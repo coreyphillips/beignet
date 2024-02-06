@@ -46,6 +46,7 @@ import {
 	TAddressIndexInfo,
 	TAddressTypeContent,
 	TAvailableNetworks,
+	TDidAddress,
 	TGetData,
 	TGetTotalFeeObj,
 	TMessageDataMap,
@@ -103,7 +104,7 @@ import { btcToSats } from '../utils/conversion';
 import * as bip39 from 'bip39';
 import { TLSSocket } from 'tls';
 import { Server } from 'net';
-
+import { Record as Web5Record, Web5 } from '@web5/api';
 const bip32 = BIP32Factory(ecc);
 
 export class Wallet {
@@ -146,6 +147,7 @@ export class Wallet {
 	public rbf: boolean;
 	public selectedFeeId: EFeeId;
 	public disableMessages: boolean;
+	public web5?: Web5;
 	private constructor({
 		mnemonic,
 		passphrase,
@@ -229,6 +231,7 @@ export class Wallet {
 			const res = await wallet.setWalletData();
 			if (res.isErr()) return err(res.error.message);
 			wallet.updateFeeEstimates();
+			await wallet.setupDid();
 			console.log('Syncing Wallet...');
 			await wallet.refreshWallet({});
 			if (wallet._disableMessagesOnCreate) wallet.disableMessages = false;
@@ -317,6 +320,7 @@ export class Wallet {
 			}
 			await this.electrum.subscribeToAddresses();
 			this._resolveAllPendingRefreshPromises(ok(this.data));
+			await this.setupDidAddress();
 			return ok(this.data);
 		} catch (e) {
 			return this._handleRefreshError(e);
@@ -423,6 +427,12 @@ export class Wallet {
 					switch (key) {
 						case 'id':
 							walletData[key] = data as string;
+							break;
+						case 'did':
+							walletData[key] = data as string;
+							break;
+						case 'didAddress':
+							walletData[key] = data as TDidAddress;
 							break;
 						case 'addressType':
 							walletData[key] = data as EAddressType;
@@ -3500,5 +3510,245 @@ export class Wallet {
 		}
 		response.id = broadcastResponse.value;
 		return ok(response);
+	}
+
+	/**
+	 * Sets up the Web5 connection, retrieves the DID and saves it to wallet data.
+	 * @returns {Promise<void>}
+	 */
+	public async setupDid(): Promise<void> {
+		const { web5, did } = await Web5.connect({
+			sync: '2s'
+		});
+		this.web5 = web5;
+		this._data.did = did;
+		await this.saveWalletData('did', this._data.did);
+	}
+
+	/**
+	 * Attempts to setup, create & update a DID address record.
+	 * If none exists, it will create one.
+	 * If one already exists and no longer matches the current address, it will attempt to update it.
+	 * @param {string} address
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async setupDidAddress(address?: string): Promise<Result<string>> {
+		if (!this.web5) return err('Web5 not connected.');
+		if (!address) address = await this.getAddress();
+
+		if (!this.data.didAddress.address) {
+			// Create an address record.
+			const setRes = await this.setDidAddress(address);
+			if (setRes.isErr()) return err(setRes.error.message);
+			return ok('DID Address Successfully Created');
+		}
+
+		// Attempt to update existing record if necessary.
+		try {
+			const currentAddress = await this.getDidAddress(this._data.did);
+			if (currentAddress && currentAddress === address) {
+				// Address already exists. No need to create or update.
+				return ok('DID Address is already setup.');
+			}
+			// Update old record if it exists.
+			if (this.data.didAddress.recordId) {
+				const updateRes = await this.updateDidAddress(
+					this.data.didAddress.recordId,
+					address
+				);
+				if (updateRes.isErr()) return err(updateRes.error.message);
+				return ok('DID Address Successfully Updated');
+			}
+			return err('Unable to update DID Address.');
+		} catch {
+			// If there was an error, the record probably doesn't exist. Create a new one.
+			const setRes = await this.setDidAddress(address);
+			if (setRes.isErr()) return err(setRes.error.message);
+			return ok('DID Address Successfully Created');
+		}
+	}
+
+	/**
+	 * Creates a DID address record.
+	 * @param {string} address
+	 * @returns {Promise<Result<Web5Record>>}
+	 */
+	public async setDidAddress(address?: string): Promise<Result<Web5Record>> {
+		if (!this.web5) return err('Web5 not connected.');
+		if (!address) address = await this.getAddress();
+		const { record } = await this.web5.dwn.records.create({
+			data: {
+				bitcoin: {
+					onchain: address
+				}
+			},
+			message: {
+				dataFormat: 'application/json',
+				published: true
+			}
+		});
+		if (!record) return err('No record returned.');
+		this._data.didAddress = { address, recordId: record.id };
+		await this.saveWalletData('didAddress', this._data.didAddress);
+		return ok(record);
+	}
+
+	/**
+	 * Updates the specified DID record with a new address.
+	 * @param {string} recordId
+	 * @param {string} address
+	 * @returns {Promise<Result<Web5Record>>}
+	 */
+	public async updateDidAddress(
+		recordId = this.data.didAddress.recordId,
+		address: string
+	): Promise<Result<Web5Record>> {
+		if (!this.web5) return err('Web5 not connected.');
+		if (!recordId) return err('No recordId provided.');
+		if (!address) {
+			address = await this.getAddress();
+		}
+		const { record } = await this.web5.dwn.records.read({
+			message: {
+				filter: {
+					recordId
+				}
+			}
+		});
+		const data = await record.update({
+			data: {
+				bitcoin: {
+					onchain: address
+				}
+			}
+		});
+		const status = data.status;
+		if (Math.floor(status.code / 100) !== 2) return err(status.detail);
+		this._data.didAddress = { address, recordId };
+		console.log('New DID Address:', this._data.didAddress);
+		await this.saveWalletData('didAddress', this._data.didAddress);
+		return ok(record);
+	}
+
+	/**
+	 * Pay a DID with a specified amount of sats.
+	 * @param {string} did
+	 * @param {number} amount
+	 * @param {string} [message]
+	 * @param {number} [satsPerByte]
+	 * @param {boolean} [rbf]
+	 * @param {boolean} [broadcast]
+	 * @param {boolean} [shuffleOutputs]
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async payDid({
+		did,
+		amount,
+		message = '',
+		satsPerByte = this.feeEstimates.normal,
+		rbf,
+		broadcast = true,
+		shuffleOutputs = true
+	}: {
+		did: string;
+		amount: number; // sats
+		message?: string;
+		satsPerByte?: number;
+		rbf?: boolean;
+		broadcast?: boolean;
+		shuffleOutputs?: boolean;
+	}): Promise<Result<string>> {
+		const address = await this.getDidAddress(did);
+		if (!address) return err('Unable to retrieve DID address.');
+		return await this.send({
+			address,
+			amount,
+			message,
+			satsPerByte,
+			rbf,
+			broadcast,
+			shuffleOutputs
+		});
+	}
+
+	/**
+	 * Deletes a DID address record by recordId.
+	 * @param {string} recordId
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async deleteDidAddress(
+		recordId = this.data.didAddress.recordId
+	): Promise<Result<string>> {
+		if (!this.web5 || !recordId) return err('Web5 not connected.');
+		if (!recordId) return err('No recordId provided.');
+
+		const { status } = await this.web5.dwn.records.delete({
+			message: {
+				recordId
+			}
+		});
+		if (Math.floor(status.code / 100) !== 2) return err(status.detail);
+		this._data.didAddress = { address: '', recordId: '' };
+		await this.saveWalletData('didAddress', {
+			address: '',
+			recordId: ''
+		});
+		return ok('DID Address Successfully Deleted');
+	}
+
+	/**
+	 * Returns the Bitcoin address of the provided DID.
+	 * @param {string} did
+	 * @returns {Promise<string>}
+	 */
+	public async getDidAddress(did = this._data.did): Promise<string> {
+		if (!this.web5) return '';
+		const response = await this.web5.dwn.records.query({
+			from: did,
+			message: {
+				filter: {
+					dataFormat: 'application/json'
+				}
+			}
+		});
+		if (!response) return '';
+		const addresses: string[] = [];
+		// Iterate through all records, but we'll only return the first address in the array if multiple exist.
+		await Promise.all(
+			// @ts-ignore
+			response.records.map(async (record) => {
+				try {
+					const data = await record.data.json();
+					if (data?.bitcoin && data.bitcoin?.onchain) {
+						addresses.push(data.bitcoin.onchain);
+					}
+				} catch (e) {
+					console.error(`Error parsing record data as JSON: ${e}`);
+				}
+			})
+		);
+		if (!addresses || !Array.isArray(addresses) || addresses.length < 1)
+			return '';
+		const address = addresses[0];
+		if (!validateAddress({ address, network: this._network })) return '';
+		return address;
+	}
+
+	/**
+	 * Returns a DID record by recordId.
+	 * @param {string} recordId
+	 * @returns {Promise<Result<Web5Record>>}
+	 */
+	public async getDidRecord(recordId: string): Promise<Result<Web5Record>> {
+		if (!this.web5) return err('Web5 not connected.');
+		const { record } = await this.web5.dwn.records.read({
+			message: {
+				filter: {
+					recordId
+				}
+			}
+		});
+		if (!record) return err('No record found.');
+		return ok(record);
 	}
 }

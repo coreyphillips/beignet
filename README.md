@@ -85,6 +85,8 @@ const feeInfo = wallet.getFeeInfo();
 // Send sats
 const sendRes = await wallet.send({ address: 'address to send sats to', amount: 1000, satPerByte: 2 });
 
+const payDidRes = await wallet.payDid({ did: 'did to send sats to', amount: 1000, satPerByte: 2 });
+
 // Send all sats to an address
 const sendMaxRes = await wallet.sendMax({ address: 'address to send sats to', satPerByte: 2 });
 ```

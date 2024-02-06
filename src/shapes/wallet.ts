@@ -103,6 +103,11 @@ export const getDefaultHeader = (): IHeader => {
 
 export const defaultWalletData: Readonly<IWalletData> = {
 	id: '',
+	did: '',
+	didAddress: {
+		recordId: '',
+		address: ''
+	},
 	addressType: EAddressType.p2wpkh,
 	header: getDefaultHeader(),
 	addresses: getAddressTypeContent<IAddresses>({}),

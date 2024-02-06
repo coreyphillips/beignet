@@ -49,6 +49,11 @@ export type TAddressTypeContent<T> = {
 	[key in EAddressType]: T;
 };
 
+export type TDidAddress = {
+	recordId: string;
+	address: string;
+};
+
 export interface IAddressTypeData {
 	type: EAddressType;
 	path: string;
@@ -151,6 +156,11 @@ export interface IAddress {
 
 export interface IWalletData {
 	id: string;
+	did: string;
+	didAddress: {
+		recordId: string;
+		address: string;
+	};
 	addressType: EAddressType;
 	header: IHeader;
 	addresses: TAddressTypeContent<IAddresses>;

@@ -5,9 +5,9 @@ import * as repl from 'repl';
 //const mnemonic = generateMnemonic();
 
 const mnemonic =
-	'develop under powder delay tunnel kite finger spend deal tiger pluck cherry';
+	'omit wine volcano bag awake travel talent lock junior frame rocket sign';
 
-const network: EAvailableNetworks = EAvailableNetworks.regtest;
+const network: EAvailableNetworks = EAvailableNetworks.mainnet;
 
 const runExample = async (): Promise<void> => {
 	// Create Wallet
@@ -26,6 +26,10 @@ const runExample = async (): Promise<void> => {
 	if (createWalletResponse.isErr()) return;
 	const wallet = createWalletResponse.value;
 
+	// Current DID
+	const did = wallet.data.did;
+	console.log('\nDID:', did);
+
 	// Get the wallet's balance.
 	const balance = wallet.getBalance();
 	console.log('\nBalance: ', balance);
@@ -33,6 +37,15 @@ const runExample = async (): Promise<void> => {
 	// Get a receiving address.
 	const address = await wallet.getAddress();
 	console.log('\nAddress:', address);
+
+	// const res = await wallet.getDidAddress(wallet.data.did);
+	// console.log('\nDID Address:', res);
+
+	// const updateRes = await wallet.updateDidAddress(
+	// 	wallet.data.didAddress.recordId,
+	// 	'bcrt1q2ps7w99nem94ynxq88fg4r3y3ddq37069p7hpe'
+	// );
+	// console.log('\nUpdate DID Address:', updateRes);
 
 	// Get fee information to perform a transaction.
 	// const feeInfo = wallet.getFeeInfo({ satsPerByte: 5 });
