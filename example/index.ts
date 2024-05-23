@@ -35,6 +35,9 @@ const runExample = async (): Promise<void> => {
 	const address = await wallet.getAddress();
 	console.log('\nAddress:', address);
 
+	const nodeId = wallet.getNodeId();
+	console.log('\nNode Id:', nodeId);
+
 	// Get fee information to perform a transaction.
 	// const feeInfo = wallet.getFeeInfo({ satsPerByte: 5 });
 	// if (feeInfo.isErr()) return;

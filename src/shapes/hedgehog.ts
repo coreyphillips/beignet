@@ -1,0 +1,22 @@
+export const hedgehogData = {
+	alices_privkey: null,
+	bobs_privkey: null,
+	alices_pubkey: null,
+	bobs_pubkey: null,
+	multisig_script: null,
+	multisig_tree: null,
+	multisig_utxo_info: {},
+	i_was_last_to_send: false,
+	alice_can_revoke: [],
+	bob_can_revoke: [],
+	balances: [],
+	balances_before_most_recent_send: [],
+	balances_before_most_recent_receive: [],
+	alices_revocation_preimages: [],
+	alices_revocation_hashes: [],
+	bobs_revocation_preimages: [],
+	bobs_revocation_hashes: [],
+	txids_to_watch_for: {},
+	latest_force_close_txs: [],
+	extra_outputs: []
+}

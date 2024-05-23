@@ -109,6 +109,7 @@ import { btcToSats } from '../utils/conversion';
 import * as bip39 from 'bip39';
 import { TLSSocket } from 'tls';
 import { Server } from 'net';
+import { Hedgehog } from '../hedgehog';
 
 const bip32 = BIP32Factory(ecc);
 
@@ -145,6 +146,7 @@ export class Wallet {
 		batchDelay?: number; // Delay (in milliseconds) between each batch of requests
 	};
 	public electrum: Electrum;
+	public hedgehog: Hedgehog;
 	public addressType: EAddressType;
 	public sendMessage: TOnMessage;
 	public transaction: Transaction;
@@ -212,6 +214,10 @@ export class Wallet {
 			wallet: this,
 			network: this.network,
 			...electrumOptions
+		});
+		this.hedgehog = new Hedgehog({
+			wallet: this,
+			network: this.network
 		});
 		this.rbf = rbf;
 		this.selectedFeeId = selectedFeeId;
@@ -3868,5 +3874,10 @@ export class Wallet {
 		} catch (e) {
 			return err(e);
 		}
+	}
+
+	public getNodeId(): string {
+		const nodePublicKey = this._root.publicKey;
+		return nodePublicKey.toString('hex');
 	}
 }
