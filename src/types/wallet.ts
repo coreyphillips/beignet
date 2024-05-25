@@ -11,6 +11,7 @@ import { TLSSocket } from 'tls';
 import { Server } from 'net';
 import { ECPairInterface } from 'ecpair';
 import { BIP32Interface } from 'bip32';
+import { IHedgehogData } from './hedgehog';
 
 export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest';
 export type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh';
@@ -23,6 +24,11 @@ export type TKeyDerivationIndex = string;
 export type TAddressTypes = {
 	[key in EAddressType]: Readonly<IAddressTypeData>;
 };
+export type TSaveWalletDataType = <K extends keyof IWalletData>(
+	key: TWalletDataKeys,
+	data: IWalletData[K]
+) => Promise<string>;
+
 export enum EAvailableNetworks {
 	bitcoin = 'bitcoin',
 	mainnet = 'bitcoin',
@@ -169,6 +175,7 @@ export interface IWalletData {
 	balance: number;
 	selectedFeeId: EFeeId;
 	feeEstimates: IOnchainFees;
+	channels: IHedgehogData;
 }
 
 export type TWalletDataKeys = keyof IWalletData;

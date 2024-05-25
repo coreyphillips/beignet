@@ -127,7 +127,8 @@ export const defaultWalletData: Readonly<IWalletData> = {
 		slow: 3,
 		minimum: 2,
 		timestamp: 0
-	}
+	},
+	channels: {}
 };
 
 export const defaultFeesShape: IOnchainFees = {

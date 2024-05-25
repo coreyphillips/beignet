@@ -1,13 +1,15 @@
+export type TScriptElement = string | number;
+
 export interface IHedgehogData {
 	[key: string]: IHedgehogChannel;
 }
 
 export interface IHedgehogChannel {
-	alices_privkey: string | null;
-	bobs_privkey: string | null;
-	alices_pubkey: string | null;
-	bobs_pubkey: string | null;
-	multisig_script: string | null;
+	alices_privkey: string;
+	bobs_privkey: string;
+	alices_pubkey: string;
+	bobs_pubkey: string;
+	multisig_script: string;
 	multisig_tree: any | null;
 	multisig_utxo_info: { [key: string]: any };
 	i_was_last_to_send: boolean;
@@ -24,3 +26,7 @@ export interface IHedgehogChannel {
 	latest_force_close_txs: any[];
 	extra_outputs: any[];
 }
+
+export type TKeyPairs = {
+	[key: string]: { privateKey: string; preImage: string };
+};

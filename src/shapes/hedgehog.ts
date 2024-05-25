@@ -1,10 +1,11 @@
-export const hedgehogData = {
-	alices_privkey: null,
-	bobs_privkey: null,
-	alices_pubkey: null,
-	bobs_pubkey: null,
-	multisig_script: null,
-	multisig_tree: null,
+export const defaultHedgehogData = {
+	channel_id: '',
+	alices_privkey: '',
+	bobs_privkey: '',
+	alices_pubkey: '',
+	bobs_pubkey: '',
+	multisig_script: '',
+	multisig_tree: '',
 	multisig_utxo_info: {},
 	i_was_last_to_send: false,
 	alice_can_revoke: [],
@@ -19,4 +20,4 @@ export const hedgehogData = {
 	txids_to_watch_for: {},
 	latest_force_close_txs: [],
 	extra_outputs: []
-}
+};

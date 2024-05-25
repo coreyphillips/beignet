@@ -110,6 +110,7 @@ import * as bip39 from 'bip39';
 import { TLSSocket } from 'tls';
 import { Server } from 'net';
 import { Hedgehog } from '../hedgehog';
+import { IHedgehogData } from '../types/hedgehog';
 
 const bip32 = BIP32Factory(ecc);
 
@@ -217,7 +218,8 @@ export class Wallet {
 		});
 		this.hedgehog = new Hedgehog({
 			wallet: this,
-			network: this.network
+			network: this.network,
+			saveWalletData: this.saveWalletData
 		});
 		this.rbf = rbf;
 		this.selectedFeeId = selectedFeeId;
@@ -509,6 +511,9 @@ export class Wallet {
 							break;
 						case 'feeEstimates':
 							walletData[key] = data as IOnchainFees;
+							break;
+						case 'channels':
+							walletData[key] = data as IHedgehogData;
 							break;
 						default:
 							console.log(`Unhandled key in getWalletData: ${key}`);

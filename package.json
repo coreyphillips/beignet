@@ -37,6 +37,7 @@
   "homepage": "https://github.com/synonymdev/beignet#readme",
   "dependencies": {
     "@bitcoinerlab/secp256k1": "1.0.5",
+    "@cmdcode/tapscript": "^1.4.6",
     "bech32": "2.0.0",
     "bip21": "2.0.3",
     "bip32": "4.0.0",
