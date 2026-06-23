@@ -8,6 +8,7 @@
 
 - [addressType](IRbfData.md#addresstype)
 - [balance](IRbfData.md#balance)
+- [changeAddress](IRbfData.md#changeaddress)
 - [fee](IRbfData.md#fee)
 - [inputs](IRbfData.md#inputs)
 - [message](IRbfData.md#message)
@@ -21,7 +22,7 @@
 
 #### Defined in
 
-[types/wallet.ts:492](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L492)
+[types/wallet.ts:494](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L494)
 
 ___
 
@@ -31,7 +32,17 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:491](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L491)
+[types/wallet.ts:493](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L493)
+
+___
+
+### changeAddress
+
+• **changeAddress**: `string`
+
+#### Defined in
+
+[types/wallet.ts:498](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L498)
 
 ___
 
@@ -41,7 +52,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:493](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L493)
+[types/wallet.ts:495](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L495)
 
 ___
 
@@ -51,7 +62,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:494](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L494)
+[types/wallet.ts:496](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L496)
 
 ___
 
@@ -61,7 +72,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:495](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L495)
+[types/wallet.ts:497](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L497)
 
 ___
 
@@ -71,4 +82,4 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:490](https://github.com/synonymdev/beignet/blob/3144d66/src/types/wallet.ts#L490)
+[types/wallet.ts:492](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L492)

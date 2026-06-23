@@ -38,9 +38,7 @@ class Err<T> {
 	 * Constructs an Err result containing the given error.
 	 * @param error - The error contained in the result.
 	 */
-	public constructor(public readonly error: Error) {
-		console.log(error);
-	}
+	public constructor(public readonly error: Error) {}
 
 	/**
 	 * Checks if the result is of type Ok.

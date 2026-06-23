@@ -1,8 +1,11 @@
 {
   "name": "beignet",
   "version": "0.0.54",
-  "description": "A self-custodial, JS Bitcoin wallet management library.",
+  "description": "A self-custodial, JS Bitcoin wallet + Lightning Network management library.",
   "main": "dist/index.js",
+  "bin": {
+    "beignet": "./dist/cli/cli.js"
+  },
   "scripts": {
     "test": "yarn build && env mocha --exit -r ts-node/register 'tests/**/*.test.ts'",
     "test:boost": "yarn build && env mocha --exit -r ts-node/register 'tests/boost.test.ts'",
@@ -12,7 +15,14 @@
     "test:electrum": "yarn build && env mocha --exit -r ts-node/register 'tests/electrum.test.ts'",
     "test:derivation": "yarn build && env mocha --exit -r ts-node/register 'tests/derivation.test.ts'",
     "test:transaction": "yarn build && env mocha --exit -r ts-node/register 'tests/transaction.test.ts'",
+    "test:lightning": "npx mocha --exit -r ts-node/register --ignore 'tests/lightning/interop/**' 'tests/lightning/**/*.test.ts'",
+    "test:interop": "npx mocha --exit --timeout 120000 -r ts-node/register 'tests/lightning/interop/**/*.test.ts'",
     "example": "ts-node example",
+    "beignet": "ts-node src/cli/cli.ts",
+    "test:cli": "npx mocha --exit -r ts-node/register --ignore 'tests/cli/daemon-security.test.ts' --ignore 'tests/cli/daemon-integration.test.ts' 'tests/cli/**/*.test.ts'",
+    "test:integration": "npx mocha --exit --timeout 60000 -r ts-node/register 'tests/cli/daemon-security.test.ts' 'tests/cli/daemon-integration.test.ts'",
+    "test:all": "npx mocha --exit --timeout 120000 -r ts-node/register 'tests/lightning/**/*.test.ts' 'tests/cli/**/*.test.ts'",
+    "example:lightning": "ts-node example/lightning.ts",
     "lint": "eslint . --ext .js,.jsx,.ts,.tsx",
     "lint:check": "eslint . --ext .js,.jsx,.ts,.tsx",
     "lint:fix": "eslint . --fix --ext .js,.jsx,.ts,.tsx",
@@ -24,23 +34,43 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/synonymdev/beignet.git",
-    "baseUrl": "https://github.com/synonymdev/beignet"
+    "url": "git+https://github.com/coreyphillips/beignet.git",
+    "baseUrl": "https://github.com/coreyphillips/beignet"
   },
   "keywords": [
     "Bitcoin",
-    "wallet"
+    "wallet",
+    "lightning",
+    "lightning-network",
+    "bolt",
+    "ai-agent"
   ],
   "types": "dist/types/index.d.ts",
-  "author": "synonymdev",
+  "exports": {
+    ".": { "types": "./dist/types/index.d.ts", "default": "./dist/index.js" },
+    "./lightning": { "types": "./dist/types/lightning/index.d.ts", "default": "./dist/lightning/index.js" },
+    "./cli": { "types": "./dist/types/cli/index.d.ts", "default": "./dist/cli/index.js" }
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "author": "coreyphillips",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/synonymdev/beignet/issues"
+    "url": "https://github.com/coreyphillips/beignet/issues"
   },
-  "homepage": "https://github.com/synonymdev/beignet#readme",
+  "homepage": "https://github.com/coreyphillips/beignet#readme",
   "dependencies": {
     "@bitcoinerlab/secp256k1": "1.0.5",
+    "@types/better-sqlite3": "^7.6.13",
     "bech32": "2.0.0",
+    "better-sqlite3": "^12.6.2",
     "bip21": "2.0.3",
     "bip32": "4.0.0",
     "bip39": "3.1.0",
@@ -50,7 +80,8 @@
     "ecpair": "2.1.0",
     "lodash.clonedeep": "4.5.0",
     "net": "1.0.2",
-    "rn-electrum-client": "0.0.22"
+    "rn-electrum-client": "0.0.22",
+    "socks": "^2.8.7"
   },
   "devDependencies": {
     "@types/chai": "4.3.0",

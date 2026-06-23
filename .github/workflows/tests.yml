@@ -35,8 +35,18 @@ jobs:
       - name: Install Node.js dependencies
         run: npm install || npm install
 
-      - name: Run Tests
-        run: npm run test
+      # Run each suite in its own process so the on-chain wallet tests get a
+      # fresh Electrum connection (they previously failed when run after the
+      # lightning/CLI suites in one long process). Interop tests are excluded
+      # here — they need LND/CLN/Eclair and run via `npm run test:interop`.
+      - name: Run on-chain wallet tests
+        run: yarn build && npx mocha --exit -r ts-node/register 'tests/*.test.ts'
+
+      - name: Run lightning unit tests
+        run: npm run test:lightning
+
+      - name: Run CLI unit tests
+        run: npm run test:cli
 
       - name: Dump docker logs on failure
         if: failure()

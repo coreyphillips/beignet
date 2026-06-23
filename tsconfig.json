@@ -2,7 +2,7 @@
   "compilerOptions": {
     "module": "commonjs",
     "esModuleInterop": true,
-    "target": "es2017",
+    "target": "es2020",
     "moduleResolution": "node",
     "sourceMap": true,
     "declarationDir": "./dist/types",
@@ -24,7 +24,7 @@
     "skipLibCheck": true,
     "useUnknownInCatchVariables": false
   },
-  "lib": ["es2015.promise", "es5"],
+  "lib": ["es2020"],
   "include": [
     "src/**/*.ts"
   ],

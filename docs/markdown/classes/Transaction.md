@@ -22,6 +22,8 @@
 - [addExternalInputs](Transaction.md#addexternalinputs)
 - [addInput](Transaction.md#addinput)
 - [addOutput](Transaction.md#addoutput)
+- [applyAutoCoinSelect](Transaction.md#applyautocoinselect)
+- [autoCoinSelect](Transaction.md#autocoinselect)
 - [createPsbtFromTransactionData](Transaction.md#createpsbtfromtransactiondata)
 - [createTransaction](Transaction.md#createtransaction)
 - [estimateTransactionCosts](Transaction.md#estimatetransactioncosts)
@@ -35,6 +37,7 @@
 - [resetSendTransaction](Transaction.md#resetsendtransaction)
 - [sendMax](Transaction.md#sendmax)
 - [setupCpfp](Transaction.md#setupcpfp)
+- [setupRbf](Transaction.md#setuprbf)
 - [setupTransaction](Transaction.md#setuptransaction)
 - [signPsbt](Transaction.md#signpsbt)
 - [updateFee](Transaction.md#updatefee)
@@ -55,7 +58,7 @@
 
 #### Defined in
 
-[transaction/index.ts:49](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L49)
+[transaction/index.ts:52](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L52)
 
 ## Properties
 
@@ -65,7 +68,7 @@
 
 #### Defined in
 
-[transaction/index.ts:46](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L46)
+[transaction/index.ts:49](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L49)
 
 ___
 
@@ -75,7 +78,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:47](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L47)
+[transaction/index.ts:50](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L50)
 
 ## Accessors
 
@@ -89,7 +92,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:54](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L54)
+[transaction/index.ts:57](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L57)
 
 ## Methods
 
@@ -113,7 +116,7 @@ Adds external inputs to the current transaction.
 
 #### Defined in
 
-[transaction/index.ts:772](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L772)
+[transaction/index.ts:859](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L859)
 
 ___
 
@@ -133,7 +136,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:659](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L659)
+[transaction/index.ts:746](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L746)
 
 ___
 
@@ -155,7 +158,56 @@ Adds an output at the specified index to the current transaction.
 
 #### Defined in
 
-[transaction/index.ts:821](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L821)
+[transaction/index.ts:908](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L908)
+
+___
+
+### applyAutoCoinSelect
+
+▸ **applyAutoCoinSelect**(`«destructured»`): `Promise`<[`Result`](../README.md#result)<[`ISendTransaction`](../interfaces/ISendTransaction.md)\>\>
+
+#### Parameters
+
+| Name | Type |
+| :------ | :------ |
+| `«destructured»` | `Object` |
+| › `coinSelectRes` | [`ICoinSelectResponse`](../interfaces/ICoinSelectResponse.md) |
+
+#### Returns
+
+`Promise`<[`Result`](../README.md#result)<[`ISendTransaction`](../interfaces/ISendTransaction.md)\>\>
+
+#### Defined in
+
+[transaction/index.ts:180](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L180)
+
+___
+
+### autoCoinSelect
+
+▸ **autoCoinSelect**(`«destructured»`): [`Result`](../README.md#result)<[`ICoinSelectResponse`](../interfaces/ICoinSelectResponse.md)\>
+
+Selects coins for transaction construction based on provided parameters.
+
+#### Parameters
+
+| Name | Type |
+| :------ | :------ |
+| `«destructured»` | `Object` |
+| › `changeAddress?` | `string` |
+| › `coinSelectPreference?` | [`ECoinSelectPreference`](../enums/ECoinSelectPreference.md) |
+| › `inputs` | [`IUtxo`](../interfaces/IUtxo.md)[] |
+| › `message?` | `string` |
+| › `outputs` | [`IOutput`](../interfaces/IOutput.md)[] |
+| › `satsPerByte?` | `number` |
+
+#### Returns
+
+[`Result`](../README.md#result)<[`ICoinSelectResponse`](../interfaces/ICoinSelectResponse.md)\>
+
+#### Defined in
+
+[transaction/index.ts:1408](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1408)
 
 ___
 
@@ -180,7 +232,7 @@ Returns a PSBT that includes unsigned funding inputs.
 
 #### Defined in
 
-[transaction/index.ts:520](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L520)
+[transaction/index.ts:607](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L607)
 
 ___
 
@@ -202,7 +254,7 @@ Creates complete signed transaction using the transaction data store
 
 #### Defined in
 
-[transaction/index.ts:379](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L379)
+[transaction/index.ts:440](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L440)
 
 ___
 
@@ -226,7 +278,7 @@ Calculates the max amount able to send for onchain/lightning
 
 #### Defined in
 
-[transaction/index.ts:1047](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1047)
+[transaction/index.ts:1138](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1138)
 
 ___
 
@@ -250,7 +302,7 @@ Returns the maximum sats per byte that can be used for a given transaction.
 
 #### Defined in
 
-[transaction/index.ts:363](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L363)
+[transaction/index.ts:423](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L423)
 
 ___
 
@@ -275,7 +327,7 @@ Calculates the max amount able to send for the provided/current onchain transact
 
 #### Defined in
 
-[transaction/index.ts:1114](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1114)
+[transaction/index.ts:1205](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1205)
 
 ___
 
@@ -290,6 +342,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 | Name | Type |
 | :------ | :------ |
 | `«destructured»` | `Object` |
+| › `coinSelectPreference?` | [`ECoinSelectPreference`](../enums/ECoinSelectPreference.md) |
 | › `fundingLightning?` | `boolean` |
 | › `message?` | `string` |
 | › `satsPerByte` | `number` |
@@ -301,7 +354,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 
 #### Defined in
 
-[transaction/index.ts:215](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L215)
+[transaction/index.ts:236](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L236)
 
 ___
 
@@ -316,6 +369,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 | Name | Type |
 | :------ | :------ |
 | `«destructured»` | `Object` |
+| › `coinSelectPreference?` | [`ECoinSelectPreference`](../enums/ECoinSelectPreference.md) |
 | › `fundingLightning?` | `boolean` |
 | › `message?` | `string` |
 | › `satsPerByte?` | `number` |
@@ -327,7 +381,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 
 #### Defined in
 
-[transaction/index.ts:270](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L270)
+[transaction/index.ts:309](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L309)
 
 ___
 
@@ -350,7 +404,7 @@ Returns total value of all utxos.
 
 #### Defined in
 
-[transaction/index.ts:448](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L448)
+[transaction/index.ts:535](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L535)
 
 ___
 
@@ -373,7 +427,7 @@ Returns total value of all outputs. Excludes any value that would be sent to the
 
 #### Defined in
 
-[transaction/index.ts:845](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L845)
+[transaction/index.ts:932](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L932)
 
 ___
 
@@ -395,7 +449,7 @@ Removes blacklisted UTXO's from the UTXO array.
 
 #### Defined in
 
-[transaction/index.ts:191](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L191)
+[transaction/index.ts:211](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L211)
 
 ___
 
@@ -411,7 +465,7 @@ This completely resets the send transaction state.
 
 #### Defined in
 
-[transaction/index.ts:181](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L181)
+[transaction/index.ts:201](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L201)
 
 ___
 
@@ -438,7 +492,7 @@ Toggles the max amount to the provided output index.
 
 #### Defined in
 
-[transaction/index.ts:982](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L982)
+[transaction/index.ts:1069](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1069)
 
 ___
 
@@ -462,7 +516,30 @@ Sets up a CPFP transaction.
 
 #### Defined in
 
-[transaction/index.ts:1165](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1165)
+[transaction/index.ts:1256](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1256)
+
+___
+
+### setupRbf
+
+▸ **setupRbf**(`txid`): `Promise`<[`Result`](../README.md#result)<[`ISendTransaction`](../interfaces/ISendTransaction.md)\>\>
+
+Sets up a transaction for RBF.
+
+#### Parameters
+
+| Name | Type |
+| :------ | :------ |
+| `txid` | `Object` |
+| `txid.txid` | `string` |
+
+#### Returns
+
+`Promise`<[`Result`](../README.md#result)<[`ISendTransaction`](../interfaces/ISendTransaction.md)\>\>
+
+#### Defined in
+
+[transaction/index.ts:1327](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1327)
 
 ___
 
@@ -485,7 +562,7 @@ This function will not override previously set transaction data. To do that you'
 
 #### Defined in
 
-[transaction/index.ts:68](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L68)
+[transaction/index.ts:71](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L71)
 
 ___
 
@@ -509,7 +586,7 @@ Loops through inputs and signs them
 
 #### Defined in
 
-[transaction/index.ts:472](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L472)
+[transaction/index.ts:559](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L559)
 
 ___
 
@@ -535,7 +612,7 @@ Updates the fee for the current transaction by the specified amount.
 
 #### Defined in
 
-[transaction/index.ts:908](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L908)
+[transaction/index.ts:995](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L995)
 
 ___
 
@@ -558,4 +635,4 @@ This updates the transaction state used for sending.
 
 #### Defined in
 
-[transaction/index.ts:870](https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L870)
+[transaction/index.ts:957](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L957)

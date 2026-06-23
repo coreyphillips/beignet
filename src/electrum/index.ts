@@ -973,7 +973,9 @@ export class Electrum {
 				if (response.isOk()) {
 					// Re-Subscribe to Addresses & Headers
 					this.subscribeToAddresses({});
-					this.subscribeToHeader().then();
+					this.subscribeToHeader().catch(() => {
+						/* best-effort re-subscribe on reconnect */
+					});
 				} else {
 					this.publishConnectionChange(false);
 				}

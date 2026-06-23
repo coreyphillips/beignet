@@ -6,10 +6,21 @@
 
 ### Properties
 
+- [runCoinSelect](ICreateTransaction.md#runcoinselect)
 - [shuffleOutputs](ICreateTransaction.md#shuffleoutputs)
 - [transactionData](ICreateTransaction.md#transactiondata)
 
 ## Properties
+
+### runCoinSelect
+
+• `Optional` **runCoinSelect**: `boolean`
+
+#### Defined in
+
+[types/transaction.ts:17](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L17)
+
+___
 
 ### shuffleOutputs
 
@@ -17,7 +28,7 @@
 
 #### Defined in
 
-[types/transaction.ts:9](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L9)
+[types/transaction.ts:16](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L16)
 
 ___
 
@@ -27,4 +38,4 @@ ___
 
 #### Defined in
 
-[types/transaction.ts:8](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L8)
+[types/transaction.ts:15](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L15)

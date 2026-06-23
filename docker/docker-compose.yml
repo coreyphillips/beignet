@@ -1,7 +1,7 @@
 services:
   bitcoind:
     container_name: bitcoin
-    image: btcpayserver/bitcoin:26.0
+    image: btcpayserver/bitcoin:29.1
     restart: unless-stopped
     expose:
       - '43782'
@@ -28,11 +28,18 @@ services:
         zmqpubrawblock=tcp://0.0.0.0:28334
         zmqpubrawtx=tcp://0.0.0.0:28335
         zmqpubhashblock=tcp://0.0.0.0:28336
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-rpcport=43782", "-rpcuser=polaruser", "-rpcpassword=polarpass", "getblockchaininfo"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   bitcoinsetup:
-    image: btcpayserver/bitcoin:26.0
+    image: btcpayserver/bitcoin:29.1
     depends_on:
-      - bitcoind
+      bitcoind:
+        condition: service_healthy
     restart: 'no'
     volumes:
       - 'bitcoin_home:/home/bitcoin/.bitcoin'
@@ -45,12 +52,105 @@ services:
         'sleep 1; while ! bitcoin-cli -rpcconnect=bitcoind -generate 1; do sleep 1; done',
       ]
 
+  lnd:
+    container_name: lnd
+    image: lightninglabs/lnd:v0.20.0-beta
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - '9735:9735'
+      - '8081:8080'
+    volumes:
+      - 'lnd_home:/root/.lnd'
+    command:
+      - '--noseedbackup'
+      - '--bitcoin.active'
+      - '--bitcoin.regtest'
+      - '--bitcoin.node=bitcoind'
+      - '--bitcoind.rpchost=bitcoind:43782'
+      - '--bitcoind.rpcuser=polaruser'
+      - '--bitcoind.rpcpass=polarpass'
+      - '--bitcoind.zmqpubrawblock=tcp://bitcoind:28334'
+      - '--bitcoind.zmqpubrawtx=tcp://bitcoind:28335'
+      - '--listen=0.0.0.0:9735'
+      - '--restlisten=0.0.0.0:8080'
+      - '--tlsextradomain=lnd'
+      - '--tlsextraip=0.0.0.0'
+      - '--debuglevel=info'
+      - '--protocol.wumbo-channels'
+      - '--protocol.zero-conf'
+      - '--protocol.option-scid-alias'
+      - '--maxpendingchannels=10'
+      - '--max-channel-fee-allocation=1.0'
+
+  cln:
+    container_name: cln
+    image: elementsproject/lightningd:v24.11.1
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - '19846:19846'
+      - '3010:3010'
+    volumes:
+      - 'cln_home:/root/.lightning'
+    command:
+      - '--network=regtest'
+      - '--bitcoin-rpcconnect=bitcoind'
+      - '--bitcoin-rpcport=43782'
+      - '--bitcoin-rpcuser=polaruser'
+      - '--bitcoin-rpcpassword=polarpass'
+      - '--addr=0.0.0.0:19846'
+      - '--clnrest-port=3010'
+      - '--clnrest-host=0.0.0.0'
+      - '--large-channels'
+      - '--log-level=info'
+      - '--experimental-offers'
+      - '--experimental-splicing'
+
+  eclair:
+    container_name: eclair
+    image: acinq/eclair:latest
+    depends_on:
+      bitcoind:
+        condition: service_healthy
+      bitcoinsetup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    ports:
+      - '9737:9737'
+      - '8082:8080'
+    environment:
+      JAVA_OPTS: >-
+        -Xmx512m
+        -Declair.allow-unsafe-startup=true
+        -Declair.chain=regtest
+        -Declair.server.port=9737
+        -Declair.server.binding-ip=0.0.0.0
+        -Declair.api.enabled=true
+        -Declair.api.port=8080
+        -Declair.api.password=eclairpassword
+        -Declair.api.binding-ip=0.0.0.0
+        -Declair.bitcoind.host=bitcoind
+        -Declair.bitcoind.rpcport=43782
+        -Declair.bitcoind.rpcuser=polaruser
+        -Declair.bitcoind.rpcpassword=polarpass
+        -Declair.bitcoind.zmqblock=tcp://bitcoind:28334
+        -Declair.bitcoind.zmqtx=tcp://bitcoind:28335
+        -Declair.channel.min-public-funding-satoshis=20000
+        -Declair.channel.min-private-funding-satoshis=20000
+        -Declair.printToConsole
+
   electrs:
     container_name: electrum
-    image: getumbrel/electrs:v0.10.2
+    image: getumbrel/electrs:v0.10.10
     restart: unless-stopped
     depends_on:
-      - bitcoind
+      bitcoind:
+        condition: service_healthy
     expose:
       - '60001'
       - '28334'
@@ -73,5 +173,8 @@ services:
 
 volumes:
   bitcoin_home:
+  lnd_home:
+  cln_home:
+  eclair_home:
 
 networks: {}
