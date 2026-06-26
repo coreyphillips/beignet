@@ -594,7 +594,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 			const msg: INodeAnnouncementMessage = {
 				signature: Buffer.alloc(64),
 				features: Buffer.alloc(0),
-				timestamp: 0,
+				timestamp: 1,
 				nodeId: Buffer.alloc(33),
 				rgbColor: Buffer.from([0, 0, 0]),
 				alias,
@@ -613,7 +613,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 			const msg: INodeAnnouncementMessage = {
 				signature: Buffer.alloc(64),
 				features: Buffer.alloc(0),
-				timestamp: 0,
+				timestamp: 1,
 				nodeId: Buffer.alloc(33),
 				rgbColor: Buffer.from([0xab, 0xcd, 0xef]),
 				alias,
@@ -642,6 +642,24 @@ describe('BOLT 7: Gossip & Routing', () => {
 		it('should reject payload too short', () => {
 			expect(() => decodeNodeAnnouncementMessage(Buffer.alloc(139))).to.throw(
 				'too short'
+			);
+		});
+
+		it('should reject a zero timestamp (gossip DoS guard)', () => {
+			const msg: INodeAnnouncementMessage = {
+				signature: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				timestamp: 1,
+				nodeId: Buffer.alloc(33),
+				rgbColor: Buffer.alloc(3),
+				alias: Buffer.alloc(32),
+				addresses: []
+			};
+			const payload = encodeNodeAnnouncementMessage(msg);
+			// Zero out the 4-byte timestamp (offset 64 sig + 2 flen + 0 features).
+			payload.writeUInt32BE(0, 66);
+			expect(() => decodeNodeAnnouncementMessage(payload)).to.throw(
+				'greater than zero'
 			);
 		});
 
@@ -723,7 +741,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 				signature: Buffer.alloc(64),
 				chainHash: Buffer.alloc(32),
 				shortChannelId: Buffer.alloc(8),
-				timestamp: 0,
+				timestamp: 1,
 				messageFlags: 0,
 				channelFlags: CHANNEL_FLAG_DIRECTION,
 				cltvExpiryDelta: 0,
@@ -744,7 +762,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 				signature: Buffer.alloc(64),
 				chainHash: Buffer.alloc(32),
 				shortChannelId: Buffer.alloc(8),
-				timestamp: 0,
+				timestamp: 1,
 				messageFlags: 0,
 				channelFlags: CHANNEL_FLAG_DISABLED,
 				cltvExpiryDelta: 0,
@@ -766,7 +784,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 				signature: Buffer.alloc(64),
 				chainHash: Buffer.alloc(32),
 				shortChannelId: Buffer.alloc(8),
-				timestamp: 0,
+				timestamp: 1,
 				messageFlags: 0,
 				channelFlags: flags,
 				cltvExpiryDelta: 0,
@@ -785,7 +803,7 @@ describe('BOLT 7: Gossip & Routing', () => {
 				signature: Buffer.alloc(64),
 				chainHash: Buffer.alloc(32),
 				shortChannelId: Buffer.alloc(8),
-				timestamp: 0,
+				timestamp: 1,
 				messageFlags: MESSAGE_FLAG_HTLC_MAX,
 				channelFlags: 0,
 				cltvExpiryDelta: 65535,
@@ -807,6 +825,27 @@ describe('BOLT 7: Gossip & Routing', () => {
 		it('should reject payload too short', () => {
 			expect(() => decodeChannelUpdateMessage(Buffer.alloc(127))).to.throw(
 				'too short'
+			);
+		});
+
+		it('should reject a zero timestamp (gossip DoS guard)', () => {
+			const msg: IChannelUpdateMessage = {
+				signature: Buffer.alloc(64),
+				chainHash: Buffer.alloc(32),
+				shortChannelId: Buffer.alloc(8),
+				timestamp: 1,
+				messageFlags: 0,
+				channelFlags: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0
+			};
+			const payload = encodeChannelUpdateMessage(msg);
+			// Zero out the 4-byte timestamp (offset 64 sig + 32 chain + 8 scid).
+			payload.writeUInt32BE(0, 104);
+			expect(() => decodeChannelUpdateMessage(payload)).to.throw(
+				'greater than zero'
 			);
 		});
 

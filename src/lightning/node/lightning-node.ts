@@ -2899,8 +2899,12 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private handleChannelAnnouncement(payload: Buffer): void {
-		const msg: IChannelAnnouncementMessage =
-			decodeChannelAnnouncementMessage(payload);
+		let msg: IChannelAnnouncementMessage;
+		try {
+			msg = decodeChannelAnnouncementMessage(payload);
+		} catch {
+			return; // malformed gossip — drop silently
+		}
 		if (!verifyChannelAnnouncement(msg, payload)) {
 			return;
 		}
@@ -2919,8 +2923,12 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private handleNodeAnnouncement(payload: Buffer): void {
-		const msg: INodeAnnouncementMessage =
-			decodeNodeAnnouncementMessage(payload);
+		let msg: INodeAnnouncementMessage;
+		try {
+			msg = decodeNodeAnnouncementMessage(payload);
+		} catch {
+			return; // malformed gossip (e.g. zero timestamp) — drop silently
+		}
 		if (!verifyNodeAnnouncement(msg, payload)) {
 			return;
 		}
@@ -2935,7 +2943,12 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private handleChannelUpdate(payload: Buffer): void {
-		const msg: IChannelUpdateMessage = decodeChannelUpdateMessage(payload);
+		let msg: IChannelUpdateMessage;
+		try {
+			msg = decodeChannelUpdateMessage(payload);
+		} catch {
+			return; // malformed gossip (e.g. zero timestamp) — drop silently
+		}
 		const channel = this.graph.getChannel(msg.shortChannelId);
 		if (!channel) {
 			return; // no prior announcement

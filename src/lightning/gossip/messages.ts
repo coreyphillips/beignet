@@ -220,6 +220,12 @@ export function decodeNodeAnnouncementMessage(
 
 	const timestamp = payload.readUInt32BE(offset);
 	offset += 4;
+	// BOLT 7: timestamps must be greater than zero. Reject zero-timestamp
+	// announcements at parse time so they never reach the network graph
+	// (defends against the zero-timestamp gossip DoS class).
+	if (timestamp === 0) {
+		throw new Error('node_announcement timestamp must be greater than zero');
+	}
 	const nodeId = Buffer.from(payload.subarray(offset, offset + 33));
 	offset += 33;
 	const rgbColor = Buffer.from(payload.subarray(offset, offset + 3));
@@ -297,6 +303,12 @@ export function decodeChannelUpdateMessage(
 	offset += 8;
 	const timestamp = payload.readUInt32BE(offset);
 	offset += 4;
+	// BOLT 7: channel_update timestamps must be greater than zero. Reject at
+	// parse time so a zero-timestamp update never reaches the network graph
+	// (defends against the zero-timestamp gossip DoS class).
+	if (timestamp === 0) {
+		throw new Error('channel_update timestamp must be greater than zero');
+	}
 	const messageFlags = payload[offset];
 	offset += 1;
 	const channelFlags = payload[offset];
