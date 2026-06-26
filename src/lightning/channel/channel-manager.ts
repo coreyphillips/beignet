@@ -1715,8 +1715,10 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private signClosingTx(channel: Channel, feeSatoshis: bigint): Buffer {
-		const { tx, witnessScript, fundingSatoshis } =
-			this.buildClosingTxAndScript(channel, feeSatoshis);
+		const { tx, witnessScript, fundingSatoshis } = this.buildClosingTxAndScript(
+			channel,
+			feeSatoshis
+		);
 		const signer =
 			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));

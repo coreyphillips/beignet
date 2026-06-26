@@ -54,19 +54,31 @@ interface IFundedUtxo {
 	value: bigint;
 }
 
-async function fundP2wpkh(seed: string, amountSats: number): Promise<IFundedUtxo> {
+async function fundP2wpkh(
+	seed: string,
+	amountSats: number
+): Promise<IFundedUtxo> {
 	const priv = crypto.createHash('sha256').update(`htlcclaim-${seed}`).digest();
 	const keyPair = ECPair.fromPrivateKey(priv, { network });
 	const pubkey = Buffer.from(keyPair.publicKey);
 	const address = bitcoin.payments.p2wpkh({ pubkey, network }).address!;
-	const txid = (await bitcoinRpc('sendtoaddress', [address, amountSats / 1e8])) as string;
+	const txid = (await bitcoinRpc('sendtoaddress', [
+		address,
+		amountSats / 1e8
+	])) as string;
 	await mineBlocks(1);
 	const wtx = (await bitcoinRpc('gettransaction', [txid])) as { hex: string };
 	const tx = bitcoin.Transaction.fromHex(wtx.hex);
 	const script = bitcoin.payments.p2wpkh({ pubkey, network }).output!;
 	const vout = tx.outs.findIndex((o) => o.script.equals(script));
 	if (vout < 0) throw new Error('funded vout not found');
-	return { priv, pubkey, prevTx: Buffer.from(tx.toBuffer()), vout, value: BigInt(tx.outs[vout].value) };
+	return {
+		priv,
+		pubkey,
+		prevTx: Buffer.from(tx.toBuffer()),
+		vout,
+		value: BigInt(tx.outs[vout].value)
+	};
 }
 
 /** Spend a funded P2WPKH UTXO into a single P2WSH(htlcScript) output, confirm it. */
@@ -75,12 +87,20 @@ async function publishHtlcOutput(
 	htlcScript: Buffer,
 	htlcValue: bigint
 ): Promise<{ txid: string; vout: number }> {
-	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: htlcScript }, network });
+	const p2wsh = bitcoin.payments.p2wsh({
+		redeem: { output: htlcScript },
+		network
+	});
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	tx.addInput(bitcoin.Transaction.fromBuffer(u.prevTx).getHash(), u.vout, 0xffffffff);
+	tx.addInput(
+		bitcoin.Transaction.fromBuffer(u.prevTx).getHash(),
+		u.vout,
+		0xffffffff
+	);
 	tx.addOutput(p2wsh.output!, Number(htlcValue));
-	const scriptCode = bitcoin.payments.p2pkh({ pubkey: u.pubkey, network }).output!;
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: u.pubkey, network })
+		.output!;
 	const sig = signSweepInput(tx, 0, scriptCode, Number(u.value), u.priv);
 	tx.setWitness(0, [sig, u.pubkey]);
 	await bitcoinRpc('sendrawtransaction', [tx.toHex()]);
@@ -91,7 +111,9 @@ async function publishHtlcOutput(
 async function testmempoolaccept(
 	rawTxs: string[]
 ): Promise<Array<{ allowed: boolean; ['reject-reason']?: string }>> {
-	return (await bitcoinRpc('testmempoolaccept', [rawTxs])) as Array<{ allowed: boolean }>;
+	return (await bitcoinRpc('testmempoolaccept', [rawTxs])) as Array<{
+		allowed: boolean;
+	}>;
 }
 
 async function destScript(label: string): Promise<Buffer> {
@@ -106,7 +128,10 @@ async function blockHeight(): Promise<number> {
 
 function key(seed: string): { priv: Buffer; pub: Buffer } {
 	const priv = crypto.createHash('sha256').update(`htlckey-${seed}`).digest();
-	return { priv, pub: Buffer.from(ECPair.fromPrivateKey(priv, { network }).publicKey) };
+	return {
+		priv,
+		pub: Buffer.from(ECPair.fromPrivateKey(priv, { network }).publicKey)
+	};
 }
 
 describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function () {
@@ -119,7 +144,9 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 			await ensureBitcoindFunds(2);
 		} catch {
 			skipAll = true;
-			console.log('    ⚠ bitcoind not available — skipping HTLC claim mempool tests.');
+			console.log(
+				'    ⚠ bitcoind not available — skipping HTLC claim mempool tests.'
+			);
 			this.skip();
 		}
 	});
@@ -146,7 +173,11 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 
 		const fundingUtxo = await fundP2wpkh('h3-funding', 80_000);
 		const htlcValue = 70_000n;
-		const { txid, vout } = await publishHtlcOutput(fundingUtxo, htlcScript, htlcValue);
+		const { txid, vout } = await publishHtlcOutput(
+			fundingUtxo,
+			htlcScript,
+			htlcValue
+		);
 
 		const buildClaim = async (): Promise<bitcoin.Transaction> => {
 			const claimTx = buildRemoteHtlcTimeoutClaimTx({
@@ -159,7 +190,13 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 				cltvExpiry,
 				inputSequence: 0xfffffffd
 			});
-			const sig = signSweepInput(claimTx, 0, htlcScript, Number(htlcValue), remoteHtlc.priv);
+			const sig = signSweepInput(
+				claimTx,
+				0,
+				htlcScript,
+				Number(htlcValue),
+				remoteHtlc.priv
+			);
 			claimTx.setWitness(0, buildRemoteHtlcTimeoutWitness(sig, htlcScript));
 			return claimTx;
 		};
@@ -167,7 +204,8 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 		// Before CLTV maturity: must be rejected (non-final / CLTV not satisfied).
 		const early = await buildClaim();
 		const [earlyRes] = await testmempoolaccept([early.toHex()]);
-		expect(earlyRes.allowed, 'claim must be rejected before cltv_expiry').to.be.false;
+		expect(earlyRes.allowed, 'claim must be rejected before cltv_expiry').to.be
+			.false;
 
 		// Mine past the expiry, then the SAME claim must be accepted.
 		const need = cltvExpiry - (await blockHeight());
@@ -184,13 +222,17 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 		// revocation key. Build an offered-HTLC output (as it appears on the
 		// cheater's commitment) and spend it via the penalty path.
 		const perCommitmentSecret = crypto.randomBytes(32);
-		const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+		const perCommitmentPoint =
+			perCommitmentPointFromSecret(perCommitmentSecret);
 		const revBase = key('h2-revbase');
 		const localHtlc = key('h2-localhtlc');
 		const remoteHtlc = key('h2-remotehtlc');
 		const paymentHash = crypto.randomBytes(32);
 
-		const revocationPubkey = deriveRevocationPubkey(revBase.pub, perCommitmentPoint);
+		const revocationPubkey = deriveRevocationPubkey(
+			revBase.pub,
+			perCommitmentPoint
+		);
 		const revocationPrivkey = deriveRevocationPrivkey(
 			revBase.priv,
 			perCommitmentSecret,
@@ -208,7 +250,11 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 
 		const fundingUtxo = await fundP2wpkh('h2-funding', 80_000);
 		const htlcValue = 70_000n;
-		const { txid, vout } = await publishHtlcOutput(fundingUtxo, htlcScript, htlcValue);
+		const { txid, vout } = await publishHtlcOutput(
+			fundingUtxo,
+			htlcScript,
+			htlcValue
+		);
 		const revokedTx = bitcoin.Transaction.fromHex(
 			((await bitcoinRpc('getrawtransaction', [txid])) as string) || ''
 		);
@@ -233,7 +279,10 @@ describe('Interop: on-chain HTLC claim mempool acceptance (regtest)', function (
 			Number(htlcValue),
 			revocationPrivkey
 		);
-		penaltyTx.setWitness(0, buildHtlcPenaltyWitness(sig, revocationPubkey, htlcScript));
+		penaltyTx.setWitness(
+			0,
+			buildHtlcPenaltyWitness(sig, revocationPubkey, htlcScript)
+		);
 
 		const [res] = await testmempoolaccept([penaltyTx.toHex()]);
 		expect(res.allowed, res['reject-reason']).to.be.true;

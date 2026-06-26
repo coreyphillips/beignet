@@ -83,7 +83,9 @@ export function calculateCommitmentFee(
  * used for BOTH the commitment outputs and the num_untrimmed_htlcs fee count so
  * the two never diverge (a divergence builds a commitment the peer rejects).
  */
-function filterUntrimmedHtlcs<T extends { amount: bigint; direction: HtlcDirection }>(
+function filterUntrimmedHtlcs<
+	T extends { amount: bigint; direction: HtlcDirection }
+>(
 	htlcOutputs: T[],
 	dustLimitSat: bigint,
 	feeratePerKw: number,

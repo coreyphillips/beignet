@@ -758,9 +758,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			const {
 				buildReceivedHtlcScript
 			} = require('../../src/lightning/script/htlc');
-			const {
-				HtlcDirection
-			} = require('../../src/lightning/channel/types');
+			const { HtlcDirection } = require('../../src/lightning/channel/types');
 
 			// An HTLC we offered that was present in revoked commitment #0 but has
 			// since settled and been removed from live state.htlcs.
@@ -813,7 +811,11 @@ describe('Output Resolver (Phase 4B)', function () {
 			const acceptPBP = isOpener
 				? state.remoteBasepoints!.paymentBasepoint
 				: state.localBasepoints.paymentBasepoint;
-			const obscured = calculateObscuredCommitmentNumber(openPBP, acceptPBP, 0n);
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
 			const revokedTx = new bitcoin.Transaction();
 			revokedTx.version = 2;
 			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);

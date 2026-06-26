@@ -82,7 +82,10 @@ describe('H3: remote HTLC-timeout claim witness (crypto validation)', function (
 
 		// 2. Witness selects the timeout branch: [sig, <empty>, witnessScript].
 		expect(witness).to.have.length(3);
-		expect(witness[1].length, 'branch selector must be empty (size != 32)').to.equal(0);
+		expect(
+			witness[1].length,
+			'branch selector must be empty (size != 32)'
+		).to.equal(0);
 		expect(witness[2].equals(htlcScript)).to.equal(true);
 
 		// 3. The signature satisfies OP_CHECKSIG: it must verify against OUR HTLC

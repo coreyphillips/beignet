@@ -65,9 +65,7 @@ describe('BOLT 8 Appendix A: transport handshake conformance', function () {
 		const act3 = initiator.createAct3();
 		expect(bufferToHex(act3)).to.equal(v.successful_handshake.act3);
 		const recoveredInitiatorStatic = responder.processAct3(act3);
-		expect(bufferToHex(recoveredInitiatorStatic)).to.equal(
-			k.initiator_ls_pub
-		);
+		expect(bufferToHex(recoveredInitiatorStatic)).to.equal(k.initiator_ls_pub);
 
 		// Both sides must converge to the same final chaining key.
 		expect(bufferToHex(initiator.state.ck)).to.equal(
@@ -89,7 +87,9 @@ describe('BOLT 8 Appendix A: transport handshake conformance', function () {
 		const msg = Buffer.from('conformance check', 'utf8');
 		const packet = initiatorTransport.encryptPacket(msg);
 		const len = responderTransport.decryptLength(packet.subarray(0, 18));
-		const body = responderTransport.decryptBody(packet.subarray(18, 18 + len + 16));
+		const body = responderTransport.decryptBody(
+			packet.subarray(18, 18 + len + 16)
+		);
 		expect(body.equals(msg)).to.equal(true);
 	});
 
@@ -101,9 +101,7 @@ describe('BOLT 8 Appendix A: transport handshake conformance', function () {
 					hexToBuffer(k.responder_ls_pub),
 					hexToBuffer(k.initiator_e_priv)
 				);
-				expect(() =>
-					initiator.processAct2(hexToBuffer(tc.input))
-				).to.throw();
+				expect(() => initiator.processAct2(hexToBuffer(tc.input))).to.throw();
 			});
 		}
 	});
@@ -115,9 +113,7 @@ describe('BOLT 8 Appendix A: transport handshake conformance', function () {
 					hexToBuffer(k.responder_ls_priv),
 					hexToBuffer(k.responder_e_priv)
 				);
-				expect(() =>
-					responder.processAct1(hexToBuffer(tc.input))
-				).to.throw();
+				expect(() => responder.processAct1(hexToBuffer(tc.input))).to.throw();
 			});
 		}
 	});
@@ -137,9 +133,7 @@ describe('BOLT 8 Appendix A: transport handshake conformance', function () {
 				responder.processAct1(initiator.act1);
 				const act2 = responder.createAct2();
 				initiator.processAct2(act2);
-				expect(() =>
-					responder.processAct3(hexToBuffer(tc.input))
-				).to.throw();
+				expect(() => responder.processAct3(hexToBuffer(tc.input))).to.throw();
 			});
 		}
 	});

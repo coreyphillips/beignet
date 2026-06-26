@@ -469,9 +469,7 @@ export function deserializeChannelState(
 		htlcs.set(key, entry);
 	}
 
-	let revokedHtlcSnapshots:
-		| Map<string, IHtlcSnapshotEntry[]>
-		| undefined;
+	let revokedHtlcSnapshots: Map<string, IHtlcSnapshotEntry[]> | undefined;
 	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.length > 0) {
 		revokedHtlcSnapshots = new Map();
 		for (const snap of s.revokedHtlcSnapshots) {

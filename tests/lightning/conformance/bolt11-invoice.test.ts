@@ -12,7 +12,10 @@
 import { expect } from 'chai';
 import { decode } from '../../../src/lightning/invoice/decode';
 import { encode } from '../../../src/lightning/invoice/encode';
-import { IInvoice, IInvoiceCreationOptions } from '../../../src/lightning/invoice/types';
+import {
+	IInvoice,
+	IInvoiceCreationOptions
+} from '../../../src/lightning/invoice/types';
 import { loadVectors, hexToBuffer, bufferToHex } from './helpers';
 
 interface IExpect {
@@ -77,9 +80,9 @@ describe('BOLT 11: invoice decode conformance', function () {
 				expect(inv.expiry).to.equal(e.expiry);
 			}
 			if (e.recoveredPubkey !== undefined) {
-				expect(inv.recoveredPubkey && bufferToHex(inv.recoveredPubkey)).to.equal(
-					e.recoveredPubkey
-				);
+				expect(
+					inv.recoveredPubkey && bufferToHex(inv.recoveredPubkey)
+				).to.equal(e.recoveredPubkey);
 			}
 			if (e.hasDescriptionHash) {
 				expect(inv.descriptionHash, 'descriptionHash present').to.not.equal(
@@ -93,7 +96,9 @@ describe('BOLT 11: invoice decode conformance', function () {
 				);
 			}
 			if (e.hasRoutingHints) {
-				expect(inv.routingHints && inv.routingHints.length).to.be.greaterThan(0);
+				expect(inv.routingHints && inv.routingHints.length).to.be.greaterThan(
+					0
+				);
 			}
 			if (e.featureBitsSet) {
 				expect(inv.featureBits, 'featureBits present').to.not.equal(undefined);

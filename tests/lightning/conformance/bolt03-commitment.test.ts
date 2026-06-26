@@ -162,7 +162,9 @@ describe('BOLT 3 Appendix C: commitment & HTLC script conformance', function () 
 		// Ordered outputs: exact values + scriptPubKeys (to_local, to_remote)
 		expect(tx.outs.length).to.equal(spec.outs.length);
 		for (let i = 0; i < spec.outs.length; i++) {
-			expect(tx.outs[i].value, `output ${i} value`).to.equal(spec.outs[i].value);
+			expect(tx.outs[i].value, `output ${i} value`).to.equal(
+				spec.outs[i].value
+			);
 			expect(bufferToHex(tx.outs[i].script), `output ${i} script`).to.equal(
 				bufferToHex(spec.outs[i].script)
 			);

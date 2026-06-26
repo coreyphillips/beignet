@@ -743,7 +743,8 @@ export class BeignetNode extends EventEmitter {
 		let waitedMs = 0;
 		this._fallbackRecoveryTimer = setInterval(() => {
 			waitedMs += 2000;
-			const done = this.wallet?.electrum?.connectedToElectrum || waitedMs >= 60_000;
+			const done =
+				this.wallet?.electrum?.connectedToElectrum || waitedMs >= 60_000;
 			if (!done) return;
 			if (this._fallbackRecoveryTimer) {
 				clearInterval(this._fallbackRecoveryTimer);

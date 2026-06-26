@@ -4007,7 +4007,11 @@ export class LightningNode extends EventEmitter {
 		// existing handleMppPart accumulation to total_msat) bounds the real
 		// received total. Zero-amount ("any amount") invoices are exempt.
 		const finalInvoice = this.invoices.get(hashHex);
-		if (finalInvoice && finalInvoice.amountMsat && finalInvoice.amountMsat > 0n) {
+		if (
+			finalInvoice &&
+			finalInvoice.amountMsat &&
+			finalInvoice.amountMsat > 0n
+		) {
 			const isMpp =
 				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
 			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;

@@ -46,7 +46,11 @@ describe('BOLT 4: Sphinx onion conformance', function () {
 		}));
 
 	it('constructs the spec onion packet byte-for-byte', function () {
-		const packet = constructOnionPacket(sessionKey, buildHops(), associatedData);
+		const packet = constructOnionPacket(
+			sessionKey,
+			buildHops(),
+			associatedData
+		);
 		expect(bufferToHex(encodeOnionPacket(packet))).to.equal(v.onion);
 	});
 

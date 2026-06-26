@@ -957,7 +957,11 @@ export function resolveTheirCurrentCommitmentOutputs(
 			// using our HTLC key; the monitor schedules it at cltv maturity. Without
 			// this the output was tracked but never swept — the funds (neither party
 			// can claim before timeout) were stranded after a remote force-close.
-			if (output.witnessScript && htlcBasepointSecret && remotePerCommitmentPoint) {
+			if (
+				output.witnessScript &&
+				htlcBasepointSecret &&
+				remotePerCommitmentPoint
+			) {
 				const claimTx = buildRemoteHtlcTimeoutClaimTx({
 					commitmentTxid: output.txid,
 					outputIndex: output.outputIndex,
@@ -1123,9 +1127,7 @@ export function resolveRevokedCommitmentOutputs(
 			// channels the CSV-1 P2WSH needs an explicit script-path spend). Claim
 			// it exactly like the non-revoked remote-commitment path.
 			const feeSatoshis = BigInt(
-				Math.ceil(
-					feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE)
-				)
+				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
 			);
 			if (output.witnessScript) {
 				// Anchor channel: P2WSH with a 1-block CSV — spend via script path.
@@ -1283,16 +1285,15 @@ export function resolveRevokedCommitmentOutputs(
 		penaltyTx.setWitness(i, witness);
 
 		resolved.push({
-			trackedOutput:
-				output ?? {
-					txid: revokedTx.getId(),
-					outputIndex: outputIdx,
-					amount: BigInt(value),
-					outputType: OutputType.OFFERED_HTLC,
-					status: OutputStatus.CONFIRMED,
-					confirmationHeight: 0,
-					witnessScript: ws
-				},
+			trackedOutput: output ?? {
+				txid: revokedTx.getId(),
+				outputIndex: outputIdx,
+				amount: BigInt(value),
+				outputType: OutputType.OFFERED_HTLC,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: ws
+			},
 			spendTx: penaltyTx,
 			witness
 		});
