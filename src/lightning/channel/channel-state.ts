@@ -13,6 +13,7 @@ import {
 	ChannelRole,
 	IChannelConfig,
 	IHtlcEntry,
+	IHtlcSnapshotEntry,
 	DEFAULT_CHANNEL_CONFIG
 } from './types';
 
@@ -114,6 +115,16 @@ export interface IChannelState {
 	/** HTLC tracking */
 	localHtlcCounter: bigint;
 	htlcs: Map<string, IHtlcEntry>;
+
+	/**
+	 * Per-remote-commitment HTLC snapshots, keyed by remote commitment number.
+	 * Records which HTLCs were present in each remote commitment we signed, so
+	 * that if the counterparty broadcasts a REVOKED commitment whose HTLCs have
+	 * since settled and been removed from `htlcs`, the justice/penalty transaction
+	 * can still reconstruct and sweep those HTLC outputs. Without it, a cheater
+	 * reclaims formerly-in-flight HTLC value the penalty was meant to confiscate.
+	 */
+	revokedHtlcSnapshots?: Map<string, IHtlcSnapshotEntry[]>;
 
 	/** Cached remote signature on our latest commitment */
 	remoteCommitmentSignature: Buffer | null;

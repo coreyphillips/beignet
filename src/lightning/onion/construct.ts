@@ -87,8 +87,16 @@ export function constructOnionPacket(
 	// Generate filler
 	const filler = generateFiller(sharedSecrets, payloadSizes);
 
-	// Initialize routing info with zeros
-	let routingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+	// Initialize routing info with a deterministic pseudo-random pad stream,
+	// NOT zeros (BOLT 4 Packet Construction). The pad key is derived from the
+	// session key — generate_key("pad", session_key) — so the unused tail of
+	// the onion is indistinguishable from real hop data and the final recipient
+	// cannot infer the route length. Zero-init would leak that structure.
+	const padKey = crypto
+		.createHmac('sha256', Buffer.from('pad', 'ascii'))
+		.update(sessionKey)
+		.digest();
+	let routingInfo = generateCipherStream(padKey, ROUTING_INFO_LENGTH);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
 	// Build right-to-left (last hop first)

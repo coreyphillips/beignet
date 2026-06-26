@@ -301,6 +301,15 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 			height: number;
 		}>
 	> {
+		// Don't probe a not-yet-open / dropped socket. The underlying
+		// rn-electrum-client helper logs the raw rejection (a "Connection to
+		// server lost" stack trace) to the console before resolving an error
+		// Result, which is alarming noise during the startup connect window.
+		// Fail fast with a clean error instead; callers treat this as
+		// "nothing to do for now" and retry once connected.
+		if (!this.electrum.connectedToElectrum) {
+			throw new Error('Electrum not connected');
+		}
 		const result = await this.withTimeout(
 			this.electrum.listUnspentAddressScriptHashes({
 				addresses: {

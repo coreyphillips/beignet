@@ -732,6 +732,7 @@ describe('Output Resolver (Phase 4B)', function () {
 				destScript,
 				10,
 				revocationBasepointSecret,
+				openerPrivkeys[0], // paymentPrivkey (unused: no to_remote output here)
 				network
 			);
 
@@ -741,6 +742,114 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(penaltyResolution).to.exist;
 			expect(penaltyResolution!.spendTx).to.exist;
 			expect(penaltyResolution!.witness).to.exist;
+		});
+
+		it('H2: penalizes a revoked HTLC output reconstructed from the snapshot (HTLC gone from live state)', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+			const state = opener.getFullState();
+
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const {
+				deriveRevocationPubkey,
+				derivePublicKey
+			} = require('../../src/lightning/keys/derivation');
+			const {
+				buildReceivedHtlcScript
+			} = require('../../src/lightning/script/htlc');
+			const {
+				HtlcDirection
+			} = require('../../src/lightning/channel/types');
+
+			// An HTLC we offered that was present in revoked commitment #0 but has
+			// since settled and been removed from live state.htlcs.
+			const paymentHash = crypto.randomBytes(32);
+			const cltvExpiry = 700_000;
+			state.revokedHtlcSnapshots = new Map([
+				[
+					'0',
+					[
+						{
+							paymentHash,
+							amountMsat: 1_000_000n,
+							cltvExpiry,
+							direction: HtlcDirection.OFFERED
+						}
+					]
+				]
+			]);
+			state.htlcs.clear(); // settled & forgotten
+
+			// Reconstruct the exact HTLC output the cheater's commitment carries.
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirHtlc = derivePublicKey(
+				state.remoteBasepoints!.htlcBasepoint,
+				revokedPoint
+			);
+			const ourHtlc = derivePublicKey(
+				state.localBasepoints.htlcBasepoint,
+				revokedPoint
+			);
+			const htlcScript = buildReceivedHtlcScript(
+				revocationPubkey,
+				theirHtlc,
+				ourHtlc,
+				paymentHash,
+				cltvExpiry,
+				false
+			);
+			const htlcP2wsh = bitcoin.payments.p2wsh({
+				redeem: { output: htlcScript }
+			});
+
+			const isOpener = state.role === ChannelRole.OPENER;
+			const openPBP = isOpener
+				? state.localBasepoints.paymentBasepoint
+				: state.remoteBasepoints!.paymentBasepoint;
+			const acceptPBP = isOpener
+				? state.remoteBasepoints!.paymentBasepoint
+				: state.localBasepoints.paymentBasepoint;
+			const obscured = calculateObscuredCommitmentNumber(openPBP, acceptPBP, 0n);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				seq
+			);
+			revokedTx.addOutput(htlcP2wsh.output!, 100_000); // the revoked HTLC output
+
+			const destScript = Buffer.alloc(22);
+			destScript[0] = 0x00;
+			destScript[1] = 0x14;
+			crypto.randomBytes(20).copy(destScript, 2);
+
+			// trackedOutputs is EMPTY — live classification missed the settled HTLC.
+			const resolved = resolveRevokedCommitmentOutputs(
+				state,
+				[],
+				0n,
+				revokedTx,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[0],
+				network
+			);
+
+			// The snapshot reconstruction must have brought the HTLC output into the
+			// penalty: a spendTx exists for output index 0.
+			const htlcPenalty = resolved.find(
+				(r) => r.trackedOutput.outputIndex === 0 && r.spendTx
+			);
+			expect(htlcPenalty, 'revoked HTLC output must be penalized').to.exist;
+			expect(htlcPenalty!.witness).to.exist;
 		});
 	});
 

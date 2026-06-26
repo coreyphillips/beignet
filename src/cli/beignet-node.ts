@@ -256,6 +256,8 @@ export class BeignetNode extends EventEmitter {
 	private sweepDestinationScript?: Buffer;
 	/** Background timer retrying wallet sweep-address resolution (see scheduleSweepAddressRefresh). */
 	private _sweepRefreshTimer?: ReturnType<typeof setInterval>;
+	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
+	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
 	private mnemonic: string;
 	private networkName: 'mainnet' | 'testnet' | 'regtest';
 	private dataDir: string;
@@ -712,14 +714,44 @@ export class BeignetNode extends EventEmitter {
 
 		// 13. Recover any funds stranded at the funding-key fallback address from
 		// past force-close sweeps (sessions where no wallet address was available).
-		// No-op when the fallback address is empty. Runs in the background.
+		// No-op when the fallback address is empty. Runs in the background, but
+		// only once Electrum is actually connected — probing a still-connecting
+		// socket otherwise surfaces a noisy "Connection to server lost" trace.
 		if (this.sweepDestinationScript) {
+			this.runFallbackRecoveryWhenConnected();
+		}
+	}
+
+	/**
+	 * Run fallback-fund recovery once Electrum is connected. At startup the
+	 * Electrum socket is often still opening, so an immediate listUnspent probe
+	 * fails noisily. This waits (bounded) for connectivity, then attempts
+	 * recovery exactly once. Best-effort: gives up quietly after ~60s.
+	 */
+	private runFallbackRecoveryWhenConnected(): void {
+		const attempt = (): void => {
 			this.recoverFallbackFunds().catch((err) => {
 				this.log('warn', 'Fallback fund recovery failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
 			});
+		};
+		if (this.wallet?.electrum?.connectedToElectrum) {
+			attempt();
+			return;
 		}
+		let waitedMs = 0;
+		this._fallbackRecoveryTimer = setInterval(() => {
+			waitedMs += 2000;
+			const done = this.wallet?.electrum?.connectedToElectrum || waitedMs >= 60_000;
+			if (!done) return;
+			if (this._fallbackRecoveryTimer) {
+				clearInterval(this._fallbackRecoveryTimer);
+				this._fallbackRecoveryTimer = undefined;
+			}
+			if (this.wallet?.electrum?.connectedToElectrum) attempt();
+		}, 2000);
+		if (this._fallbackRecoveryTimer.unref) this._fallbackRecoveryTimer.unref();
 	}
 
 	/**
@@ -3223,6 +3255,10 @@ export class BeignetNode extends EventEmitter {
 			clearInterval(this._sweepRefreshTimer);
 			this._sweepRefreshTimer = undefined;
 		}
+		if (this._fallbackRecoveryTimer) {
+			clearInterval(this._fallbackRecoveryTimer);
+			this._fallbackRecoveryTimer = undefined;
+		}
 		this.paymentQueue?.removeAllListeners();
 		// Await any in-flight backup before closing storage
 		if (this._backupPromise) {
@@ -3251,6 +3287,10 @@ export class BeignetNode extends EventEmitter {
 		if (this._sweepRefreshTimer) {
 			clearInterval(this._sweepRefreshTimer);
 			this._sweepRefreshTimer = undefined;
+		}
+		if (this._fallbackRecoveryTimer) {
+			clearInterval(this._fallbackRecoveryTimer);
+			this._fallbackRecoveryTimer = undefined;
 		}
 		this.paymentQueue?.removeAllListeners();
 		this.node.destroy();

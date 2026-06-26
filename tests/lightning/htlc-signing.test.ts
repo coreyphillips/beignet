@@ -336,17 +336,17 @@ describe('HTLC Transaction Signing', function () {
 		it('should not produce signatures for dust HTLCs', function () {
 			const { openerState, openerSeed } = createReadyState();
 
-			// Dust HTLC (below 546 sat P2WSH limit = 546_000 msat)
+			// Dust HTLC (below the negotiated dust_limit_satoshis of 354)
 			openerState.htlcs.set('offered-0', {
 				id: 0n,
-				amountMsat: 500_000n, // 500 sats → below dust
+				amountMsat: 200_000n, // 200 sats → below dust (354)
 				paymentHash: crypto.randomBytes(32),
 				cltvExpiry: 500000,
 				onionRoutingPacket: Buffer.alloc(1366),
 				direction: HtlcDirection.OFFERED,
 				state: HtlcState.COMMITTED
 			});
-			openerState.localBalanceMsat -= 500_000n;
+			openerState.localBalanceMsat -= 200_000n;
 
 			const signer = new ChannelSigner(
 				getFundingPrivkey(openerSeed),
@@ -381,7 +381,7 @@ describe('HTLC Transaction Signing', function () {
 			// Dust offered HTLC
 			openerState.htlcs.set('offered-1', {
 				id: 1n,
-				amountMsat: 400_000n, // 400 sat → dust
+				amountMsat: 200_000n, // 200 sat → dust (below negotiated 354)
 				paymentHash: crypto.randomBytes(32),
 				cltvExpiry: 500100,
 				onionRoutingPacket: Buffer.alloc(1366),
@@ -389,7 +389,7 @@ describe('HTLC Transaction Signing', function () {
 				state: HtlcState.COMMITTED
 			});
 
-			openerState.localBalanceMsat -= 50_400_000n;
+			openerState.localBalanceMsat -= 50_200_000n;
 
 			const signer = new ChannelSigner(
 				getFundingPrivkey(openerSeed),

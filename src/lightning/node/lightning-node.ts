@@ -75,6 +75,7 @@ import {
 	IHopPayload,
 	KEYSEND_TLV_TYPE,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+	FINAL_INCORRECT_CLTV_EXPIRY,
 	INVALID_ONION_HMAC,
 	UNKNOWN_NEXT_PEER,
 	INCORRECT_CLTV_EXPIRY,
@@ -756,6 +757,13 @@ export class LightningNode extends EventEmitter {
 			this.emitStructuredLog('channel', 'ready', {
 				channelId: channelId.toString('hex')
 			});
+
+			// A live channel means the node is operationally usable. Signal ready
+			// now rather than waiting for autoReconnectPeers() to finish every
+			// stored peer — otherwise a single offline/slow peer (whose reconnect
+			// only fails after its full connect timeout) holds node:ready hostage
+			// and waitForReady() spuriously times out. Idempotent via _readyEmitted.
+			this.emitReady();
 
 			// After reestablish, check if we still need to send announcement_signatures.
 			// This handles the case where LND sent its sigs before, but beignet never
@@ -3802,7 +3810,8 @@ export class LightningNode extends EventEmitter {
 				htlcId,
 				amountMsat,
 				paymentHash,
-				processed.hopPayload
+				processed.hopPayload,
+				htlcEntry.cltvExpiry
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement
@@ -3822,7 +3831,8 @@ export class LightningNode extends EventEmitter {
 		htlcId: bigint,
 		amountMsat: bigint,
 		paymentHash: Buffer,
-		hopPayload?: IHopPayload
+		hopPayload?: IHopPayload,
+		incomingCltvExpiry?: number
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -3900,12 +3910,102 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// Validate payment secret if provided in the onion payload
-		if (hopPayload?.paymentSecret) {
-			const expectedSecret = this.paymentSecrets.get(hashHex);
-			if (!expectedSecret || !hopPayload.paymentSecret.equals(expectedSecret)) {
+		// Validate payment secret. BOLT 4: when the invoice carries a
+		// payment_secret, the final hop MUST reject an HTLC that omits OR
+		// mismatches it — not only when the sender chose to include one. This
+		// defends against payment probing and unauthorized payment to the same
+		// hash. When no invoice secret exists (e.g. keysend), enforcement is
+		// skipped here and the payment is validated by preimage instead.
+		const expectedSecret = this.paymentSecrets.get(hashHex);
+		if (expectedSecret) {
+			if (
+				!hopPayload?.paymentSecret ||
+				!hopPayload.paymentSecret.equals(expectedSecret)
+			) {
 				this.emitStructuredLog('htlc', 'payment_secret_mismatch', {
 					paymentHash: hashHex
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+					  )
+					: Buffer.alloc(290);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+		}
+
+		// Validate the HTLC CLTV at the final hop (BOLT 4). Two checks:
+		//  1. final_incorrect_cltv_expiry: the on-chain HTLC cltv_expiry must equal
+		//     the outgoing_cltv_value the sender put in the onion. A mismatch means
+		//     a hop tampered with the timeout.
+		//  2. expiry-too-soon: the cltv_expiry must leave at least min_final_cltv
+		//     blocks before it expires, or we could reveal the preimage yet fail to
+		//     claim the HTLC on-chain in time (payer reclaims after learning it).
+		//     Reported as INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS per modern BOLT 4
+		//     (avoid leaking which condition failed).
+		if (incomingCltvExpiry !== undefined) {
+			if (
+				hopPayload?.outgoingCltvValue !== undefined &&
+				incomingCltvExpiry !== hopPayload.outgoingCltvValue
+			) {
+				this.emitStructuredLog('htlc', 'final_incorrect_cltv', {
+					paymentHash: hashHex,
+					htlcCltv: incomingCltvExpiry,
+					onionCltv: hopPayload.outgoingCltvValue
+				});
+				const reason = sharedSecret
+					? createFailureMessage(sharedSecret, FINAL_INCORRECT_CLTV_EXPIRY)
+					: Buffer.alloc(290);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+			if (
+				this.currentBlockHeight > 0 &&
+				incomingCltvExpiry <
+					this.currentBlockHeight + DEFAULT_MIN_FINAL_CLTV_EXPIRY
+			) {
+				this.emitStructuredLog('htlc', 'final_expiry_too_soon', {
+					paymentHash: hashHex,
+					htlcCltv: incomingCltvExpiry,
+					height: this.currentBlockHeight
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+					  )
+					: Buffer.alloc(290);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+		}
+
+		// Validate the received amount against the invoice (BOLT 4). The final
+		// node MUST NOT fulfill (and reveal the preimage) for less than the
+		// invoiced amount, and SHOULD reject gross overpayment (> 2x). Without
+		// this, a payer can settle a large invoice with a tiny HTLC and still
+		// obtain the proof-of-payment. For MPP the sender-declared total_msat is
+		// what the parts accumulate toward, so validating it here (and the
+		// existing handleMppPart accumulation to total_msat) bounds the real
+		// received total. Zero-amount ("any amount") invoices are exempt.
+		const finalInvoice = this.invoices.get(hashHex);
+		if (finalInvoice && finalInvoice.amountMsat && finalInvoice.amountMsat > 0n) {
+			const isMpp =
+				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
+			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;
+			if (
+				claimedTotal < finalInvoice.amountMsat ||
+				claimedTotal > finalInvoice.amountMsat * 2n
+			) {
+				this.emitStructuredLog('htlc', 'incorrect_payment_amount', {
+					paymentHash: hashHex,
+					received: claimedTotal.toString(),
+					invoiced: finalInvoice.amountMsat.toString()
 				});
 				const reason = sharedSecret
 					? createFailureMessage(
@@ -4035,6 +4135,12 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		// Clean up shared secret on fulfillment
 		this.cleanupHtlcSharedSecret(`${channelId.toString('hex')}:${htlcId}`);
+
+		// Deliver the preimage to the chain monitors so this received HTLC can be
+		// claimed on-chain if the channel force-closes before/around settlement
+		// (e.g. hold invoices, or a crash in this window). Without this the monitor
+		// never sees the preimage and the counterparty reclaims via timeout.
+		this.channelManager.recordPreimage(paymentHash, preimage);
 
 		// Clean up payment secret after successful fulfillment
 		this.paymentSecrets.delete(hashHex);

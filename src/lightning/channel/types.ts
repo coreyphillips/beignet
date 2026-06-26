@@ -62,6 +62,18 @@ export interface IHtlcEntry {
 	state: HtlcState;
 }
 
+/**
+ * Minimal record of one HTLC as it appeared in a specific (now potentially
+ * revoked) remote commitment — enough to reconstruct its output witness script
+ * for a penalty sweep after the live HTLC has been settled and forgotten.
+ */
+export interface IHtlcSnapshotEntry {
+	paymentHash: Buffer;
+	amountMsat: bigint;
+	cltvExpiry: number;
+	direction: HtlcDirection;
+}
+
 export interface IChannelConfig {
 	dustLimitSatoshis: bigint;
 	maxHtlcValueInFlightMsat: bigint;

@@ -68,6 +68,12 @@ export interface ICommitmentBroadcast {
 	blockHeight: number;
 	commitmentNumber: bigint;
 	trackedOutputs: ITrackedOutput[];
+	/**
+	 * Raw hex of a broadcast REVOKED commitment, retained so a stuck penalty
+	 * sweep can be re-resolved and RBF-fee-bumped (the revoked resolver needs the
+	 * full tx to read output values). Only set for revoked-commitment broadcasts.
+	 */
+	revokedTxHex?: string;
 }
 
 /** Chain action types returned by ChainMonitor */

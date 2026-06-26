@@ -160,6 +160,9 @@ export class ChannelManager extends EventEmitter {
 	private channelPeers: Map<string, string> = new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
+	// Learned payment preimages, retained so monitors created later (on
+	// force-close) can claim received HTLCs on-chain. Fed by recordPreimage().
+	private _knownPreimages: Map<string, Buffer> = new Map();
 	private zeroConfManager: ZeroConfManager = new ZeroConfManager();
 	private _nextChannelIndex = 1;
 	/** Wallet-owned destination for cooperative-close payouts, if configured. */
@@ -419,10 +422,35 @@ export class ChannelManager extends EventEmitter {
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (!peerPubkey) return null;
 
+		// Sign the acceptor's initial commitment ourselves rather than trusting a
+		// caller-supplied signature. The acceptor now verifies this signature in
+		// handleFundingCreated (BOLT 2), so it must be a real signature over their
+		// initial commitment (#0). Mirrors the acceptor-side signing in
+		// handleFundingCreated above. Falls back to the passed signature only if
+		// the remote's per-commitment point isn't available yet.
+		const fundingState = channel.getFullState();
+		fundingState.fundingTxid = fundingTxid;
+		fundingState.fundingOutputIndex = fundingOutputIndex;
+		let initialSignature = signature;
+		if (fundingState.remoteCurrentPerCommitmentPoint) {
+			const signer =
+				channel.getSigner() ||
+				new ChannelSigner(
+					this.config.localFundingPrivkey,
+					this.config.htlcBasepointSecret
+				);
+			const signed = signRemoteCommitment(
+				fundingState,
+				signer,
+				fundingState.remoteCurrentPerCommitmentPoint
+			);
+			initialSignature = signed.signature;
+		}
+
 		const actions = channel.createFundingCreated(
 			fundingTxid,
 			fundingOutputIndex,
-			signature
+			initialSignature
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -978,6 +1006,7 @@ export class ChannelManager extends EventEmitter {
 			perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
 		);
 		this.monitors.set(idHex, monitor);
+		this._seedMonitorPreimages(monitor);
 		// Persist the monitor NOW. Without this it only reaches storage once the
 		// funding spend is detected on-chain — if the session ends first, the
 		// next restore sees FORCE_CLOSED with no monitor, never re-watches the
@@ -1033,6 +1062,7 @@ export class ChannelManager extends EventEmitter {
 				perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
 			);
 			this.monitors.set(channelIdHex, monitor);
+			this._seedMonitorPreimages(monitor);
 		}
 
 		const chainActions = monitor.handleFundingSpent(spendingTx, blockHeight);
@@ -1121,11 +1151,38 @@ export class ChannelManager extends EventEmitter {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
+		this._seedMonitorPreimages(monitor);
 	}
 
 	/**
 	 * Get the chain monitor for a specific channel.
 	 */
+	/**
+	 * Record a learned payment preimage and deliver it to every chain monitor so
+	 * a received HTLC can be claimed on-chain after a force-close. Without this
+	 * wiring node-held preimages never reach the monitors (ChainMonitor.addPreimage
+	 * had no production caller), so an inbound HTLC that must be settled on-chain
+	 * — a hold-invoice, or a crash between learning the preimage and fulfilling —
+	 * would fall to the counterparty's timeout path: direct loss of the HTLC value.
+	 * Preimages are retained so monitors created later (on force-close) are seeded.
+	 */
+	recordPreimage(paymentHash: Buffer, preimage: Buffer): void {
+		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
+		for (const [channelIdHex, monitor] of this.monitors) {
+			const actions = monitor.addPreimage(paymentHash, preimage);
+			if (actions.length > 0) {
+				this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+			}
+		}
+	}
+
+	/** Seed a freshly created/restored monitor with all known preimages. */
+	private _seedMonitorPreimages(monitor: ChainMonitor): void {
+		for (const [hashHex, preimage] of this._knownPreimages) {
+			monitor.addPreimage(Buffer.from(hashHex, 'hex'), preimage);
+		}
+	}
+
 	getMonitor(channelId: Buffer): ChainMonitor | undefined {
 		return this.monitors.get(channelId.toString('hex'));
 	}
@@ -1580,10 +1637,42 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.handleClosingSigned(msg, (feeSatoshis: bigint) => {
 			return this.signClosingTx(channel, feeSatoshis);
 		});
+
+		// On agreement, verify the peer's closing signature and broadcast the
+		// mutual-close ourselves rather than trusting the peer to do it (BOLT 2).
+		const agreed = actions.some(
+			(a) => a.type === ChannelActionType.CHANNEL_CLOSED
+		);
+		if (agreed) {
+			const closeTx = this.buildSignedMutualCloseTx(
+				channel,
+				msg.feeSatoshis,
+				msg.signature
+			);
+			if (closeTx) {
+				this.emit('broadcast:tx', closeTx);
+			} else {
+				this.emit(
+					'error',
+					msg.channelId,
+					'Coop-close: peer closing signature failed to verify'
+				);
+			}
+		}
+
 		this.processActions(peerPubkey, channel, actions);
 	}
 
-	private signClosingTx(channel: Channel, feeSatoshis: bigint): Buffer {
+	private buildClosingTxAndScript(
+		channel: Channel,
+		feeSatoshis: bigint
+	): {
+		tx: import('bitcoinjs-lib').Transaction;
+		witnessScript: Buffer;
+		fundingSatoshis: bigint;
+		localFundingPubkey: Buffer;
+		remoteFundingPubkey: Buffer;
+	} {
 		const { buildClosingTx } = require('../chain/closing');
 		const { createFundingScript } = require('../script/funding');
 
@@ -1616,13 +1705,73 @@ export class ChannelManager extends EventEmitter {
 			state.remoteBasepoints!.fundingPubkey
 		);
 
-		const signer =
-			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
-		return signer.signClosingTx(
+		return {
 			tx,
 			witnessScript,
-			Number(state.fundingSatoshis)
+			fundingSatoshis: state.fundingSatoshis,
+			localFundingPubkey: state.localBasepoints.fundingPubkey,
+			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey
+		};
+	}
+
+	private signClosingTx(channel: Channel, feeSatoshis: bigint): Buffer {
+		const { tx, witnessScript, fundingSatoshis } =
+			this.buildClosingTxAndScript(channel, feeSatoshis);
+		const signer =
+			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
+	}
+
+	/**
+	 * Build the fully-signed mutual-close transaction at the agreed fee, AFTER
+	 * verifying the counterparty's closing signature. Returns the serialized tx
+	 * to broadcast, or null if their signature does not verify. Previously the
+	 * coop-close path reached agreement on fee alone, marked the channel CLOSED,
+	 * and relied entirely on the peer to broadcast a valid close — a peer that
+	 * echoed the fee with a garbage signature (or never broadcast) left funds in
+	 * limbo. We now validate their signature and broadcast the close ourselves.
+	 */
+	private buildSignedMutualCloseTx(
+		channel: Channel,
+		feeSatoshis: bigint,
+		theirSig: Buffer
+	): Buffer | null {
+		const {
+			tx,
+			witnessScript,
+			fundingSatoshis,
+			localFundingPubkey,
+			remoteFundingPubkey
+		} = this.buildClosingTxAndScript(channel, feeSatoshis);
+		const signer =
+			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const ourSig = signer.signClosingTx(
+			tx,
+			witnessScript,
+			Number(fundingSatoshis)
 		);
+		if (
+			!signer.verifyCommitmentSig(
+				tx,
+				theirSig,
+				remoteFundingPubkey,
+				witnessScript,
+				Number(fundingSatoshis)
+			)
+		) {
+			return null;
+		}
+		tx.setWitness(
+			0,
+			ChannelSigner.buildFundingWitness(
+				ourSig,
+				theirSig,
+				localFundingPubkey,
+				remoteFundingPubkey,
+				witnessScript
+			)
+		);
+		return tx.toBuffer();
 	}
 
 	/**
@@ -2421,6 +2570,20 @@ export class ChannelManager extends EventEmitter {
 				case ChainActionType.PREIMAGE_LEARNED:
 					this.emit('preimage:learned', action.paymentHash, action.preimage);
 					break;
+				case ChainActionType.REBUILD_SWEEP: {
+					// A previously-broadcast sweep has not confirmed; re-resolve it at
+					// the bumped feerate and rebroadcast (RBF). Critical for penalty
+					// txs that must confirm before the cheater's to_self_delay matures.
+					const mon = this.monitors.get(channelId.toString('hex'));
+					const rebuilt = mon?.rebuildSweep(
+						action.output,
+						action.feeRatePerVbyte
+					);
+					if (rebuilt) {
+						this.emit('broadcast:tx', rebuilt);
+					}
+					break;
+				}
 				case ChainActionType.ERROR:
 					this.emit('error', channelId, action.message);
 					break;

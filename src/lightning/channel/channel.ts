@@ -59,6 +59,7 @@ import {
 	ChannelRole,
 	IChannelConfig,
 	IHtlcEntry,
+	IHtlcSnapshotEntry,
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH
@@ -596,6 +597,35 @@ export class Channel {
 			];
 		}
 
+		// Verify the acceptor's signature on our INITIAL commitment (#0) BEFORE
+		// broadcasting the funding transaction. Every other commitment path
+		// verifies the remote signature; the initial one must too. Otherwise a
+		// malicious acceptor sends a garbage funding_signed, we lock our entire
+		// balance in the 2-of-2 funding output, and forceClose() builds an
+		// invalid witness from the bad signature that can never confirm — funds
+		// held hostage with no unilateral exit (BOLT 2 MUST).
+		if (this._signer && this._state.remoteBasepoints) {
+			const firstPerCommitmentPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				0n
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				firstPerCommitmentPoint,
+				msg.signature,
+				0n
+			);
+			if (!valid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid commitment signature in funding_signed'
+					}
+				];
+			}
+		}
+
 		// Store remote's commitment signature
 		this._state.remoteCommitmentSignature = msg.signature;
 
@@ -761,6 +791,33 @@ export class Channel {
 			msg.fundingTxid,
 			msg.fundingOutputIndex
 		);
+
+		// Verify the opener's signature on our initial commitment (#0) before
+		// sending funding_signed (BOLT 2 MUST: the acceptor validates the
+		// funder's signature first). Same class of check as funding_signed/
+		// commitment_signed; without it we'd persist an unverifiable initial
+		// commitment we cannot force-close.
+		if (this._signer && this._state.remoteBasepoints) {
+			const firstPerCommitmentPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				0n
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				firstPerCommitmentPoint,
+				msg.signature,
+				0n
+			);
+			if (!valid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid commitment signature in funding_created'
+					}
+				];
+			}
+		}
 
 		// Store remote's commitment signature
 		this._state.remoteCommitmentSignature = msg.signature;
@@ -949,9 +1006,25 @@ export class Channel {
 			];
 		}
 
-		// Check we have enough balance (including reserve the remote requires us to maintain)
+		// Check we have enough balance (including reserve the remote requires us to
+		// maintain). When we are the funder we must ALSO be able to pay the
+		// commitment fee on top of the reserve (BOLT 2), or the commitment we build
+		// would silently clamp our output to 0 / be rejected by the peer. The
+		// update_fee path already enforces this; mirror it here for adding HTLCs.
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		if (this._state.localBalanceMsat - amountMsat < reserveMsat) {
+		let requiredMsat = reserveMsat;
+		if (this._state.role === ChannelRole.OPENER) {
+			const feeMsat =
+				BigInt(
+					calculateCommitmentFee(
+						this._state.localConfig.feeratePerKw,
+						this._countActiveHtlcs() + 1,
+						isAnchorChannel(this._state.channelType)
+					)
+				) * 1000n;
+			requiredMsat += feeMsat;
+		}
+		if (this._state.localBalanceMsat - amountMsat < requiredMsat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1073,6 +1146,38 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Max inbound HTLC value in flight exceeded'
+				}
+			];
+		}
+
+		// Enforce the channel reserve (and, if the remote is the funder, the
+		// commitment fee) on the SENDER before provisionally debiting their
+		// balance. The outbound addHtlc path checks this for us; the inbound path
+		// previously debited remoteBalanceMsat unconditionally, so an over-large
+		// HTLC could drive it negative and corrupt commitment accounting / violate
+		// the reserve (BOLT 2). The reserve the remote must keep is the one WE
+		// required of them (localConfig.channelReserveSatoshis).
+		const remoteReserveMsat =
+			this._state.localConfig.channelReserveSatoshis * 1000n;
+		let remoteRequiredMsat = remoteReserveMsat;
+		if (this._state.role === ChannelRole.ACCEPTOR) {
+			// We are the acceptor, so the remote is the funder and must also cover
+			// the commitment fee above its reserve.
+			const feeMsat =
+				BigInt(
+					calculateCommitmentFee(
+						this._state.localConfig.feeratePerKw,
+						this._countActiveHtlcs() + 1,
+						isAnchorChannel(this._state.channelType)
+					)
+				) * 1000n;
+			remoteRequiredMsat += feeMsat;
+		}
+		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Remote cannot afford HTLC above channel reserve'
 				}
 			];
 		}
@@ -1214,6 +1319,25 @@ export class Channel {
 		if (!entry) {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
+			];
+		}
+
+		// Verify the revealed preimage actually hashes to this HTLC's
+		// payment_hash before crediting the counterparty. Without this a peer
+		// could fulfill with a bogus preimage and, on the next revoke_and_ack,
+		// move the HTLC value into their balance with no valid proof revealed —
+		// direct theft of every HTLC we offer. Mirrors the receive-side check in
+		// fulfillHtlc().
+		const fulfillHash = crypto
+			.createHash('sha256')
+			.update(msg.paymentPreimage)
+			.digest();
+		if (!fulfillHash.equals(entry.paymentHash)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Invalid preimage for offered HTLC'
+				}
 			];
 		}
 
@@ -1379,6 +1503,34 @@ export class Channel {
 	}
 
 	/**
+	 * Record which HTLCs are present in a given remote commitment so the penalty
+	 * path can reconstruct their outputs after they settle. Only HTLCs that
+	 * actually appear in the commitment (PENDING/COMMITTED) are captured.
+	 */
+	private _snapshotRemoteCommitmentHtlcs(commitmentNumber: bigint): void {
+		const entries: IHtlcSnapshotEntry[] = [];
+		for (const htlc of this._state.htlcs.values()) {
+			if (
+				htlc.state === HtlcState.PENDING ||
+				htlc.state === HtlcState.COMMITTED ||
+				htlc.state === HtlcState.FULFILLED ||
+				htlc.state === HtlcState.FAILED
+			) {
+				entries.push({
+					paymentHash: Buffer.from(htlc.paymentHash),
+					amountMsat: htlc.amountMsat,
+					cltvExpiry: htlc.cltvExpiry,
+					direction: htlc.direction
+				});
+			}
+		}
+		if (!this._state.revokedHtlcSnapshots) {
+			this._state.revokedHtlcSnapshots = new Map();
+		}
+		this._state.revokedHtlcSnapshots.set(commitmentNumber.toString(), entries);
+	}
+
+	/**
 	 * Sign and send commitment_signed.
 	 * The caller provides the signature and HTLC signatures (from commitment-builder).
 	 */
@@ -1406,6 +1558,11 @@ export class Channel {
 		this._state.lastSentHtlcSignatures = htlcSignatures.map((s) =>
 			Buffer.from(s)
 		);
+
+		// Snapshot the HTLCs committed in the remote commitment we just signed,
+		// keyed by its number, so a later penalty can sweep these outputs even
+		// after they settle and leave `htlcs` (H2 — revoked-HTLC justice).
+		this._snapshotRemoteCommitmentHtlcs(this._state.remoteCommitmentNumber);
 
 		// Advance remote commitment number
 		this._state.remoteCommitmentNumber++;
@@ -1558,6 +1715,31 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected revoke_and_ack' }
 			];
+		}
+
+		// Bind the revealed secret to the committed per-commitment point BEFORE
+		// trusting the revocation. shaChainStore.addSecret only checks
+		// secret-to-secret chain consistency; it does not verify that this secret
+		// actually corresponds to the per-commitment point used in the commitment
+		// being revoked. Without this, a malicious peer could "revoke" with a
+		// secret whose pubkey != remoteCurrentPerCommitmentPoint: we would treat
+		// the old, higher-balance commitment as revoked, but resolveRevoked-
+		// CommitmentOutputs would later derive the WRONG revocation key, every
+		// penalty signature would be invalid, and the cheater would sweep their
+		// inflated to_local after to_self_delay (BOLT 2 MUST-check).
+		if (this._state.remoteCurrentPerCommitmentPoint) {
+			const revealedPoint = perCommitmentPointFromSecret(
+				msg.perCommitmentSecret
+			);
+			if (!revealedPoint.equals(this._state.remoteCurrentPerCommitmentPoint)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'revoke_and_ack secret does not match committed per-commitment point'
+					}
+				];
+			}
 		}
 
 		// Store the revealed secret

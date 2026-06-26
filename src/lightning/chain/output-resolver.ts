@@ -22,6 +22,8 @@ import {
 	buildToRemoteAnchorWitness,
 	buildRemoteHtlcPreimageClaimTx,
 	buildRemoteHtlcPreimageWitness,
+	buildRemoteHtlcTimeoutClaimTx,
+	buildRemoteHtlcTimeoutWitness,
 	buildHtlcSuccessWitness,
 	buildHtlcTimeoutWitness,
 	signSweepInput,
@@ -949,12 +951,55 @@ export function resolveTheirCurrentCommitmentOutputs(
 		) {
 			// Output types are labelled from OUR perspective (see classifyOutputs /
 			// matchHtlcOutput). An OFFERED_HTLC is one WE offered (outbound) — on
-			// their commitment we can only reclaim it via the CLTV-timeout path,
-			// and only if the downstream never settled (we don't hold a preimage).
-			resolved.push({
-				trackedOutput: output,
-				cltvExpiry: output.cltvExpiry
-			});
+			// their commitment it uses the received-HTLC script and we reclaim it via
+			// the CLTV-timeout path once the HTLC has expired (the downstream never
+			// settled, so we hold no preimage). Build the single-sig timeout claim
+			// using our HTLC key; the monitor schedules it at cltv maturity. Without
+			// this the output was tracked but never swept — the funds (neither party
+			// can claim before timeout) were stranded after a remote force-close.
+			if (output.witnessScript && htlcBasepointSecret && remotePerCommitmentPoint) {
+				const claimTx = buildRemoteHtlcTimeoutClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					destinationScript,
+					feeSatoshis,
+					cltvExpiry: output.cltvExpiry ?? 0,
+					inputSequence: isAnchorChannel(state.channelType) ? 1 : 0xfffffffd
+				});
+
+				// Our HTLC private key is the timeout-path signer (the script's
+				// remote_htlcpubkey on their commitment is our HTLC key).
+				const localHtlcPrivkey = derivePrivateKey(
+					htlcBasepointSecret,
+					remotePerCommitmentPoint,
+					state.localBasepoints.htlcBasepoint
+				);
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					localHtlcPrivkey
+				);
+				const witness = buildRemoteHtlcTimeoutWitness(
+					sig,
+					output.witnessScript
+				);
+
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness,
+					cltvExpiry: output.cltvExpiry
+				});
+			} else {
+				resolved.push({
+					trackedOutput: output,
+					cltvExpiry: output.cltvExpiry
+				});
+			}
 		} else if (
 			output.outputType === OutputType.RECEIVED_HTLC &&
 			output.paymentHash
@@ -1033,6 +1078,7 @@ export function resolveRevokedCommitmentOutputs(
 	destinationScript: Buffer,
 	feeRatePerVbyte: number,
 	revocationBasepointSecret: Buffer,
+	paymentPrivkey: Buffer,
 	network: bitcoin.Network = bitcoin.networks.bitcoin
 ): IResolvedOutput[] {
 	if (!state.remoteBasepoints) return [];
@@ -1070,8 +1116,121 @@ export function resolveRevokedCommitmentOutputs(
 			claimableIndices.push(output.outputIndex);
 			witnessScripts.set(output.outputIndex, output.witnessScript);
 		} else if (output.outputType === OutputType.TO_REMOTE) {
-			// to_remote belongs to us on their revoked commitment — it's P2WPKH, no revocation needed
-			resolved.push({ trackedOutput: output });
+			// to_remote is OUR balance on their revoked commitment. It is not part
+			// of the penalty (we own it outright), but it must still be swept to our
+			// wallet — the previous code only tracked it and never built a claim, so
+			// the funds sat unspent at a channel-specific key (and for anchor
+			// channels the CSV-1 P2WSH needs an explicit script-path spend). Claim
+			// it exactly like the non-revoked remote-commitment path.
+			const feeSatoshis = BigInt(
+				Math.ceil(
+					feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE)
+				)
+			);
+			if (output.witnessScript) {
+				// Anchor channel: P2WSH with a 1-block CSV — spend via script path.
+				const claimTx = buildToLocalSweepTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					witnessScript: output.witnessScript,
+					toSelfDelay: 1,
+					destinationScript,
+					feeSatoshis
+				});
+				const sig = signSweepInput(
+					claimTx,
+					0,
+					output.witnessScript,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteAnchorWitness(sig, output.witnessScript);
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness,
+					csvDelay: 1
+				});
+			} else {
+				// Non-anchor (static_remotekey): plain P2WPKH, claimable immediately.
+				const paymentPubkey = state.localBasepoints.paymentBasepoint;
+				const claimTx = buildToRemoteClaimTx({
+					commitmentTxid: output.txid,
+					outputIndex: output.outputIndex,
+					amount: output.amount,
+					destinationScript,
+					feeSatoshis
+				});
+				const sig = signP2wpkhInput(
+					claimTx,
+					0,
+					paymentPubkey,
+					Number(output.amount),
+					paymentPrivkey
+				);
+				const witness = buildToRemoteWitness(sig, paymentPubkey);
+				resolved.push({
+					trackedOutput: output,
+					spendTx: claimTx,
+					witness
+				});
+			}
+		}
+	}
+
+	// H2: include HTLC outputs that were in this (revoked) commitment but have
+	// since settled and left state.htlcs — classifyOutputs only matches live
+	// HTLCs, so without the snapshot those outputs go unpenalized and the cheater
+	// reclaims them after their CLTV/CSV. Reconstruct each snapshot HTLC's script
+	// (using this commitment's keys) and add any matching, not-yet-claimed output.
+	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
+	if (snapshot && snapshot.length > 0) {
+		const useAnchors = isAnchorChannel(state.channelType);
+		const htlcRevocationPubkey = deriveRevocationPubkey(
+			state.localBasepoints.revocationBasepoint,
+			perCommitmentPoint
+		);
+		const theirHtlcPubkey = derivePublicKey(
+			state.remoteBasepoints.htlcBasepoint,
+			perCommitmentPoint
+		);
+		const ourHtlcPubkey = derivePublicKey(
+			state.localBasepoints.htlcBasepoint,
+			perCommitmentPoint
+		);
+		for (const entry of snapshot) {
+			// On their commitment: our offered HTLC uses the received-HTLC script,
+			// our received HTLC uses the offered-HTLC script (perspective swap).
+			const script =
+				entry.direction === HtlcDirection.OFFERED
+					? buildReceivedHtlcScript(
+							htlcRevocationPubkey,
+							theirHtlcPubkey,
+							ourHtlcPubkey,
+							entry.paymentHash,
+							entry.cltvExpiry,
+							useAnchors
+					  )
+					: buildOfferedHtlcScript(
+							htlcRevocationPubkey,
+							theirHtlcPubkey,
+							ourHtlcPubkey,
+							entry.paymentHash,
+							useAnchors
+					  );
+			const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
+			if (!p2wsh.output) continue;
+			for (let i = 0; i < revokedTx.outs.length; i++) {
+				if (
+					!claimableIndices.includes(i) &&
+					revokedTx.outs[i].script.equals(p2wsh.output)
+				) {
+					claimableIndices.push(i);
+					witnessScripts.set(i, script);
+					break;
+				}
+			}
 		}
 	}
 
@@ -1106,21 +1265,34 @@ export function resolveRevokedCommitmentOutputs(
 		const outputIdx = claimableIndices[i];
 		const ws = witnessScripts.get(outputIdx)!;
 		const value = revokedTx.outs[outputIdx].value;
-		const output = trackedOutputs.find((o) => o.outputIndex === outputIdx)!;
+		// May be undefined for an HTLC output reconstructed from the snapshot
+		// (it was not in the live classification because the HTLC had settled).
+		const output = trackedOutputs.find((o) => o.outputIndex === outputIdx);
 
 		const sig = signPenaltyInput(penaltyTx, i, ws, value, revocationPrivkey);
 
 		let witness: Buffer[];
-		if (output.outputType === OutputType.TO_LOCAL) {
+		if (output?.outputType === OutputType.TO_LOCAL) {
 			witness = buildToLocalPenaltyWitness(sig, ws);
 		} else {
+			// Both tracked HTLC outputs and snapshot-reconstructed ones use the
+			// HTLC revocation (penalty) witness.
 			witness = buildHtlcPenaltyWitness(sig, revocationPubkey, ws);
 		}
 
 		penaltyTx.setWitness(i, witness);
 
 		resolved.push({
-			trackedOutput: output,
+			trackedOutput:
+				output ?? {
+					txid: revokedTx.getId(),
+					outputIndex: outputIdx,
+					amount: BigInt(value),
+					outputType: OutputType.OFFERED_HTLC,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight: 0,
+					witnessScript: ws
+				},
 			spendTx: penaltyTx,
 			witness
 		});

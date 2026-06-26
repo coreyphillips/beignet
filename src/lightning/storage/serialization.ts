@@ -13,6 +13,7 @@ import {
 	ChannelRole,
 	IChannelConfig,
 	IHtlcEntry,
+	IHtlcSnapshotEntry,
 	HtlcDirection,
 	HtlcState,
 	DEFAULT_CHANNEL_CONFIG
@@ -129,6 +130,16 @@ export interface ISerializedHtlcEntry {
 	state: string;
 }
 
+export interface ISerializedHtlcSnapshot {
+	commitmentNumber: string;
+	htlcs: Array<{
+		paymentHash: string;
+		amountMsat: string;
+		cltvExpiry: number;
+		direction: string;
+	}>;
+}
+
 export function serializeHtlcEntry(
 	key: string,
 	e: IHtlcEntry
@@ -221,6 +232,8 @@ export interface ISerializedChannelState {
 	remoteNextPerCommitmentPoint: string | null;
 	localHtlcCounter: string;
 	htlcs: ISerializedHtlcEntry[];
+	/** Per-remote-commitment HTLC snapshots for penalty completeness (H2). */
+	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
 	channelType: string | null;
@@ -346,6 +359,22 @@ export function serializeChannelState(
 		htlcs.push(serializeHtlcEntry(key, entry));
 	}
 
+	let revokedHtlcSnapshots: ISerializedHtlcSnapshot[] | undefined;
+	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.size > 0) {
+		revokedHtlcSnapshots = [];
+		for (const [commitmentNumber, entries] of s.revokedHtlcSnapshots) {
+			revokedHtlcSnapshots.push({
+				commitmentNumber,
+				htlcs: entries.map((e) => ({
+					paymentHash: e.paymentHash.toString('hex'),
+					amountMsat: bigintToStr(e.amountMsat),
+					cltvExpiry: e.cltvExpiry,
+					direction: e.direction
+				}))
+			});
+		}
+	}
+
 	return {
 		channelId: bufToHex(s.channelId),
 		temporaryChannelId: s.temporaryChannelId.toString('hex'),
@@ -375,6 +404,7 @@ export function serializeChannelState(
 		remoteNextPerCommitmentPoint: bufToHex(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: bigintToStr(s.localHtlcCounter),
 		htlcs,
+		revokedHtlcSnapshots,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
 		channelType: bufToHex(s.channelType),
@@ -439,6 +469,24 @@ export function deserializeChannelState(
 		htlcs.set(key, entry);
 	}
 
+	let revokedHtlcSnapshots:
+		| Map<string, IHtlcSnapshotEntry[]>
+		| undefined;
+	if (s.revokedHtlcSnapshots && s.revokedHtlcSnapshots.length > 0) {
+		revokedHtlcSnapshots = new Map();
+		for (const snap of s.revokedHtlcSnapshots) {
+			revokedHtlcSnapshots.set(
+				snap.commitmentNumber,
+				snap.htlcs.map((e) => ({
+					paymentHash: Buffer.from(e.paymentHash, 'hex'),
+					amountMsat: strToBigint(e.amountMsat),
+					cltvExpiry: e.cltvExpiry,
+					direction: e.direction as HtlcDirection
+				}))
+			);
+		}
+	}
+
 	return {
 		channelId: hexToBuf(s.channelId),
 		temporaryChannelId: Buffer.from(s.temporaryChannelId, 'hex'),
@@ -470,6 +518,7 @@ export function deserializeChannelState(
 		remoteNextPerCommitmentPoint: hexToBuf(s.remoteNextPerCommitmentPoint),
 		localHtlcCounter: strToBigint(s.localHtlcCounter),
 		htlcs,
+		revokedHtlcSnapshots,
 		remoteCommitmentSignature: hexToBuf(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
 			Buffer.from(h, 'hex')

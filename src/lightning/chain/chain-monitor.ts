@@ -922,12 +922,96 @@ export class ChainMonitor {
 		return actions;
 	}
 
+	/**
+	 * Re-resolve a single tracked output at a higher feerate and return the
+	 * fee-bumped, fully-signed sweep transaction (or null if it can't be rebuilt).
+	 * Handles the REBUILD_SWEEP action: without it, a sweep first broadcast at a
+	 * fee too low to confirm would never be bumped — most dangerous for a penalty
+	 * (justice) tx that must confirm before the cheater's to_self_delay matures.
+	 */
+	rebuildSweep(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number
+	): bitcoin.Transaction | null {
+		if (!this._commitmentBroadcast) return null;
+		let resolved: ReturnType<typeof resolveOurCommitmentOutputs> = [];
+		try {
+			switch (this._commitmentBroadcast.commitmentType) {
+				case CommitmentType.OUR_COMMITMENT:
+					resolved = resolveOurCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._commitmentBroadcast.commitmentNumber,
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._knownPreimages,
+						this._delayedPaymentBasepointSecret,
+						this._htlcBasepointSecret,
+						this._channelState.remoteHtlcSignatures
+					);
+					break;
+				case CommitmentType.THEIR_CURRENT_COMMITMENT:
+					resolved = resolveTheirCurrentCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._knownPreimages,
+						this._paymentPrivkey,
+						this._htlcBasepointSecret,
+						this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+					);
+					break;
+				case CommitmentType.THEIR_REVOKED_COMMITMENT: {
+					if (!this._commitmentBroadcast.revokedTxHex) return null;
+					const revokedTx = bitcoin.Transaction.fromHex(
+						this._commitmentBroadcast.revokedTxHex
+					);
+					resolved = resolveRevokedCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._commitmentBroadcast.commitmentNumber,
+						revokedTx,
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._revocationBasepointSecret,
+						this._paymentPrivkey,
+						this._network
+					);
+					break;
+				}
+				default:
+					return null;
+			}
+		} catch {
+			return null;
+		}
+
+		for (const r of resolved) {
+			if (r.spendTx && r.witness) {
+				r.spendTx.setWitness(0, r.witness);
+				return r.spendTx;
+			}
+			// Penalty txs come back with witnesses already set.
+			if (r.spendTx) return r.spendTx;
+		}
+		return null;
+	}
+
 	private _handleRevokedCommitment(
 		actions: ChainAction[],
 		revokedTx: bitcoin.Transaction,
 		commitmentNumber: bigint
 	): ChainAction[] {
 		this._state = MonitorState.RESOLVING;
+
+		// Retain the raw revoked tx so a stuck penalty sweep can be re-resolved
+		// and fee-bumped later (rebuildSweep / REBUILD_SWEEP handling).
+		if (this._commitmentBroadcast) {
+			this._commitmentBroadcast.revokedTxHex = revokedTx
+				.toBuffer()
+				.toString('hex');
+		}
 
 		const resolved = resolveRevokedCommitmentOutputs(
 			this._channelState,
@@ -937,6 +1021,7 @@ export class ChainMonitor {
 			this._destinationScript,
 			this._feeRatePerVbyte,
 			this._revocationBasepointSecret,
+			this._paymentPrivkey,
 			this._network
 		);
 

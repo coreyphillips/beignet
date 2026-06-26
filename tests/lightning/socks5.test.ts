@@ -111,6 +111,12 @@ describe('SOCKS5 Proxy Support', function () {
 
 	describe('PeerManager with socks5Proxy', function () {
 		it('Should use explicit socks5Proxy for all connections', async function () {
+			// Fail fast and deterministically: this connects to a (normally absent)
+			// proxy on 127.0.0.1:9050. If that port is occupied/filtered in the
+			// environment, the SOCKS negotiation would otherwise hang past mocha's
+			// default 2s timeout. A short socks5TimeoutMs + generous test timeout
+			// makes the outcome (an error) deterministic regardless of the host.
+			this.timeout(5000);
 			const localKey = crypto.randomBytes(32);
 			const remoteKey = crypto.randomBytes(32);
 			const remotePub = getPublicKey(remoteKey);
@@ -118,7 +124,8 @@ describe('SOCKS5 Proxy Support', function () {
 
 			const pm = new PeerManager({
 				localPrivateKey: localKey,
-				socks5Proxy: { host: '127.0.0.1', port: 9050 }
+				socks5Proxy: { host: '127.0.0.1', port: 9050 },
+				socks5TimeoutMs: 500
 			});
 
 			// connectPeer will fail because there's no actual SOCKS5 proxy,
@@ -135,14 +142,17 @@ describe('SOCKS5 Proxy Support', function () {
 		});
 
 		it('Should auto-detect .onion and route through default Tor proxy', async function () {
+			this.timeout(5000);
 			const localKey = crypto.randomBytes(32);
 			const remoteKey = crypto.randomBytes(32);
 			const remotePub = getPublicKey(remoteKey);
 			const remotePubHex = remotePub.toString('hex');
 
 			const pm = new PeerManager({
-				localPrivateKey: localKey
-				// no socks5Proxy — should auto-detect .onion
+				localPrivateKey: localKey,
+				// no socks5Proxy — should auto-detect .onion → default Tor proxy.
+				// Short timeout so the (absent) proxy attempt fails fast.
+				socks5TimeoutMs: 500
 			});
 
 			try {
@@ -160,6 +170,7 @@ describe('SOCKS5 Proxy Support', function () {
 		});
 
 		it('Should use direct TCP for non-.onion when no socks5Proxy', async function () {
+			this.timeout(5000);
 			const localKey = crypto.randomBytes(32);
 			const remoteKey = crypto.randomBytes(32);
 			const remotePub = getPublicKey(remoteKey);

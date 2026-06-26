@@ -16,6 +16,7 @@
     "test:derivation": "yarn build && env mocha --exit -r ts-node/register 'tests/derivation.test.ts'",
     "test:transaction": "yarn build && env mocha --exit -r ts-node/register 'tests/transaction.test.ts'",
     "test:lightning": "npx mocha --exit -r ts-node/register --ignore 'tests/lightning/interop/**' 'tests/lightning/**/*.test.ts'",
+    "test:conformance": "npx mocha --exit -r ts-node/register 'tests/lightning/conformance/**/*.test.ts'",
     "test:interop": "npx mocha --exit --timeout 120000 -r ts-node/register 'tests/lightning/interop/**/*.test.ts'",
     "example": "ts-node example",
     "beignet": "ts-node src/cli/cli.ts",

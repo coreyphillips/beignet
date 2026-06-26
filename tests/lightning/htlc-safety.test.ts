@@ -396,3 +396,63 @@ describe('HTLC Safety & Forwarding Enforcement (Phase 3)', function () {
 		});
 	});
 });
+
+describe('Security audit fixes — adversarial counterparty', function () {
+	it('C1: rejects update_fulfill_htlc with a preimage that does not hash to the payment_hash', function () {
+		const { opener, htlcId } = setupChannelWithHtlc(500);
+
+		// Counterparty tries to settle our offered HTLC with 32 bytes of garbage
+		// instead of the real preimage. The offered HTLC's payment_hash is random,
+		// so the bogus preimage cannot match — must be rejected, not credited.
+		const result = opener.handleUpdateFulfillHtlc({
+			channelId: opener.getChannelId()!,
+			id: htlcId,
+			paymentPreimage: crypto.randomBytes(32)
+		});
+
+		const err = findErrorAction(result);
+		expect(err, 'bogus preimage must be rejected').to.not.be.null;
+		expect(err).to.match(/preimage/i);
+		expect(
+			opener.getFullState().htlcs.get(`offered-${htlcId}`)?.state
+		).to.not.equal(HtlcState.FULFILLED);
+	});
+
+	it('C1: accepts update_fulfill_htlc with the correct preimage', function () {
+		const { opener, htlcId } = setupChannelWithHtlc(500);
+		// Overwrite the offered HTLC's hash with one whose preimage we know, so we
+		// can exercise the success branch.
+		const preimage = crypto.randomBytes(32);
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		opener.getFullState().htlcs.get(`offered-${htlcId}`)!.paymentHash =
+			paymentHash;
+
+		const result = opener.handleUpdateFulfillHtlc({
+			channelId: opener.getChannelId()!,
+			id: htlcId,
+			paymentPreimage: preimage
+		});
+
+		expect(findErrorAction(result), 'valid preimage must be accepted').to.be
+			.null;
+		expect(
+			opener.getFullState().htlcs.get(`offered-${htlcId}`)?.state
+		).to.equal(HtlcState.FULFILLED);
+	});
+
+	it('C2: rejects revoke_and_ack whose secret does not derive the committed per-commitment point', function () {
+		const { acceptor } = setupChannelWithHtlc(500);
+
+		// A revoked-secret reveal whose pubkey != the committed point would let a
+		// cheater "revoke" a state we could never actually penalize.
+		const result = acceptor.handleRevokeAndAck({
+			channelId: acceptor.getChannelId()!,
+			perCommitmentSecret: crypto.randomBytes(32),
+			nextPerCommitmentPoint: crypto.randomBytes(33)
+		});
+
+		const err = findErrorAction(result);
+		expect(err, 'mismatched revocation secret must be rejected').to.not.be.null;
+		expect(err).to.match(/per-commitment point/i);
+	});
+});

@@ -19,8 +19,7 @@ import {
 	calculateObscuredCommitmentNumber,
 	ICommitmentTxParams,
 	ICommitmentTxResult,
-	IHtlcOutput,
-	DUST_LIMIT_P2WSH
+	IHtlcOutput
 } from '../script/commitment';
 import { createFundingScript } from '../script/funding';
 import {
@@ -73,6 +72,34 @@ export function calculateCommitmentFee(
 		: COMMITMENT_TX_BASE_WEIGHT;
 	const weight = baseWeight + COMMITMENT_TX_HTLC_WEIGHT * numUntrimmedHtlcs;
 	return BigInt(Math.floor((weight * feeratePerKw) / 1000));
+}
+
+/**
+ * BOLT 3 HTLC trimming: an HTLC is trimmed (no on-chain output) when its amount
+ * is below the holder's dust_limit PLUS the fee its second-level (timeout for
+ * offered, success for received) transaction would cost at the commitment
+ * feerate. Anchor (zero-fee-HTLC) channels have a 0 second-level fee, so the
+ * threshold is just the dust limit. Returns the HTLCs that survive trimming —
+ * used for BOTH the commitment outputs and the num_untrimmed_htlcs fee count so
+ * the two never diverge (a divergence builds a commitment the peer rejects).
+ */
+function filterUntrimmedHtlcs<T extends { amount: bigint; direction: HtlcDirection }>(
+	htlcOutputs: T[],
+	dustLimitSat: bigint,
+	feeratePerKw: number,
+	isAnchor: boolean
+): T[] {
+	return htlcOutputs.filter((h) => {
+		let htlcFeeSat = 0n;
+		if (!isAnchor) {
+			const weight =
+				h.direction === HtlcDirection.OFFERED
+					? HTLC_TIMEOUT_WEIGHT
+					: HTLC_SUCCESS_WEIGHT;
+			htlcFeeSat = BigInt(Math.floor((weight * feeratePerKw) / 1000));
+		}
+		return h.amount >= dustLimitSat + htlcFeeSat;
+	});
 }
 
 /**
@@ -225,17 +252,22 @@ export function buildLocalCommitment(
 		commitNum
 	);
 
-	// Build HTLC outputs
-	const htlcOutputs = buildHtlcOutputsForLocal(state, keys);
-
 	// Detect anchor channel
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	// Calculate commitment fee (BOLT 3): opener pays the fee
 	const feeratePerKw = getCommitmentFeeRate(state);
-	const numUntrimmedHtlcs = htlcOutputs.filter(
-		(h) => h.amount >= BigInt(DUST_LIMIT_P2WSH)
-	).length;
+
+	// Build HTLC outputs, then trim per BOLT 3 (dust_limit + second-level fee).
+	// The SAME trimmed set feeds both the commitment outputs and the
+	// num_untrimmed_htlcs fee count so they can never diverge.
+	const htlcOutputs = filterUntrimmedHtlcs(
+		buildHtlcOutputsForLocal(state, keys),
+		state.localConfig.dustLimitSatoshis,
+		feeratePerKw,
+		useAnchors
+	);
+	const numUntrimmedHtlcs = htlcOutputs.length;
 	const fee = calculateCommitmentFee(
 		feeratePerKw,
 		numUntrimmedHtlcs,
@@ -301,6 +333,9 @@ export function buildLocalCommitment(
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
 		htlcOutputs,
+		// Our local commitment is trimmed with OUR negotiated dust_limit_satoshis
+		// (we are the holder who would broadcast it).
+		dustLimitSatoshis: state.localConfig.dustLimitSatoshis,
 		useAnchors,
 		localFundingPubkey: useAnchors
 			? state.localBasepoints.fundingPubkey
@@ -359,17 +394,22 @@ export function buildRemoteCommitment(
 		commitNum
 	);
 
-	// Build HTLC outputs (swapped perspective)
-	const htlcOutputs = buildHtlcOutputsForRemote(state, keys);
-
 	// Detect anchor channel
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	// Calculate commitment fee (BOLT 3): opener pays the fee
 	const feeratePerKw = getCommitmentFeeRate(state);
-	const numUntrimmedHtlcs = htlcOutputs.filter(
-		(h) => h.amount >= BigInt(DUST_LIMIT_P2WSH)
-	).length;
+
+	// Build HTLC outputs (swapped perspective), then trim per BOLT 3 against the
+	// REMOTE holder's dust limit + second-level fee — same trimmed set for outputs
+	// and the fee count (see buildLocalCommitment).
+	const htlcOutputs = filterUntrimmedHtlcs(
+		buildHtlcOutputsForRemote(state, keys),
+		state.remoteConfig.dustLimitSatoshis,
+		feeratePerKw,
+		useAnchors
+	);
+	const numUntrimmedHtlcs = htlcOutputs.length;
 	const fee = calculateCommitmentFee(
 		feeratePerKw,
 		numUntrimmedHtlcs,
@@ -438,6 +478,9 @@ export function buildRemoteCommitment(
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
 		htlcOutputs,
+		// The remote commitment is trimmed with THEIR negotiated
+		// dust_limit_satoshis (they are the holder who would broadcast it).
+		dustLimitSatoshis: state.remoteConfig.dustLimitSatoshis,
 		useAnchors,
 		localFundingPubkey: useAnchors
 			? state.remoteBasepoints.fundingPubkey

@@ -55,9 +55,14 @@ export function decode(invoiceString: string): IInvoice {
 	// Tagged fields are between timestamp and signature
 	const taggedWords = Array.from(words.slice(TIMESTAMP_WORDS, sigStart));
 
-	// Verify signature and recover pubkey
+	// Verify signature and recover pubkey. BOLT 11: an invoice whose signature
+	// does not recover to a public key is invalid and MUST be rejected — do not
+	// return a half-parsed invoice with no recoverable payee.
 	const dataWords = Array.from(words.slice(0, sigStart));
 	const recoveredPubkey = verifyInvoice(prefix, dataWords, signature);
+	if (!recoveredPubkey) {
+		throw new Error('Invoice signature is not recoverable');
+	}
 
 	// Parse tagged fields
 	const result: Partial<IInvoice> = {};

@@ -113,6 +113,13 @@ export interface ICommitmentTxParams {
 	/** Fee rate in satoshis per kilo-weight (for weight calculation reference) */
 	feeRatePerKw?: bigint;
 
+	/**
+	 * The commitment holder's negotiated dust_limit_satoshis. Outputs below this
+	 * are trimmed (BOLT 3). When omitted, falls back to the legacy P2WSH/P2WPKH
+	 * standardness constants for backward compatibility.
+	 */
+	dustLimitSatoshis?: bigint;
+
 	/** Enable anchor outputs (BOLT 3 option_anchors) */
 	useAnchors?: boolean;
 	/** Local funding pubkey (for local anchor output, required when useAnchors=true) */
@@ -166,6 +173,12 @@ export function buildCommitmentTx(
 		remoteFundingPubkey
 	} = params;
 
+	// BOLT 3: trim outputs below the holder's negotiated dust_limit_satoshis.
+	// When the negotiated limit isn't supplied, fall back to the legacy
+	// standardness constants so existing callers are unaffected.
+	const dustWsh = params.dustLimitSatoshis ?? BigInt(DUST_LIMIT_P2WSH);
+	const dustWpkh = params.dustLimitSatoshis ?? BigInt(DUST_LIMIT_P2WPKH);
+
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 
@@ -199,7 +212,7 @@ export function buildCommitmentTx(
 
 	// to_local output (if above dust)
 	let toLocalScript: Buffer | undefined;
-	if (localAmount >= BigInt(DUST_LIMIT_P2WSH)) {
+	if (localAmount >= dustWsh) {
 		toLocalScript = buildToLocalScript(
 			revocationPubkey,
 			localDelayedPubkey,
@@ -218,7 +231,7 @@ export function buildCommitmentTx(
 	let toRemoteScript: Buffer | undefined;
 	if (useAnchors) {
 		// Anchor mode: to_remote is P2WSH with 1-block CSV delay
-		if (remoteAmount >= BigInt(DUST_LIMIT_P2WSH)) {
+		if (remoteAmount >= dustWsh) {
 			const { script, witnessScript } =
 				buildToRemoteAnchorOutput(remotePaymentPubkey);
 			toRemoteScript = witnessScript;
@@ -231,7 +244,7 @@ export function buildCommitmentTx(
 		}
 	} else {
 		// Non-anchor: to_remote is plain P2WPKH
-		if (remoteAmount >= BigInt(DUST_LIMIT_P2WPKH)) {
+		if (remoteAmount >= dustWpkh) {
 			const p2wpkh = bitcoin.payments.p2wpkh({ pubkey: remotePaymentPubkey });
 			outputs.push({
 				script: p2wpkh.output!,
@@ -246,7 +259,7 @@ export function buildCommitmentTx(
 	if (htlcOutputs) {
 		for (let i = 0; i < htlcOutputs.length; i++) {
 			const htlc = htlcOutputs[i];
-			if (htlc.amount >= BigInt(DUST_LIMIT_P2WSH)) {
+			if (htlc.amount >= dustWsh) {
 				const p2wsh = bitcoin.payments.p2wsh({
 					redeem: { output: htlc.script }
 				});

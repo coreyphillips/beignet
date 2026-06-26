@@ -335,6 +335,58 @@ export function buildRemoteHtlcPreimageWitness(
 	return [signature, preimage, witnessScript];
 }
 
+// ─────────────── Remote HTLC Timeout Claim ───────────────
+
+/**
+ * Build a transaction to reclaim OUR offered HTLC from the remote's commitment
+ * after its CLTV expiry. On the remote's commitment our offered HTLC uses the
+ * received-HTLC script; the timeout path (taken when the success element is not
+ * a 32-byte preimage) is a single signature by the offerer (us). The claim must
+ * set nLockTime = cltv_expiry and the input nSequence must NOT be 0xffffffff so
+ * OP_CHECKLOCKTIMEVERIFY is enforced. Anchor channels add a 1-block CSV, so the
+ * caller passes inputSequence = 1; non-anchor uses 0xfffffffd.
+ */
+export function buildRemoteHtlcTimeoutClaimTx(
+	params: IRemoteHtlcPreimageClaimParams & { cltvExpiry: number }
+): bitcoin.Transaction {
+	const {
+		commitmentTxid,
+		outputIndex,
+		amount,
+		destinationScript,
+		feeSatoshis,
+		cltvExpiry,
+		inputSequence = 0xfffffffd
+	} = params;
+
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.locktime = cltvExpiry;
+
+	const txidBuf = Buffer.from(commitmentTxid, 'hex').reverse();
+	tx.addInput(txidBuf, outputIndex, inputSequence);
+
+	const outputAmount = amount - feeSatoshis;
+	if (outputAmount <= 0n) {
+		throw new Error('Fee exceeds available value for HTLC timeout claim');
+	}
+	tx.addOutput(destinationScript, Number(outputAmount));
+
+	return tx;
+}
+
+/**
+ * Witness for the received-HTLC script timeout path: a single offerer signature,
+ * then an empty element so `OP_SIZE 32 OP_EQUAL` is false and the timeout branch
+ * is selected: [signature, <empty>, witnessScript].
+ */
+export function buildRemoteHtlcTimeoutWitness(
+	signature: Buffer,
+	witnessScript: Buffer
+): Buffer[] {
+	return [signature, Buffer.alloc(0), witnessScript];
+}
+
 // ─────────────── Generic Signing ───────────────
 
 /**

@@ -39,6 +39,9 @@ export interface IPeerManagerOptions {
 	/** SOCKS5 proxy for ALL outbound connections (e.g. Tor on 127.0.0.1:9050).
 	 *  When not set, .onion addresses auto-route through 127.0.0.1:9050. */
 	socks5Proxy?: { host: string; port: number };
+	/** SOCKS5 connect/negotiation timeout in ms (default 20000). Lower it when a
+	 *  fast failure is preferable to waiting out a stalled/filtered proxy. */
+	socks5TimeoutMs?: number;
 	/** Maximum number of inbound peer connections (default 125) */
 	maxInboundPeers?: number;
 }
@@ -72,6 +75,7 @@ export class PeerManager extends EventEmitter {
 	private maxReconnectDelay: number;
 	private server: net.Server | null = null;
 	private socks5Proxy?: { host: string; port: number };
+	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
@@ -85,6 +89,7 @@ export class PeerManager extends EventEmitter {
 		this.maxReconnectDelay =
 			options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY_MS;
 		this.socks5Proxy = options.socks5Proxy;
+		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 	}
 
@@ -400,8 +405,9 @@ export class PeerManager extends EventEmitter {
 				destination: { host, port },
 				// Tor circuit establishment can hang for minutes; without this the
 				// SOCKS negotiation has no deadline of its own (SocksClient destroys
-				// its socket on timeout, so nothing leaks).
-				timeout: 20_000
+				// its socket on timeout, so nothing leaks). Configurable so callers
+				// (and tests) can fail fast instead of waiting out a stalled proxy.
+				timeout: this.socks5TimeoutMs
 			});
 			return socket;
 		};

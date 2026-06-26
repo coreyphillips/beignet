@@ -1103,6 +1103,12 @@ describe('Production Hardening 11', function () {
 				connectNodes(node, bob);
 				const channelId = openReadyChannel(node, bob);
 
+				// openReadyChannel drives the channel to NORMAL, whose channel:ready
+				// handler calls emitReady() and schedules a node:ready on nextTick.
+				// Let that settle so it doesn't leak into the wait below; then we
+				// revert to a genuinely not-ready state to exercise the timeout.
+				await new Promise((r) => setImmediate(r));
+
 				const cm = (node as any).channelManager as ChannelManager;
 				const ch = cm.getChannel(channelId);
 				if (ch) ch.getFullState().state = ChannelState.AWAITING_REESTABLISH;
