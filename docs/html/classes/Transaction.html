@@ -20,7 +20,7 @@
 <ul class="tsd-hierarchy">
 <li><span class="target">Transaction</span></li></ul></section><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L45">transaction/index.ts:45</a></li></ul></aside>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L48">transaction/index.ts:48</a></li></ul></aside>
 <section class="tsd-panel-group tsd-index-group">
 <section class="tsd-panel tsd-index-panel">
 <details class="tsd-index-content tsd-index-accordion" open><summary class="tsd-accordion-summary tsd-index-summary">
@@ -44,6 +44,8 @@
 <div class="tsd-index-list"><a href="Transaction.html#addExternalInputs" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><g id="icon-2048"><rect fill="var(--color-icon-background)" stroke="#FF4DB8" stroke-width="1.5" x="1" y="1" width="22" height="22" rx="12"></rect><path d="M9.162 16V7.24H10.578L11.514 10.072C11.602 10.328 11.674 10.584 11.73 10.84C11.794 11.088 11.842 11.28 11.874 11.416C11.906 11.28 11.954 11.088 12.018 10.84C12.082 10.584 12.154 10.324 12.234 10.06L13.122 7.24H14.538V16H13.482V12.82C13.482 12.468 13.49 12.068 13.506 11.62C13.53 11.172 13.558 10.716 13.59 10.252C13.622 9.78 13.654 9.332 13.686 8.908C13.726 8.476 13.762 8.1 13.794 7.78L12.366 12.16H11.334L9.894 7.78C9.934 8.092 9.97 8.456 10.002 8.872C10.042 9.28 10.078 9.716 10.11 10.18C10.142 10.636 10.166 11.092 10.182 11.548C10.206 12.004 10.218 12.428 10.218 12.82V16H9.162Z" fill="var(--color-text)"></path></g></svg><span>add<wbr/>External<wbr/>Inputs</span></a>
 <a href="Transaction.html#addInput" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>add<wbr/>Input</span></a>
 <a href="Transaction.html#addOutput" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>add<wbr/>Output</span></a>
+<a href="Transaction.html#applyAutoCoinSelect" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>apply<wbr/>Auto<wbr/>Coin<wbr/>Select</span></a>
+<a href="Transaction.html#autoCoinSelect" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>auto<wbr/>Coin<wbr/>Select</span></a>
 <a href="Transaction.html#createPsbtFromTransactionData" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>create<wbr/>Psbt<wbr/>From<wbr/>Transaction<wbr/>Data</span></a>
 <a href="Transaction.html#createTransaction" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>create<wbr/>Transaction</span></a>
 <a href="Transaction.html#estimateTransactionCosts" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>estimate<wbr/>Transaction<wbr/>Costs</span></a>
@@ -57,6 +59,7 @@
 <a href="Transaction.html#resetSendTransaction" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>reset<wbr/>Send<wbr/>Transaction</span></a>
 <a href="Transaction.html#sendMax" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>send<wbr/>Max</span></a>
 <a href="Transaction.html#setupCpfp" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Cpfp</span></a>
+<a href="Transaction.html#setupRbf" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Rbf</span></a>
 <a href="Transaction.html#setupTransaction" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Transaction</span></a>
 <a href="Transaction.html#signPsbt" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>sign<wbr/>Psbt</span></a>
 <a href="Transaction.html#updateFee" class="tsd-index-link"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>update<wbr/>Fee</span></a>
@@ -79,19 +82,19 @@
 <h5><span class="tsd-kind-property">wallet</span><span class="tsd-signature-symbol">: </span><a href="Wallet.html" class="tsd-signature-type tsd-kind-class">Wallet</a></h5></li></ul></li></ul></div>
 <h4 class="tsd-returns-title">Returns <a href="Transaction.html" class="tsd-signature-type tsd-kind-class">Transaction</a></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L49">transaction/index.ts:49</a></li></ul></aside></li></ul></section></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L52">transaction/index.ts:52</a></li></ul></aside></li></ul></section></section>
 <section class="tsd-panel-group tsd-member-group">
 <h2>Properties</h2>
 <section class="tsd-panel tsd-member tsd-is-private"><a id="_data" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><code class="tsd-tag ts-flagPrivate">Private</code> <span>_data</span><a href="#_data" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">_data</span><span class="tsd-signature-symbol">:</span> <a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L46">transaction/index.ts:46</a></li></ul></aside></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L49">transaction/index.ts:49</a></li></ul></aside></section>
 <section class="tsd-panel tsd-member tsd-is-private"><a id="_wallet" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><code class="tsd-tag ts-flagPrivate">Private</code> <code class="tsd-tag ts-flagReadonly">Readonly</code> <span>_wallet</span><a href="#_wallet" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <div class="tsd-signature"><span class="tsd-kind-property">_wallet</span><span class="tsd-signature-symbol">:</span> <a href="Wallet.html" class="tsd-signature-type tsd-kind-class">Wallet</a></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L47">transaction/index.ts:47</a></li></ul></aside></section></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L50">transaction/index.ts:50</a></li></ul></aside></section></section>
 <section class="tsd-panel-group tsd-member-group">
 <h2>Accessors</h2>
 <section class="tsd-panel tsd-member"><a id="data" class="tsd-anchor"></a>
@@ -101,7 +104,7 @@
 <li class="tsd-description">
 <h4 class="tsd-returns-title">Returns <a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L54">transaction/index.ts:54</a></li></ul></aside></li></ul></section></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L57">transaction/index.ts:57</a></li></ul></aside></li></ul></section></section>
 <section class="tsd-panel-group tsd-member-group">
 <h2>Methods</h2>
 <section class="tsd-panel tsd-member"><a id="addExternalInputs" class="tsd-anchor"></a>
@@ -124,7 +127,7 @@
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/IUtxo.html" class="tsd-signature-type tsd-kind-interface">IUtxo</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L772">transaction/index.ts:772</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L859">transaction/index.ts:859</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="addInput" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>add<wbr/>Input</span><a href="#addInput" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -137,7 +140,7 @@
 <h5><span class="tsd-kind-parameter">__namedParameters</span>: <a href="../interfaces/IAddInput.html" class="tsd-signature-type tsd-kind-interface">IAddInput</a></h5></li></ul></div>
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L659">transaction/index.ts:659</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L746">transaction/index.ts:746</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="addOutput" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>add<wbr/>Output</span><a href="#addOutput" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -153,7 +156,52 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L821">transaction/index.ts:821</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L908">transaction/index.ts:908</a></li></ul></aside></li></ul></section>
+<section class="tsd-panel tsd-member"><a id="applyAutoCoinSelect" class="tsd-anchor"></a>
+<h3 class="tsd-anchor-link"><span>apply<wbr/>Auto<wbr/>Coin<wbr/>Select</span><a href="#applyAutoCoinSelect" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="tsd-signature tsd-anchor-link" id="applyAutoCoinSelect.applyAutoCoinSelect-1"><span class="tsd-kind-call-signature">apply<wbr/>Auto<wbr/>Coin<wbr/>Select</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">__namedParameters</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><a href="#applyAutoCoinSelect.applyAutoCoinSelect-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></li>
+<li class="tsd-description">
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li>
+<h5><span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">coinSelectRes</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/ICoinSelectResponse.html" class="tsd-signature-type tsd-kind-interface">ICoinSelectResponse</a><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span></h5>
+<ul class="tsd-parameters">
+<li class="tsd-parameter">
+<h5><span class="tsd-kind-property">coin<wbr/>Select<wbr/>Res</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/ICoinSelectResponse.html" class="tsd-signature-type tsd-kind-interface">ICoinSelectResponse</a></h5></li></ul></li></ul></div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L180">transaction/index.ts:180</a></li></ul></aside></li></ul></section>
+<section class="tsd-panel tsd-member"><a id="autoCoinSelect" class="tsd-anchor"></a>
+<h3 class="tsd-anchor-link"><span>auto<wbr/>Coin<wbr/>Select</span><a href="#autoCoinSelect" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="tsd-signature tsd-anchor-link" id="autoCoinSelect.autoCoinSelect-1"><span class="tsd-kind-call-signature">auto<wbr/>Coin<wbr/>Select</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">__namedParameters</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">: </span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ICoinSelectResponse.html" class="tsd-signature-type tsd-kind-interface">ICoinSelectResponse</a><span class="tsd-signature-symbol">&gt;</span><a href="#autoCoinSelect.autoCoinSelect-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></li>
+<li class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Selects coins for transaction construction based on provided parameters.</p>
+</div>
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li>
+<h5><span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">changeAddress</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">coinSelectPreference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">inputs</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/IUtxo.html" class="tsd-signature-type tsd-kind-interface">IUtxo</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">outputs</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/IOutput.html" class="tsd-signature-type tsd-kind-interface">IOutput</a><span class="tsd-signature-symbol">[]</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span></h5>
+<ul class="tsd-parameters">
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">change<wbr/>Address</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span></h5></li>
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">coin<wbr/>Select<wbr/>Preference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a></h5></li>
+<li class="tsd-parameter">
+<h5><span class="tsd-kind-property">inputs</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/IUtxo.html" class="tsd-signature-type tsd-kind-interface">IUtxo</a><span class="tsd-signature-symbol">[]</span></h5></li>
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span></h5></li>
+<li class="tsd-parameter">
+<h5><span class="tsd-kind-property">outputs</span><span class="tsd-signature-symbol">: </span><a href="../interfaces/IOutput.html" class="tsd-signature-type tsd-kind-interface">IOutput</a><span class="tsd-signature-symbol">[]</span></h5></li>
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">sats<wbr/>Per<wbr/>Byte</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">number</span></h5></li></ul></li></ul></div>
+<h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ICoinSelectResponse.html" class="tsd-signature-type tsd-kind-interface">ICoinSelectResponse</a><span class="tsd-signature-symbol">&gt;</span></h4>
+<div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1408">transaction/index.ts:1408</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="createPsbtFromTransactionData" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>create<wbr/>Psbt<wbr/>From<wbr/>Transaction<wbr/>Data</span><a href="#createPsbtFromTransactionData" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -176,7 +224,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type ">Psbt</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L520">transaction/index.ts:520</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L607">transaction/index.ts:607</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="createTransaction" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>create<wbr/>Transaction</span><a href="#createTransaction" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -192,7 +240,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">hex</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">id</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L379">transaction/index.ts:379</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L440">transaction/index.ts:440</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="estimateTransactionCosts" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>estimate<wbr/>Transaction<wbr/>Costs</span><a href="#estimateTransactionCosts" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -213,7 +261,7 @@
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">amount</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">fee</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1047">transaction/index.ts:1047</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1138">transaction/index.ts:1138</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getMaxSatsPerByte" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Max<wbr/>Sats<wbr/>Per<wbr/>Byte</span><a href="#getMaxSatsPerByte" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -234,7 +282,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L363">transaction/index.ts:363</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L423">transaction/index.ts:423</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getMaxSendAmount" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Max<wbr/>Send<wbr/>Amount</span><a href="#getMaxSendAmount" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -257,7 +305,7 @@
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">amount</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">fee</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1114">transaction/index.ts:1114</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1205">transaction/index.ts:1205</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getTotalFee" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Total<wbr/>Fee</span><a href="#getTotalFee" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -269,8 +317,10 @@
 <h4 class="tsd-parameters-title">Parameters</h4>
 <ul class="tsd-parameter-list">
 <li>
-<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">fundingLightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">transaction</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type ">Partial</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span></h5>
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">coinSelectPreference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">fundingLightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">transaction</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type ">Partial</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span></h5>
 <ul class="tsd-parameters">
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">coin<wbr/>Select<wbr/>Preference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a></h5></li>
 <li class="tsd-parameter">
 <h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">funding<wbr/>Lightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span></h5></li>
 <li class="tsd-parameter">
@@ -282,7 +332,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L215">transaction/index.ts:215</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L236">transaction/index.ts:236</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getTotalFeeObj" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Total<wbr/>Fee<wbr/>Obj</span><a href="#getTotalFeeObj" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -294,8 +344,10 @@
 <h4 class="tsd-parameters-title">Parameters</h4>
 <ul class="tsd-parameter-list">
 <li>
-<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">fundingLightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">transaction</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type ">Partial</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol"> = {}</span></h5>
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-parameter">__namedParameters</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">coinSelectPreference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">fundingLightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">message</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">satsPerByte</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span>    </span><span class="tsd-kind-property">transaction</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type ">Partial</span><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol"> = {}</span></h5>
 <ul class="tsd-parameters">
+<li class="tsd-parameter">
+<h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">coin<wbr/>Select<wbr/>Preference</span><span class="tsd-signature-symbol">?: </span><a href="../enums/ECoinSelectPreference.html" class="tsd-signature-type tsd-kind-enum">ECoinSelectPreference</a></h5></li>
 <li class="tsd-parameter">
 <h5><code class="tsd-tag ts-flagOptional">Optional</code> <span class="tsd-kind-property">funding<wbr/>Lightning</span><span class="tsd-signature-symbol">?: </span><span class="tsd-signature-type">boolean</span></h5></li>
 <li class="tsd-parameter">
@@ -307,7 +359,7 @@
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../types/TGetTotalFeeObj.html" class="tsd-signature-type tsd-kind-type-alias">TGetTotalFeeObj</a><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L270">transaction/index.ts:270</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L309">transaction/index.ts:309</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getTransactionInputValue" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Transaction<wbr/>Input<wbr/>Value</span><a href="#getTransactionInputValue" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -327,7 +379,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L448">transaction/index.ts:448</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L535">transaction/index.ts:535</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="getTransactionOutputValue" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>get<wbr/>Transaction<wbr/>Output<wbr/>Value</span><a href="#getTransactionOutputValue" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -347,7 +399,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type">number</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L845">transaction/index.ts:845</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L932">transaction/index.ts:932</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="removeBlackListedUtxos" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>remove<wbr/>Black<wbr/>Listed<wbr/>Utxos</span><a href="#removeBlackListedUtxos" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -364,7 +416,7 @@
 <h4 class="tsd-returns-title">Returns <a href="../interfaces/IUtxo.html" class="tsd-signature-type tsd-kind-interface">IUtxo</a><span class="tsd-signature-symbol">[]</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L191">transaction/index.ts:191</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L211">transaction/index.ts:211</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="resetSendTransaction" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>reset<wbr/>Send<wbr/>Transaction</span><a href="#resetSendTransaction" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -375,7 +427,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L181">transaction/index.ts:181</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L201">transaction/index.ts:201</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="sendMax" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>send<wbr/>Max</span><a href="#sendMax" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -402,7 +454,7 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L982">transaction/index.ts:982</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1069">transaction/index.ts:1069</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="setupCpfp" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>setup<wbr/>Cpfp</span><a href="#setupCpfp" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -423,7 +475,27 @@
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L1165">transaction/index.ts:1165</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1256">transaction/index.ts:1256</a></li></ul></aside></li></ul></section>
+<section class="tsd-panel tsd-member"><a id="setupRbf" class="tsd-anchor"></a>
+<h3 class="tsd-anchor-link"><span>setup<wbr/>Rbf</span><a href="#setupRbf" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
+<ul class="tsd-signatures">
+<li class="tsd-signature tsd-anchor-link" id="setupRbf.setupRbf-1"><span class="tsd-kind-call-signature">setup<wbr/>Rbf</span><span class="tsd-signature-symbol">(</span><span class="tsd-kind-parameter">txid</span><span class="tsd-signature-symbol">)</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span><a href="#setupRbf.setupRbf-1" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></li>
+<li class="tsd-description">
+<div class="tsd-comment tsd-typography"><p>Sets up a transaction for RBF.</p>
+</div>
+<div class="tsd-parameters">
+<h4 class="tsd-parameters-title">Parameters</h4>
+<ul class="tsd-parameter-list">
+<li>
+<h5><span class="tsd-kind-parameter">txid</span>: <span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">txid</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span></h5>
+<div class="tsd-comment tsd-typography"></div>
+<ul class="tsd-parameters">
+<li class="tsd-parameter">
+<h5><span class="tsd-kind-property">txid</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">string</span></h5></li></ul></li></ul></div>
+<h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><a href="../interfaces/ISendTransaction.html" class="tsd-signature-type tsd-kind-interface">ISendTransaction</a><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
+<div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
+<ul>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1327">transaction/index.ts:1327</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="setupTransaction" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>setup<wbr/>Transaction</span><a href="#setupTransaction" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -440,7 +512,7 @@ This function will not override previously set transaction data. To do that you&
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/TSetupTransactionResponse.html" class="tsd-signature-type tsd-kind-type-alias">TSetupTransactionResponse</a><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L68">transaction/index.ts:68</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L71">transaction/index.ts:71</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="signPsbt" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>sign<wbr/>Psbt</span><a href="#signPsbt" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -461,7 +533,7 @@ This function will not override previously set transaction data. To do that you&
 <h4 class="tsd-returns-title">Returns <span class="tsd-signature-type ">Promise</span><span class="tsd-signature-symbol">&lt;</span><a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type ">Psbt</span><span class="tsd-signature-symbol">&gt;</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L472">transaction/index.ts:472</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L559">transaction/index.ts:559</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="updateFee" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>update<wbr/>Fee</span><a href="#updateFee" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -486,7 +558,7 @@ This function will not override previously set transaction data. To do that you&
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-symbol">{ </span><br/><span>    </span><span class="tsd-kind-property">fee</span><span class="tsd-signature-symbol">: </span><span class="tsd-signature-type">number</span><span class="tsd-signature-symbol">; </span><br/><span class="tsd-signature-symbol">}</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L908">transaction/index.ts:908</a></li></ul></aside></li></ul></section>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L995">transaction/index.ts:995</a></li></ul></aside></li></ul></section>
 <section class="tsd-panel tsd-member"><a id="updateSendTransaction" class="tsd-anchor"></a>
 <h3 class="tsd-anchor-link"><span>update<wbr/>Send<wbr/>Transaction</span><a href="#updateSendTransaction" aria-label="Permalink" class="tsd-anchor-icon"><svg viewBox="0 0 24 24"><use href="#icon-anchor"></use></svg></a></h3>
 <ul class="tsd-signatures">
@@ -506,7 +578,7 @@ This function will not override previously set transaction data. To do that you&
 <h4 class="tsd-returns-title">Returns <a href="../types/Result.html" class="tsd-signature-type tsd-kind-type-alias">Result</a><span class="tsd-signature-symbol">&lt;</span><span class="tsd-signature-type">string</span><span class="tsd-signature-symbol">&gt;</span></h4>
 <div class="tsd-comment tsd-typography"></div><aside class="tsd-sources">
 <ul>
-<li>Defined in <a href="https://github.com/synonymdev/beignet/blob/3144d66/src/transaction/index.ts#L870">transaction/index.ts:870</a></li></ul></aside></li></ul></section></section></div>
+<li>Defined in <a href="https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L957">transaction/index.ts:957</a></li></ul></aside></li></ul></section></section></div>
 <div class="col-sidebar">
 <div class="page-menu">
 <div class="tsd-navigation settings">
@@ -533,6 +605,8 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="#addExternalInputs" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>add<wbr/>External<wbr/>Inputs</span></a></li>
 <li><a href="#addInput" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>add<wbr/>Input</span></a></li>
 <li><a href="#addOutput" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>add<wbr/>Output</span></a></li>
+<li><a href="#applyAutoCoinSelect" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>apply<wbr/>Auto<wbr/>Coin<wbr/>Select</span></a></li>
+<li><a href="#autoCoinSelect" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>auto<wbr/>Coin<wbr/>Select</span></a></li>
 <li><a href="#createPsbtFromTransactionData" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>create<wbr/>Psbt<wbr/>From<wbr/>Transaction<wbr/>Data</span></a></li>
 <li><a href="#createTransaction" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>create<wbr/>Transaction</span></a></li>
 <li><a href="#estimateTransactionCosts" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>estimate<wbr/>Transaction<wbr/>Costs</span></a></li>
@@ -546,6 +620,7 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="#resetSendTransaction" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>reset<wbr/>Send<wbr/>Transaction</span></a></li>
 <li><a href="#sendMax" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>send<wbr/>Max</span></a></li>
 <li><a href="#setupCpfp" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Cpfp</span></a></li>
+<li><a href="#setupRbf" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Rbf</span></a></li>
 <li><a href="#setupTransaction" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>setup<wbr/>Transaction</span></a></li>
 <li><a href="#signPsbt" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>sign<wbr/>Psbt</span></a></li>
 <li><a href="#updateFee" class=""><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-2048"></use></svg><span>update<wbr/>Fee</span></a></li>
@@ -556,6 +631,7 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../enums/EAddressType.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><g id="icon-8"><rect fill="var(--color-icon-background)" stroke="var(--color-ts-enum)" stroke-width="1.5" x="1" y="1" width="22" height="22" rx="6"></rect><path d="M9.45 16V7.24H14.49V8.224H10.518V10.936H14.07V11.908H10.518V15.016H14.49V16H9.45Z" fill="var(--color-text)"></path></g></svg><span>EAddress<wbr/>Type</span></a></li>
 <li><a href="../enums/EAvailableNetworks.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>EAvailable<wbr/>Networks</span></a></li>
 <li><a href="../enums/EBoostType.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>EBoost<wbr/>Type</span></a></li>
+<li><a href="../enums/ECoinSelectPreference.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>ECoin<wbr/>Select<wbr/>Preference</span></a></li>
 <li><a href="../enums/EElectrumNetworks.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>EElectrum<wbr/>Networks</span></a></li>
 <li><a href="../enums/EFeeId.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>EFee<wbr/>Id</span></a></li>
 <li><a href="../enums/EPaymentType.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-8"></use></svg><span>EPayment<wbr/>Type</span></a></li>
@@ -570,9 +646,13 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../interfaces/IAddressData.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IAddress<wbr/>Data</span></a></li>
 <li><a href="../interfaces/IAddressType.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IAddress<wbr/>Type</span></a></li>
 <li><a href="../interfaces/IAddressTypeData.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IAddress<wbr/>Type<wbr/>Data</span></a></li>
+<li><a href="../interfaces/IAddressTypesIO.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IAddress<wbr/>TypesIO</span></a></li>
 <li><a href="../interfaces/IAddresses.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IAddresses</span></a></li>
 <li><a href="../interfaces/IBoostedTransaction.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IBoosted<wbr/>Transaction</span></a></li>
 <li><a href="../interfaces/IBoostedTransactions.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IBoosted<wbr/>Transactions</span></a></li>
+<li><a href="../interfaces/IBtInfo.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>IBt<wbr/>Info</span></a></li>
+<li><a href="../interfaces/ICanBoostResponse.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>ICan<wbr/>Boost<wbr/>Response</span></a></li>
+<li><a href="../interfaces/ICoinSelectResponse.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>ICoin<wbr/>Select<wbr/>Response</span></a></li>
 <li><a href="../interfaces/ICreateTransaction.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>ICreate<wbr/>Transaction</span></a></li>
 <li><a href="../interfaces/ICustomGetAddress.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>ICustom<wbr/>Get<wbr/>Address</span></a></li>
 <li><a href="../interfaces/ICustomGetScriptHash.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-256"></use></svg><span>ICustom<wbr/>Get<wbr/>Script<wbr/>Hash</span></a></li>
@@ -629,6 +709,7 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../types/ElectrumConnectionPubSub.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><g id="icon-4194304"><rect fill="var(--color-icon-background)" stroke="var(--color-ts-type-alias)" stroke-width="1.5" x="1" y="1" width="22" height="22" rx="6"></rect><path d="M11.31 16V8.224H8.91V7.24H14.79V8.224H12.39V16H11.31Z" fill="var(--color-text)"></path></g></svg><span>Electrum<wbr/>Connection<wbr/>Pub<wbr/>Sub</span></a></li>
 <li><a href="../types/ElectrumConnectionSubscription.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Electrum<wbr/>Connection<wbr/>Subscription</span></a></li>
 <li><a href="../types/InputData.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Input<wbr/>Data</span></a></li>
+<li><a href="../types/Net.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Net</span></a></li>
 <li><a href="../types/ObjectKeys.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Object<wbr/>Keys</span></a></li>
 <li><a href="../types/Result.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Result</span></a></li>
 <li><a href="../types/TAddressIndexInfo.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TAddress<wbr/>Index<wbr/>Info</span></a></li>
@@ -668,8 +749,12 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../types/TTxDetails.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TTx<wbr/>Details</span></a></li>
 <li><a href="../types/TTxResponse.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TTx<wbr/>Response</span></a></li>
 <li><a href="../types/TTxResult.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TTx<wbr/>Result</span></a></li>
+<li><a href="../types/TUnspentAddressScriptHash.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TUnspent<wbr/>Address<wbr/>Script<wbr/>Hash</span></a></li>
 <li><a href="../types/TUnspentAddressScriptHashData.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TUnspent<wbr/>Address<wbr/>Script<wbr/>Hash<wbr/>Data</span></a></li>
+<li><a href="../types/TUnspentAddressScriptHashResponse.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TUnspent<wbr/>Address<wbr/>Script<wbr/>Hash<wbr/>Response</span></a></li>
+<li><a href="../types/TUnspentAddressScriptHashResult.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TUnspent<wbr/>Address<wbr/>Script<wbr/>Hash<wbr/>Result</span></a></li>
 <li><a href="../types/TWalletDataKeys.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>TWallet<wbr/>Data<wbr/>Keys</span></a></li>
+<li><a href="../types/Tls.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-4194304"></use></svg><span>Tls</span></a></li>
 <li><a href="../variables/defaultElectrumPorts.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><g id="icon-32"><rect fill="var(--color-icon-background)" stroke="var(--color-ts-variable)" stroke-width="1.5" x="1" y="1" width="22" height="22" rx="6"></rect><path d="M11.106 16L8.85 7.24H9.966L11.454 13.192C11.558 13.608 11.646 13.996 11.718 14.356C11.79 14.708 11.842 14.976 11.874 15.16C11.906 14.976 11.954 14.708 12.018 14.356C12.09 13.996 12.178 13.608 12.282 13.192L13.758 7.24H14.85L12.582 16H11.106Z" fill="var(--color-text)"></path></g></svg><span>default<wbr/>Electrum<wbr/>Ports</span></a></li>
 <li><a href="../variables/electrumConnection.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-32"></use></svg><span>electrum<wbr/>Connection</span></a></li>
 <li><a href="../functions/availableNetworks.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><g id="icon-64"><rect fill="var(--color-icon-background)" stroke="var(--color-ts-function)" stroke-width="1.5" x="1" y="1" width="22" height="22" rx="6"></rect><path d="M9.39 16V7.24H14.55V8.224H10.446V11.128H14.238V12.112H10.47V16H9.39Z" fill="var(--color-text)"></path></g></svg><span>available<wbr/>Networks</span></a></li>
@@ -678,6 +763,7 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../functions/decodeRawTransaction.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>decode<wbr/>Raw<wbr/>Transaction</span></a></li>
 <li><a href="../functions/err.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>err</span></a></li>
 <li><a href="../functions/filterAddressesForGapLimit.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>filter<wbr/>Addresses<wbr/>For<wbr/>Gap<wbr/>Limit</span></a></li>
+<li><a href="../functions/filterAddressesObjForAddressesList.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>filter<wbr/>Addresses<wbr/>Obj<wbr/>For<wbr/>Addresses<wbr/>List</span></a></li>
 <li><a href="../functions/filterAddressesObjForGapLimit.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>filter<wbr/>Addresses<wbr/>Obj<wbr/>For<wbr/>Gap<wbr/>Limit</span></a></li>
 <li><a href="../functions/filterAddressesObjForSingleIndex.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>filter<wbr/>Addresses<wbr/>Obj<wbr/>For<wbr/>Single<wbr/>Index</span></a></li>
 <li><a href="../functions/filterAddressesObjForStartingIndex.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>filter<wbr/>Addresses<wbr/>Obj<wbr/>For<wbr/>Starting<wbr/>Index</span></a></li>
@@ -720,9 +806,11 @@ This function will not override previously set transaction data. To do that you&
 <li><a href="../functions/parseOnChainPaymentRequest.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>parse<wbr/>On<wbr/>Chain<wbr/>Payment<wbr/>Request</span></a></li>
 <li><a href="../functions/reduceValue.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>reduce<wbr/>Value</span></a></li>
 <li><a href="../functions/removeDustOutputs.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>remove<wbr/>Dust<wbr/>Outputs</span></a></li>
+<li><a href="../functions/removeDustUtxos.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>remove<wbr/>Dust<wbr/>Utxos</span></a></li>
 <li><a href="../functions/setReplaceByFee.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>set<wbr/>Replace<wbr/>By<wbr/>Fee</span></a></li>
 <li><a href="../functions/shuffleArray.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>shuffle<wbr/>Array</span></a></li>
 <li><a href="../functions/sleep.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>sleep</span></a></li>
+<li><a href="../functions/splitAddresses.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>split<wbr/>Addresses</span></a></li>
 <li><a href="../functions/validateAddress.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>validate<wbr/>Address</span></a></li>
 <li><a href="../functions/validateMnemonic.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>validate<wbr/>Mnemonic</span></a></li>
 <li><a href="../functions/validateTransaction.html"><svg class="tsd-kind-icon" viewBox="0 0 24 24"><use href="#icon-64"></use></svg><span>validate<wbr/>Transaction</span></a></li></ul></nav></div></div></div>

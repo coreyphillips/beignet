@@ -256,6 +256,7 @@ export class Transaction {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs: transaction.inputs || [],
 					outputs: transaction.outputs || [],
+					changeAddress: transaction.changeAddress,
 					satsPerByte,
 					message,
 					coinSelectPreference
@@ -335,6 +336,7 @@ export class Transaction {
 				const coinSelectRes = this.autoCoinSelect({
 					inputs,
 					outputs,
+					changeAddress,
 					satsPerByte,
 					message,
 					coinSelectPreference
@@ -449,6 +451,7 @@ export class Transaction {
 				inputs: transactionData.inputs,
 				outputs: transactionData.outputs,
 				satsPerByte: transactionData.satsPerByte,
+				changeAddress: transactionData.changeAddress,
 				message: transactionData.message,
 				coinSelectPreference: this._wallet.coinSelectPreference
 			});
@@ -1405,12 +1408,14 @@ export class Transaction {
 	public autoCoinSelect({
 		inputs = [],
 		outputs = [],
+		changeAddress,
 		satsPerByte = 1,
 		message = '',
 		coinSelectPreference = ECoinSelectPreference.small
 	}: {
 		inputs: IUtxo[];
 		outputs: IOutput[];
+		changeAddress?: string;
 		satsPerByte?: number;
 		message?: string;
 		coinSelectPreference?: ECoinSelectPreference;
@@ -1512,8 +1517,11 @@ export class Transaction {
 					addressTypes.inputs[type] = 1;
 				}
 			});
-
-			outputs.forEach(({ address }) => {
+			const outputAddresses = outputs.map(({ address }) => address);
+			if (changeAddress) {
+				outputAddresses.push(changeAddress);
+			}
+			outputAddresses.forEach((address) => {
 				if (!address) {
 					return;
 				}

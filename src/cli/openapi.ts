@@ -1,0 +1,2034 @@
+/**
+ * OpenAPI 3.0 specification for the Beignet Lightning daemon.
+ *
+ * Generated from daemon routes. Served at GET /openapi.json.
+ */
+
+export function getOpenApiSpec(): Record<string, unknown> {
+	return {
+		openapi: '3.0.3',
+		info: {
+			title: 'Beignet Lightning API',
+			version: '1.0.0',
+			description:
+				'HTTP API for a self-custodial Bitcoin + Lightning node. Designed for AI agents.\n\n' +
+				'**Idempotency:** Payment endpoints (`/invoice/pay`, `/invoice/pay-safe`, `/invoice/pay-async`, `/invoice/pay-retry`, `/keysend`, `/keysend/safe`) support the `X-Idempotency-Key` header. ' +
+				'When provided, the response is cached for 24 hours — repeated requests with the same key and body return the cached response. ' +
+				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned.\n\n' +
+				'**TLS:** The daemon supports HTTPS when started with `--tls-cert` and `--tls-key` flags (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars).\n\n' +
+				'**Spending Limits:** Configure `dailySpendLimitSats` (or `BEIGNET_DAILY_SPEND_LIMIT_SATS` env var) to enforce a daily budget. Query `GET /spend-limit` for current usage.\n\n' +
+				'**Drain Mode:** `POST /stop` accepts `{ "drain": true }` to stop accepting new payments and wait for in-flight ones to settle before shutdown.'
+		},
+		servers: [{ url: 'http://127.0.0.1:2112', description: 'Local daemon' }],
+		paths: {
+			'/info': {
+				get: {
+					summary: 'Get node info',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Node info',
+							content: jsonContent({ $ref: '#/components/schemas/NodeInfo' })
+						}
+					}
+				}
+			},
+			'/balance': {
+				get: {
+					summary: 'Get balance (on-chain + lightning)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Balance',
+							content: jsonContent({ $ref: '#/components/schemas/BalanceInfo' })
+						}
+					}
+				}
+			},
+			'/health': {
+				get: {
+					summary: 'Health check (auth-exempt)',
+					tags: ['Node'],
+					security: [],
+					responses: {
+						'200': {
+							description: 'Health status',
+							content: jsonContent({ $ref: '#/components/schemas/HealthInfo' })
+						}
+					}
+				}
+			},
+			'/ready': {
+				get: {
+					summary:
+						'Simple readiness check — true when node has at least one NORMAL channel (auth-exempt)',
+					tags: ['Node'],
+					security: [],
+					responses: {
+						'200': {
+							description: 'Ready status',
+							content: jsonContent({
+								type: 'object',
+								properties: { ready: { type: 'boolean' } }
+							})
+						}
+					}
+				}
+			},
+			'/peers': {
+				get: {
+					summary: 'List connected peers',
+					tags: ['Peers'],
+					responses: {
+						'200': {
+							description: 'Peer list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/PeerInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/channels': {
+				get: {
+					summary: 'List all channels',
+					tags: ['Channels'],
+					responses: {
+						'200': {
+							description: 'Channel list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/channels/ready': {
+				get: {
+					summary: 'List channels in NORMAL state',
+					tags: ['Channels'],
+					responses: {
+						'200': {
+							description: 'Ready channels',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/payments': {
+				get: {
+					summary: 'List payments with optional filtering',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'status',
+							in: 'query',
+							schema: {
+								type: 'string',
+								enum: ['PENDING', 'COMPLETED', 'FAILED']
+							}
+						},
+						{
+							name: 'direction',
+							in: 'query',
+							schema: { type: 'string', enum: ['OUTGOING', 'INCOMING'] }
+						},
+						{ name: 'since', in: 'query', schema: { type: 'integer' } },
+						{ name: 'limit', in: 'query', schema: { type: 'integer' } },
+						{ name: 'offset', in: 'query', schema: { type: 'integer' } },
+						{
+							name: 'metadataKey',
+							in: 'query',
+							schema: { type: 'string' },
+							description:
+								'Filter by metadata key existence (or key=value when paired with metadataValue)'
+						},
+						{
+							name: 'metadataValue',
+							in: 'query',
+							schema: { type: 'string' },
+							description:
+								'Filter by metadata key=value match (requires metadataKey)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Payment list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/PaymentInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/invoices': {
+				get: {
+					summary: 'List created invoices',
+					tags: ['Invoices'],
+					responses: {
+						'200': {
+							description: 'Invoice list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/InvoiceInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/invoice/create': {
+				post: {
+					summary: 'Create a BOLT 11 invoice',
+					tags: ['Invoices'],
+					requestBody: bodyContent({
+						amountSats: 'number?',
+						description: 'string?',
+						expirySecs: 'number?',
+						descriptionHash: 'string?'
+					}),
+					responses: {
+						'200': {
+							description: 'Created invoice',
+							content: jsonContent({ $ref: '#/components/schemas/InvoiceInfo' })
+						}
+					}
+				}
+			},
+			'/invoice': {
+				get: {
+					summary: 'Get a specific invoice by payment hash',
+					tags: ['Invoices'],
+					parameters: [
+						{
+							name: 'paymentHash',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Invoice info',
+							content: jsonContent({ $ref: '#/components/schemas/InvoiceInfo' })
+						}
+					}
+				}
+			},
+			'/invoice/decode': {
+				post: {
+					summary: 'Decode a BOLT 11 invoice',
+					tags: ['Invoices'],
+					requestBody: bodyContent({ bolt11: 'string' }),
+					responses: { '200': { description: 'Decoded invoice' } }
+				}
+			},
+			'/invoice/validate': {
+				post: {
+					summary:
+						'Pre-flight payment validation — checks decode, expiry, limits, capacity, route',
+					tags: ['Payments'],
+					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Validation result',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									status: { type: 'string', enum: ['OK', 'WARN', 'FAIL'] },
+									summary: { type: 'string' },
+									checks: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												name: { type: 'string' },
+												status: {
+													type: 'string',
+													enum: ['OK', 'WARN', 'FAIL']
+												},
+												message: { type: 'string' }
+											}
+										}
+									},
+									invoice: { $ref: '#/components/schemas/DecodedInvoice' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/invoice/pay': {
+				post: {
+					summary: 'Pay an invoice (blocks until settled or timeout)',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						amountSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/invoice/pay-async': {
+				post: {
+					summary: 'Pay an invoice (returns immediately)',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						maxFeeSats: 'number?',
+						amountSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Pending payment',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									paymentHash: { type: 'string' },
+									status: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/invoice/pay-safe': {
+				post: {
+					summary:
+						'Pay an invoice (never throws — always returns PaymentInfo with COMPLETED or FAILED status)',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						amountSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result (always resolves)',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/channel/open': {
+				post: {
+					summary: 'Open a channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						pushSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel info',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/open-and-wait': {
+				post: {
+					summary: 'Open a channel and wait for it to be ready',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						pushSats: 'number?',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel info (ready)',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/close': {
+				post: {
+					summary: 'Cooperatively close a channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: { '200': { description: 'Close result' } }
+				}
+			},
+			'/channel/forceclose': {
+				post: {
+					summary: 'Force close a channel (returns commitment txid)',
+					tags: ['Channels'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': { description: 'Force close result with commitment txid' }
+					}
+				}
+			},
+			'/channel/update-fee': {
+				post: {
+					summary: 'Update channel fee rate',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						feeratePerKw: 'number'
+					}),
+					responses: { '200': { description: 'Fee updated' } }
+				}
+			},
+			'/channels/ensure-minimum': {
+				post: {
+					summary:
+						'Ensure a minimum number of channels are open (uses channel suggestions)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						count: 'number',
+						satsPerChannel: 'number',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel list (existing + newly opened)',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/channel/connect-and-open': {
+				post: {
+					summary: 'Connect to peer and open channel in one call',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						host: 'string',
+						port: 'number',
+						amountSats: 'number',
+						pushSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel info',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel': {
+				get: {
+					summary: 'Get a specific channel by ID',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Channel info',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/health': {
+				get: {
+					summary: 'Get channel health assessment with liquidity warnings',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Channel health',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelHealth'
+							})
+						},
+						'400': { description: 'Missing channelId' },
+						'404': { description: 'Channel not found' }
+					}
+				}
+			},
+			'/peer/connect': {
+				post: {
+					summary: 'Connect to a peer',
+					tags: ['Peers'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						host: 'string',
+						port: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Peer info',
+							content: jsonContent({ $ref: '#/components/schemas/PeerInfo' })
+						}
+					}
+				}
+			},
+			'/peer/disconnect': {
+				post: {
+					summary: 'Disconnect from a peer',
+					tags: ['Peers'],
+					requestBody: bodyContent({ pubkey: 'string' }),
+					responses: { '200': { description: 'Disconnected' } }
+				}
+			},
+			'/payment/cancel': {
+				post: {
+					summary: 'Cancel a pending payment',
+					tags: ['Payments'],
+					requestBody: bodyContent({ paymentHash: 'string' }),
+					responses: { '200': { description: 'Cancelled' } }
+				}
+			},
+			'/payment': {
+				get: {
+					summary: 'Get a specific payment by hash',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'paymentHash',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Payment info',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/payment/proof': {
+				get: {
+					summary: 'Get cryptographic payment proof',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'paymentHash',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Payment proof',
+							content: jsonContent({
+								$ref: '#/components/schemas/PaymentProof'
+							})
+						}
+					}
+				}
+			},
+			'/payment/verify-proof': {
+				get: {
+					summary:
+						'Cryptographically verify a payment proof (sha256(preimage) === paymentHash)',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'paymentHash',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Verification result',
+							content: jsonContent({
+								$ref: '#/components/schemas/PaymentProofVerification'
+							})
+						}
+					}
+				}
+			},
+			'/node/uri': {
+				get: {
+					summary: 'Get node connection URI (pubkey@host:port)',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'host',
+							in: 'query',
+							schema: { type: 'string' },
+							description: 'External host/IP override (defaults to 127.0.0.1)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Node URI',
+							content: jsonContent({
+								type: 'object',
+								properties: { uri: { type: 'string' } }
+							})
+						},
+						'404': { description: 'Node is not listening' }
+					}
+				}
+			},
+			'/invoice/pay-retry': {
+				post: {
+					summary:
+						'Pay an invoice with automatic retry and exponential backoff',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						maxRetries: 'number?',
+						backoffMs: 'number?',
+						maxFeeSats: 'number?',
+						amountSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result with retry info',
+							content: jsonContent({
+								$ref: '#/components/schemas/RetryPaymentResult'
+							})
+						}
+					}
+				}
+			},
+			'/keysend': {
+				post: {
+					summary:
+						'Send a keysend (spontaneous) payment — blocks until settled or timeout',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/keysend/safe': {
+				post: {
+					summary:
+						'Send a keysend payment — never throws, always returns PaymentInfo',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						timeoutMs: 'number?',
+						maxFeeSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result (always succeeds)',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/offer/create': {
+				post: {
+					summary: 'Create a BOLT 12 offer',
+					tags: ['Offers'],
+					requestBody: bodyContent({
+						description: 'string',
+						amountSats: 'number?',
+						issuer: 'string?'
+					}),
+					responses: {
+						'200': {
+							description: 'Offer info',
+							content: jsonContent({ $ref: '#/components/schemas/OfferInfo' })
+						}
+					}
+				}
+			},
+			'/offer/decode': {
+				post: {
+					summary: 'Decode a BOLT 12 offer',
+					tags: ['Offers'],
+					requestBody: bodyContent({ offer: 'string' }),
+					responses: {
+						'200': {
+							description: 'Offer info',
+							content: jsonContent({ $ref: '#/components/schemas/OfferInfo' })
+						}
+					}
+				}
+			},
+			'/offers': {
+				get: {
+					summary: 'List created offers',
+					tags: ['Offers'],
+					responses: {
+						'200': {
+							description: 'Offer list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/OfferInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/route/estimate': {
+				post: {
+					summary: 'Estimate route fee for a BOLT 11 invoice',
+					tags: ['Routing'],
+					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
+					responses: { '200': { description: 'Route estimate' } }
+				}
+			},
+			'/payment/estimate': {
+				post: {
+					summary:
+						'Estimate payment success probability, fees, and route quality',
+					tags: ['Payments'],
+					requestBody: bodyContent({ bolt11: 'string', amountSats: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Payment estimate',
+							content: jsonContent({
+								$ref: '#/components/schemas/PaymentEstimate'
+							})
+						},
+						'400': { description: 'Invalid params or no route' }
+					}
+				}
+			},
+			'/route/probe': {
+				post: {
+					summary: 'Probe route viability to a destination',
+					tags: ['Routing'],
+					requestBody: bodyContent({
+						destination: 'string',
+						amountSats: 'number'
+					}),
+					responses: { '200': { description: 'Probe result' } }
+				}
+			},
+			'/backup': {
+				post: {
+					summary: 'Create database backup',
+					tags: ['Node'],
+					requestBody: bodyContent({ destPath: 'string' }),
+					responses: { '200': { description: 'Backup result' } }
+				}
+			},
+			'/send': {
+				post: {
+					summary: 'Send on-chain Bitcoin',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						address: 'string',
+						amountSats: 'number',
+						satsPerVbyte: 'number?'
+					}),
+					responses: { '200': { description: 'Transaction info' } }
+				}
+			},
+			'/readiness': {
+				get: {
+					summary: 'Get mainnet readiness report with weighted checks',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Readiness report',
+							content: jsonContent({
+								$ref: '#/components/schemas/ReadinessReport'
+							})
+						}
+					}
+				}
+			},
+			'/stats': {
+				get: {
+					summary: 'Get node statistics',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'window',
+							in: 'query',
+							schema: { type: 'integer' },
+							description:
+								'Time window in milliseconds. Only payments created within this window are included.'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Node stats',
+							content: jsonContent({ $ref: '#/components/schemas/NodeStats' })
+						}
+					}
+				}
+			},
+			'/liquidity': {
+				get: {
+					summary: 'Get liquidity snapshot with recommendations',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Liquidity snapshot',
+							content: jsonContent({
+								$ref: '#/components/schemas/LiquiditySnapshot'
+							})
+						}
+					}
+				}
+			},
+			'/fees': {
+				get: {
+					summary:
+						'Get on-chain fee rate snapshot with trend analysis and channel-open recommendation',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Fee snapshot',
+							content: jsonContent({ $ref: '#/components/schemas/FeeSnapshot' })
+						},
+						'400': { description: 'No fee samples recorded yet' }
+					}
+				}
+			},
+			'/channel/suggestions': {
+				get: {
+					summary:
+						'Get channel open suggestions based on gossip graph analysis',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'count',
+							in: 'query',
+							schema: { type: 'integer', default: 5 },
+							description: 'Maximum number of suggestions'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Channel suggestions sorted by score',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ChannelSuggestion' }
+							})
+						}
+					}
+				}
+			},
+			'/logs': {
+				get: {
+					summary: 'Query persisted structured action log entries',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'category',
+							in: 'query',
+							schema: {
+								type: 'string',
+								enum: ['payment', 'channel', 'htlc', 'fee', 'peer', 'chain']
+							},
+							description: 'Filter by log category'
+						},
+						{
+							name: 'since',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Filter entries from this timestamp (ms)'
+						},
+						{
+							name: 'limit',
+							in: 'query',
+							schema: { type: 'integer', default: 1000 },
+							description: 'Maximum number of entries to return'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Action log entries',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ActionLogEntry' }
+							})
+						}
+					}
+				}
+			},
+			'/metrics': {
+				get: {
+					summary: 'Prometheus-compatible metrics (auth-exempt)',
+					tags: ['Node'],
+					security: [],
+					responses: {
+						'200': {
+							description: 'Prometheus text exposition format',
+							content: { 'text/plain': { schema: { type: 'string' } } }
+						}
+					}
+				}
+			},
+			'/events': {
+				get: {
+					summary:
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, channel:ready, channel:closed, peer:connect, peer:disconnect, node:ready)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'SSE stream',
+							content: { 'text/event-stream': {} }
+						}
+					}
+				}
+			},
+			'/stop': {
+				post: {
+					summary: 'Gracefully stop the daemon (supports drain mode)',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						'drain?': 'boolean',
+						'drainTimeoutMs?': 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Stopped',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									stopped: { type: 'boolean' },
+									drained: { type: 'boolean' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/spend-limit': {
+				get: {
+					summary: 'Get daily spending limit info',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Spending limit info',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									limitSats: { type: 'integer', nullable: true },
+									spentSats: { type: 'integer' },
+									remainingSats: { type: 'number' },
+									resetsAt: { type: 'integer' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/address/new': {
+				post: {
+					summary: 'Generate a new on-chain receiving address',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'New address',
+							content: jsonContent({
+								type: 'object',
+								properties: { address: { type: 'string' } }
+							})
+						}
+					}
+				}
+			},
+			'/wallet/refresh': {
+				post: {
+					summary: 'Refresh on-chain wallet (rescan UTXOs)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Refreshed',
+							content: jsonContent({
+								type: 'object',
+								properties: { refreshed: { type: 'boolean' } }
+							})
+						}
+					}
+				}
+			},
+			'/mnemonic': {
+				get: {
+					summary: 'Get wallet mnemonic (requires API token)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Mnemonic',
+							content: jsonContent({
+								type: 'object',
+								properties: { mnemonic: { type: 'string' } }
+							})
+						}
+					}
+				}
+			},
+			'/peers/bootstrap': {
+				post: {
+					summary: 'Bootstrap peer connections via DNS seeds',
+					tags: ['Peers'],
+					responses: {
+						'200': {
+							description: 'Bootstrap result',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/BootstrapPeerInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/peers/connect-seeds': {
+				post: {
+					summary: 'Connect to DNS seed peers',
+					tags: ['Peers'],
+					requestBody: bodyContent({ maxPeers: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Connected count',
+							content: jsonContent({
+								type: 'object',
+								properties: { connected: { type: 'integer' } }
+							})
+						}
+					}
+				}
+			},
+			'/trusted-peer/add': {
+				post: {
+					summary: 'Add a trusted peer for zero-conf channels',
+					tags: ['Peers'],
+					requestBody: bodyContent({ pubkey: 'string' }),
+					responses: {
+						'200': {
+							description: 'Trusted peer info',
+							content: jsonContent({
+								$ref: '#/components/schemas/TrustedPeerInfo'
+							})
+						}
+					}
+				}
+			},
+			'/trusted-peer/remove': {
+				post: {
+					summary: 'Remove a trusted peer',
+					tags: ['Peers'],
+					requestBody: bodyContent({ pubkey: 'string' }),
+					responses: { '200': { description: 'Removed' } }
+				}
+			},
+			'/trusted-peers': {
+				get: {
+					summary: 'List trusted peers',
+					tags: ['Peers'],
+					responses: {
+						'200': {
+							description: 'Trusted peer list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/TrustedPeerInfo' }
+							})
+						}
+					}
+				}
+			},
+			'/channel/open-zeroconf': {
+				post: {
+					summary: 'Open a zero-conf channel (requires trusted peer)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						pushSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel info',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/open-v2': {
+				post: {
+					summary: 'Open a dual-funded (v2) channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						pubkey: 'string',
+						amountSats: 'number',
+						fundingFeeratePerkw: 'number?',
+						commitmentFeeratePerkw: 'number?',
+						locktime: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel info',
+							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/splice-in': {
+				post: {
+					summary: 'Splice funds into a channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						amountSats: 'number',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Splice result',
+							content: jsonContent({
+								$ref: '#/components/schemas/SpliceResult'
+							})
+						}
+					}
+				}
+			},
+			'/channel/splice-out': {
+				post: {
+					summary: 'Splice funds out of a channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						amountSats: 'number',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Splice result',
+							content: jsonContent({
+								$ref: '#/components/schemas/SpliceResult'
+							})
+						}
+					}
+				}
+			},
+			'/node/wait-ready': {
+				post: {
+					summary:
+						'Wait for node to be fully operational (peers reconnected, channels restored)',
+					tags: ['Node'],
+					requestBody: bodyContent({ timeoutMs: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Node ready',
+							content: jsonContent({
+								type: 'object',
+								properties: { ready: { type: 'boolean' } }
+							})
+						}
+					}
+				}
+			},
+			'/channel/wait-ready': {
+				post: {
+					summary: 'Wait for a channel to become ready (NORMAL state)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel ready',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									channelId: { type: 'string' },
+									ready: { type: 'boolean' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/payment/wait': {
+				post: {
+					summary: 'Wait for a payment to settle',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						paymentHash: 'string',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/payment/metadata': {
+				post: {
+					summary: 'Set metadata on a payment',
+					tags: ['Payments'],
+					requestBody: bodyContent({
+						paymentHash: 'string',
+						metadata: 'Record<string,string>'
+					}),
+					responses: { '200': { description: 'Updated' } }
+				}
+			},
+			'/can-send': {
+				get: {
+					summary:
+						'Check if node can send a given amount (accounts for channel reserves)',
+					tags: ['Node'],
+					parameters: [
+						{ name: 'amountSats', in: 'query', schema: { type: 'integer' } }
+					],
+					responses: { '200': { description: 'Send capability' } }
+				}
+			},
+			'/can-receive': {
+				get: {
+					summary:
+						'Check if node can receive a given amount (accounts for channel reserves)',
+					tags: ['Node'],
+					parameters: [
+						{ name: 'amountSats', in: 'query', schema: { type: 'integer' } }
+					],
+					responses: { '200': { description: 'Receive capability' } }
+				}
+			},
+			'/offer/pay': {
+				post: {
+					summary: 'Pay a BOLT 12 offer',
+					tags: ['Offers'],
+					requestBody: bodyContent({
+						offer: 'string',
+						amountSats: 'number?',
+						timeoutMs: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Payment result',
+							content: jsonContent({ $ref: '#/components/schemas/PaymentInfo' })
+						}
+					}
+				}
+			},
+			'/webhooks/register': {
+				post: {
+					summary:
+						'Register a webhook for event notifications (persistent across restarts)',
+					tags: ['Webhooks'],
+					requestBody: bodyContent({
+						url: 'string',
+						events: 'string',
+						secret: 'string?'
+					}),
+					responses: {
+						'200': {
+							description: 'Webhook registration',
+							content: jsonContent({
+								$ref: '#/components/schemas/WebhookRegistration'
+							})
+						}
+					}
+				}
+			},
+			'/webhooks/unregister': {
+				delete: {
+					summary: 'Unregister a webhook by ID',
+					tags: ['Webhooks'],
+					requestBody: bodyContent({ id: 'string' }),
+					responses: {
+						'200': { description: 'Webhook unregistered' },
+						'404': { description: 'Webhook not found' }
+					}
+				}
+			},
+			'/webhooks': {
+				get: {
+					summary:
+						'List all registered webhooks (includes webhooks restored from storage)',
+					tags: ['Webhooks'],
+					responses: {
+						'200': {
+							description: 'Webhook list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/WebhookRegistration' }
+							})
+						}
+					}
+				}
+			},
+			'/queue/add': {
+				post: {
+					summary:
+						'Add a payment to the priority queue (persistent — survives restarts)',
+					tags: ['Queue'],
+					requestBody: bodyContent({
+						bolt11: 'string',
+						priority: 'number?',
+						amountSats: 'number?',
+						maxFeeSats: 'number?',
+						metadata: 'Record<string,string>?'
+					}),
+					responses: {
+						'200': {
+							description: 'Queued payment',
+							content: jsonContent({
+								$ref: '#/components/schemas/QueuedPayment'
+							})
+						}
+					}
+				}
+			},
+			'/queue': {
+				get: {
+					summary:
+						'List all payments in the queue (includes entries restored after restart)',
+					tags: ['Queue'],
+					responses: {
+						'200': {
+							description: 'Queue list',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/QueuedPayment' }
+							})
+						}
+					}
+				}
+			},
+			'/queue/cancel': {
+				post: {
+					summary: 'Cancel a queued payment',
+					tags: ['Queue'],
+					requestBody: bodyContent({ id: 'string' }),
+					responses: {
+						'200': { description: 'Payment cancelled' },
+						'404': {
+							description: 'Queued payment not found or already processing'
+						}
+					}
+				}
+			}
+		},
+		components: {
+			securitySchemes: {
+				bearerAuth: {
+					type: 'http',
+					scheme: 'bearer'
+				}
+			},
+			schemas: {
+				ApiEnvelope: {
+					type: 'object',
+					description: 'All responses use this envelope format',
+					properties: {
+						ok: {
+							type: 'boolean',
+							description: 'true on success, false on error'
+						},
+						result: { description: 'Response payload (present when ok=true)' },
+						error: {
+							type: 'object',
+							properties: {
+								code: {
+									type: 'string',
+									description: 'Machine-readable error code'
+								},
+								message: {
+									type: 'string',
+									description: 'Human-readable error message'
+								}
+							},
+							description: 'Error details (present when ok=false)'
+						}
+					},
+					required: ['ok']
+				},
+				NodeInfo: {
+					type: 'object',
+					properties: {
+						nodeId: { type: 'string' },
+						alias: { type: 'string' },
+						network: { type: 'string' },
+						blockHeight: { type: 'integer' },
+						onchainBalanceSats: { type: 'integer' },
+						lightningBalanceSats: { type: 'integer' },
+						pendingCloseBalanceSats: { type: 'integer' },
+						erroredBalanceSats: { type: 'integer' },
+						channelCount: { type: 'integer' },
+						peerCount: { type: 'integer' },
+						listening: { type: 'boolean' }
+					}
+				},
+				BalanceInfo: {
+					type: 'object',
+					properties: {
+						onchain: { type: 'integer' },
+						lightning: { type: 'integer' },
+						total: { type: 'integer' },
+						unsettledSats: { type: 'integer' }
+					}
+				},
+				HealthInfo: {
+					type: 'object',
+					properties: {
+						status: { type: 'string', enum: ['ready', 'syncing', 'degraded'] },
+						uptime: { type: 'integer' },
+						blockHeight: { type: 'integer' },
+						electrumConnected: { type: 'boolean' },
+						peerCount: { type: 'integer' },
+						channelCount: { type: 'integer' },
+						readyChannelCount: { type: 'integer' },
+						graphNodes: { type: 'integer' },
+						graphChannels: { type: 'integer' }
+					}
+				},
+				PeerInfo: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						host: { type: 'string' },
+						port: { type: 'integer' },
+						state: {
+							type: 'string',
+							enum: ['connected', 'connecting', 'disconnected']
+						}
+					}
+				},
+				ChannelInfo: {
+					type: 'object',
+					properties: {
+						channelId: { type: 'string' },
+						peerPubkey: { type: 'string' },
+						state: {
+							type: 'string',
+							enum: [
+								'NONE',
+								'AWAITING_FUNDING_CONFIRMED',
+								'AWAITING_CHANNEL_READY',
+								'NORMAL',
+								'SHUTTING_DOWN',
+								'NEGOTIATING_CLOSING',
+								'FORCE_CLOSED',
+								'AWAITING_REESTABLISH',
+								'CLOSED',
+								'ANNOUNCEMENT_READY'
+							]
+						},
+						localBalanceSats: { type: 'integer' },
+						remoteBalanceSats: { type: 'integer' },
+						capacitySats: { type: 'integer' },
+						isAnchor: { type: 'boolean' },
+						isPrivate: { type: 'boolean' },
+						fundingTxid: { type: 'string' },
+						shortChannelId: { type: 'string' },
+						feeratePerKw: { type: 'integer' },
+						htlcCount: { type: 'integer' }
+					}
+				},
+				PaymentInfo: {
+					type: 'object',
+					properties: {
+						paymentHash: { type: 'string' },
+						preimage: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						status: {
+							type: 'string',
+							enum: ['PENDING', 'COMPLETED', 'FAILED']
+						},
+						direction: { type: 'string', enum: ['OUTGOING', 'INCOMING'] },
+						failureCode: { type: 'integer' },
+						failureDescription: { type: 'string' },
+						createdAt: { type: 'integer' },
+						completedAt: { type: 'integer' },
+						metadata: { type: 'object' },
+						route: {
+							type: 'object',
+							description: 'Route taken for outbound payments',
+							properties: {
+								hops: {
+									type: 'array',
+									items: {
+										type: 'object',
+										properties: {
+											pubkey: { type: 'string' },
+											shortChannelId: { type: 'string' },
+											feeMsat: { type: 'integer' }
+										}
+									}
+								},
+								totalFeeMsat: { type: 'integer' },
+								hopCount: { type: 'integer' }
+							}
+						}
+					}
+				},
+				InvoiceInfo: {
+					type: 'object',
+					properties: {
+						bolt11: { type: 'string' },
+						paymentHash: { type: 'string' },
+						paymentSecret: {
+							type: 'string',
+							description:
+								'Payment secret (hex) for correlating incoming payments'
+						},
+						amountSats: { type: 'integer' },
+						description: { type: 'string' },
+						expiry: { type: 'integer' },
+						createdAt: { type: 'integer' },
+						status: { type: 'string', enum: ['PENDING', 'PAID', 'EXPIRED'] }
+					}
+				},
+				OfferInfo: {
+					type: 'object',
+					properties: {
+						offerId: { type: 'string' },
+						description: { type: 'string' },
+						encoded: { type: 'string' },
+						amountSats: { type: 'integer' },
+						issuer: { type: 'string' },
+						issuerId: { type: 'string' },
+						quantityMax: { type: 'integer' },
+						absoluteExpiry: { type: 'integer' }
+					}
+				},
+				NodeStats: {
+					type: 'object',
+					properties: {
+						totalPaymentsSent: { type: 'integer' },
+						totalPaymentsReceived: { type: 'integer' },
+						totalPaymentsFailed: { type: 'integer' },
+						totalSatsSent: { type: 'integer' },
+						totalSatsReceived: { type: 'integer' },
+						totalFeesPaid: { type: 'integer' },
+						successRate: { type: 'number' },
+						uptimeMs: { type: 'integer' },
+						windowMs: {
+							type: 'integer',
+							description:
+								'Time window in milliseconds (present only when window query param is specified)'
+						},
+						avgPaymentTimeSec: {
+							type: 'number',
+							description:
+								'Average payment completion time in seconds (present only when completed payments with timing data exist)'
+						},
+						avgFeePct: {
+							type: 'number',
+							description:
+								'Average fee as percentage of payment amount (present only when completed payments with fee data exist)'
+						}
+					}
+				},
+				PaymentProof: {
+					type: 'object',
+					properties: {
+						paymentHash: { type: 'string' },
+						preimage: { type: 'string' },
+						amountSats: { type: 'number' },
+						completedAt: { type: 'number' },
+						invoice: { type: 'string' },
+						hopCount: { type: 'number' },
+						feeSats: { type: 'number' }
+					},
+					required: ['paymentHash', 'preimage', 'amountSats', 'completedAt']
+				},
+				PaymentProofVerification: {
+					type: 'object',
+					properties: {
+						valid: {
+							type: 'boolean',
+							description: 'Whether the preimage matches the payment hash'
+						},
+						proof: { $ref: '#/components/schemas/PaymentProof' },
+						error: {
+							type: 'string',
+							description: 'Error message if verification failed'
+						}
+					},
+					required: ['valid']
+				},
+				RouteEstimate: {
+					type: 'object',
+					properties: {
+						feeSats: { type: 'integer' },
+						hops: { type: 'integer' },
+						cltvDelta: { type: 'integer' }
+					}
+				},
+				TxInfo: {
+					type: 'object',
+					properties: {
+						txid: { type: 'string' },
+						hex: { type: 'string' }
+					}
+				},
+				SpliceResult: {
+					type: 'object',
+					properties: {
+						ok: { type: 'boolean' },
+						error: { type: 'string' }
+					}
+				},
+				BootstrapPeerInfo: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						host: { type: 'string' },
+						port: { type: 'integer' }
+					}
+				},
+				TrustedPeerInfo: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						trusted: { type: 'boolean' }
+					}
+				},
+				LiquiditySnapshot: {
+					type: 'object',
+					properties: {
+						totalLocalBalanceSats: {
+							type: 'integer',
+							description: 'Total outbound capacity in satoshis'
+						},
+						totalRemoteBalanceSats: {
+							type: 'integer',
+							description: 'Total inbound capacity in satoshis'
+						},
+						totalCapacitySats: {
+							type: 'integer',
+							description: 'Total channel capacity in satoshis'
+						},
+						channelCount: {
+							type: 'integer',
+							description: 'Total number of channels'
+						},
+						activeChannelCount: {
+							type: 'integer',
+							description: 'Number of NORMAL channels'
+						},
+						outboundLiquidityPct: {
+							type: 'integer',
+							description: 'Outbound liquidity percentage (0-100)'
+						},
+						inboundLiquidityPct: {
+							type: 'integer',
+							description: 'Inbound liquidity percentage (0-100)'
+						},
+						recommendations: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/LiquidityRecommendation' },
+							description: 'Actionable recommendations'
+						}
+					}
+				},
+				LiquidityRecommendation: {
+					type: 'object',
+					properties: {
+						type: {
+							type: 'string',
+							enum: ['OPEN_CHANNEL', 'CLOSE_CHANNEL', 'REBALANCE_NEEDED']
+						},
+						priority: {
+							type: 'string',
+							enum: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'INFO']
+						},
+						reason: {
+							type: 'string',
+							description: 'Human-readable explanation'
+						},
+						channelId: {
+							type: 'string',
+							description: 'Channel ID (for channel-specific recommendations)'
+						}
+					},
+					required: ['type', 'priority', 'reason']
+				},
+				WebhookRegistration: {
+					type: 'object',
+					properties: {
+						id: { type: 'string', description: 'Unique webhook ID' },
+						url: { type: 'string', description: 'URL to POST events to' },
+						events: {
+							type: 'array',
+							items: { type: 'string' },
+							description: 'Subscribed event types'
+						},
+						secret: {
+							type: 'string',
+							description: 'Masked secret (if configured)'
+						},
+						createdAt: {
+							type: 'integer',
+							description: 'Registration timestamp (ms)'
+						}
+					},
+					required: ['id', 'url', 'events', 'createdAt']
+				},
+				QueuedPayment: {
+					type: 'object',
+					properties: {
+						id: { type: 'string', description: 'Unique queue entry ID' },
+						bolt11: { type: 'string', description: 'BOLT 11 invoice' },
+						priority: {
+							type: 'integer',
+							description: 'Priority 1 (highest) to 10 (lowest)'
+						},
+						status: {
+							type: 'string',
+							enum: [
+								'queued',
+								'dispatching',
+								'completed',
+								'failed',
+								'cancelled'
+							]
+						},
+						amountSats: {
+							type: 'integer',
+							description: 'Payment amount in satoshis'
+						},
+						maxFeeSats: {
+							type: 'integer',
+							description: 'Maximum fee in satoshis'
+						},
+						metadata: {
+							type: 'object',
+							additionalProperties: { type: 'string' }
+						},
+						error: { type: 'string', description: 'Error message if failed' },
+						createdAt: {
+							type: 'integer',
+							description: 'Creation timestamp (ms)'
+						},
+						completedAt: {
+							type: 'integer',
+							description: 'Completion timestamp (ms)'
+						}
+					},
+					required: ['id', 'bolt11', 'priority', 'status', 'createdAt']
+				},
+				ActionLogEntry: {
+					type: 'object',
+					properties: {
+						category: {
+							type: 'string',
+							enum: ['payment', 'channel', 'htlc', 'fee', 'peer', 'chain'],
+							description: 'Log category'
+						},
+						action: {
+							type: 'string',
+							description: 'Action name (e.g. sent, received, ready)'
+						},
+						timestamp: {
+							type: 'integer',
+							description: 'Timestamp in milliseconds'
+						},
+						data: { type: 'object', description: 'Structured event data' }
+					},
+					required: ['category', 'action', 'timestamp', 'data']
+				},
+				ReadinessCheck: {
+					type: 'object',
+					properties: {
+						name: { type: 'string' },
+						status: { type: 'string', enum: ['PASS', 'WARN', 'FAIL'] },
+						severity: { type: 'string', enum: ['CRITICAL', 'WARNING', 'INFO'] },
+						message: { type: 'string' }
+					},
+					required: ['name', 'status', 'severity', 'message']
+				},
+				ReadinessReport: {
+					type: 'object',
+					properties: {
+						score: {
+							type: 'number',
+							description: 'Weighted pass rate (0-100)'
+						},
+						ready: {
+							type: 'boolean',
+							description: 'True if no CRITICAL checks have failed'
+						},
+						checks: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/ReadinessCheck' },
+							description: 'Individual readiness checks'
+						}
+					},
+					required: ['score', 'ready', 'checks']
+				},
+				ChannelHealth: {
+					type: 'object',
+					properties: {
+						channelId: { type: 'string' },
+						state: { type: 'string' },
+						localBalancePct: {
+							type: 'number',
+							description: 'Local balance as percentage of capacity (0-100)'
+						},
+						remoteBalancePct: {
+							type: 'number',
+							description: 'Remote balance as percentage of capacity (0-100)'
+						},
+						htlcCount: {
+							type: 'integer',
+							description: 'Number of active HTLCs'
+						},
+						maxHtlcs: { type: 'integer', description: 'Maximum HTLCs allowed' },
+						capacitySats: {
+							type: 'integer',
+							description: 'Total channel capacity in satoshis'
+						},
+						warnings: {
+							type: 'array',
+							items: {
+								type: 'string',
+								enum: [
+									'LOW_OUTBOUND_LIQUIDITY',
+									'LOW_INBOUND_LIQUIDITY',
+									'HTLC_SLOTS_NEARLY_FULL',
+									'AWAITING_REESTABLISH'
+								]
+							},
+							description: 'Active health warnings'
+						}
+					}
+				},
+				PaymentEstimate: {
+					type: 'object',
+					properties: {
+						successProbabilityPct: {
+							type: 'integer',
+							description: 'Estimated success probability (0-100)'
+						},
+						estimatedTimeMs: {
+							type: 'integer',
+							description: 'Estimated settlement time in milliseconds'
+						},
+						routeQuality: {
+							type: 'string',
+							enum: ['HIGH', 'MEDIUM', 'LOW'],
+							description: 'Route quality assessment'
+						},
+						warning: {
+							type: 'string',
+							description: 'Warning message (if any)'
+						},
+						alternativeAvailable: {
+							type: 'boolean',
+							description: 'Whether multi-path alternatives exist'
+						},
+						estimatedFeeSats: {
+							type: 'integer',
+							description: 'Estimated routing fee in satoshis'
+						},
+						hopCount: {
+							type: 'integer',
+							description: 'Number of hops in the route'
+						}
+					},
+					required: [
+						'successProbabilityPct',
+						'estimatedTimeMs',
+						'routeQuality',
+						'alternativeAvailable',
+						'estimatedFeeSats',
+						'hopCount'
+					]
+				},
+				RetryPaymentResult: {
+					type: 'object',
+					properties: {
+						paymentHash: { type: 'string' },
+						preimage: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						status: {
+							type: 'string',
+							enum: ['PENDING', 'COMPLETED', 'FAILED']
+						},
+						direction: { type: 'string', enum: ['OUTGOING', 'INCOMING'] },
+						failureCode: { type: 'integer' },
+						failureDescription: { type: 'string' },
+						createdAt: { type: 'integer' },
+						completedAt: { type: 'integer' },
+						metadata: { type: 'object' },
+						attempts: {
+							type: 'integer',
+							description: 'Number of attempts made (1 = first try succeeded)'
+						}
+					},
+					required: [
+						'paymentHash',
+						'amountSats',
+						'status',
+						'direction',
+						'createdAt',
+						'attempts'
+					]
+				},
+				ChannelSuggestion: {
+					type: 'object',
+					properties: {
+						nodeId: {
+							type: 'string',
+							description: 'Public key of the suggested node'
+						},
+						alias: { type: 'string', description: 'Node alias (if known)' },
+						score: { type: 'integer', description: 'Suggestion score (0-100)' },
+						channelCount: {
+							type: 'integer',
+							description: 'Number of channels the node has'
+						},
+						totalCapacitySats: {
+							type: 'integer',
+							description: 'Total capacity in satoshis'
+						},
+						reason: {
+							type: 'string',
+							description: 'Human-readable reason for the suggestion'
+						}
+					},
+					required: [
+						'nodeId',
+						'score',
+						'channelCount',
+						'totalCapacitySats',
+						'reason'
+					]
+				},
+				FeeSnapshot: {
+					type: 'object',
+					properties: {
+						currentSatPerVbyte: {
+							type: 'number',
+							description: 'Most recent fee rate sample (sat/vByte)'
+						},
+						trend: {
+							type: 'string',
+							enum: ['RISING', 'FALLING', 'STABLE'],
+							description: 'Fee rate trend over recent samples'
+						},
+						percentile: {
+							type: 'integer',
+							description: 'Current rate percentile within buffer (0-100)'
+						},
+						recommendation: {
+							type: 'string',
+							enum: ['OPEN_NOW', 'WAIT', 'NEUTRAL'],
+							description: 'Channel-open timing recommendation'
+						},
+						estimatedOpenChannelCostSats: {
+							type: 'integer',
+							description:
+								'Estimated cost to open a channel at current fee rate'
+						},
+						sampleCount: {
+							type: 'integer',
+							description: 'Number of fee rate samples in buffer (max 144)'
+						},
+						minSatPerVbyte: {
+							type: 'number',
+							description: 'Lowest fee rate in buffer'
+						},
+						maxSatPerVbyte: {
+							type: 'number',
+							description: 'Highest fee rate in buffer'
+						},
+						avgSatPerVbyte: {
+							type: 'number',
+							description: 'Average fee rate in buffer'
+						}
+					},
+					required: [
+						'currentSatPerVbyte',
+						'trend',
+						'percentile',
+						'recommendation',
+						'estimatedOpenChannelCostSats',
+						'sampleCount',
+						'minSatPerVbyte',
+						'maxSatPerVbyte',
+						'avgSatPerVbyte'
+					]
+				}
+			}
+		},
+		security: [{ bearerAuth: [] }]
+	};
+}
+
+function jsonContent(schema: Record<string, unknown>): Record<string, unknown> {
+	return {
+		'application/json': {
+			schema
+		}
+	};
+}
+
+function bodyContent(fields: Record<string, string>): Record<string, unknown> {
+	const properties: Record<string, Record<string, unknown>> = {};
+	const required: string[] = [];
+	for (const [key, value] of Object.entries(fields)) {
+		const isOptional = value.endsWith('?');
+		const type = isOptional ? value.slice(0, -1) : value;
+		if (type.startsWith('Record<')) {
+			properties[key] = {
+				type: 'object',
+				additionalProperties: { type: 'string' }
+			};
+		} else {
+			properties[key] = { type };
+		}
+		if (!isOptional) required.push(key);
+	}
+	return {
+		content: {
+			'application/json': {
+				schema: {
+					type: 'object',
+					properties,
+					...(required.length > 0 ? { required } : {})
+				}
+			}
+		}
+	};
+}

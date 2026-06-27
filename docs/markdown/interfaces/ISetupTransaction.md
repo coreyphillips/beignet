@@ -20,7 +20,7 @@
 
 #### Defined in
 
-[types/transaction.ts:26](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L26)
+[types/transaction.ts:34](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L34)
 
 ___
 
@@ -30,7 +30,7 @@ ___
 
 #### Defined in
 
-[types/transaction.ts:30](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L30)
+[types/transaction.ts:38](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L38)
 
 ___
 
@@ -40,7 +40,7 @@ ___
 
 #### Defined in
 
-[types/transaction.ts:28](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L28)
+[types/transaction.ts:36](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L36)
 
 ___
 
@@ -50,7 +50,7 @@ ___
 
 #### Defined in
 
-[types/transaction.ts:29](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L29)
+[types/transaction.ts:37](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L37)
 
 ___
 
@@ -60,4 +60,4 @@ ___
 
 #### Defined in
 
-[types/transaction.ts:27](https://github.com/synonymdev/beignet/blob/3144d66/src/types/transaction.ts#L27)
+[types/transaction.ts:35](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/transaction.ts#L35)

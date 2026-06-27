@@ -63,6 +63,9 @@ export class Electrum {
 	private connectionPollingInterval: NodeJS.Timeout | null;
 	private net: Net;
 	private tls: Tls;
+	/** Shared in-flight connect, so concurrent callers don't race (see connectToElectrum). */
+	private _connectInFlight: Promise<Result<TConnectToElectrumRes>> | null =
+		null;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -112,7 +115,30 @@ export class Electrum {
 		return this._wallet;
 	}
 
-	async connectToElectrum({
+	/**
+	 * Connect to the Electrum server.
+	 *
+	 * Concurrent callers share a single in-flight attempt. At startup several
+	 * independent paths (background refreshWallet, sweep-address lookup, header
+	 * subscription) can each trigger a connect at once; without this guard they
+	 * race over rn-electrum-client's shared global client, clobbering the socket
+	 * mid-connect so the losing attempt returns an error and logs a spurious
+	 * "Unable to connect to Electrum server." De-duping collapses them into one
+	 * real connect, so the others simply join its result.
+	 */
+	async connectToElectrum(args: {
+		network?: EAvailableNetworks;
+		servers?: TServer | TServer[];
+		disableRegtestCheck?: boolean;
+	}): Promise<Result<TConnectToElectrumRes>> {
+		if (this._connectInFlight) return this._connectInFlight;
+		this._connectInFlight = this._doConnect(args).finally(() => {
+			this._connectInFlight = null;
+		});
+		return this._connectInFlight;
+	}
+
+	private async _doConnect({
 		network = this.network,
 		servers,
 		disableRegtestCheck = false // Used to ignore regtest check for certain tests.
@@ -973,7 +999,9 @@ export class Electrum {
 				if (response.isOk()) {
 					// Re-Subscribe to Addresses & Headers
 					this.subscribeToAddresses({});
-					this.subscribeToHeader().then();
+					this.subscribeToHeader().catch(() => {
+						/* best-effort re-subscribe on reconnect */
+					});
 				} else {
 					this.publishConnectionChange(false);
 				}
