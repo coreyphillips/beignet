@@ -8,6 +8,7 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { sign, verify, getPublicKey } from '../crypto/ecdh';
+import { partialSign, type SessionKey } from '../crypto/musig';
 
 bitcoin.initEccLib(ecc);
 
@@ -85,6 +86,27 @@ export class ChannelSigner {
 			throw new Error(`Digest must be 32 bytes, got ${digest.length}`);
 		}
 		return sign(digest, this.fundingPrivkey);
+	}
+
+	/**
+	 * option_taproot: produce a MuSig2 partial signature over a commitment (or
+	 * closing) transaction with the funding key, for a signing session already
+	 * derived by the caller. The funding private key never leaves the signer.
+	 *
+	 * NONCE SAFETY (catastrophic if violated): `ourPublicNonce` MUST be the exact
+	 * single-use object returned by generateNonce for this session and must never
+	 * be reused for another sighash — the caller (channel state machine) owns that
+	 * lifecycle. Returns a 32-byte partial signature.
+	 */
+	signCommitmentPartial(
+		session: SessionKey,
+		ourPublicNonce: Uint8Array
+	): Buffer {
+		return partialSign({
+			secretKey: this.fundingPrivkey,
+			publicNonce: ourPublicNonce,
+			sessionKey: session
+		});
 	}
 
 	/**
@@ -179,7 +201,11 @@ export class ChannelSigner {
 			fundingAmount,
 			bitcoin.Transaction.SIGHASH_ALL
 		);
-		return verify(sigHash, remoteFundingPubkey, signature);
+		// strict (low-S): this signature goes into the funding 2-of-2 witness of a
+		// commitment/closing tx we broadcast. A high-S signature verifies but makes
+		// that tx non-standard/non-relayable, so reject it here rather than accept an
+		// unbroadcastable commitment (BIP146).
+		return verify(sigHash, remoteFundingPubkey, signature, true);
 	}
 
 	/**

@@ -912,6 +912,53 @@ describe('BOLT 12: Offers', () => {
 			mgr.destroy();
 		});
 
+		it('retains the issued invoice preimage and emits invoice:issued', () => {
+			const mgr = new OfferManager(privkey1);
+			const { offer } = mgr.createOffer({
+				description: 'payable',
+				amount: 50_000n
+			});
+
+			let issued: { invoice: IBolt12Invoice; preimage: Buffer } | null = null;
+			mgr.on('invoice:issued', (invoice: IBolt12Invoice, preimage: Buffer) => {
+				issued = { invoice, preimage };
+			});
+
+			const request: IInvoiceRequest = {
+				payerKey: pubkey2,
+				offerId: offer.offerId,
+				amount: 50_000n
+			};
+			const requestTlv = encodeInvoiceRequestTlv(
+				request,
+				encodeOfferTlv(offer)
+			);
+			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
+
+			// The issuer-side event carries the secret preimage (never on the wire).
+			expect(issued, 'invoice:issued fired').to.not.be.null;
+			expect(issued!.invoice.paymentHash.equals(invoice.paymentHash)).to.be
+				.true;
+			expect(issued!.preimage.length).to.equal(32);
+			// preimage hashes to the invoice payment_hash.
+			const hash = crypto
+				.createHash('sha256')
+				.update(issued!.preimage)
+				.digest();
+			expect(hash.equals(invoice.paymentHash)).to.be.true;
+
+			// And it is retrievable by payment_hash for the node to fulfill with.
+			const got = mgr.getInvoicePreimage(invoice.paymentHash);
+			expect(got, 'getInvoicePreimage returns the preimage').to.not.be
+				.undefined;
+			expect(got!.equals(issued!.preimage)).to.be.true;
+
+			// Unknown hash → undefined (e.g. the payer side, which holds no preimage).
+			expect(mgr.getInvoicePreimage(crypto.randomBytes(32))).to.be.undefined;
+
+			mgr.destroy();
+		});
+
 		it('should reject expired offer', () => {
 			const mgr = new OfferManager(privkey1);
 			const { offer } = mgr.createOffer({
@@ -1169,6 +1216,13 @@ describe('BOLT 12: Offers', () => {
 				graph,
 				nodeA,
 				blindedPath,
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: 1_000_000_000n
+				},
 				1000n,
 				40
 			);
@@ -1200,6 +1254,13 @@ describe('BOLT 12: Offers', () => {
 				graph,
 				pubkey1,
 				blindedPath,
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: 1_000_000_000n
+				},
 				1000n,
 				40
 			);
@@ -1224,6 +1285,13 @@ describe('BOLT 12: Offers', () => {
 				graph,
 				pubkey1,
 				blindedPath,
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: 1_000_000_000n
+				},
 				1000n,
 				40
 			);
@@ -1242,6 +1310,13 @@ describe('BOLT 12: Offers', () => {
 				graph,
 				pubkey1,
 				blindedPath,
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: 1_000_000_000n
+				},
 				1000n,
 				40
 			);

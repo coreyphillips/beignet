@@ -56,13 +56,20 @@ function encodeTlvRecord(type: number, value: Buffer): Buffer {
 export function encodeHopPayload(payload: IHopPayload): Buffer {
 	const records: Buffer[] = [];
 
-	// Type 2: amt_to_forward (tu64)
-	const amtBytes = encodeTruncatedUint(payload.amountToForwardMsat);
-	records.push(encodeTlvRecord(2, amtBytes));
+	// BOLT 4: a blinded INTERMEDIATE hop's payload carries ONLY
+	// encrypted_recipient_data (+ the introduction node's blinding_point). It MUST
+	// NOT include amt_to_forward / outgoing_cltv_value (the hop derives those from
+	// its encrypted payment_relay + the incoming HTLC). Including them makes LND
+	// reject the onion with invalid_onion_blinding.
+	if (!payload.omitForwardAmounts) {
+		// Type 2: amt_to_forward (tu64)
+		const amtBytes = encodeTruncatedUint(payload.amountToForwardMsat);
+		records.push(encodeTlvRecord(2, amtBytes));
 
-	// Type 4: outgoing_cltv_value (tu32)
-	const cltvBytes = encodeTruncatedUint(BigInt(payload.outgoingCltvValue));
-	records.push(encodeTlvRecord(4, cltvBytes));
+		// Type 4: outgoing_cltv_value (tu32)
+		const cltvBytes = encodeTruncatedUint(BigInt(payload.outgoingCltvValue));
+		records.push(encodeTlvRecord(4, cltvBytes));
+	}
 
 	// Type 6: short_channel_id (8 bytes, omitted for final hop)
 	if (payload.shortChannelId) {

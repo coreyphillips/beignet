@@ -59,7 +59,24 @@ export enum Feature {
 	/** Keysend (bLIP-0003) — spontaneous payments via sender-generated preimage */
 	KEYSEND = 54,
 	/** Channel splicing (lightning/bolts PR #1160, option_splice) */
-	SPLICE = 62
+	SPLICE = 62,
+	/**
+	 * Simple taproot channels (option_taproot, lightning/bolts PR #995): MuSig2
+	 * key-spend P2TR funding + taproot commitment/HTLC outputs.
+	 *
+	 * Bits 180/181 — LND's *staging* assignment (`simple-taproot-chans-x`), which
+	 * is what LND v0.20 actually advertises (verified live: getinfo shows feature
+	 * 181). The "final" bits 80/81 are reserved in the spec but NOT yet activated
+	 * by any production node, so we negotiate the staging bit for interop. With
+	 * base=180, setOptional() advertises bit 181, matching LND exactly.
+	 */
+	OPTION_TAPROOT = 180,
+	/**
+	 * Liquidity ads / option_will_fund (bLIP-0051): advertises that this node
+	 * leases inbound liquidity (rates carried in node_announcement). Experimental
+	 * bit pending a spec assignment.
+	 */
+	OPTION_WILL_FUND = 112
 }
 
 /**

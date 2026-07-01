@@ -705,9 +705,16 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 			opener.markForReestablish();
 
 			const state = opener.getFullState();
+			// option_taproot: the peer's signing nonce for the current commitment is
+			// persisted so a restored taproot channel can still force-close.
+			state.remoteSigningNonce = crypto.randomBytes(66);
 			const serialized = serializeChannelState(state);
 			const deserialized = deserializeChannelState(serialized);
 
+			expect(deserialized.remoteSigningNonce, 'remoteSigningNonce round-trips')
+				.to.not.be.undefined;
+			expect(deserialized.remoteSigningNonce!.equals(state.remoteSigningNonce!))
+				.to.be.true;
 			expect(deserialized.lastSentCommitmentSigned).to.not.be.null;
 			expect(
 				deserialized.lastSentCommitmentSigned!.equals(

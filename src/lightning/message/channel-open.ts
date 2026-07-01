@@ -45,6 +45,12 @@ import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
 /** TLV types for open_channel / accept_channel */
 const TLV_UPFRONT_SHUTDOWN_SCRIPT = 0n;
 const TLV_CHANNEL_TYPE = 1n;
+/**
+ * option_taproot: the sender's MuSig2 public nonce (66 bytes) for co-signing the
+ * FIRST commitment. Present only for taproot channels. (Type 4 matches LND's
+ * local_nonce convention; pin against LND at interop time.)
+ */
+const TLV_NEXT_LOCAL_NONCE = 4n;
 
 export interface IOpenChannelMessage {
 	chainHash: Buffer;
@@ -67,6 +73,8 @@ export interface IOpenChannelMessage {
 	channelFlags: number;
 	upfrontShutdownScript?: Buffer;
 	channelType?: Buffer;
+	/** option_taproot: 66-byte MuSig2 public nonce for the first commitment. */
+	nextLocalNonce?: Buffer;
 }
 
 export interface IAcceptChannelMessage {
@@ -86,6 +94,8 @@ export interface IAcceptChannelMessage {
 	firstPerCommitmentPoint: Buffer;
 	upfrontShutdownScript?: Buffer;
 	channelType?: Buffer;
+	/** option_taproot: 66-byte MuSig2 public nonce for the first commitment. */
+	nextLocalNonce?: Buffer;
 }
 
 const OPEN_CHANNEL_FIXED_LENGTH = 319;
@@ -146,6 +156,9 @@ export function encodeOpenChannelMessage(msg: IOpenChannelMessage): Buffer {
 	}
 	if (msg.channelType) {
 		tlvRecords.push({ type: TLV_CHANNEL_TYPE, value: msg.channelType });
+	}
+	if (msg.nextLocalNonce) {
+		tlvRecords.push({ type: TLV_NEXT_LOCAL_NONCE, value: msg.nextLocalNonce });
 	}
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
@@ -238,6 +251,8 @@ export function decodeOpenChannelMessage(payload: Buffer): IOpenChannelMessage {
 				result.upfrontShutdownScript = record.value;
 			} else if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
+			} else if (record.type === TLV_NEXT_LOCAL_NONCE) {
+				result.nextLocalNonce = record.value;
 			}
 		}
 	}
@@ -292,6 +307,9 @@ export function encodeAcceptChannelMessage(msg: IAcceptChannelMessage): Buffer {
 	}
 	if (msg.channelType) {
 		tlvRecords.push({ type: TLV_CHANNEL_TYPE, value: msg.channelType });
+	}
+	if (msg.nextLocalNonce) {
+		tlvRecords.push({ type: TLV_NEXT_LOCAL_NONCE, value: msg.nextLocalNonce });
 	}
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
@@ -373,6 +391,8 @@ export function decodeAcceptChannelMessage(
 				result.upfrontShutdownScript = record.value;
 			} else if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
+			} else if (record.type === TLV_NEXT_LOCAL_NONCE) {
+				result.nextLocalNonce = record.value;
 			}
 		}
 	}

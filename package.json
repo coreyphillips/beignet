@@ -48,9 +48,18 @@
   ],
   "types": "dist/types/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/types/index.d.ts", "default": "./dist/index.js" },
-    "./lightning": { "types": "./dist/types/lightning/index.d.ts", "default": "./dist/lightning/index.js" },
-    "./cli": { "types": "./dist/types/cli/index.d.ts", "default": "./dist/cli/index.js" }
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./lightning": {
+      "types": "./dist/types/lightning/index.d.ts",
+      "default": "./dist/lightning/index.js"
+    },
+    "./cli": {
+      "types": "./dist/types/cli/index.d.ts",
+      "default": "./dist/cli/index.js"
+    }
   },
   "engines": {
     "node": ">=18.0.0"
@@ -69,6 +78,7 @@
   "homepage": "https://github.com/coreyphillips/beignet#readme",
   "dependencies": {
     "@bitcoinerlab/secp256k1": "1.0.5",
+    "@brandonblack/musig": "^0.0.1-alpha.1",
     "@types/better-sqlite3": "^7.6.13",
     "bech32": "2.0.0",
     "better-sqlite3": "^12.6.2",

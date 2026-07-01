@@ -32,6 +32,13 @@ export interface IChannelReestablishMessage {
 	 * using the original 32-byte TLV.
 	 */
 	nextFundingRetransmitFlags?: number;
+	/**
+	 * option_taproot: a freshly-generated MuSig2 verification public nonce (66
+	 * bytes) re-seeding the peer for the next commitment. The in-memory nonces are
+	 * lost on reconnect, so both sides regenerate and re-exchange them here (LND
+	 * local_nonce, TLV type 4 — same convention as open/accept/revoke).
+	 */
+	nextLocalNonce?: Buffer;
 }
 
 const CHANNEL_REESTABLISH_LENGTH = 113; // 32 + 8 + 8 + 32 + 33
@@ -44,6 +51,8 @@ const CHANNEL_REESTABLISH_LENGTH = 113; // 32 + 8 + 8 + 32 + 33
 // even TLVs are fatal. So: always SEND type 1, ACCEPT both on decode.
 const TLV_NEXT_FUNDING = 1n;
 const TLV_NEXT_FUNDING_LEGACY = 0n;
+/** option_taproot verification nonce (LND local_nonce convention). */
+const TLV_NEXT_LOCAL_NONCE = 4n;
 
 /**
  * Encode a `channel_reestablish` message payload.
@@ -79,6 +88,17 @@ export function encodeChannelReestablishMessage(
 				msg.nextFundingTxid,
 				Buffer.from([msg.nextFundingRetransmitFlags ?? 0])
 			])
+		});
+	}
+	if (msg.nextLocalNonce) {
+		if (msg.nextLocalNonce.length !== 66) {
+			throw new Error(
+				`next_local_nonce must be 66 bytes, got ${msg.nextLocalNonce.length}`
+			);
+		}
+		tlvRecords.push({
+			type: TLV_NEXT_LOCAL_NONCE,
+			value: msg.nextLocalNonce
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -141,6 +161,11 @@ export function decodeChannelReestablishMessage(
 				if (record.value.length >= 33) {
 					result.nextFundingRetransmitFlags = record.value[32];
 				}
+			} else if (
+				record.type === TLV_NEXT_LOCAL_NONCE &&
+				record.value.length === 66
+			) {
+				result.nextLocalNonce = Buffer.from(record.value);
 			}
 		}
 	}

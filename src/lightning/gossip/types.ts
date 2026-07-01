@@ -30,6 +30,25 @@ export interface IChannelAnnouncementMessage {
 	bitcoinKey2: Buffer;
 }
 
+/**
+ * Liquidity-ads lease rates (bLIP-0051 option_will_fund), advertised in a
+ * node_announcement trailing TLV. Lets a buyer compute the lease fee a seller
+ * charges to fund inbound liquidity, and bounds the routing fees the seller may
+ * charge over the lease.
+ */
+export interface ILeaseRates {
+	/** Seller's per-input funding weight, used to charge mining-fee share (u16). */
+	fundingWeightWitness: number;
+	/** Proportional lease fee in 1/10_000 of the leased amount (u16). */
+	leaseFeeBasis: number;
+	/** Flat lease fee in satoshis (u32). */
+	leaseFeeBaseSat: number;
+	/** Max routing base fee (msat) the seller may charge over the lease (u32). */
+	channelFeeMaxBaseMsat: number;
+	/** Max routing proportional fee in 1/1000 the seller may charge (u16). */
+	channelFeeMaxProportionalThousandths: number;
+}
+
 export interface INodeAnnouncementMessage {
 	signature: Buffer;
 	features: Buffer;
@@ -38,6 +57,41 @@ export interface INodeAnnouncementMessage {
 	rgbColor: Buffer;
 	alias: Buffer;
 	addresses: INodeAddress[];
+	/** Liquidity-ads lease rates (node_ann_tlvs type 1, option_will_fund). */
+	leaseRates?: ILeaseRates;
+}
+
+/** node_ann_tlvs TLV type for the option_will_fund lease-rates record. */
+export const NODE_ANN_TLV_LEASE_RATES = 1n;
+
+/** Serialized length of the lease-rates record (2+2+4+4+2). */
+export const LEASE_RATES_LENGTH = 14;
+
+/** Encode lease rates into the 14-byte option_will_fund record. */
+export function encodeLeaseRates(rates: ILeaseRates): Buffer {
+	const buf = Buffer.alloc(LEASE_RATES_LENGTH);
+	buf.writeUInt16BE(rates.fundingWeightWitness, 0);
+	buf.writeUInt16BE(rates.leaseFeeBasis, 2);
+	buf.writeUInt32BE(rates.leaseFeeBaseSat, 4);
+	buf.writeUInt32BE(rates.channelFeeMaxBaseMsat, 8);
+	buf.writeUInt16BE(rates.channelFeeMaxProportionalThousandths, 12);
+	return buf;
+}
+
+/** Decode the 14-byte option_will_fund lease-rates record. */
+export function decodeLeaseRates(buf: Buffer): ILeaseRates {
+	if (buf.length < LEASE_RATES_LENGTH) {
+		throw new Error(
+			`lease_rates too short: need ${LEASE_RATES_LENGTH} bytes, got ${buf.length}`
+		);
+	}
+	return {
+		fundingWeightWitness: buf.readUInt16BE(0),
+		leaseFeeBasis: buf.readUInt16BE(2),
+		leaseFeeBaseSat: buf.readUInt32BE(4),
+		channelFeeMaxBaseMsat: buf.readUInt32BE(8),
+		channelFeeMaxProportionalThousandths: buf.readUInt16BE(12)
+	};
 }
 
 export interface IChannelUpdateMessage {
@@ -117,6 +171,16 @@ export interface IRouteHop {
 	feeBaseMsat: number;
 	feeProportionalMillionths: number;
 	cltvExpiryDelta: number;
+	/**
+	 * Route blinding (BOLT 4): encrypted_recipient_data destined for THIS hop
+	 * (onion TLV 10). Present on the introduction node and every blinded hop.
+	 */
+	encryptedRecipientData?: Buffer;
+	/**
+	 * Route blinding (BOLT 4): blinding_point (onion TLV 12). Present only on the
+	 * introduction node — downstream blinded hops derive their own.
+	 */
+	blindingPoint?: Buffer;
 }
 
 export interface IRoute {

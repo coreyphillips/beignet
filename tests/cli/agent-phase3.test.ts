@@ -220,6 +220,13 @@ describe('findRouteToBlindedPath mission control wiring', () => {
 			graph,
 			source,
 			blindedPath,
+			{
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 1_000_000_000n
+			},
 			1000n,
 			40,
 			20,
@@ -247,6 +254,13 @@ describe('findRouteToBlindedPath mission control wiring', () => {
 			graph,
 			source,
 			blindedPath,
+			{
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 1_000_000_000n
+			},
 			1000n,
 			40,
 			20,
@@ -278,6 +292,13 @@ describe('findRouteToBlindedPath mission control wiring', () => {
 			graph,
 			source,
 			blindedPath,
+			{
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 1_000_000_000n
+			},
 			1000n,
 			40,
 			20,
@@ -306,6 +327,13 @@ describe('findRouteToBlindedPath mission control wiring', () => {
 			graph,
 			source,
 			blindedPath,
+			{
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 1_000_000_000n
+			},
 			5000n,
 			40
 		);

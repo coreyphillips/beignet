@@ -12,11 +12,23 @@ import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	HtlcState,
+	HtlcDirection
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	encodeOfferTlv,
+	encodeInvoiceRequestTlv,
+	IInvoiceRequest
+} from '../../src/lightning/offer';
+import {
+	constructBlindedPath,
+	IBlindedHopData
+} from '../../src/lightning/onion/blinded-path';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import {
 	encodeChannelAnnouncementMessage,
@@ -956,6 +968,136 @@ describe('Lightning Node', function () {
 			expect(eventFired).to.be.true;
 		});
 
+		it('settles an incoming HTLC for a BOLT 12 offer invoice (preimage wired from OfferManager)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			// Bob publishes a BOLT 12 offer and issues an invoice in response to an
+			// invoice_request (the RECEIVE side). The fix wires the issued preimage
+			// from the OfferManager into Bob's node receive stores so an incoming HTLC
+			// for this payment_hash can actually be fulfilled.
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat
+			});
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(makeNodeConfig(1).nodePrivateKey),
+				offerId: offer.offerId,
+				amount: amountMsat
+			};
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, encodeOfferTlv(offer))
+			)!;
+			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+
+			// The wiring registered the preimage + secret + amount into the SAME
+			// stores the BOLT 11 receive path consults (these were previously absent,
+			// so the HTLC was failed with unknown_payment_hash).
+			const hashHex = b12.paymentHash.toString('hex');
+			expect(bob['preimages'].has(hashHex), 'preimage registered').to.be.true;
+			expect(bob['paymentSecrets'].has(hashHex), 'secret registered').to.be
+				.true;
+			expect(bob['invoices'].has(hashHex), 'invoice registered').to.be.true;
+
+			// Alice has no BOLT 12 send pipeline in this harness, so transport the
+			// invoice's (payment_hash, payment_secret, amount) to her sender via a
+			// BOLT 11 string signed by Bob. Bob only ever sees the resulting HTLC,
+			// which it settles from the OfferManager-issued preimage now in its store.
+			const bolt11 = encodeInvoice({
+				network: Network.REGTEST,
+				amountMsat,
+				paymentHash: b12.paymentHash,
+				paymentSecret: b12.paymentSecret!,
+				description: 'bolt12 receive',
+				privateKey: makeNodeConfig(2).nodePrivateKey
+			});
+
+			let received: IPaymentInfo | null = null;
+			bob.on('payment:received', (p: IPaymentInfo) => {
+				received = p;
+			});
+
+			const sent = alice.sendPayment(bolt11);
+
+			// Alice's payment COMPLETED ⇒ Bob revealed the preimage, i.e. Bob
+			// fulfilled the HTLC from the OfferManager-issued preimage now wired into
+			// its receive store (without the fix this HTLC would be failed).
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			// Bob emitted payment:received and recorded the incoming payment.
+			expect(received, 'bob received the BOLT 12 payment').to.not.be.null;
+			expect(received!.status).to.equal(PaymentStatus.COMPLETED);
+			const bobPayment = bob.getPayment(b12.paymentHash);
+			expect(bobPayment, 'bob recorded the payment').to.exist;
+			expect(bobPayment!.preimage, 'fulfilled with a preimage').to.exist;
+			const hash = crypto
+				.createHash('sha256')
+				.update(bobPayment!.preimage!)
+				.digest();
+			expect(hash.equals(b12.paymentHash), 'preimage hashes to invoice hash').to
+				.be.true;
+		});
+
+		it('consumes an on-chain-learned preimage: seeds monitors + fulfills the inbound leg (H3)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2); // bob = the forwarding node
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const cm = bob.getChannelManager();
+			const bobChannel = cm.listChannels()[0];
+
+			// A live INBOUND (received) HTLC on bob — the leg bob must settle once it
+			// learns the preimage (e.g. its downstream force-closed and swept the
+			// outgoing HTLC on-chain, revealing it).
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			bobChannel.getFullState().htlcs.set('received-7', {
+				id: 7n,
+				amountMsat: 3_000_000n,
+				paymentHash,
+				cltvExpiry: 800_000,
+				onionRoutingPacket: crypto.randomBytes(1366),
+				direction: HtlcDirection.RECEIVED,
+				state: HtlcState.COMMITTED
+			});
+
+			// Spy the two effects the handler must produce (isolated from the full
+			// commitment machinery).
+			let recorded: { hash: string; pre: string } | null = null;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).recordPreimage = (h: Buffer, p: Buffer) => {
+				recorded = { hash: h.toString('hex'), pre: p.toString('hex') };
+			};
+			let fulfilled: { id: bigint; pre: string } | null = null;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).fulfillHtlc = (_cid: Buffer, id: bigint, p: Buffer) => {
+				fulfilled = { id, pre: p.toString('hex') };
+				return { ok: true, actions: [] };
+			};
+
+			// Fire the on-chain preimage the way ChainMonitor → processChainActions does.
+			cm.emit('preimage:learned', paymentHash, preimage);
+
+			// 1) Seeded every monitor for on-chain claim of any inbound HTLC of this hash.
+			expect(recorded, 'recordPreimage called').to.not.be.null;
+			expect(recorded!.hash).to.equal(paymentHash.toString('hex'));
+			expect(recorded!.pre).to.equal(preimage.toString('hex'));
+			// 2) Off-chain settled the matching inbound leg.
+			expect(fulfilled, 'inbound leg fulfilled').to.not.be.null;
+			expect(fulfilled!.id).to.equal(7n);
+			expect(fulfilled!.pre).to.equal(preimage.toString('hex'));
+			// 3) Preimage persisted on the node.
+			expect(bob['preimages'].has(paymentHash.toString('hex'))).to.be.true;
+		});
+
 		it('should update payment status to COMPLETED', function () {
 			const alice = createNode(1);
 			const bob = createNode(2);
@@ -1179,6 +1321,396 @@ describe('Lightning Node', function () {
 		});
 	});
 
+	describe('Hold Invoices (M2.1)', function () {
+		it('parks the HTLC and settles on demand', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold',
+				hold: true
+			});
+
+			let held = false;
+			bob.on('htlc:held', () => {
+				held = true;
+			});
+
+			alice.sendPayment(invoice.bolt11);
+
+			// HTLC is parked: Bob has not received (settled) it yet.
+			expect(held, 'htlc:held emitted').to.be.true;
+			expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+			expect(bob.listHeldHtlcs()).to.have.length(1);
+
+			// Release it — both sides complete and preimages match.
+			expect(bob.settleHeldHtlc(invoice.paymentHash)).to.be.true;
+			expect(bob.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(bob.listHeldHtlcs()).to.have.length(0);
+		});
+
+		it('cancels a held HTLC, failing the payment back', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-cancel',
+				hold: true
+			});
+
+			alice.sendPayment(invoice.bolt11);
+			expect(bob.listHeldHtlcs()).to.have.length(1);
+
+			expect(bob.cancelHeldHtlc(invoice.paymentHash)).to.be.true;
+			expect(bob.listHeldHtlcs()).to.have.length(0);
+			// Bob never completed; Alice's outgoing payment did not succeed.
+			expect(bob.getPayment(invoice.paymentHash)!.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.status).to.not.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+
+		it('supports an externally-supplied payment hash (preimage held elsewhere)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const externalPreimage = crypto.randomBytes(32);
+			const externalHash = crypto
+				.createHash('sha256')
+				.update(externalPreimage)
+				.digest();
+
+			const invoice = bob.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'hold-external',
+				hold: true,
+				paymentHash: externalHash
+			});
+			expect(invoice.paymentHash).to.deep.equal(externalHash);
+
+			alice.sendPayment(invoice.bolt11);
+			expect(bob.listHeldHtlcs()).to.have.length(1);
+
+			// Wrong preimage is rejected; the correct external preimage settles.
+			expect(() =>
+				bob.settleHeldHtlc(externalHash, crypto.randomBytes(32))
+			).to.throw();
+			expect(bob.settleHeldHtlc(externalHash, externalPreimage)).to.be.true;
+			expect(alice.getPayment(externalHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+	});
+
+	describe('Async Payments (M2.2)', function () {
+		it('LSP holds the forward until release, then the offline receiver is paid', function () {
+			const alice = createNode(1); // sender
+			const lsp = createNode(2); // always-online LSP / introduction node
+			const carol = createNode(3); // offline receiver
+
+			connectNodes(alice, lsp);
+			connectNodes(lsp, carol);
+
+			const abChannelId = openReadyChannel(alice, lsp, 1_000_000n);
+			const bcChannelId = openReadyChannel(lsp, carol, 1_000_000n);
+
+			const scidAB = encodeShortChannelId({
+				block: 700,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidBC = encodeShortChannelId({
+				block: 700,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			lsp.registerChannelScid(abChannelId, scidAB);
+			lsp.registerChannelScid(bcChannelId, scidBC);
+			carol
+				.getChannelManager()
+				.getChannel(bcChannelId)!
+				.getFullState().shortChannelId = scidBC;
+
+			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
+
+			// Carol issues an async invoice: blinded path through the LSP, marked
+			// hold_htlc so the LSP parks the HTLC while she is offline.
+			const invoice = carol.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'async',
+				useBlindedPaths: true,
+				asyncHold: true
+			});
+
+			let heldForward = false;
+			lsp.on('htlc:held-forward', () => {
+				heldForward = true;
+			});
+
+			alice.sendPayment(invoice.bolt11);
+
+			// LSP parked the forward; Carol has NOT been paid yet.
+			expect(heldForward, 'LSP parked the forward').to.be.true;
+			expect(lsp.listHeldForwards()).to.have.length(1);
+			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.PENDING
+			);
+
+			// Carol comes online → LSP releases the held forward → Carol is paid.
+			expect(lsp.releaseHeldForward(invoice.paymentHash)).to.be.true;
+			expect(lsp.listHeldForwards()).to.have.length(0);
+			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+
+		it('release via a release_held_htlc onion message from the receiver', function () {
+			const alice = createNode(1);
+			const lsp = createNode(2);
+			const carol = createNode(3);
+
+			connectNodes(alice, lsp);
+			connectNodes(lsp, carol);
+
+			const abChannelId = openReadyChannel(alice, lsp, 1_000_000n);
+			const bcChannelId = openReadyChannel(lsp, carol, 1_000_000n);
+			const scidAB = encodeShortChannelId({
+				block: 710,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidBC = encodeShortChannelId({
+				block: 710,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			lsp.registerChannelScid(abChannelId, scidAB);
+			lsp.registerChannelScid(bcChannelId, scidBC);
+			carol
+				.getChannelManager()
+				.getChannel(bcChannelId)!
+				.getFullState().shortChannelId = scidBC;
+			buildThreeNodeGraph(alice, lsp, carol, scidAB, scidBC);
+
+			// Wire onion-message delivery Carol → LSP (no networking in this harness).
+			carol
+				.getOnionMessageManager()
+				.setSendFunction((toPeer: string, _type: number, payload: Buffer) => {
+					if (toPeer === lsp.getNodeId()) {
+						lsp
+							.getOnionMessageManager()
+							.handleMessage(carol.getNodeId(), payload);
+					}
+				});
+
+			const invoice = carol.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'async-msg',
+				useBlindedPaths: true,
+				asyncHold: true
+			});
+
+			alice.sendPayment(invoice.bolt11);
+			expect(lsp.listHeldForwards()).to.have.length(1);
+
+			// Carol sends release_held_htlc as an onion message to the LSP.
+			carol.sendAsyncRelease(
+				Buffer.from(lsp.getNodeId(), 'hex'),
+				invoice.paymentHash
+			);
+
+			expect(lsp.listHeldForwards()).to.have.length(0);
+			expect(carol.getPayment(invoice.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+	});
+
+	describe('Multi-hop blinded paths (M1-FU4)', function () {
+		function nodePrivkeyFor(seedId: number): Buffer {
+			return crypto
+				.createHash('sha256')
+				.update(makeSeed(seedId))
+				.update(Buffer.from('node-identity'))
+				.digest();
+		}
+
+		it('pays a 3-hop blinded path (Alice → Bob(intro) → Carol(mid) → Dave)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			const carol = createNode(3);
+			const dave = createNode(4);
+			connectNodes(alice, bob);
+			connectNodes(bob, carol);
+			connectNodes(carol, dave);
+
+			const abChannelId = openReadyChannel(alice, bob, 2_000_000n);
+			const bcChannelId = openReadyChannel(bob, carol, 2_000_000n);
+			const cdChannelId = openReadyChannel(carol, dave, 2_000_000n);
+
+			const scidAB = encodeShortChannelId({
+				block: 900,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidBC = encodeShortChannelId({
+				block: 900,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			const scidCD = encodeShortChannelId({
+				block: 900,
+				txIndex: 3,
+				outputIndex: 0
+			});
+			bob.registerChannelScid(abChannelId, scidAB);
+			bob.registerChannelScid(bcChannelId, scidBC);
+			carol.registerChannelScid(bcChannelId, scidBC);
+			carol.registerChannelScid(cdChannelId, scidCD);
+
+			const alicePub = getPublicKey(nodePrivkeyFor(1));
+			const bobPub = getPublicKey(nodePrivkeyFor(2));
+			const carolPub = getPublicKey(nodePrivkeyFor(3));
+			const davePub = getPublicKey(nodePrivkeyFor(4));
+
+			// Alice needs a graph route to Bob (the introduction node).
+			const abIs1 = Buffer.compare(alicePub, bobPub) < 0;
+			alice.getGraph().addChannelAnnouncement({
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scidAB,
+				nodeId1: abIs1 ? alicePub : bobPub,
+				nodeId2: abIs1 ? bobPub : alicePub,
+				bitcoinKey1: Buffer.alloc(33, 2),
+				bitcoinKey2: Buffer.alloc(33, 3)
+			});
+			for (const dir of [0, 1]) {
+				alice.getGraph().applyChannelUpdate({
+					signature: Buffer.alloc(64),
+					chainHash: BITCOIN_CHAIN_HASH,
+					shortChannelId: scidAB,
+					timestamp: Math.floor(Date.now() / 1000),
+					messageFlags: 1,
+					channelFlags: dir,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 1000n,
+					feeBaseMsat: 1000,
+					feeProportionalMillionths: 1,
+					htlcMaximumMsat: 1_000_000_000n
+				});
+			}
+			alice.registerChannelScid(abChannelId, scidAB);
+
+			// Dave registers the preimage/secret via a normal invoice, then we re-issue
+			// it carrying a hand-built 3-hop blinded path through Bob and Carol.
+			const baseInv = dave.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'mh'
+			});
+			const decoded = decodeInvoice(baseInv.bolt11);
+
+			const constraints = { maxCltvExpiry: 10_000_000, htlcMinimumMsat: 0n };
+			// feeProp=0 so per-hop fees distribute exactly across the chain.
+			const relay = {
+				cltvExpiryDelta: 40,
+				feeProportionalMillionths: 0,
+				feeBaseMsat: 1000
+			};
+			const hopData: IBlindedHopData[] = [
+				{
+					nextNodeId: carolPub,
+					shortChannelId: scidBC,
+					paymentRelay: relay,
+					paymentConstraints: constraints
+				},
+				{
+					nextNodeId: davePub,
+					shortChannelId: scidCD,
+					paymentRelay: relay,
+					paymentConstraints: constraints
+				},
+				{ paymentConstraints: constraints }
+			];
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[bobPub, carolPub, davePub],
+				hopData
+			);
+			const payInfo = {
+				feeBaseMsat: 2000, // sum of the two forwarding hops' base fees
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 80, // sum of the two hops' deltas
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 1_000_000_000n
+			};
+
+			const invoiceStr = encodeInvoice({
+				network: Network.REGTEST,
+				amountMsat: 5_000_000n,
+				paymentHash: decoded.paymentHash,
+				paymentSecret: decoded.paymentSecret,
+				description: 'mh-blinded',
+				blindedPaths: [{ path, payInfo }],
+				minFinalCltvExpiry: 40,
+				privateKey: nodePrivkeyFor(4)
+			});
+
+			let bobFwd = false;
+			let carolFwd = false;
+			bob.on('htlc:forward', () => {
+				bobFwd = true;
+			});
+			carol.on('htlc:forward', () => {
+				carolFwd = true;
+			});
+
+			alice.sendPayment(invoiceStr);
+
+			// The HTLC traversed both blinded forwarding hops to the recipient.
+			expect(bobFwd, 'Bob (intro) forwarded').to.be.true;
+			expect(carolFwd, 'Carol (mid) forwarded').to.be.true;
+			expect(dave.getPayment(decoded.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(alice.getPayment(decoded.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
+	});
+
 	describe('HTLC Forwarding', function () {
 		it('should forward HTLC through intermediate node (3-hop payment)', function () {
 			const alice = createNode(1);
@@ -1285,6 +1817,77 @@ describe('Lightning Node', function () {
 			alice.sendPayment(invoice.bolt11);
 
 			expect(forwardEmitted).to.be.true;
+		});
+
+		it('should pay a blinded-path invoice end-to-end (Alice → Bob(intro) → Charlie)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			const charlie = createNode(3);
+
+			connectNodes(alice, bob);
+			connectNodes(bob, charlie);
+
+			const abChannelId = openReadyChannel(alice, bob, 1_000_000n);
+			const bcChannelId = openReadyChannel(bob, charlie, 1_000_000n);
+
+			const scidAB = encodeShortChannelId({
+				block: 600,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidBC = encodeShortChannelId({
+				block: 600,
+				txIndex: 2,
+				outputIndex: 0
+			});
+
+			// Bob (introduction/forwarding node) maps scidBC → its channel to Charlie.
+			bob.registerChannelScid(abChannelId, scidAB);
+			bob.registerChannelScid(bcChannelId, scidBC);
+
+			// Charlie must embed scidBC in its blinded path so Bob can forward to it.
+			charlie
+				.getChannelManager()
+				.getChannel(bcChannelId)!
+				.getFullState().shortChannelId = scidBC;
+
+			// Alice needs a route to the introduction node (Bob).
+			buildThreeNodeGraph(alice, bob, charlie, scidAB, scidBC);
+
+			// Charlie issues a blinded invoice; the payee node id is hidden behind Bob.
+			const invoice = charlie.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'blinded e2e',
+				useBlindedPaths: true
+			});
+			const decoded = decodeInvoice(invoice.bolt11);
+			expect(
+				decoded.blindedPaths,
+				'invoice carries a blinded path'
+			).to.have.length(1);
+			expect(
+				decoded.blindedPaths![0].path.introductionNodeId,
+				'introduction node is Bob, not Charlie'
+			).to.deep.equal(Buffer.from(bob.getNodeId(), 'hex'));
+
+			let bobForwarded = false;
+			bob.on('htlc:forward', () => {
+				bobForwarded = true;
+			});
+			let received: IPaymentInfo | null = null;
+			charlie.on('payment:received', (p: IPaymentInfo) => {
+				received = p;
+			});
+
+			alice.sendPayment(invoice.bolt11);
+
+			expect(bobForwarded, 'Bob forwarded the blinded HTLC').to.be.true;
+			expect(received, 'Charlie received the payment').to.exist;
+			expect(received!.status).to.equal(PaymentStatus.COMPLETED);
+
+			const alicePayment = alice.getPayment(decoded.paymentHash)!;
+			expect(alicePayment.status).to.equal(PaymentStatus.COMPLETED);
+			expect(alicePayment.preimage).to.exist;
 		});
 	});
 
@@ -1597,6 +2200,24 @@ describe('Lightning Node', function () {
 			expect(errors.length).to.be.greaterThanOrEqual(1);
 			// The node emits FORCE_CLOSE_FAILED in addition to the CHANNEL_ERROR from ChannelManager
 			expect(errors.some((e) => e.code === 'FORCE_CLOSE_FAILED')).to.be.true;
+		});
+
+		it('resolves a live, urgency-bumped force-close feerate when fee data exists (H2)', function () {
+			// With no fee samples the force-close feerate falls back to the historical
+			// default, so nodes without a fee estimator behave exactly as before.
+			const node = createNode(1);
+			expect((node as any).resolveForceCloseFeeRatePerVbyte()).to.equal(10);
+
+			// A live mempool sample makes us bid ABOVE the going rate (ceil(50*1.5)=75),
+			// so a force-close during a fee spike can actually confirm before an HTLC's
+			// cltv_expiry instead of pinning at 10 sat/vB.
+			(node as any).feeAdvisor.recordSample(50);
+			expect((node as any).resolveForceCloseFeeRatePerVbyte()).to.equal(75);
+
+			// A tiny sample never drops the force-close bid below the default floor.
+			const node2 = createNode(2);
+			(node2 as any).feeAdvisor.recordSample(3);
+			expect((node2 as any).resolveForceCloseFeeRatePerVbyte()).to.equal(10);
 		});
 
 		it('should re-emit ChannelManager errors as node:error', function () {
@@ -1999,6 +2620,222 @@ describe('Lightning Node', function () {
 
 			const payment = alice.sendPayment(invoice.bolt11);
 			expect(payment.status).to.equal(PaymentStatus.COMPLETED);
+		});
+	});
+
+	describe('Blinded forward CLTV enforcement (M1)', function () {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const {
+			constructBlindedPath
+		} = require('../../src/lightning/onion/blinded-path');
+
+		function makeBlindedForward(cltvExpiryDelta: number): {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			processed: any;
+			blindingPoint: Buffer;
+			outScid: Buffer;
+			nodePrivkey: Buffer;
+		} {
+			const nodePrivkey = makeNodeConfig(2).nodePrivateKey;
+			const nodePubkey = getPublicKey(nodePrivkey);
+			const outScid = crypto.randomBytes(8);
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[nodePubkey],
+				[
+					{
+						shortChannelId: outScid,
+						nextNodeId: getPublicKey(crypto.randomBytes(32)),
+						paymentRelay: {
+							cltvExpiryDelta,
+							feeProportionalMillionths: 0,
+							feeBaseMsat: 0
+						}
+					}
+				]
+			);
+			const processed = {
+				hopPayload: {
+					shortChannelId: outScid,
+					blindingPoint: path.blindingPoint,
+					encryptedRecipientData: path.blindedHops[0].encryptedData,
+					amountToForwardMsat: 100_000n,
+					outgoingCltvValue: 500_000
+				},
+				nextPacket: {
+					version: 0,
+					ephemeralKey: crypto.randomBytes(33),
+					routingInfo: crypto.randomBytes(1300),
+					hmac: crypto.randomBytes(32)
+				},
+				sharedSecret: crypto.randomBytes(32)
+			};
+			return {
+				processed,
+				blindingPoint: path.blindingPoint,
+				outScid,
+				nodePrivkey
+			};
+		}
+
+		it('rejects a blinded forward whose CLTV delta is below our own minimum', function () {
+			const bob = createNode(2); // forwardingCltvDelta defaults to 40
+			const { processed } = makeBlindedForward(1); // recipient-authored delta = 1
+			const cm = bob.getChannelManager();
+			let failedId: bigint | null = null;
+			let forwarded = false;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).failHtlc = (_c: Buffer, id: bigint) => {
+				failedId = id;
+				return { ok: true, actions: [] };
+			};
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).addHtlc = () => {
+				forwarded = true;
+				return { ok: true, actions: [] };
+			};
+
+			// incoming expires only 1 block after the outgoing HTLC (delta 1 << 40).
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).handleForwardHtlc(
+				crypto.randomBytes(32),
+				5n,
+				crypto.randomBytes(32),
+				processed,
+				100_000n,
+				500_001,
+				processed.hopPayload.blindingPoint
+			);
+
+			expect(failedId, 'inbound HTLC must be failed').to.equal(5n);
+			expect(forwarded, 'must NOT forward with an insufficient cushion').to.be
+				.false;
+		});
+
+		it('accepts a blinded forward whose CLTV delta meets our minimum', function () {
+			const bob = createNode(2);
+			const { processed, outScid } = makeBlindedForward(40); // delta = our min
+			const cm = bob.getChannelManager();
+			let forwarded = false;
+			// Register the onward channel so the forward proceeds past the SCID lookup.
+			bob['scidToChannelId'].set(
+				outScid.toString('hex'),
+				crypto.randomBytes(32)
+			);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).addHtlc = () => {
+				forwarded = true;
+				return { ok: true, actions: [] };
+			};
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(cm as any).failHtlc = () => {
+				return { ok: true, actions: [] };
+			};
+
+			// incoming expires 40 blocks after outgoing (delta 40 == our minimum).
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).handleForwardHtlc(
+				crypto.randomBytes(32),
+				6n,
+				crypto.randomBytes(32),
+				processed,
+				100_000n,
+				500_040,
+				processed.hopPayload.blindingPoint
+			);
+
+			expect(forwarded, 'adequate cushion must forward past the CLTV gate').to
+				.be.true;
+		});
+	});
+
+	describe('ChainMonitor restore signing keys (H2)', function () {
+		it('restores a monitor with the config per-channel secrets, not node/funding keys', function () {
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			const {
+				SqliteStorage
+			} = require('../../src/lightning/storage/sqlite-storage');
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+			const chainMonitorMod = require('../../src/lightning/chain/chain-monitor');
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+
+			// A node-level-basepoints config (no channelKeyDeriver) whose basepoint
+			// SECRETS are the privkeys behind makeBasepoints' pubkeys (keys[1]=revocation,
+			// keys[2]=payment, keys[4]=htlc), so the channel keys are self-consistent.
+			const seed = makeSeed(1);
+			const secretAt = (i: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(seed)
+					.update(Buffer.from([i]))
+					.digest();
+			const revocationBasepointSecret = secretAt(1);
+			const paymentBasepointSecret = secretAt(2);
+			const htlcBasepointSecret = secretAt(4);
+			const cfg = {
+				...makeNodeConfig(1),
+				storage,
+				revocationBasepointSecret,
+				paymentBasepointSecret,
+				htlcBasepointSecret
+			};
+
+			// Node A opens + force-closes a channel → a ChainMonitor is created and
+			// persisted (monitor:updated → saveChainMonitor).
+			const alice = new LightningNode(cfg);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				Buffer.alloc(20, 7)
+			]);
+			alice.forceCloseChannel(channelId, dest);
+			expect(
+				storage.loadAllChainMonitors().length,
+				'a monitor was persisted'
+			).to.be.greaterThan(0);
+
+			// Spy ChainMonitor.restore to capture the secrets the restore callsite passes.
+			const orig = chainMonitorMod.ChainMonitor.restore;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			let captured: any[] | null = null;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			chainMonitorMod.ChainMonitor.restore = function (...args: any[]) {
+				captured = args;
+				return orig.apply(this, args);
+			};
+
+			try {
+				// Node B restarts from the same storage → restoreFromStorage → restore.
+				new LightningNode(cfg);
+			} finally {
+				chainMonitorMod.ChainMonitor.restore = orig;
+			}
+
+			expect(captured, 'ChainMonitor.restore was called during restore').to.not
+				.be.null;
+			// args: (state, channelState, dest, feeRate, revocation, payment, network,
+			//        delayed, htlc)
+			expect(
+				(captured![4] as Buffer).equals(revocationBasepointSecret),
+				'restore uses the config revocation basepoint secret'
+			).to.be.true;
+			expect(
+				(captured![5] as Buffer).equals(paymentBasepointSecret),
+				'restore uses the config payment basepoint secret'
+			).to.be.true;
+			expect(
+				(captured![8] as Buffer).equals(htlcBasepointSecret),
+				'restore uses the config htlc basepoint secret'
+			).to.be.true;
+			// And NOT the buggy substitutes (node identity / funding key).
+			expect((captured![4] as Buffer).equals(cfg.nodePrivateKey)).to.be.false;
+			expect((captured![5] as Buffer).equals(cfg.fundingPrivkey)).to.be.false;
+
+			storage.close();
 		});
 	});
 });

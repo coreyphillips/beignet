@@ -10,9 +10,24 @@ import { FeatureFlags, Feature } from '../features/flags';
  */
 export function isAnchorChannel(channelType: Buffer | null): boolean {
 	if (!channelType || channelType.length === 0) return false;
-	return FeatureFlags.fromBuffer(channelType).hasFeature(
-		Feature.ANCHOR_ZERO_FEE_HTLC
+	const flags = FeatureFlags.fromBuffer(channelType);
+	// Simple taproot channels are always anchor-style commitments. LND's taproot
+	// channel_type contains ONLY the taproot bit (not the anchor bit), so treat
+	// taproot as implying anchors here — every internal anchor branch (to_remote
+	// 1-CSV, anchor outputs, zero-fee HTLC, CSV sweep sequence) must still fire.
+	return (
+		flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC) ||
+		flags.hasFeature(Feature.OPTION_TAPROOT)
 	);
+}
+
+/**
+ * Check whether a negotiated channel_type includes option_taproot (simple
+ * taproot channels). Returns true if bit 80/81 (OPTION_TAPROOT) is set.
+ */
+export function isTaprootChannel(channelType: Buffer | null): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	return FeatureFlags.fromBuffer(channelType).hasFeature(Feature.OPTION_TAPROOT);
 }
 
 export enum ChannelState {
@@ -60,6 +75,12 @@ export interface IHtlcEntry {
 	onionRoutingPacket: Buffer;
 	direction: HtlcDirection;
 	state: HtlcState;
+	/**
+	 * Route blinding (BOLT 2/4): blinding_point received in (or sent with) the
+	 * update_add_htlc. Present when this HTLC enters a blinded path; a downstream
+	 * blinded hop uses it to derive its blinded node key for onion processing.
+	 */
+	blindingPoint?: Buffer;
 }
 
 /**

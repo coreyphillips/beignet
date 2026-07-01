@@ -58,7 +58,22 @@ interface IWatchedOutput {
 	txid: string;
 	outputIndex: number;
 	scriptHash: string;
+	/**
+	 * The spend we last reported to the monitor, if any. The watch is retained after
+	 * a spend (not deleted) so a reorg that evicts the spend re-fires the scripthash
+	 * subscription and is detected here; these record what we last saw so we can tell
+	 * an idempotent re-fire from a genuine eviction.
+	 */
+	spendTxid?: string;
+	spendHeight?: number;
 }
+
+/**
+ * Confirmations after which a spend is treated as irreversible and its watch may be
+ * torn down. A reorg deeper than this is out of scope for any practical LN threat
+ * model (matches the monitor's IRREVOCABLY_RESOLVED depth).
+ */
+const SPEND_FINALITY_DEPTH = 100;
 
 export interface IChainWatcherConfig {
 	backend: IChainBackend;
@@ -708,17 +723,20 @@ export class ChainWatcher extends EventEmitter {
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
 
-		// Find the spend transaction. The script's history may contain several
-		// non-spending entries with the same script (address reuse — e.g. sweeps
-		// to a fixed destination), so every confirmed candidate must be checked,
-		// not just the first one.
+		// Find the confirmed spend of our output. The script's history may contain
+		// several non-spending entries with the same script (address reuse — e.g.
+		// sweeps to a fixed destination), so every confirmed candidate is checked.
+		let spend: {
+			tx: bitcoin.Transaction;
+			txid: string;
+			height: number;
+		} | null = null;
 		for (const entry of history) {
 			if (entry.txid === watched.txid || entry.height <= 0) continue;
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
-			// Verify this tx spends our watched output
 			const spendsOurs = spendingTx.ins.some((input) => {
 				const inputTxid = Buffer.from(input.hash).reverse().toString('hex');
 				return (
@@ -727,16 +745,46 @@ export class ChainWatcher extends EventEmitter {
 			});
 			if (!spendsOurs) continue;
 
-			this.channelManager.handleOutputSpent(
-				watched.txid,
-				watched.outputIndex,
-				spendingTx,
-				entry.height
-			);
-			// Remove from watched — it's been spent
-			this.watchedOutputs.delete(key);
-			this.emit('output:spent', watched.txid, watched.outputIndex);
+			spend = { tx: spendingTx, txid: entry.txid, height: entry.height };
+			break;
+		}
+
+		if (spend) {
+			// Idempotent: the subscription re-fires on any scripthash change, so skip
+			// re-reporting a spend we already recorded.
+			if (watched.spendTxid !== spend.txid) {
+				watched.spendTxid = spend.txid;
+				watched.spendHeight = spend.height;
+				this.channelManager.handleOutputSpent(
+					watched.txid,
+					watched.outputIndex,
+					spend.tx,
+					spend.height
+				);
+				this.emit('output:spent', watched.txid, watched.outputIndex);
+			}
+			// Retain the watch until the spend is buried deep enough to be final, so a
+			// reorg before then re-fires this check and is caught by the branch below.
+			if (
+				this.currentBlockHeight > 0 &&
+				this.currentBlockHeight - spend.height + 1 >= SPEND_FINALITY_DEPTH
+			) {
+				this.watchedOutputs.delete(key);
+			}
 			return;
+		}
+
+		// No spend in the current history. If we had previously reported one, it has
+		// been evicted by a reorg — tell the monitor so it can re-broadcast our sweep
+		// (penalty / HTLC-success) before the counterparty's timelock matures.
+		if (watched.spendTxid !== undefined) {
+			watched.spendTxid = undefined;
+			watched.spendHeight = undefined;
+			this.channelManager.handleOutputUnspent(
+				watched.txid,
+				watched.outputIndex
+			);
+			this.emit('output:unspent', watched.txid, watched.outputIndex);
 		}
 	}
 }

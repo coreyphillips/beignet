@@ -868,20 +868,32 @@ function findRouteWithCapacityLimits(
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
 
-import { IBlindedPath } from '../onion/blinded-path';
+import {
+	IBlindedPath,
+	IBlindedPayInfo
+} from '../onion/blinded-path';
 
 /**
- * Find a route from source to the introduction node of a blinded path,
- * then append blinded hops to complete the route.
+ * Find a route from `source` through a blinded path to the recipient.
  *
- * The blinded hops are appended with the blinded node IDs as pubkeys
- * and zero-valued SCIDs (since the blinded hops handle their own routing).
+ * Convention (matches constructBlindedPath): blindedHops[0] corresponds to the
+ * introduction node itself, blindedHops[1..] to the subsequent blinded hops,
+ * and the last entry is the recipient. So we route normally to the introduction
+ * node, attach its encrypted_recipient_data + the path's blinding_point to that
+ * hop, then append the remaining blinded hops carrying only their encrypted
+ * data (each derives its own blinding point downstream).
+ *
+ * The blinded section's aggregate fee/CLTV (payInfo) is paid at the
+ * introduction node: we route `amountMsat + blindedFee` to it with
+ * `finalCltvExpiry + payInfo.cltvExpiryDelta` of headroom, and the recipient
+ * still receives exactly `amountMsat`.
  *
  * @param graph - The network graph
  * @param source - 33-byte source node public key
- * @param blindedPath - The blinded path to route to
- * @param amountMsat - Amount to deliver (in millisatoshis)
- * @param finalCltvExpiry - CLTV expiry for the final hop
+ * @param blindedPath - The blinded path to route through
+ * @param payInfo - Aggregate pay parameters advertised for the blinded path
+ * @param amountMsat - Amount to deliver to the recipient (in millisatoshis)
+ * @param finalCltvExpiry - CLTV expiry delta for the final hop
  * @param maxHops - Maximum number of hops (default 20)
  * @returns Combined route or null if no path to introduction node
  */
@@ -889,69 +901,81 @@ export function findRouteToBlindedPath(
 	graph: NetworkGraph,
 	source: Buffer,
 	blindedPath: IBlindedPath,
+	payInfo: IBlindedPayInfo,
 	amountMsat: bigint,
 	finalCltvExpiry: number,
 	maxHops: number = DEFAULT_MAX_HOPS,
 	excludedChannels?: Set<string>,
-	missionControl?: MissionControl
+	missionControl?: MissionControl,
+	localChannels?: ILocalChannelEdge[]
 ): IRoute | null {
+	const hops = blindedPath.blindedHops;
+	if (hops.length === 0) return null;
+
+	// Aggregate fee charged across the blinded section, paid at the intro node.
+	const blindedFeeMsat =
+		BigInt(payInfo.feeBaseMsat) +
+		(amountMsat * BigInt(payInfo.feeProportionalMillionths)) / 1_000_000n;
+	const amountAtIntro = amountMsat + blindedFeeMsat;
+	const cltvAtIntro = finalCltvExpiry + payInfo.cltvExpiryDelta;
+
 	const introNodeId = blindedPath.introductionNodeId;
 	const sourceHex = source.toString('hex');
 	const introHex = introNodeId.toString('hex');
 
-	// If source IS the introduction node, we only need the blinded hops
+	// Build the blinded tail: the introduction-node hop carries the path's
+	// blinding point + its own encrypted data; later blinded hops carry only
+	// their encrypted data. The recipient (last hop) gets exactly amountMsat.
+	const tail: IRouteHop[] = hops.map((hop, i) => ({
+		pubkey: hop.blindedNodeId,
+		shortChannelId: Buffer.alloc(8), // blinded hops route via encrypted data
+		amountToForwardMsat: i === 0 ? amountAtIntro : amountMsat,
+		outgoingCltvValue: i === 0 ? cltvAtIntro : finalCltvExpiry,
+		cltvExpiryDelta: 0,
+		feeBaseMsat: 0,
+		feeProportionalMillionths: 0,
+		encryptedRecipientData: hop.encryptedData,
+		...(i === 0 ? { blindingPoint: blindedPath.blindingPoint } : {})
+	}));
+
+	// If source IS the introduction node, the route is just the blinded tail,
+	// but the intro hop's real pubkey is known (it's us routing onward).
 	if (sourceHex === introHex) {
-		const blindedHops: IRouteHop[] = blindedPath.blindedHops.map((hop) => ({
-			pubkey: hop.blindedNodeId,
-			shortChannelId: Buffer.alloc(8), // Blinded hops use encrypted data, not SCIDs
-			amountToForwardMsat: amountMsat,
-			outgoingCltvValue: finalCltvExpiry,
-			cltvExpiryDelta: 0,
-			feeBaseMsat: 0,
-			feeProportionalMillionths: 0
-		}));
-
-		if (blindedHops.length === 0) return null;
-
+		tail[0].pubkey = introNodeId;
 		return {
-			hops: blindedHops,
-			totalAmountMsat: amountMsat,
-			totalCltvDelta: 0,
-			totalFeeMsat: 0n
+			hops: tail,
+			totalAmountMsat: amountAtIntro,
+			totalCltvDelta: cltvAtIntro,
+			totalFeeMsat: blindedFeeMsat
 		};
 	}
 
-	// Find route to the introduction node
+	// Otherwise route to the introduction node carrying amountAtIntro, then graft
+	// the blinded tail on. The intro node is reached as a normal hop; we overlay
+	// its blinded fields onto that final routed hop and append hops[1..].
 	const routeToIntro = findRoute(
 		graph,
 		source,
 		introNodeId,
-		amountMsat,
-		finalCltvExpiry,
-		maxHops - blindedPath.blindedHops.length,
+		amountAtIntro,
+		cltvAtIntro,
+		maxHops - (hops.length - 1),
 		excludedChannels,
-		missionControl
+		missionControl,
+		DEFAULT_MAX_CLTV_EXPIRY,
+		undefined,
+		undefined,
+		// Use our local channel edges so a direct channel to the introduction node
+		// is usable even when it isn't in the public gossip graph (interop, private).
+		localChannels
 	);
-
 	if (!routeToIntro) return null;
 
-	// Append blinded hops
-	const blindedHops: IRouteHop[] = blindedPath.blindedHops.map(() => ({
-		pubkey: Buffer.alloc(33), // Will be filled by blinded path processing
-		shortChannelId: Buffer.alloc(8),
-		amountToForwardMsat: amountMsat,
-		outgoingCltvValue: finalCltvExpiry,
-		cltvExpiryDelta: 0,
-		feeBaseMsat: 0,
-		feeProportionalMillionths: 0
-	}));
+	const introHop = routeToIntro.hops[routeToIntro.hops.length - 1];
+	introHop.encryptedRecipientData = hops[0].encryptedData;
+	introHop.blindingPoint = blindedPath.blindingPoint;
 
-	// Set the pubkeys from the blinded hops
-	for (let i = 0; i < blindedPath.blindedHops.length; i++) {
-		blindedHops[i].pubkey = blindedPath.blindedHops[i].blindedNodeId;
-	}
-
-	const combinedHops = [...routeToIntro.hops, ...blindedHops];
+	const combinedHops = [...routeToIntro.hops, ...tail.slice(1)];
 
 	return {
 		hops: combinedHops,

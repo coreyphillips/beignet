@@ -128,6 +128,9 @@ export interface ISerializedHtlcEntry {
 	onionRoutingPacket: string;
 	direction: string;
 	state: string;
+	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
+	 * survives restart and can still peel its onion with the blinded key. */
+	blindingPoint?: string;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -152,7 +155,10 @@ export function serializeHtlcEntry(
 		cltvExpiry: e.cltvExpiry,
 		onionRoutingPacket: e.onionRoutingPacket.toString('hex'),
 		direction: e.direction,
-		state: e.state
+		state: e.state,
+		...(e.blindingPoint
+			? { blindingPoint: e.blindingPoint.toString('hex') }
+			: {})
 	};
 }
 
@@ -169,7 +175,10 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			cltvExpiry: s.cltvExpiry,
 			onionRoutingPacket: Buffer.from(s.onionRoutingPacket, 'hex'),
 			direction: s.direction as HtlcDirection,
-			state: s.state as HtlcState
+			state: s.state as HtlcState,
+			...(s.blindingPoint
+				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
+				: {})
 		}
 	};
 }
@@ -236,12 +245,20 @@ export interface ISerializedChannelState {
 	revokedHtlcSnapshots?: ISerializedHtlcSnapshot[];
 	remoteCommitmentSignature: string | null;
 	remoteHtlcSignatures: string[];
+	/**
+	 * option_taproot: the peer's 66-byte signing nonce for the current local
+	 * commitment, persisted so a restored taproot channel can still aggregate the
+	 * key-spend witness at force-close. Optional for backward compatibility with
+	 * pre-taproot serialized states.
+	 */
+	remoteSigningNonce?: string | null;
 	channelType: string | null;
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
 	localShutdownScript: string | null;
 	remoteShutdownScript: string | null;
 	lastSentCommitmentSigned: string | null;
+	lastSentPartialSignatureWithNonce: string | null;
 	lastSentHtlcSignatures: string[];
 	lastSentRevokeSecret: string | null;
 	lastSentRevokeNextPoint: string | null;
@@ -274,6 +291,12 @@ export interface ISerializedChannelState {
 	fundingVersion?: number;
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
+	// Liquidity ads (bLIP-0051): if we are the lessor, our to_local (and its
+	// exact on-chain script) is CLTV-locked until leaseExpiry. These MUST persist —
+	// otherwise a restart rebuilds the commitment without the lock, the peer's cached
+	// signature no longer validates, and our whole balance becomes unbroadcastable.
+	isLessor?: boolean;
+	leaseExpiry?: number;
 }
 
 export interface ISerializedSpliceInFlight {
@@ -407,12 +430,16 @@ export function serializeChannelState(
 		revokedHtlcSnapshots,
 		remoteCommitmentSignature: bufToHex(s.remoteCommitmentSignature),
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((b) => b.toString('hex')),
+		remoteSigningNonce: bufToHex(s.remoteSigningNonce ?? null),
 		channelType: bufToHex(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
 		localShutdownScript: bufToHex(s.localShutdownScript),
 		remoteShutdownScript: bufToHex(s.remoteShutdownScript),
 		lastSentCommitmentSigned: bufToHex(s.lastSentCommitmentSigned),
+		lastSentPartialSignatureWithNonce: bufToHex(
+			s.lastSentPartialSignatureWithNonce
+		),
 		lastSentHtlcSignatures: s.lastSentHtlcSignatures.map((b) =>
 			b.toString('hex')
 		),
@@ -456,7 +483,9 @@ export function serializeChannelState(
 			: null,
 		fundingVersion: s.fundingVersion,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
-		fundingLocktime: s.fundingLocktime
+		fundingLocktime: s.fundingLocktime,
+		isLessor: s.isLessor,
+		leaseExpiry: s.leaseExpiry
 	};
 }
 
@@ -521,12 +550,16 @@ export function deserializeChannelState(
 		remoteHtlcSignatures: s.remoteHtlcSignatures.map((h) =>
 			Buffer.from(h, 'hex')
 		),
+		remoteSigningNonce: hexToBuf(s.remoteSigningNonce) ?? undefined,
 		channelType: hexToBuf(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
 		localShutdownScript: hexToBuf(s.localShutdownScript),
 		remoteShutdownScript: hexToBuf(s.remoteShutdownScript),
 		lastSentCommitmentSigned: hexToBuf(s.lastSentCommitmentSigned),
+		lastSentPartialSignatureWithNonce: hexToBuf(
+			s.lastSentPartialSignatureWithNonce
+		),
 		lastSentHtlcSignatures: (s.lastSentHtlcSignatures || []).map((h) =>
 			Buffer.from(h, 'hex')
 		),
@@ -573,7 +606,9 @@ export function deserializeChannelState(
 		fundingVersion: (s.fundingVersion ?? 1) as 1 | 2,
 		dualFundingSession: null,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
-		fundingLocktime: s.fundingLocktime ?? 0
+		fundingLocktime: s.fundingLocktime ?? 0,
+		isLessor: s.isLessor,
+		leaseExpiry: s.leaseExpiry
 	};
 }
 

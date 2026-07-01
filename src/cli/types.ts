@@ -267,7 +267,7 @@ export interface NodeStats {
 }
 
 export interface LiquidityRecommendation {
-	type: 'OPEN_CHANNEL' | 'CLOSE_CHANNEL' | 'REBALANCE_NEEDED';
+	type: 'OPEN_CHANNEL' | 'CLOSE_CHANNEL' | 'REBALANCE_NEEDED' | 'BUY_LEASE';
 	priority: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
 	reason: string;
 	channelId?: string;

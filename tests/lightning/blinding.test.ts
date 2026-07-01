@@ -344,20 +344,25 @@ describe('Route Blinding (BOLT 4 Extension)', function () {
 			expect(reEncoded.equals(encoded)).to.be.true;
 		});
 
-		it('should encode nextNodeId as exactly 33 bytes', function () {
+		it('should encode nextNodeId as a BOLT 4 TLV (type 4)', function () {
 			const pubkey = getPublicKey(randomPrivkey());
 			const data: IBlindedHopData = { nextNodeId: pubkey };
 			const encoded = encodeBlindedHopData(data);
-			// 1 byte flags + 33 bytes nextNodeId = 34 bytes total
-			expect(encoded.length).to.equal(34);
+			// TLV: type(1=0x04) + length(1=0x21) + value(33) = 35 bytes
+			expect(encoded.length).to.equal(35);
+			expect(encoded[0]).to.equal(0x04); // next_node_id TLV type
+			expect(encoded[1]).to.equal(33); // length
+			expect(decodeBlindedHopData(encoded).nextNodeId).to.deep.equal(pubkey);
 		});
 
-		it('should encode shortChannelId as exactly 8 bytes', function () {
+		it('should encode shortChannelId as a BOLT 4 TLV (type 2)', function () {
 			const scid = Buffer.alloc(8, 0xab);
 			const data: IBlindedHopData = { shortChannelId: scid };
 			const encoded = encodeBlindedHopData(data);
-			// 1 byte flags + 8 bytes scid = 9 bytes total
-			expect(encoded.length).to.equal(9);
+			// TLV: type(1=0x02) + length(1=0x08) + value(8) = 10 bytes
+			expect(encoded.length).to.equal(10);
+			expect(encoded[0]).to.equal(0x02); // short_channel_id TLV type
+			expect(decodeBlindedHopData(encoded).shortChannelId).to.deep.equal(scid);
 		});
 	});
 

@@ -101,6 +101,13 @@ export class OfferManager extends EventEmitter {
 			timer: ReturnType<typeof setTimeout>;
 		}
 	> = new Map();
+	/**
+	 * Payment preimages for BOLT 12 invoices WE issued (offer-issuer side), keyed
+	 * by payment_hash hex. The preimage is secret and never goes on the wire, but
+	 * the node must register it so an incoming HTLC for this hash can be fulfilled.
+	 * Surfaced via the `invoice:issued` event and {@link getInvoicePreimage}.
+	 */
+	private invoicePreimages: Map<string, Buffer> = new Map();
 	private invoiceRequestTimeoutMs: number;
 
 	constructor(
@@ -355,6 +362,10 @@ export class OfferManager extends EventEmitter {
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		const paymentSecret = crypto.randomBytes(32);
 
+		// Retain the preimage so the node can fulfill the incoming HTLC for this
+		// invoice (it never leaves the issuer — not part of the BOLT 12 invoice).
+		this.invoicePreimages.set(paymentHash.toString('hex'), preimage);
+
 		const invoice: IBolt12Invoice = {
 			paymentHash,
 			amount,
@@ -381,8 +392,22 @@ export class OfferManager extends EventEmitter {
 			this.onionMessageManager.sendReply(replyPath, messageData);
 		}
 
+		// `invoice:issued` carries the preimage so the node can register it for
+		// settlement (the issuer side — we will RECEIVE this payment). Distinct from
+		// `invoice:received`, which also fires when we are the PAYER and hold no
+		// preimage.
+		this.emit('invoice:issued', invoice, preimage);
 		this.emit('invoice:received', invoice);
 		return invoice;
+	}
+
+	/**
+	 * The payment preimage for a BOLT 12 invoice WE issued, or undefined if this
+	 * payment_hash was not issued by us (e.g. we are the payer). Used by the node
+	 * to fulfill an incoming HTLC matching a BOLT 12 invoice.
+	 */
+	getInvoicePreimage(paymentHash: Buffer): Buffer | undefined {
+		return this.invoicePreimages.get(paymentHash.toString('hex'));
 	}
 
 	/**
@@ -436,6 +461,7 @@ export class OfferManager extends EventEmitter {
 		}
 		this.pendingInvoiceRequests.clear();
 		this.offers.clear();
+		this.invoicePreimages.clear();
 		this.onionMessageManager = null;
 		this.removeAllListeners();
 	}

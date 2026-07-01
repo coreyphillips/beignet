@@ -56,6 +56,12 @@ export interface IToLocalSweepParams {
 	destinationScript: Buffer;
 	/** Fee in satoshis */
 	feeSatoshis: bigint;
+	/**
+	 * Liquidity ads (bLIP-0051): absolute lease-expiry height. When the to_local
+	 * is a lessor output (CLTV-locked), the sweep must set nLockTime to this; the
+	 * input sequence (toSelfDelay, not 0xffffffff) keeps locktime enforced.
+	 */
+	leaseExpiry?: number;
 }
 
 /**
@@ -71,12 +77,15 @@ export function buildToLocalSweepTx(
 		amount,
 		toSelfDelay,
 		destinationScript,
-		feeSatoshis
+		feeSatoshis,
+		leaseExpiry
 	} = params;
 
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	tx.locktime = 0;
+	// Lessor to_local outputs are CLTV-locked until lease_expiry; the input
+	// sequence (toSelfDelay) is not 0xffffffff, so locktime stays enforced.
+	tx.locktime = leaseExpiry && leaseExpiry > 0 ? leaseExpiry : 0;
 
 	const txidBuf = Buffer.from(commitmentTxid, 'hex').reverse();
 	tx.addInput(txidBuf, outputIndex, toSelfDelay);
@@ -162,6 +171,11 @@ export interface ISecondLevelSweepParams {
 	destinationScript: Buffer;
 	/** Fee in satoshis */
 	feeSatoshis: bigint;
+	/**
+	 * Liquidity ads (bLIP-0051): absolute lease-expiry height. When the lessor's
+	 * second-level output is CLTV-locked, the sweep must set nLockTime to this.
+	 */
+	leaseExpiry?: number;
 }
 
 /**
@@ -177,12 +191,14 @@ export function buildSecondLevelSweepTx(
 		amount,
 		toSelfDelay,
 		destinationScript,
-		feeSatoshis
+		feeSatoshis,
+		leaseExpiry
 	} = params;
 
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	tx.locktime = 0;
+	// Lessor second-level outputs are CLTV-locked until lease_expiry.
+	tx.locktime = leaseExpiry && leaseExpiry > 0 ? leaseExpiry : 0;
 
 	const txidBuf = Buffer.from(htlcTxid, 'hex').reverse();
 	tx.addInput(txidBuf, outputIndex, toSelfDelay);

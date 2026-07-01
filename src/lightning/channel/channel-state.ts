@@ -141,6 +141,14 @@ export interface IChannelState {
 
 	/** Reestablish: cached last sent commitment_signed for retransmission */
 	lastSentCommitmentSigned: Buffer | null;
+	/**
+	 * Reestablish (option_taproot): cached 98-byte partial_signature_with_nonce
+	 * (32-byte MuSig2 partial || 66-byte public nonce) from the last sent
+	 * commitment_signed. Replayed verbatim on retransmit — the bytes are
+	 * identical to the original message, so the already-used nonce is not reused
+	 * to sign anything new.
+	 */
+	lastSentPartialSignatureWithNonce: Buffer | null;
 	/** Reestablish: cached HTLC sigs for retransmission */
 	lastSentHtlcSignatures: Buffer[];
 	/** Reestablish: cached revoke_and_ack secret for retransmission */
@@ -220,6 +228,59 @@ export interface IChannelState {
 	commitmentFeeratePerkw: number;
 	/** Dual-funding: funding tx locktime (v2 only) */
 	fundingLocktime: number;
+
+	/**
+	 * Liquidity ads (bLIP-0051): absolute block height the lease expires. Set on
+	 * both sides of a leased channel; the lessor's to_local stays CSV-locked until
+	 * this height. Undefined for non-leased channels.
+	 */
+	leaseExpiry?: number;
+	/**
+	 * Liquidity ads: true on the lessor (seller) — the side whose to_local is
+	 * CSV-locked until leaseExpiry. The lessee (buyer) leaves this false/undefined.
+	 */
+	isLessor?: boolean;
+	/**
+	 * option_taproot: OUR current MuSig2 verification nonce for our local
+	 * commitment (the peer co-signs our commitment against it; we consume it only
+	 * at force-close). This object is ALSO the secret-nonce handle (the MuSig2
+	 * library keys the secret nonce by this object's identity), so it MUST be the
+	 * exact value returned by generateNonce — never copied. NOT serialized, but it
+	 * is DETERMINISTIC per commitment height (see Channel._deriveVerificationNonce):
+	 * re-derived (identical) on reconnect/restart, which keeps the pre-reconnect
+	 * commitment force-closeable. Safe because each height's nonce signs exactly
+	 * one commitment, once.
+	 */
+	localNonce?: Uint8Array;
+	/**
+	 * option_taproot: OUR verification nonce (secret-handle object) for our NEXT
+	 * local commitment — the one the peer will co-sign in the upcoming round. Its
+	 * public part is advertised one step ahead (in channel_ready for commitment #1,
+	 * then rotated via each revoke_and_ack), mirroring how next_per_commitment_point
+	 * is pipelined. On adopting a new commitment this is promoted to `localNonce`
+	 * (becomes the current commitment's nonce) and the next one is derived. Same
+	 * deterministic-per-height + secret-handle-object-identity rules as `localNonce`.
+	 */
+	localNextNonce?: Uint8Array;
+	/**
+	 * option_taproot: the PEER's current 66-byte MuSig2 verification nonce (from
+	 * open_channel/accept_channel, then rotated via revoke_and_ack). Used as the
+	 * peer's nonce contribution when WE sign the peer's commitment.
+	 */
+	remoteNonce?: Buffer;
+	/**
+	 * option_taproot: the peer's 66-byte single-use SIGNING nonce that accompanied
+	 * `remoteCommitmentSignature` (their partial signature over OUR local
+	 * commitment, received inline in funding_signed/funding_created/
+	 * commitment_signed). Needed to aggregate our own partial with theirs into the
+	 * final key-spend witness when we broadcast our local commitment. PERSISTED
+	 * (it is a public nonce, safe to store) so the current commitment stays
+	 * force-closeable across a restart; paired with the deterministic, re-derivable
+	 * `localNonce` for the same height. It is the SINGLE peer signing nonce bound to
+	 * the current commitment height — never re-bound to a second nonce for that
+	 * height, which is what keeps the deterministic verification nonce reuse-safe.
+	 */
+	remoteSigningNonce?: Buffer;
 }
 
 /**
@@ -278,6 +339,7 @@ export function createOpenerState(params: {
 		remoteShutdownScript: null,
 
 		lastSentCommitmentSigned: null,
+		lastSentPartialSignatureWithNonce: null,
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
 		lastSentRevokeNextPoint: null,
@@ -380,6 +442,7 @@ export function createAcceptorState(params: {
 		remoteShutdownScript: null,
 
 		lastSentCommitmentSigned: null,
+		lastSentPartialSignatureWithNonce: null,
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
 		lastSentRevokeNextPoint: null,

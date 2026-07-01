@@ -63,7 +63,12 @@ import {
 } from '../script/anchor';
 import type { IFundingProvider } from '../node/types';
 import { ChannelSigner } from '../keys/signer';
-import { signRemoteCommitment } from './commitment-builder';
+import {
+	signRemoteCommitment,
+	signRemoteCommitmentPartial,
+	signRemoteHtlcSignaturesTaproot
+} from './commitment-builder';
+import { generateNonce } from '../crypto/musig';
 import { Channel } from './channel';
 import {
 	createOpenerState,
@@ -77,7 +82,8 @@ import {
 	ChannelResult,
 	ChannelState,
 	ChannelRole,
-	isAnchorChannel
+	isAnchorChannel,
+	isTaprootChannel
 } from './types';
 import {
 	IChannelBasepoints,
@@ -103,6 +109,8 @@ import {
 	encodeTxAbortMessage
 } from '../message/interactive-tx';
 import { IDualFundingParams } from './dual-funding';
+import { ILeaseRates } from '../gossip/types';
+import { signWillFund, verifyWillFund } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature } from '../features/flags';
 
@@ -132,12 +140,25 @@ export interface IChannelManagerConfig {
 	delayedPaymentBasepointSecret?: Buffer;
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) */
 	preferAnchors?: boolean;
+	/**
+	 * Propose simple taproot channels (option_taproot). EXPERIMENTAL: the taproot
+	 * commitment-round signing flow (MuSig2 nonce rotation) is not yet wired into
+	 * the live state machine, so a proposed taproot channel negotiates open/accept
+	 * (channel type + nonces) but cannot yet complete funding. Off by default.
+	 */
+	preferTaproot?: boolean;
 	/** Chain hash for open_channel messages (defaults to Bitcoin mainnet) */
 	chainHash?: Buffer;
 	/** Node identity private key (for announcements) */
 	nodePrivateKey?: Buffer;
 	/** Per-channel key derivation callback. If provided, each new channel gets unique keys. */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
+	/**
+	 * Liquidity ads (bLIP-0051): when set, this node sells inbound liquidity at
+	 * these rates — it answers a buyer's request_funds with a signed will_fund
+	 * and contributes the requested funds as the acceptor.
+	 */
+	leaseRates?: ILeaseRates;
 }
 
 /**
@@ -358,7 +379,8 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
-			this.config.preferAnchors
+			this.config.preferAnchors,
+			this.config.preferTaproot
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -401,7 +423,8 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
-			this.config.preferAnchors
+			this.config.preferAnchors,
+			this.config.preferTaproot
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -432,6 +455,7 @@ export class ChannelManager extends EventEmitter {
 		fundingState.fundingTxid = fundingTxid;
 		fundingState.fundingOutputIndex = fundingOutputIndex;
 		let initialSignature = signature;
+		let partialSignatureWithNonce: Buffer | undefined;
 		if (fundingState.remoteCurrentPerCommitmentPoint) {
 			const signer =
 				channel.getSigner() ||
@@ -439,18 +463,29 @@ export class ChannelManager extends EventEmitter {
 					this.config.localFundingPrivkey,
 					this.config.htlcBasepointSecret
 				);
-			const signed = signRemoteCommitment(
-				fundingState,
-				signer,
-				fundingState.remoteCurrentPerCommitmentPoint
-			);
-			initialSignature = signed.signature;
+			if (isTaprootChannel(fundingState.channelType)) {
+				// option_taproot: co-sign the acceptor's commitment #0 with a MuSig2
+				// partial signature instead of ECDSA.
+				partialSignatureWithNonce = this.signFundingPartial(
+					fundingState,
+					signer,
+					fundingState.remoteCurrentPerCommitmentPoint
+				);
+			} else {
+				const signed = signRemoteCommitment(
+					fundingState,
+					signer,
+					fundingState.remoteCurrentPerCommitmentPoint
+				);
+				initialSignature = signed.signature;
+			}
 		}
 
 		const actions = channel.createFundingCreated(
 			fundingTxid,
 			fundingOutputIndex,
-			initialSignature
+			initialSignature,
+			partialSignatureWithNonce
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -469,6 +504,60 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * option_taproot: produce our 98-byte partial_signature_with_nonce over the
+	 * peer's initial commitment (#0). We generate a fresh single-use SIGNING nonce
+	 * here, combine it with the peer's VERIFICATION nonce (state.remoteNonce, from
+	 * open_channel/accept_channel), and emit `partial(32) || pubSigningNonce(66)`.
+	 * The signing nonce is used exactly once and then discarded.
+	 */
+	private signFundingPartial(
+		state: IChannelState,
+		signer: ChannelSigner,
+		remotePerCommitmentPoint: Buffer
+	): Buffer {
+		return this.signCommitmentPartial(
+			state,
+			signer,
+			remotePerCommitmentPoint,
+			0n
+		);
+	}
+
+	/**
+	 * option_taproot: produce our 98-byte partial_signature_with_nonce over the
+	 * peer's commitment `commitmentNumber`. We generate a FRESH single-use SIGNING
+	 * nonce and combine it with the peer's current VERIFICATION nonce
+	 * (state.remoteNonce, seeded by channel_ready and rotated by each
+	 * revoke_and_ack); the signing nonce is used exactly once and discarded.
+	 * Returns `partial(32) || pubSigningNonce(66)`.
+	 */
+	private signCommitmentPartial(
+		state: IChannelState,
+		signer: ChannelSigner,
+		remotePerCommitmentPoint: Buffer,
+		commitmentNumber: bigint
+	): Buffer {
+		if (!state.remoteNonce || state.remoteNonce.length !== 66) {
+			throw new Error(
+				'Cannot co-sign taproot commitment: missing peer verification nonce'
+			);
+		}
+		const signingNonce = generateNonce({
+			publicKey: state.localBasepoints.fundingPubkey,
+			sessionId: crypto.randomBytes(32)
+		});
+		const partial = signRemoteCommitmentPartial(
+			state,
+			signer,
+			signingNonce,
+			state.remoteNonce,
+			remotePerCommitmentPoint,
+			commitmentNumber
+		);
+		return Buffer.concat([partial, Buffer.from(signingNonce)]);
+	}
+
+	/**
 	 * Add an HTLC to a channel.
 	 */
 	addHtlc(
@@ -476,7 +565,8 @@ export class ChannelManager extends EventEmitter {
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		cltvExpiry: number,
-		onionRoutingPacket: Buffer
+		onionRoutingPacket: Buffer,
+		blindingPoint?: Buffer
 	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
@@ -496,7 +586,8 @@ export class ChannelManager extends EventEmitter {
 			amountMsat,
 			paymentHash,
 			cltvExpiry,
-			onionRoutingPacket
+			onionRoutingPacket,
+			blindingPoint
 		);
 		this.processActions(peerPubkey, channel, actions);
 
@@ -531,6 +622,16 @@ export class ChannelManager extends EventEmitter {
 			this.emit('error', channelId, error);
 			return { ok: false, actions: [], error };
 		}
+
+		// Structural fund-safety invariant (security finding C4): whenever we
+		// settle an HTLC by revealing its preimage, deliver that preimage to the
+		// chain monitors first. recordPreimage is idempotent, so callers that
+		// already record (the node settle paths) cost nothing — but any future
+		// settle path that forgets is covered here, making the C4 class of bug
+		// (preimage learned but never wired to the monitor → on-chain loss)
+		// structurally impossible rather than relying on every caller.
+		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
+		this.recordPreimage(preimageHash, preimage);
 
 		const actions = channel.fulfillHtlc(htlcId, preimage);
 		this.processActions(peerPubkey, channel, actions);
@@ -651,14 +752,34 @@ export class ChannelManager extends EventEmitter {
 
 		// Use next commitment number (current + 1) for post-update signing
 		const nextCommitNum = state.remoteCommitmentNumber + 1n;
-		const { signature, htlcSignatures } = signRemoteCommitment(
-			state,
-			signer,
-			perCommitPoint,
-			nextCommitNum
-		);
 
-		const actions = channel.signCommitment(signature, htlcSignatures);
+		let actions: ChannelAction[];
+		if (isTaprootChannel(state.channelType)) {
+			// option_taproot: co-sign the peer's next commitment with a MuSig2 partial
+			// (fresh single-use signing nonce + peer's verification nonce), plus a
+			// BIP340 Schnorr signature per HTLC second-level tx.
+			const partial = this.signCommitmentPartial(
+				state,
+				signer,
+				perCommitPoint,
+				nextCommitNum
+			);
+			const htlcSigs = signRemoteHtlcSignaturesTaproot(
+				state,
+				signer,
+				perCommitPoint,
+				nextCommitNum
+			);
+			actions = channel.signCommitment(Buffer.alloc(64), htlcSigs, partial);
+		} else {
+			const { signature, htlcSignatures } = signRemoteCommitment(
+				state,
+				signer,
+				perCommitPoint,
+				nextCommitNum
+			);
+			actions = channel.signCommitment(signature, htlcSignatures);
+		}
 		this.processActions(peerPubkey, channel, actions);
 		return { ok: true, actions };
 	}
@@ -1147,6 +1268,28 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Reorg recovery: a previously-observed spend of a tracked output has been evicted
+	 * from the active chain. Route it to the owning monitor so it can re-arm and
+	 * re-broadcast our sweep (penalty / HTLC-success / to_local) before the
+	 * counterparty's competing timelock matures.
+	 */
+	handleOutputUnspent(txid: string, outputIndex: number): ChainAction[] {
+		for (const [channelIdHex, monitor] of this.monitors) {
+			const tracked = monitor.getTrackedOutputs();
+			if (
+				tracked.some((o) => o.txid === txid && o.outputIndex === outputIndex)
+			) {
+				const actions = monitor.handleSpendUnconfirmed(txid, outputIndex);
+				if (actions.length > 0) {
+					this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+				}
+				return actions;
+			}
+		}
+		return [];
+	}
+
+	/**
 	 * Restore a chain monitor from persisted state.
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
@@ -1426,13 +1569,30 @@ export class ChannelManager extends EventEmitter {
 				this.config.localFundingPrivkey,
 				this.config.htlcBasepointSecret
 			);
-		const { signature } = signRemoteCommitment(
-			channelState,
-			signer,
-			channelState.remoteCurrentPerCommitmentPoint!
-		);
 
-		const actions = channel.handleFundingCreated(msg, signature);
+		let signature = Buffer.alloc(64);
+		let partialSignatureWithNonce: Buffer | undefined;
+		if (isTaprootChannel(channelState.channelType)) {
+			// option_taproot: co-sign the opener's commitment #0 with a MuSig2
+			// partial signature instead of ECDSA.
+			partialSignatureWithNonce = this.signFundingPartial(
+				channelState,
+				signer,
+				channelState.remoteCurrentPerCommitmentPoint!
+			);
+		} else {
+			signature = signRemoteCommitment(
+				channelState,
+				signer,
+				channelState.remoteCurrentPerCommitmentPoint!
+			).signature;
+		}
+
+		const actions = channel.handleFundingCreated(
+			msg,
+			signature,
+			partialSignatureWithNonce
+		);
 
 		// Move to permanent channel ID map BEFORE processActions so that
 		// PERSIST_STATE (which uses the permanent channelId) can find the channel
@@ -2186,6 +2346,31 @@ export class ChannelManager extends EventEmitter {
 			)
 		};
 
+		// Liquidity ads (bLIP-0051): if the buyer requested funds and we sell
+		// liquidity, contribute the requested amount and sign a will_fund over our
+		// funding pubkey + the buyer's blockheight + channel_type + our rates.
+		//
+		// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
+		// commitment types (LND's taproot script builders have no lease/CLTV lock —
+		// there is no interoperable "leased taproot" commitment). Never offer a lease
+		// on a taproot channel; open it as a normal (unleased) taproot channel instead.
+		if (
+			msg.requestFunds &&
+			this.config.leaseRates &&
+			this.config.nodePrivateKey &&
+			!isTaprootChannel(msg.channelType ?? null)
+		) {
+			const signature = signWillFund(
+				chKeys.basepoints.fundingPubkey,
+				msg.requestFunds.blockheight,
+				msg.channelType,
+				this.config.leaseRates,
+				this.config.nodePrivateKey
+			);
+			localParams.willFund = { signature, leaseRates: this.config.leaseRates };
+			localParams.fundingSatoshis = msg.requestFunds.requestedSats;
+		}
+
 		const actions = channel.handleOpenChannel2(msg, localParams);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -2196,6 +2381,34 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) {
 			this.emit('error', null, 'Unknown channel_id in accept_channel2');
 			return;
+		}
+
+		// Liquidity ads (bLIP-0051): if we requested funds and the seller answered
+		// with a will_fund, verify the seller signed these exact lease terms before
+		// trusting the lease. A bad signature fails the open.
+		const session = channel.getDualFundingSession();
+		const requestFunds = session?.getRequestFunds();
+		if (msg.willFund && requestFunds) {
+			const ok = verifyWillFund(
+				msg.willFund.signature,
+				msg.willFund.leaseRates,
+				Buffer.from(peerPubkey, 'hex'),
+				msg.fundingPubkey,
+				requestFunds.blockheight,
+				// Verify over the channel_type WE proposed in open_channel2 (what the
+				// seller signed), not the accept's echo, which the v2 flow may omit.
+				session?.getOpenChannelType()
+			);
+			if (!ok) {
+				this.emit('error', msg.channelId, 'Invalid will_fund signature');
+				return;
+			}
+			this.emit('channel:lease', {
+				channelId: msg.channelId,
+				requestedSats: requestFunds.requestedSats,
+				leaseRates: msg.willFund.leaseRates,
+				sellerFundingSatoshis: msg.fundingSatoshis
+			});
 		}
 
 		const actions = channel.handleAcceptChannel2(msg);

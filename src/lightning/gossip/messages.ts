@@ -56,8 +56,16 @@ import {
 	ADDRESS_TYPE_IPV6,
 	ADDRESS_TYPE_TORV3,
 	MESSAGE_FLAG_HTLC_MAX,
-	ANNOUNCEMENT_SIGNATURES_LENGTH
+	ANNOUNCEMENT_SIGNATURES_LENGTH,
+	NODE_ANN_TLV_LEASE_RATES,
+	encodeLeaseRates,
+	decodeLeaseRates
 } from './types';
+import {
+	encodeTlvStream,
+	decodeTlvStream,
+	findTlvRecord
+} from '../message/tlv';
 
 // ── Channel Announcement ────────────────────────────────────────────
 
@@ -171,7 +179,18 @@ export function encodeNodeAnnouncementMessage(
 	const addrBuf = Buffer.concat(addrParts);
 	const addrlen = addrBuf.length;
 
-	const totalLen = 64 + 2 + flen + 4 + 33 + 3 + 32 + 2 + addrlen;
+	// Optional trailing node_ann_tlvs (BOLT 7). Currently: option_will_fund
+	// lease rates (type 1) for liquidity ads.
+	const tlvBuf = msg.leaseRates
+		? encodeTlvStream([
+				{
+					type: NODE_ANN_TLV_LEASE_RATES,
+					value: encodeLeaseRates(msg.leaseRates)
+				}
+		  ])
+		: Buffer.alloc(0);
+
+	const totalLen = 64 + 2 + flen + 4 + 33 + 3 + 32 + 2 + addrlen + tlvBuf.length;
 	const buf = Buffer.alloc(totalLen);
 	let offset = 0;
 
@@ -195,6 +214,9 @@ export function encodeNodeAnnouncementMessage(
 	buf.writeUInt16BE(addrlen, offset);
 	offset += 2;
 	addrBuf.copy(buf, offset);
+	offset += addrlen;
+
+	tlvBuf.copy(buf, offset);
 
 	return buf;
 }
@@ -242,8 +264,33 @@ export function decodeNodeAnnouncementMessage(
 		addresses.push(address);
 		offset += bytesRead;
 	}
+	offset = addrEnd;
 
-	return { signature, features, timestamp, nodeId, rgbColor, alias, addresses };
+	const result: INodeAnnouncementMessage = {
+		signature,
+		features,
+		timestamp,
+		nodeId,
+		rgbColor,
+		alias,
+		addresses
+	};
+
+	// Optional trailing node_ann_tlvs (BOLT 7): extract option_will_fund lease
+	// rates if present; tolerate/ignore any other trailing TLV records.
+	if (offset < payload.length) {
+		try {
+			const { records } = decodeTlvStream(payload, offset);
+			const leaseVal = findTlvRecord(records, NODE_ANN_TLV_LEASE_RATES);
+			if (leaseVal) {
+				result.leaseRates = decodeLeaseRates(leaseVal);
+			}
+		} catch {
+			/* ignore malformed trailing TLVs */
+		}
+	}
+
+	return result;
 }
 
 // ── Channel Update ──────────────────────────────────────────────────

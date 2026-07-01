@@ -18,6 +18,7 @@ import {
 import { buildHrp } from './amount';
 import { bufferToWords, encodeUintToWords, encodeTaggedField } from './words';
 import { signInvoice } from './signing';
+import { encodeInvoiceBlindedPaymentPaths } from '../onion/blinded-path';
 
 /**
  * Encode a BOLT 11 invoice from creation options.
@@ -143,6 +144,16 @@ export function encode(options: IInvoiceCreationOptions): string {
 				...encodeTaggedField(TagType.ROUTING_INFO, encodeRoutingInfo(route))
 			);
 		}
+	}
+
+	// Tag 25: blinded payment paths (receiver route blinding)
+	if (options.blindedPaths && options.blindedPaths.length > 0) {
+		dataWords.push(
+			...encodeTaggedField(
+				TagType.BLINDED_PATHS,
+				bufferToWords(encodeInvoiceBlindedPaymentPaths(options.blindedPaths))
+			)
+		);
 	}
 
 	// Tag 27: metadata

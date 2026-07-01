@@ -17,7 +17,9 @@ import {
 } from '../interactive-tx/types';
 import {
 	IOpenChannel2Message,
-	IAcceptChannel2Message
+	IAcceptChannel2Message,
+	IRequestFunds,
+	IWillFund
 } from '../message/dual-funding';
 import {
 	MIN_DUST_LIMIT_SATOSHIS,
@@ -74,6 +76,10 @@ export interface IDualFundingParams {
 	channelType?: Buffer;
 	/** Second per-commitment point */
 	secondPerCommitmentPoint: Buffer;
+	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request (opener). */
+	requestFunds?: IRequestFunds;
+	/** Liquidity ads (bLIP-0051): seller's signed will_fund commitment (acceptor). */
+	willFund?: IWillFund;
 }
 
 /** Result of a dual-funding operation */
@@ -142,6 +148,16 @@ export class DualFundingSession {
 
 	getLocalParams(): IDualFundingParams | null {
 		return this._localParams;
+	}
+
+	/** Liquidity ads: the request_funds we sent (opener) or received (acceptor). */
+	getRequestFunds(): IRequestFunds | undefined {
+		return this._openMsg?.requestFunds;
+	}
+
+	/** channel_type proposed in open_channel2 (what will_fund is signed over). */
+	getOpenChannelType(): Buffer | undefined {
+		return this._openMsg?.channelType;
 	}
 
 	getRemoteBasepoints(): IChannelBasepoints | null {
@@ -219,7 +235,8 @@ export class DualFundingSession {
 			firstPerCommitmentPoint: params.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: params.secondPerCommitmentPoint,
 			channelFlags: params.channelFlags ?? 0x01,
-			channelType: params.channelType
+			channelType: params.channelType,
+			requestFunds: params.requestFunds
 		};
 
 		this._openMsg = msg;
@@ -349,7 +366,8 @@ export class DualFundingSession {
 			firstPerCommitmentPoint:
 				localParams.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: localParams.secondPerCommitmentPoint,
-			channelType: localParams.channelType
+			channelType: localParams.channelType,
+			willFund: localParams.willFund
 		};
 
 		this._acceptMsg = acceptMsg;
