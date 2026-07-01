@@ -5659,6 +5659,12 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
+		// so a fee spike after the original broadcast cannot pin the package (M1).
+		this.channelManager.reCpfpStuckCommitments(
+			blockHeight,
+			this.resolveForceCloseFeeRatePerVbyte()
+		);
 		this.scanExpiringHtlcs(blockHeight);
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);

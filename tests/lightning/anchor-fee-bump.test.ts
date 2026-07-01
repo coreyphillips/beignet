@@ -14,7 +14,7 @@ import {
 } from '../../src/lightning/wallet/wallet-funding-provider';
 import type { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { ChainActionType } from '../../src/lightning/chain/types';
+import { ChainActionType, MonitorState } from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
@@ -522,6 +522,85 @@ describe('anchor fee bumping', () => {
 
 			expect(broadcasts.length).to.equal(1);
 			expect(broadcasts[0].equals(action.tx)).to.be.true;
+		});
+
+		// M1: the initial commitment CPFP is one-shot; a stuck package must be
+		// re-CPFP'd at a higher live feerate each block until it confirms.
+		describe('reCpfpStuckCommitments (commitment package re-bump)', () => {
+			function managerWithPendingCpfp(monitorState: MonitorState): {
+				cm: ChannelManager;
+				channelIdHex: string;
+				calls: any[];
+			} {
+				const cm = makeManager(createFeeBumpProvider([200_000]));
+				const channelIdHex = 'ab'.repeat(32);
+				(cm as any)._pendingCommitmentCpfp.set(channelIdHex, {
+					action: {
+						type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+						kind: 'anchor-cpfp',
+						tx: Buffer.alloc(10),
+						description: 'anchor commitment CPFP',
+						feeratePerVbyte: 10,
+						anchorOutputIndex: 0,
+						anchorWitnessScript: Buffer.alloc(34),
+						parentVbytes: 200,
+						parentFeeSats: 0n,
+						commitmentTxid: 'cd'.repeat(32)
+					},
+					broadcastHeight: 100,
+					lastFeeRate: 10
+				});
+				// Stub monitor exposing only getState().
+				(cm as any).monitors.set(channelIdHex, {
+					getState: () => monitorState
+				});
+				// Spy on the CPFP re-issue instead of building a real wallet tx.
+				const calls: any[] = [];
+				(cm as any)._handleFeeBumpAndBroadcast = (
+					_cid: Buffer,
+					action: any
+				) => {
+					calls.push(action);
+					return Promise.resolve();
+				};
+				return { cm, channelIdHex, calls };
+			}
+
+			it('re-issues the CPFP at a higher feerate when the commitment is stuck', () => {
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp(
+					MonitorState.WATCHING
+				);
+				// 6 blocks after broadcast (100), live feerate 30 > last 10.
+				cm.reCpfpStuckCommitments(106, 30);
+
+				expect(calls.length).to.equal(1);
+				expect(calls[0].feeratePerVbyte).to.equal(30);
+				expect(calls[0].kind).to.equal('anchor-cpfp');
+				expect(calls[0].description).to.match(/re-bump/);
+				const entry = (cm as any)._pendingCommitmentCpfp.get(channelIdHex);
+				expect(entry.lastFeeRate).to.equal(30);
+				expect(entry.broadcastHeight).to.equal(106);
+			});
+
+			it('does not re-issue before the interval, or when the feerate is not higher', () => {
+				const early = managerWithPendingCpfp(MonitorState.WATCHING);
+				early.cm.reCpfpStuckCommitments(103, 30); // only 3 blocks elapsed
+				expect(early.calls.length).to.equal(0);
+
+				const sameFee = managerWithPendingCpfp(MonitorState.WATCHING);
+				sameFee.cm.reCpfpStuckCommitments(110, 10); // interval ok, feerate == last
+				expect(sameFee.calls.length).to.equal(0);
+			});
+
+			it('drops the entry once the commitment confirms (monitor left WATCHING)', () => {
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp(
+					MonitorState.RESOLVING
+				);
+				cm.reCpfpStuckCommitments(200, 100);
+				expect(calls.length).to.equal(0);
+				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be
+					.false;
+			});
 		});
 	});
 });

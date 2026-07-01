@@ -50,6 +50,7 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IFeeBumpAndBroadcastChainAction,
+	MonitorState,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -174,6 +175,13 @@ export interface IChannelManagerConfig {
  * - 'htlc:failed' (channelId: Buffer, htlcId: bigint, reason: Buffer)
  * - 'error' (channelId: Buffer | null, message: string)
  */
+
+/**
+ * Blocks to wait between re-CPFP attempts on a stuck anchor force-close commitment
+ * package (matches the ChainMonitor sweep rebroadcast cadence).
+ */
+const COMMITMENT_CPFP_REBUMP_INTERVAL = 6;
+
 export class ChannelManager extends EventEmitter {
 	private config: IChannelManagerConfig;
 	private channels: Map<string, Channel> = new Map();
@@ -181,6 +189,19 @@ export class ChannelManager extends EventEmitter {
 	private channelPeers: Map<string, string> = new Map();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
+	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
+	private _currentBlockHeight = 0;
+	// Anchor force-close commitment CPFPs awaiting confirmation, keyed by channelId
+	// hex. Retained so a stuck commitment package can be re-CPFP'd at a higher feerate
+	// each block (reCpfpStuckCommitments) until the commitment confirms.
+	private _pendingCommitmentCpfp: Map<
+		string,
+		{
+			action: IFeeBumpAndBroadcastChainAction;
+			broadcastHeight: number;
+			lastFeeRate: number;
+		}
+	> = new Map();
 	// Learned payment preimages, retained so monitors created later (on
 	// force-close) can claim received HTLCs on-chain. Fed by recordPreimage().
 	private _knownPreimages: Map<string, Buffer> = new Map();
@@ -1212,6 +1233,7 @@ export class ChannelManager extends EventEmitter {
 	 * Forward new block to all active chain monitors.
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
+		this._currentBlockHeight = blockHeight;
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
@@ -2948,7 +2970,7 @@ export class ChannelManager extends EventEmitter {
 			);
 			const parentFeeSats =
 				state.fundingSatoshis > outsSum ? state.fundingSatoshis - outsSum : 0n;
-			void this._handleFeeBumpAndBroadcast(channelId, {
+			const cpfpAction: IFeeBumpAndBroadcastChainAction = {
 				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
 				kind: 'anchor-cpfp',
 				tx: fc.tx,
@@ -2961,6 +2983,14 @@ export class ChannelManager extends EventEmitter {
 				parentVbytes: commitmentTx.virtualSize(),
 				parentFeeSats,
 				commitmentTxid: commitmentTx.getId()
+			};
+			void this._handleFeeBumpAndBroadcast(channelId, cpfpAction);
+			// Retain it so a stuck commitment package can be re-CPFP'd at a higher
+			// feerate each block until it confirms (reCpfpStuckCommitments).
+			this._pendingCommitmentCpfp.set(channelId.toString('hex'), {
+				action: cpfpAction,
+				broadcastHeight: this._currentBlockHeight,
+				lastFeeRate: feeRatePerVbyte
 			});
 		} catch (err) {
 			this.emit(
@@ -2968,6 +2998,51 @@ export class ChannelManager extends EventEmitter {
 				channelId,
 				`anchor commitment CPFP setup failed: ${(err as Error).message}`
 			);
+		}
+	}
+
+	/**
+	 * Re-CPFP any anchor force-close commitment package that is still unconfirmed,
+	 * bidding a higher (live) feerate so a fee spike AFTER the original broadcast
+	 * cannot pin the commitment. The initial CPFP is one-shot; without this a stuck
+	 * commitment blocks every second-level HTLC claim (which spends a commitment
+	 * output) and an HTLC we hold the preimage for is lost to the peer's timeout.
+	 *
+	 * Driven by the node each block with a live feerate (the ChannelManager has no fee
+	 * estimator). An entry is dropped once its monitor leaves WATCHING (the commitment
+	 * confirmed, or the channel otherwise resolved).
+	 *
+	 * @param blockHeight - current chain tip
+	 * @param feeRatePerVbyte - live force-close feerate from the node's estimator
+	 */
+	reCpfpStuckCommitments(blockHeight: number, feeRatePerVbyte: number): void {
+		this._currentBlockHeight = blockHeight;
+		for (const [channelIdHex, entry] of this._pendingCommitmentCpfp) {
+			const monitor = this.monitors.get(channelIdHex);
+			// No monitor, or the commitment has confirmed (the monitor advanced past
+			// WATCHING when the funding spend was detected on-chain): done, stop CPFP.
+			if (!monitor || monitor.getState() !== MonitorState.WATCHING) {
+				this._pendingCommitmentCpfp.delete(channelIdHex);
+				continue;
+			}
+			// Only re-bump after a stall, and only if the live feerate actually beats
+			// what we last paid (otherwise re-broadcasting is pointless).
+			if (
+				blockHeight - entry.broadcastHeight <
+				COMMITMENT_CPFP_REBUMP_INTERVAL
+			) {
+				continue;
+			}
+			if (feeRatePerVbyte <= entry.lastFeeRate) continue;
+
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			void this._handleFeeBumpAndBroadcast(channelId, {
+				...entry.action,
+				feeratePerVbyte: feeRatePerVbyte,
+				description: 'anchor commitment CPFP (re-bump)'
+			});
+			entry.lastFeeRate = feeRatePerVbyte;
+			entry.broadcastHeight = blockHeight;
 		}
 	}
 
