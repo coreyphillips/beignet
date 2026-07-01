@@ -149,4 +149,6 @@ export interface IInvoiceInfo {
 	description?: string;
 	expiry: number;
 	createdAt: number;
+	/** Hold invoice — matching HTLCs are parked until settle/cancel. */
+	hold?: boolean;
 }

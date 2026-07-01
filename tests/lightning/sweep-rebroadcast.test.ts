@@ -66,6 +66,7 @@ function makeMinimalChannelState(): IChannelState {
 		localShutdownScript: null,
 		remoteShutdownScript: null,
 		lastSentCommitmentSigned: null,
+		lastSentPartialSignatureWithNonce: null,
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
 		lastSentRevokeNextPoint: null,

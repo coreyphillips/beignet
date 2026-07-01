@@ -54,6 +54,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 
 // ─────────────── Helpers ───────────────
 
@@ -1175,6 +1176,192 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				expect(actions[0].messageType).to.equal(MessageType.ACCEPT_CHANNEL2);
 			}
 			expect(channel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		});
+
+		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {
+			// Script-enforced lease and simple taproot are distinct commitment types
+			// with no interoperable "leased taproot" script. Even if the manager-level
+			// guard were bypassed and a will_fund reached the state machine on a taproot
+			// open, handleOpenChannel2 must refuse rather than enter an unenforceable
+			// lessor state.
+			const state = createAcceptorState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 0n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32),
+				remoteBasepoints: makeBasepoints(),
+				remoteConfig: DEFAULT_CHANNEL_CONFIG
+			});
+			const channel = new Channel(state);
+
+			const taprootType = FeatureFlags.empty();
+			taprootType.setCompulsory(Feature.OPTION_TAPROOT);
+
+			const openMsg = makeOpenChannel2Msg({
+				channelId: state.temporaryChannelId,
+				channelType: taprootType.toBuffer(),
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+			});
+			const localParams = makeDualFundingParams({
+				localBasepoints: state.localBasepoints,
+				localPerCommitmentSeed: state.localPerCommitmentSeed,
+				willFund: {
+					signature: Buffer.alloc(64, 0x01),
+					leaseRates: {
+						fundingWeightWitness: 1000,
+						leaseFeeBasis: 100,
+						leaseFeeBaseSat: 500,
+						channelFeeMaxBaseMsat: 5000,
+						channelFeeMaxProportionalThousandths: 10
+					}
+				}
+			});
+
+			const actions = channel.handleOpenChannel2(openMsg, localParams);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(
+					/lease is not supported on taproot/i
+				);
+			}
+			// No lessor state was recorded.
+			expect(channel.getFullState().isLessor).to.not.equal(true);
+			expect(channel.getFullState().leaseExpiry).to.be.undefined;
+		});
+
+		const M2_RATES = {
+			fundingWeightWitness: 1000,
+			leaseFeeBasis: 100,
+			leaseFeeBaseSat: 500,
+			channelFeeMaxBaseMsat: 5000,
+			channelFeeMaxProportionalThousandths: 10
+		};
+
+		it('rejects the lease when the seller funds less than requested (M2)', () => {
+			const { channel, params } = makeV2Channel();
+			channel.initiateOpenV2({
+				...params,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+			});
+			const channelId = channel.getTemporaryChannelId();
+
+			// Adversarial seller: a valid will_fund, but it funds only 100k of the 500k
+			// we requested. We must not pay the lease fee for liquidity never delivered.
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId,
+					fundingSatoshis: 100_000n,
+					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
+				})
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						/funded less than the requested/i.test(
+							(a as { message?: string }).message ?? ''
+						)
+				),
+				'buyer must reject an under-funded lease'
+			).to.be.true;
+			expect(channel.getFullState().leaseExpiry).to.be.undefined;
+		});
+
+		it('accepts the lease when the seller funds at least the requested amount (M2 control)', () => {
+			const { channel, params } = makeV2Channel();
+			channel.initiateOpenV2({
+				...params,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
+				// Buyer's accepted ceiling = the seller's advertised rates (H3).
+				maxLeaseRates: M2_RATES
+			});
+			const channelId = channel.getTemporaryChannelId();
+
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId,
+					fundingSatoshis: 500_000n,
+					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
+				})
+			);
+			expect(
+				actions.every((a) => a.type !== ChannelActionType.ERROR),
+				'a fully-funded lease is accepted'
+			).to.be.true;
+			expect(channel.getFullState().leaseExpiry).to.equal(800000 + 4032);
+		});
+
+		it('rejects a will_fund whose lease fee exceeds the buyer ceiling (H3)', () => {
+			// The seller's will_fund rates are self-signed and otherwise bounded only by
+			// our whole balance. A seller that inflates its rates beyond what the buyer
+			// agreed to (maxLeaseRates) must be rejected, not paid.
+			const { channel, params } = makeV2Channel();
+			channel.initiateOpenV2({
+				...params,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
+				maxLeaseRates: M2_RATES
+			});
+			const channelId = channel.getTemporaryChannelId();
+
+			// Inflate the flat base fee far above the accepted ceiling.
+			const gougingRates = {
+				...M2_RATES,
+				leaseFeeBaseSat: M2_RATES.leaseFeeBaseSat + 1_000_000
+			};
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId,
+					fundingSatoshis: 500_000n,
+					willFund: {
+						signature: Buffer.alloc(64, 0x01),
+						leaseRates: gougingRates
+					}
+				})
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						/exceeds our accepted maximum/i.test(
+							(a as { message?: string }).message ?? ''
+						)
+				),
+				'buyer must reject an over-priced lease'
+			).to.be.true;
+			// No fee shifted, no lease recorded.
+			expect(channel.getFullState().leaseExpiry).to.be.undefined;
+		});
+
+		it('rejects a lease when no maximum rates ceiling is configured (H3)', () => {
+			const { channel, params } = makeV2Channel();
+			channel.initiateOpenV2({
+				...params,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+				// no maxLeaseRates → refuse to pay an unverified fee
+			});
+			const channelId = channel.getTemporaryChannelId();
+
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId,
+					fundingSatoshis: 500_000n,
+					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
+				})
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.ERROR &&
+						/no maximum lease rates/i.test(
+							(a as { message?: string }).message ?? ''
+						)
+				),
+				'buyer must refuse a lease with no ceiling'
+			).to.be.true;
+			expect(channel.getFullState().leaseExpiry).to.be.undefined;
 		});
 
 		it('should handle tx_complete exchange', () => {

@@ -39,8 +39,10 @@ import {
 	ChainActionType,
 	OutputStatus,
 	OutputType,
-	IRREVOCABLE_DEPTH
+	IRREVOCABLE_DEPTH,
+	CommitmentType
 } from '../../src/lightning/chain/types';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
@@ -614,6 +616,67 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(htlcClaim, 'received-HTLC preimage claim must be broadcast').to
 				.exist;
 		});
+
+		// C2 fund-safety: the preimage is learned AFTER the peer force-closed with
+		// their current commitment (e.g. we forwarded the HTLC, the downstream leg
+		// settled later). addPreimage must convert the tracked-but-unswept received
+		// HTLC into an on-chain preimage claim — otherwise the peer reclaims it via
+		// HTLC-timeout and we lose the full forwarded amount.
+		it('claims a received HTLC when the preimage is learned AFTER the peer force-closed (C2)', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			opener.handleUpdateAddHtlc({
+				channelId: opener.getChannelId()!,
+				id: 0n,
+				amountMsat: 10_000_000n,
+				paymentHash,
+				cltvExpiry: 500,
+				onionRoutingPacket: Buffer.alloc(1366)
+			});
+
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+
+			// Peer force-closes with their current commitment BEFORE we know the preimage.
+			const remotePerCommitmentPoint = state.remoteCurrentPerCommitmentPoint!;
+			const built = buildRemoteCommitment(state, remotePerCommitmentPoint);
+			const closeActions = monitor.handleFundingSpent(built.result.tx, 100);
+
+			// The received HTLC cannot be claimed yet — no HTLC claim is broadcast.
+			const preClaim = closeActions.find(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('HTLC claim')
+			);
+			expect(preClaim, 'no HTLC claim before the preimage is known').to.be
+				.undefined;
+
+			// The preimage now arrives — the claim must be built and broadcast.
+			const actions = monitor.addPreimage(paymentHash, preimage);
+			const htlcClaim = actions.find(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('HTLC claim (preimage learned)')
+			);
+			expect(
+				htlcClaim,
+				'preimage-claim must be broadcast once the preimage is learned'
+			).to.exist;
+		});
 	});
 
 	describe('Revoked Commitment', function () {
@@ -697,6 +760,204 @@ describe('Chain Monitor (Phase 4C)', function () {
 				(a: any) => a.description && a.description.includes('penalty')
 			);
 			expect(penaltyBroadcast).to.exist;
+		});
+	});
+
+	describe('Stuck HTLC re-fee-bump (M1)', function () {
+		function anchorMonitorWithStuckHtlc(anchor: boolean): {
+			monitor: ChainMonitor;
+			bump: () => any;
+		} {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const flags = FeatureFlags.empty();
+			flags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			if (anchor) flags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			state.channelType = flags.toBuffer();
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				5,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+
+			// Our commitment is on-chain and we broadcast a second-level HTLC-timeout
+			// tx at height 100 that is now stuck at the original feerate.
+			(monitor as any)._state = MonitorState.RESOLVING;
+			(monitor as any)._commitmentBroadcast = {
+				commitmentType: CommitmentType.OUR_COMMITMENT,
+				commitmentNumber: 0n
+			};
+			(monitor as any)._trackedOutputs = [
+				{
+					txid: 'aa'.repeat(32),
+					outputIndex: 0,
+					amount: 100_000n,
+					outputType: OutputType.OFFERED_HTLC,
+					status: OutputStatus.SPEND_BROADCAST,
+					confirmationHeight: 100,
+					broadcastHeight: 100,
+					originalFeeRate: 5,
+					currentFeeRate: 5,
+					// Opaque hex — the rebroadcast loop only rewraps it into the action.
+					sweepTxHex: '0200000000010000000000'
+				}
+			];
+
+			// Advance past REBROADCAST_INTERVAL (6) since the broadcast.
+			const actions = monitor.handleNewBlock(106);
+			const bump = () =>
+				actions.find(
+					(a: any) =>
+						a.type === ChainActionType.FEE_BUMP_AND_BROADCAST &&
+						a.kind === 'htlc-fee-attach'
+				);
+			return { monitor, bump };
+		}
+
+		it('re-fee-bumps a stuck ANCHOR second-level HTLC tx to keep the HTLC race', function () {
+			const { bump } = anchorMonitorWithStuckHtlc(true);
+			const action = bump();
+			expect(action, 'stuck anchor HTLC tx must be re-fee-bumped').to.exist;
+			expect(action.feeratePerVbyte).to.be.greaterThan(5);
+		});
+
+		it('does NOT RBF a non-anchor second-level HTLC tx (fee is counterparty-signed)', function () {
+			const { bump } = anchorMonitorWithStuckHtlc(false);
+			expect(bump(), 'non-anchor HTLC tx must not be RBF-rebuilt').to.be
+				.undefined;
+		});
+
+		it('re-fee-bumps a stuck preimage claim on the PEER commitment (H2)', function () {
+			// The PEER force-closed (their current commitment). Our received-HTLC
+			// preimage claim is a SINGLE wallet-signed tx we fully control, so it can
+			// be freely RBF'd. Previously the blanket `continue` for HTLC outputs
+			// pinned it at the initial feerate and a fee spike let the peer win the
+			// HTLC-timeout race. It must now go through the generic REBUILD_SWEEP.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				5,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+
+			(monitor as any)._state = MonitorState.RESOLVING;
+			(monitor as any)._commitmentBroadcast = {
+				commitmentType: CommitmentType.THEIR_CURRENT_COMMITMENT,
+				commitmentNumber: 0n
+			};
+			(monitor as any)._trackedOutputs = [
+				{
+					txid: 'aa'.repeat(32),
+					outputIndex: 0,
+					amount: 100_000n,
+					outputType: OutputType.RECEIVED_HTLC,
+					status: OutputStatus.SPEND_BROADCAST,
+					confirmationHeight: 100,
+					broadcastHeight: 100,
+					originalFeeRate: 5,
+					currentFeeRate: 5,
+					sweepTxHex: '0200000000010000000000'
+				}
+			];
+
+			const actions = monitor.handleNewBlock(106);
+			const rebuild: any = actions.find(
+				(a: any) => a.type === ChainActionType.REBUILD_SWEEP
+			);
+			expect(
+				rebuild,
+				'stuck preimage claim on the peer commitment must be re-fee-bumped'
+			).to.exist;
+			expect(rebuild.feeRatePerVbyte).to.be.greaterThan(5);
+		});
+	});
+
+	describe('Reorg recovery (spend evicted)', function () {
+		function monitorWithConfirmedSweep(): {
+			monitor: ChainMonitor;
+			txid: string;
+		} {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				5,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+			const txid = 'bb'.repeat(32);
+			(monitor as any)._state = MonitorState.RESOLVING;
+			(monitor as any)._commitmentBroadcast = {
+				commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+				commitmentNumber: 0n
+			};
+			(monitor as any)._currentBlockHeight = 105;
+			(monitor as any)._trackedOutputs = [
+				{
+					txid,
+					outputIndex: 0,
+					amount: 100_000n,
+					outputType: OutputType.TO_LOCAL, // our penalty on a revoked to_local
+					status: OutputStatus.SPEND_CONFIRMED,
+					resolutionTxid: 'cc'.repeat(32),
+					confirmationHeight: 100,
+					sweepTxHex: '0200000000010000000000' // our penalty tx (opaque)
+				}
+			];
+			return { monitor, txid };
+		}
+
+		it('re-broadcasts our penalty when its confirmed spend is reorged out', function () {
+			const { monitor, txid } = monitorWithConfirmedSweep();
+			const actions = monitor.handleSpendUnconfirmed(txid, 0);
+
+			const rebroadcast = actions.find(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('reorg recovery')
+			);
+			expect(rebroadcast, 'evicted penalty must be re-broadcast').to.exist;
+
+			const out = (monitor as any)._trackedOutputs[0];
+			expect(out.status).to.equal(OutputStatus.SPEND_BROADCAST);
+			expect(out.resolutionTxid, 'stale spend record cleared').to.be.undefined;
+		});
+
+		it('handleOutputSpent is idempotent for a repeated spend notification', function () {
+			const { monitor, txid } = monitorWithConfirmedSweep();
+			// Reset the tracked output to unspent so the first call does the real work.
+			(monitor as any)._trackedOutputs[0].status = OutputStatus.CONFIRMED;
+			(monitor as any)._trackedOutputs[0].resolutionTxid = undefined;
+
+			const spendTx = new bitcoin.Transaction();
+			spendTx.version = 2;
+			spendTx.addInput(Buffer.from(txid, 'hex').reverse(), 0);
+			spendTx.addOutput(Buffer.alloc(22, 0x00), 90_000);
+
+			monitor.handleOutputSpent(txid, 0, spendTx, 100);
+			// A retained watch re-fires the subscription; the same spend must be a no-op.
+			const second = monitor.handleOutputSpent(txid, 0, spendTx, 100);
+			expect(second.length, 'duplicate spend is not reprocessed').to.equal(0);
 		});
 	});
 
@@ -853,72 +1114,6 @@ describe('Chain Monitor (Phase 4C)', function () {
 				expect((preimageAction as any).preimage).to.deep.equal(preimage);
 				expect((preimageAction as any).paymentHash).to.deep.equal(paymentHash);
 			}
-		});
-	});
-
-	describe('Reorg Handling', function () {
-		it('should reset to WATCHING if commitment block is disconnected', function () {
-			const { opener, openerPrivkeys } = setupNormalChannels();
-			const state = opener.getFullState();
-			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
-
-			const monitor = new ChainMonitor(
-				state,
-				destScript,
-				10,
-				openerPrivkeys[1],
-				openerPrivkeys[2],
-				network
-			);
-
-			const perCommitmentSecret = generateFromSeed(
-				state.localPerCommitmentSeed,
-				MAX_INDEX - state.localCommitmentNumber
-			);
-			const perCommitmentPoint =
-				perCommitmentPointFromSecret(perCommitmentSecret);
-			const built = buildLocalCommitment(state, perCommitmentPoint);
-
-			monitor.handleFundingSpent(built.result.tx, 100);
-			expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
-
-			// Disconnect the block
-			monitor.handleBlockDisconnected(100);
-			expect(monitor.getState()).to.equal(MonitorState.WATCHING);
-			expect(monitor.getTrackedOutputs()).to.have.length(0);
-		});
-
-		it('should not affect fully resolved state', function () {
-			const { opener, openerPrivkeys } = setupNormalChannels();
-			const state = opener.getFullState();
-			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
-
-			const monitor = new ChainMonitor(
-				state,
-				destScript,
-				10,
-				openerPrivkeys[1],
-				openerPrivkeys[2],
-				network
-			);
-
-			const closingResult = buildClosingTx({
-				fundingTxid: state.fundingTxid!.toString('hex'),
-				fundingOutputIndex: state.fundingOutputIndex,
-				fundingAmount: state.fundingSatoshis,
-				localScriptPubkey: destScript,
-				remoteScriptPubkey: Buffer.alloc(22, 0x02),
-				localAmount: 800_000n,
-				remoteAmount: 199_000n,
-				feeAmount: 1_000n
-			});
-
-			monitor.handleFundingSpent(closingResult.tx, 100);
-			expect(monitor.isFullyResolved()).to.be.true;
-
-			monitor.handleBlockDisconnected(100);
-			// Once fully resolved, reorg doesn't change state
-			expect(monitor.isFullyResolved()).to.be.true;
 		});
 	});
 

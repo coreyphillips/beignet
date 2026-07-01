@@ -38,6 +38,12 @@ export interface IUpdateAddHtlcMessage {
 	paymentHash: Buffer;
 	cltvExpiry: number;
 	onionRoutingPacket: Buffer;
+	/**
+	 * Route blinding (BOLT 2/4): blinding_point TLV (type 0). Set by the
+	 * introduction node when forwarding into a blinded path so the next blinded
+	 * hop can derive its blinded node key. 33-byte compressed point.
+	 */
+	blindingPoint?: Buffer;
 }
 
 export interface IUpdateFulfillHtlcMessage {
@@ -89,6 +95,19 @@ export function encodeUpdateAddHtlcMessage(msg: IUpdateAddHtlcMessage): Buffer {
 	offset += 4;
 	msg.onionRoutingPacket.copy(buf, offset);
 
+	// Optional trailing blinding_point TLV (type 0, length 33). BOLT 1 allows
+	// trailing TLV extensions; legacy decoders ignore the extra bytes.
+	if (msg.blindingPoint) {
+		if (msg.blindingPoint.length !== 33) {
+			throw new Error('blindingPoint must be 33 bytes');
+		}
+		return Buffer.concat([
+			buf,
+			Buffer.from([0x00, 0x21]), // type 0, length 33
+			msg.blindingPoint
+		]);
+	}
+
 	return buf;
 }
 
@@ -119,8 +138,21 @@ export function decodeUpdateAddHtlcMessage(
 	const onionRoutingPacket = Buffer.from(
 		payload.subarray(offset, offset + 1366)
 	);
+	offset += 1366;
 
-	return {
+	// Optional trailing blinding_point TLV (type 0, length 33). Parse only the
+	// blinding_point; tolerate/ignore any other trailing TLV records.
+	let blindingPoint: Buffer | undefined;
+	if (payload.length >= offset + 2 && payload[offset] === 0x00) {
+		const len = payload[offset + 1];
+		if (len === 33 && payload.length >= offset + 2 + 33) {
+			blindingPoint = Buffer.from(
+				payload.subarray(offset + 2, offset + 2 + 33)
+			);
+		}
+	}
+
+	const result: IUpdateAddHtlcMessage = {
 		channelId,
 		id,
 		amountMsat,
@@ -128,6 +160,10 @@ export function decodeUpdateAddHtlcMessage(
 		cltvExpiry,
 		onionRoutingPacket
 	};
+	if (blindingPoint) {
+		result.blindingPoint = blindingPoint;
+	}
+	return result;
 }
 
 /**

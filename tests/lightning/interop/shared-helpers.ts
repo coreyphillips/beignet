@@ -214,6 +214,7 @@ export function createInteropNode(seedId = 42): LightningNode {
 	features.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 	features.setOptional(Feature.QUIESCE);
 	features.setOptional(Feature.SPLICE);
+	features.setOptional(Feature.ROUTE_BLINDING);
 
 	return new LightningNode({
 		nodePrivateKey: keys.nodePrivateKey,

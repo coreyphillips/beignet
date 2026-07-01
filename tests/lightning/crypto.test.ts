@@ -354,6 +354,37 @@ describe('Lightning Crypto', function () {
 				expect(verify(messageHash, wrongPubkey, signature)).to.be.false;
 			});
 
+			it('Should reject non-canonical (high-S) signatures in strict mode (BIP146)', function () {
+				const SECP256K1_N = BigInt(
+					'0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
+				);
+				const privkey = crypto.randomBytes(32);
+				const pubkey = getPublicKey(privkey);
+				const messageHash = crypto.createHash('sha256').update('lowS').digest();
+				const sig = sign(messageHash, privkey);
+
+				const r = sig.subarray(0, 32);
+				const s = BigInt('0x' + sig.subarray(32).toString('hex'));
+				const nMinusS = SECP256K1_N - s;
+				const lowS = s < nMinusS ? s : nMinusS;
+				const highS = s < nMinusS ? nMinusS : s;
+				const withS = (x: bigint): Buffer =>
+					Buffer.concat([
+						r,
+						Buffer.from(x.toString(16).padStart(64, '0'), 'hex')
+					]);
+				const lowSig = withS(lowS);
+				const highSig = withS(highS);
+
+				// Both S variants are cryptographically valid; non-strict accepts either.
+				expect(verify(messageHash, pubkey, lowSig)).to.be.true;
+				expect(verify(messageHash, pubkey, highSig)).to.be.true;
+				// Strict (low-S) accepts the canonical one and rejects the high-S one, so
+				// we never store a signature that would make our broadcast tx non-standard.
+				expect(verify(messageHash, pubkey, lowSig, true)).to.be.true;
+				expect(verify(messageHash, pubkey, highSig, true)).to.be.false;
+			});
+
 			it('Should fail verification with wrong message', function () {
 				const privkey = crypto.randomBytes(32);
 				const pubkey = getPublicKey(privkey);

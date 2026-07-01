@@ -12,13 +12,17 @@ import {
 	decodeTlvStream,
 	findTlvRecord
 } from '../message/tlv';
-import { IBlindedPath, IBlindedHop } from '../onion/blinded-path';
+import {
+	encodeBlindedPaths,
+	decodeBlindedPaths,
+	encodeBlindedPayInfos,
+	decodeBlindedPayInfos
+} from '../onion/blinded-path';
 import {
 	IOffer,
 	IInvoiceRequest,
 	IBolt12Invoice,
 	IInvoiceError,
-	IBlindedPayInfo,
 	IFallbackAddress
 } from './types';
 
@@ -97,78 +101,13 @@ function decodeU32(buf: Buffer): number {
 }
 
 /**
- * Encode a blinded path into a TLV value.
- * Format: intro_node_id(33) || blinding_point(33) || num_hops(1) ||
- *         [blinded_node_id(33) || enc_data_len(2) || encrypted_data(...)] ...
+ * Blinded path (de)serialization lives in onion/blinded-path.ts as the shared
+ * source of truth (encodeBlindedPaths/decodeBlindedPaths), reused by both BOLT
+ * 12 here and the BOLT 11 invoice blinded-paths tagged field. The thin aliases
+ * below keep the existing call sites readable.
  */
-function encodeBlindedPathValue(path: IBlindedPath): Buffer {
-	const parts: Buffer[] = [];
-	parts.push(path.introductionNodeId);
-	parts.push(path.blindingPoint);
-
-	const numHops = Buffer.alloc(1);
-	numHops[0] = path.blindedHops.length;
-	parts.push(numHops);
-
-	for (const hop of path.blindedHops) {
-		parts.push(hop.blindedNodeId);
-		const lenBuf = Buffer.alloc(2);
-		lenBuf.writeUInt16BE(hop.encryptedData.length);
-		parts.push(lenBuf);
-		parts.push(hop.encryptedData);
-	}
-
-	return Buffer.concat(parts);
-}
-
-/**
- * Encode an array of blinded paths into a single TLV value.
- * Format: num_paths(1) || path1 || path2 || ...
- */
-function encodeBlindedPathsValue(paths: IBlindedPath[]): Buffer {
-	const parts: Buffer[] = [];
-	const numPaths = Buffer.alloc(1);
-	numPaths[0] = paths.length;
-	parts.push(numPaths);
-
-	for (const path of paths) {
-		parts.push(encodeBlindedPathValue(path));
-	}
-
-	return Buffer.concat(parts);
-}
-
-/**
- * Decode an array of blinded paths from a TLV value buffer.
- */
-function decodeBlindedPathsValue(buf: Buffer): IBlindedPath[] {
-	let offset = 0;
-	const numPaths = buf[offset++];
-	const paths: IBlindedPath[] = [];
-
-	for (let i = 0; i < numPaths; i++) {
-		const introductionNodeId = Buffer.from(buf.subarray(offset, offset + 33));
-		offset += 33;
-		const blindingPoint = Buffer.from(buf.subarray(offset, offset + 33));
-		offset += 33;
-		const numHops = buf[offset++];
-
-		const blindedHops: IBlindedHop[] = [];
-		for (let j = 0; j < numHops; j++) {
-			const blindedNodeId = Buffer.from(buf.subarray(offset, offset + 33));
-			offset += 33;
-			const encLen = buf.readUInt16BE(offset);
-			offset += 2;
-			const encryptedData = Buffer.from(buf.subarray(offset, offset + encLen));
-			offset += encLen;
-			blindedHops.push({ blindedNodeId, encryptedData });
-		}
-
-		paths.push({ introductionNodeId, blindingPoint, blindedHops });
-	}
-
-	return paths;
-}
+const encodeBlindedPathsValue = encodeBlindedPaths;
+const decodeBlindedPathsValue = decodeBlindedPaths;
 
 // ── Offer Encode/Decode ─────────────────────────────────────────────
 
@@ -608,59 +547,11 @@ export function decodeInvoiceErrorTlv(data: Buffer): IInvoiceError {
 }
 
 // ── Blinded Pay Info Encode/Decode ──────────────────────────────────
+// Shared with BOLT 11 via onion/blinded-path.ts (encodeBlindedPayInfos /
+// decodeBlindedPayInfos). Thin aliases preserve the existing call sites.
 
-function encodeBlindedPayInfoArray(infos: IBlindedPayInfo[]): Buffer {
-	const parts: Buffer[] = [];
-	const count = Buffer.alloc(1);
-	count[0] = infos.length;
-	parts.push(count);
-
-	for (const info of infos) {
-		const buf = Buffer.alloc(20);
-		buf.writeUInt32BE(info.feeBaseMsat, 0);
-		buf.writeUInt32BE(info.feeProportionalMillionths, 4);
-		buf.writeUInt16BE(info.cltvExpiryDelta, 8);
-		buf.writeBigUInt64BE(info.htlcMinimumMsat, 10);
-		buf.writeUInt16BE(0, 18); // reserved / features length placeholder
-		parts.push(buf);
-		// htlc_maximum_msat
-		const maxBuf = Buffer.alloc(8);
-		maxBuf.writeBigUInt64BE(info.htlcMaximumMsat);
-		parts.push(maxBuf);
-	}
-
-	return Buffer.concat(parts);
-}
-
-function decodeBlindedPayInfoArray(buf: Buffer): IBlindedPayInfo[] {
-	let offset = 0;
-	const count = buf[offset++];
-	const infos: IBlindedPayInfo[] = [];
-
-	for (let i = 0; i < count; i++) {
-		const feeBaseMsat = buf.readUInt32BE(offset);
-		offset += 4;
-		const feeProportionalMillionths = buf.readUInt32BE(offset);
-		offset += 4;
-		const cltvExpiryDelta = buf.readUInt16BE(offset);
-		offset += 2;
-		const htlcMinimumMsat = buf.readBigUInt64BE(offset);
-		offset += 8;
-		offset += 2; // reserved
-		const htlcMaximumMsat = buf.readBigUInt64BE(offset);
-		offset += 8;
-
-		infos.push({
-			feeBaseMsat,
-			feeProportionalMillionths,
-			cltvExpiryDelta,
-			htlcMinimumMsat,
-			htlcMaximumMsat
-		});
-	}
-
-	return infos;
-}
+const encodeBlindedPayInfoArray = encodeBlindedPayInfos;
+const decodeBlindedPayInfoArray = decodeBlindedPayInfos;
 
 // ── Fallback Address Encode/Decode ──────────────────────────────────
 

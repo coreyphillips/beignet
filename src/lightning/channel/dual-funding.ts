@@ -17,7 +17,9 @@ import {
 } from '../interactive-tx/types';
 import {
 	IOpenChannel2Message,
-	IAcceptChannel2Message
+	IAcceptChannel2Message,
+	IRequestFunds,
+	IWillFund
 } from '../message/dual-funding';
 import {
 	MIN_DUST_LIMIT_SATOSHIS,
@@ -25,6 +27,7 @@ import {
 	MAX_FUNDING_SATOSHIS
 } from './types';
 import { IChannelBasepoints } from '../keys/derivation';
+import { ILeaseRates } from '../gossip/types';
 
 /** Dual-funding session states */
 export enum DualFundingState {
@@ -74,6 +77,22 @@ export interface IDualFundingParams {
 	channelType?: Buffer;
 	/** Second per-commitment point */
 	secondPerCommitmentPoint: Buffer;
+	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request (opener). */
+	requestFunds?: IRequestFunds;
+	/**
+	 * Liquidity ads (bLIP-0051): the MAXIMUM lease rates the buyer will accept.
+	 * This MUST be a buyer-chosen local policy limit (e.g. the rates the buyer
+	 * decided were acceptable before requesting), NOT copied blindly from the
+	 * seller's gossip ad: the seller controls both the ad and will_fund, so a
+	 * seller-derived ceiling would bound nothing. Local-only (NOT sent on the
+	 * wire). The seller's will_fund rates are self-signed and otherwise
+	 * unbounded, so without this ceiling an inflated will_fund could drain
+	 * nearly the buyer's whole balance as a lease fee. handleAcceptChannel2
+	 * rejects a lease whose computed fee exceeds the fee implied by these rates.
+	 */
+	maxLeaseRates?: ILeaseRates;
+	/** Liquidity ads (bLIP-0051): seller's signed will_fund commitment (acceptor). */
+	willFund?: IWillFund;
 }
 
 /** Result of a dual-funding operation */
@@ -142,6 +161,16 @@ export class DualFundingSession {
 
 	getLocalParams(): IDualFundingParams | null {
 		return this._localParams;
+	}
+
+	/** Liquidity ads: the request_funds we sent (opener) or received (acceptor). */
+	getRequestFunds(): IRequestFunds | undefined {
+		return this._openMsg?.requestFunds;
+	}
+
+	/** channel_type proposed in open_channel2 (what will_fund is signed over). */
+	getOpenChannelType(): Buffer | undefined {
+		return this._openMsg?.channelType;
 	}
 
 	getRemoteBasepoints(): IChannelBasepoints | null {
@@ -219,7 +248,8 @@ export class DualFundingSession {
 			firstPerCommitmentPoint: params.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: params.secondPerCommitmentPoint,
 			channelFlags: params.channelFlags ?? 0x01,
-			channelType: params.channelType
+			channelType: params.channelType,
+			requestFunds: params.requestFunds
 		};
 
 		this._openMsg = msg;
@@ -349,7 +379,8 @@ export class DualFundingSession {
 			firstPerCommitmentPoint:
 				localParams.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: localParams.secondPerCommitmentPoint,
-			channelType: localParams.channelType
+			channelType: localParams.channelType,
+			willFund: localParams.willFund
 		};
 
 		this._acceptMsg = acceptMsg;

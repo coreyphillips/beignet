@@ -83,10 +83,13 @@ import { ChannelSigner } from '../keys/signer';
 import {
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
+	verifyRemoteCommitmentPartial,
 	verifyRemoteHtlcSignatures,
+	verifyRemoteHtlcSignaturesTaproot,
 	calculateCommitmentFee
 } from './commitment-builder';
-import { isAnchorChannel } from './types';
+import { isAnchorChannel, isTaprootChannel } from './types';
+import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
 import {
@@ -124,6 +127,7 @@ import {
 	DualFundingState,
 	IDualFundingParams
 } from './dual-funding';
+import { computeLeaseFeeSat, computeLeaseExpiry } from './liquidity-ads';
 import {
 	encodeTxCompleteMessage,
 	encodeTxSignaturesMessage,
@@ -402,7 +406,11 @@ export class Channel {
 	 * @param chainHash - Optional chain hash (defaults to Bitcoin mainnet)
 	 * @param preferAnchors - If true, negotiate option_anchors_zero_fee_htlc_tx
 	 */
-	initiateOpen(chainHash?: Buffer, preferAnchors?: boolean): ChannelAction[] {
+	initiateOpen(
+		chainHash?: Buffer,
+		preferAnchors?: boolean,
+		preferTaproot?: boolean
+	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
 			return [
 				{
@@ -417,12 +425,23 @@ export class Channel {
 			0n
 		);
 
-		// Build channel_type TLV: static_remotekey (feature bit 12)
-		// + option_anchors_zero_fee_htlc_tx (feature bit 22) if requested
+		// Build channel_type TLV.
+		//
+		// For simple taproot channels LND validates the channel_type with
+		// OnlyContains(SimpleTaprootChannelsRequiredStaging) — an EXACT match on a
+		// single bit (180). The taproot bit implies anchor-style commitments and
+		// static_remotekey, so those bits MUST NOT also appear; any extra bit makes
+		// LND reject with "requested channel type not supported" (verified live vs
+		// lnd v0.20). Non-taproot keeps static_remotekey (bit 12) +
+		// option_anchors_zero_fee_htlc_tx (bit 22) when requested.
 		const channelTypeFlags = FeatureFlags.empty();
-		channelTypeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
-		if (preferAnchors) {
-			channelTypeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+		if (preferTaproot) {
+			channelTypeFlags.setCompulsory(Feature.OPTION_TAPROOT);
+		} else {
+			channelTypeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			if (preferAnchors) {
+				channelTypeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			}
 		}
 		const channelType = channelTypeFlags.toBuffer();
 		this._state.channelType = channelType;
@@ -452,9 +471,17 @@ export class Channel {
 				this._state.localBasepoints.delayedPaymentBasepoint,
 			htlcBasepoint: this._state.localBasepoints.htlcBasepoint,
 			firstPerCommitmentPoint: firstPoint,
-			channelFlags: 0x01, // announce_channel
+			// announce_channel bit. Simple taproot channels MUST be unannounced —
+			// LND rejects a public taproot channel ("taproot channel type for public
+			// channel"), so force the private flag for taproot.
+			channelFlags: preferTaproot ? 0x00 : 0x01,
 			channelType
 		};
+
+		// option_taproot: attach our MuSig2 public nonce for the first commitment.
+		if (preferTaproot) {
+			msg.nextLocalNonce = this._ensureLocalFundingNonce();
+		}
 
 		// Store our first per-commitment point in the basepoints
 		this._state.localBasepoints = {
@@ -469,6 +496,127 @@ export class Channel {
 
 		this._state.state = ChannelState.SENT_OPEN;
 		return [sendMsg(MessageType.OPEN_CHANNEL, encodeOpenChannelMessage(msg))];
+	}
+
+	/**
+	 * option_taproot: DETERMINISTICALLY derive our MuSig2 verification nonce for a
+	 * given local commitment height. The returned object is the secret-handle the
+	 * library keys by identity; deriving it from a fixed sessionId makes the SAME
+	 * (public + secret) nonce reproducible after a reconnect OR a restart, so the
+	 * pre-reconnect commitment stays force-closeable (this mirrors how LND derives
+	 * taproot verification nonces). The sessionId is an HMAC of our per-commitment
+	 * SEED — a root secret the peer never learns — keyed by the height, so every
+	 * height gets a unique, secret, reproducible nonce.
+	 *
+	 * SAFETY (no nonce reuse): the verification nonce for height H is used to SIGN
+	 * exactly one thing — our own commitment at height H, and only at force-close
+	 * (see forceClose). It signs that single sighash under the one peer signing
+	 * nonce bound to height H (remoteSigningNonce, persisted), so the challenge is
+	 * fixed and the same secret nonce never signs two different challenges. During
+	 * normal operation only its PUBLIC part is shared (partialVerify is a public
+	 * op). The per-signature SIGNING nonce used when WE co-sign the peer's
+	 * commitment is a SEPARATE, fresh-random nonce — never derived here.
+	 */
+	private _deriveVerificationNonce(height: bigint): Uint8Array {
+		const heightBuf = Buffer.alloc(8);
+		heightBuf.writeBigUInt64BE(height);
+		const sessionId = crypto
+			.createHmac('sha256', this._state.localPerCommitmentSeed)
+			.update(Buffer.from('beignet-taproot-verification-nonce', 'utf8'))
+			.update(heightBuf)
+			.digest();
+		return generateNonce({
+			publicKey: this._state.localBasepoints.fundingPubkey,
+			sessionId
+		});
+	}
+
+	/**
+	 * option_taproot: our verification nonce for the CURRENT local commitment
+	 * (height = localCommitmentNumber). Re-derives deterministically if absent
+	 * (e.g. dropped on reconnect, or after restore-from-disk) and returns the
+	 * 66-byte public part for the wire. Idempotent.
+	 */
+	private _ensureLocalFundingNonce(): Buffer {
+		if (!this._state.localNonce) {
+			this._state.localNonce = this._deriveVerificationNonce(
+				this._state.localCommitmentNumber
+			);
+		}
+		return Buffer.from(this._state.localNonce);
+	}
+
+	/**
+	 * option_taproot: our verification nonce for the NEXT local commitment
+	 * (height = localCommitmentNumber + 1), advertised one step ahead
+	 * (channel_ready / revoke_and_ack / channel_reestablish). Re-derives
+	 * deterministically if absent. Idempotent — re-advertises the SAME nonce.
+	 */
+	private _ensureLocalNextNonce(): Buffer {
+		if (!this._state.localNextNonce) {
+			this._state.localNextNonce = this._deriveVerificationNonce(
+				this._state.localCommitmentNumber + 1n
+			);
+		}
+		return Buffer.from(this._state.localNextNonce);
+	}
+
+	/**
+	 * option_taproot: verify the peer's 98-byte partial_signature_with_nonce (a
+	 * MuSig2 partial signature over OUR initial commitment #0 || the peer's
+	 * single-use signing nonce) carried in funding_created/funding_signed, and on
+	 * success store it as remoteCommitmentSignature + remoteSigningNonce for later
+	 * aggregation into the key-spend witness. Returns an error string on failure,
+	 * or null on success.
+	 */
+	private _verifyAndStoreRemotePartial(
+		partialSignatureWithNonce: Buffer | undefined,
+		ourPublicNonce: Uint8Array | undefined,
+		commitmentNumber: bigint
+	): string | null {
+		if (!partialSignatureWithNonce || partialSignatureWithNonce.length !== 98) {
+			return 'Taproot commitment message missing a valid partial_signature_with_nonce';
+		}
+		if (!ourPublicNonce || !this._state.remoteBasepoints) {
+			return 'Cannot verify taproot partial: missing local verification nonce or remote basepoints';
+		}
+		const theirPartial = Buffer.from(partialSignatureWithNonce.subarray(0, 32));
+		const theirSigningNonce = Buffer.from(
+			partialSignatureWithNonce.subarray(32, 98)
+		);
+		const localPerCommitmentPoint = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			commitmentNumber
+		);
+		const valid = verifyRemoteCommitmentPartial(
+			this._state,
+			theirPartial,
+			ourPublicNonce,
+			theirSigningNonce,
+			localPerCommitmentPoint,
+			commitmentNumber
+		);
+		if (!valid) {
+			return 'Invalid taproot partial signature';
+		}
+		this._state.remoteCommitmentSignature = theirPartial;
+		this._state.remoteSigningNonce = theirSigningNonce;
+		return null;
+	}
+
+	/**
+	 * option_taproot: verify + store the peer's partial over our INITIAL commitment
+	 * (#0), carried in funding_created/funding_signed. The verification nonce here
+	 * is our funding nonce (localNonce), seeded by open_channel/accept_channel.
+	 */
+	private _acceptFundingPartial(
+		partialSignatureWithNonce?: Buffer
+	): string | null {
+		return this._verifyAndStoreRemotePartial(
+			partialSignatureWithNonce,
+			this._state.localNonce,
+			0n
+		);
 	}
 
 	/**
@@ -537,6 +685,20 @@ export class Channel {
 			this._state.channelType = msg.channelType;
 		}
 
+		// option_taproot: record the acceptor's funding nonce. Our own nonce was
+		// generated and stored when we sent open_channel.
+		if (isTaprootChannel(this._state.channelType)) {
+			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot accept_channel missing a valid next_local_nonce'
+					}
+				];
+			}
+			this._state.remoteNonce = msg.nextLocalNonce;
+		}
+
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [];
 	}
@@ -548,7 +710,8 @@ export class Channel {
 	createFundingCreated(
 		fundingTxid: Buffer,
 		fundingOutputIndex: number,
-		signature: Buffer
+		signature: Buffer,
+		partialSignatureWithNonce?: Buffer
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.SENT_ACCEPT) {
 			return [
@@ -565,11 +728,29 @@ export class Channel {
 		// Derive permanent channel ID
 		this._state.channelId = deriveChannelId(fundingTxid, fundingOutputIndex);
 
+		// option_taproot: the initial commitment is co-signed with a MuSig2 partial
+		// signature carried in partial_signature_with_nonce; the fixed 64-byte
+		// signature field is all-zero.
+		const taproot = isTaprootChannel(this._state.channelType);
+		if (
+			taproot &&
+			(!partialSignatureWithNonce || partialSignatureWithNonce.length !== 98)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Taproot funding_created requires a partial_signature_with_nonce'
+				}
+			];
+		}
+
 		const msg: IFundingCreatedMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
 			fundingTxid,
 			fundingOutputIndex,
-			signature
+			signature: taproot ? Buffer.alloc(64) : signature,
+			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
 		this._state.state = ChannelState.SENT_FUNDING_CREATED;
@@ -604,30 +785,39 @@ export class Channel {
 		// balance in the 2-of-2 funding output, and forceClose() builds an
 		// invalid witness from the bad signature that can never confirm — funds
 		// held hostage with no unilateral exit (BOLT 2 MUST).
-		if (this._signer && this._state.remoteBasepoints) {
-			const firstPerCommitmentPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				0n
-			);
-			const valid = verifyRemoteCommitmentSig(
-				this._state,
-				this._signer,
-				firstPerCommitmentPoint,
-				msg.signature,
-				0n
-			);
-			if (!valid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid commitment signature in funding_signed'
-					}
-				];
+		if (isTaprootChannel(this._state.channelType)) {
+			// option_taproot: verify the acceptor's MuSig2 partial over our
+			// commitment #0 and store it (with their signing nonce) for aggregation.
+			const err = this._acceptFundingPartial(msg.partialSignatureWithNonce);
+			if (err) {
+				return [{ type: ChannelActionType.ERROR, message: err }];
 			}
-		}
+		} else {
+			if (this._signer && this._state.remoteBasepoints) {
+				const firstPerCommitmentPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					0n
+				);
+				const valid = verifyRemoteCommitmentSig(
+					this._state,
+					this._signer,
+					firstPerCommitmentPoint,
+					msg.signature,
+					0n
+				);
+				if (!valid) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Invalid commitment signature in funding_signed'
+						}
+					];
+				}
+			}
 
-		// Store remote's commitment signature
-		this._state.remoteCommitmentSignature = msg.signature;
+			// Store remote's commitment signature
+			this._state.remoteCommitmentSignature = msg.signature;
+		}
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
@@ -715,7 +905,12 @@ export class Channel {
 		// Validate and store channel type from open_channel
 		if (msg.channelType) {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
-			if (!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY)) {
+			// Simple taproot channels carry ONLY the taproot bit (static_remotekey is
+			// implied), so accept either an explicit static_remotekey or taproot.
+			if (
+				!proposedFlags.hasFeature(Feature.STATIC_REMOTE_KEY) &&
+				!proposedFlags.hasFeature(Feature.OPTION_TAPROOT)
+			) {
 				return [
 					{
 						type: ChannelActionType.ERROR,
@@ -756,6 +951,20 @@ export class Channel {
 			channelType: this._state.channelType
 		};
 
+		// option_taproot: record the opener's funding nonce and return ours.
+		if (isTaprootChannel(this._state.channelType)) {
+			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot open_channel missing a valid next_local_nonce'
+					}
+				];
+			}
+			this._state.remoteNonce = msg.nextLocalNonce;
+			acceptMsg.nextLocalNonce = this._ensureLocalFundingNonce();
+		}
+
 		this._state.state = ChannelState.SENT_ACCEPT;
 		return [
 			sendMsg(MessageType.ACCEPT_CHANNEL, encodeAcceptChannelMessage(acceptMsg))
@@ -768,7 +977,8 @@ export class Channel {
 	 */
 	handleFundingCreated(
 		msg: IFundingCreatedMessage,
-		signature: Buffer
+		signature: Buffer,
+		partialSignatureWithNonce?: Buffer
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.SENT_ACCEPT) {
 			return [
@@ -797,34 +1007,57 @@ export class Channel {
 		// funder's signature first). Same class of check as funding_signed/
 		// commitment_signed; without it we'd persist an unverifiable initial
 		// commitment we cannot force-close.
-		if (this._signer && this._state.remoteBasepoints) {
-			const firstPerCommitmentPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				0n
-			);
-			const valid = verifyRemoteCommitmentSig(
-				this._state,
-				this._signer,
-				firstPerCommitmentPoint,
-				msg.signature,
-				0n
-			);
-			if (!valid) {
+		const taproot = isTaprootChannel(this._state.channelType);
+		if (taproot) {
+			// option_taproot: verify the opener's MuSig2 partial over our
+			// commitment #0 and store it (with their signing nonce) for aggregation.
+			const err = this._acceptFundingPartial(msg.partialSignatureWithNonce);
+			if (err) {
+				return [{ type: ChannelActionType.ERROR, message: err }];
+			}
+			if (
+				!partialSignatureWithNonce ||
+				partialSignatureWithNonce.length !== 98
+			) {
 				return [
 					{
 						type: ChannelActionType.ERROR,
-						message: 'Invalid commitment signature in funding_created'
+						message:
+							'Taproot funding_signed requires a partial_signature_with_nonce'
 					}
 				];
 			}
-		}
+		} else {
+			if (this._signer && this._state.remoteBasepoints) {
+				const firstPerCommitmentPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					0n
+				);
+				const valid = verifyRemoteCommitmentSig(
+					this._state,
+					this._signer,
+					firstPerCommitmentPoint,
+					msg.signature,
+					0n
+				);
+				if (!valid) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Invalid commitment signature in funding_created'
+						}
+					];
+				}
+			}
 
-		// Store remote's commitment signature
-		this._state.remoteCommitmentSignature = msg.signature;
+			// Store remote's commitment signature
+			this._state.remoteCommitmentSignature = msg.signature;
+		}
 
 		const signedMsg: IFundingSignedMessage = {
 			channelId: this._state.channelId,
-			signature
+			signature: taproot ? Buffer.alloc(64) : signature,
+			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
@@ -879,6 +1112,12 @@ export class Channel {
 			shortChannelId: this._state.scidAlias
 		};
 
+		// option_taproot: seed the verification-nonce pipeline — advertise our nonce
+		// for commitment #1 alongside second_per_commitment_point.
+		if (isTaprootChannel(this._state.channelType)) {
+			msg.nextLocalNonce = this._ensureLocalNextNonce();
+		}
+
 		this._state.localChannelReady = true;
 
 		if (this._state.remoteChannelReady) {
@@ -927,6 +1166,22 @@ export class Channel {
 		this._state.remoteChannelReady = true;
 		this._state.remoteNextPerCommitmentPoint = msg.secondPerCommitmentPoint;
 
+		// option_taproot: the peer's commitment-#1 verification nonce seeds the
+		// pipeline — it matches second_per_commitment_point (remoteNextPerCommitment-
+		// Point), so we use it when we co-sign the peer's first post-funding
+		// commitment. It is rotated forward thereafter by each revoke_and_ack.
+		if (isTaprootChannel(this._state.channelType) && msg.nextLocalNonce) {
+			if (msg.nextLocalNonce.length !== 66) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot channel_ready has an invalid next_local_nonce'
+					}
+				];
+			}
+			this._state.remoteNonce = msg.nextLocalNonce;
+		}
+
 		// Store remote's SCID alias if provided
 		if (msg.shortChannelId) {
 			this._state.remoteScidAlias = msg.shortChannelId;
@@ -955,7 +1210,8 @@ export class Channel {
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		cltvExpiry: number,
-		onionRoutingPacket: Buffer
+		onionRoutingPacket: Buffer,
+		blindingPoint?: Buffer
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NORMAL) {
 			return [
@@ -1058,7 +1314,8 @@ export class Channel {
 			cltvExpiry,
 			onionRoutingPacket,
 			direction: HtlcDirection.OFFERED,
-			state: HtlcState.PENDING
+			state: HtlcState.PENDING,
+			...(blindingPoint ? { blindingPoint } : {})
 		};
 
 		this._state.htlcs.set(`offered-${htlcId}`, entry);
@@ -1072,7 +1329,8 @@ export class Channel {
 			amountMsat,
 			paymentHash,
 			cltvExpiry,
-			onionRoutingPacket
+			onionRoutingPacket,
+			...(blindingPoint ? { blindingPoint } : {})
 		};
 
 		// We added an offered HTLC — we owe the remote a commitment_signed.
@@ -1224,7 +1482,8 @@ export class Channel {
 			cltvExpiry: msg.cltvExpiry,
 			onionRoutingPacket: msg.onionRoutingPacket,
 			direction: HtlcDirection.RECEIVED,
-			state: HtlcState.PENDING
+			state: HtlcState.PENDING,
+			...(msg.blindingPoint ? { blindingPoint: msg.blindingPoint } : {})
 		};
 
 		this._state.htlcs.set(`received-${msg.id}`, entry);
@@ -1534,7 +1793,11 @@ export class Channel {
 	 * Sign and send commitment_signed.
 	 * The caller provides the signature and HTLC signatures (from commitment-builder).
 	 */
-	signCommitment(signature: Buffer, htlcSignatures: Buffer[]): ChannelAction[] {
+	signCommitment(
+		signature: Buffer,
+		htlcSignatures: Buffer[],
+		partialSignatureWithNonce?: Buffer
+	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -1547,14 +1810,38 @@ export class Channel {
 			];
 		}
 
+		// option_taproot: the commitment is co-signed with a MuSig2 partial carried
+		// in partial_signature_with_nonce; the fixed 64-byte signature field is zero.
+		const taproot = isTaprootChannel(this._state.channelType);
+		if (
+			taproot &&
+			(!partialSignatureWithNonce || partialSignatureWithNonce.length !== 98)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Taproot commitment_signed requires a partial_signature_with_nonce'
+				}
+			];
+		}
+
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
-			signature,
-			htlcSignatures
+			signature: taproot ? Buffer.alloc(64) : signature,
+			htlcSignatures,
+			partialSignatureWithNonce: taproot ? partialSignatureWithNonce : undefined
 		};
 
-		// Cache for retransmission on reestablish
+		// Cache for retransmission on reestablish. For taproot we cache the
+		// 98-byte partial_signature_with_nonce that actually went on the wire so
+		// a reconnect replays the identical message (the all-zero `signature`
+		// field carries no signing material for taproot).
 		this._state.lastSentCommitmentSigned = Buffer.from(signature);
+		this._state.lastSentPartialSignatureWithNonce =
+			taproot && partialSignatureWithNonce
+				? Buffer.from(partialSignatureWithNonce)
+				: null;
 		this._state.lastSentHtlcSignatures = htlcSignatures.map((s) =>
 			Buffer.from(s)
 		);
@@ -1607,55 +1894,92 @@ export class Channel {
 			];
 		}
 
-		// Verify the remote's commitment signature BEFORE revoking old state (Fix 1.1)
-		if (this._signer && this._state.remoteBasepoints) {
-			const nextCommitmentNumber = this._state.localCommitmentNumber + 1n;
-			const nextPerCommitmentPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				nextCommitmentNumber
-			);
-			const valid = verifyRemoteCommitmentSig(
-				this._state,
-				this._signer,
-				nextPerCommitmentPoint,
-				msg.signature,
-				nextCommitmentNumber
-			);
-			if (!valid) {
-				const cid = (
-					this._state.channelId || this._state.temporaryChannelId
-				).toString('hex');
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
-					}
-				];
-			}
-		}
-
-		// Verify HTLC second-level transaction signatures before revoking old state
-		if (this._signer && this._state.remoteBasepoints) {
-			const htlcPerCommitmentPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
+		if (isTaprootChannel(this._state.channelType)) {
+			// option_taproot: verify the peer's MuSig2 partial over OUR next
+			// commitment using the verification nonce we advertised one step ahead
+			// (localNextNonce) + the peer's inline signing nonce, and store the
+			// partial + that signing nonce for force-close aggregation.
+			const err = this._verifyAndStoreRemotePartial(
+				msg.partialSignatureWithNonce,
+				this._state.localNextNonce,
 				this._state.localCommitmentNumber + 1n
 			);
-			const htlcSigsValid = verifyRemoteHtlcSignatures(
-				this._state,
-				this._signer,
-				htlcPerCommitmentPoint,
-				msg.htlcSignatures
-			);
-			if (!htlcSigsValid) {
-				return [
-					{ type: ChannelActionType.ERROR, message: 'Invalid HTLC signature' }
-				];
+			if (err) {
+				return [{ type: ChannelActionType.ERROR, message: err }];
 			}
-		}
+			// Verify the peer's Schnorr signatures over our second-level HTLC txs.
+			if (this._state.remoteBasepoints) {
+				const htlcPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					this._state.localCommitmentNumber + 1n
+				);
+				if (
+					!verifyRemoteHtlcSignaturesTaproot(
+						this._state,
+						htlcPoint,
+						msg.htlcSignatures
+					)
+				) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Invalid taproot HTLC signature'
+						}
+					];
+				}
+			}
+			this._state.remoteHtlcSignatures = msg.htlcSignatures;
+		} else {
+			// Verify the remote's commitment signature BEFORE revoking old state (Fix 1.1)
+			if (this._signer && this._state.remoteBasepoints) {
+				const nextCommitmentNumber = this._state.localCommitmentNumber + 1n;
+				const nextPerCommitmentPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					nextCommitmentNumber
+				);
+				const valid = verifyRemoteCommitmentSig(
+					this._state,
+					this._signer,
+					nextPerCommitmentPoint,
+					msg.signature,
+					nextCommitmentNumber
+				);
+				if (!valid) {
+					const cid = (
+						this._state.channelId || this._state.temporaryChannelId
+					).toString('hex');
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: `Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
+						}
+					];
+				}
+			}
 
-		// Store remote's signature
-		this._state.remoteCommitmentSignature = msg.signature;
-		this._state.remoteHtlcSignatures = msg.htlcSignatures;
+			// Verify HTLC second-level transaction signatures before revoking old state
+			if (this._signer && this._state.remoteBasepoints) {
+				const htlcPerCommitmentPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					this._state.localCommitmentNumber + 1n
+				);
+				const htlcSigsValid = verifyRemoteHtlcSignatures(
+					this._state,
+					this._signer,
+					htlcPerCommitmentPoint,
+					msg.htlcSignatures
+				);
+				if (!htlcSigsValid) {
+					return [
+						{ type: ChannelActionType.ERROR, message: 'Invalid HTLC signature' }
+					];
+				}
+			}
+
+			// Store remote's signature
+			this._state.remoteCommitmentSignature = msg.signature;
+			this._state.remoteHtlcSignatures = msg.htlcSignatures;
+		}
 
 		// Reveal current per-commitment secret and advance
 		const currentSecret = getPerCommitmentSecret(
@@ -1693,6 +2017,23 @@ export class Channel {
 			perCommitmentSecret: currentSecret,
 			nextPerCommitmentPoint: nextPoint
 		};
+
+		// option_taproot: rotate the verification nonce. The nonce the peer just
+		// used to co-sign our now-adopted commitment (localNextNonce) is promoted to
+		// the current commitment's nonce (localNonce, reserved for force-close
+		// aggregation); we then derive the verification nonce for our NEXT
+		// commitment (deterministic per height) and advertise its public part in
+		// revoke_and_ack, exactly mirroring next_per_commitment_point. The old
+		// localNonce (for the now-revoked commitment) is discarded — its secret is
+		// never used again. localCommitmentNumber was just incremented, so the next
+		// nonce is for localCommitmentNumber + 1.
+		if (isTaprootChannel(this._state.channelType)) {
+			this._state.localNonce = this._state.localNextNonce;
+			this._state.localNextNonce = this._deriveVerificationNonce(
+				this._state.localCommitmentNumber + 1n
+			);
+			revokeMsg.nextLocalNonce = Buffer.from(this._state.localNextNonce);
+		}
 
 		// Persist state BEFORE sending revoke_and_ack (Fix 2.2)
 		// Note: HTLC_FORWARDED is NOT emitted here — LND requires a full
@@ -1761,6 +2102,21 @@ export class Channel {
 		this._state.remoteCurrentPerCommitmentPoint =
 			this._state.remoteNextPerCommitmentPoint;
 		this._state.remoteNextPerCommitmentPoint = msg.nextPerCommitmentPoint;
+
+		// option_taproot: rotate the peer's verification nonce forward in lockstep
+		// with their per-commitment point — this nonce is what we use to co-sign the
+		// peer's NEXT commitment (matching remoteNextPerCommitmentPoint).
+		if (isTaprootChannel(this._state.channelType)) {
+			if (!msg.nextLocalNonce || msg.nextLocalNonce.length !== 66) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot revoke_and_ack missing a valid next_local_nonce'
+					}
+				];
+			}
+			this._state.remoteNonce = msg.nextLocalNonce;
+		}
 
 		// Clean up fulfilled/failed HTLCs and finalize balance changes
 		for (const [key, entry] of this._state.htlcs) {
@@ -2085,29 +2441,74 @@ export class Channel {
 
 		const built = buildLocal(this._state, perCommitmentPoint);
 
-		// Create the funding witness using stored remote signature
-		const funding = createFundingScript(
-			this._state.localBasepoints.fundingPubkey,
-			this._state.remoteBasepoints.fundingPubkey
-		);
+		if (isTaprootChannel(this._state.channelType)) {
+			// option_taproot: the funding output is a MuSig2 key-spend P2TR. The
+			// broadcast witness is the single 64-byte BIP340 Schnorr signature
+			// obtained by aggregating our partial with the peer's stored partial over
+			// THIS local commitment (remoteCommitmentSignature = their 32-byte
+			// partial; remoteSigningNonce = the signing nonce that accompanied it;
+			// localNonce = our verification nonce for the current commitment).
+			// Our verification nonce is deterministic per height, so re-derive it
+			// fresh here — this reproduces the EXACT nonce the peer's stored partial
+			// was made against (so the pre-reconnect commitment is force-closeable),
+			// and ALWAYS re-deriving gives a fresh single-use secret-nonce
+			// registration: the MuSig2 library purges a secret nonce after one
+			// partialSign, so a force-close retry would otherwise find no secret.
+			// Safe — same height + same persisted peer nonce + same commitment ⇒ the
+			// identical signature, never a reused nonce over a different message. The
+			// peer's signing nonce is persisted (remoteSigningNonce); without it we
+			// cannot aggregate.
+			this._state.localNonce = this._deriveVerificationNonce(
+				this._state.localCommitmentNumber
+			);
+			if (!this._state.remoteSigningNonce) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot force close taproot channel: missing peer signing nonce (remoteSigningNonce) for the current commitment'
+					}
+				];
+			}
+			const { aggregateLocalCommitmentSig } = require('./commitment-builder');
+			const {
+				buildTaprootKeySpendWitness
+			} = require('../script/funding-taproot');
+			const aggSig = aggregateLocalCommitmentSig(
+				this._state,
+				signer,
+				this._state.localNonce!,
+				this._state.remoteSigningNonce,
+				this._state.remoteCommitmentSignature,
+				perCommitmentPoint,
+				this._state.localCommitmentNumber
+			);
+			built.result.tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
+		} else {
+			// Create the funding witness using stored remote signature
+			const funding = createFundingScript(
+				this._state.localBasepoints.fundingPubkey,
+				this._state.remoteBasepoints.fundingPubkey
+			);
 
-		// Sign our side
-		const localSig = signer.signCommitmentTx(
-			built.result.tx,
-			funding.witnessScript,
-			built.fundingAmount
-		);
+			// Sign our side
+			const localSig = signer.signCommitmentTx(
+				built.result.tx,
+				funding.witnessScript,
+				built.fundingAmount
+			);
 
-		// Build the 2-of-2 witness
-		const witness = ChannelSigner.buildFundingWitness(
-			localSig,
-			this._state.remoteCommitmentSignature,
-			this._state.localBasepoints.fundingPubkey,
-			this._state.remoteBasepoints.fundingPubkey,
-			funding.witnessScript
-		);
+			// Build the 2-of-2 witness
+			const witness = ChannelSigner.buildFundingWitness(
+				localSig,
+				this._state.remoteCommitmentSignature,
+				this._state.localBasepoints.fundingPubkey,
+				this._state.remoteBasepoints.fundingPubkey,
+				funding.witnessScript
+			);
 
-		built.result.tx.setWitness(0, witness);
+			built.result.tx.setWitness(0, witness);
+		}
 
 		this._state.state = ChannelState.FORCE_CLOSED;
 
@@ -2285,7 +2686,8 @@ export class Channel {
 	 */
 	handleClosingSigned(
 		msg: IClosingSignedMessage,
-		signClosingFn: (feeSatoshis: bigint) => Buffer
+		signClosingFn: (feeSatoshis: bigint) => Buffer,
+		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
@@ -2305,11 +2707,29 @@ export class Channel {
 			this.initClosingFeeRange(idealFee);
 		}
 
+		// Fund-safety: never transition to CLOSED (which tears down the funding-output
+		// watch upstream) on fee agreement ALONE. A peer can echo our proposed fee with
+		// a garbage signature; if we closed + stopped watching we could not punish a
+		// later revoked/latest commitment broadcast on the still-live funding output.
+		// Verify the peer's closing signature over the agreed tx FIRST; on failure stay
+		// in NEGOTIATING_CLOSING (channel + funding watch intact). The callback is
+		// optional so existing unit callers that only exercise fee logic are unaffected.
+		const peerSigValid = (feeSatoshis: bigint): boolean =>
+			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.signature);
+
 		// If their fee matches our last proposal → agreement reached
 		if (
 			this._state.lastProposedClosingFeeSat !== null &&
 			msg.feeSatoshis === this._state.lastProposedClosingFeeSat
 		) {
+			if (!peerSigValid(msg.feeSatoshis)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Coop-close: peer closing signature failed to verify'
+					}
+				];
+			}
 			this._state.state = ChannelState.CLOSED;
 			return [
 				{
@@ -2324,6 +2744,14 @@ export class Channel {
 			msg.feeSatoshis >= this._state.closingFeeMin! &&
 			msg.feeSatoshis <= this._state.closingFeeMax!
 		) {
+			if (!peerSigValid(msg.feeSatoshis)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Coop-close: peer closing signature failed to verify'
+					}
+				];
+			}
 			const sig = signClosingFn(msg.feeSatoshis);
 			const response: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -2378,13 +2806,20 @@ export class Channel {
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
-		// Acceptable range: 0.5x to 2x ideal, capped at opener's available balance
+		// Acceptable range: 0.5x to 2x ideal, capped at opener's available balance.
+		// When WE are the opener the fee comes out of OUR output, so also reserve
+		// our dust limit: a fee that pushes our output below dust would silently
+		// drop it from the closing tx and burn the remainder to fees.
 		const min = idealFee / 2n;
 		const max = idealFee * 2n;
-		const openerBalance =
-			this._state.role === ChannelRole.OPENER
-				? this._state.localBalanceMsat / 1000n
-				: this._state.remoteBalanceMsat / 1000n;
+		const isOpener = this._state.role === ChannelRole.OPENER;
+		let openerBalance = isOpener
+			? this._state.localBalanceMsat / 1000n
+			: this._state.remoteBalanceMsat / 1000n;
+		if (isOpener) {
+			const dust = this._state.localConfig.dustLimitSatoshis;
+			openerBalance = openerBalance > dust ? openerBalance - dust : 0n;
+		}
 		this._state.closingFeeMin = min;
 		this._state.closingFeeMax = max < openerBalance ? max : openerBalance;
 	}
@@ -2509,6 +2944,20 @@ export class Channel {
 			yourLastPerCommitmentSecret: lastSecret,
 			myCurrentPerCommitmentPoint: myCurrentPoint
 		};
+
+		// option_taproot: our MuSig2 verification nonces are DETERMINISTIC per
+		// commitment height (see _deriveVerificationNonce), so re-derive the SAME
+		// nonces on reconnect rather than fresh random ones, and re-seed the peer
+		// with our next-commitment verification nonce (mirrors revoke_and_ack's
+		// next_local_nonce). Because the re-derived current-commitment nonce is
+		// identical to the one the peer's stored partial was made against, the
+		// PRE-reconnect commitment remains force-closeable after a reconnect.
+		if (isTaprootChannel(this._state.channelType)) {
+			this._state.localNonce = undefined;
+			this._state.localNextNonce = undefined;
+			this._ensureLocalFundingNonce();
+			msg.nextLocalNonce = this._ensureLocalNextNonce();
+		}
 
 		// Splice resumption (merged spec): set next_funding_txid while we
 		// have sent commitment_signed for an in-flight splice tx but have not yet
@@ -2912,12 +3361,27 @@ export class Channel {
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n
 		) {
-			// Peer missed our commitment_signed — retransmit
-			if (this._state.lastSentCommitmentSigned) {
+			// Peer missed our commitment_signed — retransmit.
+			// option_taproot: the signing material lives in the cached 98-byte
+			// partial_signature_with_nonce, not the all-zero `signature` field, so
+			// replay must carry the TLV verbatim or the peer sees an unsigned
+			// (zero-sig) commitment. Replaying the same bytes is BOLT-compliant and
+			// does not reuse the nonce for a new signature.
+			const taprootReest = isTaprootChannel(this._state.channelType);
+			if (
+				taprootReest
+					? this._state.lastSentPartialSignatureWithNonce
+					: this._state.lastSentCommitmentSigned
+			) {
 				const commitMsg: ICommitmentSignedMessage = {
 					channelId: this._state.channelId!,
-					signature: this._state.lastSentCommitmentSigned,
-					htlcSignatures: this._state.lastSentHtlcSignatures
+					signature: taprootReest
+						? Buffer.alloc(64)
+						: this._state.lastSentCommitmentSigned!,
+					htlcSignatures: this._state.lastSentHtlcSignatures,
+					partialSignatureWithNonce: taprootReest
+						? this._state.lastSentPartialSignatureWithNonce!
+						: undefined
 				};
 				actions.push(
 					sendMsg(
@@ -2926,6 +3390,17 @@ export class Channel {
 					)
 				);
 			}
+		}
+
+		// option_taproot: adopt the peer's freshly-regenerated verification nonce so
+		// the next commitment round can co-sign (the peer's old nonce was lost on its
+		// reconnect, exactly as ours was).
+		if (
+			isTaprootChannel(this._state.channelType) &&
+			msg.nextLocalNonce &&
+			msg.nextLocalNonce.length === 66
+		) {
+			this._state.remoteNonce = Buffer.from(msg.nextLocalNonce);
 		}
 
 		// ── Restore state ──
@@ -2956,6 +3431,12 @@ export class Channel {
 				secondPerCommitmentPoint: secondPoint,
 				shortChannelId: this._state.scidAlias || undefined
 			};
+			// option_taproot: re-advertise the SAME commitment-#1 verification nonce
+			// (idempotent helper — not a fresh secret) so the pipeline survives a
+			// reconnect before the first commitment round.
+			if (isTaprootChannel(this._state.channelType)) {
+				readyMsg.nextLocalNonce = this._ensureLocalNextNonce();
+			}
 			actions.push(
 				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(readyMsg))
 			);
@@ -4953,6 +5434,65 @@ export class Channel {
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
+		// Dual funding v2: reconcile per-side balances from BOTH contributions.
+		// The acceptor state was created as a stub (funding 0); now that we know the
+		// opener's funding (msg) and our own (localParams), set the channel capacity
+		// and each side's to_local balance. v2 has no push_msat, so each side's
+		// balance is simply its own contribution. The commitment fee (paid by the
+		// opener) is deducted later in the commitment builder.
+		const openerFunding = msg.fundingSatoshis;
+		const acceptorFunding = localParams.fundingSatoshis;
+		this._state.fundingSatoshis = openerFunding + acceptorFunding;
+		this._state.localBalanceMsat = acceptorFunding * 1000n;
+		this._state.remoteBalanceMsat = openerFunding * 1000n;
+
+		// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
+		// commitment types: LND has no taproot lease script (its taproot to_local and
+		// second-level builders take no lease_expiry), so a leased taproot commitment
+		// can be neither constructed interoperably nor swept. Refuse to enter the
+		// lessor state on a taproot channel rather than build an unenforceable lease.
+		// (The v2 acceptor doesn't stash channel_type on state yet, so key off the
+		// open_channel2 message's channel_type — the value will_fund is signed over.)
+		if (
+			isTaprootChannel(msg.channelType ?? null) &&
+			localParams.willFund &&
+			msg.requestFunds
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Script-enforced lease is not supported on taproot channels'
+				}
+			];
+		}
+
+		// Liquidity ads (bLIP-0051): if we (the seller) committed will_fund, the
+		// buyer pays us the lease fee out of its initial balance — shift it from
+		// the buyer (remote) to us (local). Reject if the buyer can't cover it.
+		if (localParams.willFund && msg.requestFunds) {
+			const feeMsat =
+				computeLeaseFeeSat(
+					localParams.willFund.leaseRates,
+					msg.requestFunds.requestedSats,
+					msg.fundingFeeratePerkw
+				) * 1000n;
+			if (feeMsat > this._state.remoteBalanceMsat) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Buyer balance cannot cover the lease fee'
+					}
+				];
+			}
+			this._state.localBalanceMsat += feeMsat;
+			this._state.remoteBalanceMsat -= feeMsat;
+			// We are the lessor: our to_local is CSV-locked until the lease expires.
+			this._state.leaseExpiry = computeLeaseExpiry(
+				msg.requestFunds.blockheight
+			);
+			this._state.isLessor = true;
+		}
+
 		return [
 			sendMsg(
 				MessageType.ACCEPT_CHANNEL2,
@@ -4990,6 +5530,103 @@ export class Channel {
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
+
+		// Dual funding v2: fold the acceptor's contribution into the channel.
+		// createOpenerState already set fundingSatoshis + localBalanceMsat to our
+		// own funding; now add the acceptor's funding to the capacity and credit it
+		// to their (remote) balance. v2 has no push_msat. The commitment fee (ours,
+		// as opener) is deducted later in the commitment builder.
+		const acceptorFunding = msg.fundingSatoshis;
+		this._state.fundingSatoshis += acceptorFunding;
+		this._state.remoteBalanceMsat += acceptorFunding * 1000n;
+
+		// Liquidity ads (bLIP-0051): if the seller committed will_fund, we (the
+		// buyer) pay the lease fee — shift it from us (local) to the seller
+		// (remote). The seller is the lessor, so its to_local is CSV-locked until
+		// lease_expiry; both sides record it so commitments agree.
+		const requestFunds = session.getRequestFunds();
+		// See handleOpenChannel2: leased + taproot is not a valid commitment type.
+		// A well-behaved peer never sends will_fund on a taproot channel; refuse to
+		// record a lease (and pay the fee) rather than expect an on-chain lease lock
+		// the taproot commitment cannot carry. Key off the channel_type we proposed in
+		// open_channel2 (the v2 opener doesn't stash it on state).
+		if (
+			isTaprootChannel(session.getOpenChannelType() ?? null) &&
+			msg.willFund &&
+			requestFunds
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Script-enforced lease is not supported on taproot channels'
+				}
+			];
+		}
+		if (msg.willFund && requestFunds) {
+			// M2 fund-safety: the seller must actually contribute at least the inbound
+			// liquidity we are paying the lease fee for. verifyWillFund authenticates
+			// the seller's signature but does NOT bind the funded amount, so without
+			// this check an adversarial seller could return fundingSatoshis=0, pocket
+			// the lease fee, and deliver no liquidity — an unconditional loss to us.
+			if (msg.fundingSatoshis < requestFunds.requestedSats) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Seller funded less than the requested lease amount'
+					}
+				];
+			}
+			const fundingFeeratePerkw =
+				session.getLocalParams()?.fundingFeeratePerkw ?? 0;
+			const leaseFeeSat = computeLeaseFeeSat(
+				msg.willFund.leaseRates,
+				requestFunds.requestedSats,
+				fundingFeeratePerkw
+			);
+			// H3 fund-safety: the seller's will_fund rates are self-signed and otherwise
+			// bounded only by our whole balance, so an inflated leaseFeeBaseSat/
+			// leaseFeeBasis could drain nearly all our funds. Bound the fee by the
+			// maximum the buyer agreed to before requesting, carried locally as
+			// maxLeaseRates. This ceiling must be buyer-chosen policy, never copied
+			// from the seller's gossip ad (the seller controls both the ad and
+			// will_fund, so a seller-derived ceiling bounds nothing). Refuse to pay
+			// an unverified lease fee when no ceiling was set.
+			const maxLeaseRates = session.getLocalParams()?.maxLeaseRates;
+			if (!maxLeaseRates) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'No maximum lease rates configured; refusing to pay an unverified lease fee'
+					}
+				];
+			}
+			const maxLeaseFeeSat = computeLeaseFeeSat(
+				maxLeaseRates,
+				requestFunds.requestedSats,
+				fundingFeeratePerkw
+			);
+			if (leaseFeeSat > maxLeaseFeeSat) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Seller lease fee exceeds our accepted maximum'
+					}
+				];
+			}
+			const feeMsat = leaseFeeSat * 1000n;
+			if (feeMsat > this._state.localBalanceMsat) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Cannot cover the lease fee from our balance'
+					}
+				];
+			}
+			this._state.localBalanceMsat -= feeMsat;
+			this._state.remoteBalanceMsat += feeMsat;
+			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
+		}
 
 		return [];
 	}

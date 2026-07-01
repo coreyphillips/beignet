@@ -245,6 +245,67 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
 		});
+
+		it('does NOT close on a fee-echo with an invalid peer signature (C1)', function () {
+			// A peer echoes our proposed fee but sends a garbage closing signature.
+			// Without a signature gate the channel would go CLOSED and the funding
+			// watch would be torn down, leaving a later revoked broadcast unpunished.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const proposeActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const proposePayload = findSendAction(
+				proposeActions,
+				MessageType.CLOSING_SIGNED
+			)!;
+			const proposedFee =
+				decodeClosingSignedMessage(proposePayload).feeSatoshis;
+
+			// verifyClosingFn returns false → peer sig is invalid
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: proposedFee,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => false
+			);
+
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(findErrorAction(actions)).to.include('signature');
+			// Channel stays in negotiation (funding watch intact upstream).
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
+		it('still closes on a fee-echo with a valid peer signature (C1 control)', function () {
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const proposeActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const proposedFee = decodeClosingSignedMessage(
+				findSendAction(proposeActions, MessageType.CLOSING_SIGNED)!
+			).feeSatoshis;
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: proposedFee,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => true
+			);
+
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
+		});
 	});
 
 	describe('handleClosingSigned — counter-proposal', function () {
@@ -346,6 +407,38 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 
 			expect(opener.getFullState().closingFeeMin).to.not.be.null;
 			expect(opener.getFullState().closingFeeMax).to.not.be.null;
+		});
+
+		it('reserves the opener dust limit in closingFeeMax so our output is not burned', function () {
+			// Fund-safety: the fee comes out of the opener's output, and the
+			// closing tx silently omits an output below dust. Capping the fee at
+			// the whole opener balance therefore allowed an accepted fee to push
+			// our output below dust and burn it. The cap must reserve our dust
+			// limit.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			// Shrink our (opener) balance so the balance cap binds: ideal fee at
+			// feeratePerKw 253 is 44 sat, so the 2x cap is 88 sat. With 400 sat of
+			// balance the old cap (whole balance) allowed fees up to 88 sat,
+			// leaving 312 sat < 354 dust and burning our output.
+			opener.getFullState().localBalanceMsat = 400_000n;
+
+			opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 88n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			// 400 sat balance minus the 354 sat dust limit
+			expect(opener.getFullState().closingFeeMax).to.equal(46n);
+			expect(opener.getState()).to.not.equal(ChannelState.CLOSED);
 		});
 
 		it('should store theirLastClosingFeeSat', function () {

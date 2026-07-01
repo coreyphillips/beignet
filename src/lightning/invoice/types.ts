@@ -3,6 +3,7 @@
  */
 
 import { FeatureFlags } from '../features/flags';
+import { IBlindedPaymentPath } from '../onion/blinded-path';
 
 /** Lightning network prefixes for HRP. */
 export enum Network {
@@ -24,7 +25,17 @@ export enum TagType {
 	PAYEE_PUBKEY = 19,
 	DESCRIPTION_HASH = 23,
 	MIN_FINAL_CLTV_EXPIRY = 24,
-	METADATA = 27
+	METADATA = 27,
+	/**
+	 * Blinded payment paths (receiver route blinding).
+	 *
+	 * BOLT 11 has no finalized blinded-paths tag yet, and beignet's
+	 * encrypted_recipient_data uses a compact non-BOLT4 format, so this is a
+	 * beignet-internal field for now. 25 is an otherwise-unused 5-bit tag value;
+	 * other implementations decode it as an unknown tag and ignore it. Revisit
+	 * the value (and switch to BOLT 4 TLV hop data) when the spec lands.
+	 */
+	BLINDED_PATHS = 25
 }
 
 /** A single hop in a routing hint (51 bytes per hop). */
@@ -56,6 +67,7 @@ export interface IInvoice {
 	minFinalCltvExpiry?: number;
 	fallbackAddress?: IFallbackAddress;
 	routingHints?: IRoutingHintHop[][];
+	blindedPaths?: IBlindedPaymentPath[];
 	featureBits?: FeatureFlags;
 	metadata?: Buffer;
 	signature: Buffer;
@@ -76,6 +88,7 @@ export interface IInvoiceCreationOptions {
 	minFinalCltvExpiry?: number;
 	fallbackAddress?: IFallbackAddress;
 	routingHints?: IRoutingHintHop[][];
+	blindedPaths?: IBlindedPaymentPath[];
 	featureBits?: FeatureFlags;
 	metadata?: Buffer;
 	payeeNodeKey?: Buffer;

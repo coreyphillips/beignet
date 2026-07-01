@@ -9,6 +9,13 @@
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { getPublicKey } from '../crypto/ecdh';
+import {
+	constructBlindedPath,
+	processBlindedHop,
+	deriveBlindedPrivkey,
+	IBlindedHopData,
+	IBlindedPaymentPath
+} from '../onion/blinded-path';
 import { ChannelManager } from '../channel/channel-manager';
 import { Channel } from '../channel/channel';
 import {
@@ -26,6 +33,7 @@ import { NetworkGraph } from '../gossip/network-graph';
 import {
 	findRoute,
 	findMultiPathRoute,
+	findRouteToBlindedPath,
 	ILocalChannelEdge
 } from '../gossip/pathfinding';
 import {
@@ -155,10 +163,13 @@ import * as bip39 from 'bip39';
 import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
+import { createTaprootFundingScript } from '../script/funding-taproot';
+import { isTaprootChannel } from '../channel/types';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
+import { AsyncPaymentManager } from '../async-payments/manager';
 import {
 	IOnionMessagePayload,
 	ISendOnionMessageOptions
@@ -203,6 +214,27 @@ bitcoin.initEccLib(ecc);
  */
 const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
+/**
+ * Blocks of headroom before a parked hold-invoice HTLC's CLTV expiry at which we
+ * auto-fail it off-chain, rather than letting it force an on-chain timeout (which
+ * would close the channel). Mirrors the safety margin used for forwarded HTLCs.
+ */
+const HELD_HTLC_EXPIRY_MARGIN = 18;
+
+/**
+ * Fallback sat/vB feerate for a force-close package when we have no live fee data
+ * at all (no fee estimator / no samples). Matches the historical default so nodes
+ * without a fee estimator behave exactly as before.
+ */
+const FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE = 10;
+
+/**
+ * Urgency multiplier applied to the freshest live fee sample when force-closing.
+ * The commitment CPFP child and the second-level HTLC txs MUST confirm before an
+ * HTLC's cltv_expiry, so we bid above the current going rate rather than at it.
+ */
+const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	private nodeId: string;
@@ -243,6 +275,18 @@ export class LightningNode extends EventEmitter {
 	private _gossipRefreshTimer?: ReturnType<typeof setInterval>;
 	// MPP: pending multi-part payments awaiting all parts (keyed by paymentHash hex)
 	private pendingMppPayments: Map<string, IPendingMppPayment> = new Map();
+	// Hold invoices: payment hashes whose incoming HTLCs are parked, not settled.
+	private heldInvoiceHashes: Set<string> = new Set();
+	// Parked HTLCs awaiting settleHeldHtlc/cancelHeldHtlc, keyed by payment hash.
+	private heldHtlcs: Map<
+		string,
+		Array<{
+			channelId: Buffer;
+			htlcId: bigint;
+			amountMsat: bigint;
+			cltvExpiry: number;
+		}>
+	> = new Map();
 	private mppTimeoutMs: number;
 	private alias?: string;
 	private fundingPubkey: Buffer;
@@ -252,6 +296,12 @@ export class LightningNode extends EventEmitter {
 	private sweepDestinationScript?: Buffer;
 	private htlcBasepointSecret: Buffer | undefined;
 	private delayedPaymentBasepointSecret: Buffer | undefined;
+	// Per-channel basepoint secrets from the node-level-basepoints config. Stored so
+	// ChainMonitor.restore signs on-chain claims with the SAME keys the create path
+	// used (channel-manager) — without them restore silently substituted node/funding
+	// keys, breaking penalty/to_remote/HTLC claims after a restart (audit H2).
+	private revocationBasepointSecret: Buffer | undefined;
+	private paymentBasepointSecret: Buffer | undefined;
 	private pendingFundingTxs: Map<string, string> = new Map();
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -275,6 +325,12 @@ export class LightningNode extends EventEmitter {
 	private missionControlTimer: ReturnType<typeof setInterval> | null = null;
 	private onionMessageManager: OnionMessageManager;
 	private offerManager: OfferManager;
+	private asyncPaymentManager: AsyncPaymentManager;
+	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
+	private heldForwards: Map<
+		string,
+		{ inChannelId: Buffer; inHtlcId: bigint; incomingCltvExpiry: number }
+	> = new Map();
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
@@ -315,6 +371,8 @@ export class LightningNode extends EventEmitter {
 		this.sweepDestinationScript = config.sweepDestinationScript;
 		this.htlcBasepointSecret = config.htlcBasepointSecret;
 		this.delayedPaymentBasepointSecret = config.delayedPaymentBasepointSecret;
+		this.revocationBasepointSecret = config.revocationBasepointSecret;
+		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
@@ -341,6 +399,10 @@ export class LightningNode extends EventEmitter {
 			paymentBasepointSecret: config.paymentBasepointSecret,
 			delayedPaymentBasepointSecret: config.delayedPaymentBasepointSecret,
 			preferAnchors,
+			// EXPERIMENTAL (option_taproot): negotiates the taproot channel type +
+			// nonces but funding cannot yet complete (commitment-round MuSig2 nonce
+			// rotation is not wired into the live state machine). Off by default.
+			preferTaproot: config.preferTaproot,
 			chainHash: config.chainHashes?.[0],
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver
@@ -369,6 +431,16 @@ export class LightningNode extends EventEmitter {
 			onionMessageManager: this.onionMessageManager
 		});
 		this.wireOfferManagerEvents();
+
+		this.asyncPaymentManager = new AsyncPaymentManager();
+		this.asyncPaymentManager.attachOnionMessageManager(
+			this.onionMessageManager
+		);
+		// Receiver: a wake message means a sender is waiting — surface it so the
+		// host can reconnect to its LSP and trigger release of the held HTLC.
+		this.asyncPaymentManager.on('wake', (paymentHash?: Buffer) => {
+			this.emit('payment:async-wake', paymentHash);
+		});
 
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
@@ -562,6 +634,39 @@ export class LightningNode extends EventEmitter {
 				invoice.createdAt = Math.floor(invoice.createdAt / 1000);
 			}
 			this.invoices.set(paymentHashHex, invoice);
+			// Rebuild the hold-invoice set so incoming HTLCs are parked, not settled.
+			if (invoice.hold) {
+				this.heldInvoiceHashes.add(paymentHashHex);
+			}
+		}
+
+		// Restore parked hold-invoice HTLCs so settle/cancel survive restart.
+		const heldJson = this.storage.loadMetadata('held_htlcs');
+		if (heldJson) {
+			try {
+				const parsed = JSON.parse(heldJson) as Array<{
+					hashHex: string;
+					htlcs: Array<{
+						channelId: string;
+						htlcId: string;
+						amountMsat: string;
+						cltvExpiry: number;
+					}>;
+				}>;
+				for (const entry of parsed) {
+					this.heldHtlcs.set(
+						entry.hashHex,
+						entry.htlcs.map((h) => ({
+							channelId: Buffer.from(h.channelId, 'hex'),
+							htlcId: BigInt(h.htlcId),
+							amountMsat: BigInt(h.amountMsat),
+							cltvExpiry: h.cltvExpiry
+						}))
+					);
+				}
+			} catch {
+				/* ignore corrupted held-htlc metadata */
+			}
 		}
 
 		// Restore block height
@@ -612,13 +717,22 @@ export class LightningNode extends EventEmitter {
 					channelState,
 					destinationScript,
 					10, // safe default fee rate (sat/vbyte), updated when fee estimator resolves
-					perCh?.revocationBasepointSecret || this.nodePrivkey, // revocation basepoint secret fallback
-					perCh?.paymentBasepointSecret || this.fundingPrivkey, // payment privkey fallback
+					// Mirror the create path (channel-manager) EXACTLY so a restored
+					// monitor signs with the same per-channel secrets — using the
+					// config's revocation/payment basepoint secrets, NOT node/funding
+					// keys (audit H2: the wrong keys broke penalty, to_remote, and HTLC
+					// claims after a restart for the node-level-basepoints config).
+					perCh?.revocationBasepointSecret ||
+						this.revocationBasepointSecret ||
+						this.fundingPrivkey,
+					perCh?.paymentBasepointSecret ||
+						this.paymentBasepointSecret ||
+						this.fundingPrivkey,
 					undefined, // network (default)
 					perCh?.delayedPaymentBasepointSecret ||
 						this.delayedPaymentBasepointSecret ||
 						this.fundingPrivkey,
-					perCh?.htlcBasepointSecret
+					perCh?.htlcBasepointSecret || this.htlcBasepointSecret
 				);
 				this.channelManager.restoreMonitor(channelId, monitor);
 
@@ -975,6 +1089,17 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// A preimage learned ON-CHAIN (downstream force-closed and swept an HTLC via
+		// HTLC-success, revealing it). Without a consumer this was dropped, so a
+		// forwarding node that already paid downstream could never collect upstream
+		// (the inbound HTLC would time out) — a loss of the forwarded amount.
+		this.channelManager.on(
+			'preimage:learned',
+			(paymentHash: Buffer, preimage: Buffer) => {
+				this.handleOnChainPreimageLearned(paymentHash, preimage);
+			}
+		);
+
 		// Wire broadcast:tx from ChannelManager (closing txs, force-close commitment txs)
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
 			if (this.chainWatcher) {
@@ -1230,11 +1355,21 @@ export class LightningNode extends EventEmitter {
 		};
 		const btcNetwork = networkMap[this.network] || bitcoin.networks.regtest;
 
-		const { address } = createFundingScript(
-			state.localBasepoints.fundingPubkey,
-			state.remoteBasepoints.fundingPubkey,
-			btcNetwork
-		);
+		// Simple taproot channels fund a P2TR MuSig2 key-spend output, NOT the
+		// witness-v0 2-of-2 P2WSH. The funding output script MUST match the one the
+		// commitment signs against (taprootFundingSpk), or the peer never sees the
+		// funding confirm and the commitment can't spend it.
+		const { address } = isTaprootChannel(state.channelType)
+			? createTaprootFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey,
+					btcNetwork
+			  )
+			: createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey,
+					btcNetwork
+			  );
 
 		// Use dynamic fee if estimator available
 		const feePromise = this.feeEstimator
@@ -2190,7 +2325,11 @@ export class LightningNode extends EventEmitter {
 		channelId: Buffer,
 		destinationScript: Buffer
 	): { ok: boolean; error?: string; commitmentTxid?: string } {
-		const result = this.channelManager.forceClose(channelId, destinationScript);
+		const result = this.channelManager.forceClose(
+			channelId,
+			destinationScript,
+			this.resolveForceCloseFeeRatePerVbyte()
+		);
 		if (!result.ok) {
 			this.emit('node:error', {
 				code: 'FORCE_CLOSE_FAILED',
@@ -2802,6 +2941,98 @@ export class LightningNode extends EventEmitter {
 		return hints;
 	}
 
+	/**
+	 * Build receiver route-blinding blinded payment paths, one per usable
+	 * channel: a 2-hop path [peer (introduction node) → us (recipient)]. The
+	 * sender routes to the peer, which forwards to us using the encrypted hop
+	 * data — our node id never appears in the cleartext route. Mirrors
+	 * getPrivateChannelRoutingHints for peer/scid/policy selection.
+	 *
+	 * The advertised payInfo aggregates the single forwarding hop (the peer's
+	 * fee and CLTV policy) so the payer can size fees/timelocks correctly.
+	 */
+	private buildBlindedPaymentPaths(asyncHold = false): IBlindedPaymentPath[] {
+		const paths: IBlindedPaymentPath[] = [];
+		const ourNodeId = getPublicKey(this.nodePrivkey);
+		// Generous absolute CLTV bound for the path's payment constraints.
+		const maxCltvExpiry = (this.currentBlockHeight || 0) + 2016;
+
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const effectiveState = state.preReestablishState ?? channel.getState();
+			if (effectiveState !== ChannelState.NORMAL) continue;
+
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
+			if (!peerPubkeyHex) continue;
+			const scid = state.shortChannelId || state.scidAlias;
+			if (!scid) continue;
+			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
+
+			// Peer's actual policy for the peer→us hop (same logic as routing hints).
+			let feeBaseMsat = this.forwardingFeeBaseMsat;
+			let feeProportionalMillionths = this.forwardingFeePropMillionths;
+			let cltvExpiryDelta = this.forwardingCltvDelta;
+			if (state.shortChannelId) {
+				const graphChannel = this.graph.getChannel(state.shortChannelId);
+				const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
+					? graphChannel.update1
+					: graphChannel?.nodeId2.equals(peerPubkey)
+					? graphChannel.update2
+					: undefined;
+				if (peerUpdate) {
+					feeBaseMsat = peerUpdate.feeBaseMsat;
+					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
+					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
+				}
+			}
+
+			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat: 0n };
+			const hopDataList: IBlindedHopData[] = [
+				// Introduction node (peer): forward to us over this channel. For async
+				// receive, mark it hold_htlc so the LSP parks the HTLC until we return.
+				{
+					nextNodeId: ourNodeId,
+					shortChannelId: scid,
+					paymentRelay: {
+						cltvExpiryDelta,
+						feeProportionalMillionths,
+						feeBaseMsat
+					},
+					paymentConstraints,
+					...(asyncHold ? { holdHtlc: true } : {})
+				},
+				// Final hop (us): recipient, no onward forwarding.
+				{ paymentConstraints }
+			];
+
+			let path;
+			try {
+				path = constructBlindedPath(
+					crypto.randomBytes(32),
+					[peerPubkey, ourNodeId],
+					hopDataList
+				);
+			} catch {
+				continue; // skip a channel whose key can't be blinded
+			}
+
+			paths.push({
+				path,
+				payInfo: {
+					feeBaseMsat,
+					feeProportionalMillionths,
+					cltvExpiryDelta,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: state.fundingSatoshis * 1000n
+				}
+			});
+		}
+
+		return paths;
+	}
+
 	// ─────────────── Gossip Handling ───────────────
 
 	private handleGossipMessage(
@@ -2987,12 +3218,26 @@ export class LightningNode extends EventEmitter {
 			throw new Error('Must specify either description or descriptionHash');
 		}
 
-		const preimage = crypto.randomBytes(32);
-		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+		// Hold invoice with an externally-held preimage: the caller supplies only
+		// the hash, so we never learn the preimage until settle time. Otherwise we
+		// generate the preimage ourselves (and can hold it for a hold invoice).
+		const externalHash =
+			options.hold && options.paymentHash ? options.paymentHash : undefined;
+		if (externalHash && externalHash.length !== 32) {
+			throw new Error('paymentHash must be 32 bytes');
+		}
+		const preimage = externalHash ? undefined : crypto.randomBytes(32);
+		const paymentHash =
+			externalHash ?? crypto.createHash('sha256').update(preimage!).digest();
 		const paymentSecret = crypto.randomBytes(32);
 
-		this.preimages.set(paymentHash.toString('hex'), preimage);
+		if (preimage) {
+			this.preimages.set(paymentHash.toString('hex'), preimage);
+		}
 		this.paymentSecrets.set(paymentHash.toString('hex'), paymentSecret);
+		if (options.hold) {
+			this.heldInvoiceHashes.add(paymentHash.toString('hex'));
+		}
 
 		// Build routing hints for all channels
 		const routingHints = this.getPrivateChannelRoutingHints();
@@ -3017,11 +3262,22 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// Optionally build receiver route-blinding blinded paths. When present we
+		// advertise blinded paths INSTEAD of cleartext hints (privacy is the whole
+		// point — a cleartext hint for the same channel would leak our node id).
+		const blindedPaths = options.useBlindedPaths
+			? this.buildBlindedPaymentPaths(options.asyncHold)
+			: [];
+		const useBlinded = blindedPaths.length > 0;
+
 		// Build invoice feature bits (BOLT 11 requires these when payment_secret is present)
 		const invoiceFeatures = FeatureFlags.empty();
 		invoiceFeatures.setCompulsory(Feature.TLV_ONION); // bit 8
 		invoiceFeatures.setCompulsory(Feature.PAYMENT_SECRET); // bit 14
 		invoiceFeatures.setOptional(Feature.BASIC_MPP); // bit 17
+		if (useBlinded) {
+			invoiceFeatures.setOptional(Feature.ROUTE_BLINDING); // bit 25
+		}
 
 		const invoiceStr = encodeInvoice({
 			network: this.network,
@@ -3035,7 +3291,9 @@ export class LightningNode extends EventEmitter {
 				options.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 			privateKey: this.nodePrivkey,
 			payeeNodeKey: getPublicKey(this.nodePrivkey),
-			routingHints: routingHints.length > 0 ? routingHints : undefined,
+			routingHints:
+				!useBlinded && routingHints.length > 0 ? routingHints : undefined,
+			blindedPaths: useBlinded ? blindedPaths : undefined,
 			featureBits: invoiceFeatures
 		});
 
@@ -3053,7 +3311,9 @@ export class LightningNode extends EventEmitter {
 		const createdAtSecs = Math.floor(Date.now() / 1000);
 
 		this.safeStorage(() => {
-			this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
+			if (preimage) {
+				this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
+			}
 			this.storage!.savePaymentSecret(
 				paymentHash.toString('hex'),
 				paymentSecret
@@ -3064,7 +3324,8 @@ export class LightningNode extends EventEmitter {
 				amountMsat: options.amountMsat,
 				description: options.description,
 				expiry: options.expiry ?? DEFAULT_EXPIRY,
-				createdAt: createdAtSecs
+				createdAt: createdAtSecs,
+				hold: options.hold
 			});
 			this.persistPayment(paymentHash);
 		}, 'saveInvoiceData');
@@ -3076,7 +3337,8 @@ export class LightningNode extends EventEmitter {
 			amountMsat: options.amountMsat,
 			description: options.description,
 			expiry: options.expiry ?? DEFAULT_EXPIRY,
-			createdAt: createdAtSecs
+			createdAt: createdAtSecs,
+			hold: options.hold
 		});
 
 		return { bolt11: invoiceStr, paymentHash, paymentSecret };
@@ -3170,6 +3432,54 @@ export class LightningNode extends EventEmitter {
 			invoice.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY;
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
+		// Route blinding: if the invoice advertises blinded paths, route through
+		// one (the sender learns only the introduction node, never the payee).
+		if (invoice.blindedPaths && invoice.blindedPaths.length > 0) {
+			const blinded = invoice.blindedPaths[0];
+			const blindedRoute = findRouteToBlindedPath(
+				this.graph,
+				sourceNodeId,
+				blinded.path,
+				blinded.payInfo,
+				paymentAmountMsat,
+				finalCltvExpiry,
+				undefined,
+				excludedChannels,
+				this.missionControl,
+				this.getLocalChannelEdges()
+			);
+			if (!blindedRoute) {
+				throw new LightningPaymentError(
+					LightningErrorCode.NO_ROUTE,
+					'No route to blinded path introduction node'
+				);
+			}
+			if (maxFeeMsat !== undefined && blindedRoute.totalFeeMsat > maxFeeMsat) {
+				throw new LightningPaymentError(
+					LightningErrorCode.FEE_EXCEEDS_MAX,
+					'Route fee exceeds maximum'
+				);
+			}
+			const bHashHex = invoice.paymentHash.toString('hex');
+			if (!this.paymentRetryContexts.has(bHashHex)) {
+				this.paymentRetryContexts.set(bHashHex, {
+					invoiceStr,
+					excludedChannels: excludedChannels || new Set(),
+					retryCount: 0,
+					maxRetries: this.maxPaymentRetries,
+					maxFeeMsat,
+					amountMsat
+				});
+			}
+			return this.sendPaymentToRoute(
+				blindedRoute,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				paymentAmountMsat
+			);
+		}
+
 		const localChannels = this.getLocalChannelEdges();
 		const route = findRoute(
 			this.graph,
@@ -3259,6 +3569,8 @@ export class LightningNode extends EventEmitter {
 				shortChannelId: Buffer;
 				amountToForwardMsat: bigint;
 				outgoingCltvValue: number;
+				encryptedRecipientData?: Buffer;
+				blindingPoint?: Buffer;
 			}>;
 		},
 		paymentHash: Buffer,
@@ -3297,6 +3609,25 @@ export class LightningNode extends EventEmitter {
 				if (isFinal && paymentSecret) {
 					payload.paymentSecret = paymentSecret;
 					payload.totalMsat = totalMsat ?? hop.amountToForwardMsat;
+				}
+				// Route blinding (BOLT 4): the introduction node and each blinded
+				// hop read their own encrypted_recipient_data (TLV 10) to learn the
+				// real next node/scid; the introduction node also receives the
+				// blinding_point (TLV 12). These belong to THIS hop, not the next.
+				if (hop.encryptedRecipientData) {
+					payload.encryptedRecipientData = hop.encryptedRecipientData;
+					// BOLT 4: a blinded hop MUST NOT carry a cleartext short_channel_id
+					// — its onward channel lives in encrypted_recipient_data. Leaving a
+					// (zero) SCID makes LND reject the payload as invalid_onion_blinding.
+					delete payload.shortChannelId;
+					// A blinded INTERMEDIATE hop also omits amt_to_forward/outgoing_cltv
+					// (derived from encrypted payment_relay). The final hop keeps them.
+					if (!isFinal) {
+						payload.omitForwardAmounts = true;
+					}
+				}
+				if (hop.blindingPoint) {
+					payload.blindingPoint = hop.blindingPoint;
 				}
 				return { pubkey: hop.pubkey, payload };
 			}
@@ -3773,15 +4104,21 @@ export class LightningNode extends EventEmitter {
 
 		const onionBuf = htlcEntry.onionRoutingPacket;
 
+		// Route blinding: if this HTLC arrived with a blinding_point (we are a
+		// downstream blinded hop, not the introduction node), the sender encrypted
+		// our onion layer to our blinded node id, so we must peel it with the
+		// matching blinded private key. The introduction node has no message-level
+		// blinding_point (it receives it inside the onion as TLV 12) and so keeps
+		// using its real key.
+		const onionPrivkey = htlcEntry.blindingPoint
+			? deriveBlindedPrivkey(htlcEntry.blindingPoint, this.nodePrivkey)
+			: this.nodePrivkey;
+
 		let onionPacket;
 		let processed;
 		try {
 			onionPacket = decodeOnionPacket(onionBuf);
-			processed = processOnionPacket(
-				onionPacket,
-				this.nodePrivkey,
-				paymentHash
-			);
+			processed = processOnionPacket(onionPacket, onionPrivkey, paymentHash);
 		} catch (err) {
 			// Onion processing failed — fail the HTLC and emit structured error
 			this.emit('node:error', {
@@ -3827,14 +4164,18 @@ export class LightningNode extends EventEmitter {
 				htlcEntry.cltvExpiry
 			);
 		} else {
-			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement
+			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
+			// htlcEntry.blindingPoint is the message-level blinding point a downstream
+			// blinded hop received (absent at the introduction node, which gets it in
+			// the onion); needed so a MID blinded hop can decrypt its hop data.
 			this.handleForwardHtlc(
 				channelId,
 				htlcId,
 				paymentHash,
 				processed,
 				amountMsat,
-				htlcEntry.cltvExpiry
+				htlcEntry.cltvExpiry,
+				htlcEntry.blindingPoint
 			);
 		}
 	}
@@ -3907,8 +4248,11 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const preimage = this.preimages.get(hashHex);
+		const isHold = this.heldInvoiceHashes.has(hashHex);
 
-		if (!preimage) {
+		// A hold invoice may legitimately have no preimage yet (held externally),
+		// so don't reject for a missing preimage in that case — we'll park below.
+		if (!preimage && !isHold) {
 			this.emitStructuredLog('htlc', 'unknown_payment_hash', {
 				paymentHash: hashHex
 			});
@@ -4036,6 +4380,21 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// Hold invoice: park the HTLC instead of settling. The preimage is revealed
+		// later via settleHeldHtlc (e.g. async receive), or the HTLC is failed via
+		// cancelHeldHtlc / the CLTV sweeper. Validation above (secret/cltv/amount)
+		// has already run, so a parked HTLC is known-good — it only awaits release.
+		if (isHold) {
+			this.parkHeldHtlc(
+				channelId,
+				htlcId,
+				paymentHash,
+				amountMsat,
+				incomingCltvExpiry ?? 0
+			);
+			return;
+		}
+
 		// MPP: if payment_data has totalMsat > amountMsat, this is a multi-part payment
 		if (hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat) {
 			this.handleMppPart(
@@ -4044,7 +4403,7 @@ export class LightningNode extends EventEmitter {
 				amountMsat,
 				paymentHash,
 				hopPayload,
-				preimage
+				preimage!
 			);
 			return;
 		}
@@ -4054,7 +4413,239 @@ export class LightningNode extends EventEmitter {
 			paymentHash: hashHex,
 			amountMsat: amountMsat.toString()
 		});
-		this.fulfillPayment(channelId, htlcId, paymentHash, preimage);
+		this.fulfillPayment(channelId, htlcId, paymentHash, preimage!);
+	}
+
+	/**
+	 * Park a validated incoming HTLC for a hold invoice. It awaits release via
+	 * settleHeldHtlc / cancelHeldHtlc (or the CLTV sweeper). Emits 'htlc:held'.
+	 */
+	private parkHeldHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		paymentHash: Buffer,
+		amountMsat: bigint,
+		cltvExpiry: number
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		const list = this.heldHtlcs.get(hashHex) ?? [];
+		// Dedup a duplicate park for the same channel+htlc (e.g. on reestablish).
+		if (
+			!list.some((h) => h.channelId.equals(channelId) && h.htlcId === htlcId)
+		) {
+			list.push({ channelId, htlcId, amountMsat, cltvExpiry });
+			this.heldHtlcs.set(hashHex, list);
+			this.persistHeldHtlcs();
+		}
+		this.emitStructuredLog('htlc', 'held', {
+			paymentHash: hashHex,
+			amountMsat: amountMsat.toString()
+		});
+		this.emit('htlc:held', { paymentHash, amountMsat });
+	}
+
+	/**
+	 * Settle a hold invoice: reveal the preimage and fulfill every parked HTLC
+	 * for the payment hash. With no preimage argument the node uses the one it
+	 * generated at createInvoice; an external preimage (validated against the
+	 * hash) is required for hold invoices created with an external payment hash.
+	 * Returns false when nothing is parked for the hash.
+	 */
+	settleHeldHtlc(paymentHash: Buffer, preimage?: Buffer): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const held = this.heldHtlcs.get(hashHex);
+		if (!held || held.length === 0) return false;
+
+		const pre = preimage ?? this.preimages.get(hashHex);
+		if (!pre) {
+			throw new Error('settleHeldHtlc: no preimage available for hold invoice');
+		}
+		const hash = crypto.createHash('sha256').update(pre).digest();
+		if (!hash.equals(paymentHash)) {
+			throw new Error('settleHeldHtlc: preimage does not match payment hash');
+		}
+
+		// Persist the preimage and deliver it to the chain monitors before
+		// fulfilling, so a force-close mid-settle can still claim on-chain.
+		this.preimages.set(hashHex, pre);
+		this.safeStorage(
+			() => this.storage!.savePreimage(hashHex, pre),
+			'savePreimage'
+		);
+		this.channelManager.recordPreimage(paymentHash, pre);
+
+		for (const h of held) {
+			this.cleanupHtlcSharedSecret(
+				`${h.channelId.toString('hex')}:${h.htlcId}`
+			);
+			this.channelManager.fulfillHtlc(h.channelId, h.htlcId, pre);
+		}
+
+		this.heldHtlcs.delete(hashHex);
+		this.heldInvoiceHashes.delete(hashHex);
+		this.persistHeldHtlcs();
+
+		const payment = this.payments.get(hashHex);
+		if (payment) {
+			payment.status = PaymentStatus.COMPLETED;
+			payment.preimage = pre;
+			payment.completedAt = Date.now();
+			this.safeStorage(
+				() => this.persistPayment(paymentHash),
+				'persistPayment'
+			);
+			this.emit('payment:received', payment);
+		}
+		this.emitStructuredLog('payment', 'received', {
+			paymentHash: hashHex,
+			held: 'true'
+		});
+		return true;
+	}
+
+	/**
+	 * Cancel a hold invoice: fail every parked HTLC back to the payer.
+	 * Returns false when nothing is parked for the hash.
+	 */
+	cancelHeldHtlc(
+		paymentHash: Buffer,
+		failureCode: number = INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+	): boolean {
+		const hashHex = paymentHash.toString('hex');
+		const held = this.heldHtlcs.get(hashHex);
+		if (!held || held.length === 0) return false;
+
+		for (const h of held) {
+			const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
+			const ss = this.receivedHtlcSharedSecrets.get(key);
+			const reason = ss
+				? createFailureMessage(ss, failureCode)
+				: Buffer.alloc(290);
+			this.cleanupHtlcSharedSecret(key);
+			this.channelManager.failHtlc(h.channelId, h.htlcId, reason);
+		}
+
+		this.heldHtlcs.delete(hashHex);
+		this.heldInvoiceHashes.delete(hashHex);
+		this.persistHeldHtlcs();
+		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
+		return true;
+	}
+
+	/**
+	 * Fail parked HTLCs approaching their CLTV expiry, so we resolve them
+	 * off-chain rather than forcing an on-chain timeout (which closes the
+	 * channel and risks the payer reclaiming after we may have leaked a preimage).
+	 */
+	private scanExpiringHeldHtlcs(height: number): void {
+		if (height <= 0) return;
+		for (const [hashHex, held] of this.heldHtlcs) {
+			const soon = held.some(
+				(h) =>
+					h.cltvExpiry > 0 && h.cltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
+			);
+			if (soon) {
+				this.cancelHeldHtlc(Buffer.from(hashHex, 'hex'));
+			}
+		}
+	}
+
+	/** Persist the parked-HTLC map so settle/cancel survive a restart. */
+	private persistHeldHtlcs(): void {
+		if (!this.storage) return;
+		const serial: Array<{
+			hashHex: string;
+			htlcs: Array<{
+				channelId: string;
+				htlcId: string;
+				amountMsat: string;
+				cltvExpiry: number;
+			}>;
+		}> = [];
+		for (const [hashHex, held] of this.heldHtlcs) {
+			serial.push({
+				hashHex,
+				htlcs: held.map((h) => ({
+					channelId: h.channelId.toString('hex'),
+					htlcId: h.htlcId.toString(),
+					amountMsat: h.amountMsat.toString(),
+					cltvExpiry: h.cltvExpiry
+				}))
+			});
+		}
+		this.safeStorage(
+			() => this.storage!.saveMetadata('held_htlcs', JSON.stringify(serial)),
+			'persistHeldHtlcs'
+		);
+	}
+
+	/** List parked hold-invoice HTLCs (for agents/operators). */
+	listHeldHtlcs(): Array<{
+		paymentHash: Buffer;
+		amountMsat: bigint;
+		htlcCount: number;
+	}> {
+		const out: Array<{
+			paymentHash: Buffer;
+			amountMsat: bigint;
+			htlcCount: number;
+		}> = [];
+		for (const [hashHex, held] of this.heldHtlcs) {
+			let total = 0n;
+			for (const h of held) total += h.amountMsat;
+			out.push({
+				paymentHash: Buffer.from(hashHex, 'hex'),
+				amountMsat: total,
+				htlcCount: held.length
+			});
+		}
+		return out;
+	}
+
+	// ─────────────── Async Payments (LSP-side held forwards) ───────────────
+
+	/** Direct access to the AsyncPaymentManager (events, manual control). */
+	getAsyncPaymentManager(): AsyncPaymentManager {
+		return this.asyncPaymentManager;
+	}
+
+	/**
+	 * LSP: release a forward parked for a now-online receiver (also triggered by
+	 * a release_held_htlc onion message). Returns false if nothing is parked.
+	 */
+	releaseHeldForward(paymentHash: Buffer): boolean {
+		return this.asyncPaymentManager.handleRelease(paymentHash);
+	}
+
+	/** Payment hashes of forwards currently parked for offline receivers. */
+	listHeldForwards(): Buffer[] {
+		return this.asyncPaymentManager.listHeldForwards();
+	}
+
+	/** Receiver: ask the LSP to release the HTLC held for this payment hash. */
+	sendAsyncRelease(lspNodeId: Buffer, paymentHash: Buffer): void {
+		this.asyncPaymentManager.sendRelease(lspNodeId, paymentHash);
+	}
+
+	/** Sender: nudge an offline receiver to come online for this payment hash. */
+	sendAsyncWake(receiverNodeId: Buffer, paymentHash: Buffer): void {
+		this.asyncPaymentManager.sendWake(receiverNodeId, paymentHash);
+	}
+
+	/**
+	 * Fail LSP-side held forwards approaching their inbound CLTV expiry, so the
+	 * channel isn't force-closed waiting on an offline receiver who never returns.
+	 */
+	private scanExpiringHeldForwards(height: number): void {
+		if (height <= 0) return;
+		for (const [hashHex, hf] of this.heldForwards) {
+			if (
+				hf.incomingCltvExpiry > 0 &&
+				hf.incomingCltvExpiry - height <= HELD_HTLC_EXPIRY_MARGIN
+			) {
+				this.asyncPaymentManager.failHeldForward(Buffer.from(hashHex, 'hex'));
+			}
+		}
 	}
 
 	private handleMppPart(
@@ -4097,6 +4688,14 @@ export class LightningNode extends EventEmitter {
 
 		// Check if we have enough
 		if (totalReceived >= pending.totalMsat) {
+			// Deliver the preimage to the chain monitors BEFORE fulfilling any part,
+			// so every part's received HTLC can still be claimed on-chain if a channel
+			// force-closes mid-settlement. recordPreimage keys on the payment hash and
+			// fans out to all monitors, so a single call covers all parts — and placing
+			// it before the loop means it runs even if a fulfillHtlc throws mid-loop.
+			// (Mirrors the single-payment path in fulfillPayment.)
+			this.channelManager.recordPreimage(paymentHash, preimage);
+
 			// Fulfill ALL parts atomically
 			for (const p of pending.receivedParts) {
 				p.status = PaymentStatus.COMPLETED;
@@ -4215,12 +4814,57 @@ export class LightningNode extends EventEmitter {
 			sharedSecret: Buffer;
 		},
 		incomingAmountMsat: bigint,
-		incomingCltvExpiry: number
+		incomingCltvExpiry: number,
+		incomingBlindingPoint?: Buffer
 	): void {
 		const { hopPayload, nextPacket, sharedSecret } = processed;
 		const inHtlcSecretKey = `${inChannelId.toString('hex')}:${inHtlcId}`;
 
-		if (!hopPayload.shortChannelId) {
+		// Route blinding (BOLT 4): a blinded forwarding hop reads its encrypted
+		// recipient data (TLV 10) for the real onward SCID and its payment_relay,
+		// and derives the next hop's blinding point. The introduction node gets the
+		// blinding point in the onion (TLV 12); a downstream/mid hop gets it via
+		// update_add_htlc (incomingBlindingPoint) — supporting blinded chains of any
+		// length. For blinded hops the forward amount/CLTV are derived from the
+		// hop's own payment_relay (not the cleartext onion), so per-hop fees
+		// distribute correctly across >2 blinded hops.
+		let outgoingScid = hopPayload.shortChannelId;
+		let nextBlindingPoint: Buffer | undefined;
+		let holdForLsp = false;
+		let blindedOutAmount: bigint | undefined;
+		let blindedOutCltv: number | undefined;
+		let blindedMaxCltv: number | undefined;
+		const effectiveBlindingPoint =
+			hopPayload.blindingPoint ?? incomingBlindingPoint;
+		if (effectiveBlindingPoint && hopPayload.encryptedRecipientData) {
+			try {
+				const { hopData, nextBlindingKey } = processBlindedHop(
+					effectiveBlindingPoint,
+					this.nodePrivkey,
+					hopPayload.encryptedRecipientData
+				);
+				outgoingScid = hopData.shortChannelId;
+				nextBlindingPoint = nextBlindingKey;
+				holdForLsp = !!hopData.holdHtlc;
+				if (hopData.paymentRelay) {
+					const relay = hopData.paymentRelay;
+					const relayFee =
+						BigInt(relay.feeBaseMsat) +
+						(incomingAmountMsat * BigInt(relay.feeProportionalMillionths)) /
+							1_000_000n;
+					blindedOutAmount = incomingAmountMsat - relayFee;
+					blindedOutCltv = incomingCltvExpiry - relay.cltvExpiryDelta;
+				}
+				blindedMaxCltv = hopData.paymentConstraints?.maxCltvExpiry;
+			} catch {
+				outgoingScid = undefined;
+			}
+		}
+		const isBlindedForward = blindedOutAmount !== undefined;
+		const forwardAmount = blindedOutAmount ?? hopPayload.amountToForwardMsat;
+		const forwardCltv = blindedOutCltv ?? hopPayload.outgoingCltvValue;
+
+		if (!outgoingScid) {
 			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
 			this.channelManager.failHtlc(
 				inChannelId,
@@ -4230,38 +4874,56 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
-		if (
-			incomingCltvExpiry <
-			hopPayload.outgoingCltvValue + this.forwardingCltvDelta
-		) {
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
-				inChannelId,
-				inHtlcId,
-				createFailureMessage(sharedSecret, INCORRECT_CLTV_EXPIRY)
-			);
-			return;
+		// For a blinded hop the fee/CLTV are defined by payment_relay (the forward
+		// amount above already subtracts the relay fee); just ensure it's viable.
+		// For a cleartext hop, enforce our own forwarding policy.
+		if (isBlindedForward) {
+			// Enforce OUR own CLTV cushion even on a blinded hop: cltvExpiryDelta comes
+			// from the recipient-authored encrypted_recipient_data, so without this a
+			// malicious path builder could set delta=1 and leave us ~1 block to claim
+			// the outgoing HTLC on-chain after revealing the preimage → loss of the
+			// forwarded amount. Also honour payment_constraints.maxCltvExpiry.
+			if (
+				forwardAmount <= 0n ||
+				incomingCltvExpiry - forwardCltv < this.forwardingCltvDelta ||
+				(blindedMaxCltv !== undefined && incomingCltvExpiry > blindedMaxCltv)
+			) {
+				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+				this.channelManager.failHtlc(
+					inChannelId,
+					inHtlcId,
+					createFailureMessage(sharedSecret, INCORRECT_CLTV_EXPIRY)
+				);
+				return;
+			}
+		} else {
+			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
+			if (incomingCltvExpiry < forwardCltv + this.forwardingCltvDelta) {
+				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+				this.channelManager.failHtlc(
+					inChannelId,
+					inHtlcId,
+					createFailureMessage(sharedSecret, INCORRECT_CLTV_EXPIRY)
+				);
+				return;
+			}
+			// Fee enforcement: incoming amount must cover outgoing amount + our fee
+			const requiredFee =
+				BigInt(this.forwardingFeeBaseMsat) +
+				(forwardAmount * BigInt(this.forwardingFeePropMillionths)) / 1_000_000n;
+			if (incomingAmountMsat < forwardAmount + requiredFee) {
+				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+				this.channelManager.failHtlc(
+					inChannelId,
+					inHtlcId,
+					createFailureMessage(sharedSecret, FEE_INSUFFICIENT)
+				);
+				return;
+			}
 		}
 
-		// Fee enforcement: incoming amount must cover outgoing amount + our fee
-		const requiredFee =
-			BigInt(this.forwardingFeeBaseMsat) +
-			(hopPayload.amountToForwardMsat *
-				BigInt(this.forwardingFeePropMillionths)) /
-				1_000_000n;
-		if (incomingAmountMsat < hopPayload.amountToForwardMsat + requiredFee) {
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
-				inChannelId,
-				inHtlcId,
-				createFailureMessage(sharedSecret, FEE_INSUFFICIENT)
-			);
-			return;
-		}
-
-		// Look up outgoing channel via SCID
-		const scidHex = hopPayload.shortChannelId.toString('hex');
+		// Look up outgoing channel via SCID (real SCID for blinded hops)
+		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
 			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
@@ -4273,51 +4935,145 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// Encode the next onion packet
-		const nextOnionBuf = encodeOnionPacket(nextPacket);
+		// The actual onward forward, deferred so an async LSP hold can run it later
+		// (on release) with a current HTLC counter. Synchronous loopback may
+		// complete the whole fulfillment chain during addHtlc, so we track the
+		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
+		const performForward = (): void => {
+			const nextOnionBuf = encodeOnionPacket(nextPacket);
+			const outChannel = this.channelManager.getChannel(outChannelId);
+			const outHtlcId = outChannel
+				? outChannel.getFullState().localHtlcCounter
+				: 0n;
+			const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
+			this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
+			this.safeStorage(
+				() => this.storage!.saveForwardedHtlc(outKey, inChannelId, inHtlcId),
+				'saveForwardedHtlc'
+			);
 
-		// Track the outgoing HTLC ID and link to incoming BEFORE forwarding,
-		// because synchronous loopback may complete the entire fulfillment
-		// chain during addHtlc (same timing issue as payment storage).
-		const outChannel = this.channelManager.getChannel(outChannelId);
-		const outHtlcId = outChannel
-			? outChannel.getFullState().localHtlcCounter
-			: 0n;
-		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
-		this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-		this.safeStorage(
-			() => this.storage!.saveForwardedHtlc(outKey, inChannelId, inHtlcId),
-			'saveForwardedHtlc'
-		);
+			// For a blinded forward, hand the next hop its blinding point and use the
+			// payment_relay-derived amount/CLTV.
+			const result = this.channelManager.addHtlc(
+				outChannelId,
+				forwardAmount,
+				paymentHash,
+				forwardCltv,
+				nextOnionBuf,
+				nextBlindingPoint
+			);
 
-		// Forward the HTLC (may trigger synchronous fulfillment via loopback)
-		const result = this.channelManager.addHtlc(
-			outChannelId,
-			hopPayload.amountToForwardMsat,
-			paymentHash,
-			hopPayload.outgoingCltvValue,
-			nextOnionBuf
-		);
+			if (!result.ok) {
+				// Forward failed — fail the incoming HTLC back
+				this.forwardedHtlcs.delete(outKey);
+				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+				this.channelManager.failHtlc(
+					inChannelId,
+					inHtlcId,
+					createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+				);
+				return;
+			}
 
-		if (!result.ok) {
-			// Forward failed — fail the incoming HTLC back
-			this.forwardedHtlcs.delete(outKey);
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
+			this.emit(
+				'htlc:forward',
+				inChannelId,
+				outChannelId,
+				forwardAmount,
+				paymentHash
+			);
+		};
+
+		// Async payments (LSP role): the recipient's blinded path marked this hop
+		// hold_htlc, so park the forward and wait for a release_held_htlc onion
+		// message (handled by AsyncPaymentManager) before forwarding to the now-
+		// online receiver. The CLTV sweeper fails it back if release never comes.
+		if (holdForLsp) {
+			const hashHex = paymentHash.toString('hex');
+			this.heldForwards.set(hashHex, {
 				inChannelId,
 				inHtlcId,
-				createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
-			);
+				incomingCltvExpiry
+			});
+			this.asyncPaymentManager.registerHeldForward({
+				paymentHash,
+				release: () => {
+					this.heldForwards.delete(hashHex);
+					performForward();
+				},
+				fail: () => {
+					this.heldForwards.delete(hashHex);
+					this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+					this.channelManager.failHtlc(
+						inChannelId,
+						inHtlcId,
+						createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
+					);
+				}
+			});
+			this.emit('htlc:held-forward', {
+				paymentHash,
+				amountMsat: hopPayload.amountToForwardMsat
+			});
+			this.emitStructuredLog('htlc', 'held_forward', { paymentHash: hashHex });
 			return;
 		}
 
-		this.emit(
-			'htlc:forward',
-			inChannelId,
-			outChannelId,
-			hopPayload.amountToForwardMsat,
-			paymentHash
+		performForward();
+	}
+
+	/**
+	 * Consume a preimage learned ON-CHAIN (extracted from a counterparty's
+	 * HTLC-success spend). Two actions, both required to avoid loss of a forwarded
+	 * amount we already paid downstream:
+	 *  1. Seed EVERY chain monitor via recordPreimage so any inbound HTLC with this
+	 *     hash can be claimed on-chain if its channel force-closes (the core fix).
+	 *  2. Off-chain settle any still-live INBOUND (received) HTLC matching the hash,
+	 *     so a healthy inbound channel resolves cleanly instead of forcing a close.
+	 * recordPreimage is idempotent, so re-learning a preimage is harmless.
+	 */
+	private handleOnChainPreimageLearned(
+		paymentHash: Buffer,
+		preimage: Buffer
+	): void {
+		const hashHex = paymentHash.toString('hex');
+		this.preimages.set(hashHex, preimage);
+		this.safeStorage(
+			() => this.storage!.savePreimage(hashHex, preimage),
+			'savePreimage'
 		);
+		// Seed all monitors (on-chain claim path for every inbound HTLC of this hash).
+		this.channelManager.recordPreimage(paymentHash, preimage);
+
+		// Settle the inbound leg off-chain where the channel is still usable.
+		for (const channel of this.channelManager.listChannels()) {
+			const cid = channel.getChannelId();
+			if (!cid) continue;
+			for (const [key, htlc] of channel.getFullState().htlcs) {
+				if (!key.startsWith('received-')) continue;
+				if (
+					htlc.state !== HtlcState.COMMITTED &&
+					htlc.state !== HtlcState.PENDING
+				)
+					continue;
+				if (!htlc.paymentHash.equals(paymentHash)) continue;
+				this.cleanupHtlcSharedSecret(`${cid.toString('hex')}:${htlc.id}`);
+				this.channelManager.fulfillHtlc(cid, htlc.id, preimage);
+				// Drop any forwarding bookkeeping for the matching outgoing leg.
+				for (const [outKey, fwd] of this.forwardedHtlcs) {
+					if (fwd.inChannelId.equals(cid) && fwd.inHtlcId === htlc.id) {
+						this.forwardedHtlcs.delete(outKey);
+						this.safeStorage(
+							() => this.storage!.deleteForwardedHtlc(outKey),
+							'deleteForwardedHtlc'
+						);
+					}
+				}
+				this.persistChannel(cid);
+			}
+		}
+
+		this.emit('preimage:learned', paymentHash, preimage);
 	}
 
 	private handleHtlcFulfilled(
@@ -4341,6 +5097,12 @@ export class LightningNode extends EventEmitter {
 			this.cleanupHtlcSharedSecret(
 				`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
 			);
+			// Deliver the preimage to the chain monitors before settling the incoming
+			// leg. We learned this preimage from the downstream fulfill; if the incoming
+			// channel force-closes before our upstream fulfill confirms, the monitor must
+			// already hold the preimage to claim the inbound HTLC on-chain. Without this
+			// the forwarded value is lost via the counterparty's timeout path.
+			this.channelManager.recordPreimage(preimageHash, preimage);
 			// Persist before sending upstream fulfill
 			this.safeStorage(
 				() => this.storage!.deleteForwardedHtlc(outKey),
@@ -4897,8 +5659,16 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
+		// so a fee spike after the original broadcast cannot pin the package (M1).
+		this.channelManager.reCpfpStuckCommitments(
+			blockHeight,
+			this.resolveForceCloseFeeRatePerVbyte()
+		);
 		this.scanExpiringHtlcs(blockHeight);
 		this.scanExpiringOfferedHtlcs(blockHeight);
+		this.scanExpiringHeldHtlcs(blockHeight);
+		this.scanExpiringHeldForwards(blockHeight);
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.scanStuckPayments();
@@ -4912,10 +5682,40 @@ export class LightningNode extends EventEmitter {
 				// best-effort
 			}
 		}
+		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
+		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.
+		if (this.feeEstimator) {
+			this.feeEstimator
+				.estimateFee(6)
+				.then((satPerVbyte) => {
+					if (satPerVbyte > 0) this.feeAdvisor.recordSample(satPerVbyte);
+				})
+				.catch(() => {
+					/* best-effort; force-close falls back to the default feerate */
+				});
+		}
 	}
 
 	getCurrentBlockHeight(): number {
 		return this.currentBlockHeight;
+	}
+
+	/**
+	 * Resolve a conservative sat/vB feerate for a force-close package — the commitment
+	 * CPFP child and the time-sensitive second-level HTLC txs, which must confirm
+	 * before an HTLC's cltv_expiry. Uses the freshest live fee sample (kept warm in
+	 * handleNewBlock / the monitor-restore loop) with an urgency multiplier, and falls
+	 * back to the historical default ONLY when we have no fee data at all — so a node
+	 * with a fee estimator never force-closes at a fee a routine mempool spike would
+	 * strand (H2), while nodes without one behave exactly as before.
+	 */
+	private resolveForceCloseFeeRatePerVbyte(): number {
+		const live = this.feeAdvisor.getCurrentRate();
+		if (live <= 0) return FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE;
+		return Math.max(
+			Math.ceil(live * FORCE_CLOSE_FEE_MULTIPLIER),
+			FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE
+		);
 	}
 
 	/**
@@ -5235,12 +6035,24 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Create a BOLT 12 offer.
+	 *
+	 * With `asyncHold`, the offer's blinded path is built through our always-online
+	 * LSP (our channel peer) and the introduction hop is marked hold_htlc, so the
+	 * LSP parks an inbound HTLC until we come online and release it (async
+	 * receive). Caller-supplied `paths` take precedence over the auto-built one.
 	 */
-	createOffer(options: ICreateOfferOptions): {
+	createOffer(options: ICreateOfferOptions & { asyncHold?: boolean }): {
 		offer: IOffer;
 		encoded: string;
 	} {
-		return this.offerManager.createOffer(options);
+		const { asyncHold, ...createOpts } = options;
+		if (asyncHold && !createOpts.paths) {
+			const paths = this.buildBlindedPaymentPaths(true).map((p) => p.path);
+			if (paths.length > 0) {
+				createOpts.paths = paths;
+			}
+		}
+		return this.offerManager.createOffer(createOpts);
 	}
 
 	/**
@@ -5292,6 +6104,39 @@ export class LightningNode extends EventEmitter {
 		const finalCltvExpiry = DEFAULT_MIN_FINAL_CLTV_EXPIRY;
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
+		// Route blinding: BOLT 12 invoices natively carry blinded payment paths.
+		// Route through one (shared blinded sender with the BOLT 11 path).
+		if (invoice.paths && invoice.paths.length > 0) {
+			const payInfo = invoice.blindedPayInfo?.[0] ?? {
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 0,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: amountMsat
+			};
+			const blindedRoute = findRouteToBlindedPath(
+				this.graph,
+				sourceNodeId,
+				invoice.paths[0],
+				payInfo,
+				amountMsat,
+				finalCltvExpiry,
+				undefined,
+				undefined,
+				this.missionControl
+			);
+			if (!blindedRoute) {
+				throw new Error('No route to BOLT 12 blinded path introduction node');
+			}
+			return this.sendPaymentToRoute(
+				blindedRoute,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				invoice.paymentSecret,
+				amountMsat
+			);
+		}
+
 		const route = findRoute(
 			this.graph,
 			sourceNodeId,
@@ -5333,6 +6178,51 @@ export class LightningNode extends EventEmitter {
 		this.offerManager.on('invoice:received', (invoice: IBolt12Invoice) => {
 			this.emit('bolt12:invoice:received', invoice);
 		});
+		// Issuer side: a BOLT 12 invoice we created in response to an invoice_request.
+		// Register its preimage/payment_secret/amount into the SAME stores the BOLT 11
+		// receive path uses, so an incoming HTLC for this payment_hash is validated
+		// and fulfilled (without this the preimage lived only in OfferManager and the
+		// HTLC was failed with unknown_payment_hash).
+		this.offerManager.on(
+			'invoice:issued',
+			(invoice: IBolt12Invoice, preimage: Buffer) => {
+				const hashHex = invoice.paymentHash.toString('hex');
+				this.preimages.set(hashHex, preimage);
+				if (invoice.paymentSecret) {
+					this.paymentSecrets.set(hashHex, invoice.paymentSecret);
+				}
+				const invoiceInfo: IInvoiceInfo = {
+					paymentHash: hashHex,
+					bolt11: '',
+					amountMsat: invoice.amount,
+					description: invoice.description,
+					expiry: invoice.relativeExpiry ?? DEFAULT_EXPIRY,
+					createdAt: Number(invoice.createdAt)
+				};
+				this.invoices.set(hashHex, invoiceInfo);
+				// Track an INCOMING payment so the receive path emits payment:received
+				// and getPayment() works — exactly as createInvoice does for BOLT 11.
+				if (!this.payments.has(hashHex)) {
+					this.payments.set(hashHex, {
+						paymentHash: invoice.paymentHash,
+						preimage,
+						amountMsat: invoice.amount,
+						status: PaymentStatus.PENDING,
+						direction: PaymentDirection.INCOMING,
+						createdAt: Date.now()
+					});
+				}
+				this.safeStorage(() => {
+					this.storage!.savePreimage(hashHex, preimage);
+					if (invoice.paymentSecret) {
+						this.storage!.savePaymentSecret(hashHex, invoice.paymentSecret);
+					}
+					this.storage!.saveInvoice(hashHex, invoiceInfo);
+					this.persistPayment(invoice.paymentHash);
+				}, 'saveBolt12Invoice');
+				this.emit('bolt12:invoice:issued', invoice);
+			}
+		);
 		this.offerManager.on('invoice:error', (error: { error: string }) => {
 			this.emit('node:error', {
 				code: 'BOLT12_INVOICE_ERROR',
@@ -5395,7 +6285,8 @@ export class LightningNode extends EventEmitter {
 					} as ILightningError);
 					this.channelManager.forceClose(
 						channelId,
-						this.getSweepDestinationScript()
+						this.getSweepDestinationScript(),
+						this.resolveForceCloseFeeRatePerVbyte()
 					);
 					break; // channel is closing; no further HTLC scanning on it
 				}
@@ -5832,7 +6723,11 @@ export class LightningNode extends EventEmitter {
 							const destScript = bitcoin.payments.p2wpkh({
 								pubkey: this.fundingPubkey
 							}).output!;
-							this.channelManager.forceClose(channelId, destScript);
+							this.channelManager.forceClose(
+								channelId,
+								destScript,
+								this.resolveForceCloseFeeRatePerVbyte()
+							);
 							this._stuckChannelTracker.delete(reestablishKey);
 							this.emit('node:error', {
 								code: 'REESTABLISH_TIMEOUT_FORCE_CLOSED',
@@ -5869,7 +6764,11 @@ export class LightningNode extends EventEmitter {
 							const destScript = bitcoin.payments.p2wpkh({
 								pubkey: this.fundingPubkey
 							}).output!;
-							this.channelManager.forceClose(channelId, destScript);
+							this.channelManager.forceClose(
+								channelId,
+								destScript,
+								this.resolveForceCloseFeeRatePerVbyte()
+							);
 							this._stuckChannelTracker.delete(shutdownKey);
 							this.emit('node:error', {
 								code: 'STUCK_CHANNEL_FORCE_CLOSED',

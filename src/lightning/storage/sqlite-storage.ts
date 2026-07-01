@@ -607,7 +607,8 @@ export class SqliteStorage implements IStorageBackend {
 					: undefined,
 			description: invoice.description,
 			expiry: invoice.expiry,
-			createdAt: invoice.createdAt
+			createdAt: invoice.createdAt,
+			hold: invoice.hold
 		});
 		this.db
 			.prepare(
@@ -636,7 +637,8 @@ export class SqliteStorage implements IStorageBackend {
 								: undefined,
 						description: parsed.description,
 						expiry: parsed.expiry,
-						createdAt: parsed.createdAt
+						createdAt: parsed.createdAt,
+						hold: parsed.hold
 					}
 				});
 			} catch (err) {

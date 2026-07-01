@@ -29,14 +29,29 @@ export interface ICommitmentSignedMessage {
 	htlcSignatures: Buffer[];
 	/** Splice: the funding txid this commitment spends (TLV type 1, internal order). */
 	fundingTxid?: Buffer;
+	/**
+	 * option_taproot: the signer's 98-byte partial_signature_with_nonce (32-byte
+	 * MuSig2 partial signature || 66-byte public nonce) over the recipient's
+	 * commitment. Replaces the ECDSA `signature` field for taproot channels (which
+	 * is then all-zero). TLV type 2 (LND convention; pin at interop).
+	 */
+	partialSignatureWithNonce?: Buffer;
 }
 
 const TLV_SPLICE_INFO = 1n;
+const TLV_PARTIAL_SIG_WITH_NONCE = 2n;
+/** option_taproot: next per-commitment verification nonce in revoke_and_ack. */
+const TLV_NEXT_LOCAL_NONCE = 4n;
 
 export interface IRevokeAndAckMessage {
 	channelId: Buffer;
 	perCommitmentSecret: Buffer;
 	nextPerCommitmentPoint: Buffer;
+	/**
+	 * option_taproot: our 66-byte MuSig2 public nonce for the NEXT commitment
+	 * (rotate-on-revoke). The previous nonce is now spent. TLV type 4.
+	 */
+	nextLocalNonce?: Buffer;
 }
 
 const COMMITMENT_SIGNED_FIXED_LENGTH = 98; // 32 + 64 + 2
@@ -64,16 +79,30 @@ export function encodeCommitmentSignedMessage(
 		offset += 64;
 	}
 
-	// Splice: append the funding_txid TLV (type 1) when set.
+	// Append optional TLVs (splice funding_txid type 1; taproot partial sig type 2).
+	const records: ITlvRecord[] = [];
 	if (msg.fundingTxid) {
 		if (msg.fundingTxid.length !== 32) {
 			throw new Error(
 				`commitment_signed funding_txid must be 32 bytes, got ${msg.fundingTxid.length}`
 			);
 		}
-		const records: ITlvRecord[] = [
-			{ type: TLV_SPLICE_INFO, value: msg.fundingTxid }
-		];
+		records.push({ type: TLV_SPLICE_INFO, value: msg.fundingTxid });
+	}
+	if (msg.partialSignatureWithNonce) {
+		if (msg.partialSignatureWithNonce.length !== 98) {
+			throw new Error(
+				`partial_signature_with_nonce must be 98 bytes, got ${msg.partialSignatureWithNonce.length}`
+			);
+		}
+		records.push({
+			type: TLV_PARTIAL_SIG_WITH_NONCE,
+			value: msg.partialSignatureWithNonce
+		});
+	}
+	if (records.length > 0) {
+		// TLV records must be in ascending type order.
+		records.sort((a, b) => (a.type < b.type ? -1 : 1));
 		return Buffer.concat([buf, encodeTlvStream(records)]);
 	}
 
@@ -114,18 +143,30 @@ export function decodeCommitmentSignedMessage(
 		offset += 64;
 	}
 
-	// Splice: parse the optional funding_txid TLV (type 1).
+	// Parse optional TLVs: splice funding_txid (1), taproot partial sig (2).
 	let fundingTxid: Buffer | undefined;
+	let partialSignatureWithNonce: Buffer | undefined;
 	if (offset < payload.length) {
 		const { records } = decodeTlvStream(payload, offset);
 		for (const record of records) {
 			if (record.type === TLV_SPLICE_INFO && record.value.length === 32) {
 				fundingTxid = Buffer.from(record.value);
+			} else if (
+				record.type === TLV_PARTIAL_SIG_WITH_NONCE &&
+				record.value.length === 98
+			) {
+				partialSignatureWithNonce = Buffer.from(record.value);
 			}
 		}
 	}
 
-	return { channelId, signature, htlcSignatures, fundingTxid };
+	return {
+		channelId,
+		signature,
+		htlcSignatures,
+		fundingTxid,
+		partialSignatureWithNonce
+	};
 }
 
 /**
@@ -136,6 +177,21 @@ export function encodeRevokeAndAckMessage(msg: IRevokeAndAckMessage): Buffer {
 	msg.channelId.copy(buf, 0);
 	msg.perCommitmentSecret.copy(buf, 32);
 	msg.nextPerCommitmentPoint.copy(buf, 64);
+
+	// option_taproot: append the next verification nonce (TLV type 4).
+	if (msg.nextLocalNonce) {
+		if (msg.nextLocalNonce.length !== 66) {
+			throw new Error(
+				`revoke_and_ack next_local_nonce must be 66 bytes, got ${msg.nextLocalNonce.length}`
+			);
+		}
+		return Buffer.concat([
+			buf,
+			encodeTlvStream([
+				{ type: TLV_NEXT_LOCAL_NONCE, value: msg.nextLocalNonce }
+			])
+		]);
+	}
 	return buf;
 }
 
@@ -155,5 +211,21 @@ export function decodeRevokeAndAckMessage(
 	const perCommitmentSecret = Buffer.from(payload.subarray(32, 64));
 	const nextPerCommitmentPoint = Buffer.from(payload.subarray(64, 97));
 
-	return { channelId, perCommitmentSecret, nextPerCommitmentPoint };
+	// option_taproot: parse the optional next_local_nonce TLV (type 4).
+	let nextLocalNonce: Buffer | undefined;
+	if (payload.length > REVOKE_AND_ACK_LENGTH) {
+		const { records } = decodeTlvStream(payload, REVOKE_AND_ACK_LENGTH);
+		for (const record of records) {
+			if (record.type === TLV_NEXT_LOCAL_NONCE && record.value.length === 66) {
+				nextLocalNonce = Buffer.from(record.value);
+			}
+		}
+	}
+
+	return {
+		channelId,
+		perCommitmentSecret,
+		nextPerCommitmentPoint,
+		nextLocalNonce
+	};
 }

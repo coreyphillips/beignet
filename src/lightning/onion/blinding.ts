@@ -62,6 +62,18 @@ export function deriveNextBlindingKey(
 }
 
 /**
+ * Blinded-node-id tweak (BOLT 4): HMAC-SHA256("blinded_node_id", ss). Used to
+ * tweak both the public key (computeBlindedNodeId) and, on the receiving side,
+ * the private key — they must use the SAME tweak so the keys correspond.
+ */
+export function deriveBlindedNodeIdTweak(sharedSecret: Buffer): Buffer {
+	return crypto
+		.createHmac('sha256', Buffer.from('blinded_node_id'))
+		.update(sharedSecret)
+		.digest();
+}
+
+/**
  * Compute a blinded node ID from a node's public key and the shared secret.
  * blinded_node_id = node_pubkey * HMAC-SHA256("blinded_node_id", ss)
  */
@@ -69,20 +81,17 @@ export function computeBlindedNodeId(
 	nodePubkey: Buffer,
 	sharedSecret: Buffer
 ): Buffer {
-	const tweak = crypto
-		.createHmac('sha256', Buffer.from('blinded_node_id'))
-		.update(sharedSecret)
-		.digest();
-	return pointMultiply(nodePubkey, tweak);
+	return pointMultiply(nodePubkey, deriveBlindedNodeIdTweak(sharedSecret));
 }
 
 /**
- * Derive the encryption key (rho) for encrypted_recipient_data.
- * rho = HMAC-SHA256("blinded_node_id", shared_secret)
+ * Derive the encryption key (rho) for encrypted_recipient_data (BOLT 4):
+ * rho = HMAC-SHA256("rho", shared_secret). Using the spec "rho" label (not
+ * "blinded_node_id") is what lets LND/CLN decrypt our encrypted_recipient_data.
  */
 export function deriveBlindingEncryptionKey(sharedSecret: Buffer): Buffer {
 	return crypto
-		.createHmac('sha256', Buffer.from('blinded_node_id'))
+		.createHmac('sha256', Buffer.from('rho'))
 		.update(sharedSecret)
 		.digest();
 }

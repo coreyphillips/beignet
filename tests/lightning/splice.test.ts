@@ -1548,7 +1548,10 @@ describe('Splice', function () {
 			.update(Buffer.from('acceptor-splice'))
 			.digest();
 
-		function makeNormalChannel(): { opener: Channel; acceptor: Channel } {
+		function makeNormalChannel(pushMsat = 0n): {
+			opener: Channel;
+			acceptor: Channel;
+		} {
 			const openerBp = makeBasepoints(openerSeed);
 			const acceptorBp = makeBasepoints(acceptorSeed);
 			const tempId = Buffer.alloc(32, 0xbb);
@@ -1556,7 +1559,7 @@ describe('Splice', function () {
 			const openerState = createOpenerState({
 				temporaryChannelId: tempId,
 				fundingSatoshis: FUNDING_SATOSHIS,
-				pushMsat: 0n,
+				pushMsat,
 				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 				localBasepoints: openerBp,
 				localPerCommitmentSeed: openerCommitmentSeed
@@ -1566,7 +1569,7 @@ describe('Splice', function () {
 			const acceptorState = createAcceptorState({
 				temporaryChannelId: tempId,
 				fundingSatoshis: 0n,
-				pushMsat: 0n,
+				pushMsat,
 				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 				localBasepoints: acceptorBp,
 				localPerCommitmentSeed: acceptorCommitmentSeed,
@@ -2504,6 +2507,179 @@ describe('Splice', function () {
 			expect(opener.getFundingSatoshis()).to.equal(FUNDING_SATOSHIS + 300_000n);
 		});
 
+		it('beignet<->beignet: complete splice-IN with MULTIPLE wallet inputs + change', function () {
+			bitcoin.initEccLib(ecc);
+			const { opener, acceptor } = makeNormalChannel();
+
+			const openerFundingPriv = crypto
+				.createHash('sha256')
+				.update(openerSeed)
+				.update(Buffer.from([0]))
+				.digest();
+			const acceptorFundingPriv = crypto
+				.createHash('sha256')
+				.update(acceptorSeed)
+				.update(Buffer.from([0]))
+				.digest();
+			opener.setSigner(new ChannelSigner(openerFundingPriv));
+			acceptor.setSigner(new ChannelSigner(acceptorFundingPriv));
+
+			// Build a self-signing P2WPKH wallet UTXO of `value` sats.
+			const makeWalletInput = (tag: string, value: number) => {
+				const priv = crypto.createHash('sha256').update(tag).digest();
+				const pub = Buffer.from(ecc.pointFromScalar(priv, true)!);
+				const script = bitcoin.payments.p2wpkh({ pubkey: pub }).output!;
+				const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output!;
+				const prevTx = new bitcoin.Transaction();
+				prevTx.version = 2;
+				prevTx.addInput(crypto.randomBytes(32), 0);
+				prevTx.addOutput(script, value);
+				return {
+					prevTx: prevTx.toBuffer(),
+					prevOutputIndex: 0,
+					value: BigInt(value),
+					sequence: 0xfffffffd,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number,
+						v: bigint
+					): Buffer[] => {
+						const sighash = tx.hashForWitnessV0(
+							inputIndex,
+							scriptCode,
+							Number(v),
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						const sig64 = Buffer.from(ecc.sign(sighash, priv));
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [der, pub];
+					}
+				};
+			};
+
+			// Two wallet UTXOs (250k + 200k) fund a 300k splice-in, with change.
+			const in1 = makeWalletInput('splice-in-multi-A', 250_000);
+			const in2 = makeWalletInput('splice-in-multi-B', 200_000);
+			const changePub = Buffer.from(
+				ecc.pointFromScalar(
+					crypto.createHash('sha256').update('splice-in-multi-change').digest(),
+					true
+				)!
+			);
+			const changeScript = bitcoin.payments.p2wpkh({ pubkey: changePub })
+				.output!;
+
+			const deliver = (
+				ch: Channel,
+				msgType: MessageType,
+				payload: Buffer
+			): any[] => {
+				switch (msgType) {
+					case MessageType.STFU:
+						return ch.handleStfuMessage(decodeStfuMessage(payload));
+					case MessageType.SPLICE:
+						return ch.handleSplice(decodeSpliceMessage(payload));
+					case MessageType.SPLICE_ACK:
+						return ch.handleSpliceAck(decodeSpliceAckMessage(payload));
+					case MessageType.TX_ADD_INPUT:
+						return ch.handleTxAddInput(decodeTxAddInputMessage(payload));
+					case MessageType.TX_ADD_OUTPUT:
+						return ch.handleTxAddOutput(decodeTxAddOutputMessage(payload));
+					case MessageType.TX_COMPLETE:
+						return ch.handleTxComplete();
+					case MessageType.TX_SIGNATURES:
+						return ch.handleTxSignatures(decodeTxSignaturesMessage(payload));
+					case MessageType.COMMITMENT_SIGNED:
+						return ch.handleCommitmentSigned(
+							decodeCommitmentSignedMessage(payload)
+						);
+					case MessageType.SPLICE_LOCKED:
+						return ch.handleSpliceLocked(decodeSpliceLockedMessage(payload));
+					default:
+						return [];
+				}
+			};
+			const queue: Array<{
+				to: Channel;
+				from: Channel;
+				msgType: MessageType;
+				payload: Buffer;
+			}> = [];
+			const broadcasts: Buffer[] = [];
+			const enqueue = (to: Channel, from: Channel, actions: any[]): void => {
+				for (const a of actions) {
+					if (a.type === ChannelActionType.ERROR)
+						throw new Error(`channel error: ${a.message}`);
+					if (a.type === ChannelActionType.SEND_MESSAGE)
+						queue.push({
+							to,
+							from,
+							msgType: a.messageType,
+							payload: a.payload
+						});
+					if (a.type === ChannelActionType.BROADCAST_TX) broadcasts.push(a.tx);
+				}
+			};
+
+			opener.setSpliceInInputs([in1, in2], changeScript);
+			enqueue(acceptor, opener, opener.initiateSplice(300_000n, 253));
+
+			let steps = 0;
+			while (queue.length > 0) {
+				if (steps++ > 300)
+					throw new Error('multi-input splice-in did not settle');
+				const { to, from, msgType, payload } = queue.shift()!;
+				enqueue(from, to, deliver(to, msgType, payload));
+			}
+
+			const otx = opener.getSpliceSession()!.buildTransaction()!;
+			// Three inputs: shared funding + the two wallet UTXOs.
+			expect(otx.inputs.length).to.equal(3);
+			const spliceInFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 2,
+					changeScriptLen: changeScript.length
+				}),
+				253
+			);
+			// Conservation: oldCap + both wallet inputs = all outputs + fee.
+			const totalOut = otx.outputs.reduce((s, o) => s + o.amountSats, 0n);
+			expect(FUNDING_SATOSHIS + 250_000n + 200_000n).to.equal(
+				totalOut + spliceInFee
+			);
+			expect(
+				otx.outputs.some((o) => o.amountSats === FUNDING_SATOSHIS + 300_000n),
+				'new funding output = oldCap + 300k'
+			).to.be.true;
+
+			// Both broadcast the identical fully-signed tx; witnesses: two 2-element
+			// P2WPKH wallet inputs + one 4-element 2-of-2 shared input.
+			expect(broadcasts.length).to.equal(2);
+			expect(broadcasts[0].equals(broadcasts[1]), 'identical signed tx').to.be
+				.true;
+			const finalTx = bitcoin.Transaction.fromBuffer(broadcasts[0]);
+			const witnessSizes = finalTx.ins.map((i) => i.witness.length).sort();
+			expect(witnessSizes).to.deep.equal([2, 2, 4]);
+
+			// splice_locked -> NORMAL with capacity increased by the splice-in amount.
+			const olMsg = findSendAction(
+				opener.sendSpliceLocked(),
+				MessageType.SPLICE_LOCKED
+			);
+			const alMsg = findSendAction(
+				acceptor.sendSpliceLocked(),
+				MessageType.SPLICE_LOCKED
+			);
+			opener.handleSpliceLocked(decodeSpliceLockedMessage(alMsg.payload));
+			acceptor.handleSpliceLocked(decodeSpliceLockedMessage(olMsg.payload));
+			expect(opener.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+			expect(opener.getFundingSatoshis()).to.equal(FUNDING_SATOSHIS + 300_000n);
+		});
+
 		it('refuses to co-sign a splice tx with a shortchanged new funding output', function () {
 			// CLN-as-initiator scenario: the peer drives the interactive tx and
 			// constructs a funding output far below the negotiated capacity (the
@@ -2643,8 +2819,8 @@ describe('Splice', function () {
 				clearDrops: () => void;
 			}
 
-			function makeWirePair(): IWirePair {
-				const { opener, acceptor } = makeNormalChannel();
+			function makeWirePair(pushMsat = 0n): IWirePair {
+				const { opener, acceptor } = makeNormalChannel(pushMsat);
 				const openerFundingPriv = crypto
 					.createHash('sha256')
 					.update(openerSeed)
@@ -3298,6 +3474,174 @@ describe('Splice', function () {
 				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
 				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
 			});
+
+			/** splice_locked both ways and pump → back to NORMAL on the new outpoint. */
+			function completeSpliceLocked(pair: IWirePair): void {
+				pair.enqueue(
+					pair.acceptor,
+					pair.opener,
+					pair.opener.sendSpliceLocked()
+				);
+				pair.enqueue(
+					pair.opener,
+					pair.acceptor,
+					pair.acceptor.sendSpliceLocked()
+				);
+				pair.pump();
+			}
+
+			it('completes two SEQUENTIAL splice-outs on the same channel (funding outpoint chain)', function () {
+				const pair = makeWirePair();
+
+				// ── First splice-out ──
+				startSpliceOut(pair, 50_000n);
+				expect(pair.opener.getSpliceSession()!.getState()).to.equal(
+					SpliceState.AWAITING_SPLICE_LOCKED
+				);
+				const spliceTxid1 = pair.opener.getSpliceSession()!.getSpliceTxid()!;
+				completeSpliceLocked(pair);
+
+				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+				expect(
+					pair.opener.getFullState().fundingTxid!.equals(spliceTxid1),
+					'opener funding moved to the first splice tx'
+				).to.be.true;
+				expect(pair.errors, 'no errors after first splice').to.be.empty;
+				const capAfter1 = pair.opener.getFundingSatoshis();
+				expect(capAfter1 < FUNDING_SATOSHIS).to.be.true;
+
+				// ── Second splice-out, spending the FIRST splice's funding output ──
+				startSpliceOut(pair, 30_000n);
+				const session2 = pair.opener.getSpliceSession()!;
+				expect(session2.getState()).to.equal(
+					SpliceState.AWAITING_SPLICE_LOCKED
+				);
+				// The chain advances: the second splice's shared input is the first
+				// splice's funding output.
+				expect(
+					session2.buildTransaction()!.inputs[0].prevTxid.equals(spliceTxid1),
+					'second splice spends the first splice output'
+				).to.be.true;
+				const spliceTxid2 = session2.getSpliceTxid()!;
+				expect(spliceTxid2.equals(spliceTxid1)).to.be.false;
+				completeSpliceLocked(pair);
+
+				// Both sides resume NORMAL on the SECOND new outpoint with a fresh,
+				// valid commitment — capacity reduced again.
+				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+				expect(
+					pair.opener.getFullState().fundingTxid!.equals(spliceTxid2),
+					'opener funding moved to the second splice tx'
+				).to.be.true;
+				expect(pair.acceptor.getFullState().fundingTxid!.equals(spliceTxid2)).to
+					.be.true;
+				expect(pair.opener.getFundingSatoshis() < capAfter1).to.be.true;
+				expect(pair.errors, 'no errors across both splices').to.be.empty;
+				expect(
+					pair.opener.getFullState().remoteCommitmentSignature,
+					'opener holds a commitment sig on the final outpoint'
+				).to.not.be.null;
+				expect(
+					pair.acceptor.getFullState().remoteCommitmentSignature,
+					'acceptor holds a commitment sig on the final outpoint'
+				).to.not.be.null;
+			});
+
+			it('splice-out with a NON-ZERO remote balance leaves the acceptor balance untouched', function () {
+				// Open with 200k sat pushed to the acceptor, so both sides hold funds.
+				const pushMsat = 200_000_000n;
+				const pair = makeWirePair(pushMsat);
+
+				const acceptorLocalBefore =
+					pair.acceptor.getFullState().localBalanceMsat;
+				const openerLocalBefore = pair.opener.getFullState().localBalanceMsat;
+				expect(acceptorLocalBefore, 'acceptor starts with the push').to.equal(
+					pushMsat
+				);
+				expect(openerLocalBefore).to.equal(FUNDING_SATOSHIS * 1000n - pushMsat);
+
+				// Opener splices 50k out of ITS OWN balance (startSpliceOut builds a
+				// zero-fee tx beignet↔beignet, so the arithmetic is exact).
+				startSpliceOut(pair, 50_000n);
+				completeSpliceLocked(pair);
+
+				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.errors, 'no errors').to.be.empty;
+
+				// The acceptor did not contribute to the splice-out — its balance is
+				// unchanged; the full 50k came out of the opener's side.
+				expect(
+					pair.acceptor.getFullState().localBalanceMsat,
+					'acceptor balance untouched'
+				).to.equal(acceptorLocalBefore);
+				expect(
+					pair.opener.getFullState().localBalanceMsat,
+					'opener balance reduced by exactly the withdrawal'
+				).to.equal(openerLocalBefore - 50_000_000n);
+
+				// Both agree on the new outpoint + capacity, and balances still sum to it.
+				const spliceTxid = pair.opener.getFullState().fundingTxid!;
+				expect(pair.acceptor.getFullState().fundingTxid!.equals(spliceTxid)).to
+					.be.true;
+				expect(pair.opener.getFundingSatoshis()).to.equal(
+					pair.acceptor.getFundingSatoshis()
+				);
+				expect(
+					pair.opener.getFullState().localBalanceMsat +
+						pair.acceptor.getFullState().localBalanceMsat,
+					'local balances sum to the new capacity'
+				).to.equal(pair.opener.getFundingSatoshis() * 1000n);
+			});
+
+			it('recovers both sides to NORMAL when a splice is aborted mid-negotiation (tx_abort)', function () {
+				const pair = makeWirePair();
+				const origFunding = pair.opener.getFullState().fundingTxid!;
+				const origCap = pair.opener.getFundingSatoshis();
+
+				// Stall the interactive-tx negotiation before any signing by dropping
+				// tx_complete, so the splice sits mid-flight with a live session.
+				pair.drop(MessageType.TX_COMPLETE);
+				startSpliceOut(pair, 50_000n);
+
+				expect(pair.opener.getState()).to.equal(ChannelState.SPLICING);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.SPLICING);
+				expect(
+					pair.opener.getSpliceSession()!.isComplete(),
+					'splice not complete (tx_signatures never exchanged)'
+				).to.be.false;
+
+				// tx_abort tears down the splice on BOTH sides. Per BOLT 2 it unwinds
+				// only the splice — the underlying channel is untouched.
+				pair.opener.handleTxAbort();
+				pair.acceptor.handleTxAbort();
+
+				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.opener.getSpliceSession(), 'opener session cleared').to.be
+					.null;
+				expect(pair.acceptor.getSpliceSession(), 'acceptor session cleared').to
+					.be.null;
+				// Funding outpoint + capacity unchanged — the splice never happened.
+				expect(
+					pair.opener.getFullState().fundingTxid!.equals(origFunding),
+					'funding outpoint unchanged'
+				).to.be.true;
+				expect(pair.opener.getFundingSatoshis()).to.equal(origCap);
+
+				// And the channel is still usable: a fresh splice-out now completes.
+				pair.clearDrops();
+				startSpliceOut(pair, 25_000n);
+				completeSpliceLocked(pair);
+				expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+				expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+				expect(
+					pair.opener.getFundingSatoshis() < origCap,
+					'post-abort splice reduced capacity'
+				).to.be.true;
+			});
 		});
 	});
 
@@ -3351,6 +3695,76 @@ describe('Splice', function () {
 
 			const result = openerManager.sendSpliceLocked(channelId);
 			expect(result.ok).to.be.true;
+		});
+
+		it('routes an HTLC payment AFTER a splice completes (commitment on the new outpoint)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = createNormalChannelPair();
+
+			// ── Drive a splice-out to completion (NORMAL on a new outpoint) ──
+			openerManager.initiateQuiescence(channelId);
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			openerChannel.setSpliceOutDestination(destScript, 50_000n);
+			expect(openerManager.initiateSplice(channelId, -50_000n, 253).ok).to.be
+				.true;
+
+			// Auto-routing ran the splice to fully-signed; lock it in both ways.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			const splicedFunding = openerChannel.getFullState().fundingTxid!;
+			expect(acceptorChannel.getFullState().fundingTxid!.equals(splicedFunding))
+				.to.be.true;
+
+			const openerCommitBefore =
+				openerChannel.getFullState().localCommitmentNumber;
+			const openerLocalMsatBefore =
+				openerChannel.getFullState().localBalanceMsat;
+
+			// ── A real HTLC payment over the post-splice channel ──
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const amountMsat = 20_000_000n;
+
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					amountMsat,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+
+			// The payment settled over the spliced channel: a fresh commitment round
+			// advanced on the NEW funding outpoint and the balance moved.
+			expect(fulfilled, 'HTLC fulfilled after splice').to.be.true;
+			expect(
+				openerChannel.getFullState().localCommitmentNumber > openerCommitBefore,
+				'commitment advanced on the spliced outpoint'
+			).to.be.true;
+			expect(
+				openerChannel.getFullState().localBalanceMsat,
+				'opener balance reduced by the payment'
+			).to.equal(openerLocalMsatBefore - amountMsat);
+			// Both sides still agree on the spliced funding outpoint.
+			expect(openerChannel.getFullState().fundingTxid!.equals(splicedFunding))
+				.to.be.true;
 		});
 
 		it('should refuse abortSplice via manager once tx_signatures are exchanged (fund safety)', function () {

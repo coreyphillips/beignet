@@ -42,9 +42,67 @@
  */
 
 import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
+import {
+	ILeaseRates,
+	encodeLeaseRates,
+	decodeLeaseRates,
+	LEASE_RATES_LENGTH
+} from '../gossip/types';
 
 /** TLV type for channel_type */
 const TLV_CHANNEL_TYPE = 1n;
+/** Liquidity ads (bLIP-0051): request_funds TLV in open_channel2. */
+const TLV_REQUEST_FUNDS = 5n;
+/** Liquidity ads (bLIP-0051): will_fund TLV in accept_channel2. */
+const TLV_WILL_FUND = 5n;
+
+/** Buyer's lease request, carried in open_channel2 (bLIP-0051). */
+export interface IRequestFunds {
+	/** Inbound liquidity requested from the seller, in satoshis (u64). */
+	requestedSats: bigint;
+	/** Current block height, bounding lease_expiry (u32). */
+	blockheight: number;
+}
+
+/** Seller's signed lease commitment, carried in accept_channel2 (bLIP-0051). */
+export interface IWillFund {
+	/** 64-byte signature over the lease parameters. */
+	signature: Buffer;
+	/** Lease rates the seller is committing to (echoes node_announcement). */
+	leaseRates: ILeaseRates;
+}
+
+/** Encode request_funds: requested_sats(u64) || blockheight(u32). */
+function encodeRequestFunds(r: IRequestFunds): Buffer {
+	const buf = Buffer.alloc(12);
+	buf.writeBigUInt64BE(r.requestedSats, 0);
+	buf.writeUInt32BE(r.blockheight, 8);
+	return buf;
+}
+
+/** Decode request_funds. */
+function decodeRequestFunds(buf: Buffer): IRequestFunds {
+	return {
+		requestedSats: buf.readBigUInt64BE(0),
+		blockheight: buf.readUInt32BE(8)
+	};
+}
+
+/** Encode will_fund: signature(64) || lease_rates(14). */
+function encodeWillFund(w: IWillFund): Buffer {
+	if (w.signature.length !== 64) {
+		throw new Error('will_fund signature must be 64 bytes');
+	}
+	return Buffer.concat([w.signature, encodeLeaseRates(w.leaseRates)]);
+}
+
+/** Decode will_fund. */
+function decodeWillFund(buf: Buffer): IWillFund {
+	return {
+		signature: Buffer.from(buf.subarray(0, 64)),
+		leaseRates: decodeLeaseRates(buf.subarray(64, 64 + LEASE_RATES_LENGTH))
+	};
+}
 
 export interface IOpenChannel2Message {
 	channelId: Buffer;
@@ -66,6 +124,8 @@ export interface IOpenChannel2Message {
 	secondPerCommitmentPoint: Buffer;
 	channelFlags: number;
 	channelType?: Buffer;
+	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request. */
+	requestFunds?: IRequestFunds;
 }
 
 export interface IAcceptChannel2Message {
@@ -85,6 +145,8 @@ export interface IAcceptChannel2Message {
 	firstPerCommitmentPoint: Buffer;
 	secondPerCommitmentPoint: Buffer;
 	channelType?: Buffer;
+	/** Liquidity ads (bLIP-0051): seller's signed lease commitment. */
+	willFund?: IWillFund;
 }
 
 // open_channel2 fixed payload length:
@@ -144,10 +206,16 @@ export function encodeOpenChannel2Message(msg: IOpenChannel2Message): Buffer {
 
 	const parts: Buffer[] = [buf];
 
-	// TLV records
+	// TLV records (strictly increasing type order)
 	const tlvRecords: ITlvRecord[] = [];
 	if (msg.channelType) {
 		tlvRecords.push({ type: TLV_CHANNEL_TYPE, value: msg.channelType });
+	}
+	if (msg.requestFunds) {
+		tlvRecords.push({
+			type: TLV_REQUEST_FUNDS,
+			value: encodeRequestFunds(msg.requestFunds)
+		});
 	}
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
@@ -242,6 +310,8 @@ export function decodeOpenChannel2Message(
 		for (const record of records) {
 			if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
+			} else if (record.type === TLV_REQUEST_FUNDS) {
+				result.requestFunds = decodeRequestFunds(record.value);
 			}
 		}
 	}
@@ -298,6 +368,12 @@ export function encodeAcceptChannel2Message(
 	const tlvRecords: ITlvRecord[] = [];
 	if (msg.channelType) {
 		tlvRecords.push({ type: TLV_CHANNEL_TYPE, value: msg.channelType });
+	}
+	if (msg.willFund) {
+		tlvRecords.push({
+			type: TLV_WILL_FUND,
+			value: encodeWillFund(msg.willFund)
+		});
 	}
 	if (tlvRecords.length > 0) {
 		parts.push(encodeTlvStream(tlvRecords));
@@ -382,6 +458,8 @@ export function decodeAcceptChannel2Message(
 		for (const record of records) {
 			if (record.type === TLV_CHANNEL_TYPE) {
 				result.channelType = record.value;
+			} else if (record.type === TLV_WILL_FUND) {
+				result.willFund = decodeWillFund(record.value);
 			}
 		}
 	}

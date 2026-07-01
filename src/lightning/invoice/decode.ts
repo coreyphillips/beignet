@@ -19,6 +19,10 @@ import {
 import { parseHrp } from './amount';
 import { wordsToBuffer, decodeUintFromWords, decodeTaggedField } from './words';
 import { verifyInvoice } from './signing';
+import {
+	IBlindedPaymentPath,
+	decodeInvoiceBlindedPaymentPaths
+} from '../onion/blinded-path';
 
 /**
  * Decode a BOLT 11 invoice string into a structured object.
@@ -68,6 +72,7 @@ export function decode(invoiceString: string): IInvoice {
 	const result: Partial<IInvoice> = {};
 	const unknownTags: Array<{ type: number; words: number[] }> = [];
 	const routingHints: IRoutingHintHop[][] = [];
+	let blindedPaths: IBlindedPaymentPath[] | undefined;
 
 	let offset = 0;
 	while (offset < taggedWords.length) {
@@ -107,6 +112,11 @@ export function decode(invoiceString: string): IInvoice {
 				break;
 			case TagType.METADATA:
 				result.metadata = wordsToBuffer(field.dataWords);
+				break;
+			case TagType.BLINDED_PATHS:
+				blindedPaths = decodeInvoiceBlindedPaymentPaths(
+					wordsToBuffer(field.dataWords)
+				);
 				break;
 			default:
 				unknownTags.push({ type: field.type, words: field.dataWords });
@@ -166,6 +176,9 @@ export function decode(invoiceString: string): IInvoice {
 	}
 	if (routingHints.length > 0) {
 		invoice.routingHints = routingHints;
+	}
+	if (blindedPaths && blindedPaths.length > 0) {
+		invoice.blindedPaths = blindedPaths;
 	}
 	if (result.featureBits) {
 		invoice.featureBits = result.featureBits;

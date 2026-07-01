@@ -18,6 +18,12 @@ export interface IHopPayload {
 	blindingPoint?: Buffer;
 	/** Custom TLV records (e.g. keysend preimage at type 5482373484) */
 	customRecords?: Map<number, Buffer>;
+	/**
+	 * Encode hint (BOLT 4): omit amt_to_forward/outgoing_cltv_value. Set for a
+	 * blinded INTERMEDIATE hop, whose payload carries only encrypted_recipient_data
+	 * (+ intro blinding_point); it derives amounts from its encrypted payment_relay.
+	 */
+	omitForwardAmounts?: boolean;
 }
 
 export interface IOnionPacket {

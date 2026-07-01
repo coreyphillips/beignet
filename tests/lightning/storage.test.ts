@@ -32,6 +32,7 @@ import {
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import {
 	PaymentStatus,
 	PaymentDirection,
@@ -133,6 +134,44 @@ describe('Storage Layer', function () {
 			expect(htlc.id).to.equal(0n);
 			expect(htlc.amountMsat).to.equal(50_000_000n);
 			expect(htlc.direction).to.equal(HtlcDirection.OFFERED);
+		});
+
+		// H1 fund-safety: the lessor's isLessor/leaseExpiry drive the CLTV lock on our
+		// to_local script. If they don't survive a serialize→restore round-trip, the
+		// rebuilt commitment differs from the one the peer signed, the cached remote
+		// signature no longer validates, and our whole balance becomes unbroadcastable.
+		// This asserts BOTH the fields AND the resulting commitment are byte-identical
+		// across a round-trip — the generalized "rebuild byte-parity" invariant.
+		it('persists lessor lease fields so the rebuilt commitment is byte-identical (H1)', function () {
+			const state = createTestChannelState();
+			state.isLessor = true;
+			state.leaseExpiry = 850_000;
+
+			const point = perCommitmentPointFromSecret(
+				generateFromSeed(
+					state.localPerCommitmentSeed,
+					MAX_INDEX - state.localCommitmentNumber
+				)
+			);
+			const before = buildLocalCommitment(state, point).result.tx.toHex();
+
+			const restored = deserializeChannelState(serializeChannelState(state));
+			expect(restored.isLessor, 'isLessor survives').to.equal(true);
+			expect(restored.leaseExpiry, 'leaseExpiry survives').to.equal(850_000);
+
+			const after = buildLocalCommitment(restored, point).result.tx.toHex();
+			expect(after, 'rebuilt commitment is byte-identical').to.equal(before);
+
+			// Guard: the lease lock actually changes the commitment, so the test is
+			// meaningful — a non-lessor rebuild must differ.
+			const nonLessor = deserializeChannelState(serializeChannelState(state));
+			nonLessor.isLessor = false;
+			nonLessor.leaseExpiry = undefined;
+			const unlocked = buildLocalCommitment(nonLessor, point).result.tx.toHex();
+			expect(
+				unlocked,
+				'lease lock materially affects the commitment'
+			).to.not.equal(before);
 		});
 
 		it('should round-trip ShaChainStore', function () {

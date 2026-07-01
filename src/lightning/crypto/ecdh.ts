@@ -174,12 +174,18 @@ export function sign(messageHash: Buffer, privateKey: Buffer): Buffer {
  * @param messageHash - 32-byte hash that was signed
  * @param publicKey - 33-byte compressed public key
  * @param signature - 64-byte compact signature
+ * @param strict - if true, reject non-canonical (high-S) signatures (BIP146 low-S).
+ *   Use this for any signature we will later place in a transaction we broadcast:
+ *   a high-S signature verifies cryptographically but makes the spending tx
+ *   non-standard/non-relayable, so accepting one silently yields an unbroadcastable
+ *   commitment or HTLC claim.
  * @returns True if signature is valid
  */
 export function verify(
 	messageHash: Buffer,
 	publicKey: Buffer,
-	signature: Buffer
+	signature: Buffer,
+	strict = false
 ): boolean {
-	return ecc.verify(messageHash, publicKey, signature);
+	return ecc.verify(messageHash, publicKey, signature, strict);
 }

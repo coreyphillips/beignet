@@ -3,10 +3,15 @@
  * Pure analysis class -- no side effects, no network calls.
  */
 
+import { ILeaseRates } from '../gossip/types';
+import { computeLeaseFeeSat } from '../channel/liquidity-ads';
+
 export enum RecommendationType {
 	OPEN_CHANNEL = 'OPEN_CHANNEL',
 	CLOSE_CHANNEL = 'CLOSE_CHANNEL',
-	REBALANCE_NEEDED = 'REBALANCE_NEEDED'
+	REBALANCE_NEEDED = 'REBALANCE_NEEDED',
+	/** Buy inbound liquidity via a liquidity-ads lease (bLIP-0051). */
+	BUY_LEASE = 'BUY_LEASE'
 }
 
 export enum RecommendationPriority {
@@ -120,6 +125,12 @@ export class LiquidityAdvisor {
 					reason:
 						'All channels have less than 10% inbound capacity. Spending or circular rebalancing needed.'
 				});
+				recommendations.push({
+					type: RecommendationType.BUY_LEASE,
+					priority: RecommendationPriority.MEDIUM,
+					reason:
+						'Inbound capacity is critically low. Consider buying inbound liquidity via a liquidity-ads lease (bLIP-0051).'
+				});
 			}
 
 			// Rule 5: Outbound:inbound ratio > 5:1 -> OPEN_CHANNEL (MEDIUM)
@@ -187,4 +198,71 @@ export class LiquidityAdvisor {
 			recommendations
 		};
 	}
+
+	// ─────────────── Liquidity Ads (bLIP-0051) ───────────────
+
+	/**
+	 * Buyer: score a set of sellers' advertised lease rates for the inbound
+	 * liquidity needed, cheapest total fee first. Lets an agent pick whom to lease
+	 * from (and whether any quote is acceptable vs maxFeeSats).
+	 */
+	quoteLeases(
+		offers: ILeaseOffer[],
+		requestedSats: bigint,
+		fundingFeeratePerkw: number
+	): ILeaseQuote[] {
+		return offers
+			.map((offer) => {
+				const feeSats = computeLeaseFeeSat(
+					offer.leaseRates,
+					requestedSats,
+					fundingFeeratePerkw
+				);
+				// Effective fee as a fraction of the leased amount (for comparison).
+				const feeRatePct =
+					requestedSats > 0n ? Number(feeSats) / Number(requestedSats) : 0;
+				return { offer, requestedSats, feeSats, feeRatePct };
+			})
+			.sort((a, b) => Number(a.feeSats - b.feeSats));
+	}
+
+	/**
+	 * Seller: suggest lease rates to advertise, given available outbound liquidity
+	 * to lease and the current funding feerate. Conservative defaults — price the
+	 * mining-fee share via funding_weight, a flat base fee, and a small
+	 * proportional fee; cap routing fees the lease permits.
+	 */
+	suggestLeaseRates(
+		opts: {
+			/** Base flat lease fee in satoshis. */
+			leaseFeeBaseSat?: number;
+			/** Proportional fee in 1/10_000 of the leased amount. */
+			leaseFeeBasis?: number;
+			/** Witness weight of the seller's funding input (~weight units). */
+			fundingWeightWitness?: number;
+		} = {}
+	): ILeaseRates {
+		return {
+			fundingWeightWitness: opts.fundingWeightWitness ?? 666,
+			leaseFeeBasis: opts.leaseFeeBasis ?? 40, // 0.4%
+			leaseFeeBaseSat: opts.leaseFeeBaseSat ?? 500,
+			channelFeeMaxBaseMsat: 5000,
+			channelFeeMaxProportionalThousandths: 10
+		};
+	}
+}
+
+/** A seller's advertised lease offer (from node_announcement lease rates). */
+export interface ILeaseOffer {
+	sellerNodeId: string;
+	leaseRates: ILeaseRates;
+}
+
+/** A scored lease quote for the buyer. */
+export interface ILeaseQuote {
+	offer: ILeaseOffer;
+	requestedSats: bigint;
+	feeSats: bigint;
+	/** Fee as a fraction of the leased amount (0.01 = 1%). */
+	feeRatePct: number;
 }

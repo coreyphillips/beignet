@@ -57,29 +57,49 @@ export function calculateObscuredCommitmentNumber(
  * OP_IF
  *   <revocationpubkey>
  * OP_ELSE
+ *   [<lease_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP]   (liquidity-ads lessor only)
  *   <to_self_delay> OP_CHECKSEQUENCEVERIFY OP_DROP
  *   <local_delayedpubkey>
  * OP_ENDIF
  * OP_CHECKSIG
  *
+ * When `leaseExpiry` is set (liquidity ads / bLIP-0051, lessor side), an absolute
+ * CLTV is prepended to the delay branch so the lessor cannot sweep its own funds
+ * before the lease expires — matching LND's script-enforced-lease
+ * LeaseCommitScriptToSelf (CLTV before the CSV). The spending tx must therefore
+ * set nLockTime >= lease_expiry in addition to satisfying the CSV.
+ *
  * @param revocationPubkey - 33-byte revocation public key
  * @param localDelayedPubkey - 33-byte local delayed payment key
  * @param toSelfDelay - CSV delay in blocks
+ * @param leaseExpiry - absolute lease-expiry block height (lessor only); omit otherwise
  * @returns The witness script
  */
 export function buildToLocalScript(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
-	toSelfDelay: number
+	toSelfDelay: number,
+	leaseExpiry?: number
 ): Buffer {
+	const delayBranch: (number | Buffer)[] = [];
+	if (leaseExpiry !== undefined && leaseExpiry > 0) {
+		delayBranch.push(
+			bitcoin.script.number.encode(leaseExpiry),
+			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
+			bitcoin.opcodes.OP_DROP
+		);
+	}
+	delayBranch.push(
+		bitcoin.script.number.encode(toSelfDelay),
+		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
+		bitcoin.opcodes.OP_DROP,
+		localDelayedPubkey
+	);
 	return bitcoin.script.compile([
 		bitcoin.opcodes.OP_IF,
 		revocationPubkey,
 		bitcoin.opcodes.OP_ELSE,
-		bitcoin.script.number.encode(toSelfDelay),
-		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
-		bitcoin.opcodes.OP_DROP,
-		localDelayedPubkey,
+		...delayBranch,
 		bitcoin.opcodes.OP_ENDIF,
 		bitcoin.opcodes.OP_CHECKSIG
 	]);
@@ -102,6 +122,11 @@ export interface ICommitmentTxParams {
 	revocationPubkey: Buffer;
 	localDelayedPubkey: Buffer;
 	toSelfDelay: number;
+	/**
+	 * Liquidity ads (bLIP-0051): absolute lease-expiry block height. When set, the
+	 * to_local output is CLTV-locked until this height (lessor side only).
+	 */
+	leaseExpiry?: number;
 
 	/** to_remote output (P2WPKH with static_remote_key) */
 	remoteAmount: bigint;
@@ -126,6 +151,19 @@ export interface ICommitmentTxParams {
 	localFundingPubkey?: Buffer;
 	/** Remote funding pubkey (for remote anchor output, required when useAnchors=true) */
 	remoteFundingPubkey?: Buffer;
+
+	/**
+	 * option_taproot: pre-built P2TR scriptPubKey overrides. When present, the
+	 * corresponding output uses this scriptPubKey instead of the witness-v0
+	 * (p2wsh/p2wpkh) construction — only the script bytes change; values, dust
+	 * trimming, BIP 69 ordering and the output map are identical. The taproot
+	 * leaf scripts are built by the caller (commitment-builder) which has the key
+	 * context. Absent ⇒ legacy behaviour (non-taproot channels stay byte-identical).
+	 */
+	taprootToLocalScript?: Buffer;
+	taprootToRemoteScript?: Buffer;
+	taprootAnchorLocalScript?: Buffer;
+	taprootAnchorRemoteScript?: Buffer;
 }
 
 export interface IHtlcOutput {
@@ -133,6 +171,8 @@ export interface IHtlcOutput {
 	amount: bigint; // Amount in satoshis
 	cltvExpiry: number; // CLTV expiry (for sorting)
 	paymentHash: Buffer; // Payment hash (for sorting)
+	/** option_taproot: pre-built P2TR scriptPubKey override for this HTLC. */
+	taprootScript?: Buffer;
 }
 
 export interface ICommitmentTxResult {
@@ -165,6 +205,7 @@ export function buildCommitmentTx(
 		revocationPubkey,
 		localDelayedPubkey,
 		toSelfDelay,
+		leaseExpiry,
 		remoteAmount,
 		remotePaymentPubkey,
 		htlcOutputs,
@@ -213,23 +254,41 @@ export function buildCommitmentTx(
 	// to_local output (if above dust)
 	let toLocalScript: Buffer | undefined;
 	if (localAmount >= dustWsh) {
-		toLocalScript = buildToLocalScript(
-			revocationPubkey,
-			localDelayedPubkey,
-			toSelfDelay
-		);
-		const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } });
+		let spk: Buffer;
+		if (params.taprootToLocalScript) {
+			spk = params.taprootToLocalScript;
+		} else {
+			toLocalScript = buildToLocalScript(
+				revocationPubkey,
+				localDelayedPubkey,
+				toSelfDelay,
+				leaseExpiry
+			);
+			spk = bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } })
+				.output!;
+		}
 		outputs.push({
-			script: p2wsh.output!,
+			script: spk,
 			value: localAmount,
-			sortKey: p2wsh.output!,
+			sortKey: spk,
 			type: 'to_local'
 		});
 	}
 
 	// to_remote output
 	let toRemoteScript: Buffer | undefined;
-	if (useAnchors) {
+	if (params.taprootToRemoteScript) {
+		// option_taproot: to_remote is a P2TR (1-block-CSV leaf). Same dust limit.
+		if (remoteAmount >= dustWsh) {
+			const spk = params.taprootToRemoteScript;
+			outputs.push({
+				script: spk,
+				value: remoteAmount,
+				sortKey: spk,
+				type: 'to_remote'
+			});
+		}
+	} else if (useAnchors) {
 		// Anchor mode: to_remote is P2WSH with 1-block CSV delay
 		if (remoteAmount >= dustWsh) {
 			const { script, witnessScript } =
@@ -260,13 +319,13 @@ export function buildCommitmentTx(
 		for (let i = 0; i < htlcOutputs.length; i++) {
 			const htlc = htlcOutputs[i];
 			if (htlc.amount >= dustWsh) {
-				const p2wsh = bitcoin.payments.p2wsh({
-					redeem: { output: htlc.script }
-				});
+				const spk =
+					htlc.taprootScript ??
+					bitcoin.payments.p2wsh({ redeem: { output: htlc.script } }).output!;
 				outputs.push({
-					script: p2wsh.output!,
+					script: spk,
 					value: htlc.amount,
-					sortKey: p2wsh.output!,
+					sortKey: spk,
 					type: 'htlc',
 					htlcIndex: i
 				});
@@ -283,21 +342,25 @@ export function buildCommitmentTx(
 		const hasToRemote = outputs.some((o) => o.type === 'to_remote');
 
 		if (hasToLocal || hasUntrimmedHtlcs) {
-			const localAnchor = buildAnchorOutput(localFundingPubkey);
+			const spk =
+				params.taprootAnchorLocalScript ??
+				buildAnchorOutput(localFundingPubkey).script;
 			outputs.push({
-				script: localAnchor.script,
+				script: spk,
 				value: ANCHOR_OUTPUT_VALUE,
-				sortKey: localAnchor.script,
+				sortKey: spk,
 				type: 'anchor_local'
 			});
 		}
 
 		if (hasToRemote || hasUntrimmedHtlcs) {
-			const remoteAnchor = buildAnchorOutput(remoteFundingPubkey);
+			const spk =
+				params.taprootAnchorRemoteScript ??
+				buildAnchorOutput(remoteFundingPubkey).script;
 			outputs.push({
-				script: remoteAnchor.script,
+				script: spk,
 				value: ANCHOR_OUTPUT_VALUE,
-				sortKey: remoteAnchor.script,
+				sortKey: spk,
 				type: 'anchor_remote'
 			});
 		}

@@ -24,7 +24,8 @@ import {
 	classifyOutputs,
 	resolveOurCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs,
-	resolveRevokedCommitmentOutputs
+	resolveRevokedCommitmentOutputs,
+	resolveSecondLevelHtlcOutput
 } from './output-resolver';
 import { estimateSweepVbytes } from './sweep';
 import { IChannelState } from '../channel/channel-state';
@@ -238,6 +239,20 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * True once the force-close commitment tx has CONFIRMED on-chain (blockHeight > 0).
+	 * While it is only mempool-detected the commitment is still unconfirmed and its
+	 * CPFP package can be pinned by a fee spike — so re-CPFP must keep running. Note
+	 * COMMITMENT_DETECTED alone does NOT imply confirmation (a mempool-first sighting
+	 * leaves blockHeight 0 until _adoptLateConfirmation records the real height).
+	 */
+	isCommitmentConfirmed(): boolean {
+		return (
+			this._commitmentBroadcast !== null &&
+			this._commitmentBroadcast.blockHeight > 0
+		);
+	}
+
+	/**
 	 * Update the fee rate used for sweep transactions.
 	 * @param feeRatePerKw Fee rate in sat/kw — converted to sat/vbyte internally.
 	 */
@@ -414,17 +429,61 @@ export class ChainMonitor {
 
 		// Re-broadcast unconfirmed sweeps stuck in SPEND_BROADCAST
 		for (const output of this._trackedOutputs) {
-			// Second-level HTLC transactions (HTLC-timeout / HTLC-success) are
-			// pre-signed by the counterparty at the channel's committed feerate.
-			// Their fee cannot be changed without invalidating that signature, so
-			// they must NOT be RBF-rebuilt. They are fee-bumped via CPFP on their
-			// own (CSV-delayed) output sweep instead — or, for anchors, by attaching
-			// a wallet input (see resolveOurCommitmentOutputs / fee attachment).
+			// HTLC output handling splits by WHOSE commitment confirmed:
+			//
+			// OUR commitment — HTLC resolution uses pre-signed second-level txs
+			// (HTLC-timeout / HTLC-success). On NON-anchor channels the fee is baked
+			// into the counterparty's signature and cannot be changed, so they must NOT
+			// be RBF-rebuilt (they are CPFP-bumped via their own CSV-delayed output
+			// sweep). On ANCHOR channels they are zero-fee (SIGHASH_SINGLE|ANYONECANPAY),
+			// so the wallet fee attached at broadcast CAN be replaced with a larger one;
+			// re-issue the fee-attach when stuck (M1). Either way, never fall through to
+			// the generic REBUILD_SWEEP below.
+			//
+			// THEIR commitment (current or revoked) — our HTLC claim (preimage/timeout/
+			// penalty) is a SINGLE tx we fully sign, so it can be freely RBF'd. Fall
+			// through to the generic REBUILD_SWEEP path so a fee spike after broadcast
+			// can't strand it and let the peer win the HTLC-timeout race (H2). The
+			// blanket `continue` here previously pinned these claims at their initial
+			// feerate forever.
 			if (
 				output.outputType === OutputType.OFFERED_HTLC ||
 				output.outputType === OutputType.RECEIVED_HTLC
 			) {
-				continue;
+				const ourCommitment =
+					this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.OUR_COMMITMENT;
+				if (ourCommitment) {
+					const ourAnchorHtlc = isAnchorChannel(this._channelState.channelType);
+					if (
+						ourAnchorHtlc &&
+						output.status === OutputStatus.SPEND_BROADCAST &&
+						output.broadcastHeight !== undefined &&
+						output.sweepTxHex !== undefined &&
+						blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
+					) {
+						const originalRate =
+							output.originalFeeRate || this._feeRatePerVbyte;
+						const currentRate = output.currentFeeRate || originalRate;
+						const bumpedRate = Math.min(
+							Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
+							originalRate * MAX_FEE_BUMP_MULTIPLIER
+						);
+						// _broadcastSweepAction reads output.currentFeeRate for the anchor
+						// HTLC fee-attach target, so set it before re-issuing the broadcast.
+						output.currentFeeRate = bumpedRate;
+						output.broadcastHeight = blockHeight;
+						actions.push(
+							this._broadcastSweepAction(
+								output,
+								Buffer.from(output.sweepTxHex, 'hex'),
+								`${output.outputType.toLowerCase()} re-fee-bump (stuck HTLC race)`
+							)
+						);
+					}
+					continue;
+				}
+				// THEIR commitment: fall through to generic RBF/REBUILD_SWEEP.
 			}
 			if (
 				output.status === OutputStatus.SPEND_BROADCAST &&
@@ -495,6 +554,16 @@ export class ChainMonitor {
 			return [];
 		}
 
+		// Idempotent: the watch is retained after a spend (so a reorg can be detected),
+		// which re-fires the subscription. If we already recorded THIS exact spend,
+		// don't reprocess it (avoids duplicate second-level tracking / preimage scans).
+		if (
+			output.status === OutputStatus.SPEND_CONFIRMED &&
+			output.resolutionTxid === spendingTx.getId()
+		) {
+			return [];
+		}
+
 		output.status = OutputStatus.SPEND_CONFIRMED;
 		output.resolutionTxid = spendingTx.getId();
 		output.confirmationHeight = blockHeight;
@@ -503,6 +572,58 @@ export class ChainMonitor {
 		// one matched output. A single counterparty tx can claim several HTLC
 		// outputs at once, and we want every preimage we can learn.
 		actions.push(...this._scanForPreimages(spendingTx));
+
+		// M2: if WE swept one of our own HTLC outputs with a second-level
+		// HTLC-timeout/success tx (its txid == the spend we just saw), that tx
+		// created a fresh CSV-delayed to_local output. Track it and schedule its
+		// sweep to our destination — otherwise the value sits unspent forever even
+		// though the channel reports fully resolved.
+		if (
+			(output.outputType === OutputType.OFFERED_HTLC ||
+				output.outputType === OutputType.RECEIVED_HTLC) &&
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.OUR_COMMITMENT &&
+			output.sweepTxHex
+		) {
+			let ourSecondLevelTxid: string | null = null;
+			try {
+				ourSecondLevelTxid = bitcoin.Transaction.fromHex(
+					output.sweepTxHex
+				).getId();
+			} catch {
+				ourSecondLevelTxid = null;
+			}
+			if (ourSecondLevelTxid === spendingTx.getId()) {
+				const already = this._trackedOutputs.some(
+					(o) => o.txid === ourSecondLevelTxid && o.outputIndex === 0
+				);
+				if (!already) {
+					const r = resolveSecondLevelHtlcOutput(
+						this._channelState,
+						spendingTx,
+						blockHeight,
+						this._commitmentBroadcast.commitmentNumber,
+						this._destinationScript,
+						this._feeRatePerVbyte,
+						this._delayedPaymentBasepointSecret,
+						this._network
+					);
+					if (r) {
+						this._trackedOutputs.push(r.trackedOutput);
+						actions.push({
+							type: ChainActionType.WATCH_OUTPUT,
+							txid: r.trackedOutput.txid,
+							outputIndex: r.trackedOutput.outputIndex
+						});
+						this._scheduleSweep(
+							actions,
+							r,
+							'second-level HTLC sweep (CSV delayed)'
+						);
+					}
+				}
+			}
+		}
 
 		return actions;
 	}
@@ -559,37 +680,49 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * Called when a block is disconnected (reorg).
-	 * Resets output states to avoid double-broadcasting.
+	 * Reorg recovery: a spend of this output that we previously saw confirmed (our
+	 * own penalty / HTLC-success / to_local sweep, or a counterparty spend we were
+	 * racing) has been evicted from the active chain by a reorg. Re-arm the output
+	 * and re-broadcast our own sweep, so a breach stays punished and an HTLC we hold
+	 * the preimage for stays claimed. Without this, a reorg that drops our penalty tx
+	 * lets the cheater sweep the revoked output once their to_self_delay matures on
+	 * the new chain — permanent loss of the breached balance.
 	 */
-	handleBlockDisconnected(blockHeight: number): ChainAction[] {
-		if (this._state === MonitorState.FULLY_RESOLVED) {
-			// Can't un-resolve
+	handleSpendUnconfirmed(txid: string, outputIndex: number): ChainAction[] {
+		const output = this._trackedOutputs.find(
+			(o) => o.txid === txid && o.outputIndex === outputIndex
+		);
+		if (!output) return [];
+		if (
+			output.status !== OutputStatus.SPEND_CONFIRMED &&
+			output.status !== OutputStatus.IRREVOCABLY_RESOLVED &&
+			output.status !== OutputStatus.SPEND_BROADCAST
+		) {
 			return [];
 		}
 
-		// Reset any outputs that were confirmed at or after the disconnected height
-		for (const output of this._trackedOutputs) {
-			if (output.confirmationHeight >= blockHeight) {
-				if (output.status === OutputStatus.SPEND_CONFIRMED) {
-					output.status = OutputStatus.CONFIRMED;
-					output.resolutionTxid = undefined;
-				} else if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
-					output.status = OutputStatus.SPEND_CONFIRMED;
-				}
-			}
+		// The recorded spend is gone; forget it.
+		output.resolutionTxid = undefined;
+		// If the monitor had declared the channel fully resolved on the strength of
+		// this spend, resume resolving so handleNewBlock keeps working the output.
+		if (this._state === MonitorState.FULLY_RESOLVED) {
+			this._state = MonitorState.RESOLVING;
 		}
 
-		// If the commitment itself was in the disconnected block, reset to WATCHING
-		if (
-			this._commitmentBroadcast &&
-			this._commitmentBroadcast.blockHeight >= blockHeight
-		) {
-			this._state = MonitorState.WATCHING;
-			this._trackedOutputs = [];
-			this._commitmentBroadcast = null;
+		// Re-broadcast our own sweep if we have one; otherwise just re-arm the watch
+		// (a counterparty spend was reorged out and we had no competing sweep).
+		if (output.sweepTxHex) {
+			output.status = OutputStatus.SPEND_BROADCAST;
+			output.broadcastHeight = this._currentBlockHeight;
+			return [
+				this._broadcastSweepAction(
+					output,
+					Buffer.from(output.sweepTxHex, 'hex'),
+					`${output.outputType.toLowerCase()} re-broadcast (reorg recovery)`
+				)
+			];
 		}
-
+		output.status = OutputStatus.CONFIRMED;
 		return [];
 	}
 
@@ -604,58 +737,91 @@ export class ChainMonitor {
 
 		// Check if any tracked HTLC can now be resolved
 		if (
-			this._state === MonitorState.RESOLVING ||
-			this._state === MonitorState.COMMITMENT_DETECTED
+			this._state !== MonitorState.RESOLVING &&
+			this._state !== MonitorState.COMMITMENT_DETECTED
 		) {
-			// Re-resolve with new preimage information
-			const commitmentType = this._commitmentBroadcast?.commitmentType;
-			if (commitmentType === CommitmentType.OUR_COMMITMENT) {
-				const htlcOutputs = this._trackedOutputs.filter(
-					(o) =>
-						o.outputType === OutputType.RECEIVED_HTLC &&
-						o.status !== OutputStatus.IRREVOCABLY_RESOLVED &&
-						o.status !== OutputStatus.SPEND_CONFIRMED
-				);
-				const resolved = resolveOurCommitmentOutputs(
-					this._channelState,
-					htlcOutputs,
-					this._commitmentBroadcast!.commitmentNumber,
-					this._destinationScript,
-					this._feeRatePerVbyte,
-					this._knownPreimages,
-					this._delayedPaymentBasepointSecret,
-					// HTLC-success on our own commitment is a second-level tx that
-					// needs OUR htlc signature plus the peer's pre-supplied htlc
-					// signature. Without these the witness cannot be built — pass
-					// them so the broadcast below is actually spendable.
-					this._htlcBasepointSecret,
-					this._channelState.remoteHtlcSignatures
-				);
+			return actions;
+		}
 
-				for (const r of resolved) {
-					// Only broadcast a fully-witnessed spend. If the witness is
-					// missing (e.g. the peer's htlc signature was never persisted),
-					// broadcasting an unsigned HTLC-success tx would be rejected by
-					// the network and waste the preimage; leave the output tracked
-					// so it can be retried once the signature is available.
-					if (r.spendTx && r.witness) {
-						r.spendTx.setWitness(0, r.witness);
-						const txBuf = r.spendTx.toBuffer();
-						actions.push(
-							this._broadcastSweepAction(
-								r.trackedOutput,
-								txBuf,
-								'HTLC-success (preimage learned)'
-							)
-						);
-						r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
-						r.trackedOutput.broadcastHeight = this._currentBlockHeight;
-						r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
-						r.trackedOutput.sweepTxHex = txBuf.toString('hex');
-					}
+		// Only inbound (received) HTLCs that are still unresolved become claimable
+		// with a newly-learned preimage.
+		const htlcOutputs = this._trackedOutputs.filter(
+			(o) =>
+				o.outputType === OutputType.RECEIVED_HTLC &&
+				o.status !== OutputStatus.IRREVOCABLY_RESOLVED &&
+				o.status !== OutputStatus.SPEND_CONFIRMED &&
+				o.status !== OutputStatus.SPEND_BROADCAST
+		);
+		if (htlcOutputs.length === 0) return actions;
+
+		const commitmentType = this._commitmentBroadcast?.commitmentType;
+		if (commitmentType === CommitmentType.OUR_COMMITMENT) {
+			const resolved = resolveOurCommitmentOutputs(
+				this._channelState,
+				htlcOutputs,
+				this._commitmentBroadcast!.commitmentNumber,
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._knownPreimages,
+				this._delayedPaymentBasepointSecret,
+				// HTLC-success on our own commitment is a second-level tx that
+				// needs OUR htlc signature plus the peer's pre-supplied htlc
+				// signature. Without these the witness cannot be built — pass
+				// them so the broadcast below is actually spendable.
+				this._htlcBasepointSecret,
+				this._channelState.remoteHtlcSignatures
+			);
+
+			for (const r of resolved) {
+				// Only broadcast a fully-witnessed spend. If the witness is
+				// missing (e.g. the peer's htlc signature was never persisted),
+				// broadcasting an unsigned HTLC-success tx would be rejected by
+				// the network and waste the preimage; leave the output tracked
+				// so it can be retried once the signature is available.
+				if (r.spendTx && r.witness) {
+					r.spendTx.setWitness(0, r.witness);
+					const txBuf = r.spendTx.toBuffer();
+					actions.push(
+						this._broadcastSweepAction(
+							r.trackedOutput,
+							txBuf,
+							'HTLC-success (preimage learned)'
+						)
+					);
+					r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
+					r.trackedOutput.broadcastHeight = this._currentBlockHeight;
+					r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
+					r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+				}
+			}
+		} else if (commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT) {
+			// C2 fund-safety: the peer force-closed with THEIR current commitment
+			// before we knew the preimage, so our received HTLC was tracked with no
+			// spend (output-resolver leaves it unswept). Now that the preimage has
+			// arrived (e.g. learned on-chain or from the downstream leg we already
+			// paid), build and broadcast the direct received-HTLC preimage claim —
+			// otherwise the peer reclaims it via HTLC-timeout after cltv_expiry and we
+			// lose the full forwarded amount. Symmetric to the OUR_COMMITMENT branch.
+			const resolved = resolveTheirCurrentCommitmentOutputs(
+				this._channelState,
+				htlcOutputs,
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._knownPreimages,
+				this._paymentPrivkey,
+				this._htlcBasepointSecret,
+				this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+			);
+			for (const r of resolved) {
+				// _scheduleSweep sets the witness, computes maturity, broadcasts (or
+				// holds), and marks the output SPEND_BROADCAST.
+				if (r.spendTx) {
+					this._scheduleSweep(actions, r, 'HTLC claim (preimage learned)');
 				}
 			}
 		}
+		// THEIR_REVOKED_COMMITMENT needs no preimage — a received HTLC on a revoked
+		// commitment is swept via the revocation key at broadcast time, not by preimage.
 
 		return actions;
 	}

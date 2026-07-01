@@ -123,6 +123,13 @@ export interface INodeConfig {
 	socks5Proxy?: { host: string; port: number };
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
 	preferAnchors?: boolean;
+	/**
+	 * EXPERIMENTAL — propose simple taproot channels (option_taproot). Negotiates
+	 * the channel type + MuSig2 nonces on open/accept, but the commitment-round
+	 * signing (nonce rotation) is not yet wired into the live state machine, so
+	 * funding cannot complete. Off by default.
+	 */
+	preferTaproot?: boolean;
 	/** Fee estimator for dynamic fee rates */
 	feeEstimator?: IFeeEstimator;
 	/** Maximum payment retries (default 3) */
@@ -200,6 +207,35 @@ export interface ICreateInvoiceOptions {
 	descriptionHash?: Buffer;
 	expiry?: number;
 	minFinalCltvExpiry?: number;
+	/**
+	 * Emit receiver route-blinding blinded paths instead of cleartext routing
+	 * hints (BOLT 4 / BOLT 11). Each usable channel becomes a 2-hop blinded path
+	 * [peer → us] so payers learn the introduction node (our peer) but not our
+	 * node id. NOTE: beignet's encrypted hop data is not yet BOLT 4 TLV, so the
+	 * introduction peer must also be a beignet node — interop with LND/CLN as the
+	 * introduction node is a follow-up. Falls back to cleartext hints when no
+	 * blinded path can be built.
+	 */
+	useBlindedPaths?: boolean;
+	/**
+	 * Hold invoice: park matching HTLCs instead of settling immediately. The
+	 * payment is held until settleHeldHtlc() (reveals the preimage) or
+	 * cancelHeldHtlc() (fails it). Underpins async receive and escrow-style flows.
+	 */
+	hold?: boolean;
+	/**
+	 * Optional externally-supplied 32-byte payment hash for a hold invoice whose
+	 * preimage is held elsewhere (the node never learns it until settle time).
+	 * Only honoured together with `hold`. When omitted, the node generates the
+	 * preimage/hash itself and can settle without an external preimage.
+	 */
+	paymentHash?: Buffer;
+	/**
+	 * Async receive: mark the introduction (LSP) hop of the blinded path with
+	 * hold_htlc, so the always-online LSP parks the inbound HTLC until this
+	 * (offline) node comes back and releases it. Requires `useBlindedPaths`.
+	 */
+	asyncHold?: boolean;
 }
 
 export interface IChannelInfo {

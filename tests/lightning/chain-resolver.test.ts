@@ -45,6 +45,7 @@ import {
 	resolveOurCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs,
 	resolveRevokedCommitmentOutputs,
+	resolveSecondLevelHtlcOutput,
 	extractPreimageFromWitness
 } from '../../src/lightning/chain/output-resolver';
 import {
@@ -389,6 +390,55 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(result.commitmentNumber).to.equal(0n);
 		});
 
+		it('classifies a revoked commitment whose index equals localCommitmentNumber as a breach, not ours (C1)', function () {
+			// C1 fund-safety regression: mid-round where WE are the initiator, our
+			// localCommitmentNumber lags remoteCommitmentNumber by one, so the peer's
+			// REVOKED commitment shares the index of our current local commitment. It
+			// must be classified THEIR_REVOKED (→ penalty), never OUR_COMMITMENT.
+			const { opener, acceptor } = setupNormalChannels();
+
+			// Capture the peer's per-commitment point #0 and build their commitment #0
+			// BEFORE the half-round (balances are unchanged, only the index/keys matter).
+			const preState = opener.getFullState();
+			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
+			const peerRevokedTx = buildRemoteCommitment(preState, peerPoint0, 0n)
+				.result.tx;
+
+			// Half a commitment round: opener signs (remoteCommitmentNumber 0→1) and
+			// consumes the peer's revoke_and_ack (stores secret #0), but never receives
+			// the peer's commitment_signed, so localCommitmentNumber stays 0.
+			const sig = crypto.randomBytes(64);
+			const commitActions = opener.signCommitment(sig, []);
+			const commitMsg = findSendAction(
+				commitActions,
+				MessageType.COMMITMENT_SIGNED
+			);
+			const raaActions = acceptor.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(commitMsg.payload)
+			);
+			const raaMsg = findSendAction(raaActions, MessageType.REVOKE_AND_ACK);
+			opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg.payload));
+
+			const c1State = opener.getFullState();
+			// Precondition: the exact ambiguous configuration.
+			expect(c1State.localCommitmentNumber).to.equal(0n);
+			expect(c1State.remoteCommitmentNumber).to.equal(1n);
+			expect(c1State.shaChainStore.getSecret(MAX_INDEX - 0n)).to.not.be.null;
+
+			// The peer's revoked commitment #0 must be recognized as a breach.
+			const breach = classifyCommitmentTx(peerRevokedTx, c1State);
+			expect(breach.type).to.equal(CommitmentType.THEIR_REVOKED_COMMITMENT);
+			expect(breach.commitmentNumber).to.equal(0n);
+
+			// Sanity: OUR OWN commitment #0 broadcast in the same state is still ours.
+			const ourPoint0 = perCommitmentPointFromSecret(
+				generateFromSeed(c1State.localPerCommitmentSeed, MAX_INDEX - 0n)
+			);
+			const ourTx = buildLocalCommitment(c1State, ourPoint0, 0n).result.tx;
+			const ours = classifyCommitmentTx(ourTx, c1State);
+			expect(ours.type).to.equal(CommitmentType.OUR_COMMITMENT);
+		});
+
 		it('should return UNKNOWN for unrecognized commitment', function () {
 			const { opener } = setupNormalChannels();
 			const state = opener.getFullState();
@@ -501,6 +551,132 @@ describe('Output Resolver (Phase 4B)', function () {
 			);
 			expect(htlcOutputs.length).to.be.greaterThan(0);
 			expect(htlcOutputs[0].paymentHash).to.deep.equal(paymentHash);
+		});
+	});
+
+	describe('leased channel classification (bLIP-0051)', function () {
+		// Regression: the lessor's to_local carries a lease CLTV lock on the
+		// build side (commitment-builder), so the classify/disambiguate script
+		// reconstruction must include it too or the output is never matched:
+		// force-close classification returns UNKNOWN (or silently drops the
+		// to_local) and the leased balance is never swept.
+		const LEASE_EXPIRY = 800_000;
+
+		it('classifies our leased (lessor) commitment and tracks the locked to_local', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = true;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const perCommitmentPoint =
+				perCommitmentPointFromSecret(perCommitmentSecret);
+			const built = buildLocalCommitment(state, perCommitmentPoint);
+
+			// Shared index (local == remote == 0) forces script disambiguation.
+			const result = classifyCommitmentTx(built.result.tx, state);
+			expect(result.type).to.equal(CommitmentType.OUR_COMMITMENT);
+
+			const outputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.OUR_COMMITMENT,
+				state.localCommitmentNumber
+			);
+			const toLocal = outputs.find((o) => o.outputType === OutputType.TO_LOCAL);
+			expect(toLocal).to.exist;
+			expect(toLocal!.witnessScript).to.not.be.undefined;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+			// The stored witnessScript must hash to the actual on-chain output.
+			const p2wsh = bitcoin.payments.p2wsh({
+				redeem: { output: toLocal!.witnessScript! }
+			});
+			expect(
+				Buffer.from(built.result.tx.outs[toLocal!.outputIndex].script)
+			).to.deep.equal(p2wsh.output);
+		});
+
+		it('classifies the lessor peer commitment and tracks their locked to_local', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = false;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const remotePerCommitmentPoint = state.remoteCurrentPerCommitmentPoint!;
+			const built = buildRemoteCommitment(state, remotePerCommitmentPoint);
+
+			const result = classifyCommitmentTx(built.result.tx, state);
+			expect(result.type).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+
+			const outputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				state.remoteCommitmentNumber
+			);
+			const toLocal = outputs.find((o) => o.outputType === OutputType.TO_LOCAL);
+			expect(toLocal).to.exist;
+			expect(toLocal!.witnessScript).to.not.be.undefined;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+		});
+
+		it('penalizes the locked to_local of a revoked leased peer commitment', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			preState.isLessor = false;
+			preState.leaseExpiry = LEASE_EXPIRY;
+
+			// Peer (lessor) commitment #0, built before it is revoked below.
+			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
+			const peerRevokedTx = buildRemoteCommitment(preState, peerPoint0, 0n)
+				.result.tx;
+
+			exchangeCommitments(opener, acceptor);
+			const state = opener.getFullState();
+			expect(state.shaChainStore.getSecret(MAX_INDEX - 0n)).to.not.be.null;
+
+			const breach = classifyCommitmentTx(peerRevokedTx, state);
+			expect(breach.type).to.equal(CommitmentType.THEIR_REVOKED_COMMITMENT);
+
+			const trackedOutputs = classifyOutputs(
+				peerRevokedTx,
+				state,
+				CommitmentType.THEIR_REVOKED_COMMITMENT,
+				0n
+			);
+			const toLocal = trackedOutputs.find(
+				(o) => o.outputType === OutputType.TO_LOCAL
+			);
+			expect(toLocal).to.exist;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const resolved = resolveRevokedCommitmentOutputs(
+				state,
+				trackedOutputs,
+				0n,
+				peerRevokedTx,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[0],
+				network
+			);
+			const penalty = resolved.find(
+				(r) => r.trackedOutput.outputType === OutputType.TO_LOCAL
+			);
+			expect(penalty).to.exist;
+			expect(penalty!.spendTx).to.exist;
+			expect(penalty!.witness).to.exist;
 		});
 	});
 
@@ -852,6 +1028,100 @@ describe('Output Resolver (Phase 4B)', function () {
 			);
 			expect(htlcPenalty, 'revoked HTLC output must be penalized').to.exist;
 			expect(htlcPenalty!.witness).to.exist;
+		});
+	});
+
+	describe('resolveSecondLevelHtlcOutput (M2)', function () {
+		it('builds a CSV sweep of our second-level HTLC output to the destination', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const commitmentNumber = 0n;
+
+			const {
+				deriveRevocationPubkey,
+				derivePublicKey
+			} = require('../../src/lightning/keys/derivation');
+
+			const point = perCommitmentPointFromSecret(
+				generateFromSeed(
+					state.localPerCommitmentSeed,
+					MAX_INDEX - commitmentNumber
+				)
+			);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.remoteBasepoints!.revocationBasepoint,
+				point
+			);
+			const delayedPubkey = derivePublicKey(
+				state.localBasepoints.delayedPaymentBasepoint,
+				point
+			);
+			const toSelfDelay = state.remoteConfig.toSelfDelay;
+			// A stand-in for our broadcast HTLC-timeout/success tx: out[0] is the
+			// to_local-format second-level output.
+			const script = buildToLocalScript(
+				revocationPubkey,
+				delayedPubkey,
+				toSelfDelay
+			);
+			const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
+			const htlcTx = new bitcoin.Transaction();
+			htlcTx.version = 2;
+			htlcTx.addInput(crypto.randomBytes(32), 0);
+			htlcTx.addOutput(p2wsh.output!, 90_000);
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const r = resolveSecondLevelHtlcOutput(
+				state,
+				htlcTx,
+				150,
+				commitmentNumber,
+				dest,
+				10,
+				openerPrivkeys[3], // delayed payment basepoint secret
+				network
+			);
+
+			expect(r, 'a second-level sweep is produced').to.not.be.null;
+			expect(r!.trackedOutput.outputType).to.equal(OutputType.TO_LOCAL);
+			expect(r!.trackedOutput.txid).to.equal(htlcTx.getId());
+			expect(r!.trackedOutput.outputIndex).to.equal(0);
+			expect(r!.trackedOutput.confirmationHeight).to.equal(150);
+			expect(r!.csvDelay).to.equal(toSelfDelay);
+			expect(r!.witness, 'signed to_local delayed witness').to.exist;
+			// The sweep spends htlcTx:0 (with the CSV sequence) and pays our destination.
+			expect(
+				Buffer.from(r!.spendTx!.ins[0].hash).reverse().toString('hex')
+			).to.equal(htlcTx.getId());
+			expect(r!.spendTx!.ins[0].sequence).to.equal(toSelfDelay);
+			expect(r!.spendTx!.outs[0].script.equals(dest)).to.be.true;
+		});
+
+		it('returns null when out[0] is not our second-level to_local output', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const htlcTx = new bitcoin.Transaction();
+			htlcTx.version = 2;
+			htlcTx.addInput(crypto.randomBytes(32), 0);
+			// A random P2WPKH — not our reconstructed to_local script.
+			htlcTx.addOutput(
+				Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+				90_000
+			);
+			const r = resolveSecondLevelHtlcOutput(
+				state,
+				htlcTx,
+				150,
+				0n,
+				Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+				10,
+				openerPrivkeys[3],
+				network
+			);
+			expect(r).to.be.null;
 		});
 	});
 
