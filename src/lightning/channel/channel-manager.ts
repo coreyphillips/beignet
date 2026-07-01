@@ -50,7 +50,6 @@ import {
 	ChainActionType,
 	CommitmentType,
 	IFeeBumpAndBroadcastChainAction,
-	MonitorState,
 	satPerVbyteToSatPerKw
 } from '../chain/types';
 import {
@@ -1816,9 +1815,15 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
-		const actions = channel.handleClosingSigned(msg, (feeSatoshis: bigint) => {
-			return this.signClosingTx(channel, feeSatoshis);
-		});
+		const actions = channel.handleClosingSigned(
+			msg,
+			(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis),
+			// Gate the CLOSED transition on a valid peer signature over the agreed tx,
+			// so a bad-sig fee-echo cannot close the channel + tear down the funding
+			// watch (which would leave a later revoked broadcast unpunished).
+			(feeSatoshis: bigint, signature: Buffer) =>
+				this.verifyPeerClosingSig(channel, feeSatoshis, signature)
+		);
 
 		// On agreement, verify the peer's closing signature and broadcast the
 		// mutual-close ourselves rather than trusting the peer to do it (BOLT 2).
@@ -1833,16 +1838,53 @@ export class ChannelManager extends EventEmitter {
 			);
 			if (closeTx) {
 				this.emit('broadcast:tx', closeTx);
+				this.processActions(peerPubkey, channel, actions);
 			} else {
+				// Defense in depth: handleClosingSigned already gated CLOSED on a valid
+				// sig, so we should not reach here — but if the close tx can't be built,
+				// do NOT process CHANNEL_CLOSED (keep the channel + funding watch alive).
 				this.emit(
 					'error',
 					msg.channelId,
 					'Coop-close: peer closing signature failed to verify'
 				);
+				this.processActions(
+					peerPubkey,
+					channel,
+					actions.filter((a) => a.type !== ChannelActionType.CHANNEL_CLOSED)
+				);
 			}
+		} else {
+			this.processActions(peerPubkey, channel, actions);
 		}
+	}
 
-		this.processActions(peerPubkey, channel, actions);
+	/**
+	 * Verify a peer's cooperative-close signature over the closing tx built at the
+	 * given fee (same tx we would broadcast). Used to gate the CLOSED transition so a
+	 * bad-sig fee-echo cannot force close + funding-watch teardown.
+	 */
+	private verifyPeerClosingSig(
+		channel: Channel,
+		feeSatoshis: bigint,
+		theirSig: Buffer
+	): boolean {
+		try {
+			const { tx, witnessScript, fundingSatoshis, remoteFundingPubkey } =
+				this.buildClosingTxAndScript(channel, feeSatoshis);
+			const signer =
+				channel.getSigner() ||
+				new ChannelSigner(this.config.localFundingPrivkey);
+			return signer.verifyCommitmentSig(
+				tx,
+				theirSig,
+				remoteFundingPubkey,
+				witnessScript,
+				Number(fundingSatoshis)
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	private buildClosingTxAndScript(
@@ -3019,9 +3061,17 @@ export class ChannelManager extends EventEmitter {
 		this._currentBlockHeight = blockHeight;
 		for (const [channelIdHex, entry] of this._pendingCommitmentCpfp) {
 			const monitor = this.monitors.get(channelIdHex);
-			// No monitor, or the commitment has confirmed (the monitor advanced past
-			// WATCHING when the funding spend was detected on-chain): done, stop CPFP.
-			if (!monitor || monitor.getState() !== MonitorState.WATCHING) {
+			// Stop CPFP only once the monitor is gone, fully resolved, or our commitment
+			// has CONFIRMED. Do NOT stop merely because the funding spend was DETECTED:
+			// the monitor leaves WATCHING the instant our own commitment is seen in the
+			// mempool (chain-watcher feeds unconfirmed spends), which is exactly when a
+			// fee spike can pin the package and re-CPFP is needed. Gating on WATCHING
+			// alone made this re-bump inert.
+			if (
+				!monitor ||
+				monitor.isFullyResolved() ||
+				monitor.isCommitmentConfirmed()
+			) {
 				this._pendingCommitmentCpfp.delete(channelIdHex);
 				continue;
 			}

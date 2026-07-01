@@ -245,6 +245,67 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getState()).to.equal(ChannelState.CLOSED);
 			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
 		});
+
+		it('does NOT close on a fee-echo with an invalid peer signature (C1)', function () {
+			// A peer echoes our proposed fee but sends a garbage closing signature.
+			// Without a signature gate the channel would go CLOSED and the funding
+			// watch would be torn down, leaving a later revoked broadcast unpunished.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const proposeActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const proposePayload = findSendAction(
+				proposeActions,
+				MessageType.CLOSING_SIGNED
+			)!;
+			const proposedFee =
+				decodeClosingSignedMessage(proposePayload).feeSatoshis;
+
+			// verifyClosingFn returns false → peer sig is invalid
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: proposedFee,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => false
+			);
+
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(findErrorAction(actions)).to.include('signature');
+			// Channel stays in negotiation (funding watch intact upstream).
+			expect(opener.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+		});
+
+		it('still closes on a fee-echo with a valid peer signature (C1 control)', function () {
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const proposeActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const proposedFee = decodeClosingSignedMessage(
+				findSendAction(proposeActions, MessageType.CLOSING_SIGNED)!
+			).feeSatoshis;
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: proposedFee,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => true
+			);
+
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
+		});
 	});
 
 	describe('handleClosingSigned — counter-proposal', function () {

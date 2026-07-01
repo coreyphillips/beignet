@@ -126,7 +126,9 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 			sellerId,
 			makeParams({
 				channelType: Buffer.from([0x10]),
-				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
+				// Buyer's accepted ceiling = the seller's advertised rates (H3).
+				maxLeaseRates: RATES
 			})
 		);
 
@@ -146,7 +148,9 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 				fundingSatoshis: 200_000n,
 				fundingFeeratePerkw: 1000,
 				channelType: Buffer.from([0x10]),
-				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
+				// Buyer's accepted ceiling = the seller's advertised rates (H3).
+				maxLeaseRates: RATES
 			})
 		);
 

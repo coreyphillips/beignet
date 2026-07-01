@@ -14,7 +14,7 @@ import {
 } from '../../src/lightning/wallet/wallet-funding-provider';
 import type { ISpliceWalletInput } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
-import { ChainActionType, MonitorState } from '../../src/lightning/chain/types';
+import { ChainActionType } from '../../src/lightning/chain/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 
@@ -527,7 +527,9 @@ describe('anchor fee bumping', () => {
 		// M1: the initial commitment CPFP is one-shot; a stuck package must be
 		// re-CPFP'd at a higher live feerate each block until it confirms.
 		describe('reCpfpStuckCommitments (commitment package re-bump)', () => {
-			function managerWithPendingCpfp(monitorState: MonitorState): {
+			function managerWithPendingCpfp(
+				opts: { fullyResolved?: boolean; commitmentConfirmed?: boolean } = {}
+			): {
 				cm: ChannelManager;
 				channelIdHex: string;
 				calls: any[];
@@ -550,9 +552,11 @@ describe('anchor fee bumping', () => {
 					broadcastHeight: 100,
 					lastFeeRate: 10
 				});
-				// Stub monitor exposing only getState().
+				// Stub monitor exposing the confirmation-driven guards the re-CPFP loop
+				// now uses (isFullyResolved / isCommitmentConfirmed) instead of getState().
 				(cm as any).monitors.set(channelIdHex, {
-					getState: () => monitorState
+					isFullyResolved: () => opts.fullyResolved === true,
+					isCommitmentConfirmed: () => opts.commitmentConfirmed === true
 				});
 				// Spy on the CPFP re-issue instead of building a real wallet tx.
 				const calls: any[] = [];
@@ -566,10 +570,14 @@ describe('anchor fee bumping', () => {
 				return { cm, channelIdHex, calls };
 			}
 
-			it('re-issues the CPFP at a higher feerate when the commitment is stuck', () => {
-				const { cm, channelIdHex, calls } = managerWithPendingCpfp(
-					MonitorState.WATCHING
-				);
+			it('re-issues the CPFP for a mempool-detected but UNCONFIRMED commitment (H1)', () => {
+				// The real stuck-commitment state: our force-close is in the mempool
+				// (monitor left WATCHING on the unconfirmed sighting) but not yet
+				// confirmed. Gating on WATCHING previously made this inert; now it bumps.
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
+					fullyResolved: false,
+					commitmentConfirmed: false
+				});
 				// 6 blocks after broadcast (100), live feerate 30 > last 10.
 				cm.reCpfpStuckCommitments(106, 30);
 
@@ -583,19 +591,29 @@ describe('anchor fee bumping', () => {
 			});
 
 			it('does not re-issue before the interval, or when the feerate is not higher', () => {
-				const early = managerWithPendingCpfp(MonitorState.WATCHING);
+				const early = managerWithPendingCpfp();
 				early.cm.reCpfpStuckCommitments(103, 30); // only 3 blocks elapsed
 				expect(early.calls.length).to.equal(0);
 
-				const sameFee = managerWithPendingCpfp(MonitorState.WATCHING);
+				const sameFee = managerWithPendingCpfp();
 				sameFee.cm.reCpfpStuckCommitments(110, 10); // interval ok, feerate == last
 				expect(sameFee.calls.length).to.equal(0);
 			});
 
-			it('drops the entry once the commitment confirms (monitor left WATCHING)', () => {
-				const { cm, channelIdHex, calls } = managerWithPendingCpfp(
-					MonitorState.RESOLVING
-				);
+			it('drops the entry once the commitment CONFIRMS (not merely detected)', () => {
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
+					commitmentConfirmed: true
+				});
+				cm.reCpfpStuckCommitments(200, 100);
+				expect(calls.length).to.equal(0);
+				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be
+					.false;
+			});
+
+			it('drops the entry once the monitor is fully resolved', () => {
+				const { cm, channelIdHex, calls } = managerWithPendingCpfp({
+					fullyResolved: true
+				});
 				cm.reCpfpStuckCommitments(200, 100);
 				expect(calls.length).to.equal(0);
 				expect((cm as any)._pendingCommitmentCpfp.has(channelIdHex)).to.be

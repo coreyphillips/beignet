@@ -833,6 +833,57 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(bump(), 'non-anchor HTLC tx must not be RBF-rebuilt').to.be
 				.undefined;
 		});
+
+		it('re-fee-bumps a stuck preimage claim on the PEER commitment (H2)', function () {
+			// The PEER force-closed (their current commitment). Our received-HTLC
+			// preimage claim is a SINGLE wallet-signed tx we fully control, so it can
+			// be freely RBF'd. Previously the blanket `continue` for HTLC outputs
+			// pinned it at the initial feerate and a fee spike let the peer win the
+			// HTLC-timeout race. It must now go through the generic REBUILD_SWEEP.
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				5,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+
+			(monitor as any)._state = MonitorState.RESOLVING;
+			(monitor as any)._commitmentBroadcast = {
+				commitmentType: CommitmentType.THEIR_CURRENT_COMMITMENT,
+				commitmentNumber: 0n
+			};
+			(monitor as any)._trackedOutputs = [
+				{
+					txid: 'aa'.repeat(32),
+					outputIndex: 0,
+					amount: 100_000n,
+					outputType: OutputType.RECEIVED_HTLC,
+					status: OutputStatus.SPEND_BROADCAST,
+					confirmationHeight: 100,
+					broadcastHeight: 100,
+					originalFeeRate: 5,
+					currentFeeRate: 5,
+					sweepTxHex: '0200000000010000000000'
+				}
+			];
+
+			const actions = monitor.handleNewBlock(106);
+			const rebuild: any = actions.find(
+				(a: any) => a.type === ChainActionType.REBUILD_SWEEP
+			);
+			expect(
+				rebuild,
+				'stuck preimage claim on the peer commitment must be re-fee-bumped'
+			).to.exist;
+			expect(rebuild.feeRatePerVbyte).to.be.greaterThan(5);
+		});
 	});
 
 	describe('Reorg recovery (spend evicted)', function () {

@@ -27,6 +27,7 @@ import {
 	MAX_FUNDING_SATOSHIS
 } from './types';
 import { IChannelBasepoints } from '../keys/derivation';
+import { ILeaseRates } from '../gossip/types';
 
 /** Dual-funding session states */
 export enum DualFundingState {
@@ -78,6 +79,15 @@ export interface IDualFundingParams {
 	secondPerCommitmentPoint: Buffer;
 	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request (opener). */
 	requestFunds?: IRequestFunds;
+	/**
+	 * Liquidity ads (bLIP-0051): the MAXIMUM lease rates the buyer will accept, taken
+	 * from the seller's advertised ad the buyer based its request on. Local-only (NOT
+	 * sent on the wire). The seller's will_fund rates are self-signed and otherwise
+	 * unbounded, so without this ceiling an inflated will_fund could drain nearly the
+	 * buyer's whole balance as a lease fee. handleAcceptChannel2 rejects a lease whose
+	 * computed fee exceeds the fee implied by these rates.
+	 */
+	maxLeaseRates?: ILeaseRates;
 	/** Liquidity ads (bLIP-0051): seller's signed will_fund commitment (acceptor). */
 	willFund?: IWillFund;
 }

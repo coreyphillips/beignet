@@ -2686,7 +2686,8 @@ export class Channel {
 	 */
 	handleClosingSigned(
 		msg: IClosingSignedMessage,
-		signClosingFn: (feeSatoshis: bigint) => Buffer
+		signClosingFn: (feeSatoshis: bigint) => Buffer,
+		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
@@ -2706,11 +2707,29 @@ export class Channel {
 			this.initClosingFeeRange(idealFee);
 		}
 
+		// Fund-safety: never transition to CLOSED (which tears down the funding-output
+		// watch upstream) on fee agreement ALONE. A peer can echo our proposed fee with
+		// a garbage signature; if we closed + stopped watching we could not punish a
+		// later revoked/latest commitment broadcast on the still-live funding output.
+		// Verify the peer's closing signature over the agreed tx FIRST; on failure stay
+		// in NEGOTIATING_CLOSING (channel + funding watch intact). The callback is
+		// optional so existing unit callers that only exercise fee logic are unaffected.
+		const peerSigValid = (feeSatoshis: bigint): boolean =>
+			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.signature);
+
 		// If their fee matches our last proposal → agreement reached
 		if (
 			this._state.lastProposedClosingFeeSat !== null &&
 			msg.feeSatoshis === this._state.lastProposedClosingFeeSat
 		) {
+			if (!peerSigValid(msg.feeSatoshis)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Coop-close: peer closing signature failed to verify'
+					}
+				];
+			}
 			this._state.state = ChannelState.CLOSED;
 			return [
 				{
@@ -2725,6 +2744,14 @@ export class Channel {
 			msg.feeSatoshis >= this._state.closingFeeMin! &&
 			msg.feeSatoshis <= this._state.closingFeeMax!
 		) {
+			if (!peerSigValid(msg.feeSatoshis)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Coop-close: peer closing signature failed to verify'
+					}
+				];
+			}
 			const sig = signClosingFn(msg.feeSatoshis);
 			const response: IClosingSignedMessage = {
 				channelId: this._state.channelId!,
@@ -5544,12 +5571,41 @@ export class Channel {
 			}
 			const fundingFeeratePerkw =
 				session.getLocalParams()?.fundingFeeratePerkw ?? 0;
-			const feeMsat =
-				computeLeaseFeeSat(
-					msg.willFund.leaseRates,
-					requestFunds.requestedSats,
-					fundingFeeratePerkw
-				) * 1000n;
+			const leaseFeeSat = computeLeaseFeeSat(
+				msg.willFund.leaseRates,
+				requestFunds.requestedSats,
+				fundingFeeratePerkw
+			);
+			// H3 fund-safety: the seller's will_fund rates are self-signed and otherwise
+			// bounded only by our whole balance, so an inflated leaseFeeBaseSat/
+			// leaseFeeBasis could drain nearly all our funds. Bound the fee by the
+			// maximum the buyer agreed to when it requested (the rates from the seller's
+			// advertised ad, carried locally as maxLeaseRates). Refuse to pay an
+			// unverified lease fee when no ceiling was set.
+			const maxLeaseRates = session.getLocalParams()?.maxLeaseRates;
+			if (!maxLeaseRates) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'No maximum lease rates configured; refusing to pay an unverified lease fee'
+					}
+				];
+			}
+			const maxLeaseFeeSat = computeLeaseFeeSat(
+				maxLeaseRates,
+				requestFunds.requestedSats,
+				fundingFeeratePerkw
+			);
+			if (leaseFeeSat > maxLeaseFeeSat) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Seller lease fee exceeds our accepted maximum'
+					}
+				];
+			}
+			const feeMsat = leaseFeeSat * 1000n;
 			if (feeMsat > this._state.localBalanceMsat) {
 				return [
 					{

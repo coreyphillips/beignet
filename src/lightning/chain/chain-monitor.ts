@@ -239,6 +239,20 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * True once the force-close commitment tx has CONFIRMED on-chain (blockHeight > 0).
+	 * While it is only mempool-detected the commitment is still unconfirmed and its
+	 * CPFP package can be pinned by a fee spike — so re-CPFP must keep running. Note
+	 * COMMITMENT_DETECTED alone does NOT imply confirmation (a mempool-first sighting
+	 * leaves blockHeight 0 until _adoptLateConfirmation records the real height).
+	 */
+	isCommitmentConfirmed(): boolean {
+		return (
+			this._commitmentBroadcast !== null &&
+			this._commitmentBroadcast.blockHeight > 0
+		);
+	}
+
+	/**
 	 * Update the fee rate used for sweep transactions.
 	 * @param feeRatePerKw Fee rate in sat/kw — converted to sat/vbyte internally.
 	 */
@@ -415,50 +429,63 @@ export class ChainMonitor {
 
 		// Re-broadcast unconfirmed sweeps stuck in SPEND_BROADCAST
 		for (const output of this._trackedOutputs) {
-			// Second-level HTLC transactions (HTLC-timeout / HTLC-success) are
-			// pre-signed by the counterparty at the channel's committed feerate.
-			// On NON-anchor channels their fee is baked into that signature and cannot
-			// be changed, so they must NOT be RBF-rebuilt (they are CPFP-bumped via
-			// their own CSV-delayed output sweep instead). On ANCHOR channels, though,
-			// they are zero-fee txs signed SIGHASH_SINGLE|ANYONECANPAY, so the wallet
-			// fee attached at broadcast CAN be replaced with a larger one. Re-issue the
-			// fee-attach at a bumped target when such a tx is stuck — otherwise a fee
-			// spike AFTER broadcast strands our HTLC-success and we lose the HTLC race
-			// while the peer bumps their competing timeout claim (M1).
+			// HTLC output handling splits by WHOSE commitment confirmed:
+			//
+			// OUR commitment — HTLC resolution uses pre-signed second-level txs
+			// (HTLC-timeout / HTLC-success). On NON-anchor channels the fee is baked
+			// into the counterparty's signature and cannot be changed, so they must NOT
+			// be RBF-rebuilt (they are CPFP-bumped via their own CSV-delayed output
+			// sweep). On ANCHOR channels they are zero-fee (SIGHASH_SINGLE|ANYONECANPAY),
+			// so the wallet fee attached at broadcast CAN be replaced with a larger one;
+			// re-issue the fee-attach when stuck (M1). Either way, never fall through to
+			// the generic REBUILD_SWEEP below.
+			//
+			// THEIR commitment (current or revoked) — our HTLC claim (preimage/timeout/
+			// penalty) is a SINGLE tx we fully sign, so it can be freely RBF'd. Fall
+			// through to the generic REBUILD_SWEEP path so a fee spike after broadcast
+			// can't strand it and let the peer win the HTLC-timeout race (H2). The
+			// blanket `continue` here previously pinned these claims at their initial
+			// feerate forever.
 			if (
 				output.outputType === OutputType.OFFERED_HTLC ||
 				output.outputType === OutputType.RECEIVED_HTLC
 			) {
-				const ourAnchorHtlc =
+				const ourCommitment =
 					this._commitmentBroadcast?.commitmentType ===
-						CommitmentType.OUR_COMMITMENT &&
-					isAnchorChannel(this._channelState.channelType);
-				if (
-					ourAnchorHtlc &&
-					output.status === OutputStatus.SPEND_BROADCAST &&
-					output.broadcastHeight !== undefined &&
-					output.sweepTxHex !== undefined &&
-					blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
-				) {
-					const originalRate = output.originalFeeRate || this._feeRatePerVbyte;
-					const currentRate = output.currentFeeRate || originalRate;
-					const bumpedRate = Math.min(
-						Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
-						originalRate * MAX_FEE_BUMP_MULTIPLIER
+					CommitmentType.OUR_COMMITMENT;
+				if (ourCommitment) {
+					const ourAnchorHtlc = isAnchorChannel(
+						this._channelState.channelType
 					);
-					// _broadcastSweepAction reads output.currentFeeRate for the anchor
-					// HTLC fee-attach target, so set it before re-issuing the broadcast.
-					output.currentFeeRate = bumpedRate;
-					output.broadcastHeight = blockHeight;
-					actions.push(
-						this._broadcastSweepAction(
-							output,
-							Buffer.from(output.sweepTxHex, 'hex'),
-							`${output.outputType.toLowerCase()} re-fee-bump (stuck HTLC race)`
-						)
-					);
+					if (
+						ourAnchorHtlc &&
+						output.status === OutputStatus.SPEND_BROADCAST &&
+						output.broadcastHeight !== undefined &&
+						output.sweepTxHex !== undefined &&
+						blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
+					) {
+						const originalRate =
+							output.originalFeeRate || this._feeRatePerVbyte;
+						const currentRate = output.currentFeeRate || originalRate;
+						const bumpedRate = Math.min(
+							Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
+							originalRate * MAX_FEE_BUMP_MULTIPLIER
+						);
+						// _broadcastSweepAction reads output.currentFeeRate for the anchor
+						// HTLC fee-attach target, so set it before re-issuing the broadcast.
+						output.currentFeeRate = bumpedRate;
+						output.broadcastHeight = blockHeight;
+						actions.push(
+							this._broadcastSweepAction(
+								output,
+								Buffer.from(output.sweepTxHex, 'hex'),
+								`${output.outputType.toLowerCase()} re-fee-bump (stuck HTLC race)`
+							)
+						);
+					}
+					continue;
 				}
-				continue;
+				// THEIR commitment: fall through to generic RBF/REBUILD_SWEEP.
 			}
 			if (
 				output.status === OutputStatus.SPEND_BROADCAST &&
