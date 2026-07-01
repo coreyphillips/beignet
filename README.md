@@ -327,36 +327,41 @@ LightningNode              ← High-level API (EventEmitter)
 | BOLT | Specification | Status |
 |------|--------------|--------|
 | 1 | Base Protocol | Peer messaging, init, error, ping/pong, feature negotiation |
-| 2 | Channel Management | Full state machine: open, fund, normal operation, shutdown, close, reestablish |
-| 3 | Transactions | Commitment txs, HTLC scripts, funding scripts, anchor outputs, fee calculation |
-| 4 | Onion Routing | Sphinx encryption, TLV hop payloads, payment_secret, failure codes |
+| 2 | Channel Management | Full state machine: open, fund, normal operation, shutdown, close, reestablish; v2 dual-funded opens (interactive-tx), splicing, quiescence |
+| 3 | Transactions | Commitment txs, HTLC scripts, funding scripts, anchor outputs, fee calculation; simple taproot channels (MuSig2 funding, Schnorr HTLC sigs) |
+| 4 | Onion Routing | Sphinx encryption, TLV hop payloads, payment_secret, failure codes, route blinding, onion messages |
 | 5 | On-Chain | Force-close detection, HTLC sweep, output resolution, chain monitoring, wallet-funded anchor fee bumping (commitment CPFP + zero-fee HTLC fee-attach) |
 | 7 | Gossip | Channel/node announcements, network graph, Dijkstra routing, gossip sync |
 | 8 | Transport | Noise_XK handshake, encrypted transport, key rotation |
-| 9 | Features | DATA_LOSS_PROTECT, STATIC_REMOTE_KEY, PAYMENT_SECRET, TLV_ONION, CHANNEL_TYPE, GOSSIP_QUERIES, ANCHORS_ZERO_FEE_HTLC_TX (default) |
-| 11 | Invoices | Encode, decode, sign, verify, amount formatting |
+| 9 | Features | DATA_LOSS_PROTECT, STATIC_REMOTE_KEY, PAYMENT_SECRET, TLV_ONION, BASIC_MPP, CHANNEL_TYPE, GOSSIP_QUERIES, ANCHORS_ZERO_FEE_HTLC_TX (default), ROUTE_BLINDING, ONION_MESSAGES, QUIESCE, SCID_ALIAS, ZERO_CONF, KEYSEND, OPTION_TAPROOT, OPTION_WILL_FUND |
+| 11 | Invoices | Encode, decode, sign, verify, amount formatting, hold invoices |
+| 12 | Offers | Offer encode/decode, invoice_request/invoice exchange over onion messages, receive-side settlement, async payment offers |
+| bLIP-51 | Liquidity Ads | lease_rates/request_funds/will_fund negotiation, lease fee accounting, CLTV-locked lessor to_local, advisor lease quoting |
 
 ### Module Reference
 
-The Lightning implementation is organized into 14 modules under `src/lightning/`:
+The Lightning implementation is organized into 21 modules under `src/lightning/`:
 
 | Module | Description |
 |--------|-------------|
-| `crypto/` | ChaCha20-Poly1305 AEAD, ECDH, HKDF key derivation |
+| `crypto/` | ChaCha20-Poly1305 AEAD, ECDH, HKDF key derivation, MuSig2 (BIP327) for taproot channels |
 | `message/` | Wire protocol encode/decode for all channel, gossip, and control messages |
 | `features/` | Feature flag bitmap management (BOLT 9) |
 | `transport/` | Noise_XK handshake, encrypted transport cipher, TCP peer connections, PeerManager |
 | `keys/` | HD key derivation, per-commitment secrets (shachain), transaction signing, wallet key derivation |
-| `script/` | Funding (2-of-2 multisig), commitment tx outputs, HTLC scripts, revocation, anchor outputs |
-| `channel/` | Channel state machine, ChannelManager, commitment builder, channel actions, validation |
+| `script/` | Funding (2-of-2 multisig), commitment tx outputs, HTLC scripts, revocation, anchor outputs, taproot commitment/HTLC scripts |
+| `channel/` | Channel state machine, ChannelManager, commitment builder, channel actions, validation, liquidity ads |
 | `chain/` | ChainMonitor, ChainWatcher, output resolver, closing tx, sweep tx, Electrum backend |
 | `invoice/` | BOLT 11 invoice encoding/decoding, bech32 word conversion, signature verification |
 | `gossip/` | NetworkGraph, Dijkstra pathfinding, gossip sync state machine, SCID encoding |
-| `onion/` | Sphinx crypto, onion packet construction/processing, hop payloads, failure handling |
+| `onion/` | Sphinx crypto, onion packet construction/processing, hop payloads, failure handling, blinded paths |
+| `onion-message/` | BOLT 4 onion message construction/processing (carries BOLT 12 and async-payment messages) |
+| `offer/` | BOLT 12 offers: encode/decode, OfferManager invoice_request/invoice flows |
+| `async-payments/` | Hold invoices and AsyncPaymentManager (LSP held-forward, release_held_htlc, wake) |
+| `interactive-tx/` | Interactive transaction construction for v2 dual-funded opens and splicing |
 | `node/` | LightningNode orchestrator — the main entry point for the Lightning API |
 | `wallet/` | WalletFundingProvider — adapts the on-chain Wallet for auto-funded channel opens |
 | `bootstrap/` | DNS seed resolution for discovering initial Lightning peers |
-
 | `advisor/` | Liquidity, fee, and channel suggestion advisors for AI agents |
 | `storage/` | SQLite persistence backend, channel state serialization/deserialization |
 | `validation/` | Input validation utilities shared across modules |
@@ -503,18 +508,19 @@ The `docker/docker-compose.yml` includes:
 
 ## Known Limitations
 
-Beignet is under active development. The following features are **not yet supported**:
+Beignet is under active development. The following features are missing or carry caveats:
 
 | Feature | Status | Impact |
 |---------|--------|--------|
 | **Watchtowers** | Not implemented | If your node goes offline, a counterparty could theoretically broadcast a revoked state. Mitigate with frequent backups and auto-reconnect. |
-| **LSP / LSPS protocols** | Not implemented | No automated inbound liquidity acquisition. You must manually open channels or coordinate with peers. |
+| **LSP / LSPS protocols** | Not implemented | No automated inbound liquidity acquisition via LSPS0/1/2. Liquidity ads (bLIP-51) are supported for negotiated leases; otherwise open channels manually. |
 | **Trampoline routing** | Not implemented | All route computation is local. Cannot delegate pathfinding to a trampoline node. |
-| **BOLT 12 offers (full)** | Partial | Offer decoding and basic support exist, but end-to-end offer payment flow is incomplete. Use BOLT 11 invoices for production. |
-| **Async payments** | Not implemented | Cannot receive payments while offline. Requires an always-on node. |
+| **BOLT 12 offers** | Newer | Offer creation/decoding, invoice_request/invoice over onion messages, and receive-side settlement are implemented, but the surface is newer and less battle-tested than BOLT 11. Prefer BOLT 11 invoices for production. |
+| **Async payments** | Implemented (LSP-dependent) | Hold invoices plus AsyncPaymentManager let an offline receiver be paid, but the receiver's LSP must run the held-forward/wake flow. |
+| **Simple taproot channels** | Experimental | Opens, payments both directions, force-close, and reestablish validated against LND v0.20 on regtest; the feature bit is still in staging upstream. Not recommended for mainnet balances yet. |
+| **Splicing / dual funding** | Partial | Splice-out and splice-in validated live against CLN on mainnet; v2 dual-funded opens implemented. CLN-initiated splices, repeat splices, and multi-UTXO splice-ins are untested. |
 | **Mainnet battle-testing** | Limited | Interop-tested against LND/CLN/Eclair on regtest. Exercise caution with large mainnet balances. |
 | **Mobile background** | Limited | Works on React Native but lacks mobile-specific optimizations (background sync, push notifications). |
-| **Dual funding (interactive-tx)** | Partial | Protocol messages implemented but not production-tested with real peers. |
 
 **Recommended safeguards for production use:**
 - Set `maxPaymentSats` and `dailySpendLimitSats` to cap exposure
