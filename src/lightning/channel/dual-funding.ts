@@ -80,12 +80,15 @@ export interface IDualFundingParams {
 	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request (opener). */
 	requestFunds?: IRequestFunds;
 	/**
-	 * Liquidity ads (bLIP-0051): the MAXIMUM lease rates the buyer will accept, taken
-	 * from the seller's advertised ad the buyer based its request on. Local-only (NOT
-	 * sent on the wire). The seller's will_fund rates are self-signed and otherwise
-	 * unbounded, so without this ceiling an inflated will_fund could drain nearly the
-	 * buyer's whole balance as a lease fee. handleAcceptChannel2 rejects a lease whose
-	 * computed fee exceeds the fee implied by these rates.
+	 * Liquidity ads (bLIP-0051): the MAXIMUM lease rates the buyer will accept.
+	 * This MUST be a buyer-chosen local policy limit (e.g. the rates the buyer
+	 * decided were acceptable before requesting), NOT copied blindly from the
+	 * seller's gossip ad: the seller controls both the ad and will_fund, so a
+	 * seller-derived ceiling would bound nothing. Local-only (NOT sent on the
+	 * wire). The seller's will_fund rates are self-signed and otherwise
+	 * unbounded, so without this ceiling an inflated will_fund could drain
+	 * nearly the buyer's whole balance as a lease fee. handleAcceptChannel2
+	 * rejects a lease whose computed fee exceeds the fee implied by these rates.
 	 */
 	maxLeaseRates?: ILeaseRates;
 	/** Liquidity ads (bLIP-0051): seller's signed will_fund commitment (acceptor). */

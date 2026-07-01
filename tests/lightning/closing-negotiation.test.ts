@@ -409,6 +409,38 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			expect(opener.getFullState().closingFeeMax).to.not.be.null;
 		});
 
+		it('reserves the opener dust limit in closingFeeMax so our output is not burned', function () {
+			// Fund-safety: the fee comes out of the opener's output, and the
+			// closing tx silently omits an output below dust. Capping the fee at
+			// the whole opener balance therefore allowed an accepted fee to push
+			// our output below dust and burn it. The cap must reserve our dust
+			// limit.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			// Shrink our (opener) balance so the balance cap binds: ideal fee at
+			// feeratePerKw 253 is 44 sat, so the 2x cap is 88 sat. With 400 sat of
+			// balance the old cap (whole balance) allowed fees up to 88 sat,
+			// leaving 312 sat < 354 dust and burning our output.
+			opener.getFullState().localBalanceMsat = 400_000n;
+
+			opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 88n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+
+			// 400 sat balance minus the 354 sat dust limit
+			expect(opener.getFullState().closingFeeMax).to.equal(46n);
+			expect(opener.getState()).to.not.equal(ChannelState.CLOSED);
+		});
+
 		it('should store theirLastClosingFeeSat', function () {
 			const { opener } = setupNegotiatingChannels();
 			opener.handleShutdown({

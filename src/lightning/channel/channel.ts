@@ -2806,13 +2806,20 @@ export class Channel {
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
-		// Acceptable range: 0.5x to 2x ideal, capped at opener's available balance
+		// Acceptable range: 0.5x to 2x ideal, capped at opener's available balance.
+		// When WE are the opener the fee comes out of OUR output, so also reserve
+		// our dust limit: a fee that pushes our output below dust would silently
+		// drop it from the closing tx and burn the remainder to fees.
 		const min = idealFee / 2n;
 		const max = idealFee * 2n;
-		const openerBalance =
-			this._state.role === ChannelRole.OPENER
-				? this._state.localBalanceMsat / 1000n
-				: this._state.remoteBalanceMsat / 1000n;
+		const isOpener = this._state.role === ChannelRole.OPENER;
+		let openerBalance = isOpener
+			? this._state.localBalanceMsat / 1000n
+			: this._state.remoteBalanceMsat / 1000n;
+		if (isOpener) {
+			const dust = this._state.localConfig.dustLimitSatoshis;
+			openerBalance = openerBalance > dust ? openerBalance - dust : 0n;
+		}
 		this._state.closingFeeMin = min;
 		this._state.closingFeeMax = max < openerBalance ? max : openerBalance;
 	}
@@ -5579,9 +5586,11 @@ export class Channel {
 			// H3 fund-safety: the seller's will_fund rates are self-signed and otherwise
 			// bounded only by our whole balance, so an inflated leaseFeeBaseSat/
 			// leaseFeeBasis could drain nearly all our funds. Bound the fee by the
-			// maximum the buyer agreed to when it requested (the rates from the seller's
-			// advertised ad, carried locally as maxLeaseRates). Refuse to pay an
-			// unverified lease fee when no ceiling was set.
+			// maximum the buyer agreed to before requesting, carried locally as
+			// maxLeaseRates. This ceiling must be buyer-chosen policy, never copied
+			// from the seller's gossip ad (the seller controls both the ad and
+			// will_fund, so a seller-derived ceiling bounds nothing). Refuse to pay
+			// an unverified lease fee when no ceiling was set.
 			const maxLeaseRates = session.getLocalParams()?.maxLeaseRates;
 			if (!maxLeaseRates) {
 				return [

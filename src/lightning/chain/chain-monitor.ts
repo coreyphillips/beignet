@@ -454,9 +454,7 @@ export class ChainMonitor {
 					this._commitmentBroadcast?.commitmentType ===
 					CommitmentType.OUR_COMMITMENT;
 				if (ourCommitment) {
-					const ourAnchorHtlc = isAnchorChannel(
-						this._channelState.channelType
-					);
+					const ourAnchorHtlc = isAnchorChannel(this._channelState.channelType);
 					if (
 						ourAnchorHtlc &&
 						output.status === OutputStatus.SPEND_BROADCAST &&
@@ -679,41 +677,6 @@ export class ChainMonitor {
 		}
 
 		return actions;
-	}
-
-	/**
-	 * Called when a block is disconnected (reorg).
-	 * Resets output states to avoid double-broadcasting.
-	 */
-	handleBlockDisconnected(blockHeight: number): ChainAction[] {
-		if (this._state === MonitorState.FULLY_RESOLVED) {
-			// Can't un-resolve
-			return [];
-		}
-
-		// Reset any outputs that were confirmed at or after the disconnected height
-		for (const output of this._trackedOutputs) {
-			if (output.confirmationHeight >= blockHeight) {
-				if (output.status === OutputStatus.SPEND_CONFIRMED) {
-					output.status = OutputStatus.CONFIRMED;
-					output.resolutionTxid = undefined;
-				} else if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
-					output.status = OutputStatus.SPEND_CONFIRMED;
-				}
-			}
-		}
-
-		// If the commitment itself was in the disconnected block, reset to WATCHING
-		if (
-			this._commitmentBroadcast &&
-			this._commitmentBroadcast.blockHeight >= blockHeight
-		) {
-			this._state = MonitorState.WATCHING;
-			this._trackedOutputs = [];
-			this._commitmentBroadcast = null;
-		}
-
-		return [];
 	}
 
 	/**
