@@ -554,6 +554,132 @@ describe('Output Resolver (Phase 4B)', function () {
 		});
 	});
 
+	describe('leased channel classification (bLIP-0051)', function () {
+		// Regression: the lessor's to_local carries a lease CLTV lock on the
+		// build side (commitment-builder), so the classify/disambiguate script
+		// reconstruction must include it too or the output is never matched:
+		// force-close classification returns UNKNOWN (or silently drops the
+		// to_local) and the leased balance is never swept.
+		const LEASE_EXPIRY = 800_000;
+
+		it('classifies our leased (lessor) commitment and tracks the locked to_local', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = true;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const perCommitmentPoint =
+				perCommitmentPointFromSecret(perCommitmentSecret);
+			const built = buildLocalCommitment(state, perCommitmentPoint);
+
+			// Shared index (local == remote == 0) forces script disambiguation.
+			const result = classifyCommitmentTx(built.result.tx, state);
+			expect(result.type).to.equal(CommitmentType.OUR_COMMITMENT);
+
+			const outputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.OUR_COMMITMENT,
+				state.localCommitmentNumber
+			);
+			const toLocal = outputs.find((o) => o.outputType === OutputType.TO_LOCAL);
+			expect(toLocal).to.exist;
+			expect(toLocal!.witnessScript).to.not.be.undefined;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+			// The stored witnessScript must hash to the actual on-chain output.
+			const p2wsh = bitcoin.payments.p2wsh({
+				redeem: { output: toLocal!.witnessScript! }
+			});
+			expect(
+				Buffer.from(built.result.tx.outs[toLocal!.outputIndex].script)
+			).to.deep.equal(p2wsh.output);
+		});
+
+		it('classifies the lessor peer commitment and tracks their locked to_local', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = false;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const remotePerCommitmentPoint = state.remoteCurrentPerCommitmentPoint!;
+			const built = buildRemoteCommitment(state, remotePerCommitmentPoint);
+
+			const result = classifyCommitmentTx(built.result.tx, state);
+			expect(result.type).to.equal(CommitmentType.THEIR_CURRENT_COMMITMENT);
+
+			const outputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.THEIR_CURRENT_COMMITMENT,
+				state.remoteCommitmentNumber
+			);
+			const toLocal = outputs.find((o) => o.outputType === OutputType.TO_LOCAL);
+			expect(toLocal).to.exist;
+			expect(toLocal!.witnessScript).to.not.be.undefined;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+		});
+
+		it('penalizes the locked to_local of a revoked leased peer commitment', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			const preState = opener.getFullState();
+			preState.isLessor = false;
+			preState.leaseExpiry = LEASE_EXPIRY;
+
+			// Peer (lessor) commitment #0, built before it is revoked below.
+			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
+			const peerRevokedTx = buildRemoteCommitment(preState, peerPoint0, 0n)
+				.result.tx;
+
+			exchangeCommitments(opener, acceptor);
+			const state = opener.getFullState();
+			expect(state.shaChainStore.getSecret(MAX_INDEX - 0n)).to.not.be.null;
+
+			const breach = classifyCommitmentTx(peerRevokedTx, state);
+			expect(breach.type).to.equal(CommitmentType.THEIR_REVOKED_COMMITMENT);
+
+			const trackedOutputs = classifyOutputs(
+				peerRevokedTx,
+				state,
+				CommitmentType.THEIR_REVOKED_COMMITMENT,
+				0n
+			);
+			const toLocal = trackedOutputs.find(
+				(o) => o.outputType === OutputType.TO_LOCAL
+			);
+			expect(toLocal).to.exist;
+			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
+			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const resolved = resolveRevokedCommitmentOutputs(
+				state,
+				trackedOutputs,
+				0n,
+				peerRevokedTx,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[0],
+				network
+			);
+			const penalty = resolved.find(
+				(r) => r.trackedOutput.outputType === OutputType.TO_LOCAL
+			);
+			expect(penalty).to.exist;
+			expect(penalty!.spendTx).to.exist;
+			expect(penalty!.witness).to.exist;
+		});
+	});
+
 	describe('resolveOurCommitmentOutputs', function () {
 		it('should produce a to_local sweep with CSV delay', function () {
 			const { opener } = setupNormalChannels();

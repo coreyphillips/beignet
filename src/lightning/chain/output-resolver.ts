@@ -288,10 +288,14 @@ function disambiguateCommitmentTx(
 		  ).output
 		: bitcoin.payments.p2wsh({
 				redeem: {
+					// Liquidity ads: when WE are the lessor our to_local carries the
+					// lease CLTV lock (mirrors buildLocalCommitment), so the rebuilt
+					// script must include it for the byte-equality match to succeed.
 					output: buildToLocalScript(
 						ourRevocationPubkey,
 						ourDelayedPubkey,
-						state.remoteConfig.toSelfDelay
+						state.remoteConfig.toSelfDelay,
+						state.isLessor ? state.leaseExpiry : undefined
 					)
 				}
 		  }).output;
@@ -336,10 +340,13 @@ function disambiguateCommitmentTx(
 			  ).output
 			: bitcoin.payments.p2wsh({
 					redeem: {
+						// Their to_local carries the lease CLTV lock when THEY are the
+						// lessor (mirrors buildRemoteCommitment).
 						output: buildToLocalScript(
 							theirRevocationPubkey,
 							theirDelayedPubkey,
-							state.localConfig.toSelfDelay
+							state.localConfig.toSelfDelay,
+							state.isLessor ? undefined : state.leaseExpiry
 						)
 					}
 			  }).output;
@@ -436,10 +443,14 @@ function classifyOurCommitmentOutputs(
 	const remotePaymentPubkey = state.remoteBasepoints.paymentBasepoint;
 
 	const toSelfDelay = state.remoteConfig.toSelfDelay;
+	// Liquidity ads: when WE are the lessor our to_local carries the lease CLTV
+	// lock (mirrors buildLocalCommitment); without it the byte-equality match
+	// below never fires and the output would go untracked and unswept.
 	const toLocalScript = buildToLocalScript(
 		revocationPubkey,
 		localDelayedPubkey,
-		toSelfDelay
+		toSelfDelay,
+		state.isLessor ? state.leaseExpiry : undefined
 	);
 	const toLocalP2wsh = bitcoin.payments.p2wsh({
 		redeem: { output: toLocalScript }
@@ -567,10 +578,14 @@ function classifyTheirCommitmentOutputs(
 	const ourPaymentPubkey = state.localBasepoints.paymentBasepoint;
 
 	const toSelfDelay = state.localConfig.toSelfDelay;
+	// Their to_local carries the lease CLTV lock when THEY are the lessor
+	// (mirrors buildRemoteCommitment); the penalty path also depends on this
+	// match to store the correct witnessScript for a revoked leased commitment.
 	const toLocalScript = buildToLocalScript(
 		revocationPubkey,
 		theirDelayedPubkey,
-		toSelfDelay
+		toSelfDelay,
+		state.isLessor ? undefined : state.leaseExpiry
 	);
 	const toLocalP2wsh = bitcoin.payments.p2wsh({
 		redeem: { output: toLocalScript }
