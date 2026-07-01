@@ -150,7 +150,8 @@ describe('Stage E — taproot force-close on-chain vs live LND', function () {
 					)
 			);
 			const pending = await lnd.pendingChannels();
-			const forceClosing = (pending.pending_force_closing_channels || []).length;
+			const forceClosing = (pending.pending_force_closing_channels || [])
+				.length;
 			const waiting =
 				(
 					pending as unknown as {

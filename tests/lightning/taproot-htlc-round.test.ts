@@ -34,7 +34,11 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
 	for (let i = 0; i < 5; i++) {
 		keys.push(
-			crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest()
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
 		);
 	}
 	return {
@@ -47,7 +51,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeConfig(seedId: number, preferTaproot: boolean): IChannelManagerConfig {
+function makeConfig(
+	seedId: number,
+	preferTaproot: boolean
+): IChannelManagerConfig {
 	const seed = makeSeed(seedId);
 	const fundingPrivkey = crypto
 		.createHash('sha256')
@@ -69,7 +76,12 @@ function makeConfig(seedId: number, preferTaproot: boolean): IChannelManagerConf
 	};
 }
 
-function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: string): void {
+function connect(
+	a: ChannelManager,
+	aPub: string,
+	b: ChannelManager,
+	bPub: string
+): void {
 	a.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
 		if (peer === bPub) b.handleMessage(aPub, type, payload);
 	});
@@ -82,9 +94,15 @@ function perCommitmentPoint(seed: Buffer, n: bigint): Buffer {
 	return perCommitmentPointFromSecret(generateFromSeed(seed, MAX_INDEX - n));
 }
 
-function assertCommitmentAggregates(channel: Channel, commitmentNumber: bigint): void {
+function assertCommitmentAggregates(
+	channel: Channel,
+	commitmentNumber: bigint
+): void {
 	const state = channel.getFullState();
-	const point = perCommitmentPoint(state.localPerCommitmentSeed, commitmentNumber);
+	const point = perCommitmentPoint(
+		state.localPerCommitmentSeed,
+		commitmentNumber
+	);
 	const finalSig = aggregateLocalCommitmentSig(
 		state,
 		channel.getSigner()!,
@@ -104,11 +122,16 @@ function assertCommitmentAggregates(channel: Channel, commitmentNumber: bigint):
 		funding.p2trOutput,
 		Number(state.fundingSatoshis)
 	);
-	expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.equal(true);
+	expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.equal(
+		true
+	);
 }
 
 describe('option_taproot HTLC-bearing commitment round (Stage D)', function () {
-	function readyChannel(seedA: number, seedB: number): {
+	function readyChannel(
+		seedA: number,
+		seedB: number
+	): {
 		alice: ChannelManager;
 		bob: ChannelManager;
 		aliceChannel: Channel;
@@ -136,7 +159,9 @@ describe('option_taproot HTLC-bearing commitment round (Stage D)', function () {
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
 		const bobChannel = bob.getChannel(channelId)!;
-		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(true);
+		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(
+			true
+		);
 		expect(aliceChannel.getFullState().state).to.equal(ChannelState.NORMAL);
 		return { alice, bob, aliceChannel, bobChannel, channelId, errors };
 	}
@@ -147,7 +172,10 @@ describe('option_taproot HTLC-bearing commitment round (Stage D)', function () {
 			2
 		);
 
-		const paymentHash = crypto.createHash('sha256').update(crypto.randomBytes(32)).digest();
+		const paymentHash = crypto
+			.createHash('sha256')
+			.update(crypto.randomBytes(32))
+			.digest();
 		const res = alice.addHtlc(
 			channelId,
 			200_000_000n, // 200k sat

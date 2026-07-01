@@ -232,14 +232,16 @@ export class LiquidityAdvisor {
 	 * mining-fee share via funding_weight, a flat base fee, and a small
 	 * proportional fee; cap routing fees the lease permits.
 	 */
-	suggestLeaseRates(opts: {
-		/** Base flat lease fee in satoshis. */
-		leaseFeeBaseSat?: number;
-		/** Proportional fee in 1/10_000 of the leased amount. */
-		leaseFeeBasis?: number;
-		/** Witness weight of the seller's funding input (~weight units). */
-		fundingWeightWitness?: number;
-	} = {}): ILeaseRates {
+	suggestLeaseRates(
+		opts: {
+			/** Base flat lease fee in satoshis. */
+			leaseFeeBaseSat?: number;
+			/** Proportional fee in 1/10_000 of the leased amount. */
+			leaseFeeBasis?: number;
+			/** Witness weight of the seller's funding input (~weight units). */
+			fundingWeightWitness?: number;
+		} = {}
+	): ILeaseRates {
 		return {
 			fundingWeightWitness: opts.fundingWeightWitness ?? 666,
 			leaseFeeBasis: opts.leaseFeeBasis ?? 40, // 0.4%

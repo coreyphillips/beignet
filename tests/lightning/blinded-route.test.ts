@@ -67,7 +67,11 @@ describe('findRouteToBlindedPath blinded tail (M1.3)', function () {
 		const graph = new NetworkGraph();
 		const alice = nodeId();
 		const bob = nodeId(); // introduction node
-		const scid = encodeShortChannelId({ block: 100, txIndex: 1, outputIndex: 0 });
+		const scid = encodeShortChannelId({
+			block: 100,
+			txIndex: 1,
+			outputIndex: 0
+		});
 		graph.addChannelAnnouncement(announce(scid, alice, bob));
 		const aliceFirst = Buffer.compare(alice, bob) < 0;
 		graph.applyChannelUpdate(update(scid, aliceFirst ? 0 : 1));

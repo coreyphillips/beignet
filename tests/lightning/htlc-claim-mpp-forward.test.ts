@@ -86,10 +86,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 		const { calls } = installFakeMonitor(node);
 
 		const preimage = crypto.randomBytes(32);
-		const paymentHash = crypto
-			.createHash('sha256')
-			.update(preimage)
-			.digest();
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		const paymentSecret = crypto.randomBytes(32);
 		const totalMsat = 1000n;
 
@@ -114,13 +111,32 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 		};
 
 		// First part — not enough yet, must not complete (and must not record).
-		internal.handleMppPart(part1Channel, 0n, 600n, paymentHash, hopPayload, preimage);
-		expect(calls.length, 'no preimage recorded before MPP completes').to.equal(0);
+		internal.handleMppPart(
+			part1Channel,
+			0n,
+			600n,
+			paymentHash,
+			hopPayload,
+			preimage
+		);
+		expect(calls.length, 'no preimage recorded before MPP completes').to.equal(
+			0
+		);
 
 		// Second part — total now exceeds totalMsat, payment completes.
-		internal.handleMppPart(part2Channel, 0n, 600n, paymentHash, hopPayload, preimage);
+		internal.handleMppPart(
+			part2Channel,
+			0n,
+			600n,
+			paymentHash,
+			hopPayload,
+			preimage
+		);
 
-		expect(calls.length, 'preimage must be delivered to the monitor').to.be.greaterThan(0);
+		expect(
+			calls.length,
+			'preimage must be delivered to the monitor'
+		).to.be.greaterThan(0);
 		expect(calls[0].hash).to.equal(paymentHash.toString('hex'));
 		expect(calls[0].preimage).to.equal(preimage.toString('hex'));
 
@@ -140,10 +156,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 		const { calls } = installFakeMonitor(node);
 
 		const preimage = crypto.randomBytes(32);
-		const paymentHash = crypto
-			.createHash('sha256')
-			.update(preimage)
-			.digest();
+		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 
 		const outChannelId = crypto.randomBytes(32);
 		const outHtlcId = 7n;
@@ -152,10 +165,7 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 
 		// Register the forward mapping the downstream fulfill will match.
 		const internal = node as unknown as {
-			forwardedHtlcs: Map<
-				string,
-				{ inChannelId: Buffer; inHtlcId: bigint }
-			>;
+			forwardedHtlcs: Map<string, { inChannelId: Buffer; inHtlcId: bigint }>;
 			handleHtlcFulfilled: (
 				channelId: Buffer,
 				htlcId: bigint,

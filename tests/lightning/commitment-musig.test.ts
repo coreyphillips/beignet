@@ -62,7 +62,11 @@ describe('option_taproot MuSig2 commitment co-signing', function () {
 			Buffer.from(localNonce)
 		);
 
-		const localPartial = partialSignCommitment(sessionL, local.priv, localNonce);
+		const localPartial = partialSignCommitment(
+			sessionL,
+			local.priv,
+			localNonce
+		);
 		const remotePartial = partialSignCommitment(
 			sessionR,
 			remote.priv,

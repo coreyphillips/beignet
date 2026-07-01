@@ -2624,11 +2624,6 @@ describe('Lightning Node', function () {
 	});
 
 	describe('Blinded forward CLTV enforcement (M1)', function () {
-		// eslint-disable-next-line @typescript-eslint/no-var-requires
-		const {
-			constructBlindedPath
-		} = require('../../src/lightning/onion/blinded-path');
-
 		function makeBlindedForward(cltvExpiryDelta: number): {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			processed: any;

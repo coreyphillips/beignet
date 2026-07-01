@@ -607,7 +607,10 @@ describe('Commitment Builder', function () {
 			};
 			openerState.htlcs.set('h', { ...htlc, direction: HtlcDirection.OFFERED });
 			openerState.localBalanceMsat -= htlc.amountMsat;
-			acceptorState.htlcs.set('h', { ...htlc, direction: HtlcDirection.RECEIVED });
+			acceptorState.htlcs.set('h', {
+				...htlc,
+				direction: HtlcDirection.RECEIVED
+			});
 			acceptorState.remoteBalanceMsat -= htlc.amountMsat;
 
 			// The opener's view of the acceptor's commitment (buildRemoteCommitment)
@@ -625,15 +628,21 @@ describe('Commitment Builder', function () {
 				expect(isP2tr(o.script)).to.be.true;
 			}
 			const htlcSpkRemote =
-				remoteBuilt.result.tx.outs[remoteBuilt.result.outputMap.htlcs[0]].script;
+				remoteBuilt.result.tx.outs[remoteBuilt.result.outputMap.htlcs[0]]
+					.script;
 			const htlcSpkLocal =
 				localBuilt.result.tx.outs[localBuilt.result.outputMap.htlcs[0]].script;
 			expect(htlcSpkRemote.equals(htlcSpkLocal)).to.be.true;
 		});
 
 		it('co-signs a taproot commitment via MuSig2 partial sigs → valid key-spend', function () {
-			const { openerState, acceptorState, openerSeed, acceptorSeed, acceptorCommitSeed } =
-				createReadyState();
+			const {
+				openerState,
+				acceptorState,
+				openerSeed,
+				acceptorSeed,
+				acceptorCommitSeed
+			} = createReadyState();
 			openerState.channelType = taprootType();
 			acceptorState.channelType = taprootType();
 
@@ -698,16 +707,13 @@ describe('Commitment Builder', function () {
 				funding.p2trOutput,
 				Number(acceptorState.fundingSatoshis)
 			);
-			expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.be.true;
+			expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.be
+				.true;
 		});
 
 		it('signs + verifies taproot HTLC second-level Schnorr signatures', function () {
-			const {
-				openerState,
-				acceptorState,
-				openerSeed,
-				acceptorCommitSeed
-			} = createReadyState();
+			const { openerState, acceptorState, openerSeed, acceptorCommitSeed } =
+				createReadyState();
 			openerState.channelType = taprootType();
 			acceptorState.channelType = taprootType();
 

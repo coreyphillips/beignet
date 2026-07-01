@@ -915,9 +915,6 @@ describe('Output Resolver (Phase 4B)', function () {
 				deriveRevocationPubkey,
 				derivePublicKey
 			} = require('../../src/lightning/keys/derivation');
-			const {
-				buildToLocalScript
-			} = require('../../src/lightning/script/commitment');
 
 			const point = perCommitmentPointFromSecret(
 				generateFromSeed(

@@ -59,15 +59,12 @@ function dumpAcceptChannelTlvs(payload: Buffer): void {
 		return;
 	}
 	try {
-		const { records } = decodeTlvStream(
-			payload,
-			ACCEPT_CHANNEL_FIXED_LENGTH
-		);
+		const { records } = decodeTlvStream(payload, ACCEPT_CHANNEL_FIXED_LENGTH);
 		for (const r of records) {
 			console.log(
-				`      TLV type=${r.type} len=${r.value.length} value=${r.value.toString(
-					'hex'
-				)}`
+				`      TLV type=${r.type} len=${
+					r.value.length
+				} value=${r.value.toString('hex')}`
 			);
 		}
 	} catch (e) {
@@ -248,11 +245,11 @@ describe('Stage E — beignet→LND simple-taproot-channels capture', function (
 			console.log(
 				`    next_local_nonce (TLV4): ${
 					decoded.nextLocalNonce
-						? `${decoded.nextLocalNonce.length}B ${decoded.nextLocalNonce.toString(
-								'hex'
-						  )}`
+						? `${
+								decoded.nextLocalNonce.length
+						  }B ${decoded.nextLocalNonce.toString('hex')}`
 						: '(none — nonce is at a different TLV type, see dump above)'
-			}`
+				}`
 			);
 		}
 
@@ -337,8 +334,9 @@ describe('Stage E — beignet→LND simple-taproot-channels capture', function (
 				.map((c) => c.channel_point)
 				.join(', ')}`
 		);
-		expect(active.length, 'LND must report an active taproot channel').to.be.at.least(
-			1
-		);
+		expect(
+			active.length,
+			'LND must report an active taproot channel'
+		).to.be.at.least(1);
 	});
 });

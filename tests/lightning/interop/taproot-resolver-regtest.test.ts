@@ -44,10 +44,17 @@ async function bitcoindUp(): Promise<boolean> {
 }
 
 function seedFor(id: number): Buffer {
-	return crypto.createHash('sha256').update(Buffer.from(`p6-resolver-${id}`)).digest();
+	return crypto
+		.createHash('sha256')
+		.update(Buffer.from(`p6-resolver-${id}`))
+		.digest();
 }
 function privAt(seed: Buffer, i: number): Buffer {
-	return crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest();
+	return crypto
+		.createHash('sha256')
+		.update(seed)
+		.update(Buffer.from([i]))
+		.digest();
 }
 function basepointsOf(seed: Buffer): IChannelBasepoints {
 	return {
@@ -61,7 +68,11 @@ function basepointsOf(seed: Buffer): IChannelBasepoints {
 }
 function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 	return {
-		localConfig: { ...DEFAULT_CHANNEL_CONFIG, feeratePerKw: 2500, toSelfDelay: TO_SELF_DELAY },
+		localConfig: {
+			...DEFAULT_CHANNEL_CONFIG,
+			feeratePerKw: 2500,
+			toSelfDelay: TO_SELF_DELAY
+		},
 		localBasepoints: basepointsOf(seed),
 		localPerCommitmentSeed: seedFor(1000 + seed[0]),
 		localFundingPrivkey: privAt(seed, 0),
@@ -69,7 +80,12 @@ function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 		preferTaproot
 	};
 }
-function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: string): void {
+function connect(
+	a: ChannelManager,
+	aPub: string,
+	b: ChannelManager,
+	bPub: string
+): void {
 	a.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
 		if (peer === bPub) b.handleMessage(aPub, type, payload);
 	});
@@ -78,7 +94,9 @@ function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: strin
 	});
 }
 
-async function accept(tx: bitcoin.Transaction): Promise<{ ok: boolean; reason?: string }> {
+async function accept(
+	tx: bitcoin.Transaction
+): Promise<{ ok: boolean; reason?: string }> {
 	const [r] = (await bitcoinRpc('testmempoolaccept', [[tx.toHex()]])) as {
 		allowed: boolean;
 		['reject-reason']?: string;
@@ -114,12 +132,20 @@ describe('Interop: option_taproot output-resolver auto-sweep (regtest, P6)', fun
 			bobCfg.localBasepoints.fundingPubkey,
 			NETWORK
 		);
-		const fundTxid = (await bitcoinRpc('sendtoaddress', [funding.address, 0.03])) as string;
+		const fundTxid = (await bitcoinRpc('sendtoaddress', [
+			funding.address,
+			0.03
+		])) as string;
 		await mineBlocks(1);
-		const fundTx = (await bitcoinRpc('getrawtransaction', [fundTxid, true])) as {
+		const fundTx = (await bitcoinRpc('getrawtransaction', [
+			fundTxid,
+			true
+		])) as {
 			vout: { value: number; n: number; scriptPubKey: { address?: string } }[];
 		};
-		const fout = fundTx.vout.find((v) => v.scriptPubKey.address === funding.address)!;
+		const fout = fundTx.vout.find(
+			(v) => v.scriptPubKey.address === funding.address
+		)!;
 
 		const aliceChannel = alice.openChannel(bPub, capacitySat, 1_500_000_000n);
 		const channelId = alice.createFunding(
@@ -130,20 +156,27 @@ describe('Interop: option_taproot output-resolver auto-sweep (regtest, P6)', fun
 		)!;
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
-		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(true);
+		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(
+			true
+		);
 		expect(aliceChannel.getFullState().state).to.equal(ChannelState.NORMAL);
 
 		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		expect(
-			bob.addHtlc(channelId, 300_000_000n, paymentHash, 800, Buffer.alloc(1366)).ok
+			bob.addHtlc(channelId, 300_000_000n, paymentHash, 800, Buffer.alloc(1366))
+				.ok
 		).to.equal(true);
 		expect(aliceChannel.getFullState().localCommitmentNumber).to.equal(1n);
 
 		// Force-close + confirm the commitment.
 		const fc = aliceChannel.forceClose(aliceChannel.getSigner()!);
 		const commitTx = bitcoin.Transaction.fromBuffer(
-			(fc.find((a) => a.type === ChannelActionType.BROADCAST_TX) as { tx: Buffer }).tx
+			(
+				fc.find((a) => a.type === ChannelActionType.BROADCAST_TX) as {
+					tx: Buffer;
+				}
+			).tx
 		);
 		expect((await accept(commitTx)).ok).to.equal(true);
 		await bitcoinRpc('sendrawtransaction', [commitTx.toHex()]);
@@ -157,7 +190,9 @@ describe('Interop: option_taproot output-resolver auto-sweep (regtest, P6)', fun
 			1n
 		);
 		const toLocal = tracked.find((o) => o.outputType === OutputType.TO_LOCAL);
-		const htlcOut = tracked.find((o) => o.outputType === OutputType.RECEIVED_HTLC);
+		const htlcOut = tracked.find(
+			(o) => o.outputType === OutputType.RECEIVED_HTLC
+		);
 		expect(toLocal, 'to_local classified').to.not.be.undefined;
 		expect(htlcOut, 'received HTLC classified').to.not.be.undefined;
 
@@ -189,13 +224,21 @@ describe('Interop: option_taproot output-resolver auto-sweep (regtest, P6)', fun
 
 		const feePriv = crypto.randomBytes(32);
 		const feePub = Buffer.from(ecc.pointFromScalar(feePriv, true)!);
-		const feeP2wpkh = bitcoin.payments.p2wpkh({ pubkey: feePub, network: NETWORK });
-		const feeTxid = (await bitcoinRpc('sendtoaddress', [feeP2wpkh.address, 0.001])) as string;
+		const feeP2wpkh = bitcoin.payments.p2wpkh({
+			pubkey: feePub,
+			network: NETWORK
+		});
+		const feeTxid = (await bitcoinRpc('sendtoaddress', [
+			feeP2wpkh.address,
+			0.001
+		])) as string;
 		await mineBlocks(1);
 		const feeTx = (await bitcoinRpc('getrawtransaction', [feeTxid, true])) as {
 			vout: { value: number; n: number; scriptPubKey: { address?: string } }[];
 		};
-		const feeO = feeTx.vout.find((v) => v.scriptPubKey.address === feeP2wpkh.address)!;
+		const feeO = feeTx.vout.find(
+			(v) => v.scriptPubKey.address === feeP2wpkh.address
+		)!;
 		const feeVal = Math.round(feeO.value * 1e8);
 		htlcSweep.addInput(Buffer.from(feeTxid, 'hex').reverse(), feeO.n);
 		htlcSweep.addOutput(feeP2wpkh.output!, feeVal - 500);

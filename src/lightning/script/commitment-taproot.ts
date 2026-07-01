@@ -60,7 +60,10 @@ export function toXOnly(pubkey: Buffer): Buffer {
 
 function taggedHash(tag: string, data: Buffer): Buffer {
 	const t = crypto.createHash('sha256').update(Buffer.from(tag)).digest();
-	return crypto.createHash('sha256').update(Buffer.concat([t, t, data])).digest();
+	return crypto
+		.createHash('sha256')
+		.update(Buffer.concat([t, t, data]))
+		.digest();
 }
 
 /**

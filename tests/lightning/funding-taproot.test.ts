@@ -24,7 +24,10 @@ import {
 	partialSign,
 	aggregatePartialSigs
 } from '../../src/lightning/crypto/musig';
-import { isTaprootChannel, isAnchorChannel } from '../../src/lightning/channel/types';
+import {
+	isTaprootChannel,
+	isAnchorChannel
+} from '../../src/lightning/channel/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
 describe('option_taproot channel type', function () {

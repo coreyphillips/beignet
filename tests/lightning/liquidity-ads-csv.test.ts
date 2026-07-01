@@ -100,7 +100,10 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 		// Input sequence is the CSV (144), not 0xffffffff, so locktime is enforced.
 		expect(tx.ins[0].sequence).to.equal(144);
 		// Witness still selects the delayed (OP_ELSE) branch.
-		const witness = buildToLocalDelayedWitness(crypto.randomBytes(72), witnessScript);
+		const witness = buildToLocalDelayedWitness(
+			crypto.randomBytes(72),
+			witnessScript
+		);
 		expect(witness[witness.length - 1].equals(witnessScript)).to.be.true;
 	});
 
@@ -152,7 +155,12 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 		// And its witness program == sha256 of the leased output script.
 		const expected = bitcoin.payments.p2wsh({
 			redeem: {
-				output: buildHtlcOutputScript(revocationPubkey, delayedPubkey, 144, leaseExpiry)
+				output: buildHtlcOutputScript(
+					revocationPubkey,
+					delayedPubkey,
+					144,
+					leaseExpiry
+				)
 			}
 		}).output!;
 		expect(leasedOut.equals(expected)).to.be.true;
@@ -182,7 +190,11 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 	});
 
 	it('a non-leased sweep keeps nLockTime = 0', function () {
-		const witnessScript = buildToLocalScript(revocationPubkey, delayedPubkey, 144);
+		const witnessScript = buildToLocalScript(
+			revocationPubkey,
+			delayedPubkey,
+			144
+		);
 		const tx = buildToLocalSweepTx({
 			commitmentTxid: crypto.randomBytes(32).toString('hex'),
 			outputIndex: 0,

@@ -39,7 +39,11 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
 	for (let i = 0; i < 5; i++) {
 		keys.push(
-			crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest()
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
 		);
 	}
 	return {
@@ -137,7 +141,9 @@ describe('option_taproot open/accept nonce exchange', function () {
 			payloadOf(opener.initiateOpen(undefined, false, true))
 		);
 		delete (open as IOpenChannelMessage).nextLocalNonce;
-		const actions = makeAcceptor(open.temporaryChannelId).handleOpenChannel(open);
+		const actions = makeAcceptor(open.temporaryChannelId).handleOpenChannel(
+			open
+		);
 		expect(actions[0].type).to.equal('ERROR');
 	});
 

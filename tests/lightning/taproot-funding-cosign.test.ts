@@ -31,7 +31,11 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
 	for (let i = 0; i < 5; i++) {
 		keys.push(
-			crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest()
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
 		);
 	}
 	return {
@@ -75,12 +79,18 @@ function connectManagers(
 	managerB: ChannelManager,
 	pubkeyB: string
 ): void {
-	managerA.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
-		if (peer === pubkeyB) managerB.handleMessage(pubkeyA, type, payload);
-	});
-	managerB.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
-		if (peer === pubkeyA) managerA.handleMessage(pubkeyB, type, payload);
-	});
+	managerA.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (peer === pubkeyB) managerB.handleMessage(pubkeyA, type, payload);
+		}
+	);
+	managerB.on(
+		'message:outbound',
+		(peer: string, type: number, payload: Buffer) => {
+			if (peer === pubkeyA) managerA.handleMessage(pubkeyB, type, payload);
+		}
+	);
 }
 
 /**
@@ -120,7 +130,9 @@ function assertAggregatesToValidKeySpend(channel: Channel): void {
 		funding.p2trOutput,
 		Number(state.fundingSatoshis)
 	);
-	expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.equal(true);
+	expect(ecc.verifySchnorr(sighash, funding.outputKey, finalSig)).to.equal(
+		true
+	);
 }
 
 describe('option_taproot funding co-sign (Stage A)', function () {
@@ -181,20 +193,26 @@ describe('option_taproot funding co-sign (Stage A)', function () {
 		const bPub = bob['config'].localBasepoints.fundingPubkey.toString('hex');
 
 		// Intercept Alice→Bob and corrupt the partial sig inside funding_created (34).
-		alice.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
-			if (peer !== bPub) return;
-			let p = payload;
-			if (type === 34) {
-				// Flip a byte inside the appended partial_signature_with_nonce TLV
-				// (after the 130-byte fixed body + 2-byte TLV header).
-				p = Buffer.from(payload);
-				p[p.length - 1] ^= 0xff;
+		alice.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				if (peer !== bPub) return;
+				let p = payload;
+				if (type === 34) {
+					// Flip a byte inside the appended partial_signature_with_nonce TLV
+					// (after the 130-byte fixed body + 2-byte TLV header).
+					p = Buffer.from(payload);
+					p[p.length - 1] ^= 0xff;
+				}
+				bob.handleMessage(aPub, type, p);
 			}
-			bob.handleMessage(aPub, type, p);
-		});
-		bob.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
-			if (peer === aPub) alice.handleMessage(bPub, type, payload);
-		});
+		);
+		bob.on(
+			'message:outbound',
+			(peer: string, type: number, payload: Buffer) => {
+				if (peer === aPub) alice.handleMessage(bPub, type, payload);
+			}
+		);
 
 		let bobError = false;
 		bob.on('error', () => {
@@ -202,7 +220,12 @@ describe('option_taproot funding co-sign (Stage A)', function () {
 		});
 
 		const aliceChannel = alice.openChannel(bPub, 1_000_000n);
-		alice.createFunding(aliceChannel, crypto.randomBytes(32), 0, crypto.randomBytes(64));
+		alice.createFunding(
+			aliceChannel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		);
 
 		// Bob must NOT advance to AWAITING_FUNDING_CONFIRMED on a bad partial.
 		const bobChannels = bob.getChannelsByPeer(aPub);

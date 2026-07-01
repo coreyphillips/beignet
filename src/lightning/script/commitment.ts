@@ -264,7 +264,8 @@ export function buildCommitmentTx(
 				toSelfDelay,
 				leaseExpiry
 			);
-			spk = bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!;
+			spk = bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } })
+				.output!;
 		}
 		outputs.push({
 			script: spk,

@@ -43,12 +43,18 @@ function makeBasepoints(): IChannelBasepoints {
 	};
 }
 
-function injectNormalChannel(
-	node: LightningNode
-): { channelId: Buffer; peerPubkey: Buffer; scid: Buffer } {
+function injectNormalChannel(node: LightningNode): {
+	channelId: Buffer;
+	peerPubkey: Buffer;
+	scid: Buffer;
+} {
 	const channelId = crypto.randomBytes(32);
 	const peerPubkey = getPublicKey(validPriv());
-	const scid = encodeShortChannelId({ block: 800000, txIndex: 1, outputIndex: 0 });
+	const scid = encodeShortChannelId({
+		block: 800000,
+		txIndex: 1,
+		outputIndex: 0
+	});
 
 	const state = createOpenerState({
 		temporaryChannelId: crypto.randomBytes(32),

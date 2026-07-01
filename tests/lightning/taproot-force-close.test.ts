@@ -29,7 +29,11 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
 	for (let i = 0; i < 5; i++) {
 		keys.push(
-			crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest()
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
 		);
 	}
 	return {
@@ -42,7 +46,10 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makeConfig(seedId: number, preferTaproot: boolean): IChannelManagerConfig {
+function makeConfig(
+	seedId: number,
+	preferTaproot: boolean
+): IChannelManagerConfig {
 	const seed = makeSeed(seedId);
 	const fundingPrivkey = crypto
 		.createHash('sha256')
@@ -123,7 +130,10 @@ function assertForceCloseWitnessValid(channel: Channel): void {
 }
 
 describe('option_taproot force-close key-spend aggregation (Stage C)', function () {
-	function readyTaprootChannel(seedA: number, seedB: number): {
+	function readyTaprootChannel(
+		seedA: number,
+		seedB: number
+	): {
 		alice: ChannelManager;
 		bob: ChannelManager;
 		aliceChannel: Channel;

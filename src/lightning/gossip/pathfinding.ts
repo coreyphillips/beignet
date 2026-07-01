@@ -868,10 +868,7 @@ function findRouteWithCapacityLimits(
 
 // ── Blinded Path Route Finding ──────────────────────────────────────
 
-import {
-	IBlindedPath,
-	IBlindedPayInfo
-} from '../onion/blinded-path';
+import { IBlindedPath, IBlindedPayInfo } from '../onion/blinded-path';
 
 /**
  * Find a route from `source` through a blinded path to the recipient.

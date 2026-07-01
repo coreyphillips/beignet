@@ -85,7 +85,12 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 
 		// Recipient: LND opens a channel to beignet2 (LND holds the balance → it has
 		// outbound to forward, beignet2 has inbound to receive).
-		const recipientSetup = await setupLndChannel(lnd, lndPubkey, 201, 1_000_000);
+		const recipientSetup = await setupLndChannel(
+			lnd,
+			lndPubkey,
+			201,
+			1_000_000
+		);
 		const beignet2 = recipientSetup.node;
 		const beignet2Id = beignet2.getNodeId();
 
@@ -129,7 +134,9 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 		// 0 proportional fee → clean sat amount. (The fractional-msat commitment
 		// mismatch this once hit is now FIXED in commitment-builder; left at 0 so the
 		// harness isolates the remaining LND blinded-relay validation issue.)
-		(beignet2 as unknown as { forwardingFeePropMillionths: number }).forwardingFeePropMillionths = 0;
+		(
+			beignet2 as unknown as { forwardingFeePropMillionths: number }
+		).forwardingFeePropMillionths = 0;
 
 		const invoice = beignet2.createInvoice({
 			amountMsat: 50_000_000n,
@@ -137,10 +144,12 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 			useBlindedPaths: true
 		});
 		const inv = decodeInvoice(invoice.bolt11);
-		expect(inv.blindedPaths, 'invoice carries a blinded path').to.have.length(1);
-		expect(inv.blindedPaths![0].path.introductionNodeId.toString('hex')).to.equal(
-			lndPubkey
+		expect(inv.blindedPaths, 'invoice carries a blinded path').to.have.length(
+			1
 		);
+		expect(
+			inv.blindedPaths![0].path.introductionNodeId.toString('hex')
+		).to.equal(lndPubkey);
 
 		let received = false;
 		beignet2.on('payment:received', () => (received = true));
@@ -148,7 +157,8 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 		beignet1.sendPayment(invoice.bolt11);
 		for (let i = 0; i < 30 && !received; i++) await sleep(1000);
 
-		expect(received, 'beignet2 received the blinded payment via LND').to.be.true;
+		expect(received, 'beignet2 received the blinded payment via LND').to.be
+			.true;
 
 		beignet1.destroy();
 		beignet2.destroy();

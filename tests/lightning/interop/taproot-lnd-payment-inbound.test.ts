@@ -85,8 +85,10 @@ describe('Stage E — LND→beignet simple-taproot payment (inbound HTLC)', func
 			payResult.payment_error,
 			`LND payment failed: ${payResult.payment_error}`
 		).to.be.oneOf(['', undefined]);
-		expect(payResult.payment_preimage, 'LND must receive a preimage').to.have
-			.length.greaterThan(0);
+		expect(
+			payResult.payment_preimage,
+			'LND must receive a preimage'
+		).to.have.length.greaterThan(0);
 
 		// Cross-check: beignet recorded the payment as received/settled.
 		await sleep(1000);

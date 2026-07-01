@@ -27,7 +27,9 @@ export function isAnchorChannel(channelType: Buffer | null): boolean {
  */
 export function isTaprootChannel(channelType: Buffer | null): boolean {
 	if (!channelType || channelType.length === 0) return false;
-	return FeatureFlags.fromBuffer(channelType).hasFeature(Feature.OPTION_TAPROOT);
+	return FeatureFlags.fromBuffer(channelType).hasFeature(
+		Feature.OPTION_TAPROOT
+	);
 }
 
 export enum ChannelState {

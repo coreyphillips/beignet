@@ -58,7 +58,11 @@ async function fundAndConfirm(address: string, confs = 1): Promise<Utxo> {
 	const txid = (await bitcoinRpc('sendtoaddress', [address, 0.01])) as string;
 	await mineBlocks(confs);
 	const tx = (await bitcoinRpc('getrawtransaction', [txid, true])) as {
-		vout: { value: number; n: number; scriptPubKey: { address?: string; hex: string } }[];
+		vout: {
+			value: number;
+			n: number;
+			scriptPubKey: { address?: string; hex: string };
+		}[];
 	};
 	const o = tx.vout.find((v) => v.scriptPubKey.address === address)!;
 	return {
@@ -79,7 +83,10 @@ async function spendTx(
 	tx.locktime = nLockTime;
 	tx.addInput(Buffer.from(utxo.txid, 'hex').reverse(), utxo.vout, sequence);
 	const dest = (await bitcoinRpc('getnewaddress')) as string;
-	tx.addOutput(bitcoin.address.toOutputScript(dest, NETWORK), utxo.valueSat - 600);
+	tx.addOutput(
+		bitcoin.address.toOutputScript(dest, NETWORK),
+		utxo.valueSat - 600
+	);
 	return tx;
 }
 
@@ -101,7 +108,9 @@ function sign(sighash: Buffer, priv: Buffer): Buffer {
 	return Buffer.from(ecc.signSchnorr(sighash, priv));
 }
 
-async function accepted(tx: bitcoin.Transaction): Promise<{ ok: boolean; reason?: string }> {
+async function accepted(
+	tx: bitcoin.Transaction
+): Promise<{ ok: boolean; reason?: string }> {
 	const [r] = (await bitcoinRpc('testmempoolaccept', [[tx.toHex()]])) as {
 		allowed: boolean;
 		['reject-reason']?: string;
@@ -151,24 +160,41 @@ describe('Interop: option_taproot HTLC outputs spendable (regtest)', function ()
 
 	it('offered HTLC: remote sweeps via the preimage-success leaf', async function () {
 		if (skip) this.skip();
-		const revoke = kp(), local = kp(), remote = kp();
+		const revoke = kp(),
+			local = kp(),
+			remote = kp();
 		const htlc = buildTaprootOfferedHtlcOutput(
-			revoke.pub, local.pub, remote.pub, paymentHash, NETWORK
+			revoke.pub,
+			local.pub,
+			remote.pub,
+			paymentHash,
+			NETWORK
 		);
 		const utxo = await fundAndConfirm(htlc.address);
 		// Offered-success leaf now ends in OP_1 OP_CSV OP_DROP → spend needs seq=1.
 		const tx = await spendTx(utxo, 1, 0);
 		const sig = sign(leafSighash(tx, utxo, htlc.success), remote.priv);
-		tx.ins[0].witness = [sig, preimage, htlc.success.script, htlc.success.controlBlock];
+		tx.ins[0].witness = [
+			sig,
+			preimage,
+			htlc.success.script,
+			htlc.success.controlBlock
+		];
 		const r = await accepted(tx);
 		expect(r.ok, r.reason).to.be.true;
 	});
 
 	it('offered HTLC: local reclaims via the 2-of-2 timeout leaf', async function () {
 		if (skip) this.skip();
-		const revoke = kp(), local = kp(), remote = kp();
+		const revoke = kp(),
+			local = kp(),
+			remote = kp();
 		const htlc = buildTaprootOfferedHtlcOutput(
-			revoke.pub, local.pub, remote.pub, paymentHash, NETWORK
+			revoke.pub,
+			local.pub,
+			remote.pub,
+			paymentHash,
+			NETWORK
 		);
 		const utxo = await fundAndConfirm(htlc.address);
 		const tx = await spendTx(utxo, 0xffffffff, 0);
@@ -187,9 +213,16 @@ describe('Interop: option_taproot HTLC outputs spendable (regtest)', function ()
 
 	it('received HTLC: local sweeps via the 2-of-2 preimage-success leaf', async function () {
 		if (skip) this.skip();
-		const revoke = kp(), local = kp(), remote = kp();
+		const revoke = kp(),
+			local = kp(),
+			remote = kp();
 		const htlc = buildTaprootReceivedHtlcOutput(
-			revoke.pub, local.pub, remote.pub, paymentHash, 100, NETWORK
+			revoke.pub,
+			local.pub,
+			remote.pub,
+			paymentHash,
+			100,
+			NETWORK
 		);
 		const utxo = await fundAndConfirm(htlc.address);
 		const tx = await spendTx(utxo, 0xffffffff, 0);
@@ -209,10 +242,17 @@ describe('Interop: option_taproot HTLC outputs spendable (regtest)', function ()
 
 	it('received HTLC: remote reclaims via the CLTV timeout leaf', async function () {
 		if (skip) this.skip();
-		const revoke = kp(), local = kp(), remote = kp();
+		const revoke = kp(),
+			local = kp(),
+			remote = kp();
 		const cltv = 100; // well below the regtest tip → locktime satisfied
 		const htlc = buildTaprootReceivedHtlcOutput(
-			revoke.pub, local.pub, remote.pub, paymentHash, cltv, NETWORK
+			revoke.pub,
+			local.pub,
+			remote.pub,
+			paymentHash,
+			cltv,
+			NETWORK
 		);
 		const utxo = await fundAndConfirm(htlc.address);
 		// Leaf is <remote> CHECKSIG OP_1 OP_CSV OP_DROP <cltv> OP_CLTV OP_DROP →
@@ -226,9 +266,15 @@ describe('Interop: option_taproot HTLC outputs spendable (regtest)', function ()
 
 	it('offered HTLC: breach is swept via the revocation key-path', async function () {
 		if (skip) this.skip();
-		const revoke = kp(), local = kp(), remote = kp();
+		const revoke = kp(),
+			local = kp(),
+			remote = kp();
 		const htlc = buildTaprootOfferedHtlcOutput(
-			revoke.pub, local.pub, remote.pub, paymentHash, NETWORK
+			revoke.pub,
+			local.pub,
+			remote.pub,
+			paymentHash,
+			NETWORK
 		);
 		const utxo = await fundAndConfirm(htlc.address);
 		const tx = await spendTx(utxo, 0xffffffff, 0);

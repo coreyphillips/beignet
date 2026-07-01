@@ -49,11 +49,20 @@ async function bitcoindUp(): Promise<boolean> {
 async function fundAndConfirm(
 	address: string,
 	confirmations: number
-): Promise<{ txid: string; vout: number; valueSat: number; scriptHex: string }> {
+): Promise<{
+	txid: string;
+	vout: number;
+	valueSat: number;
+	scriptHex: string;
+}> {
 	const txid = (await bitcoinRpc('sendtoaddress', [address, 0.01])) as string;
 	await mineBlocks(confirmations);
 	const tx = (await bitcoinRpc('getrawtransaction', [txid, true])) as {
-		vout: { value: number; n: number; scriptPubKey: { address?: string; hex: string } }[];
+		vout: {
+			value: number;
+			n: number;
+			scriptPubKey: { address?: string; hex: string };
+		}[];
 	};
 	const out = tx.vout.find((o) => o.scriptPubKey.address === address)!;
 	return {
@@ -76,11 +85,7 @@ async function spendLeaf(
 ): Promise<{ allowed: boolean; reason?: string }> {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	tx.addInput(
-		Buffer.from(utxo.txid, 'hex').reverse(),
-		utxo.vout,
-		sequence
-	);
+	tx.addInput(Buffer.from(utxo.txid, 'hex').reverse(), utxo.vout, sequence);
 	const dest = (await bitcoinRpc('getnewaddress')) as string;
 	tx.addOutput(
 		bitcoin.address.toOutputScript(dest, NETWORK),
@@ -98,9 +103,10 @@ async function spendLeaf(
 	const sig = Buffer.from(ecc.signSchnorr(sighash, signerPrivkey));
 	tx.ins[0].witness = [sig, leaf.script, leaf.controlBlock];
 
-	const [res] = (await bitcoinRpc('testmempoolaccept', [
-		[tx.toHex()]
-	])) as { allowed: boolean; ['reject-reason']?: string }[];
+	const [res] = (await bitcoinRpc('testmempoolaccept', [[tx.toHex()]])) as {
+		allowed: boolean;
+		['reject-reason']?: string;
+	}[];
 	return { allowed: res.allowed, reason: res['reject-reason'] };
 }
 

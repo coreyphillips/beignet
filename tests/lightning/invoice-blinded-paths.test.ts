@@ -90,10 +90,7 @@ describe('BOLT 11 blinded paths (M1.1)', function () {
 	});
 
 	it('round-trips multiple blinded payment paths', function () {
-		const blindedPaths = [
-			makeBlindedPaymentPath(1),
-			makeBlindedPaymentPath(3)
-		];
+		const blindedPaths = [makeBlindedPaymentPath(1), makeBlindedPaymentPath(3)];
 		const invoiceStr = encode({
 			network: Network.MAINNET,
 			paymentHash: crypto.randomBytes(32),

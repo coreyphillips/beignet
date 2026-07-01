@@ -19,7 +19,11 @@ import {
 	DEFAULT_CHANNEL_CONFIG,
 	isTaprootChannel
 } from '../../../src/lightning/channel/types';
-import { OutputType, OutputStatus, ITrackedOutput } from '../../../src/lightning/chain/types';
+import {
+	OutputType,
+	OutputStatus,
+	ITrackedOutput
+} from '../../../src/lightning/chain/types';
 import { resolveTheirCurrentCommitmentOutputs } from '../../../src/lightning/chain/output-resolver';
 import {
 	buildTaprootToRemoteOutput,
@@ -45,10 +49,17 @@ async function bitcoindUp(): Promise<boolean> {
 	}
 }
 function seedFor(id: number): Buffer {
-	return crypto.createHash('sha256').update(Buffer.from(`p6-claim-${id}`)).digest();
+	return crypto
+		.createHash('sha256')
+		.update(Buffer.from(`p6-claim-${id}`))
+		.digest();
 }
 function privAt(seed: Buffer, i: number): Buffer {
-	return crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest();
+	return crypto
+		.createHash('sha256')
+		.update(seed)
+		.update(Buffer.from([i]))
+		.digest();
 }
 function basepointsOf(seed: Buffer): IChannelBasepoints {
 	return {
@@ -62,7 +73,11 @@ function basepointsOf(seed: Buffer): IChannelBasepoints {
 }
 function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 	return {
-		localConfig: { ...DEFAULT_CHANNEL_CONFIG, feeratePerKw: 600, toSelfDelay: 10 },
+		localConfig: {
+			...DEFAULT_CHANNEL_CONFIG,
+			feeratePerKw: 600,
+			toSelfDelay: 10
+		},
 		localBasepoints: basepointsOf(seed),
 		localPerCommitmentSeed: seedFor(1000 + seed[0]),
 		localFundingPrivkey: privAt(seed, 0),
@@ -70,7 +85,12 @@ function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 		preferTaproot
 	};
 }
-function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: string): void {
+function connect(
+	a: ChannelManager,
+	aPub: string,
+	b: ChannelManager,
+	bPub: string
+): void {
 	a.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
 		if (peer === bPub) b.handleMessage(aPub, type, payload);
 	});
@@ -78,7 +98,9 @@ function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: strin
 		if (peer === aPub) a.handleMessage(bPub, type, payload);
 	});
 }
-async function fund(address: string): Promise<{ txid: string; vout: number; valueSat: number }> {
+async function fund(
+	address: string
+): Promise<{ txid: string; vout: number; valueSat: number }> {
 	const txid = (await bitcoinRpc('sendtoaddress', [address, 0.005])) as string;
 	await mineBlocks(1);
 	const tx = (await bitcoinRpc('getrawtransaction', [txid, true])) as {
@@ -87,7 +109,9 @@ async function fund(address: string): Promise<{ txid: string; vout: number; valu
 	const o = tx.vout.find((v) => v.scriptPubKey.address === address)!;
 	return { txid, vout: o.n, valueSat: Math.round(o.value * 1e8) };
 }
-async function accept(tx: bitcoin.Transaction): Promise<{ ok: boolean; reason?: string }> {
+async function accept(
+	tx: bitcoin.Transaction
+): Promise<{ ok: boolean; reason?: string }> {
 	const [r] = (await bitcoinRpc('testmempoolaccept', [[tx.toHex()]])) as {
 		allowed: boolean;
 		['reject-reason']?: string;
@@ -126,7 +150,9 @@ describe('Interop: option_taproot claim from peer current commitment (regtest, P
 		)!;
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
-		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(true);
+		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(
+			true
+		);
 		expect(aliceChannel.getFullState().state).to.equal(ChannelState.NORMAL);
 
 		const aliceState = aliceChannel.getFullState();
@@ -141,8 +167,14 @@ describe('Interop: option_taproot claim from peer current commitment (regtest, P
 			aliceCfg.localBasepoints.revocationBasepoint,
 			bobPoint
 		);
-		const theirHtlc = derivePublicKey(bobCfg.localBasepoints.htlcBasepoint, bobPoint);
-		const ourHtlc = derivePublicKey(aliceCfg.localBasepoints.htlcBasepoint, bobPoint);
+		const theirHtlc = derivePublicKey(
+			bobCfg.localBasepoints.htlcBasepoint,
+			bobPoint
+		);
+		const ourHtlc = derivePublicKey(
+			aliceCfg.localBasepoints.htlcBasepoint,
+			bobPoint
+		);
 		// Our received = their offered output: claim with preimage via the success leaf.
 		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
@@ -204,6 +236,8 @@ describe('Interop: option_taproot claim from peer current commitment (regtest, P
 		const trAccept = await accept(toRemoteClaim.spendTx!);
 		expect(trAccept.ok, `to_remote: ${trAccept.reason}`).to.equal(true);
 		const htlcAccept = await accept(htlcClaim.spendTx!);
-		expect(htlcAccept.ok, `HTLC preimage claim: ${htlcAccept.reason}`).to.equal(true);
+		expect(htlcAccept.ok, `HTLC preimage claim: ${htlcAccept.reason}`).to.equal(
+			true
+		);
 	});
 });

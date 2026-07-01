@@ -27,7 +27,8 @@ import { sha256 as nobleSha256 } from '@noble/hashes/sha256';
 // at type-level, so it is required at runtime and typed as the partial Crypto
 // surface it implements.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const baseCrypto = require('@brandonblack/musig/base_crypto') as Partial<Crypto>;
+const baseCrypto =
+	require('@brandonblack/musig/base_crypto') as Partial<Crypto>;
 
 /** BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg...). */
 function taggedHash(tag: string, ...messages: Uint8Array[]): Uint8Array {

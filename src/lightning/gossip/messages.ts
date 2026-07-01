@@ -190,7 +190,8 @@ export function encodeNodeAnnouncementMessage(
 		  ])
 		: Buffer.alloc(0);
 
-	const totalLen = 64 + 2 + flen + 4 + 33 + 3 + 32 + 2 + addrlen + tlvBuf.length;
+	const totalLen =
+		64 + 2 + flen + 4 + 33 + 3 + 32 + 2 + addrlen + tlvBuf.length;
 	const buf = Buffer.alloc(totalLen);
 	let offset = 0;
 

@@ -27,10 +27,17 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 const NETWORK = bitcoin.networks.regtest;
 
 function seedFor(id: number): Buffer {
-	return crypto.createHash('sha256').update(Buffer.from(`p6e-${id}`)).digest();
+	return crypto
+		.createHash('sha256')
+		.update(Buffer.from(`p6e-${id}`))
+		.digest();
 }
 function privAt(seed: Buffer, i: number): Buffer {
-	return crypto.createHash('sha256').update(seed).update(Buffer.from([i])).digest();
+	return crypto
+		.createHash('sha256')
+		.update(seed)
+		.update(Buffer.from([i]))
+		.digest();
 }
 function basepointsOf(seed: Buffer): IChannelBasepoints {
 	return {
@@ -52,7 +59,12 @@ function configOf(seed: Buffer, preferTaproot: boolean): IChannelManagerConfig {
 		preferTaproot
 	};
 }
-function connect(a: ChannelManager, aPub: string, b: ChannelManager, bPub: string): void {
+function connect(
+	a: ChannelManager,
+	aPub: string,
+	b: ChannelManager,
+	bPub: string
+): void {
 	a.on('message:outbound', (peer: string, type: number, payload: Buffer) => {
 		if (peer === bPub) b.handleMessage(aPub, type, payload);
 	});
@@ -83,20 +95,27 @@ describe('option_taproot ChainMonitor force-close wiring (P6e)', function () {
 		)!;
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
-		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(true);
+		expect(isTaprootChannel(aliceChannel.getFullState().channelType)).to.equal(
+			true
+		);
 		expect(aliceChannel.getFullState().state).to.equal(ChannelState.NORMAL);
 
 		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		expect(
-			bob.addHtlc(channelId, 300_000_000n, paymentHash, 800, Buffer.alloc(1366)).ok
+			bob.addHtlc(channelId, 300_000_000n, paymentHash, 800, Buffer.alloc(1366))
+				.ok
 		).to.equal(true);
 		expect(aliceChannel.getFullState().localCommitmentNumber).to.equal(1n);
 
 		const state = aliceChannel.getFullState();
 		const fc = aliceChannel.forceClose(aliceChannel.getSigner()!);
 		const commitTx = bitcoin.Transaction.fromBuffer(
-			(fc.find((a) => a.type === ChannelActionType.BROADCAST_TX) as { tx: Buffer }).tx
+			(
+				fc.find((a) => a.type === ChannelActionType.BROADCAST_TX) as {
+					tx: Buffer;
+				}
+			).tx
 		);
 
 		// Drive the force-close through the ChainMonitor.

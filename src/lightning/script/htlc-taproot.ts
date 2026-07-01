@@ -23,7 +23,10 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import crypto from 'crypto';
-import { buildTaprootSecondLevelOutput, TAPLEAF_VERSION } from './commitment-taproot';
+import {
+	buildTaprootSecondLevelOutput,
+	TAPLEAF_VERSION
+} from './commitment-taproot';
 
 bitcoin.initEccLib(ecc);
 
@@ -45,7 +48,10 @@ export function tapleafHash(
 	leafScript: Buffer,
 	version: number = TAPLEAF_VERSION
 ): Buffer {
-	const tag = crypto.createHash('sha256').update(Buffer.from('TapLeaf')).digest();
+	const tag = crypto
+		.createHash('sha256')
+		.update(Buffer.from('TapLeaf'))
+		.digest();
 	return crypto
 		.createHash('sha256')
 		.update(

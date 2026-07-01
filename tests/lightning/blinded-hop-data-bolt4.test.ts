@@ -92,7 +92,9 @@ describe('BOLT 4 encrypted_recipient_data TLV (M1-FU3)', function () {
 	});
 
 	it('ignores unknown odd TLV records (forward-compatible)', function () {
-		const base = encodeBlindedHopData({ shortChannelId: crypto.randomBytes(8) });
+		const base = encodeBlindedHopData({
+			shortChannelId: crypto.randomBytes(8)
+		});
 		// Append an unknown odd TLV after scid(type 2): type 7, len 2, value 0xaabb.
 		const extra = Buffer.from([0x07, 0x02, 0xaa, 0xbb]);
 		const withExtra = Buffer.concat([base, extra]);

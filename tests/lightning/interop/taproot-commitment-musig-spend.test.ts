@@ -66,7 +66,10 @@ describe('Interop: option_taproot commitment co-sign + spend (regtest)', functio
 			0.01
 		])) as string;
 		await mineBlocks(1);
-		const fundTx = (await bitcoinRpc('getrawtransaction', [fundTxid, true])) as {
+		const fundTx = (await bitcoinRpc('getrawtransaction', [
+			fundTxid,
+			true
+		])) as {
 			vout: { value: number; n: number; scriptPubKey: { address?: string } }[];
 		};
 		const fout = fundTx.vout.find(
@@ -78,7 +81,12 @@ describe('Interop: option_taproot commitment co-sign + spend (regtest)', functio
 		//    to_local + to_remote outputs.
 		const revoke = kp();
 		const delayed = kp();
-		const toLocal = buildTaprootToLocalOutput(revoke.pub, delayed.pub, 144, NETWORK);
+		const toLocal = buildTaprootToLocalOutput(
+			revoke.pub,
+			delayed.pub,
+			144,
+			NETWORK
+		);
 		const toRemote = buildTaprootToRemoteOutput(remote.pub, NETWORK);
 
 		const tx = new bitcoin.Transaction();
@@ -121,7 +129,11 @@ describe('Interop: option_taproot commitment co-sign + spend (regtest)', functio
 			remoteNonce,
 			Buffer.from(localNonce)
 		);
-		const localPartial = partialSignCommitment(sessionL, local.priv, localNonce);
+		const localPartial = partialSignCommitment(
+			sessionL,
+			local.priv,
+			localNonce
+		);
 		const remotePartial = partialSignCommitment(
 			sessionR,
 			remote.priv,
@@ -144,9 +156,10 @@ describe('Interop: option_taproot commitment co-sign + spend (regtest)', functio
 		tx.ins[0].witness = [finalSig];
 
 		// 4. The network accepts the co-signed taproot commitment.
-		const [res] = (await bitcoinRpc('testmempoolaccept', [
-			[tx.toHex()]
-		])) as { allowed: boolean; ['reject-reason']?: string }[];
+		const [res] = (await bitcoinRpc('testmempoolaccept', [[tx.toHex()]])) as {
+			allowed: boolean;
+			['reject-reason']?: string;
+		}[];
 		expect(res.allowed, res['reject-reason']).to.be.true;
 
 		// And it actually confirms.
