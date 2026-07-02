@@ -8,6 +8,7 @@
 
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
+import { createError, encodeErrorMessage } from '../message/error';
 import {
 	encodeOpenChannelMessage,
 	IOpenChannelMessage,
@@ -43,8 +44,14 @@ import {
 	encodeShutdownMessage,
 	IShutdownMessage,
 	encodeClosingSignedMessage,
-	IClosingSignedMessage
+	IClosingSignedMessage,
+	ClosingSigVariant,
+	IClosingCompleteMessage,
+	IClosingSigMessage,
+	encodeClosingCompleteMessage,
+	encodeClosingSigMessage
 } from '../message/channel-close';
+import { isDustOutput } from '../chain/closing';
 import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
@@ -86,7 +93,9 @@ import {
 	verifyRemoteCommitmentPartial,
 	verifyRemoteHtlcSignatures,
 	verifyRemoteHtlcSignaturesTaproot,
-	calculateCommitmentFee
+	calculateCommitmentFee,
+	getCommitmentFeeRate,
+	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
 import { generateNonce } from '../crypto/musig';
@@ -267,6 +276,19 @@ export class Channel {
 	// our new commitment (adopted as remoteCommitmentSignature at completeSplice).
 	private _spliceSentCommitment = false;
 	private _spliceReceivedCommitment = false;
+	// BOLT 2 v2 establishment: after both tx_completes the peers exchange
+	// commitment_signed for commitment #0 of the new funding output, and only
+	// then tx_signatures (lower-total-input-sats side first). In-memory only:
+	// a disconnect mid-open aborts the v2 open entirely (the manager errors
+	// v2 channels on peer disconnect), so nothing here must survive a restart.
+	private _v2SentCommitment = false;
+	private _v2ReceivedCommitment = false;
+	/** Witnesses provided by the caller before the ordering allowed sending. */
+	private _v2PendingTxSigs: {
+		txid: Buffer;
+		outputIndex: number;
+		witnesses: Buffer[][];
+	} | null = null;
 	private _spliceRemoteCommitmentSig: Buffer | null = null;
 	// We dropped an unresumable splice on disconnect/restart, but the peer may
 	// still hold its in-flight copy (CLN never forgets one on its own — it blocks
@@ -818,6 +840,9 @@ export class Channel {
 			// Store remote's commitment signature
 			this._state.remoteCommitmentSignature = msg.signature;
 		}
+		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+			this._state
+		);
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
@@ -1053,6 +1078,9 @@ export class Channel {
 			// Store remote's commitment signature
 			this._state.remoteCommitmentSignature = msg.signature;
 		}
+		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+			this._state
+		);
 
 		const signedMsg: IFundingSignedMessage = {
 			channelId: this._state.channelId,
@@ -1882,6 +1910,16 @@ export class Channel {
 			return this._handleSpliceCommitmentSigned(msg);
 		}
 
+		// BOLT 2 v2 establishment: after both tx_completes the peers exchange
+		// commitment_signed for commitment #0 of the new funding output, before
+		// any tx_signatures. There is no prior commitment to revoke.
+		if (
+			this._state.state === ChannelState.AWAITING_TX_SIGNATURES &&
+			this._state.dualFundingSession
+		) {
+			return this._handleV2CommitmentSigned(msg);
+		}
+
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -1895,19 +1933,14 @@ export class Channel {
 		}
 
 		if (isTaprootChannel(this._state.channelType)) {
-			// option_taproot: verify the peer's MuSig2 partial over OUR next
-			// commitment using the verification nonce we advertised one step ahead
-			// (localNextNonce) + the peer's inline signing nonce, and store the
-			// partial + that signing nonce for force-close aggregation.
-			const err = this._verifyAndStoreRemotePartial(
-				msg.partialSignatureWithNonce,
-				this._state.localNextNonce,
-				this._state.localCommitmentNumber + 1n
-			);
-			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
-			}
-			// Verify the peer's Schnorr signatures over our second-level HTLC txs.
+			// Verify the peer's Schnorr sigs over our second-level HTLC txs FIRST
+			// (a pure check, no state writes) — _verifyAndStoreRemotePartial
+			// overwrites remoteCommitmentSignature/remoteSigningNonce on success,
+			// destroying the CURRENT commitment's force-close witness material.
+			// If the HTLC sigs then failed, a later force-close would aggregate
+			// the next commitment's partial against the current commitment's tx —
+			// an invalid, unminable witness. No state may change unless the whole
+			// message verifies.
 			if (this._state.remoteBasepoints) {
 				const htlcPoint = getPerCommitmentPoint(
 					this._state.localPerCommitmentSeed,
@@ -1927,6 +1960,18 @@ export class Channel {
 						}
 					];
 				}
+			}
+			// option_taproot: verify the peer's MuSig2 partial over OUR next
+			// commitment using the verification nonce we advertised one step ahead
+			// (localNextNonce) + the peer's inline signing nonce, and store the
+			// partial + that signing nonce for force-close aggregation.
+			const err = this._verifyAndStoreRemotePartial(
+				msg.partialSignatureWithNonce,
+				this._state.localNextNonce,
+				this._state.localCommitmentNumber + 1n
+			);
+			if (err) {
+				return [{ type: ChannelActionType.ERROR, message: err }];
 			}
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
@@ -1980,6 +2025,14 @@ export class Channel {
 			this._state.remoteCommitmentSignature = msg.signature;
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		}
+
+		// Record the exact feerate the just-verified signature covers, so a
+		// force-close rebuild reproduces this commitment byte-for-byte even if
+		// the committed configs move on (fee-update promotion, reestablish
+		// rollback, restart).
+		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+			this._state
+		);
 
 		// Reveal current per-commitment secret and advance
 		const currentSecret = getPerCommitmentSecret(
@@ -2236,6 +2289,21 @@ export class Channel {
 			];
 		}
 
+		// Dust re-trim guard (mirror of handleUpdateFee): never propose a rate
+		// that would trim our own in-flight HTLCs — same loss mode, self-inflicted.
+		if (
+			this._dustExposureAtRateMsat(feeratePerKw) >
+			Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
+				}
+			];
+		}
+
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only
 		// promoted to localConfig.feeratePerKw once the round irrevocably commits
@@ -2320,6 +2388,26 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Fee rate would drain opener below channel reserve'
+				}
+			];
+		}
+
+		// Dust re-trim guard: on non-anchor channels the trim threshold rises
+		// with the feerate, so a fee hike can push previously-untrimmed in-flight
+		// HTLCs below dust — silently burning their value into the commitment
+		// fee. Reject a feerate that would raise total dust exposure above the
+		// same ceiling enforced at HTLC-add time. Rejecting is safe: the ERROR
+		// path force-closes at the old committed rate, where the HTLCs are still
+		// untrimmed and claimable.
+		if (
+			this._dustExposureAtRateMsat(msg.feeratePerKw) >
+			Channel.MAX_DUST_HTLC_EXPOSURE_MSAT
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'update_fee would raise dust HTLC exposure above limit (in-flight HTLCs would be trimmed)'
 				}
 			];
 		}
@@ -2439,7 +2527,10 @@ export class Channel {
 		} = require('./commitment-builder');
 		const { createFundingScript } = require('../script/funding');
 
-		const built = buildLocal(this._state, perCommitmentPoint);
+		// Rebuild at the exact feerate the stored remote signature covers
+		// (signedLocal=true) — mid-fee-round the in-flight rate can differ,
+		// which would change the sighash and make the witness invalid.
+		const built = buildLocal(this._state, perCommitmentPoint, undefined, true);
 
 		if (isTaprootChannel(this._state.channelType)) {
 			// option_taproot: the funding output is a MuSig2 key-spend P2TR. The
@@ -2530,7 +2621,28 @@ export class Channel {
 	 * Initiate cooperative close by sending shutdown.
 	 */
 	initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		// Taproot channels have a MuSig2 P2TR funding output; the cooperative
+		// close path is ECDSA/P2WSH-only today, so an attempted close would
+		// hang unsatisfiable in NEGOTIATING_CLOSING. Fail closed instead —
+		// force-close is the supported exit for taproot channels.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cooperative close is not supported for taproot channels yet; use force-close'
+				}
+			];
+		}
+
+		// option_simple_close allows re-sending shutdown to update the local
+		// script mid-negotiation (restarting the signing flow); legacy close
+		// only permits initiating from NORMAL.
+		const simpleCloseResend =
+			this._state.simpleClose === true &&
+			(this._state.state === ChannelState.SHUTTING_DOWN ||
+				this._state.state === ChannelState.NEGOTIATING_CLOSING);
+		if (this._state.state !== ChannelState.NORMAL && !simpleCloseResend) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -2541,7 +2653,13 @@ export class Channel {
 
 		// Guard against a misconfigured local close script — never broadcast a
 		// shutdown whose output we could not spend.
-		if (!isValidShutdownScript(scriptPubkey, true)) {
+		if (
+			!isValidShutdownScript(
+				scriptPubkey,
+				true,
+				this._state.simpleClose === true
+			)
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -2551,7 +2669,13 @@ export class Channel {
 		}
 
 		this._state.localShutdownScript = scriptPubkey;
-		this._state.state = ChannelState.SHUTTING_DOWN;
+		if (this._state.state === ChannelState.NORMAL) {
+			this._state.state = ChannelState.SHUTTING_DOWN;
+		} else {
+			// Script update: abandon the in-flight closing_complete round; the
+			// manager restarts negotiation with the new script.
+			this.resetSimpleCloseNegotiation();
+		}
 
 		const msg: IShutdownMessage = {
 			channelId: this._state.channelId!,
@@ -2570,11 +2694,39 @@ export class Channel {
 	 *   a real script derived from the funding pubkey.
 	 */
 	handleShutdown(msg: IShutdownMessage, localScript?: Buffer): ChannelAction[] {
+		// Fail closed for taproot channels (see initiateShutdown): warn the peer
+		// and leave state untouched — their exit is force-close, which works.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				sendMsg(
+					MessageType.WARNING,
+					encodeErrorMessage(
+						createError(
+							msg.channelId,
+							'Cooperative close is not supported for taproot channels yet'
+						)
+					)
+				),
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cooperative close is not supported for taproot channels yet; use force-close'
+				}
+			];
+		}
+
 		// BOLT 2: reject a shutdown scriptPubkey that is not a standard spendable
 		// form. Without this, a buggy/malicious peer could strand the cooperative
 		// close output in an unspendable script. We accept any valid witness
-		// program (incl. P2TR) so taproot peers can coop-close cleanly.
-		if (!isValidShutdownScript(msg.scriptPubkey, true)) {
+		// program (incl. P2TR) so taproot peers can coop-close cleanly. OP_RETURN
+		// forms are additionally allowed under option_simple_close (dust burn).
+		if (
+			!isValidShutdownScript(
+				msg.scriptPubkey,
+				true,
+				this._state.simpleClose === true
+			)
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -2583,9 +2735,14 @@ export class Channel {
 			];
 		}
 
-		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after reestablish
+		// Accept shutdown in NEGOTIATING_CLOSING — peer retransmits after
+		// reestablish, or (simple close) updates its script mid-negotiation,
+		// which abandons our in-flight closing_complete round.
 		if (this._state.state === ChannelState.NEGOTIATING_CLOSING) {
 			this._state.remoteShutdownScript = msg.scriptPubkey;
+			if (this._state.simpleClose === true) {
+				this.resetSimpleCloseNegotiation();
+			}
 			return [];
 		}
 
@@ -2656,6 +2813,21 @@ export class Channel {
 			];
 		}
 
+		// Fund-safety: the closing tx pays out localBalanceMsat/remoteBalanceMsat
+		// only, so any in-flight HTLC's value would be silently burned to fees.
+		// BOLT 2 forbids starting fee negotiation until all HTLCs are resolved.
+		if (
+			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
+			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot propose closing fee: pending HTLCs'
+				}
+			];
+		}
+
 		this._state.state = ChannelState.NEGOTIATING_CLOSING;
 
 		// Calculate ideal fee from current fee rate
@@ -2695,6 +2867,22 @@ export class Channel {
 		) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected closing_signed' }
+			];
+		}
+
+		// Fund-safety: a peer MUST NOT send closing_signed while HTLCs are still
+		// pending (BOLT 2). The closing tx is built from the settled balances only,
+		// so signing here would burn any in-flight HTLC's value to miner fees.
+		// Stay in the current state (channel + funding watch intact) and error.
+		if (
+			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
+			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected closing_signed: pending HTLCs'
+				}
 			];
 		}
 
@@ -2822,6 +3010,451 @@ export class Channel {
 		}
 		this._state.closingFeeMin = min;
 		this._state.closingFeeMax = max < openerBalance ? max : openerBalance;
+	}
+
+	// ─────────────── option_simple_close ───────────────
+
+	/**
+	 * Stamp the negotiation path for this closing session. Set by the manager
+	 * from the init-feature intersection when shutdown starts, and re-evaluated
+	 * on reestablish (features are per-connection).
+	 */
+	setSimpleClose(simple: boolean): void {
+		this._state.simpleClose = simple;
+	}
+
+	isSimpleClose(): boolean {
+		return this._state.simpleClose === true;
+	}
+
+	/**
+	 * Reset in-flight simple-close negotiation. Called on reestablish: the spec
+	 * restarts negotiation on reconnect, so a pre-disconnect closing_complete is
+	 * abandoned (its closing_sig can never arrive on the new connection).
+	 */
+	resetSimpleCloseNegotiation(): void {
+		this._state.lastLocalClosingComplete = null;
+		this._state.awaitingClosingSig = false;
+	}
+
+	/**
+	 * Closer-side variant selection per BOLT 2 option_simple_close:
+	 * - own post-fee output dust → only closee_output_only
+	 * - closee output dust → only closer_output_only
+	 * - neither dust, we are the lesser-funded side → only closer_and_closee
+	 *   (the lesser-funded closer must not propose dropping the larger output)
+	 * - neither dust otherwise → both closer_output_only and closer_and_closee
+	 */
+	private selectCloserVariants(
+		feeSatoshis: bigint,
+		closerScript: Buffer,
+		closeeScript: Buffer
+	): ClosingSigVariant[] | { error: string } {
+		const ourValue = this._state.localBalanceMsat / 1000n - feeSatoshis;
+		const theirValue = this._state.remoteBalanceMsat / 1000n;
+		const ourDust = isDustOutput(closerScript, ourValue);
+		const theirDust = isDustOutput(closeeScript, theirValue);
+
+		if (ourDust && theirDust) {
+			// Both outputs dust: the spec's OP_RETURN-burn case. We never generate
+			// OP_RETURN shutdown scripts ourselves, so fail closed (a channel this
+			// empty can be force-closed at negligible cost).
+			return {
+				error: 'Simple close: both outputs would be dust; use force-close'
+			};
+		}
+		if (ourDust) return [ClosingSigVariant.CLOSEE_OUTPUT_ONLY];
+		if (theirDust) return [ClosingSigVariant.CLOSER_OUTPUT_ONLY];
+		if (this._state.localBalanceMsat < this._state.remoteBalanceMsat) {
+			return [ClosingSigVariant.CLOSER_AND_CLOSEE];
+		}
+		return [
+			ClosingSigVariant.CLOSER_OUTPUT_ONLY,
+			ClosingSigVariant.CLOSER_AND_CLOSEE
+		];
+	}
+
+	/**
+	 * Send closing_complete (we act as the CLOSER: the fee comes entirely out of
+	 * our output). Callable initially and again as an RBF bump once the previous
+	 * round was answered with closing_sig.
+	 */
+	sendClosingComplete(
+		feeSatoshis: bigint,
+		locktime: number,
+		signFn: (
+			variant: ClosingSigVariant,
+			feeSatoshis: bigint,
+			locktime: number,
+			closerScriptPubkey: Buffer,
+			closeeScriptPubkey: Buffer
+		) => Buffer
+	): ChannelAction[] {
+		const err = (message: string): ChannelAction[] => [
+			{ type: ChannelActionType.ERROR, message }
+		];
+
+		if (
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
+			this._state.state !== ChannelState.SHUTTING_DOWN
+		) {
+			return err('Cannot send closing_complete: wrong state');
+		}
+		if (
+			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
+			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
+		) {
+			return err('Cannot send closing_complete: pending HTLCs');
+		}
+		if (!this._state.simpleClose) {
+			return err('Cannot send closing_complete: simple close not negotiated');
+		}
+		if (this._state.awaitingClosingSig) {
+			return err(
+				'Cannot send closing_complete: awaiting closing_sig for previous one'
+			);
+		}
+		const closerScript = this._state.localShutdownScript;
+		const closeeScript = this._state.remoteShutdownScript;
+		if (!closerScript || closerScript.length === 0 || !closeeScript) {
+			return err('Cannot send closing_complete: shutdown scripts not set');
+		}
+		if (feeSatoshis < 0n) {
+			return err('Cannot send closing_complete: negative fee');
+		}
+		if (feeSatoshis > this._state.localBalanceMsat / 1000n) {
+			return err('Cannot send closing_complete: fee exceeds our balance');
+		}
+		const prev = this._state.lastLocalClosingComplete;
+		if (prev && feeSatoshis <= prev.feeSatoshis) {
+			return err(
+				'Cannot send closing_complete: RBF fee must increase ' +
+					`(${feeSatoshis} <= ${prev.feeSatoshis})`
+			);
+		}
+
+		const variants = this.selectCloserVariants(
+			feeSatoshis,
+			closerScript,
+			closeeScript
+		);
+		if (!Array.isArray(variants)) {
+			return err(variants.error);
+		}
+
+		const msg: IClosingCompleteMessage = {
+			channelId: this._state.channelId!,
+			closerScriptPubkey: closerScript,
+			closeeScriptPubkey: closeeScript,
+			feeSatoshis,
+			locktime
+		};
+		for (const variant of variants) {
+			const sig = signFn(
+				variant,
+				feeSatoshis,
+				locktime,
+				closerScript,
+				closeeScript
+			);
+			if (variant === ClosingSigVariant.CLOSER_OUTPUT_ONLY) {
+				msg.closerOutputOnlySig = sig;
+			} else if (variant === ClosingSigVariant.CLOSEE_OUTPUT_ONLY) {
+				msg.closeeOutputOnlySig = sig;
+			} else {
+				msg.closerAndCloseeSig = sig;
+			}
+		}
+
+		this._state.state = ChannelState.NEGOTIATING_CLOSING;
+		this._state.lastLocalClosingComplete = {
+			feeSatoshis,
+			locktime,
+			closerScript,
+			closeeScript,
+			sentVariants: variants
+		};
+		this._state.awaitingClosingSig = true;
+
+		return [
+			sendMsg(MessageType.CLOSING_COMPLETE, encodeClosingCompleteMessage(msg))
+		];
+	}
+
+	/**
+	 * RBF entry: re-send closing_complete at a strictly higher fee. Thin guard
+	 * around sendClosingComplete (which enforces monotonicity and the
+	 * one-in-flight rule).
+	 */
+	bumpClosingFee(
+		newFeeSatoshis: bigint,
+		locktime: number,
+		signFn: Parameters<Channel['sendClosingComplete']>[2]
+	): ChannelAction[] {
+		if (!this._state.lastLocalClosingComplete) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot bump closing fee: no closing_complete sent yet'
+				}
+			];
+		}
+		return this.sendClosingComplete(newFeeSatoshis, locktime, signFn);
+	}
+
+	/**
+	 * Handle closing_complete from the peer (we act as the CLOSEE: the fee comes
+	 * out of THEIR output; ours is untouched).
+	 *
+	 * Fund-safety: no CLOSED transition and no CHANNEL_CLOSED action unless the
+	 * peer's signature verifies over the exact tx we would broadcast — the same
+	 * posture as the legacy verifyClosingFn gate. All failures return ERROR and
+	 * leave the channel (and the funding watch upstream) intact.
+	 */
+	handleClosingComplete(
+		msg: IClosingCompleteMessage,
+		verifyFn: (
+			variant: ClosingSigVariant,
+			feeSatoshis: bigint,
+			locktime: number,
+			closerScriptPubkey: Buffer,
+			closeeScriptPubkey: Buffer,
+			signature: Buffer
+		) => boolean,
+		signFn: (
+			variant: ClosingSigVariant,
+			feeSatoshis: bigint,
+			locktime: number,
+			closerScriptPubkey: Buffer,
+			closeeScriptPubkey: Buffer
+		) => Buffer
+	): ChannelAction[] {
+		const err = (message: string): ChannelAction[] => [
+			{ type: ChannelActionType.ERROR, message }
+		];
+
+		// Concurrent-close race: both sides may send closing_complete. If we
+		// already reached CLOSED through one direction, still co-sign the peer's
+		// alternative close — both variants spend the same funding output and pay
+		// us our full balance, so only one can confirm and both are fund-safe.
+		// Without this, the peer would wait forever for its closing_sig.
+		const alreadyClosed =
+			this._state.state === ChannelState.CLOSED &&
+			this._state.simpleClose === true;
+		if (
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!alreadyClosed
+		) {
+			return err('Unexpected closing_complete');
+		}
+		if (
+			this.countPendingHtlcs(HtlcDirection.OFFERED) > 0 ||
+			this.countPendingHtlcs(HtlcDirection.RECEIVED) > 0
+		) {
+			return err('Unexpected closing_complete: pending HTLCs');
+		}
+		if (!this._state.simpleClose) {
+			return err('Unexpected closing_complete: simple close not negotiated');
+		}
+
+		// The closer pays the fee from its own (remote, from our view) balance.
+		if (msg.feeSatoshis > this._state.remoteBalanceMsat / 1000n) {
+			return err('closing_complete: fee exceeds closer balance');
+		}
+		// Their view of OUR script must match what we sent in shutdown.
+		if (
+			!this._state.localShutdownScript ||
+			!msg.closeeScriptPubkey.equals(this._state.localShutdownScript)
+		) {
+			return err('closing_complete: closee script does not match ours');
+		}
+		// Their script may differ from their shutdown (simple close allows script
+		// updates), but must still be a standard form (OP_RETURN allowed here).
+		if (!isValidShutdownScript(msg.closerScriptPubkey, true, true)) {
+			return err('closing_complete: invalid closer script');
+		}
+		this._state.remoteShutdownScript = msg.closerScriptPubkey;
+		if (!alreadyClosed) {
+			this._state.state = ChannelState.NEGOTIATING_CLOSING;
+		}
+
+		// Closee sig selection: own output dust → closer_output_only; otherwise
+		// prefer closer_and_closee, then closee_output_only. Never sign a variant
+		// that drops our non-dust output.
+		const ourValue = this._state.localBalanceMsat / 1000n;
+		const ourDust = isDustOutput(msg.closeeScriptPubkey, ourValue);
+		let variant: ClosingSigVariant;
+		let theirSig: Buffer;
+		if (ourDust) {
+			if (!msg.closerOutputOnlySig) {
+				return err(
+					'closing_complete: our output is dust but no closer_output_only sig'
+				);
+			}
+			variant = ClosingSigVariant.CLOSER_OUTPUT_ONLY;
+			theirSig = msg.closerOutputOnlySig;
+		} else if (msg.closerAndCloseeSig) {
+			variant = ClosingSigVariant.CLOSER_AND_CLOSEE;
+			theirSig = msg.closerAndCloseeSig;
+		} else if (msg.closeeOutputOnlySig) {
+			variant = ClosingSigVariant.CLOSEE_OUTPUT_ONLY;
+			theirSig = msg.closeeOutputOnlySig;
+		} else {
+			// Only closer_output_only offered but our output is not dust — signing
+			// it would burn our balance to their close. Refuse.
+			return err(
+				'closing_complete: peer offered only closer_output_only for our non-dust output'
+			);
+		}
+
+		if (
+			!verifyFn(
+				variant,
+				msg.feeSatoshis,
+				msg.locktime,
+				msg.closerScriptPubkey,
+				msg.closeeScriptPubkey,
+				theirSig
+			)
+		) {
+			return err('closing_complete: peer signature failed to verify');
+		}
+
+		const ourSig = signFn(
+			variant,
+			msg.feeSatoshis,
+			msg.locktime,
+			msg.closerScriptPubkey,
+			msg.closeeScriptPubkey
+		);
+		const reply: IClosingSigMessage = {
+			channelId: this._state.channelId!,
+			closerScriptPubkey: msg.closerScriptPubkey,
+			closeeScriptPubkey: msg.closeeScriptPubkey,
+			feeSatoshis: msg.feeSatoshis,
+			locktime: msg.locktime
+		};
+		if (variant === ClosingSigVariant.CLOSER_OUTPUT_ONLY) {
+			reply.closerOutputOnlySig = ourSig;
+		} else if (variant === ClosingSigVariant.CLOSEE_OUTPUT_ONLY) {
+			reply.closeeOutputOnlySig = ourSig;
+		} else {
+			reply.closerAndCloseeSig = ourSig;
+		}
+
+		const actions: ChannelAction[] = [
+			sendMsg(MessageType.CLOSING_SIG, encodeClosingSigMessage(reply))
+		];
+		if (!alreadyClosed) {
+			this._state.state = ChannelState.CLOSED;
+			actions.push({
+				type: ChannelActionType.CHANNEL_CLOSED,
+				channelId: this._state.channelId!
+			});
+		}
+		return actions;
+	}
+
+	/**
+	 * Handle closing_sig from the peer (we are the CLOSER). The message must
+	 * echo our last closing_complete exactly and carry exactly one signature,
+	 * for a variant we actually sent.
+	 */
+	handleClosingSig(
+		msg: IClosingSigMessage,
+		verifyFn: (
+			variant: ClosingSigVariant,
+			feeSatoshis: bigint,
+			locktime: number,
+			closerScriptPubkey: Buffer,
+			closeeScriptPubkey: Buffer,
+			signature: Buffer
+		) => boolean
+	): ChannelAction[] {
+		const err = (message: string): ChannelAction[] => [
+			{ type: ChannelActionType.ERROR, message }
+		];
+
+		// Concurrent-close race: our closing_complete may be answered after we
+		// already reached CLOSED as the closee of the peer's round. Accept it —
+		// broadcasting our alternative close tx is fund-safe (same funding
+		// output, our balance paid in full either way).
+		const alreadyClosed =
+			this._state.state === ChannelState.CLOSED &&
+			this._state.simpleClose === true;
+		if (
+			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
+			!alreadyClosed
+		) {
+			return err('Unexpected closing_sig');
+		}
+		const last = this._state.lastLocalClosingComplete;
+		if (!last || !this._state.awaitingClosingSig) {
+			return err('closing_sig without a pending closing_complete');
+		}
+		if (
+			msg.feeSatoshis !== last.feeSatoshis ||
+			msg.locktime !== last.locktime ||
+			!msg.closerScriptPubkey.equals(last.closerScript) ||
+			!msg.closeeScriptPubkey.equals(last.closeeScript)
+		) {
+			return err('closing_sig does not echo our closing_complete');
+		}
+
+		const sigs: Array<{ variant: ClosingSigVariant; sig: Buffer }> = [];
+		if (msg.closerOutputOnlySig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSER_OUTPUT_ONLY,
+				sig: msg.closerOutputOnlySig
+			});
+		}
+		if (msg.closeeOutputOnlySig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSEE_OUTPUT_ONLY,
+				sig: msg.closeeOutputOnlySig
+			});
+		}
+		if (msg.closerAndCloseeSig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSER_AND_CLOSEE,
+				sig: msg.closerAndCloseeSig
+			});
+		}
+		if (sigs.length !== 1) {
+			return err(
+				`closing_sig must carry exactly one signature, got ${sigs.length}`
+			);
+		}
+		const { variant, sig } = sigs[0];
+		if (!last.sentVariants.includes(variant)) {
+			return err('closing_sig signature variant was not offered by us');
+		}
+
+		if (
+			!verifyFn(
+				variant,
+				msg.feeSatoshis,
+				msg.locktime,
+				msg.closerScriptPubkey,
+				msg.closeeScriptPubkey,
+				sig
+			)
+		) {
+			return err('closing_sig: peer signature failed to verify');
+		}
+
+		this._state.awaitingClosingSig = false;
+		if (alreadyClosed) {
+			return [];
+		}
+		this._state.state = ChannelState.CLOSED;
+		return [
+			{
+				type: ChannelActionType.CHANNEL_CLOSED,
+				channelId: this._state.channelId!
+			}
+		];
 	}
 
 	// ─────────────── Reconnection ───────────────
@@ -4896,6 +5529,9 @@ export class Channel {
 		if (this._spliceRemoteCommitmentSig) {
 			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
 			this._state.remoteHtlcSignatures = [];
+			this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+				this._state
+			);
 		} else {
 			this._state.needsCommitment = true;
 		}
@@ -4951,29 +5587,56 @@ export class Channel {
 	 */
 	static readonly MAX_DUST_HTLC_EXPOSURE_MSAT = 5_000_000n; // 5000 sats
 
-	/** Whether an HTLC of this amount would be trimmed (dust) on the commitment. */
-	private _isDustHtlc(amountMsat: bigint): boolean {
+	/**
+	 * Whether an HTLC of this amount would be trimmed (dust) on at least one of
+	 * the two commitments at the given feerate. Mirrors the commitment builder's
+	 * trim rule (dust_limit + second-level tx fee): for non-anchor channels the
+	 * threshold is feerate-dependent, and every HTLC is a received-HTLC (success
+	 * weight, the larger of the two) on one side's commitment, so success weight
+	 * is the binding threshold regardless of direction. Anchor channels use
+	 * zero-fee second-level txs, making the threshold the static dust limit.
+	 */
+	private _isDustHtlcAtRate(amountMsat: bigint, feeratePerKw: number): boolean {
 		const dustLimitSats =
 			this._state.localConfig.dustLimitSatoshis >
 			this._state.remoteConfig.dustLimitSatoshis
 				? this._state.localConfig.dustLimitSatoshis
 				: this._state.remoteConfig.dustLimitSatoshis;
-		return amountMsat < dustLimitSats * 1000n;
+		let secondLevelFeeSats = 0n;
+		if (!isAnchorChannel(this._state.channelType)) {
+			secondLevelFeeSats = BigInt(
+				Math.floor((HTLC_SUCCESS_WEIGHT * feeratePerKw) / 1000)
+			);
+		}
+		return amountMsat < (dustLimitSats + secondLevelFeeSats) * 1000n;
 	}
 
-	/** Total in-flight dust-HTLC value (both directions), in msat. */
-	private _dustExposureMsat(): bigint {
+	/** Whether an HTLC of this amount would be trimmed (dust) on the commitment. */
+	private _isDustHtlc(amountMsat: bigint): boolean {
+		return this._isDustHtlcAtRate(
+			amountMsat,
+			getCommitmentFeeRate(this._state)
+		);
+	}
+
+	/** Total in-flight dust-HTLC value (both directions) at a feerate, in msat. */
+	private _dustExposureAtRateMsat(feeratePerKw: number): bigint {
 		let total = 0n;
 		for (const entry of this._state.htlcs.values()) {
 			if (
 				(entry.state === HtlcState.PENDING ||
 					entry.state === HtlcState.COMMITTED) &&
-				this._isDustHtlc(entry.amountMsat)
+				this._isDustHtlcAtRate(entry.amountMsat, feeratePerKw)
 			) {
 				total += entry.amountMsat;
 			}
 		}
 		return total;
+	}
+
+	/** Total in-flight dust-HTLC value (both directions), in msat. */
+	private _dustExposureMsat(): bigint {
+		return this._dustExposureAtRateMsat(getCommitmentFeeRate(this._state));
 	}
 
 	private _countActiveHtlcs(): number {
@@ -5371,6 +6034,19 @@ export class Channel {
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = params.commitmentFeeratePerkw;
 		this._state.fundingLocktime = params.locktime;
+		// Both sides must build the identical commitment #0: pin our (opener)
+		// committed feerate to the NEGOTIATED commitment feerate — the acceptor
+		// signs at msg.commitmentFeeratePerkw, and getCommitmentFeeRate reads
+		// localConfig for the opener — and record the channel type so
+		// anchor/taproot dispatch sees the negotiated value.
+		this._state.localConfig.feeratePerKw = params.commitmentFeeratePerkw;
+		if (params.channelType) {
+			this._state.channelType = Buffer.from(params.channelType);
+		} else {
+			const defaultType = FeatureFlags.empty();
+			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			this._state.channelType = defaultType.toBuffer();
+		}
 
 		const session = new DualFundingSession(
 			true,
@@ -5432,6 +6108,16 @@ export class Channel {
 		this._state.dualFundingSession = session;
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
+		// Record the negotiated channel type (session validated any mismatch) so
+		// commitment #0 is built with the same anchor/taproot dispatch on both
+		// sides. Default per BOLT 2: static_remotekey.
+		if (msg.channelType) {
+			this._state.channelType = Buffer.from(msg.channelType);
+		} else {
+			const defaultType = FeatureFlags.empty();
+			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			this._state.channelType = defaultType.toBuffer();
+		}
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
 		// Dual funding v2: reconcile per-side balances from BOTH contributions.
@@ -5445,6 +6131,25 @@ export class Channel {
 		this._state.fundingSatoshis = openerFunding + acceptorFunding;
 		this._state.localBalanceMsat = acceptorFunding * 1000n;
 		this._state.remoteBalanceMsat = openerFunding * 1000n;
+
+		// Populate remoteConfig from the opener's open_channel2 so BOTH sides build
+		// commitment #0 byte-identically. The opener PAYS the commitment fee, so the
+		// acceptor's fee rate is the opener's commitment_feerate. Without this the
+		// acceptor built at the default 253 sat/kw and the commitment_signed round
+		// failed for any negotiated feerate. channel_reserve is not carried in v2
+		// (computed, and it does not affect commitment bytes).
+		this._state.remoteConfig = {
+			dustLimitSatoshis: msg.dustLimitSatoshis,
+			maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
+			channelReserveSatoshis: computeChannelReserve(
+				this._state.fundingSatoshis,
+				msg.dustLimitSatoshis
+			),
+			htlcMinimumMsat: msg.htlcMinimumMsat,
+			toSelfDelay: msg.toSelfDelay,
+			maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
+			feeratePerKw: msg.commitmentFeeratePerkw
+		};
 
 		// Script-enforced lease and simple taproot channels are MUTUALLY-EXCLUSIVE
 		// commitment types: LND has no taproot lease script (its taproot to_local and
@@ -5539,6 +6244,23 @@ export class Channel {
 		const acceptorFunding = msg.fundingSatoshis;
 		this._state.fundingSatoshis += acceptorFunding;
 		this._state.remoteBalanceMsat += acceptorFunding * 1000n;
+
+		// Populate remoteConfig from accept_channel2 so we build the acceptor's
+		// commitment #0 with the acceptor's negotiated dust/delay. accept_channel2
+		// carries no feerate (the opener sets it), so the acceptor's fee rate is our
+		// own commitment feerate (which we build both commitments at).
+		this._state.remoteConfig = {
+			dustLimitSatoshis: msg.dustLimitSatoshis,
+			maxHtlcValueInFlightMsat: msg.maxHtlcValueInFlightMsat,
+			channelReserveSatoshis: computeChannelReserve(
+				this._state.fundingSatoshis,
+				msg.dustLimitSatoshis
+			),
+			htlcMinimumMsat: msg.htlcMinimumMsat,
+			toSelfDelay: msg.toSelfDelay,
+			maxAcceptedHtlcs: msg.maxAcceptedHtlcs,
+			feeratePerKw: this._state.commitmentFeeratePerkw
+		};
 
 		// Liquidity ads (bLIP-0051): if the seller committed will_fund, we (the
 		// buyer) pay the lease fee — shift it from us (local) to the seller
@@ -5979,13 +6701,17 @@ export class Channel {
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 		}
 
+		// BOLT 2 v2: once both sides have completed, the commitment_signed
+		// exchange starts (before any tx_signatures). Ours goes out right after
+		// our tx_complete on the wire.
 		return [
 			sendMsg(
 				MessageType.TX_COMPLETE,
 				encodeTxCompleteMessage({
 					channelId: this._state.temporaryChannelId
 				})
-			)
+			),
+			...this._maybeSendV2Commitment()
 		];
 	}
 
@@ -6023,16 +6749,313 @@ export class Channel {
 			];
 		}
 
-		// If both sides are now complete, move to AWAITING_TX_SIGNATURES
+		// If both sides are now complete, move to AWAITING_TX_SIGNATURES and
+		// start the commitment_signed exchange (BOLT 2 v2: it precedes
+		// tx_signatures).
 		if (session.getState() === DualFundingState.AWAITING_TX_SIGNATURES) {
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+			return this._maybeSendV2Commitment();
 		}
 
 		return [];
 	}
 
 	/**
-	 * Provide our tx_signatures for the funding transaction.
+	 * Deterministically assemble the negotiated v2 funding transaction and
+	 * locate the 2-of-2 funding output. Both peers must know the funding
+	 * outpoint BEFORE any signatures are exchanged: the commitment_signed round
+	 * that precedes tx_signatures signs commitment #0 spending this outpoint.
+	 * Also the fund-safety check that the negotiated tx actually contains the
+	 * funding output carrying the full negotiated capacity — returns null (the
+	 * caller errors) when it does not.
+	 */
+	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+		const session = this._state.dualFundingSession;
+		if (!session || !this._state.remoteBasepoints) return null;
+		const built = session.buildTransaction();
+		if (!built) return null;
+		const {
+			buildSpliceTx: buildV2Tx,
+			findOutputIndex: findFundingIndex
+		} = require('./splice-tx');
+		const { createFundingScript } = require('../script/funding');
+		let tx;
+		try {
+			// The interactive-tx final ordering (ascending serial_id) is exactly
+			// what buildSpliceTx produces; both sides derive the identical txid.
+			tx = buildV2Tx(
+				built.inputs.map((i: IInteractiveTxInput) => ({
+					serialId: i.serialId,
+					prevTxid:
+						i.prevTx && i.prevTx.length >= 32
+							? extractTxidFromPrevTx(i.prevTx)
+							: i.prevTxid,
+					prevOutputIndex: i.prevTxVout ?? i.prevOutputIndex,
+					sequence: i.sequence
+				})),
+				built.outputs.map((o: IInteractiveTxOutput) => ({
+					serialId: o.serialId,
+					script: o.scriptPubkey,
+					valueSats: o.amountSats
+				})),
+				built.locktime
+			);
+		} catch {
+			return null;
+		}
+		const funding = createFundingScript(
+			this._state.localBasepoints.fundingPubkey,
+			this._state.remoteBasepoints.fundingPubkey
+		);
+		const outputIndex = findFundingIndex(tx, funding.p2wshOutput);
+		if (outputIndex < 0) return null;
+		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
+			return null;
+		}
+		return { txid: Buffer.from(tx.getHash()), outputIndex };
+	}
+
+	/**
+	 * Send our commitment_signed for the peer's commitment #0 once both sides
+	 * have sent tx_complete (BOLT 2 v2 establishment: the commitment_signed
+	 * exchange precedes tx_signatures). Idempotent.
+	 */
+	private _maybeSendV2Commitment(): ChannelAction[] {
+		const session = this._state.dualFundingSession;
+		if (
+			!session ||
+			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES ||
+			this._v2SentCommitment ||
+			!this._signer ||
+			!this._state.remoteBasepoints ||
+			!this._state.remoteCurrentPerCommitmentPoint
+		) {
+			return [];
+		}
+		// v2 + simple taproot would need a MuSig2 funding co-sign round that
+		// does not exist yet — fail closed rather than open without an exit.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Taproot dual-funded (v2) opens are not supported'
+				}
+			];
+		}
+		const fo = this._v2FundingOutpoint();
+		if (!fo) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'v2 funding tx does not pay the negotiated funding output — refusing to sign'
+				}
+			];
+		}
+		// signRemoteCommitment reads the funding outpoint from state; set it
+		// (and the permanent channel id) now, before either side has released
+		// any signature.
+		this._state.fundingTxid = fo.txid;
+		this._state.fundingOutputIndex = fo.outputIndex;
+		const { deriveChannelId: deriveChanId } = require('./validation');
+		this._state.channelId = deriveChanId(fo.txid, fo.outputIndex);
+
+		const { signature, htlcSignatures } = signRemoteCommitment(
+			this._state,
+			this._signer,
+			this._state.remoteCurrentPerCommitmentPoint,
+			0n
+		);
+		this._v2SentCommitment = true;
+		const msg: ICommitmentSignedMessage = {
+			channelId: this._state.channelId!,
+			signature,
+			htlcSignatures
+		};
+		// Persist BEFORE the message leaves: the peer holds our signature from
+		// this point on.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.COMMITMENT_SIGNED, encodeCommitmentSignedMessage(msg))
+		];
+	}
+
+	/**
+	 * Handle the peer's commitment_signed during a v2 open: ensure ours went
+	 * out (the peer may sign first), verify their signature over OUR commitment
+	 * #0 — the funding_signed analogue; without it the channel has no
+	 * unilateral exit — adopt it, then release tx_signatures per the ordering
+	 * rules.
+	 */
+	private _handleV2CommitmentSigned(
+		msg: ICommitmentSignedMessage
+	): ChannelAction[] {
+		const actions: ChannelAction[] = [];
+		actions.push(...this._maybeSendV2Commitment());
+		if (actions.some((a) => a.type === ChannelActionType.ERROR)) {
+			return actions;
+		}
+		if (this._v2ReceivedCommitment) {
+			// Duplicate (retransmit): the first one was verified and adopted.
+			return actions;
+		}
+		if (this._signer && this._state.remoteBasepoints) {
+			const point0 = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				0n
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				point0,
+				msg.signature,
+				0n
+			);
+			if (!valid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid commitment signature in v2 open'
+					}
+				];
+			}
+		}
+		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
+		this._state.remoteHtlcSignatures = [];
+		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+			this._state
+		);
+		this._v2ReceivedCommitment = true;
+		actions.push({ type: ChannelActionType.PERSIST_STATE });
+		// Commitment round complete — release tx_signatures if ordering allows.
+		actions.push(...this._maybeSendV2TxSigs());
+		return actions;
+	}
+
+	/**
+	 * BOLT 2 interactive-tx ordering: the peer whose inputs contribute less
+	 * total value sends tx_signatures first (the spec tie-break is the lowest
+	 * node_id, which the channel does not know — fall back to the
+	 * non-initiator, matching the splice convention: deterministic and
+	 * symmetric between beignet peers).
+	 */
+	private _v2ShouldSignFirst(): boolean {
+		const session = this._state.dualFundingSession;
+		if (!session) return false;
+		const builder = session.getTxBuilder();
+		if (!builder) return !session.isInitiator();
+		const bitcoin = require('bitcoinjs-lib');
+		let ours = 0n;
+		let theirs = 0n;
+		for (const input of builder.getInputs()) {
+			// Even serial ids belong to the initiator.
+			const isOurs = (input.serialId % 2n === 0n) === session.isInitiator();
+			let value: bigint | null = null;
+			if (input.prevTx && input.prevTx.length > 0) {
+				try {
+					const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+					const vout = input.prevTxVout ?? input.prevOutputIndex;
+					value = BigInt(prev.outs[vout].value);
+				} catch {
+					value = null;
+				}
+			}
+			if (value === null) {
+				// Unknown input value — cannot apply the spec rule.
+				return !session.isInitiator();
+			}
+			if (isOurs) ours += value;
+			else theirs += value;
+		}
+		if (ours !== theirs) return ours < theirs;
+		return !session.isInitiator();
+	}
+
+	/**
+	 * Release our tx_signatures once (a) the commitment_signed round finished
+	 * with a VERIFIED peer signature over our commitment #0 — the hard
+	 * fund-safety gate; releasing witnesses lets the peer broadcast the funding
+	 * tx — and (b) the interactive-tx ordering allows it (we sign first, or
+	 * the peer's tx_signatures already arrived). Idempotent; defers otherwise.
+	 */
+	private _maybeSendV2TxSigs(): ChannelAction[] {
+		const session = this._state.dualFundingSession;
+		if (!session) return [];
+		if (
+			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES &&
+			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
+		) {
+			return [];
+		}
+		if (!this._v2SentCommitment || !this._v2ReceivedCommitment) return [];
+		const peerSigned = session.getRemoteWitnesses() !== null;
+		if (!peerSigned && !this._v2ShouldSignFirst()) return [];
+
+		// A side that contributed no inputs has nothing to sign: auto-fill an
+		// empty witness set so a zero-contribution acceptor needs no wallet.
+		if (!this._v2PendingTxSigs) {
+			const builder = session.getTxBuilder();
+			const ownsInput = builder
+				?.getInputs()
+				.some((i) => (i.serialId % 2n === 0n) === session.isInitiator());
+			if (ownsInput !== false) return [];
+			const fo = this._v2FundingOutpoint();
+			if (!fo) return [];
+			this._v2PendingTxSigs = {
+				txid: fo.txid,
+				outputIndex: fo.outputIndex,
+				witnesses: []
+			};
+		}
+
+		const { txid, outputIndex, witnesses } = this._v2PendingTxSigs;
+		const result = session.provideWitnesses(txid, outputIndex, witnesses);
+		if (!result.ok) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: result.error || 'Failed to provide witnesses'
+				}
+			];
+		}
+		this._v2PendingTxSigs = null;
+
+		// Funding info was already set when the commitment round started; keep
+		// the assignment idempotent for callers that reached here another way.
+		this._state.fundingTxid = Buffer.from(txid);
+		this._state.fundingOutputIndex = outputIndex;
+		const { deriveChannelId: deriveChanId } = require('./validation');
+		this._state.channelId = deriveChanId(txid, outputIndex);
+
+		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
+			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		}
+
+		const msg: ITxSignaturesMessage = {
+			channelId: this._state.temporaryChannelId,
+			txid,
+			witnesses
+		};
+
+		return [
+			// Point of no return — the peer can broadcast once this leaves.
+			// Persist BEFORE sending.
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg)),
+			{
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: txid,
+				fundingOutputIndex: outputIndex,
+				minimumDepth: this._state.minimumDepth
+			}
+		];
+	}
+
+	/**
+	 * Provide our tx_signatures for the funding transaction. The witnesses are
+	 * released only after the commitment_signed exchange completes and the
+	 * interactive-tx ordering allows — until then they are held pending and
+	 * flushed automatically (empty action list means deferred, not failed).
 	 */
 	sendTxSignatures(
 		txid: Buffer,
@@ -6058,47 +7081,25 @@ export class Channel {
 			];
 		}
 
-		const result = session.provideWitnesses(txid, outputIndex, witnesses);
-		if (!result.ok) {
+		// The caller's txid must match the tx both sides actually negotiated —
+		// witnesses signed over anything else must never leave.
+		const fo = this._v2FundingOutpoint();
+		if (!fo || !fo.txid.equals(txid) || fo.outputIndex !== outputIndex) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to provide witnesses'
+					message:
+						'tx_signatures txid/output does not match the negotiated funding tx'
 				}
 			];
 		}
 
-		// Set funding info on channel state
-		this._state.fundingTxid = Buffer.from(txid);
-		this._state.fundingOutputIndex = outputIndex;
-
-		// Derive permanent channel ID
-		const { deriveChannelId: deriveChanId } = require('./validation');
-		this._state.channelId = deriveChanId(txid, outputIndex);
-
-		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
-			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
-		}
-
-		const msg: ITxSignaturesMessage = {
-			channelId: this._state.temporaryChannelId,
-			txid,
+		this._v2PendingTxSigs = {
+			txid: Buffer.from(txid),
+			outputIndex,
 			witnesses
 		};
-
-		const actions: ChannelAction[] = [
-			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
-		];
-
-		// Watch for funding confirmation
-		actions.push({
-			type: ChannelActionType.WATCH_FUNDING,
-			fundingTxid: txid,
-			fundingOutputIndex: outputIndex,
-			minimumDepth: this._state.minimumDepth
-		});
-
-		return actions;
+		return this._maybeSendV2TxSigs();
 	}
 
 	/**
@@ -6188,6 +7189,19 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2 v2: tx_signatures MUST NOT be exchanged before the
+		// commitment_signed round completes. Without this gate the old path
+		// reached AWAITING_FUNDING_CONFIRMED with no commitment signature at
+		// all — a funded channel with no unilateral exit.
+		if (!this._v2SentCommitment || !this._v2ReceivedCommitment) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'tx_signatures before the commitment_signed exchange'
+				}
+			];
+		}
+
 		const result = session.handlePeerWitnesses(msg.txid, msg.witnesses);
 		if (!result.ok) {
 			return [
@@ -6208,11 +7222,17 @@ export class Channel {
 			);
 		}
 
+		const actions: ChannelAction[] = [];
+		// We may have been holding our own tx_signatures for the peer to sign
+		// first — flush them now.
+		actions.push(...this._maybeSendV2TxSigs());
+
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
 		}
 
-		return [];
+		return actions;
 	}
 
 	/**

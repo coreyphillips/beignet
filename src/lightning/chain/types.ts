@@ -49,6 +49,14 @@ export interface ITrackedOutput {
 	originalFeeRate?: number;
 	/** Hex of the sweep transaction for re-broadcast */
 	sweepTxHex?: string;
+	/**
+	 * For a revoked second-level justice claim: hex of the cheater's confirmed
+	 * HTLC-success/timeout tx whose output this claim spends. Retained so the
+	 * claim can be re-resolved and fee-bumped (RBF) if it stalls before the
+	 * cheater's to_self_delay matures — the claim's own txid is the second-level
+	 * tx, not the revoked commitment, so rebuildSweep needs it to reconstruct.
+	 */
+	secondLevelTxHex?: string;
 	/** Current fee rate for this output's sweep (tracks per-output bumps) */
 	currentFeeRate?: number;
 	/** Index into remoteHtlcSignatures for HTLC outputs (BOLT 3 ordering) */

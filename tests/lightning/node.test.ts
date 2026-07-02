@@ -1709,6 +1709,149 @@ describe('Lightning Node', function () {
 				PaymentStatus.COMPLETED
 			);
 		});
+
+		it('pays a GENERATED 3-node blinded path (Dave builds [Bob → Carol → Dave] from his graph)', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			const carol = createNode(3);
+			const dave = createNode(4);
+			connectNodes(alice, bob);
+			connectNodes(bob, carol);
+			connectNodes(carol, dave);
+
+			const abChannelId = openReadyChannel(alice, bob, 2_000_000n);
+			const bcChannelId = openReadyChannel(bob, carol, 2_000_000n);
+			const cdChannelId = openReadyChannel(carol, dave, 2_000_000n);
+
+			const scidAB = encodeShortChannelId({
+				block: 901,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidBC = encodeShortChannelId({
+				block: 901,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			const scidCD = encodeShortChannelId({
+				block: 901,
+				txIndex: 3,
+				outputIndex: 0
+			});
+			bob.registerChannelScid(abChannelId, scidAB);
+			bob.registerChannelScid(bcChannelId, scidBC);
+			carol.registerChannelScid(bcChannelId, scidBC);
+			carol.registerChannelScid(cdChannelId, scidCD);
+			alice.registerChannelScid(abChannelId, scidAB);
+
+			const alicePub = getPublicKey(nodePrivkeyFor(1));
+			const bobPub = getPublicKey(nodePrivkeyFor(2));
+			const carolPub = getPublicKey(nodePrivkeyFor(3));
+
+			// Dave's channel needs an SCID Carol recognizes so the generated peer
+			// hop can name the forwarding channel.
+			const daveChannel = dave.getChannelManager().getChannel(cdChannelId)!;
+			daveChannel.getFullState().scidAlias = scidCD;
+
+			// Dave's graph knows the public Bob↔Carol edge (Bob's policy authored
+			// for the Bob→Carol direction) — the raw material for the extension.
+			const bcIs1 = Buffer.compare(bobPub, carolPub) < 0;
+			dave.getGraph().addChannelAnnouncement({
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scidBC,
+				nodeId1: bcIs1 ? bobPub : carolPub,
+				nodeId2: bcIs1 ? carolPub : bobPub,
+				bitcoinKey1: Buffer.alloc(33, 2),
+				bitcoinKey2: Buffer.alloc(33, 3)
+			});
+			dave.getGraph().applyChannelUpdate({
+				signature: Buffer.alloc(64),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scidBC,
+				timestamp: Math.floor(Date.now() / 1000),
+				messageFlags: 1,
+				channelFlags: bcIs1 ? 0 : 1, // Bob-authored direction
+				cltvExpiryDelta: 40,
+				htlcMinimumMsat: 1000n,
+				feeBaseMsat: 1000,
+				feeProportionalMillionths: 0,
+				htlcMaximumMsat: 1_000_000_000n
+			});
+
+			// Alice's graph knows her route to Bob (the introduction node).
+			const abIs1 = Buffer.compare(alicePub, bobPub) < 0;
+			alice.getGraph().addChannelAnnouncement({
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scidAB,
+				nodeId1: abIs1 ? alicePub : bobPub,
+				nodeId2: abIs1 ? bobPub : alicePub,
+				bitcoinKey1: Buffer.alloc(33, 2),
+				bitcoinKey2: Buffer.alloc(33, 3)
+			});
+			for (const dir of [0, 1]) {
+				alice.getGraph().applyChannelUpdate({
+					signature: Buffer.alloc(64),
+					chainHash: BITCOIN_CHAIN_HASH,
+					shortChannelId: scidAB,
+					timestamp: Math.floor(Date.now() / 1000),
+					messageFlags: 1,
+					channelFlags: dir,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 1000n,
+					feeBaseMsat: 1000,
+					feeProportionalMillionths: 1,
+					htlcMaximumMsat: 1_000_000_000n
+				});
+			}
+
+			// Dave GENERATES the blinded invoice — no hand-built path.
+			const inv = dave.createInvoice({
+				amountMsat: 5_000_000n,
+				description: 'generated-3hop',
+				useBlindedPaths: true
+			});
+			const decoded = decodeInvoice(inv.bolt11);
+			expect(
+				decoded.blindedPaths,
+				'invoice carries a blinded path'
+			).to.have.length(1);
+			const bp = decoded.blindedPaths![0];
+			expect(bp.path.blindedHops, 'generated path has 3 nodes').to.have.length(
+				3
+			);
+			// Bob (two hops from Dave) is the introduction node — Carol stays hidden.
+			expect(bp.path.introductionNodeId).to.deep.equal(bobPub);
+
+			let bobFwd = false;
+			let carolFwd = false;
+			bob.on('htlc:forward', () => {
+				bobFwd = true;
+			});
+			carol.on('htlc:forward', () => {
+				carolFwd = true;
+			});
+
+			alice.sendPayment(inv.bolt11);
+
+			expect(bobFwd, 'Bob (intro) forwarded').to.be.true;
+			expect(carolFwd, 'Carol (mid) forwarded').to.be.true;
+			expect(dave.getPayment(decoded.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(alice.getPayment(decoded.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+		});
 	});
 
 	describe('HTLC Forwarding', function () {

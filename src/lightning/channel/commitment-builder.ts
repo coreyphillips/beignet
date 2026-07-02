@@ -227,7 +227,18 @@ function sumHtlcRemainders(
  * Get the fee rate for the commitment tx.
  * The opener sets the fee rate.
  */
-export function getCommitmentFeeRate(state: IChannelState): number {
+export function getCommitmentFeeRate(
+	state: IChannelState,
+	signedLocal = false
+): number {
+	// Rebuilding the CURRENT SIGNED local commitment (force-close, on-chain
+	// claims of pre-signed second-level HTLC txs): use the exact rate the
+	// stored remote signature was verified against. Mid-fee-round the in-flight
+	// rate below can differ from it, and any difference changes the sighash and
+	// invalidates the signature.
+	if (signedLocal && state.lastSignedCommitFeeratePerKw !== undefined) {
+		return state.lastSignedCommitFeeratePerKw;
+	}
 	// A staged (proposed) fee update applies to the in-flight commitment for both
 	// parties — they both saw the update_fee before this round. It becomes the
 	// committed config once the round finalizes (or is rolled back on reestablish).
@@ -342,7 +353,8 @@ export interface IBuiltCommitment {
 export function buildLocalCommitment(
 	state: IChannelState,
 	perCommitmentPoint: Buffer,
-	commitmentNumber?: bigint
+	commitmentNumber?: bigint,
+	signedLocal = false
 ): IBuiltCommitment {
 	if (!state.remoteBasepoints || !state.fundingTxid) {
 		throw new Error('Channel state not ready for commitment building');
@@ -377,7 +389,7 @@ export function buildLocalCommitment(
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	// Calculate commitment fee (BOLT 3): opener pays the fee
-	const feeratePerKw = getCommitmentFeeRate(state);
+	const feeratePerKw = getCommitmentFeeRate(state, signedLocal);
 
 	// Build HTLC outputs, then trim per BOLT 3 (dust_limit + second-level fee).
 	// The SAME trimmed set feeds both the commitment outputs and the
@@ -910,10 +922,13 @@ export function aggregateLocalCommitmentSig(
 	localPerCommitmentPoint: Buffer,
 	commitmentNumber?: bigint
 ): Buffer {
+	// Force-close aggregation: rebuild at the feerate the stored partial covers
+	// (signedLocal), not the in-flight rate — see getCommitmentFeeRate.
 	const built = buildLocalCommitment(
 		state,
 		localPerCommitmentPoint,
-		commitmentNumber
+		commitmentNumber,
+		true
 	);
 	const sighash = taprootCommitmentSighash(
 		built.result.tx,

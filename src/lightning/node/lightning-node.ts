@@ -389,7 +389,21 @@ export class LightningNode extends EventEmitter {
 		// Escape hatch: pass preferAnchors: false to negotiate legacy static_remotekey.
 		const preferAnchors = config.preferAnchors ?? true;
 
+		// Set default features if not provided (includes static_remotekey).
+		// Computed before the ChannelManager so per-peer feature-dependent
+		// behavior (e.g. option_simple_close) can consult our own advertisement.
+		const localFeatures =
+			config.localFeatures || LightningNode.defaultFeatures();
+		// Advertise anchor support whenever anchors are preferred (the default).
+		if (
+			preferAnchors &&
+			!localFeatures.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)
+		) {
+			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
+		}
+
 		this.channelManager = new ChannelManager({
+			localFeatures,
 			localConfig: config.channelConfig,
 			localBasepoints: config.channelBasepoints,
 			localPerCommitmentSeed: config.perCommitmentSeed,
@@ -412,17 +426,6 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.setFundingProvider(this.fundingProvider);
 
 		this.graph = new NetworkGraph();
-
-		// Set default features if not provided (includes static_remotekey)
-		const localFeatures =
-			config.localFeatures || LightningNode.defaultFeatures();
-		// Advertise anchor support whenever anchors are preferred (the default).
-		if (
-			preferAnchors &&
-			!localFeatures.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)
-		) {
-			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
-		}
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
 		this.wireOnionMessageEvents();
@@ -466,7 +469,11 @@ export class LightningNode extends EventEmitter {
 			this.chainWatcher = new ChainWatcher({
 				backend: config.chainBackend,
 				channelManager: this.channelManager,
-				destinationScript
+				destinationScript,
+				// Remote force-close / breach sweeps must be built at a live rate,
+				// not the 10 sat/vB default (kept warm via handleNewBlock).
+				getSweepFeeRatePerVbyte: (): number =>
+					this.resolveForceCloseFeeRatePerVbyte()
 			});
 			this.wireChainWatcherEvents();
 		}
@@ -588,9 +595,16 @@ export class LightningNode extends EventEmitter {
 			this.payments.set(paymentHash, payment);
 		}
 
-		// Restore preimages
+		// Restore preimages — and re-seed the ChannelManager's preimage store so
+		// monitors created by a POST-restart force-close can still claim inbound
+		// HTLCs on-chain (recordPreimage is idempotent; monitors restored later
+		// in this function are seeded from the same store).
 		for (const { paymentHash, preimage } of this.storage.loadAllPreimages()) {
 			this.preimages.set(paymentHash, preimage);
+			this.channelManager.recordPreimage(
+				Buffer.from(paymentHash, 'hex'),
+				preimage
+			);
 		}
 
 		// Restore SCID mappings
@@ -767,6 +781,14 @@ export class LightningNode extends EventEmitter {
 								if (m && typeof m.updateFeeRate === 'function') {
 									m.updateFeeRate(feeratePerKw);
 								}
+								// Re-arm the anchor commitment CPFP for OUR still
+								// unconfirmed force-closes: the tracking map is
+								// in-memory only, so without this a restart leaves
+								// the low-fee commitment package unbumped forever.
+								this.channelManager.rearmCommitmentCpfp(
+									Buffer.from(monitorChannelId, 'hex'),
+									this.resolveForceCloseFeeRatePerVbyte()
+								);
 							}
 						}
 					})
@@ -775,6 +797,15 @@ export class LightningNode extends EventEmitter {
 							error: err instanceof Error ? err.message : String(err)
 						});
 					});
+			} else {
+				// No estimator: still re-arm at the fallback feerate so the
+				// commitment package is at least re-broadcast + CPFP-tracked.
+				for (const { channelId: monitorChannelId } of monitors) {
+					this.channelManager.rearmCommitmentCpfp(
+						Buffer.from(monitorChannelId, 'hex'),
+						this.resolveForceCloseFeeRatePerVbyte()
+					);
+				}
 			}
 		}
 
@@ -887,10 +918,13 @@ export class LightningNode extends EventEmitter {
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
 			this.persistChannel(channelId);
-			// Clean up watched funding entry (memory cleanup for long-lived nodes)
-			if (this.chainWatcher) {
-				this.chainWatcher.removeWatchedFunding(channelId);
-			}
+			// NOTE: the funding watch is deliberately NOT torn down here. 'closed'
+			// fires the moment a commitment spend is classified — possibly from a
+			// mempool sighting — and the spend can still be replaced (reorg, or a
+			// conflicting revoked commitment winning the race). The monitor's
+			// commitment-swap handling needs the watch alive to see the
+			// replacement; the watcher retires spends itself after
+			// SPEND_FINALITY_DEPTH, and 'channel:resolved' cleans up below.
 			this.emit('channel:closed', { channelId });
 			this.emitStructuredLog('channel', 'closed', {
 				channelId: channelId.toString('hex')
@@ -904,6 +938,12 @@ export class LightningNode extends EventEmitter {
 			const transitioned = this.channelManager.markChannelResolved(channelId);
 			if (transitioned) {
 				this.persistChannel(channelId);
+			}
+			// Every output of the close is irrevocably resolved — a commitment
+			// swap is no longer possible, so the funding watch can be retired
+			// (memory cleanup for long-lived nodes).
+			if (this.chainWatcher) {
+				this.chainWatcher.removeWatchedFunding(channelId);
 			}
 			this.emit('channel:resolved', { channelId });
 			this.emitStructuredLog('channel', 'resolved', {
@@ -2194,6 +2234,18 @@ export class LightningNode extends EventEmitter {
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
+			/**
+			 * Liquidity ads (bLIP-0051): request the peer lease us inbound
+			 * liquidity (buyer side). Requires maxLeaseRates.
+			 */
+			requestFunds?: import('../message/dual-funding').IRequestFunds;
+			/**
+			 * Buyer's LOCAL price ceiling for the lease — choose it yourself
+			 * (e.g. from the ad you decided was acceptable); never copy it from
+			 * the seller's will_fund reply. The lease is rejected if the seller's
+			 * signed rates imply a higher fee.
+			 */
+			maxLeaseRates?: import('../gossip/types').ILeaseRates;
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -2203,6 +2255,14 @@ export class LightningNode extends EventEmitter {
 			'fundingSatoshis'
 		);
 		if (satsErr) throw new Error(satsErr);
+		// Fail fast at the API boundary; handleAcceptChannel2 enforces the same
+		// invariant as defense-in-depth (an uncapped lease fee could otherwise
+		// drain the buyer's balance).
+		if (params.requestFunds && !params.maxLeaseRates) {
+			throw new Error(
+				'requestFunds requires maxLeaseRates (buyer fee ceiling)'
+			);
+		}
 
 		const config = this.channelManager['config'] as {
 			localConfig?: import('../channel/types').IChannelConfig;
@@ -2227,7 +2287,9 @@ export class LightningNode extends EventEmitter {
 			localPerCommitmentSeed: config.localPerCommitmentSeed,
 			secondPerCommitmentPoint: perCommitmentPointFromSecret(
 				generateFromSeed(config.localPerCommitmentSeed, 0xffffffffffffn - 1n)
-			)
+			),
+			requestFunds: params.requestFunds,
+			maxLeaseRates: params.maxLeaseRates
 		};
 
 		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams);
@@ -2942,16 +3004,55 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Find a graph edge that extends a blinded path one hop upstream of our
+	 * direct peer: a public channel `intro → peer` whose far endpoint is not us
+	 * and whose intro-authored channel_update provides the forwarding policy.
+	 * Returns the intro node, the edge SCID, and intro's relay policy.
+	 */
+	private findBlindedIntroExtension(peerPubkey: Buffer): {
+		introPubkey: Buffer;
+		shortChannelId: Buffer;
+		cltvExpiryDelta: number;
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+	} | null {
+		const ourNodeId = getPublicKey(this.nodePrivkey);
+		for (const edge of this.graph.getNodeChannels(peerPubkey)) {
+			const introIsNode1 = edge.nodeId2.equals(peerPubkey);
+			const introPubkey = introIsNode1 ? edge.nodeId1 : edge.nodeId2;
+			if (introPubkey.equals(ourNodeId) || introPubkey.equals(peerPubkey)) {
+				continue;
+			}
+			// Policy for the intro → peer direction is authored by the intro node.
+			const update = introIsNode1 ? edge.update1 : edge.update2;
+			if (!update) continue;
+			return {
+				introPubkey,
+				shortChannelId: edge.shortChannelId,
+				cltvExpiryDelta: update.cltvExpiryDelta,
+				feeBaseMsat: update.feeBaseMsat,
+				feeProportionalMillionths: update.feeProportionalMillionths
+			};
+		}
+		return null;
+	}
+
+	/**
 	 * Build receiver route-blinding blinded payment paths, one per usable
-	 * channel: a 2-hop path [peer (introduction node) → us (recipient)]. The
-	 * sender routes to the peer, which forwards to us using the encrypted hop
-	 * data — our node id never appears in the cleartext route. Mirrors
+	 * channel. By default each path has 3 nodes [intro → peer → us] when the
+	 * public graph offers a forwarding node upstream of our peer (the payer
+	 * then learns a node two hops away, not our direct peer), falling back to
+	 * the 2-node path [peer → us] otherwise. Mirrors
 	 * getPrivateChannelRoutingHints for peer/scid/policy selection.
 	 *
-	 * The advertised payInfo aggregates the single forwarding hop (the peer's
-	 * fee and CLTV policy) so the payer can size fees/timelocks correctly.
+	 * The advertised payInfo aggregates ALL forwarding hops (fees compound:
+	 * an upstream hop charges its fee on the amount including downstream
+	 * fees) so the payer can size fees/timelocks correctly.
 	 */
-	private buildBlindedPaymentPaths(asyncHold = false): IBlindedPaymentPath[] {
+	private buildBlindedPaymentPaths(
+		asyncHold = false,
+		numHops = 3
+	): IBlindedPaymentPath[] {
 		const paths: IBlindedPaymentPath[] = [];
 		const ourNodeId = getPublicKey(this.nodePrivkey);
 		// Generous absolute CLTV bound for the path's payment constraints.
@@ -2989,29 +3090,69 @@ export class LightningNode extends EventEmitter {
 			}
 
 			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat: 0n };
-			const hopDataList: IBlindedHopData[] = [
-				// Introduction node (peer): forward to us over this channel. For async
-				// receive, mark it hold_htlc so the LSP parks the HTLC until we return.
-				{
-					nextNodeId: ourNodeId,
-					shortChannelId: scid,
-					paymentRelay: {
-						cltvExpiryDelta,
-						feeProportionalMillionths,
-						feeBaseMsat
-					},
-					paymentConstraints,
-					...(asyncHold ? { holdHtlc: true } : {})
+			// Peer hop: forward to us over this channel. For async receive, mark
+			// it hold_htlc so the LSP parks the HTLC until we return.
+			const peerHop: IBlindedHopData = {
+				nextNodeId: ourNodeId,
+				shortChannelId: scid,
+				paymentRelay: {
+					cltvExpiryDelta,
+					feeProportionalMillionths,
+					feeBaseMsat
 				},
-				// Final hop (us): recipient, no onward forwarding.
-				{ paymentConstraints }
-			];
+				paymentConstraints,
+				...(asyncHold ? { holdHtlc: true } : {})
+			};
+			// Final hop (us): recipient, no onward forwarding.
+			const finalHop: IBlindedHopData = { paymentConstraints };
+
+			let nodeIds = [peerPubkey, ourNodeId];
+			let hopDataList: IBlindedHopData[] = [peerHop, finalHop];
+			// Aggregated payInfo across all relay hops (starts with peer's).
+			let aggBase = feeBaseMsat;
+			let aggProp = feeProportionalMillionths;
+			let aggCltv = cltvExpiryDelta;
+
+			// Extend one hop upstream of the peer when requested and the graph
+			// offers a candidate: [intro → peer → us].
+			if (numHops >= 3) {
+				const ext = this.findBlindedIntroExtension(peerPubkey);
+				if (ext) {
+					const introHop: IBlindedHopData = {
+						nextNodeId: peerPubkey,
+						shortChannelId: ext.shortChannelId,
+						paymentRelay: {
+							cltvExpiryDelta: ext.cltvExpiryDelta,
+							feeProportionalMillionths: ext.feeProportionalMillionths,
+							feeBaseMsat: ext.feeBaseMsat
+						},
+						paymentConstraints
+					};
+					nodeIds = [ext.introPubkey, peerPubkey, ourNodeId];
+					hopDataList = [introHop, peerHop, finalHop];
+					// The intro (upstream) hop charges its fee on the amount
+					// INCLUDING the peer hop's fee, so fees compound:
+					//   base = baseIntro + basePeer + ceil(basePeer * propIntro / 1e6)
+					//   prop = propIntro + propPeer + ceil(propIntro * propPeer / 1e6)
+					aggBase =
+						ext.feeBaseMsat +
+						feeBaseMsat +
+						Math.ceil((feeBaseMsat * ext.feeProportionalMillionths) / 1e6);
+					aggProp =
+						ext.feeProportionalMillionths +
+						feeProportionalMillionths +
+						Math.ceil(
+							(ext.feeProportionalMillionths * feeProportionalMillionths) / 1e6
+						);
+					aggCltv = ext.cltvExpiryDelta + cltvExpiryDelta;
+				}
+			}
 
 			let path;
 			try {
 				path = constructBlindedPath(
 					crypto.randomBytes(32),
-					[peerPubkey, ourNodeId],
+					nodeIds,
 					hopDataList
 				);
 			} catch {
@@ -3021,9 +3162,9 @@ export class LightningNode extends EventEmitter {
 			paths.push({
 				path,
 				payInfo: {
-					feeBaseMsat,
-					feeProportionalMillionths,
-					cltvExpiryDelta,
+					feeBaseMsat: aggBase,
+					feeProportionalMillionths: aggProp,
+					cltvExpiryDelta: aggCltv,
 					htlcMinimumMsat: 0n,
 					htlcMaximumMsat: state.fundingSatoshis * 1000n
 				}
@@ -3266,7 +3407,10 @@ export class LightningNode extends EventEmitter {
 		// advertise blinded paths INSTEAD of cleartext hints (privacy is the whole
 		// point — a cleartext hint for the same channel would leak our node id).
 		const blindedPaths = options.useBlindedPaths
-			? this.buildBlindedPaymentPaths(options.asyncHold)
+			? this.buildBlindedPaymentPaths(
+					options.asyncHold,
+					options.blindedPathNumHops ?? 3
+			  )
 			: [];
 		const useBlinded = blindedPaths.length > 0;
 
@@ -5652,7 +5796,8 @@ export class LightningNode extends EventEmitter {
 			channelId,
 			spendingTx,
 			blockHeight,
-			destinationScript
+			destinationScript,
+			this.resolveForceCloseFeeRatePerVbyte()
 		);
 	}
 
@@ -5688,7 +5833,17 @@ export class LightningNode extends EventEmitter {
 			this.feeEstimator
 				.estimateFee(6)
 				.then((satPerVbyte) => {
-					if (satPerVbyte > 0) this.feeAdvisor.recordSample(satPerVbyte);
+					if (satPerVbyte > 0) {
+						this.feeAdvisor.recordSample(satPerVbyte);
+						// Feed the live rate to every active monitor so the RBF
+						// re-bump floor tracks the market. Monitors created
+						// mid-session (funding spend detected by the watcher)
+						// otherwise keep their build-time rate forever.
+						// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
+						for (const monitor of this.channelManager.getMonitors().values()) {
+							monitor.updateFeeRate(satPerVbyte * 250);
+						}
+					}
 				})
 				.catch(() => {
 					/* best-effort; force-close falls back to the default feerate */
@@ -5960,6 +6115,11 @@ export class LightningNode extends EventEmitter {
 		// Anchors are the default channel type (LND/CLN/Eclair all default to them).
 		// Advertised so peers may propose anchor channels and so we negotiate them.
 		flags.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
+		// Simplified mutual close + its BOLT 9 dependency. We already accept any
+		// segwit shutdown script (isValidShutdownScript is always called with
+		// allowAnySegwit), so advertising anysegwit only states existing behavior.
+		flags.setOptional(Feature.SHUTDOWN_ANY_SEGWIT);
+		flags.setOptional(Feature.SIMPLE_CLOSE);
 		return flags;
 	}
 

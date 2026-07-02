@@ -58,6 +58,12 @@ export enum Feature {
 	ZERO_CONF = 50,
 	/** Keysend (bLIP-0003) — spontaneous payments via sender-generated preimage */
 	KEYSEND = 54,
+	/**
+	 * Simplified mutual close (option_simple_close, BOLT 2): closing_complete /
+	 * closing_sig with closer-pays-own-fee semantics replacing legacy
+	 * closing_signed fee negotiation. BOLT 9 dependency: option_shutdown_anysegwit.
+	 */
+	SIMPLE_CLOSE = 60,
 	/** Channel splicing (lightning/bolts PR #1160, option_splice) */
 	SPLICE = 62,
 	/**

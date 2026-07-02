@@ -185,7 +185,11 @@ describe('Sweep Re-broadcast', () => {
 		expect((rebuilds[0] as any).feeRatePerVbyte).to.equal(15);
 	});
 
-	it('fee bump capped at 10x original rate', () => {
+	it('fee bump cap allows reaching the live rate above 10x original', () => {
+		// A sweep built at a stale-low rate (originalFeeRate 5) must still be
+		// able to reach the KNOWN live network rate (here 100) — the runaway cap
+		// is max(10x original, live), not a hard 10x original that would strand
+		// the sweep at 50 while the mempool demands 100.
 		const state: IChainMonitorState = {
 			monitorState: MonitorState.RESOLVING,
 			commitmentBroadcast: null,
@@ -210,7 +214,7 @@ describe('Sweep Re-broadcast', () => {
 			state,
 			chanState,
 			Buffer.alloc(22),
-			100,
+			100, // live network rate
 			crypto.randomBytes(32),
 			crypto.randomBytes(32)
 		);
@@ -220,7 +224,49 @@ describe('Sweep Re-broadcast', () => {
 			(a) => a.type === ChainActionType.REBUILD_SWEEP
 		);
 		expect(rebuilds.length).to.equal(1);
-		// 1.5 * 100 = 150, but cap is 10 * 5 = 50
+		// min(max(100*1.5, live=100), max(5*10=50, live=100)) = min(150, 100) = 100
+		expect((rebuilds[0] as any).feeRatePerVbyte).to.equal(100);
+	});
+
+	it('fee bump still capped at 10x original when the live rate is low', () => {
+		// Anti-runaway: when the live rate does NOT exceed 10x the build-time
+		// rate, the cap remains 10x original so a compounding 1.5x can't
+		// overpay far beyond the market.
+		const state: IChainMonitorState = {
+			monitorState: MonitorState.RESOLVING,
+			commitmentBroadcast: null,
+			trackedOutputs: [
+				{
+					txid: 'c'.repeat(64),
+					outputIndex: 0,
+					amount: 500000n,
+					outputType: OutputType.TO_LOCAL,
+					status: OutputStatus.SPEND_BROADCAST,
+					confirmationHeight: 100,
+					broadcastHeight: 100,
+					originalFeeRate: 5,
+					sweepTxHex: 'deadbeef',
+					currentFeeRate: 100
+				}
+			],
+			currentBlockHeight: 100
+		};
+		const chanState = makeMinimalChannelState();
+		const m = ChainMonitor.restore(
+			state,
+			chanState,
+			Buffer.alloc(22),
+			10, // live rate below 10x original (=50)
+			crypto.randomBytes(32),
+			crypto.randomBytes(32)
+		);
+
+		const actions = m.handleNewBlock(106);
+		const rebuilds = actions.filter(
+			(a) => a.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuilds.length).to.equal(1);
+		// min(max(100*1.5, live=10), max(5*10=50, live=10)) = min(150, 50) = 50
 		expect((rebuilds[0] as any).feeRatePerVbyte).to.equal(50);
 	});
 

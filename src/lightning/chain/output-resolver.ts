@@ -97,7 +97,9 @@ const SIGHASH_ANCHOR =
  */
 function secondLevelHtlcFee(state: IChannelState, isSuccess: boolean): bigint {
 	if (isAnchorChannel(state.channelType)) return 0n;
-	const feeratePerKw = getCommitmentFeeRate(state);
+	// Rebuild at the rate the signature covers (signedLocal), never the
+	// in-flight rate a half-finished fee round may have staged.
+	const feeratePerKw = getCommitmentFeeRate(state, true);
 	const weight = isSuccess ? HTLC_SUCCESS_WEIGHT : HTLC_TIMEOUT_WEIGHT;
 	return BigInt(Math.floor((weight * feeratePerKw) / 1000));
 }
@@ -2403,6 +2405,169 @@ function resolveRevokedTaprootCommitmentOutputs(
 				witness
 			});
 		}
+	}
+
+	return resolved;
+}
+
+/**
+ * Justice on the peer's SECOND-LEVEL HTLC tx after a REVOKED commitment: when
+ * the cheater confirms their pre-signed HTLC-success/HTLC-timeout before our
+ * HTLC penalty, that tx creates a fresh to_local-format output whose revocation
+ * branch WE control (we hold the revoked per-commitment secret) with NO
+ * timelock. BOLT 5: a node SHOULD spend the HTLC-timeout/HTLC-success output
+ * using the revocation private key — without this claim the HTLC value is lost
+ * once the cheater's to_self_delay matures. Sides mirror
+ * resolveSecondLevelHtlcOutput to THEIR commitment: their delayed key, our
+ * revocation basepoint, the to_self_delay we demanded of them. Matches EVERY
+ * output of spendingTx (implementations may batch several HTLC claims into one
+ * tx); returns one immediate revocation-path claim per match, witness set.
+ */
+export function resolveRevokedSecondLevelOutput(
+	state: IChannelState,
+	spendingTx: bitcoin.Transaction,
+	confirmationHeight: number,
+	commitmentNumber: bigint,
+	destinationScript: Buffer,
+	feeRatePerVbyte: number,
+	revocationBasepointSecret: Buffer,
+	network: bitcoin.Network = bitcoin.networks.bitcoin
+): IResolvedOutput[] {
+	if (!state.remoteBasepoints) return [];
+	const perCommitmentSecret = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+	if (!perCommitmentSecret) return [];
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const revocationPrivkey = deriveRevocationPrivkey(
+		revocationBasepointSecret,
+		perCommitmentSecret,
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const feeSatoshis = BigInt(
+		Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
+	);
+	const spendingTxid = spendingTx.getId();
+	const resolved: IResolvedOutput[] = [];
+
+	// option_taproot: the second-level output is a TaprootSecondLevelScriptTree
+	// with the revocation key as INTERNAL key — breach-spend via key path with
+	// the tweaked revocation privkey, exactly like the revoked-commitment HTLC
+	// penalty. Keys mirror resolveRevokedTaprootCommitmentOutputs (isOurs=false:
+	// their delayed key, our revocation basepoint, our demanded to_self_delay).
+	// No lease variant: leased taproot channels are rejected at negotiation.
+	if (isTaprootChannel(state.channelType)) {
+		const keys = deriveTaprootCommitKeys(state, perCommitmentPoint, false);
+		const sl = buildTaprootSecondLevelOutput(
+			keys.revocationPubkey,
+			keys.delayedPubkey,
+			keys.toSelfDelay,
+			network
+		);
+		const merkleRoot = tapleafHash(sl.delay.script, sl.delay.leafVersion);
+		for (let i = 0; i < spendingTx.outs.length; i++) {
+			const out = spendingTx.outs[i];
+			if (!sl.output.equals(out.script)) continue;
+			const amount = BigInt(out.value);
+			if (amount <= feeSatoshis) continue;
+			const claimTx = new bitcoin.Transaction();
+			claimTx.version = 2;
+			claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
+			claimTx.addOutput(destinationScript, Number(amount - feeSatoshis));
+			const sighash = claimTx.hashForWitnessV1(
+				0,
+				[sl.output],
+				[Number(amount)],
+				bitcoin.Transaction.SIGHASH_DEFAULT
+			);
+			const tweaked = tweakTaprootKeyPathPrivkey(revocationPrivkey, merkleRoot);
+			const witness = [signTaprootHtlcLeaf(sighash, tweaked)];
+			claimTx.setWitness(0, witness);
+			resolved.push({
+				trackedOutput: {
+					txid: spendingTxid,
+					outputIndex: i,
+					amount,
+					outputType: OutputType.TO_LOCAL,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight,
+					witnessScript: sl.output
+				},
+				spendTx: claimTx,
+				witness
+			});
+		}
+		return resolved;
+	}
+
+	const revocationPubkey = deriveRevocationPubkey(
+		state.localBasepoints.revocationBasepoint,
+		perCommitmentPoint
+	);
+	const delayedPubkey = derivePublicKey(
+		state.remoteBasepoints.delayedPaymentBasepoint,
+		perCommitmentPoint
+	);
+	const toSelfDelay = state.localConfig.toSelfDelay;
+	// Liquidity ads: the peer's second-level output carries the lease CLTV lock
+	// only when THEY are the lessor (state.isLessor marks US). Their tx may or
+	// may not have been built with the lock, so match both script variants.
+	const candidateScripts: Buffer[] = [
+		buildToLocalScript(revocationPubkey, delayedPubkey, toSelfDelay)
+	];
+	if (state.leaseExpiry && !state.isLessor) {
+		candidateScripts.push(
+			buildToLocalScript(
+				revocationPubkey,
+				delayedPubkey,
+				toSelfDelay,
+				state.leaseExpiry
+			)
+		);
+	}
+
+	for (let i = 0; i < spendingTx.outs.length; i++) {
+		const out = spendingTx.outs[i];
+		let witnessScript: Buffer | undefined;
+		for (const script of candidateScripts) {
+			const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
+			if (p2wsh.output && p2wsh.output.equals(out.script)) {
+				witnessScript = script;
+				break;
+			}
+		}
+		if (!witnessScript) continue;
+		const amount = BigInt(out.value);
+		if (amount <= feeSatoshis) continue;
+		// Revocation branch: no CSV/CLTV — spend immediately (default sequence,
+		// locktime 0, matching buildPenaltyTx's convention).
+		const claimTx = new bitcoin.Transaction();
+		claimTx.version = 2;
+		claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
+		claimTx.addOutput(destinationScript, Number(amount - feeSatoshis));
+		const sig = signPenaltyInput(
+			claimTx,
+			0,
+			witnessScript,
+			Number(amount),
+			revocationPrivkey
+		);
+		const witness = buildToLocalPenaltyWitness(sig, witnessScript);
+		claimTx.setWitness(0, witness);
+		resolved.push({
+			trackedOutput: {
+				txid: spendingTxid,
+				outputIndex: i,
+				amount,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight,
+				witnessScript
+			},
+			spendTx: claimTx,
+			witness
+		});
 	}
 
 	return resolved;

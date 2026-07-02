@@ -145,4 +145,133 @@ describe('createInvoice blinded paths (M1.2)', function () {
 
 		node.destroy();
 	});
+
+	/** Inject a public graph edge intro↔peer with intro's forwarding policy. */
+	function injectIntroEdge(
+		node: LightningNode,
+		peerPubkey: Buffer
+	): {
+		introPubkey: Buffer;
+		introPolicy: {
+			cltvExpiryDelta: number;
+			feeBaseMsat: number;
+			feeProportionalMillionths: number;
+		};
+	} {
+		const introPubkey = getPublicKey(validPriv());
+		const edgeScid = encodeShortChannelId({
+			block: 799_000,
+			txIndex: 7,
+			outputIndex: 0
+		});
+		const introPolicy = {
+			cltvExpiryDelta: 144,
+			feeBaseMsat: 500,
+			feeProportionalMillionths: 100
+		};
+		const introIsNode1 = Buffer.compare(introPubkey, peerPubkey) < 0;
+		const [n1, n2] = introIsNode1
+			? [introPubkey, peerPubkey]
+			: [peerPubkey, introPubkey];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const graph = node.getGraph() as any;
+		graph._channels.set(edgeScid.toString('hex'), {
+			shortChannelId: edgeScid,
+			nodeId1: n1,
+			nodeId2: n2,
+			update1: introIsNode1 ? introPolicy : undefined,
+			update2: introIsNode1 ? undefined : introPolicy
+		});
+		for (const id of [n1, n2]) {
+			const hex = id.toString('hex');
+			const entry = graph._nodes.get(hex) ?? {
+				nodeId: id,
+				channels: new Set()
+			};
+			entry.channels.add(edgeScid.toString('hex'));
+			graph._nodes.set(hex, entry);
+		}
+		return { introPubkey, introPolicy };
+	}
+
+	it('extends to a 3-node path [intro → peer → us] using the graph', function () {
+		const node = makeNode();
+		const { peerPubkey } = injectNormalChannel(node);
+		const { introPubkey, introPolicy } = injectIntroEdge(node, peerPubkey);
+		const ourNodeId = Buffer.from(node.getNodeId(), 'hex');
+
+		const res = node.createInvoice({
+			description: 'blinded-3hop',
+			amountMsat: 100_000n,
+			useBlindedPaths: true
+		});
+		const inv = decode(res.bolt11);
+		expect(inv.blindedPaths).to.have.length(1);
+		const bp = inv.blindedPaths![0];
+
+		// The payer now learns a node TWO hops away — not our direct peer.
+		expect(bp.path.introductionNodeId).to.deep.equal(introPubkey);
+		expect(bp.path.introductionNodeId).to.not.deep.equal(peerPubkey);
+		expect(bp.path.introductionNodeId).to.not.deep.equal(ourNodeId);
+		expect(bp.path.blindedHops).to.have.length(3);
+
+		// payInfo compounds intro + peer relay fees (peer uses node defaults:
+		// base 1000, prop 1, cltv 40).
+		const peerBase = 1000;
+		const peerProp = 1;
+		const peerCltv = 40;
+		expect(bp.payInfo.feeBaseMsat).to.equal(
+			introPolicy.feeBaseMsat +
+				peerBase +
+				Math.ceil((peerBase * introPolicy.feeProportionalMillionths) / 1e6)
+		);
+		expect(bp.payInfo.feeProportionalMillionths).to.equal(
+			introPolicy.feeProportionalMillionths +
+				peerProp +
+				Math.ceil((introPolicy.feeProportionalMillionths * peerProp) / 1e6)
+		);
+		expect(bp.payInfo.cltvExpiryDelta).to.equal(
+			introPolicy.cltvExpiryDelta + peerCltv
+		);
+
+		node.destroy();
+	});
+
+	it('blindedPathNumHops: 2 disables the extension', function () {
+		const node = makeNode();
+		const { peerPubkey } = injectNormalChannel(node);
+		injectIntroEdge(node, peerPubkey);
+
+		const inv = decode(
+			node.createInvoice({
+				description: 'blinded-2hop',
+				amountMsat: 100_000n,
+				useBlindedPaths: true,
+				blindedPathNumHops: 2
+			}).bolt11
+		);
+		const bp = inv.blindedPaths![0];
+		expect(bp.path.introductionNodeId).to.deep.equal(peerPubkey);
+		expect(bp.path.blindedHops).to.have.length(2);
+
+		node.destroy();
+	});
+
+	it('stays a 2-node path when the graph has no upstream candidate', function () {
+		const node = makeNode();
+		const { peerPubkey } = injectNormalChannel(node);
+		// No intro edge injected → default numHops=3 must fall back cleanly.
+		const inv = decode(
+			node.createInvoice({
+				description: 'blinded-fallback',
+				amountMsat: 100_000n,
+				useBlindedPaths: true
+			}).bolt11
+		);
+		const bp = inv.blindedPaths![0];
+		expect(bp.path.introductionNodeId).to.deep.equal(peerPubkey);
+		expect(bp.path.blindedHops).to.have.length(2);
+
+		node.destroy();
+	});
 });

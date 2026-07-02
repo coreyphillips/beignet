@@ -24,6 +24,10 @@ export enum MessageType {
 	SHUTDOWN = 38,
 	CLOSING_SIGNED = 39,
 
+	// BOLT 2: option_simple_close simplified mutual close
+	CLOSING_COMPLETE = 40,
+	CLOSING_SIG = 41,
+
 	// BOLT 2: Channel operation (HTLC)
 	UPDATE_ADD_HTLC = 128,
 	UPDATE_FULFILL_HTLC = 130,

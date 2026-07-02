@@ -218,6 +218,16 @@ export interface ICreateInvoiceOptions {
 	 */
 	useBlindedPaths?: boolean;
 	/**
+	 * Number of NODES in each generated blinded path, including us (only
+	 * meaningful with `useBlindedPaths`). 3 (the default) inserts one real
+	 * forwarding node between the introduction node and us when the public
+	 * graph offers one — the payer then learns a node TWO hops away from us
+	 * instead of our direct peer. Falls back to a 2-node path [peer → us]
+	 * per-channel when the graph has no usable candidate. 2 disables the
+	 * extension entirely.
+	 */
+	blindedPathNumHops?: number;
+	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or
 	 * cancelHeldHtlc() (fails it). Underpins async receive and escrow-style flows.

@@ -234,6 +234,18 @@ export interface ISerializedChannelState {
 	localCommitmentNumber: string;
 	remoteCommitmentNumber: string;
 	needsCommitment?: boolean;
+	/**
+	 * A staged (uncommitted) update_fee rate. Persisted so a restart mid
+	 * fee-round restores the exact rate the in-flight commitment was built
+	 * with. Optional for backward compatibility.
+	 */
+	pendingFeeratePerKw?: number;
+	/**
+	 * The feerate baked into the current signed local commitment (the rate
+	 * remoteCommitmentSignature covers) — force-close rebuilds at this rate.
+	 * Optional for backward compatibility.
+	 */
+	lastSignedCommitFeeratePerKw?: number;
 	localBalanceMsat: string;
 	remoteBalanceMsat: string;
 	shaChainData: { entries: ISerializedShaChainEntry[]; knownCount: string };
@@ -267,6 +279,18 @@ export interface ISerializedChannelState {
 	closingFeeMin: string | null;
 	closingFeeMax: string | null;
 	theirLastClosingFeeSat: string | null;
+	/**
+	 * option_simple_close. Optional for backward compatibility with pre-simple-
+	 * close serialized states (all-absent deserializes to legacy behavior).
+	 * awaitingClosingSig is intentionally NOT persisted — negotiation restarts
+	 * on reconnect per spec.
+	 */
+	simpleClose?: boolean | null;
+	lastCloseFeeSat?: string | null;
+	lastCloseLocktime?: number | null;
+	lastCloseCloserScript?: string | null;
+	lastCloseCloseeScript?: string | null;
+	lastCloseSentVariants?: number[] | null;
 	shortChannelId: string | null;
 	fundingConfirmationHeight: number;
 	fundingBroadcastHeight?: number;
@@ -418,6 +442,8 @@ export function serializeChannelState(
 		localCommitmentNumber: bigintToStr(s.localCommitmentNumber),
 		remoteCommitmentNumber: bigintToStr(s.remoteCommitmentNumber),
 		needsCommitment: s.needsCommitment,
+		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		localBalanceMsat: bigintToStr(s.localBalanceMsat),
 		remoteBalanceMsat: bigintToStr(s.remoteBalanceMsat),
 		shaChainData: serializeShaChainEntries(s.shaChainStore),
@@ -458,6 +484,20 @@ export function serializeChannelState(
 			s.theirLastClosingFeeSat !== null
 				? bigintToStr(s.theirLastClosingFeeSat)
 				: null,
+		simpleClose: s.simpleClose,
+		lastCloseFeeSat: s.lastLocalClosingComplete
+			? bigintToStr(s.lastLocalClosingComplete.feeSatoshis)
+			: null,
+		lastCloseLocktime: s.lastLocalClosingComplete?.locktime ?? null,
+		lastCloseCloserScript: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.closerScript.toString('hex')
+			: null,
+		lastCloseCloseeScript: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.closeeScript.toString('hex')
+			: null,
+		lastCloseSentVariants: s.lastLocalClosingComplete
+			? s.lastLocalClosingComplete.sentVariants
+			: null,
 		shortChannelId: bufToHex(s.shortChannelId),
 		fundingConfirmationHeight: s.fundingConfirmationHeight,
 		fundingBroadcastHeight: s.fundingBroadcastHeight,
@@ -536,6 +576,8 @@ export function deserializeChannelState(
 		localCommitmentNumber: strToBigint(s.localCommitmentNumber),
 		remoteCommitmentNumber: strToBigint(s.remoteCommitmentNumber),
 		needsCommitment: s.needsCommitment ?? false,
+		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		localBalanceMsat: strToBigint(s.localBalanceMsat),
 		remoteBalanceMsat: strToBigint(s.remoteBalanceMsat),
 		shaChainStore: deserializeShaChainStore(s.shaChainData),
@@ -578,6 +620,22 @@ export function deserializeChannelState(
 			s.theirLastClosingFeeSat !== null
 				? strToBigint(s.theirLastClosingFeeSat)
 				: null,
+		simpleClose: s.simpleClose ?? null,
+		lastLocalClosingComplete:
+			s.lastCloseFeeSat != null &&
+			s.lastCloseLocktime != null &&
+			s.lastCloseCloserScript != null &&
+			s.lastCloseCloseeScript != null
+				? {
+						feeSatoshis: strToBigint(s.lastCloseFeeSat),
+						locktime: s.lastCloseLocktime,
+						closerScript: Buffer.from(s.lastCloseCloserScript, 'hex'),
+						closeeScript: Buffer.from(s.lastCloseCloseeScript, 'hex'),
+						sentVariants: s.lastCloseSentVariants ?? []
+				  }
+				: null,
+		// Not persisted by design: reconnection restarts simple-close negotiation.
+		awaitingClosingSig: false,
 		shortChannelId: hexToBuf(s.shortChannelId),
 		fundingConfirmationHeight: s.fundingConfirmationHeight || 0,
 		fundingBroadcastHeight: s.fundingBroadcastHeight ?? 0,
