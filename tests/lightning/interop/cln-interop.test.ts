@@ -28,6 +28,7 @@ import {
 	createClnClient,
 	waitForClnSync,
 	waitForClnChannels,
+	waitForClnPeerChannelNormal,
 	mineBlocks,
 	fundClnWallet,
 	createInteropNode,
@@ -271,12 +272,15 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 				}
 			}
 
-			// Wait for CLN to see an active channel
-			await waitForClnChannels(cln, 1, 30_000);
-
-			const { channels: clnChs } = await cln.listChannels();
-			const activeCh = (clnChs || []).find(
-				(c) => c.peer_id === beignetNodeId && c.state === 'CHANNELD_NORMAL'
+			// Wait for CLN to see THIS peer's channel reach CHANNELD_NORMAL. A plain
+			// count check (waitForClnChannels) is satisfied instantly by stale
+			// channels from earlier runs in the shared container, and CLN needs
+			// ~30s to detect its own funding confirmation under Docker before it
+			// sends channel_ready, so poll the specific peer with a generous budget.
+			const activeCh = await waitForClnPeerChannelNormal(
+				cln,
+				beignetNodeId,
+				60_000
 			);
 
 			expect(activeCh).to.not.be.undefined;
