@@ -2860,11 +2860,30 @@ export class ChannelManager extends EventEmitter {
 		);
 		const channel = new Channel(state, signer);
 		channel.channelKeyIndex = chKeys.channelIndex;
-		const tempId = state.temporaryChannelId.toString('hex');
+
+		// The channel signs with chKeys, so it MUST advertise chKeys on the wire —
+		// otherwise the funding pubkey (2-of-2) and the revocation basepoint (which
+		// the v2 channel_id is derived from) would not match what the peer sees.
+		// Override the caller's key material with the channel's own (mirrors the
+		// acceptor path in handleOpenChannel2). In the common case (no per-channel
+		// key deriver) these are already equal.
+		const alignedParams: IDualFundingParams = {
+			...params,
+			localBasepoints: chKeys.basepoints,
+			localPerCommitmentSeed: chKeys.perCommitmentSeed,
+			secondPerCommitmentPoint: perCommitmentPointFromSecret(
+				generateFromSeed(chKeys.perCommitmentSeed, 0xffffffffffffn - 1n)
+			)
+		};
+
+		// initiateOpenV2 derives the BOLT-2 temporary_channel_id from our
+		// revocation basepoint (replacing the random stub), so key tempChannels
+		// AFTER it runs — otherwise accept_channel2 (which echoes the derived id)
+		// would not route back to this channel.
+		const actions = channel.initiateOpenV2(alignedParams);
+		const tempId = channel.getTemporaryChannelId().toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
-
-		const actions = channel.initiateOpenV2(params);
 		this.processActions(peerPubkey, channel, actions);
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
@@ -3014,6 +3033,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxAddInputMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3025,6 +3045,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxAddOutputMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3036,6 +3057,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxRemoveInputMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3047,6 +3069,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxRemoveOutputMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3058,6 +3081,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxCompleteMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3073,6 +3097,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxSignaturesMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3108,6 +3133,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxInitRbfMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
@@ -3119,6 +3145,7 @@ export class ChannelManager extends EventEmitter {
 		const msg = decodeTxAbortMessage(payload);
 		const channel =
 			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
 			this.findTempChannel(msg.channelId);
 		if (!channel) return;
 
