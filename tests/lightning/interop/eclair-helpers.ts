@@ -13,7 +13,7 @@
 
 import http from 'http';
 import { execSync } from 'child_process';
-import { EclairRestClient } from './eclair-client';
+import { EclairRestClient, IEclairChannel } from './eclair-client';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
 import { REGTEST_CHAIN_HASH } from '../../../src/lightning/channel/types';
@@ -233,6 +233,42 @@ export async function waitForEclairChannels(
 	}
 	throw new Error(
 		`Eclair did not reach ${count} active channels within timeout`
+	);
+}
+
+/**
+ * Wait for the channel with a SPECIFIC peer to reach Eclair's NORMAL state.
+ *
+ * `waitForEclairChannels(client, 1)` is satisfied by ANY normal channel,
+ * including stale ones left over from earlier tiers in the shared container, so
+ * it can pass on the wrong channel or throw when the leftovers happen to be
+ * mid-close. Eclair also only learns of confirmations on restart here (ZMQ is
+ * unreliable under Docker), so the caller must poll the specific peer with a
+ * generous budget. Returns the matching channel once NORMAL; throws on timeout.
+ */
+export async function waitForEclairPeerChannelNormal(
+	client: EclairRestClient,
+	peerNodeId: string,
+	timeoutMs = 90_000
+): Promise<IEclairChannel> {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		try {
+			const channels = await client.channels(peerNodeId);
+			const ch = (channels || []).find(
+				(c) => c.nodeId === peerNodeId && c.state === 'NORMAL'
+			);
+			if (ch) return ch;
+		} catch {
+			// Not ready yet
+		}
+		await sleep(1000);
+	}
+	throw new Error(
+		`Eclair channel with ${peerNodeId.slice(
+			0,
+			16
+		)} did not reach NORMAL within timeout`
 	);
 }
 

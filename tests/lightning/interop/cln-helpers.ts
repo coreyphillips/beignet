@@ -9,7 +9,7 @@
 
 import https from 'https';
 import { execSync } from 'child_process';
-import { ClnRestClient } from './cln-client';
+import { ClnRestClient, IClnChannel } from './cln-client';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
 import { REGTEST_CHAIN_HASH } from '../../../src/lightning/channel/types';
@@ -182,6 +182,43 @@ export async function waitForClnChannels(
 		await sleep(1000);
 	}
 	throw new Error(`CLN did not reach ${count} active channels within timeout`);
+}
+
+/**
+ * Wait for the channel with a SPECIFIC peer to reach CHANNELD_NORMAL.
+ *
+ * `waitForClnChannels(client, 1)` is satisfied by ANY normal channel, including
+ * stale ones left over from earlier runs in the shared regtest container, so it
+ * returns instantly and tells you nothing about the channel you just opened.
+ * After a CLN-initiated open, CLN can take ~30s to detect its own funding
+ * confirmation under Docker (ZMQ is unreliable) before it sends channel_ready,
+ * so callers must poll for THIS peer's channel with a generous budget.
+ * Returns the matching channel once it is CHANNELD_NORMAL; throws on timeout.
+ */
+export async function waitForClnPeerChannelNormal(
+	client: ClnRestClient,
+	peerId: string,
+	timeoutMs = 60_000
+): Promise<IClnChannel> {
+	const start = Date.now();
+	while (Date.now() - start < timeoutMs) {
+		try {
+			const { channels } = await client.listChannels();
+			const ch = (channels || []).find(
+				(c) => c.peer_id === peerId && c.state === 'CHANNELD_NORMAL'
+			);
+			if (ch) return ch;
+		} catch {
+			// Not ready yet
+		}
+		await sleep(1000);
+	}
+	throw new Error(
+		`CLN channel with ${peerId.slice(
+			0,
+			16
+		)} did not reach CHANNELD_NORMAL within timeout`
+	);
 }
 
 /**
