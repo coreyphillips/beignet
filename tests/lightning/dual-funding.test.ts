@@ -1434,14 +1434,18 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			).to.be.true;
 		});
 
-		it('should handle tx_signatures exchange', () => {
+		it('does NOT release tx_signatures before the commitment_signed round (fund-safety)', () => {
+			// BOLT 2 v2: tx_signatures must never leave until the peer has
+			// verifiably signed our commitment #0. This single-channel harness has
+			// no signer, so the commitment round can't complete — sendTxSignatures
+			// must DEFER (empty actions), never emit TX_SIGNATURES. The full
+			// exchange is covered end-to-end in dual-funding-commitment.test.ts.
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2(params);
 
 			const channelId = channel.getTemporaryChannelId();
 			channel.handleAcceptChannel2(makeAcceptChannel2Msg({ channelId }));
 
-			// Add input and output, complete
 			channel.addTxInput({
 				serialId: 0n,
 				prevTxid: crypto.randomBytes(32),
@@ -1456,7 +1460,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			channel.handleTxComplete();
 			channel.sendTxComplete();
 
-			// Send signatures
+			// A random txid can't match the negotiated funding tx either.
 			const txid = crypto.randomBytes(32);
 			const actions = channel.sendTxSignatures(txid, 0, [[Buffer.alloc(72)]]);
 
@@ -1467,9 +1471,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 						(a as { messageType: MessageType }).messageType ===
 							MessageType.TX_SIGNATURES
 				)
-			).to.be.true;
-			expect(actions.some((a) => a.type === ChannelActionType.WATCH_FUNDING)).to
-				.be.true;
+			).to.be.false;
 		});
 	});
 

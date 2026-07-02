@@ -80,6 +80,13 @@ export interface IChainWatcherConfig {
 	channelManager: ChannelManager;
 	/** Destination script for sweep outputs (P2WPKH). Falls back to zeros if not set. */
 	destinationScript?: Buffer;
+	/**
+	 * Live sat/vB feerate for sweeps built when a funding spend (remote
+	 * force-close / breach) is detected. Without it every sweep and penalty tx
+	 * on this path is built at the hardcoded 10 sat/vB default and can sit
+	 * below the market rate while the cheater's to_self_delay matures.
+	 */
+	getSweepFeeRatePerVbyte?: () => number;
 }
 
 /**
@@ -149,6 +156,7 @@ export class ChainWatcher extends EventEmitter {
 	private currentBlockHeight = 0;
 	private started = false;
 	private destinationScript: Buffer;
+	private getSweepFeeRatePerVbyte?: () => number;
 	private _recheckTimer: ReturnType<typeof setInterval> | null = null;
 
 	constructor(config: IChainWatcherConfig) {
@@ -156,6 +164,7 @@ export class ChainWatcher extends EventEmitter {
 		this.backend = config.backend;
 		this.channelManager = config.channelManager;
 		this.destinationScript = config.destinationScript || Buffer.alloc(22);
+		this.getSweepFeeRatePerVbyte = config.getSweepFeeRatePerVbyte;
 
 		this.wireChannelManagerEvents();
 	}
@@ -675,7 +684,8 @@ export class ChainWatcher extends EventEmitter {
 				watched.channelId,
 				spendingTx,
 				height,
-				this.destinationScript
+				this.destinationScript,
+				this.getSweepFeeRatePerVbyte?.() ?? 10
 			);
 			this.emit('funding:spent', watched.channelId, spendingTx);
 			return;

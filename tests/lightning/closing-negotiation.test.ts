@@ -64,7 +64,10 @@ function signFn(_fee: bigint): Buffer {
 /**
  * Create two channels in NEGOTIATING_CLOSING state.
  */
-function setupNegotiatingChannels(): { opener: Channel; acceptor: Channel } {
+function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
+	opener: Channel;
+	acceptor: Channel;
+} {
 	const openerBp = makeBasepoints();
 	const acceptorBp = makeBasepoints();
 
@@ -145,6 +148,24 @@ function setupNegotiatingChannels(): { opener: Channel; acceptor: Channel } {
 		channelId: acceptor.getChannelId()!,
 		secondPerCommitmentPoint: crypto.randomBytes(33)
 	});
+
+	if (opts?.withPendingHtlc) {
+		// Put an offered HTLC in flight on the opener, then have the peer
+		// initiate shutdown. The opener holds at SHUTTING_DOWN.
+		const addActions = opener.addHtlc(
+			50_000_000n,
+			crypto.randomBytes(32),
+			500,
+			Buffer.alloc(1366)
+		);
+		expect(findErrorAction(addActions)).to.be.null;
+		opener.handleShutdown({
+			channelId: opener.getChannelId()!,
+			scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+		});
+		expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+		return { opener, acceptor };
+	}
 
 	// Initiate shutdown on both sides
 	opener.initiateShutdown(Buffer.from('0014' + '0'.repeat(40), 'hex'));
@@ -486,6 +507,42 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 				ChannelState.NEGOTIATING_CLOSING,
 				ChannelState.CLOSED
 			]).to.include(opener.getState());
+		});
+
+		it('rejects closing_signed while HTLCs are pending (fund-safety)', function () {
+			// The closing tx pays out the settled balances only, so signing a
+			// mutual close with an HTLC in flight burns that HTLC's value to
+			// fees. A peer that sends shutdown followed by closing_signed while
+			// we still have a pending HTLC must be rejected, and the channel
+			// (plus its funding watch) must stay intact.
+			const { opener } = setupNegotiatingChannels({ withPendingHtlc: true });
+
+			expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+
+			const actions = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 500n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn,
+				() => true
+			);
+
+			expect(findErrorAction(actions)).to.include('pending HTLCs');
+			expect(hasAction(actions, ChannelActionType.CHANNEL_CLOSED)).to.be.false;
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+		});
+
+		it('rejects proposeClosingFee while HTLCs are pending (fund-safety)', function () {
+			const { opener } = setupNegotiatingChannels({ withPendingHtlc: true });
+
+			const actions = opener.proposeClosingFee(crypto.randomBytes(64));
+
+			expect(findErrorAction(actions)).to.include('pending HTLCs');
+			expect(findSendAction(actions, MessageType.CLOSING_SIGNED)).to.be.null;
+			expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
 		});
 
 		it('should reject closing_signed in NORMAL state', function () {

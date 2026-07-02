@@ -25,7 +25,8 @@ import {
 	resolveOurCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs,
 	resolveRevokedCommitmentOutputs,
-	resolveSecondLevelHtlcOutput
+	resolveSecondLevelHtlcOutput,
+	resolveRevokedSecondLevelOutput
 } from './output-resolver';
 import { estimateSweepVbytes } from './sweep';
 import { IChannelState } from '../channel/channel-state';
@@ -284,11 +285,42 @@ export class ChainMonitor {
 		blockHeight: number
 	): ChainAction[] {
 		if (this._state !== MonitorState.WATCHING) {
-			// The spend was already processed (restored monitor, mempool-first
-			// sighting, or a duplicate scripthash notification). A spend first seen
-			// unconfirmed recorded confirmationHeight 0 — adopt the real height now
-			// so held BIP68 sweeps become schedulable.
-			return this._adoptLateConfirmation(spendingTx, blockHeight);
+			// Commitment SWAP: a DIFFERENT tx now spends the funding output. The
+			// funding outpoint can only be spent once per chain, so a confirmed
+			// conflicting spend means the recorded commitment was reorged out or
+			// lost a mempool race (e.g. we broadcast ours, the peer's revoked
+			// commitment confirmed instead; or a mempool-seen coop close was
+			// double-spent by a revoked commitment). Discarding it would leave
+			// the real close — possibly a revoked commitment needing penalty —
+			// entirely unresolved: our tracked outputs belong to a tx that no
+			// longer exists. Reset and reclassify against the confirmed spend.
+			// Only a CONFIRMED conflict swaps (mempool sightings of a competing
+			// commitment must not thrash the tracking back and forth), and only
+			// while the recorded spend is not yet irreversibly final.
+			const recordedFinal =
+				this._commitmentBroadcast != null &&
+				this._commitmentBroadcast.blockHeight > 0 &&
+				Math.max(this._currentBlockHeight, blockHeight) -
+					this._commitmentBroadcast.blockHeight >=
+					IRREVOCABLE_DEPTH;
+			if (
+				this._commitmentBroadcast &&
+				this._commitmentBroadcast.txid !== spendingTx.getId() &&
+				blockHeight > 0 &&
+				!recordedFinal
+			) {
+				this._trackedOutputs = [];
+				this._commitmentBroadcast = null;
+				this._state = MonitorState.WATCHING;
+				// fall through to normal classification below (preimages learned
+				// so far are retained in _knownPreimages)
+			} else {
+				// The spend was already processed (restored monitor, mempool-first
+				// sighting, or a duplicate scripthash notification). A spend first
+				// seen unconfirmed recorded confirmationHeight 0 — adopt the real
+				// height now so held BIP68 sweeps become schedulable.
+				return this._adoptLateConfirmation(spendingTx, blockHeight);
+			}
 		}
 
 		this._currentBlockHeight = blockHeight;
@@ -465,9 +497,16 @@ export class ChainMonitor {
 						const originalRate =
 							output.originalFeeRate || this._feeRatePerVbyte;
 						const currentRate = output.currentFeeRate || originalRate;
+						// Anti-runaway cap: 10x the build-time rate OR the live network
+						// rate, whichever is larger. A sweep built at a stale low rate
+						// (e.g. the 10 sat/vB restore default) must still be able to
+						// reach the known live rate.
 						const bumpedRate = Math.min(
 							Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
-							originalRate * MAX_FEE_BUMP_MULTIPLIER
+							Math.max(
+								originalRate * MAX_FEE_BUMP_MULTIPLIER,
+								this._feeRatePerVbyte
+							)
 						);
 						// _broadcastSweepAction reads output.currentFeeRate for the anchor
 						// HTLC fee-attach target, so set it before re-issuing the broadcast.
@@ -494,12 +533,17 @@ export class ChainMonitor {
 					// Bump the fee rate, but never below the current network estimate
 					// (the node feeds live rates via updateFeeRate). This lets a sweep
 					// catch up to a fee spike instead of crawling 1.5x per interval.
-					// Still capped at MAX_FEE_BUMP_MULTIPLIER × original.
+					// Anti-runaway cap: 10x the build-time rate OR the live rate,
+					// whichever is larger — a sweep built at a stale low rate (e.g.
+					// the 10 sat/vB restore default) must still reach the live rate.
 					const originalRate = output.originalFeeRate || this._feeRatePerVbyte;
 					const currentRate = output.currentFeeRate || originalRate;
 					const bumpedRate = Math.min(
 						Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
-						originalRate * MAX_FEE_BUMP_MULTIPLIER
+						Math.max(
+							originalRate * MAX_FEE_BUMP_MULTIPLIER,
+							this._feeRatePerVbyte
+						)
 					);
 					const vbytes = estimateSweepVbytes(output.outputType);
 					const feeSatoshis = BigInt(Math.ceil(bumpedRate * vbytes));
@@ -621,6 +665,77 @@ export class ChainMonitor {
 							'second-level HTLC sweep (CSV delayed)'
 						);
 					}
+				}
+			}
+		}
+
+		// #8: REVOKED commitment — the cheater confirmed their pre-signed
+		// second-level HTLC tx (success with the preimage / timeout) before our
+		// HTLC penalty. Its output is ALSO revocable by us with NO timelock
+		// (BOLT 5: SHOULD spend the HTLC-timeout/HTLC-success output using the
+		// revocation private key); without this claim the HTLC value is lost once
+		// the cheater's to_self_delay matures.
+		if (
+			(output.outputType === OutputType.OFFERED_HTLC ||
+				output.outputType === OutputType.RECEIVED_HTLC) &&
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT
+		) {
+			// Our own penalty confirming resolves the HTLC output — nothing to claim.
+			let ourPenaltyTxid: string | null = null;
+			if (output.sweepTxHex) {
+				try {
+					ourPenaltyTxid = bitcoin.Transaction.fromHex(
+						output.sweepTxHex
+					).getId();
+				} catch {
+					ourPenaltyTxid = null;
+				}
+			}
+			if (ourPenaltyTxid !== spendingTx.getId()) {
+				const resolved = resolveRevokedSecondLevelOutput(
+					this._channelState,
+					spendingTx,
+					blockHeight,
+					this._commitmentBroadcast.commitmentNumber,
+					this._destinationScript,
+					this._feeRatePerVbyte,
+					this._revocationBasepointSecret,
+					this._network
+				);
+				for (const r of resolved) {
+					if (!r.spendTx) continue;
+					const already = this._trackedOutputs.some(
+						(o) =>
+							o.txid === r.trackedOutput.txid &&
+							o.outputIndex === r.trackedOutput.outputIndex
+					);
+					if (already) continue;
+					// The revocation path has no timelock — broadcast immediately
+					// (mirrors _handleRevokedCommitment; witness already set by the
+					// resolver). The claim races the cheater's to_self_delay.
+					const txBuf = r.spendTx.toBuffer();
+					r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
+					r.trackedOutput.broadcastHeight = blockHeight;
+					r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
+					r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+					// Retain the cheater's second-level tx so a stalled claim can be
+					// re-resolved at a bumped feerate (rebuildSweep) rather than
+					// stranded at its initial rate until the to_self_delay matures.
+					r.trackedOutput.secondLevelTxHex = spendingTx
+						.toBuffer()
+						.toString('hex');
+					this._trackedOutputs.push(r.trackedOutput);
+					actions.push({
+						type: ChainActionType.WATCH_OUTPUT,
+						txid: r.trackedOutput.txid,
+						outputIndex: r.trackedOutput.outputIndex
+					});
+					actions.push({
+						type: ChainActionType.BROADCAST_TX,
+						tx: txBuf,
+						description: 'penalty sweep (revoked second-level HTLC)'
+					});
 				}
 			}
 		}
@@ -1129,10 +1244,34 @@ export class ChainMonitor {
 					);
 					break;
 				case CommitmentType.THEIR_REVOKED_COMMITMENT: {
+					// A revoked second-level justice claim (#8) spends the cheater's
+					// HTLC tx, not the revoked commitment. Re-resolve it against the
+					// retained second-level tx at the bumped rate so a stalled claim
+					// can be RBF'd before the cheater's to_self_delay matures.
+					if (output.secondLevelTxHex) {
+						const secondLevelTx = bitcoin.Transaction.fromHex(
+							output.secondLevelTxHex
+						);
+						resolved = resolveRevokedSecondLevelOutput(
+							this._channelState,
+							secondLevelTx,
+							output.confirmationHeight,
+							this._commitmentBroadcast.commitmentNumber,
+							this._destinationScript,
+							feeRatePerVbyte,
+							this._revocationBasepointSecret,
+							this._network
+						);
+						break;
+					}
 					if (!this._commitmentBroadcast.revokedTxHex) return null;
 					const revokedTx = bitcoin.Transaction.fromHex(
 						this._commitmentBroadcast.revokedTxHex
 					);
+					// Non-second-level output whose txid does not match the revoked
+					// commitment cannot be rebuilt from it — signing would target the
+					// wrong outpoint.
+					if (output.txid !== revokedTx.getId()) return null;
 					resolved = resolveRevokedCommitmentOutputs(
 						this._channelState,
 						[output],

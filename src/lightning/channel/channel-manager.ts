@@ -32,7 +32,11 @@ import {
 import {
 	decodeShutdownMessage,
 	encodeShutdownMessage,
-	decodeClosingSignedMessage
+	decodeClosingSignedMessage,
+	decodeClosingCompleteMessage,
+	decodeClosingSigMessage,
+	ClosingSigVariant,
+	IClosingCompleteMessage
 } from '../message/channel-close';
 import { decodeErrorMessage, encodeErrorMessage } from '../message/error';
 import { decodeChannelReestablishMessage } from '../message/channel-reestablish';
@@ -112,7 +116,7 @@ import { IDualFundingParams } from './dual-funding';
 import { ILeaseRates } from '../gossip/types';
 import { signWillFund, verifyWillFund } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
-import { Feature } from '../features/flags';
+import { Feature, FeatureFlags } from '../features/flags';
 
 /** Per-channel key set returned by the channel key deriver callback. */
 export interface IPerChannelKeys {
@@ -159,6 +163,12 @@ export interface IChannelManagerConfig {
 	 * and contributes the requested funds as the acceptor.
 	 */
 	leaseRates?: ILeaseRates;
+	/**
+	 * Our own advertised init features. Used to gate per-peer feature-dependent
+	 * behavior (e.g. option_simple_close) on BOTH sides having advertised it.
+	 * When absent, feature-gated behavior stays on the legacy path.
+	 */
+	localFeatures?: FeatureFlags;
 }
 
 /**
@@ -290,6 +300,8 @@ export class ChannelManager extends EventEmitter {
 			MessageType.UPDATE_FEE,
 			MessageType.SHUTDOWN,
 			MessageType.CLOSING_SIGNED,
+			MessageType.CLOSING_COMPLETE,
+			MessageType.CLOSING_SIG,
 			MessageType.CHANNEL_REESTABLISH,
 			MessageType.STFU,
 			MessageType.SPLICE,
@@ -822,8 +834,20 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		// Stamp the negotiation path from the init-feature intersection before
+		// the state machine runs (its script rules depend on it).
+		channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
+
 		const actions = channel.initiateShutdown(scriptPubkey);
 		this.processActions(peerPubkey, channel, actions);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
 		return { ok: true, actions };
 	}
 
@@ -1419,6 +1443,12 @@ export class ChannelManager extends EventEmitter {
 				case MessageType.CLOSING_SIGNED:
 					this.handleClosingSignedMsg(peerPubkey, payload);
 					break;
+				case MessageType.CLOSING_COMPLETE:
+					this.handleClosingCompleteMsg(peerPubkey, payload);
+					break;
+				case MessageType.CLOSING_SIG:
+					this.handleClosingSigMsg(peerPubkey, payload);
+					break;
 				case MessageType.CHANNEL_REESTABLISH:
 					this.handleChannelReestablish(peerPubkey, payload);
 					break;
@@ -1727,12 +1757,18 @@ export class ChannelManager extends EventEmitter {
 
 	private handleCommitmentSigned(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeCommitmentSignedMessage(payload);
-		const channel = this.findChannelByChannelId(msg.channelId);
+		// A v2 open exchanges commitment_signed while the channel still lives in
+		// tempChannels (keyed by its now-derived channelId), so fall back to the
+		// temp lookup.
+		const channel =
+			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId);
 		if (!channel) return;
 
 		const actions = channel.handleCommitmentSigned(msg);
 		const hasError = actions.some((a) => a.type === ChannelActionType.ERROR);
 		this.processActions(peerPubkey, channel, actions);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
 
 		// BOLT 2: After sending revoke_and_ack, send commitment_signed to commit
 		// any pending updates on the remote's side. autoSignAndSendCommitment is a
@@ -1776,16 +1812,25 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		// Stamp the negotiation path BEFORE processing (handleShutdown's script
+		// validation and re-send rules depend on it).
+		channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
+
 		// Derive default P2WPKH shutdown script from local funding pubkey
 		const defaultScript = this.getDefaultShutdownScript();
 		const actions = channel.handleShutdown(msg, defaultScript);
 		this.processActions(peerPubkey, channel, actions);
 
+		if (channel.getState() !== ChannelState.NEGOTIATING_CLOSING) return;
+
+		if (channel.isSimpleClose()) {
+			// option_simple_close: BOTH sides SHOULD send closing_complete.
+			this.startSimpleClose(peerPubkey, channel);
+			return;
+		}
+
 		// BOLT 2: opener must send first closing_signed after both shutdowns exchanged
-		if (
-			channel.getState() === ChannelState.NEGOTIATING_CLOSING &&
-			channel.getRole() === ChannelRole.OPENER
-		) {
+		if (channel.getRole() === ChannelRole.OPENER) {
 			const closingActions = channel.proposeClosingFee((feeSatoshis: bigint) =>
 				this.signClosingTx(channel, feeSatoshis)
 			);
@@ -2000,6 +2045,463 @@ export class ChannelManager extends EventEmitter {
 		return tx.toBuffer();
 	}
 
+	// ─────────────── option_simple_close ───────────────
+
+	/**
+	 * Kick off (or restart) the simple-close signing flow: send our
+	 * closing_complete as closer. Both sides do this independently; each
+	 * side's fee comes out of its own output. Skipped when our balance can't
+	 * cover a relayable fee — we then simply act as closee for the peer's
+	 * closing_complete.
+	 */
+	private startSimpleClose(peerPubkey: string, channel: Channel): void {
+		const { estimateSimpleCloseFee } = require('../chain/closing');
+		const state = channel.getFullState();
+		const localScript = state.localShutdownScript;
+		const remoteScript = state.remoteShutdownScript;
+		if (!localScript || localScript.length === 0 || !remoteScript) return;
+
+		const feeratePerKw = state.localConfig.feeratePerKw || 253;
+		const fee: bigint = estimateSimpleCloseFee(
+			feeratePerKw,
+			localScript.length,
+			remoteScript.length
+		);
+		const localSat = state.localBalanceMsat / 1000n;
+		if (localSat < fee) {
+			// Nothing (or not enough) at stake on our side to pay for a close tx;
+			// wait for the peer's closing_complete instead.
+			return;
+		}
+
+		const actions = channel.sendClosingComplete(
+			fee,
+			0,
+			(variant, feeSatoshis, locktime, closerScript, closeeScript) =>
+				this.signSimpleClosingTx(
+					channel,
+					variant,
+					feeSatoshis,
+					locktime,
+					true,
+					closerScript,
+					closeeScript
+				)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * Build the simple-close tx + funding witness data for one signature
+	 * variant. Unlike the legacy builder (opener pays), the CLOSER pays the
+	 * whole fee — closerIsLocal maps our/their balances onto closer/closee.
+	 */
+	private buildSimpleClosingTxAndScript(
+		channel: Channel,
+		variant: ClosingSigVariant,
+		feeSatoshis: bigint,
+		locktime: number,
+		closerIsLocal: boolean,
+		closerScript: Buffer,
+		closeeScript: Buffer
+	): {
+		tx: import('bitcoinjs-lib').Transaction;
+		witnessScript: Buffer;
+		fundingSatoshis: bigint;
+		localFundingPubkey: Buffer;
+		remoteFundingPubkey: Buffer;
+	} {
+		const { buildSimpleClosingTx } = require('../chain/closing');
+		const { createFundingScript } = require('../script/funding');
+
+		const state = channel.getFullState();
+		const localBalanceSat = state.localBalanceMsat / 1000n;
+		const remoteBalanceSat = state.remoteBalanceMsat / 1000n;
+
+		const { tx } = buildSimpleClosingTx({
+			fundingTxid: state.fundingTxid!.toString('hex'),
+			fundingOutputIndex: state.fundingOutputIndex!,
+			closerScriptPubkey: closerScript,
+			closeeScriptPubkey: closeeScript,
+			closerAmount: closerIsLocal ? localBalanceSat : remoteBalanceSat,
+			closeeAmount: closerIsLocal ? remoteBalanceSat : localBalanceSat,
+			feeSatoshis,
+			locktime,
+			variant: variant as number
+		});
+
+		const { witnessScript } = createFundingScript(
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints!.fundingPubkey
+		);
+
+		return {
+			tx,
+			witnessScript,
+			fundingSatoshis: state.fundingSatoshis,
+			localFundingPubkey: state.localBasepoints.fundingPubkey,
+			remoteFundingPubkey: state.remoteBasepoints!.fundingPubkey
+		};
+	}
+
+	private signSimpleClosingTx(
+		channel: Channel,
+		variant: ClosingSigVariant,
+		feeSatoshis: bigint,
+		locktime: number,
+		closerIsLocal: boolean,
+		closerScript: Buffer,
+		closeeScript: Buffer
+	): Buffer {
+		const { tx, witnessScript, fundingSatoshis } =
+			this.buildSimpleClosingTxAndScript(
+				channel,
+				variant,
+				feeSatoshis,
+				locktime,
+				closerIsLocal,
+				closerScript,
+				closeeScript
+			);
+		const signer =
+			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
+	}
+
+	/**
+	 * Verify the peer's signature over the simple-close tx we would broadcast.
+	 * Gates every CLOSED transition in the simple-close flow (same posture as
+	 * verifyPeerClosingSig on the legacy path).
+	 */
+	private verifyPeerSimpleClosingSig(
+		channel: Channel,
+		variant: ClosingSigVariant,
+		feeSatoshis: bigint,
+		locktime: number,
+		closerIsLocal: boolean,
+		closerScript: Buffer,
+		closeeScript: Buffer,
+		theirSig: Buffer
+	): boolean {
+		try {
+			const { tx, witnessScript, fundingSatoshis, remoteFundingPubkey } =
+				this.buildSimpleClosingTxAndScript(
+					channel,
+					variant,
+					feeSatoshis,
+					locktime,
+					closerIsLocal,
+					closerScript,
+					closeeScript
+				);
+			const signer =
+				channel.getSigner() ||
+				new ChannelSigner(this.config.localFundingPrivkey);
+			return signer.verifyCommitmentSig(
+				tx,
+				theirSig,
+				remoteFundingPubkey,
+				witnessScript,
+				Number(fundingSatoshis)
+			);
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Build the fully-signed simple-close tx (after re-verifying the peer's
+	 * signature) for broadcast. Returns null if their signature does not verify
+	 * — defense in depth behind the state machine's own verify gate, mirroring
+	 * buildSignedMutualCloseTx on the legacy path.
+	 */
+	private buildSignedSimpleMutualCloseTx(
+		channel: Channel,
+		variant: ClosingSigVariant,
+		feeSatoshis: bigint,
+		locktime: number,
+		closerIsLocal: boolean,
+		closerScript: Buffer,
+		closeeScript: Buffer,
+		theirSig: Buffer
+	): Buffer | null {
+		try {
+			const {
+				tx,
+				witnessScript,
+				fundingSatoshis,
+				localFundingPubkey,
+				remoteFundingPubkey
+			} = this.buildSimpleClosingTxAndScript(
+				channel,
+				variant,
+				feeSatoshis,
+				locktime,
+				closerIsLocal,
+				closerScript,
+				closeeScript
+			);
+			const signer =
+				channel.getSigner() ||
+				new ChannelSigner(this.config.localFundingPrivkey);
+			const ourSig = signer.signClosingTx(
+				tx,
+				witnessScript,
+				Number(fundingSatoshis)
+			);
+			if (
+				!signer.verifyCommitmentSig(
+					tx,
+					theirSig,
+					remoteFundingPubkey,
+					witnessScript,
+					Number(fundingSatoshis)
+				)
+			) {
+				return null;
+			}
+			tx.setWitness(
+				0,
+				ChannelSigner.buildFundingWitness(
+					ourSig,
+					theirSig,
+					localFundingPubkey,
+					remoteFundingPubkey,
+					witnessScript
+				)
+			);
+			return tx.toBuffer();
+		} catch {
+			return null;
+		}
+	}
+
+	/** Extract the single (variant, sig) pair from a simple-close message. */
+	private static singleClosingSig(
+		msg: IClosingCompleteMessage
+	): { variant: ClosingSigVariant; sig: Buffer } | null {
+		const sigs: Array<{ variant: ClosingSigVariant; sig: Buffer }> = [];
+		if (msg.closerOutputOnlySig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSER_OUTPUT_ONLY,
+				sig: msg.closerOutputOnlySig
+			});
+		}
+		if (msg.closeeOutputOnlySig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSEE_OUTPUT_ONLY,
+				sig: msg.closeeOutputOnlySig
+			});
+		}
+		if (msg.closerAndCloseeSig) {
+			sigs.push({
+				variant: ClosingSigVariant.CLOSER_AND_CLOSEE,
+				sig: msg.closerAndCloseeSig
+			});
+		}
+		return sigs.length === 1 ? sigs[0] : null;
+	}
+
+	/**
+	 * closing_complete from the peer: we are the CLOSEE. On success the channel
+	 * emits closing_sig + CHANNEL_CLOSED; we then broadcast the peer's close tx
+	 * ourselves (never trusting the peer to broadcast), with the same
+	 * defense-in-depth CHANNEL_CLOSED strip as the legacy path.
+	 */
+	private handleClosingCompleteMsg(peerPubkey: string, payload: Buffer): void {
+		const msg = decodeClosingCompleteMessage(payload);
+		const channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleClosingComplete(
+			msg,
+			(variant, feeSatoshis, locktime, closerScript, closeeScript, sig) =>
+				this.verifyPeerSimpleClosingSig(
+					channel,
+					variant,
+					feeSatoshis,
+					locktime,
+					false,
+					closerScript,
+					closeeScript,
+					sig
+				),
+			(variant, feeSatoshis, locktime, closerScript, closeeScript) =>
+				this.signSimpleClosingTx(
+					channel,
+					variant,
+					feeSatoshis,
+					locktime,
+					false,
+					closerScript,
+					closeeScript
+				)
+		);
+
+		// Success is signalled by the closing_sig reply (present even in the
+		// concurrent-close race where the channel is already CLOSED and no
+		// CHANNEL_CLOSED action is re-emitted). Recover the signed variant from it.
+		const replyAction = actions.find(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				(a as { messageType: MessageType }).messageType ===
+					MessageType.CLOSING_SIG
+		) as { payload: Buffer } | undefined;
+		if (!replyAction) {
+			this.processActions(peerPubkey, channel, actions);
+			return;
+		}
+		const reply = replyAction
+			? decodeClosingSigMessage(replyAction.payload)
+			: null;
+		const chosen = reply ? ChannelManager.singleClosingSig(reply) : null;
+		const theirSig = chosen
+			? {
+					[ClosingSigVariant.CLOSER_OUTPUT_ONLY]: msg.closerOutputOnlySig,
+					[ClosingSigVariant.CLOSEE_OUTPUT_ONLY]: msg.closeeOutputOnlySig,
+					[ClosingSigVariant.CLOSER_AND_CLOSEE]: msg.closerAndCloseeSig
+			  }[chosen.variant]
+			: undefined;
+
+		const closeTx =
+			chosen && theirSig
+				? this.buildSignedSimpleMutualCloseTx(
+						channel,
+						chosen.variant,
+						msg.feeSatoshis,
+						msg.locktime,
+						false,
+						msg.closerScriptPubkey,
+						msg.closeeScriptPubkey,
+						theirSig
+				  )
+				: null;
+		if (closeTx) {
+			this.emit('broadcast:tx', closeTx);
+			this.processActions(peerPubkey, channel, actions);
+		} else {
+			// Defense in depth: the state machine verified the sig already, so we
+			// should not get here — but never process CHANNEL_CLOSED (funding-watch
+			// teardown) without a broadcastable, verified close tx.
+			this.emit(
+				'error',
+				msg.channelId,
+				'Simple close: failed to build verified closing tx'
+			);
+			this.processActions(
+				peerPubkey,
+				channel,
+				actions.filter((a) => a.type !== ChannelActionType.CHANNEL_CLOSED)
+			);
+		}
+	}
+
+	/**
+	 * closing_sig from the peer: we are the CLOSER; broadcast our close tx.
+	 */
+	private handleClosingSigMsg(peerPubkey: string, payload: Buffer): void {
+		const msg = decodeClosingSigMessage(payload);
+		const channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleClosingSig(
+			msg,
+			(variant, feeSatoshis, locktime, closerScript, closeeScript, sig) =>
+				this.verifyPeerSimpleClosingSig(
+					channel,
+					variant,
+					feeSatoshis,
+					locktime,
+					true,
+					closerScript,
+					closeeScript,
+					sig
+				)
+		);
+
+		// Success = no ERROR action (the concurrent-close race succeeds with an
+		// empty action list: already CLOSED, but our alternative tx broadcasts).
+		const failed = actions.some((a) => a.type === ChannelActionType.ERROR);
+		if (failed) {
+			this.processActions(peerPubkey, channel, actions);
+			return;
+		}
+
+		const chosen = ChannelManager.singleClosingSig(msg);
+		const closeTx = chosen
+			? this.buildSignedSimpleMutualCloseTx(
+					channel,
+					chosen.variant,
+					msg.feeSatoshis,
+					msg.locktime,
+					true,
+					msg.closerScriptPubkey,
+					msg.closeeScriptPubkey,
+					chosen.sig
+			  )
+			: null;
+		if (closeTx) {
+			this.emit('broadcast:tx', closeTx);
+			this.processActions(peerPubkey, channel, actions);
+		} else {
+			this.emit(
+				'error',
+				msg.channelId,
+				'Simple close: failed to build verified closing tx'
+			);
+			this.processActions(
+				peerPubkey,
+				channel,
+				actions.filter((a) => a.type !== ChannelActionType.CHANNEL_CLOSED)
+			);
+		}
+	}
+
+	/**
+	 * RBF entry: bump our simple-close fee (option_simple_close only). Callable
+	 * once the previous closing_complete round was answered.
+	 */
+	bumpCloseFee(channelId: Buffer, feeSatoshis: bigint): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		const actions = channel.bumpClosingFee(
+			feeSatoshis,
+			0,
+			(variant, fee, locktime, closerScript, closeeScript) =>
+				this.signSimpleClosingTx(
+					channel,
+					variant,
+					fee,
+					locktime,
+					true,
+					closerScript,
+					closeeScript
+				)
+		);
+		this.processActions(peerPubkey, channel, actions);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
 	/**
 	 * Propose initial closing fee on a channel (opener-side).
 	 */
@@ -2067,6 +2569,12 @@ export class ChannelManager extends EventEmitter {
 			state === ChannelState.NEGOTIATING_CLOSING ||
 			state === ChannelState.SHUTTING_DOWN
 		) {
+			// Re-evaluate the negotiation path — features are per-connection —
+			// and abandon any in-flight closing_complete (its closing_sig can
+			// never arrive on the new connection; negotiation restarts per spec).
+			channel.setSimpleClose(this.peerNegotiatedSimpleClose(peerPubkey));
+			channel.resetSimpleCloseNegotiation();
+
 			const fullState = channel.getFullState();
 			if (
 				fullState.localShutdownScript &&
@@ -2081,15 +2589,17 @@ export class ChannelManager extends EventEmitter {
 					})
 				);
 			}
-			// Opener re-proposes closing_signed to resume fee negotiation
-			if (
-				state === ChannelState.NEGOTIATING_CLOSING &&
-				channel.getRole() === ChannelRole.OPENER
-			) {
-				const closingActions = channel.proposeClosingFee(
-					(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis)
-				);
-				this.processActions(peerPubkey, channel, closingActions);
+			if (state === ChannelState.NEGOTIATING_CLOSING) {
+				if (channel.isSimpleClose()) {
+					// Both roles restart the simple-close signing flow.
+					this.startSimpleClose(peerPubkey, channel);
+				} else if (channel.getRole() === ChannelRole.OPENER) {
+					// Opener re-proposes closing_signed to resume fee negotiation
+					const closingActions = channel.proposeClosingFee(
+						(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis)
+					);
+					this.processActions(peerPubkey, channel, closingActions);
+				}
 			}
 		}
 	}
@@ -2145,6 +2655,21 @@ export class ChannelManager extends EventEmitter {
 			init.features.hasFeature(Feature.QUIESCE) &&
 			init.features.hasFeature(Feature.SPLICE)
 		);
+	}
+
+	/**
+	 * Whether option_simple_close (closing_complete/closing_sig) was negotiated
+	 * with this peer: BOTH our advertised features and the peer's init must set
+	 * it. Unlike peerSupportsSplicing, an unknown peer init defaults to FALSE —
+	 * legacy closing_signed is the safe fallback every peer understands.
+	 */
+	private peerNegotiatedSimpleClose(peerPubkey: string): boolean {
+		if (!this.config.localFeatures?.hasFeature(Feature.SIMPLE_CLOSE)) {
+			return false;
+		}
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return false;
+		return init.features.hasFeature(Feature.SIMPLE_CLOSE);
 	}
 
 	private handleSpliceMsg(peerPubkey: string, payload: Buffer): void {
@@ -2537,6 +3062,10 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxComplete();
+		// tx_complete may trigger our v2 commitment_signed, which sets the
+		// derived channelId — promote before processActions so PERSIST_STATE
+		// resolves the channel by its permanent id.
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -2548,7 +3077,31 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxSignatures(msg);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * Promote a v2 (dual-funded) channel from tempChannels to the permanent map.
+	 * Deferred until the open reaches AWAITING_FUNDING_CONFIRMED: while the
+	 * channel is still in the commitment_signed / tx_signatures round (state
+	 * AWAITING_TX_SIGNATURES) it MUST stay in tempChannels so a mid-round peer
+	 * disconnect is aborted by handlePeerDisconnected (which only scans
+	 * tempChannels for early-state channels). Routing still works in the interim:
+	 * commitment_signed is found via findChannelByChannelIdInTemp (derived id) and
+	 * tx_signatures via findTempChannel (temporary id). Idempotent.
+	 */
+	private _promoteV2ChannelIfReady(peerPubkey: string, channel: Channel): void {
+		const cid = channel.getChannelId();
+		if (!cid) return;
+		if (channel.getState() !== ChannelState.AWAITING_FUNDING_CONFIRMED) return;
+		const permId = cid.toString('hex');
+		if (this.channels.has(permId)) return;
+		const tempId = channel.getTemporaryChannelId()?.toString('hex');
+		if (!tempId || !this.tempChannels.has(tempId)) return;
+		this.channels.set(permId, channel);
+		this.channelPeers.set(permId, peerPubkey);
+		this.tempChannels.delete(tempId);
 	}
 
 	private handleTxInitRbfMsg(peerPubkey: string, payload: Buffer): void {
@@ -3094,6 +3647,62 @@ export class ChannelManager extends EventEmitter {
 			entry.lastFeeRate = feeRatePerVbyte;
 			entry.broadcastHeight = blockHeight;
 		}
+	}
+
+	/**
+	 * After a restore: re-broadcast OUR still-unconfirmed anchor force-close
+	 * commitment and re-arm its CPFP tracking. _pendingCommitmentCpfp is
+	 * in-memory only, so without this a restart while the commitment sits
+	 * unconfirmed leaves the package unbumped (and possibly mempool-evicted)
+	 * forever — CSV/HTLC sweeps are all blocked behind the unconfirmed parent.
+	 * Safe to re-run: forceClose() rebuilds the byte-identical commitment
+	 * (deterministic signatures) and duplicate broadcasts are rejected
+	 * harmlessly by the network.
+	 */
+	rearmCommitmentCpfp(channelId: Buffer, feeRatePerVbyte: number): void {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		const monitor = this.monitors.get(idHex);
+		if (!channel || !monitor) return;
+		// Only OUR force-close broadcasts a commitment we can CPFP.
+		// markClosedOnChain(true) also sets FORCE_CLOSED for a REMOTE force-close,
+		// so gate on the monitor having classified OUR commitment as the spend —
+		// otherwise, for a peer's still-unconfirmed (mempool-only) force-close we
+		// would re-broadcast our competing commitment over theirs, and if theirs
+		// was a revoked breach we would forgo the justice claim. isCommitmentConfirmed
+		// alone does not distinguish ours from theirs.
+		if (channel.getState() !== ChannelState.FORCE_CLOSED) return;
+		const broadcast = monitor.getFullState().commitmentBroadcast;
+		if (
+			broadcast &&
+			broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
+		) {
+			return;
+		}
+		if (monitor.isFullyResolved() || monitor.isCommitmentConfirmed()) return;
+		if (this._pendingCommitmentCpfp.has(idHex)) return;
+
+		const signer =
+			channel.getSigner() ||
+			new ChannelSigner(
+				this.config.localFundingPrivkey,
+				this.config.htlcBasepointSecret
+			);
+		const actions = channel.forceClose(signer);
+		if (actions.some((a) => a.type === ChannelActionType.ERROR)) return;
+		// Re-broadcast the commitment itself (it may have been evicted while we
+		// were offline), then attach the CPFP child and re-arm per-block re-bumps.
+		for (const action of actions) {
+			if (action.type === ChannelActionType.BROADCAST_TX) {
+				this.emit('broadcast:tx', action.tx);
+			}
+		}
+		this._maybeCpfpAnchorCommitment(
+			channelId,
+			channel.getFullState(),
+			actions,
+			feeRatePerVbyte
+		);
 	}
 
 	/** Resolve the funding private key for a channel (per-channel keys or node key). */

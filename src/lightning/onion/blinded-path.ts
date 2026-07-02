@@ -207,6 +207,20 @@ export function constructBlindedPath(
 		nodePubkeys
 	);
 
+	// BOLT 4: pad every hop's encrypted_data to the same length (padding TLV
+	// type 1) so the blobs don't leak each hop's role by size. Some
+	// implementations (LND) treat unequal lengths as a validation failure.
+	// With target = maxLen + 2 every hop fits: the padding TLV costs 2 bytes
+	// of overhead plus (target - 2 - baseLen) pad bytes (0 for the largest).
+	const basePlaintexts = hopDataList.map((d) => encodeBlindedHopData(d));
+	const maxLen = Math.max(...basePlaintexts.map((p) => p.length));
+	const paddedPlaintexts = hopDataList.map((d, i) =>
+		encodeBlindedHopData({
+			...d,
+			padding: Buffer.alloc(maxLen - basePlaintexts[i].length)
+		})
+	);
+
 	const blindedHops: IBlindedHop[] = [];
 
 	for (let i = 0; i < nodePubkeys.length; i++) {
@@ -217,9 +231,8 @@ export function constructBlindedPath(
 		);
 
 		// Encrypt hop data
-		const plaintext = encodeBlindedHopData(hopDataList[i]);
 		const encKey = deriveBlindingEncryptionKey(sharedSecrets[i]);
-		const encryptedData = encryptBlindedData(encKey, plaintext);
+		const encryptedData = encryptBlindedData(encKey, paddedPlaintexts[i]);
 
 		blindedHops.push({ blindedNodeId, encryptedData });
 	}

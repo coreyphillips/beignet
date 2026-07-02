@@ -230,3 +230,84 @@ describe('update_fee Balance Drain Protection', () => {
 		expect((actions[0] as any).message).to.include('drain');
 	});
 });
+
+describe('update_fee dust re-trim protection', () => {
+	function addCommittedHtlc(channel: Channel, amountMsat: bigint): void {
+		const state = (channel as any)._state as IChannelState;
+		const id = state.localHtlcCounter++;
+		state.htlcs.set(`received-${id}`, {
+			id,
+			amountMsat,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 1000,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED
+		});
+	}
+
+	it('rejects an update_fee that would trim an in-flight HTLC (non-anchor)', () => {
+		// Non-anchor: trim threshold = dust_limit + success-tx fee, which rises
+		// with the feerate. A 10,000-sat received HTLC is untrimmed at 2000
+		// sat/kw (threshold ~1760 sat) but trimmed at 20000 sat/kw (threshold
+		// ~14414 sat) — its full value would burn into the commitment fee.
+		const channel = createTestChannel(500_000_000n, 10_000n, 2000);
+		addCommittedHtlc(channel, 10_000_000n);
+
+		const actions = channel.handleUpdateFee({
+			channelId: crypto.randomBytes(32),
+			feeratePerKw: 20_000
+		});
+		expect(actions.length).to.equal(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+		expect((actions[0] as any).message).to.include('dust HTLC exposure');
+	});
+
+	it('accepts the same update_fee when no in-flight HTLC would be trimmed', () => {
+		const channel = createTestChannel(500_000_000n, 10_000n, 2000);
+		// 50,000 sats stays above the 20000 sat/kw threshold (~14414 sat).
+		addCommittedHtlc(channel, 50_000_000n);
+
+		const actions = channel.handleUpdateFee({
+			channelId: crypto.randomBytes(32),
+			feeratePerKw: 20_000
+		});
+		expect(actions.find((a) => a.type === ChannelActionType.ERROR)).to.not
+			.exist;
+		expect(
+			((channel as any)._state as IChannelState).pendingFeeratePerKw
+		).to.equal(20_000);
+	});
+
+	it('anchor channels are immune (zero-fee second-level txs)', () => {
+		const channel = createTestChannel(500_000_000n, 10_000n, 2000);
+		const state = (channel as any)._state as IChannelState;
+		const flags = new FeatureFlags();
+		flags.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
+		state.channelType = flags.toBuffer();
+		// Trimmed threshold is the static dust limit regardless of rate, so a
+		// 10,000-sat HTLC can never be re-trimmed by a fee hike.
+		addCommittedHtlc(channel, 10_000_000n);
+
+		const actions = channel.handleUpdateFee({
+			channelId: crypto.randomBytes(32),
+			feeratePerKw: 20_000
+		});
+		expect(actions.find((a) => a.type === ChannelActionType.ERROR)).to.not
+			.exist;
+	});
+
+	it('the opener self-limit rejects proposing a trimming feerate', () => {
+		const channel = createTestChannel(500_000_000n, 10_000n, 2000);
+		const state = (channel as any)._state as IChannelState;
+		state.role = ChannelRole.OPENER;
+		state.localConfig.feeratePerKw = 2000;
+		state.localBalanceMsat = 500_000_000n;
+		addCommittedHtlc(channel, 10_000_000n);
+
+		const actions = channel.updateFee(20_000);
+		expect(actions.length).to.equal(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+		expect((actions[0] as any).message).to.include('dust HTLC exposure');
+	});
+});

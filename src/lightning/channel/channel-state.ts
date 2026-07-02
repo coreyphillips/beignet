@@ -100,6 +100,18 @@ export interface IChannelState {
 	 */
 	pendingFeeratePerKw?: number;
 
+	/**
+	 * The feerate baked into OUR current local commitment — the exact rate the
+	 * stored remoteCommitmentSignature was verified against. forceClose MUST
+	 * rebuild the local commitment at this rate: during a fee-update round the
+	 * committed configs (and pendingFeeratePerKw) can describe a different rate
+	 * than the one our latest signed commitment actually uses, and rebuilding
+	 * at any other rate changes the sighash and invalidates the stored
+	 * signature, leaving the channel with no unilateral exit. Set atomically
+	 * wherever remoteCommitmentSignature is adopted; persisted alongside it.
+	 */
+	lastSignedCommitFeeratePerKw?: number;
+
 	/** Balance tracking (in millisatoshis) */
 	localBalanceMsat: bigint;
 	remoteBalanceMsat: bigint;
@@ -166,6 +178,34 @@ export interface IChannelState {
 	closingFeeMax: bigint | null;
 	/** Closing: their last closing fee proposal */
 	theirLastClosingFeeSat: bigint | null;
+
+	/**
+	 * Closing (option_simple_close): negotiation path chosen for this closing
+	 * session. Stamped by the manager from the init-feature intersection when
+	 * shutdown starts; re-evaluated on reestablish. Null/absent = legacy
+	 * closing_signed. Optional for backward compatibility with pre-simple-close
+	 * state literals (same pattern as needsCommitment).
+	 */
+	simpleClose?: boolean | null;
+	/**
+	 * Closing (option_simple_close): the closing_complete we last sent, kept to
+	 * validate the closing_sig echo, rebuild the exact tx for broadcast, and
+	 * enforce RBF fee monotonicity. Cleared when negotiation restarts.
+	 */
+	lastLocalClosingComplete?: {
+		feeSatoshis: bigint;
+		locktime: number;
+		closerScript: Buffer;
+		closeeScript: Buffer;
+		/** ClosingSigVariant values we signed and sent (1 or 2 entries). */
+		sentVariants: number[];
+	} | null;
+	/**
+	 * Closing (option_simple_close): spec forbids re-sending closing_complete
+	 * until the previous one was answered with closing_sig. Reset on reconnect
+	 * (negotiation restarts per spec) — intentionally NOT persisted.
+	 */
+	awaitingClosingSig?: boolean;
 
 	/** Channel announcement: SCID (set at 6 confirmations) */
 	shortChannelId: Buffer | null;
@@ -349,6 +389,9 @@ export function createOpenerState(params: {
 		closingFeeMin: null,
 		closingFeeMax: null,
 		theirLastClosingFeeSat: null,
+		simpleClose: null,
+		lastLocalClosingComplete: null,
+		awaitingClosingSig: false,
 
 		shortChannelId: null,
 		fundingConfirmationHeight: 0,
@@ -452,6 +495,9 @@ export function createAcceptorState(params: {
 		closingFeeMin: null,
 		closingFeeMax: null,
 		theirLastClosingFeeSat: null,
+		simpleClose: null,
+		lastLocalClosingComplete: null,
+		awaitingClosingSig: false,
 
 		shortChannelId: null,
 		fundingConfirmationHeight: 0,

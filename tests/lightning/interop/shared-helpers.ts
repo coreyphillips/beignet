@@ -215,6 +215,10 @@ export function createInteropNode(seedId = 42): LightningNode {
 	features.setOptional(Feature.QUIESCE);
 	features.setOptional(Feature.SPLICE);
 	features.setOptional(Feature.ROUTE_BLINDING);
+	// option_simple_close (+ its BOLT 9 dependency). Odd bits — peers that
+	// don't know them (CLN v24, stock LND) simply ignore them.
+	features.setOptional(Feature.SHUTDOWN_ANY_SEGWIT);
+	features.setOptional(Feature.SIMPLE_CLOSE);
 
 	return new LightningNode({
 		nodePrivateKey: keys.nodePrivateKey,

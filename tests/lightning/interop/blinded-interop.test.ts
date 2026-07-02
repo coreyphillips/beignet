@@ -77,9 +77,7 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 		await cleanupLndState(lnd);
 	});
 
-	// Skipped: LND returns invalid_onion_blinding after decrypting (rho fix works);
-	// remaining LND-specific validation needs LND debug logs. Harness is complete.
-	it.skip('LND forwards a beignet blinded HTLC to the recipient', async function () {
+	it('LND forwards a beignet blinded HTLC to the recipient', async function () {
 		if (skipAll) this.skip();
 		this.timeout(180_000);
 
@@ -131,12 +129,25 @@ describe('Interop: LND as introduction node (blinded payment)', function () {
 		expect(b2Channel, 'beignet2 channel to LND is NORMAL').to.exist;
 		b2Channel!.getFullState().shortChannelId = lndScid;
 
-		// 0 proportional fee → clean sat amount. (The fractional-msat commitment
-		// mismatch this once hit is now FIXED in commitment-builder; left at 0 so the
-		// harness isolates the remaining LND blinded-relay validation issue.)
-		(
-			beignet2 as unknown as { forwardingFeePropMillionths: number }
-		).forwardingFeePropMillionths = 0;
+		// The blinded path must encode LND'S forwarding policy for the LND→us
+		// hop (TimeLockDelta 80, BaseFee 1000, FeeRate 1). beignet2 has no graph
+		// channel_update for the private channel, so generation falls back to
+		// these node defaults — set them to LND's real policy. (This was the
+		// long-standing "invalid_onion_blinding nit": LND accepted and decrypted
+		// the onion fine, failed the forward on FeeInsufficient/CLTV against its
+		// policy, and — per the route-blinding spec — masked that failure as
+		// invalid_onion_blinding because it is the introduction node.)
+		// Base-only fee that OVERPAYS LND's fee requirement (1000 + 50M*1/1e6 =
+		// 1050 msat) with a whole-sat HTLC amount, keeping this test focused on
+		// the blinded relay rather than sub-sat commitment rounding.
+		const b2 = beignet2 as unknown as {
+			forwardingFeeBaseMsat: number;
+			forwardingFeePropMillionths: number;
+			forwardingCltvDelta: number;
+		};
+		b2.forwardingFeeBaseMsat = 2000;
+		b2.forwardingFeePropMillionths = 0;
+		b2.forwardingCltvDelta = 80;
 
 		const invoice = beignet2.createInvoice({
 			amountMsat: 50_000_000n,

@@ -175,6 +175,8 @@ const OP_EQUAL = 0x87;
 const OP_0 = 0x00;
 const OP_1 = 0x51;
 const OP_16 = 0x60;
+const OP_RETURN = 0x6a;
+const OP_PUSHDATA1 = 0x4c;
 
 /**
  * Validate a peer-supplied shutdown scriptPubkey per BOLT 2.
@@ -187,16 +189,45 @@ const OP_16 = 0x60;
  *   - P2WSH:  OP_0 <32-byte hash>
  *   - Any other valid witness program (version 1..16, 2..40 byte program)
  *     ONLY if option_shutdown_anysegwit was negotiated.
+ *   - OP_RETURN with a 6..75-byte push (or PUSHDATA1 76..80) ONLY if
+ *     option_simple_close was negotiated (a dust-balance closer burns its
+ *     output; the output amount MUST be 0).
  *
  * @param script The remote scriptPubkey.
  * @param allowAnySegwit Whether option_shutdown_anysegwit was negotiated.
+ * @param allowOpReturn Whether option_simple_close was negotiated.
  * @returns true if the script is an acceptable shutdown destination.
  */
 export function isValidShutdownScript(
 	script: Buffer,
-	allowAnySegwit = false
+	allowAnySegwit = false,
+	allowOpReturn = false
 ): boolean {
 	if (!script || script.length === 0) return false;
+
+	// OP_RETURN forms (option_simple_close only):
+	//   6a <push 6..75> <data>            — length = data + 2
+	//   6a 4c <len 76..80> <data>         — length = data + 3
+	if (allowOpReturn && script[0] === OP_RETURN) {
+		if (
+			script.length >= 8 &&
+			script[1] >= 0x06 &&
+			script[1] <= 0x4b &&
+			script.length === script[1] + 2
+		) {
+			return true;
+		}
+		if (
+			script.length >= 79 &&
+			script[1] === OP_PUSHDATA1 &&
+			script[2] >= 0x4c &&
+			script[2] <= 0x50 &&
+			script.length === script[2] + 3
+		) {
+			return true;
+		}
+		return false;
+	}
 
 	// P2PKH: 25 bytes — 76 a9 14 <20> 88 ac
 	if (
