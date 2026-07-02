@@ -82,7 +82,13 @@ export enum Feature {
 	 * leases inbound liquidity (rates carried in node_announcement). Experimental
 	 * bit pending a spec assignment.
 	 */
-	OPTION_WILL_FUND = 112
+	OPTION_WILL_FUND = 112,
+	/**
+	 * FFOR: Fast-Forward Offline Receive (specs/ffor-offline-receive.md §5).
+	 * option_ff_receive, bits 560/561 (provisional, experimental range),
+	 * advertised in `init` and `node_announcement`.
+	 */
+	OPTION_FF_RECEIVE = 560
 }
 
 /**

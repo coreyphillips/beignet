@@ -8,6 +8,7 @@
 
 import { ShaChainStore } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
+import { IFforEpochStateData } from '../ffor/types';
 import {
 	ChannelState,
 	ChannelRole,
@@ -280,6 +281,21 @@ export interface IChannelState {
 	 * CSV-locked until leaseExpiry. The lessee (buyer) leaves this false/undefined.
 	 */
 	isLessor?: boolean;
+	/**
+	 * FFOR (specs/ffor-offline-receive.md §7.5): the channel's fast-forward
+	 * epoch — setup in progress, active (FF_EPOCH), or the last closed epoch.
+	 * Both sides MUST persist the full epoch state durably before ff_begin, so
+	 * this rides along with ordinary channel-state persistence. Optional for
+	 * backward compatibility with pre-FFOR serialized states.
+	 */
+	ffor?: IFforEpochStateData | null;
+	/**
+	 * FFOR: epoch ids already consumed on this channel (uniqueness is a setup
+	 * validation rule). Includes aborted setups — an id is burned as soon as an
+	 * ff_init carrying it is sent/accepted.
+	 */
+	fforUsedEpochIds?: string[];
+
 	/**
 	 * option_taproot: OUR current MuSig2 verification nonce for our local
 	 * commitment (the peer co-signs our commitment against it; we consume it only

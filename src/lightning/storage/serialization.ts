@@ -21,6 +21,12 @@ import {
 import { IPaymentInfo, PaymentStatus, PaymentDirection } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IGraphChannel, IGraphNode } from '../gossip/types';
+import {
+	IFforEpochStateData,
+	FforEpochState,
+	FforRole,
+	FforVariant
+} from '../ffor/types';
 
 // ─── Primitive helpers ───
 
@@ -321,6 +327,11 @@ export interface ISerializedChannelState {
 	// signature no longer validates, and our whole balance becomes unbroadcastable.
 	isLessor?: boolean;
 	leaseExpiry?: number;
+	// FFOR (specs/ffor-offline-receive.md §7.5): the epoch (params, hashes,
+	// points, invoices, sigs) MUST persist durably before ff_begin. Optional for
+	// backward compatibility with pre-FFOR serialized states.
+	ffor?: ISerializedFforEpoch | null;
+	fforUsedEpochIds?: string[];
 }
 
 export interface ISerializedSpliceInFlight {
@@ -395,6 +406,113 @@ export function deserializeSpliceInFlight(
 		localSpliceLocked: s.localSpliceLocked,
 		remoteSpliceLocked: s.remoteSpliceLocked,
 		confirmed: s.confirmed
+	};
+}
+
+// ─── FFOR epoch state (specs/ffor-offline-receive.md §7.5) ───
+
+export interface ISerializedFforEpoch {
+	epochId: string;
+	role: string;
+	state: string;
+	variant: number;
+	budgetMsat: string;
+	maxPayments: number;
+	minPaymentMsat: string;
+	settlementDeadline: number;
+	voucherExpiry: number;
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	escapeGranularityMsat: string;
+	rPerCommitmentPoints: string[];
+	paymentHashes?: string[];
+	towerNodeId?: string;
+	towerUri?: string;
+	sCommitmentNumber: string | null;
+	invoices: string[];
+	escapeSigs: string[];
+	escapeHtlcSigs: string[];
+	initSignature: string | null;
+	acceptSignature: string | null;
+	remoteNodeId: string | null;
+	epochStartHeight: number | null;
+}
+
+export function serializeFforEpoch(
+	f: IFforEpochStateData
+): ISerializedFforEpoch {
+	return {
+		epochId: f.epochId.toString('hex'),
+		role: f.role,
+		state: f.state,
+		variant: f.params.variant,
+		budgetMsat: bigintToStr(f.params.budgetMsat),
+		maxPayments: f.params.maxPayments,
+		minPaymentMsat: bigintToStr(f.params.minPaymentMsat),
+		settlementDeadline: f.params.settlementDeadline,
+		voucherExpiry: f.params.voucherExpiry,
+		feeBaseMsat: f.params.feeBaseMsat,
+		feeProportionalMillionths: f.params.feeProportionalMillionths,
+		escapeGranularityMsat: bigintToStr(f.params.escapeGranularityMsat),
+		rPerCommitmentPoints: f.params.rPerCommitmentPoints.map((p) =>
+			p.toString('hex')
+		),
+		...(f.params.paymentHashes
+			? { paymentHashes: f.params.paymentHashes.map((h) => h.toString('hex')) }
+			: {}),
+		...(f.params.towerNodeId
+			? { towerNodeId: f.params.towerNodeId.toString('hex') }
+			: {}),
+		...(f.params.towerUri !== undefined ? { towerUri: f.params.towerUri } : {}),
+		sCommitmentNumber:
+			f.sCommitmentNumber !== null ? bigintToStr(f.sCommitmentNumber) : null,
+		invoices: [...f.invoices],
+		escapeSigs: f.escapeSigs.map((s) => s.toString('hex')),
+		escapeHtlcSigs: f.escapeHtlcSigs.map((s) => s.toString('hex')),
+		initSignature: bufToHex(f.initSignature),
+		acceptSignature: bufToHex(f.acceptSignature),
+		remoteNodeId: bufToHex(f.remoteNodeId),
+		epochStartHeight: f.epochStartHeight
+	};
+}
+
+export function deserializeFforEpoch(
+	s: ISerializedFforEpoch
+): IFforEpochStateData {
+	return {
+		epochId: Buffer.from(s.epochId, 'hex'),
+		role: s.role as FforRole,
+		state: s.state as FforEpochState,
+		params: {
+			variant: s.variant as FforVariant,
+			budgetMsat: strToBigint(s.budgetMsat),
+			maxPayments: s.maxPayments,
+			minPaymentMsat: strToBigint(s.minPaymentMsat),
+			settlementDeadline: s.settlementDeadline,
+			voucherExpiry: s.voucherExpiry,
+			feeBaseMsat: s.feeBaseMsat,
+			feeProportionalMillionths: s.feeProportionalMillionths,
+			escapeGranularityMsat: strToBigint(s.escapeGranularityMsat),
+			rPerCommitmentPoints: s.rPerCommitmentPoints.map((p) =>
+				Buffer.from(p, 'hex')
+			),
+			...(s.paymentHashes
+				? { paymentHashes: s.paymentHashes.map((h) => Buffer.from(h, 'hex')) }
+				: {}),
+			...(s.towerNodeId
+				? { towerNodeId: Buffer.from(s.towerNodeId, 'hex') }
+				: {}),
+			...(s.towerUri !== undefined ? { towerUri: s.towerUri } : {})
+		},
+		sCommitmentNumber:
+			s.sCommitmentNumber !== null ? strToBigint(s.sCommitmentNumber) : null,
+		invoices: [...s.invoices],
+		escapeSigs: s.escapeSigs.map((h) => Buffer.from(h, 'hex')),
+		escapeHtlcSigs: s.escapeHtlcSigs.map((h) => Buffer.from(h, 'hex')),
+		initSignature: hexToBuf(s.initSignature),
+		acceptSignature: hexToBuf(s.acceptSignature),
+		remoteNodeId: hexToBuf(s.remoteNodeId),
+		epochStartHeight: s.epochStartHeight
 	};
 }
 
@@ -525,7 +643,9 @@ export function serializeChannelState(
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
 		isLessor: s.isLessor,
-		leaseExpiry: s.leaseExpiry
+		leaseExpiry: s.leaseExpiry,
+		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined
 	};
 }
 
@@ -666,7 +786,9 @@ export function deserializeChannelState(
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
 		fundingLocktime: s.fundingLocktime ?? 0,
 		isLessor: s.isLessor,
-		leaseExpiry: s.leaseExpiry
+		leaseExpiry: s.leaseExpiry,
+		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
+		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined
 	};
 }
 

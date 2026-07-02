@@ -100,6 +100,18 @@ import {
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
+import { FforEpoch, validateFforEpochParams } from '../ffor/epoch';
+import {
+	IFforChannelContext,
+	IFforEpochParams,
+	IFforEpochStateData,
+	IFforHandleResult
+} from '../ffor/types';
+import {
+	decodeFforHeader,
+	decodeFforErrorMessage,
+	encodeFforErrorMessage
+} from '../ffor/messages';
 import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -335,10 +347,32 @@ export class Channel {
 	} | null = null;
 	private _currentBlockHeight = 0;
 	private _channelKeyIndex: number | null = null;
+	// FFOR (specs/ffor-offline-receive.md): wrapper over _state.ffor (shared by
+	// reference so persistence sees every mutation). Recreated from persisted
+	// state in the constructor, mirroring how splice state is restored.
+	private _fforEpoch: FforEpoch | null = null;
+	// An FFOR epoch the caller requested while the channel was not yet
+	// quiescent. Fired from handleStfuMessage once QUIESCENT (we drive
+	// quiescence ourselves so we are the initiator), mirroring _pendingSplice.
+	private _pendingFforInit: {
+		params: IFforEpochParams;
+		epochId: Buffer;
+		signFn: (digest: Buffer) => Buffer;
+		remoteNodeId?: Buffer;
+	} | null = null;
+	// R side: builds the epoch's K amountless BOLT 11 invoices when ff_accept
+	// arrives (variant A hashes are only known then). In-memory only — a
+	// restart mid-setup aborts the setup anyway (spec §7.5: nothing is durable
+	// until ff_begin).
+	private _fforInvoiceFactory: ((paymentHashes: Buffer[]) => string[]) | null =
+		null;
 
 	constructor(state: IChannelState, signer?: ChannelSigner) {
 		this._state = state;
 		this._signer = signer || null;
+		if (state.ffor) {
+			this._fforEpoch = new FforEpoch(state.ffor);
+		}
 	}
 
 	/**
@@ -3502,7 +3536,9 @@ export class Channel {
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY &&
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
-			this._state.state !== ChannelState.SPLICING
+			this._state.state !== ChannelState.SPLICING &&
+			this._state.state !== ChannelState.FF_SETUP &&
+			this._state.state !== ChannelState.FF_EPOCH
 		) {
 			return; // Only mark operational or funded channels
 		}
@@ -3510,6 +3546,19 @@ export class Channel {
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
 		// to start can never fire. Drop it rather than leave it dangling.
 		this._pendingSplice = null;
+
+		// FFOR: a disconnect aborts an epoch SETUP cleanly — nothing was durable
+		// until ff_begin (spec §7.5) — while an ACTIVE epoch survives: FF_EPOCH
+		// is restored after reestablish via preReestablishState.
+		// TODO(FFOR M2, spec §11.1): carry the epoch TLV (55001) in
+		// channel_reestablish so both sides reconcile epoch state on reconnect.
+		this._pendingFforInit = null;
+		if (this._state.state === ChannelState.FF_SETUP) {
+			this._fforEpoch = null;
+			this._state.ffor = null;
+			this._fforInvoiceFactory = null;
+			this._state.state = ChannelState.NORMAL;
+		}
 
 		if (this._state.state === ChannelState.SPLICING) {
 			// Phase-aware: before the mid-splice commitment round the splice is not
@@ -4210,6 +4259,18 @@ export class Channel {
 			);
 		}
 
+		// Same for a deferred FFOR epoch setup: only R (the quiescence
+		// initiator) sends ff_init (spec §7.1).
+		if (
+			this._pendingFforInit &&
+			this._quiescence.isQuiescent() &&
+			this._quiescence.isInitiator()
+		) {
+			const pending = this._pendingFforInit;
+			this._pendingFforInit = null;
+			actions.push(...this._startFforInit(pending));
+		}
+
 		return actions;
 	}
 
@@ -4228,6 +4289,475 @@ export class Channel {
 		this._state.quiescenceState = QuiescenceState.NORMAL;
 		this._state.quiescenceInitiator = false;
 		return [];
+	}
+
+	// ─────────────── FFOR: Fast-Forward Offline Receive ───────────────
+	// specs/ffor-offline-receive.md — M1: epoch establishment only.
+
+	/** The current (or last closed) FFOR epoch state, if any. */
+	getFforEpoch(): IFforEpochStateData | null {
+		return this._state.ffor ?? null;
+	}
+
+	/** Build the channel-derived context the epoch state machine validates against. */
+	private _buildFforContext(extras?: {
+		remoteNodeId?: Buffer;
+		signFn?: (digest: Buffer) => Buffer;
+		invoiceFactory?: (paymentHashes: Buffer[]) => string[];
+	}): IFforChannelContext {
+		return {
+			channelId: this._state.channelId!,
+			currentBlockHeight: this._currentBlockHeight,
+			isAnchor: isAnchorChannel(this._state.channelType),
+			localBalanceMsat: this._state.localBalanceMsat,
+			remoteBalanceMsat: this._state.remoteBalanceMsat,
+			localDustLimitSat: this._state.localConfig.dustLimitSatoshis,
+			remoteDustLimitSat: this._state.remoteConfig.dustLimitSatoshis,
+			localMaxAcceptedHtlcs: this._state.localConfig.maxAcceptedHtlcs,
+			remoteMaxAcceptedHtlcs: this._state.remoteConfig.maxAcceptedHtlcs,
+			// The reserve WE must keep is the one the peer required of us, and
+			// vice versa (same mapping as the addHtlc/handleUpdateAddHtlc checks).
+			localRequiredReserveSat: this._state.remoteConfig.channelReserveSatoshis,
+			remoteRequiredReserveSat: this._state.localConfig.channelReserveSatoshis,
+			// Spec §5: the commitment feerate is frozen at the last signed value
+			// for the whole epoch.
+			feeratePerKw: getCommitmentFeeRate(this._state),
+			localCommitmentNumber: this._state.localCommitmentNumber,
+			usedEpochIds: new Set(this._state.fforUsedEpochIds ?? []),
+			remoteNodeId: extras?.remoteNodeId,
+			signFn: extras?.signFn,
+			invoiceFactory:
+				this._fforInvoiceFactory ?? extras?.invoiceFactory ?? undefined
+		};
+	}
+
+	/** Map an epoch state-machine result onto channel actions. */
+	private _fforResultToActions(result: IFforHandleResult): ChannelAction[] {
+		const actions: ChannelAction[] = [];
+		// Spec §7.5: persist the full epoch state durably BEFORE ff_begin (and
+		// on every FF_EPOCH transition) — PERSIST_STATE precedes the sends.
+		if (result.persistFirst) {
+			actions.push({ type: ChannelActionType.PERSIST_STATE });
+		}
+		for (const send of result.sends) {
+			actions.push(sendMsg(send.type as MessageType, send.payload));
+		}
+		if (!result.ok && result.error) {
+			actions.push({ type: ChannelActionType.ERROR, message: result.error });
+		}
+		return actions;
+	}
+
+	/**
+	 * Reset quiescence after an FFOR session ends (abort, or ff_end back to
+	 * OPERATIONAL). BOLT quiescence has no explicit exit message; within FFOR
+	 * both sides treat the session as over at these points (a reconnect resets
+	 * it anyway).
+	 */
+	private _fforResetQuiescence(): void {
+		this._quiescence.reset();
+		this._state.quiescenceState = QuiescenceState.NORMAL;
+		this._state.quiescenceInitiator = false;
+	}
+
+	/** Clean pre-ff_begin abort (spec §11.1): discard the epoch, back to NORMAL. */
+	private _fforAbortSetup(): void {
+		this._fforEpoch = null;
+		this._state.ffor = null;
+		this._fforInvoiceFactory = null;
+		this._pendingFforInit = null;
+		if (this._state.state === ChannelState.FF_SETUP) {
+			this._state.state = ChannelState.NORMAL;
+		}
+		this._fforResetQuiescence();
+	}
+
+	/** Record an epoch id as consumed on this channel (uniqueness rule). */
+	private _fforBurnEpochId(epochId: Buffer): void {
+		const ids = this._state.fforUsedEpochIds ?? [];
+		ids.push(epochId.toString('hex'));
+		this._state.fforUsedEpochIds = ids;
+	}
+
+	/** Preconditions common to starting/accepting an epoch setup (spec §5). */
+	private _fforSetupPreconditionError(): string | null {
+		if (this._state.state !== ChannelState.NORMAL) {
+			return `channel in ${this._state.state} state`;
+		}
+		if (!this._state.channelId) {
+			return 'no channel id';
+		}
+		// Spec §5: v1 targets ECDSA anchor commitments (option_static_remotekey +
+		// option_anchors; anchor channel_types imply static_remotekey).
+		if (!isAnchorChannel(this._state.channelType)) {
+			return 'FFOR requires an anchor channel (spec §5)';
+		}
+		if (isTaprootChannel(this._state.channelType)) {
+			return 'FFOR v1 is ECDSA-anchor only; taproot channels are deferred (spec §13.4)';
+		}
+		// Enforced directly in addition to the quiescence requirement (spec §5:
+		// setup begins from a quiescent channel with no pending HTLCs and no
+		// in-flight update_fee).
+		if (this.hasPendingHtlcs()) {
+			return 'pending HTLCs exist';
+		}
+		if (this._state.pendingFeeratePerKw !== undefined) {
+			return 'update_fee in flight';
+		}
+		if (
+			this._fforEpoch &&
+			(this._fforEpoch.isSetup() || this._fforEpoch.isActive())
+		) {
+			return 'an FFOR epoch is already in progress on this channel';
+		}
+		return null;
+	}
+
+	/**
+	 * R side: open a fast-forward epoch on this channel (spec §7). Drives
+	 * quiescence first when needed (mirroring initiateSplice); the ff_init
+	 * fires from handleStfuMessage once quiescent.
+	 *
+	 * `params.rPerCommitmentPoints` may be omitted — the channel derives the K
+	 * points for commitment numbers n_R+1 … n_R+K from its own seed.
+	 */
+	initiateFforEpoch(
+		params: Omit<IFforEpochParams, 'rPerCommitmentPoints'> & {
+			rPerCommitmentPoints?: Buffer[];
+		},
+		opts: {
+			signFn: (digest: Buffer) => Buffer;
+			epochId?: Buffer;
+			remoteNodeId?: Buffer;
+			invoiceFactory?: (paymentHashes: Buffer[]) => string[];
+		}
+	): ChannelAction[] {
+		const precondition = this._fforSetupPreconditionError();
+		if (precondition) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot open FFOR epoch: ${precondition}`
+				}
+			];
+		}
+
+		// TODO(FFOR M2, spec §7.1): reserve commitment numbers n_R+1 … n_R+K for
+		// the epoch — R MUST NOT reuse these indexes for any other purpose. In
+		// M1 the channel is frozen for the epoch's whole life (FF_SETUP/FF_EPOCH
+		// reject all updates), so no competing use of the indexes can occur.
+		const fullParams: IFforEpochParams = {
+			...params,
+			rPerCommitmentPoints:
+				params.rPerCommitmentPoints ??
+				Array.from({ length: params.maxPayments }, (_, i) =>
+					getPerCommitmentPoint(
+						this._state.localPerCommitmentSeed,
+						this._state.localCommitmentNumber + BigInt(i + 1)
+					)
+				)
+		};
+		const epochId = opts.epochId ?? crypto.randomBytes(32);
+
+		// Pre-validate before quiescing (like initiateSplice's up-front balance
+		// check) so we don't STFU only to then fail.
+		const preCtx = this._buildFforContext(opts);
+		if (preCtx.usedEpochIds.has(epochId.toString('hex'))) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot open FFOR epoch: epoch_id already used on this channel'
+				}
+			];
+		}
+		const validationError = validateFforEpochParams(
+			fullParams,
+			preCtx,
+			this._state.remoteBalanceMsat,
+			this._state.remoteConfig.channelReserveSatoshis
+		);
+		if (validationError) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot open FFOR epoch: ${validationError}`
+				}
+			];
+		}
+
+		this._fforInvoiceFactory = opts.invoiceFactory ?? null;
+		const pending = {
+			params: fullParams,
+			epochId,
+			signFn: opts.signFn,
+			remoteNodeId: opts.remoteNodeId
+		};
+
+		// Already quiescent — start immediately.
+		if (this._quiescence.isQuiescent()) {
+			return this._startFforInit(pending);
+		}
+
+		this._pendingFforInit = pending;
+		if (this._quiescence.isQuiescing()) {
+			// STFU already in flight; wait for QUIESCENT.
+			return [];
+		}
+		const stfuActions = this.initiateQuiescence();
+		if (stfuActions.some((a) => a.type === ChannelActionType.ERROR)) {
+			this._pendingFforInit = null;
+			this._fforInvoiceFactory = null;
+		}
+		return stfuActions;
+	}
+
+	/** Build and send ff_init. Assumes NORMAL + QUIESCENT + validated request. */
+	private _startFforInit(pending: {
+		params: IFforEpochParams;
+		epochId: Buffer;
+		signFn: (digest: Buffer) => Buffer;
+		remoteNodeId?: Buffer;
+	}): ChannelAction[] {
+		const ctx = this._buildFforContext(pending);
+		const { epoch, result } = FforEpoch.initiate(
+			pending.epochId,
+			pending.params,
+			ctx
+		);
+		if (!epoch || !result.ok) {
+			// Validation failed at fire time (state moved since the request) —
+			// don't leave the channel stuck quiescent for a dead request.
+			this._fforResetQuiescence();
+			this._fforInvoiceFactory = null;
+			return this._fforResultToActions(result);
+		}
+		this._fforEpoch = epoch;
+		this._state.ffor = epoch.data;
+		this._fforBurnEpochId(pending.epochId);
+		this._state.state = ChannelState.FF_SETUP;
+		return this._fforResultToActions(result);
+	}
+
+	/**
+	 * S side: handle ff_init (spec §7.1/§7.2). On validation failure an
+	 * ff_error is returned and setup is cleanly refused (§11.1).
+	 */
+	handleFforInit(
+		payload: Buffer,
+		extras: {
+			remoteNodeId?: Buffer;
+			signFn?: (digest: Buffer) => Buffer;
+		}
+	): ChannelAction[] {
+		let epochId: Buffer;
+		try {
+			epochId = decodeFforHeader(payload).epochId;
+		} catch (e) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Invalid ff_init: ${(e as Error).message}`
+				}
+			];
+		}
+		const rejectSetup = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({
+					channelId: this._state.channelId ?? Buffer.alloc(32),
+					epochId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
+
+		const precondition = this._fforSetupPreconditionError();
+		if (precondition) {
+			return rejectSetup(`Cannot accept FFOR epoch: ${precondition}`);
+		}
+		// Spec §5: epoch setup begins from a quiescent channel.
+		if (!this._quiescence.isQuiescent()) {
+			return rejectSetup('Cannot accept FFOR epoch: channel not quiescent');
+		}
+
+		const ctx = this._buildFforContext(extras);
+		const { epoch, result } = FforEpoch.acceptInit(payload, ctx);
+		if (!epoch || !result.ok) {
+			// The FFOR quiescence session is over. Don't disturb quiescence that
+			// belongs to an in-flight splice.
+			if (!this._spliceSession && !this._pendingSplice) {
+				this._fforResetQuiescence();
+			}
+			return this._fforResultToActions(result);
+		}
+		this._fforEpoch = epoch;
+		this._state.ffor = epoch.data;
+		this._fforBurnEpochId(epoch.epochId);
+		this._state.state = ChannelState.FF_SETUP;
+		return this._fforResultToActions(result);
+	}
+
+	/**
+	 * R side: handle ff_accept, then emit ff_invoices [+ ff_escape_sigs]
+	 * + ff_begin and enter FF_EPOCH (spec §7.2–§7.5).
+	 */
+	handleFforAccept(
+		payload: Buffer,
+		extras: {
+			remoteNodeId?: Buffer;
+			invoiceFactory?: (paymentHashes: Buffer[]) => string[];
+		}
+	): ChannelAction[] {
+		if (
+			!this._fforEpoch ||
+			this._state.state !== ChannelState.FF_SETUP ||
+			this._fforEpoch.data.role !== 'recipient'
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_accept' }
+			];
+		}
+		const ctx = this._buildFforContext(extras);
+		const result = this._fforEpoch.handleAccept(payload, ctx);
+		if (result.aborted) {
+			this._fforAbortSetup();
+			return this._fforResultToActions(result);
+		}
+		if (result.ok && result.enteredEpoch) {
+			this._state.state = ChannelState.FF_EPOCH;
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/** S side: handle ff_invoices (spec §7.3). */
+	handleFforInvoices(
+		payload: Buffer,
+		extras: { remoteNodeId?: Buffer }
+	): ChannelAction[] {
+		if (!this._fforEpoch || this._state.state !== ChannelState.FF_SETUP) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_invoices' }
+			];
+		}
+		const result = this._fforEpoch.handleInvoices(
+			payload,
+			this._buildFforContext(extras)
+		);
+		if (result.aborted) {
+			this._fforAbortSetup();
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/** S side: handle ff_escape_sigs (spec §7.4, iff G > 0). */
+	handleFforEscapeSigs(
+		payload: Buffer,
+		extras: { remoteNodeId?: Buffer }
+	): ChannelAction[] {
+		if (!this._fforEpoch || this._state.state !== ChannelState.FF_SETUP) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_escape_sigs' }
+			];
+		}
+		const result = this._fforEpoch.handleEscapeSigs(
+			payload,
+			this._buildFforContext(extras)
+		);
+		if (result.aborted) {
+			this._fforAbortSetup();
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/** S side: handle ff_begin — the epoch becomes active (spec §7.5). */
+	handleFforBegin(
+		payload: Buffer,
+		extras: { remoteNodeId?: Buffer }
+	): ChannelAction[] {
+		if (!this._fforEpoch || this._state.state !== ChannelState.FF_SETUP) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_begin' }
+			];
+		}
+		const result = this._fforEpoch.handleBegin(
+			payload,
+			this._buildFforContext(extras)
+		);
+		if (result.aborted) {
+			this._fforAbortSetup();
+			return this._fforResultToActions(result);
+		}
+		if (result.ok && result.enteredEpoch) {
+			this._state.state = ChannelState.FF_EPOCH;
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/**
+	 * Either side: close a zero-settlement epoch cooperatively via ff_end
+	 * (spec §7.5/§11.2) — the channel returns to OPERATIONAL.
+	 */
+	endFforEpoch(): ChannelAction[] {
+		if (!this._fforEpoch || this._state.state !== ChannelState.FF_EPOCH) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot end FFOR epoch: no active epoch'
+				}
+			];
+		}
+		const result = this._fforEpoch.end(this._buildFforContext());
+		if (result.ok && result.closed) {
+			this._state.state = ChannelState.NORMAL;
+			this._fforResetQuiescence();
+			this._fforInvoiceFactory = null;
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/** Either side: peer's ff_end (echoes ours when it initiated the close). */
+	handleFforEnd(payload: Buffer): ChannelAction[] {
+		if (!this._fforEpoch) {
+			return [{ type: ChannelActionType.ERROR, message: 'Unexpected ff_end' }];
+		}
+		const result = this._fforEpoch.handleEnd(payload, this._buildFforContext());
+		if (
+			result.ok &&
+			result.closed &&
+			this._state.state === ChannelState.FF_EPOCH
+		) {
+			this._state.state = ChannelState.NORMAL;
+			this._fforResetQuiescence();
+			this._fforInvoiceFactory = null;
+		}
+		return this._fforResultToActions(result);
+	}
+
+	/**
+	 * Peer's ff_error (spec §11.1): pre-ff_begin it aborts setup cleanly;
+	 * during FF_EPOCH the channel falls back to on-chain enforcement (M3) —
+	 * M1 surfaces the error without dropping the epoch.
+	 */
+	handleFforError(payload: Buffer): ChannelAction[] {
+		if (!this._fforEpoch) {
+			// An ff_error for a setup we already discarded (or never had) — just
+			// surface it.
+			let reason = 'ff_error from peer';
+			try {
+				const msg = decodeFforErrorMessage(payload);
+				reason = `ff_error from peer: ${msg.data.toString('utf8')}`;
+			} catch {
+				// opaque
+			}
+			return [{ type: ChannelActionType.ERROR, message: reason }];
+		}
+		const result = this._fforEpoch.handleError(payload);
+		if (result.aborted) {
+			this._fforAbortSetup();
+		}
+		return this._fforResultToActions(result);
 	}
 
 	// ─────────────── Splicing ───────────────

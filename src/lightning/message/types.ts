@@ -76,7 +76,18 @@ export enum MessageType {
 	GOSSIP_TIMESTAMP_FILTER = 265,
 
 	// BOLT 7: Onion messages
-	ONION_MESSAGE = 513
+	ONION_MESSAGE = 513,
+
+	// FFOR: Fast-Forward Offline Receive (specs/ffor-offline-receive.md §14).
+	// Odd types in the custom/experimental range — ignorable by
+	// non-implementing peers. Provisional pending bLIP assignment.
+	FF_INIT = 55001,
+	FF_ACCEPT = 55003,
+	FF_INVOICES = 55005,
+	FF_ESCAPE_SIGS = 55009,
+	FF_BEGIN = 55011,
+	FF_END = 55021,
+	FF_ERROR = 55023
 }
 
 /**

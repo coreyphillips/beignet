@@ -47,6 +47,20 @@ export enum ChannelState {
 	DUAL_FUNDING_V2 = 'DUAL_FUNDING_V2',
 	AWAITING_TX_SIGNATURES = 'AWAITING_TX_SIGNATURES',
 	SPLICING = 'SPLICING',
+	/**
+	 * FFOR (specs/ffor-offline-receive.md §7): epoch setup handshake in
+	 * progress (entered from quiescence when ff_init is sent/accepted;
+	 * pre-ff_begin). Normal update traffic is rejected by the existing
+	 * state !== NORMAL guards. An abort (ff_error or disconnect) cleanly
+	 * returns the channel to NORMAL (spec §11.1).
+	 */
+	FF_SETUP = 'FF_SETUP',
+	/**
+	 * FFOR (spec §7.5): epoch active — all normal update_* / commitment_signed
+	 * traffic is forbidden; only fast-forward settlement (M2+) and
+	 * reestablish / ff_end are valid. Survives disconnect AND restart.
+	 */
+	FF_EPOCH = 'FF_EPOCH',
 	CLOSED = 'CLOSED',
 	FORCE_CLOSED = 'FORCE_CLOSED',
 	ERRORED = 'ERRORED'

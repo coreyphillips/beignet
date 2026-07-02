@@ -87,13 +87,18 @@ import {
 	ChannelState,
 	ChannelRole,
 	isAnchorChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	REGTEST_CHAIN_HASH
 } from './types';
+import { decodeFforHeader, encodeFforErrorMessage } from '../ffor/messages';
+import { IFforEpochParams } from '../ffor/types';
+import { encode as encodeBolt11Invoice } from '../invoice/encode';
+import { Network } from '../invoice/types';
 import {
 	IChannelBasepoints,
 	perCommitmentPointFromSecret
 } from '../keys/derivation';
-import { getPublicKey } from '../crypto/ecdh';
+import { getPublicKey, sign } from '../crypto/ecdh';
 import { generateFromSeed } from '../keys/shachain';
 import { PeerManager } from '../transport/peer-manager';
 import { ZeroConfManager } from './zero-conf';
@@ -319,6 +324,15 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
+			// FFOR: Fast-Forward Offline Receive epoch setup
+			// (specs/ffor-offline-receive.md §14)
+			MessageType.FF_INIT,
+			MessageType.FF_ACCEPT,
+			MessageType.FF_INVOICES,
+			MessageType.FF_ESCAPE_SIGS,
+			MessageType.FF_BEGIN,
+			MessageType.FF_END,
+			MessageType.FF_ERROR,
 			// BOLT 1 error/warning: without these registrations a remote error is
 			// silently dropped — the channel never gets marked ERRORED and the node
 			// reconnect-loops against a peer that fails it on every reestablish.
@@ -989,7 +1003,12 @@ export class ChannelManager extends EventEmitter {
 				st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 				st === ChannelState.AWAITING_CHANNEL_READY ||
 				st === ChannelState.SHUTTING_DOWN ||
-				st === ChannelState.SPLICING
+				st === ChannelState.SPLICING ||
+				// FFOR: an ACTIVE epoch survives restart (FF_EPOCH is restored
+				// after reestablish); a restored mid-SETUP channel aborts cleanly
+				// inside markForReestablish (spec §7.5/§11.1).
+				st === ChannelState.FF_SETUP ||
+				st === ChannelState.FF_EPOCH
 			) {
 				channel.markForReestablish();
 			}
@@ -1496,6 +1515,27 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.ANNOUNCEMENT_SIGNATURES:
 					this.handleAnnouncementSignaturesMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_INIT:
+					this.handleFforInitMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_ACCEPT:
+					this.handleFforAcceptMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_INVOICES:
+					this.handleFforInvoicesMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_ESCAPE_SIGS:
+					this.handleFforEscapeSigsMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_BEGIN:
+					this.handleFforBeginMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_END:
+					this.handleFforEndMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_ERROR:
+					this.handleFforErrorMsg(peerPubkey, payload);
 					break;
 				case MessageType.ERROR:
 					this.handleErrorMsg(peerPubkey, payload);
@@ -2716,6 +2756,261 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.handleSpliceLocked(msg);
 		this.processActions(peerPubkey, channel, actions);
 		this.commitAfterSpliceIfComplete(channel);
+	}
+
+	// ─────────────── FFOR: Fast-Forward Offline Receive ───────────────
+	// specs/ffor-offline-receive.md — M1: epoch establishment.
+
+	/**
+	 * Whether the peer's init features negotiated FFOR. Requires BOTH
+	 * option_quiesce (setup runs from quiescence, spec §5) and
+	 * option_ff_receive (560/561). Like peerSupportsSplicing, an unknown peer
+	 * init defaults to true (unit tests drive managers directly).
+	 */
+	private peerSupportsFfor(peerPubkey: string): boolean {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return true;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.OPTION_FF_RECEIVE)
+		);
+	}
+
+	/** Peer node id + node-key signer handed to the channel's FFOR handlers. */
+	private _fforExtras(peerPubkey: string): {
+		remoteNodeId: Buffer;
+		signFn?: (digest: Buffer) => Buffer;
+	} {
+		const nodeKey = this.config.nodePrivateKey;
+		return {
+			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
+			signFn: nodeKey
+				? (digest: Buffer): Buffer => sign(digest, nodeKey)
+				: undefined
+		};
+	}
+
+	/**
+	 * Default builder for the epoch's K amountless BOLT 11 invoices (spec
+	 * §7.3): payment hash H_i, no amount, expiry covering a wall-clock estimate
+	 * of T_exp, a route hint S→R when the channel has an SCID, signed by OUR
+	 * node key. Returns undefined when no node key is configured.
+	 */
+	private _defaultFforInvoiceFactory(
+		channel: Channel,
+		peerPubkey: string
+	): ((paymentHashes: Buffer[]) => string[]) | undefined {
+		const nodeKey = this.config.nodePrivateKey;
+		if (!nodeKey) return undefined;
+		return (paymentHashes: Buffer[]): string[] => {
+			const network = this.config.chainHash?.equals(REGTEST_CHAIN_HASH)
+				? Network.REGTEST
+				: Network.MAINNET;
+			const ffor = channel.getFforEpoch();
+			const st = channel.getFullState();
+			const scid = st.scidAlias ?? st.shortChannelId;
+			// Spec §7.3: invoice expiry ≥ wall-clock estimate of T_exp
+			// (~10 min/block); fall back to 60 days when the tip is unknown.
+			const tExp = ffor?.params.voucherExpiry ?? 0;
+			const expiry =
+				this._currentBlockHeight > 0 && tExp > this._currentBlockHeight
+					? Math.max(3600, (tExp - this._currentBlockHeight) * 600)
+					: 60 * 24 * 3600;
+			return paymentHashes.map((h) =>
+				encodeBolt11Invoice({
+					network,
+					paymentHash: h,
+					description: 'ffor',
+					expiry,
+					...(scid
+						? {
+								routingHints: [
+									[
+										{
+											pubkey: Buffer.from(peerPubkey, 'hex'),
+											shortChannelId: scid,
+											feeBaseMsat: ffor?.params.feeBaseMsat ?? 0,
+											feeProportionalMillionths:
+												ffor?.params.feeProportionalMillionths ?? 0,
+											cltvExpiryDelta: 144
+										}
+									]
+								]
+						  }
+						: {}),
+					privateKey: nodeKey
+				})
+			);
+		};
+	}
+
+	/**
+	 * R side: open a fast-forward epoch on a channel (spec §7). Requires a
+	 * configured node private key (ff_init/ff_accept are node-key signed).
+	 */
+	initiateFforEpoch(
+		channelId: Buffer,
+		params: Omit<IFforEpochParams, 'rPerCommitmentPoints'> & {
+			rPerCommitmentPoints?: Buffer[];
+		},
+		options?: {
+			epochId?: Buffer;
+			invoiceFactory?: (paymentHashes: Buffer[]) => string[];
+		}
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const extras = this._fforExtras(peerPubkey);
+		if (!extras.signFn) {
+			const error = 'FFOR requires a node private key (signed setup messages)';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const invoiceFactory =
+			options?.invoiceFactory ??
+			this._defaultFforInvoiceFactory(channel, peerPubkey);
+		const actions = channel.initiateFforEpoch(params, {
+			signFn: extras.signFn,
+			remoteNodeId: extras.remoteNodeId,
+			epochId: options?.epochId,
+			invoiceFactory
+		});
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
+	}
+
+	/** Either side: cooperatively close a zero-settlement epoch via ff_end. */
+	endFforEpoch(channelId: Buffer): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const actions = channel.endFforEpoch();
+		this.processActions(peerPubkey, channel, actions);
+		return {
+			ok: !actions.some((a) => a.type === ChannelActionType.ERROR),
+			actions
+		};
+	}
+
+	private handleFforInitMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId, epochId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		// Reject ff_init from a peer that never negotiated option_ff_receive.
+		if (!this.peerSupportsFfor(peerPubkey)) {
+			this.sendMessage(
+				peerPubkey,
+				MessageType.FF_ERROR,
+				encodeFforErrorMessage({
+					channelId,
+					epochId,
+					data: Buffer.from('option_ff_receive not negotiated', 'utf8')
+				})
+			);
+			this.emit(
+				'error',
+				channelId,
+				'ff_init from peer without option_ff_receive/option_quiesce'
+			);
+			return;
+		}
+
+		const actions = channel.handleFforInit(
+			payload,
+			this._fforExtras(peerPubkey)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforAcceptMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforAccept(payload, {
+			...this._fforExtras(peerPubkey),
+			invoiceFactory: this._defaultFforInvoiceFactory(channel, peerPubkey)
+		});
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforInvoicesMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforInvoices(
+			payload,
+			this._fforExtras(peerPubkey)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforEscapeSigsMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforEscapeSigs(
+			payload,
+			this._fforExtras(peerPubkey)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforBeginMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforBegin(
+			payload,
+			this._fforExtras(peerPubkey)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforEndMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforEnd(payload);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforErrorMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforError(payload);
+		this.processActions(peerPubkey, channel, actions);
 	}
 
 	/**
