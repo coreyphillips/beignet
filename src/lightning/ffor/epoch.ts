@@ -214,6 +214,40 @@ export function validateFforEpochParams(
 	return null;
 }
 
+/** Fresh M2 settlement-state fields for a new epoch. */
+function emptySettlementState(
+	frozenFeeratePerKw: number,
+	nR: bigint,
+	rPreEpochPoint: Buffer | null
+): Pick<
+	IFforEpochStateData,
+	| 'preimages'
+	| 'lastSeq'
+	| 'packages'
+	| 'htlcAmountsMsat'
+	| 'voucherAmountsMsat'
+	| 'upstreamFulfilled'
+	| 'sHtlcIdBase'
+	| 'frozenFeeratePerKw'
+	| 'nR'
+	| 'rPreEpochPoint'
+	| 'peerLastSeq'
+> {
+	return {
+		preimages: [],
+		lastSeq: 0,
+		packages: [],
+		htlcAmountsMsat: [],
+		voucherAmountsMsat: [],
+		upstreamFulfilled: [],
+		sHtlcIdBase: 0n,
+		frozenFeeratePerKw,
+		nR,
+		rPreEpochPoint,
+		peerLastSeq: null
+	};
+}
+
 function ok(
 	sends: IFforSend[],
 	extra?: Partial<IFforHandleResult>
@@ -354,7 +388,9 @@ export class FforEpoch {
 			),
 			acceptSignature: null,
 			remoteNodeId: ctx.remoteNodeId ? Buffer.from(ctx.remoteNodeId) : null,
-			epochStartHeight: null
+			epochStartHeight: null,
+			// M2 settlement state. R's own commitment number is n_R.
+			...emptySettlementState(ctx.feeratePerKw, ctx.localCommitmentNumber, null)
 		};
 
 		return {
@@ -428,20 +464,24 @@ export class FforEpoch {
 			return reject(err);
 		}
 
-		// Variant A: S generates the hash set H_1…H_K (§7.2).
-		//
-		// TODO(FFOR M2, spec §7.2/§12.1): H_1 MUST equal
-		// SHA256(per_commitment_secret_S[n0]) so the upstream claim of payment 1
-		// is itself the revocation of C_{n0}^S, and S must RETAIN the preimages
-		// P_2…P_K for settlement. M1 establishes the epoch only (no settlement),
-		// so random hashes are used and no preimages are kept.
+		// Variant A: S generates the preimage set P_1…P_K and retains it durably
+		// (§9.2). H_1 MUST equal SHA256(per_commitment_secret_S[n0]) so the
+		// upstream claim of payment 1 is itself the revocation of C_{n0}^S
+		// (§7.2/§12.1) — i.e. P_1 IS that secret.
+		const preimages: Buffer[] = [];
 		if (params.variant === FforVariant.A) {
-			params.paymentHashes = [];
-			for (let i = 0; i < params.maxPayments; i++) {
-				params.paymentHashes.push(
-					crypto.createHash('sha256').update(crypto.randomBytes(32)).digest()
+			if (!ctx.localPerCommitmentSecretN0) {
+				return reject(
+					'cannot accept variant-A epoch: per_commitment_secret_S[n0] unavailable'
 				);
 			}
+			preimages.push(Buffer.from(ctx.localPerCommitmentSecretN0));
+			for (let i = 1; i < params.maxPayments; i++) {
+				preimages.push(crypto.randomBytes(32));
+			}
+			params.paymentHashes = preimages.map((p) =>
+				crypto.createHash('sha256').update(p).digest()
+			);
 		}
 
 		const n0 = ctx.localCommitmentNumber;
@@ -451,6 +491,8 @@ export class FforEpoch {
 			sCommitmentNumber: n0,
 			paymentHashes:
 				params.variant === FforVariant.A ? params.paymentHashes : undefined,
+			// Prototype extension (TLV 7): voucher HTLC id base — see types.ts.
+			sHtlcIdBase: ctx.localNextHtlcId ?? 0n,
 			signature: Buffer.alloc(64)
 		};
 		const acceptPayload = encodeFforAcceptMessage(acceptMsg);
@@ -471,7 +513,18 @@ export class FforEpoch {
 				acceptPayload.subarray(acceptPayload.length - 64)
 			),
 			remoteNodeId: Buffer.from(ctx.remoteNodeId),
-			epochStartHeight: null
+			epochStartHeight: null,
+			// M2 settlement state. From S's side, n_R is the REMOTE number, and
+			// R's current point is snapshotted for the ff_revoke_batch check.
+			...emptySettlementState(
+				ctx.feeratePerKw,
+				ctx.remoteCommitmentNumber,
+				ctx.remoteCurrentPerCommitmentPoint
+					? Buffer.from(ctx.remoteCurrentPerCommitmentPoint)
+					: null
+			),
+			preimages,
+			sHtlcIdBase: ctx.localNextHtlcId ?? 0n
 		};
 
 		return {
@@ -542,6 +595,8 @@ export class FforEpoch {
 		}
 		this.data.sCommitmentNumber = msg.sCommitmentNumber;
 		this.data.acceptSignature = Buffer.from(msg.signature);
+		// Prototype extension (ff_accept TLV 7): the voucher HTLC id base.
+		this.data.sHtlcIdBase = msg.sHtlcIdBase ?? 0n;
 
 		// ff_invoices (§7.3): K amountless BOLT 11 invoices for H_1…H_K.
 		if (!ctx.invoiceFactory) {
@@ -805,7 +860,12 @@ export class FforEpoch {
 	 * escape set. M1's escape sigs are placeholders, so ff_end alone suffices.
 	 */
 	end(ctx: IFforChannelContext): IFforHandleResult {
-		if (this.data.state !== FforEpochState.FF_EPOCH) {
+		// ff_end closes a zero-settlement epoch directly from FF_EPOCH (§7.5),
+		// or completes reconciliation (§11.1 step 5) from FF_RECONCILE.
+		if (
+			this.data.state !== FforEpochState.FF_EPOCH &&
+			this.data.state !== FforEpochState.FF_RECONCILE
+		) {
 			return fail(`cannot end FFOR epoch in state ${this.data.state}`);
 		}
 		this.data.state = FforEpochState.FF_CLOSED;
@@ -838,7 +898,10 @@ export class FforEpoch {
 			// We initiated and this is the echo — idempotent.
 			return ok([], { closed: true });
 		}
-		if (this.data.state !== FforEpochState.FF_EPOCH) {
+		if (
+			this.data.state !== FforEpochState.FF_EPOCH &&
+			this.data.state !== FforEpochState.FF_RECONCILE
+		) {
 			return fail(`unexpected ff_end in epoch state ${this.data.state}`);
 		}
 		this.data.state = FforEpochState.FF_CLOSED;

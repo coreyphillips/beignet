@@ -102,6 +102,7 @@ import {
 import { isAnchorChannel, isTaprootChannel } from './types';
 import { FforEpoch, validateFforEpochParams } from '../ffor/epoch';
 import {
+	FforEpochState,
 	IFforChannelContext,
 	IFforEpochParams,
 	IFforEpochStateData,
@@ -110,8 +111,20 @@ import {
 import {
 	decodeFforHeader,
 	decodeFforErrorMessage,
-	encodeFforErrorMessage
+	encodeFforErrorMessage,
+	decodeFforSettlementMessage,
+	decodeFforReconcileMessage,
+	encodeFforReconcileMessage,
+	decodeFforReconcileAckMessage,
+	encodeFforReconcileAckMessage,
+	decodeFforRevokeBatchMessage,
+	encodeFforRevokeBatchMessage
 } from '../ffor/messages';
+import {
+	adoptVouchersIntoLiveState,
+	buildVoucherStateClone,
+	validateSettlementPackage
+} from '../ffor/settlement';
 import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -366,6 +379,12 @@ export class Channel {
 	// until ff_begin).
 	private _fforInvoiceFactory: ((paymentHashes: Buffer[]) => string[]) | null =
 		null;
+	// R side: S's per-commitment point for the reconciliation catch-up
+	// commitment (needed only when escape sigs were exchanged — the catch-up
+	// then lives at n0+2, a point R does not otherwise hold). Learned from the
+	// peer's reestablish TLV 55003 (prototype extension); in-memory only, it
+	// re-arrives on every reconnect.
+	private _fforCatchupPoint: Buffer | null = null;
 
 	constructor(state: IChannelState, signer?: ChannelSigner) {
 		this._state = state;
@@ -3657,6 +3676,30 @@ export class Channel {
 			msg.nextFundingRetransmitFlags = haveTheirCommitment ? 0 : 1;
 		}
 
+		// FFOR (spec §11.1): advertise the live epoch — {epoch_id, last_seq,
+		// state} — so both sides reconcile epoch state on reconnect (and the
+		// §7.5 crash window resolves). S additionally advertises its catch-up
+		// per-commitment point when escapes were signed (n0+2 is otherwise
+		// unknowable to R — prototype extension TLV 55003).
+		const ffor = this._state.ffor;
+		if (
+			ffor &&
+			(ffor.state === FforEpochState.FF_EPOCH ||
+				ffor.state === FforEpochState.FF_RECONCILE)
+		) {
+			msg.fforEpoch = {
+				epochId: ffor.epochId,
+				lastSeq: ffor.lastSeq,
+				state: ffor.state === FforEpochState.FF_EPOCH ? 1 : 2
+			};
+			if (ffor.role === 'settlement_peer' && ffor.escapeSigs.length > 0) {
+				msg.fforCatchupPoint = getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					this._fforCatchupNumber(ffor)
+				);
+			}
+		}
+
 		const actions: ChannelAction[] = [];
 
 		// We dropped an unresumable splice; the peer may still hold it in-flight.
@@ -4099,6 +4142,9 @@ export class Channel {
 		// ── Splice resumption (merged splice spec) ──
 		actions.push(...this._handleReestablishSplice(msg));
 
+		// ── FFOR epoch reconciliation of the reestablish TLVs (§11.1/§7.5) ──
+		actions.push(...this._handleReestablishFfor(msg));
+
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
 		// Per spec: on reconnection, if a node sent channel_ready, it MUST retransmit it.
 		if (
@@ -4323,11 +4369,21 @@ export class Channel {
 			// for the whole epoch.
 			feeratePerKw: getCommitmentFeeRate(this._state),
 			localCommitmentNumber: this._state.localCommitmentNumber,
+			remoteCommitmentNumber: this._state.remoteCommitmentNumber,
+			remoteCurrentPerCommitmentPoint:
+				this._state.remoteCurrentPerCommitmentPoint,
 			usedEpochIds: new Set(this._state.fforUsedEpochIds ?? []),
 			remoteNodeId: extras?.remoteNodeId,
 			signFn: extras?.signFn,
 			invoiceFactory:
-				this._fforInvoiceFactory ?? extras?.invoiceFactory ?? undefined
+				this._fforInvoiceFactory ?? extras?.invoiceFactory ?? undefined,
+			// Variant A (§7.2): the H_1 binding needs OUR per-commitment secret at
+			// n0; the voucher-HTLC id base is our offered-HTLC counter (TLV 7).
+			localPerCommitmentSecretN0: getPerCommitmentSecret(
+				this._state.localPerCommitmentSeed,
+				this._state.localCommitmentNumber
+			),
+			localNextHtlcId: this._state.localHtlcCounter
 		};
 	}
 
@@ -4758,6 +4814,596 @@ export class Channel {
 			this._fforAbortSetup();
 		}
 		return this._fforResultToActions(result);
+	}
+
+	// ─────────── FFOR M2: settlement replay + reconciliation (§9/§11) ───────────
+
+	/** Convenience: build an ff_error + ERROR pair without touching the epoch. */
+	private _fforProtocolError(reason: string): ChannelAction[] {
+		const actions: ChannelAction[] = [];
+		if (this._fforEpoch && this._state.channelId) {
+			actions.push(
+				sendMsg(
+					MessageType.FF_ERROR,
+					encodeFforErrorMessage({
+						channelId: this._state.channelId,
+						epochId: this._fforEpoch.epochId,
+						data: Buffer.from(reason, 'utf8')
+					})
+				)
+			);
+		}
+		actions.push({ type: ChannelActionType.ERROR, message: reason });
+		return actions;
+	}
+
+	/** The reconciliation catch-up commitment number: n0+2 with escapes, else n0+1. */
+	private _fforCatchupNumber(epoch: IFforEpochStateData): bigint {
+		return epoch.sCommitmentNumber! + (epoch.escapeSigs.length > 0 ? 2n : 1n);
+	}
+
+	/**
+	 * S side: start the reconciliation replay (spec §11.1 step 1) — re-send
+	 * every persisted settlement package. Called by the manager after
+	 * channel_reestablish confirms both sides are back in FF_EPOCH. Returns []
+	 * when not applicable (recipient side, no settlements, or already
+	 * reconciling on a first attempt).
+	 */
+	fforStartReplay(): ChannelAction[] {
+		const epoch = this._state.ffor;
+		if (
+			!epoch ||
+			epoch.role !== 'settlement_peer' ||
+			this._state.state !== ChannelState.FF_EPOCH ||
+			epoch.lastSeq === 0 ||
+			(epoch.state !== FforEpochState.FF_EPOCH &&
+				// A reconnect mid-reconcile restarts the replay (R handles
+				// duplicate packages idempotently).
+				epoch.state !== FforEpochState.FF_RECONCILE)
+		) {
+			return [];
+		}
+		epoch.state = FforEpochState.FF_RECONCILE;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...epoch.packages.map((p) => sendMsg(MessageType.FF_SETTLEMENT, p))
+		];
+	}
+
+	/**
+	 * R side: one replayed settlement package (spec §11.1 step 1). Validates
+	 * with the §9.4 checklist; at seq == j (the peer's last_seq from its
+	 * reestablish TLV) adopts C_j^R and answers with ff_reconcile.
+	 */
+	handleFforSettlement(
+		payload: Buffer,
+		extras: { remoteNodeId?: Buffer }
+	): ChannelAction[] {
+		const epoch = this._state.ffor;
+		if (
+			!epoch ||
+			epoch.role !== 'recipient' ||
+			this._state.state !== ChannelState.FF_EPOCH ||
+			(epoch.state !== FforEpochState.FF_EPOCH &&
+				epoch.state !== FforEpochState.FF_RECONCILE)
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_settlement' }
+			];
+		}
+		if (!this._signer) {
+			return this._fforProtocolError('no signer for package validation');
+		}
+		if (epoch.peerLastSeq === null) {
+			return this._fforProtocolError(
+				'ff_settlement before reestablish epoch TLV (unknown last_seq)'
+			);
+		}
+		epoch.state = FforEpochState.FF_RECONCILE;
+
+		// Idempotent replay: a package we already validated must be re-sent
+		// byte-identically (a differing copy is signed evidence, §12.2).
+		let seqPeek: number;
+		try {
+			seqPeek = decodeFforSettlementMessage(payload).seq;
+		} catch (e) {
+			return this._fforProtocolError(
+				`undecodable ff_settlement: ${(e as Error).message}`
+			);
+		}
+		if (seqPeek <= epoch.lastSeq) {
+			if (epoch.packages[seqPeek - 1]?.equals(payload)) {
+				return [];
+			}
+			return this._fforProtocolError(
+				`replayed package ${seqPeek} differs from the stored copy (signed evidence)`
+			);
+		}
+
+		// §9.4 checklist. S's point at n0 is our unchanged remote current point.
+		const result = validateSettlementPackage({
+			base: this._state,
+			signer: this._signer,
+			epoch,
+			payload,
+			remoteNodeId:
+				extras.remoteNodeId ?? epoch.remoteNodeId ?? Buffer.alloc(33),
+			sPerCommitmentPointN0: this._state.remoteCurrentPerCommitmentPoint!,
+			currentBlockHeight: this._currentBlockHeight
+		});
+		if (!result.ok || !result.msg) {
+			return this._fforProtocolError(result.error ?? 'invalid ff_settlement');
+		}
+		const msg = result.msg;
+
+		// Adopt the package: store evidence + preimage, advance our seq.
+		epoch.packages[msg.seq - 1] = Buffer.from(payload);
+		if (msg.preimage) {
+			epoch.preimages[msg.seq - 1] = Buffer.from(msg.preimage);
+		}
+		epoch.lastSeq = msg.seq;
+
+		// The seq-1 pre-revocation: from this moment S has no broadcastable
+		// state (§9.3). Insert into the remote shachain store like a normal
+		// revoke_and_ack would (validate already checked secret·G == point n0).
+		if (msg.seq === 1 && msg.revocationSecretN0) {
+			this._state.shaChainStore.addSecret(
+				MAX_INDEX - epoch.sCommitmentNumber!,
+				msg.revocationSecretN0
+			);
+		}
+
+		if (msg.seq < epoch.peerLastSeq) {
+			// More packages to come.
+			return [{ type: ChannelActionType.PERSIST_STATE }];
+		}
+
+		// seq == j: adopt C_j^R into the live channel and sign S's catch-up
+		// commitment (§11.1 step 2).
+		return this._fforAdoptAndReconcile(msg.commitmentSig, msg.htlcSigs);
+	}
+
+	/** R side: adopt C_j^R, then build + send ff_reconcile (§11.1 step 2). */
+	private _fforAdoptAndReconcile(
+		commitmentSig: Buffer,
+		htlcSigs: Buffer[]
+	): ChannelAction[] {
+		const epoch = this._state.ffor!;
+		const j = epoch.lastSeq;
+		const newNumber = this._fforCatchupNumber(epoch);
+
+		// S's per-commitment point for the catch-up commitment: n0+1 we hold
+		// from the last pre-epoch revoke_and_ack; n0+2 (escape case) arrives via
+		// the reestablish TLV 55003 (prototype extension — spec erratum).
+		const catchupPoint =
+			epoch.escapeSigs.length > 0
+				? this._fforCatchupPoint
+				: this._state.remoteNextPerCommitmentPoint;
+		if (!catchupPoint) {
+			return this._fforProtocolError(
+				'missing S per-commitment point for the catch-up commitment'
+			);
+		}
+
+		// Graft the vouchers onto the live state: our commitment becomes C_j^R.
+		adoptVouchersIntoLiveState(this._state, epoch, 'recipient');
+		this._state.localCommitmentNumber = epoch.nR + BigInt(j);
+		this._state.remoteCommitmentSignature = Buffer.from(commitmentSig);
+		this._state.remoteHtlcSignatures = htlcSigs.map((s) => Buffer.from(s));
+
+		// Sign S's catch-up commitment C^S_new, mirroring C_j^R (same j
+		// vouchers, S-offered). The live state now describes exactly that world.
+		const { signature, htlcSignatures } = signRemoteCommitment(
+			this._state,
+			this._signer!,
+			catchupPoint,
+			newNumber
+		);
+		const rNext = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			epoch.nR + BigInt(j) + 1n
+		);
+		const payload = encodeFforReconcileMessage({
+			channelId: this._state.channelId!,
+			epochId: epoch.epochId,
+			newCommitmentNumber: newNumber,
+			commitmentSig: signature,
+			htlcSigs: htlcSignatures,
+			rNextPerCommitmentPoint: rNext
+		});
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_RECONCILE, payload)
+		];
+	}
+
+	/**
+	 * S side: R's signature on our catch-up commitment (§11.1 step 2) —
+	 * verify, adopt the vouchers into the live state at the new commitment
+	 * number, and answer with ff_reconcile_ack (step 3).
+	 */
+	handleFforReconcile(payload: Buffer): ChannelAction[] {
+		const epoch = this._state.ffor;
+		if (
+			!epoch ||
+			epoch.role !== 'settlement_peer' ||
+			this._state.state !== ChannelState.FF_EPOCH ||
+			(epoch.state !== FforEpochState.FF_RECONCILE &&
+				epoch.state !== FforEpochState.FF_EPOCH)
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_reconcile' }
+			];
+		}
+		if (!this._signer) {
+			return this._fforProtocolError('no signer for reconcile verification');
+		}
+		let msg;
+		try {
+			msg = decodeFforReconcileMessage(payload);
+		} catch (e) {
+			return this._fforProtocolError(
+				`undecodable ff_reconcile: ${(e as Error).message}`
+			);
+		}
+		if (!msg.epochId.equals(epoch.epochId)) {
+			return this._fforProtocolError('ff_reconcile epoch_id mismatch');
+		}
+		const j = epoch.lastSeq;
+		const newNumber = this._fforCatchupNumber(epoch);
+		if (msg.newCommitmentNumber !== newNumber) {
+			return this._fforProtocolError(
+				`ff_reconcile new_commitment_number ${msg.newCommitmentNumber} != expected ${newNumber}`
+			);
+		}
+		if (msg.htlcSigs.length !== j) {
+			return this._fforProtocolError(
+				`ff_reconcile num_htlc_sigs ${msg.htlcSigs.length} != j = ${j}`
+			);
+		}
+
+		// Verify R's signatures against OUR catch-up commitment on a working
+		// clone (the live state is only mutated once everything verifies).
+		const ourPoint = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			newNumber
+		);
+		const clone = buildVoucherStateClone(
+			this._state,
+			epoch,
+			j,
+			'settlement_peer'
+		);
+		clone.localCommitmentNumber = newNumber - 1n;
+		if (
+			!verifyRemoteCommitmentSig(
+				clone,
+				this._signer,
+				ourPoint,
+				msg.commitmentSig,
+				newNumber
+			)
+		) {
+			return this._fforProtocolError(
+				'ff_reconcile commitment_sig does not verify'
+			);
+		}
+		if (
+			!verifyRemoteHtlcSignatures(clone, this._signer, ourPoint, msg.htlcSigs)
+		) {
+			return this._fforProtocolError('ff_reconcile htlc_sigs do not verify');
+		}
+
+		// Adopt: our commitment jumps to the catch-up number with the j vouchers
+		// live as offered HTLCs; R's tracking advances to C_j^R.
+		epoch.state = FforEpochState.FF_RECONCILE;
+		adoptVouchersIntoLiveState(this._state, epoch, 'settlement_peer');
+		this._state.localCommitmentNumber = newNumber;
+		this._state.remoteCommitmentSignature = Buffer.from(msg.commitmentSig);
+		this._state.remoteHtlcSignatures = msg.htlcSigs.map((s) => Buffer.from(s));
+		this._state.remoteCommitmentNumber = epoch.nR + BigInt(j);
+		this._state.remoteCurrentPerCommitmentPoint =
+			j > 0
+				? Buffer.from(epoch.params.rPerCommitmentPoints[j - 1])
+				: this._state.remoteCurrentPerCommitmentPoint;
+		this._state.remoteNextPerCommitmentPoint = Buffer.from(
+			msg.rNextPerCommitmentPoint
+		);
+
+		// ff_reconcile_ack (§11.1 step 3).
+		const ackPayload = encodeFforReconcileAckMessage({
+			channelId: this._state.channelId!,
+			epochId: epoch.epochId,
+			sNextPerCommitmentPoint: getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				newNumber + 1n
+			),
+			// TLV 1 iff j == 0 — otherwise the secret went out in package 1.
+			revocationSecretN0:
+				j === 0
+					? getPerCommitmentSecret(
+							this._state.localPerCommitmentSeed,
+							epoch.sCommitmentNumber!
+					  )
+					: undefined,
+			// TLV 3 iff escapes were signed: revoking n0+1 kills every E_j (§10).
+			revocationSecretN0Plus1:
+				epoch.escapeSigs.length > 0
+					? getPerCommitmentSecret(
+							this._state.localPerCommitmentSeed,
+							epoch.sCommitmentNumber! + 1n
+					  )
+					: undefined
+		});
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.FF_RECONCILE_ACK, ackPayload)
+		];
+	}
+
+	/**
+	 * R side: S's reconcile ack (§11.1 step 3) — verify the revealed secrets
+	 * against our stored points, advance S's tracking, and reply with
+	 * ff_revoke_batch (step 4; skipped when j == 0).
+	 */
+	handleFforReconcileAck(payload: Buffer): ChannelAction[] {
+		const epoch = this._state.ffor;
+		if (
+			!epoch ||
+			epoch.role !== 'recipient' ||
+			this._state.state !== ChannelState.FF_EPOCH ||
+			epoch.state !== FforEpochState.FF_RECONCILE
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected ff_reconcile_ack'
+				}
+			];
+		}
+		let msg;
+		try {
+			msg = decodeFforReconcileAckMessage(payload);
+		} catch (e) {
+			return this._fforProtocolError(
+				`undecodable ff_reconcile_ack: ${(e as Error).message}`
+			);
+		}
+		if (!msg.epochId.equals(epoch.epochId)) {
+			return this._fforProtocolError('ff_reconcile_ack epoch_id mismatch');
+		}
+		const j = epoch.lastSeq;
+		const newNumber = this._fforCatchupNumber(epoch);
+
+		// j == 0: the n0 secret arrives here (it never went out in a package).
+		if (j === 0) {
+			if (!msg.revocationSecretN0) {
+				return this._fforProtocolError(
+					'ff_reconcile_ack missing revocation_secret_n0 for a zero-settlement epoch'
+				);
+			}
+			if (
+				!perCommitmentPointFromSecret(msg.revocationSecretN0).equals(
+					this._state.remoteCurrentPerCommitmentPoint!
+				)
+			) {
+				return this._fforProtocolError(
+					'revocation_secret_n0 does not match per_commitment_point_S[n0]'
+				);
+			}
+			this._state.shaChainStore.addSecret(
+				MAX_INDEX - epoch.sCommitmentNumber!,
+				msg.revocationSecretN0
+			);
+		}
+		// Escapes: revealing n0+1 makes every E_j penalizable (§10).
+		if (epoch.escapeSigs.length > 0) {
+			if (!msg.revocationSecretN0Plus1) {
+				return this._fforProtocolError(
+					'ff_reconcile_ack missing revocation_secret_n0plus1 (escapes were signed)'
+				);
+			}
+			if (
+				!perCommitmentPointFromSecret(msg.revocationSecretN0Plus1).equals(
+					this._state.remoteNextPerCommitmentPoint!
+				)
+			) {
+				return this._fforProtocolError(
+					'revocation_secret_n0plus1 does not match per_commitment_point_S[n0+1]'
+				);
+			}
+			this._state.shaChainStore.addSecret(
+				MAX_INDEX - (epoch.sCommitmentNumber! + 1n),
+				msg.revocationSecretN0Plus1
+			);
+		}
+
+		// Advance S's tracking to the catch-up commitment.
+		const catchupPoint =
+			epoch.escapeSigs.length > 0
+				? this._fforCatchupPoint
+				: this._state.remoteNextPerCommitmentPoint;
+		this._state.remoteCommitmentNumber = newNumber;
+		if (catchupPoint) {
+			this._state.remoteCurrentPerCommitmentPoint = Buffer.from(catchupPoint);
+		}
+		this._state.remoteNextPerCommitmentPoint = Buffer.from(
+			msg.sNextPerCommitmentPoint
+		);
+
+		// ff_revoke_batch (§11.1 step 4): our secrets for the skipped indexes
+		// n_R … n_R + j − 1 (pre-epoch state + every superseded C_k^R).
+		const actions: ChannelAction[] = [
+			{ type: ChannelActionType.PERSIST_STATE }
+		];
+		if (j > 0) {
+			const secrets: Buffer[] = [];
+			for (let m = 0; m < j; m++) {
+				secrets.push(
+					getPerCommitmentSecret(
+						this._state.localPerCommitmentSeed,
+						epoch.nR + BigInt(m)
+					)
+				);
+			}
+			actions.push(
+				sendMsg(
+					MessageType.FF_REVOKE_BATCH,
+					encodeFforRevokeBatchMessage({
+						channelId: this._state.channelId!,
+						epochId: epoch.epochId,
+						secrets
+					})
+				)
+			);
+		} else {
+			// Zero-settlement epoch: step 4 is empty (§11.2); close directly.
+			actions.push(...this.endFforEpoch());
+		}
+		return actions;
+	}
+
+	/**
+	 * S side: R's batch of skipped per-commitment secrets (§11.1 step 4) —
+	 * verify each against its point, insert into the shachain store, then
+	 * close the epoch with ff_end (step 5).
+	 */
+	handleFforRevokeBatch(payload: Buffer): ChannelAction[] {
+		const epoch = this._state.ffor;
+		if (
+			!epoch ||
+			epoch.role !== 'settlement_peer' ||
+			this._state.state !== ChannelState.FF_EPOCH ||
+			epoch.state !== FforEpochState.FF_RECONCILE
+		) {
+			return [
+				{ type: ChannelActionType.ERROR, message: 'Unexpected ff_revoke_batch' }
+			];
+		}
+		let msg;
+		try {
+			msg = decodeFforRevokeBatchMessage(payload);
+		} catch (e) {
+			return this._fforProtocolError(
+				`undecodable ff_revoke_batch: ${(e as Error).message}`
+			);
+		}
+		if (!msg.epochId.equals(epoch.epochId)) {
+			return this._fforProtocolError('ff_revoke_batch epoch_id mismatch');
+		}
+		const j = epoch.lastSeq;
+		if (msg.secrets.length !== j) {
+			return this._fforProtocolError(
+				`ff_revoke_batch count ${msg.secrets.length} != j = ${j}`
+			);
+		}
+		// Verify each secret against the point we hold for that index: n_R was
+		// snapshotted at setup; n_R+1 … n_R+j−1 are the pre-shared epoch points.
+		for (let m = 0; m < j; m++) {
+			const expected =
+				m === 0
+					? epoch.rPreEpochPoint
+					: epoch.params.rPerCommitmentPoints[m - 1];
+			if (
+				!expected ||
+				!perCommitmentPointFromSecret(msg.secrets[m]).equals(expected)
+			) {
+				return this._fforProtocolError(
+					`ff_revoke_batch secret ${m} does not match R's point for n_R+${m}`
+				);
+			}
+			this._state.shaChainStore.addSecret(
+				MAX_INDEX - (epoch.nR + BigInt(m)),
+				msg.secrets[m]
+			);
+		}
+
+		// ff_end (§11.1 step 5): epoch closed; the channel returns to
+		// OPERATIONAL with j live voucher HTLCs.
+		return [{ type: ChannelActionType.PERSIST_STATE }, ...this.endFforEpoch()];
+	}
+
+	/**
+	 * Reestablish TLV handling (spec §11.1 + the §7.5 crash-window rules).
+	 * Runs from handleReestablish after the channel state is restored.
+	 */
+	private _handleReestablishFfor(
+		msg: IChannelReestablishMessage
+	): ChannelAction[] {
+		const epoch = this._state.ffor;
+		const oursActive =
+			!!epoch &&
+			this._state.state === ChannelState.FF_EPOCH &&
+			(epoch.state === FforEpochState.FF_EPOCH ||
+				epoch.state === FforEpochState.FF_RECONCILE);
+
+		if (!oursActive) {
+			if (
+				msg.fforEpoch &&
+				(msg.fforEpoch.state === 1 || msg.fforEpoch.state === 2)
+			) {
+				// The peer believes an epoch is live but we hold none — signal it.
+				return [
+					sendMsg(
+						MessageType.FF_ERROR,
+						encodeFforErrorMessage({
+							channelId: this._state.channelId!,
+							epochId: msg.fforEpoch.epochId,
+							data: Buffer.from('no such epoch on this channel', 'utf8')
+						})
+					),
+					{
+						type: ChannelActionType.ERROR,
+						message: 'peer reestablished with an FFOR epoch we do not hold'
+					}
+				];
+			}
+			return [];
+		}
+
+		if (!msg.fforEpoch) {
+			// §7.5 crash-window rule: an S that reports no epoch means setup never
+			// completed — R MUST discard its persisted epoch as aborted (safe: S
+			// never accepted a delegated payment). Mirror-case for S with no
+			// settlements; with settlements S KEEPS the epoch (funds safety —
+			// spec gap, see errata) and surfaces an error.
+			if (epoch!.role === 'settlement_peer' && epoch!.lastSeq > 0) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'peer reports no FFOR epoch but settlements exist — keeping epoch (on-chain enforcement is M3)'
+					}
+				];
+			}
+			this._fforEpoch = null;
+			this._state.ffor = null;
+			this._state.state = ChannelState.NORMAL;
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'FFOR epoch discarded: peer reestablished without it (setup never completed, §7.5)'
+				}
+			];
+		}
+
+		if (!msg.fforEpoch.epochId.equals(epoch!.epochId)) {
+			return this._fforProtocolError('reestablish FFOR epoch_id mismatch');
+		}
+		// R learns j (S's settled count) for the replay; S's value is
+		// authoritative (§11.1 step 1). j == 0 means no replay will come, so
+		// nothing is recorded (keeps a zero-settlement reconnect byte-neutral).
+		if (epoch!.role === 'recipient') {
+			if (msg.fforEpoch.lastSeq > 0) {
+				epoch!.peerLastSeq = msg.fforEpoch.lastSeq;
+			}
+			this._fforCatchupPoint = msg.fforCatchupPoint
+				? Buffer.from(msg.fforCatchupPoint)
+				: this._fforCatchupPoint;
+		}
+		return [];
 	}
 
 	// ─────────────── Splicing ───────────────

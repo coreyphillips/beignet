@@ -76,6 +76,13 @@ export interface IFforAcceptMessage extends IFforHeader {
 	sCommitmentNumber: bigint;
 	/** TLV 1 — Variant A only: S-generated hashes (K×32). */
 	paymentHashes?: Buffer[];
+	/**
+	 * TLV 7 (odd, PROTOTYPE EXTENSION — spec erratum): S's offered-HTLC counter
+	 * at epoch start. Voucher seq k maps to HTLC id s_htlc_id_base + (k−1) at
+	 * reconciliation; the spec assigns no voucher HTLC ids and R cannot observe
+	 * S's counter, so it must be communicated.
+	 */
+	sHtlcIdBase?: bigint;
 	/** S's node-key signature (final 64 bytes of the body). */
 	signature: Buffer;
 }
@@ -377,7 +384,11 @@ export function decodeFforInitMessage(payload: Buffer): IFforInitMessage {
 // ---- ff_accept (55003) ----
 
 const FF_ACCEPT_TLV_PAYMENT_HASHES = 1n;
-const FF_ACCEPT_KNOWN_TLVS = new Set<bigint>([FF_ACCEPT_TLV_PAYMENT_HASHES]);
+const FF_ACCEPT_TLV_S_HTLC_ID_BASE = 7n;
+const FF_ACCEPT_KNOWN_TLVS = new Set<bigint>([
+	FF_ACCEPT_TLV_PAYMENT_HASHES,
+	FF_ACCEPT_TLV_S_HTLC_ID_BASE
+]);
 
 export function encodeFforAcceptMessage(msg: IFforAcceptMessage): Buffer {
 	if (msg.signature.length !== SIG_LEN) {
@@ -393,6 +404,11 @@ export function encodeFforAcceptMessage(msg: IFforAcceptMessage): Buffer {
 			type: FF_ACCEPT_TLV_PAYMENT_HASHES,
 			value: Buffer.concat(msg.paymentHashes)
 		});
+	}
+	if (msg.sHtlcIdBase !== undefined) {
+		const v = Buffer.alloc(8);
+		v.writeBigUInt64BE(msg.sHtlcIdBase, 0);
+		records.push({ type: FF_ACCEPT_TLV_S_HTLC_ID_BASE, value: v });
 	}
 
 	return Buffer.concat([fixed, encodeTlvStream(records), msg.signature]);
@@ -411,6 +427,12 @@ export function decodeFforAcceptMessage(payload: Buffer): IFforAcceptMessage {
 		FF_ACCEPT_KNOWN_TLVS
 	);
 	const hashBlob = findTlvRecord(records, FF_ACCEPT_TLV_PAYMENT_HASHES);
+	const idBase = findTlvRecord(records, FF_ACCEPT_TLV_S_HTLC_ID_BASE);
+	if (idBase && idBase.length !== 8) {
+		throw new Error(
+			`ff_accept s_htlc_id_base must be 8 bytes, got ${idBase.length}`
+		);
+	}
 
 	return {
 		channelId: header.channelId,
@@ -419,6 +441,7 @@ export function decodeFforAcceptMessage(payload: Buffer): IFforAcceptMessage {
 		paymentHashes: hashBlob
 			? splitHashes(hashBlob, 'ff_accept payment_hashes')
 			: undefined,
+		sHtlcIdBase: idBase ? idBase.readBigUInt64BE(0) : undefined,
 		signature: Buffer.from(payload.subarray(tlvEnd))
 	};
 }
@@ -607,4 +630,400 @@ export function decodeFforErrorMessage(payload: Buffer): IFforErrorMessage {
 			payload.subarray(FF_HEADER_LEN + 2, FF_HEADER_LEN + 2 + len)
 		)
 	};
+}
+
+// ═════════════════════ M2: settlement + reconciliation ═════════════════════
+
+export const FF_SETTLEMENT_TYPE = 55013;
+export const FF_RECONCILE_TYPE = 55015;
+export const FF_RECONCILE_ACK_TYPE = 55017;
+export const FF_REVOKE_BATCH_TYPE = 55019;
+
+// ---- ff_settlement (55013, S→R and S→T) ✍ — spec §9.1 ----
+
+const FF_SETTLEMENT_TLV_REVOCATION_SECRET_N0 = 1n;
+const FF_SETTLEMENT_TLV_PREIMAGE = 3n;
+const FF_SETTLEMENT_TLV_UPSTREAM_SCID = 5n;
+const FF_SETTLEMENT_KNOWN_TLVS = new Set<bigint>([
+	FF_SETTLEMENT_TLV_REVOCATION_SECRET_N0,
+	FF_SETTLEMENT_TLV_PREIMAGE,
+	FF_SETTLEMENT_TLV_UPSTREAM_SCID
+]);
+
+/** The settlement package (spec §9.1). All sigs are BOLT 2 compact 64-byte. */
+export interface IFforSettlementMessage extends IFforHeader {
+	/** 1-based, strictly sequential. */
+	seq: number;
+	/** MUST equal H_seq. */
+	paymentHash: Buffer;
+	/** As received upstream. */
+	htlcAmountMsat: bigint;
+	/** v_i; MUST equal htlc_amount − fee(htlc_amount). */
+	voucherAmountMsat: bigint;
+	/** n_R + seq. */
+	rCommitmentNumber: bigint;
+	/** S's signature on C_i^R (BOLT 2 compact encoding). */
+	commitmentSig: Buffer;
+	/**
+	 * S's HTLC-success signatures for EVERY voucher output on C_i^R, in BOLT 3
+	 * commitment OUTPUT-INDEX order — not voucher seq order (§8) —
+	 * (SIGHASH_SINGLE|ANYONECANPAY, anchor rules). Count = seq.
+	 */
+	htlcSigs: Buffer[];
+	/** TLV 1 — REQUIRED in seq 1, both variants: per_commitment_secret_S[n0]. */
+	revocationSecretN0?: Buffer;
+	/** TLV 3 — Variant A only: P_i. */
+	preimage?: Buffer;
+	/** TLV 5 — optional, audit. */
+	upstreamScid?: Buffer;
+	/** S's node-key sig over the package (final 64 bytes; fraud-proof anchor). */
+	signature: Buffer;
+}
+
+export function encodeFforSettlementMessage(
+	msg: IFforSettlementMessage
+): Buffer {
+	if (msg.signature.length !== SIG_LEN) {
+		throw new Error(`signature must be 64 bytes, got ${msg.signature.length}`);
+	}
+	if (msg.commitmentSig.length !== SIG_LEN) {
+		throw new Error(
+			`commitment_sig must be 64 bytes, got ${msg.commitmentSig.length}`
+		);
+	}
+	if (msg.htlcSigs.length !== msg.seq) {
+		throw new Error(
+			`num_htlc_sigs ${msg.htlcSigs.length} != seq ${msg.seq} (§9.1: every voucher is re-signed)`
+		);
+	}
+	for (const s of msg.htlcSigs) {
+		if (s.length !== SIG_LEN) {
+			throw new Error(`htlc_sig must be 64 bytes, got ${s.length}`);
+		}
+	}
+	if (msg.paymentHash.length !== 32) {
+		throw new Error('payment_hash must be 32 bytes');
+	}
+
+	// [2 seq][32 hash][8 htlc_amount][8 voucher_amount][8 r_commitment_number]
+	// [64 commitment_sig][2 num_htlc_sigs][seq×64 htlc_sigs][TLV][64 signature]
+	const fixed = Buffer.alloc(FF_HEADER_LEN + 2 + 32 + 8 + 8 + 8 + 64 + 2);
+	let o = writeHeader(fixed, msg);
+	fixed.writeUInt16BE(msg.seq, o);
+	o += 2;
+	msg.paymentHash.copy(fixed, o);
+	o += 32;
+	fixed.writeBigUInt64BE(msg.htlcAmountMsat, o);
+	o += 8;
+	fixed.writeBigUInt64BE(msg.voucherAmountMsat, o);
+	o += 8;
+	fixed.writeBigUInt64BE(msg.rCommitmentNumber, o);
+	o += 8;
+	msg.commitmentSig.copy(fixed, o);
+	o += 64;
+	fixed.writeUInt16BE(msg.htlcSigs.length, o);
+
+	const records: ITlvRecord[] = [];
+	if (msg.revocationSecretN0) {
+		if (msg.revocationSecretN0.length !== 32) {
+			throw new Error('revocation_secret_n0 must be 32 bytes');
+		}
+		records.push({
+			type: FF_SETTLEMENT_TLV_REVOCATION_SECRET_N0,
+			value: msg.revocationSecretN0
+		});
+	}
+	if (msg.preimage) {
+		if (msg.preimage.length !== 32) {
+			throw new Error('preimage must be 32 bytes');
+		}
+		records.push({ type: FF_SETTLEMENT_TLV_PREIMAGE, value: msg.preimage });
+	}
+	if (msg.upstreamScid) {
+		if (msg.upstreamScid.length !== 8) {
+			throw new Error('upstream_scid must be 8 bytes');
+		}
+		records.push({
+			type: FF_SETTLEMENT_TLV_UPSTREAM_SCID,
+			value: msg.upstreamScid
+		});
+	}
+
+	return Buffer.concat([
+		fixed,
+		...msg.htlcSigs,
+		encodeTlvStream(records),
+		msg.signature
+	]);
+}
+
+export function decodeFforSettlementMessage(
+	payload: Buffer
+): IFforSettlementMessage {
+	const header = readHeader(payload, 'ff_settlement');
+	const FIXED = FF_HEADER_LEN + 2 + 32 + 8 + 8 + 8 + 64 + 2;
+	if (payload.length < FIXED + SIG_LEN) {
+		throw new Error(`ff_settlement too short: got ${payload.length}`);
+	}
+	let o = FF_HEADER_LEN;
+	const seq = payload.readUInt16BE(o);
+	o += 2;
+	const paymentHash = Buffer.from(payload.subarray(o, o + 32));
+	o += 32;
+	const htlcAmountMsat = payload.readBigUInt64BE(o);
+	o += 8;
+	const voucherAmountMsat = payload.readBigUInt64BE(o);
+	o += 8;
+	const rCommitmentNumber = payload.readBigUInt64BE(o);
+	o += 8;
+	const commitmentSig = Buffer.from(payload.subarray(o, o + 64));
+	o += 64;
+	const numHtlcSigs = payload.readUInt16BE(o);
+	o += 2;
+	if (payload.length < o + numHtlcSigs * SIG_LEN + SIG_LEN) {
+		throw new Error('ff_settlement truncated in htlc_sigs');
+	}
+	const htlcSigs: Buffer[] = [];
+	for (let i = 0; i < numHtlcSigs; i++) {
+		htlcSigs.push(Buffer.from(payload.subarray(o, o + SIG_LEN)));
+		o += SIG_LEN;
+	}
+	const tlvEnd = payload.length - SIG_LEN;
+	const { records } = decodeTlvStream(
+		payload.subarray(o, tlvEnd),
+		0,
+		FF_SETTLEMENT_KNOWN_TLVS
+	);
+	const secret = findTlvRecord(records, FF_SETTLEMENT_TLV_REVOCATION_SECRET_N0);
+	if (secret && secret.length !== 32) {
+		throw new Error('ff_settlement revocation_secret_n0 must be 32 bytes');
+	}
+	const preimage = findTlvRecord(records, FF_SETTLEMENT_TLV_PREIMAGE);
+	if (preimage && preimage.length !== 32) {
+		throw new Error('ff_settlement preimage must be 32 bytes');
+	}
+	const scid = findTlvRecord(records, FF_SETTLEMENT_TLV_UPSTREAM_SCID);
+	if (scid && scid.length !== 8) {
+		throw new Error('ff_settlement upstream_scid must be 8 bytes');
+	}
+
+	return {
+		channelId: header.channelId,
+		epochId: header.epochId,
+		seq,
+		paymentHash,
+		htlcAmountMsat,
+		voucherAmountMsat,
+		rCommitmentNumber,
+		commitmentSig,
+		htlcSigs,
+		revocationSecretN0: secret ? Buffer.from(secret) : undefined,
+		preimage: preimage ? Buffer.from(preimage) : undefined,
+		upstreamScid: scid ? Buffer.from(scid) : undefined,
+		signature: Buffer.from(payload.subarray(tlvEnd))
+	};
+}
+
+// ---- ff_reconcile (55015, R→S) — spec §11.1 step 2 ----
+
+/**
+ * R signs S's catch-up commitment C^S_new at n0+2 (n0+1 when G = 0),
+ * mirroring C_j^R exactly (same j vouchers, now S-offered HTLCs).
+ */
+export interface IFforReconcileMessage extends IFforHeader {
+	newCommitmentNumber: bigint;
+	/** R's signature on C^S_new (BOLT 2 compact). */
+	commitmentSig: Buffer;
+	/** R's second-level sigs for every voucher on C^S_new, output-index order. */
+	htlcSigs: Buffer[];
+	/** R's per-commitment point for n_R + j + 1. */
+	rNextPerCommitmentPoint: Buffer;
+}
+
+export function encodeFforReconcileMessage(msg: IFforReconcileMessage): Buffer {
+	if (msg.commitmentSig.length !== SIG_LEN) {
+		throw new Error('commitment_sig must be 64 bytes');
+	}
+	if (msg.rNextPerCommitmentPoint.length !== 33) {
+		throw new Error('r_next_per_commitment_point must be 33 bytes');
+	}
+	for (const s of msg.htlcSigs) {
+		if (s.length !== SIG_LEN) {
+			throw new Error('htlc_sig must be 64 bytes');
+		}
+	}
+	const fixed = Buffer.alloc(FF_HEADER_LEN + 8 + 64 + 2);
+	let o = writeHeader(fixed, msg);
+	fixed.writeBigUInt64BE(msg.newCommitmentNumber, o);
+	o += 8;
+	msg.commitmentSig.copy(fixed, o);
+	o += 64;
+	fixed.writeUInt16BE(msg.htlcSigs.length, o);
+	return Buffer.concat([fixed, ...msg.htlcSigs, msg.rNextPerCommitmentPoint]);
+}
+
+export function decodeFforReconcileMessage(
+	payload: Buffer
+): IFforReconcileMessage {
+	const header = readHeader(payload, 'ff_reconcile');
+	const FIXED = FF_HEADER_LEN + 8 + 64 + 2;
+	if (payload.length < FIXED + 33) {
+		throw new Error(`ff_reconcile too short: got ${payload.length}`);
+	}
+	let o = FF_HEADER_LEN;
+	const newCommitmentNumber = payload.readBigUInt64BE(o);
+	o += 8;
+	const commitmentSig = Buffer.from(payload.subarray(o, o + 64));
+	o += 64;
+	const num = payload.readUInt16BE(o);
+	o += 2;
+	if (payload.length < o + num * SIG_LEN + 33) {
+		throw new Error('ff_reconcile truncated in htlc_sigs');
+	}
+	const htlcSigs: Buffer[] = [];
+	for (let i = 0; i < num; i++) {
+		htlcSigs.push(Buffer.from(payload.subarray(o, o + SIG_LEN)));
+		o += SIG_LEN;
+	}
+	return {
+		channelId: header.channelId,
+		epochId: header.epochId,
+		newCommitmentNumber,
+		commitmentSig,
+		htlcSigs,
+		rNextPerCommitmentPoint: Buffer.from(payload.subarray(o, o + 33))
+	};
+}
+
+// ---- ff_reconcile_ack (55017, S→R) — spec §11.1 step 3 ----
+
+const FF_RECONCILE_ACK_TLV_SECRET_N0 = 1n;
+const FF_RECONCILE_ACK_TLV_SECRET_N0_PLUS_1 = 3n;
+const FF_RECONCILE_ACK_KNOWN_TLVS = new Set<bigint>([
+	FF_RECONCILE_ACK_TLV_SECRET_N0,
+	FF_RECONCILE_ACK_TLV_SECRET_N0_PLUS_1
+]);
+
+/**
+ * Body layout: the fixed field precedes the TLV stream (standard LN layout;
+ * the spec's §11.1 prose lists the TLVs first — spec erratum, layout chosen
+ * here is normative for the prototype).
+ */
+export interface IFforReconcileAckMessage extends IFforHeader {
+	/** S's per-commitment point for new_commitment_number + 1. */
+	sNextPerCommitmentPoint: Buffer;
+	/** TLV 1 — iff j == 0 (otherwise it went out in package 1). */
+	revocationSecretN0?: Buffer;
+	/** TLV 3 — iff escapes were signed: per_commitment_secret_S[n0+1]. */
+	revocationSecretN0Plus1?: Buffer;
+}
+
+export function encodeFforReconcileAckMessage(
+	msg: IFforReconcileAckMessage
+): Buffer {
+	if (msg.sNextPerCommitmentPoint.length !== 33) {
+		throw new Error('s_next_per_commitment_point must be 33 bytes');
+	}
+	const fixed = Buffer.alloc(FF_HEADER_LEN + 33);
+	const o = writeHeader(fixed, msg);
+	msg.sNextPerCommitmentPoint.copy(fixed, o);
+
+	const records: ITlvRecord[] = [];
+	if (msg.revocationSecretN0) {
+		if (msg.revocationSecretN0.length !== 32) {
+			throw new Error('revocation_secret_n0 must be 32 bytes');
+		}
+		records.push({
+			type: FF_RECONCILE_ACK_TLV_SECRET_N0,
+			value: msg.revocationSecretN0
+		});
+	}
+	if (msg.revocationSecretN0Plus1) {
+		if (msg.revocationSecretN0Plus1.length !== 32) {
+			throw new Error('revocation_secret_n0plus1 must be 32 bytes');
+		}
+		records.push({
+			type: FF_RECONCILE_ACK_TLV_SECRET_N0_PLUS_1,
+			value: msg.revocationSecretN0Plus1
+		});
+	}
+	return Buffer.concat([fixed, encodeTlvStream(records)]);
+}
+
+export function decodeFforReconcileAckMessage(
+	payload: Buffer
+): IFforReconcileAckMessage {
+	const header = readHeader(payload, 'ff_reconcile_ack');
+	if (payload.length < FF_HEADER_LEN + 33) {
+		throw new Error(`ff_reconcile_ack too short: got ${payload.length}`);
+	}
+	const sNextPerCommitmentPoint = Buffer.from(
+		payload.subarray(FF_HEADER_LEN, FF_HEADER_LEN + 33)
+	);
+	const { records } = decodeTlvStream(
+		payload.subarray(FF_HEADER_LEN + 33),
+		0,
+		FF_RECONCILE_ACK_KNOWN_TLVS
+	);
+	const s0 = findTlvRecord(records, FF_RECONCILE_ACK_TLV_SECRET_N0);
+	if (s0 && s0.length !== 32) {
+		throw new Error('ff_reconcile_ack revocation_secret_n0 must be 32 bytes');
+	}
+	const s1 = findTlvRecord(records, FF_RECONCILE_ACK_TLV_SECRET_N0_PLUS_1);
+	if (s1 && s1.length !== 32) {
+		throw new Error(
+			'ff_reconcile_ack revocation_secret_n0plus1 must be 32 bytes'
+		);
+	}
+	return {
+		channelId: header.channelId,
+		epochId: header.epochId,
+		sNextPerCommitmentPoint,
+		revocationSecretN0: s0 ? Buffer.from(s0) : undefined,
+		revocationSecretN0Plus1: s1 ? Buffer.from(s1) : undefined
+	};
+}
+
+// ---- ff_revoke_batch (55019, R→S) — spec §11.1 step 4 ----
+
+/** R's per-commitment secrets for its skipped indexes n_R … n_R + j − 1. */
+export interface IFforRevokeBatchMessage extends IFforHeader {
+	secrets: Buffer[];
+}
+
+export function encodeFforRevokeBatchMessage(
+	msg: IFforRevokeBatchMessage
+): Buffer {
+	if (msg.secrets.length > 0xffff) {
+		throw new Error('too many secrets');
+	}
+	for (const s of msg.secrets) {
+		if (s.length !== 32) {
+			throw new Error('per-commitment secret must be 32 bytes');
+		}
+	}
+	const fixed = Buffer.alloc(FF_HEADER_LEN + 2);
+	const o = writeHeader(fixed, msg);
+	fixed.writeUInt16BE(msg.secrets.length, o);
+	return Buffer.concat([fixed, ...msg.secrets]);
+}
+
+export function decodeFforRevokeBatchMessage(
+	payload: Buffer
+): IFforRevokeBatchMessage {
+	const header = readHeader(payload, 'ff_revoke_batch');
+	if (payload.length < FF_HEADER_LEN + 2) {
+		throw new Error(`ff_revoke_batch too short: got ${payload.length}`);
+	}
+	const count = payload.readUInt16BE(FF_HEADER_LEN);
+	let o = FF_HEADER_LEN + 2;
+	if (payload.length < o + count * 32) {
+		throw new Error('ff_revoke_batch truncated in secrets');
+	}
+	const secrets: Buffer[] = [];
+	for (let i = 0; i < count; i++) {
+		secrets.push(Buffer.from(payload.subarray(o, o + 32)));
+		o += 32;
+	}
+	return { channelId: header.channelId, epochId: header.epochId, secrets };
 }

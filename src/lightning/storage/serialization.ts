@@ -436,6 +436,19 @@ export interface ISerializedFforEpoch {
 	acceptSignature: string | null;
 	remoteNodeId: string | null;
 	epochStartHeight: number | null;
+	// M2: settlement + reconciliation state (optional for backward
+	// compatibility with M1-serialized epochs).
+	preimages?: string[];
+	lastSeq?: number;
+	packages?: string[];
+	htlcAmountsMsat?: string[];
+	voucherAmountsMsat?: string[];
+	upstreamFulfilled?: boolean[];
+	sHtlcIdBase?: string;
+	frozenFeeratePerKw?: number;
+	nR?: string;
+	rPreEpochPoint?: string | null;
+	peerLastSeq?: number | null;
 }
 
 export function serializeFforEpoch(
@@ -472,7 +485,18 @@ export function serializeFforEpoch(
 		initSignature: bufToHex(f.initSignature),
 		acceptSignature: bufToHex(f.acceptSignature),
 		remoteNodeId: bufToHex(f.remoteNodeId),
-		epochStartHeight: f.epochStartHeight
+		epochStartHeight: f.epochStartHeight,
+		preimages: f.preimages.map((p) => p.toString('hex')),
+		lastSeq: f.lastSeq,
+		packages: f.packages.map((p) => p.toString('hex')),
+		htlcAmountsMsat: f.htlcAmountsMsat.map(bigintToStr),
+		voucherAmountsMsat: f.voucherAmountsMsat.map(bigintToStr),
+		upstreamFulfilled: [...f.upstreamFulfilled],
+		sHtlcIdBase: bigintToStr(f.sHtlcIdBase),
+		frozenFeeratePerKw: f.frozenFeeratePerKw,
+		nR: bigintToStr(f.nR),
+		rPreEpochPoint: bufToHex(f.rPreEpochPoint),
+		peerLastSeq: f.peerLastSeq
 	};
 }
 
@@ -512,7 +536,18 @@ export function deserializeFforEpoch(
 		initSignature: hexToBuf(s.initSignature),
 		acceptSignature: hexToBuf(s.acceptSignature),
 		remoteNodeId: hexToBuf(s.remoteNodeId),
-		epochStartHeight: s.epochStartHeight
+		epochStartHeight: s.epochStartHeight,
+		preimages: (s.preimages ?? []).map((p) => Buffer.from(p, 'hex')),
+		lastSeq: s.lastSeq ?? 0,
+		packages: (s.packages ?? []).map((p) => Buffer.from(p, 'hex')),
+		htlcAmountsMsat: (s.htlcAmountsMsat ?? []).map(strToBigint),
+		voucherAmountsMsat: (s.voucherAmountsMsat ?? []).map(strToBigint),
+		upstreamFulfilled: [...(s.upstreamFulfilled ?? [])],
+		sHtlcIdBase: s.sHtlcIdBase !== undefined ? strToBigint(s.sHtlcIdBase) : 0n,
+		frozenFeeratePerKw: s.frozenFeeratePerKw ?? 0,
+		nR: s.nR !== undefined ? strToBigint(s.nR) : 0n,
+		rPreEpochPoint: hexToBuf(s.rPreEpochPoint ?? null),
+		peerLastSeq: s.peerLastSeq ?? null
 	};
 }
 

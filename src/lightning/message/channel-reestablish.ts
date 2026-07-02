@@ -39,6 +39,20 @@ export interface IChannelReestablishMessage {
 	 * local_nonce, TLV type 4 — same convention as open/accept/revoke).
 	 */
 	nextLocalNonce?: Buffer;
+	/**
+	 * FFOR (specs/ffor-offline-receive.md §11.1): TLV 55001 — the sender's
+	 * fast-forward epoch state: `[32: epoch_id][2: last_seq][1: state]`
+	 * (state: 0 = setup, 1 = epoch, 2 = reconciling, 3 = closed). Absence
+	 * means "no epoch" and drives the §7.5 crash-window resolution.
+	 */
+	fforEpoch?: { epochId: Buffer; lastSeq: number; state: number };
+	/**
+	 * FFOR prototype extension: TLV 55003 — S's per-commitment point for the
+	 * reconciliation catch-up commitment (n0+2 when escape sigs were
+	 * exchanged). R holds n0+1 from the last pre-epoch revoke_and_ack but has
+	 * no way to learn n0+2 before signing ff_reconcile — spec erratum.
+	 */
+	fforCatchupPoint?: Buffer;
 }
 
 const CHANNEL_REESTABLISH_LENGTH = 113; // 32 + 8 + 8 + 32 + 33
@@ -53,6 +67,10 @@ const TLV_NEXT_FUNDING = 1n;
 const TLV_NEXT_FUNDING_LEGACY = 0n;
 /** option_taproot verification nonce (LND local_nonce convention). */
 const TLV_NEXT_LOCAL_NONCE = 4n;
+/** FFOR epoch state (spec §11.1). */
+const TLV_FFOR_EPOCH = 55001n;
+/** FFOR reconciliation catch-up point (prototype extension, odd). */
+const TLV_FFOR_CATCHUP_POINT = 55003n;
 
 /**
  * Encode a `channel_reestablish` message payload.
@@ -99,6 +117,25 @@ export function encodeChannelReestablishMessage(
 		tlvRecords.push({
 			type: TLV_NEXT_LOCAL_NONCE,
 			value: msg.nextLocalNonce
+		});
+	}
+	if (msg.fforEpoch) {
+		if (msg.fforEpoch.epochId.length !== 32) {
+			throw new Error('ffor epoch_id must be 32 bytes');
+		}
+		const v = Buffer.alloc(35);
+		msg.fforEpoch.epochId.copy(v, 0);
+		v.writeUInt16BE(msg.fforEpoch.lastSeq, 32);
+		v.writeUInt8(msg.fforEpoch.state, 34);
+		tlvRecords.push({ type: TLV_FFOR_EPOCH, value: v });
+	}
+	if (msg.fforCatchupPoint) {
+		if (msg.fforCatchupPoint.length !== 33) {
+			throw new Error('ffor catch-up point must be 33 bytes');
+		}
+		tlvRecords.push({
+			type: TLV_FFOR_CATCHUP_POINT,
+			value: msg.fforCatchupPoint
 		});
 	}
 	if (tlvRecords.length > 0) {
@@ -166,6 +203,17 @@ export function decodeChannelReestablishMessage(
 				record.value.length === 66
 			) {
 				result.nextLocalNonce = Buffer.from(record.value);
+			} else if (record.type === TLV_FFOR_EPOCH && record.value.length === 35) {
+				result.fforEpoch = {
+					epochId: Buffer.from(record.value.subarray(0, 32)),
+					lastSeq: record.value.readUInt16BE(32),
+					state: record.value.readUInt8(34)
+				};
+			} else if (
+				record.type === TLV_FFOR_CATCHUP_POINT &&
+				record.value.length === 33
+			) {
+				result.fforCatchupPoint = Buffer.from(record.value);
 			}
 		}
 	}

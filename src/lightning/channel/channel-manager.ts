@@ -86,12 +86,26 @@ import {
 	ChannelResult,
 	ChannelState,
 	ChannelRole,
+	HtlcDirection,
+	HtlcState,
+	IHtlcEntry,
 	isAnchorChannel,
 	isTaprootChannel,
 	REGTEST_CHAIN_HASH
 } from './types';
 import { decodeFforHeader, encodeFforErrorMessage } from '../ffor/messages';
-import { IFforEpochParams } from '../ffor/types';
+import {
+	FforEpochState,
+	FforVariant,
+	IFforEpochParams,
+	IFforEpochStateData
+} from '../ffor/types';
+import {
+	buildSettlementPackage,
+	fforSettlementCheckError,
+	fforSkimFeeMsat,
+	fforVoucherHtlcId
+} from '../ffor/settlement';
 import { encode as encodeBolt11Invoice } from '../invoice/encode';
 import { Network } from '../invoice/types';
 import {
@@ -324,13 +338,17 @@ export class ChannelManager extends EventEmitter {
 			MessageType.TX_ACK_RBF,
 			MessageType.TX_ABORT,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
-			// FFOR: Fast-Forward Offline Receive epoch setup
-			// (specs/ffor-offline-receive.md §14)
+			// FFOR: Fast-Forward Offline Receive epoch setup + settlement +
+			// reconciliation (specs/ffor-offline-receive.md §14)
 			MessageType.FF_INIT,
 			MessageType.FF_ACCEPT,
 			MessageType.FF_INVOICES,
 			MessageType.FF_ESCAPE_SIGS,
 			MessageType.FF_BEGIN,
+			MessageType.FF_SETTLEMENT,
+			MessageType.FF_RECONCILE,
+			MessageType.FF_RECONCILE_ACK,
+			MessageType.FF_REVOKE_BATCH,
 			MessageType.FF_END,
 			MessageType.FF_ERROR,
 			// BOLT 1 error/warning: without these registrations a remote error is
@@ -1531,6 +1549,18 @@ export class ChannelManager extends EventEmitter {
 				case MessageType.FF_BEGIN:
 					this.handleFforBeginMsg(peerPubkey, payload);
 					break;
+				case MessageType.FF_SETTLEMENT:
+					this.handleFforSettlementMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_RECONCILE:
+					this.handleFforReconcileMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_RECONCILE_ACK:
+					this.handleFforReconcileAckMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_REVOKE_BATCH:
+					this.handleFforRevokeBatchMsg(peerPubkey, payload);
+					break;
 				case MessageType.FF_END:
 					this.handleFforEndMsg(peerPubkey, payload);
 					break;
@@ -1836,6 +1866,11 @@ export class ChannelManager extends EventEmitter {
 		if (channelId) {
 			this.autoSignAndSendCommitment(channelId);
 		}
+
+		// FFOR (spec §9.2): the revoke completed a commitment round — any inbound
+		// HTLC on this channel is now irrevocably committed; settle it if its
+		// hash belongs to an active epoch's delegated set.
+		this._fforProcessSettlements(channel);
 	}
 
 	private handleUpdateFeeMsg(peerPubkey: string, payload: Buffer): void {
@@ -2642,6 +2677,21 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 		}
+
+		// FFOR (spec §11.1): with the channel back in FF_EPOCH after reestablish,
+		// the settlement peer starts reconciliation by replaying its packages
+		// (fforStartReplay is a no-op on the recipient / with no settlements).
+		if (channel.getState() === ChannelState.FF_EPOCH) {
+			const replay = channel.fforStartReplay();
+			if (replay.length > 0) {
+				this.processActions(peerPubkey, channel, replay);
+			}
+		}
+
+		// FFOR (spec §9.2 crash replay): an upstream channel restored with a
+		// still-committed delegated HTLC re-runs the settlement engine — the
+		// persisted package makes this idempotent by seq.
+		this._fforProcessSettlements(channel);
 	}
 
 	private handleStfu(peerPubkey: string, payload: Buffer): void {
@@ -3011,6 +3061,242 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleFforError(payload);
 		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforSettlementMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforSettlement(
+			payload,
+			this._fforExtras(peerPubkey)
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforReconcileMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforReconcile(payload);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforReconcileAckMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforReconcileAck(payload);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleFforRevokeBatchMsg(peerPubkey: string, payload: Buffer): void {
+		const { channelId } = decodeFforHeader(payload);
+		const channel = this.findChannelByChannelId(channelId);
+		if (!channel) return;
+
+		const actions = channel.handleFforRevokeBatch(payload);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	// ─────────── FFOR M2: the S-side settlement engine (spec §9.2) ───────────
+
+	/**
+	 * Scan a channel's irrevocably-committed inbound HTLCs for delegated
+	 * payments (payment_hash ∈ an active epoch's hash set, matched on the HTLC
+	 * itself — the inner onion is undecryptable and discarded, §7.3) and settle
+	 * them. Runs after every revoke_and_ack (the HTLC is then committed on both
+	 * sides) and after reestablish (crash replay). Strictly serial by design —
+	 * the scan itself is synchronous and packages are keyed by seq.
+	 */
+	private _fforProcessSettlements(upstreamChannel: Channel): void {
+		if (upstreamChannel.getState() !== ChannelState.NORMAL) return;
+		const upstreamState = upstreamChannel.getFullState();
+		for (const entry of [...upstreamState.htlcs.values()]) {
+			if (
+				entry.direction !== HtlcDirection.RECEIVED ||
+				entry.state !== HtlcState.COMMITTED
+			) {
+				continue;
+			}
+			for (const epochChannel of this.channels.values()) {
+				if (epochChannel === upstreamChannel) continue;
+				const epoch = epochChannel.getFforEpoch();
+				if (
+					!epoch ||
+					epoch.role !== 'settlement_peer' ||
+					epoch.state !== FforEpochState.FF_EPOCH ||
+					// Variant B settlement routes preimage release through the tower
+					// (M4); only variant A settles locally.
+					epoch.params.variant !== FforVariant.A
+				) {
+					continue;
+				}
+				const idx = (epoch.params.paymentHashes ?? []).findIndex((h) =>
+					h.equals(entry.paymentHash)
+				);
+				if (idx < 0) continue;
+				this._fforSettleDelegated(
+					upstreamChannel,
+					entry,
+					epochChannel,
+					epoch,
+					idx
+				);
+				break;
+			}
+		}
+	}
+
+	/** Fail a delegated HTLC upstream (spec §8: MUST NOT settle). */
+	private _fforFailUpstream(
+		upstreamChannel: Channel,
+		htlcId: bigint,
+		reason: string
+	): void {
+		this.emit('error', upstreamChannel.getChannelId(), `FFOR: ${reason}`);
+		// NOTE: a spec-complete implementation wraps temporary_node_failure in
+		// the BOLT 4 failure onion for the OUTER shared secret; onion machinery
+		// lives at the node layer, so the manager sends an opaque reason.
+		this.failHtlc(
+			upstreamChannel.getChannelId()!,
+			htlcId,
+			Buffer.from('temporary_node_failure', 'utf8')
+		);
+	}
+
+	/**
+	 * Variant A settlement (spec §9.2): after the §8 checks pass — build the
+	 * settlement package for C_i^R, persist it durably, THEN settle upstream
+	 * with update_fulfill_htlc(P_i). Idempotent by seq for crash replay.
+	 */
+	private _fforSettleDelegated(
+		upstreamChannel: Channel,
+		htlc: IHtlcEntry,
+		epochChannel: Channel,
+		epoch: IFforEpochStateData,
+		hashIndex: number
+	): void {
+		const epochChannelId = epochChannel.getChannelId()!;
+		const seq = hashIndex + 1;
+
+		// Already-settled hash: replay the fulfill if it never went out (crash
+		// between package-persist and upstream settle), else fail the duplicate
+		// part (§11.2: never settle a consumed hash again; v1 is single-part).
+		if (seq <= epoch.lastSeq) {
+			if (epoch.upstreamFulfilled[hashIndex]) {
+				this._fforFailUpstream(
+					upstreamChannel,
+					htlc.id,
+					`duplicate delegated payment for consumed hash H_${seq}`
+				);
+				return;
+			}
+			this.fulfillHtlc(
+				upstreamChannel.getChannelId()!,
+				htlc.id,
+				epoch.preimages[hashIndex]
+			);
+			epoch.upstreamFulfilled[hashIndex] = true;
+			this.emit('channel:persist', epochChannelId);
+			return;
+		}
+
+		// §9.1: packages are strictly sequential — the spec's hash set is
+		// ordered and H_seq must be consumed as payment seq (spec erratum: §7.3
+		// "serve in any order" conflicts; in-order consumption is enforced).
+		if (seq !== epoch.lastSeq + 1) {
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				`out-of-order delegated payment: hash H_${seq} before H_${
+					epoch.lastSeq + 1
+				}`
+			);
+			return;
+		}
+
+		// §8 checks.
+		const checkErr = fforSettlementCheckError(
+			epochChannel.getFullState(),
+			epoch,
+			seq,
+			htlc.amountMsat,
+			htlc.cltvExpiry,
+			this._currentBlockHeight
+		);
+		if (checkErr) {
+			this._fforFailUpstream(upstreamChannel, htlc.id, checkErr);
+			return;
+		}
+
+		const signer = epochChannel.getSigner();
+		const nodeKey = this.config.nodePrivateKey;
+		if (!signer || !nodeKey) {
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				'no signer/node key for settlement package'
+			);
+			return;
+		}
+
+		// Build + persist the package BEFORE settling upstream (§9.2 step 1).
+		epoch.htlcAmountsMsat[hashIndex] = htlc.amountMsat;
+		epoch.voucherAmountsMsat[hashIndex] =
+			htlc.amountMsat - fforSkimFeeMsat(epoch, htlc.amountMsat);
+		const { payload } = buildSettlementPackage({
+			base: epochChannel.getFullState(),
+			signer,
+			epoch,
+			channelId: epochChannelId,
+			seq,
+			signFn: (digest: Buffer): Buffer => sign(digest, nodeKey)
+		});
+		epoch.packages[hashIndex] = payload;
+		epoch.lastSeq = seq;
+		this.emit('channel:persist', epochChannelId);
+
+		// §9.2 step 2: settle upstream with update_fulfill_htlc(P_i). For seq 1
+		// the preimage IS per_commitment_secret_S[n0] — the upstream claim is
+		// itself the revocation of our only signed commitment (§12.1).
+		this.fulfillHtlc(
+			upstreamChannel.getChannelId()!,
+			htlc.id,
+			epoch.preimages[hashIndex]
+		);
+		epoch.upstreamFulfilled[hashIndex] = true;
+		this.emit('channel:persist', epochChannelId);
+	}
+
+	/**
+	 * R side, §11.1 step 6: convert the reconciled vouchers to plain balance by
+	 * fulfilling each with its package preimage through the stock commitment
+	 * dance. Call after ff_end returns the channel to NORMAL.
+	 */
+	fforFulfillVouchers(channelId: Buffer): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const epoch = channel.getFforEpoch();
+		if (!epoch || epoch.role !== 'recipient') {
+			const error = 'No reconciled FFOR epoch on this channel';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		for (let k = 1; k <= epoch.lastSeq; k++) {
+			const preimage = epoch.preimages[k - 1];
+			if (!preimage || preimage.length !== 32) continue;
+			this.fulfillHtlc(channelId, fforVoucherHtlcId(epoch, k), preimage);
+		}
+		return { ok: true, actions: [] };
 	}
 
 	/**

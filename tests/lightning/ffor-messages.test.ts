@@ -29,7 +29,17 @@ import {
 	decodeFforHeader,
 	fforMessageDigest,
 	signFforMessage,
-	verifyFforMessageSignature
+	verifyFforMessageSignature,
+	FF_SETTLEMENT_TYPE,
+	IFforSettlementMessage,
+	encodeFforSettlementMessage,
+	decodeFforSettlementMessage,
+	encodeFforReconcileMessage,
+	decodeFforReconcileMessage,
+	encodeFforReconcileAckMessage,
+	decodeFforReconcileAckMessage,
+	encodeFforRevokeBatchMessage,
+	decodeFforRevokeBatchMessage
 } from '../../src/lightning/ffor/messages';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeTlvRecord } from '../../src/lightning/message/tlv';
@@ -404,6 +414,214 @@ describe('FFOR messages (M1 codecs)', function () {
 					fforMessageDigest(FF_ACCEPT_TYPE, a)
 				)
 			).to.equal(false);
+		});
+	});
+
+	// ─────────────── M2: settlement + reconciliation codecs ───────────────
+
+	describe('ff_accept TLV 7 (s_htlc_id_base, prototype extension)', function () {
+		it('round-trips alongside the variant A hash TLV', function () {
+			const msg: IFforAcceptMessage = {
+				channelId,
+				epochId,
+				sCommitmentNumber: 42n,
+				paymentHashes: [crypto.randomBytes(32)],
+				sHtlcIdBase: 17n,
+				signature: Buffer.alloc(64, 0x11)
+			};
+			const decoded = decodeFforAcceptMessage(encodeFforAcceptMessage(msg));
+			expect(decoded.sHtlcIdBase).to.equal(17n);
+			expect(decoded.paymentHashes).to.have.length(1);
+		});
+	});
+
+	describe('ff_settlement (55013)', function () {
+		function baseSettlement(
+			overrides?: Partial<IFforSettlementMessage>
+		): IFforSettlementMessage {
+			return {
+				channelId,
+				epochId,
+				seq: 2,
+				paymentHash: Buffer.alloc(32, 0xaa),
+				htlcAmountMsat: 550_000n,
+				voucherAmountMsat: 546_250n,
+				rCommitmentNumber: 44n,
+				commitmentSig: Buffer.alloc(64, 0x01),
+				htlcSigs: [Buffer.alloc(64, 0x02), Buffer.alloc(64, 0x03)],
+				signature: Buffer.alloc(64, 0x77),
+				...overrides
+			};
+		}
+
+		it('round-trips with every TLV (seq-1 style package)', function () {
+			const msg = baseSettlement({
+				seq: 1,
+				htlcSigs: [Buffer.alloc(64, 0x02)],
+				revocationSecretN0: Buffer.alloc(32, 0x0a),
+				preimage: Buffer.alloc(32, 0x0a),
+				upstreamScid: Buffer.alloc(8, 0x05)
+			});
+			const decoded = decodeFforSettlementMessage(
+				encodeFforSettlementMessage(msg)
+			);
+			expect(decoded.seq).to.equal(1);
+			expect(decoded.htlcAmountMsat).to.equal(550_000n);
+			expect(decoded.voucherAmountMsat).to.equal(546_250n);
+			expect(decoded.rCommitmentNumber).to.equal(44n);
+			expect(decoded.commitmentSig.equals(Buffer.alloc(64, 0x01))).to.equal(
+				true
+			);
+			expect(decoded.htlcSigs).to.have.length(1);
+			expect(
+				decoded.revocationSecretN0!.equals(Buffer.alloc(32, 0x0a))
+			).to.equal(true);
+			expect(decoded.preimage!.equals(Buffer.alloc(32, 0x0a))).to.equal(true);
+			expect(decoded.upstreamScid!.equals(Buffer.alloc(8, 0x05))).to.equal(
+				true
+			);
+		});
+
+		it('round-trips without optional TLVs (seq > 1, variant B style)', function () {
+			const decoded = decodeFforSettlementMessage(
+				encodeFforSettlementMessage(baseSettlement())
+			);
+			expect(decoded.seq).to.equal(2);
+			expect(decoded.htlcSigs).to.have.length(2);
+			expect(decoded.htlcSigs[1].equals(Buffer.alloc(64, 0x03))).to.equal(true);
+			expect(decoded.revocationSecretN0).to.equal(undefined);
+			expect(decoded.preimage).to.equal(undefined);
+			expect(decoded.upstreamScid).to.equal(undefined);
+		});
+
+		it('enforces num_htlc_sigs == seq on encode (§9.1 re-signs every voucher)', function () {
+			expect(() =>
+				encodeFforSettlementMessage(
+					baseSettlement({ seq: 3 }) // 2 sigs, seq 3
+				)
+			).to.throw('num_htlc_sigs');
+		});
+
+		it('signs and verifies; rejects a tampered body', function () {
+			const nodeKey = crypto.createHash('sha256').update('pkg-key').digest();
+			const nodeId = getPublicKey(nodeKey);
+			const payload = signFforMessage(
+				FF_SETTLEMENT_TYPE,
+				encodeFforSettlementMessage(
+					baseSettlement({ signature: Buffer.alloc(64) })
+				),
+				nodeKey
+			);
+			expect(
+				verifyFforMessageSignature(FF_SETTLEMENT_TYPE, payload, nodeId)
+			).to.equal(true);
+			const tampered = Buffer.from(payload);
+			tampered[66] ^= 0x01; // flip a bit inside `seq`
+			expect(
+				verifyFforMessageSignature(FF_SETTLEMENT_TYPE, tampered, nodeId)
+			).to.equal(false);
+		});
+
+		it('rejects truncation inside htlc_sigs', function () {
+			const encoded = encodeFforSettlementMessage(baseSettlement());
+			expect(() =>
+				decodeFforSettlementMessage(encoded.subarray(0, encoded.length - 70))
+			).to.throw();
+		});
+	});
+
+	describe('ff_reconcile (55015)', function () {
+		it('round-trips', function () {
+			const pt = Buffer.concat([Buffer.from([2]), Buffer.alloc(32, 0x44)]);
+			const decoded = decodeFforReconcileMessage(
+				encodeFforReconcileMessage({
+					channelId,
+					epochId,
+					newCommitmentNumber: 43n,
+					commitmentSig: Buffer.alloc(64, 0x09),
+					htlcSigs: [Buffer.alloc(64, 0x0b)],
+					rNextPerCommitmentPoint: pt
+				})
+			);
+			expect(decoded.newCommitmentNumber).to.equal(43n);
+			expect(decoded.commitmentSig.equals(Buffer.alloc(64, 0x09))).to.equal(
+				true
+			);
+			expect(decoded.htlcSigs).to.have.length(1);
+			expect(decoded.rNextPerCommitmentPoint.equals(pt)).to.equal(true);
+		});
+
+		it('round-trips a zero-settlement reconcile (no htlc sigs)', function () {
+			const pt = Buffer.concat([Buffer.from([3]), Buffer.alloc(32, 0x45)]);
+			const decoded = decodeFforReconcileMessage(
+				encodeFforReconcileMessage({
+					channelId,
+					epochId,
+					newCommitmentNumber: 44n,
+					commitmentSig: Buffer.alloc(64),
+					htlcSigs: [],
+					rNextPerCommitmentPoint: pt
+				})
+			);
+			expect(decoded.htlcSigs).to.have.length(0);
+			expect(decoded.rNextPerCommitmentPoint.equals(pt)).to.equal(true);
+		});
+	});
+
+	describe('ff_reconcile_ack (55017)', function () {
+		const pt = Buffer.concat([Buffer.from([2]), Buffer.alloc(32, 0x66)]);
+
+		it('round-trips with both conditional secrets', function () {
+			const decoded = decodeFforReconcileAckMessage(
+				encodeFforReconcileAckMessage({
+					channelId,
+					epochId,
+					sNextPerCommitmentPoint: pt,
+					revocationSecretN0: Buffer.alloc(32, 0x0c),
+					revocationSecretN0Plus1: Buffer.alloc(32, 0x0d)
+				})
+			);
+			expect(decoded.sNextPerCommitmentPoint.equals(pt)).to.equal(true);
+			expect(
+				decoded.revocationSecretN0!.equals(Buffer.alloc(32, 0x0c))
+			).to.equal(true);
+			expect(
+				decoded.revocationSecretN0Plus1!.equals(Buffer.alloc(32, 0x0d))
+			).to.equal(true);
+		});
+
+		it('round-trips with no TLVs (j > 0, no escapes)', function () {
+			const decoded = decodeFforReconcileAckMessage(
+				encodeFforReconcileAckMessage({
+					channelId,
+					epochId,
+					sNextPerCommitmentPoint: pt
+				})
+			);
+			expect(decoded.revocationSecretN0).to.equal(undefined);
+			expect(decoded.revocationSecretN0Plus1).to.equal(undefined);
+		});
+	});
+
+	describe('ff_revoke_batch (55019)', function () {
+		it('round-trips a batch of secrets', function () {
+			const secrets = [Buffer.alloc(32, 1), Buffer.alloc(32, 2)];
+			const decoded = decodeFforRevokeBatchMessage(
+				encodeFforRevokeBatchMessage({ channelId, epochId, secrets })
+			);
+			expect(decoded.secrets).to.have.length(2);
+			expect(decoded.secrets[1].equals(Buffer.alloc(32, 2))).to.equal(true);
+		});
+
+		it('rejects truncation inside the secrets', function () {
+			const encoded = encodeFforRevokeBatchMessage({
+				channelId,
+				epochId,
+				secrets: [Buffer.alloc(32, 1)]
+			});
+			expect(() =>
+				decodeFforRevokeBatchMessage(encoded.subarray(0, encoded.length - 4))
+			).to.throw('truncated');
 		});
 	});
 });
