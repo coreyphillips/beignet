@@ -43,6 +43,40 @@ export function generateTemporaryChannelId(): Buffer {
 }
 
 /**
+ * Derive the v2 (dual-funding) channel_id per BOLT 2:
+ *   channel_id = SHA256(lesser-revocation-basepoint || greater-revocation-basepoint)
+ * where lesser/greater is the lexicographic order of the two 33-byte revocation
+ * basepoints. Both peers compute the same id from the opener's basepoint
+ * (open_channel2) and the acceptor's (accept_channel2).
+ */
+export function deriveV2ChannelId(
+	revocationBasepointA: Buffer,
+	revocationBasepointB: Buffer
+): Buffer {
+	const [lesser, greater] =
+		Buffer.compare(revocationBasepointA, revocationBasepointB) <= 0
+			? [revocationBasepointA, revocationBasepointB]
+			: [revocationBasepointB, revocationBasepointA];
+	return crypto
+		.createHash('sha256')
+		.update(Buffer.concat([lesser, greater]))
+		.digest();
+}
+
+/**
+ * Derive the v2 temporary_channel_id sent in open_channel2, before the peer's
+ * revocation basepoint is known. Per BOLT 2 it is the v2 channel_id computed
+ * with a zeroed-out basepoint for the non-initiator. A zeroed 33-byte basepoint
+ * always sorts below a real compressed point (which starts 0x02/0x03), so this
+ * is SHA256(0x00*33 || opener_revocation_basepoint).
+ */
+export function deriveV2TemporaryChannelId(
+	openerRevocationBasepoint: Buffer
+): Buffer {
+	return deriveV2ChannelId(Buffer.alloc(33), openerRevocationBasepoint);
+}
+
+/**
  * Validate open_channel parameters per BOLT 2 requirements.
  * @returns Error string if invalid, null if valid.
  */

@@ -79,6 +79,8 @@ import {
 } from './channel-state';
 import {
 	deriveChannelId,
+	deriveV2ChannelId,
+	deriveV2TemporaryChannelId,
 	validateOpenChannelParams,
 	isValidShutdownScript
 } from './validation';
@@ -6048,6 +6050,13 @@ export class Channel {
 			this._state.channelType = defaultType.toBuffer();
 		}
 
+		// BOLT 2 v2: temporary_channel_id is derived from our revocation basepoint
+		// (peer's zeroed), not random — so a spec-compliant peer routes our
+		// open_channel2 and can return channel-assignable errors.
+		this._state.temporaryChannelId = deriveV2TemporaryChannelId(
+			params.localBasepoints.revocationBasepoint
+		);
+
 		const session = new DualFundingSession(
 			true,
 			this._state.temporaryChannelId
@@ -6108,6 +6117,15 @@ export class Channel {
 		this._state.dualFundingSession = session;
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
+		// BOLT 2 v2: the real channel_id (used from the first interactive-tx
+		// message onward) is SHA256 over the two ordered revocation basepoints —
+		// the opener's (from open_channel2) and ours. Both peers derive the same
+		// value. temporary_channel_id (already adopted from the opener) stays the
+		// tempChannels key until the open completes.
+		this._state.channelId = deriveV2ChannelId(
+			this._state.remoteBasepoints!.revocationBasepoint,
+			this._state.localBasepoints.revocationBasepoint
+		);
 		// Record the negotiated channel type (session validated any mismatch) so
 		// commitment #0 is built with the same anchor/taproot dispatch on both
 		// sides. Default per BOLT 2: static_remotekey.
@@ -6235,6 +6253,14 @@ export class Channel {
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
+
+		// BOLT 2 v2: derive the real channel_id from the two ordered revocation
+		// basepoints now that the acceptor's is known (accept_channel2). Both peers
+		// arrive at the same id; it is used from the first interactive-tx message.
+		this._state.channelId = deriveV2ChannelId(
+			this._state.localBasepoints.revocationBasepoint,
+			this._state.remoteBasepoints!.revocationBasepoint
+		);
 
 		// Dual funding v2: fold the acceptor's contribution into the channel.
 		// createOpenerState already set fundingSatoshis + localBalanceMsat to our
@@ -6378,7 +6404,7 @@ export class Channel {
 		}
 
 		const msg: ITxAddInputMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			serialId: input.serialId,
 			prevTx: input.prevTx || Buffer.alloc(0),
 			prevTxVout: input.prevOutputIndex,
@@ -6485,7 +6511,7 @@ export class Channel {
 		}
 
 		const msg: ITxAddOutputMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			serialId: output.serialId,
 			amountSats: output.amountSats,
 			scriptPubkey: output.scriptPubkey
@@ -6562,7 +6588,7 @@ export class Channel {
 		}
 
 		const msg: ITxRemoveInputMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			serialId
 		};
 
@@ -6628,7 +6654,7 @@ export class Channel {
 		}
 
 		const msg: ITxRemoveOutputMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			serialId
 		};
 
@@ -6708,7 +6734,7 @@ export class Channel {
 			sendMsg(
 				MessageType.TX_COMPLETE,
 				encodeTxCompleteMessage({
-					channelId: this._state.temporaryChannelId
+					channelId: this._v2ChannelId()
 				})
 			),
 			...this._maybeSendV2Commitment()
@@ -6769,6 +6795,18 @@ export class Channel {
 	 * funding output carrying the full negotiated capacity — returns null (the
 	 * caller errors) when it does not.
 	 */
+	/**
+	 * The channel_id to stamp on v2 (dual-funding) wire messages. BOLT 2 uses the
+	 * temporary_channel_id only for open_channel2/accept_channel2 (built by the
+	 * DualFundingSession); every message from the first interactive-tx message
+	 * onward uses the real channel_id, derived from both revocation basepoints and
+	 * set as state.channelId once accept_channel2 is exchanged. Before that (the
+	 * opener aborting between open and accept) it falls back to the temp id.
+	 */
+	private _v2ChannelId(): Buffer {
+		return this._state.channelId ?? this._state.temporaryChannelId;
+	}
+
 	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
 		const session = this._state.dualFundingSession;
 		if (!session || !this._state.remoteBasepoints) return null;
@@ -6852,13 +6890,12 @@ export class Channel {
 				}
 			];
 		}
-		// signRemoteCommitment reads the funding outpoint from state; set it
-		// (and the permanent channel id) now, before either side has released
-		// any signature.
+		// signRemoteCommitment reads the funding outpoint from state; set it now,
+		// before either side has released any signature. The v2 channel_id is the
+		// basepoint-derived id set at accept_channel2 (NOT the funding outpoint) —
+		// do not overwrite it here.
 		this._state.fundingTxid = fo.txid;
 		this._state.fundingOutputIndex = fo.outputIndex;
-		const { deriveChannelId: deriveChanId } = require('./validation');
-		this._state.channelId = deriveChanId(fo.txid, fo.outputIndex);
 
 		const { signature, htlcSignatures } = signRemoteCommitment(
 			this._state,
@@ -7022,17 +7059,17 @@ export class Channel {
 
 		// Funding info was already set when the commitment round started; keep
 		// the assignment idempotent for callers that reached here another way.
+		// The v2 channel_id is the basepoint-derived id (set at accept_channel2),
+		// not the funding outpoint — leave it untouched.
 		this._state.fundingTxid = Buffer.from(txid);
 		this._state.fundingOutputIndex = outputIndex;
-		const { deriveChannelId: deriveChanId } = require('./validation');
-		this._state.channelId = deriveChanId(txid, outputIndex);
 
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 		}
 
 		const msg: ITxSignaturesMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			txid,
 			witnesses
 		};
@@ -7212,14 +7249,12 @@ export class Channel {
 			];
 		}
 
-		// Update funding txid if not yet set
+		// Update funding txid if not yet set (defensive: the commitment round
+		// already set it). The v2 channel_id is the basepoint-derived id from
+		// accept_channel2, not the funding outpoint — leave it untouched.
 		if (!this._state.fundingTxid) {
 			this._state.fundingTxid = Buffer.from(msg.txid);
-			const { deriveChannelId: deriveChanId } = require('./validation');
-			this._state.channelId = deriveChanId(
-				msg.txid,
-				session.getFundingOutputIndex()
-			);
+			this._state.fundingOutputIndex = session.getFundingOutputIndex();
 		}
 
 		const actions: ChannelAction[] = [];
@@ -7262,7 +7297,7 @@ export class Channel {
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
 		const msg: ITxInitRbfMessage = {
-			channelId: this._state.temporaryChannelId,
+			channelId: this._v2ChannelId(),
 			locktime: result.locktime ?? 0,
 			feerate: newFeeratePerkw
 		};
@@ -7298,7 +7333,7 @@ export class Channel {
 			sendMsg(
 				MessageType.TX_ACK_RBF,
 				encodeTxAckRbfMessage({
-					channelId: this._state.temporaryChannelId
+					channelId: this._v2ChannelId()
 				})
 			)
 		];
@@ -7326,7 +7361,7 @@ export class Channel {
 			sendMsg(
 				MessageType.TX_ABORT,
 				encodeTxAbortMessage({
-					channelId: this._state.temporaryChannelId,
+					channelId: this._v2ChannelId(),
 					data
 				})
 			)

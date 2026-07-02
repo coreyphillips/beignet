@@ -242,6 +242,11 @@ function driveToCommitmentExchange(
 	const openPayload = findPayload(openActions, MessageType.OPEN_CHANNEL2)!;
 	const openMsg = decodeOpenChannel2Message(openPayload);
 
+	// The acceptor adopts the opener's (now BOLT-2-derived) temporary_channel_id,
+	// exactly as the ChannelManager does on an inbound open_channel2. Without this
+	// the DualFundingSession's temporary_channel_id echo check would fail.
+	acceptorState.temporaryChannelId = Buffer.from(openMsg.channelId);
+
 	const acceptActions = acceptor.handleOpenChannel2(openMsg, acceptorParams);
 	expect(findError(acceptActions)).to.equal(null);
 	const acceptPayload = findPayload(
