@@ -67,6 +67,16 @@ export interface ITrackedOutput {
 	 * this height, then broadcast. Undefined for outputs with no built sweep.
 	 */
 	maturityHeight?: number;
+	/**
+	 * True when this TO_LOCAL output is the CSV-delayed output of OUR own
+	 * second-level HTLC-success/timeout tx (tracked by resolveSecondLevelHtlcOutput),
+	 * NOT a commitment to_local. On a taproot channel the two use DIFFERENT script
+	 * trees (second-level = revocation-key internal + single delay leaf; commitment
+	 * to_local = NUMS internal + delay/revoke leaves), so a rebuild must reconstruct
+	 * the correct one. Without this tag the rebuild path would sign against the
+	 * commitment to_local tree and strand the second-level funds.
+	 */
+	isSecondLevelHtlc?: boolean;
 }
 
 /** Info about a confirmed commitment transaction */

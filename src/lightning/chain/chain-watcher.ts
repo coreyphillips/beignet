@@ -341,12 +341,24 @@ export class ChainWatcher extends EventEmitter {
 	async watchOutput(
 		txid: string,
 		outputIndex: number,
-		scriptPubkey: Buffer
+		scriptPubkey: Buffer,
+		// Seed a previously recorded spend (its txid + confirmation height) so that
+		// after a restart checkOutputSpend can detect a REORG that evicts it. Without
+		// this seed watched.spendTxid is undefined and the eviction branch never
+		// fires, hiding a reorg-then-theft of a penalty / HTLC claim.
+		spendTxid?: string,
+		spendHeight?: number
 	): Promise<void> {
 		const scriptHash = computeScriptHash(scriptPubkey);
 		const key = `${txid}:${outputIndex}`;
 
-		this.watchedOutputs.set(key, { txid, outputIndex, scriptHash });
+		this.watchedOutputs.set(key, {
+			txid,
+			outputIndex,
+			scriptHash,
+			spendTxid,
+			spendHeight
+		});
 
 		try {
 			await this.backend.subscribeToScriptHash(scriptHash, () => {
@@ -364,7 +376,14 @@ export class ChainWatcher extends EventEmitter {
 	 * Watch an output by fetching the transaction and extracting the script.
 	 * Used to handle 'watch:output:requested' events.
 	 */
-	async watchOutputByTxid(txid: string, outputIndex: number): Promise<void> {
+	async watchOutputByTxid(
+		txid: string,
+		outputIndex: number,
+		// Forwarded to watchOutput so a restored watch re-seeds any previously
+		// recorded spend and stays reorg-eviction aware.
+		spendTxid?: string,
+		spendHeight?: number
+	): Promise<void> {
 		const rawTx = await this.backend.getTransaction(txid);
 		const tx = bitcoin.Transaction.fromBuffer(rawTx);
 		if (outputIndex >= tx.outs.length) {
@@ -373,7 +392,13 @@ export class ChainWatcher extends EventEmitter {
 			);
 		}
 		const scriptPubkey = tx.outs[outputIndex].script;
-		await this.watchOutput(txid, outputIndex, scriptPubkey);
+		await this.watchOutput(
+			txid,
+			outputIndex,
+			scriptPubkey,
+			spendTxid,
+			spendHeight
+		);
 	}
 
 	/**

@@ -678,6 +678,56 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(penalty!.spendTx).to.exist;
 			expect(penalty!.witness).to.exist;
 		});
+
+		// Audit HIGH-3: the lessor's own to_local sweep must set nLockTime =
+		// lease_expiry, otherwise the OP_CHECKLOCKTIMEVERIFY in the CLTV-locked
+		// witnessScript fails (BIP65) and the entire lessor to_local is stranded.
+		it('builds our lessor to_local sweep with nLockTime = lease_expiry', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = true;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const perCommitmentPoint =
+				perCommitmentPointFromSecret(perCommitmentSecret);
+			const built = buildLocalCommitment(state, perCommitmentPoint);
+
+			const trackedOutputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.OUR_COMMITMENT,
+				state.localCommitmentNumber
+			);
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const resolved = resolveOurCommitmentOutputs(
+				state,
+				trackedOutputs,
+				state.localCommitmentNumber,
+				destScript,
+				4,
+				new Map()
+			);
+
+			const toLocal = resolved.find(
+				(r) => r.trackedOutput.outputType === OutputType.TO_LOCAL
+			);
+			expect(toLocal).to.exist;
+			expect(toLocal!.spendTx).to.exist;
+			// Before the fix this was 0, making the sweep consensus-invalid forever.
+			expect(toLocal!.spendTx!.locktime).to.equal(LEASE_EXPIRY);
+			// The CSV input sequence must remain (locktime stays enforced).
+			expect(toLocal!.spendTx!.ins[0].sequence).to.equal(
+				state.remoteConfig.toSelfDelay
+			);
+		});
 	});
 
 	describe('resolveOurCommitmentOutputs', function () {
@@ -1098,6 +1148,97 @@ describe('Output Resolver (Phase 4B)', function () {
 			).to.equal(htlcTx.getId());
 			expect(r!.spendTx!.ins[0].sequence).to.equal(toSelfDelay);
 			expect(r!.spendTx!.outs[0].script.equals(dest)).to.be.true;
+		});
+
+		// Audit MEDIUM-6: on a taproot channel a rebuild of the second-level HTLC
+		// CSV sweep must reconstruct the second-level script tree (revocation-key
+		// internal + single delay leaf), not the commitment to_local tree (NUMS +
+		// delay/revoke leaves). Otherwise the rebuild signs against the wrong tree,
+		// yields the wrong control block, and strands the second-level funds.
+		it('taproot: rebuild uses the second-level tree, not commitment to_local', function () {
+			const {
+				FeatureFlags,
+				Feature
+			} = require('../../src/lightning/features/flags');
+			const {
+				buildTaprootSecondLevelOutput
+			} = require('../../src/lightning/script/commitment-taproot');
+			const {
+				deriveRevocationPubkey,
+				derivePublicKey
+			} = require('../../src/lightning/keys/derivation');
+
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const flags = FeatureFlags.empty();
+			flags.setCompulsory(Feature.OPTION_TAPROOT);
+			state.channelType = flags.toBuffer();
+
+			const commitmentNumber = 0n;
+			const point = perCommitmentPointFromSecret(
+				generateFromSeed(
+					state.localPerCommitmentSeed,
+					MAX_INDEX - commitmentNumber
+				)
+			);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.remoteBasepoints!.revocationBasepoint,
+				point
+			);
+			const delayedPubkey = derivePublicKey(
+				state.localBasepoints.delayedPaymentBasepoint,
+				point
+			);
+			const toSelfDelay = state.remoteConfig.toSelfDelay;
+			const sl = buildTaprootSecondLevelOutput(
+				revocationPubkey,
+				delayedPubkey,
+				toSelfDelay,
+				network
+			);
+
+			const htlcTx = new bitcoin.Transaction();
+			htlcTx.version = 2;
+			htlcTx.addInput(crypto.randomBytes(32), 0);
+			htlcTx.addOutput(sl.output, 90_000);
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const r = resolveSecondLevelHtlcOutput(
+				state,
+				htlcTx,
+				150,
+				commitmentNumber,
+				dest,
+				10,
+				openerPrivkeys[3],
+				network
+			);
+			expect(r, 'taproot second-level sweep produced').to.not.be.null;
+			expect(r!.trackedOutput.isSecondLevelHtlc).to.equal(true);
+
+			// Rebuild the tracked output as rebuildSweep / _rebuildHeldSweeps would.
+			const rebuilt = resolveOurCommitmentOutputs(
+				state,
+				[r!.trackedOutput],
+				commitmentNumber,
+				dest,
+				10,
+				new Map(),
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+			const toLocal = rebuilt.find(
+				(x) => x.trackedOutput.outputType === OutputType.TO_LOCAL
+			);
+			expect(toLocal, 'a rebuilt sweep is produced').to.exist;
+			// The rebuilt control block must be the SECOND-LEVEL one (identical to the
+			// original valid sweep). Before the fix it was the commitment to_local
+			// control block (different internal key + tree), i.e. an invalid sweep.
+			expect(toLocal!.witness![2].equals(r!.witness![2])).to.equal(true);
+			expect(toLocal!.witness![2].equals(sl.delay.controlBlock)).to.equal(true);
 		});
 
 		it('returns null when out[0] is not our second-level to_local output', function () {

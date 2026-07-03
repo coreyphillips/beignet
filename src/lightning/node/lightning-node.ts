@@ -763,6 +763,21 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
+			// Re-arm the anchor commitment CPFP for OUR still-unconfirmed
+			// force-closes: the tracking map is in-memory only, so without this a
+			// restart leaves the low-fee commitment package unbumped forever.
+			// rearmCommitmentCpfp resolves its own live-or-floored feerate, so this
+			// MUST run regardless of whether the estimator succeeded (a transient
+			// estimator error or a <=0 sample must not leave the package unbumped).
+			const rearmAllCommitmentCpfp = (): void => {
+				for (const { channelId: monitorChannelId } of monitors) {
+					this.channelManager.rearmCommitmentCpfp(
+						Buffer.from(monitorChannelId, 'hex'),
+						this.resolveForceCloseFeeRatePerVbyte()
+					);
+				}
+			};
+
 			// Update restored chain monitors with current fee rate if estimator available
 			if (this.feeEstimator) {
 				this.feeEstimator
@@ -781,31 +796,22 @@ export class LightningNode extends EventEmitter {
 								if (m && typeof m.updateFeeRate === 'function') {
 									m.updateFeeRate(feeratePerKw);
 								}
-								// Re-arm the anchor commitment CPFP for OUR still
-								// unconfirmed force-closes: the tracking map is
-								// in-memory only, so without this a restart leaves
-								// the low-fee commitment package unbumped forever.
-								this.channelManager.rearmCommitmentCpfp(
-									Buffer.from(monitorChannelId, 'hex'),
-									this.resolveForceCloseFeeRatePerVbyte()
-								);
 							}
 						}
+						// Re-arm even on a <=0 sample.
+						rearmAllCommitmentCpfp();
 					})
 					.catch((err) => {
 						this.emitStructuredLog('fee', 'estimate_failed', {
 							error: err instanceof Error ? err.message : String(err)
 						});
+						// Re-arm even when the estimator errored.
+						rearmAllCommitmentCpfp();
 					});
 			} else {
 				// No estimator: still re-arm at the fallback feerate so the
 				// commitment package is at least re-broadcast + CPFP-tracked.
-				for (const { channelId: monitorChannelId } of monitors) {
-					this.channelManager.rearmCommitmentCpfp(
-						Buffer.from(monitorChannelId, 'hex'),
-						this.resolveForceCloseFeeRatePerVbyte()
-					);
-				}
+				rearmAllCommitmentCpfp();
 			}
 		}
 
@@ -1812,8 +1818,54 @@ export class LightningNode extends EventEmitter {
 			// Only watch channels that have funding info and are not yet closed
 			if (!state.fundingTxid || state.fundingOutputIndex === undefined)
 				continue;
-			// Skip fully cooperative-closed channels
-			if (state.state === ChannelState.CLOSED) continue;
+			// A cooperative close sets CLOSED at fee/sig agreement, BEFORE the
+			// mutual-close tx confirms. Until the close is irrevocably buried a peer
+			// could still broadcast a revoked commitment on the still-live funding
+			// output, which we must be able to detect and punish. Unconditionally
+			// skipping here permanently drops the watch on restart in that window.
+			// Only skip once the close is fully resolved on-chain (mirrors the
+			// FORCE_CLOSED gate below); otherwise re-arm any per-output watches, then
+			// fall through to re-arm the funding watch and rebroadcast the stored
+			// mutual close so it re-enters the mempool if the network never saw it.
+			if (state.state === ChannelState.CLOSED) {
+				const monitor = this.channelManager.getMonitor(
+					state.channelId || state.temporaryChannelId
+				);
+				if (monitor && monitor.isFullyResolved()) continue;
+				if (monitor) {
+					for (const output of monitor.getTrackedOutputs()) {
+						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
+						try {
+							const seedTxid =
+								output.status === OutputStatus.SPEND_CONFIRMED
+									? output.resolutionTxid
+									: undefined;
+							const seedHeight =
+								seedTxid !== undefined ? output.confirmationHeight : undefined;
+							await this.chainWatcher.watchOutputByTxid(
+								output.txid,
+								output.outputIndex,
+								seedTxid,
+								seedHeight
+							);
+						} catch {
+							// Electrum hiccup: the funding watch below still drives
+							// detection of any commitment spend on the funding output.
+						}
+					}
+				}
+				if (state.lastCooperativeCloseTxHex && this._chainBackend) {
+					try {
+						await this._chainBackend.broadcastTransaction(
+							state.lastCooperativeCloseTxHex
+						);
+					} catch {
+						// Already in mempool/confirmed (or backend hiccup): the funding
+						// watch still reports the eventual spend either way.
+					}
+				}
+				// fall through to re-arm the funding watch below
+			}
 			if (state.state === ChannelState.FORCE_CLOSED) {
 				const monitor = this.channelManager.getMonitor(
 					state.channelId || state.temporaryChannelId
@@ -1827,9 +1879,22 @@ export class LightningNode extends EventEmitter {
 					for (const output of monitor.getTrackedOutputs()) {
 						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
 						try {
+							// Seed a previously recorded spend so a reorg that evicts our
+							// penalty / HTLC claim after restart is detected (checkOutputSpend
+							// only fires its eviction branch when spendTxid is set). Without
+							// this the monitor would promote SPEND_CONFIRMED to irrevocable off
+							// the stale height and hide a reorg-then-theft.
+							const seedTxid =
+								output.status === OutputStatus.SPEND_CONFIRMED
+									? output.resolutionTxid
+									: undefined;
+							const seedHeight =
+								seedTxid !== undefined ? output.confirmationHeight : undefined;
 							await this.chainWatcher.watchOutputByTxid(
 								output.txid,
-								output.outputIndex
+								output.outputIndex,
+								seedTxid,
+								seedHeight
 							);
 						} catch {
 							// Electrum hiccup — the funding watch below still drives
@@ -5874,10 +5939,25 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Blocks before an inbound HTLC's cltv_expiry at which, if we hold its
+	 * preimage but the off-chain fulfill has not been acked, we force-close the
+	 * inbound channel to claim on-chain. Must leave enough room for our
+	 * HTLC-success to confirm before the peer's HTLC-timeout becomes spendable at
+	 * cltv_expiry (LDK-style CLTV_CLAIM_BUFFER).
+	 */
+	private static readonly INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER = 18;
+
+	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
-	 * Auto-fail any that are within the safety margin.
+	 * Auto-fail any that are within the safety margin. Separately, force-close to
+	 * claim any inbound HTLC we already hold the preimage for (or that is
+	 * FULFILLED off-chain) whose counterparty may never ack the removal.
 	 */
 	private scanExpiringHtlcs(blockHeight: number): void {
+		const claimBuffer = Math.max(
+			LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			this.htlcSafetyMargin
+		);
 		const channels = this.channelManager.listChannels();
 		for (const channel of channels) {
 			const state = channel.getFullState();
@@ -5886,6 +5966,35 @@ export class LightningNode extends EventEmitter {
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
+
+				// Backstop (HIGH-4): if we hold this inbound HTLC's preimage (either
+				// it is already FULFILLED off-chain, and an adversarial upstream never
+				// acks the removal, leaving it FULFILLED indefinitely, or we learned
+				// the preimage from downstream), our only guaranteed way to collect the
+				// funds is an on-chain HTLC-success. Failing it (below) would forfeit
+				// value we can actually claim. Force-close the inbound channel while a
+				// claim buffer remains before cltv_expiry, so our HTLC-success is the
+				// only valid spend and the peer cannot win an HTLC-timeout race.
+				const paymentHashHex = htlc.paymentHash?.toString('hex');
+				const haveClaim =
+					htlc.state === HtlcState.FULFILLED ||
+					(paymentHashHex !== undefined && this.preimages.has(paymentHashHex));
+				if (haveClaim && htlc.cltvExpiry - blockHeight <= claimBuffer) {
+					const channelId = state.channelId || state.temporaryChannelId;
+					this.emit('node:error', {
+						code: 'HTLC_CLAIM_FORCE_CLOSE',
+						channelId,
+						message: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
+						timestamp: Date.now()
+					} as ILightningError);
+					this.channelManager.forceClose(
+						channelId,
+						this.getSweepDestinationScript(),
+						this.resolveForceCloseFeeRatePerVbyte()
+					);
+					break; // channel is closing; stop scanning it
+				}
+
 				if (
 					htlc.state !== HtlcState.PENDING &&
 					htlc.state !== HtlcState.COMMITTED
@@ -5908,9 +6017,16 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan forwarded HTLCs and fail any whose incoming CLTV is dangerously close.
-	 * This prevents force-close by proactively canceling stuck forwarded HTLCs
-	 * when the incoming leg's CLTV minus current height is within 2x safety margin.
+	 * Scan forwarded HTLCs whose incoming CLTV is dangerously close.
+	 *
+	 * BOLT 2 fund-safety: the upstream update_fail_htlc may only be sent once the
+	 * OUTGOING leg is irrevocably resolved as failed. Failing the inbound leg on
+	 * time alone while the outbound leg is still claimable lets the downstream
+	 * settle its HTLC-success after we already refunded upstream, so we would refund
+	 * A AND pay B. So when the deadline nears with the outbound leg unresolved we
+	 * force-close the INBOUND channel (moving resolution on-chain, where our
+	 * inbound HTLC-success/timeout is the authoritative spend) and RETAIN the
+	 * forward mapping until final resolution, instead of failing off-chain.
 	 */
 	private scanForwardTimeouts(blockHeight: number): void {
 		const doubleMargin = this.htlcSafetyMargin * 2;
@@ -5933,25 +6049,30 @@ export class LightningNode extends EventEmitter {
 				const outKey = this.findOutgoingLeg(channelId, htlc.id);
 				if (!outKey) continue;
 
-				// If incoming CLTV is dangerously close, fail both legs
-				if (htlc.cltvExpiry - blockHeight <= doubleMargin) {
-					// Fail the outgoing leg first
-					const outParts = outKey.split(':');
-					const outChannelIdHex = outParts[0];
-					const outHtlcIdStr = outParts[1]?.replace('offered-', '');
-					if (outChannelIdHex && outHtlcIdStr) {
-						const outChannelId = Buffer.from(outChannelIdHex, 'hex');
-						const outHtlcId = BigInt(outHtlcIdStr);
-						const outHtlcSecretKey = `${outChannelIdHex}:${outHtlcId}`;
-						const outSharedSecret =
-							this.receivedHtlcSharedSecrets.get(outHtlcSecretKey);
-						const outReason = outSharedSecret
-							? createFailureMessage(outSharedSecret, TEMPORARY_CHANNEL_FAILURE)
-							: Buffer.alloc(290);
-						this.channelManager.failHtlc(outChannelId, outHtlcId, outReason);
-					}
+				if (htlc.cltvExpiry - blockHeight > doubleMargin) continue;
 
-					// Fail the incoming leg
+				// Determine the outgoing leg's resolution state. outKey encodes the
+				// outgoing channel + the offered HTLC id we sent downstream.
+				const outParts = outKey.split(':');
+				const outChannelIdHex = outParts[0];
+				const outHtlcIdStr = outParts[1]?.replace('offered-', '');
+				let outgoingFailed = false;
+				if (outChannelIdHex && outHtlcIdStr) {
+					const outChannel = this.channelManager.getChannel(
+						Buffer.from(outChannelIdHex, 'hex')
+					);
+					const outHtlc = outChannel
+						?.getFullState()
+						.htlcs.get(`offered-${outHtlcIdStr}`);
+					// Only an explicitly FAILED outgoing HTLC is safe to refund upstream
+					// for: we owe the downstream nothing. Anything else (still in-flight,
+					// FULFILLED, or already removed/ambiguous) means the downstream can
+					// still legitimately claim, so refunding upstream would double-pay.
+					outgoingFailed = outHtlc?.state === HtlcState.FAILED;
+				}
+
+				if (outgoingFailed) {
+					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const sharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
@@ -5960,12 +6081,25 @@ export class LightningNode extends EventEmitter {
 						: Buffer.alloc(290);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
-
-					// Clean up forward mapping
-					if (outKey) {
-						this.forwardedHtlcs.delete(outKey);
-					}
+					this.forwardedHtlcs.delete(outKey);
+					continue;
 				}
+
+				// Outbound unresolved: never fail upstream on time alone. Force-close
+				// the inbound channel so resolution moves on-chain, and keep the forward
+				// mapping so a late downstream settlement can still be honored.
+				this.emit('node:error', {
+					code: 'FORWARD_TIMEOUT_FORCE_CLOSE',
+					channelId,
+					message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
+					timestamp: Date.now()
+				} as ILightningError);
+				this.channelManager.forceClose(
+					channelId,
+					this.getSweepDestinationScript(),
+					this.resolveForceCloseFeeRatePerVbyte()
+				);
+				break; // channel is closing; stop scanning it
 			}
 		}
 	}
@@ -6421,12 +6555,14 @@ export class LightningNode extends EventEmitter {
 					if (hashHex) {
 						this.failPayment(Buffer.from(hashHex, 'hex'));
 					}
-					// Fail the HTLC on the channel
-					this.channelManager.failHtlc(
-						channelId,
-						htlc.id,
-						createFailureMessage(Buffer.alloc(32), TEMPORARY_CHANNEL_FAILURE)
-					);
+					// This is an OFFERED HTLC: we cannot fail it off-chain (only the
+					// peer or on-chain resolution can remove it). The associated
+					// outbound payment is marked failed above; the on-chain backstop
+					// below force-closes to claim it via the timeout path. Calling
+					// channelManager.failHtlc here (with the offered id) previously fell
+					// through to the received-keyed path and canceled an unrelated
+					// same-id inbound HTLC, refunding upstream while its downstream leg
+					// could still settle.
 				}
 
 				// On-chain backstop: if the peer has not signed away an offered HTLC

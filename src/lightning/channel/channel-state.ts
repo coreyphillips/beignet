@@ -295,6 +295,15 @@ export interface IChannelState {
 	 */
 	isLessor?: boolean;
 	/**
+	 * Cooperative close: the fully-signed mutual-close transaction (hex) we
+	 * broadcast at fee/sig agreement. Persisted so that on restart, while the
+	 * close is still unconfirmed, restoreChainWatches can rebroadcast it and
+	 * keep the funding watch armed. Until the close is irrevocably buried a peer
+	 * could still broadcast a revoked commitment on the funding output, which we
+	 * must be able to detect and punish. Undefined for channels never coop-closed.
+	 */
+	lastCooperativeCloseTxHex?: string;
+	/**
 	 * option_taproot: OUR current MuSig2 verification nonce for our local
 	 * commitment (the peer co-signs our commitment against it; we consume it only
 	 * at force-close). This object is ALSO the secret-nonce handle (the MuSig2
