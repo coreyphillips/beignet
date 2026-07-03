@@ -618,10 +618,10 @@ export class ChainMonitor {
 		actions.push(...this._scanForPreimages(spendingTx));
 
 		// M2: if WE swept one of our own HTLC outputs with a second-level
-		// HTLC-timeout/success tx (its txid == the spend we just saw), that tx
-		// created a fresh CSV-delayed to_local output. Track it and schedule its
-		// sweep to our destination — otherwise the value sits unspent forever even
-		// though the channel reports fully resolved.
+		// HTLC-timeout/success tx, that tx created a fresh CSV-delayed to_local
+		// output. Track it and schedule its sweep to our destination — otherwise
+		// the value sits unspent forever even though the channel reports fully
+		// resolved.
 		if (
 			(output.outputType === OutputType.OFFERED_HTLC ||
 				output.outputType === OutputType.RECEIVED_HTLC) &&
@@ -629,17 +629,51 @@ export class ChainMonitor {
 				CommitmentType.OUR_COMMITMENT &&
 			output.sweepTxHex
 		) {
-			let ourSecondLevelTxid: string | null = null;
+			let isOurSecondLevel = false;
 			try {
-				ourSecondLevelTxid = bitcoin.Transaction.fromHex(
-					output.sweepTxHex
-				).getId();
+				const template = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				if (template.getId() === spendingTx.getId()) {
+					isOurSecondLevel = true;
+				} else {
+					// Anchor channels: the broadcast second-level tx had wallet fee
+					// inputs attached (htlc-fee-attach), which changes its txid. It is
+					// still OURS if input 0 spends the same HTLC outpoint with the
+					// identical pre-signed witness as the retained zero-fee template
+					// (SIGHASH_SINGLE|ANYONECANPAY keeps that input/witness unchanged).
+					// Without this match the fee-bumped HTLC tx's CSV output would
+					// never be tracked or swept.
+					const tIn = template.ins[0];
+					const sIn = spendingTx.ins[0];
+					// Output 0 must ALSO be the expected second-level CSV output:
+					// byte-equal script and exact value versus the pre-signed
+					// template. The SIGHASH_SINGLE|ANYONECANPAY witness already binds
+					// output 0 cryptographically for any script-valid transaction,
+					// but adoption should not depend on that sighash reasoning
+					// holding across future code paths or unvalidated sightings —
+					// explicit output validation makes it self-contained.
+					const tOut = template.outs[0];
+					const sOut = spendingTx.outs[0];
+					isOurSecondLevel =
+						!!tIn &&
+						!!sIn &&
+						Buffer.from(tIn.hash).equals(Buffer.from(sIn.hash)) &&
+						tIn.index === sIn.index &&
+						tIn.witness.length > 0 &&
+						tIn.witness.length === sIn.witness.length &&
+						tIn.witness.every((w, i) =>
+							Buffer.from(w).equals(Buffer.from(sIn.witness[i]))
+						) &&
+						!!tOut &&
+						!!sOut &&
+						tOut.value === sOut.value &&
+						Buffer.from(tOut.script).equals(Buffer.from(sOut.script));
+				}
 			} catch {
-				ourSecondLevelTxid = null;
+				isOurSecondLevel = false;
 			}
-			if (ourSecondLevelTxid === spendingTx.getId()) {
+			if (isOurSecondLevel) {
 				const already = this._trackedOutputs.some(
-					(o) => o.txid === ourSecondLevelTxid && o.outputIndex === 0
+					(o) => o.txid === spendingTx.getId() && o.outputIndex === 0
 				);
 				if (!already) {
 					const r = resolveSecondLevelHtlcOutput(
