@@ -106,6 +106,7 @@ import {
 	fforSkimFeeMsat,
 	fforVoucherHtlcId
 } from '../ffor/settlement';
+import { IFforTowerClient, buildTowerFetchRequest } from '../ffor/tower';
 import { encode as encodeBolt11Invoice } from '../invoice/encode';
 import { Network } from '../invoice/types';
 import {
@@ -239,10 +240,27 @@ export class ChannelManager extends EventEmitter {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	/**
+	 * FFOR Variant B (spec §9.4): the tower client used by the settlement peer
+	 * (S) to obtain a preimage release before settling a delegated payment
+	 * upstream. Without it, variant-B epochs cannot settle (S has no preimage).
+	 */
+	private _fforTowerClient: IFforTowerClient | null = null;
+	/** In-flight variant-B releases keyed by "channelIdHex:seq" (serialize). */
+	private _fforPendingReleases = new Set<string>();
 
 	constructor(config: IChannelManagerConfig) {
 		super();
 		this.config = config;
+	}
+
+	/**
+	 * FFOR Variant B: provide the tower client S uses to request preimage
+	 * releases (spec §9.4). The transport is out of scope; the client is any
+	 * IFforTowerClient (in-process loopback in tests, HTTPS/onion in prod).
+	 */
+	setFforTowerClient(client: IFforTowerClient | null): void {
+		this._fforTowerClient = client;
 	}
 
 	/**
@@ -3136,6 +3154,68 @@ export class ChannelManager extends EventEmitter {
 		);
 	}
 
+	/**
+	 * R side, Variant B recovery (spec §9.4/§11.1): fetch all packages +
+	 * preimages from the tower and ingest them into the epoch (validated with
+	 * the §9.4 checklist). Used when S has vanished — the tower is R's
+	 * independent copy. On success the channel is ready for fforForceClose().
+	 * Requires the node private key (the fetch is authenticated by R's node
+	 * key). `crossCheck` optionally passes S's replayed packages for the
+	 * discrepancy check (§12.2) when S is present.
+	 */
+	async fforRecoverFromTower(
+		channelId: Buffer,
+		tower: IFforTowerClient,
+		crossCheck?: Buffer[]
+	): Promise<ChannelResult> {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const epoch = channel.getFforEpoch();
+		if (!epoch || epoch.role !== 'recipient') {
+			const error = 'No recipient FFOR epoch on this channel';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const nodeKey = this.config.nodePrivateKey;
+		if (!nodeKey) {
+			const error = 'FFOR tower recovery requires a node private key';
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		let resp;
+		try {
+			resp = await tower.fetch(buildTowerFetchRequest(epoch.epochId, nodeKey));
+		} catch (err) {
+			const error = `tower fetch failed: ${
+				err instanceof Error ? err.message : String(err)
+			}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		if (!resp.ok) {
+			const error = `tower fetch rejected: ${resp.error}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const ingest = channel.fforIngestTowerPackages(
+			resp.packages,
+			resp.preimages,
+			undefined,
+			crossCheck
+		);
+		if (!ingest.ok) {
+			this.emit('error', channelId, `tower recovery: ${ingest.error}`);
+			return { ok: false, actions: [], error: ingest.error };
+		}
+		this.emit('channel:persist', channelId);
+		return { ok: true, actions: [] };
+	}
+
 	private handleFforSettlementMsg(peerPubkey: string, payload: Buffer): void {
 		const { channelId } = decodeFforHeader(payload);
 		const channel = this.findChannelByChannelId(channelId);
@@ -3201,10 +3281,7 @@ export class ChannelManager extends EventEmitter {
 				if (
 					!epoch ||
 					epoch.role !== 'settlement_peer' ||
-					epoch.state !== FforEpochState.FF_EPOCH ||
-					// Variant B settlement routes preimage release through the tower
-					// (M4); only variant A settles locally.
-					epoch.params.variant !== FforVariant.A
+					epoch.state !== FforEpochState.FF_EPOCH
 				) {
 					continue;
 				}
@@ -3212,13 +3289,26 @@ export class ChannelManager extends EventEmitter {
 					h.equals(entry.paymentHash)
 				);
 				if (idx < 0) continue;
-				this._fforSettleDelegated(
-					upstreamChannel,
-					entry,
-					epochChannel,
-					epoch,
-					idx
-				);
+				if (epoch.params.variant === FforVariant.A) {
+					this._fforSettleDelegated(
+						upstreamChannel,
+						entry,
+						epochChannel,
+						epoch,
+						idx
+					);
+				} else {
+					// Variant B (spec §9.2/§9.4): the preimage release is gated by
+					// the tower. Fire-and-forget (like the anchor fee-bump path);
+					// serialized per seq so a re-scan does not double-dispatch.
+					void this._fforSettleDelegatedViaTower(
+						upstreamChannel,
+						entry,
+						epochChannel,
+						epoch,
+						idx
+					);
+				}
 				break;
 			}
 		}
@@ -3343,6 +3433,154 @@ export class ChannelManager extends EventEmitter {
 		);
 		epoch.upstreamFulfilled[hashIndex] = true;
 		this.emit('channel:persist', epochChannelId);
+	}
+
+	/**
+	 * Variant B settlement (spec §9.2/§9.4): build the package, persist it, send
+	 * it to the tower, and settle upstream ONLY after ff_release returns the
+	 * preimage. A tower rejection or the absence of a client means S has no
+	 * preimage and MUST fail the payment upstream. Idempotent by seq: a re-scan
+	 * after an S crash re-requests the release (the tower is idempotent) and
+	 * fulfills once the preimage is back.
+	 */
+	private async _fforSettleDelegatedViaTower(
+		upstreamChannel: Channel,
+		htlc: IHtlcEntry,
+		epochChannel: Channel,
+		epoch: IFforEpochStateData,
+		hashIndex: number
+	): Promise<void> {
+		const epochChannelId = epochChannel.getChannelId()!;
+		const seq = hashIndex + 1;
+		const releaseKey = `${epochChannelId.toString('hex')}:${seq}`;
+		if (this._fforPendingReleases.has(releaseKey)) return;
+
+		// Already released: fulfill upstream if it never went out (crash between
+		// tower release and upstream settle), else fail the duplicate part.
+		if (seq <= epoch.lastSeq) {
+			if (epoch.upstreamFulfilled[hashIndex]) {
+				this._fforFailUpstream(
+					upstreamChannel,
+					htlc.id,
+					`duplicate delegated payment for consumed hash H_${seq}`
+				);
+				return;
+			}
+			const preimage = epoch.preimages[hashIndex];
+			if (preimage && preimage.length === 32) {
+				this.fulfillHtlc(upstreamChannel.getChannelId()!, htlc.id, preimage);
+				epoch.upstreamFulfilled[hashIndex] = true;
+				this.emit('channel:persist', epochChannelId);
+				return;
+			}
+			// Package released at the tower but the preimage was lost (crash before
+			// storing it) — re-request below.
+		} else if (seq !== epoch.lastSeq + 1) {
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				`out-of-order delegated payment: hash H_${seq} before H_${
+					epoch.lastSeq + 1
+				}`
+			);
+			return;
+		}
+
+		const tower = this._fforTowerClient;
+		if (!tower) {
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				'variant B settlement requires a tower client (none configured)'
+			);
+			return;
+		}
+		const signer = epochChannel.getSigner();
+		const nodeKey = this.config.nodePrivateKey;
+		if (!signer || !nodeKey) {
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				'no signer/node key for settlement package'
+			);
+			return;
+		}
+
+		this._fforPendingReleases.add(releaseKey);
+		try {
+			// New package: run §8 checks, then build + PERSIST it before asking
+			// the tower (mirrors §9.2 ordering: S commits the package first).
+			let payload: Buffer;
+			if (seq > epoch.lastSeq) {
+				const checkErr = fforSettlementCheckError(
+					epochChannel.getFullState(),
+					epoch,
+					seq,
+					htlc.amountMsat,
+					htlc.cltvExpiry,
+					this._currentBlockHeight
+				);
+				if (checkErr) {
+					this._fforFailUpstream(upstreamChannel, htlc.id, checkErr);
+					return;
+				}
+				epoch.htlcAmountsMsat[hashIndex] = htlc.amountMsat;
+				epoch.voucherAmountsMsat[hashIndex] =
+					htlc.amountMsat - fforSkimFeeMsat(epoch, htlc.amountMsat);
+				const built = buildSettlementPackage({
+					base: epochChannel.getFullState(),
+					signer,
+					epoch,
+					channelId: epochChannelId,
+					seq,
+					signFn: (digest: Buffer): Buffer => sign(digest, nodeKey)
+				});
+				payload = built.payload;
+				epoch.packages[hashIndex] = payload;
+				epoch.lastSeq = seq;
+				this.emit('channel:persist', epochChannelId);
+			} else {
+				// Re-request an already-built package (crash replay).
+				payload = epoch.packages[hashIndex];
+			}
+
+			const release = await tower.requestRelease(payload);
+			if (!release.ok) {
+				// The tower refused: S has no preimage, so it MUST fail upstream
+				// (spec §9.4 / §11.4). The persisted package stays for audit; the
+				// hash is marked consumed so the failed part is not retried into a
+				// second tower round.
+				this._fforFailUpstream(
+					upstreamChannel,
+					htlc.id,
+					`tower rejected settlement ${seq}: ${release.error}`
+				);
+				return;
+			}
+			// Store the released preimage durably, THEN settle upstream.
+			epoch.preimages[hashIndex] = Buffer.from(release.preimage);
+			this.emit('channel:persist', epochChannelId);
+			this.fulfillHtlc(
+				upstreamChannel.getChannelId()!,
+				htlc.id,
+				release.preimage
+			);
+			epoch.upstreamFulfilled[hashIndex] = true;
+			this.emit('channel:persist', epochChannelId);
+		} catch (err) {
+			// A transport failure/timeout leaves S without the preimage: fail
+			// the payment upstream (spec §11.4). The persisted package lets a
+			// later retry re-request the (idempotent) release.
+			this._fforFailUpstream(
+				upstreamChannel,
+				htlc.id,
+				`tower release failed for settlement ${seq}: ${
+					err instanceof Error ? err.message : String(err)
+				}`
+			);
+		} finally {
+			this._fforPendingReleases.delete(releaseKey);
+		}
 	}
 
 	/**

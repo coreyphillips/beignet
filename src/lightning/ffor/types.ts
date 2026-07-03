@@ -160,6 +160,13 @@ export interface IFforEpochStateData {
 	 * (how many packages to expect in replay) from S's value.
 	 */
 	peerLastSeq: number | null;
+	/**
+	 * S side: per_commitment_secret_S[n0], the seq-1 pre-revocation (§9.1 TLV 1,
+	 * REQUIRED both variants). Variant A: this also equals P_1 (§7.2 binding) so
+	 * it doubles as preimages[0]. Variant B: the tower's P_1 is unrelated, so S
+	 * keeps its own n0 secret here. Undefined on R (R never signs packages).
+	 */
+	sRevocationSecretN0?: Buffer;
 }
 
 /**

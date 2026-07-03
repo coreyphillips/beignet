@@ -449,6 +449,7 @@ export interface ISerializedFforEpoch {
 	nR?: string;
 	rPreEpochPoint?: string | null;
 	peerLastSeq?: number | null;
+	sRevocationSecretN0?: string | null;
 }
 
 export function serializeFforEpoch(
@@ -496,7 +497,8 @@ export function serializeFforEpoch(
 		frozenFeeratePerKw: f.frozenFeeratePerKw,
 		nR: bigintToStr(f.nR),
 		rPreEpochPoint: bufToHex(f.rPreEpochPoint),
-		peerLastSeq: f.peerLastSeq
+		peerLastSeq: f.peerLastSeq,
+		sRevocationSecretN0: bufToHex(f.sRevocationSecretN0 ?? null)
 	};
 }
 
@@ -547,7 +549,8 @@ export function deserializeFforEpoch(
 		frozenFeeratePerKw: s.frozenFeeratePerKw ?? 0,
 		nR: s.nR !== undefined ? strToBigint(s.nR) : 0n,
 		rPreEpochPoint: hexToBuf(s.rPreEpochPoint ?? null),
-		peerLastSeq: s.peerLastSeq ?? null
+		peerLastSeq: s.peerLastSeq ?? null,
+		sRevocationSecretN0: hexToBuf(s.sRevocationSecretN0 ?? null) ?? undefined
 	};
 }
 

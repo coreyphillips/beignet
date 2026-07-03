@@ -5001,7 +5001,15 @@ export class Channel {
 		}
 		if (
 			this._state.state !== ChannelState.FF_EPOCH &&
-			this._state.state !== ChannelState.NORMAL
+			this._state.state !== ChannelState.NORMAL &&
+			// Variant B recovery (spec §9.4): when S has vanished R never
+			// reconnects, so the channel stays AWAITING_REESTABLISH after its
+			// pre-force-close disconnect. Force-closing the adopted C_j^R is R's
+			// only exit; the pre-reestablish state was the live FF_EPOCH.
+			!(
+				this._state.state === ChannelState.AWAITING_REESTABLISH &&
+				this._state.preReestablishState === ChannelState.FF_EPOCH
+			)
 		) {
 			return `cannot prepare FFOR force-close in ${this._state.state}`;
 		}
@@ -5022,6 +5030,117 @@ export class Channel {
 		}
 		this._fforAdoptCj(pkg.commitmentSig, pkg.htlcSigs);
 		return null;
+	}
+
+	/**
+	 * R side, Variant B recovery (spec §9.4): ingest the packages + preimages
+	 * fetched from the tower when S is gone. Each package is validated with the
+	 * same §9.4 checklist R uses during replay (shared validateSettlementPackage,
+	 * not duplicated); on success it is stored as signed evidence and its
+	 * preimage retained. After ingesting through seq j the channel is ready for
+	 * fforPrepareForceClose()/fforForceClose(). Idempotent: packages at or below
+	 * the current lastSeq are re-verified for byte-equality but not re-adopted.
+	 *
+	 * `crossCheck`, when provided, is S's replayed copy of each package (from a
+	 * reconnect that DID happen): any mismatch is signed evidence (§12.2) and
+	 * aborts the ingest.
+	 */
+	fforIngestTowerPackages(
+		packages: Buffer[],
+		preimages: Buffer[],
+		remoteNodeId?: Buffer,
+		crossCheck?: Buffer[]
+	): { ok: boolean; error?: string; adopted: number } {
+		const epoch = this._state.ffor;
+		if (!epoch || epoch.role !== 'recipient') {
+			return { ok: false, error: 'no recipient FFOR epoch', adopted: 0 };
+		}
+		if (!this._signer) {
+			return {
+				ok: false,
+				error: 'no signer for package validation',
+				adopted: 0
+			};
+		}
+		if (preimages.length !== packages.length) {
+			return {
+				ok: false,
+				error: 'tower returned mismatched package/preimage counts',
+				adopted: 0
+			};
+		}
+		const sPointN0 = this._state.remoteCurrentPerCommitmentPoint;
+		if (!sPointN0) {
+			return {
+				ok: false,
+				error: 'missing S per-commitment point at n0',
+				adopted: 0
+			};
+		}
+		for (let i = 0; i < packages.length; i++) {
+			const seq = i + 1;
+			const payload = packages[i];
+			if (crossCheck && crossCheck[i] && !crossCheck[i].equals(payload)) {
+				return {
+					ok: false,
+					error: `tower package ${seq} differs from S's replay (signed evidence)`,
+					adopted: epoch.lastSeq
+				};
+			}
+			if (seq <= epoch.lastSeq) {
+				// Already ingested: require byte-equality (idempotent replay).
+				if (!epoch.packages[i]?.equals(payload)) {
+					return {
+						ok: false,
+						error: `tower package ${seq} differs from the stored copy`,
+						adopted: epoch.lastSeq
+					};
+				}
+				continue;
+			}
+			const result = validateSettlementPackage({
+				base: this._state,
+				signer: this._signer,
+				epoch,
+				payload,
+				remoteNodeId: remoteNodeId ?? epoch.remoteNodeId ?? Buffer.alloc(33),
+				sPerCommitmentPointN0: sPointN0,
+				currentBlockHeight: this._currentBlockHeight
+			});
+			if (!result.ok || !result.msg) {
+				return {
+					ok: false,
+					error: result.error ?? `invalid tower package ${seq}`,
+					adopted: epoch.lastSeq
+				};
+			}
+			// The provided preimage must actually match the package's hash.
+			const provided = preimages[i];
+			if (
+				!provided ||
+				!crypto
+					.createHash('sha256')
+					.update(provided)
+					.digest()
+					.equals(result.msg.paymentHash)
+			) {
+				return {
+					ok: false,
+					error: `tower preimage ${seq} does not hash to H_${seq}`,
+					adopted: epoch.lastSeq
+				};
+			}
+			epoch.packages[i] = Buffer.from(payload);
+			epoch.preimages[i] = Buffer.from(provided);
+			epoch.lastSeq = seq;
+			if (seq === 1 && result.msg.revocationSecretN0) {
+				this._state.shaChainStore.addSecret(
+					MAX_INDEX - epoch.sCommitmentNumber!,
+					result.msg.revocationSecretN0
+				);
+			}
+		}
+		return { ok: true, adopted: epoch.lastSeq };
 	}
 
 	/** R side: adopt C_j^R, then build + send ff_reconcile (§11.1 step 2). */

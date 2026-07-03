@@ -464,18 +464,24 @@ export class FforEpoch {
 			return reject(err);
 		}
 
-		// Variant A: S generates the preimage set P_1…P_K and retains it durably
-		// (§9.2). H_1 MUST equal SHA256(per_commitment_secret_S[n0]) so the
-		// upstream claim of payment 1 is itself the revocation of C_{n0}^S
-		// (§7.2/§12.1) — i.e. P_1 IS that secret.
+		// S always keeps its own per_commitment_secret_S[n0] — the seq-1
+		// pre-revocation carried in every settlement package's TLV 1 (§9.1),
+		// required in BOTH variants (§9.3/§12.1).
+		if (!ctx.localPerCommitmentSecretN0) {
+			return reject(
+				'cannot accept FFOR epoch: per_commitment_secret_S[n0] unavailable'
+			);
+		}
+		const sRevocationSecretN0 = Buffer.from(ctx.localPerCommitmentSecretN0);
+
+		// Variant A: S also generates the preimage set P_1…P_K and retains it
+		// durably (§9.2). H_1 MUST equal SHA256(per_commitment_secret_S[n0]) so
+		// the upstream claim of payment 1 is itself the revocation of C_{n0}^S
+		// (§7.2/§12.1) — i.e. P_1 IS that secret. Variant B: the tower holds the
+		// preimages; S never sees them until ff_release.
 		const preimages: Buffer[] = [];
 		if (params.variant === FforVariant.A) {
-			if (!ctx.localPerCommitmentSecretN0) {
-				return reject(
-					'cannot accept variant-A epoch: per_commitment_secret_S[n0] unavailable'
-				);
-			}
-			preimages.push(Buffer.from(ctx.localPerCommitmentSecretN0));
+			preimages.push(Buffer.from(sRevocationSecretN0));
 			for (let i = 1; i < params.maxPayments; i++) {
 				preimages.push(crypto.randomBytes(32));
 			}
@@ -524,7 +530,8 @@ export class FforEpoch {
 					: null
 			),
 			preimages,
-			sHtlcIdBase: ctx.localNextHtlcId ?? 0n
+			sHtlcIdBase: ctx.localNextHtlcId ?? 0n,
+			sRevocationSecretN0
 		};
 
 		return {

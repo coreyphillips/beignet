@@ -240,7 +240,10 @@ export function buildSettlementPackage(args: {
 		commitmentSig: signature,
 		htlcSigs: htlcSignatures,
 		// §9.1 TLV 1: the pre-revocation, REQUIRED in seq 1 (both variants).
-		revocationSecretN0: seq === 1 ? epoch.preimages[0] : undefined,
+		// S keeps per_commitment_secret_S[n0] in sRevocationSecretN0; in
+		// variant A that equals preimages[0] (the §7.2 binding).
+		revocationSecretN0:
+			seq === 1 ? epoch.sRevocationSecretN0 ?? epoch.preimages[0] : undefined,
 		// Variant A TLV 3 (P_1 IS per_commitment_secret_S[n0], §12.1).
 		preimage:
 			epoch.params.variant === FforVariant.A
