@@ -2539,6 +2539,10 @@ export class Channel {
 			// BOLT 1 prescription for a received error.
 			this._state.state !== ChannelState.ERRORED &&
 			this._state.state !== ChannelState.SPLICING &&
+			// FFOR (spec §11.1 step 6 / §12.1): R's unilateral exit from an
+			// epoch is force-closing its adopted C_j^R (fforPrepareForceClose
+			// grafts the packages first); the pre-epoch commitment when j = 0.
+			this._state.state !== ChannelState.FF_EPOCH &&
 			// Re-running on FORCE_CLOSED rebuilds the byte-identical commitment
 			// (deterministic signatures): the rebroadcast path when the first
 			// broadcast never reached the network. If it confirmed meanwhile the
@@ -4963,6 +4967,63 @@ export class Channel {
 		return this._fforAdoptAndReconcile(msg.commitmentSig, msg.htlcSigs);
 	}
 
+	/**
+	 * R side: graft the validated C_j^R onto the live channel state so it is
+	 * the force-closeable current commitment (the package signatures ARE the
+	 * counterparty material a force-close needs — R never ran a commitment
+	 * dance for these). Idempotent. Shared by the reconcile flow and the
+	 * unilateral on-chain fallback (spec §11.1 step 6 / §12.1 "refuse
+	 * reconciliation" row).
+	 */
+	private _fforAdoptCj(commitmentSig: Buffer, htlcSigs: Buffer[]): void {
+		const epoch = this._state.ffor!;
+		const j = epoch.lastSeq;
+		if (this._state.localCommitmentNumber === epoch.nR + BigInt(j) && j > 0) {
+			return; // already adopted
+		}
+		adoptVouchersIntoLiveState(this._state, epoch, 'recipient');
+		this._state.localCommitmentNumber = epoch.nR + BigInt(j);
+		this._state.remoteCommitmentSignature = Buffer.from(commitmentSig);
+		this._state.remoteHtlcSignatures = htlcSigs.map((s) => Buffer.from(s));
+	}
+
+	/**
+	 * R side, on-chain enforcement (M3): make the channel force-closeable with
+	 * C_j^R from FF_EPOCH/FF_RECONCILE — used when S stalls/refuses
+	 * reconciliation or a protocol violation arrives after ff_begin. Adopts
+	 * the latest validated package if the reconcile flow has not already done
+	 * so. Returns an error string when there is nothing enforceable.
+	 */
+	fforPrepareForceClose(): string | null {
+		const epoch = this._state.ffor;
+		if (!epoch || epoch.role !== 'recipient') {
+			return 'no recipient FFOR epoch on this channel';
+		}
+		if (
+			this._state.state !== ChannelState.FF_EPOCH &&
+			this._state.state !== ChannelState.NORMAL
+		) {
+			return `cannot prepare FFOR force-close in ${this._state.state}`;
+		}
+		if (epoch.lastSeq === 0) {
+			// No settlements: the pre-epoch commitment is already current and
+			// force-closeable as-is.
+			return null;
+		}
+		const pkgPayload = epoch.packages[epoch.lastSeq - 1];
+		if (!pkgPayload) {
+			return `missing settlement package ${epoch.lastSeq}`;
+		}
+		let pkg;
+		try {
+			pkg = decodeFforSettlementMessage(pkgPayload);
+		} catch (e) {
+			return `undecodable stored package: ${(e as Error).message}`;
+		}
+		this._fforAdoptCj(pkg.commitmentSig, pkg.htlcSigs);
+		return null;
+	}
+
 	/** R side: adopt C_j^R, then build + send ff_reconcile (§11.1 step 2). */
 	private _fforAdoptAndReconcile(
 		commitmentSig: Buffer,
@@ -4986,10 +5047,7 @@ export class Channel {
 		}
 
 		// Graft the vouchers onto the live state: our commitment becomes C_j^R.
-		adoptVouchersIntoLiveState(this._state, epoch, 'recipient');
-		this._state.localCommitmentNumber = epoch.nR + BigInt(j);
-		this._state.remoteCommitmentSignature = Buffer.from(commitmentSig);
-		this._state.remoteHtlcSignatures = htlcSigs.map((s) => Buffer.from(s));
+		this._fforAdoptCj(commitmentSig, htlcSigs);
 
 		// Sign S's catch-up commitment C^S_new, mirroring C_j^R (same j
 		// vouchers, S-offered). The live state now describes exactly that world.

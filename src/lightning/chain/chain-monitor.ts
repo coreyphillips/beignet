@@ -629,17 +629,38 @@ export class ChainMonitor {
 				CommitmentType.OUR_COMMITMENT &&
 			output.sweepTxHex
 		) {
-			let ourSecondLevelTxid: string | null = null;
+			let isOurSecondLevel = false;
 			try {
-				ourSecondLevelTxid = bitcoin.Transaction.fromHex(
-					output.sweepTxHex
-				).getId();
+				const template = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				if (template.getId() === spendingTx.getId()) {
+					isOurSecondLevel = true;
+				} else {
+					// Anchor channels: the broadcast second-level tx had wallet fee
+					// inputs attached (htlc-fee-attach), which changes its txid. It is
+					// still OURS if input 0 spends the same HTLC outpoint with the
+					// identical pre-signed witness as the retained zero-fee template
+					// (SIGHASH_SINGLE|ANYONECANPAY keeps that input/witness unchanged).
+					// Without this match the fee-bumped HTLC tx's CSV output would
+					// never be tracked or swept.
+					const tIn = template.ins[0];
+					const sIn = spendingTx.ins[0];
+					isOurSecondLevel =
+						!!tIn &&
+						!!sIn &&
+						Buffer.from(tIn.hash).equals(Buffer.from(sIn.hash)) &&
+						tIn.index === sIn.index &&
+						tIn.witness.length > 0 &&
+						tIn.witness.length === sIn.witness.length &&
+						tIn.witness.every((w, i) =>
+							Buffer.from(w).equals(Buffer.from(sIn.witness[i]))
+						);
+				}
 			} catch {
-				ourSecondLevelTxid = null;
+				isOurSecondLevel = false;
 			}
-			if (ourSecondLevelTxid === spendingTx.getId()) {
+			if (isOurSecondLevel) {
 				const already = this._trackedOutputs.some(
-					(o) => o.txid === ourSecondLevelTxid && o.outputIndex === 0
+					(o) => o.txid === spendingTx.getId() && o.outputIndex === 0
 				);
 				if (!already) {
 					const r = resolveSecondLevelHtlcOutput(

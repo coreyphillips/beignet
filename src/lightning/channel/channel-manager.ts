@@ -3061,6 +3061,79 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleFforError(payload);
 		this.processActions(peerPubkey, channel, actions);
+
+		// Spec §11.1: during EPOCH/RECONCILE the channel falls back to ON-CHAIN
+		// enforcement rather than aborting — for the recipient that means
+		// force-closing its adopted C_j^R (M3). The settlement peer MUST NOT
+		// broadcast anything (§9.3: its only signed state is revoked), so no
+		// fallback fires on that side. Requires a configured wallet destination
+		// script; without one we surface the instruction instead of guessing a
+		// sweep destination.
+		const epoch = channel.getFforEpoch();
+		if (
+			channel.getState() === ChannelState.FF_EPOCH &&
+			epoch &&
+			epoch.role === 'recipient' &&
+			(epoch.state === FforEpochState.FF_EPOCH ||
+				epoch.state === FforEpochState.FF_RECONCILE)
+		) {
+			if (this._walletDestinationScript) {
+				this.fforForceClose(channelId, this._walletDestinationScript);
+			} else {
+				this.emit(
+					'error',
+					channelId,
+					'FFOR: ff_error during the epoch requires on-chain enforcement; call fforForceClose with a destination script'
+				);
+			}
+		}
+	}
+
+	/**
+	 * R side, on-chain enforcement (M3, spec §11.1 step 6 / §12.1): force-close
+	 * with the adopted voucher commitment C_j^R. Works both post-reconciliation
+	 * (S stalls voucher conversion) and straight from FF_EPOCH after package
+	 * replay (S refuses to reconcile) — the packages are the counterparty
+	 * signatures. Feeds every package preimage to the chain monitors so each
+	 * voucher's HTLC-success claim is buildable.
+	 */
+	fforForceClose(
+		channelId: Buffer,
+		destinationScript: Buffer,
+		feeRatePerVbyte = 10,
+		network?: import('bitcoinjs-lib').Network
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const epoch = channel.getFforEpoch();
+		if (epoch && epoch.role === 'recipient') {
+			const prepErr = channel.fforPrepareForceClose();
+			if (prepErr) {
+				this.emit('error', channelId, `FFOR force-close: ${prepErr}`);
+				return { ok: false, actions: [], error: prepErr };
+			}
+			// Voucher preimages (from the validated packages) let the monitor
+			// build each HTLC-success claim; recordPreimage seeds every monitor,
+			// including the one forceClose() is about to create.
+			for (let k = 0; k < epoch.lastSeq; k++) {
+				const preimage = epoch.preimages[k];
+				if (preimage && preimage.length === 32) {
+					this.recordPreimage(epoch.params.paymentHashes![k], preimage);
+				}
+			}
+			this.emit('channel:persist', channelId);
+		}
+		return this.forceClose(
+			channelId,
+			destinationScript,
+			feeRatePerVbyte,
+			network
+		);
 	}
 
 	private handleFforSettlementMsg(peerPubkey: string, payload: Buffer): void {

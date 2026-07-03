@@ -198,12 +198,30 @@ export function classifyCommitmentTx(
 	const matchesLocal = commitmentNumber === state.localCommitmentNumber;
 	const matchesRemote = commitmentNumber === state.remoteCommitmentNumber;
 
+	// FFOR pre-revocation (specs/ffor-offline-receive.md §9.3): the settlement
+	// peer reveals per_commitment_secret_S[n0] in settlement package 1 WITHOUT
+	// its commitment number advancing, so a commitment can be revoked while the
+	// state machine still calls that index "current". More generally: we never
+	// hold the revocation secret for a genuinely-live remote commitment, so a
+	// stored secret at this index is proof of revocation regardless of the
+	// number comparison. Without this, a broadcast C_{n0}^S during an FFOR
+	// epoch would be misread as THEIR_CURRENT and never penalized.
+	const secretAtIndex = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+
 	if (matchesLocal && matchesRemote) {
 		// Both commitment numbers are equal — differentiate by comparing
 		// the to_local output script against expected local vs remote commitment.
 		// On our commitment, to_local uses our delayed key with their revocation.
 		// On their commitment, to_local uses their delayed key with our revocation.
 		const type = disambiguateCommitmentTx(tx, state, commitmentNumber);
+		if (type === CommitmentType.THEIR_CURRENT_COMMITMENT && secretAtIndex) {
+			return {
+				type: CommitmentType.THEIR_REVOKED_COMMITMENT,
+				commitmentNumber
+			};
+		}
 		return { type, commitmentNumber };
 	}
 
@@ -234,6 +252,14 @@ export function classifyCommitmentTx(
 	}
 
 	if (matchesRemote) {
+		// A held secret at the "current" remote index means it was pre-revoked
+		// (FFOR §9.3) — route to the penalty path, never treat as current.
+		if (secretAtIndex) {
+			return {
+				type: CommitmentType.THEIR_REVOKED_COMMITMENT,
+				commitmentNumber
+			};
+		}
 		return { type: CommitmentType.THEIR_CURRENT_COMMITMENT, commitmentNumber };
 	}
 
