@@ -1285,7 +1285,10 @@ export function resolveSecondLevelHtlcOutput(
 				outputType: OutputType.TO_LOCAL,
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight,
-				witnessScript: sl.output
+				witnessScript: sl.output,
+				// Tag so a later rebuild reconstructs the second-level tree (revocation
+				// internal + single delay leaf), not the commitment to_local tree.
+				isSecondLevelHtlc: true
 			},
 			spendTx: sweepTx,
 			witness: [sig, sl.delay.script, sl.delay.controlBlock],
@@ -1407,11 +1410,22 @@ function resolveOurTaprootCommitmentOutputs(
 	const resolved: IResolvedOutput[] = [];
 	for (const output of trackedOutputs) {
 		if (output.outputType === OutputType.TO_LOCAL) {
-			const toLocal = buildTaprootToLocalOutput(
-				keys.revocationPubkey,
-				keys.delayedPubkey,
-				toSelfDelay
-			);
+			// A second-level-derived output uses the TaprootSecondLevelScriptTree
+			// (revocation-key internal + single delay leaf), NOT the commitment
+			// to_local tree (NUMS internal + delay/revoke leaves). Reconstruct the
+			// matching one or the prevout scriptPubKey + control block are wrong and
+			// the sweep is invalid (stranding the second-level funds on rebuild).
+			const toLocal = output.isSecondLevelHtlc
+				? buildTaprootSecondLevelOutput(
+						keys.revocationPubkey,
+						keys.delayedPubkey,
+						toSelfDelay
+				  )
+				: buildTaprootToLocalOutput(
+						keys.revocationPubkey,
+						keys.delayedPubkey,
+						toSelfDelay
+				  );
 			const feeSatoshis = BigInt(
 				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
 			);
