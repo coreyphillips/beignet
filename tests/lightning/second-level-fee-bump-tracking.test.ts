@@ -327,4 +327,42 @@ describe('Fee-bumped second-level HTLC tracking (anchor channels)', function () 
 			.find((o) => o.txid === foreign.getId() && o.outputIndex === 0);
 		expect(tracked).to.equal(undefined);
 	});
+
+	it('does NOT adopt a spend with a matching input-0 witness but tampered output 0 (value)', function () {
+		const t = setup();
+		// Same prevout, byte-identical pre-signed input-0 witness, wallet fee
+		// input attached, but output 0 carries the wrong value: adoption must be
+		// rejected by the explicit output-0 validation.
+		const tampered = feeBumpedVariant(t.successTx);
+		tampered.outs[0].value = t.successTx.outs[0].value - 1_000;
+		t.monitor.handleOutputSpent(
+			t.commitmentTx.getId(),
+			t.htlcOutputIndex,
+			tampered,
+			102
+		);
+		const tracked = t.monitor
+			.getTrackedOutputs()
+			.find((o) => o.txid === tampered.getId() && o.outputIndex === 0);
+		expect(tracked).to.equal(undefined);
+	});
+
+	it('does NOT adopt a spend with a matching input-0 witness but tampered output 0 (script)', function () {
+		const t = setup();
+		const tampered = feeBumpedVariant(t.successTx);
+		tampered.outs[0].script = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			Buffer.alloc(20, 0x0f)
+		]);
+		t.monitor.handleOutputSpent(
+			t.commitmentTx.getId(),
+			t.htlcOutputIndex,
+			tampered,
+			102
+		);
+		const tracked = t.monitor
+			.getTrackedOutputs()
+			.find((o) => o.txid === tampered.getId() && o.outputIndex === 0);
+		expect(tracked).to.equal(undefined);
+	});
 });

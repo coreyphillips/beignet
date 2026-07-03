@@ -644,6 +644,15 @@ export class ChainMonitor {
 					// never be tracked or swept.
 					const tIn = template.ins[0];
 					const sIn = spendingTx.ins[0];
+					// Output 0 must ALSO be the expected second-level CSV output:
+					// byte-equal script and exact value versus the pre-signed
+					// template. The SIGHASH_SINGLE|ANYONECANPAY witness already binds
+					// output 0 cryptographically for any script-valid transaction,
+					// but adoption should not depend on that sighash reasoning
+					// holding across future code paths or unvalidated sightings —
+					// explicit output validation makes it self-contained.
+					const tOut = template.outs[0];
+					const sOut = spendingTx.outs[0];
 					isOurSecondLevel =
 						!!tIn &&
 						!!sIn &&
@@ -653,7 +662,11 @@ export class ChainMonitor {
 						tIn.witness.length === sIn.witness.length &&
 						tIn.witness.every((w, i) =>
 							Buffer.from(w).equals(Buffer.from(sIn.witness[i]))
-						);
+						) &&
+						!!tOut &&
+						!!sOut &&
+						tOut.value === sOut.value &&
+						Buffer.from(tOut.script).equals(Buffer.from(sOut.script));
 				}
 			} catch {
 				isOurSecondLevel = false;
