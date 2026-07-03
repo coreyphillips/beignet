@@ -120,8 +120,12 @@ describe('Amount-aware MissionControl', () => {
 		const fullPenalty = mc.getPenalty('abc');
 		const alsoFull = mc.getPenalty('abc', 1_000_000n);
 
-		// Both should be the same (no amount scaling when undefined)
-		expect(Number(fullPenalty)).to.equal(Number(alsoFull));
+		// Both should be the same (no amount scaling when undefined). Allow a
+		// 1-sat tolerance: getPenalty applies a time-decay from Date.now(), so
+		// two calls a fraction of a millisecond apart can floor to adjacent
+		// integers. Amount scaling, which this asserts is absent, would change
+		// the penalty by tens of thousands, not one.
+		expect(Number(fullPenalty)).to.be.closeTo(Number(alsoFull), 2);
 	});
 
 	it('getPenalty for amount larger than failure gives full penalty', () => {
@@ -131,8 +135,10 @@ describe('Amount-aware MissionControl', () => {
 		const fullPenalty = mc.getPenalty('abc', 500_000n);
 		const largerPenalty = mc.getPenalty('abc', 1_000_000n);
 
-		// When current amount >= failure amount, no reduction
-		expect(Number(largerPenalty)).to.equal(Number(fullPenalty));
+		// When current amount >= failure amount, no reduction. Allow a 1-sat
+		// tolerance for the Date.now() time-decay between the two calls (see the
+		// note above); a real amount reduction would be far larger.
+		expect(Number(largerPenalty)).to.be.closeTo(Number(fullPenalty), 2);
 	});
 
 	it('amount-aware penalty scales linearly with ratio', () => {
