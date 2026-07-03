@@ -87,7 +87,11 @@ import {
 import { IChannelBasepoints } from '../keys/derivation';
 import { FeatureFlags, Feature } from '../features/flags';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
-import { perCommitmentPointFromSecret } from '../keys/derivation';
+import {
+	perCommitmentPointFromSecret,
+	deriveRevocationPubkey,
+	deriveRevocationPrivkey
+} from '../keys/derivation';
 import { ChannelSigner } from '../keys/signer';
 import {
 	signRemoteCommitment,
@@ -100,7 +104,7 @@ import {
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
-import { FforEpoch, validateFforEpochParams } from '../ffor/epoch';
+import { FforEpoch, validateFforEpochParams, escapeCount } from '../ffor/epoch';
 import {
 	FforEpochState,
 	IFforChannelContext,
@@ -125,6 +129,18 @@ import {
 	buildVoucherStateClone,
 	validateSettlementPackage
 } from '../ffor/settlement';
+import {
+	IEscapeChannelContext,
+	buildEscapeSet,
+	buildEscapeCommitment,
+	signEscape,
+	verifyEscapeSig,
+	finalizeEscapeForBroadcast,
+	matchEscapeBroadcast,
+	buildEscapeRClaim,
+	buildEscapeRevocation
+} from '../ffor/escape';
+import { Transaction } from 'bitcoinjs-lib';
 import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -4387,7 +4403,164 @@ export class Channel {
 				this._state.localPerCommitmentSeed,
 				this._state.localCommitmentNumber
 			),
-			localNextHtlcId: this._state.localHtlcCounter
+			localNextHtlcId: this._state.localHtlcCounter,
+			// FFOR escapes (§7.4/§10): R signs, S verifies (Appendix B).
+			buildEscapeSigs: (params: IFforEpochParams): Buffer[] => {
+				const ectx = this._buildEscapeContext();
+				if (!ectx || !this._signer) {
+					throw new Error(
+						'cannot sign escapes: missing channel context/signer'
+					);
+				}
+				const set = buildEscapeSet(
+					ectx,
+					params.budgetMsat,
+					params.escapeGranularityMsat
+				);
+				return set.map((e) => signEscape(e, this._signer!));
+			},
+			verifyEscapeSigs: (
+				params: IFforEpochParams,
+				sigs: Buffer[]
+			): string | null => {
+				const ectx = this._buildEscapeContext();
+				if (!ectx) return 'cannot verify escapes: missing channel context';
+				const set = buildEscapeSet(
+					ectx,
+					params.budgetMsat,
+					params.escapeGranularityMsat
+				);
+				if (sigs.length !== set.length) {
+					return `escape sig count ${sigs.length} != J = ${set.length}`;
+				}
+				const rFundingPubkey = ectx.rBasepoints.fundingPubkey;
+				for (let j = 0; j < set.length; j++) {
+					if (!verifyEscapeSig(set[j], sigs[j], rFundingPubkey)) {
+						return `escape signature ${
+							j + 1
+						} does not verify against R's funding pubkey`;
+					}
+				}
+				return null;
+			}
+		};
+	}
+
+	/**
+	 * Snapshot the FROZEN pre-epoch state the escape set is built/signed against
+	 * (§10, Appendix B), so an escape can still be rebuilt/recognized after
+	 * reconciliation moves the live balances and per-commitment points. Called
+	 * once at setup completion (both sides), only when G > 0.
+	 */
+	private _captureEscapeFrozenState(): void {
+		const st = this._state;
+		const epoch = st.ffor;
+		if (!epoch || epoch.params.escapeGranularityMsat <= 0n) return;
+		if (epoch.preEpochSLocalMsat !== undefined) return; // already captured
+		if (epoch.role === 'recipient') {
+			if (!st.remoteNextPerCommitmentPoint) return;
+			epoch.preEpochSLocalMsat = st.remoteBalanceMsat;
+			epoch.preEpochRLocalMsat = st.localBalanceMsat;
+			epoch.sPointN0Plus1 = Buffer.from(st.remoteNextPerCommitmentPoint);
+			epoch.sIsOpener = st.role === ChannelRole.ACCEPTOR;
+			epoch.sToSelfDelay = st.localConfig.toSelfDelay;
+		} else {
+			const n0 = epoch.sCommitmentNumber ?? st.localCommitmentNumber;
+			epoch.preEpochSLocalMsat = st.localBalanceMsat;
+			epoch.preEpochRLocalMsat = st.remoteBalanceMsat;
+			epoch.sPointN0Plus1 = getPerCommitmentPoint(
+				st.localPerCommitmentSeed,
+				n0 + 1n
+			);
+			epoch.sIsOpener = st.role === ChannelRole.OPENER;
+			epoch.sToSelfDelay = st.remoteConfig.toSelfDelay;
+		}
+	}
+
+	/**
+	 * Build the escape context (Appendix B). Prefers the FROZEN snapshot stored
+	 * in the epoch (survives reconciliation); falls back to live state before
+	 * the snapshot is taken (setup, when balances still equal pre-epoch). S is
+	 * always the commitment holder; the framing (which side is S) depends on our
+	 * role. Returns null when not ready.
+	 */
+	private _buildEscapeContext(): IEscapeChannelContext | null {
+		const st = this._state;
+		if (!st.fundingTxid || !st.remoteBasepoints || !st.channelId) return null;
+		const epoch = st.ffor;
+		const weAreRecipient = epoch ? epoch.role === 'recipient' : true;
+
+		// Frozen snapshot (post-setup) — authoritative once captured.
+		if (
+			epoch &&
+			epoch.preEpochSLocalMsat !== undefined &&
+			epoch.sPointN0Plus1
+		) {
+			return {
+				fundingTxid: st.fundingTxid,
+				fundingOutputIndex: st.fundingOutputIndex,
+				fundingSatoshis: st.fundingSatoshis,
+				sIsOpener:
+					epoch.sIsOpener ??
+					(weAreRecipient
+						? st.role === ChannelRole.ACCEPTOR
+						: st.role === ChannelRole.OPENER),
+				sBasepoints: weAreRecipient ? st.remoteBasepoints : st.localBasepoints,
+				rBasepoints: weAreRecipient ? st.localBasepoints : st.remoteBasepoints,
+				sPerCommitmentPointN0Plus1: epoch.sPointN0Plus1,
+				n0: epoch.sCommitmentNumber ?? 0n,
+				preEpochSLocalMsat: epoch.preEpochSLocalMsat,
+				preEpochRLocalMsat: epoch.preEpochRLocalMsat!,
+				sToSelfDelay:
+					epoch.sToSelfDelay ??
+					(weAreRecipient
+						? st.localConfig.toSelfDelay
+						: st.remoteConfig.toSelfDelay),
+				frozenFeeratePerKw: epoch.frozenFeeratePerKw,
+				voucherExpiry: epoch.params.voucherExpiry
+			};
+		}
+
+		if (weAreRecipient) {
+			// Setup-time: S is the remote party; S's point at n0+1 = remote NEXT.
+			const sPointN0Plus1 = st.remoteNextPerCommitmentPoint;
+			if (!sPointN0Plus1) return null;
+			return {
+				fundingTxid: st.fundingTxid,
+				fundingOutputIndex: st.fundingOutputIndex,
+				fundingSatoshis: st.fundingSatoshis,
+				sIsOpener: st.role === ChannelRole.ACCEPTOR,
+				sBasepoints: st.remoteBasepoints,
+				rBasepoints: st.localBasepoints,
+				sPerCommitmentPointN0Plus1: sPointN0Plus1,
+				n0: epoch?.sCommitmentNumber ?? st.remoteCommitmentNumber,
+				preEpochSLocalMsat: st.remoteBalanceMsat,
+				preEpochRLocalMsat: st.localBalanceMsat,
+				sToSelfDelay: st.localConfig.toSelfDelay,
+				frozenFeeratePerKw:
+					epoch?.frozenFeeratePerKw ?? st.localConfig.feeratePerKw,
+				voucherExpiry: epoch?.params.voucherExpiry ?? 0
+			};
+		}
+		const n0 = epoch?.sCommitmentNumber ?? st.localCommitmentNumber;
+		return {
+			fundingTxid: st.fundingTxid,
+			fundingOutputIndex: st.fundingOutputIndex,
+			fundingSatoshis: st.fundingSatoshis,
+			sIsOpener: st.role === ChannelRole.OPENER,
+			sBasepoints: st.localBasepoints,
+			rBasepoints: st.remoteBasepoints,
+			sPerCommitmentPointN0Plus1: getPerCommitmentPoint(
+				st.localPerCommitmentSeed,
+				n0 + 1n
+			),
+			n0,
+			preEpochSLocalMsat: st.localBalanceMsat,
+			preEpochRLocalMsat: st.remoteBalanceMsat,
+			sToSelfDelay: st.remoteConfig.toSelfDelay,
+			frozenFeeratePerKw:
+				epoch?.frozenFeeratePerKw ?? st.localConfig.feeratePerKw,
+			voucherExpiry: epoch?.params.voucherExpiry ?? 0
 		};
 	}
 
@@ -4687,6 +4860,9 @@ export class Channel {
 		}
 		if (result.ok && result.enteredEpoch) {
 			this._state.state = ChannelState.FF_EPOCH;
+			// Snapshot the pre-epoch state the escapes were signed against
+			// (§10, Appendix B) — survives reconciliation for later escape ops.
+			this._captureEscapeFrozenState();
 		}
 		return this._fforResultToActions(result);
 	}
@@ -4751,6 +4927,9 @@ export class Channel {
 		}
 		if (result.ok && result.enteredEpoch) {
 			this._state.state = ChannelState.FF_EPOCH;
+			// Snapshot the pre-epoch state the escapes were signed against
+			// (§10, Appendix B) — survives reconciliation for later escape ops.
+			this._captureEscapeFrozenState();
 		}
 		return this._fforResultToActions(result);
 	}
@@ -5030,6 +5209,227 @@ export class Channel {
 		}
 		this._fforAdoptCj(pkg.commitmentSig, pkg.htlcSigs);
 		return null;
+	}
+
+	/**
+	 * S side, escape broadcast (spec §10, Appendix B): build the fully-witnessed
+	 * escape E_j for `j` (the caller computes j = ceil(owed/G), rounding up) and
+	 * return it ready to broadcast. Applies the 2-of-2 funding witness from S's
+	 * own signature + R's pre-supplied escape signature. The height/reconcile
+	 * preconditions are enforced by the manager (it holds the tip); this method
+	 * only constructs the transaction.
+	 */
+	fforBuildEscapeForBroadcast(j: number): {
+		ok: boolean;
+		error?: string;
+		txHex?: string;
+		voucherValueSat?: bigint;
+	} {
+		const epoch = this._state.ffor;
+		if (!epoch || epoch.role !== 'settlement_peer') {
+			return { ok: false, error: 'no settlement-peer FFOR epoch' };
+		}
+		if (epoch.params.escapeGranularityMsat <= 0n) {
+			return { ok: false, error: 'epoch has no escapes (G = 0)' };
+		}
+		if (!this._signer || !this._state.remoteBasepoints) {
+			return { ok: false, error: 'channel not ready to sign the escape' };
+		}
+		const J = escapeCount(
+			epoch.params.budgetMsat,
+			epoch.params.escapeGranularityMsat
+		);
+		if (j < 1 || j > J) {
+			return { ok: false, error: `escape index ${j} out of range 1..${J}` };
+		}
+		const rEscapeSig = epoch.escapeSigs[j - 1];
+		if (!rEscapeSig || rEscapeSig.length !== 64) {
+			return { ok: false, error: `missing R escape signature for E_${j}` };
+		}
+		const ectx = this._buildEscapeContext();
+		if (!ectx) {
+			return { ok: false, error: 'cannot build escape context' };
+		}
+		const escape = buildEscapeCommitment(
+			ectx,
+			j,
+			epoch.params.escapeGranularityMsat
+		);
+		if (!verifyEscapeSig(escape, rEscapeSig, ectx.rBasepoints.fundingPubkey)) {
+			return {
+				ok: false,
+				error: `stored R escape signature for E_${j} no longer verifies`
+			};
+		}
+		finalizeEscapeForBroadcast(
+			escape,
+			this._signer,
+			rEscapeSig,
+			ectx.sBasepoints.fundingPubkey,
+			ectx.rBasepoints.fundingPubkey
+		);
+		return {
+			ok: true,
+			txHex: escape.tx.toHex(),
+			voucherValueSat: escape.voucherValueSat
+		};
+	}
+
+	/**
+	 * R side, escape voucher claim (spec §10 path 3, Appendix B.2): a returning
+	 * R with only its seed + the funding outpoint claims the aggregate voucher
+	 * of a broadcast E_j. Uses R's STATIC payment basepoint secret and a
+	 * 1-block CSV. Rebuilds the voucher script from channel statics.
+	 */
+	fforClaimEscapeVoucher(
+		escapeTxHex: string,
+		destinationScript: Buffer,
+		rPaymentBasepointSecret: Buffer,
+		feeSatoshis?: bigint
+	): { ok: boolean; error?: string; txHex?: string } {
+		const ectx = this._buildEscapeContext();
+		if (!ectx) return { ok: false, error: 'cannot build escape context' };
+		const epoch = this._state.ffor;
+		if (!epoch) return { ok: false, error: 'no FFOR epoch on this channel' };
+		let escapeTx;
+		try {
+			escapeTx = Transaction.fromHex(escapeTxHex);
+		} catch (e) {
+			return { ok: false, error: `bad escape tx: ${(e as Error).message}` };
+		}
+		const match = matchEscapeBroadcast(
+			escapeTx,
+			ectx,
+			epoch.params.escapeGranularityMsat
+		);
+		if (!match.isEscape || match.voucherOutputIndex === undefined) {
+			return { ok: false, error: 'transaction is not a recognized escape' };
+		}
+		const claim = buildEscapeRClaim(
+			{
+				escapeTxid: escapeTx.getId(),
+				voucherOutputIndex: match.voucherOutputIndex,
+				voucherValueSat: match.voucherValueSat!,
+				voucherScript: match.voucherScript!,
+				destinationScript,
+				feeSatoshis
+			},
+			rPaymentBasepointSecret
+		);
+		return { ok: true, txHex: claim.toHex() };
+	}
+
+	/**
+	 * R side, stale-escape penalty (spec §B.5 / §12.1): after reconciliation has
+	 * revealed per_commitment_secret_S[n0+1], ANY broadcast E_j is a revoked
+	 * state. Build the justice claim over its aggregate voucher output via
+	 * revocation path 1 (Appendix B.2). The to_local/to_remote outputs of E_j
+	 * are swept by the standard ChainMonitor revoked-commitment path (R holds
+	 * the n0+1 secret in its shachain store); this covers the FFOR-specific
+	 * aggregate voucher the resolver does not otherwise recognize.
+	 */
+	fforPenalizeEscapeVoucher(
+		escapeTxHex: string,
+		destinationScript: Buffer,
+		revocationBasepointSecret: Buffer,
+		feeSatoshis?: bigint
+	): { ok: boolean; error?: string; txHex?: string } {
+		const ectx = this._buildEscapeContext();
+		if (!ectx) return { ok: false, error: 'cannot build escape context' };
+		const epoch = this._state.ffor;
+		if (!epoch) return { ok: false, error: 'no FFOR epoch on this channel' };
+		let escapeTx;
+		try {
+			escapeTx = Transaction.fromHex(escapeTxHex);
+		} catch (e) {
+			return { ok: false, error: `bad escape tx: ${(e as Error).message}` };
+		}
+		const match = matchEscapeBroadcast(
+			escapeTx,
+			ectx,
+			epoch.params.escapeGranularityMsat
+		);
+		if (!match.isEscape || match.voucherOutputIndex === undefined) {
+			return { ok: false, error: 'transaction is not a recognized escape' };
+		}
+		// S's per_commitment_secret[n0+1] — revealed to R at reconciliation
+		// (ff_reconcile_ack TLV 3) and stored in R's shachain.
+		const n0 = epoch.sCommitmentNumber!;
+		const sSecretN0Plus1 = this._state.shaChainStore.getSecret(
+			MAX_INDEX - (n0 + 1n)
+		);
+		if (!sSecretN0Plus1) {
+			return {
+				ok: false,
+				error:
+					'per_commitment_secret_S[n0+1] not known: escape is not (yet) revoked'
+			};
+		}
+		const sPointN0Plus1 = perCommitmentPointFromSecret(sSecretN0Plus1);
+		const revocationSecret = deriveRevocationPrivkey(
+			revocationBasepointSecret,
+			sSecretN0Plus1,
+			ectx.rBasepoints.revocationBasepoint,
+			sPointN0Plus1
+		);
+		const revocationPubkey = deriveRevocationPubkey(
+			ectx.rBasepoints.revocationBasepoint,
+			sPointN0Plus1
+		);
+		const penalty = buildEscapeRevocation(
+			{
+				escapeTxid: escapeTx.getId(),
+				voucherOutputIndex: match.voucherOutputIndex,
+				voucherValueSat: match.voucherValueSat!,
+				voucherScript: match.voucherScript!,
+				destinationScript,
+				feeSatoshis
+			},
+			revocationSecret,
+			revocationPubkey
+		);
+		return { ok: true, txHex: penalty.toHex() };
+	}
+
+	/**
+	 * R side, escape voucher claim from SEED ONLY (spec §10 path 3): a returning
+	 * R that has lost ALL epoch data reconstructs the claim from its seed
+	 * material + the funding outpoint alone — no epoch, no per-commitment
+	 * points. The aggregate voucher's path 3 uses R's static payment basepoint
+	 * and the deterministic voucher script; R needs S's basepoints + point at
+	 * n0+1 (recoverable from S's own broadcast commitment or the channel
+	 * static params R saved before going offline).
+	 */
+	static fforClaimEscapeVoucherStandalone(
+		escapeTxHex: string,
+		ctx: IEscapeChannelContext,
+		granularityMsat: bigint,
+		destinationScript: Buffer,
+		rPaymentBasepointSecret: Buffer,
+		feeSatoshis?: bigint
+	): { ok: boolean; error?: string; txHex?: string } {
+		let escapeTx;
+		try {
+			escapeTx = Transaction.fromHex(escapeTxHex);
+		} catch (e) {
+			return { ok: false, error: `bad escape tx: ${(e as Error).message}` };
+		}
+		const match = matchEscapeBroadcast(escapeTx, ctx, granularityMsat);
+		if (!match.isEscape || match.voucherOutputIndex === undefined) {
+			return { ok: false, error: 'transaction is not a recognized escape' };
+		}
+		const claim = buildEscapeRClaim(
+			{
+				escapeTxid: escapeTx.getId(),
+				voucherOutputIndex: match.voucherOutputIndex,
+				voucherValueSat: match.voucherValueSat!,
+				voucherScript: match.voucherScript!,
+				destinationScript,
+				feeSatoshis
+			},
+			rPaymentBasepointSecret
+		);
+		return { ok: true, txHex: claim.toHex() };
 	}
 
 	/**

@@ -39,7 +39,8 @@ import {
 	decodeFforSettlementMessage,
 	IFforSettlementMessage
 } from './messages';
-import { validateSettlementPackage } from './settlement';
+import { validateSettlementPackage, fforVoucherSumMsat } from './settlement';
+import { IEscapeChannelContext, matchEscapeBroadcast } from './escape';
 import {
 	classifyCommitmentTx,
 	classifyOutputs,
@@ -71,6 +72,16 @@ export interface IFforTowerChannelStatics {
 	n0: bigint;
 	/** S's per-commitment point at n0 (anchors the seq-1 pre-revocation). */
 	sPerCommitmentPointN0: Buffer;
+	/**
+	 * S's per-commitment point at n0+1 (where escapes live). Optional: needed
+	 * only for escape recognition/audit (§10). Absent ⇒ the tower does not
+	 * recognize escapes (it still detects the revoked C_{n0}^S).
+	 */
+	sPerCommitmentPointN0Plus1?: Buffer;
+	/** Whether S is the channel opener/funder (needed to rebuild escapes). */
+	sIsOpener?: boolean;
+	/** S's to_self_delay on its to_local (R's requirement). */
+	sToSelfDelay?: number;
 	/** The frozen epoch feerate (spec §5). */
 	frozenFeeratePerKw: number;
 }
@@ -171,6 +182,20 @@ export interface IFforTowerBreachResult {
 	alert?: string;
 	/** Option (a): fully-witnessed justice transaction(s), ready to broadcast. */
 	justiceTxs: Buffer[];
+	/**
+	 * An escape E_j was broadcast (spec §10). Before reconciliation this is not
+	 * a breach — S's legitimate exit — but the tower audits it against the
+	 * package history: `underBroadcast` flags provable fraud (j·G < owed,
+	 * §12.1). The tower cannot penalize E_j itself (it lacks S's n0+1 secret;
+	 * it stands down at reconciliation), so no justice tx is built here.
+	 */
+	escape?: {
+		j?: number;
+		creditedMsat: bigint;
+		owedMsat: bigint;
+		underBroadcast: boolean;
+		alert: string;
+	};
 }
 
 /** Digest R signs to authenticate a fetch. */
@@ -396,6 +421,50 @@ export class FforTower {
 				i.index === c.fundingOutputIndex
 		);
 		if (!spendsFunding) return none;
+
+		// Escape recognition (§10): if S's n0+1 point was provisioned, check
+		// whether this spend is an escape E_j (it carries the aggregate voucher
+		// output). Escapes before reconciliation are S's legitimate exit; the
+		// tower audits j against the owed value and flags under-broadcast fraud.
+		if (
+			c.sPerCommitmentPointN0Plus1 &&
+			this._prov.params.escapeGranularityMsat > 0n
+		) {
+			const ectx = this._buildEscapeContext();
+			if (ectx) {
+				const match = matchEscapeBroadcast(
+					tx,
+					ectx,
+					this._prov.params.escapeGranularityMsat
+				);
+				if (match.isEscape) {
+					const owedMsat = this._owedMsat();
+					const creditedMsat = match.voucherValueSat
+						? match.voucherValueSat * 1000n
+						: 0n;
+					const underBroadcast = creditedMsat < owedMsat;
+					const alert = underBroadcast
+						? `escape ${tx.getId()} UNDER-broadcast: credited ${creditedMsat} msat < owed ${owedMsat} msat (provable fraud bounded by ${
+								owedMsat - creditedMsat
+						  })`
+						: `escape ${tx.getId()} broadcast (E_${
+								match.j ?? '?'
+						  }), credits R ${creditedMsat} msat ≥ owed ${owedMsat} msat`;
+					return {
+						breach: false,
+						justiceTxs: [],
+						escape: {
+							j: match.j,
+							creditedMsat,
+							owedMsat,
+							underBroadcast,
+							alert
+						}
+					};
+				}
+			}
+		}
+
 		// Before package 1 the tower holds no revocation secret: C_{n0}^S is
 		// still S's legitimate state (§9.3) — nothing to do.
 		if (!this._record.revocationSecretN0Hex) return none;
@@ -460,6 +529,34 @@ export class FforTower {
 	 */
 	private _verifyOnlySigner(): ChannelSigner {
 		return new ChannelSigner(Buffer.alloc(32, 1), Buffer.alloc(32, 1));
+	}
+
+	/** Total voucher value owed to R (Σ v_k over released packages), msat. */
+	private _owedMsat(): bigint {
+		if (!this._epochView) return 0n;
+		return fforVoucherSumMsat(this._epochView, this._epochView.lastSeq);
+	}
+
+	/** Escape context from provisioned statics (§10, Appendix B). */
+	private _buildEscapeContext(): IEscapeChannelContext | null {
+		const c = this._prov!.channel;
+		if (!c.sPerCommitmentPointN0Plus1) return null;
+		return {
+			fundingTxid: c.fundingTxid,
+			fundingOutputIndex: c.fundingOutputIndex,
+			fundingSatoshis: c.fundingSatoshis,
+			sIsOpener: c.sIsOpener ?? !c.rIsOpener,
+			sBasepoints: c.sBasepoints,
+			rBasepoints: c.rBasepoints,
+			sPerCommitmentPointN0Plus1: c.sPerCommitmentPointN0Plus1,
+			n0: c.n0,
+			preEpochSLocalMsat: c.preEpochSLocalMsat,
+			preEpochRLocalMsat: c.preEpochRLocalMsat,
+			sToSelfDelay: c.sToSelfDelay ?? c.sConfig.toSelfDelay,
+			frozenFeeratePerKw: c.frozenFeeratePerKw,
+			voucherExpiry: this._prov!.params.voucherExpiry,
+			network: this._prov!.network
+		};
 	}
 
 	/**

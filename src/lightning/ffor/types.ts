@@ -167,6 +167,21 @@ export interface IFforEpochStateData {
 	 * keeps its own n0 secret here. Undefined on R (R never signs packages).
 	 */
 	sRevocationSecretN0?: Buffer;
+	/**
+	 * Escapes (§10, Appendix B): the FROZEN pre-epoch state the escape set E_j
+	 * was built and signed against. Live channel balances/points move after
+	 * reconciliation, so these must be snapshotted at setup to rebuild/recognize
+	 * an escape later (S broadcast, R claim, stale-escape penalty). Only set
+	 * when G > 0.
+	 */
+	preEpochSLocalMsat?: bigint;
+	preEpochRLocalMsat?: bigint;
+	/** S's per-commitment point at n0+1 (where escapes live). */
+	sPointN0Plus1?: Buffer;
+	/** Whether S is the channel opener/funder (escape fee side). */
+	sIsOpener?: boolean;
+	/** S's to_self_delay on its to_local (R's requirement). */
+	sToSelfDelay?: number;
 }
 
 /**
@@ -188,6 +203,12 @@ export const FFOR_BEGIN_MAX_HEIGHT_SKEW = 6;
  * default min_final_cltv_expiry headroom.
  */
 export const FFOR_SETTLEMENT_SAFETY_DELTA = 40;
+
+/**
+ * Spec §10: S MAY broadcast an escape only when
+ * `current height > D + escape_delay` (recommended escape_delay ≥ 2016).
+ */
+export const FFOR_ESCAPE_DELAY_BLOCKS = 2016;
 
 /**
  * Everything the epoch state machine needs to know about the channel (and the
@@ -238,6 +259,22 @@ export interface IFforChannelContext {
 	localPerCommitmentSecretN0?: Buffer;
 	/** S side: our offered-HTLC counter at epoch start (voucher id base). */
 	localNextHtlcId?: bigint;
+	/**
+	 * R side (§7.4/§10, Appendix B): build R's J funding-key signatures over the
+	 * deterministic escape set E_1..E_J for these params. Returns J compact
+	 * 64-byte sigs. Provided by the Channel (only it holds the statics). Absent
+	 * ⇒ escapes cannot be signed (epoch refused when G > 0).
+	 */
+	buildEscapeSigs?: (params: IFforEpochParams) => Buffer[];
+	/**
+	 * S side: verify R's escape signature set against the deterministic escape
+	 * commitments (Appendix B.1). Returns null when all verify, else a rejection
+	 * reason; S MUST refuse the epoch on any failure.
+	 */
+	verifyEscapeSigs?: (
+		params: IFforEpochParams,
+		sigs: Buffer[]
+	) => string | null;
 }
 
 /** One encoded message for the peer, in send order. */

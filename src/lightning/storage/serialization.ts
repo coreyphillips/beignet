@@ -450,6 +450,11 @@ export interface ISerializedFforEpoch {
 	rPreEpochPoint?: string | null;
 	peerLastSeq?: number | null;
 	sRevocationSecretN0?: string | null;
+	preEpochSLocalMsat?: string | null;
+	preEpochRLocalMsat?: string | null;
+	sPointN0Plus1?: string | null;
+	sIsOpener?: boolean;
+	sToSelfDelay?: number;
 }
 
 export function serializeFforEpoch(
@@ -498,7 +503,18 @@ export function serializeFforEpoch(
 		nR: bigintToStr(f.nR),
 		rPreEpochPoint: bufToHex(f.rPreEpochPoint),
 		peerLastSeq: f.peerLastSeq,
-		sRevocationSecretN0: bufToHex(f.sRevocationSecretN0 ?? null)
+		sRevocationSecretN0: bufToHex(f.sRevocationSecretN0 ?? null),
+		preEpochSLocalMsat:
+			f.preEpochSLocalMsat !== undefined
+				? bigintToStr(f.preEpochSLocalMsat)
+				: null,
+		preEpochRLocalMsat:
+			f.preEpochRLocalMsat !== undefined
+				? bigintToStr(f.preEpochRLocalMsat)
+				: null,
+		sPointN0Plus1: bufToHex(f.sPointN0Plus1 ?? null),
+		sIsOpener: f.sIsOpener,
+		sToSelfDelay: f.sToSelfDelay
 	};
 }
 
@@ -550,7 +566,18 @@ export function deserializeFforEpoch(
 		nR: s.nR !== undefined ? strToBigint(s.nR) : 0n,
 		rPreEpochPoint: hexToBuf(s.rPreEpochPoint ?? null),
 		peerLastSeq: s.peerLastSeq ?? null,
-		sRevocationSecretN0: hexToBuf(s.sRevocationSecretN0 ?? null) ?? undefined
+		sRevocationSecretN0: hexToBuf(s.sRevocationSecretN0 ?? null) ?? undefined,
+		preEpochSLocalMsat:
+			s.preEpochSLocalMsat != null
+				? strToBigint(s.preEpochSLocalMsat)
+				: undefined,
+		preEpochRLocalMsat:
+			s.preEpochRLocalMsat != null
+				? strToBigint(s.preEpochRLocalMsat)
+				: undefined,
+		sPointN0Plus1: hexToBuf(s.sPointN0Plus1 ?? null) ?? undefined,
+		sIsOpener: s.sIsOpener,
+		sToSelfDelay: s.sToSelfDelay
 	};
 }
 

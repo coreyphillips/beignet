@@ -104,9 +104,12 @@ import {
 	buildSettlementPackage,
 	fforSettlementCheckError,
 	fforSkimFeeMsat,
-	fforVoucherHtlcId
+	fforVoucherHtlcId,
+	fforVoucherSumMsat
 } from '../ffor/settlement';
 import { IFforTowerClient, buildTowerFetchRequest } from '../ffor/tower';
+import { escapeJForOwed } from '../ffor/escape';
+import { FFOR_ESCAPE_DELAY_BLOCKS } from '../ffor/types';
 import { encode as encodeBolt11Invoice } from '../invoice/encode';
 import { Network } from '../invoice/types';
 import {
@@ -3152,6 +3155,146 @@ export class ChannelManager extends EventEmitter {
 			feeRatePerVbyte,
 			network
 		);
+	}
+
+	/**
+	 * S side, escape broadcast (spec §10, Appendix B): broadcast the correct
+	 * escape E_j when R never returns. Permitted ONLY when
+	 * `current height > D + escape_delay` AND reconciliation has not begun. j is
+	 * chosen as ceil(owed/G), rounding UP so S bears the rounding cost. Emits
+	 * the fully-witnessed E_j via broadcast:tx and returns its hex.
+	 */
+	fforBroadcastEscape(
+		channelId: Buffer,
+		currentBlockHeight: number,
+		escapeDelay = FFOR_ESCAPE_DELAY_BLOCKS
+	): {
+		ok: boolean;
+		error?: string;
+		txHex?: string;
+		j?: number;
+		voucherValueSat?: bigint;
+	} {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			return { ok: false, error: `Channel not found: ${idHex}` };
+		}
+		const epoch = channel.getFforEpoch();
+		if (!epoch || epoch.role !== 'settlement_peer') {
+			return { ok: false, error: 'no settlement-peer FFOR epoch' };
+		}
+		if (epoch.params.escapeGranularityMsat <= 0n) {
+			return { ok: false, error: 'epoch has no escapes (G = 0)' };
+		}
+		// Precondition 1 (§10): reconciliation must NOT have begun. Once the
+		// epoch is reconciling/closed, S has revealed (or will reveal) the n0+1
+		// secret and any escape is a penalizable revoked state.
+		if (epoch.state !== FforEpochState.FF_EPOCH) {
+			return {
+				ok: false,
+				error: `cannot escape after reconciliation began (epoch state ${epoch.state})`
+			};
+		}
+		// Precondition 2 (§10): height > D + escape_delay.
+		const threshold = epoch.params.settlementDeadline + escapeDelay;
+		if (currentBlockHeight <= threshold) {
+			return {
+				ok: false,
+				error: `escape not permitted until height > D + escape_delay (${threshold}); current ${currentBlockHeight}`
+			};
+		}
+		// owed = Σ v_k over settled seqs; j = ceil(owed/G), rounding UP.
+		const owedMsat = fforVoucherSumMsat(epoch, epoch.lastSeq);
+		const j = escapeJForOwed(owedMsat, epoch.params.escapeGranularityMsat);
+		if (j < 1) {
+			return {
+				ok: false,
+				error: 'nothing owed (owed = 0): no escape needed'
+			};
+		}
+		const built = channel.fforBuildEscapeForBroadcast(j);
+		if (!built.ok || !built.txHex) {
+			this.emit('error', channelId, `FFOR escape: ${built.error}`);
+			return { ok: false, error: built.error };
+		}
+		this.emit('broadcast:tx', Buffer.from(built.txHex, 'hex'));
+		return {
+			ok: true,
+			txHex: built.txHex,
+			j,
+			voucherValueSat: built.voucherValueSat
+		};
+	}
+
+	/**
+	 * R side, escape-voucher claim (spec §10 path 3): claim the aggregate
+	 * voucher of a broadcast E_j to R's wallet, using R's static payment
+	 * basepoint secret (seed-derivable, no epoch data needed for the key).
+	 */
+	fforClaimEscapeVoucher(
+		channelId: Buffer,
+		escapeTxHex: string,
+		destinationScript: Buffer,
+		feeSatoshis?: bigint
+	): { ok: boolean; error?: string; txHex?: string } {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			return { ok: false, error: `Channel not found: ${idHex}` };
+		}
+		const perCh = this.perChannelMonitorKeys(channel);
+		const rPaymentSecret =
+			perCh?.paymentBasepointSecret ?? this.config.paymentBasepointSecret;
+		if (!rPaymentSecret) {
+			return { ok: false, error: 'no payment basepoint secret for R claim' };
+		}
+		const res = channel.fforClaimEscapeVoucher(
+			escapeTxHex,
+			destinationScript,
+			rPaymentSecret,
+			feeSatoshis
+		);
+		if (res.ok && res.txHex) {
+			this.emit('broadcast:tx', Buffer.from(res.txHex, 'hex'));
+		}
+		return res;
+	}
+
+	/**
+	 * R side, stale-escape penalty (spec §B.5 / §12.1): after full
+	 * reconciliation, penalize a broadcast E_j by claiming its aggregate
+	 * voucher via revocation path 1 (the to_local/to_remote are swept by the
+	 * standard revoked-commitment monitor path). Needs R's revocation basepoint
+	 * secret; the n0+1 secret is already in R's shachain from reconciliation.
+	 */
+	fforPenalizeStaleEscape(
+		channelId: Buffer,
+		escapeTxHex: string,
+		destinationScript: Buffer,
+		feeSatoshis?: bigint
+	): { ok: boolean; error?: string; txHex?: string } {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			return { ok: false, error: `Channel not found: ${idHex}` };
+		}
+		const perCh = this.perChannelMonitorKeys(channel);
+		const revSecret =
+			perCh?.revocationBasepointSecret ?? this.config.revocationBasepointSecret;
+		if (!revSecret) {
+			return { ok: false, error: 'no revocation basepoint secret for penalty' };
+		}
+		const res = channel.fforPenalizeEscapeVoucher(
+			escapeTxHex,
+			destinationScript,
+			revSecret,
+			feeSatoshis
+		);
+		if (res.ok && res.txHex) {
+			this.emit('broadcast:tx', Buffer.from(res.txHex, 'hex'));
+		}
+		return res;
 	}
 
 	/**

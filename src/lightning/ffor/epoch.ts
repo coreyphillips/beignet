@@ -178,9 +178,24 @@ export function validateFforEpochParams(
 		);
 	}
 	if (params.escapeGranularityMsat > 0n) {
-		const j = escapeCount(params.budgetMsat, params.escapeGranularityMsat);
+		const G = params.escapeGranularityMsat;
+		// §10 / B.5: G MUST be an integer multiple of 1000 msat (whole-satoshi
+		// aggregate voucher) and ≥ the voucher dust floor (never trimmed).
+		if (G % 1000n !== 0n) {
+			return `escape_granularity_msat ${G} must be a multiple of 1000 msat`;
+		}
+		if (G < dustFloor) {
+			return `escape_granularity_msat ${G} below the voucher dust floor ${dustFloor}`;
+		}
+		const j = escapeCount(params.budgetMsat, G);
 		if (j > 0xffff) {
 			return `escape set too large: ceil(budget/G) = ${j} exceeds 65535`;
+		}
+		// B.5: malformed granularity — J·G must overshoot budget by less than G
+		// (i.e. (J−1)·G < budget). By construction of ceil this always holds; the
+		// guard catches an inconsistent (budget, G) reaching validation.
+		if (BigInt(j) * G - params.budgetMsat >= G) {
+			return `malformed escape granularity: J·G − budget ≥ G (J=${j}, G=${G}, budget=${params.budgetMsat})`;
 		}
 	}
 
@@ -637,15 +652,25 @@ export class FforEpoch {
 			}
 		];
 
-		// ff_escape_sigs (§7.4), iff G > 0.
-		//
-		// TODO(FFOR M3/M5, spec §7.4/§10): construct the deterministic escape
-		// commitments E_1…E_J at S's commitment number n0+1 and SIGN them here.
-		// M1 ships the codec + handshake plumbing only, so zero-filled
-		// placeholder signatures are exchanged and MUST NOT be relied upon.
+		// ff_escape_sigs (§7.4/§10, Appendix B), iff G > 0: R builds the
+		// deterministic escape set E_1…E_J at S's commitment number n0+1 and
+		// signs each with its funding key (SIGHASH_ALL). escape_htlc_sigs stays
+		// empty in v1 (the aggregate voucher needs no second-level tx).
 		if (params.escapeGranularityMsat > 0n) {
-			const j = escapeCount(params.budgetMsat, params.escapeGranularityMsat);
-			this.data.escapeSigs = Array.from({ length: j }, () => Buffer.alloc(64));
+			if (!ctx.buildEscapeSigs) {
+				return this._setupViolation(
+					ctx,
+					'cannot build escape signatures: no escape signer configured'
+				);
+			}
+			try {
+				this.data.escapeSigs = ctx.buildEscapeSigs(params);
+			} catch (e) {
+				return this._setupViolation(
+					ctx,
+					`escape signing failed: ${(e as Error).message}`
+				);
+			}
 			this.data.escapeHtlcSigs = [];
 			sends.push({
 				type: MessageType.FF_ESCAPE_SIGS,
@@ -748,11 +773,9 @@ export class FforEpoch {
 	}
 
 	/**
-	 * S side: store R's escape signature set (§7.4).
-	 *
-	 * TODO(FFOR M3/M5, spec §7.4/§10): verify each signature against the
-	 * deterministic escape commitment E_j it signs. M1 stores them unverified
-	 * (they are zero placeholders until escape construction lands).
+	 * S side (§7.4/§10, Appendix B.1): verify R's escape signature set against
+	 * the deterministic escape commitments, then store it. S MUST refuse the
+	 * epoch on any failure.
 	 */
 	handleEscapeSigs(
 		payload: Buffer,
@@ -796,8 +819,27 @@ export class FforEpoch {
 				`ff_escape_sigs count ${msg.escapeSigs.length} != ceil(budget/G) = ${j}`
 			);
 		}
+		// Appendix B.1: S MUST verify every escape signature before ff_begin and
+		// MUST refuse the epoch on any failure. escape_htlc_sigs MUST be omitted
+		// in v1 (§7.4) — reject if present.
+		if (msg.escapeHtlcSigs && msg.escapeHtlcSigs.length > 0) {
+			return this._setupViolation(
+				ctx,
+				'ff_escape_sigs carries escape_htlc_sigs (MUST be omitted in v1)'
+			);
+		}
+		if (!ctx.verifyEscapeSigs) {
+			return this._setupViolation(
+				ctx,
+				'cannot verify escape signatures: no escape verifier configured'
+			);
+		}
+		const verifyErr = ctx.verifyEscapeSigs(params, msg.escapeSigs);
+		if (verifyErr) {
+			return this._setupViolation(ctx, verifyErr);
+		}
 		this.data.escapeSigs = msg.escapeSigs;
-		this.data.escapeHtlcSigs = msg.escapeHtlcSigs ?? [];
+		this.data.escapeHtlcSigs = [];
 		this.data.state = FforEpochState.FF_SETUP_ESCAPE_SIGS;
 		return ok([]);
 	}
@@ -862,9 +904,13 @@ export class FforEpoch {
 	 * with zero settlements is closed cooperatively with ff_end at any time";
 	 * §11.2 zero-settlement case).
 	 *
-	 * TODO(FFOR M2, spec §11.2): with escapes signed (G > 0) a zero-settlement
-	 * close must still run reconcile step 3 (reveal secret n0+1) to kill the
-	 * escape set. M1's escape sigs are placeholders, so ff_end alone suffices.
+	 * Escapes with G > 0: a plain ff_end is safe for a zero-settlement epoch.
+	 * Nothing is owed, so any E_j S might broadcast pays R j·G ≥ 0 — it only
+	 * OVERPAYS R and costs S for nothing (§12.1). The escapes live at n0+1 and
+	 * die automatically the next time that index is revoked in ordinary
+	 * operation (§12.1 note). A cooperative close after settlements goes through
+	 * reconciliation instead, which reveals per_commitment_secret_S[n0+1] and
+	 * makes every E_j penalizable at once (§11.1 step 3).
 	 */
 	end(ctx: IFforChannelContext): IFforHandleResult {
 		// ff_end closes a zero-settlement epoch directly from FF_EPOCH (§7.5),
