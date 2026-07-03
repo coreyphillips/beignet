@@ -300,7 +300,7 @@ export class ChainMonitor {
 			// The swap must NOT be gated on the recorded spend's apparent burial
 			// depth. The funding outpoint can be spent exactly once per chain, so a
 			// DIFFERENT tx confirming as its spender is itself definitive proof that
-			// the previously recorded commitment was reorged out — no matter how
+			// the previously recorded commitment was reorged out, no matter how
 			// deeply buried its (now stale, never reset after the reorg) recorded
 			// height made it look. Refusing the swap on that stale height (the old
 			// recordedFinal >= IRREVOCABLE_DEPTH guard) let a later revoked

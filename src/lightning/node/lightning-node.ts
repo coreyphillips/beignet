@@ -767,8 +767,8 @@ export class LightningNode extends EventEmitter {
 			// force-closes: the tracking map is in-memory only, so without this a
 			// restart leaves the low-fee commitment package unbumped forever.
 			// rearmCommitmentCpfp resolves its own live-or-floored feerate, so this
-			// MUST run regardless of whether the estimator succeeded — a transient
-			// estimator error or a <=0 sample must not leave the package unbumped.
+			// MUST run regardless of whether the estimator succeeded (a transient
+			// estimator error or a <=0 sample must not leave the package unbumped).
 			const rearmAllCommitmentCpfp = (): void => {
 				for (const { channelId: monitorChannelId } of monitors) {
 					this.channelManager.rearmCommitmentCpfp(
@@ -5967,10 +5967,10 @@ export class LightningNode extends EventEmitter {
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
 
-				// Backstop (HIGH-4): if we hold this inbound HTLC's preimage — either
-				// it is already FULFILLED off-chain (and an adversarial upstream never
-				// acks the removal, leaving it FULFILLED indefinitely) or we learned
-				// the preimage from downstream — our only guaranteed way to collect the
+				// Backstop (HIGH-4): if we hold this inbound HTLC's preimage (either
+				// it is already FULFILLED off-chain, and an adversarial upstream never
+				// acks the removal, leaving it FULFILLED indefinitely, or we learned
+				// the preimage from downstream), our only guaranteed way to collect the
 				// funds is an on-chain HTLC-success. Failing it (below) would forfeit
 				// value we can actually claim. Force-close the inbound channel while a
 				// claim buffer remains before cltv_expiry, so our HTLC-success is the
@@ -6022,7 +6022,7 @@ export class LightningNode extends EventEmitter {
 	 * BOLT 2 fund-safety: the upstream update_fail_htlc may only be sent once the
 	 * OUTGOING leg is irrevocably resolved as failed. Failing the inbound leg on
 	 * time alone while the outbound leg is still claimable lets the downstream
-	 * settle its HTLC-success after we already refunded upstream — we would refund
+	 * settle its HTLC-success after we already refunded upstream, so we would refund
 	 * A AND pay B. So when the deadline nears with the outbound leg unresolved we
 	 * force-close the INBOUND channel (moving resolution on-chain, where our
 	 * inbound HTLC-success/timeout is the authoritative spend) and RETAIN the

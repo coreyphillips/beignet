@@ -1390,7 +1390,7 @@ export class ChannelManager extends EventEmitter {
 			// returns its broadcast/persist actions. Those MUST be processed (mirrors
 			// recordPreimage) or, on a restored monitor whose HTLC-success was seeded
 			// here, the output is marked broadcast but the tx never reaches the network
-			// — and the non-anchor OUR-commitment rebroadcast path used to skip it too.
+			// (and the non-anchor OUR-commitment rebroadcast path used to skip it too).
 			if (actions.length > 0) {
 				this.processChainActions(channelId, actions);
 				produced = true;
