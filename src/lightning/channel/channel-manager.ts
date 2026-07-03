@@ -1385,7 +1385,10 @@ export class ChannelManager extends EventEmitter {
 		const channelId = Buffer.from(channelIdHex, 'hex');
 		let produced = false;
 		for (const [hashHex, preimage] of this._knownPreimages) {
-			const actions = monitor.addPreimage(Buffer.from(hashHex, 'hex'), preimage);
+			const actions = monitor.addPreimage(
+				Buffer.from(hashHex, 'hex'),
+				preimage
+			);
 			// addPreimage mutates the matched HTLC output to SPEND_BROADCAST and
 			// returns its broadcast/persist actions. Those MUST be processed (mirrors
 			// recordPreimage) or, on a restored monitor whose HTLC-success was seeded
@@ -3580,7 +3583,9 @@ export class ChannelManager extends EventEmitter {
 			this.emit('broadcast:tx', tx.toBuffer());
 			// The child was actually emitted: record the paid feerate + height and
 			// clear any prior failure flag, so the retry gate reflects real progress.
-			const pending = this._pendingCommitmentCpfp.get(channelId.toString('hex'));
+			const pending = this._pendingCommitmentCpfp.get(
+				channelId.toString('hex')
+			);
 			if (pending) {
 				pending.lastFeeRate = feeratePerVbyte;
 				pending.broadcastHeight = this._currentBlockHeight;
