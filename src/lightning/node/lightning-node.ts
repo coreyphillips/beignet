@@ -6011,9 +6011,16 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan forwarded HTLCs and fail any whose incoming CLTV is dangerously close.
-	 * This prevents force-close by proactively canceling stuck forwarded HTLCs
-	 * when the incoming leg's CLTV minus current height is within 2x safety margin.
+	 * Scan forwarded HTLCs whose incoming CLTV is dangerously close.
+	 *
+	 * BOLT 2 fund-safety: the upstream update_fail_htlc may only be sent once the
+	 * OUTGOING leg is irrevocably resolved as failed. Failing the inbound leg on
+	 * time alone while the outbound leg is still claimable lets the downstream
+	 * settle its HTLC-success after we already refunded upstream — we would refund
+	 * A AND pay B. So when the deadline nears with the outbound leg unresolved we
+	 * force-close the INBOUND channel (moving resolution on-chain, where our
+	 * inbound HTLC-success/timeout is the authoritative spend) and RETAIN the
+	 * forward mapping until final resolution, instead of failing off-chain.
 	 */
 	private scanForwardTimeouts(blockHeight: number): void {
 		const doubleMargin = this.htlcSafetyMargin * 2;
@@ -6036,16 +6043,30 @@ export class LightningNode extends EventEmitter {
 				const outKey = this.findOutgoingLeg(channelId, htlc.id);
 				if (!outKey) continue;
 
-				// If incoming CLTV is dangerously close, fail both legs
-				if (htlc.cltvExpiry - blockHeight <= doubleMargin) {
-					// NOTE: the outgoing leg is an HTLC WE offered downstream; a
-					// forwarder cannot cancel its own offered HTLC off-chain. The
-					// previous "fail outgoing first" call passed the offered id to the
-					// received-keyed failHtlc path and canceled an unrelated same-id
-					// inbound HTLC on the outgoing channel. It is removed here; the
-					// outbound leg is resolved only by the downstream peer or on-chain.
+				if (htlc.cltvExpiry - blockHeight > doubleMargin) continue;
 
-					// Fail the incoming leg
+				// Determine the outgoing leg's resolution state. outKey encodes the
+				// outgoing channel + the offered HTLC id we sent downstream.
+				const outParts = outKey.split(':');
+				const outChannelIdHex = outParts[0];
+				const outHtlcIdStr = outParts[1]?.replace('offered-', '');
+				let outgoingFailed = false;
+				if (outChannelIdHex && outHtlcIdStr) {
+					const outChannel = this.channelManager.getChannel(
+						Buffer.from(outChannelIdHex, 'hex')
+					);
+					const outHtlc = outChannel
+						?.getFullState()
+						.htlcs.get(`offered-${outHtlcIdStr}`);
+					// Only an explicitly FAILED outgoing HTLC is safe to refund upstream
+					// for: we owe the downstream nothing. Anything else (still in-flight,
+					// FULFILLED, or already removed/ambiguous) means the downstream can
+					// still legitimately claim, so refunding upstream would double-pay.
+					outgoingFailed = outHtlc?.state === HtlcState.FAILED;
+				}
+
+				if (outgoingFailed) {
+					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const sharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
@@ -6054,12 +6075,25 @@ export class LightningNode extends EventEmitter {
 						: Buffer.alloc(290);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
-
-					// Clean up forward mapping
-					if (outKey) {
-						this.forwardedHtlcs.delete(outKey);
-					}
+					this.forwardedHtlcs.delete(outKey);
+					continue;
 				}
+
+				// Outbound unresolved: never fail upstream on time alone. Force-close
+				// the inbound channel so resolution moves on-chain, and keep the forward
+				// mapping so a late downstream settlement can still be honored.
+				this.emit('node:error', {
+					code: 'FORWARD_TIMEOUT_FORCE_CLOSE',
+					channelId,
+					message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
+					timestamp: Date.now()
+				} as ILightningError);
+				this.channelManager.forceClose(
+					channelId,
+					this.getSweepDestinationScript(),
+					this.resolveForceCloseFeeRatePerVbyte()
+				);
+				break; // channel is closing; stop scanning it
 			}
 		}
 	}

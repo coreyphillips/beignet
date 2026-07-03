@@ -344,3 +344,76 @@ describe('Audit HIGH-4: preimage-held inbound HTLC forces a claim close', functi
 		bob.destroy();
 	});
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// HIGH-5: forwarder does not fail inbound on time while outbound unresolved
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit HIGH-5: forward timeout gates on outbound resolution', function () {
+	this.timeout(10_000);
+
+	it('force-closes inbound (not off-chain fail) when outbound leg is unresolved', () => {
+		const alice = createNode(21); // forwarder
+		const bob = createNode(22); // upstream (inbound)
+		const carol = createNode(23); // downstream (outbound)
+		connectNodes(alice, bob);
+		connectNodes(alice, carol);
+		const inChannelId = openReadyChannel(alice, bob);
+		const outChannelId = openReadyChannel(alice, carol);
+
+		const height = 800_000;
+		(alice as any).currentBlockHeight = height;
+
+		// Inbound leg: a received HTLC nearing its cltv_expiry.
+		const inChan = (alice as any).channelManager.getChannel(inChannelId);
+		const inSt = inChan.getFullState();
+		const inbound: IHtlcEntry = {
+			id: 7n,
+			amountMsat: 50_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: height + 5, // within doubleMargin
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED
+		};
+		inSt.htlcs.set('received-7', inbound);
+
+		// Outbound leg: the offered HTLC we forwarded is still UNRESOLVED.
+		const outChan = (alice as any).channelManager.getChannel(outChannelId);
+		const outSt = outChan.getFullState();
+		const outbound: IHtlcEntry = {
+			id: 7n,
+			amountMsat: 49_000n,
+			paymentHash: inbound.paymentHash,
+			cltvExpiry: height - 35,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.OFFERED,
+			state: HtlcState.COMMITTED
+		};
+		outSt.htlcs.set('offered-7', outbound);
+
+		// Link the two legs.
+		const outKey = `${outChannelId.toString('hex')}:offered-7`;
+		(alice as any).forwardedHtlcs.set(outKey, {
+			inChannelId,
+			inHtlcId: 7n
+		});
+
+		let forceClose = false;
+		alice.on('node:error', (err: any) => {
+			if (err.code === 'FORWARD_TIMEOUT_FORCE_CLOSE') forceClose = true;
+		});
+
+		(alice as any).scanForwardTimeouts(height);
+
+		// Before the fix the inbound leg was failed off-chain on time alone and the
+		// mapping deleted, so a late downstream settlement would double-pay.
+		expect(forceClose).to.equal(true);
+		expect((alice as any).forwardedHtlcs.has(outKey)).to.equal(true);
+		expect(inSt.htlcs.get('received-7')!.state).to.not.equal(HtlcState.FAILED);
+
+		alice.destroy();
+		bob.destroy();
+		carol.destroy();
+	});
+});
