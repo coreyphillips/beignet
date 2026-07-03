@@ -286,6 +286,52 @@ export class NetworkGraph {
 		return [...this._nodes.values()];
 	}
 
+	/**
+	 * FFOR M7.4 tower discovery: every node that advertised FFOR tower-service
+	 * terms (node_ann_tlvs 55043) in its node_announcement, with its dial
+	 * address taken from the SAME announcement's `addresses`. A tower with no
+	 * advertised address is still returned (address undefined) so a caller can
+	 * surface it, but it cannot be dialed. Optional filter: candidates serving a
+	 * given variant (bit 0 = A, bit 1 = B) with maxBudgetMsat >= a requested
+	 * amount.
+	 */
+	getTowerNodes(filter?: { variant?: number; minBudgetMsat?: bigint }): Array<{
+		nodeId: Buffer;
+		address?: { type: number; host: string; port: number };
+		terms: import('./types').IFforTowerTerms;
+	}> {
+		const out: Array<{
+			nodeId: Buffer;
+			address?: { type: number; host: string; port: number };
+			terms: import('./types').IFforTowerTerms;
+		}> = [];
+		for (const node of this._nodes.values()) {
+			const terms = node.announcement?.fforTowerTerms;
+			if (!terms) continue;
+			if (
+				filter?.variant !== undefined &&
+				(terms.variants & filter.variant) === 0
+			) {
+				continue;
+			}
+			if (
+				filter?.minBudgetMsat !== undefined &&
+				terms.maxBudgetMsat < filter.minBudgetMsat
+			) {
+				continue;
+			}
+			const addr = node.announcement?.addresses?.[0];
+			out.push({
+				nodeId: Buffer.from(node.nodeId),
+				address: addr
+					? { type: addr.type, host: addr.host, port: addr.port }
+					: undefined,
+				terms
+			});
+		}
+		return out;
+	}
+
 	// ── Gossip Sync Methods (BOLT 7 §4) ────────────────────────────
 
 	/**

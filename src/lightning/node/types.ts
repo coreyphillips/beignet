@@ -129,6 +129,14 @@ export interface INodeConfig {
 	 * advertised alongside the lease rates (node_ann_tlvs type 55007).
 	 */
 	fforTerms?: import('../gossip/types').IFforTerms;
+	/**
+	 * FFOR tower-service advertisement (section 11.3, M7.4 discovery): when set,
+	 * this node advertises itself as a tower in its node_announcement
+	 * (node_ann_tlvs type 55043) so recipients can discover it from gossip. The
+	 * dial address is taken from the node's advertised addresses. Auto-set by
+	 * the --tower CLI path.
+	 */
+	fforTowerTerms?: import('../gossip/types').IFforTowerTerms;
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */

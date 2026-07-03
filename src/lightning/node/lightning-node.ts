@@ -313,6 +313,8 @@ export class LightningNode extends EventEmitter {
 	private alias?: string;
 	private advertisedLeaseRates?: import('../gossip/types').ILeaseRates;
 	private advertisedFforTerms?: import('../gossip/types').IFforTerms;
+	private advertisedFforTowerTerms?: import('../gossip/types').IFforTowerTerms;
+	private advertisedAddresses: import('../gossip/types').INodeAddress[] = [];
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
 	private fundingPrivkey: Buffer;
@@ -391,6 +393,7 @@ export class LightningNode extends EventEmitter {
 		this.alias = config.alias;
 		this.advertisedLeaseRates = config.leaseRates;
 		this.advertisedFforTerms = config.fforTerms;
+		this.advertisedFforTowerTerms = config.fforTowerTerms;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
@@ -1717,7 +1720,28 @@ export class LightningNode extends EventEmitter {
 	 * on restart (the §9.4 failure) — the CLI enforces a durable store; passing a
 	 * MemoryTowerStore here is only for --tower-demo.
 	 */
-	enableTower(store: IFforTowerStore): FforTower {
+	enableTower(
+		store: IFforTowerStore,
+		opts?: {
+			/**
+			 * FFOR M7.4: advertise these tower-service terms in this node's
+			 * node_announcement (node_ann_tlvs 55043) so recipients can discover
+			 * the tower via gossip instead of out-of-band config.
+			 */
+			terms?: import('../gossip/types').IFforTowerTerms;
+			/**
+			 * The dial address to advertise alongside the terms so discoverers can
+			 * derive nodeId@host:port. type: 1=IPv4, 2=IPv6, 4=TorV3.
+			 */
+			address?: { type: number; host: string; port: number };
+		}
+	): FforTower {
+		if (opts?.terms) {
+			this.advertisedFforTowerTerms = opts.terms;
+		}
+		if (opts?.address) {
+			this.setAdvertisedAddress(opts.address);
+		}
 		const tower = new FforTower(store);
 		this._fforTower = tower;
 		this.channelManager.setFforTower(tower);
@@ -1758,6 +1782,55 @@ export class LightningNode extends EventEmitter {
 	/** The embedded tower this node hosts, if any (--tower). */
 	getFforTower(): FforTower | null {
 		return this._fforTower;
+	}
+
+	/**
+	 * Set (replacing) the address advertised in this node's node_announcement.
+	 * Needed so a tower's dial address (nodeId@host:port) travels with its
+	 * FFOR tower-terms TLV for M7.4 discovery. type: 1=IPv4, 2=IPv6, 4=TorV3.
+	 */
+	setAdvertisedAddress(address: {
+		type: number;
+		host: string;
+		port: number;
+	}): void {
+		this.advertisedAddresses = [address];
+	}
+
+	/**
+	 * FFOR M7.4 discovery (R side): towers this node has learned about from
+	 * gossip (their node_announcement carried tower-terms TLV 55043). Each entry
+	 * is { nodeId, address?, terms }; `address` (from the same announcement) is
+	 * what makes the tower dialable via useDiscoveredTower(). Optional filter:
+	 * candidates serving a variant (bit 0 = A, bit 1 = B) with budget >= amount.
+	 */
+	findTowers(filter?: { variant?: number; minBudgetMsat?: bigint }): Array<{
+		nodeId: Buffer;
+		address?: { type: number; host: string; port: number };
+		terms: import('../gossip/types').IFforTowerTerms;
+	}> {
+		return this.graph.getTowerNodes(filter);
+	}
+
+	/**
+	 * FFOR M7.4 (R side): adopt a tower discovered from gossip WITHOUT an
+	 * out-of-band URI. Resolves the tower's dial address from its
+	 * node_announcement in the local graph, then delegates to useTower().
+	 */
+	useDiscoveredTower(nodeIdHex: string): void {
+		const node = this.graph.getNode(Buffer.from(nodeIdHex, 'hex'));
+		if (!node?.announcement?.fforTowerTerms) {
+			throw new Error(
+				'useDiscoveredTower: no FFOR tower terms advertised by ' + nodeIdHex
+			);
+		}
+		const addr = node.announcement.addresses?.[0];
+		if (!addr) {
+			throw new Error(
+				'useDiscoveredTower: tower ' + nodeIdHex + ' advertised no dial address'
+			);
+		}
+		this.useTower(`${nodeIdHex}@${addr.host}:${addr.port}`);
 	}
 
 	/**
@@ -3218,11 +3291,14 @@ export class LightningNode extends EventEmitter {
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
 				alias: aliasBuffer,
-				addresses: [],
+				addresses: this.advertisedAddresses,
 				// Liquidity ads (bLIP-51) + FFOR standing terms (§11.3): a node
-				// selling inbound liquidity advertises both side by side.
+				// selling inbound liquidity advertises both side by side. A tower
+				// node also advertises its tower-service terms (M7.4 discovery);
+				// its dial address is taken from `addresses` above.
 				leaseRates: this.advertisedLeaseRates,
-				fforTerms: this.advertisedFforTerms
+				fforTerms: this.advertisedFforTerms,
+				fforTowerTerms: this.advertisedFforTowerTerms
 			});
 			const sig = signNodeAnnouncement(payload, this.nodePrivkey);
 			sig.copy(payload, 0);

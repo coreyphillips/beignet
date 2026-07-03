@@ -59,10 +59,13 @@ import {
 	ANNOUNCEMENT_SIGNATURES_LENGTH,
 	NODE_ANN_TLV_LEASE_RATES,
 	NODE_ANN_TLV_FFOR_TERMS,
+	NODE_ANN_TLV_FFOR_TOWER_TERMS,
 	encodeLeaseRates,
 	decodeLeaseRates,
 	encodeFforTerms,
-	decodeFforTerms
+	decodeFforTerms,
+	encodeFforTowerTerms,
+	decodeFforTowerTerms
 } from './types';
 import {
 	encodeTlvStream,
@@ -198,6 +201,12 @@ export function encodeNodeAnnouncementMessage(
 			value: encodeFforTerms(msg.fforTerms)
 		});
 	}
+	if (msg.fforTowerTerms) {
+		tlvRecords.push({
+			type: NODE_ANN_TLV_FFOR_TOWER_TERMS,
+			value: encodeFforTowerTerms(msg.fforTowerTerms)
+		});
+	}
 	const tlvBuf =
 		tlvRecords.length > 0 ? encodeTlvStream(tlvRecords) : Buffer.alloc(0);
 
@@ -300,6 +309,10 @@ export function decodeNodeAnnouncementMessage(
 			const fforVal = findTlvRecord(records, NODE_ANN_TLV_FFOR_TERMS);
 			if (fforVal) {
 				result.fforTerms = decodeFforTerms(fforVal);
+			}
+			const towerVal = findTlvRecord(records, NODE_ANN_TLV_FFOR_TOWER_TERMS);
+			if (towerVal) {
+				result.fforTowerTerms = decodeFforTowerTerms(towerVal);
 			}
 		} catch {
 			/* ignore malformed trailing TLVs */

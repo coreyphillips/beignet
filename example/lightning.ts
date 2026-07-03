@@ -30,6 +30,7 @@ export interface ICliArgs {
 	tower?: boolean; // --tower: host an embedded durable tower
 	towerStore?: string; // --tower-store <path>
 	towerDemo?: boolean; // --tower-demo: allow a non-durable memory tower (LOUD)
+	towerAddr?: string; // --tower-addr <host:port>: dial address to advertise (M7.4)
 	useTower?: string; // --use-tower <nodeIdHex@host:port>
 }
 
@@ -44,6 +45,7 @@ export function parseArgs(argv: string[]): ICliArgs {
 	let tower: boolean | undefined;
 	let towerStore: string | undefined;
 	let towerDemo: boolean | undefined;
+	let towerAddr: string | undefined;
 	let useTower: string | undefined;
 	const mnemonicWords: string[] = [];
 
@@ -69,6 +71,8 @@ export function parseArgs(argv: string[]): ICliArgs {
 			towerStore = args[++i];
 		} else if (args[i] === '--tower-demo') {
 			towerDemo = true;
+		} else if (args[i] === '--tower-addr' && i + 1 < args.length) {
+			towerAddr = args[++i];
 		} else if (args[i] === '--use-tower' && i + 1 < args.length) {
 			useTower = args[++i];
 		} else if (NETWORKS.includes(args[i])) {
@@ -91,6 +95,7 @@ export function parseArgs(argv: string[]): ICliArgs {
 		tower,
 		towerStore,
 		towerDemo,
+		towerAddr,
 		useTower
 	};
 }
@@ -197,7 +202,12 @@ function printHelp(): void {
     node.recoverFromTower(channelId)                      R side, on return: fetch + ingest from the tower
     node.towerStatus()                                    Provisioned epochs, released counts, alerts
 
-    CLI: --tower [--tower-store <path>|:memory: --tower-demo]  run a tower node
+  FFOR tower discovery via gossip (M7.4)
+    node.findTowers({ variant?, minBudgetMsat? })         Towers learned from gossip: { nodeId, address, terms }
+    node.useDiscoveredTower(nodeIdHex)                     Adopt a discovered tower (resolves addr from gossip)
+    node.setAdvertisedAddress({ type, host, port })       Advertise this node's dial address in node_announcement
+
+    CLI: --tower [--tower-store <path>|:memory: --tower-demo] [--tower-addr host:port]  run a tower node
          --use-tower nodeIdHex@host:port                       receive offline via a tower
     The tower MUST be a separate always-on node (a node cannot be its own tower);
     provisioning happens up-front, not on crash. A memory store is refused unless
@@ -299,7 +309,10 @@ const runExample = async (
 	mnemonic = generateMnemonic(),
 	alias?: string,
 	torProxy?: string,
-	towerArgs?: Pick<ICliArgs, 'tower' | 'towerStore' | 'towerDemo' | 'useTower'>
+	towerArgs?: Pick<
+		ICliArgs,
+		'tower' | 'towerStore' | 'towerDemo' | 'towerAddr' | 'useTower'
+	>
 ): Promise<void> => {
 	// 1. Set up SQLite persistence
 	const dataDir = path.resolve('example/lightningData');
@@ -361,10 +374,42 @@ const runExample = async (
 			towerArgs,
 			path.join(dataDir, 'tower.db')
 		);
-		node.enableTower(towerStore);
+		// M7.4: advertise sensible default tower-service terms (variant B) in the
+		// node_announcement so recipients can discover this tower from gossip. If
+		// --tower-addr host:port is given, advertise it as the dial address so the
+		// full URI (nodeId@host:port) travels with the terms.
+		let towerAddress: { type: number; host: string; port: number } | undefined;
+		if (towerArgs.towerAddr) {
+			const colon = towerArgs.towerAddr.lastIndexOf(':');
+			if (colon > 0) {
+				const host = towerArgs.towerAddr.slice(0, colon);
+				const port = parseInt(towerArgs.towerAddr.slice(colon + 1), 10);
+				towerAddress = {
+					type: host.includes(':') ? 2 : 1, // 2=IPv6, 1=IPv4
+					host,
+					port
+				};
+			}
+		}
+		node.enableTower(towerStore, {
+			terms: {
+				towerFeeBaseMsat: 1000,
+				towerFeePpm: 0,
+				maxBudgetMsat: 100_000_000n, // 100k sat
+				maxEpochBlocks: 4032, // ~4 weeks
+				variants: 0b10 // bit 1 = variant B (tower-mediated)
+			},
+			address: towerAddress
+		});
 		console.log(
 			'Tower:      ENABLED (embedded), store:',
 			towerArgs.towerStore ?? path.join(dataDir, 'tower.db')
+		);
+		console.log(
+			'Tower advert:',
+			towerAddress
+				? `variant B, addr ${towerAddress.host}:${towerAddress.port}`
+				: 'variant B (no --tower-addr: terms advertised without a dial address)'
 		);
 	}
 	if (towerArgs?.useTower) {
@@ -777,6 +822,7 @@ function main(): void {
 		tower,
 		towerStore,
 		towerDemo,
+		towerAddr,
 		useTower
 	} = parseArgs(process.argv);
 	// The FFOR tower operator flags run on the low-level LightningNode path (that
@@ -806,6 +852,7 @@ function main(): void {
 			tower,
 			towerStore,
 			towerDemo,
+			towerAddr,
 			useTower
 		}).catch(onStartupError);
 	} else {

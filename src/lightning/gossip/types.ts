@@ -69,6 +69,26 @@ export interface IFforTerms {
 	variants: number;
 }
 
+/**
+ * FFOR tower-service advertisement (specs/ffor-offline-receive.md §11.3):
+ * advertised by a TOWER node in its node_announcement so a recipient can
+ * DISCOVER a tower from gossip instead of out-of-band config. The tower's dial
+ * address is taken from the same node_announcement's `addresses` (no separate
+ * field), so the tower URI is nodeId@host:port. Mirrors IFforTerms.
+ */
+export interface IFforTowerTerms {
+	/** Per-settlement flat tower fee, msat (u32). */
+	towerFeeBaseMsat: number;
+	/** Per-settlement proportional tower fee, ppm (u32). */
+	towerFeePpm: number;
+	/** Largest epoch budget this tower will serve, msat (u64). */
+	maxBudgetMsat: bigint;
+	/** Longest epoch this tower will serve: D minus current height, blocks (u16). */
+	maxEpochBlocks: number;
+	/** Bitfield of served variants: bit 0 = A, bit 1 = B (u8). */
+	variants: number;
+}
+
 export interface INodeAnnouncementMessage {
 	signature: Buffer;
 	features: Buffer;
@@ -81,6 +101,8 @@ export interface INodeAnnouncementMessage {
 	leaseRates?: ILeaseRates;
 	/** FFOR standing terms (node_ann_tlvs type 55007, §11.3). */
 	fforTerms?: IFforTerms;
+	/** FFOR tower-service advertisement (node_ann_tlvs type 55043, §11.3). */
+	fforTowerTerms?: IFforTowerTerms;
 }
 
 /** node_ann_tlvs TLV type for the option_will_fund lease-rates record. */
@@ -118,6 +140,46 @@ export function decodeFforTerms(buf: Buffer): IFforTerms {
 	return {
 		ffFeeBaseMsat: buf.readUInt32BE(0),
 		ffFeePpm: buf.readUInt32BE(4),
+		maxBudgetMsat: buf.readBigUInt64BE(8),
+		maxEpochBlocks: buf.readUInt16BE(16),
+		variants: buf.readUInt8(18)
+	};
+}
+
+/**
+ * node_ann_tlvs TLV type for the FFOR tower-service advertisement (§11.3, M7.4
+ * tower discovery). Odd (ignorable). 55043 sits just after the FFOR
+ * tower-transport MESSAGE types (55031-55041) to keep the FFOR-tower numbers
+ * grouped. NOTE: node_announcement TLV space is a SEPARATE namespace from the
+ * peer-message type space (55001-55041), so there is no on-wire collision with
+ * any message type; 55043 is chosen only for human grouping. Spec registry: TBD.
+ */
+export const NODE_ANN_TLV_FFOR_TOWER_TERMS = 55043n;
+
+/** Serialized length of the tower-terms record (4+4+8+2+1). */
+export const FFOR_TOWER_TERMS_LENGTH = 19;
+
+/** Encode the FFOR tower-service advertisement record (§11.3). */
+export function encodeFforTowerTerms(terms: IFforTowerTerms): Buffer {
+	const buf = Buffer.alloc(FFOR_TOWER_TERMS_LENGTH);
+	buf.writeUInt32BE(terms.towerFeeBaseMsat, 0);
+	buf.writeUInt32BE(terms.towerFeePpm, 4);
+	buf.writeBigUInt64BE(terms.maxBudgetMsat, 8);
+	buf.writeUInt16BE(terms.maxEpochBlocks, 16);
+	buf.writeUInt8(terms.variants, 18);
+	return buf;
+}
+
+/** Decode the 19-byte FFOR tower-service advertisement record (§11.3). */
+export function decodeFforTowerTerms(buf: Buffer): IFforTowerTerms {
+	if (buf.length < FFOR_TOWER_TERMS_LENGTH) {
+		throw new Error(
+			`ffor_tower_terms too short: need ${FFOR_TOWER_TERMS_LENGTH} bytes, got ${buf.length}`
+		);
+	}
+	return {
+		towerFeeBaseMsat: buf.readUInt32BE(0),
+		towerFeePpm: buf.readUInt32BE(4),
 		maxBudgetMsat: buf.readBigUInt64BE(8),
 		maxEpochBlocks: buf.readUInt16BE(16),
 		variants: buf.readUInt8(18)
