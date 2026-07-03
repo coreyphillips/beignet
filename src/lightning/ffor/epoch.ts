@@ -73,6 +73,43 @@ export function voucherDustFloorMsat(
 	return (dustLimitSat + successFeeSat) * 1000n;
 }
 
+/**
+ * §11.3: check an ff_init against S's advertised standing terms. Returns null
+ * when acceptable, else the rejection reason. R "echoes" the advertised fee
+ * terms in ff_init; offering MORE than advertised is fine (S only profits),
+ * under-offering, over-budget, unsupported variant, or an epoch longer than
+ * advertised is not.
+ */
+export function fforTermsViolation(
+	params: IFforEpochParams,
+	terms: import('../gossip/types').IFforTerms,
+	currentBlockHeight: number
+): string | null {
+	const variantBit = 1 << (params.variant - 1);
+	if ((terms.variants & variantBit) === 0) {
+		return `variant ${params.variant} not offered (advertised variants bitfield ${terms.variants})`;
+	}
+	if (params.budgetMsat > terms.maxBudgetMsat) {
+		return `budget_msat ${params.budgetMsat} exceeds advertised max_budget_msat ${terms.maxBudgetMsat}`;
+	}
+	if (params.feeBaseMsat < terms.ffFeeBaseMsat) {
+		return `fee_base_msat ${params.feeBaseMsat} below advertised ff_fee_base_msat ${terms.ffFeeBaseMsat}`;
+	}
+	if (params.feeProportionalMillionths < terms.ffFeePpm) {
+		return `fee_proportional_millionths ${params.feeProportionalMillionths} below advertised ff_fee_ppm ${terms.ffFeePpm}`;
+	}
+	if (
+		currentBlockHeight > 0 &&
+		params.settlementDeadline - currentBlockHeight > terms.maxEpochBlocks
+	) {
+		return (
+			`epoch length ${params.settlementDeadline - currentBlockHeight} blocks ` +
+			`exceeds advertised max_epoch_blocks ${terms.maxEpochBlocks}`
+		);
+	}
+	return null;
+}
+
 /** Escape count J = ceil(budget / G) (spec §7.4/§10). Only valid for G > 0. */
 export function escapeCount(
 	budgetMsat: bigint,
@@ -242,6 +279,7 @@ function emptySettlementState(
 	| 'htlcAmountsMsat'
 	| 'voucherAmountsMsat'
 	| 'upstreamFulfilled'
+	| 'upstreamHtlcIds'
 	| 'sHtlcIdBase'
 	| 'frozenFeeratePerKw'
 	| 'nR'
@@ -255,6 +293,7 @@ function emptySettlementState(
 		htlcAmountsMsat: [],
 		voucherAmountsMsat: [],
 		upstreamFulfilled: [],
+		upstreamHtlcIds: [],
 		sHtlcIdBase: 0n,
 		frozenFeeratePerKw,
 		nR,
@@ -477,6 +516,19 @@ export class FforEpoch {
 		);
 		if (err) {
 			return reject(err);
+		}
+
+		// §11.3: when WE advertise standing FFOR terms, the ff_init must fall
+		// within them (variant offered, budget/epoch-length capped, fees echoed).
+		if (ctx.fforTerms) {
+			const termsErr = fforTermsViolation(
+				params,
+				ctx.fforTerms,
+				ctx.currentBlockHeight
+			);
+			if (termsErr) {
+				return reject(`outside advertised FFOR terms: ${termsErr}`);
+			}
 		}
 
 		// S always keeps its own per_commitment_secret_S[n0] — the seq-1

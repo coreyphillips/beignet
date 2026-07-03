@@ -105,6 +105,7 @@ import {
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
 import { FforEpoch, validateFforEpochParams, escapeCount } from '../ffor/epoch';
+import { IFforTerms } from '../gossip/types';
 import {
 	FforEpochState,
 	IFforChannelContext,
@@ -122,7 +123,8 @@ import {
 	decodeFforReconcileAckMessage,
 	encodeFforReconcileAckMessage,
 	decodeFforRevokeBatchMessage,
-	encodeFforRevokeBatchMessage
+	encodeFforRevokeBatchMessage,
+	encodeFforEndMessage
 } from '../ffor/messages';
 import {
 	adoptVouchersIntoLiveState,
@@ -4052,7 +4054,38 @@ export class Channel {
 		// ── Commitment retransmission logic ──
 		// msg.nextCommitmentNumber is the next commitment the peer expects to RECEIVE from us.
 		// We've created up to remoteCommitmentNumber commitments for them.
-		if (msg.nextCommitmentNumber > this._state.remoteCommitmentNumber + 1n) {
+		//
+		// FFOR (spec §8/§11.1): during an epoch, S signs R's fast-forwarded
+		// commitments C_1..C_j INSIDE settlement packages — the live
+		// remoteCommitmentNumber never advances. A reconnect mid-reconcile
+		// (e.g. R crashed after adopting C_j but before ff_reconcile) makes R
+		// legitimately report nR + j (+1): tolerate up to the settled count and
+		// let the reconciliation replay/catch-up close the gap.
+		const fforReest = this._state.ffor;
+		const fforActive =
+			!!fforReest &&
+			fforReest.lastSeq > 0 &&
+			(fforReest.state === FforEpochState.FF_EPOCH ||
+				fforReest.state === FforEpochState.FF_RECONCILE);
+		let fforCommitmentSlack: bigint | null = null;
+		if (fforActive && fforReest!.role === 'settlement_peer') {
+			fforCommitmentSlack = fforReest!.nR + BigInt(fforReest!.lastSeq) + 1n;
+		} else if (fforActive && fforReest!.role === 'recipient') {
+			// Mirror case: S adopts its catch-up commitment (n0+1, or n0+2 with
+			// escapes) inside the reconcile flow — a crash-restored S can report
+			// it before R's own remote counter reflects the catch-up round.
+			fforCommitmentSlack =
+				(fforReest!.sCommitmentNumber ?? 0n) +
+				(fforReest!.escapeSigs.length > 0 ? 2n : 1n) +
+				1n;
+		}
+		if (
+			msg.nextCommitmentNumber > this._state.remoteCommitmentNumber + 1n &&
+			!(
+				fforCommitmentSlack !== null &&
+				msg.nextCommitmentNumber <= fforCommitmentSlack
+			)
+		) {
 			// Peer expects a commitment we've never created — irrecoverable gap
 			return [
 				{
@@ -4370,6 +4403,7 @@ export class Channel {
 		remoteNodeId?: Buffer;
 		signFn?: (digest: Buffer) => Buffer;
 		invoiceFactory?: (paymentHashes: Buffer[]) => string[];
+		fforTerms?: IFforTerms;
 	}): IFforChannelContext {
 		return {
 			channelId: this._state.channelId!,
@@ -4395,6 +4429,7 @@ export class Channel {
 			usedEpochIds: new Set(this._state.fforUsedEpochIds ?? []),
 			remoteNodeId: extras?.remoteNodeId,
 			signFn: extras?.signFn,
+			fforTerms: extras?.fforTerms,
 			invoiceFactory:
 				this._fforInvoiceFactory ?? extras?.invoiceFactory ?? undefined,
 			// Variant A (§7.2): the H_1 binding needs OUR per-commitment secret at
@@ -4464,6 +4499,10 @@ export class Channel {
 			epoch.sPointN0Plus1 = Buffer.from(st.remoteNextPerCommitmentPoint);
 			epoch.sIsOpener = st.role === ChannelRole.ACCEPTOR;
 			epoch.sToSelfDelay = st.localConfig.toSelfDelay;
+			// B.1 step 5 (§11.3): S = the REMOTE party. When S is the bLIP-51
+			// lessor (we are the lessee), its to_local on every E_j keeps the
+			// lease CLTV encumbrance.
+			epoch.sLeaseExpiry = !st.isLessor ? st.leaseExpiry : undefined;
 		} else {
 			const n0 = epoch.sCommitmentNumber ?? st.localCommitmentNumber;
 			epoch.preEpochSLocalMsat = st.localBalanceMsat;
@@ -4474,6 +4513,9 @@ export class Channel {
 			);
 			epoch.sIsOpener = st.role === ChannelRole.OPENER;
 			epoch.sToSelfDelay = st.remoteConfig.toSelfDelay;
+			// B.1 step 5 (§11.3): we ARE S. When we are the lessor, our own
+			// to_local on every E_j keeps the lease CLTV encumbrance.
+			epoch.sLeaseExpiry = st.isLessor ? st.leaseExpiry : undefined;
 		}
 	}
 
@@ -4517,7 +4559,8 @@ export class Channel {
 						? st.localConfig.toSelfDelay
 						: st.remoteConfig.toSelfDelay),
 				frozenFeeratePerKw: epoch.frozenFeeratePerKw,
-				voucherExpiry: epoch.params.voucherExpiry
+				voucherExpiry: epoch.params.voucherExpiry,
+				sLeaseExpiry: epoch.sLeaseExpiry
 			};
 		}
 
@@ -4539,7 +4582,8 @@ export class Channel {
 				sToSelfDelay: st.localConfig.toSelfDelay,
 				frozenFeeratePerKw:
 					epoch?.frozenFeeratePerKw ?? st.localConfig.feeratePerKw,
-				voucherExpiry: epoch?.params.voucherExpiry ?? 0
+				voucherExpiry: epoch?.params.voucherExpiry ?? 0,
+				sLeaseExpiry: !st.isLessor ? st.leaseExpiry : undefined
 			};
 		}
 		const n0 = epoch?.sCommitmentNumber ?? st.localCommitmentNumber;
@@ -4560,7 +4604,8 @@ export class Channel {
 			sToSelfDelay: st.remoteConfig.toSelfDelay,
 			frozenFeeratePerKw:
 				epoch?.frozenFeeratePerKw ?? st.localConfig.feeratePerKw,
-			voucherExpiry: epoch?.params.voucherExpiry ?? 0
+			voucherExpiry: epoch?.params.voucherExpiry ?? 0,
+			sLeaseExpiry: st.isLessor ? st.leaseExpiry : undefined
 		};
 	}
 
@@ -4781,6 +4826,7 @@ export class Channel {
 		extras: {
 			remoteNodeId?: Buffer;
 			signFn?: (digest: Buffer) => Buffer;
+			fforTerms?: IFforTerms;
 		}
 	): ChannelAction[] {
 		let epochId: Buffer;
@@ -5096,6 +5142,24 @@ export class Channel {
 		}
 		if (seqPeek <= epoch.lastSeq) {
 			if (epoch.packages[seqPeek - 1]?.equals(payload)) {
+				// Crash-resume (§11.1): if this duplicate is the LAST package of
+				// the replay and we already hold everything (e.g. R crashed
+				// after adopting C_j but before its ff_reconcile reached S, so S
+				// replays from scratch), re-run the adopt + reconcile answer —
+				// both idempotent — instead of stalling the reconciliation.
+				if (seqPeek === epoch.peerLastSeq && epoch.lastSeq >= seqPeek) {
+					let last;
+					try {
+						last = decodeFforSettlementMessage(
+							epoch.packages[epoch.lastSeq - 1]
+						);
+					} catch (e) {
+						return this._fforProtocolError(
+							`undecodable stored package: ${(e as Error).message}`
+						);
+					}
+					return this._fforAdoptAndReconcile(last.commitmentSig, last.htlcSigs);
+				}
 				return [];
 			}
 			return this._fforProtocolError(
@@ -5496,6 +5560,24 @@ export class Channel {
 						adopted: epoch.lastSeq
 					};
 				}
+				// §11.1 step 6 (variant B): S's replay carries NO preimages (TLV 3
+				// is variant A only) — the tower fetch is where R learns them for
+				// voucher conversion. Retain any preimage we do not hold yet.
+				const held = epoch.preimages[i];
+				const provided = preimages[i];
+				if (
+					(!held || held.length !== 32) &&
+					provided &&
+					provided.length === 32 &&
+					epoch.params.paymentHashes?.[i] &&
+					crypto
+						.createHash('sha256')
+						.update(provided)
+						.digest()
+						.equals(epoch.params.paymentHashes[i])
+				) {
+					epoch.preimages[i] = Buffer.from(provided);
+				}
 				continue;
 			}
 			const result = validateSettlementPackage({
@@ -5639,6 +5721,22 @@ export class Channel {
 			);
 		}
 
+		// Crash-resume idempotency (§11.1): if we already adopted this exact
+		// catch-up (the ack was lost with the connection/process), the live
+		// state no longer matches the pre-adopt clone the signatures verify
+		// against — and nothing NEEDS re-verifying. Re-send the deterministic
+		// ack (same points/secrets, derived from our seed).
+		if (this._state.localCommitmentNumber === newNumber) {
+			epoch.state = FforEpochState.FF_RECONCILE;
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				sendMsg(
+					MessageType.FF_RECONCILE_ACK,
+					this._fforBuildReconcileAck(epoch, j, newNumber)
+				)
+			];
+		}
+
 		// Verify R's signatures against OUR catch-up commitment on a working
 		// clone (the live state is only mutated once everything verifies).
 		const ourPoint = getPerCommitmentPoint(
@@ -5688,7 +5786,23 @@ export class Channel {
 		);
 
 		// ff_reconcile_ack (§11.1 step 3).
-		const ackPayload = encodeFforReconcileAckMessage({
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(
+				MessageType.FF_RECONCILE_ACK,
+				this._fforBuildReconcileAck(epoch, j, newNumber)
+			)
+		];
+	}
+
+	/** Deterministic ff_reconcile_ack payload (§11.1 step 3) — reusable for
+	 *  crash-resume retransmission (everything derives from our seed). */
+	private _fforBuildReconcileAck(
+		epoch: IFforEpochStateData,
+		j: number,
+		newNumber: bigint
+	): Buffer {
+		return encodeFforReconcileAckMessage({
 			channelId: this._state.channelId!,
 			epochId: epoch.epochId,
 			sNextPerCommitmentPoint: getPerCommitmentPoint(
@@ -5712,10 +5826,6 @@ export class Channel {
 					  )
 					: undefined
 		});
-		return [
-			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.FF_RECONCILE_ACK, ackPayload)
-		];
 	}
 
 	/**
@@ -5751,6 +5861,15 @@ export class Channel {
 		}
 		const j = epoch.lastSeq;
 		const newNumber = this._fforCatchupNumber(epoch);
+
+		// Crash-resume idempotency (§11.1): a re-sent ack after we already
+		// processed one (our ff_revoke_batch was lost) must not re-apply the
+		// tracking mutations — remoteNextPerCommitmentPoint has already
+		// advanced, so re-deriving the catch-up point from it would corrupt
+		// the tracking. Just retransmit the deterministic revoke batch.
+		if (this._state.remoteCommitmentNumber === newNumber) {
+			return this._fforBuildRevokeBatchActions(epoch, j);
+		}
 
 		// j == 0: the n0 secret arrives here (it never went out in a package).
 		if (j === 0) {
@@ -5810,6 +5929,15 @@ export class Channel {
 
 		// ff_revoke_batch (§11.1 step 4): our secrets for the skipped indexes
 		// n_R … n_R + j − 1 (pre-epoch state + every superseded C_k^R).
+		return this._fforBuildRevokeBatchActions(epoch, j);
+	}
+
+	/** ff_revoke_batch actions (§11.1 step 4) — deterministic (all secrets
+	 *  derive from our seed), reusable for crash-resume retransmission. */
+	private _fforBuildRevokeBatchActions(
+		epoch: IFforEpochStateData,
+		j: number
+	): ChannelAction[] {
 		const actions: ChannelAction[] = [
 			{ type: ChannelActionType.PERSIST_STATE }
 		];
@@ -5919,6 +6047,25 @@ export class Channel {
 				msg.fforEpoch &&
 				(msg.fforEpoch.state === 1 || msg.fforEpoch.state === 2)
 			) {
+				// Crash-resume (§11.1 step 5): WE closed this exact epoch but the
+				// peer is still reconciling — our ff_end died with the
+				// connection/process. Retransmit it (deterministic) so the peer
+				// can close too, instead of erroring.
+				if (
+					epoch &&
+					epoch.state === FforEpochState.FF_CLOSED &&
+					epoch.epochId.equals(msg.fforEpoch.epochId)
+				) {
+					return [
+						sendMsg(
+							MessageType.FF_END,
+							encodeFforEndMessage({
+								channelId: this._state.channelId!,
+								epochId: epoch.epochId
+							})
+						)
+					];
+				}
 				// The peer believes an epoch is live but we hold none — signal it.
 				return [
 					sendMsg(
@@ -5944,12 +6091,18 @@ export class Channel {
 			// never accepted a delegated payment). Mirror-case for S with no
 			// settlements; with settlements S KEEPS the epoch (funds safety —
 			// spec gap, see errata) and surfaces an error.
-			if (epoch!.role === 'settlement_peer' && epoch!.lastSeq > 0) {
+			if (epoch!.lastSeq > 0) {
+				// With settlements, NEITHER side may discard: S keeps its packages
+				// (funds safety) and R keeps its adopted commitment + preimages —
+				// they are R's only claim on the credited vouchers (fund loss if
+				// dropped). The peer's missing TLV here usually means it CLOSED
+				// the epoch (its reestablish omits closed epochs) — its
+				// retransmitted ff_end or the on-chain fallback resolves us.
 				return [
 					{
 						type: ChannelActionType.ERROR,
 						message:
-							'peer reports no FFOR epoch but settlements exist — keeping epoch (on-chain enforcement is M3)'
+							'peer reports no FFOR epoch but settlements exist — keeping epoch (on-chain enforcement available)'
 					}
 				];
 			}

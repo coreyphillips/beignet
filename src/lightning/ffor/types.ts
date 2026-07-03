@@ -139,6 +139,15 @@ export interface IFforEpochStateData {
 	 */
 	upstreamFulfilled: boolean[];
 	/**
+	 * S side: the upstream HTLC id settled for seq k (seq−1 indexed).
+	 * Distinguishes a crash-replayed fulfill of the SAME upstream HTLC (the
+	 * upstreamFulfilled flag persisted but the fulfill round never became
+	 * durable on the upstream channel) from a genuinely NEW duplicate part on
+	 * a consumed hash: the former is re-fulfilled (idempotent recovery), the
+	 * latter failed per §11.2.
+	 */
+	upstreamHtlcIds: Array<bigint | null>;
+	/**
 	 * Base HTLC id for voucher HTLCs at reconciliation: voucher seq k becomes
 	 * HTLC id sHtlcIdBase + (k−1). This is S's offered-HTLC counter at epoch
 	 * start; the spec does not assign voucher HTLC ids, so the prototype
@@ -182,6 +191,12 @@ export interface IFforEpochStateData {
 	sIsOpener?: boolean;
 	/** S's to_self_delay on its to_local (R's requirement). */
 	sToSelfDelay?: number;
+	/**
+	 * bLIP-51 lease encumbrance (§11.3, B.1 step 5): when the channel carries
+	 * an active lease with S as lessor, S's to_local on every E_j retains the
+	 * lease CLTV lock. Snapshotted with the rest of the frozen escape state.
+	 */
+	sLeaseExpiry?: number;
 }
 
 /**
@@ -275,6 +290,12 @@ export interface IFforChannelContext {
 		params: IFforEpochParams,
 		sigs: Buffer[]
 	) => string | null;
+	/**
+	 * S side (§11.3): OUR advertised standing FFOR terms. When present, an
+	 * incoming ff_init outside them (wrong variant, over-budget, under-priced
+	 * fees, epoch too long) is rejected at acceptInit.
+	 */
+	fforTerms?: import('../gossip/types').IFforTerms;
 }
 
 /** One encoded message for the peer, in send order. */

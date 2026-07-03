@@ -58,8 +58,11 @@ import {
 	MESSAGE_FLAG_HTLC_MAX,
 	ANNOUNCEMENT_SIGNATURES_LENGTH,
 	NODE_ANN_TLV_LEASE_RATES,
+	NODE_ANN_TLV_FFOR_TERMS,
 	encodeLeaseRates,
-	decodeLeaseRates
+	decodeLeaseRates,
+	encodeFforTerms,
+	decodeFforTerms
 } from './types';
 import {
 	encodeTlvStream,
@@ -179,16 +182,24 @@ export function encodeNodeAnnouncementMessage(
 	const addrBuf = Buffer.concat(addrParts);
 	const addrlen = addrBuf.length;
 
-	// Optional trailing node_ann_tlvs (BOLT 7). Currently: option_will_fund
-	// lease rates (type 1) for liquidity ads.
-	const tlvBuf = msg.leaseRates
-		? encodeTlvStream([
-				{
-					type: NODE_ANN_TLV_LEASE_RATES,
-					value: encodeLeaseRates(msg.leaseRates)
-				}
-		  ])
-		: Buffer.alloc(0);
+	// Optional trailing node_ann_tlvs (BOLT 7): option_will_fund lease rates
+	// (type 1) for liquidity ads, and FFOR standing terms (type 55007, spec
+	// specs/ffor-offline-receive.md section 11.3) advertised alongside them.
+	const tlvRecords: { type: bigint; value: Buffer }[] = [];
+	if (msg.leaseRates) {
+		tlvRecords.push({
+			type: NODE_ANN_TLV_LEASE_RATES,
+			value: encodeLeaseRates(msg.leaseRates)
+		});
+	}
+	if (msg.fforTerms) {
+		tlvRecords.push({
+			type: NODE_ANN_TLV_FFOR_TERMS,
+			value: encodeFforTerms(msg.fforTerms)
+		});
+	}
+	const tlvBuf =
+		tlvRecords.length > 0 ? encodeTlvStream(tlvRecords) : Buffer.alloc(0);
 
 	const totalLen =
 		64 + 2 + flen + 4 + 33 + 3 + 32 + 2 + addrlen + tlvBuf.length;
@@ -285,6 +296,10 @@ export function decodeNodeAnnouncementMessage(
 			const leaseVal = findTlvRecord(records, NODE_ANN_TLV_LEASE_RATES);
 			if (leaseVal) {
 				result.leaseRates = decodeLeaseRates(leaseVal);
+			}
+			const fforVal = findTlvRecord(records, NODE_ANN_TLV_FFOR_TERMS);
+			if (fforVal) {
+				result.fforTerms = decodeFforTerms(fforVal);
 			}
 		} catch {
 			/* ignore malformed trailing TLVs */

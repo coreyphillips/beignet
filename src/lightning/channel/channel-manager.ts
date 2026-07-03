@@ -136,7 +136,7 @@ import {
 	encodeTxAbortMessage
 } from '../message/interactive-tx';
 import { IDualFundingParams } from './dual-funding';
-import { ILeaseRates } from '../gossip/types';
+import { ILeaseRates, IFforTerms } from '../gossip/types';
 import { signWillFund, verifyWillFund } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
 import { Feature, FeatureFlags } from '../features/flags';
@@ -186,6 +186,12 @@ export interface IChannelManagerConfig {
 	 * and contributes the requested funds as the acceptor.
 	 */
 	leaseRates?: ILeaseRates;
+	/**
+	 * FFOR standing terms (specs/ffor-offline-receive.md section 11.3): when
+	 * set, this node advertises them alongside its lease rates (node_ann TLV
+	 * 55007) and REJECTS any incoming ff_init that falls outside them.
+	 */
+	fforTerms?: IFforTerms;
 	/**
 	 * Our own advertised init features. Used to gate per-peer feature-dependent
 	 * behavior (e.g. option_simple_close) on BOTH sides having advertised it.
@@ -2851,13 +2857,17 @@ export class ChannelManager extends EventEmitter {
 	private _fforExtras(peerPubkey: string): {
 		remoteNodeId: Buffer;
 		signFn?: (digest: Buffer) => Buffer;
+		fforTerms?: IFforTerms;
 	} {
 		const nodeKey = this.config.nodePrivateKey;
 		return {
 			remoteNodeId: Buffer.from(peerPubkey, 'hex'),
 			signFn: nodeKey
 				? (digest: Buffer): Buffer => sign(digest, nodeKey)
-				: undefined
+				: undefined,
+			// §11.3: when WE advertise standing FFOR terms, an incoming ff_init
+			// must fall within them (checked by FforEpoch.acceptInit).
+			fforTerms: this.config.fforTerms
 		};
 	}
 
@@ -3494,6 +3504,21 @@ export class ChannelManager extends EventEmitter {
 		// part (§11.2: never settle a consumed hash again; v1 is single-part).
 		if (seq <= epoch.lastSeq) {
 			if (epoch.upstreamFulfilled[hashIndex]) {
+				// The upstreamFulfilled flag can outlive a crash that killed the
+				// fulfill round itself (the flag persists on the epoch channel;
+				// the fulfill on the upstream channel). If this is the SAME
+				// upstream HTLC we settled (same id, still live), re-fulfill —
+				// idempotent recovery, never a duplicate credit (the package
+				// already exists). Only a DIFFERENT htlc id on a consumed hash
+				// is a true duplicate part (§11.2).
+				if (epoch.upstreamHtlcIds[hashIndex] === htlc.id) {
+					this.fulfillHtlc(
+						upstreamChannel.getChannelId()!,
+						htlc.id,
+						epoch.preimages[hashIndex]
+					);
+					return;
+				}
 				this._fforFailUpstream(
 					upstreamChannel,
 					htlc.id,
@@ -3507,6 +3532,7 @@ export class ChannelManager extends EventEmitter {
 				epoch.preimages[hashIndex]
 			);
 			epoch.upstreamFulfilled[hashIndex] = true;
+			epoch.upstreamHtlcIds[hashIndex] = htlc.id;
 			this.emit('channel:persist', epochChannelId);
 			return;
 		}
@@ -3575,6 +3601,7 @@ export class ChannelManager extends EventEmitter {
 			epoch.preimages[hashIndex]
 		);
 		epoch.upstreamFulfilled[hashIndex] = true;
+		epoch.upstreamHtlcIds[hashIndex] = htlc.id;
 		this.emit('channel:persist', epochChannelId);
 	}
 
@@ -3602,6 +3629,19 @@ export class ChannelManager extends EventEmitter {
 		// tower release and upstream settle), else fail the duplicate part.
 		if (seq <= epoch.lastSeq) {
 			if (epoch.upstreamFulfilled[hashIndex]) {
+				// Same-id crash replay vs true duplicate part — see the variant A
+				// branch for the rationale.
+				if (
+					epoch.upstreamHtlcIds[hashIndex] === htlc.id &&
+					epoch.preimages[hashIndex]?.length === 32
+				) {
+					this.fulfillHtlc(
+						upstreamChannel.getChannelId()!,
+						htlc.id,
+						epoch.preimages[hashIndex]
+					);
+					return;
+				}
 				this._fforFailUpstream(
 					upstreamChannel,
 					htlc.id,
@@ -3613,6 +3653,7 @@ export class ChannelManager extends EventEmitter {
 			if (preimage && preimage.length === 32) {
 				this.fulfillHtlc(upstreamChannel.getChannelId()!, htlc.id, preimage);
 				epoch.upstreamFulfilled[hashIndex] = true;
+				epoch.upstreamHtlcIds[hashIndex] = htlc.id;
 				this.emit('channel:persist', epochChannelId);
 				return;
 			}
@@ -3709,6 +3750,7 @@ export class ChannelManager extends EventEmitter {
 				release.preimage
 			);
 			epoch.upstreamFulfilled[hashIndex] = true;
+			epoch.upstreamHtlcIds[hashIndex] = htlc.id;
 			this.emit('channel:persist', epochChannelId);
 		} catch (err) {
 			// A transport failure/timeout leaves S without the preimage: fail

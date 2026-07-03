@@ -119,6 +119,16 @@ export interface INodeConfig {
 	mppTimeoutMs?: number;
 	/** Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) */
 	alias?: string;
+	/**
+	 * Liquidity ads (bLIP-0051): advertise these lease rates in our
+	 * node_announcement (node_ann_tlvs type 1, option_will_fund).
+	 */
+	leaseRates?: import('../gossip/types').ILeaseRates;
+	/**
+	 * FFOR standing terms (specs/ffor-offline-receive.md section 11.3):
+	 * advertised alongside the lease rates (node_ann_tlvs type 55007).
+	 */
+	fforTerms?: import('../gossip/types').IFforTerms;
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */

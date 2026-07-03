@@ -82,6 +82,11 @@ export interface IFforTowerChannelStatics {
 	sIsOpener?: boolean;
 	/** S's to_self_delay on its to_local (R's requirement). */
 	sToSelfDelay?: number;
+	/**
+	 * bLIP-51 lease encumbrance on S's to_local when S is the lessor
+	 * (§11.3, B.1 step 5) — needed to rebuild escapes byte-exactly.
+	 */
+	sLeaseExpiry?: number;
 	/** The frozen epoch feerate (spec §5). */
 	frozenFeeratePerKw: number;
 }
@@ -553,6 +558,7 @@ export class FforTower {
 			preEpochSLocalMsat: c.preEpochSLocalMsat,
 			preEpochRLocalMsat: c.preEpochRLocalMsat,
 			sToSelfDelay: c.sToSelfDelay ?? c.sConfig.toSelfDelay,
+			sLeaseExpiry: c.sLeaseExpiry,
 			frozenFeeratePerKw: c.frozenFeeratePerKw,
 			voucherExpiry: this._prov!.params.voucherExpiry,
 			network: this._prov!.network
@@ -622,6 +628,7 @@ export class FforTower {
 			htlcAmountsMsat: [],
 			voucherAmountsMsat: [],
 			upstreamFulfilled: [],
+			upstreamHtlcIds: [],
 			sHtlcIdBase: 0n,
 			frozenFeeratePerKw: p.channel.frozenFeeratePerKw,
 			nR: p.channel.nR,

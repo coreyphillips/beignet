@@ -256,6 +256,8 @@ export class LiquidityAdvisor {
 export interface ILeaseOffer {
 	sellerNodeId: string;
 	leaseRates: ILeaseRates;
+	/** FFOR standing terms advertised alongside the lease rates (§11.3). */
+	fforTerms?: import('../gossip/types').IFforTerms;
 }
 
 /** A scored lease quote for the buyer. */

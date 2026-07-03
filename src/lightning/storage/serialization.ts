@@ -444,6 +444,7 @@ export interface ISerializedFforEpoch {
 	htlcAmountsMsat?: string[];
 	voucherAmountsMsat?: string[];
 	upstreamFulfilled?: boolean[];
+	upstreamHtlcIds?: Array<string | null>;
 	sHtlcIdBase?: string;
 	frozenFeeratePerKw?: number;
 	nR?: string;
@@ -455,6 +456,7 @@ export interface ISerializedFforEpoch {
 	sPointN0Plus1?: string | null;
 	sIsOpener?: boolean;
 	sToSelfDelay?: number;
+	sLeaseExpiry?: number;
 }
 
 export function serializeFforEpoch(
@@ -498,6 +500,9 @@ export function serializeFforEpoch(
 		htlcAmountsMsat: f.htlcAmountsMsat.map(bigintToStr),
 		voucherAmountsMsat: f.voucherAmountsMsat.map(bigintToStr),
 		upstreamFulfilled: [...f.upstreamFulfilled],
+		upstreamHtlcIds: (f.upstreamHtlcIds ?? []).map((x) =>
+			x === null || x === undefined ? null : x.toString()
+		),
 		sHtlcIdBase: bigintToStr(f.sHtlcIdBase),
 		frozenFeeratePerKw: f.frozenFeeratePerKw,
 		nR: bigintToStr(f.nR),
@@ -514,7 +519,8 @@ export function serializeFforEpoch(
 				: null,
 		sPointN0Plus1: bufToHex(f.sPointN0Plus1 ?? null),
 		sIsOpener: f.sIsOpener,
-		sToSelfDelay: f.sToSelfDelay
+		sToSelfDelay: f.sToSelfDelay,
+		sLeaseExpiry: f.sLeaseExpiry
 	};
 }
 
@@ -561,6 +567,9 @@ export function deserializeFforEpoch(
 		htlcAmountsMsat: (s.htlcAmountsMsat ?? []).map(strToBigint),
 		voucherAmountsMsat: (s.voucherAmountsMsat ?? []).map(strToBigint),
 		upstreamFulfilled: [...(s.upstreamFulfilled ?? [])],
+		upstreamHtlcIds: (s.upstreamHtlcIds ?? []).map((x) =>
+			x === null || x === undefined ? null : BigInt(x)
+		),
 		sHtlcIdBase: s.sHtlcIdBase !== undefined ? strToBigint(s.sHtlcIdBase) : 0n,
 		frozenFeeratePerKw: s.frozenFeeratePerKw ?? 0,
 		nR: s.nR !== undefined ? strToBigint(s.nR) : 0n,
@@ -577,7 +586,8 @@ export function deserializeFforEpoch(
 				: undefined,
 		sPointN0Plus1: hexToBuf(s.sPointN0Plus1 ?? null) ?? undefined,
 		sIsOpener: s.sIsOpener,
-		sToSelfDelay: s.sToSelfDelay
+		sToSelfDelay: s.sToSelfDelay,
+		sLeaseExpiry: s.sLeaseExpiry
 	};
 }
 

@@ -289,6 +289,8 @@ export class LightningNode extends EventEmitter {
 	> = new Map();
 	private mppTimeoutMs: number;
 	private alias?: string;
+	private advertisedLeaseRates?: import('../gossip/types').ILeaseRates;
+	private advertisedFforTerms?: import('../gossip/types').IFforTerms;
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
 	private fundingPrivkey: Buffer;
@@ -365,6 +367,8 @@ export class LightningNode extends EventEmitter {
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
 		this.mppTimeoutMs = config.mppTimeoutMs ?? 60_000;
 		this.alias = config.alias;
+		this.advertisedLeaseRates = config.leaseRates;
+		this.advertisedFforTerms = config.fforTerms;
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
@@ -419,7 +423,12 @@ export class LightningNode extends EventEmitter {
 			preferTaproot: config.preferTaproot,
 			chainHash: config.chainHashes?.[0],
 			nodePrivateKey: config.nodePrivateKey,
-			channelKeyDeriver: config.channelKeyDeriver
+			channelKeyDeriver: config.channelKeyDeriver,
+			// Liquidity ads (bLIP-51) + FFOR standing terms (§11.3): the manager
+			// answers request_funds (will_fund) and enforces the advertised FFOR
+			// terms against incoming ff_init.
+			leaseRates: config.leaseRates,
+			fforTerms: config.fforTerms
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
@@ -2823,7 +2832,11 @@ export class LightningNode extends EventEmitter {
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
 				alias: aliasBuffer,
-				addresses: []
+				addresses: [],
+				// Liquidity ads (bLIP-51) + FFOR standing terms (§11.3): a node
+				// selling inbound liquidity advertises both side by side.
+				leaseRates: this.advertisedLeaseRates,
+				fforTerms: this.advertisedFforTerms
 			});
 			const sig = signNodeAnnouncement(payload, this.nodePrivkey);
 			sig.copy(payload, 0);

@@ -49,6 +49,26 @@ export interface ILeaseRates {
 	channelFeeMaxProportionalThousandths: number;
 }
 
+/**
+ * FFOR standing terms (specs/ffor-offline-receive.md §11.3): advertised by a
+ * settlement peer alongside its bLIP-51 lease rates in a node_announcement
+ * trailing TLV, letting a recipient price uptime+delegation the same way it
+ * prices inbound capacity. R echoes the fee terms in ff_init; S rejects an
+ * ff_init that falls outside its advertised terms.
+ */
+export interface IFforTerms {
+	/** Per-settlement flat FFOR fee, msat (u32). */
+	ffFeeBaseMsat: number;
+	/** Per-settlement proportional FFOR fee, ppm (u32). */
+	ffFeePpm: number;
+	/** Largest epoch budget S will accept, msat (u64). */
+	maxBudgetMsat: bigint;
+	/** Longest epoch S will accept: D minus current height, blocks (u16). */
+	maxEpochBlocks: number;
+	/** Bitfield of accepted variants: bit 0 = A, bit 1 = B (u8). */
+	variants: number;
+}
+
 export interface INodeAnnouncementMessage {
 	signature: Buffer;
 	features: Buffer;
@@ -59,10 +79,50 @@ export interface INodeAnnouncementMessage {
 	addresses: INodeAddress[];
 	/** Liquidity-ads lease rates (node_ann_tlvs type 1, option_will_fund). */
 	leaseRates?: ILeaseRates;
+	/** FFOR standing terms (node_ann_tlvs type 55007, §11.3). */
+	fforTerms?: IFforTerms;
 }
 
 /** node_ann_tlvs TLV type for the option_will_fund lease-rates record. */
 export const NODE_ANN_TLV_LEASE_RATES = 1n;
+
+/**
+ * node_ann_tlvs TLV type for the FFOR standing-terms record (§11.3). Odd
+ * (ignorable) in the same custom range as the FFOR message types (55001+);
+ * 55007 is the gap the message registry leaves between ff_invoices (55005)
+ * and ff_escape_sigs (55009). The spec registry lists this as TBD.
+ */
+export const NODE_ANN_TLV_FFOR_TERMS = 55007n;
+
+/** Serialized length of the FFOR terms record (4+4+8+2+1). */
+export const FFOR_TERMS_LENGTH = 19;
+
+/** Encode the FFOR standing-terms record (§11.3). */
+export function encodeFforTerms(terms: IFforTerms): Buffer {
+	const buf = Buffer.alloc(FFOR_TERMS_LENGTH);
+	buf.writeUInt32BE(terms.ffFeeBaseMsat, 0);
+	buf.writeUInt32BE(terms.ffFeePpm, 4);
+	buf.writeBigUInt64BE(terms.maxBudgetMsat, 8);
+	buf.writeUInt16BE(terms.maxEpochBlocks, 16);
+	buf.writeUInt8(terms.variants, 18);
+	return buf;
+}
+
+/** Decode the 19-byte FFOR standing-terms record (§11.3). */
+export function decodeFforTerms(buf: Buffer): IFforTerms {
+	if (buf.length < FFOR_TERMS_LENGTH) {
+		throw new Error(
+			`ffor_terms too short: need ${FFOR_TERMS_LENGTH} bytes, got ${buf.length}`
+		);
+	}
+	return {
+		ffFeeBaseMsat: buf.readUInt32BE(0),
+		ffFeePpm: buf.readUInt32BE(4),
+		maxBudgetMsat: buf.readBigUInt64BE(8),
+		maxEpochBlocks: buf.readUInt16BE(16),
+		variants: buf.readUInt8(18)
+	};
+}
 
 /** Serialized length of the lease-rates record (2+2+4+4+2). */
 export const LEASE_RATES_LENGTH = 14;

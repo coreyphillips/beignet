@@ -193,6 +193,7 @@ function makeSEpoch(): IFforEpochStateData {
 		htlcAmountsMsat: [],
 		voucherAmountsMsat: [],
 		upstreamFulfilled: [],
+		upstreamHtlcIds: [],
 		sHtlcIdBase: 0n,
 		frozenFeeratePerKw: FEERATE,
 		nR: N_R,
