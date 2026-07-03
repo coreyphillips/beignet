@@ -210,6 +210,11 @@ export class ChannelManager extends EventEmitter {
 			action: IFeeBumpAndBroadcastChainAction;
 			broadcastHeight: number;
 			lastFeeRate: number;
+			// Set when the last CPFP-child build/broadcast actually failed (e.g. no
+			// confirmed wallet UTXOs). While true, reCpfpStuckCommitments retries next
+			// cycle even at an unchanged feerate, so a CPFP is re-attempted once wallet
+			// change confirms instead of being permanently blocked by the feerate gate.
+			lastAttemptFailed?: boolean;
 		}
 	> = new Map();
 	// Learned payment preimages, retained so monitors created later (on
@@ -3573,6 +3578,14 @@ export class ChannelManager extends EventEmitter {
 			// The commitment (parent) is broadcast by the force-close path; emit only
 			// the fee-bearing child so the 1-parent-1-child package clears the target.
 			this.emit('broadcast:tx', tx.toBuffer());
+			// The child was actually emitted: record the paid feerate + height and
+			// clear any prior failure flag, so the retry gate reflects real progress.
+			const pending = this._pendingCommitmentCpfp.get(channelId.toString('hex'));
+			if (pending) {
+				pending.lastFeeRate = feeratePerVbyte;
+				pending.broadcastHeight = this._currentBlockHeight;
+				pending.lastAttemptFailed = false;
+			}
 		} catch (err) {
 			this.emit(
 				'error',
@@ -3585,6 +3598,20 @@ export class ChannelManager extends EventEmitter {
 			// fallback; the commitment is already broadcast for the CPFP case.
 			if (action.kind === 'htlc-fee-attach')
 				this.emit('broadcast:tx', action.tx);
+			// anchor-cpfp failed to emit a child (e.g. no confirmed UTXOs). Flag it so
+			// reCpfpStuckCommitments retries next cycle rather than treating the paid
+			// feerate as advanced and blocking every future attempt. Advance
+			// broadcastHeight (but NOT lastFeeRate) so retries are paced by the re-bump
+			// interval instead of every block.
+			if (action.kind === 'anchor-cpfp') {
+				const pending = this._pendingCommitmentCpfp.get(
+					channelId.toString('hex')
+				);
+				if (pending) {
+					pending.lastAttemptFailed = true;
+					pending.broadcastHeight = this._currentBlockHeight;
+				}
+			}
 		}
 	}
 
@@ -3686,15 +3713,20 @@ export class ChannelManager extends EventEmitter {
 				this._pendingCommitmentCpfp.delete(channelIdHex);
 				continue;
 			}
-			// Only re-bump after a stall, and only if the live feerate actually beats
-			// what we last paid (otherwise re-broadcasting is pointless).
+			// Only re-bump after a stall.
 			if (
 				blockHeight - entry.broadcastHeight <
 				COMMITMENT_CPFP_REBUMP_INTERVAL
 			) {
 				continue;
 			}
-			if (feeRatePerVbyte <= entry.lastFeeRate) continue;
+			// Re-bump if the live feerate beats what we last paid, OR the previous
+			// attempt failed to emit a child at all (e.g. no confirmed UTXOs then).
+			// Without the failure escape a failed attempt still advanced lastFeeRate,
+			// so the `<=` gate blocked every retry even after wallet change confirmed.
+			if (feeRatePerVbyte <= entry.lastFeeRate && !entry.lastAttemptFailed) {
+				continue;
+			}
 
 			const channelId = Buffer.from(channelIdHex, 'hex');
 			// Re-broadcast the PARENT commitment alongside the child. A fee spike can
@@ -3703,13 +3735,14 @@ export class ChannelManager extends EventEmitter {
 			// child left the commitment stuck forever while lastFeeRate advanced.
 			// Re-broadcasting an already-confirmed parent is rejected harmlessly.
 			this.emit('broadcast:tx', entry.action.tx);
+			// lastFeeRate / broadcastHeight / lastAttemptFailed are updated by
+			// _handleFeeBumpAndBroadcast ONLY once a child is actually emitted, so a
+			// failed attempt does not masquerade as a paid one.
 			void this._handleFeeBumpAndBroadcast(channelId, {
 				...entry.action,
 				feeratePerVbyte: feeRatePerVbyte,
 				description: 'anchor commitment CPFP (re-bump)'
 			});
-			entry.lastFeeRate = feeRatePerVbyte;
-			entry.broadcastHeight = blockHeight;
 		}
 	}
 

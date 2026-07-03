@@ -558,13 +558,22 @@ describe('anchor fee bumping', () => {
 					isFullyResolved: () => opts.fullyResolved === true,
 					isCommitmentConfirmed: () => opts.commitmentConfirmed === true
 				});
-				// Spy on the CPFP re-issue instead of building a real wallet tx.
+				// Spy on the CPFP re-issue instead of building a real wallet tx. The
+				// production _handleFeeBumpAndBroadcast now advances the pending entry's
+				// bookkeeping ONLY once a child is actually emitted (so a failed attempt
+				// cannot masquerade as paid); mirror that success bookkeeping here.
 				const calls: any[] = [];
 				(cm as any)._handleFeeBumpAndBroadcast = (
 					_cid: Buffer,
 					action: any
 				) => {
 					calls.push(action);
+					const entry = (cm as any)._pendingCommitmentCpfp.get(channelIdHex);
+					if (entry) {
+						entry.lastFeeRate = action.feeratePerVbyte;
+						entry.broadcastHeight = (cm as any)._currentBlockHeight;
+						entry.lastAttemptFailed = false;
+					}
 					return Promise.resolve();
 				};
 				return { cm, channelIdHex, calls };

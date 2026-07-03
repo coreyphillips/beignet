@@ -524,3 +524,56 @@ describe('Audit MEDIUM-3: reCpfpStuckCommitments re-broadcasts the parent', func
 		expect(broadcasts.some((b) => b.equals(parentBuf))).to.equal(true);
 	});
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// MEDIUM-4: failed anchor-CPFP attempts are retried, not recorded as paid
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit MEDIUM-4: failed CPFP attempt is retried at unchanged feerate', function () {
+	this.timeout(10_000);
+
+	it('retries when the previous attempt failed even if the feerate is unchanged', () => {
+		const cfg: IChannelManagerConfig = {
+			localBasepoints: makeBasepoints(makeSeed(51)),
+			localPerCommitmentSeed: makeSeed(151),
+			localFundingPrivkey: makeSeed(251)
+		};
+		const cm = new ChannelManager(cfg);
+		cm.on('error', () => {});
+		(cm as any).fundingProvider = {
+			selectFeeBumpInputs: async (): Promise<unknown> => {
+				throw new Error('no confirmed UTXOs');
+			}
+		};
+
+		const parentBuf = Buffer.from('a1b2c3d4', 'hex');
+		const channelIdHex = 'dd'.repeat(32);
+		// A prior attempt failed: lastAttemptFailed is set, and lastFeeRate is the
+		// live*1.5 value that a failed attempt would previously have recorded as paid.
+		(cm as any)._pendingCommitmentCpfp.set(channelIdHex, {
+			action: {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'anchor-cpfp',
+				tx: parentBuf,
+				description: 'anchor commitment CPFP',
+				feeratePerVbyte: 50
+			},
+			broadcastHeight: 100,
+			lastFeeRate: 50,
+			lastAttemptFailed: true
+		});
+		(cm as any).monitors.set(channelIdHex, {
+			isFullyResolved: (): boolean => false,
+			isCommitmentConfirmed: (): boolean => false
+		});
+
+		const broadcasts: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+
+		// Feerate is UNCHANGED (equal to lastFeeRate). Before the fix the
+		// `feeRatePerVbyte <= entry.lastFeeRate` gate blocked the retry forever.
+		cm.reCpfpStuckCommitments(100 + 1000, 50);
+
+		expect(broadcasts.some((b) => b.equals(parentBuf))).to.equal(true);
+	});
+});
