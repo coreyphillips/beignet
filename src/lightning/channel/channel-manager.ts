@@ -110,6 +110,7 @@ import {
 import {
 	IFforTowerClient,
 	FforTower,
+	IFforTowerProvisioning,
 	buildTowerFetchRequest
 } from '../ffor/tower';
 import {
@@ -3052,6 +3053,82 @@ export class ChannelManager extends EventEmitter {
 		};
 	}
 
+	/**
+	 * R side (M7.3): build the tower provisioning bundle for a variant-B epoch
+	 * already initiated on this channel, so R can provision its tower up-front
+	 * (while online) via a tower client. Reads the channel statics + the epoch's
+	 * completed params (rPerCommitmentPoints etc.). `preimages` are the K
+	 * tower-generated preimages (their SHA256 must equal the epoch's payment
+	 * hashes). Option-(a) penalty extras are optional; omitting them yields an
+	 * alert-only (option-(b)) tower. Returns null when the channel/epoch is not
+	 * a ready variant-B recipient epoch.
+	 */
+	buildFforTowerProvisioning(
+		channelId: Buffer,
+		preimages: Buffer[],
+		opts?: {
+			revocationBasepointSecret?: Buffer;
+			sweepScript?: Buffer;
+			network?: import('bitcoinjs-lib').Network;
+		}
+	): IFforTowerProvisioning | null {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) return null;
+		const epoch = channel.getFforEpoch();
+		if (
+			!epoch ||
+			epoch.role !== 'recipient' ||
+			epoch.params.variant !== FforVariant.B ||
+			epoch.sCommitmentNumber === null
+		) {
+			return null;
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey || !this.config.nodePrivateKey) return null;
+		const st = channel.getFullState();
+		if (
+			!st.fundingTxid ||
+			!st.remoteBasepoints ||
+			!st.channelType ||
+			!st.remoteCurrentPerCommitmentPoint
+		) {
+			return null;
+		}
+		return {
+			epochId: Buffer.from(epoch.epochId),
+			params: epoch.params,
+			preimages: preimages.map((p) => Buffer.from(p)),
+			channel: {
+				fundingTxid: Buffer.from(st.fundingTxid),
+				fundingOutputIndex: st.fundingOutputIndex,
+				fundingSatoshis: st.fundingSatoshis,
+				channelType: Buffer.from(st.channelType),
+				rIsOpener: st.role === ChannelRole.OPENER,
+				rBasepoints: st.localBasepoints,
+				sBasepoints: st.remoteBasepoints,
+				rConfig: st.localConfig,
+				sConfig: st.remoteConfig,
+				preEpochRLocalMsat: st.localBalanceMsat,
+				preEpochSLocalMsat: st.remoteBalanceMsat,
+				nR: channel.getCommitmentNumbers().local,
+				n0: epoch.sCommitmentNumber,
+				sPerCommitmentPointN0: Buffer.from(st.remoteCurrentPerCommitmentPoint),
+				frozenFeeratePerKw: epoch.frozenFeeratePerKw
+			},
+			rNodeId: getPublicKey(this.config.nodePrivateKey),
+			sNodeId: Buffer.from(peerPubkey, 'hex'),
+			revocationBasepointSecret: opts?.revocationBasepointSecret,
+			sweepScript: opts?.sweepScript,
+			network: opts?.network
+		};
+	}
+
+	/** Whether an S-side tower client is configured (M7.3 auto-resolution). */
+	hasFforTowerClient(): boolean {
+		return this._fforTowerClient !== null;
+	}
+
 	/** Either side: cooperatively close a zero-settlement epoch via ff_end. */
 	endFforEpoch(channelId: Buffer): ChannelResult {
 		const idHex = channelId.toString('hex');
@@ -3104,6 +3181,26 @@ export class ChannelManager extends EventEmitter {
 			this._fforExtras(peerPubkey)
 		);
 		this.processActions(peerPubkey, channel, actions);
+
+		// M7.3: S-side tower auto-resolution. A settlement-peer node that just
+		// accepted a variant-B ff_init naming a tower (towerNodeId/towerUri TLVs)
+		// and has no tower client yet asks the node layer to connect to that
+		// tower and wire an S-side release client — so a plain settlement peer
+		// can participate in someone's variant-B epoch just by being told the
+		// tower in ff_init, with no manual setFforTowerClient call.
+		const epoch = channel.getFforEpoch();
+		if (
+			epoch &&
+			epoch.role === 'settlement_peer' &&
+			epoch.params.variant === FforVariant.B &&
+			epoch.params.towerNodeId &&
+			!this._fforTowerClient
+		) {
+			this.emit('ffor:tower:resolve', {
+				towerNodeId: Buffer.from(epoch.params.towerNodeId),
+				towerUri: epoch.params.towerUri
+			});
+		}
 	}
 
 	private handleFforAcceptMsg(peerPubkey: string, payload: Buffer): void {
@@ -3650,6 +3747,30 @@ export class ChannelManager extends EventEmitter {
 				break;
 			}
 		}
+	}
+
+	/**
+	 * Whether a payment hash belongs to an ACTIVE FFOR-delegated epoch on which
+	 * this node is the settlement peer — i.e. an HTLC the FFOR settlement engine
+	 * will handle, which must NOT be forwarded/onion-processed on a full node.
+	 */
+	private _isFforDelegatedHash(paymentHash: Buffer): boolean {
+		for (const channel of this.channels.values()) {
+			const epoch = channel.getFforEpoch();
+			if (
+				!epoch ||
+				epoch.role !== 'settlement_peer' ||
+				epoch.state !== FforEpochState.FF_EPOCH
+			) {
+				continue;
+			}
+			if (
+				(epoch.params.paymentHashes ?? []).some((h) => h.equals(paymentHash))
+			) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Fail a delegated HTLC upstream (spec §8: MUST NOT settle). */
@@ -4597,6 +4718,14 @@ export class ChannelManager extends EventEmitter {
 					break;
 				}
 				case ChannelActionType.HTLC_FORWARDED:
+					// FFOR: a delegated payment is settled by the FFOR engine
+					// (_fforProcessSettlements), NOT forwarded/onion-processed. On a
+					// full node the 'htlc:forwarded' handler peels the onion and
+					// would fail the (opaque-to-it) delegated HTLC before FFOR can
+					// settle it, so suppress the forward for a delegated hash.
+					if (this._isFforDelegatedHash(action.paymentHash)) {
+						break;
+					}
 					this.emit(
 						'htlc:forwarded',
 						channel.getChannelId(),

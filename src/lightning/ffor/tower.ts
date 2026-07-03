@@ -364,6 +364,22 @@ export class FforTower {
 	}
 
 	/**
+	 * M7.3 operator UX: per-epoch status (id + released count + K), for a
+	 * `towerStatus()` view. Multi-epoch; reflects the rehydrated durable state.
+	 */
+	listEpochStatus(): Array<{
+		epochId: Buffer;
+		lastReleased: number;
+		maxPayments: number;
+	}> {
+		return [...this._epochs.values()].map((entry) => ({
+			epochId: Buffer.from(entry.prov.epochId),
+			lastReleased: entry.record.lastReleased,
+			maxPayments: entry.prov.params.maxPayments
+		}));
+	}
+
+	/**
 	 * M7.0: reload every persisted epoch (provisioning + record) from the store
 	 * into memory, rebuilding _prov/_record/_epochView WITHOUT re-provision.
 	 * Idempotent; called from the constructor. The last-loaded epoch is left

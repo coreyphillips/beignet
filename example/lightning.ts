@@ -11,12 +11,14 @@ import { Network } from '../src/lightning/invoice/types';
 import { BITCOIN_CHAIN_HASH } from '../src/lightning/channel/types';
 import { decode as decodeInvoice } from '../src/lightning/invoice/decode';
 import { SqliteStorage } from '../src/lightning/storage/sqlite-storage';
+import { SqliteTowerStore } from '../src/lightning/ffor/tower-store-sqlite';
+import { MemoryTowerStore } from '../src/lightning/ffor/tower';
 
 // ─────────────── CLI Arg Parsing ───────────────
 
 const NETWORKS = ['mainnet', 'testnet', 'regtest'];
 
-function parseArgs(argv: string[]): {
+export interface ICliArgs {
 	mnemonic?: string;
 	alias?: string;
 	torProxy?: string;
@@ -24,7 +26,14 @@ function parseArgs(argv: string[]): {
 	electrumHost?: string;
 	electrumPort?: number;
 	electrumTls?: boolean;
-} {
+	// FFOR M7.3 operator flags.
+	tower?: boolean; // --tower: host an embedded durable tower
+	towerStore?: string; // --tower-store <path>
+	towerDemo?: boolean; // --tower-demo: allow a non-durable memory tower (LOUD)
+	useTower?: string; // --use-tower <nodeIdHex@host:port>
+}
+
+export function parseArgs(argv: string[]): ICliArgs {
 	const args = argv.slice(2);
 	let alias: string | undefined;
 	let torProxy: string | undefined;
@@ -32,6 +41,10 @@ function parseArgs(argv: string[]): {
 	let electrumHost: string | undefined;
 	let electrumPort: number | undefined;
 	let electrumTls: boolean | undefined;
+	let tower: boolean | undefined;
+	let towerStore: string | undefined;
+	let towerDemo: boolean | undefined;
+	let useTower: string | undefined;
 	const mnemonicWords: string[] = [];
 
 	for (let i = 0; i < args.length; i++) {
@@ -50,6 +63,14 @@ function parseArgs(argv: string[]): {
 			electrumTls = false;
 		} else if (args[i] === '--electrum-ssl') {
 			electrumTls = true;
+		} else if (args[i] === '--tower') {
+			tower = true;
+		} else if (args[i] === '--tower-store' && i + 1 < args.length) {
+			towerStore = args[++i];
+		} else if (args[i] === '--tower-demo') {
+			towerDemo = true;
+		} else if (args[i] === '--use-tower' && i + 1 < args.length) {
+			useTower = args[++i];
 		} else if (NETWORKS.includes(args[i])) {
 			network = args[i];
 		} else if (args[i].startsWith('--')) {
@@ -66,8 +87,46 @@ function parseArgs(argv: string[]): {
 		network,
 		electrumHost,
 		electrumPort,
-		electrumTls
+		electrumTls,
+		tower,
+		towerStore,
+		towerDemo,
+		useTower
 	};
+}
+
+/**
+ * FFOR M7.3: build the tower store for --tower, enforcing durability. A memory
+ * (non-durable) store loses released-preimage packages on restart (the §9.4
+ * failure), so --tower REFUSES to start on a memory store unless --tower-demo
+ * is set (which prints a LOUD warning and proceeds). Returns the store or
+ * throws.
+ */
+export function buildTowerStore(
+	args: Pick<ICliArgs, 'towerStore' | 'towerDemo'>,
+	defaultPath: string
+): SqliteTowerStore | MemoryTowerStore {
+	// A non-durable store is requested only when the operator explicitly points
+	// --tower-store at ':memory:'. Any other value (or the default) is a file.
+	const wantsMemory = args.towerStore === ':memory:';
+	if (wantsMemory) {
+		if (!args.towerDemo) {
+			throw new Error(
+				'--tower with a :memory: store is refused: a non-durable tower loses ' +
+					'released-preimage packages on restart (the offline-receive failure). ' +
+					'Use a file store (--tower-store <path>) or, for a throwaway demo, ' +
+					'pass --tower-demo.'
+			);
+		}
+		// eslint-disable-next-line no-console
+		console.warn(
+			'\n[beignet] WARNING: --tower-demo: running a NON-DURABLE (in-memory) ' +
+				'tower. It will LOSE all released-preimage packages on restart and MUST ' +
+				'NOT be used to custody a real offline-receive epoch.\n'
+		);
+		return new MemoryTowerStore();
+	}
+	return new SqliteTowerStore(args.towerStore ?? defaultPath);
 }
 
 // ─────────────── Help ───────────────
@@ -126,6 +185,23 @@ function printHelp(): void {
   Chain
     node.handleNewBlock(height)                           Notify of new block
     node.getCurrentBlockHeight()                          Current block height
+
+  FFOR offline-receive tower (M7.3)
+    node.enableTower(store)                               Host a durable embedded tower (or use CLI --tower)
+    node.useTower('nodeIdHex@host:port')                  Set this node's tower (or CLI --use-tower)
+    node.startOfflineReceiveEpoch({ peerPubkey|channelId, budgetMsat,
+        maxPayments, minPaymentMsat, settlementDeadline, voucherExpiry })
+                                                          R side: provision the tower + open a variant-B
+                                                          epoch UP-FRONT (while online), returns
+                                                          { epochId, invoices } to hand out, then go offline
+    node.recoverFromTower(channelId)                      R side, on return: fetch + ingest from the tower
+    node.towerStatus()                                    Provisioned epochs, released counts, alerts
+
+    CLI: --tower [--tower-store <path>|:memory: --tower-demo]  run a tower node
+         --use-tower nodeIdHex@host:port                       receive offline via a tower
+    The tower MUST be a separate always-on node (a node cannot be its own tower);
+    provisioning happens up-front, not on crash. A memory store is refused unless
+    --tower-demo (it loses released-preimage packages on restart).
 
   Lifecycle
     node.destroy()                                        Shut down the node
@@ -222,7 +298,8 @@ export async function createFundingProvider(
 const runExample = async (
 	mnemonic = generateMnemonic(),
 	alias?: string,
-	torProxy?: string
+	torProxy?: string,
+	towerArgs?: Pick<ICliArgs, 'tower' | 'towerStore' | 'towerDemo' | 'useTower'>
 ): Promise<void> => {
 	// 1. Set up SQLite persistence
 	const dataDir = path.resolve('example/lightningData');
@@ -275,6 +352,38 @@ const runExample = async (
 		'Auto-fund: ',
 		fundingProvider ? 'yes (wallet connected)' : 'no (manual createFunding)'
 	);
+
+	// 5b. FFOR offline-receive tower wiring (M7.3).
+	if (towerArgs?.tower) {
+		// --tower: host a durable embedded tower (refuses a non-durable store
+		// unless --tower-demo). The M7.2 breach-watch auto-wires.
+		const towerStore = buildTowerStore(
+			towerArgs,
+			path.join(dataDir, 'tower.db')
+		);
+		node.enableTower(towerStore);
+		console.log(
+			'Tower:      ENABLED (embedded), store:',
+			towerArgs.towerStore ?? path.join(dataDir, 'tower.db')
+		);
+	}
+	if (towerArgs?.useTower) {
+		// --use-tower: this node's default tower for the epochs it receives on.
+		node.useTower(towerArgs.useTower);
+		console.log('Use-tower: ', towerArgs.useTower);
+	}
+	node.on('ffor:tower:breach', (e: { epochId?: Buffer; alert?: string }) => {
+		console.log(
+			'\n[event] FFOR tower BREACH:',
+			e.alert ?? e.epochId?.toString('hex')
+		);
+	});
+	node.on('ffor:tower:escape', (e: { epochId?: Buffer; alert?: string }) => {
+		console.log(
+			'\n[event] FFOR tower escape:',
+			e.alert ?? e.epochId?.toString('hex')
+		);
+	});
 
 	// 6. Event listeners
 	node.on('payment:received', (p) => {
@@ -654,44 +763,65 @@ const runPaymentFlowExample = async (): Promise<void> => {
 
 // ─────────────── Entry Point ───────────────
 
-const {
-	mnemonic,
-	alias,
-	torProxy,
-	network,
-	electrumHost,
-	electrumPort,
-	electrumTls
-} = parseArgs(process.argv);
-const useLowLevel = process.argv.includes('--low-level');
-const usePaymentFlow = process.argv.includes('--payment-flow');
-const useFullGraph = process.argv.includes('--full-graph');
-
-// Surface startup failures (e.g. a second instance hitting the data-dir lock)
-// as a clean one-line message instead of an unhandled-rejection stack trace.
-const onStartupError = (err: unknown): void => {
-	const e = err as { code?: string; message?: string };
-	if (e?.code === 'INSTANCE_ALREADY_RUNNING') {
-		console.error(`\n[beignet] ${e.message}\n`);
-	} else {
-		console.error('\n[beignet] Failed to start:', e?.message ?? err, '\n');
-	}
-	process.exit(1);
-};
-
-if (usePaymentFlow) {
-	runPaymentFlowExample().catch(onStartupError);
-} else if (useLowLevel) {
-	runExample(mnemonic, alias, torProxy).catch(onStartupError);
-} else {
-	runBeignetExample(
+// Only boot a node when run directly (`ts-node example/lightning.ts ...`), not
+// when the module is IMPORTED (e.g. tests importing parseArgs/buildTowerStore).
+function main(): void {
+	const {
 		mnemonic,
-		(network as 'mainnet' | 'testnet' | 'regtest') || 'mainnet',
+		alias,
+		torProxy,
+		network,
 		electrumHost,
 		electrumPort,
-		alias,
-		useFullGraph,
-		torProxy,
-		electrumTls
-	).catch(onStartupError);
+		electrumTls,
+		tower,
+		towerStore,
+		towerDemo,
+		useTower
+	} = parseArgs(process.argv);
+	// The FFOR tower operator flags run on the low-level LightningNode path (that
+	// is where enableTower/useTower live), so --tower / --use-tower imply
+	// --low-level.
+	const useLowLevel =
+		process.argv.includes('--low-level') || !!tower || !!useTower;
+	const usePaymentFlow = process.argv.includes('--payment-flow');
+	const useFullGraph = process.argv.includes('--full-graph');
+
+	// Surface startup failures (e.g. a second instance hitting the data-dir lock)
+	// as a clean one-line message instead of an unhandled-rejection stack trace.
+	const onStartupError = (err: unknown): void => {
+		const e = err as { code?: string; message?: string };
+		if (e?.code === 'INSTANCE_ALREADY_RUNNING') {
+			console.error(`\n[beignet] ${e.message}\n`);
+		} else {
+			console.error('\n[beignet] Failed to start:', e?.message ?? err, '\n');
+		}
+		process.exit(1);
+	};
+
+	if (usePaymentFlow) {
+		runPaymentFlowExample().catch(onStartupError);
+	} else if (useLowLevel) {
+		runExample(mnemonic, alias, torProxy, {
+			tower,
+			towerStore,
+			towerDemo,
+			useTower
+		}).catch(onStartupError);
+	} else {
+		runBeignetExample(
+			mnemonic,
+			(network as 'mainnet' | 'testnet' | 'regtest') || 'mainnet',
+			electrumHost,
+			electrumPort,
+			alias,
+			useFullGraph,
+			torProxy,
+			electrumTls
+		).catch(onStartupError);
+	}
+}
+
+if (require.main === module) {
+	main();
 }

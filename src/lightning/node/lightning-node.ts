@@ -10,6 +10,15 @@ import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { getPublicKey } from '../crypto/ecdh';
 import {
+	FforTower,
+	IFforTowerStore,
+	IFforTowerClient,
+	generateTowerPreimages
+} from '../ffor/tower';
+import { PeerTowerClient } from '../ffor/tower-transport';
+import { FforVariant } from '../ffor/types';
+import { ChannelResult } from '../channel/types';
+import {
 	constructBlindedPath,
 	processBlindedHop,
 	deriveBlindedPrivkey,
@@ -258,6 +267,19 @@ export class LightningNode extends EventEmitter {
 	private storage: IStorageBackend | null = null;
 	private chainWatcher: ChainWatcher | null = null;
 	private _chainWatcherEventsWired = false;
+	// FFOR M7.3 operator UX: an embedded tower this node hosts (--tower), the
+	// default tower this node receives offline through (--use-tower), and a
+	// small ring buffer of recent breach/escape alerts for towerStatus().
+	private _fforTower: FforTower | null = null;
+	private _fforTowerClient: IFforTowerClient | null = null;
+	private _fforTowerUri: string | null = null;
+	private _fforTowerNodeId: Buffer | null = null;
+	private _fforTowerAlerts: Array<{
+		kind: 'breach' | 'escape';
+		epochId?: string;
+		alert?: string;
+		at: number;
+	}> = [];
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingCltvDelta: number;
@@ -906,6 +928,37 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Setup ───────────────
 
 	private wireChannelManagerEvents(): void {
+		// M7.3 S-side tower auto-resolution: a settlement-peer node that accepted
+		// a variant-B ff_init naming a tower (and has no tower client) connects to
+		// that tower and wires an S-side release client, so it can settle the
+		// epoch with no manual setFforTowerClient. Skipped if a tower is already
+		// configured (e.g. via useTower). No-op without networking.
+		this.channelManager.on(
+			'ffor:tower:resolve',
+			(info: { towerNodeId: Buffer; towerUri?: string }) => {
+				if (!this.peerManager || this.channelManager.hasFforTowerClient()) {
+					return;
+				}
+				if (info.towerNodeId.toString('hex') === this.nodeId) {
+					// Guard: we cannot be our own tower (M7.2 reasoning).
+					return;
+				}
+				try {
+					const client = new PeerTowerClient(this.peerManager, {
+						towerNodeId: info.towerNodeId,
+						towerUri: info.towerUri
+					});
+					this.channelManager.setFforTowerClient(client);
+				} catch (err) {
+					this.emit('node:error', {
+						code: 'FFOR_TOWER_RESOLVE_FAILED',
+						message: `Failed to auto-resolve tower: ${(err as Error).message}`,
+						timestamp: Date.now()
+					} as ILightningError);
+				}
+			}
+		);
+
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelAliases(channelId);
 			this.persistChannel(channelId);
@@ -1652,6 +1705,233 @@ export class LightningNode extends EventEmitter {
 
 	getPeerManager(): PeerManager | null {
 		return this.peerManager;
+	}
+
+	// ─────────────── FFOR: offline-receive tower (M7.3 operator UX) ───────────────
+
+	/**
+	 * Host a durable embedded tower on this node (CLI --tower). The M7.2
+	 * breach-watch auto-wires (via startChainWatcher's re-registration + the
+	 * 'ffor:tower:watch' event). Recent breach/escape alerts are buffered for
+	 * towerStatus(). A memory/non-durable store loses released-preimage packages
+	 * on restart (the §9.4 failure) — the CLI enforces a durable store; passing a
+	 * MemoryTowerStore here is only for --tower-demo.
+	 */
+	enableTower(store: IFforTowerStore): FforTower {
+		const tower = new FforTower(store);
+		this._fforTower = tower;
+		this.channelManager.setFforTower(tower);
+		this.channelManager.on(
+			'ffor:tower:breach',
+			(e: { epochId?: Buffer; alert?: string }) => {
+				this._fforTowerAlerts.push({
+					kind: 'breach',
+					epochId: e.epochId?.toString('hex'),
+					alert: e.alert,
+					at: Date.now()
+				});
+				if (this._fforTowerAlerts.length > 50) this._fforTowerAlerts.shift();
+				this.emit('ffor:tower:breach', e);
+			}
+		);
+		this.channelManager.on(
+			'ffor:tower:escape',
+			(e: { epochId?: Buffer; alert?: string }) => {
+				this._fforTowerAlerts.push({
+					kind: 'escape',
+					epochId: e.epochId?.toString('hex'),
+					alert: e.alert,
+					at: Date.now()
+				});
+				if (this._fforTowerAlerts.length > 50) this._fforTowerAlerts.shift();
+				this.emit('ffor:tower:escape', e);
+			}
+		);
+		// If the chain watcher is already running, arm the breach-watch now
+		// (otherwise startChainWatcher does it on boot).
+		if (this.chainWatcher) {
+			this.channelManager.fforRegisterTowerWatches();
+		}
+		return tower;
+	}
+
+	/** The embedded tower this node hosts, if any (--tower). */
+	getFforTower(): FforTower | null {
+		return this._fforTower;
+	}
+
+	/**
+	 * Configure this node's DEFAULT tower for the epochs it receives on (CLI
+	 * --use-tower nodeIdHex@host:port). Builds a real BOLT-8 PeerTowerClient and
+	 * wires it as the S-side/R-side release+fetch client. The tower MUST be a
+	 * separate always-on node (a node cannot be its own tower).
+	 */
+	useTower(uri: string): void {
+		if (!this.peerManager) {
+			throw new Error('useTower requires networking (enableNetworking)');
+		}
+		const at = uri.indexOf('@');
+		if (at < 0) {
+			throw new Error('useTower: expected nodeIdHex@host:port');
+		}
+		const nodeIdHex = uri.slice(0, at);
+		const hostPort = uri.slice(at + 1);
+		const colon = hostPort.lastIndexOf(':');
+		if (colon < 0) {
+			throw new Error('useTower: expected nodeIdHex@host:port');
+		}
+		const address = {
+			host: hostPort.slice(0, colon),
+			port: parseInt(hostPort.slice(colon + 1), 10)
+		};
+		if (nodeIdHex === this.nodeId) {
+			throw new Error('a node cannot be its own tower');
+		}
+		this._fforTowerNodeId = Buffer.from(nodeIdHex, 'hex');
+		this._fforTowerUri = uri;
+		this._fforTowerClient = new PeerTowerClient(this.peerManager, {
+			towerNodeId: this._fforTowerNodeId,
+			address
+		});
+		// Also wire it as the S-side release client (a node can BOTH receive
+		// offline through this tower and settle others' epochs through it).
+		this.channelManager.setFforTowerClient(this._fforTowerClient);
+	}
+
+	/**
+	 * R side, one-shot offline-receive setup. UP-FRONT (while online, BEFORE
+	 * going offline): generate K tower preimages, initiate a variant-B epoch on
+	 * the channel with the tower TLVs, build the provisioning bundle, and
+	 * PROVISION the configured tower over BOLT-8. Returns the epoch id and the K
+	 * amountless BOLT 11 invoices to hand out. Requires useTower() first.
+	 */
+	async startOfflineReceiveEpoch(opts: {
+		channelId?: Buffer;
+		peerPubkey?: string;
+		budgetMsat: bigint;
+		maxPayments: number;
+		minPaymentMsat: bigint;
+		settlementDeadline: number;
+		voucherExpiry: number;
+		feeBaseMsat?: number;
+		feeProportionalMillionths?: number;
+	}): Promise<{
+		epochId: Buffer;
+		invoices: string[];
+		paymentHashes: Buffer[];
+	}> {
+		if (
+			!this._fforTowerClient ||
+			!this._fforTowerNodeId ||
+			!this._fforTowerUri
+		) {
+			throw new Error('startOfflineReceiveEpoch requires useTower() first');
+		}
+		let channelId = opts.channelId;
+		if (!channelId && opts.peerPubkey) {
+			const chans = this.channelManager.getChannelsByPeer(opts.peerPubkey);
+			channelId = chans[0]?.getChannelId() ?? undefined;
+		}
+		if (!channelId) {
+			throw new Error('startOfflineReceiveEpoch: no channel found');
+		}
+		const K = opts.maxPayments;
+		const gen = generateTowerPreimages(K);
+		const res = this.channelManager.initiateFforEpoch(channelId, {
+			variant: FforVariant.B,
+			budgetMsat: opts.budgetMsat,
+			maxPayments: K,
+			minPaymentMsat: opts.minPaymentMsat,
+			settlementDeadline: opts.settlementDeadline,
+			voucherExpiry: opts.voucherExpiry,
+			feeBaseMsat: opts.feeBaseMsat ?? 1000,
+			feeProportionalMillionths: opts.feeProportionalMillionths ?? 5000,
+			escapeGranularityMsat: 0n,
+			paymentHashes: gen.paymentHashes,
+			towerNodeId: this._fforTowerNodeId,
+			// R advertises the full dial URI so S can auto-resolve the tower.
+			towerUri: this._fforTowerUri
+		});
+		if (!res.ok) {
+			throw new Error(`initiateFforEpoch failed: ${res.error}`);
+		}
+		// Epoch setup (ff_init -> ff_accept -> ...) round-trips over the peer
+		// connection; wait until it completes (n0 known, invoices generated)
+		// before building the provisioning bundle.
+		const ch = this.channelManager.getChannel(channelId);
+		for (let i = 0; i < 100; i++) {
+			const ep = ch?.getFforEpoch();
+			if (ep && ep.sCommitmentNumber !== null && ep.invoices.length >= K) {
+				break;
+			}
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		const provisioning = this.channelManager.buildFforTowerProvisioning(
+			channelId,
+			gen.preimages
+		);
+		if (!provisioning) {
+			throw new Error(
+				'failed to build tower provisioning bundle (epoch setup incomplete)'
+			);
+		}
+		// Provision the tower NOW, while online (not on crash) — R can then go
+		// offline safely.
+		await this._fforTowerClient.provision(provisioning);
+		const epoch = this.channelManager.getChannel(channelId)?.getFforEpoch();
+		return {
+			epochId: epoch ? Buffer.from(epoch.epochId) : provisioning.epochId,
+			invoices: epoch ? [...epoch.invoices] : [],
+			paymentHashes: gen.paymentHashes
+		};
+	}
+
+	/**
+	 * R side, on return: fetch the settled packages + preimages from the
+	 * configured tower and ingest them so the vouchers can convert to balance.
+	 */
+	async recoverFromTower(channelId: Buffer): Promise<ChannelResult> {
+		if (!this._fforTowerClient) {
+			throw new Error('recoverFromTower requires useTower() first');
+		}
+		return this.channelManager.fforRecoverFromTower(
+			channelId,
+			this._fforTowerClient
+		);
+	}
+
+	/**
+	 * Operator view of this node's tower: provisioned epochs with per-epoch
+	 * released counts, plus recent breach/escape alerts (M7.2).
+	 */
+	towerStatus(): {
+		enabled: boolean;
+		epochs: Array<{
+			epochId: string;
+			lastReleased: number;
+			maxPayments: number;
+		}>;
+		alerts: Array<{
+			kind: 'breach' | 'escape';
+			epochId?: string;
+			alert?: string;
+			at: number;
+		}>;
+		usingTower: string | null;
+	} {
+		const epochs = this._fforTower
+			? this._fforTower.listEpochStatus().map((e) => ({
+					epochId: e.epochId.toString('hex'),
+					lastReleased: e.lastReleased,
+					maxPayments: e.maxPayments
+			  }))
+			: [];
+		return {
+			enabled: this._fforTower !== null,
+			epochs,
+			alerts: [...this._fforTowerAlerts],
+			usingTower: this._fforTowerUri
+		};
 	}
 
 	// ─────────────── Peer Management ───────────────
