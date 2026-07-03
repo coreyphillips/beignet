@@ -3697,6 +3697,12 @@ export class ChannelManager extends EventEmitter {
 			if (feeRatePerVbyte <= entry.lastFeeRate) continue;
 
 			const channelId = Buffer.from(channelIdHex, 'hex');
+			// Re-broadcast the PARENT commitment alongside the child. A fee spike can
+			// evict both parent and child; the CPFP child alone is an orphan
+			// (missing-inputs) and never re-enters the mempool, so bumping only the
+			// child left the commitment stuck forever while lastFeeRate advanced.
+			// Re-broadcasting an already-confirmed parent is rejected harmlessly.
+			this.emit('broadcast:tx', entry.action.tx);
 			void this._handleFeeBumpAndBroadcast(channelId, {
 				...entry.action,
 				feeratePerVbyte: feeRatePerVbyte,

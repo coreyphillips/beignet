@@ -469,3 +469,58 @@ describe('Audit MEDIUM-2: _seedMonitorPreimages processes broadcast actions', fu
 		expect(broadcast).to.equal(fakeTx);
 	});
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// MEDIUM-3: re-CPFP re-broadcasts the parent commitment, not just the child
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit MEDIUM-3: reCpfpStuckCommitments re-broadcasts the parent', function () {
+	this.timeout(10_000);
+
+	it('emits the parent commitment tx when re-bumping a stuck package', () => {
+		const cfg: IChannelManagerConfig = {
+			localBasepoints: makeBasepoints(makeSeed(41)),
+			localPerCommitmentSeed: makeSeed(141),
+			localFundingPrivkey: makeSeed(241)
+		};
+		const cm = new ChannelManager(cfg);
+		cm.on('error', () => {});
+		// A funding provider is present, so the "no provider" fallback (which would
+		// also emit the parent) is NOT taken; the child build fails on the stub
+		// action instead, isolating the parent re-broadcast as the fix under test.
+		(cm as any).fundingProvider = {
+			selectFeeBumpInputs: async (): Promise<unknown> => ({
+				inputs: [],
+				changeScript: Buffer.alloc(22)
+			})
+		};
+
+		const parentBuf = Buffer.from('aabbccddeeff', 'hex');
+		const channelIdHex = 'cc'.repeat(32);
+		(cm as any)._pendingCommitmentCpfp.set(channelIdHex, {
+			action: {
+				type: ChainActionType.FEE_BUMP_AND_BROADCAST,
+				kind: 'anchor-cpfp',
+				tx: parentBuf,
+				description: 'anchor commitment CPFP',
+				feeratePerVbyte: 5
+			},
+			broadcastHeight: 100,
+			lastFeeRate: 5
+		});
+		(cm as any).monitors.set(channelIdHex, {
+			isFullyResolved: (): boolean => false,
+			isCommitmentConfirmed: (): boolean => false
+		});
+
+		const broadcasts: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+
+		// Advance well past the re-bump interval with a strictly higher feerate.
+		cm.reCpfpStuckCommitments(100 + 1000, 50);
+
+		// Before the fix only the (orphan) child was emitted, so the evicted parent
+		// commitment never re-entered the mempool.
+		expect(broadcasts.some((b) => b.equals(parentBuf))).to.equal(true);
+	});
+});
