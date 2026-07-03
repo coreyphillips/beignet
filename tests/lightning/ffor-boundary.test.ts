@@ -92,17 +92,17 @@ describe('FFOR M6: boundary epochs (§8/§11.4)', function () {
 		);
 	});
 
-	it('min_payment edge: below min rejected, exactly min accepted', function () {
+	it('min_payment edge: 1 msat below min rejected, exactly min accepted', function () {
 		const min = 1_000_000n;
 		const t = createTriple({
 			prefix: 'bound-min',
 			params: { minPaymentMsat: min }
 		});
 		goOffline(t);
-		// Below min: rejected, hash NOT consumed. (Whole-satoshi amount: a
-		// PRE-EXISTING non-FFOR beignet bug desyncs the commitment when a
-		// FRACTIONAL-msat HTLC is FAILED upstream — reported separately.)
-		pay(t, t.hashes[0], min - 1000n);
+		// 1 msat below: rejected, hash NOT consumed. The rejected HTLC is
+		// deliberately FRACTIONAL-msat: failing it upstream exercises the
+		// sub-satoshi removal-round parity of the commitment builder.
+		pay(t, t.hashes[0], min - 1n);
 		expect(t.pFailed).to.have.length(1);
 		expect(
 			t.sErrors.some((e) => e.includes('below min_payment_msat')),
@@ -113,6 +113,36 @@ describe('FFOR M6: boundary epochs (§8/§11.4)', function () {
 		pay(t, t.hashes[0], min);
 		expect(t.pFulfilled, t.sErrors.join('; ')).to.have.length(1);
 		expect(t.sChannel.getFforEpoch()!.lastSeq).to.equal(1);
+	});
+
+	it('fractional-msat settlement: non-whole-satoshi delegated payments settle and reconcile exactly', function () {
+		// FFOR settlement composes with fractional-msat HTLC amounts end to
+		// end: fractional upstream HTLCs, fractional vouchers (BOLT 3 keeps
+		// the sub-satoshi remainder with the offerer), and a fractional
+		// rejected payment failed upstream mid-epoch.
+		const t = createTriple({ prefix: 'bound-frac', params: { maxPayments: 3 } });
+		goOffline(t);
+		const a1 = 1_000_001n; // v1 = 1,000,001 - (1000 + 5000) = 994,001
+		const a2 = 2_345_679n; // v2 = 2,345,679 - (1000 + 11,728) = 2,332,951
+		pay(t, t.hashes[0], a1);
+		pay(t, t.hashes[1], a2);
+		expect(t.pFulfilled, t.sErrors.join('; ')).to.have.length(2);
+		// A fractional below-min duplicate-hash part fails cleanly mid-epoch.
+		pay(t, t.hashes[1], a2);
+		expect(t.pFailed).to.have.length(1);
+		expect(t.sChannel.getFforEpoch()!.lastSeq).to.equal(2);
+		reconnectSR(t);
+		expect(
+			t.rChannel.getFforEpoch()!.state,
+			t.rErrors.concat(t.sErrors).join('; ')
+		).to.equal(FforEpochState.FF_CLOSED);
+		expect(t.rManager.fforFulfillVouchers(t.srChannelId).ok).to.equal(true);
+		const v1 = a1 - (1000n + (a1 * 5000n) / 1_000_000n);
+		const v2 = a2 - (1000n + (a2 * 5000n) / 1_000_000n);
+		expect(t.rChannel.getBalances().localMsat).to.equal(v1 + v2);
+		expect(t.sChannel.getBalances().localMsat).to.equal(
+			FUNDING_SATOSHIS * 1000n - v1 - v2
+		);
 	});
 
 	it('voucher dust-floor edge: amount clears min but v_i would be trimmed', function () {
