@@ -296,3 +296,51 @@ describe('Audit HIGH-6: failHtlc is direction-aware', function () {
 		expect(received!.state).to.equal(HtlcState.FAILED);
 	});
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// HIGH-4: force-close backstop for an inbound HTLC whose preimage we hold
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit HIGH-4: preimage-held inbound HTLC forces a claim close', function () {
+	this.timeout(10_000);
+
+	it('force-closes when a FULFILLED inbound HTLC nears expiry unacked', () => {
+		const alice = createNode(11);
+		const bob = createNode(12);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+
+		const chan = (alice as any).channelManager.getChannel(channelId);
+		const st = chan.getFullState();
+
+		const currentHeight = 800_000;
+		(alice as any).currentBlockHeight = currentHeight;
+
+		// An inbound HTLC we already fulfilled off-chain, but the peer never acked
+		// its removal, so it lingers FULFILLED and nears its cltv_expiry.
+		const received: IHtlcEntry = {
+			id: 3n,
+			amountMsat: 40_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: currentHeight + 5, // within the claim buffer
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.FULFILLED
+		};
+		st.htlcs.set('received-3', received);
+
+		let forceCloseEvent = false;
+		alice.on('node:error', (err: any) => {
+			if (err.code === 'HTLC_CLAIM_FORCE_CLOSE') forceCloseEvent = true;
+		});
+
+		(alice as any).scanExpiringHtlcs(currentHeight);
+
+		// Before the fix scanExpiringHtlcs skipped FULFILLED received HTLCs entirely,
+		// so nothing force-closed and the on-chain claim became a mempool race.
+		expect(forceCloseEvent).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});

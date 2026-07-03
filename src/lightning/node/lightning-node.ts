@@ -5933,10 +5933,25 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Blocks before an inbound HTLC's cltv_expiry at which, if we hold its
+	 * preimage but the off-chain fulfill has not been acked, we force-close the
+	 * inbound channel to claim on-chain. Must leave enough room for our
+	 * HTLC-success to confirm before the peer's HTLC-timeout becomes spendable at
+	 * cltv_expiry (LDK-style CLTV_CLAIM_BUFFER).
+	 */
+	private static readonly INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER = 18;
+
+	/**
 	 * Scan all channels for received HTLCs that are close to expiry.
-	 * Auto-fail any that are within the safety margin.
+	 * Auto-fail any that are within the safety margin. Separately, force-close to
+	 * claim any inbound HTLC we already hold the preimage for (or that is
+	 * FULFILLED off-chain) whose counterparty may never ack the removal.
 	 */
 	private scanExpiringHtlcs(blockHeight: number): void {
+		const claimBuffer = Math.max(
+			LightningNode.INBOUND_HTLC_CLAIM_FORCE_CLOSE_BUFFER,
+			this.htlcSafetyMargin
+		);
 		const channels = this.channelManager.listChannels();
 		for (const channel of channels) {
 			const state = channel.getFullState();
@@ -5945,6 +5960,35 @@ export class LightningNode extends EventEmitter {
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
+
+				// Backstop (HIGH-4): if we hold this inbound HTLC's preimage — either
+				// it is already FULFILLED off-chain (and an adversarial upstream never
+				// acks the removal, leaving it FULFILLED indefinitely) or we learned
+				// the preimage from downstream — our only guaranteed way to collect the
+				// funds is an on-chain HTLC-success. Failing it (below) would forfeit
+				// value we can actually claim. Force-close the inbound channel while a
+				// claim buffer remains before cltv_expiry, so our HTLC-success is the
+				// only valid spend and the peer cannot win an HTLC-timeout race.
+				const paymentHashHex = htlc.paymentHash?.toString('hex');
+				const haveClaim =
+					htlc.state === HtlcState.FULFILLED ||
+					(paymentHashHex !== undefined && this.preimages.has(paymentHashHex));
+				if (haveClaim && htlc.cltvExpiry - blockHeight <= claimBuffer) {
+					const channelId = state.channelId || state.temporaryChannelId;
+					this.emit('node:error', {
+						code: 'HTLC_CLAIM_FORCE_CLOSE',
+						channelId,
+						message: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
+						timestamp: Date.now()
+					} as ILightningError);
+					this.channelManager.forceClose(
+						channelId,
+						this.getSweepDestinationScript(),
+						this.resolveForceCloseFeeRatePerVbyte()
+					);
+					break; // channel is closing; stop scanning it
+				}
+
 				if (
 					htlc.state !== HtlcState.PENDING &&
 					htlc.state !== HtlcState.COMMITTED
