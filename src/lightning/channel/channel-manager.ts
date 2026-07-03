@@ -114,7 +114,8 @@ import {
 } from '../ffor/tower';
 import {
 	FF_TOWER_REQUEST_TYPES,
-	handleTowerServerMessage
+	handleTowerServerMessage,
+	decodeTowerAck
 } from '../ffor/tower-transport';
 import { escapeJForOwed } from '../ffor/escape';
 import { FFOR_ESCAPE_DELAY_BLOCKS } from '../ffor/types';
@@ -1362,6 +1363,11 @@ export class ChannelManager extends EventEmitter {
 	 */
 	handleNewBlock(blockHeight: number): ChainAction[] {
 		this._currentBlockHeight = blockHeight;
+		// FFOR M7.2: an embedded tower sees the node's chain — its height drives
+		// the §9.4 "height < D" release check and the breach-watch window.
+		if (this._fforEmbeddedTower) {
+			this._fforEmbeddedTower.setBlockHeight(blockHeight);
+		}
 		// Update block height on all channels for CLTV validation
 		for (const channel of this.channels.values()) {
 			channel.setBlockHeight(blockHeight);
@@ -3205,13 +3211,17 @@ export class ChannelManager extends EventEmitter {
 		payload: Buffer
 	): void {
 		if (!this._fforEmbeddedTower || !this.peerManager) return;
+		const selfNodeIdHex = this.config.nodePrivateKey
+			? getPublicKey(this.config.nodePrivateKey).toString('hex')
+			: undefined;
 		let resp: { type: number; payload: Buffer } | null;
 		try {
 			resp = handleTowerServerMessage(
 				this._fforEmbeddedTower,
 				peerPubkey,
 				type,
-				payload
+				payload,
+				selfNodeIdHex
 			);
 		} catch (e) {
 			this.emit(
@@ -3223,7 +3233,76 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (resp) {
 			this.peerManager.sendToPeer(peerPubkey, resp.type, resp.payload);
+			// M7.2: on a successful provision, (re)register the on-chain
+			// breach-watch for the epoch's funding outpoint.
+			if (
+				type === MessageType.FF_TOWER_PROVISION &&
+				resp.type === MessageType.FF_TOWER_ACK &&
+				decodeTowerAck(resp.payload).ok
+			) {
+				this.fforRegisterTowerWatches();
+			}
 		}
+	}
+
+	/**
+	 * FFOR M7.2: (re)register the on-chain breach-watch for every epoch the
+	 * embedded tower serves. Emits 'ffor:tower:watch' with the funding outpoint
+	 * + P2WSH scriptPubkey; the node (LightningNode) wires this to its
+	 * ChainWatcher via watchTowerEpochFunding. Called on a successful provision
+	 * AND on node boot after a restart (the tower rehydrates its epochs from the
+	 * durable store, so their watch info is available without R). Idempotent.
+	 */
+	fforRegisterTowerWatches(): void {
+		if (!this._fforEmbeddedTower) return;
+		for (const w of this._fforEmbeddedTower.listEpochWatchInfo()) {
+			this.emit('ffor:tower:watch', {
+				epochId: w.epochId,
+				fundingTxid: w.fundingTxid,
+				fundingOutputIndex: w.fundingOutputIndex,
+				fundingScriptPubkey: w.fundingScriptPubkey
+			});
+		}
+	}
+
+	/**
+	 * FFOR M7.2: a watched tower-epoch funding outpoint was spent on-chain. This
+	 * is the TOWER route, distinct from the node's own channel-monitor
+	 * handleFundingSpent — the tower's epochs are external channels, never run
+	 * through the node's force-close path. Hand the full spending tx to the
+	 * tower's breach classifier; on a revoked-commitment breach broadcast any
+	 * option-(a) justice tx via the node broadcaster and ALWAYS emit an alert
+	 * (option (b) minimum). For an escape, emit an alert and surface the
+	 * provable-fraud flag; the tower cannot penalize E_j (it lacks S's n0+1
+	 * secret), so no justice is built.
+	 */
+	fforHandleTowerSpend(
+		spendingTx: import('bitcoinjs-lib').Transaction,
+		blockHeight: number
+	): void {
+		if (!this._fforEmbeddedTower) return;
+		const result = this._fforEmbeddedTower.checkBroadcast(
+			spendingTx,
+			blockHeight
+		);
+		if (result.escape) {
+			this.emit('ffor:tower:escape', {
+				epochId: result.epochId,
+				alert: result.escape.alert,
+				underBroadcast: result.escape.underBroadcast,
+				j: result.escape.j
+			});
+			return;
+		}
+		if (!result.breach) return;
+		for (const justiceTx of result.justiceTxs) {
+			this.emit('broadcast:tx', justiceTx);
+		}
+		this.emit('ffor:tower:breach', {
+			epochId: result.epochId,
+			alert: result.alert,
+			justiceTxCount: result.justiceTxs.length
+		});
 	}
 
 	/**

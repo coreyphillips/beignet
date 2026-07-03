@@ -51,6 +51,13 @@ interface IWatchedFunding {
 	confirmed: boolean;
 	confirmationHeight: number;
 	announcementTriggered: boolean;
+	/**
+	 * FFOR M7.2: when set, this outpoint belongs to an EMBEDDED-TOWER epoch (an
+	 * external channel, not one of the node's own). A spend routes to the tower
+	 * breach classifier (channelManager.fforHandleTowerSpend), NOT the node's
+	 * own channel force-close path.
+	 */
+	towerEpochId?: Buffer;
 }
 
 /** A generic output being watched for spends */
@@ -333,6 +340,36 @@ export class ChainWatcher extends EventEmitter {
 		} catch (err) {
 			this.emit('error', err);
 		}
+	}
+
+	/**
+	 * FFOR M7.2: watch an embedded-tower epoch's funding outpoint for a spend.
+	 * The tower's epochs are EXTERNAL channels (between an external R and S),
+	 * not the node's own, so a spend routes to the tower breach classifier
+	 * (channelManager.fforHandleTowerSpend) rather than the node's force-close
+	 * path. Keyed by the epoch id. Idempotent (re-registration on boot is safe).
+	 */
+	async watchTowerEpochFunding(
+		epochId: Buffer,
+		txid: string,
+		outputIndex: number,
+		scriptPubkey: Buffer
+	): Promise<void> {
+		const scriptHash = computeScriptHash(scriptPubkey);
+		const key = `tower:${epochId.toString('hex')}`;
+		const watched: IWatchedFunding = {
+			channelId: epochId, // reused as the map key basis; never a real channel
+			txid,
+			outputIndex,
+			minimumDepth: 1,
+			scriptHash,
+			confirmed: true, // we only care about spends, not confirmation depth
+			confirmationHeight: 0,
+			announcementTriggered: false,
+			towerEpochId: Buffer.from(epochId)
+		};
+		this.watchedFundings.set(key, watched);
+		await this.watchFundingSpend(watched);
 	}
 
 	/**
@@ -705,6 +742,13 @@ export class ChainWatcher extends EventEmitter {
 
 			// Use 0 for mempool txs (Electrum returns height <= 0 for unconfirmed)
 			const height = entry.height > 0 ? entry.height : 0;
+			// FFOR M7.2: a tower-epoch funding spend routes to the tower breach
+			// classifier, NOT the node's own channel force-close path.
+			if (watched.towerEpochId) {
+				this.channelManager.fforHandleTowerSpend(spendingTx, height);
+				this.emit('tower:funding:spent', watched.towerEpochId, spendingTx);
+				return;
+			}
 			this.channelManager.handleFundingSpent(
 				watched.channelId,
 				spendingTx,

@@ -548,3 +548,354 @@ describe('FFOR M4: Variant B tower (regtest bitcoind)', function () {
 		expect(Math.round(received * 1e8)).to.equal(sweptValue);
 	});
 });
+
+// ─────────────── M7.2: node-embedded tower breach-watch via the chain feed ───────────────
+
+import { SqliteTowerStore } from '../../../src/lightning/ffor/tower-store-sqlite';
+import {
+	ChainWatcher,
+	IChainBackend,
+	computeScriptHash
+} from '../../../src/lightning/chain/chain-watcher';
+import os from 'os';
+import fs from 'fs';
+import pathmod from 'path';
+
+/**
+ * A minimal REAL bitcoind-backed chain backend: it discovers the spend of a
+ * registered funding outpoint by scanning blocks (what an Electrum server
+ * indexes for us). Enough to drive the ChainWatcher tower route on regtest.
+ */
+class RegtestChainBackend implements IChainBackend {
+	private headerCbs: Array<(h: number) => void> = [];
+	shCbs = new Map<string, () => void>();
+	/** scriptHash -> the funding outpoint it watches + the confirm height. */
+	private watched = new Map<
+		string,
+		{ txidDisplay: string; vout: number; fromHeight: number }
+	>();
+
+	registerFunding(
+		scriptHash: string,
+		txidDisplay: string,
+		vout: number,
+		fromHeight: number
+	): void {
+		this.watched.set(scriptHash, { txidDisplay, vout, fromHeight });
+	}
+
+	async subscribeToHeaders(cb: (h: number) => void): Promise<void> {
+		this.headerCbs.push(cb);
+	}
+	async subscribeToScriptHash(sh: string, cb: () => void): Promise<void> {
+		this.shCbs.set(sh, cb);
+	}
+	async getScriptHashHistory(
+		sh: string
+	): Promise<Array<{ txid: string; height: number }>> {
+		const w = this.watched.get(sh);
+		if (!w) return [];
+		const out: Array<{ txid: string; height: number }> = [
+			{ txid: w.txidDisplay, height: w.fromHeight }
+		];
+		// Is the funding outpoint spent? gettxout returns null when spent.
+		const utxo = await bitcoinRpc('gettxout', [w.txidDisplay, w.vout]);
+		if (utxo === null) {
+			const tip = (await bitcoinRpc('getblockcount')) as number;
+			for (let h = w.fromHeight; h <= tip; h++) {
+				const hash = (await bitcoinRpc('getblockhash', [h])) as string;
+				const block = (await bitcoinRpc('getblock', [hash, 2])) as {
+					tx: Array<{
+						txid: string;
+						vin: Array<{ txid?: string; vout?: number }>;
+					}>;
+				};
+				for (const tx of block.tx) {
+					if (
+						tx.vin.some(
+							(vin) => vin.txid === w.txidDisplay && vin.vout === w.vout
+						)
+					) {
+						out.push({ txid: tx.txid, height: h });
+					}
+				}
+			}
+		}
+		return out;
+	}
+	async getTransaction(txid: string): Promise<Buffer> {
+		const hex = (await bitcoinRpc('getrawtransaction', [txid])) as string;
+		return Buffer.from(hex, 'hex');
+	}
+	async broadcastTransaction(hex: string): Promise<string> {
+		return (await bitcoinRpc('sendrawtransaction', [hex])) as string;
+	}
+}
+
+function tmpTowerDb(): string {
+	return pathmod.join(
+		fs.mkdtempSync(pathmod.join(os.tmpdir(), 'ffor-m72-')),
+		'tower.db'
+	);
+}
+
+describe('FFOR M7.2 GATE: node-embedded tower breach-watch through the chain feed (regtest)', function () {
+	this.timeout(240_000);
+	let skip = false;
+	before(async function () {
+		this.timeout(30_000);
+		skip = !(await bitcoindUp());
+		if (!skip) await ensureBitcoindFunds(3);
+	});
+
+	it('node chain feed detects the revoked spend, tower penalizes, node broadcasts the justice tx; height tracks; S!=T guard; restart re-registers', async function () {
+		if (skip) this.skip();
+
+		// Reuse the funded S-R channel + provisioned epoch scenario, but move the
+		// tower onto a durable SqliteTowerStore embedded in a real T node.
+		const base = await setupVariantBRegtest('m72', [1_000_000n]);
+		// Extract the exact provisioning the loopback tower received (option a).
+		const memProv = (
+			base.tower as unknown as {
+				_epochs: Map<string, { prov: IFforTowerProvisioning }>;
+			}
+		)._epochs;
+		const provisioning = [...memProv.values()][0].prov;
+
+		// T node: hosts an embedded tower on a durable store, AND operates a
+		// normal channel to prove co-hosting does not break node operation.
+		const dbPath = tmpTowerDb();
+		const towerStore = new SqliteTowerStore(dbPath);
+		const tower = new FforTower(towerStore);
+		tower.provision(provisioning);
+		const tConfig = makeConfig('m72-T');
+		const tPub = getPublicKey(tConfig.nodePrivateKey!).toString('hex');
+		const tManager = new ChannelManager(tConfig);
+		const tBroadcasts: Buffer[] = [];
+		tManager.on('broadcast:tx', (tx: Buffer) => tBroadcasts.push(tx));
+		tManager.on('error', () => {});
+		tManager.setFforTower(tower);
+
+		// Co-hosting sanity: the T node opens its own (fake-funded) channel and
+		// settles a normal payment.
+		const peerConfig = makeConfig('m72-Tpeer');
+		const peerPub = getPublicKey(peerConfig.nodePrivateKey!).toString('hex');
+		const peerManager = new ChannelManager(peerConfig);
+		peerManager.on('error', () => {});
+		connect(tManager, tPub, peerManager, peerPub);
+		const tChannel = tManager.openChannel(peerPub, FUNDING_SATOSHIS);
+		tManager.createFunding(
+			tChannel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		);
+		const tChanId = tChannel.getChannelId()!;
+		tManager.handleFundingConfirmed(tChanId);
+		peerManager.handleFundingConfirmed(tChanId);
+		const preimage = crypto.randomBytes(32);
+		tManager.addHtlc(
+			tChanId,
+			1_000_000n,
+			sha256(preimage),
+			900,
+			Buffer.alloc(1366)
+		);
+		const peerChan = peerManager
+			.getChannelsByPeer(tPub)
+			.find((c) => c.getChannelId()?.equals(tChanId))!;
+		peerManager.fulfillHtlc(
+			tChanId,
+			[...peerChan.getFullState().htlcs.values()][0].id,
+			preimage
+		);
+		expect(
+			tChannel.getBalances().localMsat,
+			'T node operated its own channel normally'
+		).to.equal(FUNDING_SATOSHIS * 1000n - 1_000_000n);
+
+		// Release seq 1 on the durable embedded tower using the exact package S
+		// sent (already stored on the loopback tower during setup). This records
+		// the package-1 pre-revocation secret the breach classifier needs.
+		const baseRecord = base.towerStore.records.get(
+			provisioning.epochId.toString('hex')
+		)!;
+		const pkg1 = Buffer.from(baseRecord.packagesHex[0], 'hex');
+		const rel = tower.handleReleaseRequest(pkg1);
+		expect(rel.ok, (rel as { error?: string }).error).to.equal(true);
+
+		// Wire a real bitcoind-backed ChainWatcher to the T node.
+		const backend = new RegtestChainBackend();
+		const watcher = new ChainWatcher({ backend, channelManager: tManager });
+		const funding = createFundingScript(
+			base.sConfig.localBasepoints.fundingPubkey,
+			base.rConfig.localBasepoints.fundingPubkey,
+			NETWORK
+		);
+		const sh = computeScriptHash(funding.p2wshOutput);
+		const fundingTxidInternal = provisioning.channel.fundingTxid;
+		const fundingTxidDisplay = Buffer.from(fundingTxidInternal)
+			.reverse()
+			.toString('hex');
+		const fundHeight = ((await bitcoinRpc('getblockcount')) as number) - 1;
+		backend.registerFunding(
+			sh,
+			fundingTxidDisplay,
+			provisioning.channel.fundingOutputIndex,
+			Math.max(1, fundHeight - 5)
+		);
+		// Wire the manager's watch event to the ChainWatcher.
+		tManager.on(
+			'ffor:tower:watch',
+			(info: {
+				epochId: Buffer;
+				fundingTxid: Buffer;
+				fundingOutputIndex: number;
+				fundingScriptPubkey: Buffer;
+			}) => {
+				const txidHex = Buffer.from(info.fundingTxid).reverse().toString('hex');
+				void watcher.watchTowerEpochFunding(
+					info.epochId,
+					txidHex,
+					info.fundingOutputIndex,
+					info.fundingScriptPubkey
+				);
+			}
+		);
+		tManager.fforRegisterTowerWatches();
+		await sleep(50);
+
+		// Height tracking: the tower's height follows the node's chain feed.
+		await mineBlocks(2);
+		const tip = (await bitcoinRpc('getblockcount')) as number;
+		tManager.handleNewBlock(tip);
+		expect(
+			tower.getCurrentBlockHeight(),
+			'tower height tracks the node chain'
+		).to.equal(tip);
+
+		// S!=T guard: a provision naming T as the settlement peer is rejected.
+		const guardResp =
+			require('../../../src/lightning/ffor/tower-transport').handleTowerServerMessage(
+				tower,
+				provisioning.rNodeId.toString('hex'),
+				require('../../../src/lightning/message/types').MessageType
+					.FF_TOWER_PROVISION,
+				require('../../../src/lightning/ffor/tower-transport').encodeTowerProvision(
+					crypto.randomBytes(16),
+					JSON.stringify(
+						require('../../../src/lightning/ffor/tower-serialization').serializeTowerProvisioning(
+							{
+								...provisioning,
+								sNodeId: getPublicKey(tConfig.nodePrivateKey!)
+							}
+						)
+					)
+				),
+				tPub
+			);
+		const guardAck =
+			require('../../../src/lightning/ffor/tower-transport').decodeTowerAck(
+				guardResp.payload
+			);
+		expect(guardAck.ok, 'S==T provision rejected').to.equal(false);
+		expect(guardAck.error).to.match(/settlement peer/);
+
+		// S cheats: broadcasts the revoked C_{n0}^S on regtest.
+		const sDest = bitcoin.address.toOutputScript(
+			(await bitcoinRpc('getnewaddress', ['m72-s-cheat', 'bech32'])) as string,
+			NETWORK
+		);
+		const cheat = base.sManager.forceClose(
+			base.srChannelId,
+			sDest,
+			10,
+			NETWORK
+		);
+		expect(cheat.ok).to.equal(true);
+		const revokedTx = bitcoin.Transaction.fromBuffer(base.sBroadcasts[0]);
+		const revokedTxid = await acceptAndConfirm(
+			revokedTx.toHex(),
+			'revoked C_{n0}^S'
+		);
+		// eslint-disable-next-line no-console
+		console.log(`      GATE M7.2 revoked commitment: ${revokedTxid}`);
+
+		// Drive the node's chain feed: fire the scripthash notification. The
+		// ChainWatcher discovers the spend from bitcoind and routes it to the
+		// TOWER (fforHandleTowerSpend), which emits the justice tx on the node.
+		let towerSpent = false;
+		watcher.on('tower:funding:spent', () => (towerSpent = true));
+		tBroadcasts.length = 0;
+		const cb = backend.shCbs.get(sh);
+		expect(cb, 'funding scripthash watched').to.not.equal(undefined);
+		cb!();
+		await sleep(200);
+		expect(
+			towerSpent,
+			'spend routed through the chain feed to the tower'
+		).to.equal(true);
+		expect(tBroadcasts.length, 'node broadcast a justice tx').to.equal(1);
+
+		const justice = bitcoin.Transaction.fromBuffer(tBroadcasts[0]);
+		expect(
+			Buffer.from(justice.ins[0].hash).equals(revokedTx.getHash()),
+			'justice spends the revoked commitment'
+		).to.equal(true);
+		expect(
+			Buffer.from(justice.outs[0].script).equals(base.sweepScript)
+		).to.equal(true);
+		// The node's own broadcaster (ChainWatcher wired to the manager's
+		// broadcast:tx) already sent the justice tx to bitcoind — that is the
+		// production path. Confirm it (do NOT re-broadcast).
+		const justiceTxid = justice.getId();
+		await mineBlocks(1);
+		const jInfo = (await bitcoinRpc('getrawtransaction', [
+			justiceTxid,
+			true
+		])) as { confirmations?: number };
+		expect(
+			jInfo.confirmations ?? 0,
+			'node-broadcast justice tx confirmed'
+		).to.be.greaterThan(0);
+		// eslint-disable-next-line no-console
+		console.log(`      GATE M7.2 justice tx:         ${justiceTxid}`);
+		const received = (await bitcoinRpc('getreceivedbyaddress', [
+			bitcoin.address.fromOutputScript(base.sweepScript, NETWORK),
+			1
+		])) as number;
+		expect(Math.round(received * 1e8)).to.equal(justice.outs[0].value);
+
+		// Restart: rebuild the tower node from the SAME durable store. The epoch
+		// rehydrates (M7.0) and the funding watch re-registers (M7.2) with no R.
+		towerStore.close();
+		const towerStore2 = new SqliteTowerStore(dbPath);
+		const tower2 = new FforTower(towerStore2);
+		const tManager2 = new ChannelManager(tConfig);
+		tManager2.on('error', () => {});
+		tManager2.setFforTower(tower2);
+		const rewatched: Buffer[] = [];
+		tManager2.on('ffor:tower:watch', (info: { fundingTxid: Buffer }) =>
+			rewatched.push(info.fundingTxid)
+		);
+		tManager2.fforRegisterTowerWatches();
+		expect(rewatched.length, 'watch re-registered after restart').to.equal(1);
+		expect(
+			Buffer.from(rewatched[0]).equals(fundingTxidInternal),
+			'the rehydrated epoch funding outpoint is re-watched'
+		).to.equal(true);
+		// The rebuilt tower still penalizes the revoked broadcast.
+		const post = tManager2.listChannels; // noop ref to keep tManager2 used
+		void post;
+		const rebuiltBroadcasts: Buffer[] = [];
+		tManager2.on('broadcast:tx', (tx: Buffer) => rebuiltBroadcasts.push(tx));
+		tManager2.fforHandleTowerSpend(revokedTx, tip);
+		expect(
+			rebuiltBroadcasts.length,
+			'rebuilt tower still detects + penalizes the breach'
+		).to.equal(1);
+
+		towerStore2.close();
+		fs.rmSync(pathmod.dirname(dbPath), { recursive: true, force: true });
+	});
+});

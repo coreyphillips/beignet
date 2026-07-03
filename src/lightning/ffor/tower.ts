@@ -40,6 +40,7 @@ import {
 	IFforSettlementMessage
 } from './messages';
 import { validateSettlementPackage, fforVoucherSumMsat } from './settlement';
+import { createFundingScript } from '../script/funding';
 import { IEscapeChannelContext, matchEscapeBroadcast } from './escape';
 import {
 	serializeTowerProvisioning,
@@ -223,6 +224,8 @@ export interface IFforTowerFetchResponse {
 
 export interface IFforTowerBreachResult {
 	breach: boolean;
+	/** The epoch the spending tx was matched to (by funding outpoint), if any. */
+	epochId?: Buffer;
 	/** Human-readable alert (always set on breach — option (b) minimum). */
 	alert?: string;
 	/** Option (a): fully-witnessed justice transaction(s), ready to broadcast. */
@@ -302,6 +305,11 @@ export class FforTower {
 		this._currentBlockHeight = height;
 	}
 
+	/** The tower's current chain height (M7.2: fed by the node's chain feed). */
+	getCurrentBlockHeight(): number {
+		return this._currentBlockHeight;
+	}
+
 	get lastReleased(): number {
 		return this._record?.lastReleased ?? 0;
 	}
@@ -318,6 +326,41 @@ export class FforTower {
 			rNodeId: Buffer.from(entry.prov.rNodeId),
 			sNodeId: Buffer.from(entry.prov.sNodeId)
 		};
+	}
+
+	/**
+	 * M7.2 breach-watch: the funding outpoint + P2WSH scriptPubkey of every
+	 * epoch the tower serves, so a node can register the on-chain watches that
+	 * feed spending txs to checkBroadcast. Rebuilt from provisioning, so it is
+	 * available immediately after a restart rehydration (M7.0).
+	 */
+	listEpochWatchInfo(): Array<{
+		epochId: Buffer;
+		fundingTxid: Buffer;
+		fundingOutputIndex: number;
+		fundingScriptPubkey: Buffer;
+	}> {
+		const out: Array<{
+			epochId: Buffer;
+			fundingTxid: Buffer;
+			fundingOutputIndex: number;
+			fundingScriptPubkey: Buffer;
+		}> = [];
+		for (const entry of this._epochs.values()) {
+			const c = entry.prov.channel;
+			// The P2WSH scriptPubkey is network-independent (OP_0 <32-byte hash>).
+			const funding = createFundingScript(
+				c.rBasepoints.fundingPubkey,
+				c.sBasepoints.fundingPubkey
+			);
+			out.push({
+				epochId: Buffer.from(entry.prov.epochId),
+				fundingTxid: Buffer.from(c.fundingTxid),
+				fundingOutputIndex: c.fundingOutputIndex,
+				fundingScriptPubkey: funding.p2wshOutput
+			});
+		}
+		return out;
 	}
 
 	/**
@@ -608,6 +651,7 @@ export class FforTower {
 						  }), credits R ${creditedMsat} msat ≥ owed ${owedMsat} msat`;
 					return {
 						breach: false,
+						epochId: Buffer.from(this._prov.epochId),
 						justiceTxs: [],
 						escape: {
 							j: match.j,
@@ -640,7 +684,12 @@ export class FforTower {
 		}) broadcast by S`;
 		if (!this._prov.revocationBasepointSecret || !this._prov.sweepScript) {
 			// Option (b): alert-only tower.
-			return { breach: true, alert, justiceTxs: [] };
+			return {
+				breach: true,
+				epochId: Buffer.from(this._prov.epochId),
+				alert,
+				justiceTxs: []
+			};
 		}
 
 		// Option (a): build the justice tx with the scoped revocation key.
@@ -673,7 +722,12 @@ export class FforTower {
 				justiceTxs.push(r.spendTx.toBuffer());
 			}
 		}
-		return { breach: true, alert, justiceTxs };
+		return {
+			breach: true,
+			epochId: Buffer.from(this._prov.epochId),
+			alert,
+			justiceTxs
+		};
 	}
 
 	// ─────────────── Internals ───────────────

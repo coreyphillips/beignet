@@ -898,3 +898,286 @@ describe('FFOR M7.0: persist-before-release ordering (§9.4 item 5)', function (
 		}
 	});
 });
+
+// ─────────────── M7.2: node-embedded breach-watch + role guard ───────────────
+
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	handleTowerServerMessage,
+	encodeTowerProvision,
+	decodeTowerAck
+} from '../../src/lightning/ffor/tower-transport';
+import {
+	ChainWatcher,
+	IChainBackend,
+	computeScriptHash
+} from '../../src/lightning/chain/chain-watcher';
+
+const T_NODE_KEY = sha256(Buffer.from('ffor/T/node-key'));
+const T_NODE_ID = getPublicKey(T_NODE_KEY);
+
+function towerManagerWithEmbedded(tower: FforTower): ChannelManager {
+	const cm = new ChannelManager({
+		localConfig: { ...CONFIG },
+		localBasepoints: sBasepoints,
+		localPerCommitmentSeed: crypto.randomBytes(32),
+		localFundingPrivkey: crypto.randomBytes(32),
+		nodePrivateKey: T_NODE_KEY
+	});
+	cm.on('error', () => {});
+	cm.setFforTower(tower);
+	return cm;
+}
+
+describe('FFOR M7.2: S != T role guard', function () {
+	it('rejects a provision whose sNodeId is the tower node id', function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		// The provisioning names S == the tower node.
+		const prov = provisioning(store, { sNodeId: T_NODE_ID });
+		const json = JSON.stringify(serializeTowerProvisioning(prov));
+		const rid = crypto.randomBytes(16);
+		const resp = handleTowerServerMessage(
+			tower,
+			R_NODE_ID.toString('hex'), // sender is R (access control passes)
+			require('../../src/lightning/message/types').MessageType
+				.FF_TOWER_PROVISION,
+			encodeTowerProvision(rid, json),
+			T_NODE_ID.toString('hex') // self = tower node
+		);
+		expect(resp).to.not.equal(null);
+		const ack = decodeTowerAck(resp!.payload);
+		expect(ack.ok).to.equal(false);
+		expect(ack.error).to.match(/settlement peer/);
+		// The epoch was NOT provisioned.
+		expect(tower.getEpochAuth(Buffer.alloc(32, 0xee))).to.equal(null);
+	});
+
+	it('rejects a provision whose rNodeId is the tower node id (T cannot be R)', function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		const prov = provisioning(store, { rNodeId: T_NODE_ID });
+		const json = JSON.stringify(serializeTowerProvisioning(prov));
+		const rid = crypto.randomBytes(16);
+		const resp = handleTowerServerMessage(
+			tower,
+			T_NODE_ID.toString('hex'), // sender is R == T
+			require('../../src/lightning/message/types').MessageType
+				.FF_TOWER_PROVISION,
+			encodeTowerProvision(rid, json),
+			T_NODE_ID.toString('hex')
+		);
+		const ack = decodeTowerAck(resp!.payload);
+		expect(ack.ok).to.equal(false);
+		expect(ack.error).to.match(/recipient/);
+	});
+
+	it('accepts a provision when S and R are both external', function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		const json = JSON.stringify(
+			serializeTowerProvisioning(provisioning(store))
+		);
+		const rid = crypto.randomBytes(16);
+		const resp = handleTowerServerMessage(
+			tower,
+			R_NODE_ID.toString('hex'),
+			require('../../src/lightning/message/types').MessageType
+				.FF_TOWER_PROVISION,
+			encodeTowerProvision(rid, json),
+			T_NODE_ID.toString('hex')
+		);
+		expect(decodeTowerAck(resp!.payload).ok).to.equal(true);
+		expect(tower.getEpochAuth(Buffer.alloc(32, 0xee))).to.not.equal(null);
+	});
+});
+
+describe('FFOR M7.2: height feed through the embedded tower', function () {
+	it('the tower rejects a release once the node advances past D', function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		tower.provision(provisioning(store));
+		const cm = towerManagerWithEmbedded(tower);
+		const sEpoch = makeSEpoch();
+		// Node height still below D: release succeeds.
+		cm.handleNewBlock(500_000);
+		const ok = tower.handleReleaseRequest(buildPackage(sEpoch, 1));
+		expect(ok.ok, (ok as { error?: string }).error).to.equal(true);
+		// Node advances past D: the tower (fed by the node's chain) now refuses.
+		cm.handleNewBlock(D_DEADLINE + 1);
+		const rej = tower.handleReleaseRequest(buildPackage(sEpoch, 2));
+		expect(rej.ok).to.equal(false);
+		expect((rej as { error: string }).error).to.match(/deadline|height/i);
+	});
+});
+
+describe('FFOR M7.2: breach-watch route (manager + tower)', function () {
+	function provisionedTowerManager(): {
+		cm: ChannelManager;
+		tower: FforTower;
+	} {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		const sweepScript = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			Buffer.alloc(20, 0x0d)
+		]);
+		tower.provision(
+			provisioning(store, {
+				revocationBasepointSecret: R_REVOCATION_SECRET,
+				sweepScript,
+				network: undefined
+			})
+		);
+		const cm = towerManagerWithEmbedded(tower);
+		cm.handleNewBlock(500_000);
+		tower.handleReleaseRequest(buildPackage(makeSEpoch(), 1));
+		return { cm, tower };
+	}
+
+	it('fforHandleTowerSpend broadcasts the justice tx and emits a breach alert', function () {
+		const { cm } = provisionedTowerManager();
+		const broadcasts: Buffer[] = [];
+		const breaches: Array<{ alert?: string; justiceTxCount: number }> = [];
+		cm.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+		cm.on(
+			'ffor:tower:breach',
+			(e: { alert?: string; justiceTxCount: number }) => breaches.push(e)
+		);
+		const revoked = buildRevokedCommitment();
+		cm.fforHandleTowerSpend(revoked, 500_000);
+		expect(broadcasts.length).to.equal(1);
+		expect(breaches.length).to.equal(1);
+		expect(breaches[0].justiceTxCount).to.equal(1);
+		expect(breaches[0].alert).to.match(/revoked commitment/);
+		// The broadcast justice tx spends the revoked commitment.
+		const justice = require('bitcoinjs-lib').Transaction.fromBuffer(
+			broadcasts[0]
+		);
+		expect(Buffer.from(justice.ins[0].hash).equals(revoked.getHash())).to.equal(
+			true
+		);
+	});
+
+	it('a spend before package 1 is not flagged as a breach', function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		tower.provision(provisioning(store));
+		const cm = towerManagerWithEmbedded(tower);
+		let breached = false;
+		cm.on('ffor:tower:breach', () => (breached = true));
+		cm.fforHandleTowerSpend(buildRevokedCommitment(), 500_000);
+		expect(breached).to.equal(false);
+	});
+});
+
+describe('FFOR M7.2: ChainWatcher tower route delivers spends to the tower', function () {
+	// Minimal backend: fires the scripthash callback on demand and returns the
+	// spend from an in-memory history (the Electrum notification an operator's
+	// node would receive).
+	class RouteBackend implements IChainBackend {
+		headerCbs: Array<(h: number) => void> = [];
+		shCbs = new Map<string, () => void>();
+		history = new Map<string, Array<{ txid: string; height: number }>>();
+		txs = new Map<string, Buffer>();
+		async subscribeToHeaders(cb: (h: number) => void): Promise<void> {
+			this.headerCbs.push(cb);
+		}
+		async subscribeToScriptHash(sh: string, cb: () => void): Promise<void> {
+			this.shCbs.set(sh, cb);
+		}
+		async getScriptHashHistory(
+			sh: string
+		): Promise<Array<{ txid: string; height: number }>> {
+			return this.history.get(sh) ?? [];
+		}
+		async getTransaction(txid: string): Promise<Buffer> {
+			const t = this.txs.get(txid);
+			if (!t) throw new Error(`no tx ${txid}`);
+			return t;
+		}
+		async broadcastTransaction(hex: string): Promise<string> {
+			return sha256(Buffer.from(hex, 'hex')).reverse().toString('hex');
+		}
+	}
+
+	it('routes a funding-outpoint spend to fforHandleTowerSpend (not the channel path)', async function () {
+		const store = new MemoryTowerStore();
+		const tower = new FforTower(store);
+		const sweepScript = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			Buffer.alloc(20, 0x0d)
+		]);
+		tower.provision(
+			provisioning(store, {
+				revocationBasepointSecret: R_REVOCATION_SECRET,
+				sweepScript,
+				network: undefined
+			})
+		);
+		const cm = towerManagerWithEmbedded(tower);
+		cm.handleNewBlock(500_000);
+		tower.handleReleaseRequest(buildPackage(makeSEpoch(), 1));
+
+		const backend = new RouteBackend();
+		const watcher = new ChainWatcher({ backend, channelManager: cm });
+
+		// The manager emits ffor:tower:watch on register; wire it to the watcher.
+		cm.on(
+			'ffor:tower:watch',
+			(info: {
+				epochId: Buffer;
+				fundingTxid: Buffer;
+				fundingOutputIndex: number;
+				fundingScriptPubkey: Buffer;
+			}) => {
+				const txidHex = Buffer.from(info.fundingTxid).reverse().toString('hex');
+				void watcher.watchTowerEpochFunding(
+					info.epochId,
+					txidHex,
+					info.fundingOutputIndex,
+					info.fundingScriptPubkey
+				);
+			}
+		);
+
+		// Register the funding watch + seed the backend with the revoked spend.
+		const revoked = buildRevokedCommitment();
+		const revokedHex = revoked.toBuffer().toString('hex');
+		backend.txs.set(revoked.getId(), revoked.toBuffer());
+		const funding =
+			require('../../src/lightning/script/funding').createFundingScript(
+				rBasepoints.fundingPubkey,
+				sBasepoints.fundingPubkey
+			);
+		const sh = computeScriptHash(funding.p2wshOutput);
+		const fundingTxidDisplay = Buffer.from(FUNDING_TXID_INTERNAL)
+			.reverse()
+			.toString('hex');
+		backend.history.set(sh, [
+			{ txid: fundingTxidDisplay, height: 100 },
+			{ txid: revoked.getId(), height: 500_000 }
+		]);
+		void revokedHex;
+
+		cm.fforRegisterTowerWatches();
+		// Give the async watch registration a tick.
+		await new Promise((r) => setTimeout(r, 20));
+
+		const broadcasts: Buffer[] = [];
+		cm.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+		let towerSpent = false;
+		watcher.on('tower:funding:spent', () => (towerSpent = true));
+
+		// Fire the scripthash notification (Electrum would on the spend).
+		const cb = backend.shCbs.get(sh);
+		expect(cb, 'watch registered for the funding scripthash').to.not.equal(
+			undefined
+		);
+		cb!();
+		await new Promise((r) => setTimeout(r, 20));
+
+		expect(towerSpent, 'spend routed via the tower path').to.equal(true);
+		expect(broadcasts.length, 'justice tx broadcast').to.equal(1);
+	});
+});

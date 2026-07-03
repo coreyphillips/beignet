@@ -1729,6 +1729,39 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		});
+		// FFOR M7.2: an embedded tower's epoch funding outpoints must be watched
+		// so a revoked-commitment/escape spend reaches the tower breach classifier
+		// through the node's real chain feed. This is a TOWER route, distinct from
+		// the node's own channel-monitor funding-spend handling.
+		this.channelManager.on(
+			'ffor:tower:watch',
+			(info: {
+				epochId: Buffer;
+				fundingTxid: Buffer;
+				fundingOutputIndex: number;
+				fundingScriptPubkey: Buffer;
+			}) => {
+				if (!this.chainWatcher) return;
+				const txidHex = Buffer.from(info.fundingTxid).reverse().toString('hex');
+				this.chainWatcher
+					.watchTowerEpochFunding(
+						info.epochId,
+						txidHex,
+						info.fundingOutputIndex,
+						info.fundingScriptPubkey
+					)
+					.catch((err) => {
+						this.emit('node:error', {
+							code: 'FFOR_TOWER_WATCH_FAILED',
+							message: `Failed to watch tower epoch funding: ${
+								(err as Error).message
+							}`,
+							timestamp: Date.now()
+						} as ILightningError);
+					});
+			}
+		);
+
 		// Wire watch:output:requested — handle sweep output watching after force-close
 		this.chainWatcher.on(
 			'watch:output:requested',
@@ -1790,6 +1823,14 @@ export class LightningNode extends EventEmitter {
 			await this.chainWatcher.start();
 			// Re-watch funding outputs for all restored channels
 			await this.restoreChainWatches();
+			// FFOR M7.2: re-register the breach-watch for every embedded-tower
+			// epoch rehydrated from the durable store (M7.0), and re-seed the
+			// tower's height, so breach-watch resumes after a node restart.
+			const towerHeight = this.chainWatcher.getCurrentBlockHeight?.();
+			if (towerHeight && towerHeight > 0) {
+				this.channelManager.handleNewBlock(towerHeight);
+			}
+			this.channelManager.fforRegisterTowerWatches();
 			// Start reconnect monitor on ElectrumBackend to resume subscriptions after drops
 			if (
 				this._chainBackend &&

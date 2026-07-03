@@ -313,7 +313,8 @@ export function handleTowerServerMessage(
 	tower: FforTower,
 	senderPubkeyHex: string,
 	type: number,
-	payload: Buffer
+	payload: Buffer,
+	selfNodeIdHex?: string
 ): { type: number; payload: Buffer } | null {
 	switch (type) {
 		case FF_TOWER_PROVISION_TYPE: {
@@ -328,6 +329,32 @@ export function handleTowerServerMessage(
 							requestId,
 							false,
 							'provision rejected: sender is not the epoch recipient (R)'
+						)
+					};
+				}
+				// S != T role guard (fund-safety): a node that is BOTH the
+				// settlement peer S and the tower T for the same epoch collapses
+				// Variant-B collusion resistance to Variant-A trust — it could
+				// settle upstream and withhold the credit alone. Refuse.
+				if (selfNodeIdHex && prov.sNodeId.toString('hex') === selfNodeIdHex) {
+					return {
+						type: FF_TOWER_ACK_TYPE,
+						payload: encodeTowerAck(
+							requestId,
+							false,
+							'provision rejected: tower cannot also be the settlement peer (S) for this epoch'
+						)
+					};
+				}
+				// A node cannot be its OWN tower (it is down exactly when R is
+				// down). Reject R == T as well.
+				if (selfNodeIdHex && prov.rNodeId.toString('hex') === selfNodeIdHex) {
+					return {
+						type: FF_TOWER_ACK_TYPE,
+						payload: encodeTowerAck(
+							requestId,
+							false,
+							'provision rejected: tower cannot also be the recipient (R) for this epoch'
 						)
 					};
 				}
