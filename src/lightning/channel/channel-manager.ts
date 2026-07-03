@@ -1882,6 +1882,10 @@ export class ChannelManager extends EventEmitter {
 				msg.signature
 			);
 			if (closeTx) {
+				// Persist the signed close tx BEFORE processActions emits channel:closed
+				// (which triggers persistChannel upstream) so a restart in the
+				// pre-confirmation window can rebroadcast it and keep the funding watch.
+				channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
 				this.emit('broadcast:tx', closeTx);
 				this.processActions(peerPubkey, channel, actions);
 			} else {
@@ -2377,6 +2381,7 @@ export class ChannelManager extends EventEmitter {
 				  )
 				: null;
 		if (closeTx) {
+			channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
 			this.emit('broadcast:tx', closeTx);
 			this.processActions(peerPubkey, channel, actions);
 		} else {
@@ -2441,6 +2446,7 @@ export class ChannelManager extends EventEmitter {
 			  )
 			: null;
 		if (closeTx) {
+			channel.recordCooperativeCloseTx(Buffer.from(closeTx).toString('hex'));
 			this.emit('broadcast:tx', closeTx);
 			this.processActions(peerPubkey, channel, actions);
 		} else {

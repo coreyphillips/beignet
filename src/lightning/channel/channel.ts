@@ -423,6 +423,16 @@ export class Channel {
 		this._currentBlockHeight = height;
 	}
 
+	/**
+	 * Record the fully-signed mutual-close transaction (hex) we broadcast at
+	 * cooperative-close agreement. Persisted with the channel state so a restart
+	 * in the pre-confirmation window can rebroadcast it and re-arm the funding
+	 * watch (see LightningNode.restoreChainWatches).
+	 */
+	recordCooperativeCloseTx(txHex: string): void {
+		this._state.lastCooperativeCloseTxHex = txHex;
+	}
+
 	// ─────────────── Opening (Opener) ───────────────
 
 	/**

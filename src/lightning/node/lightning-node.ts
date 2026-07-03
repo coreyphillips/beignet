@@ -1812,8 +1812,46 @@ export class LightningNode extends EventEmitter {
 			// Only watch channels that have funding info and are not yet closed
 			if (!state.fundingTxid || state.fundingOutputIndex === undefined)
 				continue;
-			// Skip fully cooperative-closed channels
-			if (state.state === ChannelState.CLOSED) continue;
+			// A cooperative close sets CLOSED at fee/sig agreement, BEFORE the
+			// mutual-close tx confirms. Until the close is irrevocably buried a peer
+			// could still broadcast a revoked commitment on the still-live funding
+			// output, which we must be able to detect and punish. Unconditionally
+			// skipping here permanently drops the watch on restart in that window.
+			// Only skip once the close is fully resolved on-chain (mirrors the
+			// FORCE_CLOSED gate below); otherwise re-arm any per-output watches, then
+			// fall through to re-arm the funding watch and rebroadcast the stored
+			// mutual close so it re-enters the mempool if the network never saw it.
+			if (state.state === ChannelState.CLOSED) {
+				const monitor = this.channelManager.getMonitor(
+					state.channelId || state.temporaryChannelId
+				);
+				if (monitor && monitor.isFullyResolved()) continue;
+				if (monitor) {
+					for (const output of monitor.getTrackedOutputs()) {
+						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
+						try {
+							await this.chainWatcher.watchOutputByTxid(
+								output.txid,
+								output.outputIndex
+							);
+						} catch {
+							// Electrum hiccup: the funding watch below still drives
+							// detection of any commitment spend on the funding output.
+						}
+					}
+				}
+				if (state.lastCooperativeCloseTxHex && this._chainBackend) {
+					try {
+						await this._chainBackend.broadcastTransaction(
+							state.lastCooperativeCloseTxHex
+						);
+					} catch {
+						// Already in mempool/confirmed (or backend hiccup): the funding
+						// watch still reports the eventual spend either way.
+					}
+				}
+				// fall through to re-arm the funding watch below
+			}
 			if (state.state === ChannelState.FORCE_CLOSED) {
 				const monitor = this.channelManager.getMonitor(
 					state.channelId || state.temporaryChannelId
