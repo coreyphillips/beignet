@@ -120,7 +120,10 @@ describe('FFOR M6: boundary epochs (§8/§11.4)', function () {
 		// end: fractional upstream HTLCs, fractional vouchers (BOLT 3 keeps
 		// the sub-satoshi remainder with the offerer), and a fractional
 		// rejected payment failed upstream mid-epoch.
-		const t = createTriple({ prefix: 'bound-frac', params: { maxPayments: 3 } });
+		const t = createTriple({
+			prefix: 'bound-frac',
+			params: { maxPayments: 3 }
+		});
 		goOffline(t);
 		const a1 = 1_000_001n; // v1 = 1,000,001 - (1000 + 5000) = 994,001
 		const a2 = 2_345_679n; // v2 = 2,345,679 - (1000 + 11,728) = 2,332,951

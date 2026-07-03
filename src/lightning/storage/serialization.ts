@@ -334,6 +334,9 @@ export interface ISerializedChannelState {
 	// backward compatibility with pre-FFOR serialized states.
 	ffor?: ISerializedFforEpoch | null;
 	fforUsedEpochIds?: string[];
+	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
+	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
+	lastCooperativeCloseTxHex?: string;
 }
 
 export interface ISerializedSpliceInFlight {
@@ -727,7 +730,8 @@ export function serializeChannelState(
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		ffor: s.ffor ? serializeFforEpoch(s.ffor) : null,
-		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined
+		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined,
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex
 	};
 }
 
@@ -875,7 +879,8 @@ export function deserializeChannelState(
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		ffor: s.ffor ? deserializeFforEpoch(s.ffor) : null,
-		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined
+		fforUsedEpochIds: s.fforUsedEpochIds ? [...s.fforUsedEpochIds] : undefined,
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex
 	};
 }
 

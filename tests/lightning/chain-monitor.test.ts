@@ -761,6 +761,95 @@ describe('Chain Monitor (Phase 4C)', function () {
 			);
 			expect(penaltyBroadcast).to.exist;
 		});
+
+		// Audit MEDIUM-1: a reorg can evict a recorded commitment without resetting
+		// its recorded height. A later revoked commitment that confirms as the real
+		// spender must still be classified THEIR_REVOKED and penalized, even though
+		// the (stale) recorded height made the evicted commitment look irrevocably
+		// buried.
+		it('reclassifies a revoked commitment that reorg-replaces a deeply-buried recorded one', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			// 1) OUR current commitment confirms at height 100, then blocks advance so
+			// the recorded spend appears irrevocably buried.
+			const ourSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const ourPoint = perCommitmentPointFromSecret(ourSecret);
+			const ourTx = buildLocalCommitment(state, ourPoint).result.tx;
+			monitor.handleFundingSpent(ourTx, 100);
+			const buriedHeight = 100 + IRREVOCABLE_DEPTH + 1;
+			monitor.handleNewBlock(buriedHeight);
+
+			// 2) A reorg evicts our commitment; the peer broadcasts the revoked
+			// commitment #0, which now confirms as the real spender of the funding
+			// outpoint.
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const isOpener = state.role === ChannelRole.OPENER;
+			const openPBP = isOpener
+				? state.localBasepoints.paymentBasepoint
+				: state.remoteBasepoints!.paymentBasepoint;
+			const acceptPBP = isOpener
+				? state.remoteBasepoints!.paymentBasepoint
+				: state.localBasepoints.paymentBasepoint;
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+			const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
+			revokedTx.addInput(
+				Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
+				state.fundingOutputIndex,
+				seq
+			);
+			const toLocalScript = buildToLocalScript(
+				revocationPubkey,
+				theirDelayedPubkey,
+				state.localConfig.toSelfDelay
+			);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!,
+				800_000
+			);
+
+			const actions = monitor.handleFundingSpent(revokedTx, buriedHeight);
+
+			// Before the fix the stale recorded height made recordedFinal true, the
+			// swap was refused, and the breach went unclassified/unpunished.
+			const penalty = actions.filter(
+				(a: any) =>
+					a.type === ChainActionType.BROADCAST_TX &&
+					a.description &&
+					a.description.includes('penalty')
+			);
+			expect(penalty.length).to.be.greaterThan(0);
+		});
 	});
 
 	describe('Stuck HTLC re-fee-bump (M1)', function () {

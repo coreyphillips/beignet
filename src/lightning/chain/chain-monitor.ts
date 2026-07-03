@@ -295,19 +295,21 @@ export class ChainMonitor {
 			// entirely unresolved: our tracked outputs belong to a tx that no
 			// longer exists. Reset and reclassify against the confirmed spend.
 			// Only a CONFIRMED conflict swaps (mempool sightings of a competing
-			// commitment must not thrash the tracking back and forth), and only
-			// while the recorded spend is not yet irreversibly final.
-			const recordedFinal =
-				this._commitmentBroadcast != null &&
-				this._commitmentBroadcast.blockHeight > 0 &&
-				Math.max(this._currentBlockHeight, blockHeight) -
-					this._commitmentBroadcast.blockHeight >=
-					IRREVOCABLE_DEPTH;
+			// commitment must not thrash the tracking back and forth).
+			//
+			// The swap must NOT be gated on the recorded spend's apparent burial
+			// depth. The funding outpoint can be spent exactly once per chain, so a
+			// DIFFERENT tx confirming as its spender is itself definitive proof that
+			// the previously recorded commitment was reorged out, no matter how
+			// deeply buried its (now stale, never reset after the reorg) recorded
+			// height made it look. Refusing the swap on that stale height (the old
+			// recordedFinal >= IRREVOCABLE_DEPTH guard) let a later revoked
+			// commitment escape THEIR_REVOKED_COMMITMENT classification and go
+			// unpunished. Trust the confirmed conflict and reclassify against it.
 			if (
 				this._commitmentBroadcast &&
 				this._commitmentBroadcast.txid !== spendingTx.getId() &&
-				blockHeight > 0 &&
-				!recordedFinal
+				blockHeight > 0
 			) {
 				this._trackedOutputs = [];
 				this._commitmentBroadcast = null;
@@ -517,6 +519,27 @@ export class ChainMonitor {
 								output,
 								Buffer.from(output.sweepTxHex, 'hex'),
 								`${output.outputType.toLowerCase()} re-fee-bump (stuck HTLC race)`
+							)
+						);
+					} else if (
+						!ourAnchorHtlc &&
+						output.status === OutputStatus.SPEND_BROADCAST &&
+						output.broadcastHeight !== undefined &&
+						output.sweepTxHex !== undefined &&
+						blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
+					) {
+						// Non-anchor OUR-commitment HTLC-success/timeout: its fee is fixed
+						// by the counterparty signature and cannot be RBF'd, but the SAME
+						// pre-signed tx must still be periodically REBROADCAST. Otherwise an
+						// HTLC-success marked SPEND_BROADCAST by preimage seeding on restore
+						// (whose one-shot broadcast may never have reached the network) is
+						// pinned forever and the inbound HTLC falls to the peer's timeout.
+						output.broadcastHeight = blockHeight;
+						actions.push(
+							this._broadcastSweepAction(
+								output,
+								Buffer.from(output.sweepTxHex, 'hex'),
+								`${output.outputType.toLowerCase()} rebroadcast (our-commitment HTLC)`
 							)
 						);
 					}

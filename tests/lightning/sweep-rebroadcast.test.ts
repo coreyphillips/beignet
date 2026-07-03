@@ -98,7 +98,9 @@ function makeMinimalChannelState(): IChannelState {
 		dualFundingSession: null,
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0,
-		fundingBroadcastHeight: 0
+		fundingBroadcastHeight: 0,
+		pendingLocalUpdates: [],
+		pendingLocalUpdatesSignedCount: 0
 	};
 }
 
