@@ -20,7 +20,8 @@ import {
 import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { ChainActionType } from '../../src/lightning/chain/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import { INodeConfig, IFeeEstimator } from '../../src/lightning/node/types';
+import { IStorageBackend } from '../../src/lightning/storage/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
@@ -575,5 +576,69 @@ describe('Audit MEDIUM-4: failed CPFP attempt is retried at unchanged feerate', 
 		cm.reCpfpStuckCommitments(100 + 1000, 50);
 
 		expect(broadcasts.some((b) => b.equals(parentBuf))).to.equal(true);
+	});
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// MEDIUM-5: restore re-arms commitment CPFP even when the estimator errors
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit MEDIUM-5: restore re-arms CPFP on estimator failure', function () {
+	this.timeout(10_000);
+
+	// Minimal storage: reports one persisted chain monitor so the restore
+	// fee-handling block runs; everything else is empty.
+	function stubStorage(monitorEntries: unknown[]): IStorageBackend {
+		return new Proxy(
+			{},
+			{
+				get(_t, prop: string) {
+					if (prop === 'loadAllChainMonitors') return () => monitorEntries;
+					if (typeof prop === 'string' && prop.startsWith('loadAll'))
+						return () => [];
+					return (): unknown =>
+						typeof prop === 'string' && prop.startsWith('load')
+							? null
+							: undefined;
+				}
+			}
+		) as unknown as IStorageBackend;
+	}
+
+	it('calls rearmCommitmentCpfp for restored monitors when estimateFee rejects', async () => {
+		const origRearm = ChannelManager.prototype.rearmCommitmentCpfp;
+		let rearmCalls = 0;
+		ChannelManager.prototype.rearmCommitmentCpfp = function (
+			...args: unknown[]
+		): void {
+			rearmCalls++;
+			return (origRearm as (...a: unknown[]) => void).apply(this, args);
+		};
+
+		try {
+			const feeEstimator: IFeeEstimator = {
+				estimateFee: async (): Promise<number> => {
+					throw new Error('estimator offline');
+				}
+			};
+			const cfg = makeNodeConfig(61);
+			cfg.storage = stubStorage([{ channelId: 'aa'.repeat(32), state: {} }]);
+			cfg.feeEstimator = feeEstimator;
+
+			const node = new LightningNode(cfg);
+			node.on('error', () => {});
+			node.on('node:error', () => {});
+
+			// Let the estimateFee().catch microtask run.
+			await new Promise((r) => setTimeout(r, 30));
+
+			// Before the fix the .catch only logged, so a transient estimator error
+			// left the force-close commitment package unbumped for the whole session.
+			expect(rearmCalls).to.be.greaterThan(0);
+
+			node.destroy();
+		} finally {
+			ChannelManager.prototype.rearmCommitmentCpfp = origRearm;
+		}
 	});
 });

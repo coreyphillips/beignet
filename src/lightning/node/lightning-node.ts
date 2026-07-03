@@ -763,6 +763,21 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
+			// Re-arm the anchor commitment CPFP for OUR still-unconfirmed
+			// force-closes: the tracking map is in-memory only, so without this a
+			// restart leaves the low-fee commitment package unbumped forever.
+			// rearmCommitmentCpfp resolves its own live-or-floored feerate, so this
+			// MUST run regardless of whether the estimator succeeded — a transient
+			// estimator error or a <=0 sample must not leave the package unbumped.
+			const rearmAllCommitmentCpfp = (): void => {
+				for (const { channelId: monitorChannelId } of monitors) {
+					this.channelManager.rearmCommitmentCpfp(
+						Buffer.from(monitorChannelId, 'hex'),
+						this.resolveForceCloseFeeRatePerVbyte()
+					);
+				}
+			};
+
 			// Update restored chain monitors with current fee rate if estimator available
 			if (this.feeEstimator) {
 				this.feeEstimator
@@ -781,31 +796,22 @@ export class LightningNode extends EventEmitter {
 								if (m && typeof m.updateFeeRate === 'function') {
 									m.updateFeeRate(feeratePerKw);
 								}
-								// Re-arm the anchor commitment CPFP for OUR still
-								// unconfirmed force-closes: the tracking map is
-								// in-memory only, so without this a restart leaves
-								// the low-fee commitment package unbumped forever.
-								this.channelManager.rearmCommitmentCpfp(
-									Buffer.from(monitorChannelId, 'hex'),
-									this.resolveForceCloseFeeRatePerVbyte()
-								);
 							}
 						}
+						// Re-arm even on a <=0 sample.
+						rearmAllCommitmentCpfp();
 					})
 					.catch((err) => {
 						this.emitStructuredLog('fee', 'estimate_failed', {
 							error: err instanceof Error ? err.message : String(err)
 						});
+						// Re-arm even when the estimator errored.
+						rearmAllCommitmentCpfp();
 					});
 			} else {
 				// No estimator: still re-arm at the fallback feerate so the
 				// commitment package is at least re-broadcast + CPFP-tracked.
-				for (const { channelId: monitorChannelId } of monitors) {
-					this.channelManager.rearmCommitmentCpfp(
-						Buffer.from(monitorChannelId, 'hex'),
-						this.resolveForceCloseFeeRatePerVbyte()
-					);
-				}
+				rearmAllCommitmentCpfp();
 			}
 		}
 
