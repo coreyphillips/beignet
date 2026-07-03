@@ -105,7 +105,9 @@ function createTestChannel(
 		dualFundingSession: null,
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0,
-		fundingBroadcastHeight: 0
+		fundingBroadcastHeight: 0,
+		pendingLocalUpdates: [],
+		pendingLocalUpdatesSignedCount: 0
 	};
 
 	return new Channel(state);
