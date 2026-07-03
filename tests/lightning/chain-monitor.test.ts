@@ -814,7 +814,11 @@ describe('Chain Monitor (Phase 4C)', function () {
 			const acceptPBP = isOpener
 				? state.remoteBasepoints!.paymentBasepoint
 				: state.localBasepoints.paymentBasepoint;
-			const obscured = calculateObscuredCommitmentNumber(openPBP, acceptPBP, 0n);
+			const obscured = calculateObscuredCommitmentNumber(
+				openPBP,
+				acceptPBP,
+				0n
+			);
 			const revokedTx = new bitcoin.Transaction();
 			revokedTx.version = 2;
 			revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
