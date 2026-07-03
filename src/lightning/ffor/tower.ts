@@ -307,6 +307,20 @@ export class FforTower {
 	}
 
 	/**
+	 * M7.1 access control: the Noise-authenticated peer ids bound to an epoch
+	 * (from provisioning), so a transport layer can gate provision on R, release
+	 * on S, and fetch on R. Returns null when the tower serves no such epoch.
+	 */
+	getEpochAuth(epochId: Buffer): { rNodeId: Buffer; sNodeId: Buffer } | null {
+		const entry = this._epochs.get(epochId.toString('hex'));
+		if (!entry) return null;
+		return {
+			rNodeId: Buffer.from(entry.prov.rNodeId),
+			sNodeId: Buffer.from(entry.prov.sNodeId)
+		};
+	}
+
+	/**
 	 * M7.0: reload every persisted epoch (provisioning + record) from the store
 	 * into memory, rebuilding _prov/_record/_epochView WITHOUT re-provision.
 	 * Idempotent; called from the constructor. The last-loaded epoch is left

@@ -6,3 +6,4 @@ export * from './escape';
 export * from './tower';
 export * from './tower-serialization';
 export * from './tower-store-sqlite';
+export * from './tower-transport';

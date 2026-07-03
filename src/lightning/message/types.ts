@@ -91,7 +91,16 @@ export enum MessageType {
 	FF_RECONCILE_ACK = 55017,
 	FF_REVOKE_BATCH = 55019,
 	FF_END = 55021,
-	FF_ERROR = 55023
+	FF_ERROR = 55023,
+	// FFOR M7.1: tower transport over BOLT-8 peer messages (Appendix C).
+	// Direct Noise-authenticated request/response; each request carries a
+	// 16-byte request_id the client uses to correlate the async response.
+	FF_TOWER_PROVISION = 55031, // R -> T
+	FF_TOWER_ACK = 55033, // T -> R (provision result)
+	FF_TOWER_RELEASE = 55035, // S -> T (raw ff_settlement payload)
+	FF_TOWER_RELEASE_RESP = 55037, // T -> S (preimage or error)
+	FF_TOWER_FETCH = 55039, // R -> T (authenticated fetch)
+	FF_TOWER_FETCH_RESP = 55041 // T -> R (packages + preimages)
 }
 
 /**

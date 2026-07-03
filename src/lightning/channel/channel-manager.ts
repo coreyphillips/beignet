@@ -107,7 +107,15 @@ import {
 	fforVoucherHtlcId,
 	fforVoucherSumMsat
 } from '../ffor/settlement';
-import { IFforTowerClient, buildTowerFetchRequest } from '../ffor/tower';
+import {
+	IFforTowerClient,
+	FforTower,
+	buildTowerFetchRequest
+} from '../ffor/tower';
+import {
+	FF_TOWER_REQUEST_TYPES,
+	handleTowerServerMessage
+} from '../ffor/tower-transport';
 import { escapeJForOwed } from '../ffor/escape';
 import { FFOR_ESCAPE_DELAY_BLOCKS } from '../ffor/types';
 import { encode as encodeBolt11Invoice } from '../invoice/encode';
@@ -262,6 +270,12 @@ export class ChannelManager extends EventEmitter {
 	private _fforTowerClient: IFforTowerClient | null = null;
 	/** In-flight variant-B releases keyed by "channelIdHex:seq" (serialize). */
 	private _fforPendingReleases = new Set<string>();
+	/**
+	 * FFOR M7.1: an embedded tower this node HOSTS. When set, the node answers
+	 * FF_TOWER_* peer messages (provision/release/fetch) over BOLT-8, gated by
+	 * the Noise-authenticated sender pubkey. Null on nodes that only USE a tower.
+	 */
+	private _fforEmbeddedTower: FforTower | null = null;
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -275,6 +289,17 @@ export class ChannelManager extends EventEmitter {
 	 */
 	setFforTowerClient(client: IFforTowerClient | null): void {
 		this._fforTowerClient = client;
+	}
+
+	/**
+	 * FFOR M7.1: host an embedded tower on this node. Once attached to a
+	 * PeerManager, the node answers FF_TOWER_PROVISION/RELEASE/FETCH from peers
+	 * over BOLT-8 and sends the response back to the authenticated sender. The
+	 * Noise peer id is the access-control layer (provision from R, release from
+	 * S, fetch from R); per-message signatures remain the §12.2 evidence layer.
+	 */
+	setFforTower(tower: FforTower | null): void {
+		this._fforEmbeddedTower = tower;
 	}
 
 	/**
@@ -383,6 +408,10 @@ export class ChannelManager extends EventEmitter {
 			MessageType.FF_REVOKE_BATCH,
 			MessageType.FF_END,
 			MessageType.FF_ERROR,
+			// FFOR M7.1: tower transport (Appendix C). A node hosting an embedded
+			// tower answers these REQUEST types; the RESPONSE types are handled by
+			// PeerTowerClient's own onMessage registration, not here.
+			...FF_TOWER_REQUEST_TYPES,
 			// BOLT 1 error/warning: without these registrations a remote error is
 			// silently dropped — the channel never gets marked ERRORED and the node
 			// reconnect-loops against a peer that fails it on every reestablish.
@@ -1625,6 +1654,11 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.FF_ERROR:
 					this.handleFforErrorMsg(peerPubkey, payload);
+					break;
+				case MessageType.FF_TOWER_PROVISION:
+				case MessageType.FF_TOWER_RELEASE:
+				case MessageType.FF_TOWER_FETCH:
+					this.handleFforTowerServerMsg(peerPubkey, type, payload);
 					break;
 				case MessageType.ERROR:
 					this.handleErrorMsg(peerPubkey, payload);
@@ -3155,6 +3189,40 @@ export class ChannelManager extends EventEmitter {
 					'FFOR: ff_error during the epoch requires on-chain enforcement; call fforForceClose with a destination script'
 				);
 			}
+		}
+	}
+
+	/**
+	 * FFOR M7.1 (Appendix C): dispatch a FF_TOWER_* request to this node's
+	 * embedded tower and send the response back to the authenticated sender.
+	 * The Noise peer id (peerPubkey) is the access-control layer; the pure
+	 * handler in tower-transport applies the per-op check (provision from R,
+	 * release from S, fetch from R). No-op on a node not hosting a tower.
+	 */
+	private handleFforTowerServerMsg(
+		peerPubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		if (!this._fforEmbeddedTower || !this.peerManager) return;
+		let resp: { type: number; payload: Buffer } | null;
+		try {
+			resp = handleTowerServerMessage(
+				this._fforEmbeddedTower,
+				peerPubkey,
+				type,
+				payload
+			);
+		} catch (e) {
+			this.emit(
+				'error',
+				Buffer.alloc(0),
+				`FFOR tower server: ${(e as Error).message}`
+			);
+			return;
+		}
+		if (resp) {
+			this.peerManager.sendToPeer(peerPubkey, resp.type, resp.payload);
 		}
 	}
 
