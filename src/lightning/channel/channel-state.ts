@@ -167,6 +167,20 @@ export interface IChannelState {
 	lastSentRevokeSecret: Buffer | null;
 	/** Reestablish: cached revoke_and_ack next point for retransmission */
 	lastSentRevokeNextPoint: Buffer | null;
+	/**
+	 * Reestablish (BOLT 2): raw outgoing update messages (update_add_htlc /
+	 * update_fulfill_htlc / update_fail_htlc) the peer has NOT yet
+	 * acknowledged with a revoke_and_ack. On reconnection the peer may have
+	 * lost any of these (a receiver forgets uncommitted updates; a crashed
+	 * receiver restores a state that predates them), so they MUST be
+	 * retransmitted BEFORE any retransmitted commitment_signed. Entries up to
+	 * pendingLocalUpdatesSignedCount were covered by our last sent
+	 * commitment_signed and are dropped when the peer's revoke_and_ack
+	 * arrives; later entries belong to the next round and remain queued.
+	 */
+	pendingLocalUpdates: Array<{ type: number; payload: Buffer }>;
+	/** How many pendingLocalUpdates our last sent commitment_signed covers. */
+	pendingLocalUpdatesSignedCount: number;
 	/** Reestablish: saved state before AWAITING_REESTABLISH */
 	preReestablishState: ChannelState | null;
 
@@ -382,6 +396,8 @@ export function createOpenerState(params: {
 		lastSentPartialSignatureWithNonce: null,
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
+		pendingLocalUpdates: [],
+		pendingLocalUpdatesSignedCount: 0,
 		lastSentRevokeNextPoint: null,
 		preReestablishState: null,
 
@@ -488,6 +504,8 @@ export function createAcceptorState(params: {
 		lastSentPartialSignatureWithNonce: null,
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
+		pendingLocalUpdates: [],
+		pendingLocalUpdatesSignedCount: 0,
 		lastSentRevokeNextPoint: null,
 		preReestablishState: null,
 

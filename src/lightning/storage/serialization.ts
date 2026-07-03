@@ -274,6 +274,8 @@ export interface ISerializedChannelState {
 	lastSentHtlcSignatures: string[];
 	lastSentRevokeSecret: string | null;
 	lastSentRevokeNextPoint: string | null;
+	pendingLocalUpdates?: Array<{ type: number; payloadHex: string }>;
+	pendingLocalUpdatesSignedCount?: number;
 	preReestablishState: string | null;
 	lastProposedClosingFeeSat: string | null;
 	closingFeeMin: string | null;
@@ -466,6 +468,11 @@ export function serializeChannelState(
 		lastSentPartialSignatureWithNonce: bufToHex(
 			s.lastSentPartialSignatureWithNonce
 		),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
+			type: u.type,
+			payloadHex: u.payload.toString('hex')
+		})),
+		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: s.lastSentHtlcSignatures.map((b) =>
 			b.toString('hex')
 		),
@@ -602,6 +609,11 @@ export function deserializeChannelState(
 		lastSentPartialSignatureWithNonce: hexToBuf(
 			s.lastSentPartialSignatureWithNonce
 		),
+		pendingLocalUpdates: (s.pendingLocalUpdates ?? []).map((u) => ({
+			type: u.type,
+			payload: Buffer.from(u.payloadHex, 'hex')
+		})),
+		pendingLocalUpdatesSignedCount: s.pendingLocalUpdatesSignedCount ?? 0,
 		lastSentHtlcSignatures: (s.lastSentHtlcSignatures || []).map((h) =>
 			Buffer.from(h, 'hex')
 		),
