@@ -421,30 +421,37 @@ export function buildLocalCommitment(
 	// Local commitment: localAmount = our balance, remoteAmount = their balance.
 	// Our offered HTLCs' remainder stays with us; their offered (our received)
 	// with them.
-	let localAmount = (state.localBalanceMsat + offeredRemainderMsat) / 1000n;
-	let remoteAmount = (state.remoteBalanceMsat + receivedRemainderMsat) / 1000n;
-
 	// Adjust balances for FULFILLED/FAILED HTLCs (excluded from outputs above,
-	// but balance updates were deferred until revoke_and_ack)
+	// but balance updates were deferred until revoke_and_ack). This MUST happen
+	// in millisatoshis BEFORE flooring to whole satoshis: once the removal is
+	// finalized the refund/credit is applied to the msat balance and the SUM is
+	// floored, so flooring the parts separately here diverges by 1 sat whenever
+	// a fractional-msat amount rejoins a balance carrying the matching
+	// sub-satoshi residue (e.g. a failed HTLC refunding its offerer). That 1-sat
+	// skew made the two sides of a removal round sign different commitments.
+	let localMsat = state.localBalanceMsat + offeredRemainderMsat;
+	let remoteMsat = state.remoteBalanceMsat + receivedRemainderMsat;
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received and fulfilled: credit our balance
-				localAmount += entry.amountMsat / 1000n;
+				localMsat += entry.amountMsat;
 			} else {
 				// We offered and remote fulfilled: credit their balance
-				remoteAmount += entry.amountMsat / 1000n;
+				remoteMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received but failed: refund their balance
-				remoteAmount += entry.amountMsat / 1000n;
+				remoteMsat += entry.amountMsat;
 			} else {
 				// We offered but failed: refund our balance
-				localAmount += entry.amountMsat / 1000n;
+				localMsat += entry.amountMsat;
 			}
 		}
 	}
+	let localAmount = localMsat / 1000n;
+	let remoteAmount = remoteMsat / 1000n;
 
 	if (state.role === ChannelRole.OPENER) {
 		localAmount -= fee;
@@ -575,30 +582,32 @@ export function buildRemoteCommitment(
 
 	// Deduct fee from opener's balance
 	// Remote commitment: localAmount = their balance (to_local), remoteAmount = our balance (to_remote)
-	let localAmount = (state.remoteBalanceMsat + receivedRemainderMsat) / 1000n;
-	let remoteAmount = (state.localBalanceMsat + offeredRemainderMsat) / 1000n;
-
-	// Adjust balances for FULFILLED/FAILED HTLCs (excluded from outputs above,
-	// but balance updates were deferred until revoke_and_ack)
+	// Adjust balances for FULFILLED/FAILED HTLCs in MILLISATOSHIS before the
+	// whole-satoshi floor — see buildLocalCommitment for why flooring the parts
+	// separately desyncs the two sides of a removal round by 1 sat.
+	let localMsat = state.remoteBalanceMsat + receivedRemainderMsat;
+	let remoteMsat = state.localBalanceMsat + offeredRemainderMsat;
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received and fulfilled: credit our balance
-				remoteAmount += entry.amountMsat / 1000n;
+				remoteMsat += entry.amountMsat;
 			} else {
 				// We offered and remote fulfilled: credit their balance
-				localAmount += entry.amountMsat / 1000n;
+				localMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received but failed: refund their balance
-				localAmount += entry.amountMsat / 1000n;
+				localMsat += entry.amountMsat;
 			} else {
 				// We offered but failed: refund our balance
-				remoteAmount += entry.amountMsat / 1000n;
+				remoteMsat += entry.amountMsat;
 			}
 		}
 	}
+	let localAmount = localMsat / 1000n;
+	let remoteAmount = remoteMsat / 1000n;
 
 	if (state.role === ChannelRole.OPENER) {
 		// We are opener; our balance is to_remote on their commitment
