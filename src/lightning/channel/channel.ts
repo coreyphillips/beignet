@@ -1437,9 +1437,12 @@ export class Channel {
 		// We added an offered HTLC — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;
 
-		return [
-			sendMsg(MessageType.UPDATE_ADD_HTLC, encodeUpdateAddHtlcMessage(msg))
-		];
+		const payload = encodeUpdateAddHtlcMessage(msg);
+		// BOLT 2 reestablish: queue the raw update until the peer's
+		// revoke_and_ack acknowledges it — a reconnect must retransmit it.
+		this._queuePendingLocalUpdate(MessageType.UPDATE_ADD_HTLC, payload);
+
+		return [sendMsg(MessageType.UPDATE_ADD_HTLC, payload)];
 	}
 
 	/**
@@ -1650,12 +1653,12 @@ export class Channel {
 			paymentPreimage
 		};
 
-		return [
-			sendMsg(
-				MessageType.UPDATE_FULFILL_HTLC,
-				encodeUpdateFulfillHtlcMessage(msg)
-			)
-		];
+		const payload = encodeUpdateFulfillHtlcMessage(msg);
+		// BOLT 2 reestablish: a lost update_fulfill strands the HTLC (and the
+		// revealed preimage) — queue it for retransmission until acked.
+		this._queuePendingLocalUpdate(MessageType.UPDATE_FULFILL_HTLC, payload);
+
+		return [sendMsg(MessageType.UPDATE_FULFILL_HTLC, payload)];
 	}
 
 	/**
@@ -1680,6 +1683,12 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
 			];
+		}
+
+		// Dedup check: a reestablish replay of a fulfill we already processed
+		// (BOLT 2 update retransmission) is a no-op.
+		if (entry.state === HtlcState.FULFILLED) {
+			return [];
 		}
 
 		// Verify the revealed preimage actually hashes to this HTLC's
@@ -1758,9 +1767,11 @@ export class Channel {
 			reason
 		};
 
-		return [
-			sendMsg(MessageType.UPDATE_FAIL_HTLC, encodeUpdateFailHtlcMessage(msg))
-		];
+		const payload = encodeUpdateFailHtlcMessage(msg);
+		// BOLT 2 reestablish: queue for retransmission until acked.
+		this._queuePendingLocalUpdate(MessageType.UPDATE_FAIL_HTLC, payload);
+
+		return [sendMsg(MessageType.UPDATE_FAIL_HTLC, payload)];
 	}
 
 	/**
@@ -1785,6 +1796,12 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${msg.id} not found` }
 			];
+		}
+
+		// Dedup check: a reestablish replay of a fail we already processed
+		// (BOLT 2 update retransmission) is a no-op.
+		if (entry.state === HtlcState.FAILED) {
+			return [];
 		}
 
 		entry.state = HtlcState.FAILED;
@@ -1860,6 +1877,23 @@ export class Channel {
 				reason
 			}
 		];
+	}
+
+	/**
+	 * BOLT 2 reestablish: remember a raw outgoing update message until the
+	 * peer's revoke_and_ack acknowledges the commitment that contains it. On
+	 * reconnection the peer may have lost it (uncommitted updates are
+	 * forgotten across a disconnect, and a restarted peer restores a state
+	 * that may predate it), so handleReestablish retransmits the queue BEFORE
+	 * any retransmitted commitment_signed. Receivers treat replays
+	 * idempotently (duplicate add ids are ignored; a fulfill/fail of an
+	 * already fulfilled/failed HTLC is a no-op).
+	 */
+	private _queuePendingLocalUpdate(type: MessageType, payload: Buffer): void {
+		this._state.pendingLocalUpdates.push({
+			type,
+			payload: Buffer.from(payload)
+		});
 	}
 
 	/**
@@ -1958,6 +1992,11 @@ export class Channel {
 		// We have now committed all pending updates to the remote — clear the flag
 		// so we don't re-send commitment_signed for an unchanged state.
 		this._state.needsCommitment = false;
+
+		// Everything queued so far is covered by this signature; the peer's
+		// revoke_and_ack will acknowledge exactly this many updates.
+		this._state.pendingLocalUpdatesSignedCount =
+			this._state.pendingLocalUpdates.length;
 
 		// Move pending HTLCs to committed
 		for (const entry of this._state.htlcs.values()) {
@@ -2242,6 +2281,18 @@ export class Channel {
 				];
 			}
 			this._state.remoteNonce = msg.nextLocalNonce;
+		}
+
+		// The peer's revoke_and_ack acknowledges our last commitment_signed and
+		// every update it covered — those no longer need retransmission on
+		// reconnect. Updates queued AFTER that signature stay queued for the
+		// next round.
+		if (this._state.pendingLocalUpdatesSignedCount > 0) {
+			this._state.pendingLocalUpdates.splice(
+				0,
+				this._state.pendingLocalUpdatesSignedCount
+			);
+			this._state.pendingLocalUpdatesSignedCount = 0;
 		}
 
 		// Clean up fulfilled/failed HTLCs and finalize balance changes
@@ -4098,7 +4149,13 @@ export class Channel {
 		// ── Revocation retransmission logic ──
 		// msg.nextRevocationNumber is the next revocation the peer expects from us.
 		// We can only have revoked up to localCommitmentNumber commitments.
-		if (msg.nextRevocationNumber > this._state.localCommitmentNumber) {
+		// A value of EXACTLY localCommitmentNumber + 1 is the sig-in-flight
+		// case, not a gap: the peer signed a commitment we never received (the
+		// connection died between its updates/signature and us). Its own
+		// retransmission (updates + commitment_signed, triggered by our
+		// next_commitment_number) brings us level, after which we revoke
+		// normally. Only a larger gap is irrecoverable.
+		if (msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) {
 			// Peer expects a revocation we've never created — irrecoverable
 			return [
 				{
@@ -4133,6 +4190,21 @@ export class Channel {
 		// number) — the generic path below would replay a stale pre-splice
 		// commitment_signed and desync the channel.
 		const spliceActive = !!(this._spliceSession || this._state.spliceInFlight);
+
+		// ── Retransmit un-acked update messages (BOLT 2) ──
+		// Every queued update the peer has not acknowledged with a
+		// revoke_and_ack may have been lost with the connection (the peer
+		// forgets uncommitted updates; a restarted peer restores a state that
+		// may predate them). Replay them verbatim BEFORE any retransmitted
+		// commitment_signed so the signature always follows the updates it
+		// covers. Peers that did keep them treat the replays idempotently
+		// (duplicate add ids ignored; fulfill/fail of an already
+		// fulfilled/failed HTLC is a no-op).
+		if (!spliceActive) {
+			for (const update of this._state.pendingLocalUpdates) {
+				actions.push(sendMsg(update.type as MessageType, update.payload));
+			}
+		}
 
 		// ── Check if peer missed our commitment_signed ──
 		// If peer's nextCommitmentNumber <= remoteCommitmentNumber, they haven't received our latest.
