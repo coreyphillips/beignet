@@ -1668,9 +1668,19 @@ export class Channel {
 	}
 
 	/**
-	 * Fail a received HTLC.
+	 * Fail a received HTLC. HTLC ids are per-direction, so the direction MUST be
+	 * validated: an offered HTLC we sent shares its numeric id space with the
+	 * received HTLCs, and failing by numeric id alone would cancel an unrelated
+	 * received HTLC. Only a received HTLC (one the peer offered us) can be failed
+	 * off-chain via update_fail_htlc; an offered HTLC is resolved by the peer or
+	 * on-chain, never by us. Direction defaults to RECEIVED so existing callers
+	 * (all of which fail inbound HTLCs) are unchanged.
 	 */
-	failHtlc(htlcId: bigint, reason: Buffer): ChannelAction[] {
+	failHtlc(
+		htlcId: bigint,
+		reason: Buffer,
+		direction: HtlcDirection = HtlcDirection.RECEIVED
+	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN
@@ -1679,6 +1689,18 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot fail HTLC: wrong state'
+				}
+			];
+		}
+
+		// BOLT 2: update_fail_htlc removes an HTLC the PEER offered us. Refuse to
+		// fail one we offered rather than fall through to the received-keyed lookup
+		// and corrupt the same-id inbound HTLC.
+		if (direction !== HtlcDirection.RECEIVED) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot fail offered HTLC ${htlcId} off-chain`
 				}
 			];
 		}

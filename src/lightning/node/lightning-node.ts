@@ -5994,21 +5994,12 @@ export class LightningNode extends EventEmitter {
 
 				// If incoming CLTV is dangerously close, fail both legs
 				if (htlc.cltvExpiry - blockHeight <= doubleMargin) {
-					// Fail the outgoing leg first
-					const outParts = outKey.split(':');
-					const outChannelIdHex = outParts[0];
-					const outHtlcIdStr = outParts[1]?.replace('offered-', '');
-					if (outChannelIdHex && outHtlcIdStr) {
-						const outChannelId = Buffer.from(outChannelIdHex, 'hex');
-						const outHtlcId = BigInt(outHtlcIdStr);
-						const outHtlcSecretKey = `${outChannelIdHex}:${outHtlcId}`;
-						const outSharedSecret =
-							this.receivedHtlcSharedSecrets.get(outHtlcSecretKey);
-						const outReason = outSharedSecret
-							? createFailureMessage(outSharedSecret, TEMPORARY_CHANNEL_FAILURE)
-							: Buffer.alloc(290);
-						this.channelManager.failHtlc(outChannelId, outHtlcId, outReason);
-					}
+					// NOTE: the outgoing leg is an HTLC WE offered downstream; a
+					// forwarder cannot cancel its own offered HTLC off-chain. The
+					// previous "fail outgoing first" call passed the offered id to the
+					// received-keyed failHtlc path and canceled an unrelated same-id
+					// inbound HTLC on the outgoing channel. It is removed here; the
+					// outbound leg is resolved only by the downstream peer or on-chain.
 
 					// Fail the incoming leg
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
@@ -6480,12 +6471,14 @@ export class LightningNode extends EventEmitter {
 					if (hashHex) {
 						this.failPayment(Buffer.from(hashHex, 'hex'));
 					}
-					// Fail the HTLC on the channel
-					this.channelManager.failHtlc(
-						channelId,
-						htlc.id,
-						createFailureMessage(Buffer.alloc(32), TEMPORARY_CHANNEL_FAILURE)
-					);
+					// This is an OFFERED HTLC: we cannot fail it off-chain (only the
+					// peer or on-chain resolution can remove it). The associated
+					// outbound payment is marked failed above; the on-chain backstop
+					// below force-closes to claim it via the timeout path. Calling
+					// channelManager.failHtlc here (with the offered id) previously fell
+					// through to the received-keyed path and canceled an unrelated
+					// same-id inbound HTLC, refunding upstream while its downstream leg
+					// could still settle.
 				}
 
 				// On-chain backstop: if the peer has not signed away an offered HTLC

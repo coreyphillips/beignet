@@ -86,6 +86,7 @@ import {
 	ChannelResult,
 	ChannelState,
 	ChannelRole,
+	HtlcDirection,
 	isAnchorChannel,
 	isTaprootChannel
 } from './types';
@@ -679,9 +680,16 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Fail a received HTLC on a channel.
+	 * Fail a received HTLC on a channel. Direction defaults to RECEIVED; an
+	 * offered id must be passed explicitly so channel.failHtlc can reject it
+	 * rather than cancel an unrelated same-id received HTLC.
 	 */
-	failHtlc(channelId: Buffer, htlcId: bigint, reason: Buffer): ChannelResult {
+	failHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		reason: Buffer,
+		direction: HtlcDirection = HtlcDirection.RECEIVED
+	): ChannelResult {
 		const idHex = channelId.toString('hex');
 		const channel = this.channels.get(idHex);
 		if (!channel) {
@@ -696,7 +704,7 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
-		const actions = channel.failHtlc(htlcId, reason);
+		const actions = channel.failHtlc(htlcId, reason, direction);
 		this.processActions(peerPubkey, channel, actions);
 
 		// BOLT 2: after sending update_fail_htlc, send commitment_signed to commit

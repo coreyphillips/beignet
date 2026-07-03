@@ -19,8 +19,14 @@ import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
+	HtlcDirection,
+	HtlcState,
+	IHtlcEntry,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
+import { Channel } from '../../src/lightning/channel/channel';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
@@ -207,5 +213,86 @@ describe('Audit HIGH-2: restored watch stays reorg-eviction aware', function () 
 		// Before the fix the restored watch had spendTxid undefined, so the eviction
 		// branch never fired and the reorg-then-theft went undetected.
 		expect(unspentCalls).to.equal(1);
+	});
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// HIGH-6: direction-aware failHtlc (no same-id RECEIVED corruption)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit HIGH-6: failHtlc is direction-aware', function () {
+	this.timeout(10_000);
+
+	function makeChannelWithBothLegs(seedId: number): Channel {
+		const seed = makeSeed(seedId);
+		const state = createOpenerState({
+			temporaryChannelId: Buffer.alloc(32, 0xcc),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(seed),
+			localPerCommitmentSeed: makeSeed(seedId + 100)
+		});
+		state.state = ChannelState.NORMAL;
+		state.channelId = crypto.randomBytes(32);
+		state.remoteBasepoints = makeBasepoints(makeSeed(seedId + 50));
+		state.remoteConfig = { ...DEFAULT_CHANNEL_CONFIG };
+		state.fundingTxid = crypto.randomBytes(32);
+		state.fundingOutputIndex = 0;
+		state.localBalanceMsat = 500_000_000n;
+		state.remoteBalanceMsat = 500_000_000n;
+
+		// A live inbound HTLC and a live outbound HTLC sharing numeric id 5.
+		const received: IHtlcEntry = {
+			id: 5n,
+			amountMsat: 20_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 800_100,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.RECEIVED,
+			state: HtlcState.COMMITTED
+		};
+		const offered: IHtlcEntry = {
+			id: 5n,
+			amountMsat: 15_000n,
+			paymentHash: crypto.randomBytes(32),
+			cltvExpiry: 800_060,
+			onionRoutingPacket: Buffer.alloc(1366),
+			direction: HtlcDirection.OFFERED,
+			state: HtlcState.COMMITTED
+		};
+		state.htlcs.set('received-5', received);
+		state.htlcs.set('offered-5', offered);
+		return new Channel(state);
+	}
+
+	it('refuses to fail an offered HTLC and leaves the same-id received HTLC intact', () => {
+		const channel = makeChannelWithBothLegs(6);
+
+		const actions = channel.failHtlc(
+			5n,
+			Buffer.alloc(290),
+			HtlcDirection.OFFERED
+		);
+
+		// The offered-direction fail is refused (cannot cancel our own offered HTLC).
+		expect(actions).to.have.lengthOf(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+
+		// Critically, the unrelated received-5 HTLC is NOT corrupted. Before the fix
+		// the direction-blind lookup marked it FAILED and refunded upstream.
+		const received = channel.getFullState().htlcs.get('received-5');
+		expect(received!.state).to.equal(HtlcState.COMMITTED);
+	});
+
+	it('still fails a received HTLC by default (existing callers unchanged)', () => {
+		const channel = makeChannelWithBothLegs(7);
+		const actions = channel.failHtlc(5n, Buffer.alloc(290));
+		// Default direction RECEIVED: the inbound HTLC is failed as before.
+		expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+			false
+		);
+		const received = channel.getFullState().htlcs.get('received-5');
+		expect(received!.state).to.equal(HtlcState.FAILED);
 	});
 });
