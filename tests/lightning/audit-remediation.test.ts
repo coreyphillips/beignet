@@ -13,7 +13,12 @@ import {
 	ChainWatcher,
 	IChainBackend
 } from '../../src/lightning/chain/chain-watcher';
-import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import {
+	ChannelManager,
+	IChannelManagerConfig
+} from '../../src/lightning/channel/channel-manager';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
+import { ChainActionType } from '../../src/lightning/chain/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -415,5 +420,52 @@ describe('Audit HIGH-5: forward timeout gates on outbound resolution', function 
 		alice.destroy();
 		bob.destroy();
 		carol.destroy();
+	});
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// MEDIUM-2: seeded HTLC-success broadcast actions are processed on restore
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit MEDIUM-2: _seedMonitorPreimages processes broadcast actions', function () {
+	this.timeout(10_000);
+
+	it('emits the HTLC-success broadcast when restoring a monitor', () => {
+		const cfg: IChannelManagerConfig = {
+			localBasepoints: makeBasepoints(makeSeed(31)),
+			localPerCommitmentSeed: makeSeed(131),
+			localFundingPrivkey: makeSeed(231)
+		};
+		const cm = new ChannelManager(cfg);
+		cm.on('error', () => {});
+
+		// A preimage learned before the monitor exists (the restore ordering the
+		// finding describes: preimages re-recorded, then monitors restored).
+		const preimage = crypto.randomBytes(32);
+		const hash = crypto.createHash('sha256').update(preimage).digest();
+		cm.recordPreimage(hash, preimage);
+
+		// A restored monitor whose addPreimage yields an HTLC-success broadcast and
+		// marks its output SPEND_BROADCAST (as the real ChainMonitor does).
+		const fakeTx = Buffer.from('deadbeef', 'hex');
+		let addPreimageCalled = false;
+		const stubMonitor = {
+			addPreimage: (): unknown[] => {
+				addPreimageCalled = true;
+				return [{ type: ChainActionType.BROADCAST_TX, tx: fakeTx }];
+			}
+		} as unknown as ChainMonitor;
+
+		let broadcast: Buffer | null = null;
+		cm.on('broadcast:tx', (tx: Buffer) => {
+			broadcast = tx;
+		});
+
+		cm.restoreMonitor('aa'.repeat(32), stubMonitor);
+
+		expect(addPreimageCalled).to.equal(true);
+		// Before the fix _seedMonitorPreimages discarded the action, so the output
+		// was marked SPEND_BROADCAST but the HTLC-success never reached the network.
+		expect(broadcast).to.equal(fakeTx);
 	});
 });

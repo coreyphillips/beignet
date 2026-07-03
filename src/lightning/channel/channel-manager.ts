@@ -1179,7 +1179,7 @@ export class ChannelManager extends EventEmitter {
 			perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
 		);
 		this.monitors.set(idHex, monitor);
-		this._seedMonitorPreimages(monitor);
+		this._seedMonitorPreimages(idHex, monitor);
 		// Persist the monitor NOW. Without this it only reaches storage once the
 		// funding spend is detected on-chain — if the session ends first, the
 		// next restore sees FORCE_CLOSED with no monitor, never re-watches the
@@ -1235,7 +1235,7 @@ export class ChannelManager extends EventEmitter {
 				perCh?.htlcBasepointSecret || this.config.htlcBasepointSecret
 			);
 			this.monitors.set(channelIdHex, monitor);
-			this._seedMonitorPreimages(monitor);
+			this._seedMonitorPreimages(channelIdHex, monitor);
 		}
 
 		const chainActions = monitor.handleFundingSpent(spendingTx, blockHeight);
@@ -1347,7 +1347,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	restoreMonitor(channelId: string, monitor: ChainMonitor): void {
 		this.monitors.set(channelId, monitor);
-		this._seedMonitorPreimages(monitor);
+		this._seedMonitorPreimages(channelId, monitor);
 	}
 
 	/**
@@ -1373,9 +1373,26 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/** Seed a freshly created/restored monitor with all known preimages. */
-	private _seedMonitorPreimages(monitor: ChainMonitor): void {
+	private _seedMonitorPreimages(
+		channelIdHex: string,
+		monitor: ChainMonitor
+	): void {
+		const channelId = Buffer.from(channelIdHex, 'hex');
+		let produced = false;
 		for (const [hashHex, preimage] of this._knownPreimages) {
-			monitor.addPreimage(Buffer.from(hashHex, 'hex'), preimage);
+			const actions = monitor.addPreimage(Buffer.from(hashHex, 'hex'), preimage);
+			// addPreimage mutates the matched HTLC output to SPEND_BROADCAST and
+			// returns its broadcast/persist actions. Those MUST be processed (mirrors
+			// recordPreimage) or, on a restored monitor whose HTLC-success was seeded
+			// here, the output is marked broadcast but the tx never reaches the network
+			// — and the non-anchor OUR-commitment rebroadcast path used to skip it too.
+			if (actions.length > 0) {
+				this.processChainActions(channelId, actions);
+				produced = true;
+			}
+		}
+		if (produced) {
+			this.emit('monitor:updated', channelIdHex, monitor);
 		}
 	}
 

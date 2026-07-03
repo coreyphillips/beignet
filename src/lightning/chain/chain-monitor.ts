@@ -521,6 +521,27 @@ export class ChainMonitor {
 								`${output.outputType.toLowerCase()} re-fee-bump (stuck HTLC race)`
 							)
 						);
+					} else if (
+						!ourAnchorHtlc &&
+						output.status === OutputStatus.SPEND_BROADCAST &&
+						output.broadcastHeight !== undefined &&
+						output.sweepTxHex !== undefined &&
+						blockHeight - output.broadcastHeight >= REBROADCAST_INTERVAL
+					) {
+						// Non-anchor OUR-commitment HTLC-success/timeout: its fee is fixed
+						// by the counterparty signature and cannot be RBF'd, but the SAME
+						// pre-signed tx must still be periodically REBROADCAST. Otherwise an
+						// HTLC-success marked SPEND_BROADCAST by preimage seeding on restore
+						// (whose one-shot broadcast may never have reached the network) is
+						// pinned forever and the inbound HTLC falls to the peer's timeout.
+						output.broadcastHeight = blockHeight;
+						actions.push(
+							this._broadcastSweepAction(
+								output,
+								Buffer.from(output.sweepTxHex, 'hex'),
+								`${output.outputType.toLowerCase()} rebroadcast (our-commitment HTLC)`
+							)
+						);
 					}
 					continue;
 				}
