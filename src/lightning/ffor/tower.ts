@@ -42,6 +42,10 @@ import {
 import { validateSettlementPackage, fforVoucherSumMsat } from './settlement';
 import { IEscapeChannelContext, matchEscapeBroadcast } from './escape';
 import {
+	serializeTowerProvisioning,
+	deserializeTowerProvisioning
+} from './tower-serialization';
+import {
 	classifyCommitmentTx,
 	classifyOutputs,
 	resolveRevokedCommitmentOutputs
@@ -129,15 +133,29 @@ export interface IFforTowerRecord {
  * Durable storage hook. save() MUST complete before the corresponding
  * preimage release returns (spec §9.4 checklist item 5: "Package stored
  * durably. Only then release t_i").
+ *
+ * M7.0: a durable tower must ALSO persist the provisioning bundle (preimages,
+ * channel statics, points, scoped secrets), not just the record. R is offline
+ * across a tower restart and cannot re-provision, so without it the tower
+ * could neither release preimages nor verify new packages. saveProvisioning /
+ * loadProvisioning / listEpochs let FforTower rehydrate every epoch on startup
+ * with no R involvement.
  */
 export interface IFforTowerStore {
 	save(record: IFforTowerRecord): void;
 	load(epochIdHex: string): IFforTowerRecord | null;
+	/** Durably persist the provisioning bundle for an epoch (idempotent). */
+	saveProvisioning(provisioning: IFforTowerProvisioning): void;
+	/** Load the persisted provisioning for an epoch, or null. */
+	loadProvisioning(epochIdHex: string): IFforTowerProvisioning | null;
+	/** Every epoch id (hex) with a persisted provisioning bundle. */
+	listEpochs(): string[];
 }
 
 /** In-memory store; records the order of operations for tests. */
 export class MemoryTowerStore implements IFforTowerStore {
 	records = new Map<string, IFforTowerRecord>();
+	provisionings = new Map<string, IFforTowerProvisioning>();
 	saveLog: Array<{ epochIdHex: string; lastReleased: number }> = [];
 
 	save(record: IFforTowerRecord): void {
@@ -152,7 +170,29 @@ export class MemoryTowerStore implements IFforTowerStore {
 	}
 
 	load(epochIdHex: string): IFforTowerRecord | null {
-		return this.records.get(epochIdHex) ?? null;
+		const r = this.records.get(epochIdHex);
+		return r ? { ...r, packagesHex: [...r.packagesHex] } : null;
+	}
+
+	saveProvisioning(provisioning: IFforTowerProvisioning): void {
+		// Deep-clone via the hex/string serialization so the stored copy is a
+		// faithful round-trip (no aliasing of the live buffers) — the same
+		// contract a disk-backed store honours.
+		this.provisionings.set(
+			provisioning.epochId.toString('hex'),
+			deserializeTowerProvisioning(serializeTowerProvisioning(provisioning))
+		);
+	}
+
+	loadProvisioning(epochIdHex: string): IFforTowerProvisioning | null {
+		const p = this.provisionings.get(epochIdHex);
+		return p
+			? deserializeTowerProvisioning(serializeTowerProvisioning(p))
+			: null;
+	}
+
+	listEpochs(): string[] {
+		return [...this.provisionings.keys()];
 	}
 }
 
@@ -228,16 +268,33 @@ export function buildTowerFetchRequest(
 
 // ─────────────── The tower ───────────────
 
+/** One epoch's live runtime state inside the tower. */
+interface ITowerEpoch {
+	prov: IFforTowerProvisioning;
+	record: IFforTowerRecord;
+	/** Mirror of R's epoch state (fed to the §9.4 checklist). */
+	epochView: IFforEpochStateData;
+}
+
 export class FforTower {
+	/**
+	 * Currently-selected epoch pointers. The request handlers key off the
+	 * incoming epoch_id via _selectEpoch, so these point at the epoch being
+	 * served; the escape/mirror helpers read them after selection.
+	 */
 	private _prov: IFforTowerProvisioning | null = null;
 	private _record: IFforTowerRecord | null = null;
-	private _store: IFforTowerStore;
-	/** The tower's view of the epoch, mirroring R's (fed to the §9.4 checklist). */
 	private _epochView: IFforEpochStateData | null = null;
+	/** All epochs the tower is durably serving (rehydrated on construct). */
+	private _epochs = new Map<string, ITowerEpoch>();
+	private _store: IFforTowerStore;
 	private _currentBlockHeight = 0;
 
 	constructor(store?: IFforTowerStore) {
 		this._store = store ?? new MemoryTowerStore();
+		// M7.0: a store-backed tower resumes every persisted epoch on startup,
+		// with NO re-provision (R is offline across the restart).
+		this.rehydrate();
 	}
 
 	/** The tower's chain view (drives the height < D checklist item). */
@@ -247,6 +304,75 @@ export class FforTower {
 
 	get lastReleased(): number {
 		return this._record?.lastReleased ?? 0;
+	}
+
+	/**
+	 * M7.0: reload every persisted epoch (provisioning + record) from the store
+	 * into memory, rebuilding _prov/_record/_epochView WITHOUT re-provision.
+	 * Idempotent; called from the constructor. The last-loaded epoch is left
+	 * selected for single-epoch callers, but any epoch is reachable by
+	 * _selectEpoch on the incoming request's epoch_id.
+	 */
+	rehydrate(): void {
+		for (const epochIdHex of this._store.listEpochs()) {
+			if (this._epochs.has(epochIdHex)) continue;
+			const prov = this._store.loadProvisioning(epochIdHex);
+			if (!prov) continue;
+			const record = this._store.load(epochIdHex) ?? {
+				epochIdHex,
+				lastReleased: 0,
+				packagesHex: [],
+				revocationSecretN0Hex: null
+			};
+			this._activateEpoch(prov, record);
+		}
+	}
+
+	/**
+	 * Build the in-memory runtime for an epoch (prov + record + replayed view),
+	 * register it in _epochs, and leave it selected. Shared by provision (fresh
+	 * or idempotent) and rehydrate (restart). Does NOT persist — callers that
+	 * mutate persistent state call the store explicitly (persist-before-release).
+	 */
+	private _activateEpoch(
+		prov: IFforTowerProvisioning,
+		record: IFforTowerRecord
+	): ITowerEpoch {
+		this._prov = prov;
+		this._record = record;
+		this._epochView = this._buildEpochView();
+		// Replay any previously stored packages through the view so the
+		// deterministic reconstruction state matches after a tower restart.
+		for (let i = 0; i < record.lastReleased; i++) {
+			const msg = decodeFforSettlementMessage(
+				Buffer.from(record.packagesHex[i], 'hex')
+			);
+			this._epochView.htlcAmountsMsat[i] = msg.htlcAmountMsat;
+			this._epochView.voucherAmountsMsat[i] = msg.voucherAmountMsat;
+			this._epochView.lastSeq = msg.seq;
+		}
+		const entry: ITowerEpoch = {
+			prov,
+			record,
+			epochView: this._epochView
+		};
+		this._epochs.set(prov.epochId.toString('hex'), entry);
+		return entry;
+	}
+
+	/**
+	 * Point _prov/_record/_epochView at the epoch identified by `epochId`.
+	 * Returns false when the tower is serving no such epoch. The mutations the
+	 * handlers apply to _record are on the SAME object stored in _epochs, so
+	 * they persist across selects.
+	 */
+	private _selectEpoch(epochId: Buffer): boolean {
+		const entry = this._epochs.get(epochId.toString('hex'));
+		if (!entry) return false;
+		this._prov = entry.prov;
+		this._record = entry.record;
+		this._epochView = entry.epochView;
+		return true;
 	}
 
 	/** R provisions the tower BEFORE ff_init (spec §9.4). */
@@ -263,25 +389,19 @@ export class FforTower {
 				throw new Error(`tower provisioning: SHA256(t_${i + 1}) != H_${i + 1}`);
 			}
 		}
-		this._prov = p;
 		const epochIdHex = p.epochId.toString('hex');
-		this._record = this._store.load(epochIdHex) ?? {
+		// A restart may have already rehydrated this epoch; a re-provision is
+		// idempotent (keep the persisted record — its released seqs are final).
+		const record = this._store.load(epochIdHex) ?? {
 			epochIdHex,
 			lastReleased: 0,
 			packagesHex: [],
 			revocationSecretN0Hex: null
 		};
-		this._epochView = this._buildEpochView();
-		// Replay any previously stored packages through the view so the
-		// deterministic reconstruction state matches after a tower restart.
-		for (let i = 0; i < this._record.lastReleased; i++) {
-			const msg = decodeFforSettlementMessage(
-				Buffer.from(this._record.packagesHex[i], 'hex')
-			);
-			this._epochView.htlcAmountsMsat[i] = msg.htlcAmountMsat;
-			this._epochView.voucherAmountsMsat[i] = msg.voucherAmountMsat;
-			this._epochView.lastSeq = msg.seq;
-		}
+		this._activateEpoch(p, record);
+		// M7.0: the provisioning bundle MUST survive a tower restart (R is
+		// offline and cannot re-provision). Persist it durably now.
+		this._store.saveProvisioning(p);
 	}
 
 	/**
@@ -293,7 +413,7 @@ export class FforTower {
 	 * (the two signed copies are themselves evidence, §12.2).
 	 */
 	handleReleaseRequest(payload: Buffer): IFforTowerReleaseResult {
-		if (!this._prov || !this._record || !this._epochView) {
+		if (this._epochs.size === 0) {
 			return { ok: false, error: 'tower not provisioned' };
 		}
 		let msg: IFforSettlementMessage;
@@ -305,7 +425,13 @@ export class FforTower {
 				error: `undecodable package: ${(e as Error).message}`
 			};
 		}
-		if (!msg.epochId.equals(this._prov.epochId)) {
+		// Serve the epoch the package names (multi-epoch, restart-safe).
+		if (
+			!this._selectEpoch(msg.epochId) ||
+			!this._prov ||
+			!this._record ||
+			!this._epochView
+		) {
 			return { ok: false, error: 'unknown epoch_id' };
 		}
 
@@ -370,10 +496,10 @@ export class FforTower {
 			packages: [],
 			preimages: []
 		});
-		if (!this._prov || !this._record) {
+		if (this._epochs.size === 0) {
 			return fail('tower not provisioned');
 		}
-		if (!req.epochId.equals(this._prov.epochId)) {
+		if (!this._selectEpoch(req.epochId) || !this._prov || !this._record) {
 			return fail('unknown epoch_id');
 		}
 		let authed = false;
@@ -417,15 +543,26 @@ export class FforTower {
 		blockHeight: number
 	): IFforTowerBreachResult {
 		const none: IFforTowerBreachResult = { breach: false, justiceTxs: [] };
-		if (!this._prov || !this._record) return none;
-		// Only spends of OUR funding outpoint are of interest.
+		if (this._epochs.size === 0) return none;
+		// Multi-epoch breach watch: select the epoch whose funding outpoint this
+		// tx spends. The rest of the check runs against that selected epoch.
+		let matched = false;
+		for (const hex of this._epochs.keys()) {
+			if (!this._selectEpoch(Buffer.from(hex, 'hex')) || !this._prov) continue;
+			const fc = this._prov.channel;
+			if (
+				tx.ins.some(
+					(i) =>
+						Buffer.from(i.hash).equals(fc.fundingTxid) &&
+						i.index === fc.fundingOutputIndex
+				)
+			) {
+				matched = true;
+				break;
+			}
+		}
+		if (!matched || !this._prov || !this._record) return none;
 		const c = this._prov.channel;
-		const spendsFunding = tx.ins.some(
-			(i) =>
-				Buffer.from(i.hash).equals(c.fundingTxid) &&
-				i.index === c.fundingOutputIndex
-		);
-		if (!spendsFunding) return none;
 
 		// Escape recognition (§10): if S's n0+1 point was provisioned, check
 		// whether this spend is an escape E_j (it carries the aggregate voucher

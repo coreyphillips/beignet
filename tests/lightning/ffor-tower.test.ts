@@ -665,3 +665,236 @@ function buildRevokedCommitment(): import('bitcoinjs-lib').Transaction {
 	built.result.tx.setWitness(0, witness);
 	return built.result.tx;
 }
+
+// ─────────────── M7.0: durable SqliteTowerStore + restart rehydration ───────────────
+
+import os from 'os';
+import fs from 'fs';
+import path from 'path';
+import { SqliteTowerStore } from '../../src/lightning/ffor/tower-store-sqlite';
+import {
+	serializeTowerProvisioning,
+	deserializeTowerProvisioning
+} from '../../src/lightning/ffor/tower-serialization';
+
+function tmpDbPath(tag: string): string {
+	return path.join(
+		fs.mkdtempSync(path.join(os.tmpdir(), `ffor-tower-${tag}-`)),
+		'tower.db'
+	);
+}
+
+// The core release/verify/fetch flow must behave identically on either store.
+for (const kind of ['memory', 'sqlite'] as const) {
+	describe(`FFOR M7.0: tower core flow on ${kind} store`, function () {
+		let store: MemoryTowerStore | SqliteTowerStore;
+		let dbPath: string | null = null;
+		beforeEach(function () {
+			if (kind === 'memory') {
+				store = new MemoryTowerStore();
+			} else {
+				dbPath = tmpDbPath('core');
+				store = new SqliteTowerStore(dbPath);
+			}
+		});
+		afterEach(function () {
+			if (store instanceof SqliteTowerStore) store.close();
+			if (dbPath)
+				fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+		});
+
+		it('verifies + releases seq 1, then verifies + releases seq 2', function () {
+			const tower = new FforTower(store);
+			tower.provision(provisioning());
+			tower.setBlockHeight(500_000);
+			const sEpoch = makeSEpoch();
+			const r1 = tower.handleReleaseRequest(buildPackage(sEpoch, 1));
+			expect(r1.ok, (r1 as { error?: string }).error).to.equal(true);
+			if (r1.ok) expect(r1.preimage.equals(TOWER.preimages[0])).to.equal(true);
+			const r2 = tower.handleReleaseRequest(buildPackage(sEpoch, 2));
+			expect(r2.ok, (r2 as { error?: string }).error).to.equal(true);
+			if (r2.ok) expect(r2.preimage.equals(TOWER.preimages[1])).to.equal(true);
+			expect(tower.lastReleased).to.equal(2);
+		});
+
+		it('idempotent replay + differing-package rejection for a released seq', function () {
+			const tower = new FforTower(store);
+			tower.provision(provisioning());
+			tower.setBlockHeight(500_000);
+			const sEpoch = makeSEpoch();
+			const pkg1 = buildPackage(sEpoch, 1);
+			expect(tower.handleReleaseRequest(pkg1).ok).to.equal(true);
+			// Byte-identical replay returns the same preimage.
+			const replay = tower.handleReleaseRequest(pkg1);
+			expect(replay.ok).to.equal(true);
+			// A DIFFERENT package for the released seq 1 is rejected (the two
+			// signed copies are themselves evidence, §12.2). Settlement-package
+			// signing is deterministic, so a fresh build is byte-identical; flip
+			// a signature byte to get a decodable-but-differing payload.
+			const differing = Buffer.from(pkg1);
+			differing[differing.length - 1] ^= 0xff;
+			const rej = tower.handleReleaseRequest(differing);
+			expect(rej.ok).to.equal(false);
+			expect((rej as { error: string }).error).to.match(
+				/differs from the stored copy/
+			);
+		});
+
+		it('serves an authenticated fetch of all released packages + preimages', function () {
+			const tower = new FforTower(store);
+			tower.provision(provisioning());
+			tower.setBlockHeight(500_000);
+			const sEpoch = makeSEpoch();
+			tower.handleReleaseRequest(buildPackage(sEpoch, 1));
+			tower.handleReleaseRequest(buildPackage(sEpoch, 2));
+			const req = buildTowerFetchRequest(Buffer.alloc(32, 0xee), R_NODE_KEY);
+			const res = tower.handleFetch(req);
+			expect(res.ok).to.equal(true);
+			expect(res.lastReleased).to.equal(2);
+			expect(res.preimages[0].equals(TOWER.preimages[0])).to.equal(true);
+			expect(res.preimages[1].equals(TOWER.preimages[1])).to.equal(true);
+		});
+	});
+}
+
+describe('FFOR M7.0: provisioning serialization round-trips exactly', function () {
+	it('every buffer/bigint/config/basepoint survives serialize -> deserialize', function () {
+		const prov = provisioning(undefined, {
+			// option (a) extras + escape statics exercise the optional fields.
+			revocationBasepointSecret: crypto.randomBytes(32),
+			sweepScript: crypto.randomBytes(22),
+			channel: {
+				...provisioning().channel,
+				sPerCommitmentPointN0Plus1: pcPoint(S_PC_SEED, N0 + 1n),
+				sIsOpener: true,
+				sToSelfDelay: 144,
+				sLeaseExpiry: 810_000
+			}
+		});
+		const round = deserializeTowerProvisioning(
+			serializeTowerProvisioning(prov)
+		);
+		expect(JSON.stringify(serializeTowerProvisioning(round))).to.equal(
+			JSON.stringify(serializeTowerProvisioning(prov))
+		);
+		expect(round.epochId.equals(prov.epochId)).to.equal(true);
+		expect(round.preimages[0].equals(prov.preimages[0])).to.equal(true);
+		expect(round.channel.fundingSatoshis).to.equal(
+			prov.channel.fundingSatoshis
+		);
+		expect(
+			round.channel.rBasepoints.fundingPubkey.equals(
+				prov.channel.rBasepoints.fundingPubkey
+			)
+		).to.equal(true);
+		expect(
+			round.revocationBasepointSecret!.equals(prov.revocationBasepointSecret!)
+		).to.equal(true);
+		expect(round.channel.sLeaseExpiry).to.equal(810_000);
+	});
+});
+
+describe('FFOR M7.0 GATE: genuine restart durability (temp-file SqliteTowerStore)', function () {
+	it('a fresh tower on the same db file resumes the epoch with NO re-provision', function () {
+		const dbPath = tmpDbPath('restart');
+		try {
+			// ── Boot 1: provision + release seq 1, then "crash". ──
+			const store1 = new SqliteTowerStore(dbPath);
+			const tower1 = new FforTower(store1);
+			tower1.provision(provisioning());
+			tower1.setBlockHeight(500_000);
+			const sEpoch1 = makeSEpoch();
+			const pkg1 = buildPackage(sEpoch1, 1);
+			const rel1 = tower1.handleReleaseRequest(pkg1);
+			expect(rel1.ok, (rel1 as { error?: string }).error).to.equal(true);
+			// DESTROY the objects + close the db (simulate a process exit).
+			store1.close();
+
+			// ── Boot 2: fresh store + tower on the SAME file, NO provision(). ──
+			const store2 = new SqliteTowerStore(dbPath);
+			const tower2 = new FforTower(store2); // rehydrates on construct
+			tower2.setBlockHeight(500_000);
+
+			// (a) still serves preimage 1 on an idempotent re-request.
+			const replay = tower2.handleReleaseRequest(pkg1);
+			expect(replay.ok, (replay as { error?: string }).error).to.equal(true);
+			if (replay.ok) {
+				expect(replay.preimage.equals(TOWER.preimages[0])).to.equal(true);
+			}
+			// ...and on an authenticated fetch.
+			const fetchRes = tower2.handleFetch(
+				buildTowerFetchRequest(Buffer.alloc(32, 0xee), R_NODE_KEY)
+			);
+			expect(fetchRes.ok).to.equal(true);
+			expect(fetchRes.lastReleased).to.equal(1);
+			expect(fetchRes.preimages[0].equals(TOWER.preimages[0])).to.equal(true);
+
+			// (b) REJECTS a DIFFERENT package for the released seq 1 (signing is
+			// deterministic, so flip a signature byte to differ from the stored
+			// copy while still decoding to seq 1).
+			const diff = Buffer.from(pkg1);
+			diff[diff.length - 1] ^= 0xff;
+			const rej = tower2.handleReleaseRequest(diff);
+			expect(rej.ok).to.equal(false);
+			expect((rej as { error: string }).error).to.match(
+				/differs from the stored copy/
+			);
+
+			// (c) verifies + releases seq 2 — proving PROVISIONING rehydrated
+			// (seq-2 verification needs the channel statics/points/preimages,
+			// not just the record).
+			const sEpoch2 = makeSEpoch();
+			buildPackage(sEpoch2, 1); // advance the local mirror to seq 1
+			const pkg2 = buildPackage(sEpoch2, 2);
+			const rel2 = tower2.handleReleaseRequest(pkg2);
+			expect(rel2.ok, (rel2 as { error?: string }).error).to.equal(true);
+			if (rel2.ok) {
+				expect(rel2.seq).to.equal(2);
+				expect(rel2.preimage.equals(TOWER.preimages[1])).to.equal(true);
+			}
+			expect(tower2.lastReleased).to.equal(2);
+			store2.close();
+
+			// ── Boot 3: confirm seq 2 also survived the restart. ──
+			const store3 = new SqliteTowerStore(dbPath);
+			const tower3 = new FforTower(store3);
+			expect(tower3.lastReleased).to.equal(2);
+			store3.close();
+		} finally {
+			fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+		}
+	});
+});
+
+describe('FFOR M7.0: persist-before-release ordering (§9.4 item 5)', function () {
+	it('durably commits the record BEFORE returning the preimage', function () {
+		const dbPath = tmpDbPath('order');
+		const store = new SqliteTowerStore(dbPath);
+		// Wrap save() to read the committed state through an INDEPENDENT
+		// connection at the moment save() returns. If the row is visible there,
+		// the write was durably committed before handleReleaseRequest could
+		// hand out the preimage (save() is strictly before the return in code).
+		let committedLastReleasedAtSaveTime = -1;
+		const origSave = store.save.bind(store);
+		store.save = (rec): void => {
+			origSave(rec);
+			const reader = new SqliteTowerStore(dbPath);
+			committedLastReleasedAtSaveTime =
+				reader.load(rec.epochIdHex)?.lastReleased ?? -1;
+			reader.close();
+		};
+		try {
+			const tower = new FforTower(store);
+			tower.provision(provisioning());
+			tower.setBlockHeight(500_000);
+			const rel = tower.handleReleaseRequest(buildPackage(makeSEpoch(), 1));
+			expect(rel.ok, (rel as { error?: string }).error).to.equal(true);
+			// The independent reader observed lastReleased=1 during save(), i.e.
+			// the package was durably on disk before the preimage was released.
+			expect(committedLastReleasedAtSaveTime).to.equal(1);
+		} finally {
+			store.close();
+			fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+		}
+	});
+});
