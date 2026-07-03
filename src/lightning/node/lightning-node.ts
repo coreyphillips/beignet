@@ -1830,9 +1830,17 @@ export class LightningNode extends EventEmitter {
 					for (const output of monitor.getTrackedOutputs()) {
 						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
 						try {
+							const seedTxid =
+								output.status === OutputStatus.SPEND_CONFIRMED
+									? output.resolutionTxid
+									: undefined;
+							const seedHeight =
+								seedTxid !== undefined ? output.confirmationHeight : undefined;
 							await this.chainWatcher.watchOutputByTxid(
 								output.txid,
-								output.outputIndex
+								output.outputIndex,
+								seedTxid,
+								seedHeight
 							);
 						} catch {
 							// Electrum hiccup: the funding watch below still drives
@@ -1865,9 +1873,22 @@ export class LightningNode extends EventEmitter {
 					for (const output of monitor.getTrackedOutputs()) {
 						if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) continue;
 						try {
+							// Seed a previously recorded spend so a reorg that evicts our
+							// penalty / HTLC claim after restart is detected (checkOutputSpend
+							// only fires its eviction branch when spendTxid is set). Without
+							// this the monitor would promote SPEND_CONFIRMED to irrevocable off
+							// the stale height and hide a reorg-then-theft.
+							const seedTxid =
+								output.status === OutputStatus.SPEND_CONFIRMED
+									? output.resolutionTxid
+									: undefined;
+							const seedHeight =
+								seedTxid !== undefined ? output.confirmationHeight : undefined;
 							await this.chainWatcher.watchOutputByTxid(
 								output.txid,
-								output.outputIndex
+								output.outputIndex,
+								seedTxid,
+								seedHeight
 							);
 						} catch {
 							// Electrum hiccup — the funding watch below still drives

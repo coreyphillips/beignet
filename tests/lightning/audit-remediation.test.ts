@@ -8,6 +8,12 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
+import {
+	ChainWatcher,
+	IChainBackend
+} from '../../src/lightning/chain/chain-watcher';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -146,5 +152,60 @@ describe('Audit HIGH-1: coop-close CLOSED channel re-armed on restart', function
 
 		alice.destroy();
 		bob.destroy();
+	});
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// HIGH-2: reorg eviction of a recorded spend detectable after restart
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('Audit HIGH-2: restored watch stays reorg-eviction aware', function () {
+	this.timeout(10_000);
+
+	function buildOneOutputTx(): { rawTx: Buffer; txid: string } {
+		const tx = new bitcoin.Transaction();
+		tx.addInput(crypto.randomBytes(32), 0);
+		tx.addOutput(Buffer.from('0014' + '00'.repeat(20), 'hex'), 1000);
+		return { rawTx: tx.toBuffer(), txid: tx.getId() };
+	}
+
+	it('detects an evicted spend on a restored (seeded) output watch', async () => {
+		const { rawTx, txid } = buildOneOutputTx();
+
+		// Backend history reports only the output's own tx, i.e. the previously
+		// recorded spend has been reorged out of the active chain.
+		const backend: IChainBackend = {
+			subscribeToHeaders: async (): Promise<void> => {},
+			subscribeToScriptHash: async (): Promise<void> => {},
+			getScriptHashHistory: async (): Promise<
+				Array<{ txid: string; height: number }>
+			> => [{ txid, height: 90 }],
+			getTransaction: async (): Promise<Buffer> => rawTx,
+			broadcastTransaction: async (): Promise<string> => 'sent'
+		};
+
+		let unspentCalls = 0;
+		const channelManager = {
+			on: (): void => {},
+			handleOutputSpent: (): void => {},
+			handleOutputUnspent: (): void => {
+				unspentCalls++;
+			}
+		} as unknown as ChannelManager;
+
+		const watcher = new ChainWatcher({ backend, channelManager });
+		(watcher as any).currentBlockHeight = 95;
+
+		// Simulate restoreChainWatches re-arming a SPEND_CONFIRMED output: seed the
+		// recorded resolution txid + height so the eviction branch can fire.
+		const resolutionTxid = crypto.randomBytes(32).toString('hex');
+		await watcher.watchOutputByTxid(txid, 0, resolutionTxid, 91);
+
+		// A subscription re-fire re-checks the output; the seeded spend is gone.
+		await (watcher as any).checkOutputSpend(`${txid}:0`);
+
+		// Before the fix the restored watch had spendTxid undefined, so the eviction
+		// branch never fired and the reorg-then-theft went undetected.
+		expect(unspentCalls).to.equal(1);
 	});
 });
