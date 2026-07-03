@@ -339,6 +339,16 @@ export interface IBuiltCommitment {
 	result: ICommitmentTxResult;
 	fundingWitnessScript: Buffer;
 	fundingAmount: number;
+	/**
+	 * The trimmed HTLC output set actually enumerated into the commitment tx,
+	 * in the SAME basis as result.outputMap.htlcOriginalIndices (those indices
+	 * point INTO this array). Second-level HTLC signing/verification MUST read
+	 * metadata from here, not from a freshly rebuilt UNFILTERED list: filtering
+	 * compacts positions, so an unfiltered list is a different basis and a
+	 * trimmed HTLC ordered before a surviving one would shift every subsequent
+	 * index and bind the counterparty signature to the wrong output.
+	 */
+	htlcOutputs: (IHtlcOutput & { direction: HtlcDirection })[];
 }
 
 /**
@@ -506,7 +516,8 @@ export function buildLocalCommitment(
 	return {
 		result,
 		fundingWitnessScript: funding.witnessScript,
-		fundingAmount: Number(state.fundingSatoshis)
+		fundingAmount: Number(state.fundingSatoshis),
+		htlcOutputs
 	};
 }
 
@@ -667,7 +678,8 @@ export function buildRemoteCommitment(
 	return {
 		result,
 		fundingWitnessScript: funding.witnessScript,
-		fundingAmount: Number(state.fundingSatoshis)
+		fundingAmount: Number(state.fundingSatoshis),
+		htlcOutputs
 	};
 }
 
@@ -724,8 +736,12 @@ export function signRemoteCommitment(
 		false
 	);
 
-	// Build HTLC outputs with metadata to know direction/cltvExpiry
-	const htlcOutputsMeta = buildHtlcOutputsForRemote(state, keys);
+	// HTLC metadata comes from the SAME trimmed set the commitment tx
+	// enumerated (built.htlcOutputs) — htlcOriginalIndices index INTO it. A
+	// freshly rebuilt UNFILTERED list is a different basis (filtering compacts
+	// positions), so a trimmed HTLC ordered before a surviving one would shift
+	// the index and bind this signature to the wrong output.
+	const htlcOutputsMeta = built.htlcOutputs;
 
 	// Fee rate for HTLC transaction fee calculation
 	const feeratePerKw =
@@ -1029,7 +1045,8 @@ export function signRemoteHtlcSignaturesTaproot(
 		remotePerCommitmentPoint,
 		false
 	);
-	const htlcOutputsMeta = buildHtlcOutputsForRemote(state, keys);
+	// Same trimmed basis as htlcOriginalIndices (see signRemoteCommitment).
+	const htlcOutputsMeta = built.htlcOutputs;
 	const localHtlcPrivkey = derivePrivateKey(
 		signer.htlcBasepointSecret,
 		remotePerCommitmentPoint,
@@ -1106,7 +1123,8 @@ export function verifyRemoteHtlcSignaturesTaproot(
 		perCommitmentPoint,
 		true
 	);
-	const htlcOutputsMeta = buildHtlcOutputsForLocal(state, keys);
+	// Same trimmed basis as htlcOriginalIndices (see signRemoteCommitment).
+	const htlcOutputsMeta = built.htlcOutputs;
 	const commitTxid = built.result.tx.getId();
 
 	for (let k = 0; k < htlcs.length; k++) {
@@ -1193,8 +1211,9 @@ export function verifyRemoteHtlcSignatures(
 		true
 	);
 
-	// Build HTLC output metadata for the local commitment
-	const htlcOutputsMeta = buildHtlcOutputsForLocal(state, keys);
+	// HTLC metadata in the SAME trimmed basis as htlcOriginalIndices (see
+	// signRemoteCommitment) — never an unfiltered rebuild.
+	const htlcOutputsMeta = built.htlcOutputs;
 
 	// Remote's HTLC pubkey on our local commitment
 	const remoteHtlcPubkey = keys.remoteHtlcPubkey;
