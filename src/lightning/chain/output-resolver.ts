@@ -1029,7 +1029,13 @@ export function resolveOurCommitmentOutputs(
 				witnessScript: output.witnessScript,
 				toSelfDelay,
 				destinationScript,
-				feeSatoshis
+				feeSatoshis,
+				// Liquidity ads: a lessor's to_local witnessScript is CLTV-locked with
+				// `<lease_expiry> CLTV DROP`, so the sweep MUST set nLockTime to
+				// lease_expiry or OP_CHECKLOCKTIMEVERIFY fails (BIP65) and the sweep is
+				// consensus-invalid forever. Mirror the second-level and classification
+				// paths: only OUR to_local is lease-locked when we are the lessor.
+				leaseExpiry: state.isLessor ? state.leaseExpiry : undefined
 			});
 
 			// Derive the delayed payment private key for signing

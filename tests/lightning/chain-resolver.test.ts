@@ -678,6 +678,56 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(penalty!.spendTx).to.exist;
 			expect(penalty!.witness).to.exist;
 		});
+
+		// Audit HIGH-3: the lessor's own to_local sweep must set nLockTime =
+		// lease_expiry, otherwise the OP_CHECKLOCKTIMEVERIFY in the CLTV-locked
+		// witnessScript fails (BIP65) and the entire lessor to_local is stranded.
+		it('builds our lessor to_local sweep with nLockTime = lease_expiry', function () {
+			const { opener } = setupNormalChannels();
+			const state = opener.getFullState();
+			state.isLessor = true;
+			state.leaseExpiry = LEASE_EXPIRY;
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const perCommitmentPoint =
+				perCommitmentPointFromSecret(perCommitmentSecret);
+			const built = buildLocalCommitment(state, perCommitmentPoint);
+
+			const trackedOutputs = classifyOutputs(
+				built.result.tx,
+				state,
+				CommitmentType.OUR_COMMITMENT,
+				state.localCommitmentNumber
+			);
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const resolved = resolveOurCommitmentOutputs(
+				state,
+				trackedOutputs,
+				state.localCommitmentNumber,
+				destScript,
+				4,
+				new Map()
+			);
+
+			const toLocal = resolved.find(
+				(r) => r.trackedOutput.outputType === OutputType.TO_LOCAL
+			);
+			expect(toLocal).to.exist;
+			expect(toLocal!.spendTx).to.exist;
+			// Before the fix this was 0, making the sweep consensus-invalid forever.
+			expect(toLocal!.spendTx!.locktime).to.equal(LEASE_EXPIRY);
+			// The CSV input sequence must remain (locktime stays enforced).
+			expect(toLocal!.spendTx!.ins[0].sequence).to.equal(
+				state.remoteConfig.toSelfDelay
+			);
+		});
 	});
 
 	describe('resolveOurCommitmentOutputs', function () {
