@@ -87,7 +87,10 @@ services:
 
   cln:
     container_name: cln
-    image: elementsproject/lightningd:v24.11.1
+    # v26.06.1 matches the live CLN that beignet splicing was validated
+    # against on mainnet; v24.11.1's channeld crashed right after sending
+    # splice_ack (CLN-side bug), blocking all splice interop tests.
+    image: elementsproject/lightningd:v26.06.1
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -108,7 +111,8 @@ services:
       - '--clnrest-host=0.0.0.0'
       - '--large-channels'
       - '--log-level=info'
-      - '--experimental-offers'
+      # v26: offers are always on (--experimental-offers was removed);
+      # splicing still uses the experimental flag.
       - '--experimental-splicing'
 
   eclair:
