@@ -815,6 +815,65 @@ describe('BOLT 2 Channel Messages', function () {
 			buf.writeUInt16BE(9999, 32);
 			expect(() => decodeShutdownMessage(buf)).to.throw('exceeds payload');
 		});
+
+		it('should roundtrip the taproot shutdown_nonce TLV (type 8, 66B)', function () {
+			const msg = makeShutdown();
+			msg.shutdownNonce = randomBytes(66);
+			const encoded = encodeShutdownMessage(msg);
+			// fixed 59 + TLV header (1 type + 1 len) + 66 value
+			expect(encoded.length).to.equal(59 + 2 + 66);
+			const decoded = decodeShutdownMessage(encoded);
+			expect(decoded.shutdownNonce).to.deep.equal(msg.shutdownNonce);
+		});
+
+		it('should encode byte-identical to legacy when no nonce is set', function () {
+			const msg = makeShutdown();
+			const encoded = encodeShutdownMessage(msg);
+			expect(encoded.length).to.equal(59);
+			const decoded = decodeShutdownMessage(encoded);
+			expect(decoded.shutdownNonce).to.equal(undefined);
+		});
+
+		it('should throw on a wrong-length shutdown_nonce', function () {
+			const msg = makeShutdown();
+			msg.shutdownNonce = randomBytes(65);
+			expect(() => encodeShutdownMessage(msg)).to.throw('66 bytes');
+
+			const bad = makeShutdown();
+			bad.shutdownNonce = undefined;
+			const base = encodeShutdownMessage(bad);
+			const tlv = Buffer.concat([Buffer.from([8, 65]), randomBytes(65)]);
+			expect(() => decodeShutdownMessage(Buffer.concat([base, tlv]))).to.throw(
+				'66 bytes'
+			);
+		});
+
+		it('should reject an unknown even TLV type', function () {
+			const base = encodeShutdownMessage(makeShutdown());
+			const tlv = Buffer.concat([Buffer.from([10, 2]), randomBytes(2)]);
+			expect(() => decodeShutdownMessage(Buffer.concat([base, tlv]))).to.throw(
+				'Unknown required TLV'
+			);
+		});
+
+		it('should decode the LND v0.20 taproot shutdown capture', function () {
+			// Captured live from lnd-taproot (Step 0): P2WPKH script + TLV 8 nonce.
+			const raw = Buffer.from(
+				'cf145ba635bb4cc901f58465cf8faaae66efec8a7160552854b35beb98e9fde0' +
+					'001600145fcaa2267ed8f78e49360a4242e2c369a70693cb' +
+					'08420376a5fb60f0c6e71388acc08e2183299a95f7bb5845cb407eb0810f54ca' +
+					'aec475035eb1bdce748bc5edf010575b36b0ce244ed0b7b11df07f5b6608ce77' +
+					'93d810e3',
+				'hex'
+			);
+			const decoded = decodeShutdownMessage(raw);
+			expect(decoded.scriptPubkey.length).to.equal(22);
+			expect(decoded.shutdownNonce).to.exist;
+			expect(decoded.shutdownNonce!.length).to.equal(66);
+			// A MuSig2 pubnonce is two compressed EC points.
+			expect([2, 3]).to.include(decoded.shutdownNonce![0]);
+			expect([2, 3]).to.include(decoded.shutdownNonce![33]);
+		});
 	});
 
 	// ─────────────── closing_signed ───────────────
@@ -854,6 +913,54 @@ describe('BOLT 2 Channel Messages', function () {
 		it('should throw on truncated payload', function () {
 			const payload = Buffer.alloc(50);
 			expect(() => decodeClosingSignedMessage(payload)).to.throw('too short');
+		});
+
+		it('should roundtrip the taproot partial signature TLV (type 6, 32B) with a zeroed sig field', function () {
+			const msg = makeClosingSigned();
+			msg.partialSignature = randomBytes(32);
+			const encoded = encodeClosingSignedMessage(msg);
+			expect(encoded.length).to.equal(104 + 2 + 32);
+			// The fixed ECDSA signature field must be zeroed on the wire.
+			expect(encoded.subarray(40, 104)).to.deep.equal(Buffer.alloc(64));
+			const decoded = decodeClosingSignedMessage(encoded);
+			expect(decoded.partialSignature).to.deep.equal(msg.partialSignature);
+			expect(decoded.feeSatoshis).to.equal(msg.feeSatoshis);
+		});
+
+		it('should encode byte-identical to legacy when no partial sig is set', function () {
+			const msg = makeClosingSigned();
+			const encoded = encodeClosingSignedMessage(msg);
+			expect(encoded.length).to.equal(104);
+			expect(encoded.subarray(40, 104)).to.deep.equal(msg.signature);
+			const decoded = decodeClosingSignedMessage(encoded);
+			expect(decoded.partialSignature).to.equal(undefined);
+		});
+
+		it('should throw on a wrong-length partial signature', function () {
+			const msg = makeClosingSigned();
+			msg.partialSignature = randomBytes(31);
+			expect(() => encodeClosingSignedMessage(msg)).to.throw('32 bytes');
+
+			const base = encodeClosingSignedMessage(makeClosingSigned());
+			const tlv = Buffer.concat([Buffer.from([6, 31]), randomBytes(31)]);
+			expect(() =>
+				decodeClosingSignedMessage(Buffer.concat([base, tlv]))
+			).to.throw('32 bytes');
+		});
+
+		it('should ignore an odd fee_range TLV and reject unknown even types', function () {
+			const base = encodeClosingSignedMessage(makeClosingSigned());
+			// LND attaches fee_range as TLV type 1 (odd = ignorable): 2x u64.
+			const feeRange = Buffer.concat([Buffer.from([1, 16]), randomBytes(16)]);
+			const decoded = decodeClosingSignedMessage(
+				Buffer.concat([base, feeRange])
+			);
+			expect(decoded.partialSignature).to.equal(undefined);
+
+			const unknownEven = Buffer.concat([Buffer.from([4, 2]), randomBytes(2)]);
+			expect(() =>
+				decodeClosingSignedMessage(Buffer.concat([base, unknownEven]))
+			).to.throw('Unknown required TLV');
 		});
 	});
 

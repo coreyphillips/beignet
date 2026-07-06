@@ -72,8 +72,19 @@ import {
 	signRemoteCommitmentPartial,
 	signRemoteHtlcSignaturesTaproot
 } from './commitment-builder';
-import { generateNonce } from '../crypto/musig';
-import { Channel } from './channel';
+import { generateNonce, type SessionKey } from '../crypto/musig';
+import {
+	taprootCommitmentSighash,
+	startCommitmentSigningSession,
+	verifyPartialCommitmentSig,
+	aggregateCommitmentSig
+} from './commitment-musig';
+import {
+	createTaprootFundingScript,
+	buildTaprootKeySpendWitness
+} from '../script/funding-taproot';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import { Channel, ITaprootClosingCache } from './channel';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -1909,10 +1920,16 @@ export class ChannelManager extends EventEmitter {
 			(a) => a.type === ChannelActionType.CHANNEL_CLOSED
 		);
 		if (agreed) {
+			// Taproot channels carry the peer's MuSig2 partial in TLV 6; the fixed
+			// ECDSA field is zeroed. agreed=true implies the channel already
+			// validated the right one is present.
+			const theirSig = isTaprootChannel(channel.getFullState().channelType)
+				? msg.partialSignature!
+				: msg.signature;
 			const closeTx = this.buildSignedMutualCloseTx(
 				channel,
 				msg.feeSatoshis,
-				msg.signature
+				theirSig
 			);
 			if (closeTx) {
 				// Persist the signed close tx BEFORE processActions emits channel:closed
@@ -1952,6 +1969,21 @@ export class ChannelManager extends EventEmitter {
 		theirSig: Buffer
 	): boolean {
 		try {
+			if (isTaprootChannel(channel.getFullState().channelType)) {
+				const cache = this.getOrCreateTaprootClosingSession(
+					channel,
+					feeSatoshis
+				);
+				if (!cache) return false;
+				const remoteNonce = channel.getClosingNonces().remote;
+				if (!remoteNonce) return false;
+				return verifyPartialCommitmentSig(
+					cache.session as SessionKey,
+					theirSig,
+					channel.getFullState().remoteBasepoints!.fundingPubkey,
+					remoteNonce
+				);
+			}
 			const { tx, witnessScript, fundingSatoshis, remoteFundingPubkey } =
 				this.buildClosingTxAndScript(channel, feeSatoshis);
 			const signer =
@@ -2003,7 +2035,10 @@ export class ChannelManager extends EventEmitter {
 			remoteScriptPubkey: state.remoteShutdownScript!,
 			localAmount,
 			remoteAmount,
-			feeAmount: feeSatoshis
+			feeAmount: feeSatoshis,
+			// LND builds the taproot coop-close tx RBF-signalled; the sequence
+			// is part of the MuSig2 sighash, so it must match exactly.
+			sequence: isTaprootChannel(state.channelType) ? 0xfffffffd : 0xffffffff
 		});
 
 		const { witnessScript } = createFundingScript(
@@ -2021,6 +2056,9 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	private signClosingTx(channel: Channel, feeSatoshis: bigint): Buffer {
+		if (isTaprootChannel(channel.getFullState().channelType)) {
+			return this.signTaprootClosingPartial(channel, feeSatoshis);
+		}
 		const { tx, witnessScript, fundingSatoshis } = this.buildClosingTxAndScript(
 			channel,
 			feeSatoshis
@@ -2028,6 +2066,91 @@ export class ChannelManager extends EventEmitter {
 		const signer =
 			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
+	}
+
+	// ─────────────── taproot cooperative close (MuSig2) ───────────────
+
+	/**
+	 * Get (or build) the MuSig2 signing session for the taproot closing tx at
+	 * the given fee. The cache lives on the channel, which clears it whenever
+	 * the closing nonces refresh (shutdown (re)transmission). Returns null when
+	 * the nonce exchange hasn't completed — the caller treats that as
+	 * "cannot sign/verify yet", never as a fallback to ECDSA.
+	 *
+	 * NONCE SAFETY: one closing session ever signs ONE sighash. If we already
+	 * produced a partial in this session, a request at a DIFFERENT fee is
+	 * refused (returns null) — a second sighash under the same nonce would leak
+	 * the funding key.
+	 */
+	private getOrCreateTaprootClosingSession(
+		channel: Channel,
+		feeSatoshis: bigint
+	): ITaprootClosingCache | null {
+		const cached = channel.getTaprootClosingCache();
+		if (cached && cached.feeSatoshis === feeSatoshis) return cached;
+		if (cached && cached.ourPartialSig) return null;
+
+		const nonces = channel.getClosingNonces();
+		if (!nonces.local || !nonces.remote) return null;
+
+		const state = channel.getFullState();
+		if (!state.remoteBasepoints) return null;
+		const { tx, fundingSatoshis } = this.buildClosingTxAndScript(
+			channel,
+			feeSatoshis
+		);
+		const { p2trOutput } = createTaprootFundingScript(
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints.fundingPubkey
+		);
+		const sighash = taprootCommitmentSighash(
+			tx,
+			p2trOutput,
+			Number(fundingSatoshis)
+		);
+		const session = startCommitmentSigningSession(
+			sighash,
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints.fundingPubkey,
+			nonces.local,
+			nonces.remote
+		);
+		const cache: ITaprootClosingCache = {
+			feeSatoshis,
+			session,
+			tx,
+			ourPartialSig: null
+		};
+		channel.setTaprootClosingCache(cache);
+		return cache;
+	}
+
+	/**
+	 * Produce our 32-byte MuSig2 partial over the closing tx at the given fee.
+	 * Idempotent per closing session: the partial is cached and the secret
+	 * nonce is consumed exactly once (the musig library purges it after one
+	 * partialSign, and the channel's sign-once latch prevents re-entry).
+	 */
+	private signTaprootClosingPartial(
+		channel: Channel,
+		feeSatoshis: bigint
+	): Buffer {
+		const cache = this.getOrCreateTaprootClosingSession(channel, feeSatoshis);
+		if (!cache) {
+			throw new Error(
+				'Taproot closing session unavailable (nonce exchange incomplete or nonce already used at another fee)'
+			);
+		}
+		if (cache.ourPartialSig) return cache.ourPartialSig;
+		const nonces = channel.getClosingNonces();
+		const signer =
+			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const partial = signer.signCommitmentPartial(
+			cache.session as SessionKey,
+			nonces.local!
+		);
+		cache.ourPartialSig = partial;
+		return partial;
 	}
 
 	/**
@@ -2044,6 +2167,13 @@ export class ChannelManager extends EventEmitter {
 		feeSatoshis: bigint,
 		theirSig: Buffer
 	): Buffer | null {
+		if (isTaprootChannel(channel.getFullState().channelType)) {
+			return this.buildSignedTaprootMutualCloseTx(
+				channel,
+				feeSatoshis,
+				theirSig
+			);
+		}
 		const {
 			tx,
 			witnessScript,
@@ -2080,6 +2210,66 @@ export class ChannelManager extends EventEmitter {
 			)
 		);
 		return tx.toBuffer();
+	}
+
+	/**
+	 * Taproot mutual close: aggregate our cached partial with the peer's into
+	 * the final 64-byte key-spend witness. NEVER signs here — our partial must
+	 * already exist in the session cache (made once via signClosingTx); a
+	 * missing partial is an internal-ordering error and returns null (the
+	 * caller keeps the channel + funding watch alive). Belt-and-braces: the
+	 * aggregated signature is verified against the funding output key before
+	 * the tx is released for broadcast (mirrors the force-close aggregation
+	 * pattern).
+	 */
+	private buildSignedTaprootMutualCloseTx(
+		channel: Channel,
+		feeSatoshis: bigint,
+		theirPartialSig: Buffer
+	): Buffer | null {
+		const cache = channel.getTaprootClosingCache();
+		if (!cache || cache.feeSatoshis !== feeSatoshis || !cache.ourPartialSig) {
+			return null;
+		}
+		const state = channel.getFullState();
+		if (!state.remoteBasepoints) return null;
+		const remoteNonce = channel.getClosingNonces().remote;
+		if (!remoteNonce) return null;
+
+		// Defense in depth: re-verify the peer's partial against the session
+		// even though handleClosingSigned already gated CLOSED on it.
+		if (
+			!verifyPartialCommitmentSig(
+				cache.session as SessionKey,
+				theirPartialSig,
+				state.remoteBasepoints.fundingPubkey,
+				remoteNonce
+			)
+		) {
+			return null;
+		}
+
+		const finalSig = aggregateCommitmentSig(
+			cache.session as SessionKey,
+			cache.ourPartialSig,
+			theirPartialSig
+		);
+
+		const { p2trOutput, outputKey } = createTaprootFundingScript(
+			state.localBasepoints.fundingPubkey,
+			state.remoteBasepoints.fundingPubkey
+		);
+		const sighash = taprootCommitmentSighash(
+			cache.tx,
+			p2trOutput,
+			Number(state.fundingSatoshis)
+		);
+		if (!ecc.verifySchnorr(sighash, outputKey, finalSig)) {
+			return null;
+		}
+
+		cache.tx.setWitness(0, buildTaprootKeySpendWitness(finalSig));
+		return cache.tx.toBuffer();
 	}
 
 	// ─────────────── option_simple_close ───────────────
@@ -2619,13 +2809,13 @@ export class ChannelManager extends EventEmitter {
 				fullState.localShutdownScript &&
 				fullState.localShutdownScript.length > 0
 			) {
+				// buildShutdownRetransmit refreshes the MuSig2 closing nonce for
+				// taproot channels (the pre-disconnect closing session is dead);
+				// non-taproot channels get the plain shutdown unchanged.
 				this.sendMessage(
 					peerPubkey,
 					MessageType.SHUTDOWN,
-					encodeShutdownMessage({
-						channelId: fullState.channelId!,
-						scriptPubkey: fullState.localShutdownScript
-					})
+					encodeShutdownMessage(channel.buildShutdownRetransmit())
 				);
 			}
 			if (state === ChannelState.NEGOTIATING_CLOSING) {
