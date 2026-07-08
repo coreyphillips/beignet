@@ -19,6 +19,7 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
 import { generateMnemonic } from '../utils/helpers';
+import { btcToSats } from '../utils/conversion';
 import {
 	EAvailableNetworks,
 	EPaymentType,
@@ -988,6 +989,8 @@ export class BeignetNode extends EventEmitter {
 	listOnchainTransactions(): OnchainTxInfo[] {
 		// wallet.transactions already includes unconfirmed txs;
 		// unconfirmedTransactions is a subset copy, so no merge here.
+		// IFormattedTransaction stores value/fee in BTC (see wallet formatting),
+		// so both need conversion to satisfy the *Sats field names.
 		return Object.values(this.wallet.transactions)
 			.map((tx) => ({
 				txid: tx.txid,
@@ -995,8 +998,8 @@ export class BeignetNode extends EventEmitter {
 					tx.type === EPaymentType.sent
 						? ('sent' as const)
 						: ('received' as const),
-				valueSats: tx.value,
-				feeSats: tx.fee,
+				valueSats: btcToSats(tx.value),
+				feeSats: btcToSats(tx.fee),
 				satsPerVbyte: tx.satsPerByte,
 				address: tx.address,
 				...(tx.height ? { height: tx.height } : {}),
