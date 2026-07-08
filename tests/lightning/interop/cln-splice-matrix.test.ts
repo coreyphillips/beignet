@@ -111,7 +111,10 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 	}
 
 	/** Current splice txid recorded on the channel state (display order). */
-	function spliceTxidHex(node: LightningNode, channelId: Buffer): string | null {
+	function spliceTxidHex(
+		node: LightningNode,
+		channelId: Buffer
+	): string | null {
 		const st = node
 			.getChannelManager()
 			.getChannel(channelId)!
@@ -182,8 +185,7 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 		while (Date.now() < deadline) {
 			const { channels } = await cln.listChannels();
 			const entry = (channels || []).find(
-				(c) =>
-					c.peer_id === peerId && c.funding_txid === expectedFundingTxid
+				(c) => c.peer_id === peerId && c.funding_txid === expectedFundingTxid
 			);
 			if (entry && entry.state === 'CHANNELD_NORMAL') return;
 			last = entry ? entry.state : 'no-entry';
@@ -332,11 +334,9 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 
 			const after = cm.getChannel(channelId)!.getFullState();
 			console.log(
-				`    B1 beignet view: cap ${capBefore} -> ${after.fundingSatoshis}, txid ${Buffer.from(
-					after.fundingTxid!
-				)
-					.reverse()
-					.toString('hex')}`
+				`    B1 beignet view: cap ${capBefore} -> ${
+					after.fundingSatoshis
+				}, txid ${Buffer.from(after.fundingTxid!).reverse().toString('hex')}`
 			);
 			// CLN withdrew 60k from its own side: capacity down by the declared
 			// relative amount, beignet's balance untouched.
@@ -383,9 +383,7 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 					valueSat / 1e8
 				])) as string;
 				await mineBlocks(1);
-				const raw = (await bitcoinRpc('getrawtransaction', [
-					txid
-				])) as string;
+				const raw = (await bitcoinRpc('getrawtransaction', [txid])) as string;
 				const prevTx = bitcoin.Transaction.fromHex(raw);
 				const vout = prevTx.outs.findIndex((o) =>
 					Buffer.from(o.script).equals(payment.output!)
@@ -479,28 +477,12 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			pm.sendToPeer = (pk: string, type: number, payload: Buffer): void => {
 				if (type === MessageType.TX_SIGNATURES && !dropped) {
 					dropped = true;
-					console.log(
-						'    D1 dropping beignet tx_signatures + disconnecting'
-					);
+					console.log('    D1 dropping beignet tx_signatures + disconnecting');
 					setImmediate(() => node.disconnectPeer(clnPubkey));
 					return;
 				}
 				realSend(pk, type, payload);
 			};
-			// Wire tap (diagnostic): trace the post-reconnect exchange.
-			(
-				pm as unknown as {
-					on(
-						ev: string,
-						cb: (pk: string, type: number, payload: Buffer) => void
-					): void;
-				}
-			).on('message', (_pk: string, type: number, payload: Buffer) => {
-				console.log(`    D1 [IN ] type=${type} len=${payload.length}`);
-			});
-			node.on('node:error', (e: { code?: string; message?: string }) => {
-				console.log(`    D1 [node:error] ${e.code}: ${e.message}`);
-			});
 
 			const res = node.spliceOut(channelId, 45_000n, 1000);
 			expect(res.ok, res.error).to.equal(true);
@@ -511,12 +493,11 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			expect(dropped, 'tx_signatures was dropped').to.equal(true);
 			await sleep(2000);
 
-			// Restore the wire and reconnect: channel_reestablish carries
-			// next_funding_txid on both sides and the splice resumes.
-			pm.sendToPeer = (pk: string, type: number, payload: Buffer): void => {
-				console.log(`    D1 [OUT] type=${type} len=${payload.length}`);
-				realSend(pk, type, payload);
-			};
+			// Restore the wire and reconnect: channel_reestablish announces
+			// next_funding_txid on both sides, beignet retransmits its
+			// tx_signatures, and the splice resumes (CLN also runs an update_fee
+			// round as start_batch commitment batches in this window).
+			pm.sendToPeer = realSend;
 			await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 
 			const spliceTxid = await confirmSplice(node, channelId, null);
