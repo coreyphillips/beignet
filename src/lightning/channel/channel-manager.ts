@@ -44,7 +44,8 @@ import { decodeStfuMessage } from '../message/stfu';
 import {
 	decodeSpliceMessage,
 	decodeSpliceAckMessage,
-	decodeSpliceLockedMessage
+	decodeSpliceLockedMessage,
+	decodeStartBatchMessage
 } from '../message/splice';
 import { ChannelAction, ChannelActionType } from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
@@ -324,6 +325,7 @@ export class ChannelManager extends EventEmitter {
 			MessageType.SPLICE,
 			MessageType.SPLICE_ACK,
 			MessageType.SPLICE_LOCKED,
+			MessageType.START_BATCH,
 			MessageType.OPEN_CHANNEL2,
 			MessageType.ACCEPT_CHANNEL2,
 			MessageType.TX_ADD_INPUT,
@@ -834,7 +836,31 @@ export class ChannelManager extends EventEmitter {
 				perCommitPoint,
 				nextCommitNum
 			);
-			actions = channel.signCommitment(signature, htlcSignatures);
+			if (channel.isSplicePendingLock()) {
+				// Fully-signed splice awaiting its lock: every commitment update
+				// signs BOTH active fundings (current + pending splice) and goes
+				// out as a start_batch batch answered by one revoke_and_ack.
+				const spliced = channel.getSplicedStateForSigning();
+				if (!spliced) {
+					return {
+						ok: false,
+						actions: [],
+						error: 'Pending splice: spliced state unavailable for batch signing'
+					};
+				}
+				const spliceSigned = signRemoteCommitment(
+					spliced,
+					signer,
+					perCommitPoint,
+					nextCommitNum
+				);
+				actions = channel.signCommitment(signature, htlcSignatures, undefined, {
+					spliceSignature: spliceSigned.signature,
+					spliceHtlcSignatures: spliceSigned.htlcSignatures
+				});
+			} else {
+				actions = channel.signCommitment(signature, htlcSignatures);
+			}
 		}
 		this.processActions(peerPubkey, channel, actions);
 		return { ok: true, actions };
@@ -1508,6 +1534,9 @@ export class ChannelManager extends EventEmitter {
 				case MessageType.SPLICE_LOCKED:
 					this.handleSpliceLockedMsg(peerPubkey, payload);
 					break;
+				case MessageType.START_BATCH:
+					this.handleStartBatchMsg(peerPubkey, payload);
+					break;
 				case MessageType.OPEN_CHANNEL2:
 					this.handleOpenChannel2(peerPubkey, payload);
 					break;
@@ -1817,8 +1846,10 @@ export class ChannelManager extends EventEmitter {
 		// BOLT 2: After sending revoke_and_ack, send commitment_signed to commit
 		// any pending updates on the remote's side. autoSignAndSendCommitment is a
 		// no-op unless we actually owe a commitment (channel.needsCommitment()), so
-		// this does not loop. Skip if handleCommitmentSigned returned an error.
-		if (!hasError && channel.getChannelId()) {
+		// this does not loop. Skip if handleCommitmentSigned returned an error, and
+		// skip while a start_batch batch is mid-collection — the reply belongs
+		// AFTER the whole batch (one logical update) has been verified and revoked.
+		if (!hasError && channel.getChannelId() && !channel.isCollectingBatch()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
 	}
@@ -2945,6 +2976,15 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.handleSpliceLocked(msg);
 		this.processActions(peerPubkey, channel, actions);
 		this.commitAfterSpliceIfComplete(channel);
+	}
+
+	private handleStartBatchMsg(peerPubkey: string, payload: Buffer): void {
+		const msg = decodeStartBatchMessage(payload);
+		const channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleStartBatch(msg);
+		this.processActions(peerPubkey, channel, actions);
 	}
 
 	/**

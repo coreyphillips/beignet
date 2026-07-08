@@ -44,6 +44,13 @@ export interface ISpliceInFlight {
 	ourWalletInputIndices: number[];
 	/** Peer's signature on OUR spliced commitment (adopted at completeSplice). */
 	remoteCommitmentSig: Buffer | null;
+	/**
+	 * The committed commitment feerate that remoteCommitmentSig was produced
+	 * at. force-close rebuilds the spliced commitment at THIS rate, not a
+	 * feerate that may have been staged (update_fee) but not yet covered by the
+	 * adopted signature.
+	 */
+	remoteCommitmentSigFeeratePerKw?: number;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
 	localSpliceLocked: boolean;

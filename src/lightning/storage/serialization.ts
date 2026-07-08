@@ -342,6 +342,7 @@ export interface ISerializedSpliceInFlight {
 	ourWalletWitnesses: string[][];
 	ourWalletInputIndices: number[];
 	remoteCommitmentSig: string | null;
+	remoteCommitmentSigFeeratePerKw?: number;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
 	localSpliceLocked: boolean;
@@ -368,6 +369,7 @@ export function serializeSpliceInFlight(
 		),
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
+		remoteCommitmentSigFeeratePerKw: f.remoteCommitmentSigFeeratePerKw,
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
 		localSpliceLocked: f.localSpliceLocked,
@@ -395,6 +397,7 @@ export function deserializeSpliceInFlight(
 		),
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
+		remoteCommitmentSigFeeratePerKw: s.remoteCommitmentSigFeeratePerKw,
 		sentTxSignatures: s.sentTxSignatures,
 		receivedTxSignatures: s.receivedTxSignatures,
 		localSpliceLocked: s.localSpliceLocked,
