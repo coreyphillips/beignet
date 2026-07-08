@@ -28,7 +28,7 @@ TTxResult.height
 
 #### Defined in
 
-[types/electrum.ts:54](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L54)
+[types/electrum.ts:54](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L54)
 
 ___
 
@@ -38,7 +38,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:312](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L312)
+[types/wallet.ts:312](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L312)
 
 ___
 
@@ -52,4 +52,4 @@ TTxResult.tx\_hash
 
 #### Defined in
 
-[types/electrum.ts:53](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L53)
+[types/electrum.ts:53](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L53)

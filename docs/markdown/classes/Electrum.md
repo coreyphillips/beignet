@@ -10,6 +10,7 @@
 
 ### Properties
 
+- [\_connectInFlight](Electrum.md#_connectinflight)
 - [\_wallet](Electrum.md#_wallet)
 - [batchDelay](Electrum.md#batchdelay)
 - [batchLimit](Electrum.md#batchlimit)
@@ -30,6 +31,7 @@
 
 ### Methods
 
+- [\_doConnect](Electrum.md#_doconnect)
 - [broadcastTransaction](Electrum.md#broadcasttransaction)
 - [checkConnection](Electrum.md#checkconnection)
 - [connectToElectrum](Electrum.md#connecttoelectrum)
@@ -78,9 +80,21 @@
 
 #### Defined in
 
-[electrum/index.ts:75](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L75)
+[electrum/index.ts:78](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L78)
 
 ## Properties
+
+### \_connectInFlight
+
+• `Private` **\_connectInFlight**: ``null`` \| `Promise`<[`Result`](../README.md#result)<`string`\>\> = `null`
+
+Shared in-flight connect, so concurrent callers don't race (see connectToElectrum).
+
+#### Defined in
+
+[electrum/index.ts:67](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L67)
+
+___
 
 ### \_wallet
 
@@ -88,7 +102,7 @@
 
 #### Defined in
 
-[electrum/index.ts:60](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L60)
+[electrum/index.ts:60](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L60)
 
 ___
 
@@ -98,7 +112,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:73](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L73)
+[electrum/index.ts:76](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L76)
 
 ___
 
@@ -108,7 +122,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:72](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L72)
+[electrum/index.ts:75](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L75)
 
 ___
 
@@ -118,7 +132,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:70](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L70)
+[electrum/index.ts:73](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L73)
 
 ___
 
@@ -128,7 +142,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:63](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L63)
+[electrum/index.ts:63](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L63)
 
 ___
 
@@ -138,7 +152,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:69](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L69)
+[electrum/index.ts:72](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L72)
 
 ___
 
@@ -148,7 +162,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:62](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L62)
+[electrum/index.ts:62](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L62)
 
 ___
 
@@ -158,7 +172,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:64](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L64)
+[electrum/index.ts:64](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L64)
 
 ___
 
@@ -168,7 +182,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:68](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L68)
+[electrum/index.ts:71](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L71)
 
 ___
 
@@ -192,7 +206,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:71](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L71)
+[electrum/index.ts:74](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L74)
 
 ___
 
@@ -202,7 +216,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:61](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L61)
+[electrum/index.ts:61](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L61)
 
 ___
 
@@ -212,7 +226,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:67](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L67)
+[electrum/index.ts:70](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L70)
 
 ___
 
@@ -222,7 +236,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:65](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L65)
+[electrum/index.ts:65](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L65)
 
 ## Accessors
 
@@ -236,9 +250,32 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:111](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L111)
+[electrum/index.ts:114](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L114)
 
 ## Methods
+
+### \_doConnect
+
+▸ `Private` **_doConnect**(`«destructured»`): `Promise`<[`Result`](../README.md#result)<`string`\>\>
+
+#### Parameters
+
+| Name | Type |
+| :------ | :------ |
+| `«destructured»` | `Object` |
+| › `disableRegtestCheck?` | `boolean` |
+| › `network?` | [`EAvailableNetworks`](../enums/EAvailableNetworks.md) |
+| › `servers?` | [`TServer`](../README.md#tserver) \| [`TServer`](../README.md#tserver)[] |
+
+#### Returns
+
+`Promise`<[`Result`](../README.md#result)<`string`\>\>
+
+#### Defined in
+
+[electrum/index.ts:141](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L141)
+
+___
 
 ### broadcastTransaction
 
@@ -258,7 +295,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:915](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L915)
+[electrum/index.ts:941](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L941)
 
 ___
 
@@ -274,22 +311,32 @@ Attempts to check the current Electrum connection.
 
 #### Defined in
 
-[electrum/index.ts:962](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L962)
+[electrum/index.ts:988](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L988)
 
 ___
 
 ### connectToElectrum
 
-▸ **connectToElectrum**(`«destructured»`): `Promise`<[`Result`](../README.md#result)<`string`\>\>
+▸ **connectToElectrum**(`args`): `Promise`<[`Result`](../README.md#result)<`string`\>\>
+
+Connect to the Electrum server.
+
+Concurrent callers share a single in-flight attempt. At startup several
+independent paths (background refreshWallet, sweep-address lookup, header
+subscription) can each trigger a connect at once; without this guard they
+race over rn-electrum-client's shared global client, clobbering the socket
+mid-connect so the losing attempt returns an error and logs a spurious
+"Unable to connect to Electrum server." De-duping collapses them into one
+real connect, so the others simply join its result.
 
 #### Parameters
 
 | Name | Type |
 | :------ | :------ |
-| `«destructured»` | `Object` |
-| › `disableRegtestCheck?` | `boolean` |
-| › `network?` | [`EAvailableNetworks`](../enums/EAvailableNetworks.md) |
-| › `servers?` | [`TServer`](../README.md#tserver) \| [`TServer`](../README.md#tserver)[] |
+| `args` | `Object` |
+| `args.disableRegtestCheck?` | `boolean` |
+| `args.network?` | [`EAvailableNetworks`](../enums/EAvailableNetworks.md) |
+| `args.servers?` | [`TServer`](../README.md#tserver) \| [`TServer`](../README.md#tserver)[] |
 
 #### Returns
 
@@ -297,7 +344,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:115](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L115)
+[electrum/index.ts:129](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L129)
 
 ___
 
@@ -311,7 +358,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:1002](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L1002)
+[electrum/index.ts:1028](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L1028)
 
 ___
 
@@ -333,7 +380,7 @@ Returns the balance in sats for a given address.
 
 #### Defined in
 
-[electrum/index.ts:169](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L169)
+[electrum/index.ts:195](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L195)
 
 ___
 
@@ -357,7 +404,7 @@ Returns the available history for the provided address script hashes.
 
 #### Defined in
 
-[electrum/index.ts:266](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L266)
+[electrum/index.ts:292](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L292)
 
 ___
 
@@ -377,7 +424,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:189](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L189)
+[electrum/index.ts:215](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L215)
 
 ___
 
@@ -399,7 +446,7 @@ Returns an array of tx_hashes and their height for a given array of address scri
 
 #### Defined in
 
-[electrum/index.ts:432](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L432)
+[electrum/index.ts:458](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L458)
 
 ___
 
@@ -423,7 +470,7 @@ Leaving blockHex empty will return the last known block hash from storage.
 
 #### Defined in
 
-[electrum/index.ts:712](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L712)
+[electrum/index.ts:738](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L738)
 
 ___
 
@@ -439,7 +486,7 @@ Returns last known block height, and it's corresponding hex from local storage.
 
 #### Defined in
 
-[electrum/index.ts:728](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L728)
+[electrum/index.ts:754](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L754)
 
 ___
 
@@ -462,7 +509,7 @@ Returns the block hex of the provided block height.
 
 #### Defined in
 
-[electrum/index.ts:690](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L690)
+[electrum/index.ts:716](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L716)
 
 ___
 
@@ -478,7 +525,7 @@ Returns currently connected peer.
 
 #### Defined in
 
-[electrum/index.ts:202](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L202)
+[electrum/index.ts:228](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L228)
 
 ___
 
@@ -500,7 +547,7 @@ Used to retrieve scriptPubkey history for LDK.
 
 #### Defined in
 
-[electrum/index.ts:390](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L390)
+[electrum/index.ts:416](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L416)
 
 ___
 
@@ -524,7 +571,7 @@ Returns the merkle branch to a confirmed transaction given its hash and height.
 
 #### Defined in
 
-[electrum/index.ts:768](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L768)
+[electrum/index.ts:794](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L794)
 
 ___
 
@@ -547,7 +594,7 @@ Returns available transactions from electrum based on the provided txHashes.
 
 #### Defined in
 
-[electrum/index.ts:610](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L610)
+[electrum/index.ts:636](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L636)
 
 ___
 
@@ -570,7 +617,7 @@ Returns transactions associated with the provided transaction hashes.
 
 #### Defined in
 
-[electrum/index.ts:737](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L737)
+[electrum/index.ts:763](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L763)
 
 ___
 
@@ -601,7 +648,7 @@ Returns UTXO's for a given wallet and network along with the available balance.
 
 #### Defined in
 
-[electrum/index.ts:456](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L456)
+[electrum/index.ts:482](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L482)
 
 ___
 
@@ -615,7 +662,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:159](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L159)
+[electrum/index.ts:185](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L185)
 
 ___
 
@@ -638,7 +685,7 @@ Queries Electrum to return the available UTXO's and balance of the provided addr
 
 #### Defined in
 
-[electrum/index.ts:215](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L215)
+[electrum/index.ts:241](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L241)
 
 ___
 
@@ -658,7 +705,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:991](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L991)
+[electrum/index.ts:1017](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L1017)
 
 ___
 
@@ -672,7 +719,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:1007](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L1007)
+[electrum/index.ts:1033](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L1033)
 
 ___
 
@@ -686,7 +733,7 @@ ___
 
 #### Defined in
 
-[electrum/index.ts:1015](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L1015)
+[electrum/index.ts:1041](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L1041)
 
 ___
 
@@ -710,7 +757,7 @@ Subscribes to a number of address script hashes for receiving.
 
 #### Defined in
 
-[electrum/index.ts:830](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L830)
+[electrum/index.ts:856](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L856)
 
 ___
 
@@ -726,7 +773,7 @@ Subscribes to the current networks headers.
 
 #### Defined in
 
-[electrum/index.ts:790](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L790)
+[electrum/index.ts:816](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L816)
 
 ___
 
@@ -748,4 +795,4 @@ Determines whether a transaction exists based on the transaction response from e
 
 #### Defined in
 
-[electrum/index.ts:667](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/electrum/index.ts#L667)
+[electrum/index.ts:693](https://github.com/coreyphillips/beignet/blob/e43f953/src/electrum/index.ts#L693)

@@ -34,7 +34,7 @@
 
 #### Defined in
 
-[types/wallet.ts:149](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L149)
+[types/wallet.ts:149](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L149)
 
 ___
 
@@ -48,7 +48,7 @@ TTxResult.height
 
 #### Defined in
 
-[types/electrum.ts:54](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L54)
+[types/electrum.ts:54](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L54)
 
 ___
 
@@ -62,7 +62,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:147](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L147)
+[types/wallet.ts:147](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L147)
 
 ___
 
@@ -76,7 +76,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:148](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L148)
+[types/wallet.ts:148](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L148)
 
 ___
 
@@ -90,7 +90,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:151](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L151)
+[types/wallet.ts:151](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L151)
 
 ___
 
@@ -104,7 +104,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:150](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L150)
+[types/wallet.ts:150](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L150)
 
 ___
 
@@ -118,4 +118,4 @@ TTxResult.tx\_hash
 
 #### Defined in
 
-[types/electrum.ts:53](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L53)
+[types/electrum.ts:53](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L53)

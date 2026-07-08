@@ -160,7 +160,7 @@
 
 #### Defined in
 
-[wallet/index.ts:160](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L160)
+[wallet/index.ts:160](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L160)
 
 ## Properties
 
@@ -184,7 +184,7 @@
 
 #### Defined in
 
-[wallet/index.ts:127](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L127)
+[wallet/index.ts:127](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L127)
 
 ___
 
@@ -208,7 +208,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:130](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L130)
+[wallet/index.ts:130](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L130)
 
 ___
 
@@ -218,7 +218,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:124](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L124)
+[wallet/index.ts:124](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L124)
 
 ___
 
@@ -228,7 +228,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:136](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L136)
+[wallet/index.ts:136](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L136)
 
 ___
 
@@ -238,7 +238,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:125](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L125)
+[wallet/index.ts:125](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L125)
 
 ___
 
@@ -248,7 +248,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:120](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L120)
+[wallet/index.ts:120](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L120)
 
 ___
 
@@ -258,7 +258,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:119](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L119)
+[wallet/index.ts:119](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L119)
 
 ___
 
@@ -268,7 +268,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:121](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L121)
+[wallet/index.ts:121](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L121)
 
 ___
 
@@ -278,7 +278,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:133](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L133)
+[wallet/index.ts:133](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L133)
 
 ___
 
@@ -288,7 +288,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:123](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L123)
+[wallet/index.ts:123](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L123)
 
 ___
 
@@ -298,7 +298,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:122](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L122)
+[wallet/index.ts:122](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L122)
 
 ___
 
@@ -308,7 +308,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:126](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L126)
+[wallet/index.ts:126](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L126)
 
 ___
 
@@ -318,7 +318,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:152](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L152)
+[wallet/index.ts:152](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L152)
 
 ___
 
@@ -328,7 +328,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:138](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L138)
+[wallet/index.ts:138](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L138)
 
 ___
 
@@ -338,7 +338,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:139](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L139)
+[wallet/index.ts:139](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L139)
 
 ___
 
@@ -348,7 +348,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:158](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L158)
+[wallet/index.ts:158](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L158)
 
 ___
 
@@ -358,7 +358,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:151](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L151)
+[wallet/index.ts:151](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L151)
 
 ___
 
@@ -378,7 +378,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:144](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L144)
+[wallet/index.ts:144](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L144)
 
 ___
 
@@ -388,7 +388,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:155](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L155)
+[wallet/index.ts:155](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L155)
 
 ___
 
@@ -398,7 +398,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:159](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L159)
+[wallet/index.ts:159](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L159)
 
 ___
 
@@ -408,7 +408,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:142](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L142)
+[wallet/index.ts:142](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L142)
 
 ___
 
@@ -418,7 +418,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:140](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L140)
+[wallet/index.ts:140](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L140)
 
 ___
 
@@ -428,7 +428,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:141](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L141)
+[wallet/index.ts:141](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L141)
 
 ___
 
@@ -438,7 +438,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:143](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L143)
+[wallet/index.ts:143](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L143)
 
 ___
 
@@ -448,7 +448,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:156](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L156)
+[wallet/index.ts:156](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L156)
 
 ___
 
@@ -466,7 +466,7 @@ Saves the wallet data object to storage if able.
 
 #### Defined in
 
-[wallet/index.ts:1836](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1836)
+[wallet/index.ts:1836](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1836)
 
 ___
 
@@ -476,7 +476,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:157](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L157)
+[wallet/index.ts:157](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L157)
 
 ___
 
@@ -486,7 +486,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:153](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L153)
+[wallet/index.ts:153](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L153)
 
 ___
 
@@ -496,7 +496,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:154](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L154)
+[wallet/index.ts:154](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L154)
 
 ## Accessors
 
@@ -510,7 +510,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:266](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L266)
+[wallet/index.ts:266](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L266)
 
 ___
 
@@ -524,7 +524,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:250](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L250)
+[wallet/index.ts:250](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L250)
 
 ___
 
@@ -538,7 +538,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:270](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L270)
+[wallet/index.ts:270](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L270)
 
 ___
 
@@ -552,7 +552,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:254](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L254)
+[wallet/index.ts:254](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L254)
 
 ___
 
@@ -566,7 +566,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:258](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L258)
+[wallet/index.ts:258](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L258)
 
 ___
 
@@ -580,7 +580,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:262](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L262)
+[wallet/index.ts:262](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L262)
 
 ## Methods
 
@@ -611,7 +611,7 @@ Extracts data from the provided vout.
 
 #### Defined in
 
-[wallet/index.ts:2716](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2716)
+[wallet/index.ts:2716](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2716)
 
 ___
 
@@ -634,7 +634,7 @@ Returns the address for the specified path and address type.
 
 #### Defined in
 
-[wallet/index.ts:605](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L605)
+[wallet/index.ts:605](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L605)
 
 ___
 
@@ -654,7 +654,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:430](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L430)
+[wallet/index.ts:430](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L430)
 
 ___
 
@@ -679,7 +679,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:2737](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2737)
+[wallet/index.ts:2737](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2737)
 
 ___
 
@@ -699,7 +699,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:420](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L420)
+[wallet/index.ts:420](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L420)
 
 ___
 
@@ -723,7 +723,7 @@ This method will generate addresses as specified and return an object of filtere
 
 #### Defined in
 
-[wallet/index.ts:1356](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1356)
+[wallet/index.ts:1356](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1356)
 
 ___
 
@@ -749,7 +749,7 @@ Adds a boosted transaction id to the boostedTransactions object.
 
 #### Defined in
 
-[wallet/index.ts:3495](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3495)
+[wallet/index.ts:3495](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3495)
 
 ___
 
@@ -772,7 +772,7 @@ Sets "exists" to false for a given on-chain transaction id.
 
 #### Defined in
 
-[wallet/index.ts:3480](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3480)
+[wallet/index.ts:3480](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3480)
 
 ___
 
@@ -795,7 +795,7 @@ Adds a specified input to the current transaction.
 
 #### Defined in
 
-[wallet/index.ts:3618](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3618)
+[wallet/index.ts:3618](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3618)
 
 ___
 
@@ -818,7 +818,7 @@ Adds a specified tag to the current transaction.
 
 #### Defined in
 
-[wallet/index.ts:3669](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3669)
+[wallet/index.ts:3669](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3669)
 
 ___
 
@@ -843,7 +843,7 @@ Parses and adds unconfirmed transactions to the store.
 
 #### Defined in
 
-[wallet/index.ts:2392](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2392)
+[wallet/index.ts:2392](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2392)
 
 ___
 
@@ -867,7 +867,7 @@ Returns the number of confirmations for a given block height.
 
 #### Defined in
 
-[wallet/index.ts:2434](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2434)
+[wallet/index.ts:2434](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2434)
 
 ___
 
@@ -889,7 +889,7 @@ Used to determine if we're able to boost a transaction either by RBF or CPFP.
 
 #### Defined in
 
-[wallet/index.ts:4011](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L4011)
+[wallet/index.ts:4011](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L4011)
 
 ___
 
@@ -906,7 +906,7 @@ Will attempt to reconnect if not initially available.
 
 #### Defined in
 
-[wallet/index.ts:943](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L943)
+[wallet/index.ts:943](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L943)
 
 ___
 
@@ -932,7 +932,7 @@ will be removed from the store and updated in the activity list.
 
 #### Defined in
 
-[wallet/index.ts:2063](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2063)
+[wallet/index.ts:2063](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2063)
 
 ___
 
@@ -950,7 +950,7 @@ Clears the addresses and changeAddresses object for a given wallet and network.
 
 #### Defined in
 
-[wallet/index.ts:2352](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2352)
+[wallet/index.ts:2352](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2352)
 
 ___
 
@@ -966,7 +966,7 @@ Clears the transactions object for a given wallet and network from storage.
 
 #### Defined in
 
-[wallet/index.ts:2340](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2340)
+[wallet/index.ts:2340](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2340)
 
 ___
 
@@ -984,7 +984,7 @@ Clears the UTXO array and balance from storage.
 
 #### Defined in
 
-[wallet/index.ts:2325](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2325)
+[wallet/index.ts:2325](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2325)
 
 ___
 
@@ -1008,7 +1008,7 @@ Returns the block height for a given number of confirmations from storage.
 
 #### Defined in
 
-[wallet/index.ts:2188](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2188)
+[wallet/index.ts:2188](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2188)
 
 ___
 
@@ -1030,7 +1030,7 @@ Attempts to connect to the specified Electrum server(s).
 
 #### Defined in
 
-[wallet/index.ts:704](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L704)
+[wallet/index.ts:704](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L704)
 
 ___
 
@@ -1053,7 +1053,7 @@ Deletes a given on-chain transaction by id.
 
 #### Defined in
 
-[wallet/index.ts:3459](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3459)
+[wallet/index.ts:3459](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3459)
 
 ___
 
@@ -1078,7 +1078,7 @@ Formats the provided transaction.
 
 #### Defined in
 
-[wallet/index.ts:2460](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2460)
+[wallet/index.ts:2460](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2460)
 
 ___
 
@@ -1102,7 +1102,7 @@ Generates a series of addresses based on the specified params.
 
 #### Defined in
 
-[wallet/index.ts:835](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L835)
+[wallet/index.ts:835](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L835)
 
 ___
 
@@ -1129,7 +1129,7 @@ Generate a new receive address for the provided addresstype up to the set gap li
 
 #### Defined in
 
-[wallet/index.ts:1637](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1637)
+[wallet/index.ts:1637](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1637)
 
 ___
 
@@ -1152,7 +1152,7 @@ index and whether it is a change address.
 
 #### Defined in
 
-[wallet/index.ts:644](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L644)
+[wallet/index.ts:644](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L644)
 
 ___
 
@@ -1174,7 +1174,7 @@ Returns the address balance for the specified address.
 
 #### Defined in
 
-[wallet/index.ts:725](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L725)
+[wallet/index.ts:725](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L725)
 
 ___
 
@@ -1196,7 +1196,7 @@ Get address for a given keyPair, network and type.
 
 #### Defined in
 
-[wallet/index.ts:678](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L678)
+[wallet/index.ts:678](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L678)
 
 ___
 
@@ -1218,7 +1218,7 @@ Returns the address from a provided script hash in storage.
 
 #### Defined in
 
-[wallet/index.ts:3088](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3088)
+[wallet/index.ts:3088](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3088)
 
 ___
 
@@ -1240,7 +1240,7 @@ Returns an array of tx_hashes and their height for a given address.
 
 #### Defined in
 
-[wallet/index.ts:3963](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3963)
+[wallet/index.ts:3963](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3963)
 
 ___
 
@@ -1256,7 +1256,7 @@ Returns current address index information.
 
 #### Defined in
 
-[wallet/index.ts:3205](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3205)
+[wallet/index.ts:3205](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3205)
 
 ___
 
@@ -1276,7 +1276,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:3917](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3917)
+[wallet/index.ts:3917](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3917)
 
 ___
 
@@ -1300,7 +1300,7 @@ Returns combined balance of provided addresses.
 
 #### Defined in
 
-[wallet/index.ts:743](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L743)
+[wallet/index.ts:743](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L743)
 
 ___
 
@@ -1323,7 +1323,7 @@ Get addresses from a given private key.
 
 #### Defined in
 
-[wallet/index.ts:3790](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3790)
+[wallet/index.ts:3790](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3790)
 
 ___
 
@@ -1339,7 +1339,7 @@ Returns the known balance from storage.
 
 #### Defined in
 
-[wallet/index.ts:819](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L819)
+[wallet/index.ts:819](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L819)
 
 ___
 
@@ -1355,7 +1355,7 @@ Creates a BIP32Interface from the selected wallet's mnemonic and passphrase
 
 #### Defined in
 
-[wallet/index.ts:3602](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3602)
+[wallet/index.ts:3602](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3602)
 
 ___
 
@@ -1377,7 +1377,7 @@ Returns the Network object of the currently selected network (bitcoin or testnet
 
 #### Defined in
 
-[wallet/index.ts:584](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L584)
+[wallet/index.ts:584](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L584)
 
 ___
 
@@ -1398,7 +1398,7 @@ Returns an array of transactions that can be boosted with cpfp and rbf.
 
 #### Defined in
 
-[wallet/index.ts:3585](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3585)
+[wallet/index.ts:3585](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3585)
 
 ___
 
@@ -1422,7 +1422,7 @@ Returns an array of parents for a boosted transaction id.
 
 #### Defined in
 
-[wallet/index.ts:3548](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3548)
+[wallet/index.ts:3548](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3548)
 
 ___
 
@@ -1438,7 +1438,7 @@ Returns boosted transactions object.
 
 #### Defined in
 
-[wallet/index.ts:3569](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3569)
+[wallet/index.ts:3569](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3569)
 
 ___
 
@@ -1462,7 +1462,7 @@ Retrieves the next available change address data.
 
 #### Defined in
 
-[wallet/index.ts:2766](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2766)
+[wallet/index.ts:2766](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2766)
 
 ___
 
@@ -1484,7 +1484,7 @@ Fallback method to use blocktank for fee estimates if mempool.space is down.
 
 #### Defined in
 
-[wallet/index.ts:2839](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2839)
+[wallet/index.ts:2839](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2839)
 
 ___
 
@@ -1508,7 +1508,7 @@ Returns the current fee estimates for the provided network.
 
 #### Defined in
 
-[wallet/index.ts:2799](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2799)
+[wallet/index.ts:2799](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2799)
 
 ___
 
@@ -1535,7 +1535,7 @@ Returns a fee object for the current transaction.
 
 #### Defined in
 
-[wallet/index.ts:2894](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2894)
+[wallet/index.ts:2894](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2894)
 
 ___
 
@@ -1558,7 +1558,7 @@ Returns the difference between the current address index and the last used addre
 
 #### Defined in
 
-[wallet/index.ts:1748](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1748)
+[wallet/index.ts:1748](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1748)
 
 ___
 
@@ -1582,7 +1582,7 @@ Retrives the highest stored address index for the provided address type.
 
 #### Defined in
 
-[wallet/index.ts:1316](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1316)
+[wallet/index.ts:1316](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1316)
 
 ___
 
@@ -1607,7 +1607,7 @@ Returns formatted input data from the inputs array.
 
 #### Defined in
 
-[wallet/index.ts:2633](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2633)
+[wallet/index.ts:2633](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2633)
 
 ___
 
@@ -1629,7 +1629,7 @@ Returns the next available address for the given addresstype.
 
 #### Defined in
 
-[wallet/index.ts:959](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L959)
+[wallet/index.ts:959](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L959)
 
 ___
 
@@ -1651,7 +1651,7 @@ Returns private key for the provided path.
 
 #### Defined in
 
-[wallet/index.ts:797](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L797)
+[wallet/index.ts:797](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L797)
 
 ___
 
@@ -1675,7 +1675,7 @@ Returns the balance, utxos, and keyPair info for a given private key.
 
 #### Defined in
 
-[wallet/index.ts:3812](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3812)
+[wallet/index.ts:3812](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3812)
 
 ___
 
@@ -1699,7 +1699,7 @@ replace-by-fee transaction for any 0-conf, RBF-enabled tx.
 
 #### Defined in
 
-[wallet/index.ts:3275](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3275)
+[wallet/index.ts:3275](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3275)
 
 ___
 
@@ -1722,7 +1722,7 @@ Returns the next available receive address.
 
 #### Defined in
 
-[wallet/index.ts:3227](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3227)
+[wallet/index.ts:3227](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3227)
 
 ___
 
@@ -1746,7 +1746,7 @@ Get scriptHash for a given address
 
 #### Defined in
 
-[wallet/index.ts:778](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L778)
+[wallet/index.ts:778](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L778)
 
 ___
 
@@ -1768,7 +1768,7 @@ Returns the balance for the specified scriptHash.
 
 #### Defined in
 
-[wallet/index.ts:807](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L807)
+[wallet/index.ts:807](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L807)
 
 ___
 
@@ -1790,7 +1790,7 @@ Returns the transaction details for a given tx_hash.
 
 #### Defined in
 
-[wallet/index.ts:3988](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3988)
+[wallet/index.ts:3988](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3988)
 
 ___
 
@@ -1806,7 +1806,7 @@ Returns the current wallet's unconfirmed transactions from storage.
 
 #### Defined in
 
-[wallet/index.ts:2176](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2176)
+[wallet/index.ts:2176](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2176)
 
 ___
 
@@ -1833,7 +1833,7 @@ Retrieves and sets UTXO's for the current wallet from Electrum.
 
 #### Defined in
 
-[wallet/index.ts:1784](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1784)
+[wallet/index.ts:1784](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1784)
 
 ___
 
@@ -1850,7 +1850,7 @@ Otherwise, it falls back to the default wallet data object.
 
 #### Defined in
 
-[wallet/index.ts:498](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L498)
+[wallet/index.ts:498](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L498)
 
 ___
 
@@ -1872,7 +1872,7 @@ Returns the key used for storing wallet data in the key/value pair.
 
 #### Defined in
 
-[wallet/index.ts:489](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L489)
+[wallet/index.ts:489](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L489)
 
 ___
 
@@ -1894,7 +1894,7 @@ Ensures the provided mnemonic matches the one stored in the wallet and is valid.
 
 #### Defined in
 
-[wallet/index.ts:594](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L594)
+[wallet/index.ts:594](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L594)
 
 ___
 
@@ -1910,7 +1910,7 @@ Returns the current wallet's UTXO's from storage.
 
 #### Defined in
 
-[wallet/index.ts:1824](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1824)
+[wallet/index.ts:1824](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1824)
 
 ___
 
@@ -1931,7 +1931,7 @@ This method processes all transactions with less than 6 confirmations and return
 
 #### Defined in
 
-[wallet/index.ts:2106](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2106)
+[wallet/index.ts:2106](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2106)
 
 ___
 
@@ -1956,7 +1956,7 @@ Refreshes/Syncs the wallet data.
 
 #### Defined in
 
-[wallet/index.ts:371](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L371)
+[wallet/index.ts:371](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L371)
 
 ___
 
@@ -1982,7 +1982,7 @@ This method will compare a set of specified addresses to the currently stored ad
 
 #### Defined in
 
-[wallet/index.ts:1430](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1430)
+[wallet/index.ts:1430](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1430)
 
 ___
 
@@ -2005,7 +2005,7 @@ Removes the specified input from the current transaction.
 
 #### Defined in
 
-[wallet/index.ts:3643](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3643)
+[wallet/index.ts:3643](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3643)
 
 ___
 
@@ -2028,7 +2028,7 @@ Removes a specified tag from the current transaction.
 
 #### Defined in
 
-[wallet/index.ts:3692](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3692)
+[wallet/index.ts:3692](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3692)
 
 ___
 
@@ -2057,7 +2057,7 @@ limit or higher (if previously set higher by the user).
 
 #### Defined in
 
-[wallet/index.ts:2266](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2266)
+[wallet/index.ts:2266](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2266)
 
 ___
 
@@ -2073,7 +2073,7 @@ Resets address indexes back to the app's default/original state.
 
 #### Defined in
 
-[wallet/index.ts:1608](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1608)
+[wallet/index.ts:1608](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1608)
 
 ___
 
@@ -2089,7 +2089,7 @@ This completely resets the send transaction state.
 
 #### Defined in
 
-[wallet/index.ts:3577](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3577)
+[wallet/index.ts:3577](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3577)
 
 ___
 
@@ -2116,7 +2116,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:1837](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1837)
+[wallet/index.ts:1837](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1837)
 
 ___
 
@@ -2147,7 +2147,7 @@ Sets up and creates a transaction to a single output/recipient.
 
 #### Defined in
 
-[wallet/index.ts:3057](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3057)
+[wallet/index.ts:3057](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3057)
 
 ___
 
@@ -2174,7 +2174,7 @@ Sets up and creates a transaction to multiple outputs.
 
 #### Defined in
 
-[wallet/index.ts:2925](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2925)
+[wallet/index.ts:2925](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2925)
 
 ___
 
@@ -2200,7 +2200,7 @@ Sends the maximum amount of sats to a given address at the specified satsPerByte
 
 #### Defined in
 
-[wallet/index.ts:3001](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3001)
+[wallet/index.ts:3001](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3001)
 
 ___
 
@@ -2216,7 +2216,7 @@ Sets the wallet data object.
 
 #### Defined in
 
-[wallet/index.ts:441](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L441)
+[wallet/index.ts:441](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L441)
 
 ___
 
@@ -2235,7 +2235,7 @@ Will also generate and store address and changeAddress at index 0.
 
 #### Defined in
 
-[wallet/index.ts:3108](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3108)
+[wallet/index.ts:3108](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3108)
 
 ___
 
@@ -2259,7 +2259,7 @@ Updates the fee rate for the current transaction to the preferred value if none 
 
 #### Defined in
 
-[wallet/index.ts:3717](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3717)
+[wallet/index.ts:3717](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3717)
 
 ___
 
@@ -2282,7 +2282,7 @@ Sets up the transaction object with existing inputs and change address informati
 
 #### Defined in
 
-[wallet/index.ts:2879](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2879)
+[wallet/index.ts:2879](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2879)
 
 ___
 
@@ -2298,7 +2298,7 @@ Stops the wallet. Use this method to prepare the wallet to be de
 
 #### Defined in
 
-[wallet/index.ts:292](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L292)
+[wallet/index.ts:292](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L292)
 
 ___
 
@@ -2322,7 +2322,7 @@ Ensure we are not overwriting wallet data of a different wallet by checking that
 
 #### Defined in
 
-[wallet/index.ts:464](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L464)
+[wallet/index.ts:464](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L464)
 
 ___
 
@@ -2346,7 +2346,7 @@ Sweeps a private key to a given address.
 
 #### Defined in
 
-[wallet/index.ts:3856](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3856)
+[wallet/index.ts:3856](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3856)
 
 ___
 
@@ -2367,7 +2367,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:316](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L316)
+[wallet/index.ts:316](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L316)
 
 ___
 
@@ -2393,7 +2393,7 @@ Updates the address index for a given address type.
 
 #### Defined in
 
-[wallet/index.ts:3158](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3158)
+[wallet/index.ts:3158](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3158)
 
 ___
 
@@ -2411,7 +2411,7 @@ This method updates the next available (zero-balance) address & changeAddress in
 
 #### Defined in
 
-[wallet/index.ts:1479](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1479)
+[wallet/index.ts:1479](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1479)
 
 ___
 
@@ -2433,7 +2433,7 @@ Updates the address type for the current wallet.
 
 #### Defined in
 
-[wallet/index.ts:356](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L356)
+[wallet/index.ts:356](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L356)
 
 ___
 
@@ -2455,7 +2455,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:1869](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1869)
+[wallet/index.ts:1869](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1869)
 
 ___
 
@@ -2475,7 +2475,7 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:310](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L310)
+[wallet/index.ts:310](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L310)
 
 ___
 
@@ -2499,7 +2499,7 @@ Updates the fee estimates for the current network.
 
 #### Defined in
 
-[wallet/index.ts:3770](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3770)
+[wallet/index.ts:3770](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3770)
 
 ___
 
@@ -2521,7 +2521,7 @@ Allows the user to update the gap limit options.
 
 #### Defined in
 
-[wallet/index.ts:3940](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3940)
+[wallet/index.ts:3940](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3940)
 
 ___
 
@@ -2546,7 +2546,7 @@ Removes transactions from the store and activity list.
 
 #### Defined in
 
-[wallet/index.ts:2222](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2222)
+[wallet/index.ts:2222](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2222)
 
 ___
 
@@ -2568,7 +2568,7 @@ Updates & Saves header information to storage.
 
 #### Defined in
 
-[wallet/index.ts:2210](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2210)
+[wallet/index.ts:2210](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2210)
 
 ___
 
@@ -2592,7 +2592,7 @@ Updates the confirmation state of activity item transactions that were reorg'd o
 
 #### Defined in
 
-[wallet/index.ts:2369](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2369)
+[wallet/index.ts:2369](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2369)
 
 ___
 
@@ -2616,7 +2616,7 @@ Retrieves, formats & stores the transaction history for the selected wallet/netw
 
 #### Defined in
 
-[wallet/index.ts:1890](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L1890)
+[wallet/index.ts:1890](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L1890)
 
 ___
 
@@ -2639,7 +2639,7 @@ Used to temporarily update the balance until the Electrum server catches up afte
 
 #### Defined in
 
-[wallet/index.ts:3753](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L3753)
+[wallet/index.ts:3753](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L3753)
 
 ___
 
@@ -2661,7 +2661,7 @@ Attempts to validate a given address.
 
 #### Defined in
 
-[wallet/index.ts:2756](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L2756)
+[wallet/index.ts:2756](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L2756)
 
 ___
 
@@ -2681,4 +2681,4 @@ ___
 
 #### Defined in
 
-[wallet/index.ts:274](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/wallet/index.ts#L274)
+[wallet/index.ts:274](https://github.com/coreyphillips/beignet/blob/e43f953/src/wallet/index.ts#L274)

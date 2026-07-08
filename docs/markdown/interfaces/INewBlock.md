@@ -17,7 +17,7 @@
 
 #### Defined in
 
-[types/electrum.ts:117](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L117)
+[types/electrum.ts:117](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L117)
 
 ___
 
@@ -27,4 +27,4 @@ ___
 
 #### Defined in
 
-[types/electrum.ts:118](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L118)
+[types/electrum.ts:118](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L118)

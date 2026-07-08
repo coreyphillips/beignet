@@ -58,7 +58,7 @@
 
 #### Defined in
 
-[transaction/index.ts:52](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L52)
+[transaction/index.ts:52](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L52)
 
 ## Properties
 
@@ -68,7 +68,7 @@
 
 #### Defined in
 
-[transaction/index.ts:49](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L49)
+[transaction/index.ts:49](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L49)
 
 ___
 
@@ -78,7 +78,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:50](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L50)
+[transaction/index.ts:50](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L50)
 
 ## Accessors
 
@@ -92,7 +92,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:57](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L57)
+[transaction/index.ts:57](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L57)
 
 ## Methods
 
@@ -116,7 +116,7 @@ Adds external inputs to the current transaction.
 
 #### Defined in
 
-[transaction/index.ts:859](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L859)
+[transaction/index.ts:859](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L859)
 
 ___
 
@@ -136,7 +136,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:746](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L746)
+[transaction/index.ts:746](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L746)
 
 ___
 
@@ -158,7 +158,7 @@ Adds an output at the specified index to the current transaction.
 
 #### Defined in
 
-[transaction/index.ts:908](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L908)
+[transaction/index.ts:908](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L908)
 
 ___
 
@@ -179,7 +179,7 @@ ___
 
 #### Defined in
 
-[transaction/index.ts:180](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L180)
+[transaction/index.ts:180](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L180)
 
 ___
 
@@ -207,7 +207,7 @@ Selects coins for transaction construction based on provided parameters.
 
 #### Defined in
 
-[transaction/index.ts:1408](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1408)
+[transaction/index.ts:1408](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1408)
 
 ___
 
@@ -232,7 +232,7 @@ Returns a PSBT that includes unsigned funding inputs.
 
 #### Defined in
 
-[transaction/index.ts:607](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L607)
+[transaction/index.ts:607](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L607)
 
 ___
 
@@ -254,7 +254,7 @@ Creates complete signed transaction using the transaction data store
 
 #### Defined in
 
-[transaction/index.ts:440](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L440)
+[transaction/index.ts:440](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L440)
 
 ___
 
@@ -278,7 +278,7 @@ Calculates the max amount able to send for onchain/lightning
 
 #### Defined in
 
-[transaction/index.ts:1138](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1138)
+[transaction/index.ts:1138](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1138)
 
 ___
 
@@ -302,7 +302,7 @@ Returns the maximum sats per byte that can be used for a given transaction.
 
 #### Defined in
 
-[transaction/index.ts:423](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L423)
+[transaction/index.ts:423](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L423)
 
 ___
 
@@ -327,7 +327,7 @@ Calculates the max amount able to send for the provided/current onchain transact
 
 #### Defined in
 
-[transaction/index.ts:1205](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1205)
+[transaction/index.ts:1205](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1205)
 
 ___
 
@@ -354,7 +354,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 
 #### Defined in
 
-[transaction/index.ts:236](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L236)
+[transaction/index.ts:236](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L236)
 
 ___
 
@@ -381,7 +381,7 @@ Attempt to estimate the current fee for a given transaction and its UTXO's
 
 #### Defined in
 
-[transaction/index.ts:309](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L309)
+[transaction/index.ts:309](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L309)
 
 ___
 
@@ -404,7 +404,7 @@ Returns total value of all utxos.
 
 #### Defined in
 
-[transaction/index.ts:535](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L535)
+[transaction/index.ts:535](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L535)
 
 ___
 
@@ -427,7 +427,7 @@ Returns total value of all outputs. Excludes any value that would be sent to the
 
 #### Defined in
 
-[transaction/index.ts:932](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L932)
+[transaction/index.ts:932](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L932)
 
 ___
 
@@ -449,7 +449,7 @@ Removes blacklisted UTXO's from the UTXO array.
 
 #### Defined in
 
-[transaction/index.ts:211](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L211)
+[transaction/index.ts:211](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L211)
 
 ___
 
@@ -465,7 +465,7 @@ This completely resets the send transaction state.
 
 #### Defined in
 
-[transaction/index.ts:201](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L201)
+[transaction/index.ts:201](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L201)
 
 ___
 
@@ -492,7 +492,7 @@ Toggles the max amount to the provided output index.
 
 #### Defined in
 
-[transaction/index.ts:1069](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1069)
+[transaction/index.ts:1069](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1069)
 
 ___
 
@@ -516,7 +516,7 @@ Sets up a CPFP transaction.
 
 #### Defined in
 
-[transaction/index.ts:1256](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1256)
+[transaction/index.ts:1256](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1256)
 
 ___
 
@@ -539,7 +539,7 @@ Sets up a transaction for RBF.
 
 #### Defined in
 
-[transaction/index.ts:1327](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L1327)
+[transaction/index.ts:1327](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L1327)
 
 ___
 
@@ -562,7 +562,7 @@ This function will not override previously set transaction data. To do that you'
 
 #### Defined in
 
-[transaction/index.ts:71](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L71)
+[transaction/index.ts:71](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L71)
 
 ___
 
@@ -586,7 +586,7 @@ Loops through inputs and signs them
 
 #### Defined in
 
-[transaction/index.ts:559](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L559)
+[transaction/index.ts:559](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L559)
 
 ___
 
@@ -612,7 +612,7 @@ Updates the fee for the current transaction by the specified amount.
 
 #### Defined in
 
-[transaction/index.ts:995](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L995)
+[transaction/index.ts:995](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L995)
 
 ___
 
@@ -635,4 +635,4 @@ This updates the transaction state used for sending.
 
 #### Defined in
 
-[transaction/index.ts:957](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/transaction/index.ts#L957)
+[transaction/index.ts:957](https://github.com/coreyphillips/beignet/blob/e43f953/src/transaction/index.ts#L957)

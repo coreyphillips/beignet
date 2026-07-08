@@ -22,7 +22,7 @@ Available nodes.
 
 #### Defined in
 
-[types/wallet.ts:541](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L541)
+[types/wallet.ts:541](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L541)
 
 ___
 
@@ -42,7 +42,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:593](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L593)
+[types/wallet.ts:593](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L593)
 
 ___
 
@@ -65,7 +65,7 @@ ___
 
 #### Defined in
 
-[types/wallet.ts:542](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L542)
+[types/wallet.ts:542](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L542)
 
 ___
 
@@ -79,7 +79,7 @@ Use the `versions` object instead.
 
 #### Defined in
 
-[types/wallet.ts:537](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L537)
+[types/wallet.ts:537](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L537)
 
 ___
 
@@ -99,4 +99,4 @@ SemVer versions of the micro services.
 
 #### Defined in
 
-[types/wallet.ts:579](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/wallet.ts#L579)
+[types/wallet.ts:579](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/wallet.ts#L579)
