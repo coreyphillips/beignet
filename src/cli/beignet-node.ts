@@ -963,19 +963,27 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		satsPerVbyte?: number
 	): Promise<TxInfo> {
+		// wallet.send with broadcast:true resolves to the txid, not the raw
+		// hex, so build first (broadcast:false returns the hex) and broadcast
+		// separately to report both txid and hex.
 		const result = await this.wallet.send({
 			address,
 			amount: amountSats,
-			broadcast: true,
+			broadcast: false,
 			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
 		});
 		if (result.isErr()) {
 			throw new BeignetError('SEND_FAILED', result.error.message);
 		}
 		const hex = result.value;
-		// Extract txid from raw hex
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
+		const broadcastRes = await this.wallet.electrum.broadcastTransaction({
+			rawTx: hex
+		});
+		if (broadcastRes.isErr()) {
+			throw new BeignetError('SEND_FAILED', broadcastRes.error.message);
+		}
 		return { txid: tx.getId(), hex };
 	}
 
