@@ -314,6 +314,14 @@ export interface ISerializedChannelState {
 	spliceFundingOutputIndex?: number;
 	preSpliceState?: string | null;
 	spliceInFlight?: ISerializedSpliceInFlight | null;
+	remoteForwardingPolicy?: {
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		cltvExpiryDelta: number;
+		htlcMinimumMsat: string;
+		htlcMaximumMsat: string | null;
+		timestamp: number;
+	} | null;
 	fundingVersion?: number;
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
@@ -531,6 +539,20 @@ export function serializeChannelState(
 		spliceInFlight: s.spliceInFlight
 			? serializeSpliceInFlight(s.spliceInFlight)
 			: null,
+		remoteForwardingPolicy: s.remoteForwardingPolicy
+			? {
+					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,
+					feeProportionalMillionths:
+						s.remoteForwardingPolicy.feeProportionalMillionths,
+					cltvExpiryDelta: s.remoteForwardingPolicy.cltvExpiryDelta,
+					htlcMinimumMsat: s.remoteForwardingPolicy.htlcMinimumMsat.toString(),
+					htlcMaximumMsat:
+						s.remoteForwardingPolicy.htlcMaximumMsat === null
+							? null
+							: s.remoteForwardingPolicy.htlcMaximumMsat.toString(),
+					timestamp: s.remoteForwardingPolicy.timestamp
+			  }
+			: null,
 		fundingVersion: s.fundingVersion,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
@@ -676,6 +698,20 @@ export function deserializeChannelState(
 		preSpliceState: (s.preSpliceState as ChannelState) || null,
 		spliceInFlight: s.spliceInFlight
 			? deserializeSpliceInFlight(s.spliceInFlight)
+			: null,
+		remoteForwardingPolicy: s.remoteForwardingPolicy
+			? {
+					feeBaseMsat: s.remoteForwardingPolicy.feeBaseMsat,
+					feeProportionalMillionths:
+						s.remoteForwardingPolicy.feeProportionalMillionths,
+					cltvExpiryDelta: s.remoteForwardingPolicy.cltvExpiryDelta,
+					htlcMinimumMsat: BigInt(s.remoteForwardingPolicy.htlcMinimumMsat),
+					htlcMaximumMsat:
+						s.remoteForwardingPolicy.htlcMaximumMsat === null
+							? null
+							: BigInt(s.remoteForwardingPolicy.htlcMaximumMsat),
+					timestamp: s.remoteForwardingPolicy.timestamp
+			  }
 			: null,
 		fundingVersion: (s.fundingVersion ?? 1) as 1 | 2,
 		dualFundingSession: null,
