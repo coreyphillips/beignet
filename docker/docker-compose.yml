@@ -113,7 +113,13 @@ services:
 
   eclair:
     container_name: eclair
-    image: acinq/eclair:latest
+    # Pinned: acinq/eclair:latest moved to a build that asserts "Eclair
+    # requires Bitcoin Core 30 or higher" against our bitcoind 29.1, then
+    # crash-loops under restart:unless-stopped and starves the CI runner
+    # (electrs loses its connection mid-suite and every tests job fails).
+    # polarlightning/eclair:0.13.1 is the same eclair version the interop
+    # suites are validated against locally.
+    image: polarlightning/eclair:0.13.1
     depends_on:
       bitcoind:
         condition: service_healthy
