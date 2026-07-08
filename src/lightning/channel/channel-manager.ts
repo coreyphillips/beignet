@@ -3136,8 +3136,22 @@ export class ChannelManager extends EventEmitter {
 		// Override the caller's key material with the channel's own (mirrors the
 		// acceptor path in handleOpenChannel2). In the common case (no per-channel
 		// key deriver) these are already equal.
+		// CLN requires the channel_type TLV on open_channel2 (tx_abort: "open_channel2
+		// missing channel_type"). Default it exactly like the legacy open.
+		let channelType = params.channelType;
+		if (!channelType) {
+			const typeFlags = FeatureFlags.empty();
+			typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			if (this.config.preferAnchors) {
+				typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			}
+			channelType = typeFlags.toBuffer();
+		}
+
 		const alignedParams: IDualFundingParams = {
 			...params,
+			chainHash: params.chainHash ?? this.config.chainHash,
+			channelType,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed,
 			secondPerCommitmentPoint: perCommitmentPointFromSecret(
@@ -3161,6 +3175,22 @@ export class ChannelManager extends EventEmitter {
 
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
+
+		// Reject opens for a chain we do not operate on. (The legacy v1 open
+		// path does not yet validate chain_hash; this guard is intentionally
+		// stricter for v2, where we always send and receive the field.)
+		if (
+			this.config.chainHash &&
+			msg.chainHash &&
+			!msg.chainHash.equals(this.config.chainHash)
+		) {
+			this.emit(
+				'error',
+				msg.channelId,
+				`open_channel2 for unknown chain ${msg.chainHash.toString('hex')}`
+			);
+			return;
+		}
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createAcceptorState({
