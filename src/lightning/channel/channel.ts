@@ -50,7 +50,7 @@ import {
 	encodeClosingCompleteMessage,
 	encodeClosingSigMessage
 } from '../message/channel-close';
-import { isDustOutput } from '../chain/closing';
+import { isDustOutput, calculateClosingFee } from '../chain/closing';
 import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
@@ -2907,9 +2907,16 @@ export class Channel {
 		// which abandons our in-flight closing_complete round.
 		if (this._state.state === ChannelState.NEGOTIATING_CLOSING) {
 			this._state.remoteShutdownScript = msg.scriptPubkey;
-			if (msg.shutdownNonce) {
-				// A retransmitted shutdown carries a FRESH closing nonce: the
-				// previous closing session (and any partial made in it) is dead.
+			// Only adopt a fresh remote nonce (which resets the closing session)
+			// when OUR nonce has also been refreshed since we last signed. The
+			// legitimate case is a post-reestablish retransmit, where
+			// buildShutdownRetransmit already generated a fresh local nonce (so
+			// _hasSignedClosing is false). A same-connection DUPLICATE shutdown
+			// arriving after we signed (_hasSignedClosing true) would otherwise
+			// clear our sign-once latch while our local nonce is already spent,
+			// wedging the close (partialSign throws, no secret nonce). Ignore it:
+			// our already-signed partial stays valid for the peer to complete.
+			if (msg.shutdownNonce && !this._hasSignedClosing) {
 				this._adoptRemoteClosingNonce(msg.shutdownNonce);
 			}
 			if (this._state.simpleClose === true) {
@@ -3278,9 +3285,43 @@ export class Channel {
 			];
 		}
 
-		// Responder: accept the initiator's first offer verbatim. The fee comes
-		// out of the OPENER's output only; a fee its balance cannot cover is the
-		// one un-buildable case.
+		// Responder: accept the initiator's first offer, but bound it to a
+		// reasonable range. Single-round negotiation means we cannot counter, so
+		// an unbounded accept would let the initiator burn our balance to miners
+		// with an absurdly high fee (when WE are the opener, the fee comes out of
+		// OUR output) or wedge the channel with an unrelayable, un-RBF-able low
+		// fee. The band is computed at the EFFECTIVE channel feerate (the higher
+		// of the two sides' committed rates): the initiator picks its own
+		// closing feerate, which may exceed our stale local config, so a band
+		// keyed only to our local feerate would reject legitimate offers.
+		const bandFeeRate = BigInt(
+			Math.max(
+				this._state.localConfig.feeratePerKw || 253,
+				this._state.remoteConfig.feeratePerKw || 253,
+				253
+			)
+		);
+		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
+		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
+		const bandWeight = BigInt(
+			206 + 4 * (9 + bandLocalLen) + 4 * (9 + bandRemoteLen) + 66
+		);
+		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
+		const maxAcceptableFee = idealFee * 5n;
+		const minAcceptableFee = idealFee / 5n;
+		if (
+			msg.feeSatoshis > maxAcceptableFee ||
+			msg.feeSatoshis < minAcceptableFee
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Taproot closing fee ${msg.feeSatoshis} outside acceptable range [${minAcceptableFee}, ${maxAcceptableFee}]`
+				}
+			];
+		}
+		// The fee comes out of the OPENER's output only; a fee its balance
+		// cannot cover is un-buildable.
 		const isOpener = this._state.role === ChannelRole.OPENER;
 		const openerBalanceSat = isOpener
 			? this._state.localBalanceMsat / 1000n
@@ -3326,15 +3367,13 @@ export class Channel {
 
 	private calculateIdealClosingFee(): bigint {
 		const feeRate = this._state.localConfig.feeratePerKw || 253;
-		// Taproot single-round close: the responder accepts our fee verbatim,
-		// so it must make the tx actually relayable. Use the real weight:
-		// header+input 206 wu + per-output 4*(9+scriptLen) + 66 wu key-spend
-		// witness (matches chain/closing.ts calculateClosingFee taproot mode).
+		// Taproot single-round close: the responder accepts our fee verbatim, so
+		// it must make the tx actually relayable. Use the SAME weight model as
+		// the tx builder (chain/closing.ts) with the 66-WU key-spend witness.
 		if (isTaprootChannel(this._state.channelType)) {
 			const localLen = this._state.localShutdownScript?.length ?? 22;
 			const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-			const weight = 206 + 4 * (9 + localLen) + 4 * (9 + remoteLen) + 66;
-			return BigInt(Math.ceil((weight * feeRate) / 1000));
+			return calculateClosingFee(feeRate, localLen, remoteLen, true);
 		}
 		// A typical closing tx is ~170 weight units (simplified calculation)
 		// fee = weight * feeratePerKw / 1000

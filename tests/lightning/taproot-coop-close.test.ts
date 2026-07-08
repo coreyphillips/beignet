@@ -177,6 +177,9 @@ function assertCloseTxValid(txBuf: Buffer, channel: Channel): void {
 	expect(witness.length, 'key-spend witness has one element').to.equal(1);
 	const sig = witness[0];
 	expect(sig.length).to.equal(64);
+	// LND builds the taproot coop-close tx RBF-signalled; the sequence is part
+	// of the BIP341 sighash, so it is consensus-critical.
+	expect(tx.ins[0].sequence).to.equal(0xfffffffd);
 
 	const funding = createTaprootFundingScript(
 		state.localBasepoints.fundingPubkey,
@@ -363,6 +366,81 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		expect(err, 'expected an ERROR action').to.exist;
 		expect(err.message).to.match(/echo/i);
 		expect(aliceChannel.getState()).to.not.equal(ChannelState.CLOSED);
+	});
+
+	it('responder rejects an unreasonable initiator fee (fund-safety)', function () {
+		// bob is the RESPONDER here (alice, the opener, never proposes): a fee
+		// far outside the reasonable band must be refused rather than accepted
+		// verbatim, since single-round negotiation cannot counter it.
+		const { bobChannel, channelId } = readyTaprootChannel(21, 22);
+		bobChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(bobChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		// An absurdly high fee (would burn the balance to miners).
+		const high = bobChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 5_000_000n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		expect(
+			high.find((a) => a.type === ChannelActionType.ERROR),
+			'high fee rejected'
+		).to.exist;
+		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+
+		// An absurdly low fee (would produce an unrelayable, un-RBF-able tx).
+		const low = bobChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: 1n,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		expect(
+			low.find((a) => a.type === ChannelActionType.ERROR),
+			'low fee rejected'
+		).to.exist;
+		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
+	});
+
+	it('ignores a same-connection duplicate shutdown after signing (no wedge)', function () {
+		// After we (opener) propose and sign with our closing nonce, a duplicate
+		// shutdown with a fresh peer nonce on the SAME connection must NOT reset
+		// our sign-once latch (which would strand us with a spent local nonce).
+		const { aliceChannel, channelId } = readyTaprootChannel(23, 24);
+		aliceChannel.initiateShutdown(P2WPKH_A);
+		aliceChannel.handleShutdown({
+			channelId,
+			scriptPubkey: P2WPKH_A,
+			shutdownNonce: crypto.randomBytes(66)
+		});
+		aliceChannel.proposeClosingFee(() => crypto.randomBytes(32));
+		const before = aliceChannel.getFullState().lastProposedClosingFeeSat;
+
+		// Duplicate shutdown, fresh nonce, same connection.
+		const actions = aliceChannel.handleShutdown({
+			channelId,
+			scriptPubkey: P2WPKH_A,
+			shutdownNonce: crypto.randomBytes(66)
+		});
+		expect(actions).to.deep.equal([]);
+		// Our signed proposal is intact (not reset).
+		expect(aliceChannel.getFullState().lastProposedClosingFeeSat).to.equal(
+			before
+		);
 	});
 
 	it('never signs twice in one closing session (sign-once latch)', function () {
