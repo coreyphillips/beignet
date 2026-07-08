@@ -49,6 +49,8 @@ export enum DualFundingState {
 
 /** Parameters for opening a dual-funded channel */
 export interface IDualFundingParams {
+	/** Genesis hash of the target chain (open_channel2's first field). */
+	chainHash?: Buffer;
 	/** Our funding contribution in satoshis */
 	fundingSatoshis: bigint;
 	/** Fee rate for the funding transaction (sat/kw) */
@@ -230,6 +232,7 @@ export class DualFundingSession {
 		this._localParams = params;
 
 		const msg: IOpenChannel2Message = {
+			chainHash: params.chainHash,
 			channelId: this._channelId,
 			fundingFeeratePerkw: params.fundingFeeratePerkw,
 			commitmentFeeratePerkw: params.commitmentFeeratePerkw,

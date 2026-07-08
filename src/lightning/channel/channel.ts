@@ -6146,6 +6146,20 @@ export class Channel {
 		// localConfig for the opener — and record the channel type so
 		// anchor/taproot dispatch sees the negotiated value.
 		this._state.localConfig.feeratePerKw = params.commitmentFeeratePerkw;
+		// The wire message carries first_per_commitment_point as a real EC
+		// point; the basepoints struct often holds a zeroed placeholder (the
+		// legacy open derives the point at send time too). An all-zero "point"
+		// makes CLN reject the whole open_channel2 as unparsable.
+		params = {
+			...params,
+			localBasepoints: {
+				...params.localBasepoints,
+				firstPerCommitmentPoint: getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					0n
+				)
+			}
+		};
 		if (params.channelType) {
 			this._state.channelType = Buffer.from(params.channelType);
 		} else {
@@ -6203,6 +6217,20 @@ export class Channel {
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = msg.commitmentFeeratePerkw;
 		this._state.fundingLocktime = msg.locktime;
+
+		// accept_channel2 also carries a REAL first_per_commitment_point (see
+		// initiateOpenV2): derive it from our seed rather than trusting the
+		// basepoints struct's placeholder.
+		localParams = {
+			...localParams,
+			localBasepoints: {
+				...localParams.localBasepoints,
+				firstPerCommitmentPoint: getPerCommitmentPoint(
+					this._state.localPerCommitmentSeed,
+					0n
+				)
+			}
+		};
 
 		const session = new DualFundingSession(
 			false,

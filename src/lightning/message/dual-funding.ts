@@ -2,6 +2,7 @@
  * BOLT 2: `open_channel2` and `accept_channel2` message encoding/decoding.
  *
  * open_channel2 (type 64):
+ *   [32: chain_hash]
  *   [32: channel_id]
  *   [4: funding_feerate_perkw]
  *   [4: commitment_feerate_perkw]
@@ -41,6 +42,7 @@
  *   [accept_channel2_tlvs]
  */
 
+import { BITCOIN_CHAIN_HASH } from '../channel/types';
 import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
 import {
 	ILeaseRates,
@@ -105,6 +107,13 @@ function decodeWillFund(buf: Buffer): IWillFund {
 }
 
 export interface IOpenChannel2Message {
+	/**
+	 * Genesis hash of the chain the channel opens on (spec: the FIRST field of
+	 * open_channel2). Optional on encode for backward compatibility with
+	 * existing callers/tests (defaults to Bitcoin mainnet); always present
+	 * after decode.
+	 */
+	chainHash?: Buffer;
 	channelId: Buffer;
 	fundingFeeratePerkw: number;
 	commitmentFeeratePerkw: number;
@@ -151,7 +160,7 @@ export interface IAcceptChannel2Message {
 
 // open_channel2 fixed payload length:
 // 32 + 4 + 4 + 8 + 8 + 8 + 8 + 2 + 2 + 4 + 33*7 + 1 = 312
-const OPEN_CHANNEL2_FIXED_LENGTH = 312;
+const OPEN_CHANNEL2_FIXED_LENGTH = 344; // incl. the leading 32-byte chain_hash
 
 // accept_channel2 fixed payload length:
 // 32 + 8 + 8 + 8 + 8 + 4 + 2 + 2 + 33*7 = 303
@@ -168,6 +177,10 @@ export function encodeOpenChannel2Message(msg: IOpenChannel2Message): Buffer {
 	const buf = Buffer.alloc(OPEN_CHANNEL2_FIXED_LENGTH);
 	let offset = 0;
 
+	// chain_hash is the FIRST field per the merged BOLT 2 (CLN rejects the
+	// whole message as unparsable without it).
+	(msg.chainHash ?? BITCOIN_CHAIN_HASH).copy(buf, offset);
+	offset += 32;
 	msg.channelId.copy(buf, offset);
 	offset += 32;
 	buf.writeUInt32BE(msg.fundingFeeratePerkw, offset);
@@ -238,6 +251,8 @@ export function decodeOpenChannel2Message(
 
 	let offset = 0;
 
+	const chainHash = Buffer.from(payload.subarray(offset, offset + 32));
+	offset += 32;
 	const channelId = Buffer.from(payload.subarray(offset, offset + 32));
 	offset += 32;
 	const fundingFeeratePerkw = payload.readUInt32BE(offset);
@@ -284,6 +299,7 @@ export function decodeOpenChannel2Message(
 	offset += 1;
 
 	const result: IOpenChannel2Message = {
+		chainHash,
 		channelId,
 		fundingFeeratePerkw,
 		commitmentFeeratePerkw,
