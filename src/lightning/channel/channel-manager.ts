@@ -2946,8 +2946,9 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
 
-		// Reject opens for a chain we do not operate on (mirrors the legacy
-		// open_channel chain_hash validation).
+		// Reject opens for a chain we do not operate on. (The legacy v1 open
+		// path does not yet validate chain_hash; this guard is intentionally
+		// stricter for v2, where we always send and receive the field.)
 		if (
 			this.config.chainHash &&
 			msg.chainHash &&

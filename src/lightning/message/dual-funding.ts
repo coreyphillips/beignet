@@ -159,8 +159,9 @@ export interface IAcceptChannel2Message {
 }
 
 // open_channel2 fixed payload length:
-// 32 + 4 + 4 + 8 + 8 + 8 + 8 + 2 + 2 + 4 + 33*7 + 1 = 312
-const OPEN_CHANNEL2_FIXED_LENGTH = 344; // incl. the leading 32-byte chain_hash
+// 32 (chain_hash) + 32 (channel_id) + 4 + 4 + 8 + 8 + 8 + 8 + 2 + 2 + 4 +
+// 33*7 + 1 (channel_flags) = 344
+const OPEN_CHANNEL2_FIXED_LENGTH = 344;
 
 // accept_channel2 fixed payload length:
 // 32 + 8 + 8 + 8 + 8 + 4 + 2 + 2 + 33*7 = 303
