@@ -303,6 +303,14 @@ export class Channel {
 		size: number;
 		msgs: ICommitmentSignedMessage[];
 	} | null = null;
+	// Wire bytes of the last commitment batch WE sent during the pending-lock
+	// window, retained for verbatim retransmission on reestablish until the
+	// peer's revoke_and_ack acknowledges it. In-memory only: a batch not yet
+	// acked is re-sent from here on reconnect.
+	private _lastSentBatch: {
+		startBatch: Buffer;
+		commitments: Buffer[];
+	} | null = null;
 	// We dropped an unresumable splice on disconnect/restart, but the peer may
 	// still hold its in-flight copy (CLN never forgets one on its own — it blocks
 	// the channel waiting for the splice commitment_signed). Triggers a tx_abort
@@ -1264,10 +1272,7 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			!this.isSplicePendingLock()
-		) {
+		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1276,9 +1281,8 @@ export class Channel {
 			];
 		}
 
-		// Reject during quiescence (the session formally ends at completeSplice,
-		// but update traffic resumes once the splice is fully signed).
-		if (this._quiescence.isQuiescing() && !this.isSplicePendingLock()) {
+		// Reject during quiescence.
+		if (this._quiescence.isQuiescing()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1403,12 +1407,7 @@ export class Channel {
 	 * Handle update_add_htlc from remote (received HTLC).
 	 */
 	handleUpdateAddHtlc(msg: IUpdateAddHtlcMessage): ChannelAction[] {
-		// A fully-signed splice awaiting its lock resumes normal update traffic
-		// (commitments are then exchanged as start_batch batches).
-		if (
-			this._state.state !== ChannelState.NORMAL &&
-			!this.isSplicePendingLock()
-		) {
+		if (this._state.state !== ChannelState.NORMAL) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
 			];
@@ -1419,10 +1418,8 @@ export class Channel {
 			return [];
 		}
 
-		// Reject during quiescence. The quiescence session formally ends at
-		// completeSplice, but the splicing spec resumes update traffic as soon
-		// as tx_signatures are exchanged in both directions.
-		if (this._quiescence.isQuiescing() && !this.isSplicePendingLock()) {
+		// Reject during quiescence.
+		if (this._quiescence.isQuiescing()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1572,8 +1569,7 @@ export class Channel {
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.isSplicePendingLock()
+			this._state.state !== ChannelState.SHUTTING_DOWN
 		) {
 			return [
 				{
@@ -1629,8 +1625,7 @@ export class Channel {
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.isSplicePendingLock()
+			this._state.state !== ChannelState.SHUTTING_DOWN
 		) {
 			return [
 				{
@@ -1707,8 +1702,7 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.isSplicePendingLock()
+			this._state.state !== ChannelState.SHUTTING_DOWN
 		) {
 			return [
 				{
@@ -1766,8 +1760,7 @@ export class Channel {
 	handleUpdateFailHtlc(msg: IUpdateFailHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.isSplicePendingLock()
+			this._state.state !== ChannelState.SHUTTING_DOWN
 		) {
 			return [
 				{
@@ -1818,8 +1811,7 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN &&
-			!this.isSplicePendingLock()
+			this._state.state !== ChannelState.SHUTTING_DOWN
 		) {
 			return [
 				{
@@ -2030,16 +2022,22 @@ export class Channel {
 				htlcSignatures: spliceBatch.spliceHtlcSignatures,
 				fundingTxid: Buffer.from(this._state.spliceInFlight.spliceTxid)
 			};
+			const startBatchBytes = encodeStartBatchMessage(startBatch);
+			const currentBytes = encodeCommitmentSignedMessage(msg);
+			const spliceBytes = encodeCommitmentSignedMessage(spliceMsg);
+			// Cache the exact wire bytes so a disconnect straddling this batch can
+			// retransmit it verbatim on reestablish (the generic single-message
+			// retransmit path cannot: it holds neither the start_batch framing nor
+			// the splice-side commitment). Cleared when the peer's revoke_and_ack
+			// for this round arrives, or at completeSplice.
+			this._lastSentBatch = {
+				startBatch: startBatchBytes,
+				commitments: [currentBytes, spliceBytes]
+			};
 			return [
-				sendMsg(MessageType.START_BATCH, encodeStartBatchMessage(startBatch)),
-				sendMsg(
-					MessageType.COMMITMENT_SIGNED,
-					encodeCommitmentSignedMessage(msg)
-				),
-				sendMsg(
-					MessageType.COMMITMENT_SIGNED,
-					encodeCommitmentSignedMessage(spliceMsg)
-				)
+				sendMsg(MessageType.START_BATCH, startBatchBytes),
+				sendMsg(MessageType.COMMITMENT_SIGNED, currentBytes),
+				sendMsg(MessageType.COMMITMENT_SIGNED, spliceBytes)
 			];
 		}
 
@@ -2075,10 +2073,19 @@ export class Channel {
 		}
 
 		if (this._state.state === ChannelState.SPLICING && this._spliceSession) {
-			// Fully signed and awaiting the lock: the channel has resumed normal
-			// operation, so a lone commitment_signed is a batch of one.
+			// Fully signed and awaiting the lock: the channel resumed normal
+			// operation, but with TWO active fundings every commitment update
+			// MUST arrive as a start_batch of one commitment_signed per funding.
+			// A lone commitment_signed here (no preceding start_batch) is invalid
+			// and would revoke on only one funding.
 			if (this.isSplicePendingLock()) {
-				return this._handleCommitmentSignedBatch([msg]);
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'commitment_signed during a pending splice must be a start_batch'
+					}
+				];
 			}
 			// Mid-splice: the peer sends commitment_signed for the new commitment
 			// (spending the spliced funding output) after the interactive tx
@@ -2288,6 +2295,10 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: 'Unexpected revoke_and_ack' }
 			];
 		}
+
+		// The peer acknowledged our latest commitment (batch included): it no
+		// longer needs retransmission.
+		this._lastSentBatch = null;
 
 		// Bind the revealed secret to the committed per-commitment point BEFORE
 		// trusting the revocation. shaChainStore.addSecret only checks
@@ -4195,8 +4206,12 @@ export class Channel {
 		// An in-flight splice means commitment retransmission must follow the
 		// SPLICE rules (the mid-splice commitment_signed reuses the same commitment
 		// number) — the generic path below would replay a stale pre-splice
-		// commitment_signed and desync the channel.
+		// commitment_signed and desync the channel. EXCEPTION: once the splice is
+		// fully signed and awaiting its lock (isSplicePendingLock), normal update
+		// traffic has resumed and commitments flow as start_batch batches, which
+		// DO need the generic un-acked-update replay + a batch-aware retransmit.
 		const spliceActive = !!(this._spliceSession || this._state.spliceInFlight);
+		const pendingLock = this.isSplicePendingLock();
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
 		// Every queued update the peer has not acknowledged with a
@@ -4207,9 +4222,27 @@ export class Channel {
 		// covers. Peers that did keep them treat the replays idempotently
 		// (duplicate add ids ignored; fulfill/fail of an already
 		// fulfilled/failed HTLC is a no-op).
-		if (!spliceActive) {
+		if (!spliceActive || pendingLock) {
 			for (const update of this._state.pendingLocalUpdates) {
 				actions.push(sendMsg(update.type as MessageType, update.payload));
+			}
+		}
+
+		// ── Retransmit our pending-lock commitment BATCH if the peer missed it ──
+		// The generic single-message path below can't: it holds neither the
+		// start_batch framing nor the splice-side commitment. Replay the cached
+		// wire bytes verbatim (idempotent — same signatures, no nonce reuse).
+		if (
+			pendingLock &&
+			this._lastSentBatch &&
+			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
+			this._state.remoteCommitmentNumber > 0n
+		) {
+			actions.push(
+				sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+			);
+			for (const c of this._lastSentBatch.commitments) {
+				actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
 			}
 		}
 
@@ -5378,6 +5411,8 @@ export class Channel {
 		this._spliceSentCommitment = false;
 		this._spliceReceivedCommitment = false;
 		this._spliceRemoteCommitmentSig = null;
+		this._lastSentBatch = null;
+		this._pendingBatch = null;
 		this._spliceOutDestination = null;
 		this._spliceInInputs = null;
 		this._spliceTx = null;
@@ -5607,12 +5642,15 @@ export class Channel {
 				}
 			];
 		}
-		// One current funding + exactly one pending splice (no splice RBF yet).
-		if (msg.batchSize < 1 || msg.batchSize > 2) {
+		// Exactly one current funding + one pending splice (no splice RBF yet):
+		// the batch MUST carry one commitment_signed per active funding. A
+		// smaller batch would revoke on only one funding (see the fund-safety
+		// note in _handleCommitmentSignedBatch).
+		if (msg.batchSize !== 2) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: `Unsupported start_batch size ${msg.batchSize}`
+					message: `Unsupported start_batch size ${msg.batchSize} (expected 2)`
 				}
 			];
 		}
@@ -5647,12 +5685,28 @@ export class Channel {
 		let spliceMsg: ICommitmentSignedMessage | null = null;
 		for (const m of msgs) {
 			if (m.fundingTxid && m.fundingTxid.equals(inflight.spliceTxid)) {
+				if (spliceMsg) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Commitment batch has two splice-funding commitments'
+						}
+					];
+				}
 				spliceMsg = m;
 			} else if (
 				!m.fundingTxid ||
 				(this._state.fundingTxid &&
 					m.fundingTxid.equals(this._state.fundingTxid))
 			) {
+				if (currentMsg) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Commitment batch has two current-funding commitments'
+						}
+					];
+				}
 				currentMsg = m;
 			} else {
 				const peerTxid = Buffer.from(m.fundingTxid).reverse().toString('hex');
@@ -5664,6 +5718,13 @@ export class Channel {
 				];
 			}
 		}
+		// Fund-safety (both required): the revoke_and_ack the standard path emits
+		// reveals a per-commitment secret that revokes commitment N on BOTH active
+		// fundings (they share the commitment-number sequence). We must therefore
+		// hold a valid, verified peer signature for the NEXT commitment on EACH
+		// funding before revoking; a batch missing either commitment would revoke
+		// the splice-funding commitment while leaving us with only a stale
+		// signature for it, and hence no unilateral exit on the spliced channel.
 		if (!currentMsg) {
 			return [
 				{
@@ -5672,60 +5733,76 @@ export class Channel {
 				}
 			];
 		}
+		if (!spliceMsg) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Commitment batch missing the splice-funding commitment'
+				}
+			];
+		}
 
 		// Verify the SPLICE-funding commitment first, at the post-round height
 		// (the round advances the local commitment number by one) against the
 		// spliced view of the state — a clone re-anchored on the new funding
 		// output that inherits any staged feerate, so pending update_fee is
-		// applied identically to both commitments.
-		if (spliceMsg && this._signer && this._state.remoteBasepoints) {
-			const spliced = this._splicedState();
-			if (!spliced) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Commitment batch: cannot rebuild spliced state'
-					}
-				];
-			}
-			const nextNum = this._state.localCommitmentNumber + 1n;
-			const ourPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				nextNum
-			);
-			if (
-				!verifyRemoteCommitmentSig(
-					spliced,
-					this._signer,
-					ourPoint,
-					spliceMsg.signature,
-					nextNum
-				)
-			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid batched splice commitment signature'
-					}
-				];
-			}
-			if (
-				spliceMsg.htlcSignatures.length > 0 &&
-				!verifyRemoteHtlcSignatures(
-					spliced,
-					this._signer,
-					ourPoint,
-					spliceMsg.htlcSignatures
-				)
-			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid batched splice HTLC signatures'
-					}
-				];
-			}
+		// applied identically to both commitments. Both the commitment sig and
+		// the second-level HTLC sigs are verified BEFORE the standard path
+		// reveals any revocation secret.
+		if (!this._signer || !this._state.remoteBasepoints) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Commitment batch: no signer or remote basepoints'
+				}
+			];
 		}
+		const spliced = this._splicedState();
+		if (!spliced) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Commitment batch: cannot rebuild spliced state'
+				}
+			];
+		}
+		const nextNum = this._state.localCommitmentNumber + 1n;
+		const ourPoint = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			nextNum
+		);
+		if (
+			!verifyRemoteCommitmentSig(
+				spliced,
+				this._signer,
+				ourPoint,
+				spliceMsg.signature,
+				nextNum
+			)
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Invalid batched splice commitment signature'
+				}
+			];
+		}
+		// HTLC traffic is rejected during the pending-lock window (splices begin
+		// quiescent, i.e. with no HTLCs, and new adds are refused until the
+		// splice locks), so both commitments are HTLC-free here. Reject a peer
+		// that nonetheless attaches HTLC sigs to a splice commitment.
+		if (spliceMsg.htlcSignatures.length > 0) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected HTLC signatures in a pending-lock batch'
+				}
+			];
+		}
+		// The rate the spliced commitment was verified at (before the standard
+		// path commits any staged update_fee) — force-close must rebuild at this
+		// exact rate to match the adopted signature.
+		const spliceSigFeeratePerKw = getCommitmentFeeRate(spliced);
 
 		// Now run the current-funding commitment through the standard path (it
 		// verifies at the same post-round height, adopts any staged feerate,
@@ -5741,12 +5818,14 @@ export class Channel {
 		}
 
 		const failed = actions.some((a) => a.type === ChannelActionType.ERROR);
-		if (!failed && spliceMsg) {
-			// Adopt the peer's newest splice-side commitment signature so a
-			// force-close after the splice confirms uses the latest state.
+		if (!failed) {
+			// Adopt the peer's newest splice-side commitment signature (and the
+			// feerate it was made at) so a force-close after the splice confirms
+			// uses the latest state at the matching rate.
 			this._spliceRemoteCommitmentSig = Buffer.from(spliceMsg.signature);
 			this._syncSpliceInFlight({
-				remoteCommitmentSig: this._spliceRemoteCommitmentSig
+				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
+				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw
 			});
 		}
 		return actions;
@@ -5946,10 +6025,15 @@ export class Channel {
 		// exchanged, fall back to driving a post-splice commitment round.
 		if (this._spliceRemoteCommitmentSig) {
 			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
+			// The splice window is HTLC-free (splices start quiescent and new
+			// HTLCs are refused until the lock), so the post-splice commitment
+			// carries no HTLC outputs.
 			this._state.remoteHtlcSignatures = [];
-			this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
-				this._state
-			);
+			// Rebuild at the rate the adopted signature was actually made at, not
+			// a feerate that may have been staged (update_fee) but not yet signed.
+			this._state.lastSignedCommitFeeratePerKw =
+				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
+				getCommitmentFeeRate(this._state);
 		} else {
 			this._state.needsCommitment = true;
 		}

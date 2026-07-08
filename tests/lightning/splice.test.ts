@@ -4037,55 +4037,31 @@ describe('Splice', function () {
 			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
-		it('routes an HTLC round as batches during the pending window', function () {
-			const pair = pendingLockPair();
-			const {
-				openerManager,
-				acceptorManager,
-				channelId,
-				openerChannel,
-				acceptorChannel
-			} = pair;
-
-			let fulfilled = false;
-			openerManager.on('htlc:fulfilled', () => {
-				fulfilled = true;
-			});
-
-			const preimage = crypto.randomBytes(32);
-			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
-			const balBefore = openerChannel.getFullState().localBalanceMsat;
-
+		it('rejects new HTLC traffic during the pending-lock window', function () {
+			// The pending-lock window supports only update_fee + commitment
+			// batches (what CLN sends); adding an HTLC there is refused so no
+			// HTLC can be committed on the spliced commitment before it locks.
+			const { openerManager, channelId, openerChannel } = pendingLockPair();
+			const paymentHash = crypto.createHash('sha256').update('x').digest();
+			// Drive the channel state machine directly (the manager wrapper always
+			// reports ok:true and surfaces the refusal as an ERROR action).
+			const actions = openerChannel.addHtlc(
+				15_000_000n,
+				paymentHash,
+				500000,
+				crypto.randomBytes(1366)
+			);
 			expect(
-				openerManager.addHtlc(
-					channelId,
-					15_000_000n,
-					paymentHash,
-					500000,
-					crypto.randomBytes(1366)
-				).ok
+				actions.some((a) => a.type === ChannelActionType.ERROR),
+				'HTLC add refused during pending-lock'
 			).to.equal(true);
-			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
-
-			expect(fulfilled, 'HTLC fulfilled during the pending window').to.equal(
-				true
-			);
-			expect(openerChannel.getFullState().localBalanceMsat).to.equal(
-				balBefore - 15_000_000n
-			);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
 			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
-
-			// Lock the splice: the channel lands on the new outpoint with the
-			// payment reflected in both balances.
+			// The splice still locks cleanly with no in-flight HTLCs.
 			openerManager.sendSpliceLocked(channelId);
-			acceptorManager.sendSpliceLocked(channelId);
-			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
-			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
-			expect(
-				openerChannel
-					.getFullState()
-					.fundingTxid!.equals(acceptorChannel.getFullState().fundingTxid!)
-			).to.equal(true);
+			expect(openerChannel.getFullState().remoteHtlcSignatures).to.deep.equal(
+				[]
+			);
 		});
 
 		it('rejects a batch whose splice-side signature is invalid WITHOUT revoking', function () {
@@ -4159,6 +4135,118 @@ describe('Splice', function () {
 			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
 				true
 			);
+		});
+
+		it('rejects an incomplete batch (size 1) without revoking (fund-safety)', function () {
+			const { acceptorChannel, channelId } = pendingLockPair();
+			const before = acceptorChannel.getFullState().localCommitmentNumber;
+			// A start_batch of 1 would revoke on only ONE of the two active
+			// fundings; it must be refused before the standard path runs.
+			const actions = acceptorChannel.handleStartBatch({
+				channelId,
+				batchSize: 1,
+				messageType: 132
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
+			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				before
+			);
+		});
+
+		it('rejects a lone commitment_signed during pending-lock (no start_batch)', function () {
+			const { acceptorChannel, channelId } = pendingLockPair();
+			const before = acceptorChannel.getFullState().localCommitmentNumber;
+			const actions = acceptorChannel.handleCommitmentSigned({
+				channelId,
+				signature: crypto.randomBytes(64),
+				htlcSignatures: []
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
+			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				before
+			);
+		});
+
+		it('rejects a size-2 batch missing the splice-funding commitment without revoking', function () {
+			const { acceptorChannel, channelId } = pendingLockPair();
+			const before = acceptorChannel.getFullState().localCommitmentNumber;
+			const fundingTxid = acceptorChannel.getFullState().fundingTxid!;
+			acceptorChannel.handleStartBatch({
+				channelId,
+				batchSize: 2,
+				messageType: 132
+			});
+			// Both messages target the CURRENT funding: the splice-side commitment
+			// is absent, so revoking would strand the splice with a stale sig.
+			acceptorChannel.handleCommitmentSigned({
+				channelId,
+				signature: crypto.randomBytes(64),
+				htlcSignatures: [],
+				fundingTxid
+			});
+			const actions = acceptorChannel.handleCommitmentSigned({
+				channelId,
+				signature: crypto.randomBytes(64),
+				htlcSignatures: [],
+				fundingTxid
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
+			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				before
+			);
+		});
+
+		it('retransmits an un-acked pending-lock batch on reestablish', function () {
+			const pair = pendingLockPair();
+			const { openerManager, acceptorManager, channelId, openerPubkey } = pair;
+
+			// Capture the opener's outbound batch, but drop it before delivery so
+			// the acceptor never acks: mirrors a disconnect straddling the batch.
+			const outbound: number[] = [];
+			openerManager.removeAllListeners('message:outbound');
+			openerManager.on('message:outbound', (_pk, type) => {
+				outbound.push(type);
+			});
+			expect(openerManager.updateChannelFee(channelId, 1000).ok).to.equal(true);
+			expect(
+				outbound.filter((t) => t === MessageType.START_BATCH).length
+			).to.be.gte(1);
+
+			// Reconnect: the acceptor's channel_reestablish shows it never received
+			// the batch (its nextCommitmentNumber is behind), so the opener must
+			// retransmit the whole batch.
+			const resent: number[] = [];
+			openerManager.removeAllListeners('message:outbound');
+			openerManager.on('message:outbound', (_pk, type) => resent.push(type));
+			const acceptorReest = acceptorManager
+				.getChannel(channelId)!
+				.createReestablish();
+			for (const a of acceptorReest) {
+				if (
+					'payload' in a &&
+					a.messageType === MessageType.CHANNEL_REESTABLISH
+				) {
+					openerManager.handleMessage(
+						pair.acceptorPubkey,
+						MessageType.CHANNEL_REESTABLISH,
+						(a as { payload: Buffer }).payload
+					);
+				}
+			}
+			void openerPubkey;
+			expect(
+				resent.filter((t) => t === MessageType.START_BATCH).length,
+				'batch retransmitted'
+			).to.be.gte(1);
+			expect(
+				resent.filter((t) => t === MessageType.COMMITMENT_SIGNED).length
+			).to.be.gte(2);
 		});
 	});
 
