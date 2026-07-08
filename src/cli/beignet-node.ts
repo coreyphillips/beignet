@@ -19,7 +19,11 @@ import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
 import { generateMnemonic } from '../utils/helpers';
-import { EAvailableNetworks } from '../types/wallet';
+import {
+	EAvailableNetworks,
+	EPaymentType,
+	IOnchainFees
+} from '../types/wallet';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { IPaymentInfo } from '../lightning/node/types';
@@ -55,6 +59,8 @@ import {
 	InvoiceInfo,
 	DecodedInvoice,
 	TxInfo,
+	OnchainTxInfo,
+	UtxoInfo,
 	BalanceInfo,
 	OfferInfo,
 	TrustedPeerInfo,
@@ -977,6 +983,61 @@ export class BeignetNode extends EventEmitter {
 		if (result.isErr()) {
 			throw new BeignetError('REFRESH_FAILED', result.error.message);
 		}
+	}
+
+	listOnchainTransactions(): OnchainTxInfo[] {
+		// wallet.transactions already includes unconfirmed txs;
+		// unconfirmedTransactions is a subset copy, so no merge here.
+		return Object.values(this.wallet.transactions)
+			.map((tx) => ({
+				txid: tx.txid,
+				type:
+					tx.type === EPaymentType.sent
+						? ('sent' as const)
+						: ('received' as const),
+				valueSats: tx.value,
+				feeSats: tx.fee,
+				satsPerVbyte: tx.satsPerByte,
+				address: tx.address,
+				...(tx.height ? { height: tx.height } : {}),
+				confirmed: Boolean(tx.height),
+				timestamp: tx.timestamp,
+				...(tx.confirmTimestamp !== undefined
+					? { confirmTimestamp: tx.confirmTimestamp }
+					: {})
+			}))
+			.sort((a, b) => b.timestamp - a.timestamp);
+	}
+
+	listUtxos(): UtxoInfo[] {
+		// Trimmed shape: drops keyPair/publicKey so key material never
+		// lands in REPL output or logs.
+		return this.wallet.listUtxos().map((utxo) => ({
+			txid: utxo.tx_hash,
+			vout: utxo.tx_pos,
+			address: utxo.address,
+			valueSats: utxo.value,
+			height: utxo.height
+		}));
+	}
+
+	async getFeeEstimates(): Promise<IOnchainFees> {
+		try {
+			return await this.wallet.getFeeEstimates();
+		} catch (e) {
+			throw new BeignetError(
+				'FEE_ESTIMATE_FAILED',
+				e instanceof Error ? e.message : String(e)
+			);
+		}
+	}
+
+	validateAddress(address: string): boolean {
+		return this.wallet.validateAddress(address);
+	}
+
+	getWallet(): Wallet {
+		return this.wallet;
 	}
 
 	// ─────────────── Peers ───────────────

@@ -26,6 +26,8 @@ import type {
 	DecodedInvoice,
 	PeerInfo,
 	TxInfo,
+	OnchainTxInfo,
+	UtxoInfo,
 	BalanceInfo,
 	BeignetConfig,
 	OfferInfo,
@@ -495,6 +497,57 @@ describe('New CLI types', () => {
 		expect(typeof json.port).to.equal('number');
 	});
 
+	it('OnchainTxInfo shape', () => {
+		const tx: OnchainTxInfo = {
+			txid: 'aabbccdd',
+			type: 'received',
+			valueSats: 25000,
+			feeSats: 300,
+			satsPerVbyte: 2,
+			address: 'bc1qexample',
+			height: 800000,
+			confirmed: true,
+			timestamp: 1700000000,
+			confirmTimestamp: 1700000600
+		};
+		const json = JSON.parse(JSON.stringify(tx));
+		expect(json.txid).to.equal('aabbccdd');
+		expect(json.type).to.equal('received');
+		expect(json.valueSats).to.equal(25000);
+		expect(json.confirmed).to.be.true;
+	});
+
+	it('OnchainTxInfo unconfirmed shape', () => {
+		const tx: OnchainTxInfo = {
+			txid: 'eeff0011',
+			type: 'sent',
+			valueSats: -5000,
+			feeSats: 200,
+			satsPerVbyte: 1,
+			address: 'bc1qexample',
+			confirmed: false,
+			timestamp: 1700000000
+		};
+		const json = JSON.parse(JSON.stringify(tx));
+		expect(json.height).to.be.undefined;
+		expect(json.confirmed).to.be.false;
+		expect(json.confirmTimestamp).to.be.undefined;
+	});
+
+	it('UtxoInfo shape', () => {
+		const utxo: UtxoInfo = {
+			txid: 'aabbccdd',
+			vout: 1,
+			address: 'bc1qexample',
+			valueSats: 10000,
+			height: 800000
+		};
+		const json = JSON.parse(JSON.stringify(utxo));
+		expect(json.txid).to.equal('aabbccdd');
+		expect(json.vout).to.equal(1);
+		expect(json.valueSats).to.equal(10000);
+	});
+
 	it('Bolt12InvoiceInfo shape', () => {
 		const inv: Bolt12InvoiceInfo = {
 			paymentHash: 'aabb',
@@ -562,6 +615,28 @@ describe('BeignetNode new methods', () => {
 
 	it('should have payOffer method', () => {
 		expect(typeof BeignetNode.prototype.payOffer).to.equal('function');
+	});
+
+	it('should have listOnchainTransactions method', () => {
+		expect(typeof BeignetNode.prototype.listOnchainTransactions).to.equal(
+			'function'
+		);
+	});
+
+	it('should have listUtxos method', () => {
+		expect(typeof BeignetNode.prototype.listUtxos).to.equal('function');
+	});
+
+	it('should have getFeeEstimates method', () => {
+		expect(typeof BeignetNode.prototype.getFeeEstimates).to.equal('function');
+	});
+
+	it('should have validateAddress method', () => {
+		expect(typeof BeignetNode.prototype.validateAddress).to.equal('function');
+	});
+
+	it('should have getWallet method', () => {
+		expect(typeof BeignetNode.prototype.getWallet).to.equal('function');
 	});
 });
 

@@ -45,44 +45,53 @@ const runExample = async (mnemonic = generateMnemonic()): Promise<void> => {
 	const address = await wallet.getAddress();
 	console.log('\nAddress:', address);
 
-	// Get fee information to perform a transaction.
-	// const feeInfo = wallet.getFeeInfo({ satsPerByte: 5 });
-	// if (feeInfo.isErr()) return;
-	// console.log('\nFee Info:', feeInfo.value);
-
-	// Get fee estimate in sats for a given satsPerByte to perform a transaction.
-	// This is useful for quickly calculating how many sats are needed to perform a transaction when using a slider.
-	// const txFeeInSats = getTxFee({
-	// 	satsPerByte: 5,
-	// 	transactionByteCount: feeInfo.value.transactionByteCount
-	// });
-	// console.log('\nFee In Sats:', txFeeInSats);
-
-	// Create a transaction.
-	// const sendRes = await wallet.send({
-	// 	address,
-	// 	amount: 5000,
-	// 	satsPerByte: 5,
-	// 	broadcast: false // Mostly set to false for testing, but can also be used to return the raw transaction hex.
-	// });
-	// if (sendRes.isErr()) return;
-	// console.log('\nSend Res:', sendRes.value);
-
-	// Decode the transaction to verify prior to broadcasting.
-	// const decodeRes = decodeRawTransaction(sendRes.value, network);
-	// if (decodeRes.isErr()) return;
-	// console.log('\nDecode Transaction:');
-	// console.dir(decodeRes.value, { depth: null });
-
-	// Broadcast the transaction.
-	// const broadcastRes = await wallet.electrum.broadcastTransaction({
-	// 	rawTx: createRes.value.hex
-	// });
-	// console.log('\nBroadcast Response:', broadcastRes);
-	// if (broadcastRes.isErr()) return;
+	// REPL
+	console.log('\n--- REPL ---');
+	console.log('Type help() for available commands.\n');
 
 	const r = repl.start('> ');
 	r.context.wallet = wallet;
+	r.context.help = (): void => {
+		console.log(`
+  Wallet
+    wallet.getBalance()                         Confirmed + unconfirmed balance (sats)
+    wallet.getAddress()                         Receiving address (async)
+    wallet.getNextAvailableAddress()            Next unused address data (async)
+    wallet.refreshWallet()                      Resync wallet (async)
+    wallet.validateAddress(addr)                Validate a bitcoin address
+
+  Transactions & UTXOs
+    wallet.transactions                         On-chain tx history (keyed by txid)
+    wallet.unconfirmedTransactions              Txs with <6 confirmations
+    wallet.listUtxos()                          Spendable UTXOs
+    wallet.getTransactionDetails(txid)          Full tx details (async)
+
+  Fees
+    wallet.getFeeEstimates()                    Fee estimates in sats/vB (async)
+    wallet.getFeeInfo({ satsPerByte })          Fee info for a transaction
+
+  Sending
+    wallet.send({ address, amount, satsPerByte, broadcast })
+                                                Send sats (async). broadcast: false
+                                                returns raw tx hex without sending.
+    wallet.sendMax({ address, satsPerByte })    Send entire balance (async)
+    wallet.electrum.broadcastTransaction({ rawTx })
+                                                Broadcast a raw tx (async)
+
+  Boosting (RBF)
+    wallet.getBoostableTransactions()           Txs eligible for fee boosting
+    wallet.canBoost(txid)                       Check if a tx can be boosted
+
+  Lifecycle
+    .exit                                       Exit REPL
+`);
+	};
+
+	r.on('exit', async () => {
+		console.log('\nShutting down...');
+		await wallet.stop();
+		process.exit(0);
+	});
 };
 
 const mnemonic = process.argv[2];

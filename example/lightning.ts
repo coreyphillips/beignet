@@ -449,6 +449,10 @@ const runBeignetExample = async (
   On-chain Wallet
     node.getNewAddress()                        New deposit address (async)
     node.sendOnchain(addr, sats, satsPerVbyte?) Send on-chain (async)
+    node.listOnchainTransactions()              On-chain tx history (newest first)
+    node.listUtxos()                            Spendable on-chain UTXOs
+    node.getFeeEstimates()                      Fee estimates in sats/vB (async)
+    node.validateAddress(addr)                  Validate a bitcoin address
     node.refreshWallet()                        Resync wallet (async)
 
   Peers
@@ -534,6 +538,7 @@ const runBeignetExample = async (
     node.backup(destPath)                       Backup DB to path (async)
     node.triggerBackup()                        Trigger configured backup
     node.getNode()                              Underlying LightningNode (low-level)
+    node.getWallet()                            Underlying on-chain Wallet (low-level)
     node.getStorage()                           Underlying SqliteStorage
 
   Lifecycle
@@ -546,6 +551,7 @@ const runBeignetExample = async (
 	r.on('exit', async () => {
 		console.log('\nShutting down...');
 		await node.destroy();
+		process.exit(0);
 	});
 };
 
