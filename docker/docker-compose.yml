@@ -112,8 +112,9 @@ services:
       - '--large-channels'
       - '--log-level=info'
       # v26: offers are always on (--experimental-offers was removed);
-      # splicing still uses the experimental flag.
+      # splicing and dual funding still use experimental flags.
       - '--experimental-splicing'
+      - '--experimental-dual-fund'
 
   eclair:
     container_name: eclair
