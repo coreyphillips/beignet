@@ -145,6 +145,27 @@ export interface TxInfo {
 	hex: string;
 }
 
+export interface OnchainTxInfo {
+	txid: string;
+	type: 'sent' | 'received';
+	valueSats: number;
+	feeSats: number;
+	satsPerVbyte: number;
+	address: string;
+	height?: number;
+	confirmed: boolean;
+	timestamp: number;
+	confirmTimestamp?: number;
+}
+
+export interface UtxoInfo {
+	txid: string;
+	vout: number;
+	address: string;
+	valueSats: number;
+	height: number;
+}
+
 export interface BalanceInfo {
 	onchain: number;
 	lightning: number;
