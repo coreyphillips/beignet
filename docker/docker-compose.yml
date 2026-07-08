@@ -87,7 +87,10 @@ services:
 
   cln:
     container_name: cln
-    image: elementsproject/lightningd:v24.11.1
+    # v26.06.1 matches the live CLN that beignet splicing was validated
+    # against on mainnet; v24.11.1's channeld crashed right after sending
+    # splice_ack (CLN-side bug), blocking all splice interop tests.
+    image: elementsproject/lightningd:v26.06.1
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -108,8 +111,15 @@ services:
       - '--clnrest-host=0.0.0.0'
       - '--large-channels'
       - '--log-level=info'
-      - '--experimental-offers'
+      # v26: offers are always on (--experimental-offers was removed);
+      # splicing and dual funding still use experimental flags.
+      # --experimental-dual-fund only changes CLN behavior for peers that also
+      # advertise option_dual_fund; the shared interop node (cln-helpers /
+      # createInteropNode) deliberately does NOT, so CLN's fundchannel stays v1
+      # for every tier except the dedicated v2 test. Do not add
+      # Feature.DUAL_FUND to createInteropNode without revisiting this.
       - '--experimental-splicing'
+      - '--experimental-dual-fund'
 
   eclair:
     container_name: eclair

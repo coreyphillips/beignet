@@ -115,12 +115,20 @@ describe('Interop: Beignet ↔ CLN splice handshake (regtest)', function () {
 		//   splice_init sent -> AWAITING_ACK
 		//   splice_ack from CLN -> TX_NEGOTIATION
 		//   our tx_add_input/output + both tx_complete -> AWAITING_TX_SIGNATURES
+		// The session is created only once quiescence completes over the real
+		// wire (spliceOut is fire-and-forget), and against a fast CLN the
+		// intermediate states can flash by between polls — so poll tightly,
+		// tolerate a missing session while quiescence is in flight, and treat
+		// any at-or-past-signatures state as proof the ack + negotiation
+		// happened.
 		let sawTxNegotiation = false;
 		let reachedTxSigs = false;
+		let sawSession = false;
 		const deadline = Date.now() + 90_000;
 		while (Date.now() < deadline) {
 			const session = cm.getChannel(channelId)?.getSpliceSession();
 			const state = session?.getState();
+			if (state !== undefined) sawSession = true;
 			if (state === SpliceState.TX_NEGOTIATION) sawTxNegotiation = true;
 			if (
 				state === SpliceState.AWAITING_TX_SIGNATURES ||
@@ -130,19 +138,21 @@ describe('Interop: Beignet ↔ CLN splice handshake (regtest)', function () {
 				reachedTxSigs = true;
 				break;
 			}
-			if (state === SpliceState.ABORTED || state === undefined) {
+			if (
+				state === SpliceState.ABORTED ||
+				(sawSession && state === undefined)
+			) {
 				break;
 			}
-			await sleep(1000);
+			await sleep(200);
 		}
 
-		// Always at least exchange splice_init/splice_ack.
-		expect(
-			sawTxNegotiation,
-			'splice reached TX_NEGOTIATION (splice_ack from CLN)'
-		).to.equal(true);
 		// The interactive-tx negotiation (shared input + outputs + tx_complete)
-		// completed with CLN.
+		// completed with CLN — which implies splice_init/splice_ack succeeded
+		// even when the transient TX_NEGOTIATION state fell between polls (so
+		// we no longer assert sawTxNegotiation directly; reaching tx_signatures
+		// is strictly stronger).
+		void sawTxNegotiation;
 		expect(
 			reachedTxSigs,
 			'interactive-tx negotiation completed with CLN (AWAITING_TX_SIGNATURES)'
