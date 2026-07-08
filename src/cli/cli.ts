@@ -120,6 +120,19 @@ async function main(): Promise<void> {
 			return outputResult(await httpRequest('GET', '/info'));
 		case 'balance':
 			return outputResult(await httpRequest('GET', '/balance'));
+		case 'transactions':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					filteredArgs[1]
+						? `/transactions?limit=${encodeURIComponent(filteredArgs[1])}`
+						: '/transactions'
+				)
+			);
+		case 'utxos':
+			return outputResult(await httpRequest('GET', '/utxos'));
+		case 'fee-estimates':
+			return outputResult(await httpRequest('GET', '/fees/estimates'));
 		case 'address':
 			return outputResult(await httpRequest('POST', '/address/new'));
 		case 'mnemonic':
@@ -659,6 +672,9 @@ Info:
 
 On-chain:
   send <address> <sats>                  Send on-chain
+  transactions [limit]                   List on-chain transactions (newest first)
+  utxos                                  List wallet UTXOs
+  fee-estimates                          Current fee estimates (sats/vbyte)
   backup <destPath>                      Create database backup
 
 Peers:
