@@ -627,6 +627,48 @@ describe('BeignetNode new methods', () => {
 		expect(typeof BeignetNode.prototype.listUtxos).to.equal('function');
 	});
 
+	it('listOnchainTransactions converts BTC value/fee to sats', () => {
+		// IFormattedTransaction stores value/fee in BTC; the DTO fields are
+		// named *Sats so the mapping must convert (regression for 1e8 bug).
+		const fakeWallet = {
+			transactions: {
+				aa: {
+					txid: 'aa',
+					type: 'received',
+					value: 0.5,
+					fee: 0.00000141,
+					satsPerByte: 1,
+					address: 'bcrt1qexample',
+					height: 0,
+					timestamp: 2000
+				},
+				bb: {
+					txid: 'bb',
+					type: 'sent',
+					value: -0.001,
+					fee: 0.00000282,
+					satsPerByte: 2,
+					address: 'bcrt1qexample',
+					height: 100,
+					timestamp: 1000
+				}
+			}
+		};
+		const txs = BeignetNode.prototype.listOnchainTransactions.call({
+			wallet: fakeWallet
+		} as unknown as BeignetNode);
+		expect(txs).to.have.lengthOf(2);
+		// Sorted newest first
+		expect(txs[0].txid).to.equal('aa');
+		expect(txs[0].valueSats).to.equal(50000000);
+		expect(txs[0].feeSats).to.equal(141);
+		expect(txs[0].confirmed).to.be.false;
+		expect(txs[1].txid).to.equal('bb');
+		expect(txs[1].valueSats).to.equal(-100000);
+		expect(txs[1].feeSats).to.equal(282);
+		expect(txs[1].confirmed).to.be.true;
+	});
+
 	it('should have getFeeEstimates method', () => {
 		expect(typeof BeignetNode.prototype.getFeeEstimates).to.equal('function');
 	});
