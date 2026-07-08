@@ -669,6 +669,69 @@ describe('BeignetNode new methods', () => {
 		expect(txs[1].confirmed).to.be.true;
 	});
 
+	describe('sendOnchain broadcast handling', () => {
+		// Raw regtest tx captured from a live send; txid is its double-SHA id.
+		const rawTxHex =
+			'020000000001015fe96b90765817d417fabf240b85139021c7b9de8583660330364aacc471596e0000000000ffffffff02689ee80200000000160014b3910b705bdb9cc0765320fc4096e865e84ad2c8400d0300000000001600146b49ad185987df3a44bb9fd57004d66eebaa448c0247304402200ad82fcfe687ba8be82cf390ea5dad8d63fbe6e0eb325687d2b82207031129f9022015857e99b3fbfdca2c41187f14b7c018eb3c7ce600f40915c670add976af13480121035d49eccd54d0099e43676277c7a6d4625d611da88a5df49bf9517a7791a777a500000000';
+		const rawTxId =
+			'c5e16610ec61535498f672f71653242a05f80b7e7e080b8b86badb49737f0efa';
+
+		it('builds without broadcast, then broadcasts the hex', async () => {
+			const { ok } = require('../../src/utils/result');
+			const calls: Record<string, unknown>[] = [];
+			const fakeWallet = {
+				send: async (opts: Record<string, unknown>): Promise<unknown> => {
+					calls.push({ method: 'send', ...opts });
+					return ok(rawTxHex);
+				},
+				electrum: {
+					broadcastTransaction: async (opts: {
+						rawTx: string;
+					}): Promise<unknown> => {
+						calls.push({ method: 'broadcast', rawTx: opts.rawTx });
+						return ok(rawTxId);
+					}
+				}
+			};
+			const result = await BeignetNode.prototype.sendOnchain.call(
+				{ wallet: fakeWallet } as unknown as BeignetNode,
+				'bcrt1qexample',
+				200000,
+				2
+			);
+			expect(result.txid).to.equal(rawTxId);
+			expect(result.hex).to.equal(rawTxHex);
+			expect(calls[0].method).to.equal('send');
+			// wallet.send with broadcast:true resolves to a txid, which is not
+			// parseable as hex, so sendOnchain must build unbroadcast.
+			expect(calls[0].broadcast).to.be.false;
+			expect(calls[1].method).to.equal('broadcast');
+			expect(calls[1].rawTx).to.equal(rawTxHex);
+		});
+
+		it('throws SEND_FAILED when broadcast fails', async () => {
+			const { ok, err } = require('../../src/utils/result');
+			const fakeWallet = {
+				send: async (): Promise<unknown> => ok(rawTxHex),
+				electrum: {
+					broadcastTransaction: async (): Promise<unknown> =>
+						err('electrum rejected')
+				}
+			};
+			try {
+				await BeignetNode.prototype.sendOnchain.call(
+					{ wallet: fakeWallet } as unknown as BeignetNode,
+					'bcrt1qexample',
+					200000
+				);
+				expect.fail('Should have thrown');
+			} catch (e: unknown) {
+				expect((e as BeignetError).code).to.equal('SEND_FAILED');
+				expect((e as BeignetError).message).to.include('electrum rejected');
+			}
+		});
+	});
+
 	it('should have getFeeEstimates method', () => {
 		expect(typeof BeignetNode.prototype.getFeeEstimates).to.equal('function');
 	});
