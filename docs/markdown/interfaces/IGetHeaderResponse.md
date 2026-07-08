@@ -20,7 +20,7 @@
 
 #### Defined in
 
-[types/electrum.ts:125](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L125)
+[types/electrum.ts:125](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L125)
 
 ___
 
@@ -30,7 +30,7 @@ ___
 
 #### Defined in
 
-[types/electrum.ts:123](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L123)
+[types/electrum.ts:123](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L123)
 
 ___
 
@@ -40,7 +40,7 @@ ___
 
 #### Defined in
 
-[types/electrum.ts:122](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L122)
+[types/electrum.ts:122](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L122)
 
 ___
 
@@ -50,7 +50,7 @@ ___
 
 #### Defined in
 
-[types/electrum.ts:124](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L124)
+[types/electrum.ts:124](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L124)
 
 ___
 
@@ -60,4 +60,4 @@ ___
 
 #### Defined in
 
-[types/electrum.ts:126](https://github.com/coreyphillips/beignet/blob/8a84ec1/src/types/electrum.ts#L126)
+[types/electrum.ts:126](https://github.com/coreyphillips/beignet/blob/e43f953/src/types/electrum.ts#L126)
