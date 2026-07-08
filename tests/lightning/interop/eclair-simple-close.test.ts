@@ -2,9 +2,11 @@
  * Interop: option_simple_close (closing_complete / closing_sig) vs live Eclair.
  *
  * Eclair ≥ 0.11 activates option_simple_close by default, making it the
- * primary interop gate for beignet's simplified mutual close. CLN v24 does
- * NOT advertise bits 60/61 — the legacy-fallback regression lives in the CLN
- * Tier 6 tests, which must keep passing unmodified.
+ * primary interop gate for beignet's simplified mutual close. The CLN Tier 6
+ * tests still exercise the LEGACY closing_signed fallback because the shared
+ * interop helper nodes deliberately do not advertise Feature.SIMPLE_CLOSE
+ * (note: modern CLN itself does advertise bits 60/61, so the legacy coverage
+ * relies on the helper's feature set, not on CLN's).
  *
  * Also captures Eclair's real closing_complete/closing_sig wire bytes into
  * tests/lightning/conformance/vectors/eclair-simple-close.json (no upstream

@@ -138,7 +138,10 @@ describe('Interop: Beignet ↔ CLN splice handshake (regtest)', function () {
 				reachedTxSigs = true;
 				break;
 			}
-			if (state === SpliceState.ABORTED || (sawSession && state === undefined)) {
+			if (
+				state === SpliceState.ABORTED ||
+				(sawSession && state === undefined)
+			) {
 				break;
 			}
 			await sleep(200);
@@ -146,11 +149,13 @@ describe('Interop: Beignet ↔ CLN splice handshake (regtest)', function () {
 
 		// The interactive-tx negotiation (shared input + outputs + tx_complete)
 		// completed with CLN — which implies splice_init/splice_ack succeeded
-		// even when the transient TX_NEGOTIATION state fell between polls.
+		// even when the transient TX_NEGOTIATION state fell between polls (so
+		// we no longer assert sawTxNegotiation directly; reaching tx_signatures
+		// is strictly stronger).
+		void sawTxNegotiation;
 		expect(
 			reachedTxSigs,
 			'interactive-tx negotiation completed with CLN (AWAITING_TX_SIGNATURES)'
 		).to.equal(true);
-		expect(sawTxNegotiation || reachedTxSigs).to.equal(true);
 	});
 });

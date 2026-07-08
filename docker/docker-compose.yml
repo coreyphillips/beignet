@@ -113,6 +113,11 @@ services:
       - '--log-level=info'
       # v26: offers are always on (--experimental-offers was removed);
       # splicing and dual funding still use experimental flags.
+      # --experimental-dual-fund only changes CLN behavior for peers that also
+      # advertise option_dual_fund; the shared interop node (cln-helpers /
+      # createInteropNode) deliberately does NOT, so CLN's fundchannel stays v1
+      # for every tier except the dedicated v2 test. Do not add
+      # Feature.DUAL_FUND to createInteropNode without revisiting this.
       - '--experimental-splicing'
       - '--experimental-dual-fund'
 
