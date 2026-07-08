@@ -8,7 +8,6 @@
 
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
-import { createError, encodeErrorMessage } from '../message/error';
 import {
 	encodeOpenChannelMessage,
 	IOpenChannelMessage,
@@ -51,7 +50,7 @@ import {
 	encodeClosingCompleteMessage,
 	encodeClosingSigMessage
 } from '../message/channel-close';
-import { isDustOutput } from '../chain/closing';
+import { isDustOutput, calculateClosingFee } from '../chain/closing';
 import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
@@ -244,6 +243,20 @@ export interface ISpliceWalletInput {
 }
 
 /**
+ * Taproot cooperative close: the manager's cached MuSig2 signing session for
+ * the closing tx at a specific fee. Opaque to the channel state machine (the
+ * session and tx types belong to the manager's crypto layer); the channel
+ * only owns its lifecycle, clearing it whenever the closing nonces refresh.
+ */
+export interface ITaprootClosingCache {
+	feeSatoshis: bigint;
+	session: unknown;
+	tx: import('bitcoinjs-lib').Transaction;
+	/** Our 32-byte MuSig2 partial signature over the closing tx, once made. */
+	ourPartialSig: Buffer | null;
+}
+
+/**
  * Lightning channel state machine.
  */
 export class Channel {
@@ -333,6 +346,22 @@ export class Channel {
 		ourWalletWitnesses: Buffer[][];
 		ourWalletInputIndices: number[];
 	} | null = null;
+	// ─── Taproot cooperative close (MuSig2 key-spend) ───
+	// All in-memory only, NEVER persisted: BOLT 2 retransmits shutdown on
+	// reestablish and each retransmission carries a FRESH MuSig2 closing nonce
+	// (LND does the same), so a reconnect/restart simply restarts the closing
+	// session. _ourClosingNonce is the EXACT object returned by generateNonce —
+	// the musig library keys the secret nonce by object identity, so it must
+	// never be copied before signing.
+	private _ourClosingNonce: Uint8Array | null = null;
+	private _remoteClosingNonce: Buffer | null = null;
+	// Sign-once latch: our closing nonce signs exactly ONE sighash. Set when we
+	// produce our closing partial; cleared only when fresh nonces arrive.
+	private _hasSignedClosing = false;
+	// Opaque cache managed by the ChannelManager: the MuSig2 signing session,
+	// unsigned closing tx and our partial at a specific fee. Invalidated here
+	// whenever the nonces refresh (the channel owns the nonce lifecycle).
+	private _taprootClosingCache: ITaprootClosingCache | null = null;
 	private _currentBlockHeight = 0;
 	private _channelKeyIndex: number | null = null;
 
@@ -563,6 +592,52 @@ export class Channel {
 			publicKey: this._state.localBasepoints.fundingPubkey,
 			sessionId
 		});
+	}
+
+	/**
+	 * Taproot coop close: generate a FRESH single-use closing nonce for the
+	 * shutdown we are about to send, resetting the closing session (cache,
+	 * partial, sign-once latch). Fresh-random (not derived): each shutdown
+	 * (re)transmission starts a new closing session, mirroring LND, and the
+	 * nonce secret lives only as long as this connection's negotiation.
+	 * Returns the 66-byte public part for the shutdown TLV.
+	 */
+	private _refreshOurClosingNonce(): Buffer {
+		this._ourClosingNonce = generateNonce({
+			publicKey: this._state.localBasepoints.fundingPubkey,
+			sessionId: crypto.randomBytes(32)
+		});
+		this._taprootClosingCache = null;
+		this._hasSignedClosing = false;
+		return Buffer.from(this._ourClosingNonce);
+	}
+
+	/**
+	 * Taproot coop close: adopt the peer's closing nonce from its shutdown
+	 * TLV. A (re)transmitted shutdown carries a fresh nonce, which invalidates
+	 * any in-flight closing session built on the previous one.
+	 */
+	private _adoptRemoteClosingNonce(nonce: Buffer): void {
+		this._remoteClosingNonce = Buffer.from(nonce);
+		this._taprootClosingCache = null;
+		this._hasSignedClosing = false;
+	}
+
+	/** Taproot coop close: nonce pair for the manager's signing session. */
+	getClosingNonces(): {
+		local: Uint8Array | null;
+		remote: Buffer | null;
+	} {
+		return { local: this._ourClosingNonce, remote: this._remoteClosingNonce };
+	}
+
+	/** Taproot coop close: manager-owned session cache (see ITaprootClosingCache). */
+	getTaprootClosingCache(): ITaprootClosingCache | null {
+		return this._taprootClosingCache;
+	}
+
+	setTaprootClosingCache(cache: ITaprootClosingCache | null): void {
+		this._taprootClosingCache = cache;
 	}
 
 	/**
@@ -2706,20 +2781,6 @@ export class Channel {
 	 * Initiate cooperative close by sending shutdown.
 	 */
 	initiateShutdown(scriptPubkey: Buffer): ChannelAction[] {
-		// Taproot channels have a MuSig2 P2TR funding output; the cooperative
-		// close path is ECDSA/P2WSH-only today, so an attempted close would
-		// hang unsatisfiable in NEGOTIATING_CLOSING. Fail closed instead —
-		// force-close is the supported exit for taproot channels.
-		if (isTaprootChannel(this._state.channelType)) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cooperative close is not supported for taproot channels yet; use force-close'
-				}
-			];
-		}
-
 		// option_simple_close allows re-sending shutdown to update the local
 		// script mid-negotiation (restarting the signing flow); legacy close
 		// only permits initiating from NORMAL.
@@ -2766,8 +2827,36 @@ export class Channel {
 			channelId: this._state.channelId!,
 			scriptPubkey
 		};
+		if (isTaprootChannel(this._state.channelType)) {
+			// Simple-taproot close: every shutdown we send starts a fresh MuSig2
+			// closing session and advertises the new nonce (TLV 8).
+			msg.shutdownNonce = this._refreshOurClosingNonce();
+		}
 
 		return [sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(msg))];
+	}
+
+	/**
+	 * Taproot coop close: rebuild our shutdown for retransmission (reestablish).
+	 * Refreshes our closing nonce — the pre-disconnect closing session is dead
+	 * by construction — and re-advertises the local script. Non-taproot callers
+	 * should retransmit the plain shutdown directly.
+	 */
+	buildShutdownRetransmit(): IShutdownMessage {
+		const msg: IShutdownMessage = {
+			channelId: this._state.channelId!,
+			scriptPubkey: this._state.localShutdownScript ?? Buffer.alloc(0)
+		};
+		if (isTaprootChannel(this._state.channelType)) {
+			msg.shutdownNonce = this._refreshOurClosingNonce();
+			// The peer regenerates ITS closing nonce for the shutdown it must
+			// retransmit after reestablish (which always arrives after this
+			// runs — reestablish precedes shutdown on the wire). Drop the stale
+			// one so no proposal is signed against a session the peer no longer
+			// has; proposeClosingFee waits until the fresh nonce lands.
+			this._remoteClosingNonce = null;
+		}
+		return msg;
 	}
 
 	/**
@@ -2779,25 +2868,18 @@ export class Channel {
 	 *   a real script derived from the funding pubkey.
 	 */
 	handleShutdown(msg: IShutdownMessage, localScript?: Buffer): ChannelAction[] {
-		// Fail closed for taproot channels (see initiateShutdown): warn the peer
-		// and leave state untouched — their exit is force-close, which works.
+		// Simple-taproot close: the peer's shutdown MUST carry its MuSig2
+		// closing nonce (TLV 8) — without it no closing session can exist and
+		// we must never fall back to ECDSA negotiation on a P2TR funding.
 		if (isTaprootChannel(this._state.channelType)) {
-			return [
-				sendMsg(
-					MessageType.WARNING,
-					encodeErrorMessage(
-						createError(
-							msg.channelId,
-							'Cooperative close is not supported for taproot channels yet'
-						)
-					)
-				),
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cooperative close is not supported for taproot channels yet; use force-close'
-				}
-			];
+			if (!msg.shutdownNonce || msg.shutdownNonce.length !== 66) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Taproot shutdown missing the MuSig2 closing nonce (TLV 8)'
+					}
+				];
+			}
 		}
 
 		// BOLT 2: reject a shutdown scriptPubkey that is not a standard spendable
@@ -2825,6 +2907,18 @@ export class Channel {
 		// which abandons our in-flight closing_complete round.
 		if (this._state.state === ChannelState.NEGOTIATING_CLOSING) {
 			this._state.remoteShutdownScript = msg.scriptPubkey;
+			// Only adopt a fresh remote nonce (which resets the closing session)
+			// when OUR nonce has also been refreshed since we last signed. The
+			// legitimate case is a post-reestablish retransmit, where
+			// buildShutdownRetransmit already generated a fresh local nonce (so
+			// _hasSignedClosing is false). A same-connection DUPLICATE shutdown
+			// arriving after we signed (_hasSignedClosing true) would otherwise
+			// clear our sign-once latch while our local nonce is already spent,
+			// wedging the close (partialSign throws, no secret nonce). Ignore it:
+			// our already-signed partial stays valid for the peer to complete.
+			if (msg.shutdownNonce && !this._hasSignedClosing) {
+				this._adoptRemoteClosingNonce(msg.shutdownNonce);
+			}
 			if (this._state.simpleClose === true) {
 				this.resetSimpleCloseNegotiation();
 			}
@@ -2841,6 +2935,9 @@ export class Channel {
 		}
 
 		this._state.remoteShutdownScript = msg.scriptPubkey;
+		if (msg.shutdownNonce) {
+			this._adoptRemoteClosingNonce(msg.shutdownNonce);
+		}
 
 		const actions: ChannelAction[] = [];
 
@@ -2855,14 +2952,15 @@ export class Channel {
 			this._state.state = ChannelState.SHUTTING_DOWN;
 			// Send shutdown response per BOLT 2 (only if we have a real script)
 			if (this._state.localShutdownScript.length > 0) {
+				const response: IShutdownMessage = {
+					channelId: this._state.channelId!,
+					scriptPubkey: this._state.localShutdownScript
+				};
+				if (isTaprootChannel(this._state.channelType)) {
+					response.shutdownNonce = this._refreshOurClosingNonce();
+				}
 				actions.push(
-					sendMsg(
-						MessageType.SHUTDOWN,
-						encodeShutdownMessage({
-							channelId: this._state.channelId!,
-							scriptPubkey: this._state.localShutdownScript
-						})
-					)
+					sendMsg(MessageType.SHUTDOWN, encodeShutdownMessage(response))
 				);
 			}
 		}
@@ -2914,6 +3012,42 @@ export class Channel {
 		}
 
 		this._state.state = ChannelState.NEGOTIATING_CLOSING;
+
+		// Simple-taproot close: single-round negotiation. Our closing nonce
+		// signs exactly ONE sighash, so we propose once (the latch is cleared
+		// only by a fresh nonce exchange) and the peer must accept the fee
+		// verbatim. The callback returns our 32-byte MuSig2 partial.
+		if (isTaprootChannel(this._state.channelType)) {
+			if (this._hasSignedClosing) {
+				// Already proposed in this closing session (manager re-entry,
+				// e.g. duplicate shutdown handling) — the peer has our offer.
+				return [];
+			}
+			if (!this._remoteClosingNonce) {
+				// The peer's shutdown (with its fresh nonce) has not arrived on
+				// this connection yet; the proposal fires when it does.
+				return [];
+			}
+			const idealFee = this.calculateIdealClosingFee();
+			this._state.lastProposedClosingFeeSat = idealFee;
+			const partial =
+				typeof signatureOrFn === 'function'
+					? signatureOrFn(idealFee)
+					: signatureOrFn;
+			this._hasSignedClosing = true;
+			const taprootMsg: IClosingSignedMessage = {
+				channelId: this._state.channelId!,
+				feeSatoshis: idealFee,
+				signature: Buffer.alloc(64),
+				partialSignature: partial
+			};
+			return [
+				sendMsg(
+					MessageType.CLOSING_SIGNED,
+					encodeClosingSignedMessage(taprootMsg)
+				)
+			];
+		}
 
 		// Calculate ideal fee from current fee rate
 		const idealFee = this.calculateIdealClosingFee();
@@ -2973,6 +3107,15 @@ export class Channel {
 
 		this._state.state = ChannelState.NEGOTIATING_CLOSING;
 		this._state.theirLastClosingFeeSat = msg.feeSatoshis;
+
+		// Simple-taproot close: single-round MuSig2 negotiation.
+		if (isTaprootChannel(this._state.channelType)) {
+			return this._handleTaprootClosingSigned(
+				msg,
+				signClosingFn,
+				verifyClosingFn
+			);
+		}
 
 		// Initialize our fee range if not done yet
 		if (this._state.closingFeeMin === null) {
@@ -3070,8 +3213,168 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Taproot coop close: handle closing_signed under the single-round rule.
+	 * Nonces were exchanged via shutdown (TLV 8) and each side's closing nonce
+	 * signs exactly one sighash, so there is no fee haggling:
+	 * - as INITIATOR (we proposed first) the peer must echo our fee exactly;
+	 *   anything else is a protocol error (countering would need a second
+	 *   nonce use).
+	 * - as RESPONDER we accept the initiator's fee verbatim (LND behavior),
+	 *   with the only sanity check being that the opener's output can pay it.
+	 * The peer's 32-byte MuSig2 partial (TLV 6) is verified BEFORE any CLOSED
+	 * transition — same fund-safety gate as the ECDSA path: fee agreement
+	 * alone must never tear down the funding watch.
+	 */
+	private _handleTaprootClosingSigned(
+		msg: IClosingSignedMessage,
+		signClosingFn: (feeSatoshis: bigint) => Buffer,
+		verifyClosingFn?: (feeSatoshis: bigint, signature: Buffer) => boolean
+	): ChannelAction[] {
+		if (!msg.partialSignature) {
+			// Never fall back to interpreting the (zeroed) ECDSA field: the
+			// funding output is P2TR key-spend and only a MuSig2 partial works.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Taproot closing_signed missing the MuSig2 partial signature (TLV 6)'
+				}
+			];
+		}
+		if (!this._remoteClosingNonce || !this._ourClosingNonce) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Taproot closing_signed before the shutdown nonce exchange completed'
+				}
+			];
+		}
+
+		const peerSigValid = (feeSatoshis: bigint): boolean =>
+			!verifyClosingFn || verifyClosingFn(feeSatoshis, msg.partialSignature!);
+
+		// Initiator: we already made our (only) offer.
+		if (this._state.lastProposedClosingFeeSat !== null) {
+			if (msg.feeSatoshis !== this._state.lastProposedClosingFeeSat) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							`Taproot closing fee must echo our offer: sent ${this._state.lastProposedClosingFeeSat}, ` +
+							`got ${msg.feeSatoshis}`
+					}
+				];
+			}
+			if (!peerSigValid(msg.feeSatoshis)) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Coop-close: peer closing partial signature failed to verify'
+					}
+				];
+			}
+			this._state.state = ChannelState.CLOSED;
+			return [
+				{
+					type: ChannelActionType.CHANNEL_CLOSED,
+					channelId: this._state.channelId!
+				}
+			];
+		}
+
+		// Responder: accept the initiator's first offer, but bound it to a
+		// reasonable range. Single-round negotiation means we cannot counter, so
+		// an unbounded accept would let the initiator burn our balance to miners
+		// with an absurdly high fee (when WE are the opener, the fee comes out of
+		// OUR output) or wedge the channel with an unrelayable, un-RBF-able low
+		// fee. The band is computed at the EFFECTIVE channel feerate (the higher
+		// of the two sides' committed rates): the initiator picks its own
+		// closing feerate, which may exceed our stale local config, so a band
+		// keyed only to our local feerate would reject legitimate offers.
+		const bandFeeRate = BigInt(
+			Math.max(
+				this._state.localConfig.feeratePerKw || 253,
+				this._state.remoteConfig.feeratePerKw || 253,
+				253
+			)
+		);
+		const bandLocalLen = this._state.localShutdownScript?.length ?? 22;
+		const bandRemoteLen = this._state.remoteShutdownScript?.length ?? 22;
+		const bandWeight = BigInt(
+			206 + 4 * (9 + bandLocalLen) + 4 * (9 + bandRemoteLen) + 66
+		);
+		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
+		const maxAcceptableFee = idealFee * 5n;
+		const minAcceptableFee = idealFee / 5n;
+		if (
+			msg.feeSatoshis > maxAcceptableFee ||
+			msg.feeSatoshis < minAcceptableFee
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Taproot closing fee ${msg.feeSatoshis} outside acceptable range [${minAcceptableFee}, ${maxAcceptableFee}]`
+				}
+			];
+		}
+		// The fee comes out of the OPENER's output only; a fee its balance
+		// cannot cover is un-buildable.
+		const isOpener = this._state.role === ChannelRole.OPENER;
+		const openerBalanceSat = isOpener
+			? this._state.localBalanceMsat / 1000n
+			: this._state.remoteBalanceMsat / 1000n;
+		if (msg.feeSatoshis > openerBalanceSat) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Taproot closing fee ${msg.feeSatoshis} exceeds opener balance ${openerBalanceSat}`
+				}
+			];
+		}
+		if (!peerSigValid(msg.feeSatoshis)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Coop-close: peer closing partial signature failed to verify'
+				}
+			];
+		}
+		if (this._hasSignedClosing) {
+			// Duplicate closing_signed in the same session — our reply is out.
+			return [];
+		}
+		const partial = signClosingFn(msg.feeSatoshis);
+		this._hasSignedClosing = true;
+		this._state.lastProposedClosingFeeSat = msg.feeSatoshis;
+		this._state.state = ChannelState.CLOSED;
+		const response: IClosingSignedMessage = {
+			channelId: this._state.channelId!,
+			feeSatoshis: msg.feeSatoshis,
+			signature: Buffer.alloc(64),
+			partialSignature: partial
+		};
+		return [
+			sendMsg(MessageType.CLOSING_SIGNED, encodeClosingSignedMessage(response)),
+			{
+				type: ChannelActionType.CHANNEL_CLOSED,
+				channelId: this._state.channelId!
+			}
+		];
+	}
+
 	private calculateIdealClosingFee(): bigint {
 		const feeRate = this._state.localConfig.feeratePerKw || 253;
+		// Taproot single-round close: the responder accepts our fee verbatim, so
+		// it must make the tx actually relayable. Use the SAME weight model as
+		// the tx builder (chain/closing.ts) with the 66-WU key-spend witness.
+		if (isTaprootChannel(this._state.channelType)) {
+			const localLen = this._state.localShutdownScript?.length ?? 22;
+			const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
+			return calculateClosingFee(feeRate, localLen, remoteLen, true);
+		}
 		// A typical closing tx is ~170 weight units (simplified calculation)
 		// fee = weight * feeratePerKw / 1000
 		const weight = 170;
@@ -3105,6 +3408,14 @@ export class Channel {
 	 * on reestablish (features are per-connection).
 	 */
 	setSimpleClose(simple: boolean): void {
+		// Simple-taproot channels always close via the legacy closing_signed
+		// flow carrying MuSig2 partial-sig TLVs; LND excludes taproot from
+		// option_simple_close/RBF close, so force the legacy path even when
+		// both peers advertise feature 60.
+		if (isTaprootChannel(this._state.channelType)) {
+			this._state.simpleClose = false;
+			return;
+		}
 		this._state.simpleClose = simple;
 	}
 

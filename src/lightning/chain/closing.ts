@@ -22,6 +22,13 @@ export interface IClosingTxParams {
 	localAmount: bigint;
 	remoteAmount: bigint;
 	feeAmount: bigint;
+	/**
+	 * nSequence for the funding input. Defaults to 0xffffffff (legacy BOLT 2
+	 * closing tx). Simple-taproot channels MUST pass 0xfffffffd — LND builds
+	 * the taproot coop-close tx RBF-signalled, and a different sequence
+	 * changes the MuSig2 sighash.
+	 */
+	sequence?: number;
 }
 
 export interface IClosingTxResult {
@@ -57,7 +64,11 @@ export function buildClosingTx(params: IClosingTxParams): IClosingTxResult {
 
 	// fundingTxid is in internal byte order per BOLT 2
 	const fundingTxidBuf = Buffer.from(fundingTxid, 'hex');
-	tx.addInput(fundingTxidBuf, fundingOutputIndex, 0xffffffff);
+	tx.addInput(
+		fundingTxidBuf,
+		fundingOutputIndex,
+		params.sequence ?? 0xffffffff
+	);
 
 	interface IOutputEntry {
 		script: Buffer;
@@ -123,7 +134,8 @@ export function buildClosingTx(params: IClosingTxParams): IClosingTxResult {
 export function calculateClosingFee(
 	feeratePerKw: number,
 	localScriptLen: number,
-	remoteScriptLen: number
+	remoteScriptLen: number,
+	isTaproot = false
 ): bigint {
 	// Base weight: header (40) + 1 input (164 witness-adjusted) + segwit marker (2)
 	// = 206 weight units for base + input
@@ -133,8 +145,11 @@ export function calculateClosingFee(
 	const localOutputWeight = 4 * (8 + 1 + localScriptLen);
 	const remoteOutputWeight = 4 * (8 + 1 + remoteScriptLen);
 
-	// Witness: multisig witness (OP_0 + 2 sigs + redeemScript) ≈ 220 weight units
-	const witnessWeight = 220;
+	// Witness:
+	// - P2WSH 2-of-2 (OP_0 + 2 sigs + redeemScript) ≈ 220 weight units
+	// - P2TR MuSig2 key-spend: stack count (1) + item len (1) + 64B Schnorr
+	//   sig = 66 weight units
+	const witnessWeight = isTaproot ? 66 : 220;
 
 	const totalWeight =
 		baseWeight + localOutputWeight + remoteOutputWeight + witnessWeight;

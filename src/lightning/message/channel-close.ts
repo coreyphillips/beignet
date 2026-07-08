@@ -33,16 +33,34 @@ import { ITlvRecord, decodeTlvStream, encodeTlvStream } from './tlv';
 export interface IShutdownMessage {
 	channelId: Buffer;
 	scriptPubkey: Buffer;
+	/**
+	 * MuSig2 closing pubnonce (66 bytes) for simple-taproot channels, carried
+	 * as TLV type 8 (LND shutdown_nonce convention). Absent on non-taproot
+	 * channels; the wire encoding is byte-identical to legacy when unset.
+	 */
+	shutdownNonce?: Buffer;
 }
 
 export interface IClosingSignedMessage {
 	channelId: Buffer;
 	feeSatoshis: bigint;
 	signature: Buffer;
+	/**
+	 * MuSig2 partial signature (32 bytes) for simple-taproot channels, carried
+	 * as TLV type 6 (LND partial_sig convention). When set, the fixed 64-byte
+	 * `signature` field is zeroed on the wire.
+	 */
+	partialSignature?: Buffer;
 }
 
 const SHUTDOWN_FIXED_LENGTH = 34; // 32 + 2
 const CLOSING_SIGNED_LENGTH = 104; // 32 + 8 + 64
+const SHUTDOWN_NONCE_TLV = 8n;
+const SHUTDOWN_NONCE_LENGTH = 66;
+const SHUTDOWN_TLV_TYPES = new Set<bigint>([SHUTDOWN_NONCE_TLV]);
+const CLOSING_PARTIAL_SIG_TLV = 6n;
+const CLOSING_PARTIAL_SIG_LENGTH = 32;
+const CLOSING_SIGNED_TLV_TYPES = new Set<bigint>([CLOSING_PARTIAL_SIG_TLV]);
 
 /**
  * Encode a `shutdown` message payload.
@@ -57,7 +75,16 @@ export function encodeShutdownMessage(msg: IShutdownMessage): Buffer {
 	offset += 2;
 	msg.scriptPubkey.copy(buf, offset);
 
-	return buf;
+	if (msg.shutdownNonce === undefined) return buf;
+	if (msg.shutdownNonce.length !== SHUTDOWN_NONCE_LENGTH) {
+		throw new Error(
+			`shutdown_nonce must be ${SHUTDOWN_NONCE_LENGTH} bytes, got ${msg.shutdownNonce.length}`
+		);
+	}
+	const tlvs = encodeTlvStream([
+		{ type: SHUTDOWN_NONCE_TLV, value: msg.shutdownNonce }
+	]);
+	return Buffer.concat([buf, tlvs]);
 }
 
 /**
@@ -82,8 +109,24 @@ export function decodeShutdownMessage(payload: Buffer): IShutdownMessage {
 	}
 
 	const scriptPubkey = Buffer.from(payload.subarray(offset, offset + len));
+	offset += len;
 
-	return { channelId, scriptPubkey };
+	const msg: IShutdownMessage = { channelId, scriptPubkey };
+	if (offset < payload.length) {
+		// Unknown even TLV types are rejected; unknown odd types are ignored.
+		const { records } = decodeTlvStream(payload, offset, SHUTDOWN_TLV_TYPES);
+		for (const r of records) {
+			if (r.type === SHUTDOWN_NONCE_TLV) {
+				if (r.value.length !== SHUTDOWN_NONCE_LENGTH) {
+					throw new Error(
+						`shutdown_nonce must be ${SHUTDOWN_NONCE_LENGTH} bytes, got ${r.value.length}`
+					);
+				}
+				msg.shutdownNonce = Buffer.from(r.value);
+			}
+		}
+	}
+	return msg;
 }
 
 /**
@@ -93,8 +136,21 @@ export function encodeClosingSignedMessage(msg: IClosingSignedMessage): Buffer {
 	const buf = Buffer.alloc(CLOSING_SIGNED_LENGTH);
 	msg.channelId.copy(buf, 0);
 	buf.writeBigUInt64BE(msg.feeSatoshis, 32);
-	msg.signature.copy(buf, 40);
-	return buf;
+	if (msg.partialSignature === undefined) {
+		msg.signature.copy(buf, 40);
+		return buf;
+	}
+	if (msg.partialSignature.length !== CLOSING_PARTIAL_SIG_LENGTH) {
+		throw new Error(
+			`closing partial signature must be ${CLOSING_PARTIAL_SIG_LENGTH} bytes, got ${msg.partialSignature.length}`
+		);
+	}
+	// Taproot: the fixed ECDSA field stays zeroed; the MuSig2 partial rides
+	// in TLV type 6.
+	const tlvs = encodeTlvStream([
+		{ type: CLOSING_PARTIAL_SIG_TLV, value: msg.partialSignature }
+	]);
+	return Buffer.concat([buf, tlvs]);
 }
 
 /**
@@ -113,7 +169,29 @@ export function decodeClosingSignedMessage(
 	const feeSatoshis = payload.readBigUInt64BE(32);
 	const signature = Buffer.from(payload.subarray(40, 104));
 
-	return { channelId, feeSatoshis, signature };
+	const msg: IClosingSignedMessage = { channelId, feeSatoshis, signature };
+	if (payload.length > CLOSING_SIGNED_LENGTH) {
+		// Unknown even TLV types are rejected; unknown odd types (e.g. LND's
+		// fee_range, type 1) are ignored per BOLT 1.
+		const { records } = decodeTlvStream(
+			payload,
+			CLOSING_SIGNED_LENGTH,
+			CLOSING_SIGNED_TLV_TYPES
+		);
+		for (const r of records) {
+			if (r.type === CLOSING_PARTIAL_SIG_TLV) {
+				if (r.value.length !== CLOSING_PARTIAL_SIG_LENGTH) {
+					throw new Error(
+						`closing partial signature must be ${CLOSING_PARTIAL_SIG_LENGTH} bytes, got ${r.value.length}`
+					);
+				}
+				msg.partialSignature = Buffer.from(r.value);
+			}
+			// LND also attaches an odd fee_range TLV (type 1); unknown odd
+			// types are ignored per BOLT 1.
+		}
+	}
+	return msg;
 }
 
 // ─────────────── option_simple_close ───────────────
