@@ -237,6 +237,8 @@ const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
 
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
+	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
+	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
 	private network: Network;
 	private channelManager: ChannelManager;
@@ -349,6 +351,7 @@ export class LightningNode extends EventEmitter {
 		this.nodePrivkey = config.nodePrivateKey;
 		this.nodeId = getPublicKey(config.nodePrivateKey).toString('hex');
 		this.network = config.network || Network.REGTEST;
+		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
 
 		this.resourceConfig = {
@@ -3153,11 +3156,13 @@ export class LightningNode extends EventEmitter {
 			let feeBaseMsat = this.forwardingFeeBaseMsat;
 			let feeProportionalMillionths = this.forwardingFeePropMillionths;
 			let cltvExpiryDelta = this.forwardingCltvDelta;
+			let htlcMinimumMsat = 0n;
 			const directPolicy = state.remoteForwardingPolicy;
 			if (directPolicy) {
 				feeBaseMsat = directPolicy.feeBaseMsat;
 				feeProportionalMillionths = directPolicy.feeProportionalMillionths;
 				cltvExpiryDelta = directPolicy.cltvExpiryDelta;
+				htlcMinimumMsat = directPolicy.htlcMinimumMsat;
 			}
 			if (state.shortChannelId) {
 				const graphChannel = this.graph.getChannel(state.shortChannelId);
@@ -3173,10 +3178,14 @@ export class LightningNode extends EventEmitter {
 					feeBaseMsat = peerUpdate.feeBaseMsat;
 					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
 					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
+					htlcMinimumMsat = peerUpdate.htlcMinimumMsat;
 				}
 			}
 
-			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat: 0n };
+			// Advertise the peer's real htlc_minimum_msat in the blinded hop's
+			// payment_constraints so the payer never sends a sub-minimum HTLC the
+			// peer would reject (the same masked-failure class as the fee gap).
+			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat };
 			// Peer hop: forward to us over this channel. For async receive, mark
 			// it hold_htlc so the LSP parks the HTLC until we return.
 			const peerHop: IBlindedHopData = {
@@ -3190,8 +3199,11 @@ export class LightningNode extends EventEmitter {
 				paymentConstraints,
 				...(asyncHold ? { holdHtlc: true } : {})
 			};
-			// Final hop (us): recipient, no onward forwarding.
-			const finalHop: IBlindedHopData = { paymentConstraints };
+			// Final hop (us): recipient, no onward forwarding. Our own minimum is
+			// 0; do not inherit the peer's htlc_minimum constraint here.
+			const finalHop: IBlindedHopData = {
+				paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n }
+			};
 
 			let nodeIds = [peerPubkey, ourNodeId];
 			let hopDataList: IBlindedHopData[] = [peerHop, finalHop];
@@ -3446,6 +3458,14 @@ export class LightningNode extends EventEmitter {
 		msg: IChannelUpdateMessage,
 		payload: Buffer
 	): void {
+		// A channel_update for another chain can never describe one of our
+		// channels; drop it before touching channel state.
+		if (
+			this.acceptableChainHashes.length > 0 &&
+			!this.acceptableChainHashes.some((h) => h.equals(msg.chainHash))
+		) {
+			return;
+		}
 		const ourNodeId = getPublicKey(this.nodePrivkey);
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
@@ -3456,10 +3476,14 @@ export class LightningNode extends EventEmitter {
 			].filter((s): s is Buffer => s !== null);
 			if (!scids.some((s) => s.equals(msg.shortChannelId))) continue;
 
+			// A non-matching candidate must NOT end the scan: remoteScidAlias is a
+			// peer-chosen value, so a malicious peer could otherwise alias-collide
+			// with the real SCID of an honest peer's channel and (by sorting
+			// earlier) permanently shadow its policy. Skip to the next channel.
 			const channelId = channel.getChannelId();
-			if (!channelId) return;
+			if (!channelId) continue;
 			const peerHex = this.channelManager.getPeerForChannel(channelId);
-			if (!peerHex) return;
+			if (!peerHex) continue;
 			const peerNodeId = Buffer.from(peerHex, 'hex');
 
 			// The update must be authored by the PEER (direction bit selects the
@@ -3469,8 +3493,8 @@ export class LightningNode extends EventEmitter {
 					? [ourNodeId, peerNodeId]
 					: [peerNodeId, ourNodeId];
 			const signer = (msg.channelFlags & 1) === 0 ? nodeId1 : nodeId2;
-			if (!signer.equals(peerNodeId)) return; // our own update echoed back
-			if (!verifyChannelUpdate(msg, payload, nodeId1, nodeId2)) return;
+			if (!signer.equals(peerNodeId)) continue; // our own update, or wrong channel
+			if (!verifyChannelUpdate(msg, payload, nodeId1, nodeId2)) continue;
 
 			const adopted = channel.adoptRemoteForwardingPolicy({
 				feeBaseMsat: msg.feeBaseMsat,

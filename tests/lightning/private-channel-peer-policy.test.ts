@@ -319,6 +319,72 @@ describe('Private-channel peer forwarding policy', function () {
 		expect(state.remoteForwardingPolicy!.feeBaseMsat).to.equal(7777);
 	});
 
+	it('does not let one channel shadow another when a peer alias-collides', function () {
+		// Two channels to two DIFFERENT peers. The first-scanned channel (to a
+		// third node "mallory") carries a remoteScidAlias equal to the SECOND
+		// channel's real SCID. A signed update from bob for that SCID must still
+		// reach bob's channel rather than being dropped at mallory's (whose
+		// signer check fails). Regression for the early-return shadowing bug.
+		const aliceCfg = makeNodeConfig(30);
+		const malloryCfg = makeNodeConfig(31);
+		const bobCfg = makeNodeConfig(32);
+		const alice = new LightningNode(aliceCfg);
+		const mallory = new LightningNode(malloryCfg);
+		const bob = new LightningNode(bobCfg);
+		for (const n of [alice, mallory, bob]) n.on('node:error', () => {});
+		connectNodes(alice, mallory);
+		connectNodes(alice, bob);
+
+		const openTo = (peer: LightningNode): Buffer => {
+			const ch = alice.openChannel(peer.getNodeId(), 1_000_000n);
+			const cid = alice.createFunding(
+				ch,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(cid);
+			peer.handleFundingConfirmed(cid);
+			return cid;
+		};
+		// Mallory's channel is opened first, so it sorts first in listChannels().
+		const malloryCid = openTo(mallory);
+		const bobCid = openTo(bob);
+
+		const bobScid = crypto.randomBytes(8);
+		alice.getChannelManager().getChannel(bobCid)!.getFullState().scidAlias =
+			bobScid;
+		// Mallory (peer-chosen) aliases its channel to bob's real SCID.
+		alice
+			.getChannelManager()
+			.getChannel(malloryCid)!
+			.getFullState().remoteScidAlias = bobScid;
+
+		const aliceId = Buffer.from(alice.getNodeId(), 'hex');
+		const bobId = Buffer.from(bob.getNodeId(), 'hex');
+		const bobDir = Buffer.compare(aliceId, bobId) < 0 ? 1 : 0;
+		const { payload } = makePeerUpdate(bobScid, bobDir, bobCfg.nodePrivateKey, {
+			feeBaseMsat: 4242
+		});
+		alice.handlePeerMessage('', MessageType.CHANNEL_UPDATE, payload);
+
+		const bobState = alice
+			.getChannelManager()
+			.getChannel(bobCid)!
+			.getFullState();
+		expect(bobState.remoteForwardingPolicy, 'bob policy adopted').to.exist;
+		expect(bobState.remoteForwardingPolicy!.feeBaseMsat).to.equal(4242);
+		// Mallory's channel is untouched (bob did not sign for it).
+		expect(
+			alice.getChannelManager().getChannel(malloryCid)!.getFullState()
+				.remoteForwardingPolicy ?? null
+		).to.equal(null);
+
+		alice.destroy();
+		mallory.destroy();
+		bob.destroy();
+	});
+
 	it('persists the policy across a serialize/deserialize round-trip', function () {
 		const { alice, channelId, scid, bobDirection, bobNodePrivkey } = setup();
 

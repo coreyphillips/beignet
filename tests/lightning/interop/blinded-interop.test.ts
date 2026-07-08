@@ -10,15 +10,15 @@
  * end and confirmed, via iterative diagnosis, that:
  *   - routing to the introduction node works (findRouteToBlindedPath local edges),
  *   - the blinded onion reaches LND and the HTLC commits cleanly,
- *   - LND SUCCESSFULLY DECRYPTS beignet's encrypted_recipient_data — the BOLT 4
- *     "rho" key fix is validated (the failure is invalid_onion_blinding 0xc018, a
- *     POST-decryption validation error, not invalid_onion_hmac / a decrypt failure).
+ *   - LND SUCCESSFULLY DECRYPTS beignet's encrypted_recipient_data (the BOLT 4
+ *     "rho" key fix is validated).
  * Real conformance fixes landed from this work: rho encryption key, blinded-hop
  * SCID omission, blinded-intermediate amt/cltv omission, ROUTE_BLINDING feature,
- * findRouteToBlindedPath local edges, and a fractional-msat HTLC commitment fix
- * (the sub-satoshi remainder must stay with the offerer's to_local per BOLT 3 —
- * verified against LND: the commitment now signs cleanly where it previously
- * failed with "Invalid commitment signature").
+ * and findRouteToBlindedPath local edges. NOTE on fractional-msat commitments:
+ * BOLT 3 and LND FLOOR every commitment output; an untrimmed HTLC's sub-satoshi
+ * msat remainder is lost to fee, NOT credited to the offerer (the fix in this
+ * PR removed a prior crediting rule that diverged from LND by 1 sat and failed
+ * commit_sig for any fractional-msat HTLC).
  *
  * RESOLVED: the invalid_onion_blinding was never an onion bug — the harness
  * encoded OUR defaults as LND's payment_relay, LND failed the forward on
