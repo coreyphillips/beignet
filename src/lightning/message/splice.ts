@@ -268,3 +268,70 @@ export function decodeSpliceLockedMessage(
 
 	return { channelId, fundingTxid };
 }
+
+// ---- start_batch (type 127) ----
+
+/**
+ * start_batch announces that the next `batchSize` messages of `messageType`
+ * (in practice: commitment_signed, one per active funding output while a
+ * splice is pending confirmation) form ONE logical update, answered by a
+ * single revoke_and_ack.
+ *
+ *   [32: channel_id]
+ *   [2:  batch_size]
+ *   TLV: [1: message_type] (u16)
+ */
+export interface IStartBatchMessage {
+	channelId: Buffer;
+	batchSize: number;
+	/** TLV 1: the message type being batched (expected: 132 commitment_signed). */
+	messageType?: number;
+}
+
+export function encodeStartBatchMessage(msg: IStartBatchMessage): Buffer {
+	if (msg.channelId.length !== 32) {
+		throw new Error(`Channel ID must be 32 bytes, got ${msg.channelId.length}`);
+	}
+	const hasType = msg.messageType !== undefined;
+	const buf = Buffer.alloc(34 + (hasType ? 4 : 0));
+	msg.channelId.copy(buf, 0);
+	buf.writeUInt16BE(msg.batchSize, 32);
+	if (hasType) {
+		buf[34] = 1; // TLV type 1 (message_type)
+		buf[35] = 2; // length
+		buf.writeUInt16BE(msg.messageType!, 36);
+	}
+	return buf;
+}
+
+export function decodeStartBatchMessage(payload: Buffer): IStartBatchMessage {
+	if (payload.length < 34) {
+		throw new Error(
+			`start_batch too short: need 34 bytes, got ${payload.length}`
+		);
+	}
+	const msg: IStartBatchMessage = {
+		channelId: Buffer.from(payload.subarray(0, 32)),
+		batchSize: payload.readUInt16BE(32)
+	};
+	// TLV stream: only type 1 (message_type, u16) is known; unknown odd types
+	// are skipped, unknown even types reject per BOLT 1.
+	let offset = 34;
+	while (offset + 2 <= payload.length) {
+		const type = payload[offset];
+		const len = payload[offset + 1];
+		if (offset + 2 + len > payload.length) {
+			throw new Error('start_batch: truncated TLV record');
+		}
+		if (type === 1) {
+			if (len !== 2) {
+				throw new Error(`start_batch: message_type TLV must be 2 bytes`);
+			}
+			msg.messageType = payload.readUInt16BE(offset + 2);
+		} else if (type % 2 === 0) {
+			throw new Error(`start_batch: unknown required TLV type ${type}`);
+		}
+		offset += 2 + len;
+	}
+	return msg;
+}

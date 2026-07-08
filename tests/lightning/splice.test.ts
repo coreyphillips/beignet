@@ -9,6 +9,8 @@ import {
 	decodeSpliceAckMessage,
 	encodeSpliceLockedMessage,
 	decodeSpliceLockedMessage,
+	encodeStartBatchMessage,
+	decodeStartBatchMessage,
 	ISpliceMessage,
 	ISpliceAckMessage,
 	ISpliceLockedMessage
@@ -44,7 +46,10 @@ import {
 	encodeTxAddInputMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
-import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import {
+	decodeCommitmentSignedMessage,
+	encodeCommitmentSignedMessage
+} from '../../src/lightning/message/channel-commitment';
 import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import {
 	serializeChannelState,
@@ -3308,9 +3313,15 @@ describe('Splice', function () {
 
 				disconnect(pair);
 				const { openerMsg, acceptorMsg } = reconnect(pair);
-				// Fully signed: per spec neither side sets next_funding_txid.
-				expect(openerMsg.nextFundingTxid).to.be.undefined;
-				expect(acceptorMsg.nextFundingTxid).to.be.undefined;
+				// CLN v26 semantics: BOTH sides keep announcing next_funding_txid on
+				// every reestablish until the splice tx LOCKS, even when fully
+				// signed. A reestablish without it makes CLN silently forget its
+				// inflight (and ignore any tx_signatures retransmitted afterwards).
+				expect(openerMsg.nextFundingTxid).to.deep.equal(spliceTxid);
+				expect(acceptorMsg.nextFundingTxid).to.deep.equal(spliceTxid);
+				// Both hold the peer's splice commitment sig: nothing to retransmit.
+				expect(openerMsg.nextFundingRetransmitFlags).to.equal(0);
+				expect(acceptorMsg.nextFundingRetransmitFlags).to.equal(0);
 				expect(
 					pair.opener.getState(),
 					'back to SPLICING, awaiting locks'
@@ -3419,8 +3430,8 @@ describe('Splice', function () {
 				);
 				expect(
 					decodeChannelReestablishMessage(rRe.payload).nextFundingTxid,
-					'fully signed: no txid'
-				).to.be.undefined;
+					'announced until locked (CLN v26 keeps its inflight alive on it)'
+				).to.not.be.undefined;
 				restored.handleReestablish(
 					decodeChannelReestablishMessage(aRe.payload)
 				);
@@ -3898,6 +3909,258 @@ describe('Splice', function () {
 	});
 
 	// ─────────────── LightningNode Integration ───────────────
+
+	describe('start_batch commitment rounds while a splice awaits its lock', function () {
+		it('roundtrips the start_batch codec (with and without message_type TLV)', function () {
+			const channelId = crypto.randomBytes(32);
+			const withType = encodeStartBatchMessage({
+				channelId,
+				batchSize: 2,
+				messageType: 132
+			});
+			expect(withType.length).to.equal(38);
+			const decoded = decodeStartBatchMessage(withType);
+			expect(decoded.channelId).to.deep.equal(channelId);
+			expect(decoded.batchSize).to.equal(2);
+			expect(decoded.messageType).to.equal(132);
+
+			const bare = encodeStartBatchMessage({ channelId, batchSize: 2 });
+			expect(bare.length).to.equal(34);
+			expect(decodeStartBatchMessage(bare).messageType).to.equal(undefined);
+		});
+
+		function pendingLockPair(): ReturnType<typeof createNormalChannelPair> {
+			const pair = createNormalChannelPair();
+			pair.openerManager.initiateQuiescence(pair.channelId);
+			// Auto-routing drives the splice to fully-signed (tx_signatures both
+			// ways); without splice_locked the channel sits in the pending window.
+			expect(
+				pair.openerManager.initiateSplice(pair.channelId, 100_000n, 253).ok
+			).to.equal(true);
+			expect(pair.openerChannel.getState()).to.equal(ChannelState.SPLICING);
+			expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
+			expect(pair.acceptorChannel.isSplicePendingLock()).to.equal(true);
+			return pair;
+		}
+
+		it('completes an update_fee round as start_batch batches in both directions', function () {
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pair;
+
+			// Tap the wire AFTER the splice negotiation so only the fee round is
+			// captured.
+			const wire: Array<{ from: string; type: number; payload: Buffer }> = [];
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === acceptorPubkey) {
+					wire.push({ from: 'opener', type, payload });
+				}
+			});
+			acceptorManager.on('message:outbound', (pk, type, payload) => {
+				if (pk === openerPubkey) {
+					wire.push({ from: 'acceptor', type, payload });
+				}
+			});
+
+			const errors: string[] = [];
+			openerManager.on('channel:error' as never, (() => {}) as never);
+			openerManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+			acceptorManager.on('error', (_id: Buffer, m: string) => errors.push(m));
+
+			const openerCommitBefore =
+				openerChannel.getFullState().localCommitmentNumber;
+			const acceptorCommitBefore =
+				acceptorChannel.getFullState().localCommitmentNumber;
+			const spliceSigBefore = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.remoteCommitmentSig!
+			);
+
+			expect(openerManager.updateChannelFee(channelId, 1000).ok).to.equal(true);
+
+			expect(errors, `channel errors: ${errors.join('; ')}`).to.deep.equal([]);
+
+			// Both directions sent start_batch followed by two commitment_signed
+			// (one per active funding output, routed by funding_txid TLV).
+			for (const side of ['opener', 'acceptor'] as const) {
+				const msgs = wire.filter((w) => w.from === side);
+				const batchIdx = msgs.findIndex(
+					(w) => w.type === MessageType.START_BATCH
+				);
+				expect(batchIdx, `${side} sent start_batch`).to.be.gte(0);
+				const batch = decodeStartBatchMessage(msgs[batchIdx].payload);
+				expect(batch.batchSize).to.equal(2);
+				expect(batch.messageType).to.equal(132);
+				const commits = msgs
+					.slice(batchIdx + 1)
+					.filter((w) => w.type === MessageType.COMMITMENT_SIGNED)
+					.slice(0, 2)
+					.map((w) => decodeCommitmentSignedMessage(w.payload));
+				expect(commits.length, `${side} sent 2 commitment_signed`).to.equal(2);
+				const txids = commits.map((c) =>
+					c.fundingTxid ? c.fundingTxid.toString('hex') : 'none'
+				);
+				const state = openerChannel.getFullState();
+				expect(txids).to.include(state.fundingTxid!.toString('hex'));
+				expect(txids).to.include(
+					state.spliceInFlight!.spliceTxid.toString('hex')
+				);
+			}
+
+			// One full round on each side: commitment numbers advanced once, the
+			// splice-side signature was refreshed, and the channel still awaits
+			// its lock.
+			expect(openerChannel.getFullState().localCommitmentNumber).to.equal(
+				openerCommitBefore + 1n
+			);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				acceptorCommitBefore + 1n
+			);
+			expect(
+				openerChannel
+					.getFullState()
+					.spliceInFlight!.remoteCommitmentSig!.equals(spliceSigBefore)
+			).to.equal(false);
+			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+
+			// The splice still completes normally afterwards.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('routes an HTLC round as batches during the pending window', function () {
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = pair;
+
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const balBefore = openerChannel.getFullState().localBalanceMsat;
+
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+
+			expect(fulfilled, 'HTLC fulfilled during the pending window').to.equal(
+				true
+			);
+			expect(openerChannel.getFullState().localBalanceMsat).to.equal(
+				balBefore - 15_000_000n
+			);
+			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
+
+			// Lock the splice: the channel lands on the new outpoint with the
+			// payment reflected in both balances.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerChannel
+					.getFullState()
+					.fundingTxid!.equals(acceptorChannel.getFullState().fundingTxid!)
+			).to.equal(true);
+		});
+
+		it('rejects a batch whose splice-side signature is invalid WITHOUT revoking', function () {
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				acceptorChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pair;
+
+			// Detach the opener auto-wire and re-wire with tampering: corrupt the
+			// SPLICE-side commitment signature inside the batch.
+			openerManager.removeAllListeners('message:outbound');
+			const spliceTxidHex = acceptorChannel
+				.getFullState()
+				.spliceInFlight!.spliceTxid.toString('hex');
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk !== acceptorPubkey) return;
+				if (type === MessageType.COMMITMENT_SIGNED) {
+					const m = decodeCommitmentSignedMessage(payload);
+					if (m.fundingTxid?.toString('hex') === spliceTxidHex) {
+						m.signature = crypto.randomBytes(64);
+						acceptorManager.handleMessage(
+							openerPubkey,
+							type,
+							encodeCommitmentSignedMessage(m)
+						);
+						return;
+					}
+				}
+				acceptorManager.handleMessage(openerPubkey, type, payload);
+			});
+
+			const revokes: number[] = [];
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey && type === MessageType.REVOKE_AND_ACK) {
+					revokes.push(type);
+				}
+			});
+
+			const commitBefore = acceptorChannel.getFullState().localCommitmentNumber;
+			const spliceSigBefore = Buffer.from(
+				acceptorChannel.getFullState().spliceInFlight!.remoteCommitmentSig!
+			);
+
+			openerManager.updateChannelFee(channelId, 1000);
+
+			// The acceptor refused the batch: nothing revoked, nothing advanced,
+			// the stored splice-side signature untouched.
+			expect(revokes.length, 'no revoke_and_ack sent').to.equal(0);
+			expect(acceptorChannel.getFullState().localCommitmentNumber).to.equal(
+				commitBefore
+			);
+			expect(
+				acceptorChannel
+					.getFullState()
+					.spliceInFlight!.remoteCommitmentSig!.equals(spliceSigBefore)
+			).to.equal(true);
+		});
+
+		it('rejects start_batch outside the pending-lock window', function () {
+			const { openerChannel, channelId } = createNormalChannelPair();
+			const actions = openerChannel.handleStartBatch({
+				channelId,
+				batchSize: 2,
+				messageType: 132
+			});
+			expect(actions.some((a) => a.type === ChannelActionType.ERROR)).to.equal(
+				true
+			);
+		});
+	});
 
 	describe('LightningNode splice API', function () {
 		// Note: LightningNode splice tests require a more complex setup.

@@ -58,6 +58,10 @@ export enum MessageType {
 	SPLICE = 80,
 	SPLICE_ACK = 81,
 	SPLICE_LOCKED = 77,
+	// Announces that the next `batch_size` commitment_signed messages (one per
+	// active funding output while a splice is pending) form ONE logical update
+	// answered by a single revoke_and_ack.
+	START_BATCH = 127,
 
 	// BOLT 2: Stfu (quiescence)
 	STFU = 2,
