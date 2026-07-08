@@ -545,3 +545,115 @@ describe('Daemon: updateChannelFee route', () => {
 		}
 	});
 });
+
+// ─────────────── On-chain routes (transactions, utxos, fee estimates) ───────────────
+
+describe('Daemon: on-chain routes', () => {
+	let tmpDir: string;
+	const origHome = process.env.HOME;
+
+	beforeEach(function () {
+		if (skipAll) this.skip();
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-onchain-'));
+		process.env.HOME = tmpDir;
+	});
+
+	afterEach(() => {
+		if (!skipAll) {
+			process.env.HOME = origHome;
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it('GET /transactions returns array and validates limit', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/transactions');
+			expect(resp.status).to.equal(200);
+			expect(resp.body.ok).to.be.true;
+			expect(resp.body.result).to.be.an('array');
+
+			const limited = await httpGet(addr.port, '/transactions?limit=0');
+			expect(limited.body.ok).to.be.true;
+			expect(limited.body.result).to.deep.equal([]);
+
+			const bad = await httpGet(addr.port, '/transactions?limit=abc');
+			expect(bad.body.ok).to.be.false;
+			expect((bad.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+
+			const negative = await httpGet(addr.port, '/transactions?limit=-1');
+			expect(negative.body.ok).to.be.false;
+			expect((negative.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /utxos returns array', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/utxos');
+			expect(resp.status).to.equal(200);
+			expect(resp.body.ok).to.be.true;
+			expect(resp.body.result).to.be.an('array');
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /fees/estimates route exists', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/fees/estimates');
+			if (resp.body.ok) {
+				const fees = resp.body.result as Record<string, unknown>;
+				expect(fees.fast).to.be.a('number');
+				expect(fees.normal).to.be.a('number');
+				expect(fees.slow).to.be.a('number');
+				expect(fees.minimum).to.be.a('number');
+			} else {
+				// Regtest electrum may have no fee estimation data; the route
+				// must still resolve (anything but a routing 404).
+				expect((resp.body.error as { code: string }).code).to.not.equal(
+					'NOT_FOUND'
+				);
+			}
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+});

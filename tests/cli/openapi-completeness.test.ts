@@ -81,7 +81,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'/payment/metadata',
 		'/can-send',
 		'/can-receive',
-		'/offer/pay'
+		'/offer/pay',
+		'/transactions',
+		'/utxos',
+		'/fees/estimates'
 	];
 
 	for (const route of expectedRoutes) {
@@ -108,7 +111,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'TxInfo',
 		'SpliceResult',
 		'BootstrapPeerInfo',
-		'TrustedPeerInfo'
+		'TrustedPeerInfo',
+		'OnchainTxInfo',
+		'UtxoInfo',
+		'OnchainFees'
 	];
 
 	for (const schema of expectedSchemas) {

@@ -823,6 +823,57 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/fees/estimates': {
+				get: {
+					summary: 'Get current on-chain fee rate estimates in sats/vbyte',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Fee estimates',
+							content: jsonContent({ $ref: '#/components/schemas/OnchainFees' })
+						}
+					}
+				}
+			},
+			'/transactions': {
+				get: {
+					summary: 'List on-chain wallet transactions, newest first',
+					tags: ['Node'],
+					parameters: [
+						{
+							name: 'limit',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Maximum number of transactions to return'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'On-chain transactions',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/OnchainTxInfo' }
+							})
+						},
+						'400': { description: 'Invalid limit parameter' }
+					}
+				}
+			},
+			'/utxos': {
+				get: {
+					summary: 'List on-chain wallet UTXOs',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'UTXOs',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/UtxoInfo' }
+							})
+						}
+					}
+				}
+			},
 			'/channel/suggestions': {
 				get: {
 					summary:
@@ -1402,6 +1453,43 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						lightning: { type: 'integer' },
 						total: { type: 'integer' },
 						unsettledSats: { type: 'integer' }
+					}
+				},
+				OnchainTxInfo: {
+					type: 'object',
+					properties: {
+						txid: { type: 'string' },
+						type: { type: 'string', enum: ['sent', 'received'] },
+						valueSats: { type: 'integer' },
+						feeSats: { type: 'integer' },
+						satsPerVbyte: { type: 'number' },
+						address: { type: 'string' },
+						height: { type: 'integer' },
+						confirmed: { type: 'boolean' },
+						timestamp: { type: 'integer' },
+						confirmTimestamp: { type: 'integer' }
+					}
+				},
+				UtxoInfo: {
+					type: 'object',
+					properties: {
+						txid: { type: 'string' },
+						vout: { type: 'integer' },
+						address: { type: 'string' },
+						valueSats: { type: 'integer' },
+						height: { type: 'integer' }
+					}
+				},
+				OnchainFees: {
+					type: 'object',
+					description:
+						'Fee rate estimates in sats/vbyte by confirmation target',
+					properties: {
+						fast: { type: 'number' },
+						normal: { type: 'number' },
+						slow: { type: 'number' },
+						minimum: { type: 'number' },
+						timestamp: { type: 'integer' }
 					}
 				},
 				HealthInfo: {

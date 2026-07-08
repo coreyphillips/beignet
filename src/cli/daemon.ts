@@ -213,6 +213,22 @@ export async function startDaemon(
 			if (!snapshot) return failure('NO_DATA', 'No fee samples recorded yet');
 			return success(snapshot);
 		},
+		'GET /fees/estimates': async () => success(await node.getFeeEstimates()),
+		'GET /transactions': (_body, query) => {
+			const limitParam = query.get('limit');
+			let txs = node.listOnchainTransactions();
+			if (limitParam !== null) {
+				const limit = Number(limitParam);
+				if (!Number.isInteger(limit) || limit < 0)
+					return failure(
+						'INVALID_PARAMS',
+						'limit must be a non-negative integer'
+					);
+				txs = txs.slice(0, limit);
+			}
+			return success(txs);
+		},
+		'GET /utxos': () => success(node.listUtxos()),
 		'GET /channel/suggestions': (_body, query) => {
 			const count = query.get('count') ? Number(query.get('count')) : undefined;
 			return success(node.getChannelSuggestions(count));
