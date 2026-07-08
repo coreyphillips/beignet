@@ -237,6 +237,8 @@ const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
 
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
+	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
+	private acceptableChainHashes: Buffer[];
 	private nodeId: string;
 	private network: Network;
 	private channelManager: ChannelManager;
@@ -349,6 +351,7 @@ export class LightningNode extends EventEmitter {
 		this.nodePrivkey = config.nodePrivateKey;
 		this.nodeId = getPublicKey(config.nodePrivateKey).toString('hex');
 		this.network = config.network || Network.REGTEST;
+		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
 
 		this.resourceConfig = {
@@ -3034,12 +3037,19 @@ export class LightningNode extends EventEmitter {
 			// not our own forwarding defaults. The peer is the forwarding node for
 			// this hop, so the hint must match what it really requires — otherwise it
 			// rejects the HTLC (e.g. incorrect_cltv_expiry / fee insufficient). For a
-			// public channel the peer's channel_update is in our graph; look it up and
-			// use it. Fall back to our defaults only when it isn't available (e.g. a
-			// private channel that was never announced).
+			// public channel the peer's channel_update is in our graph; for a
+			// PRIVATE channel the graph never stores it, so use the policy the peer
+			// sent us directly on this channel (state.remoteForwardingPolicy). Our
+			// own defaults are the last resort only.
 			let feeBaseMsat = this.forwardingFeeBaseMsat;
 			let feeProportionalMillionths = this.forwardingFeePropMillionths;
 			let cltvExpiryDelta = this.forwardingCltvDelta;
+			const directPolicy = state.remoteForwardingPolicy;
+			if (directPolicy) {
+				feeBaseMsat = directPolicy.feeBaseMsat;
+				feeProportionalMillionths = directPolicy.feeProportionalMillionths;
+				cltvExpiryDelta = directPolicy.cltvExpiryDelta;
+			}
 			if (state.shortChannelId) {
 				const graphChannel = this.graph.getChannel(state.shortChannelId);
 				const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
@@ -3047,7 +3057,11 @@ export class LightningNode extends EventEmitter {
 					: graphChannel?.nodeId2.equals(peerPubkey)
 					? graphChannel.update2
 					: undefined;
-				if (peerUpdate) {
+				// Prefer whichever the peer signed most recently.
+				if (
+					peerUpdate &&
+					(!directPolicy || peerUpdate.timestamp >= directPolicy.timestamp)
+				) {
 					feeBaseMsat = peerUpdate.feeBaseMsat;
 					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
 					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
@@ -3136,10 +3150,20 @@ export class LightningNode extends EventEmitter {
 			if (!scid) continue;
 			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
 
-			// Peer's actual policy for the peer→us hop (same logic as routing hints).
+			// Peer's actual policy for the peer→us hop (same logic as routing
+			// hints): graph update for public channels, the channel_update the
+			// peer sent us directly for private ones, our defaults last.
 			let feeBaseMsat = this.forwardingFeeBaseMsat;
 			let feeProportionalMillionths = this.forwardingFeePropMillionths;
 			let cltvExpiryDelta = this.forwardingCltvDelta;
+			let htlcMinimumMsat = 0n;
+			const directPolicy = state.remoteForwardingPolicy;
+			if (directPolicy) {
+				feeBaseMsat = directPolicy.feeBaseMsat;
+				feeProportionalMillionths = directPolicy.feeProportionalMillionths;
+				cltvExpiryDelta = directPolicy.cltvExpiryDelta;
+				htlcMinimumMsat = directPolicy.htlcMinimumMsat;
+			}
 			if (state.shortChannelId) {
 				const graphChannel = this.graph.getChannel(state.shortChannelId);
 				const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
@@ -3147,14 +3171,21 @@ export class LightningNode extends EventEmitter {
 					: graphChannel?.nodeId2.equals(peerPubkey)
 					? graphChannel.update2
 					: undefined;
-				if (peerUpdate) {
+				if (
+					peerUpdate &&
+					(!directPolicy || peerUpdate.timestamp >= directPolicy.timestamp)
+				) {
 					feeBaseMsat = peerUpdate.feeBaseMsat;
 					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
 					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
+					htlcMinimumMsat = peerUpdate.htlcMinimumMsat;
 				}
 			}
 
-			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat: 0n };
+			// Advertise the peer's real htlc_minimum_msat in the blinded hop's
+			// payment_constraints so the payer never sends a sub-minimum HTLC the
+			// peer would reject (the same masked-failure class as the fee gap).
+			const paymentConstraints = { maxCltvExpiry, htlcMinimumMsat };
 			// Peer hop: forward to us over this channel. For async receive, mark
 			// it hold_htlc so the LSP parks the HTLC until we return.
 			const peerHop: IBlindedHopData = {
@@ -3168,8 +3199,11 @@ export class LightningNode extends EventEmitter {
 				paymentConstraints,
 				...(asyncHold ? { holdHtlc: true } : {})
 			};
-			// Final hop (us): recipient, no onward forwarding.
-			const finalHop: IBlindedHopData = { paymentConstraints };
+			// Final hop (us): recipient, no onward forwarding. Our own minimum is
+			// 0; do not inherit the peer's htlc_minimum constraint here.
+			const finalHop: IBlindedHopData = {
+				paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n }
+			};
 
 			let nodeIds = [peerPubkey, ourNodeId];
 			let hopDataList: IBlindedHopData[] = [peerHop, finalHop];
@@ -3386,6 +3420,12 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return; // malformed gossip (e.g. zero timestamp) — drop silently
 		}
+		// Peer policy for OUR channels: private channels never get an
+		// announcement, so their updates can never live in the graph. Retain a
+		// signature-verified direct update on the channel state instead — the
+		// only real source of the peer's fees/CLTV for invoice route hints and
+		// blinded-path payment_relay.
+		this.maybeAdoptPeerChannelPolicy(msg, payload);
 		const channel = this.graph.getChannel(msg.shortChannelId);
 		if (!channel) {
 			return; // no prior announcement
@@ -3404,6 +3444,70 @@ export class LightningNode extends EventEmitter {
 						),
 					'saveGossipChannel'
 				);
+		}
+	}
+
+	/**
+	 * If a channel_update targets one of OUR channels (by real SCID or either
+	 * side's alias) and is validly signed by that channel's PEER, retain the
+	 * policy on the channel state. This is how the peer's real forwarding
+	 * policy for PRIVATE channels reaches invoice route hints and blinded-path
+	 * payment_relay; the graph only stores updates for announced channels.
+	 */
+	private maybeAdoptPeerChannelPolicy(
+		msg: IChannelUpdateMessage,
+		payload: Buffer
+	): void {
+		// A channel_update for another chain can never describe one of our
+		// channels; drop it before touching channel state.
+		if (
+			this.acceptableChainHashes.length > 0 &&
+			!this.acceptableChainHashes.some((h) => h.equals(msg.chainHash))
+		) {
+			return;
+		}
+		const ourNodeId = getPublicKey(this.nodePrivkey);
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const scids = [
+				state.shortChannelId,
+				state.scidAlias,
+				state.remoteScidAlias
+			].filter((s): s is Buffer => s !== null);
+			if (!scids.some((s) => s.equals(msg.shortChannelId))) continue;
+
+			// A non-matching candidate must NOT end the scan: remoteScidAlias is a
+			// peer-chosen value, so a malicious peer could otherwise alias-collide
+			// with the real SCID of an honest peer's channel and (by sorting
+			// earlier) permanently shadow its policy. Skip to the next channel.
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			const peerHex = this.channelManager.getPeerForChannel(channelId);
+			if (!peerHex) continue;
+			const peerNodeId = Buffer.from(peerHex, 'hex');
+
+			// The update must be authored by the PEER (direction bit selects the
+			// lexicographically ordered node id) and carry its valid signature.
+			const [nodeId1, nodeId2] =
+				Buffer.compare(ourNodeId, peerNodeId) < 0
+					? [ourNodeId, peerNodeId]
+					: [peerNodeId, ourNodeId];
+			const signer = (msg.channelFlags & 1) === 0 ? nodeId1 : nodeId2;
+			if (!signer.equals(peerNodeId)) continue; // our own update, or wrong channel
+			if (!verifyChannelUpdate(msg, payload, nodeId1, nodeId2)) continue;
+
+			const adopted = channel.adoptRemoteForwardingPolicy({
+				feeBaseMsat: msg.feeBaseMsat,
+				feeProportionalMillionths: msg.feeProportionalMillionths,
+				cltvExpiryDelta: msg.cltvExpiryDelta,
+				htlcMinimumMsat: msg.htlcMinimumMsat,
+				htlcMaximumMsat: msg.htlcMaximumMsat ?? null,
+				timestamp: msg.timestamp
+			});
+			if (adopted) {
+				this.persistChannel(channelId);
+			}
+			return;
 		}
 	}
 

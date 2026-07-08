@@ -59,6 +59,21 @@ export interface ISpliceInFlight {
 	confirmed: boolean;
 }
 
+/**
+ * The peer's forwarding policy for the peer-to-us direction of a channel,
+ * from a signature-verified channel_update the peer sent us directly.
+ * Primarily for PRIVATE channels, whose updates never enter the public graph.
+ */
+export interface IRemoteForwardingPolicy {
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	cltvExpiryDelta: number;
+	htlcMinimumMsat: bigint;
+	htlcMaximumMsat: bigint | null;
+	/** channel_update timestamp: only newer updates replace the stored policy. */
+	timestamp: number;
+}
+
 export interface IChannelState {
 	/** Identity */
 	channelId: Buffer | null;
@@ -255,6 +270,16 @@ export interface IChannelState {
 	scidAlias: Buffer | null;
 	/** Remote's SCID alias (from their channel_ready TLV) */
 	remoteScidAlias: Buffer | null;
+	/**
+	 * The peer's forwarding policy for the peer-to-us direction of THIS
+	 * channel, learned from a signature-verified channel_update the peer sent
+	 * us directly. For PRIVATE channels this is the only source of the peer's
+	 * real fees/CLTV: the graph drops updates without a prior announcement, so
+	 * BOLT 11 route hints and blinded-path payment_relay would otherwise
+	 * advertise OUR defaults as the peer's policy and payments would fail with
+	 * fee_insufficient / incorrect_cltv_expiry whenever they differ.
+	 */
+	remoteForwardingPolicy?: IRemoteForwardingPolicy | null;
 
 	/** Zero-conf: channel is enabled before funding confirms */
 	zeroConfEnabled: boolean;

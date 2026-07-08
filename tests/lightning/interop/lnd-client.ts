@@ -329,6 +329,31 @@ export class LndRestClient {
 		return this.request('GET', '/v1/channels/closed');
 	}
 
+	/**
+	 * Update the forwarding policy of one channel. Side effect used by tests:
+	 * LND signs and sends a FRESH channel_update to the channel peer (also for
+	 * private channels, directly over the connection).
+	 */
+	async updateChannelPolicy(
+		fundingTxid: string,
+		outputIndex: number,
+		policy: {
+			baseFeeMsat: string;
+			feeRatePpm: number;
+			timeLockDelta: number;
+		}
+	): Promise<unknown> {
+		return this.request('POST', '/v1/chanpolicy', {
+			chan_point: {
+				funding_txid_str: fundingTxid,
+				output_index: outputIndex
+			},
+			base_fee_msat: policy.baseFeeMsat,
+			fee_rate_ppm: policy.feeRatePpm,
+			time_lock_delta: policy.timeLockDelta
+		});
+	}
+
 	// ── Invoices ──
 
 	async addInvoice(valueSat: number, memo?: string): Promise<ILndInvoice> {

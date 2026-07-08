@@ -428,12 +428,13 @@ describe('Commitment Builder', function () {
 			expect(valid).to.be.true;
 		});
 
-		it('retains a fractional-msat HTLC remainder with the offerer + stays cross-party consistent (BOLT 3)', function () {
-			// (a) Remainder retained: a clean 50_000_000-msat HTLC and a fractional
-			// 50_000_999-msat HTLC (identical 50_000-sat output) must yield the SAME
-			// offerer to_local — the sub-satoshi remainder stays with the offerer, it
-			// is NOT dropped to fee. (Matches LND; without this beignet's commitment
-			// diverges by 1 sat and the signature fails to verify against LND.)
+		it('floors a fractional-msat HTLC offerer balance to whole sats + stays cross-party consistent (BOLT 3)', function () {
+			// (a) Pure floor: every output value is the whole-satoshi floor of its
+			// msat amount; the sub-satoshi remainder of a fractional HTLC is lost
+			// to fee, NOT credited back to the offerer. Verified live against LND
+			// 0.20: for an offerer at 349,998,950 msat post-deduction LND builds
+			// to_remote 349,998 (a prior beignet rule credited the remainder and
+			// diverged by 1 sat, failing commit_sig for any fractional HTLC).
 			const offererToLocal = (amountMsat: bigint): number => {
 				const { openerState, openerCommitSeed } = createReadyState();
 				openerState.localBalanceMsat = 900_000_000n;
@@ -452,7 +453,11 @@ describe('Commitment Builder', function () {
 				const built = buildLocalCommitment(openerState, point);
 				return built.result.tx.outs[built.result.outputMap.toLocal!].value;
 			};
-			expect(offererToLocal(50_000_999n)).to.equal(offererToLocal(50_000_000n));
+			// 900,000,000 - 50,000,999 = 849,999,001 msat -> floor 849,999 sat:
+			// one LESS than the clean 850,000 (the 999 msat goes to fee).
+			expect(offererToLocal(50_000_999n)).to.equal(
+				offererToLocal(50_000_000n) - 1
+			);
 
 			// (b) Cross-party consistency: the opener signs the acceptor's commitment
 			// for a fractional-msat HTLC and the acceptor verifies. This regressed

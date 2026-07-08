@@ -72,6 +72,7 @@ import {
 } from './types';
 import {
 	IChannelState,
+	IRemoteForwardingPolicy,
 	ISpliceInFlight,
 	createOpenerState,
 	createAcceptorState
@@ -5031,6 +5032,20 @@ export class Channel {
 		// as the peer responds.
 		this._computeSpliceContributions();
 		return this._driveSplice();
+	}
+
+	/**
+	 * Adopt the peer's forwarding policy for the peer-to-us direction, learned
+	 * from a channel_update the peer sent us directly (the node verifies the
+	 * update signature against the peer's node id BEFORE calling this). Only a
+	 * strictly newer timestamp replaces a stored policy. Returns true when the
+	 * policy was adopted (caller persists the channel).
+	 */
+	adoptRemoteForwardingPolicy(policy: IRemoteForwardingPolicy): boolean {
+		const existing = this._state.remoteForwardingPolicy;
+		if (existing && existing.timestamp >= policy.timestamp) return false;
+		this._state.remoteForwardingPolicy = policy;
+		return true;
 	}
 
 	/**
