@@ -774,6 +774,24 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/restore/scb': {
+				post: {
+					summary:
+						'Restore channels from a static channel backup (on-chain recovery only: the peer force-closes and our balance is swept from its commitment)',
+					tags: ['Node'],
+					requestBody: bodyContent({ encoded: 'string?', path: 'string?' }),
+					responses: {
+						'200': {
+							description:
+								'Channel ids now recovering, entries skipped with reasons, and total channel count in the backup'
+						},
+						'400': {
+							description:
+								'Invalid params (need exactly one of encoded/path), wrong seed, or wrong network'
+						}
+					}
+				}
+			},
 			'/send': {
 				post: {
 					summary: 'Send on-chain Bitcoin',

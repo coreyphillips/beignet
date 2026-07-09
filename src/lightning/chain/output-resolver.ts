@@ -172,7 +172,30 @@ export function classifyCommitmentTx(
 	tx: bitcoin.Transaction,
 	state: IChannelState
 ): IClassifiedCommitment {
+	// Cooperative close needs no key material to identify (BOLT 3 commitments
+	// stamp the obscured commitment number into locktime/sequence with the
+	// 0x20/0x80 type bits, so a commitment's sequence is never 0xffffffff).
+	// Checked before the key-material guard so a recovery state without remote
+	// basepoints still recognizes a mutual close.
+	if (tx.locktime === 0 && tx.ins[0].sequence === 0xffffffff) {
+		return { type: CommitmentType.COOPERATIVE_CLOSE, commitmentNumber: 0n };
+	}
+
 	if (!state.remoteBasepoints || !state.fundingTxid) {
+		// Static-channel-backup recovery: the reconstructed state has no remote
+		// basepoints, so the obscured commitment number cannot be extracted. With
+		// dataLossDetected set we can never have broadcast a commitment ourselves
+		// (Channel.forceClose refuses and scanStuckChannels skips), so any
+		// non-cooperative spend of the funding output is necessarily the peer's
+		// commitment: treat it as THEIR_FUTURE_COMMITMENT and resolve only our
+		// to_remote, which derives from our STATIC payment basepoint and needs no
+		// peer key material.
+		if (state.dataLossDetected) {
+			return {
+				type: CommitmentType.THEIR_FUTURE_COMMITMENT,
+				commitmentNumber: 0n
+			};
+		}
 		return { type: CommitmentType.UNKNOWN, commitmentNumber: 0n };
 	}
 
@@ -189,11 +212,6 @@ export function classifyCommitmentTx(
 		openPaymentBasepoint,
 		acceptPaymentBasepoint
 	);
-
-	// Check if this is a cooperative close (version 2, locktime 0, no witness programs in outputs)
-	if (tx.locktime === 0 && tx.ins[0].sequence === 0xffffffff) {
-		return { type: CommitmentType.COOPERATIVE_CLOSE, commitmentNumber: 0n };
-	}
 
 	const matchesLocal = commitmentNumber === state.localCommitmentNumber;
 	const matchesRemote = commitmentNumber === state.remoteCommitmentNumber;
@@ -383,7 +401,13 @@ export function classifyOutputs(
 	commitmentType: CommitmentType,
 	commitmentNumber: bigint
 ): ITrackedOutput[] {
-	if (!state.remoteBasepoints) {
+	// THEIR_FUTURE_COMMITMENT (data-loss / SCB recovery) matches only our
+	// to_remote output, which derives from our STATIC payment basepoint - the
+	// one classification that works without the peer's basepoints.
+	if (
+		!state.remoteBasepoints &&
+		commitmentType !== CommitmentType.THEIR_FUTURE_COMMITMENT
+	) {
 		return [];
 	}
 
@@ -705,8 +729,9 @@ function classifyTheirFutureCommitmentOutputs(
 	state: IChannelState,
 	txid: string
 ): ITrackedOutput[] {
-	if (!state.remoteBasepoints) return [];
-
+	// Intentionally NO remoteBasepoints guard: every to_remote variant below
+	// derives from our STATIC payment basepoint only, so this must also work
+	// for SCB-recovery states where the peer's basepoints are unknown.
 	const outputs: ITrackedOutput[] = [];
 	const ourPaymentPubkey = state.localBasepoints.paymentBasepoint;
 
@@ -1798,7 +1823,16 @@ export function resolveTheirCurrentCommitmentOutputs(
 	htlcBasepointSecret?: Buffer,
 	remotePerCommitmentPoint?: Buffer
 ): IResolvedOutput[] {
-	if (!state.remoteBasepoints) return [];
+	if (!state.remoteBasepoints) {
+		// SCB recovery (THEIR_FUTURE_COMMITMENT on a reconstructed state): only
+		// our to_remote is resolvable - it pays our STATIC payment basepoint and
+		// needs no peer key material. Every other output type requires the
+		// peer's basepoints, so drop them rather than refusing the sweep.
+		trackedOutputs = trackedOutputs.filter(
+			(o) => o.outputType === OutputType.TO_REMOTE
+		);
+		if (trackedOutputs.length === 0) return [];
+	}
 
 	if (isTaprootChannel(state.channelType)) {
 		return resolveTheirCurrentTaprootCommitmentOutputs(

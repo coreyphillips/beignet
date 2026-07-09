@@ -31,7 +31,11 @@ import { IPaymentInfo } from '../lightning/node/types';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
-import { encodeScb, IStaticChannelBackup } from '../lightning/backup/scb';
+import {
+	encodeScb,
+	decodeScb,
+	IStaticChannelBackup
+} from '../lightning/backup/scb';
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
@@ -3390,6 +3394,39 @@ export class BeignetNode extends EventEmitter {
 		fs.writeFileSync(tmpPath, encoded);
 		fs.renameSync(tmpPath, scbPath);
 		return { encoded, channelCount: data.channels.length, path: scbPath };
+	}
+
+	/**
+	 * Restore channels from an encoded static channel backup blob.
+	 *
+	 * Decrypts the blob with this wallet's seed (the SCB is only decodable with
+	 * the mnemonic that created it), refuses a backup taken on a different
+	 * network, and hands the entries to the library recovery flow: each unknown
+	 * channel is reconstructed in a broadcast-banned ERRORED state, its funding
+	 * outpoint is watched, and funds arrive on-chain when the peer force-closes.
+	 */
+	async restoreFromScb(encoded: string): Promise<{
+		recovering: string[];
+		skipped: Array<{ channelId: string; reason: string }>;
+		channelCount: number;
+	}> {
+		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const backup = decodeScb(encoded.trim(), seed);
+		const expectedNetwork = this.toLnNetwork(this.networkName);
+		if (backup.network !== expectedNetwork) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`SCB network "${backup.network}" does not match this node's network "${expectedNetwork}"`
+			);
+		}
+		const { recovering, skipped } =
+			await this.node.recoverFromStaticChannelBackup(backup.channels);
+		this.log('info', 'SCB restore processed', {
+			channelCount: backup.channels.length,
+			recovering: recovering.length,
+			skipped: skipped.length
+		});
+		return { recovering, skipped, channelCount: backup.channels.length };
 	}
 
 	/**

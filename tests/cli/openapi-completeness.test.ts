@@ -61,6 +61,7 @@ describe('OpenAPI Spec Completeness', () => {
 		'/route/probe',
 		'/backup',
 		'/backup/scb',
+		'/restore/scb',
 		'/send',
 		'/stats',
 		'/events',

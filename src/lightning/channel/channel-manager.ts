@@ -1148,6 +1148,33 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Resolve the LOCAL key material for a channel being reconstructed from a
+	 * static channel backup: the per-channel deriver keys for a non-null
+	 * channelKeyIndex, or the node-level basepoints for legacy channels. Also
+	 * returns the local channel config the manager would use for a new channel.
+	 * Never advances the next-channel index (restoreChannel handles that).
+	 */
+	getRecoveryChannelMaterial(channelKeyIndex: number | null): {
+		basepoints: IChannelBasepoints;
+		perCommitmentSeed: Buffer;
+		localConfig: IChannelConfig;
+	} {
+		if (this.config.channelKeyDeriver && channelKeyIndex != null) {
+			const keys = this.config.channelKeyDeriver(channelKeyIndex);
+			return {
+				basepoints: keys.basepoints,
+				perCommitmentSeed: keys.perCommitmentSeed,
+				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG
+			};
+		}
+		return {
+			basepoints: this.config.localBasepoints,
+			perCommitmentSeed: this.config.localPerCommitmentSeed,
+			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG
+		};
+	}
+
+	/**
 	 * Update the sweep destination on every existing chain monitor. Used when a
 	 * wallet-owned sweep address becomes available after startup, so pending
 	 * force-close recoveries redirect to the wallet instead of the funding key.

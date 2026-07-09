@@ -166,6 +166,11 @@ import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import { isTaprootChannel, isAnchorChannel } from '../channel/types';
+import {
+	createOpenerState,
+	createAcceptorState,
+	IChannelState
+} from '../channel/channel-state';
 import { IScbChannelEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner } from '../keys/signer';
@@ -1545,6 +1550,165 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Recover channels from static-channel-backup entries.
+	 *
+	 * For each entry not already known to the channel manager this reconstructs
+	 * a minimal recovery state (correct local keys via channelKeyIndex, NO
+	 * remote basepoints, commitment numbers zeroed), marks it ERRORED with
+	 * dataLossDetected so nothing local can ever be broadcast, registers and
+	 * persists it, arms the funding-outpoint watch, and (best effort) contacts
+	 * the peer. Recovery is passive from there: reconnecting prompts the honest
+	 * peer to force-close (our reestablish state is provably stale), the funding
+	 * spend is classified THEIR_FUTURE_COMMITMENT, and the chain monitor sweeps
+	 * ONLY our to_remote output to the sweep destination.
+	 */
+	async recoverFromStaticChannelBackup(entries: IScbChannelEntry[]): Promise<{
+		recovering: string[];
+		skipped: Array<{ channelId: string; reason: string }>;
+	}> {
+		const recovering: string[] = [];
+		const skipped: Array<{ channelId: string; reason: string }> = [];
+
+		for (const entry of entries) {
+			const channelId = Buffer.from(entry.channelId, 'hex');
+			if (
+				channelId.length !== 32 ||
+				channelId.toString('hex') !== entry.channelId.toLowerCase()
+			) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: 'invalid channelId (expected 32-byte hex)'
+				});
+				continue;
+			}
+			if (this.channelManager.getChannel(channelId)) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: 'channel already exists'
+				});
+				continue;
+			}
+
+			// Local key material: per-channel keys for the recorded index, or the
+			// node-level basepoints for legacy (null-index) channels. Using the
+			// SAME derivation as the original open is what makes the peer's DLP
+			// proof verifiable and the to_remote output ours to claim.
+			const material = this.channelManager.getRecoveryChannelMaterial(
+				entry.channelKeyIndex
+			);
+			const stateParams = {
+				temporaryChannelId: Buffer.from(channelId),
+				fundingSatoshis: BigInt(entry.fundingSatoshis),
+				pushMsat: 0n,
+				localConfig: material.localConfig,
+				localBasepoints: material.basepoints,
+				localPerCommitmentSeed: material.perCommitmentSeed
+			};
+			const state =
+				entry.role === 'ACCEPTOR'
+					? createAcceptorState({
+							...stateParams,
+							// Placeholder only - nulled right below. The peer's basepoints
+							// are not in the backup; classification and to_remote resolution
+							// intentionally work without them (see classifyCommitmentTx).
+							remoteBasepoints: material.basepoints,
+							remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+					  })
+					: createOpenerState(stateParams);
+			state.remoteBasepoints = null;
+			state.channelId = channelId;
+			state.fundingTxid = Buffer.from(entry.fundingTxid, 'hex');
+			state.fundingOutputIndex = entry.fundingOutputIndex;
+			state.channelType = entry.channelType
+				? Buffer.from(entry.channelType, 'hex')
+				: null;
+			state.localCommitmentNumber = 0n;
+			state.remoteCommitmentNumber = 0n;
+			// Balances are unknown after data loss; the sweep takes its amount from
+			// the on-chain to_remote output, so never report a fabricated balance.
+			state.localBalanceMsat = 0n;
+			state.remoteBalanceMsat = 0n;
+			state.announceChannel = false;
+			// We KNOW we have no usable commitment state: refuse every local
+			// broadcast (forceClose refuses, scanStuckChannels skips) and wait for
+			// the peer's force-close on-chain.
+			state.state = ChannelState.ERRORED;
+			state.dataLossDetected = true;
+
+			const channel = new Channel(state);
+			channel.channelKeyIndex = entry.channelKeyIndex;
+			this.channelManager.restoreChannel(
+				channel,
+				entry.peerNodeId,
+				entry.channelKeyIndex
+			);
+			this.persistChannel(channelId);
+			recovering.push(entry.channelId);
+
+			this.emitStructuredLog('channel', 'recovery_started', {
+				channelId: entry.channelId,
+				peerNodeId: entry.peerNodeId,
+				fundingTxid: entry.fundingTxid,
+				fundingOutputIndex: entry.fundingOutputIndex,
+				channelKeyIndex: entry.channelKeyIndex
+			});
+
+			// Watch the funding outpoint so the peer's force-close is detected and
+			// swept. A watch failure is loud but does not abort the recovery of
+			// the remaining channels; restoreChainWatches re-arms it on restart.
+			if (this.chainWatcher) {
+				try {
+					await this.watchRecoveredFundingOutput(channelId, state);
+				} catch (err) {
+					this.emit('node:error', {
+						code: 'RECOVERY_WATCH_FAILED',
+						channelId,
+						message: `Failed to watch recovered funding output: ${
+							(err as Error).message
+						}`,
+						timestamp: Date.now()
+					} as ILightningError);
+				}
+			}
+
+			// Best-effort peer contact: reconnecting lets the peer's reestablish
+			// hit our provably-stale state, prompting it to error and force-close.
+			// Failures are non-fatal - recovery only needs the funding spend to
+			// appear on chain eventually.
+			if (this.peerManager && entry.peerAddresses.length > 0) {
+				void this.contactRecoveryPeer(entry.peerNodeId, entry.peerAddresses);
+			}
+		}
+
+		return { recovering, skipped };
+	}
+
+	/** Try each known address for a recovery peer until one connects. */
+	private async contactRecoveryPeer(
+		peerNodeId: string,
+		addresses: string[]
+	): Promise<void> {
+		for (const address of addresses) {
+			// 'host:port' with a possibly-bracketed IPv6 host: split on the LAST colon.
+			const sep = address.lastIndexOf(':');
+			if (sep <= 0) continue;
+			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
+			const port = parseInt(address.slice(sep + 1), 10);
+			if (!Number.isFinite(port) || port <= 0) continue;
+			try {
+				await this.connectPeer(peerNodeId, host, port);
+				return;
+			} catch {
+				// Try the next address; unreachable peers are expected here.
+			}
+		}
+		this.emitStructuredLog('peer', 'recovery_connect_failed', {
+			peerNodeId,
+			addresses
+		});
+	}
+
+	/**
 	 * Get a P2WPKH on-chain address derived from the funding public key.
 	 * Send sats here to fund channels.
 	 */
@@ -1969,8 +2133,31 @@ export class LightningNode extends EventEmitter {
 				// schedules the sweeps. Skipping here orphans the funds.
 			}
 
-			// Build the funding P2WSH script from the channel's pubkeys
-			if (!state.remoteBasepoints) continue;
+			// Build the funding P2WSH script from the channel's pubkeys. An
+			// SCB-recovered channel has NO remote basepoints (the backup does not
+			// carry the peer's funding pubkey), so the script cannot be rebuilt
+			// locally - fetch it from the chain instead so the funding spend is
+			// still detected after a restart.
+			if (!state.remoteBasepoints) {
+				if (state.dataLossDetected && state.fundingTxid) {
+					try {
+						await this.watchRecoveredFundingOutput(
+							state.channelId || state.temporaryChannelId,
+							state
+						);
+					} catch (err) {
+						this.emit('node:error', {
+							code: 'RECOVERY_WATCH_FAILED',
+							channelId: state.channelId || state.temporaryChannelId,
+							message: `Failed to watch recovered funding output: ${
+								(err as Error).message
+							}`,
+							timestamp: Date.now()
+						} as ILightningError);
+					}
+				}
+				continue;
+			}
 			const { p2wshOutput } = createFundingScript(
 				state.localBasepoints.fundingPubkey,
 				state.remoteBasepoints.fundingPubkey,
@@ -2021,6 +2208,42 @@ export class LightningNode extends EventEmitter {
 				p2wshOutput
 			);
 		}
+	}
+
+	/**
+	 * Arm the funding-outpoint watch for a channel reconstructed from a static
+	 * channel backup. The backup does not carry the peer's funding pubkey, so
+	 * the 2-of-2 funding scriptPubkey cannot be rebuilt locally the way
+	 * restoreChainWatches does for normal channels - fetch the funding tx and
+	 * take the output's script verbatim instead. Spend detection then flows
+	 * through the exact same watchFundingOutput path, so the peer's force-close
+	 * lazily creates a monitor and sweeps our to_remote.
+	 */
+	private async watchRecoveredFundingOutput(
+		channelId: Buffer,
+		state: IChannelState
+	): Promise<void> {
+		if (!this.chainWatcher || !this._chainBackend) {
+			throw new Error('Chain backend is not available');
+		}
+		if (!state.fundingTxid) {
+			throw new Error('Recovered channel has no funding txid');
+		}
+		const txidHex = Buffer.from(state.fundingTxid).reverse().toString('hex');
+		const rawTx = await this._chainBackend.getTransaction(txidHex);
+		const fundingTx = bitcoin.Transaction.fromBuffer(rawTx);
+		if (state.fundingOutputIndex >= fundingTx.outs.length) {
+			throw new Error(
+				`Funding output index ${state.fundingOutputIndex} out of range for tx ${txidHex}`
+			);
+		}
+		await this.chainWatcher.watchFundingOutput(
+			channelId,
+			txidHex,
+			state.fundingOutputIndex,
+			state.minimumDepth || 1,
+			Buffer.from(fundingTx.outs[state.fundingOutputIndex].script)
+		);
 	}
 
 	/**
