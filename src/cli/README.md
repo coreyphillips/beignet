@@ -102,6 +102,8 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `getInfo()` | `NodeInfo` | Node ID, network, balances, peer/channel counts |
 | `getMnemonic()` | `string` | The BIP39 mnemonic |
 | `getBalance()` | `BalanceInfo` | `{ onchain, lightning, total, unsettledSats }` in sats |
+| `signMessage(message)` | `{ signature, pubkey }` | Sign with the node key (LND-compatible: `Lightning Signed Message:` prefix, double-SHA256, compact recoverable ECDSA, zbase32). Verifiable with `lncli verifymessage` |
+| `verifyMessage(message, signature)` | `{ valid, pubkey, knownNode }` | Recover the signer pubkey from an LND-style signature; `knownNode` says whether it is in our graph. Compare `pubkey` to the expected signer |
 
 #### On-chain
 
@@ -159,6 +161,23 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `createInvoice(amountSats?, description?, expirySecs?, descriptionHash?)` | `InvoiceInfo` | Create BOLT 11 invoice. Use `descriptionHash` (hex Buffer) for hashed descriptions > 639 bytes — omit `description` when using hash. Returns `paymentSecret` for correlating incoming payments. |
 | `decodeInvoice(bolt11)` | `DecodedInvoice` | Decode any BOLT 11 invoice |
 | `listInvoices()` | `InvoiceInfo[]` | List all created invoices |
+| `createHoldInvoice({ paymentHash, amountMsat?, amountSats?, description?, expiry? })` | `InvoiceInfo` | Hold invoice for a caller-supplied `sha256(preimage)`: the preimage stays with the caller and the incoming HTLC parks instead of settling |
+| `settleHoldInvoice(preimage)` | `{ paymentHash }` | Validate `sha256(preimage)` and fulfill every parked HTLC (all MPP parts) |
+| `cancelHoldInvoice(paymentHash)` | `{ paymentHash, htlcsFailed }` | Fail parked HTLCs back (`incorrect_or_unknown_payment_details`) and close the invoice |
+| `listHoldInvoices()` | `HoldInvoiceInfo[]` | Hold invoices with state `OPEN\|ACCEPTED\|SETTLED\|CANCELLED` and parked totals |
+
+##### Hold invoices
+
+A hold (HODL) invoice decouples HTLC acceptance from settlement. The caller
+generates a preimage, keeps it, and hands `sha256(preimage)` to
+`createHoldInvoice`. When the payer pays, the HTLC is validated and **parked**:
+the payer sees the payment as in-flight (PENDING) while the recipient decides.
+`settleHoldInvoice(preimage)` completes it (the payer receives the preimage);
+`cancelHoldInvoice(paymentHash)` fails it back as if the invoice were unknown.
+Parked HTLCs are restart-safe (they re-park from storage) and are
+**auto-cancelled** by the CLTV sweeper 18 blocks before the HTLC expiry, so a
+forgotten hold can never force an on-chain timeout. Typical uses: escrow-style
+flows, just-in-time inventory checks, atomic swaps.
 
 #### Payments
 
@@ -1031,8 +1050,35 @@ beignet invoice pay-retry <bolt11> [--max-retries 5] [--backoff-ms 1000] [--max-
 beignet invoice list
 # {"ok":true,"result":[{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000,...}]}
 
+# Hold invoices: you keep the preimage; the payer's HTLC parks until you settle
+beignet invoice create-hold <sha256(preimage)> 1000 "escrow" --expiry 3600
+# {"ok":true,"result":{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000}}
+
+beignet invoice held
+# {"ok":true,"result":[{"paymentHash":"ab12...","state":"ACCEPTED","heldAmountMsat":"1000000","htlcCount":1,...}]}
+
+beignet invoice settle-hold <preimage>       # fulfills the parked HTLC(s)
+beignet invoice cancel-hold <paymentHash>    # fails them back to the payer
+
 beignet payment list
 beignet payment get <paymentHash>
+```
+
+### Messages & Gossip
+
+```bash
+beignet message sign "proof of node ownership"
+# {"ok":true,"result":{"signature":"d7y...104 zbase32 chars...","pubkey":"02ab..."}}
+
+beignet message verify "proof of node ownership" <signature>
+# {"ok":true,"result":{"valid":true,"pubkey":"02ab...","knownNode":true}}
+
+beignet gossip sync            # sync graph from all connected peers
+beignet gossip sync-rapid      # Rapid Gossip Sync snapshot (mainnet)
+beignet channel diagnostics <channelId>
+beignet address validate bc1q...
+beignet recover-fallback-funds --fee-rate 5
+beignet backup trigger
 ```
 
 ### BOLT 12 Offers
@@ -1200,6 +1246,10 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw }` | Splice-out funds |
 | POST | `/invoice/create` | `{ amountSats?, description? }` | Create invoice (omit amountSats for amount-less) |
+| POST | `/invoice/create-hold` | `{ paymentHash, amountMsat?, amountSats?, description?, expiry? }` | Create hold invoice for a caller-supplied payment hash (HTLCs park until settle/cancel) |
+| POST | `/invoice/settle-hold` | `{ preimage }` | Settle a parked hold invoice (fulfills all MPP parts) |
+| POST | `/invoice/cancel-hold` | `{ paymentHash }` | Cancel a hold invoice; fails parked HTLCs back |
+| GET | `/invoices/held` | -- | List hold invoices with state + parked totals |
 | POST | `/invoice/decode` | `{ bolt11 }` | Decode invoice |
 | POST | `/invoice/pay` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats?, metadata? }` | Pay invoice (`amountSats` for amount-less invoices, `metadata` for labels) |
 | POST | `/invoice/pay-safe` | `{ bolt11, timeoutMs?, maxFeeSats?, amountSats? }` | Pay invoice; resolves with `status: 'FAILED'` on failure instead of error. |
@@ -1217,6 +1267,14 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query` |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
+| POST | `/backup/trigger` | -- | Run the configured scheduled backup now (no-op when `backupPath` unset) |
+| POST | `/message/sign` | `{ message }` | Sign message with the node key (LND-compatible zbase32 signature) |
+| POST | `/message/verify` | `{ message, signature }` | Recover signer pubkey; `knownNode` = present in our graph |
+| POST | `/gossip/sync` | `{ pubkey? }` | Gossip sync from one peer or all connected peers |
+| POST | `/gossip/sync-rapid` | -- | Rapid Gossip Sync snapshot (mainnet only) |
+| GET | `/channel/diagnostics` | `?channelId=<hex>` | Routing-readiness diagnostics (SCID/announcement/peer issues) |
+| POST | `/address/validate` | `{ address }` | Validate a Bitcoin address for the active network |
+| POST | `/recover-fallback-funds` | `{ feeRatePerVbyte? }` | Sweep funding-key fallback UTXOs into the wallet |
 | POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
 | POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
 | POST | `/channel/update-policy` | `{ channelId?, all?, feeBaseMsat?, feeProportionalMillionths?, cltvExpiryDelta?, htlcMinimumMsat?, htlcMaximumMsat? }` | Set ROUTING fee policy per channel (or `all: true`); regenerates + re-broadcasts channel_update |

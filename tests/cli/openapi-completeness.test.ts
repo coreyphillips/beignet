@@ -101,7 +101,19 @@ describe('OpenAPI Spec Completeness', () => {
 		'/payment/send-to-route',
 		'/rebalance',
 		'/advisor/recommendations',
-		'/advisor/execute-rebalances'
+		'/advisor/execute-rebalances',
+		'/invoice/create-hold',
+		'/invoice/settle-hold',
+		'/invoice/cancel-hold',
+		'/invoices/held',
+		'/message/sign',
+		'/message/verify',
+		'/gossip/sync',
+		'/gossip/sync-rapid',
+		'/channel/diagnostics',
+		'/address/validate',
+		'/recover-fallback-funds',
+		'/backup/trigger'
 	];
 
 	for (const route of expectedRoutes) {
@@ -144,7 +156,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'RebalancePlan',
 		'AdvisorRecommendations',
 		'RebalanceResult',
-		'RebalanceExecutionSummary'
+		'RebalanceExecutionSummary',
+		'HoldInvoiceInfo'
 	];
 
 	for (const schema of expectedSchemas) {

@@ -139,6 +139,13 @@ async function main(): Promise<void> {
 		case 'fee-estimates':
 			return outputResult(await httpRequest('GET', '/fees/estimates'));
 		case 'address':
+			if (filteredArgs[1] === 'validate') {
+				return outputResult(
+					await httpRequest('POST', '/address/validate', {
+						address: filteredArgs[2]
+					})
+				);
+			}
 			return outputResult(await httpRequest('POST', '/address/new'));
 		case 'mnemonic':
 			return outputResult(await httpRequest('GET', '/mnemonic'));
@@ -161,6 +168,18 @@ async function main(): Promise<void> {
 			return handleForwards();
 		case 'graph':
 			return handleGraph();
+		case 'gossip':
+			return handleGossip();
+		case 'message':
+			return handleMessage();
+		case 'recover-fallback-funds':
+			return outputResult(
+				await httpRequest('POST', '/recover-fallback-funds', {
+					feeRatePerVbyte: parseFlag('--fee-rate')
+						? parseInt(parseFlag('--fee-rate')!, 10)
+						: undefined
+				})
+			);
 		case 'route':
 			return handleRoute();
 		case 'rebalance':
@@ -475,6 +494,15 @@ async function handleChannel(): Promise<void> {
 					satsPerChannel: parseInt(filteredArgs[3], 10)
 				})
 			);
+		case 'diagnostics':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/diagnostics?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
 		case 'update-policy': {
 			const target = filteredArgs[2];
 			if (!target) {
@@ -513,7 +541,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|diagnostics|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -530,6 +558,48 @@ async function handleInvoice(): Promise<void> {
 					description: filteredArgs[3] || ''
 				})
 			);
+		case 'create-hold': {
+			// The caller supplies sha256(preimage) and keeps the preimage until
+			// `invoice settle-hold`. The incoming HTLC parks instead of settling.
+			const paymentHash = filteredArgs[2];
+			if (!paymentHash) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet invoice create-hold <paymentHash> [amountSats] [description] [--expiry secs]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const expiryFlag = parseFlag('--expiry');
+			return outputResult(
+				await httpRequest('POST', '/invoice/create-hold', {
+					paymentHash,
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					description: filteredArgs[4] || '',
+					expiry: expiryFlag ? parseInt(expiryFlag, 10) : undefined
+				})
+			);
+		}
+		case 'settle-hold':
+			return outputResult(
+				await httpRequest('POST', '/invoice/settle-hold', {
+					preimage: filteredArgs[2]
+				})
+			);
+		case 'cancel-hold':
+			return outputResult(
+				await httpRequest('POST', '/invoice/cancel-hold', {
+					paymentHash: filteredArgs[2]
+				})
+			);
+		case 'held':
+			return outputResult(await httpRequest('GET', '/invoices/held'));
 		case 'decode':
 			return outputResult(
 				await httpRequest('POST', '/invoice/decode', {
@@ -564,7 +634,8 @@ async function handleInvoice(): Promise<void> {
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet invoice [create|decode|pay|pay-retry|list]'
+					message:
+						'Usage: beignet invoice [create|create-hold|settle-hold|cancel-hold|held|decode|pay|pay-retry|list]'
 				}
 			});
 			process.exitCode = 1;
@@ -899,8 +970,64 @@ async function handleOffer(): Promise<void> {
 	}
 }
 
+async function handleGossip(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'sync':
+			return outputResult(
+				await httpRequest('POST', '/gossip/sync', {
+					pubkey: filteredArgs[2] || undefined
+				})
+			);
+		case 'sync-rapid':
+			return outputResult(await httpRequest('POST', '/gossip/sync-rapid'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet gossip [sync [pubkey]|sync-rapid]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleMessage(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'sign':
+			return outputResult(
+				await httpRequest('POST', '/message/sign', {
+					message: filteredArgs[2]
+				})
+			);
+		case 'verify':
+			return outputResult(
+				await httpRequest('POST', '/message/verify', {
+					message: filteredArgs[2],
+					signature: filteredArgs[3]
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet message [sign <message>|verify <message> <signature>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 async function handleBackup(): Promise<void> {
 	const sub = filteredArgs[1];
+	if (sub === 'trigger') {
+		// On-demand encrypted database backup to the configured backupPath.
+		return outputResult(await httpRequest('POST', '/backup/trigger'));
+	}
 	if (sub === 'peer-retrieved') {
 		// `beignet backup peer-retrieved`: newest valid SCB a peer returned via
 		// BOLT 1 peer storage. Restore explicitly with `beignet restore scb`.
@@ -929,7 +1056,7 @@ async function handleBackup(): Promise<void> {
 			error: {
 				code: 'INVALID_PARAMS',
 				message:
-					'Usage: beignet backup <destPath> | beignet backup scb [destPath]'
+					'Usage: beignet backup <destPath> | beignet backup scb [destPath] | beignet backup trigger'
 			}
 		});
 		process.exitCode = 1;
@@ -1108,6 +1235,7 @@ Info:
   info                                   Node info
   balance                                On-chain + Lightning balance
   address                                New receive address
+  address validate <address>             Validate a Bitcoin address
   mnemonic                               Show mnemonic
   health                                 Node health status
   readiness                              Mainnet readiness checklist
@@ -1119,7 +1247,10 @@ On-chain:
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)
+  recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
+                                         the wallet
   backup <destPath>                      Create database backup
+  backup trigger                         Run the configured scheduled backup now
   backup scb [destPath]                  Export encrypted static channel backup
   backup peer-retrieved                  Show newest SCB returned by a peer
                                          (BOLT 1 peer storage)
@@ -1158,9 +1289,17 @@ Channels:
                                          Set routing fee policy (channel_update)
   channel list                           List channels
   channel get <id>                       Channel details (includes routing policy)
+  channel diagnostics <id>               Routing-readiness diagnostics for a channel
 
 Invoices & Payments:
   invoice create <sats> [description]    Create BOLT 11 invoice
+  invoice create-hold <hash> [sats] [description] [--expiry secs]
+                                         Create hold invoice for a payment hash
+                                         you supply (keep the preimage; HTLCs
+                                         park until settle-hold/cancel-hold)
+  invoice settle-hold <preimage>         Settle a parked hold invoice
+  invoice cancel-hold <hash>             Cancel a hold invoice (fails HTLCs back)
+  invoice held                           List hold invoices + their state
   invoice decode <bolt11>                Decode invoice
   invoice pay <bolt11>                   Pay invoice (blocks until settled)
   invoice pay-retry <bolt11> [flags]     Pay with exponential backoff retry
@@ -1177,6 +1316,8 @@ Graph Queries:
   graph channel <scid>                   Channel endpoints + both fee policies
                                          (scid: <block>x<tx>x<out> or hex)
   graph describe [--limit N] [--offset N]  Paged channel dump (default 500)
+  gossip sync [pubkey]                   Sync gossip from peers (or one peer)
+  gossip sync-rapid                      Rapid Gossip Sync snapshot (mainnet)
   route query <destination> <sats>       Compute a route without paying
                                          [--max-fee <sats>]
 
@@ -1190,6 +1331,10 @@ Routing:
   advisor execute-rebalances [--budget <sats>]
                                          Run the advisor's rebalance plan under
                                          a per-day fee budget
+
+Messages:
+  message sign <message>                 Sign with the node key (LND-compatible)
+  message verify <message> <signature>   Recover + check the signer pubkey
 
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer

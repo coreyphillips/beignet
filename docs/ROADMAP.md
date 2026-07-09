@@ -107,9 +107,10 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M4. Daemon / CLI surface gaps (library has it, surface does not)
 
-- [ ] Hold invoices end to end: createHoldInvoice(hash), settleInvoice(preimage),
-      cancelInvoice(hash) on BeignetNode + daemon + CLI. Internal machinery exists
-      (heldInvoiceHashes, restart-safe parking in lightning-node.ts).
+- [~] Hold invoices end to end (this PR): createHoldInvoice (caller-supplied hash),
+      settleHoldInvoice, cancelHoldInvoice (works pre-accept, restart-safe),
+      listHoldInvoices; CLTV auto-cancel respected and the near-expiry claim
+      backstop no longer force-closes on parked holds with unrevealed preimages.
 - [ ] Onchain power endpoints: sweep-all/send-max, bump-fee (RBF), boost (CPFP),
       consolidate. Library already has sendMax, setupRbf, setupCpfp.
 - [ ] Persist the daemon's onchain wallet state through encrypted storage: BeignetNode
@@ -119,11 +120,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       a small TStorage adapter over the encrypted SQLite (or createEncryptedStorage
       from PR #41) wired into beignet-node.ts. Correctness is unaffected today; this
       buys fast boots, less Electrum chatter, and durable metadata.
-- [ ] sign/verify message with the node key (LND SignMessage compatible, zbase32) via
-      library + daemon + CLI.
+- [~] sign/verify message with the node key (this PR): LND-compatible construction
+      (prefix, double-SHA256, compact recoverable ECDSA, zbase32); live lncli
+      cross-check noted as an interop follow-up.
 - [ ] Onchain message signing (BIP322 plus legacy fallback) in the wallet layer.
-- [ ] Expose existing methods with no route: syncGossip, syncRapidGossip,
-      getChannelDiagnostics, validateAddress, recoverFallbackFunds, triggerBackup.
+- [~] Expose existing methods with no route (this PR): syncGossip, syncRapidGossip,
+      getChannelDiagnostics, validateAddress, recoverFallbackFunds, triggerBackup
+      all routed + CLI.
 - [ ] CLI parity sweep: wrap the ~25 daemon endpoints with no CLI command (keysend,
       webhooks, queue, route probe/estimate, payment proof/cancel/wait, update-fee,
       liquidity, logs, spend-limit, node/uri, channel health, can-send/can-receive,
@@ -221,6 +224,9 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): PR #46 merged, M3 complete. M2 watchtower client prioritized
+  (in progress, parallel) per Corey; M4 batch 1 (this PR): hold invoices,
+  sign/verifymessage, unrouted-method exposure.
 - 2026-07-09 (cont.): PR #45 merged (wumbo, connect-by-id, fee clamp). Advisor
   execution (this PR) completes M3.
 - 2026-07-09 (cont.): PR #44 merged (graph queries + send-to-route). M3 small items

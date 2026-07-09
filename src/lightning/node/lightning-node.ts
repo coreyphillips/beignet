@@ -10,6 +10,10 @@ import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import { getPublicKey } from '../crypto/ecdh';
 import {
+	signMessageWithKey,
+	verifyMessageSignature
+} from '../crypto/message-signing';
+import {
 	constructBlindedPath,
 	processBlindedHop,
 	deriveBlindedPrivkey,
@@ -802,8 +806,15 @@ export class LightningNode extends EventEmitter {
 			}
 			this.invoices.set(paymentHashHex, invoice);
 			// Rebuild the hold-invoice set so incoming HTLCs are parked, not settled.
+			// A cancelled hold invoice must NOT re-arm parking: drop its preimage
+			// and secret from memory so a late HTLC fails with unknown-details.
 			if (invoice.hold) {
-				this.heldInvoiceHashes.add(paymentHashHex);
+				if (invoice.cancelledAt) {
+					this.preimages.delete(paymentHashHex);
+					this.paymentSecrets.delete(paymentHashHex);
+				} else {
+					this.heldInvoiceHashes.add(paymentHashHex);
+				}
 			}
 		}
 
@@ -1842,6 +1853,37 @@ export class LightningNode extends EventEmitter {
 
 	getNodeId(): string {
 		return this.nodeId;
+	}
+
+	/**
+	 * Sign a message with the node identity key (LND-compatible: double-SHA256
+	 * of 'Lightning Signed Message:' + message, compact recoverable ECDSA,
+	 * zbase32). Verifiable with `lncli verifymessage`.
+	 */
+	signMessage(message: string): string {
+		return signMessageWithKey(message, this.nodePrivkey);
+	}
+
+	/**
+	 * Verify an LND-style message signature. Recovery success alone does not
+	 * authenticate: the recovered pubkey must match the expected signer.
+	 * `knownNode` reports whether the recovered key is in our network graph
+	 * (LND's verifymessage validity criterion).
+	 */
+	verifyMessage(
+		message: string,
+		signature: string
+	): { valid: boolean; pubkey: string | null; knownNode: boolean } {
+		const result = verifyMessageSignature(message, signature);
+		if (!result.valid || !result.pubkey) {
+			return { valid: false, pubkey: null, knownNode: false };
+		}
+		const knownNode = this.graph.getNode(result.pubkey) !== undefined;
+		return {
+			valid: true,
+			pubkey: result.pubkey.toString('hex'),
+			knownNode
+		};
 	}
 
 	getNodeInfo(): INodeInfo {
@@ -6404,8 +6446,118 @@ export class LightningNode extends EventEmitter {
 		this.heldHtlcs.delete(hashHex);
 		this.heldInvoiceHashes.delete(hashHex);
 		this.persistHeldHtlcs();
+		this.markHoldInvoiceCancelled(hashHex);
 		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
 		return true;
+	}
+
+	/**
+	 * Record hold-invoice cancellation so a restart cannot re-arm parking for
+	 * the hash, and drop the preimage/secret so a late HTLC fails with
+	 * incorrect_or_unknown_payment_details instead of settling.
+	 */
+	private markHoldInvoiceCancelled(hashHex: string): void {
+		this.preimages.delete(hashHex);
+		this.paymentSecrets.delete(hashHex);
+		this.safeStorage(
+			() => this.storage!.deletePaymentSecret(hashHex),
+			'deletePaymentSecret'
+		);
+		const invoice = this.invoices.get(hashHex);
+		if (invoice && !invoice.cancelledAt) {
+			invoice.cancelledAt = Date.now();
+			this.safeStorage(
+				() => this.storage!.saveInvoice(hashHex, invoice),
+				'saveInvoice'
+			);
+		}
+		const payment = this.payments.get(hashHex);
+		if (
+			payment &&
+			payment.direction === PaymentDirection.INCOMING &&
+			payment.status !== PaymentStatus.COMPLETED
+		) {
+			payment.status = PaymentStatus.FAILED;
+			this.safeStorage(
+				() => this.persistPayment(Buffer.from(hashHex, 'hex')),
+				'persistPayment'
+			);
+		}
+	}
+
+	/**
+	 * Cancel a hold invoice by payment hash: fails any parked HTLC back to the
+	 * payer (incorrect_or_unknown_payment_details) and closes the invoice so
+	 * future HTLCs are rejected. Works before an HTLC arrives (unlike
+	 * cancelHeldHtlc). Returns the number of HTLCs failed, or null when the
+	 * hash is not a known open hold invoice.
+	 */
+	cancelHoldInvoice(paymentHash: Buffer): { htlcsFailed: number } | null {
+		const hashHex = paymentHash.toString('hex');
+		const held = this.heldHtlcs.get(hashHex);
+		if (held && held.length > 0) {
+			const count = held.length;
+			// cancelHeldHtlc also marks the invoice cancelled.
+			this.cancelHeldHtlc(paymentHash);
+			return { htlcsFailed: count };
+		}
+		if (!this.heldInvoiceHashes.has(hashHex)) return null;
+		this.heldInvoiceHashes.delete(hashHex);
+		this.markHoldInvoiceCancelled(hashHex);
+		this.emitStructuredLog('htlc', 'held_cancelled', { paymentHash: hashHex });
+		return { htlcsFailed: 0 };
+	}
+
+	/**
+	 * List hold invoices with their derived lifecycle state.
+	 * OPEN: created, no HTLC parked yet. ACCEPTED: HTLC(s) parked awaiting
+	 * settle/cancel. SETTLED: preimage revealed, payment received.
+	 * CANCELLED: failed back (explicitly or by the CLTV sweeper).
+	 */
+	listHoldInvoices(): Array<{
+		paymentHash: string;
+		bolt11: string;
+		amountMsat?: bigint;
+		description?: string;
+		expiry: number;
+		createdAt: number;
+		state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
+		heldAmountMsat: bigint;
+		htlcCount: number;
+	}> {
+		const out: ReturnType<LightningNode['listHoldInvoices']> = [];
+		for (const [hashHex, invoice] of this.invoices) {
+			if (!invoice.hold) continue;
+			const held = this.heldHtlcs.get(hashHex) ?? [];
+			let heldAmountMsat = 0n;
+			for (const h of held) heldAmountMsat += h.amountMsat;
+			const payment = this.payments.get(hashHex);
+			let state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
+			if (held.length > 0) {
+				state = 'ACCEPTED';
+			} else if (
+				payment?.status === PaymentStatus.COMPLETED &&
+				payment.direction === PaymentDirection.INCOMING
+			) {
+				state = 'SETTLED';
+			} else if (invoice.cancelledAt || !this.heldInvoiceHashes.has(hashHex)) {
+				state = 'CANCELLED';
+			} else {
+				state = 'OPEN';
+			}
+			out.push({
+				paymentHash: hashHex,
+				bolt11: invoice.bolt11,
+				amountMsat: invoice.amountMsat,
+				description: invoice.description,
+				expiry: invoice.expiry,
+				createdAt: invoice.createdAt,
+				state,
+				heldAmountMsat,
+				htlcCount: held.length
+			});
+		}
+		return out;
 	}
 
 	/**
@@ -7770,9 +7922,19 @@ export class LightningNode extends EventEmitter {
 				// claim buffer remains before cltv_expiry, so our HTLC-success is the
 				// only valid spend and the peer cannot win an HTLC-timeout race.
 				const paymentHashHex = htlc.paymentHash?.toString('hex');
+				// A parked hold-invoice HTLC whose preimage was never revealed must
+				// be failed off-chain by the held-HTLC sweeper (same margin), not
+				// force-closed to claim: claiming would settle a payment the
+				// operator has not released.
+				const parkedHold =
+					htlc.state !== HtlcState.FULFILLED &&
+					paymentHashHex !== undefined &&
+					this.heldInvoiceHashes.has(paymentHashHex);
 				const haveClaim =
-					htlc.state === HtlcState.FULFILLED ||
-					(paymentHashHex !== undefined && this.preimages.has(paymentHashHex));
+					!parkedHold &&
+					(htlc.state === HtlcState.FULFILLED ||
+						(paymentHashHex !== undefined &&
+							this.preimages.has(paymentHashHex)));
 				if (haveClaim && htlc.cltvExpiry - blockHeight <= claimBuffer) {
 					const channelId = state.channelId || state.temporaryChannelId;
 					this.emit('node:error', {
