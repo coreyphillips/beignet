@@ -111,6 +111,7 @@ import {
 	PaymentValidationCheck,
 	PaymentValidationStatus,
 	ChannelPolicyInfo,
+	HoldInvoiceInfo,
 	GraphInfo,
 	GraphChannelInfo,
 	GraphChannelPolicy,
@@ -1046,6 +1047,41 @@ export class BeignetNode extends EventEmitter {
 		return this.mnemonic;
 	}
 
+	/**
+	 * Sign a message with the node identity key (LND-compatible format,
+	 * verifiable with `lncli verifymessage`).
+	 */
+	signMessage(message: string): { signature: string; pubkey: string } {
+		if (typeof message !== 'string' || message.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'message required'
+			);
+		}
+		return {
+			signature: this.node.signMessage(message),
+			pubkey: this.node.getNodeId()
+		};
+	}
+
+	/**
+	 * Verify an LND-style message signature: recovers the signer pubkey and
+	 * reports whether it belongs to a node in our network graph. Callers must
+	 * check the recovered pubkey against the expected signer.
+	 */
+	verifyMessage(
+		message: string,
+		signature: string
+	): { valid: boolean; pubkey: string | null; knownNode: boolean } {
+		if (typeof message !== 'string' || typeof signature !== 'string') {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'message and signature required'
+			);
+		}
+		return this.node.verifyMessage(message, signature);
+	}
+
 	getBalance(): BalanceInfo {
 		const onchain = this.wallet.getBalance();
 		const lnBalance = this.node.getBalance();
@@ -1723,6 +1759,122 @@ export class BeignetNode extends EventEmitter {
 		};
 		if (expirySecs !== undefined) info.expiry = expirySecs;
 		return info;
+	}
+
+	/**
+	 * Create a hold invoice for a caller-supplied payment hash. The preimage
+	 * stays with the caller: an incoming HTLC parks (payer sees the payment as
+	 * in-flight) until settleHoldInvoice(preimage) or cancelHoldInvoice(hash).
+	 * Parked HTLCs are auto-cancelled by the CLTV sweeper before their expiry
+	 * safety margin, so they can never ride into an on-chain timeout.
+	 */
+	createHoldInvoice(opts: {
+		/** 32-byte payment hash, hex. sha256(preimage) held by the caller. */
+		paymentHash: string;
+		amountMsat?: bigint;
+		amountSats?: number;
+		description?: string;
+		/** Invoice expiry in seconds. */
+		expiry?: number;
+	}): InvoiceInfo {
+		if (!/^[0-9a-fA-F]{64}$/.test(opts.paymentHash)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'paymentHash must be 32 bytes hex (64 hex chars)'
+			);
+		}
+		const amountMsat =
+			opts.amountMsat ??
+			(opts.amountSats !== undefined && opts.amountSats !== 0
+				? BigInt(opts.amountSats) * 1000n
+				: undefined);
+		const result = this.node.createInvoice({
+			amountMsat,
+			description: opts.description || '',
+			expiry: opts.expiry,
+			hold: true,
+			paymentHash: Buffer.from(opts.paymentHash, 'hex')
+		});
+		const info: InvoiceInfo = {
+			bolt11: result.bolt11,
+			paymentHash: result.paymentHash.toString('hex'),
+			paymentSecret: result.paymentSecret.toString('hex')
+		};
+		if (amountMsat !== undefined) info.amountSats = Number(amountMsat / 1000n);
+		if (opts.expiry !== undefined) info.expiry = opts.expiry;
+		return info;
+	}
+
+	/**
+	 * Settle a hold invoice with its preimage. Validates sha256(preimage)
+	 * against the parked HTLCs' payment hash and fulfills all of them (every
+	 * MPP part). Throws when nothing is parked for the hash.
+	 */
+	settleHoldInvoice(preimage: string): { paymentHash: string } {
+		if (!/^[0-9a-fA-F]{64}$/.test(preimage)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'preimage must be 32 bytes hex (64 hex chars)'
+			);
+		}
+		const preimageBuf = Buffer.from(preimage, 'hex');
+		const paymentHash = crypto
+			.createHash('sha256')
+			.update(preimageBuf)
+			.digest();
+		const settled = this.node.settleHeldHtlc(paymentHash, preimageBuf);
+		if (!settled) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'No parked HTLCs for this preimage (invoice unknown, not yet paid, or already resolved)'
+			);
+		}
+		return { paymentHash: paymentHash.toString('hex') };
+	}
+
+	/**
+	 * Cancel a hold invoice: fails any parked HTLC back to the payer with
+	 * incorrect_or_unknown_payment_details and closes the invoice to future
+	 * HTLCs. Throws when the hash is not a known open hold invoice.
+	 */
+	cancelHoldInvoice(paymentHash: string): {
+		paymentHash: string;
+		htlcsFailed: number;
+	} {
+		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'paymentHash must be 32 bytes hex (64 hex chars)'
+			);
+		}
+		const result = this.node.cancelHoldInvoice(Buffer.from(paymentHash, 'hex'));
+		if (!result) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_FOUND,
+				'No open hold invoice for this payment hash'
+			);
+		}
+		return { paymentHash, htlcsFailed: result.htlcsFailed };
+	}
+
+	/** List hold invoices with lifecycle state and parked HTLC totals. */
+	listHoldInvoices(): HoldInvoiceInfo[] {
+		return this.node.listHoldInvoices().map((inv) => {
+			const info: HoldInvoiceInfo = {
+				paymentHash: inv.paymentHash,
+				bolt11: inv.bolt11,
+				state: inv.state,
+				heldAmountMsat: inv.heldAmountMsat.toString(),
+				htlcCount: inv.htlcCount,
+				expiry: inv.expiry,
+				createdAt: inv.createdAt
+			};
+			if (inv.amountMsat !== undefined) {
+				info.amountSats = Number(inv.amountMsat / 1000n);
+			}
+			if (inv.description) info.description = inv.description;
+			return info;
+		});
 	}
 
 	decodeInvoice(bolt11: string): DecodedInvoice {

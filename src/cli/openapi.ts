@@ -259,6 +259,78 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/invoice/create-hold': {
+				post: {
+					summary:
+						'Create a hold invoice for a caller-supplied payment hash (preimage stays with the caller; the incoming HTLC parks until settle/cancel)',
+					tags: ['Invoices'],
+					requestBody: bodyContent({
+						paymentHash: 'string',
+						amountMsat: 'string?',
+						amountSats: 'number?',
+						description: 'string?',
+						expiry: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Created hold invoice',
+							content: jsonContent({ $ref: '#/components/schemas/InvoiceInfo' })
+						}
+					}
+				}
+			},
+			'/invoice/settle-hold': {
+				post: {
+					summary:
+						'Settle a hold invoice with its preimage: validates sha256(preimage) and fulfills every parked HTLC (all MPP parts)',
+					tags: ['Invoices'],
+					requestBody: bodyContent({ preimage: 'string' }),
+					responses: {
+						'200': {
+							description: 'Settled',
+							content: jsonContent({
+								type: 'object',
+								properties: { paymentHash: { type: 'string' } }
+							})
+						}
+					}
+				}
+			},
+			'/invoice/cancel-hold': {
+				post: {
+					summary:
+						'Cancel a hold invoice: fails parked HTLCs back with incorrect_or_unknown_payment_details and rejects future ones',
+					tags: ['Invoices'],
+					requestBody: bodyContent({ paymentHash: 'string' }),
+					responses: {
+						'200': {
+							description: 'Cancelled',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									paymentHash: { type: 'string' },
+									htlcsFailed: { type: 'integer' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/invoices/held': {
+				get: {
+					summary: 'List hold invoices with lifecycle state and parked totals',
+					tags: ['Invoices'],
+					responses: {
+						'200': {
+							description: 'Hold invoices',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/HoldInvoiceInfo' }
+							})
+						}
+					}
+				}
+			},
 			'/invoice': {
 				get: {
 					summary: 'Get a specific invoice by payment hash',
@@ -1020,6 +1092,165 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description: 'Payment info',
 							content: jsonContent({
 								$ref: '#/components/schemas/PaymentInfo'
+							})
+						}
+					}
+				}
+			},
+			'/message/sign': {
+				post: {
+					summary:
+						"Sign a message with the node identity key (LND-compatible: double-SHA256 of 'Lightning Signed Message:' + message, compact recoverable ECDSA, zbase32)",
+					tags: ['Node'],
+					requestBody: bodyContent({ message: 'string' }),
+					responses: {
+						'200': {
+							description: 'Signature (zbase32) and our node pubkey',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									signature: { type: 'string' },
+									pubkey: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/message/verify': {
+				post: {
+					summary:
+						'Verify an LND-style message signature: recovers the signer pubkey and reports whether it is a known graph node. Compare pubkey against the expected signer.',
+					tags: ['Node'],
+					requestBody: bodyContent({ message: 'string', signature: 'string' }),
+					responses: {
+						'200': {
+							description: 'Verification result',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									valid: { type: 'boolean' },
+									pubkey: { type: 'string', nullable: true },
+									knownNode: { type: 'boolean' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/gossip/sync': {
+				post: {
+					summary:
+						'Request a gossip graph sync from one peer (pubkey) or all connected peers',
+					tags: ['Graph'],
+					requestBody: bodyContent({ pubkey: 'string?' }),
+					responses: {
+						'200': {
+							description: 'Pubkeys a sync was initiated with',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									syncedFrom: {
+										type: 'array',
+										items: { type: 'string' }
+									}
+								}
+							})
+						}
+					}
+				}
+			},
+			'/gossip/sync-rapid': {
+				post: {
+					summary:
+						'Download and apply a Rapid Gossip Sync snapshot (mainnet only)',
+					tags: ['Graph'],
+					responses: {
+						'200': {
+							description: 'Ingestion counts',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									channelsAdded: { type: 'integer' },
+									updatesApplied: { type: 'integer' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/channel/diagnostics': {
+				get: {
+					summary:
+						'Routing-readiness diagnostics for a channel (SCID/announcement/peer-connection issues)',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': { description: 'Diagnostics with an issues list' },
+						'404': { description: 'Channel not found' }
+					}
+				}
+			},
+			'/address/validate': {
+				post: {
+					summary: 'Validate a Bitcoin address for the active network',
+					tags: ['Node'],
+					requestBody: bodyContent({ address: 'string' }),
+					responses: {
+						'200': {
+							description: 'Validity',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									address: { type: 'string' },
+									valid: { type: 'boolean' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/recover-fallback-funds': {
+				post: {
+					summary:
+						'Sweep UTXOs at the funding-key fallback address into the wallet',
+					tags: ['Node'],
+					requestBody: bodyContent({ feeRatePerVbyte: 'number?' }),
+					responses: {
+						'200': {
+							description:
+								'Broadcast txid and recovered amount, or { recovered: false } when nothing to recover',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									txid: { type: 'string' },
+									amountSat: { type: 'integer' },
+									inputCount: { type: 'integer' },
+									recovered: { type: 'boolean' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/backup/trigger': {
+				post: {
+					summary:
+						'Trigger an on-demand backup to the configured backupPath (no-op when unset)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Trigger acknowledged',
+							content: jsonContent({
+								type: 'object',
+								properties: { triggered: { type: 'boolean' } }
 							})
 						}
 					}
@@ -2041,6 +2272,26 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						expiry: { type: 'integer' },
 						createdAt: { type: 'integer' },
 						status: { type: 'string', enum: ['PENDING', 'PAID', 'EXPIRED'] }
+					}
+				},
+				HoldInvoiceInfo: {
+					type: 'object',
+					properties: {
+						paymentHash: { type: 'string' },
+						bolt11: { type: 'string' },
+						state: {
+							type: 'string',
+							enum: ['OPEN', 'ACCEPTED', 'SETTLED', 'CANCELLED']
+						},
+						heldAmountMsat: {
+							type: 'string',
+							description: 'Total msat currently parked'
+						},
+						htlcCount: { type: 'integer' },
+						amountSats: { type: 'integer' },
+						description: { type: 'string' },
+						expiry: { type: 'integer' },
+						createdAt: { type: 'integer' }
 					}
 				},
 				OfferInfo: {

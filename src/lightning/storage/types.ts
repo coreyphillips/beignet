@@ -231,4 +231,9 @@ export interface IInvoiceInfo {
 	createdAt: number;
 	/** Hold invoice — matching HTLCs are parked until settle/cancel. */
 	hold?: boolean;
+	/**
+	 * Hold invoice cancelled (ms timestamp). Kept so a restart does not
+	 * re-arm parking for a hash the operator already cancelled.
+	 */
+	cancelledAt?: number;
 }

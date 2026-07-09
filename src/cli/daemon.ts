@@ -511,6 +511,47 @@ export async function startDaemon(
 				node.createInvoice(amountSats, description, expirySecs, hashBuf)
 			);
 		},
+		'POST /invoice/create-hold': (body) => {
+			const { paymentHash, amountMsat, amountSats, description, expiry } =
+				body as {
+					paymentHash?: string;
+					amountMsat?: string | number;
+					amountSats?: number;
+					description?: string;
+					expiry?: number;
+				};
+			if (!paymentHash)
+				return failure('INVALID_PARAMS', 'paymentHash required');
+			let amountMsatBig: bigint | undefined;
+			if (amountMsat !== undefined) {
+				try {
+					amountMsatBig = BigInt(amountMsat);
+				} catch {
+					return failure('INVALID_PARAMS', 'amountMsat must be an integer');
+				}
+			}
+			return success(
+				node.createHoldInvoice({
+					paymentHash,
+					amountMsat: amountMsatBig,
+					amountSats,
+					description,
+					expiry
+				})
+			);
+		},
+		'POST /invoice/settle-hold': (body) => {
+			const { preimage } = body as { preimage?: string };
+			if (!preimage) return failure('INVALID_PARAMS', 'preimage required');
+			return success(node.settleHoldInvoice(preimage));
+		},
+		'POST /invoice/cancel-hold': (body) => {
+			const { paymentHash } = body as { paymentHash?: string };
+			if (!paymentHash)
+				return failure('INVALID_PARAMS', 'paymentHash required');
+			return success(node.cancelHoldInvoice(paymentHash));
+		},
+		'GET /invoices/held': () => success(node.listHoldInvoices()),
 		'POST /invoice/decode': (body) => {
 			const { bolt11 } = body as { bolt11: string };
 			if (!bolt11) return failure('INVALID_PARAMS', 'bolt11 required');
@@ -936,6 +977,64 @@ export async function startDaemon(
 			if (!paymentHash || !route)
 				return failure('INVALID_PARAMS', 'paymentHash and route required');
 			return success(node.sendToRoute(paymentHash, route, paymentSecret));
+		},
+
+		// ── Message Signing ──
+		'POST /message/sign': (body) => {
+			const { message } = body as { message?: string };
+			if (!message) return failure('INVALID_PARAMS', 'message required');
+			return success(node.signMessage(message));
+		},
+		'POST /message/verify': (body) => {
+			const { message, signature } = body as {
+				message?: string;
+				signature?: string;
+			};
+			if (!message || !signature)
+				return failure('INVALID_PARAMS', 'message and signature required');
+			return success(node.verifyMessage(message, signature));
+		},
+
+		// ── Gossip Sync ──
+		'POST /gossip/sync': (body) => {
+			const { pubkey } = body as { pubkey?: string };
+			return success({ syncedFrom: node.syncGossip(pubkey) });
+		},
+		'POST /gossip/sync-rapid': async () => {
+			const result = await node.syncRapidGossip();
+			if (!result) {
+				return failure(
+					'INVALID_PARAMS',
+					'Rapid gossip sync is only available on mainnet'
+				);
+			}
+			return success(result);
+		},
+
+		// ── Diagnostics & Recovery ──
+		'GET /channel/diagnostics': (body, query) => {
+			const channelId =
+				query.get('channelId') || (body as { channelId?: string }).channelId;
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			const diagnostics = node.getChannelDiagnostics(channelId);
+			if (!diagnostics) return failure('NOT_FOUND', 'Channel not found');
+			return success(diagnostics);
+		},
+		'POST /address/validate': (body) => {
+			const { address } = body as { address?: string };
+			if (!address) return failure('INVALID_PARAMS', 'address required');
+			return success({ address, valid: node.validateAddress(address) });
+		},
+		'POST /recover-fallback-funds': async (body) => {
+			const { feeRatePerVbyte } = body as { feeRatePerVbyte?: number };
+			const result = await node.recoverFallbackFunds(
+				feeRatePerVbyte !== undefined ? { feeRatePerVbyte } : undefined
+			);
+			return success(result ?? { recovered: false });
+		},
+		'POST /backup/trigger': () => {
+			node.triggerBackup();
+			return success({ triggered: true });
 		},
 
 		// ── Database Backup ──

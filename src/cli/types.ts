@@ -137,6 +137,20 @@ export interface InvoiceInfo {
 	status?: 'PENDING' | 'PAID' | 'EXPIRED';
 }
 
+export interface HoldInvoiceInfo {
+	paymentHash: string;
+	bolt11: string;
+	/** OPEN: unpaid. ACCEPTED: HTLC(s) parked. SETTLED / CANCELLED: resolved. */
+	state: 'OPEN' | 'ACCEPTED' | 'SETTLED' | 'CANCELLED';
+	/** Total msat currently parked (string for JSON safety). */
+	heldAmountMsat: string;
+	htlcCount: number;
+	amountSats?: number;
+	description?: string;
+	expiry: number;
+	createdAt: number;
+}
+
 export interface DecodedInvoice {
 	network: string;
 	amountSats?: number;
