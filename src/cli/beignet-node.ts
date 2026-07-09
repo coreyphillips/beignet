@@ -34,6 +34,8 @@ import {
 	fetchRapidGossipSnapshot,
 	DEFAULT_RGS_URL
 } from '../lightning/gossip/rapid-sync';
+import { parseAnnouncedAddress } from '../lightning/gossip/messages';
+import { INodeAddress } from '../lightning/gossip/types';
 import { ElectrumBackend } from '../lightning/chain/electrum-backend';
 import { Network } from '../lightning/invoice/types';
 import { LnCoinType } from '../lightning/keys/wallet-keys';
@@ -165,6 +167,13 @@ export interface BeignetNodeOptions {
 	 * an onion address. Needs a running Tor daemon/Tor Browser on that port.
 	 */
 	torProxy?: string;
+	/**
+	 * Addresses to advertise in our node_announcement so remote peers can
+	 * discover and dial us, as "host[:port]" strings (port defaults to 9735).
+	 * Supports IPv4, "[ipv6]:port", Tor v3 ".onion" and DNS hostnames.
+	 * Only announced once the node has at least one public channel.
+	 */
+	announceAddresses?: string[];
 }
 
 const DEFAULT_DATA_DIR = path.join(
@@ -526,6 +535,21 @@ export class BeignetNode extends EventEmitter {
 			socks5Proxy = { host: proxyHost, port };
 		}
 
+		// Parse addresses to advertise in our node_announcement (BOLT 7).
+		let announcedAddresses: INodeAddress[] | undefined;
+		if (opts.announceAddresses && opts.announceAddresses.length > 0) {
+			announcedAddresses = opts.announceAddresses.map((addr) => {
+				try {
+					return parseAnnouncedAddress(addr);
+				} catch (e) {
+					throw new BeignetError(
+						'INVALID_PARAMS',
+						e instanceof Error ? e.message : `Invalid address "${addr}"`
+					);
+				}
+			});
+		}
+
 		this.node = LightningNode.fromMnemonic(this.mnemonic, {
 			coinType,
 			network: lnNetwork,
@@ -536,6 +560,7 @@ export class BeignetNode extends EventEmitter {
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,
+			announcedAddresses,
 			fundingProvider,
 			preferAnchors: opts.preferAnchors,
 			chainBackend: electrumBackend,

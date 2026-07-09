@@ -298,6 +298,24 @@ describe('Config management', () => {
 		const resolved = resolveConfig({});
 		expect(resolved.torProxy).to.be.undefined;
 	});
+
+	it('resolveConfig splits BEIGNET_ANNOUNCE_ADDRESSES on commas', () => {
+		process.env.BEIGNET_ANNOUNCE_ADDRESSES =
+			'203.0.113.7:9735, ln.example.com:9736 ,';
+		const resolved = resolveConfig({});
+		expect(resolved.announceAddresses).to.deep.equal([
+			'203.0.113.7:9735',
+			'ln.example.com:9736'
+		]);
+		delete process.env.BEIGNET_ANNOUNCE_ADDRESSES;
+	});
+
+	it('resolveConfig prefers announceAddresses CLI flag over env', () => {
+		process.env.BEIGNET_ANNOUNCE_ADDRESSES = 'env.example.com';
+		const resolved = resolveConfig({ announceAddresses: ['flag.example.com'] });
+		expect(resolved.announceAddresses).to.deep.equal(['flag.example.com']);
+		delete process.env.BEIGNET_ANNOUNCE_ADDRESSES;
+	});
 });
 
 // ─────────────── BeignetNode Static Tests ───────────────

@@ -44,7 +44,8 @@ import { MissionControl } from '../gossip/mission-control';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
-	INodeAnnouncementMessage
+	INodeAnnouncementMessage,
+	INodeAddress
 } from '../gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
@@ -291,6 +292,7 @@ export class LightningNode extends EventEmitter {
 	> = new Map();
 	private mppTimeoutMs: number;
 	private alias?: string;
+	private announcedAddresses: INodeAddress[] = [];
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
 	private fundingPrivkey: Buffer;
@@ -368,6 +370,10 @@ export class LightningNode extends EventEmitter {
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
 		this.mppTimeoutMs = config.mppTimeoutMs ?? 60_000;
 		this.alias = config.alias;
+		// BOLT 7 requires address descriptors in ascending order by type.
+		this.announcedAddresses = [...(config.announcedAddresses ?? [])].sort(
+			(a, b) => a.type - b.type
+		);
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
@@ -2891,7 +2897,7 @@ export class LightningNode extends EventEmitter {
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
 				alias: aliasBuffer,
-				addresses: []
+				addresses: this.announcedAddresses
 			});
 			const sig = signNodeAnnouncement(payload, this.nodePrivkey);
 			sig.copy(payload, 0);
@@ -6265,6 +6271,7 @@ export class LightningNode extends EventEmitter {
 			localFeatures?: FeatureFlags;
 			chainHashes?: Buffer[];
 			alias?: string;
+			announcedAddresses?: INodeAddress[];
 			fundingProvider?: IFundingProvider;
 			feeEstimator?: IFeeEstimator;
 			socks5Proxy?: { host: string; port: number };
@@ -6322,6 +6329,7 @@ export class LightningNode extends EventEmitter {
 			localFeatures: options?.localFeatures,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,
+			announcedAddresses: options?.announcedAddresses,
 			fundingProvider: options?.fundingProvider,
 			feeEstimator: options?.feeEstimator,
 			socks5Proxy: options?.socks5Proxy,

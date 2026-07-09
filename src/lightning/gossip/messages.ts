@@ -561,3 +561,160 @@ export function decodeNodeAddress(
 			throw new Error(`Unknown address type: ${type}`);
 	}
 }
+
+// ── Announced Address Parsing ───────────────────────────────────────
+
+const BASE32_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567';
+
+function base32Decode(input: string): Buffer {
+	let bits = 0;
+	let value = 0;
+	const out: number[] = [];
+	for (const ch of input) {
+		const idx = BASE32_ALPHABET.indexOf(ch);
+		if (idx === -1) {
+			throw new Error(`Invalid base32 character: ${ch}`);
+		}
+		value = (value << 5) | idx;
+		bits += 5;
+		if (bits >= 8) {
+			out.push((value >>> (bits - 8)) & 0xff);
+			bits -= 8;
+		}
+	}
+	return Buffer.from(out);
+}
+
+function expandIpv6(host: string): string {
+	let groups: string[];
+	const doubleColon = host.indexOf('::');
+	if (doubleColon !== -1) {
+		if (host.indexOf('::', doubleColon + 1) !== -1) {
+			throw new Error(`Invalid IPv6 address: ${host}`);
+		}
+		const head = host
+			.slice(0, doubleColon)
+			.split(':')
+			.filter((g) => g.length > 0);
+		const tail = host
+			.slice(doubleColon + 2)
+			.split(':')
+			.filter((g) => g.length > 0);
+		const missing = 8 - head.length - tail.length;
+		if (missing < 1) {
+			throw new Error(`Invalid IPv6 address: ${host}`);
+		}
+		groups = [...head, ...new Array(missing).fill('0'), ...tail];
+	} else {
+		groups = host.split(':');
+	}
+	if (
+		groups.length !== 8 ||
+		groups.some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))
+	) {
+		throw new Error(`Invalid IPv6 address: ${host}`);
+	}
+	return groups.map((g) => g.toLowerCase().padStart(4, '0')).join(':');
+}
+
+/** Verify the 2-byte checksum embedded in a Tor v3 onion address:
+ *  sha3_256(".onion checksum" || pubkey || version)[0..1]. Uses the runtime's
+ *  sha3-256 if available; silently skipped where it is not (e.g. browsers),
+ *  since a bad checksum only makes the address unreachable, not unsafe. */
+function verifyOnionV3Checksum(decoded: Buffer, host: string): void {
+	let digest: Buffer;
+	try {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const { createHash } = require('crypto');
+		digest = createHash('sha3-256')
+			.update(Buffer.from('.onion checksum', 'ascii'))
+			.update(decoded.subarray(0, 32))
+			.update(decoded.subarray(34, 35))
+			.digest();
+	} catch {
+		return;
+	}
+	if (!digest.subarray(0, 2).equals(decoded.subarray(32, 34))) {
+		throw new Error(`Invalid Tor v3 onion address checksum: ${host}`);
+	}
+}
+
+/**
+ * Parse a user-supplied "host:port" string into a BOLT 7 address descriptor
+ * for our own node_announcement. Supports IPv4, IPv6 ("[addr]:port",
+ * compressed forms expanded), Tor v3 ".onion" (56-char base32 label,
+ * decoded to the 35-byte descriptor payload) and DNS hostnames (type 5).
+ * Port defaults to 9735 when omitted.
+ */
+export function parseAnnouncedAddress(input: string): INodeAddress {
+	const trimmed = input.trim();
+	let host: string;
+	let portStr: string | undefined;
+
+	if (trimmed.startsWith('[')) {
+		const end = trimmed.indexOf(']');
+		if (end === -1) {
+			throw new Error(`Invalid address "${input}": missing closing ']'`);
+		}
+		host = trimmed.slice(1, end);
+		const rest = trimmed.slice(end + 1);
+		if (rest.startsWith(':')) {
+			portStr = rest.slice(1);
+		} else if (rest.length > 0) {
+			throw new Error(`Invalid address "${input}": expected [host]:port`);
+		}
+	} else {
+		const lastColon = trimmed.lastIndexOf(':');
+		if (lastColon !== -1 && trimmed.indexOf(':') !== lastColon) {
+			throw new Error(
+				`Invalid address "${input}": IPv6 addresses must be written as [host]:port`
+			);
+		}
+		if (lastColon === -1) {
+			host = trimmed;
+		} else {
+			host = trimmed.slice(0, lastColon);
+			portStr = trimmed.slice(lastColon + 1);
+		}
+	}
+
+	const port = portStr === undefined ? 9735 : Number(portStr);
+	if (!Number.isInteger(port) || port < 1 || port > 65535) {
+		throw new Error(`Invalid port in address "${input}"`);
+	}
+	if (!host) {
+		throw new Error(`Invalid address "${input}": empty host`);
+	}
+
+	if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+		if (host.split('.').some((o) => Number(o) > 255)) {
+			throw new Error(`Invalid IPv4 address: ${host}`);
+		}
+		return { type: ADDRESS_TYPE_IPV4, host, port };
+	}
+
+	if (host.includes(':')) {
+		return { type: ADDRESS_TYPE_IPV6, host: expandIpv6(host), port };
+	}
+
+	const lower = host.toLowerCase();
+	if (lower.endsWith('.onion')) {
+		const label = lower.slice(0, -'.onion'.length);
+		if (label.length !== 56) {
+			throw new Error(
+				`Only Tor v3 onion addresses are supported (56-char label): ${host}`
+			);
+		}
+		const decoded = base32Decode(label);
+		if (decoded.length !== 35 || decoded[34] !== 3) {
+			throw new Error(`Invalid Tor v3 onion address: ${host}`);
+		}
+		verifyOnionV3Checksum(decoded, host);
+		return { type: ADDRESS_TYPE_TORV3, host: decoded.toString('hex'), port };
+	}
+
+	if (!/^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(lower) || lower.length > 255) {
+		throw new Error(`Invalid hostname: ${host}`);
+	}
+	return { type: ADDRESS_TYPE_DNS, host: lower, port };
+}
