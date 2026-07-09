@@ -230,6 +230,8 @@ export interface BeignetConfig {
 	connectTimeoutMs?: number;
 	tlsCert?: string;
 	tlsKey?: string;
+	/** SOCKS5 proxy as "host:port" for outbound Lightning peer connections (e.g. Tor). */
+	torProxy?: string;
 }
 
 export interface HealthInfo {

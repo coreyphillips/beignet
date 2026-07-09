@@ -110,7 +110,9 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				: undefined) ||
 			file.connectTimeoutMs,
 		tlsCert: cliFlags.tlsCert || process.env.BEIGNET_TLS_CERT || file.tlsCert,
-		tlsKey: cliFlags.tlsKey || process.env.BEIGNET_TLS_KEY || file.tlsKey
+		tlsKey: cliFlags.tlsKey || process.env.BEIGNET_TLS_KEY || file.tlsKey,
+		torProxy:
+			cliFlags.torProxy || process.env.BEIGNET_TOR_PROXY || file.torProxy
 	};
 }
 
