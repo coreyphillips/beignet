@@ -158,10 +158,10 @@ export interface IChannelManagerConfig {
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) */
 	preferAnchors?: boolean;
 	/**
-	 * Propose simple taproot channels (option_taproot). EXPERIMENTAL: the taproot
-	 * commitment-round signing flow (MuSig2 nonce rotation) is not yet wired into
-	 * the live state machine, so a proposed taproot channel negotiates open/accept
-	 * (channel type + nonces) but cannot yet complete funding. Off by default.
+	 * Propose simple taproot channels (option_taproot). MuSig2 funding and
+	 * commitment signing (deterministic verification nonces) are fully wired;
+	 * the complete lifecycle is validated against LND on regtest. Off by
+	 * default because the feature bit is still in staging upstream (180/181).
 	 */
 	preferTaproot?: boolean;
 	/** Chain hash for open_channel messages (defaults to Bitcoin mainnet) */

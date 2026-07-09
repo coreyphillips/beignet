@@ -6366,6 +6366,24 @@ export class LightningNode extends EventEmitter {
 		// allowAnySegwit), so advertising anysegwit only states existing behavior.
 		flags.setOptional(Feature.SHUTDOWN_ANY_SEGWIT);
 		flags.setOptional(Feature.SIMPLE_CLOSE);
+		// Implemented but NOT advertised by default (opt in via config.localFeatures):
+		//  - DUAL_FUND (28): open_channel2 initiator and acceptor paths work, but
+		//    the bit stays off the default init set pending broader interop soak.
+		//  - ZERO_CONF (50): zero-conf is gated per-peer (trusted peers) and via
+		//    channel_type; the init bit is deliberately not blanket-advertised.
+		// Defined in Feature but intentionally not advertised or implemented:
+		//  - LARGE_CHANNELS (18): funding is capped at 2^24 sat (wumbo is planned).
+		//  - ANCHOR_OUTPUTS (20): legacy anchors, superseded by bit 22 above.
+		//  - GOSSIP_QUERIES_EX (10): extended queries not implemented.
+		//  - UPFRONT_SHUTDOWN_SCRIPT (4): parsed from channel-open messages but
+		//    not enforced, so the bit is not advertised.
+		//  - OPTION_WILL_FUND (112): liquidity ads negotiate via open_channel2
+		//    TLVs when liquidity rates are configured; init-bit advertising is a
+		//    separate decision.
+		//  - ROUTE_BLINDING (24): advertised per-invoice (see invoiceFeatures),
+		//    not in the init set.
+		//  - OPTION_TAPROOT (180/181): negotiated via channel_type when
+		//    preferTaproot is set; staging bits are not init-advertised.
 		return flags;
 	}
 
