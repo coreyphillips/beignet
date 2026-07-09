@@ -253,6 +253,7 @@ async function handleStart(): Promise<void> {
 	const hostFlag = parseFlag('--host');
 	if (hostFlag) cliFlags.daemonHost = hostFlag;
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
+	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
 	const backupPathFlag = parseFlag('--backup-path');
@@ -308,6 +309,7 @@ async function handleStart(): Promise<void> {
 			daemonPort,
 			daemonHost: config.daemonHost,
 			preferAnchors: config.preferAnchors,
+			largeChannels: config.largeChannels,
 			apiToken: config.apiToken,
 			backupPath: config.backupPath,
 			backupIntervalMs: config.backupIntervalMs,
@@ -361,12 +363,20 @@ async function handlePeer(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
 		case 'connect':
+			// host/port are optional: "beignet peer connect <pubkey>" resolves the
+			// address from the gossip graph / DNS bootstrap.
 			return outputResult(
-				await httpRequest('POST', '/peer/connect', {
-					pubkey: filteredArgs[2],
-					host: filteredArgs[3],
-					port: parseInt(filteredArgs[4], 10)
-				})
+				await httpRequest(
+					'POST',
+					'/peer/connect',
+					filteredArgs[3] !== undefined
+						? {
+								pubkey: filteredArgs[2],
+								host: filteredArgs[3],
+								port: parseInt(filteredArgs[4], 10)
+						  }
+						: { pubkey: filteredArgs[2] }
+				)
 			);
 		case 'disconnect':
 			return outputResult(

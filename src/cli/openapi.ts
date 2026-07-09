@@ -605,12 +605,13 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/peer/connect': {
 				post: {
-					summary: 'Connect to a peer',
+					summary:
+						'Connect to a peer (omit host+port to resolve the address from the gossip graph / DNS bootstrap)',
 					tags: ['Peers'],
 					requestBody: bodyContent({
 						pubkey: 'string',
-						host: 'string',
-						port: 'number'
+						host: 'string?',
+						port: 'number?'
 					}),
 					responses: {
 						'200': {

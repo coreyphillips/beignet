@@ -286,9 +286,15 @@ export async function startDaemon(
 				pubkey,
 				host: peerHost,
 				port: peerPort
-			} = body as { pubkey: string; host: string; port: number };
-			if (!pubkey || !peerHost || !peerPort)
-				return failure('INVALID_PARAMS', 'pubkey, host, and port required');
+			} = body as { pubkey: string; host?: string; port?: number };
+			if (!pubkey) return failure('INVALID_PARAMS', 'pubkey required');
+			// host/port are optional together: when omitted the node resolves the
+			// address from the gossip graph / DNS bootstrap.
+			if ((peerHost === undefined) !== (peerPort === undefined))
+				return failure(
+					'INVALID_PARAMS',
+					'host and port must be provided together (omit both to resolve by node id)'
+				);
 			return success(await node.connectPeer(pubkey, peerHost, peerPort));
 		},
 		'POST /peer/disconnect': (body) => {

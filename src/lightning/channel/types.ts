@@ -113,6 +113,11 @@ export const MAX_ACCEPTED_HTLCS = 483;
 /** BOLT 2: Maximum channel funding size (2^24 satoshis without wumbo) */
 export const MAX_FUNDING_SATOSHIS = 16777216n;
 
+/** Funding ceiling when option_wumbo (large_channels, bit 18) is negotiated:
+ *  10 BTC. Wumbo lifts the 2^24 cap, but an unbounded channel is a fat-finger
+ *  and fund-concentration hazard, so a sane absolute ceiling remains. */
+export const MAX_WUMBO_FUNDING_SATOSHIS = 1_000_000_000n;
+
 /** Dust limit matching LND's DustLimitForSize(UnknownWitnessSize) = 354 sat.
  *  LND requires: 354 <= dustLimit <= 1062, and
  *  min(ourReserve, theirReserve) >= max(ourDust, theirDust).

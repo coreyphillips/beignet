@@ -47,12 +47,15 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
 	INodeAddress,
-	IRoute
+	IRoute,
+	ADDRESS_TYPE_TORV2,
+	ADDRESS_TYPE_TORV3
 } from '../gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
 	decodeNodeAnnouncementMessage,
-	decodeChannelUpdateMessage
+	decodeChannelUpdateMessage,
+	nodeAddressToHostPort
 } from '../gossip/messages';
 import {
 	decodeReplyChannelRangeMessage,
@@ -140,7 +143,8 @@ import {
 	IPaymentEstimate,
 	IKeysendOptions,
 	IChannelPolicy,
-	IChannelPolicyUpdate
+	IChannelPolicyUpdate,
+	clampFeeRateSatPerVbyte
 } from './types';
 import {
 	validateHexPubkey,
@@ -373,6 +377,10 @@ export class LightningNode extends EventEmitter {
 	private channelSuggestions = new ChannelSuggestions();
 	// BOLT 1 peer storage (option_provide_storage)
 	private peerStorageEnabled: boolean;
+	// option_wumbo (large_channels): lift the 2^24 sat funding cap
+	private largeChannels: boolean;
+	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
+	private socks5Proxy: { host: string; port: number } | null;
 	/** Server side: latest blob held per peer (mirrors storage when available). */
 	private peerStorageBlobs: Map<string, { blob: Buffer; receivedAt: number }> =
 		new Map();
@@ -423,6 +431,7 @@ export class LightningNode extends EventEmitter {
 		this.revocationBasepointSecret = config.revocationBasepointSecret;
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
+		this.socks5Proxy = config.socks5Proxy ?? null;
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
 		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
@@ -450,6 +459,12 @@ export class LightningNode extends EventEmitter {
 		) {
 			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 		}
+		// option_wumbo: advertise large_channels only when explicitly enabled:
+		// the bit invites peers to propose > 2^24 sat fundings.
+		this.largeChannels = config.largeChannels ?? false;
+		if (this.largeChannels) {
+			localFeatures.setOptional(Feature.LARGE_CHANNELS);
+		}
 		// Peer storage (option_provide_storage): on by default. When disabled,
 		// the bit must not be advertised: advertising it obliges us to store
 		// and return blobs (BOLT 1).
@@ -476,7 +491,8 @@ export class LightningNode extends EventEmitter {
 			preferTaproot: config.preferTaproot,
 			chainHash: config.chainHashes?.[0],
 			nodePrivateKey: config.nodePrivateKey,
-			channelKeyDeriver: config.channelKeyDeriver
+			channelKeyDeriver: config.channelKeyDeriver,
+			largeChannels: this.largeChannels
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
@@ -861,7 +877,8 @@ export class LightningNode extends EventEmitter {
 			if (this.feeEstimator) {
 				this.feeEstimator
 					.estimateFee(6)
-					.then((satPerVbyte) => {
+					.then((rawSatPerVbyte) => {
+						const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
 						if (satPerVbyte > 0) {
 							this.feeAdvisor.recordSample(satPerVbyte);
 							const feeratePerKw = Math.max(
@@ -1712,9 +1729,11 @@ export class LightningNode extends EventEmitter {
 					btcNetwork
 			  );
 
-		// Use dynamic fee if estimator available
+		// Use dynamic fee if estimator available (sanity-clamped)
 		const feePromise = this.feeEstimator
-			? this.feeEstimator.estimateFee(6).then((f) => (f > 0 ? f : undefined))
+			? this.feeEstimator
+					.estimateFee(6)
+					.then((f) => (f > 0 ? this.clampEstimatedFeeRate(f) : undefined))
 			: Promise.resolve(undefined);
 
 		feePromise
@@ -2073,7 +2092,9 @@ export class LightningNode extends EventEmitter {
 		let feeRatePerVbyte = opts?.feeRatePerVbyte ?? 0;
 		if (feeRatePerVbyte <= 0 && this.feeEstimator) {
 			try {
-				feeRatePerVbyte = await this.feeEstimator.estimateFee(6);
+				feeRatePerVbyte = this.clampEstimatedFeeRate(
+					await this.feeEstimator.estimateFee(6)
+				);
 			} catch {
 				/* fall through to default */
 			}
@@ -2152,17 +2173,115 @@ export class LightningNode extends EventEmitter {
 
 	// ─────────────── Peer Management ───────────────
 
-	async connectPeer(pubkey: string, host: string, port: number): Promise<void> {
+	/**
+	 * Connect to a peer. When host/port are omitted, the dial address is
+	 * resolved from the gossip graph's node_announcement (addresses tried in
+	 * announced order; Tor addresses are skipped unless a socks5Proxy is
+	 * configured), falling back to DNS bootstrap when the graph has none.
+	 */
+	async connectPeer(
+		pubkey: string,
+		host?: string,
+		port?: number
+	): Promise<void> {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (host === undefined && port === undefined) {
+			await this.connectPeerById(pubkey);
+			return;
+		}
+		if (host === undefined || port === undefined) {
+			throw new Error(
+				'host and port must be provided together (omit both to resolve from gossip/DNS)'
+			);
+		}
 		const hostErr = validateHost(host);
 		if (hostErr) throw new Error(hostErr);
 		const portErr = validatePort(port);
 		if (portErr) throw new Error(portErr);
 		await this.peerManager.connectPeer(pubkey, host, port);
+	}
+
+	/**
+	 * Connect to a peer by node id alone, resolving its address from the
+	 * gossip graph, then DNS bootstrap. Throws an error describing every
+	 * address tried (and every Tor address skipped) when nothing connects.
+	 */
+	private async connectPeerById(pubkey: string): Promise<void> {
+		const attempts: string[] = [];
+		const isTor = (a: INodeAddress): boolean =>
+			a.type === ADDRESS_TYPE_TORV2 || a.type === ADDRESS_TYPE_TORV3;
+
+		// 1. Gossip graph: node_announcement addresses in announced order.
+		const announced =
+			this.graph.getNode(Buffer.from(pubkey, 'hex'))?.announcement?.addresses ??
+			[];
+		let skippedTor = 0;
+		const candidates: Array<{ host: string; port: number }> = [];
+		for (const addr of announced) {
+			if (isTor(addr) && !this.socks5Proxy) {
+				skippedTor++;
+				continue;
+			}
+			const dialable = nodeAddressToHostPort(addr);
+			if (dialable) candidates.push(dialable);
+		}
+		for (const { host, port } of candidates) {
+			try {
+				await this.peerManager!.connectPeer(pubkey, host, port);
+				return;
+			} catch (err) {
+				attempts.push(
+					`graph ${host}:${port} (${
+						err instanceof Error ? err.message : String(err)
+					})`
+				);
+			}
+		}
+		if (skippedTor > 0) {
+			attempts.push(
+				`skipped ${skippedTor} Tor address(es): no socks5Proxy configured`
+			);
+		}
+
+		// 2. DNS bootstrap fallback when the graph produced nothing dialable.
+		if (candidates.length === 0) {
+			let seedPeers: IPeerAddress[] = [];
+			try {
+				seedPeers = await this.bootstrapPeers();
+			} catch (err) {
+				attempts.push(
+					`DNS bootstrap failed (${
+						err instanceof Error ? err.message : String(err)
+					})`
+				);
+			}
+			const matches = seedPeers.filter(
+				(p) => p.pubkey.toString('hex') === pubkey
+			);
+			if (matches.length === 0) {
+				attempts.push('DNS bootstrap returned no address for this node id');
+			}
+			for (const peer of matches) {
+				try {
+					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
+					return;
+				} catch (err) {
+					attempts.push(
+						`dns ${peer.host}:${peer.port} (${
+							err instanceof Error ? err.message : String(err)
+						})`
+					);
+				}
+			}
+		}
+
+		throw new Error(
+			`Unable to resolve a connection to ${pubkey}: ${attempts.join('; ')}`
+		);
 	}
 
 	disconnectPeer(pubkey: string): void {
@@ -3766,9 +3885,16 @@ export class LightningNode extends EventEmitter {
 					Math.min(32, Buffer.byteLength(this.alias, 'utf8'))
 				);
 			}
+			// node_announcement features: only large_channels (bit 19) is
+			// meaningful to announce today; it tells remote nodes wumbo fundings
+			// may be proposed to us.
+			const announcedFeatures = FeatureFlags.empty();
+			if (this.largeChannels) {
+				announcedFeatures.setOptional(Feature.LARGE_CHANNELS);
+			}
 			const payload = encodeNodeAnnouncementMessage({
 				signature: Buffer.alloc(64), // placeholder — signed below
-				features: Buffer.alloc(0),
+				features: announcedFeatures.toBuffer(),
 				timestamp,
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
@@ -7016,7 +7142,8 @@ export class LightningNode extends EventEmitter {
 		if (this.feeEstimator) {
 			this.feeEstimator
 				.estimateFee(6)
-				.then((satPerVbyte) => {
+				.then((rawSatPerVbyte) => {
+					const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
 					if (satPerVbyte > 0) {
 						this.feeAdvisor.recordSample(satPerVbyte);
 						// Feed the live rate to every active monitor so the RBF
@@ -7055,6 +7182,20 @@ export class LightningNode extends EventEmitter {
 			Math.ceil(live * FORCE_CLOSE_FEE_MULTIPLIER),
 			FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE
 		);
+	}
+
+	/**
+	 * Sanity-clamp an IFeeEstimator sample before it feeds any LN operation
+	 * (see clampFeeRateSatPerVbyte), logging a structured warning when the
+	 * estimator's value was actually adjusted.
+	 */
+	private clampEstimatedFeeRate(satPerVbyte: number): number {
+		return clampFeeRateSatPerVbyte(satPerVbyte, (original, clamped) => {
+			this.emitStructuredLog('fee', 'estimate_clamped', {
+				original,
+				clamped
+			});
+		});
 	}
 
 	/**
@@ -7285,6 +7426,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator?: IFeeEstimator;
 			socks5Proxy?: { host: string; port: number };
 			preferAnchors?: boolean;
+			largeChannels?: boolean;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
@@ -7344,6 +7486,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator: options?.feeEstimator,
 			socks5Proxy: options?.socks5Proxy,
 			preferAnchors: options?.preferAnchors,
+			largeChannels: options?.largeChannels,
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
 			peerStorageEnabled: options?.peerStorageEnabled,
@@ -7389,8 +7532,10 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
-		// Defined in Feature but intentionally not advertised or implemented:
-		//  - LARGE_CHANNELS (18): funding is capped at 2^24 sat (wumbo is planned).
+		// Defined in Feature but intentionally not advertised by default:
+		//  - LARGE_CHANNELS (18): advertised only when the largeChannels config
+		//    flag opts in (the constructor sets the bit); default keeps the
+		//    2^24 sat funding cap.
 		//  - ANCHOR_OUTPUTS (20): legacy anchors, superseded by bit 22 above.
 		//  - GOSSIP_QUERIES_EX (10): extended queries not implemented.
 		//  - UPFRONT_SHUTDOWN_SCRIPT (4): parsed from channel-open messages but
@@ -8248,7 +8393,9 @@ export class LightningNode extends EventEmitter {
 	private async checkAndUpdateFees(): Promise<void> {
 		if (!this.feeEstimator) return;
 
-		const satPerVbyte = await this.feeEstimator.estimateFee(6);
+		const satPerVbyte = this.clampEstimatedFeeRate(
+			await this.feeEstimator.estimateFee(6)
+		);
 		if (satPerVbyte <= 0) return;
 
 		this.feeAdvisor.recordSample(satPerVbyte);

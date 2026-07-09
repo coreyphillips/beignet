@@ -585,6 +585,50 @@ function base32Decode(input: string): Buffer {
 	return Buffer.from(out);
 }
 
+function base32Encode(buf: Buffer): string {
+	let bits = 0;
+	let value = 0;
+	let out = '';
+	for (const byte of buf) {
+		value = (value << 8) | byte;
+		bits += 8;
+		while (bits >= 5) {
+			out += BASE32_ALPHABET[(value >>> (bits - 5)) & 0x1f];
+			bits -= 5;
+		}
+	}
+	if (bits > 0) {
+		out += BASE32_ALPHABET[(value << (5 - bits)) & 0x1f];
+	}
+	return out;
+}
+
+/**
+ * Convert a BOLT 7 address descriptor (as stored in the graph: Tor hosts are
+ * the hex-encoded descriptor payload) into a dialable host:port. Tor v2/v3
+ * payloads are re-encoded to their base32 ".onion" hostname; unknown types
+ * return null.
+ */
+export function nodeAddressToHostPort(
+	addr: INodeAddress
+): { host: string; port: number } | null {
+	switch (addr.type) {
+		case ADDRESS_TYPE_IPV4:
+		case ADDRESS_TYPE_IPV6:
+		case ADDRESS_TYPE_DNS:
+			return { host: addr.host, port: addr.port };
+		case ADDRESS_TYPE_TORV2:
+		case ADDRESS_TYPE_TORV3: {
+			const payload = Buffer.from(addr.host, 'hex');
+			const expectedLen = addr.type === ADDRESS_TYPE_TORV2 ? 10 : 35;
+			if (payload.length !== expectedLen) return null;
+			return { host: `${base32Encode(payload)}.onion`, port: addr.port };
+		}
+		default:
+			return null;
+	}
+}
+
 function expandIpv6(host: string): string {
 	let groups: string[];
 	const doubleColon = host.indexOf('::');

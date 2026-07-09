@@ -100,7 +100,9 @@ import {
 	ChannelRole,
 	HtlcDirection,
 	isAnchorChannel,
-	isTaprootChannel
+	isTaprootChannel,
+	MAX_FUNDING_SATOSHIS,
+	MAX_WUMBO_FUNDING_SATOSHIS
 } from './types';
 import {
 	IChannelBasepoints,
@@ -182,6 +184,12 @@ export interface IChannelManagerConfig {
 	 * When absent, feature-gated behavior stays on the legacy path.
 	 */
 	localFeatures?: FeatureFlags;
+	/**
+	 * option_wumbo (large_channels, bit 18): lift the 2^24 sat funding cap to
+	 * MAX_WUMBO_FUNDING_SATOSHIS for peers that ALSO advertised the bit. Off by
+	 * default: every open/accept/v2/splice keeps the BOLT 2 cap.
+	 */
+	largeChannels?: boolean;
 }
 
 /**
@@ -424,6 +432,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		const channel = new Channel(state, signer);
 		channel.channelKeyIndex = chKeys.channelIndex;
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
@@ -468,6 +477,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		const channel = new Channel(state, signer);
 		channel.channelKeyIndex = chKeys.channelIndex;
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
@@ -1669,6 +1679,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		const channel = new Channel(state, signer);
 		channel.channelKeyIndex = chKeys.channelIndex;
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
@@ -2965,6 +2976,21 @@ export class ChannelManager extends EventEmitter {
 	 * it. Unlike peerSupportsSplicing, an unknown peer init defaults to FALSE —
 	 * legacy closing_signed is the safe fallback every peer understands.
 	 */
+	/**
+	 * Funding cap to enforce for operations with this peer. Lifted above the
+	 * BOLT 2 2^24 sat cap only when option_wumbo is BOTH enabled locally
+	 * (largeChannels) and advertised in the peer's init features; an unknown
+	 * peer init defaults to the non-wumbo cap.
+	 */
+	private maxFundingForPeer(peerPubkey: string): bigint {
+		if (!this.config.largeChannels) return MAX_FUNDING_SATOSHIS;
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return MAX_FUNDING_SATOSHIS;
+		return init.features.hasFeature(Feature.LARGE_CHANNELS)
+			? MAX_WUMBO_FUNDING_SATOSHIS
+			: MAX_FUNDING_SATOSHIS;
+	}
+
 	private peerNegotiatedSimpleClose(peerPubkey: string): boolean {
 		if (!this.config.localFeatures?.hasFeature(Feature.SIMPLE_CLOSE)) {
 			return false;
@@ -2997,6 +3023,9 @@ export class ChannelManager extends EventEmitter {
 			return;
 		}
 
+		// Splices can grow capacity, so refresh the (possibly wumbo-lifted) cap
+		// from the peer's live init features before validating.
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const actions = channel.handleSplice(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -3006,6 +3035,7 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const actions = channel.handleSpliceAck(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -3081,6 +3111,9 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		// Refresh the (possibly wumbo-lifted) funding cap before the splice-in
+		// growth check inside initiateSplice.
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const actions = channel.initiateSplice(
 			relativeSatoshis,
 			fundingFeeratePerkw,
@@ -3201,6 +3234,7 @@ export class ChannelManager extends EventEmitter {
 			)
 		};
 
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		// initiateOpenV2 derives the BOLT-2 temporary_channel_id from our
 		// revocation basepoint (replacing the random stub), so key tempChannels
 		// AFTER it runs — otherwise accept_channel2 (which echoes the derived id)
@@ -3266,6 +3300,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		const channel = new Channel(state, signer);
 		channel.channelKeyIndex = chKeys.channelIndex;
+		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.channelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
