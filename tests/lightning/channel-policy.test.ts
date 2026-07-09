@@ -408,7 +408,11 @@ describe('Channel Routing Policy (M3)', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
 			try {
-				expect(storage.getSchemaVersion()).to.equal(4);
+				// At least v4: the channel_policies migration this test depends on
+				expect(storage.getSchemaVersion()).to.be.at.least(4);
+				expect(storage.getSchemaVersion()).to.equal(
+					SqliteStorage.CURRENT_SCHEMA_VERSION
+				);
 				storage.saveChannelPolicy('aa'.repeat(32), {
 					feeBaseMsat: 123,
 					htlcMinimumMsat: '999'

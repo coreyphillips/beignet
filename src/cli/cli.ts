@@ -664,6 +664,11 @@ async function handleOffer(): Promise<void> {
 
 async function handleBackup(): Promise<void> {
 	const sub = filteredArgs[1];
+	if (sub === 'peer-retrieved') {
+		// `beignet backup peer-retrieved`: newest valid SCB a peer returned via
+		// BOLT 1 peer storage. Restore explicitly with `beignet restore scb`.
+		return outputResult(await httpRequest('GET', '/backup/peer-retrieved'));
+	}
 	if (sub === 'scb') {
 		// `beignet backup scb [destPath]`: fetch the encrypted static channel
 		// backup; with destPath, write the encoded blob there instead of printing.
@@ -879,6 +884,8 @@ On-chain:
   fee-estimates                          Current fee estimates (sats/vbyte)
   backup <destPath>                      Create database backup
   backup scb [destPath]                  Export encrypted static channel backup
+  backup peer-retrieved                  Show newest SCB returned by a peer
+                                         (BOLT 1 peer storage)
   restore scb <file>                     Restore channels from an SCB (on-chain
                                          recovery only: peers force-close and
                                          funds are swept to the wallet)

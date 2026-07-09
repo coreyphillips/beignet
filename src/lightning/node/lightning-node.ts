@@ -106,6 +106,13 @@ import {
 } from '../invoice/types';
 import { MessageType } from '../message/types';
 import {
+	PEER_STORAGE_MAX_BYTES,
+	encodePeerStorageMessage,
+	decodePeerStorageMessage,
+	encodePeerStorageRetrievalMessage,
+	decodePeerStorageRetrievalMessage
+} from '../message/peer-storage';
+import {
 	INodeConfig,
 	IResourceConfig,
 	IPaymentInfo,
@@ -215,6 +222,7 @@ bitcoin.initEccLib(ecc);
  * - 'peer:connect' (pubkey: string)
  * - 'peer:disconnect' (pubkey: string)
  * - 'peer:error' (pubkey: string, error: Error)
+ * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
  */
 
 /**
@@ -356,6 +364,20 @@ export class LightningNode extends EventEmitter {
 	private liquidityAdvisor = new LiquidityAdvisor();
 	private feeAdvisor = new FeeAdvisor();
 	private channelSuggestions = new ChannelSuggestions();
+	// BOLT 1 peer storage (option_provide_storage)
+	private peerStorageEnabled: boolean;
+	/** Server side: latest blob held per peer (mirrors storage when available). */
+	private peerStorageBlobs: Map<string, { blob: Buffer; receivedAt: number }> =
+		new Map();
+	/** Server side: last accepted peer_storage timestamp per peer (rate limit). */
+	private peerStorageLastAccepted: Map<string, number> = new Map();
+	/** Client side: our own blob, pushed to capable peers on change/connect. */
+	private ourPeerStorageBlob: Buffer | null = null;
+	/** Client side: newest blob each peer returned via peer_storage_retrieval. */
+	private retrievedPeerStorage: Map<
+		string,
+		{ blob: Buffer; receivedAt: number }
+	> = new Map();
 
 	constructor(config: INodeConfig) {
 		super();
@@ -421,6 +443,14 @@ export class LightningNode extends EventEmitter {
 		) {
 			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 		}
+		// Peer storage (option_provide_storage): on by default. When disabled,
+		// the bit must not be advertised: advertising it obliges us to store
+		// and return blobs (BOLT 1).
+		this.peerStorageEnabled = config.peerStorageEnabled ?? true;
+		if (!this.peerStorageEnabled) {
+			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
+			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
+		}
 
 		this.channelManager = new ChannelManager({
 			localFeatures,
@@ -477,6 +507,7 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.attachToPeerManager(this.peerManager);
 			this.registerGossipHandlers();
 			this.registerOnionMessageHandler();
+			this.registerPeerStorageHandlers();
 			this.wirePeerManagerEvents();
 		}
 
@@ -1331,9 +1362,215 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	// ─────────────── Peer Storage (BOLT 1 option_provide_storage) ───────────────
+
+	/** Server side: minimum interval between accepted blobs per peer. */
+	private static readonly PEER_STORAGE_MIN_INTERVAL_MS = 60_000;
+
+	private registerPeerStorageHandlers(): void {
+		if (!this.peerManager) return;
+		this.peerManager.onMessage(
+			MessageType.PEER_STORAGE,
+			(pubkey, _t, payload) => {
+				this.handlePeerStorageMessage(pubkey, payload);
+			}
+		);
+		this.peerManager.onMessage(
+			MessageType.PEER_STORAGE_RETRIEVAL,
+			(pubkey, _t, payload) => {
+				this.handlePeerStorageRetrievalMessage(pubkey, payload);
+			}
+		);
+	}
+
+	/**
+	 * Server side: hold the latest blob for a peer we have a channel with (or a
+	 * trusted peer). Odd message type, so malformed/ineligible blobs are dropped
+	 * (logged), never a connection error.
+	 */
+	private handlePeerStorageMessage(pubkey: string, payload: Buffer): void {
+		if (!this.peerStorageEnabled) return;
+		let blob: Buffer;
+		try {
+			blob = decodePeerStorageMessage(payload).blob;
+		} catch (err) {
+			this.emitStructuredLog('peer', 'peer_storage_invalid', {
+				pubkey,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return;
+		}
+		// Only spend storage on peers with a fund relationship: an open channel
+		// in any live state, or explicit trust (zero-conf set).
+		if (!this.peerQualifiesForStorage(pubkey)) {
+			this.emitStructuredLog('peer', 'peer_storage_rejected', {
+				pubkey,
+				reason: 'no channel and not trusted'
+			});
+			return;
+		}
+		// Rate limit: one accepted blob per peer per interval, so a misbehaving
+		// peer cannot turn every update into a disk write.
+		const now = Date.now();
+		const last = this.peerStorageLastAccepted.get(pubkey);
+		if (
+			last !== undefined &&
+			now - last < LightningNode.PEER_STORAGE_MIN_INTERVAL_MS
+		) {
+			return;
+		}
+		this.peerStorageLastAccepted.set(pubkey, now);
+		this.peerStorageBlobs.set(pubkey, { blob, receivedAt: now });
+		if (this.storage?.savePeerStorageBlob) {
+			this.safeStorage(
+				() => this.storage!.savePeerStorageBlob!(pubkey, blob, now),
+				'savePeerStorageBlob'
+			);
+		}
+	}
+
+	/**
+	 * Client side: a peer returned the blob it held for us. Kept in memory
+	 * (newest per peer) and surfaced via event; validation and any use of the
+	 * contents is the caller's job: a peer may return stale data or garbage.
+	 */
+	private handlePeerStorageRetrievalMessage(
+		pubkey: string,
+		payload: Buffer
+	): void {
+		if (!this.peerStorageEnabled) return;
+		let blob: Buffer;
+		try {
+			blob = decodePeerStorageRetrievalMessage(payload).blob;
+		} catch (err) {
+			this.emitStructuredLog('peer', 'peer_storage_retrieval_invalid', {
+				pubkey,
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return;
+		}
+		this.retrievedPeerStorage.set(pubkey, { blob, receivedAt: Date.now() });
+		this.emit('peer_storage:retrieved', pubkey, blob);
+	}
+
+	/** Whether a peer earns storage: any non-CLOSED channel, or trusted. */
+	private peerQualifiesForStorage(pubkey: string): boolean {
+		if (this.channelManager.isTrustedPeer(pubkey)) return true;
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			if (this.channelManager.getPeerForChannel(channelId) !== pubkey) continue;
+			if (channel.getState() !== ChannelState.CLOSED) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * On (re)connect: return the peer's stored blob (BOLT 1 MUST, we advertise
+	 * the feature) and push our own blob if the peer advertised
+	 * option_provide_storage. Best-effort: the peer may already be gone.
+	 */
+	private sendPeerStorageOnConnect(pubkey: string): void {
+		if (!this.peerStorageEnabled || !this.peerManager) return;
+		// Server direction: peer_storage_retrieval with the blob we hold.
+		let held = this.peerStorageBlobs.get(pubkey);
+		if (!held && this.storage?.loadPeerStorageBlob) {
+			try {
+				const loaded = this.storage.loadPeerStorageBlob(pubkey);
+				if (loaded) {
+					held = loaded;
+					this.peerStorageBlobs.set(pubkey, loaded);
+				}
+			} catch (err) {
+				this.emitStructuredLog('peer', 'peer_storage_load_failed', {
+					pubkey,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+		}
+		try {
+			if (held) {
+				this.peerManager.sendToPeer(
+					pubkey,
+					MessageType.PEER_STORAGE_RETRIEVAL,
+					encodePeerStorageRetrievalMessage({ blob: held.blob })
+				);
+			}
+			// Client direction: our current blob, only to peers advertising the bit.
+			if (this.ourPeerStorageBlob && this.peerAdvertisesPeerStorage(pubkey)) {
+				this.peerManager.sendToPeer(
+					pubkey,
+					MessageType.PEER_STORAGE,
+					encodePeerStorageMessage({ blob: this.ourPeerStorageBlob })
+				);
+			}
+		} catch {
+			// Peer disconnected between connect event and send; ignore.
+		}
+	}
+
+	private peerAdvertisesPeerStorage(pubkey: string): boolean {
+		const init = this.peerManager?.getPeer(pubkey)?.getRemoteInit();
+		return init ? init.features.hasFeature(Feature.PROVIDE_STORAGE) : false;
+	}
+
+	/**
+	 * Set our backup blob and push it to every connected peer that advertised
+	 * option_provide_storage (BOLT 1 forbids sending to others). The blob is
+	 * remembered and re-pushed to each capable peer on connect. Returns the
+	 * number of peers the blob was sent to.
+	 *
+	 * Throws on an oversized blob: silently truncated backups are worse than
+	 * no backup.
+	 */
+	distributePeerStorage(blob: Buffer): number {
+		if (blob.length > PEER_STORAGE_MAX_BYTES) {
+			throw new Error(
+				`peer storage blob too large: ${blob.length} > ${PEER_STORAGE_MAX_BYTES} bytes`
+			);
+		}
+		if (!this.peerStorageEnabled) return 0;
+		this.ourPeerStorageBlob = Buffer.from(blob);
+		if (!this.peerManager) return 0;
+		const payload = encodePeerStorageMessage({ blob: this.ourPeerStorageBlob });
+		let sent = 0;
+		for (const peer of this.peerManager.listPeers()) {
+			if (!this.peerAdvertisesPeerStorage(peer.pubkey)) continue;
+			try {
+				this.peerManager.sendToPeer(
+					peer.pubkey,
+					MessageType.PEER_STORAGE,
+					payload
+				);
+				sent++;
+			} catch {
+				// Peer disconnected mid-iteration; skip.
+			}
+		}
+		return sent;
+	}
+
+	/** Newest blob each peer has returned via peer_storage_retrieval. */
+	getRetrievedPeerStorage(): Array<{
+		peerPubkey: string;
+		blob: Buffer;
+		receivedAt: number;
+	}> {
+		return [...this.retrievedPeerStorage.entries()].map(
+			([peerPubkey, { blob, receivedAt }]) => ({
+				peerPubkey,
+				blob: Buffer.from(blob),
+				receivedAt
+			})
+		);
+	}
+
 	private wirePeerManagerEvents(): void {
 		if (!this.peerManager) return;
 		this.peerManager.on('peer:connect', (pubkey: string) => {
+			// BOLT 1 peer storage first: return the peer's stored blob and push our
+			// own, before reestablish/gossip traffic (spec: ideally right after init).
+			this.sendPeerStorageOnConnect(pubkey);
 			this.channelManager.handlePeerReconnected(pubkey);
 			// Push our own gossip to the new peer so it propagates onward — a one-shot
 			// broadcast at announcement time rarely reaches the whole network.
@@ -6937,6 +7174,7 @@ export class LightningNode extends EventEmitter {
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
 			sweepDestinationScript?: Buffer;
+			peerStorageEnabled?: boolean;
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
@@ -6993,6 +7231,7 @@ export class LightningNode extends EventEmitter {
 			preferAnchors: options?.preferAnchors,
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
+			peerStorageEnabled: options?.peerStorageEnabled,
 			channelKeyDeriver
 		});
 	}
@@ -7030,6 +7269,11 @@ export class LightningNode extends EventEmitter {
 		// zero_conf channel_type is still rejected, and minimum_depth stays
 		// non-zero, unless the peer is in the trusted set (ZeroConfManager).
 		flags.setOptional(Feature.ZERO_CONF);
+		// Peer storage (BOLT 1): we hold one small blob per channel/trusted peer
+		// and return it on reconnect, enabling peers to recover their static
+		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
+		// the constructor clears the bit when that config flag is false.
+		flags.setOptional(Feature.PROVIDE_STORAGE);
 		// Defined in Feature but intentionally not advertised or implemented:
 		//  - LARGE_CHANNELS (18): funding is capped at 2^24 sat (wumbo is planned).
 		//  - ANCHOR_OUTPUTS (20): legacy anchors, superseded by bit 22 above.

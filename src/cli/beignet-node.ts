@@ -189,6 +189,14 @@ export interface BeignetNodeOptions {
 	 * to keep storage in plaintext.
 	 */
 	storageEncryption?: boolean;
+	/**
+	 * BOLT 1 peer storage (default true): push our seed-encrypted static
+	 * channel backup to connected peers that advertise option_provide_storage,
+	 * store one small blob per channel/trusted peer in return, and keep the
+	 * newest valid SCB peers hand back on reconnect (see
+	 * getPeerRetrievedBackup). Recovery stays explicit via restoreFromScb.
+	 */
+	peerStorageEnabled?: boolean;
 }
 
 const DEFAULT_DATA_DIR = path.join(
@@ -316,6 +324,13 @@ export class BeignetNode extends EventEmitter {
 	private _pendingSpendSats = 0;
 	private _maxPaymentSats?: number;
 	private _draining = false;
+	private peerStorageEnabled = true;
+	/** Newest VALID SCB a peer returned via peer storage (never auto-restored). */
+	private _peerRetrievedScb: {
+		encoded: string;
+		createdAt: number;
+		fromPeer: string;
+	} | null = null;
 
 	private constructor(
 		mnemonic: string,
@@ -357,6 +372,7 @@ export class BeignetNode extends EventEmitter {
 	private async init(opts: BeignetNodeOptions): Promise<void> {
 		if (opts.logLevel) this.logLevel = opts.logLevel;
 		this.autoGossipSync = opts.autoGossipSync ?? true;
+		this.peerStorageEnabled = opts.peerStorageEnabled ?? true;
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
 		this.rapidGossipSyncUrl = opts.rapidGossipSyncUrl;
 		const networkName = this.networkName;
@@ -594,7 +610,8 @@ export class BeignetNode extends EventEmitter {
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			sweepDestinationScript,
-			socks5Proxy
+			socks5Proxy,
+			peerStorageEnabled: this.peerStorageEnabled
 		});
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
@@ -711,6 +728,18 @@ export class BeignetNode extends EventEmitter {
 			this.log('info', 'Node ready');
 			this.emit('node:ready');
 		});
+
+		// Peer storage: peers that hold our SCB return it on every reconnect.
+		// Keep only blobs that decrypt as OUR backup (a peer may return stale
+		// data or garbage) and only the newest of those. Never auto-restored.
+		this.node.on('peer_storage:retrieved', (peerPubkey: string, blob: Buffer) =>
+			this.handleRetrievedPeerStorage(peerPubkey, blob)
+		);
+		// Prime the distributed blob so on-connect pushes carry the current SCB
+		// (channels are already restored from storage at this point).
+		if (this.peerStorageEnabled) {
+			this.refreshStaticChannelBackup();
+		}
 
 		// 7. Warm fee cache so getFeeSnapshot() works immediately
 		try {
@@ -3503,17 +3532,75 @@ export class BeignetNode extends EventEmitter {
 
 	/**
 	 * Re-export the SCB after a channel-set change. A backup failure must never
-	 * crash the node, so failures only log a warning.
+	 * crash the node, so failures only log a warning. When peer storage is
+	 * enabled, the fresh blob is also pushed to every connected peer that
+	 * advertises option_provide_storage (and to capable peers on connect).
 	 */
 	private refreshStaticChannelBackup(): void {
 		if (this.destroyed) return;
 		try {
-			this.exportStaticChannelBackup();
+			const { encoded } = this.exportStaticChannelBackup();
+			if (this.peerStorageEnabled) {
+				const sent = this.node.distributePeerStorage(
+					Buffer.from(encoded, 'utf8')
+				);
+				if (sent > 0) {
+					this.log('debug', 'Pushed SCB to peer storage', { peers: sent });
+				}
+			}
 		} catch (err) {
 			this.log('warn', 'Static channel backup refresh failed', {
 				error: err instanceof Error ? err.message : String(err)
 			});
 		}
+	}
+
+	/**
+	 * Validate a peer-returned storage blob as OUR seed-encrypted SCB and keep
+	 * the newest valid one. Undecodable blobs are ignored: peers are untrusted
+	 * and may return anything.
+	 */
+	private handleRetrievedPeerStorage(peerPubkey: string, blob: Buffer): void {
+		let backup: IStaticChannelBackup;
+		const encoded = blob.toString('utf8');
+		try {
+			const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+			backup = decodeScb(encoded, seed);
+		} catch {
+			this.log('debug', 'Ignoring peer storage blob that is not our SCB', {
+				fromPeer: peerPubkey
+			});
+			return;
+		}
+		if (
+			this._peerRetrievedScb &&
+			this._peerRetrievedScb.createdAt >= backup.createdAt
+		) {
+			return;
+		}
+		this._peerRetrievedScb = {
+			encoded,
+			createdAt: backup.createdAt,
+			fromPeer: peerPubkey
+		};
+		this.log('info', 'Recovered SCB from peer storage', {
+			fromPeer: peerPubkey,
+			createdAt: backup.createdAt,
+			channelCount: backup.channels.length
+		});
+	}
+
+	/**
+	 * Newest valid SCB a peer has returned via BOLT 1 peer storage this
+	 * session, or null. Recovery stays explicit: feed `encoded` to
+	 * restoreFromScb (daemon: POST /restore/scb) when recovering.
+	 */
+	getPeerRetrievedBackup(): {
+		encoded: string;
+		createdAt: number;
+		fromPeer: string;
+	} | null {
+		return this._peerRetrievedScb;
 	}
 
 	// ─────────────── Node URI ───────────────

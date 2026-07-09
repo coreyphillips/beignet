@@ -99,8 +99,9 @@ describe('Webhook Persistence', () => {
 		expect(list[0].secret).to.equal('***');
 	});
 
-	it('SqliteStorage schema version advances to 4', () => {
-		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(4);
+	it('SqliteStorage schema version covers the webhooks migration', () => {
+		// Webhooks arrived in v2; later features keep bumping the version
+		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.be.at.least(2);
 		const version = storage.getSchemaVersion();
 		expect(version).to.be.at.least(1);
 	});

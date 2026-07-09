@@ -132,6 +132,20 @@ export interface IStorageBackend {
 	/** Delete a per-channel routing-policy override. */
 	deleteChannelPolicy?(channelId: string): void;
 
+	// ─── Peer Storage Blobs (optional, BOLT 1 option_provide_storage) ───
+	/** Persist the latest peer_storage blob for a peer (one blob per peer). */
+	savePeerStorageBlob?(
+		peerPubkey: string,
+		blob: Buffer,
+		receivedAt: number
+	): void;
+	/** Load the stored peer_storage blob for a peer. */
+	loadPeerStorageBlob?(
+		peerPubkey: string
+	): { blob: Buffer; receivedAt: number } | null;
+	/** Delete the stored peer_storage blob for a peer. */
+	deletePeerStorageBlob?(peerPubkey: string): void;
+
 	// ─── Action Log (optional) ───
 	/** Save a structured log entry. Capped at maxRows (default 10000). */
 	saveActionLog?(entry: {
