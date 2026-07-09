@@ -1050,6 +1050,20 @@ export class Channel {
 					}
 				];
 			}
+			// A zero_conf channel type commits us to minimum_depth 0 (BOLT 2), so
+			// only accept it from peers in the trusted set (unconfirmed funding can
+			// be double-spent by the opener).
+			if (
+				proposedFlags.hasFeature(Feature.ZERO_CONF) &&
+				!(this._state.zeroConfEnabled && this._state.trustedPeer)
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Proposed zero_conf channel type requires a trusted peer'
+					}
+				];
+			}
 			this._state.channelType = msg.channelType;
 		} else {
 			// If no channel type proposed, default to static_remotekey
@@ -6939,6 +6953,23 @@ export class Channel {
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = msg.commitmentFeeratePerkw;
 		this._state.fundingLocktime = msg.locktime;
+
+		// Same trusted-peer gate as the v1 path: a zero_conf channel type commits
+		// us to minimum_depth 0, which we only extend to trusted peers.
+		if (msg.channelType) {
+			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
+			if (
+				proposedFlags.hasFeature(Feature.ZERO_CONF) &&
+				!(this._state.zeroConfEnabled && this._state.trustedPeer)
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Proposed zero_conf channel type requires a trusted peer'
+					}
+				];
+			}
+		}
 
 		// accept_channel2 also carries a REAL first_per_commitment_point (see
 		// initiateOpenV2): derive it from our seed rather than trusting the
