@@ -263,6 +263,34 @@ automatically whenever the channel set changes (channel open/splice calls,
 `channel:ready`, `channel:closed`, and channel resolution). Store a copy
 off-machine (e.g. via `beignet backup scb <destPath>` or `GET /backup/scb`).
 
+#### Automatic Peer Backup (BOLT 1 peer storage)
+
+| Method / Command | Returns | Description |
+|--------|---------|-------------|
+| `getPeerRetrievedBackup()` | `{ encoded, createdAt, fromPeer } \| null` | Newest valid SCB a peer returned this session (daemon: `GET /backup/peer-retrieved`; CLI: `beignet backup peer-retrieved`) |
+
+With `peerStorageEnabled` (default true) the node advertises
+`option_provide_storage` and uses it in both directions:
+
+- **Our backup, held by peers.** Every SCB refresh is pushed as an opaque
+  `peer_storage` blob to each connected peer that advertises the feature, and
+  each such peer returns its held copy via `peer_storage_retrieval` on every
+  reconnect. Recovery-from-nothing: reinstall with the mnemonic, connect to
+  your old peers, read `GET /backup/peer-retrieved`, and feed its `encoded`
+  blob to `POST /restore/scb`. Nothing is restored automatically - recovery
+  stays explicit, and SCB recovery never broadcasts a stale commitment, so a
+  peer returning an old blob is harmless.
+- **Trust model.** Peers only ever see the seed-encrypted `beignet-scb-v1`
+  ciphertext; without the mnemonic it is useless to them. Blobs returned by
+  peers are untrusted input: anything that does not decrypt as our own SCB is
+  ignored, and among valid ones only the newest (`createdAt`) is kept.
+- **Storing for peers.** In return the node holds ONE blob (max 65531 bytes,
+  newest wins) per peer it has a non-closed channel with or trusts
+  (zero-conf trusted set), accepts at most one blob per peer per 60 seconds,
+  and sends it back on every reconnect. Blobs from strangers are dropped.
+  Stored blobs live in the `peer_storage_blobs` table, encrypted at rest like
+  the rest of the database.
+
 #### Restore
 
 | Method / Command | Returns | Description |

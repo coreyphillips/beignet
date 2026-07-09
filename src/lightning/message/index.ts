@@ -11,6 +11,7 @@ export * from './channel-commitment';
 export * from './channel-close';
 export * from './channel-reestablish';
 export * from './stfu';
+export * from './peer-storage';
 export * from './interactive-tx';
 export * from './dual-funding';
 export * from './splice';

@@ -48,6 +48,12 @@ export enum Feature {
 	DUAL_FUND = 28,
 	/** Onion messages */
 	ONION_MESSAGES = 38,
+	/**
+	 * Peer storage (option_provide_storage, BOLT 1): node stores a small
+	 * opaque blob per peer (peer_storage, type 7) and returns it on reconnect
+	 * (peer_storage_retrieval, type 9).
+	 */
+	PROVIDE_STORAGE = 42,
 	/** Quiescence / STFU (BOLT 2) — prerequisite for splicing */
 	QUIESCE = 34,
 	/** Channel type negotiation */

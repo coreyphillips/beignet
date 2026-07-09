@@ -137,6 +137,14 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/**
+	 * BOLT 1 peer storage (option_provide_storage, default true): store the
+	 * latest peer_storage blob per channel/trusted peer and return it on
+	 * reconnect, and push our own blob (set via distributePeerStorage) to
+	 * capable peers. When false the feature bit is not advertised and both
+	 * directions are disabled.
+	 */
+	peerStorageEnabled?: boolean;
 	/** Fee estimator for dynamic fee rates */
 	feeEstimator?: IFeeEstimator;
 	/** Maximum payment retries (default 3) */

@@ -834,6 +834,18 @@ export async function startDaemon(
 			return success({ backed_up: true });
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
+		// Newest valid SCB returned by a peer via BOLT 1 peer storage. Recovery
+		// stays explicit: POST /restore/scb with the returned `encoded` blob.
+		'GET /backup/peer-retrieved': () => {
+			const retrieved = node.getPeerRetrievedBackup();
+			if (!retrieved) {
+				return failure(
+					'NOT_FOUND',
+					'No peer-retrieved backup this session (no capable peer has returned our SCB yet)'
+				);
+			}
+			return success(retrieved);
+		},
 		'POST /restore/scb': async (body) => {
 			const { encoded, path: scbPath } = body as {
 				encoded?: string;

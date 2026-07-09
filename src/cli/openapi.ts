@@ -830,6 +830,22 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/backup/peer-retrieved': {
+				get: {
+					summary:
+						'Get the newest valid SCB a peer returned via BOLT 1 peer storage (recovery flow: reinstall with the mnemonic, connect to peers, fetch this, then POST /restore/scb with its encoded blob)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description:
+								'Encoded SCB blob, its creation timestamp, and the peer that returned it'
+						},
+						'404': {
+							description: 'No peer has returned a valid backup this session'
+						}
+					}
+				}
+			},
 			'/restore/scb': {
 				post: {
 					summary:

@@ -14,6 +14,10 @@ export enum MessageType {
 	PING = 18,
 	PONG = 19,
 
+	// BOLT 1: Peer storage (option_provide_storage)
+	PEER_STORAGE = 7,
+	PEER_STORAGE_RETRIEVAL = 9,
+
 	// BOLT 2: Channel management
 	OPEN_CHANNEL = 32,
 	ACCEPT_CHANNEL = 33,

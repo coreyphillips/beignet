@@ -122,7 +122,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 4;
+	static readonly CURRENT_SCHEMA_VERSION = 5;
 
 	/**
 	 * Sensitive payload columns encrypted at rest when an encryptionKey is set.
@@ -156,7 +156,11 @@ export class SqliteStorage implements IStorageBackend {
 			table: 'channel_key_indices',
 			pk: 'channel_id',
 			columns: ['channel_index']
-		}
+		},
+		// Opaque per-peer blobs (BOLT 1 peer storage). The sender encrypts them
+		// itself, but they are still user data we should not leak from a stolen
+		// database file.
+		{ table: 'peer_storage_blobs', pk: 'peer_pubkey', columns: ['blob'] }
 	];
 
 	/**
@@ -320,6 +324,12 @@ export class SqliteStorage implements IStorageBackend {
 			CREATE TABLE IF NOT EXISTS channel_policies (
 				channel_id TEXT PRIMARY KEY,
 				policy_json TEXT NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS peer_storage_blobs (
+				peer_pubkey TEXT PRIMARY KEY,
+				blob TEXT NOT NULL,
+				received_at INTEGER NOT NULL
 			);
 		`);
 
@@ -1011,6 +1021,12 @@ export class SqliteStorage implements IStorageBackend {
 			// is broadcast publicly in channel_update gossip, nothing sensitive.
 			(): void => {
 				// No-op
+			},
+			// Migration 4->5: peer_storage_blobs table (BOLT 1 peer storage).
+			// Created via CREATE IF NOT EXISTS above; the blob column is in
+			// ENCRYPTED_COLUMNS so it is encrypted at rest when a key is set.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1083,6 +1099,43 @@ export class SqliteStorage implements IStorageBackend {
 		this.db
 			.prepare('DELETE FROM channel_policies WHERE channel_id = ?')
 			.run(channelId);
+	}
+
+	// ─── Peer Storage Blobs (BOLT 1 option_provide_storage) ───
+	// One blob per peer, newest wins. Stored base64 and encrypted at rest
+	// (see ENCRYPTED_COLUMNS): opaque user data, not ours to inspect.
+
+	savePeerStorageBlob(
+		peerPubkey: string,
+		blob: Buffer,
+		receivedAt: number
+	): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO peer_storage_blobs (peer_pubkey, blob, received_at) VALUES (?, ?, ?)'
+			)
+			.run(peerPubkey, this._enc(blob.toString('base64')), receivedAt);
+	}
+
+	loadPeerStorageBlob(
+		peerPubkey: string
+	): { blob: Buffer; receivedAt: number } | null {
+		const row = this.db
+			.prepare(
+				'SELECT blob, received_at FROM peer_storage_blobs WHERE peer_pubkey = ?'
+			)
+			.get(peerPubkey) as { blob: string; received_at: number } | undefined;
+		if (!row) return null;
+		return {
+			blob: Buffer.from(this._dec(row.blob), 'base64'),
+			receivedAt: row.received_at
+		};
+	}
+
+	deletePeerStorageBlob(peerPubkey: string): void {
+		this.db
+			.prepare('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?')
+			.run(peerPubkey);
 	}
 
 	// ─── Transaction ───

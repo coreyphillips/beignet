@@ -49,13 +49,17 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       envelope encryption of sensitive tables (htlc_shared_secrets included) keyed
       via HKDF from the seed, default-on in BeignetNode with in-place migration and
       an opt-out flag.
-- [~] Onchain wallet (this PR): document that persistence encryption is delegated to
-      the host TStorage, and provide an optional built-in encryption wrapper
+- [x] Onchain wallet (PR #41, merged): documented that persistence encryption is
+      delegated to the host TStorage, plus an optional built-in encryption wrapper
       (`createEncryptedStorage`, AES-256-GCM keyed via HKDF from the seed, lazy
-      plaintext migration).
-- [~] DECIDED (Corey): Peer storage (option_provide_storage, peer_storage/
-      your_peer_storage messages): implement client + server, in progress in a
-      parallel PR. Store an encrypted SCB with channel peers, retrieve on reconnect.
+      plaintext migration). Daemon audit: BeignetNode passes no wallet storage at
+      all; persistence item added under M4.
+- [~] DECIDED (Corey): Peer storage (this PR): option_provide_storage bit 42
+      advertised, peer_storage (7) / peer_storage_retrieval (9) messages, server
+      stores one encrypted blob per channel/trusted peer (rate-limited, returned on
+      every reconnect), client pushes our seed-encrypted SCB to capable peers on
+      each refresh and keeps the newest valid retrieved copy; recovery stays
+      explicit via POST /restore/scb. No auto-restore.
 
 ## M2. Watchtower
 
@@ -97,6 +101,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       (heldInvoiceHashes, restart-safe parking in lightning-node.ts).
 - [ ] Onchain power endpoints: sweep-all/send-max, bump-fee (RBF), boost (CPFP),
       consolidate. Library already has sendMax, setupRbf, setupCpfp.
+- [ ] Persist the daemon's onchain wallet state through encrypted storage: BeignetNode
+      passes no storage to Wallet.create, so wallet state is in-memory and rebuilt from
+      Electrum on every boot (startup cost grows with address history, full footprint
+      re-queried against Electrum each start, labels/boost metadata forgotten). Fix is
+      a small TStorage adapter over the encrypted SQLite (or createEncryptedStorage
+      from PR #41) wired into beignet-node.ts. Correctness is unaffected today; this
+      buys fast boots, less Electrum chatter, and durable metadata.
 - [ ] sign/verify message with the node key (LND SignMessage compatible, zbase32) via
       library + daemon + CLI.
 - [ ] Onchain message signing (BIP322 plus legacy fallback) in the wallet layer.
