@@ -49,11 +49,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       envelope encryption of sensitive tables (htlc_shared_secrets included) keyed
       via HKDF from the seed, default-on in BeignetNode with in-place migration and
       an opt-out flag.
-- [ ] Onchain wallet: document that persistence encryption is delegated to the host
-      TStorage, and provide an optional built-in encryption wrapper.
-- [?] Peer storage (option_provide_storage, peer_storage/your_peer_storage messages):
-      store an encrypted SCB with channel peers, retrieve on reconnect. Decide priority
-      vs external backup targets.
+- [~] Onchain wallet (this PR): document that persistence encryption is delegated to
+      the host TStorage, and provide an optional built-in encryption wrapper
+      (`createEncryptedStorage`, AES-256-GCM keyed via HKDF from the seed, lazy
+      plaintext migration).
+- [~] DECIDED (Corey): Peer storage (option_provide_storage, peer_storage/
+      your_peer_storage messages): implement client + server, in progress in a
+      parallel PR. Store an encrypted SCB with channel peers, retrieve on reconnect.
 
 ## M2. Watchtower
 
@@ -66,7 +68,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M3. Routing-node operations
 
-- [~] Routing fee-policy control (this PR): set base_fee_msat, fee_proportional_millionths,
+- [x] Routing fee-policy control (PR #40, merged): set base_fee_msat, fee_proportional_millionths,
       cltv_expiry_delta, htlc_minimum/maximum_msat per channel (and a node-wide
       default), regenerating channel_update. Library method + daemon
       `/channel/update-policy` + CLI. Internal pieces exist privately
@@ -194,3 +196,5 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
   3094/0); storage encryption at rest in progress in a parallel worktree.
 - 2026-07-09 (cont.): M1 core merged as #36-#39 (DLP fell-behind recovery, storage
   encryption, SCB export, restore API). M3 started: routing fee-policy control.
+- 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
+  wrapper + peer storage (option_provide_storage).

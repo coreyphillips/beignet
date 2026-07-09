@@ -137,6 +137,24 @@ const utxos = wallet.value.listUtxos();
 const history = await wallet.value.getAddressHistory('bc1q...');
 ```
 
+### Storage & Encryption
+
+The wallet persists its state through the host-injected `TStorage` interface (`storage: { getData, setData }` on `Wallet.create`). Values are handed to the host as-is, so by default they are stored in plaintext. The persisted data is addresses, address indexes, UTXOs, transactions, balance and fee estimates. No private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss.
+
+To encrypt at rest, wrap any `TStorage` with `createEncryptedStorage` before passing it in. Values are encrypted with AES-256-GCM under a key derived from the seed via HKDF, and pre-existing plaintext values are passed through unchanged and migrate lazily as they are rewritten:
+
+```typescript
+import { createEncryptedStorage, Wallet } from 'beignet';
+import * as bip39 from 'bip39';
+
+const seed = bip39.mnemonicToSeedSync(mnemonic);
+const wallet = await Wallet.create({
+  mnemonic,
+  storage: createEncryptedStorage({ getData, setData }, seed),
+  // ...
+});
+```
+
 ## Lightning Network
 
 ### Lightning Quick Start (BeignetNode)
