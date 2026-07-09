@@ -30,6 +30,8 @@ import { LightningNode } from '../lightning/node/lightning-node';
 import { IPaymentInfo } from '../lightning/node/types';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
+import { deriveStorageKey } from '../lightning/storage/encryption';
+import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
 	DEFAULT_RGS_URL
@@ -174,6 +176,13 @@ export interface BeignetNodeOptions {
 	 * Only announced once the node has at least one public channel.
 	 */
 	announceAddresses?: string[];
+	/**
+	 * Encrypt the SQLite database at rest with a key derived from the wallet
+	 * seed (default true). An existing plaintext database is migrated in place
+	 * on first open; restoring a backup requires the same mnemonic. Set false
+	 * to keep storage in plaintext.
+	 */
+	storageEncryption?: boolean;
 }
 
 const DEFAULT_DATA_DIR = path.join(
@@ -416,11 +425,24 @@ export class BeignetNode extends EventEmitter {
 			}
 		}
 
-		this.storage = new SqliteStorage(dbPath, (err) => {
-			this.log('warn', 'Skipped corrupted storage row during load', {
-				error: err instanceof Error ? err.message : String(err)
-			});
-		});
+		// Encryption at rest (default on): derive the storage key from the BIP39
+		// seed of the wallet mnemonic - the same seed material the Lightning and
+		// on-chain keys derive from - so DB files and backups are unreadable
+		// without the mnemonic. Pre-existing plaintext rows migrate on open().
+		let encryptionKey: Buffer | undefined;
+		if (opts.storageEncryption ?? true) {
+			encryptionKey = deriveStorageKey(bip39.mnemonicToSeedSync(this.mnemonic));
+		}
+
+		this.storage = new SqliteStorage(
+			dbPath,
+			(err) => {
+				this.log('warn', 'Skipped corrupted storage row during load', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			},
+			encryptionKey ? { encryptionKey } : undefined
+		);
 		this.storage.open();
 
 		// 3. Create on-chain wallet

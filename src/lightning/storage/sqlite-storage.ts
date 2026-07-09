@@ -23,10 +23,17 @@ import {
 	serializeGraphNode,
 	deserializeGraphNode
 } from './serialization';
+import {
+	encryptValue,
+	decryptValue,
+	isEncryptedValue,
+	StorageEncryptedError
+} from './encryption';
 
 export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
 	private onCorruptRow?: (error: unknown) => void;
+	private encryptionKey?: Buffer;
 
 	/**
 	 * @param dbPath Path to the SQLite database file (or ':memory:').
@@ -34,16 +41,48 @@ export class SqliteStorage implements IStorageBackend {
 	 *   deserialize during a `loadAll*` call. The corrupt row is skipped so the
 	 *   node still starts, but the callback makes the (silent) data loss visible
 	 *   to operators.
+	 * @param opts.encryptionKey Optional 32-byte key (see deriveStorageKey).
+	 *   When set, sensitive payload columns are encrypted at rest with
+	 *   AES-256-GCM; legacy plaintext rows remain readable and are rewritten
+	 *   encrypted on open().
 	 */
-	constructor(dbPath: string, onCorruptRow?: (error: unknown) => void) {
+	constructor(
+		dbPath: string,
+		onCorruptRow?: (error: unknown) => void,
+		opts?: { encryptionKey?: Buffer }
+	) {
 		this.db = new Database(dbPath);
 		this.onCorruptRow = onCorruptRow;
+		this.encryptionKey = opts?.encryptionKey;
 	}
 
 	private reportCorruptRow(error: unknown): void {
+		// A missing encryption key is a configuration problem, not row
+		// corruption - propagate instead of silently skipping every row.
+		if (error instanceof StorageEncryptedError) {
+			throw error;
+		}
 		if (this.onCorruptRow) {
 			this.onCorruptRow(error);
 		}
+	}
+
+	/** Encrypt a sensitive payload value when an encryption key is configured. */
+	private _enc(value: string): string {
+		return this.encryptionKey ? encryptValue(this.encryptionKey, value) : value;
+	}
+
+	/**
+	 * Decrypt a sensitive payload value. Plaintext (pre-encryption) rows pass
+	 * through unchanged so migration is lazy-safe. Encrypted rows without a
+	 * configured key fail with a clear error rather than returning garbage.
+	 */
+	private _dec(value: string): string {
+		if (!isEncryptedValue(value)) return value;
+		if (!this.encryptionKey) {
+			throw new StorageEncryptedError();
+		}
+		return decryptValue(this.encryptionKey, value);
 	}
 
 	open(opts?: { synchronous?: 'FULL' | 'NORMAL' }): void {
@@ -52,6 +91,9 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.pragma('foreign_keys = ON');
 		this.db.pragma('busy_timeout = 5000');
 		this._createTables();
+		if (this.encryptionKey) {
+			this._encryptExistingData();
+		}
 	}
 
 	/**
@@ -76,7 +118,79 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 2;
+	static readonly CURRENT_SCHEMA_VERSION = 3;
+
+	/**
+	 * Sensitive payload columns encrypted at rest when an encryptionKey is set.
+	 * Primary-key/lookup columns are never encrypted (they appear in WHERE
+	 * clauses); public or non-secret tables (gossip, mission control, peer
+	 * addresses, scid mappings, action log, ...) are excluded.
+	 */
+	private static readonly ENCRYPTED_COLUMNS: ReadonlyArray<{
+		table: string;
+		pk: string;
+		columns: string[];
+	}> = [
+		{ table: 'channels', pk: 'channel_id', columns: ['state_json'] },
+		{ table: 'payments', pk: 'payment_hash', columns: ['payment_json'] },
+		{ table: 'preimages', pk: 'payment_hash', columns: ['preimage'] },
+		{
+			table: 'htlc_payment_map',
+			pk: 'htlc_key',
+			columns: ['payment_hash_hex']
+		},
+		{
+			table: 'forwarded_htlcs',
+			pk: 'out_key',
+			columns: ['in_channel_id', 'in_htlc_id']
+		},
+		{ table: 'chain_monitors', pk: 'channel_id', columns: ['state_json'] },
+		{ table: 'payment_secrets', pk: 'payment_hash_hex', columns: ['secret'] },
+		{ table: 'htlc_shared_secrets', pk: 'key', columns: ['secret'] },
+		{ table: 'invoices', pk: 'payment_hash_hex', columns: ['invoice_json'] },
+		{
+			table: 'channel_key_indices',
+			pk: 'channel_id',
+			columns: ['channel_index']
+		}
+	];
+
+	/**
+	 * Rewrite any plaintext rows in the sensitive tables as encrypted values,
+	 * in a single transaction. Idempotent: rows already carrying the 'enc1:'
+	 * prefix are skipped, so reopening an already-encrypted database is a no-op.
+	 */
+	private _encryptExistingData(): void {
+		const key = this.encryptionKey;
+		if (!key) return;
+		this.db.transaction(() => {
+			for (const { table, pk, columns } of SqliteStorage.ENCRYPTED_COLUMNS) {
+				const rows = this.db
+					.prepare(`SELECT ${pk}, ${columns.join(', ')} FROM ${table}`)
+					.all() as Array<Record<string, unknown>>;
+				for (const row of rows) {
+					const updates: string[] = [];
+					const params: unknown[] = [];
+					for (const col of columns) {
+						const raw = row[col];
+						if (raw === null || raw === undefined) continue;
+						// channel_key_indices stores integers; encrypt their string form
+						const text = typeof raw === 'string' ? raw : String(raw);
+						if (isEncryptedValue(text)) continue;
+						updates.push(`${col} = ?`);
+						params.push(encryptValue(key, text));
+					}
+					if (updates.length === 0) continue;
+					params.push(row[pk]);
+					this.db
+						.prepare(
+							`UPDATE ${table} SET ${updates.join(', ')} WHERE ${pk} = ?`
+						)
+						.run(...params);
+				}
+			}
+		})();
+	}
 
 	private _createTables(): void {
 		this.db.exec(`
@@ -213,7 +327,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO channels (channel_id, state_json, peer_pubkey) VALUES (?, ?, ?)'
 			)
-			.run(id, json, peerPubkey);
+			.run(id, this._enc(json), peerPubkey);
 	}
 
 	loadChannel(id: string): { state: IChannelState; peerPubkey: string } | null {
@@ -224,7 +338,7 @@ export class SqliteStorage implements IStorageBackend {
 			.get(id) as { state_json: string; peer_pubkey: string } | undefined;
 		if (!row) return null;
 		return {
-			state: deserializeChannelState(JSON.parse(row.state_json)),
+			state: deserializeChannelState(JSON.parse(this._dec(row.state_json))),
 			peerPubkey: row.peer_pubkey
 		};
 	}
@@ -250,7 +364,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					channelId: row.channel_id,
-					state: deserializeChannelState(JSON.parse(row.state_json)),
+					state: deserializeChannelState(JSON.parse(this._dec(row.state_json))),
 					peerPubkey: row.peer_pubkey
 				});
 			} catch (err) {
@@ -274,7 +388,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO payments (payment_hash, payment_json) VALUES (?, ?)'
 			)
-			.run(paymentHash, json);
+			.run(paymentHash, this._enc(json));
 	}
 
 	loadPayment(paymentHash: string): IPaymentInfo | null {
@@ -282,7 +396,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare('SELECT payment_json FROM payments WHERE payment_hash = ?')
 			.get(paymentHash) as { payment_json: string } | undefined;
 		if (!row) return null;
-		return deserializePaymentInfo(JSON.parse(row.payment_json));
+		return deserializePaymentInfo(JSON.parse(this._dec(row.payment_json)));
 	}
 
 	loadAllPayments(): Array<{ paymentHash: string; payment: IPaymentInfo }> {
@@ -294,7 +408,9 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
-					payment: deserializePaymentInfo(JSON.parse(row.payment_json))
+					payment: deserializePaymentInfo(
+						JSON.parse(this._dec(row.payment_json))
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -317,7 +433,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO preimages (payment_hash, preimage) VALUES (?, ?)'
 			)
-			.run(paymentHash, preimage.toString('hex'));
+			.run(paymentHash, this._enc(preimage.toString('hex')));
 	}
 
 	loadPreimage(paymentHash: string): Buffer | null {
@@ -325,7 +441,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare('SELECT preimage FROM preimages WHERE payment_hash = ?')
 			.get(paymentHash) as { preimage: string } | undefined;
 		if (!row) return null;
-		return Buffer.from(row.preimage, 'hex');
+		return Buffer.from(this._dec(row.preimage), 'hex');
 	}
 
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }> {
@@ -337,7 +453,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
-					preimage: Buffer.from(row.preimage, 'hex')
+					preimage: Buffer.from(this._dec(row.preimage), 'hex')
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -383,7 +499,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO htlc_payment_map (htlc_key, payment_hash_hex) VALUES (?, ?)'
 			)
-			.run(key, paymentHashHex);
+			.run(key, this._enc(paymentHashHex));
 	}
 
 	loadAllHtlcPaymentMappings(): Array<{ key: string; paymentHashHex: string }> {
@@ -395,7 +511,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					key: row.htlc_key,
-					paymentHashHex: row.payment_hash_hex
+					paymentHashHex: this._dec(row.payment_hash_hex)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -420,7 +536,11 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO forwarded_htlcs (out_key, in_channel_id, in_htlc_id) VALUES (?, ?, ?)'
 			)
-			.run(outKey, inChannelId.toString('hex'), inHtlcId.toString());
+			.run(
+				outKey,
+				this._enc(inChannelId.toString('hex')),
+				this._enc(inHtlcId.toString())
+			);
 	}
 
 	loadAllForwardedHtlcs(): Array<{
@@ -444,8 +564,8 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					outKey: row.out_key,
-					inChannelId: Buffer.from(row.in_channel_id, 'hex'),
-					inHtlcId: BigInt(row.in_htlc_id)
+					inChannelId: Buffer.from(this._dec(row.in_channel_id), 'hex'),
+					inHtlcId: BigInt(this._dec(row.in_htlc_id))
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -469,7 +589,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO chain_monitors (channel_id, state_json) VALUES (?, ?)'
 			)
-			.run(channelId, json);
+			.run(channelId, this._enc(json));
 	}
 
 	loadChainMonitor(channelId: string): IChainMonitorState | null {
@@ -477,7 +597,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare('SELECT state_json FROM chain_monitors WHERE channel_id = ?')
 			.get(channelId) as { state_json: string } | undefined;
 		if (!row) return null;
-		return deserializeChainMonitorState(row.state_json);
+		return deserializeChainMonitorState(this._dec(row.state_json));
 	}
 
 	loadAllChainMonitors(): Array<{
@@ -492,7 +612,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					channelId: row.channel_id,
-					state: deserializeChainMonitorState(row.state_json)
+					state: deserializeChainMonitorState(this._dec(row.state_json))
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -567,7 +687,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO payment_secrets (payment_hash_hex, secret) VALUES (?, ?)'
 			)
-			.run(paymentHashHex, secret.toString('hex'));
+			.run(paymentHashHex, this._enc(secret.toString('hex')));
 	}
 
 	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }> {
@@ -579,7 +699,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					secret: Buffer.from(row.secret, 'hex')
+					secret: Buffer.from(this._dec(row.secret), 'hex')
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -614,7 +734,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO invoices (payment_hash_hex, invoice_json) VALUES (?, ?)'
 			)
-			.run(paymentHashHex, json);
+			.run(paymentHashHex, this._enc(json));
 	}
 
 	loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo }> {
@@ -625,7 +745,7 @@ export class SqliteStorage implements IStorageBackend {
 			[];
 		for (const row of rows) {
 			try {
-				const parsed = JSON.parse(row.invoice_json);
+				const parsed = JSON.parse(this._dec(row.invoice_json));
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
 					invoice: {
@@ -704,7 +824,15 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO channel_key_indices (channel_id, channel_index) VALUES (?, ?)'
 			)
-			.run(channelId, channelIndex);
+			.run(
+				channelId,
+				this.encryptionKey ? this._enc(String(channelIndex)) : channelIndex
+			);
+	}
+
+	/** Decode a channel_index cell: plaintext INTEGER or encrypted TEXT. */
+	private _decodeChannelIndex(value: number | string): number {
+		return typeof value === 'number' ? value : Number(this._dec(value));
 	}
 
 	loadChannelKeyIndex(channelId: string): number | null {
@@ -712,15 +840,22 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'SELECT channel_index FROM channel_key_indices WHERE channel_id = ?'
 			)
-			.get(channelId) as { channel_index: number } | undefined;
-		return row ? row.channel_index : null;
+			.get(channelId) as { channel_index: number | string } | undefined;
+		return row ? this._decodeChannelIndex(row.channel_index) : null;
 	}
 
 	loadNextChannelIndex(): number {
-		const row = this.db
-			.prepare('SELECT MAX(channel_index) as max_idx FROM channel_key_indices')
-			.get() as { max_idx: number | null };
-		return row && row.max_idx !== null ? row.max_idx + 1 : 1;
+		// Encrypted cells are TEXT, so SQL MAX() would compare ciphertext;
+		// decode in JS instead (one small row per channel)
+		const rows = this.db
+			.prepare('SELECT channel_index FROM channel_key_indices')
+			.all() as Array<{ channel_index: number | string }>;
+		let maxIdx: number | null = null;
+		for (const row of rows) {
+			const idx = this._decodeChannelIndex(row.channel_index);
+			if (maxIdx === null || idx > maxIdx) maxIdx = idx;
+		}
+		return maxIdx !== null ? maxIdx + 1 : 1;
 	}
 
 	// ─── HTLC Shared Secrets ───
@@ -730,7 +865,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO htlc_shared_secrets (key, secret) VALUES (?, ?)'
 			)
-			.run(key, secret.toString('hex'));
+			.run(key, this._enc(secret.toString('hex')));
 	}
 
 	deleteHtlcSharedSecret(key: string): void {
@@ -746,7 +881,7 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					key: row.key,
-					secret: Buffer.from(row.secret, 'hex')
+					secret: Buffer.from(this._dec(row.secret), 'hex')
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -855,6 +990,12 @@ export class SqliteStorage implements IStorageBackend {
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
 			() => {
 				// No-op — tables created by CREATE IF NOT EXISTS above
+			},
+			// Migration 2->3: encryption-at-rest rollout. Structurally a no-op;
+			// the data rewrite happens in _encryptExistingData() during open()
+			// whenever an encryptionKey is provided (lazy-safe for plaintext rows)
+			() => {
+				// No-op
 			}
 		];
 

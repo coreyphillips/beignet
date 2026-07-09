@@ -81,6 +81,7 @@ const node = await BeignetNode.create({
   electrumServers?: Array<{ host: string; port: number; tls?: boolean }>,  // failover servers
   backupPath?: string,      // enable automated backups to this path
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
+  storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
   dailySpendLimitSats?: number, // daily spending limit in satoshis (resets at midnight UTC)
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
@@ -233,6 +234,14 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `backup(destPath)` | `Promise<void>` | Create online backup of SQLite database |
+
+Storage encryption: the SQLite database is encrypted at rest by default with a
+key derived (HKDF-SHA256) from the wallet's BIP39 seed. Sensitive payloads
+(channel state, preimages, payment secrets, invoices, payments, chain-monitor
+state) are AES-256-GCM encrypted, so backups made with `backup()` are encrypted
+too; restoring one requires the same mnemonic. Pre-encryption databases are
+migrated in place on first open. Set `storageEncryption: false` to opt out
+(plaintext storage).
 
 #### Health & Monitoring
 
