@@ -279,6 +279,25 @@ describe('Config management', () => {
 		expect(resolved.network).to.equal('testnet');
 		delete process.env.BEIGNET_NETWORK;
 	});
+
+	it('resolveConfig resolves torProxy from BEIGNET_TOR_PROXY env', () => {
+		process.env.BEIGNET_TOR_PROXY = '127.0.0.1:9050';
+		const resolved = resolveConfig({});
+		expect(resolved.torProxy).to.equal('127.0.0.1:9050');
+		delete process.env.BEIGNET_TOR_PROXY;
+	});
+
+	it('resolveConfig prefers torProxy CLI flag over env', () => {
+		process.env.BEIGNET_TOR_PROXY = '127.0.0.1:9050';
+		const resolved = resolveConfig({ torProxy: '10.21.21.11:9050' });
+		expect(resolved.torProxy).to.equal('10.21.21.11:9050');
+		delete process.env.BEIGNET_TOR_PROXY;
+	});
+
+	it('resolveConfig leaves torProxy undefined when unset', () => {
+		const resolved = resolveConfig({});
+		expect(resolved.torProxy).to.be.undefined;
+	});
 });
 
 // ─────────────── BeignetNode Static Tests ───────────────

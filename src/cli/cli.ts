@@ -258,6 +258,8 @@ async function handleStart(): Promise<void> {
 	if (tlsCertFlag) cliFlags.tlsCert = tlsCertFlag;
 	const tlsKeyFlag = parseFlag('--tls-key');
 	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
+	const torProxyFlag = parseFlag('--tor-proxy');
+	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
 
 	const config = resolveConfig(cliFlags);
 
@@ -296,7 +298,8 @@ async function handleStart(): Promise<void> {
 			backupIntervalMs: config.backupIntervalMs,
 			dailySpendLimitSats: config.dailySpendLimitSats,
 			tlsCert: config.tlsCert,
-			tlsKey: config.tlsKey
+			tlsKey: config.tlsKey,
+			torProxy: config.torProxy
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -728,6 +731,8 @@ Start flags:
   --daily-spend-limit <sats>             Daily spending limit in satoshis
   --tls-cert <path>                      TLS certificate file (enables HTTPS)
   --tls-key <path>                       TLS private key file (requires --tls-cert)
+  --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
+                                         connections (e.g. Tor at 127.0.0.1:9050)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)
