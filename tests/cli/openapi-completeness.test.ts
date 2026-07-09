@@ -46,6 +46,7 @@ describe('OpenAPI Spec Completeness', () => {
 		'/channel/open-and-wait',
 		'/channel/close',
 		'/channel/forceclose',
+		'/channel/update-commitment-feerate',
 		'/channel/update-fee',
 		'/channel/connect-and-open',
 		'/channel',

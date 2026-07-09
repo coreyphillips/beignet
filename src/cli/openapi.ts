@@ -379,15 +379,29 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
-			'/channel/update-fee': {
+			'/channel/update-commitment-feerate': {
 				post: {
-					summary: 'Update channel fee rate',
+					summary:
+						'Update the channel commitment transaction feerate (BOLT 2 update_fee). Not the routing fee policy.',
 					tags: ['Channels'],
 					requestBody: bodyContent({
 						channelId: 'string',
 						feeratePerKw: 'number'
 					}),
-					responses: { '200': { description: 'Fee updated' } }
+					responses: { '200': { description: 'Commitment feerate updated' } }
+				}
+			},
+			'/channel/update-fee': {
+				post: {
+					summary:
+						'Deprecated alias for /channel/update-commitment-feerate. Sets the commitment feerate, not the routing fee policy.',
+					deprecated: true,
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						feeratePerKw: 'number'
+					}),
+					responses: { '200': { description: 'Commitment feerate updated' } }
 				}
 			},
 			'/channels/ensure-minimum': {
