@@ -326,6 +326,50 @@ export async function startDaemon(
 				return failure('INVALID_PARAMS', 'feeratePerKw required');
 			return success(node.updateChannelFee(channelId, feeratePerKw));
 		},
+		// Sets the ROUTING fee policy advertised in channel_update. Unrelated to
+		// the commitment feerate endpoint above.
+		'POST /channel/update-policy': (body) => {
+			const {
+				channelId,
+				all,
+				feeBaseMsat,
+				feeProportionalMillionths,
+				cltvExpiryDelta,
+				htlcMinimumMsat,
+				htlcMaximumMsat
+			} = body as {
+				channelId?: string;
+				all?: boolean;
+				feeBaseMsat?: number;
+				feeProportionalMillionths?: number;
+				cltvExpiryDelta?: number;
+				htlcMinimumMsat?: number | string;
+				htlcMaximumMsat?: number | string;
+			};
+			if (!channelId && all !== true)
+				return failure('INVALID_PARAMS', 'channelId or all:true required');
+			try {
+				return success(
+					node.updateChannelPolicy(all === true ? 'all' : channelId!, {
+						feeBaseMsat,
+						feeProportionalMillionths,
+						cltvExpiryDelta,
+						htlcMinimumMsat,
+						htlcMaximumMsat
+					})
+				);
+			} catch (err) {
+				return failure('INVALID_PARAMS', (err as Error).message);
+			}
+		},
+		'GET /channel/policy': (body, query) => {
+			const channelId =
+				query.get('channelId') || (body as { channelId?: string }).channelId;
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			const policy = node.getChannelPolicy(channelId);
+			if (!policy) return failure('NOT_FOUND', 'Channel not found');
+			return success(policy);
+		},
 		'GET /channel': (body, query) => {
 			const channelId =
 				query.get('channelId') || (body as { channelId?: string }).channelId;

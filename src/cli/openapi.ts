@@ -404,6 +404,62 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'Commitment feerate updated' } }
 				}
 			},
+			'/channel/update-policy': {
+				post: {
+					summary:
+						'Set the ROUTING fee policy for one channel (channelId) or all channels (all: true); regenerates and re-broadcasts the channel_update. Msat fields accept number or decimal string.',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string?',
+						all: 'boolean?',
+						feeBaseMsat: 'number?',
+						feeProportionalMillionths: 'number?',
+						cltvExpiryDelta: 'number?',
+						htlcMinimumMsat: 'string?',
+						htlcMaximumMsat: 'string?'
+					}),
+					responses: {
+						'200': {
+							description: 'Updated count + effective policies',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									updated: { type: 'integer' },
+									policies: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/ChannelPolicy' }
+									}
+								}
+							})
+						}
+					}
+				}
+			},
+			'/channel/policy': {
+				get: {
+					summary:
+						'Get the effective routing fee policy for a channel (override or node defaults)',
+					tags: ['Channels'],
+					parameters: [
+						{
+							name: 'channelId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Effective channel policy',
+							content: jsonContent({
+								$ref: '#/components/schemas/ChannelPolicy'
+							})
+						},
+						'400': { description: 'Missing channelId' },
+						'404': { description: 'Channel not found' }
+					}
+				}
+			},
 			'/channels/ensure-minimum': {
 				post: {
 					summary:
@@ -1590,7 +1646,36 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						fundingTxid: { type: 'string' },
 						shortChannelId: { type: 'string' },
 						feeratePerKw: { type: 'integer' },
-						htlcCount: { type: 'integer' }
+						htlcCount: { type: 'integer' },
+						feeBaseMsat: { type: 'integer' },
+						feeProportionalMillionths: { type: 'integer' },
+						cltvExpiryDelta: { type: 'integer' },
+						htlcMinimumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						htlcMaximumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						}
+					}
+				},
+				ChannelPolicy: {
+					type: 'object',
+					properties: {
+						channelId: { type: 'string' },
+						feeBaseMsat: { type: 'integer' },
+						feeProportionalMillionths: { type: 'integer' },
+						cltvExpiryDelta: { type: 'integer' },
+						htlcMinimumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						htlcMaximumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						source: { type: 'string', enum: ['override', 'default'] }
 					}
 				},
 				PaymentInfo: {

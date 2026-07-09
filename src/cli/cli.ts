@@ -455,13 +455,45 @@ async function handleChannel(): Promise<void> {
 					satsPerChannel: parseInt(filteredArgs[3], 10)
 				})
 			);
+		case 'update-policy': {
+			const target = filteredArgs[2];
+			if (!target) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const body: Record<string, unknown> =
+				target === 'all' ? { all: true } : { channelId: target };
+			const baseFee = parseFlag('--base-fee-msat');
+			if (baseFee !== undefined) body.feeBaseMsat = parseInt(baseFee, 10);
+			const ppm = parseFlag('--ppm');
+			if (ppm !== undefined) body.feeProportionalMillionths = parseInt(ppm, 10);
+			const cltvDelta = parseFlag('--cltv-delta');
+			if (cltvDelta !== undefined)
+				body.cltvExpiryDelta = parseInt(cltvDelta, 10);
+			// Msat bounds travel as strings so values above 2^53 survive JSON
+			const htlcMin = parseFlag('--htlc-min-msat');
+			if (htlcMin !== undefined) body.htlcMinimumMsat = htlcMin;
+			const htlcMax = parseFlag('--htlc-max-msat');
+			if (htlcMax !== undefined) body.htlcMaximumMsat = htlcMax;
+			return outputResult(
+				await httpRequest('POST', '/channel/update-policy', body)
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|close|forceclose|splice-in|splice-out|ensure-minimum|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -877,8 +909,11 @@ Channels:
   channel splice-in <id> <sats> <feerate>   Add funds to channel
   channel splice-out <id> <sats> <feerate>  Withdraw funds from channel
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
+  channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
+                        [--htlc-min-msat N] [--htlc-max-msat N]
+                                         Set routing fee policy (channel_update)
   channel list                           List channels
-  channel get <id>                       Channel details
+  channel get <id>                       Channel details (includes routing policy)
 
 Invoices & Payments:
   invoice create <sats> [description]    Create BOLT 11 invoice

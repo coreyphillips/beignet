@@ -95,7 +95,8 @@ import {
 	RetryPaymentResult,
 	PaymentValidation,
 	PaymentValidationCheck,
-	PaymentValidationStatus
+	PaymentValidationStatus,
+	ChannelPolicyInfo
 } from './types';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
@@ -1463,6 +1464,11 @@ export class BeignetNode extends EventEmitter {
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
+		feeBaseMsat?: number;
+		feeProportionalMillionths?: number;
+		cltvExpiryDelta?: number;
+		htlcMinimumMsat?: bigint;
+		htlcMaximumMsat?: bigint;
 	}): ChannelInfo {
 		// Import ChannelStateString to satisfy the narrowed type
 		type CS = import('./types').ChannelStateString;
@@ -1484,6 +1490,15 @@ export class BeignetNode extends EventEmitter {
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;
 		if (ch.htlcCount !== undefined) info.htlcCount = ch.htlcCount;
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
+		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
+		if (ch.feeProportionalMillionths !== undefined)
+			info.feeProportionalMillionths = ch.feeProportionalMillionths;
+		if (ch.cltvExpiryDelta !== undefined)
+			info.cltvExpiryDelta = ch.cltvExpiryDelta;
+		if (ch.htlcMinimumMsat !== undefined)
+			info.htlcMinimumMsat = ch.htlcMinimumMsat.toString();
+		if (ch.htlcMaximumMsat !== undefined)
+			info.htlcMaximumMsat = ch.htlcMaximumMsat.toString();
 		return info;
 	}
 
@@ -2372,7 +2387,7 @@ export class BeignetNode extends EventEmitter {
 	/**
 	 * Update the channel's COMMITMENT transaction feerate (BOLT 2 update_fee,
 	 * min 253 sat/kw). This is not the routing fee policy (base fee msat /
-	 * proportional millionths); routing policy control is a separate planned API.
+	 * proportional millionths); see updateChannelPolicy for that.
 	 */
 	updateChannelFee(
 		channelId: string,
@@ -2382,6 +2397,63 @@ export class BeignetNode extends EventEmitter {
 			Buffer.from(channelId, 'hex'),
 			feeratePerKw
 		);
+	}
+
+	/**
+	 * Set the ROUTING fee policy for one channel or all channels. Msat fields
+	 * accept number or decimal string (they are bigint in the library).
+	 * Regenerates and re-broadcasts the channel_update. Throws on invalid
+	 * values or unknown channelId.
+	 */
+	updateChannelPolicy(
+		channelId: string | 'all',
+		policy: {
+			feeBaseMsat?: number;
+			feeProportionalMillionths?: number;
+			cltvExpiryDelta?: number;
+			htlcMinimumMsat?: number | string;
+			htlcMaximumMsat?: number | string;
+		}
+	): { updated: number; policies: ChannelPolicyInfo[] } {
+		const update: import('../lightning/node/types').IChannelPolicyUpdate = {};
+		if (policy.feeBaseMsat !== undefined)
+			update.feeBaseMsat = policy.feeBaseMsat;
+		if (policy.feeProportionalMillionths !== undefined)
+			update.feeProportionalMillionths = policy.feeProportionalMillionths;
+		if (policy.cltvExpiryDelta !== undefined)
+			update.cltvExpiryDelta = policy.cltvExpiryDelta;
+		if (policy.htlcMinimumMsat !== undefined)
+			update.htlcMinimumMsat = BigInt(policy.htlcMinimumMsat);
+		if (policy.htlcMaximumMsat !== undefined)
+			update.htlcMaximumMsat = BigInt(policy.htlcMaximumMsat);
+
+		const targets =
+			channelId === 'all'
+				? this.node.listChannels().map((ch) => ch.channelId.toString('hex'))
+				: [channelId];
+		this.node.setChannelPolicy(
+			channelId === 'all' ? 'all' : Buffer.from(channelId, 'hex'),
+			update
+		);
+		const policies = targets
+			.map((id) => this.getChannelPolicy(id))
+			.filter((p): p is ChannelPolicyInfo => p !== null);
+		return { updated: policies.length, policies };
+	}
+
+	/** Effective routing policy for a channel, or null if unknown. */
+	getChannelPolicy(channelId: string): ChannelPolicyInfo | null {
+		const policy = this.node.getChannelPolicy(Buffer.from(channelId, 'hex'));
+		if (!policy) return null;
+		return {
+			channelId,
+			feeBaseMsat: policy.feeBaseMsat,
+			feeProportionalMillionths: policy.feeProportionalMillionths,
+			cltvExpiryDelta: policy.cltvExpiryDelta,
+			htlcMinimumMsat: policy.htlcMinimumMsat.toString(),
+			htlcMaximumMsat: policy.htlcMaximumMsat.toString(),
+			source: policy.source
+		};
 	}
 
 	cancelPayment(paymentHash: string): { ok: boolean } {

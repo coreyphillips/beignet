@@ -62,6 +62,25 @@ export interface ChannelInfo {
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
+	/** Effective routing policy (per-channel override or node defaults) */
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	/** Msat values as decimal strings (bigint in the library) */
+	htlcMinimumMsat?: string;
+	htlcMaximumMsat?: string;
+}
+
+export interface ChannelPolicyInfo {
+	channelId: string;
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	cltvExpiryDelta: number;
+	/** Msat values as decimal strings (bigint in the library) */
+	htlcMinimumMsat: string;
+	htlcMaximumMsat: string;
+	/** 'override' when a per-channel override is set, 'default' otherwise */
+	source: 'override' | 'default';
 }
 
 export interface PaymentRouteHop {

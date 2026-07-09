@@ -26,7 +26,8 @@ import {
 	ChannelState,
 	ChannelRole,
 	HtlcState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	BITCOIN_CHAIN_HASH
 } from '../channel/types';
 import { PeerManager, IPeerInfo } from '../transport/peer-manager';
 import { NetworkGraph } from '../gossip/network-graph';
@@ -129,7 +130,9 @@ import {
 	IStructuredLog,
 	IPaymentProof,
 	IPaymentEstimate,
-	IKeysendOptions
+	IKeysendOptions,
+	IChannelPolicy,
+	IChannelPolicyUpdate
 } from './types';
 import {
 	validateHexPubkey,
@@ -143,7 +146,7 @@ import {
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { IStorageBackend } from '../storage/types';
+import { IStorageBackend, IPersistedChannelPolicy } from '../storage/types';
 import { FeatureFlags, Feature } from '../features/flags';
 import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
@@ -272,6 +275,8 @@ export class LightningNode extends EventEmitter {
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
 	private forwardingFeePropMillionths: number;
+	/** Per-channel routing-policy overrides (channelId hex -> partial policy). */
+	private channelPolicies: Map<string, IChannelPolicyUpdate> = new Map();
 	private gossipSyncManagers: Map<string, GossipSyncManager> = new Map();
 	/** Our own node_announcement (cached so we can re-broadcast it for propagation). */
 	private _ownNodeAnnouncement?: Buffer;
@@ -655,6 +660,27 @@ export class LightningNode extends EventEmitter {
 		// Restore HTLC shared secrets (for failure decryption after crash)
 		for (const { key, secret } of this.storage.loadAllHtlcSharedSecrets()) {
 			this.receivedHtlcSharedSecrets.set(key, secret);
+		}
+
+		// Restore per-channel routing-policy overrides
+		if (this.storage.loadAllChannelPolicies) {
+			for (const {
+				channelId,
+				policy
+			} of this.storage.loadAllChannelPolicies()) {
+				const override: IChannelPolicyUpdate = {};
+				if (policy.feeBaseMsat !== undefined)
+					override.feeBaseMsat = policy.feeBaseMsat;
+				if (policy.feeProportionalMillionths !== undefined)
+					override.feeProportionalMillionths = policy.feeProportionalMillionths;
+				if (policy.cltvExpiryDelta !== undefined)
+					override.cltvExpiryDelta = policy.cltvExpiryDelta;
+				if (policy.htlcMinimumMsat !== undefined)
+					override.htlcMinimumMsat = BigInt(policy.htlcMinimumMsat);
+				if (policy.htlcMaximumMsat !== undefined)
+					override.htlcMaximumMsat = BigInt(policy.htlcMaximumMsat);
+				this.channelPolicies.set(channelId, override);
+			}
 		}
 
 		// Restore invoices — migrate ms timestamps to seconds if needed
@@ -1093,15 +1119,25 @@ export class LightningNode extends EventEmitter {
 				channelAnnouncement: Buffer,
 				channelUpdate: Buffer
 			) => {
-				// Sign the channel_update before broadcasting (it arrives with a placeholder signature)
-				let signedChannelUpdate = channelUpdate;
-				try {
-					const sig = signChannelUpdate(channelUpdate, this.nodePrivkey);
-					// Write real signature into first 64 bytes of the channel_update payload
-					signedChannelUpdate = Buffer.from(channelUpdate);
-					sig.copy(signedChannelUpdate, 0);
-				} catch {
-					// If signing fails, use the original (will likely be rejected by peers)
+				// Stamp the channel's EFFECTIVE routing policy (per-channel override
+				// or node-wide defaults) into the update, since the Channel-built one
+				// carries placeholder fee/CLTV values, then sign it.
+				let signedChannelUpdate = this.refreshChannelUpdate(
+					channelUpdate,
+					Math.floor(Date.now() / 1000),
+					channelId
+				);
+				if (!signedChannelUpdate) {
+					// Fall back to signing the original as-is
+					signedChannelUpdate = channelUpdate;
+					try {
+						const sig = signChannelUpdate(channelUpdate, this.nodePrivkey);
+						// Write real signature into first 64 bytes of the channel_update payload
+						signedChannelUpdate = Buffer.from(channelUpdate);
+						sig.copy(signedChannelUpdate, 0);
+					} catch {
+						// If signing fails, use the original (will likely be rejected by peers)
+					}
 				}
 
 				// Add to our own network graph
@@ -2732,6 +2768,318 @@ export class LightningNode extends EventEmitter {
 		return { ok: true };
 	}
 
+	// ─────────────── Routing Fee Policy ───────────────
+
+	/**
+	 * Set the ROUTING policy for one channel (or 'all'): fees charged and CLTV
+	 * delta required to forward through it, plus the advertised HTLC size
+	 * bounds. Partial: unset fields keep any existing override or fall back to
+	 * the node-wide defaults. Regenerates and re-broadcasts the channel_update
+	 * for announced channels; for unannounced channels a signed update is sent
+	 * directly to the peer (BOLT 7 permits this; the peer retains it for route
+	 * hints, see maybeAdoptPeerChannelPolicy). Unrelated to the commitment
+	 * feerate (updateChannelFee / BOLT 2 update_fee).
+	 */
+	setChannelPolicy(
+		channelId: Buffer | 'all',
+		policy: IChannelPolicyUpdate
+	): void {
+		this.validateChannelPolicyFields(policy);
+
+		let targets: Buffer[];
+		if (channelId === 'all') {
+			targets = this.channelManager
+				.listChannels()
+				.map((ch) => ch.getChannelId())
+				.filter((id): id is Buffer => id !== null);
+		} else {
+			const cidErr = validateBuffer(channelId, 32, 'channelId');
+			if (cidErr) throw new Error(cidErr);
+			if (!this.channelManager.getChannel(channelId)) {
+				throw new Error(`Channel not found: ${channelId.toString('hex')}`);
+			}
+			targets = [channelId];
+		}
+
+		for (const target of targets) {
+			const hex = target.toString('hex');
+			const merged: IChannelPolicyUpdate = {
+				...this.channelPolicies.get(hex),
+				...policy
+			};
+			// Cross-field check on the MERGED override: a partial update must not
+			// silently invert an existing min/max pair.
+			if (
+				merged.htlcMinimumMsat !== undefined &&
+				merged.htlcMaximumMsat !== undefined &&
+				merged.htlcMinimumMsat > merged.htlcMaximumMsat
+			) {
+				throw new Error(
+					`htlcMinimumMsat (${merged.htlcMinimumMsat}) exceeds htlcMaximumMsat (${merged.htlcMaximumMsat})`
+				);
+			}
+			this.channelPolicies.set(hex, merged);
+			this.safeStorage(
+				() =>
+					this.storage!.saveChannelPolicy?.(
+						hex,
+						LightningNode.serializeChannelPolicy(merged)
+					),
+				'saveChannelPolicy'
+			);
+			this.regenerateChannelUpdateForPolicy(target);
+			this.emitStructuredLog('channel', 'policy_updated', {
+				channelId: hex,
+				...LightningNode.serializeChannelPolicy(merged)
+			});
+		}
+	}
+
+	/**
+	 * Effective routing policy for a channel: the per-channel override where
+	 * set, node-wide defaults otherwise. Returns null for unknown channels.
+	 */
+	getChannelPolicy(channelId: Buffer): IChannelPolicy | null {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return null;
+		const state = channel.getFullState();
+		const override = this.channelPolicies.get(channelId.toString('hex'));
+		// Same defaults the initial channel_update advertises: the channel's
+		// negotiated htlc_minimum_msat and capacity-capped max-in-flight.
+		const capacityMsat = state.fundingSatoshis * 1000n;
+		const defaultHtlcMax =
+			state.localConfig.maxHtlcValueInFlightMsat > capacityMsat
+				? capacityMsat
+				: state.localConfig.maxHtlcValueInFlightMsat;
+		return {
+			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
+			feeProportionalMillionths:
+				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
+			cltvExpiryDelta: override?.cltvExpiryDelta ?? this.forwardingCltvDelta,
+			htlcMinimumMsat:
+				override?.htlcMinimumMsat ?? state.localConfig.htlcMinimumMsat,
+			htlcMaximumMsat: override?.htlcMaximumMsat ?? defaultHtlcMax,
+			source:
+				override && Object.keys(override).length > 0 ? 'override' : 'default'
+		};
+	}
+
+	/**
+	 * Fee/CLTV policy the forwarding checks enforce for HTLCs going OUT over
+	 * the given channel (the direction our channel_update advertises).
+	 */
+	private getForwardingPolicyForChannel(channelId: Buffer | undefined): {
+		feeBaseMsat: number;
+		feeProportionalMillionths: number;
+		cltvExpiryDelta: number;
+	} {
+		const override = channelId
+			? this.channelPolicies.get(channelId.toString('hex'))
+			: undefined;
+		return {
+			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
+			feeProportionalMillionths:
+				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
+			cltvExpiryDelta: override?.cltvExpiryDelta ?? this.forwardingCltvDelta
+		};
+	}
+
+	private validateChannelPolicyFields(policy: IChannelPolicyUpdate): void {
+		if (
+			policy.feeBaseMsat === undefined &&
+			policy.feeProportionalMillionths === undefined &&
+			policy.cltvExpiryDelta === undefined &&
+			policy.htlcMinimumMsat === undefined &&
+			policy.htlcMaximumMsat === undefined
+		) {
+			throw new Error('policy must set at least one field');
+		}
+		// channel_update encodes these as u32/u32/u16; out-of-range values would
+		// wrap on the wire and advertise a policy we do not enforce.
+		if (policy.feeBaseMsat !== undefined) {
+			if (
+				!Number.isInteger(policy.feeBaseMsat) ||
+				policy.feeBaseMsat < 0 ||
+				policy.feeBaseMsat > 0xffffffff
+			) {
+				throw new Error(
+					`feeBaseMsat must be an integer in [0, 4294967295], got ${policy.feeBaseMsat}`
+				);
+			}
+		}
+		if (policy.feeProportionalMillionths !== undefined) {
+			if (
+				!Number.isInteger(policy.feeProportionalMillionths) ||
+				policy.feeProportionalMillionths < 0 ||
+				policy.feeProportionalMillionths > 0xffffffff
+			) {
+				throw new Error(
+					`feeProportionalMillionths must be an integer in [0, 4294967295], got ${policy.feeProportionalMillionths}`
+				);
+			}
+		}
+		if (policy.cltvExpiryDelta !== undefined) {
+			// Zero would leave no window to claim a forwarded HTLC on-chain after
+			// learning the preimage (loss of the forwarded amount). BOLT 2/7
+			// guidance recommends >= 18; small positive values are allowed but at
+			// the operator's own risk.
+			if (
+				!Number.isInteger(policy.cltvExpiryDelta) ||
+				policy.cltvExpiryDelta < 1 ||
+				policy.cltvExpiryDelta > 0xffff
+			) {
+				throw new Error(
+					`cltvExpiryDelta must be an integer in [1, 65535] (>= 18 recommended), got ${policy.cltvExpiryDelta}`
+				);
+			}
+		}
+		if (
+			policy.htlcMinimumMsat !== undefined &&
+			(typeof policy.htlcMinimumMsat !== 'bigint' ||
+				policy.htlcMinimumMsat < 0n)
+		) {
+			throw new Error(
+				`htlcMinimumMsat must be a non-negative bigint, got ${policy.htlcMinimumMsat}`
+			);
+		}
+		if (
+			policy.htlcMaximumMsat !== undefined &&
+			(typeof policy.htlcMaximumMsat !== 'bigint' ||
+				policy.htlcMaximumMsat < 0n)
+		) {
+			throw new Error(
+				`htlcMaximumMsat must be a non-negative bigint, got ${policy.htlcMaximumMsat}`
+			);
+		}
+		if (
+			policy.htlcMinimumMsat !== undefined &&
+			policy.htlcMaximumMsat !== undefined &&
+			policy.htlcMinimumMsat > policy.htlcMaximumMsat
+		) {
+			throw new Error(
+				`htlcMinimumMsat (${policy.htlcMinimumMsat}) exceeds htlcMaximumMsat (${policy.htlcMaximumMsat})`
+			);
+		}
+	}
+
+	private static serializeChannelPolicy(
+		policy: IChannelPolicyUpdate
+	): IPersistedChannelPolicy {
+		const out: IPersistedChannelPolicy = {};
+		if (policy.feeBaseMsat !== undefined) out.feeBaseMsat = policy.feeBaseMsat;
+		if (policy.feeProportionalMillionths !== undefined)
+			out.feeProportionalMillionths = policy.feeProportionalMillionths;
+		if (policy.cltvExpiryDelta !== undefined)
+			out.cltvExpiryDelta = policy.cltvExpiryDelta;
+		if (policy.htlcMinimumMsat !== undefined)
+			out.htlcMinimumMsat = policy.htlcMinimumMsat.toString();
+		if (policy.htlcMaximumMsat !== undefined)
+			out.htlcMaximumMsat = policy.htlcMaximumMsat.toString();
+		return out;
+	}
+
+	/**
+	 * Push the (new) effective policy out as a channel_update. Announced
+	 * channels: rewrite the cached update, re-add to our graph, and broadcast
+	 * to all peers. Unannounced channels: sign a fresh update and send it
+	 * directly to the peer only.
+	 */
+	private regenerateChannelUpdateForPolicy(channelId: Buffer): void {
+		const hex = channelId.toString('hex');
+		const gossip = this._ownChannelGossip.get(hex);
+		if (gossip) {
+			// Strictly increasing timestamp: peers dedupe an unchanged one, so a
+			// same-second policy change would never propagate.
+			let timestamp = Math.floor(Date.now() / 1000);
+			try {
+				timestamp = Math.max(
+					timestamp,
+					decodeChannelUpdateMessage(gossip.update).timestamp + 1
+				);
+			} catch {
+				// Unreadable cached update; fall through with the wall-clock time.
+			}
+			const refreshed = this.refreshChannelUpdate(
+				gossip.update,
+				timestamp,
+				channelId
+			);
+			if (!refreshed) return;
+			this._ownChannelGossip.set(hex, {
+				announcement: gossip.announcement,
+				update: refreshed
+			});
+			try {
+				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed));
+			} catch {
+				// Own-update decode failure only affects our local graph view.
+			}
+			this.broadcastOwnGossip();
+			return;
+		}
+
+		const payload = this.buildDirectChannelUpdate(channelId);
+		if (!payload) return;
+		const peer = this.channelManager.getPeerForChannel(channelId);
+		if (!peer) return;
+		if (this.peerManager) {
+			try {
+				this.peerManager.sendToPeer(peer, MessageType.CHANNEL_UPDATE, payload);
+			} catch {
+				// Peer not connected; it will learn the policy from route hints.
+			}
+		} else {
+			this.emit('message:outbound', peer, MessageType.CHANNEL_UPDATE, payload);
+		}
+	}
+
+	/**
+	 * Build and sign a channel_update for an UNANNOUNCED channel, addressed by
+	 * the real SCID once confirmed or else the alias we gave the peer (the SCID
+	 * it routes to us with, per option_scid_alias).
+	 */
+	private buildDirectChannelUpdate(channelId: Buffer): Buffer | null {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return null;
+		const state = channel.getFullState();
+		const scid = state.shortChannelId ?? state.scidAlias;
+		if (!scid) return null;
+		const peerHex = this.channelManager.getPeerForChannel(channelId);
+		if (!peerHex) return null;
+		const policy = this.getChannelPolicy(channelId);
+		if (!policy) return null;
+		try {
+			const { encodeChannelUpdateMessage } = require('../gossip/messages');
+			const ourNodeId = getPublicKey(this.nodePrivkey);
+			const peerNodeId = Buffer.from(peerHex, 'hex');
+			// BOLT 7: htlc_maximum_msat MUST NOT exceed the channel capacity.
+			const capacityMsat = state.fundingSatoshis * 1000n;
+			const htlcMaxMsat =
+				policy.htlcMaximumMsat > capacityMsat
+					? capacityMsat
+					: policy.htlcMaximumMsat;
+			const payload = encodeChannelUpdateMessage({
+				signature: Buffer.alloc(64), // placeholder, signed below
+				// Match the chain scope the receiver enforces (acceptableChainHashes)
+				chainHash: this.acceptableChainHashes[0] ?? BITCOIN_CHAIN_HASH,
+				shortChannelId: scid,
+				timestamp: Math.floor(Date.now() / 1000),
+				messageFlags: 0x01, // htlc_maximum_msat present
+				channelFlags: Buffer.compare(ourNodeId, peerNodeId) < 0 ? 0 : 1,
+				cltvExpiryDelta: policy.cltvExpiryDelta,
+				htlcMinimumMsat: policy.htlcMinimumMsat,
+				feeBaseMsat: policy.feeBaseMsat,
+				feeProportionalMillionths: policy.feeProportionalMillionths,
+				htlcMaximumMsat: htlcMaxMsat
+			});
+			const sig = signChannelUpdate(payload, this.nodePrivkey);
+			sig.copy(payload, 0);
+			return payload;
+		} catch {
+			return null;
+		}
+	}
+
 	forceCloseChannel(
 		channelId: Buffer,
 		destinationScript: Buffer
@@ -3115,6 +3463,15 @@ export class LightningNode extends EventEmitter {
 		info.localReserveMsat = state.remoteConfig.channelReserveSatoshis * 1000n;
 		info.remoteReserveMsat = state.localConfig.channelReserveSatoshis * 1000n;
 		info.isPrivate = !state.announceChannel;
+		// Effective routing policy (per-channel override or node defaults)
+		const policy = this.getChannelPolicy(channelId);
+		if (policy) {
+			info.feeBaseMsat = policy.feeBaseMsat;
+			info.feeProportionalMillionths = policy.feeProportionalMillionths;
+			info.cltvExpiryDelta = policy.cltvExpiryDelta;
+			info.htlcMinimumMsat = policy.htlcMinimumMsat;
+			info.htlcMaximumMsat = policy.htlcMaximumMsat;
+		}
 		return info;
 	}
 
@@ -3183,19 +3540,36 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Refresh a cached channel_update: bump only its timestamp and re-sign, keeping
-	 * the exact same policy (fees/CLTV/flags/SCID). This is a pure gossip message —
-	 * it never touches the commitment state machine, HTLCs or update_fee, so it
-	 * cannot trigger a force-close. Returns null if decode/encode/sign fails.
+	 * Refresh a cached channel_update: bump its timestamp, stamp the channel's
+	 * EFFECTIVE routing policy (per-channel override or node defaults) when a
+	 * channelId is given, and re-sign. This is a pure gossip message: it never
+	 * touches the commitment state machine, HTLCs or update_fee, so it cannot
+	 * trigger a force-close. Returns null if decode/encode/sign fails.
 	 */
 	private refreshChannelUpdate(
 		cachedUpdate: Buffer,
-		timestamp: number
+		timestamp: number,
+		channelId?: Buffer
 	): Buffer | null {
 		try {
 			const { encodeChannelUpdateMessage } = require('../gossip/messages');
 			const msg = decodeChannelUpdateMessage(cachedUpdate);
 			msg.timestamp = timestamp;
+			const policy = channelId ? this.getChannelPolicy(channelId) : null;
+			if (policy && channelId) {
+				msg.cltvExpiryDelta = policy.cltvExpiryDelta;
+				msg.feeBaseMsat = policy.feeBaseMsat;
+				msg.feeProportionalMillionths = policy.feeProportionalMillionths;
+				msg.htlcMinimumMsat = policy.htlcMinimumMsat;
+				// BOLT 7: htlc_maximum_msat MUST NOT exceed the channel capacity.
+				const capacityMsat =
+					this.channelManager.getChannel(channelId)!.getFullState()
+						.fundingSatoshis * 1000n;
+				msg.htlcMaximumMsat =
+					policy.htlcMaximumMsat > capacityMsat
+						? capacityMsat
+						: policy.htlcMaximumMsat;
+			}
 			const payload = encodeChannelUpdateMessage(msg);
 			const sig = signChannelUpdate(payload, this.nodePrivkey);
 			sig.copy(payload, 0);
@@ -3261,7 +3635,11 @@ export class LightningNode extends EventEmitter {
 			// Likewise refresh each channel_update so the CHANNELS aren't pruned as
 			// stale either. Same policy, fresh timestamp — pure gossip, no force-close risk.
 			for (const [channelIdHex, gossip] of this._ownChannelGossip) {
-				const refreshedUpdate = this.refreshChannelUpdate(gossip.update, now);
+				const refreshedUpdate = this.refreshChannelUpdate(
+					gossip.update,
+					now,
+					Buffer.from(channelIdHex, 'hex')
+				);
 				if (refreshedUpdate) {
 					this._ownChannelGossip.set(channelIdHex, {
 						announcement: gossip.announcement,
@@ -5468,6 +5846,22 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		// Look up outgoing channel via SCID (real SCID for blinded hops) BEFORE
+		// the policy checks: the fee/CLTV we enforce is the OUTGOING channel's
+		// effective policy (per-channel override or node defaults).
+		const scidHex = outgoingScid.toString('hex');
+		const outChannelId = this.scidToChannelId.get(scidHex);
+		if (!outChannelId) {
+			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+			this.channelManager.failHtlc(
+				inChannelId,
+				inHtlcId,
+				createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
+			);
+			return;
+		}
+		const outPolicy = this.getForwardingPolicyForChannel(outChannelId);
+
 		// For a blinded hop the fee/CLTV are defined by payment_relay (the forward
 		// amount above already subtracts the relay fee); just ensure it's viable.
 		// For a cleartext hop, enforce our own forwarding policy.
@@ -5479,7 +5873,7 @@ export class LightningNode extends EventEmitter {
 			// forwarded amount. Also honour payment_constraints.maxCltvExpiry.
 			if (
 				forwardAmount <= 0n ||
-				incomingCltvExpiry - forwardCltv < this.forwardingCltvDelta ||
+				incomingCltvExpiry - forwardCltv < outPolicy.cltvExpiryDelta ||
 				(blindedMaxCltv !== undefined && incomingCltvExpiry > blindedMaxCltv)
 			) {
 				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
@@ -5492,7 +5886,7 @@ export class LightningNode extends EventEmitter {
 			}
 		} else {
 			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
-			if (incomingCltvExpiry < forwardCltv + this.forwardingCltvDelta) {
+			if (incomingCltvExpiry < forwardCltv + outPolicy.cltvExpiryDelta) {
 				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
 				this.channelManager.failHtlc(
 					inChannelId,
@@ -5503,8 +5897,9 @@ export class LightningNode extends EventEmitter {
 			}
 			// Fee enforcement: incoming amount must cover outgoing amount + our fee
 			const requiredFee =
-				BigInt(this.forwardingFeeBaseMsat) +
-				(forwardAmount * BigInt(this.forwardingFeePropMillionths)) / 1_000_000n;
+				BigInt(outPolicy.feeBaseMsat) +
+				(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
+					1_000_000n;
 			if (incomingAmountMsat < forwardAmount + requiredFee) {
 				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
 				this.channelManager.failHtlc(
@@ -5514,19 +5909,6 @@ export class LightningNode extends EventEmitter {
 				);
 				return;
 			}
-		}
-
-		// Look up outgoing channel via SCID (real SCID for blinded hops)
-		const scidHex = outgoingScid.toString('hex');
-		const outChannelId = this.scidToChannelId.get(scidHex);
-		if (!outChannelId) {
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
-				inChannelId,
-				inHtlcId,
-				createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
-			);
-			return;
 		}
 
 		// The actual onward forward, deferred so an async LSP hold can run it later

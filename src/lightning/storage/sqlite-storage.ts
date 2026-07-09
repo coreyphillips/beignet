@@ -6,7 +6,11 @@
  */
 
 import Database from 'better-sqlite3';
-import { IStorageBackend, IInvoiceInfo } from './types';
+import {
+	IStorageBackend,
+	IInvoiceInfo,
+	IPersistedChannelPolicy
+} from './types';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
@@ -118,7 +122,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 3;
+	static readonly CURRENT_SCHEMA_VERSION = 4;
 
 	/**
 	 * Sensitive payload columns encrypted at rest when an encryptionKey is set.
@@ -311,6 +315,11 @@ export class SqliteStorage implements IStorageBackend {
 				error TEXT,
 				created_at INTEGER NOT NULL,
 				completed_at INTEGER
+			);
+
+			CREATE TABLE IF NOT EXISTS channel_policies (
+				channel_id TEXT PRIMARY KEY,
+				policy_json TEXT NOT NULL
 			);
 		`);
 
@@ -996,6 +1005,12 @@ export class SqliteStorage implements IStorageBackend {
 			// whenever an encryptionKey is provided (lazy-safe for plaintext rows)
 			() => {
 				// No-op
+			},
+			// Migration 3->4: channel_policies table (routing-policy overrides).
+			// Created via CREATE IF NOT EXISTS above. Kept plaintext: the policy
+			// is broadcast publicly in channel_update gossip, nothing sensitive.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1027,6 +1042,47 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare('SELECT value FROM metadata WHERE key = ?')
 			.get(key) as { value: string } | undefined;
 		return row ? row.value : null;
+	}
+
+	// ─── Channel Routing Policies ───
+	// Stored plaintext: the policy is public data (broadcast in channel_update).
+
+	saveChannelPolicy(channelId: string, policy: IPersistedChannelPolicy): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO channel_policies (channel_id, policy_json) VALUES (?, ?)'
+			)
+			.run(channelId, JSON.stringify(policy));
+	}
+
+	loadAllChannelPolicies(): Array<{
+		channelId: string;
+		policy: IPersistedChannelPolicy;
+	}> {
+		const rows = this.db
+			.prepare('SELECT channel_id, policy_json FROM channel_policies')
+			.all() as Array<{ channel_id: string; policy_json: string }>;
+		const results: Array<{
+			channelId: string;
+			policy: IPersistedChannelPolicy;
+		}> = [];
+		for (const row of rows) {
+			try {
+				results.push({
+					channelId: row.channel_id,
+					policy: JSON.parse(row.policy_json) as IPersistedChannelPolicy
+				});
+			} catch (err) {
+				this.reportCorruptRow(err);
+			}
+		}
+		return results;
+	}
+
+	deleteChannelPolicy(channelId: string): void {
+		this.db
+			.prepare('DELETE FROM channel_policies WHERE channel_id = ?')
+			.run(channelId);
 	}
 
 	// ─── Transaction ───
