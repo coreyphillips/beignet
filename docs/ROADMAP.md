@@ -10,28 +10,28 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M0. Docs and discrepancy quick wins (small, do first)
 
-- [ ] Fix stale taproot comments claiming funding "cannot complete" and "off by default,
-      experimental". Taproot is fully wired (deterministic MuSig2 verification nonces,
-      full LND interop lifecycle). Locations: `src/lightning/node/types.ts:130-136`,
-      `src/lightning/channel/channel-manager.ts:160-164`. Update README BOLT-coverage
-      section if it repeats the claim.
-- [ ] Resolve the `/channel/update-fee` naming trap: it sets the commitment feerate
-      (update_fee), not routing policy. Rename to `/channel/update-commitment-feerate`
-      (keep old path as deprecated alias) and document clearly. Routing policy control
+- [~] Fix stale taproot comments claiming funding "cannot complete" (PR #32).
+      README line 520 was already accurate (experimental because the feature bit
+      is staging upstream), so only the two source comments changed.
+- [~] Resolve the `/channel/update-fee` naming trap (PR #33): renamed to
+      `/channel/update-commitment-feerate` with the old path kept as a deprecated
+      alias; OpenAPI, docstrings and README clarified. Routing policy control
       itself is M3.
 - [?] Decide: dual-fund (28) and zero-conf (50) are implemented but absent from
       `defaultFeatures()` (`lightning-node.ts:6347-6369`), so they never negotiate
-      unless the host passes custom feature flags. Confirm intentional gating or add
-      config toggles that advertise them.
-- [ ] Sweep other defined-but-never-advertised bits for intent: LARGE_CHANNELS(18),
-      ANCHOR_OUTPUTS(20), GOSSIP_QUERIES_EX(10), UPFRONT_SHUTDOWN_SCRIPT(4),
-      OPTION_WILL_FUND(112). Document each as deliberate or wire it up.
-- [ ] Legacy v1 `open_channel` path does not validate chain_hash (the v2 path
-      already does, `channel-manager.ts:3176-3193`). Add the same guard to
-      `handleOpenChannel`.
-- [ ] `decodeInvoiceRequestTlv` returns a zero-buffer offerId placeholder
-      (`offer/tlv.ts:351`); compute it from the offer TLV records. Note:
-      `createOffer` and `handleInvoiceRequest` already compute real offer ids.
+      unless the host passes custom feature flags (config.localFeatures). Current
+      gating documented in code (PR #32); Corey to confirm defaults or request
+      config toggles.
+- [~] Sweep other defined-but-never-advertised bits for intent (PR #32): each of
+      LARGE_CHANNELS(18), ANCHOR_OUTPUTS(20), GOSSIP_QUERIES_EX(10),
+      UPFRONT_SHUTDOWN_SCRIPT(4), OPTION_WILL_FUND(112), ROUTE_BLINDING(24),
+      OPTION_TAPROOT(180/181) now documented in defaultFeatures(). Wumbo wiring
+      itself is an M3 item.
+- [~] Legacy v1 `open_channel` path did not validate chain_hash (the v2 path
+      already did). Same guard added to `handleOpenChannel` + test (PR #34).
+- [~] `decodeInvoiceRequestTlv` returned a zero-buffer offerId placeholder;
+      now computed from the mirrored offer TLV records, and
+      `handleInvoiceRequest` reuses the decoded value + tests (PR #34).
 
 ## M1. Recovery and backup (highest fund-safety impact)
 
@@ -182,3 +182,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 ## Session log
 
 - 2026-07-09: Roadmap created from the four-domain feature review. No code changes yet.
+- 2026-07-09 (same session): M0 executed as three PRs awaiting review: #32 (roadmap +
+  taproot comment corrections + feature-bit gating docs), #33 (update-fee endpoint
+  rename with deprecated alias), #34 (v1 open_channel chain_hash validation +
+  invoice_request offerId computation). Open decision for Corey: default advertising
+  of dual_fund/zero_conf, see the [?] item above.
