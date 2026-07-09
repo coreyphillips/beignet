@@ -300,15 +300,13 @@ export class OfferManager extends EventEmitter {
 	): IBolt12Invoice | null {
 		const { request } = decodeInvoiceRequestTlv(requestData);
 
-		// Try to find matching offer by re-decoding offer fields
-		const requestRecords = getTlvRecords(requestData);
-		const offerRecords = requestRecords.filter((r) => Number(r.type) <= 22);
+		// Match against local offers by the offerId the decoder computed from the
+		// offer TLV records mirrored into the request (zero when none present).
 		let matchedOffer: IOffer | undefined;
 		let matchedOfferIdHex: string | undefined;
 
-		if (offerRecords.length > 0) {
-			const computedOfferId = computeOfferId(offerRecords);
-			matchedOfferIdHex = computedOfferId.toString('hex');
+		if (!request.offerId.equals(Buffer.alloc(32))) {
+			matchedOfferIdHex = request.offerId.toString('hex');
 			matchedOffer = this.offers.get(matchedOfferIdHex)?.offer;
 		}
 

@@ -147,6 +147,28 @@ describe('Channel Manager', function () {
 			expect(channel.getState()).to.equal(ChannelState.SENT_ACCEPT);
 		});
 
+		it('should reject open_channel for a different chain', function () {
+			// Bob operates on a different chain than Alice's open_channel targets
+			const bobRegtest = new ChannelManager({
+				...makeConfig(2),
+				chainHash: crypto.createHash('sha256').update('other-chain').digest()
+			});
+			const alice = new ChannelManager(makeConfig(1));
+			connectManagers(alice, alicePubkey, bobRegtest, bobPubkey);
+
+			const errors: string[] = [];
+			bobRegtest.on('error', (_id: Buffer, message: string) =>
+				errors.push(message)
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+
+			// Bob rejected the open: no accept_channel came back
+			expect(channel.getState()).to.equal(ChannelState.SENT_OPEN);
+			expect(errors.length).to.equal(1);
+			expect(errors[0]).to.include('unknown chain');
+		});
+
 		it('should reach AWAITING_FUNDING_CONFIRMED after funding', function () {
 			const { alice } = createConnectedManagers();
 

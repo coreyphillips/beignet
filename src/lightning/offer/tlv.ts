@@ -25,6 +25,9 @@ import {
 	IInvoiceError,
 	IFallbackAddress
 } from './types';
+// Note: merkle.ts also imports from this module; both imports are used only at
+// call time, so the module cycle is benign under CommonJS.
+import { computeOfferId } from './merkle';
 
 // ── Offer TLV Types (BOLT 12) ──────────────────────────────────────
 
@@ -347,8 +350,11 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 		throw new Error('Invoice request missing required payer_key field');
 	}
 
-	// Compute offerId from the offer TLV records (types <= 22)
-	const offerId = Buffer.alloc(32); // Placeholder — caller should compute
+	// Compute offerId from the offer TLV records mirrored into the request
+	// (types <= 22). Zero when the request carries no offer records.
+	const offerRecords = records.filter((r) => Number(r.type) <= 22);
+	const offerId =
+		offerRecords.length > 0 ? computeOfferId(offerRecords) : Buffer.alloc(32);
 
 	const request: IInvoiceRequest = {
 		payerKey: payerKeyVal,
