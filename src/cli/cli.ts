@@ -260,6 +260,12 @@ async function handleStart(): Promise<void> {
 	if (tlsKeyFlag) cliFlags.tlsKey = tlsKeyFlag;
 	const torProxyFlag = parseFlag('--tor-proxy');
 	if (torProxyFlag) cliFlags.torProxy = torProxyFlag;
+	const announceAddrFlag = parseFlag('--announce-addr');
+	if (announceAddrFlag)
+		cliFlags.announceAddresses = announceAddrFlag
+			.split(',')
+			.map((a) => a.trim())
+			.filter((a) => a.length > 0);
 
 	const config = resolveConfig(cliFlags);
 
@@ -299,7 +305,8 @@ async function handleStart(): Promise<void> {
 			dailySpendLimitSats: config.dailySpendLimitSats,
 			tlsCert: config.tlsCert,
 			tlsKey: config.tlsKey,
-			torProxy: config.torProxy
+			torProxy: config.torProxy,
+			announceAddresses: config.announceAddresses
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -733,6 +740,9 @@ Start flags:
   --tls-key <path>                       TLS private key file (requires --tls-cert)
   --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer
                                          connections (e.g. Tor at 127.0.0.1:9050)
+  --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
+                                         (IPv4, [ipv6]:port, .onion v3, or hostname;
+                                         port defaults to 9735)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

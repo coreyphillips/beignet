@@ -112,7 +112,15 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 		tlsCert: cliFlags.tlsCert || process.env.BEIGNET_TLS_CERT || file.tlsCert,
 		tlsKey: cliFlags.tlsKey || process.env.BEIGNET_TLS_KEY || file.tlsKey,
 		torProxy:
-			cliFlags.torProxy || process.env.BEIGNET_TOR_PROXY || file.torProxy
+			cliFlags.torProxy || process.env.BEIGNET_TOR_PROXY || file.torProxy,
+		announceAddresses:
+			cliFlags.announceAddresses ||
+			(process.env.BEIGNET_ANNOUNCE_ADDRESSES
+				? process.env.BEIGNET_ANNOUNCE_ADDRESSES.split(',')
+						.map((a) => a.trim())
+						.filter((a) => a.length > 0)
+				: undefined) ||
+			file.announceAddresses
 	};
 }
 

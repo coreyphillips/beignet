@@ -1016,6 +1016,75 @@ describe('BOLT 7: Gossip & Routing', () => {
 			).to.throw('DNS hostname must be 1-255 bytes');
 		});
 
+		describe('parseAnnouncedAddress', () => {
+			const { parseAnnouncedAddress } = require('../../src/lightning/gossip');
+			// Real v3 onion (DuckDuckGo) — exercises base32 decode, version byte
+			// and the sha3-256 checksum verification.
+			const REAL_ONION =
+				'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion';
+
+			it('parses IPv4 with and without port', () => {
+				expect(parseAnnouncedAddress('203.0.113.7:9736')).to.deep.equal({
+					type: ADDRESS_TYPE_IPV4,
+					host: '203.0.113.7',
+					port: 9736
+				});
+				expect(parseAnnouncedAddress('203.0.113.7').port).to.equal(9735);
+			});
+
+			it('parses [ipv6]:port and expands compressed form', () => {
+				const addr = parseAnnouncedAddress('[2001:db8::1]:9736');
+				expect(addr.type).to.equal(ADDRESS_TYPE_IPV6);
+				expect(addr.host).to.equal('2001:0db8:0000:0000:0000:0000:0000:0001');
+				expect(addr.port).to.equal(9736);
+			});
+
+			it('rejects bare IPv6 without brackets', () => {
+				expect(() => parseAnnouncedAddress('2001:db8::1')).to.throw(
+					'must be written as [host]:port'
+				);
+			});
+
+			it('parses a real Tor v3 onion address to a 35-byte descriptor', () => {
+				const addr = parseAnnouncedAddress(`${REAL_ONION}:9735`);
+				expect(addr.type).to.equal(ADDRESS_TYPE_TORV3);
+				expect(Buffer.from(addr.host, 'hex')).to.have.length(35);
+				// Version byte is always 3 for v3 onions
+				expect(Buffer.from(addr.host, 'hex')[34]).to.equal(3);
+				// Round-trips through the BOLT 7 codec
+				const { address } = decodeNodeAddress(encodeNodeAddress(addr), 0);
+				expect(address).to.deep.equal(addr);
+			});
+
+			it('rejects onion addresses with a corrupted label', () => {
+				const corrupted = REAL_ONION.replace('duckduckgo', 'duckduckgq');
+				expect(() => parseAnnouncedAddress(corrupted)).to.throw(
+					'Invalid Tor v3 onion address'
+				);
+			});
+
+			it('rejects v2 onion addresses (16-char label)', () => {
+				expect(() =>
+					parseAnnouncedAddress('expyuzz4wqqyqhjn.onion:9735')
+				).to.throw('Only Tor v3');
+			});
+
+			it('parses DNS hostnames as type 5', () => {
+				expect(parseAnnouncedAddress('ln.example.com:9737')).to.deep.equal({
+					type: ADDRESS_TYPE_DNS,
+					host: 'ln.example.com',
+					port: 9737
+				});
+			});
+
+			it('rejects invalid ports and empty hosts', () => {
+				expect(() => parseAnnouncedAddress('203.0.113.7:99999')).to.throw(
+					'Invalid port'
+				);
+				expect(() => parseAnnouncedAddress(':9735')).to.throw('empty host');
+			});
+		});
+
 		it('node_announcement with DNS + TorV2 addresses round-trips byte-identically', () => {
 			// Regression: these types previously threw in decodeNodeAddress, so
 			// the whole announcement was dropped in handleNodeAnnouncement.
@@ -2809,5 +2878,59 @@ describe('BOLT 7: Gossip & Routing', () => {
 			);
 			expect(route10).to.be.null;
 		});
+	});
+});
+
+// ── Own node_announcement address advertising ───────────────────────
+
+describe('LightningNode announced addresses', () => {
+	const TEST_MNEMONIC =
+		'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about';
+
+	it('buildNodeAnnouncement includes configured addresses sorted by type', () => {
+		const {
+			LightningNode
+		} = require('../../src/lightning/node/lightning-node');
+		const { parseAnnouncedAddress } = require('../../src/lightning/gossip');
+		const node = LightningNode.fromMnemonic(TEST_MNEMONIC, {
+			enableNetworking: false,
+			alias: 'onion-node',
+			announcedAddresses: [
+				// Deliberately out of order: DNS (5), onion (4), IPv4 (1)
+				parseAnnouncedAddress('ln.example.com:9737'),
+				parseAnnouncedAddress(
+					'duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion:9735'
+				),
+				parseAnnouncedAddress('203.0.113.7:9736')
+			]
+		});
+		const payload = (node as any).buildNodeAnnouncement(1700000000);
+		expect(payload).to.not.be.null;
+		const decoded = decodeNodeAnnouncementMessage(payload);
+		expect(verifyNodeAnnouncement(decoded, payload)).to.be.true;
+		expect(decoded.addresses).to.have.length(3);
+		// BOLT 7: ascending by type
+		expect(decoded.addresses.map((a: INodeAddress) => a.type)).to.deep.equal([
+			ADDRESS_TYPE_IPV4,
+			ADDRESS_TYPE_TORV3,
+			ADDRESS_TYPE_DNS
+		]);
+		expect(decoded.addresses[0].host).to.equal('203.0.113.7');
+		expect(decoded.addresses[2].host).to.equal('ln.example.com');
+		expect(decoded.alias.toString('utf8').replace(/\0+$/, '')).to.equal(
+			'onion-node'
+		);
+	});
+
+	it('buildNodeAnnouncement stays empty-addressed when none configured', () => {
+		const {
+			LightningNode
+		} = require('../../src/lightning/node/lightning-node');
+		const node = LightningNode.fromMnemonic(TEST_MNEMONIC, {
+			enableNetworking: false
+		});
+		const payload = (node as any).buildNodeAnnouncement(1700000000);
+		const decoded = decodeNodeAnnouncementMessage(payload);
+		expect(decoded.addresses).to.deep.equal([]);
 	});
 });
