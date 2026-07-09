@@ -54,7 +54,9 @@ import {
 	INodeAddress,
 	ADDRESS_TYPE_IPV4,
 	ADDRESS_TYPE_IPV6,
+	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
+	ADDRESS_TYPE_DNS,
 	MESSAGE_FLAG_HTLC_MAX,
 	ANNOUNCEMENT_SIGNATURES_LENGTH,
 	NODE_ANN_TLV_LEASE_RATES,
@@ -467,6 +469,21 @@ export function encodeNodeAddress(addr: INodeAddress): Buffer {
 			buf.writeUInt16BE(addr.port, 17);
 			return buf;
 		}
+		case ADDRESS_TYPE_TORV2: {
+			// Deprecated, but still appears in the wild; round-trip it so relayed
+			// announcements re-encode byte-identically to the signed payload.
+			const buf = Buffer.alloc(13);
+			buf[0] = ADDRESS_TYPE_TORV2;
+			const hostBuf = Buffer.from(addr.host, 'hex');
+			if (hostBuf.length !== 10) {
+				throw new Error(
+					`TorV2 host must be 10 bytes (20 hex chars), got ${hostBuf.length}`
+				);
+			}
+			hostBuf.copy(buf, 1);
+			buf.writeUInt16BE(addr.port, 11);
+			return buf;
+		}
 		case ADDRESS_TYPE_TORV3: {
 			const buf = Buffer.alloc(38);
 			buf[0] = ADDRESS_TYPE_TORV3;
@@ -478,6 +495,18 @@ export function encodeNodeAddress(addr: INodeAddress): Buffer {
 			}
 			hostBuf.copy(buf, 1);
 			buf.writeUInt16BE(addr.port, 36);
+			return buf;
+		}
+		case ADDRESS_TYPE_DNS: {
+			const hostBuf = Buffer.from(addr.host, 'ascii');
+			if (hostBuf.length < 1 || hostBuf.length > 255) {
+				throw new Error(`DNS hostname must be 1-255 bytes: ${addr.host}`);
+			}
+			const buf = Buffer.alloc(1 + 1 + hostBuf.length + 2);
+			buf[0] = ADDRESS_TYPE_DNS;
+			buf[1] = hostBuf.length;
+			hostBuf.copy(buf, 2);
+			buf.writeUInt16BE(addr.port, 2 + hostBuf.length);
 			return buf;
 		}
 		default:
@@ -512,10 +541,21 @@ export function decodeNodeAddress(
 			const port = buf.readUInt16BE(offset + 17);
 			return { address: { type, host, port }, bytesRead: 19 };
 		}
+		case ADDRESS_TYPE_TORV2: {
+			const host = buf.subarray(offset + 1, offset + 11).toString('hex');
+			const port = buf.readUInt16BE(offset + 11);
+			return { address: { type, host, port }, bytesRead: 13 };
+		}
 		case ADDRESS_TYPE_TORV3: {
 			const host = buf.subarray(offset + 1, offset + 36).toString('hex');
 			const port = buf.readUInt16BE(offset + 36);
 			return { address: { type, host, port }, bytesRead: 38 };
+		}
+		case ADDRESS_TYPE_DNS: {
+			const len = buf[offset + 1];
+			const host = buf.subarray(offset + 2, offset + 2 + len).toString('ascii');
+			const port = buf.readUInt16BE(offset + 2 + len);
+			return { address: { type, host, port }, bytesRead: 2 + len + 2 };
 		}
 		default:
 			throw new Error(`Unknown address type: ${type}`);

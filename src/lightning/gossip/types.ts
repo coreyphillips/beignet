@@ -194,7 +194,9 @@ export interface IRoute {
 
 export const ADDRESS_TYPE_IPV4 = 1;
 export const ADDRESS_TYPE_IPV6 = 2;
+export const ADDRESS_TYPE_TORV2 = 3;
 export const ADDRESS_TYPE_TORV3 = 4;
+export const ADDRESS_TYPE_DNS = 5;
 
 export const CHANNEL_FLAG_DIRECTION = 0x01;
 export const CHANNEL_FLAG_DISABLED = 0x02;

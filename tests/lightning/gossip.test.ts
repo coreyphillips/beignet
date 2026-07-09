@@ -17,7 +17,9 @@ import {
 	IAnnouncementSignaturesMessage,
 	ADDRESS_TYPE_IPV4,
 	ADDRESS_TYPE_IPV6,
+	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3,
+	ADDRESS_TYPE_DNS,
 	CHANNEL_FLAG_DIRECTION,
 	CHANNEL_FLAG_DISABLED,
 	MESSAGE_FLAG_HTLC_MAX,
@@ -971,6 +973,76 @@ describe('BOLT 7: Gossip & Routing', () => {
 			expect(() => encodeNodeAddress({ type: 99, host: '', port: 0 })).to.throw(
 				'Unknown address type'
 			);
+		});
+
+		it('should encode/decode TorV2 address (deprecated but relayed)', () => {
+			const hostHex = crypto.randomBytes(10).toString('hex');
+			const addr: INodeAddress = {
+				type: ADDRESS_TYPE_TORV2,
+				host: hostHex,
+				port: 9735
+			};
+			const encoded = encodeNodeAddress(addr);
+			expect(encoded.length).to.equal(13);
+			const { address, bytesRead } = decodeNodeAddress(encoded, 0);
+			expect(bytesRead).to.equal(13);
+			expect(address.type).to.equal(ADDRESS_TYPE_TORV2);
+			expect(address.host).to.equal(hostHex);
+			expect(address.port).to.equal(9735);
+		});
+
+		it('should encode/decode DNS hostname address', () => {
+			const addr: INodeAddress = {
+				type: ADDRESS_TYPE_DNS,
+				host: 'ln.example.com',
+				port: 9735
+			};
+			const encoded = encodeNodeAddress(addr);
+			expect(encoded.length).to.equal(1 + 1 + 14 + 2);
+			const { address, bytesRead } = decodeNodeAddress(encoded, 0);
+			expect(bytesRead).to.equal(18);
+			expect(address.type).to.equal(ADDRESS_TYPE_DNS);
+			expect(address.host).to.equal('ln.example.com');
+			expect(address.port).to.equal(9735);
+		});
+
+		it('should reject oversize DNS hostname on encode', () => {
+			expect(() =>
+				encodeNodeAddress({
+					type: ADDRESS_TYPE_DNS,
+					host: 'a'.repeat(256),
+					port: 9735
+				})
+			).to.throw('DNS hostname must be 1-255 bytes');
+		});
+
+		it('node_announcement with DNS + TorV2 addresses round-trips byte-identically', () => {
+			// Regression: these types previously threw in decodeNodeAddress, so
+			// the whole announcement was dropped in handleNodeAnnouncement.
+			const { privateKey } = makeKeypair();
+			const addresses: INodeAddress[] = [
+				{ type: ADDRESS_TYPE_IPV4, host: '203.0.113.9', port: 9735 },
+				{
+					type: ADDRESS_TYPE_TORV2,
+					host: crypto.randomBytes(10).toString('hex'),
+					port: 9735
+				},
+				{ type: ADDRESS_TYPE_DNS, host: 'node.example.org', port: 9736 }
+			];
+			const { payload } = buildNodeAnnouncement(
+				privateKey,
+				1700000000,
+				'dns-node',
+				addresses
+			);
+			const decoded = decodeNodeAnnouncementMessage(payload);
+			expect(decoded.addresses).to.have.length(3);
+			expect(decoded.addresses[2].host).to.equal('node.example.org');
+			// Relay path re-encodes the stored announcement; it must reproduce
+			// the exact signed bytes or the signature breaks for other peers.
+			const reencoded = encodeNodeAnnouncementMessage(decoded);
+			expect(reencoded.equals(payload)).to.be.true;
+			expect(verifyNodeAnnouncement(decoded, reencoded)).to.be.true;
 		});
 	});
 
