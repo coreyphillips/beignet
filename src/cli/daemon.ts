@@ -790,6 +790,37 @@ export async function startDaemon(
 			return success({ backed_up: true });
 		},
 		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
+		'POST /restore/scb': async (body) => {
+			const { encoded, path: scbPath } = body as {
+				encoded?: string;
+				path?: string;
+			};
+			if ((encoded ? 1 : 0) + (scbPath ? 1 : 0) !== 1) {
+				return failure(
+					'INVALID_PARAMS',
+					'Provide exactly one of encoded or path'
+				);
+			}
+			let blob = encoded;
+			if (scbPath) {
+				if (
+					scbPath.includes('..') ||
+					scbPath.includes('%2e%2e') ||
+					scbPath.includes('%2E%2E')
+				) {
+					return failure('INVALID_PARAMS', 'Path traversal not allowed');
+				}
+				try {
+					blob = fs.readFileSync(scbPath, 'utf8');
+				} catch (err) {
+					return failure(
+						'INVALID_PARAMS',
+						`Cannot read SCB file: ${(err as Error).message}`
+					);
+				}
+			}
+			return success(await node.restoreFromScb(blob!));
+		},
 
 		// ── BOLT 12 Offers ──
 		'POST /offer/create': (body) => {

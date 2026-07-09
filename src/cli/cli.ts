@@ -9,6 +9,7 @@
 
 import * as http from 'http';
 import * as fs from 'fs';
+import * as nodePath from 'path';
 import { generateMnemonic } from '../utils/helpers';
 import {
 	loadConfig,
@@ -20,6 +21,9 @@ import {
 	getDaemonPort
 } from './config';
 import { startDaemon } from './daemon';
+import { defaultDataDirForMnemonic } from './beignet-node';
+import { performDbRestore } from './restore';
+import { InstanceLockError } from './instance-lock';
 import { ApiResponse, BeignetConfig } from './types';
 
 const args = process.argv.slice(2);
@@ -174,6 +178,8 @@ async function main(): Promise<void> {
 			);
 		case 'backup':
 			return handleBackup();
+		case 'restore':
+			return handleRestore();
 		default:
 			output({
 				ok: false,
@@ -658,6 +664,129 @@ async function handleBackup(): Promise<void> {
 	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
 }
 
+async function handleRestore(): Promise<void> {
+	const sub = filteredArgs[1];
+	const file = filteredArgs[2];
+
+	if (sub === 'scb') {
+		// On-chain recovery only: channels are reconstructed in a broadcast-banned
+		// state and funds arrive when each peer force-closes. Requires the daemon.
+		if (!file) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet restore scb <file>'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		let encoded: string;
+		try {
+			encoded = fs.readFileSync(file, 'utf8').trim();
+		} catch (err: unknown) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: `Cannot read SCB file: ${(err as Error).message}`
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		return outputResult(await httpRequest('POST', '/restore/scb', { encoded }));
+	}
+
+	if (sub === 'db') {
+		// OFFLINE full-state restore: copies a database backup into place. The
+		// daemon must be stopped - the restore holds the same single-instance
+		// lock the daemon takes, so a live node is never overwritten.
+		if (!file) {
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message: 'Usage: beignet restore db <backupFile>'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		const config = resolveConfig({});
+		if (!config.mnemonic) {
+			output({
+				ok: false,
+				error: {
+					code: 'NO_MNEMONIC',
+					message:
+						'No mnemonic found. Run "beignet init" first or set BEIGNET_MNEMONIC (the restored DB is seed-encrypted and needs the same mnemonic).'
+				}
+			});
+			process.exitCode = 1;
+			return;
+		}
+		// Belt and braces: the PID file catches a daemon started via this CLI
+		// even when it runs on a different data dir than the one resolved here.
+		const pidInfo = readPidFile();
+		if (pidInfo) {
+			try {
+				process.kill(pidInfo.pid, 0);
+				output({
+					ok: false,
+					error: {
+						code: 'DAEMON_RUNNING',
+						message: `Daemon is running (PID ${pidInfo.pid}). Stop it with 'beignet stop' before restoring the database.`
+					}
+				});
+				process.exitCode = 1;
+				return;
+			} catch {
+				// Stale PID file - the instance lock below is the real gate.
+			}
+		}
+		const network = config.network || 'mainnet';
+		const dataDir =
+			config.dataDir || defaultDataDirForMnemonic(config.mnemonic);
+		const dbPath = nodePath.join(dataDir, `${network}.db`);
+		const lockPath = nodePath.join(dataDir, `${network}.lock`);
+		try {
+			fs.mkdirSync(dataDir, { recursive: true });
+			const result = performDbRestore(file, dbPath, lockPath);
+			output({
+				ok: true,
+				result: {
+					restored: true,
+					dbPath: result.dbPath,
+					preRestorePath: result.preRestorePath,
+					network,
+					note: 'DB is encrypted under the wallet seed; start the node with the same mnemonic.'
+				}
+			});
+		} catch (err: unknown) {
+			const code =
+				err instanceof InstanceLockError ? 'DAEMON_RUNNING' : 'RESTORE_FAILED';
+			output({
+				ok: false,
+				error: { code, message: (err as Error).message }
+			});
+			process.exitCode = 1;
+		}
+		return;
+	}
+
+	output({
+		ok: false,
+		error: {
+			code: 'UNKNOWN_COMMAND',
+			message:
+				'Usage: beignet restore scb <file> | beignet restore db <backupFile>'
+		}
+	});
+	process.exitCode = 1;
+}
+
 async function handleMetrics(): Promise<void> {
 	const port = getDaemonPort();
 	const token = getApiToken();
@@ -718,6 +847,12 @@ On-chain:
   fee-estimates                          Current fee estimates (sats/vbyte)
   backup <destPath>                      Create database backup
   backup scb [destPath]                  Export encrypted static channel backup
+  restore scb <file>                     Restore channels from an SCB (on-chain
+                                         recovery only: peers force-close and
+                                         funds are swept to the wallet)
+  restore db <backupFile>                Restore a database backup (full state;
+                                         OFFLINE - stop the daemon first; needs
+                                         the same mnemonic, DB is seed-encrypted)
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer

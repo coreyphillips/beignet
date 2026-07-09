@@ -263,9 +263,39 @@ automatically whenever the channel set changes (channel open/splice calls,
 `channel:ready`, `channel:closed`, and channel resolution). Store a copy
 off-machine (e.g. via `beignet backup scb <destPath>` or `GET /backup/scb`).
 
-RESTORE from an SCB (reconnect to peers with stale state so they force-close,
-then sweep our balance on chain) lands in a follow-up release; this version
-covers export only.
+#### Restore
+
+| Method / Command | Returns | Description |
+|--------|---------|-------------|
+| `restoreFromScb(encoded)` | `Promise<{ recovering, skipped, channelCount }>` | Recover channels from an SCB blob (daemon: `POST /restore/scb` with `{ encoded }` or `{ path }`; CLI: `beignet restore scb <file>`) |
+| `beignet restore db <backupFile>` | JSON result | Copy a database backup into place (OFFLINE, local CLI operation - no daemon call) |
+
+Two very different restore modes:
+
+- **SCB restore = on-chain recovery only.** The backup holds no commitment
+  state, so the channels themselves cannot be resumed. Each entry is
+  reconstructed as a broadcast-banned channel (`ERRORED`, data-loss flagged -
+  the node will never publish its own stale commitment), the funding outpoint
+  is watched, and the peer is contacted so the normal reestablish exchange
+  proves our state stale. The honest peer then force-closes with ITS
+  commitment and the node sweeps only our `to_remote` balance to the wallet.
+  Funds arrive on-chain after the peer's force-close confirms; in-flight
+  HTLCs and anything beyond `to_remote` are not recoverable this way. The
+  blob decrypts only with the wallet mnemonic, and a backup taken on another
+  network is refused.
+
+- **DB restore = full state.** `beignet restore db <backupFile>` copies a
+  backup made with `backup()` over `<dataDir>/<network>.db`. The node must be
+  STOPPED: the command refuses while a daemon holds the wallet's
+  single-instance lock (and holds that lock itself during the copy). The file
+  must be a real SQLite database (16-byte header check), any existing
+  database is preserved at `<db>.pre-restore-<timestamp>` first, and stale
+  `-wal`/`-shm` sidecars are moved aside so they cannot corrupt the restored
+  file. The database is encrypted under the wallet seed, so the node must be
+  started with the same mnemonic that made the backup. WARNING: restoring a
+  stale database and going online can be unsafe (peers may prove the state
+  stale); prefer the most recent backup, and rely on SCB recovery when in
+  doubt.
 
 #### Health & Monitoring
 
