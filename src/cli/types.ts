@@ -440,6 +440,47 @@ export interface LiquiditySnapshot {
 	recommendations: LiquidityRecommendation[];
 }
 
+/** One planned circular rebalance (not yet executed). */
+export interface RebalancePlanInfo {
+	fromChannelId: string;
+	toChannelId: string;
+	amountSats: number;
+	reason: string;
+}
+
+/** GET /advisor/recommendations: analyze() output plus the concrete plan. */
+export interface AdvisorRecommendations extends LiquiditySnapshot {
+	rebalancePlan: RebalancePlanInfo[];
+}
+
+/** Outcome of one circular rebalance. Msat values are decimal strings. */
+export interface RebalanceResult {
+	paymentHash: string;
+	amountSats: number;
+	feeMsat: string;
+	feeSats: number;
+	hops: number;
+}
+
+export interface RebalanceAttemptInfo {
+	fromChannelId: string;
+	toChannelId: string;
+	amountSats: number;
+	status: 'SUCCEEDED' | 'FAILED' | 'SKIPPED_BUDGET';
+	feeMsat?: string;
+	error?: string;
+}
+
+/** POST /advisor/execute-rebalances result. Msat values are decimal strings. */
+export interface RebalanceExecutionSummary {
+	attempts: RebalanceAttemptInfo[];
+	succeeded: number;
+	failed: number;
+	skippedBudget: number;
+	feeSpentMsat: string;
+	budgetRemainingMsat: string;
+}
+
 export interface WebhookRegistration {
 	id: string;
 	url: string;

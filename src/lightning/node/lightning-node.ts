@@ -35,6 +35,7 @@ import {
 	findRoute,
 	findMultiPathRoute,
 	findRouteToBlindedPath,
+	calculateFee,
 	ILocalChannelEdge
 } from '../gossip/pathfinding';
 import {
@@ -144,7 +145,12 @@ import {
 	IKeysendOptions,
 	IChannelPolicy,
 	IChannelPolicyUpdate,
-	clampFeeRateSatPerVbyte
+	clampFeeRateSatPerVbyte,
+	IAutoRebalanceConfig,
+	IAutoTuneFeesConfig,
+	IRebalanceResult,
+	IRebalanceAttempt,
+	IRebalanceExecutionSummary
 } from './types';
 import {
 	validateHexPubkey,
@@ -215,6 +221,18 @@ import {
 	ChannelSuggestions,
 	IChannelSuggestion
 } from '../advisor/channel-suggestions';
+import {
+	planRebalances,
+	IRebalancePlan,
+	MIN_REBALANCE_SATS
+} from '../advisor/rebalance-planner';
+import {
+	computeFeeTuneAdjustments,
+	IFeeTuneInput,
+	IFeeTuneAdjustment,
+	DEFAULT_FEE_TUNE_FLOOR_PPM,
+	DEFAULT_FEE_TUNE_CEIL_PPM
+} from '../advisor/fee-tuner';
 
 bitcoin.initEccLib(ecc);
 
@@ -375,6 +393,16 @@ export class LightningNode extends EventEmitter {
 	private liquidityAdvisor = new LiquidityAdvisor();
 	private feeAdvisor = new FeeAdvisor();
 	private channelSuggestions = new ChannelSuggestions();
+	// Advisor execution (both OFF by default; see INodeConfig)
+	private autoRebalanceConfig: IAutoRebalanceConfig;
+	private autoTuneFeesConfig: IAutoTuneFeesConfig;
+	private autoRebalanceTimer: ReturnType<typeof setInterval> | null = null;
+	private autoTuneFeesTimer: ReturnType<typeof setInterval> | null = null;
+	/** Rebalance-fee spend for the current UTC day (mirrors persisted metadata). */
+	private rebalanceBudgetDay: { day: string; spentFeeMsat: bigint } | null =
+		null;
+	/** Serializes executeRebalanceRecommendations runs (budget consistency). */
+	private rebalanceRunInFlight = false;
 	// BOLT 1 peer storage (option_provide_storage)
 	private peerStorageEnabled: boolean;
 	// option_wumbo (large_channels): lift the 2^24 sat funding cap
@@ -607,6 +635,36 @@ export class LightningNode extends EventEmitter {
 			}, 300_000);
 			if (this.missionControlTimer.unref) {
 				this.missionControlTimer.unref();
+			}
+		}
+
+		// Advisor execution timers -- both features are opt-in (enabled: true).
+		this.autoRebalanceConfig = config.autoRebalance ?? {};
+		this.autoTuneFeesConfig = config.autoTuneFees ?? {};
+		if (this.autoRebalanceConfig.enabled === true) {
+			this.autoRebalanceTimer = setInterval(() => {
+				this.executeRebalanceRecommendations().catch((err) => {
+					this.emitStructuredLog('payment', 'auto_rebalance_failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				});
+			}, this.autoRebalanceConfig.intervalMs ?? 3_600_000);
+			if (this.autoRebalanceTimer.unref) {
+				this.autoRebalanceTimer.unref();
+			}
+		}
+		if (this.autoTuneFeesConfig.enabled === true) {
+			this.autoTuneFeesTimer = setInterval(() => {
+				try {
+					this.runFeeTuneOnce();
+				} catch (err) {
+					this.emitStructuredLog('fee', 'auto_tune_failed', {
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}, this.autoTuneFeesConfig.intervalMs ?? 21_600_000);
+			if (this.autoTuneFeesTimer.unref) {
+				this.autoTuneFeesTimer.unref();
 			}
 		}
 
@@ -2748,6 +2806,14 @@ export class LightningNode extends EventEmitter {
 			clearInterval(this._gossipRefreshTimer);
 			this._gossipRefreshTimer = undefined;
 		}
+		if (this.autoRebalanceTimer) {
+			clearInterval(this.autoRebalanceTimer);
+			this.autoRebalanceTimer = null;
+		}
+		if (this.autoTuneFeesTimer) {
+			clearInterval(this.autoTuneFeesTimer);
+			this.autoTuneFeesTimer = null;
+		}
 		// Clear reconnect timers
 		for (const t of this._reconnectTimers) {
 			clearTimeout(t);
@@ -3763,6 +3829,465 @@ export class LightningNode extends EventEmitter {
 		return this.liquidityAdvisor.analyze(snapshots);
 	}
 
+	// ─────────────── Advisor Execution (M3 phases 1+2) ───────────────
+
+	/**
+	 * Concrete circular-rebalance plan derived from the advisor's view of the
+	 * current channels: saturated channels paired with depleted ones, amounts
+	 * sized toward 50/50. Pure planning -- nothing is executed.
+	 */
+	planRebalanceRecommendations(minImbalancePct?: number): IRebalancePlan[] {
+		const snapshots: IChannelSnapshot[] = this.listChannels().map((ch) => ({
+			channelId: ch.channelId.toString('hex'),
+			state: ch.state as string,
+			localBalanceMsat: ch.localBalanceMsat,
+			remoteBalanceMsat: ch.remoteBalanceMsat,
+			capacitySats: Number(ch.fundingSatoshis),
+			peerPubkey: ch.peerPubkey
+		}));
+		const plans = planRebalances(snapshots, {
+			minImbalancePct:
+				minImbalancePct ?? this.autoRebalanceConfig.minImbalancePct
+		});
+		// Clamp each plan to what ONE HTLC can carry: the outbound leg (amount
+		// plus fees) is bounded by the donor peer's max_htlc_value_in_flight,
+		// the inbound leg by our own limit on the receiving channel. 1% of the
+		// cap is held back as fee headroom.
+		const clamped: IRebalancePlan[] = [];
+		for (const plan of plans) {
+			const fromCh = this.channelManager.getChannel(
+				Buffer.from(plan.fromChannelId, 'hex')
+			);
+			const toCh = this.channelManager.getChannel(
+				Buffer.from(plan.toChannelId, 'hex')
+			);
+			if (!fromCh || !toCh) continue;
+			const outCapMsat =
+				fromCh.getFullState().remoteConfig.maxHtlcValueInFlightMsat;
+			const inCapMsat =
+				toCh.getFullState().localConfig.maxHtlcValueInFlightMsat;
+			const capMsat = outCapMsat < inCapMsat ? outCapMsat : inCapMsat;
+			const maxAmountSats = (capMsat * 99n) / 100n / 1000n;
+			const amountSats =
+				plan.amountSats < maxAmountSats ? plan.amountSats : maxAmountSats;
+			if (amountSats < MIN_REBALANCE_SATS) continue;
+			clamped.push({ ...plan, amountSats });
+		}
+		return clamped;
+	}
+
+	/**
+	 * Circular rebalance: pay OURSELVES out over `fromChannelId` and back in
+	 * over `toChannelId`, moving `amountSats` of local balance between the two.
+	 *
+	 * Route construction: the graph search runs from us to the toChannel's peer
+	 * with the FIRST hop pinned to fromChannel (only that channel is offered as
+	 * a local edge; every other local SCID/alias is excluded), then the final
+	 * peer→us hop is appended from our own routing hint for toChannel (the same
+	 * SCID/policy an invoice would advertise), so the loop provably re-enters
+	 * on toChannelId. `maxFeeSats` is enforced BEFORE anything is sent -- on a
+	 * route costing more, this aborts without paying.
+	 */
+	async rebalanceChannel(options: {
+		fromChannelId: Buffer;
+		toChannelId: Buffer;
+		amountSats: bigint;
+		maxFeeSats: bigint;
+		timeoutMs?: number;
+	}): Promise<IRebalanceResult> {
+		const { fromChannelId, toChannelId, amountSats, maxFeeSats } = options;
+		const cidErr =
+			validateBuffer(fromChannelId, 32, 'fromChannelId') ||
+			validateBuffer(toChannelId, 32, 'toChannelId');
+		if (cidErr) throw new Error(cidErr);
+		if (fromChannelId.equals(toChannelId)) {
+			throw new Error('fromChannelId and toChannelId must differ');
+		}
+		if (amountSats <= 0n) throw new Error('amountSats must be positive');
+		if (maxFeeSats < 0n) throw new Error('maxFeeSats must be non-negative');
+
+		const fromChannel = this.channelManager.getChannel(fromChannelId);
+		if (!fromChannel || fromChannel.getState() !== ChannelState.NORMAL) {
+			throw new Error(
+				`from channel not found or not NORMAL: ${fromChannelId.toString('hex')}`
+			);
+		}
+		const toChannel = this.channelManager.getChannel(toChannelId);
+		if (!toChannel || toChannel.getState() !== ChannelState.NORMAL) {
+			throw new Error(
+				`to channel not found or not NORMAL: ${toChannelId.toString('hex')}`
+			);
+		}
+
+		const amountMsat = amountSats * 1000n;
+		const maxFeeMsat = maxFeeSats * 1000n;
+		const fromState = fromChannel.getFullState();
+		const toState = toChannel.getFullState();
+		if (fromState.localBalanceMsat < amountMsat) {
+			throw new Error('insufficient local balance on from channel');
+		}
+		if (toState.remoteBalanceMsat < amountMsat) {
+			throw new Error('insufficient inbound capacity on to channel');
+		}
+		// Single-HTLC size limits -- fail fast instead of sending a doomed HTLC:
+		// the loop rides ONE HTLC back in over toChannel (our own in-flight cap
+		// applies); the outbound leg (amount + fees) is checked against the
+		// peer's cap after the route is known below.
+		if (amountMsat > toState.localConfig.maxHtlcValueInFlightMsat) {
+			throw new Error(
+				'amount exceeds our max_htlc_value_in_flight on the to channel'
+			);
+		}
+
+		const fromScid = fromState.shortChannelId ?? fromState.scidAlias;
+		if (!fromScid) {
+			throw new Error('from channel has no SCID or alias yet');
+		}
+		const fromPeerHex = this.channelManager.getPeerForChannel(fromChannelId);
+		if (!fromPeerHex) throw new Error('from channel has no known peer');
+
+		// The final peer→us hop: our own invoice routing hint for toChannel gives
+		// the SCID the peer forwards over and the fee/CLTV policy it enforces.
+		const toHint = this.buildRoutingHintForChannel(toChannel);
+		if (!toHint) {
+			throw new Error('to channel has no usable routing hint (SCID/alias)');
+		}
+
+		// Exclude every local channel's SCID/alias except fromChannel's, so the
+		// graph search can only leave (and never re-enter) through fromChannel.
+		const excluded = new Set<string>();
+		for (const channel of this.channelManager.listChannels()) {
+			const id = channel.getChannelId();
+			if (id && id.equals(fromChannelId)) continue;
+			const st = channel.getFullState();
+			if (st.shortChannelId) excluded.add(st.shortChannelId.toString('hex'));
+			if (st.scidAlias) excluded.add(st.scidAlias.toString('hex'));
+			if (st.remoteScidAlias) {
+				excluded.add(st.remoteScidAlias.toString('hex'));
+			}
+		}
+
+		const ourNodeId = getPublicKey(this.nodePrivkey);
+		const finalCltvExpiry = DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		// The toChannel peer charges its forwarding fee on the amount it relays
+		// to us, and needs its CLTV delta of headroom above our final expiry.
+		const toPeerFeeMsat = calculateFee(
+			amountMsat,
+			toHint.feeBaseMsat,
+			toHint.feeProportionalMillionths
+		);
+		const subRoute = findRoute(
+			this.graph,
+			ourNodeId,
+			toHint.pubkey,
+			amountMsat + toPeerFeeMsat,
+			finalCltvExpiry + toHint.cltvExpiryDelta,
+			undefined,
+			excluded,
+			this.missionControl,
+			undefined,
+			undefined,
+			undefined,
+			[
+				{
+					shortChannelId: fromScid,
+					peer: Buffer.from(fromPeerHex, 'hex'),
+					outboundMsat: fromState.localBalanceMsat
+				}
+			]
+		);
+		if (!subRoute) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'No circular route from fromChannel back to toChannel'
+			);
+		}
+		// Defense in depth: the exclusion set must have forced the first hop
+		// onto fromChannel -- never send if the constraint did not hold.
+		if (!subRoute.hops[0].shortChannelId.equals(fromScid)) {
+			throw new LightningPaymentError(
+				LightningErrorCode.NO_ROUTE,
+				'Route does not leave over the requested from channel'
+			);
+		}
+
+		const totalFeeMsat = subRoute.totalAmountMsat - amountMsat;
+		// STRICT fee cap: abort before creating the invoice or sending anything.
+		if (totalFeeMsat > maxFeeMsat) {
+			throw new LightningPaymentError(
+				LightningErrorCode.FEE_EXCEEDS_MAX,
+				`Rebalance fee ${totalFeeMsat} msat exceeds cap ${maxFeeMsat} msat`
+			);
+		}
+		// Outbound leg = amount + fees on one HTLC; the fromChannel peer's
+		// max_htlc_value_in_flight would reject anything larger.
+		if (
+			subRoute.totalAmountMsat > fromState.remoteConfig.maxHtlcValueInFlightMsat
+		) {
+			throw new Error(
+				'amount plus fees exceeds the peer max_htlc_value_in_flight on the from channel'
+			);
+		}
+
+		const invoice = this.createInvoice({
+			amountMsat,
+			description: 'beignet circular rebalance',
+			minFinalCltvExpiry: finalCltvExpiry
+		});
+
+		const hops = [
+			...subRoute.hops,
+			{
+				pubkey: ourNodeId,
+				shortChannelId: toHint.shortChannelId,
+				amountToForwardMsat: amountMsat,
+				outgoingCltvValue: finalCltvExpiry,
+				cltvExpiryDelta: toHint.cltvExpiryDelta,
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0
+			}
+		];
+
+		this.emitStructuredLog('payment', 'rebalance_started', {
+			fromChannelId: fromChannelId.toString('hex'),
+			toChannelId: toChannelId.toString('hex'),
+			amountMsat: amountMsat.toString(),
+			feeMsat: totalFeeMsat.toString(),
+			hops: hops.length
+		});
+
+		this.sendPaymentToRoute(
+			{ hops },
+			invoice.paymentHash,
+			finalCltvExpiry,
+			invoice.paymentSecret,
+			amountMsat
+		);
+		await this.waitForPayment(invoice.paymentHash, options.timeoutMs ?? 60_000);
+
+		this.emitStructuredLog('payment', 'rebalance_succeeded', {
+			fromChannelId: fromChannelId.toString('hex'),
+			toChannelId: toChannelId.toString('hex'),
+			amountMsat: amountMsat.toString(),
+			feeMsat: totalFeeMsat.toString()
+		});
+
+		return {
+			paymentHash: invoice.paymentHash,
+			amountMsat,
+			feeMsat: totalFeeMsat,
+			hops: hops.length
+		};
+	}
+
+	/** Metadata key for the persisted per-day rebalance fee spend. */
+	private static readonly REBALANCE_BUDGET_KEY = 'advisor:rebalance-budget';
+
+	/** Current UTC day, the granularity at which the fee budget resets. */
+	private static currentUtcDay(): string {
+		return new Date().toISOString().slice(0, 10);
+	}
+
+	/** Fee spend recorded for TODAY (loads persisted state across restarts). */
+	private loadRebalanceSpentMsat(): bigint {
+		const day = LightningNode.currentUtcDay();
+		if (!this.rebalanceBudgetDay || this.rebalanceBudgetDay.day !== day) {
+			// In-memory state is missing or stale -- consult persisted metadata.
+			let spent = 0n;
+			if (this.storage) {
+				try {
+					const raw = this.storage.loadMetadata(
+						LightningNode.REBALANCE_BUDGET_KEY
+					);
+					if (raw) {
+						const parsed = JSON.parse(raw) as {
+							day?: string;
+							spentFeeMsat?: string;
+						};
+						if (parsed.day === day && parsed.spentFeeMsat) {
+							spent = BigInt(parsed.spentFeeMsat);
+						}
+					}
+				} catch {
+					// Unreadable metadata counts as zero spend (budget still capped).
+				}
+			}
+			this.rebalanceBudgetDay = { day, spentFeeMsat: spent };
+		}
+		return this.rebalanceBudgetDay.spentFeeMsat;
+	}
+
+	private recordRebalanceSpend(feeMsat: bigint): void {
+		const spent = this.loadRebalanceSpentMsat() + feeMsat;
+		this.rebalanceBudgetDay = {
+			day: LightningNode.currentUtcDay(),
+			spentFeeMsat: spent
+		};
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					LightningNode.REBALANCE_BUDGET_KEY,
+					JSON.stringify({
+						day: this.rebalanceBudgetDay!.day,
+						spentFeeMsat: spent.toString()
+					})
+				),
+			'saveRebalanceBudget'
+		);
+	}
+
+	/**
+	 * Execute the advisor's rebalance plan under a strict per-UTC-day fee
+	 * budget. Each pair gets a fee cap of min(remaining budget, 0.5% of the
+	 * amount, at least 1 sat); once the day's budget is exhausted the remaining
+	 * pairs are skipped, never partially overspent. Failures are recorded and
+	 * do not stop later pairs (they spent nothing).
+	 */
+	async executeRebalanceRecommendations(options?: {
+		budgetSatsPerDay?: number;
+		minImbalancePct?: number;
+	}): Promise<IRebalanceExecutionSummary> {
+		if (this.rebalanceRunInFlight) {
+			throw new Error('a rebalance execution run is already in progress');
+		}
+		this.rebalanceRunInFlight = true;
+		try {
+			const budgetSats =
+				options?.budgetSatsPerDay ??
+				this.autoRebalanceConfig.budgetSatsPerDay ??
+				1_000;
+			if (budgetSats < 0) throw new Error('budgetSatsPerDay must be >= 0');
+			const budgetMsat = BigInt(budgetSats) * 1000n;
+
+			const plans = this.planRebalanceRecommendations(options?.minImbalancePct);
+			const attempts: IRebalanceAttempt[] = [];
+			let feeSpentThisRunMsat = 0n;
+
+			for (const plan of plans) {
+				const remainingMsat = budgetMsat - this.loadRebalanceSpentMsat();
+				// Per-pair cap: never above the remaining daily budget, and never
+				// above 0.5% of the moved amount (min 1 sat so tiny amounts route).
+				const proportionalCapMsat =
+					(plan.amountSats * 1000n * 5000n) / 1_000_000n;
+				const perPairCapMsat =
+					proportionalCapMsat > 1000n ? proportionalCapMsat : 1000n;
+				const feeCapMsat =
+					remainingMsat < perPairCapMsat ? remainingMsat : perPairCapMsat;
+				// Below 1 sat of cap the route cannot pay any fee -- budget exhausted.
+				if (feeCapMsat < 1000n) {
+					attempts.push({
+						fromChannelId: plan.fromChannelId,
+						toChannelId: plan.toChannelId,
+						amountSats: plan.amountSats,
+						status: 'SKIPPED_BUDGET'
+					});
+					this.emitStructuredLog('payment', 'rebalance_budget_exhausted', {
+						remainingMsat: remainingMsat.toString(),
+						budgetMsat: budgetMsat.toString()
+					});
+					continue;
+				}
+				try {
+					const result = await this.rebalanceChannel({
+						fromChannelId: Buffer.from(plan.fromChannelId, 'hex'),
+						toChannelId: Buffer.from(plan.toChannelId, 'hex'),
+						amountSats: plan.amountSats,
+						maxFeeSats: feeCapMsat / 1000n
+					});
+					this.recordRebalanceSpend(result.feeMsat);
+					feeSpentThisRunMsat += result.feeMsat;
+					attempts.push({
+						fromChannelId: plan.fromChannelId,
+						toChannelId: plan.toChannelId,
+						amountSats: plan.amountSats,
+						status: 'SUCCEEDED',
+						feeMsat: result.feeMsat
+					});
+				} catch (err) {
+					attempts.push({
+						fromChannelId: plan.fromChannelId,
+						toChannelId: plan.toChannelId,
+						amountSats: plan.amountSats,
+						status: 'FAILED',
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
+
+			const spent = this.loadRebalanceSpentMsat();
+			return {
+				attempts,
+				succeeded: attempts.filter((a) => a.status === 'SUCCEEDED').length,
+				failed: attempts.filter((a) => a.status === 'FAILED').length,
+				skippedBudget: attempts.filter((a) => a.status === 'SKIPPED_BUDGET')
+					.length,
+				feeSpentMsat: feeSpentThisRunMsat,
+				budgetRemainingMsat: budgetMsat > spent ? budgetMsat - spent : 0n
+			};
+		} finally {
+			this.rebalanceRunInFlight = false;
+		}
+	}
+
+	/**
+	 * One routing-fee auto-tune pass (phase 2). Deterministic per snapshot:
+	 * each NORMAL channel gets at most ONE ppm adjustment per pass, computed by
+	 * the pure fee-tuner from its local balance and the forwards ledger over
+	 * the past interval window (see computeFeeTuneAdjustments for the rules).
+	 * `now` is injectable for tests; the periodic timer passes the real clock.
+	 */
+	runFeeTuneOnce(now: number = Date.now()): IFeeTuneAdjustment[] {
+		const intervalMs = this.autoTuneFeesConfig.intervalMs ?? 21_600_000;
+		const floorPpm =
+			this.autoTuneFeesConfig.floorPpm ?? DEFAULT_FEE_TUNE_FLOOR_PPM;
+		const ceilPpm =
+			this.autoTuneFeesConfig.ceilPpm ?? DEFAULT_FEE_TUNE_CEIL_PPM;
+		if (floorPpm < 0 || ceilPpm < floorPpm) {
+			throw new Error('autoTuneFees requires 0 <= floorPpm <= ceilPpm');
+		}
+		const since = now - intervalMs;
+
+		const inputs: IFeeTuneInput[] = [];
+		for (const channel of this.channelManager.listChannels()) {
+			if (channel.getState() !== ChannelState.NORMAL) continue;
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			const hex = channelId.toString('hex');
+			const policy = this.getChannelPolicy(channelId);
+			if (!policy) continue;
+			const st = channel.getFullState();
+			const capacityMsat = st.fundingSatoshis * 1000n;
+			if (capacityMsat <= 0n) continue;
+			const forwards = this.listForwards({ since, until: now, channelId: hex });
+			inputs.push({
+				channelId: hex,
+				currentPpm: policy.feeProportionalMillionths,
+				localBalanceFraction:
+					Number(st.localBalanceMsat) / Number(capacityMsat),
+				outboundForwards: forwards.filter((f) => f.outChannelId === hex).length,
+				totalForwards: forwards.length
+			});
+		}
+
+		const adjustments = computeFeeTuneAdjustments(inputs, {
+			floorPpm,
+			ceilPpm
+		});
+		for (const adj of adjustments) {
+			this.setChannelPolicy(Buffer.from(adj.channelId, 'hex'), {
+				feeProportionalMillionths: adj.newPpm
+			});
+			this.emitStructuredLog('fee', 'auto_tune_adjusted', {
+				channelId: adj.channelId,
+				oldPpm: adj.oldPpm,
+				newPpm: adj.newPpm,
+				reason: adj.reason,
+				windowMs: intervalMs
+			});
+		}
+		return adjustments;
+	}
+
 	getFeeSnapshot(): IFeeSnapshot | null {
 		return this.feeAdvisor.getSnapshot();
 	}
@@ -4031,84 +4556,91 @@ export class LightningNode extends EventEmitter {
 	 */
 	private getPrivateChannelRoutingHints(): IRoutingHintHop[][] {
 		const hints: IRoutingHintHop[][] = [];
-		const channels = this.channelManager.listChannels();
 
-		for (const channel of channels) {
-			const state = channel.getFullState();
-			// Use preReestablishState for channels awaiting reestablish after restart —
-			// the SCID and peer info are still valid for routing hints
-			const effectiveState = state.preReestablishState ?? channel.getState();
-			if (effectiveState !== ChannelState.NORMAL) continue;
-
-			// Emit a hint for EVERY usable channel — private AND public. Relying on
-			// gossip for public channels (LND's behaviour) is too fragile for a
-			// wallet/agent node: a freshly-announced channel often hasn't propagated
-			// to the payer's graph yet, so without a hint the invoice is unpayable
-			// even though the channel is healthy. Including a hint for an
-			// already-propagated public channel is harmless (the payer dedupes it).
-			const channelId = channel.getChannelId();
-			if (!channelId) continue;
-
-			const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
-			if (!peerPubkeyHex) continue;
-
-			// SCID for the peer→us hop = the SCID the peer uses to forward HTLCs to
-			// us. Per option_scid_alias the alias WE sent in channel_ready is what
-			// the peer accepts for incoming HTLCs to us, so use the real SCID (once
-			// confirmed) or OUR own scidAlias — NOT remoteScidAlias (the peer's
-			// alias, which we use to route to them, the wrong direction).
-			const scid = state.shortChannelId || state.scidAlias;
-			if (!scid) continue;
-
-			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
-
-			// Advertise the PEER's actual fee/CLTV policy for the peer→us direction,
-			// not our own forwarding defaults. The peer is the forwarding node for
-			// this hop, so the hint must match what it really requires — otherwise it
-			// rejects the HTLC (e.g. incorrect_cltv_expiry / fee insufficient). For a
-			// public channel the peer's channel_update is in our graph; for a
-			// PRIVATE channel the graph never stores it, so use the policy the peer
-			// sent us directly on this channel (state.remoteForwardingPolicy). Our
-			// own defaults are the last resort only.
-			let feeBaseMsat = this.forwardingFeeBaseMsat;
-			let feeProportionalMillionths = this.forwardingFeePropMillionths;
-			let cltvExpiryDelta = this.forwardingCltvDelta;
-			const directPolicy = state.remoteForwardingPolicy;
-			if (directPolicy) {
-				feeBaseMsat = directPolicy.feeBaseMsat;
-				feeProportionalMillionths = directPolicy.feeProportionalMillionths;
-				cltvExpiryDelta = directPolicy.cltvExpiryDelta;
-			}
-			if (state.shortChannelId) {
-				const graphChannel = this.graph.getChannel(state.shortChannelId);
-				const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
-					? graphChannel.update1
-					: graphChannel?.nodeId2.equals(peerPubkey)
-					? graphChannel.update2
-					: undefined;
-				// Prefer whichever the peer signed most recently.
-				if (
-					peerUpdate &&
-					(!directPolicy || peerUpdate.timestamp >= directPolicy.timestamp)
-				) {
-					feeBaseMsat = peerUpdate.feeBaseMsat;
-					feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
-					cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
-				}
-			}
-
-			const hop: IRoutingHintHop = {
-				pubkey: peerPubkey,
-				shortChannelId: scid,
-				feeBaseMsat,
-				feeProportionalMillionths,
-				cltvExpiryDelta
-			};
-
-			hints.push([hop]);
+		// Emit a hint for EVERY usable channel — private AND public. Relying on
+		// gossip for public channels (LND's behaviour) is too fragile for a
+		// wallet/agent node: a freshly-announced channel often hasn't propagated
+		// to the payer's graph yet, so without a hint the invoice is unpayable
+		// even though the channel is healthy. Including a hint for an
+		// already-propagated public channel is harmless (the payer dedupes it).
+		for (const channel of this.channelManager.listChannels()) {
+			const hop = this.buildRoutingHintForChannel(channel);
+			if (hop) hints.push([hop]);
 		}
 
 		return hints;
+	}
+
+	/**
+	 * The peer→us routing hint for one channel (the hop a payer -- or our own
+	 * circular rebalance -- uses to land the final hop on this channel), or null
+	 * when the channel is unusable or lacks an SCID/alias.
+	 */
+	private buildRoutingHintForChannel(channel: Channel): IRoutingHintHop | null {
+		const state = channel.getFullState();
+		// Use preReestablishState for channels awaiting reestablish after restart —
+		// the SCID and peer info are still valid for routing hints
+		const effectiveState = state.preReestablishState ?? channel.getState();
+		if (effectiveState !== ChannelState.NORMAL) return null;
+
+		const channelId = channel.getChannelId();
+		if (!channelId) return null;
+
+		const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
+		if (!peerPubkeyHex) return null;
+
+		// SCID for the peer→us hop = the SCID the peer uses to forward HTLCs to
+		// us. Per option_scid_alias the alias WE sent in channel_ready is what
+		// the peer accepts for incoming HTLCs to us, so use the real SCID (once
+		// confirmed) or OUR own scidAlias — NOT remoteScidAlias (the peer's
+		// alias, which we use to route to them, the wrong direction).
+		const scid = state.shortChannelId || state.scidAlias;
+		if (!scid) return null;
+
+		const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
+
+		// Advertise the PEER's actual fee/CLTV policy for the peer→us direction,
+		// not our own forwarding defaults. The peer is the forwarding node for
+		// this hop, so the hint must match what it really requires — otherwise it
+		// rejects the HTLC (e.g. incorrect_cltv_expiry / fee insufficient). For a
+		// public channel the peer's channel_update is in our graph; for a
+		// PRIVATE channel the graph never stores it, so use the policy the peer
+		// sent us directly on this channel (state.remoteForwardingPolicy). Our
+		// own defaults are the last resort only.
+		let feeBaseMsat = this.forwardingFeeBaseMsat;
+		let feeProportionalMillionths = this.forwardingFeePropMillionths;
+		let cltvExpiryDelta = this.forwardingCltvDelta;
+		const directPolicy = state.remoteForwardingPolicy;
+		if (directPolicy) {
+			feeBaseMsat = directPolicy.feeBaseMsat;
+			feeProportionalMillionths = directPolicy.feeProportionalMillionths;
+			cltvExpiryDelta = directPolicy.cltvExpiryDelta;
+		}
+		if (state.shortChannelId) {
+			const graphChannel = this.graph.getChannel(state.shortChannelId);
+			const peerUpdate = graphChannel?.nodeId1.equals(peerPubkey)
+				? graphChannel.update1
+				: graphChannel?.nodeId2.equals(peerPubkey)
+				? graphChannel.update2
+				: undefined;
+			// Prefer whichever the peer signed most recently.
+			if (
+				peerUpdate &&
+				(!directPolicy || peerUpdate.timestamp >= directPolicy.timestamp)
+			) {
+				feeBaseMsat = peerUpdate.feeBaseMsat;
+				feeProportionalMillionths = peerUpdate.feeProportionalMillionths;
+				cltvExpiryDelta = peerUpdate.cltvExpiryDelta;
+			}
+		}
+
+		return {
+			pubkey: peerPubkey,
+			shortChannelId: scid,
+			feeBaseMsat,
+			feeProportionalMillionths,
+			cltvExpiryDelta
+		};
 	}
 
 	/**
@@ -4988,12 +5520,14 @@ export class LightningNode extends EventEmitter {
 		);
 		const onionBuf = encodeOnionPacket(onionPacket);
 
-		// Find outgoing channel to first hop (smart selection by balance, Fix 3.3)
+		// Find outgoing channel to first hop. When the route's first-hop SCID
+		// names one of OUR channels to that peer (e.g. a circular rebalance that
+		// must leave over a specific channel), honor it; otherwise fall back to
+		// smart selection by balance (Fix 3.3).
 		const firstHopPubkey = hops[0].pubkey.toString('hex');
-		const outChannel = this.findChannelForPeer(
-			firstHopPubkey,
-			hops[0].amountToForwardMsat
-		);
+		const outChannel =
+			this.findLocalChannelByScid(hops[0].shortChannelId, firstHopPubkey) ??
+			this.findChannelForPeer(firstHopPubkey, hops[0].amountToForwardMsat);
 		if (!outChannel) {
 			throw new LightningPaymentError(
 				LightningErrorCode.NO_CHANNEL_TO_HOP,
@@ -7432,6 +7966,8 @@ export class LightningNode extends EventEmitter {
 			autoUpdateChannelFees?: boolean;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
+			autoRebalance?: IAutoRebalanceConfig;
+			autoTuneFees?: IAutoTuneFeesConfig;
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
@@ -7490,6 +8026,8 @@ export class LightningNode extends EventEmitter {
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
 			peerStorageEnabled: options?.peerStorageEnabled,
+			autoRebalance: options?.autoRebalance,
+			autoTuneFees: options?.autoTuneFees,
 			channelKeyDeriver
 		});
 	}
@@ -8523,6 +9061,34 @@ export class LightningNode extends EventEmitter {
 				/* best-effort */
 			}
 		}
+	}
+
+	/**
+	 * Resolve a route's first-hop SCID (real SCID or either side's alias) to one
+	 * of OUR usable channels to that peer. Returns undefined when the SCID does
+	 * not name a local channel -- callers then fall back to peer-based selection.
+	 */
+	private findLocalChannelByScid(
+		scid: Buffer | undefined,
+		peerPubkeyHex: string
+	): Channel | undefined {
+		if (!scid || scid.length === 0 || scid.equals(Buffer.alloc(scid.length))) {
+			return undefined;
+		}
+		for (const channel of this.channelManager.getChannelsByPeer(
+			peerPubkeyHex
+		)) {
+			if (channel.getState() !== ChannelState.NORMAL) continue;
+			const st = channel.getFullState();
+			if (
+				(st.shortChannelId && st.shortChannelId.equals(scid)) ||
+				(st.scidAlias && st.scidAlias.equals(scid)) ||
+				(st.remoteScidAlias && st.remoteScidAlias.equals(scid))
+			) {
+				return channel;
+			}
+		}
+		return undefined;
 	}
 
 	private findChannelForPeer(

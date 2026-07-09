@@ -44,7 +44,10 @@ const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay-async',
 	'POST /invoice/pay-retry',
 	'POST /keysend',
-	'POST /keysend/safe'
+	'POST /keysend/safe',
+	// Fee-spending advisor execution: retries must not double-spend fees.
+	'POST /rebalance',
+	'POST /advisor/execute-rebalances'
 ]);
 
 function success<T>(result: T): ApiResponse<T> {
@@ -225,6 +228,40 @@ export async function startDaemon(
 		},
 		'GET /spend-limit': () => success(node.getDailySpendInfo()),
 		'GET /liquidity': () => success(node.getLiquiditySnapshot()),
+		'GET /advisor/recommendations': () =>
+			success(node.getAdvisorRecommendations()),
+		'POST /advisor/execute-rebalances': async (body) => {
+			const { budgetSatsPerDay } = body as { budgetSatsPerDay?: number };
+			return success(await node.executeRebalances(budgetSatsPerDay));
+		},
+		'POST /rebalance': async (body) => {
+			const { fromChannelId, toChannelId, amountSats, maxFeeSats } = body as {
+				fromChannelId: string;
+				toChannelId: string;
+				amountSats: number;
+				maxFeeSats: number;
+			};
+			// maxFeeSats is mandatory: fee-spending endpoints never guess a cap.
+			if (
+				!fromChannelId ||
+				!toChannelId ||
+				amountSats === undefined ||
+				maxFeeSats === undefined
+			) {
+				return failure(
+					'INVALID_PARAMS',
+					'fromChannelId, toChannelId, amountSats, and maxFeeSats required'
+				);
+			}
+			return success(
+				await node.rebalanceChannel(
+					fromChannelId,
+					toChannelId,
+					amountSats,
+					maxFeeSats
+				)
+			);
+		},
 		'GET /fees': () => {
 			const snapshot = node.getFeeSnapshot();
 			if (!snapshot) return failure('NO_DATA', 'No fee samples recorded yet');

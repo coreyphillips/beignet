@@ -233,6 +233,11 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `getLiquiditySnapshot()` | `LiquiditySnapshot` | Liquidity analysis with actionable recommendations (OPEN_CHANNEL, CLOSE_CHANNEL, REBALANCE) |
 | `getChannelSuggestions(count?)` | `ChannelSuggestion[]` | Graph-based channel open suggestions scored by connectivity, capacity, freshness, relevance |
 | `getFeeSnapshot()` | `FeeSnapshot \| null` | On-chain fee trend analysis with open/wait recommendation |
+| `getAdvisorRecommendations()` | `AdvisorRecommendations` | Liquidity analysis plus the concrete circular-rebalance plan (read-only) |
+| `rebalanceChannel(fromId, toId, amountSats, maxFeeSats)` | `Promise<RebalanceResult>` | Circular rebalance (self-payment out fromId, back in toId). Aborts without paying if the route fee exceeds `maxFeeSats` |
+| `executeRebalances(budgetSatsPerDay?)` | `Promise<RebalanceExecutionSummary>` | Run the advisor's rebalance plan under a per-UTC-day fee budget (persisted; restarts never overspend the day) |
+
+Automatic execution is **off by default**: pass `autoRebalance: { enabled: true, budgetSatsPerDay, minImbalancePct }` and/or `autoTuneFees: { enabled: true, intervalMs, floorPpm, ceilPpm }` in `BeignetNodeOptions` to turn on the periodic rebalance scan and routing-fee (ppm) auto-tuning.
 
 #### Statistics
 

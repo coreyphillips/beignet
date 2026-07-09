@@ -163,6 +163,10 @@ async function main(): Promise<void> {
 			return handleGraph();
 		case 'route':
 			return handleRoute();
+		case 'rebalance':
+			return handleRebalance();
+		case 'advisor':
+			return handleAdvisor();
 		case 'bootstrap':
 			return handleBootstrap();
 		case 'trusted-peer':
@@ -753,6 +757,61 @@ async function handleForwards(): Promise<void> {
 	);
 }
 
+async function handleRebalance(): Promise<void> {
+	const fromChannelId = filteredArgs[1];
+	const toChannelId = filteredArgs[2];
+	const amountSats = filteredArgs[3];
+	const maxFee = parseFlag('--max-fee');
+	// --max-fee is mandatory: the CLI never invents a routing-fee cap.
+	if (!fromChannelId || !toChannelId || !amountSats || maxFee === undefined) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet rebalance <fromChannelId> <toChannelId> <amountSats> --max-fee <sats>'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	return outputResult(
+		await httpRequest('POST', '/rebalance', {
+			fromChannelId,
+			toChannelId,
+			amountSats: parseInt(amountSats, 10),
+			maxFeeSats: parseInt(maxFee, 10)
+		})
+	);
+}
+
+async function handleAdvisor(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'recommendations':
+			return outputResult(await httpRequest('GET', '/advisor/recommendations'));
+		case 'execute-rebalances': {
+			const budget = parseFlag('--budget');
+			return outputResult(
+				await httpRequest('POST', '/advisor/execute-rebalances', {
+					budgetSatsPerDay:
+						budget !== undefined ? parseInt(budget, 10) : undefined
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet advisor [recommendations|execute-rebalances [--budget <sats>]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 async function handleBootstrap(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
@@ -1124,6 +1183,13 @@ Graph Queries:
 Routing:
   forwards [--since ts] [--limit n]      List settled forwards (fees earned)
   forwards summary [--since ts]          Forwarding totals (count, volume, fees)
+  rebalance <fromId> <toId> <sats> --max-fee <sats>
+                                         Circular rebalance between two of our
+                                         channels (aborts if fee exceeds cap)
+  advisor recommendations                Liquidity analysis + rebalance plan
+  advisor execute-rebalances [--budget <sats>]
+                                         Run the advisor's rebalance plan under
+                                         a per-day fee budget
 
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
