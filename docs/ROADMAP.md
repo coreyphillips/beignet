@@ -87,17 +87,21 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [x] Expose `sendPaymentToRoute` (PR #44, merged): daemon
       `/payment/send-to-route` + CLI `payment send-to-route`, composing with
       `/route/query` output.
-- [~] option_wumbo (this PR): largeChannels config flag advertises LARGE_CHANNELS and
+- [x] option_wumbo (PR #45, merged): largeChannels config flag advertises LARGE_CHANNELS and
       lifts the 2^24 sat cap (10 BTC absolute ceiling) at every enforcement site incl.
       v1/v2 opens and three new splice capacity checks; acceptor gated on flag AND
       the peer's advertised bit.
-- [~] Connect by node id alone (this PR): connectPeer(pubkey) resolves addresses from
+- [x] Connect by node id alone (PR #45, merged): connectPeer(pubkey) resolves addresses from
       gossip node_announcement in announced order (Tor skipped without socks5Proxy,
       .onion re-encoded for dialing), DNS bootstrap fallback, error lists every attempt.
-- [ ] Advisor execution, phase 1: circular rebalancing (self-payment out one channel,
-      in another) with budget caps, driven by existing REBALANCE recommendations.
-- [ ] Advisor execution, phase 2: routing-fee auto-tuning loop (off by default).
-- [~] Fee estimator sanity clamp (this PR): estimateFee output clamped to 5000 sat/vB
+- [~] Advisor execution, phase 1 (this PR): rebalanceChannel (first-hop-pinned route,
+      final hop via our own invoice hint, strict maxFeeSats abort BEFORE sending,
+      HTLC-cap clamping) + executeRebalanceRecommendations with a persisted UTC-day
+      fee budget; off by default.
+- [~] Advisor execution, phase 2 (this PR): autoTuneFees loop nudging per-channel ppm
+      +/-25% (floor/ceil clamped, one adjustment per channel per interval) from
+      depletion + the #43 forwarding ledger via the #40 policy API; off by default.
+- [x] Fee estimator sanity clamp (PR #45, merged): estimateFee output clamped to 5000 sat/vB
       (floor 1) at all five consumer sites with a structured warning when adjusted;
       sweep MAX_FEE_BUMP_MULTIPLIER untouched.
 
@@ -217,6 +221,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): PR #45 merged (wumbo, connect-by-id, fee clamp). Advisor
+  execution (this PR) completes M3.
 - 2026-07-09 (cont.): PR #44 merged (graph queries + send-to-route). M3 small items
   (wumbo, connect-by-id, fee clamp) this PR; advisor execution lands next.
 - 2026-07-09 (cont.): forwarding history merged as PR #43. M3 continued: graph query

@@ -230,6 +230,48 @@ const readiness = node.getMainnetReadiness();
 console.log('Score:', readiness.score + '/100', 'Ready:', readiness.ready);
 ```
 
+### Advisor Execution (circular rebalancing + fee auto-tuning)
+
+The advisor can also *act*, not just recommend. Both features are **off by
+default** and only run when explicitly enabled in the node options.
+
+```typescript
+// One-shot circular rebalance: self-payment out over fromChannelId and back
+// in over toChannelId. Aborts WITHOUT paying if the route fee > maxFeeSats.
+const result = await node.rebalanceChannel(
+  fromChannelId, toChannelId, 50_000, /* maxFeeSats: */ 50
+);
+
+// Inspect what the executor would do (read-only)
+const recs = node.getAdvisorRecommendations(); // analyze() + rebalancePlan[]
+
+// Run the advisor's rebalance plan under a per-day fee budget
+const summary = await node.executeRebalances(/* budgetSatsPerDay: */ 500);
+```
+
+Automatic modes (opt-in via `BeignetNodeOptions` / `INodeConfig`):
+
+```typescript
+const node = await BeignetNode.create({
+  mnemonic,
+  // Periodically executes the rebalance plan. Routing fees spent on
+  // rebalances are capped at budgetSatsPerDay per UTC day; the running spend
+  // is persisted, so restarts never overspend the same day. The budget
+  // resets at midnight UTC.
+  autoRebalance: { enabled: true, budgetSatsPerDay: 500, minImbalancePct: 20 },
+  // Every intervalMs (default 6h) nudges each channel's proportional fee:
+  // +25% when outbound is depleted (<20% local) but still forwarding,
+  // -25% when the channel saw no forwards in the window, clamped to
+  // [floorPpm, ceilPpm]. One adjustment per channel per interval.
+  autoTuneFees: { enabled: true, floorPpm: 1, ceilPpm: 5_000 }
+});
+```
+
+Daemon/CLI surfaces: `POST /rebalance`, `GET /advisor/recommendations`,
+`POST /advisor/execute-rebalances`; `beignet rebalance <from> <to> <sats>
+--max-fee <sats>`, `beignet advisor recommendations`, `beignet advisor
+execute-rebalances [--budget <sats>]`.
+
 ### HTTP Daemon
 
 BeignetNode can also run as an HTTP/SSE daemon for language-agnostic integrations:

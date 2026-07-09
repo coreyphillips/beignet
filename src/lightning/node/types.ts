@@ -215,6 +215,76 @@ export interface INodeConfig {
 	 * LN-key address the wallet does NOT track — for backward compatibility.
 	 */
 	sweepDestinationScript?: Buffer;
+	/**
+	 * Automatic circular rebalancing (default DISABLED). When enabled, a
+	 * periodic scan runs the advisor's rebalance plan via
+	 * executeRebalanceRecommendations, spending at most budgetSatsPerDay in
+	 * routing fees per UTC day (tracked in memory and persisted via metadata).
+	 */
+	autoRebalance?: IAutoRebalanceConfig;
+	/**
+	 * Automatic routing-fee (ppm) tuning (default DISABLED). When enabled, a
+	 * periodic loop nudges each channel's proportional fee up 25% when its
+	 * outbound side is depleted but still forwarding, and down 25% when it saw
+	 * no forwards in the window, clamped to [floorPpm, ceilPpm].
+	 */
+	autoTuneFees?: IAutoTuneFeesConfig;
+}
+
+// ─── Advisor Execution ───
+
+export interface IAutoRebalanceConfig {
+	/** Master switch -- MUST be explicitly set to true (default false). */
+	enabled?: boolean;
+	/** Max routing fees to spend on rebalances per UTC day (default 1000). */
+	budgetSatsPerDay?: number;
+	/** Local-balance percent below/above which a channel is imbalanced (default 20). */
+	minImbalancePct?: number;
+	/** Scan interval in ms (default 3_600_000 = 1 hour). */
+	intervalMs?: number;
+}
+
+export interface IAutoTuneFeesConfig {
+	/** Master switch -- MUST be explicitly set to true (default false). */
+	enabled?: boolean;
+	/** Tune interval AND forwarding observation window in ms (default 6 hours). */
+	intervalMs?: number;
+	/** Lowest ppm the tuner will ever set (default 1). */
+	floorPpm?: number;
+	/** Highest ppm the tuner will ever set (default 10_000). */
+	ceilPpm?: number;
+}
+
+/** Outcome of one circular rebalance (msat values are bigint in the library). */
+export interface IRebalanceResult {
+	paymentHash: Buffer;
+	/** Amount that arrived back on the inbound channel. */
+	amountMsat: bigint;
+	/** Total routing fee paid for the loop. */
+	feeMsat: bigint;
+	/** Number of hops in the circular route (including the final hop to us). */
+	hops: number;
+}
+
+/** One attempted rebalance inside executeRebalanceRecommendations. */
+export interface IRebalanceAttempt {
+	fromChannelId: string;
+	toChannelId: string;
+	amountSats: bigint;
+	status: 'SUCCEEDED' | 'FAILED' | 'SKIPPED_BUDGET';
+	feeMsat?: bigint;
+	error?: string;
+}
+
+export interface IRebalanceExecutionSummary {
+	attempts: IRebalanceAttempt[];
+	succeeded: number;
+	failed: number;
+	skippedBudget: number;
+	/** Fees spent by THIS run in msat. */
+	feeSpentMsat: bigint;
+	/** Remaining fee budget for the current UTC day in msat. */
+	budgetRemainingMsat: bigint;
 }
 
 export enum PaymentStatus {

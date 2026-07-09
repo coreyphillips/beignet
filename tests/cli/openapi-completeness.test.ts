@@ -98,7 +98,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'/graph/channel',
 		'/graph/describe',
 		'/route/query',
-		'/payment/send-to-route'
+		'/payment/send-to-route',
+		'/rebalance',
+		'/advisor/recommendations',
+		'/advisor/execute-rebalances'
 	];
 
 	for (const route of expectedRoutes) {
@@ -137,7 +140,11 @@ describe('OpenAPI Spec Completeness', () => {
 		'GraphChannelInfo',
 		'GraphNodeInfo',
 		'RouteHop',
-		'RouteQueryResult'
+		'RouteQueryResult',
+		'RebalancePlan',
+		'AdvisorRecommendations',
+		'RebalanceResult',
+		'RebalanceExecutionSummary'
 	];
 
 	for (const schema of expectedSchemas) {

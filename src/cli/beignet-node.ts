@@ -117,7 +117,11 @@ import {
 	GraphNodeInfo,
 	GraphDescribeResult,
 	RouteHop,
-	RouteQueryResult
+	RouteQueryResult,
+	RebalancePlanInfo,
+	AdvisorRecommendations,
+	RebalanceResult,
+	RebalanceExecutionSummary
 } from './types';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
@@ -223,6 +227,29 @@ export interface BeignetNodeOptions {
 	 * getPeerRetrievedBackup). Recovery stays explicit via restoreFromScb.
 	 */
 	peerStorageEnabled?: boolean;
+	/**
+	 * Automatic circular rebalancing (default DISABLED). When enabled the node
+	 * periodically executes the advisor's rebalance plan, spending at most
+	 * budgetSatsPerDay in routing fees per UTC day. Off unless enabled: true.
+	 */
+	autoRebalance?: {
+		enabled?: boolean;
+		budgetSatsPerDay?: number;
+		minImbalancePct?: number;
+		intervalMs?: number;
+	};
+	/**
+	 * Automatic routing-fee (ppm) tuning (default DISABLED). When enabled the
+	 * node periodically nudges each channel's proportional fee up 25% when its
+	 * outbound side is depleted but still forwarding, and down 25% when it saw
+	 * no forwards in the window, clamped to [floorPpm, ceilPpm].
+	 */
+	autoTuneFees?: {
+		enabled?: boolean;
+		intervalMs?: number;
+		floorPpm?: number;
+		ceilPpm?: number;
+	};
 }
 
 const DEFAULT_DATA_DIR = path.join(
@@ -733,7 +760,9 @@ export class BeignetNode extends EventEmitter {
 			feeEstimator: electrumBackend,
 			sweepDestinationScript,
 			socks5Proxy,
-			peerStorageEnabled: this.peerStorageEnabled
+			peerStorageEnabled: this.peerStorageEnabled,
+			autoRebalance: opts.autoRebalance,
+			autoTuneFees: opts.autoTuneFees
 		});
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
@@ -3257,6 +3286,111 @@ export class BeignetNode extends EventEmitter {
 			outboundLiquidityPct: snapshot.outboundLiquidityPct,
 			inboundLiquidityPct: snapshot.inboundLiquidityPct,
 			recommendations: snapshot.recommendations
+		};
+	}
+
+	/**
+	 * Advisor recommendations: the liquidity analysis (same engine as
+	 * getLiquiditySnapshot) plus the concrete circular-rebalance plan the
+	 * executor would run. Read-only -- nothing is executed.
+	 */
+	getAdvisorRecommendations(): AdvisorRecommendations {
+		const plan: RebalancePlanInfo[] = this.node
+			.planRebalanceRecommendations()
+			.map((p) => ({
+				fromChannelId: p.fromChannelId,
+				toChannelId: p.toChannelId,
+				amountSats: Number(p.amountSats),
+				reason: p.reason
+			}));
+		return { ...this.getLiquiditySnapshot(), rebalancePlan: plan };
+	}
+
+	/**
+	 * Circular rebalance: self-payment out over fromChannelId and back in over
+	 * toChannelId. Aborts (without paying anything) if the route fee exceeds
+	 * maxFeeSats.
+	 */
+	async rebalanceChannel(
+		fromChannelId: string,
+		toChannelId: string,
+		amountSats: number,
+		maxFeeSats: number
+	): Promise<RebalanceResult> {
+		if (!/^[0-9a-fA-F]{64}$/.test(fromChannelId))
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'fromChannelId must be 64 hex chars'
+			);
+		if (!/^[0-9a-fA-F]{64}$/.test(toChannelId))
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'toChannelId must be 64 hex chars'
+			);
+		if (!Number.isInteger(amountSats) || amountSats <= 0)
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'amountSats must be a positive integer'
+			);
+		if (!Number.isInteger(maxFeeSats) || maxFeeSats < 0)
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'maxFeeSats must be a non-negative integer'
+			);
+		const result = await this.node.rebalanceChannel({
+			fromChannelId: Buffer.from(fromChannelId, 'hex'),
+			toChannelId: Buffer.from(toChannelId, 'hex'),
+			amountSats: BigInt(amountSats),
+			maxFeeSats: BigInt(maxFeeSats)
+		});
+		this.log('info', 'Rebalance completed', {
+			fromChannelId,
+			toChannelId,
+			amountSats,
+			feeMsat: result.feeMsat.toString()
+		});
+		return {
+			paymentHash: result.paymentHash.toString('hex'),
+			amountSats,
+			feeMsat: result.feeMsat.toString(),
+			feeSats: Number(result.feeMsat / 1000n),
+			hops: result.hops
+		};
+	}
+
+	/**
+	 * Execute the advisor's rebalance plan under the per-UTC-day fee budget
+	 * (persisted, so restarts cannot overspend the same day).
+	 */
+	async executeRebalances(
+		budgetSatsPerDay?: number
+	): Promise<RebalanceExecutionSummary> {
+		if (
+			budgetSatsPerDay !== undefined &&
+			(!Number.isInteger(budgetSatsPerDay) || budgetSatsPerDay < 0)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'budgetSatsPerDay must be a non-negative integer'
+			);
+		}
+		const summary = await this.node.executeRebalanceRecommendations({
+			budgetSatsPerDay
+		});
+		return {
+			attempts: summary.attempts.map((a) => ({
+				fromChannelId: a.fromChannelId,
+				toChannelId: a.toChannelId,
+				amountSats: Number(a.amountSats),
+				status: a.status,
+				feeMsat: a.feeMsat?.toString(),
+				error: a.error
+			})),
+			succeeded: summary.succeeded,
+			failed: summary.failed,
+			skippedBudget: summary.skippedBudget,
+			feeSpentMsat: summary.feeSpentMsat.toString(),
+			budgetRemainingMsat: summary.budgetRemainingMsat.toString()
 		};
 	}
 

@@ -1140,6 +1140,61 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/advisor/recommendations': {
+				get: {
+					summary:
+						'Liquidity analysis (advisor analyze) plus the concrete circular-rebalance plan',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Advisor recommendations',
+							content: jsonContent({
+								$ref: '#/components/schemas/AdvisorRecommendations'
+							})
+						}
+					}
+				}
+			},
+			'/advisor/execute-rebalances': {
+				post: {
+					summary:
+						'Execute the advisor rebalance plan under a strict per-UTC-day routing-fee budget (persisted across restarts)',
+					tags: ['Node'],
+					requestBody: bodyContent({ budgetSatsPerDay: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Execution summary (msat values as strings)',
+							content: jsonContent({
+								$ref: '#/components/schemas/RebalanceExecutionSummary'
+							})
+						}
+					}
+				}
+			},
+			'/rebalance': {
+				post: {
+					summary:
+						'Circular rebalance: self-payment out over fromChannelId and back in over toChannelId; aborts without paying if the route fee exceeds maxFeeSats',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						fromChannelId: 'string',
+						toChannelId: 'string',
+						amountSats: 'number',
+						maxFeeSats: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Rebalance result',
+							content: jsonContent({
+								$ref: '#/components/schemas/RebalanceResult'
+							})
+						},
+						'400': {
+							description: 'No route, fee exceeds maxFeeSats, or invalid params'
+						}
+					}
+				}
+			},
 			'/fees': {
 				get: {
 					summary:
@@ -2257,6 +2312,85 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'array',
 							items: { $ref: '#/components/schemas/LiquidityRecommendation' },
 							description: 'Actionable recommendations'
+						}
+					}
+				},
+				RebalancePlan: {
+					type: 'object',
+					properties: {
+						fromChannelId: {
+							type: 'string',
+							description: 'Channel to push liquidity out of'
+						},
+						toChannelId: {
+							type: 'string',
+							description: 'Channel to pull liquidity in on'
+						},
+						amountSats: { type: 'integer' },
+						reason: { type: 'string' }
+					},
+					required: ['fromChannelId', 'toChannelId', 'amountSats', 'reason']
+				},
+				AdvisorRecommendations: {
+					allOf: [
+						{ $ref: '#/components/schemas/LiquiditySnapshot' },
+						{
+							type: 'object',
+							properties: {
+								rebalancePlan: {
+									type: 'array',
+									items: { $ref: '#/components/schemas/RebalancePlan' },
+									description:
+										'Circular rebalances the executor would run (nothing is executed by this endpoint)'
+								}
+							}
+						}
+					]
+				},
+				RebalanceResult: {
+					type: 'object',
+					properties: {
+						paymentHash: { type: 'string' },
+						amountSats: { type: 'integer' },
+						feeMsat: {
+							type: 'string',
+							description: 'Routing fee paid, msat as decimal string'
+						},
+						feeSats: { type: 'integer' },
+						hops: { type: 'integer' }
+					},
+					required: ['paymentHash', 'amountSats', 'feeMsat', 'feeSats', 'hops']
+				},
+				RebalanceExecutionSummary: {
+					type: 'object',
+					properties: {
+						attempts: {
+							type: 'array',
+							items: {
+								type: 'object',
+								properties: {
+									fromChannelId: { type: 'string' },
+									toChannelId: { type: 'string' },
+									amountSats: { type: 'integer' },
+									status: {
+										type: 'string',
+										enum: ['SUCCEEDED', 'FAILED', 'SKIPPED_BUDGET']
+									},
+									feeMsat: { type: 'string' },
+									error: { type: 'string' }
+								}
+							}
+						},
+						succeeded: { type: 'integer' },
+						failed: { type: 'integer' },
+						skippedBudget: { type: 'integer' },
+						feeSpentMsat: {
+							type: 'string',
+							description: 'Fees spent by this run, msat as decimal string'
+						},
+						budgetRemainingMsat: {
+							type: 'string',
+							description: 'Remaining budget for the current UTC day'
 						}
 					}
 				},

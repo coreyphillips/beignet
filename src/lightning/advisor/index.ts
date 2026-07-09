@@ -15,3 +15,19 @@ export type {
 	IChannelSuggestion,
 	IChannelSuggestionsOptions
 } from './channel-suggestions';
+export {
+	planRebalances,
+	MIN_REBALANCE_SATS,
+	DEFAULT_MIN_IMBALANCE_PCT
+} from './rebalance-planner';
+export type { IRebalancePlan } from './rebalance-planner';
+export {
+	computeFeeTuneAdjustments,
+	DEFAULT_FEE_TUNE_FLOOR_PPM,
+	DEFAULT_FEE_TUNE_CEIL_PPM
+} from './fee-tuner';
+export type {
+	IFeeTuneInput,
+	IFeeTuneAdjustment,
+	IFeeTuneOptions
+} from './fee-tuner';
