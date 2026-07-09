@@ -9,7 +9,7 @@
 import { Network } from '../invoice/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
-import { IRoute } from '../gossip/types';
+import { IRoute, INodeAddress } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
@@ -119,6 +119,10 @@ export interface INodeConfig {
 	mppTimeoutMs?: number;
 	/** Human-readable node alias (max 32 bytes UTF-8, per BOLT 7) */
 	alias?: string;
+	/** Addresses to advertise in our node_announcement (BOLT 7 descriptors,
+	 *  e.g. from parseAnnouncedAddress). Only meaningful once the node has at
+	 *  least one announced (public) channel. */
+	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
