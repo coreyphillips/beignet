@@ -358,6 +358,24 @@ export interface IChannelState {
 	 */
 	localNextNonce?: Uint8Array;
 	/**
+	 * Data loss protection (BOLT 2): set when the peer's channel_reestablish
+	 * proved OUR restored state is stale (it supplied a per-commitment secret
+	 * only derivable from our seed at an index we have not reached). Once set,
+	 * we MUST NOT broadcast our own (revoked-by-now) commitment: doing so hands
+	 * our whole balance to the peer's justice path. Recovery is passive - the
+	 * honest peer force-closes with ITS newer commitment and we sweep only our
+	 * to_remote from it.
+	 */
+	dataLossDetected?: boolean;
+	/**
+	 * Data loss protection: the peer's my_current_per_commitment_point from the
+	 * reestablish that proved data loss. Stored for completeness/legacy
+	 * commitments; static_remotekey/anchor/taproot to_remote sweeps derive from
+	 * our static payment basepoint and do not need it.
+	 */
+	dlpRemotePerCommitmentPoint?: Buffer;
+
+	/**
 	 * option_taproot: the PEER's current 66-byte MuSig2 verification nonce (from
 	 * open_channel/accept_channel, then rotated via revoke_and_ack). Used as the
 	 * peer's nonce contribution when WE sign the peer's commitment.

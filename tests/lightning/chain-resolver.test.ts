@@ -439,11 +439,14 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(ours.type).to.equal(CommitmentType.OUR_COMMITMENT);
 		});
 
-		it('should return UNKNOWN for unrecognized commitment', function () {
+		it('should classify a commitment beyond our remote number as THEIR_FUTURE_COMMITMENT', function () {
 			const { opener } = setupNormalChannels();
 			const state = opener.getFullState();
 
-			// Build a tx with a commitment number we don't recognize
+			// A commitment number beyond our recorded remote state: only the peer
+			// can co-sign a funding spend, so this means it legitimately advanced
+			// past us (data loss on our side) - classified for to_remote-only
+			// recovery, no longer UNKNOWN.
 			const obscured = calculateObscuredCommitmentNumber(
 				state.localBasepoints.paymentBasepoint,
 				state.remoteBasepoints!.paymentBasepoint,
@@ -462,7 +465,8 @@ describe('Output Resolver (Phase 4B)', function () {
 			tx.addOutput(Buffer.alloc(34), 500_000);
 
 			const result = classifyCommitmentTx(tx, state);
-			expect(result.type).to.equal(CommitmentType.UNKNOWN);
+			expect(result.type).to.equal(CommitmentType.THEIR_FUTURE_COMMITMENT);
+			expect(result.commitmentNumber).to.equal(999n);
 		});
 	});
 

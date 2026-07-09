@@ -334,6 +334,11 @@ export interface ISerializedChannelState {
 	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
 	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
 	lastCooperativeCloseTxHex?: string;
+	// Data loss protection: MUST persist - a restart after detecting we fell
+	// behind would otherwise forget the flag and let a force-close broadcast
+	// our stale (revoked) commitment.
+	dataLossDetected?: boolean;
+	dlpRemotePerCommitmentPoint?: string | null;
 }
 
 export interface ISerializedSpliceInFlight {
@@ -561,7 +566,9 @@ export function serializeChannelState(
 		fundingLocktime: s.fundingLocktime,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
-		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		dataLossDetected: s.dataLossDetected,
+		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
 	};
 }
 
@@ -722,7 +729,10 @@ export function deserializeChannelState(
 		fundingLocktime: s.fundingLocktime ?? 0,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
-		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex
+		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
+		dataLossDetected: s.dataLossDetected,
+		dlpRemotePerCommitmentPoint:
+			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined
 	};
 }
 
