@@ -165,7 +165,8 @@ import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
-import { isTaprootChannel } from '../channel/types';
+import { isTaprootChannel, isAnchorChannel } from '../channel/types';
+import { IScbChannelEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
@@ -1490,6 +1491,57 @@ export class LightningNode extends EventEmitter {
 			networkingEnabled: this.peerManager !== null,
 			alias: this.alias
 		};
+	}
+
+	/**
+	 * Collect the per-channel data for a static channel backup. Includes every
+	 * channel that has an on-chain funding outpoint and is not fully
+	 * closed/resolved: recovery via the fell-behind DLP path needs the peer to
+	 * still hold a live (or force-closable) commitment, so pre-funding channels
+	 * have nothing on chain to recover and CLOSED channels have already
+	 * resolved. Buffers are hex-encoded; the funding txid stays in INTERNAL
+	 * byte order exactly as stored in channel state.
+	 */
+	buildStaticChannelBackupData(): {
+		network: string;
+		channels: IScbChannelEntry[];
+	} {
+		// One persisted address per peer (upserted on connect); map to 'host:port'.
+		const peerAddresses = new Map<string, string[]>();
+		if (this.storage) {
+			for (const addr of this.storage.loadAllPeerAddresses()) {
+				const list = peerAddresses.get(addr.pubkey) ?? [];
+				list.push(`${addr.host}:${addr.port}`);
+				peerAddresses.set(addr.pubkey, list);
+			}
+		}
+
+		const channels: IScbChannelEntry[] = [];
+		const seen = new Set<string>();
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid || !state.channelId) continue;
+			if (state.state === ChannelState.CLOSED) continue;
+			const idHex = state.channelId.toString('hex');
+			if (seen.has(idHex)) continue;
+			const peer = this.channelManager.getPeerForChannel(state.channelId);
+			if (!peer) continue;
+			seen.add(idHex);
+			channels.push({
+				channelId: idHex,
+				peerNodeId: peer,
+				peerAddresses: peerAddresses.get(peer) ?? [],
+				fundingTxid: state.fundingTxid.toString('hex'),
+				fundingOutputIndex: state.fundingOutputIndex,
+				fundingSatoshis: state.fundingSatoshis.toString(),
+				channelKeyIndex: channel.channelKeyIndex,
+				channelType: state.channelType ? state.channelType.toString('hex') : '',
+				role: state.role === ChannelRole.OPENER ? 'OPENER' : 'ACCEPTOR',
+				isTaproot: isTaprootChannel(state.channelType),
+				isAnchor: isAnchorChannel(state.channelType)
+			});
+		}
+		return { network: this.network, channels };
 	}
 
 	/**

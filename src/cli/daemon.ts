@@ -789,6 +789,7 @@ export async function startDaemon(
 			await node.backup(destPath);
 			return success({ backed_up: true });
 		},
+		'GET /backup/scb': () => success(node.exportStaticChannelBackup()),
 
 		// ── BOLT 12 Offers ──
 		'POST /offer/create': (body) => {

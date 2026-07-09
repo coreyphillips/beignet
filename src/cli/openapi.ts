@@ -762,6 +762,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'Backup result' } }
 				}
 			},
+			'/backup/scb': {
+				get: {
+					summary:
+						'Export the encrypted static channel backup (seed-encrypted blob)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Encoded SCB blob, channel count, and on-disk path'
+						}
+					}
+				}
+			},
 			'/send': {
 				post: {
 					summary: 'Send on-chain Bitcoin',

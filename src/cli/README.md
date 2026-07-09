@@ -243,6 +243,30 @@ too; restoring one requires the same mnemonic. Pre-encryption databases are
 migrated in place on first open. Set `storageEncryption: false` to opt out
 (plaintext storage).
 
+#### Static Channel Backup (SCB)
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `exportStaticChannelBackup()` | `{ encoded, channelCount, path }` | Build, encrypt, and write the static channel backup |
+
+A static channel backup is a small, portable, versioned blob holding the
+minimum needed to recover funds for every open channel without the full
+database: per channel it records the channel id, peer node id and last-known
+addresses, funding outpoint (txid internal byte order + output index),
+capacity, per-channel key index, channel type, role, and taproot/anchor flags.
+The blob is JSON encrypted with AES-256-GCM under a key derived
+(HKDF-SHA256, info `beignet-scb-v1`) from the wallet's BIP39 seed, encoded as
+`beignet-scb-v1:` + base64 - it is useless without the mnemonic.
+
+The file is written atomically to `<dataDir>/channels.scb` and refreshed
+automatically whenever the channel set changes (channel open/splice calls,
+`channel:ready`, `channel:closed`, and channel resolution). Store a copy
+off-machine (e.g. via `beignet backup scb <destPath>` or `GET /backup/scb`).
+
+RESTORE from an SCB (reconnect to peers with stale state so they force-close,
+then sweep our balance on chain) lands in a follow-up release; this version
+covers export only.
+
 #### Health & Monitoring
 
 | Method | Returns | Description |
@@ -1049,6 +1073,7 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
 | POST | `/route/probe` | `{ destination, amountSats }` | Probe route viability to a destination |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
+| GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
 | POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
 | POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s) |

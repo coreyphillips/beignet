@@ -8,6 +8,7 @@
  */
 
 import * as http from 'http';
+import * as fs from 'fs';
 import { generateMnemonic } from '../utils/helpers';
 import {
 	loadConfig,
@@ -172,11 +173,7 @@ async function main(): Promise<void> {
 				)
 			);
 		case 'backup':
-			return outputResult(
-				await httpRequest('POST', '/backup', {
-					destPath: filteredArgs[1]
-				})
-			);
+			return handleBackup();
 		default:
 			output({
 				ok: false,
@@ -627,6 +624,40 @@ async function handleOffer(): Promise<void> {
 	}
 }
 
+async function handleBackup(): Promise<void> {
+	const sub = filteredArgs[1];
+	if (sub === 'scb') {
+		// `beignet backup scb [destPath]`: fetch the encrypted static channel
+		// backup; with destPath, write the encoded blob there instead of printing.
+		const result = await httpRequest('GET', '/backup/scb');
+		const destPath = filteredArgs[2];
+		if (!result.ok || !destPath) return outputResult(result);
+		const { encoded, channelCount } = result.result as {
+			encoded: string;
+			channelCount: number;
+		};
+		fs.writeFileSync(destPath, encoded);
+		return output({
+			ok: true,
+			result: { written: true, path: destPath, channelCount }
+		});
+	}
+	// `beignet backup <destPath>`: legacy full-database copy.
+	if (!sub) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet backup <destPath> | beignet backup scb [destPath]'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	return outputResult(await httpRequest('POST', '/backup', { destPath: sub }));
+}
+
 async function handleMetrics(): Promise<void> {
 	const port = getDaemonPort();
 	const token = getApiToken();
@@ -686,6 +717,7 @@ On-chain:
   utxos                                  List wallet UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)
   backup <destPath>                      Create database backup
+  backup scb [destPath]                  Export encrypted static channel backup
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer
