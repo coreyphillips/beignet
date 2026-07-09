@@ -249,6 +249,35 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.payerInfo!.toString()).to.equal('payer-info');
 		});
 
+		it('should compute offerId from mirrored offer records on decode', () => {
+			const offer: IOffer = {
+				offerId: Buffer.alloc(32),
+				description: 'offerId decode test',
+				issuerId: pubkey1,
+				amount: 12_345n
+			};
+			const offerTlvData = encodeOfferTlv(offer);
+			const expectedOfferId = computeOfferId(getTlvRecords(offerTlvData));
+
+			const request: IInvoiceRequest = {
+				payerKey: pubkey2,
+				offerId: expectedOfferId
+			};
+			const tlvData = encodeInvoiceRequestTlv(request, offerTlvData);
+			const { request: decoded } = decodeInvoiceRequestTlv(tlvData);
+			expect(decoded.offerId.equals(expectedOfferId)).to.be.true;
+		});
+
+		it('should return zero offerId when no offer records are mirrored', () => {
+			const request: IInvoiceRequest = {
+				payerKey: pubkey2,
+				offerId: Buffer.alloc(32)
+			};
+			const tlvData = encodeInvoiceRequestTlv(request);
+			const { request: decoded } = decodeInvoiceRequestTlv(tlvData);
+			expect(decoded.offerId.equals(Buffer.alloc(32))).to.be.true;
+		});
+
 		it('should include offer TLV data when provided', () => {
 			const offer: IOffer = {
 				offerId: Buffer.alloc(32),

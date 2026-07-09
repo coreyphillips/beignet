@@ -1594,6 +1594,21 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannelMessage(payload);
 
+		// Reject opens for a chain we do not operate on (same guard as the v2
+		// open_channel2 path below).
+		if (
+			this.config.chainHash &&
+			msg.chainHash &&
+			!msg.chainHash.equals(this.config.chainHash)
+		) {
+			this.emit(
+				'error',
+				msg.temporaryChannelId,
+				`open_channel for unknown chain ${msg.chainHash.toString('hex')}`
+			);
+			return;
+		}
+
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createAcceptorState({
 			temporaryChannelId: msg.temporaryChannelId,
@@ -3176,9 +3191,8 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
 
-		// Reject opens for a chain we do not operate on. (The legacy v1 open
-		// path does not yet validate chain_hash; this guard is intentionally
-		// stricter for v2, where we always send and receive the field.)
+		// Reject opens for a chain we do not operate on (the v1 open path
+		// applies the same guard).
 		if (
 			this.config.chainHash &&
 			msg.chainHash &&
