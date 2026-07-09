@@ -1200,11 +1200,13 @@ describe('Zero-Conf Channels', function () {
 			node.destroy();
 		});
 
-		it('defaultFeatures does not include ZERO_CONF by default', function () {
+		it('defaultFeatures advertises ZERO_CONF as optional', function () {
 			const features = LightningNode.defaultFeatures();
-			// Zero conf is not in default features (must be explicitly requested)
+			// Advertising only signals capability: zero-conf treatment still
+			// requires the peer to be in the trusted set.
 			const { Feature } = require('../../src/lightning/features/flags');
-			expect(features.hasFeature(Feature.ZERO_CONF)).to.be.false;
+			expect(features.hasFeature(Feature.ZERO_CONF)).to.be.true;
+			expect(features.isCompulsory(Feature.ZERO_CONF)).to.be.false;
 		});
 
 		it('zero-conf trusted peers survive across operations', function () {

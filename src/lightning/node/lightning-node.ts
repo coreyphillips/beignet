@@ -6366,11 +6366,13 @@ export class LightningNode extends EventEmitter {
 		// allowAnySegwit), so advertising anysegwit only states existing behavior.
 		flags.setOptional(Feature.SHUTDOWN_ANY_SEGWIT);
 		flags.setOptional(Feature.SIMPLE_CLOSE);
-		// Implemented but NOT advertised by default (opt in via config.localFeatures):
-		//  - DUAL_FUND (28): open_channel2 initiator and acceptor paths work, but
-		//    the bit stays off the default init set pending broader interop soak.
-		//  - ZERO_CONF (50): zero-conf is gated per-peer (trusted peers) and via
-		//    channel_type; the init bit is deliberately not blanket-advertised.
+		// Dual-funded (v2) channel establishment: both the open_channel2 initiator
+		// and acceptor paths are implemented and interop-validated.
+		flags.setOptional(Feature.DUAL_FUND);
+		// Zero-conf support. Advertising the bit only signals capability: a
+		// zero_conf channel_type is still rejected, and minimum_depth stays
+		// non-zero, unless the peer is in the trusted set (ZeroConfManager).
+		flags.setOptional(Feature.ZERO_CONF);
 		// Defined in Feature but intentionally not advertised or implemented:
 		//  - LARGE_CHANNELS (18): funding is capped at 2^24 sat (wumbo is planned).
 		//  - ANCHOR_OUTPUTS (20): legacy anchors, superseded by bit 22 above.
