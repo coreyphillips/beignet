@@ -54,7 +54,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       (`createEncryptedStorage`, AES-256-GCM keyed via HKDF from the seed, lazy
       plaintext migration). Daemon audit: BeignetNode passes no wallet storage at
       all; persistence item added under M4.
-- [~] DECIDED (Corey): Peer storage (this PR): option_provide_storage bit 42
+- [x] DECIDED (Corey): Peer storage (PR #42, merged): option_provide_storage bit 42
       advertised, peer_storage (7) / peer_storage_retrieval (9) messages, server
       stores one encrypted blob per channel/trusted peer (rate-limited, returned on
       every reconnect), client pushes our seed-encrypted SCB to capable peers on
@@ -77,9 +77,9 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       default), regenerating channel_update. Library method + daemon
       `/channel/update-policy` + CLI. Internal pieces exist privately
       (`refreshChannelUpdate`, `maybeAdoptPeerChannelPolicy` in lightning-node.ts).
-- [ ] Forwarding history and fee accounting: persist settled forwards with amounts,
-      fees earned, timestamps, channel pair; `listforwards`-style API via library +
-      daemon `/forwards` + CLI.
+- [~] Forwarding history and fee accounting (this PR): persist settled forwards with
+      amounts, fees earned, timestamps, channel pair; `listforwards`-style API via
+      library + daemon `/forwards` + CLI.
 - [ ] Graph query surface: describegraph, getnodeinfo(pubkey), getchaninfo(scid),
       queryroutes via daemon + CLI (library `getGraph()` already exists,
       `lightning-node.ts:1636`).
@@ -209,3 +209,4 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
   encryption, SCB export, restore API). M3 started: routing fee-policy control.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
+- 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.

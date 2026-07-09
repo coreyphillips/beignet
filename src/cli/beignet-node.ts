@@ -78,6 +78,9 @@ import {
 	BootstrapPeerInfo,
 	HealthInfo,
 	PaymentFilter,
+	ForwardsFilter,
+	ForwardingEventInfo,
+	ForwardingSummaryInfo,
 	RouteEstimate,
 	NodeStats,
 	PaymentProof,
@@ -2378,6 +2381,33 @@ export class BeignetNode extends EventEmitter {
 		const p = this.node.getPayment(Buffer.from(paymentHash, 'hex'));
 		if (!p) return null;
 		return this.toPaymentInfo(p);
+	}
+
+	/** Settled forwards, newest first. Msat values as strings (JSON-safe). */
+	listForwards(filter?: ForwardsFilter): ForwardingEventInfo[] {
+		return this.node.listForwards(filter).map((f) => ({
+			id: f.id,
+			settledAt: f.settledAt,
+			inChannelId: f.inChannelId,
+			outChannelId: f.outChannelId,
+			inScid: f.inScid,
+			outScid: f.outScid,
+			amountInMsat: f.amountInMsat.toString(),
+			amountOutMsat: f.amountOutMsat.toString(),
+			feeMsat: f.feeMsat.toString()
+		}));
+	}
+
+	/** Forwarding totals: count, volume forwarded out, fees earned. */
+	getForwardingSummary(since?: number): ForwardingSummaryInfo {
+		const summary = this.node.getForwardingSummary(
+			since !== undefined ? { since } : undefined
+		);
+		return {
+			count: summary.count,
+			volumeOutMsat: summary.volumeOutMsat.toString(),
+			feesEarnedMsat: summary.feesEarnedMsat.toString()
+		};
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {

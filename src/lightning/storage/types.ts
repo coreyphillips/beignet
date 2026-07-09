@@ -146,6 +146,14 @@ export interface IStorageBackend {
 	/** Delete the stored peer_storage blob for a peer. */
 	deletePeerStorageBlob?(peerPubkey: string): void;
 
+	// ─── Forwarding Events (optional, settled-forward ledger) ───
+	/** Persist one settled forward (both legs fulfilled). */
+	saveForwardingEvent?(event: Omit<IForwardingEvent, 'id'>): void;
+	/** List settled forwards, newest first. */
+	listForwardingEvents?(filter?: IForwardingEventFilter): IForwardingEvent[];
+	/** Aggregate totals over settled forwards. */
+	getForwardingSummary?(options?: { since?: number }): IForwardingSummary;
+
 	// ─── Action Log (optional) ───
 	/** Save a structured log entry. Capped at maxRows (default 10000). */
 	saveActionLog?(entry: {
@@ -177,6 +185,41 @@ export interface IPersistedChannelPolicy {
 	cltvExpiryDelta?: number;
 	htlcMinimumMsat?: string;
 	htlcMaximumMsat?: string;
+}
+
+/**
+ * One settled forward: an HTLC we relayed whose downstream fulfill completed
+ * both legs. Msat fields are bigint in the library (strings in JSON surfaces).
+ */
+export interface IForwardingEvent {
+	id: number;
+	/** When the downstream fulfill settled the forward (ms since epoch). */
+	settledAt: number;
+	inChannelId: string;
+	outChannelId: string;
+	inScid?: string;
+	outScid?: string;
+	amountInMsat: bigint;
+	amountOutMsat: bigint;
+	/** amountInMsat - amountOutMsat: the fee we earned. */
+	feeMsat: bigint;
+}
+
+export interface IForwardingEventFilter {
+	/** Only events with settledAt >= since (ms). */
+	since?: number;
+	/** Only events with settledAt <= until (ms). */
+	until?: number;
+	limit?: number;
+	offset?: number;
+	/** Match events where this channel was the inbound OR outbound leg. */
+	channelId?: string;
+}
+
+export interface IForwardingSummary {
+	count: number;
+	volumeOutMsat: bigint;
+	feesEarnedMsat: bigint;
 }
 
 export interface IInvoiceInfo {

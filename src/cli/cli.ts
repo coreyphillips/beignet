@@ -157,6 +157,8 @@ async function main(): Promise<void> {
 			return handleInvoice();
 		case 'payment':
 			return handlePayment();
+		case 'forwards':
+			return handleForwards();
 		case 'bootstrap':
 			return handleBootstrap();
 		case 'trusted-peer':
@@ -575,6 +577,24 @@ async function handlePayment(): Promise<void> {
 	}
 }
 
+async function handleForwards(): Promise<void> {
+	const params = new URLSearchParams();
+	const since = parseFlag('--since');
+	if (since !== undefined) params.set('since', since);
+	if (filteredArgs[1] === 'summary') {
+		const qs = params.toString();
+		return outputResult(
+			await httpRequest('GET', `/forwards/summary${qs ? `?${qs}` : ''}`)
+		);
+	}
+	const limit = parseFlag('--limit');
+	if (limit !== undefined) params.set('limit', limit);
+	const qs = params.toString();
+	return outputResult(
+		await httpRequest('GET', `/forwards${qs ? `?${qs}` : ''}`)
+	);
+}
+
 async function handleBootstrap(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
@@ -930,6 +950,10 @@ Invoices & Payments:
   invoice list                           List created invoices
   payment list                           List payments
   payment get <hash>                     Payment details
+
+Routing:
+  forwards [--since ts] [--limit n]      List settled forwards (fees earned)
+  forwards summary [--since ts]          Forwarding totals (count, volume, fees)
 
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
