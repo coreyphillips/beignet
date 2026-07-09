@@ -31,6 +31,7 @@ import { IPaymentInfo } from '../lightning/node/types';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
+import { encodeScb, IStaticChannelBackup } from '../lightning/backup/scb';
 import * as bip39 from 'bip39';
 import {
 	fetchRapidGossipSnapshot,
@@ -655,12 +656,19 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('channel:ready', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel ready', { channelId });
+			this.refreshStaticChannelBackup();
 			this.emit('channel:ready', { channelId });
 		});
 		this.node.on('channel:closed', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
 			this.log('info', 'Channel closed', { channelId });
+			this.refreshStaticChannelBackup();
 			this.emit('channel:closed', { channelId });
+		});
+		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
+		// so refresh here too even though the event is not re-emitted.
+		this.node.on('channel:resolved', () => {
+			this.refreshStaticChannelBackup();
 		});
 
 		// Forward peer events
@@ -1222,6 +1230,7 @@ export class BeignetNode extends EventEmitter {
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
 		const channelId = state.channelId || state.temporaryChannelId;
+		this.refreshStaticChannelBackup();
 		return {
 			channelId: channelId.toString('hex'),
 			peerPubkey: pubkey,
@@ -2495,6 +2504,7 @@ export class BeignetNode extends EventEmitter {
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
 		const channelId = state.channelId || state.temporaryChannelId;
+		this.refreshStaticChannelBackup();
 		return {
 			channelId: channelId.toString('hex'),
 			peerPubkey,
@@ -2526,6 +2536,7 @@ export class BeignetNode extends EventEmitter {
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
 		const channelId = state.channelId || state.temporaryChannelId;
+		this.refreshStaticChannelBackup();
 		return {
 			channelId: channelId.toString('hex'),
 			peerPubkey,
@@ -2545,7 +2556,9 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): SpliceResult {
 		const idBuf = Buffer.from(channelId, 'hex');
-		return this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw);
+		const result = this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw);
+		this.refreshStaticChannelBackup();
+		return result;
 	}
 
 	spliceOut(
@@ -2554,7 +2567,9 @@ export class BeignetNode extends EventEmitter {
 		feeratePerkw: number
 	): SpliceResult {
 		const idBuf = Buffer.from(channelId, 'hex');
-		return this.node.spliceOut(idBuf, BigInt(amountSats), feeratePerkw);
+		const result = this.node.spliceOut(idBuf, BigInt(amountSats), feeratePerkw);
+		this.refreshStaticChannelBackup();
+		return result;
 	}
 
 	// ─────────────── BOLT 12 Offers ───────────────
@@ -3345,6 +3360,51 @@ export class BeignetNode extends EventEmitter {
 	/** Trigger an on-demand backup (if backupPath is configured) */
 	triggerBackup(): void {
 		this.performScheduledBackup();
+	}
+
+	// ─────────────── Static Channel Backup ───────────────
+
+	/**
+	 * Build, encrypt, and persist the static channel backup. The blob is
+	 * encrypted under the BIP39 seed of the wallet mnemonic (same seed material
+	 * as storage encryption), written atomically to <dataDir>/channels.scb, and
+	 * also returned for out-of-band storage.
+	 */
+	exportStaticChannelBackup(): {
+		encoded: string;
+		channelCount: number;
+		path: string;
+	} {
+		const data = this.node.buildStaticChannelBackupData();
+		const backup: IStaticChannelBackup = {
+			version: 1,
+			network: data.network,
+			createdAt: Date.now(),
+			channels: data.channels
+		};
+		const seed = bip39.mnemonicToSeedSync(this.mnemonic);
+		const encoded = encodeScb(backup, seed);
+		const scbPath = path.join(this.dataDir, 'channels.scb');
+		// Atomic write: a crash mid-write must never leave a truncated backup.
+		const tmpPath = `${scbPath}.tmp`;
+		fs.writeFileSync(tmpPath, encoded);
+		fs.renameSync(tmpPath, scbPath);
+		return { encoded, channelCount: data.channels.length, path: scbPath };
+	}
+
+	/**
+	 * Re-export the SCB after a channel-set change. A backup failure must never
+	 * crash the node, so failures only log a warning.
+	 */
+	private refreshStaticChannelBackup(): void {
+		if (this.destroyed) return;
+		try {
+			this.exportStaticChannelBackup();
+		} catch (err) {
+			this.log('warn', 'Static channel backup refresh failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
 	}
 
 	// ─────────────── Node URI ───────────────
