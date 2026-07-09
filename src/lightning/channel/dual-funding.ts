@@ -138,9 +138,17 @@ export class DualFundingSession {
 	/** The accept_channel2 message that was sent/received */
 	private _acceptMsg: IAcceptChannel2Message | null = null;
 
-	constructor(isInitiator: boolean, channelId: Buffer) {
+	/** Per-side funding cap: 2^24 sat unless option_wumbo lifted it. */
+	private _maxFundingSatoshis: bigint;
+
+	constructor(
+		isInitiator: boolean,
+		channelId: Buffer,
+		maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
+	) {
 		this._isInitiator = isInitiator;
 		this._channelId = Buffer.from(channelId);
+		this._maxFundingSatoshis = maxFundingSatoshis;
 	}
 
 	// ─────────────── Getters ───────────────
@@ -843,8 +851,8 @@ export class DualFundingSession {
 	// ─────────────── Validation ───────────────
 
 	private validateLocalParams(params: IDualFundingParams): string | null {
-		if (params.fundingSatoshis > MAX_FUNDING_SATOSHIS) {
-			return `funding_satoshis ${params.fundingSatoshis} exceeds maximum ${MAX_FUNDING_SATOSHIS}`;
+		if (params.fundingSatoshis > this._maxFundingSatoshis) {
+			return `funding_satoshis ${params.fundingSatoshis} exceeds maximum ${this._maxFundingSatoshis}`;
 		}
 
 		if (params.dustLimitSatoshis < MIN_DUST_LIMIT_SATOSHIS) {
@@ -875,8 +883,8 @@ export class DualFundingSession {
 	}
 
 	private validateOpenMsg(msg: IOpenChannel2Message): string | null {
-		if (msg.fundingSatoshis > MAX_FUNDING_SATOSHIS) {
-			return `funding_satoshis ${msg.fundingSatoshis} exceeds maximum ${MAX_FUNDING_SATOSHIS}`;
+		if (msg.fundingSatoshis > this._maxFundingSatoshis) {
+			return `funding_satoshis ${msg.fundingSatoshis} exceeds maximum ${this._maxFundingSatoshis}`;
 		}
 
 		if (msg.dustLimitSatoshis < MIN_DUST_LIMIT_SATOSHIS) {

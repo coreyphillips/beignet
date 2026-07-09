@@ -69,7 +69,8 @@ import {
 	IHtlcSnapshotEntry,
 	HtlcDirection,
 	HtlcState,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	MAX_FUNDING_SATOSHIS
 } from './types';
 import {
 	IChannelState,
@@ -385,10 +386,22 @@ export class Channel {
 	private _taprootClosingCache: ITaprootClosingCache | null = null;
 	private _currentBlockHeight = 0;
 	private _channelKeyIndex: number | null = null;
+	// Funding cap for this channel's open/splice validation: 2^24 sat (BOLT 2)
+	// unless the ChannelManager lifted it because option_wumbo was negotiated
+	// with the peer. In-memory only; the manager re-derives it per operation.
+	private _maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS;
 
 	constructor(state: IChannelState, signer?: ChannelSigner) {
 		this._state = state;
 		this._signer = signer || null;
+	}
+
+	/**
+	 * Set the funding cap used to validate opens and splices on this channel
+	 * (lifted above 2^24 sat only when option_wumbo was negotiated).
+	 */
+	setMaxFundingSatoshis(max: bigint): void {
+		this._maxFundingSatoshis = max;
 	}
 
 	/**
@@ -573,7 +586,7 @@ export class Channel {
 			firstPerCommitmentPoint: firstPoint
 		};
 
-		const error = validateOpenChannelParams(msg);
+		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -991,7 +1004,7 @@ export class Channel {
 			];
 		}
 
-		const error = validateOpenChannelParams(msg);
+		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -4911,6 +4924,23 @@ export class Channel {
 			];
 		}
 
+		// A splice-in must not grow the channel past the funding cap (2^24 sat,
+		// lifted only when option_wumbo was negotiated). Checked up-front, before
+		// we quiesce, like the balance check below.
+		if (
+			relativeSatoshis > 0n &&
+			this._state.fundingSatoshis + relativeSatoshis > this._maxFundingSatoshis
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot splice-in: post-splice capacity ${
+						this._state.fundingSatoshis + relativeSatoshis
+					} exceeds maximum ${this._maxFundingSatoshis}`
+				}
+			];
+		}
+
 		// Validate splice-out doesn't exceed our balance (cheap to check up-front,
 		// before we quiesce, so we don't STFU only to then fail).
 		if (relativeSatoshis < 0n) {
@@ -5037,6 +5067,20 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
 		}
 
+		// The combined contributions must not grow the channel past the funding
+		// cap (2^24 sat, lifted only when option_wumbo was negotiated).
+		const postSpliceCapacity =
+			this._state.fundingSatoshis + this._spliceSession.getNetCapacityChange();
+		if (postSpliceCapacity > this._maxFundingSatoshis) {
+			this._spliceSession = null;
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot accept splice: post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
+				}
+			];
+		}
+
 		this._state.preSpliceState = this._state.state;
 		this._state.state = ChannelState.SPLICING;
 
@@ -5069,6 +5113,34 @@ export class Channel {
 		const result = this._spliceSession.handleSpliceAck(msg);
 		if (!result.ok) {
 			return [{ type: ChannelActionType.ERROR, message: result.error! }];
+		}
+
+		// The peer's splice_ack contribution counts toward capacity too: the
+		// combined post-splice capacity must stay under the funding cap (2^24 sat,
+		// lifted only when option_wumbo was negotiated). Unwind like the
+		// require_confirmed_inputs failure below.
+		const postSpliceCapacity =
+			this._state.fundingSatoshis + this._spliceSession.getNetCapacityChange();
+		if (postSpliceCapacity > this._maxFundingSatoshis) {
+			const actions: ChannelAction[] = [
+				sendMsg(
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: this._state.channelId!,
+						data: Buffer.from('post-splice capacity exceeds maximum', 'utf8')
+					})
+				)
+			];
+			actions.push(
+				...this.abortSplice(
+					`post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
+				)
+			);
+			actions.push({
+				type: ChannelActionType.ERROR,
+				message: `splice aborted: post-splice capacity ${postSpliceCapacity} exceeds maximum ${this._maxFundingSatoshis}`
+			});
+			return actions;
 		}
 
 		// Honor the peer's require_confirmed_inputs: contributing an unconfirmed
@@ -6972,7 +7044,8 @@ export class Channel {
 
 		const session = new DualFundingSession(
 			true,
-			this._state.temporaryChannelId
+			this._state.temporaryChannelId,
+			this._maxFundingSatoshis
 		);
 		const result = session.initiateOpen(params);
 		if (!result.ok || !result.message) {
@@ -7046,7 +7119,8 @@ export class Channel {
 
 		const session = new DualFundingSession(
 			false,
-			this._state.temporaryChannelId
+			this._state.temporaryChannelId,
+			this._maxFundingSatoshis
 		);
 		const result = session.handleOpenChannel2(msg, localParams);
 		if (!result.ok || !result.message) {

@@ -31,6 +31,38 @@ export interface IFeeEstimator {
 	estimateFee(targetBlocks: number): Promise<number>;
 }
 
+/** Ceiling for estimator-supplied feerates fed into LN operations (sat/vB).
+ *  A buggy or unit-confused estimator (e.g. one returning sat/kvB or a
+ *  BTC-denominated value) must not translate into absurd commitment feerates
+ *  or funding/sweep fees; 5000 sat/vB comfortably exceeds any observed
+ *  mempool peak. */
+export const MAX_FEE_RATE_SAT_PER_VBYTE = 5000;
+
+/**
+ * Sanity-clamp an IFeeEstimator result before it feeds LN operations: cap at
+ * MAX_FEE_RATE_SAT_PER_VBYTE and floor positive sub-1 values to 1 sat/vB.
+ * Non-positive / non-finite values pass through unchanged; they are the
+ * estimator's "unavailable" signal and every caller has its own fallback.
+ * `onClamp` fires only when the value was actually adjusted.
+ */
+export function clampFeeRateSatPerVbyte(
+	satPerVbyte: number,
+	onClamp?: (original: number, clamped: number) => void
+): number {
+	if (Number.isNaN(satPerVbyte) || satPerVbyte <= 0) return satPerVbyte;
+	let clamped = satPerVbyte;
+	if (clamped > MAX_FEE_RATE_SAT_PER_VBYTE) {
+		clamped = MAX_FEE_RATE_SAT_PER_VBYTE;
+	}
+	if (clamped < 1) {
+		clamped = 1;
+	}
+	if (clamped !== satPerVbyte && onClamp) {
+		onClamp(satPerVbyte, clamped);
+	}
+	return clamped;
+}
+
 export interface IFundingProvider {
 	buildFundingTransaction(
 		address: string,
@@ -127,6 +159,13 @@ export interface INodeConfig {
 	socks5Proxy?: { host: string; port: number };
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
 	preferAnchors?: boolean;
+	/**
+	 * option_wumbo (large_channels, bit 18, default false): advertise the bit
+	 * and lift the BOLT 2 2^24 sat funding cap to MAX_WUMBO_FUNDING_SATOSHIS
+	 * (10 BTC) for peers that also advertise it. Opens/accepts/splices with
+	 * non-wumbo peers keep the 2^24 cap.
+	 */
+	largeChannels?: boolean;
 	/**
 	 * Propose simple taproot channels (option_taproot) when opening channels.
 	 * MuSig2 funding and commitment signing (deterministic verification nonces)

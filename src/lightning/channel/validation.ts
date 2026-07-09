@@ -81,16 +81,19 @@ export function deriveV2TemporaryChannelId(
  * @returns Error string if invalid, null if valid.
  */
 export function validateOpenChannelParams(
-	msg: IOpenChannelMessage
+	msg: IOpenChannelMessage,
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
 ): string | null {
 	// funding_satoshis must be > 0
 	if (msg.fundingSatoshis === 0n) {
 		return 'funding_satoshis must be greater than 0';
 	}
 
-	// funding_satoshis must not exceed max (without wumbo)
-	if (msg.fundingSatoshis > MAX_FUNDING_SATOSHIS) {
-		return `funding_satoshis ${msg.fundingSatoshis} exceeds maximum ${MAX_FUNDING_SATOSHIS}`;
+	// funding_satoshis must not exceed the cap: 2^24 sat (BOLT 2) unless
+	// option_wumbo was negotiated, in which case the caller passes the lifted
+	// (but still bounded) per-node maximum.
+	if (msg.fundingSatoshis > maxFundingSatoshis) {
+		return `funding_satoshis ${msg.fundingSatoshis} exceeds maximum ${maxFundingSatoshis}`;
 	}
 
 	// push_msat must not be > 1000 * funding_satoshis

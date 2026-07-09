@@ -146,6 +146,11 @@ export interface BeignetNodeOptions {
 	electrumTls?: boolean;
 	listenPort?: number;
 	preferAnchors?: boolean;
+	/**
+	 * option_wumbo (large_channels, default false): advertise the bit and lift
+	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
+	 */
+	largeChannels?: boolean;
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -723,6 +728,7 @@ export class BeignetNode extends EventEmitter {
 			announcedAddresses,
 			fundingProvider,
 			preferAnchors: opts.preferAnchors,
+			largeChannels: opts.largeChannels,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			sweepDestinationScript,
@@ -1260,9 +1266,15 @@ export class BeignetNode extends EventEmitter {
 
 	async connectPeer(
 		pubkey: string,
-		host: string,
-		port: number
+		host?: string,
+		port?: number
 	): Promise<PeerInfo> {
+		// Where we are dialing, for error messages: explicit host:port, or the
+		// gossip/DNS resolution the library performs when both are omitted.
+		const target =
+			host !== undefined && port !== undefined
+				? `${host}:${port}`
+				: 'resolved address (gossip graph / DNS bootstrap)';
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const connectPromise = this.node.connectPeer(pubkey, host, port);
 		const timeoutPromise = new Promise<never>((_, reject) => {
@@ -1271,7 +1283,7 @@ export class BeignetNode extends EventEmitter {
 					reject(
 						new BeignetError(
 							'CONNECT_TIMEOUT',
-							`connectPeer timed out after ${this._connectTimeoutMs}ms (is ${host}:${port} the peer's P2P address?)`
+							`connectPeer timed out after ${this._connectTimeoutMs}ms (is ${target} the peer's P2P address?)`
 						)
 					),
 				this._connectTimeoutMs
@@ -1286,14 +1298,21 @@ export class BeignetNode extends EventEmitter {
 			// always means a wrong node pubkey or a non-LN address/port.
 			throw new BeignetError(
 				'CONNECT_FAILED',
-				`Failed to connect to ${pubkey.slice(0, 16)}…@${host}:${port}: ${
+				`Failed to connect to ${pubkey.slice(0, 16)}…@${target}: ${
 					(err as Error).message
 				}`
 			);
 		} finally {
 			if (timer) clearTimeout(timer);
 		}
-		return { pubkey, host, port, state: 'connected' };
+		// When the library resolved the address, report the one it connected to.
+		const connected = this.node.listPeers().find((p) => p.pubkey === pubkey);
+		return {
+			pubkey,
+			host: host ?? connected?.host ?? '',
+			port: port ?? connected?.port ?? 0,
+			state: 'connected'
+		};
 	}
 
 	disconnectPeer(pubkey: string): void {

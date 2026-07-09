@@ -80,6 +80,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_PREFER_ANCHORS === 'true'
 				: undefined) ??
 			file.preferAnchors,
+		largeChannels:
+			cliFlags.largeChannels ??
+			(process.env.BEIGNET_LARGE_CHANNELS !== undefined
+				? process.env.BEIGNET_LARGE_CHANNELS === 'true'
+				: undefined) ??
+			file.largeChannels,
 		apiToken:
 			cliFlags.apiToken || process.env.BEIGNET_API_TOKEN || file.apiToken,
 		autoBootstrap:

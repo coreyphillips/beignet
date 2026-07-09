@@ -241,6 +241,8 @@ export interface BeignetConfig {
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;
+	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
+	largeChannels?: boolean;
 	apiToken?: string;
 	autoBootstrap?: boolean;
 	backupPath?: string;
