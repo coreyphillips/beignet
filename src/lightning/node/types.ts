@@ -157,6 +157,12 @@ export interface INodeConfig {
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
+	/**
+	 * Watchtowers to ship encrypted justice data to at every revocation, as
+	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined
+	 * disables the watchtower client entirely.
+	 */
+	watchtowers?: string[];
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
 	preferAnchors?: boolean;
 	/**
@@ -545,7 +551,14 @@ export interface IChannelHealth {
 // ─── Structured Logging ───
 
 export interface IStructuredLog {
-	category: 'payment' | 'channel' | 'htlc' | 'fee' | 'peer' | 'chain';
+	category:
+		| 'payment'
+		| 'channel'
+		| 'htlc'
+		| 'fee'
+		| 'peer'
+		| 'chain'
+		| 'watchtower';
 	action: string;
 	timestamp: number;
 	data: Record<string, unknown>;

@@ -272,6 +272,43 @@ Daemon/CLI surfaces: `POST /rebalance`, `GET /advisor/recommendations`,
 --max-fee <sats>`, `beignet advisor recommendations`, `beignet advisor
 execute-rebalances [--budget <sats>]`.
 
+### Watchtowers
+
+Penalty enforcement normally requires this node's own chain monitor to be online:
+if a counterparty broadcasts a revoked commitment while you are offline, nobody
+sweeps the breach. The **watchtower client** closes that gap. At every revocation
+it builds an encrypted *justice kit* (the revoked commitment's breach hint plus a
+pre-signed to_local penalty) and ships it to one or more remote towers over the
+standard BOLT 8 Noise transport. When a tower later sees the breach transaction on
+chain, it decrypts the kit and broadcasts the penalty on your behalf — reclaiming
+the channel even though you never came back online.
+
+- **Altruist only.** Sessions use `reward = 0`; towers take no cut. There is no
+  server mode (beignet is a tower *client*, not a tower).
+- **LND-tower compatible.** Implements LND's `wtwire` protocol (Init/CreateSession/
+  StateUpdate/DeleteSession, message types 600-607) and the version-0 justice blob
+  (XChaCha20-Poly1305, breach hint = `SHA256(txid)[:16]`, key = `SHA256(txid‖txid)`),
+  so it interoperates with existing public LND altruist towers.
+- **Legacy + anchor channels.** The to_local revocation penalty (the fund-critical
+  breach punishment) is packed for both; taproot channels are not yet backed up.
+- **Durable.** Per-tower session state and the un-acked update backlog are persisted
+  (encrypted at rest) and drained with exponential backoff on reconnect. An un-acked
+  update is never dropped silently.
+
+Configure towers as `pubkey@host:port` URIs (off when empty):
+
+```ts
+const node = await BeignetNode.create({
+  mnemonic,
+  watchtowers: ['03abc...@tower.example.com:9911']
+});
+```
+
+Daemon/CLI surfaces: `GET /watchtowers`, `POST /watchtower/add`,
+`DELETE /watchtower/remove`; `beignet watchtower list`, `beignet watchtower add
+<pubkey@host:port>`, `beignet watchtower remove <uri>`; daemon flag `--watchtower`
+(repeatable) or `BEIGNET_WATCHTOWERS` (comma-separated).
+
 ### HTTP Daemon
 
 BeignetNode can also run as an HTTP/SSE daemon for language-agnostic integrations:
@@ -572,7 +609,7 @@ Beignet is under active development. The following features are missing or carry
 
 | Feature | Status | Impact |
 |---------|--------|--------|
-| **Watchtowers** | Not implemented | If your node goes offline, a counterparty could theoretically broadcast a revoked state. Mitigate with frequent backups and auto-reconnect. |
+| **Watchtowers** | Client implemented (altruist) | Ships encrypted justice data to remote LND altruist towers at every revocation so a breach is punished while you are offline (see [Watchtowers](#watchtowers)). Legacy + anchor channels only; taproot channels are not yet backed up, and server mode is out of scope. |
 | **LSP / LSPS protocols** | Not implemented | No automated inbound liquidity acquisition via LSPS0/1/2. Liquidity ads (bLIP-51) are supported for negotiated leases; otherwise open channels manually. |
 | **Trampoline routing** | Not implemented | All route computation is local. Cannot delegate pathfinding to a trampoline node. |
 | **BOLT 12 offers** | Newer | Offer creation/decoding, invoice_request/invoice over onion messages, and receive-side settlement are implemented, but the surface is newer and less battle-tested than BOLT 11. Prefer BOLT 11 invoices for production. |

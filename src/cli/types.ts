@@ -270,6 +270,8 @@ export interface BeignetConfig {
 	/** Addresses to advertise in node_announcement, as "host[:port]" strings
 	 *  (IPv4, "[ipv6]:port", Tor v3 ".onion", or DNS hostname). */
 	announceAddresses?: string[];
+	/** Watchtowers to ship justice data to, as "pubkey@host:port" URIs. */
+	watchtowers?: string[];
 }
 
 export interface HealthInfo {

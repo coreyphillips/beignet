@@ -228,6 +228,26 @@ export async function startDaemon(
 		},
 		'GET /spend-limit': () => success(node.getDailySpendInfo()),
 		'GET /liquidity': () => success(node.getLiquiditySnapshot()),
+		'GET /watchtowers': () => success({ towers: node.listWatchtowers() }),
+		'POST /watchtower/add': (body) => {
+			const { uri } = body as { uri?: string };
+			if (!uri) return failure('INVALID_PARAMS', 'uri required');
+			try {
+				node.addWatchtower(uri);
+			} catch (err) {
+				return failure(
+					'INVALID_PARAMS',
+					err instanceof Error ? err.message : String(err)
+				);
+			}
+			return success({ added: uri });
+		},
+		'DELETE /watchtower/remove': (body) => {
+			const { uri } = body as { uri?: string };
+			if (!uri) return failure('INVALID_PARAMS', 'uri required');
+			node.removeWatchtower(uri);
+			return success({ removed: uri });
+		},
 		'GET /advisor/recommendations': () =>
 			success(node.getAdvisorRecommendations()),
 		'POST /advisor/execute-rebalances': async (body) => {

@@ -14,6 +14,7 @@ import {
 	IForwardingEventFilter,
 	IForwardingSummary
 } from './types';
+import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
@@ -125,7 +126,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 6;
+	static readonly CURRENT_SCHEMA_VERSION = 7;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -170,7 +171,16 @@ export class SqliteStorage implements IStorageBackend {
 		// Opaque per-peer blobs (BOLT 1 peer storage). The sender encrypts them
 		// itself, but they are still user data we should not leak from a stolen
 		// database file.
-		{ table: 'peer_storage_blobs', pk: 'peer_pubkey', columns: ['blob'] }
+		{ table: 'peer_storage_blobs', pk: 'peer_pubkey', columns: ['blob'] },
+		// Watchtower session keys are per-session Noise identities; the justice
+		// blobs are already ciphertext but still reveal breach hints, so both are
+		// encrypted at rest.
+		{
+			table: 'watchtower_sessions',
+			pk: 'session_id',
+			columns: ['session_key']
+		},
+		{ table: 'watchtower_updates', pk: 'id', columns: ['encrypted_blob'] }
 	];
 
 	/**
@@ -354,6 +364,32 @@ export class SqliteStorage implements IStorageBackend {
 				fee_msat TEXT NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_forwarding_events_settled_at ON forwarding_events(settled_at);
+
+			CREATE TABLE IF NOT EXISTS watchtower_sessions (
+				session_id TEXT PRIMARY KEY,
+				tower_uri TEXT NOT NULL,
+				tower_pubkey TEXT NOT NULL,
+				session_key TEXT NOT NULL,
+				blob_type INTEGER NOT NULL,
+				max_updates INTEGER NOT NULL,
+				sweep_fee_rate TEXT NOT NULL,
+				seq_num INTEGER NOT NULL,
+				last_applied INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_watchtower_sessions_tower ON watchtower_sessions(tower_uri);
+
+			CREATE TABLE IF NOT EXISTS watchtower_updates (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				tower_uri TEXT NOT NULL,
+				channel_id TEXT NOT NULL,
+				hint TEXT NOT NULL,
+				encrypted_blob TEXT NOT NULL,
+				seq_num INTEGER NOT NULL,
+				acked INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_watchtower_updates_pending ON watchtower_updates(tower_uri, acked);
 		`);
 
 		// Run migrations
@@ -1061,6 +1097,13 @@ export class SqliteStorage implements IStorageBackend {
 			// encrypted values would break.
 			(): void => {
 				// No-op
+			},
+			// Migration 6->7: watchtower_sessions + watchtower_updates tables
+			// (created via CREATE IF NOT EXISTS above; session_key + encrypted_blob
+			// are in ENCRYPTED_COLUMNS so they are encrypted at rest when a key is
+			// set).
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1170,6 +1213,117 @@ export class SqliteStorage implements IStorageBackend {
 		this.db
 			.prepare('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?')
 			.run(peerPubkey);
+	}
+
+	// ─── Watchtower (LND altruist client) ───
+	// session_key + encrypted_blob are encrypted at rest (see ENCRYPTED_COLUMNS).
+
+	saveWatchtowerSession(session: IWatchtowerSession, sessionKey: Buffer): void {
+		this.db
+			.prepare(
+				`INSERT OR REPLACE INTO watchtower_sessions
+					(session_id, tower_uri, tower_pubkey, session_key, blob_type,
+					 max_updates, sweep_fee_rate, seq_num, last_applied, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			)
+			.run(
+				session.sessionId,
+				session.towerUri,
+				session.towerPubkey,
+				this._enc(sessionKey.toString('base64')),
+				session.blobType,
+				session.maxUpdates,
+				session.sweepFeeRate,
+				session.seqNum,
+				session.lastApplied,
+				session.createdAt
+			);
+	}
+
+	loadWatchtowerSessions(): Array<IWatchtowerSession & { sessionKey: Buffer }> {
+		const rows = this.db
+			.prepare('SELECT * FROM watchtower_sessions')
+			.all() as Array<Record<string, unknown>>;
+		return rows.map((r) => ({
+			sessionId: r.session_id as string,
+			towerUri: r.tower_uri as string,
+			towerPubkey: r.tower_pubkey as string,
+			sessionKey: Buffer.from(this._dec(r.session_key as string), 'base64'),
+			blobType: r.blob_type as number,
+			maxUpdates: r.max_updates as number,
+			sweepFeeRate: r.sweep_fee_rate as string,
+			seqNum: r.seq_num as number,
+			lastApplied: r.last_applied as number,
+			createdAt: r.created_at as number
+		}));
+	}
+
+	setWatchtowerSessionProgress(
+		sessionId: string,
+		seqNum: number,
+		lastApplied: number
+	): void {
+		this.db
+			.prepare(
+				'UPDATE watchtower_sessions SET seq_num = ?, last_applied = ? WHERE session_id = ?'
+			)
+			.run(seqNum, lastApplied, sessionId);
+	}
+
+	deleteWatchtowerTower(towerUri: string): void {
+		this.db.transaction(() => {
+			this.db
+				.prepare('DELETE FROM watchtower_sessions WHERE tower_uri = ?')
+				.run(towerUri);
+			this.db
+				.prepare('DELETE FROM watchtower_updates WHERE tower_uri = ?')
+				.run(towerUri);
+		})();
+	}
+
+	addWatchtowerUpdate(update: IWatchtowerUpdate): number {
+		const info = this.db
+			.prepare(
+				`INSERT INTO watchtower_updates
+					(tower_uri, channel_id, hint, encrypted_blob, seq_num, acked, created_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			)
+			.run(
+				update.towerUri,
+				update.channelId,
+				update.hint,
+				this._enc(update.encryptedBlob),
+				update.seqNum,
+				update.acked ? 1 : 0,
+				update.createdAt
+			);
+		return Number(info.lastInsertRowid);
+	}
+
+	loadPendingWatchtowerUpdates(): Array<IWatchtowerUpdate & { id: number }> {
+		const rows = this.db
+			.prepare(
+				'SELECT * FROM watchtower_updates WHERE acked = 0 ORDER BY id ASC'
+			)
+			.all() as Array<Record<string, unknown>>;
+		return rows.map((r) => ({
+			id: r.id as number,
+			towerUri: r.tower_uri as string,
+			channelId: r.channel_id as string,
+			hint: r.hint as string,
+			encryptedBlob: this._dec(r.encrypted_blob as string),
+			seqNum: r.seq_num as number,
+			acked: (r.acked as number) === 1,
+			createdAt: r.created_at as number
+		}));
+	}
+
+	markWatchtowerUpdateAcked(id: number, seqNum: number): void {
+		this.db
+			.prepare(
+				'UPDATE watchtower_updates SET acked = 1, seq_num = ? WHERE id = ?'
+			)
+			.run(seqNum, id);
 	}
 
 	// ─── Forwarding Events (settled-forward ledger) ───

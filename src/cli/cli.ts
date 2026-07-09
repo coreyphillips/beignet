@@ -45,6 +45,15 @@ function hasFlag(name: string): boolean {
 	return filteredArgs.includes(name);
 }
 
+/** Collect every value of a repeatable flag (e.g. --watchtower a --watchtower b). */
+function parseRepeatedFlag(name: string): string[] {
+	const out: string[] = [];
+	for (let i = 0; i < filteredArgs.length - 1; i++) {
+		if (filteredArgs[i] === name) out.push(filteredArgs[i + 1]);
+	}
+	return out;
+}
+
 // Resolve apiToken from CLI flag, env, or config file for HTTP requests
 function getApiToken(): string | undefined {
 	const flagToken = parseFlag('--api-token');
@@ -180,6 +189,8 @@ async function main(): Promise<void> {
 						: undefined
 				})
 			);
+		case 'watchtower':
+			return handleWatchtower();
 		case 'route':
 			return handleRoute();
 		case 'rebalance':
@@ -299,6 +310,8 @@ async function handleStart(): Promise<void> {
 			.split(',')
 			.map((a) => a.trim())
 			.filter((a) => a.length > 0);
+	const watchtowerFlags = parseRepeatedFlag('--watchtower');
+	if (watchtowerFlags.length > 0) cliFlags.watchtowers = watchtowerFlags;
 
 	const config = resolveConfig(cliFlags);
 
@@ -340,7 +353,8 @@ async function handleStart(): Promise<void> {
 			tlsCert: config.tlsCert,
 			tlsKey: config.tlsKey,
 			torProxy: config.torProxy,
-			announceAddresses: config.announceAddresses
+			announceAddresses: config.announceAddresses,
+			watchtowers: config.watchtowers
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -765,6 +779,57 @@ async function handleGraph(): Promise<void> {
 					code: 'UNKNOWN_COMMAND',
 					message:
 						'Usage: beignet graph [info|node <pubkey>|channel <scid>|describe [--limit N] [--offset N]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleWatchtower(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'list':
+			return outputResult(await httpRequest('GET', '/watchtowers'));
+		case 'add': {
+			const uri = filteredArgs[2];
+			if (!uri) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet watchtower add <pubkey@host:port>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/watchtower/add', { uri })
+			);
+		}
+		case 'remove': {
+			const uri = filteredArgs[2];
+			if (!uri) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet watchtower remove <pubkey@host:port>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('DELETE', '/watchtower/remove', { uri })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet watchtower [list|add <uri>|remove <uri>]'
 				}
 			});
 			process.exitCode = 1;
@@ -1335,6 +1400,10 @@ Routing:
 Messages:
   message sign <message>                 Sign with the node key (LND-compatible)
   message verify <message> <signature>   Recover + check the signer pubkey
+Watchtowers:
+  watchtower list                        Per-tower session + backlog health
+  watchtower add <pubkey@host:port>      Add an LND altruist watchtower
+  watchtower remove <pubkey@host:port>   Remove a watchtower
 
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer

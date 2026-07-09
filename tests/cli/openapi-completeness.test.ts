@@ -113,7 +113,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'/channel/diagnostics',
 		'/address/validate',
 		'/recover-fallback-funds',
-		'/backup/trigger'
+		'/backup/trigger',
+		'/watchtowers',
+		'/watchtower/add',
+		'/watchtower/remove'
 	];
 
 	for (const route of expectedRoutes) {
@@ -157,7 +160,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'AdvisorRecommendations',
 		'RebalanceResult',
 		'RebalanceExecutionSummary',
-		'HoldInvoiceInfo'
+		'HoldInvoiceInfo',
+		'WatchtowerInfo'
 	];
 
 	for (const schema of expectedSchemas) {

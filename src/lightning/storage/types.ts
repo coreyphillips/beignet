@@ -9,6 +9,7 @@ import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IGraphChannel, IGraphNode } from '../gossip/types';
+import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 
 /**
  * Abstract storage backend. SqliteStorage implements this.
@@ -173,6 +174,26 @@ export interface IStorageBackend {
 		timestamp: number;
 		data: string;
 	}>;
+
+	// ─── Watchtower (optional, LND altruist client) ───
+	/** Persist a negotiated tower session plus its per-session Noise key. */
+	saveWatchtowerSession?(session: IWatchtowerSession, sessionKey: Buffer): void;
+	/** Load all persisted tower sessions with their session keys. */
+	loadWatchtowerSessions?(): Array<IWatchtowerSession & { sessionKey: Buffer }>;
+	/** Advance a session's shipped/acked sequence counters. */
+	setWatchtowerSessionProgress?(
+		sessionId: string,
+		seqNum: number,
+		lastApplied: number
+	): void;
+	/** Drop all sessions + queued updates for a removed tower. */
+	deleteWatchtowerTower?(towerUri: string): void;
+	/** Queue an un-acked justice update; returns its row id. */
+	addWatchtowerUpdate?(update: IWatchtowerUpdate): number;
+	/** Load the un-acked backlog (oldest first). */
+	loadPendingWatchtowerUpdates?(): Array<IWatchtowerUpdate & { id: number }>;
+	/** Mark a queued update acked at the given sequence number. */
+	markWatchtowerUpdateAcked?(id: number, seqNum: number): void;
 }
 
 /**

@@ -126,7 +126,15 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 						.map((a) => a.trim())
 						.filter((a) => a.length > 0)
 				: undefined) ||
-			file.announceAddresses
+			file.announceAddresses,
+		watchtowers:
+			cliFlags.watchtowers ||
+			(process.env.BEIGNET_WATCHTOWERS
+				? process.env.BEIGNET_WATCHTOWERS.split(',')
+						.map((a) => a.trim())
+						.filter((a) => a.length > 0)
+				: undefined) ||
+			file.watchtowers
 	};
 }
 
