@@ -92,7 +92,13 @@ describe('OpenAPI Spec Completeness', () => {
 		'/utxos',
 		'/fees/estimates',
 		'/forwards',
-		'/forwards/summary'
+		'/forwards/summary',
+		'/graph/info',
+		'/graph/node',
+		'/graph/channel',
+		'/graph/describe',
+		'/route/query',
+		'/payment/send-to-route'
 	];
 
 	for (const route of expectedRoutes) {
@@ -125,7 +131,13 @@ describe('OpenAPI Spec Completeness', () => {
 		'UtxoInfo',
 		'OnchainFees',
 		'ForwardingEvent',
-		'ForwardingSummary'
+		'ForwardingSummary',
+		'GraphInfo',
+		'GraphChannelPolicy',
+		'GraphChannelInfo',
+		'GraphNodeInfo',
+		'RouteHop',
+		'RouteQueryResult'
 	];
 
 	for (const schema of expectedSchemas) {

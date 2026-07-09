@@ -200,6 +200,17 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `probeRoute(destination, amountSats)` | `{ success, feeSats?, hops? }` | Probe route viability to a destination node |
 | `estimatePayment(bolt11, amountSats?)` | `PaymentEstimate \| null` | Full payment intelligence: success probability, route quality, estimated fee and time, warnings |
 
+#### Graph Queries
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `getGraphInfo()` | `GraphInfo` | Node/channel counts + last gossip sync time this session |
+| `getGraphNode(pubkey)` | `GraphNodeInfo \| null` | Node announcement info (alias, addresses, features) + its known channel SCIDs |
+| `getGraphChannel(scid)` | `GraphChannelInfo \| null` | Channel endpoints, capacity (from htlc_maximum_msat) and both directions' policies |
+| `describeGraph(limit?, offset?)` | `GraphDescribeResult` | Paged channel dump (limit defaults to 500, capped at 500) |
+| `queryRoute(destination, amountSats, maxFeeSats?)` | `RouteQueryResult` | Compute a route WITHOUT sending; hops feed `sendToRoute` |
+| `sendToRoute(paymentHash, route, paymentSecret?)` | `PaymentInfo` | Send a payment along an explicit route from `queryRoute` |
+
 #### Payment Proof
 
 | Method | Returns | Description |
@@ -966,6 +977,33 @@ beignet forwards --since 1751000000000 --limit 50
 
 beignet forwards summary --since 1751000000000
 # {"ok":true,"result":{"count":42,"volumeOutMsat":"210000000","feesEarnedMsat":"210000"}}
+### Graph Queries
+
+lncli-style read access to the gossip network graph, plus manual routing:
+compute a route without paying, then (optionally) pay along exactly that route.
+SCIDs are formatted `<block>x<txIndex>x<output>` (16-char hex also accepted).
+
+```bash
+beignet graph info
+# {"ok":true,"result":{"nodeCount":18432,"channelCount":51200,"lastSyncAt":1767952800000}}
+
+beignet graph node 02abc...
+# {"ok":true,"result":{"pubkey":"02abc...","alias":"ACINQ","color":"ff9900","addresses":[...],"featuresHex":"8000...","lastUpdate":1767950000,"channelCount":3,"channels":["700000x1x0",...]}}
+
+beignet graph channel 700000x1x0
+# {"ok":true,"result":{"shortChannelId":"700000x1x0","node1Pubkey":"02ab..","node2Pubkey":"03cd..","capacitySats":1000000,"node1Policy":{"feeBaseMsat":1000,"feeProportionalMillionths":1,"cltvExpiryDelta":40,"htlcMinimumMsat":"1000","htlcMaximumMsat":"1000000000","disabled":false,"lastUpdate":1767950000},"node2Policy":{...}}}
+
+beignet graph describe --limit 100 --offset 200
+# Paged dump: {"ok":true,"result":{"totalChannels":51200,"limit":100,"offset":200,"channels":[...]}}
+
+beignet route query 02abc... 50000 --max-fee 100
+# Computes a route WITHOUT paying:
+# {"ok":true,"result":{"destination":"02abc...","amountSats":50000,"hops":[{"pubkey":"03cd..","shortChannelId":"700000x1x0","amountToForwardMsat":"50001000","outgoingCltvValue":80,"feeMsat":"1000","cltvExpiryDelta":40},...],"totalAmountMsat":"50001000","totalFeeMsat":"1000","totalCltvDelta":80,"finalCltvExpiry":40}}
+
+beignet route query 02abc... 50000 --pretty > route.json
+beignet payment send-to-route <paymentHash> route.json --payment-secret <hex>
+# Pays along exactly that route (accepts a file path or inline JSON;
+# both the full result object and a bare {"hops":[...]} work)
 ```
 
 ### Invoices & Payments
@@ -1166,6 +1204,12 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/payment/metadata` | `{ paymentHash, metadata }` | Attach key-value metadata to an existing payment |
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
 | POST | `/route/probe` | `{ destination, amountSats }` | Probe route viability to a destination |
+| GET | `/graph/info` | -- | Network graph summary: node/channel counts, last sync time |
+| GET | `/graph/node` | `?pubkey=<hex>` | Node announcement info + its known channel SCIDs (404 if unknown) |
+| GET | `/graph/channel` | `?scid=<BxTxO or hex>` | Channel endpoints, capacity and both directions' policies (404 if unknown) |
+| GET | `/graph/describe` | `?limit=&offset=` | Paged channel dump (limit defaults to 500, capped at 500) |
+| POST | `/route/query` | `{ destination, amountSats, maxFeeSats? }` | Compute a route WITHOUT sending; hops feed `/payment/send-to-route` |
+| POST | `/payment/send-to-route` | `{ paymentHash, route: { hops }, paymentSecret? }` | Send a payment along an explicit route from `/route/query` |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |

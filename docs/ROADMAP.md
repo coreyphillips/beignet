@@ -77,13 +77,16 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       default), regenerating channel_update. Library method + daemon
       `/channel/update-policy` + CLI. Internal pieces exist privately
       (`refreshChannelUpdate`, `maybeAdoptPeerChannelPolicy` in lightning-node.ts).
-- [~] Forwarding history and fee accounting (this PR): persist settled forwards with
-      amounts, fees earned, timestamps, channel pair; `listforwards`-style API via
+- [x] Forwarding history and fee accounting (PR #43, merged): persist settled forwards
+      with amounts, fees earned, timestamps, channel pair; `listforwards`-style API via
       library + daemon `/forwards` + CLI.
-- [ ] Graph query surface: describegraph, getnodeinfo(pubkey), getchaninfo(scid),
-      queryroutes via daemon + CLI (library `getGraph()` already exists,
-      `lightning-node.ts:1636`).
-- [ ] Expose `sendPaymentToRoute` (`lightning-node.ts:3884`) through daemon + CLI.
+- [~] Graph query surface (this PR): describegraph, getnodeinfo(pubkey),
+      getchaninfo(scid), queryroutes via daemon `/graph/info`, `/graph/node`,
+      `/graph/channel`, `/graph/describe` (paged), `/route/query` + CLI
+      `graph`/`route query` commands (library `getGraph()` already existed).
+- [~] Expose `sendPaymentToRoute` (this PR, same branch): daemon
+      `/payment/send-to-route` + CLI `payment send-to-route`, composing with
+      `/route/query` output.
 - [ ] option_wumbo: advertise LARGE_CHANNELS, lift the 2^24 sat funding cap behind a
       config flag (`validation.ts:91-93`, MAX_FUNDING_SATOSHIS in types.ts).
 - [ ] Connect by node id alone: resolve dial address from gossip node_announcement
@@ -210,3 +213,6 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): forwarding history merged as PR #43. M3 continued: graph query
+  surface (graph info/node/channel/describe + route query) and sendPaymentToRoute
+  exposure, one branch/PR for both since send-to-route consumes route-query output.

@@ -325,6 +325,87 @@ export interface RouteEstimate {
 	cltvDelta: number;
 }
 
+export interface GraphInfo {
+	nodeCount: number;
+	channelCount: number;
+	/** Epoch ms of the last gossip/RGS sync completed this session, if any */
+	lastSyncAt?: number;
+}
+
+/** One direction's routing policy from a channel_update. */
+export interface GraphChannelPolicy {
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	cltvExpiryDelta: number;
+	/** Msat values as decimal strings (bigint in the library) */
+	htlcMinimumMsat: string;
+	htlcMaximumMsat?: string;
+	disabled: boolean;
+	/** channel_update timestamp (seconds since epoch) */
+	lastUpdate: number;
+}
+
+export interface GraphChannelInfo {
+	/** Human-readable SCID: "<block>x<txIndex>x<outputIndex>" */
+	shortChannelId: string;
+	node1Pubkey: string;
+	node2Pubkey: string;
+	/**
+	 * Capacity is not gossiped in channel_announcement; when either direction
+	 * advertises htlc_maximum_msat this is the larger of the two as sats.
+	 */
+	capacitySats?: number;
+	/** Policy for the node1 -> node2 direction (channel_update direction 0) */
+	node1Policy?: GraphChannelPolicy;
+	/** Policy for the node2 -> node1 direction (channel_update direction 1) */
+	node2Policy?: GraphChannelPolicy;
+}
+
+export interface GraphNodeInfo {
+	pubkey: string;
+	alias?: string;
+	/** RGB color from node_announcement as hex (e.g. "ff9900") */
+	color?: string;
+	addresses?: Array<{ type: number; host: string; port: number }>;
+	featuresHex?: string;
+	/** node_announcement timestamp (seconds since epoch) */
+	lastUpdate?: number;
+	channelCount: number;
+	/** SCIDs of the node's known channels, "<block>x<txIndex>x<outputIndex>" */
+	channels: string[];
+}
+
+export interface GraphDescribeResult {
+	totalChannels: number;
+	limit: number;
+	offset: number;
+	channels: GraphChannelInfo[];
+}
+
+export interface RouteHop {
+	pubkey: string;
+	/** "<block>x<txIndex>x<outputIndex>" (16-char hex also accepted on input) */
+	shortChannelId: string;
+	/** Msat as decimal string (bigint in the library) */
+	amountToForwardMsat: string;
+	/** RELATIVE CLTV delta from pathfinding (absolute height added at send) */
+	outgoingCltvValue: number;
+	/** Fee this hop charges for forwarding, msat as decimal string (0 on final) */
+	feeMsat: string;
+	cltvExpiryDelta: number;
+}
+
+export interface RouteQueryResult {
+	destination: string;
+	amountSats: number;
+	hops: RouteHop[];
+	/** Msat as decimal strings (bigint in the library) */
+	totalAmountMsat: string;
+	totalFeeMsat: string;
+	totalCltvDelta: number;
+	finalCltvExpiry: number;
+}
+
 export interface NodeStats {
 	totalPaymentsSent: number;
 	totalPaymentsReceived: number;
