@@ -42,9 +42,20 @@ import {
 	DEFAULT_RGS_URL
 } from '../lightning/gossip/rapid-sync';
 import { parseAnnouncedAddress } from '../lightning/gossip/messages';
-import { INodeAddress } from '../lightning/gossip/types';
+import {
+	INodeAddress,
+	IGraphChannel,
+	IChannelUpdateMessage,
+	IRoute,
+	CHANNEL_FLAG_DISABLED,
+	encodeShortChannelId,
+	decodeShortChannelId
+} from '../lightning/gossip/types';
 import { ElectrumBackend } from '../lightning/chain/electrum-backend';
-import { Network } from '../lightning/invoice/types';
+import {
+	Network,
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY
+} from '../lightning/invoice/types';
 import { LnCoinType } from '../lightning/keys/wallet-keys';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -99,7 +110,14 @@ import {
 	PaymentValidation,
 	PaymentValidationCheck,
 	PaymentValidationStatus,
-	ChannelPolicyInfo
+	ChannelPolicyInfo,
+	GraphInfo,
+	GraphChannelInfo,
+	GraphChannelPolicy,
+	GraphNodeInfo,
+	GraphDescribeResult,
+	RouteHop,
+	RouteQueryResult
 } from './types';
 
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
@@ -229,6 +247,99 @@ export function defaultDataDirForMnemonic(
 	return path.join(baseDir, walletTag);
 }
 
+/** Format an 8-byte SCID buffer as "<block>x<txIndex>x<outputIndex>". */
+export function formatScid(scid: Buffer): string {
+	const { block, txIndex, outputIndex } = decodeShortChannelId(scid);
+	return `${block}x${txIndex}x${outputIndex}`;
+}
+
+/**
+ * Parse an SCID from "<block>x<txIndex>x<outputIndex>" or 16-char hex into the
+ * 8-byte wire buffer. Throws BeignetError INVALID_PARAMS on malformed input.
+ */
+export function parseScid(scid: string): Buffer {
+	const human = scid.match(/^(\d+)x(\d+)x(\d+)$/);
+	if (human) {
+		return encodeShortChannelId({
+			block: parseInt(human[1], 10),
+			txIndex: parseInt(human[2], 10),
+			outputIndex: parseInt(human[3], 10)
+		});
+	}
+	if (/^[0-9a-fA-F]{16}$/.test(scid)) {
+		return Buffer.from(scid, 'hex');
+	}
+	throw new BeignetError(
+		BeignetErrorCode.INVALID_PARAMS,
+		`Invalid short channel id: ${scid} (expected <block>x<txIndex>x<output> or 16-char hex)`
+	);
+}
+
+/** Convert pathfinding route hops to the JSON shape used by the daemon/CLI. */
+export function routeHopsToJson(route: IRoute): RouteHop[] {
+	return route.hops.map((hop, idx) => {
+		// A hop's fee = what it receives minus what it forwards; the final hop
+		// forwards nothing so its fee is 0.
+		const feeMsat =
+			idx < route.hops.length - 1
+				? hop.amountToForwardMsat - route.hops[idx + 1].amountToForwardMsat
+				: 0n;
+		return {
+			pubkey: hop.pubkey.toString('hex'),
+			shortChannelId: formatScid(hop.shortChannelId),
+			amountToForwardMsat: hop.amountToForwardMsat.toString(),
+			outgoingCltvValue: hop.outgoingCltvValue,
+			feeMsat: feeMsat.toString(),
+			cltvExpiryDelta: hop.cltvExpiryDelta
+		};
+	});
+}
+
+/** Convert JSON route hops back to the shape sendPaymentToRoute expects. */
+export function jsonToRouteHops(hops: RouteHop[]): Array<{
+	pubkey: Buffer;
+	shortChannelId: Buffer;
+	amountToForwardMsat: bigint;
+	outgoingCltvValue: number;
+}> {
+	return hops.map((hop, idx) => {
+		if (!hop.pubkey || !/^[0-9a-fA-F]{66}$/.test(hop.pubkey)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Route hop ${idx}: pubkey must be a 33-byte hex string`
+			);
+		}
+		let amountToForwardMsat: bigint;
+		try {
+			amountToForwardMsat = BigInt(hop.amountToForwardMsat);
+		} catch {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Route hop ${idx}: amountToForwardMsat must be a decimal string`
+			);
+		}
+		if (
+			typeof hop.outgoingCltvValue !== 'number' ||
+			!Number.isInteger(hop.outgoingCltvValue) ||
+			hop.outgoingCltvValue < 0
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Route hop ${idx}: outgoingCltvValue must be a non-negative integer`
+			);
+		}
+		return {
+			pubkey: Buffer.from(hop.pubkey, 'hex'),
+			shortChannelId: parseScid(hop.shortChannelId),
+			amountToForwardMsat,
+			outgoingCltvValue: hop.outgoingCltvValue
+		};
+	});
+}
+
+/** Hard page-size cap for GET /graph/describe (the graph can be huge). */
+const GRAPH_DESCRIBE_MAX_LIMIT = 500;
+
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
@@ -328,6 +439,8 @@ export class BeignetNode extends EventEmitter {
 	private _maxPaymentSats?: number;
 	private _draining = false;
 	private peerStorageEnabled = true;
+	/** Epoch ms of the last gossip/RGS sync completed this session. */
+	private _lastGraphSyncAt?: number;
 	/** Newest VALID SCB a peer returned via peer storage (never auto-restored). */
 	private _peerRetrievedScb: {
 		encoded: string;
@@ -1218,6 +1331,7 @@ export class BeignetNode extends EventEmitter {
 				});
 			}
 		}
+		if (synced.length > 0) this._lastGraphSyncAt = Date.now();
 		return synced;
 	}
 
@@ -1238,6 +1352,7 @@ export class BeignetNode extends EventEmitter {
 		this.log('info', 'Rapid gossip sync: downloading snapshot', { url });
 		const data = await fetchRapidGossipSnapshot(url);
 		const result = this.node.loadRapidGossipSnapshot(data);
+		this._lastGraphSyncAt = Date.now();
 		this.log('info', 'Rapid gossip sync complete', {
 			channelsAdded: result.channelsAdded,
 			updatesApplied: result.updatesApplied,
@@ -3153,6 +3268,228 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number
 	): { success: boolean; feeSats?: number; hops?: number } {
 		return this.node.probeRoute(destination, amountSats);
+	}
+
+	// ─────────────── Graph Queries ───────────────
+
+	getGraphInfo(): GraphInfo {
+		const graph = this.node.getGraph();
+		const info: GraphInfo = {
+			nodeCount: graph.getNodeCount(),
+			channelCount: graph.getChannelCount()
+		};
+		if (this._lastGraphSyncAt !== undefined) {
+			info.lastSyncAt = this._lastGraphSyncAt;
+		}
+		return info;
+	}
+
+	getGraphNode(pubkey: string): GraphNodeInfo | null {
+		if (!/^[0-9a-fA-F]{66}$/.test(pubkey)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'pubkey must be a 33-byte hex string'
+			);
+		}
+		const graph = this.node.getGraph();
+		const node = graph.getNode(Buffer.from(pubkey, 'hex'));
+		if (!node) return null;
+		const info: GraphNodeInfo = {
+			pubkey: node.nodeId.toString('hex'),
+			channelCount: node.channels.size,
+			channels: graph
+				.getNodeChannels(node.nodeId)
+				.map((ch) => formatScid(ch.shortChannelId))
+		};
+		const ann = node.announcement;
+		if (ann) {
+			// alias is a fixed 32-byte field, zero-padded on the wire
+			const alias = ann.alias
+				.subarray(0, ann.alias.indexOf(0) === -1 ? 32 : ann.alias.indexOf(0))
+				.toString('utf8');
+			if (alias.length > 0) info.alias = alias;
+			info.color = ann.rgbColor.toString('hex');
+			info.addresses = ann.addresses.map((a) => ({
+				type: a.type,
+				host: a.host,
+				port: a.port
+			}));
+			info.featuresHex = ann.features.toString('hex');
+			info.lastUpdate = ann.timestamp;
+		}
+		return info;
+	}
+
+	getGraphChannel(scid: string): GraphChannelInfo | null {
+		const scidBuf = parseScid(scid);
+		const channel = this.node.getGraph().getChannel(scidBuf);
+		if (!channel) return null;
+		return this.toGraphChannelInfo(channel);
+	}
+
+	/** Paged dump of known graph channels (limit is capped at 500). */
+	describeGraph(limit?: number, offset?: number): GraphDescribeResult {
+		const cappedLimit = Math.min(
+			Math.max(1, Math.floor(limit ?? GRAPH_DESCRIBE_MAX_LIMIT)),
+			GRAPH_DESCRIBE_MAX_LIMIT
+		);
+		const safeOffset = Math.max(0, Math.floor(offset ?? 0));
+		const all = this.node.getGraph().getAllChannels();
+		return {
+			totalChannels: all.length,
+			limit: cappedLimit,
+			offset: safeOffset,
+			channels: all
+				.slice(safeOffset, safeOffset + cappedLimit)
+				.map((ch) => this.toGraphChannelInfo(ch))
+		};
+	}
+
+	private toGraphChannelInfo(channel: IGraphChannel): GraphChannelInfo {
+		const info: GraphChannelInfo = {
+			shortChannelId: formatScid(channel.shortChannelId),
+			node1Pubkey: channel.nodeId1.toString('hex'),
+			node2Pubkey: channel.nodeId2.toString('hex')
+		};
+		// Capacity is not gossiped; the larger advertised htlc_maximum_msat is
+		// the best known lower bound.
+		const max1 = channel.update1?.htlcMaximumMsat;
+		const max2 = channel.update2?.htlcMaximumMsat;
+		const best = (max1 ?? 0n) > (max2 ?? 0n) ? max1 : max2;
+		if (best !== undefined) info.capacitySats = Number(best / 1000n);
+		if (channel.update1) {
+			info.node1Policy = this.toGraphChannelPolicy(channel.update1);
+		}
+		if (channel.update2) {
+			info.node2Policy = this.toGraphChannelPolicy(channel.update2);
+		}
+		return info;
+	}
+
+	private toGraphChannelPolicy(
+		update: IChannelUpdateMessage
+	): GraphChannelPolicy {
+		const policy: GraphChannelPolicy = {
+			feeBaseMsat: update.feeBaseMsat,
+			feeProportionalMillionths: update.feeProportionalMillionths,
+			cltvExpiryDelta: update.cltvExpiryDelta,
+			htlcMinimumMsat: update.htlcMinimumMsat.toString(),
+			disabled: (update.channelFlags & CHANNEL_FLAG_DISABLED) !== 0,
+			lastUpdate: update.timestamp
+		};
+		if (update.htlcMaximumMsat !== undefined) {
+			policy.htlcMaximumMsat = update.htlcMaximumMsat.toString();
+		}
+		return policy;
+	}
+
+	/**
+	 * Compute a route to a destination WITHOUT sending. The returned hops mirror
+	 * the shape POST /payment/send-to-route accepts, so the two compose.
+	 */
+	queryRoute(
+		destination: string,
+		amountSats: number,
+		maxFeeSats?: number
+	): RouteQueryResult {
+		if (!/^[0-9a-fA-F]{66}$/.test(destination)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'destination must be a 33-byte hex string'
+			);
+		}
+		if (!Number.isInteger(amountSats) || amountSats <= 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'amountSats must be a positive integer'
+			);
+		}
+		const amountMsat = BigInt(amountSats) * 1000n;
+		const route = this.node.queryRoute(
+			Buffer.from(destination, 'hex'),
+			amountMsat,
+			DEFAULT_MIN_FINAL_CLTV_EXPIRY
+		);
+		if (!route) {
+			throw new BeignetError(
+				BeignetErrorCode.NO_ROUTE,
+				'No route found to destination'
+			);
+		}
+		if (
+			maxFeeSats !== undefined &&
+			route.totalFeeMsat > BigInt(maxFeeSats) * 1000n
+		) {
+			throw new BeignetError(
+				'FEE_EXCEEDS_MAX',
+				`Route fee ${route.totalFeeMsat} msat exceeds maximum ${maxFeeSats} sats`
+			);
+		}
+		return {
+			destination,
+			amountSats,
+			hops: routeHopsToJson(route),
+			totalAmountMsat: route.totalAmountMsat.toString(),
+			totalFeeMsat: route.totalFeeMsat.toString(),
+			totalCltvDelta: route.totalCltvDelta,
+			finalCltvExpiry: DEFAULT_MIN_FINAL_CLTV_EXPIRY
+		};
+	}
+
+	/**
+	 * Send a payment along an explicit route (from queryRoute / POST
+	 * /route/query). paymentSecret is required by most modern invoices.
+	 */
+	sendToRoute(
+		paymentHash: string,
+		route: { hops: RouteHop[] },
+		paymentSecret?: string
+	): PaymentInfo {
+		if (!/^[0-9a-fA-F]{64}$/.test(paymentHash)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'paymentHash must be a 32-byte hex string'
+			);
+		}
+		if (!route || !Array.isArray(route.hops) || route.hops.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'route.hops must be a non-empty array'
+			);
+		}
+		if (
+			paymentSecret !== undefined &&
+			!/^[0-9a-fA-F]{64}$/.test(paymentSecret)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'paymentSecret must be a 32-byte hex string'
+			);
+		}
+		this._checkDraining();
+		const hops = jsonToRouteHops(route.hops);
+		const finalHop = hops[hops.length - 1];
+		try {
+			const payment = this.node.sendPaymentToRoute(
+				{ hops },
+				Buffer.from(paymentHash, 'hex'),
+				finalHop.outgoingCltvValue,
+				paymentSecret ? Buffer.from(paymentSecret, 'hex') : undefined,
+				finalHop.amountToForwardMsat
+			);
+			return this.toPaymentInfo(payment);
+		} catch (err) {
+			if (err instanceof BeignetError) throw err;
+			// Surface library payment errors (NO_CHANNEL_TO_HOP, ...) by code
+			const code =
+				err !== null && typeof err === 'object' && 'code' in err
+					? String((err as { code: unknown }).code)
+					: 'PAYMENT_FAILED';
+			throw new BeignetError(
+				code,
+				err instanceof Error ? err.message : String(err)
+			);
+		}
 	}
 
 	// ─────────────── Channel Readiness Helpers ───────────────

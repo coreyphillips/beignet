@@ -869,6 +869,161 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'Probe result' } }
 				}
 			},
+			'/graph/info': {
+				get: {
+					summary: 'Network graph summary (node/channel counts, last sync)',
+					tags: ['Graph'],
+					responses: {
+						'200': {
+							description: 'Graph summary',
+							content: jsonContent({ $ref: '#/components/schemas/GraphInfo' })
+						}
+					}
+				}
+			},
+			'/graph/node': {
+				get: {
+					summary:
+						'Node announcement info (alias, addresses, features) + its known channels',
+					tags: ['Graph'],
+					parameters: [
+						{
+							name: 'pubkey',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description: '33-byte node public key (hex)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Graph node info',
+							content: jsonContent({
+								$ref: '#/components/schemas/GraphNodeInfo'
+							})
+						},
+						'404': { description: 'Node not found in graph' }
+					}
+				}
+			},
+			'/graph/channel': {
+				get: {
+					summary:
+						'Channel info from gossip: endpoints, capacity and both directions of routing policy',
+					tags: ['Graph'],
+					parameters: [
+						{
+							name: 'scid',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description:
+								'Short channel id as <block>x<txIndex>x<output> or 16-char hex'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Graph channel info',
+							content: jsonContent({
+								$ref: '#/components/schemas/GraphChannelInfo'
+							})
+						},
+						'404': { description: 'Channel not found in graph' }
+					}
+				}
+			},
+			'/graph/describe': {
+				get: {
+					summary:
+						'Paged dump of known graph channels (limit defaults to 500 and is capped at 500)',
+					tags: ['Graph'],
+					parameters: [
+						{ name: 'limit', in: 'query', schema: { type: 'integer' } },
+						{ name: 'offset', in: 'query', schema: { type: 'integer' } }
+					],
+					responses: {
+						'200': {
+							description: 'Paged channel dump with totalChannels/limit/offset',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									totalChannels: { type: 'integer' },
+									limit: { type: 'integer' },
+									offset: { type: 'integer' },
+									channels: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/GraphChannelInfo' }
+									}
+								}
+							})
+						}
+					}
+				}
+			},
+			'/route/query': {
+				post: {
+					summary:
+						'Compute a route to a destination WITHOUT sending; hops feed /payment/send-to-route',
+					tags: ['Routing'],
+					requestBody: bodyContent({
+						destination: 'string',
+						amountSats: 'number',
+						maxFeeSats: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Route with per-hop fees and totals',
+							content: jsonContent({
+								$ref: '#/components/schemas/RouteQueryResult'
+							})
+						},
+						'400': { description: 'No route or fee exceeds maximum' }
+					}
+				}
+			},
+			'/payment/send-to-route': {
+				post: {
+					summary:
+						'Send a payment along an explicit route (hops from POST /route/query)',
+					tags: ['Payments'],
+					requestBody: {
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										paymentHash: { type: 'string' },
+										route: {
+											type: 'object',
+											properties: {
+												hops: {
+													type: 'array',
+													items: { $ref: '#/components/schemas/RouteHop' }
+												}
+											},
+											required: ['hops']
+										},
+										paymentSecret: {
+											type: 'string',
+											description:
+												'Invoice payment_secret (required by most modern invoices)'
+										}
+									},
+									required: ['paymentHash', 'route']
+								}
+							}
+						}
+					},
+					responses: {
+						'200': {
+							description: 'Payment info',
+							content: jsonContent({
+								$ref: '#/components/schemas/PaymentInfo'
+							})
+						}
+					}
+				}
+			},
 			'/backup': {
 				post: {
 					summary: 'Create database backup',
@@ -1907,6 +2062,134 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						feeSats: { type: 'integer' },
 						hops: { type: 'integer' },
 						cltvDelta: { type: 'integer' }
+					}
+				},
+				GraphInfo: {
+					type: 'object',
+					properties: {
+						nodeCount: { type: 'integer' },
+						channelCount: { type: 'integer' },
+						lastSyncAt: {
+							type: 'integer',
+							description:
+								'Epoch ms of the last gossip/RGS sync this session, if any'
+						}
+					}
+				},
+				GraphChannelPolicy: {
+					type: 'object',
+					description: "One direction's routing policy from a channel_update",
+					properties: {
+						feeBaseMsat: { type: 'integer' },
+						feeProportionalMillionths: { type: 'integer' },
+						cltvExpiryDelta: { type: 'integer' },
+						htlcMinimumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						htlcMaximumMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						disabled: { type: 'boolean' },
+						lastUpdate: {
+							type: 'integer',
+							description: 'channel_update timestamp (seconds)'
+						}
+					}
+				},
+				GraphChannelInfo: {
+					type: 'object',
+					properties: {
+						shortChannelId: {
+							type: 'string',
+							description: '<block>x<txIndex>x<outputIndex>'
+						},
+						node1Pubkey: { type: 'string' },
+						node2Pubkey: { type: 'string' },
+						capacitySats: {
+							type: 'integer',
+							description:
+								'Best-known lower bound from htlc_maximum_msat (capacity is not gossiped)'
+						},
+						node1Policy: {
+							$ref: '#/components/schemas/GraphChannelPolicy'
+						},
+						node2Policy: {
+							$ref: '#/components/schemas/GraphChannelPolicy'
+						}
+					}
+				},
+				GraphNodeInfo: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						alias: { type: 'string' },
+						color: { type: 'string' },
+						addresses: {
+							type: 'array',
+							items: {
+								type: 'object',
+								properties: {
+									type: { type: 'integer' },
+									host: { type: 'string' },
+									port: { type: 'integer' }
+								}
+							}
+						},
+						featuresHex: { type: 'string' },
+						lastUpdate: {
+							type: 'integer',
+							description: 'node_announcement timestamp (seconds)'
+						},
+						channelCount: { type: 'integer' },
+						channels: { type: 'array', items: { type: 'string' } }
+					}
+				},
+				RouteHop: {
+					type: 'object',
+					properties: {
+						pubkey: { type: 'string' },
+						shortChannelId: {
+							type: 'string',
+							description:
+								'<block>x<txIndex>x<outputIndex> (16-char hex also accepted on input)'
+						},
+						amountToForwardMsat: {
+							type: 'string',
+							description: 'Msat as decimal string'
+						},
+						outgoingCltvValue: {
+							type: 'integer',
+							description:
+								'RELATIVE CLTV delta from pathfinding (absolute height added at send)'
+						},
+						feeMsat: {
+							type: 'string',
+							description: 'Fee this hop charges, msat as decimal string'
+						},
+						cltvExpiryDelta: { type: 'integer' }
+					},
+					required: [
+						'pubkey',
+						'shortChannelId',
+						'amountToForwardMsat',
+						'outgoingCltvValue'
+					]
+				},
+				RouteQueryResult: {
+					type: 'object',
+					properties: {
+						destination: { type: 'string' },
+						amountSats: { type: 'integer' },
+						hops: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/RouteHop' }
+						},
+						totalAmountMsat: { type: 'string' },
+						totalFeeMsat: { type: 'string' },
+						totalCltvDelta: { type: 'integer' },
+						finalCltvExpiry: { type: 'integer' }
 					}
 				},
 				TxInfo: {

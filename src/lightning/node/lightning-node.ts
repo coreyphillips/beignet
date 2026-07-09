@@ -46,7 +46,8 @@ import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage,
-	INodeAddress
+	INodeAddress,
+	IRoute
 } from '../gossip/types';
 import {
 	decodeChannelAnnouncementMessage,
@@ -6904,6 +6905,33 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return { success: false };
 		}
+	}
+
+	/**
+	 * Compute a route to a destination via the network graph WITHOUT sending a
+	 * payment or mutating MissionControl. Returns the raw pathfinding route
+	 * (relative CLTV deltas, bigint msat amounts) or null if no path exists.
+	 */
+	queryRoute(
+		destination: Buffer,
+		amountMsat: bigint,
+		finalCltvExpiry: number = DEFAULT_MIN_FINAL_CLTV_EXPIRY
+	): IRoute | null {
+		const sourceBuf = Buffer.from(this.nodeId, 'hex');
+		return findRoute(
+			this.graph,
+			sourceBuf,
+			destination,
+			amountMsat,
+			finalCltvExpiry,
+			undefined,
+			undefined,
+			this.missionControl,
+			undefined, // maxCltvExpiry
+			undefined, // routingHints
+			undefined, // currentTimestamp
+			this.getLocalChannelEdges()
+		);
 	}
 
 	// ─────────────── Message Handling (testing support) ───────────────

@@ -159,6 +159,10 @@ async function main(): Promise<void> {
 			return handlePayment();
 		case 'forwards':
 			return handleForwards();
+		case 'graph':
+			return handleGraph();
+		case 'route':
+			return handleRoute();
 		case 'bootstrap':
 			return handleBootstrap();
 		case 'trusted-peer':
@@ -565,12 +569,156 @@ async function handlePayment(): Promise<void> {
 					`/payment?paymentHash=${encodeURIComponent(filteredArgs[2] || '')}`
 				)
 			);
+		case 'send-to-route': {
+			// Route comes from `beignet route query`: inline JSON or a file path.
+			const paymentHash = filteredArgs[2];
+			const routeArg = filteredArgs[3];
+			if (!paymentHash || !routeArg) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet payment send-to-route <paymentHash> <routeJson|routeFile> [--payment-secret <hex>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			let routeStr = routeArg;
+			if (!routeArg.trimStart().startsWith('{')) {
+				try {
+					routeStr = fs.readFileSync(routeArg, 'utf8');
+				} catch (err: unknown) {
+					output({
+						ok: false,
+						error: {
+							code: 'INVALID_PARAMS',
+							message: `Cannot read route file: ${(err as Error).message}`
+						}
+					});
+					process.exitCode = 1;
+					return;
+				}
+			}
+			let route: { hops?: unknown };
+			try {
+				route = JSON.parse(routeStr);
+			} catch {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Route is not valid JSON'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			// Accept the full `route query` result (it has hops) or { hops: [...] }
+			const result =
+				route && typeof route === 'object' && 'result' in route
+					? (route as { result: { hops?: unknown } }).result
+					: route;
+			return outputResult(
+				await httpRequest('POST', '/payment/send-to-route', {
+					paymentHash,
+					route: { hops: result.hops },
+					paymentSecret: parseFlag('--payment-secret')
+				})
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet payment [list|get]'
+					message: 'Usage: beignet payment [list|get|send-to-route]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleGraph(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'info':
+			return outputResult(await httpRequest('GET', '/graph/info'));
+		case 'node':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/graph/node?pubkey=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'channel':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/graph/channel?scid=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
+		case 'describe': {
+			const params = new URLSearchParams();
+			const limit = parseFlag('--limit');
+			if (limit !== undefined) params.set('limit', limit);
+			const offset = parseFlag('--offset');
+			if (offset !== undefined) params.set('offset', offset);
+			const qs = params.toString();
+			return outputResult(
+				await httpRequest(
+					'GET',
+					qs ? `/graph/describe?${qs}` : '/graph/describe'
+				)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet graph [info|node <pubkey>|channel <scid>|describe [--limit N] [--offset N]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleRoute(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'query': {
+			const destination = filteredArgs[2];
+			const sats = filteredArgs[3];
+			if (!destination || !sats) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet route query <destination> <sats> [--max-fee <sats>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const maxFee = parseFlag('--max-fee');
+			return outputResult(
+				await httpRequest('POST', '/route/query', {
+					destination,
+					amountSats: parseInt(sats, 10),
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet route query <destination> <sats>'
 				}
 			});
 			process.exitCode = 1;
@@ -950,6 +1098,18 @@ Invoices & Payments:
   invoice list                           List created invoices
   payment list                           List payments
   payment get <hash>                     Payment details
+  payment send-to-route <hash> <route>   Pay along an explicit route (inline
+                                         JSON or a file with 'route query'
+                                         output) [--payment-secret <hex>]
+
+Graph Queries:
+  graph info                             Graph summary (node/channel counts)
+  graph node <pubkey>                    Node announcement info + its channels
+  graph channel <scid>                   Channel endpoints + both fee policies
+                                         (scid: <block>x<tx>x<out> or hex)
+  graph describe [--limit N] [--offset N]  Paged channel dump (default 500)
+  route query <destination> <sats>       Compute a route without paying
+                                         [--max-fee <sats>]
 
 Routing:
   forwards [--since ts] [--limit n]      List settled forwards (fees earned)

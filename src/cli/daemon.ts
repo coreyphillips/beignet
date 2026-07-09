@@ -9,7 +9,7 @@ import * as https from 'https';
 import * as fs from 'fs';
 import { BeignetNode, BeignetNodeOptions } from './beignet-node';
 import { BeignetError } from './errors';
-import { ApiResponse } from './types';
+import { ApiResponse, RouteHop } from './types';
 import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
@@ -834,6 +834,65 @@ export async function startDaemon(
 			if (!destination || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'destination and amountSats required');
 			return success(node.probeRoute(destination, amountSats));
+		},
+
+		// ── Graph Queries ──
+		'GET /graph/info': () => success(node.getGraphInfo()),
+		'GET /graph/node': (_body, query) => {
+			const pubkey = query.get('pubkey');
+			if (!pubkey) return failure('INVALID_PARAMS', 'pubkey required');
+			const info = node.getGraphNode(pubkey);
+			if (!info) return failure('NOT_FOUND', 'Node not found in graph');
+			return success(info);
+		},
+		'GET /graph/channel': (_body, query) => {
+			const scid = query.get('scid');
+			if (!scid) return failure('INVALID_PARAMS', 'scid required');
+			const info = node.getGraphChannel(scid);
+			if (!info) return failure('NOT_FOUND', 'Channel not found in graph');
+			return success(info);
+		},
+		'GET /graph/describe': (_body, query) => {
+			const limitParam = query.get('limit');
+			const offsetParam = query.get('offset');
+			let limit: number | undefined;
+			let offset: number | undefined;
+			if (limitParam !== null) {
+				limit = Number(limitParam);
+				if (!Number.isInteger(limit) || limit < 1)
+					return failure('INVALID_PARAMS', 'limit must be a positive integer');
+			}
+			if (offsetParam !== null) {
+				offset = Number(offsetParam);
+				if (!Number.isInteger(offset) || offset < 0)
+					return failure(
+						'INVALID_PARAMS',
+						'offset must be a non-negative integer'
+					);
+			}
+			return success(node.describeGraph(limit, offset));
+		},
+
+		// ── Route Query / Send-to-Route ──
+		'POST /route/query': (body) => {
+			const { destination, amountSats, maxFeeSats } = body as {
+				destination: string;
+				amountSats: number;
+				maxFeeSats?: number;
+			};
+			if (!destination || amountSats === undefined)
+				return failure('INVALID_PARAMS', 'destination and amountSats required');
+			return success(node.queryRoute(destination, amountSats, maxFeeSats));
+		},
+		'POST /payment/send-to-route': (body) => {
+			const { paymentHash, route, paymentSecret } = body as {
+				paymentHash: string;
+				route: { hops: RouteHop[] };
+				paymentSecret?: string;
+			};
+			if (!paymentHash || !route)
+				return failure('INVALID_PARAMS', 'paymentHash and route required');
+			return success(node.sendToRoute(paymentHash, route, paymentSecret));
 		},
 
 		// ── Database Backup ──
