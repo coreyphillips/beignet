@@ -226,6 +226,43 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/watchtowers': {
+				get: {
+					summary:
+						'List configured watchtowers with per-tower session + backlog health',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Watchtower health',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									towers: {
+										type: 'array',
+										items: { $ref: '#/components/schemas/WatchtowerInfo' }
+									}
+								}
+							})
+						}
+					}
+				}
+			},
+			'/watchtower/add': {
+				post: {
+					summary: 'Add a watchtower (pubkey@host:port, LND altruist tower)',
+					tags: ['Node'],
+					requestBody: bodyContent({ uri: 'string' }),
+					responses: { '200': { description: 'Tower added' } }
+				}
+			},
+			'/watchtower/remove': {
+				delete: {
+					summary: 'Remove a watchtower and drop its sessions + backlog',
+					tags: ['Node'],
+					requestBody: bodyContent({ uri: 'string' }),
+					responses: { '200': { description: 'Tower removed' } }
+				}
+			},
 			'/invoices': {
 				get: {
 					summary: 'List created invoices',
@@ -2131,6 +2168,17 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						count: { type: 'integer' },
 						volumeOutMsat: { type: 'string' },
 						feesEarnedMsat: { type: 'string' }
+					}
+				},
+				WatchtowerInfo: {
+					type: 'object',
+					properties: {
+						uri: { type: 'string' },
+						pubkey: { type: 'string' },
+						connected: { type: 'boolean' },
+						sessions: { type: 'integer' },
+						pendingBacklog: { type: 'integer' },
+						lastAck: { type: 'integer', nullable: true }
 					}
 				},
 				HealthInfo: {

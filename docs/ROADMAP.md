@@ -63,12 +63,14 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M2. Watchtower
 
-- [ ] Watchtower client: encrypt and ship justice/penalty data per revoked state to a
-      remote tower (LND altruist-tower wire protocol or a minimal custom protocol;
-      decide at design time). Retry queue, tower health tracking.
+- [~] Watchtower client (this PR): LND altruist wtwire protocol (public-tower
+      interop), XChaCha20-Poly1305 v0 justice blobs shipped at every revocation,
+      per-session Noise keys, persisted sessions + un-acked backlog with retry,
+      config watchtowers[] URIs. Deferred + documented: anchor to_remote and
+      taproot (v1 blob) coverage, reward sessions.
 - [?] Watchtower server mode (lower priority; decide whether beignet should offer it).
-- [ ] Document the single-process online-requirement for penalty enforcement until the
-      tower client ships (`chain-monitor.ts` justice path).
+- [x] Document the single-process online-requirement (this PR: README limitations
+      table updated alongside the tower client).
 
 ## M3. Routing-node operations
 
@@ -107,7 +109,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M4. Daemon / CLI surface gaps (library has it, surface does not)
 
-- [~] Hold invoices end to end (this PR): createHoldInvoice (caller-supplied hash),
+- [x] Hold invoices end to end (PR #47, merged): createHoldInvoice (caller-supplied hash),
       settleHoldInvoice, cancelHoldInvoice (works pre-accept, restart-safe),
       listHoldInvoices; CLTV auto-cancel respected and the near-expiry claim
       backstop no longer force-closes on parked holds with unrevealed preimages.
@@ -120,11 +122,11 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       a small TStorage adapter over the encrypted SQLite (or createEncryptedStorage
       from PR #41) wired into beignet-node.ts. Correctness is unaffected today; this
       buys fast boots, less Electrum chatter, and durable metadata.
-- [~] sign/verify message with the node key (this PR): LND-compatible construction
+- [x] sign/verify message with the node key (PR #47, merged): LND-compatible construction
       (prefix, double-SHA256, compact recoverable ECDSA, zbase32); live lncli
       cross-check noted as an interop follow-up.
 - [ ] Onchain message signing (BIP322 plus legacy fallback) in the wallet layer.
-- [~] Expose existing methods with no route (this PR): syncGossip, syncRapidGossip,
+- [x] Expose existing methods with no route (PR #47, merged): syncGossip, syncRapidGossip,
       getChannelDiagnostics, validateAddress, recoverFallbackFunds, triggerBackup
       all routed + CLI.
 - [ ] CLI parity sweep: wrap the ~25 daemon endpoints with no CLI command (keysend,
@@ -224,6 +226,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): PR #47 merged (M4 batch 1). Watchtower client (this PR)
+  lands the M2 core.
 - 2026-07-09 (cont.): PR #46 merged, M3 complete. M2 watchtower client prioritized
   (in progress, parallel) per Corey; M4 batch 1 (this PR): hold invoices,
   sign/verifymessage, unrouted-method exposure.

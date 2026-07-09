@@ -214,6 +214,11 @@ export interface BeignetNodeOptions {
 	 */
 	announceAddresses?: string[];
 	/**
+	 * Watchtowers to ship encrypted justice data to at every revocation, as
+	 * "pubkey@host:port" URIs (LND altruist wtwire protocol). Off when empty.
+	 */
+	watchtowers?: string[];
+	/**
 	 * Encrypt the SQLite database at rest with a key derived from the wallet
 	 * seed (default true). An existing plaintext database is migrated in place
 	 * on first open; restoring a backup requires the same mnemonic. Set false
@@ -763,7 +768,8 @@ export class BeignetNode extends EventEmitter {
 			socks5Proxy,
 			peerStorageEnabled: this.peerStorageEnabled,
 			autoRebalance: opts.autoRebalance,
-			autoTuneFees: opts.autoTuneFees
+			autoTuneFees: opts.autoTuneFees,
+			watchtowers: opts.watchtowers
 		});
 
 		// If the wallet sweep address couldn't be resolved yet (e.g. Electrum was
@@ -2723,6 +2729,21 @@ export class BeignetNode extends EventEmitter {
 			volumeOutMsat: summary.volumeOutMsat.toString(),
 			feesEarnedMsat: summary.feesEarnedMsat.toString()
 		};
+	}
+
+	/** Per-tower watchtower health (LND altruist client). */
+	listWatchtowers(): ReturnType<LightningNode['getWatchtowers']> {
+		return this.node.getWatchtowers();
+	}
+
+	/** Add a watchtower by `pubkey@host:port` URI. */
+	addWatchtower(uri: string): void {
+		this.node.addWatchtower(uri);
+	}
+
+	/** Remove a watchtower and drop its persisted sessions + backlog. */
+	removeWatchtower(uri: string): void {
+		this.node.removeWatchtower(uri);
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {

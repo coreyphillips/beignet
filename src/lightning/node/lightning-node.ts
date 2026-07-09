@@ -186,6 +186,12 @@ import {
 import { ChainMonitor } from '../chain/chain-monitor';
 import { ElectrumBackend } from '../chain/electrum-backend';
 import {
+	WatchtowerClient,
+	IWatchtowerStore,
+	IJusticeContext,
+	chainHashForNetwork
+} from '../watchtower';
+import {
 	deriveLightningKeysFromMnemonic,
 	deriveChannelKeys,
 	LnCoinType
@@ -413,6 +419,8 @@ export class LightningNode extends EventEmitter {
 	private largeChannels: boolean;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
+	// Watchtower client (LND altruist wtwire). Null when no towers configured.
+	private watchtowerClient: WatchtowerClient | null = null;
 	/** Server side: latest blob held per peer (mirrors storage when available). */
 	private peerStorageBlobs: Map<string, { blob: Buffer; receivedAt: number }> =
 		new Map();
@@ -464,6 +472,7 @@ export class LightningNode extends EventEmitter {
 		this.paymentBasepointSecret = config.paymentBasepointSecret;
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
+		this.initWatchtowerClient(config.watchtowers ?? []);
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
 		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
@@ -1062,6 +1071,21 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Setup ───────────────
 
 	private wireChannelManagerEvents(): void {
+		this.channelManager.on(
+			'watchtower:backup',
+			(
+				channelId: Buffer,
+				_peerPubkey: string,
+				perCommitmentSecret: Buffer,
+				revokedTx: Buffer
+			) => {
+				this.backupRevokedStateToTowers(
+					channelId,
+					perCommitmentSecret,
+					revokedTx
+				);
+			}
+		);
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelAliases(channelId);
 			this.persistChannel(channelId);
@@ -2129,6 +2153,108 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/** Map the node's Network enum to a bitcoinjs network object. */
+	private getBitcoinNetwork(): bitcoin.Network {
+		if (this.network === Network.MAINNET) return bitcoin.networks.bitcoin;
+		if (this.network === Network.REGTEST) return bitcoin.networks.regtest;
+		return bitcoin.networks.testnet;
+	}
+
+	/** Construct the watchtower client and wire its structured logs. */
+	private initWatchtowerClient(towers: string[]): void {
+		if (towers.length === 0) {
+			this.watchtowerClient = null;
+			return;
+		}
+		const btcNetwork = this.getBitcoinNetwork();
+		const store =
+			this.storage &&
+			typeof (this.storage as IWatchtowerStore).saveWatchtowerSession ===
+				'function'
+				? (this.storage as unknown as IWatchtowerStore)
+				: undefined;
+		this.watchtowerClient = new WatchtowerClient({
+			localPrivateKey: this.nodePrivkey,
+			chainHash: chainHashForNetwork(btcNetwork),
+			network: btcNetwork,
+			towers,
+			store,
+			socks5Proxy: this.socks5Proxy ?? undefined
+		});
+		this.watchtowerClient.on('log', (entry: Record<string, unknown>) => {
+			const event = String(entry.event ?? 'log');
+			this.emitStructuredLog('watchtower', event, entry);
+		});
+	}
+
+	/**
+	 * Assemble the justice context for a revoked remote commitment and ship it to
+	 * the towers. Combines the channel's static params with the per-channel
+	 * signing secrets and our sweep destination.
+	 */
+	private backupRevokedStateToTowers(
+		channelId: Buffer,
+		perCommitmentSecret: Buffer,
+		revokedTx: Buffer
+	): void {
+		const client = this.watchtowerClient;
+		if (!client || !client.enabled) return;
+		try {
+			const channel = this.channelManager.getChannel(channelId);
+			if (!channel) return;
+			const state = channel.getFullState();
+			if (!state.remoteBasepoints) return;
+			const perCh = this.channelManager.getMonitorSigningKeys(channelId);
+			const revocationBasepointSecret =
+				perCh?.revocationBasepointSecret ?? this.revocationBasepointSecret;
+			if (!revocationBasepointSecret) return;
+			const paymentBasepointSecret =
+				perCh?.paymentBasepointSecret ?? this.paymentBasepointSecret;
+			const btcNetwork = this.getBitcoinNetwork();
+			const ctx: IJusticeContext = {
+				channelId: channelId.toString('hex'),
+				revokedTx: bitcoin.Transaction.fromBuffer(revokedTx),
+				perCommitmentSecret,
+				revocationBasepoint: state.localBasepoints.revocationBasepoint,
+				revocationBasepointSecret,
+				remoteDelayedBasepoint: state.remoteBasepoints.delayedPaymentBasepoint,
+				toSelfDelay: state.localConfig.toSelfDelay,
+				isAnchor: isAnchorChannel(state.channelType),
+				localPaymentPubkey: state.localBasepoints.paymentBasepoint,
+				paymentBasepointSecret,
+				sweepScript: this.getSweepDestinationScript(),
+				network: btcNetwork
+			};
+			client.backupRevokedState(ctx);
+		} catch (err) {
+			this.emitStructuredLog('watchtower', 'backup_context_failed', {
+				channelId: channelId.toString('hex'),
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+	}
+
+	/** Add a watchtower at runtime (persists nothing until a session forms). */
+	addWatchtower(uri: string): void {
+		if (!this.watchtowerClient) {
+			this.initWatchtowerClient([uri]);
+			const client = this.watchtowerClient as WatchtowerClient | null;
+			void client?.start();
+			return;
+		}
+		this.watchtowerClient.addTower(uri);
+	}
+
+	/** Remove a watchtower and drop its persisted sessions + backlog. */
+	removeWatchtower(uri: string): void {
+		this.watchtowerClient?.removeTower(uri);
+	}
+
+	/** Per-tower health snapshot for GET /watchtowers. */
+	getWatchtowers(): ReturnType<WatchtowerClient['getHealth']> {
+		return this.watchtowerClient ? this.watchtowerClient.getHealth() : [];
+	}
+
 	/**
 	 * Set the wallet-owned sweep destination after construction and propagate it
 	 * to the chain watcher and all existing monitors. Lets the caller redirect
@@ -2500,6 +2626,15 @@ export class LightningNode extends EventEmitter {
 	}
 
 	async startChainWatcher(): Promise<void> {
+		// Bring up the watchtower client alongside on-chain monitoring: restore the
+		// persisted backlog and connect to towers (no-op when none configured).
+		if (this.watchtowerClient) {
+			this.watchtowerClient.start().catch((err) => {
+				this.emitStructuredLog('watchtower', 'start_failed', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			});
+		}
 		if (this.chainWatcher) {
 			this.wireChainWatcherEvents();
 			await this.chainWatcher.start();
@@ -2875,6 +3010,9 @@ export class LightningNode extends EventEmitter {
 		}
 		if (this.chainWatcher) {
 			this.chainWatcher.stop();
+		}
+		if (this.watchtowerClient) {
+			this.watchtowerClient.stop();
 		}
 		if (this.peerManager) {
 			this.peerManager.destroy();
@@ -8130,6 +8268,7 @@ export class LightningNode extends EventEmitter {
 			peerStorageEnabled?: boolean;
 			autoRebalance?: IAutoRebalanceConfig;
 			autoTuneFees?: IAutoTuneFeesConfig;
+			watchtowers?: string[];
 			channelKeyDeriver?: (
 				channelIndex: number
 			) => import('../channel/channel-manager').IPerChannelKeys;
@@ -8190,6 +8329,7 @@ export class LightningNode extends EventEmitter {
 			peerStorageEnabled: options?.peerStorageEnabled,
 			autoRebalance: options?.autoRebalance,
 			autoTuneFees: options?.autoTuneFees,
+			watchtowers: options?.watchtowers,
 			channelKeyDeriver
 		});
 	}

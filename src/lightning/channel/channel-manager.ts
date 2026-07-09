@@ -1915,6 +1915,26 @@ export class ChannelManager extends EventEmitter {
 		const actions = channel.handleRevokeAndAck(msg);
 		this.processActions(peerPubkey, channel, actions);
 
+		// Watchtower: on a clean revocation, hand the just-revoked remote
+		// commitment tx (if we cached it) to any listener so it can ship justice
+		// data to towers before the peer can broadcast the breach.
+		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
+		if (!hadError) {
+			const revokedTx = channel.takeRevokedCommitmentTx(
+				msg.perCommitmentSecret
+			);
+			const revChannelId = channel.getChannelId();
+			if (revokedTx && revChannelId) {
+				this.emit(
+					'watchtower:backup',
+					revChannelId,
+					peerPubkey,
+					msg.perCommitmentSecret,
+					revokedTx
+				);
+			}
+		}
+
 		// BOLT 2: After processing revoke_and_ack, an HTLC_FORWARDED event above may
 		// have triggered a local fulfill/fail (setting needsCommitment). Send
 		// commitment_signed to commit those updates on the remote's side.
