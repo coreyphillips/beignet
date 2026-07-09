@@ -10,28 +10,26 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M0. Docs and discrepancy quick wins (small, do first)
 
-- [~] Fix stale taproot comments claiming funding "cannot complete" (PR #32).
+- [x] Fix stale taproot comments claiming funding "cannot complete" (PR #32, merged).
       README line 520 was already accurate (experimental because the feature bit
       is staging upstream), so only the two source comments changed.
-- [~] Resolve the `/channel/update-fee` naming trap (PR #33): renamed to
+- [x] Resolve the `/channel/update-fee` naming trap (PR #33, merged): renamed to
       `/channel/update-commitment-feerate` with the old path kept as a deprecated
       alias; OpenAPI, docstrings and README clarified. Routing policy control
       itself is M3.
-- [?] Decide: dual-fund (28) and zero-conf (50) are implemented but absent from
-      `defaultFeatures()` (`lightning-node.ts:6347-6369`), so they never negotiate
-      unless the host passes custom feature flags (config.localFeatures). Current
-      gating documented in code (PR #32); Corey to confirm defaults or request
-      config toggles.
-- [~] Sweep other defined-but-never-advertised bits for intent (PR #32): each of
+- [x] DECIDED (Corey): advertise dual-fund (28) and zero-conf (50) by default
+      (PR #35, merged). Includes a trusted-peer gate rejecting a zero_conf
+      channel_type from untrusted peers on both v1 and v2 open paths.
+- [x] Sweep other defined-but-never-advertised bits for intent (PR #32, merged): each of
       LARGE_CHANNELS(18), ANCHOR_OUTPUTS(20), GOSSIP_QUERIES_EX(10),
       UPFRONT_SHUTDOWN_SCRIPT(4), OPTION_WILL_FUND(112), ROUTE_BLINDING(24),
       OPTION_TAPROOT(180/181) now documented in defaultFeatures(). Wumbo wiring
       itself is an M3 item.
-- [~] Legacy v1 `open_channel` path did not validate chain_hash (the v2 path
-      already did). Same guard added to `handleOpenChannel` + test (PR #34).
-- [~] `decodeInvoiceRequestTlv` returned a zero-buffer offerId placeholder;
+- [x] Legacy v1 `open_channel` path did not validate chain_hash (the v2 path
+      already did). Same guard added to `handleOpenChannel` + test (PR #34, merged).
+- [x] `decodeInvoiceRequestTlv` returned a zero-buffer offerId placeholder;
       now computed from the mirrored offer TLV records, and
-      `handleInvoiceRequest` reuses the decoded value + tests (PR #34).
+      `handleInvoiceRequest` reuses the decoded value + tests (PR #34, merged).
 
 ## M1. Recovery and backup (highest fund-safety impact)
 
@@ -39,15 +37,16 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       backup blob (peer pubkey, funding outpoint, basepoints/channel key index) that is
       sufficient to trigger the data-loss-protect recovery path. Export via library +
       daemon endpoint + CLI; auto-refresh on every channel open/close.
-- [ ] "We fell behind" recovery flow: on reestablish detecting our state is stale, do
-      NOT broadcast; persist the peer's per-commitment point, wait for their unilateral
-      close, sweep to_remote. Today the flow is protect-by-force-close only
-      (`channel/channel.ts:4442-4496`).
+- [~] "We fell behind" recovery flow (PR #36): reestablish proof marks the channel
+      dataLossDetected + ERRORED (persist-first), sends a BOLT 1 error, refuses all
+      local broadcasts (forceClose + stuck-channel timer), and sweeps only to_remote
+      from the peer's THEIR_FUTURE_COMMITMENT via the chain monitor.
 - [ ] Restore API: daemon endpoint + CLI command that ingests a DB backup or SCB blob
       and starts recovery (today restore is manual file placement; `POST /backup` has
       no counterpart).
-- [ ] Encryption at rest for the node SQLite DB (keys and preimages are currently
-      cleartext). SQLCipher or app-level envelope encryption keyed from the seed.
+- [~] Encryption at rest for the node SQLite DB (in progress): AES-256-GCM envelope
+      encryption of sensitive tables keyed via HKDF from the seed, default-on in
+      BeignetNode with in-place migration and an opt-out flag.
 - [ ] Onchain wallet: document that persistence encryption is delegated to the host
       TStorage, and provide an optional built-in encryption wrapper.
 - [?] Peer storage (option_provide_storage, peer_storage/your_peer_storage messages):
@@ -187,3 +186,7 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
   rename with deprecated alias), #34 (v1 open_channel chain_hash validation +
   invoice_request offerId computation). Open decision for Corey: default advertising
   of dual_fund/zero_conf, see the [?] item above.
+- 2026-07-09 (later): M0 PRs #32-#34 merged; decision made to advertise dual_fund +
+  zero_conf by default, landed as PR #35 (merged, includes untrusted-peer zero_conf
+  channel_type rejection). M1 started: PR #36 open (fell-behind DLP recovery, suite
+  3094/0); storage encryption at rest in progress in a parallel worktree.

@@ -154,6 +154,22 @@ export class ChainMonitor {
 						this._paymentPrivkey
 					);
 					break;
+				case CommitmentType.THEIR_FUTURE_COMMITMENT:
+					// Future commitment (data loss on our side): the only held sweep
+					// possible is our to_remote (anchor CSV-1) claim.
+					resolved = resolveTheirCurrentCommitmentOutputs(
+						this._channelState,
+						held.filter((o) => o.outputType === OutputType.TO_REMOTE),
+						this._destinationScript,
+						this._feeRatePerVbyte,
+						this._knownPreimages,
+						this._paymentPrivkey,
+						this._htlcBasepointSecret,
+						this._channelState.dlpRemotePerCommitmentPoint ??
+							this._channelState.remoteCurrentPerCommitmentPoint ??
+							undefined
+					);
+					break;
 				default:
 					// Penalty sweeps broadcast immediately and are never held.
 					return;
@@ -380,6 +396,9 @@ export class ChainMonitor {
 
 			case CommitmentType.THEIR_CURRENT_COMMITMENT:
 				return this._handleTheirCurrentCommitment(actions);
+
+			case CommitmentType.THEIR_FUTURE_COMMITMENT:
+				return this._handleTheirFutureCommitment(actions);
 
 			case CommitmentType.THEIR_REVOKED_COMMITMENT:
 				return this._handleRevokedCommitment(
@@ -1261,6 +1280,45 @@ export class ChainMonitor {
 	}
 
 	/**
+	 * The peer broadcast a commitment NEWER than our recorded remote state
+	 * (data loss on our side - the fell-behind reestablish path). We never saw
+	 * its per-commitment point, so HTLC scripts are unknowable and its
+	 * to_local is not ours: resolve ONLY our to_remote output. The classifier
+	 * already tracks just to_remote for a future commitment; the filter here
+	 * is defense in depth.
+	 */
+	private _handleTheirFutureCommitment(actions: ChainAction[]): ChainAction[] {
+		this._state = MonitorState.RESOLVING;
+
+		const toRemoteOutputs = this._trackedOutputs.filter(
+			(o) => o.outputType === OutputType.TO_REMOTE
+		);
+		const resolved = resolveTheirCurrentCommitmentOutputs(
+			this._channelState,
+			toRemoteOutputs,
+			this._destinationScript,
+			this._feeRatePerVbyte,
+			this._knownPreimages,
+			this._paymentPrivkey,
+			this._htlcBasepointSecret,
+			// The reestablish-supplied point (kept for legacy completeness). The
+			// to_remote spend itself derives from our static payment basepoint,
+			// but the taproot resolver refuses to run without SOME point.
+			this._channelState.dlpRemotePerCommitmentPoint ??
+				this._channelState.remoteCurrentPerCommitmentPoint ??
+				undefined
+		);
+
+		for (const r of resolved) {
+			if (r.spendTx) {
+				this._scheduleSweep(actions, r, 'to_remote claim (peer ahead)');
+			}
+		}
+
+		return actions;
+	}
+
+	/**
 	 * Re-resolve a single tracked output at a higher feerate and return the
 	 * fee-bumped, fully-signed sweep transaction (or null if it can't be rebuilt).
 	 * Handles the REBUILD_SWEEP action: without it, a sweep first broadcast at a
@@ -1298,6 +1356,23 @@ export class ChainMonitor {
 						this._paymentPrivkey,
 						this._htlcBasepointSecret,
 						this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+					);
+					break;
+				case CommitmentType.THEIR_FUTURE_COMMITMENT:
+					// Future commitment (data loss on our side): only our to_remote
+					// is ever tracked/claimable; never rebuild anything else.
+					if (output.outputType !== OutputType.TO_REMOTE) return null;
+					resolved = resolveTheirCurrentCommitmentOutputs(
+						this._channelState,
+						[output],
+						this._destinationScript,
+						feeRatePerVbyte,
+						this._knownPreimages,
+						this._paymentPrivkey,
+						this._htlcBasepointSecret,
+						this._channelState.dlpRemotePerCommitmentPoint ??
+							this._channelState.remoteCurrentPerCommitmentPoint ??
+							undefined
 					);
 					break;
 				case CommitmentType.THEIR_REVOKED_COMMITMENT: {

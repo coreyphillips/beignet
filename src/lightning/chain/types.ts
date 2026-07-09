@@ -11,6 +11,12 @@ export enum CommitmentType {
 	OUR_COMMITMENT = 'OUR_COMMITMENT',
 	THEIR_CURRENT_COMMITMENT = 'THEIR_CURRENT_COMMITMENT',
 	THEIR_REVOKED_COMMITMENT = 'THEIR_REVOKED_COMMITMENT',
+	/**
+	 * A commitment with an index beyond our recorded remote state: the peer
+	 * legitimately advanced past us (data loss on our side). We never saw its
+	 * per-commitment point, so we can only claim our to_remote output.
+	 */
+	THEIR_FUTURE_COMMITMENT = 'THEIR_FUTURE_COMMITMENT',
 	UNKNOWN = 'UNKNOWN'
 }
 

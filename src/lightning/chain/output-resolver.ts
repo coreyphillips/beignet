@@ -250,6 +250,13 @@ export function classifyCommitmentTx(
 		}
 	}
 
+	// A commitment index beyond our recorded remote state means the peer
+	// legitimately advanced past us (data loss on our side); we can only
+	// claim our to_remote output from it.
+	if (commitmentNumber > state.remoteCommitmentNumber) {
+		return { type: CommitmentType.THEIR_FUTURE_COMMITMENT, commitmentNumber };
+	}
+
 	return { type: CommitmentType.UNKNOWN, commitmentNumber };
 }
 
@@ -390,6 +397,8 @@ export function classifyOutputs(
 		commitmentType === CommitmentType.THEIR_REVOKED_COMMITMENT
 	) {
 		return classifyTheirCommitmentOutputs(tx, state, txid, commitmentNumber);
+	} else if (commitmentType === CommitmentType.THEIR_FUTURE_COMMITMENT) {
+		return classifyTheirFutureCommitmentOutputs(tx, state, txid);
 	}
 
 	// For cooperative close, track outputs but they're already resolved
@@ -678,6 +687,59 @@ function classifyTheirCommitmentOutputs(
 				witnessScript: htlcMatch.witnessScript
 			});
 		}
+	}
+
+	return outputs;
+}
+
+/**
+ * to_remote-only scan for a commitment the peer advanced past our recorded
+ * state (data loss on our side). We never learned its per-commitment point,
+ * so to_local/HTLC scripts cannot be derived - and we could not claim them
+ * anyway. Our to_remote pays our STATIC payment basepoint on every channel
+ * type we run (static_remotekey P2WPKH, anchors CSV-1 P2WSH, taproot leaf)
+ * and needs no per-commitment point.
+ */
+function classifyTheirFutureCommitmentOutputs(
+	tx: bitcoin.Transaction,
+	state: IChannelState,
+	txid: string
+): ITrackedOutput[] {
+	if (!state.remoteBasepoints) return [];
+
+	const outputs: ITrackedOutput[] = [];
+	const ourPaymentPubkey = state.localBasepoints.paymentBasepoint;
+
+	const taprootToRemote = isTaprootChannel(state.channelType)
+		? buildTaprootToRemoteOutput(ourPaymentPubkey).output
+		: null;
+	const anchorToRemote =
+		!taprootToRemote && isAnchorChannel(state.channelType)
+			? buildToRemoteAnchorOutput(ourPaymentPubkey)
+			: null;
+	const plainToRemote =
+		!taprootToRemote && !anchorToRemote
+			? bitcoin.payments.p2wpkh({ pubkey: ourPaymentPubkey }).output
+			: null;
+
+	for (let i = 0; i < tx.outs.length; i++) {
+		const outScript = tx.outs[i].script;
+		const isOurs = taprootToRemote
+			? outScript.equals(taprootToRemote)
+			: anchorToRemote
+			? outScript.equals(anchorToRemote.script)
+			: !!plainToRemote && outScript.equals(plainToRemote);
+		if (!isOurs) continue;
+		outputs.push({
+			txid,
+			outputIndex: i,
+			amount: BigInt(tx.outs[i].value),
+			outputType: OutputType.TO_REMOTE,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0,
+			// witnessScript signals the anchor (CSV-1) variant to the resolver.
+			witnessScript: anchorToRemote?.witnessScript
+		});
 	}
 
 	return outputs;

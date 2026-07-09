@@ -7114,6 +7114,15 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			const channelId = state.channelId || state.temporaryChannelId;
 
+			// Data loss protection: the peer proved our state is stale. Auto
+			// force-closing here would broadcast our revoked-in-their-view
+			// commitment and lose the whole balance to the justice path. The
+			// peer's force close resolves the channel; never time it out.
+			// (Channel.forceClose refuses too - this skip avoids even trying.)
+			if (state.dataLossDetected) {
+				continue;
+			}
+
 			const effectiveState =
 				state.state === ChannelState.AWAITING_REESTABLISH
 					? state.preReestablishState || state.state

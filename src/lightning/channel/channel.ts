@@ -55,6 +55,7 @@ import {
 	encodeChannelReestablishMessage,
 	IChannelReestablishMessage
 } from '../message/channel-reestablish';
+import { encodeErrorMessage } from '../message/error';
 import {
 	ChannelAction,
 	ChannelActionType,
@@ -2772,6 +2773,19 @@ export class Channel {
 	 * Returns the commitment transaction to broadcast and a CHANNEL_CLOSED action.
 	 */
 	forceClose(signer: ChannelSigner): ChannelAction[] {
+		// Data loss protection: the peer proved our state is stale. Our latest
+		// local commitment is revoked in the peer's view - broadcasting it hands
+		// our entire balance to the justice path. Recovery is passive: the peer
+		// force-closes with its newer commitment and we sweep our to_remote.
+		if (this._state.dataLossDetected) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Refusing to broadcast stale commitment after data loss'
+				}
+			];
+		}
+
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -4475,6 +4489,51 @@ export class Channel {
 					}
 				];
 			}
+		}
+
+		// ── Data loss protection: WE fell behind (BOLT 2) ──
+		// The peer expects a commitment/revocation beyond anything our restored
+		// state ever produced AND its yourLastPerCommitmentSecret passed the
+		// validation above while being non-zero: that secret is only derivable
+		// from OUR seed at an index we have not reached, so the peer provably
+		// holds a newer channel state than we do (we lost data). We MUST NOT
+		// broadcast our commitment - it is revoked in the peer's view and would
+		// be swept by the justice path. Send an error so the honest peer force
+		// closes with ITS commitment, then sweep our to_remote from that.
+		// The proof is only sound when the secret's index (nextRevocationNumber
+		// minus 1) is one our restored state has NOT revoked yet (released
+		// indices run 0..localCommitmentNumber-1): a malicious peer always
+		// holds our already-released secrets, and an old secret must not let it
+		// freeze the channel with a fake gap.
+		if (
+			(msg.nextCommitmentNumber > this._state.remoteCommitmentNumber + 1n ||
+				msg.nextRevocationNumber > this._state.localCommitmentNumber + 1n) &&
+			msg.nextRevocationNumber > this._state.localCommitmentNumber &&
+			!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32))
+		) {
+			this._state.dataLossDetected = true;
+			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			this._state.state = ChannelState.ERRORED;
+			return [
+				// Persist FIRST: a crash between the error send and the peer's
+				// force-close must not forget that broadcasting is forbidden.
+				{ type: ChannelActionType.PERSIST_STATE },
+				sendMsg(
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: this._state.channelId!,
+						data: Buffer.from(
+							'peer proved our channel state is stale (data loss); awaiting your force close',
+							'ascii'
+						)
+					})
+				),
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Channel fell behind: peer proved our state is stale (data loss); refusing to broadcast, awaiting peer force close'
+				}
+			];
 		}
 
 		// ── Commitment retransmission logic ──
