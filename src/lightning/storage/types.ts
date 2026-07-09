@@ -121,6 +121,17 @@ export interface IStorageBackend {
 	/** Delete a gossip channel by SCID hex. Used during graph pruning. */
 	deleteGossipChannel?(scidHex: string): void;
 
+	// ─── Channel Routing Policies (optional) ───
+	/** Save a per-channel routing-policy override (msat fields as strings). */
+	saveChannelPolicy?(channelId: string, policy: IPersistedChannelPolicy): void;
+	/** Load all persisted routing-policy overrides. */
+	loadAllChannelPolicies?(): Array<{
+		channelId: string;
+		policy: IPersistedChannelPolicy;
+	}>;
+	/** Delete a per-channel routing-policy override. */
+	deleteChannelPolicy?(channelId: string): void;
+
 	// ─── Action Log (optional) ───
 	/** Save a structured log entry. Capped at maxRows (default 10000). */
 	saveActionLog?(entry: {
@@ -140,6 +151,18 @@ export interface IStorageBackend {
 		timestamp: number;
 		data: string;
 	}>;
+}
+
+/**
+ * JSON-safe shape of a per-channel routing-policy override. Msat fields are
+ * decimal strings because they are bigint in the node layer.
+ */
+export interface IPersistedChannelPolicy {
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	htlcMinimumMsat?: string;
+	htlcMaximumMsat?: string;
 }
 
 export interface IInvoiceInfo {

@@ -902,8 +902,27 @@ beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw>
 beignet channel ensure-minimum 3 500000
 # Auto-open channels to at least 3 using graph suggestions, 500k sats each
+beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]
 beignet channel list
 beignet channel get <channelId>
+# channel get/list include the effective routing policy fields
+```
+
+### Routing Fee Policy
+
+Per-channel control of the ROUTING policy advertised in `channel_update` (not
+the commitment feerate, which is `/channel/update-commitment-feerate`): base
+fee, proportional fee (ppm), CLTV delta, and HTLC min/max. Unset fields fall
+back to the node-wide defaults; overrides persist across restarts. Announced
+channels re-broadcast the updated `channel_update` immediately; unannounced
+channels send it directly to the peer.
+
+```bash
+beignet channel update-policy ab12... --base-fee-msat 500 --ppm 100
+# {"ok":true,"result":{"updated":1,"policies":[{"channelId":"ab12...","feeBaseMsat":500,"feeProportionalMillionths":100,"cltvExpiryDelta":40,"htlcMinimumMsat":"1000","htlcMaximumMsat":"500000000","source":"override"}]}}
+
+beignet channel update-policy all --cltv-delta 80
+# Applies to every channel; other fields keep their current values
 ```
 
 ### Invoices & Payments
@@ -1106,6 +1125,8 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | GET | `/backup/scb` | - | Export encrypted static channel backup `{ encoded, channelCount, path }` |
 | POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
 | POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
+| POST | `/channel/update-policy` | `{ channelId?, all?, feeBaseMsat?, feeProportionalMillionths?, cltvExpiryDelta?, htlcMinimumMsat?, htlcMaximumMsat? }` | Set ROUTING fee policy per channel (or `all: true`); regenerates + re-broadcasts channel_update |
+| GET | `/channel/policy` | `?channelId=<hex>` | Effective routing policy (override or node defaults) with `source` field |
 | POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s) |
 | POST | `/channel/wait-ready` | `{ channelId, timeoutMs? }` | Wait for channel to reach NORMAL (default 60s) |
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |

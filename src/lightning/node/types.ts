@@ -273,6 +273,39 @@ export interface IChannelInfo {
 	remoteReserveMsat?: bigint;
 	/** Whether this channel is private (unannounced) */
 	isPrivate?: boolean;
+	/** Effective routing policy (per-channel override or node defaults) */
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	htlcMinimumMsat?: bigint;
+	htlcMaximumMsat?: bigint;
+}
+
+// ─── Channel Routing Policy ───
+
+/**
+ * Partial per-channel routing-policy override. Unset fields fall back to the
+ * node-wide defaults (forwardingFeeBaseMsat / forwardingFeePropMillionths /
+ * forwardingCltvDelta) and the channel's negotiated htlc_minimum_msat /
+ * capacity-capped max_htlc_value_in_flight_msat.
+ */
+export interface IChannelPolicyUpdate {
+	feeBaseMsat?: number;
+	feeProportionalMillionths?: number;
+	cltvExpiryDelta?: number;
+	htlcMinimumMsat?: bigint;
+	htlcMaximumMsat?: bigint;
+}
+
+/** Effective routing policy for a channel plus where each value came from. */
+export interface IChannelPolicy {
+	feeBaseMsat: number;
+	feeProportionalMillionths: number;
+	cltvExpiryDelta: number;
+	htlcMinimumMsat: bigint;
+	htlcMaximumMsat: bigint;
+	/** 'override' when a per-channel override is set, 'default' otherwise */
+	source: 'override' | 'default';
 }
 
 export interface INodeInfo {

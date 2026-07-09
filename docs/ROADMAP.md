@@ -33,20 +33,22 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M1. Recovery and backup (highest fund-safety impact)
 
-- [ ] Static channel backup (SCB) equivalent: portable, versioned, encrypted per-channel
-      backup blob (peer pubkey, funding outpoint, basepoints/channel key index) that is
-      sufficient to trigger the data-loss-protect recovery path. Export via library +
-      daemon endpoint + CLI; auto-refresh on every channel open/close.
-- [~] "We fell behind" recovery flow (PR #36): reestablish proof marks the channel
-      dataLossDetected + ERRORED (persist-first), sends a BOLT 1 error, refuses all
-      local broadcasts (forceClose + stuck-channel timer), and sweeps only to_remote
-      from the peer's THEIR_FUTURE_COMMITMENT via the chain monitor.
-- [ ] Restore API: daemon endpoint + CLI command that ingests a DB backup or SCB blob
-      and starts recovery (today restore is manual file placement; `POST /backup` has
-      no counterpart).
-- [~] Encryption at rest for the node SQLite DB (in progress): AES-256-GCM envelope
-      encryption of sensitive tables keyed via HKDF from the seed, default-on in
-      BeignetNode with in-place migration and an opt-out flag.
+- [x] Static channel backup (SCB) equivalent (PR #38, merged): portable, versioned,
+      encrypted per-channel backup blob (peer pubkey, funding outpoint,
+      basepoints/channel key index) that is sufficient to trigger the
+      data-loss-protect recovery path. Export via library + daemon endpoint + CLI;
+      auto-refresh on every channel open/close.
+- [x] "We fell behind" recovery flow (PR #36, merged): reestablish proof marks the
+      channel dataLossDetected + ERRORED (persist-first), sends a BOLT 1 error,
+      refuses all local broadcasts (forceClose + stuck-channel timer), and sweeps
+      only to_remote from the peer's THEIR_FUTURE_COMMITMENT via the chain monitor.
+- [x] Restore API (PR #39, merged): daemon endpoint + CLI command that ingests a DB
+      backup or SCB blob and starts recovery (previously restore was manual file
+      placement; `POST /backup` had no counterpart).
+- [x] Encryption at rest for the node SQLite DB (PR #37, merged): AES-256-GCM
+      envelope encryption of sensitive tables (htlc_shared_secrets included) keyed
+      via HKDF from the seed, default-on in BeignetNode with in-place migration and
+      an opt-out flag.
 - [ ] Onchain wallet: document that persistence encryption is delegated to the host
       TStorage, and provide an optional built-in encryption wrapper.
 - [?] Peer storage (option_provide_storage, peer_storage/your_peer_storage messages):
@@ -64,7 +66,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M3. Routing-node operations
 
-- [ ] Routing fee-policy control: set base_fee_msat, fee_proportional_millionths,
+- [~] Routing fee-policy control (this PR): set base_fee_msat, fee_proportional_millionths,
       cltv_expiry_delta, htlc_minimum/maximum_msat per channel (and a node-wide
       default), regenerating channel_update. Library method + daemon
       `/channel/update-policy` + CLI. Internal pieces exist privately
@@ -190,3 +192,5 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
   zero_conf by default, landed as PR #35 (merged, includes untrusted-peer zero_conf
   channel_type rejection). M1 started: PR #36 open (fell-behind DLP recovery, suite
   3094/0); storage encryption at rest in progress in a parallel worktree.
+- 2026-07-09 (cont.): M1 core merged as #36-#39 (DLP fell-behind recovery, storage
+  encryption, SCB export, restore API). M3 started: routing fee-policy control.
