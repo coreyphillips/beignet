@@ -128,10 +128,13 @@ export interface INodeConfig {
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
 	preferAnchors?: boolean;
 	/**
-	 * EXPERIMENTAL — propose simple taproot channels (option_taproot). Negotiates
-	 * the channel type + MuSig2 nonces on open/accept, but the commitment-round
-	 * signing (nonce rotation) is not yet wired into the live state machine, so
-	 * funding cannot complete. Off by default.
+	 * Propose simple taproot channels (option_taproot) when opening channels.
+	 * MuSig2 funding and commitment signing (deterministic verification nonces)
+	 * are fully wired into the live state machine; the complete lifecycle
+	 * (open, payments both directions, reestablish, cooperative close, force
+	 * close) is validated against LND on regtest. Off by default because the
+	 * feature bit is still in staging upstream (180/181); not recommended for
+	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
 	/** Fee estimator for dynamic fee rates */
