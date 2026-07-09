@@ -9,7 +9,10 @@ import Database from 'better-sqlite3';
 import {
 	IStorageBackend,
 	IInvoiceInfo,
-	IPersistedChannelPolicy
+	IPersistedChannelPolicy,
+	IForwardingEvent,
+	IForwardingEventFilter,
+	IForwardingSummary
 } from './types';
 import { IChannelState } from '../channel/channel-state';
 import { IPaymentInfo } from '../node/types';
@@ -122,7 +125,14 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 5;
+	static readonly CURRENT_SCHEMA_VERSION = 6;
+
+	/**
+	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
+	 * Oldest rows are pruned on insert once the cap is exceeded. Instance
+	 * property (not a constant) so tests can exercise pruning with a small cap.
+	 */
+	forwardingEventsMaxRows = 100_000;
 
 	/**
 	 * Sensitive payload columns encrypted at rest when an encryptionKey is set.
@@ -331,6 +341,19 @@ export class SqliteStorage implements IStorageBackend {
 				blob TEXT NOT NULL,
 				received_at INTEGER NOT NULL
 			);
+
+			CREATE TABLE IF NOT EXISTS forwarding_events (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				settled_at INTEGER NOT NULL,
+				in_channel_id TEXT NOT NULL,
+				out_channel_id TEXT NOT NULL,
+				in_scid TEXT,
+				out_scid TEXT,
+				amount_in_msat TEXT NOT NULL,
+				amount_out_msat TEXT NOT NULL,
+				fee_msat TEXT NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_forwarding_events_settled_at ON forwarding_events(settled_at);
 		`);
 
 		// Run migrations
@@ -1027,6 +1050,15 @@ export class SqliteStorage implements IStorageBackend {
 			// ENCRYPTED_COLUMNS so it is encrypted at rest when a key is set.
 			(): void => {
 				// No-op
+			},
+			// Migration 5->6: forwarding_events table (settled-forward ledger).
+			// Created via CREATE IF NOT EXISTS above. Kept plaintext: rows are
+			// operator analytics on already-settled relays (channel ids, amounts,
+			// timestamps; no keys, preimages or secrets), and the since/until/
+			// channel filters need SQL WHERE clauses on the raw columns, which
+			// encrypted values would break.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1136,6 +1168,109 @@ export class SqliteStorage implements IStorageBackend {
 		this.db
 			.prepare('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?')
 			.run(peerPubkey);
+	}
+
+	// ─── Forwarding Events (settled-forward ledger) ───
+	// Stored plaintext (see migration 5->6 note): operator analytics, and the
+	// filters/index need SQL access to the raw columns.
+
+	saveForwardingEvent(event: Omit<IForwardingEvent, 'id'>): void {
+		this.db
+			.prepare(
+				`INSERT INTO forwarding_events
+					(settled_at, in_channel_id, out_channel_id, in_scid, out_scid,
+					 amount_in_msat, amount_out_msat, fee_msat)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			)
+			.run(
+				event.settledAt,
+				event.inChannelId,
+				event.outChannelId,
+				event.inScid ?? null,
+				event.outScid ?? null,
+				event.amountInMsat.toString(),
+				event.amountOutMsat.toString(),
+				event.feeMsat.toString()
+			);
+		// Cap the ledger (default 100k rows), pruning oldest first
+		this.db
+			.prepare(
+				'DELETE FROM forwarding_events WHERE id NOT IN (SELECT id FROM forwarding_events ORDER BY id DESC LIMIT ?)'
+			)
+			.run(this.forwardingEventsMaxRows);
+	}
+
+	listForwardingEvents(filter?: IForwardingEventFilter): IForwardingEvent[] {
+		let sql =
+			'SELECT id, settled_at, in_channel_id, out_channel_id, in_scid, out_scid, amount_in_msat, amount_out_msat, fee_msat FROM forwarding_events WHERE 1=1';
+		const params: unknown[] = [];
+		if (filter?.since !== undefined) {
+			sql += ' AND settled_at >= ?';
+			params.push(filter.since);
+		}
+		if (filter?.until !== undefined) {
+			sql += ' AND settled_at <= ?';
+			params.push(filter.until);
+		}
+		if (filter?.channelId !== undefined) {
+			sql += ' AND (in_channel_id = ? OR out_channel_id = ?)';
+			params.push(filter.channelId, filter.channelId);
+		}
+		// Newest first; id breaks same-millisecond ties deterministically
+		sql += ' ORDER BY settled_at DESC, id DESC';
+		// Default limit bounds response size; the table itself is already capped
+		sql += ' LIMIT ?';
+		params.push(
+			filter?.limit !== undefined && filter.limit > 0 ? filter.limit : 1000
+		);
+		if (filter?.offset !== undefined && filter.offset > 0) {
+			sql += ' OFFSET ?';
+			params.push(filter.offset);
+		}
+		const rows = this.db.prepare(sql).all(...params) as Array<{
+			id: number;
+			settled_at: number;
+			in_channel_id: string;
+			out_channel_id: string;
+			in_scid: string | null;
+			out_scid: string | null;
+			amount_in_msat: string;
+			amount_out_msat: string;
+			fee_msat: string;
+		}>;
+		return rows.map((row) => ({
+			id: row.id,
+			settledAt: row.settled_at,
+			inChannelId: row.in_channel_id,
+			outChannelId: row.out_channel_id,
+			inScid: row.in_scid ?? undefined,
+			outScid: row.out_scid ?? undefined,
+			amountInMsat: BigInt(row.amount_in_msat),
+			amountOutMsat: BigInt(row.amount_out_msat),
+			feeMsat: BigInt(row.fee_msat)
+		}));
+	}
+
+	getForwardingSummary(options?: { since?: number }): IForwardingSummary {
+		// Accumulate in JS bigints: SQL SUM over the TEXT msat columns would
+		// coerce to floats and lose precision above 2^53
+		let sql =
+			'SELECT amount_out_msat, fee_msat FROM forwarding_events WHERE 1=1';
+		const params: unknown[] = [];
+		if (options?.since !== undefined) {
+			sql += ' AND settled_at >= ?';
+			params.push(options.since);
+		}
+		let count = 0;
+		let volumeOutMsat = 0n;
+		let feesEarnedMsat = 0n;
+		for (const row of this.db.prepare(sql).iterate(...params)) {
+			const r = row as { amount_out_msat: string; fee_msat: string };
+			count++;
+			volumeOutMsat += BigInt(r.amount_out_msat);
+			feesEarnedMsat += BigInt(r.fee_msat);
+		}
+		return { count, volumeOutMsat, feesEarnedMsat };
 	}
 
 	// ─── Transaction ───

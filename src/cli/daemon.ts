@@ -187,6 +187,23 @@ export async function startDaemon(
 				)
 			);
 		},
+		'GET /forwards': (_body, query) => {
+			const filter: Record<string, unknown> = {};
+			if (query.get('since')) filter.since = Number(query.get('since'));
+			if (query.get('until')) filter.until = Number(query.get('until'));
+			if (query.get('limit')) filter.limit = Number(query.get('limit'));
+			if (query.get('offset')) filter.offset = Number(query.get('offset'));
+			if (query.get('channelId')) filter.channelId = query.get('channelId');
+			return success(
+				node.listForwards(
+					Object.keys(filter).length > 0 ? (filter as any) : undefined
+				)
+			);
+		},
+		'GET /forwards/summary': (_body, query) => {
+			const since = query.get('since') ? Number(query.get('since')) : undefined;
+			return success(node.getForwardingSummary(since));
+		},
 		'GET /invoices': () => success(node.listInvoices()),
 		'GET /invoice': (_body, query) => {
 			const paymentHash = query.get('paymentHash');

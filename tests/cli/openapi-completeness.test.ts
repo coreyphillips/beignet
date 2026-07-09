@@ -90,7 +90,9 @@ describe('OpenAPI Spec Completeness', () => {
 		'/offer/pay',
 		'/transactions',
 		'/utxos',
-		'/fees/estimates'
+		'/fees/estimates',
+		'/forwards',
+		'/forwards/summary'
 	];
 
 	for (const route of expectedRoutes) {
@@ -121,7 +123,9 @@ describe('OpenAPI Spec Completeness', () => {
 		'TrustedPeerInfo',
 		'OnchainTxInfo',
 		'UtxoInfo',
-		'OnchainFees'
+		'OnchainFees',
+		'ForwardingEvent',
+		'ForwardingSummary'
 	];
 
 	for (const schema of expectedSchemas) {

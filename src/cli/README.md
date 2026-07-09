@@ -953,6 +953,21 @@ beignet channel update-policy all --cltv-delta 80
 # Applies to every channel; other fields keep their current values
 ```
 
+### Forwarding History
+
+Ledger of settled forwards (HTLCs this node relayed where both legs
+fulfilled), with the fee earned per forward. Records persist in the node
+database (capped at 100k rows, oldest pruned first). Msat values are decimal
+strings. Failed forwards are not recorded.
+
+```bash
+beignet forwards --since 1751000000000 --limit 50
+# {"ok":true,"result":[{"id":7,"settledAt":1751234567890,"inChannelId":"ab12...","outChannelId":"cd34...","amountInMsat":"5005000","amountOutMsat":"5000000","feeMsat":"5000"}]}
+
+beignet forwards summary --since 1751000000000
+# {"ok":true,"result":{"count":42,"volumeOutMsat":"210000000","feesEarnedMsat":"210000"}}
+```
+
 ### Invoices & Payments
 
 ```bash
@@ -1113,6 +1128,8 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | GET | `/can-send` | `?amountSats=<n>` | Check send capacity |
 | GET | `/can-receive` | `?amountSats=<n>` | Check receive capacity |
 | GET | `/payments` | `?status=&direction=&since=&limit=&offset=` | List payments (filterable) |
+| GET | `/forwards` | `?since=&until=&limit=&offset=&channelId=` | Settled forwards with fees earned (msat values as strings) |
+| GET | `/forwards/summary` | `?since=` | Forwarding totals: `{ count, volumeOutMsat, feesEarnedMsat }` |
 | GET | `/invoices` | -- | List created invoices |
 | GET | `/channel` | `?channelId=<hex>` | Get channel (query param or body) |
 | GET | `/channel/health` | `?channelId=<hex>` | Channel health assessment with liquidity warnings |

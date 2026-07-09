@@ -167,6 +167,65 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/forwards': {
+				get: {
+					summary: 'List settled forwards (fees earned), newest first',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'since',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Only events settled at/after this ms timestamp'
+						},
+						{
+							name: 'until',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Only events settled at/before this ms timestamp'
+						},
+						{ name: 'limit', in: 'query', schema: { type: 'integer' } },
+						{ name: 'offset', in: 'query', schema: { type: 'integer' } },
+						{
+							name: 'channelId',
+							in: 'query',
+							schema: { type: 'string' },
+							description: 'Match the inbound OR outbound leg'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Forwarding events (msat values as strings)',
+							content: jsonContent({
+								type: 'array',
+								items: { $ref: '#/components/schemas/ForwardingEvent' }
+							})
+						}
+					}
+				}
+			},
+			'/forwards/summary': {
+				get: {
+					summary: 'Forwarding totals: count, volume out, fees earned',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'since',
+							in: 'query',
+							schema: { type: 'integer' },
+							description: 'Only events settled at/after this ms timestamp'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Forwarding summary (msat values as strings)',
+							content: jsonContent({
+								$ref: '#/components/schemas/ForwardingSummary'
+							})
+						}
+					}
+				}
+			},
 			'/invoices': {
 				get: {
 					summary: 'List created invoices',
@@ -1606,6 +1665,30 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						slow: { type: 'number' },
 						minimum: { type: 'number' },
 						timestamp: { type: 'integer' }
+					}
+				},
+				ForwardingEvent: {
+					type: 'object',
+					description:
+						'One settled forward. Msat values are decimal strings (JSON-safe bigint).',
+					properties: {
+						id: { type: 'integer' },
+						settledAt: { type: 'integer' },
+						inChannelId: { type: 'string' },
+						outChannelId: { type: 'string' },
+						inScid: { type: 'string' },
+						outScid: { type: 'string' },
+						amountInMsat: { type: 'string' },
+						amountOutMsat: { type: 'string' },
+						feeMsat: { type: 'string' }
+					}
+				},
+				ForwardingSummary: {
+					type: 'object',
+					properties: {
+						count: { type: 'integer' },
+						volumeOutMsat: { type: 'string' },
+						feesEarnedMsat: { type: 'string' }
 					}
 				},
 				HealthInfo: {

@@ -153,7 +153,13 @@ import {
 } from '../validation';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { IStorageBackend, IPersistedChannelPolicy } from '../storage/types';
+import {
+	IStorageBackend,
+	IPersistedChannelPolicy,
+	IForwardingEvent,
+	IForwardingEventFilter,
+	IForwardingSummary
+} from '../storage/types';
 import { FeatureFlags, Feature } from '../features/flags';
 import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
@@ -6316,6 +6322,9 @@ export class LightningNode extends EventEmitter {
 			// already hold the preimage to claim the inbound HTLC on-chain. Without this
 			// the forwarded value is lost via the counterparty's timeout path.
 			this.channelManager.recordPreimage(preimageHash, preimage);
+			// Both legs of the forward settle here: record the ledger entry now,
+			// while both HTLC entries still exist (they are dropped on revoke)
+			this.recordForwardingEvent(channelId, htlcId, forward);
 			// Persist before sending upstream fulfill
 			this.safeStorage(
 				() => this.storage!.deleteForwardedHtlc(outKey),
@@ -6379,6 +6388,51 @@ export class LightningNode extends EventEmitter {
 				status: payment.status
 			});
 		}
+	}
+
+	/**
+	 * Persist a forwarding-ledger entry for a forward whose downstream fulfill
+	 * just arrived. Amounts come from the live HTLC entries on both legs; they
+	 * still exist at this point (removed only on the later revoke_and_ack). A
+	 * forward restored after a restart whose entries are already gone is
+	 * skipped: there is no accurate amount left to record.
+	 */
+	private recordForwardingEvent(
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		forward: { inChannelId: Buffer; inHtlcId: bigint }
+	): void {
+		if (
+			!this.storage ||
+			typeof this.storage.saveForwardingEvent !== 'function'
+		) {
+			return;
+		}
+		const outState = this.channelManager
+			.getChannel(outChannelId)
+			?.getFullState();
+		const inState = this.channelManager
+			.getChannel(forward.inChannelId)
+			?.getFullState();
+		const outHtlc = outState?.htlcs.get(`offered-${outHtlcId}`);
+		const inHtlc = inState?.htlcs.get(`received-${forward.inHtlcId}`);
+		if (!outHtlc || !inHtlc) return;
+		const amountInMsat = inHtlc.amountMsat;
+		const amountOutMsat = outHtlc.amountMsat;
+		this.safeStorage(
+			() =>
+				this.storage!.saveForwardingEvent!({
+					settledAt: Date.now(),
+					inChannelId: forward.inChannelId.toString('hex'),
+					outChannelId: outChannelId.toString('hex'),
+					inScid: inState?.shortChannelId?.toString('hex'),
+					outScid: outState?.shortChannelId?.toString('hex'),
+					amountInMsat,
+					amountOutMsat,
+					feeMsat: amountInMsat - amountOutMsat
+				}),
+			'saveForwardingEvent'
+		);
 	}
 
 	private handleHtlcFailed(
@@ -6559,6 +6613,39 @@ export class LightningNode extends EventEmitter {
 
 	listPayments(): IPaymentInfo[] {
 		return [...this.payments.values()];
+	}
+
+	/**
+	 * List settled forwards (newest first). Storage-backed: without a storage
+	 * backend that supports the forwarding ledger, returns [].
+	 */
+	listForwards(filter?: IForwardingEventFilter): IForwardingEvent[] {
+		if (
+			!this.storage ||
+			typeof this.storage.listForwardingEvents !== 'function'
+		) {
+			return [];
+		}
+		try {
+			return this.storage.listForwardingEvents(filter);
+		} catch {
+			return [];
+		}
+	}
+
+	/** Aggregate totals (count, volume out, fees earned) over settled forwards. */
+	getForwardingSummary(options?: { since?: number }): IForwardingSummary {
+		if (
+			!this.storage ||
+			typeof this.storage.getForwardingSummary !== 'function'
+		) {
+			return { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
+		}
+		try {
+			return this.storage.getForwardingSummary(options);
+		} catch {
+			return { count: 0, volumeOutMsat: 0n, feesEarnedMsat: 0n };
+		}
 	}
 
 	/**

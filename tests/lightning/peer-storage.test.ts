@@ -530,11 +530,13 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 	});
 
 	describe('storage round-trip', function () {
-		it('schema version is 5 with the peer_storage_blobs migration', function () {
+		it('schema includes the peer_storage_blobs migration (v5+)', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
-			expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(5);
-			expect(storage.getSchemaVersion()).to.equal(5);
+			expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.be.at.least(5);
+			expect(storage.getSchemaVersion()).to.equal(
+				SqliteStorage.CURRENT_SCHEMA_VERSION
+			);
 			storage.close();
 		});
 

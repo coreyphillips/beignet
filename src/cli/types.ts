@@ -291,6 +291,34 @@ export interface PaymentFilter {
 	metadataValue?: string;
 }
 
+export interface ForwardsFilter {
+	since?: number;
+	until?: number;
+	limit?: number;
+	offset?: number;
+	/** Match events where this channel was the inbound OR outbound leg. */
+	channelId?: string;
+}
+
+/** One settled forward. Msat values are decimal strings (JSON-safe bigint). */
+export interface ForwardingEventInfo {
+	id: number;
+	settledAt: number;
+	inChannelId: string;
+	outChannelId: string;
+	inScid?: string;
+	outScid?: string;
+	amountInMsat: string;
+	amountOutMsat: string;
+	feeMsat: string;
+}
+
+export interface ForwardingSummaryInfo {
+	count: number;
+	volumeOutMsat: string;
+	feesEarnedMsat: string;
+}
+
 export interface RouteEstimate {
 	feeSats: number;
 	hops: number;
