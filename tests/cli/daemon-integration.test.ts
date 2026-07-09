@@ -535,6 +535,18 @@ describe('Daemon: updateChannelFee route', () => {
 				expect((resp2.body.error as { code: string }).code).to.equal(
 					'INVALID_PARAMS'
 				);
+
+				// Primary route name: /channel/update-fee is a deprecated alias
+				const resp3 = await httpRequest(
+					addr.port,
+					'POST',
+					'/channel/update-commitment-feerate',
+					{
+						channelId,
+						feeratePerKw: 500
+					}
+				);
+				expect(resp3.status).to.equal(200);
 			} finally {
 				await node.destroy();
 				server.close();

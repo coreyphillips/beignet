@@ -313,7 +313,10 @@ export async function startDaemon(
 				commitmentTxid: result.commitmentTxid
 			});
 		},
-		'POST /channel/update-fee': (body) => {
+		// Sets the channel's COMMITMENT transaction feerate (BOLT 2 update_fee).
+		// This is not the routing fee policy (base fee / proportional millionths);
+		// routing policy control is a separate planned endpoint.
+		'POST /channel/update-commitment-feerate': (body) => {
 			const { channelId, feeratePerKw } = body as {
 				channelId: string;
 				feeratePerKw: number;
@@ -861,6 +864,11 @@ export async function startDaemon(
 			return success({ cancelled: true });
 		}
 	};
+
+	// DEPRECATED alias: the old name implied routing fee policy, but the handler
+	// sets the commitment feerate. Kept for compatibility; remove in a future major.
+	routes['POST /channel/update-fee'] =
+		routes['POST /channel/update-commitment-feerate'];
 
 	const sseClients: Set<http.ServerResponse> = new Set();
 

@@ -147,7 +147,7 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `spliceOut(channelId, amountSats, feerate)` | `SpliceResult` | Withdraw funds from channel |
 | `listChannels()` | `ChannelInfo[]` | List all channels |
 | `getChannel(channelId)` | `ChannelInfo \| null` | Get specific channel |
-| `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel feerate (min 253) |
+| `updateChannelFee(channelId, feeratePerKw)` | `{ ok: true }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
 | `connectAndOpenChannel(pubkey, host, port, amountSats, opts?)` | `Promise<ChannelInfo>` | Connect to peer + open channel in one call. `opts: { pushSats? }` |
 | `ensureMinimumChannels(count, satsPerChannel, opts?)` | `Promise<ChannelInfo[]>` | Auto-open channels to meet minimum count. Connects to peers via gossip graph addresses before opening. `opts: { timeoutMs? }` |
 
@@ -1040,7 +1040,8 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/route/estimate` | `{ bolt11, amountSats? }` | Estimate route fee without sending |
 | POST | `/route/probe` | `{ destination, amountSats }` | Probe route viability to a destination |
 | POST | `/backup` | `{ destPath }` | Create online database backup |
-| POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Update channel feerate (min 253) |
+| POST | `/channel/update-commitment-feerate` | `{ channelId, feeratePerKw }` | Update channel COMMITMENT feerate via update_fee (min 253). Not the routing fee policy |
+| POST | `/channel/update-fee` | `{ channelId, feeratePerKw }` | Deprecated alias for `/channel/update-commitment-feerate` |
 | POST | `/node/wait-ready` | `{ timeoutMs? }` | Wait for node to be fully operational (default 30s) |
 | POST | `/channel/wait-ready` | `{ channelId, timeoutMs? }` | Wait for channel to reach NORMAL (default 60s) |
 | POST | `/payment/wait` | `{ paymentHash, timeoutMs? }` | Wait for payment to settle (default 60s) |

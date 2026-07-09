@@ -2334,6 +2334,11 @@ export class BeignetNode extends EventEmitter {
 		return { valid: true, proof };
 	}
 
+	/**
+	 * Update the channel's COMMITMENT transaction feerate (BOLT 2 update_fee,
+	 * min 253 sat/kw). This is not the routing fee policy (base fee msat /
+	 * proportional millionths); routing policy control is a separate planned API.
+	 */
 	updateChannelFee(
 		channelId: string,
 		feeratePerKw: number
