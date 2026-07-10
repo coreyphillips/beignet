@@ -62,6 +62,9 @@ services:
     ports:
       - '9735:9735'
       - '8081:8080'
+      # LND altruist watchtower server (wtwire), for beignet tower-client
+      # interop tests.
+      - '9911:9911'
     volumes:
       - 'lnd_home:/root/.lnd'
     command:
@@ -84,6 +87,8 @@ services:
       - '--protocol.option-scid-alias'
       - '--maxpendingchannels=10'
       - '--max-channel-fee-allocation=1.0'
+      - '--watchtower.active'
+      - '--watchtower.listen=0.0.0.0:9911'
 
   cln:
     container_name: cln

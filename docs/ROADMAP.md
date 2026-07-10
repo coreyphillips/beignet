@@ -68,6 +68,15 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       per-session Noise keys, persisted sessions + un-acked backlog with retry,
       config watchtowers[] URIs. Deferred + documented: anchor to_remote and
       taproot (v1 blob) coverage, reward sessions.
+- [x] Live LND tower interop (this PR): session negotiation, real
+      revoked-commitment backups acked with advancing sequence numbers, and
+      per-identity sessions validated against a real LND v0.20 altruist tower
+      (docker lnd now runs --watchtower.active on 9911;
+      tests/lightning/interop/watchtower-lnd.test.ts). Found and fixed a live
+      bug: the wtwire regtest chain_hash constant was stored in display byte
+      order, so a real regtest LND tower rejected Init with "unknown chain
+      hash" (mainnet/testnet/signet were correct); CI regression tests pin all
+      chain hashes to the interop-proven channel-layer constants.
 - [?] Watchtower server mode (lower priority; decide whether beignet should offer it).
 - [x] Document the single-process online-requirement (PR #48, merged: README limitations
       table updated alongside the tower client).
@@ -217,7 +226,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       secrets directly (separate surface, future work).
 - [?] mTLS / client certificates for the daemon. Decide priority.
 - [?] Key rotation strategy. Decide scope.
-- [~] Leveled logging (this PR): platform-neutral src/logger.ts (ILogger
+- [x] Leveled logging (PR #61, merged): platform-neutral src/logger.ts (ILogger
       debug/info/warn/error, createConsoleLogger with level filtering,
       noopLogger), injectable via Wallet config, INodeConfig, and
       BeignetNodeOptions; daemon --log-level flag / BEIGNET_LOG_LEVEL env /
@@ -272,7 +281,13 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
-- 2026-07-10: PR #60 merged (ISigner abstraction). Leveled logging (this PR)
+- 2026-07-10: PR #61 merged (leveled logging), closing the buildable M6 items.
+  Interop follow-ups (this PR): lncli verifymessage cross-check passed live in
+  both directions vs LND v0.20 (beignet signature recovers our exact pubkey
+  via lncli verifymessage; LND signature verifies in beignet and recovers
+  LND's identity key; no code change needed). Live LND tower interop test
+  added, which caught and fixed the regtest wtwire chain_hash byte-order bug.
+- 2026-07-10: PR #60 merged (ISigner abstraction). Leveled logging (PR #61)
   closes the buildable M6 items; remaining M6 entries are the mTLS and key
   rotation [?] decisions.
 - 2026-07-10: PR #58 merged (scoped API auth) and v0.3.0 released (PR #59,

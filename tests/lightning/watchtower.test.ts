@@ -8,7 +8,11 @@ import {
 	createOpenerState,
 	createAcceptorState
 } from '../../src/lightning/channel/channel-state';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	BITCOIN_CHAIN_HASH,
+	DEFAULT_CHANNEL_CONFIG,
+	REGTEST_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 import { Channel } from '../../src/lightning/channel/channel';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { MessageType } from '../../src/lightning/message/types';
@@ -878,5 +882,30 @@ describe('watchtower config gating', function () {
 		// backupRevokedState must be a no-op (no towers, no throw).
 		client.backupRevokedState(contextForClient());
 		expect(client.getHealth()).to.deep.equal([]);
+	});
+});
+
+describe('watchtower chain hashes', function () {
+	it('match the channel-layer chain hash constants (internal byte order)', function () {
+		// Regression: the regtest entry was stored in display byte order and a
+		// live LND tower rejected Init with "remote init has unknown chain
+		// hash". The channel layer's constants are interop-proven; the wtwire
+		// Init chain_hash must be byte-identical to them.
+		expect(
+			chainHashForNetwork(bitcoin.networks.bitcoin).equals(BITCOIN_CHAIN_HASH)
+		).to.equal(true);
+		expect(
+			chainHashForNetwork(bitcoin.networks.regtest).equals(REGTEST_CHAIN_HASH)
+		).to.equal(true);
+	});
+
+	it('regtest chain hash is the genesis hash in internal byte order', function () {
+		// bitcoin-cli -regtest getblockhash 0 (display order), reversed.
+		const display =
+			'0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206';
+		const internal = Buffer.from(display, 'hex').reverse();
+		expect(
+			chainHashForNetwork(bitcoin.networks.regtest).equals(internal)
+		).to.equal(true);
 	});
 });
