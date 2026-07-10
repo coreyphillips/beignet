@@ -30,6 +30,24 @@ export function saveConfig(config: BeignetConfig): void {
 }
 
 /**
+ * BEIGNET_API_KEYS: JSON array of { name, key, scopes } for scoped API keys.
+ * Malformed JSON is ignored here (treated as unset); scope/name validation
+ * happens in the daemon's ApiKeyAuthenticator at startup.
+ */
+function parseApiKeysEnv(): BeignetConfig['apiKeys'] {
+	const raw = process.env.BEIGNET_API_KEYS;
+	if (!raw) return undefined;
+	try {
+		const parsed = JSON.parse(raw);
+		return Array.isArray(parsed)
+			? (parsed as BeignetConfig['apiKeys'])
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Merge CLI flags > env vars > config file, returning final config.
  */
 export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
@@ -88,6 +106,7 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			file.largeChannels,
 		apiToken:
 			cliFlags.apiToken || process.env.BEIGNET_API_TOKEN || file.apiToken,
+		apiKeys: cliFlags.apiKeys || parseApiKeysEnv() || file.apiKeys,
 		autoBootstrap:
 			cliFlags.autoBootstrap ??
 			(process.env.BEIGNET_AUTO_BOOTSTRAP !== undefined

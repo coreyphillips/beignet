@@ -12,6 +12,16 @@ export {
 	isPermanentFailure
 } from './errors';
 export { startDaemon, DaemonOptions } from './daemon';
+export {
+	ApiKeyAuthenticator,
+	ApiKeyDefinition,
+	ApiScope,
+	AuthResult,
+	AuthSuccess,
+	ROUTE_SCOPES,
+	getRouteScopes,
+	scopesAllowRoute
+} from './auth';
 export { getOpenApiSpec } from './openapi';
 export { WebhookManager, IWebhookStorage } from './webhooks';
 export { PaymentQueue, IPaymentQueueStorage } from './payment-queue';

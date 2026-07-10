@@ -15,11 +15,21 @@ import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
 import { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
+import {
+	ApiKeyAuthenticator,
+	ApiKeyDefinition,
+	AuthSuccess,
+	getRouteScopes,
+	scopesAllowRoute
+} from './auth';
 
 export interface DaemonOptions extends BeignetNodeOptions {
 	daemonPort?: number;
 	daemonHost?: string;
+	/** Legacy single bearer token. Still honored, with implicit admin scope. */
 	apiToken?: string;
+	/** Named API keys with permission scopes (readonly/invoice/admin). */
+	apiKeys?: ApiKeyDefinition[];
 	cors?: boolean | string;
 	/** Optional rate limiting configuration. Disabled by default. */
 	rateLimit?: RateLimitOptions;
@@ -60,6 +70,13 @@ function success<T>(result: T): ApiResponse<T> {
 
 function failure(code: string, message: string): ApiResponse<never> {
 	return { ok: false, error: { code, message } };
+}
+
+/** 403 message: which scopes the route accepts (admin always qualifies). */
+function insufficientScopeMessage(auth: AuthSuccess, routeKey: string): string {
+	const accepted = [...getRouteScopes(routeKey), 'admin'].join(', ');
+	const who = auth.keyName === null ? 'API key' : `API key "${auth.keyName}"`;
+	return `${who} lacks the required scope (accepted: ${accepted})`;
 }
 
 export async function parseBody(
@@ -105,20 +122,8 @@ export async function parseBody(
 	});
 }
 
-/**
- * Check Authorization header. Returns true if authorized.
- * Case-insensitive matching on "Bearer" prefix.
- */
-function checkAuth(req: http.IncomingMessage, apiToken: string): boolean {
-	const header = req.headers['authorization'];
-	if (!header) return false;
-	const match = header.match(/^bearer\s+(.+)$/i);
-	if (!match) return false;
-	return match[1] === apiToken;
-}
-
 // Routes exempt from authentication
-const AUTH_EXEMPT_ROUTES = new Set([
+export const AUTH_EXEMPT_ROUTES = new Set([
 	'GET /health',
 	'GET /ready',
 	'GET /openapi.json',
@@ -158,7 +163,9 @@ export async function startDaemon(
 			? opts.daemonPort
 			: 2112;
 	const host = opts.daemonHost || '127.0.0.1';
-	const apiToken = opts.apiToken;
+	// Validates apiKeys (names/keys/scopes) up front; throws INVALID_PARAMS
+	// on bad config before the node is created.
+	const authenticator = new ApiKeyAuthenticator(opts.apiToken, opts.apiKeys);
 	const node = await BeignetNode.create(opts);
 	const storage = node.getStorage();
 	const webhookManager = new WebhookManager(storage);
@@ -191,10 +198,10 @@ export async function startDaemon(
 	const routes: Record<string, RouteHandler> = {
 		'GET /info': () => success(node.getInfo()),
 		'GET /mnemonic': () => {
-			if (!apiToken) {
+			if (!authenticator.enabled) {
 				return failure(
 					'MNEMONIC_REQUIRES_AUTH',
-					'Configure apiToken to enable mnemonic access'
+					'Configure apiToken or apiKeys to enable mnemonic access'
 				);
 			}
 			return success({ mnemonic: node.getMnemonic() });
@@ -1316,6 +1323,20 @@ export async function startDaemon(
 					'Queued payment not found or already processing'
 				);
 			return success({ cancelled: true });
+		},
+
+		// ── Scoped API keys (admin-only) ──
+		'GET /auth/keys': () => success({ keys: authenticator.listKeys() }),
+		'POST /auth/keys/revoke': (body) => {
+			const { name } = body as { name?: string };
+			if (!name) return failure('INVALID_PARAMS', 'name required');
+			const revoked = authenticator.revoke(name);
+			if (!revoked)
+				return failure(
+					'NOT_FOUND',
+					`No API key named "${name}" (the legacy apiToken has no name; remove it from the config and restart)`
+				);
+			return success({ revoked: name });
 		}
 	};
 
@@ -1379,15 +1400,28 @@ export async function startDaemon(
 
 		// ── SSE endpoint ──
 		if (routeKey === 'GET /events') {
-			if (apiToken && !checkAuth(req, apiToken)) {
-				res.setHeader('Content-Type', 'application/json');
-				res.statusCode = 401;
-				res.end(
-					JSON.stringify(
-						failure('UNAUTHORIZED', 'Invalid or missing Authorization header')
-					)
-				);
-				return;
+			if (authenticator.enabled) {
+				const auth = authenticator.authenticate(req.headers['authorization']);
+				if (!auth.ok) {
+					res.setHeader('Content-Type', 'application/json');
+					res.statusCode = 401;
+					res.end(
+						JSON.stringify(
+							failure('UNAUTHORIZED', 'Invalid or missing Authorization header')
+						)
+					);
+					return;
+				}
+				if (!scopesAllowRoute(auth.scopes, routeKey)) {
+					res.setHeader('Content-Type', 'application/json');
+					res.statusCode = 403;
+					res.end(
+						JSON.stringify(
+							failure('FORBIDDEN', insufficientScopeMessage(auth, routeKey))
+						)
+					);
+					return;
+				}
 			}
 			const sseHeaders: Record<string, string> = {
 				'Content-Type': 'text/event-stream',
@@ -1401,6 +1435,9 @@ export async function startDaemon(
 					'Content-Type, Authorization';
 			}
 			res.writeHead(200, sseHeaders);
+			// SSE comment line: parsers ignore it; flushes headers to the client
+			// immediately instead of buffering until the first event/keepalive.
+			res.write(': connected\n\n');
 			sseClients.add(res);
 			// Send keepalive every 30s to prevent proxy timeouts
 			const keepalive = setInterval(() => {
@@ -1423,12 +1460,25 @@ export async function startDaemon(
 		res.setHeader('Content-Type', 'application/json');
 
 		// ── Auth middleware ──
-		if (apiToken && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
-			if (!checkAuth(req, apiToken)) {
+		// 401 for a bad/absent key, 403 for a valid key without the required
+		// scope. Unclassified routes fail closed to admin-only (see
+		// ROUTE_SCOPES in auth.ts and the drift test that keeps it complete).
+		if (authenticator.enabled && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
+			const auth = authenticator.authenticate(req.headers['authorization']);
+			if (!auth.ok) {
 				res.statusCode = 401;
 				res.end(
 					JSON.stringify(
 						failure('UNAUTHORIZED', 'Invalid or missing Authorization header')
+					)
+				);
+				return;
+			}
+			if (!scopesAllowRoute(auth.scopes, routeKey)) {
+				res.statusCode = 403;
+				res.end(
+					JSON.stringify(
+						failure('FORBIDDEN', insufficientScopeMessage(auth, routeKey))
 					)
 				);
 				return;

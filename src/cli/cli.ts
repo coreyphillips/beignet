@@ -54,11 +54,14 @@ function parseRepeatedFlag(name: string): string[] {
 	return out;
 }
 
-// Resolve apiToken from CLI flag, env, or config file for HTTP requests
+// Resolve the bearer credential for HTTP requests: CLI flag, env, or config
+// file. A named scoped key's secret works anywhere the legacy token does
+// (--api-key/BEIGNET_API_KEY are aliases for supplying one explicitly).
 function getApiToken(): string | undefined {
-	const flagToken = parseFlag('--api-token');
+	const flagToken = parseFlag('--api-token') || parseFlag('--api-key');
 	if (flagToken) return flagToken;
 	if (process.env.BEIGNET_API_TOKEN) return process.env.BEIGNET_API_TOKEN;
+	if (process.env.BEIGNET_API_KEY) return process.env.BEIGNET_API_KEY;
 	const config = loadConfig();
 	return config.apiToken;
 }
@@ -300,6 +303,8 @@ async function main(): Promise<void> {
 			return handleWebhooks();
 		case 'queue':
 			return handleQueue();
+		case 'auth':
+			return handleAuth();
 		case 'backup':
 			return handleBackup();
 		case 'restore':
@@ -437,6 +442,7 @@ async function handleStart(): Promise<void> {
 			preferAnchors: config.preferAnchors,
 			largeChannels: config.largeChannels,
 			apiToken: config.apiToken,
+			apiKeys: config.apiKeys,
 			backupPath: config.backupPath,
 			backupIntervalMs: config.backupIntervalMs,
 			dailySpendLimitSats: config.dailySpendLimitSats,
@@ -1310,6 +1316,40 @@ async function handleWebhooks(): Promise<void> {
 	}
 }
 
+async function handleAuth(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'keys':
+			return outputResult(await httpRequest('GET', '/auth/keys'));
+		case 'revoke': {
+			const name = filteredArgs[2];
+			if (!name) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet auth revoke <name>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/auth/keys/revoke', { name })
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet auth [keys|revoke <name>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 async function handleQueue(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
@@ -2144,6 +2184,12 @@ Webhooks (event push; see also GET /events SSE):
   webhooks unregister <id>               Remove a webhook
   webhooks list                          List registered webhooks
 
+API auth (scoped keys; see apiKeys config):
+  auth keys                              List named API keys (names + scopes,
+                                         never secrets)
+  auth revoke <name>                     Disable a named key until restart
+                                         (remove it from config for good)
+
 Start flags:
   --network <name>                       mainnet | testnet | signet | regtest
   --fee-source <src>                     Fee estimate source: electrum | http |
@@ -2153,7 +2199,12 @@ Start flags:
   --host <addr>                          HTTP daemon bind address (default: 127.0.0.1)
   --daemon                               Run in background
   --anchors                              Prefer anchor channels (zero-fee HTLC)
-  --api-token <token>                    API authentication token
+  --api-token <token>                    API authentication token (legacy single
+                                         token, implicit admin scope; named
+                                         scoped keys go in the apiKeys config
+                                         or BEIGNET_API_KEYS env JSON)
+  --api-key <key>                        Alias of --api-token for sending a
+                                         named key's secret with any command
   --backup-path <path>                   Enable automated backups to path
   --backup-interval <ms>                 Backup interval (default: 21600000 = 6h)
   --daily-spend-limit <sats>             Combined daily spending limit in sats
