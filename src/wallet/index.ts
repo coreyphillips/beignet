@@ -1,6 +1,6 @@
 import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
-import { Network, networks } from 'bitcoinjs-lib';
+import { Network } from 'bitcoinjs-lib';
 import BIP32Factory, { BIP32Interface } from 'bip32';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import cloneDeep from 'lodash.clonedeep';
@@ -59,6 +59,7 @@ import {
 	TAddressIndexInfo,
 	TAddressTypeContent,
 	TAvailableNetworks,
+	TFeeEstimationSource,
 	TGapLimitOptions,
 	TGetData,
 	TGetTotalFeeObj,
@@ -76,6 +77,7 @@ import {
 	TWalletDataKeys
 } from '../types';
 import {
+	clampFeeRate,
 	decodeOpReturnMessage,
 	err,
 	filterAddressesObjForGapLimit,
@@ -88,6 +90,7 @@ import {
 	getDataFallback,
 	getDefaultWalletData,
 	getDefaultWalletDataKeys,
+	getBitcoinJsNetwork,
 	getElectrumNetwork,
 	getHighestUsedIndexFromTxHashes,
 	getKeyDerivationPath,
@@ -165,6 +168,7 @@ export class Wallet {
 	public feeEstimates: IOnchainFees;
 	public rbf: boolean;
 	public selectedFeeId: EFeeId;
+	public feeEstimationSource: TFeeEstimationSource;
 	public disableMessages: boolean;
 	public gapLimitOptions: TGapLimitOptions;
 	private constructor({
@@ -182,6 +186,7 @@ export class Wallet {
 		customGetScriptHash,
 		rbf = false,
 		selectedFeeId = EFeeId.normal,
+		feeEstimationSource = 'auto',
 		disableMessages = false,
 		disableMessagesOnCreate = false,
 		addressTypesToMonitor = Object.values(EAddressType),
@@ -254,6 +259,7 @@ export class Wallet {
 		});
 		this.rbf = rbf;
 		this.selectedFeeId = selectedFeeId;
+		this.feeEstimationSource = feeEstimationSource;
 		this.isRefreshing = false;
 		this.isSwitchingNetworks = false;
 		this.addressTypesToMonitor = addressTypesToMonitor;
@@ -638,7 +644,7 @@ export class Wallet {
 	 */
 	private getBitcoinNetwork(network?: TAvailableNetworks): Network {
 		if (!network) network = this._network;
-		return bitcoin.networks[network];
+		return getBitcoinJsNetwork(network);
 	}
 
 	/**
@@ -2932,37 +2938,96 @@ export class Wallet {
 	}
 
 	/**
-	 * Returns the current fee estimates for the provided network.
+	 * Returns the current fee estimates for the provided network, honoring
+	 * feeEstimationSource ('electrum' | 'http' | 'auto'):
+	 * - 'electrum': connected Electrum server only; on failure the previous
+	 *   estimates are returned rather than leaking the request to clearnet HTTP.
+	 * - 'http': mempool.space with a blocktank fallback.
+	 * - 'auto' (default): Electrum first, HTTP only when Electrum is
+	 *   disconnected or returns unusable values.
+	 * All remote-sourced rates are clamped to [1, MAX_FEE_RATE_SAT_PER_VBYTE].
 	 * @async
 	 * @returns {Promise<IOnchainFees>}
 	 */
 	public async getFeeEstimates(network = this._network): Promise<IOnchainFees> {
-		try {
-			if (network === EAvailableNetworks.bitcoinRegtest) {
-				return { ...defaultFeesShape, timestamp: Date.now() };
+		if (network === EAvailableNetworks.bitcoinRegtest) {
+			return { ...defaultFeesShape, timestamp: Date.now() };
+		}
+		if (this.feeEstimationSource !== 'http') {
+			const electrumFees = await this.getFeeEstimatesFromElectrum();
+			if (electrumFees.isOk()) {
+				return electrumFees.value;
 			}
-			const urlModifier = network === 'bitcoin' ? '' : 'testnet/';
+			if (this.feeEstimationSource === 'electrum') {
+				return this.feeEstimates;
+			}
+		}
+		return this.getFeeEstimatesFromHttp(network);
+	}
+
+	/**
+	 * Queries the connected Electrum server (blockchain.estimatefee) for fee
+	 * estimates at the fast/normal/slow/minimum confirmation targets. Errs when
+	 * disconnected or when any target returns an unusable value (-1).
+	 * @async
+	 * @returns {Promise<Result<IOnchainFees>>}
+	 */
+	public async getFeeEstimatesFromElectrum(): Promise<Result<IOnchainFees>> {
+		if (!this.electrum.connectedToElectrum) {
+			return err('Not connected to an Electrum server.');
+		}
+		// Confirmation targets (blocks) for fast/normal/slow/minimum.
+		const targets = [2, 6, 24, 144];
+		const results = await Promise.all(
+			targets.map((blocks) => this.electrum.getFeeEstimate(blocks))
+		);
+		const [fast, normal, slow, minimum] = results;
+		if (fast.isErr() || normal.isErr() || slow.isErr() || minimum.isErr()) {
+			return err('Electrum returned unusable fee estimates.');
+		}
+		return ok({
+			fast: fast.value,
+			normal: normal.value,
+			slow: slow.value,
+			minimum: minimum.value,
+			timestamp: Date.now()
+		});
+	}
+
+	/**
+	 * Fetches fee estimates over HTTP from mempool.space, falling back to
+	 * blocktank if mempool.space is down.
+	 * @async
+	 * @param {EAvailableNetworks} network
+	 * @returns {Promise<IOnchainFees>}
+	 */
+	public async getFeeEstimatesFromHttp(
+		network = this._network
+	): Promise<IOnchainFees> {
+		try {
+			let urlModifier = '';
+			if (network !== EAvailableNetworks.bitcoinMainnet) {
+				urlModifier =
+					network === EAvailableNetworks.bitcoinSignet ? 'signet/' : 'testnet/';
+			}
 			const response = await fetch(
 				`https://mempool.space/${urlModifier}api/v1/fees/recommended`
 			);
 			const res: IGetFeeEstimatesResponse = await response.json();
-			// check the response for the expected properties
-			if (
-				!(
-					res.fastestFee > 0 &&
-					res.halfHourFee > 0 &&
-					res.hourFee > 0 &&
-					res.minimumFee > 0
-				)
-			) {
+			const fast = clampFeeRate(res.fastestFee);
+			const normal = clampFeeRate(res.halfHourFee);
+			const slow = clampFeeRate(res.hourFee);
+			const minimum = clampFeeRate(res.minimumFee);
+			// clampFeeRate returns 0 for unusable (non-finite or <= 0) values.
+			if (!(fast > 0 && normal > 0 && slow > 0 && minimum > 0)) {
 				throw new Error('Unexpected response from mempool.space');
 			}
 
 			return {
-				fast: res.fastestFee,
-				normal: res.halfHourFee,
-				slow: res.hourFee,
-				minimum: res.minimumFee,
+				fast,
+				normal,
+				slow,
+				minimum,
 				timestamp: Date.now()
 			};
 		} catch {
@@ -2996,10 +3061,16 @@ export class Wallet {
 			) {
 				throw new Error('Unexpected response from blocktank');
 			}
-			const { fast, mid, slow } = res.onchain.feeRates;
+			const fast = clampFeeRate(res.onchain.feeRates.fast);
+			const normal = clampFeeRate(res.onchain.feeRates.mid);
+			const slow = clampFeeRate(res.onchain.feeRates.slow);
+			// clampFeeRate returns 0 for unusable (non-finite or <= 0) values.
+			if (!(fast > 0 && normal > 0 && slow > 0)) {
+				throw new Error('Unexpected response from blocktank');
+			}
 			return {
 				fast,
-				normal: mid,
+				normal,
 				slow,
 				minimum: slow,
 				timestamp: Date.now()
@@ -3934,7 +4005,7 @@ export class Wallet {
 	getBip32Interface = async (): Promise<Result<BIP32Interface>> => {
 		try {
 			if (!this._mnemonic) return err(new WatchOnlySigningError());
-			const network = networks[this._network];
+			const network = getBitcoinJsNetwork(this._network);
 			const seed = await bip39.mnemonicToSeed(this._mnemonic, this._passphrase);
 			const root = bip32.fromSeed(seed, network);
 			return ok(root);

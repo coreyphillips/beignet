@@ -298,13 +298,15 @@ export interface Bolt12InvoiceInfo {
 
 export interface BeignetConfig {
 	mnemonic?: string;
-	network?: 'mainnet' | 'testnet' | 'regtest';
+	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
 	dataDir?: string;
 	electrumHost?: string;
 	electrumPort?: number;
 	electrumTls?: boolean;
 	electrumServers?: Array<{ host: string; port: number; tls?: boolean }>;
+	/** Fee estimate source: 'electrum' | 'http' | 'auto' (default 'auto'). */
+	feeEstimationSource?: 'electrum' | 'http' | 'auto';
 	listenPort?: number;
 	daemonPort?: number;
 	daemonHost?: string;

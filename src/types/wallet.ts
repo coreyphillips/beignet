@@ -12,7 +12,7 @@ import { ECoinSelectPreference, EFeeId, TGapLimitOptions } from './transaction';
 import { ECPairInterface } from 'ecpair';
 import { BIP32Interface } from 'bip32';
 
-export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest';
+export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest' | 'signet';
 export type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh';
 export type TAddressLabel = 'bech32' | 'segwit' | 'legacy';
 export type TKeyDerivationPurpose = '84' | '49' | '44' | string; //"p2wpkh" | "p2sh" | "p2pkh";
@@ -30,8 +30,19 @@ export enum EAvailableNetworks {
 	testnet = 'testnet',
 	bitcoinTestnet = 'testnet',
 	regtest = 'regtest',
-	bitcoinRegtest = 'regtest'
+	bitcoinRegtest = 'regtest',
+	signet = 'signet',
+	bitcoinSignet = 'signet'
 }
+
+/**
+ * Where getFeeEstimates sources its data:
+ * - 'electrum': the connected Electrum server only (no clearnet HTTP leak).
+ * - 'http': mempool.space with a blocktank fallback (legacy behavior).
+ * - 'auto' (default): Electrum first, HTTP only when Electrum is unavailable
+ *   or returns unusable values.
+ */
+export type TFeeEstimationSource = 'electrum' | 'http' | 'auto';
 export enum EAddressType {
 	p2wpkh = 'p2wpkh',
 	p2sh = 'p2sh',
@@ -210,6 +221,7 @@ export interface IWallet {
 	customGetScriptHash?: (data: ICustomGetScriptHash) => Promise<string>;
 	rbf?: boolean;
 	selectedFeeId?: EFeeId;
+	feeEstimationSource?: TFeeEstimationSource;
 	disableMessages?: boolean;
 	disableMessagesOnCreate?: boolean;
 	addressTypesToMonitor?: EAddressType[];

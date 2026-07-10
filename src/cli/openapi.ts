@@ -1799,13 +1799,24 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/address/new': {
 				post: {
 					summary: 'Generate a new on-chain receiving address',
+					description:
+						'Pass bip21:true (with optional amountSats/label/message) to also receive the address encoded as a BIP21 payment URI.',
 					tags: ['Node'],
+					requestBody: bodyContent({
+						bip21: 'boolean?',
+						amountSats: 'integer?',
+						label: 'string?',
+						message: 'string?'
+					}),
 					responses: {
 						'200': {
 							description: 'New address',
 							content: jsonContent({
 								type: 'object',
-								properties: { address: { type: 'string' } }
+								properties: {
+									address: { type: 'string' },
+									bip21: { type: 'string' }
+								}
 							})
 						}
 					}

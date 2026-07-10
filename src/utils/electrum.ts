@@ -10,7 +10,7 @@ import {
 	IFormattedPeerData,
 	TProtocol
 } from '../types';
-import * as hardcodedPeers from 'rn-electrum-client/helpers/peers.json';
+import { defaultElectrumPeers } from '../shapes/electrum';
 
 const POLLING_INTERVAL = 1000 * 20;
 export const defaultElectrumPorts = ['51002', '50002', '51001', '50001'];
@@ -25,6 +25,9 @@ export const getDefaultPort = (
 	selectedNetwork: EAvailableNetworks,
 	protocol: TProtocol
 ): number => {
+	if (selectedNetwork === 'signet') {
+		return protocol === 'ssl' ? 60602 : 60601;
+	}
 	if (protocol === 'ssl') {
 		return selectedNetwork === 'testnet' ? 51002 : 50002;
 	} else {
@@ -48,6 +51,10 @@ export const getProtocolForPort = (
 
 	if (network === 'testnet') {
 		return port === '51002' ? 'ssl' : 'tcp';
+	}
+
+	if (network === 'signet') {
+		return port === '60602' ? 'ssl' : 'tcp';
 	}
 
 	return port === '50002' ? 'ssl' : 'tcp';
@@ -117,7 +124,7 @@ export const getPeers = async ({
 			}
 		}
 		// No peers available grab hardcoded peers instead.
-		return ok(hardcodedPeers[selectedNetwork]);
+		return ok(defaultElectrumPeers[getElectrumNetwork(selectedNetwork)] ?? []);
 	} catch (e) {
 		if (typeof e === 'string' || e instanceof Error) {
 			return err(e);
@@ -204,6 +211,8 @@ export const getElectrumNetwork = (
 			return EElectrumNetworks.bitcoinTestnet;
 		case 'regtest':
 			return EElectrumNetworks.bitcoinRegtest;
+		case 'signet':
+			return EElectrumNetworks.bitcoinSignet;
 		default:
 			return EElectrumNetworks.bitcoinTestnet;
 	}

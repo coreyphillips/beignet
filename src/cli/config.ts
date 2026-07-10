@@ -103,6 +103,9 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				: undefined) ||
 			file.backupIntervalMs,
 		electrumServers: cliFlags.electrumServers || file.electrumServers,
+		feeEstimationSource: (cliFlags.feeEstimationSource ||
+			process.env.BEIGNET_FEE_SOURCE ||
+			file.feeEstimationSource) as BeignetConfig['feeEstimationSource'],
 		dailySpendLimitSats:
 			cliFlags.dailySpendLimitSats ||
 			(process.env.BEIGNET_DAILY_SPEND_LIMIT_SATS

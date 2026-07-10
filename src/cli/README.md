@@ -68,7 +68,7 @@ await node.destroy();
 ```typescript
 const node = await BeignetNode.create({
   mnemonic?: string,        // BIP39 mnemonic; generates new if omitted
-  network?: string,         // 'mainnet' | 'testnet' | 'regtest' (default: 'mainnet')
+  network?: string,         // 'mainnet' | 'testnet' | 'signet' | 'regtest' (default: 'mainnet')
   alias?: string,           // node alias
   dataDir?: string,         // SQLite + data dir (default: ~/.beignet/data)
   electrumHost?: string,    // Electrum server host
@@ -446,7 +446,7 @@ The `log` event fires based on the `logLevel` option. Set `logLevel: 'debug'` fo
 interface NodeInfo {
   nodeId: string;           // 33-byte compressed pubkey, hex
   alias?: string;
-  network: string;          // 'mainnet' | 'testnet' | 'regtest'
+  network: string;          // 'mainnet' | 'testnet' | 'signet' | 'regtest'
   blockHeight: number;
   onchainBalanceSats: number;
   lightningBalanceSats: number;

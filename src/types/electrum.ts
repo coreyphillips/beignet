@@ -9,11 +9,16 @@ import {
 export type Net = typeof import('net');
 export type Tls = typeof import('tls');
 
-export type TElectrumNetworks = 'bitcoin' | 'bitcoinTestnet' | 'bitcoinRegtest';
+export type TElectrumNetworks =
+	| 'bitcoin'
+	| 'bitcoinTestnet'
+	| 'bitcoinRegtest'
+	| 'bitcoinSignet';
 export enum EElectrumNetworks {
 	bitcoin = 'bitcoin',
 	bitcoinTestnet = 'bitcoinTestnet',
-	bitcoinRegtest = 'bitcoinRegtest'
+	bitcoinRegtest = 'bitcoinRegtest',
+	bitcoinSignet = 'bitcoinSignet'
 }
 export type TConnectToElectrumRes = string;
 

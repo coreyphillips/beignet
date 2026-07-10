@@ -155,6 +155,19 @@ async function main(): Promise<void> {
 					})
 				);
 			}
+			if (hasFlag('--bip21')) {
+				const amountFlag = parseFlag('--amount');
+				const labelFlag = parseFlag('--label');
+				const messageFlag = parseFlag('--message');
+				return outputResult(
+					await httpRequest('POST', '/address/new', {
+						bip21: true,
+						...(amountFlag ? { amountSats: parseInt(amountFlag, 10) } : {}),
+						...(labelFlag ? { label: labelFlag } : {}),
+						...(messageFlag ? { message: messageFlag } : {})
+					})
+				);
+			}
 			return outputResult(await httpRequest('POST', '/address/new'));
 		case 'mnemonic':
 			return outputResult(await httpRequest('GET', '/mnemonic'));
@@ -370,6 +383,10 @@ async function handleStart(): Promise<void> {
 			.filter((a) => a.length > 0);
 	const watchtowerFlags = parseRepeatedFlag('--watchtower');
 	if (watchtowerFlags.length > 0) cliFlags.watchtowers = watchtowerFlags;
+	const feeSourceFlag = parseFlag('--fee-source');
+	if (feeSourceFlag)
+		cliFlags.feeEstimationSource =
+			feeSourceFlag as BeignetConfig['feeEstimationSource'];
 
 	const config = resolveConfig(cliFlags);
 
@@ -399,6 +416,7 @@ async function handleStart(): Promise<void> {
 			electrumPort: config.electrumPort,
 			electrumTls: config.electrumTls,
 			electrumServers: config.electrumServers,
+			feeEstimationSource: config.feeEstimationSource,
 			listenPort: config.listenPort,
 			daemonPort,
 			daemonHost: config.daemonHost,
@@ -1881,6 +1899,8 @@ Info:
   info                                   Node info
   balance                                On-chain + Lightning balance
   address                                New receive address
+  address --bip21 [--amount <sats>] [--label L] [--message M]
+                                         New address as a BIP21 URI
   address validate <address>             Validate a Bitcoin address
   mnemonic                               Show mnemonic
   health                                 Node health status
@@ -2059,6 +2079,10 @@ Webhooks (event push; see also GET /events SSE):
   webhooks list                          List registered webhooks
 
 Start flags:
+  --network <name>                       mainnet | testnet | signet | regtest
+  --fee-source <src>                     Fee estimate source: electrum | http |
+                                         auto (default: auto = Electrum first,
+                                         HTTP fallback)
   --port <N>                             HTTP daemon port (default: 2112)
   --host <addr>                          HTTP daemon bind address (default: 127.0.0.1)
   --daemon                               Run in background

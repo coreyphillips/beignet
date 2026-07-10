@@ -143,28 +143,32 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M5. Onchain wallet features
 
-- [~] Watch-only wallets (this PR): Wallet.createWatchOnly from any SLIP-132
+- [x] Watch-only wallets (PR #51, merged): Wallet.createWatchOnly from any SLIP-132
       xpub/ypub/zpub/tpub/upub/vpub, full read-only surface, byte-identical
       derivation to the full wallet, every signing path guarded with a typed
       WatchOnlySigningError. Library-only (the daemon always has the mnemonic).
-- [~] External-signer PSBT flow (this PR): buildPsbt (unsigned, with witnessUtxo,
+- [x] External-signer PSBT flow (PR #51, merged): buildPsbt (unsigned, with witnessUtxo,
       bip32Derivation fingerprint/path/pubkey, taproot fields, legacy
       nonWitnessUtxo), importSignedPsbt (validates every signature before
       finalizing, no broadcast), wallet.broadcastTransaction; daemon /psbt/build,
       /psbt/import-signed, /psbt/combine + CLI psbt commands.
-- [~] PSBT combine for multi-party signing (this PR): combinePsbts.
+- [x] PSBT combine for multi-party signing (PR #51, merged): combinePsbts.
 - [ ] Multisig / P2WSH address type (enum entry currently commented out,
       `types/wallet.ts:40`). Scope: descriptor-based multisig receive + spend.
 (Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
-- [ ] Fee estimation privacy: optional Electrum-based estimatefee source so fee data
-      does not leak to mempool.space/blocktank over clearnet.
-- [ ] Robust multi-server Electrum failover: rotate through the provided server array
-      on failure with health tracking.
-- [ ] BIP21 URI generation (decode exists, encode does not).
+- [~] Fee estimation privacy (this PR): feeEstimationSource 'auto' (default,
+      Electrum first) | 'electrum' (never HTTP) | 'http'; every remote rate
+      clamped to 5000 sat/vB.
+- [~] Robust multi-server Electrum failover (this PR): deterministic ordered
+      rotation with per-server 60s cooldown, then network fallback peers (never
+      for regtest); lightning reconnect monitor untouched.
+- [~] BIP21 URI generation (this PR): encodeBip21 + POST /address/new bip21 option
+      + CLI address --bip21.
 - [ ] Public UTXO freeze/unfreeze API surfacing the internal blacklist.
 - [ ] Per-address user labels (tx labels/tags exist; IAddressData.label is the type
       name, not user data).
-- [ ] Signet network support (enums are bitcoin/testnet/regtest only).
+- [~] Signet network support (this PR): full onchain + lightning (chain hash, coin
+      type 1, daemon --network signet, default signet Electrum peer).
 - [ ] Wallet birthday / height checkpoint to bound rescans.
 - [ ] Multi-account support (account index is hardwired to 0).
 - [ ] Descriptor / backup export for the onchain wallet.
@@ -232,6 +236,10 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #51 merged (watch-only + PSBT flow; CI now isolates the offline
+  suites from live-Electrum tests). PR #52 merged (untracked a node_modules symlink
+  #51 accidentally committed; .gitignore pattern hardened). Batch B (this PR):
+  Electrum fee source, failover, signet, BIP21 encode.
 - 2026-07-10: PRs #49/#50 completed M4. M5 started; Tor-for-Electrum deferred to M7
   (Corey). DECIDED: dailySpendLimit becomes a combined LN+onchain budget (external
   sends count; consolidate/channel-funding/fee-bumps excluded) - lands in batch C.

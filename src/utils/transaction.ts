@@ -1,5 +1,5 @@
 import * as bitcoin from 'bitcoinjs-lib';
-import { networks, Psbt } from 'bitcoinjs-lib';
+import { Psbt } from 'bitcoinjs-lib';
 import { err, ok, Result } from './result';
 import {
 	EAddressType,
@@ -14,7 +14,7 @@ import { reduceValue } from './wallet';
 import validate, { getAddressInfo } from 'bitcoin-address-validation';
 import * as bip21 from 'bip21';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
-import { validateAddress } from './helpers';
+import { getBitcoinJsNetwork, validateAddress } from './helpers';
 import { btcToSats } from './conversion';
 
 /**
@@ -50,6 +50,51 @@ export const setReplaceByFee = ({
 			});
 		}
 	} catch {}
+};
+
+export interface IEncodeBip21 {
+	address: string;
+	amountSats?: number;
+	label?: string;
+	message?: string;
+}
+
+/**
+ * Encodes a BIP21 payment URI (bitcoin:<address>?amount=&label=&message=).
+ * The amount is expressed in BTC decimal as the spec requires; it is passed
+ * as a fixed-notation string so sub-1e-6 amounts never serialize in exponent
+ * form (e.g. "1e-8").
+ * @param {IEncodeBip21} params
+ * @returns {Result<string>}
+ */
+export const encodeBip21 = ({
+	address,
+	amountSats,
+	label,
+	message
+}: IEncodeBip21): Result<string> => {
+	try {
+		if (!address) {
+			return err('No address provided.');
+		}
+		const options: { [key: string]: string } = {};
+		if (amountSats !== undefined) {
+			if (!Number.isInteger(amountSats) || amountSats < 0) {
+				return err('amountSats must be a non-negative integer.');
+			}
+			if (amountSats > 0) {
+				options.amount = (amountSats / 1e8)
+					.toFixed(8)
+					.replace(/0+$/, '')
+					.replace(/\.$/, '');
+			}
+		}
+		if (label) options.label = label;
+		if (message) options.message = message;
+		return ok(bip21.encode(address, options));
+	} catch (e) {
+		return err(e);
+	}
 };
 
 /*
@@ -380,7 +425,7 @@ export const decodeRawTransaction = (
 	_network: EAvailableNetworks
 ): Result<TDecodeRawTx> => {
 	try {
-		const network = networks[_network];
+		const network = getBitcoinJsNetwork(_network);
 		const tx = bitcoin.Transaction.fromHex(hex);
 		return ok({
 			txid: tx.getId(),
