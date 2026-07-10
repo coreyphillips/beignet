@@ -6,6 +6,15 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { BeignetConfig } from './types';
+import { TLogLevel } from '../logger';
+
+const LOG_LEVELS: TLogLevel[] = ['debug', 'info', 'warn', 'error', 'silent'];
+
+function parseLogLevel(value?: string): TLogLevel | undefined {
+	return LOG_LEVELS.includes(value as TLogLevel)
+		? (value as TLogLevel)
+		: undefined;
+}
 
 const BEIGNET_DIR = path.join(
 	process.env.HOME || process.env.USERPROFILE || '.',
@@ -162,7 +171,11 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 			(process.env.BEIGNET_HTLC_EVENTS !== undefined
 				? process.env.BEIGNET_HTLC_EVENTS === 'true'
 				: undefined) ??
-			file.htlcEvents
+			file.htlcEvents,
+		logLevel:
+			parseLogLevel(cliFlags.logLevel) ||
+			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||
+			parseLogLevel(file.logLevel)
 	};
 }
 

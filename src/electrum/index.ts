@@ -1139,7 +1139,9 @@ export class Electrum {
 			const { error } = await electrum.pingServer();
 
 			if (error) {
-				console.log('Connection to Electrum Server lost, reconnecting...');
+				this.wallet.logger.info(
+					'Connection to Electrum Server lost, reconnecting...'
+				);
 				const response = await this.connectToElectrum({
 					network: this.network,
 					servers: this.servers
@@ -1158,7 +1160,7 @@ export class Electrum {
 				this.publishConnectionChange(true);
 			}
 		} catch (e) {
-			console.error(e);
+			this.wallet.logger.error('Electrum connection check failed.', e);
 			this.publishConnectionChange(false);
 		}
 	}

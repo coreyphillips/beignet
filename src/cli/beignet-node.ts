@@ -18,6 +18,7 @@ import {
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
+import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
 import {
@@ -135,7 +136,7 @@ import {
 	RebalanceExecutionSummary
 } from './types';
 
-export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'silent';
+export type LogLevel = TLogLevel;
 
 export interface LogEntry {
 	level: LogLevel;
@@ -205,6 +206,14 @@ export interface BeignetNodeOptions {
 	}) => void;
 	/** Log level (default 'info'). Set to 'silent' to suppress. */
 	logLevel?: LogLevel;
+	/**
+	 * Leveled diagnostic logger. When set, every log entry that passes
+	 * logLevel is forwarded to it (in addition to the 'log' event) and it is
+	 * injected into the underlying Wallet and LightningNode. When unset,
+	 * behavior is unchanged: BeignetNode only emits 'log' events and the
+	 * wallet keeps its default console output.
+	 */
+	logger?: ILogger;
 	/** Multiple Electrum servers for failover redundancy */
 	electrumServers?: Array<{ host: string; port: number; tls?: boolean }>;
 	/** Path for automated periodic backups (enables backup scheduling) */
@@ -428,14 +437,6 @@ async function resolveHostToIPv4(host: string): Promise<string> {
 	}
 }
 
-const LOG_PRIORITY: Record<LogLevel, number> = {
-	debug: 0,
-	info: 1,
-	warn: 2,
-	error: 3,
-	silent: 4
-};
-
 export class BeignetNode extends EventEmitter {
 	// ─── Typed event overloads ───
 	on<K extends keyof BeignetNodeEvents>(
@@ -484,6 +485,7 @@ export class BeignetNode extends EventEmitter {
 	private destroyed = false;
 	private startedAt = Date.now();
 	private logLevel: LogLevel = 'info';
+	private logger?: ILogger;
 	private autoGossipSync = true;
 	private rapidGossipSync = true;
 	private rapidGossipSyncUrl?: string;
@@ -531,9 +533,12 @@ export class BeignetNode extends EventEmitter {
 		message: string,
 		data?: Record<string, unknown>
 	): void {
-		if (LOG_PRIORITY[level] < LOG_PRIORITY[this.logLevel]) return;
+		if (LOG_LEVEL_PRIORITY[level] < LOG_LEVEL_PRIORITY[this.logLevel]) return;
 		const entry: LogEntry = { level, message, data, timestamp: Date.now() };
 		this.emit('log', entry);
+		if (this.logger && level !== 'silent') {
+			this.logger[level](message, data);
+		}
 	}
 
 	static async create(opts: BeignetNodeOptions = {}): Promise<BeignetNode> {
@@ -554,6 +559,7 @@ export class BeignetNode extends EventEmitter {
 
 	private async init(opts: BeignetNodeOptions): Promise<void> {
 		if (opts.logLevel) this.logLevel = opts.logLevel;
+		if (opts.logger) this.logger = opts.logger;
 		this.autoGossipSync = opts.autoGossipSync ?? true;
 		this.peerStorageEnabled = opts.peerStorageEnabled ?? true;
 		this.rapidGossipSync = opts.rapidGossipSync ?? true;
@@ -622,12 +628,16 @@ export class BeignetNode extends EventEmitter {
 		if (!opts.dataDir) {
 			const legacyDb = path.join(DEFAULT_DATA_DIR, `${networkName}.db`);
 			if (fs.existsSync(legacyDb) && !fs.existsSync(dbPath)) {
-				// eslint-disable-next-line no-console
-				console.warn(
+				const legacyMsg =
 					`[beignet] Found a legacy shared database at ${legacyDb}. ` +
-						`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
-						`If it held this wallet's channels, re-run with dataDir set to "${DEFAULT_DATA_DIR}" to use it.`
-				);
+					`Storage is now per-wallet (${dbPath}), so it is no longer auto-loaded. ` +
+					`If it held this wallet's channels, re-run with dataDir set to "${DEFAULT_DATA_DIR}" to use it.`;
+				this.log('warn', legacyMsg);
+				if (!this.logger) {
+					// Preserve the historical console notice when no logger is injected.
+					// eslint-disable-next-line no-console
+					console.warn(legacyMsg);
+				}
 			}
 		}
 
@@ -670,6 +680,9 @@ export class BeignetNode extends EventEmitter {
 				servers: electrumServer
 			},
 			disableMessagesOnCreate: true,
+			// Route wallet diagnostics through the injected logger when provided;
+			// otherwise keep the wallet's default console logger (status quo).
+			...(this.logger ? { logger: this.logger } : {}),
 			// Enable RBF wallet-wide: canBoost() only ever reports rbf when this
 			// flag is set, so without it /tx/bump-fee could never apply. Send
 			// paths pass it per-transaction so outputs actually signal BIP 125.
@@ -807,6 +820,7 @@ export class BeignetNode extends EventEmitter {
 			largeChannels: opts.largeChannels,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
+			logger: this.logger,
 			sweepDestinationScript,
 			socks5Proxy,
 			peerStorageEnabled: this.peerStorageEnabled,

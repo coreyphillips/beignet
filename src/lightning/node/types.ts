@@ -13,6 +13,7 @@ import { IRoute, INodeAddress } from '../gossip/types';
 import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
+import { ILogger } from '../../logger';
 import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 
@@ -203,6 +204,13 @@ export interface INodeConfig {
 	peerStorageEnabled?: boolean;
 	/** Fee estimator for dynamic fee rates */
 	feeEstimator?: IFeeEstimator;
+	/**
+	 * Leveled diagnostic logger (debug/info/warn/error). Defaults to a no-op
+	 * logger (the node is silent today), so injecting one only adds output.
+	 * Every structured action log entry is mirrored to logger.debug as
+	 * "category:action" alongside the persisted action log.
+	 */
+	logger?: ILogger;
 	/** Maximum payment retries (default 3) */
 	maxPaymentRetries?: number;
 	/** Global HTLC limit across all channels (default 1000) */

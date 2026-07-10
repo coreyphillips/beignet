@@ -132,6 +132,7 @@ import { Electrum } from '../electrum';
 import { Transaction } from '../transaction';
 import { GAP_LIMIT, GAP_LIMIT_CHANGE, TRANSACTION_DEFAULTS } from './constants';
 import { btcToSats } from '../utils/conversion';
+import { ILogger, createConsoleLogger } from '../logger';
 
 const bip32 = BIP32Factory(ecc);
 
@@ -191,6 +192,9 @@ export class Wallet {
 	public feeEstimationSource: TFeeEstimationSource;
 	public disableMessages: boolean;
 	public gapLimitOptions: TGapLimitOptions;
+	// Leveled diagnostic logger. Defaults to a console-backed logger at
+	// 'info' (preserving historical console output); injectable via IWallet.
+	public readonly logger: ILogger;
 	private constructor({
 		mnemonic,
 		xpub,
@@ -211,6 +215,7 @@ export class Wallet {
 		feeEstimationSource = 'auto',
 		disableMessages = false,
 		disableMessagesOnCreate = false,
+		logger,
 		addressTypesToMonitor = Object.values(EAddressType),
 		gapLimitOptions = {
 			lookBehind: GAP_LIMIT,
@@ -299,6 +304,7 @@ export class Wallet {
 				(type) => type !== EAddressType.p2wsh
 			);
 		}
+		this.logger = logger ?? createConsoleLogger('info');
 		this._data = getDefaultWalletData();
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
@@ -840,7 +846,7 @@ export class Wallet {
 		if (res.value !== id) {
 			const msg =
 				'Mismatched id found in storage. Change the wallet name or delete the old wallet from storage and try again.';
-			console.log(msg);
+			this.logger.warn(msg);
 			return err(msg);
 		}
 		return ok("ID's match, it's safe to continue.");
@@ -903,7 +909,7 @@ export class Wallet {
 						}
 						dataResult = getDataRes?.value;
 					} catch (e) {
-						console.log(e);
+						this.logger.error('Failed to read wallet data from storage.', e);
 					}
 					const data = dataResult ?? walletData[key];
 					switch (key) {
@@ -960,14 +966,14 @@ export class Wallet {
 							walletData[key] = data as number;
 							break;
 						default:
-							console.log(`Unhandled key in getWalletData: ${key}`);
+							this.logger.warn(`Unhandled key in getWalletData: ${key}`);
 							break;
 					}
 				})
 			);
 			return ok(walletData);
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to get wallet data.', e);
 			return err(e);
 		}
 	}
@@ -1205,7 +1211,7 @@ export class Wallet {
 		});
 		let msg = 'Unable to connect to Electrum server.';
 		if (res.isErr()) {
-			console.log(msg);
+			this.logger.warn(msg);
 			return err(msg);
 		}
 		msg = 'Connected to Electrum server.';
@@ -1616,7 +1622,7 @@ export class Wallet {
 				});
 
 				if (addressHistory.isErr()) {
-					console.log(addressHistory.error.message);
+					this.logger.warn(addressHistory.error.message);
 					return lastKnownIndexes;
 				}
 
@@ -1631,7 +1637,7 @@ export class Wallet {
 				});
 
 				if (highestUsedIndex.isErr()) {
-					console.log(highestUsedIndex.error.message);
+					this.logger.warn(highestUsedIndex.error.message);
 					return lastKnownIndexes;
 				}
 
@@ -1652,7 +1658,7 @@ export class Wallet {
 				});
 
 				if (highestStoredIndex.isErr()) {
-					console.log(highestStoredIndex.error.message);
+					this.logger.warn(highestStoredIndex.error.message);
 					return lastKnownIndexes;
 				}
 
@@ -3208,7 +3214,7 @@ export class Wallet {
 			);
 			return ok('Successfully updated unconfirmed transactions.');
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to update unconfirmed transactions.', e);
 			return err(e);
 		}
 	}
@@ -3526,12 +3532,12 @@ export class Wallet {
 		error: { code?: number; message?: string },
 		data: { tx_hash: string; vout: number }
 	): void {
-		console.error('\nError:', error);
+		this.logger.error('\nError:', error);
 		if (data) {
-			console.warn('Unable to retrieve input data for:', data);
+			this.logger.warn('Unable to retrieve input data for:', data);
 		}
 		if (error?.code && error.code === -32600)
-			console.info(
+			this.logger.info(
 				'Suggestion: Please increase the response limit on your Electrum server.'
 			);
 	}
@@ -3573,7 +3579,7 @@ export class Wallet {
 			addressType
 		});
 		if (generateAddressResponse.isErr()) {
-			console.log(generateAddressResponse.error.message);
+			this.logger.warn(generateAddressResponse.error.message);
 			return err('Unable to successfully generate a change address.');
 		}
 		return ok(generateAddressResponse.value.changeAddresses[0]);
@@ -3718,7 +3724,7 @@ export class Wallet {
 				timestamp: Date.now()
 			};
 		} catch (e) {
-			console.log('Unable to fetch fee estimates.', e);
+			this.logger.warn('Unable to fetch fee estimates.', e);
 			return this.feeEstimates;
 		}
 	}
@@ -4429,7 +4435,7 @@ export class Wallet {
 			if (generatedAddress.isOk()) {
 				return ok(generatedAddress.value.address);
 			} else {
-				console.log(generatedAddress.error.message);
+				this.logger.warn(generatedAddress.error.message);
 			}
 			return err('No receive address available.');
 		} catch (e) {
@@ -4552,7 +4558,7 @@ export class Wallet {
 					inputTotal = inputTotal + value;
 				}
 			} catch (e) {
-				console.log(e);
+				this.logger.error('Failed to get input value.', e);
 			}
 		}
 		for (let i = 0; i < vouts.length; i++) {
@@ -4802,7 +4808,7 @@ export class Wallet {
 			});
 			return ok(newInputs);
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to add transaction input.', e);
 			return err(e);
 		}
 	}
@@ -4828,7 +4834,7 @@ export class Wallet {
 			});
 			return ok(newInputs);
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to remove transaction input.', e);
 			return err(e);
 		}
 	}
@@ -4851,7 +4857,7 @@ export class Wallet {
 			});
 			return ok('Tag successfully added');
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to add transaction tag.', e);
 			return err(e);
 		}
 	}
@@ -4875,7 +4881,7 @@ export class Wallet {
 			});
 			return ok('Tag successfully added');
 		} catch (e) {
-			console.log(e);
+			this.logger.error('Failed to remove transaction tag.', e);
 			return err(e);
 		}
 	}
@@ -4907,7 +4913,7 @@ export class Wallet {
 				selectedFeeId
 			});
 			if (res.isErr()) {
-				console.log(res.error.message);
+				this.logger.warn(res.error.message);
 				return err(res.error.message);
 			}
 

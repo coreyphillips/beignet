@@ -1,3 +1,4 @@
+export * from './logger';
 export * from './wallet/index';
 export * from './types';
 export * from './utils';

@@ -3,6 +3,8 @@
  * All IDs are hex strings, all amounts are numbers in satoshis.
  */
 
+import { TLogLevel } from '../logger';
+
 export interface NodeInfo {
 	nodeId: string;
 	alias?: string;
@@ -357,6 +359,10 @@ export interface BeignetConfig {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Daemon diagnostic log level ('debug' | 'info' | 'warn' | 'error' |
+	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
+	 *  unset keeps the daemon silent (status quo). */
+	logLevel?: TLogLevel;
 }
 
 export interface HealthInfo {

@@ -7,7 +7,9 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
+import { Console } from 'console';
 import { BeignetNode, BeignetNodeOptions } from './beignet-node';
+import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
 import { ApiResponse, RouteHop } from './types';
 import { getOpenApiSpec } from './openapi';
@@ -166,7 +168,18 @@ export async function startDaemon(
 	// Validates apiKeys (names/keys/scopes) up front; throws INVALID_PARAMS
 	// on bad config before the node is created.
 	const authenticator = new ApiKeyAuthenticator(opts.apiToken, opts.apiKeys);
-	const node = await BeignetNode.create(opts);
+	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
+	// logLevel creates a console logger on stderr (stdout stays reserved for
+	// command output). With neither, the daemon stays silent as before.
+	let logger: ILogger | undefined = opts.logger;
+	if (!logger && opts.logLevel && opts.logLevel !== 'silent') {
+		const stderrConsole = new Console({
+			stdout: process.stderr,
+			stderr: process.stderr
+		});
+		logger = createConsoleLogger(opts.logLevel, stderrConsole);
+	}
+	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
 	const storage = node.getStorage();
 	const webhookManager = new WebhookManager(storage);
 	const paymentQueue = new PaymentQueue(
@@ -1622,6 +1635,7 @@ export async function startDaemon(
 	return new Promise((resolve, reject) => {
 		server.on('error', reject);
 		server.listen(port, host, () => {
+			logger?.info(`Daemon listening on ${host}:${port}`);
 			resolve({ server, node });
 		});
 	});
