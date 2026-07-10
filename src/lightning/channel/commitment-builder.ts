@@ -7,13 +7,9 @@
  */
 
 import * as bitcoin from 'bitcoinjs-lib';
-import {
-	derivePublicKey,
-	deriveRevocationPubkey,
-	derivePrivateKey
-} from '../keys/derivation';
+import { derivePublicKey, deriveRevocationPubkey } from '../keys/derivation';
 import { verify } from '../crypto/ecdh';
-import { ChannelSigner } from '../keys/signer';
+import { ISigner } from '../keys/signer';
 import {
 	buildCommitmentTx,
 	calculateObscuredCommitmentNumber,
@@ -49,7 +45,6 @@ import {
 	buildTaprootHtlcSuccessTx,
 	buildTaprootHtlcTimeoutTx,
 	taprootHtlcLeafSighash,
-	signTaprootHtlcLeaf,
 	verifyTaprootHtlcLeaf
 } from '../script/htlc-taproot';
 import {
@@ -663,7 +658,7 @@ export function buildRemoteCommitment(
  */
 export function signRemoteCommitment(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	remotePerCommitmentPoint: Buffer,
 	commitmentNumber?: bigint
 ): { signature: Buffer; htlcSignatures: Buffer[] } {
@@ -681,20 +676,10 @@ export function signRemoteCommitment(
 
 	const htlcSignatures: Buffer[] = [];
 
-	// If no htlcBasepointSecret or no HTLC outputs, return empty sigs
-	if (
-		!signer.htlcBasepointSecret ||
-		built.result.outputMap.htlcs.length === 0
-	) {
+	// If the signer has no HTLC keys or no HTLC outputs, return empty sigs
+	if (!signer.hasHtlcKeys || built.result.outputMap.htlcs.length === 0) {
 		return { signature, htlcSignatures };
 	}
-
-	// Derive our HTLC private key for the remote's commitment
-	const localHtlcPrivkey = derivePrivateKey(
-		signer.htlcBasepointSecret,
-		remotePerCommitmentPoint,
-		state.localBasepoints.htlcBasepoint
-	);
 
 	// Get commitment keys for the remote commitment
 	const keys = deriveCommitmentKeys(
@@ -769,11 +754,14 @@ export function signRemoteCommitment(
 			);
 		}
 
-		const sig = signer.signHtlcTx(
+		// The signer derives our per-commitment HTLC privkey internally from
+		// the remote per-commitment point and our advertised HTLC basepoint.
+		const sig = signer.signHtlcTxForCommitment(
 			htlcTx,
 			meta.script,
 			Number(meta.amount),
-			localHtlcPrivkey,
+			remotePerCommitmentPoint,
+			state.localBasepoints.htlcBasepoint,
 			useAnchors
 		);
 		htlcSignatures.push(sig);
@@ -787,7 +775,7 @@ export function signRemoteCommitment(
  */
 export function verifyRemoteCommitmentSig(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	perCommitmentPoint: Buffer,
 	remoteSig: Buffer,
 	commitmentNumber?: bigint
@@ -838,7 +826,7 @@ function taprootFundingSpk(state: IChannelState): Buffer {
  */
 export function signRemoteCommitmentPartial(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	ourPublicNonce: Uint8Array,
 	theirPublicNonce: Buffer,
 	remotePerCommitmentPoint: Buffer,
@@ -908,7 +896,7 @@ export function verifyRemoteCommitmentPartial(
  */
 export function aggregateLocalCommitmentSig(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	ourPublicNonce: Uint8Array,
 	theirPublicNonce: Buffer,
 	theirPartialSig: Buffer,
@@ -992,11 +980,11 @@ function taprootHtlcOutputAndLeaf(
  */
 export function signRemoteHtlcSignaturesTaproot(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	remotePerCommitmentPoint: Buffer,
 	commitmentNumber?: bigint
 ): Buffer[] {
-	if (!isTaprootChannel(state.channelType) || !signer.htlcBasepointSecret) {
+	if (!isTaprootChannel(state.channelType) || !signer.hasHtlcKeys) {
 		return [];
 	}
 	const built = buildRemoteCommitment(
@@ -1015,11 +1003,6 @@ export function signRemoteHtlcSignaturesTaproot(
 	);
 	// Same trimmed basis as htlcOriginalIndices (see signRemoteCommitment).
 	const htlcOutputsMeta = built.htlcOutputs;
-	const localHtlcPrivkey = derivePrivateKey(
-		signer.htlcBasepointSecret,
-		remotePerCommitmentPoint,
-		state.localBasepoints.htlcBasepoint
-	);
 	const commitTxid = built.result.tx.getId();
 
 	const sigs: Buffer[] = [];
@@ -1062,7 +1045,15 @@ export function signRemoteHtlcSignaturesTaproot(
 			leafScript,
 			leafVersion
 		);
-		sigs.push(signTaprootHtlcLeaf(sighash, localHtlcPrivkey));
+		// The signer derives our per-commitment HTLC privkey internally (same
+		// derivation as the ECDSA path in signRemoteCommitment).
+		sigs.push(
+			signer.signTaprootHtlcForCommitment(
+				sighash,
+				remotePerCommitmentPoint,
+				state.localBasepoints.htlcBasepoint
+			)
+		);
 	}
 	return sigs;
 }
@@ -1156,7 +1147,7 @@ export function verifyRemoteHtlcSignaturesTaproot(
  */
 export function verifyRemoteHtlcSignatures(
 	state: IChannelState,
-	signer: ChannelSigner,
+	signer: ISigner,
 	perCommitmentPoint: Buffer,
 	htlcSignatures: Buffer[]
 ): boolean {

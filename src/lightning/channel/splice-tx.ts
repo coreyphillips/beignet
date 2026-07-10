@@ -18,7 +18,7 @@
 
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { ChannelSigner } from '../keys/signer';
+import { ChannelSigner, ISigner } from '../keys/signer';
 import { createFundingScript } from '../script/funding';
 
 bitcoin.initEccLib(ecc);
@@ -141,7 +141,7 @@ export function signSpliceSharedInput(
 	sharedInputIndex: number,
 	oldFundingWitnessScript: Buffer,
 	fundingValueSats: bigint,
-	signer: ChannelSigner
+	signer: ISigner
 ): Buffer {
 	const sigHash = tx.hashForWitnessV0(
 		sharedInputIndex,

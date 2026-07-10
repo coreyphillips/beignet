@@ -90,7 +90,7 @@ import { IChannelBasepoints } from '../keys/derivation';
 import { FeatureFlags, Feature } from '../features/flags';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
-import { ChannelSigner } from '../keys/signer';
+import { ChannelSigner, ISigner } from '../keys/signer';
 import {
 	buildRemoteCommitment,
 	signRemoteCommitment,
@@ -267,7 +267,7 @@ export interface ITaprootClosingCache {
  */
 export class Channel {
 	private _state: IChannelState;
-	private _signer: ChannelSigner | null = null;
+	private _signer: ISigner | null = null;
 	private _quiescence: QuiescenceManager = new QuiescenceManager();
 	private _spliceSession: SpliceSession | null = null;
 	// A splice the caller requested while the channel was not yet quiescent.
@@ -398,7 +398,7 @@ export class Channel {
 	// with the peer. In-memory only; the manager re-derives it per operation.
 	private _maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS;
 
-	constructor(state: IChannelState, signer?: ChannelSigner) {
+	constructor(state: IChannelState, signer?: ISigner) {
 		this._state = state;
 		this._signer = signer || null;
 	}
@@ -428,14 +428,14 @@ export class Channel {
 	/**
 	 * Set or update the channel signer (used for commitment signature verification).
 	 */
-	setSigner(signer: ChannelSigner): void {
+	setSigner(signer: ISigner): void {
 		this._signer = signer;
 	}
 
 	/**
 	 * Get the channel's signer. Returns null if no signer has been set.
 	 */
-	getSigner(): ChannelSigner | null {
+	getSigner(): ISigner | null {
 		return this._signer;
 	}
 
@@ -2847,7 +2847,7 @@ export class Channel {
 	 * Force close the channel by broadcasting the latest local commitment.
 	 * Returns the commitment transaction to broadcast and a CHANNEL_CLOSED action.
 	 */
-	forceClose(signer: ChannelSigner): ChannelAction[] {
+	forceClose(signer: ISigner): ChannelAction[] {
 		// Data loss protection: the peer proved our state is stale. Our latest
 		// local commitment is revoked in the peer's view - broadcasting it hands
 		// our entire balance to the justice path. Recovery is passive: the peer
