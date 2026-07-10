@@ -338,6 +338,38 @@ export async function startDaemon(
 			return success(await node.sendOnchain(address, amountSats, satsPerVbyte));
 		},
 
+		'POST /send-max': async (body) => {
+			const { address, satsPerVbyte } = body as {
+				address: string;
+				satsPerVbyte?: number;
+			};
+			if (!address) return failure('INVALID_PARAMS', 'address required');
+			return success(await node.sendMaxOnchain(address, satsPerVbyte));
+		},
+		'POST /tx/bump-fee': async (body) => {
+			const { txid, satsPerVbyte } = body as {
+				txid: string;
+				satsPerVbyte: number;
+			};
+			if (!txid || satsPerVbyte === undefined)
+				return failure('INVALID_PARAMS', 'txid and satsPerVbyte required');
+			return success(await node.bumpFeeOnchain(txid, satsPerVbyte));
+		},
+		'POST /tx/boost': async (body) => {
+			const { txid, satsPerVbyte } = body as {
+				txid: string;
+				satsPerVbyte?: number;
+			};
+			if (!txid) return failure('INVALID_PARAMS', 'txid required');
+			return success(await node.boostOnchain(txid, satsPerVbyte));
+		},
+		'GET /transactions/boostable': () =>
+			success(node.listBoostableTransactions()),
+		'POST /consolidate': async (body) => {
+			const { satsPerVbyte } = body as { satsPerVbyte?: number };
+			return success(await node.consolidateUtxos(satsPerVbyte));
+		},
+
 		'POST /peer/connect': async (body) => {
 			const {
 				pubkey,

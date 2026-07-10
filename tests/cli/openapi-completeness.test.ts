@@ -116,7 +116,12 @@ describe('OpenAPI Spec Completeness', () => {
 		'/backup/trigger',
 		'/watchtowers',
 		'/watchtower/add',
-		'/watchtower/remove'
+		'/watchtower/remove',
+		'/send-max',
+		'/tx/bump-fee',
+		'/tx/boost',
+		'/transactions/boostable',
+		'/consolidate'
 	];
 
 	for (const route of expectedRoutes) {
@@ -161,7 +166,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'RebalanceResult',
 		'RebalanceExecutionSummary',
 		'HoldInvoiceInfo',
-		'WatchtowerInfo'
+		'WatchtowerInfo',
+		'BoostResult',
+		'BoostableTransactions',
+		'ConsolidateResult'
 	];
 
 	for (const schema of expectedSchemas) {

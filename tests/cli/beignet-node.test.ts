@@ -691,9 +691,12 @@ describe('BeignetNode new methods', () => {
 				}
 			}
 		};
-		const txs = BeignetNode.prototype.listOnchainTransactions.call({
-			wallet: fakeWallet
-		} as unknown as BeignetNode);
+		// Inherit the prototype so internal helpers (toOnchainTxInfo) resolve.
+		const txs = BeignetNode.prototype.listOnchainTransactions.call(
+			Object.assign(Object.create(BeignetNode.prototype), {
+				wallet: fakeWallet
+			}) as unknown as BeignetNode
+		);
 		expect(txs).to.have.lengthOf(2);
 		// Sorted newest first
 		expect(txs[0].txid).to.equal('aa');
@@ -730,8 +733,11 @@ describe('BeignetNode new methods', () => {
 					}
 				}
 			};
+			// Inherit the prototype so internal helpers (_broadcastRawTx) resolve.
 			const result = await BeignetNode.prototype.sendOnchain.call(
-				{ wallet: fakeWallet } as unknown as BeignetNode,
+				Object.assign(Object.create(BeignetNode.prototype), {
+					wallet: fakeWallet
+				}) as unknown as BeignetNode,
 				'bcrt1qexample',
 				200000,
 				2
@@ -757,7 +763,9 @@ describe('BeignetNode new methods', () => {
 			};
 			try {
 				await BeignetNode.prototype.sendOnchain.call(
-					{ wallet: fakeWallet } as unknown as BeignetNode,
+					Object.assign(Object.create(BeignetNode.prototype), {
+						wallet: fakeWallet
+					}) as unknown as BeignetNode,
 					'bcrt1qexample',
 					200000
 				);

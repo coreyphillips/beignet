@@ -126,7 +126,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 7;
+	static readonly CURRENT_SCHEMA_VERSION = 8;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -180,7 +180,11 @@ export class SqliteStorage implements IStorageBackend {
 			pk: 'session_id',
 			columns: ['session_key']
 		},
-		{ table: 'watchtower_updates', pk: 'id', columns: ['encrypted_blob'] }
+		{ table: 'watchtower_updates', pk: 'id', columns: ['encrypted_blob'] },
+		// On-chain wallet state (addresses, UTXOs, transactions, balance) is
+		// privacy-sensitive: a stolen DB file must not reveal the wallet's
+		// holdings or address set.
+		{ table: 'wallet_data', pk: 'key', columns: ['value'] }
 	];
 
 	/**
@@ -390,6 +394,11 @@ export class SqliteStorage implements IStorageBackend {
 				created_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_watchtower_updates_pending ON watchtower_updates(tower_uri, acked);
+
+			CREATE TABLE IF NOT EXISTS wallet_data (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
 		`);
 
 		// Run migrations
@@ -1104,6 +1113,13 @@ export class SqliteStorage implements IStorageBackend {
 			// set).
 			(): void => {
 				// No-op
+			},
+			// Migration 7->8: wallet_data table (on-chain IWalletData key/value
+			// persistence). Created via CREATE IF NOT EXISTS above; the value
+			// column is in ENCRYPTED_COLUMNS so it is encrypted at rest when a
+			// key is set.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1135,6 +1151,23 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare('SELECT value FROM metadata WHERE key = ?')
 			.get(key) as { value: string } | undefined;
 		return row ? row.value : null;
+	}
+
+	// ─── On-chain Wallet Data ───
+	// Key/value persistence for the on-chain wallet's IWalletData. Values are
+	// JSON strings, encrypted at rest when a key is set (see ENCRYPTED_COLUMNS).
+
+	saveWalletData(key: string, value: string): void {
+		this.db
+			.prepare('INSERT OR REPLACE INTO wallet_data (key, value) VALUES (?, ?)')
+			.run(key, this._enc(value));
+	}
+
+	loadWalletData(key: string): string | null {
+		const row = this.db
+			.prepare('SELECT value FROM wallet_data WHERE key = ?')
+			.get(key) as { value: string } | undefined;
+		return row ? this._dec(row.value) : null;
 	}
 
 	// ─── Channel Routing Policies ───
