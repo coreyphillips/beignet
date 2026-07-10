@@ -18,6 +18,9 @@ import {
 	IBoostedTransaction,
 	IBoostedTransactions,
 	IBtInfo,
+	IBuildPsbtArgs,
+	IBuildPsbtResponse,
+	IImportSignedPsbtResponse,
 	ICanBoostResponse,
 	ICustomGetAddress,
 	ICustomGetScriptHash,
@@ -51,6 +54,7 @@ import {
 	IVout,
 	IWallet,
 	IWalletData,
+	IWatchOnlyWallet,
 	Net,
 	TAddressIndexInfo,
 	TAddressTypeContent,
@@ -96,11 +100,14 @@ import {
 	objectKeys,
 	objectsMatch,
 	ok,
+	parseExtendedPublicKey,
 	removeDustUtxos,
 	Result,
 	shuffleArray,
 	validateAddress,
-	validateMnemonic
+	validateMnemonic,
+	validatePsbtSignature,
+	WatchOnlySigningError
 } from '../utils';
 import {
 	addressTypes,
@@ -117,10 +124,12 @@ const bip32 = BIP32Factory(ecc);
 
 export class Wallet {
 	private _network: EAvailableNetworks;
-	private readonly _mnemonic: string;
+	private readonly _mnemonic?: string;
 	private readonly _passphrase: string;
-	private readonly _seed: Buffer;
-	private readonly _root: BIP32Interface;
+	private readonly _seed?: Buffer;
+	private readonly _root?: BIP32Interface;
+	// Account-level xpub node for watch-only wallets (no private keys).
+	private readonly _accountNode?: BIP32Interface;
 	private _data: IWalletData;
 	private _getData: TGetData;
 	private _setData?: TSetData;
@@ -137,6 +146,7 @@ export class Wallet {
 
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
+	public readonly isWatchOnly: boolean;
 	public isRefreshing: boolean;
 	public isSwitchingNetworks: boolean;
 	public readonly id: string;
@@ -159,10 +169,11 @@ export class Wallet {
 	public gapLimitOptions: TGapLimitOptions;
 	private constructor({
 		mnemonic,
+		xpub,
 		passphrase,
 		name,
 		network = EAvailableNetworks.mainnet,
-		addressType = EAddressType.p2wpkh,
+		addressType,
 		coinSelectPreference = ECoinSelectPreference.consolidate,
 		storage,
 		electrumOptions,
@@ -181,27 +192,47 @@ export class Wallet {
 			lookAheadChange: GAP_LIMIT_CHANGE
 		}
 	}: IWallet) {
-		if (!mnemonic) throw new Error('No mnemonic specified.');
-		if (!validateMnemonic(mnemonic)) throw new Error('Invalid mnemonic.');
+		if (!mnemonic && !xpub) throw new Error('No mnemonic specified.');
 		if (name && name.includes('-'))
 			throw new Error('Wallet name cannot include a hyphen (-).');
 		this._network = network;
-		this._mnemonic = mnemonic;
 		this._passphrase = passphrase ?? '';
-		this._seed = getSeed(this._mnemonic, this._passphrase);
-		this._root = bip32.fromSeed(
-			this._seed,
-			this.getBitcoinNetwork(this._network)
-		);
+		this.isWatchOnly = !mnemonic;
+		if (mnemonic) {
+			if (!validateMnemonic(mnemonic)) throw new Error('Invalid mnemonic.');
+			this._mnemonic = mnemonic;
+			this._seed = getSeed(this._mnemonic, this._passphrase);
+			this._root = bip32.fromSeed(
+				this._seed,
+				this.getBitcoinNetwork(this._network)
+			);
+			this.id = generateWalletId(this._seed);
+			this.addressType = addressType ?? EAddressType.p2wpkh;
+		} else {
+			const parseRes = parseExtendedPublicKey(xpub!, this._network);
+			if (parseRes.isErr()) throw parseRes.error;
+			const { node, addressType: inferredType } = parseRes.value;
+			if (addressType && inferredType && addressType !== inferredType) {
+				throw new Error(
+					`The provided xpub prefix implies ${inferredType}, but addressType ${addressType} was requested.`
+				);
+			}
+			this._accountNode = node;
+			this.addressType = addressType ?? inferredType ?? EAddressType.p2wpkh;
+			// Deterministic id across SLIP-132 encodings of the same account key.
+			this.id = generateWalletId(
+				Buffer.concat([node.publicKey, node.chainCode])
+			);
+			// A single account-level xpub only yields one address type.
+			addressTypesToMonitor = [this.addressType];
+		}
 		this._data = getDefaultWalletData();
 		this._getData = storage?.getData ?? getDataFallback;
 		this._setData = storage?.setData;
 		this._disableMessagesOnCreate = disableMessagesOnCreate;
 		if (customGetAddress) this._customGetAddress = customGetAddress;
 		if (customGetScriptHash) this._customGetScriptHash = customGetScriptHash;
-		this.id = generateWalletId(this._seed);
 		this.name = name ?? this.id;
-		this.addressType = addressType;
 		this.coinSelectPreference = coinSelectPreference;
 		this.transaction = new Transaction({
 			wallet: this
@@ -286,6 +317,23 @@ export class Wallet {
 	}
 
 	/**
+	 * Creates a watch-only wallet from an account-level extended public key
+	 * (xpub/ypub/zpub/tpub/upub/vpub). The key is assumed to sit at the
+	 * account level (m/purpose'/coin'/account', e.g. m/84'/0'/0' for p2wpkh),
+	 * so receive and change addresses are derived publicly as xpub/0/i and
+	 * xpub/1/i. All read-only functionality works; anything that requires
+	 * private keys fails with WatchOnlySigningError.
+	 * @param {IWatchOnlyWallet} params
+	 * @returns {Promise<Result<Wallet>>}
+	 */
+	static async createWatchOnly(
+		params: IWatchOnlyWallet
+	): Promise<Result<Wallet>> {
+		if (!params?.xpub) return err('No xpub provided.');
+		return await Wallet.create(params);
+	}
+
+	/**
 	 * Stops the wallet. Use this method to prepare the wallet to be de
 	 * @returns {Promise<Result<string>>}
 	 */
@@ -317,6 +365,13 @@ export class Wallet {
 		network: EAvailableNetworks,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
+		if (this.isWatchOnly) {
+			// The xpub version bytes encode the network; a new watch-only wallet
+			// must be created from a key that matches the target network.
+			return err(
+				'Watch-only wallets cannot switch networks. Create a new watch-only wallet with an xpub for the target network.'
+			);
+		}
 		this.isSwitchingNetworks = true;
 		// Disconnect from Electrum.
 		await this.electrum.disconnect();
@@ -592,7 +647,91 @@ export class Wallet {
 	 * @returns {boolean}
 	 */
 	isValid(mnemonic): boolean {
-		return mnemonic === this._mnemonic && validateMnemonic(mnemonic);
+		return (
+			!!this._mnemonic &&
+			mnemonic === this._mnemonic &&
+			validateMnemonic(mnemonic)
+		);
+	}
+
+	/**
+	 * Derives the key pair (public only for watch-only wallets) for a given
+	 * full derivation path.
+	 * @param {string} path
+	 * @returns {BIP32Interface}
+	 * @private
+	 */
+	private _derivePathKeyPair(path: string): BIP32Interface {
+		if (this._root) return this._root.derivePath(path);
+		return this._deriveWatchOnlyNode(path);
+	}
+
+	/**
+	 * Watch-only wallets hold the account-level xpub, so only the public
+	 * change/index segments of a full path can be derived. The path's purpose
+	 * must match the wallet's address type.
+	 * @param {string} path
+	 * @returns {BIP32Interface}
+	 * @private
+	 */
+	private _deriveWatchOnlyNode(path: string): BIP32Interface {
+		if (!this._accountNode) {
+			throw new Error('Watch-only account node is unavailable.');
+		}
+		const segments = path.replace(/'/g, '').split('/');
+		if (segments.length !== 6) {
+			throw new Error(
+				`Watch-only wallets require a full path (m/purpose'/coin'/account'/change/index): ${path}`
+			);
+		}
+		const expectedPathRes = getKeyDerivationPathObject({
+			path: addressTypes[this.addressType].path,
+			network: this._network
+		});
+		if (expectedPathRes.isErr()) throw expectedPathRes.error;
+		if (segments[1] !== expectedPathRes.value.purpose) {
+			throw new Error(
+				`This watch-only wallet only derives ${this.addressType} paths (purpose ${expectedPathRes.value.purpose}'), received: ${path}`
+			);
+		}
+		const change = Number(segments[4]);
+		const index = Number(segments[5]);
+		if (
+			!Number.isInteger(change) ||
+			!Number.isInteger(index) ||
+			change < 0 ||
+			index < 0
+		) {
+			throw new Error(`Invalid change/index segments in path: ${path}`);
+		}
+		return this._accountNode.derive(change).derive(index);
+	}
+
+	/**
+	 * Returns a public-only BIP32 node for the given full derivation path.
+	 * @param {string} path
+	 * @returns {Result<BIP32Interface>}
+	 */
+	public derivePublicNode(path: string): Result<BIP32Interface> {
+		try {
+			if (this._root) return ok(this._root.derivePath(path).neutered());
+			return ok(this._deriveWatchOnlyNode(path));
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Returns the fingerprint external signers should match against. For full
+	 * wallets this is the master fingerprint. Watch-only wallets cannot know
+	 * the master fingerprint, so the xpub's parent fingerprint is used.
+	 * @returns {Buffer}
+	 */
+	public getMasterFingerprint(): Buffer {
+		if (this._root) return Buffer.from(this._root.fingerprint);
+		const fingerprint = Buffer.alloc(4);
+		fingerprint.writeUInt32BE(this._accountNode?.parentFingerprint ?? 0, 0);
+		return fingerprint;
 	}
 
 	/**
@@ -616,7 +755,7 @@ export class Wallet {
 				const res = await this._customGetAddress(data);
 				if (res.isErr()) return err(res.error.message);
 			}
-			const keyPair = this._root.derivePath(path);
+			const keyPair = this._derivePathKeyPair(path);
 			const network = this.getBitcoinNetwork(this._network);
 			const addressInfo = getAddressFromKeyPair({
 				keyPair,
@@ -795,6 +934,7 @@ export class Wallet {
 	 * @returns {string}
 	 */
 	getPrivateKey(path: string): string {
+		if (!this._root) throw new WatchOnlySigningError();
 		const keyPair = this._root.derivePath(path);
 		return keyPair.toWIF();
 	}
@@ -2935,6 +3075,7 @@ export class Wallet {
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
+		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
@@ -3009,6 +3150,7 @@ export class Wallet {
 		rbf?: boolean;
 		broadcast?: boolean;
 	} = {}): Promise<Result<string>> {
+		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
 		}
@@ -3077,6 +3219,196 @@ export class Wallet {
 			rbf,
 			broadcast,
 			shuffleOutputs
+		});
+	}
+
+	/**
+	 * Builds an UNSIGNED PSBT for an external signer (e.g. a hardware wallet).
+	 * Runs the same setup, coin selection and fee logic as send/sendMany but
+	 * stops before signing. Each input carries witnessUtxo (nonWitnessUtxo for
+	 * legacy p2pkh), redeemScript for p2sh-p2wpkh, tapInternalKey for p2tr and
+	 * bip32Derivation/tapBip32Derivation metadata. Works on both full and
+	 * watch-only wallets.
+	 * @param {IBuildPsbtArgs} args
+	 * @returns {Promise<Result<IBuildPsbtResponse>>}
+	 */
+	public async buildPsbt({
+		txs,
+		address,
+		amount,
+		message = '',
+		satsPerByte = this.feeEstimates.normal,
+		rbf = false,
+		shuffleOutputs = true
+	}: IBuildPsbtArgs): Promise<Result<IBuildPsbtResponse>> {
+		try {
+			let sendTxs: ISendTx[] = txs ?? [];
+			if (!sendTxs.length) {
+				if (!address || !amount) {
+					return err('No outputs provided. Specify txs or address and amount.');
+				}
+				sendTxs = [{ address, amount, message }];
+			}
+			if (!this.data.utxos.length) {
+				return err('No UTXOs available.');
+			}
+			await this.resetSendTransaction();
+			const setupTransactionRes = await this.transaction.setupTransaction({
+				rbf,
+				satsPerByte
+			});
+			if (setupTransactionRes.isErr()) {
+				return err(setupTransactionRes.error.message);
+			}
+			let index = 0;
+			for (const tx of sendTxs) {
+				const updateSendTransactionRes = this.transaction.updateSendTransaction(
+					{
+						transaction: {
+							label: tx.message,
+							outputs: [{ address: tx.address, value: tx.amount, index }]
+						}
+					}
+				);
+				if (updateSendTransactionRes.isErr()) {
+					return err(updateSendTransactionRes.error.message);
+				}
+				index++;
+			}
+			const updateFeeRes = this.transaction.updateFee({ satsPerByte });
+			if (updateFeeRes.isErr()) return err(updateFeeRes.error.message);
+			const psbtRes = await this.transaction.createUnsignedPsbt({
+				shuffleOutputs
+			});
+			if (psbtRes.isErr()) return err(psbtRes.error.message);
+			const psbt = psbtRes.value;
+			const txData = this.transaction.data;
+			const inputValue = this.transaction.getTransactionInputValue({
+				inputs: txData.inputs
+			});
+			const outputValue = psbt.txOutputs.reduce((acc, o) => acc + o.value, 0);
+			const fee = inputValue - outputValue;
+			// The fee was computed as byteCount * satsPerByte by updateFee, so the
+			// byte count it used is recoverable from the fee itself.
+			const effectiveSatsPerByte = txData.satsPerByte || satsPerByte;
+			const vsizeEstimate =
+				effectiveSatsPerByte > 0 ? Math.round(fee / effectiveSatsPerByte) : 0;
+			const network = this.getBitcoinNetwork();
+			const outputs = psbt.txOutputs.map((output, i) => {
+				let outputAddress: string | undefined = output.address;
+				if (!outputAddress) {
+					try {
+						outputAddress = bitcoin.address.fromOutputScript(
+							output.script,
+							network
+						);
+					} catch {
+						outputAddress = undefined;
+					}
+				}
+				return { address: outputAddress, value: output.value, index: i };
+			});
+			const inputs = txData.inputs.map((input) => ({
+				tx_hash: input.tx_hash,
+				tx_pos: input.tx_pos,
+				address: input.address,
+				value: input.value,
+				path: input.path
+			}));
+			return ok({
+				psbtBase64: psbt.toBase64(),
+				fee,
+				vsizeEstimate,
+				satsPerByte: effectiveSatsPerByte,
+				inputs,
+				outputs
+			});
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Imports an externally signed PSBT, validates that EVERY input carries a
+	 * valid signature, finalizes and extracts the transaction WITHOUT
+	 * broadcasting it. Broadcast separately via broadcastTransaction.
+	 * @param {string} psbtBase64
+	 * @returns {Result<IImportSignedPsbtResponse>}
+	 */
+	public importSignedPsbt(
+		psbtBase64: string
+	): Result<IImportSignedPsbtResponse> {
+		try {
+			if (!psbtBase64) return err('No PSBT provided.');
+			const network = this.getBitcoinNetwork();
+			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
+			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
+			for (let i = 0; i < psbt.inputCount; i++) {
+				const input = psbt.data.inputs[i];
+				// Inputs already finalized by the signer carry their signature in
+				// the final script and cannot be re-validated via partialSig.
+				const finalized = !!(input.finalScriptSig || input.finalScriptWitness);
+				if (finalized) continue;
+				const hasSignature =
+					(input.partialSig?.length ?? 0) > 0 ||
+					!!input.tapKeySig ||
+					(input.tapScriptSig?.length ?? 0) > 0;
+				if (!hasSignature) {
+					return err(`Input ${i} is missing a signature.`);
+				}
+				let valid = false;
+				try {
+					valid = psbt.validateSignaturesOfInput(i, validatePsbtSignature);
+				} catch (e) {
+					return err(
+						`Unable to validate the signature for input ${i}: ${
+							e instanceof Error ? e.message : String(e)
+						}`
+					);
+				}
+				if (!valid) return err(`Input ${i} has an invalid signature.`);
+				psbt.finalizeInput(i);
+			}
+			const tx = psbt.extractTransaction();
+			return ok({ txHex: tx.toHex(), txid: tx.getId() });
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Combines multiple partially signed copies of the same PSBT (multi-party
+	 * signing flows) into one.
+	 * @param {string[]} psbts base64-encoded PSBTs.
+	 * @returns {Result<string>} The combined PSBT in base64.
+	 */
+	public combinePsbts(psbts: string[]): Result<string> {
+		try {
+			if (!psbts || psbts.length < 2) {
+				return err('Provide at least two PSBTs to combine.');
+			}
+			const network = this.getBitcoinNetwork();
+			const parsed = psbts.map((psbtBase64) =>
+				bitcoin.Psbt.fromBase64(psbtBase64, { network })
+			);
+			const [base, ...rest] = parsed;
+			base.combine(...rest);
+			return ok(base.toBase64());
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Broadcasts a raw transaction via Electrum and returns the txid.
+	 * @param {string} txHex
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async broadcastTransaction(txHex: string): Promise<Result<string>> {
+		if (!txHex) return err('No transaction hex provided.');
+		return await this.electrum.broadcastTransaction({
+			rawTx: txHex,
+			subscribeToOutputAddress: false
 		});
 	}
 
@@ -3601,6 +3933,7 @@ export class Wallet {
 	 */
 	getBip32Interface = async (): Promise<Result<BIP32Interface>> => {
 		try {
+			if (!this._mnemonic) return err(new WatchOnlySigningError());
 			const network = networks[this._network];
 			const seed = await bip39.mnemonicToSeed(this._mnemonic, this._passphrase);
 			const root = bip32.fromSeed(seed, network);
@@ -3860,6 +4193,9 @@ export class Wallet {
 		broadcast = true,
 		combineWithWalletUtxos = false
 	}: ISweepPrivateKey): Promise<Result<ISweepPrivateKeyRes>> {
+		// The sweep transaction is signed through the wallet signing path, which
+		// requires the wallet's own keys even for an externally provided key.
+		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		const privateKeyInfo = await this.getPrivateKeyInfo(privateKey);
 		if (privateKeyInfo.isErr()) {
 			return err(privateKeyInfo.error.message);

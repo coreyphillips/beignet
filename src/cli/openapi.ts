@@ -1453,6 +1453,50 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/psbt/build': {
+				post: {
+					summary:
+						'Build an UNSIGNED PSBT for an external signer (hardware wallet); includes bip32 derivation metadata, nothing is signed or broadcast',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						outputs: 'array',
+						satsPerVbyte: 'number?'
+					}),
+					responses: {
+						'200': {
+							description:
+								'Unsigned PSBT (base64) with fee, vsize estimate and input/output summary'
+						},
+						'400': { description: 'Invalid outputs/fee rate or no UTXOs' }
+					}
+				}
+			},
+			'/psbt/import-signed': {
+				post: {
+					summary:
+						'Validate and finalize an externally signed PSBT; returns { txid, txHex } WITHOUT broadcasting',
+					tags: ['Node'],
+					requestBody: bodyContent({ psbtBase64: 'string' }),
+					responses: {
+						'200': { description: 'Finalized transaction (not broadcast)' },
+						'400': {
+							description: 'PSBT_IMPORT_FAILED (missing/invalid signatures)'
+						}
+					}
+				}
+			},
+			'/psbt/combine': {
+				post: {
+					summary:
+						'Combine partially signed copies of the same PSBT (multi-party signing)',
+					tags: ['Node'],
+					requestBody: bodyContent({ psbts: 'array' }),
+					responses: {
+						'200': { description: 'Combined PSBT (base64)' },
+						'400': { description: 'Fewer than two PSBTs or malformed input' }
+					}
+				}
+			},
 			'/readiness': {
 				get: {
 					summary: 'Get mainnet readiness report with weighted checks',

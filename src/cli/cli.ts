@@ -176,6 +176,8 @@ async function main(): Promise<void> {
 			);
 		case 'tx':
 			return handleTx();
+		case 'psbt':
+			return handlePsbt();
 		case 'consolidate':
 			return outputResult(
 				await httpRequest('POST', '/consolidate', {
@@ -483,6 +485,64 @@ async function handleTx(): Promise<void> {
 					code: 'UNKNOWN_COMMAND',
 					message:
 						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+/** Accepts a PSBT as a base64 string or as a path to a file containing one. */
+function readPsbtArg(arg?: string): string | undefined {
+	if (!arg) return undefined;
+	try {
+		if (fs.existsSync(arg) && fs.statSync(arg).isFile()) {
+			return fs.readFileSync(arg, 'utf8').trim();
+		}
+	} catch {
+		// Fall through: treat the argument as a base64 string.
+	}
+	return arg;
+}
+
+async function handlePsbt(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'build':
+			return outputResult(
+				await httpRequest('POST', '/psbt/build', {
+					outputs: [
+						{
+							address: filteredArgs[2],
+							amountSats: parseInt(filteredArgs[3], 10)
+						}
+					],
+					satsPerVbyte: filteredArgs[4]
+						? parseInt(filteredArgs[4], 10)
+						: undefined
+				})
+			);
+		case 'import-signed':
+			return outputResult(
+				await httpRequest('POST', '/psbt/import-signed', {
+					psbtBase64: readPsbtArg(filteredArgs[2])
+				})
+			);
+		case 'combine':
+			return outputResult(
+				await httpRequest('POST', '/psbt/combine', {
+					psbts: filteredArgs
+						.slice(2)
+						.map((arg) => readPsbtArg(arg))
+						.filter((psbt): psbt is string => !!psbt)
+				})
+			);
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet psbt [build <address> <sats> [satsPerVbyte]|import-signed <psbtBase64|file>|combine <psbt|file> <psbt|file> ...]'
 				}
 			});
 			process.exitCode = 1;
@@ -1848,6 +1908,12 @@ On-chain:
                                          RBF/CPFP
   consolidate [satsPerVbyte]             Merge all UTXOs into one output at a
                                          fresh wallet address
+  psbt build <address> <sats> [satsPerVbyte]
+                                         Build an UNSIGNED PSBT for an external
+                                         signer (hardware wallet)
+  psbt import-signed <psbtBase64|file>   Validate + finalize a signed PSBT;
+                                         returns txid/txHex WITHOUT broadcast
+  psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)

@@ -137,6 +137,86 @@ const utxos = wallet.value.listUtxos();
 const history = await wallet.value.getAddressHistory('bc1q...');
 ```
 
+### Watch-Only Wallets
+
+A watch-only wallet is constructed from an account-level extended public key
+(xpub/ypub/zpub for mainnet, tpub/upub/vpub for testnet/regtest) instead of a
+mnemonic. The key is assumed to sit at the account level
+(m/purpose'/coin'/account', e.g. m/84'/0'/0' for p2wpkh), so receive and
+change addresses derive publicly as xpub/0/i and xpub/1/i. SLIP-132 version
+bytes are normalized automatically: a zpub/vpub implies p2wpkh and a
+ypub/upub implies p2sh-p2wpkh; a plain xpub/tpub uses the `addressType`
+option (default p2wpkh). Because one account xpub yields exactly one address
+type, a watch-only wallet monitors only that type.
+
+Everything read-only works: address generation, gap-limit scanning, Electrum
+refresh, balances, transaction history, UTXOs, fee estimates and address
+subscriptions. Anything that requires private keys
+(send/sendMax/sendMany/sweepPrivateKey/getPrivateKey and the internal signing
+paths) fails with the typed `WatchOnlySigningError`
+(`code: 'WATCH_ONLY_CANNOT_SIGN'`, message `watch-only wallet cannot sign`).
+
+Watch-only is a library feature only for now: the HTTP daemon always runs
+with a mnemonic.
+
+```typescript
+import { Wallet } from 'beignet';
+
+const res = await Wallet.createWatchOnly({
+  xpub: 'zpub6r...',
+  network: 'bitcoin',
+  electrumOptions: { net, tls },
+});
+if (res.isErr()) return;
+const watchOnly = res.value;
+
+const address = await watchOnly.getAddress(); // works
+const balance = watchOnly.getBalance(); // works
+const sendRes = await watchOnly.send({ address: 'bc1q...', amount: 1000 });
+// sendRes.isErr() === true; sendRes.error.message === 'watch-only wallet cannot sign'
+```
+
+### External Signer (Hardware Wallet) PSBT Flow
+
+`buildPsbt` runs the normal transaction setup (coin selection, change, fee)
+but stops before signing and returns a base64 PSBT populated with everything
+a hardware signer needs: `witnessUtxo` (or `nonWitnessUtxo` for legacy
+p2pkh), `redeemScript` for p2sh-p2wpkh, `tapInternalKey` plus
+`tapBip32Derivation` for p2tr, and `bip32Derivation` (fingerprint + path +
+pubkey) on every wallet input. It works on both full and watch-only wallets.
+Note for watch-only wallets: the true master fingerprint is unknowable from
+an account xpub, so the xpub's parent fingerprint is used; signers should
+locate keys by derivation path.
+
+```typescript
+// 1. Build (works on a watch-only wallet)
+const build = await wallet.buildPsbt({
+  address: 'bc1q...',
+  amount: 50000,
+  satsPerByte: 4,
+});
+if (build.isErr()) return;
+const { psbtBase64, fee, vsizeEstimate } = build.value;
+
+// 2. Sign externally (hardware wallet / HWI / another machine)
+const signedBase64 = await myHardwareWallet.signPsbt(psbtBase64);
+
+// 3. Import: validates a signature on EVERY input, finalizes, does NOT broadcast
+const imported = wallet.importSignedPsbt(signedBase64);
+if (imported.isErr()) return; // missing/invalid signatures are rejected loudly
+const { txHex, txid } = imported.value;
+
+// 4. Broadcast when ready
+await wallet.broadcastTransaction(txHex);
+
+// Multi-party signing: merge partially signed copies of the same PSBT
+const combined = wallet.combinePsbts([copyA, copyB]);
+```
+
+The HTTP daemon exposes the same flow on its (mnemonic-backed) wallet via
+`POST /psbt/build`, `POST /psbt/import-signed` and `POST /psbt/combine`, and
+the CLI via `beignet psbt build|import-signed|combine`.
+
 ### Storage & Encryption
 
 The wallet persists its state through the host-injected `TStorage` interface (`storage: { getData, setData }` on `Wallet.create`). Values are handed to the host as-is, so by default they are stored in plaintext. The persisted data is addresses, address indexes, UTXOs, transactions, balance and fee estimates. No private keys and no mnemonic are ever written, so exposure is a privacy concern (full wallet history), not fund loss.

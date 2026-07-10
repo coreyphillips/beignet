@@ -143,17 +143,19 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M5. Onchain wallet features
 
-- [ ] Watch-only wallets: construct from xpub/ypub/zpub, address derivation and
-      balance tracking without a mnemonic (constructor currently throws,
-      `wallet/index.ts:184-185`).
-- [ ] External-signer PSBT flow: build unsigned PSBT, export base64, import signed,
-      combine, finalize as separate steps (today signPsbt always signs locally and
-      finalizes, `transaction/index.ts:559-597`).
-- [ ] PSBT combine for multi-party signing.
+- [~] Watch-only wallets (this PR): Wallet.createWatchOnly from any SLIP-132
+      xpub/ypub/zpub/tpub/upub/vpub, full read-only surface, byte-identical
+      derivation to the full wallet, every signing path guarded with a typed
+      WatchOnlySigningError. Library-only (the daemon always has the mnemonic).
+- [~] External-signer PSBT flow (this PR): buildPsbt (unsigned, with witnessUtxo,
+      bip32Derivation fingerprint/path/pubkey, taproot fields, legacy
+      nonWitnessUtxo), importSignedPsbt (validates every signature before
+      finalizing, no broadcast), wallet.broadcastTransaction; daemon /psbt/build,
+      /psbt/import-signed, /psbt/combine + CLI psbt commands.
+- [~] PSBT combine for multi-party signing (this PR): combinePsbts.
 - [ ] Multisig / P2WSH address type (enum entry currently commented out,
       `types/wallet.ts:40`). Scope: descriptor-based multisig receive + spend.
-- [ ] Tor support for Electrum: route TCP/SSL through the existing socks5Proxy config
-      (socks dep already present; only lightning uses it today).
+(Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
 - [ ] Fee estimation privacy: optional Electrum-based estimatefee source so fee data
       does not leak to mempool.space/blocktank over clearnet.
 - [ ] Robust multi-server Electrum failover: rotate through the provided server array
@@ -198,6 +200,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - [ ] WebSocket transport (relevant to the browser port)
 - [ ] Tor hidden-service inbound provisioning (external today, document setup)
 - [ ] Legacy option_anchor_outputs bit 20 (likely never; modern bit 22 shipped)
+- [ ] Tor support for Electrum (deferred 2026-07-10): route TCP/SSL through a SOCKS5
+      proxy like the lightning transport already does.
 
 ---
 
@@ -228,6 +232,10 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PRs #49/#50 completed M4. M5 started; Tor-for-Electrum deferred to M7
+  (Corey). DECIDED: dailySpendLimit becomes a combined LN+onchain budget (external
+  sends count; consolidate/channel-funding/fee-bumps excluded) - lands in batch C.
+  Batch A (this PR): watch-only wallets + external-signer PSBT flow.
 - 2026-07-09 (cont.): PR #49 merged (batch 2a). Batch 2b (this PR): CLI parity
   sweep + event granularity + seed-gen note; completes M4.
 - 2026-07-09 (cont.): PR #48 merged (watchtower client, M2 core). M4 batch 2a

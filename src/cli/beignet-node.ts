@@ -85,6 +85,8 @@ import {
 	TxInfo,
 	OnchainTxInfo,
 	UtxoInfo,
+	PsbtBuildInfo,
+	PsbtImportInfo,
 	BoostResult,
 	BoostableTransactions,
 	ConsolidateResult,
@@ -1370,6 +1372,91 @@ export class BeignetNode extends EventEmitter {
 			throw new BeignetError('SEND_FAILED', result.error.message);
 		}
 		return this._broadcastRawTx(result.value);
+	}
+
+	/**
+	 * Builds an UNSIGNED PSBT for an external signer (hardware wallet).
+	 * Nothing is signed or broadcast.
+	 */
+	async buildPsbt(
+		outputs: Array<{ address: string; amountSats: number }>,
+		satsPerVbyte?: number
+	): Promise<PsbtBuildInfo> {
+		if (!Array.isArray(outputs) || outputs.length === 0) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'outputs array required'
+			);
+		}
+		for (const output of outputs) {
+			if (!output?.address || typeof output.amountSats !== 'number') {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'each output requires address and amountSats'
+				);
+			}
+		}
+		this._validateFeeRate(satsPerVbyte);
+		const result = await this.wallet.buildPsbt({
+			txs: outputs.map((o) => ({ address: o.address, amount: o.amountSats })),
+			rbf: this.wallet.rbf,
+			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+		});
+		if (result.isErr()) {
+			throw new BeignetError('PSBT_BUILD_FAILED', result.error.message);
+		}
+		const built = result.value;
+		return {
+			psbtBase64: built.psbtBase64,
+			feeSats: built.fee,
+			vsizeEstimate: built.vsizeEstimate,
+			satsPerVbyte: built.satsPerByte,
+			inputs: built.inputs.map((input) => ({
+				txid: input.tx_hash,
+				vout: input.tx_pos,
+				address: input.address,
+				valueSats: input.value,
+				path: input.path
+			})),
+			outputs: built.outputs.map((output) => ({
+				address: output.address,
+				valueSats: output.value
+			}))
+		};
+	}
+
+	/**
+	 * Validates and finalizes an externally signed PSBT. Returns the raw
+	 * transaction WITHOUT broadcasting; use sendRawTransaction-style flows or
+	 * the wallet broadcast explicitly.
+	 */
+	importSignedPsbt(psbtBase64: string): PsbtImportInfo {
+		if (!psbtBase64 || typeof psbtBase64 !== 'string') {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'psbtBase64 required'
+			);
+		}
+		const result = this.wallet.importSignedPsbt(psbtBase64);
+		if (result.isErr()) {
+			throw new BeignetError('PSBT_IMPORT_FAILED', result.error.message);
+		}
+		return { txid: result.value.txid, txHex: result.value.txHex };
+	}
+
+	/** Combines partially signed copies of the same PSBT (multi-party flows). */
+	combinePsbts(psbts: string[]): { psbtBase64: string } {
+		if (!Array.isArray(psbts) || psbts.length < 2) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'psbts array with at least two entries required'
+			);
+		}
+		const result = this.wallet.combinePsbts(psbts);
+		if (result.isErr()) {
+			throw new BeignetError('PSBT_COMBINE_FAILED', result.error.message);
+		}
+		return { psbtBase64: result.value };
 	}
 
 	/** Broadcast a built raw transaction and report both txid and hex. */

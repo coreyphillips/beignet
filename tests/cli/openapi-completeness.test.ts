@@ -121,7 +121,10 @@ describe('OpenAPI Spec Completeness', () => {
 		'/tx/bump-fee',
 		'/tx/boost',
 		'/transactions/boostable',
-		'/consolidate'
+		'/consolidate',
+		'/psbt/build',
+		'/psbt/import-signed',
+		'/psbt/combine'
 	];
 
 	for (const route of expectedRoutes) {
