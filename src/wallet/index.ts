@@ -41,8 +41,6 @@ import {
 	IGetUtxosResponse,
 	IHeader,
 	IKeyDerivationPath,
-	IMultisigOptions,
-	IMultisigWallet,
 	InputData,
 	IOnchainFees,
 	IOutput,
@@ -84,7 +82,6 @@ import {
 } from '../types';
 import {
 	appendDescriptorChecksum,
-	buildSortedMultisigPayment,
 	clampFeeRate,
 	decodeOpReturnMessage,
 	err,
@@ -108,11 +105,9 @@ import {
 	getSeed,
 	getWalletDataStorageKey,
 	isPositive,
-	MultisigSpendError,
 	objectKeys,
 	objectsMatch,
 	ok,
-	parseBip48Path,
 	parseExtendedPublicKey,
 	removeDustUtxos,
 	Result,
@@ -143,12 +138,6 @@ export class Wallet {
 	private readonly _root?: BIP32Interface;
 	// Account-level xpub node for watch-only wallets (no private keys).
 	private readonly _accountNode?: BIP32Interface;
-	// Sorted-multisig configuration: threshold + account-level PUBLIC nodes
-	// for every cosigner (ours included when a mnemonic was provided).
-	private readonly _multisig?: {
-		threshold: number;
-		cosigners: { node: BIP32Interface; isOurs: boolean }[];
-	};
 	private _data: IWalletData;
 	private _getData: TGetData;
 	private _setData?: TSetData;
@@ -217,12 +206,9 @@ export class Wallet {
 			lookAhead: GAP_LIMIT,
 			lookBehindChange: GAP_LIMIT_CHANGE,
 			lookAheadChange: GAP_LIMIT_CHANGE
-		},
-		multisig
-	}: IWallet) {
-		if (!mnemonic && !xpub && !multisig) {
-			throw new Error('No mnemonic specified.');
 		}
+	}: IWallet) {
+		if (!mnemonic && !xpub) throw new Error('No mnemonic specified.');
 		if (name && name.includes('-'))
 			throw new Error('Wallet name cannot include a hyphen (-).');
 		if (!Number.isInteger(account) || account < 0) {
@@ -247,26 +233,7 @@ export class Wallet {
 				this._seed,
 				this.getBitcoinNetwork(this._network)
 			);
-		}
-		if (multisig) {
-			if (addressType && addressType !== EAddressType.p2wsh) {
-				throw new Error(
-					'Multisig wallets only support the p2wsh address type.'
-				);
-			}
-			const setup = this._initMultisig(multisig);
-			this._multisig = setup.config;
-			this.id = setup.id;
-			this.addressType = EAddressType.p2wsh;
-			// Multisig wallets derive exactly one script type.
-			addressTypesToMonitor = [EAddressType.p2wsh];
-		} else if (mnemonic) {
-			if (addressType === EAddressType.p2wsh) {
-				throw new Error(
-					'p2wsh is a multisig address type. Use Wallet.createMultisig.'
-				);
-			}
-			this.id = generateWalletId(this._seed!);
+			this.id = generateWalletId(this._seed);
 			this.addressType = addressType ?? EAddressType.p2wpkh;
 		} else {
 			const parseRes = parseExtendedPublicKey(xpub!, this._network);
@@ -277,27 +244,14 @@ export class Wallet {
 					`The provided xpub prefix implies ${inferredType}, but addressType ${addressType} was requested.`
 				);
 			}
-			const resolvedType = addressType ?? inferredType ?? EAddressType.p2wpkh;
-			if (resolvedType === EAddressType.p2wsh) {
-				throw new Error(
-					'p2wsh is a multisig address type. Use Wallet.createMultisig with every cosigner xpub.'
-				);
-			}
 			this._accountNode = node;
-			this.addressType = resolvedType;
+			this.addressType = addressType ?? inferredType ?? EAddressType.p2wpkh;
 			// Deterministic id across SLIP-132 encodings of the same account key.
 			this.id = generateWalletId(
 				Buffer.concat([node.publicKey, node.chainCode])
 			);
 			// A single account-level xpub only yields one address type.
 			addressTypesToMonitor = [this.addressType];
-		}
-		if (!this._multisig) {
-			// Sorted multisig cannot be derived without cosigner keys; it never
-			// belongs in a single-sig wallet's monitor set.
-			addressTypesToMonitor = addressTypesToMonitor.filter(
-				(type) => type !== EAddressType.p2wsh
-			);
 		}
 		this._data = getDefaultWalletData();
 		this._getData = storage?.getData ?? getDataFallback;
@@ -393,22 +347,6 @@ export class Wallet {
 		return this._data.birthdayHeight ?? 0;
 	}
 
-	/** True when this wallet is a sorted-multisig (p2wsh) wallet. */
-	public get isMultisig(): boolean {
-		return !!this._multisig;
-	}
-
-	/** Threshold and cosigner count for multisig wallets. */
-	public get multisigInfo():
-		| { threshold: number; totalCosigners: number }
-		| undefined {
-		if (!this._multisig) return undefined;
-		return {
-			threshold: this._multisig.threshold,
-			totalCosigners: this._multisig.cosigners.length
-		};
-	}
-
 	static async create(params: IWallet): Promise<Result<Wallet>> {
 		try {
 			const wallet = new Wallet(params);
@@ -444,188 +382,6 @@ export class Wallet {
 	}
 
 	/**
-	 * Creates a sorted-multisig (BIP 48 / BIP 67) P2WSH wallet:
-	 * wsh(sortedmulti(threshold, cosigner keys...)), derived at
-	 * m/48'/coin'/account'/2'/{0,1}/index. Cosigners are provided as
-	 * account-level extended public keys (xpub/tpub or SLIP-132 Zpub/Vpub).
-	 * When a mnemonic is provided we are one of the cosigners: our BIP 48
-	 * account xpub is derived and included automatically. Without a mnemonic
-	 * the wallet is a watch-only multisig (full read-only surface, no
-	 * signing). Spending is PSBT-only: buildPsbt -> signPsbtWithOurKey ->
-	 * combinePsbts -> importSignedPsbt -> broadcastTransaction.
-	 * @param {IMultisigWallet} params
-	 * @returns {Promise<Result<Wallet>>}
-	 */
-	static async createMultisig(
-		params: IMultisigWallet
-	): Promise<Result<Wallet>> {
-		if (!params) return err('No multisig parameters provided.');
-		const { threshold, cosigners, ourXpub, ...walletParams } = params;
-		return await Wallet.create({
-			...walletParams,
-			addressType: EAddressType.p2wsh,
-			multisig: { threshold, cosigners, ourXpub }
-		});
-	}
-
-	/**
-	 * Validates the multisig options and resolves every cosigner to an
-	 * account-level PUBLIC node. Requires _network/_account/_root to be set.
-	 * The cosigner list is stored sorted by account public key so every
-	 * instance of the same quorum is deterministic (BIP 67 ordering of the
-	 * DERIVED child keys happens per address in buildSortedMultisigPayment).
-	 * @private
-	 * @param {IMultisigOptions} multisig
-	 * @returns {{ config; id }}
-	 */
-	private _initMultisig(multisig: IMultisigOptions): {
-		config: {
-			threshold: number;
-			cosigners: { node: BIP32Interface; isOurs: boolean }[];
-		};
-		id: string;
-	} {
-		const { threshold, cosigners, ourXpub } = multisig;
-		if (!Number.isInteger(threshold) || threshold < 1) {
-			throw new Error('Multisig threshold must be a positive integer.');
-		}
-		const keyId = (node: BIP32Interface): string =>
-			Buffer.concat([node.publicKey, node.chainCode]).toString('hex');
-		const entries: { node: BIP32Interface; isOurs: boolean }[] = [];
-		const addCosigner = (xpub: string): void => {
-			const res = parseExtendedPublicKey(xpub, this._network);
-			if (res.isErr()) throw res.error;
-			const node = res.value.node;
-			if (entries.some((e) => keyId(e.node) === keyId(node))) {
-				throw new Error(`Duplicate cosigner xpub provided: ${xpub}`);
-			}
-			entries.push({ node, isOurs: false });
-		};
-		for (const xpub of cosigners ?? []) addCosigner(xpub);
-		if (this._root) {
-			// We are a cosigner: derive our BIP 48 account xpub and include it.
-			const coinType = this._network === EAvailableNetworks.bitcoin ? '0' : '1';
-			const ourNode = this._root
-				.derivePath(`m/48'/${coinType}'/${this._account}'/2'`)
-				.neutered();
-			if (ourXpub) {
-				const parsed = parseExtendedPublicKey(ourXpub, this._network);
-				if (parsed.isErr()) throw parsed.error;
-				if (keyId(parsed.value.node) !== keyId(ourNode)) {
-					throw new Error(
-						`ourXpub does not match the account xpub derived from the mnemonic at m/48'/${coinType}'/${this._account}'/2'.`
-					);
-				}
-			}
-			const existing = entries.find((e) => keyId(e.node) === keyId(ourNode));
-			if (existing) {
-				existing.isOurs = true;
-			} else {
-				entries.push({ node: ourNode, isOurs: true });
-			}
-		} else if (ourXpub) {
-			// Watch-only multisig: ourXpub is just another cosigner key.
-			addCosigner(ourXpub);
-		}
-		const n = entries.length;
-		if (threshold > n) {
-			throw new Error(
-				`Multisig threshold (${threshold}) exceeds the number of cosigners (${n}).`
-			);
-		}
-		if (n > 15) {
-			throw new Error(`Multisig supports at most 15 cosigners, received ${n}.`);
-		}
-		entries.sort((a, b) => a.node.publicKey.compare(b.node.publicKey));
-		// Deterministic id for the quorum, independent of input order and of
-		// which cosigner (or watch-only coordinator) instantiates it.
-		const id = generateWalletId(
-			Buffer.concat([
-				Buffer.from('sortedmulti'),
-				Buffer.from([threshold, n]),
-				...entries.map((e) =>
-					Buffer.concat([e.node.publicKey, e.node.chainCode])
-				)
-			])
-		);
-		return { config: { threshold, cosigners: entries }, id };
-	}
-
-	/**
-	 * Builds the sorted-multisig payment data for a full BIP 48 path
-	 * (m/48'/coin'/account'/2'/change/index): the P2WSH address/output, the
-	 * m-of-n witnessScript and one bip32Derivation entry per cosigner
-	 * (ordered by BIP 67 derived-key order). publicKey is OUR derived child
-	 * key when a mnemonic is present, '' for watch-only multisig.
-	 * @param {string} path
-	 * @returns {Result}
-	 */
-	public getMultisigPayment(path: string): Result<{
-		address: string;
-		output: Buffer;
-		witnessScript: Buffer;
-		publicKey: string;
-		derivations: { masterFingerprint: Buffer; path: string; pubkey: Buffer }[];
-	}> {
-		try {
-			if (!this._multisig) {
-				return err('This wallet is not a multisig wallet.');
-			}
-			const parsed = parseBip48Path(path);
-			if (parsed.isErr()) return err(parsed.error.message);
-			const { coinType, account, change, index } = parsed.value;
-			const expectedCoin =
-				this._network === EAvailableNetworks.bitcoin ? '0' : '1';
-			if (coinType !== expectedCoin || account !== this._account) {
-				return err(
-					`Path ${path} does not match this wallet (expected m/48'/${expectedCoin}'/${this._account}'/2'/change/index).`
-				);
-			}
-			const payment = buildSortedMultisigPayment({
-				threshold: this._multisig.threshold,
-				cosignerNodes: this._multisig.cosigners.map((c) => c.node),
-				change,
-				index,
-				network: this.getBitcoinNetwork()
-			});
-			if (payment.isErr()) return err(payment.error.message);
-			const perCosigner = this._multisig.cosigners
-				.map((c) => {
-					let masterFingerprint: Buffer;
-					if (c.isOurs && this._root) {
-						masterFingerprint = Buffer.from(this._root.fingerprint);
-					} else {
-						// Only the account xpub is known for this cosigner; expose
-						// its parent fingerprint (watch-only single-sig convention).
-						masterFingerprint = Buffer.alloc(4);
-						masterFingerprint.writeUInt32BE(c.node.parentFingerprint ?? 0, 0);
-					}
-					return {
-						masterFingerprint,
-						path,
-						pubkey: c.node.derive(change).derive(index).publicKey,
-						isOurs: c.isOurs
-					};
-				})
-				.sort((a, b) => a.pubkey.compare(b.pubkey));
-			const ours = perCosigner.find((d) => d.isOurs);
-			return ok({
-				address: payment.value.address,
-				output: payment.value.output,
-				witnessScript: payment.value.witnessScript,
-				publicKey: ours && this._root ? ours.pubkey.toString('hex') : '',
-				derivations: perCosigner.map((d) => ({
-					masterFingerprint: d.masterFingerprint,
-					path: d.path,
-					pubkey: d.pubkey
-				}))
-			});
-		} catch (e) {
-			return err(e);
-		}
-	}
-
-	/**
 	 * Stops the wallet. Use this method to prepare the wallet to be de
 	 * @returns {Promise<Result<string>>}
 	 */
@@ -657,13 +413,6 @@ export class Wallet {
 		network: EAvailableNetworks,
 		servers?: TServer | TServer[]
 	): Promise<Result<Wallet>> {
-		if (this._multisig) {
-			// Cosigner xpub version bytes encode the network; a new multisig
-			// wallet must be created from keys for the target network.
-			return err(
-				'Multisig wallets cannot switch networks. Create a new multisig wallet with cosigner xpubs for the target network.'
-			);
-		}
 		if (this.isWatchOnly) {
 			// The xpub version bytes encode the network; a new watch-only wallet
 			// must be created from a key that matches the target network.
@@ -710,14 +459,6 @@ export class Wallet {
 	 * @returns {Promise<void>}
 	 */
 	async updateAddressType(addressType: EAddressType): Promise<void> {
-		if (addressType === EAddressType.p2wsh && !this._multisig) {
-			throw new Error(
-				'p2wsh is a multisig address type. Use Wallet.createMultisig.'
-			);
-		}
-		if (this._multisig && addressType !== EAddressType.p2wsh) {
-			throw new Error('Multisig wallets only support the p2wsh address type.');
-		}
 		this.addressType = addressType;
 		if (!this.addressTypesToMonitor.includes(this.addressType)) {
 			this.addressTypesToMonitor.push(this.addressType);
@@ -1087,20 +828,6 @@ export class Wallet {
 		addressType: EAddressType
 	): Promise<Result<IGetAddressResponse>> {
 		try {
-			if (addressType === EAddressType.p2wsh) {
-				if (!this._multisig) {
-					return err(
-						'p2wsh addresses require a multisig wallet (Wallet.createMultisig).'
-					);
-				}
-				const payment = this.getMultisigPayment(path);
-				if (payment.isErr()) return err(payment.error.message);
-				return ok({
-					address: payment.value.address,
-					publicKey: payment.value.publicKey,
-					path
-				});
-			}
 			if (this._customGetAddress) {
 				const data = {
 					path,
@@ -2496,40 +2223,9 @@ export class Wallet {
 						return `wpkh(${keyExpr})`;
 					case EAddressType.p2tr:
 						return `tr(${keyExpr})`;
-					case EAddressType.p2wsh:
-						// Multisig descriptors are assembled in the multisig branch
-						// below; p2wsh is filtered out of the single-sig loop.
-						return `wsh(${keyExpr})`;
 				}
 			};
-			if (this._multisig) {
-				// wsh(sortedmulti(k, key1, key2, ...)): our key carries the full
-				// origin (master fingerprint + BIP 48 path); cosigners known only
-				// as xpubs carry a fingerprint-only origin (the account key's
-				// parent fingerprint, the watch-only single-sig convention).
-				const coinType =
-					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
-				const keyExpr = (chain: 0 | 1): string => {
-					const keys = this._multisig!.cosigners.map((cosigner) => {
-						const xpub = this._toStandardBase58(cosigner.node);
-						let origin: string;
-						if (cosigner.isOurs && this._root) {
-							origin = `[${fingerprint}/48h/${coinType}h/${this._account}h/2h]`;
-						} else {
-							const parentFp = Buffer.alloc(4);
-							parentFp.writeUInt32BE(cosigner.node.parentFingerprint ?? 0, 0);
-							origin = `[${parentFp.toString('hex')}]`;
-						}
-						return `${origin}${xpub}/${chain}/*`;
-					});
-					return `sortedmulti(${this._multisig!.threshold},${keys.join(',')})`;
-				};
-				descriptors.push({
-					addressType: EAddressType.p2wsh,
-					external: appendDescriptorChecksum(`wsh(${keyExpr(0)})`),
-					internal: appendDescriptorChecksum(`wsh(${keyExpr(1)})`)
-				});
-			} else if (this.isWatchOnly) {
+			if (this.isWatchOnly) {
 				if (!this._accountNode) {
 					return err('Watch-only account node is unavailable.');
 				}
@@ -2547,11 +2243,7 @@ export class Wallet {
 				if (!this._root) return err('Wallet root is unavailable.');
 				const coinType =
 					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
-				// p2wsh is multisig-only and has no single-key descriptor.
-				const singleSigTypes = Object.values(EAddressType).filter(
-					(type) => type !== EAddressType.p2wsh
-				);
-				for (const addressType of singleSigTypes) {
+				for (const addressType of Object.values(EAddressType)) {
 					const pathRes = getKeyDerivationPathObject({
 						path: addressTypes[addressType].path,
 						network: this._network
@@ -3788,7 +3480,6 @@ export class Wallet {
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<Result<string>> {
-		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
@@ -3864,7 +3555,6 @@ export class Wallet {
 		rbf?: boolean;
 		broadcast?: boolean;
 	} = {}): Promise<Result<string>> {
-		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		if (!this.data.utxos.length) {
 			return err('No UTXOs available.');
@@ -4047,9 +3737,6 @@ export class Wallet {
 	 * Imports an externally signed PSBT, validates that EVERY input carries a
 	 * valid signature, finalizes and extracts the transaction WITHOUT
 	 * broadcasting it. Broadcast separately via broadcastTransaction.
-	 * Multisig (P2WSH m-of-n witnessScript) inputs finalize only when at
-	 * least m VALID partial signatures from script keys are present; below
-	 * the threshold the error names how many signatures it has and needs.
 	 * @param {string} psbtBase64
 	 * @returns {Result<IImportSignedPsbtResponse>}
 	 */
@@ -4074,8 +3761,6 @@ export class Wallet {
 				if (!hasSignature) {
 					return err(`Input ${i} is missing a signature.`);
 				}
-				const multisigCheck = this._enforceMultisigThreshold(psbt, i);
-				if (multisigCheck.isErr()) return err(multisigCheck.error.message);
 				let valid = false;
 				try {
 					valid = psbt.validateSignaturesOfInput(i, validatePsbtSignature);
@@ -4091,125 +3776,6 @@ export class Wallet {
 			}
 			const tx = psbt.extractTransaction();
 			return ok({ txHex: tx.toHex(), txid: tx.getId() });
-		} catch (e) {
-			return err(e);
-		}
-	}
-
-	/**
-	 * Threshold gate for multisig PSBT inputs. When input i carries an m-of-n
-	 * OP_CHECKMULTISIG witnessScript, this verifies (fail-closed):
-	 * - the witnessUtxo commits to that witnessScript (P2WSH match),
-	 * - every partial signature comes from a key IN the script,
-	 * - at least m distinct script keys signed (else err naming have/need).
-	 * Extra signatures beyond m (all still validated by the caller) are
-	 * trimmed in script-key order so the finalizer can build the witness.
-	 * Non-multisig inputs pass through untouched.
-	 * @private
-	 * @param {bitcoin.Psbt} psbt
-	 * @param {number} i
-	 * @returns {Result<string>}
-	 */
-	private _enforceMultisigThreshold(
-		psbt: bitcoin.Psbt,
-		i: number
-	): Result<string> {
-		const input = psbt.data.inputs[i];
-		const witnessScript = input.witnessScript;
-		if (!witnessScript) return ok('Not a multisig input.');
-		let m: number | undefined;
-		let pubkeys: Buffer[] | undefined;
-		try {
-			const p2ms = bitcoin.payments.p2ms({ output: witnessScript });
-			m = p2ms.m;
-			pubkeys = p2ms.pubkeys;
-		} catch {
-			return ok('Not a multisig witnessScript.');
-		}
-		if (!m || !pubkeys?.length) return ok('Not a multisig witnessScript.');
-		const p2wsh = bitcoin.payments.p2wsh({
-			redeem: { output: witnessScript }
-		});
-		if (
-			!input.witnessUtxo ||
-			!p2wsh.output ||
-			!input.witnessUtxo.script.equals(p2wsh.output)
-		) {
-			return err(
-				`Input ${i}: witnessScript does not match the witnessUtxo script.`
-			);
-		}
-		const partials = input.partialSig ?? [];
-		for (const ps of partials) {
-			if (!pubkeys.some((pk) => pk.equals(ps.pubkey))) {
-				return err(
-					`Input ${i} carries a signature from a key that is not in the multisig script.`
-				);
-			}
-		}
-		const signedKeys = new Set(partials.map((ps) => ps.pubkey.toString('hex')));
-		const have = signedKeys.size;
-		if (have < m) {
-			return err(
-				`Input ${i} is below the multisig threshold: have ${have} signature(s), need ${m}.`
-			);
-		}
-		if (have > m) {
-			// Keep the first m signatures in script-key order; the multisig
-			// finalizer requires exactly m.
-			const keep: typeof partials = [];
-			for (const pk of pubkeys) {
-				if (keep.length >= m) break;
-				const ps = partials.find((p) => p.pubkey.equals(pk));
-				if (ps) keep.push(ps);
-			}
-			input.partialSig = keep;
-		}
-		return ok('Multisig threshold satisfied.');
-	}
-
-	/**
-	 * Adds OUR partial signature(s) to a PSBT without finalizing it (multisig
-	 * cosigner flow). Inputs are matched through their bip32Derivation
-	 * entries: any entry whose pubkey equals the key this wallet derives at
-	 * that path gets signed. Inputs we already signed are skipped. Requires
-	 * the mnemonic; watch-only wallets get the typed WatchOnlySigningError.
-	 * @param {string} psbtBase64
-	 * @returns {Result<string>} The PSBT (base64) including our signatures.
-	 */
-	public signPsbtWithOurKey(psbtBase64: string): Result<string> {
-		try {
-			if (!this._root) return err(new WatchOnlySigningError());
-			if (!psbtBase64) return err('No PSBT provided.');
-			const network = this.getBitcoinNetwork();
-			const psbt = bitcoin.Psbt.fromBase64(psbtBase64, { network });
-			if (psbt.inputCount === 0) return err('PSBT has no inputs.');
-			let matched = 0;
-			for (let i = 0; i < psbt.inputCount; i++) {
-				const input = psbt.data.inputs[i];
-				if (input.finalScriptSig || input.finalScriptWitness) continue;
-				for (const derivation of input.bip32Derivation ?? []) {
-					let keyPair: BIP32Interface;
-					try {
-						keyPair = this._root.derivePath(derivation.path);
-					} catch {
-						continue;
-					}
-					if (!keyPair.publicKey.equals(derivation.pubkey)) continue;
-					matched++;
-					const alreadySigned = (input.partialSig ?? []).some((ps) =>
-						ps.pubkey.equals(keyPair.publicKey)
-					);
-					if (!alreadySigned) psbt.signInput(i, keyPair);
-					break;
-				}
-			}
-			if (matched === 0) {
-				return err(
-					'No PSBT input carries a bip32Derivation this wallet can sign for.'
-				);
-			}
-			return ok(psbt.toBase64());
 		} catch (e) {
 			return err(e);
 		}
@@ -4961,8 +4527,7 @@ export class Wallet {
 	 */
 	public getAddressesFromPrivateKey(
 		privateKey: string,
-		// p2wsh is excluded: a single private key cannot form a multisig script.
-		_addressTypes = getAddressTypes().filter((t) => t !== EAddressType.p2wsh)
+		_addressTypes = getAddressTypes()
 	): Result<IGetAddressesFromPrivateKey> {
 		try {
 			const network = this.getBitcoinNetwork();
@@ -5035,7 +4600,6 @@ export class Wallet {
 	}: ISweepPrivateKey): Promise<Result<ISweepPrivateKeyRes>> {
 		// The sweep transaction is signed through the wallet signing path, which
 		// requires the wallet's own keys even for an externally provided key.
-		if (this._multisig) return err(new MultisigSpendError());
 		if (this.isWatchOnly) return err(new WatchOnlySigningError());
 		const privateKeyInfo = await this.getPrivateKeyInfo(privateKey);
 		if (privateKeyInfo.isErr()) {

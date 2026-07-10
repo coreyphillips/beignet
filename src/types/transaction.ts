@@ -19,9 +19,7 @@ export interface ICreateTransaction {
 
 export interface IAddInput {
 	psbt: Psbt;
-	// Not required for multisig (p2wsh) inputs, whose scripts come from the
-	// wallet's cosigner set rather than a single key.
-	keyPair?: BIP32Interface | ECPairInterface;
+	keyPair: BIP32Interface | ECPairInterface;
 	input: IUtxo;
 }
 

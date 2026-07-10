@@ -137,6 +137,7 @@ const utxos = wallet.value.listUtxos();
 const history = await wallet.value.getAddressHistory('bc1q...');
 ```
 
+<<<<<<< HEAD
 ### Watch-Only Wallets
 
 A watch-only wallet is constructed from an account-level extended public key
@@ -216,112 +217,14 @@ const combined = wallet.combinePsbts([copyA, copyB]);
 The HTTP daemon exposes the same flow on its (mnemonic-backed) wallet via
 `POST /psbt/build`, `POST /psbt/import-signed` and `POST /psbt/combine`, and
 the CLI via `beignet psbt build|import-signed|combine`.
-
-### Multisig P2WSH Wallets (sortedmulti)
-
-`Wallet.createMultisig` creates a descriptor-based sorted-multisig wallet:
-`wsh(sortedmulti(threshold, key1, key2, ...))`, the interoperable standard
-used by Bitcoin Core, Sparrow and Specter. Derivation follows BIP 48 with
-script type 2 (`m/48'/coin'/account'/2'`, receive `/0/*`, change `/1/*`) and
-public keys are ordered per BIP 67 at every index, so any wallet built from
-the same account xpubs produces identical addresses regardless of the order
-the cosigners were listed in.
-
-Cosigners are supplied as account-level extended public keys (`xpub`/`tpub`,
-or the SLIP-132 multisig encodings `Zpub`/`Vpub`, normalized automatically).
-When a mnemonic is provided, this wallet IS one of the cosigners: its BIP 48
-account xpub is derived and included automatically (pass `ourXpub` to assert
-it explicitly; a mismatch is rejected). Omit the mnemonic for a watch-only
-multisig coordinator: the full read-only surface (scanning, balances,
-history, subscriptions) works, signing does not.
-
-Spending is PSBT-only. Direct spends (`send`/`sendMany`/`sendMax`) fail with
-the typed `MultisigSpendError` (`code: 'MULTISIG_REQUIRES_PSBT'`). `buildPsbt`
-attaches the `witnessScript` and one `bip32Derivation` entry per cosigner to
-every input; `signPsbtWithOurKey` adds this cosigner's partial signature
-without finalizing; `importSignedPsbt` counts the VALID partial signatures on
-each input against the witnessScript threshold and refuses to finalize below
-it (the error names how many signatures it has and needs).
-`exportDescriptors()` emits the checksummed `wsh(sortedmulti(...))` receive
-and change descriptors for import into Bitcoin Core/Sparrow/Specter; our key
-carries its full key origin, cosigners known only as xpubs carry a
-fingerprint-only origin. Multisig is a library-only feature for now: the
-HTTP daemon wallet stays single-sig.
-
-Full 2-of-3 walkthrough:
-
-```typescript
-import { Wallet } from 'beignet';
-
-// Each cosigner shares their BIP 48 account xpub (m/48'/0'/0'/2' on mainnet).
-// Grab ours from exportDescriptors() or derive it with any BIP 48 tool.
-
-// 1. Cosigner A creates their multisig wallet (A holds mnemonicA).
-const walletA = (
-  await Wallet.createMultisig({
-    threshold: 2,
-    mnemonic: mnemonicA, // we are one cosigner; our xpub is added automatically
-    cosigners: [xpubB, xpubC],
-    network: 'bitcoin',
-    electrumOptions: { net, tls },
-  })
-).value;
-
-// Cosigner B does the same in their own instance/machine.
-const walletB = (
-  await Wallet.createMultisig({
-    threshold: 2,
-    mnemonic: mnemonicB,
-    cosigners: [xpubA, xpubC],
-    network: 'bitcoin',
-    electrumOptions: { net, tls },
-  })
-).value;
-
-// An optional watch-only coordinator holds no keys at all.
-const coordinator = (
-  await Wallet.createMultisig({
-    threshold: 2,
-    cosigners: [xpubA, xpubB, xpubC],
-    network: 'bitcoin',
-    electrumOptions: { net, tls },
-  })
-).value;
-
-// 2. Fund the multisig: every instance derives the same addresses.
-const deposit = await walletA.getAddress(); // == walletB/coordinator address
-
-// 3. Build the unsigned PSBT (works on any instance, coordinator included).
-const built = await walletA.buildPsbt({
-  address: 'bc1q...',
-  amount: 50000,
-  satsPerByte: 4,
-});
-const unsigned = built.value.psbtBase64;
-
-// 4. Each cosigner signs their own copy (below threshold nothing finalizes).
-const signedA = walletA.signPsbtWithOurKey(unsigned).value;
-const signedB = walletB.signPsbtWithOurKey(unsigned).value;
-
-// 5. Combine the partials, finalize at threshold, broadcast.
-const combined = coordinator.combinePsbts([signedA, signedB]).value;
-const finalized = coordinator.importSignedPsbt(combined).value; // 2-of-3 met
-await coordinator.broadcastTransaction(finalized.txHex);
-
-// Importing with only one signature fails loudly:
-// 'Input 0 is below the multisig threshold: have 1 signature(s), need 2.'
-
-// Interop: import the wallet into Bitcoin Core/Sparrow/Specter.
-const descriptors = walletA.exportDescriptors().value;
-// wsh(sortedmulti(2,[fp/48h/0h/0h/2h]xpub.../0/*,[fp]xpub.../0/*,...))#checksum
-```
-
+=======
 ### Networks, Fee Estimates & Electrum Failover
 
 - **Networks:** `mainnet`, `testnet`, `regtest`, and `signet` are supported end to end (on-chain wallet, Electrum, CLI/daemon via `--network signet`, and the Lightning node config, which uses the signet chain hash and `tbs` invoice prefix). Signet shares testnet's address formats and derivation paths (coin type 1); only the chain differs.
 - **Fee estimation source:** `Wallet.create({ feeEstimationSource })` accepts `'electrum' | 'http' | 'auto'` (default `'auto'`). `'electrum'` queries only the connected Electrum server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet; `'auto'` prefers Electrum and falls back to HTTP only when Electrum is unavailable or returns unusable values. All remote-sourced rates are clamped to at most 5000 sat/vB. The daemon exposes the same option as `feeEstimationSource` / `--fee-source` / `BEIGNET_FEE_SOURCE`.
 - **Electrum failover:** when multiple `electrumOptions.servers` are provided, the wallet rotates through them in order on connect/reconnect failure (then through hardcoded fallback peers for the network), with a per-server cooldown so dead servers are not hammered. `wallet.electrum.currentServer` and `wallet.electrum.rotationCount` expose the current server and rotation history.
 - **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` payment URI; the daemon's `POST /address/new` accepts `{ bip21: true, amountSats?, label?, message? }` and the CLI supports `address --bip21 [--amount <sats>] [--label L] [--message M]`.
+>>>>>>> d1ecb90 (wip)
 
 ### Storage & Encryption
 

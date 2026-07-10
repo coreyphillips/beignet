@@ -40,13 +40,13 @@ jobs:
       # lightning/CLI suites in one long process). Interop tests are excluded
       # here — they need LND/CLN/Eclair and run via `npm run test:interop`.
       - name: Run on-chain wallet tests
-        run: yarn build && npx mocha --exit -r ts-node/register --ignore 'tests/watch-only.test.ts' --ignore 'tests/psbt-flow.test.ts' --ignore 'tests/utxo-freeze.test.ts' --ignore 'tests/wallet-metadata.test.ts' --ignore 'tests/multi-account.test.ts' --ignore 'tests/descriptors.test.ts' --ignore 'tests/multisig.test.ts' 'tests/*.test.ts'
+        run: yarn build && npx mocha --exit -r ts-node/register --ignore 'tests/watch-only.test.ts' --ignore 'tests/psbt-flow.test.ts' --ignore 'tests/utxo-freeze.test.ts' --ignore 'tests/wallet-metadata.test.ts' --ignore 'tests/multi-account.test.ts' --ignore 'tests/descriptors.test.ts' 'tests/*.test.ts'
 
       # Offline suites that intentionally point wallets at an unreachable
       # Electrum port. rn-electrum-client keeps module-global client state, so
       # they must not share a process with the live-Electrum wallet tests.
       - name: Run watch-only and PSBT tests (isolated)
-        run: npx mocha --exit -r ts-node/register tests/watch-only.test.ts tests/psbt-flow.test.ts tests/utxo-freeze.test.ts tests/wallet-metadata.test.ts tests/multi-account.test.ts tests/descriptors.test.ts tests/multisig.test.ts
+        run: npx mocha --exit -r ts-node/register tests/watch-only.test.ts tests/psbt-flow.test.ts tests/utxo-freeze.test.ts tests/wallet-metadata.test.ts tests/multi-account.test.ts tests/descriptors.test.ts
 
       - name: Run lightning unit tests
         run: npm run test:lightning

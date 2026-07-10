@@ -296,10 +296,6 @@ export const getAddressFromKeyPair = ({
 				address = res.value.address;
 			}
 			break;
-		case EAddressType.p2wsh:
-			// A sorted-multisig P2WSH address needs every cosigner's key, not a
-			// single key pair; the Wallet multisig path builds it instead.
-			break;
 	}
 	if (!address) return err('Unable to get address from key pair.');
 	return ok({
@@ -343,8 +339,7 @@ export const getTapRootAddressFromPublicKey = ({
  */
 export const getAddressesFromPrivateKey = ({
 	privateKey,
-	// p2wsh is excluded: a single private key cannot form a multisig script.
-	addrTypes = getAddressTypes().filter((t) => t !== EAddressType.p2wsh),
+	addrTypes = getAddressTypes(),
 	network = bitcoin.networks.bitcoin
 }: {
 	privateKey: string;
