@@ -406,6 +406,9 @@ async function handleStart(): Promise<void> {
 	if (feeSourceFlag)
 		cliFlags.feeEstimationSource =
 			feeSourceFlag as BeignetConfig['feeEstimationSource'];
+	const logLevelFlag = parseFlag('--log-level');
+	if (logLevelFlag)
+		cliFlags.logLevel = logLevelFlag as BeignetConfig['logLevel'];
 
 	const config = resolveConfig(cliFlags);
 
@@ -451,7 +454,8 @@ async function handleStart(): Promise<void> {
 			torProxy: config.torProxy,
 			announceAddresses: config.announceAddresses,
 			watchtowers: config.watchtowers,
-			htlcEvents: config.htlcEvents
+			htlcEvents: config.htlcEvents,
+			logLevel: config.logLevel
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -2196,6 +2200,9 @@ Start flags:
                                          auto (default: auto = Electrum first,
                                          HTTP fallback)
   --port <N>                             HTTP daemon port (default: 2112)
+  --log-level <level>                    Daemon stderr log level: debug | info |
+                                         warn | error | silent (default: silent;
+                                         env BEIGNET_LOG_LEVEL, config logLevel)
   --host <addr>                          HTTP daemon bind address (default: 127.0.0.1)
   --daemon                               Run in background
   --anchors                              Prefer anchor channels (zero-fee HTLC)

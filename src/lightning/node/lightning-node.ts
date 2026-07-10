@@ -8,6 +8,7 @@
 
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
+import { ILogger, noopLogger } from '../../logger';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	signMessageWithKey,
@@ -373,6 +374,8 @@ export class LightningNode extends EventEmitter {
 	private receivedHtlcSharedSecrets: Map<string, Buffer> = new Map();
 	private feeEstimator: IFeeEstimator | null = null;
 	private missionControl: MissionControl;
+	/** Leveled diagnostic logger (injectable via INodeConfig.logger; no-op by default). */
+	private logger: ILogger;
 	private maxPaymentRetries: number;
 	private maxTotalInFlightHtlcs: number;
 	private autoUpdateChannelFees = false;
@@ -476,6 +479,7 @@ export class LightningNode extends EventEmitter {
 		this.feeEstimator = config.feeEstimator || null;
 		this.socks5Proxy = config.socks5Proxy ?? null;
 		this.initWatchtowerClient(config.watchtowers ?? []);
+		this.logger = config.logger ?? noopLogger;
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
 		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
@@ -8328,6 +8332,7 @@ export class LightningNode extends EventEmitter {
 			announcedAddresses?: INodeAddress[];
 			fundingProvider?: IFundingProvider;
 			feeEstimator?: IFeeEstimator;
+			logger?: ILogger;
 			socks5Proxy?: { host: string; port: number };
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
@@ -8391,6 +8396,7 @@ export class LightningNode extends EventEmitter {
 			announcedAddresses: options?.announcedAddresses,
 			fundingProvider: options?.fundingProvider,
 			feeEstimator: options?.feeEstimator,
+			logger: options?.logger,
 			socks5Proxy: options?.socks5Proxy,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,
@@ -9388,6 +9394,9 @@ export class LightningNode extends EventEmitter {
 			data
 		};
 		this.emit('log', log);
+		// Mirror to the injectable diagnostic logger (no-op unless configured).
+		// The persisted action log below stays untouched and separate.
+		this.logger.debug(`${category}:${action}`, data);
 		// Persist to storage if available
 		if (this.storage && typeof this.storage.saveActionLog === 'function') {
 			try {

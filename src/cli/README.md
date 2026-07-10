@@ -86,6 +86,7 @@ const node = await BeignetNode.create({
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
+  logger?: ILogger,          // leveled diagnostic logger; entries passing logLevel are forwarded to it and it is injected into the underlying Wallet + LightningNode
 });
 ```
 
@@ -456,7 +457,7 @@ node.on('electrum:failover', ({ from, to, timestamp }) => { ... }); // auto-reco
 node.on('log', (entry: LogEntry) => { ... });  // structured logs
 ```
 
-The `log` event fires based on the `logLevel` option. Set `logLevel: 'debug'` for verbose output, `'silent'` to suppress.
+The `log` event fires based on the `logLevel` option. Set `logLevel: 'debug'` for verbose output, `'silent'` to suppress. Pass a `logger` (any `ILogger`, e.g. `createConsoleLogger(level)` from the main package) to also receive those entries as `logger.debug/info/warn/error(message, meta)` calls; the daemon uses this with `--log-level` / `BEIGNET_LOG_LEVEL` to print diagnostics to stderr (silent by default).
 
 ### Return Types
 
@@ -922,7 +923,7 @@ beignet init [--network regtest] [--alias mynode]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token mysecret] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
   [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
-  [--htlc-events]
+  [--htlc-events] [--log-level info]
 beignet stop
 ```
 
@@ -1396,6 +1397,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_TLS_CERT` | Path to TLS certificate for HTTPS daemon |
 | `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
 | `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
+| `BEIGNET_LOG_LEVEL` | Daemon stderr log level: `debug`, `info`, `warn`, `error`, `silent` (default: silent) |
 
 ### Priority Order
 

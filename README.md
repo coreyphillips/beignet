@@ -13,6 +13,7 @@ Beignet provides two layers of Bitcoin wallet functionality:
 
 1. [Getting Started](#getting-started)
 2. [On-Chain Wallet](#on-chain-wallet)
+   - [Leveled Logging](#leveled-logging)
 3. [Lightning Network](#lightning-network)
    - [Lightning Quick Start (BeignetNode)](#lightning-quick-start-beignetnode)
    - [Decision-Support APIs](#decision-support-apis)
@@ -340,6 +341,27 @@ const wallet = await Wallet.create({
   // ...
 });
 ```
+
+### Leveled Logging
+
+Diagnostic output (debug/info/warn/error) flows through a small injectable logger, kept separate from the Lightning node's persisted structured action log (`getActionLog`). The `ILogger` interface is four methods, `debug`/`info`/`warn`/`error`(`message: string, meta?: unknown`), with level filtering `debug < info < warn < error` plus `'silent'`:
+
+```typescript
+import { Wallet, createConsoleLogger, noopLogger } from 'beignet';
+
+const wallet = await Wallet.create({
+  mnemonic,
+  logger: createConsoleLogger('warn'), // only warn + error reach the console
+  // logger: noopLogger,               // fully silent
+  // logger: myLogger,                 // any ILogger: route into your own stack
+  // ...
+});
+```
+
+- **`Wallet.create({ logger })`** defaults to `createConsoleLogger('info')`, which preserves the wallet's historical console output. `disableMessages` is independent and keeps its existing meaning: it only gates `onMessage` callbacks.
+- **`LightningNode`** accepts `logger` in `INodeConfig` / `fromMnemonic` options and defaults to `noopLogger` (the node prints nothing, as before). Every structured action-log entry is additionally mirrored to `logger.debug('category:action', data)`.
+- **`BeignetNode.create({ logger, logLevel })`**: log entries that pass `logLevel` are forwarded to the injected logger (in addition to the `'log'` event), and the logger is injected into the underlying `Wallet` and `LightningNode`. Without `logger`, behavior is unchanged (events only).
+- **Daemon:** `beignet start --log-level <debug|info|warn|error|silent>` (or `BEIGNET_LOG_LEVEL`, or `logLevel` in `~/.beignet/config.json`) prints leveled diagnostics to stderr. Unset keeps the daemon silent (the default); stdout stays reserved for command output.
 
 ## Lightning Network
 

@@ -11,8 +11,12 @@ import {
 	TProtocol
 } from '../types';
 import { defaultElectrumPeers } from '../shapes/electrum';
+import { createConsoleLogger } from '../logger';
 
 const POLLING_INTERVAL = 1000 * 20;
+// Module-level singleton (electrumConnection) has no injection point, so it
+// logs through a default console logger to preserve historical output.
+const logger = createConsoleLogger('info');
 export const defaultElectrumPorts = ['51002', '50002', '51001', '50001'];
 
 /**
@@ -151,7 +155,7 @@ export const electrumConnection = ((
 
 			if (error) {
 				if (connectToElectrum) {
-					console.log('Connection to Electrum Server lost, reconnecting...');
+					logger.info('Connection to Electrum Server lost, reconnecting...');
 					const response = await connectToElectrum();
 
 					if (response.isErr()) {
@@ -162,7 +166,7 @@ export const electrumConnection = ((
 				electrumConnection.publish(true);
 			}
 		} catch (e) {
-			console.error(e);
+			logger.error('Electrum connection check failed.', e);
 		}
 	}, POLLING_INTERVAL);
 

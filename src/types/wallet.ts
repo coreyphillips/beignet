@@ -11,6 +11,7 @@ import {
 import { ECoinSelectPreference, EFeeId, TGapLimitOptions } from './transaction';
 import { ECPairInterface } from 'ecpair';
 import { BIP32Interface } from 'bip32';
+import { ILogger } from '../logger';
 
 export type TAvailableNetworks = 'bitcoin' | 'testnet' | 'regtest' | 'signet';
 export type TAddressType = 'p2wpkh' | 'p2sh' | 'p2pkh';
@@ -244,6 +245,11 @@ export interface IWallet {
 	feeEstimationSource?: TFeeEstimationSource;
 	disableMessages?: boolean;
 	disableMessagesOnCreate?: boolean;
+	// Leveled diagnostic logger (debug/info/warn/error). Defaults to a
+	// console-backed logger at 'info' so existing console output is
+	// preserved; inject your own to reroute or silence diagnostics.
+	// Independent of disableMessages, which only gates onMessage callbacks.
+	logger?: ILogger;
 	addressTypesToMonitor?: EAddressType[];
 	gapLimitOptions?: TGapLimitOptions;
 	addressLookBehind?: number;
