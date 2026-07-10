@@ -23,7 +23,10 @@ import * as bitcoin from 'bitcoinjs-lib';
 const GENESIS_HASHES: Record<string, string> = {
 	bitcoin: '6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000',
 	testnet: '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000',
-	regtest: '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206',
+	// Internal order like the rest (the display-order form of this hash is
+	// 0f9188f1...e206). A live LND tower rejects the reversed form with
+	// "remote init has unknown chain hash".
+	regtest: '06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f',
 	signet: 'f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000'
 };
 
