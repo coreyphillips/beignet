@@ -204,7 +204,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       crypto.timingSafeEqual comparison for named keys and the legacy token;
       401 vs 403 distinction; runtime revocation by name (POST /auth/keys/revoke)
       plus durable removal via config.
-- [~] Remote/external signer interface (this PR): ISigner + SignerFactory in
+- [x] Remote/external signer interface (PR #60, merged): ISigner + SignerFactory in
       keys/signer.ts covering every channel-state-machine signature (funding
       digest, commitment/closing ECDSA, MuSig2 partial, second-level HTLC with
       per-commitment derivation INSIDE the signer, taproot Schnorr HTLC);
@@ -217,8 +217,14 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       secrets directly (separate surface, future work).
 - [?] mTLS / client certificates for the daemon. Decide priority.
 - [?] Key rotation strategy. Decide scope.
-- [ ] Leveled logging (debug/info/warn/error) with injectable logger, alongside the
-      existing structured action log.
+- [~] Leveled logging (this PR): platform-neutral src/logger.ts (ILogger
+      debug/info/warn/error, createConsoleLogger with level filtering,
+      noopLogger), injectable via Wallet config, INodeConfig, and
+      BeignetNodeOptions; daemon --log-level flag / BEIGNET_LOG_LEVEL env /
+      logLevel config writing to stderr (stdout stays reserved for command
+      output, default silent); LightningNode mirrors structured-log entries to
+      logger.debug; the persisted SQLite action log is untouched; defaults
+      preserve pre-existing output at every call site.
 
 ## M7. Deferred / decide-later protocol features
 
@@ -266,9 +272,12 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #60 merged (ISigner abstraction). Leveled logging (this PR)
+  closes the buildable M6 items; remaining M6 entries are the mTLS and key
+  rotation [?] decisions.
 - 2026-07-10: PR #58 merged (scoped API auth) and v0.3.0 released (PR #59,
   tag v0.3.0 at the multisig re-land point for npm publish). ISigner
-  remote-signer abstraction (this PR) is M6 item 2 of 3; leveled logging
+  remote-signer abstraction (PR #60) is M6 item 2 of 3; leveled logging
   follows.
 - 2026-07-10: PR #57 merged (multisig P2WSH re-land). M6 started with three
   parallel branches: scoped API auth (PR #58), ISigner remote-signer
