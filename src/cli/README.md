@@ -116,6 +116,9 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `boostOnchain(txid, satsPerVbyte?)` | `Promise<BoostResult>` | Fee-bump a tx: RBF when possible, else CPFP to a fresh wallet address |
 | `listBoostableTransactions()` | `BoostableTransactions` | Unconfirmed wallet txs eligible for RBF and/or CPFP |
 | `consolidateUtxos(satsPerVbyte?)` | `Promise<ConsolidateResult>` | Merge all UTXOs into one output at a fresh wallet address (send-max-to-self) |
+| `buildPsbt(outputs, satsPerVbyte?)` | `Promise<PsbtBuildInfo>` | Build an UNSIGNED PSBT for an external signer (hardware wallet); nothing is signed or broadcast |
+| `importSignedPsbt(psbtBase64)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT; returns `{ txid, txHex }` WITHOUT broadcasting |
+| `combinePsbts(psbts)` | `{ psbtBase64 }` | Combine partially signed copies of the same PSBT (multi-party signing) |
 | `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
 
 #### Peers
@@ -987,6 +990,15 @@ beignet tx boostable
 
 beignet consolidate [satsPerVbyte]
 # {"ok":true,"result":{"txid":"23ab...","utxosConsolidated":7,"address":"bc1q...","feeSats":310}}
+
+beignet psbt build <address> <sats> [satsPerVbyte]
+# Unsigned PSBT for a hardware wallet: {"ok":true,"result":{"psbtBase64":"cHNi...","feeSats":418,...}}
+
+beignet psbt import-signed <psbtBase64|file>
+# Validate + finalize (no broadcast): {"ok":true,"result":{"txid":"ab12...","txHex":"0200..."}}
+
+beignet psbt combine <psbt|file> <psbt|file>
+# {"ok":true,"result":{"psbtBase64":"cHNi..."}}
 beignet wallet refresh
 # {"ok":true,"result":{"refreshed":true}}
 ```
@@ -1376,6 +1388,9 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/tx/boost` | `{ txid, satsPerVbyte? }` | Fee-bump a tx: RBF when possible, else CPFP |
 | GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
 | POST | `/consolidate` | `{ satsPerVbyte? }` | Merge all UTXOs into one output at a fresh wallet address |
+| POST | `/psbt/build` | `{ outputs, satsPerVbyte? }` | Build an UNSIGNED PSBT for an external signer |
+| POST | `/psbt/import-signed` | `{ psbtBase64 }` | Validate + finalize a signed PSBT (no broadcast) |
+| POST | `/psbt/combine` | `{ psbts }` | Combine partially signed PSBT copies |
 | POST | `/peer/connect` | `{ pubkey, host, port }` | Connect peer |
 | POST | `/peer/disconnect` | `{ pubkey }` | Disconnect peer |
 | POST | `/peers/bootstrap` | -- | Discover peers via DNS |

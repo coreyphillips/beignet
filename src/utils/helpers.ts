@@ -17,6 +17,26 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import { BIP32Interface } from 'bip32';
 import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 const ECPair = ECPairFactory(ecc);
+
+/**
+ * PSBT signature validator for Psbt.validateSignaturesOfInput. A 32-byte
+ * pubkey means a taproot (x-only, schnorr) signature; 33 bytes means ECDSA.
+ * @param {Buffer} pubkey
+ * @param {Buffer} msghash
+ * @param {Buffer} signature
+ * @returns {boolean}
+ */
+export const validatePsbtSignature = (
+	pubkey: Buffer,
+	msghash: Buffer,
+	signature: Buffer
+): boolean => {
+	if (pubkey.length === 32) {
+		return Boolean(ecc.verifySchnorr(msghash, pubkey, signature));
+	}
+	return ECPair.fromPublicKey(pubkey).verify(msghash, signature);
+};
+
 /**
  * Get address for a given scriptPubKey.
  * @param scriptPubKey

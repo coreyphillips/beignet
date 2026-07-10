@@ -199,6 +199,31 @@ export interface UtxoInfo {
 	height: number;
 }
 
+/** Unsigned PSBT built for an external signer (hardware wallet). */
+export interface PsbtBuildInfo {
+	psbtBase64: string;
+	feeSats: number;
+	vsizeEstimate: number;
+	satsPerVbyte: number;
+	inputs: Array<{
+		txid: string;
+		vout: number;
+		address: string;
+		valueSats: number;
+		path: string;
+	}>;
+	outputs: Array<{
+		address?: string;
+		valueSats: number;
+	}>;
+}
+
+/** Finalized transaction extracted from a signed PSBT. NOT broadcast. */
+export interface PsbtImportInfo {
+	txid: string;
+	txHex: string;
+}
+
 /** Result of an RBF/CPFP fee bump. */
 export interface BoostResult {
 	/** Txid of the replacement (RBF) or child (CPFP) transaction. */

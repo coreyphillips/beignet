@@ -42,6 +42,7 @@ import ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 import { getAddressInfo } from 'bitcoin-address-validation';
 import { ECPairInterface } from 'ecpair';
+import { toXOnly } from 'bitcoinjs-lib/src/psbt/bip371';
 
 bitcoin.initEccLib(ecc);
 
@@ -678,7 +679,9 @@ export class Transaction {
 			targets.push({ script: embed.output!, value: 0, index: targets.length });
 		}
 
-		if (!bip32Interface) {
+		// Watch-only wallets cannot produce a signing root; inputs only need
+		// public keys here, which derivePublicNode provides in both modes.
+		if (!bip32Interface && !this._wallet.isWatchOnly) {
 			const bip32InterfaceRes = await this._wallet.getBip32Interface();
 			if (bip32InterfaceRes.isErr()) {
 				return err(bip32InterfaceRes.error.message);
@@ -692,9 +695,18 @@ export class Transaction {
 		//Add Inputs from inputs array
 		try {
 			for (const input of inputs) {
-				let keyPair = input?.keyPair;
+				let keyPair: BIP32Interface | ECPairInterface | undefined =
+					input?.keyPair;
 				if (!keyPair && input?.path) {
-					keyPair = root.derivePath(input.path);
+					if (root) {
+						keyPair = root.derivePath(input.path);
+					} else {
+						const publicNodeRes = this._wallet.derivePublicNode(input.path);
+						if (publicNodeRes.isErr()) {
+							return err(publicNodeRes.error.message);
+						}
+						keyPair = publicNodeRes.value;
+					}
 				}
 				if (!keyPair) {
 					return err('Unable to derive keyPair.');
@@ -742,6 +754,121 @@ export class Transaction {
 
 		return ok(psbt);
 	};
+
+	/**
+	 * Builds an UNSIGNED PSBT from the current (or provided) transaction data
+	 * and attaches the metadata an external signer needs
+	 * (bip32Derivation/tapBip32Derivation). Mirrors createTransaction but
+	 * stops before signing.
+	 * @param {ISendTransaction} [transactionData]
+	 * @param {boolean} [shuffleOutputs]
+	 * @returns {Promise<Result<Psbt>>}
+	 */
+	createUnsignedPsbt = async ({
+		transactionData = this.data,
+		shuffleOutputs = true
+	}: {
+		transactionData?: ISendTransaction;
+		shuffleOutputs?: boolean;
+	} = {}): Promise<Result<Psbt>> => {
+		//Remove any outputs that are below the dust limit and apply them to the fee.
+		removeDustOutputs(transactionData.outputs);
+
+		const inputValue = this.getTransactionInputValue({
+			inputs: transactionData.inputs
+		});
+		const outputValue = this.getTransactionOutputValue({
+			outputs: transactionData.outputs
+		});
+		if (inputValue === 0) {
+			return err('No inputs to spend.');
+		}
+		const fee = inputValue - outputValue;
+		if (fee > inputValue) {
+			return err('Fee is larger than the intended payment.');
+		}
+
+		const validateRes = validateTransaction(transactionData);
+		if (validateRes.isErr()) return err(validateRes.error.message);
+
+		try {
+			const psbtRes = await this.createPsbtFromTransactionData({
+				transactionData,
+				shuffleTargets: shuffleOutputs
+			});
+			if (psbtRes.isErr()) return err(psbtRes.error);
+			const psbt = psbtRes.value;
+			const metadataRes = this.addSignerMetadata({
+				psbt,
+				inputs: transactionData.inputs
+			});
+			if (metadataRes.isErr()) return err(metadataRes.error.message);
+			return ok(psbt);
+		} catch (e) {
+			return err(e);
+		}
+	};
+
+	/**
+	 * Attaches bip32Derivation (tapBip32Derivation for p2tr) to each PSBT
+	 * input so external signers can locate their keys. PSBT inputs are added
+	 * in the order of the inputs array, so indexes line up.
+	 * @param {Psbt} psbt
+	 * @param {IUtxo[]} inputs
+	 * @returns {Result<string>}
+	 * @private
+	 */
+	private addSignerMetadata({
+		psbt,
+		inputs
+	}: {
+		psbt: Psbt;
+		inputs: IUtxo[];
+	}): Result<string> {
+		try {
+			const masterFingerprint = this._wallet.getMasterFingerprint();
+			inputs.forEach((input, index) => {
+				// External inputs (e.g. swept keys) have no wallet path; an
+				// external signer cannot be pointed at them.
+				if (!input.path) return;
+				let pubkey: Buffer | undefined;
+				if (input.publicKey) {
+					pubkey = Buffer.from(input.publicKey, 'hex');
+				} else if (input.keyPair) {
+					pubkey = input.keyPair.publicKey;
+				} else {
+					const publicNodeRes = this._wallet.derivePublicNode(input.path);
+					if (publicNodeRes.isErr()) throw publicNodeRes.error;
+					pubkey = publicNodeRes.value.publicKey;
+				}
+				if (isP2trPrefix(input.address)) {
+					psbt.updateInput(index, {
+						tapBip32Derivation: [
+							{
+								masterFingerprint,
+								path: input.path,
+								pubkey: toXOnly(pubkey),
+								leafHashes: []
+							}
+						]
+					});
+				} else {
+					psbt.updateInput(index, {
+						bip32Derivation: [
+							{
+								masterFingerprint,
+								path: input.path,
+								pubkey
+							}
+						]
+					});
+				}
+			});
+			return ok('Signer metadata added.');
+		} catch (e) {
+			return err(e);
+		}
+	}
 
 	addInput = async ({
 		psbt,

@@ -398,6 +398,34 @@ export async function startDaemon(
 			return success(await node.consolidateUtxos(satsPerVbyte));
 		},
 
+		// ── External-signer PSBT flow ──
+		'POST /psbt/build': async (body) => {
+			const { outputs, satsPerVbyte } = body as {
+				outputs?: Array<{ address: string; amountSats: number }>;
+				satsPerVbyte?: number;
+			};
+			if (!outputs || !Array.isArray(outputs) || outputs.length === 0)
+				return failure(
+					'INVALID_PARAMS',
+					'outputs array of { address, amountSats } required'
+				);
+			return success(await node.buildPsbt(outputs, satsPerVbyte));
+		},
+		'POST /psbt/import-signed': (body) => {
+			const { psbtBase64 } = body as { psbtBase64?: string };
+			if (!psbtBase64) return failure('INVALID_PARAMS', 'psbtBase64 required');
+			return success(node.importSignedPsbt(psbtBase64));
+		},
+		'POST /psbt/combine': (body) => {
+			const { psbts } = body as { psbts?: string[] };
+			if (!psbts || !Array.isArray(psbts) || psbts.length < 2)
+				return failure(
+					'INVALID_PARAMS',
+					'psbts array with at least two base64 PSBTs required'
+				);
+			return success(node.combinePsbts(psbts));
+		},
+
 		'POST /peer/connect': async (body) => {
 			const {
 				pubkey,

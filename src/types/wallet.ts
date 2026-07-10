@@ -183,7 +183,10 @@ export type TSetData = <K extends keyof IWalletData>(
 ) => Promise<Result<boolean>>;
 
 export interface IWallet {
-	mnemonic: string;
+	mnemonic?: string;
+	// Account-level extended public key (xpub/ypub/zpub/tpub/upub/vpub) for
+	// watch-only wallets. Used only when no mnemonic is provided.
+	xpub?: string;
 	id?: string;
 	name?: string;
 	passphrase?: string;
@@ -474,6 +477,53 @@ export interface ISendTx {
 export interface ISend {
 	txs: ISendTx | ISendTx[];
 	satsPerByte?: number;
+}
+
+// Watch-only wallets are constructed from an account-level xpub; mnemonic,
+// passphrase and key-dependent options do not apply.
+export type IWatchOnlyWallet = Omit<
+	IWallet,
+	'mnemonic' | 'passphrase' | 'xpub'
+> & {
+	xpub: string;
+};
+
+export interface IBuildPsbtArgs {
+	txs?: ISendTx[];
+	address?: string;
+	amount?: number; // sats
+	message?: string;
+	satsPerByte?: number;
+	rbf?: boolean;
+	shuffleOutputs?: boolean;
+}
+
+export interface IBuildPsbtInputSummary {
+	tx_hash: string;
+	tx_pos: number;
+	address: string;
+	value: number;
+	path: string;
+}
+
+export interface IBuildPsbtOutputSummary {
+	address?: string; // Undefined for non-address outputs (e.g. OP_RETURN).
+	value: number;
+	index: number;
+}
+
+export interface IBuildPsbtResponse {
+	psbtBase64: string;
+	fee: number; // sats
+	vsizeEstimate: number; // vbytes
+	satsPerByte: number;
+	inputs: IBuildPsbtInputSummary[];
+	outputs: IBuildPsbtOutputSummary[];
+}
+
+export interface IImportSignedPsbtResponse {
+	txHex: string;
+	txid: string;
 }
 
 export type TAddressIndexInfo = {
