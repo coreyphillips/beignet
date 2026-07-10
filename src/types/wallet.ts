@@ -181,7 +181,15 @@ export interface IWalletData {
 	balance: number;
 	selectedFeeId: EFeeId;
 	feeEstimates: IOnchainFees;
+	// User-set labels keyed by address. Separate from IAddressData.label,
+	// which holds the address-type name and is kept for back-compat.
+	addressLabels: TAddressLabels;
+	// Wallet creation height (0 = unknown). Metadata only on Electrum; see
+	// Wallet.birthdayHeight docs.
+	birthdayHeight: number;
 }
+
+export type TAddressLabels = { [address: string]: string };
 
 export type TWalletDataKeys = keyof IWalletData;
 
@@ -203,6 +211,16 @@ export interface IWallet {
 	passphrase?: string;
 	network?: EAvailableNetworks;
 	addressType?: EAddressType;
+	// BIP32 account index (m/purpose'/coin'/ACCOUNT'/change/index). Defaults
+	// to 0. Non-zero accounts use distinct storage keys so instances over the
+	// same mnemonic and storage never collide. For watch-only wallets the
+	// account is already encoded in the xpub; the option only namespaces
+	// storage.
+	account?: number;
+	// Block height at wallet creation. Stored (earliest value wins) and
+	// exposed for backends/tools that can bound scans by height; the Electrum
+	// protocol cannot, see Wallet.birthdayHeight docs.
+	birthdayHeight?: number;
 	coinSelectPreference?: ECoinSelectPreference;
 	data?: IWalletData;
 	storage?: TStorage;
@@ -681,4 +699,29 @@ export interface ICanBoostResponse {
 	canBoost: boolean;
 	rbf: boolean;
 	cpfp: boolean;
+}
+
+// Balance split by frozen (blacklisted) UTXOs. total always equals
+// spendable + frozen; getBalance() keeps returning total.
+export interface IBalanceBreakdown {
+	total: number;
+	spendable: number;
+	frozen: number;
+}
+
+// One output descriptor pair for a single address type.
+export interface IExportedDescriptor {
+	addressType: EAddressType;
+	external: string; // .../0/* receive chain
+	internal: string; // .../1/* change chain
+}
+
+export interface IExportDescriptorsResponse {
+	fingerprint: string; // Master fingerprint hex (see getMasterFingerprint)
+	network: EAvailableNetworks;
+	account: number;
+	// Present when a birthday was recorded; helps a restore bound its scan.
+	birthdayHeight?: number;
+	watchOnly: boolean;
+	descriptors: IExportedDescriptor[];
 }

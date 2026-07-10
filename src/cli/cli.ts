@@ -145,6 +145,8 @@ async function main(): Promise<void> {
 			);
 		case 'utxos':
 			return outputResult(await httpRequest('GET', '/utxos'));
+		case 'utxo':
+			return handleUtxo();
 		case 'fee-estimates':
 			return outputResult(await httpRequest('GET', '/fees/estimates'));
 		case 'address':
@@ -154,6 +156,18 @@ async function main(): Promise<void> {
 						address: filteredArgs[2]
 					})
 				);
+			}
+			if (filteredArgs[1] === 'label') {
+				// Empty label ('' or omitted) clears an existing label.
+				return outputResult(
+					await httpRequest('POST', '/address/label', {
+						address: filteredArgs[2],
+						label: filteredArgs.slice(3).join(' ')
+					})
+				);
+			}
+			if (filteredArgs[1] === 'labels') {
+				return outputResult(await httpRequest('GET', '/address/labels'));
 			}
 			if (hasFlag('--bip21')) {
 				const amountFlag = parseFlag('--amount');
@@ -1156,12 +1170,54 @@ async function handleWallet(): Promise<void> {
 	switch (sub) {
 		case 'refresh':
 			return outputResult(await httpRequest('POST', '/wallet/refresh'));
+		case 'descriptors':
+			return outputResult(await httpRequest('GET', '/wallet/descriptors'));
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet wallet refresh'
+					message: 'Usage: beignet wallet [refresh|descriptors]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleUtxo(): Promise<void> {
+	const sub = filteredArgs[1];
+	const outpoint = (): { txid: string; index: number } => ({
+		txid: filteredArgs[2],
+		index: parseInt(filteredArgs[3], 10)
+	});
+	switch (sub) {
+		case 'freeze':
+			return outputResult(
+				await httpRequest('POST', '/utxo/freeze', outpoint())
+			);
+		case 'unfreeze':
+			return outputResult(
+				await httpRequest('POST', '/utxo/unfreeze', outpoint())
+			);
+		case 'frozen': {
+			const res = await httpRequest('GET', '/utxos');
+			if (res.ok && Array.isArray(res.result)) {
+				return output({
+					ok: true,
+					result: (res.result as Array<{ frozen?: boolean }>).filter(
+						(u) => u.frozen
+					)
+				});
+			}
+			return outputResult(res);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet utxo [freeze <txid> <index>|unfreeze <txid> <index>|frozen]'
 				}
 			});
 			process.exitCode = 1;
@@ -1902,6 +1958,9 @@ Info:
   address --bip21 [--amount <sats>] [--label L] [--message M]
                                          New address as a BIP21 URI
   address validate <address>             Validate a Bitcoin address
+  address label <address> [label]        Set a user label for an address
+                                         (omit the label to clear it)
+  address labels                         List all user address labels
   mnemonic                               Show mnemonic
   health                                 Node health status
   ready                                  Whether the node is operational
@@ -1910,7 +1969,8 @@ Info:
   stats [windowMs]                       Node statistics (optional time window)
   liquidity                              Liquidity snapshot + recommendations
   fees                                   On-chain fee trend analysis
-  spend-limit                            Daily spending limit status
+  spend-limit                            Combined LN + on-chain daily spend
+                                         limit status (with breakdown)
   logs [--category C] [--since ts] [--limit n]
                                          Query the persistent action log
   can-send [sats]                        Check Lightning send capacity
@@ -1935,9 +1995,15 @@ On-chain:
                                          returns txid/txHex WITHOUT broadcast
   psbt combine <psbt|file> <psbt|file>   Combine partially signed PSBT copies
   transactions [limit]                   List on-chain transactions (newest first)
-  utxos                                  List wallet UTXOs
+  utxos                                  List wallet UTXOs (includes frozen flag)
+  utxo freeze <txid> <index>             Freeze a UTXO (excluded from coin
+                                         selection until unfrozen)
+  utxo unfreeze <txid> <index>           Unfreeze a UTXO
+  utxo frozen                            List frozen UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)
   wallet refresh                         Re-sync the on-chain wallet
+  wallet descriptors                     Export BIP 380 output descriptors
+                                         (public keys only, never private)
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
   backup <destPath>                      Create database backup
@@ -2090,7 +2156,9 @@ Start flags:
   --api-token <token>                    API authentication token
   --backup-path <path>                   Enable automated backups to path
   --backup-interval <ms>                 Backup interval (default: 21600000 = 6h)
-  --daily-spend-limit <sats>             Daily spending limit in satoshis
+  --daily-spend-limit <sats>             Combined daily spending limit in sats
+                                         (Lightning payments AND external
+                                         on-chain sends share one budget)
   --tls-cert <path>                      TLS certificate file (enables HTTPS)
   --tls-key <path>                       TLS private key file (requires --tls-cert)
   --tor-proxy <host:port>                SOCKS5 proxy for outbound Lightning peer

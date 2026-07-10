@@ -83,17 +83,21 @@ export class Transaction {
 
 			const transaction = currentWallet.transaction;
 
-			// Gather required inputs.
+			// Gather required inputs. Frozen (blacklisted) UTXOs are excluded
+			// from every wallet-driven selection path; only an explicit utxos
+			// argument (internal RBF/CPFP flows) bypasses the filter.
 			let inputs: IUtxo[] = [];
 			if (inputTxHashes) {
 				// If specified, filter for the desired tx_hash and push the utxo as an input.
-				inputs = currentWallet.utxos.filter((utxo) => {
-					return inputTxHashes.includes(utxo.tx_hash);
-				});
+				inputs = this.removeBlackListedUtxos(
+					currentWallet.utxos.filter((utxo) => {
+						return inputTxHashes.includes(utxo.tx_hash);
+					})
+				);
 			} else if (utxos) {
 				inputs = utxos;
 			} else {
-				inputs = currentWallet.utxos;
+				inputs = this.removeBlackListedUtxos(currentWallet.utxos);
 			}
 
 			if (!inputs.length) {
@@ -214,11 +218,11 @@ export class Transaction {
 			utxos = this._wallet.data.utxos;
 		}
 		const blacklistedUtxos = this._wallet.data.blacklistedUtxos;
+		// Match by outpoint only: height changes when a frozen UTXO confirms
+		// and must not silently unfreeze it.
 		return utxos.filter((utxo) => {
 			return !blacklistedUtxos.find(
 				(blacklistedUtxo) =>
-					utxo.address === blacklistedUtxo.address &&
-					utxo.height === blacklistedUtxo.height &&
 					utxo.tx_hash === blacklistedUtxo.tx_hash &&
 					utxo.tx_pos === blacklistedUtxo.tx_pos
 			);

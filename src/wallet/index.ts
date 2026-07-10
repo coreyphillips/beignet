@@ -15,6 +15,7 @@ import {
 	EScanningStrategy,
 	IAddress,
 	IAddresses,
+	IBalanceBreakdown,
 	IBoostedTransaction,
 	IBoostedTransactions,
 	IBtInfo,
@@ -24,6 +25,8 @@ import {
 	ICanBoostResponse,
 	ICustomGetAddress,
 	ICustomGetScriptHash,
+	IExportDescriptorsResponse,
+	IExportedDescriptor,
 	IFormattedTransaction,
 	IFormattedTransactions,
 	IGenerateAddresses,
@@ -57,6 +60,7 @@ import {
 	IWatchOnlyWallet,
 	Net,
 	TAddressIndexInfo,
+	TAddressLabels,
 	TAddressTypeContent,
 	TAvailableNetworks,
 	TFeeEstimationSource,
@@ -77,6 +81,7 @@ import {
 	TWalletDataKeys
 } from '../types';
 import {
+	appendDescriptorChecksum,
 	clampFeeRate,
 	decodeOpReturnMessage,
 	err,
@@ -146,6 +151,10 @@ export class Wallet {
 		(result: Result<IWalletData>) => void
 	> = [];
 	private _disableMessagesOnCreate: boolean;
+	// BIP32 account index as a path segment string ('0' by default).
+	private readonly _account: string;
+	// Requested at create time; merged with the stored value in setWalletData.
+	private readonly _birthdayHeightOption?: number;
 
 	public addressTypesToMonitor: EAddressType[];
 	public coinSelectPreference: ECoinSelectPreference;
@@ -178,6 +187,8 @@ export class Wallet {
 		name,
 		network = EAvailableNetworks.mainnet,
 		addressType,
+		account = 0,
+		birthdayHeight,
 		coinSelectPreference = ECoinSelectPreference.consolidate,
 		storage,
 		electrumOptions,
@@ -200,6 +211,17 @@ export class Wallet {
 		if (!mnemonic && !xpub) throw new Error('No mnemonic specified.');
 		if (name && name.includes('-'))
 			throw new Error('Wallet name cannot include a hyphen (-).');
+		if (!Number.isInteger(account) || account < 0) {
+			throw new Error('account must be a non-negative integer.');
+		}
+		if (
+			birthdayHeight !== undefined &&
+			(!Number.isInteger(birthdayHeight) || birthdayHeight < 0)
+		) {
+			throw new Error('birthdayHeight must be a non-negative integer.');
+		}
+		this._account = String(account);
+		this._birthdayHeightOption = birthdayHeight;
 		this._network = network;
 		this._passphrase = passphrase ?? '';
 		this.isWatchOnly = !mnemonic;
@@ -308,6 +330,23 @@ export class Wallet {
 		return this._network;
 	}
 
+	/** BIP32 account index this wallet derives from (default 0). */
+	public get account(): number {
+		return Number(this._account);
+	}
+
+	/**
+	 * Wallet creation height (0 = unknown). HONEST SCOPE: the Electrum
+	 * protocol addresses history by scripthash, not by height, so a birthday
+	 * cannot reduce Electrum scan work today. The value is persisted
+	 * (earliest provided value wins), included in exportDescriptors() output,
+	 * and recorded for future backends (bitcoind RPC / compact filters) and
+	 * external tooling that CAN bound scans by height.
+	 */
+	public get birthdayHeight(): number {
+		return this._data.birthdayHeight ?? 0;
+	}
+
 	static async create(params: IWallet): Promise<Result<Wallet>> {
 		try {
 			const wallet = new Wallet(params);
@@ -329,6 +368,9 @@ export class Wallet {
 	 * so receive and change addresses are derived publicly as xpub/0/i and
 	 * xpub/1/i. All read-only functionality works; anything that requires
 	 * private keys fails with WatchOnlySigningError.
+	 * The account option does not affect derivation here (the xpub already
+	 * encodes its account); it only namespaces the storage keys so two
+	 * watch-only wallets over different account xpubs can share storage.
 	 * @param {IWatchOnlyWallet} params
 	 * @returns {Promise<Result<Wallet>>}
 	 */
@@ -388,6 +430,8 @@ export class Wallet {
 			...this,
 			mnemonic: this._mnemonic,
 			passphrase: this._passphrase,
+			account: Number(this._account),
+			birthdayHeight: this._birthdayHeightOption,
 			network,
 			electrumOptions: {
 				servers,
@@ -509,6 +553,7 @@ export class Wallet {
 			if (walletDataResponse.isErr())
 				return err(walletDataResponse.error.message);
 			this._data = walletDataResponse.value;
+			await this._applyBirthdayHeightOption();
 			return ok(true);
 		} catch (e) {
 			return err(e);
@@ -548,7 +593,32 @@ export class Wallet {
 	 * @param key
 	 */
 	public getWalletDataKey(key: keyof IWalletData): string {
-		return getWalletDataStorageKey(this.name, this._network, key);
+		return getWalletDataStorageKey(
+			this.name,
+			this._network,
+			key,
+			Number(this._account)
+		);
+	}
+
+	/**
+	 * Merges a birthdayHeight passed to Wallet.create with the stored value.
+	 * The EARLIEST non-zero value wins: moving a birthday later could let a
+	 * future height-bounded backend skip real history, so it is never allowed.
+	 * @private
+	 * @returns {Promise<void>}
+	 */
+	private async _applyBirthdayHeightOption(): Promise<void> {
+		if (this._birthdayHeightOption === undefined) return;
+		const stored = this._data.birthdayHeight ?? 0;
+		const next =
+			stored > 0
+				? Math.min(stored, this._birthdayHeightOption)
+				: this._birthdayHeightOption;
+		if (next !== stored) {
+			this._data.birthdayHeight = next;
+			await this.saveWalletData('birthdayHeight', next);
+		}
 	}
 
 	/**
@@ -623,6 +693,12 @@ export class Wallet {
 							break;
 						case 'feeEstimates':
 							walletData[key] = data as IOnchainFees;
+							break;
+						case 'addressLabels':
+							walletData[key] = data as TAddressLabels;
+							break;
+						case 'birthdayHeight':
+							walletData[key] = data as number;
 							break;
 						default:
 							console.log(`Unhandled key in getWalletData: ${key}`);
@@ -800,6 +876,7 @@ export class Wallet {
 				addressType,
 				changeAddress,
 				index,
+				accountType: this._account,
 				network: this._network
 			});
 			if (pathRes.isErr()) {
@@ -997,6 +1074,7 @@ export class Wallet {
 				if (keyDerivationPathResponse.isErr())
 					return err(keyDerivationPathResponse.error.message);
 				keyDerivationPath = keyDerivationPathResponse.value;
+				keyDerivationPath.account = this._account;
 			}
 
 			const addresses = {} as IAddresses;
@@ -1119,6 +1197,7 @@ export class Wallet {
 			}
 
 			const { pathObject: keyDerivationPath } = result.value;
+			keyDerivationPath.account = this._account;
 
 			//The currently known/stored address index.
 			let addressIndex = currentWallet.addressIndex[addressType];
@@ -1519,6 +1598,7 @@ export class Wallet {
 				return err(keyDerivationPathResponse.error.message);
 			}
 			keyDerivationPath = keyDerivationPathResponse.value;
+			keyDerivationPath.account = this._account;
 		}
 		const generatedAddresses = await this.generateAddresses({
 			addressAmount,
@@ -1821,6 +1901,7 @@ export class Wallet {
 					return err(keyDerivationPathResponse.error.message);
 				}
 				keyDerivationPath = keyDerivationPathResponse.value;
+				keyDerivationPath.account = this._account;
 			}
 			const addresses: IAddresses = currentWallet.addresses[addressType];
 			const currentAddressIndex: number =
@@ -1969,6 +2050,259 @@ export class Wallet {
 	 */
 	listUtxos(): IUtxo[] {
 		return this.data.utxos;
+	}
+
+	/**
+	 * Returns true when the given outpoint is currently frozen (blacklisted).
+	 * @param {string} txid
+	 * @param {number} index
+	 * @returns {boolean}
+	 */
+	public isUtxoFrozen(txid: string, index: number): boolean {
+		return this.data.blacklistedUtxos.some(
+			(frozen) => frozen.tx_hash === txid && frozen.tx_pos === index
+		);
+	}
+
+	/**
+	 * Freezes a wallet UTXO: it is excluded from every wallet-driven coin
+	 * selection path (send/sendMany/sendMax/consolidate/buildPsbt) until
+	 * unfrozen, while still counting toward getBalance(). Persists through
+	 * the existing blacklistedUtxos wallet data. Matching is by outpoint
+	 * (txid + index) so confirmation height changes cannot unfreeze it.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async freezeUtxo({
+		txid,
+		index
+	}: {
+		txid: string;
+		index: number;
+	}): Promise<Result<string>> {
+		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
+			return err('txid must be a 64-character hex string.');
+		}
+		if (!Number.isInteger(index) || index < 0) {
+			return err('index must be a non-negative integer.');
+		}
+		const utxo = this.data.utxos.find(
+			(u) => u.tx_hash === txid && u.tx_pos === index
+		);
+		if (!utxo) {
+			return err(`UTXO ${txid}:${index} is not known to this wallet.`);
+		}
+		if (this.isUtxoFrozen(txid, index)) {
+			return ok(`UTXO ${txid}:${index} is already frozen.`);
+		}
+		// keyPair must never be persisted with the frozen entry.
+		const { keyPair, ...frozen } = utxo;
+		void keyPair;
+		this._data.blacklistedUtxos.push(frozen);
+		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
+		return ok(`UTXO ${txid}:${index} frozen.`);
+	}
+
+	/**
+	 * Unfreezes a previously frozen UTXO, making it spendable again.
+	 * @param {string} txid
+	 * @param {number} index
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async unfreezeUtxo({
+		txid,
+		index
+	}: {
+		txid: string;
+		index: number;
+	}): Promise<Result<string>> {
+		const before = this._data.blacklistedUtxos.length;
+		this._data.blacklistedUtxos = this._data.blacklistedUtxos.filter(
+			(frozen) => !(frozen.tx_hash === txid && frozen.tx_pos === index)
+		);
+		if (this._data.blacklistedUtxos.length === before) {
+			return err(`UTXO ${txid}:${index} is not frozen.`);
+		}
+		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
+		return ok(`UTXO ${txid}:${index} unfrozen.`);
+	}
+
+	/**
+	 * Returns the frozen (blacklisted) UTXO entries. Entries are kept even
+	 * when the underlying outpoint has been spent or is not currently in the
+	 * UTXO set; matching against live UTXOs is by txid + index.
+	 * @returns {IUtxo[]}
+	 */
+	public listFrozenUtxos(): IUtxo[] {
+		return this.data.blacklistedUtxos;
+	}
+
+	/**
+	 * Splits the stored balance into spendable and frozen portions.
+	 * getBalance() keeps returning the total.
+	 * @returns {IBalanceBreakdown}
+	 */
+	public getBalanceBreakdown(): IBalanceBreakdown {
+		const total = this.getBalance();
+		const frozen = this.data.utxos.reduce((acc, utxo) => {
+			return this.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)
+				? acc + utxo.value
+				: acc;
+		}, 0);
+		return { total, spendable: total - frozen, frozen };
+	}
+
+	/**
+	 * Sets (or clears, when label is empty) a user label for an address.
+	 * Stored in its own addressLabels map; the pre-existing
+	 * IAddressData.label field (the address-type name) is untouched.
+	 * @param {string} address
+	 * @param {string} label
+	 * @returns {Promise<Result<string>>}
+	 */
+	public async setAddressLabel(
+		address: string,
+		label: string
+	): Promise<Result<string>> {
+		if (!address || !this.validateAddress(address)) {
+			return err(`Invalid ${this._network} address: ${address}`);
+		}
+		if (typeof label !== 'string') {
+			return err('label must be a string.');
+		}
+		if (label.length > 255) {
+			return err('label must be 255 characters or fewer.');
+		}
+		if (label === '') {
+			delete this._data.addressLabels[address];
+		} else {
+			this._data.addressLabels[address] = label;
+		}
+		await this.saveWalletData('addressLabels', this._data.addressLabels);
+		return ok(label === '' ? 'Label removed.' : 'Label saved.');
+	}
+
+	/**
+	 * Returns the user label for an address, if any.
+	 * @param {string} address
+	 * @returns {string | undefined}
+	 */
+	public getAddressLabel(address: string): string | undefined {
+		return this.data.addressLabels[address];
+	}
+
+	/**
+	 * Returns all user address labels keyed by address.
+	 * @returns {TAddressLabels}
+	 */
+	public listAddressLabels(): TAddressLabels {
+		return { ...this.data.addressLabels };
+	}
+
+	/**
+	 * Exports BIP 380 output descriptors (with checksums) for this wallet.
+	 * Full wallets export all four address types with key origin info
+	 * ([fingerprint/purpose'/coin'/account']); watch-only wallets export
+	 * their single address type without origin info, since only the xpub's
+	 * parent fingerprint is known and origins require the master fingerprint.
+	 * NO PRIVATE KEYS are ever included.
+	 * @returns {Result<IExportDescriptorsResponse>}
+	 */
+	public exportDescriptors(): Result<IExportDescriptorsResponse> {
+		try {
+			const fingerprint = this.getMasterFingerprint().toString('hex');
+			const descriptors: IExportedDescriptor[] = [];
+			const wrap = (addressType: EAddressType, keyExpr: string): string => {
+				switch (addressType) {
+					case EAddressType.p2pkh:
+						return `pkh(${keyExpr})`;
+					case EAddressType.p2sh:
+						return `sh(wpkh(${keyExpr}))`;
+					case EAddressType.p2wpkh:
+						return `wpkh(${keyExpr})`;
+					case EAddressType.p2tr:
+						return `tr(${keyExpr})`;
+				}
+			};
+			if (this.isWatchOnly) {
+				if (!this._accountNode) {
+					return err('Watch-only account node is unavailable.');
+				}
+				const xpub = this._toStandardBase58(this._accountNode);
+				descriptors.push({
+					addressType: this.addressType,
+					external: appendDescriptorChecksum(
+						wrap(this.addressType, `${xpub}/0/*`)
+					),
+					internal: appendDescriptorChecksum(
+						wrap(this.addressType, `${xpub}/1/*`)
+					)
+				});
+			} else {
+				if (!this._root) return err('Wallet root is unavailable.');
+				const coinType =
+					this._network === EAvailableNetworks.bitcoin ? '0' : '1';
+				for (const addressType of Object.values(EAddressType)) {
+					const pathRes = getKeyDerivationPathObject({
+						path: addressTypes[addressType].path,
+						network: this._network
+					});
+					if (pathRes.isErr()) return err(pathRes.error.message);
+					const purpose = pathRes.value.purpose;
+					const accountPath = `m/${purpose}'/${coinType}'/${this._account}'`;
+					// neutered(): the exported node carries public material only.
+					const accountXpub = this._toStandardBase58(
+						this._root.derivePath(accountPath).neutered()
+					);
+					const origin = `[${fingerprint}/${purpose}h/${coinType}h/${this._account}h]`;
+					descriptors.push({
+						addressType,
+						external: appendDescriptorChecksum(
+							wrap(addressType, `${origin}${accountXpub}/0/*`)
+						),
+						internal: appendDescriptorChecksum(
+							wrap(addressType, `${origin}${accountXpub}/1/*`)
+						)
+					});
+				}
+			}
+			const birthdayHeight = this.birthdayHeight;
+			return ok({
+				fingerprint,
+				network: this._network,
+				account: Number(this._account),
+				...(birthdayHeight > 0 ? { birthdayHeight } : {}),
+				watchOnly: this.isWatchOnly,
+				descriptors
+			});
+		} catch (e) {
+			return err(e);
+		}
+	}
+
+	/**
+	 * Re-encodes a public BIP32 node with the network's standard version
+	 * bytes (xpub/tpub). Watch-only account nodes parsed from SLIP-132
+	 * encodings (ypub/zpub/upub/vpub) otherwise serialize with their
+	 * non-standard prefix, which descriptor parsers reject.
+	 * @param {BIP32Interface} node
+	 * @returns {string}
+	 * @private
+	 */
+	private _toStandardBase58(node: BIP32Interface): string {
+		const standard = this.getBitcoinNetwork(this._network);
+		if (node.network?.bip32?.public === standard.bip32.public) {
+			return node.toBase58();
+		}
+		// Property-descriptor clone: swaps only the version bytes used by
+		// toBase58 while preserving depth/parentFingerprint/index metadata.
+		const clone = Object.create(
+			Object.getPrototypeOf(node),
+			Object.getOwnPropertyDescriptors(node)
+		) as BIP32Interface;
+		(clone as { network: Network }).network = standard;
+		return clone.toBase58();
 	}
 
 	/**

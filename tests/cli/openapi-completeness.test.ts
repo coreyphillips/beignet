@@ -124,7 +124,13 @@ describe('OpenAPI Spec Completeness', () => {
 		'/consolidate',
 		'/psbt/build',
 		'/psbt/import-signed',
-		'/psbt/combine'
+		'/psbt/combine',
+		'/utxo/freeze',
+		'/utxo/unfreeze',
+		'/address/label',
+		'/address/labels',
+		'/wallet/descriptors',
+		'/spend-limit'
 	];
 
 	for (const route of expectedRoutes) {
@@ -172,7 +178,8 @@ describe('OpenAPI Spec Completeness', () => {
 		'WatchtowerInfo',
 		'BoostResult',
 		'BoostableTransactions',
-		'ConsolidateResult'
+		'ConsolidateResult',
+		'DescriptorsInfo'
 	];
 
 	for (const schema of expectedSchemas) {

@@ -577,12 +577,14 @@ describe('New CLI types', () => {
 			vout: 1,
 			address: 'bc1qexample',
 			valueSats: 10000,
-			height: 800000
+			height: 800000,
+			frozen: false
 		};
 		const json = JSON.parse(JSON.stringify(utxo));
 		expect(json.txid).to.equal('aabbccdd');
 		expect(json.vout).to.equal(1);
 		expect(json.valueSats).to.equal(10000);
+		expect(json.frozen).to.equal(false);
 	});
 
 	it('Bolt12InvoiceInfo shape', () => {
