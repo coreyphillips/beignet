@@ -9,8 +9,144 @@ import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { sign, verify, getPublicKey } from '../crypto/ecdh';
 import { partialSign, type SessionKey } from '../crypto/musig';
+import { derivePrivateKey } from './derivation';
+import { signTaprootHtlcLeaf } from '../script/htlc-taproot';
 
 bitcoin.initEccLib(ecc);
+
+/**
+ * Channel signing abstraction: every signature the channel state machine needs
+ * over the funding key or the HTLC basepoint goes through this interface, so
+ * the raw private keys can live out of process (hardware module, remote
+ * signing daemon) without the channel code changing.
+ *
+ * SYNC CONSTRAINT: every method is synchronous. Signing is invoked deep inside
+ * synchronous state-machine paths (commitment_signed handling, force-close
+ * witness assembly, coop-close negotiation), so a remote signer implementation
+ * must do its own orchestration at a higher layer (e.g. pre-fetch signatures,
+ * or bridge to a blocking transport) rather than expect Promises here.
+ *
+ * NONCE SAFETY (taproot): `signCommitmentPartial` consumes single-use MuSig2
+ * nonces whose lifecycle is owned by the channel state machine — an
+ * implementation must never reuse a nonce across sighashes.
+ */
+export interface ISigner {
+	/** 33-byte compressed funding public key this signer signs for. */
+	readonly fundingPubkey: Buffer;
+
+	/**
+	 * Whether this signer holds HTLC key material (can produce second-level
+	 * HTLC signatures). When false the channel produces no htlc_signatures.
+	 */
+	readonly hasHtlcKeys: boolean;
+
+	/**
+	 * Sign an arbitrary 32-byte digest with the funding key (splice shared
+	 * input, channel_announcement bitcoin_signature). 64-byte compact sig.
+	 */
+	signFundingDigest(digest: Buffer): Buffer;
+
+	/**
+	 * Sign a commitment transaction's funding input (2-of-2 P2WSH,
+	 * SIGHASH_ALL). 64-byte compact signature.
+	 */
+	signCommitmentTx(
+		tx: bitcoin.Transaction,
+		fundingWitnessScript: Buffer,
+		fundingAmount: number
+	): Buffer;
+
+	/** Sign a cooperative closing transaction (same sighash as commitment). */
+	signClosingTx(
+		tx: bitcoin.Transaction,
+		fundingWitnessScript: Buffer,
+		fundingAmount: number
+	): Buffer;
+
+	/**
+	 * option_taproot: MuSig2 partial signature with the funding key over a
+	 * session already derived by the caller. `ourPublicNonce` MUST be the
+	 * exact single-use object generated for this session. 32 bytes.
+	 */
+	signCommitmentPartial(
+		session: SessionKey,
+		ourPublicNonce: Uint8Array
+	): Buffer;
+
+	/**
+	 * Sign a second-level HTLC transaction (HTLC-success/HTLC-timeout),
+	 * deriving the per-commitment HTLC private key internally per BOLT 3:
+	 * htlc_privkey = htlc_basepoint_secret + SHA256(per_commitment_point ||
+	 * htlc_basepoint). `htlcBasepoint` is the channel's advertised local HTLC
+	 * basepoint (passed in rather than recomputed so the derivation matches
+	 * the keys on the wire). Throws if `hasHtlcKeys` is false.
+	 */
+	signHtlcTxForCommitment(
+		tx: bitcoin.Transaction,
+		htlcWitnessScript: Buffer,
+		htlcAmount: number,
+		perCommitmentPoint: Buffer,
+		htlcBasepoint: Buffer,
+		useAnchorSighash?: boolean
+	): Buffer;
+
+	/**
+	 * option_taproot: BIP340 Schnorr signature over a second-level HTLC
+	 * tapscript sighash, deriving the per-commitment HTLC private key
+	 * internally (same derivation as signHtlcTxForCommitment). Throws if
+	 * `hasHtlcKeys` is false.
+	 */
+	signTaprootHtlcForCommitment(
+		sighash: Buffer,
+		perCommitmentPoint: Buffer,
+		htlcBasepoint: Buffer
+	): Buffer;
+
+	/**
+	 * Verify a remote signature on a commitment/closing transaction
+	 * (public-key operation — no private key involved). Implementations
+	 * should delegate to {@link verifyCommitmentSignature}: it enforces
+	 * low-S (BIP146) so we never accept a non-relayable commitment.
+	 */
+	verifyCommitmentSig(
+		tx: bitcoin.Transaction,
+		signature: Buffer,
+		remoteFundingPubkey: Buffer,
+		fundingWitnessScript: Buffer,
+		fundingAmount: number
+	): boolean;
+}
+
+/**
+ * Constructs the {@link ISigner} for a channel, keyed by the channel's key
+ * index (0 for node-level shared keys; the per-channel index when a
+ * channelKeyDeriver is configured). Inject via config to keep keys out of
+ * process — when present it REPLACES the internal ChannelSigner construction.
+ */
+export type SignerFactory = (channelKeyIndex: number) => ISigner;
+
+/**
+ * Verify a 64-byte compact ECDSA signature over a commitment/closing tx's
+ * funding-input sighash. Strict low-S (BIP146): a high-S signature verifies
+ * but makes the tx non-standard/non-relayable, so it is rejected here rather
+ * than accepting an unbroadcastable commitment. Exported so custom ISigner
+ * implementations can reuse the exact verification the channel depends on.
+ */
+export function verifyCommitmentSignature(
+	tx: bitcoin.Transaction,
+	signature: Buffer,
+	remoteFundingPubkey: Buffer,
+	fundingWitnessScript: Buffer,
+	fundingAmount: number
+): boolean {
+	const sigHash = tx.hashForWitnessV0(
+		0,
+		fundingWitnessScript,
+		fundingAmount,
+		bitcoin.Transaction.SIGHASH_ALL
+	);
+	return verify(sigHash, remoteFundingPubkey, signature, true);
+}
 
 /**
  * Encode a 64-byte compact signature to DER format.
@@ -45,9 +181,11 @@ function toDer(sig: Buffer): Buffer {
 }
 
 /**
- * Handles signing operations for a Lightning channel.
+ * The in-process {@link ISigner}: holds the raw funding private key (and
+ * optionally the HTLC basepoint secret) and signs locally. This is the
+ * default signer the node constructs from the raw key Buffers in its config.
  */
-export class ChannelSigner {
+export class ChannelSigner implements ISigner {
 	private fundingPrivkey: Buffer;
 	readonly fundingPubkey: Buffer;
 	private _htlcBasepointSecret: Buffer | undefined;
@@ -73,6 +211,57 @@ export class ChannelSigner {
 
 	get htlcBasepointSecret(): Buffer | undefined {
 		return this._htlcBasepointSecret;
+	}
+
+	get hasHtlcKeys(): boolean {
+		return this._htlcBasepointSecret !== undefined;
+	}
+
+	/**
+	 * BOLT 3 per-commitment HTLC private key for this signer's basepoint
+	 * secret. Kept private: channel code goes through the *ForCommitment
+	 * signing methods, never the raw key.
+	 */
+	private deriveHtlcPrivkey(
+		perCommitmentPoint: Buffer,
+		htlcBasepoint: Buffer
+	): Buffer {
+		if (!this._htlcBasepointSecret) {
+			throw new Error('Signer has no HTLC basepoint secret');
+		}
+		return derivePrivateKey(
+			this._htlcBasepointSecret,
+			perCommitmentPoint,
+			htlcBasepoint
+		);
+	}
+
+	signHtlcTxForCommitment(
+		tx: bitcoin.Transaction,
+		htlcWitnessScript: Buffer,
+		htlcAmount: number,
+		perCommitmentPoint: Buffer,
+		htlcBasepoint: Buffer,
+		useAnchorSighash?: boolean
+	): Buffer {
+		return this.signHtlcTx(
+			tx,
+			htlcWitnessScript,
+			htlcAmount,
+			this.deriveHtlcPrivkey(perCommitmentPoint, htlcBasepoint),
+			useAnchorSighash
+		);
+	}
+
+	signTaprootHtlcForCommitment(
+		sighash: Buffer,
+		perCommitmentPoint: Buffer,
+		htlcBasepoint: Buffer
+	): Buffer {
+		return signTaprootHtlcLeaf(
+			sighash,
+			this.deriveHtlcPrivkey(perCommitmentPoint, htlcBasepoint)
+		);
 	}
 
 	/**
@@ -195,17 +384,17 @@ export class ChannelSigner {
 		fundingWitnessScript: Buffer,
 		fundingAmount: number
 	): boolean {
-		const sigHash = tx.hashForWitnessV0(
-			0,
-			fundingWitnessScript,
-			fundingAmount,
-			bitcoin.Transaction.SIGHASH_ALL
-		);
 		// strict (low-S): this signature goes into the funding 2-of-2 witness of a
 		// commitment/closing tx we broadcast. A high-S signature verifies but makes
 		// that tx non-standard/non-relayable, so reject it here rather than accept an
 		// unbroadcastable commitment (BIP146).
-		return verify(sigHash, remoteFundingPubkey, signature, true);
+		return verifyCommitmentSignature(
+			tx,
+			signature,
+			remoteFundingPubkey,
+			fundingWitnessScript,
+			fundingAmount
+		);
 	}
 
 	/**

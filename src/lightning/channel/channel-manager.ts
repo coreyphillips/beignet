@@ -67,7 +67,7 @@ import {
 	buildAnchorScript
 } from '../script/anchor';
 import type { IFundingProvider } from '../node/types';
-import { ChannelSigner } from '../keys/signer';
+import { ChannelSigner, ISigner, SignerFactory } from '../keys/signer';
 import {
 	signRemoteCommitment,
 	signRemoteCommitmentPartial,
@@ -172,6 +172,14 @@ export interface IChannelManagerConfig {
 	nodePrivateKey?: Buffer;
 	/** Per-channel key derivation callback. If provided, each new channel gets unique keys. */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
+	/**
+	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
+	 * set, it replaces the internal ChannelSigner construction for every
+	 * channel signer, keyed by the channel's key index (0 for node-level
+	 * shared keys). The raw key Buffers in this config remain required for
+	 * non-signer paths (sweeps, monitors); library-level injection only.
+	 */
+	signerFactory?: SignerFactory;
 	/**
 	 * Liquidity ads (bLIP-0051): when set, this node sells inbound liquidity at
 	 * these rates — it answers a buyer's request_funds with a signed will_fund
@@ -309,6 +317,39 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Construct the signer for a channel's keys: the injected signerFactory
+	 * when configured (keys live out of process), else the in-process
+	 * ChannelSigner over the raw key material.
+	 */
+	private makeSigner(
+		channelKeyIndex: number,
+		fundingPrivkey: Buffer,
+		htlcBasepointSecret?: Buffer
+	): ISigner {
+		if (this.config.signerFactory) {
+			return this.config.signerFactory(channelKeyIndex);
+		}
+		return new ChannelSigner(fundingPrivkey, htlcBasepointSecret);
+	}
+
+	/**
+	 * Signer for an already-tracked channel: its own signer when set, else a
+	 * fallback over the node-level keys (via the injected factory when
+	 * configured). `includeHtlcSecret` preserves each call site's historical
+	 * fallback shape — closing paths never needed HTLC keys.
+	 */
+	private signerFor(channel: Channel, includeHtlcSecret: boolean): ISigner {
+		return (
+			channel.getSigner() ||
+			this.makeSigner(
+				channel.channelKeyIndex ?? 0,
+				this.config.localFundingPrivkey,
+				includeHtlcSecret ? this.config.htlcBasepointSecret : undefined
+			)
+		);
+	}
+
+	/**
 	 * Attach to a PeerManager to send/receive messages.
 	 */
 	attachToPeerManager(peerManager: PeerManager): void {
@@ -429,7 +470,8 @@ export class ChannelManager extends EventEmitter {
 		state.trustedPeer = true;
 		state.minimumDepth = 0;
 
-		const signer = new ChannelSigner(
+		const signer = this.makeSigner(
+			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
@@ -474,7 +516,8 @@ export class ChannelManager extends EventEmitter {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
-		const signer = new ChannelSigner(
+		const signer = this.makeSigner(
+			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
@@ -521,12 +564,7 @@ export class ChannelManager extends EventEmitter {
 		let initialSignature = signature;
 		let partialSignatureWithNonce: Buffer | undefined;
 		if (fundingState.remoteCurrentPerCommitmentPoint) {
-			const signer =
-				channel.getSigner() ||
-				new ChannelSigner(
-					this.config.localFundingPrivkey,
-					this.config.htlcBasepointSecret
-				);
+			const signer = this.signerFor(channel, true);
 			if (isTaprootChannel(fundingState.channelType)) {
 				// option_taproot: co-sign the acceptor's commitment #0 with a MuSig2
 				// partial signature instead of ECDSA.
@@ -576,7 +614,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private signFundingPartial(
 		state: IChannelState,
-		signer: ChannelSigner,
+		signer: ISigner,
 		remotePerCommitmentPoint: Buffer
 	): Buffer {
 		return this.signCommitmentPartial(
@@ -597,7 +635,7 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private signCommitmentPartial(
 		state: IChannelState,
-		signer: ChannelSigner,
+		signer: ISigner,
 		remotePerCommitmentPoint: Buffer,
 		commitmentNumber: bigint
 	): Buffer {
@@ -1036,7 +1074,11 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 
-			const signer = new ChannelSigner(fundingPrivkey, htlcBasepointSecret);
+			const signer = this.makeSigner(
+				this.config.channelKeyDeriver && keyIndex != null ? keyIndex : 0,
+				fundingPrivkey,
+				htlcBasepointSecret
+			);
 			channel.setSigner(signer);
 
 			// Rebuild the in-memory splice session/driver for a persisted in-flight
@@ -1217,12 +1259,7 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
-		const signer =
-			channel.getSigner() ||
-			new ChannelSigner(
-				this.config.localFundingPrivkey,
-				this.config.htlcBasepointSecret
-			);
+		const signer = this.signerFor(channel, true);
 		const actions = channel.forceClose(signer);
 		const failure = actions.find(
 			(a): a is { type: ChannelActionType.ERROR; message: string } =>
@@ -1687,7 +1724,8 @@ export class ChannelManager extends EventEmitter {
 			}
 		});
 
-		const signer = new ChannelSigner(
+		const signer = this.makeSigner(
+			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
@@ -1754,12 +1792,7 @@ export class ChannelManager extends EventEmitter {
 		channelState.fundingOutputIndex = msg.fundingOutputIndex;
 
 		// Sign the remote's initial commitment transaction with the channel's signer
-		const signer =
-			channel.getSigner() ||
-			new ChannelSigner(
-				this.config.localFundingPrivkey,
-				this.config.htlcBasepointSecret
-			);
+		const signer = this.signerFor(channel, true);
 
 		let signature = Buffer.alloc(64);
 		let partialSignatureWithNonce: Buffer | undefined;
@@ -2117,9 +2150,7 @@ export class ChannelManager extends EventEmitter {
 			}
 			const { tx, witnessScript, fundingSatoshis, remoteFundingPubkey } =
 				this.buildClosingTxAndScript(channel, feeSatoshis);
-			const signer =
-				channel.getSigner() ||
-				new ChannelSigner(this.config.localFundingPrivkey);
+			const signer = this.signerFor(channel, false);
 			return signer.verifyCommitmentSig(
 				tx,
 				theirSig,
@@ -2194,8 +2225,7 @@ export class ChannelManager extends EventEmitter {
 			channel,
 			feeSatoshis
 		);
-		const signer =
-			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const signer = this.signerFor(channel, false);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
 	}
 
@@ -2274,8 +2304,7 @@ export class ChannelManager extends EventEmitter {
 		}
 		if (cache.ourPartialSig) return cache.ourPartialSig;
 		const nonces = channel.getClosingNonces();
-		const signer =
-			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const signer = this.signerFor(channel, false);
 		const partial = signer.signCommitmentPartial(
 			cache.session as SessionKey,
 			nonces.local!
@@ -2312,8 +2341,7 @@ export class ChannelManager extends EventEmitter {
 			localFundingPubkey,
 			remoteFundingPubkey
 		} = this.buildClosingTxAndScript(channel, feeSatoshis);
-		const signer =
-			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const signer = this.signerFor(channel, false);
 		const ourSig = signer.signClosingTx(
 			tx,
 			witnessScript,
@@ -2521,8 +2549,7 @@ export class ChannelManager extends EventEmitter {
 				closerScript,
 				closeeScript
 			);
-		const signer =
-			channel.getSigner() || new ChannelSigner(this.config.localFundingPrivkey);
+		const signer = this.signerFor(channel, false);
 		return signer.signClosingTx(tx, witnessScript, Number(fundingSatoshis));
 	}
 
@@ -2552,9 +2579,7 @@ export class ChannelManager extends EventEmitter {
 					closerScript,
 					closeeScript
 				);
-			const signer =
-				channel.getSigner() ||
-				new ChannelSigner(this.config.localFundingPrivkey);
+			const signer = this.signerFor(channel, false);
 			return signer.verifyCommitmentSig(
 				tx,
 				theirSig,
@@ -2599,9 +2624,7 @@ export class ChannelManager extends EventEmitter {
 				closerScript,
 				closeeScript
 			);
-			const signer =
-				channel.getSigner() ||
-				new ChannelSigner(this.config.localFundingPrivkey);
+			const signer = this.signerFor(channel, false);
 			const ourSig = signer.signClosingTx(
 				tx,
 				witnessScript,
@@ -3245,7 +3268,8 @@ export class ChannelManager extends EventEmitter {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
-		const signer = new ChannelSigner(
+		const signer = this.makeSigner(
+			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
@@ -3341,7 +3365,8 @@ export class ChannelManager extends EventEmitter {
 			}
 		});
 
-		const signer = new ChannelSigner(
+		const signer = this.makeSigner(
+			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
 			chKeys.htlcBasepointSecret
 		);
@@ -4176,12 +4201,7 @@ export class ChannelManager extends EventEmitter {
 		if (monitor.isFullyResolved() || monitor.isCommitmentConfirmed()) return;
 		if (this._pendingCommitmentCpfp.has(idHex)) return;
 
-		const signer =
-			channel.getSigner() ||
-			new ChannelSigner(
-				this.config.localFundingPrivkey,
-				this.config.htlcBasepointSecret
-			);
+		const signer = this.signerFor(channel, true);
 		const actions = channel.forceClose(signer);
 		if (actions.some((a) => a.type === ChannelActionType.ERROR)) return;
 		// Re-broadcast the commitment itself (it may have been evicted while we

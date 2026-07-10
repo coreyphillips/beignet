@@ -210,7 +210,7 @@ import {
 } from '../channel/channel-state';
 import { IScbChannelEntry } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
-import { ChannelSigner } from '../keys/signer';
+import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
 import { OnionMessageManager } from '../onion-message/manager';
 import { AsyncPaymentManager } from '../async-payments/manager';
@@ -354,6 +354,8 @@ export class LightningNode extends EventEmitter {
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
 	private fundingPrivkey: Buffer;
+	/** Custom channel-signer factory (see INodeConfig.signerFactory). */
+	private signerFactory: SignerFactory | undefined;
 	/** Wallet-owned script that on-chain sweeps pay into (see INodeConfig). */
 	private sweepDestinationScript?: Buffer;
 	private htlcBasepointSecret: Buffer | undefined;
@@ -465,6 +467,7 @@ export class LightningNode extends EventEmitter {
 		this.fundingPubkey = config.channelBasepoints.fundingPubkey;
 		this.fundingProvider = config.fundingProvider || null;
 		this.fundingPrivkey = config.fundingPrivkey;
+		this.signerFactory = config.signerFactory;
 		this.sweepDestinationScript = config.sweepDestinationScript;
 		this.htlcBasepointSecret = config.htlcBasepointSecret;
 		this.delayedPaymentBasepointSecret = config.delayedPaymentBasepointSecret;
@@ -533,6 +536,7 @@ export class LightningNode extends EventEmitter {
 			chainHash: config.chainHashes?.[0],
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
+			signerFactory: config.signerFactory,
 			largeChannels: this.largeChannels
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
@@ -1880,7 +1884,9 @@ export class LightningNode extends EventEmitter {
 				// Sign the remote's initial commitment (use channel signer for per-channel keys)
 				const signer =
 					channel.getSigner() ||
-					new ChannelSigner(this.fundingPrivkey, this.htlcBasepointSecret);
+					(this.signerFactory
+						? this.signerFactory(channel.channelKeyIndex ?? 0)
+						: new ChannelSigner(this.fundingPrivkey, this.htlcBasepointSecret));
 				const { signature } = signRemoteCommitment(
 					state,
 					signer,

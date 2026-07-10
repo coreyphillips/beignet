@@ -14,6 +14,7 @@ import { FeatureFlags } from '../features/flags';
 import { IStorageBackend, IInvoiceInfo } from '../storage/types';
 import { IChainBackend } from '../chain/chain-watcher';
 import { IPerChannelKeys } from '../channel/channel-manager';
+import { SignerFactory } from '../keys/signer';
 
 export type { IInvoiceInfo };
 
@@ -113,6 +114,16 @@ export interface INodeConfig {
 	channelBasepoints: IChannelBasepoints;
 	perCommitmentSeed: Buffer;
 	fundingPrivkey: Buffer;
+	/**
+	 * Custom channel signer factory (ISigner) so channel signing keys can
+	 * live out of process (remote/external signer). When set it replaces the
+	 * internal ChannelSigner construction for every channel, keyed by the
+	 * channel's key index. Library-level injection only (no transport). The
+	 * raw key Buffers above remain required for non-signer paths (sweeps,
+	 * chain monitors); with a factory they are simply never used to sign
+	 * channel commitments.
+	 */
+	signerFactory?: SignerFactory;
 	/** HTLC basepoint secret for signing HTLC second-level transactions */
 	htlcBasepointSecret?: Buffer;
 	/** Revocation basepoint secret for penalty sweeps */
