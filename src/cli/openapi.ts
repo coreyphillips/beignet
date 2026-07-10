@@ -1359,6 +1359,100 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					responses: { '200': { description: 'Transaction info' } }
 				}
 			},
+			'/send-max': {
+				post: {
+					summary:
+						'Sweep the entire spendable on-chain balance to one address (amount = balance minus fee)',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						address: 'string',
+						satsPerVbyte: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Transaction info',
+							content: jsonContent({ $ref: '#/components/schemas/TxInfo' })
+						},
+						'400': { description: 'Invalid address/fee rate or no UTXOs' }
+					}
+				}
+			},
+			'/tx/bump-fee': {
+				post: {
+					summary:
+						'Replace an unconfirmed RBF-signalling wallet transaction with a higher-fee version (BIP 125)',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						txid: 'string',
+						satsPerVbyte: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Boost result',
+							content: jsonContent({ $ref: '#/components/schemas/BoostResult' })
+						},
+						'400': {
+							description:
+								'NOT_BOOSTABLE (unknown/confirmed/non-RBF tx; try /tx/boost for CPFP) or invalid params'
+						}
+					}
+				}
+			},
+			'/tx/boost': {
+				post: {
+					summary:
+						'Fee-bump an unconfirmed wallet transaction: RBF when possible, otherwise CPFP',
+					tags: ['Node'],
+					requestBody: bodyContent({
+						txid: 'string',
+						satsPerVbyte: 'number?'
+					}),
+					responses: {
+						'200': {
+							description: 'Boost result',
+							content: jsonContent({ $ref: '#/components/schemas/BoostResult' })
+						},
+						'400': {
+							description: 'NOT_BOOSTABLE or invalid params'
+						}
+					}
+				}
+			},
+			'/transactions/boostable': {
+				get: {
+					summary:
+						'List unconfirmed wallet transactions eligible for RBF and/or CPFP fee bumping',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Boostable transactions by method',
+							content: jsonContent({
+								$ref: '#/components/schemas/BoostableTransactions'
+							})
+						}
+					}
+				}
+			},
+			'/consolidate': {
+				post: {
+					summary:
+						'Merge all spendable UTXOs into a single output at a fresh wallet address (send-max-to-self)',
+					tags: ['Node'],
+					requestBody: bodyContent({ satsPerVbyte: 'number?' }),
+					responses: {
+						'200': {
+							description: 'Consolidation result',
+							content: jsonContent({
+								$ref: '#/components/schemas/ConsolidateResult'
+							})
+						},
+						'400': {
+							description:
+								'NOTHING_TO_CONSOLIDATE (fewer than 2 UTXOs) or invalid params'
+						}
+					}
+				}
+			},
 			'/readiness': {
 				get: {
 					summary: 'Get mainnet readiness report with weighted checks',
@@ -2552,6 +2646,45 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					properties: {
 						txid: { type: 'string' },
 						hex: { type: 'string' }
+					}
+				},
+				BoostResult: {
+					type: 'object',
+					properties: {
+						txid: {
+							type: 'string',
+							description: 'Replacement (RBF) or child (CPFP) txid'
+						},
+						hex: { type: 'string' },
+						boostType: { type: 'string', enum: ['rbf', 'cpfp'] },
+						feeSats: { type: 'integer' },
+						originalTxid: { type: 'string' }
+					}
+				},
+				BoostableTransactions: {
+					type: 'object',
+					properties: {
+						rbf: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/OnchainTxInfo' }
+						},
+						cpfp: {
+							type: 'array',
+							items: { $ref: '#/components/schemas/OnchainTxInfo' }
+						}
+					}
+				},
+				ConsolidateResult: {
+					type: 'object',
+					properties: {
+						txid: { type: 'string' },
+						hex: { type: 'string' },
+						utxosConsolidated: { type: 'integer' },
+						address: {
+							type: 'string',
+							description: 'Fresh wallet address holding the merged output'
+						},
+						feeSats: { type: 'integer' }
 					}
 				},
 				SpliceResult: {

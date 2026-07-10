@@ -111,7 +111,12 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 |--------|---------|-------------|
 | `getNewAddress()` | `Promise<string>` | Next unused bech32 receive address |
 | `sendOnchain(address, amountSats, satsPerVbyte?)` | `Promise<TxInfo>` | Build, sign, broadcast tx. Returns `{ txid, hex }`. Optional fee rate. |
-| `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum |
+| `sendMaxOnchain(address, satsPerVbyte?)` | `Promise<TxInfo>` | Sweep the entire spendable balance to one address (amount = balance minus fee) |
+| `bumpFeeOnchain(txid, satsPerVbyte)` | `Promise<BoostResult>` | RBF-replace an unconfirmed wallet tx at a higher fee rate (BIP 125); NOT_BOOSTABLE when RBF is unavailable |
+| `boostOnchain(txid, satsPerVbyte?)` | `Promise<BoostResult>` | Fee-bump a tx: RBF when possible, else CPFP to a fresh wallet address |
+| `listBoostableTransactions()` | `BoostableTransactions` | Unconfirmed wallet txs eligible for RBF and/or CPFP |
+| `consolidateUtxos(satsPerVbyte?)` | `Promise<ConsolidateResult>` | Merge all UTXOs into one output at a fresh wallet address (send-max-to-self) |
+| `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
 
 #### Peers
 
@@ -814,6 +819,8 @@ Error codes (`BeignetErrorCode` enum):
 | `ADDRESS_FAILED` | Wallet | Could not derive new address |
 | `SEND_FAILED` | Wallet | On-chain send failed |
 | `REFRESH_FAILED` | Wallet | Wallet sync failed |
+| `NOT_BOOSTABLE` | Wallet | Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able) |
+| `NOTHING_TO_CONSOLIDATE` | Wallet | Consolidation needs at least two spendable UTXOs |
 | `PAYMENT_FAILED` | Payments | Lightning payment failed |
 | `PAYMENT_TIMEOUT` | Payments | Payment did not settle within timeout |
 | `INVOICE_EXPIRED` | Payments | Invoice has expired |
@@ -920,7 +927,31 @@ beignet stats 3600000
 ```bash
 beignet send <address> <sats>
 # {"ok":true,"result":{"txid":"ab12...","hex":"0200..."}}
+
+beignet send-max <address> [satsPerVbyte]
+# Sweep the whole balance: {"ok":true,"result":{"txid":"cd34...","hex":"0200..."}}
+
+beignet tx bump-fee <txid> <satsPerVbyte>
+# RBF replacement: {"ok":true,"result":{"txid":"ef56...","boostType":"rbf","feeSats":420,"originalTxid":"ab12..."}}
+
+beignet tx boost <txid> [satsPerVbyte]
+# Auto RBF-else-CPFP: {"ok":true,"result":{"txid":"0178...","boostType":"cpfp",...}}
+
+beignet tx boostable
+# {"ok":true,"result":{"rbf":[...],"cpfp":[...]}}
+
+beignet consolidate [satsPerVbyte]
+# {"ok":true,"result":{"txid":"23ab...","utxosConsolidated":7,"address":"bc1q...","feeSats":310}}
 ```
+
+On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
+can later be bumped with `tx bump-fee` (or `tx boost`, which falls back to
+CPFP when RBF is unavailable).
+
+The on-chain wallet's state (addresses, UTXOs, transactions) persists in the
+node's SQLite database (encrypted at rest when `storageEncryption` is on, the
+default), so restarts sync incrementally from Electrum instead of rebuilding
+the wallet from scratch.
 
 ### Peers
 
@@ -1229,6 +1260,11 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/address/new` | -- | New address |
 | POST | `/wallet/refresh` | -- | Sync wallet |
 | POST | `/send` | `{ address, amountSats, satsPerVbyte? }` | Send on-chain (optional fee rate) |
+| POST | `/send-max` | `{ address, satsPerVbyte? }` | Sweep the whole on-chain balance to one address |
+| POST | `/tx/bump-fee` | `{ txid, satsPerVbyte }` | RBF an unconfirmed tx at a higher fee (NOT_BOOSTABLE if RBF unavailable) |
+| POST | `/tx/boost` | `{ txid, satsPerVbyte? }` | Fee-bump a tx: RBF when possible, else CPFP |
+| GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
+| POST | `/consolidate` | `{ satsPerVbyte? }` | Merge all UTXOs into one output at a fresh wallet address |
 | POST | `/peer/connect` | `{ pubkey, host, port }` | Connect peer |
 | POST | `/peer/disconnect` | `{ pubkey }` | Disconnect peer |
 | POST | `/peers/bootstrap` | -- | Discover peers via DNS |

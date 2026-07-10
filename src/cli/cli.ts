@@ -165,6 +165,25 @@ async function main(): Promise<void> {
 					amountSats: parseInt(filteredArgs[2], 10)
 				})
 			);
+		case 'send-max':
+			return outputResult(
+				await httpRequest('POST', '/send-max', {
+					address: filteredArgs[1],
+					satsPerVbyte: filteredArgs[2]
+						? parseInt(filteredArgs[2], 10)
+						: undefined
+				})
+			);
+		case 'tx':
+			return handleTx();
+		case 'consolidate':
+			return outputResult(
+				await httpRequest('POST', '/consolidate', {
+					satsPerVbyte: filteredArgs[1]
+						? parseInt(filteredArgs[1], 10)
+						: undefined
+				})
+			);
 		case 'peer':
 			return handlePeer();
 		case 'channel':
@@ -393,6 +412,42 @@ async function handleStop(): Promise<void> {
 		removePidFile();
 		const msg = err instanceof Error ? err.message : String(err);
 		output({ ok: false, error: { code: 'STOP_FAILED', message: msg } });
+	}
+}
+
+async function handleTx(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'bump-fee':
+			return outputResult(
+				await httpRequest('POST', '/tx/bump-fee', {
+					txid: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'boost':
+			return outputResult(
+				await httpRequest('POST', '/tx/boost', {
+					txid: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'boostable':
+			return outputResult(await httpRequest('GET', '/transactions/boostable'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable]'
+				}
+			});
+			process.exitCode = 1;
 	}
 }
 
@@ -1309,6 +1364,14 @@ Info:
 
 On-chain:
   send <address> <sats>                  Send on-chain
+  send-max <address> [satsPerVbyte]      Sweep the whole on-chain balance
+  tx bump-fee <txid> <satsPerVbyte>      RBF an unconfirmed tx at a higher fee
+  tx boost <txid> [satsPerVbyte]         Fee-bump a tx (RBF when possible,
+                                         else CPFP)
+  tx boostable                           List unconfirmed txs eligible for
+                                         RBF/CPFP
+  consolidate [satsPerVbyte]             Merge all UTXOs into one output at a
+                                         fresh wallet address
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)

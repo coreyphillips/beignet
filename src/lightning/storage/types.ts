@@ -103,6 +103,12 @@ export interface IStorageBackend {
 	saveMetadata(key: string, value: string): void;
 	loadMetadata(key: string): string | null;
 
+	// ─── On-chain Wallet Data (optional, key/value) ───
+	/** Persist one on-chain wallet data value (JSON string) under its key. */
+	saveWalletData?(key: string, value: string): void;
+	/** Load one on-chain wallet data value, or null when absent. */
+	loadWalletData?(key: string): string | null;
+
 	// ─── Transaction wrapper ───
 	transaction<T>(fn: () => T): T;
 

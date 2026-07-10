@@ -63,13 +63,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M2. Watchtower
 
-- [~] Watchtower client (this PR): LND altruist wtwire protocol (public-tower
+- [x] Watchtower client (PR #48, merged): LND altruist wtwire protocol (public-tower
       interop), XChaCha20-Poly1305 v0 justice blobs shipped at every revocation,
       per-session Noise keys, persisted sessions + un-acked backlog with retry,
       config watchtowers[] URIs. Deferred + documented: anchor to_remote and
       taproot (v1 blob) coverage, reward sessions.
 - [?] Watchtower server mode (lower priority; decide whether beignet should offer it).
-- [x] Document the single-process online-requirement (this PR: README limitations
+- [x] Document the single-process online-requirement (PR #48, merged: README limitations
       table updated alongside the tower client).
 
 ## M3. Routing-node operations
@@ -113,15 +113,15 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       settleHoldInvoice, cancelHoldInvoice (works pre-accept, restart-safe),
       listHoldInvoices; CLTV auto-cancel respected and the near-expiry claim
       backstop no longer force-closes on parked holds with unrevealed preimages.
-- [ ] Onchain power endpoints: sweep-all/send-max, bump-fee (RBF), boost (CPFP),
-      consolidate. Library already has sendMax, setupRbf, setupCpfp.
-- [ ] Persist the daemon's onchain wallet state through encrypted storage: BeignetNode
-      passes no storage to Wallet.create, so wallet state is in-memory and rebuilt from
-      Electrum on every boot (startup cost grows with address history, full footprint
-      re-queried against Electrum each start, labels/boost metadata forgotten). Fix is
-      a small TStorage adapter over the encrypted SQLite (or createEncryptedStorage
-      from PR #41) wired into beignet-node.ts. Correctness is unaffected today; this
-      buys fast boots, less Electrum chatter, and durable metadata.
+- [~] Onchain power endpoints (this PR): POST /send-max, /tx/bump-fee, /tx/boost
+      (auto RBF-else-CPFP), GET /transactions/boostable, POST /consolidate
+      (send-max-to-self). Also fixes the daemon wallet never signalling BIP 125
+      (rbf was off, bump-fee was permanently dead).
+- [~] Persist the daemon's onchain wallet state (this PR): TStorage adapter over the
+      encrypted SQLite (wallet_data table, schema v8, per-network scoped twice: db
+      file + key prefix); boots load from disk and refresh incrementally. Note:
+      dailySpendLimit remains LN-only by existing design; onchain routes mirror
+      /send (no accounting) - flagged for a future decision.
 - [x] sign/verify message with the node key (PR #47, merged): LND-compatible construction
       (prefix, double-SHA256, compact recoverable ECDSA, zbase32); live lncli
       cross-check noted as an interop follow-up.
@@ -226,6 +226,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): PR #48 merged (watchtower client, M2 core). M4 batch 2a
+  (this PR): onchain power endpoints + daemon wallet persistence.
 - 2026-07-09 (cont.): PR #47 merged (M4 batch 1). Watchtower client (this PR)
   lands the M2 core.
 - 2026-07-09 (cont.): PR #46 merged, M3 complete. M2 watchtower client prioritized

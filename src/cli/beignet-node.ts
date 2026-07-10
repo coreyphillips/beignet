@@ -22,9 +22,12 @@ import { generateMnemonic } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
 import {
 	EAvailableNetworks,
+	EBoostType,
 	EPaymentType,
+	IFormattedTransaction,
 	IOnchainFees
 } from '../types/wallet';
+import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { IPaymentInfo } from '../lightning/node/types';
@@ -82,6 +85,9 @@ import {
 	TxInfo,
 	OnchainTxInfo,
 	UtxoInfo,
+	BoostResult,
+	BoostableTransactions,
+	ConsolidateResult,
 	BalanceInfo,
 	OfferInfo,
 	TrustedPeerInfo,
@@ -636,7 +642,17 @@ export class BeignetNode extends EventEmitter {
 				tls,
 				servers: electrumServer
 			},
-			disableMessagesOnCreate: true
+			disableMessagesOnCreate: true,
+			// Enable RBF wallet-wide: canBoost() only ever reports rbf when this
+			// flag is set, so without it /tx/bump-fee could never apply. Send
+			// paths pass it per-transaction so outputs actually signal BIP 125.
+			rbf: true,
+			// Persist wallet state (addresses, UTXOs, transactions) through the
+			// node's SQLite DB so a restart syncs incrementally from Electrum
+			// instead of rebuilding from scratch. Rows are encrypted at rest iff
+			// the storage encryption key above is set; the DB file is per-network
+			// and keys embed the network, so testnet/mainnet data cannot mix.
+			storage: createWalletStorage(this.storage)
 		});
 		if (walletResult.isErr()) {
 			throw new BeignetError(
@@ -1247,17 +1263,23 @@ export class BeignetNode extends EventEmitter {
 	): Promise<TxInfo> {
 		// wallet.send with broadcast:true resolves to the txid, not the raw
 		// hex, so build first (broadcast:false returns the hex) and broadcast
-		// separately to report both txid and hex.
+		// separately to report both txid and hex. rbf must be passed per-send:
+		// the wallet-level flag does not propagate into setupTransaction.
 		const result = await this.wallet.send({
 			address,
 			amount: amountSats,
 			broadcast: false,
+			rbf: this.wallet.rbf,
 			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
 		});
 		if (result.isErr()) {
 			throw new BeignetError('SEND_FAILED', result.error.message);
 		}
-		const hex = result.value;
+		return this._broadcastRawTx(result.value);
+	}
+
+	/** Broadcast a built raw transaction and report both txid and hex. */
+	private async _broadcastRawTx(hex: string): Promise<TxInfo> {
 		const bitcoin = await import('bitcoinjs-lib');
 		const tx = bitcoin.Transaction.fromHex(hex);
 		const broadcastRes = await this.wallet.electrum.broadcastTransaction({
@@ -1269,6 +1291,279 @@ export class BeignetNode extends EventEmitter {
 		return { txid: tx.getId(), hex };
 	}
 
+	/** Reject a fee rate that is not a positive finite number. */
+	private _validateFeeRate(
+		satsPerVbyte: number | undefined,
+		required = false
+	): void {
+		if (satsPerVbyte === undefined) {
+			if (required) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					'satsPerVbyte required'
+				);
+			}
+			return;
+		}
+		if (
+			typeof satsPerVbyte !== 'number' ||
+			!Number.isFinite(satsPerVbyte) ||
+			satsPerVbyte <= 0
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'satsPerVbyte must be a positive number'
+			);
+		}
+	}
+
+	private _validateTxid(txid: string): void {
+		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'txid must be a 64-character hex string'
+			);
+		}
+	}
+
+	/**
+	 * Sweep the entire spendable on-chain balance to one address. The output
+	 * value is balance minus fee; the wallet rejects rates where the fee would
+	 * consume the whole balance.
+	 */
+	async sendMaxOnchain(
+		address: string,
+		satsPerVbyte?: number
+	): Promise<TxInfo> {
+		if (
+			!address ||
+			typeof address !== 'string' ||
+			!this.wallet.validateAddress(address)
+		) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				`Invalid ${this.networkName} address: ${address}`
+			);
+		}
+		this._validateFeeRate(satsPerVbyte);
+		const result = await this.wallet.sendMax({
+			address,
+			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+			rbf: this.wallet.rbf,
+			broadcast: false
+		});
+		if (result.isErr()) {
+			throw new BeignetError('SEND_FAILED', result.error.message);
+		}
+		return this._broadcastRawTx(result.value);
+	}
+
+	/**
+	 * Replace an unconfirmed, RBF-signalling wallet transaction with a
+	 * higher-fee version (BIP 125). Throws NOT_BOOSTABLE when RBF is not
+	 * possible; use boostOnchain for the automatic RBF-else-CPFP path.
+	 */
+	async bumpFeeOnchain(
+		txid: string,
+		satsPerVbyte: number
+	): Promise<BoostResult> {
+		this._validateTxid(txid);
+		this._validateFeeRate(satsPerVbyte, true);
+		const can = this.wallet.canBoost(txid);
+		if (!can.rbf) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_BOOSTABLE,
+				can.cpfp
+					? `Transaction ${txid} cannot be replaced via RBF; use POST /tx/boost (CPFP) instead`
+					: `Transaction ${txid} is not boostable (unknown, already confirmed, or balance too low)`
+			);
+		}
+		return this._boostRbf(txid, satsPerVbyte);
+	}
+
+	/**
+	 * Fee-bump an unconfirmed wallet transaction, choosing RBF when canBoost
+	 * allows it and CPFP otherwise. Falls back to CPFP when RBF setup fails
+	 * (e.g. the change output cannot be identified) and CPFP is possible.
+	 */
+	async boostOnchain(
+		txid: string,
+		satsPerVbyte?: number
+	): Promise<BoostResult> {
+		this._validateTxid(txid);
+		this._validateFeeRate(satsPerVbyte);
+		const can = this.wallet.canBoost(txid);
+		if (!can.canBoost) {
+			throw new BeignetError(
+				BeignetErrorCode.NOT_BOOSTABLE,
+				`Transaction ${txid} is not boostable (unknown, already confirmed, or balance too low)`
+			);
+		}
+		if (can.rbf) {
+			try {
+				return await this._boostRbf(txid, satsPerVbyte);
+			} catch (e) {
+				const rbfImpossible =
+					e instanceof BeignetError &&
+					e.code === BeignetErrorCode.NOT_BOOSTABLE;
+				if (!(rbfImpossible && can.cpfp)) throw e;
+			}
+		}
+		return this._boostCpfp(txid, satsPerVbyte);
+	}
+
+	private async _boostRbf(
+		txid: string,
+		satsPerVbyte?: number
+	): Promise<BoostResult> {
+		const setup = await this.wallet.transaction.setupRbf({ txid });
+		if (setup.isErr()) {
+			await this.wallet.resetSendTransaction();
+			throw new BeignetError(
+				BeignetErrorCode.NOT_BOOSTABLE,
+				setup.error.message
+			);
+		}
+		try {
+			// setupRbf defaults to the fast feerate; apply a requested rate through
+			// updateFee so the wallet's fee-overpayment guards run.
+			if (satsPerVbyte !== undefined) {
+				const feeRes = this.wallet.transaction.updateFee({
+					satsPerByte: satsPerVbyte
+				});
+				if (feeRes.isErr()) {
+					throw new BeignetError(
+						BeignetErrorCode.INVALID_PARAMS,
+						feeRes.error.message
+					);
+				}
+			}
+			// BIP 125 rule 3/4: the replacement must pay strictly more than the
+			// original fee or the network rejects it; fail with a clear message
+			// instead of a broadcast error.
+			const original =
+				this.wallet.unconfirmedTransactions[txid] ??
+				this.wallet.transactions[txid];
+			const originalFeeSats = original ? btcToSats(original.fee) : 0;
+			const newFeeSats = this.wallet.transaction.data.fee;
+			if (newFeeSats <= originalFeeSats) {
+				throw new BeignetError(
+					BeignetErrorCode.INVALID_PARAMS,
+					`Replacement fee ${newFeeSats} sats does not exceed the original fee ${originalFeeSats} sats; raise satsPerVbyte`
+				);
+			}
+			const createRes = await this.wallet.transaction.createTransaction();
+			if (createRes.isErr()) {
+				throw new BeignetError('SEND_FAILED', createRes.error.message);
+			}
+			const info = await this._broadcastRawTx(createRes.value.hex);
+			await this._recordBoost(txid, info.txid, EBoostType.rbf, newFeeSats);
+			return {
+				...info,
+				boostType: 'rbf',
+				feeSats: newFeeSats,
+				originalTxid: txid
+			};
+		} finally {
+			await this.wallet.resetSendTransaction();
+		}
+	}
+
+	private async _boostCpfp(
+		txid: string,
+		satsPerVbyte?: number
+	): Promise<BoostResult> {
+		const setup = await this.wallet.transaction.setupCpfp({
+			txid,
+			...(satsPerVbyte !== undefined ? { satsPerByte: satsPerVbyte } : {})
+		});
+		if (setup.isErr()) {
+			await this.wallet.resetSendTransaction();
+			throw new BeignetError(
+				BeignetErrorCode.NOT_BOOSTABLE,
+				setup.error.message
+			);
+		}
+		try {
+			const feeSats = setup.value.fee;
+			const createRes = await this.wallet.transaction.createTransaction();
+			if (createRes.isErr()) {
+				throw new BeignetError('SEND_FAILED', createRes.error.message);
+			}
+			const info = await this._broadcastRawTx(createRes.value.hex);
+			await this._recordBoost(txid, info.txid, EBoostType.cpfp, feeSats);
+			return {
+				...info,
+				boostType: 'cpfp',
+				feeSats,
+				originalTxid: txid
+			};
+		} finally {
+			await this.wallet.resetSendTransaction();
+		}
+	}
+
+	/** Record a broadcast boost; bookkeeping failure must not fail the bump. */
+	private async _recordBoost(
+		oldTxId: string,
+		newTxId: string,
+		type: EBoostType,
+		fee: number
+	): Promise<void> {
+		const res = await this.wallet.addBoostedTransaction({
+			oldTxId,
+			newTxId,
+			type,
+			fee
+		});
+		if (res.isErr()) {
+			this.log('warn', 'Failed to record boosted transaction', {
+				oldTxId,
+				newTxId,
+				error: res.error.message
+			});
+		}
+	}
+
+	/** Unconfirmed wallet transactions that can be fee-bumped, by method. */
+	listBoostableTransactions(): BoostableTransactions {
+		const { rbf, cpfp } = this.wallet.getBoostableTransactions();
+		return {
+			rbf: rbf.map((tx) => this.toOnchainTxInfo(tx)),
+			cpfp: cpfp.map((tx) => this.toOnchainTxInfo(tx))
+		};
+	}
+
+	/**
+	 * Consolidate every spendable UTXO into a single output at a fresh wallet
+	 * address. Implemented as send-max-to-self: wallet.sendMax spends ALL
+	 * wallet UTXOs by construction, which is exactly a consolidation, and it
+	 * reuses the wallet's existing fee ceiling guards.
+	 */
+	async consolidateUtxos(satsPerVbyte?: number): Promise<ConsolidateResult> {
+		this._validateFeeRate(satsPerVbyte);
+		const utxoCount = this.wallet.listUtxos().length;
+		if (utxoCount < 2) {
+			throw new BeignetError(
+				BeignetErrorCode.NOTHING_TO_CONSOLIDATE,
+				`Nothing to consolidate: wallet has ${utxoCount} spendable UTXO(s), need at least 2`
+			);
+		}
+		const address = await this.getNewAddress();
+		const result = await this.wallet.sendMax({
+			address,
+			satsPerByte: satsPerVbyte ?? this.wallet.feeEstimates.normal,
+			rbf: this.wallet.rbf,
+			broadcast: false
+		});
+		if (result.isErr()) {
+			throw new BeignetError('SEND_FAILED', result.error.message);
+		}
+		const feeSats = this.wallet.transaction.data.fee;
+		const info = await this._broadcastRawTx(result.value);
+		return { ...info, utxosConsolidated: utxoCount, address, feeSats };
+	}
+
 	async refreshWallet(): Promise<void> {
 		const result = await this.wallet.refreshWallet({});
 		if (result.isErr()) {
@@ -1276,29 +1571,33 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
+	// IFormattedTransaction stores value/fee in BTC (see wallet formatting),
+	// so both need conversion to satisfy the *Sats field names.
+	private toOnchainTxInfo(tx: IFormattedTransaction): OnchainTxInfo {
+		return {
+			txid: tx.txid,
+			type:
+				tx.type === EPaymentType.sent
+					? ('sent' as const)
+					: ('received' as const),
+			valueSats: btcToSats(tx.value),
+			feeSats: btcToSats(tx.fee),
+			satsPerVbyte: tx.satsPerByte,
+			address: tx.address,
+			...(tx.height ? { height: tx.height } : {}),
+			confirmed: Boolean(tx.height),
+			timestamp: tx.timestamp,
+			...(tx.confirmTimestamp !== undefined
+				? { confirmTimestamp: tx.confirmTimestamp }
+				: {})
+		};
+	}
+
 	listOnchainTransactions(): OnchainTxInfo[] {
 		// wallet.transactions already includes unconfirmed txs;
 		// unconfirmedTransactions is a subset copy, so no merge here.
-		// IFormattedTransaction stores value/fee in BTC (see wallet formatting),
-		// so both need conversion to satisfy the *Sats field names.
 		return Object.values(this.wallet.transactions)
-			.map((tx) => ({
-				txid: tx.txid,
-				type:
-					tx.type === EPaymentType.sent
-						? ('sent' as const)
-						: ('received' as const),
-				valueSats: btcToSats(tx.value),
-				feeSats: btcToSats(tx.fee),
-				satsPerVbyte: tx.satsPerByte,
-				address: tx.address,
-				...(tx.height ? { height: tx.height } : {}),
-				confirmed: Boolean(tx.height),
-				timestamp: tx.timestamp,
-				...(tx.confirmTimestamp !== undefined
-					? { confirmTimestamp: tx.confirmTimestamp }
-					: {})
-			}))
+			.map((tx) => this.toOnchainTxInfo(tx))
 			.sort((a, b) => b.timestamp - a.timestamp);
 	}
 

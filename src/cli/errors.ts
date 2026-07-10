@@ -8,6 +8,10 @@ export enum BeignetErrorCode {
 	ADDRESS_FAILED = 'ADDRESS_FAILED',
 	SEND_FAILED = 'SEND_FAILED',
 	REFRESH_FAILED = 'REFRESH_FAILED',
+	/** Transaction cannot be fee-bumped (unknown, confirmed, or not RBF/CPFP-able). */
+	NOT_BOOSTABLE = 'NOT_BOOSTABLE',
+	/** Consolidation needs at least two spendable UTXOs. */
+	NOTHING_TO_CONSOLIDATE = 'NOTHING_TO_CONSOLIDATE',
 	/** Another instance already holds the data-dir lock. */
 	INSTANCE_ALREADY_RUNNING = 'INSTANCE_ALREADY_RUNNING',
 

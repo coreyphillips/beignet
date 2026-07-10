@@ -199,6 +199,35 @@ export interface UtxoInfo {
 	height: number;
 }
 
+/** Result of an RBF/CPFP fee bump. */
+export interface BoostResult {
+	/** Txid of the replacement (RBF) or child (CPFP) transaction. */
+	txid: string;
+	hex: string;
+	boostType: 'rbf' | 'cpfp';
+	/** Total fee paid by the new transaction, in sats. */
+	feeSats: number;
+	/** The transaction that was boosted. */
+	originalTxid: string;
+}
+
+/** Unconfirmed wallet transactions eligible for fee bumping, by method. */
+export interface BoostableTransactions {
+	rbf: OnchainTxInfo[];
+	cpfp: OnchainTxInfo[];
+}
+
+/** Result of a UTXO consolidation (send-max-to-self). */
+export interface ConsolidateResult {
+	txid: string;
+	hex: string;
+	/** Number of UTXOs spent into the single output. */
+	utxosConsolidated: number;
+	/** Fresh wallet address the consolidated output pays to. */
+	address: string;
+	feeSats: number;
+}
+
 export interface BalanceInfo {
 	onchain: number;
 	lightning: number;
