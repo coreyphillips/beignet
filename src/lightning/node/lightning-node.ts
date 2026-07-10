@@ -1111,6 +1111,39 @@ export class LightningNode extends EventEmitter {
 			this.triggerPendingAnnouncementSigning(channelId);
 		});
 
+		this.channelManager.on(
+			'channel:opening',
+			(channelId: Buffer, fundingTxid: Buffer) => {
+				this.emit('channel:opening', { channelId, fundingTxid });
+				this.emitStructuredLog('channel', 'opening', {
+					channelId: channelId.toString('hex'),
+					fundingTxid: fundingTxid.toString('hex')
+				});
+			}
+		);
+
+		this.channelManager.on(
+			'channel:pending-close',
+			(channelId: Buffer, initiator: 'local' | 'remote') => {
+				this.emit('channel:pending-close', { channelId, initiator });
+				this.emitStructuredLog('channel', 'pending_close', {
+					channelId: channelId.toString('hex'),
+					initiator
+				});
+			}
+		);
+
+		this.channelManager.on(
+			'channel:force-closing',
+			(channelId: Buffer, initiator: 'local' | 'remote') => {
+				this.emit('channel:force-closing', { channelId, initiator });
+				this.emitStructuredLog('channel', 'force_closing', {
+					channelId: channelId.toString('hex'),
+					initiator
+				});
+			}
+		);
+
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
 			this.persistChannel(channelId);
 			// NOTE: the funding watch is deliberately NOT torn down here. 'closed'
@@ -1195,6 +1228,7 @@ export class LightningNode extends EventEmitter {
 			'htlc:fulfilled',
 			(channelId: Buffer, htlcId: bigint, preimage: Buffer) => {
 				this.handleHtlcFulfilled(channelId, htlcId, preimage);
+				this.emit('htlc:fulfilled', { channelId, htlcId });
 			}
 		);
 
@@ -1202,6 +1236,7 @@ export class LightningNode extends EventEmitter {
 			'htlc:failed',
 			(channelId: Buffer, htlcId: bigint, reason: Buffer) => {
 				this.handleHtlcFailed(channelId, htlcId, reason);
+				this.emit('htlc:failed', { channelId, htlcId });
 			}
 		);
 
@@ -6551,12 +6586,32 @@ export class LightningNode extends EventEmitter {
 				'persistPayment'
 			);
 			this.emit('payment:received', payment);
+			this.emitInvoiceSettled(paymentHash, payment);
 		}
 		this.emitStructuredLog('payment', 'received', {
 			paymentHash: hashHex,
 			held: 'true'
 		});
 		return true;
+	}
+
+	/**
+	 * Emit invoice:settled when a settled receive corresponds to an invoice WE
+	 * issued. Spontaneous receives (keysend) have no invoice entry and only
+	 * fire payment:received.
+	 */
+	private emitInvoiceSettled(paymentHash: Buffer, payment: IPaymentInfo): void {
+		const invoice = this.invoices.get(paymentHash.toString('hex'));
+		if (!invoice) return;
+		this.emit('invoice:settled', {
+			paymentHash,
+			bolt11: invoice.bolt11,
+			amountMsat: payment.amountMsat
+		});
+		this.emitStructuredLog('payment', 'invoice_settled', {
+			paymentHash: paymentHash.toString('hex'),
+			amountMsat: payment.amountMsat.toString()
+		});
 	}
 
 	/**
@@ -6876,6 +6931,7 @@ export class LightningNode extends EventEmitter {
 				payment.completedAt = Date.now();
 				this.persistPayment(paymentHash);
 				this.emit('payment:received', payment);
+				this.emitInvoiceSettled(paymentHash, payment);
 			}
 		}
 	}
@@ -6957,6 +7013,7 @@ export class LightningNode extends EventEmitter {
 
 		if (payment) {
 			this.emit('payment:received', payment);
+			this.emitInvoiceSettled(paymentHash, payment);
 			this.emitStructuredLog('payment', 'received', {
 				paymentHash: hashHex,
 				amountMsat: Number(payment.amountMsat),
@@ -7353,12 +7410,6 @@ export class LightningNode extends EventEmitter {
 		outHtlcId: bigint,
 		forward: { inChannelId: Buffer; inHtlcId: bigint }
 	): void {
-		if (
-			!this.storage ||
-			typeof this.storage.saveForwardingEvent !== 'function'
-		) {
-			return;
-		}
 		const outState = this.channelManager
 			.getChannel(outChannelId)
 			?.getFullState();
@@ -7370,6 +7421,19 @@ export class LightningNode extends EventEmitter {
 		if (!outHtlc || !inHtlc) return;
 		const amountInMsat = inHtlc.amountMsat;
 		const amountOutMsat = outHtlc.amountMsat;
+		this.emit('htlc:forwarded', {
+			inChannelId: forward.inChannelId,
+			outChannelId,
+			amountInMsat,
+			amountOutMsat,
+			feeMsat: amountInMsat - amountOutMsat
+		});
+		if (
+			!this.storage ||
+			typeof this.storage.saveForwardingEvent !== 'function'
+		) {
+			return;
+		}
 		this.safeStorage(
 			() =>
 				this.storage!.saveForwardingEvent!({

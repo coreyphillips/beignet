@@ -1700,7 +1700,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, channel:ready, channel:closed, peer:connect, peer:disconnect, node:ready)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -1785,6 +1785,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/mnemonic': {
 				get: {
 					summary: 'Get wallet mnemonic (requires API token)',
+					description:
+						'Seed generation is CLI-only: `beignet init` creates the mnemonic; the daemon never generates or replaces a seed. This endpoint only reveals the configured mnemonic, and only when apiToken is set (returns MNEMONIC_REQUIRES_AUTH otherwise).',
 					tags: ['Node'],
 					responses: {
 						'200': {

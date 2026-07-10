@@ -134,7 +134,13 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 						.map((a) => a.trim())
 						.filter((a) => a.length > 0)
 				: undefined) ||
-			file.watchtowers
+			file.watchtowers,
+		htlcEvents:
+			cliFlags.htlcEvents ??
+			(process.env.BEIGNET_HTLC_EVENTS !== undefined
+				? process.env.BEIGNET_HTLC_EVENTS === 'true'
+				: undefined) ??
+			file.htlcEvents
 	};
 }
 

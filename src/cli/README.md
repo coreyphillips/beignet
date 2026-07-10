@@ -415,8 +415,15 @@ Two very different restore modes:
 node.on('payment:received', (info: PaymentInfo) => { ... });
 node.on('payment:sent', (info: PaymentInfo) => { ... });
 node.on('payment:failed', (info: PaymentInfo) => { ... });
+node.on('invoice:settled', ({ paymentHash, bolt11, amountSats }) => { ... }); // an invoice WE issued was paid (keysend fires only payment:received)
+node.on('channel:opening', ({ channelId, fundingTxid }) => { ... }); // funding negotiated + broadcast/watched
 node.on('channel:ready', ({ channelId }) => { ... });
+node.on('channel:pending-close', ({ channelId, initiator }) => { ... }); // coop close initiated ('local' | 'remote')
+node.on('channel:force-closing', ({ channelId, initiator }) => { ... }); // our force-close broadcast or peer unilateral detected
 node.on('channel:closed', ({ channelId }) => { ... });
+node.on('htlc:forwarded', ({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat }) => { ... }); // a forward settled (msat values as strings)
+node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we offered was fulfilled
+node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
 node.on('peer:connect', ({ pubkey }) => { ... });
 node.on('peer:disconnect', ({ pubkey }) => { ... });
 node.on('node:error', ({ code, message, timestamp }) => { ... });
@@ -747,8 +754,15 @@ interface BeignetNodeEvents {
   'payment:received': (info: PaymentInfo) => void;
   'payment:sent': (info: PaymentInfo) => void;
   'payment:failed': (info: PaymentInfo) => void;
+  'invoice:settled': (data: { paymentHash: string; bolt11: string; amountSats: number }) => void;
+  'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
   'channel:ready': (data: { channelId: string }) => void;
+  'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
+  'channel:force-closing': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:closed': (data: { channelId: string }) => void;
+  'htlc:forwarded': (data: { inChannelId: string; outChannelId: string; amountInMsat: string; amountOutMsat: string; feeMsat: string }) => void;
+  'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
+  'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
   'peer:connect': (data: { pubkey: string }) => void;
   'peer:disconnect': (data: { pubkey: string }) => void;
   'node:error': (data: { code: string; message: string; timestamp: number }) => void;
@@ -885,9 +899,15 @@ All output is JSON. Add `--pretty` for indented output.
 beignet init [--network regtest] [--alias mynode]
 beignet start [--port 2112] [--host 0.0.0.0] [--daemon] [--anchors] [--api-token mysecret] \
   [--backup-path /path/to/backup.db] [--backup-interval 21600000] \
-  [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem]
+  [--daily-spend-limit 100000] [--tls-cert /path/cert.pem] [--tls-key /path/key.pem] \
+  [--htlc-events]
 beignet stop
 ```
+
+Seed generation is CLI-only: `beignet init` creates the mnemonic (or you supply
+one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
+seed. `GET /mnemonic` only reveals the configured seed, and only when
+`apiToken` is set.
 
 ### Info
 
@@ -920,6 +940,31 @@ beignet stats
 
 beignet stats 3600000
 # {"ok":true,"result":{"totalPaymentsSent":3,"windowMs":3600000,...}}
+
+beignet ready
+# {"ok":true,"result":{"ready":true}}
+
+beignet liquidity
+# {"ok":true,"result":{"totalLocalBalanceSats":500000,...,"recommendations":[...]}}
+
+beignet fees
+# {"ok":true,"result":{"currentSatPerVbyte":12,"trend":"FALLING","recommendation":"OPEN_NOW",...}}
+
+beignet spend-limit
+# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...}}
+
+beignet logs --category payment --limit 20
+# {"ok":true,"result":[{"category":"payment","action":"sent","timestamp":...,"data":{...}}]}
+
+beignet can-send 50000
+beignet can-receive 50000
+# {"ok":true,"result":{"canSend":true,...}}
+
+beignet node uri --host mynode.example.com
+# {"ok":true,"result":{"uri":"02ab...@mynode.example.com:9735"}}
+
+beignet node wait-ready --timeout 30000
+# Blocks until the node is operational
 ```
 
 ### On-chain
@@ -942,6 +987,8 @@ beignet tx boostable
 
 beignet consolidate [satsPerVbyte]
 # {"ok":true,"result":{"txid":"23ab...","utxosConsolidated":7,"address":"bc1q...","feeSats":310}}
+beignet wallet refresh
+# {"ok":true,"result":{"refreshed":true}}
 ```
 
 On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
@@ -990,6 +1037,8 @@ beignet trusted-peer list
 beignet channel open <pubkey> <sats> [pushSats]
 beignet channel open-zeroconf <pubkey> <sats> [pushSats]
 beignet channel open-v2 <pubkey> <sats> [fundingFeeratePerkw]
+beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
+beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId>
 beignet channel forceclose <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
@@ -997,9 +1046,17 @@ beignet channel splice-out <channelId> <sats> <feeratePerkw>
 beignet channel ensure-minimum 3 500000
 # Auto-open channels to at least 3 using graph suggestions, 500k sats each
 beignet channel update-policy <channelId|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N] [--htlc-min-msat N] [--htlc-max-msat N]
+beignet channel update-commitment-feerate <channelId> <feeratePerKw>
+# COMMITMENT feerate (BOLT 2 update_fee, opener only) - not the routing policy
+beignet channel policy <channelId>
 beignet channel list
+beignet channel ready
+# Only channels in NORMAL state
 beignet channel get <channelId>
 # channel get/list include the effective routing policy fields
+beignet channel health <channelId>
+beignet channel suggestions [count]
+beignet channel wait-ready <channelId> [--timeout 60000]
 ```
 
 ### Routing Fee Policy
@@ -1059,6 +1116,12 @@ beignet route query 02abc... 50000 --pretty > route.json
 beignet payment send-to-route <paymentHash> route.json --payment-secret <hex>
 # Pays along exactly that route (accepts a file path or inline JSON;
 # both the full result object and a bare {"hops":[...]} work)
+
+beignet route estimate <bolt11> [sats]
+# {"ok":true,"result":{"feeSats":2,"hops":3,"cltvDelta":120}}
+
+beignet route probe 02abc... 50000
+# Probes route viability without paying
 ```
 
 ### Invoices & Payments
@@ -1070,13 +1133,29 @@ beignet invoice create [sats] [description]
 beignet invoice decode <bolt11>
 # {"ok":true,"result":{"network":"bcrt","amountSats":1000,"paymentHash":"ab12...",...}}
 
+beignet invoice validate <bolt11> [sats]
+# Pre-flight checks (decode, capacity, route): {"ok":true,"result":{"status":"OK","checks":[...]}}
+
+beignet invoice get <paymentHash>
+# Details of an invoice this node created
+
 beignet invoice pay <bolt11>
 # Blocks until payment settles or fails (60s timeout)
 # {"ok":true,"result":{"paymentHash":"ab12...","preimage":"cd34...","status":"COMPLETED",...}}
 
+beignet invoice pay-safe <bolt11> [--max-fee 100] [--amount 1000] [--timeout 60000]
+# Never errors: resolves with status FAILED instead
+
+beignet invoice pay-async <bolt11> [--max-fee 100] [--amount 1000]
+# Fire-and-forget: returns {paymentHash,status} immediately; poll 'payment get'
+
 beignet invoice pay-retry <bolt11> [--max-retries 5] [--backoff-ms 1000] [--max-fee 100]
 # Retries with exponential backoff on transient failures
 # {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED","attempts":2,...}}
+
+beignet keysend <pubkey> <sats> [--max-fee 100] [--timeout 60000]
+beignet keysend safe <pubkey> <sats>
+# Spontaneous payment, no invoice ('safe' resolves FAILED instead of erroring)
 
 beignet invoice list
 # {"ok":true,"result":[{"bolt11":"lnbcrt10n1...","paymentHash":"ab12...","amountSats":1000,...}]}
@@ -1093,6 +1172,17 @@ beignet invoice cancel-hold <paymentHash>    # fails them back to the payer
 
 beignet payment list
 beignet payment get <paymentHash>
+beignet payment cancel <paymentHash>
+beignet payment wait <paymentHash> [--timeout 60000]
+beignet payment proof <paymentHash>
+beignet payment verify-proof <paymentHash>
+beignet payment estimate <bolt11> [sats]
+beignet payment metadata <paymentHash> '{"orderId":"1234"}'
+
+# Payment queue: ordered dispatch with priorities
+beignet queue add <bolt11> [--priority 5] [--amount 1000] [--max-fee 100]
+beignet queue list
+beignet queue cancel <id>
 ```
 
 ### Messages & Gossip
@@ -1121,10 +1211,29 @@ beignet offer create "Coffee" 1000
 beignet offer list
 # {"ok":true,"result":[{"offerId":"ab12...","description":"Coffee",...}]}
 
+beignet offer decode lno1...
+# {"ok":true,"result":{"offerId":"ab12...","description":"Coffee","amountSats":1000,...}}
+
 beignet offer pay lno1... 1000
 # Requests invoice from offer issuer, then pays it
 # {"ok":true,"result":{"paymentHash":"ab12...","status":"COMPLETED",...}}
 ```
+
+### Webhooks (CLI)
+
+```bash
+beignet webhooks register https://myagent.com/callback payment:received,channel:ready --secret mysecret
+beignet webhooks register https://myagent.com/callback '*'
+# '*' subscribes to every event, including any added in future versions
+beignet webhooks list
+beignet webhooks unregister <id>
+```
+
+Every daemon endpoint has a CLI command except two that only make sense over
+HTTP: `GET /events` (SSE stream for long-lived consumers; use `webhooks` from
+the CLI instead) and `GET /openapi.json` (machine-readable API discovery). The
+deprecated `POST /channel/update-fee` alias is covered by
+`channel update-commitment-feerate`.
 
 ### JSON Envelope
 
@@ -1170,7 +1279,8 @@ Every response follows this format:
   "dailySpendLimitSats": 100000,
   "connectTimeoutMs": 15000,
   "tlsCert": "/etc/ssl/beignet/cert.pem",
-  "tlsKey": "/etc/ssl/beignet/key.pem"
+  "tlsKey": "/etc/ssl/beignet/key.pem",
+  "htlcEvents": false
 }
 ```
 
@@ -1199,6 +1309,7 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_CONNECT_TIMEOUT_MS` | Timeout for `connectPeer()` in milliseconds (default: 15000) |
 | `BEIGNET_TLS_CERT` | Path to TLS certificate for HTTPS daemon |
 | `BEIGNET_TLS_KEY` | Path to TLS private key for HTTPS daemon |
+| `BEIGNET_HTLC_EVENTS` | `true` to relay per-HTLC events over SSE + webhooks |
 
 ### Priority Order
 
@@ -1354,7 +1465,12 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events: `payment:received`, `payment:sent`, `payment:failed`, `payment:retry`, `channel:ready`, `channel:closed`, `peer:connect`, `peer:disconnect`, `node:ready`, `backup:completed`, `backup:failed`, `electrum:failover`.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `peer:connect`, `peer:disconnect`, `node:ready`.
+
+- `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
+- `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).
+
+Per-HTLC events (`htlc:forwarded`, `htlc:fulfilled`, `htlc:failed`) are relayed only when the daemon is started with `--htlc-events` (config `htlcEvents: true`, env `BEIGNET_HTLC_EVENTS=true`); routing nodes generate one event per HTLC, so they are off by default.
 
 A keepalive comment (`: keepalive`) is sent every 30 seconds to prevent proxy timeouts.
 
@@ -1380,6 +1496,8 @@ curl -X DELETE http://localhost:2112/webhooks/unregister \
 ```
 
 Webhook deliveries are POST requests with JSON body `{ event, data, timestamp }`. When a `secret` is configured, an `X-Webhook-Signature: sha256=<hmac>` header is included for payload verification. Webhooks are persisted to SQLite and survive daemon restarts. Note: HMAC secrets are stored as hashes — re-register with a secret after restart if HMAC verification is needed.
+
+Registering with `"events": ["*"]` matches every relayed event, including the invoice, channel-lifecycle, and (when `--htlc-events` is enabled) HTLC events, plus any event types added in future versions. The event list matches the SSE list above.
 
 ### API Versioning
 

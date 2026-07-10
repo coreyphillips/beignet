@@ -113,11 +113,11 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       settleHoldInvoice, cancelHoldInvoice (works pre-accept, restart-safe),
       listHoldInvoices; CLTV auto-cancel respected and the near-expiry claim
       backstop no longer force-closes on parked holds with unrevealed preimages.
-- [~] Onchain power endpoints (this PR): POST /send-max, /tx/bump-fee, /tx/boost
+- [x] Onchain power endpoints (PR #49, merged): POST /send-max, /tx/bump-fee, /tx/boost
       (auto RBF-else-CPFP), GET /transactions/boostable, POST /consolidate
       (send-max-to-self). Also fixes the daemon wallet never signalling BIP 125
       (rbf was off, bump-fee was permanently dead).
-- [~] Persist the daemon's onchain wallet state (this PR): TStorage adapter over the
+- [x] Persist the daemon's onchain wallet state (PR #49, merged): TStorage adapter over the
       encrypted SQLite (wallet_data table, schema v8, per-network scoped twice: db
       file + key prefix); boots load from disk and refresh incrementally. Note:
       dailySpendLimit remains LN-only by existing design; onchain routes mirror
@@ -129,15 +129,17 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [x] Expose existing methods with no route (PR #47, merged): syncGossip, syncRapidGossip,
       getChannelDiagnostics, validateAddress, recoverFallbackFunds, triggerBackup
       all routed + CLI.
-- [ ] CLI parity sweep: wrap the ~25 daemon endpoints with no CLI command (keysend,
-      webhooks, queue, route probe/estimate, payment proof/cancel/wait, update-fee,
-      liquidity, logs, spend-limit, node/uri, channel health, can-send/can-receive,
-      wallet/refresh).
-- [ ] Event granularity: distinct invoice:settled event, channel:opening /
-      channel:force-closing / channel:pending-close states, optional HTLC-level
-      events; wire into SSE + webhooks.
-- [ ] Seed generation endpoint parity check: document that seed creation is CLI-init
-      only, or add a guarded daemon route.
+- [~] CLI parity sweep (this PR): every one of the 114 daemon routes now has a CLI
+      command or a documented intentionally-none entry (/events SSE, /openapi.json,
+      deprecated /channel/update-fee alias); enforced by a source-derived
+      regression test that fails on future drift either way.
+- [~] Event granularity (this PR): invoice:settled (never fires on keysend),
+      channel:opening / pending-close / force-closing (local and remote, deduped),
+      htlc:forwarded/fulfilled/failed behind an htlcEvents flag; all wired through
+      SSE + webhooks with wildcard coverage. invoice:expired skipped: no issued-
+      invoice expiry sweep exists (payer-side scan only); would be new machinery.
+- [~] Seed generation parity (this PR): documented (README + OpenAPI): seed creation
+      is CLI init only; GET /mnemonic reveals it only when apiToken is configured.
 
 ## M5. Onchain wallet features
 
@@ -226,6 +228,8 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-09 (cont.): PR #49 merged (batch 2a). Batch 2b (this PR): CLI parity
+  sweep + event granularity + seed-gen note; completes M4.
 - 2026-07-09 (cont.): PR #48 merged (watchtower client, M2 core). M4 batch 2a
   (this PR): onchain power endpoints + daemon wallet persistence.
 - 2026-07-09 (cont.): PR #47 merged (M4 batch 1). Watchtower client (this PR)
