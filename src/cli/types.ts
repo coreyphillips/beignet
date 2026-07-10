@@ -197,6 +197,25 @@ export interface UtxoInfo {
 	address: string;
 	valueSats: number;
 	height: number;
+	/** Frozen UTXOs are excluded from coin selection until unfrozen. */
+	frozen: boolean;
+}
+
+/**
+ * BIP 380 output descriptors for the on-chain wallet. Public material only;
+ * private keys are never exported.
+ */
+export interface DescriptorsInfo {
+	fingerprint: string;
+	network: string;
+	account: number;
+	birthdayHeight?: number;
+	watchOnly: boolean;
+	descriptors: Array<{
+		addressType: string;
+		external: string;
+		internal: string;
+	}>;
 }
 
 /** Unsigned PSBT built for an external signer (hardware wallet). */

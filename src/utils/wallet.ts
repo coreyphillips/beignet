@@ -321,8 +321,13 @@ export const generateWalletId = (seed: Buffer): string => {
 export const getWalletDataStorageKey = (
 	name: string,
 	network: EAvailableNetworks,
-	key: keyof IWalletData
+	key: keyof IWalletData,
+	account = 0
 ): string => {
+	// Account 0 keeps the legacy key format so existing stored wallets keep
+	// loading. Non-zero accounts get their own namespace so two Wallet
+	// instances over the same mnemonic and storage never collide.
+	if (account > 0) return `${name}-${network}-acct${account}-${key}`;
 	return `${name}-${network}-${key}`;
 };
 

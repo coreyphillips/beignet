@@ -86,6 +86,7 @@ import {
 	TxInfo,
 	OnchainTxInfo,
 	UtxoInfo,
+	DescriptorsInfo,
 	PsbtBuildInfo,
 	PsbtImportInfo,
 	BoostResult,
@@ -210,7 +211,14 @@ export interface BeignetNodeOptions {
 	backupPath?: string;
 	/** Backup interval in milliseconds (default: 6 hours, requires backupPath) */
 	backupIntervalMs?: number;
-	/** Daily spending limit in satoshis. When set, payInvoice/sendKeysend reject if the limit is exceeded. Resets at midnight UTC. */
+	/**
+	 * COMBINED daily spending limit in satoshis, shared by Lightning payments
+	 * (payInvoice/sendKeysend) AND external on-chain sends (sendOnchain and
+	 * sendMaxOnchain, counted as amount + fee). Excluded by design:
+	 * consolidateUtxos (self-pay), channel opens/splices/funding, and
+	 * bumpFeeOnchain/boostOnchain (fee-only). Resets at midnight UTC.
+	 * NOTE: before v0.3.0 this limit covered Lightning only.
+	 */
 	dailySpendLimitSats?: number;
 	/** Maximum amount in satoshis for a single payment. Rejects any payInvoice/sendKeysend call exceeding this. Prevents accidental large payments. */
 	maxPaymentSats?: number;
@@ -488,7 +496,11 @@ export class BeignetNode extends EventEmitter {
 	private _listenPort?: number;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
+	// _dailySpentSats is the combined LN + onchain total; the two source
+	// counters below only feed the GET /spend-limit breakdown.
 	private _dailySpentSats = 0;
+	private _dailySpentLightningSats = 0;
+	private _dailySpentOnchainSats = 0;
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	private _maxPaymentSats?: number;
@@ -1370,6 +1382,9 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		satsPerVbyte?: number
 	): Promise<TxInfo> {
+		// External onchain sends share the daily budget with Lightning
+		// payments. Fail fast on the amount alone before building.
+		this._checkSpendLimit(amountSats);
 		// wallet.send with broadcast:true resolves to the txid, not the raw
 		// hex, so build first (broadcast:false returns the hex) and broadcast
 		// separately to report both txid and hex. rbf must be passed per-send:
@@ -1384,7 +1399,27 @@ export class BeignetNode extends EventEmitter {
 		if (result.isErr()) {
 			throw new BeignetError('SEND_FAILED', result.error.message);
 		}
-		return this._broadcastRawTx(result.value);
+		// No limit configured: broadcast without touching the budget.
+		if (this._dailySpendLimitSats === undefined) {
+			return this._broadcastRawTx(result.value);
+		}
+		// Re-check with the real fee included, then reserve the total so
+		// concurrent sends cannot both pass before either records.
+		const totalSats = this._builtOnchainTotalSats(amountSats);
+		try {
+			this._checkSpendLimit(totalSats);
+		} catch (e) {
+			await this.wallet.resetSendTransaction();
+			throw e;
+		}
+		this._pendingSpendSats += totalSats;
+		try {
+			const info = await this._broadcastRawTx(result.value);
+			this._recordSpend(totalSats, 'onchain');
+			return info;
+		} finally {
+			this._pendingSpendSats -= totalSats;
+		}
 	}
 
 	/**
@@ -1549,13 +1584,45 @@ export class BeignetNode extends EventEmitter {
 		if (result.isErr()) {
 			throw new BeignetError('SEND_FAILED', result.error.message);
 		}
-		return this._broadcastRawTx(result.value);
+		// No limit configured: broadcast without touching the budget.
+		if (this._dailySpendLimitSats === undefined) {
+			return this._broadcastRawTx(result.value);
+		}
+		// A sweep drains the entire input value (send amount + fee). Check it
+		// against the shared daily budget BEFORE broadcast; the amount is only
+		// known once the transaction has been built.
+		const totalSats = this.wallet.transaction.getTransactionInputValue({
+			inputs: this.wallet.transaction.data.inputs
+		});
+		if (totalSats <= 0) {
+			// Fail closed: never broadcast a sweep the limit cannot account for.
+			await this.wallet.resetSendTransaction();
+			throw new BeignetError(
+				'SPENDING_LIMIT_EXCEEDED',
+				'Unable to determine the swept amount for the daily spend limit check; refusing to send'
+			);
+		}
+		try {
+			this._checkSpendLimit(totalSats);
+		} catch (e) {
+			await this.wallet.resetSendTransaction();
+			throw e;
+		}
+		this._pendingSpendSats += totalSats;
+		try {
+			const info = await this._broadcastRawTx(result.value);
+			this._recordSpend(totalSats, 'onchain');
+			return info;
+		} finally {
+			this._pendingSpendSats -= totalSats;
+		}
 	}
 
 	/**
 	 * Replace an unconfirmed, RBF-signalling wallet transaction with a
 	 * higher-fee version (BIP 125). Throws NOT_BOOSTABLE when RBF is not
 	 * possible; use boostOnchain for the automatic RBF-else-CPFP path.
+	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async bumpFeeOnchain(
 		txid: string,
@@ -1579,6 +1646,7 @@ export class BeignetNode extends EventEmitter {
 	 * Fee-bump an unconfirmed wallet transaction, choosing RBF when canBoost
 	 * allows it and CPFP otherwise. Falls back to CPFP when RBF setup fails
 	 * (e.g. the change output cannot be identified) and CPFP is possible.
+	 * Fee-only operation: EXCLUDED from the daily spend limit by design.
 	 */
 	async boostOnchain(
 		txid: string,
@@ -1735,8 +1803,14 @@ export class BeignetNode extends EventEmitter {
 	 * reuses the wallet's existing fee ceiling guards.
 	 */
 	async consolidateUtxos(satsPerVbyte?: number): Promise<ConsolidateResult> {
+		// Self-pay: funds return to the wallet, so consolidation is EXCLUDED
+		// from the daily spend limit by design (only external sends count).
 		this._validateFeeRate(satsPerVbyte);
-		const utxoCount = this.wallet.listUtxos().length;
+		// Frozen UTXOs are excluded from coin selection, so count only
+		// spendable ones here.
+		const utxoCount = this.wallet
+			.listUtxos()
+			.filter((u) => !this.wallet.isUtxoFrozen(u.tx_hash, u.tx_pos)).length;
 		if (utxoCount < 2) {
 			throw new BeignetError(
 				BeignetErrorCode.NOTHING_TO_CONSOLIDATE,
@@ -1803,8 +1877,67 @@ export class BeignetNode extends EventEmitter {
 			vout: utxo.tx_pos,
 			address: utxo.address,
 			valueSats: utxo.value,
-			height: utxo.height
+			height: utxo.height,
+			frozen: this.wallet.isUtxoFrozen(utxo.tx_hash, utxo.tx_pos)
 		}));
+	}
+
+	/** Freeze a UTXO: excluded from all coin selection until unfrozen. */
+	async freezeUtxo(txid: string, index: number): Promise<{ frozen: string }> {
+		this._validateTxid(txid);
+		const res = await this.wallet.freezeUtxo({ txid, index });
+		if (res.isErr()) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				res.error.message
+			);
+		}
+		return { frozen: `${txid}:${index}` };
+	}
+
+	/** Unfreeze a previously frozen UTXO. */
+	async unfreezeUtxo(
+		txid: string,
+		index: number
+	): Promise<{ unfrozen: string }> {
+		this._validateTxid(txid);
+		const res = await this.wallet.unfreezeUtxo({ txid, index });
+		if (res.isErr()) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				res.error.message
+			);
+		}
+		return { unfrozen: `${txid}:${index}` };
+	}
+
+	/** Set (or clear with an empty label) a user label for an address. */
+	async setAddressLabel(
+		address: string,
+		label: string
+	): Promise<{ address: string; label: string }> {
+		const res = await this.wallet.setAddressLabel(address, label);
+		if (res.isErr()) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				res.error.message
+			);
+		}
+		return { address, label };
+	}
+
+	/** All user address labels keyed by address. */
+	listAddressLabels(): Record<string, string> {
+		return this.wallet.listAddressLabels();
+	}
+
+	/** BIP 380 output descriptors for the wallet (no private keys, ever). */
+	exportDescriptors(): DescriptorsInfo {
+		const res = this.wallet.exportDescriptors();
+		if (res.isErr()) {
+			throw new BeignetError('DESCRIPTOR_EXPORT_FAILED', res.error.message);
+		}
+		return res.value;
 	}
 
 	async getFeeEstimates(): Promise<IOnchainFees> {
@@ -2437,6 +2570,8 @@ export class BeignetNode extends EventEmitter {
 			tomorrow.setUTCHours(24, 0, 0, 0);
 			this._dailySpendResetTime = tomorrow.getTime();
 			this._dailySpentSats = 0;
+			this._dailySpentLightningSats = 0;
+			this._dailySpentOnchainSats = 0;
 		}
 	}
 
@@ -2463,9 +2598,38 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
-	private _recordSpend(amountSats: number): void {
+	private _recordSpend(
+		amountSats: number,
+		source: 'lightning' | 'onchain' = 'lightning'
+	): void {
 		if (this._dailySpendLimitSats === undefined) return;
 		this._dailySpentSats += amountSats;
+		if (source === 'onchain') {
+			this._dailySpentOnchainSats += amountSats;
+		} else {
+			this._dailySpentLightningSats += amountSats;
+		}
+	}
+
+	/**
+	 * Returns the on-chain amount+fee an external send will subtract from the
+	 * daily budget, computed from the transaction the wallet just built.
+	 * FAIL CLOSED: when a limit is configured and the built fee cannot be
+	 * read as a finite non-negative number, the send is rejected rather than
+	 * checked against an understated total.
+	 */
+	private _builtOnchainTotalSats(amountSats: number): number {
+		const feeSats = this.wallet.transaction?.data?.fee;
+		if (!Number.isFinite(feeSats) || feeSats < 0) {
+			if (this._dailySpendLimitSats !== undefined) {
+				throw new BeignetError(
+					'SPENDING_LIMIT_EXCEEDED',
+					'Unable to determine the transaction fee for the daily spend limit check; refusing to send'
+				);
+			}
+			return amountSats;
+		}
+		return amountSats + feeSats;
 	}
 
 	getDailySpendInfo(): {
@@ -2473,15 +2637,23 @@ export class BeignetNode extends EventEmitter {
 		spentSats: number;
 		remainingSats: number;
 		resetsAt: number;
+		totalSats: number;
+		lightningSats: number;
+		onchainSats: number;
 	} {
 		this._resetDailySpendIfNeeded();
 		const limit = this._dailySpendLimitSats ?? null;
 		return {
+			// Back-compat fields (spentSats == totalSats):
 			limitSats: limit,
 			spentSats: this._dailySpentSats,
 			remainingSats:
 				limit !== null ? Math.max(0, limit - this._dailySpentSats) : Infinity,
-			resetsAt: this._dailySpendResetTime
+			resetsAt: this._dailySpendResetTime,
+			// Breakdown: the limit is a single combined LN + onchain budget.
+			totalSats: this._dailySpentSats,
+			lightningSats: this._dailySpentLightningSats,
+			onchainSats: this._dailySpentOnchainSats
 		};
 	}
 

@@ -82,7 +82,7 @@ const node = await BeignetNode.create({
   backupPath?: string,      // enable automated backups to this path
   backupIntervalMs?: number, // backup interval (default: 6 hours, requires backupPath)
   storageEncryption?: boolean, // encrypt SQLite storage at rest with a seed-derived key (default: true)
-  dailySpendLimitSats?: number, // daily spending limit in satoshis (resets at midnight UTC)
+  dailySpendLimitSats?: number, // COMBINED LN + on-chain daily spending limit in satoshis (resets at midnight UTC); see Spending Limits
   connectTimeoutMs?: number,  // timeout for connectPeer() in ms (default: 15000)
   onError?: (error) => void, // error callback for node:error events
   logLevel?: LogLevel,       // 'debug' | 'info' | 'warn' | 'error' | 'silent' (default: 'info')
@@ -120,6 +120,12 @@ All methods return plain objects. IDs are hex strings. Amounts are numbers in sa
 | `importSignedPsbt(psbtBase64)` | `PsbtImportInfo` | Validate + finalize an externally signed PSBT; returns `{ txid, txHex }` WITHOUT broadcasting |
 | `combinePsbts(psbts)` | `{ psbtBase64 }` | Combine partially signed copies of the same PSBT (multi-party signing) |
 | `refreshWallet()` | `Promise<void>` | Sync UTXOs from Electrum (incremental: wallet state persists in the node's SQLite DB across restarts) |
+| `listUtxos()` | `UtxoInfo[]` | Wallet UTXOs; each entry carries a `frozen` flag |
+| `freezeUtxo(txid, index)` | `Promise<{ frozen }>` | Freeze a UTXO: excluded from ALL coin selection (send/send-max/consolidate/PSBT build) until unfrozen; still counted in the balance |
+| `unfreezeUtxo(txid, index)` | `Promise<{ unfrozen }>` | Make a frozen UTXO spendable again |
+| `setAddressLabel(address, label)` | `Promise<{ address, label }>` | Set a user label for an address (empty label clears it) |
+| `listAddressLabels()` | `Record<string, string>` | All user address labels keyed by address |
+| `exportDescriptors()` | `DescriptorsInfo` | BIP 380 output descriptors (with checksums) for all four address types. Public keys only; private keys are never exported |
 
 #### Peers
 
@@ -391,9 +397,21 @@ Two very different restore modes:
 
 #### Spending Limits
 
+> **SEMANTICS CHANGE: the daily spend limit is now a COMBINED Lightning +
+> on-chain budget.** It previously covered Lightning payments only. If you
+> rely on `dailySpendLimitSats`, external on-chain sends now consume the same
+> budget: `sendOnchain` (`POST /send`) and `sendMaxOnchain`
+> (`POST /send-max`) each count **amount + fee** against the daily limit and
+> are rejected with `SPENDING_LIMIT_EXCEEDED` once it is exhausted. For
+> send-max the check runs against the actual computed sweep total before
+> broadcast. Excluded by design (they are not external spends):
+> `consolidateUtxos` (self-pay), channel opens/splices/funding, and
+> `bumpFeeOnchain`/`boostOnchain` (fee-only). PSBT building is also not
+> counted (nothing is broadcast). Resets at midnight UTC.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `getDailySpendInfo()` | `DailySpendInfo` | Current spending limit status: `{ limitSats, spentSats, remainingSats, resetsAt }` |
+| `getDailySpendInfo()` | `DailySpendInfo` | Current combined limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt }` plus the legacy `spentSats` field (equals `totalSats`) for back-compat |
 
 #### Drain Mode
 
@@ -954,7 +972,8 @@ beignet fees
 # {"ok":true,"result":{"currentSatPerVbyte":12,"trend":"FALLING","recommendation":"OPEN_NOW",...}}
 
 beignet spend-limit
-# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...}}
+# Combined LN + on-chain budget with breakdown (spentSats == totalSats, kept for back-compat):
+# {"ok":true,"result":{"limitSats":100000,"spentSats":2500,"remainingSats":97500,"resetsAt":...,"totalSats":2500,"lightningSats":1500,"onchainSats":1000}}
 
 beignet logs --category payment --limit 20
 # {"ok":true,"result":[{"category":"payment","action":"sent","timestamp":...,"data":{...}}]}
@@ -1001,11 +1020,47 @@ beignet psbt combine <psbt|file> <psbt|file>
 # {"ok":true,"result":{"psbtBase64":"cHNi..."}}
 beignet wallet refresh
 # {"ok":true,"result":{"refreshed":true}}
+
+beignet utxos
+# Each UTXO carries a frozen flag:
+# {"ok":true,"result":[{"txid":"ab12...","vout":0,"valueSats":50000,"frozen":false,...}]}
+
+beignet utxo freeze <txid> <index>
+# {"ok":true,"result":{"frozen":"ab12...:0"}}
+beignet utxo unfreeze <txid> <index>
+# {"ok":true,"result":{"unfrozen":"ab12...:0"}}
+beignet utxo frozen
+# List only frozen UTXOs
+
+beignet address label bc1q... "cold storage change"
+# {"ok":true,"result":{"address":"bc1q...","label":"cold storage change"}}
+beignet address labels
+# {"ok":true,"result":{"bc1q...":"cold storage change"}}
+
+beignet wallet descriptors
+# BIP 380 descriptors for all four address types (public keys only, with checksums):
+# {"ok":true,"result":{"fingerprint":"73c5da0a","descriptors":[{"addressType":"p2wpkh","external":"wpkh([73c5da0a/84h/0h/0h]xpub.../0/*)#...","internal":"wpkh(.../1/*)#..."},...]}}
 ```
 
 On-chain sends signal BIP 125 replace-by-fee, so an underpaying transaction
 can later be bumped with `tx bump-fee` (or `tx boost`, which falls back to
 CPFP when RBF is unavailable).
+
+**Daily spend limit (combined):** when the daemon is started with
+`--daily-spend-limit`, `send` and `send-max` count amount + fee against the
+SAME daily budget as Lightning payments and fail with
+`SPENDING_LIMIT_EXCEEDED` once it is exhausted. This limit was previously
+Lightning-only. `consolidate`, channel funding and `tx bump-fee`/`tx boost`
+are not counted. Frozen UTXOs are excluded from every send path (`send`,
+`send-max`, `consolidate`, `psbt build`) until unfrozen.
+
+**Multi-account and wallet birthday (library only):** `Wallet.create` accepts
+`account` (BIP32 account index, default 0; per-account storage isolation) and
+`birthdayHeight` (persisted creation-height metadata, exported with
+descriptors). The daemon always runs a single account-0 wallet and does not
+expose either option. `birthdayHeight` cannot speed up Electrum scans (the
+protocol has no height-filtered history), it is recorded for future backends
+and external tooling.
 
 The on-chain wallet's state (addresses, UTXOs, transactions) persists in the
 node's SQLite database (encrypted at rest when `storageEncryption` is on, the
@@ -1382,8 +1437,8 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | GET | `/events` | -- | SSE event stream (auth-gated) |
 | POST | `/address/new` | -- | New address |
 | POST | `/wallet/refresh` | -- | Sync wallet |
-| POST | `/send` | `{ address, amountSats, satsPerVbyte? }` | Send on-chain (optional fee rate) |
-| POST | `/send-max` | `{ address, satsPerVbyte? }` | Sweep the whole on-chain balance to one address |
+| POST | `/send` | `{ address, amountSats, satsPerVbyte? }` | Send on-chain (optional fee rate). Counts amount + fee against the combined daily spend limit |
+| POST | `/send-max` | `{ address, satsPerVbyte? }` | Sweep the whole on-chain balance to one address. The computed sweep total is checked against the combined daily spend limit before broadcast |
 | POST | `/tx/bump-fee` | `{ txid, satsPerVbyte }` | RBF an unconfirmed tx at a higher fee (NOT_BOOSTABLE if RBF unavailable) |
 | POST | `/tx/boost` | `{ txid, satsPerVbyte? }` | Fee-bump a tx: RBF when possible, else CPFP |
 | GET | `/transactions/boostable` | -- | Unconfirmed txs eligible for RBF/CPFP, by method |
@@ -1391,6 +1446,11 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/psbt/build` | `{ outputs, satsPerVbyte? }` | Build an UNSIGNED PSBT for an external signer |
 | POST | `/psbt/import-signed` | `{ psbtBase64 }` | Validate + finalize a signed PSBT (no broadcast) |
 | POST | `/psbt/combine` | `{ psbts }` | Combine partially signed PSBT copies |
+| POST | `/utxo/freeze` | `{ txid, index }` | Freeze a UTXO: excluded from all coin selection until unfrozen |
+| POST | `/utxo/unfreeze` | `{ txid, index }` | Unfreeze a previously frozen UTXO |
+| POST | `/address/label` | `{ address, label }` | Set a user label for an address (empty label clears it) |
+| GET | `/address/labels` | -- | All user address labels keyed by address |
+| GET | `/wallet/descriptors` | -- | BIP 380 output descriptors (checksummed, public keys only) |
 | POST | `/peer/connect` | `{ pubkey, host, port }` | Connect peer |
 | POST | `/peer/disconnect` | `{ pubkey }` | Disconnect peer |
 | POST | `/peers/bootstrap` | -- | Discover peers via DNS |
@@ -1465,7 +1525,7 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/queue/cancel` | `{ id }` | Cancel queued payment |
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
-| GET | `/spend-limit` | -- | Daily spending limit status: `{ limitSats, spentSats, remainingSats, resetsAt }` |
+| GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat) |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)

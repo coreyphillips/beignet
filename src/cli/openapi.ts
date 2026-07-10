@@ -1778,19 +1778,107 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			},
 			'/spend-limit': {
 				get: {
-					summary: 'Get daily spending limit info',
+					summary:
+						'Get combined daily spending limit info (Lightning + external on-chain sends share one budget)',
+					description:
+						'The daily limit covers Lightning payments AND external on-chain sends (amount + fee). Consolidation, channel funding and fee bumps are excluded. spentSats mirrors totalSats for back-compat.',
 					tags: ['Node'],
 					responses: {
 						'200': {
-							description: 'Spending limit info',
+							description: 'Spending limit info with LN/onchain breakdown',
 							content: jsonContent({
 								type: 'object',
 								properties: {
 									limitSats: { type: 'integer', nullable: true },
 									spentSats: { type: 'integer' },
 									remainingSats: { type: 'number' },
-									resetsAt: { type: 'integer' }
+									resetsAt: { type: 'integer' },
+									totalSats: { type: 'integer' },
+									lightningSats: { type: 'integer' },
+									onchainSats: { type: 'integer' }
 								}
+							})
+						}
+					}
+				}
+			},
+			'/utxo/freeze': {
+				post: {
+					summary:
+						'Freeze a UTXO so coin selection cannot spend it until unfrozen',
+					tags: ['Node'],
+					requestBody: bodyContent({ txid: 'string', index: 'integer' }),
+					responses: {
+						'200': {
+							description: 'Frozen outpoint',
+							content: jsonContent({
+								type: 'object',
+								properties: { frozen: { type: 'string' } }
+							})
+						}
+					}
+				}
+			},
+			'/utxo/unfreeze': {
+				post: {
+					summary: 'Unfreeze a previously frozen UTXO',
+					tags: ['Node'],
+					requestBody: bodyContent({ txid: 'string', index: 'integer' }),
+					responses: {
+						'200': {
+							description: 'Unfrozen outpoint',
+							content: jsonContent({
+								type: 'object',
+								properties: { unfrozen: { type: 'string' } }
+							})
+						}
+					}
+				}
+			},
+			'/address/label': {
+				post: {
+					summary: 'Set a user label for an address (empty label clears it)',
+					tags: ['Node'],
+					requestBody: bodyContent({ address: 'string', label: 'string' }),
+					responses: {
+						'200': {
+							description: 'Stored label',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									address: { type: 'string' },
+									label: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/address/labels': {
+				get: {
+					summary: 'List all user address labels keyed by address',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Labels map',
+							content: jsonContent({
+								type: 'object',
+								additionalProperties: { type: 'string' }
+							})
+						}
+					}
+				}
+			},
+			'/wallet/descriptors': {
+				get: {
+					summary:
+						'Export BIP 380 output descriptors for the on-chain wallet (public keys only)',
+					tags: ['Node'],
+					responses: {
+						'200': {
+							description: 'Descriptors',
+							content: jsonContent({
+								$ref: '#/components/schemas/DescriptorsInfo'
 							})
 						}
 					}
@@ -2282,7 +2370,35 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						vout: { type: 'integer' },
 						address: { type: 'string' },
 						valueSats: { type: 'integer' },
-						height: { type: 'integer' }
+						height: { type: 'integer' },
+						frozen: {
+							type: 'boolean',
+							description:
+								'Frozen UTXOs are excluded from coin selection until unfrozen'
+						}
+					}
+				},
+				DescriptorsInfo: {
+					type: 'object',
+					description:
+						'BIP 380 output descriptors (with checksums). Public keys only; private keys are never exported.',
+					properties: {
+						fingerprint: { type: 'string' },
+						network: { type: 'string' },
+						account: { type: 'integer' },
+						birthdayHeight: { type: 'integer' },
+						watchOnly: { type: 'boolean' },
+						descriptors: {
+							type: 'array',
+							items: {
+								type: 'object',
+								properties: {
+									addressType: { type: 'string' },
+									external: { type: 'string' },
+									internal: { type: 'string' }
+								}
+							}
+						}
 					}
 				},
 				OnchainFees: {

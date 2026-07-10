@@ -113,13 +113,12 @@ export const getKeyDerivationPathString = ({
 			network.toLocaleLowerCase() === EAvailableNetworks.bitcoin ? '0' : '1';
 
 		if (accountType !== undefined) {
-			if (typeof accountType === 'number') {
-				path.account = String(accountType);
-			}
 			path.account =
 				typeof accountType === 'number' ? String(accountType) : accountType;
 		} else {
-			path.account = '0';
+			// Respect an account carried by the provided path object; only
+			// default to 0 when nothing specified one.
+			path.account = path.account ?? '0';
 		}
 
 		path.change = changeAddress ? '1' : '0';

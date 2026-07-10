@@ -122,6 +122,9 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       file + key prefix); boots load from disk and refresh incrementally. Note:
       dailySpendLimit remains LN-only by existing design; onchain routes mirror
       /send (no accounting) - flagged for a future decision.
+      DECIDED + implemented (this PR): combined LN+onchain daily budget; external
+      onchain sends count amount+fee (send, send-max), consolidate/channel
+      funding/fee bumps excluded; /spend-limit gains a breakdown.
 - [x] sign/verify message with the node key (PR #47, merged): LND-compatible construction
       (prefix, double-SHA256, compact recoverable ECDSA, zbase32); live lncli
       cross-check noted as an interop follow-up.
@@ -156,22 +159,31 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [ ] Multisig / P2WSH address type (enum entry currently commented out,
       `types/wallet.ts:40`). Scope: descriptor-based multisig receive + spend.
 (Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
-- [~] Fee estimation privacy (this PR): feeEstimationSource 'auto' (default,
+- [x] Fee estimation privacy (PR #53, merged): feeEstimationSource 'auto' (default,
       Electrum first) | 'electrum' (never HTTP) | 'http'; every remote rate
       clamped to 5000 sat/vB.
-- [~] Robust multi-server Electrum failover (this PR): deterministic ordered
+- [x] Robust multi-server Electrum failover (PR #53, merged): deterministic ordered
       rotation with per-server 60s cooldown, then network fallback peers (never
       for regtest); lightning reconnect monitor untouched.
-- [~] BIP21 URI generation (this PR): encodeBip21 + POST /address/new bip21 option
-      + CLI address --bip21.
-- [ ] Public UTXO freeze/unfreeze API surfacing the internal blacklist.
-- [ ] Per-address user labels (tx labels/tags exist; IAddressData.label is the type
-      name, not user data).
-- [~] Signet network support (this PR): full onchain + lightning (chain hash, coin
-      type 1, daemon --network signet, default signet Electrum peer).
-- [ ] Wallet birthday / height checkpoint to bound rescans.
-- [ ] Multi-account support (account index is hardwired to 0).
-- [ ] Descriptor / backup export for the onchain wallet.
+- [x] BIP21 URI generation (PR #53, merged): encodeBip21 + POST /address/new bip21
+      option + CLI address --bip21.
+- [~] Public UTXO freeze/unfreeze API (this PR): freeze/unfreeze/listFrozen +
+      getBalanceBreakdown; ALSO fixes a live gap where the blacklist was only
+      applied when the caller passed no explicit UTXO list.
+- [~] Per-address user labels (this PR): setAddressLabel/getAddressLabel/list +
+      daemon/CLI; the legacy IAddressData.label field is untouched.
+- [x] Signet network support (PR #53, merged): full onchain + lightning (chain hash,
+      coin type 1, daemon --network signet, default signet Electrum peer).
+- [~] Wallet birthday (this PR): validated, persisted, earliest-wins metadata
+      exposed in descriptors. Candid finding: the Electrum protocol has no
+      height-filtered scans, so nothing is boundable today; documented as
+      forward-looking for bitcoind/compact-filter backends.
+- [~] Multi-account support (this PR): account option threaded through derivation
+      and storage keys (account 0 keeps the legacy format); library-only, daemon
+      stays single-account.
+- [~] Descriptor export (this PR): all four script types with BIP 380 checksums
+      validated against Bitcoin Core vectors; watch-only supported, no private
+      key material ever emitted.
 - [?] Silent payments (BIP352) receive/send. Larger effort; decide priority.
 - [?] Payjoin (BIP78/BIP77). Decide priority.
 - [?] Alternate chain backends (bitcoind RPC, Esplora). IChainBackend exists for
@@ -236,6 +248,9 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #53 merged (Electrum layer). Batch C (this PR): combined spend
+  limit per Corey, UTXO freeze (+ selection-gap fix), labels, birthday,
+  multi-account, descriptor export. Multisig P2WSH next as its own PR.
 - 2026-07-10: PR #51 merged (watch-only + PSBT flow; CI now isolates the offline
   suites from live-Electrum tests). PR #52 merged (untracked a node_modules symlink
   #51 accidentally committed; .gitignore pattern hardened). Batch B (this PR):

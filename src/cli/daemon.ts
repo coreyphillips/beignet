@@ -332,6 +332,29 @@ export async function startDaemon(
 			return success(txs);
 		},
 		'GET /utxos': () => success(node.listUtxos()),
+		'POST /utxo/freeze': async (body) => {
+			const { txid, index } = body as { txid?: string; index?: number };
+			if (!txid || index === undefined)
+				return failure('INVALID_PARAMS', 'txid and index required');
+			return success(await node.freezeUtxo(txid, index));
+		},
+		'POST /utxo/unfreeze': async (body) => {
+			const { txid, index } = body as { txid?: string; index?: number };
+			if (!txid || index === undefined)
+				return failure('INVALID_PARAMS', 'txid and index required');
+			return success(await node.unfreezeUtxo(txid, index));
+		},
+		'POST /address/label': async (body) => {
+			const { address, label } = body as { address?: string; label?: string };
+			if (!address || label === undefined)
+				return failure(
+					'INVALID_PARAMS',
+					'address and label required (empty label clears)'
+				);
+			return success(await node.setAddressLabel(address, label));
+		},
+		'GET /address/labels': () => success(node.listAddressLabels()),
+		'GET /wallet/descriptors': () => success(node.exportDescriptors()),
 		'GET /channel/suggestions': (_body, query) => {
 			const count = query.get('count') ? Number(query.get('count')) : undefined;
 			return success(node.getChannelSuggestions(count));

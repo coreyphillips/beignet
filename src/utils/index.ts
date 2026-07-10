@@ -5,5 +5,6 @@ export * from './helpers';
 export * from './electrum';
 export * from './fees';
 export * from './derivation-path';
+export * from './descriptors';
 export * from './transaction';
 export * from './result';
