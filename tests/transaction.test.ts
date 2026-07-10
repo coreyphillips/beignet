@@ -435,4 +435,25 @@ describe('Transaction CoinSelect Test', function (): void {
 			expect(result.error.message).to.equal('No inputs provided');
 		}
 	});
+
+	it('Should coin-select on a Transaction with no wallet attached', () => {
+		// autoCoinSelect is a pure function of its inputs and must not
+		// require a wallet (regression: multisig weight rewrite dereferenced
+		// an undefined wallet and every selection returned an error).
+		const walletlessTransaction = new Transaction({
+			wallet: undefined as unknown as Wallet
+		});
+		const result = walletlessTransaction.autoCoinSelect({
+			inputs: testInputs,
+			outputs: testOutputs,
+			satsPerByte: 1,
+			coinSelectPreference: ECoinSelectPreference.small
+		});
+
+		expect(result.isOk()).to.be.true;
+		if (result.isOk()) {
+			expect(result.value.inputs).to.have.length.at.least(1);
+			expect(result.value.fee).to.be.greaterThan(0);
+		}
+	});
 });
