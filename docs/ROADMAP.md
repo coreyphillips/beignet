@@ -156,13 +156,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       finalizing, no broadcast), wallet.broadcastTransaction; daemon /psbt/build,
       /psbt/import-signed, /psbt/combine + CLI psbt commands.
 - [x] PSBT combine for multi-party signing (PR #51, merged): combinePsbts.
-- [~] Multisig / P2WSH (this PR, re-land of PR #55 which merged with red CI and
-      was reverted in PR #56): Wallet.createMultisig, BIP 48 derivation,
+- [x] Multisig / P2WSH (PR #57, merged; re-land of PR #55 which merged with red CI
+      and was reverted in PR #56): Wallet.createMultisig, BIP 48 derivation,
       wsh(sortedmulti()) with BIP 67 ordering, watch-only coordinator support,
       spending exclusively via the PSBT flow with fail-closed threshold
-      enforcement, descriptor export with checksums. Library-only. Re-land fixes
+      enforcement, descriptor export with checksums. Library-only. Re-land fixed
       the coin-select regression (applyMultisigInputWeights assumed a wallet is
-      always attached; autoCoinSelect must work without one) and pins that
+      always attached; autoCoinSelect must work without one) and pinned that
       property with a regression test.
 (Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
 - [x] Fee estimation privacy (PR #53, merged): feeEstimationSource 'auto' (default,
@@ -197,9 +197,13 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M6. Security and auth hardening
 
-- [ ] Scoped API auth: multiple named API keys with permission scopes (read-only,
-      invoice-only, admin) replacing the single static bearer token; constant-time
-      compare; key revocation.
+- [~] Scoped API auth (this PR): multiple named API keys (apiKeys config) with
+      readonly/invoice/admin scopes alongside the legacy apiToken (implicit
+      admin); explicit route-to-scope map with a source-derived drift test,
+      unclassified routes fail closed to admin-only; SHA-256 +
+      crypto.timingSafeEqual comparison for named keys and the legacy token;
+      401 vs 403 distinction; runtime revocation by name (POST /auth/keys/revoke)
+      plus durable removal via config.
 - [ ] Remote/external signer interface for the node: abstract ChannelSigner behind an
       ISigner so keys can live out of process (raw Buffers in INodeConfig today,
       `node/types.ts:78-91`).
@@ -254,7 +258,10 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
-- 2026-07-10: multisig P2WSH re-landed (this PR). PR #55 had merged with a red
+- 2026-07-10: PR #57 merged (multisig P2WSH re-land). M6 started with three
+  parallel branches: scoped API auth (this PR), ISigner remote-signer
+  abstraction, and leveled logging.
+- 2026-07-10: multisig P2WSH re-landed (PR #57). PR #55 had merged with a red
   unit-test job through a merge-gate hole and was reverted in PR #56: its
   applyMultisigInputWeights helper dereferenced the wallet unconditionally,
   breaking autoCoinSelect on wallet-less Transaction instances (the six
