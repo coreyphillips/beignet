@@ -771,6 +771,7 @@ describe('watchtower client session state machine (fake tower)', function () {
 			id: 1,
 			towerUri: TOWER_URI,
 			channelId: 'c1',
+			blobType: BlobType.ALTRUIST_COMMIT,
 			hint: crypto.randomBytes(16).toString('hex'),
 			encryptedBlob: crypto.randomBytes(314).toString('hex'),
 			seqNum: 0,
@@ -816,6 +817,7 @@ describe('watchtower persistence round-trip', function () {
 		const update: IWatchtowerUpdate = {
 			towerUri: TOWER_URI,
 			channelId: 'c1',
+			blobType: BlobType.ALTRUIST_COMMIT,
 			hint: crypto.randomBytes(16).toString('hex'),
 			encryptedBlob: crypto.randomBytes(314).toString('hex'),
 			seqNum: 0,

@@ -7,9 +7,14 @@
  * key from the on-chain txid, decrypts the kit, reassembles the penalty
  * transaction, and broadcasts it.
  *
- * Only the version-0 kit (legacy + anchor channels) is implemented here; the
- * to-local revocation branch is identical for both, and it is the fund-critical
- * breach punishment. The version-1 (taproot) kit is not yet produced.
+ * Two kit versions exist, mirroring lnd watchtower/blob/justice_kit_packet.go:
+ *   - version 0 (274-byte plaintext): legacy + anchor channels. ECDSA sigs
+ *     (SIGHASH_ALL), 33-byte compressed pubkeys, explicit csv_delay.
+ *   - version 1 (300-byte plaintext): simple taproot channels. BIP340 schnorr
+ *     sigs (SIGHASH_DEFAULT), 32-byte x-only to-local keys, and the tapleaf
+ *     hash of the to_local delay script so the tower can rebuild the script
+ *     tree (revoke leaf + delay-leaf hash) and the control block.
+ * Both share the same envelope: 24-byte XNonce || ciphertext || 16-byte MAC.
  */
 
 import { createHash, randomBytes } from 'crypto';
@@ -45,6 +50,8 @@ export const CIPHERTEXT_EXPANSION = 16;
 export const MAX_SWEEP_ADDR_SIZE = 42;
 /** Fixed plaintext size of a version-0 kit. */
 export const V0_PLAINTEXT_SIZE = 274;
+/** Fixed plaintext size of a version-1 (taproot) kit. */
+export const V1_PLAINTEXT_SIZE = 300;
 
 /**
  * Breach hint = SHA256(txid)[:16]. `txid` MUST be in internal (little-endian,
@@ -172,23 +179,143 @@ function isCompressedPoint(b: Buffer): boolean {
 }
 
 /**
+ * Version-1 (taproot) justice kit fields (justiceKitPacketV1). The to-local
+ * keys are 32-byte x-only (schnorr) keys; signatures are 64-byte BIP340
+ * schnorr signatures under SIGHASH_DEFAULT. delayScriptHash is the tapleaf
+ * hash of the to_local delay leaf, the sibling the tower needs to rebuild the
+ * to_local taproot tree (NUMS internal key) and the revoke-path control block.
+ */
+export interface IJusticeKitV1 {
+	/** Witness program of the client's sweep output (<= 42 bytes). */
+	sweepAddress: Buffer;
+	/** 32-byte x-only revocation pubkey. */
+	revocationPubKey: Buffer;
+	/** 32-byte x-only remote-party delayed pubkey. */
+	localDelayPubKey: Buffer;
+	/** 64-byte schnorr signature for the to_local revoke-leaf spend. */
+	commitToLocalSig: Buffer;
+	/** 32-byte tapleaf hash of the to_local delay script. */
+	delayScriptHash: Buffer;
+	/** 33-byte compressed to-remote pubkey; blank (33 zero bytes) when absent. */
+	commitToRemotePubKey?: Buffer;
+	/** 64-byte schnorr to-remote signature; only used when pubkey present. */
+	commitToRemoteSig?: Buffer;
+}
+
+/** Encode a version-1 kit to its constant 300-byte plaintext. */
+export function encodeJusticeKitV1(kit: IJusticeKitV1): Buffer {
+	if (kit.sweepAddress.length > MAX_SWEEP_ADDR_SIZE) {
+		throw new Error('justice kit: sweep address too long');
+	}
+	if (
+		kit.revocationPubKey.length !== 32 ||
+		kit.localDelayPubKey.length !== 32
+	) {
+		throw new Error('justice kit v1: to-local pubkeys must be 32 bytes');
+	}
+	if (kit.commitToLocalSig.length !== 64) {
+		throw new Error('justice kit: to-local sig must be 64 bytes');
+	}
+	if (kit.delayScriptHash.length !== 32) {
+		throw new Error('justice kit v1: delay script hash must be 32 bytes');
+	}
+	const out = Buffer.alloc(V1_PLAINTEXT_SIZE);
+	let o = 0;
+	out.writeUInt8(kit.sweepAddress.length, o);
+	o += 1;
+	kit.sweepAddress.copy(out, o);
+	o += MAX_SWEEP_ADDR_SIZE;
+	kit.revocationPubKey.copy(out, o);
+	o += 32;
+	kit.localDelayPubKey.copy(out, o);
+	o += 32;
+	kit.commitToLocalSig.copy(out, o);
+	o += 64;
+	kit.delayScriptHash.copy(out, o);
+	o += 32;
+	(kit.commitToRemotePubKey ?? EMPTY_33).copy(out, o);
+	o += 33;
+	(kit.commitToRemoteSig ?? EMPTY_64).copy(out, o);
+	return out;
+}
+
+/** Decode a version-1 kit from its 300-byte plaintext. */
+export function decodeJusticeKitV1(pt: Buffer): IJusticeKitV1 {
+	if (pt.length !== V1_PLAINTEXT_SIZE) {
+		throw new Error(
+			`justice kit: plaintext must be ${V1_PLAINTEXT_SIZE} bytes, got ${pt.length}`
+		);
+	}
+	let o = 0;
+	const addrLen = pt.readUInt8(o);
+	o += 1;
+	if (addrLen > MAX_SWEEP_ADDR_SIZE) {
+		throw new Error('justice kit: sweep address too long');
+	}
+	const sweepAddress = Buffer.from(pt.subarray(o, o + addrLen));
+	o += MAX_SWEEP_ADDR_SIZE;
+	const revocationPubKey = Buffer.from(pt.subarray(o, o + 32));
+	o += 32;
+	const localDelayPubKey = Buffer.from(pt.subarray(o, o + 32));
+	o += 32;
+	const commitToLocalSig = Buffer.from(pt.subarray(o, o + 64));
+	o += 64;
+	const delayScriptHash = Buffer.from(pt.subarray(o, o + 32));
+	o += 32;
+	const remotePub = Buffer.from(pt.subarray(o, o + 33));
+	o += 33;
+	const remoteSig = Buffer.from(pt.subarray(o, o + 64));
+	const kit: IJusticeKitV1 = {
+		sweepAddress,
+		revocationPubKey,
+		localDelayPubKey,
+		commitToLocalSig,
+		delayScriptHash
+	};
+	// A blank (all-zero / non-point) to-remote pubkey means no to-remote output.
+	if (isCompressedPoint(remotePub)) {
+		kit.commitToRemotePubKey = remotePub;
+		kit.commitToRemoteSig = remoteSig;
+	}
+	return kit;
+}
+
+/**
  * Encrypt a version-0 kit under the breach key. Layout: 24-byte nonce ||
  * ciphertext || 16-byte MAC (chacha20poly1305 XNonce), matching blob.Encrypt.
  */
 export function encryptJusticeKitV0(kit: IJusticeKitV0, key: Buffer): Buffer {
-	const nonce = randomNonce();
-	const ct = xEncrypt(key, nonce, encodeJusticeKitV0(kit));
-	return Buffer.concat([nonce, ct]);
+	return sealPlaintext(encodeJusticeKitV0(kit), key);
 }
 
 /** Decrypt a version-0 blob produced by encryptJusticeKitV0 / blob.Encrypt. */
 export function decryptJusticeKitV0(blob: Buffer, key: Buffer): IJusticeKitV0 {
+	return decodeJusticeKitV0(openBlob(blob, key));
+}
+
+/** Encrypt a version-1 kit under the breach key (same envelope as v0). */
+export function encryptJusticeKitV1(kit: IJusticeKitV1, key: Buffer): Buffer {
+	return sealPlaintext(encodeJusticeKitV1(kit), key);
+}
+
+/** Decrypt a version-1 blob produced by encryptJusticeKitV1 / blob.Encrypt. */
+export function decryptJusticeKitV1(blob: Buffer, key: Buffer): IJusticeKitV1 {
+	return decodeJusticeKitV1(openBlob(blob, key));
+}
+
+function sealPlaintext(plaintext: Buffer, key: Buffer): Buffer {
+	const nonce = randomNonce();
+	const ct = xEncrypt(key, nonce, plaintext);
+	return Buffer.concat([nonce, ct]);
+}
+
+function openBlob(blob: Buffer, key: Buffer): Buffer {
 	if (blob.length < NONCE_SIZE + CIPHERTEXT_EXPANSION) {
 		throw new Error('justice blob: ciphertext too small');
 	}
 	const nonce = blob.subarray(0, NONCE_SIZE);
 	const ct = blob.subarray(NONCE_SIZE);
-	return decodeJusticeKitV0(xDecrypt(key, nonce, ct));
+	return xDecrypt(key, nonce, ct);
 }
 
 function randomNonce(): Buffer {

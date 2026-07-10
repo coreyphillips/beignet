@@ -12,9 +12,13 @@
  * Coverage: transport handshake with LND's tower identity key, Init feature
  * and chain-hash exchange, CreateSession negotiation (altruist policy), and
  * StateUpdate acks for justice blobs built from REAL revoked commitments
- * (sequence advances across multiple updates, backlog drains). The justice
- * blob byte format itself is verified against the LND RFC vector and a
- * chain-monitor derivation in tests/lightning/watchtower.test.ts.
+ * (sequence advances across multiple updates, backlog drains). Per-blob-type
+ * sessions are exercised live: the anchor (v0 kit, blob type 6) and taproot
+ * (v1 kit, blob type 10) sessions each negotiate over their own session-keyed
+ * connection and get backups acked — LND v0.20's tower accepts all three
+ * altruist blob types (blob.IsSupportedType). The justice blob byte formats
+ * are verified against LND source semantics and chain-monitor derivations in
+ * tests/lightning/watchtower.test.ts and watchtower-taproot.test.ts.
  */
 import { expect } from 'chai';
 import crypto from 'crypto';
@@ -48,9 +52,11 @@ import { buildRemoteCommitment } from '../../../src/lightning/channel/commitment
 import { perCommitmentPointFromSecret } from '../../../src/lightning/keys/derivation';
 import { MAX_INDEX } from '../../../src/lightning/keys/shachain';
 import { ChannelActionType } from '../../../src/lightning/channel/channel-actions';
+import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
 import { IJusticeContext } from '../../../src/lightning/watchtower/justice';
 import { WatchtowerClient } from '../../../src/lightning/watchtower/watchtower-client';
 import { chainHashForNetwork } from '../../../src/lightning/watchtower';
+import { BlobType } from '../../../src/lightning/watchtower/blob';
 
 bitcoin.initEccLib(ecc);
 
@@ -120,12 +126,32 @@ function exchangeOnce(opener: Channel, acceptor: Channel): void {
 	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg.payload));
 }
 
+type ChannelKind = 'legacy' | 'anchor' | 'taproot';
+
+function channelTypeFor(kind: ChannelKind): Buffer | null {
+	if (kind === 'legacy') return null;
+	const flags = FeatureFlags.empty();
+	if (kind === 'anchor') {
+		flags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+		flags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+	} else {
+		flags.setCompulsory(Feature.OPTION_TAPROOT);
+	}
+	return flags.toBuffer();
+}
+
 /**
  * Drive a real channel to NORMAL with random funding (unique breach txids per
  * run), advance `rounds` commitments, and return one justice context per
- * revoked state (opener's view of the acceptor's revoked commitments).
+ * revoked state (opener's view of the acceptor's revoked commitments). For
+ * anchor/taproot kinds the negotiated channel_type is flipped before the
+ * revoked commitments are rebuilt, so the contexts carry real anchor/taproot
+ * format commitments (the chain-monitor fixture pattern).
  */
-function buildRevokedContexts(rounds: number): IJusticeContext[] {
+function buildRevokedContexts(
+	rounds: number,
+	kind: ChannelKind = 'legacy'
+): IJusticeContext[] {
 	const { basepoints: openerBp, privkeys: openerPrivkeys } = makeBasepoints(
 		crypto.randomBytes(32)
 	);
@@ -194,6 +220,7 @@ function buildRevokedContexts(rounds: number): IJusticeContext[] {
 	}
 
 	const state = opener.getFullState();
+	state.channelType = channelTypeFor(kind);
 	const sweepScript = bitcoin.payments.p2wpkh({
 		pubkey: getPublicKey(crypto.randomBytes(32)),
 		network
@@ -205,14 +232,15 @@ function buildRevokedContexts(rounds: number): IJusticeContext[] {
 		const revokedPoint = perCommitmentPointFromSecret(secret!);
 		const built = buildRemoteCommitment(state, revokedPoint, BigInt(i));
 		contexts.push({
-			channelId: `wt-lnd-interop-${i}`,
+			channelId: `wt-lnd-interop-${kind}-${i}`,
 			revokedTx: built.result.tx,
 			perCommitmentSecret: secret!,
 			revocationBasepoint: state.localBasepoints.revocationBasepoint,
 			revocationBasepointSecret: openerPrivkeys[1],
 			remoteDelayedBasepoint: state.remoteBasepoints!.delayedPaymentBasepoint,
 			toSelfDelay: state.localConfig.toSelfDelay,
-			isAnchor: false,
+			isAnchor: kind !== 'legacy',
+			isTaproot: kind === 'taproot',
 			localPaymentPubkey: state.localBasepoints.paymentBasepoint,
 			paymentBasepointSecret: openerPrivkeys[2],
 			sweepScript,
@@ -255,6 +283,56 @@ function waitForEvent(
 		]);
 		function onLog(e: ITowerLogEvent): void {
 			if (e.event === event) {
+				clearTimeout(timer);
+				client.removeListener('log', onLog);
+				resolve(e);
+			} else if (failEvents.has(e.event)) {
+				clearTimeout(timer);
+				client.removeListener('log', onLog);
+				reject(
+					new Error(`Tower failure event "${e.event}": ${JSON.stringify(e)}`)
+				);
+			}
+		}
+		client.on('log', onLog);
+	});
+}
+
+/** Wait for a watchtower log event matching a predicate, failing on errors. */
+function waitForMatch(
+	events: ITowerLogEvent[],
+	client: WatchtowerClient,
+	desc: string,
+	match: (e: ITowerLogEvent) => boolean,
+	timeoutMs: number
+): Promise<ITowerLogEvent> {
+	return new Promise((resolve, reject) => {
+		const existing = events.find(match);
+		if (existing) {
+			resolve(existing);
+			return;
+		}
+		const timer = setTimeout(() => {
+			client.removeListener('log', onLog);
+			reject(
+				new Error(
+					`Timed out waiting for ${desc}; saw: ${events
+						.map((e) => e.event)
+						.join(', ')}`
+				)
+			);
+		}, timeoutMs);
+		const failEvents = new Set([
+			'tower_error',
+			'tower_wt_error',
+			'connect_failed',
+			'session_error',
+			'session_rejected',
+			'update_rejected',
+			'backup_failed'
+		]);
+		function onLog(e: ITowerLogEvent): void {
+			if (match(e)) {
 				clearTimeout(timer);
 				client.removeListener('log', onLog);
 				resolve(e);
@@ -338,6 +416,72 @@ describe('watchtower client vs live LND tower', function () {
 			const ack = await acked;
 			expect(ack.seqNum).to.equal(i + 2);
 		}
+	});
+
+	it('negotiates an anchor session and gets an anchor v0 backup acked', async function () {
+		// Anchor channels use blob type 6 (FlagCommitOutputs|FlagAnchorChannel):
+		// a separate session over its own session-keyed connection, since LND
+		// towers accept one blob type per session (keyed to the connection pub).
+		const [ctx] = buildRevokedContexts(1, 'anchor');
+		const sessionCreated = waitForMatch(
+			events,
+			client,
+			'anchor session_created',
+			(e) =>
+				e.event === 'session_created' &&
+				e.blobType === BlobType.ALTRUIST_ANCHOR_COMMIT,
+			30000
+		);
+		const acked = waitForMatch(
+			events,
+			client,
+			'anchor update_acked',
+			(e) =>
+				e.event === 'update_acked' &&
+				e.blobType === BlobType.ALTRUIST_ANCHOR_COMMIT,
+			30000
+		);
+		client.backupRevokedState(ctx);
+		await sessionCreated;
+		const ack = await acked;
+		// Fresh session for this blob type: its sequence starts at 1 even though
+		// the legacy session has already shipped several updates.
+		expect(ack.seqNum).to.equal(1);
+	});
+
+	it('negotiates a taproot session (LND v0.20 accepts blob type 10) and gets a v1 backup acked', async function () {
+		// LND v0.20's tower supports TypeAltruistTaprootCommit
+		// (watchtower/blob/type.go supportedTypes), even though its Init only
+		// advertises anchor-optional; CreateSession succeeds. If a tower ever
+		// rejects (CreateSessionCodeRejectBlobType 64), the client queues taproot
+		// backups instead of crashing (covered offline in watchtower-taproot).
+		const [ctx] = buildRevokedContexts(1, 'taproot');
+		const sessionCreated = waitForMatch(
+			events,
+			client,
+			'taproot session_created',
+			(e) =>
+				e.event === 'session_created' &&
+				e.blobType === BlobType.ALTRUIST_TAPROOT_COMMIT,
+			30000
+		);
+		const acked = waitForMatch(
+			events,
+			client,
+			'taproot update_acked',
+			(e) =>
+				e.event === 'update_acked' &&
+				e.blobType === BlobType.ALTRUIST_TAPROOT_COMMIT,
+			30000
+		);
+		client.backupRevokedState(ctx);
+		await sessionCreated;
+		const ack = await acked;
+		expect(ack.seqNum).to.equal(1);
+		// All three blob-type sessions now live against the same tower.
+		const health = client.getHealth();
+		expect(health[0].sessions).to.equal(3);
+		expect(health[0].pendingBacklog).to.equal(0);
 	});
 
 	it('a fresh client with a new identity negotiates its own session', async function () {
