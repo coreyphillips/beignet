@@ -29,7 +29,8 @@ const LN_PURPOSE = 1017;
 export enum LnCoinType {
 	BITCOIN = 0,
 	TESTNET = 1,
-	REGTEST = 1
+	REGTEST = 1,
+	SIGNET = 1
 }
 
 export interface ILightningKeysFromSeed {

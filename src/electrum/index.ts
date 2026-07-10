@@ -39,6 +39,7 @@ import {
 	Tls
 } from '../types';
 import {
+	btcPerKbToSatPerVbyte,
 	err,
 	filterAddressesForGapLimit,
 	filterAddressesObjForAddressesList,
@@ -54,7 +55,12 @@ import {
 	splitAddresses
 } from '../utils';
 import { Wallet } from '../wallet';
-import { onMessageKeys, POLLING_INTERVAL } from '../shapes';
+import {
+	defaultElectrumPeers,
+	ELECTRUM_SERVER_COOLDOWN_MS,
+	onMessageKeys,
+	POLLING_INTERVAL
+} from '../shapes';
 
 export class Electrum {
 	private readonly _wallet: Wallet;
@@ -66,6 +72,14 @@ export class Electrum {
 	/** Shared in-flight connect, so concurrent callers don't race (see connectToElectrum). */
 	private _connectInFlight: Promise<Result<TConnectToElectrumRes>> | null =
 		null;
+	/** Per-server failure tracking for rotation (keyed by host|protocol|port). */
+	private _serverFailures: Map<
+		string,
+		{ failures: number; lastFailureAt: number }
+	> = new Map();
+	private _currentServer: TServer | null = null;
+	/** Number of times the connected server changed after the first connect. */
+	private _rotationCount = 0;
 
 	public servers?: TServer | TServer[];
 	public network: EAvailableNetworks;
@@ -162,16 +176,24 @@ export class Electrum {
 		) {
 			return err('Regtest requires that you pre-specify a server.');
 		}
-		const startResponse = await electrum.start({
-			clientName: 'beignet',
-			protocolVersion: '1.4',
-			network: electrumNetwork,
-			net: this.net,
-			tls: this.tls,
-			customPeers
-		});
-		if (startResponse.error && !this.wallet.isSwitchingNetworks)
-			return err(startResponse.error);
+		const candidates = this.getServerCandidates(customPeers, electrumNetwork);
+		let connected = false;
+		let lastError = 'No Electrum servers available.';
+		for (const candidate of this.orderCandidates(candidates)) {
+			const startResponse = await this.attemptConnect(
+				candidate,
+				electrumNetwork
+			);
+			if (startResponse.error) {
+				this.recordServerFailure(candidate);
+				lastError = String(startResponse.error);
+				continue;
+			}
+			this.recordServerSuccess(candidate);
+			connected = true;
+			break;
+		}
+		if (!connected && !this.wallet.isSwitchingNetworks) return err(lastError);
 		this.network = network;
 		this.electrumNetwork = electrumNetwork;
 		if (customPeers.length) {
@@ -180,6 +202,111 @@ export class Electrum {
 		this.publishConnectionChange(true);
 		this.subscribeToHeader().then();
 		return ok('Connected to Electrum server.');
+	}
+
+	/**
+	 * Attempts a single connect to the given server. Isolated so tests can
+	 * exercise rotation with a fake connection layer.
+	 */
+	private async attemptConnect(
+		server: TServer,
+		electrumNetwork: EElectrumNetworks
+	): Promise<{ error: unknown }> {
+		return await electrum.start({
+			clientName: 'beignet',
+			protocolVersion: '1.4',
+			network: electrumNetwork,
+			net: this.net,
+			tls: this.tls,
+			customPeers: [server]
+		});
+	}
+
+	/**
+	 * Ordered rotation candidates: user-provided servers first, then the
+	 * hardcoded fallback peers for the network (never for regtest), deduped.
+	 */
+	private getServerCandidates(
+		customPeers: TServer[],
+		electrumNetwork: EElectrumNetworks
+	): TServer[] {
+		const fallback =
+			electrumNetwork === EElectrumNetworks.bitcoinRegtest
+				? []
+				: defaultElectrumPeers[electrumNetwork] ?? [];
+		const candidates: TServer[] = [];
+		const seen = new Set<string>();
+		for (const server of [...customPeers, ...fallback]) {
+			const key = this.serverKey(server);
+			if (seen.has(key)) continue;
+			seen.add(key);
+			candidates.push(server);
+		}
+		return candidates;
+	}
+
+	/**
+	 * Starts iteration at the currently connected server (stable across
+	 * transient reconnects) and moves servers still cooling down from a recent
+	 * failure to the end, so a dead server is only retried once healthier
+	 * candidates have been exhausted.
+	 */
+	private orderCandidates(candidates: TServer[]): TServer[] {
+		let ordered = candidates;
+		if (this._currentServer) {
+			const currentKey = this.serverKey(this._currentServer);
+			const index = candidates.findIndex(
+				(s) => this.serverKey(s) === currentKey
+			);
+			if (index > 0) {
+				ordered = [...candidates.slice(index), ...candidates.slice(0, index)];
+			}
+		}
+		const now = Date.now();
+		const coolingDown = (server: TServer): boolean => {
+			const failure = this._serverFailures.get(this.serverKey(server));
+			if (!failure) return false;
+			return now - failure.lastFailureAt < ELECTRUM_SERVER_COOLDOWN_MS;
+		};
+		return [
+			...ordered.filter((s) => !coolingDown(s)),
+			...ordered.filter(coolingDown)
+		];
+	}
+
+	private serverKey(server: TServer): string {
+		const port = server.protocol === 'ssl' ? server.ssl : server.tcp;
+		return `${server.host}|${server.protocol}|${port}`;
+	}
+
+	private recordServerFailure(server: TServer): void {
+		const key = this.serverKey(server);
+		const failure = this._serverFailures.get(key);
+		this._serverFailures.set(key, {
+			failures: (failure?.failures ?? 0) + 1,
+			lastFailureAt: Date.now()
+		});
+	}
+
+	private recordServerSuccess(server: TServer): void {
+		this._serverFailures.delete(this.serverKey(server));
+		if (
+			this._currentServer &&
+			this.serverKey(this._currentServer) !== this.serverKey(server)
+		) {
+			this._rotationCount++;
+		}
+		this._currentServer = server;
+	}
+
+	/** The server of the most recent successful connect, if any. */
+	public get currentServer(): TServer | null {
+		return this._currentServer;
+	}
+
+	/** How many times the connected server has changed (rotation history). */
+	public get rotationCount(): number {
+		return this._rotationCount;
 	}
 
 	async isConnected(): Promise<boolean> {
@@ -219,6 +346,28 @@ export class Electrum {
 			scriptHashes,
 			network: this.electrumNetwork
 		});
+	}
+
+	/**
+	 * Returns the fee estimate in sat/vB for the given confirmation target via
+	 * blockchain.estimatefee. Errs when the server has no estimate (-1) or
+	 * returns an unusable value; results are clamped to a sane range.
+	 * @param {number} blocksWillingToWait
+	 * @returns {Promise<Result<number>>}
+	 */
+	async getFeeEstimate(blocksWillingToWait: number): Promise<Result<number>> {
+		const response = await electrum.getFeeEstimate({
+			blocksWillingToWait,
+			network: this.electrumNetwork
+		});
+		if (response.error) {
+			return err('Unable to get fee estimate from Electrum server.');
+		}
+		const satPerVbyte = btcPerKbToSatPerVbyte(Number(response.data));
+		if (satPerVbyte <= 0) {
+			return err('Electrum server returned an unusable fee estimate.');
+		}
+		return ok(satPerVbyte);
 	}
 
 	/**

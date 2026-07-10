@@ -137,6 +137,7 @@ const utxos = wallet.value.listUtxos();
 const history = await wallet.value.getAddressHistory('bc1q...');
 ```
 
+<<<<<<< HEAD
 ### Watch-Only Wallets
 
 A watch-only wallet is constructed from an account-level extended public key
@@ -216,6 +217,14 @@ const combined = wallet.combinePsbts([copyA, copyB]);
 The HTTP daemon exposes the same flow on its (mnemonic-backed) wallet via
 `POST /psbt/build`, `POST /psbt/import-signed` and `POST /psbt/combine`, and
 the CLI via `beignet psbt build|import-signed|combine`.
+=======
+### Networks, Fee Estimates & Electrum Failover
+
+- **Networks:** `mainnet`, `testnet`, `regtest`, and `signet` are supported end to end (on-chain wallet, Electrum, CLI/daemon via `--network signet`, and the Lightning node config, which uses the signet chain hash and `tbs` invoice prefix). Signet shares testnet's address formats and derivation paths (coin type 1); only the chain differs.
+- **Fee estimation source:** `Wallet.create({ feeEstimationSource })` accepts `'electrum' | 'http' | 'auto'` (default `'auto'`). `'electrum'` queries only the connected Electrum server via `blockchain.estimatefee`, so fee lookups never leak to mempool.space/blocktank over clearnet; `'auto'` prefers Electrum and falls back to HTTP only when Electrum is unavailable or returns unusable values. All remote-sourced rates are clamped to at most 5000 sat/vB. The daemon exposes the same option as `feeEstimationSource` / `--fee-source` / `BEIGNET_FEE_SOURCE`.
+- **Electrum failover:** when multiple `electrumOptions.servers` are provided, the wallet rotates through them in order on connect/reconnect failure (then through hardcoded fallback peers for the network), with a per-server cooldown so dead servers are not hammered. `wallet.electrum.currentServer` and `wallet.electrum.rotationCount` expose the current server and rotation history.
+- **BIP21:** `encodeBip21({ address, amountSats?, label?, message? })` builds a `bitcoin:` payment URI; the daemon's `POST /address/new` accepts `{ bip21: true, amountSats?, label?, message? }` and the CLI supports `address --bip21 [--amount <sats>] [--label L] [--message M]`.
+>>>>>>> d1ecb90 (wip)
 
 ### Storage & Encryption
 

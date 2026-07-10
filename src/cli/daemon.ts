@@ -14,6 +14,7 @@ import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
 import { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
+import { encodeBip21 } from '../utils/transaction';
 
 export interface DaemonOptions extends BeignetNodeOptions {
 	daemonPort?: number;
@@ -348,8 +349,24 @@ export async function startDaemon(
 			);
 		},
 
-		'POST /address/new': async () =>
-			success({ address: await node.getNewAddress() }),
+		'POST /address/new': async (body) => {
+			const {
+				bip21: wantBip21,
+				amountSats,
+				label,
+				message
+			} = (body ?? {}) as {
+				bip21?: boolean;
+				amountSats?: number;
+				label?: string;
+				message?: string;
+			};
+			const address = await node.getNewAddress();
+			if (!wantBip21) return success({ address });
+			const uri = encodeBip21({ address, amountSats, label, message });
+			if (uri.isErr()) return failure('INVALID_PARAMS', uri.error.message);
+			return success({ address, bip21: uri.value });
+		},
 		'POST /wallet/refresh': async () => {
 			await node.refreshWallet();
 			return success({ refreshed: true });

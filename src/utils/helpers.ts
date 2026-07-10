@@ -3,7 +3,8 @@ import {
 	EAvailableNetworks,
 	IGetAddressesFromKeyPair,
 	IGetAddressesFromPrivateKey,
-	IKeyDerivationPath
+	IKeyDerivationPath,
+	TAvailableNetworks
 } from '../types';
 import { address as bitcoinJSAddress, Network, networks } from 'bitcoinjs-lib';
 import * as bip39 from 'bip39';
@@ -38,6 +39,27 @@ export const validatePsbtSignature = (
 };
 
 /**
+ * Signet shares testnet's address prefixes, bech32 hrp ('tb') and BIP32
+ * versions; only the genesis block differs, so bitcoinjs-lib ships no
+ * dedicated network entry for it.
+ */
+const signetNetwork: Network = { ...networks.testnet };
+
+/**
+ * Returns the bitcoinjs-lib Network object for the given beignet network.
+ * Required because bitcoinjs-lib's networks object has no 'signet' key.
+ * @param {EAvailableNetworks} network
+ * @returns {Network}
+ */
+export const getBitcoinJsNetwork = (
+	network: EAvailableNetworks | TAvailableNetworks
+): Network => {
+	if (network === EAvailableNetworks.signet) {
+		return signetNetwork;
+	}
+	return networks[network];
+};
+/**
  * Get address for a given scriptPubKey.
  * @param scriptPubKey
  * @param selectedNetwork
@@ -47,7 +69,7 @@ export const getAddressFromScriptPubKey = (
 	scriptPubKey: string,
 	selectedNetwork: EAvailableNetworks
 ): string => {
-	const network = networks[selectedNetwork];
+	const network = getBitcoinJsNetwork(selectedNetwork);
 	return bitcoin.address.fromOutputScript(
 		Buffer.from(scriptPubKey, 'hex'),
 		network
@@ -90,7 +112,7 @@ export const validateAddress = ({
 		//Validate address for a specific network
 		if (network !== undefined) {
 			try {
-				bitcoinJSAddress.toOutputScript(address, networks[network]);
+				bitcoinJSAddress.toOutputScript(address, getBitcoinJsNetwork(network));
 				return { isValid: true, network };
 			} catch {
 				// In the event the normal check fails, determine if this is a taproot address.
@@ -160,7 +182,7 @@ export const getScriptHash = ({
 	network: EAvailableNetworks;
 }): string => {
 	try {
-		const _network: Network = bitcoin.networks[network];
+		const _network: Network = getBitcoinJsNetwork(network);
 		const script = bitcoin.address.toOutputScript(address, _network);
 		const hash = bitcoin.crypto.sha256(script);
 		const reversedHash = Buffer.from(hash.reverse());

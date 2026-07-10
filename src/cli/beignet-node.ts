@@ -18,7 +18,7 @@ import {
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
-import { generateMnemonic } from '../utils/helpers';
+import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
 import {
 	EAvailableNetworks,
@@ -63,6 +63,7 @@ import { LnCoinType } from '../lightning/keys/wallet-keys';
 import {
 	BITCOIN_CHAIN_HASH,
 	REGTEST_CHAIN_HASH,
+	SIGNET_CHAIN_HASH,
 	isAnchorChannel,
 	ChannelState
 } from '../lightning/channel/types';
@@ -144,7 +145,7 @@ export interface LogEntry {
 
 export interface BeignetNodeOptions {
 	mnemonic?: string;
-	network?: 'mainnet' | 'testnet' | 'regtest';
+	network?: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	alias?: string;
 	dataDir?: string;
 	/**
@@ -157,6 +158,13 @@ export interface BeignetNodeOptions {
 	electrumHost?: string;
 	electrumPort?: number;
 	electrumTls?: boolean;
+	/**
+	 * Where the wallet sources on-chain fee estimates (default 'auto'):
+	 * 'electrum' queries only the connected Electrum server (no clearnet HTTP
+	 * leak), 'http' uses mempool.space/blocktank, 'auto' prefers Electrum and
+	 * falls back to HTTP when Electrum is unavailable.
+	 */
+	feeEstimationSource?: 'electrum' | 'http' | 'auto';
 	listenPort?: number;
 	preferAnchors?: boolean;
 	/**
@@ -392,6 +400,7 @@ const DEFAULT_ELECTRUM: Record<
 > = {
 	mainnet: { host: 'fulcrum.bitkit.blocktank.to', port: 8900, useTls: true },
 	testnet: { host: 'electrum.blockstream.info', port: 60002, useTls: true },
+	signet: { host: 'mempool.space', port: 60602, useTls: true },
 	regtest: { host: '34.65.252.32', port: 18483, useTls: false }
 };
 
@@ -458,7 +467,7 @@ export class BeignetNode extends EventEmitter {
 	/** Background timer waiting for Electrum before fallback-fund recovery (see runFallbackRecoveryWhenConnected). */
 	private _fallbackRecoveryTimer?: ReturnType<typeof setInterval>;
 	private mnemonic: string;
-	private networkName: 'mainnet' | 'testnet' | 'regtest';
+	private networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet';
 	private dataDir: string;
 	/** Path to the single-instance lock file (null if locking was skipped). */
 	private _lockPath: string | null = null;
@@ -496,7 +505,7 @@ export class BeignetNode extends EventEmitter {
 
 	private constructor(
 		mnemonic: string,
-		networkName: 'mainnet' | 'testnet' | 'regtest',
+		networkName: 'mainnet' | 'testnet' | 'regtest' | 'signet',
 		dataDir: string
 	) {
 		super();
@@ -560,8 +569,9 @@ export class BeignetNode extends EventEmitter {
 		const beignetNetwork = this.toBeignetNetwork(networkName);
 		const lnNetwork = this.toLnNetwork(networkName);
 		const coinType = this.toCoinType(networkName);
-		const chainHash =
-			networkName === 'regtest' ? REGTEST_CHAIN_HASH : BITCOIN_CHAIN_HASH;
+		let chainHash = BITCOIN_CHAIN_HASH;
+		if (networkName === 'regtest') chainHash = REGTEST_CHAIN_HASH;
+		if (networkName === 'signet') chainHash = SIGNET_CHAIN_HASH;
 
 		// 2. Acquire the single-instance lock before touching storage. Two
 		// instances on one data dir share a node identity (peer churns the
@@ -639,6 +649,9 @@ export class BeignetNode extends EventEmitter {
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
 			network: beignetNetwork,
+			...(opts.feeEstimationSource
+				? { feeEstimationSource: opts.feeEstimationSource }
+				: {}),
 			electrumOptions: {
 				net,
 				tls,
@@ -4880,6 +4893,8 @@ export class BeignetNode extends EventEmitter {
 				return EAvailableNetworks.testnet;
 			case 'regtest':
 				return EAvailableNetworks.regtest;
+			case 'signet':
+				return EAvailableNetworks.signet;
 			default:
 				return EAvailableNetworks.bitcoin;
 		}
@@ -4893,6 +4908,8 @@ export class BeignetNode extends EventEmitter {
 				return Network.TESTNET;
 			case 'regtest':
 				return Network.REGTEST;
+			case 'signet':
+				return Network.SIGNET;
 			default:
 				return Network.MAINNET;
 		}
@@ -4906,22 +4923,16 @@ export class BeignetNode extends EventEmitter {
 				return LnCoinType.TESTNET;
 			case 'regtest':
 				return LnCoinType.REGTEST;
+			case 'signet':
+				return LnCoinType.SIGNET;
 			default:
 				return LnCoinType.BITCOIN;
 		}
 	}
 
 	private getBitcoinNetwork(): unknown {
-		const bitcoin = require('bitcoinjs-lib');
-		switch (this.networkName) {
-			case 'mainnet':
-				return bitcoin.networks.bitcoin;
-			case 'testnet':
-				return bitcoin.networks.testnet;
-			case 'regtest':
-				return bitcoin.networks.regtest;
-			default:
-				return bitcoin.networks.bitcoin;
-		}
+		// getBitcoinJsNetwork covers signet, which bitcoinjs-lib's networks
+		// object lacks.
+		return getBitcoinJsNetwork(this.toBeignetNetwork(this.networkName));
 	}
 }

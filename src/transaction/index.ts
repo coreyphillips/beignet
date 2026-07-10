@@ -21,7 +21,7 @@ import {
 	getTapRootAddressFromPublicKey,
 	isP2trPrefix
 } from '../utils';
-import { reduceValue, shuffleArray } from '../utils';
+import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
@@ -36,7 +36,7 @@ import {
 	ITargets,
 	TSetupTransactionResponse
 } from '../types';
-import { networks, Psbt } from 'bitcoinjs-lib';
+import { Psbt } from 'bitcoinjs-lib';
 import { BIP32Interface } from 'bip32';
 import ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
@@ -577,7 +577,7 @@ export class Transaction {
 				if (isP2trPrefix(input.address)) {
 					const tapRootAddress = getTapRootAddressFromPublicKey({
 						publicKey: keyPair.publicKey,
-						network: networks[this._wallet.network]
+						network: getBitcoinJsNetwork(this._wallet.network)
 					});
 					if (tapRootAddress.isErr()) return err(tapRootAddress.error.message);
 					const childNodeXOnlyPubkey = tapRootAddress.value.internalPubkey;
@@ -627,7 +627,7 @@ export class Transaction {
 			outputs
 		});
 
-		const network = networks[this._wallet.network];
+		const network = getBitcoinJsNetwork(this._wallet.network);
 
 		//Collect all outputs.
 		let targets: ITargets[] = outputs.concat();
@@ -876,7 +876,7 @@ export class Transaction {
 		input
 	}: IAddInput): Promise<Result<string>> => {
 		try {
-			const network = networks[this._wallet.network];
+			const network = getBitcoinJsNetwork(this._wallet.network);
 			const { type } = getAddressInfo(input.address);
 
 			if (!input.value) {
