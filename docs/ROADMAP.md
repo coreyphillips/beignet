@@ -197,16 +197,24 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 
 ## M6. Security and auth hardening
 
-- [~] Scoped API auth (this PR): multiple named API keys (apiKeys config) with
+- [x] Scoped API auth (PR #58, merged): multiple named API keys (apiKeys config) with
       readonly/invoice/admin scopes alongside the legacy apiToken (implicit
       admin); explicit route-to-scope map with a source-derived drift test,
       unclassified routes fail closed to admin-only; SHA-256 +
       crypto.timingSafeEqual comparison for named keys and the legacy token;
       401 vs 403 distinction; runtime revocation by name (POST /auth/keys/revoke)
       plus durable removal via config.
-- [ ] Remote/external signer interface for the node: abstract ChannelSigner behind an
-      ISigner so keys can live out of process (raw Buffers in INodeConfig today,
-      `node/types.ts:78-91`).
+- [~] Remote/external signer interface (this PR): ISigner + SignerFactory in
+      keys/signer.ts covering every channel-state-machine signature (funding
+      digest, commitment/closing ECDSA, MuSig2 partial, second-level HTLC with
+      per-commitment derivation INSIDE the signer, taproot Schnorr HTLC);
+      ChannelSigner stays the in-process default constructed from the raw key
+      Buffers; signerFactory injectable via INodeConfig/IChannelManagerConfig;
+      zero behavior change, byte-identity pinned against pre-refactor vectors.
+      Deliberately synchronous (documented): remote implementations orchestrate
+      above the state machine; sync-to-async conversion noted as a follow-up.
+      Note: ChainMonitor sweep/justice paths still consume raw basepoint
+      secrets directly (separate surface, future work).
 - [?] mTLS / client certificates for the daemon. Decide priority.
 - [?] Key rotation strategy. Decide scope.
 - [ ] Leveled logging (debug/info/warn/error) with injectable logger, alongside the
@@ -258,8 +266,12 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #58 merged (scoped API auth) and v0.3.0 released (PR #59,
+  tag v0.3.0 at the multisig re-land point for npm publish). ISigner
+  remote-signer abstraction (this PR) is M6 item 2 of 3; leveled logging
+  follows.
 - 2026-07-10: PR #57 merged (multisig P2WSH re-land). M6 started with three
-  parallel branches: scoped API auth (this PR), ISigner remote-signer
+  parallel branches: scoped API auth (PR #58), ISigner remote-signer
   abstraction, and leveled logging.
 - 2026-07-10: multisig P2WSH re-landed (PR #57). PR #55 had merged with a red
   unit-test job through a merge-gate hole and was reverted in PR #56: its
