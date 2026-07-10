@@ -1302,8 +1302,10 @@ export class ChainMonitor {
 			this._paymentPrivkey,
 			this._htlcBasepointSecret,
 			// The reestablish-supplied point (kept for legacy completeness). The
-			// to_remote spend itself derives from our static payment basepoint,
-			// but the taproot resolver refuses to run without SOME point.
+			// to_remote spend itself derives from our static payment basepoint on
+			// every channel type - static_remotekey P2WPKH, anchor CSV-1 P2WSH,
+			// and the taproot 1-CSV leaf - so it also resolves on an SCB-recovery
+			// state where no point was ever learned.
 			this._channelState.dlpRemotePerCommitmentPoint ??
 				this._channelState.remoteCurrentPerCommitmentPoint ??
 				undefined

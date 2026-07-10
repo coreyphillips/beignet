@@ -42,6 +42,15 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       channel dataLossDetected + ERRORED (persist-first), sends a BOLT 1 error,
       refuses all local broadcasts (forceClose + stuck-channel timer), and sweeps
       only to_remote from the peer's THEIR_FUTURE_COMMITMENT via the chain monitor.
+- [~] Taproot to_remote sweep in SCB recovery (this PR): the taproot output
+      resolver bailed without remote basepoints or a per-commitment point, so a
+      restored simple-taproot channel tracked its to_remote but never swept it.
+      The taproot to_remote leaf pays our STATIC payment basepoint (like the
+      static_remotekey and anchor variants), so it now resolves with zero peer
+      key material; the full taproot key set is derived only for HTLC leaves.
+      No SCB format change needed (v1 entries already carry channelKeyIndex +
+      channelType). Proven live on regtest: open, SCB export, wipe, peer
+      MuSig2 force-close, restore, sweep confirms after the 1-block CSV.
 - [x] Restore API (PR #39, merged): daemon endpoint + CLI command that ingests a DB
       backup or SCB blob and starts recovery (previously restore was manual file
       placement; `POST /backup` had no counterpart).
@@ -281,6 +290,9 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #62 merged (regtest wtwire chain-hash fix + live LND tower
+  interop). Taproot SCB-recovery sweep (this PR) closes the M1 known
+  limitation; watchtower v1 taproot blobs in progress in a parallel worktree.
 - 2026-07-10: PR #61 merged (leveled logging), closing the buildable M6 items.
   Interop follow-ups (this PR): lncli verifymessage cross-check passed live in
   both directions vs LND v0.20 (beignet signature recovers our exact pubkey

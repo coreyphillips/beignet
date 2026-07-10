@@ -1675,18 +1675,28 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 	htlcBasepointSecret?: Buffer,
 	remotePerCommitmentPoint?: Buffer
 ): IResolvedOutput[] {
-	if (!state.remoteBasepoints) return [];
+	// Our to_remote on their commitment is a NUMS-internal-key P2TR whose single
+	// 1-CSV leaf pays our STATIC payment basepoint - it needs NO peer key
+	// material and NO per-commitment point, exactly like the static_remotekey /
+	// anchor variants. The full taproot key set (which requires the peer's
+	// basepoints and a per-commitment point) is only needed for the HTLC leaves,
+	// so derive it opportunistically: an SCB-recovery state (remoteBasepoints
+	// null, no point ever learned - THEIR_FUTURE_COMMITMENT) must still resolve
+	// the to_remote sweep instead of returning nothing.
 	const point =
 		remotePerCommitmentPoint || state.remoteCurrentPerCommitmentPoint;
-	if (!point) return [];
-	const keys = deriveTaprootCommitKeys(state, point, false);
-	const htlcPrivkey = htlcBasepointSecret
-		? derivePrivateKey(
-				htlcBasepointSecret,
-				point,
-				state.localBasepoints.htlcBasepoint
-		  )
-		: undefined;
+	const keys =
+		state.remoteBasepoints && point
+			? deriveTaprootCommitKeys(state, point, false)
+			: null;
+	const htlcPrivkey =
+		htlcBasepointSecret && point
+			? derivePrivateKey(
+					htlcBasepointSecret,
+					point,
+					state.localBasepoints.htlcBasepoint
+			  )
+			: undefined;
 	const resolved: IResolvedOutput[] = [];
 
 	const spendLeaf = (
@@ -1726,7 +1736,13 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 
 	for (const output of trackedOutputs) {
 		if (output.outputType === OutputType.TO_REMOTE) {
-			const tr = buildTaprootToRemoteOutput(keys.paymentPubkey);
+			// Static key: identical to keys.paymentPubkey when keys are derivable,
+			// but also available on an SCB-recovery state (paymentPrivkey is its
+			// secret in both cases - the monitor supplies the per-channel
+			// paymentBasepointSecret located by the SCB's channelKeyIndex).
+			const tr = buildTaprootToRemoteOutput(
+				state.localBasepoints.paymentBasepoint
+			);
 			const tx = spendLeaf(
 				output,
 				tr.output,
@@ -1747,7 +1763,11 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		} else if (output.outputType === OutputType.TO_LOCAL) {
 			// Their to_local — not ours unless revoked (handled elsewhere).
 			resolved.push({ trackedOutput: output });
-		} else if (output.outputType === OutputType.OFFERED_HTLC && htlcPrivkey) {
+		} else if (
+			output.outputType === OutputType.OFFERED_HTLC &&
+			htlcPrivkey &&
+			keys
+		) {
 			// Our offered = their received output → reclaim via the CLTV-timeout leaf.
 			const h = buildTaprootReceivedHtlcOutput(
 				keys.revocationPubkey,
@@ -1773,7 +1793,11 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				witness: tx.ins[0].witness,
 				cltvExpiry: output.cltvExpiry
 			});
-		} else if (output.outputType === OutputType.RECEIVED_HTLC && htlcPrivkey) {
+		} else if (
+			output.outputType === OutputType.RECEIVED_HTLC &&
+			htlcPrivkey &&
+			keys
+		) {
 			// Our received = their offered output → claim via the preimage success leaf.
 			const hashHex = output.paymentHash?.toString('hex');
 			const preimage = hashHex ? knownPreimages.get(hashHex) : undefined;
