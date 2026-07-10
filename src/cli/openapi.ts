@@ -4,8 +4,10 @@
  * Generated from daemon routes. Served at GET /openapi.json.
  */
 
+import { ROUTE_SCOPES } from './auth';
+
 export function getOpenApiSpec(): Record<string, unknown> {
-	return {
+	const spec: Record<string, unknown> = {
 		openapi: '3.0.3',
 		info: {
 			title: 'Beignet Lightning API',
@@ -16,6 +18,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 				'When provided, the response is cached for 24 hours — repeated requests with the same key and body return the cached response. ' +
 				'If the same key is reused with a different request body, a `409 IDEMPOTENCY_CONFLICT` error is returned.\n\n' +
 				'**TLS:** The daemon supports HTTPS when started with `--tls-cert` and `--tls-key` flags (or `BEIGNET_TLS_CERT`/`BEIGNET_TLS_KEY` env vars).\n\n' +
+				'**Scoped API keys:** Besides the legacy single `apiToken` (implicit admin scope), the `apiKeys` config defines named keys with `readonly`, `invoice`, and/or `admin` scopes. Each operation lists the scopes it accepts in `x-accepted-scopes`; unclassified routes are admin-only. Requests fail with 401 (bad/absent key) or 403 (valid key, insufficient scope).\n\n' +
 				'**Spending Limits:** Configure `dailySpendLimitSats` (or `BEIGNET_DAILY_SPEND_LIMIT_SATS` env var) to enforce a daily budget. Query `GET /spend-limit` for current usage.\n\n' +
 				'**Drain Mode:** `POST /stop` accepts `{ "drain": true }` to stop accepting new payments and wait for in-flight ones to settle before shutdown.'
 		},
@@ -2287,13 +2290,62 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						}
 					}
 				}
+			},
+			'/auth/keys': {
+				get: {
+					summary: 'List named API keys (admin scope; never returns secrets)',
+					tags: ['Auth'],
+					responses: {
+						'200': {
+							description: 'Key names with their scopes and revoked flag',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									keys: {
+										type: 'array',
+										items: {
+											type: 'object',
+											properties: {
+												name: { type: 'string' },
+												scopes: {
+													type: 'array',
+													items: {
+														type: 'string',
+														enum: ['readonly', 'invoice', 'admin']
+													}
+												},
+												revoked: { type: 'boolean' }
+											}
+										}
+									}
+								}
+							})
+						}
+					}
+				}
+			},
+			'/auth/keys/revoke': {
+				post: {
+					summary:
+						'Revoke a named API key for the lifetime of this daemon process (admin scope)',
+					description:
+						'Runtime revocation only: the durable mechanism is removing the key from the config file and restarting. The legacy apiToken has no name and cannot be revoked here.',
+					tags: ['Auth'],
+					requestBody: bodyContent({ name: 'string' }),
+					responses: {
+						'200': { description: 'Key revoked' },
+						'404': { description: 'No key with that name' }
+					}
+				}
 			}
 		},
 		components: {
 			securitySchemes: {
 				bearerAuth: {
 					type: 'http',
-					scheme: 'bearer'
+					scheme: 'bearer',
+					description:
+						'Legacy apiToken (implicit admin scope) or the secret of a named scoped API key from the apiKeys config. Routes advertise the scopes they accept via x-accepted-scopes; 401 = bad/absent key, 403 = valid key without a required scope.'
 				}
 			},
 			schemas: {
@@ -3333,6 +3385,23 @@ export function getOpenApiSpec(): Record<string, unknown> {
 		},
 		security: [{ bearerAuth: [] }]
 	};
+
+	// Annotate every documented operation with the API key scopes it accepts
+	// (from the daemon's route classification). Auth-exempt routes (security:
+	// []) have no entry in ROUTE_SCOPES and stay unannotated.
+	const paths = spec.paths as Record<string, Record<string, unknown>>;
+	for (const [routePath, operations] of Object.entries(paths)) {
+		for (const [method, operation] of Object.entries(operations)) {
+			const routeKey = `${method.toUpperCase()} ${routePath}`;
+			if (!(routeKey in ROUTE_SCOPES)) continue;
+			(operation as Record<string, unknown>)['x-accepted-scopes'] = [
+				...ROUTE_SCOPES[routeKey],
+				'admin'
+			];
+		}
+	}
+
+	return spec;
 }
 
 function jsonContent(schema: Record<string, unknown>): Record<string, unknown> {

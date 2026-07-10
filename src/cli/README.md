@@ -868,8 +868,9 @@ Error codes (`BeignetErrorCode` enum):
 | `INVALID_PARAMS` | Node | Missing or invalid request parameters |
 | `NOT_FOUND` | Node | Resource not found |
 | `BODY_TOO_LARGE` | Node | Request body exceeds 1MB |
-| `MNEMONIC_REQUIRES_AUTH` | Node | apiToken required for mnemonic access |
-| `UNAUTHORIZED` | Node | Invalid or missing auth token |
+| `MNEMONIC_REQUIRES_AUTH` | Node | apiToken or apiKeys required for mnemonic access |
+| `UNAUTHORIZED` | Node | Invalid or missing auth token / API key (HTTP 401) |
+| `FORBIDDEN` | Node | Valid API key without the scope a route requires (HTTP 403) |
 | `INSUFFICIENT_BALANCE` | Payments | Not enough balance to send |
 | `PEER_NOT_CONNECTED` | Peers | Peer is not connected |
 | `DUPLICATE_PAYMENT` | Payments | Payment with this hash already pending |
@@ -928,7 +929,18 @@ beignet stop
 Seed generation is CLI-only: `beignet init` creates the mnemonic (or you supply
 one via `BEIGNET_MNEMONIC`/config); the daemon never generates or replaces a
 seed. `GET /mnemonic` only reveals the configured seed, and only when
-`apiToken` is set.
+`apiToken` or `apiKeys` is set (admin scope).
+
+### API key management
+
+```bash
+beignet auth keys            # list named API keys (names + scopes, never secrets)
+beignet auth revoke <name>   # disable a named key in the running daemon
+```
+
+Any command accepts `--api-key <secret>` (alias of `--api-token`) or the
+`BEIGNET_API_KEY` env var to authenticate with a named key instead of the
+legacy token.
 
 ### Info
 
@@ -1336,6 +1348,11 @@ Every response follows this format:
   "daemonPort": 2112,
   "preferAnchors": true,
   "apiToken": "mysecrettoken",
+  "apiKeys": [
+    { "name": "monitor", "key": "readonlysecret", "scopes": ["readonly"] },
+    { "name": "shop", "key": "invoicesecret", "scopes": ["invoice", "readonly"] },
+    { "name": "ops", "key": "adminsecret", "scopes": ["admin"] }
+  ],
   "autoBootstrap": false,
   "backupPath": "/var/backups/beignet/node.db",
   "backupIntervalMs": 21600000,
@@ -1368,7 +1385,9 @@ Environment variables override the config file but are overridden by CLI flags.
 | `BEIGNET_DAEMON_HOST` | HTTP daemon bind address (default: `127.0.0.1`) |
 | `BEIGNET_DAEMON_PORT` | HTTP daemon port |
 | `BEIGNET_PREFER_ANCHORS` | `true` to prefer anchor channels |
-| `BEIGNET_API_TOKEN` | API authentication token (required for mnemonic access) |
+| `BEIGNET_API_TOKEN` | Legacy single API token (implicit admin scope) |
+| `BEIGNET_API_KEYS` | Named scoped API keys as a JSON array: `[{"name","key","scopes":["readonly"\|"invoice"\|"admin"]}]` |
+| `BEIGNET_API_KEY` | CLI-side only: bearer credential the CLI sends to the daemon (alias of `BEIGNET_API_TOKEN` for named-key secrets) |
 | `BEIGNET_AUTO_BOOTSTRAP` | `true` to auto-connect to DNS seed peers on start |
 | `BEIGNET_BACKUP_PATH` | Automated backup destination path |
 | `BEIGNET_BACKUP_INTERVAL_MS` | Backup interval in milliseconds (default: 21600000 = 6h) |
@@ -1403,12 +1422,32 @@ The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemon
 
 ### Authentication
 
-When `apiToken` is configured (via `--api-token`, `BEIGNET_API_TOKEN`, or config file), all endpoints require a `Authorization: Bearer <token>` header. Exceptions:
+Two kinds of credentials, usable together:
 
-- `GET /health` -- always accessible (for monitoring tools)
-- `GET /openapi.json` -- always accessible (for API discovery)
+- **Legacy single token** -- `apiToken` (via `--api-token`, `BEIGNET_API_TOKEN`, or config file). Backward compatible: it keeps working and carries an implicit `admin` scope.
+- **Named scoped keys** -- the `apiKeys` config array (or `BEIGNET_API_KEYS` env var as JSON): `[{ "name": "monitor", "key": "<secret>", "scopes": ["readonly"] }, ...]`. A key may hold multiple scopes.
 
-If no `apiToken` is configured, all endpoints are open (backward-compatible). `GET /mnemonic` is only accessible when `apiToken` is set.
+When any credential is configured, all endpoints require an `Authorization: Bearer <token-or-key-secret>` header. Exceptions (always accessible):
+
+- `GET /health`, `GET /ready` -- monitoring tools
+- `GET /openapi.json` -- API discovery
+- `GET /metrics` -- Prometheus scrapers
+
+If neither `apiToken` nor `apiKeys` is configured, all endpoints are open (backward-compatible). `GET /mnemonic` is only accessible when auth is configured (and only to `admin`).
+
+**Scopes:**
+
+| Scope | Grants |
+|-------|--------|
+| `readonly` | Every GET route (except `GET /mnemonic` and `GET /webhooks`) plus POSTs that are pure queries: estimate/validate/decode/verify and the wait endpoints. |
+| `invoice` | Receive-side routes: creating invoices/offers/hold invoices, settling/cancelling holds, `POST /address/new`, invoice/offer lookups and decoding, `GET /can-receive`, `POST /payment/wait`, and the `GET /events` SSE stream. |
+| `admin` | Everything, including paying/spending, channel and peer management, PSBTs, backups, webhooks management, `POST /stop`, and API key management. |
+
+Every route is explicitly classified in `src/cli/auth.ts` (`ROUTE_SCOPES`); a drift test fails the build if a new route ships without a classification, and unclassified routes fail closed (admin-only). Notable classifications: all webhook routes including `GET /webhooks` are admin-only (callback URLs can embed credentials; management is one unit); `POST /message/sign` is admin-only because it signs with the node identity key; `GET /events` (SSE) accepts `readonly` and `invoice`.
+
+Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSafeEqual`), for the legacy token too. Failures return **401** `UNAUTHORIZED` for a bad or missing key and **403** `FORBIDDEN` for a valid key without a required scope.
+
+**Revocation:** removing a key from the config file (and restarting) is the durable mechanism. A running daemon can also disable a named key immediately via `POST /auth/keys/revoke` (`beignet auth revoke <name>`, admin scope, in-memory until restart). The legacy `apiToken` has no name and can only be revoked via config change + restart.
 
 ### Endpoints
 
@@ -1526,6 +1565,8 @@ If no `apiToken` is configured, all endpoints are open (backward-compatible). `G
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
 | GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat) |
+| GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked flag (never secrets; admin scope) |
+| POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key until restart (admin scope; config removal is the durable revocation) |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)
@@ -1607,6 +1648,7 @@ src/cli/
   beignet-node.ts   -- Core wrapper class (most important file)
   config.ts         -- Config file + PID file management
   daemon.ts         -- HTTP daemon (http.createServer)
+  auth.ts           -- Scoped API keys: route->scope map, constant-time authenticator
   openapi.ts        -- OpenAPI 3.0 spec generator (served at GET /openapi.json)
   webhooks.ts       -- WebhookManager (register, dispatch, HMAC signing)
   payment-queue.ts  -- PaymentQueue (priority, concurrency, capacity-aware)
