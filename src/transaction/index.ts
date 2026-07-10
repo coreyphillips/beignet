@@ -241,7 +241,9 @@ export class Transaction {
 	private applyMultisigInputWeights(
 		param: TGetByteCountInputs
 	): TGetByteCountInputs {
-		const info = this._wallet.multisigInfo;
+		// autoCoinSelect must stay usable on a Transaction with no wallet
+		// attached, so tolerate an undefined wallet here.
+		const info = this._wallet?.multisigInfo;
 		if (!info) return param;
 		const record = param as Record<string, number>;
 		const count = record.P2WSH ?? record.p2wsh ?? 0;

@@ -156,10 +156,14 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       finalizing, no broadcast), wallet.broadcastTransaction; daemon /psbt/build,
       /psbt/import-signed, /psbt/combine + CLI psbt commands.
 - [x] PSBT combine for multi-party signing (PR #51, merged): combinePsbts.
-- [~] Multisig / P2WSH (this PR): Wallet.createMultisig, BIP 48 derivation,
+- [~] Multisig / P2WSH (this PR, re-land of PR #55 which merged with red CI and
+      was reverted in PR #56): Wallet.createMultisig, BIP 48 derivation,
       wsh(sortedmulti()) with BIP 67 ordering, watch-only coordinator support,
       spending exclusively via the PSBT flow with fail-closed threshold
-      enforcement, descriptor export with checksums. Library-only.
+      enforcement, descriptor export with checksums. Library-only. Re-land fixes
+      the coin-select regression (applyMultisigInputWeights assumed a wallet is
+      always attached; autoCoinSelect must work without one) and pins that
+      property with a regression test.
 (Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
 - [x] Fee estimation privacy (PR #53, merged): feeEstimationSource 'auto' (default,
       Electrum first) | 'electrum' (never HTTP) | 'http'; every remote rate
@@ -250,6 +254,13 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: multisig P2WSH re-landed (this PR). PR #55 had merged with a red
+  unit-test job through a merge-gate hole and was reverted in PR #56: its
+  applyMultisigInputWeights helper dereferenced the wallet unconditionally,
+  breaking autoCoinSelect on wallet-less Transaction instances (the six
+  deterministic coin-select tests). Re-land tolerates a missing wallet, adds a
+  regression test pinning wallet-less autoCoinSelect, and the merge gate is now
+  strict (>= 3 check lines, all pass, empty output blocks).
 - 2026-07-10: PR #54 merged (batch C). Multisig P2WSH (this PR) completes the
   active M5 items; also repairs README merge markers PR #54 shipped.
 - 2026-07-10: PR #53 merged (Electrum layer). Batch C (this PR): combined spend
