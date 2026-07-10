@@ -44,11 +44,17 @@ const electrumOptions = {
 const network = EAvailableNetworks.regtest;
 const testTimeout = 60000;
 
+// p2wsh is multisig-only and has no single-key descriptor.
+const SINGLE_SIG_TYPES = Object.values(EAddressType).filter(
+	(t) => t !== EAddressType.p2wsh
+);
+
 const PURPOSE: { [key in EAddressType]: string } = {
 	[EAddressType.p2pkh]: '44',
 	[EAddressType.p2sh]: '49',
 	[EAddressType.p2wpkh]: '84',
-	[EAddressType.p2tr]: '86'
+	[EAddressType.p2tr]: '86',
+	[EAddressType.p2wsh]: '48'
 };
 
 const wrapExpected = (addressType: EAddressType, keyExpr: string): string => {
@@ -61,6 +67,8 @@ const wrapExpected = (addressType: EAddressType, keyExpr: string): string => {
 			return `wpkh(${keyExpr})`;
 		case EAddressType.p2tr:
 			return `tr(${keyExpr})`;
+		case EAddressType.p2wsh:
+			return `wsh(${keyExpr})`;
 	}
 };
 
@@ -123,7 +131,7 @@ describe('Wallet.exportDescriptors', function () {
 		expect(info.account).to.equal(0);
 		expect(info.watchOnly).to.equal(false);
 		expect(info.descriptors).to.have.length(4);
-		for (const addressType of Object.values(EAddressType)) {
+		for (const addressType of SINGLE_SIG_TYPES) {
 			const entry = info.descriptors.find((d) => d.addressType === addressType);
 			expect(entry, `missing ${addressType}`).to.not.equal(undefined);
 			const purpose = PURPOSE[addressType];
