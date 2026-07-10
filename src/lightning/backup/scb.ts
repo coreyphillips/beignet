@@ -7,6 +7,15 @@
  * peer identity/addresses, the funding outpoint, and the key material locator
  * (channelKeyIndex) that flow needs.
  *
+ * This covers every channel type we run, INCLUDING simple taproot channels:
+ * the to_remote output always pays our STATIC payment basepoint
+ * (static_remotekey P2WPKH, anchor CSV-1 P2WSH, taproot NUMS+1-CSV leaf), and
+ * that basepoint's secret is re-derived from the seed via channelKeyIndex (or
+ * the node-level paymentBasepointSecret for legacy null-index channels) - so
+ * v1 entries carry everything a taproot recovery sweep needs and no format
+ * bump is required. channelType (hex) tells the restored state which to_remote
+ * variant to look for.
+ *
  * Encoding: 'beignet-scb-v1:' + base64(iv || authTag || ciphertext) where the
  * ciphertext is the JSON backup encrypted with AES-256-GCM under
  * HKDF-SHA256(seed, salt empty, info 'beignet-scb-v1').
