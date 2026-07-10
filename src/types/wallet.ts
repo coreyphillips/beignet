@@ -47,10 +47,8 @@ export enum EAddressType {
 	p2wpkh = 'p2wpkh',
 	p2sh = 'p2sh',
 	p2pkh = 'p2pkh',
-	p2tr = 'p2tr',
-	// Sorted-multisig P2WSH (BIP 48 script type 2). Only available on wallets
-	// created via Wallet.createMultisig; single-sig wallets reject it.
-	p2wsh = 'p2wsh'
+	p2tr = 'p2tr'
+	// p2wsh = 'p2wsh',
 }
 
 export enum EPaymentType {
@@ -248,9 +246,6 @@ export interface IWallet {
 	gapLimitOptions?: TGapLimitOptions;
 	addressLookBehind?: number;
 	addressLookAhead?: number;
-	// Sorted-multisig configuration. Prefer Wallet.createMultisig over
-	// passing this directly.
-	multisig?: IMultisigOptions;
 }
 
 export interface IAddressData {
@@ -522,26 +517,6 @@ export type IWatchOnlyWallet = Omit<
 > & {
 	xpub: string;
 };
-
-// Sorted-multisig (BIP 48 / BIP 67) wallet configuration.
-export interface IMultisigOptions {
-	// Signatures required to spend (m of n).
-	threshold: number;
-	// Account-level extended public keys (BIP 48 m/48'/coin'/account'/2')
-	// for the cosigners. SLIP-132 Zpub/Vpub encodings are normalized. When a
-	// mnemonic is provided, our own derived account xpub is added
-	// automatically if it is not already present.
-	cosigners: string[];
-	// Optional explicit statement of OUR account xpub. With a mnemonic it
-	// must match the derived key; provided without a mnemonic it is simply
-	// included as a cosigner.
-	ourXpub?: string;
-}
-
-// createMultisig params: a multisig wallet is always p2wsh and never uses a
-// single account xpub. Omitting the mnemonic creates a watch-only multisig.
-export type IMultisigWallet = Omit<IWallet, 'xpub' | 'addressType'> &
-	IMultisigOptions;
 
 export interface IBuildPsbtArgs {
 	txs?: ISendTx[];

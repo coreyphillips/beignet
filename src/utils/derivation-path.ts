@@ -47,18 +47,13 @@ export const getKeyDerivationPathObject = ({
 
 		const account = parsedPath[3] as TKeyDerivationAccount;
 
-		// BIP 48 paths carry a script-type level between account and change
-		// (m/48'/coin'/account'/2'/change/index). Only script type 2' (P2WSH
-		// sorted multisig) is supported, so the level stays implicit in the
-		// path object and is re-emitted by getKeyDerivationPathString.
-		const isBip48 = purpose === '48';
-		let change = parsedPath[isBip48 ? 5 : 4] as TKeyDerivationChange;
+		let change = parsedPath[4] as TKeyDerivationChange;
 		if (changeAddress !== undefined) {
 			change = changeAddress ? '1' : '0';
 		}
 
 		if (!index) {
-			index = parsedPath[isBip48 ? 6 : 5];
+			index = parsedPath[5];
 		}
 
 		return ok({
@@ -135,10 +130,8 @@ export const getKeyDerivationPathString = ({
 			index = String(index);
 		}
 
-		// BIP 48 re-inserts the script-type level (2' = P2WSH sorted multisig).
-		const scriptTypeSegment = path.purpose === '48' ? "2'/" : '';
 		return ok(
-			`m/${path.purpose}'/${path.coinType}'/${path.account}'/${scriptTypeSegment}${path.change}/${index}`
+			`m/${path.purpose}'/${path.coinType}'/${path.account}'/${path.change}/${index}`
 		);
 	} catch (e) {
 		return err(e);
@@ -164,8 +157,6 @@ export const getAddressTypeFromPath = (
 		switch (purpose) {
 			case '44':
 				return ok(EAddressType.p2pkh);
-			case '48':
-				return ok(EAddressType.p2wsh);
 			case '49':
 				return ok(EAddressType.p2sh);
 			case '84':

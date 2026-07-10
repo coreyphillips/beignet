@@ -122,7 +122,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       file + key prefix); boots load from disk and refresh incrementally. Note:
       dailySpendLimit remains LN-only by existing design; onchain routes mirror
       /send (no accounting) - flagged for a future decision.
-      DECIDED + implemented (PR #54, merged): combined LN+onchain daily budget; external
+      DECIDED + implemented (this PR): combined LN+onchain daily budget; external
       onchain sends count amount+fee (send, send-max), consolidate/channel
       funding/fee bumps excluded; /spend-limit gains a breakdown.
 - [x] sign/verify message with the node key (PR #47, merged): LND-compatible construction
@@ -156,10 +156,8 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       finalizing, no broadcast), wallet.broadcastTransaction; daemon /psbt/build,
       /psbt/import-signed, /psbt/combine + CLI psbt commands.
 - [x] PSBT combine for multi-party signing (PR #51, merged): combinePsbts.
-- [~] Multisig / P2WSH (this PR): Wallet.createMultisig, BIP 48 derivation,
-      wsh(sortedmulti()) with BIP 67 ordering, watch-only coordinator support,
-      spending exclusively via the PSBT flow with fail-closed threshold
-      enforcement, descriptor export with checksums. Library-only.
+- [ ] Multisig / P2WSH address type (enum entry currently commented out,
+      `types/wallet.ts:40`). Scope: descriptor-based multisig receive + spend.
 (Tor support for Electrum: DEFERRED by Corey 2026-07-10, moved to M7.)
 - [x] Fee estimation privacy (PR #53, merged): feeEstimationSource 'auto' (default,
       Electrum first) | 'electrum' (never HTTP) | 'http'; every remote rate
@@ -169,21 +167,21 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       for regtest); lightning reconnect monitor untouched.
 - [x] BIP21 URI generation (PR #53, merged): encodeBip21 + POST /address/new bip21
       option + CLI address --bip21.
-- [x] Public UTXO freeze/unfreeze API (PR #54, merged): freeze/unfreeze/listFrozen +
+- [~] Public UTXO freeze/unfreeze API (this PR): freeze/unfreeze/listFrozen +
       getBalanceBreakdown; ALSO fixes a live gap where the blacklist was only
       applied when the caller passed no explicit UTXO list.
-- [x] Per-address user labels (PR #54, merged): setAddressLabel/getAddressLabel/list +
+- [~] Per-address user labels (this PR): setAddressLabel/getAddressLabel/list +
       daemon/CLI; the legacy IAddressData.label field is untouched.
 - [x] Signet network support (PR #53, merged): full onchain + lightning (chain hash,
       coin type 1, daemon --network signet, default signet Electrum peer).
-- [x] Wallet birthday (PR #54, merged): validated, persisted, earliest-wins metadata
+- [~] Wallet birthday (this PR): validated, persisted, earliest-wins metadata
       exposed in descriptors. Candid finding: the Electrum protocol has no
       height-filtered scans, so nothing is boundable today; documented as
       forward-looking for bitcoind/compact-filter backends.
-- [x] Multi-account support (PR #54, merged): account option threaded through derivation
+- [~] Multi-account support (this PR): account option threaded through derivation
       and storage keys (account 0 keeps the legacy format); library-only, daemon
       stays single-account.
-- [x] Descriptor export (PR #54, merged): all four script types with BIP 380 checksums
+- [~] Descriptor export (this PR): all four script types with BIP 380 checksums
       validated against Bitcoin Core vectors; watch-only supported, no private
       key material ever emitted.
 - [?] Silent payments (BIP352) receive/send. Larger effort; decide priority.
@@ -250,8 +248,6 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
-- 2026-07-10: PR #54 merged (batch C). Multisig P2WSH (this PR) completes the
-  active M5 items; also repairs README merge markers PR #54 shipped.
 - 2026-07-10: PR #53 merged (Electrum layer). Batch C (this PR): combined spend
   limit per Corey, UTXO freeze (+ selection-gap fix), labels, birthday,
   multi-account, descriptor export. Multisig P2WSH next as its own PR.
