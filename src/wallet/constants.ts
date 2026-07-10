@@ -17,7 +17,8 @@ export const DUST_LIMITS = {
 	[EAddressType.p2pkh]: 546,
 	[EAddressType.p2sh]: 546,
 	[EAddressType.p2wpkh]: 294,
-	[EAddressType.p2tr]: 294
+	[EAddressType.p2tr]: 294,
+	[EAddressType.p2wsh]: 330
 };
 
 export const TRANSACTION_DEFAULTS = {

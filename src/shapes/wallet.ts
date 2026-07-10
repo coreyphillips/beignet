@@ -47,6 +47,15 @@ export const addressTypes: Readonly<TAddressTypes> = {
 		shortName: 'Taproot',
 		description: 'Taproot Address',
 		example: '(bc1px...)'
+	},
+	[EAddressType.p2wsh]: {
+		type: EAddressType.p2wsh,
+		// BIP 48, script type 2' = P2WSH sorted multisig.
+		path: "m/48'/0'/0'/2'/0/0",
+		name: 'Multisig Segwit P2WSH',
+		shortName: 'Multisig',
+		description: 'Pay-to-witness-script-hash sorted multisig',
+		example: '(bc1q... 62 chars)'
 	}
 };
 

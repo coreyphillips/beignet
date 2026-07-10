@@ -36,12 +36,23 @@ const EXTENDED_KEY_VERSIONS: {
 		mainnet: true,
 		addressType: EAddressType.p2wpkh
 	},
+	// SLIP-132 multisig P2WSH account keys (BIP 48 script type 2').
+	Zpub: {
+		version: 0x02aa7ed3,
+		mainnet: true,
+		addressType: EAddressType.p2wsh
+	},
 	tpub: { version: 0x043587cf, mainnet: false },
 	upub: { version: 0x044a5262, mainnet: false, addressType: EAddressType.p2sh },
 	vpub: {
 		version: 0x045f1cf6,
 		mainnet: false,
 		addressType: EAddressType.p2wpkh
+	},
+	Vpub: {
+		version: 0x02575483,
+		mainnet: false,
+		addressType: EAddressType.p2wsh
 	}
 };
 
@@ -65,7 +76,7 @@ export const parseExtendedPublicKey = (
 	try {
 		if (!extendedKey) return err('No extended public key provided.');
 		const prefix = extendedKey.slice(0, 4);
-		if (/^[xyztuv]prv$/.test(prefix)) {
+		if (/^[xyztuv]prv$/i.test(prefix)) {
 			return err(
 				'An extended PRIVATE key was provided. Watch-only wallets accept public keys only.'
 			);

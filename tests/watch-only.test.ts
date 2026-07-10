@@ -45,7 +45,9 @@ const ACCOUNT_PATHS: { [key in EAddressType]: string } = {
 	[EAddressType.p2pkh]: "m/44'/1'/0'",
 	[EAddressType.p2sh]: "m/49'/1'/0'",
 	[EAddressType.p2wpkh]: "m/84'/1'/0'",
-	[EAddressType.p2tr]: "m/86'/1'/0'"
+	[EAddressType.p2tr]: "m/86'/1'/0'",
+	// Multisig-only; single-xpub watch-only wallets reject it.
+	[EAddressType.p2wsh]: "m/48'/1'/0'/2'"
 };
 
 // SLIP-132 version bytes used to fabricate vpub/upub encodings in tests.

@@ -9,6 +9,7 @@ import {
 	IOutput,
 	ISendTransaction,
 	IUtxo,
+	TGetByteCountInputs,
 	TGetTotalFeeObj
 } from '../types';
 import { getDefaultSendTransaction } from '../shapes';
@@ -230,6 +231,29 @@ export class Transaction {
 	}
 
 	/**
+	 * Rewrites plain P2WSH input counts to the weight-accurate
+	 * MULTISIG-P2WSH:m-n key for multisig wallets. getByteCount has no
+	 * generic P2WSH input weight; without this the byte count is unusable.
+	 * @private
+	 * @param {TGetByteCountInputs} param
+	 * @returns {TGetByteCountInputs}
+	 */
+	private applyMultisigInputWeights(
+		param: TGetByteCountInputs
+	): TGetByteCountInputs {
+		const info = this._wallet.multisigInfo;
+		if (!info) return param;
+		const record = param as Record<string, number>;
+		const count = record.P2WSH ?? record.p2wsh ?? 0;
+		if (count > 0) {
+			delete record.P2WSH;
+			delete record.p2wsh;
+			record[`MULTISIG-P2WSH:${info.threshold}-${info.totalCosigners}`] = count;
+		}
+		return param;
+	}
+
+	/**
 	 * Attempt to estimate the current fee for a given transaction and its UTXO's
 	 * @param {number} [satsPerByte]
 	 * @param {string} [message]
@@ -283,7 +307,9 @@ export class Transaction {
 			}
 
 			//Determine the address type of each address and construct the object for fee calculation
-			const inputParam = constructByteCountParam(inputAddresses);
+			const inputParam = this.applyMultisigInputWeights(
+				constructByteCountParam(inputAddresses)
+			);
 			const outputParam = constructByteCountParam(outputAddresses);
 			//Increase P2WPKH output address by one for lightning funding calculation.
 			if (fundingLightning) {
@@ -376,7 +402,9 @@ export class Transaction {
 			}
 
 			//Determine the address type of each address and construct the object for fee calculation
-			const inputParam = constructByteCountParam(inputAddresses);
+			const inputParam = this.applyMultisigInputWeights(
+				constructByteCountParam(inputAddresses)
+			);
 			const outputParam = constructByteCountParam(outputAddresses, [
 				{ addrType: this._wallet.addressType, count: increaseAddressCount }
 			]);
@@ -699,6 +727,13 @@ export class Transaction {
 		//Add Inputs from inputs array
 		try {
 			for (const input of inputs) {
+				if (this._wallet.isMultisig) {
+					// Multisig inputs are built from the sortedmulti script, not a
+					// single key pair (watch-only multisig has no derivable key).
+					const addRes = await this.addInput({ psbt, input });
+					if (addRes.isErr()) return err(addRes.error.message);
+					continue;
+				}
 				let keyPair: BIP32Interface | ECPairInterface | undefined =
 					input?.keyPair;
 				if (!keyPair && input?.path) {
@@ -830,6 +865,19 @@ export class Transaction {
 		inputs: IUtxo[];
 	}): Result<string> {
 		try {
+			if (this._wallet.isMultisig) {
+				// Multisig inputs carry one bip32Derivation entry PER COSIGNER so
+				// every signer can locate its key.
+				inputs.forEach((input, index) => {
+					if (!input.path) return;
+					const paymentRes = this._wallet.getMultisigPayment(input.path);
+					if (paymentRes.isErr()) throw paymentRes.error;
+					psbt.updateInput(index, {
+						bip32Derivation: paymentRes.value.derivations
+					});
+				});
+				return ok('Signer metadata added.');
+			}
 			const masterFingerprint = this._wallet.getMasterFingerprint();
 			inputs.forEach((input, index) => {
 				// External inputs (e.g. swept keys) have no wallet path; an
@@ -894,6 +942,33 @@ export class Transaction {
 			// Use the provided input keyPair if available.
 			if (input?.keyPair) {
 				keyPair = input.keyPair;
+			}
+
+			if (type === 'p2wsh') {
+				// Sorted-multisig input: the witnessScript comes from the wallet's
+				// multisig configuration, keyed by the input's BIP 48 path.
+				const paymentRes = this._wallet.getMultisigPayment(input.path);
+				if (paymentRes.isErr()) return err(paymentRes.error.message);
+				const { address, output, witnessScript } = paymentRes.value;
+				if (address !== input.address) {
+					return err(
+						`Multisig script for path ${input.path} does not produce address ${input.address}.`
+					);
+				}
+				psbt.addInput({
+					hash: input.tx_hash,
+					index: input.tx_pos,
+					witnessUtxo: {
+						script: output,
+						value: input.value
+					},
+					witnessScript
+				});
+				return ok('Success');
+			}
+
+			if (!keyPair) {
+				return err('Unable to derive keyPair.');
 			}
 
 			if (type === 'p2wpkh') {
@@ -1669,7 +1744,7 @@ export class Transaction {
 			});
 
 			let baseFee = getByteCount(
-				addressTypes.inputs,
+				this.applyMultisigInputWeights(addressTypes.inputs),
 				addressTypes.outputs,
 				message
 			);
