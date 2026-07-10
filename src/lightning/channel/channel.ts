@@ -2018,13 +2018,12 @@ export class Channel {
 	/**
 	 * Cache the remote commitment tx we just signed, keyed by its per-commitment
 	 * point, mirroring the manager's build (remoteNextPerCommitmentPoint, number
-	 * +1). Taproot commitments use a different (v1) justice encoding that is not
-	 * yet packed, so they are skipped. Never throws: a cache miss only forfeits a
-	 * pre-emptive tower ship, it must not break commitment signing.
+	 * +1). Taproot commitments are cached too: they feed the version-1 (schnorr)
+	 * justice kit. Never throws: a cache miss only forfeits a pre-emptive tower
+	 * ship, it must not break commitment signing.
 	 */
 	private _cacheRemoteCommitmentForWatchtower(): void {
 		try {
-			if (isTaprootChannel(this._state.channelType)) return;
 			if (!this._state.remoteBasepoints || !this._state.fundingTxid) return;
 			const point =
 				this._state.remoteNextPerCommitmentPoint ||

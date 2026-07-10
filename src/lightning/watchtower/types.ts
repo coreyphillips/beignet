@@ -28,8 +28,16 @@ export interface ITowerTransport extends EventEmitter {
 	isConnected(): boolean;
 }
 
-/** Factory so the client can be tested against a fake transport. */
-export type TowerTransportFactory = (addr: ITowerAddress) => ITowerTransport;
+/**
+ * Factory so the client can be tested against a fake transport. `transportKey`
+ * is the Noise private key the connection must authenticate with: LND towers
+ * key each session to the CONNECTION's pubkey (wtdb.NewSessionIDFromPubKey),
+ * so per-blob-type sessions each dial with their own session key.
+ */
+export type TowerTransportFactory = (
+	addr: ITowerAddress,
+	transportKey?: Buffer
+) => ITowerTransport;
 
 /** Persisted per-tower session state. */
 export interface IWatchtowerSession {
@@ -47,12 +55,21 @@ export interface IWatchtowerSession {
 	/** Tower's last-applied sequence (from replies). */
 	lastApplied: number;
 	createdAt: number;
+	/**
+	 * True when the tower-side session is keyed to the stored session key (the
+	 * connection dials with it). Sessions persisted before per-blob-type support
+	 * were negotiated over the node-identity connection, so they reconnect with
+	 * the node key (false / absent).
+	 */
+	dialsWithSessionKey?: boolean;
 }
 
 /** A pending (or shipped-but-unacked) state update for the retry backlog. */
 export interface IWatchtowerUpdate {
 	towerUri: string;
 	channelId: string;
+	/** blob.Type the kit was built for; ships only through a matching session. */
+	blobType: number;
 	/** 16-byte breach hint, hex. */
 	hint: string;
 	/** Encrypted justice blob, hex (encrypted at rest via ENCRYPTED_COLUMNS). */

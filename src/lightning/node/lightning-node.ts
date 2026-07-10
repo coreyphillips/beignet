@@ -2265,6 +2265,8 @@ export class LightningNode extends EventEmitter {
 				remoteDelayedBasepoint: state.remoteBasepoints.delayedPaymentBasepoint,
 				toSelfDelay: state.localConfig.toSelfDelay,
 				isAnchor: isAnchorChannel(state.channelType),
+				// Taproot selects the v1 (schnorr) justice kit + taproot blob type.
+				isTaproot: isTaprootChannel(state.channelType),
 				localPaymentPubkey: state.localBasepoints.paymentBasepoint,
 				paymentBasepointSecret,
 				sweepScript: this.getSweepDestinationScript(),

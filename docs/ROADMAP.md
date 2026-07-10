@@ -42,7 +42,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       channel dataLossDetected + ERRORED (persist-first), sends a BOLT 1 error,
       refuses all local broadcasts (forceClose + stuck-channel timer), and sweeps
       only to_remote from the peer's THEIR_FUTURE_COMMITMENT via the chain monitor.
-- [~] Taproot to_remote sweep in SCB recovery (this PR): the taproot output
+- [x] Taproot to_remote sweep in SCB recovery (PR #63, merged): the taproot output
       resolver bailed without remote basepoints or a per-commitment point, so a
       restored simple-taproot channel tracked its to_remote but never swept it.
       The taproot to_remote leaf pays our STATIC payment basepoint (like the
@@ -77,7 +77,20 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       per-session Noise keys, persisted sessions + un-acked backlog with retry,
       config watchtowers[] URIs. Deferred + documented: anchor to_remote and
       taproot (v1 blob) coverage, reward sessions.
-- [x] Live LND tower interop (this PR): session negotiation, real
+- [~] Anchor + taproot tower coverage (this PR): LND v1 (taproot) justice kits
+      (300-byte plaintext pinned byte-exact to LND justice_kit_packet.go, same
+      XChaCha20 envelope), tower-side reconstruction cross-checked against a
+      REAL revoked taproot commitment. FIXES a fund-safety gap: anchor blobs
+      previously shipped under the legacy session type with the anchor
+      to_local weight, so an LND tower's reconstructed sweep value differed
+      and the signature could never verify (anchor breaches unpunishable);
+      anchor backups now negotiate blob-type-6 sessions and pack the P2WSH
+      1-CSV to_remote. Per-blob-type session slots per tower (own session
+      keys, graceful REJECT_BLOB_TYPE queueing, MAX_UPDATES rotation), schema
+      v9 (blob_type on updates, session-key dialing flag). Live vs LND v0.20:
+      6/6 including anchor and taproot sessions acked (LND v0.20 accepts blob
+      type 10). Reward sessions remain out of scope.
+- [x] Live LND tower interop (PR #62, merged): session negotiation, real
       revoked-commitment backups acked with advancing sequence numbers, and
       per-identity sessions validated against a real LND v0.20 altruist tower
       (docker lnd now runs --watchtower.active on 9911;
@@ -290,8 +303,13 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #63 merged (taproot SCB-recovery sweep). Anchor + taproot
+  tower coverage (this PR) closes the last queued interop follow-up and fixes
+  the anchor-blob session-type fund-safety gap; only [?] decision items remain
+  on the roadmap (mTLS, key rotation, silent payments, payjoin, alternate
+  chain backends, watchtower server mode).
 - 2026-07-10: PR #62 merged (regtest wtwire chain-hash fix + live LND tower
-  interop). Taproot SCB-recovery sweep (this PR) closes the M1 known
+  interop). Taproot SCB-recovery sweep (PR #63) closes the M1 known
   limitation; watchtower v1 taproot blobs in progress in a parallel worktree.
 - 2026-07-10: PR #61 merged (leveled logging), closing the buildable M6 items.
   Interop follow-ups (this PR): lncli verifymessage cross-check passed live in

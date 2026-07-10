@@ -126,7 +126,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 8;
+	static readonly CURRENT_SCHEMA_VERSION = 9;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -379,7 +379,8 @@ export class SqliteStorage implements IStorageBackend {
 				sweep_fee_rate TEXT NOT NULL,
 				seq_num INTEGER NOT NULL,
 				last_applied INTEGER NOT NULL,
-				created_at INTEGER NOT NULL
+				created_at INTEGER NOT NULL,
+				dials_with_session_key INTEGER NOT NULL DEFAULT 0
 			);
 			CREATE INDEX IF NOT EXISTS idx_watchtower_sessions_tower ON watchtower_sessions(tower_uri);
 
@@ -391,7 +392,8 @@ export class SqliteStorage implements IStorageBackend {
 				encrypted_blob TEXT NOT NULL,
 				seq_num INTEGER NOT NULL,
 				acked INTEGER NOT NULL,
-				created_at INTEGER NOT NULL
+				created_at INTEGER NOT NULL,
+				blob_type INTEGER NOT NULL DEFAULT 2
 			);
 			CREATE INDEX IF NOT EXISTS idx_watchtower_updates_pending ON watchtower_updates(tower_uri, acked);
 
@@ -1120,6 +1122,28 @@ export class SqliteStorage implements IStorageBackend {
 			// key is set.
 			(): void => {
 				// No-op
+			},
+			// Migration 8->9: per-blob-type watchtower sessions.
+			// watchtower_updates.blob_type routes each update to a session of the
+			// matching type; pre-existing rows default to 2 (ALTRUIST_COMMIT), the
+			// only type old clients ever negotiated. watchtower_sessions.
+			// dials_with_session_key records which Noise key the tower keyed the
+			// session to; pre-existing rows used the node identity key (0).
+			(db): void => {
+				try {
+					db.exec(
+						'ALTER TABLE watchtower_updates ADD COLUMN blob_type INTEGER NOT NULL DEFAULT 2'
+					);
+				} catch {
+					// Column may already exist (fresh DBs create it in _createTables)
+				}
+				try {
+					db.exec(
+						'ALTER TABLE watchtower_sessions ADD COLUMN dials_with_session_key INTEGER NOT NULL DEFAULT 0'
+					);
+				} catch {
+					// Column may already exist
+				}
 			}
 		];
 
@@ -1256,8 +1280,9 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				`INSERT OR REPLACE INTO watchtower_sessions
 					(session_id, tower_uri, tower_pubkey, session_key, blob_type,
-					 max_updates, sweep_fee_rate, seq_num, last_applied, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+					 max_updates, sweep_fee_rate, seq_num, last_applied, created_at,
+					 dials_with_session_key)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 			)
 			.run(
 				session.sessionId,
@@ -1269,7 +1294,8 @@ export class SqliteStorage implements IStorageBackend {
 				session.sweepFeeRate,
 				session.seqNum,
 				session.lastApplied,
-				session.createdAt
+				session.createdAt,
+				session.dialsWithSessionKey ? 1 : 0
 			);
 	}
 
@@ -1287,7 +1313,8 @@ export class SqliteStorage implements IStorageBackend {
 			sweepFeeRate: r.sweep_fee_rate as string,
 			seqNum: r.seq_num as number,
 			lastApplied: r.last_applied as number,
-			createdAt: r.created_at as number
+			createdAt: r.created_at as number,
+			dialsWithSessionKey: (r.dials_with_session_key as number) === 1
 		}));
 	}
 
@@ -1318,8 +1345,9 @@ export class SqliteStorage implements IStorageBackend {
 		const info = this.db
 			.prepare(
 				`INSERT INTO watchtower_updates
-					(tower_uri, channel_id, hint, encrypted_blob, seq_num, acked, created_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+					(tower_uri, channel_id, hint, encrypted_blob, seq_num, acked,
+					 created_at, blob_type)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 			)
 			.run(
 				update.towerUri,
@@ -1328,7 +1356,8 @@ export class SqliteStorage implements IStorageBackend {
 				this._enc(update.encryptedBlob),
 				update.seqNum,
 				update.acked ? 1 : 0,
-				update.createdAt
+				update.createdAt,
+				update.blobType
 			);
 		return Number(info.lastInsertRowid);
 	}
@@ -1343,6 +1372,7 @@ export class SqliteStorage implements IStorageBackend {
 			id: r.id as number,
 			towerUri: r.tower_uri as string,
 			channelId: r.channel_id as string,
+			blobType: r.blob_type as number,
 			hint: r.hint as string,
 			encryptedBlob: this._dec(r.encrypted_blob as string),
 			seqNum: r.seq_num as number,

@@ -3,7 +3,7 @@
  *
  * BeignetNode wires a TStorage adapter (src/cli/wallet-storage.ts) into
  * Wallet.create so IWalletData persists in the node's SQLite DB (wallet_data
- * table, schema v8). Rows are encrypted at rest when storageEncryption is on
+ * table, added in schema v8). Rows are encrypted at rest when storageEncryption is on
  * (the default) and plaintext when it is off. A rebooted node must reload
  * wallet state from disk without Electrum.
  *
@@ -69,8 +69,9 @@ function readWalletRows(dbPath: string): Array<{ key: string; value: string }> {
 describe('Daemon on-chain wallet persistence', function () {
 	this.timeout(180_000);
 
-	it('SqliteStorage schema version is 8', () => {
-		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(8);
+	it('SqliteStorage schema version is 9', () => {
+		// v9 added per-blob-type watchtower session columns.
+		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(9);
 	});
 
 	describe('encrypted mode (default)', () => {
@@ -120,13 +121,13 @@ describe('Daemon on-chain wallet persistence', function () {
 			expect(raw.includes(markerUtxo.address)).to.equal(false);
 		});
 
-		it('recorded schema version is 8', () => {
+		it('recorded schema version is 9', () => {
 			const db = new Database(dbPath, { readonly: true });
 			try {
 				const row = db
 					.prepare('SELECT MAX(version) as v FROM schema_version')
 					.get() as { v: number };
-				expect(row.v).to.equal(8);
+				expect(row.v).to.equal(9);
 			} finally {
 				db.close();
 			}
