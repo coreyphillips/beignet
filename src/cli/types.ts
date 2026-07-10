@@ -301,6 +301,9 @@ export interface BeignetConfig {
 	announceAddresses?: string[];
 	/** Watchtowers to ship justice data to, as "pubkey@host:port" URIs. */
 	watchtowers?: string[];
+	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
+	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
+	htlcEvents?: boolean;
 }
 
 export interface HealthInfo {
@@ -640,8 +643,31 @@ export interface BeignetNodeEvents {
 		nextRetryMs: number;
 		error: string;
 	}) => void;
+	'invoice:settled': (data: {
+		paymentHash: string;
+		bolt11: string;
+		amountSats: number;
+	}) => void;
+	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
+	'channel:pending-close': (data: {
+		channelId: string;
+		initiator: 'local' | 'remote';
+	}) => void;
+	'channel:force-closing': (data: {
+		channelId: string;
+		initiator: 'local' | 'remote';
+	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
+	'htlc:forwarded': (data: {
+		inChannelId: string;
+		outChannelId: string;
+		amountInMsat: string;
+		amountOutMsat: string;
+		feeMsat: string;
+	}) => void;
+	'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
+	'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
 	'peer:connect': (data: { pubkey: string }) => void;
 	'peer:disconnect': (data: { pubkey: string }) => void;
 	'peer:error': (data: { pubkey: string; message: string }) => void;

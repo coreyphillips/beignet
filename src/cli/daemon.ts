@@ -26,6 +26,9 @@ export interface DaemonOptions extends BeignetNodeOptions {
 	tlsCert?: string;
 	/** Path to TLS private key file (PEM). Required when tlsCert is set. */
 	tlsKey?: string;
+	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
+	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
+	htlcEvents?: boolean;
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
@@ -120,6 +123,31 @@ const AUTH_EXEMPT_ROUTES = new Set([
 	'GET /openapi.json',
 	'GET /metrics'
 ]);
+
+/**
+ * Node events relayed to SSE clients and webhooks. Per-HTLC events are opt-in
+ * via htlcEvents because routing nodes generate one event per HTLC.
+ */
+export function getRelayedEvents(htlcEvents?: boolean): string[] {
+	const events = [
+		'payment:received',
+		'payment:sent',
+		'payment:failed',
+		'invoice:settled',
+		'channel:opening',
+		'channel:ready',
+		'channel:pending-close',
+		'channel:force-closing',
+		'channel:closed',
+		'peer:connect',
+		'peer:disconnect',
+		'node:ready'
+	];
+	if (htlcEvents === true) {
+		events.push('htlc:forwarded', 'htlc:fulfilled', 'htlc:failed');
+	}
+	return events;
+}
 
 export async function startDaemon(
 	opts: DaemonOptions
@@ -1455,16 +1483,7 @@ export async function startDaemon(
 	}
 
 	// Wire up SSE events from BeignetNode (already JSON-safe types)
-	const sseEvents = [
-		'payment:received',
-		'payment:sent',
-		'payment:failed',
-		'channel:ready',
-		'channel:closed',
-		'peer:connect',
-		'peer:disconnect',
-		'node:ready'
-	] as const;
+	const sseEvents = getRelayedEvents(opts.htlcEvents);
 	for (const eventName of sseEvents) {
 		node.on(eventName, (data: unknown) => {
 			if (sseClients.size === 0) return;

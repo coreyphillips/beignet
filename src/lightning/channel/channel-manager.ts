@@ -198,7 +198,10 @@ export interface IChannelManagerConfig {
  *
  * Events:
  * - 'channel:opened' (channelId: Buffer)
+ * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
  * - 'channel:ready' (channelId: Buffer)
+ * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
+ * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:closed' (channelId: Buffer)
  * - 'htlc:forwarded' (channelId: Buffer, htlcId: bigint, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:fulfilled' (channelId: Buffer, htlcId: bigint, preimage: Buffer)
@@ -908,6 +911,7 @@ export class ChannelManager extends EventEmitter {
 				error: (errorAction as { message: string }).message
 			};
 		}
+		this.emit('channel:pending-close', channelId, 'local');
 		return { ok: true, actions };
 	}
 
@@ -1232,6 +1236,7 @@ export class ChannelManager extends EventEmitter {
 		if (peerPubkey) {
 			this.processActions(peerPubkey, channel, actions);
 		}
+		this.emit('channel:force-closing', channelId, 'local');
 
 		// Create a ChainMonitor for this channel, signing with the channel's own
 		// per-channel keys when present (falling back to node-level base secrets).
@@ -1330,6 +1335,15 @@ export class ChannelManager extends EventEmitter {
 				const isCoop =
 					broadcast.commitmentType === CommitmentType.COOPERATIVE_CLOSE;
 				if (channel.markClosedOnChain(!isCoop)) {
+					// A non-coop spend of a channel we did not already force-close
+					// is the peer's unilateral close (current, future, or revoked
+					// commitment). Our own broadcast emits at forceClose() time.
+					if (
+						!isCoop &&
+						broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
+					) {
+						this.emit('channel:force-closing', channelId, 'remote');
+					}
 					this.emit('channel:closed', channelId);
 				}
 			}
@@ -1966,8 +1980,21 @@ export class ChannelManager extends EventEmitter {
 
 		// Derive default P2WPKH shutdown script from local funding pubkey
 		const defaultScript = this.getDefaultShutdownScript();
+		// A shutdown for a channel not already closing means the PEER initiated
+		// the coop close (a reply to OUR shutdown arrives in SHUTTING_DOWN).
+		const wasClosing =
+			channel.getState() === ChannelState.SHUTTING_DOWN ||
+			channel.getState() === ChannelState.NEGOTIATING_CLOSING;
 		const actions = channel.handleShutdown(msg, defaultScript);
 		this.processActions(peerPubkey, channel, actions);
+		if (
+			!wasClosing &&
+			(channel.getState() === ChannelState.SHUTTING_DOWN ||
+				channel.getState() === ChannelState.NEGOTIATING_CLOSING ||
+				channel.getState() === ChannelState.CLOSED)
+		) {
+			this.emit('channel:pending-close', msg.channelId, 'remote');
+		}
 
 		if (channel.getState() !== ChannelState.NEGOTIATING_CLOSING) return;
 
@@ -3761,6 +3788,15 @@ export class ChannelManager extends EventEmitter {
 						action.fundingOutputIndex,
 						action.minimumDepth
 					);
+					// A splice re-watches a NEW funding outpoint on an existing
+					// channel; only a first-time funding watch means "opening".
+					if (channel.getState() !== ChannelState.SPLICING) {
+						this.emit(
+							'channel:opening',
+							channel.getChannelId() || channel.getTemporaryChannelId(),
+							action.fundingTxid
+						);
+					}
 					break;
 				case ChannelActionType.BROADCAST_TX:
 					this.emit('broadcast:tx', action.tx);

@@ -866,6 +866,100 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('channel:resolved', () => {
 			this.refreshStaticChannelBackup();
 		});
+		this.node.on(
+			'channel:opening',
+			(data: { channelId: Buffer; fundingTxid: Buffer }) => {
+				const channelId = data.channelId.toString('hex');
+				const fundingTxid = data.fundingTxid.toString('hex');
+				this.log('info', 'Channel opening', { channelId, fundingTxid });
+				this.emit('channel:opening', { channelId, fundingTxid });
+			}
+		);
+		this.node.on(
+			'channel:pending-close',
+			(data: { channelId: Buffer; initiator: 'local' | 'remote' }) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('info', 'Channel pending close', {
+					channelId,
+					initiator: data.initiator
+				});
+				this.emit('channel:pending-close', {
+					channelId,
+					initiator: data.initiator
+				});
+			}
+		);
+		this.node.on(
+			'channel:force-closing',
+			(data: { channelId: Buffer; initiator: 'local' | 'remote' }) => {
+				const channelId = data.channelId.toString('hex');
+				this.log('warn', 'Channel force-closing', {
+					channelId,
+					initiator: data.initiator
+				});
+				this.emit('channel:force-closing', {
+					channelId,
+					initiator: data.initiator
+				});
+			}
+		);
+
+		// Invoice settled: an invoice WE issued was paid (keysend receives fire
+		// only payment:received).
+		this.node.on(
+			'invoice:settled',
+			(data: { paymentHash: Buffer; bolt11: string; amountMsat: bigint }) => {
+				const info = {
+					paymentHash: data.paymentHash.toString('hex'),
+					bolt11: data.bolt11,
+					amountSats: Number(data.amountMsat / 1000n)
+				};
+				this.log('info', 'Invoice settled', {
+					paymentHash: info.paymentHash,
+					amountSats: info.amountSats
+				});
+				this.emit('invoice:settled', info);
+			}
+		);
+
+		// HTLC-level events (high volume; the daemon only exposes these over
+		// SSE/webhooks when htlcEvents is enabled).
+		this.node.on(
+			'htlc:forwarded',
+			(data: {
+				inChannelId: Buffer;
+				outChannelId: Buffer;
+				amountInMsat: bigint;
+				amountOutMsat: bigint;
+				feeMsat: bigint;
+			}) => {
+				this.emit('htlc:forwarded', {
+					inChannelId: data.inChannelId.toString('hex'),
+					outChannelId: data.outChannelId.toString('hex'),
+					amountInMsat: data.amountInMsat.toString(),
+					amountOutMsat: data.amountOutMsat.toString(),
+					feeMsat: data.feeMsat.toString()
+				});
+			}
+		);
+		this.node.on(
+			'htlc:fulfilled',
+			(data: { channelId: Buffer; htlcId: bigint }) => {
+				this.emit('htlc:fulfilled', {
+					channelId: data.channelId.toString('hex'),
+					htlcId: data.htlcId.toString()
+				});
+			}
+		);
+		this.node.on(
+			'htlc:failed',
+			(data: { channelId: Buffer; htlcId: bigint }) => {
+				this.emit('htlc:failed', {
+					channelId: data.channelId.toString('hex'),
+					htlcId: data.htlcId.toString()
+				});
+			}
+		);
 
 		// Forward peer events
 		this.node.on('peer:connect', (pubkey: string) => {

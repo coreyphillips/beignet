@@ -192,6 +192,8 @@ async function main(): Promise<void> {
 			return handleInvoice();
 		case 'payment':
 			return handlePayment();
+		case 'keysend':
+			return handleKeysend();
 		case 'forwards':
 			return handleForwards();
 		case 'graph':
@@ -224,6 +226,8 @@ async function main(): Promise<void> {
 			return handleOffer();
 		case 'health':
 			return outputResult(await httpRequest('GET', '/health'));
+		case 'ready':
+			return outputResult(await httpRequest('GET', '/ready'));
 		case 'readiness':
 			return outputResult(await httpRequest('GET', '/readiness'));
 		case 'metrics':
@@ -235,6 +239,38 @@ async function main(): Promise<void> {
 					filteredArgs[1] ? `/stats?window=${filteredArgs[1]}` : '/stats'
 				)
 			);
+		case 'liquidity':
+			return outputResult(await httpRequest('GET', '/liquidity'));
+		case 'fees':
+			return outputResult(await httpRequest('GET', '/fees'));
+		case 'spend-limit':
+			return outputResult(await httpRequest('GET', '/spend-limit'));
+		case 'logs':
+			return handleLogs();
+		case 'can-send':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/can-send?amountSats=${encodeURIComponent(filteredArgs[1] || '0')}`
+				)
+			);
+		case 'can-receive':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/can-receive?amountSats=${encodeURIComponent(
+						filteredArgs[1] || '0'
+					)}`
+				)
+			);
+		case 'wallet':
+			return handleWallet();
+		case 'node':
+			return handleNode();
+		case 'webhooks':
+			return handleWebhooks();
+		case 'queue':
+			return handleQueue();
 		case 'backup':
 			return handleBackup();
 		case 'restore':
@@ -307,6 +343,7 @@ async function handleStart(): Promise<void> {
 	if (hostFlag) cliFlags.daemonHost = hostFlag;
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
 	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
+	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
 	const backupPathFlag = parseFlag('--backup-path');
@@ -373,7 +410,8 @@ async function handleStart(): Promise<void> {
 			tlsKey: config.tlsKey,
 			torProxy: config.torProxy,
 			announceAddresses: config.announceAddresses,
-			watchtowers: config.watchtowers
+			watchtowers: config.watchtowers,
+			htlcEvents: config.htlcEvents
 		});
 
 		writePidFile(process.pid, daemonPort);
@@ -572,6 +610,81 @@ async function handleChannel(): Promise<void> {
 					)}`
 				)
 			);
+		case 'health':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/health?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'policy':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/channel/policy?channelId=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'suggestions':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					filteredArgs[2]
+						? `/channel/suggestions?count=${encodeURIComponent(
+								filteredArgs[2]
+						  )}`
+						: '/channel/suggestions'
+				)
+			);
+		case 'ready':
+			return outputResult(await httpRequest('GET', '/channels/ready'));
+		case 'connect-and-open':
+			return outputResult(
+				await httpRequest('POST', '/channel/connect-and-open', {
+					pubkey: filteredArgs[2],
+					host: filteredArgs[3],
+					port: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					amountSats: filteredArgs[5]
+						? parseInt(filteredArgs[5], 10)
+						: undefined,
+					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined
+				})
+			);
+		case 'open-and-wait': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/channel/open-and-wait', {
+					pubkey: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		case 'wait-ready': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/channel/wait-ready', {
+					channelId: filteredArgs[2],
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		// COMMITMENT feerate (BOLT 2 update_fee), not the routing fee policy.
+		case 'update-commitment-feerate':
+			return outputResult(
+				await httpRequest('POST', '/channel/update-commitment-feerate', {
+					channelId: filteredArgs[2],
+					feeratePerKw: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
 		case 'update-policy': {
 			const target = filteredArgs[2];
 			if (!target) {
@@ -610,7 +723,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|diagnostics|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -675,10 +788,53 @@ async function handleInvoice(): Promise<void> {
 					bolt11: filteredArgs[2]
 				})
 			);
+		case 'validate':
+			return outputResult(
+				await httpRequest('POST', '/invoice/validate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'get':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/invoice?paymentHash=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
 		case 'pay':
 			return outputResult(
 				await httpRequest('POST', '/invoice/pay', {
 					bolt11: filteredArgs[2]
+				})
+			);
+		case 'pay-safe':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-safe', {
+					bolt11: filteredArgs[2],
+					maxFeeSats: parseFlag('--max-fee')
+						? parseInt(parseFlag('--max-fee')!, 10)
+						: undefined,
+					amountSats: parseFlag('--amount')
+						? parseInt(parseFlag('--amount')!, 10)
+						: undefined,
+					timeoutMs: parseFlag('--timeout')
+						? parseInt(parseFlag('--timeout')!, 10)
+						: undefined
+				})
+			);
+		case 'pay-async':
+			return outputResult(
+				await httpRequest('POST', '/invoice/pay-async', {
+					bolt11: filteredArgs[2],
+					maxFeeSats: parseFlag('--max-fee')
+						? parseInt(parseFlag('--max-fee')!, 10)
+						: undefined,
+					amountSats: parseFlag('--amount')
+						? parseInt(parseFlag('--amount')!, 10)
+						: undefined
 				})
 			);
 		case 'pay-retry':
@@ -704,7 +860,7 @@ async function handleInvoice(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet invoice [create|create-hold|settle-hold|cancel-hold|held|decode|pay|pay-retry|list]'
+						'Usage: beignet invoice [create|create-hold|settle-hold|cancel-hold|held|decode|validate|get|pay|pay-safe|pay-async|pay-retry|list]'
 				}
 			});
 			process.exitCode = 1;
@@ -782,12 +938,285 @@ async function handlePayment(): Promise<void> {
 				})
 			);
 		}
+		case 'cancel':
+			return outputResult(
+				await httpRequest('POST', '/payment/cancel', {
+					paymentHash: filteredArgs[2]
+				})
+			);
+		case 'wait': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/payment/wait', {
+					paymentHash: filteredArgs[2],
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		case 'proof':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/payment/proof?paymentHash=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'verify-proof':
+			return outputResult(
+				await httpRequest(
+					'GET',
+					`/payment/verify-proof?paymentHash=${encodeURIComponent(
+						filteredArgs[2] || ''
+					)}`
+				)
+			);
+		case 'estimate':
+			return outputResult(
+				await httpRequest('POST', '/payment/estimate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'metadata': {
+			// Metadata is passed as inline JSON: '{"key":"value"}'
+			const paymentHash = filteredArgs[2];
+			const metadataArg = filteredArgs[3];
+			if (!paymentHash || !metadataArg) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet payment metadata <paymentHash> \'{"key":"value"}\''
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			let metadata: Record<string, string>;
+			try {
+				metadata = JSON.parse(metadataArg);
+			} catch {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Metadata is not valid JSON'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/payment/metadata', {
+					paymentHash,
+					metadata
+				})
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet payment [list|get|send-to-route]'
+					message:
+						'Usage: beignet payment [list|get|cancel|wait|proof|verify-proof|estimate|metadata|send-to-route]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleKeysend(): Promise<void> {
+	// "keysend safe <pubkey> <sats>" maps to POST /keysend/safe (never throws;
+	// resolves with status FAILED instead).
+	const safe = filteredArgs[1] === 'safe';
+	const base = safe ? 2 : 1;
+	const pubkey = filteredArgs[base];
+	const sats = filteredArgs[base + 1];
+	if (!pubkey || !sats) {
+		output({
+			ok: false,
+			error: {
+				code: 'INVALID_PARAMS',
+				message:
+					'Usage: beignet keysend [safe] <pubkey> <sats> [--max-fee <sats>] [--timeout <ms>]'
+			}
+		});
+		process.exitCode = 1;
+		return;
+	}
+	const maxFee = parseFlag('--max-fee');
+	const timeout = parseFlag('--timeout');
+	return outputResult(
+		await httpRequest('POST', safe ? '/keysend/safe' : '/keysend', {
+			pubkey,
+			amountSats: parseInt(sats, 10),
+			maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined,
+			timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+		})
+	);
+}
+
+async function handleLogs(): Promise<void> {
+	const params = new URLSearchParams();
+	const category = parseFlag('--category');
+	if (category !== undefined) params.set('category', category);
+	const since = parseFlag('--since');
+	if (since !== undefined) params.set('since', since);
+	const limit = parseFlag('--limit');
+	if (limit !== undefined) params.set('limit', limit);
+	const qs = params.toString();
+	return outputResult(await httpRequest('GET', qs ? `/logs?${qs}` : '/logs'));
+}
+
+async function handleWallet(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'refresh':
+			return outputResult(await httpRequest('POST', '/wallet/refresh'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet wallet refresh'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleNode(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'uri': {
+			const host = parseFlag('--host');
+			return outputResult(
+				await httpRequest(
+					'GET',
+					host !== undefined
+						? `/node/uri?host=${encodeURIComponent(host)}`
+						: '/node/uri'
+				)
+			);
+		}
+		case 'wait-ready': {
+			const timeout = parseFlag('--timeout');
+			return outputResult(
+				await httpRequest('POST', '/node/wait-ready', {
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined
+				})
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet node [uri [--host <addr>]|wait-ready [--timeout <ms>]]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleWebhooks(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'register': {
+			// Events are comma-separated, e.g. "payment:received,channel:ready" or "*"
+			const url = filteredArgs[2];
+			const events = filteredArgs[3];
+			if (!url || !events) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet webhooks register <url> <event,event,...|*> [--secret <secret>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/webhooks/register', {
+					url,
+					events: events
+						.split(',')
+						.map((e) => e.trim())
+						.filter((e) => e.length > 0),
+					secret: parseFlag('--secret')
+				})
+			);
+		}
+		case 'unregister':
+			return outputResult(
+				await httpRequest('DELETE', '/webhooks/unregister', {
+					id: filteredArgs[2]
+				})
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/webhooks'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message:
+						'Usage: beignet webhooks [register <url> <events>|unregister <id>|list]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
+async function handleQueue(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'add': {
+			const bolt11 = filteredArgs[2];
+			if (!bolt11) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet queue add <bolt11> [--priority <1-10>] [--amount <sats>] [--max-fee <sats>]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const priority = parseFlag('--priority');
+			const amount = parseFlag('--amount');
+			const maxFee = parseFlag('--max-fee');
+			return outputResult(
+				await httpRequest('POST', '/queue/add', {
+					bolt11,
+					priority: priority !== undefined ? parseInt(priority, 10) : undefined,
+					amountSats: amount !== undefined ? parseInt(amount, 10) : undefined,
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined
+				})
+			);
+		}
+		case 'cancel':
+			return outputResult(
+				await httpRequest('POST', '/queue/cancel', { id: filteredArgs[2] })
+			);
+		case 'list':
+			return outputResult(await httpRequest('GET', '/queue'));
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'UNKNOWN_COMMAND',
+					message: 'Usage: beignet queue [add <bolt11>|cancel <id>|list]'
 				}
 			});
 			process.exitCode = 1;
@@ -918,12 +1347,43 @@ async function handleRoute(): Promise<void> {
 				})
 			);
 		}
+		case 'estimate':
+			return outputResult(
+				await httpRequest('POST', '/route/estimate', {
+					bolt11: filteredArgs[2],
+					amountSats: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined
+				})
+			);
+		case 'probe': {
+			const destination = filteredArgs[2];
+			const sats = filteredArgs[3];
+			if (!destination || !sats) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet route probe <destination> <sats>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/route/probe', {
+					destination,
+					amountSats: parseInt(sats, 10)
+				})
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet route query <destination> <sats>'
+					message:
+						'Usage: beignet route [query <destination> <sats>|estimate <bolt11> [sats]|probe <destination> <sats>]'
 				}
 			});
 			process.exitCode = 1;
@@ -1069,6 +1529,12 @@ async function handleOffer(): Promise<void> {
 			);
 		case 'list':
 			return outputResult(await httpRequest('GET', '/offers'));
+		case 'decode':
+			return outputResult(
+				await httpRequest('POST', '/offer/decode', {
+					offer: filteredArgs[2]
+				})
+			);
 		case 'pay':
 			return outputResult(
 				await httpRequest('POST', '/offer/pay', {
@@ -1083,7 +1549,7 @@ async function handleOffer(): Promise<void> {
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet offer [create|list|pay]'
+					message: 'Usage: beignet offer [create|list|decode|pay]'
 				}
 			});
 			process.exitCode = 1;
@@ -1358,9 +1824,19 @@ Info:
   address validate <address>             Validate a Bitcoin address
   mnemonic                               Show mnemonic
   health                                 Node health status
+  ready                                  Whether the node is operational
   readiness                              Mainnet readiness checklist
   metrics                                Prometheus-format metrics (text/plain)
   stats [windowMs]                       Node statistics (optional time window)
+  liquidity                              Liquidity snapshot + recommendations
+  fees                                   On-chain fee trend analysis
+  spend-limit                            Daily spending limit status
+  logs [--category C] [--since ts] [--limit n]
+                                         Query the persistent action log
+  can-send [sats]                        Check Lightning send capacity
+  can-receive [sats]                     Check Lightning receive capacity
+  node uri [--host <addr>]               Node connection URI (pubkey@host:port)
+  node wait-ready [--timeout ms]         Block until the node is operational
 
 On-chain:
   send <address> <sats>                  Send on-chain
@@ -1375,6 +1851,7 @@ On-chain:
   transactions [limit]                   List on-chain transactions (newest first)
   utxos                                  List wallet UTXOs
   fee-estimates                          Current fee estimates (sats/vbyte)
+  wallet refresh                         Re-sync the on-chain wallet
   recover-fallback-funds [--fee-rate N]  Sweep funding-key fallback UTXOs into
                                          the wallet
   backup <destPath>                      Create database backup
@@ -1407,6 +1884,10 @@ Channels:
   channel open <pubkey> <sats> [push]    Open channel (auto-funded)
   channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
   channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
+  channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
+                                         Open channel + block until NORMAL
+  channel connect-and-open <pubkey> <host> <port> <sats> [push]
+                                         Connect to peer + open in one call
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
   channel splice-in <id> <sats> <feerate>   Add funds to channel
@@ -1415,9 +1896,17 @@ Channels:
   channel update-policy <id|all> [--base-fee-msat N] [--ppm N] [--cltv-delta N]
                         [--htlc-min-msat N] [--htlc-max-msat N]
                                          Set routing fee policy (channel_update)
+  channel update-commitment-feerate <id> <feeratePerKw>
+                                         Set COMMITMENT feerate (BOLT 2
+                                         update_fee), not the routing policy
+  channel policy <id>                    Effective routing policy for a channel
   channel list                           List channels
+  channel ready                          List channels in NORMAL state
   channel get <id>                       Channel details (includes routing policy)
+  channel health <id>                    Channel health + liquidity warnings
   channel diagnostics <id>               Routing-readiness diagnostics for a channel
+  channel suggestions [count]            Graph-based channel open suggestions
+  channel wait-ready <id> [--timeout ms] Block until a channel reaches NORMAL
 
 Invoices & Payments:
   invoice create <sats> [description]    Create BOLT 11 invoice
@@ -1429,14 +1918,34 @@ Invoices & Payments:
   invoice cancel-hold <hash>             Cancel a hold invoice (fails HTLCs back)
   invoice held                           List hold invoices + their state
   invoice decode <bolt11>                Decode invoice
+  invoice validate <bolt11> [sats]       Pre-flight checks: should this be paid?
+  invoice get <hash>                     Details of an invoice we created
   invoice pay <bolt11>                   Pay invoice (blocks until settled)
+  invoice pay-safe <bolt11> [--max-fee N] [--amount N] [--timeout ms]
+                                         Pay; resolves with status FAILED
+                                         instead of erroring
+  invoice pay-async <bolt11> [--max-fee N] [--amount N]
+                                         Fire-and-forget pay; poll 'payment get'
   invoice pay-retry <bolt11> [flags]     Pay with exponential backoff retry
   invoice list                           List created invoices
+  keysend [safe] <pubkey> <sats> [--max-fee N] [--timeout ms]
+                                         Spontaneous payment, no invoice needed
+                                         ('safe' resolves FAILED, never errors)
   payment list                           List payments
   payment get <hash>                     Payment details
+  payment cancel <hash>                  Cancel a pending outbound payment
+  payment wait <hash> [--timeout ms]     Block until a payment settles
+  payment proof <hash>                   Cryptographic payment proof
+  payment verify-proof <hash>            Verify a stored payment proof
+  payment estimate <bolt11> [sats]       Success probability + fee estimate
+  payment metadata <hash> <json>         Attach key-value metadata to a payment
   payment send-to-route <hash> <route>   Pay along an explicit route (inline
                                          JSON or a file with 'route query'
                                          output) [--payment-secret <hex>]
+  queue add <bolt11> [--priority N] [--amount N] [--max-fee N]
+                                         Enqueue a payment for ordered dispatch
+  queue cancel <id>                      Cancel a queued payment
+  queue list                             List the payment queue
 
 Graph Queries:
   graph info                             Graph summary (node/channel counts)
@@ -1448,6 +1957,8 @@ Graph Queries:
   gossip sync-rapid                      Rapid Gossip Sync snapshot (mainnet)
   route query <destination> <sats>       Compute a route without paying
                                          [--max-fee <sats>]
+  route estimate <bolt11> [sats]         Estimate route fee for an invoice
+  route probe <destination> <sats>       Probe route viability (no payment)
 
 Routing:
   forwards [--since ts] [--limit n]      List settled forwards (fees earned)
@@ -1471,7 +1982,15 @@ Watchtowers:
 BOLT 12 Offers:
   offer create <description> [amountSats]  Create reusable offer
   offer list                             List local offers
+  offer decode <offer>                   Decode a BOLT 12 offer string
   offer pay <offer> [amountSats]         Pay a BOLT 12 offer
+
+Webhooks (event push; see also GET /events SSE):
+  webhooks register <url> <events> [--secret S]
+                                         Register a callback URL; <events> is
+                                         comma-separated (or '*' for all)
+  webhooks unregister <id>               Remove a webhook
+  webhooks list                          List registered webhooks
 
 Start flags:
   --port <N>                             HTTP daemon port (default: 2112)
@@ -1489,6 +2008,9 @@ Start flags:
   --announce-addr <addr[,addr...]>       Addresses to advertise in node_announcement
                                          (IPv4, [ipv6]:port, .onion v3, or hostname;
                                          port defaults to 9735)
+  --htlc-events                          Relay per-HTLC events (htlc:forwarded/
+                                         fulfilled/failed) over SSE + webhooks
+                                         (off by default: high volume on routers)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)
