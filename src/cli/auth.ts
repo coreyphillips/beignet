@@ -22,7 +22,7 @@
  * an explicit classification.
  */
 
-import { createHash, timingSafeEqual } from 'crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import { BeignetError } from './errors';
 
 export type ApiScope = 'readonly' | 'invoice' | 'admin';
@@ -33,12 +33,55 @@ export const API_SCOPES: ReadonlySet<ApiScope> = new Set([
 	'admin'
 ]);
 
-/** One named API key from config: { name, key, scopes }. */
+/** One named API key from config: { name, key, scopes, expiresAt? }. */
 export interface ApiKeyDefinition {
 	name: string;
 	key: string;
 	scopes: ApiScope[];
+	/**
+	 * Optional expiry as an ISO 8601 timestamp (e.g. "2027-01-01T00:00:00Z").
+	 * Validated at construction; an expired key fails authentication exactly
+	 * like an unknown key (401). The legacy apiToken cannot expire.
+	 */
+	expiresAt?: string;
 }
+
+/**
+ * Persisted per-name override for a config-declared key. Only digests are
+ * ever stored, never plaintext secrets.
+ */
+export interface StoredKeyOverride {
+	/**
+	 * SHA-256 hex of the CONFIG-declared secret at the time the override was
+	 * written. If the operator later changes the key's secret in the config,
+	 * the digests no longer match and the override is pruned: an explicit
+	 * config re-key always wins over stored rotation/revocation state.
+	 */
+	configDigest: string;
+	/** Durable revocation flag (fixes in-memory-only revocation of M6). */
+	revoked?: boolean;
+	/** SHA-256 hex of the rotated secret that replaces the config secret. */
+	keyDigest?: string;
+	/** ISO 8601 timestamp of the last rotation. */
+	rotatedAt?: string;
+	/** Optional expiry override (ISO 8601) applied over the config expiresAt. */
+	expiresAt?: string;
+}
+
+/**
+ * Durable backend for auth-key overrides (daemon wires this to the node's
+ * encrypted SQLite storage). load() returns null when nothing is stored or
+ * the stored value is unreadable; save() replaces the whole map.
+ */
+export interface AuthOverrideStore {
+	load(): Record<string, StoredKeyOverride> | null;
+	save(overrides: Record<string, StoredKeyOverride>): void;
+}
+
+/** wallet_data key under which auth-key overrides are persisted. The colon
+ *  segments can never collide with on-chain wallet keys, which always end in
+ *  an IWalletData field name ("<wallet>-<network>-<field>"). */
+export const AUTH_KEY_OVERRIDES_STORAGE_KEY = 'daemon:auth-key-overrides:v1';
 
 export interface AuthSuccess {
 	ok: true;
@@ -207,7 +250,8 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 
 	// ── Admin-only: API key management ──
 	'GET /auth/keys': [],
-	'POST /auth/keys/revoke': []
+	'POST /auth/keys/revoke': [],
+	'POST /auth/keys/rotate': []
 };
 
 /**
@@ -231,22 +275,41 @@ function sha256(input: string): Buffer {
 	return createHash('sha256').update(input, 'utf8').digest();
 }
 
+const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
 interface CandidateKey {
 	name: string | null;
 	digest: Buffer;
 	scopes: ReadonlySet<ApiScope>;
+	/** SHA-256 hex of the CONFIG-declared secret (named keys only). Stays the
+	 *  config digest after rotation replaces `digest`; anchors overrides. */
+	configDigestHex?: string;
+	/** Effective expiry (config value or persisted override). */
+	expiresAt?: string;
+	expiresAtMs?: number;
+	/** ISO timestamp of the last rotation, when the key was ever rotated. */
+	rotatedAt?: string;
 }
 
 /**
  * Authenticates bearer tokens against the legacy apiToken (implicit admin)
- * and named scoped API keys, with an in-memory revocation set. Removing a
- * key from the config file is the durable revocation mechanism; runtime
- * revocation covers the window until restart.
+ * and named scoped API keys.
+ *
+ * Rotation and revocation are durable once an AuthOverrideStore is attached
+ * (the daemon wires one backed by the node's encrypted SQLite storage):
+ * per-name overrides (revoked flag, rotated-secret digest, rotatedAt) are
+ * persisted and re-applied over the config-declared keys on the next start.
+ * The config file remains the source of truth for the key SET; overrides
+ * apply by name, and an override is pruned when its name left the config or
+ * when the config secret for that name changed (explicit re-key wins).
+ * Without a store, rotation/revocation still work for the process lifetime.
  */
 export class ApiKeyAuthenticator {
 	private readonly candidates: CandidateKey[] = [];
 	private readonly revoked = new Set<string>();
 	private readonly keyNames: string[] = [];
+	private overrides: Record<string, StoredKeyOverride> = {};
+	private store: AuthOverrideStore | null = null;
 
 	constructor(apiToken?: string, apiKeys?: ApiKeyDefinition[]) {
 		if (apiToken) {
@@ -296,6 +359,18 @@ export class ApiKeyAuthenticator {
 				`apiKeys entry "${def.name}" duplicates the legacy apiToken value`
 			);
 		}
+		let expiresAtMs: number | undefined;
+		if (def.expiresAt !== undefined) {
+			expiresAtMs =
+				typeof def.expiresAt === 'string' ? Date.parse(def.expiresAt) : NaN;
+			if (!Number.isFinite(expiresAtMs)) {
+				throw new BeignetError(
+					'INVALID_PARAMS',
+					`apiKeys entry "${def.name}" has an unparseable expiresAt ` +
+						`(use ISO 8601, e.g. "2027-01-01T00:00:00Z")`
+				);
+			}
+		}
 		const digest = sha256(def.key);
 		for (const existing of this.candidates) {
 			if (existing.name !== null && timingSafeEqual(existing.digest, digest)) {
@@ -309,7 +384,10 @@ export class ApiKeyAuthenticator {
 		this.candidates.push({
 			name: def.name,
 			digest,
-			scopes: new Set<ApiScope>(def.scopes)
+			scopes: new Set<ApiScope>(def.scopes),
+			configDigestHex: digest.toString('hex'),
+			expiresAt: def.expiresAt,
+			expiresAtMs
 		});
 	}
 
@@ -318,11 +396,72 @@ export class ApiKeyAuthenticator {
 		return this.candidates.length > 0;
 	}
 
+	private isExpired(candidate: CandidateKey): boolean {
+		return (
+			candidate.expiresAtMs !== undefined && Date.now() >= candidate.expiresAtMs
+		);
+	}
+
+	/**
+	 * Attach a durable override store: load persisted per-name overrides,
+	 * prune stale ones (name no longer in config, config secret changed, or
+	 * malformed entry), apply the rest over the config-declared keys, and use
+	 * the store for all future rotate/revoke writes. Called by the daemon
+	 * once the node's storage exists, before the HTTP server accepts requests.
+	 */
+	attachOverrideStore(store: AuthOverrideStore): void {
+		this.store = store;
+		const loaded = store.load();
+		const kept: Record<string, StoredKeyOverride> = {};
+		let pruned = false;
+		for (const [name, override] of Object.entries(loaded ?? {})) {
+			const candidate = this.candidates.find((c) => c.name === name);
+			if (
+				!candidate ||
+				typeof override !== 'object' ||
+				override === null ||
+				typeof override.configDigest !== 'string' ||
+				override.configDigest !== candidate.configDigestHex ||
+				(override.keyDigest !== undefined &&
+					!SHA256_HEX_RE.test(override.keyDigest))
+			) {
+				// Stale or malformed: the key left the config, the operator
+				// re-keyed it in the config (config wins), or corrupt data.
+				pruned = true;
+				continue;
+			}
+			kept[name] = override;
+			if (override.keyDigest !== undefined) {
+				candidate.digest = Buffer.from(override.keyDigest, 'hex');
+				candidate.rotatedAt = override.rotatedAt;
+			}
+			if (override.revoked === true) {
+				this.revoked.add(name);
+			}
+			if (override.expiresAt !== undefined) {
+				const ms =
+					typeof override.expiresAt === 'string'
+						? Date.parse(override.expiresAt)
+						: NaN;
+				// Unparseable stored expiry is ignored (never brick startup on
+				// corrupt storage); config validation already ran.
+				if (Number.isFinite(ms)) {
+					candidate.expiresAt = override.expiresAt;
+					candidate.expiresAtMs = ms;
+				}
+			}
+		}
+		this.overrides = kept;
+		// Rewrite only when something was pruned, so entries never linger.
+		if (pruned) store.save(kept);
+	}
+
 	/**
 	 * Authenticate an Authorization header value. Constant-time: the
 	 * presented token is hashed once and compared against every candidate
 	 * digest (no early exit), so response time does not depend on which key
-	 * matched or how much of a key matched. Revoked keys never match.
+	 * matched or how much of a key matched. Revoked and expired keys never
+	 * match (both fail exactly like an unknown key).
 	 */
 	authenticate(header: string | undefined): AuthResult {
 		if (!header) return { ok: false };
@@ -335,7 +474,8 @@ export class ApiKeyAuthenticator {
 			if (
 				equal &&
 				matched === null &&
-				(candidate.name === null || !this.revoked.has(candidate.name))
+				(candidate.name === null || !this.revoked.has(candidate.name)) &&
+				!this.isExpired(candidate)
 			) {
 				matched = candidate;
 			}
@@ -345,24 +485,89 @@ export class ApiKeyAuthenticator {
 	}
 
 	/**
-	 * Revoke a named key for the lifetime of this process. Returns false for
-	 * unknown names. The legacy apiToken has no name and cannot be revoked at
-	 * runtime; remove it from the config and restart instead.
+	 * Revoke a named key, effective immediately. Returns false for unknown
+	 * names. With an attached store the revocation is persisted and survives
+	 * restarts (removing the key from the config remains the ultimate
+	 * mechanism); without one it lasts for the process lifetime. The legacy
+	 * apiToken has no name and cannot be revoked here; remove it from the
+	 * config and restart instead.
 	 */
 	revoke(name: string): boolean {
-		if (!this.keyNames.includes(name)) return false;
+		const candidate = this.candidates.find((c) => c.name === name);
+		if (!candidate || candidate.name === null) return false;
+		// Memory first: the security effect must not depend on storage health.
 		this.revoked.add(name);
+		this.overrides = {
+			...this.overrides,
+			[name]: {
+				...(this.overrides[name] ?? {
+					configDigest: candidate.configDigestHex ?? ''
+				}),
+				revoked: true
+			}
+		};
+		this.store?.save(this.overrides);
 		return true;
 	}
 
-	/** Named keys (never the secrets): name, scopes, revoked flag. */
-	listKeys(): Array<{ name: string; scopes: ApiScope[]; revoked: boolean }> {
+	/**
+	 * Rotate a named key: mint a cryptographically random 32-byte secret
+	 * (hex) that replaces the current one. The old secret stops
+	 * authenticating immediately; the new secret is returned ONCE and only
+	 * its SHA-256 digest is ever stored. Rotating a revoked key reinstates
+	 * it under the new secret (the compromised secret stays dead). Returns
+	 * null for unknown names; the legacy apiToken has no name and cannot be
+	 * rotated.
+	 */
+	rotate(
+		name: string
+	): { name: string; key: string; rotatedAt: string } | null {
+		const candidate = this.candidates.find((c) => c.name === name);
+		if (!candidate || candidate.name === null) return null;
+		const newKey = randomBytes(32).toString('hex');
+		const newDigest = sha256(newKey);
+		const rotatedAt = new Date().toISOString();
+		const override: StoredKeyOverride = {
+			...(this.overrides[name] ?? {
+				configDigest: candidate.configDigestHex ?? ''
+			}),
+			keyDigest: newDigest.toString('hex'),
+			rotatedAt
+		};
+		delete override.revoked;
+		const next = { ...this.overrides, [name]: override };
+		// Persist BEFORE applying in memory: if the write fails, the old
+		// secret keeps working and no one holds a secret that a restart
+		// would silently invalidate.
+		this.store?.save(next);
+		this.overrides = next;
+		candidate.digest = newDigest;
+		candidate.rotatedAt = rotatedAt;
+		this.revoked.delete(name);
+		return { name, key: newKey, rotatedAt };
+	}
+
+	/**
+	 * Named keys (never the secrets): name, scopes, revoked/expired flags,
+	 * plus expiresAt/rotatedAt when set.
+	 */
+	listKeys(): Array<{
+		name: string;
+		scopes: ApiScope[];
+		revoked: boolean;
+		expired: boolean;
+		expiresAt?: string;
+		rotatedAt?: string;
+	}> {
 		return this.candidates
 			.filter((c): c is CandidateKey & { name: string } => c.name !== null)
 			.map((c) => ({
 				name: c.name,
 				scopes: [...c.scopes],
-				revoked: this.revoked.has(c.name)
+				revoked: this.revoked.has(c.name),
+				expired: this.isExpired(c),
+				...(c.expiresAt !== undefined ? { expiresAt: c.expiresAt } : {}),
+				...(c.rotatedAt !== undefined ? { rotatedAt: c.rotatedAt } : {})
 			}));
 	}
 }

@@ -119,7 +119,8 @@ describe('Route scope classification (drift test)', () => {
 			'POST /webhooks/register',
 			'POST /message/sign',
 			'GET /auth/keys',
-			'POST /auth/keys/revoke'
+			'POST /auth/keys/revoke',
+			'POST /auth/keys/rotate'
 		]) {
 			expect(ROUTE_SCOPES[route], route).to.deep.equal([]);
 		}
@@ -241,7 +242,7 @@ describe('ApiKeyAuthenticator', () => {
 		expect(auth.revoke('legacy-token')).to.equal(false); // legacy has no name
 	});
 
-	it('listKeys exposes names/scopes/revoked but never secrets', () => {
+	it('listKeys exposes names/scopes/revoked/expired but never secrets', () => {
 		const auth = new ApiKeyAuthenticator('legacy-token', keys);
 		auth.revoke('shop');
 		const listed = auth.listKeys();
@@ -249,11 +250,14 @@ describe('ApiKeyAuthenticator', () => {
 		expect(listed.find((k) => k.name === 'shop')?.revoked).to.equal(true);
 		expect(listed.find((k) => k.name === 'monitor')?.revoked).to.equal(false);
 		for (const entry of listed) {
+			// expiresAt/rotatedAt appear only when set; none are set here
 			expect(Object.keys(entry).sort()).to.deep.equal([
+				'expired',
 				'name',
 				'revoked',
 				'scopes'
 			]);
+			expect(entry.expired).to.equal(false);
 		}
 	});
 
@@ -381,6 +385,13 @@ describe('OpenAPI scope annotations', () => {
 	it('documents the auth key management endpoints', () => {
 		expect(spec.paths).to.have.property('/auth/keys');
 		expect(spec.paths).to.have.property('/auth/keys/revoke');
+		expect(spec.paths).to.have.property('/auth/keys/rotate');
+		expect(
+			spec.paths['/auth/keys/rotate'].post['x-accepted-scopes']
+		).to.deep.equal(['admin']);
+		expect(
+			spec.paths['/auth/keys/revoke'].post['x-accepted-scopes']
+		).to.deep.equal(['admin']);
 	});
 
 	it('auth-exempt routes stay unannotated', () => {

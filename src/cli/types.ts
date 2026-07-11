@@ -336,11 +336,13 @@ export interface BeignetConfig {
 	largeChannels?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */
 	apiToken?: string;
-	/** Named API keys with permission scopes (readonly/invoice/admin). */
+	/** Named API keys with permission scopes (readonly/invoice/admin).
+	 *  expiresAt (optional, ISO 8601): key stops authenticating at that time. */
 	apiKeys?: Array<{
 		name: string;
 		key: string;
 		scopes: Array<'readonly' | 'invoice' | 'admin'>;
+		expiresAt?: string;
 	}>;
 	autoBootstrap?: boolean;
 	backupPath?: string;

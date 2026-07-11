@@ -2297,7 +2297,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					tags: ['Auth'],
 					responses: {
 						'200': {
-							description: 'Key names with their scopes and revoked flag',
+							description:
+								'Key names with their scopes, revoked/expired flags, and expiresAt/rotatedAt when set',
 							content: jsonContent({
 								type: 'object',
 								properties: {
@@ -2314,7 +2315,18 @@ export function getOpenApiSpec(): Record<string, unknown> {
 														enum: ['readonly', 'invoice', 'admin']
 													}
 												},
-												revoked: { type: 'boolean' }
+												revoked: { type: 'boolean' },
+												expired: { type: 'boolean' },
+												expiresAt: {
+													type: 'string',
+													description:
+														'ISO 8601 expiry, present only when configured'
+												},
+												rotatedAt: {
+													type: 'string',
+													description:
+														'ISO 8601 time of the last rotation, present only when the key was ever rotated'
+												}
 											}
 										}
 									}
@@ -2327,13 +2339,42 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/auth/keys/revoke': {
 				post: {
 					summary:
-						'Revoke a named API key for the lifetime of this daemon process (admin scope)',
+						'Revoke a named API key, effective immediately (admin scope)',
 					description:
-						'Runtime revocation only: the durable mechanism is removing the key from the config file and restarting. The legacy apiToken has no name and cannot be revoked here.',
+						'The revocation is persisted in the node database and survives daemon restarts; removing the key from the config file remains the ultimate cleanup. The legacy apiToken has no name and cannot be revoked here.',
 					tags: ['Auth'],
 					requestBody: bodyContent({ name: 'string' }),
 					responses: {
 						'200': { description: 'Key revoked' },
+						'404': { description: 'No key with that name' }
+					}
+				}
+			},
+			'/auth/keys/rotate': {
+				post: {
+					summary:
+						'Rotate a named API key: mint a new random secret (admin scope)',
+					description:
+						'Replaces the secret of the named key with a cryptographically random 32-byte hex secret. The old secret stops authenticating immediately; scopes are unchanged. The new secret is returned ONCE in this response and cannot be retrieved again (only its SHA-256 digest is persisted, so the rotation survives restarts). Rotating a revoked key reinstates it under the new secret. Editing the secret of a key in the config file discards the stored rotation on next start (config wins). The legacy apiToken has no name and cannot be rotated; change it in the config and restart.',
+					tags: ['Auth'],
+					requestBody: bodyContent({ name: 'string' }),
+					responses: {
+						'200': {
+							description: 'New secret, shown only once; store it now',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									name: { type: 'string' },
+									key: {
+										type: 'string',
+										description:
+											'The new secret (64 hex chars). Shown only in this response.'
+									},
+									rotatedAt: { type: 'string' },
+									warning: { type: 'string' }
+								}
+							})
+						},
 						'404': { description: 'No key with that name' }
 					}
 				}
