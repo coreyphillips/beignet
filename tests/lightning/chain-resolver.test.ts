@@ -531,6 +531,11 @@ describe('Output Resolver (Phase 4B)', function () {
 			const preimage = crypto.randomBytes(32);
 			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 			opener.addHtlc(10_000_000n, paymentHash, 500, Buffer.alloc(1366));
+			// Model a completed commitment round: the peer has committed the add
+			// (two-phase update tracking) so it appears in our local commitment.
+			for (const e of opener.getFullState().htlcs.values()) {
+				e.addRemoteCommitted = true;
+			}
 
 			const state = opener.getFullState();
 			const perCommitmentSecret = generateFromSeed(
@@ -785,6 +790,11 @@ describe('Output Resolver (Phase 4B)', function () {
 			const preimage = crypto.randomBytes(32);
 			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 			opener.addHtlc(10_000_000n, paymentHash, 500, Buffer.alloc(1366));
+			// Model a completed commitment round: the peer has committed the add
+			// (two-phase update tracking) so it appears in our local commitment.
+			for (const e of opener.getFullState().htlcs.values()) {
+				e.addRemoteCommitted = true;
+			}
 
 			const state = opener.getFullState();
 			const perCommitmentSecret = generateFromSeed(
@@ -1330,6 +1340,10 @@ describe('Output Resolver (Phase 4B)', function () {
 			const hashB = crypto.createHash('sha256').update(preimageB).digest();
 			opener.addHtlc(10_000_000n, hashA, 500, Buffer.alloc(1366));
 			opener.addHtlc(50_000_000n, hashB, 600, Buffer.alloc(1366));
+			// Model a completed commitment round (two-phase update tracking).
+			for (const e of opener.getFullState().htlcs.values()) {
+				e.addRemoteCommitted = true;
+			}
 
 			const state = opener.getFullState();
 			const perCommitmentSecret = generateFromSeed(

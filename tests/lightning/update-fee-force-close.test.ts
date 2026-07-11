@@ -121,7 +121,23 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		expect(state.pendingFeeratePerKw).to.equal(NEW_RATE);
 	});
 
-	it('rebuilds the signed commitment byte-for-byte after the pending rate is lost', function () {
+	it('rolls back a staged rate on reestablish ONLY while no signature covers it', function () {
+		// Fee staged but the opener's covering commitment_signed never arrived:
+		// the round is void — reestablish wipes the staged rate (the opener
+		// forgets/replays its update_fee on reconnect).
+		const uncovered = makeNormalAcceptorChannel();
+		const uncoveredState = uncovered.getFullState();
+		uncovered.handleUpdateFee({
+			channelId: uncoveredState.channelId!,
+			feeratePerKw: NEW_RATE
+		});
+		uncovered.markForReestablish();
+		expect(uncoveredState.pendingFeeratePerKw).to.equal(undefined);
+
+		// Fee staged AND covered by the opener's commitment_signed (we revoked
+		// for it): the rate is locked into the exchange — the opener will NOT
+		// re-send update_fee, so the OLD rollback here desynced every later
+		// commitment (the live CLN "Bad commit_sig" class). It must survive.
 		const channel = makeNormalAcceptorChannel();
 		const state = channel.getFullState();
 		const point = getPerCommitmentPoint(localSeed, 1n);
@@ -139,9 +155,10 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		// The commitment the peer signed: built at the staged rate.
 		const signedTx = buildLocalCommitment(state, point).result.tx.toHex();
 
-		// Reestablish rollback wipes the staged rate (restart would too).
 		channel.markForReestablish();
-		expect(state.pendingFeeratePerKw).to.equal(undefined);
+		expect(state.pendingFeeratePerKw, 'covered fee survives').to.equal(
+			NEW_RATE
+		);
 		expect(state.lastSignedCommitFeeratePerKw).to.equal(NEW_RATE);
 
 		// signedLocal rebuild reproduces the signed tx exactly...
@@ -153,9 +170,14 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		).result.tx.toHex();
 		expect(rebuilt).to.equal(signedTx);
 
-		// ...while an in-flight-rate rebuild (the old force-close behavior)
-		// would produce a DIFFERENT tx, i.e. an invalid witness.
-		const wrong = buildLocalCommitment(state, point).result.tx.toHex();
+		// ...while a rebuild after the OLD unconditional rollback (staged rate
+		// stripped) would produce a DIFFERENT tx, i.e. an invalid witness.
+		const rolledBack = {
+			...state,
+			pendingFeeratePerKw: undefined,
+			lastSignedCommitFeeratePerKw: undefined
+		};
+		const wrong = buildLocalCommitment(rolledBack, point).result.tx.toHex();
 		expect(wrong).to.not.equal(signedTx);
 	});
 

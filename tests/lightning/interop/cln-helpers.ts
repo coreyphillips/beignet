@@ -9,8 +9,12 @@
 
 import https from 'https';
 import { execSync } from 'child_process';
-import { ClnRestClient, IClnChannel } from './cln-client';
+import { ClnRestClient, IClnChannel, parseClnMsat } from './cln-client';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
+import {
+	PaymentStatus,
+	PaymentDirection
+} from '../../../src/lightning/node/types';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
 import { REGTEST_CHAIN_HASH } from '../../../src/lightning/channel/types';
 import { Network } from '../../../src/lightning/invoice/types';
@@ -356,6 +360,125 @@ export async function setupClnChannel(
 	}
 
 	return { node, channelId, fundingTxid: openResult.txid };
+}
+
+// ── Strict Payment Helpers ──────────────────────────────────────
+
+/** Poll until `check` returns truthy or the timeout elapses; null on timeout. */
+export async function waitFor<T>(
+	check: () => T | null | Promise<T | null>,
+	timeoutMs: number,
+	intervalMs = 500
+): Promise<T | null> {
+	const start = Date.now();
+	for (;;) {
+		const v = await check();
+		if (v) return v;
+		if (Date.now() - start >= timeoutMs) return null;
+		await sleep(intervalMs);
+	}
+}
+
+/**
+ * STRICT beignet → CLN payment: sends the payment and requires it to SETTLE —
+ * the CLN invoice reaches status "paid" with the exact amount, and beignet's
+ * own payment record completes. Historically this direction was asserted
+ * leniently because payments over a CLN-funded channel were flaky; the cause
+ * was the remote-update_fee commitment desync (fixed on this branch), so the
+ * assertions are strict now.
+ */
+export async function payClnInvoiceStrict(
+	node: LightningNode,
+	cln: ClnRestClient,
+	amountMsat: number,
+	tag: string
+): Promise<void> {
+	// The interop node has no chain watcher, so its block height is 0 and any
+	// outgoing HTLC would carry an absolute CLTV of ~min_final_cltv_expiry —
+	// CLN (correctly) fails that with incorrect_or_unknown_payment_details.
+	// Feed it the real regtest height before building the route.
+	const btcInfo = (await bitcoinRpc('getblockchaininfo')) as {
+		blocks: number;
+	};
+	node.handleNewBlock(btcInfo.blocks);
+
+	const label = `strict-${tag}-${Date.now()}-${Math.random()
+		.toString(36)
+		.slice(2)}`;
+	const clnInvoice = await cln.createInvoice(amountMsat, label, tag);
+
+	const payment = node.sendPayment(clnInvoice.bolt11);
+	if (!payment || !payment.paymentHash) {
+		throw new Error(`sendPayment returned no paymentHash (${tag})`);
+	}
+
+	const paid = await waitFor(async () => {
+		const { invoices } = await cln.listInvoices(label);
+		const inv = (invoices || [])[0];
+		return inv && inv.status === 'paid' ? inv : null;
+	}, 30_000);
+	if (!paid) {
+		throw new Error(`CLN invoice did not settle within 30s (${tag})`);
+	}
+	const received = Number(parseClnMsat(paid.amount_received_msat));
+	if (received !== amountMsat) {
+		throw new Error(
+			`CLN received ${received} msat, expected ${amountMsat} (${tag})`
+		);
+	}
+
+	const done = await waitFor(() => {
+		const p = node
+			.listPayments()
+			.find(
+				(x) =>
+					x.paymentHash.toString('hex') === payment.paymentHash.toString('hex')
+			);
+		return p && p.status === PaymentStatus.COMPLETED ? p : null;
+	}, 15_000);
+	if (!done) {
+		throw new Error(`beignet payment did not reach COMPLETED (${tag})`);
+	}
+}
+
+/**
+ * STRICT CLN → beignet payment: CLN pays a beignet invoice and the payment
+ * must complete at beignet with the exact amount (see payClnInvoiceStrict on
+ * why this is strict now).
+ */
+export async function payBeignetInvoiceStrict(
+	node: LightningNode,
+	cln: ClnRestClient,
+	amountMsat: number,
+	tag: string
+): Promise<void> {
+	const invoice = node.createInvoice({
+		amountMsat: BigInt(amountMsat),
+		description: tag
+	});
+	const payResult = await cln.pay(invoice.bolt11);
+	if (!payResult.payment_preimage || payResult.payment_preimage.length === 0) {
+		throw new Error(`CLN pay returned no preimage (${tag})`);
+	}
+
+	const incoming = await waitFor(() => {
+		const p = node
+			.listPayments()
+			.find(
+				(x) =>
+					x.direction === PaymentDirection.INCOMING &&
+					x.paymentHash.toString('hex') === invoice.paymentHash.toString('hex')
+			);
+		return p && p.status === PaymentStatus.COMPLETED ? p : null;
+	}, 15_000);
+	if (!incoming) {
+		throw new Error(`incoming payment did not complete (${tag})`);
+	}
+	if (Number(incoming.amountMsat) !== amountMsat) {
+		throw new Error(
+			`beignet received ${incoming.amountMsat} msat, expected ${amountMsat} (${tag})`
+		);
+	}
 }
 
 // ── Beignet-Funded Channel Setup ────────────────────────────────

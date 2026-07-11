@@ -828,6 +828,15 @@ export class ChannelManager extends EventEmitter {
 		if (!channel.needsCommitment()) {
 			return { ok: true, actions: [] };
 		}
+		// Commitment-round alternation: never pipeline a second
+		// commitment_signed while the previous one is unrevoked. The channel's
+		// revocation bookkeeping binds each incoming revoke_and_ack to the one
+		// outstanding commitment, and the reestablish retransmit cache holds a
+		// single commitment_signed. needsCommitment stays set, so the deferred
+		// signature goes out from the revoke_and_ack handler below.
+		if (channel.isAwaitingRemoteRevocation()) {
+			return { ok: true, actions: [] };
+		}
 		const peerPubkey = this.channelPeers.get(idHex);
 		if (!peerPubkey) {
 			return {
@@ -2985,6 +2994,16 @@ export class ChannelManager extends EventEmitter {
 				}
 			}
 		}
+
+		// NOTE: no unconditional commitment_signed here. needsCommitment can be
+		// true for updates the peer has NOT yet committed to us (a received
+		// add/fulfill whose covering commitment_signed was lost with the
+		// connection) — signing those into the peer's commitment before it
+		// retransmits and we revoke violates the two-phase update flow. A
+		// commitment that was legitimately deferred by the alternation gate is
+		// released when the peer's (retransmitted) revoke_and_ack arrives — our
+		// accurate next_revocation_number in channel_reestablish makes the peer
+		// retransmit it (see handleRevokeAndAck's autoSignAndSendCommitment).
 	}
 
 	private handleStfu(peerPubkey: string, payload: Buffer): void {
