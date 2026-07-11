@@ -35,6 +35,8 @@ import {
 	BITCOIN_CHAIN_HASH
 } from '../channel/types';
 import { PeerManager, IPeerInfo } from '../transport/peer-manager';
+import { IPeerTransportOptions } from '../transport/duplex-transport';
+import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
 import {
 	findRoute,
@@ -574,7 +576,8 @@ export class LightningNode extends EventEmitter {
 				networks: config.chainHashes,
 				autoReconnect: config.autoReconnect ?? config.enableNetworking ?? false,
 				maxReconnectDelay: config.maxReconnectDelay,
-				socks5Proxy: config.socks5Proxy
+				socks5Proxy: config.socks5Proxy,
+				webSocketImpl: config.webSocketImpl
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			this.registerGossipHandlers();
@@ -2451,18 +2454,44 @@ export class LightningNode extends EventEmitter {
 	 * resolved from the gossip graph's node_announcement (addresses tried in
 	 * announced order; Tor addresses are skipped unless a socks5Proxy is
 	 * configured), falling back to DNS bootstrap when the graph has none.
+	 *
+	 * `transport` is optional and additive: omit it for TCP (unchanged
+	 * behavior); pass {type: 'ws'} to dial over WebSocket at ws://host:port,
+	 * or {type: 'ws', url} for an explicit ws:// or wss:// URL (host/port may
+	 * then be omitted — they are derived from the URL).
 	 */
 	async connectPeer(
 		pubkey: string,
 		host?: string,
-		port?: number
+		port?: number,
+		transport?: IPeerTransportOptions
 	): Promise<void> {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
+		if (transport?.type === 'ws' && transport.url !== undefined) {
+			// Derive the dial address from the explicit URL (and reject a
+			// mismatched host/port pair to avoid ambiguous bookkeeping).
+			const parsed = parseWebSocketUrl(transport.url);
+			if (
+				(host !== undefined && host !== parsed.host) ||
+				(port !== undefined && port !== parsed.port)
+			) {
+				throw new Error(
+					'host/port conflict with the WebSocket url (omit host/port or make them match)'
+				);
+			}
+			host = parsed.host;
+			port = parsed.port;
+		}
 		if (host === undefined && port === undefined) {
+			if (transport?.type === 'ws') {
+				throw new Error(
+					'WebSocket transport requires host+port or an explicit url'
+				);
+			}
 			await this.connectPeerById(pubkey);
 			return;
 		}
@@ -2475,7 +2504,7 @@ export class LightningNode extends EventEmitter {
 		if (hostErr) throw new Error(hostErr);
 		const portErr = validatePort(port);
 		if (portErr) throw new Error(portErr);
-		await this.peerManager.connectPeer(pubkey, host, port);
+		await this.peerManager.connectPeer(pubkey, host, port, transport);
 	}
 
 	/**
@@ -2584,7 +2613,18 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Stop listening for inbound connections.
+	 * Start listening for inbound peers over WebSocket (opt-in; coexists with
+	 * the TCP listener started via listen()).
+	 */
+	async listenWebSocket(port: number, host?: string): Promise<void> {
+		if (!this.peerManager) {
+			throw new Error('Networking is not enabled');
+		}
+		await this.peerManager.listenWebSocket(port, host);
+	}
+
+	/**
+	 * Stop listening for inbound connections (TCP and WebSocket).
 	 */
 	stopListening(): void {
 		if (this.peerManager) {
@@ -8336,6 +8376,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator?: IFeeEstimator;
 			logger?: ILogger;
 			socks5Proxy?: { host: string; port: number };
+			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
@@ -8400,6 +8441,7 @@ export class LightningNode extends EventEmitter {
 			feeEstimator: options?.feeEstimator,
 			logger: options?.logger,
 			socks5Proxy: options?.socks5Proxy,
+			webSocketImpl: options?.webSocketImpl,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,
 			chainBackend: options?.chainBackend,

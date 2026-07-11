@@ -93,6 +93,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? parseInt(process.env.BEIGNET_LISTEN_PORT, 10)
 				: undefined) ||
 			file.listenPort,
+		websocketPort:
+			cliFlags.websocketPort ||
+			(process.env.BEIGNET_WEBSOCKET_PORT
+				? parseInt(process.env.BEIGNET_WEBSOCKET_PORT, 10)
+				: undefined) ||
+			file.websocketPort,
 		daemonHost:
 			cliFlags.daemonHost || process.env.BEIGNET_DAEMON_HOST || file.daemonHost,
 		daemonPort:

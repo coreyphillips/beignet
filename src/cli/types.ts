@@ -28,6 +28,8 @@ export interface NodeInfo {
 	channelCount: number;
 	peerCount: number;
 	listening: boolean;
+	/** WebSocket listener port when accepting inbound WS peers (opt-in). */
+	websocketPort?: number;
 }
 
 export type PeerState = 'connected' | 'connecting' | 'disconnected';
@@ -329,6 +331,9 @@ export interface BeignetConfig {
 	/** Fee estimate source: 'electrum' | 'http' | 'auto' (default 'auto'). */
 	feeEstimationSource?: 'electrum' | 'http' | 'auto';
 	listenPort?: number;
+	/** Accept inbound Lightning peers over WebSocket on this port (opt-in;
+	 *  coexists with the TCP listener on listenPort). */
+	websocketPort?: number;
 	daemonPort?: number;
 	daemonHost?: string;
 	preferAnchors?: boolean;

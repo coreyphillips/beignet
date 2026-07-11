@@ -1,15 +1,18 @@
 /**
- * BOLT 8: Single peer TCP connection.
+ * BOLT 8: Single peer connection.
  *
  * Manages the full lifecycle of a connection to a Lightning peer:
  * connect → handshake → init exchange → encrypted messaging.
  *
- * Uses Node.js TCP sockets with the Noise_XK handshake protocol
- * and BOLT 8 encrypted message framing.
+ * Runs the Noise_XK handshake and BOLT 8 encrypted message framing over an
+ * IDuplexTransport. The default (and unchanged) transport is a Node.js TCP
+ * socket — which satisfies the interface structurally — including the
+ * SOCKS5/Tor factory path; WebSocket transports plug in via createSocket.
  */
 
 import { EventEmitter } from 'events';
 import net from 'net';
+import { IDuplexTransport } from './duplex-transport';
 import {
 	createInitiatorHandshake,
 	createResponderHandshake,
@@ -61,8 +64,10 @@ export interface IPeerOptions {
 	pingInterval?: number;
 	/** Pong timeout in ms (default 10s) */
 	pongTimeout?: number;
-	/** Optional socket factory (e.g. for SOCKS5/Tor proxy connections) */
-	createSocket?: (host: string, port: number) => Promise<net.Socket>;
+	/** Optional transport factory (e.g. SOCKS5/Tor proxy sockets, WebSocket).
+	 *  net.Socket satisfies IDuplexTransport, so existing socket factories
+	 *  keep working unchanged. */
+	createSocket?: (host: string, port: number) => Promise<IDuplexTransport>;
 	/** TCP connect timeout in ms (default 15000) */
 	connectTimeout?: number;
 	/** Noise handshake + init exchange timeout in ms (default 30000) */
@@ -94,7 +99,7 @@ export class Peer extends EventEmitter {
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private state: PeerState = 'disconnected';
-	private socket: net.Socket | null = null;
+	private socket: IDuplexTransport | null = null;
 	private transport: TransportCipher | null = null;
 	private remoteInit: IInitMessage | null = null;
 
@@ -108,8 +113,11 @@ export class Peer extends EventEmitter {
 	private pingIntervalMs: number;
 	private pongTimeoutMs: number;
 
-	// Optional socket factory for proxy connections (e.g. SOCKS5/Tor)
-	private createSocketFn?: (host: string, port: number) => Promise<net.Socket>;
+	// Optional transport factory (e.g. SOCKS5/Tor proxy sockets, WebSocket)
+	private createSocketFn?: (
+		host: string,
+		port: number
+	) => Promise<IDuplexTransport>;
 
 	// Connection timeouts (Fix 3.1)
 	private connectTimeoutMs: number;
@@ -234,9 +242,10 @@ export class Peer extends EventEmitter {
 
 	/**
 	 * Accept an inbound connection from a peer.
-	 * @param socket - Already-connected TCP socket
+	 * @param socket - Already-connected transport (TCP socket or accepted
+	 *                 WebSocket connection)
 	 */
-	async acceptInbound(socket: net.Socket): Promise<void> {
+	async acceptInbound(socket: IDuplexTransport): Promise<void> {
 		if (this.state !== 'disconnected') {
 			throw new Error(`Cannot accept: peer is ${this.state}`);
 		}

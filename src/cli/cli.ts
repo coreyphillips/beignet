@@ -440,6 +440,7 @@ async function handleStart(): Promise<void> {
 			electrumServers: config.electrumServers,
 			feeEstimationSource: config.feeEstimationSource,
 			listenPort: config.listenPort,
+			websocketPort: config.websocketPort,
 			daemonPort,
 			daemonHost: config.daemonHost,
 			preferAnchors: config.preferAnchors,
@@ -594,22 +595,49 @@ async function handlePsbt(): Promise<void> {
 async function handlePeer(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'connect':
-			// host/port are optional: "beignet peer connect <pubkey>" resolves the
-			// address from the gossip graph / DNS bootstrap.
+		case 'connect': {
+			// Accepted forms (first two unchanged, the rest additive):
+			//   peer connect <pubkey>                      resolve via gossip/DNS
+			//   peer connect <pubkey> <host> <port>        TCP
+			//   peer connect <pubkey> <ws[s]://host:port>  WebSocket
+			//   peer connect <pubkey@host:port>            TCP (URI form)
+			//   peer connect <pubkey@ws[s]://host:port>    WebSocket (URI form)
+			let connectBody: Record<string, unknown>;
+			const target = filteredArgs[2];
+			if (target !== undefined && target.includes('@')) {
+				const at = target.indexOf('@');
+				const pubkey = target.slice(0, at);
+				const address = target.slice(at + 1);
+				if (/^wss?:\/\//i.test(address)) {
+					connectBody = { pubkey, url: address };
+				} else {
+					const lastColon = address.lastIndexOf(':');
+					connectBody = {
+						pubkey,
+						host: address.slice(0, lastColon),
+						port: parseInt(address.slice(lastColon + 1), 10)
+					};
+				}
+			} else if (
+				filteredArgs[3] !== undefined &&
+				/^wss?:\/\//i.test(filteredArgs[3])
+			) {
+				connectBody = { pubkey: target, url: filteredArgs[3] };
+			} else if (filteredArgs[3] !== undefined) {
+				connectBody = {
+					pubkey: target,
+					host: filteredArgs[3],
+					port: parseInt(filteredArgs[4], 10)
+				};
+			} else {
+				// host/port omitted: the node resolves the address from the gossip
+				// graph / DNS bootstrap.
+				connectBody = { pubkey: target };
+			}
 			return outputResult(
-				await httpRequest(
-					'POST',
-					'/peer/connect',
-					filteredArgs[3] !== undefined
-						? {
-								pubkey: filteredArgs[2],
-								host: filteredArgs[3],
-								port: parseInt(filteredArgs[4], 10)
-						  }
-						: { pubkey: filteredArgs[2] }
-				)
+				await httpRequest('POST', '/peer/connect', connectBody)
 			);
+		}
 		case 'disconnect':
 			return outputResult(
 				await httpRequest('POST', '/peer/disconnect', {
@@ -2083,6 +2111,8 @@ On-chain:
 
 Peers:
   peer connect <pubkey> <host> <port>    Connect to peer
+  peer connect <pubkey> <ws://host:port> Connect over WebSocket (ws:// or wss://)
+  peer connect <pubkey@[ws://]host:port> Connect by URI
   peer disconnect <pubkey>               Disconnect peer
   peer list                              List peers
 

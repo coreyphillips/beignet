@@ -102,6 +102,9 @@ services:
     restart: unless-stopped
     ports:
       - '19846:19846'
+      # WebSocket peer listener (bind-addr=ws:), for beignet WS transport
+      # interop tests.
+      - '19847:19847'
       - '3010:3010'
     volumes:
       - 'cln_home:/root/.lightning'
@@ -112,6 +115,8 @@ services:
       - '--bitcoin-rpcuser=polaruser'
       - '--bitcoin-rpcpassword=polarpass'
       - '--addr=0.0.0.0:19846'
+      # Accept BOLT 8 peers over WebSocket (RFC 6455) on 19847
+      - '--bind-addr=ws:0.0.0.0:19847'
       - '--clnrest-port=3010'
       - '--clnrest-host=0.0.0.0'
       - '--large-channels'
