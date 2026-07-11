@@ -15,6 +15,30 @@ import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
 import { IInitMessage } from '../message/init';
 import { captureWireMessage, captureWireEvent } from './wire-capture';
+import { IDuplexTransport, IPeerTransportOptions } from './duplex-transport';
+import {
+	connectWebSocket,
+	buildWebSocketUrl,
+	WebSocketConstructor
+} from './websocket';
+import { WebSocketServer } from './websocket-server';
+import { NodeWebSocket } from './websocket-node-client';
+
+/**
+ * Default WS client for outbound peers when none is injected. Under Node the
+ * built-in WebSocket (undici) lowercases request headers, which CLN's
+ * case-sensitive `bind-addr=ws:` handshake parser rejects — so Node uses the
+ * in-repo RFC-cased client. Everywhere else (browsers) connectWebSocket
+ * resolves globalThis.WebSocket.
+ */
+function defaultWebSocketImpl(): WebSocketConstructor | undefined {
+	const proc = (globalThis as { process?: { versions?: { node?: string } } })
+		.process;
+	if (proc?.versions?.node) {
+		return NodeWebSocket;
+	}
+	return undefined;
+}
 
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 300_000; // 5 minutes
 const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
@@ -44,6 +68,12 @@ export interface IPeerManagerOptions {
 	socks5TimeoutMs?: number;
 	/** Maximum number of inbound peer connections (default 125) */
 	maxInboundPeers?: number;
+	/** WebSocket constructor for outbound WS peer connections. Defaults to
+	 *  the in-repo RFC-cased Node client under Node (CLN's ws listener
+	 *  rejects the built-in WebSocket's lowercased headers) and to
+	 *  globalThis.WebSocket in browsers. Only consulted when a peer is
+	 *  dialed with transport {type: 'ws'}. */
+	webSocketImpl?: WebSocketConstructor;
 }
 
 export interface IPeerInfo {
@@ -52,6 +82,8 @@ export interface IPeerInfo {
 	port: number;
 	state: string;
 	remoteInit: IInitMessage | null;
+	/** Transport used to dial this peer ('tcp' when absent/unknown). */
+	transport?: 'tcp' | 'ws';
 }
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
@@ -61,8 +93,10 @@ export class PeerManager extends EventEmitter {
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private peers: Map<string, Peer> = new Map();
-	private peerAddresses: Map<string, { host: string; port: number }> =
-		new Map();
+	private peerAddresses: Map<
+		string,
+		{ host: string; port: number; transport?: IPeerTransportOptions }
+	> = new Map();
 	private messageHandlers: Map<number, MessageHandler[]> = new Map();
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
@@ -74,11 +108,13 @@ export class PeerManager extends EventEmitter {
 	private autoReconnect: boolean;
 	private maxReconnectDelay: number;
 	private server: net.Server | null = null;
+	private wsServer: WebSocketServer | null = null;
 	private socks5Proxy?: { host: string; port: number };
 	private socks5TimeoutMs: number;
 	private maxInboundPeers: number;
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
+	private webSocketImpl?: WebSocketConstructor;
 
 	constructor(options: IPeerManagerOptions) {
 		super();
@@ -91,6 +127,7 @@ export class PeerManager extends EventEmitter {
 		this.socks5Proxy = options.socks5Proxy;
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
+		this.webSocketImpl = options.webSocketImpl;
 	}
 
 	/**
@@ -98,14 +135,25 @@ export class PeerManager extends EventEmitter {
 	 * @param pubkey - Remote node's public key (hex string)
 	 * @param host - Remote host address
 	 * @param port - Remote port
+	 * @param transport - Optional transport selection; omit for TCP (default,
+	 *                    unchanged behavior). {type: 'ws', url?} dials over
+	 *                    WebSocket (url defaults to ws://host:port).
 	 */
-	async connectPeer(pubkey: string, host: string, port: number): Promise<void> {
+	async connectPeer(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): Promise<void> {
+		// Keep stored address objects shaped exactly as before for TCP peers
+		// (no `transport` key unless a non-default transport was requested).
+		const addressEntry = transport ? { host, port, transport } : { host, port };
 		if (this.peers.has(pubkey)) {
 			// Idempotent: the post-condition "connected to this peer" already holds.
 			// Throwing here forces every caller (reconnect loops, app code) to special-
 			// case an already-connected peer; instead refresh the cached address and
 			// return successfully.
-			this.peerAddresses.set(pubkey, { host, port });
+			this.peerAddresses.set(pubkey, addressEntry);
 			return;
 		}
 
@@ -114,12 +162,24 @@ export class PeerManager extends EventEmitter {
 		// address (e.g. one typo'd manual connectPeer permanently breaks
 		// reconnection to a channel peer).
 		const previousAddress = this.peerAddresses.get(pubkey);
-		this.peerAddresses.set(pubkey, { host, port });
+		this.peerAddresses.set(pubkey, addressEntry);
 
-		// Use explicit proxy, or auto-detect .onion → default Tor SOCKS5 proxy
-		const proxy =
-			this.socks5Proxy ??
-			(host.endsWith('.onion') ? DEFAULT_TOR_PROXY : undefined);
+		let createSocket:
+			| ((h: string, p: number) => Promise<IDuplexTransport>)
+			| undefined;
+		if (transport?.type === 'ws') {
+			// WebSocket transport (does NOT route through the SOCKS5 proxy)
+			const url = transport.url ?? buildWebSocketUrl(host, port);
+			const webSocketImpl = this.webSocketImpl ?? defaultWebSocketImpl();
+			createSocket = (): Promise<IDuplexTransport> =>
+				connectWebSocket(url, { webSocketImpl });
+		} else {
+			// Use explicit proxy, or auto-detect .onion → default Tor SOCKS5 proxy
+			const proxy =
+				this.socks5Proxy ??
+				(host.endsWith('.onion') ? DEFAULT_TOR_PROXY : undefined);
+			createSocket = proxy ? this.buildSocks5Factory(proxy) : undefined;
+		}
 
 		const peer = new Peer({
 			localPrivateKey: this.localPrivateKey,
@@ -128,7 +188,7 @@ export class PeerManager extends EventEmitter {
 			port,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
-			createSocket: proxy ? this.buildSocks5Factory(proxy) : undefined
+			createSocket
 		});
 
 		this.setupPeerListeners(pubkey, peer);
@@ -216,13 +276,15 @@ export class PeerManager extends EventEmitter {
 		const result: IPeerInfo[] = [];
 		for (const [pubkey, peer] of this.peers) {
 			const addr = this.peerAddresses.get(pubkey);
-			result.push({
+			const info: IPeerInfo = {
 				pubkey,
 				host: addr?.host || peer.host,
 				port: addr?.port || peer.port,
 				state: peer.getState(),
 				remoteInit: peer.getRemoteInit()
-			});
+			};
+			if (addr?.transport?.type === 'ws') info.transport = 'ws';
+			result.push(info);
 		}
 		return result;
 	}
@@ -276,20 +338,66 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
-	 * Stop listening for inbound connections.
+	 * Start listening for inbound peers over WebSocket (RFC 6455). Opt-in and
+	 * additive: coexists with (does not replace) the TCP listener.
+	 */
+	async listenWebSocket(port: number, host = '0.0.0.0'): Promise<void> {
+		if (this.wsServer) {
+			throw new Error('Already listening for WebSocket peers');
+		}
+		const server = new WebSocketServer();
+		server.on('connection', (transport: IDuplexTransport) => {
+			this.handleInboundConnection(transport);
+		});
+		server.on('error', (err: Error) => {
+			this.emit('listen:error', err);
+		});
+		await server.listen(port, host);
+		this.wsServer = server;
+		const addr = server.address();
+		const boundPort = addr && typeof addr === 'object' ? addr.port : port;
+		this.emit('listening:ws', boundPort, host);
+	}
+
+	/**
+	 * Stop listening for inbound connections (TCP and WebSocket).
 	 */
 	stopListening(): void {
 		if (this.server) {
 			this.server.close();
 			this.server = null;
 		}
+		if (this.wsServer) {
+			this.wsServer.close();
+			this.wsServer = null;
+		}
 	}
 
 	/**
-	 * Whether the peer manager is listening for inbound connections.
+	 * Whether the peer manager is listening for inbound connections
+	 * (TCP or WebSocket).
 	 */
 	isListening(): boolean {
-		return this.server !== null && this.server.listening;
+		return (
+			(this.server !== null && this.server.listening) ||
+			(this.wsServer !== null && this.wsServer.isListening())
+		);
+	}
+
+	/**
+	 * Whether the WebSocket listener is active.
+	 */
+	isListeningWebSocket(): boolean {
+		return this.wsServer !== null && this.wsServer.isListening();
+	}
+
+	/**
+	 * Bound WebSocket listener port (null when not listening). Useful when
+	 * listening on port 0.
+	 */
+	getWebSocketListenerPort(): number | null {
+		const addr = this.wsServer?.address();
+		return addr && typeof addr === 'object' ? addr.port : null;
 	}
 
 	/**
@@ -312,7 +420,7 @@ export class PeerManager extends EventEmitter {
 		this.messageHandlers.clear();
 	}
 
-	private handleInboundConnection(socket: net.Socket): void {
+	private handleInboundConnection(socket: IDuplexTransport): void {
 		// Reject if at inbound peer limit
 		if (this.inboundPeerCount >= this.maxInboundPeers) {
 			socket.destroy();
@@ -429,7 +537,7 @@ export class PeerManager extends EventEmitter {
 		const timer = setTimeout(async () => {
 			this.reconnectTimers.delete(pubkey);
 			try {
-				await this.connectPeer(pubkey, addr.host, addr.port);
+				await this.connectPeer(pubkey, addr.host, addr.port, addr.transport);
 			} catch {
 				// connectPeer re-schedules when autoReconnect is enabled
 			}

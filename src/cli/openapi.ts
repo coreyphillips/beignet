@@ -718,12 +718,14 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/peer/connect': {
 				post: {
 					summary:
-						'Connect to a peer (omit host+port to resolve the address from the gossip graph / DNS bootstrap)',
+						'Connect to a peer (omit host+port to resolve the address from the gossip graph / DNS bootstrap; pass transport "ws" and/or a ws:///wss:// url to dial over WebSocket)',
 					tags: ['Peers'],
 					requestBody: bodyContent({
 						pubkey: 'string',
 						host: 'string?',
-						port: 'number?'
+						port: 'number?',
+						transport: 'string?',
+						url: 'string?'
 					}),
 					responses: {
 						'200': {

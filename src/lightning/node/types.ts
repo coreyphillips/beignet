@@ -16,6 +16,7 @@ import { IChainBackend } from '../chain/chain-watcher';
 import { ILogger } from '../../logger';
 import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
+import { WebSocketConstructor } from '../transport/websocket';
 
 export type { IInvoiceInfo };
 
@@ -169,6 +170,14 @@ export interface INodeConfig {
 	announcedAddresses?: INodeAddress[];
 	/** SOCKS5 proxy for outbound peer connections (e.g. Tor on 127.0.0.1:9050) */
 	socks5Proxy?: { host: string; port: number };
+	/**
+	 * WebSocket constructor for outbound WS peer connections. Defaults to the
+	 * in-repo RFC-cased Node client under Node (CLN's ws listener rejects the
+	 * built-in WebSocket's lowercased headers) and to globalThis.WebSocket in
+	 * browsers. Only consulted when a peer is dialed with transport
+	 * {type: 'ws'}; mirrors how electrumOptions injects net/tls.
+	 */
+	webSocketImpl?: WebSocketConstructor;
 	/**
 	 * Watchtowers to ship encrypted justice data to at every revocation, as
 	 * `pubkey@host:port` URIs (LND altruist wtwire protocol). Empty/undefined

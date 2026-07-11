@@ -518,9 +518,40 @@ export async function startDaemon(
 			const {
 				pubkey,
 				host: peerHost,
-				port: peerPort
-			} = body as { pubkey: string; host?: string; port?: number };
+				port: peerPort,
+				transport: peerTransport,
+				url: peerUrl
+			} = body as {
+				pubkey: string;
+				host?: string;
+				port?: number;
+				transport?: string;
+				url?: string;
+			};
 			if (!pubkey) return failure('INVALID_PARAMS', 'pubkey required');
+			// Additive WebSocket support: transport 'ws' and/or an explicit
+			// ws:// / wss:// url. Omitting both preserves TCP behavior exactly.
+			if (
+				peerTransport !== undefined &&
+				peerTransport !== 'tcp' &&
+				peerTransport !== 'ws'
+			)
+				return failure('INVALID_PARAMS', "transport must be 'tcp' or 'ws'");
+			if (peerUrl !== undefined) {
+				if (typeof peerUrl !== 'string' || !/^wss?:\/\//i.test(peerUrl))
+					return failure('INVALID_PARAMS', 'url must be a ws:// or wss:// URL');
+				if (peerTransport === 'tcp')
+					return failure(
+						'INVALID_PARAMS',
+						"transport 'tcp' cannot be combined with a WebSocket url"
+					);
+				return success(
+					await node.connectPeer(pubkey, peerHost, peerPort, {
+						type: 'ws',
+						url: peerUrl
+					})
+				);
+			}
 			// host/port are optional together: when omitted the node resolves the
 			// address from the gossip graph / DNS bootstrap.
 			if ((peerHost === undefined) !== (peerPort === undefined))
@@ -528,6 +559,16 @@ export async function startDaemon(
 					'INVALID_PARAMS',
 					'host and port must be provided together (omit both to resolve by node id)'
 				);
+			if (peerTransport === 'ws') {
+				if (peerHost === undefined)
+					return failure(
+						'INVALID_PARAMS',
+						"transport 'ws' requires host+port or url"
+					);
+				return success(
+					await node.connectPeer(pubkey, peerHost, peerPort, { type: 'ws' })
+				);
+			}
 			return success(await node.connectPeer(pubkey, peerHost, peerPort));
 		},
 		'POST /peer/disconnect': (body) => {

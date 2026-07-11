@@ -32,6 +32,7 @@ import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import { IPaymentInfo } from '../lightning/node/types';
+import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
 import { SqliteStorage } from '../lightning/storage/sqlite-storage';
 import { deriveStorageKey } from '../lightning/storage/encryption';
@@ -168,6 +169,11 @@ export interface BeignetNodeOptions {
 	 */
 	feeEstimationSource?: 'electrum' | 'http' | 'auto';
 	listenPort?: number;
+	/**
+	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
+	 * Opt-in and additive: coexists with the TCP listener on listenPort.
+	 */
+	websocketPort?: number;
 	preferAnchors?: boolean;
 	/**
 	 * option_wumbo (large_channels, default false): advertise the bit and lift
@@ -496,6 +502,7 @@ export class BeignetNode extends EventEmitter {
 	private _failoverInProgress = false;
 	private _backupPromise?: Promise<void>;
 	private _listenPort?: number;
+	private _websocketPort?: number;
 	private _connectTimeoutMs = 15_000;
 	private _dailySpendLimitSats?: number;
 	// _dailySpentSats is the combined LN + onchain total; the two source
@@ -1083,6 +1090,14 @@ export class BeignetNode extends EventEmitter {
 				// Non-fatal
 			}
 		}
+		if (opts.websocketPort) {
+			try {
+				await this.node.listenWebSocket(opts.websocketPort);
+				this._websocketPort = opts.websocketPort;
+			} catch {
+				// Non-fatal
+			}
+		}
 
 		// 11. Connect timeout + Daily spending limit
 		if (opts.connectTimeoutMs !== undefined && opts.connectTimeoutMs > 0) {
@@ -1185,7 +1200,7 @@ export class BeignetNode extends EventEmitter {
 	getInfo(): NodeInfo {
 		const info = this.node.getNodeInfo();
 		const lightningBalance = this.getLightningBalanceSats();
-		return {
+		const result: NodeInfo = {
 			nodeId: info.nodeId,
 			alias: info.alias,
 			network: this.networkName,
@@ -1198,6 +1213,10 @@ export class BeignetNode extends EventEmitter {
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
 		};
+		if (this._websocketPort !== undefined) {
+			result.websocketPort = this._websocketPort;
+		}
+		return result;
 	}
 
 	getMnemonic(): string {
@@ -1978,16 +1997,19 @@ export class BeignetNode extends EventEmitter {
 	async connectPeer(
 		pubkey: string,
 		host?: string,
-		port?: number
+		port?: number,
+		transport?: IPeerTransportOptions
 	): Promise<PeerInfo> {
 		// Where we are dialing, for error messages: explicit host:port, or the
 		// gossip/DNS resolution the library performs when both are omitted.
 		const target =
-			host !== undefined && port !== undefined
+			transport?.type === 'ws' && transport.url !== undefined
+				? transport.url
+				: host !== undefined && port !== undefined
 				? `${host}:${port}`
 				: 'resolved address (gossip graph / DNS bootstrap)';
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const connectPromise = this.node.connectPeer(pubkey, host, port);
+		const connectPromise = this.node.connectPeer(pubkey, host, port, transport);
 		const timeoutPromise = new Promise<never>((_, reject) => {
 			timer = setTimeout(
 				() =>
