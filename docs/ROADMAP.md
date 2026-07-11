@@ -77,7 +77,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       per-session Noise keys, persisted sessions + un-acked backlog with retry,
       config watchtowers[] URIs. Deferred + documented: anchor to_remote and
       taproot (v1 blob) coverage, reward sessions.
-- [~] Anchor + taproot tower coverage (this PR): LND v1 (taproot) justice kits
+- [x] Anchor + taproot tower coverage (PR #64, merged): LND v1 (taproot) justice kits
       (300-byte plaintext pinned byte-exact to LND justice_kit_packet.go, same
       XChaCha20 envelope), tower-side reconstruction cross-checked against a
       REAL revoked taproot commitment. FIXES a fund-safety gap: anchor blobs
@@ -127,11 +127,11 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [x] Connect by node id alone (PR #45, merged): connectPeer(pubkey) resolves addresses from
       gossip node_announcement in announced order (Tor skipped without socks5Proxy,
       .onion re-encoded for dialing), DNS bootstrap fallback, error lists every attempt.
-- [~] Advisor execution, phase 1 (this PR): rebalanceChannel (first-hop-pinned route,
+- [x] Advisor execution, phase 1 (PR #46, merged): rebalanceChannel (first-hop-pinned route,
       final hop via our own invoice hint, strict maxFeeSats abort BEFORE sending,
       HTLC-cap clamping) + executeRebalanceRecommendations with a persisted UTC-day
       fee budget; off by default.
-- [~] Advisor execution, phase 2 (this PR): autoTuneFees loop nudging per-channel ppm
+- [x] Advisor execution, phase 2 (PR #46, merged): autoTuneFees loop nudging per-channel ppm
       +/-25% (floor/ceil clamped, one adjustment per channel per interval) from
       depletion + the #43 forwarding ledger via the #40 policy API; off by default.
 - [x] Fee estimator sanity clamp (PR #45, merged): estimateFee output clamped to 5000 sat/vB
@@ -163,16 +163,16 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [x] Expose existing methods with no route (PR #47, merged): syncGossip, syncRapidGossip,
       getChannelDiagnostics, validateAddress, recoverFallbackFunds, triggerBackup
       all routed + CLI.
-- [~] CLI parity sweep (this PR): every one of the 114 daemon routes now has a CLI
+- [x] CLI parity sweep (PR #50, merged): every one of the 114 daemon routes now has a CLI
       command or a documented intentionally-none entry (/events SSE, /openapi.json,
       deprecated /channel/update-fee alias); enforced by a source-derived
       regression test that fails on future drift either way.
-- [~] Event granularity (this PR): invoice:settled (never fires on keysend),
+- [x] Event granularity (PR #50, merged): invoice:settled (never fires on keysend),
       channel:opening / pending-close / force-closing (local and remote, deduped),
       htlc:forwarded/fulfilled/failed behind an htlcEvents flag; all wired through
       SSE + webhooks with wildcard coverage. invoice:expired skipped: no issued-
       invoice expiry sweep exists (payer-side scan only); would be new machinery.
-- [~] Seed generation parity (this PR): documented (README + OpenAPI): seed creation
+- [x] Seed generation parity (PR #50, merged): documented (README + OpenAPI): seed creation
       is CLI init only; GET /mnemonic reveals it only when apiToken is configured.
 
 ## M5. Onchain wallet features
@@ -280,7 +280,7 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - [ ] LSPS0/1/2 (client side first if Blocktank integration wants it)
 - [ ] Dynamic commitments
 - [ ] PTLCs
-- [~] WebSocket transport (PROMOTED from parked by Corey 2026-07-10; this PR):
+- [x] WebSocket transport (PROMOTED from parked by Corey 2026-07-10; PR #67, merged):
       IDuplexTransport interface over the existing TCP/SOCKS5 path (types-only
       diff, zero behavior change), browser-clean WS client against the
       standard WebSocket API with injectable constructor, in-repo RFC 6455
@@ -326,7 +326,21 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
-- 2026-07-10: PR #66 merged (key rotation). WebSocket transport (this PR)
+- 2026-07-11: CLN update_fee desync FIXED (this PR): the commitment state
+  machine applied remote update_fee (and peer HTLC updates) to commitments we
+  sign at receipt instead of after revoking for the covering
+  commitment_signed (BOLT 2 two-phase), promoted the pending feerate on any
+  revoke_and_ack, and keyed the shachain slot + reestablish
+  next_revocation_number to the sign counter, producing CLN's "Bad
+  commit_sig" / "bad future last_local_per_commit_secret" force-close chain
+  in CLN-funded channels. Fixed with staged two-phase tracking, a persisted
+  remoteRevocationNumber (legacy defaults preserved), and a commitment-round
+  alternation gate. Offline repro pinned pre-fix; full cln-interop 43/43
+  with Tier 4/8 tightened to strict settled-exact-amount assertions.
+  Related: upstream CLN issue ElementsProject/lightning#9307 filed
+  (case-sensitive WebSocket handshake parsing) with fix PR
+  ElementsProject/lightning#9308.
+- 2026-07-10: PR #66 merged (key rotation). WebSocket transport (PR #67)
   lands the browser-peer prerequisite live-proven vs CLN v26. Two
   pre-existing transport-independent bugs surfaced during interop and are
   QUEUED for their own fix branches: (1) CLN-funded channels desync after
