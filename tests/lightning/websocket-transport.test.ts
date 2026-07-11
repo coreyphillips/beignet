@@ -134,8 +134,14 @@ describe('WebSocket transport (offline)', function () {
 		});
 
 		it('falls back to globalThis.WebSocket when available', function () {
+			// globalThis.WebSocket only exists on Node >= 21 (CI runs 20);
+			// on older Node the "throws when nothing available" case below
+			// covers the resolution path instead.
 			const g = globalThis as { WebSocket?: unknown };
-			expect(typeof g.WebSocket).to.equal('function'); // Node >= 22
+			if (typeof g.WebSocket !== 'function') {
+				this.skip();
+				return;
+			}
 			expect(resolveWebSocketConstructor()).to.equal(g.WebSocket);
 		});
 
@@ -887,14 +893,20 @@ describe('WebSocket transport (offline)', function () {
 		}> = [
 			{ name: 'TCP (net.Socket)', make: tcpPair },
 			{
-				name: 'WebSocket (global undici client)',
-				make: (): Promise<ITransportPair> => wsPair()
-			},
-			{
 				name: 'WebSocket (in-repo Node client)',
 				make: (): Promise<ITransportPair> => wsPair(NodeWebSocket)
 			}
 		];
+		// globalThis.WebSocket only exists on Node >= 21 (CI runs 20); the
+		// in-repo client above covers the same conformance surface there.
+		if (
+			typeof (globalThis as { WebSocket?: unknown }).WebSocket === 'function'
+		) {
+			variants.push({
+				name: 'WebSocket (global undici client)',
+				make: (): Promise<ITransportPair> => wsPair()
+			});
+		}
 
 		for (const variant of variants) {
 			describe(variant.name, function () {
@@ -1041,8 +1053,13 @@ describe('WebSocket transport (offline)', function () {
 				remotePublicKey: responderPub,
 				host: '127.0.0.1',
 				port,
+				// In-repo client explicitly: matches the PeerManager default
+				// under Node and keeps this green on Node 20 (no global
+				// WebSocket there).
 				createSocket: (host, p): Promise<WebSocketTransport> =>
-					connectWebSocket(`ws://${host}:${p}`)
+					connectWebSocket(`ws://${host}:${p}`, {
+						webSocketImpl: NodeWebSocket
+					})
 			});
 			initiator.on('error', () => {});
 
