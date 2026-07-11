@@ -582,6 +582,12 @@ describe('Chain Monitor (Phase 4C)', function () {
 				cltvExpiry: 500,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
+			// Model a completed commitment round: we have revoked for the peer's
+			// add (two-phase update tracking), so the HTLC appears in the
+			// commitment the peer broadcast.
+			for (const e of opener.getFullState().htlcs.values()) {
+				e.addLocallyRevoked = true;
+			}
 
 			const state = opener.getFullState();
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
@@ -635,6 +641,12 @@ describe('Chain Monitor (Phase 4C)', function () {
 				cltvExpiry: 500,
 				onionRoutingPacket: Buffer.alloc(1366)
 			});
+			// Model a completed commitment round: we have revoked for the peer's
+			// add (two-phase update tracking), so the HTLC appears in the
+			// commitment the peer broadcast.
+			for (const e of opener.getFullState().htlcs.values()) {
+				e.addLocallyRevoked = true;
+			}
 
 			const state = opener.getFullState();
 			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));

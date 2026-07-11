@@ -35,6 +35,8 @@ import {
 	setupClnChannel,
 	setupBeignetFundedClnChannel,
 	setupRoutingForChannel,
+	payClnInvoiceStrict,
+	payBeignetInvoiceStrict,
 	bitcoinRpc,
 	getDockerHostAddress,
 	sleep,
@@ -507,54 +509,24 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 		});
 
 		it('should pay CLN invoice', async function () {
-			this.timeout(90_000);
+			this.timeout(120_000);
 
-			node = createInteropNode(130);
-			node.on('node:error', () => {
-				/* absorb */
-			});
-
-			await fundClnWallet(cln);
-			await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
-
-			const beignetNodeId = node.getNodeId();
-
-			// Open channel with push_msat so beignet has outbound capacity
-			await cln.fundChannel(beignetNodeId, 500_000, 200_000_000);
-			await mineBlocks(6);
-			await sleep(3000);
-
-			const channelManager = node.getChannelManager();
-			const channels = channelManager.listChannels();
-			if (channels.length > 0) {
-				const channelId = channels[0].getChannelId();
-				if (channelId) {
-					node.handleFundingConfirmed(channelId);
-
-					// Setup routing for beignet → CLN
-					setupRoutingForChannel(node, clnPubkey);
-				}
-			}
-
-			await waitForClnChannels(cln, 1, 30_000);
-
-			// Create CLN invoice (label must be unique)
-			const label = `test-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-			const clnInvoice = await cln.createInvoice(
-				10_000_000,
-				label,
-				'beignet pays CLN'
+			// STRICT since the remote-update_fee commitment desync fix: a payment
+			// over a CLN-funded channel must SETTLE (exact amount at CLN, payment
+			// COMPLETED at beignet). The old leniency ("may succeed or fail")
+			// papered over the desync this branch fixed.
+			const setup = await setupClnChannel(
+				cln,
+				clnPubkey,
+				130,
+				500_000,
+				200_000_000
 			);
+			node = setup.node;
+			setupRoutingForChannel(node, clnPubkey);
+			await sleep(2000);
 
-			try {
-				const payment = node.sendPayment(clnInvoice.bolt11);
-				// Payment may succeed or fail depending on routing setup
-				expect(payment).to.have.property('paymentHash');
-			} catch (err: unknown) {
-				// If no route found, that's expected without full graph
-				const msg = (err as Error).message || '';
-				expect(msg).to.match(/No route|No channel/);
-			}
+			await payClnInvoiceStrict(node, cln, 10_000_000, 'tier4-pay-cln');
 		});
 
 		it('should include payment_secret in outbound payments', async function () {
@@ -994,7 +966,9 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 		it('should handle bidirectional payments in same channel', async function () {
 			this.timeout(120_000);
 
-			// Open channel with push_msat (both sides have balance)
+			// STRICT since the remote-update_fee commitment desync fix: both
+			// directions must SETTLE with exact amounts (the old leniency
+			// papered over the desync this branch fixed).
 			const setup = await setupClnChannel(
 				cln,
 				clnPubkey,
@@ -1009,42 +983,11 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 
 			await sleep(2000);
 
-			// 1. CLN pays beignet (10k sats)
-			const invoice1 = node.createInvoice({
-				amountMsat: 10_000_000n,
-				description: 'bidirectional test 1 - CLN to beignet'
-			});
+			// 1. CLN pays beignet (10k sats) — must settle.
+			await payBeignetInvoiceStrict(node, cln, 10_000_000, 'tier8-bidi-1');
 
-			let clnPaySuccess = false;
-			try {
-				await cln.pay(invoice1.bolt11);
-				clnPaySuccess = true;
-			} catch {
-				// Payment failure acceptable
-			}
-
-			if (clnPaySuccess) {
-				await sleep(1000);
-
-				// 2. Beignet pays CLN (5k sats)
-				const label = `test-${Date.now()}-${Math.random()
-					.toString(36)
-					.slice(2)}`;
-				const clnInvoice = await cln.createInvoice(
-					5_000_000,
-					label,
-					'bidirectional test 2 - beignet to CLN'
-				);
-
-				try {
-					const payment = node.sendPayment(clnInvoice.bolt11);
-					expect(payment).to.have.property('paymentHash');
-				} catch (err: unknown) {
-					// Route issues are acceptable, but shouldn't crash
-					const msg = (err as Error).message || '';
-					expect(msg).to.match(/No route|No channel|Insufficient/);
-				}
-			}
+			// 2. Beignet pays CLN (5k sats) — must settle.
+			await payClnInvoiceStrict(node, cln, 5_000_000, 'tier8-bidi-2');
 
 			// Node should still be alive
 			expect(node.getNodeInfo().networkingEnabled).to.be.true;
@@ -1066,52 +1009,19 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 
 			await sleep(2000);
 
-			const results: { direction: string; success: boolean }[] = [];
+			// STRICT since the remote-update_fee commitment desync fix: every
+			// alternating payment must SETTLE with its exact amount.
 
 			// Payment 1: CLN → beignet (2k sats)
-			const inv1 = node.createInvoice({
-				amountMsat: 2_000_000n,
-				description: 'alternating 1'
-			});
-			try {
-				await cln.pay(inv1.bolt11);
-				results.push({ direction: 'CLN→beignet', success: true });
-			} catch {
-				results.push({ direction: 'CLN→beignet', success: false });
-			}
+			await payBeignetInvoiceStrict(node, cln, 2_000_000, 'tier8-alt-1');
 			await sleep(1000);
 
 			// Payment 2: beignet → CLN (1k sats)
-			try {
-				const label = `test-${Date.now()}-${Math.random()
-					.toString(36)
-					.slice(2)}`;
-				const clnInv2 = await cln.createInvoice(
-					1_000_000,
-					label,
-					'alternating 2'
-				);
-				node.sendPayment(clnInv2.bolt11);
-				results.push({ direction: 'beignet→CLN', success: true });
-			} catch {
-				results.push({ direction: 'beignet→CLN', success: false });
-			}
+			await payClnInvoiceStrict(node, cln, 1_000_000, 'tier8-alt-2');
 			await sleep(1000);
 
 			// Payment 3: CLN → beignet (3k sats)
-			const inv3 = node.createInvoice({
-				amountMsat: 3_000_000n,
-				description: 'alternating 3'
-			});
-			try {
-				await cln.pay(inv3.bolt11);
-				results.push({ direction: 'CLN→beignet', success: true });
-			} catch {
-				results.push({ direction: 'CLN→beignet', success: false });
-			}
-
-			// At least the first and third payments (CLN→beignet) should work
-			expect(results).to.have.length(3);
+			await payBeignetInvoiceStrict(node, cln, 3_000_000, 'tier8-alt-3');
 
 			// Node should survive the sequence
 			expect(node.getNodeInfo().networkingEnabled).to.be.true;
@@ -1129,26 +1039,16 @@ describe('Interop: Beignet ↔ CLN (regtest)', function () {
 			);
 			node = setup.node;
 
-			// CLN pays beignet
-			const invoice = node.createInvoice({
-				amountMsat: 5_000_000n,
-				description: 'status tracking test'
-			});
+			// STRICT: CLN pays beignet, the incoming payment must complete with
+			// the exact amount (payBeignetInvoiceStrict asserts the tracked
+			// payment record reaches COMPLETED).
+			await payBeignetInvoiceStrict(node, cln, 5_000_000, 'tier8-status');
 
-			try {
-				await cln.pay(invoice.bolt11);
-
-				// Check that beignet tracked the received payment
-				const payments = node.listPayments();
-				const incoming = payments.filter((p) => p.direction === 'INCOMING');
-				expect(incoming.length).to.be.greaterThan(0);
-
-				// At least one should be completed
-				const completed = incoming.filter((p) => p.status === 'COMPLETED');
-				expect(completed.length).to.be.greaterThan(0);
-			} catch {
-				// Payment failure is acceptable
-			}
+			const payments = node.listPayments();
+			const incoming = payments.filter((p) => p.direction === 'INCOMING');
+			expect(incoming.length).to.be.greaterThan(0);
+			const completed = incoming.filter((p) => p.status === 'COMPLETED');
+			expect(completed.length).to.be.greaterThan(0);
 		});
 	});
 

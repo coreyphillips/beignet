@@ -131,6 +131,12 @@ export interface ISerializedHtlcEntry {
 	/** Route blinding: blinding_point (hex) so an in-flight blinded receive
 	 * survives restart and can still peel its onion with the blinded key. */
 	blindingPoint?: string;
+	/** Two-phase update flags (see IHtlcEntry). Optional for compatibility. */
+	addRemoteCommitted?: boolean;
+	removalRemoteCommitted?: boolean;
+	commitCoverPending?: boolean;
+	addLocallyRevoked?: boolean;
+	removalLocallyRevoked?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -158,6 +164,21 @@ export function serializeHtlcEntry(
 		state: e.state,
 		...(e.blindingPoint
 			? { blindingPoint: e.blindingPoint.toString('hex') }
+			: {}),
+		...(e.addRemoteCommitted !== undefined
+			? { addRemoteCommitted: e.addRemoteCommitted }
+			: {}),
+		...(e.removalRemoteCommitted !== undefined
+			? { removalRemoteCommitted: e.removalRemoteCommitted }
+			: {}),
+		...(e.commitCoverPending !== undefined
+			? { commitCoverPending: e.commitCoverPending }
+			: {}),
+		...(e.addLocallyRevoked !== undefined
+			? { addLocallyRevoked: e.addLocallyRevoked }
+			: {}),
+		...(e.removalLocallyRevoked !== undefined
+			? { removalLocallyRevoked: e.removalLocallyRevoked }
 			: {})
 	};
 }
@@ -178,6 +199,21 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 			state: s.state as HtlcState,
 			...(s.blindingPoint
 				? { blindingPoint: Buffer.from(s.blindingPoint, 'hex') }
+				: {}),
+			...(s.addRemoteCommitted !== undefined
+				? { addRemoteCommitted: s.addRemoteCommitted }
+				: {}),
+			...(s.removalRemoteCommitted !== undefined
+				? { removalRemoteCommitted: s.removalRemoteCommitted }
+				: {}),
+			...(s.commitCoverPending !== undefined
+				? { commitCoverPending: s.commitCoverPending }
+				: {}),
+			...(s.addLocallyRevoked !== undefined
+				? { addLocallyRevoked: s.addLocallyRevoked }
+				: {}),
+			...(s.removalLocallyRevoked !== undefined
+				? { removalLocallyRevoked: s.removalLocallyRevoked }
 				: {})
 		}
 	};
@@ -233,6 +269,12 @@ export interface ISerializedChannelState {
 	remoteBasepoints: ISerializedBasepoints | null;
 	localCommitmentNumber: string;
 	remoteCommitmentNumber: string;
+	/**
+	 * Count of revoke_and_ack messages received from the peer (next remote
+	 * revocation index). Optional for backward compatibility; absent means
+	 * "in sync with remoteCommitmentNumber" (see Channel accessors).
+	 */
+	remoteRevocationNumber?: string;
 	needsCommitment?: boolean;
 	/**
 	 * A staged (uncommitted) update_fee rate. Persisted so a restart mid
@@ -240,6 +282,12 @@ export interface ISerializedChannelState {
 	 * with. Optional for backward compatibility.
 	 */
 	pendingFeeratePerKw?: number;
+	/**
+	 * Two-phase update_fee phases for the staged rate (see IChannelState).
+	 * Optional for backward compatibility.
+	 */
+	pendingFeerateSignable?: boolean;
+	pendingFeerateCommitted?: boolean;
 	/**
 	 * The feerate baked into the current signed local commitment (the rate
 	 * remoteCommitmentSignature covers) — force-close rebuilds at this rate.
@@ -462,8 +510,14 @@ export function serializeChannelState(
 			: null,
 		localCommitmentNumber: bigintToStr(s.localCommitmentNumber),
 		remoteCommitmentNumber: bigintToStr(s.remoteCommitmentNumber),
+		remoteRevocationNumber:
+			s.remoteRevocationNumber !== undefined
+				? bigintToStr(s.remoteRevocationNumber)
+				: undefined,
 		needsCommitment: s.needsCommitment,
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		pendingFeerateSignable: s.pendingFeerateSignable,
+		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		localBalanceMsat: bigintToStr(s.localBalanceMsat),
 		remoteBalanceMsat: bigintToStr(s.remoteBalanceMsat),
@@ -618,8 +672,14 @@ export function deserializeChannelState(
 			: null,
 		localCommitmentNumber: strToBigint(s.localCommitmentNumber),
 		remoteCommitmentNumber: strToBigint(s.remoteCommitmentNumber),
+		remoteRevocationNumber:
+			s.remoteRevocationNumber !== undefined
+				? strToBigint(s.remoteRevocationNumber)
+				: undefined,
 		needsCommitment: s.needsCommitment ?? false,
 		pendingFeeratePerKw: s.pendingFeeratePerKw,
+		pendingFeerateSignable: s.pendingFeerateSignable,
+		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
 		localBalanceMsat: strToBigint(s.localBalanceMsat),
 		remoteBalanceMsat: strToBigint(s.remoteBalanceMsat),

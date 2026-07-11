@@ -100,6 +100,7 @@ import {
 	verifyRemoteHtlcSignaturesTaproot,
 	calculateCommitmentFee,
 	getCommitmentFeeRate,
+	getLocalCommitmentFeeRate,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
@@ -454,6 +455,46 @@ export class Channel {
 	 */
 	needsCommitment(): boolean {
 		return this._state.needsCommitment === true;
+	}
+
+	/**
+	 * Revocations received from the peer (the next remote revocation index).
+	 * Legacy states persisted before remoteRevocationNumber existed are
+	 * assumed in sync (every signed commitment revoked) — exactly the
+	 * assumption the pre-counter code baked in everywhere.
+	 */
+	private _remoteRevocationCount(): bigint {
+		return (
+			this._state.remoteRevocationNumber ?? this._state.remoteCommitmentNumber
+		);
+	}
+
+	/**
+	 * The revocation count to validate an INCOMING revoke_and_ack against.
+	 * Legacy states default to remoteCommitmentNumber - 1: the historical
+	 * behavior treated every incoming revoke_and_ack as revoking the
+	 * last-signed commitment.
+	 */
+	private _remoteRevocationCountForRaa(): bigint {
+		if (this._state.remoteRevocationNumber !== undefined) {
+			return this._state.remoteRevocationNumber;
+		}
+		return this._state.remoteCommitmentNumber > 0n
+			? this._state.remoteCommitmentNumber - 1n
+			: 0n;
+	}
+
+	/**
+	 * BOLT 2 commitment-round alternation: true while a commitment_signed we
+	 * sent has not been answered by the peer's revoke_and_ack. Signing another
+	 * commitment in that window desyncs the shachain index bookkeeping (which
+	 * binds each incoming revoke_and_ack to one outstanding commitment), can
+	 * bake a staged update_fee into a commitment the peer does not expect yet,
+	 * and outruns the single-slot commitment_signed retransmission cache used
+	 * on reestablish. Callers defer signing until the revoke_and_ack arrives.
+	 */
+	isAwaitingRemoteRevocation(): boolean {
+		return this._remoteRevocationCount() < this._state.remoteCommitmentNumber;
 	}
 
 	getTemporaryChannelId(): Buffer {
@@ -968,7 +1009,7 @@ export class Channel {
 			// Store remote's commitment signature
 			this._state.remoteCommitmentSignature = msg.signature;
 		}
-		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
 
@@ -1220,7 +1261,7 @@ export class Channel {
 			// Store remote's commitment signature
 			this._state.remoteCommitmentSignature = msg.signature;
 		}
-		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
 
@@ -1485,6 +1526,9 @@ export class Channel {
 			onionRoutingPacket,
 			direction: HtlcDirection.OFFERED,
 			state: HtlcState.PENDING,
+			// Two-phase: the peer incorporates this add into its signatures over
+			// OUR commitment only after revoking a commitment of ours covering it.
+			addRemoteCommitted: false,
 			...(blindingPoint ? { blindingPoint } : {})
 		};
 
@@ -1660,13 +1704,17 @@ export class Channel {
 		};
 
 		this._state.htlcs.set(`received-${msg.id}`, entry);
+		// Two-phase: the peer's add enters commitments WE sign only after we
+		// revoke for the peer's covering commitment_signed (the peer builds its
+		// own local commitment WITHOUT the add until it holds our
+		// revoke_and_ack). handleCommitmentSigned flips this and marks the
+		// commitment we then owe. Setting needsCommitment here (the previous
+		// behavior) let unrelated triggers sign the peer's own add into its
+		// commitment prematurely — "Bad commit_sig" at the peer.
+		entry.addLocallyRevoked = false;
 
 		// Deduct from remote balance provisionally
 		this._state.remoteBalanceMsat -= msg.amountMsat;
-
-		// We received an HTLC — we owe the remote a commitment_signed to commit it
-		// on their side.
-		this._state.needsCommitment = true;
 
 		// Note: HTLC_FORWARDED is NOT emitted here — per BOLT 2, HTLCs should
 		// only be processed after commitment_signed is verified and revoke_and_ack
@@ -1707,6 +1755,9 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FULFILLED;
+		// Two-phase: the peer's signatures still include this HTLC until it
+		// revokes for our removal — buildLocalCommitment keeps it present.
+		entry.removalRemoteCommitted = false;
 
 		// Note: balance is NOT updated here. The credit to localBalanceMsat
 		// happens when the remote sends revoke_and_ack, confirming the
@@ -1780,13 +1831,19 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FULFILLED;
+		// Two-phase: finalize the balance movement (and delete the entry) only
+		// once the peer has revoked for OUR commitment covering this removal.
+		entry.removalRemoteCommitted = false;
+		// And the peer's removal enters commitments WE sign only after we
+		// revoke for its covering commitment_signed — until then the peer's own
+		// local commitment still contains the HTLC, and a premature
+		// removal-applied signature is "Bad commit_sig" at the peer (observed
+		// live vs CLN). handleCommitmentSigned flips this and sets
+		// needsCommitment for the removal-ack round.
+		entry.removalLocallyRevoked = false;
 
 		// Note: balance is NOT updated here. The credit to remoteBalanceMsat
 		// happens when the commitment exchange confirms via revoke_and_ack.
-
-		// We received a fulfill — we owe the remote a commitment_signed to commit
-		// the removal on their side.
-		this._state.needsCommitment = true;
 
 		return [
 			{
@@ -1844,6 +1901,9 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FAILED;
+		// Two-phase: the peer's signatures still include this HTLC until it
+		// revokes for our removal — buildLocalCommitment keeps it present.
+		entry.removalRemoteCommitted = false;
 
 		// Note: balance is NOT refunded here. The refund to remoteBalanceMsat
 		// happens when the commitment exchange confirms the removal (BOLT 2).
@@ -1896,13 +1956,15 @@ export class Channel {
 		}
 
 		entry.state = HtlcState.FAILED;
+		// Two-phase: finalize the refund (and delete the entry) only once the
+		// peer has revoked for OUR commitment covering this removal.
+		entry.removalRemoteCommitted = false;
+		// The peer's removal enters commitments WE sign only after we revoke
+		// for its covering commitment_signed (see handleUpdateFulfillHtlc).
+		entry.removalLocallyRevoked = false;
 
 		// Note: balance is NOT refunded here. The refund to localBalanceMsat
 		// happens when the commitment exchange confirms via revoke_and_ack.
-
-		// We received a fail — we owe the remote a commitment_signed to commit the
-		// removal on their side.
-		this._state.needsCommitment = true;
 
 		return [
 			{
@@ -2153,6 +2215,48 @@ export class Channel {
 		// keyed by its per-commitment point, for pre-emptive justice on breach.
 		this._cacheRemoteCommitmentForWatchtower();
 
+		// A staged update_fee that is signable here (opener always; acceptor
+		// once the fee round reached it — see getRemoteCommitmentFeeRate) is
+		// baked into this signature: the peer's revoke_and_ack for it finalizes
+		// the fee round and promotes the staged rate to the committed config.
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			(this._state.role === ChannelRole.OPENER ||
+				this._state.pendingFeerateSignable === true)
+		) {
+			this._state.pendingFeerateCommitted = true;
+		}
+
+		// Two-phase updates: stamp every entry whose phase THIS signature
+		// advances — the peer's answering revoke_and_ack promotes them
+		// (addRemoteCommitted / removalRemoteCommitted) in handleRevokeAndAck.
+		// A removal is only in this signature once it is signable: our own
+		// removals always are; a peer removal only after we revoked for it
+		// (removalLocallyRevoked — buildRemoteCommitment keeps the HTLC present
+		// until then).
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.addRemoteCommitted === false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.commitCoverPending = true;
+			}
+			if (
+				entry.removalRemoteCommitted === false &&
+				entry.removalLocallyRevoked !== false &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				entry.commitCoverPending = true;
+			}
+		}
+
+		// Materialize the revocation counter (legacy states lack it) BEFORE
+		// advancing the sign counter, so the two can diverge by exactly the one
+		// commitment this signature puts in flight.
+		this._state.remoteRevocationNumber = this._remoteRevocationCount();
+
 		// Advance remote commitment number
 		this._state.remoteCommitmentNumber++;
 
@@ -2379,9 +2483,51 @@ export class Channel {
 		// force-close rebuild reproduces this commitment byte-for-byte even if
 		// the committed configs move on (fee-update promotion, reestablish
 		// rollback, restart).
-		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+
+		// Two-phase update_fee, acceptor side: this commitment_signed from the
+		// opener covers its staged update_fee (the update always precedes its
+		// covering signature on the wire), and the revoke_and_ack below locks
+		// it in on our side. Only NOW may the new rate be baked into
+		// commitments WE sign, and we owe the opener a commitment_signed at
+		// the new rate to complete the fee round. Marking the fee "owed" at
+		// update_fee RECEIPT (the previous behavior) let unrelated triggers
+		// sign at the staged rate before the opener's own commitment expected
+		// it — CLN rejects that with "Bad commit_sig".
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.role === ChannelRole.ACCEPTOR &&
+			this._state.pendingFeerateSignable !== true
+		) {
+			this._state.pendingFeerateSignable = true;
+			this._state.needsCommitment = true;
+		}
+
+		// Two-phase HTLC updates, mirror side: every peer update received
+		// before this commitment_signed is covered by it, and the
+		// revoke_and_ack below revokes for it. Only NOW may those updates be
+		// baked into commitments WE sign, and we owe the peer the
+		// commitment_signed that commits them on its side.
+		for (const entry of this._state.htlcs.values()) {
+			if (
+				entry.addLocallyRevoked === false &&
+				(entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED)
+			) {
+				entry.addLocallyRevoked = true;
+				this._state.needsCommitment = true;
+			}
+			if (
+				entry.removalLocallyRevoked === false &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED)
+			) {
+				entry.removalLocallyRevoked = true;
+				this._state.needsCommitment = true;
+			}
+		}
 
 		// Reveal current per-commitment secret and advance
 		const currentSecret = getPerCommitmentSecret(
@@ -2490,8 +2636,24 @@ export class Channel {
 			}
 		}
 
+		// A revoke_and_ack revokes the OLDEST outstanding commitment we signed —
+		// index = revocations received so far, NOT remoteCommitmentNumber - 1
+		// (the sign counter): with a commitment_signed in flight the two differ,
+		// and indexing off the sign counter mis-slotted the revealed secret
+		// ("Invalid per-commitment secret" → force close, observed live vs CLN).
+		const revocationCount = this._remoteRevocationCountForRaa();
+		if (revocationCount >= this._state.remoteCommitmentNumber) {
+			// No commitment of ours is outstanding — nothing this could revoke.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected revoke_and_ack: no outstanding commitment'
+				}
+			];
+		}
+
 		// Store the revealed secret
-		const expectedIndex = MAX_INDEX - (this._state.remoteCommitmentNumber - 1n);
+		const expectedIndex = MAX_INDEX - revocationCount;
 		const stored = this._state.shaChainStore.addSecret(
 			expectedIndex,
 			msg.perCommitmentSecret
@@ -2504,6 +2666,9 @@ export class Channel {
 				}
 			];
 		}
+
+		// The oldest outstanding commitment is now revoked.
+		this._state.remoteRevocationNumber = revocationCount + 1n;
 
 		// Update remote's per-commitment point
 		this._state.remoteCurrentPerCommitmentPoint =
@@ -2537,8 +2702,34 @@ export class Channel {
 			this._state.pendingLocalUpdatesSignedCount = 0;
 		}
 
-		// Clean up fulfilled/failed HTLCs and finalize balance changes
+		// Two-phase updates: this revoke_and_ack answers our one outstanding
+		// commitment_signed — every entry it stamped is now irrevocably
+		// committed by the peer. Promote the flags so buildLocalCommitment
+		// includes our adds (and applies our removals) from the peer's NEXT
+		// signature onward — exactly when the peer starts covering them.
+		for (const entry of this._state.htlcs.values()) {
+			if (entry.commitCoverPending === true) {
+				entry.commitCoverPending = false;
+				if (
+					entry.state === HtlcState.PENDING ||
+					entry.state === HtlcState.COMMITTED
+				) {
+					entry.addRemoteCommitted = true;
+				} else {
+					entry.removalRemoteCommitted = true;
+				}
+			}
+		}
+
+		// Clean up fulfilled/failed HTLCs and finalize balance changes — but
+		// ONLY once the peer has committed the removal (removalRemoteCommitted
+		// is false while our removal is still awaiting its covering
+		// commitment round; deleting and settling on just any revoke_and_ack
+		// moved balances the peer's signatures did not agree to yet).
 		for (const [key, entry] of this._state.htlcs) {
+			if (entry.removalRemoteCommitted === false) {
+				continue;
+			}
 			if (entry.state === HtlcState.FULFILLED) {
 				if (entry.direction === HtlcDirection.RECEIVED) {
 					// We received and fulfilled: credit our balance
@@ -2560,15 +2751,26 @@ export class Channel {
 			}
 		}
 
-		// A staged fee update is now irrevocably committed on both sides (the round
-		// has finalized) — promote it to the committed config and clear pending.
-		if (this._state.pendingFeeratePerKw !== undefined) {
+		// A staged fee update we SIGNED at (pendingFeerateCommitted) is now
+		// irrevocably committed on both sides — this revoke_and_ack answers
+		// exactly that signature (one commitment outstanding at a time) —
+		// promote it to the committed config and clear the staging. A staged
+		// fee we have NOT signed at yet must survive: this revoke_and_ack
+		// belongs to an earlier round that interleaved with the update_fee,
+		// and promoting (or clearing) it here desynced the commitment feerate
+		// against CLN.
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.pendingFeerateCommitted === true
+		) {
 			if (this._state.role === ChannelRole.OPENER) {
 				this._state.localConfig.feeratePerKw = this._state.pendingFeeratePerKw;
 			} else {
 				this._state.remoteConfig.feeratePerKw = this._state.pendingFeeratePerKw;
 			}
 			this._state.pendingFeeratePerKw = undefined;
+			this._state.pendingFeerateSignable = false;
+			this._state.pendingFeerateCommitted = false;
 		}
 
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
@@ -2673,12 +2875,30 @@ export class Channel {
 			];
 		}
 
+		// One fee round at a time: once the staged rate is baked into a
+		// commitment_signed we sent (committed), overwriting it would promote a
+		// rate the peer never saw in that signature when its revoke_and_ack
+		// arrives. Propose again after the in-flight round settles.
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.pendingFeerateCommitted === true
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Previous fee update still committing'
+				}
+			];
+		}
+
 		// Stage the new feerate as pending — do NOT apply it to the committed
 		// config yet. It is used for the commitment built in this round and only
 		// promoted to localConfig.feeratePerKw once the round irrevocably commits
 		// (handleRevokeAndAck). If a restart interrupts the round, reestablish
 		// rolls it back, avoiding a permanent commitment-fee desync.
 		this._state.pendingFeeratePerKw = feeratePerKw;
+		this._state.pendingFeerateSignable = false;
+		this._state.pendingFeerateCommitted = false;
 
 		const msg: IUpdateFeeMessage = {
 			channelId: this._state.channelId!,
@@ -2688,7 +2908,14 @@ export class Channel {
 		// Fee change is an update — we owe the remote a commitment_signed.
 		this._state.needsCommitment = true;
 
-		return [sendMsg(MessageType.UPDATE_FEE, encodeUpdateFeeMessage(msg))];
+		const payload = encodeUpdateFeeMessage(msg);
+		// BOLT 2 reestablish: like every update, the peer forgets an
+		// uncommitted update_fee across a disconnect — queue it so a
+		// reconnect replays it BEFORE any retransmitted commitment_signed
+		// (whose cached bytes were signed at the new rate).
+		this._queuePendingLocalUpdate(MessageType.UPDATE_FEE, payload);
+
+		return [sendMsg(MessageType.UPDATE_FEE, payload)];
 	}
 
 	/**
@@ -2790,11 +3017,33 @@ export class Channel {
 		// remoteConfig immediately. It is promoted to the committed config once the
 		// round finalizes, and rolled back on reestablish if interrupted — keeping
 		// our commitment fee in lockstep with the opener's.
+		//
+		// Two-phase (BOLT 2, mirrors CLN's fee state machine): from here the
+		// staged rate applies to verifying the opener's signatures over OUR
+		// commitment (the opener bakes its own fee into everything it signs from
+		// the moment it sends update_fee). It must NOT yet apply to commitments
+		// WE sign, and we do NOT owe a commitment_signed yet: that happens only
+		// after the opener's covering commitment_signed arrives and we revoke
+		// (handleCommitmentSigned sets pendingFeerateSignable + needsCommitment).
+		// Setting needsCommitment here let any unrelated trigger (our own HTLC
+		// add/fulfill, a prior round's revoke_and_ack) sign the opener's
+		// commitment at the new rate while the opener still expected the old one
+		// — "Bad commit_sig" at CLN, force close (observed live).
+		//
+		// A NEW update_fee while a previous staged rate already reached the
+		// signable phase: the previous rate is locked into the exchange (the
+		// opener saw our revocation for its covering commitment and expects our
+		// signatures at it until THIS one completes its own half-round) —
+		// promote it to the committed config before staging the replacement.
+		if (
+			this._state.pendingFeeratePerKw !== undefined &&
+			this._state.pendingFeerateSignable === true
+		) {
+			this._state.remoteConfig.feeratePerKw = this._state.pendingFeeratePerKw;
+		}
 		this._state.pendingFeeratePerKw = msg.feeratePerKw;
-
-		// We received a fee update — we owe the remote a commitment_signed to
-		// commit it on their side.
-		this._state.needsCommitment = true;
+		this._state.pendingFeerateSignable = false;
+		this._state.pendingFeerateCommitted = false;
 		return [];
 	}
 
@@ -4170,21 +4419,47 @@ export class Channel {
 		this._state.preReestablishState = this._state.state;
 		this._state.state = ChannelState.AWAITING_REESTABLISH;
 
-		// Roll back any uncommitted fee update. A disconnect/restart may have
+		// Roll back an uncommitted fee update. A disconnect/restart may have
 		// interrupted the fee-update commitment round before it finalized; without
 		// this rollback we would keep building commitments at a feerate the peer
 		// never committed to, permanently desyncing the commitment transactions.
-		this._state.pendingFeeratePerKw = undefined;
+		//
+		// EXCEPTION: a staged fee that already reached the signable/committed
+		// phase is covered by exchanged signatures and revocations — the peer
+		// will NOT replay the update_fee after reconnect (it is committed on its
+		// ledger), so rolling it back here is what would desync. It survives the
+		// reconnect and finishes its round via the reestablish retransmissions.
+		if (
+			this._state.pendingFeerateSignable !== true &&
+			this._state.pendingFeerateCommitted !== true
+		) {
+			this._state.pendingFeeratePerKw = undefined;
+			// Drop the matching queued update_fee retransmission (opener): the
+			// staged rate was rolled back, so replaying the update on reconnect
+			// would stage a rate on the peer that we no longer track.
+			this._state.pendingLocalUpdates = (
+				this._state.pendingLocalUpdates ?? []
+			).filter((u) => u.type !== MessageType.UPDATE_FEE);
+		}
 	}
 
 	/**
 	 * Create a channel_reestablish message for reconnection.
 	 */
 	createReestablish(): ChannelAction[] {
+		// BOLT 2: next_revocation_number is the commitment number of the next
+		// revoke_and_ack we expect to RECEIVE — the count of revocations
+		// received so far, NOT of commitments we signed. With a
+		// commitment_signed in flight (unrevoked) the sign counter is one
+		// ahead; using it here overclaimed the peer's revocations and paired
+		// the claim with a secret we never received (all zeros) — CLN fails
+		// the connection with "bad future last_local_per_commit_secret: N vs
+		// N-1" and force-closes.
+		const revocationCount = this._remoteRevocationCount();
 		const lastSecret =
-			this._state.remoteCommitmentNumber > 0n
+			revocationCount > 0n
 				? this._state.shaChainStore.getSecret(
-						MAX_INDEX - (this._state.remoteCommitmentNumber - 1n)
+						MAX_INDEX - (revocationCount - 1n)
 				  ) || Buffer.alloc(32)
 				: Buffer.alloc(32);
 
@@ -4196,7 +4471,7 @@ export class Channel {
 		const msg: IChannelReestablishMessage = {
 			channelId: this._state.channelId!,
 			nextCommitmentNumber: this._state.localCommitmentNumber + 1n,
-			nextRevocationNumber: this._state.remoteCommitmentNumber,
+			nextRevocationNumber: revocationCount,
 			yourLastPerCommitmentSecret: lastSecret,
 			myCurrentPerCommitmentPoint: myCurrentPoint
 		};
@@ -6334,7 +6609,7 @@ export class Channel {
 		// The rate the spliced commitment was verified at (before the standard
 		// path commits any staged update_fee) — force-close must rebuild at this
 		// exact rate to match the adopted signature.
-		const spliceSigFeeratePerKw = getCommitmentFeeRate(spliced);
+		const spliceSigFeeratePerKw = getLocalCommitmentFeeRate(spliced);
 
 		// Now run the current-funding commitment through the standard path (it
 		// verifies at the same post-round height, adopts any staged feerate,
@@ -6565,7 +6840,7 @@ export class Channel {
 			// a feerate that may have been staged (update_fee) but not yet signed.
 			this._state.lastSignedCommitFeeratePerKw =
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
-				getCommitmentFeeRate(this._state);
+				getLocalCommitmentFeeRate(this._state);
 		} else {
 			this._state.needsCommitment = true;
 		}
@@ -8038,7 +8313,7 @@ export class Channel {
 		}
 		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
 		this._state.remoteHtlcSignatures = [];
-		this._state.lastSignedCommitFeeratePerKw = getCommitmentFeeRate(
+		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
 		this._v2ReceivedCommitment = true;

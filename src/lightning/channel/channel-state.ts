@@ -102,6 +102,21 @@ export interface IChannelState {
 	remoteCommitmentNumber: bigint;
 
 	/**
+	 * How many revoke_and_ack messages we have RECEIVED from the peer — i.e.
+	 * the index of the next remote commitment we expect the peer to revoke.
+	 * remoteCommitmentNumber counts commitments we have SIGNED; while a
+	 * commitment_signed of ours is in flight (unrevoked) the two differ by one.
+	 * The shachain insertion index and channel_reestablish's
+	 * next_revocation_number MUST come from this counter, not the sign counter:
+	 * deriving them from remoteCommitmentNumber desynced the channel whenever a
+	 * signature was outstanding ("Invalid per-commitment secret" locally, "bad
+	 * future last_local_per_commit_secret" at CLN). Optional for backward
+	 * compatibility with states persisted before it existed (see the accessors
+	 * in Channel for the legacy defaults).
+	 */
+	remoteRevocationNumber?: bigint;
+
+	/**
 	 * BOLT 2: true when we have pending updates (HTLC add/fulfill/fail or fee
 	 * change) that have not yet been committed to the remote via a
 	 * commitment_signed we sent. Set when an update is added/received, cleared
@@ -121,6 +136,27 @@ export interface IChannelState {
 	 * finalizes; cleared (rolled back) on reestablish if still uncommitted.
 	 */
 	pendingFeeratePerKw?: number;
+
+	/**
+	 * Two-phase update_fee tracking (BOLT 2: an update takes effect on a
+	 * commitment only once that commitment round covers it — mirroring CLN's
+	 * per-side fee state machine):
+	 *
+	 * pendingFeerateSignable (acceptor only): the staged REMOTE update_fee has
+	 * been committed to OUR local commitment (we verified the opener's covering
+	 * commitment_signed and revoked). Only from this point may the new rate be
+	 * baked into commitments WE sign — the opener builds its own commitment at
+	 * the old rate until it has received our revoke_and_ack, so signing at the
+	 * new rate any earlier produces a bad signature at the opener.
+	 *
+	 * pendingFeerateCommitted (both roles): we have SIGNED a commitment at the
+	 * staged rate; the peer's next revoke_and_ack finalizes the round and
+	 * promotes the staged rate to the committed config. Promoting on just any
+	 * revoke_and_ack (the previous behavior) committed the rate prematurely
+	 * when the update_fee interleaved with an unrelated round.
+	 */
+	pendingFeerateSignable?: boolean;
+	pendingFeerateCommitted?: boolean;
 
 	/**
 	 * The feerate baked into OUR current local commitment — the exact rate the
@@ -428,6 +464,7 @@ export function createOpenerState(params: {
 
 		localCommitmentNumber: 0n,
 		remoteCommitmentNumber: 0n,
+		remoteRevocationNumber: 0n,
 		needsCommitment: false,
 
 		localBalanceMsat: params.fundingSatoshis * 1000n - params.pushMsat,
@@ -535,6 +572,7 @@ export function createAcceptorState(params: {
 
 		localCommitmentNumber: 0n,
 		remoteCommitmentNumber: 0n,
+		remoteRevocationNumber: 0n,
 		needsCommitment: false,
 
 		// For acceptor: remote (opener) has funding - push, local gets push

@@ -83,6 +83,57 @@ export interface IHtlcEntry {
 	 * blinded hop uses it to derive its blinded node key for onion processing.
 	 */
 	blindingPoint?: Buffer;
+
+	/**
+	 * BOLT 2 two-phase updates — OUR side of an update the PEER has not yet
+	 * irrevocably committed. The peer only bakes an update of ours into its
+	 * signatures over OUR commitment after it has revoked a commitment of its
+	 * own covering the update; until then, commitments the peer signs (and
+	 * that we verify with buildLocalCommitment) legitimately EXCLUDE it.
+	 *
+	 * addRemoteCommitted (OFFERED entries we added): false from addHtlc until
+	 * the peer's revoke_and_ack for our commitment_signed covering the add.
+	 * While false, buildLocalCommitment omits the HTLC output and returns the
+	 * provisionally-deducted amount to our balance.
+	 *
+	 * removalRemoteCommitted (FULFILLED/FAILED entries): false from OUR
+	 * update_fulfill/fail (RECEIVED direction) or from receiving the peer's
+	 * (OFFERED direction) until the peer's revoke_and_ack for our
+	 * commitment_signed covering the removal. While false on a RECEIVED entry,
+	 * buildLocalCommitment still includes the HTLC (the peer's signatures do).
+	 * The removal's balance movement is finalized (and the entry deleted) only
+	 * once it is no longer false.
+	 *
+	 * commitCoverPending: stamp set by signCommitment on every entry whose
+	 * phase the in-flight commitment advances; the answering revoke_and_ack
+	 * promotes the flags above and clears it.
+	 *
+	 * MIRROR SIDE — the PEER's updates that WE have not revoked for yet. We may
+	 * only bake a peer update into commitments WE sign (buildRemoteCommitment)
+	 * after we have revoked our own prior commitment in response to the peer's
+	 * commitment_signed covering that update; the peer builds its own local
+	 * commitment WITHOUT the update until it holds our revoke_and_ack, so
+	 * signing it in early produces "Bad commit_sig" at the peer (observed live
+	 * vs CLN when its update_fail interleaved with its revoke_and_ack).
+	 *
+	 * addLocallyRevoked (RECEIVED entries the peer added): false from
+	 * handleUpdateAddHtlc until we revoke for the peer's covering
+	 * commitment_signed. While false, buildRemoteCommitment omits the HTLC and
+	 * returns the peer's provisionally-deducted amount.
+	 *
+	 * removalLocallyRevoked (OFFERED entries the peer fulfilled/failed): false
+	 * from handleUpdateFulfill/FailHtlc until we revoke for the covering
+	 * commitment_signed. While false, buildRemoteCommitment still includes the
+	 * HTLC.
+	 *
+	 * All are optional: absent (legacy persisted states and hand-built
+	 * fixtures) means "already committed/revoked" — the pre-two-phase behavior.
+	 */
+	addRemoteCommitted?: boolean;
+	removalRemoteCommitted?: boolean;
+	commitCoverPending?: boolean;
+	addLocallyRevoked?: boolean;
+	removalLocallyRevoked?: boolean;
 }
 
 /**

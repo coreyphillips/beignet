@@ -194,9 +194,23 @@ function filterUntrimmedHtlcs<
 	});
 }
 
+/** The last COMMITTED channel feerate (fee rounds fully finalized). */
+function committedFeeRate(state: IChannelState): number {
+	return state.role === ChannelRole.OPENER
+		? state.localConfig.feeratePerKw
+		: state.remoteConfig.feeratePerKw;
+}
+
 /**
  * Get the fee rate for the commitment tx.
  * The opener sets the fee rate.
+ *
+ * Generic/advisory rate (dust-exposure guards, fee suggestions): the staged
+ * update_fee rate when one is in flight, else the committed rate. Commitment
+ * CONSTRUCTION must not use this — the staged rate applies to our local and
+ * the peer's commitment at DIFFERENT points of the fee round (BOLT 2
+ * two-phase updates); use getLocalCommitmentFeeRate /
+ * getRemoteCommitmentFeeRate instead.
  */
 export function getCommitmentFeeRate(
 	state: IChannelState,
@@ -210,15 +224,68 @@ export function getCommitmentFeeRate(
 	if (signedLocal && state.lastSignedCommitFeeratePerKw !== undefined) {
 		return state.lastSignedCommitFeeratePerKw;
 	}
-	// A staged (proposed) fee update applies to the in-flight commitment for both
-	// parties — they both saw the update_fee before this round. It becomes the
-	// committed config once the round finalizes (or is rolled back on reestablish).
 	if (state.pendingFeeratePerKw !== undefined) {
 		return state.pendingFeeratePerKw;
 	}
-	return state.role === ChannelRole.OPENER
-		? state.localConfig.feeratePerKw
-		: state.remoteConfig.feeratePerKw;
+	return committedFeeRate(state);
+}
+
+/**
+ * Fee rate for OUR local commitment — verifying the peer's commitment_signed
+ * or rebuilding what they signed.
+ *
+ * Acceptor: a staged remote update_fee applies IMMEDIATELY — the opener bakes
+ * its own fee into every signature it produces from the moment it sends
+ * update_fee, and the update_fee always precedes its covering
+ * commitment_signed on the wire.
+ *
+ * Opener: our own staged update_fee does NOT apply — the acceptor may only
+ * sign at the new rate after it has revoked a commitment covering the fee,
+ * and its revoke_and_ack promotes our staged rate to the committed config
+ * BEFORE any new-rate signature of the acceptor can arrive. Until then the
+ * peer's signatures (including ones that crossed our update_fee in flight)
+ * are over the OLD rate.
+ */
+export function getLocalCommitmentFeeRate(
+	state: IChannelState,
+	signedLocal = false
+): number {
+	if (signedLocal && state.lastSignedCommitFeeratePerKw !== undefined) {
+		return state.lastSignedCommitFeeratePerKw;
+	}
+	if (
+		state.pendingFeeratePerKw !== undefined &&
+		state.role === ChannelRole.ACCEPTOR
+	) {
+		return state.pendingFeeratePerKw;
+	}
+	return committedFeeRate(state);
+}
+
+/**
+ * Fee rate for the commitment WE SIGN for the peer (commitment_signed we
+ * send).
+ *
+ * Opener: our own staged update_fee applies immediately — we announced it
+ * before this signature on the wire.
+ *
+ * Acceptor: a staged remote update_fee applies ONLY once it is signable
+ * (pendingFeerateSignable): we have received the opener's commitment_signed
+ * covering the fee and revoked. Before that the opener still builds its own
+ * commitment at the old rate (its fee is not revocation-acked), so a new-rate
+ * signature would be rejected ("Bad commit_sig" at CLN) — the exact live
+ * failure this gates against.
+ */
+export function getRemoteCommitmentFeeRate(state: IChannelState): number {
+	if (state.pendingFeeratePerKw !== undefined) {
+		if (
+			state.role === ChannelRole.OPENER ||
+			state.pendingFeerateSignable === true
+		) {
+			return state.pendingFeeratePerKw;
+		}
+	}
+	return committedFeeRate(state);
 }
 
 /**
@@ -370,7 +437,7 @@ export function buildLocalCommitment(
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	// Calculate commitment fee (BOLT 3): opener pays the fee
-	const feeratePerKw = getCommitmentFeeRate(state, signedLocal);
+	const feeratePerKw = getLocalCommitmentFeeRate(state, signedLocal);
 
 	// Build HTLC outputs, then trim per BOLT 3 (dust_limit + second-level fee).
 	// The SAME trimmed set feeds both the commitment outputs and the
@@ -411,20 +478,35 @@ export function buildLocalCommitment(
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
-				// We received and fulfilled: credit our balance
-				localMsat += entry.amountMsat;
+				// We received and fulfilled: credit our balance — unless the peer
+				// has not committed our removal yet (the HTLC output is still in
+				// this commitment; see buildHtlcOutputsForLocal).
+				if (entry.removalRemoteCommitted !== false) {
+					localMsat += entry.amountMsat;
+				}
 			} else {
 				// We offered and remote fulfilled: credit their balance
 				remoteMsat += entry.amountMsat;
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
-				// We received but failed: refund their balance
-				remoteMsat += entry.amountMsat;
+				// We received but failed: refund their balance — unless our
+				// removal is not committed by the peer yet (output still present).
+				if (entry.removalRemoteCommitted !== false) {
+					remoteMsat += entry.amountMsat;
+				}
 			} else {
 				// We offered but failed: refund our balance
 				localMsat += entry.amountMsat;
 			}
+		} else if (
+			entry.direction === HtlcDirection.OFFERED &&
+			entry.addRemoteCommitted === false
+		) {
+			// An add of ours the peer has not committed yet: the provisional
+			// balance deduction from addHtlc is not in the peer's signatures —
+			// return it for this build (the output is excluded above).
+			localMsat += entry.amountMsat;
 		}
 	}
 	let localAmount = localMsat / 1000n;
@@ -532,7 +614,7 @@ export function buildRemoteCommitment(
 	const useAnchors = isAnchorChannel(state.channelType);
 
 	// Calculate commitment fee (BOLT 3): opener pays the fee
-	const feeratePerKw = getCommitmentFeeRate(state);
+	const feeratePerKw = getRemoteCommitmentFeeRate(state);
 
 	// Build HTLC outputs (swapped perspective), then trim per BOLT 3 against the
 	// REMOTE holder's dust limit + second-level fee — same trimmed set for outputs
@@ -567,17 +649,32 @@ export function buildRemoteCommitment(
 				// We received and fulfilled: credit our balance
 				remoteMsat += entry.amountMsat;
 			} else {
-				// We offered and remote fulfilled: credit their balance
-				localMsat += entry.amountMsat;
+				// We offered and remote fulfilled: credit their balance — unless
+				// we have not revoked for the peer's removal yet (the HTLC output
+				// is still in this commitment; see buildHtlcOutputsForRemote).
+				if (entry.removalLocallyRevoked !== false) {
+					localMsat += entry.amountMsat;
+				}
 			}
 		} else if (entry.state === HtlcState.FAILED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
 				// We received but failed: refund their balance
 				localMsat += entry.amountMsat;
 			} else {
-				// We offered but failed: refund our balance
-				remoteMsat += entry.amountMsat;
+				// We offered but failed: refund our balance — unless we have not
+				// revoked for the peer's removal yet (output still present).
+				if (entry.removalLocallyRevoked !== false) {
+					remoteMsat += entry.amountMsat;
+				}
 			}
+		} else if (
+			entry.direction === HtlcDirection.RECEIVED &&
+			entry.addLocallyRevoked === false
+		) {
+			// An add of the PEER's we have not revoked for: the peer's
+			// provisional balance deduction is not in its own view of this
+			// commitment yet — return it for this build (output excluded above).
+			localMsat += entry.amountMsat;
 		}
 	}
 	let localAmount = localMsat / 1000n;
@@ -696,11 +793,10 @@ export function signRemoteCommitment(
 	// the index and bind this signature to the wrong output.
 	const htlcOutputsMeta = built.htlcOutputs;
 
-	// Fee rate for HTLC transaction fee calculation
-	const feeratePerKw =
-		state.role === ChannelRole.OPENER
-			? state.localConfig.feeratePerKw
-			: state.remoteConfig.feeratePerKw;
+	// Fee rate for HTLC transaction fee calculation — MUST be the same rate the
+	// commitment body above was built at (buildRemoteCommitment), or the HTLC
+	// second-level signatures diverge from the peer's mid-fee-round.
+	const feeratePerKw = getRemoteCommitmentFeeRate(state);
 
 	const useAnchors = isAnchorChannel(state.channelType);
 	const htlcSuccessWeight = useAnchors
@@ -1177,7 +1273,9 @@ export function verifyRemoteHtlcSignatures(
 	// Remote's HTLC pubkey on our local commitment
 	const remoteHtlcPubkey = keys.remoteHtlcPubkey;
 
-	const feeratePerKw = getCommitmentFeeRate(state);
+	// Same rate as the LOCAL commitment these HTLC txs spend from
+	// (buildLocalCommitment above).
+	const feeratePerKw = getLocalCommitmentFeeRate(state);
 	const useAnchors = isAnchorChannel(state.channelType);
 	const htlcSuccessWeight = useAnchors
 		? HTLC_SUCCESS_WEIGHT_ANCHORS
@@ -1271,9 +1369,34 @@ function buildHtlcOutputsForLocal(
 		// FULFILLED/FAILED HTLCs are excluded because we already sent
 		// update_fulfill/fail_htlc + commitment_signed for them — the remote
 		// expects the next commitment without these HTLCs.
+		//
+		// Two-phase exceptions (this is OUR commitment — the peer's signatures
+		// define its contents, and the peer only incorporates OUR updates after
+		// revoking a commitment that covers them):
+		// - an add WE offered that the peer has not committed yet
+		//   (addRemoteCommitted === false) is NOT in the peer's signatures —
+		//   exclude it;
+		// - a removal WE sent for a RECEIVED HTLC that the peer has not
+		//   committed yet (removalRemoteCommitted === false) is not in the
+		//   peer's signatures either — the HTLC output is still present.
 		if (
+			entry.state === HtlcState.FULFILLED ||
+			entry.state === HtlcState.FAILED
+		) {
+			const stillPresent =
+				entry.direction === HtlcDirection.RECEIVED &&
+				entry.removalRemoteCommitted === false;
+			if (!stillPresent) {
+				continue;
+			}
+		} else if (
 			entry.state !== HtlcState.PENDING &&
 			entry.state !== HtlcState.COMMITTED
+		) {
+			continue;
+		} else if (
+			entry.direction === HtlcDirection.OFFERED &&
+			entry.addRemoteCommitted === false
 		) {
 			continue;
 		}
@@ -1357,9 +1480,34 @@ function buildHtlcOutputsForRemote(
 		// For the REMOTE commitment, exclude FULFILLED/FAILED HTLCs because
 		// we already sent update_fulfill/fail_htlc for them.
 		// Only include PENDING and COMMITTED HTLCs.
+		//
+		// Two-phase exceptions (this is the PEER's commitment — WE sign it, and
+		// we may only incorporate the PEER's updates after we have revoked for
+		// its covering commitment_signed; until then the peer builds its own
+		// local commitment WITHOUT them):
+		// - an add the PEER offered that we have not revoked for
+		//   (addLocallyRevoked === false) must be excluded;
+		// - a removal the PEER sent for an HTLC we offered
+		//   (removalLocallyRevoked === false) is not in the peer's own view
+		//   yet — the HTLC output is still present.
 		if (
+			entry.state === HtlcState.FULFILLED ||
+			entry.state === HtlcState.FAILED
+		) {
+			const stillPresent =
+				entry.direction === HtlcDirection.OFFERED &&
+				entry.removalLocallyRevoked === false;
+			if (!stillPresent) {
+				continue;
+			}
+		} else if (
 			entry.state !== HtlcState.PENDING &&
 			entry.state !== HtlcState.COMMITTED
+		) {
+			continue;
+		} else if (
+			entry.direction === HtlcDirection.RECEIVED &&
+			entry.addLocallyRevoked === false
 		) {
 			continue;
 		}
