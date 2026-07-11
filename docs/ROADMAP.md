@@ -246,8 +246,20 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
       above the state machine; sync-to-async conversion noted as a follow-up.
       Note: ChainMonitor sweep/justice paths still consume raw basepoint
       secrets directly (separate surface, future work).
-- [?] mTLS / client certificates for the daemon. Decide priority.
-- [?] Key rotation strategy. Decide scope.
+- [?] mTLS / client certificates for the daemon. Decide priority. (Discussed
+      2026-07-10: low value while deployments are localhost/Tor; if ever
+      needed, server-side HTTPS first, client certs as an opt-in on top.)
+- [~] Key rotation (this PR; DECIDED by Corey 2026-07-10: auth material only,
+      zero breaking changes): optional expiresAt per API key (ISO 8601,
+      expired = 401 like a bad key), admin POST /auth/keys/rotate + CLI
+      beignet auth rotate (new 32-byte secret shown ONCE, digest-only
+      storage), and durable rotation/revocation overrides persisted in the
+      encrypted wallet_data table (no schema bump), which also fixes PR #58's
+      documented restart-resurrection hole for revoked keys. Config stays the
+      source of truth for the key set; a config re-key supersedes stale
+      overrides. Legacy apiToken unchanged (no name, no expiry, no rotation).
+      Node identity/channel keys explicitly out of scope (not rotatable in
+      Lightning without closing channels).
 - [x] Leveled logging (PR #61, merged): platform-neutral src/logger.ts (ILogger
       debug/info/warn/error, createConsoleLogger with level filtering,
       noopLogger), injectable via Wallet config, INodeConfig, and
@@ -303,6 +315,11 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #64 merged (anchor + taproot tower coverage) and v0.4.0
+  released (PR #65, tag v0.4.0 at 1ca36cf). Corey decided: key rotation
+  scoped to auth material only (this PR) and WebSocket transport promoted
+  from M7 toward browser support (in progress in a parallel worktree); mTLS
+  stays deferred.
 - 2026-07-10: PR #63 merged (taproot SCB-recovery sweep). Anchor + taproot
   tower coverage (this PR) closes the last queued interop follow-up and fixes
   the anchor-blob session-type fund-safety gap; only [?] decision items remain

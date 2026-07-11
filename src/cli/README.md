@@ -935,8 +935,12 @@ seed. `GET /mnemonic` only reveals the configured seed, and only when
 ### API key management
 
 ```bash
-beignet auth keys            # list named API keys (names + scopes, never secrets)
-beignet auth revoke <name>   # disable a named key in the running daemon
+beignet auth keys            # list named API keys (names, scopes, revoked/expired,
+                             # expiresAt/rotatedAt; never secrets)
+beignet auth revoke <name>   # disable a named key immediately (persisted;
+                             # survives restarts)
+beignet auth rotate <name>   # mint a new random secret for a named key;
+                             # printed ONCE, cannot be retrieved again
 ```
 
 Any command accepts `--api-key <secret>` (alias of `--api-token`) or the
@@ -1352,7 +1356,9 @@ Every response follows this format:
   "apiKeys": [
     { "name": "monitor", "key": "readonlysecret", "scopes": ["readonly"] },
     { "name": "shop", "key": "invoicesecret", "scopes": ["invoice", "readonly"] },
-    { "name": "ops", "key": "adminsecret", "scopes": ["admin"] }
+    { "name": "ops", "key": "adminsecret", "scopes": ["admin"] },
+    { "name": "contractor", "key": "temporarysecret", "scopes": ["readonly"],
+      "expiresAt": "2027-01-01T00:00:00Z" }
   ],
   "autoBootstrap": false,
   "backupPath": "/var/backups/beignet/node.db",
@@ -1427,7 +1433,7 @@ The daemon exposes these endpoints on `127.0.0.1:2112` (configurable via `daemon
 Two kinds of credentials, usable together:
 
 - **Legacy single token** -- `apiToken` (via `--api-token`, `BEIGNET_API_TOKEN`, or config file). Backward compatible: it keeps working and carries an implicit `admin` scope.
-- **Named scoped keys** -- the `apiKeys` config array (or `BEIGNET_API_KEYS` env var as JSON): `[{ "name": "monitor", "key": "<secret>", "scopes": ["readonly"] }, ...]`. A key may hold multiple scopes.
+- **Named scoped keys** -- the `apiKeys` config array (or `BEIGNET_API_KEYS` env var as JSON): `[{ "name": "monitor", "key": "<secret>", "scopes": ["readonly"], "expiresAt": "2027-01-01T00:00:00Z" }, ...]`. A key may hold multiple scopes; `expiresAt` is optional.
 
 When any credential is configured, all endpoints require an `Authorization: Bearer <token-or-key-secret>` header. Exceptions (always accessible):
 
@@ -1449,7 +1455,13 @@ Every route is explicitly classified in `src/cli/auth.ts` (`ROUTE_SCOPES`); a dr
 
 Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSafeEqual`), for the legacy token too. Failures return **401** `UNAUTHORIZED` for a bad or missing key and **403** `FORBIDDEN` for a valid key without a required scope.
 
-**Revocation:** removing a key from the config file (and restarting) is the durable mechanism. A running daemon can also disable a named key immediately via `POST /auth/keys/revoke` (`beignet auth revoke <name>`, admin scope, in-memory until restart). The legacy `apiToken` has no name and can only be revoked via config change + restart.
+**Expiry:** a named key may declare `expiresAt` (ISO 8601, e.g. `"2027-01-01T00:00:00Z"`). From that moment the key fails authentication exactly like an unknown key (401); the check happens on every request, so no restart is needed. An unparseable `expiresAt` is rejected at daemon startup (`INVALID_PARAMS`). `GET /auth/keys` reports `expiresAt` and a computed `expired` boolean per key.
+
+**Rotation:** `POST /auth/keys/rotate {"name": "..."}` (`beignet auth rotate <name>`, admin scope) mints a cryptographically random 32-byte hex secret for an existing named key. The old secret stops authenticating immediately; scopes and expiry are unchanged. The new secret appears ONCE in the response -- only its SHA-256 digest is stored, so it cannot be retrieved again; if it is lost, rotate again. Rotating a revoked key reinstates it under the new secret (the old, possibly compromised secret stays dead).
+
+**Persistence:** rotation and revocation are written to the node database (the encrypted `wallet_data` table -- digests only, never plaintext secrets) and are re-applied over the config-declared keys on every start. This fixes the earlier limitation where revocation was in-memory only and a daemon restart resurrected a revoked key. The config file remains the source of truth for the key *set*: overrides apply by name, an override whose name left the config is pruned, and editing a key's secret in the config discards any stored rotation/revocation for that name (an explicit config re-key wins). Removing a key from the config file remains the ultimate cleanup.
+
+**Legacy token caveats:** the single `apiToken` has no name, so it can be neither rotated nor expired nor revoked at runtime -- its behavior is unchanged. To retire it, change or remove it in the config and restart. Prefer named `apiKeys` for anything that needs lifecycle management.
 
 ### Endpoints
 
@@ -1567,8 +1579,9 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/keysend` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Spontaneous payment (no invoice). Blocks until settled. |
 | POST | `/keysend/safe` | `{ pubkey, amountSats, timeoutMs?, maxFeeSats?, metadata? }` | Keysend that never errors — resolves with `status: 'FAILED'` instead. |
 | GET | `/spend-limit` | -- | COMBINED LN + on-chain daily spend limit status: `{ totalSats, lightningSats, onchainSats, limitSats, remainingSats, resetsAt, spentSats }` (`spentSats` mirrors `totalSats` for back-compat) |
-| GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked flag (never secrets; admin scope) |
-| POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key until restart (admin scope; config removal is the durable revocation) |
+| GET | `/auth/keys` | -- | List named API keys: names, scopes, revoked/expired flags, expiresAt/rotatedAt (never secrets; admin scope) |
+| POST | `/auth/keys/revoke` | `{ name }` | Disable a named API key immediately (admin scope; persisted, survives restarts) |
+| POST | `/auth/keys/rotate` | `{ name }` | Mint a new random secret for a named key; returned once, old secret dies immediately (admin scope; persisted) |
 | POST | `/stop` | `{ drain?, drainTimeoutMs? }` | Stop daemon. `drain: true` waits for in-flight payments before shutting down. |
 
 ### Server-Sent Events (SSE)

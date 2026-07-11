@@ -21,6 +21,8 @@ import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
 	AuthSuccess,
+	AUTH_KEY_OVERRIDES_STORAGE_KEY,
+	StoredKeyOverride,
 	getRouteScopes,
 	scopesAllowRoute
 } from './auth';
@@ -181,6 +183,32 @@ export async function startDaemon(
 	}
 	const node = await BeignetNode.create(logger ? { ...opts, logger } : opts);
 	const storage = node.getStorage();
+	// Durable auth-key state: persisted rotate/revoke overrides live in the
+	// encrypted wallet_data table and are re-applied over the config-declared
+	// keys on every start (so a restart no longer resurrects a revoked or
+	// rotated-away secret). Attached before the server accepts requests.
+	authenticator.attachOverrideStore({
+		load: (): Record<string, StoredKeyOverride> | null => {
+			try {
+				const raw = storage.loadWalletData(AUTH_KEY_OVERRIDES_STORAGE_KEY);
+				if (raw === null) return null;
+				const parsed = JSON.parse(raw);
+				return typeof parsed === 'object' &&
+					parsed !== null &&
+					!Array.isArray(parsed)
+					? (parsed as Record<string, StoredKeyOverride>)
+					: null;
+			} catch {
+				return null;
+			}
+		},
+		save: (overrides): void => {
+			storage.saveWalletData(
+				AUTH_KEY_OVERRIDES_STORAGE_KEY,
+				JSON.stringify(overrides)
+			);
+		}
+	});
 	const webhookManager = new WebhookManager(storage);
 	const paymentQueue = new PaymentQueue(
 		(bolt11, timeout, maxFee, amount, meta) =>
@@ -1350,6 +1378,21 @@ export async function startDaemon(
 					`No API key named "${name}" (the legacy apiToken has no name; remove it from the config and restart)`
 				);
 			return success({ revoked: name });
+		},
+		'POST /auth/keys/rotate': (body) => {
+			const { name } = body as { name?: string };
+			if (!name) return failure('INVALID_PARAMS', 'name required');
+			const rotated = authenticator.rotate(name);
+			if (!rotated)
+				return failure(
+					'NOT_FOUND',
+					`No API key named "${name}" (the legacy apiToken has no name and cannot be rotated; change it in the config and restart)`
+				);
+			return success({
+				...rotated,
+				warning:
+					'Store this key now: it is shown only once and cannot be retrieved again'
+			});
 		}
 	};
 

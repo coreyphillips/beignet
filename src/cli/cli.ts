@@ -1342,12 +1342,31 @@ async function handleAuth(): Promise<void> {
 				await httpRequest('POST', '/auth/keys/revoke', { name })
 			);
 		}
+		case 'rotate': {
+			const name = filteredArgs[2];
+			if (!name) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet auth rotate <name>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			// The new secret appears ONCE in this response; it is never stored
+			// in plaintext and cannot be retrieved again.
+			return outputResult(
+				await httpRequest('POST', '/auth/keys/rotate', { name })
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet auth [keys|revoke <name>]'
+					message: 'Usage: beignet auth [keys|revoke <name>|rotate <name>]'
 				}
 			});
 			process.exitCode = 1;
@@ -2189,10 +2208,14 @@ Webhooks (event push; see also GET /events SSE):
   webhooks list                          List registered webhooks
 
 API auth (scoped keys; see apiKeys config):
-  auth keys                              List named API keys (names + scopes,
+  auth keys                              List named API keys (names, scopes,
+                                         revoked/expired, expiresAt, rotatedAt;
                                          never secrets)
-  auth revoke <name>                     Disable a named key until restart
-                                         (remove it from config for good)
+  auth revoke <name>                     Disable a named key immediately;
+                                         persisted, survives restarts
+  auth rotate <name>                     Mint a new random secret for a named
+                                         key (printed ONCE, never again); the
+                                         old secret stops working immediately
 
 Start flags:
   --network <name>                       mainnet | testnet | signet | regtest
