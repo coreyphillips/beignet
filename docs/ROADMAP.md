@@ -249,7 +249,7 @@ Legend: `[ ]` open, `[x]` done (PR #), `[~]` in progress, `[?]` needs a decision
 - [?] mTLS / client certificates for the daemon. Decide priority. (Discussed
       2026-07-10: low value while deployments are localhost/Tor; if ever
       needed, server-side HTTPS first, client certs as an opt-in on top.)
-- [~] Key rotation (this PR; DECIDED by Corey 2026-07-10: auth material only,
+- [x] Key rotation (PR #66, merged; DECIDED by Corey 2026-07-10: auth material only,
       zero breaking changes): optional expiresAt per API key (ISO 8601,
       expired = 401 like a bad key), admin POST /auth/keys/rotate + CLI
       beignet auth rotate (new 32-byte secret shown ONCE, digest-only
@@ -280,7 +280,18 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - [ ] LSPS0/1/2 (client side first if Blocktank integration wants it)
 - [ ] Dynamic commitments
 - [ ] PTLCs
-- [ ] WebSocket transport (relevant to the browser port)
+- [~] WebSocket transport (PROMOTED from parked by Corey 2026-07-10; this PR):
+      IDuplexTransport interface over the existing TCP/SOCKS5 path (types-only
+      diff, zero behavior change), browser-clean WS client against the
+      standard WebSocket API with injectable constructor, in-repo RFC 6455
+      Node client AND opt-in server (zero new dependencies; CLN's ws upgrade
+      parser is case-sensitive so undici's lowercased headers cannot connect,
+      hence the RFC-cased in-repo client), pubkey@ws:// and wss:// peer URIs,
+      daemon/CLI additive connect forms + websocketPort config. Live vs CLN
+      v26 over bind-addr=ws: handshake, ping/pong, channel to NORMAL,
+      payments both directions, reestablish (5/5). Browser-blockers
+      assessment recorded in the PR (crypto shim, storage backend, Electrum
+      over WSS, DNS bootstrap, Buffer/net shims).
 - [ ] Tor hidden-service inbound provisioning (external today, document setup)
 - [ ] Legacy option_anchor_outputs bit 20 (likely never; modern bit 22 shipped)
 - [ ] Tor support for Electrum (deferred 2026-07-10): route TCP/SSL through a SOCKS5
@@ -315,9 +326,17 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-10: PR #66 merged (key rotation). WebSocket transport (this PR)
+  lands the browser-peer prerequisite live-proven vs CLN v26. Two
+  pre-existing transport-independent bugs surfaced during interop and are
+  QUEUED for their own fix branches: (1) CLN-funded channels desync after
+  CLN sends update_fee (beignet HTLC then yields "Bad commit_sig" at CLN and
+  a stale per-commitment secret on reestablish - the reason cln-interop Tier
+  4/8 assertions are lenient); (2) upstream CLN quirk: case-sensitive
+  WebSocket upgrade parsing, worth reporting to CLN.
 - 2026-07-10: PR #64 merged (anchor + taproot tower coverage) and v0.4.0
   released (PR #65, tag v0.4.0 at 1ca36cf). Corey decided: key rotation
-  scoped to auth material only (this PR) and WebSocket transport promoted
+  scoped to auth material only (PR #66) and WebSocket transport promoted
   from M7 toward browser support (in progress in a parallel worktree); mTLS
   stays deferred.
 - 2026-07-10: PR #63 merged (taproot SCB-recovery sweep). Anchor + taproot
