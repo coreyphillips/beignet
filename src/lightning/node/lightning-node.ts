@@ -3899,16 +3899,31 @@ export class LightningNode extends EventEmitter {
 	 * @param channelId - The channel to splice from
 	 * @param amountSats - Amount to withdraw (positive value, will be negated)
 	 * @param fundingFeeratePerkw - Feerate for the splice tx (default 253)
+	 * @param destinationScript - Optional output script (scriptPubKey) to receive
+	 *   the withdrawn funds. Defaults to the node's configured sweep script
+	 *   (getSweepDestinationScript()). Passing an external script pays that
+	 *   address directly from the channel balance inside the splice funding
+	 *   transaction. Only this splice-out is affected; force-close and justice
+	 *   sweeps continue to use the sweep script.
 	 */
 	spliceOut(
 		channelId: Buffer,
 		amountSats: bigint,
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		destinationScript?: Buffer
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
 		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
 		if (satsErr) throw new Error(satsErr);
+		if (
+			destinationScript !== undefined &&
+			(!Buffer.isBuffer(destinationScript) || destinationScript.length === 0)
+		) {
+			throw new Error(
+				'destinationScript must be a non-empty Buffer when provided'
+			);
+		}
 
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) {
@@ -3918,14 +3933,14 @@ export class LightningNode extends EventEmitter {
 			};
 		}
 
-		const destinationScript = this.getSweepDestinationScript();
+		const destination = destinationScript ?? this.getSweepDestinationScript();
 
 		// Sanity checks before any protocol message goes out: dust amount, peer
 		// support, and spendable channel balance.
 		const fee = spliceFeeSats(
 			estimateSpliceTxWeight({
 				walletInputCount: 0,
-				destinationScriptLen: destinationScript.length
+				destinationScriptLen: destination.length
 			}),
 			fundingFeeratePerkw
 		);
@@ -3960,9 +3975,10 @@ export class LightningNode extends EventEmitter {
 			return { ok: false, error };
 		}
 
-		// Record where the withdrawn funds are paid (a wallet-owned script) before
-		// initiating, so the interactive-tx driver can add the destination output.
-		channel.setSpliceOutDestination(destinationScript, amountSats);
+		// Record where the withdrawn funds are paid (a wallet-owned or external
+		// script) before initiating, so the interactive-tx driver can add the
+		// destination output.
+		channel.setSpliceOutDestination(destination, amountSats);
 
 		// Declare the splice contribution as -(amount + fee): the new funding
 		// output is oldCap + relative, so folding the fee into `relative` makes our
