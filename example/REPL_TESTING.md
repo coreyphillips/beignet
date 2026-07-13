@@ -36,6 +36,14 @@ await node.refreshWallet()     // resync after sending funds
 node.getBalance()              // confirm onchain balance shows up
 ```
 
+To move funds back out, send a specific amount or sweep the whole balance:
+
+```js
+await node.sendOnchain('<address>', 50000)   // 50k sats, normal fee rate
+await node.sendMaxOnchain('<address>')       // sweep everything, minus the fee
+await node.sendMaxOnchain('<address>', 5)    // sweep at 5 sats/vB
+```
+
 ---
 
 ## 2. Connect to a peer
