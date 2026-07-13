@@ -586,7 +586,10 @@ export interface IStructuredLog {
 		| 'fee'
 		| 'peer'
 		| 'chain'
-		| 'watchtower';
+		| 'watchtower'
+		// Node-level errors (ILightningError). The action is the error code, e.g.
+		// CHANNEL_ERROR or AUTO_FUNDING_FAILED.
+		| 'error';
 	action: string;
 	timestamp: number;
 	data: Record<string, unknown>;

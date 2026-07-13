@@ -151,6 +151,11 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'channel:closed',
 		'peer:connect',
 		'peer:disconnect',
+		// Every channel failure reason (peer rejection, funding build/broadcast
+		// failure, disconnect mid-open) is reported as node:error. Without it on
+		// this list a failed open is invisible to clients: the pending channel
+		// just disappears and nothing ever says why.
+		'node:error',
 		'node:ready'
 	];
 	if (htlcEvents === true) {
