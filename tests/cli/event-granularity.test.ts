@@ -59,6 +59,15 @@ describe('Event granularity (M4 batch 2b)', () => {
 				expect(events, e).to.include(e);
 			}
 		});
+
+		// node:error carries the reason a channel open failed (peer rejection,
+		// funding failure, disconnect mid-open). Leaving it off the relay list
+		// makes a failed open indistinguishable from one that never happened:
+		// the pending channel disappears and no client is ever told why.
+		it('relays node:error, with and without htlc events', () => {
+			expect(getRelayedEvents()).to.include('node:error');
+			expect(getRelayedEvents(true)).to.include('node:error');
+		});
 	});
 
 	describe('daemon wiring', () => {

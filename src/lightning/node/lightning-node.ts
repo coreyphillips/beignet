@@ -1264,6 +1264,21 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// Record every node:error, wherever it was raised. These carry the reason a
+		// channel open failed (peer rejection, funding build/broadcast failure,
+		// disconnect mid-open). Emitting them alone is not enough: a caller that is
+		// not listening loses the reason entirely, and a failed open then looks like
+		// a pending channel that silently disappeared. Logging here puts the reason
+		// on stdout and in the queryable action log (GET /logs?category=error).
+		this.on('node:error', (err: ILightningError) => {
+			const channelId = err.channelId?.toString('hex');
+			this.logger.error(`${err.code}: ${err.message}`, { channelId });
+			this.emitStructuredLog('error', err.code, {
+				message: err.message,
+				channelId
+			});
+		});
+
 		// Auto-funding: build funding tx when accept_channel is received
 		this.channelManager.on(
 			'channel:accepted',

@@ -3791,7 +3791,14 @@ export class ChannelManager extends EventEmitter {
 					this.emit('channel:closed', action.channelId);
 					break;
 				case ChannelActionType.ERROR: {
-					this.emit('error', channel.getChannelId(), action.message);
+					// A channel that failed before funding has no permanent id yet, so
+					// fall back to the temporary one: without it the error carries a
+					// null channelId and cannot be tied back to the open it belongs to.
+					this.emit(
+						'error',
+						channel.getChannelId() ?? channel.getTemporaryChannelId(),
+						action.message
+					);
 					// Clean up temp channel on error
 					const tempId = channel.getTemporaryChannelId()?.toString('hex');
 					if (tempId && this.tempChannels.has(tempId)) {
