@@ -134,7 +134,8 @@ import {
 	RebalancePlanInfo,
 	AdvisorRecommendations,
 	RebalanceResult,
-	RebalanceExecutionSummary
+	RebalanceExecutionSummary,
+	TOnchainQuote
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -1591,6 +1592,143 @@ export class BeignetNode extends EventEmitter {
 				'txid must be a 64-character hex string'
 			);
 		}
+	}
+
+	/**
+	 * Quote an on-chain transaction before sending it: what it will really cost,
+	 * not what a caller guessed it might.
+	 *
+	 * A client cannot work this out for itself. The fee depends on which UTXOs coin
+	 * selection picks, on their script types, and on whether change is needed, none
+	 * of which a client knows. Guessing it means quoting one number and spending
+	 * another, and sizing a "max" against a guess means either stranding sats or
+	 * building a transaction that cannot be funded. So the wallet answers from the
+	 * same setup and coin selection a real send runs.
+	 *
+	 * `max` quotes a sweep: the exact amount sendable once its own fee is taken out.
+	 * `channelFunding` quotes a channel funding transaction, whose output is a 2-of-2
+	 * P2WSH (43 vB) rather than the P2WPKH (31 vB) an ordinary send pays to.
+	 */
+	async quoteOnchain({
+		address,
+		amountSats,
+		satsPerVbyte,
+		max = false,
+		channelFunding = false
+	}: {
+		address?: string;
+		amountSats?: number;
+		satsPerVbyte?: number;
+		max?: boolean;
+		channelFunding?: boolean;
+	} = {}): Promise<TOnchainQuote> {
+		const satsPerByte = satsPerVbyte ?? this.wallet.feeEstimates.normal;
+		if (!(satsPerByte > 0)) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'satsPerVbyte must be a positive rate'
+			);
+		}
+		if (!max && amountSats === undefined) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'amountSats is required unless max is set'
+			);
+		}
+		const txn = this.wallet.transaction;
+		try {
+			// Mirror a real send exactly: reset the scratch transaction, gather the
+			// wallet's UTXOs and a change address, then place the output. Anything else
+			// quotes a transaction the wallet would not have built.
+			await txn.resetSendTransaction();
+			const setup = await txn.setupTransaction({ rbf: this.wallet.rbf });
+			if (setup.isErr()) {
+				throw new BeignetError(
+					BeignetErrorCode.SEND_FAILED,
+					setup.error.message
+				);
+			}
+			// The output's script type is part of the size, so quote against the script
+			// that will actually be paid to. A caller that has no address yet still gets
+			// the right shape from a stand-in of the same type.
+			txn.updateSendTransaction({
+				transaction: {
+					outputs: [
+						{
+							address: address || this.sampleOutputAddress(channelFunding),
+							value: amountSats ?? 0,
+							index: 0
+						}
+					]
+				}
+			});
+
+			if (max) {
+				const maxSend = txn.getMaxSendAmount({ satsPerByte });
+				if (maxSend.isErr()) {
+					throw new BeignetError(
+						BeignetErrorCode.SEND_FAILED,
+						maxSend.error.message
+					);
+				}
+				const info = this.wallet.getFeeInfo({
+					satsPerByte,
+					transaction: { ...txn.data, max: true }
+				});
+				if (info.isErr()) {
+					throw new BeignetError(
+						BeignetErrorCode.SEND_FAILED,
+						info.error.message
+					);
+				}
+				return {
+					satsPerVbyte: satsPerByte,
+					feeSats: maxSend.value.fee,
+					vsize: info.value.transactionByteCount,
+					maxSendSats: maxSend.value.amount,
+					maxSatsPerVbyte: info.value.maxSatPerByte
+				};
+			}
+
+			const info = this.wallet.getFeeInfo({ satsPerByte });
+			if (info.isErr()) {
+				throw new BeignetError(
+					BeignetErrorCode.SEND_FAILED,
+					info.error.message
+				);
+			}
+			return {
+				satsPerVbyte: satsPerByte,
+				feeSats: info.value.totalFee,
+				vsize: info.value.transactionByteCount,
+				maxSatsPerVbyte: info.value.maxSatPerByte
+			};
+		} finally {
+			// Scratch state. Leaving it behind would let the next real send inherit
+			// this quote's inputs and outputs.
+			await txn.resetSendTransaction();
+		}
+	}
+
+	/**
+	 * An address of the type an output will actually use, for quoting a transaction
+	 * whose destination is not known yet. Only its script type matters here: that is
+	 * what decides the output's size. A channel funding output is a 2-of-2 P2WSH.
+	 */
+	private sampleOutputAddress(channelFunding: boolean): string {
+		if (channelFunding) {
+			const bitcoin = require('bitcoinjs-lib');
+			// A witness-v0 32-byte program: the shape of a 2-of-2 funding output.
+			// The bytes are irrelevant, only the script type is.
+			return bitcoin.address.fromOutputScript(
+				Buffer.concat([Buffer.from([0x00, 0x20]), Buffer.alloc(32)]),
+				this.getBitcoinNetwork()
+			);
+		}
+		// The wallet's own current receive address. Reading it does not consume it,
+		// and it is of the type the wallet actually uses, which is the only thing
+		// the size depends on.
+		return this.wallet.data.addressIndex[this.wallet.addressType].address;
 	}
 
 	/**
