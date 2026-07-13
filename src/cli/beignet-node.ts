@@ -861,10 +861,15 @@ export class BeignetNode extends EventEmitter {
 						channelId: err.channelId ? err.channelId.toString('hex') : undefined
 					});
 				}
+				// Carry the channel id, as onError already does. Without it a
+				// subscriber (SSE, webhooks) cannot tell which channel an error
+				// belongs to, so an error raised while a channel is being opened
+				// is indistinguishable from an unrelated one on another channel.
 				this.emit('node:error', {
 					code: err.code,
 					message: err.message,
-					timestamp: err.timestamp
+					timestamp: err.timestamp,
+					channelId: err.channelId ? err.channelId.toString('hex') : undefined
 				});
 			}
 		);
