@@ -869,9 +869,7 @@ export class BeignetNode extends EventEmitter {
 					code: err.code,
 					message: err.message,
 					timestamp: err.timestamp,
-					channelId: err.channelId
-						? err.channelId.toString('hex')
-						: undefined
+					channelId: err.channelId ? err.channelId.toString('hex') : undefined
 				});
 			}
 		);
