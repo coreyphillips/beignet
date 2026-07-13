@@ -521,13 +521,28 @@ async function handleTx(): Promise<void> {
 			);
 		case 'boostable':
 			return outputResult(await httpRequest('GET', '/transactions/boostable'));
+		case 'quote':
+			// What a send would really cost, without sending it. `max` quotes a
+			// sweep and reports the exact amount that leaves once its fee is out.
+			return outputResult(
+				await httpRequest('POST', '/tx/quote', {
+					amountSats: filteredArgs[2]
+						? parseInt(filteredArgs[2], 10)
+						: undefined,
+					satsPerVbyte: filteredArgs[3]
+						? parseInt(filteredArgs[3], 10)
+						: undefined,
+					max: hasFlag('--max'),
+					channelFunding: hasFlag('--channel-funding')
+				})
+			);
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable]'
+						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable|quote <amountSats> [satsPerVbyte] [--max] [--channel-funding]]'
 				}
 			});
 			process.exitCode = 1;
