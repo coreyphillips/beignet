@@ -459,6 +459,30 @@ export async function startDaemon(
 			return success(await node.sendOnchain(address, amountSats, satsPerVbyte));
 		},
 
+		// What an on-chain transaction will really cost. A client cannot work this
+		// out: the fee depends on which UTXOs coin selection picks, their script
+		// types, and whether change is needed. Quoting it here means the number
+		// shown is the number spent.
+		'POST /tx/quote': async (body) => {
+			const { address, amountSats, satsPerVbyte, max, channelFunding } =
+				body as {
+					address?: string;
+					amountSats?: number;
+					satsPerVbyte?: number;
+					max?: boolean;
+					channelFunding?: boolean;
+				};
+			return success(
+				await node.quoteOnchain({
+					address,
+					amountSats,
+					satsPerVbyte,
+					max,
+					channelFunding
+				})
+			);
+		},
+
 		'POST /send-max': async (body) => {
 			const { address, satsPerVbyte } = body as {
 				address: string;

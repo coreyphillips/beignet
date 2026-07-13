@@ -182,6 +182,23 @@ export interface TxInfo {
 	hex: string;
 }
 
+/**
+ * What an on-chain transaction will really cost, from the coin selection that
+ * will really run, rather than from a caller's guess at it.
+ */
+export type TOnchainQuote = {
+	/** The rate the quote was made at. */
+	satsPerVbyte: number;
+	/** The fee this transaction will pay. Not an estimate. */
+	feeSats: number;
+	/** Its size in virtual bytes, from the selected inputs and outputs. */
+	vsize: number;
+	/** Set when quoting a sweep: the exact amount sendable once the fee is out. */
+	maxSendSats?: number;
+	/** The highest rate this transaction can pay without the fee taking half the balance. */
+	maxSatsPerVbyte: number;
+};
+
 export interface OnchainTxInfo {
 	txid: string;
 	type: 'sent' | 'received';

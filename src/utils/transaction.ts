@@ -288,9 +288,16 @@ export const getByteCount = (
 				: 9;
 		};
 
-		Object.keys(inputs).forEach(function (key) {
-			key = key.toUpperCase();
-			checkUInt53(inputs[key]);
+		// Read each count from the key it was given under, then upper-case the key
+		// only to look the type up. Upper-casing first and re-reading the object
+		// with the upper-cased key makes a lower-case entry ("p2wpkh") read the
+		// value of its upper-case twin ("P2WPKH") and count it a second time, so a
+		// param carrying both forms was double-counted. constructByteCountParam
+		// emits exactly that pair, which inflated every fee getTotalFeeObj quoted.
+		Object.keys(inputs).forEach(function (originalKey) {
+			const count = inputs[originalKey];
+			const key = originalKey.toUpperCase();
+			checkUInt53(count);
 			if (key.slice(0, 8) === 'MULTISIG') {
 				// ex. "MULTISIG-P2SH:2-3" would mean 2 of 3 P2SH MULTISIG
 				const keyParts = key.split(':');
@@ -300,22 +307,22 @@ export const getByteCount = (
 					return parseInt(item);
 				});
 
-				totalWeight += types.inputs[newKey] * inputs[key];
+				totalWeight += types.inputs[newKey] * count;
 				const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
-				totalWeight +=
-					(73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * inputs[key];
+				totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
 			} else {
-				totalWeight += types.inputs[key] * inputs[key];
+				totalWeight += types.inputs[key] * count;
 			}
-			inputCount += inputs[key];
-			if (key.indexOf('W') >= 0) hasWitness = true;
+			inputCount += count;
+			if (count > 0 && key.indexOf('W') >= 0) hasWitness = true;
 		});
 
-		Object.keys(outputs).forEach(function (key) {
-			key = key.toUpperCase();
-			checkUInt53(outputs[key]);
-			totalWeight += types.outputs[key] * outputs[key];
-			outputCount += outputs[key];
+		Object.keys(outputs).forEach(function (originalKey) {
+			const count = outputs[originalKey];
+			const key = originalKey.toUpperCase();
+			checkUInt53(count);
+			totalWeight += types.outputs[key] * count;
+			outputCount += count;
 		});
 
 		if (hasWitness) totalWeight += 2;
