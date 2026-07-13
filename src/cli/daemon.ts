@@ -584,14 +584,17 @@ export async function startDaemon(
 		},
 
 		'POST /channel/open': (body) => {
-			const { pubkey, amountSats, pushSats } = body as {
+			const { pubkey, amountSats, pushSats, satsPerVbyte } = body as {
 				pubkey: string;
 				amountSats: number;
 				pushSats?: number;
+				satsPerVbyte?: number;
 			};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
-			return success(node.openChannel(pubkey, amountSats, pushSats));
+			return success(
+				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte)
+			);
 		},
 		'POST /channel/close': (body) => {
 			const { channelId } = body as { channelId: string };
@@ -706,13 +709,15 @@ export async function startDaemon(
 				host: peerHost,
 				port: peerPort,
 				amountSats,
-				pushSats
+				pushSats,
+				satsPerVbyte
 			} = body as {
 				pubkey: string;
 				host: string;
 				port: number;
 				amountSats: number;
 				pushSats?: number;
+				satsPerVbyte?: number;
 			};
 			if (!pubkey || !peerHost || !peerPort || amountSats === undefined) {
 				return failure(
@@ -726,7 +731,7 @@ export async function startDaemon(
 					peerHost,
 					peerPort,
 					amountSats,
-					{ pushSats }
+					{ pushSats, satsPerVbyte }
 				)
 			);
 		},

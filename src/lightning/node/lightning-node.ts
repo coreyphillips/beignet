@@ -1254,6 +1254,12 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'error',
 			(channelId: Buffer | null, message: string) => {
+				// An open that failed is never funded, so the rate it asked for has
+				// nothing left to apply to. Drop it rather than hold it for a channel
+				// that no longer exists.
+				if (channelId) {
+					this.requestedFundingFeeRates.delete(channelId.toString('hex'));
+				}
 				const err: ILightningError = {
 					code: 'CHANNEL_ERROR',
 					channelId: channelId ?? undefined,
@@ -1883,12 +1889,23 @@ export class LightningNode extends EventEmitter {
 					btcNetwork
 			  );
 
-		// Use dynamic fee if estimator available (sanity-clamped)
-		const feePromise = this.feeEstimator
-			? this.feeEstimator
-					.estimateFee(6)
-					.then((f) => (f > 0 ? this.clampEstimatedFeeRate(f) : undefined))
-			: Promise.resolve(undefined);
+		// Fund at the rate the opener asked for, if it asked for one. Sanity-clamped
+		// like the estimator's own rate: a caller-supplied number is still a number
+		// that can be wrong, and an absurd one here is paid to miners out of the
+		// balance that was meant to go into the channel.
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		const requestedFeeRate = this.requestedFundingFeeRates.get(tempId);
+		this.requestedFundingFeeRates.delete(tempId);
+
+		// Otherwise use a dynamic fee if an estimator is available (sanity-clamped).
+		const feePromise =
+			requestedFeeRate !== undefined
+				? Promise.resolve(this.clampEstimatedFeeRate(requestedFeeRate))
+				: this.feeEstimator
+				? this.feeEstimator
+						.estimateFee(6)
+						.then((f) => (f > 0 ? this.clampEstimatedFeeRate(f) : undefined))
+				: Promise.resolve(undefined);
 
 		feePromise
 			.then((satsPerByte) =>
@@ -3299,7 +3316,8 @@ export class LightningNode extends EventEmitter {
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
-		pushMsat?: bigint
+		pushMsat?: bigint,
+		fundingFeeRate?: number
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -3312,12 +3330,35 @@ export class LightningNode extends EventEmitter {
 				})`
 			);
 		}
-		return this.channelManager.openChannel(
+		if (fundingFeeRate !== undefined && !(fundingFeeRate > 0)) {
+			throw new Error(
+				`fundingFeeRate (${fundingFeeRate}) must be a positive sat/vB rate`
+			);
+		}
+		const channel = this.channelManager.openChannel(
 			peerPubkey,
 			fundingSatoshis,
 			pushMsat
 		);
+		// Remembered against the temporary channel id, which is all the channel has
+		// until funding is created. handleAutoFunding picks it up when the peer
+		// accepts; until then the funding transaction does not exist and there is
+		// nothing to apply it to.
+		if (fundingFeeRate !== undefined) {
+			this.requestedFundingFeeRates.set(
+				channel.getTemporaryChannelId().toString('hex'),
+				fundingFeeRate
+			);
+		}
+		return channel;
 	}
+
+	/**
+	 * Funding fee rates (sat/vB) chosen by the caller, keyed by temporary channel
+	 * id. Empty for an open that did not ask for one, which funds at the fee
+	 * estimator's rate as before.
+	 */
+	private readonly requestedFundingFeeRates = new Map<string, number>();
 
 	/**
 	 * Open a dual-funded (v2) channel with a peer.
