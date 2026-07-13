@@ -449,6 +449,7 @@ const runBeignetExample = async (
   On-chain Wallet
     node.getNewAddress()                        New deposit address (async)
     node.sendOnchain(addr, sats, satsPerVbyte?) Send on-chain (async)
+    node.sendMaxOnchain(addr, satsPerVbyte?)    Sweep entire balance (async)
     node.listOnchainTransactions()              On-chain tx history (newest first)
     node.listUtxos()                            Spendable on-chain UTXOs
     node.getFeeEstimates()                      Fee estimates in sats/vB (async)
