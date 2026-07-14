@@ -192,20 +192,28 @@ export const constructByteCountParam = (
 	increaseAddressCount: { addrType: EAddressType; count: number }[] = []
 ): TGetByteCountInputs | TGetByteCountOutputs => {
 	try {
-		if (addresses.length <= 0) {
-			return { P2WPKH: 0 };
-		}
 		const param: TGetByteCountOutputs = {};
-		addresses.map((address) => {
+		addresses.forEach((address) => {
 			if (validate(address)) {
 				const addressType = getAddressInfo(address).type.toUpperCase();
-				param[addressType] = param[addressType] ? param[addressType] + 1 : 1;
+				param[addressType] = (param[addressType] ?? 0) + 1;
 			}
 		});
+		// Applied even when there are no addresses. That is precisely when a caller
+		// asks for an assumed output, and returning early on an empty list dropped
+		// the request on the floor: sendMax works out its amount before it knows the
+		// destination, so it priced a sweep with no outputs at all and went out
+		// below the fee rate it was given.
+		//
+		// The key is upper-cased and a zero count is not written. Writing `p2wpkh: 0`
+		// next to `P2WPKH: n`, as this did, left getByteCount holding both spellings
+		// of the same type, which it then counted twice.
 		increaseAddressCount.forEach(({ addrType, count }) => {
-			param[addrType] = (param[addrType] ?? 0) + count;
+			if (count <= 0) return;
+			const key = String(addrType).toUpperCase();
+			param[key] = (param[key] ?? 0) + count;
 		});
-		return param;
+		return Object.keys(param).length ? param : { P2WPKH: 0 };
 	} catch {
 		return { P2WPKH: 0 };
 	}
