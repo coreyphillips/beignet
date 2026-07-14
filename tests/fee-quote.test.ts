@@ -231,18 +231,38 @@ describe('On-chain fee quoting', function () {
 			expect(await feePaid(sent.value)).to.equal(quote.value.fee);
 		});
 
-		it('leaves the staged transaction untouched', () => {
+		it('leaves the staged transaction byte-for-byte unchanged', async () => {
+			// The invariant itself, rather than a proxy for it. This is the staging
+			// area a real send builds in, and the one the old implementation reset,
+			// repopulated and reset again to get its answer.
+			const dest = 'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080';
 			const before = JSON.stringify(wallet.transaction.data);
+
 			const quote = wallet.getFeeInfo({
 				satsPerByte: 10,
-				transaction: quoteTransaction(
-					'bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080',
-					1_000_000,
-					10
-				)
+				transaction: quoteTransaction(dest, 1_000_000, 10)
 			});
 			if (quote.isErr()) throw quote.error;
+
+			const sweep = wallet.transaction.getMaxSendAmount({
+				satsPerByte: 10,
+				transaction: quoteTransaction(dest, 0, 10, true)
+			});
+			if (sweep.isErr()) throw sweep.error;
+
 			expect(JSON.stringify(wallet.transaction.data)).to.equal(before);
+
+			// And the check has teeth. Staging a transaction is the path a quote must
+			// not take, and taking it does move this; without proving that, the
+			// assertion above would pass just as happily against something that never
+			// changes, and would not have caught the implementation it exists to
+			// rule out.
+			await wallet.transaction.setupTransaction({ rbf: wallet.rbf });
+			expect(
+				JSON.stringify(wallet.transaction.data),
+				'staging a transaction should have moved it'
+			).to.not.equal(before);
+			await wallet.transaction.resetSendTransaction();
 		});
 
 		it('two quotes in flight together do not disturb each other', () => {
