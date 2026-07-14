@@ -10,6 +10,7 @@ import {
 	ISendTransaction,
 	IUtxo,
 	TGetByteCountInputs,
+	TGetByteCountOutputs,
 	TGetTotalFeeObj
 } from '../types';
 import { getDefaultSendTransaction } from '../shapes';
@@ -308,14 +309,31 @@ export class Transaction {
 				outputAddresses.push(changeAddress);
 			}
 
+			// Every transaction pays to at least one output, even when the caller has
+			// not named it yet. sendMax works out the amount before it knows where it
+			// is going, so the outputs are still empty here; counting none of them
+			// priced the sweep one output short and it went out below the rate that
+			// was asked for. getTotalFeeObj already assumes the output. Assume it here
+			// too, or the two disagree about the same transaction.
+			let increaseAddressCount = 0;
+			if (!outputAddresses.length) {
+				increaseAddressCount++;
+			}
+
 			//Determine the address type of each address and construct the object for fee calculation
 			const inputParam = this.applyMultisigInputWeights(
 				constructByteCountParam(inputAddresses)
 			);
-			const outputParam = constructByteCountParam(outputAddresses);
-			//Increase P2WPKH output address by one for lightning funding calculation.
+			const outputParam = constructByteCountParam(outputAddresses, [
+				{ addrType: this._wallet.addressType, count: increaseAddressCount }
+			]);
+			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+			// every channel funding transaction by 12 vB, which is a real shortfall
+			// at the fee rates a funding transaction is actually broadcast at.
 			if (fundingLightning) {
-				outputParam.P2WPKH = (outputParam.P2WPKH || 0) + 1;
+				const fundingOutputs = outputParam as TGetByteCountOutputs;
+				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);
@@ -410,9 +428,13 @@ export class Transaction {
 			const outputParam = constructByteCountParam(outputAddresses, [
 				{ addrType: this._wallet.addressType, count: increaseAddressCount }
 			]);
-			//Increase P2WPKH output address by one for lightning funding calculation.
+			// A channel funding output is a 2-of-2 P2WSH (43 vB), not the P2WPKH
+			// (31 vB) an ordinary send pays to. Counting it as P2WPKH understates
+			// every channel funding transaction by 12 vB, which is a real shortfall
+			// at the fee rates a funding transaction is actually broadcast at.
 			if (fundingLightning) {
-				outputParam.P2WPKH = (outputParam.P2WPKH || 0) + 1;
+				const fundingOutputs = outputParam as TGetByteCountOutputs;
+				fundingOutputs.P2WSH = (fundingOutputs.P2WSH || 0) + 1;
 			}
 
 			let transactionByteCount = getByteCount(inputParam, outputParam, message);

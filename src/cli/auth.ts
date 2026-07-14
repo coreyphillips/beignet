@@ -149,6 +149,10 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /route/estimate': ['readonly'],
 	'POST /route/query': ['readonly'],
 	'POST /payment/estimate': ['readonly'],
+	// Prices a transaction without building or broadcasting one. It runs the same
+	// setup and coin selection a send would, but on scratch state that is reset
+	// again, so nothing is spent and nothing is left behind.
+	'POST /tx/quote': ['readonly'],
 	'POST /message/verify': ['readonly'],
 	'POST /address/validate': ['readonly'],
 	'POST /node/wait-ready': ['readonly'],

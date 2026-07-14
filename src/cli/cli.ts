@@ -521,13 +521,49 @@ async function handleTx(): Promise<void> {
 			);
 		case 'boostable':
 			return outputResult(await httpRequest('GET', '/transactions/boostable'));
+		case 'quote': {
+			// What a send would cost, without sending it. The destination is part of
+			// the answer, not decoration: a P2TR output is 43 vB against a P2WPKH's
+			// 31, so quoting without the address prices the wrong transaction.
+			// A channel funding open has no address to give, and says so instead.
+			const channelFunding = hasFlag('--channel-funding');
+			const isMax = hasFlag('--max');
+			const quoteAddress = channelFunding ? undefined : filteredArgs[2];
+			// Positional layout: [address?] [amountSats?] [satsPerVbyte?]. An address
+			// is absent when funding a channel, and an amount is absent when sweeping,
+			// so the rate lands wherever those leave it.
+			let next = channelFunding ? 2 : 3;
+			const amountArg = isMax ? undefined : filteredArgs[next++];
+			const rateArg = filteredArgs[next];
+			if (!channelFunding && !quoteAddress) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet tx quote <address> <amountSats> [satsPerVbyte] | beignet tx quote <address> --max [satsPerVbyte] | beignet tx quote --channel-funding <amountSats> [satsPerVbyte]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest('POST', '/tx/quote', {
+					address: quoteAddress,
+					amountSats: amountArg ? parseInt(amountArg, 10) : undefined,
+					satsPerVbyte: rateArg ? Number(rateArg) : undefined,
+					max: isMax,
+					channelFunding
+				})
+			);
+		}
 		default:
 			output({
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable]'
+						'Usage: beignet tx [bump-fee <txid> <satsPerVbyte>|boost <txid> [satsPerVbyte]|boostable|quote <address> <amountSats> [satsPerVbyte] [--max] [--channel-funding]]'
 				}
 			});
 			process.exitCode = 1;

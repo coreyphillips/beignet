@@ -18,6 +18,8 @@ import {
 import * as crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { Wallet } from '../wallet';
+import { getDefaultSendTransaction } from '../shapes/wallet';
+import { ISendTransaction } from '../types/wallet';
 import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
@@ -134,7 +136,8 @@ import {
 	RebalancePlanInfo,
 	AdvisorRecommendations,
 	RebalanceResult,
-	RebalanceExecutionSummary
+	RebalanceExecutionSummary,
+	TOnchainQuote
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -441,6 +444,32 @@ async function resolveHostToIPv4(host: string): Promise<string> {
 	} catch {
 		return host;
 	}
+}
+
+/**
+ * Numbers arriving over HTTP are whatever JSON.parse made of them, so `> 0` is
+ * not a check: it lets through 0.5 satoshis, Infinity, and 2^60. Reject them at
+ * the edge rather than leaving deeper transaction code to trip over them.
+ */
+function requirePositiveSafeInteger(value: unknown, field: string): number {
+	if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a positive whole number of satoshis`
+		);
+	}
+	return value;
+}
+
+/** A fee rate may be fractional, but it must be a real, positive, finite number. */
+function requirePositiveFiniteNumber(value: unknown, field: string): number {
+	if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_PARAMS,
+			`${field} must be a positive finite number`
+		);
+	}
+	return value;
 }
 
 export class BeignetNode extends EventEmitter {
@@ -1594,6 +1623,147 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Quote an on-chain transaction: what it will cost, without building one.
+	 *
+	 * A client cannot work this out for itself. The fee depends on which UTXOs coin
+	 * selection picks, on their script types, and on whether change is needed, none
+	 * of which a client knows. Guessing it means quoting one number and spending
+	 * another, and sizing a "max" against a guess either strands sats or builds a
+	 * transaction that cannot be funded.
+	 *
+	 * This is a pure calculation. It assembles a transaction in memory and prices
+	 * it, and touches neither the wallet's staged send transaction nor its stored
+	 * data. It must stay that way: that staging area is what a real send builds in,
+	 * so a quote that reset or repopulated it could erase a send being prepared
+	 * alongside it, and a route classified `readonly` has no business writing to
+	 * the wallet at all.
+	 *
+	 * The figures hold for the UTXO set as it stands. A confirmation, a freeze, or
+	 * another spend changes the inputs available and so changes the fee; coin
+	 * selection itself is deterministic, so nothing else will.
+	 *
+	 * `max` prices a sweep, and reports the exact amount that leaves once its own
+	 * fee is taken out.
+	 */
+	async quoteOnchain({
+		address,
+		amountSats,
+		satsPerVbyte,
+		max = false,
+		channelFunding = false
+	}: {
+		address?: string;
+		amountSats?: number;
+		satsPerVbyte?: number;
+		max?: boolean;
+		channelFunding?: boolean;
+	} = {}): Promise<TOnchainQuote> {
+		const satsPerByte =
+			satsPerVbyte === undefined
+				? this.wallet.feeEstimates.normal
+				: requirePositiveFiniteNumber(satsPerVbyte, 'satsPerVbyte');
+		if (!max) {
+			requirePositiveSafeInteger(amountSats, 'amountSats');
+		}
+
+		const txn = this.wallet.transaction;
+		// The same UTXOs a send would gather: everything spendable, frozen ones out.
+		const inputs = txn.removeBlackListedUtxos(this.wallet.data.utxos);
+		if (!inputs.length) {
+			throw new BeignetError(
+				BeignetErrorCode.SEND_FAILED,
+				'No UTXOs available.'
+			);
+		}
+		const changeAddress =
+			this.wallet.data.changeAddressIndex[this.wallet.addressType]?.address;
+		if (!changeAddress) {
+			throw new BeignetError(
+				BeignetErrorCode.SEND_FAILED,
+				'No change address available.'
+			);
+		}
+
+		// Priced in memory, against a transaction the wallet never sees.
+		const transaction: ISendTransaction = {
+			...getDefaultSendTransaction(),
+			rbf: this.wallet.rbf,
+			satsPerByte,
+			max,
+			changeAddress,
+			inputs,
+			outputs: [
+				{
+					address: address || this.fundingSampleAddress(channelFunding),
+					value: amountSats ?? 0,
+					index: 0
+				}
+			]
+		};
+
+		if (max) {
+			const maxSend = txn.getMaxSendAmount({ satsPerByte, transaction });
+			if (maxSend.isErr()) {
+				throw new BeignetError(
+					BeignetErrorCode.SEND_FAILED,
+					maxSend.error.message
+				);
+			}
+			const info = this.wallet.getFeeInfo({ satsPerByte, transaction });
+			if (info.isErr()) {
+				throw new BeignetError(
+					BeignetErrorCode.SEND_FAILED,
+					info.error.message
+				);
+			}
+			return {
+				satsPerVbyte: satsPerByte,
+				feeSats: maxSend.value.fee,
+				vsize: info.value.transactionByteCount,
+				maxSendSats: maxSend.value.amount,
+				maxSatsPerVbyte: info.value.maxSatPerByte
+			};
+		}
+
+		const info = this.wallet.getFeeInfo({ satsPerByte, transaction });
+		if (info.isErr()) {
+			throw new BeignetError(BeignetErrorCode.SEND_FAILED, info.error.message);
+		}
+		return {
+			satsPerVbyte: satsPerByte,
+			feeSats: info.value.totalFee,
+			vsize: info.value.transactionByteCount,
+			maxSatsPerVbyte: info.value.maxSatPerByte
+		};
+	}
+
+	/**
+	 * An address of the type an output will actually use, for quoting a transaction
+	 * whose destination is not known yet. Only the script type matters: that is what
+	 * decides the output's size.
+	 *
+	 * A channel funding output is the 2-of-2 the commitment signs against. That is a
+	 * P2WSH here, because this node does not open taproot channels: preferTaproot is
+	 * a LightningNode option and BeignetNode never passes it. If it ever does, this
+	 * has to learn about the P2TR key-spend funding output at the same time, or a
+	 * taproot open will be quoted against the wrong script.
+	 */
+	private fundingSampleAddress(channelFunding: boolean): string {
+		if (!channelFunding) {
+			// The wallet's own current receive address, of the type it actually uses.
+			// Reading it does not consume it.
+			return this.wallet.data.addressIndex[this.wallet.addressType].address;
+		}
+		const bitcoin = require('bitcoinjs-lib');
+		// A witness-v0 32-byte program: the shape of a 2-of-2 funding output. The
+		// bytes are irrelevant, only the script type is.
+		return bitcoin.address.fromOutputScript(
+			Buffer.concat([Buffer.from([0x00, 0x20]), Buffer.alloc(32)]),
+			this.getBitcoinNetwork()
+		);
+	}
+
+	/**
 	 * Sweep the entire spendable on-chain balance to one address. The output
 	 * value is balance minus fee; the wallet rejects rates where the fee would
 	 * consume the whole balance.
@@ -2130,12 +2300,18 @@ export class BeignetNode extends EventEmitter {
 	openChannel(
 		pubkey: string,
 		amountSats: number,
-		pushSats?: number
+		pushSats?: number,
+		satsPerVbyte?: number
 	): ChannelInfo {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
-		const channel = this.node.openChannel(pubkey, fundingSatoshis, pushMsat);
+		const channel = this.node.openChannel(
+			pubkey,
+			fundingSatoshis,
+			pushMsat,
+			satsPerVbyte
+		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
 		const channelId = state.channelId || state.temporaryChannelId;
@@ -2168,10 +2344,15 @@ export class BeignetNode extends EventEmitter {
 		host: string,
 		port: number,
 		amountSats: number,
-		opts?: { pushSats?: number }
+		opts?: { pushSats?: number; satsPerVbyte?: number }
 	): Promise<ChannelInfo> {
 		await this.connectPeer(pubkey, host, port);
-		return this.openChannel(pubkey, amountSats, opts?.pushSats);
+		return this.openChannel(
+			pubkey,
+			amountSats,
+			opts?.pushSats,
+			opts?.satsPerVbyte
+		);
 	}
 
 	async ensureMinimumChannels(

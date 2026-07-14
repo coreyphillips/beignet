@@ -192,20 +192,28 @@ export const constructByteCountParam = (
 	increaseAddressCount: { addrType: EAddressType; count: number }[] = []
 ): TGetByteCountInputs | TGetByteCountOutputs => {
 	try {
-		if (addresses.length <= 0) {
-			return { P2WPKH: 0 };
-		}
 		const param: TGetByteCountOutputs = {};
-		addresses.map((address) => {
+		addresses.forEach((address) => {
 			if (validate(address)) {
 				const addressType = getAddressInfo(address).type.toUpperCase();
-				param[addressType] = param[addressType] ? param[addressType] + 1 : 1;
+				param[addressType] = (param[addressType] ?? 0) + 1;
 			}
 		});
+		// Applied even when there are no addresses. That is precisely when a caller
+		// asks for an assumed output, and returning early on an empty list dropped
+		// the request on the floor: sendMax works out its amount before it knows the
+		// destination, so it priced a sweep with no outputs at all and went out
+		// below the fee rate it was given.
+		//
+		// The key is upper-cased and a zero count is not written. Writing `p2wpkh: 0`
+		// next to `P2WPKH: n`, as this did, left getByteCount holding both spellings
+		// of the same type, which it then counted twice.
 		increaseAddressCount.forEach(({ addrType, count }) => {
-			param[addrType] = (param[addrType] ?? 0) + count;
+			if (count <= 0) return;
+			const key = String(addrType).toUpperCase();
+			param[key] = (param[key] ?? 0) + count;
 		});
-		return param;
+		return Object.keys(param).length ? param : { P2WPKH: 0 };
 	} catch {
 		return { P2WPKH: 0 };
 	}
@@ -267,7 +275,11 @@ export const getByteCount = (
 				P2WPKH: 31 * 4,
 				// (p2wsh:35) + (amount:8)
 				P2WSH: 43 * 4,
-				P2TR: (8 + 1 + 32) * 4
+				// (p2tr:35) + (amount:8). The script is OP_1 <32-byte program>, so 34
+				// bytes plus its length prefix, the same size as a P2WSH output. It was
+				// counted as (8 + 1 + 32), which omits the two opcode bytes and
+				// under-priced every taproot output by 2 vB.
+				P2TR: 43 * 4
 			}
 		};
 
@@ -288,9 +300,16 @@ export const getByteCount = (
 				: 9;
 		};
 
-		Object.keys(inputs).forEach(function (key) {
-			key = key.toUpperCase();
-			checkUInt53(inputs[key]);
+		// Read each count from the key it was given under, then upper-case the key
+		// only to look the type up. Upper-casing first and re-reading the object
+		// with the upper-cased key makes a lower-case entry ("p2wpkh") read the
+		// value of its upper-case twin ("P2WPKH") and count it a second time, so a
+		// param carrying both forms was double-counted. constructByteCountParam
+		// emits exactly that pair, which inflated every fee getTotalFeeObj quoted.
+		Object.keys(inputs).forEach(function (originalKey) {
+			const count = inputs[originalKey];
+			const key = originalKey.toUpperCase();
+			checkUInt53(count);
 			if (key.slice(0, 8) === 'MULTISIG') {
 				// ex. "MULTISIG-P2SH:2-3" would mean 2 of 3 P2SH MULTISIG
 				const keyParts = key.split(':');
@@ -300,22 +319,22 @@ export const getByteCount = (
 					return parseInt(item);
 				});
 
-				totalWeight += types.inputs[newKey] * inputs[key];
+				totalWeight += types.inputs[newKey] * count;
 				const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
-				totalWeight +=
-					(73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * inputs[key];
+				totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
 			} else {
-				totalWeight += types.inputs[key] * inputs[key];
+				totalWeight += types.inputs[key] * count;
 			}
-			inputCount += inputs[key];
-			if (key.indexOf('W') >= 0) hasWitness = true;
+			inputCount += count;
+			if (count > 0 && key.indexOf('W') >= 0) hasWitness = true;
 		});
 
-		Object.keys(outputs).forEach(function (key) {
-			key = key.toUpperCase();
-			checkUInt53(outputs[key]);
-			totalWeight += types.outputs[key] * outputs[key];
-			outputCount += outputs[key];
+		Object.keys(outputs).forEach(function (originalKey) {
+			const count = outputs[originalKey];
+			const key = originalKey.toUpperCase();
+			checkUInt53(count);
+			totalWeight += types.outputs[key] * count;
+			outputCount += count;
 		});
 
 		if (hasWitness) totalWeight += 2;
