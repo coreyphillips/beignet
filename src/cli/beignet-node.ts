@@ -3922,10 +3922,24 @@ export class BeignetNode extends EventEmitter {
 	spliceOut(
 		channelId: string,
 		amountSats: number,
-		feeratePerkw: number
+		feeratePerkw: number,
+		destinationAddress?: string
 	): SpliceResult {
 		const idBuf = Buffer.from(channelId, 'hex');
-		const result = this.node.spliceOut(idBuf, BigInt(amountSats), feeratePerkw);
+		let destinationScript: Buffer | undefined;
+		if (destinationAddress) {
+			const bitcoin = require('bitcoinjs-lib');
+			destinationScript = bitcoin.address.toOutputScript(
+				destinationAddress,
+				this.getBitcoinNetwork()
+			);
+		}
+		const result = this.node.spliceOut(
+			idBuf,
+			BigInt(amountSats),
+			feeratePerkw,
+			destinationScript
+		);
 		this.refreshStaticChannelBackup();
 		return result;
 	}

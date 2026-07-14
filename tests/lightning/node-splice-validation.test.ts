@@ -160,4 +160,32 @@ describe('LightningNode splice validation', function () {
 		expect(result.error).to.include('selectSpliceInputs');
 		node.destroy();
 	});
+
+	it('throws when destinationScript is provided but empty', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		expect(() =>
+			node.spliceOut(channelId, 10_000n, 2500, Buffer.alloc(0))
+		).to.throw('destinationScript must be a non-empty Buffer');
+		node.destroy();
+	});
+
+	it('records an external destinationScript for splice-out', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// A P2WPKH scriptPubKey (OP_0 <20-byte hash>) for an address the node
+		// does not own, proving splice-out can pay an external destination.
+		const externalScript = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto.randomBytes(20)
+		]);
+		const result = node.spliceOut(channelId, 10_000n, 2500, externalScript);
+		expect(result.error ?? '').to.not.include('insufficient channel balance');
+		const channel = (node as any).channelManager.channels.get(
+			channelId.toString('hex')
+		);
+		expect(channel._spliceOutDestination.script.equals(externalScript)).to.be
+			.true;
+		node.destroy();
+	});
 });
