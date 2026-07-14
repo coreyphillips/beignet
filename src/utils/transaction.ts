@@ -267,7 +267,11 @@ export const getByteCount = (
 				P2WPKH: 31 * 4,
 				// (p2wsh:35) + (amount:8)
 				P2WSH: 43 * 4,
-				P2TR: (8 + 1 + 32) * 4
+				// (p2tr:35) + (amount:8). The script is OP_1 <32-byte program>, so 34
+				// bytes plus its length prefix, the same size as a P2WSH output. It was
+				// counted as (8 + 1 + 32), which omits the two opcode bytes and
+				// under-priced every taproot output by 2 vB.
+				P2TR: 43 * 4
 			}
 		};
 

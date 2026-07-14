@@ -183,17 +183,24 @@ export interface TxInfo {
 }
 
 /**
- * What an on-chain transaction will really cost, from the coin selection that
- * will really run, rather than from a caller's guess at it.
+ * What an on-chain transaction costs, from the same coin selection a send runs,
+ * rather than from a caller's guess at it.
+ *
+ * The figures are exact for the UTXO set as it stands, which is the most a quote
+ * can promise: coin selection is deterministic, so nothing here drifts on its
+ * own, but a confirmation, a freeze, or another spend changes which inputs are
+ * available and therefore what the transaction costs. Quote close to sending,
+ * and treat a quote as current rather than as a reservation. Nothing here binds
+ * the inputs a later send will pick.
  */
 export type TOnchainQuote = {
 	/** The rate the quote was made at. */
 	satsPerVbyte: number;
-	/** The fee this transaction will pay. Not an estimate. */
+	/** The fee this transaction pays, at the current UTXO set. */
 	feeSats: number;
 	/** Its size in virtual bytes, from the selected inputs and outputs. */
 	vsize: number;
-	/** Set when quoting a sweep: the exact amount sendable once the fee is out. */
+	/** Set when quoting a sweep: the amount sendable once its own fee is out. */
 	maxSendSats?: number;
 	/** The highest rate this transaction can pay without the fee taking half the balance. */
 	maxSatsPerVbyte: number;

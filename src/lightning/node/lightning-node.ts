@@ -3317,7 +3317,7 @@ export class LightningNode extends EventEmitter {
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
-		fundingFeeRate?: number
+		satsPerVbyte?: number
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -3330,9 +3330,14 @@ export class LightningNode extends EventEmitter {
 				})`
 			);
 		}
-		if (fundingFeeRate !== undefined && !(fundingFeeRate > 0)) {
+		// `> 0` alone would admit Infinity and NaN-adjacent nonsense; a fee rate has
+		// to be a real, finite, positive number before it is paid to miners.
+		if (
+			satsPerVbyte !== undefined &&
+			(!Number.isFinite(satsPerVbyte) || satsPerVbyte <= 0)
+		) {
 			throw new Error(
-				`fundingFeeRate (${fundingFeeRate}) must be a positive sat/vB rate`
+				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
 			);
 		}
 		const channel = this.channelManager.openChannel(
@@ -3344,10 +3349,22 @@ export class LightningNode extends EventEmitter {
 		// until funding is created. handleAutoFunding picks it up when the peer
 		// accepts; until then the funding transaction does not exist and there is
 		// nothing to apply it to.
-		if (fundingFeeRate !== undefined) {
+		if (satsPerVbyte !== undefined) {
+			// An open that is accepted, or that fails, takes its entry with it. One
+			// the peer neither accepts nor refuses leaves it behind, so the map is
+			// bounded rather than trusting every open to end in a way we hear about.
+			if (
+				this.requestedFundingFeeRates.size >=
+				LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
+			) {
+				const oldest = this.requestedFundingFeeRates.keys().next().value;
+				if (oldest !== undefined) {
+					this.requestedFundingFeeRates.delete(oldest);
+				}
+			}
 			this.requestedFundingFeeRates.set(
 				channel.getTemporaryChannelId().toString('hex'),
-				fundingFeeRate
+				satsPerVbyte
 			);
 		}
 		return channel;
@@ -3359,6 +3376,9 @@ export class LightningNode extends EventEmitter {
 	 * estimator's rate as before.
 	 */
 	private readonly requestedFundingFeeRates = new Map<string, number>();
+
+	/** Far more than any node has opens in flight; a backstop, not a budget. */
+	private static readonly MAX_REQUESTED_FUNDING_FEE_RATES = 256;
 
 	/**
 	 * Open a dual-funded (v2) channel with a peer.
