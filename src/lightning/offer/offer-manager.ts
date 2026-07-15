@@ -48,10 +48,13 @@ export const TLV_INVOICE = 66;
 /** TLV type for BOLT 12 invoice error in onion messages */
 export const TLV_INVOICE_ERROR = 68;
 
-/** Signature tag for BOLT 12 invoices */
-const INVOICE_SIGNATURE_TAG = 'lightning';
-/** Signature tag for invoice requests */
-const INVOICE_REQUEST_SIGNATURE_TAG = 'lightning';
+// BOLT 12 signature tags are "lightning" || messagename || fieldname (the field
+// is always the "signature" field, type 240). A bare "lightning" tag made every
+// signature incompatible with CLN/eclair/LDK in both directions.
+/** Signature tag for BOLT 12 invoices. */
+const INVOICE_SIGNATURE_TAG = 'lightninginvoicesignature';
+/** Signature tag for BOLT 12 invoice requests. */
+const INVOICE_REQUEST_SIGNATURE_TAG = 'lightninginvoice_requestsignature';
 
 export interface ICreateOfferOptions {
 	/** Amount in millisatoshis (optional for "any amount" offers) */

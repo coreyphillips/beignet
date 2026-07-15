@@ -39,8 +39,6 @@ import {
 	computeSignatureHash,
 	computeOfferId,
 	taggedHash,
-	leafHash,
-	branchHash,
 	// Schnorr
 	schnorrSign,
 	schnorrVerify,
@@ -426,78 +424,35 @@ describe('BOLT 12: Offers', () => {
 
 	// ── Merkle Root Computation ─────────────────────────────────────
 
-	describe('Merkle root computation', () => {
-		it('should compute leaf hash correctly', () => {
-			const data = Buffer.from('test data');
-			const hash = leafHash(data);
-			expect(hash.length).to.equal(32);
+	describe('Merkle root computation (BOLT 12)', () => {
+		// Known-answer vectors from LDK's BOLT 12 merkle tests. The tree
+		// interleaves an "LnNonce" leaf per TLV; matching these confirms the
+		// construction is byte-identical to CLN/eclair/LDK.
+		it('matches the LDK single-record vector', () => {
+			const root = computeMerkleRoot([Buffer.from('010203e8', 'hex')]);
+			expect(root.toString('hex')).to.equal(
+				'b013756c8fee86503a0b4abdab4cddeb1af5d344ca6fc2fa8b6c08938caa6f93'
+			);
 		});
 
-		it('should compute branch hash correctly', () => {
-			const left = crypto.randomBytes(32);
-			const right = crypto.randomBytes(32);
-			const hash = branchHash(left, right);
-			expect(hash.length).to.equal(32);
+		it('matches the LDK two-record vector', () => {
+			const root = computeMerkleRoot([
+				Buffer.from('010203e8', 'hex'),
+				Buffer.from('02080000010000020003', 'hex')
+			]);
+			expect(root.toString('hex')).to.equal(
+				'c3774abbf4815aa54ccaa026bff6581f01f3be5fe814c620a252534f434bc0d1'
+			);
 		});
 
-		it('should produce different hash for different data', () => {
-			const hash1 = leafHash(Buffer.from('data1'));
-			const hash2 = leafHash(Buffer.from('data2'));
-			expect(hash1.equals(hash2)).to.be.false;
-		});
-
-		it('should compute merkle root for single element', () => {
-			const record = Buffer.from('single record');
-			const root = computeMerkleRoot([record]);
-			expect(root.length).to.equal(32);
-			// Single element = just the leaf hash
-			expect(root.equals(leafHash(record))).to.be.true;
-		});
-
-		it('should compute merkle root for two elements', () => {
-			const r1 = Buffer.from('record1');
-			const r2 = Buffer.from('record2');
-			const root = computeMerkleRoot([r1, r2]);
-			expect(root.length).to.equal(32);
-			// Two elements = branch(leaf(r1), leaf(r2))
-			const expected = branchHash(leafHash(r1), leafHash(r2));
-			expect(root.equals(expected)).to.be.true;
-		});
-
-		it('should compute merkle root for three elements', () => {
-			const r1 = Buffer.from('record1');
-			const r2 = Buffer.from('record2');
-			const r3 = Buffer.from('record3');
-			const root = computeMerkleRoot([r1, r2, r3]);
-			expect(root.length).to.equal(32);
-			// Three elements: branch(leaf(r1), leaf(r2)) then branch(that, leaf(r3))
-			const left = branchHash(leafHash(r1), leafHash(r2));
-			const expected = branchHash(left, leafHash(r3));
-			expect(root.equals(expected)).to.be.true;
-		});
-
-		it('should compute merkle root for four elements', () => {
-			const records = [
-				Buffer.from('record1'),
-				Buffer.from('record2'),
-				Buffer.from('record3'),
-				Buffer.from('record4')
-			];
-			const root = computeMerkleRoot(records);
-			expect(root.length).to.equal(32);
-			// Four elements: branch(branch(leaf(r1),leaf(r2)), branch(leaf(r3),leaf(r4)))
-			const left = branchHash(leafHash(records[0]), leafHash(records[1]));
-			const right = branchHash(leafHash(records[2]), leafHash(records[3]));
-			const expected = branchHash(left, right);
-			expect(root.equals(expected)).to.be.true;
-		});
-
-		it('branch hash should be order-independent', () => {
-			const a = crypto.randomBytes(32);
-			const b = crypto.randomBytes(32);
-			const hash1 = branchHash(a, b);
-			const hash2 = branchHash(b, a);
-			expect(hash1.equals(hash2)).to.be.true;
+		it('excludes the signature record (type 240) from the tree', () => {
+			const withoutSig = computeMerkleRoot([Buffer.from('010203e8', 'hex')]);
+			const withSig = computeMerkleRoot([
+				Buffer.from('010203e8', 'hex'),
+				// type 240 (0xf0), len 64, value — the signature field.
+				Buffer.concat([Buffer.from('f040', 'hex'), Buffer.alloc(64, 0xab)])
+			]);
+			expect(withSig.equals(withoutSig)).to.be.true;
 		});
 
 		it('should throw for empty records', () => {
