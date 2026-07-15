@@ -248,6 +248,7 @@ export function buildCommitmentTx(
 		sortKey: Buffer;
 		type: OutputKind;
 		htlcIndex?: number;
+		cltvExpiry?: number;
 	}
 	const outputs: IOutputEntry[] = [];
 
@@ -327,7 +328,8 @@ export function buildCommitmentTx(
 					value: htlc.amount,
 					sortKey: spk,
 					type: 'htlc',
-					htlcIndex: i
+					htlcIndex: i,
+					cltvExpiry: htlc.cltvExpiry
 				});
 			}
 		}
@@ -366,12 +368,28 @@ export function buildCommitmentTx(
 		}
 	}
 
-	// Sort outputs: BIP 69 — by value, then by scriptPubKey
+	// Sort outputs: BIP 69 (by value, then by scriptPubKey) with the BOLT 3
+	// tie-break for HTLC outputs — two offered HTLCs with the same amount and
+	// payment_hash share an identical scriptPubKey (the offered-HTLC script omits
+	// cltv_expiry), so BIP 69 alone cannot order them. BOLT 3 orders such
+	// identical HTLC outputs by cltv_expiry ascending. Without this the
+	// htlc_signature index mapping diverges from LND/CLN/eclair/LDK and a valid
+	// commitment_signed is rejected (a deterministic, peer-inducible failure).
 	outputs.sort((a, b) => {
 		if (a.value !== b.value) {
 			return a.value < b.value ? -1 : 1;
 		}
-		return Buffer.compare(a.sortKey, b.sortKey);
+		const byScript = Buffer.compare(a.sortKey, b.sortKey);
+		if (byScript !== 0) return byScript;
+		if (
+			a.type === 'htlc' &&
+			b.type === 'htlc' &&
+			a.cltvExpiry !== undefined &&
+			b.cltvExpiry !== undefined
+		) {
+			return a.cltvExpiry - b.cltvExpiry;
+		}
+		return 0;
 	});
 
 	// Add sorted outputs to transaction
