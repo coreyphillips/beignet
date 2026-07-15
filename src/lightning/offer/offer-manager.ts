@@ -37,6 +37,7 @@ import {
 } from './merkle';
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
+import { ITlvRecord } from '../message/tlv';
 import { IBlindedPath } from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
@@ -241,11 +242,14 @@ export class OfferManager extends EventEmitter {
 		const payerPrivkey = crypto.randomBytes(32);
 		const payerPubkey = getPublicKey(payerPrivkey);
 
-		// Build invoice request
+		// Build invoice request. invreq_metadata (type 0) is a payer-generated
+		// nonce that BOLT 12 requires and that the signature commits to; it must be
+		// set before we encode + sign.
 		const request: IInvoiceRequest = {
 			payerKey: payerPubkey,
 			offerId: offer.offerId,
-			amount: options?.amount ?? offer.amount
+			amount: options?.amount ?? offer.amount,
+			metadata: crypto.randomBytes(32)
 		};
 
 		if (options?.quantity !== undefined) request.quantity = options.quantity;
@@ -301,7 +305,30 @@ export class OfferManager extends EventEmitter {
 		requestData: Buffer,
 		replyPath?: IBlindedPath
 	): IBolt12Invoice | null {
-		const { request } = decodeInvoiceRequestTlv(requestData);
+		const { request, records } = decodeInvoiceRequestTlv(requestData);
+
+		// BOLT 12: a valid invoice_request MUST carry invreq_metadata (type 0) and
+		// a signature (type 240) by the payer key. Reject an unsigned or forged
+		// request rather than issuing an invoice against it.
+		if (
+			!request.metadata ||
+			!request.signature ||
+			!this.verifyInvoiceRequestSignature(
+				records,
+				request.payerKey,
+				request.signature
+			)
+		) {
+			const error: IInvoiceError = { error: 'Invalid invoice request' };
+			if (replyPath && this.onionMessageManager) {
+				const errData = encodeInvoiceErrorTlv(error);
+				const messageData = new Map<number, Buffer>();
+				messageData.set(TLV_INVOICE_ERROR, errData);
+				this.onionMessageManager.sendReply(replyPath, messageData);
+			}
+			this.emit('invoice:error', error);
+			return null;
+		}
 
 		// Match against local offers by the offerId the decoder computed from the
 		// offer TLV records mirrored into the request (zero when none present).
@@ -427,6 +454,24 @@ export class OfferManager extends EventEmitter {
 
 		const xOnlyNodeId = toXOnlyPubkey(invoice.nodeId);
 		return schnorrVerify(sigHash, xOnlyNodeId, invoice.signature);
+	}
+
+	/**
+	 * Verify an invoice_request's payer signature (BOLT 12): the signature covers
+	 * the merkle root of all request TLVs except the signature itself, and is made
+	 * by the invreq_payer_id key.
+	 */
+	verifyInvoiceRequestSignature(
+		records: ITlvRecord[],
+		payerKey: Buffer,
+		signature: Buffer
+	): boolean {
+		const merkleRoot = computeMerkleRootFromRecords(records);
+		const sigHash = computeSignatureHash(
+			INVOICE_REQUEST_SIGNATURE_TAG,
+			merkleRoot
+		);
+		return schnorrVerify(sigHash, toXOnlyPubkey(payerKey), signature);
 	}
 
 	/**
