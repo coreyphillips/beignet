@@ -2911,11 +2911,22 @@ export class LightningNode extends EventEmitter {
 				}
 				continue;
 			}
-			const { p2wshOutput } = createFundingScript(
-				state.localBasepoints.fundingPubkey,
-				state.remoteBasepoints.fundingPubkey,
-				btcNetwork
-			);
+			// The funding output the chain watcher subscribes to MUST be the real
+			// on-chain scriptPubKey. Simple-taproot channels fund a P2TR MuSig2
+			// key-spend output, NOT the witness-v0 2-of-2 P2WSH, so subscribing the
+			// P2WSH scripthash would never match and a breach or force-close on a
+			// taproot channel would go undetected (funds stranded / stolen).
+			const fundingScript = isTaprootChannel(state.channelType)
+				? createTaprootFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2trOutput
+				: createFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2wshOutput;
 
 			const inflight = state.spliceInFlight;
 			if (inflight) {
@@ -2958,7 +2969,7 @@ export class LightningNode extends EventEmitter {
 				txidHex,
 				state.fundingOutputIndex,
 				state.minimumDepth ?? 3,
-				p2wshOutput
+				fundingScript
 			);
 		}
 	}
