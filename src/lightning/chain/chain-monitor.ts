@@ -1426,13 +1426,24 @@ export class ChainMonitor {
 			return null;
 		}
 
-		for (const r of resolved) {
-			if (r.spendTx && r.witness) {
-				r.spendTx.setWitness(0, r.witness);
-				return r.spendTx;
-			}
-			// Penalty txs come back with witnesses already set.
-			if (r.spendTx) return r.spendTx;
+		// Return the claim for the SPECIFIC tracked output that triggered this
+		// rebuild. A batched second-level justice tx (SIGHASH_SINGLE|ANYONECANPAY
+		// lets a cheater confirm multiple HTLC claims in one tx) resolves to one
+		// entry per output, so returning resolved[0] unconditionally would re-bump
+		// only the first claim and leave outputs 1..N-1 pinned at their stale
+		// feerate until the cheater's to_self_delay matures. Match on the outpoint;
+		// fall back to the sole entry only when resolution produced exactly one.
+		const match =
+			resolved.find(
+				(r) =>
+					r.trackedOutput.txid === output.txid &&
+					r.trackedOutput.outputIndex === output.outputIndex
+			) ?? (resolved.length === 1 ? resolved[0] : undefined);
+		if (match?.spendTx) {
+			// Penalty txs come back with witnesses already set; others carry a
+			// separate witness to attach.
+			if (match.witness) match.spendTx.setWitness(0, match.witness);
+			return match.spendTx;
 		}
 		return null;
 	}

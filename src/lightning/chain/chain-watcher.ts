@@ -481,17 +481,33 @@ export class ChainWatcher extends EventEmitter {
 
 		// Broadcast transactions (closing/sweep txs)
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
+			if (!Buffer.isBuffer(tx)) {
+				// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
+				// hex-encodes to "[object Object]" and cannot be broadcast; drop it
+				// loudly instead of letting the failure path below throw an unhandled
+				// rejection when it calls Transaction.fromBuffer on a non-Buffer.
+				this.emit(
+					'broadcast:failure',
+					new Error('broadcast:tx received a non-Buffer payload; dropped')
+				);
+				return;
+			}
 			this.broadcastTransaction(tx).catch((err) => {
-				// Queue for retry on next block
-				const txObj = bitcoin.Transaction.fromBuffer(tx);
-				const txidHex = txObj.getId();
-				// Dedup by txid
-				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
-					this.failedBroadcasts.push({
-						rawTx: Buffer.from(tx),
-						txidHex,
-						retryCount: 0
-					});
+				// Queue for retry on next block. Guard the decode so a malformed
+				// payload is logged and dropped rather than throwing an unhandled
+				// rejection inside this catch handler (which would crash the process).
+				try {
+					const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
+					// Dedup by txid
+					if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
+						this.failedBroadcasts.push({
+							rawTx: Buffer.from(tx),
+							txidHex,
+							retryCount: 0
+						});
+					}
+				} catch {
+					// Not a decodable transaction; nothing to queue for retry.
 				}
 				this.emit('broadcast:failure', err);
 			});

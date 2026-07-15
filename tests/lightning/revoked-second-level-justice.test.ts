@@ -540,5 +540,180 @@ describe('Revoked second-level HTLC justice (#8)', function () {
 			expect(htlcOutput.status).to.equal(OutputStatus.SPEND_CONFIRMED);
 			expect(htlcOutput.resolutionTxid).to.equal(penaltyTx.getId());
 		});
+
+		// FS-8: a cheater can batch multiple HTLC-success claims into ONE
+		// second-level tx (SIGHASH_SINGLE|ANYONECANPAY). rebuildSweep must re-bump
+		// the claim for the SPECIFIC triggering output, not always resolved[0], or
+		// the non-first claims stay pinned at their stale feerate and the cheater
+		// reclaims them after its to_self_delay.
+		it('re-bumps each claim of a batched second-level justice tx by outpoint (FS-8)', function () {
+			const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
+			exchangeCommitments(opener, acceptor);
+			const state = opener.getFullState();
+
+			const mkHtlc = (id: number, tag: string, cltv: number): Buffer => {
+				const preimage = crypto.createHash('sha256').update(tag).digest();
+				const paymentHash = crypto
+					.createHash('sha256')
+					.update(preimage)
+					.digest();
+				state.htlcs.set(`OFFERED-${id}`, {
+					id: BigInt(id),
+					amountMsat: 100_000_000n,
+					paymentHash,
+					cltvExpiry: cltv,
+					onionRoutingPacket: Buffer.alloc(0),
+					direction: HtlcDirection.OFFERED,
+					state: HtlcState.COMMITTED
+				});
+				return paymentHash;
+			};
+			const hash0 = mkHtlc(0, 'fs8-h0', 700_000);
+			const hash1 = mkHtlc(1, 'fs8-h1', 700_001);
+
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+			const revokedPoint = perCommitmentPointFromSecret(secret);
+			const revocationPubkey = deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			);
+			const theirDelayedPubkey = derivePublicKey(
+				state.remoteBasepoints!.delayedPaymentBasepoint,
+				revokedPoint
+			);
+			const theirHtlcPubkey = derivePublicKey(
+				state.remoteBasepoints!.htlcBasepoint,
+				revokedPoint
+			);
+			const ourHtlcPubkey = derivePublicKey(
+				state.localBasepoints.htlcBasepoint,
+				revokedPoint
+			);
+
+			// Revoked commitment: to_local @0, HTLC0 @1, HTLC1 @2.
+			const revokedTx = buildRevokedTxShell(state);
+			revokedTx.addOutput(
+				bitcoin.payments.p2wsh({
+					redeem: {
+						output: buildToLocalScript(
+							revocationPubkey,
+							theirDelayedPubkey,
+							state.localConfig.toSelfDelay
+						)
+					}
+				}).output!,
+				700_000
+			);
+			for (const [hash, cltv] of [
+				[hash0, 700_000],
+				[hash1, 700_001]
+			] as const) {
+				revokedTx.addOutput(
+					bitcoin.payments.p2wsh({
+						redeem: {
+							output: buildReceivedHtlcScript(
+								revocationPubkey,
+								theirHtlcPubkey,
+								ourHtlcPubkey,
+								hash,
+								cltv,
+								false
+							)
+						}
+					}).output!,
+					100_000
+				);
+			}
+
+			monitor.handleFundingSpent(revokedTx, 100);
+			const htlcOutputs = monitor
+				.getTrackedOutputs()
+				.filter((o) => o.outputType === OutputType.OFFERED_HTLC);
+			expect(htlcOutputs.length, 'both revoked HTLC outputs tracked').to.equal(
+				2
+			);
+
+			// The cheater confirms ONE second-level tx batching both claims. Both
+			// outputs use the to_local-format second-level script but carry DIFFERENT
+			// amounts, so a wrong-outpoint rebuild is detectable.
+			const secondLevelScript = buildPeerSecondLevelScript(state, revokedPoint);
+			const secondLevelTx = new bitcoin.Transaction();
+			secondLevelTx.version = 2;
+			for (const ho of htlcOutputs) {
+				secondLevelTx.addInput(
+					Buffer.from(revokedTx.getId(), 'hex').reverse(),
+					ho.outputIndex,
+					0
+				);
+			}
+			secondLevelTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: secondLevelScript } })
+					.output!,
+				95_000
+			);
+			secondLevelTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: secondLevelScript } })
+					.output!,
+				90_000
+			);
+			secondLevelTx.ins.forEach((_, i) => {
+				secondLevelTx.ins[i].witness = [
+					Buffer.alloc(0),
+					crypto.randomBytes(72),
+					crypto.randomBytes(72),
+					crypto.randomBytes(32),
+					crypto.randomBytes(80)
+				];
+			});
+
+			monitor.handleOutputSpent(
+				revokedTx.getId(),
+				htlcOutputs[0].outputIndex,
+				secondLevelTx,
+				105
+			);
+
+			const slOutputs = monitor
+				.getTrackedOutputs()
+				.filter((o) => o.txid === secondLevelTx.getId());
+			expect(
+				slOutputs.length,
+				'both batched second-level outputs tracked'
+			).to.equal(2);
+			for (const o of slOutputs) {
+				expect(o.secondLevelTxHex, 'secondLevelTxHex retained').to.exist;
+			}
+
+			// Each output's rebuild must spend ITS OWN outpoint. On the prior code
+			// both rebuilds returned the claim for output 0.
+			for (const o of slOutputs) {
+				const rebuilt = (
+					monitor as unknown as {
+						rebuildSweep: (
+							out: (typeof slOutputs)[number],
+							fee: number
+						) => bitcoin.Transaction | null;
+					}
+				).rebuildSweep(o, 25);
+				expect(rebuilt, `rebuild for output ${o.outputIndex}`).to.not.be.null;
+				expect(
+					Buffer.from(rebuilt!.ins[0].hash).reverse().toString('hex')
+				).to.equal(secondLevelTx.getId());
+				expect(
+					rebuilt!.ins[0].index,
+					'rebuild spends the triggering output index'
+				).to.equal(o.outputIndex);
+			}
+		});
 	});
 });
