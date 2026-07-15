@@ -10,8 +10,23 @@ import {
 import {
 	MAX_ACCEPTED_HTLCS,
 	MAX_FUNDING_SATOSHIS,
-	MIN_DUST_LIMIT_SATOSHIS
+	MIN_DUST_LIMIT_SATOSHIS,
+	MAX_DUST_LIMIT_SATOSHIS
 } from './types';
+
+/**
+ * The subset of the open_channel we proposed that accept_channel is validated
+ * against. Lets the opener pass its own proposed values (from channel state)
+ * without reconstructing a full open_channel message; a full IOpenChannelMessage
+ * is structurally assignable here, so existing callers are unaffected.
+ */
+export type IProposedOpenParams = Pick<
+	IOpenChannelMessage,
+	| 'temporaryChannelId'
+	| 'dustLimitSatoshis'
+	| 'channelReserveSatoshis'
+	| 'fundingSatoshis'
+>;
 
 /**
  * Derive the permanent channel_id from funding txid and output index.
@@ -149,7 +164,7 @@ export function validateOpenChannelParams(
  * @returns Error string if invalid, null if valid.
  */
 export function validateAcceptChannelParams(
-	open: IOpenChannelMessage,
+	open: IProposedOpenParams,
 	accept: IAcceptChannelMessage
 ): string | null {
 	// temporary_channel_id must match
@@ -160,6 +175,13 @@ export function validateAcceptChannelParams(
 	// dust_limit must be >= minimum
 	if (accept.dustLimitSatoshis < MIN_DUST_LIMIT_SATOSHIS) {
 		return `dust_limit_satoshis ${accept.dustLimitSatoshis} below minimum ${MIN_DUST_LIMIT_SATOSHIS}`;
+	}
+
+	// dust_limit must be <= a sane maximum. An unbounded dust_limit is the FS-1
+	// fund-loss: the acceptor sets it near our whole balance, so every remote
+	// commitment we build trims our to_remote output as "dust" and we sign it.
+	if (accept.dustLimitSatoshis > MAX_DUST_LIMIT_SATOSHIS) {
+		return `dust_limit_satoshis ${accept.dustLimitSatoshis} exceeds maximum ${MAX_DUST_LIMIT_SATOSHIS}`;
 	}
 
 	// max_accepted_htlcs must be <= 483

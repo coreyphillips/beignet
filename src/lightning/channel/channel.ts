@@ -84,6 +84,7 @@ import {
 	deriveV2ChannelId,
 	deriveV2TemporaryChannelId,
 	validateOpenChannelParams,
+	validateAcceptChannelParams,
 	isValidShutdownScript
 } from './validation';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -825,6 +826,29 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'temporary_channel_id mismatch'
+				}
+			];
+		}
+
+		// Validate the acceptor's parameters against what WE proposed in
+		// open_channel BEFORE adopting them. Without this an adversarial acceptor
+		// could set e.g. an unbounded dust_limit that trims our to_remote output to
+		// fees on every commitment we sign (FS-1). The values we proposed live in
+		// channel state.
+		const acceptError = validateAcceptChannelParams(
+			{
+				temporaryChannelId: this._state.temporaryChannelId,
+				dustLimitSatoshis: this._state.localConfig.dustLimitSatoshis,
+				channelReserveSatoshis: this._state.localConfig.channelReserveSatoshis,
+				fundingSatoshis: this._state.fundingSatoshis
+			},
+			msg
+		);
+		if (acceptError) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Invalid accept_channel: ${acceptError}`
 				}
 			];
 		}

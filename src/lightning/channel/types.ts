@@ -175,6 +175,12 @@ export const MAX_WUMBO_FUNDING_SATOSHIS = 1_000_000_000n;
  *  Using 354 ensures compatibility with LND's own 354 dust limit. */
 export const MIN_DUST_LIMIT_SATOSHIS = 354n;
 
+/** Upper bound on a peer-proposed dust limit, matching LND's own cap
+ *  (354 <= dustLimit <= 1062). A dust limit above this is not a genuine
+ *  "too-small-to-create" threshold: an unbounded value lets an acceptor trim
+ *  our to_remote output out of every commitment we sign (see FS-1). */
+export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
+
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
