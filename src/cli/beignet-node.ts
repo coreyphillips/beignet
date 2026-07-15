@@ -948,6 +948,12 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('channel:resolved', () => {
 			this.refreshStaticChannelBackup();
 		});
+		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
+		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
+		// the outpoint a restore must actually watch (FS-7).
+		this.node.on('splice:complete', () => {
+			this.refreshStaticChannelBackup();
+		});
 		this.node.on(
 			'channel:opening',
 			(data: { channelId: Buffer; fundingTxid: Buffer }) => {
@@ -3915,7 +3921,8 @@ export class BeignetNode extends EventEmitter {
 	): SpliceResult {
 		const idBuf = Buffer.from(channelId, 'hex');
 		const result = this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw);
-		this.refreshStaticChannelBackup();
+		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
+		// the new outpoint), NOT here at initiation where it still holds the old one.
 		return result;
 	}
 
@@ -3940,7 +3947,8 @@ export class BeignetNode extends EventEmitter {
 			feeratePerkw,
 			destinationScript
 		);
-		this.refreshStaticChannelBackup();
+		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
+		// the new outpoint), NOT here at initiation where it still holds the old one.
 		return result;
 	}
 

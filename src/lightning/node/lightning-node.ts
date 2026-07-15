@@ -1208,6 +1208,12 @@ export class LightningNode extends EventEmitter {
 				const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
 				this.chainWatcher.rearmAnnouncementTracking(channelId, displayTxid);
 			}
+			// Re-emit outward so the embedder can refresh a static channel backup
+			// NOW, while fundingTxid holds the NEW (post-splice) outpoint. A backup
+			// refreshed at splice initiation still encodes the OLD, already-spent
+			// outpoint, so an SCB restore would watch an outpoint the splice consumed
+			// and miss the peer's force-close on the new one (FS-7).
+			this.emit('splice:complete', { channelId, fundingTxid });
 		});
 
 		// Persist-before-send: channel state persisted via PERSIST_STATE action (Fix 2.2)
@@ -2950,6 +2956,20 @@ export class LightningNode extends EventEmitter {
 					inflight.newFundingOutputIndex,
 					state.minimumDepth ?? 3,
 					spliceFunding.p2wshOutput
+				);
+				// The new-outpoint watch above only arms spend detection once the
+				// splice tx confirms, so the OLD (still-confirmed) funding output has
+				// no spend subscription. Watch it directly for a hostile spend, so a
+				// revoked pre-splice commitment (peer evicts our low-feerate splice and
+				// broadcasts an old commitment) is detected. The splice tx itself
+				// spends the old output legitimately, so it is ignored. state.fundingTxid
+				// still holds the OLD outpoint until completeSplice swaps it.
+				await this.chainWatcher.watchFundingSpendDuringSplice(
+					state.channelId || state.temporaryChannelId,
+					Buffer.from(state.fundingTxid).reverse().toString('hex'),
+					state.fundingOutputIndex,
+					fundingScript,
+					spliceTxidHex
 				);
 				if (inflight.fullySigned && this._chainBackend) {
 					try {

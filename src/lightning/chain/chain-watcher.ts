@@ -53,6 +53,14 @@ interface IWatchedFunding {
 	confirmed: boolean;
 	confirmationHeight: number;
 	announcementTriggered: boolean;
+	/**
+	 * A spend by this txid is NOT a hostile close and must be ignored. Used for
+	 * the pre-splice funding output during an in-flight splice: the splice tx
+	 * legitimately spends it, but a revoked pre-splice commitment (a peer evicting
+	 * our low-feerate splice from the mempool) spends the SAME outpoint with a
+	 * different txid and must trigger the breach path.
+	 */
+	ignoreSpendTxid?: string;
 }
 
 /** A generic output being watched for spends */
@@ -335,6 +343,39 @@ export class ChainWatcher extends EventEmitter {
 		} catch (err) {
 			this.emit('error', err);
 		}
+	}
+
+	/**
+	 * Watch an ALREADY-CONFIRMED funding output for a hostile spend, ignoring one
+	 * expected txid. Used for the pre-splice funding output during an in-flight
+	 * splice: the new-outpoint watch (watchFundingOutput, keyed by channelId) only
+	 * arms spend detection once the SPLICE tx confirms, so the old output would
+	 * otherwise have no spend subscription. A peer that evicts our low-feerate
+	 * splice from the mempool and broadcasts a revoked pre-splice commitment
+	 * spends the old outpoint with a different txid, which this detects and routes
+	 * to handleFundingSpent (the breach path). This watch is intentionally NOT
+	 * stored in watchedFundings so it does not collide with the channel's
+	 * new-outpoint funding watch; a restart re-arms it via restoreChainWatches.
+	 */
+	async watchFundingSpendDuringSplice(
+		channelId: Buffer,
+		txid: string,
+		outputIndex: number,
+		scriptPubkey: Buffer,
+		ignoreSpendTxid: string
+	): Promise<void> {
+		const watched: IWatchedFunding = {
+			channelId,
+			txid,
+			outputIndex,
+			minimumDepth: 0,
+			scriptHash: computeScriptHash(scriptPubkey),
+			confirmed: true,
+			confirmationHeight: 0,
+			announcementTriggered: true,
+			ignoreSpendTxid
+		};
+		await this.watchFundingSpend(watched);
 	}
 
 	/**
@@ -716,6 +757,11 @@ export class ChainWatcher extends EventEmitter {
 		// mempool (height <= 0) spends.
 		for (const entry of history) {
 			if (entry.txid === watched.txid) continue;
+			// A legitimate splice spends the pre-splice funding output; only a
+			// DIFFERENT spender (a revoked/force-close commitment) is a breach.
+			if (watched.ignoreSpendTxid && entry.txid === watched.ignoreSpendTxid) {
+				continue;
+			}
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
