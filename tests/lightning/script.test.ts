@@ -265,6 +265,57 @@ describe('Lightning Scripts (BOLT 3)', function () {
 			expect(sorted[1].script[0]).to.equal(0x02);
 			expect(Number(sorted[2].value)).to.equal(1000);
 		});
+
+		it('BOLT 3: orders identical HTLC outputs by cltv_expiry (S-3.M2)', function () {
+			// Two OFFERED HTLCs with the same amount and payment_hash produce an
+			// identical scriptPubKey (the offered-HTLC script omits cltv_expiry), so
+			// BIP 69 alone cannot order them. BOLT 3 orders them by cltv_expiry
+			// ascending; without it the htlc_signature index mapping diverges from
+			// LND/CLN/eclair/LDK and a valid commitment_signed is rejected.
+			const revocationPub = getPublicKey(crypto.randomBytes(32));
+			const delayedPub = getPublicKey(crypto.randomBytes(32));
+			const remotePub = getPublicKey(crypto.randomBytes(32));
+			const localHtlcPub = getPublicKey(crypto.randomBytes(32));
+			const remoteHtlcPub = getPublicKey(crypto.randomBytes(32));
+			const paymentHash = crypto
+				.createHash('sha256')
+				.update(crypto.randomBytes(32))
+				.digest();
+
+			const htlcScript = buildOfferedHtlcScript(
+				revocationPub,
+				localHtlcPub,
+				remoteHtlcPub,
+				paymentHash
+			);
+			const mkHtlc = (cltvExpiry: number) => ({
+				script: htlcScript,
+				amount: 100_000n,
+				cltvExpiry,
+				paymentHash
+			});
+
+			const result = buildCommitmentTx({
+				fundingTxid: 'c'.repeat(64),
+				fundingOutputIndex: 0,
+				fundingAmount: 1_000_000n,
+				obscuredCommitmentNumber: 0n,
+				localAmount: 400_000n,
+				revocationPubkey: revocationPub,
+				localDelayedPubkey: delayedPub,
+				toSelfDelay: 144,
+				remoteAmount: 300_000n,
+				remotePaymentPubkey: remotePub,
+				// Pass the HIGHER cltv first: the sort must reorder so the lower one
+				// (index 1) is placed first.
+				htlcOutputs: [mkHtlc(600), mkHtlc(500)]
+			});
+
+			expect(result.outputMap.htlcs).to.have.length(2);
+			// The first HTLC output corresponds to the lower-cltv HTLC (original
+			// index 1); the second to the higher-cltv one (original index 0).
+			expect(result.outputMap.htlcOriginalIndices).to.deep.equal([1, 0]);
+		});
 	});
 
 	// ─── HTLC Script Tests ──────────────────────────────────────
