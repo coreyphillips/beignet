@@ -3783,8 +3783,19 @@ export class Channel {
 			206 + 4 * (9 + bandLocalLen) + 4 * (9 + bandRemoteLen) + 66
 		);
 		const idealFee = (bandWeight * bandFeeRate + 999n) / 1000n;
-		const maxAcceptableFee = idealFee * 5n;
 		const minAcceptableFee = idealFee / 5n;
+		// The fee comes out of the OPENER's output only. When WE are the opener the
+		// fee is paid from OUR balance, so bound it tightly (the legacy 2x cap) and
+		// reserve our dust limit: without this an adversarial non-opener could send
+		// closing_signed with feeSatoshis equal to our whole balance, the tx builder
+		// would drop our sub-dust output, and the entire balance would be paid to
+		// miners. When the peer is the opener the fee is theirs, so keep the lenient
+		// interop band (their chosen closing feerate may exceed our stale config).
+		const isOpener = this._state.role === ChannelRole.OPENER;
+		const openerBalanceSat = isOpener
+			? this._state.localBalanceMsat / 1000n
+			: this._state.remoteBalanceMsat / 1000n;
+		const maxAcceptableFee = isOpener ? idealFee * 2n : idealFee * 5n;
 		if (
 			msg.feeSatoshis > maxAcceptableFee ||
 			msg.feeSatoshis < minAcceptableFee
@@ -3796,13 +3807,19 @@ export class Channel {
 				}
 			];
 		}
-		// The fee comes out of the OPENER's output only; a fee its balance
-		// cannot cover is un-buildable.
-		const isOpener = this._state.role === ChannelRole.OPENER;
-		const openerBalanceSat = isOpener
-			? this._state.localBalanceMsat / 1000n
-			: this._state.remoteBalanceMsat / 1000n;
-		if (msg.feeSatoshis > openerBalanceSat) {
+		if (isOpener) {
+			// Reserve our dust limit so an accepted fee can neither drop our output
+			// nor consume it down to a dust remnant.
+			const dust = this._state.localConfig.dustLimitSatoshis;
+			if (openerBalanceSat < msg.feeSatoshis + dust) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Taproot closing fee ${msg.feeSatoshis} leaves our output below dust (balance ${openerBalanceSat}, dust ${dust})`
+					}
+				];
+			}
+		} else if (msg.feeSatoshis > openerBalanceSat) {
 			return [
 				{
 					type: ChannelActionType.ERROR,

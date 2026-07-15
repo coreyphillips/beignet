@@ -416,6 +416,97 @@ describe('Taproot cooperative close (MuSig2)', function () {
 		expect(bobChannel.getState()).to.not.equal(ChannelState.CLOSED);
 	});
 
+	// FS-5: when WE are the opener the closing fee is paid from OUR output. The
+	// responder branch must reserve our dust limit (as the legacy fee-range path
+	// does) so an adversarial non-opener cannot send closing_signed with a fee
+	// that drops our output, burning the balance to miners.
+	function driveOpenerIntoResponderBranch(): {
+		aliceChannel: Channel;
+		channelId: Buffer;
+		idealFee: bigint;
+		dust: bigint;
+	} {
+		const { aliceChannel, channelId } = readyTaprootChannel(41, 42);
+		// Alice (opener) receives the peer's shutdown and is driven into the
+		// responder branch without ever proposing a fee - the in-flight-HTLC case
+		// where the opener-proposes-first trigger never fired.
+		aliceChannel.handleShutdown(
+			{
+				channelId,
+				scriptPubkey: P2WPKH_A,
+				shutdownNonce: crypto.randomBytes(66)
+			},
+			P2WPKH_A
+		);
+		expect(aliceChannel.getState()).to.equal(ChannelState.NEGOTIATING_CLOSING);
+
+		const st = aliceChannel.getFullState();
+		const rate = BigInt(
+			Math.max(
+				st.localConfig.feeratePerKw || 253,
+				st.remoteConfig.feeratePerKw || 253,
+				253
+			)
+		);
+		const localLen = BigInt(st.localShutdownScript?.length ?? 22);
+		const remoteLen = BigInt(st.remoteShutdownScript?.length ?? 22);
+		const bandWeight =
+			206n + 4n * (9n + localLen) + 4n * (9n + remoteLen) + 66n;
+		const idealFee = (bandWeight * rate + 999n) / 1000n;
+		return {
+			aliceChannel,
+			channelId,
+			idealFee,
+			dust: st.localConfig.dustLimitSatoshis
+		};
+	}
+
+	it('responder-as-opener rejects an in-band fee that leaves our output below dust (FS-5)', function () {
+		const { aliceChannel, channelId, idealFee, dust } =
+			driveOpenerIntoResponderBranch();
+		// Our whole balance is one sat short of covering fee + dust, so a normal
+		// (mid-band) fee would push our output below the dust limit.
+		aliceChannel.getFullState().localBalanceMsat =
+			(idealFee + dust - 1n) * 1000n;
+
+		const actions = aliceChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: idealFee,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		const err = actions.find((a) => a.type === ChannelActionType.ERROR) as {
+			message: string;
+		};
+		expect(err, 'sub-dust-reserve fee is rejected').to.exist;
+		expect(err.message).to.match(/dust/i);
+		expect(aliceChannel.getState()).to.not.equal(ChannelState.CLOSED);
+	});
+
+	it('responder-as-opener accepts a fee that leaves exactly the dust reserve', function () {
+		const { aliceChannel, channelId, idealFee, dust } =
+			driveOpenerIntoResponderBranch();
+		aliceChannel.getFullState().localBalanceMsat = (idealFee + dust) * 1000n;
+
+		const actions = aliceChannel.handleClosingSigned(
+			{
+				channelId,
+				feeSatoshis: idealFee,
+				signature: Buffer.alloc(64),
+				partialSignature: crypto.randomBytes(32)
+			},
+			() => crypto.randomBytes(32)
+		);
+		expect(
+			actions.find((a) => a.type === ChannelActionType.ERROR),
+			'exactly-dust-reserve fee is accepted'
+		).to.not.exist;
+		expect(aliceChannel.getState()).to.equal(ChannelState.CLOSED);
+	});
+
 	it('ignores a same-connection duplicate shutdown after signing (no wedge)', function () {
 		// After we (opener) propose and sign with our closing nonce, a duplicate
 		// shutdown with a fresh peer nonce on the SAME connection must NOT reset
