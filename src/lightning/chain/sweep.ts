@@ -12,6 +12,8 @@ import { sign } from '../crypto/ecdh';
 import { OutputType } from './types';
 import type { ISpliceWalletInput } from '../channel/channel';
 import { P2WPKH_DUST_LIMIT } from '../channel/splice-weight';
+import { tweakTaprootKeyPathPrivkey } from '../script/commitment-taproot';
+import { signTaprootHtlcLeaf } from '../script/htlc-taproot';
 
 bitcoin.initEccLib(ecc);
 
@@ -625,7 +627,12 @@ export interface IAnchorCpfpParams {
 	anchorAmount: bigint;
 	/** The anchor witness script (`<funding_pubkey> OP_CHECKSIG OP_IFDUP ...`). */
 	anchorWitnessScript: Buffer;
-	/** Our funding private key — spends the anchor's owner path immediately. */
+	/**
+	 * The private key that owns the anchor and spends it immediately. For legacy
+	 * anchor channels this is the funding privkey (witness-v0 owner path); for a
+	 * taproot anchor (taprootAnchorMerkleRoot set) it is the local delayed
+	 * payment privkey for the broadcast commitment (BIP341 key-path).
+	 */
 	localFundingPrivkey: Buffer;
 	/** Virtual size of the parent (commitment) tx being bumped. */
 	parentVbytes: number;
@@ -637,6 +644,17 @@ export interface IAnchorCpfpParams {
 	changeScript: Buffer;
 	/** Target fee rate in sat/vByte the whole package must clear. */
 	feeratePerVbyte: number;
+	/**
+	 * Simple-taproot anchor: the P2TR anchor scriptPubKey. When set, the anchor
+	 * input is spent via a BIP341 key-path (Schnorr) spend rather than the legacy
+	 * witness-v0 owner path, and anchorWitnessScript is ignored.
+	 */
+	taprootAnchorScript?: Buffer;
+	/**
+	 * Simple-taproot anchor: merkle root of the anchor's single-leaf (16-CSV)
+	 * tree, used to tweak localFundingPrivkey (the delayed privkey) for the spend.
+	 */
+	taprootAnchorMerkleRoot?: Buffer;
 }
 
 /**
@@ -667,6 +685,7 @@ export function buildAnchorCpfpTx(params: IAnchorCpfpParams): {
 	if (walletInputs.length === 0) {
 		throw new Error('buildAnchorCpfpTx requires at least one wallet input');
 	}
+	const isTaproot = !!params.taprootAnchorMerkleRoot;
 	const totalIn =
 		anchorAmount + walletInputs.reduce((sum, w) => sum + w.value, 0n);
 
@@ -684,9 +703,13 @@ export function buildAnchorCpfpTx(params: IAnchorCpfpParams): {
 		return tx;
 	};
 
-	// Size the child with dummy witnesses to derive the package fee.
+	// Size the child with dummy witnesses to derive the package fee. A taproot
+	// key-path spend is a single 64-byte Schnorr signature (no witness script).
 	const sizing = build(totalIn);
-	sizing.setWitness(0, [Buffer.alloc(72), anchorWitnessScript]);
+	sizing.setWitness(
+		0,
+		isTaproot ? [Buffer.alloc(64)] : [Buffer.alloc(72), anchorWitnessScript]
+	);
 	walletInputs.forEach((_, i) =>
 		sizing.setWitness(1 + i, DUMMY_P2WPKH_WITNESS)
 	);
@@ -707,14 +730,43 @@ export function buildAnchorCpfpTx(params: IAnchorCpfpParams): {
 	}
 
 	const tx = build(change);
-	const anchorSig = signSweepInput(
-		tx,
-		0,
-		anchorWitnessScript,
-		Number(anchorAmount),
-		localFundingPrivkey
-	);
-	tx.setWitness(0, [anchorSig, anchorWitnessScript]);
+	if (isTaproot) {
+		// BIP341 key-path spend of the P2TR anchor. The taproot sighash commits to
+		// every input's prevout script and value, so gather them across the anchor
+		// and the P2WPKH wallet inputs.
+		const prevScripts: Buffer[] = [
+			params.taprootAnchorScript!,
+			...walletInputs.map(
+				(w) =>
+					bitcoin.Transaction.fromBuffer(w.prevTx).outs[w.prevOutputIndex]
+						.script
+			)
+		];
+		const prevValues: number[] = [
+			Number(anchorAmount),
+			...walletInputs.map((w) => Number(w.value))
+		];
+		const sighash = tx.hashForWitnessV1(
+			0,
+			prevScripts,
+			prevValues,
+			bitcoin.Transaction.SIGHASH_DEFAULT
+		);
+		const tweaked = tweakTaprootKeyPathPrivkey(
+			localFundingPrivkey,
+			params.taprootAnchorMerkleRoot!
+		);
+		tx.setWitness(0, [signTaprootHtlcLeaf(sighash, tweaked)]);
+	} else {
+		const anchorSig = signSweepInput(
+			tx,
+			0,
+			anchorWitnessScript,
+			Number(anchorAmount),
+			localFundingPrivkey
+		);
+		tx.setWitness(0, [anchorSig, anchorWitnessScript]);
+	}
 	walletInputs.forEach((w, i) => {
 		tx.setWitness(1 + i, w.signWitness(tx, 1 + i, w.value));
 	});
