@@ -345,6 +345,16 @@ describe('Channel Types and Validation', function () {
 			accept.fundingPubkey = Buffer.alloc(32);
 			expect(validateAcceptChannelParams(open, accept)).to.contain('33 bytes');
 		});
+
+		it('should reject a dust_limit above the maximum', function () {
+			const open = makeValidOpenMsg();
+			const accept = makeValidAcceptMsg(open);
+			// The FS-1 attack value: a dust limit near the whole balance.
+			accept.dustLimitSatoshis = 900_000n;
+			expect(validateAcceptChannelParams(open, accept)).to.contain(
+				'exceeds maximum'
+			);
+		});
 	});
 
 	describe('isValidShutdownScript (BOLT 2)', function () {
