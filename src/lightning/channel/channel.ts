@@ -2037,10 +2037,24 @@ export class Channel {
 			];
 		}
 
-		entry.state = HtlcState.FAILED;
+		// Dedup check: a reestablish replay of a fail we already processed is a
+		// no-op.
+		if (entry.state === HtlcState.FAILED) {
+			return [];
+		}
 
-		// Refund local balance
-		this._state.localBalanceMsat += entry.amountMsat;
+		// A malformed-HTLC removal follows the SAME two-phase settlement as a plain
+		// update_fail_htlc (mirror handleUpdateFailHtlc). Setting FAILED and
+		// crediting localBalanceMsat here while leaving the phase flags undefined
+		// made the revoke settlement loop credit the same HTLC a SECOND time (the
+		// loop only skips entries whose removalRemoteCommitted === false): a double
+		// credit that inflated our balance and desynced the commitment.
+		entry.state = HtlcState.FAILED;
+		entry.removalRemoteCommitted = false;
+		entry.removalLocallyRevoked = false;
+
+		// Note: balance is NOT refunded here. The refund to localBalanceMsat
+		// happens when the commitment exchange confirms via revoke_and_ack.
 
 		// Build a synthetic reason buffer with the failure code
 		const reason = Buffer.alloc(4);
