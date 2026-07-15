@@ -148,6 +148,16 @@ export interface IFeeBumpAndBroadcastChainAction {
 	parentFeeSats?: bigint;
 	/** anchor-cpfp only: commitment txid in display (big-endian) hex. */
 	commitmentTxid?: string;
+	/**
+	 * anchor-cpfp taproot only: the P2TR anchor scriptPubKey. Its presence marks
+	 * a taproot key-path anchor spend; the legacy path uses anchorWitnessScript.
+	 */
+	taprootAnchorScript?: Buffer;
+	/**
+	 * anchor-cpfp taproot only: merkle root of the anchor's single-leaf (16-CSV)
+	 * tree, used to tweak the local delayed privkey for the BIP341 key-path spend.
+	 */
+	taprootAnchorMerkleRoot?: Buffer;
 }
 
 export interface IWatchOutputChainAction {

@@ -84,6 +84,7 @@ import {
 	createTaprootFundingScript,
 	buildTaprootKeySpendWitness
 } from '../script/funding-taproot';
+import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { Channel, ITaprootClosingCache } from './channel';
 import {
@@ -106,7 +107,9 @@ import {
 } from './types';
 import {
 	IChannelBasepoints,
-	perCommitmentPointFromSecret
+	perCommitmentPointFromSecret,
+	derivePublicKey,
+	derivePrivateKey
 } from '../keys/derivation';
 import { getPublicKey } from '../crypto/ecdh';
 import { generateFromSeed } from '../keys/shachain';
@@ -4014,12 +4017,18 @@ export class ChannelManager extends EventEmitter {
 				anchorOutputIndex: action.anchorOutputIndex,
 				anchorAmount: ANCHOR_OUTPUT_VALUE,
 				anchorWitnessScript: action.anchorWitnessScript,
-				localFundingPrivkey: this._channelFundingPrivkey(channelId),
+				// Taproot anchors are key-path spent by the local delayed privkey;
+				// legacy anchors by the funding privkey.
+				localFundingPrivkey: action.taprootAnchorMerkleRoot
+					? this._channelTaprootAnchorPrivkey(channelId)
+					: this._channelFundingPrivkey(channelId),
 				parentVbytes: action.parentVbytes,
 				parentFeeSats: action.parentFeeSats,
 				walletInputs: inputs,
 				changeScript,
-				feeratePerVbyte
+				feeratePerVbyte,
+				taprootAnchorScript: action.taprootAnchorScript,
+				taprootAnchorMerkleRoot: action.taprootAnchorMerkleRoot
 			});
 			// The commitment (parent) is broadcast by the force-close path; emit only
 			// the fee-bearing child so the 1-parent-1-child package clears the target.
@@ -4085,9 +4094,18 @@ export class ChannelManager extends EventEmitter {
 		if (!fc) return;
 		try {
 			const commitmentTx = bitcoin.Transaction.fromBuffer(fc.tx);
-			const anchorScript = buildAnchorOutput(
-				state.localBasepoints.fundingPubkey
-			).script;
+			// Simple-taproot commitments carry a P2TR anchor keyed to the local
+			// to_local delayed pubkey; legacy anchor channels carry a witness-v0
+			// P2WSH anchor keyed to the funding pubkey. Matching the wrong script
+			// leaves findIndex at -1 and silently skips the CPFP, so a taproot
+			// force-close could never be fee-bumped and would ride at its stale
+			// open-time feerate through a spike.
+			const taprootAnchor = isTaprootChannel(state.channelType)
+				? this._localTaprootAnchor(state)
+				: null;
+			const anchorScript = taprootAnchor
+				? taprootAnchor.script
+				: buildAnchorOutput(state.localBasepoints.fundingPubkey).script;
 			const anchorOutputIndex = commitmentTx.outs.findIndex((o) =>
 				o.script.equals(anchorScript)
 			);
@@ -4105,12 +4123,18 @@ export class ChannelManager extends EventEmitter {
 				description: 'anchor commitment CPFP',
 				feeratePerVbyte: feeRatePerVbyte,
 				anchorOutputIndex,
-				anchorWitnessScript: buildAnchorScript(
-					state.localBasepoints.fundingPubkey
-				),
+				anchorWitnessScript: taprootAnchor
+					? Buffer.alloc(0)
+					: buildAnchorScript(state.localBasepoints.fundingPubkey),
 				parentVbytes: commitmentTx.virtualSize(),
 				parentFeeSats,
-				commitmentTxid: commitmentTx.getId()
+				commitmentTxid: commitmentTx.getId(),
+				...(taprootAnchor
+					? {
+							taprootAnchorScript: taprootAnchor.script,
+							taprootAnchorMerkleRoot: taprootAnchor.merkleRoot
+					  }
+					: {})
 			};
 			void this._handleFeeBumpAndBroadcast(channelId, cpfpAction);
 			// Retain it so a stuck commitment package can be re-CPFP'd at a higher
@@ -4253,6 +4277,64 @@ export class ChannelManager extends EventEmitter {
 			return this.config.channelKeyDeriver(keyIndex).fundingPrivkey;
 		}
 		return this.config.localFundingPrivkey;
+	}
+
+	/**
+	 * Per-commitment point of OUR current local commitment. The commitment
+	 * broadcast on force-close is at height localCommitmentNumber, so its
+	 * per-commitment secret index is MAX_INDEX - localCommitmentNumber.
+	 */
+	private _localCommitmentPoint(state: IChannelState): Buffer {
+		return perCommitmentPointFromSecret(
+			generateFromSeed(
+				state.localPerCommitmentSeed,
+				0xffffffffffffn - state.localCommitmentNumber
+			)
+		);
+	}
+
+	/**
+	 * Simple-taproot anchor script + tree merkle root for OUR local anchor on the
+	 * broadcast commitment. The taproot local anchor's internal key is the
+	 * to_local delayed pubkey (LND CommitScriptAnchors keySelector), NOT the
+	 * funding key legacy anchors use.
+	 */
+	private _localTaprootAnchor(state: IChannelState): {
+		script: Buffer;
+		merkleRoot: Buffer;
+	} {
+		const point = this._localCommitmentPoint(state);
+		const localDelayedPubkey = derivePublicKey(
+			state.localBasepoints.delayedPaymentBasepoint,
+			point
+		);
+		const anchor = buildTaprootAnchorOutput(localDelayedPubkey);
+		return { script: anchor.output, merkleRoot: anchor.merkleRoot };
+	}
+
+	/**
+	 * The private key that spends OUR taproot anchor: the to_local delayed payment
+	 * privkey for the broadcast commitment. Uses the same delayed-secret
+	 * resolution the chain monitor uses for the to_local sweep, so the derived key
+	 * matches the anchor's internal (delayed) pubkey.
+	 */
+	private _channelTaprootAnchorPrivkey(channelId: Buffer): Buffer {
+		const channel = this.channels.get(channelId.toString('hex'));
+		if (!channel) {
+			throw new Error('taproot anchor CPFP: channel not found');
+		}
+		const state = channel.getFullState();
+		const perCh = this.perChannelMonitorKeys(channel);
+		const delayedSecret =
+			perCh?.delayedPaymentBasepointSecret ||
+			this.config.delayedPaymentBasepointSecret ||
+			this.config.localFundingPrivkey;
+		const point = this._localCommitmentPoint(state);
+		return derivePrivateKey(
+			delayedSecret,
+			point,
+			state.localBasepoints.delayedPaymentBasepoint
+		);
 	}
 
 	private sendMessage(
