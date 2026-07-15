@@ -12,6 +12,8 @@ import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { ChannelManager } from '../channel/channel-manager';
 import { createFundingScript } from '../script/funding';
+import { createTaprootFundingScript } from '../script/funding-taproot';
+import { isTaprootChannel } from '../channel/types';
 
 bitcoin.initEccLib(ecc);
 
@@ -450,11 +452,19 @@ export class ChainWatcher extends EventEmitter {
 					return;
 				}
 
-				// Reconstruct the P2WSH funding script
-				const { p2wshOutput } = createFundingScript(
-					state.localBasepoints.fundingPubkey,
-					state.remoteBasepoints.fundingPubkey
-				);
+				// Reconstruct the funding scriptPubKey. Simple-taproot channels fund a
+				// P2TR MuSig2 key-spend output, so watching the witness-v0 P2WSH
+				// scripthash would never match and the funding spend would go
+				// undetected.
+				const fundingScript = isTaprootChannel(state.channelType)
+					? createTaprootFundingScript(
+							state.localBasepoints.fundingPubkey,
+							state.remoteBasepoints.fundingPubkey
+					  ).p2trOutput
+					: createFundingScript(
+							state.localBasepoints.fundingPubkey,
+							state.remoteBasepoints.fundingPubkey
+					  ).p2wshOutput;
 
 				const channelId = state.channelId || state.temporaryChannelId;
 				this.watchFundingOutput(
@@ -462,7 +472,7 @@ export class ChainWatcher extends EventEmitter {
 					displayTxid,
 					fundingOutputIndex,
 					minimumDepth,
-					p2wshOutput
+					fundingScript
 				).catch((err) => {
 					this.emit('error', err);
 				});
