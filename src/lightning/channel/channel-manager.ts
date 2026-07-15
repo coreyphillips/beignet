@@ -4007,10 +4007,28 @@ export class ChannelManager extends EventEmitter {
 			) {
 				throw new Error('anchor-cpfp action missing anchor metadata');
 			}
-			// The wallet covers the parent's fee deficit plus the child's own weight.
-			const targetFeeSats = BigInt(
-				Math.ceil(feeratePerVbyte * action.parentVbytes)
+			// Size the wallet-selection target to the CHILD-PACKAGE deficit, not the
+			// parent-only fee. buildAnchorCpfpTx pays
+			//   ceil(feerate * (parentVbytes + childVbytes)) - parentFeeSats,
+			// and selectFeeBumpInputs already adds the fee for the wallet inputs and
+			// change output it appends. So the target must cover the parent deficit
+			// PLUS the child's own non-wallet weight (base overhead + the anchor
+			// input), less the parent's already-paid fee, credited by the 330-sat
+			// anchor value the child spends. The previous target (parent-only fee,
+			// no child weight, no parentFeeSats credit) under-funded selection, so
+			// with small P2WPKH UTXOs buildAnchorCpfpTx could throw "insufficient
+			// funds" and no CPFP child was emitted while the commitment sat unbumped.
+			// The actual child fee is still computed exactly from the real child
+			// weight, so a generous overhead estimate only affects selection.
+			const estChildOverheadVbytes = action.taprootAnchorMerkleRoot ? 70 : 85;
+			const packageFeeSats = BigInt(
+				Math.ceil(
+					feeratePerVbyte * (action.parentVbytes + estChildOverheadVbytes)
+				)
 			);
+			const rawTarget =
+				packageFeeSats - action.parentFeeSats - ANCHOR_OUTPUT_VALUE;
+			const targetFeeSats = rawTarget > 0n ? rawTarget : 0n;
 			const { inputs, changeScript } = await fp.selectFeeBumpInputs(
 				targetFeeSats,
 				feeratePerKw
