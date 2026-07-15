@@ -11,7 +11,8 @@ import {
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
-	HtlcState
+	HtlcState,
+	HtlcDirection
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -344,19 +345,29 @@ describe('HTLC Safety & Forwarding Enforcement (Phase 3)', function () {
 			expect(findErrorAction(result)).to.include('BADONION');
 		});
 
-		it('should refund local balance on malformed HTLC failure', function () {
+		it('defers the refund on malformed HTLC failure (two-phase removal)', function () {
 			const { opener, htlcId } = setupChannelWithHtlc(500);
 			const balanceBefore = opener.getBalances().localMsat;
 
-			opener.handleUpdateFailMalformedHtlc({
+			const result = opener.handleUpdateFailMalformedHtlc({
 				channelId: opener.getChannelId()!,
 				id: htlcId,
 				sha256OfOnion: crypto.randomBytes(32),
 				failureCode: 0x8000 | 5
 			});
 
-			const balanceAfter = opener.getBalances().localMsat;
-			expect(Number(balanceAfter)).to.be.greaterThan(Number(balanceBefore));
+			// The refund MUST NOT be applied immediately. Crediting here (while the
+			// revoke settlement loop also credits once the removal commits) was the
+			// S-2.H1 double-credit. The balance moves only at revoke_and_ack.
+			expect(opener.getBalances().localMsat).to.equal(balanceBefore);
+			expect(
+				result.some((a) => a.type === ChannelActionType.HTLC_FAILED)
+			).to.equal(true);
+			const entry = [...opener.getFullState().htlcs.values()].find(
+				(h) => h.id === htlcId && h.direction === HtlcDirection.OFFERED
+			)!;
+			expect(entry.state).to.equal(HtlcState.FAILED);
+			expect(entry.removalRemoteCommitted).to.equal(false);
 		});
 
 		it('should error on unknown HTLC ID for malformed', function () {
