@@ -3924,7 +3924,10 @@ export class ChannelManager extends EventEmitter {
 						action.feeRatePerVbyte
 					);
 					if (rebuilt) {
-						this.emit('broadcast:tx', rebuilt);
+						// rebuildSweep returns a bitcoin.Transaction; every broadcast:tx
+						// listener expects a raw Buffer. Emitting the Transaction serialized
+						// to "[object Object]" and the RBF re-bump never reached the network.
+						this.emit('broadcast:tx', rebuilt.toBuffer());
 					}
 					break;
 				}
