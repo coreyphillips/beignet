@@ -3440,7 +3440,6 @@ export class ChannelManager extends EventEmitter {
 			const signature = signWillFund(
 				chKeys.basepoints.fundingPubkey,
 				msg.requestFunds.blockheight,
-				msg.channelType,
 				this.config.leaseRates,
 				this.config.nodePrivateKey
 			);
@@ -3471,10 +3470,7 @@ export class ChannelManager extends EventEmitter {
 				msg.willFund.leaseRates,
 				Buffer.from(peerPubkey, 'hex'),
 				msg.fundingPubkey,
-				requestFunds.blockheight,
-				// Verify over the channel_type WE proposed in open_channel2 (what the
-				// seller signed), not the accept's echo, which the v2 flow may omit.
-				session?.getOpenChannelType()
+				requestFunds.blockheight
 			);
 			if (!ok) {
 				this.emit('error', msg.channelId, 'Invalid will_fund signature');

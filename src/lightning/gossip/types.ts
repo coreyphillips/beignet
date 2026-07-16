@@ -64,33 +64,63 @@ export interface INodeAnnouncementMessage {
 /** node_ann_tlvs TLV type for the option_will_fund lease-rates record. */
 export const NODE_ANN_TLV_LEASE_RATES = 1n;
 
-/** Serialized length of the lease-rates record (2+2+4+4+2). */
-export const LEASE_RATES_LENGTH = 14;
+/**
+ * Fixed prefix length of the lease-rates record. The full record is this
+ * 10-byte prefix followed by channel_fee_max_base_msat as a tu32 (0-4 bytes),
+ * so the total is variable. CLN/spec field order:
+ *   funding_weight(u16) || lease_fee_basis(u16)
+ *   || channel_fee_max_proportional_thousandths(u16) || lease_fee_base_sat(u32)
+ *   || channel_fee_max_base_msat(tu32)
+ */
+export const LEASE_RATES_FIXED_LEN = 10;
 
-/** Encode lease rates into the 14-byte option_will_fund record. */
-export function encodeLeaseRates(rates: ILeaseRates): Buffer {
-	const buf = Buffer.alloc(LEASE_RATES_LENGTH);
-	buf.writeUInt16BE(rates.fundingWeightWitness, 0);
-	buf.writeUInt16BE(rates.leaseFeeBasis, 2);
-	buf.writeUInt32BE(rates.leaseFeeBaseSat, 4);
-	buf.writeUInt32BE(rates.channelFeeMaxBaseMsat, 8);
-	buf.writeUInt16BE(rates.channelFeeMaxProportionalThousandths, 12);
-	return buf;
+/** Minimal big-endian encoding of a u32 (tu32): no leading zero bytes. */
+function encodeTu32(val: number): Buffer {
+	if (val === 0) return Buffer.alloc(0);
+	const full = Buffer.alloc(4);
+	full.writeUInt32BE(val >>> 0);
+	let start = 0;
+	while (start < 3 && full[start] === 0) start++;
+	return full.subarray(start);
 }
 
-/** Decode the 14-byte option_will_fund lease-rates record. */
+/** Decode a tu32 (rejects a non-minimal leading zero byte or >4 bytes). */
+function decodeTu32(buf: Buffer): number {
+	if (buf.length === 0) return 0;
+	if (buf.length > 4) throw new Error('lease_rates tu32 exceeds 4 bytes');
+	if (buf[0] === 0) throw new Error('lease_rates tu32 is not minimal');
+	const padded = Buffer.alloc(4);
+	buf.copy(padded, 4 - buf.length);
+	return padded.readUInt32BE();
+}
+
+/** Encode lease rates into the option_will_fund record (spec/CLN byte order). */
+export function encodeLeaseRates(rates: ILeaseRates): Buffer {
+	const fixed = Buffer.alloc(LEASE_RATES_FIXED_LEN);
+	fixed.writeUInt16BE(rates.fundingWeightWitness, 0);
+	fixed.writeUInt16BE(rates.leaseFeeBasis, 2);
+	fixed.writeUInt16BE(rates.channelFeeMaxProportionalThousandths, 4);
+	fixed.writeUInt32BE(rates.leaseFeeBaseSat, 6);
+	return Buffer.concat([fixed, encodeTu32(rates.channelFeeMaxBaseMsat)]);
+}
+
+/**
+ * Decode an option_will_fund lease-rates record. `buf` must be exactly the
+ * lease_rates bytes (the TLV value, or the will_fund tail after the signature),
+ * since channel_fee_max_base_msat (tu32) consumes the remainder.
+ */
 export function decodeLeaseRates(buf: Buffer): ILeaseRates {
-	if (buf.length < LEASE_RATES_LENGTH) {
+	if (buf.length < LEASE_RATES_FIXED_LEN) {
 		throw new Error(
-			`lease_rates too short: need ${LEASE_RATES_LENGTH} bytes, got ${buf.length}`
+			`lease_rates too short: need >= ${LEASE_RATES_FIXED_LEN} bytes, got ${buf.length}`
 		);
 	}
 	return {
 		fundingWeightWitness: buf.readUInt16BE(0),
 		leaseFeeBasis: buf.readUInt16BE(2),
-		leaseFeeBaseSat: buf.readUInt32BE(4),
-		channelFeeMaxBaseMsat: buf.readUInt32BE(8),
-		channelFeeMaxProportionalThousandths: buf.readUInt16BE(12)
+		channelFeeMaxProportionalThousandths: buf.readUInt16BE(4),
+		leaseFeeBaseSat: buf.readUInt32BE(6),
+		channelFeeMaxBaseMsat: decodeTu32(buf.subarray(LEASE_RATES_FIXED_LEN))
 	};
 }
 

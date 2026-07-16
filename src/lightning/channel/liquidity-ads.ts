@@ -10,7 +10,7 @@
 
 import crypto from 'crypto';
 import { sign, verify } from '../crypto/ecdh';
-import { ILeaseRates, encodeLeaseRates } from '../gossip/types';
+import { ILeaseRates } from '../gossip/types';
 
 /** Lease duration in blocks (bLIP-0051): ~4 weeks. */
 export const LEASE_DURATION_BLOCKS = 4032;
@@ -45,39 +45,39 @@ export function computeLeaseExpiry(blockheight: number): number {
 // leaseExpiry param in script/commitment.ts). An earlier CSV-extension sketch was
 // removed in favour of this interoperable encoding.
 
+/** BOLT/CLN option_will_fund signature tag prefix (16 ASCII bytes). */
+const WILL_FUND_TAG = Buffer.from('option_will_fund');
+
 /**
- * The bytes a seller signs to commit to lease terms: its funding pubkey, the
- * buyer-supplied blockheight, the negotiated channel_type, and the lease rates.
- * Binding the funding pubkey + blockheight ties the signature to this specific
- * channel and lease window.
+ * The exact bytes a seller signs to commit to lease terms, matching CLN's
+ * lease_rates_get_commitment:
+ *   "option_will_fund" || funding_pubkey(33)
+ *   || lease_expiry(u32 BE) || channel_fee_max_base_msat(u32 BE)
+ *   || channel_fee_max_proportional_thousandths(u16 BE)
+ * where lease_expiry = blockheight + LEASE_DURATION_BLOCKS. Only the routing-fee
+ * caps are committed (not the whole rates record), and the negotiated
+ * channel_type is NOT part of the preimage.
  */
 export function leaseWitnessData(
 	sellerFundingPubkey: Buffer,
 	blockheight: number,
-	channelType: Buffer | undefined,
 	rates: ILeaseRates
 ): Buffer {
-	const bh = Buffer.alloc(4);
-	bh.writeUInt32BE(blockheight, 0);
-	return Buffer.concat([
-		sellerFundingPubkey,
-		bh,
-		channelType ?? Buffer.alloc(0),
-		encodeLeaseRates(rates)
-	]);
+	const tail = Buffer.alloc(10);
+	tail.writeUInt32BE(computeLeaseExpiry(blockheight), 0);
+	tail.writeUInt32BE(rates.channelFeeMaxBaseMsat, 4);
+	tail.writeUInt16BE(rates.channelFeeMaxProportionalThousandths, 8);
+	return Buffer.concat([WILL_FUND_TAG, sellerFundingPubkey, tail]);
 }
 
 function leaseSigHash(
 	sellerFundingPubkey: Buffer,
 	blockheight: number,
-	channelType: Buffer | undefined,
 	rates: ILeaseRates
 ): Buffer {
 	return crypto
 		.createHash('sha256')
-		.update(
-			leaseWitnessData(sellerFundingPubkey, blockheight, channelType, rates)
-		)
+		.update(leaseWitnessData(sellerFundingPubkey, blockheight, rates))
 		.digest();
 }
 
@@ -85,12 +85,11 @@ function leaseSigHash(
 export function signWillFund(
 	sellerFundingPubkey: Buffer,
 	blockheight: number,
-	channelType: Buffer | undefined,
 	rates: ILeaseRates,
 	sellerNodePrivkey: Buffer
 ): Buffer {
 	return sign(
-		leaseSigHash(sellerFundingPubkey, blockheight, channelType, rates),
+		leaseSigHash(sellerFundingPubkey, blockheight, rates),
 		sellerNodePrivkey
 	);
 }
@@ -105,12 +104,11 @@ export function verifyWillFund(
 	rates: ILeaseRates,
 	sellerNodeId: Buffer,
 	sellerFundingPubkey: Buffer,
-	blockheight: number,
-	channelType: Buffer | undefined
+	blockheight: number
 ): boolean {
 	try {
 		return verify(
-			leaseSigHash(sellerFundingPubkey, blockheight, channelType, rates),
+			leaseSigHash(sellerFundingPubkey, blockheight, rates),
 			sellerNodeId,
 			signature
 		);

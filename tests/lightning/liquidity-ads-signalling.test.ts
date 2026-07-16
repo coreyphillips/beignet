@@ -19,7 +19,9 @@ import {
 } from '../../src/lightning/gossip/validation';
 import {
 	INodeAnnouncementMessage,
-	ILeaseRates
+	ILeaseRates,
+	encodeLeaseRates,
+	decodeLeaseRates
 } from '../../src/lightning/gossip/types';
 import {
 	encodeOpenChannel2Message,
@@ -157,6 +159,17 @@ describe('Liquidity ads signalling (M3.1)', function () {
 		);
 		expect(decoded.willFund!.signature).to.deep.equal(sig);
 		expect(decoded.willFund!.leaseRates).to.deep.equal(RATES);
+	});
+
+	it('encodes lease_rates in CLN byte order with a tu32 base fee (S-L.H2)', function () {
+		// funding_weight(u16) || lease_fee_basis(u16)
+		//   || channel_fee_max_proportional_thousandths(u16) || lease_fee_base_sat(u32)
+		//   || channel_fee_max_base_msat(tu32). 5000 = 0x1388 -> 2-byte tu32.
+		const encoded = encodeLeaseRates(RATES);
+		expect(encoded.toString('hex')).to.equal(
+			'029a' + '0028' + '000a' + '000000fa' + '1388'
+		);
+		expect(decodeLeaseRates(encoded)).to.deep.equal(RATES);
 	});
 
 	it('advertises OPTION_WILL_FUND as an optional feature bit', function () {
