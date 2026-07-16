@@ -48,13 +48,16 @@ export enum OfferTlvType {
 // ── Invoice Request TLV Types ───────────────────────────────────────
 
 export enum InvoiceRequestTlvType {
+	// invreq_metadata: BOLT 12 type 0 (payer proof/nonce), sorts before the
+	// mirrored offer fields. Type 90 (payer_info) was an obsolete draft field.
+	METADATA = 0,
 	CHAIN = 80,
 	AMOUNT = 82,
 	FEATURES = 84,
 	QUANTITY = 86,
 	PAYER_KEY = 88,
 	PAYER_NOTE = 89,
-	PAYER_INFO = 90
+	SIGNATURE = 240
 }
 
 // ── Invoice TLV Types ───────────────────────────────────────────────
@@ -254,6 +257,15 @@ export function encodeInvoiceRequestTlv(
 ): Buffer {
 	const records: ITlvRecord[] = [];
 
+	// invreq_metadata (type 0): the payer's proof/nonce. BOLT 12 requires it and
+	// it is covered by the signature; it sorts before the mirrored offer fields.
+	if (request.metadata) {
+		records.push({
+			type: BigInt(InvoiceRequestTlvType.METADATA),
+			value: request.metadata
+		});
+	}
+
 	// Include offer TLV data at the beginning if provided (types 2-22)
 	if (offerTlvData) {
 		const { records: offerRecords } = decodeTlvStream(offerTlvData);
@@ -297,10 +309,12 @@ export function encodeInvoiceRequestTlv(
 			value: Buffer.from(request.payerNote, 'utf8')
 		});
 	}
-	if (request.payerInfo) {
+	// signature (type 240): serialized last so it is on the wire. It is excluded
+	// from the signed merkle tree, so emitting it does not change the hash.
+	if (request.signature) {
 		records.push({
-			type: BigInt(InvoiceRequestTlvType.PAYER_INFO),
-			value: request.payerInfo
+			type: BigInt(InvoiceRequestTlvType.SIGNATURE),
+			value: request.signature
 		});
 	}
 
@@ -341,18 +355,24 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 		records,
 		BigInt(InvoiceRequestTlvType.PAYER_NOTE)
 	);
-	const payerInfoVal = findTlvRecord(
+	const metadataVal = findTlvRecord(
 		records,
-		BigInt(InvoiceRequestTlvType.PAYER_INFO)
+		BigInt(InvoiceRequestTlvType.METADATA)
+	);
+	const signatureVal = findTlvRecord(
+		records,
+		BigInt(InvoiceRequestTlvType.SIGNATURE)
 	);
 
 	if (!payerKeyVal) {
 		throw new Error('Invoice request missing required payer_key field');
 	}
 
-	// Compute offerId from the offer TLV records mirrored into the request
-	// (types <= 22). Zero when the request carries no offer records.
-	const offerRecords = records.filter((r) => Number(r.type) <= 22);
+	// Compute offerId from the offer TLV records mirrored into the request. Offer
+	// TLVs occupy types 1-79; invreq_metadata (type 0) and the invreq fields
+	// (80+) are NOT part of the offer and must be excluded, or the offer_id would
+	// not match the one the issuer computed. Zero when no offer records mirrored.
+	const offerRecords = records.filter((r) => r.type >= 1n && r.type <= 79n);
 	const offerId =
 		offerRecords.length > 0 ? computeOfferId(offerRecords) : Buffer.alloc(32);
 
@@ -366,7 +386,8 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 	if (featuresVal) request.features = featuresVal;
 	if (qtyVal) request.quantity = decodeTruncatedU64(qtyVal);
 	if (payerNoteVal) request.payerNote = payerNoteVal.toString('utf8');
-	if (payerInfoVal) request.payerInfo = payerInfoVal;
+	if (metadataVal) request.metadata = metadataVal;
+	if (signatureVal) request.signature = signatureVal;
 
 	return { request, records };
 }

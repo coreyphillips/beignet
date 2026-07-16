@@ -56,8 +56,8 @@ export interface IInvoiceRequest {
 	quantity?: bigint;
 	/** Chain hash (32 bytes) */
 	chain?: Buffer;
-	/** Arbitrary payer info / metadata */
-	payerInfo?: Buffer;
+	/** invreq_metadata (BOLT 12 type 0): payer-generated proof/nonce, MUST be set. */
+	metadata?: Buffer;
 	/** Signature over the invoice request TLV stream (64 bytes Schnorr) */
 	signature?: Buffer;
 }

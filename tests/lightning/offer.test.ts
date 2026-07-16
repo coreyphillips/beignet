@@ -86,6 +86,29 @@ describe('BOLT 12: Offers', () => {
 		};
 	}
 
+	// Build a BOLT 12 invoice_request TLV signed by pubkey2/privkey2, with the
+	// required invreq_metadata. handleInvoiceRequest now rejects unsigned requests.
+	function makeSignedRequestTlv(
+		fields: Partial<IInvoiceRequest>,
+		offer?: IOffer
+	): Buffer {
+		const request: IInvoiceRequest = {
+			payerKey: pubkey2,
+			offerId: offer ? offer.offerId : Buffer.alloc(32),
+			metadata: crypto.randomBytes(16),
+			...fields
+		};
+		const offerTlv = offer ? encodeOfferTlv(offer) : undefined;
+		const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+		const merkleRoot = computeMerkleRootFromRecords(getTlvRecords(unsigned));
+		const sigHash = computeSignatureHash(
+			'lightninginvoice_requestsignature',
+			merkleRoot
+		);
+		request.signature = schnorrSign(sigHash, privkey2);
+		return encodeInvoiceRequestTlv(request, offerTlv);
+	}
+
 	// ── Truncated U64 ───────────────────────────────────────────────
 
 	describe('Truncated U64 encoding', () => {
@@ -237,14 +260,14 @@ describe('BOLT 12: Offers', () => {
 				quantity: 3n,
 				chain: crypto.randomBytes(32),
 				payerNote: 'for services',
-				payerInfo: Buffer.from('payer-info')
+				metadata: Buffer.from('payer-metadata')
 			};
 			const tlvData = encodeInvoiceRequestTlv(request);
 			const { request: decoded } = decodeInvoiceRequestTlv(tlvData);
 			expect(decoded.amount).to.equal(75_000n);
 			expect(decoded.quantity).to.equal(3n);
 			expect(decoded.payerNote).to.equal('for services');
-			expect(decoded.payerInfo!.toString()).to.equal('payer-info');
+			expect(decoded.metadata!.toString()).to.equal('payer-metadata');
 		});
 
 		it('should compute offerId from mirrored offer records on decode', () => {
@@ -862,14 +885,8 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			// Build an invoice request
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const offerTlv = encodeOfferTlv(offer);
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			// Build a signed invoice request
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.not.be.null;
@@ -884,15 +901,49 @@ describe('BOLT 12: Offers', () => {
 		it('should return null for unknown offer', () => {
 			const mgr = new OfferManager(privkey1);
 
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: crypto.randomBytes(32)
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request);
+			// A well-formed (signed) request for an offer the manager does not know.
+			const requestTlv = makeSignedRequestTlv({
+				offerId: crypto.randomBytes(32),
+				amount: 50_000n
+			});
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.be.null;
 
+			mgr.destroy();
+		});
+
+		it('rejects an invoice request with no signature (S-4.H2)', () => {
+			const mgr = new OfferManager(privkey1);
+			const { offer } = mgr.createOffer({
+				description: 'payable',
+				amount: 50_000n
+			});
+			// A request that carries metadata but no signature.
+			const request: IInvoiceRequest = {
+				payerKey: pubkey2,
+				offerId: offer.offerId,
+				amount: 50_000n,
+				metadata: crypto.randomBytes(16)
+			};
+			const requestTlv = encodeInvoiceRequestTlv(
+				request,
+				encodeOfferTlv(offer)
+			);
+			expect(mgr.handleInvoiceRequest(requestTlv)).to.be.null;
+			mgr.destroy();
+		});
+
+		it('rejects an invoice request with a forged signature (S-4.H2)', () => {
+			const mgr = new OfferManager(privkey1);
+			const { offer } = mgr.createOffer({
+				description: 'payable',
+				amount: 50_000n
+			});
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
+			// Flip a byte of the serialized signature (type 240, last field).
+			requestTlv[requestTlv.length - 1] ^= 0xff;
+			expect(mgr.handleInvoiceRequest(requestTlv)).to.be.null;
 			mgr.destroy();
 		});
 
@@ -908,15 +959,7 @@ describe('BOLT 12: Offers', () => {
 				issued = { invoice, preimage };
 			});
 
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const requestTlv = encodeInvoiceRequestTlv(
-				request,
-				encodeOfferTlv(offer)
-			);
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
 
 			// The issuer-side event carries the secret preimage (never on the wire).
@@ -951,12 +994,7 @@ describe('BOLT 12: Offers', () => {
 				absoluteExpiry: BigInt(Math.floor(Date.now() / 1000) - 3600) // 1 hour ago
 			});
 
-			const offerTlv = encodeOfferTlv(offer);
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({}, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.be.null;
@@ -971,13 +1009,7 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			const offerTlv = encodeOfferTlv(offer);
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.not.be.null;
@@ -995,13 +1027,7 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			const offerTlv = encodeOfferTlv(offer);
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
 			// Tamper with amount
@@ -1020,13 +1046,7 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			const offerTlv = encodeOfferTlv(offer);
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
 
 			const valid = mgr.validateInvoiceForOffer(invoice, offer);
@@ -1042,13 +1062,7 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			const offerTlv = encodeOfferTlv(offer);
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
 			invoice.description = 'tampered';
 
@@ -1087,11 +1101,9 @@ describe('BOLT 12: Offers', () => {
 				errorEmitted = true;
 			});
 
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
+			const requestTlv = makeSignedRequestTlv({
 				offerId: crypto.randomBytes(32)
-			};
-			const requestTlv = encodeInvoiceRequestTlv(request);
+			});
 			mgr.handleInvoiceRequest(requestTlv);
 
 			expect(errorEmitted).to.be.true;
@@ -1336,14 +1348,8 @@ describe('BOLT 12: Offers', () => {
 				amount: 50_000n
 			});
 
-			// Build invoice request from the payer's side
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 50_000n
-			};
-			const offerTlv = encodeOfferTlv(offer);
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			// Build a signed invoice request from the payer's side
+			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			// Issuer handles the request
 			const invoice = issuerMgr.handleInvoiceRequest(requestTlv);
@@ -1376,13 +1382,7 @@ describe('BOLT 12: Offers', () => {
 				// No amount — "any amount" offer
 			});
 
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId,
-				amount: 75_000n
-			};
-			const offerTlv = encodeOfferTlv(offer);
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({ amount: 75_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.not.be.null;
@@ -1395,13 +1395,7 @@ describe('BOLT 12: Offers', () => {
 			const mgr = new OfferManager(privkey1);
 			const { offer } = mgr.createOffer({ description: 'no amount' });
 
-			const request: IInvoiceRequest = {
-				payerKey: pubkey2,
-				offerId: offer.offerId
-				// No amount
-			};
-			const offerTlv = encodeOfferTlv(offer);
-			const requestTlv = encodeInvoiceRequestTlv(request, offerTlv);
+			const requestTlv = makeSignedRequestTlv({}, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv);
 			expect(invoice).to.be.null;
@@ -1432,9 +1426,10 @@ describe('BOLT 12: Offers', () => {
 			expect(InvoiceRequestTlvType.AMOUNT).to.equal(82);
 			expect(InvoiceRequestTlvType.FEATURES).to.equal(84);
 			expect(InvoiceRequestTlvType.QUANTITY).to.equal(86);
+			expect(InvoiceRequestTlvType.METADATA).to.equal(0);
 			expect(InvoiceRequestTlvType.PAYER_KEY).to.equal(88);
 			expect(InvoiceRequestTlvType.PAYER_NOTE).to.equal(89);
-			expect(InvoiceRequestTlvType.PAYER_INFO).to.equal(90);
+			expect(InvoiceRequestTlvType.SIGNATURE).to.equal(240);
 		});
 
 		it('should have correct invoice TLV types', () => {
