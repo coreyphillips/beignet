@@ -451,7 +451,10 @@ export class ChainMonitor {
 					actions.push({
 						type: ChainActionType.OUTPUT_RESOLVED,
 						txid: output.txid,
-						outputIndex: output.outputIndex
+						outputIndex: output.outputIndex,
+						channelId: this._channelState.channelId ?? undefined,
+						outputType: output.outputType,
+						paymentHash: output.paymentHash
 					});
 					continue;
 				}
