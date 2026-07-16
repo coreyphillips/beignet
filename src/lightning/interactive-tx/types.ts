@@ -31,6 +31,13 @@ export interface IInteractiveTxInput {
 	prevTx?: Buffer;
 	/** Previous tx output vout */
 	prevTxVout?: number;
+	/**
+	 * Splice shared input (the channel's current funding output), signalled
+	 * via the shared_input_txid TLV with an empty prevTx. Exempt from the
+	 * prevtx/segwit receive-side checks: its outpoint is validated against
+	 * the channel's own funding outpoint instead.
+	 */
+	isShared?: boolean;
 }
 
 export interface IInteractiveTxOutput {
@@ -55,4 +62,11 @@ export interface IInteractiveTxSession {
 	locktime: number;
 	/** Next serial ID counter */
 	nextSerialId: bigint;
+	/**
+	 * BOLT 2 DoS caps: total tx_add_input / tx_add_output messages RECEIVED
+	 * this session (adds and re-adds after removes all count; the spec fails
+	 * the negotiation at 4096 to bound add/remove churn).
+	 */
+	peerAddInputMsgs?: number;
+	peerAddOutputMsgs?: number;
 }

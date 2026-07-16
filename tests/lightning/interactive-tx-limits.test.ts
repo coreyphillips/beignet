@@ -82,20 +82,12 @@ describe('Interactive-tx receive-side limits (S-2.M4)', function () {
 	it('caps a peer at 252 inputs', function () {
 		const builder = new InteractiveTxBuilder(true);
 		for (let i = 0; i < MAX_INTERACTIVE_TX_INPUTS; i++) {
-			const err = builder.addPeerInput({
-				serialId: BigInt(2 * i + 1),
-				prevTxid: crypto.randomBytes(32),
-				prevOutputIndex: i,
-				sequence: 0xfffffffd
-			});
+			const err = builder.addPeerInput(peerInput(BigInt(2 * i + 1), 10_000n));
 			expect(err).to.equal(null);
 		}
-		const err = builder.addPeerInput({
-			serialId: BigInt(2 * MAX_INTERACTIVE_TX_INPUTS + 1),
-			prevTxid: crypto.randomBytes(32),
-			prevOutputIndex: 0,
-			sequence: 0xfffffffd
-		});
+		const err = builder.addPeerInput(
+			peerInput(BigInt(2 * MAX_INTERACTIVE_TX_INPUTS + 1), 10_000n)
+		);
 		expect(err).to.contain('exceeded 252 inputs');
 	});
 
