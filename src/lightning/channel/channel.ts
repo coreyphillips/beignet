@@ -3025,9 +3025,13 @@ export class Channel {
 	 */
 	handleUpdateFee(msg: IUpdateFeeMessage): ChannelAction[] {
 		// A fully-signed splice awaiting its lock resumes normal update traffic
-		// (CLN routinely sends update_fee in this window).
+		// (CLN routinely sends update_fee in this window). BOLT 2 also allows
+		// update_fee during shutdown while HTLCs remain (CLN sends it), exactly
+		// like the other update_* messages — rejecting it force-closed a channel
+		// that was shutting down cleanly.
 		if (
 			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
 			!this.isSplicePendingLock()
 		) {
 			return [
