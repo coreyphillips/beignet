@@ -97,15 +97,6 @@ function encodeU32(val: number): Buffer {
 	return buf;
 }
 
-function decodeU32(buf: Buffer): number {
-	if (buf.length < 4) {
-		const padded = Buffer.alloc(4);
-		buf.copy(padded, 4 - buf.length);
-		return padded.readUInt32BE();
-	}
-	return buf.readUInt32BE();
-}
-
 /**
  * Blinded path (de)serialization lives in onion/blinded-path.ts as the shared
  * source of truth (encodeBlindedPaths/decodeBlindedPaths), reused by both BOLT
@@ -420,7 +411,9 @@ export function encodeInvoiceTlv(invoice: IBolt12Invoice): Buffer {
 	if (invoice.relativeExpiry !== undefined) {
 		records.push({
 			type: BigInt(InvoiceTlvType.RELATIVE_EXPIRY),
-			value: encodeU32(invoice.relativeExpiry)
+			// BOLT 12: invoice_relative_expiry is tu32, not a fixed u32. A fixed
+			// encoding carries leading zero bytes that a spec reader MUST reject.
+			value: encodeTruncatedU32(invoice.relativeExpiry)
 		});
 	}
 	records.push({
@@ -507,7 +500,7 @@ export function decodeInvoiceTlv(data: Buffer): {
 	if (pathsVal) invoice.paths = decodeBlindedPathsValue(pathsVal);
 	if (blindedPayVal)
 		invoice.blindedPayInfo = decodeBlindedPayInfoArray(blindedPayVal);
-	if (relExpiryVal) invoice.relativeExpiry = decodeU32(relExpiryVal);
+	if (relExpiryVal) invoice.relativeExpiry = decodeTruncatedU32(relExpiryVal);
 	if (fallbacksVal) invoice.fallbacks = decodeFallbacks(fallbacksVal);
 	if (featuresVal) invoice.features = featuresVal;
 	if (sigVal) invoice.signature = sigVal;
@@ -641,6 +634,37 @@ export function decodeTruncatedU64(buf: Buffer): bigint {
 	const padded = Buffer.alloc(8);
 	buf.copy(padded, 8 - buf.length);
 	return padded.readBigUInt64BE();
+}
+
+/**
+ * Encode a number as a truncated big-endian u32 (tu32): no leading zero bytes,
+ * 0 encodes to an empty buffer. BOLT 12 uses tu32 for invoice_relative_expiry.
+ */
+export function encodeTruncatedU32(val: number): Buffer {
+	if (val === 0) return Buffer.alloc(0);
+	const full = encodeU32(val >>> 0);
+	let start = 0;
+	while (start < full.length - 1 && full[start] === 0) {
+		start++;
+	}
+	return Buffer.from(full.subarray(start));
+}
+
+/**
+ * Decode a truncated big-endian u32 (tu32). BOLT 12 readers MUST reject a
+ * non-minimal integer (a leading zero byte) or one longer than 4 bytes.
+ */
+export function decodeTruncatedU32(buf: Buffer): number {
+	if (buf.length === 0) return 0;
+	if (buf.length > 4) {
+		throw new Error('tu32 value exceeds 4 bytes');
+	}
+	if (buf[0] === 0) {
+		throw new Error('tu32 value is not minimally encoded');
+	}
+	const padded = Buffer.alloc(4);
+	buf.copy(padded, 4 - buf.length);
+	return padded.readUInt32BE();
 }
 
 /**

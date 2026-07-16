@@ -369,6 +369,50 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.relativeExpiry).to.equal(7200);
 		});
 
+		it('encodes invoice_relative_expiry as minimal tu32 (S-4.H3)', () => {
+			// 7200 = 0x1c20 must encode to 2 bytes (no leading zero), not 4.
+			const invoice: IBolt12Invoice = {
+				paymentHash: crypto.randomBytes(32),
+				amount: 100_000n,
+				description: 'tu32',
+				createdAt: BigInt(Math.floor(Date.now() / 1000)),
+				relativeExpiry: 7200,
+				nodeId: pubkey1
+			};
+			const records = getTlvRecords(encodeInvoiceTlv(invoice));
+			const rel = records.find(
+				(r) => Number(r.type) === InvoiceTlvType.RELATIVE_EXPIRY
+			)!;
+			expect(rel.value.equals(Buffer.from('1c20', 'hex'))).to.be.true;
+		});
+
+		it('rejects a non-minimal invoice_relative_expiry tu32 (S-4.H3)', () => {
+			// A spec peer MUST reject a leading-zero (non-minimal) tu32.
+			const records: ITlvRecord[] = [
+				{
+					type: BigInt(InvoiceTlvType.CREATED_AT),
+					value: encodeTruncatedU64(1n)
+				},
+				{
+					type: BigInt(InvoiceTlvType.RELATIVE_EXPIRY),
+					value: Buffer.from('00001c20', 'hex') // fixed-u32 form
+				},
+				{
+					type: BigInt(InvoiceTlvType.PAYMENT_HASH),
+					value: crypto.randomBytes(32)
+				},
+				{
+					type: BigInt(InvoiceTlvType.AMOUNT),
+					value: encodeTruncatedU64(1000n)
+				},
+				{ type: BigInt(InvoiceTlvType.NODE_ID), value: pubkey1 }
+			];
+			const { encodeTlvStream } = require('../../src/lightning/message/tlv');
+			expect(() => decodeInvoiceTlv(encodeTlvStream(records))).to.throw(
+				'minimal'
+			);
+		});
+
 		it('should encode and decode invoice with signature', () => {
 			const invoice: IBolt12Invoice = {
 				paymentHash: crypto.randomBytes(32),
