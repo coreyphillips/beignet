@@ -104,6 +104,7 @@ import {
 	FINAL_INCORRECT_HTLC_AMOUNT,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_BLINDING,
+	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT,
@@ -189,7 +190,8 @@ import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
-	OutputStatus
+	OutputStatus,
+	OutputType
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
 import { ElectrumBackend } from '../chain/electrum-backend';
@@ -1449,6 +1451,26 @@ export class LightningNode extends EventEmitter {
 			'preimage:learned',
 			(paymentHash: Buffer, preimage: Buffer) => {
 				this.handleOnChainPreimageLearned(paymentHash, preimage);
+			}
+		);
+
+		// The TIMEOUT counterpart of preimage:learned: an HTLC output we OFFERED
+		// downstream resolved irrevocably on-chain without revealing a preimage,
+		// so the outgoing leg of that forward is finally failed. Without a
+		// consumer the inbound HTLC was never failed off-chain and
+		// scanForwardTimeouts force-closed the healthy inbound channel instead
+		// of sending a clean update_fail_htlc.
+		this.channelManager.on(
+			'output:resolved',
+			(
+				_txid: string,
+				_outputIndex: number,
+				channelId?: Buffer,
+				outputType?: OutputType,
+				paymentHash?: Buffer
+			) => {
+				if (outputType === undefined) return;
+				this.handleOnChainOutputResolved(channelId, outputType, paymentHash);
 			}
 		);
 
@@ -7662,6 +7684,75 @@ export class LightningNode extends EventEmitter {
 		}
 
 		this.emit('preimage:learned', paymentHash, preimage);
+	}
+
+	/**
+	 * A tracked output resolved irrevocably on-chain. The case that needs
+	 * off-chain follow-up here is an OFFERED_HTLC (the outgoing leg of a
+	 * forward) resolved WITHOUT a preimage: the downstream never settled and
+	 * our HTLC-timeout (or the peer's own timeout claim) is now irrevocable,
+	 * which is exactly the BOLT 2 condition for refunding the upstream. Fail
+	 * the inbound HTLC off-chain so the healthy inbound channel resolves with
+	 * update_fail_htlc instead of the scanForwardTimeouts force-close.
+	 * Preimage resolutions are handled by handleOnChainPreimageLearned.
+	 */
+	private handleOnChainOutputResolved(
+		channelId: Buffer | undefined,
+		outputType: OutputType,
+		paymentHash?: Buffer
+	): void {
+		if (outputType !== OutputType.OFFERED_HTLC) return;
+		if (!channelId || !paymentHash) return;
+		// A known preimage means the downstream DID settle; the fulfill path
+		// (handleOnChainPreimageLearned / handleHtlcFulfilled) owns the inbound leg.
+		if (this.preimages.has(paymentHash.toString('hex'))) return;
+
+		const outChannelIdHex = channelId.toString('hex');
+		for (const [outKey, forward] of this.forwardedHtlcs) {
+			if (!outKey.startsWith(`${outChannelIdHex}:offered-`)) continue;
+			const inChannel = this.channelManager.getChannel(forward.inChannelId);
+			const inHtlc = inChannel
+				?.getFullState()
+				.htlcs.get(`received-${forward.inHtlcId}`);
+			if (!inHtlc || !inHtlc.paymentHash.equals(paymentHash)) continue;
+			if (
+				inHtlc.state !== HtlcState.PENDING &&
+				inHtlc.state !== HtlcState.COMMITTED
+			)
+				continue;
+
+			const inSecretKey = `${forward.inChannelId.toString('hex')}:${
+				forward.inHtlcId
+			}`;
+			// BOLT 4 route blinding: failures of a blinded forward must surface as
+			// invalid_onion_blinding (update_fail_malformed_htlc for a 'mid' hop).
+			const blindedRole = this.blindedIncomingHtlcs.get(inSecretKey);
+			if (blindedRole) {
+				this.failBlindedIncomingHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					blindedRole
+				);
+			} else {
+				const sharedSecret = this.receivedHtlcSharedSecrets.get(inSecretKey);
+				const reason = sharedSecret
+					? createFailureMessage(sharedSecret, PERMANENT_CHANNEL_FAILURE)
+					: Buffer.alloc(290);
+				this.cleanupHtlcSharedSecret(inSecretKey);
+				this.channelManager.failHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					reason
+				);
+			}
+			this.forwardedHtlcs.delete(outKey);
+			this.safeStorage(
+				() => this.storage!.deleteForwardedHtlc(outKey),
+				'deleteForwardedHtlc'
+			);
+			this.persistChannel(forward.inChannelId);
+			break;
+		}
 	}
 
 	private handleHtlcFulfilled(

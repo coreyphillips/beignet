@@ -3954,7 +3954,14 @@ export class ChannelManager extends EventEmitter {
 					this.emit('watch:tx', action.txid);
 					break;
 				case ChainActionType.OUTPUT_RESOLVED:
-					this.emit('output:resolved', action.txid, action.outputIndex);
+					this.emit(
+						'output:resolved',
+						action.txid,
+						action.outputIndex,
+						action.channelId,
+						action.outputType,
+						action.paymentHash
+					);
 					break;
 				case ChainActionType.CHANNEL_FULLY_RESOLVED:
 					this.emit('channel:resolved', action.channelId);

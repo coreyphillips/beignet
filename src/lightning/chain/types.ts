@@ -175,6 +175,15 @@ export interface IOutputResolvedChainAction {
 	type: ChainActionType.OUTPUT_RESOLVED;
 	txid: string;
 	outputIndex: number;
+	/**
+	 * Context for consumers acting on the resolution. An OFFERED_HTLC resolved
+	 * without a known preimage is a downstream timeout: the outgoing leg of a
+	 * forward is irrevocably failed, so the inbound HTLC can be failed off-chain
+	 * (BOLT 2 gates the upstream update_fail_htlc on exactly this).
+	 */
+	channelId?: Buffer;
+	outputType: OutputType;
+	paymentHash?: Buffer;
 }
 
 export interface IChannelFullyResolvedChainAction {
