@@ -277,7 +277,7 @@ describe('Onion Messages (Phase 8)', () => {
 
 		it('should reject truncated blinded path', () => {
 			expect(() => decodeBlindedPathTlv(Buffer.alloc(10))).to.throw(
-				'too short'
+				'truncated'
 			);
 		});
 	});

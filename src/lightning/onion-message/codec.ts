@@ -15,7 +15,11 @@ import {
 	TLV_REPLY_PATH,
 	TLV_MESSAGE_DATA_BASE
 } from './types';
-import { IBlindedPath, IBlindedHop } from '../onion/blinded-path';
+import {
+	IBlindedPath,
+	encodeBlindedPath,
+	decodeBlindedPath
+} from '../onion/blinded-path';
 import { encodeBigSize, decodeBigSize } from '../message/codec';
 
 /**
@@ -77,84 +81,25 @@ function encodeTlvRecord(type: number, value: Buffer): Buffer {
 }
 
 /**
- * Encode a blinded path for the reply_path TLV.
- * Format:
- *   [33: introduction_node_id]
- *   [33: blinding_point]
- *   [1: num_hops]
- *   For each hop:
- *     [33: blinded_node_id]
- *     [2: encrypted_data_len]
- *     [encrypted_data_len: encrypted_data]
+ * Encode a blinded path for the reply_path TLV (BOLT 4 `blinded_path`
+ * subtype). Delegates to the shared codec so the sciddir_or_pubkey
+ * first_node_id form is handled identically everywhere.
  */
 export function encodeBlindedPathTlv(path: IBlindedPath): Buffer {
-	const parts: Buffer[] = [];
-
-	// introduction_node_id (33 bytes)
-	parts.push(path.introductionNodeId);
-
-	// blinding_point (33 bytes)
-	parts.push(path.blindingPoint);
-
-	// num_hops (1 byte)
-	const numHops = Buffer.alloc(1);
-	numHops[0] = path.blindedHops.length;
-	parts.push(numHops);
-
-	// Each hop: blinded_node_id (33) + encrypted_data_len (2) + encrypted_data
-	for (const hop of path.blindedHops) {
-		parts.push(hop.blindedNodeId);
-		const lenBuf = Buffer.alloc(2);
-		lenBuf.writeUInt16BE(hop.encryptedData.length, 0);
-		parts.push(lenBuf);
-		parts.push(hop.encryptedData);
-	}
-
-	return Buffer.concat(parts);
+	return encodeBlindedPath(path);
 }
 
 /**
- * Decode a blinded path from a reply_path TLV value.
+ * Decode a blinded path from a reply_path TLV value. Byte-identical to the
+ * shared BOLT 4 codec; the previous local copy assumed a 33-byte
+ * first_node_id and mis-parsed the scid-dir form (S-4.H4).
  */
 export function decodeBlindedPathTlv(buf: Buffer): IBlindedPath {
-	let offset = 0;
-
-	if (buf.length < 67) {
-		// 33 + 33 + 1
-		throw new Error('reply_path TLV too short');
+	const { path, offset } = decodeBlindedPath(buf, 0);
+	if (offset !== buf.length) {
+		throw new Error('reply_path TLV has trailing bytes');
 	}
-
-	const introductionNodeId = Buffer.from(buf.subarray(offset, offset + 33));
-	offset += 33;
-
-	const blindingPoint = Buffer.from(buf.subarray(offset, offset + 33));
-	offset += 33;
-
-	const numHops = buf[offset++];
-	const blindedHops: IBlindedHop[] = [];
-
-	for (let i = 0; i < numHops; i++) {
-		if (offset + 33 + 2 > buf.length) {
-			throw new Error('reply_path TLV truncated at hop');
-		}
-		const blindedNodeId = Buffer.from(buf.subarray(offset, offset + 33));
-		offset += 33;
-
-		const encDataLen = buf.readUInt16BE(offset);
-		offset += 2;
-
-		if (offset + encDataLen > buf.length) {
-			throw new Error('reply_path TLV truncated at hop encrypted data');
-		}
-		const encryptedData = Buffer.from(
-			buf.subarray(offset, offset + encDataLen)
-		);
-		offset += encDataLen;
-
-		blindedHops.push({ blindedNodeId, encryptedData });
-	}
-
-	return { introductionNodeId, blindingPoint, blindedHops };
+	return path;
 }
 
 /**
