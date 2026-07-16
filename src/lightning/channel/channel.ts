@@ -29,6 +29,7 @@ import {
 	IUpdateFulfillHtlcMessage,
 	encodeUpdateFailHtlcMessage,
 	IUpdateFailHtlcMessage,
+	encodeUpdateFailMalformedHtlcMessage,
 	IUpdateFailMalformedHtlcMessage,
 	encodeUpdateFeeMessage,
 	IUpdateFeeMessage
@@ -1947,6 +1948,69 @@ export class Channel {
 		this._queuePendingLocalUpdate(MessageType.UPDATE_FAIL_HTLC, payload);
 
 		return [sendMsg(MessageType.UPDATE_FAIL_HTLC, payload)];
+	}
+
+	/**
+	 * Fail a received HTLC with update_fail_malformed_htlc (BOLT 2). Used when
+	 * the onion itself is unparseable, and by BOLT 4 route blinding: a blinded
+	 * hop that got its blinding point in update_add_htlc MUST fail with
+	 * invalid_onion_blinding via this message. Same state machine as failHtlc;
+	 * the failure_code MUST have BADONION set.
+	 */
+	failMalformedHtlc(
+		htlcId: bigint,
+		sha256OfOnion: Buffer,
+		failureCode: number
+	): ChannelAction[] {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Cannot fail HTLC: wrong state'
+				}
+			];
+		}
+
+		if ((failureCode & 0x8000) === 0) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_fail_malformed_htlc failure_code ${failureCode} lacks BADONION`
+				}
+			];
+		}
+
+		const key = `received-${htlcId}`;
+		const entry = this._state.htlcs.get(key);
+		if (!entry) {
+			return [
+				{ type: ChannelActionType.ERROR, message: `HTLC ${htlcId} not found` }
+			];
+		}
+
+		entry.state = HtlcState.FAILED;
+		// Two-phase removal, exactly as failHtlc.
+		entry.removalRemoteCommitted = false;
+		this._state.needsCommitment = true;
+
+		const msg: IUpdateFailMalformedHtlcMessage = {
+			channelId: this._state.channelId!,
+			id: htlcId,
+			sha256OfOnion,
+			failureCode
+		};
+
+		const payload = encodeUpdateFailMalformedHtlcMessage(msg);
+		// BOLT 2 reestablish: queue for retransmission until acked.
+		this._queuePendingLocalUpdate(
+			MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+			payload
+		);
+
+		return [sendMsg(MessageType.UPDATE_FAIL_MALFORMED_HTLC, payload)];
 	}
 
 	/**
