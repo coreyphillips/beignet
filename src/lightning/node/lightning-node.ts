@@ -451,8 +451,11 @@ export class LightningNode extends EventEmitter {
 	/** Server side: latest blob held per peer (mirrors storage when available). */
 	private peerStorageBlobs: Map<string, { blob: Buffer; receivedAt: number }> =
 		new Map();
-	/** Server side: last accepted peer_storage timestamp per peer (rate limit). */
+	/** Server side: last PERSISTED peer_storage timestamp per peer (rate limit). */
 	private peerStorageLastAccepted: Map<string, number> = new Map();
+	/** Server side: deferred disk-flush timer per peer (coalesced newest blob). */
+	private peerStorageFlushTimers: Map<string, ReturnType<typeof setTimeout>> =
+		new Map();
 	/** Client side: our own blob, pushed to capable peers on change/connect. */
 	private ourPeerStorageBlob: Buffer | null = null;
 	/** Client side: newest blob each peer returned via peer_storage_retrieval. */
@@ -1620,21 +1623,42 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
-		// Rate limit: one accepted blob per peer per interval, so a misbehaving
-		// peer cannot turn every update into a disk write.
+		// Always keep the FRESHEST blob in memory: this is a backup of the peer's
+		// latest channel state, so dropping the newest one (as a naive rate limit
+		// does) loses exactly the backup that matters when state just changed.
 		const now = Date.now();
+		this.peerStorageBlobs.set(pubkey, { blob, receivedAt: now });
+
+		// Rate-limit only the DISK write (a misbehaving peer must not turn every
+		// update into a disk write). Within the interval, coalesce: schedule a
+		// single deferred flush that persists whatever the freshest blob is when
+		// it fires, so the latest backup still reaches disk.
 		const last = this.peerStorageLastAccepted.get(pubkey);
 		if (
 			last !== undefined &&
 			now - last < LightningNode.PEER_STORAGE_MIN_INTERVAL_MS
 		) {
+			if (!this.peerStorageFlushTimers.has(pubkey)) {
+				const delay = LightningNode.PEER_STORAGE_MIN_INTERVAL_MS - (now - last);
+				const timer = setTimeout(() => {
+					this.peerStorageFlushTimers.delete(pubkey);
+					const freshest = this.peerStorageBlobs.get(pubkey);
+					if (freshest) this.persistPeerStorageBlob(pubkey, freshest.blob);
+				}, delay);
+				if (typeof timer.unref === 'function') timer.unref();
+				this.peerStorageFlushTimers.set(pubkey, timer);
+			}
 			return;
 		}
-		this.peerStorageLastAccepted.set(pubkey, now);
-		this.peerStorageBlobs.set(pubkey, { blob, receivedAt: now });
+		this.persistPeerStorageBlob(pubkey, blob);
+	}
+
+	/** Persist a peer-storage blob and mark the rate-limit window. */
+	private persistPeerStorageBlob(pubkey: string, blob: Buffer): void {
+		this.peerStorageLastAccepted.set(pubkey, Date.now());
 		if (this.storage?.savePeerStorageBlob) {
 			this.safeStorage(
-				() => this.storage!.savePeerStorageBlob!(pubkey, blob, now),
+				() => this.storage!.savePeerStorageBlob!(pubkey, blob, Date.now()),
 				'savePeerStorageBlob'
 			);
 		}
@@ -3181,6 +3205,11 @@ export class LightningNode extends EventEmitter {
 			clearTimeout(t);
 		}
 		this._reconnectTimers.clear();
+		// Clear deferred peer-storage flush timers
+		for (const t of this.peerStorageFlushTimers.values()) {
+			clearTimeout(t);
+		}
+		this.peerStorageFlushTimers.clear();
 		// Reject all active wait promises
 		for (const cleanup of this._activeWaitCleanups) {
 			cleanup();
@@ -4881,13 +4910,36 @@ export class LightningNode extends EventEmitter {
 				msg.feeProportionalMillionths = policy.feeProportionalMillionths;
 				msg.htlcMinimumMsat = policy.htlcMinimumMsat;
 				// BOLT 7: htlc_maximum_msat MUST NOT exceed the channel capacity.
-				const capacityMsat =
-					this.channelManager.getChannel(channelId)!.getFullState()
-						.fundingSatoshis * 1000n;
+				const st = this.channelManager.getChannel(channelId)!.getFullState();
+				const capacityMsat = st.fundingSatoshis * 1000n;
 				msg.htlcMaximumMsat =
 					policy.htlcMaximumMsat > capacityMsat
 						? capacityMsat
 						: policy.htlcMaximumMsat;
+				// Liquidity ads (bLIP-0051): while WE are the lessor and the lease is
+				// still active, clamp our advertised routing fees to the caps we
+				// signed into will_fund. The buyer paid for capped fees; exceeding
+				// them breaks the lease promise.
+				if (
+					st.isLessor &&
+					st.leaseExpiry !== undefined &&
+					(this.currentBlockHeight === 0 ||
+						this.currentBlockHeight < st.leaseExpiry)
+				) {
+					if (
+						st.leaseChannelFeeMaxBaseMsat !== undefined &&
+						msg.feeBaseMsat > st.leaseChannelFeeMaxBaseMsat
+					) {
+						msg.feeBaseMsat = st.leaseChannelFeeMaxBaseMsat;
+					}
+					if (st.leaseChannelFeeMaxProportionalThousandths !== undefined) {
+						const capMillionths =
+							st.leaseChannelFeeMaxProportionalThousandths * 1000;
+						if (msg.feeProportionalMillionths > capMillionths) {
+							msg.feeProportionalMillionths = capMillionths;
+						}
+					}
+				}
 			}
 			const payload = encodeChannelUpdateMessage(msg);
 			const sig = signChannelUpdate(payload, this.nodePrivkey);

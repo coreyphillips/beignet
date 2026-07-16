@@ -253,8 +253,20 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			node.destroy();
 		});
 
-		it('rate-limits to one accepted blob per peer per 60s', function () {
+		it('keeps the freshest in-memory blob but rate-limits disk writes (S-L/S-W MEDIUM)', function () {
+			// Count disk writes to verify the rate limit applies to persistence,
+			// while the in-memory backup always tracks the freshest blob (the old
+			// behavior dropped the newest blob within the window — losing exactly
+			// the backup that matters when state just changed).
 			const node = makeNode();
+			let writes = 0;
+			(node as any).persistPeerStorageBlob = function (
+				pubkey: string,
+				_blob: Buffer
+			): void {
+				writes++;
+				this.peerStorageLastAccepted.set(pubkey, Date.now());
+			};
 			node.addTrustedPeer(PEER_PK);
 			const first = Buffer.from('first blob');
 			const second = Buffer.from('second blob');
@@ -268,19 +280,27 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 				PEER_PK,
 				encodePeerStorageMessage({ blob: second })
 			);
-			expect(
-				(node as any).peerStorageBlobs.get(PEER_PK).blob.equals(first)
-			).to.equal(true);
-			// After the window the newer blob replaces the old (one blob per peer)
-			(node as any).peerStorageLastAccepted.set(PEER_PK, Date.now() - 61_000);
-			deliverPeerStorage(
-				node,
-				PEER_PK,
-				encodePeerStorageMessage({ blob: second })
-			);
+			// Freshest blob is kept in memory even within the rate-limit window.
 			expect(
 				(node as any).peerStorageBlobs.get(PEER_PK).blob.equals(second)
 			).to.equal(true);
+			// But only the first triggered an immediate disk write; the second is
+			// coalesced into a single deferred flush.
+			expect(writes).to.equal(1);
+			expect((node as any).peerStorageFlushTimers.has(PEER_PK)).to.equal(true);
+
+			// After the window a fresh blob writes through immediately again.
+			(node as any).peerStorageLastAccepted.set(PEER_PK, Date.now() - 61_000);
+			const third = Buffer.from('third blob');
+			deliverPeerStorage(
+				node,
+				PEER_PK,
+				encodePeerStorageMessage({ blob: third })
+			);
+			expect(
+				(node as any).peerStorageBlobs.get(PEER_PK).blob.equals(third)
+			).to.equal(true);
+			expect(writes).to.equal(2);
 			node.destroy();
 		});
 

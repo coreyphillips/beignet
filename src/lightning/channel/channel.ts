@@ -196,6 +196,17 @@ function sendMsg(
  * capped at BOLT 2 max of funding / 5 (20%).
  */
 const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as minimum reserve
+
+/**
+ * Liquidity ads: how far a buyer-supplied lease blockheight may sit from our
+ * current tip before we reject it (S-L/S-W MEDIUM). The buyer sets it to its
+ * own tip; a small past tolerance absorbs propagation skew, and the future
+ * tolerance (a day of blocks) bounds how long the resulting CLTV can freeze
+ * our to_local without being so tight it rejects an honest peer a few blocks
+ * ahead.
+ */
+const LEASE_BLOCKHEIGHT_PAST_TOLERANCE = 6;
+const LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE = 144;
 function computeChannelReserve(
 	fundingSatoshis: bigint,
 	dustLimitSatoshis: bigint
@@ -7602,10 +7613,38 @@ export class Channel {
 		// buyer pays us the lease fee out of its initial balance — shift it from
 		// the buyer (remote) to us (local). Reject if the buyer can't cover it.
 		if (localParams.willFund && msg.requestFunds) {
+			// Validate the buyer-supplied blockheight before it becomes our own
+			// to_local CLTV lock: a bogus far-future or >= 500,000,000 value
+			// (the CLTV height/timestamp boundary) would freeze OUR funds for
+			// years. Require it within a sane window of our current tip.
+			const bh = msg.requestFunds.blockheight;
+			if (
+				!Number.isInteger(bh) ||
+				bh <= 0 ||
+				bh >= 500_000_000 ||
+				(this._currentBlockHeight > 0 &&
+					(bh < this._currentBlockHeight - LEASE_BLOCKHEIGHT_PAST_TOLERANCE ||
+						bh > this._currentBlockHeight + LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE))
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `Buyer lease blockheight ${bh} is out of the acceptable range`
+					}
+				];
+			}
+			// Charge the proportional fee on what the lease actually funds:
+			// min(our funding_satoshis, requested_sats). If we (the seller) fund
+			// less than requested, billing the full request desyncs balances vs a
+			// compliant peer that computes the fee on the amount truly provided.
+			const leasedSats =
+				localParams.fundingSatoshis < msg.requestFunds.requestedSats
+					? localParams.fundingSatoshis
+					: msg.requestFunds.requestedSats;
 			const feeMsat =
 				computeLeaseFeeSat(
 					localParams.willFund.leaseRates,
-					msg.requestFunds.requestedSats,
+					leasedSats,
 					msg.fundingFeeratePerkw
 				) * 1000n;
 			if (feeMsat > this._state.remoteBalanceMsat) {
@@ -7623,6 +7662,13 @@ export class Channel {
 				msg.requestFunds.blockheight
 			);
 			this._state.isLessor = true;
+			// Remember the routing-fee caps we signed: while the lease is active we
+			// MUST NOT advertise a channel_update exceeding them (the buyer paid
+			// for capped fees).
+			this._state.leaseChannelFeeMaxBaseMsat =
+				localParams.willFund.leaseRates.channelFeeMaxBaseMsat;
+			this._state.leaseChannelFeeMaxProportionalThousandths =
+				localParams.willFund.leaseRates.channelFeeMaxProportionalThousandths;
 		}
 
 		return [
@@ -7735,9 +7781,19 @@ export class Channel {
 			}
 			const fundingFeeratePerkw =
 				session.getLocalParams()?.fundingFeeratePerkw ?? 0;
+			// Proportional fee is charged on min(seller funding, requested): a
+			// seller that funds less than we requested is paid only for what it
+			// actually provided (S-L/S-W MEDIUM). The verified min-funding check
+			// above already guarantees fundingSatoshis >= requestedSats, so this
+			// resolves to requestedSats in the honest path and simply refuses to
+			// overpay if that ever changes.
+			const leasedSats =
+				msg.fundingSatoshis < requestFunds.requestedSats
+					? msg.fundingSatoshis
+					: requestFunds.requestedSats;
 			const leaseFeeSat = computeLeaseFeeSat(
 				msg.willFund.leaseRates,
-				requestFunds.requestedSats,
+				leasedSats,
 				fundingFeeratePerkw
 			);
 			// H3 fund-safety: the seller's will_fund rates are self-signed and otherwise
@@ -7760,7 +7816,7 @@ export class Channel {
 			}
 			const maxLeaseFeeSat = computeLeaseFeeSat(
 				maxLeaseRates,
-				requestFunds.requestedSats,
+				leasedSats,
 				fundingFeeratePerkw
 			);
 			if (leaseFeeSat > maxLeaseFeeSat) {
