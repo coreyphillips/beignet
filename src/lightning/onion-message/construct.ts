@@ -266,11 +266,15 @@ export function constructReplyOnionMessage(
 	}
 
 	// Build hop payloads for the blinded path
-	// The introduction node gets the first blinded hop's encrypted data
+	// The introduction node gets the first blinded hop's encrypted data. In a
+	// 1-hop reply path the introduction node IS the recipient, so it must also
+	// receive the message body; hard-coding an empty TLV map here made every
+	// reply over a 1-hop path arrive empty.
 	path.push(replyPath.introductionNodeId);
+	const introIsRecipient = replyPath.blindedHops.length === 1;
 	const introPayload: IOnionMessagePayload = {
 		encryptedRecipientData: replyPath.blindedHops[0].encryptedData,
-		messageTlvs: new Map()
+		messageTlvs: introIsRecipient ? messageData : new Map()
 	};
 	payloads.push(encodeOnionMessagePayload(introPayload));
 
