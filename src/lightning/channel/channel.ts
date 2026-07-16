@@ -2615,12 +2615,11 @@ export class Channel {
 					const cid = (
 						this._state.channelId || this._state.temporaryChannelId
 					).toString('hex');
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: `Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
-						}
-					];
+					// BOLT 2: MUST fail the channel — send the wire error so the
+					// peer force-closes; continuing would wedge on desynced state.
+					return this._failChannelWithWireError(
+						`Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
+					);
 				}
 			}
 
@@ -2637,9 +2636,8 @@ export class Channel {
 					msg.htlcSignatures
 				);
 				if (!htlcSigsValid) {
-					return [
-						{ type: ChannelActionType.ERROR, message: 'Invalid HTLC signature' }
-					];
+					// BOLT 2: MUST fail the channel (see above).
+					return this._failChannelWithWireError('Invalid HTLC signature');
 				}
 			}
 
@@ -2798,13 +2796,11 @@ export class Channel {
 				msg.perCommitmentSecret
 			);
 			if (!revealedPoint.equals(this._state.remoteCurrentPerCommitmentPoint)) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'revoke_and_ack secret does not match committed per-commitment point'
-					}
-				];
+				// BOLT 2: MUST fail the channel — a fake revocation means the peer
+				// can still cheat with the "revoked" commitment.
+				return this._failChannelWithWireError(
+					'revoke_and_ack secret does not match committed per-commitment point'
+				);
 			}
 		}
 
@@ -2831,12 +2827,10 @@ export class Channel {
 			msg.perCommitmentSecret
 		);
 		if (!stored) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid per-commitment secret'
-				}
-			];
+			// BOLT 2: an unverifiable revocation secret means the peer can cheat
+			// with the "revoked" commitment — MUST fail the channel with a wire
+			// error, never keep exchanging updates on top of it.
+			return this._failChannelWithWireError('Invalid per-commitment secret');
 		}
 
 		// The oldest outstanding commitment is now revoked.
@@ -4674,6 +4668,33 @@ export class Channel {
 	}
 
 	/**
+	 * BOLT 1 "fail the channel" for a peer protocol violation: send a wire
+	 * error scoped to this channel (a conformant peer force-closes and stops
+	 * using it), mark the channel ERRORED so no further updates are exchanged
+	 * over provably-desynced state, persist FIRST, and surface the app-level
+	 * error. Generalizes the DLP fell-behind pattern in handleReestablish.
+	 *
+	 * ONLY for violations by the PEER (invalid signatures, bad revocation
+	 * secrets, ...): a wire error kills the channel at the peer, so local API
+	 * misuse must keep returning plain ERROR actions.
+	 */
+	private _failChannelWithWireError(message: string): ChannelAction[] {
+		this._state.state = ChannelState.ERRORED;
+		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId,
+					data: Buffer.from(message, 'ascii')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
+	}
+
+	/**
 	 * Create a channel_reestablish message for reconnection.
 	 */
 	createReestablish(): ChannelAction[] {
@@ -5061,12 +5082,11 @@ export class Channel {
 				!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
 				!msg.yourLastPerCommitmentSecret.equals(expectedSecret)
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid per-commitment secret in channel_reestablish'
-					}
-				];
+				// BOLT 2: MUST fail the channel — the peer is lying about (or has
+				// corrupted) our revocation chain. Wire error like the DLP path.
+				return this._failChannelWithWireError(
+					'Invalid per-commitment secret in channel_reestablish'
+				);
 			}
 		}
 
