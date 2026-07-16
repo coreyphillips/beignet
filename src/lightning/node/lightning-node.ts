@@ -298,6 +298,18 @@ const FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE = 10;
  */
 const FORCE_CLOSE_FEE_MULTIPLIER = 1.5;
 
+/**
+ * Invoice feature bits this payer implements (BOLT 11 `9` field). An unknown
+ * even (compulsory) bit outside this set MUST fail the payment. Listed by the
+ * even bit; the odd variant is unknown-odd and always safe to ignore.
+ */
+const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
+	Feature.TLV_ONION,
+	Feature.PAYMENT_SECRET,
+	Feature.BASIC_MPP,
+	Feature.ROUTE_BLINDING
+]);
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -5685,6 +5697,7 @@ export class LightningNode extends EventEmitter {
 				'Cannot determine payee from invoice'
 			);
 		}
+
 		let paymentAmountMsat = invoice.amountMsat;
 		if (paymentAmountMsat === undefined) {
 			if (amountMsat === undefined) {
@@ -5711,6 +5724,27 @@ export class LightningNode extends EventEmitter {
 			this.payments.set(invoice.paymentHash.toString('hex'), payment);
 			this.emit('payment:failed', payment);
 			return payment;
+		}
+
+		// BOLT 11 payer MUSTs: fail the payment when the invoice requires a
+		// feature we do not understand (unknown even bit in the `9` field), and
+		// never pay a secretless invoice (payment_secret is compulsory; without
+		// it any forwarding node can probe or steal an amount-adjusted payment).
+		if (invoice.featureBits) {
+			for (const bit of invoice.featureBits.listSetBits()) {
+				if (bit % 2 === 0 && !PAYER_UNDERSTOOD_INVOICE_FEATURES.has(bit)) {
+					throw new LightningPaymentError(
+						LightningErrorCode.INVALID_INVOICE,
+						`Invoice requires unknown feature bit ${bit}`
+					);
+				}
+			}
+		}
+		if (!invoice.paymentSecret) {
+			throw new LightningPaymentError(
+				LightningErrorCode.INVALID_INVOICE,
+				'Invoice has no payment secret (s field); refusing to pay'
+			);
 		}
 
 		const finalCltvExpiry =
@@ -5780,7 +5814,13 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			localChannels
 		);
-		if (!route && invoice.paymentSecret) {
+		// MPP requires the recipient to advertise basic_mpp (BOLT 4): splitting
+		// to a non-MPP recipient locks every part until the mpp_timeout.
+		if (
+			!route &&
+			invoice.paymentSecret &&
+			invoice.featureBits?.hasFeature(Feature.BASIC_MPP)
+		) {
 			// Try multi-path routing as fallback
 			const multiRoute = findMultiPathRoute(
 				this.graph,

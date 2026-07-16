@@ -40,6 +40,7 @@ import {
 	signChannelUpdate
 } from '../../src/lightning/gossip/validation';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
 // ─────────────── Helpers ───────────────
 
@@ -673,7 +674,48 @@ describe('MPP Sending (Phase 5)', function () {
 			]);
 		});
 
-		it('should throw "No route found" for invoice without paymentSecret when single path fails', function () {
+		it('should not attempt MPP when the invoice does not advertise basic_mpp (S-4.M8)', function () {
+			// Two direct 60k-sat channels; a 90k-sat payment cannot fit any single
+			// channel but splits fine across both. With basic_mpp advertised the
+			// MPP fallback dispatches; without it (payment secret alone) splitting
+			// to a non-MPP recipient would lock every part until the mpp_timeout,
+			// so sendPayment must report no route instead.
+			const alice = createNode(62);
+			const bob = createNode(63);
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 60_000n);
+			openReadyChannel(alice, bob, 60_000n);
+
+			// Control: bob's own invoice advertises basic_mpp → MPP dispatches
+			const mppInvoice = bob.createInvoice({
+				description: 'with basic_mpp',
+				amountMsat: 90_000_000n
+			});
+			const controlPayment = alice.sendPayment(mppInvoice.bolt11);
+			expect(controlPayment).to.not.be.null;
+
+			const bobConfig = makeNodeConfig(63);
+			const noMppFeatures = FeatureFlags.empty();
+			noMppFeatures.setCompulsory(Feature.TLV_ONION);
+			noMppFeatures.setCompulsory(Feature.PAYMENT_SECRET);
+
+			const invoiceStr = encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'no basic_mpp',
+				amountMsat: 90_000_000n,
+				payeeNodeKey: getPublicKey(bobConfig.nodePrivateKey),
+				privateKey: bobConfig.nodePrivateKey,
+				featureBits: noMppFeatures
+			});
+
+			// Without basic_mpp the MPP fallback must not run: no route
+			expect(() => alice.sendPayment(invoiceStr)).to.throw('No route found');
+		});
+
+		it('should refuse to pay an invoice without paymentSecret (BOLT 11 payer MUST)', function () {
 			const alice = createNode(70);
 			const bob = createNode(71);
 			connectNodes(alice, bob);
@@ -736,7 +778,7 @@ describe('MPP Sending (Phase 5)', function () {
 				privateKey: bobConfig.nodePrivateKey
 			});
 
-			expect(() => alice.sendPayment(invoiceStr)).to.throw('No route found');
+			expect(() => alice.sendPayment(invoiceStr)).to.throw('no payment secret');
 		});
 
 		it('should set totalMsat on each MPP part to full invoice amount', function () {
