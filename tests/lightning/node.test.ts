@@ -23,6 +23,10 @@ import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
 import {
 	encodeOfferTlv,
 	encodeInvoiceRequestTlv,
+	getTlvRecords,
+	computeMerkleRootFromRecords,
+	computeSignatureHash,
+	schnorrSign,
 	IInvoiceRequest
 } from '../../src/lightning/offer';
 import {
@@ -985,13 +989,26 @@ describe('Lightning Node', function () {
 				description: 'bolt12 receive',
 				amount: amountMsat
 			});
+			// A signed invoice_request (handleInvoiceRequest requires metadata + a
+			// valid payer signature per BOLT 12).
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
 			const request: IInvoiceRequest = {
-				payerKey: getPublicKey(makeNodeConfig(1).nodePrivateKey),
+				payerKey: getPublicKey(payerPriv),
 				offerId: offer.offerId,
-				amount: amountMsat
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
 			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
 			const b12 = offerMgr.handleInvoiceRequest(
-				encodeInvoiceRequestTlv(request, encodeOfferTlv(offer))
+				encodeInvoiceRequestTlv(request, offerTlv)
 			)!;
 			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
 
