@@ -264,7 +264,13 @@ export const getByteCount = (
 				// Segwit: (push_count:1) + (sig:73) + (pubkey:34)
 				// Non-segwit: (txid:32) + (vout:4) + (sequence:4) + (script_len:1) + (p2wpkh:23)
 				'P2SH-P2WPKH': 108 + 64 * 4,
-				P2TR: 138 * 4
+				// Taproot key-path spend. Witness: (push_count:1) + (schnorr sig:65
+				// incl. length) = 66 WU. Non-witness: (txid:32)+(vout:4)+(sequence:4)
+				// +(script_len:1) = 41 bytes * 4 = 164 WU. Total ~230 WU = 57.5 vB.
+				// It was priced at 138*4 = 552 WU (138 vB), a ~2.4x fee overpay on
+				// every taproot spend (and sendMax paid the recipient correspondingly
+				// less).
+				P2TR: 66 + 41 * 4
 			},
 			outputs: {
 				// (p2sh:24) + (amount:8)
@@ -326,7 +332,11 @@ export const getByteCount = (
 				totalWeight += types.inputs[key] * count;
 			}
 			inputCount += count;
-			if (count > 0 && key.indexOf('W') >= 0) hasWitness = true;
+			// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
+			// has no 'W' in its name, so it was missed here and every taproot-only
+			// tx under-counted the witness overhead by 2 WU.
+			if (count > 0 && (key.indexOf('W') >= 0 || key === 'P2TR'))
+				hasWitness = true;
 		});
 
 		Object.keys(outputs).forEach(function (originalKey) {

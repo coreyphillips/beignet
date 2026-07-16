@@ -2053,9 +2053,13 @@ export class Wallet {
 					changeAddressIndex.index - lastUsedChangeIndex
 				);
 				if (currentChangeAddressGap > this.gapLimitOptions.lookBehindChange) {
+					// Clamp the CHANGE chain using the change gap/index, not the receive
+					// chain's currentGap / addressIndex.index. The copy-pasted receive
+					// variables here could place change past the gap (undiscoverable by
+					// a standard restore) or reuse an address.
 					const excessAmount =
-						currentGap - this.gapLimitOptions.lookBehindChange;
-					const newIndex = addressIndex.index - excessAmount;
+						currentChangeAddressGap - this.gapLimitOptions.lookBehindChange;
+					const newIndex = changeAddressIndex.index - excessAmount;
 					const _changeAddressIndex = await this.generateAddresses({
 						addressType: addressTypeKey,
 						addressAmount: 0,
