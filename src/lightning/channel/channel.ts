@@ -1638,9 +1638,28 @@ export class Channel {
 			];
 		}
 
-		// Dedup check: if this HTLC ID was already received, silently ignore (BOLT 2 reestablish)
-		if (this._state.htlcs.has(`received-${msg.id}`)) {
-			return [];
+		// Dedup check (BOLT 2 reestablish): a replay of an add we already hold
+		// is a no-op — but ONLY if it is byte-identical. markForReestablish
+		// reverses uncommitted adds, so any surviving entry was committed and
+		// its id can never be legitimately reused: an id collision with
+		// different contents is a protocol violation that would desync the
+		// commitment if swallowed, so fail the channel instead.
+		const existing = this._state.htlcs.get(`received-${msg.id}`);
+		if (existing) {
+			if (
+				existing.amountMsat === msg.amountMsat &&
+				existing.paymentHash.equals(msg.paymentHash) &&
+				existing.cltvExpiry === msg.cltvExpiry &&
+				existing.onionRoutingPacket.equals(msg.onionRoutingPacket)
+			) {
+				return [];
+			}
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_add_htlc reuses id ${msg.id} with different contents`
+				}
+			];
 		}
 
 		// Reject during quiescence.
@@ -2352,6 +2371,9 @@ export class Channel {
 		this._state.lastSentHtlcSignatures = htlcSignatures.map((s) =>
 			Buffer.from(s)
 		);
+		// Reestablish ordering (BOLT 2): commitment_signed is now the most
+		// recently sent of {commitment_signed, revoke_and_ack}.
+		this._state.lastSentWasRevoke = false;
 
 		// Snapshot the HTLCs committed in the remote commitment we just signed,
 		// keyed by its number, so a later penalty can sweep these outputs even
@@ -2699,6 +2721,9 @@ export class Channel {
 		// Cache for retransmission on reestablish
 		this._state.lastSentRevokeSecret = Buffer.from(currentSecret);
 		this._state.lastSentRevokeNextPoint = Buffer.from(nextPoint);
+		// Reestablish ordering (BOLT 2): revoke_and_ack is now the most
+		// recently sent of {commitment_signed, revoke_and_ack}.
+		this._state.lastSentWasRevoke = true;
 
 		// Move pending HTLCs to committed
 		for (const entry of this._state.htlcs.values()) {
@@ -4587,6 +4612,43 @@ export class Channel {
 		this._state.preReestablishState = this._state.state;
 		this._state.state = ChannelState.AWAITING_REESTABLISH;
 
+		// BOLT 2: uncommitted REMOTE updates do not survive a disconnect — the
+		// peer forgets what it never committed via commitment_signed and
+		// retransmits (possibly different) updates after reestablish. Keeping
+		// them would (a) strand a phantom received-HTLC that permanently
+		// debits remoteBalanceMsat and leaks an HTLC slot, and (b) make the
+		// id-only add dedup swallow a reused id carrying a DIFFERENT HTLC,
+		// desyncing the commitment. (Our own uncommitted updates are the
+		// opposite case: they stay and replay via pendingLocalUpdates.)
+		for (const [key, entry] of this._state.htlcs) {
+			// A peer add never covered by the peer's commitment_signed
+			// (addLocallyRevoked flips in handleCommitmentSigned).
+			if (
+				key.startsWith('received-') &&
+				entry.state === HtlcState.PENDING &&
+				entry.addLocallyRevoked === false
+			) {
+				this._state.htlcs.delete(key);
+				this._state.remoteBalanceMsat += entry.amountMsat;
+				continue;
+			}
+			// A peer fulfill/fail of our offered HTLC never covered by the
+			// peer's commitment_signed (removalLocallyRevoked flips there):
+			// restore the HTLC; the peer retransmits the removal after
+			// reestablish. (A learned preimage stays learned upstream, which
+			// is harmless — it only ever lets us claim.)
+			if (
+				key.startsWith('offered-') &&
+				(entry.state === HtlcState.FULFILLED ||
+					entry.state === HtlcState.FAILED) &&
+				entry.removalLocallyRevoked === false
+			) {
+				entry.state = HtlcState.COMMITTED;
+				delete entry.removalRemoteCommitted;
+				delete entry.removalLocallyRevoked;
+			}
+		}
+
 		// Roll back an uncommitted fee update. A disconnect/restart may have
 		// interrupted the fee-update commitment round before it finalized; without
 		// this rollback we would keep building commitments at a feerate the peer
@@ -5085,6 +5147,13 @@ export class Channel {
 			];
 		}
 
+		// Collected separately from `actions`: when the peer missed BOTH our
+		// last revoke_and_ack AND our last commitment_signed, BOLT 2 requires
+		// retransmission in the ORIGINAL relative order (lastSentWasRevoke). A
+		// fixed revoke-first replay of a crossed round (we signed first, then
+		// revoked for the peer's crossed commitment) desyncs a conformant peer
+		// and force-closes.
+		const revokeRetransmit: ChannelAction[] = [];
 		if (msg.nextRevocationNumber + 1n === this._state.localCommitmentNumber) {
 			// Peer missed our last revoke_and_ack — retransmit
 			if (
@@ -5096,13 +5165,21 @@ export class Channel {
 					perCommitmentSecret: this._state.lastSentRevokeSecret,
 					nextPerCommitmentPoint: this._state.lastSentRevokeNextPoint
 				};
-				actions.push(
+				revokeRetransmit.push(
 					sendMsg(
 						MessageType.REVOKE_AND_ACK,
 						encodeRevokeAndAckMessage(revokeMsg)
 					)
 				);
 			}
+		}
+		// revoke_and_ack sent BEFORE the commitment_signed originally (or no
+		// commitment_signed recorded after it): keep the revoke first. Only when
+		// the revoke was the LAST thing we sent does it replay after the
+		// commitment_signed below.
+		if (this._state.lastSentWasRevoke !== true) {
+			actions.push(...revokeRetransmit);
+			revokeRetransmit.length = 0;
 		}
 
 		// An in-flight splice means commitment retransmission must follow the
@@ -5185,6 +5262,9 @@ export class Channel {
 				);
 			}
 		}
+
+		// Deferred revoke_and_ack (original order: commitment_signed first).
+		actions.push(...revokeRetransmit);
 
 		// option_taproot: adopt the peer's freshly-regenerated verification nonce so
 		// the next commitment round can co-sign (the peer's old nonce was lost on its

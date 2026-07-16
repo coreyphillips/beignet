@@ -226,6 +226,14 @@ export interface IChannelState {
 	/** Reestablish: cached revoke_and_ack next point for retransmission */
 	lastSentRevokeNextPoint: Buffer | null;
 	/**
+	 * Reestablish (BOLT 2): true when the most recently sent of
+	 * {revoke_and_ack, commitment_signed} was the revoke_and_ack. When the
+	 * peer missed BOTH, they MUST be retransmitted in their original relative
+	 * order (a crossed commitment round otherwise desyncs and force-closes);
+	 * this records which came last. Null until either has been sent.
+	 */
+	lastSentWasRevoke: boolean | null;
+	/**
 	 * Reestablish (BOLT 2): raw outgoing update messages (update_add_htlc /
 	 * update_fulfill_htlc / update_fail_htlc) the peer has NOT yet
 	 * acknowledged with a revoke_and_ack. On reconnection the peer may have
@@ -504,6 +512,7 @@ export function createOpenerState(params: {
 		pendingLocalUpdates: [],
 		pendingLocalUpdatesSignedCount: 0,
 		lastSentRevokeNextPoint: null,
+		lastSentWasRevoke: null,
 		preReestablishState: null,
 
 		lastProposedClosingFeeSat: null,
@@ -613,6 +622,7 @@ export function createAcceptorState(params: {
 		pendingLocalUpdates: [],
 		pendingLocalUpdatesSignedCount: 0,
 		lastSentRevokeNextPoint: null,
+		lastSentWasRevoke: null,
 		preReestablishState: null,
 
 		lastProposedClosingFeeSat: null,
