@@ -1001,6 +1001,40 @@ describe('Onion Messages (Phase 8)', () => {
 			);
 		});
 
+		it('should deliver the message body over a 1-hop reply path (S-4.M9)', () => {
+			// In a 1-hop reply path the introduction node IS the recipient. The
+			// reply's message TLVs must land in the intro hop's payload; dropping
+			// them made every BOLT 12 invoice reply over such a path arrive empty.
+			const replyDest = generateKeyPair();
+			const blindingSecret = crypto.randomBytes(32);
+
+			const replyPath = constructBlindedPath(
+				blindingSecret,
+				[replyDest.pubkey],
+				[
+					{
+						/* final hop - no nextNodeId */
+					}
+				]
+			);
+
+			const replyData = new Map<number, Buffer>();
+			replyData.set(64, Buffer.from('reply body'));
+
+			const reply = constructReplyOnionMessage(replyPath, replyData);
+			const result = processOnionMessage(
+				reply.onionRoutingPacket,
+				replyDest.privkey
+			);
+			expect(result.type).to.equal('delivery');
+			if (result.type === 'delivery') {
+				expect(result.payload.messageTlvs.get(64)).to.not.be.undefined;
+				expect(result.payload.messageTlvs.get(64)!.toString()).to.equal(
+					'reply body'
+				);
+			}
+		});
+
 		it('should reject reply path with no blinded hops', () => {
 			const kp = generateKeyPair();
 			const emptyPath: IBlindedPath = {
