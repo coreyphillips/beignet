@@ -41,6 +41,7 @@ import {
 	IGetUtxosResponse,
 	IHeader,
 	IKeyDerivationPath,
+	IMultisigCosigner,
 	IMultisigOptions,
 	IMultisigWallet,
 	InputData,
@@ -107,8 +108,10 @@ import {
 	getScriptHash,
 	getSeed,
 	getWalletDataStorageKey,
+	IKeyOrigin,
 	isPositive,
 	MultisigSpendError,
+	normalizeKeyOrigin,
 	objectKeys,
 	objectsMatch,
 	ok,
@@ -144,11 +147,19 @@ export class Wallet {
 	private readonly _root?: BIP32Interface;
 	// Account-level xpub node for watch-only wallets (no private keys).
 	private readonly _accountNode?: BIP32Interface;
+	// True key origin of the watch-only account xpub (master fingerprint +
+	// path from that master), when the caller supplied it.
+	private readonly _keyOrigin?: IKeyOrigin;
 	// Sorted-multisig configuration: threshold + account-level PUBLIC nodes
-	// for every cosigner (ours included when a mnemonic was provided).
+	// for every cosigner (ours included when a mnemonic was provided), plus
+	// each cosigner's true key origin when supplied.
 	private readonly _multisig?: {
 		threshold: number;
-		cosigners: { node: BIP32Interface; isOurs: boolean }[];
+		cosigners: {
+			node: BIP32Interface;
+			isOurs: boolean;
+			keyOrigin?: IKeyOrigin;
+		}[];
 	};
 	private _data: IWalletData;
 	private _getData: TGetData;
@@ -198,6 +209,8 @@ export class Wallet {
 	private constructor({
 		mnemonic,
 		xpub,
+		masterFingerprint,
+		originPath,
 		passphrase,
 		name,
 		network = EAvailableNetworks.mainnet,
@@ -286,6 +299,15 @@ export class Wallet {
 			if (resolvedType === EAddressType.p2wsh) {
 				throw new Error(
 					'p2wsh is a multisig address type. Use Wallet.createMultisig with every cosigner xpub.'
+				);
+			}
+			if (masterFingerprint) {
+				const originRes = normalizeKeyOrigin(masterFingerprint, originPath);
+				if (originRes.isErr()) throw originRes.error;
+				this._keyOrigin = originRes.value;
+			} else if (originPath) {
+				throw new Error(
+					'originPath requires masterFingerprint (a path is meaningless without the fingerprint it starts from).'
 				);
 			}
 			this._accountNode = node;
@@ -487,7 +509,11 @@ export class Wallet {
 	private _initMultisig(multisig: IMultisigOptions): {
 		config: {
 			threshold: number;
-			cosigners: { node: BIP32Interface; isOurs: boolean }[];
+			cosigners: {
+				node: BIP32Interface;
+				isOurs: boolean;
+				keyOrigin?: IKeyOrigin;
+			}[];
 		};
 		id: string;
 	} {
@@ -497,17 +523,34 @@ export class Wallet {
 		}
 		const keyId = (node: BIP32Interface): string =>
 			Buffer.concat([node.publicKey, node.chainCode]).toString('hex');
-		const entries: { node: BIP32Interface; isOurs: boolean }[] = [];
-		const addCosigner = (xpub: string): void => {
+		const entries: {
+			node: BIP32Interface;
+			isOurs: boolean;
+			keyOrigin?: IKeyOrigin;
+		}[] = [];
+		const addCosigner = (cosigner: string | IMultisigCosigner): void => {
+			const info: IMultisigCosigner =
+				typeof cosigner === 'string' ? { xpub: cosigner } : cosigner;
+			const { xpub, masterFingerprint, originPath } = info;
 			const res = parseExtendedPublicKey(xpub, this._network);
 			if (res.isErr()) throw res.error;
 			const node = res.value.node;
 			if (entries.some((e) => keyId(e.node) === keyId(node))) {
 				throw new Error(`Duplicate cosigner xpub provided: ${xpub}`);
 			}
-			entries.push({ node, isOurs: false });
+			let keyOrigin: IKeyOrigin | undefined;
+			if (masterFingerprint) {
+				const originRes = normalizeKeyOrigin(masterFingerprint, originPath);
+				if (originRes.isErr()) throw originRes.error;
+				keyOrigin = originRes.value;
+			} else if (originPath) {
+				throw new Error(
+					`Cosigner ${xpub} has an originPath but no masterFingerprint.`
+				);
+			}
+			entries.push({ node, isOurs: false, keyOrigin });
 		};
-		for (const xpub of cosigners ?? []) addCosigner(xpub);
+		for (const cosigner of cosigners ?? []) addCosigner(cosigner);
 		if (this._root) {
 			// We are a cosigner: derive our BIP 48 account xpub and include it.
 			const coinType = this._network === EAvailableNetworks.bitcoin ? '0' : '1';
@@ -598,8 +641,17 @@ export class Wallet {
 			const perCosigner = this._multisig.cosigners
 				.map((c) => {
 					let masterFingerprint: Buffer;
+					let cosignerPath = path;
 					if (c.isOurs && this._root) {
 						masterFingerprint = Buffer.from(this._root.fingerprint);
+					} else if (c.keyOrigin) {
+						// The cosigner's true origin was supplied: pair its master
+						// fingerprint with the path THAT device derives, so hardware
+						// cosigners recognize the entry (BIP 174).
+						masterFingerprint = Buffer.from(c.keyOrigin.fingerprint);
+						if (c.keyOrigin.path) {
+							cosignerPath = `m/${c.keyOrigin.path}/${change}/${index}`;
+						}
 					} else {
 						// Only the account xpub is known for this cosigner; expose
 						// its parent fingerprint (watch-only single-sig convention).
@@ -608,7 +660,7 @@ export class Wallet {
 					}
 					return {
 						masterFingerprint,
-						path,
+						path: cosignerPath,
 						pubkey: c.node.derive(change).derive(index).publicKey,
 						isOurs: c.isOurs
 					};
@@ -1070,15 +1122,38 @@ export class Wallet {
 
 	/**
 	 * Returns the fingerprint external signers should match against. For full
-	 * wallets this is the master fingerprint. Watch-only wallets cannot know
-	 * the master fingerprint, so the xpub's parent fingerprint is used.
+	 * wallets this is the master fingerprint. Watch-only wallets use the
+	 * caller-supplied masterFingerprint when one was provided at creation;
+	 * otherwise they fall back to the xpub's parent fingerprint (which
+	 * hardware signers will refuse to match, but is all that is derivable
+	 * from the xpub alone).
 	 * @returns {Buffer}
 	 */
 	public getMasterFingerprint(): Buffer {
 		if (this._root) return Buffer.from(this._root.fingerprint);
+		if (this._keyOrigin) return Buffer.from(this._keyOrigin.fingerprint);
 		const fingerprint = Buffer.alloc(4);
 		fingerprint.writeUInt32BE(this._accountNode?.parentFingerprint ?? 0, 0);
 		return fingerprint;
+	}
+
+	/**
+	 * Rewrites a wallet-derived full path (m/purpose'/coin'/account'/change/
+	 * index) onto the watch-only key's true origin path, so PSBT
+	 * bip32_derivation entries pair the supplied master fingerprint with the
+	 * path that fingerprint's device actually uses. Returns the path
+	 * unchanged for full wallets or when no origin path was supplied.
+	 * @param {string} path
+	 * @returns {string}
+	 */
+	public mapPathToKeyOrigin(path: string): string {
+		if (this._root || !this._keyOrigin?.path) return path;
+		const segments = path.replace(/^m\//i, '').split('/');
+		// The account xpub derives change/index only; keep the last two
+		// (non-hardened) segments and graft them onto the true origin.
+		if (segments.length < 2) return path;
+		const suffix = segments.slice(-2).join('/');
+		return `m/${this._keyOrigin.path}/${suffix}`;
 	}
 
 	/**
@@ -2486,9 +2561,11 @@ export class Wallet {
 	/**
 	 * Exports BIP 380 output descriptors (with checksums) for this wallet.
 	 * Full wallets export all four address types with key origin info
-	 * ([fingerprint/purpose'/coin'/account']); watch-only wallets export
-	 * their single address type without origin info, since only the xpub's
-	 * parent fingerprint is known and origins require the master fingerprint.
+	 * ([fingerprint/purpose'/coin'/account']). Watch-only wallets and
+	 * external multisig cosigners include a full key origin when a
+	 * masterFingerprint + originPath were supplied at creation; otherwise
+	 * origins are omitted (watch-only) or fingerprint-only (cosigners),
+	 * since a true origin cannot be derived from an xpub alone.
 	 * NO PRIVATE KEYS are ever included.
 	 * @returns {Result<IExportDescriptorsResponse>}
 	 */
@@ -2525,6 +2602,12 @@ export class Wallet {
 						let origin: string;
 						if (cosigner.isOurs && this._root) {
 							origin = `[${fingerprint}/48h/${coinType}h/${this._account}h/2h]`;
+						} else if (cosigner.keyOrigin?.path) {
+							// BIP 380 key origin: the cosigner's own master fingerprint
+							// followed by the full path from that master to the xpub.
+							const fp = cosigner.keyOrigin.fingerprint.toString('hex');
+							const originPath = cosigner.keyOrigin.path.replace(/'/g, 'h');
+							origin = `[${fp}/${originPath}]`;
 						} else {
 							const parentFp = Buffer.alloc(4);
 							parentFp.writeUInt32BE(cosigner.node.parentFingerprint ?? 0, 0);
@@ -2544,13 +2627,20 @@ export class Wallet {
 					return err('Watch-only account node is unavailable.');
 				}
 				const xpub = this._toStandardBase58(this._accountNode);
+				// With a supplied key origin the descriptor carries the full
+				// BIP 380 origin; without one it stays origin-less as before.
+				const origin = this._keyOrigin?.path
+					? `[${this._keyOrigin.fingerprint.toString(
+							'hex'
+					  )}/${this._keyOrigin.path.replace(/'/g, 'h')}]`
+					: '';
 				descriptors.push({
 					addressType: this.addressType,
 					external: appendDescriptorChecksum(
-						wrap(this.addressType, `${xpub}/0/*`)
+						wrap(this.addressType, `${origin}${xpub}/0/*`)
 					),
 					internal: appendDescriptorChecksum(
-						wrap(this.addressType, `${xpub}/1/*`)
+						wrap(this.addressType, `${origin}${xpub}/1/*`)
 					)
 				});
 			} else {

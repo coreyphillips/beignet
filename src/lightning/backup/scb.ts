@@ -14,7 +14,8 @@
  * the node-level paymentBasepointSecret for legacy null-index channels) - so
  * v1 entries carry everything a taproot recovery sweep needs and no format
  * bump is required. channelType (hex) tells the restored state which to_remote
- * variant to look for.
+ * variant to look for; leaseExpiry/isLessor (optional, liquidity ads) let it
+ * reconstruct a lessor's lease-locked to_remote and set the sweep locktime.
  *
  * Encoding: 'beignet-scb-v1:' + base64(iv || authTag || ciphertext) where the
  * ciphertext is the JSON backup encrypted with AES-256-GCM under
@@ -50,6 +51,15 @@ export interface IScbChannelEntry {
 	role: 'OPENER' | 'ACCEPTOR';
 	isTaproot: boolean;
 	isAnchor: boolean;
+	/**
+	 * Liquidity ads (script-enforced lease). A LESSOR's to_remote is the
+	 * lease-locked CLTV variant, so recovery needs these to reconstruct the
+	 * right script and set the sweep's nLockTime. Optional: absent on
+	 * non-lease channels and on backups created before the fields existed
+	 * (JSON tolerates both directions; no version bump).
+	 */
+	leaseExpiry?: number;
+	isLessor?: boolean;
 }
 
 export interface IStaticChannelBackup {

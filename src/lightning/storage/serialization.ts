@@ -322,6 +322,7 @@ export interface ISerializedChannelState {
 	lastSentHtlcSignatures: string[];
 	lastSentRevokeSecret: string | null;
 	lastSentRevokeNextPoint: string | null;
+	lastSentWasRevoke?: boolean | null;
 	pendingLocalUpdates?: Array<{ type: number; payloadHex: string }>;
 	pendingLocalUpdatesSignedCount?: number;
 	preReestablishState: string | null;
@@ -551,6 +552,7 @@ export function serializeChannelState(
 		),
 		lastSentRevokeSecret: bufToHex(s.lastSentRevokeSecret),
 		lastSentRevokeNextPoint: bufToHex(s.lastSentRevokeNextPoint),
+		lastSentWasRevoke: s.lastSentWasRevoke,
 		preReestablishState: s.preReestablishState,
 		lastProposedClosingFeeSat:
 			s.lastProposedClosingFeeSat !== null
@@ -715,6 +717,7 @@ export function deserializeChannelState(
 		),
 		lastSentRevokeSecret: hexToBuf(s.lastSentRevokeSecret),
 		lastSentRevokeNextPoint: hexToBuf(s.lastSentRevokeNextPoint),
+		lastSentWasRevoke: s.lastSentWasRevoke ?? null,
 		preReestablishState: (s.preReestablishState as ChannelState) || null,
 		lastProposedClosingFeeSat:
 			s.lastProposedClosingFeeSat !== null

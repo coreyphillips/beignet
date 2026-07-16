@@ -546,6 +546,12 @@ export function buildLocalCommitment(
 		leaseExpiry: state.isLessor ? state.leaseExpiry : undefined,
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
+		// Liquidity ads: OUR commitment's to_remote pays the PEER, so it is
+		// lease-locked when the peer is the lessor (we are the lessee) — the
+		// MIRROR of the to_local gate above. Exactly one of to_local/to_remote
+		// per commitment carries the lock, always on the lessor's balance.
+		// (See the matching gate in buildRemoteCommitment.)
+		toRemoteLeaseExpiry: !state.isLessor ? state.leaseExpiry : undefined,
 		htlcOutputs,
 		// Our local commitment is trimmed with OUR negotiated dust_limit_satoshis
 		// (we are the holder who would broadcast it).
@@ -719,6 +725,12 @@ export function buildRemoteCommitment(
 		leaseExpiry: state.isLessor ? undefined : state.leaseExpiry,
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
+		// Liquidity ads: THEIR commitment's to_remote pays US, so it is
+		// lease-locked when WE are the lessor — the MIRROR of the to_local gate
+		// above (and the counterpart of buildLocalCommitment's to_remote gate).
+		// This is the output S-L.H4 was about: without it a seller escapes the
+		// lease by provoking the buyer into force-closing.
+		toRemoteLeaseExpiry: state.isLessor ? state.leaseExpiry : undefined,
 		htlcOutputs,
 		// The remote commitment is trimmed with THEIR negotiated
 		// dust_limit_satoshis (they are the holder who would broadcast it).

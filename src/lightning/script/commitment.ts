@@ -131,6 +131,13 @@ export interface ICommitmentTxParams {
 	/** to_remote output (P2WPKH with static_remote_key) */
 	remoteAmount: bigint;
 	remotePaymentPubkey: Buffer;
+	/**
+	 * Liquidity ads: absolute lease-expiry height for THIS tx's to_remote
+	 * output. Set only when the party the to_remote pays is the lessor (the
+	 * mirror of `leaseExpiry`, which locks the to_local). Anchors only: the
+	 * plain P2WPKH to_remote cannot carry a lease lock.
+	 */
+	toRemoteLeaseExpiry?: number;
 
 	/** HTLC outputs (pre-built scripts and amounts) */
 	htlcOutputs?: IHtlcOutput[];
@@ -280,6 +287,12 @@ export function buildCommitmentTx(
 	let toRemoteScript: Buffer | undefined;
 	if (params.taprootToRemoteScript) {
 		// option_taproot: to_remote is a P2TR (1-block-CSV leaf). Same dust limit.
+		// Leased taproot channels are rejected at negotiation, so no lease here.
+		if (params.toRemoteLeaseExpiry !== undefined) {
+			throw new Error(
+				'toRemoteLeaseExpiry is not supported on taproot commitments.'
+			);
+		}
 		if (remoteAmount >= dustWsh) {
 			const spk = params.taprootToRemoteScript;
 			outputs.push({
@@ -290,10 +303,13 @@ export function buildCommitmentTx(
 			});
 		}
 	} else if (useAnchors) {
-		// Anchor mode: to_remote is P2WSH with 1-block CSV delay
+		// Anchor mode: to_remote is P2WSH with 1-block CSV delay; the lease
+		// variant adds a CLTV when the paid party is the lessor.
 		if (remoteAmount >= dustWsh) {
-			const { script, witnessScript } =
-				buildToRemoteAnchorOutput(remotePaymentPubkey);
+			const { script, witnessScript } = buildToRemoteAnchorOutput(
+				remotePaymentPubkey,
+				params.toRemoteLeaseExpiry
+			);
 			toRemoteScript = witnessScript;
 			outputs.push({
 				script,
@@ -303,7 +319,13 @@ export function buildCommitmentTx(
 			});
 		}
 	} else {
-		// Non-anchor: to_remote is plain P2WPKH
+		// Non-anchor: a plain P2WPKH to_remote cannot carry a lease lock;
+		// leases are negotiated anchors-only.
+		if (params.toRemoteLeaseExpiry !== undefined) {
+			throw new Error(
+				'toRemoteLeaseExpiry requires an anchor (P2WSH confirmed) to_remote.'
+			);
+		}
 		if (remoteAmount >= dustWpkh) {
 			const p2wpkh = bitcoin.payments.p2wpkh({ pubkey: remotePaymentPubkey });
 			outputs.push({

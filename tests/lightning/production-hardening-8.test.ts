@@ -156,6 +156,7 @@ function makeMinimalChannelState(
 		lastSentHtlcSignatures: [],
 		lastSentRevokeSecret: null,
 		lastSentRevokeNextPoint: null,
+		lastSentWasRevoke: null,
 		preReestablishState: null,
 		lastProposedClosingFeeSat: null,
 		closingFeeMin: null,

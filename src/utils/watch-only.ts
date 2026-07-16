@@ -19,6 +19,40 @@ export class WatchOnlySigningError extends Error {
 	}
 }
 
+/** A key's true BIP 32 origin: master fingerprint + path to the known xpub. */
+export interface IKeyOrigin {
+	fingerprint: Buffer;
+	// Path from the master to the xpub, "'"-hardened, no "m/" prefix
+	// (e.g. "84'/0'/0'"). Undefined when only the fingerprint was supplied.
+	path?: string;
+}
+
+/**
+ * Validates and normalizes user-supplied key-origin metadata. The
+ * fingerprint must be 8 hex chars; the path accepts "m/84'/0'/0'",
+ * "84h/0h/0h" etc. and is normalized to "'"-hardened with no "m/" prefix.
+ */
+export const normalizeKeyOrigin = (
+	masterFingerprint: string,
+	originPath?: string
+): Result<IKeyOrigin> => {
+	if (!/^[0-9a-fA-F]{8}$/.test(masterFingerprint)) {
+		return err(
+			`masterFingerprint must be 8 hex characters, received "${masterFingerprint}".`
+		);
+	}
+	const fingerprint = Buffer.from(masterFingerprint.toLowerCase(), 'hex');
+	if (originPath === undefined) return ok({ fingerprint });
+	const stripped = originPath.replace(/^m\//i, '').replace(/h/gi, "'");
+	const segments = stripped.split('/');
+	if (!segments.length || segments.some((s) => !/^\d+'?$/.test(s))) {
+		return err(
+			`originPath must be a derivation path like "m/84'/0'/0'", received "${originPath}".`
+		);
+	}
+	return ok({ fingerprint, path: stripped });
+};
+
 // SLIP-132 extended public key version bytes. The version only encodes how
 // the exporting wallet intended addresses to be derived; the key material is
 // identical, so we re-parse under the target network after prefix checks.

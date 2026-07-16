@@ -72,6 +72,11 @@ const RATES: ILeaseRates = {
 	channelFeeMaxProportionalThousandths: 10
 };
 
+// static_remotekey (12) + anchors_zero_fee_htlc_tx (22), both compulsory.
+// Script-enforced leases are anchors-only (the lease CLTV lives in the
+// confirmed P2WSH to_remote), so lease negotiations must propose this type.
+const ANCHOR_CHANNEL_TYPE = Buffer.from('401000', 'hex');
+
 /** Wire two managers so each one's outbound goes to the other's handleMessage. */
 function wire(
 	a: ChannelManager,
@@ -125,7 +130,7 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 		buyer.createDualFundedChannel(
 			sellerId,
 			makeParams({
-				channelType: Buffer.from([0x10]),
+				channelType: ANCHOR_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
 				// Buyer's accepted ceiling = the seller's advertised rates (H3).
 				maxLeaseRates: RATES
@@ -147,7 +152,7 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 			makeParams({
 				fundingSatoshis: 200_000n,
 				fundingFeeratePerkw: 1000,
-				channelType: Buffer.from([0x10]),
+				channelType: ANCHOR_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
 				// Buyer's accepted ceiling = the seller's advertised rates (H3).
 				maxLeaseRates: RATES

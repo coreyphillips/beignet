@@ -917,12 +917,15 @@ export class Transaction {
 					if (publicNodeRes.isErr()) throw publicNodeRes.error;
 					pubkey = publicNodeRes.value.publicKey;
 				}
+				// Watch-only wallets with a supplied key origin pair the master
+				// fingerprint with the path that master actually derives.
+				const originPath = this._wallet.mapPathToKeyOrigin(input.path);
 				if (isP2trPrefix(input.address)) {
 					psbt.updateInput(index, {
 						tapBip32Derivation: [
 							{
 								masterFingerprint,
-								path: input.path,
+								path: originPath,
 								pubkey: toXOnly(pubkey),
 								leafHashes: []
 							}
@@ -933,7 +936,7 @@ export class Transaction {
 						bip32Derivation: [
 							{
 								masterFingerprint,
-								path: input.path,
+								path: originPath,
 								pubkey
 							}
 						]
@@ -943,6 +946,33 @@ export class Transaction {
 			return ok('Signer metadata added.');
 		} catch (e) {
 			return err(e);
+		}
+	}
+
+	/**
+	 * Fetches the full previous transaction for a PSBT input, as a spreadable
+	 * { nonWitnessUtxo } field. Segwit v0 signers postdating CVE-2020-14199
+	 * (Ledger 2.x, Trezor >= 2.3.5) require non_witness_utxo alongside
+	 * witness_utxo to verify input amounts. Returns {} when the backend
+	 * cannot supply it (witness_utxo alone remains BIP 174-valid), so
+	 * offline builds still succeed.
+	 * @param {string} txHash
+	 * @returns {Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>>}
+	 * @private
+	 */
+	private async nonWitnessUtxoField(
+		txHash: string
+	): Promise<{ nonWitnessUtxo: Buffer } | Record<string, never>> {
+		try {
+			const transaction = await this._wallet.electrum.getTransactions({
+				txHashes: [{ tx_hash: txHash }]
+			});
+			if (transaction.isErr()) return {};
+			const hex = transaction.value.data[0]?.result?.hex;
+			if (!hex) return {};
+			return { nonWitnessUtxo: Buffer.from(hex, 'hex') };
+		} catch {
+			return {};
 		}
 	}
 
@@ -986,7 +1016,8 @@ export class Transaction {
 						script: output,
 						value: input.value
 					},
-					witnessScript
+					witnessScript,
+					...(await this.nonWitnessUtxoField(input.tx_hash))
 				});
 				return ok('Success');
 			}
@@ -1009,7 +1040,8 @@ export class Transaction {
 					witnessUtxo: {
 						script: p2wpkh.output,
 						value: input.value
-					}
+					},
+					...(await this.nonWitnessUtxoField(input.tx_hash))
 				});
 			}
 
@@ -1032,7 +1064,8 @@ export class Transaction {
 						script: p2sh.output,
 						value: input.value
 					},
-					redeemScript: p2sh.redeem.output
+					redeemScript: p2sh.redeem.output,
+					...(await this.nonWitnessUtxoField(input.tx_hash))
 				});
 			}
 

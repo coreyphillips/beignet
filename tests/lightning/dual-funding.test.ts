@@ -1239,11 +1239,14 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			channelFeeMaxBaseMsat: 5000,
 			channelFeeMaxProportionalThousandths: 10
 		};
+		// Leases are anchors-only: static_remotekey (12) + anchors (22).
+		const LEASE_CHANNEL_TYPE = Buffer.from('401000', 'hex');
 
 		it('rejects the lease when the seller funds less than requested (M2)', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2({
 				...params,
+				channelType: LEASE_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
 			});
 			const channelId = channel.getTemporaryChannelId();
@@ -1274,6 +1277,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2({
 				...params,
+				channelType: LEASE_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
 				// Buyer's accepted ceiling = the seller's advertised rates (H3).
 				maxLeaseRates: M2_RATES
@@ -1301,6 +1305,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2({
 				...params,
+				channelType: LEASE_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 },
 				maxLeaseRates: M2_RATES
 			});
@@ -1339,6 +1344,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2({
 				...params,
+				channelType: LEASE_CHANNEL_TYPE,
 				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
 				// no maxLeaseRates → refuse to pay an unverified fee
 			});

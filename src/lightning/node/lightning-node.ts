@@ -104,6 +104,7 @@ import {
 	FINAL_INCORRECT_HTLC_AMOUNT,
 	INVALID_ONION_HMAC,
 	INVALID_ONION_BLINDING,
+	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT,
@@ -205,7 +206,8 @@ import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
-	OutputStatus
+	OutputStatus,
+	OutputType
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
 import { ElectrumBackend } from '../chain/electrum-backend';
@@ -1514,6 +1516,26 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// The TIMEOUT counterpart of preimage:learned: an HTLC output we OFFERED
+		// downstream resolved irrevocably on-chain without revealing a preimage,
+		// so the outgoing leg of that forward is finally failed. Without a
+		// consumer the inbound HTLC was never failed off-chain and
+		// scanForwardTimeouts force-closed the healthy inbound channel instead
+		// of sending a clean update_fail_htlc.
+		this.channelManager.on(
+			'output:resolved',
+			(
+				_txid: string,
+				_outputIndex: number,
+				channelId?: Buffer,
+				outputType?: OutputType,
+				paymentHash?: Buffer
+			) => {
+				if (outputType === undefined) return;
+				this.handleOnChainOutputResolved(channelId, outputType, paymentHash);
+			}
+		);
+
 		// Wire broadcast:tx from ChannelManager (closing txs, force-close commitment txs)
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
 			if (this.chainWatcher) {
@@ -2181,7 +2203,14 @@ export class LightningNode extends EventEmitter {
 				channelType: state.channelType ? state.channelType.toString('hex') : '',
 				role: state.role === ChannelRole.OPENER ? 'OPENER' : 'ACCEPTOR',
 				isTaproot: isTaprootChannel(state.channelType),
-				isAnchor: isAnchorChannel(state.channelType)
+				isAnchor: isAnchorChannel(state.channelType),
+				// Liquidity ads: a lessor's to_remote is the lease-locked variant;
+				// recovery needs these to find and sweep it. Omitted when unset so
+				// non-lease backups stay byte-identical.
+				...(state.leaseExpiry !== undefined
+					? { leaseExpiry: state.leaseExpiry }
+					: {}),
+				...(state.isLessor !== undefined ? { isLessor: state.isLessor } : {})
 			});
 		}
 		return { network: this.network, channels };
@@ -2260,6 +2289,10 @@ export class LightningNode extends EventEmitter {
 			state.channelType = entry.channelType
 				? Buffer.from(entry.channelType, 'hex')
 				: null;
+			// Liquidity ads: restore the lease fields so the DLP classifier builds
+			// the lease-locked to_remote variant and the sweep sets its nLockTime.
+			state.leaseExpiry = entry.leaseExpiry;
+			state.isLessor = entry.isLessor;
 			state.localCommitmentNumber = 0n;
 			state.remoteCommitmentNumber = 0n;
 			// Balances are unknown after data loss; the sweep takes its amount from
@@ -2454,7 +2487,11 @@ export class LightningNode extends EventEmitter {
 				localPaymentPubkey: state.localBasepoints.paymentBasepoint,
 				paymentBasepointSecret,
 				sweepScript: this.getSweepDestinationScript(),
-				network: btcNetwork
+				network: btcNetwork,
+				// Liquidity ads: lets the kit builder exclude the lease-locked
+				// to_remote (lessor) / name the lessee-side blob limitation.
+				isLessor: state.isLessor,
+				leaseExpiry: state.leaseExpiry
 			};
 			client.backupRevokedState(ctx);
 		} catch (err) {
@@ -8037,6 +8074,75 @@ export class LightningNode extends EventEmitter {
 		}
 
 		this.emit('preimage:learned', paymentHash, preimage);
+	}
+
+	/**
+	 * A tracked output resolved irrevocably on-chain. The case that needs
+	 * off-chain follow-up here is an OFFERED_HTLC (the outgoing leg of a
+	 * forward) resolved WITHOUT a preimage: the downstream never settled and
+	 * our HTLC-timeout (or the peer's own timeout claim) is now irrevocable,
+	 * which is exactly the BOLT 2 condition for refunding the upstream. Fail
+	 * the inbound HTLC off-chain so the healthy inbound channel resolves with
+	 * update_fail_htlc instead of the scanForwardTimeouts force-close.
+	 * Preimage resolutions are handled by handleOnChainPreimageLearned.
+	 */
+	private handleOnChainOutputResolved(
+		channelId: Buffer | undefined,
+		outputType: OutputType,
+		paymentHash?: Buffer
+	): void {
+		if (outputType !== OutputType.OFFERED_HTLC) return;
+		if (!channelId || !paymentHash) return;
+		// A known preimage means the downstream DID settle; the fulfill path
+		// (handleOnChainPreimageLearned / handleHtlcFulfilled) owns the inbound leg.
+		if (this.preimages.has(paymentHash.toString('hex'))) return;
+
+		const outChannelIdHex = channelId.toString('hex');
+		for (const [outKey, forward] of this.forwardedHtlcs) {
+			if (!outKey.startsWith(`${outChannelIdHex}:offered-`)) continue;
+			const inChannel = this.channelManager.getChannel(forward.inChannelId);
+			const inHtlc = inChannel
+				?.getFullState()
+				.htlcs.get(`received-${forward.inHtlcId}`);
+			if (!inHtlc || !inHtlc.paymentHash.equals(paymentHash)) continue;
+			if (
+				inHtlc.state !== HtlcState.PENDING &&
+				inHtlc.state !== HtlcState.COMMITTED
+			)
+				continue;
+
+			const inSecretKey = `${forward.inChannelId.toString('hex')}:${
+				forward.inHtlcId
+			}`;
+			// BOLT 4 route blinding: failures of a blinded forward must surface as
+			// invalid_onion_blinding (update_fail_malformed_htlc for a 'mid' hop).
+			const blindedRole = this.blindedIncomingHtlcs.get(inSecretKey);
+			if (blindedRole) {
+				this.failBlindedIncomingHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					blindedRole
+				);
+			} else {
+				const sharedSecret = this.receivedHtlcSharedSecrets.get(inSecretKey);
+				const reason = sharedSecret
+					? createFailureMessage(sharedSecret, PERMANENT_CHANNEL_FAILURE)
+					: Buffer.alloc(290);
+				this.cleanupHtlcSharedSecret(inSecretKey);
+				this.channelManager.failHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					reason
+				);
+			}
+			this.forwardedHtlcs.delete(outKey);
+			this.safeStorage(
+				() => this.storage!.deleteForwardedHtlc(outKey),
+				'deleteForwardedHtlc'
+			);
+			this.persistChannel(forward.inChannelId);
+			break;
+		}
 	}
 
 	private handleHtlcFulfilled(

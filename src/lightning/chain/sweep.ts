@@ -36,9 +36,16 @@ const SWEEP_VBYTES: Record<OutputType, number> = {
 
 /**
  * Get the estimated virtual byte size for sweeping a given output type.
+ * `leased` marks a lease-locked (liquidity ads) to_remote claim, whose
+ * witness script carries an extra CLTV clause: +7 WU (LND's lease
+ * script-size overhead), ~+2 vbytes.
  */
-export function estimateSweepVbytes(outputType: OutputType): number {
-	return SWEEP_VBYTES[outputType];
+export function estimateSweepVbytes(
+	outputType: OutputType,
+	leased = false
+): number {
+	const base = SWEEP_VBYTES[outputType];
+	return leased && outputType === OutputType.TO_REMOTE ? base + 2 : base;
 }
 
 // ─────────────── To-Local Sweep ───────────────
