@@ -257,6 +257,15 @@ export interface IWallet {
 	// Sorted-multisig configuration. Prefer Wallet.createMultisig over
 	// passing this directly.
 	multisig?: IMultisigOptions;
+	// Watch-only only: the true BIP 32 master fingerprint (8 hex chars) of
+	// the device that holds the xpub's private key, and the derivation path
+	// from that master to the xpub (e.g. "m/84'/0'/0'"). When provided, PSBT
+	// bip32_derivation entries and exported descriptors carry a correct
+	// BIP 174/380 key origin that hardware signers accept. Without them the
+	// xpub's parent fingerprint is used as before, which most hardware
+	// signers refuse to match.
+	masterFingerprint?: string;
+	originPath?: string;
 }
 
 export interface IAddressData {
@@ -529,15 +538,27 @@ export type IWatchOnlyWallet = Omit<
 	xpub: string;
 };
 
+// A multisig cosigner known by more than a bare xpub: the cosigner device's
+// true master fingerprint (8 hex chars) and the path from that master to the
+// account xpub (e.g. "m/48'/0'/0'/2'"). Supplying them lets PSBTs and
+// exported descriptors carry the BIP 174/380 key origin hardware cosigners
+// (Coldcard/Ledger/BitBox) and coordinators (Sparrow) require.
+export interface IMultisigCosigner {
+	xpub: string;
+	masterFingerprint?: string;
+	originPath?: string;
+}
+
 // Sorted-multisig (BIP 48 / BIP 67) wallet configuration.
 export interface IMultisigOptions {
 	// Signatures required to spend (m of n).
 	threshold: number;
 	// Account-level extended public keys (BIP 48 m/48'/coin'/account'/2')
-	// for the cosigners. SLIP-132 Zpub/Vpub encodings are normalized. When a
-	// mnemonic is provided, our own derived account xpub is added
-	// automatically if it is not already present.
-	cosigners: string[];
+	// for the cosigners, either as bare strings or as IMultisigCosigner
+	// objects carrying key-origin metadata. SLIP-132 Zpub/Vpub encodings are
+	// normalized. When a mnemonic is provided, our own derived account xpub
+	// is added automatically if it is not already present.
+	cosigners: (string | IMultisigCosigner)[];
 	// Optional explicit statement of OUR account xpub. With a mnemonic it
 	// must match the derived key; provided without a mnemonic it is simply
 	// included as a cosigner.
