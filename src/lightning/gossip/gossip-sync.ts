@@ -61,10 +61,17 @@ export class GossipSyncManager extends EventEmitter {
 	private _accumulatedScids: Buffer[] = [];
 	private _pendingQueryBatches: Buffer[][] = [];
 	private _currentBatchIndex = 0;
+	private readonly _chainHash: Buffer;
 
-	constructor(graph: NetworkGraph) {
+	/**
+	 * @param chainHash The chain to query/announce on. Defaults to mainnet; the
+	 *   node passes its configured network's chain_hash so our own queries carry
+	 *   the right chain and are not ignored on regtest/testnet/signet.
+	 */
+	constructor(graph: NetworkGraph, chainHash: Buffer = BITCOIN_CHAIN_HASH) {
 		super();
 		this._graph = graph;
+		this._chainHash = chainHash;
 	}
 
 	getState(): GossipSyncState {
@@ -82,7 +89,7 @@ export class GossipSyncManager extends EventEmitter {
 		messages.push({
 			type: MessageType.GOSSIP_TIMESTAMP_FILTER,
 			payload: encodeGossipTimestampFilterMessage({
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: this._chainHash,
 				firstTimestamp: 0,
 				timestampRange: 0xffffffff
 			})
@@ -92,7 +99,7 @@ export class GossipSyncManager extends EventEmitter {
 		messages.push({
 			type: MessageType.QUERY_CHANNEL_RANGE,
 			payload: encodeQueryChannelRangeMessage({
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: this._chainHash,
 				firstBlocknum: 0,
 				numberOfBlocks: 0xffffffff
 			})
@@ -180,7 +187,8 @@ export class GossipSyncManager extends EventEmitter {
 			messages.push({
 				type: MessageType.REPLY_CHANNEL_RANGE,
 				payload: encodeReplyChannelRangeMessage({
-					chainHash: BITCOIN_CHAIN_HASH,
+					// BOLT 7: reply MUST echo the query's chain_hash.
+					chainHash: msg.chainHash,
 					firstBlocknum: msg.firstBlocknum,
 					numberOfBlocks: msg.numberOfBlocks,
 					syncComplete: true,
@@ -197,7 +205,8 @@ export class GossipSyncManager extends EventEmitter {
 			messages.push({
 				type: MessageType.REPLY_CHANNEL_RANGE,
 				payload: encodeReplyChannelRangeMessage({
-					chainHash: BITCOIN_CHAIN_HASH,
+					// BOLT 7: reply MUST echo the query's chain_hash.
+					chainHash: msg.chainHash,
 					firstBlocknum: msg.firstBlocknum,
 					numberOfBlocks: msg.numberOfBlocks,
 					syncComplete: isLast,
@@ -248,7 +257,8 @@ export class GossipSyncManager extends EventEmitter {
 		messages.push({
 			type: MessageType.REPLY_SHORT_CHANNEL_IDS_END,
 			payload: encodeReplyShortChannelIdsEndMessage({
-				chainHash: BITCOIN_CHAIN_HASH,
+				// BOLT 7: reply MUST echo the query's chain_hash.
+				chainHash: msg.chainHash,
 				complete: true
 			})
 		});
@@ -266,7 +276,7 @@ export class GossipSyncManager extends EventEmitter {
 			{
 				type: MessageType.QUERY_SHORT_CHANNEL_IDS,
 				payload: encodeQueryShortChannelIdsMessage({
-					chainHash: BITCOIN_CHAIN_HASH,
+					chainHash: this._chainHash,
 					encodedShortIds: encodeShortChannelIds(batch)
 				})
 			}
