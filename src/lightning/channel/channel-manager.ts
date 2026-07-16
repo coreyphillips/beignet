@@ -789,6 +789,45 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Fail a received HTLC with update_fail_malformed_htlc (BOLT 2). Used for
+	 * unparseable onions and for invalid_onion_blinding at a non-introduction
+	 * blinded hop (BOLT 4 route blinding).
+	 */
+	failMalformedHtlc(
+		channelId: Buffer,
+		htlcId: bigint,
+		sha256OfOnion: Buffer,
+		failureCode: number
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		const actions = channel.failMalformedHtlc(
+			htlcId,
+			sha256OfOnion,
+			failureCode
+		);
+		this.processActions(peerPubkey, channel, actions);
+
+		// BOLT 2: commit the removal, exactly as failHtlc.
+		if (channel.getChannelId()) {
+			this.autoSignAndSendCommitment(channel.getChannelId()!);
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Sign and send commitment on a channel.
 	 */
 	signCommitment(

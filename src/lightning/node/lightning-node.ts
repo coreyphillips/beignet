@@ -102,6 +102,7 @@ import {
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 	FINAL_INCORRECT_CLTV_EXPIRY,
 	INVALID_ONION_HMAC,
+	INVALID_ONION_BLINDING,
 	UNKNOWN_NEXT_PEER,
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT,
@@ -377,6 +378,15 @@ export class LightningNode extends EventEmitter {
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
 	private receivedHtlcSharedSecrets: Map<string, Buffer> = new Map();
+	/**
+	 * Incoming HTLCs we are relaying inside a blinded route, keyed like
+	 * receivedHtlcSharedSecrets. BOLT 4: ANY failure on these must surface as
+	 * invalid_onion_blinding — via update_fail_malformed_htlc at a hop whose
+	 * blinding point arrived in update_add_htlc ('mid'), or as a normal
+	 * encrypted error at the introduction node ('intro'). In-memory only: a
+	 * forward interrupted by a restart falls back to an ordinary error.
+	 */
+	private blindedIncomingHtlcs: Map<string, 'intro' | 'mid'> = new Map();
 	private feeEstimator: IFeeEstimator | null = null;
 	private missionControl: MissionControl;
 	/** Leveled diagnostic logger (injectable via INodeConfig.logger; no-op by default). */
@@ -6416,6 +6426,18 @@ export class LightningNode extends EventEmitter {
 				)}: ${(err as Error).message || 'unknown'}`,
 				timestamp: Date.now()
 			} as ILightningError);
+			// BOLT 4 route blinding: an HTLC that arrived with a blinding point is
+			// inside a blinded route, so even an unparseable onion must surface as
+			// invalid_onion_blinding via update_fail_malformed_htlc.
+			if (htlcEntry.blindingPoint) {
+				this.channelManager.failMalformedHtlc(
+					channelId,
+					htlcId,
+					crypto.createHash('sha256').update(onionBuf).digest(),
+					INVALID_ONION_BLINDING
+				);
+				return;
+			}
 			// BOLT 4: INVALID_ONION_HMAC — we can't decrypt, so use a zero shared secret
 			// (the sender will not be able to decrypt this, but it's the best we can do)
 			this.channelManager.failHtlc(
@@ -7267,11 +7289,17 @@ export class LightningNode extends EventEmitter {
 				holdForLsp = !!hopData.holdHtlc;
 				if (hopData.paymentRelay) {
 					const relay = hopData.paymentRelay;
-					const relayFee =
-						BigInt(relay.feeBaseMsat) +
-						(incomingAmountMsat * BigInt(relay.feeProportionalMillionths)) /
-							1_000_000n;
-					blindedOutAmount = incomingAmountMsat - relayFee;
+					// BOLT 4 route blinding: invert the sender's fee computation with
+					// the spec's ceiling formula. Charging the proportional fee on the
+					// INCOMING amount instead forwards a few msat short and the
+					// downstream node fails the HTLC.
+					const propPlusOne =
+						1_000_000n + BigInt(relay.feeProportionalMillionths);
+					blindedOutAmount =
+						((incomingAmountMsat - BigInt(relay.feeBaseMsat)) * 1_000_000n +
+							propPlusOne -
+							1n) /
+						propPlusOne;
 					blindedOutCltv = incomingCltvExpiry - relay.cltvExpiryDelta;
 				}
 				blindedMaxCltv = hopData.paymentConstraints?.maxCltvExpiry;
@@ -7283,13 +7311,44 @@ export class LightningNode extends EventEmitter {
 		const forwardAmount = blindedOutAmount ?? hopPayload.amountToForwardMsat;
 		const forwardCltv = blindedOutCltv ?? hopPayload.outgoingCltvValue;
 
-		if (!outgoingScid) {
+		// BOLT 4 route blinding: remember that this incoming HTLC is part of a
+		// blinded route (and our role in it) so that EVERY failure — local checks
+		// here, addHtlc errors, and downstream failures relayed later — surfaces
+		// as invalid_onion_blinding instead of leaking the real cause.
+		// TLV 12 (current_blinding_point) marks the introduction node and takes
+		// precedence, matching effectiveBlindingPoint above; otherwise the
+		// blinding point arrived in update_add_htlc and we are a mid hop.
+		const inBlindedRole: 'intro' | 'mid' | undefined = effectiveBlindingPoint
+			? hopPayload.blindingPoint
+				? 'intro'
+				: 'mid'
+			: undefined;
+		if (inBlindedRole) {
+			this.blindedIncomingHtlcs.set(inHtlcSecretKey, inBlindedRole);
+		}
+
+		// Fail the incoming HTLC with the given code — or, inside a blinded
+		// route, with invalid_onion_blinding regardless of the local cause.
+		const failIncoming = (failureCode: number): void => {
+			if (inBlindedRole) {
+				this.failBlindedIncomingHtlc(
+					inChannelId,
+					inHtlcId,
+					inBlindedRole,
+					sharedSecret
+				);
+				return;
+			}
 			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
 			this.channelManager.failHtlc(
 				inChannelId,
 				inHtlcId,
-				createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
+				createFailureMessage(sharedSecret, failureCode)
 			);
+		};
+
+		if (!outgoingScid) {
+			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
 
@@ -7299,12 +7358,7 @@ export class LightningNode extends EventEmitter {
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
-				inChannelId,
-				inHtlcId,
-				createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
-			);
+			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
 		const outPolicy = this.getForwardingPolicyForChannel(outChannelId);
@@ -7323,23 +7377,13 @@ export class LightningNode extends EventEmitter {
 				incomingCltvExpiry - forwardCltv < outPolicy.cltvExpiryDelta ||
 				(blindedMaxCltv !== undefined && incomingCltvExpiry > blindedMaxCltv)
 			) {
-				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-				this.channelManager.failHtlc(
-					inChannelId,
-					inHtlcId,
-					createFailureMessage(sharedSecret, INCORRECT_CLTV_EXPIRY)
-				);
+				failIncoming(INCORRECT_CLTV_EXPIRY);
 				return;
 			}
 		} else {
 			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
 			if (incomingCltvExpiry < forwardCltv + outPolicy.cltvExpiryDelta) {
-				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-				this.channelManager.failHtlc(
-					inChannelId,
-					inHtlcId,
-					createFailureMessage(sharedSecret, INCORRECT_CLTV_EXPIRY)
-				);
+				failIncoming(INCORRECT_CLTV_EXPIRY);
 				return;
 			}
 			// Fee enforcement: incoming amount must cover outgoing amount + our fee
@@ -7348,12 +7392,7 @@ export class LightningNode extends EventEmitter {
 				(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
 					1_000_000n;
 			if (incomingAmountMsat < forwardAmount + requiredFee) {
-				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-				this.channelManager.failHtlc(
-					inChannelId,
-					inHtlcId,
-					createFailureMessage(sharedSecret, FEE_INSUFFICIENT)
-				);
+				failIncoming(FEE_INSUFFICIENT);
 				return;
 			}
 		}
@@ -7389,12 +7428,7 @@ export class LightningNode extends EventEmitter {
 			if (!result.ok) {
 				// Forward failed — fail the incoming HTLC back
 				this.forwardedHtlcs.delete(outKey);
-				this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-				this.channelManager.failHtlc(
-					inChannelId,
-					inHtlcId,
-					createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
-				);
+				failIncoming(TEMPORARY_CHANNEL_FAILURE);
 				return;
 			}
 
@@ -7426,12 +7460,7 @@ export class LightningNode extends EventEmitter {
 				},
 				fail: () => {
 					this.heldForwards.delete(hashHex);
-					this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-					this.channelManager.failHtlc(
-						inChannelId,
-						inHtlcId,
-						createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER)
-					);
+					failIncoming(UNKNOWN_NEXT_PEER);
 				}
 			});
 			this.emit('htlc:held-forward', {
@@ -7646,6 +7675,54 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Fail an incoming HTLC that is part of a blinded route (BOLT 4): every
+	 * failure must surface as invalid_onion_blinding with the sha256 of the
+	 * onion we received, so the sender learns nothing about the blinded
+	 * portion. A hop whose blinding point arrived in update_add_htlc ('mid')
+	 * MUST use update_fail_malformed_htlc; the introduction node ('intro')
+	 * returns a normally encrypted failure.
+	 */
+	private failBlindedIncomingHtlc(
+		inChannelId: Buffer,
+		inHtlcId: bigint,
+		role: 'intro' | 'mid',
+		sharedSecret?: Buffer
+	): void {
+		const inHtlcSecretKey = `${inChannelId.toString('hex')}:${inHtlcId}`;
+		const htlcEntry = this.channelManager
+			.getChannel(inChannelId)
+			?.getFullState()
+			.htlcs.get(`received-${inHtlcId}`);
+		const sha256OfOnion = htlcEntry?.onionRoutingPacket
+			? crypto
+					.createHash('sha256')
+					.update(htlcEntry.onionRoutingPacket)
+					.digest()
+			: Buffer.alloc(32);
+		const secret =
+			sharedSecret ?? this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
+		this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+		if (role === 'mid') {
+			this.channelManager.failMalformedHtlc(
+				inChannelId,
+				inHtlcId,
+				sha256OfOnion,
+				INVALID_ONION_BLINDING
+			);
+			return;
+		}
+		this.channelManager.failHtlc(
+			inChannelId,
+			inHtlcId,
+			createFailureMessage(
+				secret ?? Buffer.alloc(32),
+				INVALID_ONION_BLINDING,
+				sha256OfOnion
+			)
+		);
+	}
+
 	private handleHtlcFailed(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -7658,6 +7735,24 @@ export class LightningNode extends EventEmitter {
 			const inHtlcSecretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
 			}`;
+			// BOLT 4 route blinding: a downstream failure of a blinded forward must
+			// NOT be relayed (it would leak the blinded portion); replace it with
+			// invalid_onion_blinding.
+			const blindedRole = this.blindedIncomingHtlcs.get(inHtlcSecretKey);
+			if (blindedRole) {
+				this.failBlindedIncomingHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					blindedRole
+				);
+				this.forwardedHtlcs.delete(outKey);
+				this.safeStorage(
+					() => this.storage!.deleteForwardedHtlc(outKey),
+					'deleteForwardedHtlc'
+				);
+				this.persistChannel(channelId);
+				return;
+			}
 			const inSharedSecret =
 				this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
 			const wrappedReason = inSharedSecret
@@ -8358,6 +8453,11 @@ export class LightningNode extends EventEmitter {
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
+					const blindedRole = this.blindedIncomingHtlcs.get(htlcSecretKey);
+					if (blindedRole) {
+						this.failBlindedIncomingHtlc(channelId, htlc.id, blindedRole);
+						continue;
+					}
 					const htlcSharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = htlcSharedSecret
@@ -8428,6 +8528,12 @@ export class LightningNode extends EventEmitter {
 				if (outgoingFailed) {
 					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
+					const blindedRole = this.blindedIncomingHtlcs.get(htlcSecretKey);
+					if (blindedRole) {
+						this.failBlindedIncomingHtlc(channelId, htlc.id, blindedRole);
+						this.forwardedHtlcs.delete(outKey);
+						continue;
+					}
 					const sharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = sharedSecret
@@ -9623,6 +9729,7 @@ export class LightningNode extends EventEmitter {
 
 	private cleanupHtlcSharedSecret(key: string): void {
 		this.receivedHtlcSharedSecrets.delete(key);
+		this.blindedIncomingHtlcs.delete(key);
 		if (this.storage) {
 			try {
 				this.storage.deleteHtlcSharedSecret(key);
