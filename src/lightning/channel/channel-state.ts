@@ -363,6 +363,15 @@ export interface IChannelState {
 	 */
 	isLessor?: boolean;
 	/**
+	 * Liquidity ads (bLIP-0051): the routing-fee caps the lessor signed into its
+	 * will_fund. While the lease is active the lessor MUST NOT advertise a
+	 * channel_update whose fees exceed these — the buyer paid for capped fees.
+	 * Set on the lessor only. Base is msat; proportional is thousandths (×1000
+	 * to compare against channel_update's fee_proportional_millionths).
+	 */
+	leaseChannelFeeMaxBaseMsat?: number;
+	leaseChannelFeeMaxProportionalThousandths?: number;
+	/**
 	 * Cooperative close: the fully-signed mutual-close transaction (hex) we
 	 * broadcast at fee/sig agreement. Persisted so that on restart, while the
 	 * close is still unconfirmed, restoreChainWatches can rebroadcast it and
