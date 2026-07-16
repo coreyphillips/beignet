@@ -422,6 +422,10 @@ export class LightningNode extends EventEmitter {
 	private rebalanceRunInFlight = false;
 	// BOLT 1 peer storage (option_provide_storage)
 	private peerStorageEnabled: boolean;
+	// The feature set we advertise in init; reused for node_announcement so the
+	// graph reflects what we actually support (e.g. onion messages, route
+	// blinding), which is what peers consult to route offers/onion-messages to us.
+	private localFeatures: FeatureFlags;
 	// option_wumbo (large_channels): lift the 2^24 sat funding cap
 	private largeChannels: boolean;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
@@ -523,6 +527,7 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
+		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
 			localFeatures,
@@ -4800,16 +4805,15 @@ export class LightningNode extends EventEmitter {
 					Math.min(32, Buffer.byteLength(this.alias, 'utf8'))
 				);
 			}
-			// node_announcement features: only large_channels (bit 19) is
-			// meaningful to announce today; it tells remote nodes wumbo fundings
-			// may be proposed to us.
-			const announcedFeatures = FeatureFlags.empty();
-			if (this.largeChannels) {
-				announcedFeatures.setOptional(Feature.LARGE_CHANNELS);
-			}
+			// node_announcement MUST advertise the features we actually support, not
+			// just large_channels: remote nodes make routing decisions (onion-message
+			// relay, route blinding) from the graph, so an almost-empty features
+			// field made CLN/eclair/LDK refuse to route onion messages to us and
+			// left our BOLT 12 offers unreachable to non-direct peers. Reuse the init
+			// feature set (large_channels is already in it when wumbo is enabled).
 			const payload = encodeNodeAnnouncementMessage({
 				signature: Buffer.alloc(64), // placeholder — signed below
-				features: announcedFeatures.toBuffer(),
+				features: this.localFeatures.toBuffer(),
 				timestamp,
 				nodeId,
 				rgbColor: Buffer.from([0, 0, 0]),
