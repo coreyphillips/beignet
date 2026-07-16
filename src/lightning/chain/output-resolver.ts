@@ -33,7 +33,10 @@ import {
 	encodeWitnessSignature
 } from './sweep';
 import { buildToLocalScript } from '../script/commitment';
-import { buildToRemoteAnchorOutput } from '../script/anchor';
+import {
+	buildToRemoteAnchorOutput,
+	leaseExpiryFromToRemoteScript
+} from '../script/anchor';
 import {
 	buildOfferedHtlcScript,
 	buildReceivedHtlcScript,
@@ -631,6 +634,13 @@ function classifyTheirCommitmentOutputs(
 	const ourToRemoteAnchor = isAnchorChannel(state.channelType)
 		? buildToRemoteAnchorOutput(ourPaymentPubkey)
 		: null;
+	// Liquidity ads: when WE are the lessor, our balance on THEIR commitment is
+	// the lease-locked to_remote variant (CLTV until lease expiry). Match it
+	// first; the plain variant stays matched for pre-lease/legacy outputs.
+	const ourToRemoteAnchorLease =
+		ourToRemoteAnchor && state.isLessor && state.leaseExpiry
+			? buildToRemoteAnchorOutput(ourPaymentPubkey, state.leaseExpiry)
+			: null;
 
 	// HTLC keys from their perspective
 	const theirHtlcPubkey = derivePublicKey(
@@ -654,6 +664,24 @@ function classifyTheirCommitmentOutputs(
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
 				witnessScript: toLocalScript
+			});
+			continue;
+		}
+
+		if (
+			ourToRemoteAnchorLease &&
+			outScript.equals(ourToRemoteAnchorLease.script)
+		) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				// The lease-locked witnessScript: the resolver reads the CLTV out
+				// of it to set the sweep's nLockTime.
+				witnessScript: ourToRemoteAnchorLease.witnessScript
 			});
 			continue;
 		}
@@ -742,6 +770,12 @@ function classifyTheirFutureCommitmentOutputs(
 		!taprootToRemote && isAnchorChannel(state.channelType)
 			? buildToRemoteAnchorOutput(ourPaymentPubkey)
 			: null;
+	// Liquidity ads: a lessor's to_remote is the lease-locked variant. The
+	// lease fields ride along in the SCB, so this also works after recovery.
+	const anchorToRemoteLease =
+		anchorToRemote && state.isLessor && state.leaseExpiry
+			? buildToRemoteAnchorOutput(ourPaymentPubkey, state.leaseExpiry)
+			: null;
 	const plainToRemote =
 		!taprootToRemote && !anchorToRemote
 			? bitcoin.payments.p2wpkh({ pubkey: ourPaymentPubkey }).output
@@ -749,11 +783,15 @@ function classifyTheirFutureCommitmentOutputs(
 
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
-		const isOurs = taprootToRemote
-			? outScript.equals(taprootToRemote)
-			: anchorToRemote
-			? outScript.equals(anchorToRemote.script)
-			: !!plainToRemote && outScript.equals(plainToRemote);
+		const isLeased =
+			!!anchorToRemoteLease && outScript.equals(anchorToRemoteLease.script);
+		const isOurs =
+			isLeased ||
+			(taprootToRemote
+				? outScript.equals(taprootToRemote)
+				: anchorToRemote
+				? outScript.equals(anchorToRemote.script)
+				: !!plainToRemote && outScript.equals(plainToRemote));
 		if (!isOurs) continue;
 		outputs.push({
 			txid,
@@ -762,8 +800,11 @@ function classifyTheirFutureCommitmentOutputs(
 			outputType: OutputType.TO_REMOTE,
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0,
-			// witnessScript signals the anchor (CSV-1) variant to the resolver.
-			witnessScript: anchorToRemote?.witnessScript
+			// witnessScript signals the anchor (CSV-1) variant to the resolver;
+			// the lease variant additionally carries the CLTV the sweep must honor.
+			witnessScript: isLeased
+				? anchorToRemoteLease!.witnessScript
+				: anchorToRemote?.witnessScript
 		});
 	}
 
@@ -1874,8 +1915,20 @@ export function resolveTheirCurrentCommitmentOutputs(
 	const resolved: IResolvedOutput[] = [];
 
 	for (const output of trackedOutputs) {
+		// A lease-locked to_remote (liquidity ads, we are the lessor) carries
+		// its CLTV in the witness script; the claim must set nLockTime to it.
+		const toRemoteLeaseExpiry =
+			output.outputType === OutputType.TO_REMOTE && output.witnessScript
+				? leaseExpiryFromToRemoteScript(output.witnessScript)
+				: undefined;
 		const feeSatoshis = BigInt(
-			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
+			Math.ceil(
+				feeRatePerVbyte *
+					estimateSweepVbytes(
+						output.outputType,
+						toRemoteLeaseExpiry !== undefined
+					)
+			)
 		);
 
 		if (output.outputType === OutputType.TO_REMOTE) {
@@ -1892,7 +1945,8 @@ export function resolveTheirCurrentCommitmentOutputs(
 					witnessScript: output.witnessScript,
 					toSelfDelay: 1,
 					destinationScript,
-					feeSatoshis
+					feeSatoshis,
+					leaseExpiry: toRemoteLeaseExpiry
 				});
 
 				const sig = signSweepInput(
@@ -2133,8 +2187,19 @@ export function resolveRevokedCommitmentOutputs(
 			// the funds sat unspent at a channel-specific key (and for anchor
 			// channels the CSV-1 P2WSH needs an explicit script-path spend). Claim
 			// it exactly like the non-revoked remote-commitment path.
+			// A lessor's to_remote is lease-locked (CLTV in the witness script);
+			// the claim must set nLockTime to it even on a revoked commitment.
+			const toRemoteLeaseExpiry = output.witnessScript
+				? leaseExpiryFromToRemoteScript(output.witnessScript)
+				: undefined;
 			const feeSatoshis = BigInt(
-				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
+				Math.ceil(
+					feeRatePerVbyte *
+						estimateSweepVbytes(
+							OutputType.TO_REMOTE,
+							toRemoteLeaseExpiry !== undefined
+						)
+				)
 			);
 			if (output.witnessScript) {
 				// Anchor channel: P2WSH with a 1-block CSV — spend via script path.
@@ -2145,7 +2210,8 @@ export function resolveRevokedCommitmentOutputs(
 					witnessScript: output.witnessScript,
 					toSelfDelay: 1,
 					destinationScript,
-					feeSatoshis
+					feeSatoshis,
+					leaseExpiry: toRemoteLeaseExpiry
 				});
 				const sig = signSweepInput(
 					claimTx,

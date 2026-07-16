@@ -7739,6 +7739,23 @@ export class Channel {
 			];
 		}
 
+		// Likewise anchors-only: the plain P2WPKH to_remote of a non-anchor
+		// channel cannot carry the lease CLTV, so the lessor's balance on the
+		// buyer's commitment would be unencumbered (the S-L.H4 escape).
+		if (
+			!isAnchorChannel(msg.channelType ?? null) &&
+			localParams.willFund &&
+			msg.requestFunds
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
+				}
+			];
+		}
+
 		// Liquidity ads (bLIP-0051): if we (the seller) committed will_fund, the
 		// buyer pays us the lease fee out of its initial balance — shift it from
 		// the buyer (remote) to us (local). Reject if the buyer can't cover it.
@@ -7892,6 +7909,21 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Script-enforced lease is not supported on taproot channels'
+				}
+			];
+		}
+		// Anchors-only for the same reason as handleOpenChannel2: a non-anchor
+		// P2WPKH to_remote cannot carry the lessor's lease CLTV.
+		if (
+			!isAnchorChannel(session.getOpenChannelType() ?? null) &&
+			msg.willFund &&
+			requestFunds
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
 				}
 			];
 		}

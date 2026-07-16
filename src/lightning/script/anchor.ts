@@ -41,17 +41,69 @@ export function buildAnchorScript(fundingPubkey: Buffer): Buffer {
 
 /**
  * Build the to_remote script for anchor channels:
- *   <remotepubkey> OP_CHECKSIGVERIFY 1 OP_CHECKSEQUENCEVERIFY
+ *   <remotepubkey> OP_CHECKSIGVERIFY
+ *   [<lease_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP]   (liquidity-ads lessor only)
+ *   1 OP_CHECKSEQUENCEVERIFY
  *
  * This adds a 1-block CSV delay compared to the non-anchor P2WPKH to_remote.
+ *
+ * When `leaseExpiry` is set (liquidity ads / script-enforced lease), an
+ * absolute CLTV is inserted between the CHECKSIGVERIFY and the 1-block CSV so
+ * the LESSOR cannot sweep its balance from the lessee's commitment before the
+ * lease expires — matching LND's LeaseCommitScriptToRemoteConfirmed. The
+ * spending tx must set nLockTime >= lease_expiry in addition to the CSV.
  */
-export function buildToRemoteAnchorScript(remotePubkey: Buffer): Buffer {
+export function buildToRemoteAnchorScript(
+	remotePubkey: Buffer,
+	leaseExpiry?: number
+): Buffer {
+	const leaseClause: (number | Buffer)[] = [];
+	if (leaseExpiry !== undefined && leaseExpiry > 0) {
+		leaseClause.push(
+			bitcoin.script.number.encode(leaseExpiry),
+			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
+			bitcoin.opcodes.OP_DROP
+		);
+	}
 	return bitcoin.script.compile([
 		remotePubkey,
 		bitcoin.opcodes.OP_CHECKSIGVERIFY,
+		...leaseClause,
 		bitcoin.script.number.encode(1),
 		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY
 	]);
+}
+
+/**
+ * If the witness script is a lease-locked confirmed to_remote
+ * (LeaseCommitScriptToRemoteConfirmed layout above), return its lease-expiry
+ * height; undefined for the plain variant or any other script. Spend paths
+ * derive the required nLockTime from the on-chain script itself so sweeps
+ * work even from restored state that lost the lease fields.
+ */
+export function leaseExpiryFromToRemoteScript(
+	witnessScript: Buffer
+): number | undefined {
+	const chunks = bitcoin.script.decompile(witnessScript);
+	if (!chunks || chunks.length !== 7) return undefined;
+	const [pubkey, checksigverify, expiry, cltv, drop, one, csv] = chunks;
+	if (
+		!Buffer.isBuffer(pubkey) ||
+		pubkey.length !== 33 ||
+		checksigverify !== bitcoin.opcodes.OP_CHECKSIGVERIFY ||
+		!Buffer.isBuffer(expiry) ||
+		cltv !== bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY ||
+		drop !== bitcoin.opcodes.OP_DROP ||
+		one !== bitcoin.opcodes.OP_1 ||
+		csv !== bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY
+	) {
+		return undefined;
+	}
+	try {
+		return bitcoin.script.number.decode(expiry);
+	} catch {
+		return undefined;
+	}
 }
 
 /**
@@ -70,13 +122,17 @@ export function buildAnchorOutput(fundingPubkey: Buffer): {
 }
 
 /**
- * Build the P2WSH output script for a to_remote anchor output.
+ * Build the P2WSH output script for a to_remote anchor output. Pass
+ * `leaseExpiry` for the lease-locked (lessor) variant.
  */
-export function buildToRemoteAnchorOutput(remotePubkey: Buffer): {
+export function buildToRemoteAnchorOutput(
+	remotePubkey: Buffer,
+	leaseExpiry?: number
+): {
 	script: Buffer;
 	witnessScript: Buffer;
 } {
-	const witnessScript = buildToRemoteAnchorScript(remotePubkey);
+	const witnessScript = buildToRemoteAnchorScript(remotePubkey, leaseExpiry);
 	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: witnessScript } });
 	return {
 		script: p2wsh.output!,

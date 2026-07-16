@@ -62,6 +62,11 @@ const RATES: ILeaseRates = {
 	channelFeeMaxProportionalThousandths: 10
 };
 
+// static_remotekey (12) + anchors_zero_fee_htlc_tx (22), both compulsory.
+// Script-enforced leases are anchors-only (the lease CLTV lives in the
+// confirmed P2WSH to_remote), so lease negotiations must propose this type.
+const ANCHOR_CHANNEL_TYPE = Buffer.from('401000', 'hex');
+
 /**
  * Build an acceptor Channel and drive handleOpenChannel2 as the seller, with a
  * buyer request for `requestedSats` at `blockheight` and our own contribution
@@ -131,7 +136,7 @@ function driveSellerOpen(opts: {
 		firstPerCommitmentPoint: buyerKeys.firstPerCommitmentPoint,
 		secondPerCommitmentPoint: getPublicKey(validPriv()),
 		channelFlags: 0,
-		channelType: Buffer.from([0x10]),
+		channelType: ANCHOR_CHANNEL_TYPE,
 		requestFunds: {
 			requestedSats: opts.requestedSats,
 			blockheight: opts.blockheight

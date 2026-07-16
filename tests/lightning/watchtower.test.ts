@@ -31,6 +31,7 @@ import {
 } from '../../src/lightning/message/channel-commitment';
 import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
 import { buildToLocalScript } from '../../src/lightning/script/commitment';
+import { buildToRemoteAnchorScript } from '../../src/lightning/script/anchor';
 import {
 	deriveRevocationPubkey,
 	derivePublicKey,
@@ -576,6 +577,91 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 				sweepFeeRate: 2500n
 			})
 		).to.throw(/to_local output not found/);
+	});
+
+	it('excludes the lessor lease-locked to_remote from the kit (S-L.H4)', function () {
+		// Blob v0 has no lease field: an LND tower rebuilds the PLAIN confirmed
+		// to_remote with locktime 0 and could never spend the CLTV-locked output;
+		// because the client pre-signs over the exact tx the tower assembles,
+		// including it would invalidate the whole kit (to_local penalty too).
+		const built = buildRevokedContext(p2wpkhScript());
+		const leaseExpiry = 804032;
+		// The revoked (buyer) commitment carries OUR lease-locked to_remote.
+		const leaseSpk = bitcoin.payments.p2wsh({
+			redeem: {
+				output: buildToRemoteAnchorScript(
+					built.ctx.localPaymentPubkey!,
+					leaseExpiry
+				)
+			},
+			network
+		}).output!;
+		const plainP2wpkh = bitcoin.payments.p2wpkh({
+			pubkey: built.ctx.localPaymentPubkey!,
+			network
+		}).output!;
+		for (const out of built.ctx.revokedTx.outs) {
+			if (out.script.equals(plainP2wpkh)) out.script = leaseSpk;
+		}
+		const ctx = {
+			...built.ctx,
+			isAnchor: true,
+			isLessor: true,
+			leaseExpiry
+		};
+
+		const backup = buildJusticeBackup(ctx, {
+			blobType: BlobType.ALTRUIST_COMMIT,
+			sweepFeeRate: 2500n
+		});
+		const revokedTxid = Buffer.from(ctx.revokedTx.getId(), 'hex').reverse();
+		const kit = decryptJusticeKitV0(
+			backup.encryptedBlob,
+			breachKeyFromTxid(revokedTxid)
+		);
+		// The kit stands on the to_local penalty alone; no to_remote rides along.
+		expect(kit.commitToRemotePubKey).to.be.undefined;
+		expect(kit.commitToLocalSig).to.have.length(64);
+		expect(Number(backup.sweptSats)).to.be.greaterThan(0);
+		expect(Number(backup.sweptSats)).to.be.lessThan(built.toLocalValue);
+	});
+
+	it('names the blob limitation for a lessee-side lease-locked to_local (S-L.H4)', function () {
+		const built = buildRevokedContext(p2wpkhScript());
+		const leaseExpiry = 804032;
+		// We are the LESSEE: the peer (lessor) commitment's to_local carries the
+		// lease CLTV. Rebuild the revoked tx's to_local as the lease variant.
+		const plainToLocalSpk = bitcoin.payments.p2wsh({
+			redeem: {
+				output: buildToLocalScript(
+					built.revocationPubkey,
+					built.theirDelayed,
+					built.toSelfDelay
+				)
+			},
+			network
+		}).output!;
+		const leaseToLocalSpk = bitcoin.payments.p2wsh({
+			redeem: {
+				output: buildToLocalScript(
+					built.revocationPubkey,
+					built.theirDelayed,
+					built.toSelfDelay,
+					leaseExpiry
+				)
+			},
+			network
+		}).output!;
+		for (const out of built.ctx.revokedTx.outs) {
+			if (out.script.equals(plainToLocalSpk)) out.script = leaseToLocalSpk;
+		}
+		const ctx = { ...built.ctx, isAnchor: true, leaseExpiry };
+		expect(() =>
+			buildJusticeBackup(ctx, {
+				blobType: BlobType.ALTRUIST_COMMIT,
+				sweepFeeRate: 2500n
+			})
+		).to.throw(/lease-locked to_local/);
 	});
 });
 
