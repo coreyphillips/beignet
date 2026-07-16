@@ -123,7 +123,11 @@ import { SpliceSession, SpliceState, ISpliceSessionParams } from './splice';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
-	P2WPKH_DUST_LIMIT
+	P2WPKH_DUST_LIMIT,
+	SPLICE_TX_BASE_WEIGHT,
+	SHARED_FUNDING_INPUT_WEIGHT,
+	P2WPKH_INPUT_WEIGHT,
+	outputWeight
 } from './splice-weight';
 import {
 	buildSpliceTx,
@@ -169,6 +173,7 @@ import {
 	IInteractiveTxOutput,
 	InteractiveTxState
 } from '../interactive-tx/types';
+import { validateCompletedInteractiveTx } from '../interactive-tx/validation';
 
 function getPerCommitmentPoint(seed: Buffer, commitmentNumber: bigint): Buffer {
 	const index = MAX_INDEX - commitmentNumber;
@@ -221,6 +226,24 @@ function computeChannelReserve(
 function extractTxidFromPrevTx(prevTx: Buffer): Buffer {
 	const bitcoin = require('bitcoinjs-lib');
 	return Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash());
+}
+
+/**
+ * Best-effort value (sats) of the output a peer's interactive-tx input spends,
+ * read from its prev_tx bytes. Returns null when prev_tx is absent or
+ * unparseable (strict prev_tx enforcement is tracked separately, S-2.H3).
+ */
+function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
+	if (!input.prevTx || input.prevTx.length === 0) return null;
+	try {
+		const bitcoin = require('bitcoinjs-lib');
+		const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+		const vout = input.prevTxVout ?? input.prevOutputIndex;
+		if (vout < 0 || vout >= prev.outs.length) return null;
+		return BigInt(prev.outs[vout].value);
+	} catch {
+		return null;
+	}
 }
 
 /**
@@ -307,6 +330,17 @@ export class Channel {
 	// v2 channels on peer disconnect), so nothing here must survive a restart.
 	private _v2SentCommitment = false;
 	private _v2ReceivedCommitment = false;
+	/**
+	 * BOLT 2 interactive-tx tx_signatures ordering tie-break: whether OUR
+	 * node_id sorts (lexicographically) below the peer's. Set by the
+	 * ChannelManager (the channel itself never learns node ids); null until
+	 * known, in which case ordering falls back to the non-initiator.
+	 */
+	private _localNodeIdLower: boolean | null = null;
+
+	setLocalNodeIdLower(lower: boolean): void {
+		this._localNodeIdLower = lower;
+	}
 	/** Witnesses provided by the caller before the ordering allowed sending. */
 	private _v2PendingTxSigs: {
 		txid: Buffer;
@@ -6844,17 +6878,45 @@ export class Channel {
 	}
 
 	/**
-	 * tx_signatures ordering (BOLT 2 interactive-tx): the peer with less input value
-	 * sends first. The splice initiator contributes the shared input (100% of prior
-	 * capacity), so it sends tx_signatures LAST — only in response to the peer's.
-	 * The acceptor sends first, once the commitment round is complete.
+	 * tx_signatures ordering (BOLT 2 interactive-tx): the peer with less input
+	 * value sends first; on a tie the lower node_id sends first (S-2.M5). The
+	 * splice initiator contributes the shared input (100% of prior capacity),
+	 * so it USUALLY has more input value and sends last — but an acceptor
+	 * splicing in more than the prior capacity contributes more, and
+	 * hard-coding acceptor-first there deadlocks against a spec-compliant
+	 * peer (both sides wait).
 	 */
+	private _spliceShouldSignFirst(): boolean {
+		const session = this._spliceSession;
+		if (!session) return false;
+		const builder = session.getTxBuilder();
+		// No builder (e.g. a restored post-negotiation session): fall back to
+		// the previous acceptor-first convention.
+		if (!builder) return !session.isInitiator();
+		let ours = 0n;
+		let theirs = 0n;
+		for (const input of builder.getInputs()) {
+			const isOurs = (input.serialId % 2n === 0n) === session.isInitiator();
+			const isShared = !input.prevTx || input.prevTx.length === 0;
+			// The shared funding input is contributed by the initiator and is
+			// worth the pre-splice capacity.
+			const value = isShared
+				? this._state.fundingSatoshis
+				: interactiveInputValueSats(input);
+			if (value === null) return !session.isInitiator();
+			if (isShared ? session.isInitiator() : isOurs) ours += value;
+			else theirs += value;
+		}
+		if (ours !== theirs) return ours < theirs;
+		return this._localNodeIdLower ?? !session.isInitiator();
+	}
+
 	private _maybeSendSpliceTxSigsOrdered(): ChannelAction[] {
 		const session = this._spliceSession;
 		if (!session) return [];
 		if (!this._spliceSentCommitment || !this._spliceReceivedCommitment)
 			return [];
-		if (session.isInitiator()) return []; // initiator waits for the peer's tx_signatures
+		if (!this._spliceShouldSignFirst()) return []; // wait for the peer's tx_signatures
 		return this._maybeSendSpliceTxSigs();
 	}
 
@@ -7941,9 +8003,20 @@ export class Channel {
 			];
 		}
 
+		// Extract the real prevout txid: leaving it zeroed made every peer input
+		// share the same prevout key, so checkDuplicatePrevouts collapsed two
+		// distinct inputs with the same vout into a "duplicate" (S-2.H4).
+		let prevTxid = Buffer.alloc(32);
+		if (msg.prevTx && msg.prevTx.length >= 32) {
+			try {
+				prevTxid = extractTxidFromPrevTx(msg.prevTx);
+			} catch {
+				// Unparseable prev_tx: keep zeros (strict enforcement is S-2.H3).
+			}
+		}
 		const input: IInteractiveTxInput = {
 			serialId: msg.serialId,
-			prevTxid: Buffer.alloc(32), // extracted from prevTx
+			prevTxid,
 			prevOutputIndex: msg.prevTxVout,
 			sequence: msg.sequence,
 			prevTx: msg.prevTx,
@@ -8002,6 +8075,14 @@ export class Channel {
 	 */
 	handleTxAddOutput(msg: ITxAddOutputMessage): ChannelAction[] {
 		if (this._spliceTxNegotiationActive()) {
+			// Peer outputs must respect the negotiated dust floor, not a flat 546:
+			// both sides' commitment dust limits are known on an active channel.
+			this._spliceSession!.getTxBuilder()?.setDustLimit(
+				this._state.localConfig.dustLimitSatoshis >
+					this._state.remoteConfig.dustLimitSatoshis
+					? this._state.localConfig.dustLimitSatoshis
+					: this._state.remoteConfig.dustLimitSatoshis
+			);
 			const output: IInteractiveTxOutput = {
 				serialId: msg.serialId,
 				amountSats: msg.amountSats,
@@ -8020,6 +8101,15 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: 'Unexpected tx_add_output' }
 			];
 		}
+
+		// Negotiated dust floor from open_channel2/accept_channel2.
+		const localDust = session.getLocalParams()?.dustLimitSatoshis ?? 0n;
+		const remoteDust = session.isInitiator()
+			? session.getAcceptMsg()?.dustLimitSatoshis ?? 0n
+			: session.getOpenMsg()?.dustLimitSatoshis ?? 0n;
+		session
+			.getTxBuilder()
+			?.setDustLimit(localDust > remoteDust ? localDust : remoteDust);
 
 		const output: IInteractiveTxOutput = {
 			serialId: msg.serialId,
@@ -8201,6 +8291,11 @@ export class Channel {
 
 		// If both sides are now complete, move to AWAITING_TX_SIGNATURES
 		if (session.getState() === DualFundingState.AWAITING_TX_SIGNATURES) {
+			// Audit the negotiated tx before signing anything for it (S-2.M4).
+			const invalid = this._validateNegotiatedInteractiveTx('v2');
+			if (invalid) {
+				return [{ type: ChannelActionType.ERROR, message: invalid }];
+			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 		}
 
@@ -8232,7 +8327,18 @@ export class Channel {
 			// moves to AWAITING_TX_SIGNATURES, at which point we build the splice tx
 			// and send commitment_signed for the new outpoint (BOLT 2 splicing: the
 			// commitment_signed round precedes tx_signatures).
-			return [...this._driveSplice(), ...this._maybeSendSpliceCommitment()];
+			const driveActions = this._driveSplice();
+			if (
+				this._spliceSession!.getState() === SpliceState.AWAITING_TX_SIGNATURES
+			) {
+				// Both sides complete: audit the negotiated tx before signing
+				// anything for it (S-2.M4).
+				const invalid = this._validateNegotiatedInteractiveTx('splice');
+				if (invalid) {
+					return [{ type: ChannelActionType.ERROR, message: invalid }];
+				}
+			}
+			return [...driveActions, ...this._maybeSendSpliceCommitment()];
 		}
 
 		const session = this._state.dualFundingSession;
@@ -8256,6 +8362,11 @@ export class Channel {
 		// start the commitment_signed exchange (BOLT 2 v2: it precedes
 		// tx_signatures).
 		if (session.getState() === DualFundingState.AWAITING_TX_SIGNATURES) {
+			// Audit the negotiated tx before signing anything for it (S-2.M4).
+			const invalid = this._validateNegotiatedInteractiveTx('v2');
+			if (invalid) {
+				return [{ type: ChannelActionType.ERROR, message: invalid }];
+			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 			return this._maybeSendV2Commitment();
 		}
@@ -8282,6 +8393,120 @@ export class Channel {
 	 */
 	private _v2ChannelId(): Buffer {
 		return this._state.channelId ?? this._state.temporaryChannelId;
+	}
+
+	/**
+	 * BOLT 2 receive-side checks on a fully negotiated interactive tx (v2
+	 * funding or splice), run when the negotiation completes: standardness
+	 * weight cap, and — when every input's value is known from its prev_tx —
+	 * that the peer's inputs cover its outputs plus its positive contribution
+	 * and that the paid fee meets the negotiated feerate (S-2.M4). The shared
+	 * splice input (no prev_tx; worth the pre-splice capacity) belongs to the
+	 * splice initiator; the shared funding output belongs to whoever added it.
+	 * Inputs with unparseable prev_tx skip the funds/fee checks (their strict
+	 * enforcement is S-2.H3).
+	 */
+	private _validateNegotiatedInteractiveTx(
+		kind: 'v2' | 'splice'
+	): string | null {
+		let inputs: IInteractiveTxInput[];
+		let outputs: IInteractiveTxOutput[];
+		let weAreInitiator: boolean;
+		let remoteContributionSats: bigint;
+		let feeratePerKw: number;
+		if (kind === 'splice') {
+			const session = this._spliceSession;
+			const builder = session?.getTxBuilder();
+			if (!session || !builder) return null;
+			inputs = builder.getInputs();
+			outputs = builder.getOutputs();
+			weAreInitiator = session.isInitiator();
+			remoteContributionSats = session.getRemoteRelativeSatoshis();
+			feeratePerKw = session.getFundingFeeratePerkw();
+		} else {
+			const session = this._state.dualFundingSession;
+			const builder = session?.getTxBuilder();
+			if (!session || !builder) return null;
+			inputs = builder.getInputs();
+			outputs = builder.getOutputs();
+			weAreInitiator = session.isInitiator();
+			remoteContributionSats = session.getRemoteFundingSatoshis();
+			feeratePerKw =
+				session.getLocalParams()?.fundingFeeratePerkw ??
+				session.getOpenMsg()?.fundingFeeratePerkw ??
+				0;
+		}
+
+		// The shared 2-of-2 funding output (the one paying the new/negotiated
+		// funding script) is excluded from per-side output sums: each side's
+		// stake in it is its contribution.
+		let fundingScript: Buffer | null = null;
+		if (this._state.remoteBasepoints) {
+			try {
+				const { createFundingScript } = require('../script/funding');
+				const localPub =
+					kind === 'splice'
+						? this._spliceSession!.getLocalFundingPubkey()
+						: this._state.localBasepoints.fundingPubkey;
+				const remotePub =
+					kind === 'splice'
+						? this._spliceSession!.getRemoteFundingPubkey() ??
+						  this._state.remoteBasepoints.fundingPubkey
+						: this._state.remoteBasepoints.fundingPubkey;
+				fundingScript = createFundingScript(localPub, remotePub).p2wshOutput;
+			} catch {
+				fundingScript = null;
+			}
+		}
+
+		let weight = SPLICE_TX_BASE_WEIGHT;
+		let remoteInputSats = 0n;
+		let remoteOutputSats = 0n;
+		let totalInSats = 0n;
+		let totalOutSats = 0n;
+		let valuesKnown = true;
+		for (const input of inputs) {
+			const remoteOwned = (input.serialId % 2n === 0n) !== weAreInitiator;
+			const isShared =
+				kind === 'splice' && (!input.prevTx || input.prevTx.length === 0);
+			weight += isShared ? SHARED_FUNDING_INPUT_WEIGHT : P2WPKH_INPUT_WEIGHT;
+			if (isShared) {
+				// Pre-splice capacity rolls over; it is nobody's new contribution.
+				totalInSats += this._state.fundingSatoshis;
+				continue;
+			}
+			const value = interactiveInputValueSats(input);
+			if (value === null) {
+				valuesKnown = false;
+				continue;
+			}
+			totalInSats += value;
+			if (remoteOwned) remoteInputSats += value;
+		}
+		for (const output of outputs) {
+			const remoteOwned = (output.serialId % 2n === 0n) !== weAreInitiator;
+			const isShared =
+				fundingScript !== null && output.scriptPubkey.equals(fundingScript);
+			weight += outputWeight(output.scriptPubkey.length);
+			totalOutSats += output.amountSats;
+			if (remoteOwned && !isShared) remoteOutputSats += output.amountSats;
+		}
+
+		if (!valuesKnown) {
+			// Cannot audit funds/fees without input values; still enforce weight.
+			return weight > 400_000
+				? `Transaction weight ${weight} exceeds 400000 WU`
+				: null;
+		}
+
+		return validateCompletedInteractiveTx({
+			remoteInputSats,
+			remoteOutputSats,
+			remoteContributionSats,
+			feeSats: totalInSats - totalOutSats,
+			weight,
+			feeratePerKw
+		});
 	}
 
 	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
@@ -8448,32 +8673,22 @@ export class Channel {
 
 	/**
 	 * BOLT 2 interactive-tx ordering: the peer whose inputs contribute less
-	 * total value sends tx_signatures first (the spec tie-break is the lowest
-	 * node_id, which the channel does not know — fall back to the
-	 * non-initiator, matching the splice convention: deterministic and
-	 * symmetric between beignet peers).
+	 * total value sends tx_signatures first; on an exact tie the lower node_id
+	 * signs first (S-2.M5). The node-id ordering is provided by the
+	 * ChannelManager; if it is somehow unknown, fall back to the
+	 * non-initiator (deterministic and symmetric between beignet peers).
 	 */
 	private _v2ShouldSignFirst(): boolean {
 		const session = this._state.dualFundingSession;
 		if (!session) return false;
 		const builder = session.getTxBuilder();
 		if (!builder) return !session.isInitiator();
-		const bitcoin = require('bitcoinjs-lib');
 		let ours = 0n;
 		let theirs = 0n;
 		for (const input of builder.getInputs()) {
 			// Even serial ids belong to the initiator.
 			const isOurs = (input.serialId % 2n === 0n) === session.isInitiator();
-			let value: bigint | null = null;
-			if (input.prevTx && input.prevTx.length > 0) {
-				try {
-					const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
-					const vout = input.prevTxVout ?? input.prevOutputIndex;
-					value = BigInt(prev.outs[vout].value);
-				} catch {
-					value = null;
-				}
-			}
+			const value = interactiveInputValueSats(input);
 			if (value === null) {
 				// Unknown input value — cannot apply the spec rule.
 				return !session.isInitiator();
@@ -8482,7 +8697,7 @@ export class Channel {
 			else theirs += value;
 		}
 		if (ours !== theirs) return ours < theirs;
-		return !session.isInitiator();
+		return this._localNodeIdLower ?? !session.isInitiator();
 	}
 
 	/**

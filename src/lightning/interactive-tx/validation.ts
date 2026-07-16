@@ -13,6 +13,14 @@ import { IInteractiveTxInput, IInteractiveTxOutput } from './types';
 
 const DUST_LIMIT_SATS = 546n;
 
+/** BOLT 2 interactive-tx: each peer may add at most 252 inputs / 252 outputs. */
+export const MAX_INTERACTIVE_TX_INPUTS = 252;
+export const MAX_INTERACTIVE_TX_OUTPUTS = 252;
+/** Consensus money cap: 21M BTC in satoshis. */
+export const MAX_MONEY_SATS = 2_100_000_000_000_000n;
+/** Standardness cap: a heavier tx will not relay, stranding the channel. */
+export const MAX_STANDARD_TX_WEIGHT = 400_000;
+
 /**
  * Validate serial ID parity.
  * Initiator must use even serial IDs, acceptor must use odd.
@@ -61,14 +69,21 @@ export function checkDuplicatePrevouts(
 }
 
 /**
- * Check that all outputs meet dust limit.
+ * Check that all outputs meet the dust limit (the negotiated limit when
+ * known; never below the 546-sat floor) and the consensus money cap.
  */
 export function checkDustOutputs(
-	outputs: IInteractiveTxOutput[]
+	outputs: IInteractiveTxOutput[],
+	dustLimitSats: bigint = DUST_LIMIT_SATS
 ): string | null {
+	const dust =
+		dustLimitSats > DUST_LIMIT_SATS ? dustLimitSats : DUST_LIMIT_SATS;
 	for (const output of outputs) {
-		if (output.amountSats < DUST_LIMIT_SATS) {
-			return `Output amount ${output.amountSats} below dust limit ${DUST_LIMIT_SATS}`;
+		if (output.amountSats < dust) {
+			return `Output amount ${output.amountSats} below dust limit ${dust}`;
+		}
+		if (output.amountSats > MAX_MONEY_SATS) {
+			return `Output amount ${output.amountSats} exceeds MAX_MONEY`;
 		}
 	}
 	return null;
@@ -79,7 +94,8 @@ export function checkDustOutputs(
  */
 export function validateInteractiveTx(
 	inputs: IInteractiveTxInput[],
-	outputs: IInteractiveTxOutput[]
+	outputs: IInteractiveTxOutput[],
+	dustLimitSats?: bigint
 ): string | null {
 	if (inputs.length === 0) {
 		return 'Transaction must have at least one input';
@@ -87,14 +103,60 @@ export function validateInteractiveTx(
 	if (outputs.length === 0) {
 		return 'Transaction must have at least one output';
 	}
+	if (inputs.length > MAX_INTERACTIVE_TX_INPUTS * 2) {
+		return `Transaction has ${inputs.length} inputs, above the interactive-tx cap`;
+	}
+	if (outputs.length > MAX_INTERACTIVE_TX_OUTPUTS * 2) {
+		return `Transaction has ${outputs.length} outputs, above the interactive-tx cap`;
+	}
 
 	const dupError = checkDuplicatePrevouts(inputs);
 	if (dupError) return dupError;
 
-	const dustError = checkDustOutputs(outputs);
+	const dustError = checkDustOutputs(outputs, dustLimitSats);
 	if (dustError) return dustError;
 
 	return null;
+}
+
+/**
+ * Per-peer completion checks for a negotiated interactive tx (BOLT 2, on
+ * tx_complete): each side's inputs must cover its outputs plus its positive
+ * channel contribution, the paid fee must meet the negotiated feerate, and
+ * the transaction must stay under the 400k-WU standardness cap. The shared
+ * splice input/output are excluded from the per-side sums by the caller
+ * (their net effect is each side's contribution).
+ */
+export function validateCompletedInteractiveTx(opts: {
+	/** Peer's non-shared input total (sats). */
+	remoteInputSats: bigint;
+	/** Peer's non-shared output total (sats). */
+	remoteOutputSats: bigint;
+	/**
+	 * Peer's SIGNED channel contribution (v2 funding sats, or splice relative
+	 * sats). A negative contribution (splice-out) funds the peer's destination
+	 * output from the shared output rather than from its inputs.
+	 */
+	remoteContributionSats: bigint;
+	/** Full transaction fee: all inputs minus all outputs, shared included. */
+	feeSats: bigint;
+	/** Estimated transaction weight in WU. */
+	weight: number;
+	/** Negotiated funding feerate (sat/kw). */
+	feeratePerKw: number;
+}): string | null {
+	if (opts.weight > MAX_STANDARD_TX_WEIGHT) {
+		return `Transaction weight ${opts.weight} exceeds ${MAX_STANDARD_TX_WEIGHT} WU`;
+	}
+	const owed = opts.remoteOutputSats + opts.remoteContributionSats;
+	const remoteOwes = owed > 0n ? owed : 0n;
+	if (opts.remoteInputSats < remoteOwes) {
+		return `Peer inputs ${opts.remoteInputSats} sats do not cover its outputs and contribution ${remoteOwes} sats`;
+	}
+	if (opts.feeSats < 0n) {
+		return 'Negotiated transaction outputs exceed its inputs';
+	}
+	return checkFeeSufficiency(opts.feeSats, opts.weight, opts.feeratePerKw);
 }
 
 /**

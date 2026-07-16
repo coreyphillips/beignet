@@ -260,6 +260,8 @@ export class ChannelManager extends EventEmitter {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	/** Cached local node id (pubkey) for the tx_signatures ordering tie-break. */
+	private localNodeIdCache: Buffer | null = null;
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -3817,6 +3819,17 @@ export class ChannelManager extends EventEmitter {
 		channel: Channel,
 		actions: ChannelAction[]
 	): void {
+		// Keep the channel's node-id ordering current (BOLT 2 interactive-tx
+		// tx_signatures tie-break): the channel itself never learns node ids.
+		if (this.config.nodePrivateKey) {
+			if (!this.localNodeIdCache) {
+				this.localNodeIdCache = getPublicKey(this.config.nodePrivateKey);
+			}
+			channel.setLocalNodeIdLower(
+				Buffer.compare(this.localNodeIdCache, Buffer.from(peerPubkey, 'hex')) <
+					0
+			);
+		}
 		for (const action of actions) {
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
