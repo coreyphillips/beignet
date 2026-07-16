@@ -25,6 +25,18 @@ import {
 } from '../onion/blinded-path';
 
 /**
+ * BOLT 11 exact data_lengths (in 5-bit words) for the fixed-length tagged
+ * fields: p/h/s are 52 words (256 bits + padding), n is 53 words (264 bits).
+ * A field of any other length MUST be skipped, not truncated.
+ */
+const FIXED_LENGTH_TAG_WORDS: Partial<Record<TagType, number>> = {
+	[TagType.PAYMENT_HASH]: 52,
+	[TagType.PAYMENT_SECRET]: 52,
+	[TagType.DESCRIPTION_HASH]: 52,
+	[TagType.PAYEE_PUBKEY]: 53
+};
+
+/**
  * Decode a BOLT 11 invoice string into a structured object.
  */
 export function decode(invoiceString: string): IInvoice {
@@ -79,6 +91,19 @@ export function decode(invoiceString: string): IInvoice {
 		const field = decodeTaggedField(taggedWords, offset);
 		offset = field.nextOffset;
 
+		// BOLT 11: a reader MUST skip over p, h, s or n fields that do not have
+		// data_lengths of 52, 52, 52 or 53 respectively. Truncating an over-length
+		// field instead would yield a wrong payment hash / secret / payee that we
+		// would then try to pay.
+		const expectedWords = FIXED_LENGTH_TAG_WORDS[field.type];
+		if (
+			expectedWords !== undefined &&
+			field.dataWords.length !== expectedWords
+		) {
+			unknownTags.push({ type: field.type, words: field.dataWords });
+			continue;
+		}
+
 		switch (field.type) {
 			case TagType.PAYMENT_HASH:
 				result.paymentHash = decodeFixedLengthHash(field.dataWords, 32);
@@ -127,6 +152,15 @@ export function decode(invoiceString: string): IInvoice {
 	// Validate: payment_hash is required
 	if (!result.paymentHash) {
 		throw new Error('Invoice missing required payment_hash (tag 1)');
+	}
+
+	// BOLT 11: when an `n` field is present the reader MUST use it to validate
+	// the signature (equivalently: the recovered key must BE `n`). Otherwise a
+	// signature by anyone routes a payment to the claimed payee.
+	if (result.payeeNodeKey && !result.payeeNodeKey.equals(recoveredPubkey)) {
+		throw new Error(
+			'Invoice signature does not match the payee node id (n field)'
+		);
 	}
 
 	// Validate: must have exactly one of description or description_hash

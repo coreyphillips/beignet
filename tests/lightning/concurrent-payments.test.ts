@@ -157,6 +157,13 @@ function makeInvoice(
 ): string {
 	const paymentHash = crypto.randomBytes(32);
 	const paymentSecret = crypto.randomBytes(32);
+	// Sign with the payee's actual node identity key: the decoder rejects an
+	// invoice whose n field does not match the signing key (BOLT 11).
+	const payeeNodePrivkey = crypto
+		.createHash('sha256')
+		.update(payeeSeed)
+		.update(Buffer.from('node-identity'))
+		.digest();
 	return encodeInvoice({
 		network: Network.REGTEST,
 		paymentHash,
@@ -166,7 +173,7 @@ function makeInvoice(
 		minFinalCltvExpiry: 40,
 		amountMsat,
 		payeeNodeKey: payeeKey,
-		privateKey: payeeSeed
+		privateKey: payeeNodePrivkey
 	});
 }
 
