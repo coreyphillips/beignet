@@ -32,7 +32,10 @@ import {
 	ChannelRole,
 	HtlcState,
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	TESTNET_CHAIN_HASH,
+	REGTEST_CHAIN_HASH,
+	SIGNET_CHAIN_HASH
 } from '../channel/types';
 import { PeerManager, IPeerInfo } from '../transport/peer-manager';
 import { IPeerTransportOptions } from '../transport/duplex-transport';
@@ -2249,6 +2252,20 @@ export class LightningNode extends EventEmitter {
 		if (this.network === Network.MAINNET) return bitcoin.networks.bitcoin;
 		if (this.network === Network.REGTEST) return bitcoin.networks.regtest;
 		return bitcoin.networks.testnet;
+	}
+
+	/** The BOLT chain_hash for the node's configured network. */
+	private chainHash(): Buffer {
+		switch (this.network) {
+			case Network.MAINNET:
+				return BITCOIN_CHAIN_HASH;
+			case Network.TESTNET:
+				return TESTNET_CHAIN_HASH;
+			case Network.SIGNET:
+				return SIGNET_CHAIN_HASH;
+			default:
+				return REGTEST_CHAIN_HASH;
+		}
 	}
 
 	/** Construct the watchtower client and wire its structured logs. */
@@ -5299,7 +5316,7 @@ export class LightningNode extends EventEmitter {
 	private getOrCreateSyncManager(pubkey: string): GossipSyncManager {
 		let mgr = this.gossipSyncManagers.get(pubkey);
 		if (!mgr) {
-			mgr = new GossipSyncManager(this.graph);
+			mgr = new GossipSyncManager(this.graph, this.chainHash());
 			this.gossipSyncManagers.set(pubkey, mgr);
 		}
 		return mgr;

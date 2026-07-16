@@ -216,3 +216,9 @@ export const SIGNET_CHAIN_HASH = Buffer.from(
 	'f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000',
 	'hex'
 );
+
+/** Bitcoin testnet3 chain hash (genesis hash, internal byte order) */
+export const TESTNET_CHAIN_HASH = Buffer.from(
+	'43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000',
+	'hex'
+);

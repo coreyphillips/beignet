@@ -33,7 +33,10 @@ import {
 	GossipSyncState
 } from '../../src/lightning/gossip/gossip-sync';
 import { MessageType } from '../../src/lightning/message/types';
-import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
+import {
+	BITCOIN_CHAIN_HASH,
+	REGTEST_CHAIN_HASH
+} from '../../src/lightning/channel/types';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Feature } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -308,6 +311,33 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(() =>
 				decodeGossipTimestampFilterMessage(Buffer.alloc(10))
 			).to.throw('too short');
+		});
+	});
+
+	describe('chain_hash handling (S-7.M1)', function () {
+		it('reply_channel_range echoes the query chain_hash', function () {
+			const graph = new NetworkGraph();
+			const mgr = new GossipSyncManager(graph, REGTEST_CHAIN_HASH);
+			const reply = mgr.handleQueryChannelRange({
+				chainHash: REGTEST_CHAIN_HASH,
+				firstBlocknum: 0,
+				numberOfBlocks: 0xffffffff
+			});
+			const decoded = decodeReplyChannelRangeMessage(reply[0].payload);
+			expect(decoded.chainHash.equals(REGTEST_CHAIN_HASH)).to.be.true;
+		});
+
+		it('outbound queries carry the manager chain_hash, not mainnet', function () {
+			const graph = new NetworkGraph();
+			const mgr = new GossipSyncManager(graph, REGTEST_CHAIN_HASH);
+			const out = mgr.initiateSync();
+			// Both gossip_timestamp_filter and query_channel_range start with the
+			// chain_hash; it must be regtest, not the hardcoded mainnet.
+			for (const m of out) {
+				expect(m.payload.subarray(0, 32).equals(REGTEST_CHAIN_HASH)).to.be.true;
+				expect(m.payload.subarray(0, 32).equals(BITCOIN_CHAIN_HASH)).to.be
+					.false;
+			}
 		});
 	});
 
