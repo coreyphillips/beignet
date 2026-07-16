@@ -29,6 +29,7 @@ import {
 	resolveRevokedSecondLevelOutput
 } from './output-resolver';
 import { estimateSweepVbytes } from './sweep';
+import { leaseExpiryFromToRemoteScript } from '../script/anchor';
 import { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
@@ -590,7 +591,13 @@ export class ChainMonitor {
 							this._feeRatePerVbyte
 						)
 					);
-					const vbytes = estimateSweepVbytes(output.outputType);
+					const vbytes = estimateSweepVbytes(
+						output.outputType,
+						// Lease-locked to_remote (liquidity ads): CLTV clause adds ~2 vb.
+						output.outputType === OutputType.TO_REMOTE &&
+							!!output.witnessScript &&
+							leaseExpiryFromToRemoteScript(output.witnessScript) !== undefined
+					);
 					const feeSatoshis = BigInt(Math.ceil(bumpedRate * vbytes));
 
 					if (output.amount > feeSatoshis) {

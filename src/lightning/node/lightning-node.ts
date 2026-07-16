@@ -2129,7 +2129,14 @@ export class LightningNode extends EventEmitter {
 				channelType: state.channelType ? state.channelType.toString('hex') : '',
 				role: state.role === ChannelRole.OPENER ? 'OPENER' : 'ACCEPTOR',
 				isTaproot: isTaprootChannel(state.channelType),
-				isAnchor: isAnchorChannel(state.channelType)
+				isAnchor: isAnchorChannel(state.channelType),
+				// Liquidity ads: a lessor's to_remote is the lease-locked variant;
+				// recovery needs these to find and sweep it. Omitted when unset so
+				// non-lease backups stay byte-identical.
+				...(state.leaseExpiry !== undefined
+					? { leaseExpiry: state.leaseExpiry }
+					: {}),
+				...(state.isLessor !== undefined ? { isLessor: state.isLessor } : {})
 			});
 		}
 		return { network: this.network, channels };
@@ -2208,6 +2215,10 @@ export class LightningNode extends EventEmitter {
 			state.channelType = entry.channelType
 				? Buffer.from(entry.channelType, 'hex')
 				: null;
+			// Liquidity ads: restore the lease fields so the DLP classifier builds
+			// the lease-locked to_remote variant and the sweep sets its nLockTime.
+			state.leaseExpiry = entry.leaseExpiry;
+			state.isLessor = entry.isLessor;
 			state.localCommitmentNumber = 0n;
 			state.remoteCommitmentNumber = 0n;
 			// Balances are unknown after data loss; the sweep takes its amount from
@@ -2402,7 +2413,11 @@ export class LightningNode extends EventEmitter {
 				localPaymentPubkey: state.localBasepoints.paymentBasepoint,
 				paymentBasepointSecret,
 				sweepScript: this.getSweepDestinationScript(),
-				network: btcNetwork
+				network: btcNetwork,
+				// Liquidity ads: lets the kit builder exclude the lease-locked
+				// to_remote (lessor) / name the lessee-side blob limitation.
+				isLessor: state.isLessor,
+				leaseExpiry: state.leaseExpiry
 			};
 			client.backupRevokedState(ctx);
 		} catch (err) {

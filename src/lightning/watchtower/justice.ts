@@ -97,6 +97,14 @@ export interface IJusticeContext {
 	/** Witness program we sweep breached funds into (<= 42 bytes). */
 	sweepScript: Buffer;
 	network: bitcoin.Network;
+	/**
+	 * Liquidity ads: set when the channel carries a script-enforced lease.
+	 * The blob v0 format has no lease field — LND towers rebuild the PLAIN
+	 * scripts with locktime 0 — so lease-locked outputs cannot ride in the
+	 * kit (see buildJusticeBackupV0).
+	 */
+	isLessor?: boolean;
+	leaseExpiry?: number;
 }
 
 /** Negotiated per-session parameters that shape the justice transaction. */
@@ -158,6 +166,28 @@ function buildJusticeBackupV0(
 
 	const toLocalIndex = findOutput(ctx.revokedTx, toLocalSpk);
 	if (toLocalIndex < 0) {
+		// Lessee side of a leased channel: the peer (lessor) commitment's
+		// to_local carries a lease CLTV the blob v0 format cannot express (only
+		// csvDelay travels; an LND tower rebuilds the plain script). Name the
+		// limitation instead of a generic mismatch.
+		if (ctx.leaseExpiry && !ctx.isLessor) {
+			const leaseToLocalSpk = bitcoin.payments.p2wsh({
+				redeem: {
+					output: buildToLocalScript(
+						keys.revocationPubkey,
+						keys.theirDelayedPubkey,
+						ctx.toSelfDelay,
+						ctx.leaseExpiry
+					)
+				},
+				network: ctx.network
+			}).output!;
+			if (findOutput(ctx.revokedTx, leaseToLocalSpk) >= 0) {
+				throw new Error(
+					`watchtower: blob v0 cannot express the lease-locked to_local of leased channel ${ctx.channelId} (LND towers rebuild the plain script); tower protection is unavailable for the lessee side of a leased channel`
+				);
+			}
+		}
 		throw new Error(
 			`watchtower: to_local output not found on revoked commitment ${ctx.channelId}`
 		);
@@ -180,9 +210,28 @@ function buildJusticeBackupV0(
 	// (CommitScriptToRemoteConfirmed) spent with sequence 1. Include it so a
 	// tower sweeps everything in one transaction; the to_local penalty still
 	// stands alone when we don't hold a to_remote output.
+	//
+	// EXCEPTION — lessor's lease-locked to_remote: blob v0 has no lease field,
+	// so an LND-format tower rebuilds the PLAIN confirmed script with
+	// locktime 0 and could never locate/spend the CLTV-locked output. Because
+	// the client pre-signs SIGHASH_ALL over the exact tx the tower assembles,
+	// including it would make the tower build a DIFFERENT tx and invalidate
+	// the to_local penalty signature too — bricking the entire kit. Skip it:
+	// the to_local penalty (whose revocation branch has no CLTV) still
+	// punishes the breach, and our own chain monitor sweeps the lease-locked
+	// to_remote after expiry via the lease-aware output resolver.
 	let toRemotePubkey: Buffer | undefined;
 	let toRemoteIndex = -1;
-	if (ctx.localPaymentPubkey && ctx.paymentBasepointSecret) {
+	const leaseLockedToRemote = !!(
+		ctx.isAnchor &&
+		ctx.isLessor &&
+		ctx.leaseExpiry
+	);
+	if (
+		!leaseLockedToRemote &&
+		ctx.localPaymentPubkey &&
+		ctx.paymentBasepointSecret
+	) {
 		const toRemoteSpk = ctx.isAnchor
 			? bitcoin.payments.p2wsh({
 					redeem: {
