@@ -101,6 +101,7 @@ import {
 	KEYSEND_TLV_TYPE,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 	FINAL_INCORRECT_CLTV_EXPIRY,
+	FINAL_INCORRECT_HTLC_AMOUNT,
 	INVALID_ONION_HMAC,
 	UNKNOWN_NEXT_PEER,
 	INCORRECT_CLTV_EXPIRY,
@@ -6467,6 +6468,76 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * BOLT 4 final-node safety checks common to every terminating HTLC (keysend
+	 * and invoice), run before any preimage is revealed. Returns a failure reason
+	 * buffer if the HTLC must be failed, or null if it is safe to proceed.
+	 */
+	private finalHopSafetyFailure(
+		sharedSecret: Buffer | undefined,
+		hopPayload: IHopPayload | undefined,
+		incomingCltvExpiry: number | undefined,
+		amountMsat: bigint,
+		hashHex: string
+	): Buffer | null {
+		const fail = (code: number): Buffer =>
+			sharedSecret
+				? createFailureMessage(sharedSecret, code)
+				: Buffer.alloc(290);
+
+		if (incomingCltvExpiry !== undefined) {
+			// final_incorrect_cltv_expiry: the HTLC cltv_expiry MUST be >= the onion's
+			// outgoing_cltv_value. A sender may over-provision it (a strictly larger
+			// value is fine); only a SHORTFALL is a tampered timeout. (Previously this
+			// required exact equality and rejected a compliant over-provisioning
+			// sender.)
+			if (
+				hopPayload?.outgoingCltvValue !== undefined &&
+				incomingCltvExpiry < hopPayload.outgoingCltvValue
+			) {
+				this.emitStructuredLog('htlc', 'final_incorrect_cltv', {
+					paymentHash: hashHex,
+					htlcCltv: incomingCltvExpiry,
+					onionCltv: hopPayload.outgoingCltvValue
+				});
+				return fail(FINAL_INCORRECT_CLTV_EXPIRY);
+			}
+			// expiry-too-soon: the cltv_expiry must leave at least min_final_cltv
+			// blocks, or we could reveal the preimage yet fail to claim on-chain in
+			// time. Reported as INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS (avoid leaking
+			// which condition failed).
+			if (
+				this.currentBlockHeight > 0 &&
+				incomingCltvExpiry <
+					this.currentBlockHeight + DEFAULT_MIN_FINAL_CLTV_EXPIRY
+			) {
+				this.emitStructuredLog('htlc', 'final_expiry_too_soon', {
+					paymentHash: hashHex,
+					htlcCltv: incomingCltvExpiry,
+					height: this.currentBlockHeight
+				});
+				return fail(INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS);
+			}
+		}
+
+		// final_incorrect_htlc_amount: the HTLC amount MUST be >= the onion's
+		// amt_to_forward. This catches a hop that skimmed the amount even for
+		// keysend / zero-amount invoices, which have no invoice-amount check.
+		if (
+			hopPayload?.amountToForwardMsat !== undefined &&
+			amountMsat < hopPayload.amountToForwardMsat
+		) {
+			this.emitStructuredLog('htlc', 'final_incorrect_htlc_amount', {
+				paymentHash: hashHex,
+				received: amountMsat.toString(),
+				amtToForward: hopPayload.amountToForwardMsat.toString()
+			});
+			return fail(FINAL_INCORRECT_HTLC_AMOUNT);
+		}
+
+		return null;
+	}
+
 	private handleFinalHopHtlc(
 		channelId: Buffer,
 		htlcId: bigint,
@@ -6478,6 +6549,24 @@ export class LightningNode extends EventEmitter {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
 		const sharedSecret = this.receivedHtlcSharedSecrets.get(htlcSecretKey);
+
+		// BOLT 4 final-node safety checks that apply to EVERY terminating HTLC
+		// (keysend and invoice alike) and MUST run BEFORE any preimage is revealed:
+		// the cltv_expiry must be >= the onion's outgoing_cltv_value with a safe
+		// claim window, and the amount must be >= amt_to_forward. Running these
+		// first fixes keysend settling a next-block-expiring or skimmed HTLC.
+		const safetyReason = this.finalHopSafetyFailure(
+			sharedSecret,
+			hopPayload,
+			incomingCltvExpiry,
+			amountMsat,
+			hashHex
+		);
+		if (safetyReason) {
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, safetyReason);
+			return;
+		}
 
 		// Keysend: extract preimage from custom TLV records (bLIP-0003)
 		const keysendPreimage = hopPayload?.customRecords?.get(KEYSEND_TLV_TYPE);
@@ -6581,53 +6670,8 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Validate the HTLC CLTV at the final hop (BOLT 4). Two checks:
-		//  1. final_incorrect_cltv_expiry: the on-chain HTLC cltv_expiry must equal
-		//     the outgoing_cltv_value the sender put in the onion. A mismatch means
-		//     a hop tampered with the timeout.
-		//  2. expiry-too-soon: the cltv_expiry must leave at least min_final_cltv
-		//     blocks before it expires, or we could reveal the preimage yet fail to
-		//     claim the HTLC on-chain in time (payer reclaims after learning it).
-		//     Reported as INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS per modern BOLT 4
-		//     (avoid leaking which condition failed).
-		if (incomingCltvExpiry !== undefined) {
-			if (
-				hopPayload?.outgoingCltvValue !== undefined &&
-				incomingCltvExpiry !== hopPayload.outgoingCltvValue
-			) {
-				this.emitStructuredLog('htlc', 'final_incorrect_cltv', {
-					paymentHash: hashHex,
-					htlcCltv: incomingCltvExpiry,
-					onionCltv: hopPayload.outgoingCltvValue
-				});
-				const reason = sharedSecret
-					? createFailureMessage(sharedSecret, FINAL_INCORRECT_CLTV_EXPIRY)
-					: Buffer.alloc(290);
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.failHtlc(channelId, htlcId, reason);
-				return;
-			}
-			if (
-				this.currentBlockHeight > 0 &&
-				incomingCltvExpiry <
-					this.currentBlockHeight + DEFAULT_MIN_FINAL_CLTV_EXPIRY
-			) {
-				this.emitStructuredLog('htlc', 'final_expiry_too_soon', {
-					paymentHash: hashHex,
-					htlcCltv: incomingCltvExpiry,
-					height: this.currentBlockHeight
-				});
-				const reason = sharedSecret
-					? createFailureMessage(
-							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
-					  )
-					: Buffer.alloc(290);
-				this.cleanupHtlcSharedSecret(htlcSecretKey);
-				this.channelManager.failHtlc(channelId, htlcId, reason);
-				return;
-			}
-		}
+		// (final-hop cltv/amount safety was validated up front, before any
+		// preimage was revealed — see finalHopSafetyFailure.)
 
 		// Validate the received amount against the invoice (BOLT 4). The final
 		// node MUST NOT fulfill (and reveal the preimage) for less than the
