@@ -15,11 +15,15 @@ import {
 import {
 	validateSerialIdParity,
 	validatePeerSerialIdParity,
-	validateInteractiveTx
+	validateInteractiveTx,
+	MAX_INTERACTIVE_TX_INPUTS,
+	MAX_INTERACTIVE_TX_OUTPUTS,
+	MAX_MONEY_SATS
 } from './validation';
 
 export class InteractiveTxBuilder {
 	private session: IInteractiveTxSession;
+	private dustLimitSats = 546n;
 
 	constructor(isInitiator: boolean, locktime = 0) {
 		this.session = {
@@ -30,6 +34,28 @@ export class InteractiveTxBuilder {
 			locktime,
 			nextSerialId: isInitiator ? 0n : 1n
 		};
+	}
+
+	/**
+	 * Set the negotiated dust limit (never lowered below the 546-sat floor)
+	 * used to validate output amounts.
+	 */
+	setDustLimit(sats: bigint): void {
+		if (sats > this.dustLimitSats) {
+			this.dustLimitSats = sats;
+		}
+	}
+
+	/** Count inputs/outputs contributed by one side (even serial = initiator). */
+	private countBySide(
+		map: Map<string, { serialId: bigint }>,
+		initiatorSide: boolean
+	): number {
+		let n = 0;
+		for (const entry of map.values()) {
+			if ((entry.serialId % 2n === 0n) === initiatorSide) n++;
+		}
+		return n;
 	}
 
 	getState(): InteractiveTxState {
@@ -106,6 +132,14 @@ export class InteractiveTxBuilder {
 		);
 		if (parityErr) return parityErr;
 
+		// BOLT 2 interactive-tx: a peer may contribute at most 252 inputs.
+		if (
+			this.countBySide(this.session.inputs, !this.session.isInitiator) >=
+			MAX_INTERACTIVE_TX_INPUTS
+		) {
+			return `Peer exceeded ${MAX_INTERACTIVE_TX_INPUTS} inputs`;
+		}
+
 		const key = input.serialId.toString();
 		if (this.session.inputs.has(key)) {
 			return `Input with serial ID ${input.serialId} already exists`;
@@ -168,6 +202,21 @@ export class InteractiveTxBuilder {
 			this.session.isInitiator
 		);
 		if (parityErr) return parityErr;
+
+		// BOLT 2 interactive-tx: a peer may contribute at most 252 outputs, each
+		// within [dust_limit, MAX_MONEY].
+		if (
+			this.countBySide(this.session.outputs, !this.session.isInitiator) >=
+			MAX_INTERACTIVE_TX_OUTPUTS
+		) {
+			return `Peer exceeded ${MAX_INTERACTIVE_TX_OUTPUTS} outputs`;
+		}
+		if (output.amountSats > MAX_MONEY_SATS) {
+			return `Output amount ${output.amountSats} exceeds MAX_MONEY`;
+		}
+		if (output.amountSats < this.dustLimitSats) {
+			return `Output amount ${output.amountSats} below dust limit ${this.dustLimitSats}`;
+		}
 
 		const key = output.serialId.toString();
 		if (this.session.outputs.has(key)) {
@@ -314,7 +363,7 @@ export class InteractiveTxBuilder {
 			a.serialId < b.serialId ? -1 : a.serialId > b.serialId ? 1 : 0
 		);
 
-		const error = validateInteractiveTx(inputs, outputs);
+		const error = validateInteractiveTx(inputs, outputs, this.dustLimitSats);
 		if (error) return null;
 
 		return { inputs, outputs, locktime: this.session.locktime };

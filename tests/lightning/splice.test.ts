@@ -149,6 +149,68 @@ function connectManagers(
 const FUNDING_SATOSHIS = 1_000_000n;
 
 /**
+ * A parseable wallet UTXO (plus change script) funding a splice-in: the
+ * tx_complete audit requires splice-in contributions to be backed by real
+ * inputs whose values cover the capacity increase plus the on-chain fee.
+ * The UTXO is worth amountSats + 100k so a non-dust change remains.
+ */
+function makeSpliceInWallet(amountSats: bigint): {
+	walletInput: {
+		prevTx: Buffer;
+		prevOutputIndex: number;
+		value: bigint;
+		sequence: number;
+		signWitness: (
+			tx: bitcoin.Transaction,
+			inputIndex: number,
+			value: bigint
+		) => Buffer[];
+	};
+	changeScript: Buffer;
+} {
+	bitcoin.initEccLib(ecc);
+	const walletPriv = crypto
+		.createHash('sha256')
+		.update('splice-in-wallet-helper')
+		.digest();
+	const walletPub = Buffer.from(ecc.pointFromScalar(walletPriv, true)!);
+	const walletScript = bitcoin.payments.p2wpkh({ pubkey: walletPub }).output!;
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: walletPub }).output!;
+	const value = amountSats + 100_000n;
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addOutput(walletScript, Number(value));
+	return {
+		walletInput: {
+			prevTx: prevTx.toBuffer(),
+			prevOutputIndex: 0,
+			value,
+			sequence: 0xfffffffd,
+			signWitness: (
+				tx: bitcoin.Transaction,
+				inputIndex: number,
+				inputValue: bigint
+			): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					scriptCode,
+					Number(inputValue),
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				const sig64 = Buffer.from(ecc.sign(sighash, walletPriv));
+				const der = bitcoin.script.signature.encode(
+					sig64,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				return [der, walletPub];
+			}
+		},
+		changeScript: walletScript
+	};
+}
+
+/**
  * Helper to create a pair of channels (opener + acceptor) in NORMAL state,
  * connected through ChannelManagers with message routing.
  */
@@ -1757,7 +1819,10 @@ describe('Splice', function () {
 			acceptor.handleSplice({
 				channelId,
 				fundingPubkey: Buffer.alloc(33, 0x02),
-				relativeSatoshis: 0n,
+				// The peer's 400k output below draws on the shared capacity, so it
+				// must be declared as a matching splice-out contribution or the
+				// tx_complete audit rejects the books (S-2.M4).
+				relativeSatoshis: -400_000n,
 				fundingFeeratePerkw: 253,
 				locktime: 0
 			});
@@ -1792,6 +1857,39 @@ describe('Splice', function () {
 			const built = session.getTxBuilder()!;
 			expect(built.getInputs().some((i) => i.serialId === 0n)).to.be.true;
 			expect(built.getOutputs().some((o) => o.serialId === 2n)).to.be.true;
+		});
+
+		it('rejects a tx_complete whose peer output is not covered by inputs or contribution (S-2.M4)', function () {
+			// Same wire shape as the routing test above, but the peer declares NO
+			// contribution while directing 400k of the shared capacity to its own
+			// output: the completion audit must reject the books.
+			const { acceptor } = makeNormalChannel();
+			quiesce(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: Buffer.alloc(33, 0x02),
+				relativeSatoshis: 0n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			acceptor.handleTxAddInput({
+				channelId,
+				serialId: 0n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			});
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 2n,
+				amountSats: 400_000n,
+				scriptPubkey: Buffer.alloc(34, 0x00)
+			});
+			const completeAction = acceptor.handleTxComplete();
+			const err = findAction(completeAction, ChannelActionType.ERROR);
+			expect(err, 'tx_complete audit rejects uncovered peer output').to.exist;
+			expect((err as { message: string }).message).to.contain('do not cover');
 		});
 
 		it('should drive splice-out contributions: shared input (TLV) + new funding + destination + tx_complete', function () {
@@ -2984,6 +3082,18 @@ describe('Splice', function () {
 				return { openerMsg, acceptorMsg };
 			}
 
+			// Fee a startSpliceOut splice tx pays at 253 sat/kw (P2WPKH destination),
+			// folded into relative_satoshis exactly as node.spliceOut does: the
+			// negotiated tx must actually pay the declared feerate (the tx_complete
+			// audit enforces it).
+			const SPLICE_OUT_TEST_FEE = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: 22
+				}),
+				253
+			);
+
 			function startSpliceOut(pair: IWirePair, withdraw = 50_000n): Buffer {
 				const destScript = Buffer.concat([
 					Buffer.from([0x00, 0x14]),
@@ -2993,7 +3103,7 @@ describe('Splice', function () {
 				pair.enqueue(
 					pair.acceptor,
 					pair.opener,
-					pair.opener.initiateSplice(-withdraw, 253)
+					pair.opener.initiateSplice(-(withdraw + SPLICE_OUT_TEST_FEE), 253)
 				);
 				pair.pump();
 				return destScript;
@@ -3573,8 +3683,8 @@ describe('Splice', function () {
 				);
 				expect(openerLocalBefore).to.equal(FUNDING_SATOSHIS * 1000n - pushMsat);
 
-				// Opener splices 50k out of ITS OWN balance (startSpliceOut builds a
-				// zero-fee tx beignet↔beignet, so the arithmetic is exact).
+				// Opener splices 50k out of ITS OWN balance (plus the folded
+				// on-chain fee, which also comes out of the opener's side).
 				startSpliceOut(pair, 50_000n);
 				completeSpliceLocked(pair);
 
@@ -3590,8 +3700,8 @@ describe('Splice', function () {
 				).to.equal(acceptorLocalBefore);
 				expect(
 					pair.opener.getFullState().localBalanceMsat,
-					'opener balance reduced by exactly the withdrawal'
-				).to.equal(openerLocalBefore - 50_000_000n);
+					'opener balance reduced by exactly the withdrawal plus the fee'
+				).to.equal(openerLocalBefore - (50_000n + SPLICE_OUT_TEST_FEE) * 1000n);
 
 				// Both agree on the new outpoint + capacity, and balances still sum to it.
 				const spliceTxid = pair.opener.getFullState().fundingTxid!;
@@ -3723,9 +3833,20 @@ describe('Splice', function () {
 				Buffer.from([0x00, 0x14]),
 				crypto.randomBytes(20)
 			]);
+			// Fold the on-chain fee into relative_satoshis exactly as
+			// node.spliceOut does (the tx_complete audit enforces the feerate).
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
 			openerChannel.setSpliceOutDestination(destScript, 50_000n);
-			expect(openerManager.initiateSplice(channelId, -50_000n, 253).ok).to.be
-				.true;
+			expect(
+				openerManager.initiateSplice(channelId, -(50_000n + spliceOutFee), 253)
+					.ok
+			).to.be.true;
 
 			// Auto-routing ran the splice to fully-signed; lock it in both ways.
 			openerManager.sendSpliceLocked(channelId);
@@ -3783,7 +3904,13 @@ describe('Splice', function () {
 				createNormalChannelPair();
 
 			openerManager.initiateQuiescence(channelId);
-			// Auto-routing runs the whole splice to the fully-signed stage.
+			// Auto-routing runs the whole splice to the fully-signed stage. The
+			// splice-in must be backed by a real wallet input (tx_complete audit).
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			openerManager.initiateSplice(channelId, 100_000n, 253);
 			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
 			expect(
@@ -3934,6 +4061,12 @@ describe('Splice', function () {
 			pair.openerManager.initiateQuiescence(pair.channelId);
 			// Auto-routing drives the splice to fully-signed (tx_signatures both
 			// ways); without splice_locked the channel sits in the pending window.
+			// The splice-in must be backed by a real wallet input (tx_complete audit).
+			const wallet = makeSpliceInWallet(100_000n);
+			pair.openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			expect(
 				pair.openerManager.initiateSplice(pair.channelId, 100_000n, 253).ok
 			).to.equal(true);
