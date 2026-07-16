@@ -160,16 +160,24 @@ describe('Gossip Sync (Phase 5)', function () {
 			}
 		});
 
-		it('should encode/decode zlib (type 1) round-trip', function () {
+		it('rejects the removed zlib (type 1) encoding (S-7.M3)', function () {
 			const scids = [makeScid(500, 10, 0), makeScid(600, 20, 1)];
 			const encoded = encodeShortChannelIdsCompressed(scids);
 			expect(encoded[0]).to.equal(1); // type 1
+			// BOLT 7 removed the zlib encoding; decoding it is unsupported.
+			expect(() => decodeShortChannelIds(encoded)).to.throw(/type 1/i);
+		});
 
-			const decoded = decodeShortChannelIds(encoded);
-			expect(decoded.length).to.equal(2);
-			for (let i = 0; i < 2; i++) {
-				expect(decoded[i].equals(scids[i])).to.be.true;
-			}
+		it('does not inflate a type-1 decompression bomb (S-7.M3)', function () {
+			const zlib = require('zlib');
+			// ~10 MB of zeros compresses to a few KB; the old decoder would
+			// inflateSync it with no cap. The fix rejects type 1 before inflating.
+			const bomb = Buffer.concat([
+				Buffer.from([0x01]),
+				zlib.deflateSync(Buffer.alloc(10_000_000))
+			]);
+			expect(bomb.length).to.be.lessThan(100_000);
+			expect(() => decodeShortChannelIds(bomb)).to.throw(/type 1/i);
 		});
 
 		it('should handle empty SCID list', function () {

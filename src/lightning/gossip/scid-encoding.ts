@@ -50,8 +50,13 @@ export function decodeShortChannelIds(encoded: Buffer): Buffer[] {
 		// Raw encoding
 		body = Buffer.from(encoded.subarray(1));
 	} else if (encodingType === 1) {
-		// Zlib compressed
-		body = zlib.inflateSync(encoded.subarray(1));
+		// BOLT 7 removed the zlib (type 1) encoding. Inflating attacker-supplied
+		// data with no output cap is a decompression bomb (~1032:1) reachable from
+		// any peer over query_short_channel_ids / reply_channel_range, so reject it
+		// outright rather than calling zlib.inflateSync on peer bytes.
+		throw new Error(
+			'SCID zlib encoding (type 1) is unsupported: BOLT 7 removed it'
+		);
 	} else {
 		throw new Error(`Unknown SCID encoding type: ${encodingType}`);
 	}
