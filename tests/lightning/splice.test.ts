@@ -100,6 +100,22 @@ function findSendAction(actions: any[], msgType: MessageType): any {
 	);
 }
 
+/**
+ * A minimal VALID previous transaction paying `valueSats` to a P2WPKH at
+ * vout 0, for peer tx_add_input fixtures (S-2.H3: the receive side now
+ * enforces prevtx validity + native-segwit spends).
+ */
+function makePeerPrevTx(valueSats = 100_000): Buffer {
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.addInput(crypto.randomBytes(32), 0);
+	tx.addOutput(
+		bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!,
+		valueSats
+	);
+	return tx.toBuffer();
+}
+
 function makeSeed(id: number): Buffer {
 	return crypto
 		.createHash('sha256')
@@ -993,7 +1009,9 @@ describe('Splice', function () {
 					serialId: 1n, // odd = acceptor
 					prevTxid: crypto.randomBytes(32),
 					prevOutputIndex: 0,
-					sequence: 0xfffffffd
+					sequence: 0xfffffffd,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0
 				});
 				expect(err).to.be.null;
 			});
@@ -1113,7 +1131,9 @@ describe('Splice', function () {
 					serialId: 1n,
 					prevTxid: crypto.randomBytes(32),
 					prevOutputIndex: 0,
-					sequence: 0xfffffffd
+					sequence: 0xfffffffd,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0
 				});
 				const err = session.removePeerInput(1n);
 				expect(err).to.be.null;
@@ -1835,7 +1855,8 @@ describe('Splice', function () {
 			const inAction = acceptor.handleTxAddInput({
 				channelId,
 				serialId: 0n,
-				prevTx: Buffer.alloc(0),
+				// Covers the peer's 400k output plus the negotiated fee.
+				prevTx: makePeerPrevTx(500_000),
 				prevTxVout: 0,
 				sequence: 0xfffffffd
 			});
@@ -1876,7 +1897,7 @@ describe('Splice', function () {
 			acceptor.handleTxAddInput({
 				channelId,
 				serialId: 0n,
-				prevTx: Buffer.alloc(0),
+				prevTx: makePeerPrevTx(10_000),
 				prevTxVout: 0,
 				sequence: 0xfffffffd
 			});
@@ -1890,6 +1911,70 @@ describe('Splice', function () {
 			const err = findAction(completeAction, ChannelActionType.ERROR);
 			expect(err, 'tx_complete audit rejects uncovered peer output').to.exist;
 			expect((err as { message: string }).message).to.contain('do not cover');
+		});
+
+		it('tx_aborts a splice whose shared input does not match the funding outpoint (S-2.H3)', function () {
+			// A mismatched shared input would make each side sign commitments
+			// against a different splice txid. The negotiation must fail with
+			// tx_abort and the channel must keep operating on the existing funding.
+			const { acceptor } = makeNormalChannel();
+			quiesce(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: Buffer.alloc(33, 0x02),
+				relativeSatoshis: 0n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			const actions = acceptor.handleTxAddInput({
+				channelId,
+				serialId: 0n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd,
+				sharedInputTxid: crypto.randomBytes(32) // NOT our funding txid
+			});
+			expect(findSendAction(actions, MessageType.TX_ABORT), 'tx_abort sent').to
+				.exist;
+			expect(acceptor.getSpliceSession()).to.be.null;
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('tx_aborts a splice input spending a legacy output; the channel survives (S-2.H3)', function () {
+			const { acceptor } = makeNormalChannel();
+			quiesce(acceptor);
+			const channelId = acceptor.getChannelId()!;
+			acceptor.handleSplice({
+				channelId,
+				fundingPubkey: Buffer.alloc(33, 0x02),
+				relativeSatoshis: 0n,
+				fundingFeeratePerkw: 253,
+				locktime: 0
+			});
+			// A legacy (P2PKH) prev output makes the splice txid malleable after
+			// signing; the receive side must fail the negotiation.
+			const legacyPrev = new bitcoin.Transaction();
+			legacyPrev.version = 2;
+			legacyPrev.addInput(crypto.randomBytes(32), 0);
+			legacyPrev.addOutput(
+				bitcoin.payments.p2pkh({ hash: crypto.randomBytes(20) }).output!,
+				100_000
+			);
+			const actions = acceptor.handleTxAddInput({
+				channelId,
+				serialId: 0n,
+				prevTx: legacyPrev.toBuffer(),
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			});
+			expect(findSendAction(actions, MessageType.TX_ABORT), 'tx_abort sent').to
+				.exist;
+			const abortMsg = findSendAction(actions, MessageType.TX_ABORT);
+			expect(abortMsg.payload.toString()).to.contain('non-native-segwit');
+			// The negotiation died; the channel did not.
+			expect(acceptor.getSpliceSession()).to.be.null;
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
 		});
 
 		it('should drive splice-out contributions: shared input (TLV) + new funding + destination + tx_complete', function () {

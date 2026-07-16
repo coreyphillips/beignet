@@ -40,6 +40,7 @@ import {
 } from '../../src/lightning/interactive-tx/validation';
 import { InteractiveTxBuilder } from '../../src/lightning/interactive-tx/builder';
 import * as crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 
 function randomChannelId(): Buffer {
 	return crypto.randomBytes(32);
@@ -54,11 +55,25 @@ function makeInput(
 	prevTxid?: Buffer,
 	prevOutputIndex?: number
 ): IInteractiveTxInput {
+	const vout = prevOutputIndex ?? 0;
+	// A valid prev_tx with a native-segwit output at `vout`: the receive side
+	// now enforces prevtx validity + segwit-only spends (S-2.H3).
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	for (let i = 0; i <= vout; i++) {
+		prevTx.addOutput(
+			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+			100_000
+		);
+	}
 	return {
 		serialId,
 		prevTxid: prevTxid || randomTxid(),
-		prevOutputIndex: prevOutputIndex ?? 0,
-		sequence: 0xfffffffd
+		prevOutputIndex: vout,
+		sequence: 0xfffffffd,
+		prevTx: prevTx.toBuffer(),
+		prevTxVout: vout
 	};
 }
 

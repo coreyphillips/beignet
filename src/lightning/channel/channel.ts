@@ -8144,22 +8144,69 @@ export class Channel {
 			// shared_input_txid TLV with an empty prevTx; use it so both sides build
 			// the identical transaction. For ordinary inputs the txid comes from the
 			// provided prevTx.
-			const prevTxid = msg.sharedInputTxid
-				? Buffer.from(msg.sharedInputTxid)
-				: msg.prevTx && msg.prevTx.length >= 32
-				? extractTxidFromPrevTx(msg.prevTx)
-				: Buffer.alloc(32);
+			//
+			// The shared input MUST be the channel's own funding outpoint: a
+			// mismatched shared input would make each side sign commitments
+			// against a different splice txid. Fail the negotiation with tx_abort
+			// (the existing channel is unaffected) rather than a channel error.
+			if (msg.sharedInputTxid) {
+				if (
+					!this._state.fundingTxid ||
+					!msg.sharedInputTxid.equals(this._state.fundingTxid) ||
+					msg.prevTxVout !== this._state.fundingOutputIndex
+				) {
+					return [
+						sendMsg(
+							MessageType.TX_ABORT,
+							encodeTxAbortMessage({
+								channelId: this._state.channelId!,
+								data: Buffer.from(
+									'splice shared input does not match the channel funding outpoint',
+									'utf8'
+								)
+							})
+						),
+						...this.abortSplice(
+							'peer splice shared input does not match the channel funding outpoint'
+						)
+					];
+				}
+			}
+			let prevTxid = Buffer.alloc(32);
+			if (msg.sharedInputTxid) {
+				prevTxid = Buffer.from(msg.sharedInputTxid);
+			} else if (msg.prevTx && msg.prevTx.length >= 32) {
+				try {
+					prevTxid = extractTxidFromPrevTx(msg.prevTx);
+				} catch {
+					// Unparseable prev_tx: rejected by the builder's prevtx checks.
+				}
+			}
 			const input: IInteractiveTxInput = {
 				serialId: msg.serialId,
 				prevTxid,
 				prevOutputIndex: msg.prevTxVout,
 				sequence: msg.sequence,
 				prevTx: msg.prevTx,
-				prevTxVout: msg.prevTxVout
+				prevTxVout: msg.prevTxVout,
+				isShared: !!msg.sharedInputTxid
 			};
 			const err = this._spliceSession!.addPeerInput(input);
 			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
+				// BOLT 2: an invalid tx_add_input fails the NEGOTIATION. For a
+				// splice that means tx_abort + unwind; the channel keeps operating
+				// on the existing funding output.
+				return [
+					sendMsg(
+						MessageType.TX_ABORT,
+						encodeTxAbortMessage({
+							channelId: this._state.channelId!,
+							data: Buffer.from(err, 'utf8')
+						})
+					),
+					...this.abortSplice(err),
+					{ type: ChannelActionType.ERROR, message: `splice aborted: ${err}` }
+				];
 			}
 			return this._driveSplice();
 		}
@@ -8179,7 +8226,7 @@ export class Channel {
 			try {
 				prevTxid = extractTxidFromPrevTx(msg.prevTx);
 			} catch {
-				// Unparseable prev_tx: keep zeros (strict enforcement is S-2.H3).
+				// Unparseable prev_tx: rejected by the builder's prevtx checks.
 			}
 		}
 		const input: IInteractiveTxInput = {
