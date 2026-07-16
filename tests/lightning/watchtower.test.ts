@@ -339,6 +339,28 @@ describe('watchtower wtwire codecs', function () {
 		);
 	});
 
+	it('uses LND StateUpdateCode wire values 70/71/72 (S-W.H1)', function () {
+		// These MUST match LND's wtwire StateUpdateCode block exactly. At 40/41/42
+		// a full session's MAX_UPDATES_EXCEEDED reply never matched (protection
+		// silently stopped) and CLIENT_BEHIND collided with the generic
+		// TEMPORARY_FAILURE code (40), wrongly rewinding seqNum.
+		expect(StateUpdateCode.CLIENT_BEHIND).to.equal(70);
+		expect(StateUpdateCode.MAX_UPDATES_EXCEEDED).to.equal(71);
+		expect(StateUpdateCode.SEQ_NUM_OUT_OF_ORDER).to.equal(72);
+		// No collision with the generic temporary-failure code (40).
+		expect(StateUpdateCode.CLIENT_BEHIND).to.not.equal(40);
+
+		// And they land on the wire as the LND bytes.
+		const wire = encodeStateUpdateReply({
+			code: StateUpdateCode.MAX_UPDATES_EXCEEDED,
+			lastApplied: 3
+		});
+		expect(wire.readUInt16BE(0)).to.equal(71);
+		expect(
+			decodeStateUpdateReply(Buffer.from('00470005', 'hex')).code
+		).to.equal(StateUpdateCode.MAX_UPDATES_EXCEEDED);
+	});
+
 	it('round-trips DeleteSessionReply', function () {
 		const msg = { code: 0 };
 		expect(

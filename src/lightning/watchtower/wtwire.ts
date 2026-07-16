@@ -53,13 +53,20 @@ export enum CreateSessionCode {
 	REJECT_BLOB_TYPE = 64
 }
 
-/** StateUpdateReply codes (error_code.go StateUpdateCode block). */
+/**
+ * StateUpdateReply codes (LND wtwire state_update_reply.go). These MUST match
+ * LND's StateUpdateCode block byte-for-byte: 70/71/72, NOT 40/41/42. With the
+ * wrong values a full session's MAX_UPDATES_EXCEEDED reply (71) never matched,
+ * so the session never rotated and every later revocation queued forever
+ * (tower protection silently stops); and CLIENT_BEHIND at 40 collided with the
+ * generic TEMPORARY_FAILURE (40), wrongly rewinding seqNum on a transient error.
+ */
 export enum StateUpdateCode {
 	OK = 0,
 	/** Tower's LastApplied is ahead of the client's SeqNum. */
-	CLIENT_BEHIND = 40,
-	MAX_UPDATES_EXCEEDED = 41,
-	SEQ_NUM_OUT_OF_ORDER = 42
+	CLIENT_BEHIND = 70,
+	MAX_UPDATES_EXCEEDED = 71,
+	SEQ_NUM_OUT_OF_ORDER = 72
 }
 
 export interface IWtInit {
