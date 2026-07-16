@@ -134,7 +134,17 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		// Matches makeBasepoints keys[4]: without it HTLC signatures are built
+		// from the wrong key and commitment_signed fails 'Invalid HTLC
+		// signature' once an HTLC exists — previously masked because that
+		// error did not fail the channel, so payments settled on UNVERIFIED
+		// signatures; the wire-error fix made it loud.
+		htlcBasepointSecret: crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from([4]))
+			.digest()
 	};
 }
 
