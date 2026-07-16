@@ -233,6 +233,38 @@ describe('update_fee Balance Drain Protection', () => {
 	});
 });
 
+describe('update_fee during shutdown (S-2.M6)', () => {
+	it('accepts a valid inbound update_fee while SHUTTING_DOWN', () => {
+		// BOLT 2 allows update_fee during shutdown while HTLCs remain (CLN
+		// sends it); rejecting it force-closed a cleanly shutting-down channel.
+		const channel = createTestChannel(500_000_000n, 10_000n, 1000);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		((channel as any)._state as IChannelState).state =
+			ChannelState.SHUTTING_DOWN;
+
+		const msg: IUpdateFeeMessage = {
+			channelId: crypto.randomBytes(32),
+			feeratePerKw: 1000
+		};
+
+		const actions = channel.handleUpdateFee(msg);
+		expect(actions.length).to.equal(0);
+	});
+
+	it('still rejects update_fee in a non-operational state', () => {
+		const channel = createTestChannel(500_000_000n, 10_000n, 1000);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		((channel as any)._state as IChannelState).state = ChannelState.CLOSED;
+
+		const actions = channel.handleUpdateFee({
+			channelId: crypto.randomBytes(32),
+			feeratePerKw: 1000
+		});
+		expect(actions.length).to.equal(1);
+		expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+	});
+});
+
 describe('update_fee dust re-trim protection', () => {
 	function addCommittedHtlc(channel: Channel, amountMsat: bigint): void {
 		const state = (channel as any)._state as IChannelState;

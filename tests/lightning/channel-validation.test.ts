@@ -222,10 +222,52 @@ describe('Channel Types and Validation', function () {
 			expect(validateOpenChannelParams(msg)).to.contain('push_msat');
 		});
 
-		it('should accept push_msat exactly funding * 1000', function () {
+		it('should reject push_msat of the full funding (funder cannot pay the fee)', function () {
+			// Pushing everything passes the push_msat <= funding * 1000 writer rule
+			// but violates the acceptor MUST: the funder can no longer afford the
+			// initial commitment fee.
 			const msg = makeValidOpenMsg();
 			msg.fundingSatoshis = 100_000n;
 			msg.pushMsat = 100_000_000n;
+			expect(validateOpenChannelParams(msg)).to.contain('cannot afford');
+		});
+
+		it('should accept push_msat leaving exactly the commitment fee', function () {
+			// feerate 253, no HTLCs, non-anchor: fee = floor(724 * 253 / 1000) = 183
+			const msg = makeValidOpenMsg();
+			msg.fundingSatoshis = 100_000n;
+			msg.pushMsat = (100_000n - 183n) * 1000n;
+			expect(validateOpenChannelParams(msg)).to.be.null;
+		});
+
+		it('should reject an open where the funder cannot afford the initial fee (S-2.M7)', function () {
+			// fee at feerate 253 = 183 sat; push leaves only 100 sat to the funder
+			const msg = makeValidOpenMsg();
+			msg.fundingSatoshis = 100_000n;
+			msg.pushMsat = (100_000n - 100n) * 1000n;
+			expect(validateOpenChannelParams(msg)).to.contain('cannot afford');
+		});
+
+		it('should reject an open where both initial outputs are below channel_reserve (S-2.M7)', function () {
+			// fee at feerate 2000 = floor(724 * 2000 / 1000) = 1448 sat.
+			// to_local = 29_000 - 14_000 - 1_448 = 13_552 <= 14_000 reserve, and
+			// to_remote (push) = 14_000 <= 14_000 reserve: neither output exists.
+			const msg = makeValidOpenMsg();
+			msg.fundingSatoshis = 29_000n;
+			msg.channelReserveSatoshis = 14_000n;
+			msg.feeratePerKw = 2000;
+			msg.pushMsat = 14_000_000n;
+			expect(validateOpenChannelParams(msg)).to.contain(
+				'below channel_reserve'
+			);
+		});
+
+		it('should accept an open where one side is above channel_reserve', function () {
+			const msg = makeValidOpenMsg();
+			msg.fundingSatoshis = 29_000n;
+			msg.channelReserveSatoshis = 14_000n;
+			msg.feeratePerKw = 2000;
+			msg.pushMsat = 0n; // to_local = 27_552 > 14_000
 			expect(validateOpenChannelParams(msg)).to.be.null;
 		});
 

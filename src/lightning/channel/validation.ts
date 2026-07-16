@@ -11,8 +11,12 @@ import {
 	MAX_ACCEPTED_HTLCS,
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
-	MAX_DUST_LIMIT_SATOSHIS
+	MAX_DUST_LIMIT_SATOSHIS,
+	isAnchorChannel,
+	isTaprootChannel
 } from './types';
+import { calculateCommitmentFee } from './commitment-builder';
+import { ANCHOR_TOTAL_COST } from '../script/anchor';
 
 /**
  * The subset of the open_channel we proposed that accept_channel is validated
@@ -154,6 +158,32 @@ export function validateOpenChannelParams(
 	// funding_pubkey must be 33 bytes
 	if (msg.fundingPubkey.length !== 33) {
 		return 'funding_pubkey must be 33 bytes';
+	}
+
+	// BOLT 2 acceptor MUSTs on the initial commitment. The opener pays the
+	// commitment fee (plus both 330-sat anchors on anchor channels), so its
+	// balance after push_msat must cover that in full, and at least one side
+	// must start above channel_reserve or neither commitment output exists.
+	const anchor = isAnchorChannel(msg.channelType ?? null);
+	const commitCostMsat =
+		(calculateCommitmentFee(
+			msg.feeratePerKw,
+			0,
+			anchor,
+			isTaprootChannel(msg.channelType ?? null)
+		) +
+			(anchor ? ANCHOR_TOTAL_COST : 0n)) *
+		1000n;
+	const funderMsat = msg.fundingSatoshis * 1000n - msg.pushMsat;
+	if (funderMsat < commitCostMsat) {
+		return 'funder cannot afford the initial commitment fee';
+	}
+	const reserveMsat = msg.channelReserveSatoshis * 1000n;
+	if (
+		funderMsat - commitCostMsat <= reserveMsat &&
+		msg.pushMsat <= reserveMsat
+	) {
+		return 'both initial commitment outputs are below channel_reserve';
 	}
 
 	return null;
