@@ -45,63 +45,60 @@ describe('Liquidity ads fee + will_fund (M3.2)', function () {
 		const sellerNodePriv = validPriv();
 		const sellerNodeId = Buffer.from(secp.getPublicKey(sellerNodePriv, true));
 		const fundingPubkey = Buffer.from(secp.getPublicKey(validPriv(), true));
-		const channelType = Buffer.from([0x10]);
 		const blockheight = 800000;
 
-		const sig = signWillFund(
-			fundingPubkey,
-			blockheight,
-			channelType,
-			RATES,
-			sellerNodePriv
-		);
+		const sig = signWillFund(fundingPubkey, blockheight, RATES, sellerNodePriv);
 
+		expect(verifyWillFund(sig, RATES, sellerNodeId, fundingPubkey, blockheight))
+			.to.be.true;
+
+		// Tampered COMMITTED term (channel_fee_max_base_msat) → invalid. Per CLN the
+		// signature only covers the routing-fee caps, so tampering an uncommitted
+		// field (e.g. leaseFeeBaseSat) does NOT invalidate it (validated separately
+		// against the advertised node_announcement rates).
 		expect(
 			verifyWillFund(
 				sig,
-				RATES,
+				{ ...RATES, channelFeeMaxBaseMsat: RATES.channelFeeMaxBaseMsat + 1 },
 				sellerNodeId,
 				fundingPubkey,
-				blockheight,
-				channelType
-			)
-		).to.be.true;
-
-		// Tampered rates → invalid.
-		expect(
-			verifyWillFund(
-				sig,
-				{ ...RATES, leaseFeeBaseSat: 9999 },
-				sellerNodeId,
-				fundingPubkey,
-				blockheight,
-				channelType
+				blockheight
 			)
 		).to.be.false;
 
 		// Different blockheight → invalid (lease bound to its window).
-		expect(
-			verifyWillFund(
-				sig,
-				RATES,
-				sellerNodeId,
-				fundingPubkey,
-				800001,
-				channelType
-			)
-		).to.be.false;
+		expect(verifyWillFund(sig, RATES, sellerNodeId, fundingPubkey, 800001)).to
+			.be.false;
 
 		// Wrong signer → invalid.
 		const otherId = Buffer.from(secp.getPublicKey(validPriv(), true));
-		expect(
-			verifyWillFund(
-				sig,
-				RATES,
-				otherId,
-				fundingPubkey,
-				blockheight,
-				channelType
+		expect(verifyWillFund(sig, RATES, otherId, fundingPubkey, blockheight)).to
+			.be.false;
+	});
+
+	it('signs the exact CLN option_will_fund preimage (S-L.H3)', function () {
+		const { verify } = require('../../src/lightning/crypto/ecdh');
+		const sellerNodePriv = validPriv();
+		const sellerNodeId = Buffer.from(secp.getPublicKey(sellerNodePriv, true));
+		const fundingPubkey = Buffer.from(secp.getPublicKey(validPriv(), true));
+		const blockheight = 800000;
+
+		// Reconstruct CLN's lease_rates_get_commitment preimage independently:
+		// "option_will_fund" || funding_pubkey || lease_expiry(u32)
+		//   || channel_fee_max_base_msat(u32) || channel_fee_max_ppt(u16).
+		const tail = Buffer.alloc(10);
+		tail.writeUInt32BE(blockheight + LEASE_DURATION_BLOCKS, 0);
+		tail.writeUInt32BE(RATES.channelFeeMaxBaseMsat, 4);
+		tail.writeUInt16BE(RATES.channelFeeMaxProportionalThousandths, 8);
+		const expectedSigHash = crypto
+			.createHash('sha256')
+			.update(
+				Buffer.concat([Buffer.from('option_will_fund'), fundingPubkey, tail])
 			)
-		).to.be.false;
+			.digest();
+
+		// signWillFund must have signed exactly that hash.
+		const sig = signWillFund(fundingPubkey, blockheight, RATES, sellerNodePriv);
+		expect(verify(expectedSigHash, sellerNodeId, sig)).to.be.true;
 	});
 });

@@ -47,16 +47,18 @@ import { decodeTlvStream, encodeTlvStream, ITlvRecord } from './tlv';
 import {
 	ILeaseRates,
 	encodeLeaseRates,
-	decodeLeaseRates,
-	LEASE_RATES_LENGTH
+	decodeLeaseRates
 } from '../gossip/types';
 
 /** TLV type for channel_type */
 const TLV_CHANNEL_TYPE = 1n;
-/** Liquidity ads (bLIP-0051): request_funds TLV in open_channel2. */
-const TLV_REQUEST_FUNDS = 5n;
-/** Liquidity ads (bLIP-0051): will_fund TLV in accept_channel2. */
-const TLV_WILL_FUND = 5n;
+// option_will_fund: request_funds (open_channel2) and will_fund (accept_channel2)
+// are BOTH TLV type 3, matching CLN and the spec. They were type 5, so leases
+// never negotiated cross-implementation (both odd types are silently ignored).
+/** request_funds TLV in open_channel2. */
+const TLV_REQUEST_FUNDS = 3n;
+/** will_fund TLV in accept_channel2. */
+const TLV_WILL_FUND = 3n;
 
 /** Buyer's lease request, carried in open_channel2 (bLIP-0051). */
 export interface IRequestFunds {
@@ -90,7 +92,7 @@ function decodeRequestFunds(buf: Buffer): IRequestFunds {
 	};
 }
 
-/** Encode will_fund: signature(64) || lease_rates(14). */
+/** Encode will_fund: signature(64) || lease_rates (variable, tu32-tailed). */
 function encodeWillFund(w: IWillFund): Buffer {
 	if (w.signature.length !== 64) {
 		throw new Error('will_fund signature must be 64 bytes');
@@ -98,11 +100,11 @@ function encodeWillFund(w: IWillFund): Buffer {
 	return Buffer.concat([w.signature, encodeLeaseRates(w.leaseRates)]);
 }
 
-/** Decode will_fund. */
+/** Decode will_fund. lease_rates is the tu32-tailed remainder after the sig. */
 function decodeWillFund(buf: Buffer): IWillFund {
 	return {
 		signature: Buffer.from(buf.subarray(0, 64)),
-		leaseRates: decodeLeaseRates(buf.subarray(64, 64 + LEASE_RATES_LENGTH))
+		leaseRates: decodeLeaseRates(buf.subarray(64))
 	};
 }
 
