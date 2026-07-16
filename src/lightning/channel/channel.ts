@@ -283,6 +283,14 @@ export interface ISpliceWalletInput {
 	 * require_confirmed_inputs; treated as unknown when omitted.
 	 */
 	confirmed?: boolean;
+	/**
+	 * Direct funding: this input belongs to a THIRD PARTY (e.g. a
+	 * beignet-aware sender funding the recipient's channel directly). Its
+	 * witness cannot be produced locally — signWitness is never called;
+	 * instead the host collects the owner's signature out-of-band and calls
+	 * provideV2ExternalWitness, which releases our tx_signatures.
+	 */
+	external?: boolean;
 }
 
 /**
@@ -409,6 +417,32 @@ export class Channel {
 		inputs: ISpliceWalletInput[];
 		changeScript: Buffer;
 	} | null = null;
+	// v2 dual-funded open auto-funding: wallet inputs (each with a
+	// witness-signing closure) + change script for OUR side of the interactive
+	// tx. When set, the channel drives its interactive-tx turns and signs its
+	// inputs automatically (mirrors the splice-in machinery); when unset, the
+	// legacy manual-drive API (addTxInput/sendTxComplete/sendTxSignatures)
+	// behaves exactly as before.
+	private _v2FundingInputs: {
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+	} | null = null;
+	private _v2AutoContributions: Array<
+		| { kind: 'input'; input: IInteractiveTxInput }
+		| { kind: 'output'; output: IInteractiveTxOutput }
+	> | null = null;
+	private _v2ContribIndex = 0;
+	// Acceptor: respond on our interactive-tx turns (contributions or
+	// tx_complete) without the host driving manually.
+	private _v2AutoRespond = false;
+	// Our wallet-input witnesses were queued once — never re-queue (the
+	// pending sigs are consumed/nulled after release).
+	private _v2AutoSigned = false;
+	// The fully-signed v2 funding tx was handed to the chain layer once.
+	private _v2FundingBroadcast = false;
+	// Direct funding: witnesses delivered by third-party input owners,
+	// keyed "txidHex:vout".
+	private _v2ExternalWitnesses = new Map<string, Buffer[]>();
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -5714,6 +5748,342 @@ export class Channel {
 	}
 
 	/**
+	 * Record the wallet inputs + change script funding OUR side of a v2
+	 * dual-funded open, and enable automatic interactive-tx turn-taking and
+	 * input signing for it. Works for both roles: the initiator additionally
+	 * contributes the funding output; an acceptor (e.g. a liquidity seller
+	 * honoring will_fund) contributes only its inputs and change.
+	 */
+	setV2FundingInputs(inputs: ISpliceWalletInput[], changeScript: Buffer): void {
+		this._v2FundingInputs = { inputs, changeScript };
+		this._v2AutoRespond = true;
+	}
+
+	/**
+	 * Acceptor: automatically take our interactive-tx turns (contributions or
+	 * tx_complete) during a v2 open instead of requiring manual driving. On by
+	 * itself this contributes nothing — pair with setV2FundingInputs to fund.
+	 */
+	enableV2AutoResponder(): void {
+		this._v2AutoRespond = true;
+	}
+
+	/**
+	 * Re-enter the v2 auto-funding drive. Needed when input sourcing finished
+	 * AFTER accept_channel2 arrived: the accept handler found no inputs and
+	 * took no turn, so nothing else will trigger the negotiation. Idempotent —
+	 * returns [] whenever it is not actually our turn.
+	 */
+	kickV2Funding(): ChannelAction[] {
+		// Only act when we have NOT contributed anything yet — if the drive is
+		// already mid-negotiation, our next turn comes from the peer's messages
+		// and driving here would violate interactive-tx turn-taking.
+		if (this._v2AutoContributions !== null && this._v2ContribIndex > 0) {
+			return [];
+		}
+		// Recompute (an inputs-less early drive may have cached empty
+		// contributions before the wallet inputs arrived).
+		this._v2AutoContributions = null;
+		this._v2ContribIndex = 0;
+		return this._driveV2Funding();
+	}
+
+	/**
+	 * Compute the ordered interactive-tx contributions for OUR side of an
+	 * auto-funded v2 open (mirrors _computeSpliceContributions):
+	 *   initiator: wallet inputs → funding output (full negotiated capacity)
+	 *              → change
+	 *   acceptor:  wallet inputs → change
+	 * Fees follow BOLT 2 v2: the opener pays for the common fields and the
+	 * funding output; each side pays for its own inputs and outputs.
+	 */
+	private _computeV2Contributions(): void {
+		this._v2AutoContributions = [];
+		this._v2ContribIndex = 0;
+
+		const session = this._state.dualFundingSession;
+		if (!session) return;
+		const localParams = session.getLocalParams();
+		if (!localParams) return;
+
+		const isInitiator = session.isInitiator();
+		const inputs = this._v2FundingInputs?.inputs ?? [];
+		const changeScript = this._v2FundingInputs?.changeScript;
+		const feeratePerKw = localParams.fundingFeeratePerkw || 253;
+		const ourFundingSats = localParams.fundingSatoshis;
+
+		let walletTotal = 0n;
+		for (const w of inputs) {
+			walletTotal += w.value;
+			this._v2AutoContributions.push({
+				kind: 'input',
+				input: {
+					serialId: session.nextSerialId()!,
+					prevTxid: extractTxidFromPrevTx(w.prevTx),
+					prevOutputIndex: w.prevOutputIndex,
+					sequence: w.sequence,
+					prevTx: w.prevTx,
+					prevTxVout: w.prevOutputIndex
+				}
+			});
+		}
+
+		let fundingScriptLen = 34;
+		if (isInitiator) {
+			const remoteFundingPubkey =
+				session.getRemoteBasepoints()?.fundingPubkey ??
+				this._state.remoteBasepoints?.fundingPubkey;
+			if (!remoteFundingPubkey) return;
+			const { createFundingScript } = require('../script/funding');
+			const funding = createFundingScript(
+				this._state.localBasepoints.fundingPubkey,
+				remoteFundingPubkey
+			);
+			fundingScriptLen = funding.p2wshOutput.length;
+			this._v2AutoContributions.push({
+				kind: 'output',
+				output: {
+					serialId: session.nextSerialId()!,
+					// The funding output carries the FULL negotiated capacity (our
+					// contribution + the acceptor's, folded in at accept_channel2).
+					amountSats: this._state.fundingSatoshis,
+					scriptPubkey: funding.p2wshOutput
+				}
+			});
+		}
+
+		if (inputs.length > 0 && changeScript) {
+			// Our fee share: own inputs + own change, plus (initiator only) the
+			// common fields and the funding output.
+			let weight =
+				inputs.length * P2WPKH_INPUT_WEIGHT + outputWeight(changeScript.length);
+			if (isInitiator) {
+				weight += SPLICE_TX_BASE_WEIGHT + outputWeight(fundingScriptLen);
+			}
+			const feeSats = spliceFeeSats(weight, feeratePerKw);
+			const changeSats = walletTotal - ourFundingSats - feeSats;
+			// Drop dust change (it implicitly becomes extra fee).
+			if (changeSats > P2WPKH_DUST_LIMIT) {
+				this._v2AutoContributions.push({
+					kind: 'output',
+					output: {
+						serialId: session.nextSerialId()!,
+						amountSats: changeSats,
+						scriptPubkey: changeScript
+					}
+				});
+			}
+		}
+	}
+
+	/**
+	 * Take our interactive-tx turn during an auto-funded v2 open: send the next
+	 * contribution, or tx_complete once we have nothing left to add. No-op
+	 * unless auto-funding/auto-response was enabled — the legacy manual-drive
+	 * API is unaffected.
+	 */
+	private _driveV2Funding(): ChannelAction[] {
+		if (!this._v2AutoRespond) return [];
+		const session = this._state.dualFundingSession;
+		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
+			return [];
+		}
+
+		if (this._v2AutoContributions === null) {
+			this._computeV2Contributions();
+		}
+		const contributions = this._v2AutoContributions!;
+
+		if (this._v2ContribIndex < contributions.length) {
+			const c = contributions[this._v2ContribIndex++];
+			if (c.kind === 'input') {
+				return this.addTxInput(c.input);
+			}
+			return this.addTxOutput(c.output);
+		}
+
+		// Nothing (left) to add: complete our side whenever the builder says the
+		// turn is ours. The builder resets SENT_COMPLETE → COLLECTING when the
+		// peer adds afterwards, so this re-sends tx_complete correctly across
+		// the whole negotiation.
+		const builderState = session.getTxState();
+		if (
+			builderState === InteractiveTxState.COLLECTING ||
+			builderState === InteractiveTxState.RECEIVED_COMPLETE
+		) {
+			return this.sendTxComplete();
+		}
+		return [];
+	}
+
+	/**
+	 * Sign our wallet inputs over the negotiated v2 funding tx and queue the
+	 * witnesses for tx_signatures release (ordering is handled downstream by
+	 * _maybeSendV2TxSigs). No-op without auto-funding inputs or before the
+	 * funding tx is negotiated; idempotent once queued.
+	 */
+	private _autoSignV2Inputs(): void {
+		if (!this._v2FundingInputs || this._v2PendingTxSigs || this._v2AutoSigned) {
+			return;
+		}
+		const session = this._state.dualFundingSession;
+		if (!session) return;
+		if (
+			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES &&
+			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
+		) {
+			return;
+		}
+		const built = session.buildTransaction();
+		if (!built) return;
+		const fo = this._v2FundingOutpoint();
+		if (!fo) return;
+
+		const tx = buildSpliceTx(
+			built.inputs.map((i) => ({
+				serialId: i.serialId,
+				prevTxid:
+					i.prevTx && i.prevTx.length >= 32
+						? extractTxidFromPrevTx(i.prevTx)
+						: i.prevTxid,
+				prevOutputIndex: i.prevTxVout ?? i.prevOutputIndex,
+				sequence: i.sequence
+			})),
+			built.outputs.map((o) => ({
+				serialId: o.serialId,
+				script: o.scriptPubkey,
+				valueSats: o.amountSats
+			})),
+			built.locktime
+		);
+
+		// Witness list covers OUR inputs in the built tx's input order. An
+		// external (third-party) input uses the witness its owner delivered
+		// out-of-band; until every one has arrived we queue nothing — our
+		// tx_signatures must never leave with a hole in it.
+		const witnesses: Buffer[][] = [];
+		for (const w of this._v2FundingInputs.inputs) {
+			const wTxid = extractTxidFromPrevTx(w.prevTx);
+			const index = tx.ins.findIndex(
+				(i) => Buffer.from(i.hash).equals(wTxid) && i.index === w.prevOutputIndex
+			);
+			if (index < 0) return; // our input missing — refuse to sign anything
+			if (w.external) {
+				const key = `${wTxid.toString('hex')}:${w.prevOutputIndex}`;
+				const provided = this._v2ExternalWitnesses.get(key);
+				if (!provided) return; // still waiting for the owner's signature
+				witnesses.push(provided);
+				continue;
+			}
+			witnesses.push(w.signWitness(tx, index, w.value));
+		}
+
+		// Sanity: the locally rebuilt tx must match the negotiated funding txid;
+		// witnesses signed over anything else must never leave.
+		if (!Buffer.from(tx.getHash()).equals(fo.txid)) return;
+
+		this._v2AutoSigned = true;
+		this._v2PendingTxSigs = {
+			txid: Buffer.from(fo.txid),
+			outputIndex: fo.outputIndex,
+			witnesses
+		};
+	}
+
+	/**
+	 * Direct funding: store the witness a third-party input owner produced for
+	 * the negotiated v2 funding tx. Call flushV2TxSignatures afterwards to
+	 * (re)attempt the tx_signatures release.
+	 */
+	provideV2ExternalWitness(
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): void {
+		this._v2ExternalWitnesses.set(
+			`${prevTxid.toString('hex')}:${prevOutputIndex}`,
+			witness
+		);
+	}
+
+	/**
+	 * Re-attempt the v2 tx_signatures release (e.g. after an external witness
+	 * arrived). No-op when signatures already went out or prerequisites are
+	 * still missing.
+	 */
+	flushV2TxSignatures(): ChannelAction[] {
+		return this._maybeSendV2TxSigs();
+	}
+
+	/**
+	 * Once BOTH witness sets are known, assemble the fully-signed v2 funding
+	 * transaction and hand it to the chain layer. BOLT 2 lets either side
+	 * broadcast; between two beignet peers both do (idempotent on the network,
+	 * and guarded locally). Witness lists cover each side's inputs in final tx
+	 * order; input ownership follows serial-id parity (initiator = even).
+	 */
+	private _broadcastV2FundingIfReady(): ChannelAction[] {
+		if (this._v2FundingBroadcast) return [];
+		const session = this._state.dualFundingSession;
+		if (
+			!session ||
+			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
+		) {
+			return [];
+		}
+		const local = session.getLocalWitnesses();
+		const remote = session.getRemoteWitnesses();
+		if (!local || !remote) return [];
+		const built = session.buildTransaction();
+		if (!built) return [];
+
+		const tx = buildSpliceTx(
+			built.inputs.map((i) => ({
+				serialId: i.serialId,
+				prevTxid:
+					i.prevTx && i.prevTx.length >= 32
+						? extractTxidFromPrevTx(i.prevTx)
+						: i.prevTxid,
+				prevOutputIndex: i.prevTxVout ?? i.prevOutputIndex,
+				sequence: i.sequence
+			})),
+			built.outputs.map((o) => ({
+				serialId: o.serialId,
+				script: o.scriptPubkey,
+				valueSats: o.amountSats
+			})),
+			built.locktime
+		);
+
+		// buildSpliceTx sorts inputs by serial id — align both witness lists.
+		const sorted = [...built.inputs].sort((a, b) =>
+			a.serialId < b.serialId ? -1 : a.serialId > b.serialId ? 1 : 0
+		);
+		const isInitiator = session.isInitiator();
+		let localIdx = 0;
+		let remoteIdx = 0;
+		for (let i = 0; i < sorted.length; i++) {
+			const isOurs = (sorted[i].serialId % 2n === 0n) === isInitiator;
+			const witness = isOurs ? local[localIdx++] : remote[remoteIdx++];
+			if (witness && witness.length > 0) {
+				tx.setWitness(i, witness);
+			}
+		}
+		if (localIdx !== local.length || remoteIdx !== remote.length) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'v2 funding witness count does not match input ownership — refusing to broadcast'
+				}
+			];
+		}
+
+		this._v2FundingBroadcast = true;
+		return [{ type: ChannelActionType.BROADCAST_TX, tx: tx.toBuffer() }];
+	}
+
+	/**
 	 * Compute the ordered list of interactive-tx contributions we (the initiator)
 	 * send for this splice. Currently supports the single-sided cases:
 	 *   - splice-out: shared input -> new funding output + destination output
@@ -7971,7 +8341,10 @@ export class Channel {
 			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
 		}
 
-		return [];
+		// Auto-funded opens: the interactive-tx negotiation starts with us (the
+		// initiator) — contribute our first input. Manual-drive callers get []
+		// exactly as before.
+		return this._driveV2Funding();
 	}
 
 	/**
@@ -8089,7 +8462,8 @@ export class Channel {
 			];
 		}
 
-		return [];
+		// Auto-funded opens: peer took its turn — take ours.
+		return this._driveV2Funding();
 	}
 
 	/**
@@ -8183,7 +8557,8 @@ export class Channel {
 			];
 		}
 
-		return [];
+		// Auto-funded opens: peer took its turn — take ours.
+		return this._driveV2Funding();
 	}
 
 	/**
@@ -8427,7 +8802,9 @@ export class Channel {
 			return this._maybeSendV2Commitment();
 		}
 
-		return [];
+		// Peer completed but we have not: our turn (auto-funded opens add any
+		// remaining contributions, then complete; manual callers get []).
+		return this._driveV2Funding();
 	}
 
 	/**
@@ -8766,6 +9143,9 @@ export class Channel {
 	private _maybeSendV2TxSigs(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session) return [];
+		// Auto-funded opens: sign our wallet inputs the moment the negotiated tx
+		// is final, so the ordering logic below can release them.
+		this._autoSignV2Inputs();
 		if (
 			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES &&
 			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
@@ -8832,7 +9212,10 @@ export class Channel {
 				fundingTxid: txid,
 				fundingOutputIndex: outputIndex,
 				minimumDepth: this._state.minimumDepth
-			}
+			},
+			// If the peer signed first, our release completes the pair —
+			// broadcast the fully-signed funding tx.
+			...this._broadcastV2FundingIfReady()
 		];
 	}
 
@@ -9014,6 +9397,9 @@ export class Channel {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 		}
+
+		// Both signature sets known → put the funding tx on the network.
+		actions.push(...this._broadcastV2FundingIfReady());
 
 		return actions;
 	}

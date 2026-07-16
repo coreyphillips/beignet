@@ -38,6 +38,24 @@ interface IResultErr extends IResult {
 	error: { message: string };
 }
 
+/** A specific outpoint the caller wants spent. */
+export interface IOutPointRef {
+	/** Txid in big-endian (display/electrum) hex. */
+	txid: string;
+	vout: number;
+}
+
+/**
+ * Caller-directed UTXO selection (auto-channelization: spend THIS deposit).
+ * With `utxos` set, selection is restricted to exactly those outpoints in the
+ * given order; a shortfall is an error unless `allowTopUp` lets the provider
+ * add its own coins after them.
+ */
+export interface IUtxoSelectionOptions {
+	utxos?: IOutPointRef[];
+	allowTopUp?: boolean;
+}
+
 /** A wallet UTXO, shaped like beignet's IUtxo (only the fields we need). */
 export interface ISpliceUtxo {
 	address: string;
@@ -180,7 +198,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	async selectSpliceInputs(
 		amountSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: IUtxoSelectionOptions
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		// Cover the splice amount plus the splice tx fee, recomputed per added
 		// input using the SAME weight formula the channel uses to derive change.
@@ -194,7 +213,8 @@ export class WalletFundingProvider implements IFundingProvider {
 						changeScriptLen: 22
 					}),
 					feeratePerKw
-				)
+				),
+			opts
 		);
 	}
 
@@ -233,7 +253,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	private async gatherWalletInputs(
 		purpose: string,
-		computeTarget: (selectedCount: number) => bigint
+		computeTarget: (selectedCount: number) => bigint,
+		opts?: IUtxoSelectionOptions
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		const wallet = this.wallet;
 		if (
@@ -250,7 +271,7 @@ export class WalletFundingProvider implements IFundingProvider {
 		const network = this.bitcoinJsNetwork();
 
 		// P2WPKH UTXOs only — the signing recipe below is P2WPKH-specific.
-		const candidates = wallet.listUtxos().filter((u) => {
+		let candidates = wallet.listUtxos().filter((u) => {
 			try {
 				return bitcoin.address.toOutputScript(u.address, network).length === 22;
 			} catch {
@@ -268,15 +289,44 @@ export class WalletFundingProvider implements IFundingProvider {
 		const selected: ISpliceUtxo[] = [];
 		let selectedSum = 0n;
 		let target = 0n;
+
+		// Caller-directed selection: spend exactly these outpoints (in order),
+		// e.g. channelizing a specific deposit. Top-up with wallet coins only
+		// when explicitly allowed.
+		if (opts?.utxos && opts.utxos.length > 0) {
+			for (const ref of opts.utxos) {
+				const match = candidates.find(
+					(u) => u.tx_hash === ref.txid && u.tx_pos === ref.vout
+				);
+				if (!match) {
+					throw new Error(
+						`${purpose}: requested UTXO ${ref.txid}:${ref.vout} not found among spendable P2WPKH wallet UTXOs`
+					);
+				}
+				selected.push(match);
+				selectedSum += BigInt(match.value);
+			}
+			target = computeTarget(selected.length);
+			if (selectedSum < target && !opts.allowTopUp) {
+				throw new Error(
+					`${purpose}: requested UTXOs total ${selectedSum} sats but ${target} sats (amount + fee) are needed; pass allowTopUp to add wallet coins`
+				);
+			}
+			candidates = candidates.filter((u) => !selected.includes(u));
+		}
+
 		for (const utxo of candidates) {
+			if (selectedSum >= target && selected.length > 0) break;
 			selected.push(utxo);
 			selectedSum += BigInt(utxo.value);
 			// Each added input grows the tx (and thus the fee) — recompute.
 			target = computeTarget(selected.length);
-			if (selectedSum >= target) break;
 		}
 		if (selectedSum < target || selected.length === 0) {
-			const have = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+			const have = candidates.reduce(
+				(s, u) => s + BigInt(u.value),
+				selectedSum
+			);
 			throw new Error(
 				`insufficient wallet funds for ${purpose}: need ${
 					target > 0n ? target : 0n

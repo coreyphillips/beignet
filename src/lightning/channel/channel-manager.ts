@@ -278,6 +278,33 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Re-enter a v2 auto-funded negotiation after async input sourcing —
+	 * needed when accept_channel2 beat the wallet's UTXO selection, leaving
+	 * the negotiation stalled on our first turn. Safe to call anytime; no-op
+	 * unless it is actually our turn.
+	 */
+	kickV2AutoFunding(peerPubkey: string, channel: Channel): void {
+		const actions = channel.kickV2Funding();
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * Direct funding: deliver a third-party input owner's witness and release
+	 * our (now complete) tx_signatures if everything else is ready.
+	 */
+	provideV2ExternalWitness(
+		peerPubkey: string,
+		channel: Channel,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): void {
+		channel.provideV2ExternalWitness(prevTxid, prevOutputIndex, witness);
+		const actions = channel.flushV2TxSignatures();
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
 	 * Get the next channel index (for per-channel key derivation).
 	 */
 	get nextChannelIndex(): number {
@@ -697,6 +724,18 @@ export class ChannelManager extends EventEmitter {
 			blindingPoint
 		);
 		this.processActions(peerPubkey, channel, actions);
+
+		// A rejected add (insufficient balance, quiescent/splicing channel, HTLC
+		// caps) surfaces as an ERROR action. Report it in the result — callers
+		// like the forwarding path make hold-vs-fail decisions on ok, and an
+		// "ok" add that never happened leaves the upstream HTLC dangling until
+		// its CLTV instead of failing fast.
+		const errAction = actions.find(
+			(a) => a.type === ChannelActionType.ERROR
+		) as { type: unknown; message?: string } | undefined;
+		if (errAction) {
+			return { ok: false, actions, error: errAction.message ?? 'add failed' };
+		}
 
 		// BOLT 2: after sending update_add_htlc we must send commitment_signed so
 		// the peer commits the HTLC. This kicks off the commitment exchange.
@@ -3486,8 +3525,43 @@ export class ChannelManager extends EventEmitter {
 			);
 			localParams.willFund = { signature, leaseRates: this.config.leaseRates };
 			localParams.fundingSatoshis = msg.requestFunds.requestedSats;
+
+			// Selling liquidity means actually contributing the leased amount:
+			// source wallet inputs BEFORE accept_channel2 goes out, so our
+			// interactive-tx turns can add them (the buyer validates that our
+			// inputs cover our declared funding). Without a funding provider,
+			// fall through with the paper lease only (hosts that fund manually,
+			// and unit tests).
+			if (this.fundingProvider?.selectSpliceInputs) {
+				this.fundingProvider
+					.selectSpliceInputs(
+						msg.requestFunds.requestedSats,
+						msg.fundingFeeratePerkw
+					)
+					.then(({ inputs, changeScript }) => {
+						channel.setV2FundingInputs(inputs, changeScript);
+						const actions = channel.handleOpenChannel2(msg, localParams);
+						this.processActions(peerPubkey, channel, actions);
+					})
+					.catch((err) => {
+						this.tempChannels.delete(tempId);
+						this.channelPeers.delete(tempId);
+						this.emit(
+							'error',
+							null,
+							`Liquidity lease funding failed: ${
+								err instanceof Error ? err.message : String(err)
+							}`
+						);
+					});
+				return;
+			}
 		}
 
+		// Take our interactive-tx turns automatically so an inbound v2 open
+		// completes without manual driving (contributing nothing unless funded
+		// above).
+		channel.enableV2AutoResponder();
 		const actions = channel.handleOpenChannel2(msg, localParams);
 		this.processActions(peerPubkey, channel, actions);
 	}

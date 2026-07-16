@@ -4,6 +4,7 @@
  */
 
 import { TLogLevel } from '../logger';
+import { IFormattedTransaction } from '../types/wallet';
 
 export interface NodeInfo {
 	nodeId: string;
@@ -43,6 +44,10 @@ export interface PeerInfo {
 
 export type ChannelStateString =
 	| 'NONE'
+	| 'SENT_OPEN'
+	| 'SENT_ACCEPT'
+	| 'SENT_FUNDING_CREATED'
+	| 'SENT_FUNDING_SIGNED'
 	| 'AWAITING_FUNDING_CONFIRMED'
 	| 'AWAITING_CHANNEL_READY'
 	| 'NORMAL'
@@ -50,6 +55,10 @@ export type ChannelStateString =
 	| 'NEGOTIATING_CLOSING'
 	| 'FORCE_CLOSED'
 	| 'AWAITING_REESTABLISH'
+	| 'DUAL_FUNDING_V2'
+	| 'AWAITING_TX_SIGNATURES'
+	| 'SPLICING'
+	| 'ERRORED'
 	| 'CLOSED'
 	| 'ANNOUNCEMENT_READY';
 
@@ -723,6 +732,13 @@ export interface PaymentValidationCheck {
 }
 
 export interface BeignetNodeEvents {
+	/** Onchain wallet activity (deposit detection for auto-channelization). */
+	'onchain:tx-received': (data: { transaction: IFormattedTransaction }) => void;
+	'onchain:tx-confirmed': (data: {
+		transaction: IFormattedTransaction;
+	}) => void;
+	'onchain:tx-sent': (data: { transaction: IFormattedTransaction }) => void;
+	'onchain:rbf': (data: { txids: string[] }) => void;
 	'payment:received': (info: PaymentInfo) => void;
 	'payment:sent': (info: PaymentInfo) => void;
 	'payment:failed': (info: PaymentInfo) => void;

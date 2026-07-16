@@ -28,7 +28,9 @@ import {
 	EBoostType,
 	EPaymentType,
 	IFormattedTransaction,
-	IOnchainFees
+	IOnchainFees,
+	TMessageDataMap,
+	TTransactionMessage
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
@@ -183,6 +185,17 @@ export interface BeignetNodeOptions {
 	 * the 2^24 sat funding cap (up to 10 BTC) for peers that also advertise it.
 	 */
 	largeChannels?: boolean;
+	/**
+	 * Liquidity ads (bLIP-0051) seller side: sell inbound liquidity at these
+	 * rates. A buyer's openChannelV2 requestFunds is answered with a signed
+	 * will_fund and the requested amount is contributed from this wallet.
+	 */
+	leaseRates?: import('../lightning/gossip/types').ILeaseRates;
+	/**
+	 * JIT channel receive (LSP role): intercept HTLCs for registered synthetic
+	 * SCIDs, open a zero-conf channel to the wallet, then forward.
+	 */
+	jitReceive?: import('../lightning/liquidity/jit-receive').IJitReceiveConfig;
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -503,6 +516,7 @@ export class BeignetNode extends EventEmitter {
 
 	private wallet!: Wallet;
 	private node!: LightningNode;
+	private _initialSync?: Promise<void>;
 	private storage!: SqliteStorage;
 	/** Wallet-owned output script that force-close sweeps pay into. */
 	private sweepDestinationScript?: Buffer;
@@ -716,6 +730,10 @@ export class BeignetNode extends EventEmitter {
 				servers: electrumServer
 			},
 			disableMessagesOnCreate: true,
+			// Surface on-chain wallet activity as node events (deposit detection
+			// for auto-channelization). Messages stay disabled during the initial
+			// full refresh, so these fire only for live activity after startup.
+			onMessage: (key, data): void => this.handleWalletMessage(key, data),
 			// Route wallet diagnostics through the injected logger when provided;
 			// otherwise keep the wallet's default console logger (status quo).
 			...(this.logger ? { logger: this.logger } : {}),
@@ -854,6 +872,8 @@ export class BeignetNode extends EventEmitter {
 			fundingProvider,
 			preferAnchors: opts.preferAnchors,
 			largeChannels: opts.largeChannels,
+			leaseRates: opts.leaseRates,
+			jitReceive: opts.jitReceive,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			logger: this.logger,
@@ -1180,6 +1200,82 @@ export class BeignetNode extends EventEmitter {
 		if (this.sweepDestinationScript) {
 			this.runFallbackRecoveryWhenConnected();
 		}
+
+		// 14. Initial wallet sync, in the background so create() keeps its
+		// historical timing. Without this the wallet never calls
+		// subscribeToAddresses, so incoming on-chain transactions are invisible
+		// until someone manually refreshes. Await waitForInitialSync() when you
+		// need the balance and live deposit events to be reliable.
+		this._initialSync = this.wallet
+			.refreshWallet({})
+			.then((res) => {
+				if (res.isErr()) {
+					this.log('warn', 'Initial wallet refresh failed', {
+						error: res.error.message
+					});
+				}
+			})
+			.catch((err) => {
+				this.log('warn', 'Initial wallet refresh failed', {
+					error: err instanceof Error ? err.message : String(err)
+				});
+			});
+	}
+
+	/**
+	 * Resolves once the startup wallet refresh (balance scan + Electrum address
+	 * subscriptions) has completed. After this, getBalance() reflects the chain
+	 * and onchain:tx-* events fire for live activity.
+	 */
+	async waitForInitialSync(): Promise<void> {
+		await this._initialSync;
+	}
+
+	/**
+	 * Re-emit on-chain wallet messages as node events so hosts can react to
+	 * deposits without polling: 'onchain:tx-received' (first seen, usually
+	 * mempool), 'onchain:tx-confirmed', 'onchain:tx-sent', 'onchain:rbf'
+	 * (replaced txids). The wallet's own Electrum subscription triggers a
+	 * refreshWallet before these fire, so balances are already updated.
+	 */
+	private handleWalletMessage<K extends keyof TMessageDataMap>(
+		key: K,
+		data: TMessageDataMap[K]
+	): void {
+		switch (key) {
+			case 'transactionReceived': {
+				const tx = (data as TTransactionMessage).transaction;
+				this.log('info', 'Onchain transaction received', {
+					txid: tx.txid,
+					value: tx.value
+				});
+				this.emit('onchain:tx-received', { transaction: tx });
+				break;
+			}
+			case 'transactionConfirmed': {
+				const tx = (data as TTransactionMessage).transaction;
+				this.log('info', 'Onchain transaction confirmed', {
+					txid: tx.txid,
+					height: tx.height
+				});
+				this.emit('onchain:tx-confirmed', { transaction: tx });
+				break;
+			}
+			case 'transactionSent': {
+				const tx = (data as TTransactionMessage).transaction;
+				this.emit('onchain:tx-sent', { transaction: tx });
+				break;
+			}
+			case 'rbf': {
+				this.log('info', 'Onchain transaction replaced (RBF)', {
+					txids: data as string[]
+				});
+				this.emit('onchain:rbf', { txids: data as string[] });
+				break;
+			}
+			default:
+				break;
+		}
 	}
 
 	/**
@@ -1233,6 +1329,21 @@ export class BeignetNode extends EventEmitter {
 			});
 		}
 		return result;
+	}
+
+	// ─────────────── Escape hatches ───────────────
+
+	/**
+	 * Direct access to the underlying LightningNode for features BeignetNode
+	 * does not proxy (held forwards, routing-hint injection, custom messages).
+	 */
+	get lightningNode(): LightningNode {
+		return this.node;
+	}
+
+	/** Direct access to the underlying on-chain Wallet. */
+	get onchainWallet(): Wallet {
+		return this.wallet;
 	}
 
 	// ─────────────── Info ───────────────
@@ -3889,13 +4000,36 @@ export class BeignetNode extends EventEmitter {
 			fundingFeeratePerkw?: number;
 			commitmentFeeratePerkw?: number;
 			locktime?: number;
+			/** Buyer side of liquidity ads: request the peer lease us inbound. */
+			requestFunds?: { requestedSats: number; blockheight: number };
+			/** Buyer's local price ceiling for the lease (required w/ requestFunds). */
+			maxLeaseRates?: import('../lightning/gossip/types').ILeaseRates;
+			/**
+			 * Auto-fund from the wallet, optionally from specific outpoints
+			 * (auto-channelization of a deposit). Drives the whole open
+			 * automatically.
+			 */
+			autoFund?: {
+				utxos?: Array<{ txid: string; vout: number }>;
+				allowTopUp?: boolean;
+			};
 		}
 	): ChannelInfo {
 		const channel = this.node.openChannelV2(peerPubkey, {
 			fundingSatoshis: BigInt(params.amountSats),
 			fundingFeeratePerkw: params.fundingFeeratePerkw,
 			commitmentFeeratePerkw: params.commitmentFeeratePerkw,
-			locktime: params.locktime
+			locktime: params.locktime,
+			...(params.requestFunds
+				? {
+						requestFunds: {
+							requestedSats: BigInt(params.requestFunds.requestedSats),
+							blockheight: params.requestFunds.blockheight
+						}
+				  }
+				: {}),
+			maxLeaseRates: params.maxLeaseRates,
+			autoFund: params.autoFund
 		});
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -3917,10 +4051,20 @@ export class BeignetNode extends EventEmitter {
 	spliceIn(
 		channelId: string,
 		amountSats: number,
-		feeratePerkw: number
+		feeratePerkw: number,
+		opts?: {
+			/** Splice in these specific outpoints (e.g. a detected deposit). */
+			utxos?: Array<{ txid: string; vout: number }>;
+			allowTopUp?: boolean;
+		}
 	): SpliceResult {
 		const idBuf = Buffer.from(channelId, 'hex');
-		const result = this.node.spliceIn(idBuf, BigInt(amountSats), feeratePerkw);
+		const result = this.node.spliceIn(
+			idBuf,
+			BigInt(amountSats),
+			feeratePerkw,
+			opts
+		);
 		// The SCB is refreshed on the splice:complete event (when fundingTxid holds
 		// the new outpoint), NOT here at initiation where it still holds the old one.
 		return result;

@@ -123,6 +123,22 @@ import {
 } from '../invoice/types';
 import { MessageType } from '../message/types';
 import {
+	BEIGNET_CUSTOM_MESSAGE_TYPE,
+	BeignetCustomSubtype,
+	decodeCustomMessage,
+	encodeCustomMessage
+} from '../message/custom';
+import {
+	JitReceiveManager,
+	IHeldJitPart,
+	allocateInterceptScid,
+	decodeJitAuthorization,
+	encodeJitAuthorization,
+	encodeJitAck,
+	decodeJitAck,
+	IJitReceiveAck
+} from '../liquidity/jit-receive';
+import {
 	PEER_STORAGE_MAX_BYTES,
 	encodePeerStorageMessage,
 	decodePeerStorageMessage,
@@ -421,6 +437,8 @@ export class LightningNode extends EventEmitter {
 	private onionMessageManager: OnionMessageManager;
 	private offerManager: OfferManager;
 	private asyncPaymentManager: AsyncPaymentManager;
+	/** JIT channel receive engine (LSP role) — set when config.jitReceive.enabled. */
+	private jitReceiveManager?: JitReceiveManager;
 	// LSP-side: forwards parked for offline receivers, keyed by payment hash hex.
 	private heldForwards: Map<
 		string,
@@ -577,7 +595,8 @@ export class LightningNode extends EventEmitter {
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
 			signerFactory: config.signerFactory,
-			largeChannels: this.largeChannels
+			largeChannels: this.largeChannels,
+			leaseRates: config.leaseRates
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
@@ -592,6 +611,44 @@ export class LightningNode extends EventEmitter {
 			onionMessageManager: this.onionMessageManager
 		});
 		this.wireOfferManagerEvents();
+
+		// JIT channel receive (LSP role): hold HTLCs addressed to registered
+		// intercept SCIDs, open a zero-conf channel to the wallet, forward.
+		if (config.jitReceive?.enabled) {
+			this.jitReceiveManager = new JitReceiveManager(
+				{
+					openZeroConfChannelAndWait: (walletPubkeyHex, fundingSats, timeoutMs) =>
+						this.openZeroConfChannelAndWait(
+							walletPubkeyHex,
+							fundingSats,
+							timeoutMs
+						),
+					forwardOnto: (outChannelId, part) =>
+						this.forwardHtlcOnto(outChannelId, part),
+					getBlockHeight: () => this.currentBlockHeight,
+					failureCodes: {
+						unknownNextPeer: UNKNOWN_NEXT_PEER,
+						temporaryChannelFailure: TEMPORARY_CHANNEL_FAILURE
+					},
+					isJitClientChannel: (outChannelId) => {
+						const peer = this.channelManager.getPeerForChannel(outChannelId);
+						return !!peer && this.channelManager.isTrustedPeer(peer);
+					},
+					spliceInAndWait: (channelId, amountSats, timeoutMs) =>
+						this.spliceInAndWait(channelId, amountSats, timeoutMs)
+				},
+				config.jitReceive
+			);
+			for (const evt of [
+				'jit:intent',
+				'jit:intercepted',
+				'jit:funding',
+				'jit:forwarded',
+				'jit:failed'
+			]) {
+				this.jitReceiveManager.on(evt, (data) => this.emit(evt, data));
+			}
+		}
 
 		this.asyncPaymentManager = new AsyncPaymentManager();
 		this.asyncPaymentManager.attachOnionMessageManager(
@@ -615,6 +672,7 @@ export class LightningNode extends EventEmitter {
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			this.registerGossipHandlers();
+			this.registerCustomMessageHandler();
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
 			this.wirePeerManagerEvents();
@@ -1330,6 +1388,10 @@ export class LightningNode extends EventEmitter {
 			'channel:accepted',
 			(channel: Channel, peerPubkey: string) => {
 				if (!this.fundingProvider) return;
+				// v2 (dual-funded) opens build their funding tx inside the
+				// interactive-tx negotiation — the v1 wallet-send path here would
+				// build a SECOND, competing funding transaction.
+				if (channel.getFullState().fundingVersion === 2) return;
 				this.handleAutoFunding(channel, peerPubkey);
 			}
 		);
@@ -1565,6 +1627,18 @@ export class LightningNode extends EventEmitter {
 			// (it can be stale, e.g. from a pre-splice funding generation).
 			void this.signAnnouncementForScid(channelId, state.shortChannelId);
 		}
+	}
+
+	private registerCustomMessageHandler(): void {
+		if (!this.peerManager) return;
+		// Beignet↔beignet custom traffic rides one odd type; route it through
+		// handlePeerMessage (which decodes + dispatches + emits).
+		this.peerManager.onMessage(
+			BEIGNET_CUSTOM_MESSAGE_TYPE,
+			(pubkey, msgType, payload) => {
+				this.handlePeerMessage(pubkey, msgType, payload);
+			}
+		);
 	}
 
 	private registerGossipHandlers(): void {
@@ -3175,6 +3249,188 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Open a zero-conf channel and resolve with the (funding-derived) channel
+	 * id once it is usable. Zero-conf skips confirmation, so this typically
+	 * resolves within seconds of funding broadcast. Used by the JIT engine.
+	 */
+	async openZeroConfChannelAndWait(
+		peerPubkey: string,
+		fundingSatoshis: bigint,
+		timeoutMs = 120_000
+	): Promise<Buffer> {
+		const before = new Set(
+			this.channelManager
+				.listChannels()
+				.filter(
+					(c) =>
+						c.getFullState().state === ChannelState.NORMAL &&
+						this.channelManager.getPeerForChannel(c.getChannelId()!) === peerPubkey
+				)
+				.map((c) => c.getChannelId()!.toString('hex'))
+		);
+		const channel = this.openZeroConfChannel(peerPubkey, fundingSatoshis);
+		if (!channel) {
+			throw new Error('openZeroConfChannel failed (peer not trusted?)');
+		}
+		const start = Date.now();
+		// The channel id changes from temporary to funding-derived during the
+		// open, so readiness is detected by peer + NORMAL state, not by id.
+		while (Date.now() - start < timeoutMs) {
+			for (const c of this.channelManager.listChannels()) {
+				const cid = c.getChannelId();
+				if (!cid) continue;
+				const cidHex = cid.toString('hex');
+				if (before.has(cidHex)) continue;
+				if (c.getFullState().state !== ChannelState.NORMAL) continue;
+				if (this.channelManager.getPeerForChannel(cid) !== peerPubkey) continue;
+				return cid;
+			}
+			await new Promise((r) => setTimeout(r, 250));
+		}
+		throw new Error(
+			`zero-conf channel to ${peerPubkey.slice(0, 12)} not ready within ${timeoutMs}ms`
+		);
+	}
+
+	/**
+	 * Direct funding: deliver the witness a third-party input owner produced
+	 * for a v2 open this node initiated with an `external` input, releasing
+	 * our tx_signatures once complete.
+	 */
+	provideV2ExternalWitness(
+		peerPubkeyHex: string,
+		channel: Channel,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): void {
+		this.channelManager.provideV2ExternalWitness(
+			peerPubkeyHex,
+			channel,
+			prevTxid,
+			prevOutputIndex,
+			witness
+		);
+	}
+
+	/**
+	 * Splice own funds into a channel and resolve once the splice is locked
+	 * (channel usable again). Used by the JIT engine for on-the-fly funding of
+	 * oversized receives.
+	 */
+	async spliceInAndWait(
+		channelId: Buffer,
+		amountSats: bigint,
+		timeoutMs = 120_000
+	): Promise<void> {
+		const cidHex = channelId.toString('hex');
+		const done = new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				cleanup();
+				reject(new Error(`splice on ${cidHex.slice(0, 12)} not locked within ${timeoutMs}ms`));
+			}, timeoutMs);
+			const onComplete = (data: { channelId: Buffer }): void => {
+				if (data.channelId.toString('hex') !== cidHex) return;
+				cleanup();
+				resolve();
+			};
+			const onError = (err: ILightningError): void => {
+				if (err.channelId?.toString('hex') !== cidHex) return;
+				if (err.code !== 'SPLICE_IN_FAILED') return;
+				cleanup();
+				reject(new Error(err.message));
+			};
+			const cleanup = (): void => {
+				clearTimeout(timer);
+				this.removeListener('splice:complete', onComplete);
+				this.removeListener('node:error', onError);
+			};
+			this.on('splice:complete', onComplete);
+			this.on('node:error', onError);
+		});
+
+		const result = this.spliceIn(channelId, amountSats);
+		if (!result.ok) {
+			throw new Error(result.error ?? 'splice-in failed to start');
+		}
+		await done;
+	}
+
+	/**
+	 * Wallet side of JIT receive: register a receive intent with the LSP and
+	 * return the routing hint (LSP → synthetic intercept SCID) to embed in the
+	 * invoice via createInvoice({ extraRoutingHints }).
+	 */
+	async requestJitReceive(
+		lspPubkeyHex: string,
+		params: {
+			paymentHash?: Buffer;
+			maxAmountMsat: bigint;
+			expectedTotalMsat?: bigint;
+			targetRemainingInboundSat: bigint;
+			expirySeconds?: number;
+			timeoutMs?: number;
+		}
+	): Promise<{ interceptScid: Buffer; hint: IRoutingHintHop }> {
+		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
+		if (pubkeyErr) throw new Error(pubkeyErr);
+		const interceptScid = allocateInterceptScid();
+
+		const ackPromise = new Promise<IJitReceiveAck>((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.removeListener('custom-message', onMsg);
+				reject(new Error('timed out waiting for JIT ack from LSP'));
+			}, params.timeoutMs ?? 15_000);
+			const onMsg = (msg: {
+				peerPubkey: string;
+				subtype: number;
+				payload: Buffer;
+			}): void => {
+				if (msg.peerPubkey !== lspPubkeyHex) return;
+				if (msg.subtype !== BeignetCustomSubtype.JIT_RECEIVE_ACK) return;
+				try {
+					const ack = decodeJitAck(msg.payload);
+					if (!ack.interceptScid.equals(interceptScid)) return;
+					clearTimeout(timer);
+					this.removeListener('custom-message', onMsg);
+					resolve(ack);
+				} catch {
+					// ignore malformed acks
+				}
+			};
+			this.on('custom-message', onMsg);
+		});
+
+		this.sendCustomMessage(
+			lspPubkeyHex,
+			BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION,
+			encodeJitAuthorization({
+				paymentHash: params.paymentHash,
+				interceptScid,
+				maxAmountMsat: params.maxAmountMsat,
+				expectedTotalMsat: params.expectedTotalMsat,
+				targetRemainingInboundSat: params.targetRemainingInboundSat,
+				expirySeconds: params.expirySeconds ?? 3600
+			})
+		);
+
+		const ack = await ackPromise;
+		if (!ack.accepted) {
+			throw new Error(`LSP declined JIT receive: ${ack.reason ?? 'no reason'}`);
+		}
+		return {
+			interceptScid,
+			hint: {
+				pubkey: Buffer.from(lspPubkeyHex, 'hex'),
+				shortChannelId: interceptScid,
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 80
+			}
+		};
+	}
+
 	destroy(): void {
 		this._destroyed = true;
 		this.stopCleanupTimer();
@@ -3508,6 +3764,17 @@ export class LightningNode extends EventEmitter {
 			 * signed rates imply a higher fee.
 			 */
 			maxLeaseRates?: import('../gossip/types').ILeaseRates;
+			/**
+			 * Auto-fund the open from the on-chain wallet: source inputs via the
+			 * funding provider (optionally restricted to specific outpoints, e.g.
+			 * channelizing a deposit), then drive the interactive tx and sign the
+			 * inputs automatically. Without this, the caller must drive the
+			 * negotiation manually (addTxInput/sendTxComplete/sendTxSignatures).
+			 */
+			autoFund?: {
+				utxos?: Array<{ txid: string; vout: number }>;
+				allowTopUp?: boolean;
+			};
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -3554,7 +3821,44 @@ export class LightningNode extends EventEmitter {
 			maxLeaseRates: params.maxLeaseRates
 		};
 
-		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams);
+		if (params.autoFund && !this.fundingProvider?.selectSpliceInputs) {
+			throw new Error(
+				'autoFund requires a funding provider with selectSpliceInputs (wallet UTXO sourcing)'
+			);
+		}
+
+		const channel = this.channelManager.createDualFundedChannel(
+			peerPubkey,
+			dualParams
+		);
+
+		// Auto-funding: source wallet inputs covering our contribution plus our
+		// fee share, stash them on the channel, and let it drive the interactive
+		// tx from accept_channel2 onward. Sourcing is async but the negotiation
+		// only needs the inputs once accept_channel2 arrives; failures surface
+		// via node:error and abort the open.
+		if (params.autoFund) {
+			this.fundingProvider!.selectSpliceInputs!(
+				params.fundingSatoshis,
+				dualParams.fundingFeeratePerkw,
+				params.autoFund
+			)
+				.then(({ inputs, changeScript }) => {
+					channel.setV2FundingInputs(inputs, changeScript);
+					// If accept_channel2 already arrived, the negotiation is stalled
+					// on our first turn — re-enter the drive.
+					this.channelManager.kickV2AutoFunding(peerPubkey, channel);
+				})
+				.catch((err) => {
+					this.emit('node:error', {
+						code: 'V2_AUTO_FUNDING_FAILED',
+						message: (err as Error).message,
+						timestamp: Date.now()
+					} as ILightningError);
+				});
+		}
+
+		return channel;
 	}
 
 	createFunding(
@@ -3998,11 +4302,17 @@ export class LightningNode extends EventEmitter {
 	 * @param channelId - The channel to splice into
 	 * @param amountSats - Amount to add (positive value)
 	 * @param fundingFeeratePerkw - Feerate for the splice tx (default 253)
+	 * @param opts - Optional caller-directed UTXO selection (e.g. splice in a
+	 *   specific deposit for auto-channelization)
 	 */
 	spliceIn(
 		channelId: Buffer,
 		amountSats: bigint,
-		fundingFeeratePerkw = 253
+		fundingFeeratePerkw = 253,
+		opts?: {
+			utxos?: Array<{ txid: string; vout: number }>;
+			allowTopUp?: boolean;
+		}
 	): { ok: boolean; error?: string } {
 		const cidErr = validateBuffer(channelId, 32, 'channelId');
 		if (cidErr) throw new Error(cidErr);
@@ -4044,7 +4354,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		this.fundingProvider
-			.selectSpliceInputs(amountSats, fundingFeeratePerkw)
+			.selectSpliceInputs(amountSats, fundingFeeratePerkw, opts)
 			.then(({ inputs, changeScript }) => {
 				channel.setSpliceInInputs(inputs, changeScript);
 				const result = this.channelManager.initiateSplice(
@@ -5597,7 +5907,13 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Build routing hints for all channels
-		const routingHints = this.getPrivateChannelRoutingHints();
+		const routingHints = [
+			...this.getPrivateChannelRoutingHints(),
+			// Caller-injected hints (e.g. a JIT intercept SCID through the LSP,
+			// from requestJitReceive) — the invoice becomes payable through a
+			// channel that does not exist yet.
+			...(options.extraRoutingHints ?? [])
+		];
 
 		// Warn if we have a NORMAL channel that could receive (has inbound) but
 		// produced no hint — payers may then be unable to find a route to us
@@ -7494,6 +7810,28 @@ export class LightningNode extends EventEmitter {
 		const scidHex = outgoingScid.toString('hex');
 		const outChannelId = this.scidToChannelId.get(scidHex);
 		if (!outChannelId) {
+			// JIT receive (LSP role): an unknown SCID may be a registered
+			// intercept SCID — hold the HTLC and open/fund a channel to the
+			// wallet instead of failing it.
+			if (
+				this.jitReceiveManager?.tryInterceptUnknownScid(scidHex, {
+					inChannelId,
+					inHtlcId,
+					paymentHash,
+					forwardAmountMsat: forwardAmount,
+					forwardCltv,
+					incomingCltvExpiry,
+					nextPacket,
+					nextBlindingPoint,
+					failIncoming
+				})
+			) {
+				this.emitStructuredLog('htlc', 'jit_intercepted', {
+					scid: scidHex,
+					amountMsat: forwardAmount.toString()
+				});
+				return;
+			}
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
 		}
@@ -7538,43 +7876,17 @@ export class LightningNode extends EventEmitter {
 		// complete the whole fulfillment chain during addHtlc, so we track the
 		// outgoing→incoming link BEFORE forwarding (same timing as payment storage).
 		const performForward = (): void => {
-			const nextOnionBuf = encodeOnionPacket(nextPacket);
-			const outChannel = this.channelManager.getChannel(outChannelId);
-			const outHtlcId = outChannel
-				? outChannel.getFullState().localHtlcCounter
-				: 0n;
-			const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
-			this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-			this.safeStorage(
-				() => this.storage!.saveForwardedHtlc(outKey, inChannelId, inHtlcId),
-				'saveForwardedHtlc'
-			);
-
-			// For a blinded forward, hand the next hop its blinding point and use the
-			// payment_relay-derived amount/CLTV.
-			const result = this.channelManager.addHtlc(
-				outChannelId,
-				forwardAmount,
-				paymentHash,
-				forwardCltv,
-				nextOnionBuf,
-				nextBlindingPoint
-			);
-
-			if (!result.ok) {
-				// Forward failed — fail the incoming HTLC back
-				this.forwardedHtlcs.delete(outKey);
-				failIncoming(TEMPORARY_CHANNEL_FAILURE);
-				return;
-			}
-
-			this.emit(
-				'htlc:forward',
+			this.forwardHtlcOnto(outChannelId, {
 				inChannelId,
-				outChannelId,
-				forwardAmount,
-				paymentHash
-			);
+				inHtlcId,
+				paymentHash,
+				forwardAmountMsat: forwardAmount,
+				forwardCltv,
+				incomingCltvExpiry,
+				nextPacket,
+				nextBlindingPoint,
+				failIncoming
+			});
 		};
 
 		// Async payments (LSP role): the recipient's blinded path marked this hop
@@ -7608,6 +7920,69 @@ export class LightningNode extends EventEmitter {
 		}
 
 		performForward();
+	}
+
+	/**
+	 * Forward a (possibly previously held) HTLC part onto a specific outgoing
+	 * channel. Shared by the normal forwarding path, async-payment releases,
+	 * and JIT releases — where the outgoing channel did not even exist when
+	 * the HTLC arrived.
+	 */
+	private forwardHtlcOnto(outChannelId: Buffer, part: IHeldJitPart): void {
+		const nextOnionBuf = encodeOnionPacket(part.nextPacket);
+		const outChannel = this.channelManager.getChannel(outChannelId);
+		const outHtlcId = outChannel
+			? outChannel.getFullState().localHtlcCounter
+			: 0n;
+		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
+		this.forwardedHtlcs.set(outKey, {
+			inChannelId: part.inChannelId,
+			inHtlcId: part.inHtlcId
+		});
+		this.safeStorage(
+			() =>
+				this.storage!.saveForwardedHtlc(
+					outKey,
+					part.inChannelId,
+					part.inHtlcId
+				),
+			'saveForwardedHtlc'
+		);
+
+		// For a blinded forward, hand the next hop its blinding point and use the
+		// payment_relay-derived amount/CLTV.
+		const result = this.channelManager.addHtlc(
+			outChannelId,
+			part.forwardAmountMsat,
+			part.paymentHash,
+			part.forwardCltv,
+			nextOnionBuf,
+			part.nextBlindingPoint
+		);
+
+		if (!result.ok) {
+			// Forward failed — insufficient outgoing balance or the channel is
+			// mid-splice/quiescent. For a trusted JIT client, hold the part and
+			// splice our own funds in instead of failing (on-the-fly funding).
+			this.forwardedHtlcs.delete(outKey);
+			if (this.jitReceiveManager?.tryHoldForSplice(outChannelId, part)) {
+				this.emitStructuredLog('htlc', 'jit_held_for_splice', {
+					channelId: outChannelId.toString('hex'),
+					amountMsat: part.forwardAmountMsat.toString()
+				});
+				return;
+			}
+			part.failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+
+		this.emit(
+			'htlc:forward',
+			part.inChannelId,
+			outChannelId,
+			part.forwardAmountMsat,
+			part.paymentHash
+		);
 	}
 
 	/**
@@ -8405,8 +8780,60 @@ export class LightningNode extends EventEmitter {
 			this.onionMessageManager.handleMessage(pubkey, payload);
 		}
 
+		// Beignet↔beignet custom traffic (odd type — unknown peers ignore it).
+		if (type === BEIGNET_CUSTOM_MESSAGE_TYPE) {
+			try {
+				const msg = decodeCustomMessage(payload);
+				// JIT receive authorization (LSP role): register + ack.
+				if (
+					msg.subtype === BeignetCustomSubtype.JIT_RECEIVE_AUTHORIZATION &&
+					this.jitReceiveManager
+				) {
+					const auth = decodeJitAuthorization(msg.payload);
+					const ack = this.jitReceiveManager.registerIntent(pubkey, auth);
+					this.sendCustomMessage(
+						pubkey,
+						BeignetCustomSubtype.JIT_RECEIVE_ACK,
+						encodeJitAck(ack)
+					);
+				}
+				this.emit('custom-message', {
+					peerPubkey: pubkey,
+					version: msg.version,
+					subtype: msg.subtype,
+					payload: msg.payload
+				});
+			} catch (err) {
+				this.emitStructuredLog('peer', 'custom_message_decode_failed', {
+					pubkey,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			}
+			return;
+		}
+
 		// Route channel messages to ChannelManager
 		this.channelManager.handleMessage(pubkey, type, payload);
+	}
+
+	/**
+	 * Send a beignet custom message to a connected peer. Carried on a single
+	 * odd wire type, so non-beignet peers silently ignore it (BOLT 1).
+	 */
+	sendCustomMessage(
+		peerPubkeyHex: string,
+		subtype: number,
+		payload: Buffer
+	): void {
+		if (!this.peerManager) {
+			throw new Error('Networking is not enabled on this node');
+		}
+		const envelope = encodeCustomMessage(subtype, payload);
+		this.peerManager.sendToPeer(
+			peerPubkeyHex,
+			BEIGNET_CUSTOM_MESSAGE_TYPE,
+			envelope
+		);
 	}
 
 	// ─────────────── Chain Monitor Delegation ───────────────
@@ -8765,6 +9192,8 @@ export class LightningNode extends EventEmitter {
 			webSocketImpl?: import('../transport/websocket').WebSocketConstructor;
 			preferAnchors?: boolean;
 			largeChannels?: boolean;
+			leaseRates?: import('../gossip/types').ILeaseRates;
+			jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
@@ -8830,6 +9259,8 @@ export class LightningNode extends EventEmitter {
 			webSocketImpl: options?.webSocketImpl,
 			preferAnchors: options?.preferAnchors,
 			largeChannels: options?.largeChannels,
+			leaseRates: options?.leaseRates,
+			jitReceive: options?.jitReceive,
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
 			peerStorageEnabled: options?.peerStorageEnabled,

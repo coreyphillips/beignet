@@ -62,8 +62,75 @@ import {
 	POLLING_INTERVAL
 } from '../shapes';
 
+/**
+ * ─── Multi-instance fan-out ───
+ * rn-electrum-client keeps ONE connection and ONE notification-callback slot
+ * per network for the entire process (module-level singleton). With a single
+ * Wallet that is fine; a second Wallet on the same network would silently
+ * stop receiving header/address notifications (its subscribe calls return
+ * "Already Subscribed." and its callbacks are dropped). To support several
+ * in-process instances (e.g. wallet + LSP in one test harness), exactly one
+ * process-level dispatcher per network is handed to the library, and it fans
+ * every notification out to all live Electrum instances, which route by
+ * scripthash locally.
+ */
+const liveInstances = new Map<string, Set<Electrum>>();
+const lastHeaderByNetwork = new Map<string, IHeader>();
+const headerDispatchers = new Map<string, (data: INewBlock[]) => void>();
+const addressDispatchers = new Map<string, (data: TSubscribedReceive) => void>();
+
+function registerInstance(network: string, instance: Electrum): void {
+	let set = liveInstances.get(network);
+	if (!set) {
+		set = new Set();
+		liveInstances.set(network, set);
+	}
+	set.add(instance);
+}
+
+/** Returns true when this was the last live instance on the network. */
+function unregisterInstance(network: string, instance: Electrum): boolean {
+	const set = liveInstances.get(network);
+	if (!set) return true;
+	set.delete(instance);
+	return set.size === 0;
+}
+
+function getHeaderDispatcher(network: string): (data: INewBlock[]) => void {
+	let dispatcher = headerDispatchers.get(network);
+	if (!dispatcher) {
+		dispatcher = (data): void => {
+			for (const instance of liveInstances.get(network) ?? []) {
+				void instance.handleHeaderNotification(data);
+			}
+		};
+		headerDispatchers.set(network, dispatcher);
+	}
+	return dispatcher;
+}
+
+function getAddressDispatcher(
+	network: string
+): (data: TSubscribedReceive) => void {
+	let dispatcher = addressDispatchers.get(network);
+	if (!dispatcher) {
+		dispatcher = (data): void => {
+			for (const instance of liveInstances.get(network) ?? []) {
+				void instance.handleAddressNotification(data);
+			}
+		};
+		addressDispatchers.set(network, dispatcher);
+	}
+	return dispatcher;
+}
+
 export class Electrum {
 	private readonly _wallet: Wallet;
+	/** Per-scripthash notification handlers for this instance (see fan-out). */
+	private _addressHandlers: Map<
+		string,
+		(data: TSubscribedReceive) => Promise<void>
+	> = new Map();
 	private sendMessage: TOnMessage;
 	private latestConnectionState: boolean | null = null;
 	private connectionPollingInterval: NodeJS.Timeout | null;
@@ -119,6 +186,7 @@ export class Electrum {
 		this.tls = tls;
 		this.batchLimit = batchLimit;
 		this.batchDelay = batchDelay;
+		registerInstance(this.electrumNetwork, this);
 		this.connectionPollingInterval = setInterval(
 			(): Promise<void> => this.checkConnection(),
 			POLLING_INTERVAL
@@ -966,19 +1034,7 @@ export class Electrum {
 		const subscribeResponse: ISubscribeToHeader =
 			await electrum.subscribeHeader({
 				network: this.electrumNetwork,
-				onReceive: async (data: INewBlock[]) => {
-					const hex = data[0].hex;
-					const hash = this.getBlockHashFromHex({ blockHex: hex });
-					const header: IHeader = { ...data[0], hash };
-					const reorgDetected = header.height < this.getBlockHeader().height;
-					await this._wallet.updateHeader(header);
-					if (reorgDetected) {
-						await this._wallet.checkUnconfirmedTransactions(reorgDetected);
-					}
-					await this._wallet.refreshWallet();
-					this.onReceive?.(data);
-					this.sendMessage(onMessageKeys.newBlock, data[0]);
-				}
+				onReceive: getHeaderDispatcher(this.electrumNetwork)
 			});
 		if (subscribeResponse.error) {
 			return err('Unable to subscribe to headers.');
@@ -986,14 +1042,47 @@ export class Electrum {
 		// eslint-disable-next-line @typescript-eslint/ban-ts-comment
 		// @ts-ignore
 		if (subscribeResponse?.data === 'Already Subscribed.') {
+			// Another instance holds the library-level subscription; adopt the
+			// freshest header this process has seen (our own storage may still
+			// be at height 0 for a brand-new wallet).
+			const known = lastHeaderByNetwork.get(this.electrumNetwork);
+			if (known && known.height > this.getBlockHeader().height) {
+				await this._wallet.updateHeader(known);
+				return ok(known);
+			}
 			return ok(this.getBlockHeader());
 		}
 		// Update local storage with current height and hex.
 		const hex = subscribeResponse.data.hex;
 		const hash = this.getBlockHashFromHex({ blockHex: hex });
 		const header = { ...subscribeResponse.data, hash };
+		lastHeaderByNetwork.set(this.electrumNetwork, header);
 		await this._wallet.updateHeader(header);
 		return ok(header);
+	}
+
+	/** Per-instance header notification (invoked via the network dispatcher). */
+	public async handleHeaderNotification(data: INewBlock[]): Promise<void> {
+		const hex = data[0].hex;
+		const hash = this.getBlockHashFromHex({ blockHex: hex });
+		const header: IHeader = { ...data[0], hash };
+		lastHeaderByNetwork.set(this.electrumNetwork, header);
+		const reorgDetected = header.height < this.getBlockHeader().height;
+		await this._wallet.updateHeader(header);
+		if (reorgDetected) {
+			await this._wallet.checkUnconfirmedTransactions(reorgDetected);
+		}
+		await this._wallet.refreshWallet();
+		this.onReceive?.(data);
+		this.sendMessage(onMessageKeys.newBlock, data[0]);
+	}
+
+	/** Per-instance address notification (invoked via the network dispatcher). */
+	public async handleAddressNotification(
+		data: TSubscribedReceive
+	): Promise<void> {
+		const handler = this._addressHandlers.get(data[0]);
+		if (handler) await handler(data);
 	}
 
 	/**
@@ -1044,15 +1133,18 @@ export class Electrum {
 			});
 		}
 
-		// Subscribe to all provided script hashes.
+		// Subscribe to all provided script hashes. The library keeps one
+		// notification callback per network (the dispatcher); this instance's
+		// per-scripthash behavior lives in _addressHandlers.
 		const allScriptHashesPromises = scriptHashes.map(async (scriptHash) => {
+			this._addressHandlers.set(scriptHash, async (data) => {
+				onReceive?.(data);
+				this._wallet.refreshWallet({});
+			});
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					this._wallet.refreshWallet({});
-				}
+				onReceive: getAddressDispatcher(this.electrumNetwork)
 			});
 			if (response.error) {
 				throw Error('Unable to subscribe to receiving addresses.');
@@ -1060,18 +1152,19 @@ export class Electrum {
 		});
 
 		const allUtxosPromises = allUtxos.map(async (utxo) => {
+			this._addressHandlers.set(utxo.scriptHash, async (data) => {
+				onReceive?.(data);
+				await this.getUtxos({
+					scanningStrategy: EScanningStrategy.singleIndex,
+					addressIndex: utxo.index,
+					changeAddressIndex: utxo.index
+				});
+				this._wallet.refreshWallet({});
+			});
 			const response: ISubscribeToAddress = await electrum.subscribeAddress({
 				scriptHash: utxo.scriptHash,
 				network: this.electrumNetwork,
-				onReceive: async (data: TSubscribedReceive): Promise<void> => {
-					onReceive?.(data);
-					await this.getUtxos({
-						scanningStrategy: EScanningStrategy.singleIndex,
-						addressIndex: utxo.index,
-						changeAddressIndex: utxo.index
-					});
-					this._wallet.refreshWallet({});
-				}
+				onReceive: getAddressDispatcher(this.electrumNetwork)
 			});
 			if (response.error) {
 				throw Error('Unable to subscribe to receiving addresses.');
@@ -1178,7 +1271,13 @@ export class Electrum {
 
 	public async disconnect(): Promise<void> {
 		this.stopConnectionPolling();
-		await electrum.stop();
+		this._addressHandlers.clear();
+		// The connection is shared by every instance on this network — only the
+		// last one out actually closes it.
+		const wasLast = unregisterInstance(this.electrumNetwork, this);
+		if (wasLast) {
+			await electrum.stop();
+		}
 	}
 
 	public startConnectionPolling(): void {

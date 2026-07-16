@@ -83,7 +83,13 @@ export interface IFundingProvider {
 	 */
 	selectSpliceInputs?(
 		amountSats: bigint,
-		feeratePerKw: number
+		feeratePerKw: number,
+		opts?: {
+			/** Restrict selection to exactly these outpoints (in order). */
+			utxos?: Array<{ txid: string; vout: number }>;
+			/** Allow adding wallet coins after the requested outpoints. */
+			allowTopUp?: boolean;
+		}
 	): Promise<{
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
@@ -193,6 +199,19 @@ export interface INodeConfig {
 	 * non-wumbo peers keep the 2^24 cap.
 	 */
 	largeChannels?: boolean;
+	/**
+	 * Liquidity ads (bLIP-0051) seller side: when set, this node sells inbound
+	 * liquidity at these rates — it answers a buyer's request_funds with a
+	 * signed will_fund and contributes the requested funds as the acceptor
+	 * (requires a funding provider with selectSpliceInputs).
+	 */
+	leaseRates?: import('../gossip/types').ILeaseRates;
+	/**
+	 * JIT channel receive (LSP role): hold HTLCs addressed to registered
+	 * intercept SCIDs, open a zero-conf channel to the wallet, then forward.
+	 * The wallet peer must be in this node's zero-conf trusted set.
+	 */
+	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/**
 	 * Propose simple taproot channels (option_taproot) when opening channels.
 	 * MuSig2 funding and commitment signing (deterministic verification nonces)
@@ -404,6 +423,12 @@ export interface ICreateInvoiceOptions {
 	 * (offline) node comes back and releases it. Requires `useBlindedPaths`.
 	 */
 	asyncHold?: boolean;
+	/**
+	 * Extra routing hints appended to the auto-generated per-channel hints —
+	 * e.g. a JIT intercept SCID through the LSP (requestJitReceive), which
+	 * makes the invoice payable through a channel that does not exist yet.
+	 */
+	extraRoutingHints?: import('../invoice/types').IRoutingHintHop[][];
 }
 
 export interface IChannelInfo {
