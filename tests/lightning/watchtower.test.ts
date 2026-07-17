@@ -530,6 +530,39 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		expect(Number(backup.sweptSats)).to.be.greaterThan(built.toLocalValue);
 	});
 
+	it('applies the P2WSH dust floor (330 sat) to a P2WSH sweep script', function () {
+		// A 34-byte P2WSH sweep: the dust floor is 330 sat, not the P2WPKH 294
+		// the old check hardcoded for every script type.
+		const sweepScript = Buffer.concat([
+			Buffer.from([0x00, 0x20]),
+			crypto.randomBytes(32)
+		]);
+		const built = buildRevokedContext(sweepScript);
+		// Sweep only to_local so the justice tx weight is deterministic.
+		const ctx: IJusticeContext = {
+			...built.ctx,
+			localPaymentPubkey: undefined,
+			paymentBasepointSecret: undefined
+		};
+		// Probe at 1 sat/wu (rate 1000): fee == weight, so the weight falls out.
+		const probe = buildJusticeBackup(ctx, {
+			blobType: BlobType.ALTRUIST_COMMIT,
+			sweepFeeRate: 1000n
+		});
+		const weight = BigInt(built.toLocalValue) - probe.sweptSats;
+		// Aim the sweep output at ~300 sat: above the P2WPKH floor (294) so the
+		// old flat check passed it, below the P2WSH floor (330) that actually
+		// applies to this script.
+		const targetFee = BigInt(built.toLocalValue) - 300n;
+		const rate = (targetFee * 1000n) / weight;
+		expect(() =>
+			buildJusticeBackup(ctx, {
+				blobType: BlobType.ALTRUIST_COMMIT,
+				sweepFeeRate: rate
+			})
+		).to.throw(/below the dust limit/);
+	});
+
 	it('the channel caches the revoked tx and returns it by revealed secret', function () {
 		const pair = freshPair();
 		// Two rounds: the first revoke reveals the funding-state point (never

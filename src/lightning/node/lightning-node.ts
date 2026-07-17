@@ -1742,7 +1742,15 @@ export class LightningNode extends EventEmitter {
 		header.write('bPS1', 0, 'ascii');
 		header.writeUInt32BE(blob.length, 4);
 		const framed = Buffer.concat([header, blob]);
-		if (framed.length >= PEER_STORAGE_MAX_BYTES) return framed;
+		if (framed.length > PEER_STORAGE_MAX_BYTES) {
+			// An over-max frame would be rejected by the wire encoder (and by the
+			// peer); throwing here keeps the failure loud instead of losing the
+			// backup inside a best-effort send path.
+			throw new Error(
+				`peer storage blob too large to frame: ${blob.length} + 8 > ${PEER_STORAGE_MAX_BYTES} bytes`
+			);
+		}
+		if (framed.length === PEER_STORAGE_MAX_BYTES) return framed;
 		return Buffer.concat([
 			framed,
 			Buffer.alloc(PEER_STORAGE_MAX_BYTES - framed.length)
@@ -1832,9 +1840,15 @@ export class LightningNode extends EventEmitter {
 	 * no backup.
 	 */
 	distributePeerStorage(blob: Buffer): number {
-		if (blob.length > PEER_STORAGE_MAX_BYTES) {
+		// The privacy padding (padOwnPeerStorageBlob) frames the blob with an
+		// 8-byte header before padding to the wire maximum, so the raw blob must
+		// leave room for it; otherwise a blob accepted here would throw (or be
+		// silently dropped by best-effort sends) at encode time.
+		if (blob.length > PEER_STORAGE_MAX_BYTES - 8) {
 			throw new Error(
-				`peer storage blob too large: ${blob.length} > ${PEER_STORAGE_MAX_BYTES} bytes`
+				`peer storage blob too large: ${blob.length} > ${
+					PEER_STORAGE_MAX_BYTES - 8
+				} bytes (${PEER_STORAGE_MAX_BYTES} wire max minus 8-byte framing)`
 			);
 		}
 		if (!this.peerStorageEnabled) return 0;

@@ -30,6 +30,7 @@ import {
 } from '../keys/derivation';
 import { buildToLocalScript } from '../script/commitment';
 import { buildToRemoteAnchorScript } from '../script/anchor';
+import { isDustOutput } from '../chain/closing';
 import {
 	buildTaprootToLocalOutput,
 	buildTaprootToRemoteOutput,
@@ -456,10 +457,11 @@ function buildJusticeTx(
 	}
 	// A dust justice output is unredeemable: the tower ships a blob that can
 	// never be mined, so a tiny channel silently loses breach protection.
-	// P2WPKH dust floor is 294 sat (the sweep is always a witness output).
-	if (sweepAmt < 294n) {
+	// The floor depends on the sweep script type (P2WPKH 294 / P2WSH 330 /
+	// other witness programs 354), so use the shared per-script check.
+	if (isDustOutput(ctx.sweepScript, sweepAmt)) {
 		throw new Error(
-			`watchtower: justice sweep output ${sweepAmt} sat is below the dust limit`
+			`watchtower: justice sweep output ${sweepAmt} sat is below the dust limit for the sweep script`
 		);
 	}
 

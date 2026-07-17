@@ -380,6 +380,42 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			node.destroy();
 		});
 
+		it('rejects a blob that leaves no room for the 8-byte privacy framing', function () {
+			// The padding frame adds 8 bytes; a raw blob in (65523, 65531] used to
+			// pass this check and then throw (or be silently dropped) at encode
+			// time. It must be rejected up front.
+			const node = makeNode();
+			expect(() =>
+				node.distributePeerStorage(Buffer.alloc(PEER_STORAGE_MAX_BYTES - 7))
+			).to.throw(/framing/);
+			node.destroy();
+		});
+
+		it('accepts a blob exactly at the framed capacity (wire max minus 8)', function () {
+			const node = makeNode({ enableNetworking: true });
+			const capablePk = '03'.repeat(33);
+			const capableFeatures = FeatureFlags.empty();
+			capableFeatures.setOptional(Feature.PROVIDE_STORAGE);
+			const sent: Array<{ pubkey: string; type: number; payload: Buffer }> = [];
+			(node as any).peerManager = {
+				listPeers: (): unknown[] => [{ pubkey: capablePk }],
+				getPeer: (): unknown => ({
+					getRemoteInit: (): unknown => ({ features: capableFeatures })
+				}),
+				sendToPeer: (pubkey: string, type: number, payload: Buffer): void => {
+					sent.push({ pubkey, type, payload });
+				},
+				destroy: (): void => {}
+			};
+			const blob = crypto.randomBytes(PEER_STORAGE_MAX_BYTES - 8);
+			expect(node.distributePeerStorage(blob)).to.equal(1);
+			const wire = decodePeerStorageMessage(sent[0].payload).blob;
+			expect(wire.length).to.equal(PEER_STORAGE_MAX_BYTES);
+			expect(wire.readUInt32BE(4)).to.equal(blob.length);
+			expect(wire.subarray(8).equals(blob)).to.equal(true);
+			node.destroy();
+		});
+
 		it('sends only to connected peers advertising the feature bit', function () {
 			const node = makeNode({ enableNetworking: true });
 			const capablePk = '03'.repeat(33);
