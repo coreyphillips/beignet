@@ -32,7 +32,7 @@ import {
 	estimateSweepVbytes,
 	encodeWitnessSignature
 } from './sweep';
-import { buildToLocalScript } from '../script/commitment';
+import { buildToLocalScript, csvFromToLocalScript } from '../script/commitment';
 import {
 	buildToRemoteAnchorOutput,
 	leaseCsvFromToRemoteScript
@@ -286,6 +286,29 @@ export function classifyCommitmentTx(
  * When local and remote commitment numbers are equal, differentiate by
  * comparing the to_local output scripts.
  */
+/**
+ * Every lease CSV this channel may have baked into a commitment script. The
+ * agreed blockheight advances over the channel's life (update_blockheight
+ * rounds, lessor side), so an OLD commitment appearing on-chain (force-close,
+ * breach) can carry any previously committed height's CSV — matchers must try
+ * them all. Includes the committed, staged, and last-signed heights plus the
+ * full promotion history; falls back to the full lease duration for legacy
+ * states that never recorded a height.
+ */
+function leaseCsvCandidates(state: IChannelState): number[] {
+	const csvs = new Set<number>();
+	const add = (h: number | undefined): void => {
+		const csv = leaseCsvBlocks(state.leaseExpiry, h);
+		if (csv !== undefined) csvs.add(csv);
+	};
+	add(state.leaseCommitBlockheight);
+	add(state.pendingLeaseBlockheight);
+	add(state.lastSignedCommitLeaseBlockheight);
+	for (const h of state.leaseHeightHistory ?? []) add(h);
+	if (csvs.size === 0) add(undefined); // legacy: full duration
+	return [...csvs];
+}
+
 function disambiguateCommitmentTx(
 	tx: bitcoin.Transaction,
 	state: IChannelState,
@@ -310,33 +333,45 @@ function disambiguateCommitmentTx(
 		state.localBasepoints.delayedPaymentBasepoint,
 		localPerCommitmentPoint
 	);
-	// Our to_local scriptPubKey: P2TR for taproot, P2WSH otherwise.
-	const ourToLocalSpk = isTaprootChannel(state.channelType)
-		? buildTaprootToLocalOutput(
-				ourRevocationPubkey,
-				ourDelayedPubkey,
-				state.remoteConfig.toSelfDelay
-		  ).output
-		: bitcoin.payments.p2wsh({
+	// Our to_local scriptPubKey candidates: P2TR for taproot, P2WSH otherwise.
+	// Liquidity ads: when WE are the lessor our to_local carries the lease CSV
+	// (mirrors buildLocalCommitment); the CSV depends on the agreed blockheight
+	// which update_blockheight advances, so every committed height's variant
+	// (plus the plain post-expiry form) must be tried for the match.
+	const ourToLocalSpks: Buffer[] = [];
+	if (isTaprootChannel(state.channelType)) {
+		const out = buildTaprootToLocalOutput(
+			ourRevocationPubkey,
+			ourDelayedPubkey,
+			state.remoteConfig.toSelfDelay
+		).output;
+		if (out) ourToLocalSpks.push(out);
+	} else {
+		const csvVariants: (number | undefined)[] =
+			state.isLessor && state.leaseExpiry
+				? [undefined, ...leaseCsvCandidates(state)]
+				: [undefined];
+		for (const csv of csvVariants) {
+			const out = bitcoin.payments.p2wsh({
 				redeem: {
-					// Liquidity ads: when WE are the lessor our to_local carries the
-					// lease CLTV lock (mirrors buildLocalCommitment), so the rebuilt
-					// script must include it for the byte-equality match to succeed.
 					output: buildToLocalScript(
 						ourRevocationPubkey,
 						ourDelayedPubkey,
 						state.remoteConfig.toSelfDelay,
-						state.isLessor
-							? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
-							: undefined
+						csv
 					)
 				}
-		  }).output;
+			}).output;
+			if (out) ourToLocalSpks.push(out);
+		}
+	}
 
 	// Check if any tx output matches our to_local script
 	for (const out of tx.outs) {
-		if (ourToLocalSpk && Buffer.from(out.script).equals(ourToLocalSpk)) {
-			return CommitmentType.OUR_COMMITMENT;
+		for (const spk of ourToLocalSpks) {
+			if (Buffer.from(out.script).equals(spk)) {
+				return CommitmentType.OUR_COMMITMENT;
+			}
 		}
 	}
 
@@ -489,19 +524,27 @@ function classifyOurCommitmentOutputs(
 	const remotePaymentPubkey = state.remoteBasepoints.paymentBasepoint;
 
 	const toSelfDelay = state.remoteConfig.toSelfDelay;
-	// Liquidity ads: when WE are the lessor our to_local carries the lease CLTV
-	// lock (mirrors buildLocalCommitment); without it the byte-equality match
-	// below never fires and the output would go untracked and unswept.
-	const toLocalScript = buildToLocalScript(
-		revocationPubkey,
-		localDelayedPubkey,
-		toSelfDelay,
-		state.isLessor
-			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
-			: undefined
-	);
-	const toLocalP2wsh = bitcoin.payments.p2wsh({
-		redeem: { output: toLocalScript }
+	// Liquidity ads: when WE are the lessor our to_local carries the lease CSV
+	// (mirrors buildLocalCommitment); without it the byte-equality match below
+	// never fires and the output would go untracked and unswept. The CSV
+	// depends on the agreed blockheight, which update_blockheight advances, so
+	// every committed height's variant (plus the plain post-expiry form) is a
+	// candidate.
+	const toLocalCsvVariants: (number | undefined)[] =
+		state.isLessor && state.leaseExpiry
+			? [undefined, ...leaseCsvCandidates(state)]
+			: [undefined];
+	const toLocalCandidates = toLocalCsvVariants.map((csv) => {
+		const witnessScript = buildToLocalScript(
+			revocationPubkey,
+			localDelayedPubkey,
+			toSelfDelay,
+			csv
+		);
+		return {
+			witnessScript,
+			spk: bitcoin.payments.p2wsh({ redeem: { output: witnessScript } }).output
+		};
 	});
 	const remoteP2wpkh = bitcoin.payments.p2wpkh({ pubkey: remotePaymentPubkey });
 	// Anchor channels carry the PEER's to_remote on our commitment as a P2WSH
@@ -536,7 +579,10 @@ function classifyOurCommitmentOutputs(
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
 
-		if (toLocalP2wsh.output && outScript.equals(toLocalP2wsh.output)) {
+		const toLocalMatch = toLocalCandidates.find(
+			(c) => c.spk && outScript.equals(c.spk)
+		);
+		if (toLocalMatch) {
 			outputs.push({
 				txid,
 				outputIndex: i,
@@ -544,7 +590,7 @@ function classifyOurCommitmentOutputs(
 				outputType: OutputType.TO_LOCAL,
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
-				witnessScript: toLocalScript
+				witnessScript: toLocalMatch.witnessScript
 			});
 			continue;
 		}
@@ -693,15 +739,16 @@ function classifyTheirCommitmentOutputs(
 		? buildToRemoteAnchorOutput(ourPaymentPubkey)
 		: null;
 	// Liquidity ads: when WE are the lessor, our balance on THEIR commitment is
-	// the lease-locked to_remote variant (CLTV until lease expiry). Match it
-	// first; the plain variant stays matched for pre-lease/legacy outputs.
-	const ourToRemoteAnchorLease =
+	// the lease-locked to_remote variant. Match every CSV this channel may
+	// have committed (update_blockheight advances the agreed height, and a
+	// REVOKED commitment carries the height in effect when it was signed);
+	// the plain variant stays matched for pre-lease/legacy/post-expiry outputs.
+	const ourToRemoteAnchorLeases =
 		ourToRemoteAnchor && state.isLessor && state.leaseExpiry
-			? buildToRemoteAnchorOutput(
-					ourPaymentPubkey,
-					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			? leaseCsvCandidates(state).map((csv) =>
+					buildToRemoteAnchorOutput(ourPaymentPubkey, csv)
 			  )
-			: null;
+			: [];
 
 	// HTLC keys from their perspective
 	const theirHtlcPubkey = derivePublicKey(
@@ -729,10 +776,10 @@ function classifyTheirCommitmentOutputs(
 			continue;
 		}
 
-		if (
-			ourToRemoteAnchorLease &&
-			outScript.equals(ourToRemoteAnchorLease.script)
-		) {
+		const toRemoteLeaseMatch = ourToRemoteAnchorLeases.find((c) =>
+			outScript.equals(c.script)
+		);
+		if (toRemoteLeaseMatch) {
 			outputs.push({
 				txid,
 				outputIndex: i,
@@ -740,9 +787,9 @@ function classifyTheirCommitmentOutputs(
 				outputType: OutputType.TO_REMOTE,
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
-				// The lease-locked witnessScript: the resolver reads the CLTV out
-				// of it to set the sweep's nLockTime.
-				witnessScript: ourToRemoteAnchorLease.witnessScript
+				// The lease-locked witnessScript: the resolver reads the CSV out
+				// of it to set the sweep's input sequence.
+				witnessScript: toRemoteLeaseMatch.witnessScript
 			});
 			continue;
 		}
@@ -833,13 +880,14 @@ function classifyTheirFutureCommitmentOutputs(
 			: null;
 	// Liquidity ads: a lessor's to_remote is the lease-locked variant. The
 	// lease fields ride along in the SCB, so this also works after recovery.
-	const anchorToRemoteLease =
+	// Try every CSV this channel may have committed (update_blockheight
+	// advances the agreed height over the channel's life).
+	const anchorToRemoteLeases =
 		anchorToRemote && state.isLessor && state.leaseExpiry
-			? buildToRemoteAnchorOutput(
-					ourPaymentPubkey,
-					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			? leaseCsvCandidates(state).map((csv) =>
+					buildToRemoteAnchorOutput(ourPaymentPubkey, csv)
 			  )
-			: null;
+			: [];
 	const plainToRemote =
 		!taprootToRemote && !anchorToRemote
 			? bitcoin.payments.p2wpkh({ pubkey: ourPaymentPubkey }).output
@@ -847,10 +895,11 @@ function classifyTheirFutureCommitmentOutputs(
 
 	for (let i = 0; i < tx.outs.length; i++) {
 		const outScript = tx.outs[i].script;
-		const isLeased =
-			!!anchorToRemoteLease && outScript.equals(anchorToRemoteLease.script);
+		const leaseMatch = anchorToRemoteLeases.find((c) =>
+			outScript.equals(c.script)
+		);
 		const isOurs =
-			isLeased ||
+			!!leaseMatch ||
 			(taprootToRemote
 				? outScript.equals(taprootToRemote)
 				: anchorToRemote
@@ -865,9 +914,9 @@ function classifyTheirFutureCommitmentOutputs(
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0,
 			// witnessScript signals the anchor (CSV-1) variant to the resolver;
-			// the lease variant additionally carries the CLTV the sweep must honor.
-			witnessScript: isLeased
-				? anchorToRemoteLease!.witnessScript
+			// the lease variant additionally carries the CSV the sweep must honor.
+			witnessScript: leaseMatch
+				? leaseMatch.witnessScript
 				: anchorToRemote?.witnessScript
 		});
 	}
@@ -1216,14 +1265,19 @@ export function resolveOurCommitmentOutputs(
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
 			// Liquidity ads (CLN pure-CSV): a lessor's to_local CSV is
 			// max(to_self_delay, lease_csv), so the sweep's input nSequence must
-			// satisfy that larger value, not just to_self_delay.
+			// satisfy that larger value, not just to_self_delay. Parse the CSV
+			// out of the ON-CHAIN script (update_blockheight can have advanced
+			// the height since this commitment was signed); the state-derived
+			// value stays as the fallback for non-parseable legacy scripts.
+			const scriptCsv = csvFromToLocalScript(output.witnessScript);
 			const leaseCsv = state.isLessor
 				? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
 				: undefined;
 			const toLocalCsv =
-				leaseCsv !== undefined && leaseCsv > toSelfDelay
+				scriptCsv ??
+				(leaseCsv !== undefined && leaseCsv > toSelfDelay
 					? leaseCsv
-					: toSelfDelay;
+					: toSelfDelay);
 			const sweepTx = buildToLocalSweepTx({
 				commitmentTxid: output.txid,
 				outputIndex: output.outputIndex,

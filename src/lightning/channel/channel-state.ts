@@ -390,6 +390,33 @@ export interface IChannelState {
 	 */
 	leaseCommitBlockheight?: number;
 	/**
+	 * Two-phase update_blockheight (bLIP-0051, mirrors the pendingFeerate
+	 * machine): the OPENER's staged blockheight. From receipt it applies to
+	 * verifying the opener's signatures over OUR commitment; it applies to
+	 * commitments WE sign only once signable, and is promoted to
+	 * leaseCommitBlockheight when the round finalizes.
+	 */
+	pendingLeaseBlockheight?: number;
+	pendingLeaseBlockheightSignable?: boolean;
+	pendingLeaseBlockheightCommitted?: boolean;
+	/**
+	 * The lease blockheight the CURRENT SIGNED local commitment was verified
+	 * at (mirrors lastSignedCommitFeeratePerKw): mid-blockheight-round the
+	 * in-flight value can differ from the committed one, and rebuilding the
+	 * signed commitment (force-close) with the wrong height changes the
+	 * lease-locked scripts and invalidates the stored signature.
+	 */
+	lastSignedCommitLeaseBlockheight?: number;
+	/**
+	 * Every DISTINCT leaseCommitBlockheight this channel has ever committed
+	 * (in promotion order, incl. the value at open). On-chain classification
+	 * of an OLD (revoked) commitment must rebuild its lease-locked scripts
+	 * with the blockheight in effect when THAT commitment was signed, so
+	 * matchers try these as candidates. Grows only when the opener's
+	 * update_blockheight rounds actually land (lessor side).
+	 */
+	leaseHeightHistory?: number[];
+	/**
 	 * Liquidity ads (bLIP-0051): the routing-fee caps the lessor signed into its
 	 * will_fund. While the lease is active the lessor MUST NOT advertise a
 	 * channel_update whose fees exceed these — the buyer paid for capped fees.

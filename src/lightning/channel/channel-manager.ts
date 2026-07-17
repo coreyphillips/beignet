@@ -23,7 +23,8 @@ import {
 	decodeUpdateFulfillHtlcMessage,
 	decodeUpdateFailHtlcMessage,
 	decodeUpdateFailMalformedHtlcMessage,
-	decodeUpdateFeeMessage
+	decodeUpdateFeeMessage,
+	decodeUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
 	decodeCommitmentSignedMessage,
@@ -373,6 +374,7 @@ export class ChannelManager extends EventEmitter {
 			MessageType.COMMITMENT_SIGNED,
 			MessageType.REVOKE_AND_ACK,
 			MessageType.UPDATE_FEE,
+			MessageType.UPDATE_BLOCKHEIGHT,
 			MessageType.SHUTDOWN,
 			MessageType.CLOSING_SIGNED,
 			MessageType.CLOSING_COMPLETE,
@@ -1657,6 +1659,9 @@ export class ChannelManager extends EventEmitter {
 				case MessageType.UPDATE_FEE:
 					this.handleUpdateFeeMsg(peerPubkey, payload);
 					break;
+				case MessageType.UPDATE_BLOCKHEIGHT:
+					this.handleUpdateBlockheightMsg(peerPubkey, payload);
+					break;
 				case MessageType.SHUTDOWN:
 					this.handleShutdownMsg(peerPubkey, payload);
 					break;
@@ -2064,6 +2069,18 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleUpdateFee(msg);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleUpdateBlockheightMsg(
+		peerPubkey: string,
+		payload: Buffer
+	): void {
+		const msg = decodeUpdateBlockheightMessage(payload);
+		const channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleUpdateBlockheight(msg);
 		this.processActions(peerPubkey, channel, actions);
 	}
 

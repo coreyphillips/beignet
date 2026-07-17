@@ -294,6 +294,17 @@ export interface ISerializedChannelState {
 	 * Optional for backward compatibility.
 	 */
 	lastSignedCommitFeeratePerKw?: number;
+	/**
+	 * Two-phase update_blockheight (bLIP-0051 leases): staged height, its
+	 * phases, the height the current signed local commitment was built at,
+	 * and every distinct committed height (old-commitment classification).
+	 * All optional for backward compatibility.
+	 */
+	pendingLeaseBlockheight?: number;
+	pendingLeaseBlockheightSignable?: boolean;
+	pendingLeaseBlockheightCommitted?: boolean;
+	lastSignedCommitLeaseBlockheight?: number;
+	leaseHeightHistory?: number[];
 	localBalanceMsat: string;
 	remoteBalanceMsat: string;
 	shaChainData: { entries: ISerializedShaChainEntry[]; knownCount: string };
@@ -526,6 +537,11 @@ export function serializeChannelState(
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
 		localBalanceMsat: bigintToStr(s.localBalanceMsat),
 		remoteBalanceMsat: bigintToStr(s.remoteBalanceMsat),
 		shaChainData: serializeShaChainEntries(s.shaChainStore),
@@ -690,6 +706,11 @@ export function deserializeChannelState(
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
 		localBalanceMsat: strToBigint(s.localBalanceMsat),
 		remoteBalanceMsat: strToBigint(s.remoteBalanceMsat),
 		shaChainStore: deserializeShaChainStore(s.shaChainData),

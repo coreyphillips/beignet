@@ -58,12 +58,15 @@ export function leaseCsvBlocks(
 	leaseCommitBlockheight: number | undefined
 ): number | undefined {
 	if (leaseExpiry === undefined || leaseExpiry <= 0) return undefined;
-	if (
-		leaseCommitBlockheight === undefined ||
-		leaseCommitBlockheight <= 0 ||
-		leaseCommitBlockheight >= leaseExpiry
-	) {
+	if (leaseCommitBlockheight === undefined || leaseCommitBlockheight <= 0) {
 		return LEASE_DURATION_BLOCKS;
+	}
+	// An agreed blockheight at/past expiry means the lease has RUN OUT (CLN:
+	// lease_remaining = 0): the commitment scripts revert to their plain,
+	// un-leased form. Only reachable via committed update_blockheight rounds
+	// (at open the height is always expiry - LEASE_DURATION).
+	if (leaseCommitBlockheight >= leaseExpiry) {
+		return undefined;
 	}
 	return leaseExpiry - leaseCommitBlockheight;
 }

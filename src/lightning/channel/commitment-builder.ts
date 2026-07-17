@@ -290,6 +290,50 @@ export function getRemoteCommitmentFeeRate(state: IChannelState): number {
 }
 
 /**
+ * Lease blockheight for OUR local commitment — verifying the opener's
+ * commitment_signed or rebuilding what they signed. A staged remote
+ * update_blockheight applies IMMEDIATELY (the opener bakes it into every
+ * signature from the moment it sends the update; only the opener may send
+ * one, so we are always the acceptor here). Phases mirror the
+ * getLocalCommitmentFeeRate machine exactly.
+ */
+export function getLocalCommitmentLeaseBlockheight(
+	state: IChannelState,
+	signedLocal = false
+): number | undefined {
+	if (signedLocal && state.lastSignedCommitLeaseBlockheight !== undefined) {
+		return state.lastSignedCommitLeaseBlockheight;
+	}
+	if (
+		state.pendingLeaseBlockheight !== undefined &&
+		state.role === ChannelRole.ACCEPTOR
+	) {
+		return state.pendingLeaseBlockheight;
+	}
+	return state.leaseCommitBlockheight;
+}
+
+/**
+ * Lease blockheight for the commitment WE SIGN for the peer. A staged remote
+ * update_blockheight applies ONLY once signable (the opener's covering
+ * commitment_signed arrived and we revoked) — before that the opener still
+ * builds its own commitment at the old height and would reject a new-height
+ * signature, exactly like the update_fee case.
+ */
+export function getRemoteCommitmentLeaseBlockheight(
+	state: IChannelState
+): number | undefined {
+	if (
+		state.pendingLeaseBlockheight !== undefined &&
+		(state.role === ChannelRole.OPENER ||
+			state.pendingLeaseBlockheightSignable === true)
+	) {
+		return state.pendingLeaseBlockheight;
+	}
+	return state.leaseCommitBlockheight;
+}
+
+/**
  * Derived keys for a specific commitment transaction.
  */
 export interface ICommitmentKeys {
@@ -544,9 +588,13 @@ export function buildLocalCommitment(
 		toSelfDelay: state.remoteConfig.toSelfDelay,
 		// Liquidity ads (CLN pure-CSV model): if WE are the lessor, our own
 		// to_local CSV is raised to the remaining lease so we can't reclaim the
-		// leased funds early.
+		// leased funds early. Phase-aware height: a staged opener
+		// update_blockheight applies to everything the opener signs.
 		leaseCsv: state.isLessor
-			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			? leaseCsvBlocks(
+					state.leaseExpiry,
+					getLocalCommitmentLeaseBlockheight(state, signedLocal)
+			  )
 			: undefined,
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
@@ -556,7 +604,10 @@ export function buildLocalCommitment(
 		// per commitment carries the lock, always on the lessor's balance.
 		// (See the matching gate in buildRemoteCommitment.)
 		toRemoteLeaseCsv: !state.isLessor
-			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			? leaseCsvBlocks(
+					state.leaseExpiry,
+					getLocalCommitmentLeaseBlockheight(state, signedLocal)
+			  )
 			: undefined,
 		htlcOutputs,
 		// Our local commitment is trimmed with OUR negotiated dust_limit_satoshis
@@ -728,9 +779,14 @@ export function buildRemoteCommitment(
 		// remote is the lessor (i.e. WE are the lessee), raise its CSV to the
 		// remaining lease so the signature we give them is over the encumbered
 		// script. When we are the lessor the remote is the lessee, so no lock.
+		// Phase-aware height: a staged update_blockheight is baked into
+		// commitments WE sign only once signable (mirrors the fee machine).
 		leaseCsv: state.isLessor
 			? undefined
-			: leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight),
+			: leaseCsvBlocks(
+					state.leaseExpiry,
+					getRemoteCommitmentLeaseBlockheight(state)
+			  ),
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
 		// Liquidity ads: THEIR commitment's to_remote pays US, so it is
@@ -739,7 +795,10 @@ export function buildRemoteCommitment(
 		// This is the output S-L.H4 was about: without it a seller escapes the
 		// lease by provoking the buyer into force-closing.
 		toRemoteLeaseCsv: state.isLessor
-			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			? leaseCsvBlocks(
+					state.leaseExpiry,
+					getRemoteCommitmentLeaseBlockheight(state)
+			  )
 			: undefined,
 		htlcOutputs,
 		// The remote commitment is trimmed with THEIR negotiated
