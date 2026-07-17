@@ -389,6 +389,31 @@ describe('S-L.H4: lease-locked to_remote (CLN CSV model)', function () {
 			).to.be.true;
 		});
 
+		it('classifies the lessor lease-locked to_remote on the BUYER OWN commitment', function () {
+			// The seller's balance on the buyer's OWN commitment is the same
+			// lease-locked CSV variant; classification of OUR commitment used to
+			// match only the plain P2WPKH and silently skipped it.
+			const { buyerState, buyerCommitSeed } = createLeasedChannelStates();
+			const buyerPoint = getPerCommitmentPoint(buyerCommitSeed, 0n);
+			const built = buildLocalCommitment(buyerState, buyerPoint);
+
+			const tracked = classifyOutputs(
+				built.result.tx,
+				buyerState,
+				CommitmentType.OUR_COMMITMENT,
+				buyerState.localCommitmentNumber
+			);
+			const toRemote = tracked.find(
+				(o) => o.outputType === OutputType.TO_REMOTE
+			);
+			expect(toRemote, 'lease-locked to_remote classified on own commitment').to
+				.exist;
+			expect(toRemote!.witnessScript).to.exist;
+			expect(leaseCsvFromToRemoteScript(toRemote!.witnessScript!)).to.equal(
+				LEASE_CSV
+			);
+		});
+
 		it('SCB-restored (DLP) states still find and lock the lease to_remote', function () {
 			const { sellerState, buyerCommitSeed } = createLeasedChannelStates();
 			const buyerPoint = getPerCommitmentPoint(buyerCommitSeed, 0n);

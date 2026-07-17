@@ -440,6 +440,20 @@ export class ChainMonitor {
 				continue;
 			}
 
+			// The PEER's to_remote on OUR commitment is tracked (classification
+			// completeness) but only the peer can spend it. A vanished peer would
+			// otherwise pin the monitor in RESOLVING forever, so an unspent one
+			// does not block full resolution; once the peer does spend it, the
+			// normal SPEND_CONFIRMED path below applies.
+			if (
+				this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.OUR_COMMITMENT &&
+				output.outputType === OutputType.TO_REMOTE &&
+				output.status === OutputStatus.CONFIRMED
+			) {
+				continue;
+			}
+
 			// Check if confirmed spend has reached irrevocable depth
 			if (
 				output.status === OutputStatus.SPEND_CONFIRMED &&

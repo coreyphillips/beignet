@@ -1144,6 +1144,52 @@ describe('Chain Monitor (Phase 4C)', function () {
 			expect(fullyResolved).to.exist;
 			expect(monitor.isFullyResolved()).to.be.true;
 		});
+
+		it('an unspent PEER to_remote on OUR commitment does not block full resolution', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				10,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network
+			);
+
+			const perCommitmentSecret = generateFromSeed(
+				state.localPerCommitmentSeed,
+				MAX_INDEX - state.localCommitmentNumber
+			);
+			const perCommitmentPoint =
+				perCommitmentPointFromSecret(perCommitmentSecret);
+			const built = buildLocalCommitment(state, perCommitmentPoint);
+			monitor.handleFundingSpent(built.result.tx, 100);
+
+			// Resolve OUR outputs; the peer's to_remote stays CONFIRMED (a
+			// vanished peer never claims it).
+			const fullState = monitor.getFullState();
+			const toRemote = fullState.trackedOutputs.find(
+				(o) => o.outputType === OutputType.TO_REMOTE
+			);
+			expect(toRemote, 'peer to_remote tracked').to.exist;
+			for (const output of fullState.trackedOutputs) {
+				if (output.outputType === OutputType.TO_REMOTE) continue;
+				output.status = OutputStatus.SPEND_CONFIRMED;
+				output.resolutionTxid = crypto.randomBytes(32).toString('hex');
+				output.confirmationHeight = 100;
+			}
+
+			const actions = monitor.handleNewBlock(100 + IRREVOCABLE_DEPTH);
+			const fullyResolved = actions.find(
+				(a) => a.type === ChainActionType.CHANNEL_FULLY_RESOLVED
+			);
+			expect(fullyResolved, 'channel resolves despite unspent peer output').to
+				.exist;
+			expect(monitor.isFullyResolved()).to.be.true;
+		});
 	});
 
 	describe('Output Spent Events', function () {

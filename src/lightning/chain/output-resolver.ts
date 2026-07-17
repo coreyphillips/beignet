@@ -504,6 +504,23 @@ function classifyOurCommitmentOutputs(
 		redeem: { output: toLocalScript }
 	});
 	const remoteP2wpkh = bitcoin.payments.p2wpkh({ pubkey: remotePaymentPubkey });
+	// Anchor channels carry the PEER's to_remote on our commitment as a P2WSH
+	// with a 1-block CSV, not a plain P2WPKH. Without these variants the
+	// output was silently skipped (never tracked), leaving a gap in
+	// classification/balance events for every anchor channel.
+	const remoteToRemoteAnchor = isAnchorChannel(state.channelType)
+		? buildToRemoteAnchorOutput(remotePaymentPubkey)
+		: null;
+	// Liquidity ads: when WE are the lessee the peer (lessor)'s balance on OUR
+	// commitment is the lease-locked CSV variant (mirrors
+	// buildLocalCommitment's toRemoteLeaseCsv gate).
+	const remoteToRemoteAnchorLease =
+		remoteToRemoteAnchor && !state.isLessor && state.leaseExpiry
+			? buildToRemoteAnchorOutput(
+					remotePaymentPubkey,
+					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			  )
+			: null;
 
 	// Derive HTLC keys
 	const localHtlcPubkey = derivePublicKey(
@@ -528,6 +545,35 @@ function classifyOurCommitmentOutputs(
 				status: OutputStatus.CONFIRMED,
 				confirmationHeight: 0,
 				witnessScript: toLocalScript
+			});
+			continue;
+		}
+
+		if (
+			remoteToRemoteAnchorLease &&
+			outScript.equals(remoteToRemoteAnchorLease.script)
+		) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: remoteToRemoteAnchorLease.witnessScript
+			});
+			continue;
+		}
+
+		if (remoteToRemoteAnchor && outScript.equals(remoteToRemoteAnchor.script)) {
+			outputs.push({
+				txid,
+				outputIndex: i,
+				amount: BigInt(tx.outs[i].value),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 0,
+				witnessScript: remoteToRemoteAnchor.witnessScript
 			});
 			continue;
 		}

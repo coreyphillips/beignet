@@ -918,6 +918,37 @@ describe('Anchor Channels (option_anchors_zero_fee_htlc_tx)', function () {
 				.be.true;
 		});
 
+		it('classifies the PEER anchor to_remote (P2WSH) on OUR commitment', function () {
+			// The peer's balance on our commitment is an anchor CSV-1 P2WSH too;
+			// it used to be silently skipped (only the plain P2WPKH was matched),
+			// leaving the output untracked.
+			const { openerState } = createReadyAnchorState();
+			const remotePaymentPubkey =
+				openerState.remoteBasepoints!.paymentBasepoint;
+			const anchorToRemote = buildToRemoteAnchorOutput(remotePaymentPubkey);
+
+			const tx = new bitcoin.Transaction();
+			tx.version = 2;
+			tx.addInput(crypto.randomBytes(32), 0);
+			tx.addOutput(anchorToRemote.script, 3333);
+
+			const outputs = classifyOutputs(
+				tx,
+				openerState,
+				CommitmentType.OUR_COMMITMENT,
+				openerState.localCommitmentNumber
+			);
+			const toRemote = outputs.find(
+				(o) => o.outputType === OutputType.TO_REMOTE
+			);
+			expect(toRemote, 'peer to_remote should be classified').to.exist;
+			expect(toRemote!.amount).to.equal(3333n);
+			expect(toRemote!.witnessScript, 'anchor variant carries a witnessScript')
+				.to.exist;
+			expect(toRemote!.witnessScript!.equals(anchorToRemote.witnessScript)).to
+				.be.true;
+		});
+
 		it('builds a valid CSV-1 claim spending the anchor to_remote output', function () {
 			const { openerState, openerSeed } = createReadyAnchorState();
 			const ourPaymentPubkey = openerState.localBasepoints.paymentBasepoint;
