@@ -17,7 +17,10 @@ import {
 import { decodeOnionPacket, encodeOnionPacket } from '../onion/construct';
 import { decodeOnionMessagePayload } from './codec';
 import { OnionMessageProcessResult } from './types';
-import { decodeBlindedHopData } from '../onion/blinded-path';
+import {
+	decodeBlindedHopData,
+	deriveBlindedPrivkey
+} from '../onion/blinded-path';
 import {
 	deriveBlindingSharedSecret,
 	deriveBlindingEncryptionKey,
@@ -48,17 +51,37 @@ export function processOnionMessage(
 		throw new Error(`Invalid onion version: ${packet.version}`);
 	}
 
-	// Compute shared secret with the onion ephemeral key
-	const sharedSecret = ecdh(nodePrivkey, packet.ephemeralKey);
-	const keys = deriveHopKeys(sharedSecret);
+	// BOLT 4 route blinding: a spec onion message is sphinx-encrypted to our
+	// BLINDED node id, so the packet must be peeled with the blinded private
+	// key derived from the path_key (this is how CLN/LND always send). Try
+	// that first, then fall back to the raw node key for beignet's own
+	// legacy unblinded flows (sendOnionMessage / sendMultiHopOnionMessage).
+	const candidateKeys: Buffer[] = [];
+	if (blindingPoint) {
+		try {
+			candidateKeys.push(deriveBlindedPrivkey(blindingPoint, nodePrivkey));
+		} catch {
+			// Invalid blinding point — fall through to the raw key.
+		}
+	}
+	candidateKeys.push(nodePrivkey);
 
-	// Verify HMAC on the encrypted routing info
-	const expectedHmac = crypto
-		.createHmac('sha256', keys.mu)
-		.update(packet.routingInfo)
-		.digest();
-
-	if (!packet.hmac.equals(expectedHmac)) {
+	let sharedSecret: Buffer | null = null;
+	let keys: ReturnType<typeof deriveHopKeys> | null = null;
+	for (const candidate of candidateKeys) {
+		const ss = ecdh(candidate, packet.ephemeralKey);
+		const k = deriveHopKeys(ss);
+		const expectedHmac = crypto
+			.createHmac('sha256', k.mu)
+			.update(packet.routingInfo)
+			.digest();
+		if (packet.hmac.equals(expectedHmac)) {
+			sharedSecret = ss;
+			keys = k;
+			break;
+		}
+	}
+	if (!sharedSecret || !keys) {
 		throw new Error('HMAC verification failed');
 	}
 

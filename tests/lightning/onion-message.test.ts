@@ -1022,9 +1022,13 @@ describe('Onion Messages (Phase 8)', () => {
 			replyData.set(64, Buffer.from('reply body'));
 
 			const reply = constructReplyOnionMessage(replyPath, replyData);
+			// Spec route blinding: the packet is sphinx-encrypted to the blinded
+			// node id, so the recipient peels with the path_key (blinding point)
+			// exactly as the wire handler does.
 			const result = processOnionMessage(
 				reply.onionRoutingPacket,
-				replyDest.privkey
+				replyDest.privkey,
+				reply.blindingPoint
 			);
 			expect(result.type).to.equal('delivery');
 			if (result.type === 'delivery') {

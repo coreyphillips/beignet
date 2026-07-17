@@ -38,7 +38,7 @@ import {
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
 import { ITlvRecord } from '../message/tlv';
-import { IBlindedPath } from '../onion/blinded-path';
+import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 
@@ -260,7 +260,11 @@ export class OfferManager extends EventEmitter {
 
 		if (options?.quantity !== undefined) request.quantity = options.quantity;
 		if (options?.payerNote) request.payerNote = options.payerNote;
-		if (options?.chain) request.chain = options.chain;
+		// BOLT 12: invreq_chain MUST name the chain unless it is bitcoin
+		// mainnet. Default it from the offer's own chains — omitting it on
+		// regtest/testnet makes the issuer reject with "Wrong chain".
+		const chain = options?.chain ?? offer.chains?.[0];
+		if (chain) request.chain = chain;
 
 		// Encode the invoice request TLV (includes offer fields)
 		const offerTlvData = encodeOfferTlv(offer);
@@ -285,11 +289,37 @@ export class OfferManager extends EventEmitter {
 			const messageData = new Map<number, Buffer>();
 			messageData.set(TLV_INVOICE_REQUEST, signedRequestTlv);
 
-			// Send to the first blinded path, or directly to issuer_id
+			// BOLT 12: the issuer sends its invoice back over OUR reply path, so
+			// the invoice_request MUST carry one — without it a conformant
+			// issuer (CLN) silently drops the request and the payer times out.
+			// A 1-hop path to ourselves: the issuer routes to our real node id
+			// (the introduction node IS the recipient) and only WE ever decrypt
+			// the hop blob, so it also carries a path_id we can later verify.
+			const replyPathId = crypto.randomBytes(32);
+			const replyPath = constructBlindedPath(
+				crypto.randomBytes(32),
+				[this.nodeId],
+				[{ pathId: replyPathId }]
+			);
+
+			// Send along the offer's first blinded path, or — for a pathless
+			// offer — along a 1-hop blinded path we build to the issuer: BOLT 4
+			// onion messages are ALWAYS blinded (every hop payload carries
+			// encrypted_data and the sphinx layer is addressed to blinded node
+			// ids), so a raw unblinded send is silently dropped by CLN/LND.
 			if (offer.paths && offer.paths.length > 0) {
-				this.onionMessageManager.sendReply(offer.paths[0], messageData);
+				this.onionMessageManager.sendReply(offer.paths[0], messageData, {
+					replyPath
+				});
 			} else if (offer.issuerId) {
-				this.onionMessageManager.sendOnionMessage(offer.issuerId, messageData);
+				const issuerPath = constructBlindedPath(
+					crypto.randomBytes(32),
+					[offer.issuerId],
+					[{}]
+				);
+				this.onionMessageManager.sendReply(issuerPath, messageData, {
+					replyPath
+				});
 			}
 		}
 

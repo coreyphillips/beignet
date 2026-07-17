@@ -8078,16 +8078,14 @@ export class Channel {
 					leasedSats,
 					msg.fundingFeeratePerkw
 				) * 1000n;
-			if (feeMsat > this._state.remoteBalanceMsat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Buyer balance cannot cover the lease fee'
-					}
-				];
-			}
+			// CLN's lease accounting (validated live): the buyer pays the fee
+			// through the FUNDING TX — the funding output totals both
+			// contributions PLUS the fee, our (seller) channel balance is
+			// credited contribution + fee, and the buyer's balance stays its
+			// full contribution. Mirrors the buyer side in handleAcceptChannel2.
+			this._state.fundingSatoshis += feeMsat / 1000n;
 			this._state.localBalanceMsat += feeMsat;
-			this._state.remoteBalanceMsat -= feeMsat;
+			this._state.leaseFeeSats = feeMsat / 1000n;
 			// We are the lessor: our to_local is CSV-locked until the lease expires.
 			this._state.leaseExpiry = computeLeaseExpiry(
 				msg.requestFunds.blockheight
@@ -8273,17 +8271,18 @@ export class Channel {
 					}
 				];
 			}
+			// CLN's lease accounting (validated live): the buyer pays the fee
+			// through the FUNDING TRANSACTION — the funding output must total
+			// opener_funds + seller_funds + lease_fee, and the seller's CHANNEL
+			// balance is credited seller_funds + lease_fee while the opener's
+			// balance stays opener_funds. Deducting the fee from the opener's
+			// channel balance instead (the old model) makes both the funding
+			// output and the initial commitment disagree with the seller
+			// ("Insufficiently funded funding tx" tx_abort from CLN).
 			const feeMsat = leaseFeeSat * 1000n;
-			if (feeMsat > this._state.localBalanceMsat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Cannot cover the lease fee from our balance'
-					}
-				];
-			}
-			this._state.localBalanceMsat -= feeMsat;
+			this._state.fundingSatoshis += leaseFeeSat;
 			this._state.remoteBalanceMsat += feeMsat;
+			this._state.leaseFeeSats = leaseFeeSat;
 			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
 		}
 

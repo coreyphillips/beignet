@@ -491,7 +491,8 @@ export async function setupBeignetFundedClnChannel(
 	cln: ClnRestClient,
 	clnPubkey: string,
 	seedId: number,
-	fundingAmount = 500_000n
+	fundingAmount = 500_000n,
+	extraFeatures: Feature[] = []
 ): Promise<{
 	node: LightningNode;
 	channelId: Buffer;
@@ -518,6 +519,9 @@ export async function setupBeignetFundedClnChannel(
 	features.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 	features.setOptional(Feature.QUIESCE);
 	features.setOptional(Feature.SPLICE);
+	for (const f of extraFeatures) {
+		features.setOptional(f);
+	}
 
 	const node = new LightningNode({
 		nodePrivateKey: keys.nodePrivateKey,

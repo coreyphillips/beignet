@@ -16,6 +16,13 @@ export interface IHopPayload {
 	encryptedRecipientData?: Buffer;
 	/** TLV type 12: blinding_point (33-byte ephemeral key for blinded hops) */
 	blindingPoint?: Buffer;
+	/**
+	 * TLV type 18: total_amount_msat — REQUIRED on the FINAL hop of a blinded
+	 * payment path (payment_data/payment_secret is not used there; the
+	 * encrypted path_id authenticates instead). CLN fails the HTLC with
+	 * invalid_onion_payload when it is missing.
+	 */
+	totalAmountMsat?: bigint;
 	/** Custom TLV records (e.g. keysend preimage at type 5482373484) */
 	customRecords?: Map<number, Buffer>;
 	/**

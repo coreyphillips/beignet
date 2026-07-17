@@ -259,7 +259,8 @@ export function constructMultiHopOnionMessage(
 export function constructReplyOnionMessage(
 	replyPath: IBlindedPath,
 	messageData: Map<number, Buffer>,
-	sessionKey?: Buffer
+	sessionKey?: Buffer,
+	options?: ISendOnionMessageOptions
 ): IOnionMessage {
 	const sessKey = sessionKey || crypto.randomBytes(32);
 
@@ -278,10 +279,21 @@ export function constructReplyOnionMessage(
 	// 1-hop reply path the introduction node IS the recipient, so it must also
 	// receive the message body; hard-coding an empty TLV map here made every
 	// reply over a 1-hop path arrive empty.
-	path.push(replyPath.introductionNodeId);
+	//
+	// BOLT 4 route blinding: the sphinx onion is encrypted to each hop's
+	// BLINDED node id — including the introduction node's (path_hops[0]) —
+	// and every hop derives its blinded key from the path_key on receipt.
+	// Sphinx-addressing the intro by its real id (the old behavior) produced
+	// onions no spec implementation (CLN/LND) could peel.
+	path.push(replyPath.blindedHops[0].blindedNodeId);
 	const introIsRecipient = replyPath.blindedHops.length === 1;
 	const introPayload: IOnionMessagePayload = {
 		encryptedRecipientData: replyPath.blindedHops[0].encryptedData,
+		// The recipient hop also carries OUR reply path when the message
+		// expects an answer (e.g. invoice_request over an offer's path).
+		...(introIsRecipient && options?.replyPath
+			? { replyPath: options.replyPath }
+			: {}),
 		messageTlvs: introIsRecipient ? messageData : new Map()
 	};
 	payloads.push(encodeOnionMessagePayload(introPayload));
@@ -294,6 +306,7 @@ export function constructReplyOnionMessage(
 		const isLast = i === replyPath.blindedHops.length - 1;
 		const hopPayload: IOnionMessagePayload = {
 			encryptedRecipientData: hop.encryptedData,
+			...(isLast && options?.replyPath ? { replyPath: options.replyPath } : {}),
 			messageTlvs: isLast ? messageData : new Map()
 		};
 		payloads.push(encodeOnionMessagePayload(hopPayload));
