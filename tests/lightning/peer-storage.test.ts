@@ -408,9 +408,13 @@ describe('Peer Storage (BOLT 1 option_provide_storage)', function () {
 			expect(sent.length).to.equal(1);
 			expect(sent[0].pubkey).to.equal(capablePk);
 			expect(sent[0].type).to.equal(MessageType.PEER_STORAGE);
-			expect(
-				decodePeerStorageMessage(sent[0].payload).blob.equals(blob)
-			).to.equal(true);
+			// Our outbound blob is padded to the fixed max to hide how much
+			// state we back up (BOLT 1 privacy); it unwraps to the original.
+			const wire = decodePeerStorageMessage(sent[0].payload).blob;
+			expect(wire.length).to.equal(65531);
+			expect(wire.toString('ascii', 0, 4)).to.equal('bPS1');
+			expect(wire.readUInt32BE(4)).to.equal(blob.length);
+			expect(wire.subarray(8, 8 + blob.length).equals(blob)).to.equal(true);
 			node.destroy();
 		});
 

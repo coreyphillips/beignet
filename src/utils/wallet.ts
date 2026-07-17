@@ -190,19 +190,36 @@ export const getHighestUsedIndexFromTxHashes = ({
 export const isValidBech32mEncodedString = (
 	address: string
 ): { isValid: boolean; network: EAvailableNetworks } => {
+	const invalid = {
+		isValid: false,
+		network: EAvailableNetworks.bitcoin
+	};
 	try {
 		const decoded = bech32m.decode(address);
-		if (decoded.prefix === 'bc') {
-			return { isValid: true, network: EAvailableNetworks.bitcoin };
-		} else if (decoded.prefix === 'tb') {
-			return { isValid: true, network: EAvailableNetworks.bitcoinTestnet };
-		} else if (decoded.prefix === 'bcrt') {
-			return { isValid: true, network: EAvailableNetworks.bitcoinRegtest };
+		// BIP-350: a well-formed checksum is not enough — bech32m addresses
+		// carry a witness version (word 0) in 1..16 and a program of 2..40
+		// bytes, and taproot (v1) is exactly 32. A bare checksum check accepted
+		// junk like "bc1p...<any length>".
+		const version = decoded.words[0];
+		if (version === undefined || version < 1 || version > 16) return invalid;
+		const program = bech32m.fromWords(decoded.words.slice(1));
+		if (program.length < 2 || program.length > 40) return invalid;
+		if (version === 1 && program.length !== 32) return invalid;
+		switch (decoded.prefix) {
+			case 'bc':
+				return { isValid: true, network: EAvailableNetworks.bitcoin };
+			case 'tb':
+				// 'tb' is shared by testnet and signet; beignet models signet
+				// under the testnet params, so it is reported as testnet.
+				return { isValid: true, network: EAvailableNetworks.bitcoinTestnet };
+			case 'bcrt':
+				return { isValid: true, network: EAvailableNetworks.bitcoinRegtest };
+			default:
+				return invalid;
 		}
 	} catch (error) {
-		return { isValid: false, network: EAvailableNetworks.bitcoin };
+		return invalid;
 	}
-	return { isValid: false, network: EAvailableNetworks.bitcoin };
 };
 
 /**
