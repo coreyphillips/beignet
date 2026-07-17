@@ -10,6 +10,7 @@
  */
 
 import { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
+import { ITlvRecord, encodeTlvStream } from '../message/tlv';
 import {
 	encodeOfferTlv,
 	encodeInvoiceRequestTlv,
@@ -40,7 +41,19 @@ export function encodeInvoiceRequest(
 
 /**
  * Encode an IBolt12Invoice as a checksum-less bech32 string ("lni" prefix).
+ *
+ * When the invoice carries its full wire `records` (set on decode and on
+ * issuance) they are re-encoded verbatim — the BOLT 12 mirror of the
+ * invoice_request and any unknown TLVs live only there, and the signature
+ * commits to them. `mirrorRecords` overrides for callers assembling a fresh
+ * invoice against known invreq records.
  */
-export function encodeBolt12Invoice(invoice: IBolt12Invoice): string {
-	return encodeNoChecksum('lni', encodeInvoiceTlv(invoice));
+export function encodeBolt12Invoice(
+	invoice: IBolt12Invoice,
+	mirrorRecords?: ITlvRecord[]
+): string {
+	if (!mirrorRecords && invoice.records) {
+		return encodeNoChecksum('lni', encodeTlvStream(invoice.records));
+	}
+	return encodeNoChecksum('lni', encodeInvoiceTlv(invoice, mirrorRecords));
 }

@@ -1074,8 +1074,11 @@ describe('BOLT 12: Offers', () => {
 			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
-			// Tamper with amount
-			invoice.amount = 99_000n;
+			// Tamper with the WIRE record for invoice_amount (type 170): the
+			// signature commits to the full record set (invoice.records is the
+			// source of truth for verification, not the structural fields).
+			const amountRecord = invoice.records!.find((r) => r.type === 170n)!;
+			amountRecord.value = Buffer.from([0xff, 0xff, 0xff]);
 
 			const valid = mgr.verifyInvoiceSignature(invoice);
 			expect(valid).to.be.false;

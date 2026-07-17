@@ -388,9 +388,30 @@ export function decodeInvoiceRequestTlv(data: Buffer): {
 /**
  * Encode an IBolt12Invoice into a TLV stream.
  * The signature field (type 240) is included if present.
+ *
+ * `mirrorRecords` (BOLT 12): when the invoice responds to an invoice_request,
+ * the writer MUST copy ALL non-signature fields from the request (including
+ * unknown ones) — the invreq/offer fields live in types 0-159 and the
+ * experimental ranges. Without the mirror every spec reader (CLN/eclair/LDK)
+ * rejects the invoice outright (S-4.H3).
  */
-export function encodeInvoiceTlv(invoice: IBolt12Invoice): Buffer {
+export function encodeInvoiceTlv(
+	invoice: IBolt12Invoice,
+	mirrorRecords?: ITlvRecord[]
+): Buffer {
 	const records: ITlvRecord[] = [];
+
+	if (mirrorRecords) {
+		for (const r of mirrorRecords) {
+			if (r.type === BigInt(InvoiceTlvType.SIGNATURE)) continue;
+			if (
+				(r.type >= 0n && r.type < 160n) ||
+				(r.type >= 1_000_000_000n && r.type < 3_000_000_000n)
+			) {
+				records.push(r);
+			}
+		}
+	}
 
 	if (invoice.paths && invoice.paths.length > 0) {
 		records.push({
@@ -447,6 +468,10 @@ export function encodeInvoiceTlv(invoice: IBolt12Invoice): Buffer {
 		});
 	}
 
+	// Mirrored invreq/offer records (0-159) interleave BELOW the invoice's own
+	// fields (160+); encodeTlvStream requires strictly increasing types.
+	records.sort((a, b) => (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
+
 	return encodeTlvStream(records);
 }
 
@@ -489,10 +514,13 @@ export function decodeInvoiceTlv(data: Buffer): {
 	if (!createdAtVal)
 		throw new Error('Invoice missing required created_at field');
 
+	// The mirrored offer_description (type 10) rides in the invoice per the
+	// BOLT 12 copy-all-invreq-fields rule; use it when present.
+	const mirroredDesc = findTlvRecord(records, BigInt(OfferTlvType.DESCRIPTION));
 	const invoice: IBolt12Invoice = {
 		paymentHash: payHashVal,
 		amount: decodeTruncatedU64(amountVal),
-		description: '', // Description comes from offer context, not always in invoice TLV
+		description: mirroredDesc ? mirroredDesc.toString('utf8') : '',
 		createdAt: decodeTruncatedU64(createdAtVal),
 		nodeId: nodeIdVal
 	};
@@ -504,6 +532,9 @@ export function decodeInvoiceTlv(data: Buffer): {
 	if (fallbacksVal) invoice.fallbacks = decodeFallbacks(fallbacksVal);
 	if (featuresVal) invoice.features = featuresVal;
 	if (sigVal) invoice.signature = sigVal;
+	// Full wire records (mirrored invreq fields + unknown TLVs included):
+	// the source of truth for signature verification and re-encoding.
+	invoice.records = records;
 
 	return { invoice, records };
 }

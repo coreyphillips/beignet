@@ -96,6 +96,13 @@ export interface IBolt12Invoice {
 	nodeId: Buffer;
 	/** Schnorr signature (64 bytes) */
 	signature?: Buffer;
+	/**
+	 * The full wire TLV records (BOLT 12): includes the invreq fields the
+	 * invoice mirrors and any unknown TLVs. Source of truth for signature
+	 * verification and faithful re-encoding — the structural fields above
+	 * cannot reconstruct them. Set on decode and on issuance.
+	 */
+	records?: import('../message/tlv').ITlvRecord[];
 	/** Optional metadata from the offer */
 	metadata?: Buffer;
 	/** Offer ID this invoice is for */
