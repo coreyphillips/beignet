@@ -2130,6 +2130,17 @@ export function resolveTheirCurrentCommitmentOutputs(
  * Resolve outputs from a revoked commitment transaction.
  * All outputs can be claimed using the revocation key.
  */
+/**
+ * A penalty input whose HTLC cltv_expiry is within this many blocks of the
+ * current height is claimed in its OWN single-input penalty tx instead of the
+ * batch: near the deadline the cheater's pre-signed HTLC-timeout (or a
+ * preimage claim) competes for that one outpoint, and if it wins it would
+ * invalidate the WHOLE batched penalty, stalling every other claim until the
+ * rebroadcast interval rebuilds them. Isolating the contested input caps the
+ * blast radius and lets its fee be bumped independently.
+ */
+export const PENALTY_SPLIT_DEADLINE_BLOCKS = 18;
+
 export function resolveRevokedCommitmentOutputs(
 	state: IChannelState,
 	trackedOutputs: ITrackedOutput[],
@@ -2139,7 +2150,8 @@ export function resolveRevokedCommitmentOutputs(
 	feeRatePerVbyte: number,
 	revocationBasepointSecret: Buffer,
 	paymentPrivkey: Buffer,
-	network: bitcoin.Network = bitcoin.networks.bitcoin
+	network: bitcoin.Network = bitcoin.networks.bitcoin,
+	currentHeight?: number
 ): IResolvedOutput[] {
 	if (!state.remoteBasepoints) return [];
 
@@ -2153,7 +2165,8 @@ export function resolveRevokedCommitmentOutputs(
 			feeRatePerVbyte,
 			revocationBasepointSecret,
 			paymentPrivkey,
-			network
+			network,
+			currentHeight
 		);
 	}
 
@@ -2177,6 +2190,9 @@ export function resolveRevokedCommitmentOutputs(
 	// Collect claimable output indices and witness scripts
 	const claimableIndices: number[] = [];
 	const witnessScripts = new Map<number, Buffer>();
+	// HTLC cltv_expiry per output index: near this height the cheater's
+	// pre-signed HTLC-timeout competes for the outpoint (deadline-split below).
+	const htlcDeadlines = new Map<number, number>();
 
 	for (const output of trackedOutputs) {
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
@@ -2189,6 +2205,9 @@ export function resolveRevokedCommitmentOutputs(
 		) {
 			claimableIndices.push(output.outputIndex);
 			witnessScripts.set(output.outputIndex, output.witnessScript);
+			if (output.cltvExpiry !== undefined) {
+				htlcDeadlines.set(output.outputIndex, output.cltvExpiry);
+			}
 		} else if (output.outputType === OutputType.TO_REMOTE) {
 			// to_remote is OUR balance on their revoked commitment. It is not part
 			// of the penalty (we own it outright), but it must still be swept to our
@@ -2311,6 +2330,7 @@ export function resolveRevokedCommitmentOutputs(
 				) {
 					claimableIndices.push(i);
 					witnessScripts.set(i, script);
+					htlcDeadlines.set(i, entry.cltvExpiry);
 					break;
 				}
 			}
@@ -2327,57 +2347,83 @@ export function resolveRevokedCommitmentOutputs(
 		network
 	);
 
-	// Build penalty transaction
-	const penaltyTx = buildPenaltyTx({
-		revokedTx,
-		revocationPrivkey,
-		destinationAddress: destAddress,
-		feeRatePerVbyte,
-		outputIndices: claimableIndices,
-		witnessScripts,
-		network
-	});
-
-	// Sign each input and build witnesses
 	const revocationPubkey = deriveRevocationPubkey(
 		state.localBasepoints.revocationBasepoint,
 		perCommitmentPoint
 	);
 
-	for (let i = 0; i < claimableIndices.length; i++) {
-		const outputIdx = claimableIndices[i];
-		const ws = witnessScripts.get(outputIdx)!;
-		const value = revokedTx.outs[outputIdx].value;
-		// May be undefined for an HTLC output reconstructed from the snapshot
-		// (it was not in the live classification because the HTLC had settled).
-		const output = trackedOutputs.find((o) => o.outputIndex === outputIdx);
-
-		const sig = signPenaltyInput(penaltyTx, i, ws, value, revocationPrivkey);
-
-		let witness: Buffer[];
-		if (output?.outputType === OutputType.TO_LOCAL) {
-			witness = buildToLocalPenaltyWitness(sig, ws);
-		} else {
-			// Both tracked HTLC outputs and snapshot-reconstructed ones use the
-			// HTLC revocation (penalty) witness.
-			witness = buildHtlcPenaltyWitness(sig, revocationPubkey, ws);
-		}
-
-		penaltyTx.setWitness(i, witness);
-
-		resolved.push({
-			trackedOutput: output ?? {
-				txid: revokedTx.getId(),
-				outputIndex: outputIdx,
-				amount: BigInt(value),
-				outputType: OutputType.OFFERED_HTLC,
-				status: OutputStatus.CONFIRMED,
-				confirmationHeight: 0,
-				witnessScript: ws
-			},
-			spendTx: penaltyTx,
-			witness
+	// Build ONE penalty tx over the given indices, sign every input, and push
+	// a resolved entry per input (all sharing that tx).
+	const buildAndSignPenalty = (outputIndices: number[]): void => {
+		const penaltyTx = buildPenaltyTx({
+			revokedTx,
+			revocationPrivkey,
+			destinationAddress: destAddress,
+			feeRatePerVbyte,
+			outputIndices,
+			witnessScripts,
+			network
 		});
+
+		for (let i = 0; i < outputIndices.length; i++) {
+			const outputIdx = outputIndices[i];
+			const ws = witnessScripts.get(outputIdx)!;
+			const value = revokedTx.outs[outputIdx].value;
+			// May be undefined for an HTLC output reconstructed from the snapshot
+			// (it was not in the live classification because the HTLC had settled).
+			const output = trackedOutputs.find((o) => o.outputIndex === outputIdx);
+
+			const sig = signPenaltyInput(penaltyTx, i, ws, value, revocationPrivkey);
+
+			let witness: Buffer[];
+			if (output?.outputType === OutputType.TO_LOCAL) {
+				witness = buildToLocalPenaltyWitness(sig, ws);
+			} else {
+				// Both tracked HTLC outputs and snapshot-reconstructed ones use the
+				// HTLC revocation (penalty) witness.
+				witness = buildHtlcPenaltyWitness(sig, revocationPubkey, ws);
+			}
+
+			penaltyTx.setWitness(i, witness);
+
+			resolved.push({
+				trackedOutput: output ?? {
+					txid: revokedTx.getId(),
+					outputIndex: outputIdx,
+					amount: BigInt(value),
+					outputType: OutputType.OFFERED_HTLC,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight: 0,
+					witnessScript: ws,
+					cltvExpiry: htlcDeadlines.get(outputIdx)
+				},
+				spendTx: penaltyTx,
+				witness
+			});
+		}
+	};
+
+	// Deadline split: an HTLC input near (or past) its cltv_expiry is contested
+	// by the cheater's pre-signed HTLC-timeout, so it gets its OWN penalty tx;
+	// everything else stays in one batch. Only meaningful when more than one
+	// output is claimable and a height is known.
+	const urgent =
+		currentHeight !== undefined && claimableIndices.length > 1
+			? claimableIndices.filter((idx) => {
+					const deadline = htlcDeadlines.get(idx);
+					return (
+						deadline !== undefined &&
+						deadline - currentHeight <= PENALTY_SPLIT_DEADLINE_BLOCKS
+					);
+			  })
+			: [];
+	const batched = claimableIndices.filter((idx) => !urgent.includes(idx));
+
+	for (const idx of urgent) {
+		buildAndSignPenalty([idx]);
+	}
+	if (batched.length > 0) {
+		buildAndSignPenalty(batched);
 	}
 
 	return resolved;
@@ -2401,7 +2447,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 	feeRatePerVbyte: number,
 	revocationBasepointSecret: Buffer,
 	paymentPrivkey: Buffer,
-	network: bitcoin.Network
+	network: bitcoin.Network,
+	currentHeight?: number
 ): IResolvedOutput[] {
 	if (!state.remoteBasepoints) return [];
 	const perCommitmentSecret = state.shaChainStore.getSecret(
@@ -2561,11 +2608,13 @@ function resolveRevokedTaprootCommitmentOutputs(
 		}
 	}
 
-	if (penaltyIns.length > 0) {
+	// Build ONE taproot penalty tx over the given inputs, sign, and push a
+	// resolved entry per input (all sharing that tx).
+	const buildAndSignPenalty = (ins: IPenaltyIn[]): void => {
 		const penaltyTx = new bitcoin.Transaction();
 		penaltyTx.version = 2;
 		let totalIn = 0;
-		for (const pin of penaltyIns) {
+		for (const pin of ins) {
 			penaltyTx.addInput(
 				Buffer.from(pin.output.txid, 'hex').reverse(),
 				pin.output.outputIndex
@@ -2574,15 +2623,15 @@ function resolveRevokedTaprootCommitmentOutputs(
 		}
 		// Rough taproot penalty vbytes: ~43 base + per-input (~58 key-path / ~70
 		// script-path) + ~43 output. Overestimate slightly so we clear min-relay.
-		const estVbytes = 50 + penaltyIns.length * 75 + 43;
+		const estVbytes = 50 + ins.length * 75 + 43;
 		const fee = Math.ceil(feeRatePerVbyte * estVbytes);
 		penaltyTx.addOutput(destinationScript, totalIn - fee);
 
-		const prevScripts = penaltyIns.map((p) => p.spk);
-		const values = penaltyIns.map((p) => p.value);
+		const prevScripts = ins.map((p) => p.spk);
+		const values = ins.map((p) => p.value);
 
-		for (let i = 0; i < penaltyIns.length; i++) {
-			const pin = penaltyIns[i];
+		for (let i = 0; i < ins.length; i++) {
+			const pin = ins[i];
 			let witness: Buffer[];
 			if (pin.merkleRoot) {
 				// HTLC key-path breach: tweak the revocation key by the output's tree.
@@ -2618,6 +2667,29 @@ function resolveRevokedTaprootCommitmentOutputs(
 				spendTx: penaltyTx,
 				witness
 			});
+		}
+	};
+
+	if (penaltyIns.length > 0) {
+		// Deadline split (mirrors the witness-v0 path): an HTLC input near its
+		// cltv_expiry is contested by the cheater's pre-signed HTLC-timeout and
+		// gets its own penalty tx so a lost race cannot invalidate the batch.
+		const urgent =
+			currentHeight !== undefined && penaltyIns.length > 1
+				? penaltyIns.filter(
+						(pin) =>
+							pin.output.cltvExpiry !== undefined &&
+							pin.output.cltvExpiry - currentHeight <=
+								PENALTY_SPLIT_DEADLINE_BLOCKS
+				  )
+				: [];
+		const batched = penaltyIns.filter((pin) => !urgent.includes(pin));
+
+		for (const pin of urgent) {
+			buildAndSignPenalty([pin]);
+		}
+		if (batched.length > 0) {
+			buildAndSignPenalty(batched);
 		}
 	}
 
