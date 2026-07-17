@@ -21,7 +21,7 @@ import {
 	generateKey
 } from '../onion/sphinx-crypto';
 import { getPublicKey } from '../crypto/ecdh';
-import { IBlindedPath, encodeBlindedHopData } from '../onion/blinded-path';
+import { IBlindedPath } from '../onion/blinded-path';
 import { encodeOnionPacket } from '../onion/construct';
 
 /**
@@ -202,50 +202,6 @@ export function constructSimpleOnionMessage(
 	const encodedPayload = encodeOnionMessagePayload(finalPayload);
 
 	return constructOnionMessage(sessKey, [destination], [encodedPayload]);
-}
-
-/**
- * Construct a multi-hop onion message through intermediate nodes to a destination.
- *
- * @param intermediateNodes - Array of intermediate node public keys
- * @param destination - Final destination public key
- * @param messageData - Application data for the final hop
- * @param sessionKey - Optional session key
- * @param options - Optional: reply path, etc.
- * @returns The complete IOnionMessage
- */
-export function constructMultiHopOnionMessage(
-	intermediateNodes: Buffer[],
-	destination: Buffer,
-	messageData: Map<number, Buffer>,
-	sessionKey?: Buffer,
-	options?: ISendOnionMessageOptions
-): IOnionMessage {
-	const sessKey = sessionKey || crypto.randomBytes(32);
-
-	const path = [...intermediateNodes, destination];
-	const payloads: Buffer[] = [];
-
-	// Intermediate hops need encrypted_recipient_data with next_node_id
-	for (let i = 0; i < intermediateNodes.length; i++) {
-		const nextNode =
-			i < intermediateNodes.length - 1 ? intermediateNodes[i + 1] : destination;
-		const hopData = encodeBlindedHopData({ nextNodeId: nextNode });
-		const intermediatePayload: IOnionMessagePayload = {
-			encryptedRecipientData: hopData,
-			messageTlvs: new Map()
-		};
-		payloads.push(encodeOnionMessagePayload(intermediatePayload));
-	}
-
-	// Final hop gets the message data and optional reply path
-	const finalPayload: IOnionMessagePayload = {
-		replyPath: options?.replyPath,
-		messageTlvs: messageData
-	};
-	payloads.push(encodeOnionMessagePayload(finalPayload));
-
-	return constructOnionMessage(sessKey, path, payloads);
 }
 
 /**

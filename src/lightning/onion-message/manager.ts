@@ -18,7 +18,6 @@ import {
 } from './codec';
 import {
 	constructSimpleOnionMessage,
-	constructMultiHopOnionMessage,
 	constructReplyOnionMessage
 } from './construct';
 import { processOnionMessage } from './process';
@@ -29,7 +28,8 @@ type TlvHandler = (
 	fromPeer: string,
 	tlvType: number,
 	data: Buffer,
-	replyPath?: IBlindedPath
+	replyPath?: IBlindedPath,
+	pathId?: Buffer
 ) => void;
 
 /**
@@ -127,42 +127,6 @@ export class OnionMessageManager extends EventEmitter {
 	}
 
 	/**
-	 * Send a multi-hop onion message through intermediate nodes.
-	 *
-	 * @param intermediateNodes - Array of intermediate node public keys
-	 * @param destination - Final destination public key
-	 * @param messageData - Application data for the final hop
-	 * @param options - Optional: reply path
-	 */
-	sendMultiHopOnionMessage(
-		intermediateNodes: Buffer[],
-		destination: Buffer,
-		messageData: Map<number, Buffer>,
-		options?: ISendOnionMessageOptions
-	): void {
-		if (!this.sendMessage) {
-			throw new Error('Send function not configured');
-		}
-
-		const msg = constructMultiHopOnionMessage(
-			intermediateNodes,
-			destination,
-			messageData,
-			undefined,
-			options
-		);
-		const wirePayload = encodeOnionMessageWire(msg);
-
-		// Send to the first node in the path
-		const firstHop =
-			intermediateNodes.length > 0
-				? intermediateNodes[0].toString('hex')
-				: destination.toString('hex');
-		this.sendMessage(firstHop, 513, wirePayload);
-		this.emit('message:send', firstHop, 513, wirePayload);
-	}
-
-	/**
 	 * Send a reply using a blinded reply path.
 	 *
 	 * @param replyPath - The blinded path received in the original message
@@ -222,9 +186,11 @@ export class OnionMessageManager extends EventEmitter {
 			);
 
 			if (result.type === 'delivery') {
-				// Final destination — emit event and invoke TLV handlers
+				// Final destination — emit event and invoke TLV handlers. The
+				// pathId (ERD type 6, decrypted-data only) lets handlers verify
+				// the message arrived over a blinded path WE issued.
 				this.emit('message:received', fromPeer, result.payload);
-				this.invokeTlvHandlers(fromPeer, result.payload);
+				this.invokeTlvHandlers(fromPeer, result.payload, result.pathId);
 			} else {
 				// Intermediate — forward to next hop
 				const nextNodeHex = result.nextNodeId.toString('hex');
@@ -312,13 +278,14 @@ export class OnionMessageManager extends EventEmitter {
 	 */
 	private invokeTlvHandlers(
 		fromPeer: string,
-		payload: IOnionMessagePayload
+		payload: IOnionMessagePayload,
+		pathId?: Buffer
 	): void {
 		for (const [tlvType, data] of payload.messageTlvs) {
 			const handlers = this.tlvHandlers.get(tlvType);
 			if (handlers) {
 				for (const handler of handlers) {
-					handler(fromPeer, tlvType, data, payload.replyPath);
+					handler(fromPeer, tlvType, data, payload.replyPath, pathId);
 				}
 			}
 		}
