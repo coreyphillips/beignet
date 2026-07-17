@@ -37,8 +37,8 @@ const SWEEP_VBYTES: Record<OutputType, number> = {
 /**
  * Get the estimated virtual byte size for sweeping a given output type.
  * `leased` marks a lease-locked (liquidity ads) to_remote claim, whose
- * witness script carries an extra CLTV clause: +7 WU (LND's lease
- * script-size overhead), ~+2 vbytes.
+ * witness script carries a multi-byte CSV number instead of OP_1 (CLN lease
+ * form): ~+4 WU, ~+1 vbyte (keep the old +2 vbyte cushion).
  */
 export function estimateSweepVbytes(
 	outputType: OutputType,
@@ -65,12 +65,6 @@ export interface IToLocalSweepParams {
 	destinationScript: Buffer;
 	/** Fee in satoshis */
 	feeSatoshis: bigint;
-	/**
-	 * Liquidity ads (bLIP-0051): absolute lease-expiry height. When the to_local
-	 * is a lessor output (CLTV-locked), the sweep must set nLockTime to this; the
-	 * input sequence (toSelfDelay, not 0xffffffff) keeps locktime enforced.
-	 */
-	leaseExpiry?: number;
 }
 
 /**
@@ -86,15 +80,14 @@ export function buildToLocalSweepTx(
 		amount,
 		toSelfDelay,
 		destinationScript,
-		feeSatoshis,
-		leaseExpiry
+		feeSatoshis
 	} = params;
 
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	// Lessor to_local outputs are CLTV-locked until lease_expiry; the input
-	// sequence (toSelfDelay) is not 0xffffffff, so locktime stays enforced.
-	tx.locktime = leaseExpiry && leaseExpiry > 0 ? leaseExpiry : 0;
+	// Liquidity-ads leases are pure CSV locks (CLN model): the lease rides in
+	// toSelfDelay (the script's CSV number), never in nLockTime.
+	tx.locktime = 0;
 
 	const txidBuf = Buffer.from(commitmentTxid, 'hex').reverse();
 	tx.addInput(txidBuf, outputIndex, toSelfDelay);
@@ -180,11 +173,6 @@ export interface ISecondLevelSweepParams {
 	destinationScript: Buffer;
 	/** Fee in satoshis */
 	feeSatoshis: bigint;
-	/**
-	 * Liquidity ads (bLIP-0051): absolute lease-expiry height. When the lessor's
-	 * second-level output is CLTV-locked, the sweep must set nLockTime to this.
-	 */
-	leaseExpiry?: number;
 }
 
 /**
@@ -200,14 +188,14 @@ export function buildSecondLevelSweepTx(
 		amount,
 		toSelfDelay,
 		destinationScript,
-		feeSatoshis,
-		leaseExpiry
+		feeSatoshis
 	} = params;
 
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
-	// Lessor second-level outputs are CLTV-locked until lease_expiry.
-	tx.locktime = leaseExpiry && leaseExpiry > 0 ? leaseExpiry : 0;
+	// BOLT 3 / CLN: second-level HTLC outputs are never lease-locked, so no
+	// nLockTime; the to_self_delay CSV is the only encumbrance.
+	tx.locktime = 0;
 
 	const txidBuf = Buffer.from(htlcTxid, 'hex').reverse();
 	tx.addInput(txidBuf, outputIndex, toSelfDelay);

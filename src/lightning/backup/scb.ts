@@ -52,14 +52,17 @@ export interface IScbChannelEntry {
 	isTaproot: boolean;
 	isAnchor: boolean;
 	/**
-	 * Liquidity ads (script-enforced lease). A LESSOR's to_remote is the
-	 * lease-locked CLTV variant, so recovery needs these to reconstruct the
-	 * right script and set the sweep's nLockTime. Optional: absent on
+	 * Liquidity ads (bLIP-0051 lease). A LESSOR's to_remote is the
+	 * lease-locked CSV variant, so recovery needs these to reconstruct the
+	 * right script and set the sweep's input sequence. leaseCommitBlockheight
+	 * is the blockheight agreed at open; the lease CSV =
+	 * leaseExpiry - leaseCommitBlockheight (CLN model). Optional: absent on
 	 * non-lease channels and on backups created before the fields existed
 	 * (JSON tolerates both directions; no version bump).
 	 */
 	leaseExpiry?: number;
 	isLessor?: boolean;
+	leaseCommitBlockheight?: number;
 }
 
 export interface IStaticChannelBackup {

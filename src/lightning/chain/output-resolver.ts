@@ -35,7 +35,7 @@ import {
 import { buildToLocalScript } from '../script/commitment';
 import {
 	buildToRemoteAnchorOutput,
-	leaseExpiryFromToRemoteScript
+	leaseCsvFromToRemoteScript
 } from '../script/anchor';
 import {
 	buildOfferedHtlcScript,
@@ -75,6 +75,7 @@ import {
 } from '../keys/derivation';
 import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import { IChannelState } from '../channel/channel-state';
+import { leaseCsvBlocks } from '../channel/liquidity-ads';
 import {
 	ChannelRole,
 	HtlcDirection,
@@ -325,7 +326,9 @@ function disambiguateCommitmentTx(
 						ourRevocationPubkey,
 						ourDelayedPubkey,
 						state.remoteConfig.toSelfDelay,
-						state.isLessor ? state.leaseExpiry : undefined
+						state.isLessor
+							? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+							: undefined
 					)
 				}
 		  }).output;
@@ -376,7 +379,12 @@ function disambiguateCommitmentTx(
 							theirRevocationPubkey,
 							theirDelayedPubkey,
 							state.localConfig.toSelfDelay,
-							state.isLessor ? undefined : state.leaseExpiry
+							state.isLessor
+								? undefined
+								: leaseCsvBlocks(
+										state.leaseExpiry,
+										state.leaseCommitBlockheight
+								  )
 						)
 					}
 			  }).output;
@@ -488,7 +496,9 @@ function classifyOurCommitmentOutputs(
 		revocationPubkey,
 		localDelayedPubkey,
 		toSelfDelay,
-		state.isLessor ? state.leaseExpiry : undefined
+		state.isLessor
+			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			: undefined
 	);
 	const toLocalP2wsh = bitcoin.payments.p2wsh({
 		redeem: { output: toLocalScript }
@@ -623,7 +633,9 @@ function classifyTheirCommitmentOutputs(
 		revocationPubkey,
 		theirDelayedPubkey,
 		toSelfDelay,
-		state.isLessor ? undefined : state.leaseExpiry
+		state.isLessor
+			? undefined
+			: leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
 	);
 	const toLocalP2wsh = bitcoin.payments.p2wsh({
 		redeem: { output: toLocalScript }
@@ -639,7 +651,10 @@ function classifyTheirCommitmentOutputs(
 	// first; the plain variant stays matched for pre-lease/legacy outputs.
 	const ourToRemoteAnchorLease =
 		ourToRemoteAnchor && state.isLessor && state.leaseExpiry
-			? buildToRemoteAnchorOutput(ourPaymentPubkey, state.leaseExpiry)
+			? buildToRemoteAnchorOutput(
+					ourPaymentPubkey,
+					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			  )
 			: null;
 
 	// HTLC keys from their perspective
@@ -774,7 +789,10 @@ function classifyTheirFutureCommitmentOutputs(
 	// lease fields ride along in the SCB, so this also works after recovery.
 	const anchorToRemoteLease =
 		anchorToRemote && state.isLessor && state.leaseExpiry
-			? buildToRemoteAnchorOutput(ourPaymentPubkey, state.leaseExpiry)
+			? buildToRemoteAnchorOutput(
+					ourPaymentPubkey,
+					leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			  )
 			: null;
 	const plainToRemote =
 		!taprootToRemote && !anchorToRemote
@@ -1150,20 +1168,24 @@ export function resolveOurCommitmentOutputs(
 		);
 
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
+			// Liquidity ads (CLN pure-CSV): a lessor's to_local CSV is
+			// max(to_self_delay, lease_csv), so the sweep's input nSequence must
+			// satisfy that larger value, not just to_self_delay.
+			const leaseCsv = state.isLessor
+				? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+				: undefined;
+			const toLocalCsv =
+				leaseCsv !== undefined && leaseCsv > toSelfDelay
+					? leaseCsv
+					: toSelfDelay;
 			const sweepTx = buildToLocalSweepTx({
 				commitmentTxid: output.txid,
 				outputIndex: output.outputIndex,
 				amount: output.amount,
 				witnessScript: output.witnessScript,
-				toSelfDelay,
+				toSelfDelay: toLocalCsv,
 				destinationScript,
-				feeSatoshis,
-				// Liquidity ads: a lessor's to_local witnessScript is CLTV-locked with
-				// `<lease_expiry> CLTV DROP`, so the sweep MUST set nLockTime to
-				// lease_expiry or OP_CHECKLOCKTIMEVERIFY fails (BIP65) and the sweep is
-				// consensus-invalid forever. Mirror the second-level and classification
-				// paths: only OUR to_local is lease-locked when we are the lessor.
-				leaseExpiry: state.isLessor ? state.leaseExpiry : undefined
+				feeSatoshis
 			});
 
 			// Derive the delayed payment private key for signing
@@ -1188,7 +1210,7 @@ export function resolveOurCommitmentOutputs(
 				trackedOutput: output,
 				spendTx: sweepTx,
 				witness,
-				csvDelay: toSelfDelay
+				csvDelay: toLocalCsv
 			});
 		} else if (output.outputType === OutputType.TO_REMOTE) {
 			// to_remote on our commitment belongs to remote — we don't spend it
@@ -1210,10 +1232,7 @@ export function resolveOurCommitmentOutputs(
 				localDelayedPubkey,
 				toSelfDelay,
 				secondLevelHtlcFee(state, false),
-				useAnchors,
-				// Liquidity ads: our own second-level output is CLTV-locked iff we are
-				// the lessor — must match the pre-signed script.
-				state.isLessor ? state.leaseExpiry : undefined
+				useAnchors
 			);
 
 			// Sign HTLC-timeout if we have the htlc basepoint secret and remote sig
@@ -1272,10 +1291,7 @@ export function resolveOurCommitmentOutputs(
 					localDelayedPubkey,
 					toSelfDelay,
 					secondLevelHtlcFee(state, true),
-					useAnchors,
-					// Liquidity ads: our own second-level output is CLTV-locked iff we
-					// are the lessor — must match the pre-signed script.
-					state.isLessor ? state.leaseExpiry : undefined
+					useAnchors
 				);
 
 				// Sign HTLC-success if we have the htlc basepoint secret and remote sig
@@ -1440,13 +1456,11 @@ export function resolveSecondLevelHtlcOutput(
 	const toSelfDelay = state.remoteConfig.toSelfDelay;
 	// The second-level output uses the SAME to_local-format script the
 	// HTLC-timeout/success tx produced (buildHtlcTimeoutTx / buildHtlcSuccessTx):
-	// revocation-OR-(delayed + CSV), plus the lease CLTV lock when we are the lessor.
-	const leaseExpiry = state.isLessor ? state.leaseExpiry : undefined;
+	// revocation-OR-(delayed + CSV). BOLT 3 / CLN: never lease-locked.
 	const witnessScript = buildToLocalScript(
 		revocationPubkey,
 		delayedPubkey,
-		toSelfDelay,
-		leaseExpiry
+		toSelfDelay
 	);
 	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: witnessScript } });
 	if (!p2wsh.output || !p2wsh.output.equals(out.script)) return null;
@@ -1463,9 +1477,7 @@ export function resolveSecondLevelHtlcOutput(
 		witnessScript,
 		toSelfDelay,
 		destinationScript,
-		feeSatoshis,
-		// Liquidity ads: a lessor's second-level output is CLTV-locked to lease_expiry.
-		leaseExpiry
+		feeSatoshis
 	});
 
 	const basepointSecret =
@@ -1915,19 +1927,17 @@ export function resolveTheirCurrentCommitmentOutputs(
 	const resolved: IResolvedOutput[] = [];
 
 	for (const output of trackedOutputs) {
-		// A lease-locked to_remote (liquidity ads, we are the lessor) carries
-		// its CLTV in the witness script; the claim must set nLockTime to it.
-		const toRemoteLeaseExpiry =
+		// A lease-locked to_remote (liquidity ads, we are the lessor) carries a
+		// CSV number > 1 in the witness script (CLN model); the claim's input
+		// nSequence must satisfy it.
+		const toRemoteLeaseCsv =
 			output.outputType === OutputType.TO_REMOTE && output.witnessScript
-				? leaseExpiryFromToRemoteScript(output.witnessScript)
+				? leaseCsvFromToRemoteScript(output.witnessScript)
 				: undefined;
 		const feeSatoshis = BigInt(
 			Math.ceil(
 				feeRatePerVbyte *
-					estimateSweepVbytes(
-						output.outputType,
-						toRemoteLeaseExpiry !== undefined
-					)
+					estimateSweepVbytes(output.outputType, toRemoteLeaseCsv !== undefined)
 			)
 		);
 
@@ -1943,10 +1953,9 @@ export function resolveTheirCurrentCommitmentOutputs(
 					outputIndex: output.outputIndex,
 					amount: output.amount,
 					witnessScript: output.witnessScript,
-					toSelfDelay: 1,
+					toSelfDelay: toRemoteLeaseCsv ?? 1,
 					destinationScript,
-					feeSatoshis,
-					leaseExpiry: toRemoteLeaseExpiry
+					feeSatoshis
 				});
 
 				const sig = signSweepInput(
@@ -1962,7 +1971,7 @@ export function resolveTheirCurrentCommitmentOutputs(
 					trackedOutput: output,
 					spendTx: claimTx,
 					witness,
-					csvDelay: 1
+					csvDelay: toRemoteLeaseCsv ?? 1
 				});
 			} else {
 				// Non-anchor (static_remotekey): P2WPKH, claimable immediately.
@@ -2189,15 +2198,15 @@ export function resolveRevokedCommitmentOutputs(
 			// it exactly like the non-revoked remote-commitment path.
 			// A lessor's to_remote is lease-locked (CLTV in the witness script);
 			// the claim must set nLockTime to it even on a revoked commitment.
-			const toRemoteLeaseExpiry = output.witnessScript
-				? leaseExpiryFromToRemoteScript(output.witnessScript)
+			const toRemoteLeaseCsv = output.witnessScript
+				? leaseCsvFromToRemoteScript(output.witnessScript)
 				: undefined;
 			const feeSatoshis = BigInt(
 				Math.ceil(
 					feeRatePerVbyte *
 						estimateSweepVbytes(
 							OutputType.TO_REMOTE,
-							toRemoteLeaseExpiry !== undefined
+							toRemoteLeaseCsv !== undefined
 						)
 				)
 			);
@@ -2208,10 +2217,9 @@ export function resolveRevokedCommitmentOutputs(
 					outputIndex: output.outputIndex,
 					amount: output.amount,
 					witnessScript: output.witnessScript,
-					toSelfDelay: 1,
+					toSelfDelay: toRemoteLeaseCsv ?? 1,
 					destinationScript,
-					feeSatoshis,
-					leaseExpiry: toRemoteLeaseExpiry
+					feeSatoshis
 				});
 				const sig = signSweepInput(
 					claimTx,
@@ -2716,22 +2724,11 @@ export function resolveRevokedSecondLevelOutput(
 		perCommitmentPoint
 	);
 	const toSelfDelay = state.localConfig.toSelfDelay;
-	// Liquidity ads: the peer's second-level output carries the lease CLTV lock
-	// only when THEY are the lessor (state.isLessor marks US). Their tx may or
-	// may not have been built with the lock, so match both script variants.
+	// BOLT 3 / CLN: second-level HTLC outputs are never lease-locked, so the
+	// peer's revoked second-level output is the plain to_local-format script.
 	const candidateScripts: Buffer[] = [
 		buildToLocalScript(revocationPubkey, delayedPubkey, toSelfDelay)
 	];
-	if (state.leaseExpiry && !state.isLessor) {
-		candidateScripts.push(
-			buildToLocalScript(
-				revocationPubkey,
-				delayedPubkey,
-				toSelfDelay,
-				state.leaseExpiry
-			)
-		);
-	}
 
 	for (let i = 0; i < spendingTx.outs.length; i++) {
 		const out = spendingTx.outs[i];

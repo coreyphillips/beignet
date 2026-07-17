@@ -380,6 +380,7 @@ export interface ISerializedChannelState {
 	// signature no longer validates, and our whole balance becomes unbroadcastable.
 	isLessor?: boolean;
 	leaseExpiry?: number;
+	leaseCommitBlockheight?: number;
 	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
 	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
 	lastCooperativeCloseTxHex?: string;
@@ -627,6 +628,7 @@ export function serializeChannelState(
 		fundingLocktime: s.fundingLocktime,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
@@ -797,6 +799,7 @@ export function deserializeChannelState(
 		fundingLocktime: s.fundingLocktime ?? 0,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		dlpRemotePerCommitmentPoint:

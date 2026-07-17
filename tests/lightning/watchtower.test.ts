@@ -662,8 +662,10 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 	it('names the blob limitation for a lessee-side lease-locked to_local (S-L.H4)', function () {
 		const built = buildRevokedContext(p2wpkhScript());
 		const leaseExpiry = 804032;
+		const leaseCommitBlockheight = 800000;
+		const leaseCsv = leaseExpiry - leaseCommitBlockheight; // 4032, CLN model
 		// We are the LESSEE: the peer (lessor) commitment's to_local carries the
-		// lease CLTV. Rebuild the revoked tx's to_local as the lease variant.
+		// lease CSV. Rebuild the revoked tx's to_local as the lease variant.
 		const plainToLocalSpk = bitcoin.payments.p2wsh({
 			redeem: {
 				output: buildToLocalScript(
@@ -680,7 +682,7 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 					built.revocationPubkey,
 					built.theirDelayed,
 					built.toSelfDelay,
-					leaseExpiry
+					leaseCsv
 				)
 			},
 			network
@@ -688,7 +690,12 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		for (const out of built.ctx.revokedTx.outs) {
 			if (out.script.equals(plainToLocalSpk)) out.script = leaseToLocalSpk;
 		}
-		const ctx = { ...built.ctx, isAnchor: true, leaseExpiry };
+		const ctx = {
+			...built.ctx,
+			isAnchor: true,
+			leaseExpiry,
+			leaseCommitBlockheight
+		};
 		expect(() =>
 			buildJusticeBackup(ctx, {
 				blobType: BlobType.ALTRUIST_COMMIT,

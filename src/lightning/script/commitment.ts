@@ -57,49 +57,43 @@ export function calculateObscuredCommitmentNumber(
  * OP_IF
  *   <revocationpubkey>
  * OP_ELSE
- *   [<lease_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP]   (liquidity-ads lessor only)
- *   <to_self_delay> OP_CHECKSEQUENCEVERIFY OP_DROP
+ *   <max(to_self_delay, lease_csv)> OP_CHECKSEQUENCEVERIFY OP_DROP
  *   <local_delayedpubkey>
  * OP_ENDIF
  * OP_CHECKSIG
  *
- * When `leaseExpiry` is set (liquidity ads / bLIP-0051, lessor side), an absolute
- * CLTV is prepended to the delay branch so the lessor cannot sweep its own funds
- * before the lease expires — matching LND's script-enforced-lease
- * LeaseCommitScriptToSelf (CLTV before the CSV). The spending tx must therefore
- * set nLockTime >= lease_expiry in addition to satisfying the CSV.
+ * When `leaseCsv` is set (liquidity ads / bLIP-0051, lessor side), the CSV
+ * number becomes max(to_self_delay, leaseCsv) so the lessor cannot sweep its
+ * own funds before the lease runs out — CLN's bitcoin_wscript_to_local model
+ * (a pure relative lock; leaseCsv = lease_expiry - agreed blockheight,
+ * 4032 at open).
  *
  * @param revocationPubkey - 33-byte revocation public key
  * @param localDelayedPubkey - 33-byte local delayed payment key
  * @param toSelfDelay - CSV delay in blocks
- * @param leaseExpiry - absolute lease-expiry block height (lessor only); omit otherwise
+ * @param leaseCsv - remaining lease blocks (lessor only); omit otherwise
  * @returns The witness script
  */
 export function buildToLocalScript(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
-	leaseExpiry?: number
+	leaseCsv?: number
 ): Buffer {
-	const delayBranch: (number | Buffer)[] = [];
-	if (leaseExpiry !== undefined && leaseExpiry > 0) {
-		delayBranch.push(
-			bitcoin.script.number.encode(leaseExpiry),
-			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
-			bitcoin.opcodes.OP_DROP
-		);
-	}
-	delayBranch.push(
-		bitcoin.script.number.encode(toSelfDelay),
-		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
-		bitcoin.opcodes.OP_DROP,
-		localDelayedPubkey
-	);
+	// Liquidity ads (bLIP-0051, CLN model validated from source): the lease is
+	// a PURE CSV — the delay number becomes max(to_self_delay, lease_remaining)
+	// (CLN bitcoin_wscript_to_local). No CLTV clause; the earlier LND-Pool
+	// style CLTV variant produced commitments CLN rejects.
+	const csv =
+		leaseCsv !== undefined && leaseCsv > toSelfDelay ? leaseCsv : toSelfDelay;
 	return bitcoin.script.compile([
 		bitcoin.opcodes.OP_IF,
 		revocationPubkey,
 		bitcoin.opcodes.OP_ELSE,
-		...delayBranch,
+		bitcoin.script.number.encode(csv),
+		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
+		bitcoin.opcodes.OP_DROP,
+		localDelayedPubkey,
 		bitcoin.opcodes.OP_ENDIF,
 		bitcoin.opcodes.OP_CHECKSIG
 	]);
@@ -123,21 +117,22 @@ export interface ICommitmentTxParams {
 	localDelayedPubkey: Buffer;
 	toSelfDelay: number;
 	/**
-	 * Liquidity ads (bLIP-0051): absolute lease-expiry block height. When set, the
-	 * to_local output is CLTV-locked until this height (lessor side only).
+	 * Liquidity ads (bLIP-0051): remaining-lease CSV blocks. When set, the
+	 * to_local CSV number becomes max(to_self_delay, this) (lessor side only,
+	 * CLN model).
 	 */
-	leaseExpiry?: number;
+	leaseCsv?: number;
 
 	/** to_remote output (P2WPKH with static_remote_key) */
 	remoteAmount: bigint;
 	remotePaymentPubkey: Buffer;
 	/**
-	 * Liquidity ads: absolute lease-expiry height for THIS tx's to_remote
-	 * output. Set only when the party the to_remote pays is the lessor (the
-	 * mirror of `leaseExpiry`, which locks the to_local). Anchors only: the
-	 * plain P2WPKH to_remote cannot carry a lease lock.
+	 * Liquidity ads: remaining-lease CSV blocks for THIS tx's to_remote output.
+	 * Set only when the party the to_remote pays is the lessor (the mirror of
+	 * `leaseCsv`, which locks the to_local). Anchors only: the plain P2WPKH
+	 * to_remote cannot carry a lease lock.
 	 */
-	toRemoteLeaseExpiry?: number;
+	toRemoteLeaseCsv?: number;
 
 	/** HTLC outputs (pre-built scripts and amounts) */
 	htlcOutputs?: IHtlcOutput[];
@@ -212,7 +207,7 @@ export function buildCommitmentTx(
 		revocationPubkey,
 		localDelayedPubkey,
 		toSelfDelay,
-		leaseExpiry,
+		leaseCsv,
 		remoteAmount,
 		remotePaymentPubkey,
 		htlcOutputs,
@@ -270,7 +265,7 @@ export function buildCommitmentTx(
 				revocationPubkey,
 				localDelayedPubkey,
 				toSelfDelay,
-				leaseExpiry
+				leaseCsv
 			);
 			spk = bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } })
 				.output!;
@@ -288,9 +283,9 @@ export function buildCommitmentTx(
 	if (params.taprootToRemoteScript) {
 		// option_taproot: to_remote is a P2TR (1-block-CSV leaf). Same dust limit.
 		// Leased taproot channels are rejected at negotiation, so no lease here.
-		if (params.toRemoteLeaseExpiry !== undefined) {
+		if (params.toRemoteLeaseCsv !== undefined) {
 			throw new Error(
-				'toRemoteLeaseExpiry is not supported on taproot commitments.'
+				'toRemoteLeaseCsv is not supported on taproot commitments.'
 			);
 		}
 		if (remoteAmount >= dustWsh) {
@@ -308,7 +303,7 @@ export function buildCommitmentTx(
 		if (remoteAmount >= dustWsh) {
 			const { script, witnessScript } = buildToRemoteAnchorOutput(
 				remotePaymentPubkey,
-				params.toRemoteLeaseExpiry
+				params.toRemoteLeaseCsv
 			);
 			toRemoteScript = witnessScript;
 			outputs.push({
@@ -321,9 +316,9 @@ export function buildCommitmentTx(
 	} else {
 		// Non-anchor: a plain P2WPKH to_remote cannot carry a lease lock;
 		// leases are negotiated anchors-only.
-		if (params.toRemoteLeaseExpiry !== undefined) {
+		if (params.toRemoteLeaseCsv !== undefined) {
 			throw new Error(
-				'toRemoteLeaseExpiry requires an anchor (P2WSH confirmed) to_remote.'
+				'toRemoteLeaseCsv requires an anchor (P2WSH confirmed) to_remote.'
 			);
 		}
 		if (remoteAmount >= dustWpkh) {

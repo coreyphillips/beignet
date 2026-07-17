@@ -2195,7 +2195,10 @@ export class LightningNode extends EventEmitter {
 				...(state.leaseExpiry !== undefined
 					? { leaseExpiry: state.leaseExpiry }
 					: {}),
-				...(state.isLessor !== undefined ? { isLessor: state.isLessor } : {})
+				...(state.isLessor !== undefined ? { isLessor: state.isLessor } : {}),
+				...(state.leaseCommitBlockheight !== undefined
+					? { leaseCommitBlockheight: state.leaseCommitBlockheight }
+					: {})
 			});
 		}
 		return { network: this.network, channels };
@@ -2278,6 +2281,7 @@ export class LightningNode extends EventEmitter {
 			// the lease-locked to_remote variant and the sweep sets its nLockTime.
 			state.leaseExpiry = entry.leaseExpiry;
 			state.isLessor = entry.isLessor;
+			state.leaseCommitBlockheight = entry.leaseCommitBlockheight;
 			state.localCommitmentNumber = 0n;
 			state.remoteCommitmentNumber = 0n;
 			// Balances are unknown after data loss; the sweep takes its amount from
@@ -2476,7 +2480,8 @@ export class LightningNode extends EventEmitter {
 				// Liquidity ads: lets the kit builder exclude the lease-locked
 				// to_remote (lessor) / name the lessee-side blob limitation.
 				isLessor: state.isLessor,
-				leaseExpiry: state.leaseExpiry
+				leaseExpiry: state.leaseExpiry,
+				leaseCommitBlockheight: state.leaseCommitBlockheight
 			};
 			client.backupRevokedState(ctx);
 		} catch (err) {
