@@ -575,7 +575,10 @@ export class LightningNode extends EventEmitter {
 			// nonces but funding cannot yet complete (commitment-round MuSig2 nonce
 			// rotation is not wired into the live state machine). Off by default.
 			preferTaproot: config.preferTaproot,
-			chainHash: config.chainHashes?.[0],
+			// Default to the node's OWN network's chain hash, never mainnet: a
+			// regtest/testnet node without explicit chainHashes previously opened
+			// channels (and announced) with the mainnet hash (S-7.M1).
+			chainHash: config.chainHashes?.[0] ?? this.chainHash(),
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
 			signerFactory: config.signerFactory,
@@ -585,7 +588,7 @@ export class LightningNode extends EventEmitter {
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
 
-		this.graph = new NetworkGraph();
+		this.graph = new NetworkGraph(this.chainHash());
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
 		this.wireOnionMessageEvents();
@@ -3974,8 +3977,9 @@ export class LightningNode extends EventEmitter {
 					: policy.htlcMaximumMsat;
 			const payload = encodeChannelUpdateMessage({
 				signature: Buffer.alloc(64), // placeholder, signed below
-				// Match the chain scope the receiver enforces (acceptableChainHashes)
-				chainHash: this.acceptableChainHashes[0] ?? BITCOIN_CHAIN_HASH,
+				// Match the chain scope the receiver enforces (acceptableChainHashes),
+				// defaulting to OUR network's hash — never mainnet (S-7.M1).
+				chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
 				shortChannelId: scid,
 				timestamp: Math.floor(Date.now() / 1000),
 				messageFlags: 0x01, // htlc_maximum_msat present
