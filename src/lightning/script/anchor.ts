@@ -42,65 +42,55 @@ export function buildAnchorScript(fundingPubkey: Buffer): Buffer {
 /**
  * Build the to_remote script for anchor channels:
  *   <remotepubkey> OP_CHECKSIGVERIFY
- *   [<lease_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP]   (liquidity-ads lessor only)
- *   1 OP_CHECKSEQUENCEVERIFY
+ *   <csv> OP_CHECKSEQUENCEVERIFY
  *
- * This adds a 1-block CSV delay compared to the non-anchor P2WPKH to_remote.
- *
- * When `leaseExpiry` is set (liquidity ads / script-enforced lease), an
- * absolute CLTV is inserted between the CHECKSIGVERIFY and the 1-block CSV so
- * the LESSOR cannot sweep its balance from the lessee's commitment before the
- * lease expires — matching LND's LeaseCommitScriptToRemoteConfirmed. The
- * spending tx must set nLockTime >= lease_expiry in addition to the CSV.
+ * csv is 1 for a normal channel (the standard anchored to_remote), and the
+ * remaining lease blocks for the LESSOR's output on a leased channel — CLN's
+ * bitcoin_wscript_to_remote_anchored model (bLIP-0051 leases are a pure CSV;
+ * leaseCsv = lease_expiry - agreed blockheight, 4032 at open). The earlier
+ * LND-Pool style CLTV variant produced commitments CLN rejects.
  */
 export function buildToRemoteAnchorScript(
 	remotePubkey: Buffer,
-	leaseExpiry?: number
+	leaseCsv?: number
 ): Buffer {
-	const leaseClause: (number | Buffer)[] = [];
-	if (leaseExpiry !== undefined && leaseExpiry > 0) {
-		leaseClause.push(
-			bitcoin.script.number.encode(leaseExpiry),
-			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
-			bitcoin.opcodes.OP_DROP
-		);
-	}
+	const csv = leaseCsv !== undefined && leaseCsv > 1 ? leaseCsv : 1;
 	return bitcoin.script.compile([
 		remotePubkey,
 		bitcoin.opcodes.OP_CHECKSIGVERIFY,
-		...leaseClause,
-		bitcoin.script.number.encode(1),
+		bitcoin.script.number.encode(csv),
 		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY
 	]);
 }
 
 /**
- * If the witness script is a lease-locked confirmed to_remote
- * (LeaseCommitScriptToRemoteConfirmed layout above), return its lease-expiry
- * height; undefined for the plain variant or any other script. Spend paths
- * derive the required nLockTime from the on-chain script itself so sweeps
- * work even from restored state that lost the lease fields.
+ * If the witness script is a lease-locked anchored to_remote (the CLN layout
+ * above with csv > 1), return its remaining-lease CSV; undefined for the
+ * plain variant or any other script. Spend paths derive the required input
+ * SEQUENCE from the on-chain script itself so sweeps work even from restored
+ * state that lost the lease fields.
  */
-export function leaseExpiryFromToRemoteScript(
+export function leaseCsvFromToRemoteScript(
 	witnessScript: Buffer
 ): number | undefined {
 	const chunks = bitcoin.script.decompile(witnessScript);
-	if (!chunks || chunks.length !== 7) return undefined;
-	const [pubkey, checksigverify, expiry, cltv, drop, one, csv] = chunks;
+	if (!chunks || chunks.length !== 4) return undefined;
+	const [pubkey, checksigverify, csvNum, csv] = chunks;
 	if (
 		!Buffer.isBuffer(pubkey) ||
 		pubkey.length !== 33 ||
 		checksigverify !== bitcoin.opcodes.OP_CHECKSIGVERIFY ||
-		!Buffer.isBuffer(expiry) ||
-		cltv !== bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY ||
-		drop !== bitcoin.opcodes.OP_DROP ||
-		one !== bitcoin.opcodes.OP_1 ||
 		csv !== bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY
 	) {
 		return undefined;
 	}
+	// Plain anchored to_remote encodes 1 as OP_1 (a number opcode, not a
+	// push); anything above 1 is a lease lock.
+	if (csvNum === bitcoin.opcodes.OP_1) return undefined;
+	if (!Buffer.isBuffer(csvNum)) return undefined;
 	try {
-		return bitcoin.script.number.decode(expiry);
+		const v = bitcoin.script.number.decode(csvNum);
+		return v > 1 ? v : undefined;
 	} catch {
 		return undefined;
 	}

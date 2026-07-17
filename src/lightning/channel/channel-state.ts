@@ -384,6 +384,12 @@ export interface IChannelState {
 	 */
 	leaseFeeSats?: bigint;
 	/**
+	 * Liquidity ads: the blockheight both sides agreed on at open
+	 * (request_funds.blockheight). Commitment lease CSV =
+	 * leaseExpiry - this (CLN model); advanced only by update_blockheight.
+	 */
+	leaseCommitBlockheight?: number;
+	/**
 	 * Liquidity ads (bLIP-0051): the routing-fee caps the lessor signed into its
 	 * will_fund. While the lease is active the lessor MUST NOT advertise a
 	 * channel_update whose fees exceed these — the buyer paid for capped fees.

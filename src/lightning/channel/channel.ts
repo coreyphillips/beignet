@@ -8090,6 +8090,7 @@ export class Channel {
 			this._state.leaseExpiry = computeLeaseExpiry(
 				msg.requestFunds.blockheight
 			);
+			this._state.leaseCommitBlockheight = msg.requestFunds.blockheight;
 			this._state.isLessor = true;
 			// Remember the routing-fee caps we signed: while the lease is active we
 			// MUST NOT advertise a channel_update exceeding them (the buyer paid
@@ -8284,6 +8285,7 @@ export class Channel {
 			this._state.remoteBalanceMsat += feeMsat;
 			this._state.leaseFeeSats = leaseFeeSat;
 			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
+			this._state.leaseCommitBlockheight = requestFunds.blockheight;
 		}
 
 		return [];

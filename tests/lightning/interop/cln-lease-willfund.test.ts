@@ -22,7 +22,9 @@ import {
 	isClnAvailable,
 	createClnClient,
 	waitForClnSync,
+	waitForClnPeerChannelNormal,
 	fundClnWallet,
+	waitFor,
 	CLN_P2P_HOST,
 	CLN_P2P_PORT,
 	sleep
@@ -35,13 +37,17 @@ import {
 } from './shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
-import { REGTEST_CHAIN_HASH } from '../../../src/lightning/channel/types';
+import {
+	REGTEST_CHAIN_HASH,
+	ChannelState
+} from '../../../src/lightning/channel/types';
 import { Network } from '../../../src/lightning/invoice/types';
 import {
 	deriveLightningKeysFromMnemonic,
 	LnCoinType
 } from '../../../src/lightning/keys/wallet-keys';
 import { createFundingScript } from '../../../src/lightning/script/funding';
+import { buildSpliceTx } from '../../../src/lightning/channel/splice-tx';
 
 bitcoin.initEccLib(ecc);
 
@@ -157,23 +163,6 @@ describe('Interop: option_will_fund lease vs CLN (regtest)', function () {
 		node.on('node:error', (e: { code?: string; message?: string }) => {
 			console.log(`    [node:error] ${e.code}: ${e.message}`);
 		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		node.getChannelManager().on('error', (...a: any[]) => {
-			console.log('    [cm:error]', ...a.map((x) => String(x)));
-		});
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(node as any).peerManager.on(
-			'message',
-			(_pk: string, type: number, payload: Buffer) => {
-				if (type < 1000 && type !== 258 && type !== 265 && type !== 19) {
-					console.log(
-						`    [wire<-] type ${type} len ${payload.length} ${payload
-							.toString('hex')
-							.slice(0, 80)}`
-					);
-				}
-			}
-		);
 		await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 		await sleep(1500);
 
@@ -187,6 +176,7 @@ describe('Interop: option_will_fund lease vs CLN (regtest)', function () {
 			pubkey: walletPub,
 			network: bitcoin.networks.regtest
 		});
+		const scriptCode = bitcoin.payments.p2pkh({ pubkey: walletPub }).output!;
 		const utxoValue = 700_000;
 		const fundTxid = (await bitcoinRpc('sendtoaddress', [
 			walletPayment.address!,
@@ -327,17 +317,123 @@ describe('Interop: option_will_fund lease vs CLN (regtest)', function () {
 				`lease_expiry ${state.leaseExpiry})`
 		);
 
-		// KNOWN RESIDUAL (tracked): the leased-commitment scripts (the lessor's
-		// CSV/CLTV-locked to_remote on OUR commitment) still diverge from CLN's
-		// ("Invalid commitment signature in v2 open"), so the signature exchange
-		// is not completed here. Abort cleanly; no signatures were released.
+		// The mid-open commitment round already ran (via auto-routing) when
+		// tx_complete completed. With the CLN pure-CSV lease scripts, CLN's
+		// commitment signature over OUR leased commitment now VERIFIES — the
+		// channel would have ERRORED otherwise (asserted here).
+		expect(channel.getState(), 'no commitment-sig error').to.not.equal(
+			ChannelState.ERRORED
+		);
+
+		// Sign our wallet input over the negotiated funding tx and release
+		// tx_signatures; CLN then sends its own (its lease input witnesses).
+		const tx = buildSpliceTx(
+			built.inputs.map((i) => ({
+				serialId: i.serialId,
+				prevTxid:
+					i.prevTx && i.prevTx.length >= 32
+						? bitcoin.Transaction.fromBuffer(i.prevTx).getHash()
+						: i.prevTxid,
+				prevOutputIndex: i.prevTxVout ?? i.prevOutputIndex,
+				sequence: i.sequence
+			})),
+			built.outputs.map((o) => ({
+				serialId: o.serialId,
+				script: o.scriptPubkey,
+				valueSats: o.amountSats
+			})),
+			built.locktime
+		);
+		expect(
+			Buffer.from(tx.getHash()).equals(negotiated.fundingTxid!),
+			'locally rebuilt funding tx matches the negotiated txid'
+		).to.equal(true);
+		const ourIndex = tx.ins.findIndex(
+			(i) =>
+				Buffer.from(i.hash).equals(prevTx.getHash()) && i.index === prevVout
+		);
+		expect(ourIndex, 'our wallet input present').to.be.gte(0);
+		const sighash = tx.hashForWitnessV0(
+			ourIndex,
+			scriptCode,
+			utxoValue,
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		const der = bitcoin.script.signature.encode(
+			Buffer.from(ecc.sign(sighash, walletPriv)),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
 		node
 			.getChannelManager()
 			['processActions'](
 				clnPubkey,
 				channel,
-				channel.abortDualFunding('lease interop test complete (pre-signature)')
+				channel.sendTxSignatures(
+					negotiated.fundingTxid!,
+					negotiated.fundingOutputIndex,
+					[[der, walletPub]]
+				)
 			);
-		await sleep(500);
+
+		// Wait for CLN's tx_signatures, then broadcast (CLN may or may not).
+		await waitFor(() => {
+			const w = session.getRemoteWitnesses();
+			return w && w.length > 0 ? w : null;
+		}, 30_000);
+		const displayTxid = Buffer.from(negotiated.fundingTxid!)
+			.reverse()
+			.toString('hex');
+		let seen = false;
+		const bcastDeadline = Date.now() + 30_000;
+		while (Date.now() < bcastDeadline) {
+			try {
+				await bitcoinRpc('getrawtransaction', [displayTxid]);
+				seen = true;
+				break;
+			} catch {
+				await sleep(1000);
+			}
+		}
+		if (!seen) {
+			tx.setWitness(ourIndex, [der, walletPub]);
+			const remoteWitnesses = session.getRemoteWitnesses() || [];
+			expect(
+				remoteWitnesses.length,
+				'CLN tx_signatures witnesses received'
+			).to.equal(tx.ins.length - 1);
+			let w = 0;
+			for (let idx = 0; idx < tx.ins.length; idx++) {
+				if (idx === ourIndex) continue;
+				tx.setWitness(idx, remoteWitnesses[w++]);
+			}
+			await bitcoinRpc('sendrawtransaction', [tx.toHex()]);
+		}
+		await mineBlocks(6);
+		await sleep(2000);
+
+		const channelId = channel.getChannelId();
+		expect(channelId, 'channel promoted').to.exist;
+		node.handleFundingConfirmed(channelId!);
+
+		await waitForClnPeerChannelNormal(cln, node.getNodeId(), 60_000);
+		const readyDeadline = Date.now() + 30_000;
+		while (Date.now() < readyDeadline) {
+			if (channel.getState() === ChannelState.NORMAL) break;
+			await sleep(500);
+		}
+		expect(channel.getState(), 'beignet leased channel NORMAL').to.equal(
+			ChannelState.NORMAL
+		);
+
+		const { channels } = await cln.listChannels();
+		const entry = (channels || []).find(
+			(c) => c.peer_id === node!.getNodeId() && c.state === 'CHANNELD_NORMAL'
+		);
+		expect(entry, 'CLN lists the leased channel NORMAL').to.exist;
+		console.log(
+			`    LEASED CHANNEL OPEN vs CLN: total ${totalFunding} sat ` +
+				`(ours ${FUNDING} + CLN lease ${sellerSats}), fee ${leaseFee} sat, ` +
+				`lease_expiry ${state.leaseExpiry} — commitment scripts CLN-verified`
+		);
 	});
 });

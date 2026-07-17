@@ -1,14 +1,13 @@
 /**
  * S-L.H4 regression: the lessor's `to_remote` output must be lease-locked.
  *
- * Before this fix `leaseExpiry` was threaded only into to_local, so on the
- * BUYER's commitment the seller's balance sat in a plain 1-CSV confirmed
- * to_remote: the seller could escape the lease early simply by provoking the
- * buyer into force-closing. The fix adds LND's
- * LeaseCommitScriptToRemoteConfirmed variant
- * (<key> OP_CHECKSIGVERIFY <lease_expiry> OP_CLTV OP_DROP 1 OP_CSV) and
- * threads it through the commitment builder (mirror of the to_local gates),
- * the output classifier/resolver (sweep sets nLockTime = lease_expiry), the
+ * The BUYER's commitment must pay the seller's balance to a lease-locked
+ * to_remote, else the seller could escape the lease by provoking a buyer
+ * force-close. CLN's model (bLIP-0051, validated live) is a PURE CSV:
+ * <key> OP_CHECKSIGVERIFY <lease_csv> OP_CHECKSEQUENCEVERIFY, where
+ * lease_csv = lease_expiry - the agreed blockheight. It is threaded through the
+ * commitment builder (mirror of the to_local gates), the output
+ * classifier/resolver (sweep input sequence = lease_csv, no nLockTime), the
  * watchtower kit (lease outputs excluded: blob v0 cannot express them), and
  * the SCB (lease fields ride along for post-restore recovery).
  */
@@ -39,7 +38,7 @@ import { generateFromSeed } from '../../src/lightning/keys/shachain';
 import { deriveChannelId } from '../../src/lightning/channel/validation';
 import {
 	buildToRemoteAnchorScript,
-	leaseExpiryFromToRemoteScript
+	leaseCsvFromToRemoteScript
 } from '../../src/lightning/script/anchor';
 import {
 	classifyOutputs,
@@ -55,6 +54,8 @@ import {
 bitcoin.initEccLib(ecc);
 
 const LEASE_EXPIRY = 804032; // computeLeaseExpiry(800000)
+const LEASE_COMMIT_BH = 800000; // request_funds.blockheight agreed at open
+const LEASE_CSV = LEASE_EXPIRY - LEASE_COMMIT_BH; // 4032
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -169,7 +170,9 @@ function createLeasedChannelStates(withLease = true) {
 
 	if (withLease) {
 		buyerState.leaseExpiry = LEASE_EXPIRY; // lessee: no isLessor
+		buyerState.leaseCommitBlockheight = LEASE_COMMIT_BH;
 		sellerState.leaseExpiry = LEASE_EXPIRY;
+		sellerState.leaseCommitBlockheight = LEASE_COMMIT_BH;
 		sellerState.isLessor = true;
 	}
 
@@ -183,15 +186,12 @@ function createLeasedChannelStates(withLease = true) {
 	};
 }
 
-/** The lease-locked confirmed to_remote script, hand-compiled (LND layout). */
-function handBuiltLeaseToRemote(key: Buffer, expiry: number): Buffer {
+/** The lease-locked confirmed to_remote script, hand-compiled (CLN CSV layout). */
+function handBuiltLeaseToRemote(key: Buffer, csv: number): Buffer {
 	return bitcoin.script.compile([
 		key,
 		bitcoin.opcodes.OP_CHECKSIGVERIFY,
-		bitcoin.script.number.encode(expiry),
-		bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
-		bitcoin.opcodes.OP_DROP,
-		bitcoin.script.number.encode(1),
+		bitcoin.script.number.encode(csv),
 		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY
 	]);
 }
@@ -200,36 +200,34 @@ function p2wsh(script: Buffer): Buffer {
 	return bitcoin.payments.p2wsh({ redeem: { output: script } }).output!;
 }
 
-describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', function () {
-	describe('script layout (LND parity)', function () {
+describe('S-L.H4: lease-locked to_remote (CLN CSV model)', function () {
+	describe('script layout (CLN parity)', function () {
 		const key = getPublicKey(crypto.randomBytes(32));
 
-		it('matches the hand-built LeaseCommitScriptToRemoteConfirmed layout', function () {
-			const leased = buildToRemoteAnchorScript(key, LEASE_EXPIRY);
-			expect(leased.equals(handBuiltLeaseToRemote(key, LEASE_EXPIRY))).to.be
-				.true;
-			// CLTV sits between CHECKSIGVERIFY and the 1-block CSV.
+		it('matches the hand-built CLN CSV layout', function () {
+			const leased = buildToRemoteAnchorScript(key, LEASE_CSV);
+			expect(leased.equals(handBuiltLeaseToRemote(key, LEASE_CSV))).to.be.true;
+			// <key> CHECKSIGVERIFY <lease_csv> CHECKSEQUENCEVERIFY — no CLTV.
 			const ops = bitcoin.script.decompile(leased)!;
+			expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
 			expect(ops[1]).to.equal(bitcoin.opcodes.OP_CHECKSIGVERIFY);
-			expect(ops[3]).to.equal(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
-			expect(ops[6]).to.equal(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
+			expect(ops[3]).to.equal(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
 			expect(bitcoin.script.number.decode(ops[2] as Buffer)).to.equal(
-				LEASE_EXPIRY
+				LEASE_CSV
 			);
 		});
 
-		it('no expiry (or 0) returns the plain 37-byte confirmed script', function () {
+		it('no csv (or 1) returns the plain 37-byte confirmed script', function () {
 			const plain = buildToRemoteAnchorScript(key);
-			expect(plain.length).to.equal(37); // LND ToRemoteConfirmedScriptSize
-			expect(buildToRemoteAnchorScript(key, 0).equals(plain)).to.be.true;
-			expect(leaseExpiryFromToRemoteScript(plain)).to.be.undefined;
+			expect(plain.length).to.equal(37); // ToRemoteConfirmedScriptSize
+			expect(buildToRemoteAnchorScript(key, 1).equals(plain)).to.be.true;
+			expect(leaseCsvFromToRemoteScript(plain)).to.be.undefined;
 		});
 
-		it('leaseExpiryFromToRemoteScript round-trips the lease height', function () {
-			const leased = buildToRemoteAnchorScript(key, LEASE_EXPIRY);
-			expect(leaseExpiryFromToRemoteScript(leased)).to.equal(LEASE_EXPIRY);
-			expect(leaseExpiryFromToRemoteScript(Buffer.from([0x51]))).to.be
-				.undefined;
+		it('leaseCsvFromToRemoteScript round-trips the lease CSV', function () {
+			const leased = buildToRemoteAnchorScript(key, LEASE_CSV);
+			expect(leaseCsvFromToRemoteScript(leased)).to.equal(LEASE_CSV);
+			expect(leaseCsvFromToRemoteScript(Buffer.from([0x51]))).to.be.undefined;
 		});
 	});
 
@@ -243,7 +241,7 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 			// The seller (lessor) balance on the buyer's commitment pays the
 			// seller's STATIC payment basepoint under the LEASE variant.
 			const leasedSpk = p2wsh(
-				handBuiltLeaseToRemote(seller.basepoints.paymentBasepoint, LEASE_EXPIRY)
+				handBuiltLeaseToRemote(seller.basepoints.paymentBasepoint, LEASE_CSV)
 			);
 			const plainSpk = p2wsh(
 				buildToRemoteAnchorScript(seller.basepoints.paymentBasepoint)
@@ -272,10 +270,10 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 			const sellerPoint = getPerCommitmentPoint(sellerCommitSeed, 0n);
 
 			const sellerLeaseSpk = p2wsh(
-				handBuiltLeaseToRemote(seller.basepoints.paymentBasepoint, LEASE_EXPIRY)
+				handBuiltLeaseToRemote(seller.basepoints.paymentBasepoint, LEASE_CSV)
 			);
 			const buyerLeaseSpk = p2wsh(
-				handBuiltLeaseToRemote(buyer.basepoints.paymentBasepoint, LEASE_EXPIRY)
+				handBuiltLeaseToRemote(buyer.basepoints.paymentBasepoint, LEASE_CSV)
 			);
 			const buyerPlainSpk = p2wsh(
 				buildToRemoteAnchorScript(buyer.basepoints.paymentBasepoint)
@@ -331,7 +329,7 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 	});
 
 	describe('classification + sweep (lessor claims after buyer force-close)', function () {
-		it('classifies the lease-locked to_remote and sweeps with nLockTime = lease_expiry', function () {
+		it('classifies the lease-locked to_remote and sweeps with input sequence = lease_csv', function () {
 			const { sellerState, seller, buyerCommitSeed } =
 				createLeasedChannelStates();
 			// The buyer force-closes: the buyer's commitment is the seller's
@@ -350,8 +348,8 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 			);
 			expect(toRemote, 'lease-locked to_remote classified').to.exist;
 			expect(toRemote!.witnessScript).to.exist;
-			expect(leaseExpiryFromToRemoteScript(toRemote!.witnessScript!)).to.equal(
-				LEASE_EXPIRY
+			expect(leaseCsvFromToRemoteScript(toRemote!.witnessScript!)).to.equal(
+				LEASE_CSV
 			);
 
 			const destScript = bitcoin.payments.p2wpkh({
@@ -369,9 +367,9 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 				(r) => r.trackedOutput.outputType === OutputType.TO_REMOTE
 			);
 			expect(claim?.spendTx, 'to_remote claim built').to.exist;
-			// CLTV honored: nLockTime = lease_expiry, sequence stays the 1-CSV.
-			expect(claim!.spendTx!.locktime).to.equal(LEASE_EXPIRY);
-			expect(claim!.spendTx!.ins[0].sequence).to.equal(1);
+			// Pure CSV: no nLockTime, input sequence = lease_csv.
+			expect(claim!.spendTx!.locktime).to.equal(0);
+			expect(claim!.spendTx!.ins[0].sequence).to.equal(LEASE_CSV);
 			// Witness spends the lease script: [sig, leaseWitnessScript].
 			expect(claim!.witness).to.have.length(2);
 			expect(claim!.witness![1].equals(toRemote!.witnessScript!)).to.be.true;
@@ -412,14 +410,14 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 				(o) => o.outputType === OutputType.TO_REMOTE
 			);
 			expect(toRemote, 'to_remote found without remote basepoints').to.exist;
-			expect(leaseExpiryFromToRemoteScript(toRemote!.witnessScript!)).to.equal(
-				LEASE_EXPIRY
+			expect(leaseCsvFromToRemoteScript(toRemote!.witnessScript!)).to.equal(
+				LEASE_CSV
 			);
 		});
 	});
 
 	describe('SCB carries the lease fields', function () {
-		it('round-trips leaseExpiry/isLessor and still decodes legacy entries', function () {
+		it('round-trips leaseExpiry/isLessor/leaseCommitBlockheight and still decodes legacy entries', function () {
 			const seed = crypto.randomBytes(32);
 			const base: IScbChannelEntry = {
 				channelId: 'aa'.repeat(32),
@@ -437,7 +435,8 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 			const leased: IScbChannelEntry = {
 				...base,
 				leaseExpiry: LEASE_EXPIRY,
-				isLessor: true
+				isLessor: true,
+				leaseCommitBlockheight: LEASE_COMMIT_BH
 			};
 			const encoded = encodeScb(
 				{
@@ -451,6 +450,9 @@ describe('S-L.H4: lease-locked to_remote (LeaseCommitScriptToRemoteConfirmed)', 
 			const decoded = decodeScb(encoded, seed);
 			expect(decoded.channels[0].leaseExpiry).to.equal(LEASE_EXPIRY);
 			expect(decoded.channels[0].isLessor).to.equal(true);
+			expect(decoded.channels[0].leaseCommitBlockheight).to.equal(
+				LEASE_COMMIT_BH
+			);
 			// Legacy-shaped entry (no lease fields) decodes unchanged.
 			expect(decoded.channels[1].leaseExpiry).to.be.undefined;
 			expect(decoded.channels[1].isLessor).to.be.undefined;

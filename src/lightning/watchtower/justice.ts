@@ -30,6 +30,7 @@ import {
 } from '../keys/derivation';
 import { buildToLocalScript } from '../script/commitment';
 import { buildToRemoteAnchorScript } from '../script/anchor';
+import { leaseCsvBlocks } from '../channel/liquidity-ads';
 import { isDustOutput } from '../chain/closing';
 import {
 	buildTaprootToLocalOutput,
@@ -106,6 +107,7 @@ export interface IJusticeContext {
 	 */
 	isLessor?: boolean;
 	leaseExpiry?: number;
+	leaseCommitBlockheight?: number;
 }
 
 /** Negotiated per-session parameters that shape the justice transaction. */
@@ -187,7 +189,7 @@ function buildJusticeBackupV0(
 						keys.revocationPubkey,
 						keys.theirDelayedPubkey,
 						ctx.toSelfDelay,
-						ctx.leaseExpiry
+						leaseCsvBlocks(ctx.leaseExpiry, ctx.leaseCommitBlockheight)
 					)
 				},
 				network: ctx.network

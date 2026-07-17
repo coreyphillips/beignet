@@ -39,11 +39,34 @@ export function computeLeaseExpiry(blockheight: number): number {
 	return blockheight + LEASE_DURATION_BLOCKS;
 }
 
-// On-chain lease enforcement (M3.3) uses LND's "script-enforced lease" encoding:
-// the lessor's to_local keeps the normal to_self_delay CSV and gains an absolute
-// `<lease_expiry> OP_CHECKLOCKTIMEVERIFY OP_DROP` (see buildToLocalScript's
-// leaseExpiry param in script/commitment.ts). An earlier CSV-extension sketch was
-// removed in favour of this interoperable encoding.
+// On-chain lease enforcement uses CLN's encoding (bLIP-0051, validated live +
+// from CLN source): a PURE CSV. The lessor's to_local CSV number becomes
+// max(to_self_delay, lease_csv) and its anchored to_remote carries
+// `<lease_csv> OP_CHECKSEQUENCEVERIFY` instead of the standard 1, where
+// lease_csv = lease_expiry - the blockheight both sides agreed on at open
+// (advanced later only by opener-sent update_blockheight, wire type 137,
+// which beignet does not yet send). An earlier LND-Pool-style CLTV encoding
+// produced commitments CLN rejects.
+
+/**
+ * Remaining-lease CSV for commitment scripts. leaseCommitBlockheight is the
+ * blockheight agreed at open (request_funds.blockheight); legacy states that
+ * lost it fall back to the full lease duration (the value at open).
+ */
+export function leaseCsvBlocks(
+	leaseExpiry: number | undefined,
+	leaseCommitBlockheight: number | undefined
+): number | undefined {
+	if (leaseExpiry === undefined || leaseExpiry <= 0) return undefined;
+	if (
+		leaseCommitBlockheight === undefined ||
+		leaseCommitBlockheight <= 0 ||
+		leaseCommitBlockheight >= leaseExpiry
+	) {
+		return LEASE_DURATION_BLOCKS;
+	}
+	return leaseExpiry - leaseCommitBlockheight;
+}
 
 /** BOLT/CLN option_will_fund signature tag prefix (16 ASCII bytes). */
 const WILL_FUND_TAG = Buffer.from('option_will_fund');

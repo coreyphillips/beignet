@@ -181,30 +181,19 @@ export function buildReceivedHtlcScript(
 export function buildHtlcOutputScript(
 	revocationPubkey: Buffer,
 	localDelayedPubkey: Buffer,
-	toSelfDelay: number,
-	leaseExpiry?: number
+	toSelfDelay: number
 ): Buffer {
-	// Liquidity ads (bLIP-0051): the lessor's second-level HTLC output is also
-	// CLTV-locked until lease_expiry (LND script-enforced lease) — CLTV before CSV.
-	const delayBranch: (number | Buffer)[] = [];
-	if (leaseExpiry !== undefined && leaseExpiry > 0) {
-		delayBranch.push(
-			bitcoin.script.number.encode(leaseExpiry),
-			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
-			bitcoin.opcodes.OP_DROP
-		);
-	}
-	delayBranch.push(
-		bitcoin.script.number.encode(toSelfDelay),
-		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
-		bitcoin.opcodes.OP_DROP,
-		localDelayedPubkey
-	);
+	// BOLT 3 / CLN: second-level HTLC outputs are NEVER lease-locked (CLN's
+	// htlc_tx has no lease param). Only to_local/to_remote carry the bLIP-0051
+	// lease CSV; the HTLC delayed output is a plain to_self_delay CSV.
 	return bitcoin.script.compile([
 		bitcoin.opcodes.OP_IF,
 		revocationPubkey,
 		bitcoin.opcodes.OP_ELSE,
-		...delayBranch,
+		bitcoin.script.number.encode(toSelfDelay),
+		bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
+		bitcoin.opcodes.OP_DROP,
+		localDelayedPubkey,
 		bitcoin.opcodes.OP_ENDIF,
 		bitcoin.opcodes.OP_CHECKSIG
 	]);
@@ -234,8 +223,7 @@ export function buildHtlcSuccessTx(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	feeSatoshis: bigint,
-	zeroFee?: boolean,
-	leaseExpiry?: number
+	zeroFee?: boolean
 ): bitcoin.Transaction {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
@@ -249,8 +237,7 @@ export function buildHtlcSuccessTx(
 	const outputScript = buildHtlcOutputScript(
 		revocationPubkey,
 		localDelayedPubkey,
-		toSelfDelay,
-		leaseExpiry
+		toSelfDelay
 	);
 	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: outputScript } });
 
@@ -278,8 +265,7 @@ export function buildHtlcTimeoutTx(
 	localDelayedPubkey: Buffer,
 	toSelfDelay: number,
 	feeSatoshis: bigint,
-	zeroFee?: boolean,
-	leaseExpiry?: number
+	zeroFee?: boolean
 ): bitcoin.Transaction {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
@@ -293,8 +279,7 @@ export function buildHtlcTimeoutTx(
 	const outputScript = buildHtlcOutputScript(
 		revocationPubkey,
 		localDelayedPubkey,
-		toSelfDelay,
-		leaseExpiry
+		toSelfDelay
 	);
 	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: outputScript } });
 

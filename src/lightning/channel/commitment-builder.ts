@@ -26,6 +26,7 @@ import {
 } from '../script/htlc';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import { IChannelState } from './channel-state';
+import { leaseCsvBlocks } from './liquidity-ads';
 import {
 	ChannelRole,
 	HtlcDirection,
@@ -541,9 +542,12 @@ export function buildLocalCommitment(
 		revocationPubkey: keys.revocationPubkey,
 		localDelayedPubkey: keys.localDelayedPubkey,
 		toSelfDelay: state.remoteConfig.toSelfDelay,
-		// Liquidity ads: if WE are the lessor, our own to_local is CLTV-locked until
-		// the lease expires (we can't reclaim the leased funds early).
-		leaseExpiry: state.isLessor ? state.leaseExpiry : undefined,
+		// Liquidity ads (CLN pure-CSV model): if WE are the lessor, our own
+		// to_local CSV is raised to the remaining lease so we can't reclaim the
+		// leased funds early.
+		leaseCsv: state.isLessor
+			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			: undefined,
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
 		// Liquidity ads: OUR commitment's to_remote pays the PEER, so it is
@@ -551,7 +555,9 @@ export function buildLocalCommitment(
 		// MIRROR of the to_local gate above. Exactly one of to_local/to_remote
 		// per commitment carries the lock, always on the lessor's balance.
 		// (See the matching gate in buildRemoteCommitment.)
-		toRemoteLeaseExpiry: !state.isLessor ? state.leaseExpiry : undefined,
+		toRemoteLeaseCsv: !state.isLessor
+			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			: undefined,
 		htlcOutputs,
 		// Our local commitment is trimmed with OUR negotiated dust_limit_satoshis
 		// (we are the holder who would broadcast it).
@@ -719,10 +725,12 @@ export function buildRemoteCommitment(
 		localDelayedPubkey: keys.localDelayedPubkey,
 		toSelfDelay: state.localConfig.toSelfDelay,
 		// Liquidity ads: this to_local is the REMOTE party's delayed output. If the
-		// remote is the lessor (i.e. WE are the lessee), lock it until lease expiry
-		// so the signature we give them is over the encumbered script. When we are
-		// the lessor the remote is the lessee, so no lock.
-		leaseExpiry: state.isLessor ? undefined : state.leaseExpiry,
+		// remote is the lessor (i.e. WE are the lessee), raise its CSV to the
+		// remaining lease so the signature we give them is over the encumbered
+		// script. When we are the lessor the remote is the lessee, so no lock.
+		leaseCsv: state.isLessor
+			? undefined
+			: leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight),
 		remoteAmount,
 		remotePaymentPubkey: keys.remotePaymentPubkey,
 		// Liquidity ads: THEIR commitment's to_remote pays US, so it is
@@ -730,7 +738,9 @@ export function buildRemoteCommitment(
 		// above (and the counterpart of buildLocalCommitment's to_remote gate).
 		// This is the output S-L.H4 was about: without it a seller escapes the
 		// lease by provoking the buyer into force-closing.
-		toRemoteLeaseExpiry: state.isLessor ? state.leaseExpiry : undefined,
+		toRemoteLeaseCsv: state.isLessor
+			? leaseCsvBlocks(state.leaseExpiry, state.leaseCommitBlockheight)
+			: undefined,
 		htlcOutputs,
 		// The remote commitment is trimmed with THEIR negotiated
 		// dust_limit_satoshis (they are the holder who would broadcast it).
@@ -827,9 +837,8 @@ export function signRemoteCommitment(
 		const origIdx = htlcOriginalIndices[k];
 		const meta = htlcOutputsMeta[origIdx];
 
-		// Liquidity ads: this is the REMOTE's commitment, so its second-level HTLC
-		// output is CLTV-locked iff the remote is the lessor (i.e. we are not).
-		const htlcLeaseExpiry = state.isLessor ? undefined : state.leaseExpiry;
+		// BOLT 3 / CLN: second-level HTLC outputs are NEVER lease-locked (CLN's
+		// htlc_tx has no lease param); only to_local/to_remote carry the lease.
 		let htlcTx;
 		if (meta.direction === HtlcDirection.OFFERED) {
 			// Our offered = their received → HTLC-success tx (locktime=0)
@@ -842,8 +851,7 @@ export function signRemoteCommitment(
 				keys.localDelayedPubkey,
 				state.localConfig.toSelfDelay,
 				fee,
-				useAnchors,
-				htlcLeaseExpiry
+				useAnchors
 			);
 		} else {
 			// Our received = their offered → HTLC-timeout tx (locktime=cltvExpiry)
@@ -857,8 +865,7 @@ export function signRemoteCommitment(
 				keys.localDelayedPubkey,
 				state.localConfig.toSelfDelay,
 				fee,
-				useAnchors,
-				htlcLeaseExpiry
+				useAnchors
 			);
 		}
 
@@ -1314,10 +1321,7 @@ export function verifyRemoteHtlcSignatures(
 		const origIdx = htlcOriginalIndices[k];
 		const meta = htlcOutputsMeta[origIdx];
 
-		// Liquidity ads: this is OUR commitment, so its second-level HTLC output is
-		// CLTV-locked iff we are the lessor. Both parties build this script
-		// identically (peer via signRemoteCommitment), so the sigs still match.
-		const htlcLeaseExpiry = state.isLessor ? state.leaseExpiry : undefined;
+		// BOLT 3 / CLN: second-level HTLC outputs are NEVER lease-locked.
 		let htlcTx;
 		if (meta.direction === HtlcDirection.OFFERED) {
 			// Our offered → HTLC-timeout tx (we reclaim after timeout)
@@ -1331,8 +1335,7 @@ export function verifyRemoteHtlcSignatures(
 				keys.localDelayedPubkey,
 				state.remoteConfig.toSelfDelay,
 				fee,
-				useAnchors,
-				htlcLeaseExpiry
+				useAnchors
 			);
 		} else {
 			// Our received → HTLC-success tx (we claim with preimage)
@@ -1345,8 +1348,7 @@ export function verifyRemoteHtlcSignatures(
 				keys.localDelayedPubkey,
 				state.remoteConfig.toSelfDelay,
 				fee,
-				useAnchors,
-				htlcLeaseExpiry
+				useAnchors
 			);
 		}
 
