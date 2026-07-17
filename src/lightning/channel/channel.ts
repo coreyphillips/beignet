@@ -32,7 +32,8 @@ import {
 	encodeUpdateFailMalformedHtlcMessage,
 	IUpdateFailMalformedHtlcMessage,
 	encodeUpdateFeeMessage,
-	IUpdateFeeMessage
+	IUpdateFeeMessage,
+	IUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
 	encodeCommitmentSignedMessage,
@@ -103,6 +104,7 @@ import {
 	calculateCommitmentFee,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
+	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
@@ -1111,6 +1113,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
@@ -1382,6 +1386,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		const signedMsg: IFundingSignedMessage = {
 			channelId: this._state.channelId,
@@ -2468,6 +2474,15 @@ export class Channel {
 			this._state.pendingFeerateCommitted = true;
 		}
 
+		// update_blockheight, same machine: a signable staged height is baked
+		// into this signature; the answering revoke_and_ack promotes it.
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightSignable === true
+		) {
+			this._state.pendingLeaseBlockheightCommitted = true;
+		}
+
 		// Two-phase updates: stamp every entry whose phase THIS signature
 		// advances — the peer's answering revoke_and_ack promotes them
 		// (addRemoteCommitted / removalRemoteCommitted) in handleRevokeAndAck.
@@ -2725,6 +2740,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -2741,6 +2758,18 @@ export class Channel {
 			this._state.pendingFeerateSignable !== true
 		) {
 			this._state.pendingFeerateSignable = true;
+			this._state.needsCommitment = true;
+		}
+
+		// update_blockheight, same machine: this commitment_signed from the
+		// opener covers its staged height; only NOW may it be baked into
+		// commitments WE sign, and we owe a commitment_signed at it.
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.role === ChannelRole.ACCEPTOR &&
+			this._state.pendingLeaseBlockheightSignable !== true
+		) {
+			this._state.pendingLeaseBlockheightSignable = true;
 			this._state.needsCommitment = true;
 		}
 
@@ -3009,6 +3038,19 @@ export class Channel {
 			this._state.pendingFeeratePerKw = undefined;
 			this._state.pendingFeerateSignable = false;
 			this._state.pendingFeerateCommitted = false;
+		}
+
+		// update_blockheight, same machine: a staged height we SIGNED at is now
+		// irrevocably committed on both sides — promote it (and record it in
+		// the height history for on-chain classification of old commitments).
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightCommitted === true
+		) {
+			this._promoteLeaseBlockheight(this._state.pendingLeaseBlockheight);
+			this._state.pendingLeaseBlockheight = undefined;
+			this._state.pendingLeaseBlockheightSignable = false;
+			this._state.pendingLeaseBlockheightCommitted = false;
 		}
 
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
@@ -3287,6 +3329,120 @@ export class Channel {
 		this._state.pendingFeerateSignable = false;
 		this._state.pendingFeerateCommitted = false;
 		return [];
+	}
+
+	/**
+	 * bLIP-0051 update_blockheight (type 137): the OPENER of a leased channel
+	 * advances the agreed blockheight, shrinking the lessor's remaining-lease
+	 * CSV (lease_csv = lease_expiry - blockheight) in the commitment scripts.
+	 * We only ever RECEIVE this (the lessor is always the acceptor); the staged
+	 * height runs the same two-phase machine as update_fee — it applies to the
+	 * opener's signatures immediately and to commitments WE sign only once
+	 * signable, and is promoted on round completion. Ignoring the message (the
+	 * old behavior: type 137 is odd, so it was dropped) desynced every
+	 * subsequent commitment script against a CLN buyer.
+	 */
+	handleUpdateBlockheight(msg: IUpdateBlockheightMessage): ChannelAction[] {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.isSplicePendingLock()
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected update_blockheight'
+				}
+			];
+		}
+
+		// Only the opener sends update_blockheight (CLN channeld enforces the
+		// same on both sides).
+		if (this._state.role !== ChannelRole.ACCEPTOR) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Only the opener can send update_blockheight'
+				}
+			];
+		}
+
+		// Only meaningful on a leased channel where WE are the lessor: the
+		// height feeds our lease CSV. CLN fails the channel for it too.
+		if (this._state.leaseExpiry === undefined || !this._state.isLessor) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'update_blockheight on a non-leased channel'
+				}
+			];
+		}
+
+		// Monotonic: the agreed blockheight never decreases (CLN warns and
+		// fails). An equal height is a harmless no-op.
+		const current =
+			this._state.pendingLeaseBlockheight ??
+			this._state.leaseCommitBlockheight ??
+			0;
+		if (msg.blockheight < current) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_blockheight decreased (${msg.blockheight} < ${current})`
+				}
+			];
+		}
+		if (msg.blockheight === current) {
+			return [];
+		}
+
+		// Staleness (CLN parity): a height more than 1008 blocks behind our own
+		// tip means the opener's view is unusably old.
+		if (
+			this._currentBlockHeight > 0 &&
+			msg.blockheight + 1008 < this._currentBlockHeight
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_blockheight too old (${msg.blockheight} vs tip ${this._currentBlockHeight})`
+				}
+			];
+		}
+
+		// A NEW update while a previous staged height already reached the
+		// signable phase: the previous height is locked into the exchange —
+		// promote it before staging the replacement (mirrors update_fee).
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightSignable === true
+		) {
+			this._promoteLeaseBlockheight(this._state.pendingLeaseBlockheight);
+		}
+		this._state.pendingLeaseBlockheight = msg.blockheight;
+		this._state.pendingLeaseBlockheightSignable = false;
+		this._state.pendingLeaseBlockheightCommitted = false;
+		return [];
+	}
+
+	/**
+	 * Promote a lease blockheight to the committed config and record it in the
+	 * height history (on-chain classification of OLD commitments needs every
+	 * height that was ever committed to rebuild their lease-locked scripts).
+	 */
+	private _promoteLeaseBlockheight(height: number): void {
+		if (this._state.leaseCommitBlockheight !== height) {
+			const history = this._state.leaseHeightHistory ?? [];
+			if (
+				this._state.leaseCommitBlockheight !== undefined &&
+				history[history.length - 1] !== this._state.leaseCommitBlockheight
+			) {
+				history.push(this._state.leaseCommitBlockheight);
+			}
+			history.push(height);
+			this._state.leaseHeightHistory = history;
+		}
+		this._state.leaseCommitBlockheight = height;
 	}
 
 	// ─────────────── Closing ───────────────
@@ -4736,6 +4892,17 @@ export class Channel {
 			this._state.pendingLocalUpdates = (
 				this._state.pendingLocalUpdates ?? []
 			).filter((u) => u.type !== MessageType.UPDATE_FEE);
+		}
+
+		// Roll back an uncommitted staged update_blockheight for the same
+		// reason (the opener re-sends a fresh one after reconnect; a
+		// signable/committed height is covered by exchanged signatures and
+		// survives to finish its round).
+		if (
+			this._state.pendingLeaseBlockheightSignable !== true &&
+			this._state.pendingLeaseBlockheightCommitted !== true
+		) {
+			this._state.pendingLeaseBlockheight = undefined;
 		}
 	}
 
@@ -7293,6 +7460,8 @@ export class Channel {
 			this._state.lastSignedCommitFeeratePerKw =
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
 				getLocalCommitmentFeeRate(this._state);
+			this._state.lastSignedCommitLeaseBlockheight =
+				getLocalCommitmentLeaseBlockheight(this._state);
 		} else {
 			this._state.needsCommitment = true;
 		}
@@ -9084,6 +9253,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 		this._v2ReceivedCommitment = true;
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
 		// Commitment round complete — release tx_signatures if ordering allows.

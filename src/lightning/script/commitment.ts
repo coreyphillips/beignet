@@ -100,6 +100,54 @@ export function buildToLocalScript(
 }
 
 /**
+ * Parse the delay-branch CSV number out of a to_local witness script (the
+ * buildToLocalScript layout). Sweep paths derive the required input sequence
+ * from the ON-CHAIN script itself: on a leased channel the CSV depends on the
+ * agreed blockheight, which update_blockheight advances over the channel's
+ * life, so recomputing it from current state can disagree with the script the
+ * peer actually signed. Returns undefined for any other script shape.
+ */
+export function csvFromToLocalScript(
+	witnessScript: Buffer
+): number | undefined {
+	const chunks = bitcoin.script.decompile(witnessScript);
+	if (!chunks || chunks.length !== 9) return undefined;
+	const [opIf, revKey, opElse, csvNum, csv, drop, delayedKey, endif, checksig] =
+		chunks;
+	if (
+		opIf !== bitcoin.opcodes.OP_IF ||
+		!Buffer.isBuffer(revKey) ||
+		revKey.length !== 33 ||
+		opElse !== bitcoin.opcodes.OP_ELSE ||
+		csv !== bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY ||
+		drop !== bitcoin.opcodes.OP_DROP ||
+		!Buffer.isBuffer(delayedKey) ||
+		delayedKey.length !== 33 ||
+		endif !== bitcoin.opcodes.OP_ENDIF ||
+		checksig !== bitcoin.opcodes.OP_CHECKSIG
+	) {
+		return undefined;
+	}
+	if (Buffer.isBuffer(csvNum)) {
+		try {
+			const v = bitcoin.script.number.decode(csvNum);
+			return v > 0 ? v : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	// Minimally-encoded 1..16 decompile to the OP_1..OP_16 opcodes.
+	if (
+		typeof csvNum === 'number' &&
+		csvNum >= bitcoin.opcodes.OP_1 &&
+		csvNum <= bitcoin.opcodes.OP_16
+	) {
+		return csvNum - bitcoin.opcodes.OP_1 + 1;
+	}
+	return undefined;
+}
+
+/**
  * Parameters for building a commitment transaction.
  */
 export interface ICommitmentTxParams {

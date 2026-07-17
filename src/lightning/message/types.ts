@@ -41,6 +41,8 @@ export enum MessageType {
 	COMMITMENT_SIGNED = 132,
 	REVOKE_AND_ACK = 133,
 	UPDATE_FEE = 134,
+	/** bLIP-0051 liquidity ads: opener advances the agreed lease blockheight. */
+	UPDATE_BLOCKHEIGHT = 137,
 
 	CHANNEL_REESTABLISH = 136,
 
