@@ -3604,6 +3604,12 @@ export class LightningNode extends EventEmitter {
 			 * signed rates imply a higher fee.
 			 */
 			maxLeaseRates?: import('../gossip/types').ILeaseRates;
+			/**
+			 * channel_type feature bitmap for open_channel2. A lease
+			 * (requestFunds) requires an anchor channel_type — the lessor's
+			 * to_remote lease CLTV cannot ride a non-anchor P2WPKH output.
+			 */
+			channelType?: Buffer;
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -3647,7 +3653,8 @@ export class LightningNode extends EventEmitter {
 				generateFromSeed(config.localPerCommitmentSeed, 0xffffffffffffn - 1n)
 			),
 			requestFunds: params.requestFunds,
-			maxLeaseRates: params.maxLeaseRates
+			maxLeaseRates: params.maxLeaseRates,
+			channelType: params.channelType
 		};
 
 		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams);
@@ -6129,9 +6136,15 @@ export class LightningNode extends EventEmitter {
 					// (zero) SCID makes LND reject the payload as invalid_onion_blinding.
 					delete payload.shortChannelId;
 					// A blinded INTERMEDIATE hop also omits amt_to_forward/outgoing_cltv
-					// (derived from encrypted payment_relay). The final hop keeps them.
+					// (derived from encrypted payment_relay). The final hop keeps them
+					// and MUST carry total_amount_msat (TLV 18) — the blinded path's
+					// path_id authenticates the payment there, not payment_data, and
+					// CLN fails a blinded final payload without it as
+					// invalid_onion_payload.
 					if (!isFinal) {
 						payload.omitForwardAmounts = true;
+					} else {
+						payload.totalAmountMsat = totalMsat ?? hop.amountToForwardMsat;
 					}
 				}
 				if (hop.blindingPoint) {
@@ -9261,7 +9274,11 @@ export class LightningNode extends EventEmitter {
 				finalCltvExpiry,
 				undefined,
 				undefined,
-				this.missionControl
+				this.missionControl,
+				// Our own channels: a direct channel to the introduction node must
+				// be routable even when it never entered the public gossip graph
+				// (private channels; a fresh interop channel paying a CLN offer).
+				this.getLocalChannelEdges()
 			);
 			if (!blindedRoute) {
 				throw new Error('No route to BOLT 12 blinded path introduction node');

@@ -168,12 +168,21 @@ export class OnionMessageManager extends EventEmitter {
 	 * @param replyPath - The blinded path received in the original message
 	 * @param messageData - Application data for the reply
 	 */
-	sendReply(replyPath: IBlindedPath, messageData: Map<number, Buffer>): void {
+	sendReply(
+		replyPath: IBlindedPath,
+		messageData: Map<number, Buffer>,
+		options?: ISendOnionMessageOptions
+	): void {
 		if (!this.sendMessage) {
 			throw new Error('Send function not configured');
 		}
 
-		const msg = constructReplyOnionMessage(replyPath, messageData);
+		const msg = constructReplyOnionMessage(
+			replyPath,
+			messageData,
+			undefined,
+			options
+		);
 		const wirePayload = encodeOnionMessageWire(msg);
 
 		// Send to the introduction node

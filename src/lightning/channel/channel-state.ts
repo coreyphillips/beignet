@@ -377,6 +377,13 @@ export interface IChannelState {
 	 */
 	isLessor?: boolean;
 	/**
+	 * Liquidity ads (buyer side): the lease fee in satoshis, paid THROUGH the
+	 * funding transaction — the funding output must total opener_funds +
+	 * seller_funds + this fee (CLN model, validated live). The tx-building
+	 * caller adds it to the funding output amount. Transient during opening.
+	 */
+	leaseFeeSats?: bigint;
+	/**
 	 * Liquidity ads (bLIP-0051): the routing-fee caps the lessor signed into its
 	 * will_fund. While the lease is active the lessor MUST NOT advertise a
 	 * channel_update whose fees exceed these — the buyer paid for capped fees.

@@ -279,7 +279,7 @@ export function setupRoutingForChannel(
 			bitcoinSignature1: Buffer.alloc(64),
 			bitcoinSignature2: Buffer.alloc(64),
 			features: Buffer.alloc(0),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			nodeId1:
 				Buffer.compare(nodePubBuf, remotePubBuf) < 0
@@ -298,7 +298,7 @@ export function setupRoutingForChannel(
 
 		graph.applyChannelUpdate({
 			signature: Buffer.alloc(64),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			timestamp: ts,
 			messageFlags: 0x01,
@@ -312,7 +312,7 @@ export function setupRoutingForChannel(
 
 		graph.applyChannelUpdate({
 			signature: Buffer.alloc(64),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			timestamp: ts,
 			messageFlags: 0x01,

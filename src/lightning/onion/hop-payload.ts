@@ -101,6 +101,14 @@ export function encodeHopPayload(payload: IHopPayload): Buffer {
 		records.push({ type: 12, value: payload.blindingPoint });
 	}
 
+	// Type 18: total_amount_msat (tu64) — blinded final hop
+	if (payload.totalAmountMsat !== undefined) {
+		records.push({
+			type: 18,
+			value: encodeTruncatedUint(payload.totalAmountMsat)
+		});
+	}
+
 	// Custom TLV records (e.g. keysend preimage)
 	if (payload.customRecords && payload.customRecords.size > 0) {
 		for (const [type, value] of payload.customRecords.entries()) {
@@ -156,6 +164,7 @@ export function decodeHopPayload(
 	let totalMsat: bigint | undefined;
 	let encryptedRecipientData: Buffer | undefined;
 	let blindingPoint: Buffer | undefined;
+	let totalAmountMsat: bigint | undefined;
 	let customRecords: Map<number, Buffer> | undefined;
 
 	let prevTlvType: number | undefined;
@@ -211,6 +220,10 @@ export function decodeHopPayload(
 				// blinding_point (33 bytes)
 				blindingPoint = Buffer.from(tlvValue);
 				break;
+			case 18:
+				// total_amount_msat (tu64) — blinded final hop
+				totalAmountMsat = decodeTruncatedUint(tlvValue);
+				break;
 			default:
 				// Keysend TLV (5482373484) is even but is a widely-deployed de facto standard
 				if (tlvType === KEYSEND_TLV_TYPE) {
@@ -243,6 +256,9 @@ export function decodeHopPayload(
 	}
 	if (blindingPoint) {
 		result.blindingPoint = blindingPoint;
+	}
+	if (totalAmountMsat !== undefined) {
+		result.totalAmountMsat = totalAmountMsat;
 	}
 	if (customRecords) {
 		result.customRecords = customRecords;
