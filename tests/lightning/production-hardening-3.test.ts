@@ -847,11 +847,16 @@ describe('Production Hardening 3: Transport & Routing', function () {
 			// We don't support anything
 
 			const remote = FeatureFlags.empty();
-			remote.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			// A truly-unknown required feature bit (not in the implemented set):
+			// the check now compares against what we IMPLEMENT, not what this
+			// instance advertised, so a known feature like static_remote_key no
+			// longer counts as unsupported (S-7 LOW).
+			const UNKNOWN_REQUIRED_BIT = 100;
+			remote.setBit(UNKNOWN_REQUIRED_BIT);
 
 			const unsupported = hasUnsupportedRequiredFeatures(local, remote);
 			expect(unsupported).to.have.length(1);
-			expect(unsupported[0]).to.equal(Feature.STATIC_REMOTE_KEY);
+			expect(unsupported[0]).to.equal(UNKNOWN_REQUIRED_BIT);
 		});
 
 		it('multiple unsupported features listed', () => {
@@ -859,13 +864,14 @@ describe('Production Hardening 3: Transport & Routing', function () {
 			local.setOptional(Feature.TLV_ONION);
 
 			const remote = FeatureFlags.empty();
-			remote.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			remote.setCompulsory(Feature.PAYMENT_SECRET);
+			// Two unknown required bits we neither advertise nor implement.
+			remote.setBit(100);
+			remote.setBit(102);
 
 			const unsupported = hasUnsupportedRequiredFeatures(local, remote);
 			expect(unsupported).to.have.length(2);
-			expect(unsupported).to.include(Feature.STATIC_REMOTE_KEY);
-			expect(unsupported).to.include(Feature.PAYMENT_SECRET);
+			expect(unsupported).to.include(100);
+			expect(unsupported).to.include(102);
 		});
 	});
 

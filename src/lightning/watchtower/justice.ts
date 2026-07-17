@@ -143,6 +143,15 @@ export function buildJusticeBackup(
 	ctx: IJusticeContext,
 	policy: ISessionPolicy
 ): IJusticeBackup {
+	// BOLT: the user-supplied sweep script MUST be a standard witness program
+	// (P2WPKH=22 / P2WSH=34 here); an off-spec length makes LND's tower error
+	// at breach time, silently voiding protection. Checked up front, before any
+	// key derivation, so a misconfiguration fails loudly at session setup.
+	if (ctx.sweepScript.length !== 22 && ctx.sweepScript.length !== 34) {
+		throw new Error(
+			`watchtower: sweep script must be 22 or 34 bytes, got ${ctx.sweepScript.length}`
+		);
+	}
 	return ctx.isTaproot
 		? buildJusticeBackupV1(ctx, policy)
 		: buildJusticeBackupV0(ctx, policy);
@@ -444,6 +453,14 @@ function buildJusticeTx(
 	const sweepAmt = totalAmt - fee;
 	if (sweepAmt <= 0n) {
 		throw new Error('watchtower: justice fee exceeds swept value');
+	}
+	// A dust justice output is unredeemable: the tower ships a blob that can
+	// never be mined, so a tiny channel silently loses breach protection.
+	// P2WPKH dust floor is 294 sat (the sweep is always a witness output).
+	if (sweepAmt < 294n) {
+		throw new Error(
+			`watchtower: justice sweep output ${sweepAmt} sat is below the dust limit`
+		);
 	}
 
 	const tx = new bitcoin.Transaction();

@@ -173,6 +173,13 @@ export function encodeNodeAnnouncementMessage(
 ): Buffer {
 	const flen = msg.features.length;
 
+	// BOLT 7: a node_announcement MUST NOT include more than one address of
+	// type 5 (DNS hostname).
+	if (msg.addresses.filter((a) => a.type === ADDRESS_TYPE_DNS).length > 1) {
+		throw new Error(
+			'node_announcement MUST NOT include more than one DNS address (type 5)'
+		);
+	}
 	// Encode addresses first to know total length
 	const addrParts: Buffer[] = [];
 	for (const addr of msg.addresses) {

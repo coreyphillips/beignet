@@ -1719,8 +1719,44 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
-		this.retrievedPeerStorage.set(pubkey, { blob, receivedAt: Date.now() });
-		this.emit('peer_storage:retrieved', pubkey, blob);
+		// Unwrap our own privacy padding (see padOwnPeerStorageBlob). A blob we
+		// never padded (or a peer's un-framed blob echoed back) is passed
+		// through unchanged.
+		const unwrapped = this.unpadOwnPeerStorageBlob(blob);
+		this.retrievedPeerStorage.set(pubkey, {
+			blob: unwrapped,
+			receivedAt: Date.now()
+		});
+		this.emit('peer_storage:retrieved', pubkey, unwrapped);
+	}
+
+	/**
+	 * Pad OUR outbound peer-storage blob to the fixed maximum so a storing peer
+	 * cannot learn how much channel state we hold (BOLT 1 privacy). Framing:
+	 * [4-byte magic 'bPS1'][4-byte big-endian real length][blob][zero pad] to
+	 * PEER_STORAGE_MAX_BYTES. Only applied to our own blob; peers' blobs we
+	 * store are kept verbatim.
+	 */
+	private padOwnPeerStorageBlob(blob: Buffer): Buffer {
+		const header = Buffer.alloc(8);
+		header.write('bPS1', 0, 'ascii');
+		header.writeUInt32BE(blob.length, 4);
+		const framed = Buffer.concat([header, blob]);
+		if (framed.length >= PEER_STORAGE_MAX_BYTES) return framed;
+		return Buffer.concat([
+			framed,
+			Buffer.alloc(PEER_STORAGE_MAX_BYTES - framed.length)
+		]);
+	}
+
+	/** Reverse padOwnPeerStorageBlob; pass through anything not our framing. */
+	private unpadOwnPeerStorageBlob(blob: Buffer): Buffer {
+		if (blob.length < 8 || blob.toString('ascii', 0, 4) !== 'bPS1') {
+			return blob;
+		}
+		const realLen = blob.readUInt32BE(4);
+		if (8 + realLen > blob.length) return blob;
+		return Buffer.from(blob.subarray(8, 8 + realLen));
 	}
 
 	/** Whether a peer earns storage: any non-CLOSED channel, or trusted. */
@@ -1771,7 +1807,9 @@ export class LightningNode extends EventEmitter {
 				this.peerManager.sendToPeer(
 					pubkey,
 					MessageType.PEER_STORAGE,
-					encodePeerStorageMessage({ blob: this.ourPeerStorageBlob })
+					encodePeerStorageMessage({
+						blob: this.padOwnPeerStorageBlob(this.ourPeerStorageBlob)
+					})
 				);
 			}
 		} catch {
@@ -1802,7 +1840,10 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerStorageEnabled) return 0;
 		this.ourPeerStorageBlob = Buffer.from(blob);
 		if (!this.peerManager) return 0;
-		const payload = encodePeerStorageMessage({ blob: this.ourPeerStorageBlob });
+		// Fixed-size padding hides how much channel state we back up (BOLT 1).
+		const payload = encodePeerStorageMessage({
+			blob: this.padOwnPeerStorageBlob(this.ourPeerStorageBlob)
+		});
 		let sent = 0;
 		for (const peer of this.peerManager.listPeers()) {
 			if (!this.peerAdvertisesPeerStorage(peer.pubkey)) continue;
@@ -3982,7 +4023,10 @@ export class LightningNode extends EventEmitter {
 				chainHash: this.acceptableChainHashes[0] ?? this.chainHash(),
 				shortChannelId: scid,
 				timestamp: Math.floor(Date.now() / 1000),
-				messageFlags: 0x01, // htlc_maximum_msat present
+				// bit 0: htlc_maximum_msat present; bit 1: dont_forward — this
+				// update is for an UNANNOUNCED channel, so a peer relaying it would
+				// leak private-channel existence and policy (BOLT 7).
+				messageFlags: 0x01 | 0x02,
 				channelFlags: Buffer.compare(ourNodeId, peerNodeId) < 0 ? 0 : 1,
 				cltvExpiryDelta: policy.cltvExpiryDelta,
 				htlcMinimumMsat: policy.htlcMinimumMsat,
@@ -4908,12 +4952,14 @@ export class LightningNode extends EventEmitter {
 			const nodeId = getPublicKey(this.nodePrivkey);
 			const aliasBuffer = Buffer.alloc(32);
 			if (this.alias) {
-				Buffer.from(this.alias, 'utf8').copy(
-					aliasBuffer,
-					0,
-					0,
-					Math.min(32, Buffer.byteLength(this.alias, 'utf8'))
-				);
+				// BOLT 7: alias is a 32-byte field that MUST be valid UTF-8. A raw
+				// byte-count truncation can split the last multi-byte codepoint,
+				// yielding invalid UTF-8; trim whole codepoints to fit 32 bytes.
+				let aliasStr = this.alias;
+				while (Buffer.byteLength(aliasStr, 'utf8') > 32) {
+					aliasStr = [...aliasStr].slice(0, -1).join('');
+				}
+				Buffer.from(aliasStr, 'utf8').copy(aliasBuffer, 0);
 			}
 			// node_announcement MUST advertise the features we actually support, not
 			// just large_channels: remote nodes make routing decisions (onion-message
