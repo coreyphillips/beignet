@@ -285,7 +285,7 @@ export function buildCommitmentTx(
 		// Leased taproot channels are rejected at negotiation, so no lease here.
 		if (params.toRemoteLeaseCsv !== undefined) {
 			throw new Error(
-				'toRemoteLeaseExpiry is not supported on taproot commitments.'
+				'toRemoteLeaseCsv is not supported on taproot commitments.'
 			);
 		}
 		if (remoteAmount >= dustWsh) {
@@ -318,7 +318,7 @@ export function buildCommitmentTx(
 		// leases are negotiated anchors-only.
 		if (params.toRemoteLeaseCsv !== undefined) {
 			throw new Error(
-				'toRemoteLeaseExpiry requires an anchor (P2WSH confirmed) to_remote.'
+				'toRemoteLeaseCsv requires an anchor (P2WSH confirmed) to_remote.'
 			);
 		}
 		if (remoteAmount >= dustWpkh) {

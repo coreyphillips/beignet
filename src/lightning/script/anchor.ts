@@ -113,16 +113,16 @@ export function buildAnchorOutput(fundingPubkey: Buffer): {
 
 /**
  * Build the P2WSH output script for a to_remote anchor output. Pass
- * `leaseExpiry` for the lease-locked (lessor) variant.
+ * `leaseCsv` (remaining lease blocks) for the lease-locked (lessor) variant.
  */
 export function buildToRemoteAnchorOutput(
 	remotePubkey: Buffer,
-	leaseExpiry?: number
+	leaseCsv?: number
 ): {
 	script: Buffer;
 	witnessScript: Buffer;
 } {
-	const witnessScript = buildToRemoteAnchorScript(remotePubkey, leaseExpiry);
+	const witnessScript = buildToRemoteAnchorScript(remotePubkey, leaseCsv);
 	const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: witnessScript } });
 	return {
 		script: p2wsh.output!,
