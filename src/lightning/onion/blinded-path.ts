@@ -62,6 +62,13 @@ export interface IBlindedHopData {
 	 * release_held_htlc onion message before forwarding.
 	 */
 	holdHtlc?: boolean;
+	/**
+	 * path_id (BOLT 4 encrypted_recipient_data type 6): a private, recipient-
+	 * chosen identifier placed in the FINAL hop of a blinded path. The
+	 * recipient checks the decrypted path_id matches one it published, proving
+	 * the message arrived via the intended path (and not a probe/replay).
+	 */
+	pathId?: Buffer;
 	/** Padding for uniform hop sizes */
 	padding?: Buffer;
 }
@@ -70,6 +77,7 @@ export interface IBlindedHopData {
 const ERD_PADDING = 1n;
 const ERD_SHORT_CHANNEL_ID = 2n;
 const ERD_NEXT_NODE_ID = 4n;
+const ERD_PATH_ID = 6n;
 const ERD_PAYMENT_RELAY = 10n;
 const ERD_PAYMENT_CONSTRAINTS = 12n;
 /**
@@ -117,6 +125,9 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 	if (data.nextNodeId) {
 		records.push({ type: ERD_NEXT_NODE_ID, value: data.nextNodeId });
 	}
+	if (data.pathId) {
+		records.push({ type: ERD_PATH_ID, value: data.pathId });
+	}
 	if (data.paymentRelay) {
 		const head = Buffer.alloc(6);
 		head.writeUInt16BE(data.paymentRelay.cltvExpiryDelta, 0);
@@ -163,6 +174,8 @@ export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 			data.shortChannelId = Buffer.from(r.value);
 		} else if (r.type === ERD_NEXT_NODE_ID) {
 			data.nextNodeId = Buffer.from(r.value);
+		} else if (r.type === ERD_PATH_ID) {
+			data.pathId = Buffer.from(r.value);
 		} else if (r.type === ERD_PAYMENT_RELAY) {
 			data.paymentRelay = {
 				cltvExpiryDelta: r.value.readUInt16BE(0),

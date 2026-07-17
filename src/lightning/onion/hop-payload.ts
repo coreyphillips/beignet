@@ -131,6 +131,14 @@ export function decodeHopPayload(
 	if (payloadEnd > buf.length) {
 		throw new Error('Hop payload extends beyond buffer');
 	}
+	// BOLT 4: a length of 0 or 1 is the legacy/reserved form and is invalid for
+	// a TLV hop payload — reject as invalid_onion_payload rather than parse an
+	// empty/garbage TLV stream.
+	if (payloadLength < 2n) {
+		throw new Error(
+			`Invalid hop payload length ${payloadLength} (invalid_onion_payload)`
+		);
+	}
 
 	let amountToForwardMsat = 0n;
 	let outgoingCltvValue = 0;
@@ -141,17 +149,31 @@ export function decodeHopPayload(
 	let blindingPoint: Buffer | undefined;
 	let customRecords: Map<number, Buffer> | undefined;
 
+	let prevTlvType: number | undefined;
 	while (offset < payloadEnd) {
 		// Read TLV type
 		const typeResult = decodeBigSize(buf, offset);
 		offset += typeResult.bytesRead;
 		const tlvType = Number(typeResult.value);
 
+		// BOLT 1/4: TLV records MUST be strictly increasing by type (this also
+		// rejects duplicates). A misordered/duplicate stream is
+		// invalid_onion_payload.
+		if (prevTlvType !== undefined && tlvType <= prevTlvType) {
+			throw new Error(
+				`Hop payload TLV type ${tlvType} out of order after ${prevTlvType} (invalid_onion_payload)`
+			);
+		}
+		prevTlvType = tlvType;
+
 		// Read TLV length
 		const lengthResult = decodeBigSize(buf, offset);
 		offset += lengthResult.bytesRead;
 		const tlvLength = Number(lengthResult.value);
 
+		if (offset + tlvLength > payloadEnd) {
+			throw new Error('Hop payload TLV extends beyond the payload');
+		}
 		const tlvValue = buf.subarray(offset, offset + tlvLength);
 		offset += tlvLength;
 

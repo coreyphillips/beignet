@@ -5738,8 +5738,14 @@ export class LightningNode extends EventEmitter {
 				options.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY,
 			privateKey: this.nodePrivkey,
 			payeeNodeKey: getPublicKey(this.nodePrivkey),
+			// Cleartext hints are suppressed under blinding (they would leak the
+			// node id blinding hides) UNLESS the caller opts into including them
+			// so non-blinded-aware payers can still route (S-4 LOW).
 			routingHints:
-				!useBlinded && routingHints.length > 0 ? routingHints : undefined,
+				(!useBlinded || options.includeCleartextHintsWithBlinded) &&
+				routingHints.length > 0
+					? routingHints
+					: undefined,
 			blindedPaths: useBlinded ? blindedPaths : undefined,
 			featureBits: invoiceFeatures
 		});
@@ -7330,6 +7336,22 @@ export class LightningNode extends EventEmitter {
 				createdAt: Date.now()
 			};
 			this.pendingMppPayments.set(hashHex, pending);
+		} else if (
+			hopPayload.totalMsat !== undefined &&
+			hopPayload.totalMsat !== pending.totalMsat
+		) {
+			// BOLT 4: every part of a multi-part payment MUST carry the same
+			// total_msat. A part disagreeing with the set is
+			// final_incorrect_htlc_amount; fail just this part and keep the set
+			// intact (the payer may still complete with conformant parts).
+			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
+				: Buffer.alloc(290);
+			this.cleanupHtlcSharedSecret(secretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
 		}
 
 		// Add this part

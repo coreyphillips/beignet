@@ -86,8 +86,12 @@ export function constructOnionMessagePacket(
 	// Generate filler
 	const filler = generateFiller(sharedSecrets, payloadSizes);
 
-	// Initialize routing info with zeros
-	let routingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+	// BOLT 4: initialize routing_info from the pseudo-random `pad`-key stream
+	// (derived from the first hop's shared secret), NOT zeros. Zero-init leaves
+	// the trailing padding as recognizable zeros after each hop decrypts,
+	// which distinguishes real hops from padding and can leak the hop count.
+	const padKeys = deriveHopKeys(sharedSecrets[0]);
+	let routingInfo = generateCipherStream(padKeys.pad, ROUTING_INFO_LENGTH);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
 	// Build right-to-left (last hop first)

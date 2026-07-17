@@ -386,6 +386,14 @@ export interface ICreateInvoiceOptions {
 	 */
 	blindedPathNumHops?: number;
 	/**
+	 * With `useBlindedPaths`, ALSO emit cleartext BOLT 11 routing hints (tag 3)
+	 * for private channels, so a payer that does not understand the non-spec
+	 * blinded-paths tag (25) can still route (e.g. CLN/LND paying a private
+	 * channel). Off by default: a cleartext hint exposes the node id that
+	 * blinding is meant to hide, so this trades that privacy for routability.
+	 */
+	includeCleartextHintsWithBlinded?: boolean;
+	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or
 	 * cancelHeldHtlc() (fails it). Underpins async receive and escrow-style flows.

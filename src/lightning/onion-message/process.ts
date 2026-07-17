@@ -97,10 +97,31 @@ export function processOnionMessage(
 	const isFinal = nextHmac.equals(Buffer.alloc(32));
 
 	if (isFinal) {
-		// Final delivery — return the decoded payload
+		// Final delivery — surface the blinded-path path_id (BOLT 4) so the
+		// recipient can verify the message arrived via a path it published.
+		// Only trust a path_id from SUCCESSFULLY DECRYPTED recipient data:
+		// unencrypted/plaintext hop data is attacker-forgeable.
+		let pathId: Buffer | undefined;
+		if (hopPayload.encryptedRecipientData && blindingPoint) {
+			try {
+				const blindingSharedSecret = deriveBlindingSharedSecret(
+					blindingPoint,
+					nodePrivkey
+				);
+				const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
+				const plaintext = decryptBlindedData(
+					encKey,
+					hopPayload.encryptedRecipientData
+				);
+				pathId = decodeBlindedHopData(plaintext).pathId;
+			} catch {
+				// Undecryptable final-hop recipient data: no verifiable path_id.
+			}
+		}
 		return {
 			type: 'delivery',
-			payload: hopPayload
+			payload: hopPayload,
+			...(pathId ? { pathId } : {})
 		};
 	}
 
@@ -139,8 +160,9 @@ export function processOnionMessage(
 }
 
 /**
- * Resolve next hop from encrypted_recipient_data.
- * Attempts blinded path decryption first; falls back to raw hop data decoding.
+ * Resolve next hop from encrypted_recipient_data. Prefers blinded-path
+ * decryption (BOLT 4); falls back to raw hop data only for beignet's own
+ * unblinded multi-hop messages (sendMultiHopOnionMessage).
  */
 function resolveNextHop(
 	encryptedRecipientData: Buffer,
@@ -148,7 +170,7 @@ function resolveNextHop(
 	blindingPoint: Buffer | undefined,
 	fallbackBlindingKey: Buffer
 ): { nextNodeId: Buffer; nextBlindingKey: Buffer } {
-	// Try blinded path decryption if blinding point is available
+	// Try blinded path decryption if a blinding point is available.
 	if (blindingPoint) {
 		try {
 			const blindingSharedSecret = deriveBlindingSharedSecret(
@@ -173,7 +195,9 @@ function resolveNextHop(
 		}
 	}
 
-	// Fallback: parse raw (unencrypted) hop data
+	// Fallback: parse raw (unencrypted) hop data. Reachable only for beignet's
+	// own unblinded multi-hop path; a spec message always carries a blinding
+	// point and decrypts above.
 	const data = decodeBlindedHopData(encryptedRecipientData);
 	if (!data.nextNodeId) {
 		throw new Error(
