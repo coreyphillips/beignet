@@ -1174,10 +1174,14 @@ export function signRemoteHtlcSignaturesTaproot(
 export function verifyRemoteHtlcSignaturesTaproot(
 	state: IChannelState,
 	perCommitmentPoint: Buffer,
-	htlcSignatures: Buffer[]
+	htlcSignatures: Buffer[],
+	commitmentNumber?: bigint
 ): boolean {
 	if (!state.remoteBasepoints) return false;
-	const nextCommitNum = state.localCommitmentNumber + 1n;
+	// Default: the post-round number (the normal commitment_signed flow).
+	// Mid-splice callers verify the CURRENT number's commitment re-anchored on
+	// the new funding and pass it explicitly.
+	const nextCommitNum = commitmentNumber ?? state.localCommitmentNumber + 1n;
 	const built = buildLocalCommitment(state, perCommitmentPoint, nextCommitNum);
 	const { htlcs, htlcOriginalIndices } = built.result.outputMap;
 
@@ -1257,12 +1261,15 @@ export function verifyRemoteHtlcSignatures(
 	state: IChannelState,
 	signer: ISigner,
 	perCommitmentPoint: Buffer,
-	htlcSignatures: Buffer[]
+	htlcSignatures: Buffer[],
+	commitmentNumber?: bigint
 ): boolean {
 	if (!state.remoteBasepoints) return false;
 
-	// Use next commitment number (same as verifyRemoteCommitmentSig)
-	const nextCommitNum = state.localCommitmentNumber + 1n;
+	// Default: the post-round number (same as verifyRemoteCommitmentSig in the
+	// normal commitment_signed flow). Mid-splice callers verify the CURRENT
+	// number's commitment re-anchored on the new funding and pass it explicitly.
+	const nextCommitNum = commitmentNumber ?? state.localCommitmentNumber + 1n;
 	const built = buildLocalCommitment(state, perCommitmentPoint, nextCommitNum);
 	const { htlcs, htlcOriginalIndices } = built.result.outputMap;
 

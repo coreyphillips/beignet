@@ -363,6 +363,11 @@ export class Channel {
 		witnesses: Buffer[][];
 	} | null = null;
 	private _spliceRemoteCommitmentSig: Buffer | null = null;
+	// Peer's second-level HTLC sigs paired with _spliceRemoteCommitmentSig:
+	// committed HTLCs riding through the splice (S-2.M8) put HTLC outputs on
+	// the spliced commitment, and a force-close on the new funding needs
+	// these to claim them.
+	private _spliceRemoteHtlcSigs: Buffer[] | null = null;
 	// start_batch collection: while a fully-signed splice awaits confirmation,
 	// every commitment update arrives as a batch of commitment_signed messages
 	// (one per active funding output) announced by start_batch and answered by
@@ -5113,6 +5118,7 @@ export class Channel {
 		this._spliceReceivedCommitment = true;
 		this._spliceSentTxSigs = inflight.sentTxSignatures;
 		this._spliceRemoteCommitmentSig = inflight.remoteCommitmentSig;
+		this._spliceRemoteHtlcSigs = inflight.remoteHtlcSignatures ?? null;
 	}
 
 	/**
@@ -6570,6 +6576,7 @@ export class Channel {
 		this._spliceSentCommitment = false;
 		this._spliceReceivedCommitment = false;
 		this._spliceRemoteCommitmentSig = null;
+		this._spliceRemoteHtlcSigs = null;
 		this._lastSentBatch = null;
 		this._pendingBatch = null;
 		this._spliceOutDestination = null;
@@ -6648,7 +6655,19 @@ export class Channel {
 			this._state.localBalanceMsat +
 			session.getLocalRelativeSatoshis() * 1000n -
 			myFeeMsat;
-		const theirNewMsat = newCapacity * 1000n - myNewLocalMsat;
+		// Committed HTLCs riding through the splice (S-2.M8) hold value in
+		// NEITHER balance (it sits in their commitment outputs), so the peer's
+		// balance is the remainder of the new capacity AFTER the in-flight HTLC
+		// value. Without this each side attributes every HTLC's value to the
+		// OTHER side and the two build different commitments ("Invalid splice
+		// commitment signature"). The splice window is quiescent, so every
+		// entry is a settled committed HTLC.
+		let htlcInFlightMsat = 0n;
+		for (const e of this._state.htlcs.values()) {
+			htlcInFlightMsat += e.amountMsat;
+		}
+		const theirNewMsat =
+			newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
 
 		// The spliced commitment spends the NEW funding 2-of-2, which uses the
 		// funding pubkeys negotiated in splice_init/splice_ack — NOT necessarily
@@ -6946,17 +6965,35 @@ export class Channel {
 				}
 			];
 		}
-		// HTLC traffic is rejected during the pending-lock window (splices begin
-		// quiescent, i.e. with no HTLCs, and new adds are refused until the
-		// splice locks), so both commitments are HTLC-free here. Reject a peer
-		// that nonetheless attaches HTLC sigs to a splice commitment.
-		if (spliceMsg.htlcSignatures.length > 0) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Unexpected HTLC signatures in a pending-lock batch'
-				}
-			];
+		// Committed HTLCs may ride through a splice (S-2.M8): the spliced
+		// commitment then carries HTLC outputs, and the peer's second-level
+		// sigs over them must verify BEFORE the standard path reveals any
+		// revocation secret (they are the force-close witness material for the
+		// new funding). An HTLC-free splice yields an empty list and this
+		// verifies trivially; a count/sig mismatch fails the batch.
+		{
+			const htlcSigsValid = isTaprootChannel(this._state.channelType)
+				? verifyRemoteHtlcSignaturesTaproot(
+						spliced,
+						ourPoint,
+						spliceMsg.htlcSignatures,
+						nextNum
+				  )
+				: verifyRemoteHtlcSignatures(
+						spliced,
+						this._signer,
+						ourPoint,
+						spliceMsg.htlcSignatures,
+						nextNum
+				  );
+			if (!htlcSigsValid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid HTLC signature in a pending-lock batch'
+					}
+				];
+			}
 		}
 		// The rate the spliced commitment was verified at (before the standard
 		// path commits any staged update_fee) — force-close must rebuild at this
@@ -6982,9 +7019,13 @@ export class Channel {
 			// feerate it was made at) so a force-close after the splice confirms
 			// uses the latest state at the matching rate.
 			this._spliceRemoteCommitmentSig = Buffer.from(spliceMsg.signature);
+			this._spliceRemoteHtlcSigs = spliceMsg.htlcSignatures.map((s) =>
+				Buffer.from(s)
+			);
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
-				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw
+				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw,
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
 			});
 		}
 		return actions;
@@ -7055,15 +7096,43 @@ export class Channel {
 					}
 				];
 			}
+			// Committed HTLCs riding through the splice (S-2.M8) put HTLC
+			// outputs on the spliced commitment; verify the peer's second-level
+			// sigs over them before caching anything (they are the force-close
+			// witness material for the new funding).
+			const htlcSigsValid = isTaprootChannel(this._state.channelType)
+				? verifyRemoteHtlcSignaturesTaproot(
+						spliced,
+						ourPoint,
+						msg.htlcSignatures,
+						this._state.localCommitmentNumber
+				  )
+				: verifyRemoteHtlcSignatures(
+						spliced,
+						this._signer,
+						ourPoint,
+						msg.htlcSignatures,
+						this._state.localCommitmentNumber
+				  );
+			if (!htlcSigsValid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid splice commitment HTLC signature'
+					}
+				];
+			}
 		}
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
+		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
 		this._spliceReceivedCommitment = true;
 		// Keep the persisted in-flight record in sync (it may already exist from
 		// our own commitment send): the peer's commitment sig must survive a
 		// crash, and reestablish derives retransmit_flags from it.
 		if (this._state.spliceInFlight) {
 			this._syncSpliceInFlight({
-				remoteCommitmentSig: this._spliceRemoteCommitmentSig
+				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
 			});
 		}
 
@@ -7212,10 +7281,13 @@ export class Channel {
 		// exchanged, fall back to driving a post-splice commitment round.
 		if (this._spliceRemoteCommitmentSig) {
 			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
-			// The splice window is HTLC-free (splices start quiescent and new
-			// HTLCs are refused until the lock), so the post-splice commitment
-			// carries no HTLC outputs.
-			this._state.remoteHtlcSignatures = [];
+			// Committed HTLCs that rode through the splice (S-2.M8) keep their
+			// outputs on the post-splice commitment; adopt the peer's verified
+			// second-level sigs over them (empty for an HTLC-free splice).
+			this._state.remoteHtlcSignatures =
+				this._spliceRemoteHtlcSigs ??
+				this._state.spliceInFlight?.remoteHtlcSignatures ??
+				[];
 			// Rebuild at the rate the adopted signature was actually made at, not
 			// a feerate that may have been staged (update_fee) but not yet signed.
 			this._state.lastSignedCommitFeeratePerKw =
@@ -7255,11 +7327,39 @@ export class Channel {
 		this._resetSpliceDriver();
 	}
 
+	/**
+	 * BOLT 2 quiescence gate: stfu may only be sent (or honored) when no
+	 * UPDATES are pending, i.e. nothing is between "sent" and "irrevocably
+	 * committed by both sides". A fully-committed live HTLC is NOT a pending
+	 * update — rejecting stfu for one (the old behavior) made CLN/eclair
+	 * initiated quiescence (and thus splicing) on any busy channel stall until
+	 * the peer's quiescence timeout disconnected us (S-2.M8).
+	 */
 	private hasPendingHtlcs(): boolean {
+		if (this.needsCommitment()) {
+			return true;
+		}
 		for (const entry of this._state.htlcs.values()) {
+			// An add not yet committed by both sides.
+			if (entry.state === HtlcState.PENDING) {
+				return true;
+			}
+			// A removal in flight: fulfilled/failed entries are deleted once the
+			// removal is fully committed, so their presence means it is not.
 			if (
-				entry.state === HtlcState.PENDING ||
-				entry.state === HtlcState.COMMITTED
+				entry.state === HtlcState.FULFILLED ||
+				entry.state === HtlcState.FAILED
+			) {
+				return true;
+			}
+			// Two-phase flags mid-flight (false = the covering commitment round
+			// has not completed; absent/true = settled).
+			if (
+				entry.addRemoteCommitted === false ||
+				entry.addLocallyRevoked === false ||
+				entry.removalRemoteCommitted === false ||
+				entry.removalLocallyRevoked === false ||
+				entry.commitCoverPending === true
 			) {
 				return true;
 			}

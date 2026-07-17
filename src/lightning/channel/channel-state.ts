@@ -45,6 +45,12 @@ export interface ISpliceInFlight {
 	/** Peer's signature on OUR spliced commitment (adopted at completeSplice). */
 	remoteCommitmentSig: Buffer | null;
 	/**
+	 * Peer's second-level HTLC signatures on OUR spliced commitment, parallel
+	 * to remoteCommitmentSig. Present when committed HTLCs ride through the
+	 * splice (S-2.M8); absent/empty for an HTLC-free splice.
+	 */
+	remoteHtlcSignatures?: Buffer[];
+	/**
 	 * The committed commitment feerate that remoteCommitmentSig was produced
 	 * at. force-close rebuilds the spliced commitment at THIS rate, not a
 	 * feerate that may have been staged (update_fee) but not yet covered by the

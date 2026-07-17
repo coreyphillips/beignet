@@ -35,7 +35,8 @@ import {
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -4003,6 +4004,70 @@ describe('Splice', function () {
 			// Both sides still agree on the spliced funding outpoint.
 			expect(openerChannel.getFullState().fundingTxid!.equals(splicedFunding))
 				.to.be.true;
+		});
+
+		it('splices with a COMMITTED HTLC riding through (S-2.M8)', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = createNormalChannelPair();
+
+			// A fully committed live HTLC before the splice (added and driven
+			// through both commitment rounds by the loopback, NOT settled).
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					20_000_000n,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			const entry = [...openerChannel.getFullState().htlcs.values()][0];
+			expect(entry.state, 'HTLC fully committed').to.equal(HtlcState.COMMITTED);
+
+			// Quiescence must be accepted with the committed HTLC (S-2.M8), and
+			// the splice-in runs to fully signed via auto-routing.
+			expect(openerManager.initiateQuiescence(channelId).ok).to.be.true;
+			expect(openerChannel.isQuiescent()).to.be.true;
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.be
+				.true;
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+
+			// The committed HTLC survived the splice, and BOTH sides adopted the
+			// peer's verified second-level HTLC signature over the spliced
+			// commitment (the force-close witness material on the new funding;
+			// previously zeroed unconditionally).
+			expect(openerChannel.getFullState().htlcs.size).to.equal(1);
+			expect(
+				openerChannel.getFullState().remoteHtlcSignatures.length,
+				'opener adopted splice HTLC sig'
+			).to.equal(1);
+			expect(
+				acceptorChannel.getFullState().remoteHtlcSignatures.length,
+				'acceptor adopted splice HTLC sig'
+			).to.equal(1);
+
+			// The HTLC still settles normally on the spliced channel.
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(fulfilled, 'HTLC fulfilled after the splice').to.be.true;
 		});
 
 		it('should refuse abortSplice via manager once tx_signatures are exchanged (fund safety)', function () {
