@@ -103,6 +103,12 @@ export class OfferManager extends EventEmitter {
 			resolve: (invoice: IBolt12Invoice) => void;
 			reject: (err: Error) => void;
 			timer: ReturnType<typeof setTimeout>;
+			/**
+			 * The signed invreq records we sent, retained so the invoice's
+			 * mirrored fields can be checked (BOLT 12: the reader MUST reject an
+			 * invoice whose invreq-range fields differ from the request).
+			 */
+			sentRecords?: ITlvRecord[];
 		}
 	> = new Map();
 	/**
@@ -269,10 +275,14 @@ export class OfferManager extends EventEmitter {
 		);
 		request.signature = schnorrSign(sigHash, payerPrivkey);
 
+		// The exact signed records we send: retained so the invoice's mirrored
+		// invreq-range fields can be verified on receipt (BOLT 12 reader MUST).
+		const signedRequestTlv = encodeInvoiceRequestTlv(request, offerTlvData);
+		const sentRecords = getTlvRecords(signedRequestTlv);
+
 		// If we have an onion message manager and the offer has paths or issuer_id, send via onion
 		if (this.onionMessageManager && (offer.paths || offer.issuerId)) {
 			const messageData = new Map<number, Buffer>();
-			const signedRequestTlv = encodeInvoiceRequestTlv(request, offerTlvData);
 			messageData.set(TLV_INVOICE_REQUEST, signedRequestTlv);
 
 			// Send to the first blinded path, or directly to issuer_id
@@ -293,7 +303,12 @@ export class OfferManager extends EventEmitter {
 				reject(new Error('Invoice request timed out'));
 			}, this.invoiceRequestTimeoutMs);
 
-			this.pendingInvoiceRequests.set(offerIdHex, { resolve, reject, timer });
+			this.pendingInvoiceRequests.set(offerIdHex, {
+				resolve,
+				reject,
+				timer,
+				sentRecords
+			});
 		});
 	}
 
@@ -394,6 +409,31 @@ export class OfferManager extends EventEmitter {
 		// invoice (it never leaves the issuer — not part of the BOLT 12 invoice).
 		this.invoicePreimages.set(paymentHash.toString('hex'), preimage);
 
+		// BOLT 12: the invoice MUST include invoice_paths (one or more blinded
+		// paths to us) with exactly one blinded_payinfo per path. Reuse the
+		// offer's paths when it has them; a direct (announced-node) offer gets a
+		// minimal 1-hop path terminating at us — the payer treats the
+		// introduction node as the destination.
+		const invoicePaths =
+			matchedOffer.paths && matchedOffer.paths.length > 0
+				? matchedOffer.paths
+				: [
+						{
+							introductionNodeId: this.nodeId,
+							blindingPoint: getPublicKey(crypto.randomBytes(32)),
+							blindedHops: [
+								{ blindedNodeId: this.nodeId, encryptedData: Buffer.alloc(0) }
+							]
+						}
+				  ];
+		const invoicePayInfo = invoicePaths.map(() => ({
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0,
+			cltvExpiryDelta: 18,
+			htlcMinimumMsat: 1n,
+			htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
+		}));
+
 		const invoice: IBolt12Invoice = {
 			paymentHash,
 			amount,
@@ -402,19 +442,26 @@ export class OfferManager extends EventEmitter {
 			relativeExpiry: 7200, // 2 hours
 			paymentSecret,
 			nodeId: this.nodeId,
-			paths: matchedOffer.paths
+			paths: invoicePaths,
+			blindedPayInfo: invoicePayInfo
 		};
 
-		// Sign the invoice
-		const invoiceTlvData = encodeInvoiceTlv(invoice);
+		// Sign the invoice. BOLT 12: the invoice MUST copy all non-signature
+		// fields from the invoice_request (mirrored via `records`), and the
+		// signature commits to the FULL record set — mirrored fields included.
+		const invoiceTlvData = encodeInvoiceTlv(invoice, records);
 		const invoiceRecords = getTlvRecordsForSigning(invoiceTlvData);
 		const merkleRoot = computeMerkleRootFromRecords(invoiceRecords);
 		const sigHash = computeSignatureHash(INVOICE_SIGNATURE_TAG, merkleRoot);
 		invoice.signature = schnorrSign(sigHash, this.nodePrivkey);
+		// Retain the full signed wire records (mirrored fields included):
+		// signature verification and any re-encode must use these, never a
+		// structural re-encode that would drop the mirror.
+		invoice.records = getTlvRecords(encodeInvoiceTlv(invoice, records));
 
 		// Send via reply path if available
 		if (replyPath && this.onionMessageManager) {
-			const signedInvoiceTlv = encodeInvoiceTlv(invoice);
+			const signedInvoiceTlv = encodeInvoiceTlv(invoice, records);
 			const messageData = new Map<number, Buffer>();
 			messageData.set(TLV_INVOICE, signedInvoiceTlv);
 			this.onionMessageManager.sendReply(replyPath, messageData);
@@ -440,15 +487,27 @@ export class OfferManager extends EventEmitter {
 
 	/**
 	 * Validate a BOLT 12 invoice signature.
+	 *
+	 * When the raw decoded `records` are available (any invoice received off
+	 * the wire) they MUST be used: the signature commits to every record —
+	 * including invreq fields mirrored per BOLT 12 and unknown TLVs — which a
+	 * structural re-encode would drop, wrongly failing every spec invoice.
 	 */
-	verifyInvoiceSignature(invoice: IBolt12Invoice): boolean {
+	verifyInvoiceSignature(
+		invoice: IBolt12Invoice,
+		rawRecords?: ITlvRecord[]
+	): boolean {
 		if (!invoice.signature) return false;
 
-		const invoiceTlvData = encodeInvoiceTlv({
-			...invoice,
-			signature: undefined
-		});
-		const records = getTlvRecords(invoiceTlvData);
+		const raw = rawRecords ?? invoice.records;
+		const records = raw
+			? raw.filter((r) => r.type !== 240n)
+			: getTlvRecords(
+					encodeInvoiceTlv({
+						...invoice,
+						signature: undefined
+					})
+			  );
 		const merkleRoot = computeMerkleRootFromRecords(records);
 		const sigHash = computeSignatureHash(INVOICE_SIGNATURE_TAG, merkleRoot);
 
@@ -522,7 +581,36 @@ export class OfferManager extends EventEmitter {
 	}
 
 	private handleIncomingInvoice(data: Buffer): void {
-		const { invoice } = decodeInvoiceTlv(data);
+		const { invoice, records } = decodeInvoiceTlv(data);
+
+		// BOLT 12 reader checks (S-4.H3): the signature commits to the FULL
+		// record set (mirrored + unknown fields included), the invoice MUST
+		// carry blinded payment paths with exactly one payinfo per path, and
+		// its invreq-range fields MUST byte-match the request we sent.
+		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null => {
+			if (!this.verifyInvoiceSignature(invoice, records)) {
+				return 'invalid invoice signature';
+			}
+			if (!invoice.paths || invoice.paths.length === 0) {
+				return 'invoice_paths missing or empty';
+			}
+			if (
+				!invoice.blindedPayInfo ||
+				invoice.blindedPayInfo.length !== invoice.paths.length
+			) {
+				return 'invoice_blindedpay must carry one payinfo per path';
+			}
+			if (sentRecords) {
+				for (const sent of sentRecords) {
+					if (sent.type === 240n) continue; // signature not mirrored
+					const mirrored = records.find((r) => r.type === sent.type);
+					if (!mirrored || !mirrored.value.equals(sent.value)) {
+						return `invoice does not mirror invreq field ${sent.type}`;
+					}
+				}
+			}
+			return null;
+		};
 
 		// Try to match by offer description + node ID (offer-aware matching)
 		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
@@ -534,6 +622,14 @@ export class OfferManager extends EventEmitter {
 					!offerEntry.offer.issuerId ||
 					invoice.nodeId.equals(offerEntry.offer.issuerId);
 				if (descMatch && issuerMatch) {
+					const reason = validateAgainstSent(pending.sentRecords);
+					if (reason) {
+						clearTimeout(pending.timer);
+						this.pendingInvoiceRequests.delete(offerIdHex);
+						pending.reject(new Error(`Rejected BOLT 12 invoice: ${reason}`));
+						this.emit('invoice:error', { error: reason });
+						return;
+					}
 					clearTimeout(pending.timer);
 					this.pendingInvoiceRequests.delete(offerIdHex);
 					pending.resolve(invoice);
@@ -547,8 +643,14 @@ export class OfferManager extends EventEmitter {
 		if (this.pendingInvoiceRequests.size === 1) {
 			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
 				.value!;
+			const reason = validateAgainstSent(pending.sentRecords);
 			clearTimeout(pending.timer);
 			this.pendingInvoiceRequests.delete(offerIdHex);
+			if (reason) {
+				pending.reject(new Error(`Rejected BOLT 12 invoice: ${reason}`));
+				this.emit('invoice:error', { error: reason });
+				return;
+			}
 			pending.resolve(invoice);
 			this.emit('invoice:received', invoice);
 			return;
