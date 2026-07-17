@@ -213,6 +213,10 @@ const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as m
  */
 const LEASE_BLOCKHEIGHT_PAST_TOLERANCE = 6;
 const LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE = 144;
+function bigIntMax(a: bigint, b: bigint): bigint {
+	return a > b ? a : b;
+}
+
 function computeChannelReserve(
 	fundingSatoshis: bigint,
 	dustLimitSatoshis: bigint
@@ -949,6 +953,18 @@ export class Channel {
 					}
 				];
 			}
+		} else if (this._state.channelType && !msg.channelType) {
+			// BOLT 2: if open_channel set channel_type, accept_channel MUST set it
+			// to the exact same type. An omission is a violation, not an implicit
+			// agreement — silently keeping our own type risks the two sides
+			// building different commitment formats.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'accept_channel omitted channel_type after open_channel set it'
+				}
+			];
 		}
 		if (msg.channelType) {
 			this._state.channelType = msg.channelType;
@@ -1212,10 +1228,29 @@ export class Channel {
 			this._state.channelType = defaultType.toBuffer();
 		}
 
-		const channelReserve = computeChannelReserve(
-			this._state.fundingSatoshis,
-			this._state.localConfig.dustLimitSatoshis
+		// BOLT 2 couplings for the accept_channel WE build: our channel_reserve
+		// MUST be >= the opener's dust_limit (else the opener's below-reserve
+		// balance could be trimmed as dust), so raise it if our formula lands
+		// lower. And our dust_limit MUST be <= the opener's channel_reserve; we
+		// will not lower our own dust floor, so reject the open instead of
+		// emitting a non-compliant accept_channel the opener must then fail.
+		const channelReserve = bigIntMax(
+			computeChannelReserve(
+				this._state.fundingSatoshis,
+				this._state.localConfig.dustLimitSatoshis
+			),
+			msg.dustLimitSatoshis
 		);
+		if (
+			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `our dust_limit ${this._state.localConfig.dustLimitSatoshis} exceeds opener channel_reserve ${msg.channelReserveSatoshis}`
+				}
+			];
+		}
 
 		const acceptMsg: IAcceptChannelMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -1521,6 +1556,18 @@ export class Channel {
 			];
 		}
 
+		// BOLT 2: cltv_expiry MUST be < 500000000 (values at or above are
+		// interpreted as unix timestamps, not block heights). Send-side check so
+		// we never emit an update_add_htlc a conformant peer must fail.
+		if (cltvExpiry >= 500_000_000) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${cltvExpiry} is not a block height (>= 500000000)`
+				}
+			];
+		}
+
 		// Check amount exceeds minimum
 		if (amountMsat < this._state.remoteConfig.htlcMinimumMsat) {
 			return [
@@ -1765,6 +1812,18 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Dust HTLC exposure limit exceeded'
+				}
+			];
+		}
+
+		// BOLT 2: cltv_expiry >= 500000000 is a unix timestamp, not a block
+		// height — always invalid, independent of whether we know the current
+		// block height.
+		if (msg.cltvExpiry >= 500_000_000) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${msg.cltvExpiry} is not a block height (>= 500000000)`
 				}
 			];
 		}
@@ -5080,6 +5139,17 @@ export class Channel {
 	handleReestablish(msg: IChannelReestablishMessage): ChannelAction[] {
 		const actions: ChannelAction[] = [];
 
+		// BOLT 2: next_commitment_number MUST NOT be 0 — the initial commitment
+		// (number 0) is delivered inside funding_created/funding_signed, so the
+		// first commitment_signed a peer can expect is number 1. Zero means the
+		// peer's state is corrupt or hostile; fail the channel loudly rather
+		// than fall through the retransmission logic with it.
+		if (msg.nextCommitmentNumber === 0n) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_commitment_number is 0'
+			);
+		}
+
 		// ── Data loss protection: validate yourLastPerCommitmentSecret ──
 		if (msg.nextRevocationNumber > 0n) {
 			const expectedSecret = getPerCommitmentSecret(
@@ -5318,10 +5388,16 @@ export class Channel {
 		actions.push(...this._handleReestablishSplice(msg));
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
-		// Per spec: on reconnection, if a node sent channel_ready, it MUST retransmit it.
+		// Spec trigger: the peer's next_commitment_number == 1 proves it never
+		// processed anything past the initial commitment, i.e. it may have
+		// missed our channel_ready — retransmit REGARDLESS of our local state
+		// (we may already have advanced to NORMAL). The local-state condition
+		// is kept as a belt-and-braces fallback for peers that omit the field
+		// semantics (pre-ready states always retransmit).
 		if (
 			this._state.localChannelReady &&
-			(this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
+			(msg.nextCommitmentNumber === 1n ||
+				this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
 				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED)
 		) {
 			const secondPoint = getPerCommitmentPoint(
@@ -9244,6 +9320,23 @@ export class Channel {
 	 * Handle tx_init_rbf from peer (acceptor side).
 	 */
 	handleTxInitRbf(msg: ITxInitRbfMessage): ChannelAction[] {
+		// BOLT 2: the receiver of tx_init_rbf MUST respond with tx_ack_rbf or
+		// tx_abort. A splice uses _spliceSession, not a dual-funding session;
+		// we do not support RBF of a splice yet, so refuse it properly with
+		// tx_abort (the channel itself is unaffected) instead of a generic
+		// error the peer cannot interpret.
+		if (this._spliceSession && !this._spliceSession.isComplete()) {
+			return [
+				sendMsg(
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: this._state.channelId ?? msg.channelId,
+						data: Buffer.from('splice RBF not supported', 'utf8')
+					})
+				)
+			];
+		}
+
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			return [
@@ -9253,7 +9346,16 @@ export class Channel {
 
 		const result = session.handleRbf(msg.feerate, msg.locktime);
 		if (!result.ok) {
+			// Spec-conformant refusal: tx_abort with the reason, plus the
+			// app-level error for observability.
 			return [
+				sendMsg(
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: this._v2ChannelId(),
+						data: Buffer.from(result.error || 'Failed to handle RBF', 'utf8')
+					})
+				),
 				{
 					type: ChannelActionType.ERROR,
 					message: result.error || 'Failed to handle RBF'
@@ -9316,8 +9418,22 @@ export class Channel {
 
 		// A splice tx_abort unwinds the splice and returns the channel to normal
 		// operation (the existing channel is unaffected), rather than erroring it.
+		// BOLT 2: a node receiving tx_abort that has not itself sent one MUST
+		// echo tx_abort back — the peer treats the echo as the ack that both
+		// sides have forgotten the transaction.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
-			return this.abortSplice('peer sent tx_abort');
+			const echo = this._state.channelId
+				? [
+						sendMsg(
+							MessageType.TX_ABORT,
+							encodeTxAbortMessage({
+								channelId: this._state.channelId,
+								data: Buffer.alloc(0)
+							})
+						)
+				  ]
+				: [];
+			return [...echo, ...this.abortSplice('peer sent tx_abort')];
 		}
 
 		const session = this._state.dualFundingSession;
@@ -9342,7 +9458,17 @@ export class Channel {
 
 		session.abort();
 		this._state.state = ChannelState.ERRORED;
-		return [];
+		// Echo the tx_abort (BOLT 2 ack) — we had an active session and had not
+		// sent tx_abort ourselves.
+		return [
+			sendMsg(
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: this._v2ChannelId(),
+					data: Buffer.alloc(0)
+				})
+			)
+		];
 	}
 }
 

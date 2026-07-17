@@ -7,6 +7,7 @@ import {
 	IOpenChannelMessage,
 	IAcceptChannelMessage
 } from '../message/channel-open';
+import { isValidPublicKey } from '../crypto/ecdh';
 import {
 	MAX_ACCEPTED_HTLCS,
 	MAX_FUNDING_SATOSHIS,
@@ -96,6 +97,40 @@ export function deriveV2TemporaryChannelId(
 }
 
 /**
+ * BOLT 2: every public key and basepoint in open_channel / accept_channel MUST
+ * be a valid secp256k1 point. An off-curve basepoint makes every later key
+ * derivation (commitment keys, revocation, HTLC keys) fail or, worse, produce
+ * unspendable outputs.
+ * @returns Error string naming the bad field, or null.
+ */
+function validateChannelPoints(
+	msg: Pick<
+		IOpenChannelMessage,
+		| 'fundingPubkey'
+		| 'revocationBasepoint'
+		| 'paymentBasepoint'
+		| 'delayedPaymentBasepoint'
+		| 'htlcBasepoint'
+		| 'firstPerCommitmentPoint'
+	>
+): string | null {
+	const points: Array<[string, Buffer]> = [
+		['funding_pubkey', msg.fundingPubkey],
+		['revocation_basepoint', msg.revocationBasepoint],
+		['payment_basepoint', msg.paymentBasepoint],
+		['delayed_payment_basepoint', msg.delayedPaymentBasepoint],
+		['htlc_basepoint', msg.htlcBasepoint],
+		['first_per_commitment_point', msg.firstPerCommitmentPoint]
+	];
+	for (const [name, point] of points) {
+		if (!isValidPublicKey(point)) {
+			return `${name} is not a valid secp256k1 public key`;
+		}
+	}
+	return null;
+}
+
+/**
  * Validate open_channel parameters per BOLT 2 requirements.
  * @returns Error string if invalid, null if valid.
  */
@@ -158,6 +193,12 @@ export function validateOpenChannelParams(
 	// funding_pubkey must be 33 bytes
 	if (msg.fundingPubkey.length !== 33) {
 		return 'funding_pubkey must be 33 bytes';
+	}
+
+	// All keys/basepoints must be valid curve points
+	const pointError = validateChannelPoints(msg);
+	if (pointError) {
+		return pointError;
 	}
 
 	// BOLT 2 acceptor MUSTs on the initial commitment. The opener pays the
@@ -250,6 +291,12 @@ export function validateAcceptChannelParams(
 	// funding_pubkey must be 33 bytes
 	if (accept.fundingPubkey.length !== 33) {
 		return 'funding_pubkey must be 33 bytes';
+	}
+
+	// All keys/basepoints must be valid curve points
+	const pointError = validateChannelPoints(accept);
+	if (pointError) {
+		return pointError;
 	}
 
 	return null;
