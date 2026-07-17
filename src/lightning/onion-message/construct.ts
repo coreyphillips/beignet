@@ -17,7 +17,8 @@ import { ONION_VERSION, ROUTING_INFO_LENGTH } from '../onion/types';
 import {
 	computeSharedSecrets,
 	deriveHopKeys,
-	generateCipherStream
+	generateCipherStream,
+	generateKey
 } from '../onion/sphinx-crypto';
 import { getPublicKey } from '../crypto/ecdh';
 import { IBlindedPath, encodeBlindedHopData } from '../onion/blinded-path';
@@ -86,8 +87,15 @@ export function constructOnionMessagePacket(
 	// Generate filler
 	const filler = generateFiller(sharedSecrets, payloadSizes);
 
-	// Initialize routing info with zeros
-	let routingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+	// BOLT 4: initialize routing_info from the pseudo-random `pad`-key stream
+	// keyed by the SESSION private key, NOT zeros and NOT any per-hop secret.
+	// Zero-init leaves the trailing padding recognizable after each hop
+	// decrypts (leaking hop count); keying from a hop's shared secret would let
+	// that hop regenerate the stream and locate the padding boundary.
+	let routingInfo = generateCipherStream(
+		generateKey('pad', sessionKey),
+		ROUTING_INFO_LENGTH
+	);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
 	// Build right-to-left (last hop first)

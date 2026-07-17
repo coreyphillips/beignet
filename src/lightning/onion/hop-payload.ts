@@ -54,7 +54,7 @@ function encodeTlvRecord(type: number, value: Buffer): Buffer {
  * Encode a hop payload as TLV with BigSize length prefix.
  */
 export function encodeHopPayload(payload: IHopPayload): Buffer {
-	const records: Buffer[] = [];
+	const records: { type: number; value: Buffer }[] = [];
 
 	// BOLT 4: a blinded INTERMEDIATE hop's payload carries ONLY
 	// encrypted_recipient_data (+ the introduction node's blinding_point). It MUST
@@ -63,17 +63,21 @@ export function encodeHopPayload(payload: IHopPayload): Buffer {
 	// reject the onion with invalid_onion_blinding.
 	if (!payload.omitForwardAmounts) {
 		// Type 2: amt_to_forward (tu64)
-		const amtBytes = encodeTruncatedUint(payload.amountToForwardMsat);
-		records.push(encodeTlvRecord(2, amtBytes));
+		records.push({
+			type: 2,
+			value: encodeTruncatedUint(payload.amountToForwardMsat)
+		});
 
 		// Type 4: outgoing_cltv_value (tu32)
-		const cltvBytes = encodeTruncatedUint(BigInt(payload.outgoingCltvValue));
-		records.push(encodeTlvRecord(4, cltvBytes));
+		records.push({
+			type: 4,
+			value: encodeTruncatedUint(BigInt(payload.outgoingCltvValue))
+		});
 	}
 
 	// Type 6: short_channel_id (8 bytes, omitted for final hop)
 	if (payload.shortChannelId) {
-		records.push(encodeTlvRecord(6, payload.shortChannelId));
+		records.push({ type: 6, value: payload.shortChannelId });
 	}
 
 	// Type 8: payment_data — payment_secret (32 bytes) + total_msat (tu64)
@@ -81,31 +85,36 @@ export function encodeHopPayload(payload: IHopPayload): Buffer {
 		const totalMsatBytes = encodeTruncatedUint(
 			payload.totalMsat ?? payload.amountToForwardMsat
 		);
-		const paymentData = Buffer.concat([payload.paymentSecret, totalMsatBytes]);
-		records.push(encodeTlvRecord(8, paymentData));
+		records.push({
+			type: 8,
+			value: Buffer.concat([payload.paymentSecret, totalMsatBytes])
+		});
 	}
 
 	// Type 10: encrypted_recipient_data (blinded hop)
 	if (payload.encryptedRecipientData) {
-		records.push(encodeTlvRecord(10, payload.encryptedRecipientData));
+		records.push({ type: 10, value: payload.encryptedRecipientData });
 	}
 
 	// Type 12: blinding_point (33-byte ephemeral key)
 	if (payload.blindingPoint) {
-		records.push(encodeTlvRecord(12, payload.blindingPoint));
+		records.push({ type: 12, value: payload.blindingPoint });
 	}
 
-	// Custom TLV records (e.g. keysend preimage), sorted by type ascending
+	// Custom TLV records (e.g. keysend preimage)
 	if (payload.customRecords && payload.customRecords.size > 0) {
-		const sortedEntries = [...payload.customRecords.entries()].sort(
-			(a, b) => a[0] - b[0]
-		);
-		for (const [type, value] of sortedEntries) {
-			records.push(encodeTlvRecord(type, value));
+		for (const [type, value] of payload.customRecords.entries()) {
+			records.push({ type, value });
 		}
 	}
 
-	const tlvData = Buffer.concat(records);
+	// BOLT 1: a TLV stream MUST be strictly increasing by type. Sort the FULL
+	// record set (a custom record type below 12 would otherwise be appended out
+	// of order and rejected by our own hardened decoder).
+	records.sort((a, b) => a.type - b.type);
+	const tlvData = Buffer.concat(
+		records.map((r) => encodeTlvRecord(r.type, r.value))
+	);
 	const lengthPrefix = encodeBigSize(BigInt(tlvData.length));
 	return Buffer.concat([lengthPrefix, tlvData]);
 }
@@ -131,6 +140,14 @@ export function decodeHopPayload(
 	if (payloadEnd > buf.length) {
 		throw new Error('Hop payload extends beyond buffer');
 	}
+	// BOLT 4: a length of 0 or 1 is the legacy/reserved form and is invalid for
+	// a TLV hop payload — reject as invalid_onion_payload rather than parse an
+	// empty/garbage TLV stream.
+	if (payloadLength < 2n) {
+		throw new Error(
+			`Invalid hop payload length ${payloadLength} (invalid_onion_payload)`
+		);
+	}
 
 	let amountToForwardMsat = 0n;
 	let outgoingCltvValue = 0;
@@ -141,17 +158,31 @@ export function decodeHopPayload(
 	let blindingPoint: Buffer | undefined;
 	let customRecords: Map<number, Buffer> | undefined;
 
+	let prevTlvType: number | undefined;
 	while (offset < payloadEnd) {
 		// Read TLV type
 		const typeResult = decodeBigSize(buf, offset);
 		offset += typeResult.bytesRead;
 		const tlvType = Number(typeResult.value);
 
+		// BOLT 1/4: TLV records MUST be strictly increasing by type (this also
+		// rejects duplicates). A misordered/duplicate stream is
+		// invalid_onion_payload.
+		if (prevTlvType !== undefined && tlvType <= prevTlvType) {
+			throw new Error(
+				`Hop payload TLV type ${tlvType} out of order after ${prevTlvType} (invalid_onion_payload)`
+			);
+		}
+		prevTlvType = tlvType;
+
 		// Read TLV length
 		const lengthResult = decodeBigSize(buf, offset);
 		offset += lengthResult.bytesRead;
 		const tlvLength = Number(lengthResult.value);
 
+		if (offset + tlvLength > payloadEnd) {
+			throw new Error('Hop payload TLV extends beyond the payload');
+		}
 		const tlvValue = buf.subarray(offset, offset + tlvLength);
 		offset += tlvLength;
 
