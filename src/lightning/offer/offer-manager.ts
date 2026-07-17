@@ -76,6 +76,13 @@ export interface ICreateOfferOptions {
 	chains?: Buffer[];
 	/** Optional metadata */
 	metadata?: Buffer;
+	/**
+	 * BOLT 4 path_id embedded in the final hop of `paths`. When set, an
+	 * incoming invoice_request for this offer MUST have arrived over one of
+	 * those paths (its decrypted recipient data carries this path_id) or it is
+	 * rejected. Omit for externally built paths without one.
+	 */
+	pathId?: Buffer;
 }
 
 export interface IRequestInvoiceOptions {
@@ -94,7 +101,7 @@ export class OfferManager extends EventEmitter {
 	private nodeId: Buffer;
 	private offers: Map<
 		string,
-		{ offer: IOffer; encoded: string; tlvData: Buffer }
+		{ offer: IOffer; encoded: string; tlvData: Buffer; pathId?: Buffer }
 	> = new Map();
 	private onionMessageManager: OnionMessageManager | null = null;
 	private pendingInvoiceRequests: Map<
@@ -109,6 +116,13 @@ export class OfferManager extends EventEmitter {
 			 * invoice whose invreq-range fields differ from the request).
 			 */
 			sentRecords?: ITlvRecord[];
+			/**
+			 * The path_id we embedded in the blinded reply path sent with the
+			 * invreq. When set, only an invoice delivered over that path (its
+			 * decrypted recipient data surfaces this path_id) may resolve this
+			 * request.
+			 */
+			replyPathId?: Buffer;
 		}
 	> = new Map();
 	/**
@@ -146,14 +160,17 @@ export class OfferManager extends EventEmitter {
 		// Register TLV handlers for BOLT 12 message types
 		mgr.registerTlvHandler(
 			TLV_INVOICE_REQUEST,
-			(_fromPeer, _tlvType, data, replyPath) => {
-				this.handleIncomingInvoiceRequest(data, replyPath);
+			(_fromPeer, _tlvType, data, replyPath, pathId) => {
+				this.handleIncomingInvoiceRequest(data, replyPath, pathId);
 			}
 		);
 
-		mgr.registerTlvHandler(TLV_INVOICE, (_fromPeer, _tlvType, data) => {
-			this.handleIncomingInvoice(data);
-		});
+		mgr.registerTlvHandler(
+			TLV_INVOICE,
+			(_fromPeer, _tlvType, data, _replyPath, pathId) => {
+				this.handleIncomingInvoice(data, pathId);
+			}
+		);
 
 		mgr.registerTlvHandler(TLV_INVOICE_ERROR, (_fromPeer, _tlvType, data) => {
 			this.handleIncomingInvoiceError(data);
@@ -195,8 +212,13 @@ export class OfferManager extends EventEmitter {
 
 		const encoded = encodeOffer(offer);
 
-		// Store offer
-		this.offers.set(offerId.toString('hex'), { offer, encoded, tlvData });
+		// Store offer (with the expected path_id when its paths carry one)
+		this.offers.set(offerId.toString('hex'), {
+			offer,
+			encoded,
+			tlvData,
+			pathId: options.pathId
+		});
 
 		this.emit('offer:created', offer, encoded);
 		return { offer, encoded };
@@ -285,6 +307,7 @@ export class OfferManager extends EventEmitter {
 		const sentRecords = getTlvRecords(signedRequestTlv);
 
 		// If we have an onion message manager and the offer has paths or issuer_id, send via onion
+		let replyPathId: Buffer | undefined;
 		if (this.onionMessageManager && (offer.paths || offer.issuerId)) {
 			const messageData = new Map<number, Buffer>();
 			messageData.set(TLV_INVOICE_REQUEST, signedRequestTlv);
@@ -294,8 +317,9 @@ export class OfferManager extends EventEmitter {
 			// issuer (CLN) silently drops the request and the payer times out.
 			// A 1-hop path to ourselves: the issuer routes to our real node id
 			// (the introduction node IS the recipient) and only WE ever decrypt
-			// the hop blob, so it also carries a path_id we can later verify.
-			const replyPathId = crypto.randomBytes(32);
+			// the hop blob, so it also carries a path_id we verify on the reply
+			// (stored on the pending request below).
+			replyPathId = crypto.randomBytes(32);
 			const replyPath = constructBlindedPath(
 				crypto.randomBytes(32),
 				[this.nodeId],
@@ -337,7 +361,8 @@ export class OfferManager extends EventEmitter {
 				resolve,
 				reject,
 				timer,
-				sentRecords
+				sentRecords,
+				replyPathId
 			});
 		});
 	}
@@ -348,7 +373,8 @@ export class OfferManager extends EventEmitter {
 	 */
 	handleInvoiceRequest(
 		requestData: Buffer,
-		replyPath?: IBlindedPath
+		replyPath?: IBlindedPath,
+		pathId?: Buffer
 	): IBolt12Invoice | null {
 		const { request, records } = decodeInvoiceRequestTlv(requestData);
 
@@ -388,6 +414,23 @@ export class OfferManager extends EventEmitter {
 		if (!matchedOffer) {
 			// Send error
 			const error: IInvoiceError = { error: 'Unknown offer' };
+			if (replyPath && this.onionMessageManager) {
+				const errData = encodeInvoiceErrorTlv(error);
+				const messageData = new Map<number, Buffer>();
+				messageData.set(TLV_INVOICE_ERROR, errData);
+				this.onionMessageManager.sendReply(replyPath, messageData);
+			}
+			this.emit('invoice:error', error);
+			return null;
+		}
+
+		// BOLT 4: when we embedded a path_id in this offer's blinded paths, the
+		// invoice_request MUST have arrived over one of them — its decrypted
+		// recipient data surfaces that path_id. A request addressed to us
+		// directly (or over a forged path) is rejected.
+		const expectedPathId = this.offers.get(matchedOfferIdHex!)?.pathId;
+		if (expectedPathId && (!pathId || !pathId.equals(expectedPathId))) {
+			const error: IInvoiceError = { error: 'Invalid path_id' };
 			if (replyPath && this.onionMessageManager) {
 				const errData = encodeInvoiceErrorTlv(error);
 				const messageData = new Map<number, Buffer>();
@@ -605,12 +648,13 @@ export class OfferManager extends EventEmitter {
 
 	private handleIncomingInvoiceRequest(
 		data: Buffer,
-		replyPath?: IBlindedPath
+		replyPath?: IBlindedPath,
+		pathId?: Buffer
 	): void {
-		this.handleInvoiceRequest(data, replyPath);
+		this.handleInvoiceRequest(data, replyPath, pathId);
 	}
 
-	private handleIncomingInvoice(data: Buffer): void {
+	private handleIncomingInvoice(data: Buffer, pathId?: Buffer): void {
 		const { invoice, records } = decodeInvoiceTlv(data);
 
 		// BOLT 12 reader checks (S-4.H3): the signature commits to the FULL
@@ -642,37 +686,12 @@ export class OfferManager extends EventEmitter {
 			return null;
 		};
 
-		// Try to match by offer description + node ID (offer-aware matching)
-		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-			const offerEntry = this.offers.get(offerIdHex);
-			if (offerEntry) {
-				// Match by description and issuer
-				const descMatch = offerEntry.offer.description === invoice.description;
-				const issuerMatch =
-					!offerEntry.offer.issuerId ||
-					invoice.nodeId.equals(offerEntry.offer.issuerId);
-				if (descMatch && issuerMatch) {
-					const reason = validateAgainstSent(pending.sentRecords);
-					if (reason) {
-						clearTimeout(pending.timer);
-						this.pendingInvoiceRequests.delete(offerIdHex);
-						pending.reject(new Error(`Rejected BOLT 12 invoice: ${reason}`));
-						this.emit('invoice:error', { error: reason });
-						return;
-					}
-					clearTimeout(pending.timer);
-					this.pendingInvoiceRequests.delete(offerIdHex);
-					pending.resolve(invoice);
-					this.emit('invoice:received', invoice);
-					return;
-				}
-			}
-		}
-
-		// Fallback: if only one pending request, resolve it (backward compat)
-		if (this.pendingInvoiceRequests.size === 1) {
-			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
-				.value!;
+		const settle = (
+			offerIdHex: string,
+			pending: NonNullable<
+				ReturnType<(typeof this.pendingInvoiceRequests)['get']>
+			>
+		): void => {
 			const reason = validateAgainstSent(pending.sentRecords);
 			clearTimeout(pending.timer);
 			this.pendingInvoiceRequests.delete(offerIdHex);
@@ -683,6 +702,58 @@ export class OfferManager extends EventEmitter {
 			}
 			pending.resolve(invoice);
 			this.emit('invoice:received', invoice);
+		};
+
+		// BOLT 4: an invoice delivered over one of OUR blinded reply paths
+		// surfaces the path_id we embedded — the strongest possible binding to
+		// the request that issued it. Match on it first; a path_id that matches
+		// no pending request means the message did not come over a path we
+		// issued for a live request, so ignore it entirely.
+		if (pathId) {
+			for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
+				if (pending.replyPathId && pending.replyPathId.equals(pathId)) {
+					settle(offerIdHex, pending);
+					return;
+				}
+			}
+			this.emit('invoice:error', {
+				error: 'invoice path_id matches no pending invoice_request'
+			});
+			return;
+		}
+
+		// No path_id: the invoice did NOT arrive over a blinded reply path we
+		// issued. A pending request that sent one (replyPathId set) must only be
+		// resolved via that path, so it is skipped here; legacy pendings created
+		// without an onion send (no reply path) keep the description/issuer match.
+		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
+			if (pending.replyPathId) continue;
+			const offerEntry = this.offers.get(offerIdHex);
+			if (offerEntry) {
+				// Match by description and issuer
+				const descMatch = offerEntry.offer.description === invoice.description;
+				const issuerMatch =
+					!offerEntry.offer.issuerId ||
+					invoice.nodeId.equals(offerEntry.offer.issuerId);
+				if (descMatch && issuerMatch) {
+					settle(offerIdHex, pending);
+					return;
+				}
+			}
+		}
+
+		// Fallback: if only one pending request (without a reply-path binding),
+		// resolve it (backward compat)
+		if (this.pendingInvoiceRequests.size === 1) {
+			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
+				.value!;
+			if (!pending.replyPathId) {
+				settle(offerIdHex, pending);
+				return;
+			}
+			this.emit('invoice:error', {
+				error: 'invoice lacks the path_id of its pending invoice_request'
+			});
 			return;
 		}
 

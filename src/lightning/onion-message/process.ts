@@ -55,7 +55,7 @@ export function processOnionMessage(
 	// BLINDED node id, so the packet must be peeled with the blinded private
 	// key derived from the path_key (this is how CLN/LND always send). Try
 	// that first, then fall back to the raw node key for beignet's own
-	// legacy unblinded flows (sendOnionMessage / sendMultiHopOnionMessage).
+	// single-hop direct sends (sendOnionMessage, which carries no blinding).
 	const candidateKeys: Buffer[] = [];
 	if (blindingPoint) {
 		try {
@@ -153,12 +153,11 @@ export function processOnionMessage(
 		throw new Error('Cannot determine next hop: no encrypted_recipient_data');
 	}
 
-	// Resolve next hop: try blinded decryption first, fall back to raw decode
+	// Resolve next hop from the DECRYPTED recipient data only.
 	const resolved = resolveNextHop(
 		hopPayload.encryptedRecipientData,
 		nodePrivkey,
-		blindingPoint,
-		nextEphemeralKey
+		blindingPoint
 	);
 	const nextNodeId = resolved.nextNodeId;
 	const nextBlindingKey = resolved.nextBlindingKey;
@@ -183,52 +182,37 @@ export function processOnionMessage(
 }
 
 /**
- * Resolve next hop from encrypted_recipient_data. Prefers blinded-path
- * decryption (BOLT 4); falls back to raw hop data only for beignet's own
- * unblinded multi-hop messages (sendMultiHopOnionMessage).
+ * Resolve next hop from encrypted_recipient_data (BOLT 4 route blinding).
+ * Forwarding REQUIRES a blinding point and decryptable recipient data: the
+ * plaintext next_node_id fallback (beignet's pre-route-blinding multi-hop
+ * form) is gone — a plaintext blob is attacker-forgeable and no spec
+ * implementation emits one.
  */
 function resolveNextHop(
 	encryptedRecipientData: Buffer,
 	nodePrivkey: Buffer,
-	blindingPoint: Buffer | undefined,
-	fallbackBlindingKey: Buffer
+	blindingPoint: Buffer | undefined
 ): { nextNodeId: Buffer; nextBlindingKey: Buffer } {
-	// Try blinded path decryption if a blinding point is available.
-	if (blindingPoint) {
-		try {
-			const blindingSharedSecret = deriveBlindingSharedSecret(
-				blindingPoint,
-				nodePrivkey
-			);
-			const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
-			const plaintext = decryptBlindedData(encKey, encryptedRecipientData);
-			const blindedHopData = decodeBlindedHopData(plaintext);
-
-			if (blindedHopData.nextNodeId) {
-				return {
-					nextNodeId: blindedHopData.nextNodeId,
-					nextBlindingKey: deriveNextBlindingKey(
-						blindingPoint,
-						blindingSharedSecret
-					)
-				};
-			}
-		} catch {
-			// Blinded decryption failed — try raw decode
-		}
+	if (!blindingPoint) {
+		throw new Error(
+			'Cannot determine next hop: onion message carries no blinding point'
+		);
 	}
+	const blindingSharedSecret = deriveBlindingSharedSecret(
+		blindingPoint,
+		nodePrivkey
+	);
+	const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
+	const plaintext = decryptBlindedData(encKey, encryptedRecipientData);
+	const blindedHopData = decodeBlindedHopData(plaintext);
 
-	// Fallback: parse raw (unencrypted) hop data. Reachable only for beignet's
-	// own unblinded multi-hop path; a spec message always carries a blinding
-	// point and decrypts above.
-	const data = decodeBlindedHopData(encryptedRecipientData);
-	if (!data.nextNodeId) {
+	if (!blindedHopData.nextNodeId) {
 		throw new Error(
 			'Cannot determine next hop: no next_node_id in encrypted_recipient_data'
 		);
 	}
 	return {
-		nextNodeId: data.nextNodeId,
-		nextBlindingKey: blindingPoint || fallbackBlindingKey
+		nextNodeId: blindedHopData.nextNodeId,
+		nextBlindingKey: deriveNextBlindingKey(blindingPoint, blindingSharedSecret)
 	};
 }

@@ -5303,7 +5303,8 @@ export class LightningNode extends EventEmitter {
 	 */
 	private buildBlindedPaymentPaths(
 		asyncHold = false,
-		numHops = 3
+		numHops = 3,
+		pathId?: Buffer
 	): IBlindedPaymentPath[] {
 		const paths: IBlindedPaymentPath[] = [];
 		const ourNodeId = getPublicKey(this.nodePrivkey);
@@ -5373,9 +5374,13 @@ export class LightningNode extends EventEmitter {
 				...(asyncHold ? { holdHtlc: true } : {})
 			};
 			// Final hop (us): recipient, no onward forwarding. Our own minimum is
-			// 0; do not inherit the peer's htlc_minimum constraint here.
+			// 0; do not inherit the peer's htlc_minimum constraint here. The
+			// optional path_id binds messages arriving over this path back to
+			// whatever published it (e.g. a BOLT 12 offer), for receiver-side
+			// verification.
 			const finalHop: IBlindedHopData = {
-				paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n }
+				paymentConstraints: { maxCltvExpiry, htlcMinimumMsat: 0n },
+				...(pathId ? { pathId } : {})
 			};
 
 			let nodeIds = [peerPubkey, ourNodeId];
@@ -9203,9 +9208,15 @@ export class LightningNode extends EventEmitter {
 	} {
 		const { asyncHold, ...createOpts } = options;
 		if (asyncHold && !createOpts.paths) {
-			const paths = this.buildBlindedPaymentPaths(true).map((p) => p.path);
+			// One path_id shared by every path of this offer: invoice_requests
+			// must arrive over one of them (verified in handleInvoiceRequest).
+			const pathId = crypto.randomBytes(32);
+			const paths = this.buildBlindedPaymentPaths(true, 3, pathId).map(
+				(p) => p.path
+			);
 			if (paths.length > 0) {
 				createOpts.paths = paths;
+				createOpts.pathId = pathId;
 			}
 		}
 		return this.offerManager.createOffer(createOpts);
