@@ -392,6 +392,14 @@ export class Channel {
 	// connection). While set, the peer's tx_abort is an ack — not an error — and
 	// a remote `error` for this channel is part of the abort dance, not a
 	// channel failure.
+	/**
+	 * BOLT 7 chain scope for the channel_announcement / channel_update this
+	 * channel builds AND signs (buildAnnouncementData is both the signing
+	 * digest and the emitted message). Set by the ChannelManager from its
+	 * configured chain; the previous hardcoded mainnet made every non-mainnet
+	 * announcement invalid for the actual chain (S-7.M1).
+	 */
+	announcementChainHash: Buffer = BITCOIN_CHAIN_HASH;
 	private _spliceAbortPending = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
@@ -7530,7 +7538,7 @@ export class Channel {
 		const flen = Buffer.alloc(2);
 		const parts = [
 			flen,
-			BITCOIN_CHAIN_HASH,
+			this.announcementChainHash,
 			this._state.shortChannelId!,
 			nodeId1,
 			nodeId2,
@@ -7574,7 +7582,7 @@ export class Channel {
 				? this._state.remoteAnnouncementBitcoinSig
 				: localBitcoinSig,
 			features: Buffer.alloc(0),
-			chainHash: BITCOIN_CHAIN_HASH,
+			chainHash: this.announcementChainHash,
 			shortChannelId: this._state.shortChannelId!,
 			nodeId1: isNode1 ? localNodeId : remoteNodeId,
 			nodeId2: isNode1 ? remoteNodeId : localNodeId,
@@ -7594,7 +7602,7 @@ export class Channel {
 
 		const channelUpdate = encodeChannelUpdateMessage({
 			signature: Buffer.alloc(64), // placeholder — caller should sign
-			chainHash: BITCOIN_CHAIN_HASH,
+			chainHash: this.announcementChainHash,
 			shortChannelId: this._state.shortChannelId!,
 			timestamp: Math.floor(Date.now() / 1000),
 			messageFlags: 0x01,

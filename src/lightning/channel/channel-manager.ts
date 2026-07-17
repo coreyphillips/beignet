@@ -481,6 +481,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
@@ -527,6 +530,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
@@ -1109,6 +1115,9 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		keyIndex?: number | null
 	): void {
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		const channelId = channel.getChannelId();
 		if (channelId) {
 			// Wire signer — use per-channel keys when available
@@ -1783,6 +1792,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.temporaryChannelId.toString('hex');
@@ -3337,6 +3349,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 
 		// The channel signs with chKeys, so it MUST advertise chKeys on the wire —
@@ -3434,6 +3449,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.channelId.toString('hex');

@@ -20,7 +20,7 @@ import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -150,7 +150,7 @@ function addGraphChannel(
 		bitcoinSignature1: Buffer.alloc(64),
 		bitcoinSignature2: Buffer.alloc(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		nodeId1: aIs1 ? pubA : pubB,
 		nodeId2: aIs1 ? pubB : pubA,
@@ -160,7 +160,7 @@ function addGraphChannel(
 	for (const dir of [0, 1]) {
 		node.getGraph().applyChannelUpdate({
 			signature: Buffer.alloc(64),
-			chainHash: BITCOIN_CHAIN_HASH,
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId: scid,
 			timestamp: Math.floor(Date.now() / 1000),
 			messageFlags: 1,
