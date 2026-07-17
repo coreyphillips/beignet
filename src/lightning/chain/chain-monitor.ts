@@ -1425,7 +1425,8 @@ export class ChainMonitor {
 						feeRatePerVbyte,
 						this._revocationBasepointSecret,
 						this._paymentPrivkey,
-						this._network
+						this._network,
+						this._currentBlockHeight
 					);
 					break;
 				}
@@ -1482,18 +1483,27 @@ export class ChainMonitor {
 			this._feeRatePerVbyte,
 			this._revocationBasepointSecret,
 			this._paymentPrivkey,
-			this._network
+			this._network,
+			// Lets the resolver split a near-cltv-deadline HTLC input into its
+			// own penalty tx (independent broadcast + fee-bump fate).
+			this._currentBlockHeight
 		);
 
+		// A batched penalty produces one resolved entry PER INPUT sharing the
+		// same tx; broadcast each distinct tx once (the deadline split can also
+		// yield several distinct txs here).
+		const broadcastTxids = new Set<string>();
 		for (const r of resolved) {
 			if (r.spendTx) {
-				// Penalty tx already has witnesses set
 				const txBuf = r.spendTx.toBuffer();
-				actions.push({
-					type: ChainActionType.BROADCAST_TX,
-					tx: txBuf,
-					description: 'penalty sweep (revoked commitment)'
-				});
+				if (!broadcastTxids.has(r.spendTx.getId())) {
+					broadcastTxids.add(r.spendTx.getId());
+					actions.push({
+						type: ChainActionType.BROADCAST_TX,
+						tx: txBuf,
+						description: 'penalty sweep (revoked commitment)'
+					});
+				}
 				r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
 				r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 				r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
