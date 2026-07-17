@@ -161,8 +161,9 @@ export interface IChannelConfig {
 /** BOLT 2: Maximum allowed number of pending HTLCs per direction */
 export const MAX_ACCEPTED_HTLCS = 483;
 
-/** BOLT 2: Maximum channel funding size (2^24 satoshis without wumbo) */
-export const MAX_FUNDING_SATOSHIS = 16777216n;
+/** BOLT 2: maximum channel funding without wumbo. The spec bound is
+ *  funding_satoshis < 2^24, so the largest VALID value is 2^24 - 1. */
+export const MAX_FUNDING_SATOSHIS = 16777215n;
 
 /** Funding ceiling when option_wumbo (large_channels, bit 18) is negotiated:
  *  10 BTC. Wumbo lifts the 2^24 cap, but an unbounded channel is a fat-finger

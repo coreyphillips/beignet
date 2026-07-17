@@ -23,6 +23,7 @@ import {
 } from '../onion/blinded-path';
 import { ChannelManager } from '../channel/channel-manager';
 import { Channel } from '../channel/channel';
+import { isValidShutdownScript } from '../channel/validation';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats
@@ -4202,6 +4203,18 @@ export class LightningNode extends EventEmitter {
 		) {
 			throw new Error(
 				'destinationScript must be a non-empty Buffer when provided'
+			);
+		}
+		// A splice-out output pays channel funds to this script inside the
+		// splice transaction, so restrict it to the standard address forms
+		// (P2PKH/P2SH/P2WPKH/P2WSH/any witness program). A raw caller passing
+		// OP_RETURN or a malformed script would irrecoverably burn the funds.
+		if (
+			destinationScript !== undefined &&
+			!isValidShutdownScript(destinationScript, true)
+		) {
+			throw new Error(
+				'destinationScript is not a standard output script (would burn the withdrawn funds)'
 			);
 		}
 

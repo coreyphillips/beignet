@@ -2166,6 +2166,17 @@ describe('Splice', function () {
 			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
 			expect(acceptor.getSpliceSession()).to.be.null;
 			expect(acceptor.isQuiescent()).to.be.false;
+			// BOLT 2: the tx_abort must be echoed back as the ack (we had an
+			// active splice session and had not sent tx_abort ourselves).
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType: MessageType }).messageType ===
+							MessageType.TX_ABORT
+				),
+				'tx_abort echoed'
+			).to.be.true;
 		});
 
 		it('should reject splice_ack when not SPLICING', function () {
