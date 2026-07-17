@@ -39,7 +39,12 @@ function makeBlindedPaymentPath(numHops: number): IBlindedPaymentPath {
 	}
 	return {
 		path: {
-			introductionNodeId: crypto.randomBytes(33),
+			// A valid sciddir_or_pubkey point form (leading 0x02): the codec now
+			// validates the discriminator byte (S-4.H4).
+			introductionNodeId: Buffer.concat([
+				Buffer.from([0x02]),
+				crypto.randomBytes(32)
+			]),
 			blindingPoint: crypto.randomBytes(33),
 			blindedHops
 		},
@@ -119,13 +124,14 @@ describe('BOLT 11 blinded paths (M1.1)', function () {
 		const entry = makeBlindedPaymentPath(2);
 
 		// The combined BOLT 11 blob begins with num(1) then the same path bytes
-		// the BOLT 12 array serializer produces for that single path.
+		// the BOLT 12 array serializer produces for that single path. The
+		// BOLT 12 array itself carries NO count prefix (S-4.H4: [...*blinded_path]
+		// fills the TLV length).
 		const combined = encodeInvoiceBlindedPaymentPaths([entry]);
 		const pathsOnly = encodeBlindedPaths([entry.path]);
-		// combined: [num=1][path][payinfo28]; pathsOnly: [num=1][path]
+		// combined: [num=1][path][payinfo(28, no features)]; pathsOnly: [path]
 		const combinedPathBytes = combined.subarray(1, combined.length - 28);
-		const offerPathBytes = pathsOnly.subarray(1);
-		expect(combinedPathBytes).to.deep.equal(offerPathBytes);
+		expect(combinedPathBytes).to.deep.equal(pathsOnly);
 
 		// And the path decodes identically through either decoder.
 		expect(decodeBlindedPaths(pathsOnly)[0].introductionNodeId).to.deep.equal(
