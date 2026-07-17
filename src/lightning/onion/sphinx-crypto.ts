@@ -41,25 +41,30 @@ export function computeBlindingFactor(
 }
 
 /**
+ * BOLT 4: generate_key(key_type, secret) = HMAC-SHA256(key=key_type, msg=secret).
+ * Used both for per-hop keys (secret = shared secret) and for the routing_info
+ * pad stream (secret = the SESSION private key, so no hop can regenerate it).
+ */
+export function generateKey(keyType: string, secret: Buffer): Buffer {
+	return Buffer.from(
+		crypto
+			.createHmac('sha256', Buffer.from(keyType, 'ascii'))
+			.update(secret)
+			.digest()
+	);
+}
+
+/**
  * Derive per-hop keys from a shared secret.
  * Each key = HMAC-SHA256(sharedSecret, keyType) where keyType is ASCII.
  */
 export function deriveHopKeys(sharedSecret: Buffer): IHopKeys {
-	const derive = (keyType: string): Buffer => {
-		// BOLT 4: generate_key(key_type, ss) = HMAC-SHA256(key=key_type, msg=ss)
-		return Buffer.from(
-			crypto
-				.createHmac('sha256', Buffer.from(keyType, 'ascii'))
-				.update(sharedSecret)
-				.digest()
-		);
-	};
 	return {
-		rho: derive('rho'),
-		mu: derive('mu'),
-		pad: derive('pad'),
-		um: derive('um'),
-		ammag: derive('ammag')
+		rho: generateKey('rho', sharedSecret),
+		mu: generateKey('mu', sharedSecret),
+		pad: generateKey('pad', sharedSecret),
+		um: generateKey('um', sharedSecret),
+		ammag: generateKey('ammag', sharedSecret)
 	};
 }
 
