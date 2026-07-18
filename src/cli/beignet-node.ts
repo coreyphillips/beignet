@@ -4147,20 +4147,38 @@ export class BeignetNode extends EventEmitter {
 		const electrumConnected =
 			this.wallet?.electrum?.connectedToElectrum ?? false;
 		const channels = this.node.listChannels();
-		const readyChannels = channels.filter((ch) => ch.state === 'NORMAL');
+		const readyChannels = channels.filter(
+			(ch) => ch.state === ChannelState.NORMAL
+		);
 		const peerCount = this.node.listPeers().length;
 		const graph = this.node.getGraph();
+
+		// Only channels that were fully established and should be operational
+		// right now get a vote on "degraded". A channel mid-open, mid-splice or
+		// in a cooperative shutdown is a deliberate operation in progress, not a
+		// fault: a wallet whose only channel is waiting on funding confirmations
+		// is doing exactly what it was asked to. AWAITING_REESTABLISH and
+		// ERRORED are the states that mean an established channel is broken.
+		const operating = channels.filter(
+			(ch) =>
+				ch.state === ChannelState.NORMAL || ch.state === ChannelState.SPLICING
+		);
+		const broken = channels.filter(
+			(ch) =>
+				ch.state === ChannelState.AWAITING_REESTABLISH ||
+				ch.state === ChannelState.ERRORED
+		);
 
 		let status: HealthInfo['status'] = 'ready';
 		if (!electrumConnected) {
 			status = 'degraded';
 		} else if (blockHeight === 0) {
 			status = 'syncing';
-		} else if (channels.length > 0 && readyChannels.length === 0) {
-			// Has channels but none operational
+		} else if (broken.length > 0 && operating.length === 0) {
+			// Every established channel is broken
 			status = 'degraded';
-		} else if (peerCount === 0 && channels.length > 0) {
-			// Has channels but no peers connected
+		} else if (peerCount === 0 && operating.length > 0) {
+			// Has operational channels but no peers connected to use them with
 			status = 'degraded';
 		}
 
