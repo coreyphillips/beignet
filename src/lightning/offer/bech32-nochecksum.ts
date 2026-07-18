@@ -56,11 +56,17 @@ export function encodeNoChecksum(hrp: string, data: Buffer): string {
 }
 
 /**
- * Decode a checksum-less BOLT 12 string. Accepts `+`-joined parts (with
- * optional whitespace around the `+`) and uppercase-or-lowercase (not mixed).
+ * Decode a checksum-less BOLT 12 string. Accepts `+`-joined parts (a `+`
+ * immediately after a bech32 character, followed by optional whitespace and
+ * another bech32 character) and uppercase-or-lowercase (not mixed).
  */
 export function decodeNoChecksum(str: string): { hrp: string; data: Buffer } {
-	// BOLT 12: strings may be split with `+` between parts.
+	// BOLT 12: `+` MUST be surrounded by bech32 characters (whitespace is only
+	// allowed AFTER the `+`). Stripping unconditionally accepted leading,
+	// trailing, doubled, and whitespace-preceded joins the spec rejects.
+	if (/(^|[^0-9a-zA-Z])\+/.test(str) || /\+(?!\s*[0-9a-zA-Z])/.test(str)) {
+		throw new Error('BOLT 12 string has a misplaced + join');
+	}
 	const joined = str.replace(/\+\s*/g, '').trim();
 	const hasUpper = /[A-Z]/.test(joined);
 	const hasLower = /[a-z]/.test(joined);
@@ -80,6 +86,15 @@ export function decodeNoChecksum(str: string): { hrp: string; data: Buffer } {
 			throw new Error(`BOLT 12 string has invalid character '${ch}'`);
 		}
 		words.push(w);
+	}
+	// Final padding must be less than a full word (else a whole character
+	// carries no data) and its bits must be zero.
+	const padBits = (words.length * 5) % 8;
+	if (padBits >= 5) {
+		throw new Error('BOLT 12 string padding exceeds 4-bit limit');
+	}
+	if (padBits > 0 && (words[words.length - 1] & ((1 << padBits) - 1)) !== 0) {
+		throw new Error('BOLT 12 string has non-zero padding bits');
 	}
 	return { hrp, data: fromWords(words) };
 }

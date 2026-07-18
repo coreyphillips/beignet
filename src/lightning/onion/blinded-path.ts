@@ -20,7 +20,7 @@ import {
 	deriveBlindingSharedSecret,
 	deriveNextBlindingKey
 } from './blinding';
-import { privateMultiply } from '../crypto/ecdh';
+import { privateMultiply, isValidPublicKey } from '../crypto/ecdh';
 import { encodeTlvStream, decodeTlvStream } from '../message/tlv';
 
 export interface IBlindedHop {
@@ -362,16 +362,31 @@ export function decodeBlindedPath(
 	const introductionNodeId = Buffer.from(
 		buf.subarray(offset, offset + firstLen)
 	);
+	// BOLT 12: a reader MUST reject invalid points; a 33-byte first_node_id is
+	// a pubkey (the 9-byte form is scid+direction, no point to validate).
+	if (firstLen === 33 && !isValidPublicKey(introductionNodeId)) {
+		throw new Error('blinded_path first_node_id is not a valid point');
+	}
 	offset += firstLen;
 	const blindingPoint = Buffer.from(buf.subarray(offset, offset + 33));
+	if (!isValidPublicKey(blindingPoint)) {
+		throw new Error('blinded_path path_key is not a valid point');
+	}
 	offset += 33;
 	const numHops = buf[offset++];
+	// A path with no hops routes nowhere; BOLT 12 rejects it outright.
+	if (numHops === 0) {
+		throw new Error('blinded_path has zero hops');
+	}
 	const blindedHops: IBlindedHop[] = [];
 	for (let j = 0; j < numHops; j++) {
 		if (offset + 33 + 2 > buf.length) {
 			throw new Error('blinded_path truncated at hop');
 		}
 		const blindedNodeId = Buffer.from(buf.subarray(offset, offset + 33));
+		if (!isValidPublicKey(blindedNodeId)) {
+			throw new Error('blinded_path blinded_node_id is not a valid point');
+		}
 		offset += 33;
 		const encLen = buf.readUInt16BE(offset);
 		offset += 2;
