@@ -1,0 +1,78 @@
+{
+	"_source": "BOLT 1, Appendix B: Type-Length-Value Test Vectors (lightning/bolts @ 94eb038). The appendix's numbered bullet pairs are reshaped into records; stream hex has whitespace stripped, reasons/explanations kept verbatim, decimal values quoted as strings so JSON.parse cannot lose uint64 precision. No values altered.",
+	"namespaces": {
+		"n1": ["1", "2", "3", "254"],
+		"n2": ["0", "11"]
+	},
+	"invalid_any_namespace": [
+		{ "stream": "fd", "reason": "type truncated" },
+		{ "stream": "fd01", "reason": "type truncated" },
+		{ "stream": "fd000100", "reason": "not minimally encoded type" },
+		{ "stream": "fd0101", "reason": "missing length" },
+		{ "stream": "0ffd", "reason": "(length truncated)" },
+		{ "stream": "0ffd26", "reason": "(length truncated)" },
+		{ "stream": "0ffd2602", "reason": "missing value" },
+		{ "stream": "0ffd000100", "reason": "not minimally encoded length" },
+		{ "stream": "0ffd0201000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000", "reason": "value truncated" }
+	],
+	"invalid_either_namespace": [
+		{ "stream": "1200", "reason": "unknown even type." },
+		{ "stream": "fd010200", "reason": "unknown even type." },
+		{ "stream": "fe0100000200", "reason": "unknown even type." },
+		{ "stream": "ff010000000000000200", "reason": "unknown even type." }
+	],
+	"invalid_n1": [
+		{ "stream": "0109ffffffffffffffffff", "reason": "greater than encoding length for n1s tlv1." },
+		{ "stream": "010100", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "01020001", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "0103000100", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "010400010000", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "01050001000000", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "0106000100000000", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "010700010000000000", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "01080001000000000000", "reason": "encoding for n1s tlv1s amount_msat is not minimal" },
+		{ "stream": "020701010101010101", "reason": "less than encoding length for n1s tlv2." },
+		{ "stream": "0209010101010101010101", "reason": "greater than encoding length for n1s tlv2." },
+		{ "stream": "0321023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb", "reason": "less than encoding length for n1s tlv3." },
+		{ "stream": "0329023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb0000000000000001", "reason": "less than encoding length for n1s tlv3." },
+		{ "stream": "0330023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb000000000000000100000000000001", "reason": "less than encoding length for n1s tlv3." },
+		{ "stream": "0331043da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb00000000000000010000000000000002", "reason": "n1s node_id is not a valid point." },
+		{ "stream": "0332023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb0000000000000001000000000000000001", "reason": "greater than encoding length for n1s tlv3." },
+		{ "stream": "fd00fe00", "reason": "less than encoding length for n1s tlv4." },
+		{ "stream": "fd00fe0101", "reason": "less than encoding length for n1s tlv4." },
+		{ "stream": "fd00fe03010101", "reason": "greater than encoding length for n1s tlv4." },
+		{ "stream": "0000", "reason": "unknown even field for n1s namespace." }
+	],
+	"valid_ignored": [
+		{ "stream": "", "explanation": "empty message" },
+		{ "stream": "2100", "explanation": "Unknown odd type." },
+		{ "stream": "fd020100", "explanation": "Unknown odd type." },
+		{ "stream": "fd00fd00", "explanation": "Unknown odd type." },
+		{ "stream": "fd00ff00", "explanation": "Unknown odd type." },
+		{ "stream": "fe0200000100", "explanation": "Unknown odd type." },
+		{ "stream": "ff020000000000000100", "explanation": "Unknown odd type." }
+	],
+	"valid_n1": [
+		{ "stream": "0100", "values": { "tlv1": { "amount_msat": "0" } } },
+		{ "stream": "010101", "values": { "tlv1": { "amount_msat": "1" } } },
+		{ "stream": "01020100", "values": { "tlv1": { "amount_msat": "256" } } },
+		{ "stream": "0103010000", "values": { "tlv1": { "amount_msat": "65536" } } },
+		{ "stream": "010401000000", "values": { "tlv1": { "amount_msat": "16777216" } } },
+		{ "stream": "01050100000000", "values": { "tlv1": { "amount_msat": "4294967296" } } },
+		{ "stream": "0106010000000000", "values": { "tlv1": { "amount_msat": "1099511627776" } } },
+		{ "stream": "010701000000000000", "values": { "tlv1": { "amount_msat": "281474976710656" } } },
+		{ "stream": "01080100000000000000", "values": { "tlv1": { "amount_msat": "72057594037927936" } } },
+		{ "stream": "02080000000000000226", "values": { "tlv2": { "scid": "0x0x550" } } },
+		{ "stream": "0331023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb00000000000000010000000000000002", "values": { "tlv3": { "node_id": "023da092f6980e58d2c037173180e9a465476026ee50f96695963e8efe436f54eb", "amount_msat_1": "1", "amount_msat_2": "2" } } },
+		{ "stream": "fd00fe020226", "values": { "tlv4": { "cltv_delta": 550 } } }
+	],
+	"invalid_ordering_n1": [
+		{ "stream": "0208000000000000022601012a", "reason": "valid TLV records but invalid ordering" },
+		{ "stream": "0208000000000000023102080000000000000451", "reason": "duplicate TLV type" },
+		{ "stream": "1f000f012a", "reason": "valid (ignored) TLV records but invalid ordering" },
+		{ "stream": "1f001f012a", "reason": "duplicate TLV type (ignored)" }
+	],
+	"invalid_ordering_n2": [
+		{ "stream": "ffffffffffffffffff000000", "reason": "valid TLV records but invalid ordering" }
+	]
+}
