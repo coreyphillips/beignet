@@ -95,7 +95,8 @@ import {
 	createFailureMessage,
 	wrapFailureMessage,
 	decryptFailureMessage,
-	extractChannelUpdate
+	extractChannelUpdate,
+	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
 import {
 	IHopPayload,
@@ -6749,7 +6750,7 @@ export class LightningNode extends EventEmitter {
 		const fail = (code: number): Buffer =>
 			sharedSecret
 				? createFailureMessage(sharedSecret, code)
-				: Buffer.alloc(290);
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 
 		if (incomingCltvExpiry !== undefined) {
 			// final_incorrect_cltv_expiry: the HTLC cltv_expiry MUST be >= the onion's
@@ -6843,7 +6844,7 @@ export class LightningNode extends EventEmitter {
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 					  )
-					: Buffer.alloc(290);
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
@@ -6858,7 +6859,7 @@ export class LightningNode extends EventEmitter {
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 					  )
-					: Buffer.alloc(290);
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
@@ -6903,7 +6904,7 @@ export class LightningNode extends EventEmitter {
 						sharedSecret,
 						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 				  )
-				: Buffer.alloc(290);
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(htlcSecretKey);
 			this.channelManager.failHtlc(channelId, htlcId, reason);
 			return;
@@ -6929,7 +6930,7 @@ export class LightningNode extends EventEmitter {
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 					  )
-					: Buffer.alloc(290);
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
@@ -6970,7 +6971,7 @@ export class LightningNode extends EventEmitter {
 							sharedSecret,
 							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 					  )
-					: Buffer.alloc(290);
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
 				this.channelManager.failHtlc(channelId, htlcId, reason);
 				return;
@@ -7137,7 +7138,7 @@ export class LightningNode extends EventEmitter {
 			const ss = this.receivedHtlcSharedSecrets.get(key);
 			const reason = ss
 				? createFailureMessage(ss, failureCode)
-				: Buffer.alloc(290);
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(key);
 			this.channelManager.failHtlc(h.channelId, h.htlcId, reason);
 		}
@@ -7407,7 +7408,7 @@ export class LightningNode extends EventEmitter {
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
 				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
-				: Buffer.alloc(290);
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(secretKey);
 			this.channelManager.failHtlc(channelId, htlcId, reason);
 			return;
@@ -7476,7 +7477,7 @@ export class LightningNode extends EventEmitter {
 							this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 						const reason = sharedSecret
 							? createFailureMessage(sharedSecret, MPP_TIMEOUT)
-							: Buffer.alloc(290);
+							: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 						this.cleanupHtlcSharedSecret(htlcSecretKey);
 						this.channelManager.failHtlc(part.channelId, part.htlcId, reason);
 					}
@@ -7883,7 +7884,7 @@ export class LightningNode extends EventEmitter {
 				const sharedSecret = this.receivedHtlcSharedSecrets.get(inSecretKey);
 				const reason = sharedSecret
 					? createFailureMessage(sharedSecret, PERMANENT_CHANNEL_FAILURE)
-					: Buffer.alloc(290);
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(inSecretKey);
 				this.channelManager.failHtlc(
 					forward.inChannelId,
@@ -8835,7 +8836,7 @@ export class LightningNode extends EventEmitter {
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = htlcSharedSecret
 						? createFailureMessage(htlcSharedSecret, EXPIRY_TOO_SOON)
-						: Buffer.alloc(290);
+						: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
 				}
@@ -8911,7 +8912,7 @@ export class LightningNode extends EventEmitter {
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = sharedSecret
 						? createFailureMessage(sharedSecret, EXPIRY_TOO_SOON)
-						: Buffer.alloc(290);
+						: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
 					this.forwardedHtlcs.delete(outKey);
