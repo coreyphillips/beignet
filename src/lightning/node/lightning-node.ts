@@ -551,6 +551,12 @@ export class LightningNode extends EventEmitter {
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
+		// option_will_fund: advertised only when a seller policy is configured —
+		// a CLN buyer refuses to even request funds (fundchannel request_amt)
+		// from a peer that does not advertise the bit.
+		if (config.leaseRates) {
+			localFeatures.setOptional(Feature.OPTION_WILL_FUND);
+		}
 		// Peer storage (option_provide_storage): on by default. When disabled,
 		// the bit must not be advertised: advertising it obliges us to store
 		// and return blobs (BOLT 1).
@@ -583,7 +589,10 @@ export class LightningNode extends EventEmitter {
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
 			signerFactory: config.signerFactory,
-			largeChannels: this.largeChannels
+			largeChannels: this.largeChannels,
+			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
+			// request_funds and fund the contribution via the fundingProvider.
+			leaseRates: config.leaseRates
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).

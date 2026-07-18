@@ -428,6 +428,26 @@ export class Channel {
 		inputs: ISpliceWalletInput[];
 		changeScript: Buffer;
 	} | null = null;
+	// Dual-funding ACCEPTOR contribution (v2 open, e.g. a bLIP-0051 lease we
+	// sell): wallet inputs funding our fundingSatoshis share, the change
+	// script, and the contribution amount. Same wallet-closure model as
+	// _spliceInInputs — the wallet signs its own inputs.
+	private _dualFundingContribution: {
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+		contributionSats: bigint;
+		feeratePerKw: number;
+	} | null = null;
+	// The ordered interactive-tx contributions derived from the above, sent
+	// one per turn (interactive-tx alternation) by _driveDualFunding.
+	private _dualFundingContribs: Array<
+		| { kind: 'input'; input: IInteractiveTxInput }
+		| { kind: 'output'; output: IInteractiveTxOutput }
+	> | null = null;
+	private _dualFundingContribIndex = 0;
+	// Set once our v2 tx_signatures witnesses have been provided to the
+	// session, so later flushes never re-provide.
+	private _v2TxSigsReleased = false;
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -8622,7 +8642,9 @@ export class Channel {
 			];
 		}
 
-		return [];
+		// Our turn: contribute our own inputs/change when we accepted with a
+		// contribution (lease selling); no-op otherwise.
+		return this._driveDualFunding();
 	}
 
 	/**
@@ -8716,7 +8738,8 @@ export class Channel {
 			];
 		}
 
-		return [];
+		// Our turn (see handleTxAddInput).
+		return this._driveDualFunding();
 	}
 
 	/**
@@ -8857,6 +8880,162 @@ export class Channel {
 	/**
 	 * Signal tx_complete during interactive TX construction.
 	 */
+	/**
+	 * Register the wallet inputs funding OUR side of a v2 open we ACCEPT (the
+	 * lessor's contribution on a bLIP-0051 lease). The interactive-tx drive
+	 * then contributes them automatically on our turns, and tx_signatures
+	 * signs them via each input's wallet closure.
+	 */
+	setDualFundingContribution(
+		inputs: ISpliceWalletInput[],
+		changeScript: Buffer,
+		contributionSats: bigint,
+		feeratePerKw: number
+	): void {
+		this._dualFundingContribution = {
+			inputs,
+			changeScript,
+			contributionSats,
+			feeratePerKw
+		};
+		this._dualFundingContribs = null;
+		this._dualFundingContribIndex = 0;
+	}
+
+	/**
+	 * Derive the ordered interactive-tx contributions for our acceptor share:
+	 * each wallet input, then a change output (walletTotal - contribution -
+	 * our interactive-tx fee share). BOLT 2: each side pays the feerate over
+	 * the weight of what IT adds — for us that is the P2WPKH inputs and the
+	 * change output (the opener pays for the shared funding output).
+	 */
+	private _computeDualFundingContributions(): string | null {
+		const session = this._state.dualFundingSession;
+		const c = this._dualFundingContribution;
+		if (!session || !c) return 'No dual-funding contribution registered';
+
+		// P2WPKH input ≈ 272 WU (outpoint+scriptlen+sequence 164 + witness
+		// ~108); P2WPKH output = 124 WU. Reserve a small cushion above that —
+		// the peer's interactive-tx balance check (CLN) estimates our witness
+		// weight before seeing it, and under-reserving fails the negotiation
+		// while a few extra sats simply shrink the change.
+		const weight = 320 * c.inputs.length + 140;
+		const feeSats = spliceFeeSats(weight, c.feeratePerKw);
+
+		let walletTotal = 0n;
+		this._dualFundingContribs = [];
+		this._dualFundingContribIndex = 0;
+		for (const w of c.inputs) {
+			walletTotal += w.value;
+			this._dualFundingContribs.push({
+				kind: 'input',
+				input: {
+					serialId: session.nextSerialId(),
+					prevTxid: extractTxidFromPrevTx(w.prevTx),
+					prevOutputIndex: w.prevOutputIndex,
+					sequence: w.sequence,
+					prevTx: w.prevTx,
+					prevTxVout: w.prevOutputIndex
+				}
+			});
+		}
+
+		const changeSats = walletTotal - c.contributionSats - feeSats;
+		if (changeSats < 0n) {
+			return `Dual-funding contribution underfunded: inputs ${walletTotal} < contribution ${c.contributionSats} + fee ${feeSats}`;
+		}
+		// A sub-dust change simply becomes extra fee (mirrors splice-in).
+		if (changeSats > P2WPKH_DUST_LIMIT) {
+			this._dualFundingContribs.push({
+				kind: 'output',
+				output: {
+					serialId: session.nextSerialId(),
+					amountSats: changeSats,
+					scriptPubkey: c.changeScript
+				}
+			});
+		}
+		return null;
+	}
+
+	/**
+	 * Acceptor-side interactive-tx drive for a v2 open with a contribution:
+	 * on each of our turns send the next wallet input / change output, then
+	 * tx_complete (re-sent whenever the peer keeps adding, exactly like the
+	 * splice acceptor drive). Without a registered contribution this is a
+	 * no-op and the legacy caller-driven flow applies.
+	 */
+	private _driveDualFunding(): ChannelAction[] {
+		const session = this._state.dualFundingSession;
+		if (
+			!session ||
+			session.isInitiator() ||
+			!this._dualFundingContribution ||
+			session.getState() !== DualFundingState.TX_NEGOTIATION
+		) {
+			return [];
+		}
+
+		if (!this._dualFundingContribs) {
+			const err = this._computeDualFundingContributions();
+			if (err) return [{ type: ChannelActionType.ERROR, message: err }];
+		}
+
+		if (this._dualFundingContribIndex < this._dualFundingContribs!.length) {
+			const c = this._dualFundingContribs![this._dualFundingContribIndex++];
+			if (c.kind === 'input') {
+				const result = session.addInput(c.input);
+				if (!result.ok) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: result.error || 'Failed to add contribution input'
+						}
+					];
+				}
+				const msg: ITxAddInputMessage = {
+					channelId: this._v2ChannelId(),
+					serialId: c.input.serialId,
+					prevTx: c.input.prevTx || Buffer.alloc(0),
+					prevTxVout: c.input.prevOutputIndex,
+					sequence: c.input.sequence
+				};
+				return [
+					sendMsg(MessageType.TX_ADD_INPUT, encodeTxAddInputMessage(msg))
+				];
+			}
+			const result = session.addOutput(c.output);
+			if (!result.ok) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: result.error || 'Failed to add contribution output'
+					}
+				];
+			}
+			const outMsg: ITxAddOutputMessage = {
+				channelId: this._v2ChannelId(),
+				serialId: c.output.serialId,
+				amountSats: c.output.amountSats,
+				scriptPubkey: c.output.scriptPubkey
+			};
+			return [
+				sendMsg(MessageType.TX_ADD_OUTPUT, encodeTxAddOutputMessage(outMsg))
+			];
+		}
+
+		// Contributions exhausted: (re)send tx_complete whenever the builder is
+		// back in a state where our completion is outstanding.
+		const builderState = session.getTxBuilder()?.getState();
+		if (
+			builderState === InteractiveTxState.COLLECTING ||
+			builderState === InteractiveTxState.RECEIVED_COMPLETE
+		) {
+			return this.sendTxComplete();
+		}
+		return [];
+	}
+
 	sendTxComplete(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
@@ -8960,7 +9139,10 @@ export class Channel {
 			return this._maybeSendV2Commitment();
 		}
 
-		return [];
+		// Peer completed but we have not: contribute our remaining
+		// inputs/change (or answer with our tx_complete) when a contribution
+		// is registered; legacy caller-driven flow otherwise.
+		return this._driveDualFunding();
 	}
 
 	/**
@@ -9098,7 +9280,10 @@ export class Channel {
 		});
 	}
 
-	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+	private _v2NegotiatedTx(): {
+		tx: import('bitcoinjs-lib').Transaction;
+		outputIndex: number;
+	} | null {
 		const session = this._state.dualFundingSession;
 		if (!session || !this._state.remoteBasepoints) return null;
 		const built = session.buildTransaction();
@@ -9141,7 +9326,16 @@ export class Channel {
 		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
 			return null;
 		}
-		return { txid: Buffer.from(tx.getHash()), outputIndex };
+		return { tx, outputIndex };
+	}
+
+	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+		const built = this._v2NegotiatedTx();
+		if (!built) return null;
+		return {
+			txid: Buffer.from(built.tx.getHash()),
+			outputIndex: built.outputIndex
+		};
 	}
 
 	/**
@@ -9308,8 +9502,38 @@ export class Channel {
 			return [];
 		}
 		if (!this._v2SentCommitment || !this._v2ReceivedCommitment) return [];
+		// Witnesses go out exactly once; later flushes (e.g. the peer's own
+		// tx_signatures arriving after ours) must not re-provide.
+		if (this._v2TxSigsReleased) return [];
 		const peerSigned = session.getRemoteWitnesses() !== null;
 		if (!peerSigned && !this._v2ShouldSignFirst()) return [];
+
+		if (!this._v2PendingTxSigs && this._dualFundingContribution) {
+			// We contributed wallet inputs (acceptor lease share): sign each via
+			// its wallet closure over the negotiated tx, exactly like splice-in
+			// (buildAndSignSpliceTx), and release them as our tx_signatures.
+			const built = this._v2NegotiatedTx();
+			if (!built) return [];
+			const witnesses: Buffer[][] = [];
+			for (let i = 0; i < built.tx.ins.length; i++) {
+				const prevTxid = Buffer.from(built.tx.ins[i].hash);
+				const vout = built.tx.ins[i].index;
+				const w = this._dualFundingContribution.inputs.find(
+					(wi) =>
+						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+						wi.prevOutputIndex === vout
+				);
+				if (!w) continue;
+				const witness = w.signWitness(built.tx, i, w.value);
+				built.tx.setWitness(i, witness);
+				witnesses.push(witness);
+			}
+			this._v2PendingTxSigs = {
+				txid: Buffer.from(built.tx.getHash()),
+				outputIndex: built.outputIndex,
+				witnesses
+			};
+		}
 
 		// A side that contributed no inputs has nothing to sign: auto-fill an
 		// empty witness set so a zero-contribution acceptor needs no wallet.
@@ -9339,6 +9563,7 @@ export class Channel {
 			];
 		}
 		this._v2PendingTxSigs = null;
+		this._v2TxSigsReleased = true;
 
 		// Funding info was already set when the commitment round started; keep
 		// the assignment idempotent for callers that reached here another way.
@@ -9548,9 +9773,63 @@ export class Channel {
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
+			// When WE contributed inputs (lease selling) both witness sets are
+			// now in hand: assemble and broadcast the funding tx ourselves
+			// (mirrors the splice path; the opener usually broadcasts too, and
+			// a duplicate broadcast is harmless).
+			if (this._dualFundingContribution) {
+				const assembled = this._assembleV2FundingTx();
+				if (assembled) {
+					actions.push({
+						type: ChannelActionType.BROADCAST_TX,
+						tx: assembled
+					});
+				}
+			}
 		}
 
 		return actions;
+	}
+
+	/**
+	 * Assemble the fully-signed v2 funding tx: our wallet witnesses (re-signed
+	 * via the wallet closures) on our inputs, the peer's tx_signatures
+	 * witnesses on theirs (both in ascending-serial input order).
+	 */
+	private _assembleV2FundingTx(): Buffer | null {
+		const session = this._state.dualFundingSession;
+		const c = this._dualFundingContribution;
+		if (!session || !c) return null;
+		const built = this._v2NegotiatedTx();
+		if (!built) return null;
+		const builder = session.getTxBuilder();
+		if (!builder) return null;
+		const sorted = [...builder.getInputs()].sort((a, b) =>
+			a.serialId < b.serialId ? -1 : 1
+		);
+		if (sorted.length !== built.tx.ins.length) return null;
+		const remote = session.getRemoteWitnesses() ?? [];
+		let r = 0;
+		for (let i = 0; i < built.tx.ins.length; i++) {
+			// BOLT 2: initiator uses even serial ids, the acceptor odd.
+			const ourInput =
+				(sorted[i].serialId % 2n === 0n) === session.isInitiator();
+			if (ourInput) {
+				const prevTxid = Buffer.from(built.tx.ins[i].hash);
+				const vout = built.tx.ins[i].index;
+				const w = c.inputs.find(
+					(wi) =>
+						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+						wi.prevOutputIndex === vout
+				);
+				if (!w) return null;
+				built.tx.setWitness(i, w.signWitness(built.tx, i, w.value));
+			} else {
+				if (r >= remote.length) return null;
+				built.tx.setWitness(i, remote[r++]);
+			}
+		}
+		return built.tx.toBuffer();
 	}
 
 	/**
