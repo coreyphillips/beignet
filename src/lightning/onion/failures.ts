@@ -5,12 +5,14 @@
  * propagates back to the sender. Each intermediate hop wraps the error
  * with its own key, and only the sender can unwrap all layers.
  *
- * Failure packet structure:
- *   HMAC-SHA256(um, payload) [32 bytes]
- *   len [2 bytes, = 256]
- *   pad [len bytes: failureCode(2) + failureData(var) + zero-padding to 256]
- * Total inner = 32 + 2 + 256 = 290 bytes.
- * Then XOR with generateCipherStream(ammag, 290).
+ * Failure packet structure (BOLT 4):
+ *   HMAC-SHA256(um, remainder) [32 bytes]
+ *   failure_len [2 bytes: actual failuremsg length]
+ *   failuremsg [failure_len bytes: failureCode(2) + failureData(var)]
+ *   pad_len [2 bytes]
+ *   pad [pad_len zero bytes; failuremsg + pad = 256]
+ * Total inner = 32 + 2 + 256 + 2 = 292 bytes.
+ * Then XOR with generateCipherStream(ammag, 292).
  */
 
 import crypto from 'crypto';
@@ -38,28 +40,35 @@ import {
 } from './types';
 import { deriveHopKeys, generateCipherStream } from './sphinx-crypto';
 
-const FAILURE_PAYLOAD_LENGTH = 256;
-const FAILURE_MESSAGE_LENGTH = 290; // 32 (HMAC) + 2 (len) + 256 (pad)
+const FAILURE_PAYLOAD_LENGTH = 256; // failuremsg + pad (BOLT 4 SHOULD)
+// 32 (HMAC) + 2 (failure_len) + 256 (failuremsg + pad) + 2 (pad_len)
+export const FAILURE_MESSAGE_LENGTH = 292;
 
 /**
- * Encode a failure payload: failureCode(2) + failureData + zero-padding to 256 bytes.
+ * Encode the failure plaintext the HMAC covers (BOLT 4):
+ *   failure_len(2) || failureCode(2) + failureData || pad_len(2) || pad
+ * with failuremsg + pad totalling 256 bytes.
  */
 export function encodeFailurePayload(
 	failureCode: number,
 	failureData: Buffer = Buffer.alloc(0)
 ): Buffer {
-	if (2 + failureData.length > FAILURE_PAYLOAD_LENGTH) {
+	const failureLen = 2 + failureData.length;
+	if (failureLen > FAILURE_PAYLOAD_LENGTH) {
 		throw new Error('Failure data too large');
 	}
-	const payload = Buffer.alloc(FAILURE_PAYLOAD_LENGTH);
-	payload.writeUInt16BE(failureCode, 0);
-	failureData.copy(payload, 2);
+	const padLen = FAILURE_PAYLOAD_LENGTH - failureLen;
+	const payload = Buffer.alloc(2 + FAILURE_PAYLOAD_LENGTH + 2);
+	payload.writeUInt16BE(failureLen, 0);
+	payload.writeUInt16BE(failureCode, 2);
+	failureData.copy(payload, 4);
+	payload.writeUInt16BE(padLen, 2 + failureLen);
 	return payload;
 }
 
 /**
  * Create an encrypted failure message at the originating hop.
- * Returns a 290-byte encrypted message.
+ * Returns a 292-byte encrypted message.
  */
 export function createFailureMessage(
 	sharedSecret: Buffer,
@@ -67,19 +76,13 @@ export function createFailureMessage(
 	failureData: Buffer = Buffer.alloc(0)
 ): Buffer {
 	const keys = deriveHopKeys(sharedSecret);
-	const payload = encodeFailurePayload(failureCode, failureData);
 
-	// Build inner: HMAC(um, failure_len || failmsg || pad) || failure_len || failmsg || pad
-	// Per BOLT 4: failure_len is the actual failure message length (code + data),
-	// NOT the padded length. The pad fills the rest to 256 bytes total.
-	const actualLen = 2 + failureData.length;
-	const lenAndPad = Buffer.alloc(2 + FAILURE_PAYLOAD_LENGTH);
-	lenAndPad.writeUInt16BE(actualLen, 0);
-	payload.copy(lenAndPad, 2);
+	// The HMAC covers everything after itself:
+	// failure_len || failuremsg || pad_len || pad (spec plaintext).
+	const plaintext = encodeFailurePayload(failureCode, failureData);
+	const hmac = crypto.createHmac('sha256', keys.um).update(plaintext).digest();
 
-	const hmac = crypto.createHmac('sha256', keys.um).update(lenAndPad).digest();
-
-	const inner = Buffer.concat([hmac, lenAndPad]);
+	const inner = Buffer.concat([hmac, plaintext]);
 
 	// XOR with ammag cipher stream
 	const stream = generateCipherStream(keys.ammag, FAILURE_MESSAGE_LENGTH);

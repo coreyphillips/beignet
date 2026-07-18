@@ -822,18 +822,25 @@ describe('BOLT 4: Onion Routing', () => {
 	// ── Failure Handling ────────────────────────────────────────────
 
 	describe('Failure Handling', () => {
-		it('should encode failure payload as 256 bytes', () => {
+		it('should encode the spec failure plaintext (260 bytes)', () => {
+			// failure_len(2) || failuremsg || pad_len(2) || pad, msg+pad = 256
 			const payload = encodeFailurePayload(TEMPORARY_CHANNEL_FAILURE);
-			expect(payload.length).to.equal(256);
-			expect(payload.readUInt16BE(0)).to.equal(TEMPORARY_CHANNEL_FAILURE);
+			expect(payload.length).to.equal(260);
+			expect(payload.readUInt16BE(0)).to.equal(2); // failure_len
+			expect(payload.readUInt16BE(2)).to.equal(TEMPORARY_CHANNEL_FAILURE);
+			expect(payload.readUInt16BE(4)).to.equal(254); // pad_len
 		});
 
 		it('should encode failure with data', () => {
 			const data = Buffer.from('test data');
 			const payload = encodeFailurePayload(FEE_INSUFFICIENT, data);
-			expect(payload.length).to.equal(256);
-			expect(payload.readUInt16BE(0)).to.equal(FEE_INSUFFICIENT);
-			expect(payload.subarray(2, 2 + data.length).equals(data)).to.be.true;
+			expect(payload.length).to.equal(260);
+			expect(payload.readUInt16BE(0)).to.equal(2 + data.length);
+			expect(payload.readUInt16BE(2)).to.equal(FEE_INSUFFICIENT);
+			expect(payload.subarray(4, 4 + data.length).equals(data)).to.be.true;
+			expect(payload.readUInt16BE(4 + data.length)).to.equal(
+				256 - 2 - data.length
+			);
 		});
 
 		it('should reject oversized failure data', () => {
@@ -841,10 +848,10 @@ describe('BOLT 4: Onion Routing', () => {
 			expect(() => encodeFailurePayload(0, tooLarge)).to.throw('too large');
 		});
 
-		it('should create a 290-byte failure message', () => {
+		it('should create a 292-byte failure message', () => {
 			const ss = crypto.randomBytes(32);
 			const msg = createFailureMessage(ss, UNKNOWN_NEXT_PEER);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
 		it('should wrap and unwrap failure at single hop', () => {
