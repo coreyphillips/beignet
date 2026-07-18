@@ -400,4 +400,213 @@ describe('Dual funding acceptor contribution (auto-driven, real keys)', function
 		).to.be.true;
 		expect(acceptor.getFundingSatoshis()).to.equal(TOTAL_FUNDING);
 	});
+
+	it('contributes MULTIPLE wallet inputs across turns (opener re-sends tx_complete)', function () {
+		const sharedTempId = crypto.randomBytes(32);
+		const openerFundingPriv = crypto.randomBytes(32);
+		const acceptorFundingPriv = crypto.randomBytes(32);
+		const openerFundingPub = getPublicKey(openerFundingPriv);
+		const acceptorFundingPub = getPublicKey(acceptorFundingPriv);
+		const openerSeed = crypto.randomBytes(32);
+		const acceptorSeed = crypto.randomBytes(32);
+
+		const openerState = createOpenerState({
+			temporaryChannelId: sharedTempId,
+			fundingSatoshis: OPENER_FUNDING,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(openerFundingPub, openerSeed),
+			localPerCommitmentSeed: openerSeed
+		});
+		const opener = new Channel(
+			openerState,
+			new ChannelSigner(openerFundingPriv)
+		);
+		const acceptorState = createAcceptorState({
+			temporaryChannelId: sharedTempId,
+			fundingSatoshis: 0n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(acceptorFundingPub, acceptorSeed),
+			localPerCommitmentSeed: acceptorSeed,
+			remoteBasepoints: makeBasepoints(
+				getPublicKey(crypto.randomBytes(32)),
+				crypto.randomBytes(32)
+			),
+			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+		});
+		const acceptor = new Channel(
+			acceptorState,
+			new ChannelSigner(acceptorFundingPriv)
+		);
+
+		// TWO wallet UTXOs (40k + 30k) funding the 50k contribution.
+		const walletPriv = crypto.randomBytes(32);
+		const walletPub = getPublicKey(walletPriv);
+		const walletPayment = bitcoin.payments.p2wpkh({ pubkey: walletPub });
+		const scriptCode = bitcoin.payments.p2pkh({ pubkey: walletPub }).output!;
+		const makeWalletInput = (sats: number): ISpliceWalletInput => {
+			const prev = new bitcoin.Transaction();
+			prev.version = 2;
+			prev.addInput(crypto.randomBytes(32), 0);
+			prev.addOutput(walletPayment.output!, sats);
+			return {
+				prevTx: prev.toBuffer(),
+				prevOutputIndex: 0,
+				value: BigInt(sats),
+				sequence: 0xfffffffd,
+				signWitness: (tx, inputIndex, value) => {
+					const sighash = tx.hashForWitnessV0(
+						inputIndex,
+						scriptCode,
+						Number(value),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					const der = bitcoin.script.signature.encode(
+						Buffer.from(ecc.sign(sighash, walletPriv)),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					return [der, walletPub];
+				}
+			};
+		};
+		const changeScript = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20)
+		}).output!;
+		acceptor.setDualFundingContribution(
+			[makeWalletInput(40_000), makeWalletInput(30_000)],
+			changeScript,
+			ACCEPTOR_FUNDING,
+			FUNDING_FEERATE
+		);
+
+		const params = (
+			state: typeof openerState,
+			seed: Buffer,
+			sats: bigint
+		): IDualFundingParams => ({
+			fundingSatoshis: sats,
+			fundingFeeratePerkw: FUNDING_FEERATE,
+			commitmentFeeratePerkw: DEFAULT_CHANNEL_CONFIG.feeratePerKw,
+			dustLimitSatoshis: DEFAULT_CHANNEL_CONFIG.dustLimitSatoshis,
+			maxHtlcValueInFlightMsat: DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat,
+			htlcMinimumMsat: DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat,
+			toSelfDelay: DEFAULT_CHANNEL_CONFIG.toSelfDelay,
+			maxAcceptedHtlcs: DEFAULT_CHANNEL_CONFIG.maxAcceptedHtlcs,
+			locktime: 0,
+			localBasepoints: state.localBasepoints,
+			localPerCommitmentSeed: state.localPerCommitmentSeed,
+			secondPerCommitmentPoint: getPerCommitmentPoint(seed, 1n)
+		});
+
+		const openActions = opener.initiateOpenV2(
+			params(openerState, openerSeed, OPENER_FUNDING)
+		);
+		const openMsg = decodeOpenChannel2Message(
+			findPayload(openActions, MessageType.OPEN_CHANNEL2)!
+		);
+		acceptorState.temporaryChannelId = Buffer.from(openMsg.channelId);
+		const acceptActions = acceptor.handleOpenChannel2(
+			openMsg,
+			params(acceptorState, acceptorSeed, ACCEPTOR_FUNDING)
+		);
+		opener.handleAcceptChannel2(
+			decodeAcceptChannel2Message(
+				findPayload(acceptActions, MessageType.ACCEPT_CHANNEL2)!
+			)
+		);
+
+		const openerPrev = new bitcoin.Transaction();
+		openerPrev.version = 2;
+		openerPrev.addInput(crypto.randomBytes(32), 0);
+		openerPrev.addOutput(
+			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+			120_000
+		);
+
+		// Turn 1: opener input -> our wallet input #1.
+		const oIn = opener.addTxInput({
+			serialId: 0n,
+			prevTxid: Buffer.from(openerPrev.getHash()),
+			prevOutputIndex: 0,
+			sequence: 0xfffffffd,
+			prevTx: openerPrev.toBuffer(),
+			prevTxVout: 0
+		});
+		const aTurn1 = acceptor.handleTxAddInput(
+			decodeTxAddInputMessage(findPayload(oIn, MessageType.TX_ADD_INPUT)!)
+		);
+		const in1 = decodeTxAddInputMessage(
+			findPayload(aTurn1, MessageType.TX_ADD_INPUT)!
+		);
+		opener.handleTxAddInput(in1);
+
+		// Turn 2: opener funding output -> our wallet input #2.
+		const funding = createFundingScript(openerFundingPub, acceptorFundingPub);
+		const oOut = opener.addTxOutput({
+			serialId: 2n,
+			amountSats: TOTAL_FUNDING,
+			scriptPubkey: funding.p2wshOutput
+		});
+		const aTurn2 = acceptor.handleTxAddOutput(
+			decodeTxAddOutputMessage(findPayload(oOut, MessageType.TX_ADD_OUTPUT)!)
+		);
+		const in2Payload = findPayload(aTurn2, MessageType.TX_ADD_INPUT);
+		expect(in2Payload, 'second wallet input on the second turn').to.not.equal(
+			null
+		);
+		opener.handleTxAddInput(decodeTxAddInputMessage(in2Payload!));
+
+		// Turn 3: opener completes -> our CHANGE output.
+		const oComplete1 = opener.sendTxComplete();
+		expect(findError(oComplete1)).to.equal(null);
+		const aTurn3 = acceptor.handleTxComplete();
+		const changePayload = findPayload(aTurn3, MessageType.TX_ADD_OUTPUT);
+		expect(changePayload, 'change output after both inputs').to.not.equal(null);
+		const changeMsg = decodeTxAddOutputMessage(changePayload!);
+		const expectedFee = spliceFeeSats(320 * 2 + 140, FUNDING_FEERATE);
+		expect(changeMsg.amountSats).to.equal(
+			70_000n - ACCEPTOR_FUNDING - expectedFee
+		);
+		opener.handleTxAddOutput(changeMsg);
+
+		// The opener re-sends tx_complete (its earlier one was invalidated by
+		// our add); our next turn finishes with our own tx_complete.
+		const oComplete2 = opener.sendTxComplete();
+		expect(findError(oComplete2)).to.equal(null);
+		const aTurn4 = acceptor.handleTxComplete();
+		expect(findError(aTurn4)).to.equal(null);
+		expect(
+			findPayload(aTurn4, MessageType.TX_COMPLETE),
+			'acceptor completes once contributions are exhausted'
+		).to.not.equal(null);
+		const acceptorCommit = findPayload(aTurn4, MessageType.COMMITMENT_SIGNED);
+		expect(acceptorCommit).to.not.equal(null);
+		const oAfter = opener.handleTxComplete();
+		const openerCommit = findPayload(oAfter, MessageType.COMMITMENT_SIGNED);
+		expect(openerCommit).to.not.equal(null);
+
+		// Commitment round; the acceptor (70k < 120k input total) auto-signs
+		// BOTH wallet inputs into its tx_signatures.
+		const aCommitHandle = acceptor.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(openerCommit!)
+		);
+		expect(findError(aCommitHandle)).to.equal(null);
+		const oCommitHandle = opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(acceptorCommit!)
+		);
+		expect(findError(oCommitHandle)).to.equal(null);
+		const aSigsPayload =
+			findPayload(aCommitHandle, MessageType.TX_SIGNATURES) ??
+			findPayload(oCommitHandle, MessageType.TX_SIGNATURES);
+		expect(aSigsPayload, 'acceptor auto-releases tx_signatures').to.not.equal(
+			null
+		);
+		const aSigs = decodeTxSignaturesMessage(aSigsPayload!);
+		expect(aSigs.witnesses.length).to.equal(2);
+		for (const w of aSigs.witnesses) {
+			expect(w.length).to.equal(2);
+			expect(w[1].equals(walletPub)).to.be.true;
+		}
+	});
 });
