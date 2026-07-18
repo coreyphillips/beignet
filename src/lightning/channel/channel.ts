@@ -474,6 +474,8 @@ export class Channel {
 	// Sign-once latch: our closing nonce signs exactly ONE sighash. Set when we
 	// produce our closing partial; cleared only when fresh nonces arrive.
 	private _hasSignedClosing = false;
+	/** Live closing feerate (sat/kw) injected by the manager; ephemeral. */
+	private _closingFeeratePerKw: number | null = null;
 	// Opaque cache managed by the ChannelManager: the MuSig2 signing session,
 	// unsigned closing tx and our partial at a specific fee. Invalidated here
 	// whenever the nonces refresh (the channel owns the nonce lifecycle).
@@ -4276,20 +4278,40 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Inject a live on-chain feerate (sat/kw) for cooperative-close fee
+	 * calculation. Anchor channels pin the COMMITMENT feerate to the 253
+	 * sat/kw floor (fees ride on CPFP), so deriving the closing fee from it
+	 * produces offers below the peer's minimum acceptable close fee; CLN
+	 * warns ("Feerange ... below minimum acceptable") and disconnects, and
+	 * the close retries forever. The effective closing feerate is the higher
+	 * of this and the commitment feerate.
+	 */
+	setClosingFeeratePerKw(feeratePerKw: number): void {
+		if (feeratePerKw > 0) this._closingFeeratePerKw = feeratePerKw;
+	}
+
+	/** Effective feerate (sat/kw) for cooperative closing transactions. */
+	getClosingFeeratePerKw(): number {
+		const commitmentRate = this._state.localConfig.feeratePerKw || 253;
+		return Math.max(this._closingFeeratePerKw ?? 0, commitmentRate);
+	}
+
 	private calculateIdealClosingFee(): bigint {
-		const feeRate = this._state.localConfig.feeratePerKw || 253;
-		// Taproot single-round close: the responder accepts our fee verbatim, so
-		// it must make the tx actually relayable. Use the SAME weight model as
-		// the tx builder (chain/closing.ts) with the 66-WU key-spend witness.
-		if (isTaprootChannel(this._state.channelType)) {
-			const localLen = this._state.localShutdownScript?.length ?? 22;
-			const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-			return calculateClosingFee(feeRate, localLen, remoteLen, true);
-		}
-		// A typical closing tx is ~170 weight units (simplified calculation)
-		// fee = weight * feeratePerKw / 1000
-		const weight = 170;
-		return BigInt(Math.ceil((weight * feeRate) / 1000));
+		const feeRate = this.getClosingFeeratePerKw();
+		// The fee must make the closing tx actually relayable, so use the SAME
+		// weight model as the tx builder (chain/closing.ts): 2-of-2 P2WSH
+		// funding input + both shutdown outputs (66-WU key-spend witness on
+		// taproot). The old 170-WU shortcut priced the tx at a quarter of its
+		// real weight.
+		const localLen = this._state.localShutdownScript?.length ?? 22;
+		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
+		return calculateClosingFee(
+			feeRate,
+			localLen,
+			remoteLen,
+			isTaprootChannel(this._state.channelType)
+		);
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
