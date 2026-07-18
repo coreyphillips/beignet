@@ -202,6 +202,15 @@ export interface IChannelManagerConfig {
 	 * default: every open/accept/v2/splice keeps the BOLT 2 cap.
 	 */
 	largeChannels?: boolean;
+	/**
+	 * Live on-chain feerate (sat/kw) for cooperative closing transactions.
+	 * Called at each closing entry point. Anchor channels pin the commitment
+	 * feerate to the 253 sat/kw floor, so without this the closing fee is
+	 * derived from that floor and spec peers reject the negotiation as below
+	 * their minimum acceptable fee. When absent (or returning undefined) the
+	 * channel falls back to its commitment feerate.
+	 */
+	getClosingFeeratePerKw?: () => number | undefined;
 }
 
 /**
@@ -2121,6 +2130,7 @@ export class ChannelManager extends EventEmitter {
 
 		// BOLT 2: opener must send first closing_signed after both shutdowns exchanged
 		if (channel.getRole() === ChannelRole.OPENER) {
+			this.applyClosingFeerate(channel);
 			const closingActions = channel.proposeClosingFee((feeSatoshis: bigint) =>
 				this.signClosingTx(channel, feeSatoshis)
 			);
@@ -2150,6 +2160,9 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		// Responder side: the acceptable-fee range is initialized lazily on the
+		// first closing_signed, so the live feerate must be in place first.
+		this.applyClosingFeerate(channel);
 		const actions = channel.handleClosingSigned(
 			msg,
 			(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis),
@@ -2522,14 +2535,27 @@ export class ChannelManager extends EventEmitter {
 	 * cover a relayable fee — we then simply act as closee for the peer's
 	 * closing_complete.
 	 */
+	/**
+	 * Inject the live closing feerate (when a provider is configured) so the
+	 * closing fee is priced for the CURRENT chain, not the channel's
+	 * commitment feerate (pinned to the 253 sat/kw floor on anchors).
+	 */
+	private applyClosingFeerate(channel: Channel): void {
+		const rate = this.config.getClosingFeeratePerKw?.();
+		if (rate !== undefined && rate > 0) {
+			channel.setClosingFeeratePerKw(rate);
+		}
+	}
+
 	private startSimpleClose(peerPubkey: string, channel: Channel): void {
 		const { estimateSimpleCloseFee } = require('../chain/closing');
+		this.applyClosingFeerate(channel);
 		const state = channel.getFullState();
 		const localScript = state.localShutdownScript;
 		const remoteScript = state.remoteShutdownScript;
 		if (!localScript || localScript.length === 0 || !remoteScript) return;
 
-		const feeratePerKw = state.localConfig.feeratePerKw || 253;
+		const feeratePerKw = channel.getClosingFeeratePerKw();
 		const fee: bigint = estimateSimpleCloseFee(
 			feeratePerKw,
 			localScript.length,
@@ -2985,6 +3011,7 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		this.applyClosingFeerate(channel);
 		const actions = channel.proposeClosingFee(signature);
 		this.processActions(peerPubkey, channel, actions);
 		return { ok: true, actions };
@@ -3060,6 +3087,9 @@ export class ChannelManager extends EventEmitter {
 					this.startSimpleClose(peerPubkey, channel);
 				} else if (channel.getRole() === ChannelRole.OPENER) {
 					// Opener re-proposes closing_signed to resume fee negotiation
+					// (proposeClosingFee re-derives the fee range, so a range
+					// persisted from a stale/too-low feerate is replaced here).
+					this.applyClosingFeerate(channel);
 					const closingActions = channel.proposeClosingFee(
 						(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis)
 					);

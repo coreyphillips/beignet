@@ -593,7 +593,16 @@ export class LightningNode extends EventEmitter {
 			largeChannels: this.largeChannels,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
-			leaseRates: config.leaseRates
+			leaseRates: config.leaseRates,
+			// Cooperative closes are priced from the LIVE feerate, not the
+			// commitment feerate (pinned to the 253 sat/kw floor on anchors,
+			// where fees ride on CPFP — a closing tx has no anchor to bump).
+			getClosingFeeratePerKw: () => {
+				const satPerVbyte = this.feeAdvisor.getCurrentRate();
+				return satPerVbyte > 0
+					? Math.ceil(this.clampEstimatedFeeRate(satPerVbyte) * 250)
+					: undefined;
+			}
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
