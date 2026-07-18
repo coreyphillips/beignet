@@ -14,6 +14,7 @@ rather than hand-written fixtures.
 | `bolt03/derivation.json` | `03-transactions.md` — Appendix E: Key Derivation Test Vectors |
 | `bolt03/commitment.json` | `03-transactions.md` — Appendix C: Commitment and HTLC Transaction Test Vectors (non-anchor) |
 | `bolt03/per-commitment-secrets.json` | `03-transactions.md` — Appendix D: Per-commitment Secret Generation Test Vectors |
+| `bolt03/commitment-anchors.json` | `03-transactions.md` — Appendix F: Commitment and HTLC Transaction Test Vectors (anchors) |
 | `bolt04/onion.json` | `bolt04/onion-test.json` |
 | `bolt04/route-blinding.json` | `bolt04/route-blinding-test.json` |
 | `bolt04/blinded-payment-onion.json` | `bolt04/blinded-payment-onion-test.json` |
