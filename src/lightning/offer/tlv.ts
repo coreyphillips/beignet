@@ -18,6 +18,11 @@ import {
 	encodeBlindedPayInfos,
 	decodeBlindedPayInfos
 } from '../onion/blinded-path';
+import { isValidPublicKey } from '../crypto/ecdh';
+import {
+	FeatureFlags,
+	hasUnsupportedRequiredFeatures
+} from '../features/flags';
 import {
 	IOffer,
 	IInvoiceRequest,
@@ -183,15 +188,46 @@ export function encodeOfferTlv(offer: IOffer): Buffer {
 	return encodeTlvStream(records);
 }
 
+/** Even TLV types an offer reader understands (unknown even = reject). */
+const OFFER_KNOWN_TYPES = new Set<bigint>(
+	Object.values(OfferTlvType)
+		.filter((t): t is number => typeof t === 'number')
+		.map((t) => BigInt(t))
+);
+
+/** Decode UTF-8 rejecting invalid/truncated sequences (BOLT 12 MUST). */
+const strictUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
+function decodeStrictUtf8(value: Buffer, field: string): string {
+	try {
+		return strictUtf8Decoder.decode(value);
+	} catch {
+		throw new Error(`Offer ${field} is not valid UTF-8`);
+	}
+}
+
 /**
- * Decode an IOffer from a TLV stream.
+ * Decode an IOffer from a TLV stream, enforcing the BOLT 12 reader MUSTs:
+ * offer types confined to 1..79 and the 1000000000..1999999999 experimental
+ * range, unknown even types rejected, description required exactly when an
+ * amount is set, currency only with an amount, non-zero amount, whole 32-byte
+ * chains, valid UTF-8 strings, a valid issuer_id point, and issuer_id or at
+ * least one path present.
  * Does NOT set offerId — caller must compute the merkle root.
  */
 export function decodeOfferTlv(data: Buffer): {
 	offer: Omit<IOffer, 'offerId'>;
 	records: ITlvRecord[];
 } {
-	const { records } = decodeTlvStream(data);
+	const { records } = decodeTlvStream(data, 0, OFFER_KNOWN_TYPES);
+
+	for (const r of records) {
+		const inOfferRange = r.type >= 1n && r.type <= 79n;
+		const inExperimentalRange =
+			r.type >= 1_000_000_000n && r.type <= 1_999_999_999n;
+		if (!inOfferRange && !inExperimentalRange) {
+			throw new Error(`Offer TLV type ${r.type} outside the offer ranges`);
+		}
+	}
 
 	const chainsVal = findTlvRecord(records, BigInt(OfferTlvType.CHAINS));
 	const metadataVal = findTlvRecord(records, BigInt(OfferTlvType.METADATA));
@@ -208,15 +244,36 @@ export function decodeOfferTlv(data: Buffer): {
 	const qtyMaxVal = findTlvRecord(records, BigInt(OfferTlvType.QUANTITY_MAX));
 	const issuerIdVal = findTlvRecord(records, BigInt(OfferTlvType.ISSUER_ID));
 
-	if (!descVal) {
-		throw new Error('Offer missing required description field');
+	// BOLT 12: offer_description is required exactly when offer_amount is set
+	// (a minimal offer has neither); offer_currency requires offer_amount; a
+	// present offer_amount must be non-zero.
+	if (amountVal && !descVal) {
+		throw new Error('Offer with offer_amount missing required description');
+	}
+	if (currencyVal && !amountVal) {
+		throw new Error('Offer has offer_currency without offer_amount');
+	}
+	if (amountVal && decodeTruncatedU64(amountVal) === 0n) {
+		throw new Error('Offer has zero offer_amount');
+	}
+	// The recipient must be reachable: issuer_id or at least one blinded path.
+	if (!issuerIdVal && !pathsVal) {
+		throw new Error('Offer missing both offer_issuer_id and offer_paths');
+	}
+	if (issuerIdVal && !isValidPublicKey(Buffer.from(issuerIdVal))) {
+		throw new Error('Offer offer_issuer_id is not a valid point');
 	}
 
 	const offer: Omit<IOffer, 'offerId'> = {
-		description: descVal.toString('utf8')
+		// Optional in the spec (required only with an amount, enforced above);
+		// IOffer keeps the field mandatory, so an absent description maps to ''.
+		description: descVal ? decodeStrictUtf8(descVal, 'description') : ''
 	};
 
 	if (chainsVal) {
+		if (chainsVal.length === 0 || chainsVal.length % 32 !== 0) {
+			throw new Error('Offer offer_chains is not a list of 32-byte chains');
+		}
 		const chains: Buffer[] = [];
 		for (let i = 0; i < chainsVal.length; i += 32) {
 			chains.push(Buffer.from(chainsVal.subarray(i, i + 32)));
@@ -224,12 +281,24 @@ export function decodeOfferTlv(data: Buffer): {
 		offer.chains = chains;
 	}
 	if (metadataVal) offer.metadata = metadataVal;
-	if (currencyVal) offer.currency = currencyVal.toString('utf8');
+	if (currencyVal) offer.currency = decodeStrictUtf8(currencyVal, 'currency');
 	if (amountVal) offer.amount = decodeTruncatedU64(amountVal);
-	if (featuresVal) offer.features = featuresVal;
+	if (featuresVal) {
+		// Unknown even (required) feature bits make the offer unusable.
+		const unknownRequired = hasUnsupportedRequiredFeatures(
+			FeatureFlags.empty(),
+			FeatureFlags.fromBuffer(featuresVal)
+		);
+		if (unknownRequired.length > 0) {
+			throw new Error(
+				`Offer requires unknown feature bit ${unknownRequired[0]}`
+			);
+		}
+		offer.features = featuresVal;
+	}
 	if (expiryVal) offer.absoluteExpiry = decodeTruncatedU64(expiryVal);
 	if (pathsVal) offer.paths = decodeBlindedPathsValue(pathsVal);
-	if (issuerVal) offer.issuer = issuerVal.toString('utf8');
+	if (issuerVal) offer.issuer = decodeStrictUtf8(issuerVal, 'issuer');
 	if (qtyMaxVal) offer.quantityMax = decodeTruncatedU64(qtyMaxVal);
 	if (issuerIdVal) offer.issuerId = issuerIdVal;
 

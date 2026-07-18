@@ -29,23 +29,23 @@ function makeKeypair(): Buffer {
 	return privKey;
 }
 
+/** A real compressed point: the decoder validates every path pubkey. */
+function makePoint(): Buffer {
+	return Buffer.from(secp.getPublicKey(makeKeypair(), true));
+}
+
 function makeBlindedPaymentPath(numHops: number): IBlindedPaymentPath {
 	const blindedHops: IBlindedHop[] = [];
 	for (let i = 0; i < numHops; i++) {
 		blindedHops.push({
-			blindedNodeId: crypto.randomBytes(33),
+			blindedNodeId: makePoint(),
 			encryptedData: crypto.randomBytes(20 + i) // variable length on purpose
 		});
 	}
 	return {
 		path: {
-			// A valid sciddir_or_pubkey point form (leading 0x02): the codec now
-			// validates the discriminator byte (S-4.H4).
-			introductionNodeId: Buffer.concat([
-				Buffer.from([0x02]),
-				crypto.randomBytes(32)
-			]),
-			blindingPoint: crypto.randomBytes(33),
+			introductionNodeId: makePoint(),
+			blindingPoint: makePoint(),
 			blindedHops
 		},
 		payInfo: {
