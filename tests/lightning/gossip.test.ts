@@ -1954,6 +1954,79 @@ describe('BOLT 7: Gossip & Routing', () => {
 				expect(route!.hops[0].pubkey).to.deep.equal(keys[1].publicKey);
 			});
 
+			it('routes through a local channel whose graph entry lacks our update', () => {
+				// The failure this guards against: our channel to a peer gets
+				// announced (the peer's channel_announcement and channel_update
+				// reach our graph), but our own channel_update is absent (lost to
+				// a restart, or not yet applied). The graph edge alone is
+				// untraversable in the outgoing direction, and the local-channel
+				// overlay used to stand down whenever the SCID was announced,
+				// leaving no route to a directly-connected peer.
+				const graph = new NetworkGraph();
+				const { key1: S, key2: D } = makeOrderedKeypairs();
+				const scid = makeScid(100, 1, 0);
+				const { msg: ann } = buildChannelAnnouncement(
+					S,
+					D,
+					makeKeypair(),
+					makeKeypair(),
+					scid
+				);
+				graph.addChannelAnnouncement(ann);
+				// Only the peer's direction update lands in the graph: S is node1
+				// (ordered), so D's update carries direction bit 1.
+				const { msg: upd } = buildChannelUpdate(
+					D.privateKey,
+					scid,
+					1700000000,
+					1,
+					{
+						cltvExpiryDelta: 40,
+						htlcMinimumMsat: 0n,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0,
+						htlcMaximumMsat: 1_000_000_000n
+					}
+				);
+				graph.applyChannelUpdate(upd);
+
+				// Without the local overlay the announced-but-one-sided edge is
+				// unusable from S.
+				const withoutLocal = findRoute(
+					graph,
+					S.publicKey,
+					D.publicKey,
+					100_000n,
+					144
+				);
+				expect(withoutLocal).to.be.null;
+
+				// The local channel edge must stand in for it.
+				const route = findRoute(
+					graph,
+					S.publicKey,
+					D.publicKey,
+					100_000n,
+					144,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					[
+						{
+							shortChannelId: scid,
+							peer: D.publicKey,
+							outboundMsat: 500_000_000n
+						}
+					]
+				);
+				expect(route).to.not.be.null;
+				expect(route!.hops).to.have.length(1);
+				expect(route!.hops[0].pubkey).to.deep.equal(D.publicKey);
+			});
+
 			it('prefers a shorter route over a longer zero-fee route (hop penalty)', () => {
 				// Pure fee-minimization would pick a long zero-fee path, which is
 				// far more likely to stall (each extra hop is a failure point). The
