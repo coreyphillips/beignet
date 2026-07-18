@@ -5,6 +5,7 @@
  * Handles construction, processing, forwarding, and rate limiting.
  */
 
+import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import {
 	IOnionMessage,
@@ -16,12 +17,9 @@ import {
 	encodeOnionMessage as encodeOnionMessageWire,
 	decodeOnionMessage as decodeOnionMessageWire
 } from './codec';
-import {
-	constructSimpleOnionMessage,
-	constructReplyOnionMessage
-} from './construct';
+import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
-import { IBlindedPath } from '../onion/blinded-path';
+import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
 
 /** TLV type handler callback */
 type TlvHandler = (
@@ -99,11 +97,38 @@ export class OnionMessageManager extends EventEmitter {
 	/**
 	 * Send an onion message to a destination.
 	 *
+	 * BOLT 4: onion messages are ALWAYS route-blinded (the sphinx layer is
+	 * addressed to blinded node ids and every hop carries encrypted_data), so
+	 * this builds a 1-hop blinded path to the destination — a raw unblinded
+	 * send is silently dropped by CLN/LND. The receiver peels with its
+	 * blinded key derived from the path_key.
+	 *
 	 * @param destination - 33-byte destination node public key
 	 * @param messageData - Application data as Map<tlvType, value>
-	 * @param options - Optional: reply path
+	 * @param options - Optional: reply path, path_id
 	 */
 	sendOnionMessage(
+		destination: Buffer,
+		messageData: Map<number, Buffer>,
+		options?: ISendOnionMessageOptions
+	): void {
+		this.sendMultiHopOnionMessage([], destination, messageData, options);
+	}
+
+	/**
+	 * Send a route-blinded onion message through intermediate forwarding
+	 * nodes. A blinded path is constructed over [intermediates..., destination]
+	 * (each hop's encrypted_data carries the next real node id; the final
+	 * hop optionally carries options.pathId), and the sphinx onion is
+	 * addressed to the blinded node ids, exactly like a spec reply path.
+	 *
+	 * @param intermediateNodes - Real node ids of the forwarding hops (may be empty)
+	 * @param destination - Final destination's real node id
+	 * @param messageData - Application data for the final hop
+	 * @param options - Optional: reply path, path_id
+	 */
+	sendMultiHopOnionMessage(
+		intermediateNodes: Buffer[],
 		destination: Buffer,
 		messageData: Map<number, Buffer>,
 		options?: ISendOnionMessageOptions
@@ -112,18 +137,28 @@ export class OnionMessageManager extends EventEmitter {
 			throw new Error('Send function not configured');
 		}
 
-		const msg = constructSimpleOnionMessage(
-			destination,
+		const nodeIds = [...intermediateNodes, destination];
+		const hopData = nodeIds.map((_, i) =>
+			i < nodeIds.length - 1
+				? { nextNodeId: nodeIds[i + 1] }
+				: options?.pathId
+				? { pathId: options.pathId }
+				: {}
+		);
+		const path = constructBlindedPath(crypto.randomBytes(32), nodeIds, hopData);
+		const msg = constructReplyOnionMessage(
+			path,
 			messageData,
 			undefined,
 			options
 		);
 		const wirePayload = encodeOnionMessageWire(msg);
 
-		// For single-hop messages, send directly to the destination
-		const destHex = destination.toString('hex');
-		this.sendMessage(destHex, 513, wirePayload);
-		this.emit('message:send', destHex, 513, wirePayload);
+		// The first hop is addressed by its REAL id on the transport; only the
+		// sphinx layer uses the blinded ids.
+		const firstHop = path.introductionNodeId.toString('hex');
+		this.sendMessage(firstHop, 513, wirePayload);
+		this.emit('message:send', firstHop, 513, wirePayload);
 	}
 
 	/**

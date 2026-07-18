@@ -9142,6 +9142,25 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Send a route-blinded onion message through intermediate forwarding nodes
+	 * (BOLT 4: the sphinx layer is addressed to blinded node ids; each
+	 * intermediate learns only its next hop).
+	 */
+	sendMultiHopOnionMessage(
+		intermediateNodes: Buffer[],
+		destination: Buffer,
+		messageData: Map<number, Buffer>,
+		options?: ISendOnionMessageOptions
+	): void {
+		this.onionMessageManager.sendMultiHopOnionMessage(
+			intermediateNodes,
+			destination,
+			messageData,
+			options
+		);
+	}
+
+	/**
 	 * Get the OnionMessageManager for direct access.
 	 */
 	getOnionMessageManager(): OnionMessageManager {
