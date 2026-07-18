@@ -97,6 +97,12 @@ export type OnionMessageProcessResult =
 export interface ISendOnionMessageOptions {
 	/** Include a reply path so the recipient can respond */
 	replyPath?: IBlindedPath;
+	/**
+	 * BOLT 4 path_id embedded in the final hop's encrypted recipient data of a
+	 * blinded send: the recipient's delivery surfaces it, letting it verify
+	 * the message arrived over a path the sender was given.
+	 */
+	pathId?: Buffer;
 }
 
 /**

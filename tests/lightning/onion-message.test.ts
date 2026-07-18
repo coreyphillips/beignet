@@ -1262,6 +1262,92 @@ describe('Onion Messages (Phase 8)', () => {
 			mgr.destroy();
 		});
 
+		it('sendMultiHopOnionMessage delivers end to end through a blinded intermediate', () => {
+			const sender = generateKeyPair();
+			const mid = generateKeyPair();
+			const dest = generateKeyPair();
+			const senderMgr = new OnionMessageManager(sender.privkey);
+			const midMgr = new OnionMessageManager(mid.privkey);
+			const destMgr = new OnionMessageManager(dest.privkey);
+			const byId = new Map<string, OnionMessageManager>([
+				[mid.pubkey.toString('hex'), midMgr],
+				[dest.pubkey.toString('hex'), destMgr]
+			]);
+			for (const [self, mgr] of [
+				[sender, senderMgr],
+				[mid, midMgr],
+				[dest, destMgr]
+			] as const) {
+				mgr.setSendFunction((peer, _type, payload) => {
+					byId.get(peer)?.handleMessage(self.pubkey.toString('hex'), payload);
+				});
+			}
+
+			const forwarded: string[] = [];
+			midMgr.on('message:forwarded', (_f: string, next: string) =>
+				forwarded.push(next)
+			);
+			const seen: { data: Buffer; pathId?: Buffer }[] = [];
+			destMgr.registerTlvHandler(64, (_f, _t, data, _replyPath, pathId) => {
+				seen.push({ data, pathId });
+			});
+
+			const pathId = crypto.randomBytes(32);
+			const msgData = new Map<number, Buffer>();
+			msgData.set(64, Buffer.from('blinded multi-hop'));
+			senderMgr.sendMultiHopOnionMessage([mid.pubkey], dest.pubkey, msgData, {
+				pathId
+			});
+
+			// The intermediate forwarded to the REAL destination id (decrypted
+			// from its blob), and the destination got the body + path_id.
+			expect(forwarded).to.deep.equal([dest.pubkey.toString('hex')]);
+			expect(seen.length).to.equal(1);
+			expect(seen[0].data.toString()).to.equal('blinded multi-hop');
+			expect(seen[0].pathId).to.exist;
+			expect(seen[0].pathId!.equals(pathId)).to.be.true;
+
+			senderMgr.destroy();
+			midMgr.destroy();
+			destMgr.destroy();
+		});
+
+		it('single-hop sendOnionMessage is route-blinded (raw peel fails)', () => {
+			const sender = generateKeyPair();
+			const dest = generateKeyPair();
+			const mgr = new OnionMessageManager(sender.privkey);
+
+			let wire: Buffer | null = null;
+			mgr.setSendFunction((_peer, _type, payload) => {
+				wire = payload;
+			});
+			const msgData = new Map<number, Buffer>();
+			msgData.set(64, Buffer.from('blinded single-hop'));
+			mgr.sendOnionMessage(dest.pubkey, msgData);
+			expect(wire).to.not.be.null;
+
+			const decoded = decodeOnionMessage(wire!);
+			// Without the path_key the sphinx is unpeelable (it is addressed to
+			// the BLINDED node id, not the raw one)...
+			expect(() =>
+				processOnionMessage(decoded.onionRoutingPacket, dest.privkey)
+			).to.throw('HMAC');
+			// ...and with it, the destination decrypts the body.
+			const result = processOnionMessage(
+				decoded.onionRoutingPacket,
+				dest.privkey,
+				decoded.blindingPoint
+			);
+			expect(result.type).to.equal('delivery');
+			if (result.type === 'delivery') {
+				expect(result.payload.messageTlvs.get(64)!.toString()).to.equal(
+					'blinded single-hop'
+				);
+			}
+
+			mgr.destroy();
+		});
+
 		it('surfaces path_id to TLV handlers on final delivery', () => {
 			const sender = generateKeyPair();
 			const recipient = generateKeyPair();
