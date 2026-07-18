@@ -211,8 +211,13 @@ function resolveNextHop(
 			'Cannot determine next hop: no next_node_id in encrypted_recipient_data'
 		);
 	}
+	// BOLT 4: next_path_key_override (ERD type 8, creator-authenticated by the
+	// decryption) replaces the standard derivation at the seam where two
+	// blinded routes were concatenated.
 	return {
 		nextNodeId: blindedHopData.nextNodeId,
-		nextBlindingKey: deriveNextBlindingKey(blindingPoint, blindingSharedSecret)
+		nextBlindingKey:
+			blindedHopData.nextPathKeyOverride ??
+			deriveNextBlindingKey(blindingPoint, blindingSharedSecret)
 	};
 }

@@ -69,6 +69,14 @@ export interface IBlindedHopData {
 	 * the message arrived via the intended path (and not a probe/replay).
 	 */
 	pathId?: Buffer;
+	/**
+	 * next_path_key_override (BOLT 4 encrypted_recipient_data type 8): the
+	 * path key to forward to the next hop INSTEAD of the standard derivation.
+	 * Set at the seam where two blinded routes are concatenated (e.g. a
+	 * sender-prepended segment joining a recipient-built path), so the next
+	 * hop unblinds with the key its own route creator chose.
+	 */
+	nextPathKeyOverride?: Buffer;
 	/** Padding for uniform hop sizes */
 	padding?: Buffer;
 }
@@ -78,6 +86,7 @@ const ERD_PADDING = 1n;
 const ERD_SHORT_CHANNEL_ID = 2n;
 const ERD_NEXT_NODE_ID = 4n;
 const ERD_PATH_ID = 6n;
+const ERD_NEXT_PATH_KEY_OVERRIDE = 8n;
 const ERD_PAYMENT_RELAY = 10n;
 const ERD_PAYMENT_CONSTRAINTS = 12n;
 /**
@@ -128,6 +137,12 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 	if (data.pathId) {
 		records.push({ type: ERD_PATH_ID, value: data.pathId });
 	}
+	if (data.nextPathKeyOverride) {
+		records.push({
+			type: ERD_NEXT_PATH_KEY_OVERRIDE,
+			value: data.nextPathKeyOverride
+		});
+	}
 	if (data.paymentRelay) {
 		const head = Buffer.alloc(6);
 		head.writeUInt16BE(data.paymentRelay.cltvExpiryDelta, 0);
@@ -176,6 +191,8 @@ export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 			data.nextNodeId = Buffer.from(r.value);
 		} else if (r.type === ERD_PATH_ID) {
 			data.pathId = Buffer.from(r.value);
+		} else if (r.type === ERD_NEXT_PATH_KEY_OVERRIDE) {
+			data.nextPathKeyOverride = Buffer.from(r.value);
 		} else if (r.type === ERD_PAYMENT_RELAY) {
 			data.paymentRelay = {
 				cltvExpiryDelta: r.value.readUInt16BE(0),
@@ -520,8 +537,12 @@ export function processBlindedHop(
 	// Decode hop data
 	const hopData = decodeBlindedHopData(plaintext);
 
-	// Derive next blinding key
-	const nextBlindingKey = deriveNextBlindingKey(blindingKey, sharedSecret);
+	// Derive the next blinding key. BOLT 4: next_path_key_override (from the
+	// DECRYPTED data, so it is creator-authenticated) replaces the standard
+	// derivation at a concatenated-route seam.
+	const nextBlindingKey =
+		hopData.nextPathKeyOverride ??
+		deriveNextBlindingKey(blindingKey, sharedSecret);
 
 	return { hopData, nextBlindingKey };
 }

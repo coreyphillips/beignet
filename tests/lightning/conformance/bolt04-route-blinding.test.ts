@@ -165,17 +165,22 @@ describe('BOLT 4: route blinding conformance', function () {
 				);
 				expect(bufferToHex(plaintext)).to.equal(hop.decrypted_data);
 
+				// The vector's next_path_key is the STANDARD derivation; the
+				// key actually forwarded honors the override (ERD type 8) at
+				// the seam between the two concatenated routes (Carol).
+				expect(bufferToHex(deriveNextBlindingKey(pathKey, ss))).to.equal(
+					hop.next_path_key
+				);
+
 				const processed = processBlindedHop(
 					pathKey,
 					nodePrivkey,
 					hexToBuffer(v.route.hops[i].encrypted_data)
 				);
 				expect(bufferToHex(processed.nextBlindingKey)).to.equal(
-					hop.next_path_key
+					hop.next_path_key_override ?? hop.next_path_key
 				);
 
-				// The seam between the two concatenated routes: the override
-				// path key rides in encrypted_data TLV type 8.
 				const { records } = decodeTlvStream(plaintext);
 				const override = findTlvRecord(records, ERD_NEXT_PATH_KEY_OVERRIDE);
 				if (hop.next_path_key_override) {
