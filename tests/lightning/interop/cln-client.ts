@@ -251,11 +251,14 @@ export class ClnRestClient {
 
 	async closeChannel(
 		id: string,
-		opts?: { unilateraltimeout?: number }
+		opts?: { unilateraltimeout?: number; destination?: string }
 	): Promise<IClnCloseResponse> {
 		const body: Record<string, unknown> = { id };
 		if (opts?.unilateraltimeout !== undefined) {
 			body.unilateraltimeout = opts.unilateraltimeout;
+		}
+		if (opts?.destination !== undefined) {
+			body.destination = opts.destination;
 		}
 		return this.request('POST', '/v1/close', body);
 	}

@@ -29,6 +29,8 @@ import {
 	waitForClnSync,
 	waitForClnPeerChannelNormal,
 	fundClnWallet,
+	payClnInvoiceStrict,
+	payBeignetInvoiceStrict,
 	waitFor,
 	CLN_P2P_HOST,
 	CLN_P2P_PORT,
@@ -38,7 +40,8 @@ import {
 	TEST_MNEMONIC,
 	bitcoinRpc,
 	mineBlocks,
-	ensureBitcoindFunds
+	ensureBitcoindFunds,
+	setupRoutingForChannel
 } from './shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { FeatureFlags, Feature } from '../../../src/lightning/features/flags';
@@ -133,6 +136,7 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 
 	it('funds and opens the leased channel NORMAL, then survives update_blockheight rounds', async function () {
 		if (skipAll) this.skip();
+		this.timeout(600_000);
 
 		// ── A REAL confirmed P2WPKH wallet UTXO for our lease contribution ──
 		const walletPriv = crypto
@@ -206,7 +210,7 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		//    option_will_fund) + the wallet-backed funding provider ──
 		const keys = deriveLightningKeysFromMnemonic(
 			TEST_MNEMONIC,
-			'interop-seed-270',
+			`interop-seed-270-${Date.now() % 100000}`,
 			LnCoinType.REGTEST
 		);
 		const features = FeatureFlags.empty();
@@ -225,6 +229,12 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 			perCommitmentSeed: keys.perCommitmentSeed,
 			fundingPrivkey: keys.fundingPrivkey,
 			htlcBasepointSecret: keys.htlcBasepointSecret,
+			// The on-chain claim of our static-remotekey (lease-locked) to_remote
+			// signs with the PAYMENT basepoint secret; the sweep is consensus-
+			// invalid without it.
+			paymentBasepointSecret: keys.paymentBasepointSecret,
+			revocationBasepointSecret: keys.revocationBasepointSecret,
+			delayedPaymentBasepointSecret: keys.delayedPaymentBasepointSecret,
 			network: Network.REGTEST,
 			enableNetworking: true,
 			localFeatures: features,
@@ -321,6 +331,116 @@ describe('Interop: beignet SELLS a lease to CLN (option_will_fund seller + updat
 		expect(entry, 'CLN lists the leased channel NORMAL').to.exist;
 		console.log(
 			'    SELLER-SIDE LEASE + update_blockheight VALIDATED vs live CLN'
+		);
+
+		// ── Payments over the leased channel, both directions ──
+		setupRoutingForChannel(node, clnPubkey);
+		await sleep(2000);
+		await payClnInvoiceStrict(node, cln, 20_000_000, 'lessor-pays-buyer');
+		await payBeignetInvoiceStrict(node, cln, 15_000_000, 'buyer-pays-lessor');
+		expect(
+			channel.getState(),
+			'channel NORMAL after payments both ways'
+		).to.equal(ChannelState.NORMAL);
+		console.log('    payments over the leased channel OK (20k out, 15k in)');
+
+		// ── CLN force-closes: our whole lessor balance sits in the
+		//    LEASE-LOCKED to_remote (pure CSV). Sweep it after maturity —
+		//    the consensus-level validation of the CLN lease scripts. ──
+		const broadcasts: Buffer[] = [];
+		node.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+		const st = channel.getFullState();
+		const fundingTxidInternal = st.fundingTxid!;
+		const fundingVout = st.fundingOutputIndex;
+		const leaseCsvNow = st.leaseExpiry! - st.leaseCommitBlockheight!;
+		// beignet does not advertise option_shutdown_anysegwit, so give CLN an
+		// explicit v0 destination or its close RPC refuses its default (v1) addr.
+		const clnDest = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20),
+			network: bitcoin.networks.regtest
+		}).address!;
+		await cln.closeChannel(node.getNodeId(), {
+			unilateraltimeout: 1,
+			destination: clnDest
+		});
+		const closingHex = (await waitFor(async () => {
+			const mem = (await bitcoinRpc('getrawmempool', [])) as string[];
+			for (const txid of mem) {
+				const hex = (await bitcoinRpc('getrawtransaction', [txid])) as string;
+				const t = bitcoin.Transaction.fromHex(hex);
+				if (
+					t.ins.some(
+						(i) =>
+							Buffer.from(i.hash).equals(fundingTxidInternal) &&
+							i.index === fundingVout
+					)
+				) {
+					return hex;
+				}
+			}
+			return null;
+		}, 60_000))!;
+		const closingTx = bitcoin.Transaction.fromHex(closingHex);
+		await mineBlocks(1);
+		const confHeight = (await bitcoinRpc('getblockcount', [])) as number;
+		const destScript = bitcoin.payments.p2wpkh({
+			hash: crypto.randomBytes(20),
+			network: bitcoin.networks.regtest
+		}).output!;
+		node
+			.getChannelManager()
+			.handleFundingSpent(channelId!, closingTx, confHeight, destScript);
+
+		// The claim is HELD until the lease CSV matures (BIP68). Mine past it
+		// and release.
+		console.log(`    mining ${leaseCsvNow + 1} blocks to mature the lease CSV`);
+		await mineBlocks(leaseCsvNow + 1);
+		const tipFinal = (await bitcoinRpc('getblockcount', [])) as number;
+		const before = broadcasts.length;
+		node.handleNewBlock(tipFinal);
+		await sleep(3000);
+		const closingHash = Buffer.from(closingTx.getHash());
+		const sweep = broadcasts
+			.slice(before)
+			.map((b) => bitcoin.Transaction.fromBuffer(b))
+			.find((t) => t.ins.some((i) => Buffer.from(i.hash).equals(closingHash)));
+		expect(
+			sweep,
+			'lease-locked to_remote sweep broadcast after CSV maturity'
+		).to.not.equal(undefined);
+		// CLN pure-CSV lease: input nSequence = remaining lease, NO nLockTime.
+		const swIn = sweep!.ins.find((i) =>
+			Buffer.from(i.hash).equals(closingHash)
+		)!;
+		expect(swIn.sequence, 'sweep sequence = remaining lease CSV').to.equal(
+			leaseCsvNow
+		);
+		expect(sweep!.locktime).to.equal(0);
+		expect(Buffer.from(sweep!.outs[0].script).equals(destScript)).to.be.true;
+
+		// Consensus-valid on a REAL node: accepted + confirmed.
+		try {
+			await bitcoinRpc('sendrawtransaction', [sweep!.toHex()]);
+		} catch (e) {
+			const msg = (e as Error).message || '';
+			if (!/already/i.test(msg)) throw e;
+		}
+		await mineBlocks(1);
+		const swConf = (await bitcoinRpc('getrawtransaction', [
+			sweep!.getId(),
+			true
+		])) as { confirmations?: number };
+		expect(
+			swConf.confirmations ?? 0,
+			'lease sweep CONFIRMED on-chain'
+		).to.be.gte(1);
+		// The lessor balance came home: 100k lease + 673 fee - 20k + 15k
+		// payments, minus the sweep fee.
+		expect(sweep!.outs[0].value).to.be.greaterThan(90_000);
+		console.log(
+			`    LEASE-LOCKED to_remote SWEPT + CONFIRMED on-chain ` +
+				`(${sweep!.outs[0].value} sat, CSV ${leaseCsvNow}) — ` +
+				`lease scripts consensus-validated`
 		);
 	});
 });
