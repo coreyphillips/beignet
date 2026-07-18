@@ -23,6 +23,9 @@ rather than hand-written fixtures.
 | `bolt07/extended-queries.json` | `bolt07/extended-queries.json` |
 | `bolt08/transport.json` | `08-transport.md` — Appendix A: Transport Test Vectors |
 | `bolt11/invoices.json` | `11-payment-encoding.md` — Examples / Examples of Invalid Invoices |
+| `bolt12/offers.json` | `bolt12/offers-test.json` |
+| `bolt12/format-string.json` | `bolt12/format-string-test.json` |
+| `bolt12/signature.json` | `bolt12/signature-test.json` |
 
 Each JSON carries a `_source` field naming its upstream origin. Values are the
 spec's hex/decimal as published; the JSON wrappers only reshape them into
