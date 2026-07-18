@@ -256,23 +256,36 @@ describe('Production Hardening 9 — Agent DX', () => {
 			expect(health.status).to.equal('degraded');
 		});
 
-		it('BeignetNode.getHealth source checks channels-but-none-NORMAL', () => {
+		it('BeignetNode.getHealth source checks all-established-channels-broken', () => {
 			// Structural: verify the degraded logic exists in the source
 			const src = require('fs').readFileSync(
 				require('path').join(__dirname, '../../src/cli/beignet-node.ts'),
 				'utf8'
 			);
-			expect(src).to.include(
-				'channels.length > 0 && readyChannels.length === 0'
-			);
+			expect(src).to.include('broken.length > 0 && operating.length === 0');
 		});
 
-		it('BeignetNode.getHealth source checks no-peers-but-has-channels', () => {
+		it('BeignetNode.getHealth source checks no-peers-but-operational-channels', () => {
 			const src = require('fs').readFileSync(
 				require('path').join(__dirname, '../../src/cli/beignet-node.ts'),
 				'utf8'
 			);
-			expect(src).to.include('peerCount === 0 && channels.length > 0');
+			expect(src).to.include('peerCount === 0 && operating.length > 0');
+		});
+
+		it('BeignetNode.getHealth does not count pending opens toward degraded', () => {
+			// A channel mid-open (SENT_*/AWAITING_FUNDING_CONFIRMED/etc) is a
+			// deliberate operation in progress, not a fault. Only NORMAL/SPLICING
+			// (operating) and AWAITING_REESTABLISH/ERRORED (broken) get a vote.
+			const src = require('fs').readFileSync(
+				require('path').join(__dirname, '../../src/cli/beignet-node.ts'),
+				'utf8'
+			);
+			expect(src).to.include('ChannelState.SPLICING');
+			expect(src).to.include('ChannelState.AWAITING_REESTABLISH');
+			expect(src).to.not.include(
+				'channels.length > 0 && readyChannels.length === 0'
+			);
 		});
 	});
 
