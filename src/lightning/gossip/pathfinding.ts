@@ -331,9 +331,7 @@ function buildEdgeOverlay(
 			// filtering in the route loops).
 			const gc = graph.getChannel(lc.shortChannelId);
 			if (gc) {
-				const ourUpdate = source.equals(gc.nodeId1)
-					? gc.update1
-					: gc.update2;
+				const ourUpdate = source.equals(gc.nodeId1) ? gc.update1 : gc.update2;
 				if (ourUpdate) continue;
 				shadowedScids.add(lc.shortChannelId.toString('hex'));
 			}
@@ -454,7 +452,7 @@ export function findRoute(
 			shadowedScids.size > 0
 				? allGraphChannels.filter(
 						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
-					)
+				  )
 				: allGraphChannels;
 		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
 		const channels =
@@ -779,7 +777,7 @@ function findRouteWithCapacityLimits(
 			shadowedScids.size > 0
 				? allGraphChannels.filter(
 						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
-					)
+				  )
 				: allGraphChannels;
 		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
 		const channels =
