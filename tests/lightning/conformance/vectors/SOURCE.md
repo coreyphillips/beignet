@@ -18,6 +18,8 @@ rather than hand-written fixtures.
 | `bolt04/onion.json` | `bolt04/onion-test.json` |
 | `bolt04/route-blinding.json` | `bolt04/route-blinding-test.json` |
 | `bolt04/blinded-payment-onion.json` | `bolt04/blinded-payment-onion-test.json` |
+| `bolt04/blinded-onion-message.json` | `bolt04/blinded-onion-message-onion-test.json` |
+| `bolt04/onion-error.json` | `bolt04/onion-error-test.json` |
 | `bolt07/extended-queries.json` | `bolt07/extended-queries.json` |
 | `bolt08/transport.json` | `08-transport.md` — Appendix A: Transport Test Vectors |
 | `bolt11/invoices.json` | `11-payment-encoding.md` — Examples / Examples of Invalid Invoices |
