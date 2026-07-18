@@ -402,7 +402,9 @@ export class DualFundingSession {
 			firstPerCommitmentPoint:
 				localParams.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: localParams.secondPerCommitmentPoint,
-			channelType: localParams.channelType,
+			// BOLT 2: the accepter echoes the channel_type it is accepting. CLN
+			// REQUIRES the echo (and refuses a lease without one).
+			channelType: localParams.channelType ?? msg.channelType,
 			willFund: localParams.willFund
 		};
 

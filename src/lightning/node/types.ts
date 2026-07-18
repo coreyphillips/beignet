@@ -204,6 +204,13 @@ export interface INodeConfig {
 	 */
 	preferTaproot?: boolean;
 	/**
+	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
+	 * open_channel2 carrying request_funds is answered with a signed will_fund
+	 * at these rates and the requested contribution is funded from the node's
+	 * on-chain wallet (fundingProvider). Leave unset to never sell leases.
+	 */
+	leaseRates?: import('../gossip/types').ILeaseRates;
+	/**
 	 * BOLT 1 peer storage (option_provide_storage, default true): store the
 	 * latest peer_storage blob per channel/trusted peer and return it on
 	 * reconnect, and push our own blob (set via distributePeerStorage) to

@@ -3523,6 +3523,46 @@ export class ChannelManager extends EventEmitter {
 			localParams.fundingSatoshis = msg.requestFunds.requestedSats;
 		}
 
+		if (localParams.willFund && msg.requestFunds) {
+			// The lease contribution must actually be FUNDED: source wallet
+			// inputs + change for it, register them on the channel (the
+			// interactive-tx drive contributes and later signs them), and only
+			// then answer with will_fund. No wallet coverage: withdraw the
+			// offer and accept as a plain zero-contribution acceptor rather
+			// than negotiating a funding tx we cannot fund.
+			const requested = msg.requestFunds.requestedSats;
+			const fp = this.fundingProvider;
+			if (fp?.selectSpliceInputs) {
+				fp.selectSpliceInputs(requested, msg.fundingFeeratePerkw)
+					.then(({ inputs, changeScript }) => {
+						channel.setDualFundingContribution(
+							inputs,
+							changeScript,
+							requested,
+							msg.fundingFeeratePerkw
+						);
+						const actions = channel.handleOpenChannel2(msg, localParams);
+						this.processActions(peerPubkey, channel, actions);
+					})
+					.catch((err) => {
+						this.emit(
+							'error',
+							msg.channelId,
+							`Lease contribution not funded (${
+								(err as Error)?.message ?? err
+							}); accepting without will_fund`
+						);
+						delete localParams.willFund;
+						localParams.fundingSatoshis = 0n;
+						const actions = channel.handleOpenChannel2(msg, localParams);
+						this.processActions(peerPubkey, channel, actions);
+					});
+				return;
+			}
+			// No funding provider: keep the legacy behavior (the embedder — or a
+			// test harness — drives the contribution itself via addTxInput).
+		}
+
 		const actions = channel.handleOpenChannel2(msg, localParams);
 		this.processActions(peerPubkey, channel, actions);
 	}
