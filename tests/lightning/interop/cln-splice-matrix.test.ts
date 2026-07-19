@@ -32,6 +32,7 @@ import {
 	setupClnChannel,
 	CLN_P2P_HOST,
 	CLN_P2P_PORT,
+	payClnInvoiceStrict,
 	sleep
 } from './cln-helpers';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
@@ -543,6 +544,14 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 				node.getChannelManager().getChannel(channelId)!.isSplicePendingLock(),
 				'pending-lock reached (splice tx unmined)'
 			).to.equal(true);
+
+			// Make the central invariant undeniable: the splice tx is sitting in
+			// the mempool, unconfirmed, while every payment below crosses the
+			// channel. getmempoolentry throws for confirmed/unknown txids.
+			const pendingSpliceTxid = spliceTxidHex(node, channelId);
+			expect(pendingSpliceTxid, 'splice txid known').to.not.equal(null);
+			const entry = await bitcoinRpc('getmempoolentry', [pendingSpliceTxid!]);
+			expect(entry, 'splice tx is in the mempool').to.be.an('object');
 		});
 
 		it('E1: CLN pays a beignet invoice while the splice awaits its lock', async function () {
@@ -566,22 +575,21 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 		});
 
 		it('E2: beignet pays a CLN invoice while the splice awaits its lock', async function () {
-			const inv = await cln.createInvoice(
-				15_000_000,
-				`tier-e2-${process.hrtime.bigint()}`,
-				'pay during splice'
-			);
-			let sent = false;
-			node.on('payment:sent', () => (sent = true));
-			node.sendPayment(inv.bolt11);
-			for (let i = 0; i < 30 && !sent; i++) await sleep(1000);
-			expect(sent, 'outbound payment settled mid-splice').to.equal(true);
+			// The strict helper syncs the node's block height first (these
+			// interop nodes have no chain watcher, so an outbound HTLC would
+			// otherwise carry an invalid absolute CLTV) and asserts settlement
+			// on BOTH sides for this specific payment.
+			await payClnInvoiceStrict(node, cln, 15_000_000, 'tier-e2');
 			expect(
 				node.getChannelManager().getChannel(channelId)!.isSplicePendingLock()
 			).to.equal(true);
 		});
 
-		it('E3: disconnect and reconnect mid-splice; payments still flow', async function () {
+		it('E3: pending-lock reestablish against real CLN, then a payment settles', async function () {
+			// This proves the channel survives a pending-lock disconnect against
+			// CLN's own implementation and processes HTLC traffic afterwards.
+			// (Interrupted-round REPLAY has its targeted matrix in
+			// splice.test.ts — no HTLC is in flight at this disconnect.)
 			node.disconnectPeer(clnPubkey);
 			await sleep(2000);
 			await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
