@@ -39,6 +39,7 @@ import {
 	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { calculateCommitmentFee } from '../../src/lightning/channel/commitment-builder';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	decodeTxAddInputMessage,
@@ -4068,6 +4069,150 @@ describe('Splice', function () {
 			});
 			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
 			expect(fulfilled, 'HTLC fulfilled after the splice').to.be.true;
+		});
+
+		it('spliced-state balances conserve value with a committed HTLC in flight (pending-lock)', function () {
+			// The invariant pay-during-splice rests on: an HTLC's value leaves a
+			// balance at add and re-enters one only when its entry is deleted, so
+			// local + remote + Σ(htlcs) = capacity holds continuously and the
+			// spliced state's remainder computation stays correct with HTLCs in
+			// the map. Verified here at the pending-lock boundary on BOTH sides.
+			const { openerManager, channelId, openerChannel, acceptorChannel } =
+				createNormalChannelPair();
+
+			const paymentHash = crypto
+				.createHash('sha256')
+				.update(crypto.randomBytes(32))
+				.digest();
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					20_000_000n,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+
+			expect(openerManager.initiateQuiescence(channelId).ok).to.be.true;
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			expect(openerManager.initiateSplice(channelId, 100_000n, 253).ok).to.be
+				.true;
+			expect(openerChannel.isSplicePendingLock()).to.equal(true);
+
+			const openerSpliced = openerChannel.getSplicedStateForSigning();
+			const acceptorSpliced = acceptorChannel.getSplicedStateForSigning();
+			expect(openerSpliced).to.not.equal(null);
+			expect(acceptorSpliced).to.not.equal(null);
+			for (const spliced of [openerSpliced!, acceptorSpliced!]) {
+				let htlcMsat = 0n;
+				for (const e of spliced.htlcs.values()) htlcMsat += e.amountMsat;
+				expect(
+					spliced.localBalanceMsat + spliced.remoteBalanceMsat + htlcMsat
+				).to.equal(spliced.fundingSatoshis * 1000n);
+			}
+			// The check with teeth: BOTH SIDES agree on the split. Each side
+			// computes its own balance and derives the peer's as the remainder;
+			// disagreement here is exactly what produces "Invalid splice
+			// commitment signature" between real peers.
+			expect(openerSpliced!.localBalanceMsat).to.equal(
+				acceptorSpliced!.remoteBalanceMsat
+			);
+			expect(openerSpliced!.remoteBalanceMsat).to.equal(
+				acceptorSpliced!.localBalanceMsat
+			);
+			expect(openerSpliced!.fundingSatoshis).to.equal(
+				acceptorSpliced!.fundingSatoshis
+			);
+		});
+
+		it('getSpendableOutboundMsat is the addHtlc ceiling, and dips to the spliced side during a splice-out', function () {
+			// NORMAL: the helper is exactly the addHtlc arithmetic — local
+			// balance minus the peer-required reserve minus the opener's
+			// commitment fee with one more HTLC.
+			const fresh = createNormalChannelPair();
+			const spendable = fresh.openerChannel.getSpendableOutboundMsat();
+			const st = fresh.openerChannel.getFullState();
+			const expected =
+				st.localBalanceMsat -
+				st.remoteConfig.channelReserveSatoshis * 1000n -
+				BigInt(calculateCommitmentFee(st.localConfig.feeratePerKw, 1, false)) *
+					1000n;
+			expect(spendable).to.equal(expected);
+			expect(spendable > 0n).to.be.true;
+
+			// Pending-lock splice-out: the candidate commitment has less local
+			// balance, so the ceiling must drop by the amount leaving (which the
+			// initiator's relative carries, fee folded in).
+			const pair = createNormalChannelPair();
+			const before = pair.openerChannel.getSpendableOutboundMsat();
+			pair.openerManager.initiateQuiescence(pair.channelId);
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
+			pair.openerChannel.setSpliceOutDestination(destScript, 50_000n);
+			expect(
+				pair.openerManager.initiateSplice(
+					pair.channelId,
+					-(50_000n + spliceOutFee),
+					253
+				).ok
+			).to.be.true;
+			expect(pair.openerChannel.isSplicePendingLock()).to.equal(true);
+			expect(pair.openerChannel.getSpendableOutboundMsat()).to.equal(
+				before - (50_000n + spliceOutFee) * 1000n
+			);
+
+			// Pending-lock splice-in: the live side is the smaller commitment, so
+			// the ceiling is unchanged.
+			const spliceIn = createNormalChannelPair();
+			const beforeIn = spliceIn.openerChannel.getSpendableOutboundMsat();
+			spliceIn.openerManager.initiateQuiescence(spliceIn.channelId);
+			const inWallet = makeSpliceInWallet(100_000n);
+			spliceIn.openerChannel.setSpliceInInputs(
+				[inWallet.walletInput],
+				inWallet.changeScript
+			);
+			expect(
+				spliceIn.openerManager.initiateSplice(spliceIn.channelId, 100_000n, 253)
+					.ok
+			).to.be.true;
+			expect(spliceIn.openerChannel.isSplicePendingLock()).to.equal(true);
+			expect(spliceIn.openerChannel.getSpendableOutboundMsat()).to.equal(
+				beforeIn
+			);
+		});
+
+		it('getSpendableOutboundMsat gates at a staged update_fee rate before the round completes', function () {
+			// During a fee round the next commitments can build at the staged
+			// rate before localConfig is promoted; the ceiling must use the
+			// higher phase-aware rate immediately, or an add admitted at the old
+			// rate would not fit the commitment the builder actually produces.
+			const pair = createNormalChannelPair();
+			const st = pair.openerChannel.getFullState();
+			const before = pair.openerChannel.getSpendableOutboundMsat();
+			const oldRate = st.localConfig.feeratePerKw;
+			st.pendingFeeratePerKw = oldRate * 4;
+			const after = pair.openerChannel.getSpendableOutboundMsat();
+			const delta =
+				BigInt(
+					calculateCommitmentFee(oldRate * 4, 1, false) -
+						calculateCommitmentFee(oldRate, 1, false)
+				) * 1000n;
+			expect(after).to.equal(before - delta);
+			delete st.pendingFeeratePerKw;
 		});
 
 		it('should refuse abortSplice via manager once tx_signatures are exchanged (fund safety)', function () {

@@ -104,6 +104,7 @@ import {
 	calculateCommitmentFee,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
+	getRemoteCommitmentFeeRate,
 	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
@@ -1631,25 +1632,13 @@ export class Channel {
 			];
 		}
 
-		// Check we have enough balance (including reserve the remote requires us to
-		// maintain). When we are the funder we must ALSO be able to pay the
-		// commitment fee on top of the reserve (BOLT 2), or the commitment we build
-		// would silently clamp our output to 0 / be rejected by the peer. The
-		// update_fee path already enforces this; mirror it here for adding HTLCs.
-		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		let requiredMsat = reserveMsat;
-		if (this._state.role === ChannelRole.OPENER) {
-			const feeMsat =
-				BigInt(
-					calculateCommitmentFee(
-						this._state.localConfig.feeratePerKw,
-						this._countActiveHtlcs() + 1,
-						isAnchorChannel(this._state.channelType)
-					)
-				) * 1000n;
-			requiredMsat += feeMsat;
-		}
-		if (this._state.localBalanceMsat - amountMsat < requiredMsat) {
+		// Check we have enough balance (including reserve the remote requires us
+		// to maintain, plus the funder's commitment fee — BOLT 2). Delegated to
+		// getSpendableOutboundMsat so the same ceiling that gates an add here is
+		// the one accounting/routing surfaces report, and so a pending splice's
+		// lower-balance commitment (when the gates allow adds mid-splice) is
+		// automatically respected.
+		if (amountMsat > this.getSpendableOutboundMsat()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -6868,6 +6857,57 @@ export class Channel {
 		);
 	}
 
+	/**
+	 * A conservative ceiling on the outbound HTLC value this channel can add
+	 * right now, in msat: local balance minus the reserve the peer requires,
+	 * minus (for the opener) the commitment fee with one more HTLC. This is
+	 * the arithmetic addHtlc enforces. Conservative in one respect: the fee
+	 * counts every active HTLC, while the builder fees only the untrimmed set,
+	 * so this can under-report by the trimmed HTLCs' fee share — it never
+	 * over-admits.
+	 *
+	 * Phase-aware on fees: during an update_fee round the next local and
+	 * remote commitments can transiently build at different rates (the
+	 * builder's own accessors), and the HTLC must be affordable on whichever
+	 * is higher — a staged fee increase gates adds immediately, before the
+	 * round completes.
+	 *
+	 * While a splice awaits its lock, every update is mirrored onto BOTH
+	 * commitments (current funding + pending splice funding), so the
+	 * constraint is the minimum across the live and pending-splice local
+	 * balances: a splice-out's candidate commitment has less to spend, and an
+	 * HTLC the live commitment could afford would make the spliced one
+	 * unbuildable.
+	 */
+	getSpendableOutboundMsat(): bigint {
+		const spendableFor = (localMsat: bigint): bigint => {
+			const reserveMsat =
+				this._state.remoteConfig.channelReserveSatoshis * 1000n;
+			let requiredMsat = reserveMsat;
+			if (this._state.role === ChannelRole.OPENER) {
+				const feeratePerKw = Math.max(
+					getLocalCommitmentFeeRate(this._state),
+					getRemoteCommitmentFeeRate(this._state)
+				);
+				requiredMsat +=
+					BigInt(
+						calculateCommitmentFee(
+							feeratePerKw,
+							this._countActiveHtlcs() + 1,
+							isAnchorChannel(this._state.channelType)
+						)
+					) * 1000n;
+			}
+			const spendable = localMsat - requiredMsat;
+			return spendable > 0n ? spendable : 0n;
+		};
+		const live = spendableFor(this._state.localBalanceMsat);
+		const pendingSplice = this.getPendingSpliceLocalBalanceMsat();
+		if (pendingSplice === null) return live;
+		const spliced = spendableFor(pendingSplice);
+		return spliced < live ? spliced : live;
+	}
+
 	private _splicedState(): IChannelState | null {
 		if (!this._spliceTx || !this._spliceSession) return null;
 		const session = this._spliceSession;
@@ -6890,13 +6930,25 @@ export class Channel {
 			this._state.localBalanceMsat +
 			session.getLocalRelativeSatoshis() * 1000n -
 			myFeeMsat;
-		// Committed HTLCs riding through the splice (S-2.M8) hold value in
-		// NEITHER balance (it sits in their commitment outputs), so the peer's
-		// balance is the remainder of the new capacity AFTER the in-flight HTLC
-		// value. Without this each side attributes every HTLC's value to the
-		// OTHER side and the two build different commitments ("Invalid splice
-		// commitment signature"). The splice window is quiescent, so every
-		// entry is a settled committed HTLC.
+		// HTLCs riding through the splice (S-2.M8) hold value in NEITHER
+		// balance, so the peer's balance is the remainder of the new capacity
+		// AFTER the in-flight HTLC value. Without this each side attributes
+		// every HTLC's value to the OTHER side and the two build different
+		// commitments ("Invalid splice commitment signature").
+		//
+		// Summing EVERY entry is correct for in-flight adds and removals too,
+		// not just settled committed HTLCs: an HTLC's value leaves a balance at
+		// add time and re-enters one only when its entry is DELETED (settlement
+		// finalized at removal-commit in handleRevokeAndAck), so
+		//   localBalanceMsat + remoteBalanceMsat + Σ(htlcs) = capacity
+		// holds continuously, and the commitment builder makes its own
+		// per-commitment adjustments for mid-lifecycle entries from the shared
+		// htlcs map (buildLocalCommitment / buildRemoteCommitment). The spliced
+		// state only needs its base balances to satisfy the same invariant
+		// against the NEW capacity, which the remainder computation provides.
+		// This is what lets pending-lock commitment rounds (and, with the
+		// HTLC gates lifted, pay-during-splice) mirror updates onto both
+		// fundings without divergence.
 		let htlcInFlightMsat = 0n;
 		for (const e of this._state.htlcs.values()) {
 			htlcInFlightMsat += e.amountMsat;
