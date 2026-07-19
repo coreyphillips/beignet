@@ -4195,6 +4195,26 @@ describe('Splice', function () {
 			);
 		});
 
+		it('getSpendableOutboundMsat gates at a staged update_fee rate before the round completes', function () {
+			// During a fee round the next commitments can build at the staged
+			// rate before localConfig is promoted; the ceiling must use the
+			// higher phase-aware rate immediately, or an add admitted at the old
+			// rate would not fit the commitment the builder actually produces.
+			const pair = createNormalChannelPair();
+			const st = pair.openerChannel.getFullState();
+			const before = pair.openerChannel.getSpendableOutboundMsat();
+			const oldRate = st.localConfig.feeratePerKw;
+			st.pendingFeeratePerKw = oldRate * 4;
+			const after = pair.openerChannel.getSpendableOutboundMsat();
+			const delta =
+				BigInt(
+					calculateCommitmentFee(oldRate * 4, 1, false) -
+						calculateCommitmentFee(oldRate, 1, false)
+				) * 1000n;
+			expect(after).to.equal(before - delta);
+			delete st.pendingFeeratePerKw;
+		});
+
 		it('should refuse abortSplice via manager once tx_signatures are exchanged (fund safety)', function () {
 			const { openerManager, channelId, openerChannel } =
 				createNormalChannelPair();

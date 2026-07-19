@@ -104,6 +104,7 @@ import {
 	calculateCommitmentFee,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
+	getRemoteCommitmentFeeRate,
 	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
@@ -6857,10 +6858,19 @@ export class Channel {
 	}
 
 	/**
-	 * The most outbound HTLC value this channel can add right now, in msat:
-	 * local balance minus the reserve the peer requires, minus (for the
-	 * opener) the commitment fee with one more HTLC — the same arithmetic
-	 * addHtlc enforces.
+	 * A conservative ceiling on the outbound HTLC value this channel can add
+	 * right now, in msat: local balance minus the reserve the peer requires,
+	 * minus (for the opener) the commitment fee with one more HTLC. This is
+	 * the arithmetic addHtlc enforces. Conservative in one respect: the fee
+	 * counts every active HTLC, while the builder fees only the untrimmed set,
+	 * so this can under-report by the trimmed HTLCs' fee share — it never
+	 * over-admits.
+	 *
+	 * Phase-aware on fees: during an update_fee round the next local and
+	 * remote commitments can transiently build at different rates (the
+	 * builder's own accessors), and the HTLC must be affordable on whichever
+	 * is higher — a staged fee increase gates adds immediately, before the
+	 * round completes.
 	 *
 	 * While a splice awaits its lock, every update is mirrored onto BOTH
 	 * commitments (current funding + pending splice funding), so the
@@ -6875,10 +6885,14 @@ export class Channel {
 				this._state.remoteConfig.channelReserveSatoshis * 1000n;
 			let requiredMsat = reserveMsat;
 			if (this._state.role === ChannelRole.OPENER) {
+				const feeratePerKw = Math.max(
+					getLocalCommitmentFeeRate(this._state),
+					getRemoteCommitmentFeeRate(this._state)
+				);
 				requiredMsat +=
 					BigInt(
 						calculateCommitmentFee(
-							this._state.localConfig.feeratePerKw,
+							feeratePerKw,
 							this._countActiveHtlcs() + 1,
 							isAnchorChannel(this._state.channelType)
 						)
