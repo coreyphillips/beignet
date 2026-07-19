@@ -90,6 +90,18 @@ export interface IFundingProvider {
 	}>;
 
 	/**
+	 * Price a splice-in without performing one (optional): the fee and the
+	 * largest fundable amount at this feerate, computed with the same UTXO
+	 * filter and weight formula selectSpliceInputs will use.
+	 */
+	quoteSpliceIn?(feeratePerKw: number): {
+		spendableSats: bigint;
+		feeSats: bigint;
+		maxAmountSats: bigint;
+		inputCount: number;
+	};
+
+	/**
 	 * Anchor fee-bumping (optional): select wallet UTXOs to fund a fee bump and
 	 * return them (each with prevTx, value and a witness-signing closure) plus a
 	 * change script. Used to attach a fee input to a zero-fee second-level HTLC

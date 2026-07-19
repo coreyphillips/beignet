@@ -744,6 +744,14 @@ async function handleChannel(): Promise<void> {
 						: undefined
 				})
 			);
+		case 'splice-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/splice-quote', {
+					channelId: filteredArgs[2],
+					direction: filteredArgs[3],
+					feeratePerkw: parseInt(filteredArgs[4], 10)
+				})
+			);
 		case 'splice-in':
 			return outputResult(
 				await httpRequest('POST', '/channel/splice-in', {
@@ -889,7 +897,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -2171,6 +2179,8 @@ Channels:
                                          Connect to peer + open in one call
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
+  channel splice-quote <id> <in|out> <feerate>
+                                         Quote a splice: fee + max amount
   channel splice-in <id> <sats> <feerate>   Add funds to channel
   channel splice-out <id> <sats> <feerate>  Withdraw funds from channel
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count

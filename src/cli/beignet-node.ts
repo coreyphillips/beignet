@@ -3914,6 +3914,18 @@ export class BeignetNode extends EventEmitter {
 
 	// ─────────────── Splicing ───────────────
 
+	spliceQuote(
+		channelId: string,
+		direction: 'in' | 'out',
+		feeratePerkw: number
+	): ReturnType<LightningNode['spliceQuote']> {
+		return this.node.spliceQuote(
+			Buffer.from(channelId, 'hex'),
+			direction,
+			feeratePerkw
+		);
+	}
+
 	spliceIn(
 		channelId: string,
 		amountSats: number,

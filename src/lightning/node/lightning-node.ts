@@ -4218,6 +4218,71 @@ export class LightningNode extends EventEmitter {
 	 *   transaction. Only this splice-out is affected; force-close and justice
 	 *   sweeps continue to use the sweep script.
 	 */
+	/**
+	 * Price a splice without performing one: the on-chain fee and the largest
+	 * amount that can actually move at this feerate. Splice-in asks the funding
+	 * provider (same UTXO filter and weight formula as the real selection);
+	 * splice-out prices from the channel's own spendable balance net of the
+	 * reserve the peer actually set. Exists so a UI never has to reconstruct
+	 * this arithmetic and offer an amount the daemon then rejects.
+	 */
+	spliceQuote(
+		channelId: Buffer,
+		direction: 'in' | 'out',
+		fundingFeeratePerkw = 253
+	): {
+		direction: 'in' | 'out';
+		feeSats: number;
+		spendableSats: number;
+		maxAmountSats: number;
+		reserveSats?: number;
+		inputCount?: number;
+	} {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			throw new Error(`Channel not found: ${channelId.toString('hex')}`);
+		}
+
+		if (direction === 'out') {
+			const destination = this.getSweepDestinationScript();
+			const feeSats = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destination.length
+				}),
+				fundingFeeratePerkw
+			);
+			const state = channel.getFullState();
+			const reserve = state.remoteConfig?.channelReserveSatoshis ?? 0n;
+			const local = channel.getBalances().localMsat / 1000n;
+			const spendable = local > reserve ? local - reserve : 0n;
+			const max = spendable > feeSats ? spendable - feeSats : 0n;
+			return {
+				direction,
+				feeSats: Number(feeSats),
+				spendableSats: Number(spendable),
+				maxAmountSats: Number(max),
+				reserveSats: Number(reserve)
+			};
+		}
+
+		if (!this.fundingProvider?.quoteSpliceIn) {
+			throw new Error(
+				'splice-in quote requires a funding provider with quoteSpliceIn (wallet UTXO sourcing)'
+			);
+		}
+		const q = this.fundingProvider.quoteSpliceIn(fundingFeeratePerkw);
+		return {
+			direction,
+			feeSats: Number(q.feeSats),
+			spendableSats: Number(q.spendableSats),
+			maxAmountSats: Number(q.maxAmountSats),
+			inputCount: q.inputCount
+		};
+	}
+
 	spliceOut(
 		channelId: Buffer,
 		amountSats: bigint,

@@ -80,6 +80,7 @@ describe('OpenAPI Spec Completeness', () => {
 		'/trusted-peers',
 		'/channel/open-zeroconf',
 		'/channel/open-v2',
+		'/channel/splice-quote',
 		'/channel/splice-in',
 		'/channel/splice-out',
 		'/channel/wait-ready',

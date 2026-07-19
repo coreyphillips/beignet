@@ -636,6 +636,10 @@ describe('BeignetNode new methods', () => {
 		expect(typeof BeignetNode.prototype.openChannelV2).to.equal('function');
 	});
 
+	it('should have spliceQuote method', () => {
+		expect(typeof BeignetNode.prototype.spliceQuote).to.equal('function');
+	});
+
 	it('should have spliceIn method', () => {
 		expect(typeof BeignetNode.prototype.spliceIn).to.equal('function');
 	});
