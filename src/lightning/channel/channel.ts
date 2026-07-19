@@ -6842,6 +6842,32 @@ export class Channel {
 	 * commitment during the mid-splice commitment round WITHOUT mutating the live
 	 * state (the old commitment must stay valid until splice_locked).
 	 */
+	/**
+	 * The local balance this channel will settle to when the in-flight splice
+	 * locks, or null when no splice is past its point of no return. Uses the
+	 * same arithmetic as the spliced commitment (_splicedState), so accounting
+	 * surfaces can report the pending balance without reconstructing splice
+	 * semantics: the live localBalanceMsat stays pre-splice until splice_locked,
+	 * which would make a max splice-in's newly added sats vanish from every
+	 * reported figure during the confirmation window.
+	 *
+	 * Gated on spliceInFlight (recorded at the point of no return): before
+	 * that, splice-in wallet UTXOs are still visible in the on-chain balance,
+	 * and counting the post-splice figure would double-count them.
+	 */
+	getPendingSpliceLocalBalanceMsat(): bigint | null {
+		if (!this._state.spliceInFlight) return null;
+		const spliced = this._splicedState();
+		if (spliced) return spliced.localBalanceMsat;
+		// The in-memory session is not rebuilt yet (e.g. shortly after a
+		// restart): net-change accounting from the persisted record, matching
+		// completeSplice's fallback (does not subtract the on-chain fee).
+		return (
+			this._state.localBalanceMsat +
+			this._state.spliceInFlight.localRelativeSatoshis * 1000n
+		);
+	}
+
 	private _splicedState(): IChannelState | null {
 		if (!this._spliceTx || !this._spliceSession) return null;
 		const session = this._spliceSession;
