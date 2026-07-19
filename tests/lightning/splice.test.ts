@@ -5050,32 +5050,52 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
-		it('refuses to force-close against the spent old funding when adoption is impossible', function () {
-			// The defensive floor: splice confirmed, but the in-memory session
-			// is gone and cannot be rebuilt (worst-case restart). Broadcasting
-			// the old-funding commitment would be knowingly unconfirmable — the
-			// force-close must refuse instead.
+		it('recovers a unilateral exit from the persisted record alone (worst-case restart)', function () {
+			// The in-memory splice session is gone and cannot be rebuilt — the
+			// case that used to end in a safe refusal. The point-of-no-return
+			// record carries everything adoption needs (outpoint, capacity,
+			// relatives, the peer's funding pubkey and splice-side signatures),
+			// so completeSplice now adopts session-free and the force-close
+			// exits on the confirmed NEW funding, mid-splice HTLC aboard. The
+			// #147 refusal guard remains as the unreachable last line of defense.
 			const pair = pendingLockPair();
 			const { openerManager, channelId, openerChannel, acceptorPubkey } = pair;
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
 			openerManager.handlePeerDisconnected(acceptorPubkey);
 			openerChannel.markSpliceConfirmed();
-			// Sabotage: no session, and restore made impotent.
+			// Worst-case restart: no session, restore impotent, in-memory
+			// splice-side signature copies gone.
 			(openerChannel as any)._spliceSession = null;
 			(openerChannel as any).restoreSpliceInFlight = () => {};
+			(openerChannel as any)._spliceRemoteCommitmentSig = null;
+			(openerChannel as any)._spliceRemoteHtlcSigs = null;
 
 			const dest = Buffer.concat([
 				Buffer.from([0x00, 0x14]),
 				crypto.randomBytes(20)
 			]);
 			const res = openerManager.forceClose(channelId, dest);
-			expect(res.ok, 'refused rather than broadcast unconfirmable').to.equal(
-				false
-			);
-			expect(String(res.error)).to.include('could not be adopted');
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
 			expect(
-				findAction(res.actions, ChannelActionType.BROADCAST_TX),
-				'nothing broadcast'
-			).to.equal(undefined);
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'exits on the confirmed NEW funding from the record alone'
+			).to.equal(true);
+			expect(
+				tx.outs.some((o) => o.value === 15_000),
+				'the mid-splice HTLC rode onto the record-adopted commitment'
+			).to.equal(true);
 		});
 
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {

@@ -7701,7 +7701,51 @@ export class Channel {
 	 * Complete the splice: update channel funding outpoint, balances, and exit quiescence.
 	 */
 	private completeSplice(): void {
-		if (!this._spliceSession) return;
+		const inflight = this._state.spliceInFlight;
+		if (!this._spliceSession && !inflight) return;
+
+		if (!this._spliceSession) {
+			// Session-free adoption from the persisted point-of-no-return record:
+			// the worst-case restart where the in-memory session could not be
+			// rebuilt. The record carries everything the swap needs — beignet
+			// reuses its own local funding pubkey across a splice, the peer's is
+			// stored, and the balance arithmetic mirrors _splicedState exactly
+			// (fee borne by the initiator; in-flight HTLC value in neither
+			// balance).
+			const newCapacity = inflight!.newFundingSatoshis;
+			const feeFromChannelSats =
+				this._state.fundingSatoshis +
+				inflight!.localRelativeSatoshis +
+				inflight!.remoteRelativeSatoshis -
+				newCapacity;
+			const myFeeMsat = inflight!.isInitiator ? feeFromChannelSats * 1000n : 0n;
+			const myNewLocalMsat =
+				this._state.localBalanceMsat +
+				inflight!.localRelativeSatoshis * 1000n -
+				myFeeMsat;
+			let htlcInFlightMsat = 0n;
+			for (const e of this._state.htlcs.values()) {
+				htlcInFlightMsat += e.amountMsat;
+			}
+			const theirNewMsat =
+				newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+
+			this._state.spliceFundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.spliceFundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.fundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingSatoshis = newCapacity;
+			this._state.localBalanceMsat = myNewLocalMsat;
+			this._state.remoteBalanceMsat = theirNewMsat;
+			if (this._state.remoteBasepoints) {
+				this._state.remoteBasepoints = {
+					...this._state.remoteBasepoints,
+					fundingPubkey: Buffer.from(inflight!.remoteFundingPubkey)
+				};
+			}
+			this._finishCompleteSplice();
+			return;
+		}
 
 		// Capture the fee-adjusted new outpoint/capacity/balances from the actual
 		// splice transaction before the driver is reset.
@@ -7734,12 +7778,28 @@ export class Channel {
 				this._spliceSession.getRemoteRelativeSatoshis() * 1000n;
 		}
 
+		this._finishCompleteSplice();
+	}
+
+	/**
+	 * The funding-independent tail of completeSplice: adopt the peer's
+	 * splice-side signatures, reset announcement state for the new funding
+	 * generation, exit quiescence, return to NORMAL and clear the splice
+	 * bookkeeping. Shared by the session-driven and session-free (post-restart)
+	 * adoption paths.
+	 */
+	private _finishCompleteSplice(): void {
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
-		// spliced channel. If for some reason no mid-splice commitment was
-		// exchanged, fall back to driving a post-splice commitment round.
-		if (this._spliceRemoteCommitmentSig) {
-			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
+		// spliced channel. After a restart the in-memory copy is gone but the
+		// point-of-no-return record still holds it. If no mid-splice commitment
+		// was ever exchanged, fall back to driving a post-splice round.
+		const adoptedSig =
+			this._spliceRemoteCommitmentSig ??
+			this._state.spliceInFlight?.remoteCommitmentSig ??
+			null;
+		if (adoptedSig) {
+			this._state.remoteCommitmentSignature = Buffer.from(adoptedSig);
 			// Committed HTLCs that rode through the splice (S-2.M8) keep their
 			// outputs on the post-splice commitment; adopt the peer's verified
 			// second-level sigs over them (empty for an HTLC-free splice).
