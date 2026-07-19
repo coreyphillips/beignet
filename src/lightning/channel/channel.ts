@@ -3559,6 +3559,38 @@ export class Channel {
 			];
 		}
 
+		// A splice tx that CONFIRMED makes the old funding output unspendable —
+		// the live-state commitment below would spend a spent outpoint and can
+		// never confirm, leaving no unilateral exit. The only valid exit is the
+		// commitment on the NEW funding, whose peer signatures the
+		// point-of-no-return record carries; adopt the spliced view first
+		// (completeSplice swaps the outpoint, balances and signature material,
+		// exactly as a splice_locked exchange would — the peer's signatures are
+		// over commitment N regardless of whether splice_locked ever crossed).
+		//
+		// Judged by EFFECTIVE state: the production shape of "peer vanished" is
+		// a disconnect wrapping SPLICING in AWAITING_REESTABLISH (that is where
+		// the chain watcher records the confirmation it could not announce),
+		// and the reestablish-timeout auto-close arrives in exactly that state.
+		const spliceEffState =
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: this._state.state;
+		if (
+			spliceEffState === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.confirmed === true
+		) {
+			// After a restart the in-memory splice session may not be rebuilt
+			// yet; restore is a no-op when it already exists.
+			this.restoreSpliceInFlight();
+			this.completeSplice();
+			if (this._state.state === ChannelState.NORMAL) {
+				// Adoption succeeded from inside the reestablish wrapper: the
+				// wrapper's return-to state no longer exists.
+				this._state.preReestablishState = null;
+			}
+		}
+
 		if (!this._state.fundingTxid || !this._state.remoteBasepoints) {
 			return [
 				{
