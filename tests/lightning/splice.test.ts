@@ -5145,6 +5145,48 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
+		it('refuses to splice a taproot (MuSig2) channel, both sides, with a real answer', function () {
+			// The splice commitment machinery is ECDSA-only; an attempted
+			// taproot splice used to fail messily mid-negotiation. It now
+			// refuses up front on both the initiator and acceptor paths.
+			// Full taproot splicing is its own tracked project.
+			const { openerChannel, acceptorChannel } = createNormalChannelPair();
+			const flags = FeatureFlags.empty();
+			flags.setCompulsory(Feature.OPTION_TAPROOT);
+			openerChannel.getFullState().channelType = flags.toBuffer();
+			acceptorChannel.getFullState().channelType = flags.toBuffer();
+
+			const initActions = openerChannel.initiateSplice(50_000n, 253);
+			const initErr = findAction(initActions, ChannelActionType.ERROR);
+			expect(initErr, 'initiator refused').to.not.equal(undefined);
+			expect(String(initErr.message)).to.include('taproot');
+			expect(openerChannel.getState(), 'no state change').to.equal(
+				ChannelState.NORMAL
+			);
+
+			acceptorChannel.initiateQuiescence();
+			(acceptorChannel as any)._quiescence.forceQuiescent?.();
+			// Drive the acceptor's handleSplice gate directly: quiescent taproot
+			// channel receiving splice_init must refuse with the same answer.
+			(acceptorChannel.getFullState() as any).quiescenceState = 'QUIESCENT';
+			const quiesced = (acceptorChannel as any)._quiescence;
+			if (quiesced && typeof quiesced.isQuiescent === 'function') {
+				const orig = quiesced.isQuiescent.bind(quiesced);
+				quiesced.isQuiescent = () => true;
+				const acceptActions = acceptorChannel.handleSplice({
+					channelId: acceptorChannel.getChannelId()!,
+					relativeSatoshis: 50_000n,
+					fundingFeeratePerkw: 253,
+					locktime: 0,
+					fundingPubkey: crypto.randomBytes(33)
+				} as any);
+				quiesced.isQuiescent = orig;
+				const acceptErr = findAction(acceptActions, ChannelActionType.ERROR);
+				expect(acceptErr, 'acceptor refused').to.not.equal(undefined);
+				expect(String(acceptErr.message)).to.include('taproot');
+			}
+		});
+
 		it('recovers a unilateral exit from the persisted record alone (worst-case restart)', function () {
 			// The in-memory splice session is gone and cannot be rebuilt — the
 			// case that used to end in a safe refusal. The point-of-no-return

@@ -5949,6 +5949,22 @@ export class Channel {
 			];
 		}
 
+		// The splice commitment machinery is ECDSA-only: the mid-splice round
+		// signs with signRemoteCommitment, which would produce garbage for a
+		// MuSig2 funding and wedge the negotiation against a real peer. Refuse
+		// up front with a real answer instead. Taproot splicing (aggregate key
+		// for the new funding, nonce lifecycle across the splice, batched
+		// partials) is tracked separately.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot splice: taproot (MuSig2) channels do not support splicing yet'
+				}
+			];
+		}
+
 		if (!this._state.channelId) {
 			return [
 				{
@@ -6071,6 +6087,19 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot accept splice: channel must be quiescent'
+				}
+			];
+		}
+
+		// Mirror of initiateSplice: the ECDSA-only splice commitment machinery
+		// cannot serve a MuSig2 funding; refuse before any negotiation state
+		// exists (the peer receives tx_abort semantics via the error path).
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
 				}
 			];
 		}
