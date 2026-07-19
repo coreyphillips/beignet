@@ -4943,6 +4943,80 @@ describe('Splice', function () {
 			});
 		});
 
+		it('force-close mid-splice (splice unconfirmed) exits on the OLD funding with the HTLC aboard', function () {
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			const oldFunding = Buffer.from(openerChannel.getFullState().fundingTxid!);
+
+			// A mid-splice HTLC must ride on whichever commitment exits.
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
+			expect(
+				Buffer.from(tx.ins[0].hash).equals(oldFunding),
+				'spends the OLD funding while the splice tx is unconfirmed'
+			).to.equal(true);
+			expect(
+				tx.outs.some((o) => o.value === 15_000),
+				'the mid-splice HTLC has its output on the exiting commitment'
+			).to.equal(true);
+		});
+
+		it('force-close after the splice tx CONFIRMED exits on the NEW funding (no splice_locked ever)', function () {
+			// The peer vanished after tx_signatures; the splice tx confirmed on
+			// chain. The old funding is spent — the live-state commitment could
+			// never confirm — so forceClose must adopt the spliced view and exit
+			// on the new funding, carrying the mid-splice HTLC with it.
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
+
+			// The chain watcher saw the confirmation but splice_locked could not
+			// be exchanged (peer gone).
+			openerChannel.markSpliceConfirmed();
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
+			expect(
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'spends the NEW (confirmed splice) funding'
+			).to.equal(true);
+			expect(
+				tx.outs.some((o) => o.value === 15_000),
+				'the mid-splice HTLC rode onto the spliced commitment'
+			).to.equal(true);
+		});
+
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {
 			// The splicing spec's transition race: we lock and complete while the
 			// peer, not yet having observed our splice_locked, sends a

@@ -3559,6 +3559,21 @@ export class Channel {
 			];
 		}
 
+		// A splice tx that CONFIRMED makes the old funding output unspendable —
+		// the live-state commitment below would spend a spent outpoint and can
+		// never confirm, leaving no unilateral exit. The only valid exit is the
+		// commitment on the NEW funding, whose peer signatures the
+		// point-of-no-return record carries; adopt the spliced view first
+		// (completeSplice swaps the outpoint, balances and signature material,
+		// exactly as a splice_locked exchange would — the peer's signatures are
+		// over commitment N regardless of whether splice_locked ever crossed).
+		if (
+			this._state.state === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.confirmed === true
+		) {
+			this.completeSplice();
+		}
+
 		if (!this._state.fundingTxid || !this._state.remoteBasepoints) {
 			return [
 				{
