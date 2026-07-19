@@ -4511,31 +4511,185 @@ describe('Splice', function () {
 			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
-		it('rejects new HTLC traffic during the pending-lock window', function () {
-			// The pending-lock window supports only update_fee + commitment
-			// batches (what CLN sends); adding an HTLC there is refused so no
-			// HTLC can be committed on the spliced commitment before it locks.
-			const { openerManager, channelId, openerChannel } = pendingLockPair();
-			const paymentHash = crypto.createHash('sha256').update('x').digest();
-			// Drive the channel state machine directly (the manager wrapper always
-			// reports ok:true and surfaces the refusal as an ERROR action).
-			const actions = openerChannel.addHtlc(
+		it('accepts new HTLC traffic during the pending-lock window (pay during splice)', function () {
+			// tx_signatures have crossed both ways: per the splicing extension
+			// quiescence is over and update traffic resumes, with every update
+			// mirrored onto both fundings by start_batch commitment rounds. The
+			// old behavior (parking the channel until splice_locked) is exactly
+			// what #139 removes.
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = pendingLockPair();
+			expect(openerChannel.isQuiescent(), 'quiescence over at pending-lock').to
+				.be.false;
+			expect(acceptorChannel.isQuiescent()).to.be.false;
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			// The loopback drove the full batch round: the add is committed on
+			// BOTH sides, and both hold the peer's splice-side HTLC signature
+			// (the force-close witness material on the new funding).
+			const entry = [...openerChannel.getFullState().htlcs.values()][0];
+			expect(entry.state, 'HTLC committed mid-splice').to.equal(
+				HtlcState.COMMITTED
+			);
+			expect(
+				openerChannel.getFullState().spliceInFlight?.remoteHtlcSignatures
+					?.length,
+				'opener holds splice-side HTLC sig'
+			).to.equal(1);
+
+			// It settles mid-splice too.
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(fulfilled, 'HTLC fulfilled during pending-lock').to.be.true;
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
+
+			// And the splice still locks cleanly afterwards.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('an HTLC added mid-splice survives the lock and settles on the spliced channel', function () {
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = pendingLockPair();
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					paymentHash,
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+			const openerLocalBefore = openerChannel.getBalances().localMsat;
+
+			// Lock with the HTLC still in flight: it must ride onto the spliced
+			// channel (completeSplice adopts the splice-side signatures).
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(1);
+			expect(
+				openerChannel.getFullState().remoteHtlcSignatures.length,
+				'adopted splice HTLC sig at lock'
+			).to.equal(1);
+
+			// Settles normally on the spliced channel, crediting the acceptor.
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(fulfilled).to.be.true;
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+			// The fulfilled amount went to the acceptor; the opener keeps its
+			// post-add balance plus the 100k sats the splice-in added at the lock.
+			expect(openerChannel.getBalances().localMsat).to.equal(
+				openerLocalBefore + 100_000_000n
+			);
+			expect(acceptorChannel.getBalances().localMsat).to.equal(
+				openerChannel.getBalances().remoteMsat
+			);
+		});
+
+		it('spliced-state invariant holds at every HTLC lifecycle stage mid-splice', function () {
+			// The table-driven check the review asked for before lifting gates:
+			// at each observable stage of add and settle during pending-lock, the
+			// spliced states of BOTH sides conserve value against the new
+			// capacity and agree on the split (divergence here is 'Invalid
+			// splice commitment signature' between real peers).
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel
+			} = pendingLockPair();
+
+			const assertInvariant = (label: string): void => {
+				const o = openerChannel.getSplicedStateForSigning();
+				const a = acceptorChannel.getSplicedStateForSigning();
+				expect(o, `${label}: opener spliced state`).to.not.equal(null);
+				expect(a, `${label}: acceptor spliced state`).to.not.equal(null);
+				for (const spliced of [o!, a!]) {
+					let htlcMsat = 0n;
+					for (const e of spliced.htlcs.values()) htlcMsat += e.amountMsat;
+					expect(
+						spliced.localBalanceMsat + spliced.remoteBalanceMsat + htlcMsat,
+						`${label}: conservation`
+					).to.equal(spliced.fundingSatoshis * 1000n);
+				}
+				expect(o!.localBalanceMsat, `${label}: split (local/remote)`).to.equal(
+					a!.remoteBalanceMsat
+				);
+				expect(o!.remoteBalanceMsat, `${label}: split (remote/local)`).to.equal(
+					a!.localBalanceMsat
+				);
+			};
+
+			assertInvariant('pending-lock, no HTLC');
+
+			// Opener → acceptor add, committed via the loopback batch rounds.
+			const p1 = crypto.randomBytes(32);
+			openerManager.addHtlc(
+				channelId,
 				15_000_000n,
-				paymentHash,
+				crypto.createHash('sha256').update(p1).digest(),
 				500000,
 				crypto.randomBytes(1366)
 			);
-			expect(
-				actions.some((a) => a.type === ChannelActionType.ERROR),
-				'HTLC add refused during pending-lock'
-			).to.equal(true);
-			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
-			expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
-			// The splice still locks cleanly with no in-flight HTLCs.
-			openerManager.sendSpliceLocked(channelId);
-			expect(openerChannel.getFullState().remoteHtlcSignatures).to.deep.equal(
-				[]
+			assertInvariant('offered add committed');
+
+			// Acceptor → opener add in the opposite direction, coexisting.
+			const p2 = crypto.randomBytes(32);
+			acceptorManager.addHtlc(
+				channelId,
+				7_000_000n,
+				crypto.createHash('sha256').update(p2).digest(),
+				500000,
+				crypto.randomBytes(1366)
 			);
+			assertInvariant('adds in both directions');
+
+			// Fulfill one; fail the other.
+			acceptorManager.fulfillHtlc(channelId, 0n, p1);
+			assertInvariant('one fulfilled, one live');
+			openerManager.failHtlc(channelId, 0n, Buffer.from([0x10, 0x0f]));
+			assertInvariant('one fulfilled, one failed');
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+
+			// The window ends cleanly after all of it.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
 		it('rejects a batch whose splice-side signature is invalid WITHOUT revoking', function () {

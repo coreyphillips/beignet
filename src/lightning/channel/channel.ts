@@ -1571,7 +1571,13 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
+		// update traffic has resumed per the splicing extension, and every add
+		// is mirrored onto both fundings by the start_batch commitment round.
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1709,7 +1715,10 @@ export class Channel {
 	 * Handle update_add_htlc from remote (received HTLC).
 	 */
 	handleUpdateAddHtlc(msg: IUpdateAddHtlcMessage): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
 			];
@@ -1906,7 +1915,8 @@ export class Channel {
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -1965,7 +1975,8 @@ export class Channel {
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2048,7 +2059,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2117,7 +2129,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2172,7 +2185,8 @@ export class Channel {
 	handleUpdateFailHtlc(msg: IUpdateFailHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2225,7 +2239,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -6823,6 +6838,19 @@ export class Channel {
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
+
+		// The splice negotiation is over once tx_signatures have crossed both
+		// ways; per the splicing extension quiescence ends with it, and update
+		// traffic (HTLCs, fees) resumes while the splice awaits its lock, with
+		// every update mirrored onto both fundings via start_batch commitment
+		// rounds. Exiting here (not at splice_locked) is what makes
+		// pay-during-splice possible; completeSplice's exit remains as the
+		// backstop for states persisted before this change.
+		if (this.isSplicePendingLock() && this._quiescence.isQuiescent()) {
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+		}
 	}
 
 	/**
@@ -7068,6 +7096,20 @@ export class Channel {
 	 * one plus the pending splice), announced by start_batch and acknowledged
 	 * with a single revoke_and_ack.
 	 */
+	/**
+	 * True when HTLC update traffic may flow during the splice's pending-lock
+	 * window. Restricted to ECDSA channels for now: the manager's taproot
+	 * (MuSig2) auto-sign path does not batch-sign both fundings yet, so a
+	 * taproot channel adding HTLCs mid-splice would commit them on only one
+	 * commitment — the exact divergence the batch exists to prevent. Taproot
+	 * channels keep the pre-#139 behavior (parked until splice_locked).
+	 */
+	canUpdateHtlcsDuringSplice(): boolean {
+		return (
+			this.isSplicePendingLock() && !isTaprootChannel(this._state.channelType)
+		);
+	}
+
 	isSplicePendingLock(): boolean {
 		return (
 			this._state.state === ChannelState.SPLICING &&
