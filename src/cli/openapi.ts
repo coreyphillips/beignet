@@ -2466,7 +2466,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						splicingBalanceSats: {
 							type: 'integer',
 							description:
-								'Post-splice local balance of channels with a splice in flight (what they settle to at splice_locked, when it rejoins lightningBalanceSats)'
+								'Splice-in-transit funds: for channels paying through their splice, only what is still arriving; for parked mid-splice channels, the whole settle-to balance. Rejoins lightningBalanceSats at splice_locked'
 						},
 						channelCount: { type: 'integer' },
 						peerCount: { type: 'integer' },
@@ -2483,7 +2483,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						splicingSats: {
 							type: 'integer',
 							description:
-								'Post-splice local balance of channels with a splice in flight; rejoins lightning at splice_locked. Excluded from total, which counts only currently spendable funds'
+								'Splice-in-transit funds (see splicingBalanceSats); rejoins lightning at splice_locked. Excluded from total, which counts only currently spendable funds'
 						}
 					}
 				},

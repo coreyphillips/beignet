@@ -26,12 +26,13 @@ export interface NodeInfo {
 	 */
 	erroredBalanceSats: number;
 	/**
-	 * Balance the wallet's splicing channels SETTLE TO when their splices
-	 * lock: post-splice local balance, so a max splice-in's newly added sats
-	 * are accounted for here during the confirmation window (the live channel
-	 * balance stays pre-splice until splice_locked, and the swept UTXOs have
-	 * already left onchainBalanceSats). Rejoins lightningBalanceSats at
-	 * splice_locked.
+	 * Splice-in-transit funds. For a channel paying through its splice
+	 * (pay-during-splice, ECDSA pending-lock), the canonical lightning balance
+	 * already counts it at the conservative side of its two fundings, and this
+	 * bucket holds only what is still arriving (a splice-in's added sats until
+	 * the lock). For a parked mid-splice channel (taproot, or before the point
+	 * of no return), the whole settle-to balance sits here. Rejoins
+	 * lightningBalanceSats at splice_locked.
 	 */
 	splicingBalanceSats: number;
 	channelCount: number;
@@ -326,8 +327,8 @@ export interface BalanceInfo {
 	total: number;
 	unsettledSats?: number;
 	/**
-	 * Post-splice local balance of channels with a splice in flight (see
-	 * NodeInfo.splicingBalanceSats). Rejoins lightning at splice_locked.
+	 * Splice-in-transit funds (see NodeInfo.splicingBalanceSats). Rejoins
+	 * lightning at splice_locked.
 	 */
 	splicingSats?: number;
 }
