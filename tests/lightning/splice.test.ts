@@ -5050,6 +5050,34 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
+		it('refuses to force-close against the spent old funding when adoption is impossible', function () {
+			// The defensive floor: splice confirmed, but the in-memory session
+			// is gone and cannot be rebuilt (worst-case restart). Broadcasting
+			// the old-funding commitment would be knowingly unconfirmable — the
+			// force-close must refuse instead.
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel, acceptorPubkey } = pair;
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			openerChannel.markSpliceConfirmed();
+			// Sabotage: no session, and restore made impotent.
+			(openerChannel as any)._spliceSession = null;
+			(openerChannel as any).restoreSpliceInFlight = () => {};
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, 'refused rather than broadcast unconfirmable').to.equal(
+				false
+			);
+			expect(String(res.error)).to.include('could not be adopted');
+			expect(
+				findAction(res.actions, ChannelActionType.BROADCAST_TX),
+				'nothing broadcast'
+			).to.equal(undefined);
+		});
+
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {
 			// The splicing spec's transition race: we lock and complete while the
 			// peer, not yet having observed our splice_locked, sends a

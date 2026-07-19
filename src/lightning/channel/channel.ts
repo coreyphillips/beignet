@@ -3580,10 +3580,30 @@ export class Channel {
 			spliceEffState === ChannelState.SPLICING &&
 			this._state.spliceInFlight?.confirmed === true
 		) {
+			// Capture the adoption target BEFORE completeSplice nulls the record.
+			const expectedTxid = Buffer.from(this._state.spliceInFlight.spliceTxid);
+			const expectedOutputIndex =
+				this._state.spliceInFlight.newFundingOutputIndex;
 			// After a restart the in-memory splice session may not be rebuilt
 			// yet; restore is a no-op when it already exists.
 			this.restoreSpliceInFlight();
 			this.completeSplice();
+			// Never knowingly broadcast a commitment against the spent
+			// pre-splice funding: if the session could not be rebuilt and the
+			// adoption no-oped, refuse rather than produce an unconfirmable
+			// exit and transition toward FORCE_CLOSED on the strength of it.
+			if (
+				!this._state.fundingTxid?.equals(expectedTxid) ||
+				this._state.fundingOutputIndex !== expectedOutputIndex
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot force close: confirmed splice funding could not be adopted'
+					}
+				];
+			}
 			if (this._state.state === ChannelState.NORMAL) {
 				// Adoption succeeded from inside the reestablish wrapper: the
 				// wrapper's return-to state no longer exists.
