@@ -460,6 +460,54 @@ describe('WalletFundingProvider', () => {
 				expect((err as Error).message).to.include('does not support splice-in');
 			}
 		});
+
+		describe('quoteSpliceIn', () => {
+			it('quotes a max the selection will actually fund', async () => {
+				// The regression this guards: a UI computed its own "max" from the
+				// total balance and an approximate fee, and the daemon then rejected
+				// it as unfundable. The quoted max must round-trip through the real
+				// selection.
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 60_000 }, { valueSats: 19_772 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(2500);
+				expect(q.inputCount).to.equal(2);
+				expect(q.spendableSats).to.equal(79_772n);
+				expect(q.maxAmountSats).to.equal(q.spendableSats - q.feeSats);
+
+				const { inputs } = await provider.selectSpliceInputs(
+					q.maxAmountSats,
+					2500
+				);
+				expect(inputs.length).to.equal(2);
+			});
+
+			it('excludes non-P2WPKH UTXOs from the spendable total', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [
+						{ valueSats: 40_000 },
+						{ valueSats: 100_000, nonP2wpkh: true }
+					]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(253);
+				expect(q.inputCount).to.equal(1);
+				expect(q.spendableSats).to.equal(40_000n);
+			});
+
+			it('quotes zero max when the fee exceeds the balance', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 200 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(50_000);
+				expect(q.maxAmountSats).to.equal(0n);
+			});
+		});
 	});
 
 	describe('network detection', () => {

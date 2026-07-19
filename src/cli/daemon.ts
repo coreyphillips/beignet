@@ -1077,6 +1077,23 @@ export async function startDaemon(
 		},
 
 		// ── Splicing ──
+		'POST /channel/splice-quote': (body) => {
+			const { channelId, direction, feeratePerkw } = body as {
+				channelId: string;
+				direction: 'in' | 'out';
+				feeratePerkw: number;
+			};
+			if (
+				!channelId ||
+				(direction !== 'in' && direction !== 'out') ||
+				feeratePerkw === undefined
+			)
+				return failure(
+					'INVALID_PARAMS',
+					"channelId, direction ('in' or 'out') and feeratePerkw required"
+				);
+			return success(node.spliceQuote(channelId, direction, feeratePerkw));
+		},
 		'POST /channel/splice-in': (body) => {
 			const { channelId, amountSats, feeratePerkw } = body as {
 				channelId: string;

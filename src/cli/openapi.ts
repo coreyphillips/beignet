@@ -2052,6 +2052,40 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/channel/splice-quote': {
+				post: {
+					summary:
+						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						direction: 'string',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Splice quote',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									direction: { type: 'string', enum: ['in', 'out'] },
+									feeSats: { type: 'number' },
+									spendableSats: { type: 'number' },
+									maxAmountSats: { type: 'number' },
+									reserveSats: {
+										type: 'number',
+										description: 'splice-out only'
+									},
+									inputCount: {
+										type: 'number',
+										description: 'splice-in only'
+									}
+								}
+							})
+						}
+					}
+				}
+			},
 			'/channel/splice-in': {
 				post: {
 					summary: 'Splice funds into a channel',

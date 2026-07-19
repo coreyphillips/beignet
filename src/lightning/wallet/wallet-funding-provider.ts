@@ -224,6 +224,63 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/**
+	 * The UTXOs a splice-in (or fee bump) may spend: P2WPKH only, since the
+	 * signing recipe in gatherWalletInputs is P2WPKH-specific. Confirmed before
+	 * unconfirmed, then largest first within each group.
+	 */
+	private spendableP2wpkhUtxos(): ISpliceUtxo[] {
+		if (!this.wallet.listUtxos) return [];
+		const network = this.bitcoinJsNetwork();
+		const candidates = this.wallet.listUtxos().filter((u) => {
+			try {
+				return bitcoin.address.toOutputScript(u.address, network).length === 22;
+			} catch {
+				return false;
+			}
+		});
+		candidates.sort((a, b) => {
+			const aConf = a.height > 0 ? 0 : 1;
+			const bConf = b.height > 0 ? 0 : 1;
+			if (aConf !== bConf) return aConf - bConf;
+			return b.value - a.value;
+		});
+		return candidates;
+	}
+
+	/**
+	 * Price a splice-in without performing one: what the wallet could add to a
+	 * channel at this feerate. Uses the SAME UTXO filter and weight formula as
+	 * selectSpliceInputs, so the quoted maximum is an amount the selection will
+	 * actually fund rather than a guess reconstructed in a UI. The maximum
+	 * sweeps every spendable UTXO; the change output the weight includes is
+	 * dropped as dust by the channel, a slight, safe overestimate of the fee.
+	 */
+	quoteSpliceIn(feeratePerKw: number): {
+		spendableSats: bigint;
+		feeSats: bigint;
+		maxAmountSats: bigint;
+		inputCount: number;
+	} {
+		const candidates = this.spendableP2wpkhUtxos();
+		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+		const feeSats = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: Math.max(1, candidates.length),
+				changeScriptLen: 22
+			}),
+			feeratePerKw
+		);
+		const maxAmountSats =
+			spendableSats > feeSats ? spendableSats - feeSats : 0n;
+		return {
+			spendableSats,
+			feeSats,
+			maxAmountSats,
+			inputCount: candidates.length
+		};
+	}
+
+	/**
 	 * Shared P2WPKH UTXO selection used by splice-in and fee bumping.
 	 *
 	 * Selects confirmed-first, largest-first until the running total covers
@@ -247,23 +304,8 @@ export class WalletFundingProvider implements IFundingProvider {
 			);
 		}
 
+		const candidates = this.spendableP2wpkhUtxos();
 		const network = this.bitcoinJsNetwork();
-
-		// P2WPKH UTXOs only — the signing recipe below is P2WPKH-specific.
-		const candidates = wallet.listUtxos().filter((u) => {
-			try {
-				return bitcoin.address.toOutputScript(u.address, network).length === 22;
-			} catch {
-				return false;
-			}
-		});
-		// Confirmed before unconfirmed, then largest first within each group.
-		candidates.sort((a, b) => {
-			const aConf = a.height > 0 ? 0 : 1;
-			const bConf = b.height > 0 ? 0 : 1;
-			if (aConf !== bConf) return aConf - bConf;
-			return b.value - a.value;
-		});
 
 		const selected: ISpliceUtxo[] = [];
 		let selectedSum = 0n;
