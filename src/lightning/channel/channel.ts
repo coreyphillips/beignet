@@ -37,6 +37,7 @@ import {
 } from '../message/channel-update';
 import {
 	encodeCommitmentSignedMessage,
+	decodeCommitmentSignedMessage,
 	ICommitmentSignedMessage,
 	encodeRevokeAndAckMessage,
 	IRevokeAndAckMessage
@@ -1571,7 +1572,13 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
+		// update traffic has resumed per the splicing extension, and every add
+		// is mirrored onto both fundings by the start_batch commitment round.
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1709,7 +1716,10 @@ export class Channel {
 	 * Handle update_add_htlc from remote (received HTLC).
 	 */
 	handleUpdateAddHtlc(msg: IUpdateAddHtlcMessage): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
 			];
@@ -1906,7 +1916,8 @@ export class Channel {
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -1965,7 +1976,8 @@ export class Channel {
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2048,7 +2060,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2117,7 +2130,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2172,7 +2186,8 @@ export class Channel {
 	handleUpdateFailHtlc(msg: IUpdateFailHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2225,7 +2240,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -6823,6 +6839,27 @@ export class Channel {
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
+
+		// The splice negotiation is over once tx_signatures have crossed both
+		// ways; per the splicing extension quiescence ends with it, and update
+		// traffic (HTLCs, fees) resumes while the splice awaits its lock, with
+		// every update mirrored onto both fundings via start_batch commitment
+		// rounds. Exiting here (not at splice_locked) is what makes
+		// pay-during-splice possible; completeSplice's exit remains as the
+		// backstop for states persisted before this change.
+		// Taproot channels stay parked (quiescent) for the whole splice: the
+		// manager's MuSig2 auto-sign path cannot batch both fundings yet, so
+		// resuming update traffic would start rounds it cannot finish. Matches
+		// canUpdateHtlcsDuringSplice's ECDSA-only restriction.
+		if (
+			this.isSplicePendingLock() &&
+			this._quiescence.isQuiescent() &&
+			!isTaprootChannel(this._state.channelType)
+		) {
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+		}
 	}
 
 	/**
@@ -7068,6 +7105,20 @@ export class Channel {
 	 * one plus the pending splice), announced by start_batch and acknowledged
 	 * with a single revoke_and_ack.
 	 */
+	/**
+	 * True when HTLC update traffic may flow during the splice's pending-lock
+	 * window. Restricted to ECDSA channels for now: the manager's taproot
+	 * (MuSig2) auto-sign path does not batch-sign both fundings yet, so a
+	 * taproot channel adding HTLCs mid-splice would commit them on only one
+	 * commitment — the exact divergence the batch exists to prevent. Taproot
+	 * channels keep the pre-#139 behavior (parked until splice_locked).
+	 */
+	canUpdateHtlcsDuringSplice(): boolean {
+		return (
+			this.isSplicePendingLock() && !isTaprootChannel(this._state.channelType)
+		);
+	}
+
 	isSplicePendingLock(): boolean {
 		return (
 			this._state.state === ChannelState.SPLICING &&
@@ -7091,7 +7142,19 @@ export class Channel {
 	 * commitment_signed messages form one logical update.
 	 */
 	handleStartBatch(msg: IStartBatchMessage): ChannelAction[] {
-		if (!this.isSplicePendingLock()) {
+		// splice_locked can race a commitment round: the peer may have built a
+		// batch (old + new funding) before observing our splice_locked, and it
+		// arrives after we completed the splice. Per the splicing spec the
+		// receiver filters by funding_txid rather than failing — so accept the
+		// batch framing post-completion too (the completed splice leaves
+		// fundingTxid === spliceFundingTxid) and let the batch handler drop the
+		// obsolete old-funding commitment.
+		const postSpliceNormal =
+			this._state.state === ChannelState.NORMAL &&
+			this._state.spliceFundingTxid !== null &&
+			this._state.fundingTxid !== null &&
+			this._state.spliceFundingTxid.equals(this._state.fundingTxid);
+		if (!this.isSplicePendingLock() && !postSpliceNormal) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -7138,12 +7201,26 @@ export class Channel {
 	): ChannelAction[] {
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch without a pending splice'
-				}
-			];
+			// The batch raced our splice_locked: the peer built it before
+			// observing the lock. The commitment for the funding that is now
+			// current goes through the standard single-commitment path; the
+			// obsolete old-funding commitment is ignored (splicing spec).
+			const current = msgs.find(
+				(m) =>
+					m.fundingTxid &&
+					this._state.fundingTxid &&
+					m.fundingTxid.equals(this._state.fundingTxid)
+			);
+			if (!current) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Commitment batch without a pending splice or a current-funding commitment'
+					}
+				];
+			}
+			return this.handleCommitmentSigned(current);
 		}
 
 		let currentMsg: ICommitmentSignedMessage | null = null;
@@ -7603,6 +7680,28 @@ export class Channel {
 		this._state.remoteAnnouncementBitcoinSig = null;
 		this._state.fundingConfirmationHeight = 0;
 		this._state.fundingTxIndex = 0;
+
+		// A batch round can be outstanding at the lock: our commitment_signed
+		// pair went out, the peer's revoke_and_ack has not arrived. The generic
+		// reestablish retransmit rebuilds from lastSentCommitmentSigned, which
+		// still holds the OLD funding's signature; promote the cached
+		// splice-side signature (the funding that is current from here on) so a
+		// reconnect retransmits a commitment the peer can verify.
+		if (this._lastSentBatch && this._lastSentBatch.commitments.length === 2) {
+			try {
+				const spliceSigned = decodeCommitmentSignedMessage(
+					this._lastSentBatch.commitments[1]
+				);
+				this._state.lastSentCommitmentSigned = Buffer.from(
+					spliceSigned.signature
+				);
+				this._state.lastSentHtlcSignatures = spliceSigned.htlcSignatures.map(
+					(h) => Buffer.from(h)
+				);
+			} catch {
+				// Undecodable cache: keep the existing material rather than corrupt it.
+			}
+		}
 
 		// Exit quiescence and restore normal operation
 		this._quiescence.exitQuiescence();
