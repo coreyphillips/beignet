@@ -12,7 +12,11 @@ import { expect } from 'chai';
 import { BeignetNode } from '../../src/cli/beignet-node';
 import { ChannelState } from '../../src/lightning/channel/types';
 
-type FakeChannel = { state: ChannelState; localBalanceMsat: bigint };
+type FakeChannel = {
+	state: ChannelState;
+	localBalanceMsat: bigint;
+	pendingSpliceLocalBalanceMsat?: bigint;
+};
 
 function fakeNode(channels: FakeChannel[]): {
 	node: { listChannels: () => FakeChannel[] };
@@ -74,13 +78,45 @@ describe('Balance visibility (pending close / errored)', () => {
 		expect(sats).to.equal(23_500);
 	});
 
-	it('splicingBalanceSats sums only SPLICING channels', () => {
-		// The scare this guards against: during a splice the canonical lightning
-		// balance excludes the channel, so a wallet mid-splice read as empty.
+	it('splicingBalanceSats reports the POST-splice balance for a splice-in', () => {
+		// The scare this guards against, observed on mainnet: a max splice-in
+		// sweeps the on-chain balance into the splice, the canonical lightning
+		// balance excludes the SPLICING channel, and the live localBalanceMsat
+		// stays PRE-splice until splice_locked — so the newly spliced-in sats
+		// appeared in no reported figure at all. The bucket must use the
+		// pending post-splice balance (old local 132,295 + spliced ~79,451).
 		const sats = splicingSats([
-			{ state: ChannelState.SPLICING, localBalanceMsat: 132_295_000n },
+			{
+				state: ChannelState.SPLICING,
+				localBalanceMsat: 132_295_000n,
+				pendingSpliceLocalBalanceMsat: 211_746_000n
+			},
 			{ state: ChannelState.NORMAL, localBalanceMsat: 50_000_000n },
 			{ state: ChannelState.FORCE_CLOSED, localBalanceMsat: 9_000_000n }
+		]);
+		expect(sats).to.equal(211_746);
+	});
+
+	it('splicingBalanceSats reports the POST-splice balance for a splice-out', () => {
+		// The inverse error: a splice-out's live balance is still the old
+		// 120k, but only ~20k rejoins Lightning at splice_locked; the rest is
+		// on its way on-chain and must not be promised back to Lightning.
+		const sats = splicingSats([
+			{
+				state: ChannelState.SPLICING,
+				localBalanceMsat: 120_000_000n,
+				pendingSpliceLocalBalanceMsat: 20_000_000n
+			}
+		]);
+		expect(sats).to.equal(20_000);
+	});
+
+	it('splicingBalanceSats falls back to the live balance pre point-of-no-return', () => {
+		// A channel still negotiating its splice has no pending figure yet; the
+		// wallet inputs are still visible on-chain, so the live balance is the
+		// double-count-free number.
+		const sats = splicingSats([
+			{ state: ChannelState.SPLICING, localBalanceMsat: 132_295_000n }
 		]);
 		expect(sats).to.equal(132_295);
 	});

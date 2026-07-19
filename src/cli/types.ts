@@ -26,10 +26,12 @@ export interface NodeInfo {
 	 */
 	erroredBalanceSats: number;
 	/**
-	 * Local balance in channels with a splice in flight. The funds are safe in
-	 * the channel and return to lightningBalanceSats when the splice confirms
-	 * and locks; without this bucket they would read as vanished, since a
-	 * SPLICING channel is excluded from the live lightning balance.
+	 * Balance the wallet's splicing channels SETTLE TO when their splices
+	 * lock: post-splice local balance, so a max splice-in's newly added sats
+	 * are accounted for here during the confirmation window (the live channel
+	 * balance stays pre-splice until splice_locked, and the swept UTXOs have
+	 * already left onchainBalanceSats). Rejoins lightningBalanceSats at
+	 * splice_locked.
 	 */
 	splicingBalanceSats: number;
 	channelCount: number;
@@ -73,6 +75,12 @@ export interface ChannelInfo {
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
+	/**
+	 * Local balance this channel settles to when its in-flight splice locks.
+	 * Present only while a splice is past its point of no return; the live
+	 * localBalanceSats stays pre-splice until splice_locked.
+	 */
+	pendingSpliceLocalBalanceSats?: number;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;
@@ -310,9 +318,17 @@ export interface ConsolidateResult {
 export interface BalanceInfo {
 	onchain: number;
 	lightning: number;
+	/**
+	 * Currently spendable funds: onchain + lightning. Deliberately excludes
+	 * splicingSats (and pending-close funds): those are accounted for but not
+	 * spendable until their transitions complete.
+	 */
 	total: number;
 	unsettledSats?: number;
-	/** Local balance parked in channels with a splice in flight (see NodeInfo). */
+	/**
+	 * Post-splice local balance of channels with a splice in flight (see
+	 * NodeInfo.splicingBalanceSats). Rejoins lightning at splice_locked.
+	 */
 	splicingSats?: number;
 }
 

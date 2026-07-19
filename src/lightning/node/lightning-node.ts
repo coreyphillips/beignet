@@ -5007,6 +5007,9 @@ export class LightningNode extends EventEmitter {
 			info.fundingTxid = Buffer.from(state.fundingTxid)
 				.reverse()
 				.toString('hex');
+		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
+		if (pendingSplice !== null)
+			info.pendingSpliceLocalBalanceMsat = pendingSplice;
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
 		info.feeratePerKw = state.localConfig.feeratePerKw;

@@ -1352,17 +1352,22 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
-	 * Local balance in channels with a splice in flight. The canonical
-	 * lightning balance excludes SPLICING channels, so during the splice's
-	 * confirmation window these funds would otherwise read as vanished; they
-	 * are safe in the channel and rejoin the lightning balance at
-	 * splice_locked.
+	 * Local balance in channels with a splice in flight: the balance each
+	 * channel SETTLES TO when its splice locks, not the live pre-splice figure.
+	 * The distinction is the whole point: the live localBalanceMsat stays
+	 * pre-splice until splice_locked, so after a max splice-in the newly added
+	 * sats would appear in no bucket at all (on-chain swept, lightning
+	 * excludes SPLICING, and the old local balance never contained them), and
+	 * after a splice-out the bucket would overstate what rejoins Lightning.
+	 * Falls back to the live balance for a channel still negotiating (before
+	 * the point of no return), when the wallet inputs are still visible in the
+	 * on-chain balance.
 	 */
 	private getSplicingBalanceSats(): number {
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
 			if (ch.state === ChannelState.SPLICING) {
-				totalMsat += ch.localBalanceMsat;
+				totalMsat += ch.pendingSpliceLocalBalanceMsat ?? ch.localBalanceMsat;
 			}
 		}
 		return Number(totalMsat / 1000n);
@@ -2577,6 +2582,7 @@ export class BeignetNode extends EventEmitter {
 		shortChannelId?: string;
 		feeratePerKw?: number;
 		htlcCount?: number;
+		pendingSpliceLocalBalanceMsat?: bigint;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
@@ -2605,6 +2611,10 @@ export class BeignetNode extends EventEmitter {
 		if (ch.shortChannelId) info.shortChannelId = ch.shortChannelId;
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;
 		if (ch.htlcCount !== undefined) info.htlcCount = ch.htlcCount;
+		if (ch.pendingSpliceLocalBalanceMsat !== undefined)
+			info.pendingSpliceLocalBalanceSats = Number(
+				ch.pendingSpliceLocalBalanceMsat / 1000n
+			);
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
 		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
 		if (ch.feeProportionalMillionths !== undefined)

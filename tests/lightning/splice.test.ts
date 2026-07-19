@@ -4247,6 +4247,31 @@ describe('Splice', function () {
 			return pair;
 		}
 
+		it('exposes the post-splice pending local balance during the pending-lock window', function () {
+			// Accounting surfaces report this instead of the live balance, which
+			// stays pre-splice until splice_locked: without it, a max splice-in's
+			// newly added sats appear in no balance figure at all during the
+			// confirmation window (observed on mainnet: on-chain swept to zero,
+			// lightning excludes SPLICING, old local never contained them).
+			const fresh = createNormalChannelPair();
+			expect(fresh.openerChannel.getPendingSpliceLocalBalanceMsat()).to.equal(
+				null
+			);
+
+			const pair = pendingLockPair();
+			const liveLocalMsat = pair.openerChannel.getBalances().localMsat;
+			const pending = pair.openerChannel.getPendingSpliceLocalBalanceMsat();
+			// Old local + the 100k splice-in; the splice-in's on-chain fee comes
+			// from wallet change, not the channel, so nothing else moves.
+			expect(pending).to.equal(liveLocalMsat + 100_000_000n);
+
+			// The acceptor contributed nothing: its side settles unchanged.
+			const acceptorLive = pair.acceptorChannel.getBalances().localMsat;
+			expect(pair.acceptorChannel.getPendingSpliceLocalBalanceMsat()).to.equal(
+				acceptorLive
+			);
+		});
+
 		it('completes an update_fee round as start_batch batches in both directions', function () {
 			const pair = pendingLockPair();
 			const {

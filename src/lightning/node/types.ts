@@ -445,6 +445,12 @@ export interface IChannelInfo {
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
+	/**
+	 * Local balance the channel settles to when its in-flight splice locks.
+	 * Present only while a splice is past its point of no return; the live
+	 * localBalanceMsat stays pre-splice until splice_locked.
+	 */
+	pendingSpliceLocalBalanceMsat?: bigint;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
 	/** Reserve remote must maintain (set by us), in msat */
