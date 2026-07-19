@@ -4719,6 +4719,10 @@ describe('Splice', function () {
 				feeMsgAction.payload
 			);
 
+			let openerStartBatches = 0;
+			openerManager.on('message:outbound', (pk, type) => {
+				if (type === MessageType.START_BATCH) openerStartBatches++;
+			});
 			const preimage = crypto.randomBytes(32);
 			expect(
 				openerManager.addHtlc(
@@ -4730,8 +4734,10 @@ describe('Splice', function () {
 				).ok
 			).to.be.true;
 
-			// One batched round carried both: the add is committed on both sides
-			// and both sides now build at the new rate.
+			// One batched round carried both: exactly one initiating start_batch
+			// left the opener, the add is committed on both sides and both sides
+			// now build at the new rate.
+			expect(openerStartBatches, 'a single initiating batch').to.equal(1);
 			const entry = [...openerChannel.getFullState().htlcs.values()][0];
 			expect(entry.state).to.equal(HtlcState.COMMITTED);
 			expect(
@@ -4766,7 +4772,7 @@ describe('Splice', function () {
 			// batch; these scenarios cut the wire at each message boundary.
 			function runDisconnectScenario(
 				deliverOpenerMsgs: number,
-				deliverAcceptorReplies: boolean
+				deliverAcceptorMsgs: number
 			): void {
 				const pair = pendingLockPair();
 				const {
@@ -4805,10 +4811,11 @@ describe('Splice', function () {
 				for (const m of fromOpener.slice(0, deliverOpenerMsgs)) {
 					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
 				}
-				if (deliverAcceptorReplies) {
-					for (const m of fromAcceptor.splice(0)) {
-						openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
-					}
+				// The acceptor's replies to a fully delivered batch:
+				// [revoke_and_ack, start_batch, commitment_signed x2] — deliver a
+				// scenario-chosen prefix of the counter-round too.
+				for (const m of fromAcceptor.splice(0, deliverAcceptorMsgs)) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
 				}
 
 				// The link dies.
@@ -4877,16 +4884,31 @@ describe('Splice', function () {
 			}
 
 			it('the add itself is lost', function () {
-				runDisconnectScenario(0, false);
+				runDisconnectScenario(0, 0);
 			});
 			it('the add arrives, the batch is lost', function () {
-				runDisconnectScenario(1, false);
+				runDisconnectScenario(1, 0);
+			});
+			it('start_batch arrives with neither commitment (stale half-collected batch)', function () {
+				runDisconnectScenario(2, 0);
+			});
+			it('start_batch and one commitment arrive (partially collected batch)', function () {
+				runDisconnectScenario(3, 0);
 			});
 			it('the batch arrives, the revoke_and_ack is lost', function () {
-				runDisconnectScenario(4, false);
+				runDisconnectScenario(4, 0);
+			});
+			it('the revoke_and_ack arrives, the counter-round is lost', function () {
+				runDisconnectScenario(4, 1);
+			});
+			it('the counter-round start_batch arrives with neither commitment', function () {
+				runDisconnectScenario(4, 2);
+			});
+			it('the counter-round is cut after its first commitment', function () {
+				runDisconnectScenario(4, 3);
 			});
 			it('only our answer to the counter-round is lost', function () {
-				runDisconnectScenario(4, true);
+				runDisconnectScenario(4, 4);
 			});
 		});
 

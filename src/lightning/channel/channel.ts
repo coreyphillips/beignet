@@ -4873,6 +4873,12 @@ export class Channel {
 		this._spliceAbortPending = false;
 		this._reestablishRetransmitted = false;
 
+		// A partially collected start_batch is connection-scoped: the peer
+		// re-announces the batch (with fresh framing) when it retransmits after
+		// reestablish, and appending post-reconnect commitments to a stale
+		// half-collected batch would pair signatures across two deliveries.
+		this._pendingBatch = null;
+
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
