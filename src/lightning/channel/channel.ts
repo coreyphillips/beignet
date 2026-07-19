@@ -4873,6 +4873,12 @@ export class Channel {
 		this._spliceAbortPending = false;
 		this._reestablishRetransmitted = false;
 
+		// A partially collected start_batch is connection-scoped: the peer
+		// re-announces the batch (with fresh framing) when it retransmits after
+		// reestablish, and appending post-reconnect commitments to a stale
+		// half-collected batch would pair signatures across two deliveries.
+		this._pendingBatch = null;
+
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
@@ -5508,7 +5514,19 @@ export class Channel {
 		// traffic has resumed and commitments flow as start_batch batches, which
 		// DO need the generic un-acked-update replay + a batch-aware retransmit.
 		const spliceActive = !!(this._spliceSession || this._state.spliceInFlight);
-		const pendingLock = this.isSplicePendingLock();
+		// isSplicePendingLock() requires state === SPLICING, but at this point
+		// in the handshake the channel still sits in AWAITING_REESTABLISH (the
+		// restore-state block runs further down) — look through it via
+		// preReestablishState, or the pending-lock replays below can never fire
+		// on reconnect and a round interrupted by the disconnect never resumes.
+		const effectiveState =
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: this._state.state;
+		const pendingLock =
+			effectiveState === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.sentTxSignatures === true &&
+			this._state.spliceInFlight?.receivedTxSignatures === true;
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
 		// Every queued update the peer has not acknowledged with a

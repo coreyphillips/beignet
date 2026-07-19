@@ -4692,6 +4692,226 @@ describe('Splice', function () {
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
+		it('a round mixing update_fee and an HTLC add batches cleanly mid-splice', function () {
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey
+			} = pair;
+
+			// Stage a fee update directly on the channel (no auto-sign fires) and
+			// hand its update_fee to the acceptor, then let the manager's add
+			// trigger ONE round covering both staged updates.
+			const oldRate = openerChannel.getFullState().localConfig.feeratePerKw;
+			const feeActions = openerChannel.updateFee(oldRate * 2);
+			const feeMsgAction = findAction(
+				feeActions,
+				ChannelActionType.SEND_MESSAGE
+			);
+			expect(feeMsgAction, 'update_fee produced').to.not.equal(undefined);
+			acceptorManager.handleMessage(
+				openerPubkey,
+				feeMsgAction.messageType,
+				feeMsgAction.payload
+			);
+
+			let openerStartBatches = 0;
+			openerManager.on('message:outbound', (pk, type) => {
+				if (type === MessageType.START_BATCH) openerStartBatches++;
+			});
+			const preimage = crypto.randomBytes(32);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					10_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.be.true;
+
+			// One batched round carried both: exactly one initiating start_batch
+			// left the opener, the add is committed on both sides and both sides
+			// now build at the new rate.
+			expect(openerStartBatches, 'a single initiating batch').to.equal(1);
+			const entry = [...openerChannel.getFullState().htlcs.values()][0];
+			expect(entry.state).to.equal(HtlcState.COMMITTED);
+			expect(
+				openerChannel.getFullState().localConfig.feeratePerKw,
+				'opener promoted the staged fee'
+			).to.equal(oldRate * 2);
+			// The acceptor promotes one round later (its promotion answers the
+			// opener's revoke of the acceptor's own new-rate signature) — the
+			// fee is at least staged or already promoted; what matters here is
+			// that mixing it with the add desynced nothing.
+			// The committed rate lives in the role-appropriate config: the opener
+			// sets fees, so the acceptor promotes into remoteConfig.
+			expect(
+				acceptorChannel.getFullState().remoteConfig.feeratePerKw,
+				'acceptor promoted the staged fee'
+			).to.equal(oldRate * 2);
+
+			// Settles, and the splice locks cleanly at the new rate.
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		describe('disconnects with an HTLC in flight during pending-lock', function () {
+			// The matrix: reach pending-lock, capture an add's traffic without
+			// delivering it, deliver a scenario-chosen prefix, drop the link,
+			// reconnect, and require full convergence — the add COMMITTED on
+			// both sides, settling, and the splice locking cleanly. BOLT 2
+			// reestablish replays un-acked updates before the retransmitted
+			// batch; these scenarios cut the wire at each message boundary.
+			function runDisconnectScenario(
+				deliverOpenerMsgs: number,
+				deliverAcceptorMsgs: number
+			): void {
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					openerChannel,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+
+				// Detach the loopback; record both directions, deliver nothing.
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+
+				const preimage = crypto.randomBytes(32);
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				// [update_add_htlc, start_batch, commitment_signed, commitment_signed]
+				expect(fromOpener.length, 'add produced its batch').to.equal(4);
+
+				for (const m of fromOpener.slice(0, deliverOpenerMsgs)) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				// The acceptor's replies to a fully delivered batch:
+				// [revoke_and_ack, start_batch, commitment_signed x2] — deliver a
+				// scenario-chosen prefix of the counter-round too.
+				for (const m of fromAcceptor.splice(0, deliverAcceptorMsgs)) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				// The link dies.
+				openerManager.handlePeerDisconnected(acceptorPubkey);
+				acceptorManager.handlePeerDisconnected(openerPubkey);
+				expect(openerChannel.getState()).to.equal(
+					ChannelState.AWAITING_REESTABLISH
+				);
+
+				// Reconnect. Both sides emit channel_reestablish independently (as
+				// real transports do) BEFORE either is delivered — a synchronous
+				// loopback would otherwise deliver the first reestablish before
+				// the second side has sent its own. Capture both, rewire, then
+				// deliver cross-wise; all replays flow through the live loopback.
+				fromOpener.length = 0;
+				fromAcceptor.length = 0;
+				openerManager.handlePeerReconnected(acceptorPubkey);
+				acceptorManager.handlePeerReconnected(openerPubkey);
+				const openerReest = fromOpener.splice(0);
+				const acceptorReest = fromAcceptor.splice(0);
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				connectManagers(
+					openerManager,
+					openerPubkey,
+					acceptorManager,
+					acceptorPubkey
+				);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				expect(
+					openerChannel.getState(),
+					'back to SPLICING pending-lock'
+				).to.equal(ChannelState.SPLICING);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.SPLICING);
+				expect(openerChannel.isSplicePendingLock()).to.equal(true);
+
+				// Convergence: the add committed on both sides...
+				const oEntry = [...openerChannel.getFullState().htlcs.values()][0];
+				const aEntry = [...acceptorChannel.getFullState().htlcs.values()][0];
+				expect(oEntry?.state, 'opener committed after reconnect').to.equal(
+					HtlcState.COMMITTED
+				);
+				expect(aEntry?.state, 'acceptor committed after reconnect').to.equal(
+					HtlcState.COMMITTED
+				);
+
+				// ...it settles...
+				let fulfilled = false;
+				openerManager.on('htlc:fulfilled', () => {
+					fulfilled = true;
+				});
+				acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+				expect(fulfilled, 'settled after reconnect').to.be.true;
+
+				// ...and the splice still locks cleanly.
+				openerManager.sendSpliceLocked(channelId);
+				acceptorManager.sendSpliceLocked(channelId);
+				expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			}
+
+			it('the add itself is lost', function () {
+				runDisconnectScenario(0, 0);
+			});
+			it('the add arrives, the batch is lost', function () {
+				runDisconnectScenario(1, 0);
+			});
+			it('start_batch arrives with neither commitment (stale half-collected batch)', function () {
+				runDisconnectScenario(2, 0);
+			});
+			it('start_batch and one commitment arrive (partially collected batch)', function () {
+				runDisconnectScenario(3, 0);
+			});
+			it('the batch arrives, the revoke_and_ack is lost', function () {
+				runDisconnectScenario(4, 0);
+			});
+			it('the revoke_and_ack arrives, the counter-round is lost', function () {
+				runDisconnectScenario(4, 1);
+			});
+			it('the counter-round start_batch arrives with neither commitment', function () {
+				runDisconnectScenario(4, 2);
+			});
+			it('the counter-round is cut after its first commitment', function () {
+				runDisconnectScenario(4, 3);
+			});
+			it('only our answer to the counter-round is lost', function () {
+				runDisconnectScenario(4, 4);
+			});
+		});
+
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {
 			// The splicing spec's transition race: we lock and complete while the
 			// peer, not yet having observed our splice_locked, sends a
