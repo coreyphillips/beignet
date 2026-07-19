@@ -4914,6 +4914,101 @@ describe('Splice', function () {
 				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
 			}
 
+			it('a RESTART mid-round re-signs the batch from persisted material', function () {
+				// Same as 'the batch is lost', but the opener also loses its
+				// in-memory batch cache — what a process restart destroys. The
+				// reestablish path must REBUILD the batch: persisted signature
+				// bytes for the current funding, a deterministic ECDSA re-sign
+				// for the splice side.
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					openerChannel,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', () => {});
+
+				const preimage = crypto.randomBytes(32);
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				expect(fromOpener.length).to.equal(4);
+				// Only the add reaches the acceptor; the batch is lost.
+				acceptorManager.handleMessage(
+					openerPubkey,
+					fromOpener[0].type,
+					fromOpener[0].payload
+				);
+
+				openerManager.handlePeerDisconnected(acceptorPubkey);
+				acceptorManager.handlePeerDisconnected(openerPubkey);
+				// The restart: the cached wire bytes die with the process (the
+				// splice session itself is restored from persistence on boot).
+				(openerChannel as any)._lastSentBatch = null;
+
+				fromOpener.length = 0;
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				acceptorManager.removeAllListeners('message:outbound');
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+				openerManager.handlePeerReconnected(acceptorPubkey);
+				acceptorManager.handlePeerReconnected(openerPubkey);
+				const openerReest = fromOpener.splice(0);
+				const acceptorReest = fromAcceptor.splice(0);
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				connectManagers(
+					openerManager,
+					openerPubkey,
+					acceptorManager,
+					acceptorPubkey
+				);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				// The rebuilt batch converged the round.
+				const oEntry = [...openerChannel.getFullState().htlcs.values()][0];
+				const aEntry = [...acceptorChannel.getFullState().htlcs.values()][0];
+				expect(oEntry?.state, 'opener committed via rebuilt batch').to.equal(
+					HtlcState.COMMITTED
+				);
+				expect(aEntry?.state, 'acceptor committed via rebuilt batch').to.equal(
+					HtlcState.COMMITTED
+				);
+
+				// Settles, and the splice locks cleanly.
+				let fulfilled = false;
+				openerManager.on('htlc:fulfilled', () => {
+					fulfilled = true;
+				});
+				acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+				expect(fulfilled, 'settled after the restart-rebuilt round').to.be.true;
+				openerManager.sendSpliceLocked(channelId);
+				acceptorManager.sendSpliceLocked(channelId);
+				expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			});
+
 			it('the add itself is lost', function () {
 				runDisconnectScenario(0, 0);
 			});

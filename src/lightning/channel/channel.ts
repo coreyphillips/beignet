@@ -5601,15 +5601,71 @@ export class Channel {
 		// wire bytes verbatim (idempotent — same signatures, no nonce reuse).
 		if (
 			pendingLock &&
-			this._lastSentBatch &&
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n
 		) {
-			actions.push(
-				sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
-			);
-			for (const c of this._lastSentBatch.commitments) {
-				actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+			if (this._lastSentBatch) {
+				actions.push(
+					sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+				);
+				for (const c of this._lastSentBatch.commitments) {
+					actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+				}
+			} else if (
+				this._signer &&
+				this._state.channelId &&
+				this._state.spliceInFlight &&
+				this._state.lastSentCommitmentSigned &&
+				!isTaprootChannel(this._state.channelType)
+			) {
+				// Restart mid-round: the cached wire bytes died with the process.
+				// Rebuild the batch from persisted material. The current-funding
+				// half replays the persisted signature bytes; the splice-side
+				// half is RE-SIGNED, which is exact for ECDSA (RFC 6979 is
+				// deterministic) over the spliced view at the same commitment
+				// number — and the same per-commitment point, because no
+				// revoke_and_ack arrived to rotate it.
+				const spliced = this._splicedState();
+				const point =
+					this._state.remoteNextPerCommitmentPoint ??
+					this._state.remoteCurrentPerCommitmentPoint;
+				if (spliced && point) {
+					try {
+						const spliceSigned = signRemoteCommitment(
+							spliced,
+							this._signer,
+							point,
+							this._state.remoteCommitmentNumber
+						);
+						const startBatchBytes = encodeStartBatchMessage({
+							channelId: this._state.channelId,
+							batchSize: 2,
+							messageType: MessageType.COMMITMENT_SIGNED
+						});
+						const currentBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: this._state.lastSentCommitmentSigned,
+							htlcSignatures: this._state.lastSentHtlcSignatures ?? []
+						});
+						const spliceBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: spliceSigned.signature,
+							htlcSignatures: spliceSigned.htlcSignatures,
+							fundingTxid: Buffer.from(this._state.spliceInFlight.spliceTxid)
+						});
+						actions.push(sendMsg(MessageType.START_BATCH, startBatchBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, currentBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, spliceBytes));
+						// Cache for any further replay on this connection.
+						this._lastSentBatch = {
+							startBatch: startBatchBytes,
+							commitments: [currentBytes, spliceBytes]
+						};
+					} catch {
+						// Unrebuildable: leave retransmission to the peer's
+						// next_funding retransmit flags, as before this change.
+					}
+				}
 			}
 		}
 
