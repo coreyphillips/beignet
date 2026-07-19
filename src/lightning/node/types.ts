@@ -451,6 +451,11 @@ export interface IChannelInfo {
 	 * localBalanceMsat stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceMsat?: bigint;
+	/**
+	 * Whether the channel can carry HTLC traffic right now (NORMAL, or ECDSA
+	 * pending-lock mid-splice with pay-during-splice active).
+	 */
+	htlcUsable?: boolean;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
 	/** Reserve remote must maintain (set by us), in msat */

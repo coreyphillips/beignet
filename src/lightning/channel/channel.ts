@@ -7137,6 +7137,31 @@ export class Channel {
 		);
 	}
 
+	/**
+	 * Whether this channel can carry HTLC traffic right now: NORMAL, or
+	 * mid-splice with update traffic flowing (ECDSA pending-lock). This is the
+	 * predicate node-level consumers (router edges, forwarding, invoice hints,
+	 * balance) share, so "the router will use it" and "the channel will accept
+	 * it" can never disagree. With lookThroughReestablish, a disconnected
+	 * channel is judged by the state it will return to — for surfaces like
+	 * invoice routing hints that describe the channel rather than use it
+	 * immediately.
+	 */
+	isHtlcUsable(lookThroughReestablish = false): boolean {
+		const eff =
+			lookThroughReestablish &&
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: this._state.state;
+		if (eff === ChannelState.NORMAL) return true;
+		return (
+			eff === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.sentTxSignatures === true &&
+			this._state.spliceInFlight?.receivedTxSignatures === true &&
+			!isTaprootChannel(this._state.channelType)
+		);
+	}
+
 	isSplicePendingLock(): boolean {
 		return (
 			this._state.state === ChannelState.SPLICING &&

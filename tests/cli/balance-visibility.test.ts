@@ -16,6 +16,7 @@ type FakeChannel = {
 	state: ChannelState;
 	localBalanceMsat: bigint;
 	pendingSpliceLocalBalanceMsat?: bigint;
+	htlcUsable?: boolean;
 };
 
 function fakeNode(channels: FakeChannel[]): {
@@ -119,6 +120,35 @@ describe('Balance visibility (pending close / errored)', () => {
 			{ state: ChannelState.SPLICING, localBalanceMsat: 132_295_000n }
 		]);
 		expect(sats).to.equal(132_295);
+	});
+
+	it('splicingBalanceSats holds only the arriving delta for a channel paying through its splice-in', () => {
+		// Pay-during-splice: the canonical balance counts a usable mid-splice
+		// channel at min(live, settle-to), so the bucket keeps only what is
+		// still in transit — here the ~79,451 sats arriving with the splice.
+		const sats = splicingSats([
+			{
+				state: ChannelState.SPLICING,
+				localBalanceMsat: 132_295_000n,
+				pendingSpliceLocalBalanceMsat: 211_746_000n,
+				htlcUsable: true
+			}
+		]);
+		expect(sats).to.equal(79_451);
+	});
+
+	it('splicingBalanceSats is 0 for a channel paying through its splice-out', () => {
+		// The canonical balance already counts the settle-to side (20k); the
+		// departing 100k surfaces on-chain once the splice tx is seen.
+		const sats = splicingSats([
+			{
+				state: ChannelState.SPLICING,
+				localBalanceMsat: 120_000_000n,
+				pendingSpliceLocalBalanceMsat: 20_000_000n,
+				htlcUsable: true
+			}
+		]);
+		expect(sats).to.equal(0);
 	});
 
 	it('splicingBalanceSats is 0 with no splice in flight', () => {

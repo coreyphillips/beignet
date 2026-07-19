@@ -4579,15 +4579,15 @@ export class LightningNode extends EventEmitter {
 		if (maxFeeSats < 0n) throw new Error('maxFeeSats must be non-negative');
 
 		const fromChannel = this.channelManager.getChannel(fromChannelId);
-		if (!fromChannel || fromChannel.getState() !== ChannelState.NORMAL) {
+		if (!fromChannel || !fromChannel.isHtlcUsable()) {
 			throw new Error(
-				`from channel not found or not NORMAL: ${fromChannelId.toString('hex')}`
+				`from channel not found or not usable: ${fromChannelId.toString('hex')}`
 			);
 		}
 		const toChannel = this.channelManager.getChannel(toChannelId);
-		if (!toChannel || toChannel.getState() !== ChannelState.NORMAL) {
+		if (!toChannel || !toChannel.isHtlcUsable()) {
 			throw new Error(
-				`to channel not found or not NORMAL: ${toChannelId.toString('hex')}`
+				`to channel not found or not usable: ${toChannelId.toString('hex')}`
 			);
 		}
 
@@ -5010,6 +5010,7 @@ export class LightningNode extends EventEmitter {
 		const pendingSplice = channel.getPendingSpliceLocalBalanceMsat();
 		if (pendingSplice !== null)
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
+		info.htlcUsable = channel.isHtlcUsable();
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
 		info.feeratePerKw = state.localConfig.feeratePerKw;
@@ -5277,10 +5278,10 @@ export class LightningNode extends EventEmitter {
 	 */
 	private buildRoutingHintForChannel(channel: Channel): IRoutingHintHop | null {
 		const state = channel.getFullState();
-		// Use preReestablishState for channels awaiting reestablish after restart —
-		// the SCID and peer info are still valid for routing hints
-		const effectiveState = state.preReestablishState ?? channel.getState();
-		if (effectiveState !== ChannelState.NORMAL) return null;
+		// Look through a reconnect (SCID and peer info stay valid for hints),
+		// and admit a usable mid-splice channel: it receives fine, still under
+		// its pre-splice scid until the lock.
+		if (!channel.isHtlcUsable(true)) return null;
 
 		const channelId = channel.getChannelId();
 		if (!channelId) return null;
@@ -5400,8 +5401,7 @@ export class LightningNode extends EventEmitter {
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
-			const effectiveState = state.preReestablishState ?? channel.getState();
-			if (effectiveState !== ChannelState.NORMAL) continue;
+			if (!channel.isHtlcUsable(true)) continue;
 
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
@@ -5822,11 +5822,7 @@ export class LightningNode extends EventEmitter {
 		// (e.g. missing SCID/alias, or relying on gossip that hasn't propagated).
 		const allChannels = this.channelManager.listChannels();
 		if (routingHints.length === 0) {
-			const receivableNormal = allChannels.some((ch) => {
-				const st = ch.getFullState();
-				const effState = st.preReestablishState ?? ch.getState();
-				return effState === ChannelState.NORMAL;
-			});
+			const receivableNormal = allChannels.some((ch) => ch.isHtlcUsable(true));
 			if (receivableNormal) {
 				this.emit('node:error', {
 					code: 'NO_ROUTING_HINTS',
@@ -5939,21 +5935,29 @@ export class LightningNode extends EventEmitter {
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
-			if (channel.getState() !== ChannelState.NORMAL) continue;
+			if (!channel.isHtlcUsable()) continue;
 			const channelId = channel.getChannelId();
 			if (!channelId) continue;
 			const peerHex = this.channelManager.getPeerForChannel(channelId);
 			if (!peerHex) continue;
 			const st = channel.getFullState();
+			// A splice keeps using its pre-splice scid until the lock.
 			const scid = st.shortChannelId ?? st.scidAlias;
 			if (!scid) continue;
-			if (st.localBalanceMsat <= 0n) continue;
+			// Mid-splice, the ceiling is the min across both fundings (a
+			// splice-out's candidate commitment has less to spend) — the same
+			// figure addHtlc enforces, so the router never offers a route the
+			// channel then refuses. NORMAL channels keep the historical
+			// upper-bound (the add enforces reserve/in-flight limits).
+			const outboundMsat =
+				st.state === ChannelState.SPLICING
+					? channel.getSpendableOutboundMsat()
+					: st.localBalanceMsat;
+			if (outboundMsat <= 0n) continue;
 			edges.push({
 				shortChannelId: scid,
 				peer: Buffer.from(peerHex, 'hex'),
-				// Upper-bound capacity for the routing gate; the actual outgoing
-				// channel selection and HTLC add enforce reserve/in-flight limits.
-				outboundMsat: st.localBalanceMsat
+				outboundMsat
 			});
 		}
 		return edges;
@@ -9932,12 +9936,26 @@ export class LightningNode extends EventEmitter {
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
+			const usableMidSplice =
+				state.state === ChannelState.SPLICING && channel.isHtlcUsable();
 			if (
 				state.state !== ChannelState.NORMAL &&
-				state.state !== ChannelState.AWAITING_REESTABLISH
+				state.state !== ChannelState.AWAITING_REESTABLISH &&
+				!usableMidSplice
 			)
 				continue;
-			localBalanceMsat += state.localBalanceMsat;
+			if (usableMidSplice) {
+				// Pay-during-splice: the channel is live, but count the
+				// conservative side of the two fundings — a splice-out's balance
+				// is already committed to leave; a splice-in's arriving sats are
+				// reported by the splicing bucket until the lock.
+				const pending =
+					channel.getPendingSpliceLocalBalanceMsat() ?? state.localBalanceMsat;
+				localBalanceMsat +=
+					pending < state.localBalanceMsat ? pending : state.localBalanceMsat;
+			} else {
+				localBalanceMsat += state.localBalanceMsat;
+			}
 			remoteBalanceMsat += state.remoteBalanceMsat;
 			for (const [, htlc] of state.htlcs) {
 				if (
@@ -10234,7 +10252,7 @@ export class LightningNode extends EventEmitter {
 		for (const channel of this.channelManager.getChannelsByPeer(
 			peerPubkeyHex
 		)) {
-			if (channel.getState() !== ChannelState.NORMAL) continue;
+			if (!channel.isHtlcUsable()) continue;
 			const st = channel.getFullState();
 			if (
 				(st.shortChannelId && st.shortChannelId.equals(scid)) ||
@@ -10252,9 +10270,7 @@ export class LightningNode extends EventEmitter {
 		amountMsat?: bigint
 	): Channel | undefined {
 		const channels = this.channelManager.getChannelsByPeer(peerPubkeyHex);
-		const normalChannels = channels.filter(
-			(ch) => ch.getState() === ChannelState.NORMAL
-		);
+		const normalChannels = channels.filter((ch) => ch.isHtlcUsable());
 
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];

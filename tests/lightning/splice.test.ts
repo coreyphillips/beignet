@@ -4692,6 +4692,37 @@ describe('Splice', function () {
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
+		it('isHtlcUsable tracks the pending-lock window, looking through a reconnect', function () {
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorPubkey
+			} = pair;
+			expect(openerChannel.isHtlcUsable(), 'usable at pending-lock').to.be.true;
+
+			// A disconnect parks it strictly, but hint surfaces look through.
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			expect(
+				openerChannel.isHtlcUsable(),
+				'strict: not usable while disconnected'
+			).to.be.false;
+			expect(
+				openerChannel.isHtlcUsable(true),
+				'hints: usable through the reconnect'
+			).to.be.true;
+
+			// Recover the wire and lock; NORMAL is usable.
+			openerChannel.getFullState().state = ChannelState.SPLICING;
+			openerChannel.getFullState().preReestablishState = null;
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(openerChannel.isHtlcUsable()).to.be.true;
+		});
+
 		it('a round mixing update_fee and an HTLC add batches cleanly mid-splice', function () {
 			const pair = pendingLockPair();
 			const {
