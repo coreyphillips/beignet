@@ -4692,6 +4692,102 @@ describe('Splice', function () {
 			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
 		});
 
+		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {
+			// The splicing spec's transition race: we lock and complete while the
+			// peer, not yet having observed our splice_locked, sends a
+			// start_batch built for BOTH fundings. The receiver must filter by
+			// funding_txid — process the commitment for the now-current funding,
+			// drop the obsolete one — not fail the channel.
+			const pair = pendingLockPair();
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey,
+				acceptorPubkey
+			} = pair;
+
+			// Capture the opener's batch instead of delivering it; everything
+			// else (the add, splice_locked) flows normally.
+			openerManager.removeAllListeners('message:outbound');
+			const held: Array<{ type: number; payload: Buffer }> = [];
+			let holding = false;
+			openerManager.on('message:outbound', (pk, type, payload) => {
+				if (pk !== acceptorPubkey) return;
+				if (type === MessageType.START_BATCH) {
+					holding = true;
+					held.push({ type, payload });
+					return;
+				}
+				if (holding && type === MessageType.COMMITMENT_SIGNED) {
+					held.push({ type, payload });
+					if (held.length === 3) holding = false;
+					return;
+				}
+				acceptorManager.handleMessage(openerPubkey, type, payload);
+			});
+
+			const preimage = crypto.randomBytes(32);
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(preimage).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			expect(held.length, 'start_batch + both commitments held').to.equal(3);
+
+			// Both sides lock with the round still outstanding.
+			openerManager.sendSpliceLocked(channelId);
+			acceptorManager.sendSpliceLocked(channelId);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+
+			// Reconnect safety: with the round outstanding at the lock, the
+			// opener's retransmission material must now be the SPLICE-side
+			// signature (the funding that is current from here on), not the old
+			// funding's — the generic reestablish path rebuilds from it.
+			const heldSplice = decodeCommitmentSignedMessage(held[2].payload);
+			expect(
+				openerChannel
+					.getFullState()
+					.lastSentCommitmentSigned!.equals(heldSplice.signature),
+				'splice-side signature promoted for retransmission'
+			).to.be.true;
+
+			// Deliver the late batch. No error; the acceptor processes the
+			// new-funding commitment, ignores the old, and the round completes:
+			// the add ends COMMITTED on both sides.
+			let errors = 0;
+			acceptorManager.on('error', () => {
+				errors++;
+			});
+			for (const m of held) {
+				acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+			}
+			expect(errors, 'late batch accepted without error').to.equal(0);
+			const openerEntry = [...openerChannel.getFullState().htlcs.values()][0];
+			const acceptorEntry = [
+				...acceptorChannel.getFullState().htlcs.values()
+			][0];
+			expect(openerEntry.state, 'opener committed').to.equal(
+				HtlcState.COMMITTED
+			);
+			expect(acceptorEntry.state, 'acceptor committed').to.equal(
+				HtlcState.COMMITTED
+			);
+
+			// And it settles on the spliced channel.
+			let fulfilled = false;
+			openerManager.on('htlc:fulfilled', () => {
+				fulfilled = true;
+			});
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(fulfilled, 'HTLC settled after the raced lock').to.be.true;
+		});
+
 		it('rejects a batch whose splice-side signature is invalid WITHOUT revoking', function () {
 			const pair = pendingLockPair();
 			const {
