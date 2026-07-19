@@ -5017,6 +5017,39 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
+		it('force-close from AWAITING_REESTABLISH (peer actually vanished) exits on the confirmed NEW funding', function () {
+			// The production shape of the scenario: the peer disconnects after
+			// tx_signatures (SPLICING wrapped in AWAITING_REESTABLISH), the
+			// splice confirms while it is gone (the chain watcher records
+			// markSpliceConfirmed because sendSpliceLocked cannot run), and the
+			// reestablish-timeout auto-close force-closes in exactly this state.
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel, acceptorPubkey } = pair;
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
+
+			openerManager.handlePeerDisconnected(acceptorPubkey);
+			expect(openerChannel.getState()).to.equal(
+				ChannelState.AWAITING_REESTABLISH
+			);
+			openerChannel.markSpliceConfirmed();
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
+			expect(
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'force-close while disconnected must spend the confirmed NEW funding'
+			).to.equal(true);
+		});
+
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {
 			// The splicing spec's transition race: we lock and complete while the
 			// peer, not yet having observed our splice_locked, sends a
