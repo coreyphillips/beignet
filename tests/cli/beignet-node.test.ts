@@ -122,6 +122,7 @@ describe('CLI types', () => {
 			lightningBalanceSats: 10000,
 			pendingCloseBalanceSats: 0,
 			erroredBalanceSats: 0,
+			splicingBalanceSats: 0,
 			channelCount: 1,
 			peerCount: 2,
 			listening: true

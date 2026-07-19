@@ -2463,6 +2463,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						lightningBalanceSats: { type: 'integer' },
 						pendingCloseBalanceSats: { type: 'integer' },
 						erroredBalanceSats: { type: 'integer' },
+						splicingBalanceSats: {
+							type: 'integer',
+							description:
+								'Local balance in channels with a splice in flight; rejoins lightningBalanceSats at splice_locked'
+						},
 						channelCount: { type: 'integer' },
 						peerCount: { type: 'integer' },
 						listening: { type: 'boolean' }
@@ -2474,7 +2479,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						onchain: { type: 'integer' },
 						lightning: { type: 'integer' },
 						total: { type: 'integer' },
-						unsettledSats: { type: 'integer' }
+						unsettledSats: { type: 'integer' },
+						splicingSats: {
+							type: 'integer',
+							description:
+								'Local balance in channels with a splice in flight; rejoins lightning at splice_locked'
+						}
 					}
 				},
 				OnchainTxInfo: {

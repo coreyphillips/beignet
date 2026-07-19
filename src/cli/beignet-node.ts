@@ -1249,6 +1249,7 @@ export class BeignetNode extends EventEmitter {
 			lightningBalanceSats: lightningBalance,
 			pendingCloseBalanceSats: this.getPendingCloseBalanceSats(),
 			erroredBalanceSats: this.getErroredBalanceSats(),
+			splicingBalanceSats: this.getSplicingBalanceSats(),
 			channelCount: info.channelCount,
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
@@ -1303,7 +1304,14 @@ export class BeignetNode extends EventEmitter {
 		const lnBalance = this.node.getBalance();
 		const lightning = Number(lnBalance.localBalanceMsat / 1000n);
 		const unsettledSats = Number(lnBalance.unsettledBalanceMsat / 1000n);
-		return { onchain, lightning, total: onchain + lightning, unsettledSats };
+		const splicingSats = this.getSplicingBalanceSats();
+		return {
+			onchain,
+			lightning,
+			total: onchain + lightning,
+			unsettledSats,
+			splicingSats
+		};
 	}
 
 	/**
@@ -1337,6 +1345,23 @@ export class BeignetNode extends EventEmitter {
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
 			if (ch.state === ChannelState.ERRORED) {
+				totalMsat += ch.localBalanceMsat;
+			}
+		}
+		return Number(totalMsat / 1000n);
+	}
+
+	/**
+	 * Local balance in channels with a splice in flight. The canonical
+	 * lightning balance excludes SPLICING channels, so during the splice's
+	 * confirmation window these funds would otherwise read as vanished; they
+	 * are safe in the channel and rejoin the lightning balance at
+	 * splice_locked.
+	 */
+	private getSplicingBalanceSats(): number {
+		let totalMsat = 0n;
+		for (const ch of this.node.listChannels()) {
+			if (ch.state === ChannelState.SPLICING) {
 				totalMsat += ch.localBalanceMsat;
 			}
 		}

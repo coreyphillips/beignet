@@ -25,6 +25,13 @@ export interface NodeInfo {
 	 * being recovered on-chain — typically needs a force-close to resolve.
 	 */
 	erroredBalanceSats: number;
+	/**
+	 * Local balance in channels with a splice in flight. The funds are safe in
+	 * the channel and return to lightningBalanceSats when the splice confirms
+	 * and locks; without this bucket they would read as vanished, since a
+	 * SPLICING channel is excluded from the live lightning balance.
+	 */
+	splicingBalanceSats: number;
 	channelCount: number;
 	peerCount: number;
 	listening: boolean;
@@ -305,6 +312,8 @@ export interface BalanceInfo {
 	lightning: number;
 	total: number;
 	unsettledSats?: number;
+	/** Local balance parked in channels with a splice in flight (see NodeInfo). */
+	splicingSats?: number;
 }
 
 export interface OfferInfo {

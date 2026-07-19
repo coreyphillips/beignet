@@ -32,6 +32,12 @@ function erroredSats(channels: FakeChannel[]): number {
 	);
 }
 
+function splicingSats(channels: FakeChannel[]): number {
+	return (BeignetNode.prototype as any).getSplicingBalanceSats.call(
+		fakeNode(channels)
+	);
+}
+
 describe('Balance visibility (pending close / errored)', () => {
 	it('pendingCloseBalanceSats sums closing-state channels only', () => {
 		const sats = pendingCloseSats([
@@ -66,6 +72,25 @@ describe('Balance visibility (pending close / errored)', () => {
 			{ state: ChannelState.NORMAL, localBalanceMsat: 50_000_000n }
 		]);
 		expect(sats).to.equal(23_500);
+	});
+
+	it('splicingBalanceSats sums only SPLICING channels', () => {
+		// The scare this guards against: during a splice the canonical lightning
+		// balance excludes the channel, so a wallet mid-splice read as empty.
+		const sats = splicingSats([
+			{ state: ChannelState.SPLICING, localBalanceMsat: 132_295_000n },
+			{ state: ChannelState.NORMAL, localBalanceMsat: 50_000_000n },
+			{ state: ChannelState.FORCE_CLOSED, localBalanceMsat: 9_000_000n }
+		]);
+		expect(sats).to.equal(132_295);
+	});
+
+	it('splicingBalanceSats is 0 with no splice in flight', () => {
+		expect(
+			splicingSats([
+				{ state: ChannelState.NORMAL, localBalanceMsat: 50_000_000n }
+			])
+		).to.equal(0);
 	});
 
 	it('erroredBalanceSats is 0 with no errored channels', () => {
