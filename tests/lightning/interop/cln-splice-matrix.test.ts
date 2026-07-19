@@ -32,6 +32,7 @@ import {
 	setupClnChannel,
 	CLN_P2P_HOST,
 	CLN_P2P_PORT,
+	payClnInvoiceStrict,
 	sleep
 } from './cln-helpers';
 import { bitcoinRpc, mineBlocks, ensureBitcoindFunds } from './shared-helpers';
@@ -503,6 +504,127 @@ describe('Interop: Beignet ↔ CLN splice matrix (regtest)', function () {
 			const spliceTxid = await confirmSplice(node, channelId, null);
 			await waitForSpliceComplete(node, channelId, oldTxid, 90_000);
 			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
+		});
+	});
+
+	// ── Tier E: payments DURING the splice (pending-lock window, #139) ──
+	// The splice-out is initiated and NOT mined: the splice tx sits in the
+	// regtest mempool and the channel holds in the pending-lock window while
+	// real payments cross it in both directions against a real CLN.
+	describe('Tier E: pay during splice (pending-lock window)', function () {
+		let node: LightningNode;
+		let channelId: Buffer;
+		let oldTxid: string;
+
+		before(async function () {
+			if (skipAll) this.skip();
+			const setup = await setupClnChannel(
+				cln,
+				clnPubkey,
+				224,
+				1_000_000,
+				400_000_000
+			);
+			node = setup.node;
+			nodes.push(node);
+			channelId = setup.channelId;
+			const st = node.getChannelManager().getChannel(channelId)!.getFullState();
+			oldTxid = Buffer.from(st.fundingTxid!).toString('hex');
+
+			const res = node.spliceOut(channelId, 50_000n, 1000);
+			expect(res.ok, res.error).to.equal(true);
+			const deadline = Date.now() + 30_000;
+			while (
+				Date.now() < deadline &&
+				!node.getChannelManager().getChannel(channelId)!.isSplicePendingLock()
+			) {
+				await sleep(500);
+			}
+			expect(
+				node.getChannelManager().getChannel(channelId)!.isSplicePendingLock(),
+				'pending-lock reached (splice tx unmined)'
+			).to.equal(true);
+
+			// Make the central invariant undeniable: the splice tx is sitting in
+			// the mempool, unconfirmed, while every payment below crosses the
+			// channel. getmempoolentry throws for confirmed/unknown txids.
+			const pendingSpliceTxid = spliceTxidHex(node, channelId);
+			expect(pendingSpliceTxid, 'splice txid known').to.not.equal(null);
+			const entry = await bitcoinRpc('getmempoolentry', [pendingSpliceTxid!]);
+			expect(entry, 'splice tx is in the mempool').to.be.an('object');
+		});
+
+		it('E1: CLN pays a beignet invoice while the splice awaits its lock', async function () {
+			const invoice = node.createInvoice({
+				amountMsat: 20_000_000n,
+				description: 'tier-e1'
+			});
+			const payResult = await Promise.race([
+				cln.pay(invoice.bolt11),
+				sleep(60_000).then(() => {
+					throw new Error('CLN pay timed out mid-splice');
+				})
+			]);
+			expect(payResult.status).to.equal('complete');
+			await sleep(2000);
+			const ch = node.getChannelManager().getChannel(channelId)!;
+			expect(ch.getState(), 'still mid-splice after the payment').to.equal(
+				'SPLICING'
+			);
+			expect(ch.isSplicePendingLock()).to.equal(true);
+		});
+
+		it('E2: beignet pays a CLN invoice while the splice awaits its lock', async function () {
+			// The strict helper syncs the node's block height first (these
+			// interop nodes have no chain watcher, so an outbound HTLC would
+			// otherwise carry an invalid absolute CLTV) and asserts settlement
+			// on BOTH sides for this specific payment.
+			await payClnInvoiceStrict(node, cln, 15_000_000, 'tier-e2');
+			expect(
+				node.getChannelManager().getChannel(channelId)!.isSplicePendingLock()
+			).to.equal(true);
+		});
+
+		it('E3: pending-lock reestablish against real CLN, then a payment settles', async function () {
+			// This proves the channel survives a pending-lock disconnect against
+			// CLN's own implementation and processes HTLC traffic afterwards.
+			// (Interrupted-round REPLAY has its targeted matrix in
+			// splice.test.ts — no HTLC is in flight at this disconnect.)
+			node.disconnectPeer(clnPubkey);
+			await sleep(2000);
+			await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
+			await sleep(3000);
+			const invoice = node.createInvoice({
+				amountMsat: 10_000_000n,
+				description: 'tier-e3'
+			});
+			const payResult = await Promise.race([
+				cln.pay(invoice.bolt11),
+				sleep(60_000).then(() => {
+					throw new Error('CLN pay timed out after the mid-splice reconnect');
+				})
+			]);
+			expect(payResult.status).to.equal('complete');
+			expect(
+				node.getChannelManager().getChannel(channelId)!.isSplicePendingLock()
+			).to.equal(true);
+		});
+
+		it('E4: the splice then confirms, locks, and a post-lock payment settles', async function () {
+			const spliceTxid = await confirmSplice(node, channelId, null);
+			await waitForSpliceComplete(node, channelId, oldTxid, 90_000);
+			await waitForClnSplicedNormal(node.getNodeId(), spliceTxid);
+			const invoice = node.createInvoice({
+				amountMsat: 10_000_000n,
+				description: 'tier-e4'
+			});
+			const payResult = await Promise.race([
+				cln.pay(invoice.bolt11),
+				sleep(60_000).then(() => {
+					throw new Error('CLN pay timed out post-lock');
+				})
+			]);
+			expect(payResult.status).to.equal('complete');
 		});
 	});
 });
