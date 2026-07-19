@@ -5011,6 +5011,17 @@ export class LightningNode extends EventEmitter {
 		if (pendingSplice !== null)
 			info.pendingSpliceLocalBalanceMsat = pendingSplice;
 		info.htlcUsable = channel.isHtlcUsable();
+		// Present exactly when the channel is mid-splice by EFFECTIVE state
+		// (looking through a reconnect): true = pay-through accounting (counted
+		// in the canonical balance at min(live, settle-to)), false = parked
+		// (lives entirely in the splicing bucket).
+		const effInfoState =
+			state.state === ChannelState.AWAITING_REESTABLISH
+				? state.preReestablishState ?? state.state
+				: state.state;
+		if (effInfoState === ChannelState.SPLICING) {
+			info.payThroughSplice = channel.isHtlcUsable(true);
+		}
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
 		info.feeratePerKw = state.localConfig.feeratePerKw;
@@ -9936,23 +9947,31 @@ export class LightningNode extends EventEmitter {
 
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
-			const usableMidSplice =
-				state.state === ChannelState.SPLICING && channel.isHtlcUsable();
-			if (
-				state.state !== ChannelState.NORMAL &&
-				state.state !== ChannelState.AWAITING_REESTABLISH &&
-				!usableMidSplice
-			)
-				continue;
-			if (usableMidSplice) {
-				// Pay-during-splice: the channel is live, but count the
-				// conservative side of the two fundings — a splice-out's balance
-				// is already committed to leave; a splice-in's arriving sats are
-				// reported by the splicing bucket until the lock.
+			// Accounting classifies by EFFECTIVE state: the splice's accounting
+			// phase survives a disconnect (AWAITING_REESTABLISH wrapping
+			// SPLICING), or a splice-out would bounce back to its full
+			// pre-splice balance the moment the peer drops and double-count
+			// against the on-chain side. Routing keeps strict isHtlcUsable().
+			const effState =
+				state.state === ChannelState.AWAITING_REESTABLISH
+					? state.preReestablishState ?? state.state
+					: state.state;
+			if (effState === ChannelState.SPLICING) {
+				// Pay-through splices count at the conservative side of their two
+				// fundings — a splice-out's balance is already committed to
+				// leave; a splice-in's arriving sats sit in the splicing bucket
+				// until the lock. Parked splices (taproot, pre point-of-no-return)
+				// live entirely in the bucket.
+				if (!channel.isHtlcUsable(true)) continue;
 				const pending =
 					channel.getPendingSpliceLocalBalanceMsat() ?? state.localBalanceMsat;
 				localBalanceMsat +=
 					pending < state.localBalanceMsat ? pending : state.localBalanceMsat;
+			} else if (
+				state.state !== ChannelState.NORMAL &&
+				state.state !== ChannelState.AWAITING_REESTABLISH
+			) {
+				continue;
 			} else {
 				localBalanceMsat += state.localBalanceMsat;
 			}

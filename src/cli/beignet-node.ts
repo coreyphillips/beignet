@@ -1366,9 +1366,13 @@ export class BeignetNode extends EventEmitter {
 	private getSplicingBalanceSats(): number {
 		let totalMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (ch.state !== ChannelState.SPLICING) continue;
+			// payThroughSplice is present exactly when the channel is mid-splice
+			// by EFFECTIVE state — including one disconnected mid-splice, whose
+			// in-transit funds must not vanish from the bucket while the peer is
+			// away.
+			if (ch.payThroughSplice === undefined) continue;
 			const pending = ch.pendingSpliceLocalBalanceMsat ?? ch.localBalanceMsat;
-			if (ch.htlcUsable) {
+			if (ch.payThroughSplice) {
 				// Pay-during-splice: the canonical balance already counts this
 				// channel at min(live, settle-to); the bucket holds only what is
 				// still in transit — a splice-in's arriving sats. A splice-out's
