@@ -2647,6 +2647,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Local balance the channel settles to when its in-flight splice locks; present only mid-splice (localBalanceSats stays pre-splice until splice_locked)'
 						},
+						htlcUsable: {
+							type: 'boolean',
+							description:
+								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+						},
+						payThroughSplice: {
+							type: 'boolean',
+							description:
+								'Present exactly when mid-splice by effective state: true = paying through the splice, false = parked'
+						},
 						feeBaseMsat: { type: 'integer' },
 						feeProportionalMillionths: { type: 'integer' },
 						cltvExpiryDelta: { type: 'integer' },

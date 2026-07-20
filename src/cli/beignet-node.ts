@@ -2541,11 +2541,18 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'NO_USABLE_SCID: No SCID the remote peer recognizes. Need 6 confirmations for real SCID, or remote must send alias in channel_ready. Routing hints will be skipped — invoice will have no route.'
 			);
-		if (state.state !== 'NORMAL' && state.preReestablishState !== 'NORMAL') {
+		// Pay-during-splice (0.6.0): a channel paying through its splice is
+		// fully usable — hints generate, payments flow — so it is not an issue.
+		const htlcUsableThrough = channel.isHtlcUsable(true);
+		if (
+			state.state !== 'NORMAL' &&
+			state.preReestablishState !== 'NORMAL' &&
+			!htlcUsableThrough
+		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
 					state.preReestablishState || 'none'
-				}). Routing hints require NORMAL state.`
+				}). Routing hints require a usable channel.`
 			);
 		}
 		if (!state.announceChannel)
@@ -2580,7 +2587,9 @@ export class BeignetNode extends EventEmitter {
 			effectiveScid: effectiveScid?.toString('hex') || null,
 			willGenerateRoutingHint:
 				!!effectiveScid &&
-				(state.state === 'NORMAL' || state.preReestablishState === 'NORMAL'),
+				(state.state === 'NORMAL' ||
+					state.preReestablishState === 'NORMAL' ||
+					htlcUsableThrough),
 			localBalanceSats: Number(state.localBalanceMsat / 1000n),
 			remoteBalanceSats: Number(state.remoteBalanceMsat / 1000n),
 			issues
@@ -2600,6 +2609,8 @@ export class BeignetNode extends EventEmitter {
 		feeratePerKw?: number;
 		htlcCount?: number;
 		pendingSpliceLocalBalanceMsat?: bigint;
+		htlcUsable?: boolean;
+		payThroughSplice?: boolean;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
@@ -2632,6 +2643,12 @@ export class BeignetNode extends EventEmitter {
 			info.pendingSpliceLocalBalanceSats = Number(
 				ch.pendingSpliceLocalBalanceMsat / 1000n
 			);
+		// The dashboard's Send gating reads these off the wire; dropping them
+		// here re-parked every mid-splice channel in the UI while the daemon
+		// happily paid through the window.
+		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
+		if (ch.payThroughSplice !== undefined)
+			info.payThroughSplice = ch.payThroughSplice;
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
 		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
 		if (ch.feeProportionalMillionths !== undefined)

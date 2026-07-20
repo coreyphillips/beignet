@@ -138,6 +138,58 @@ describe('LightningNode.getBalance mid-splice accounting', () => {
 	});
 });
 
+describe('Channel listing wire fields (GET /channels JSON)', () => {
+	// Regression: htlcUsable/payThroughSplice existed on the node-layer channel
+	// info but the CLI serializer dropped them, so the dashboard re-parked
+	// every mid-splice channel while the daemon happily paid through the
+	// window (observed live on umbrel 0.8.1 / beignet 0.6.1).
+	it('toChannelInfo passes htlcUsable and payThroughSplice through', () => {
+		const info = (BeignetNode.prototype as any).toChannelInfo.call(
+			{
+				node: {
+					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' })
+				}
+			},
+			{
+				channelId: Buffer.alloc(32, 1),
+				peerPubkey: 'peerpk',
+				state: 'SPLICING',
+				localBalanceMsat: 132_295_000n,
+				remoteBalanceMsat: 5_000_000n,
+				fundingSatoshis: 137_295n,
+				channelType: null,
+				htlcUsable: true,
+				payThroughSplice: true,
+				pendingSpliceLocalBalanceMsat: 211_746_000n
+			}
+		);
+		expect(info.htlcUsable).to.equal(true);
+		expect(info.payThroughSplice).to.equal(true);
+		expect(info.pendingSpliceLocalBalanceSats).to.equal(211_746);
+	});
+
+	it('omits the flags when the node layer does not provide them', () => {
+		const info = (BeignetNode.prototype as any).toChannelInfo.call(
+			{
+				node: {
+					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' })
+				}
+			},
+			{
+				channelId: Buffer.alloc(32, 2),
+				peerPubkey: 'peerpk',
+				state: 'NORMAL',
+				localBalanceMsat: 1_000_000n,
+				remoteBalanceMsat: 0n,
+				fundingSatoshis: 1_000n,
+				channelType: null
+			}
+		);
+		expect(info.htlcUsable).to.equal(undefined);
+		expect(info.payThroughSplice).to.equal(undefined);
+	});
+});
+
 describe('Balance visibility (pending close / errored)', () => {
 	it('pendingCloseBalanceSats sums closing-state channels only', () => {
 		const sats = pendingCloseSats([

@@ -82,6 +82,13 @@ export interface ChannelInfo {
 	 * localBalanceSats stays pre-splice until splice_locked.
 	 */
 	pendingSpliceLocalBalanceSats?: number;
+	/** Whether the channel can carry HTLC traffic right now (0.6.0+). */
+	htlcUsable?: boolean;
+	/**
+	 * Present exactly when mid-splice by effective state: true = paying
+	 * through the splice (counted in the canonical balance), false = parked.
+	 */
+	payThroughSplice?: boolean;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;
