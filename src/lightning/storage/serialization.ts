@@ -417,6 +417,7 @@ export interface ISerializedSpliceInFlight {
 	ourWalletInputIndices: number[];
 	remoteCommitmentSig: string | null;
 	remoteCommitmentSigFeeratePerKw?: number;
+	remoteCommitmentSigLeaseBlockheight?: number;
 	remoteHtlcSignatures?: string[];
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
@@ -445,6 +446,7 @@ export function serializeSpliceInFlight(
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: f.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: f.remoteCommitmentSigLeaseBlockheight,
 		remoteHtlcSignatures: f.remoteHtlcSignatures?.map((b) => b.toString('hex')),
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
@@ -474,6 +476,7 @@ export function deserializeSpliceInFlight(
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: s.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: s.remoteCommitmentSigLeaseBlockheight,
 		remoteHtlcSignatures: s.remoteHtlcSignatures?.map((h) =>
 			Buffer.from(h, 'hex')
 		),

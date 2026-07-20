@@ -4914,6 +4914,101 @@ describe('Splice', function () {
 				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
 			}
 
+			it('a RESTART mid-round re-signs the batch from persisted material', function () {
+				// Same as 'the batch is lost', but the opener also loses its
+				// in-memory batch cache — what a process restart destroys. The
+				// reestablish path must REBUILD the batch: persisted signature
+				// bytes for the current funding, a deterministic ECDSA re-sign
+				// for the splice side.
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					openerChannel,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', () => {});
+
+				const preimage = crypto.randomBytes(32);
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				expect(fromOpener.length).to.equal(4);
+				// Only the add reaches the acceptor; the batch is lost.
+				acceptorManager.handleMessage(
+					openerPubkey,
+					fromOpener[0].type,
+					fromOpener[0].payload
+				);
+
+				openerManager.handlePeerDisconnected(acceptorPubkey);
+				acceptorManager.handlePeerDisconnected(openerPubkey);
+				// The restart: the cached wire bytes die with the process (the
+				// splice session itself is restored from persistence on boot).
+				(openerChannel as any)._lastSentBatch = null;
+
+				fromOpener.length = 0;
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				acceptorManager.removeAllListeners('message:outbound');
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+				openerManager.handlePeerReconnected(acceptorPubkey);
+				acceptorManager.handlePeerReconnected(openerPubkey);
+				const openerReest = fromOpener.splice(0);
+				const acceptorReest = fromAcceptor.splice(0);
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				connectManagers(
+					openerManager,
+					openerPubkey,
+					acceptorManager,
+					acceptorPubkey
+				);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				// The rebuilt batch converged the round.
+				const oEntry = [...openerChannel.getFullState().htlcs.values()][0];
+				const aEntry = [...acceptorChannel.getFullState().htlcs.values()][0];
+				expect(oEntry?.state, 'opener committed via rebuilt batch').to.equal(
+					HtlcState.COMMITTED
+				);
+				expect(aEntry?.state, 'acceptor committed via rebuilt batch').to.equal(
+					HtlcState.COMMITTED
+				);
+
+				// Settles, and the splice locks cleanly.
+				let fulfilled = false;
+				openerManager.on('htlc:fulfilled', () => {
+					fulfilled = true;
+				});
+				acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+				expect(fulfilled, 'settled after the restart-rebuilt round').to.be.true;
+				openerManager.sendSpliceLocked(channelId);
+				acceptorManager.sendSpliceLocked(channelId);
+				expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			});
+
 			it('the add itself is lost', function () {
 				runDisconnectScenario(0, 0);
 			});
@@ -5050,32 +5145,162 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
-		it('refuses to force-close against the spent old funding when adoption is impossible', function () {
-			// The defensive floor: splice confirmed, but the in-memory session
-			// is gone and cannot be rebuilt (worst-case restart). Broadcasting
-			// the old-funding commitment would be knowingly unconfirmable — the
-			// force-close must refuse instead.
+		it('refuses a taproot splice ON THE WIRE: tx_abort, quiescence unwound, channel stays usable', function () {
+			// The splice commitment machinery is ECDSA-only. The refusal must be
+			// a real protocol answer, not a local error: the initiator gets
+			// tx_abort (so it stops waiting for splice_ack and unwinds its own
+			// pending splice), and the refusing side exits the quiescence the
+			// handshake established rather than sitting silently quiescent.
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey
+			} = createNormalChannelPair();
+			// Only the acceptor is taproot: the initiator's own up-front refusal
+			// (covered below) would otherwise stop splice_init leaving at all.
+			const flags = FeatureFlags.empty();
+			flags.setCompulsory(Feature.OPTION_TAPROOT);
+			const originalType = acceptorChannel.getFullState().channelType;
+			acceptorChannel.getFullState().channelType = flags.toBuffer();
+
+			const sent: number[] = [];
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey) sent.push(type);
+			});
+
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			openerManager.initiateQuiescence(channelId);
+			openerManager.initiateSplice(channelId, 100_000n, 253);
+
+			expect(
+				sent.includes(MessageType.TX_ABORT),
+				'tx_abort went out on the wire'
+			).to.equal(true);
+			expect(sent.includes(MessageType.SPLICE_ACK), 'no splice_ack').to.equal(
+				false
+			);
+			expect(
+				acceptorChannel.isQuiescent(),
+				'acceptor quiescence unwound'
+			).to.equal(false);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerChannel.getState(),
+				'opener recovered via tx_abort'
+			).to.equal(ChannelState.NORMAL);
+
+			// The channel remains fully usable after the refusal. (Restore the
+			// real channel type first: the fake taproot flag exists only to
+			// drive the refusal; the usability claim is about the quiescence
+			// unwind, and a genuinely-taproot pair would sign via MuSig2.)
+			acceptorChannel.getFullState().channelType = originalType;
+			const preimage = crypto.randomBytes(32);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					10_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+
+			// And the initiator-side up-front refusal, for completeness.
+			openerChannel.getFullState().channelType = flags.toBuffer();
+			const initActions = openerChannel.initiateSplice(50_000n, 253);
+			const initErr = findAction(initActions, ChannelActionType.ERROR);
+			expect(initErr, 'initiator refused').to.not.equal(undefined);
+			expect(String(initErr.message)).to.include('taproot');
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('force-close adopts the splice signature at the rate it was MADE at, not a later staged fee', function () {
+			// The race: the splice-side signature is persisted at rate A; an
+			// update_fee stages rate B during the pending-lock window; the
+			// splice confirms and we force-close. Rebuilding at B with a
+			// signature made for A would produce an invalid witness. The exact
+			// rate now travels with the signature in the record.
+			const pair = pendingLockPair();
+			const { acceptorManager, channelId, acceptorChannel } = pair;
+			const inflight = acceptorChannel.getFullState().spliceInFlight!;
+			const rateA = inflight.remoteCommitmentSigFeeratePerKw;
+			expect(
+				rateA,
+				'exact rate persisted with the initial signature'
+			).to.not.equal(undefined);
+
+			// A staged fee the acceptor has not signed at (getLocalCommitmentFeeRate
+			// would return it for the ACCEPTOR role — the fallback this guards).
+			acceptorChannel.getFullState().pendingFeeratePerKw = rateA! * 4;
+			acceptorChannel.markSpliceConfirmed();
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = acceptorManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			expect(
+				acceptorChannel.getFullState().lastSignedCommitFeeratePerKw,
+				'rebuilt at the rate the adopted signature covers'
+			).to.equal(rateA);
+		});
+
+		it('recovers a unilateral exit from the persisted record alone (worst-case restart)', function () {
+			// The in-memory splice session is gone and cannot be rebuilt — the
+			// case that used to end in a safe refusal. The point-of-no-return
+			// record carries everything adoption needs (outpoint, capacity,
+			// relatives, the peer's funding pubkey and splice-side signatures),
+			// so completeSplice now adopts session-free and the force-close
+			// exits on the confirmed NEW funding, mid-splice HTLC aboard. The
+			// #147 refusal guard remains as the unreachable last line of defense.
 			const pair = pendingLockPair();
 			const { openerManager, channelId, openerChannel, acceptorPubkey } = pair;
+			openerManager.addHtlc(
+				channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
 			openerManager.handlePeerDisconnected(acceptorPubkey);
 			openerChannel.markSpliceConfirmed();
-			// Sabotage: no session, and restore made impotent.
+			// Worst-case restart: no session, restore impotent, in-memory
+			// splice-side signature copies gone.
 			(openerChannel as any)._spliceSession = null;
 			(openerChannel as any).restoreSpliceInFlight = () => {};
+			(openerChannel as any)._spliceRemoteCommitmentSig = null;
+			(openerChannel as any)._spliceRemoteHtlcSigs = null;
 
 			const dest = Buffer.concat([
 				Buffer.from([0x00, 0x14]),
 				crypto.randomBytes(20)
 			]);
 			const res = openerManager.forceClose(channelId, dest);
-			expect(res.ok, 'refused rather than broadcast unconfirmable').to.equal(
-				false
-			);
-			expect(String(res.error)).to.include('could not be adopted');
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
 			expect(
-				findAction(res.actions, ChannelActionType.BROADCAST_TX),
-				'nothing broadcast'
-			).to.equal(undefined);
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'exits on the confirmed NEW funding from the record alone'
+			).to.equal(true);
+			expect(
+				tx.outs.some((o) => o.value === 15_000),
+				'the mid-splice HTLC rode onto the record-adopted commitment'
+			).to.equal(true);
 		});
 
 		it('accepts a batch that raced splice_locked, ignoring the obsolete old-funding commitment', function () {

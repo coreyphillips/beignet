@@ -57,6 +57,12 @@ export interface ISpliceInFlight {
 	 * adopted signature.
 	 */
 	remoteCommitmentSigFeeratePerKw?: number;
+	/**
+	 * Lease blockheight covered by remoteCommitmentSig, captured with it for
+	 * the same reason as the feerate: force-close reconstruction must never
+	 * derive a signed commitment's parameters from mutable current state.
+	 */
+	remoteCommitmentSigLeaseBlockheight?: number;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
 	localSpliceLocked: boolean;

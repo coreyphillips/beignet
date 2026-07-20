@@ -5601,15 +5601,71 @@ export class Channel {
 		// wire bytes verbatim (idempotent — same signatures, no nonce reuse).
 		if (
 			pendingLock &&
-			this._lastSentBatch &&
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n
 		) {
-			actions.push(
-				sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
-			);
-			for (const c of this._lastSentBatch.commitments) {
-				actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+			if (this._lastSentBatch) {
+				actions.push(
+					sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+				);
+				for (const c of this._lastSentBatch.commitments) {
+					actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+				}
+			} else if (
+				this._signer &&
+				this._state.channelId &&
+				this._state.spliceInFlight &&
+				this._state.lastSentCommitmentSigned &&
+				!isTaprootChannel(this._state.channelType)
+			) {
+				// Restart mid-round: the cached wire bytes died with the process.
+				// Rebuild the batch from persisted material. The current-funding
+				// half replays the persisted signature bytes; the splice-side
+				// half is RE-SIGNED, which is exact for ECDSA (RFC 6979 is
+				// deterministic) over the spliced view at the same commitment
+				// number — and the same per-commitment point, because no
+				// revoke_and_ack arrived to rotate it.
+				const spliced = this._splicedState();
+				const point =
+					this._state.remoteNextPerCommitmentPoint ??
+					this._state.remoteCurrentPerCommitmentPoint;
+				if (spliced && point) {
+					try {
+						const spliceSigned = signRemoteCommitment(
+							spliced,
+							this._signer,
+							point,
+							this._state.remoteCommitmentNumber
+						);
+						const startBatchBytes = encodeStartBatchMessage({
+							channelId: this._state.channelId,
+							batchSize: 2,
+							messageType: MessageType.COMMITMENT_SIGNED
+						});
+						const currentBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: this._state.lastSentCommitmentSigned,
+							htlcSignatures: this._state.lastSentHtlcSignatures ?? []
+						});
+						const spliceBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: spliceSigned.signature,
+							htlcSignatures: spliceSigned.htlcSignatures,
+							fundingTxid: Buffer.from(this._state.spliceInFlight.spliceTxid)
+						});
+						actions.push(sendMsg(MessageType.START_BATCH, startBatchBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, currentBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, spliceBytes));
+						// Cache for any further replay on this connection.
+						this._lastSentBatch = {
+							startBatch: startBatchBytes,
+							commitments: [currentBytes, spliceBytes]
+						};
+					} catch {
+						// Unrebuildable: leave retransmission to the peer's
+						// next_funding retransmit flags, as before this change.
+					}
+				}
 			}
 		}
 
@@ -5893,6 +5949,22 @@ export class Channel {
 			];
 		}
 
+		// The splice commitment machinery is ECDSA-only: the mid-splice round
+		// signs with signRemoteCommitment, which would produce garbage for a
+		// MuSig2 funding and wedge the negotiation against a real peer. Refuse
+		// up front with a real answer instead. Taproot splicing (aggregate key
+		// for the new funding, nonce lifecycle across the splice, batched
+		// partials) is tracked separately.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot splice: taproot (MuSig2) channels do not support splicing yet'
+				}
+			];
+		}
+
 		if (!this._state.channelId) {
 			return [
 				{
@@ -6017,6 +6089,35 @@ export class Channel {
 					message: 'Cannot accept splice: channel must be quiescent'
 				}
 			];
+		}
+
+		// Mirror of initiateSplice: the ECDSA-only splice commitment machinery
+		// cannot serve a MuSig2 funding. Refuse ON THE WIRE (tx_abort) so the
+		// peer stops waiting for splice_ack, and unwind the quiescence the
+		// handshake already established so this side resumes normal operation
+		// instead of sitting silently quiescent on a splice it rejected.
+		if (isTaprootChannel(this._state.channelType)) {
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+			const abort: ChannelAction[] = [];
+			if (this._state.channelId) {
+				abort.push(
+					sendMsg(
+						MessageType.TX_ABORT,
+						encodeTxAbortMessage({
+							channelId: this._state.channelId,
+							data: Buffer.from('taproot splicing unsupported', 'utf8')
+						})
+					)
+				);
+			}
+			abort.push({
+				type: ChannelActionType.ERROR,
+				message:
+					'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
+			});
+			return abort;
 		}
 
 		if (!this._state.channelId) {
@@ -7484,6 +7585,9 @@ export class Channel {
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
 				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw,
+				remoteCommitmentSigLeaseBlockheight: getLocalCommitmentLeaseBlockheight(
+					this._state
+				),
 				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
 			});
 		}
@@ -7591,7 +7695,14 @@ export class Channel {
 		if (this._state.spliceInFlight) {
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
-				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs,
+				// The exact parameters this signature covers. Without them a
+				// force-close after e.g. an update_fee staged mid-window would
+				// rebuild the commitment at the newer rate and attach a
+				// signature made for the older one.
+				remoteCommitmentSigFeeratePerKw: getLocalCommitmentFeeRate(spliced),
+				remoteCommitmentSigLeaseBlockheight:
+					getLocalCommitmentLeaseBlockheight(spliced)
 			});
 		}
 
@@ -7701,7 +7812,51 @@ export class Channel {
 	 * Complete the splice: update channel funding outpoint, balances, and exit quiescence.
 	 */
 	private completeSplice(): void {
-		if (!this._spliceSession) return;
+		const inflight = this._state.spliceInFlight;
+		if (!this._spliceSession && !inflight) return;
+
+		if (!this._spliceSession) {
+			// Session-free adoption from the persisted point-of-no-return record:
+			// the worst-case restart where the in-memory session could not be
+			// rebuilt. The record carries everything the swap needs — beignet
+			// reuses its own local funding pubkey across a splice, the peer's is
+			// stored, and the balance arithmetic mirrors _splicedState exactly
+			// (fee borne by the initiator; in-flight HTLC value in neither
+			// balance).
+			const newCapacity = inflight!.newFundingSatoshis;
+			const feeFromChannelSats =
+				this._state.fundingSatoshis +
+				inflight!.localRelativeSatoshis +
+				inflight!.remoteRelativeSatoshis -
+				newCapacity;
+			const myFeeMsat = inflight!.isInitiator ? feeFromChannelSats * 1000n : 0n;
+			const myNewLocalMsat =
+				this._state.localBalanceMsat +
+				inflight!.localRelativeSatoshis * 1000n -
+				myFeeMsat;
+			let htlcInFlightMsat = 0n;
+			for (const e of this._state.htlcs.values()) {
+				htlcInFlightMsat += e.amountMsat;
+			}
+			const theirNewMsat =
+				newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+
+			this._state.spliceFundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.spliceFundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.fundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingSatoshis = newCapacity;
+			this._state.localBalanceMsat = myNewLocalMsat;
+			this._state.remoteBalanceMsat = theirNewMsat;
+			if (this._state.remoteBasepoints) {
+				this._state.remoteBasepoints = {
+					...this._state.remoteBasepoints,
+					fundingPubkey: Buffer.from(inflight!.remoteFundingPubkey)
+				};
+			}
+			this._finishCompleteSplice();
+			return;
+		}
 
 		// Capture the fee-adjusted new outpoint/capacity/balances from the actual
 		// splice transaction before the driver is reset.
@@ -7734,12 +7889,28 @@ export class Channel {
 				this._spliceSession.getRemoteRelativeSatoshis() * 1000n;
 		}
 
+		this._finishCompleteSplice();
+	}
+
+	/**
+	 * The funding-independent tail of completeSplice: adopt the peer's
+	 * splice-side signatures, reset announcement state for the new funding
+	 * generation, exit quiescence, return to NORMAL and clear the splice
+	 * bookkeeping. Shared by the session-driven and session-free (post-restart)
+	 * adoption paths.
+	 */
+	private _finishCompleteSplice(): void {
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
-		// spliced channel. If for some reason no mid-splice commitment was
-		// exchanged, fall back to driving a post-splice commitment round.
-		if (this._spliceRemoteCommitmentSig) {
-			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
+		// spliced channel. After a restart the in-memory copy is gone but the
+		// point-of-no-return record still holds it. If no mid-splice commitment
+		// was ever exchanged, fall back to driving a post-splice round.
+		const adoptedSig =
+			this._spliceRemoteCommitmentSig ??
+			this._state.spliceInFlight?.remoteCommitmentSig ??
+			null;
+		if (adoptedSig) {
+			this._state.remoteCommitmentSignature = Buffer.from(adoptedSig);
 			// Committed HTLCs that rode through the splice (S-2.M8) keep their
 			// outputs on the post-splice commitment; adopt the peer's verified
 			// second-level sigs over them (empty for an HTLC-free splice).
@@ -7753,6 +7924,7 @@ export class Channel {
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
 				getLocalCommitmentFeeRate(this._state);
 			this._state.lastSignedCommitLeaseBlockheight =
+				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
 				getLocalCommitmentLeaseBlockheight(this._state);
 		} else {
 			this._state.needsCommitment = true;
