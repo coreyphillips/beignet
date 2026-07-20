@@ -67,10 +67,17 @@ export function clampFeeRateSatPerVbyte(
 }
 
 export interface IFundingProvider {
+	/**
+	 * Build (but do not broadcast) the channel funding transaction.
+	 * @param max When true, sweep the whole balance into the funding output (no
+	 *   change). The caller must have committed funding_satoshis equal to the swept
+	 *   amount; the provider verifies the output matches.
+	 */
 	buildFundingTransaction(
 		address: string,
 		amountSats: bigint,
-		satsPerByte?: number
+		satsPerByte?: number,
+		max?: boolean
 	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }>;
 
 	broadcastTransaction(txHex: string): Promise<string>;

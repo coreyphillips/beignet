@@ -1320,10 +1320,11 @@ export class LightningNode extends EventEmitter {
 			'error',
 			(channelId: Buffer | null, message: string) => {
 				// An open that failed is never funded, so the rate it asked for has
-				// nothing left to apply to. Drop it rather than hold it for a channel
-				// that no longer exists.
+				// nothing left to apply to. Drop it, and the max-funding flag with it,
+				// rather than hold them for a channel that no longer exists.
 				if (channelId) {
 					this.requestedFundingFeeRates.delete(channelId.toString('hex'));
+					this.fundingMaxRequests.delete(channelId.toString('hex'));
 				}
 				const err: ILightningError = {
 					code: 'CHANNEL_ERROR',
@@ -2057,6 +2058,8 @@ export class LightningNode extends EventEmitter {
 		const tempId = channel.getTemporaryChannelId().toString('hex');
 		const requestedFeeRate = this.requestedFundingFeeRates.get(tempId);
 		this.requestedFundingFeeRates.delete(tempId);
+		const fundMax = this.fundingMaxRequests.has(tempId);
+		this.fundingMaxRequests.delete(tempId);
 
 		// Otherwise use a dynamic fee if an estimator is available (sanity-clamped).
 		const feePromise =
@@ -2073,7 +2076,8 @@ export class LightningNode extends EventEmitter {
 				this.fundingProvider!.buildFundingTransaction(
 					address,
 					state.fundingSatoshis,
-					satsPerByte
+					satsPerByte,
+					fundMax
 				)
 			)
 			.then(({ txHex, txid, outputIndex }) => {
@@ -3542,7 +3546,8 @@ export class LightningNode extends EventEmitter {
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
-		satsPerVbyte?: number
+		satsPerVbyte?: number,
+		fundMax = false
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -3592,6 +3597,23 @@ export class LightningNode extends EventEmitter {
 				satsPerVbyte
 			);
 		}
+		// Same lifecycle as the fee rate: remembered against the temporary id and
+		// consumed when the peer accepts, so funding sweeps instead of building a
+		// fixed-amount tx that cannot cover its own change output at the max.
+		if (fundMax) {
+			if (
+				this.fundingMaxRequests.size >=
+				LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
+			) {
+				const oldest = this.fundingMaxRequests.values().next().value;
+				if (oldest !== undefined) {
+					this.fundingMaxRequests.delete(oldest);
+				}
+			}
+			this.fundingMaxRequests.add(
+				channel.getTemporaryChannelId().toString('hex')
+			);
+		}
 		return channel;
 	}
 
@@ -3601,6 +3623,13 @@ export class LightningNode extends EventEmitter {
 	 * estimator's rate as before.
 	 */
 	private readonly requestedFundingFeeRates = new Map<string, number>();
+
+	/**
+	 * Temporary channel ids whose funding should sweep the whole balance (a "max"
+	 * channel), keyed the same way as the fee rates above and consumed together
+	 * when the peer accepts. Bounded by the same backstop.
+	 */
+	private readonly fundingMaxRequests = new Set<string>();
 
 	/** Far more than any node has opens in flight; a backstop, not a budget. */
 	private static readonly MAX_REQUESTED_FUNDING_FEE_RATES = 256;

@@ -69,6 +69,18 @@ export interface IWalletLike {
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<IResult>;
+	/**
+	 * Sweep the whole spendable balance to `address` (no change output). Used to
+	 * fund a "max" channel: the funding output then equals inputs minus fee, which
+	 * is exactly the amount the sweep quote computed, so it matches the committed
+	 * funding_satoshis. Optional so minimal/legacy wallets can omit it; a max
+	 * funding request against a wallet without it is rejected rather than guessed.
+	 */
+	sendMax?(params: {
+		address: string;
+		satsPerByte?: number;
+		broadcast?: boolean;
+	}): Promise<IResult>;
 	electrum: {
 		broadcastTransaction(params: {
 			rawTx: string;
@@ -106,25 +118,45 @@ export class WalletFundingProvider implements IFundingProvider {
 	async buildFundingTransaction(
 		address: string,
 		amountSats: bigint,
-		satsPerByte?: number
+		satsPerByte?: number,
+		max = false
 	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }> {
-		const sendParams: {
-			address: string;
-			amount: number;
-			broadcast: boolean;
-			shuffleOutputs: boolean;
-			satsPerByte?: number;
-		} = {
-			address,
-			amount: Number(amountSats),
-			broadcast: false,
-			shuffleOutputs: true
-		};
-		if (satsPerByte !== undefined) {
-			sendParams.satsPerByte = satsPerByte;
+		let result: IResult;
+		if (max) {
+			// A max channel sweeps the whole balance into the funding output. Funding
+			// it as a fixed-amount send instead adds a change output whose fee the
+			// swept balance cannot cover, so the fixed path fails at the exact max
+			// ("New total amount exceeds the available balance"). Sweeping produces a
+			// no-change tx whose output is inputs minus fee, i.e. the amount the
+			// caller already committed as funding_satoshis.
+			if (!this.wallet.sendMax) {
+				throw new Error(
+					'Wallet does not support max funding (sendMax unavailable)'
+				);
+			}
+			result = await this.wallet.sendMax({
+				address,
+				broadcast: false,
+				...(satsPerByte !== undefined ? { satsPerByte } : {})
+			});
+		} else {
+			const sendParams: {
+				address: string;
+				amount: number;
+				broadcast: boolean;
+				shuffleOutputs: boolean;
+				satsPerByte?: number;
+			} = {
+				address,
+				amount: Number(amountSats),
+				broadcast: false,
+				shuffleOutputs: true
+			};
+			if (satsPerByte !== undefined) {
+				sendParams.satsPerByte = satsPerByte;
+			}
+			result = await this.wallet.send(sendParams);
 		}
-
-		const result = await this.wallet.send(sendParams);
 		if (result.isErr()) {
 			throw new Error(
 				`Wallet send failed: ${(result as IResultErr).error.message}`
@@ -149,6 +181,20 @@ export class WalletFundingProvider implements IFundingProvider {
 
 		if (outputIndex === -1) {
 			throw new Error('Funding output not found in transaction');
+		}
+
+		// The commitment is built against the committed funding_satoshis, so the
+		// on-chain funding output must equal it exactly. A max sweep is priced from
+		// the same balance and rate as the amount already committed, so they match;
+		// guard the rare drift (a UTXO arriving or spent between quote and funding)
+		// rather than sign a commitment against a mismatched output.
+		if (max) {
+			const fundedValue = tx.outs[outputIndex].value;
+			if (fundedValue !== Number(amountSats)) {
+				throw new Error(
+					`Max funding output (${fundedValue} sats) does not match committed funding amount (${amountSats} sats); on-chain balance changed since the amount was quoted`
+				);
+			}
 		}
 
 		// getHash() returns txid in internal byte order (per BOLT 2)
