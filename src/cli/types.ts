@@ -608,6 +608,11 @@ export interface LiquiditySnapshot {
 	activeChannelCount: number;
 	outboundLiquidityPct: number;
 	inboundLiquidityPct: number;
+	/** Total local balance held back as channel reserve, unspendable (sats). */
+	reserveSats: number;
+	/** Local balance above the reserve, i.e. what can actually be sent (sats).
+	 *  Zero while a channel's balance is still below its reserve. */
+	sendableSats: number;
 	recommendations: LiquidityRecommendation[];
 }
 
