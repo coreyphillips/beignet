@@ -6092,16 +6092,32 @@ export class Channel {
 		}
 
 		// Mirror of initiateSplice: the ECDSA-only splice commitment machinery
-		// cannot serve a MuSig2 funding; refuse before any negotiation state
-		// exists (the peer receives tx_abort semantics via the error path).
+		// cannot serve a MuSig2 funding. Refuse ON THE WIRE (tx_abort) so the
+		// peer stops waiting for splice_ack, and unwind the quiescence the
+		// handshake already established so this side resumes normal operation
+		// instead of sitting silently quiescent on a splice it rejected.
 		if (isTaprootChannel(this._state.channelType)) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
-				}
-			];
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+			const abort: ChannelAction[] = [];
+			if (this._state.channelId) {
+				abort.push(
+					sendMsg(
+						MessageType.TX_ABORT,
+						encodeTxAbortMessage({
+							channelId: this._state.channelId,
+							data: Buffer.from('taproot splicing unsupported', 'utf8')
+						})
+					)
+				);
+			}
+			abort.push({
+				type: ChannelActionType.ERROR,
+				message:
+					'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
+			});
+			return abort;
 		}
 
 		if (!this._state.channelId) {
@@ -7569,6 +7585,9 @@ export class Channel {
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
 				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw,
+				remoteCommitmentSigLeaseBlockheight: getLocalCommitmentLeaseBlockheight(
+					this._state
+				),
 				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
 			});
 		}
@@ -7676,7 +7695,14 @@ export class Channel {
 		if (this._state.spliceInFlight) {
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
-				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs,
+				// The exact parameters this signature covers. Without them a
+				// force-close after e.g. an update_fee staged mid-window would
+				// rebuild the commitment at the newer rate and attach a
+				// signature made for the older one.
+				remoteCommitmentSigFeeratePerKw: getLocalCommitmentFeeRate(spliced),
+				remoteCommitmentSigLeaseBlockheight:
+					getLocalCommitmentLeaseBlockheight(spliced)
 			});
 		}
 
@@ -7898,6 +7924,7 @@ export class Channel {
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
 				getLocalCommitmentFeeRate(this._state);
 			this._state.lastSignedCommitLeaseBlockheight =
+				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
 				getLocalCommitmentLeaseBlockheight(this._state);
 		} else {
 			this._state.needsCommitment = true;

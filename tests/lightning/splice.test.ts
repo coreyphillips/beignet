@@ -5145,46 +5145,114 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
-		it('refuses to splice a taproot (MuSig2) channel, both sides, with a real answer', function () {
-			// The splice commitment machinery is ECDSA-only; an attempted
-			// taproot splice used to fail messily mid-negotiation. It now
-			// refuses up front on both the initiator and acceptor paths.
-			// Full taproot splicing is its own tracked project.
-			const { openerChannel, acceptorChannel } = createNormalChannelPair();
+		it('refuses a taproot splice ON THE WIRE: tx_abort, quiescence unwound, channel stays usable', function () {
+			// The splice commitment machinery is ECDSA-only. The refusal must be
+			// a real protocol answer, not a local error: the initiator gets
+			// tx_abort (so it stops waiting for splice_ack and unwinds its own
+			// pending splice), and the refusing side exits the quiescence the
+			// handshake established rather than sitting silently quiescent.
+			const {
+				openerManager,
+				acceptorManager,
+				channelId,
+				openerChannel,
+				acceptorChannel,
+				openerPubkey
+			} = createNormalChannelPair();
+			// Only the acceptor is taproot: the initiator's own up-front refusal
+			// (covered below) would otherwise stop splice_init leaving at all.
 			const flags = FeatureFlags.empty();
 			flags.setCompulsory(Feature.OPTION_TAPROOT);
-			openerChannel.getFullState().channelType = flags.toBuffer();
+			const originalType = acceptorChannel.getFullState().channelType;
 			acceptorChannel.getFullState().channelType = flags.toBuffer();
 
+			const sent: number[] = [];
+			acceptorManager.on('message:outbound', (pk, type) => {
+				if (pk === openerPubkey) sent.push(type);
+			});
+
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
+			openerManager.initiateQuiescence(channelId);
+			openerManager.initiateSplice(channelId, 100_000n, 253);
+
+			expect(
+				sent.includes(MessageType.TX_ABORT),
+				'tx_abort went out on the wire'
+			).to.equal(true);
+			expect(sent.includes(MessageType.SPLICE_ACK), 'no splice_ack').to.equal(
+				false
+			);
+			expect(
+				acceptorChannel.isQuiescent(),
+				'acceptor quiescence unwound'
+			).to.equal(false);
+			expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			expect(
+				openerChannel.getState(),
+				'opener recovered via tx_abort'
+			).to.equal(ChannelState.NORMAL);
+
+			// The channel remains fully usable after the refusal. (Restore the
+			// real channel type first: the fake taproot flag exists only to
+			// drive the refusal; the usability claim is about the quiescence
+			// unwind, and a genuinely-taproot pair would sign via MuSig2.)
+			acceptorChannel.getFullState().channelType = originalType;
+			const preimage = crypto.randomBytes(32);
+			expect(
+				openerManager.addHtlc(
+					channelId,
+					10_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok
+			).to.equal(true);
+			acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+			expect(openerChannel.getFullState().htlcs.size).to.equal(0);
+
+			// And the initiator-side up-front refusal, for completeness.
+			openerChannel.getFullState().channelType = flags.toBuffer();
 			const initActions = openerChannel.initiateSplice(50_000n, 253);
 			const initErr = findAction(initActions, ChannelActionType.ERROR);
 			expect(initErr, 'initiator refused').to.not.equal(undefined);
 			expect(String(initErr.message)).to.include('taproot');
-			expect(openerChannel.getState(), 'no state change').to.equal(
-				ChannelState.NORMAL
-			);
+			expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+		});
 
-			acceptorChannel.initiateQuiescence();
-			(acceptorChannel as any)._quiescence.forceQuiescent?.();
-			// Drive the acceptor's handleSplice gate directly: quiescent taproot
-			// channel receiving splice_init must refuse with the same answer.
-			(acceptorChannel.getFullState() as any).quiescenceState = 'QUIESCENT';
-			const quiesced = (acceptorChannel as any)._quiescence;
-			if (quiesced && typeof quiesced.isQuiescent === 'function') {
-				const orig = quiesced.isQuiescent.bind(quiesced);
-				quiesced.isQuiescent = () => true;
-				const acceptActions = acceptorChannel.handleSplice({
-					channelId: acceptorChannel.getChannelId()!,
-					relativeSatoshis: 50_000n,
-					fundingFeeratePerkw: 253,
-					locktime: 0,
-					fundingPubkey: crypto.randomBytes(33)
-				} as any);
-				quiesced.isQuiescent = orig;
-				const acceptErr = findAction(acceptActions, ChannelActionType.ERROR);
-				expect(acceptErr, 'acceptor refused').to.not.equal(undefined);
-				expect(String(acceptErr.message)).to.include('taproot');
-			}
+		it('force-close adopts the splice signature at the rate it was MADE at, not a later staged fee', function () {
+			// The race: the splice-side signature is persisted at rate A; an
+			// update_fee stages rate B during the pending-lock window; the
+			// splice confirms and we force-close. Rebuilding at B with a
+			// signature made for A would produce an invalid witness. The exact
+			// rate now travels with the signature in the record.
+			const pair = pendingLockPair();
+			const { acceptorManager, channelId, acceptorChannel } = pair;
+			const inflight = acceptorChannel.getFullState().spliceInFlight!;
+			const rateA = inflight.remoteCommitmentSigFeeratePerKw;
+			expect(
+				rateA,
+				'exact rate persisted with the initial signature'
+			).to.not.equal(undefined);
+
+			// A staged fee the acceptor has not signed at (getLocalCommitmentFeeRate
+			// would return it for the ACCEPTOR role — the fallback this guards).
+			acceptorChannel.getFullState().pendingFeeratePerKw = rateA! * 4;
+			acceptorChannel.markSpliceConfirmed();
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = acceptorManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			expect(
+				acceptorChannel.getFullState().lastSignedCommitFeeratePerKw,
+				'rebuilt at the rate the adopted signature covers'
+			).to.equal(rateA);
 		});
 
 		it('recovers a unilateral exit from the persisted record alone (worst-case restart)', function () {
