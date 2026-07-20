@@ -49,6 +49,47 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
 const STABLE_CONNECTION_MS = 60_000;
 const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
 
+/**
+ * True for hosts that must be dialed directly and never through the SOCKS5/Tor
+ * proxy: localhost, loopback, and RFC1918 / link-local / unique-local IPs.
+ *
+ * Tor refuses to proxy connections to private and loopback addresses
+ * ("Rejecting SOCKS request for anonymous connection to private address"), so
+ * with a proxy configured, routing a LAN or localhost peer through it turns
+ * every dial and every auto-reconnect into a hard failure. A user who enables
+ * Tor to gain privacy on public peers should not thereby lose the channel peer
+ * that lives on their own network. Onion routing is decided by the caller; this
+ * only classifies literal IP addresses (and `localhost`). A hostname that
+ * happens to resolve to a private address is not caught here, because that would
+ * require resolving it first; peers on a LAN are addressed by IP in practice.
+ */
+export function isPrivateOrLoopbackHost(host: string): boolean {
+	const h = host.trim().toLowerCase();
+	if (h === '' || h === 'localhost') return h === 'localhost';
+
+	// IPv6: drop brackets and any zone id, then match the reserved ranges.
+	const v6 = h.replace(/^\[/, '').replace(/\]$/, '').split('%')[0];
+	if (v6 === '::1' || v6 === '::') return true;
+	if (/^fe[89ab][0-9a-f]:/.test(v6)) return true; // fe80::/10 link-local
+	if (/^f[cd][0-9a-f]{2}:/.test(v6)) return true; // fc00::/7  unique-local
+	// IPv4-mapped IPv6 (e.g. ::ffff:192.168.1.2) reduces to the IPv4 check.
+	const mapped = v6.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+
+	const v4 = mapped ? mapped[1] : h;
+	const m = v4.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+	if (!m) return false;
+	const parts = m.slice(1).map(Number);
+	if (parts.some((n) => n > 255)) return false;
+	const [a, b] = parts;
+	if (a === 0) return true; // 0.0.0.0/8 "this host on this network"
+	if (a === 127) return true; // 127.0.0.0/8 loopback
+	if (a === 10) return true; // 10.0.0.0/8
+	if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+	if (a === 192 && b === 168) return true; // 192.168.0.0/16
+	if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+	return false;
+}
+
 export interface IPeerManagerOptions {
 	/** Local node private key (32 bytes) */
 	localPrivateKey: Buffer;
@@ -174,10 +215,16 @@ export class PeerManager extends EventEmitter {
 			createSocket = (): Promise<IDuplexTransport> =>
 				connectWebSocket(url, { webSocketImpl });
 		} else {
-			// Use explicit proxy, or auto-detect .onion → default Tor SOCKS5 proxy
-			const proxy =
-				this.socks5Proxy ??
-				(host.endsWith('.onion') ? DEFAULT_TOR_PROXY : undefined);
+			// Route selection for the outbound socket:
+			//   .onion           → always via Tor (explicit proxy, else the default)
+			//   private/loopback → always direct; Tor rejects these, so proxying a
+			//                      LAN or localhost peer would only ever fail
+			//   public clearnet  → via the configured proxy (privacy), else direct
+			const proxy = host.endsWith('.onion')
+				? this.socks5Proxy ?? DEFAULT_TOR_PROXY
+				: isPrivateOrLoopbackHost(host)
+				? undefined
+				: this.socks5Proxy;
 			createSocket = proxy ? this.buildSocks5Factory(proxy) : undefined;
 		}
 
