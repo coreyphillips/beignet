@@ -2354,7 +2354,8 @@ export class BeignetNode extends EventEmitter {
 		pubkey: string,
 		amountSats: number,
 		pushSats?: number,
-		satsPerVbyte?: number
+		satsPerVbyte?: number,
+		max = false
 	): ChannelInfo {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
@@ -2363,7 +2364,8 @@ export class BeignetNode extends EventEmitter {
 			pubkey,
 			fundingSatoshis,
 			pushMsat,
-			satsPerVbyte
+			satsPerVbyte,
+			max
 		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -2397,14 +2399,15 @@ export class BeignetNode extends EventEmitter {
 		host: string,
 		port: number,
 		amountSats: number,
-		opts?: { pushSats?: number; satsPerVbyte?: number }
+		opts?: { pushSats?: number; satsPerVbyte?: number; max?: boolean }
 	): Promise<ChannelInfo> {
 		await this.connectPeer(pubkey, host, port);
 		return this.openChannel(
 			pubkey,
 			amountSats,
 			opts?.pushSats,
-			opts?.satsPerVbyte
+			opts?.satsPerVbyte,
+			opts?.max
 		);
 	}
 

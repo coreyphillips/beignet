@@ -815,7 +815,8 @@ async function handleChannel(): Promise<void> {
 			);
 		case 'ready':
 			return outputResult(await httpRequest('GET', '/channels/ready'));
-		case 'connect-and-open':
+		case 'connect-and-open': {
+			const cnoRate = parseFlag('--sats-per-vbyte');
 			return outputResult(
 				await httpRequest('POST', '/channel/connect-and-open', {
 					pubkey: filteredArgs[2],
@@ -824,9 +825,13 @@ async function handleChannel(): Promise<void> {
 					amountSats: filteredArgs[5]
 						? parseInt(filteredArgs[5], 10)
 						: undefined,
-					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined
+					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined,
+					satsPerVbyte: cnoRate ? parseInt(cnoRate, 10) : undefined,
+					// Sweep the whole on-chain balance into the channel (no change).
+					max: hasFlag('--max') || undefined
 				})
 			);
+		}
 		case 'open-and-wait': {
 			const timeout = parseFlag('--timeout');
 			return outputResult(
@@ -2175,7 +2180,7 @@ Channels:
   channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
   channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
                                          Open channel + block until NORMAL
-  channel connect-and-open <pubkey> <host> <port> <sats> [push]
+  channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max]
                                          Connect to peer + open in one call
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close

@@ -206,6 +206,108 @@ describe('WalletFundingProvider', () => {
 			const tx = bitcoin.Transaction.fromHex(txHex);
 			expect(result.txid.equals(Buffer.from(tx.getHash()))).to.be.true;
 		});
+
+		it('sweeps via sendMax (not send) when max is set', async () => {
+			const { txHex } = buildFakeFundingTx(fundingAddress, 100_000, network);
+			let sendCalled = false;
+			let sendMaxCalled = false;
+			let capturedRate: number | undefined;
+			let capturedBroadcast: boolean | undefined;
+			const wallet: IWalletLike = {
+				send: async () => {
+					sendCalled = true;
+					return mockOk(txHex);
+				},
+				sendMax: async (p) => {
+					sendMaxCalled = true;
+					capturedRate = p.satsPerByte;
+					capturedBroadcast = p.broadcast;
+					return mockOk(txHex);
+				},
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			const res = await provider.buildFundingTransaction(
+				fundingAddress,
+				100_000n,
+				7,
+				true
+			);
+			expect(sendMaxCalled, 'used sendMax').to.be.true;
+			expect(sendCalled, 'did not use fixed send').to.be.false;
+			expect(capturedRate).to.equal(7);
+			expect(capturedBroadcast).to.equal(false);
+			expect(res.outputIndex).to.equal(1);
+		});
+
+		it('still uses fixed send when max is not set', async () => {
+			const { txHex } = buildFakeFundingTx(fundingAddress, 100_000, network);
+			let sendCalled = false;
+			let sendMaxCalled = false;
+			const wallet: IWalletLike = {
+				send: async () => {
+					sendCalled = true;
+					return mockOk(txHex);
+				},
+				sendMax: async () => {
+					sendMaxCalled = true;
+					return mockOk(txHex);
+				},
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			await provider.buildFundingTransaction(fundingAddress, 100_000n);
+			expect(sendCalled).to.be.true;
+			expect(sendMaxCalled).to.be.false;
+		});
+
+		it('throws when the swept output does not match the committed amount', async () => {
+			// The sweep produced 90k but the caller committed 100k as funding_satoshis
+			// (balance changed between quote and funding): signing the commitment
+			// against a mismatched output would break the channel, so it must fail.
+			const { txHex } = buildFakeFundingTx(fundingAddress, 90_000, network);
+			const wallet: IWalletLike = {
+				send: async () => mockOk(txHex),
+				sendMax: async () => mockOk(txHex),
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					100_000n,
+					undefined,
+					true
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not match committed funding amount'
+				);
+			}
+		});
+
+		it('throws when max funding is requested but the wallet cannot sweep', async () => {
+			const wallet = createMockWallet({ txHex: '' }); // legacy mock, no sendMax
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					100_000n,
+					undefined,
+					true
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not support max funding'
+				);
+			}
+		});
 	});
 
 	describe('broadcastTransaction', () => {

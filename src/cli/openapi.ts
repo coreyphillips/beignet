@@ -661,7 +661,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						host: 'string',
 						port: 'number',
 						amountSats: 'number',
-						pushSats: 'number?'
+						pushSats: 'number?',
+						satsPerVbyte: 'number?',
+						max: 'boolean?'
 					}),
 					responses: {
 						'200': {

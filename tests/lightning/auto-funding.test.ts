@@ -350,4 +350,114 @@ describe('Auto-Funding Integration', function () {
 			node.destroy();
 		});
 	});
+
+	describe('max funding flag plumbing', function () {
+		// Deliver peer messages on the next tick rather than synchronously. A real
+		// transport is async, so openChannel returns (registering the fee rate and
+		// max flag against the temporary id) before accept_channel comes back and
+		// handleAutoFunding reads them. Synchronous delivery would run funding inside
+		// openChannel, before those are set, which no real network does.
+		function connectNodesAsync(a: LightningNode, b: LightningNode): void {
+			a.on('message:outbound', (pubkey, type, payload) => {
+				if (pubkey === b.getNodeId())
+					setImmediate(() => b.handlePeerMessage(a.getNodeId(), type, payload));
+			});
+			b.on('message:outbound', (pubkey, type, payload) => {
+				if (pubkey === a.getNodeId())
+					setImmediate(() => a.handlePeerMessage(b.getNodeId(), type, payload));
+			});
+		}
+
+		// A capturing provider records exactly what handleAutoFunding passes at
+		// funding time, so these assert the temporary-id flag reaches the provider,
+		// not the sweep math (covered in wallet-funding-provider.test.ts).
+		function capturingProvider(): {
+			provider: IFundingProvider;
+			calls: Array<{ amount: bigint; rate?: number; max?: boolean }>;
+		} {
+			const calls: Array<{ amount: bigint; rate?: number; max?: boolean }> = [];
+			const provider: IFundingProvider = {
+				buildFundingTransaction: async (address, amountSats, rate, max) => {
+					calls.push({ amount: amountSats, rate, max });
+					return buildMockFundingTx(address, Number(amountSats));
+				},
+				broadcastTransaction: async (txHex) =>
+					bitcoin.Transaction.fromHex(txHex).getId()
+			};
+			return { provider, calls };
+		}
+
+		it('threads max and the pinned rate through accept_channel to funding', function (done) {
+			const { provider, calls } = capturingProvider();
+			const alice = new LightningNode(makeNodeConfig(41, provider));
+			const bob = new LightningNode(makeNodeConfig(42));
+			alice.on('node:error', () => {});
+			bob.on('node:error', () => {});
+			connectNodesAsync(alice, bob);
+
+			alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
+
+			setTimeout(() => {
+				expect(calls.length, 'funding built once').to.equal(1);
+				expect(calls[0].max, 'max threaded to provider').to.be.true;
+				expect(calls[0].rate, 'pinned rate threaded').to.equal(2);
+				expect(calls[0].amount).to.equal(99_500n);
+				alice.destroy();
+				bob.destroy();
+				done();
+			}, 80);
+		});
+
+		it('does not leak the max flag to a later non-max open', function (done) {
+			// Sequential opens: a max open funds and consumes its flag, then a later
+			// open to a different peer must not inherit it (the temporary-id entry is
+			// per-channel and cleared after use).
+			const { provider, calls } = capturingProvider();
+			const alice = new LightningNode(makeNodeConfig(43, provider));
+			const bob = new LightningNode(makeNodeConfig(44));
+			const carol = new LightningNode(makeNodeConfig(45));
+			[alice, bob, carol].forEach((n) => n.on('node:error', () => {}));
+			connectNodesAsync(alice, bob);
+			connectNodesAsync(alice, carol);
+
+			alice.openChannel(bob.getNodeId(), 99_500n, undefined, 2, true);
+			setTimeout(() => {
+				expect(calls.length, 'max open funded').to.equal(1);
+				expect(calls[0].max, 'max open swept').to.be.true;
+
+				// A later, non-max open to a different peer.
+				alice.openChannel(carol.getNodeId(), 40_000n, undefined, 2);
+				setTimeout(() => {
+					expect(calls.length, 'both opens funded').to.equal(2);
+					expect(calls[1].amount).to.equal(40_000n);
+					expect(calls[1].max, 'plain open did not inherit max').to.not.equal(
+						true
+					);
+					alice.destroy();
+					bob.destroy();
+					carol.destroy();
+					done();
+				}, 80);
+			}, 80);
+		});
+
+		it('rejects a max open without a pinned satsPerVbyte', function () {
+			// An unpinned rate would let funding price the sweep differently from the
+			// committed amount; the open is refused up front rather than failing after
+			// the peer has accepted.
+			const { provider } = capturingProvider();
+			const alice = new LightningNode(makeNodeConfig(46, provider));
+			const bob = new LightningNode(makeNodeConfig(47));
+			alice.on('node:error', () => {});
+			bob.on('node:error', () => {});
+			connectNodes(alice, bob);
+
+			expect(() =>
+				alice.openChannel(bob.getNodeId(), 99_500n, undefined, undefined, true)
+			).to.throw(/pinned satsPerVbyte/);
+
+			alice.destroy();
+			bob.destroy();
+		});
+	});
 });
