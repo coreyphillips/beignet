@@ -3570,6 +3570,18 @@ export class LightningNode extends EventEmitter {
 				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
 			);
 		}
+		// A max open commits fundingSatoshis now but sweeps at funding time, and the
+		// two only agree if both are priced at the same rate. Without a pinned rate,
+		// handleAutoFunding would ask the estimator for a fresh one after the peer
+		// accepts, and a rate that has since moved makes the sweep miss the committed
+		// amount, failing the funding after negotiation. Require the caller to pin
+		// the rate its max was quoted at, so only an on-chain balance change (which
+		// the funding provider guards) can still cause a mismatch.
+		if (fundMax && satsPerVbyte === undefined) {
+			throw new Error(
+				'max funding requires a pinned satsPerVbyte (the rate the max amount was quoted at)'
+			);
+		}
 		const channel = this.channelManager.openChannel(
 			peerPubkey,
 			fundingSatoshis,
