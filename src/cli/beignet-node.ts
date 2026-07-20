@@ -4458,6 +4458,22 @@ export class BeignetNode extends EventEmitter {
 
 	getLiquiditySnapshot(): LiquiditySnapshot {
 		const snapshot = this.node.getLiquiditySnapshot();
+		// The reserve every channel holds back on our side is unspendable, so what
+		// can actually be sent is the local balance above it, summed over routable
+		// channels, the same figure canSend() reports. Surfacing both lets callers
+		// show a true "can send" (zero while still below the reserve) instead of the
+		// raw local balance, which overstates it.
+		let reserveMsat = 0n;
+		let sendableMsat = 0n;
+		for (const ch of this.node.listChannels()) {
+			if (ch.state !== ChannelState.NORMAL) continue;
+			const chReserveMsat = ch.localReserveMsat ?? 0n;
+			reserveMsat += chReserveMsat;
+			sendableMsat +=
+				ch.localBalanceMsat > chReserveMsat
+					? ch.localBalanceMsat - chReserveMsat
+					: 0n;
+		}
 		return {
 			totalLocalBalanceSats: snapshot.totalLocalBalanceSats,
 			totalRemoteBalanceSats: snapshot.totalRemoteBalanceSats,
@@ -4466,6 +4482,8 @@ export class BeignetNode extends EventEmitter {
 			activeChannelCount: snapshot.activeChannelCount,
 			outboundLiquidityPct: snapshot.outboundLiquidityPct,
 			inboundLiquidityPct: snapshot.inboundLiquidityPct,
+			reserveSats: Number(reserveMsat / 1000n),
+			sendableSats: Number(sendableMsat / 1000n),
 			recommendations: snapshot.recommendations
 		};
 	}

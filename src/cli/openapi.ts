@@ -3067,6 +3067,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'integer',
 							description: 'Inbound liquidity percentage (0-100)'
 						},
+						reserveSats: {
+							type: 'integer',
+							description:
+								'Total local balance held back as channel reserve, unspendable (sats)'
+						},
+						sendableSats: {
+							type: 'integer',
+							description:
+								'Local balance above the reserve, i.e. what can actually be sent (sats); zero while below the reserve'
+						},
 						recommendations: {
 							type: 'array',
 							items: { $ref: '#/components/schemas/LiquidityRecommendation' },

@@ -102,6 +102,87 @@ describe('Agent Review: canSend reserve math', () => {
 	});
 });
 
+describe('Agent Review: liquidity snapshot reserve aggregation', () => {
+	// Mirrors BeignetNode.getLiquiditySnapshot(): reserveSats and sendableSats are
+	// summed over NORMAL channels, sendable clamped at zero per channel so a
+	// balance below its reserve contributes nothing sendable while its reserve
+	// still counts. Aggregated here in isolation because getLiquiditySnapshot()
+	// needs a real wallet, matching how canSend's math is covered above.
+	type Ch = {
+		state: string;
+		localBalanceMsat: bigint;
+		localReserveMsat?: bigint;
+	};
+	const aggregate = (
+		channels: Ch[]
+	): { reserveSats: number; sendableSats: number } => {
+		let reserveMsat = 0n;
+		let sendableMsat = 0n;
+		for (const ch of channels) {
+			if (ch.state !== 'NORMAL') continue;
+			const r = ch.localReserveMsat ?? 0n;
+			reserveMsat += r;
+			sendableMsat += ch.localBalanceMsat > r ? ch.localBalanceMsat - r : 0n;
+		}
+		return {
+			reserveSats: Number(reserveMsat / 1000n),
+			sendableSats: Number(sendableMsat / 1000n)
+		};
+	};
+
+	it('sums reserve and sendable across NORMAL channels', () => {
+		const res = aggregate([
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 500_000_000n,
+				localReserveMsat: 10_000_000n
+			},
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 200_000_000n,
+				localReserveMsat: 5_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(15_000);
+		expect(res.sendableSats).to.equal(685_000); // 490k + 195k
+	});
+
+	it('counts a below-reserve channel reserve but zero sendable', () => {
+		const res = aggregate([
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 12_000_000n,
+				localReserveMsat: 20_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(20_000);
+		expect(res.sendableSats).to.equal(0);
+	});
+
+	it('ignores non-NORMAL channels', () => {
+		const res = aggregate([
+			{
+				state: 'AWAITING_FUNDING_CONFIRMED',
+				localBalanceMsat: 500_000_000n,
+				localReserveMsat: 10_000_000n
+			},
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 100_000_000n,
+				localReserveMsat: 4_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(4_000);
+		expect(res.sendableSats).to.equal(96_000);
+	});
+
+	it('treats a missing reserve as zero', () => {
+		const res = aggregate([{ state: 'NORMAL', localBalanceMsat: 30_000_000n }]);
+		expect(res.reserveSats).to.equal(0);
+		expect(res.sendableSats).to.equal(30_000);
+	});
+});
+
 describe('Agent Review: IChannelInfo reserve fields', () => {
 	it('IChannelInfo should accept localReserveMsat and remoteReserveMsat', () => {
 		// Verify the interface accepts the new fields
