@@ -489,10 +489,33 @@ export class PeerManager extends EventEmitter {
 			.then(() => {
 				const pubkey = peer.remotePublicKey.toString('hex');
 
-				// Reject if already connected
-				if (this.peers.has(pubkey)) {
-					peer.disconnect();
-					return;
+				// Newest wins (matches LND/CLN/LDK): when a peer's old connection
+				// dies on its side (common over Tor circuits), the remote re-dials
+				// before our ping/pong timeout notices the stale socket. Rejecting
+				// the fresh connection keeps the dead one, and since inbound peers
+				// store no dialable address there is no self-recovery: channels sit
+				// in AWAITING_REESTABLISH until a human forces a reconnect.
+				const existing = this.peers.get(pubkey);
+				if (existing) {
+					// Tear the old connection down synchronously with our own
+					// bookkeeping. Its 'close' event fires on a later tick, so the
+					// normal close handler must be detached first or it would delete
+					// the replacement from the peer map and emit a spurious
+					// out-of-order peer:disconnect. disconnect() also strips the
+					// socket listeners, so the old Peer can never emit again.
+					existing.removeAllListeners();
+					existing.disconnect();
+					this.peers.delete(pubkey);
+					this.clearStabilityTimer(pubkey);
+					if (this.inboundPeerSet.has(pubkey)) {
+						this.inboundPeerCount--;
+						this.inboundPeerSet.delete(pubkey);
+					}
+					captureWireEvent('close', pubkey);
+					// Emitted before the replacement's peer:connect so channels are
+					// marked AWAITING_REESTABLISH first and the connect handler then
+					// re-drives channel_reestablish over the new connection.
+					this.emit('peer:disconnect', pubkey);
 				}
 
 				this.setupPeerListeners(pubkey, peer);
