@@ -843,6 +843,7 @@ export interface ISerializedPaymentInfo {
 	sharedSecrets?: string[]; // hex
 	failureCode?: number;
 	failureSourceIndex?: number;
+	failureReason?: string;
 	createdAt: number;
 	completedAt?: number;
 	metadata?: Record<string, string>;
@@ -871,6 +872,7 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		sharedSecrets: p.sharedSecrets?.map((b) => b.toString('hex')),
 		failureCode: p.failureCode,
 		failureSourceIndex: p.failureSourceIndex,
+		failureReason: p.failureReason,
 		createdAt: p.createdAt,
 		completedAt: p.completedAt,
 		metadata: p.metadata
@@ -900,6 +902,7 @@ export function deserializePaymentInfo(
 		sharedSecrets: s.sharedSecrets?.map((h) => Buffer.from(h, 'hex')),
 		failureCode: s.failureCode,
 		failureSourceIndex: s.failureSourceIndex,
+		failureReason: s.failureReason,
 		createdAt: s.createdAt,
 		completedAt: s.completedAt,
 		metadata: s.metadata

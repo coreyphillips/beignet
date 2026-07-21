@@ -6272,6 +6272,9 @@ export class LightningNode extends EventEmitter {
 				amountMsat: paymentAmountMsat,
 				status: PaymentStatus.FAILED,
 				direction: PaymentDirection.OUTGOING,
+				failureReason: `Invoice expired at ${new Date(
+					expiryTimestamp * 1000
+				).toISOString()}`,
 				createdAt: Date.now(),
 				completedAt: Date.now()
 			};
@@ -6601,6 +6604,12 @@ export class LightningNode extends EventEmitter {
 		if (!result.ok) {
 			payment.status = PaymentStatus.FAILED;
 			payment.completedAt = Date.now();
+			// The HTLC never left this node, so there is no onion failure to
+			// decrypt and failureCode stays undefined. addHtlc already knows why
+			// (no such channel, peer not connected, insufficient balance); losing
+			// that string is what makes a local failure look like a mystery.
+			payment.failureReason =
+				result.error ?? 'Local failure: could not add HTLC to the channel';
 			this.emit('payment:failed', payment);
 		}
 
@@ -6774,6 +6783,12 @@ export class LightningNode extends EventEmitter {
 		if (!result.ok) {
 			payment.status = PaymentStatus.FAILED;
 			payment.completedAt = Date.now();
+			// The HTLC never left this node, so there is no onion failure to
+			// decrypt and failureCode stays undefined. addHtlc already knows why
+			// (no such channel, peer not connected, insufficient balance); losing
+			// that string is what makes a local failure look like a mystery.
+			payment.failureReason =
+				result.error ?? 'Local failure: could not add HTLC to the channel';
 			this.emit('payment:failed', payment);
 		}
 
@@ -6938,6 +6953,9 @@ export class LightningNode extends EventEmitter {
 				// Part failed to dispatch — mark payment failed
 				payment.status = PaymentStatus.FAILED;
 				payment.completedAt = Date.now();
+				payment.failureReason = `Local failure: MPP part could not be dispatched (${
+					result.error ?? 'unknown reason'
+				})`;
 				this.outboundMppPayments.delete(hashHex);
 				this.emit('payment:failed', payment);
 				return payment;
@@ -8507,7 +8525,15 @@ export class LightningNode extends EventEmitter {
 				payment.failureCode = result.failure.failureCode;
 				payment.failureSourceIndex = result.originIndex;
 				failureData = result.failure.failureData;
+			} else {
+				// No HMAC in the chain matched, so we cannot tell which hop failed or
+				// why. Record that rather than leaving an empty failure that reads
+				// identically to one that never reached the network at all.
+				payment.failureReason =
+					'Remote failure could not be decrypted (no hop HMAC matched)';
 			}
+		} else if (reason.length === 0) {
+			payment.failureReason = 'Peer failed the HTLC with an empty reason';
 		}
 
 		// Record failure in MissionControl for future pathfinding
@@ -8569,6 +8595,7 @@ export class LightningNode extends EventEmitter {
 			payment.status = PaymentStatus.PENDING;
 			payment.failureCode = undefined;
 			payment.failureSourceIndex = undefined;
+			payment.failureReason = undefined;
 			payment.completedAt = undefined;
 
 			try {
@@ -9850,7 +9877,10 @@ export class LightningNode extends EventEmitter {
 					const htlcKey = `${channelId.toString('hex')}:${key}`;
 					const hashHex = this.htlcPaymentMap.get(htlcKey);
 					if (hashHex) {
-						this.failPayment(Buffer.from(hashHex, 'hex'));
+						this.failPayment(
+							Buffer.from(hashHex, 'hex'),
+							`HTLC timed out on-chain at block ${blockHeight} (cltv_expiry ${htlc.cltvExpiry})`
+						);
 					}
 					// This is an OFFERED HTLC: we cannot fail it off-chain (only the
 					// peer or on-chain resolution can remove it). The associated
@@ -9897,13 +9927,16 @@ export class LightningNode extends EventEmitter {
 	 * Publicly fail a payment by its payment hash.
 	 * Marks a PENDING payment as FAILED, persists, cleans up retry context, emits payment:failed.
 	 */
-	failPayment(paymentHash: Buffer): void {
+	failPayment(paymentHash: Buffer, reason?: string): void {
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.status !== PaymentStatus.PENDING) return;
 
 		payment.status = PaymentStatus.FAILED;
 		payment.completedAt = Date.now();
+		if (payment.failureCode === undefined) {
+			payment.failureReason = reason ?? 'Payment failed locally';
+		}
 		this.paymentRetryContexts.delete(hashHex);
 		this.outboundMppPayments.delete(hashHex);
 		this.persistPayment(paymentHash);
@@ -9950,7 +9983,10 @@ export class LightningNode extends EventEmitter {
 			if (activeHtlcHashes.has(hashHex)) continue;
 
 			// No active HTLC and payment older than 10 min → fail
-			this.failPayment(payment.paymentHash);
+			this.failPayment(
+				payment.paymentHash,
+				'Stuck payment swept: no active HTLC after 10 minutes'
+			);
 		}
 	}
 
@@ -9972,7 +10008,10 @@ export class LightningNode extends EventEmitter {
 				const expiryTimestamp =
 					(decoded.timestamp || 0) + (decoded.expiry || 3600);
 				if (now > expiryTimestamp) {
-					this.failPayment(payment.paymentHash);
+					this.failPayment(
+						payment.paymentHash,
+						'Invoice expired while the payment was still in flight'
+					);
 				}
 			} catch {
 				// Can't decode invoice — skip
@@ -10051,7 +10090,10 @@ export class LightningNode extends EventEmitter {
 		return new Promise<IPaymentInfo>((resolve, reject) => {
 			const timer = setTimeout(() => {
 				cleanup();
-				this.failPayment(invoice.paymentHash);
+				this.failPayment(
+					invoice.paymentHash,
+					`No resolution within the ${timeoutMs}ms wait window`
+				);
 				reject(new Error(`Payment timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
 

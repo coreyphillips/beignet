@@ -927,9 +927,15 @@ export class BeignetNode extends EventEmitter {
 			// different things depending on WHICH hop returned it. Log the erring hop
 			// and the channel it was asked to forward over, so a route failure can be
 			// told apart from a destination failure without reproducing it.
+			//
+			// failureCode is absent entirely when the payment failed LOCALLY and the
+			// HTLC never reached the network. That used to log as a lone
+			// "failureCode: undefined", which reads like a decoding bug rather than
+			// "your peer is unreachable", so carry the reason instead.
 			this.log('warn', 'Payment failed', {
 				paymentHash: pi.paymentHash,
 				failureCode: pi.failureCode,
+				...(info.failureReason ? { reason: info.failureReason } : {}),
 				...this.describeFailureSource(info)
 			});
 			this.emit('payment:failed', pi);
@@ -3876,6 +3882,10 @@ export class BeignetNode extends EventEmitter {
 		if (p.failureCode !== undefined) {
 			info.failureCode = p.failureCode;
 			info.failureDescription = describeFailureCode(p.failureCode);
+		} else if (p.failureReason) {
+			// A local failure has no onion code, so without this the API reports a
+			// FAILED payment with nothing at all to explain it.
+			info.failureDescription = p.failureReason;
 		}
 		if (p.route?.totalFeeMsat !== undefined) {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);

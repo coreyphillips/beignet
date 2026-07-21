@@ -368,6 +368,13 @@ export interface IPaymentInfo {
 	sharedSecrets?: Buffer[];
 	failureCode?: number;
 	failureSourceIndex?: number;
+	/**
+	 * Why a payment failed when no onion failure code is available: it failed
+	 * LOCALLY, before the HTLC ever reached the network, or a peer's failure came
+	 * back undecryptable. Without this a local failure is indistinguishable from a
+	 * remote one, since both surface only as an absent failureCode.
+	 */
+	failureReason?: string;
 	retryCount?: number;
 	createdAt: number;
 	completedAt?: number;
