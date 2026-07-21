@@ -185,10 +185,12 @@ export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
-	// "No artificial limit" (CLN advertises the same U64 max). The advertised
-	// value is clamped to channel capacity at every open/accept build via
-	// clampMaxHtlcValueInFlightMsat, so the default resolves to the capacity
-	// of each channel. A fixed default here (formerly 500k sat) capped the
+	// "No artificial limit" (CLN advertises the same U64 max). The v1
+	// open/accept builds clamp the advertised value to channel capacity via
+	// clampMaxHtlcValueInFlightMsat (capacity is exact and known there), so
+	// the default resolves to the capacity of each v1 channel; v2 builds
+	// advertise it as-is because final capacity is not known until after the
+	// message is sent. A fixed default here (formerly 500k sat) capped the
 	// usable in-flight amount of every larger channel: CLN and LDK compute a
 	// channel's effective capacity as min(capacity, this value), so a wumbo
 	// channel was treated as a 500k-sat one and peers with a min-capacity

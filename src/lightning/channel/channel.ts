@@ -7918,15 +7918,14 @@ export class Channel {
 	 * adoption paths.
 	 */
 	private _finishCompleteSplice(): void {
-		// A splice-out shrinks capacity below what was negotiated at open. The
-		// advertised max_htlc_value_in_flight cannot be renegotiated post-open,
-		// but our own inbound enforcement must track the new capacity. Only
-		// ever clamps downward, so a splice-in changes nothing.
-		this._state.localConfig.maxHtlcValueInFlightMsat =
-			clampMaxHtlcValueInFlightMsat(
-				this._state.localConfig.maxHtlcValueInFlightMsat,
-				this._state.fundingSatoshis
-			);
+		// localConfig.maxHtlcValueInFlightMsat is deliberately NOT re-clamped to
+		// the post-splice capacity: it is the limit we NEGOTIATED at open, and
+		// the peer holds us to it across splices. Lowering it after a splice-out
+		// would make us reject in-flight totals the peer is entitled to once a
+		// later splice-in restores capacity. While capacity is low, balance and
+		// reserve rules already bound what can actually be in flight, and the
+		// gossip htlc_maximum_msat is clamped against current capacity at
+		// channel_update build time.
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
 		// spliced channel. After a restart the in-memory copy is gone but the
@@ -8525,18 +8524,13 @@ export class Channel {
 				)
 			}
 		};
-		// Our own contribution is a floor on the final v2 capacity (the acceptor
-		// may add more), so clamping to it can only be conservative. Mirrored
-		// into localConfig so inbound enforcement matches what we advertise.
-		params = {
-			...params,
-			maxHtlcValueInFlightMsat: clampMaxHtlcValueInFlightMsat(
-				params.maxHtlcValueInFlightMsat,
-				params.fundingSatoshis
-			)
-		};
-		this._state.localConfig.maxHtlcValueInFlightMsat =
-			params.maxHtlcValueInFlightMsat;
+		// Unlike the v1 open, max_htlc_value_in_flight_msat is NOT clamped here:
+		// final v2 capacity (acceptor contribution, lease fee) is unknown until
+		// after this message is sent, and the advertisement cannot be
+		// renegotiated, so clamping to our own contribution would permanently
+		// cap the channel at a fraction of its capacity. Over-capacity values
+		// are interop-safe (CLN always advertises U64 max); balance and reserve
+		// rules provide the physical limit.
 		if (params.channelType) {
 			this._state.channelType = Buffer.from(params.channelType);
 		} else {
@@ -8626,18 +8620,10 @@ export class Channel {
 				)
 			}
 		};
-		// The v2 capacity is both contributions (a will_fund lease fee can only
-		// add to it later). Mirrored into localConfig so inbound enforcement
-		// matches what we advertise in accept_channel2.
-		localParams = {
-			...localParams,
-			maxHtlcValueInFlightMsat: clampMaxHtlcValueInFlightMsat(
-				localParams.maxHtlcValueInFlightMsat,
-				msg.fundingSatoshis + localParams.fundingSatoshis
-			)
-		};
-		this._state.localConfig.maxHtlcValueInFlightMsat =
-			localParams.maxHtlcValueInFlightMsat;
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped: a will_fund lease fee can still grow capacity after
+		// this message, the advertisement cannot be renegotiated, and
+		// over-capacity values are interop-safe (see initiateOpenV2).
 
 		const session = new DualFundingSession(
 			false,
