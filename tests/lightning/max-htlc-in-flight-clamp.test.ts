@@ -1,5 +1,5 @@
 /**
- * max_htlc_value_in_flight_msat capacity scaling (issue #161).
+ * max_htlc_value_in_flight_msat policy (issue #161).
  *
  * The default used to be a fixed 500k sat sent unclamped in open_channel and
  * accept_channel. CLN and LDK compute a channel's effective capacity as
@@ -7,13 +7,13 @@
  * every larger channel's usable in-flight amount at 500k sat, and peers with a
  * min-capacity policy above 500k sat rejected our opens at any funding size.
  *
- * The default is now "no artificial limit". The v1 open/accept builds clamp
- * the advertised value to capacity (exact and known there). The v2 builds
- * advertise it as-is: final capacity is unknown until after the message is
- * sent and the advertisement cannot be renegotiated, so clamping to a partial
- * contribution would permanently cap the channel. The negotiated value is
- * never re-clamped on splice: the peer holds us to what we advertised at
- * open, across capacity changes in both directions.
+ * The default is now "no artificial limit" (U64 max, the same sentinel CLN
+ * advertises), sent as configured on every open/accept path, v1 and v2, and
+ * never clamped to capacity: the advertisement is immutable for the life of
+ * the channel while capacity is not (splice), so clamping at open would bake
+ * the initial capacity in as a permanent ceiling. What we advertise is always
+ * what localConfig enforces, and the negotiated value survives splices in
+ * both directions.
  */
 
 import { expect } from 'chai';
@@ -23,10 +23,7 @@ import {
 	Channel,
 	createOpenerChannel
 } from '../../src/lightning/channel/channel';
-import {
-	DEFAULT_CHANNEL_CONFIG,
-	clampMaxHtlcValueInFlightMsat
-} from '../../src/lightning/channel/types';
+import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import {
@@ -148,52 +145,32 @@ function v2OpenMsgFor(
 	return { channel, msg: decodeOpenChannel2Message(payload) };
 }
 
-describe('max_htlc_value_in_flight_msat clamping', function () {
-	describe('clampMaxHtlcValueInFlightMsat helper', function () {
-		it('clamps values above capacity down to capacity', function () {
-			expect(clampMaxHtlcValueInFlightMsat(500_000_000n, 100_000n)).to.equal(
-				100_000_000n
-			);
-		});
-
-		it('preserves values at or below capacity', function () {
-			expect(clampMaxHtlcValueInFlightMsat(100_000_000n, 100_000n)).to.equal(
-				100_000_000n
-			);
-			expect(clampMaxHtlcValueInFlightMsat(50_000_000n, 100_000n)).to.equal(
-				50_000_000n
-			);
-		});
-	});
-
+describe('max_htlc_value_in_flight_msat policy', function () {
 	describe('open_channel (v1)', function () {
-		it('advertises full capacity for a small channel (default config)', function () {
+		it('advertises the unlimited default, not the old 500k sat cap', function () {
+			const { channel, msg } = openMsgFor(2_000_000n);
+			expect(msg.maxHtlcValueInFlightMsat).to.equal(U64_MAX);
+			expect(
+				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
+			).to.equal(U64_MAX);
+		});
+
+		it('is not clamped to initial capacity (a later splice-in must not inherit a ceiling)', function () {
 			const { msg } = openMsgFor(100_000n);
-			expect(msg.maxHtlcValueInFlightMsat).to.equal(100_000_000n);
+			expect(msg.maxHtlcValueInFlightMsat).to.equal(U64_MAX);
 		});
 
-		it('is not capped at 500k sat for a large channel', function () {
-			// The old fixed default (500_000_000 msat) capped a 2M sat channel's
-			// in-flight amount at a quarter of its capacity.
-			const { msg } = openMsgFor(2_000_000n);
-			expect(msg.maxHtlcValueInFlightMsat).to.equal(2_000_000_000n);
-		});
-
-		it('preserves an explicitly configured value below capacity', function () {
-			const { msg } = openMsgFor(1_000_000n, 200_000_000n);
+		it('preserves an explicitly configured policy', function () {
+			const { channel, msg } = openMsgFor(1_000_000n, 200_000_000n);
 			expect(msg.maxHtlcValueInFlightMsat).to.equal(200_000_000n);
-		});
-
-		it('writes the advertised value back to localConfig for enforcement', function () {
-			const { channel, msg } = openMsgFor(750_000n);
-			expect(channel.getFullState().localConfig.maxHtlcValueInFlightMsat)
-				.to.equal(msg.maxHtlcValueInFlightMsat)
-				.and.to.equal(750_000_000n);
+			expect(
+				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
+			).to.equal(200_000_000n);
 		});
 	});
 
 	describe('accept_channel (v1)', function () {
-		it('clamps the advertised value to the opener capacity', function () {
+		it('advertises the configured value, matching localConfig enforcement', function () {
 			const { msg: openMsg } = openMsgFor(150_000n);
 
 			const acceptorState = createAcceptorState({
@@ -229,20 +206,18 @@ describe('max_htlc_value_in_flight_msat clamping', function () {
 			)!;
 			const acceptMsg = decodeAcceptChannelMessage(acceptPayload);
 
-			expect(acceptMsg.maxHtlcValueInFlightMsat).to.equal(150_000_000n);
+			expect(acceptMsg.maxHtlcValueInFlightMsat).to.equal(U64_MAX);
 			expect(
 				acceptor.getFullState().localConfig.maxHtlcValueInFlightMsat
-			).to.equal(150_000_000n);
+			).to.equal(U64_MAX);
 		});
 	});
 
 	describe('open_channel2 / accept_channel2 (v2)', function () {
 		it('does not clamp the opener to its own contribution', function () {
-			// Final capacity is unknown when open_channel2 is sent (a 100k
-			// opener contribution may end up in a 1M channel once the acceptor
-			// contributes), and the advertisement cannot be renegotiated.
-			// Clamping to the contribution would permanently cap the channel:
-			// the default must go out as-is.
+			// A 100k opener contribution may end up in a 1M channel once the
+			// acceptor contributes; clamping to the contribution would
+			// permanently cap the channel.
 			const { channel, msg } = v2OpenMsgFor(100_000n);
 			expect(msg.maxHtlcValueInFlightMsat).to.equal(U64_MAX);
 			expect(
@@ -250,14 +225,19 @@ describe('max_htlc_value_in_flight_msat clamping', function () {
 			).to.equal(U64_MAX);
 		});
 
-		it('preserves an explicit opener policy', function () {
-			const { msg } = v2OpenMsgFor(100_000n, 200_000_000n);
+		it('mirrors an explicit opener policy into localConfig enforcement', function () {
+			// v2 params arrive separately from the state config: without the
+			// write-back, the wire would carry 200M while enforcement read the
+			// state config's U64 max (or worse, a lower value, rejecting HTLC
+			// totals the peer is entitled to under the advertised limit).
+			const { channel, msg } = v2OpenMsgFor(100_000n, 200_000_000n);
 			expect(msg.maxHtlcValueInFlightMsat).to.equal(200_000_000n);
+			expect(
+				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
+			).to.equal(200_000_000n);
 		});
 
-		it('does not clamp the acceptor advertisement', function () {
-			// A will_fund lease fee can still grow capacity after
-			// accept_channel2 is sent, so the acceptor advertises as-is too.
+		it('advertises the acceptor policy unclamped and mirrors it into localConfig', function () {
 			const { msg: openMsg } = v2OpenMsgFor(100_000n);
 
 			const seed = crypto.randomBytes(32);
@@ -274,7 +254,7 @@ describe('max_htlc_value_in_flight_msat clamping', function () {
 			const acceptor = new Channel(acceptorState);
 			const acceptActions = acceptor.handleOpenChannel2(
 				openMsg,
-				v2Params(50_000n, acceptorState.localBasepoints, seed)
+				v2Params(50_000n, acceptorState.localBasepoints, seed, 300_000_000n)
 			);
 			const acceptPayload = findSendAction(
 				acceptActions,
@@ -282,10 +262,10 @@ describe('max_htlc_value_in_flight_msat clamping', function () {
 			)!;
 			const acceptMsg = decodeAcceptChannel2Message(acceptPayload);
 
-			expect(acceptMsg.maxHtlcValueInFlightMsat).to.equal(U64_MAX);
+			expect(acceptMsg.maxHtlcValueInFlightMsat).to.equal(300_000_000n);
 			expect(
 				acceptor.getFullState().localConfig.maxHtlcValueInFlightMsat
-			).to.equal(U64_MAX);
+			).to.equal(300_000_000n);
 		});
 	});
 
@@ -296,7 +276,7 @@ describe('max_htlc_value_in_flight_msat clamping', function () {
 			// later splice-in the peer may legitimately fill the original limit
 			// and we would erroneously reject its HTLCs. Balance and reserve
 			// rules bound what can actually be in flight while capacity is low.
-			const { channel } = openMsgFor(1_000_000n);
+			const { channel } = openMsgFor(1_000_000n, 1_000_000_000n);
 			expect(
 				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
 			).to.equal(1_000_000_000n);

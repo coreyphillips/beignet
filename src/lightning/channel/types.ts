@@ -185,16 +185,19 @@ export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
-	// "No artificial limit" (CLN advertises the same U64 max). The v1
-	// open/accept builds clamp the advertised value to channel capacity via
-	// clampMaxHtlcValueInFlightMsat (capacity is exact and known there), so
-	// the default resolves to the capacity of each v1 channel; v2 builds
-	// advertise it as-is because final capacity is not known until after the
-	// message is sent. A fixed default here (formerly 500k sat) capped the
-	// usable in-flight amount of every larger channel: CLN and LDK compute a
-	// channel's effective capacity as min(capacity, this value), so a wumbo
-	// channel was treated as a 500k-sat one and peers with a min-capacity
-	// policy above it rejected our opens at any funding size.
+	// "No artificial limit" (CLN advertises the same U64 max). The value is
+	// advertised as configured on every open/accept path, v1 and v2, and is
+	// never clamped to capacity: the advertisement is immutable for the life
+	// of the channel while capacity is not (splice), so clamping at open
+	// would bake the initial capacity in as a permanent ceiling. Peers take
+	// min(capacity, value) as the effective limit, balance/reserve rules
+	// bound what can actually be in flight, and the gossip htlc_maximum_msat
+	// is clamped to current capacity at channel_update build time. A fixed
+	// default here (formerly 500k sat) capped the usable in-flight amount of
+	// every larger channel: CLN and LDK compute effective capacity as
+	// min(capacity, this value), so a wumbo channel was treated as a 500k-sat
+	// one and peers with a min-capacity policy above it rejected our opens at
+	// any funding size.
 	maxHtlcValueInFlightMsat: 0xffffffffffffffffn,
 	channelReserveSatoshis: 10_000n,
 	htlcMinimumMsat: 1_000n,
@@ -202,20 +205,6 @@ export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	maxAcceptedHtlcs: 483,
 	feeratePerKw: 253
 };
-
-/**
- * Cap a max_htlc_value_in_flight_msat at the channel's capacity. An in-flight
- * limit above capacity is meaningless (nothing larger can ever be in flight),
- * and a configured value below capacity is a deliberate policy, so this only
- * ever clamps downward.
- */
-export function clampMaxHtlcValueInFlightMsat(
-	valueMsat: bigint,
-	capacitySat: bigint
-): bigint {
-	const capacityMsat = capacitySat * 1000n;
-	return valueMsat > capacityMsat ? capacityMsat : valueMsat;
-}
 
 /** Result type for ChannelManager operations that may fail. */
 export interface ChannelResult {

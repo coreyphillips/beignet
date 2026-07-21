@@ -73,8 +73,7 @@ import {
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
-	MAX_FUNDING_SATOSHIS,
-	clampMaxHtlcValueInFlightMsat
+	MAX_FUNDING_SATOSHIS
 } from './types';
 import {
 	IChannelState,
@@ -687,14 +686,13 @@ export class Channel {
 			this._state.localConfig.dustLimitSatoshis
 		);
 
-		// Written back to localConfig (not just the wire message) so our own
-		// inbound in-flight enforcement matches what we advertise.
-		this._state.localConfig.maxHtlcValueInFlightMsat =
-			clampMaxHtlcValueInFlightMsat(
-				this._state.localConfig.maxHtlcValueInFlightMsat,
-				this._state.fundingSatoshis
-			);
-
+		// max_htlc_value_in_flight_msat is advertised as configured, NOT
+		// clamped to capacity: the advertisement is immutable for the life of
+		// the channel while capacity is not (splice-in), so clamping would
+		// bake the initial capacity in as a permanent ceiling. Over-capacity
+		// values are interop-safe (CLN always advertises U64 max); peers take
+		// min(capacity, value) and balance/reserve rules bound what can
+		// actually be in flight.
 		const msg: IOpenChannelMessage = {
 			chainHash: chainHash || BITCOIN_CHAIN_HASH,
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -1294,15 +1292,9 @@ export class Channel {
 			];
 		}
 
-		// Capacity is known here (set from the opener's funding_satoshis when
-		// open_channel was received). Written back to localConfig so our own
-		// inbound in-flight enforcement matches what we advertise.
-		this._state.localConfig.maxHtlcValueInFlightMsat =
-			clampMaxHtlcValueInFlightMsat(
-				this._state.localConfig.maxHtlcValueInFlightMsat,
-				this._state.fundingSatoshis
-			);
-
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// clamped to the opener's capacity (see initiateOpen: the
+		// advertisement outlives the current capacity).
 		const acceptMsg: IAcceptChannelMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
 			dustLimitSatoshis: this._state.localConfig.dustLimitSatoshis,
@@ -8524,13 +8516,15 @@ export class Channel {
 				)
 			}
 		};
-		// Unlike the v1 open, max_htlc_value_in_flight_msat is NOT clamped here:
-		// final v2 capacity (acceptor contribution, lease fee) is unknown until
-		// after this message is sent, and the advertisement cannot be
-		// renegotiated, so clamping to our own contribution would permanently
-		// cap the channel at a fraction of its capacity. Over-capacity values
-		// are interop-safe (CLN always advertises U64 max); balance and reserve
-		// rules provide the physical limit.
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped (final v2 capacity is unknown here anyway; see
+		// initiateOpen for why clamping is wrong in general). v2 params arrive
+		// separately from the state config, so mirror the advertised value
+		// into localConfig: our inbound enforcement reads localConfig, and if
+		// it were lower than what we advertised we would reject in-flight
+		// totals the peer is entitled to send.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			params.maxHtlcValueInFlightMsat;
 		if (params.channelType) {
 			this._state.channelType = Buffer.from(params.channelType);
 		} else {
@@ -8621,9 +8615,11 @@ export class Channel {
 			}
 		};
 		// max_htlc_value_in_flight_msat is advertised as configured, not
-		// capacity-clamped: a will_fund lease fee can still grow capacity after
-		// this message, the advertisement cannot be renegotiated, and
-		// over-capacity values are interop-safe (see initiateOpenV2).
+		// capacity-clamped (a will_fund lease fee can still grow capacity
+		// after this message; see initiateOpen). Mirrored into localConfig so
+		// enforcement matches the advertisement (see initiateOpenV2).
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			localParams.maxHtlcValueInFlightMsat;
 
 		const session = new DualFundingSession(
 			false,
