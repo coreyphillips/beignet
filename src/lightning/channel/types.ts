@@ -182,6 +182,9 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 
+/** Largest value encodable in a wire u64 field. */
+export const U64_MAX = 0xffffffffffffffffn;
+
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
@@ -198,7 +201,7 @@ export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	// min(capacity, this value), so a wumbo channel was treated as a 500k-sat
 	// one and peers with a min-capacity policy above it rejected our opens at
 	// any funding size.
-	maxHtlcValueInFlightMsat: 0xffffffffffffffffn,
+	maxHtlcValueInFlightMsat: U64_MAX,
 	channelReserveSatoshis: 10_000n,
 	htlcMinimumMsat: 1_000n,
 	toSelfDelay: 144,

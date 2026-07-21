@@ -13,11 +13,26 @@ import {
 	MAX_FUNDING_SATOSHIS,
 	MIN_DUST_LIMIT_SATOSHIS,
 	MAX_DUST_LIMIT_SATOSHIS,
+	U64_MAX,
 	isAnchorChannel,
 	isTaprootChannel
 } from './types';
 import { calculateCommitmentFee } from './commitment-builder';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
+
+/**
+ * Local policy values are written to the wire with writeBigUInt64BE, which
+ * throws a RangeError outside [0, 2^64). Inbound values cannot be out of
+ * range (the decoder reads a u64), so this guards the LOCAL configuration
+ * boundary: a misconfigured value surfaces as a normal channel ERROR action
+ * instead of a serialization crash mid-send.
+ */
+export function validateU64(value: bigint, field: string): string | null {
+	if (value < 0n || value > U64_MAX) {
+		return `${field} must be between 0 and ${U64_MAX}`;
+	}
+	return null;
+}
 
 /**
  * The subset of the open_channel we proposed that accept_channel is validated

@@ -63,6 +63,14 @@ function makeBasepoints(): IChannelBasepoints {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
+function findError(actions: any[]): string | null {
+	for (const a of actions) {
+		if (a.type === ChannelActionType.ERROR) return a.message;
+	}
+	return null;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function findSendAction(actions: any[], msgType: MessageType): Buffer | null {
 	for (const a of actions) {
 		if (
@@ -266,6 +274,60 @@ describe('max_htlc_value_in_flight_msat policy', function () {
 			expect(
 				acceptor.getFullState().localConfig.maxHtlcValueInFlightMsat
 			).to.equal(300_000_000n);
+		});
+	});
+
+	describe('u64 range validation of local policy', function () {
+		// The configured value is deliberately an exact wire policy now, so an
+		// out-of-range bigint must surface as a channel ERROR action, not a
+		// RangeError thrown from writeBigUInt64BE mid-serialization.
+		it('rejects a value above u64 max (v1 open)', function () {
+			const channel = createOpenerChannel({
+				fundingSatoshis: 1_000_000n,
+				localConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					maxHtlcValueInFlightMsat: U64_MAX + 1n
+				},
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const err = findError(channel.initiateOpen());
+			expect(err).to.contain('max_htlc_value_in_flight_msat');
+		});
+
+		it('rejects a negative value (v1 open)', function () {
+			const channel = createOpenerChannel({
+				fundingSatoshis: 1_000_000n,
+				localConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					maxHtlcValueInFlightMsat: -1n
+				},
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const err = findError(channel.initiateOpen());
+			expect(err).to.contain('max_htlc_value_in_flight_msat');
+		});
+
+		it('rejects an out-of-range value (v2 open)', function () {
+			const seed = crypto.randomBytes(32);
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: seed
+			});
+			const channel = new Channel(state);
+			const actions = channel.initiateOpenV2(
+				v2Params(100_000n, state.localBasepoints, seed, U64_MAX + 1n)
+			);
+			expect(findError(actions)).to.contain('max_htlc_value_in_flight_msat');
+			// The failed open must not have mutated enforcement state.
+			expect(
+				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
+			).to.equal(U64_MAX);
 		});
 	});
 
