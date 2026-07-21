@@ -636,6 +636,23 @@ export function nodeAddressToHostPort(
 	}
 }
 
+/**
+ * Dialable reconnect candidates from a node_announcement address list.
+ * Converts each descriptor to host:port, dropping Tor v2 (network retired,
+ * dials can never succeed), zero ports (not connectable) and unknown types.
+ */
+export function announcedDialableAddresses(
+	addresses: INodeAddress[]
+): Array<{ host: string; port: number }> {
+	const out: Array<{ host: string; port: number }> = [];
+	for (const addr of addresses) {
+		if (addr.type === ADDRESS_TYPE_TORV2 || addr.port === 0) continue;
+		const hostPort = nodeAddressToHostPort(addr);
+		if (hostPort) out.push(hostPort);
+	}
+	return out;
+}
+
 function expandIpv6(host: string): string {
 	let groups: string[];
 	const doubleColon = host.indexOf('::');

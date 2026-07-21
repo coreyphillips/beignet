@@ -48,6 +48,10 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
 // resets the backoff every cycle and reconnects in a tight 1s loop forever.
 const STABLE_CONNECTION_MS = 60_000;
 const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
+// Cap on gossip-announced reconnect candidates kept per peer. Announcements
+// are peer-controlled input; without a cap a peer could make every reconnect
+// round crawl through a long list of dead addresses.
+const MAX_ANNOUNCED_ADDRESSES = 5;
 
 /**
  * True for hosts that must be dialed directly and never through the SOCKS5/Tor
@@ -138,6 +142,15 @@ export class PeerManager extends EventEmitter {
 		string,
 		{ host: string; port: number; transport?: IPeerTransportOptions }
 	> = new Map();
+	// Addresses learned from a peer's signature-verified node_announcement.
+	// Reconnect fallbacks only: a peer that has only ever connected inbound
+	// exposes no dialable address (its TCP source port is ephemeral), so these
+	// are the one self-recovery path for its channels. Never dialed before the
+	// last-known-good outbound address in peerAddresses.
+	private announcedAddresses: Map<
+		string,
+		Array<{ host: string; port: number }>
+	> = new Map();
 	private messageHandlers: Map<number, MessageHandler[]> = new Map();
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
@@ -181,6 +194,27 @@ export class PeerManager extends EventEmitter {
 	 *                    WebSocket (url defaults to ws://host:port).
 	 */
 	async connectPeer(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): Promise<void> {
+		try {
+			await this.dialPeer(pubkey, host, port, transport);
+		} catch (err) {
+			if (this.autoReconnect) {
+				this.scheduleReconnect(pubkey);
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Single dial attempt. Unlike connectPeer, a failure does NOT schedule a
+	 * reconnect — the reconnect loop tries several candidate addresses per round
+	 * and must control when the next round starts.
+	 */
+	private async dialPeer(
 		pubkey: string,
 		host: string,
 		port: number,
@@ -247,9 +281,6 @@ export class PeerManager extends EventEmitter {
 			// when there was no previous address, so initial connects still retry).
 			if (previousAddress) {
 				this.peerAddresses.set(pubkey, previousAddress);
-			}
-			if (this.autoReconnect) {
-				this.scheduleReconnect(pubkey);
 			}
 			throw err;
 		}
@@ -341,6 +372,59 @@ export class PeerManager extends EventEmitter {
 	 */
 	getPeerAddress(pubkey: string): { host: string; port: number } | undefined {
 		return this.peerAddresses.get(pubkey);
+	}
+
+	/**
+	 * Record dialable addresses learned from the peer's signature-verified
+	 * node_announcement, used as reconnect fallbacks after the last-known-good
+	 * outbound address (if any). Replaces any previous set for the peer; an
+	 * empty list clears it.
+	 */
+	setAnnouncedAddresses(
+		pubkey: string,
+		addresses: Array<{ host: string; port: number }>
+	): void {
+		if (addresses.length === 0) {
+			this.announcedAddresses.delete(pubkey);
+			return;
+		}
+		this.announcedAddresses.set(
+			pubkey,
+			addresses
+				.slice(0, MAX_ANNOUNCED_ADDRESSES)
+				.map((a) => ({ host: a.host, port: a.port }))
+		);
+	}
+
+	/**
+	 * Gossip-announced reconnect fallbacks currently held for a peer.
+	 */
+	getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number }> {
+		return [...(this.announcedAddresses.get(pubkey) ?? [])];
+	}
+
+	/**
+	 * Addresses a reconnect round dials, in order: the last-known-good outbound
+	 * address first, then gossip-announced fallbacks (deduplicated against it).
+	 */
+	private reconnectCandidates(
+		pubkey: string
+	): Array<{ host: string; port: number; transport?: IPeerTransportOptions }> {
+		const candidates: Array<{
+			host: string;
+			port: number;
+			transport?: IPeerTransportOptions;
+		}> = [];
+		const dialed = this.peerAddresses.get(pubkey);
+		if (dialed) candidates.push(dialed);
+		for (const addr of this.announcedAddresses.get(pubkey) ?? []) {
+			if (
+				!candidates.some((c) => c.host === addr.host && c.port === addr.port)
+			) {
+				candidates.push(addr);
+			}
+		}
+		return candidates;
 	}
 
 	/**
@@ -460,6 +544,7 @@ export class PeerManager extends EventEmitter {
 		}
 		this.reconnectTimers.clear();
 		this.reconnectDelays.clear();
+		this.announcedAddresses.clear();
 		for (const timer of this.stabilityTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -492,9 +577,11 @@ export class PeerManager extends EventEmitter {
 				// Newest wins (matches LND/CLN/LDK): when a peer's old connection
 				// dies on its side (common over Tor circuits), the remote re-dials
 				// before our ping/pong timeout notices the stale socket. Rejecting
-				// the fresh connection keeps the dead one, and since inbound peers
-				// store no dialable address there is no self-recovery: channels sit
-				// in AWAITING_REESTABLISH until a human forces a reconnect.
+				// the fresh connection keeps the dead one, and inbound peers store
+				// no dialable address (their TCP source port is ephemeral), so the
+				// only self-recovery is a gossip-announced fallback that may not
+				// exist: channels could sit in AWAITING_REESTABLISH until a human
+				// forces a reconnect.
 				const existing = this.peers.get(pubkey);
 				if (existing) {
 					// Tear the old connection down synchronously with our own
@@ -566,7 +653,7 @@ export class PeerManager extends EventEmitter {
 			}
 			this.emit('peer:disconnect', pubkey);
 
-			if (this.autoReconnect && this.peerAddresses.has(pubkey)) {
+			if (this.autoReconnect && this.reconnectCandidates(pubkey).length > 0) {
 				this.scheduleReconnect(pubkey);
 			}
 		});
@@ -593,8 +680,7 @@ export class PeerManager extends EventEmitter {
 
 	private scheduleReconnect(pubkey: string): void {
 		if (this.reconnectTimers.has(pubkey)) return; // already scheduled
-		const addr = this.peerAddresses.get(pubkey);
-		if (!addr) return;
+		if (this.reconnectCandidates(pubkey).length === 0) return;
 
 		const baseDelay =
 			this.reconnectDelays.get(pubkey) || DEFAULT_INITIAL_RECONNECT_DELAY_MS;
@@ -606,11 +692,20 @@ export class PeerManager extends EventEmitter {
 
 		const timer = setTimeout(async () => {
 			this.reconnectTimers.delete(pubkey);
-			try {
-				await this.connectPeer(pubkey, addr.host, addr.port, addr.transport);
-			} catch {
-				// connectPeer re-schedules when autoReconnect is enabled
+			// The peer may have re-dialed us while we waited (common over Tor).
+			if (this.peers.has(pubkey)) return;
+			// Candidates are re-read at fire time so addresses learned while
+			// waiting (e.g. a fresh node_announcement) are included.
+			for (const addr of this.reconnectCandidates(pubkey)) {
+				try {
+					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
+					return;
+				} catch {
+					// try the next candidate
+				}
 			}
+			// Every candidate failed: next round with a larger backoff.
+			this.scheduleReconnect(pubkey);
 		}, actualDelay);
 
 		this.reconnectTimers.set(pubkey, timer);

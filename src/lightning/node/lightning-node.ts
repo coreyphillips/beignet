@@ -67,7 +67,8 @@ import {
 	decodeChannelAnnouncementMessage,
 	decodeNodeAnnouncementMessage,
 	decodeChannelUpdateMessage,
-	nodeAddressToHostPort
+	nodeAddressToHostPort,
+	announcedDialableAddresses
 } from '../gossip/messages';
 import {
 	decodeReplyChannelRangeMessage,
@@ -1978,6 +1979,27 @@ export class LightningNode extends EventEmitter {
 		const peersToConnect = peerAddresses.filter((p) =>
 			channelPeers.has(p.pubkey)
 		);
+
+		// Seed gossip-announced addresses from the restored graph as reconnect
+		// fallbacks for every channel peer, and dial peers that have no stored
+		// address at all (they only ever connected inbound) via their
+		// announcement. Without this, such peers are unreachable after a
+		// restart until they dial us.
+		for (const pubkey of channelPeers) {
+			const node = this.graph.getNode(Buffer.from(pubkey, 'hex'));
+			if (!node?.announcement) continue;
+			const addrs = announcedDialableAddresses(node.announcement.addresses);
+			if (addrs.length === 0) continue;
+			this.peerManager.setAnnouncedAddresses(pubkey, addrs);
+			if (!peersToConnect.some((p) => p.pubkey === pubkey)) {
+				peersToConnect.push({
+					pubkey,
+					host: addrs[0].host,
+					port: addrs[0].port
+				});
+			}
+		}
+
 		if (peersToConnect.length === 0) {
 			this.emitReady();
 			return;
@@ -5723,6 +5745,13 @@ export class LightningNode extends EventEmitter {
 		if (!verifyNodeAnnouncement(msg, payload)) {
 			return;
 		}
+		// A signature-verified announcement from a channel peer is the only
+		// dialable address we ever learn for peers that connected inbound (their
+		// TCP source port is ephemeral, so it is never stored). Capture it even
+		// when the graph rejects the announcement below — a node with only
+		// private channels never enters the graph, yet its channels still need
+		// a reconnect path or they sit in AWAITING_REESTABLISH forever.
+		this.captureChannelPeerAddresses(msg);
 		if (this.graph.applyNodeAnnouncement(msg)) {
 			const node = this.graph.getNode(msg.nodeId);
 			if (node)
@@ -5730,6 +5759,47 @@ export class LightningNode extends EventEmitter {
 					() => this.storage!.saveGossipNode(msg.nodeId.toString('hex'), node),
 					'saveGossipNode'
 				);
+		}
+	}
+
+	/** Pubkeys of every peer we currently have a channel with. */
+	private channelPeerPubkeys(): Set<string> {
+		const peers = new Set<string>();
+		for (const channel of this.channelManager.listChannels()) {
+			const channelId = channel.getChannelId();
+			if (!channelId) continue;
+			const peer = this.channelManager.getPeerForChannel(channelId);
+			if (peer) peers.add(peer);
+		}
+		return peers;
+	}
+
+	/**
+	 * Keep a channel peer's announced addresses as reconnect fallbacks, and
+	 * persist one so the peer is dialable after a restart too. The persisted
+	 * copy never clobbers a stored last-known-good address from a real
+	 * outbound dial (the peer:connect handler saves those).
+	 */
+	private captureChannelPeerAddresses(msg: INodeAnnouncementMessage): void {
+		if (!this.peerManager) return;
+		const pubkey = msg.nodeId.toString('hex');
+		if (!this.channelPeerPubkeys().has(pubkey)) return;
+		const candidates = announcedDialableAddresses(msg.addresses);
+		if (candidates.length === 0) return;
+		this.peerManager.setAnnouncedAddresses(pubkey, candidates);
+		if (
+			this.storage &&
+			!this.storage.loadAllPeerAddresses().some((p) => p.pubkey === pubkey)
+		) {
+			this.safeStorage(
+				() =>
+					this.storage!.savePeerAddress(
+						pubkey,
+						candidates[0].host,
+						candidates[0].port
+					),
+				'savePeerAddress'
+			);
 		}
 	}
 
