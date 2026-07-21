@@ -295,6 +295,12 @@ export class SqliteStorage implements IStorageBackend {
 				last_connected INTEGER NOT NULL DEFAULT 0
 			);
 
+			CREATE TABLE IF NOT EXISTS announced_peer_addresses (
+				pubkey TEXT PRIMARY KEY,
+				announcement_timestamp INTEGER NOT NULL,
+				addresses_json TEXT NOT NULL
+			);
+
 			CREATE TABLE IF NOT EXISTS channel_key_indices (
 				channel_id TEXT PRIMARY KEY,
 				channel_index INTEGER NOT NULL
@@ -906,6 +912,44 @@ export class SqliteStorage implements IStorageBackend {
 
 	deletePeerAddress(pubkey: string): void {
 		this.db.prepare('DELETE FROM peer_addresses WHERE pubkey = ?').run(pubkey);
+	}
+
+	// ─── Announced Peer Addresses ───
+
+	saveAnnouncedPeerAddresses(
+		pubkey: string,
+		timestamp: number,
+		addresses: Array<{ host: string; port: number }>
+	): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO announced_peer_addresses (pubkey, announcement_timestamp, addresses_json) VALUES (?, ?, ?)'
+			)
+			.run(pubkey, timestamp, JSON.stringify(addresses));
+	}
+
+	loadAllAnnouncedPeerAddresses(): Array<{
+		pubkey: string;
+		timestamp: number;
+		addresses: Array<{ host: string; port: number }>;
+	}> {
+		const rows = this.db
+			.prepare(
+				'SELECT pubkey, announcement_timestamp, addresses_json FROM announced_peer_addresses'
+			)
+			.all() as Array<{
+			pubkey: string;
+			announcement_timestamp: number;
+			addresses_json: string;
+		}>;
+		return rows.map((row) => ({
+			pubkey: row.pubkey,
+			timestamp: row.announcement_timestamp,
+			addresses: JSON.parse(row.addresses_json) as Array<{
+				host: string;
+				port: number;
+			}>
+		}));
 	}
 
 	// ─── Channel Key Indices ───

@@ -94,6 +94,25 @@ export interface IStorageBackend {
 	loadAllPeerAddresses(): Array<{ pubkey: string; host: string; port: number }>;
 	deletePeerAddress(pubkey: string): void;
 
+	// ─── Announced Peer Addresses (optional) ───
+	// Reconnect fallbacks from a channel peer's signature-verified
+	// node_announcement, kept separate from peer_addresses: those hold
+	// last-known-good addresses proven by a successful outbound dial, while
+	// these are unproven claims that the peer's next announcement (tracked by
+	// its timestamp) supersedes — including down to an empty list.
+	/** Persist the newest announced address set for a channel peer. */
+	saveAnnouncedPeerAddresses?(
+		pubkey: string,
+		timestamp: number,
+		addresses: Array<{ host: string; port: number }>
+	): void;
+	/** Load every persisted announced address set. */
+	loadAllAnnouncedPeerAddresses?(): Array<{
+		pubkey: string;
+		timestamp: number;
+		addresses: Array<{ host: string; port: number }>;
+	}>;
+
 	// ─── Channel Key Indices ───
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void;
 	loadChannelKeyIndex(channelId: string): number | null;

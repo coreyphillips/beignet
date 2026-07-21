@@ -376,6 +376,15 @@ export class LightningNode extends EventEmitter {
 	private mppTimeoutMs: number;
 	private alias?: string;
 	private announcedAddresses: INodeAddress[] = [];
+	// Newest announced address set captured per channel peer, keyed by pubkey.
+	// The timestamp enforces node_announcement monotonicity for the reconnect
+	// fallback path independently of the graph, which never accepts
+	// announcements from nodes with only private channels — a valid signature
+	// alone must not let a replayed old announcement regress the addresses.
+	private announcedPeerAddresses: Map<
+		string,
+		{ timestamp: number; addresses: Array<{ host: string; port: number }> }
+	> = new Map();
 	private fundingPubkey: Buffer;
 	private fundingProvider: IFundingProvider | null = null;
 	private fundingPrivkey: Buffer;
@@ -1980,22 +1989,47 @@ export class LightningNode extends EventEmitter {
 			channelPeers.has(p.pubkey)
 		);
 
-		// Seed gossip-announced addresses from the restored graph as reconnect
-		// fallbacks for every channel peer, and dial peers that have no stored
-		// address at all (they only ever connected inbound) via their
-		// announcement. Without this, such peers are unreachable after a
-		// restart until they dial us.
+		// Seed gossip-announced reconnect fallbacks for every channel peer, and
+		// dial peers that have no stored address at all (they only ever
+		// connected inbound) via their announcement. Without this, such peers
+		// are unreachable after a restart until they dial us. Two sources,
+		// newest announcement timestamp wins: the persisted capture (the only
+		// record for private-only peers, whose announcements the graph
+		// rejects) and the restored graph. Seeding the timestamps also keeps
+		// replayed old announcements from regressing addresses post-restart.
+		const persistedAnnounced = new Map(
+			(this.storage.loadAllAnnouncedPeerAddresses?.() ?? []).map((entry) => [
+				entry.pubkey,
+				entry
+			])
+		);
 		for (const pubkey of channelPeers) {
+			let newest = persistedAnnounced.get(pubkey);
 			const node = this.graph.getNode(Buffer.from(pubkey, 'hex'));
-			if (!node?.announcement) continue;
-			const addrs = announcedDialableAddresses(node.announcement.addresses);
-			if (addrs.length === 0) continue;
-			this.peerManager.setAnnouncedAddresses(pubkey, addrs);
-			if (!peersToConnect.some((p) => p.pubkey === pubkey)) {
+			if (
+				node?.announcement &&
+				(!newest || node.announcement.timestamp > newest.timestamp)
+			) {
+				newest = {
+					pubkey,
+					timestamp: node.announcement.timestamp,
+					addresses: announcedDialableAddresses(node.announcement.addresses)
+				};
+			}
+			if (!newest) continue;
+			this.announcedPeerAddresses.set(pubkey, {
+				timestamp: newest.timestamp,
+				addresses: newest.addresses
+			});
+			this.peerManager.setAnnouncedAddresses(pubkey, newest.addresses);
+			if (
+				newest.addresses.length > 0 &&
+				!peersToConnect.some((p) => p.pubkey === pubkey)
+			) {
 				peersToConnect.push({
 					pubkey,
-					host: addrs[0].host,
-					port: addrs[0].port
+					host: newest.addresses[0].host,
+					port: newest.addresses[0].port
 				});
 			}
 		}
@@ -5775,30 +5809,39 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Keep a channel peer's announced addresses as reconnect fallbacks, and
-	 * persist one so the peer is dialable after a restart too. The persisted
-	 * copy never clobbers a stored last-known-good address from a real
-	 * outbound dial (the peer:connect handler saves those).
+	 * Keep a channel peer's announced addresses as reconnect fallbacks and
+	 * persist them (with the announcement timestamp) so the peer stays
+	 * dialable after a restart. These are deliberately NOT written to
+	 * peer_addresses: that store holds last-known-good addresses proven by a
+	 * successful outbound dial, and an unproven gossip claim persisted there
+	 * would shadow every later announcement (the peer:connect handler is what
+	 * promotes a fallback once a dial to it succeeds). The newest announcement
+	 * always supersedes, including down to an empty address list.
 	 */
 	private captureChannelPeerAddresses(msg: INodeAnnouncementMessage): void {
 		if (!this.peerManager) return;
 		const pubkey = msg.nodeId.toString('hex');
 		if (!this.channelPeerPubkeys().has(pubkey)) return;
+		// A valid signature does not make an old announcement current: reject
+		// anything not strictly newer than what we already hold (mirrors the
+		// graph's freshness rule, which cannot cover private-only peers).
+		const previous = this.announcedPeerAddresses.get(pubkey);
+		if (previous && msg.timestamp <= previous.timestamp) return;
 		const candidates = announcedDialableAddresses(msg.addresses);
-		if (candidates.length === 0) return;
+		this.announcedPeerAddresses.set(pubkey, {
+			timestamp: msg.timestamp,
+			addresses: candidates
+		});
 		this.peerManager.setAnnouncedAddresses(pubkey, candidates);
-		if (
-			this.storage &&
-			!this.storage.loadAllPeerAddresses().some((p) => p.pubkey === pubkey)
-		) {
+		if (this.storage?.saveAnnouncedPeerAddresses) {
 			this.safeStorage(
 				() =>
-					this.storage!.savePeerAddress(
+					this.storage!.saveAnnouncedPeerAddresses!(
 						pubkey,
-						candidates[0].host,
-						candidates[0].port
+						msg.timestamp,
+						candidates
 					),
-				'savePeerAddress'
+				'saveAnnouncedPeerAddresses'
 			);
 		}
 	}

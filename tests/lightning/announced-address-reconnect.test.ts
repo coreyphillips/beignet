@@ -11,8 +11,10 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import { EventEmitter } from 'events';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	encodeNodeAnnouncementMessage,
 	announcedDialableAddresses
@@ -195,9 +197,16 @@ describe('PeerManager: gossip-announced reconnect fallbacks', function () {
 // ── LightningNode: capture from node_announcement ──────────────────
 
 describe('LightningNode: channel peer address capture', function () {
-	function storageStub(
-		saved: Array<{ pubkey: string; host: string; port: number }>
-	): IStorageBackend {
+	interface IAnnouncedSave {
+		pubkey: string;
+		timestamp: number;
+		addresses: Array<{ host: string; port: number }>;
+	}
+
+	function storageStub(recorded: {
+		peerSaves: Array<{ pubkey: string; host: string; port: number }>;
+		announcedSaves: IAnnouncedSave[];
+	}): IStorageBackend {
 		const stub: Partial<IStorageBackend> = {
 			loadAllChannels: () => [],
 			loadAllPayments: () => [],
@@ -211,21 +220,47 @@ describe('LightningNode: channel peer address capture', function () {
 			loadAllChainMonitors: () => [],
 			loadAllGossipChannels: () => [],
 			loadAllGossipNodes: () => [],
-			loadAllPeerAddresses: () => [...saved],
+			loadAllPeerAddresses: () => [...recorded.peerSaves],
+			loadAllAnnouncedPeerAddresses: () => [...recorded.announcedSaves],
 			loadMetadata: () => null,
 			loadAllHtlcSharedSecrets: () => [],
 			saveHtlcSharedSecret: () => {},
 			deleteHtlcSharedSecret: () => {},
 			savePeerAddress: (pubkey: string, host: string, port: number) => {
-				saved.push({ pubkey, host, port });
+				recorded.peerSaves.push({ pubkey, host, port });
+			},
+			saveAnnouncedPeerAddresses: (
+				pubkey: string,
+				timestamp: number,
+				addresses: Array<{ host: string; port: number }>
+			) => {
+				recorded.announcedSaves.push({ pubkey, timestamp, addresses });
 			}
 		};
 		return stub as IStorageBackend;
 	}
 
-	it('captures and persists a channel peer announcement the graph rejects', function () {
-		const saved: Array<{ pubkey: string; host: string; port: number }> = [];
-		const node = makeNode({ storage: storageStub(saved) });
+	interface ICaptureHarness {
+		node: LightningNode;
+		peerKey: Buffer;
+		peerPub: string;
+		recorded: {
+			peerSaves: Array<{ pubkey: string; host: string; port: number }>;
+			announcedSaves: IAnnouncedSave[];
+		};
+		announce(
+			addresses: Array<{ type: number; host: string; port: number }>,
+			timestamp: number
+		): void;
+		announced(): Array<{ host: string; port: number }>;
+	}
+
+	function makeCaptureHarness(): ICaptureHarness {
+		const recorded = {
+			peerSaves: [] as Array<{ pubkey: string; host: string; port: number }>,
+			announcedSaves: [] as IAnnouncedSave[]
+		};
+		const node = makeNode({ storage: storageStub(recorded) });
 		const peerKey = crypto.randomBytes(32);
 		const peerPub = getPublicKey(peerKey).toString('hex');
 		const internal = node as unknown as {
@@ -234,59 +269,194 @@ describe('LightningNode: channel peer address capture', function () {
 			peerManager: PeerManager;
 		};
 		internal.channelPeerPubkeys = (): Set<string> => new Set([peerPub]);
+		return {
+			node,
+			peerKey,
+			peerPub,
+			recorded,
+			announce: (addresses, timestamp): void =>
+				internal.handleNodeAnnouncement(
+					makeAnnouncement(peerKey, addresses, timestamp)
+				),
+			announced: (): Array<{ host: string; port: number }> =>
+				internal.peerManager.getAnnouncedAddresses(peerPub)
+		};
+	}
 
+	const ADDR_1 = { type: ADDRESS_TYPE_IPV4, host: '203.0.113.7', port: 9735 };
+	const ADDR_2 = { type: ADDRESS_TYPE_IPV4, host: '203.0.113.8', port: 9735 };
+
+	it('captures and persists a channel peer announcement the graph rejects', function () {
+		const h = makeCaptureHarness();
 		// The peer has no channels in the graph, so applyNodeAnnouncement
 		// rejects this announcement; the capture path must still run.
-		internal.handleNodeAnnouncement(
-			makeAnnouncement(peerKey, [
-				{ type: ADDRESS_TYPE_IPV4, host: '203.0.113.7', port: 9735 }
-			])
-		);
+		h.announce([ADDR_1], 1000);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.7', port: 9735 }]);
+		// Persisted to the announced-address store with its timestamp, and
+		// NEVER to peer_addresses: that store is reserved for addresses proven
+		// by a successful outbound dial.
+		expect(h.recorded.announcedSaves).to.deep.equal([
+			{
+				pubkey: h.peerPub,
+				timestamp: 1000,
+				addresses: [{ host: '203.0.113.7', port: 9735 }]
+			}
+		]);
+		expect(h.recorded.peerSaves).to.deep.equal([]);
 
-		expect(internal.peerManager.getAnnouncedAddresses(peerPub)).to.deep.equal([
-			{ host: '203.0.113.7', port: 9735 }
-		]);
-		expect(saved).to.deep.equal([
-			{ pubkey: peerPub, host: '203.0.113.7', port: 9735 }
-		]);
+		// A newer announcement supersedes, in memory and in storage.
+		h.announce([ADDR_2], 2000);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.8', port: 9735 }]);
+		expect(h.recorded.announcedSaves.length).to.equal(2);
+		expect(h.recorded.announcedSaves[1].timestamp).to.equal(2000);
+		expect(h.recorded.peerSaves).to.deep.equal([]);
+		h.node.destroy();
+	});
 
-		// A second announcement must not clobber the persisted address:
-		// the stored entry now stands in for a last-known-good address.
-		internal.handleNodeAnnouncement(
-			makeAnnouncement(
-				peerKey,
-				[{ type: ADDRESS_TYPE_IPV4, host: '203.0.113.8', port: 9735 }],
-				Math.floor(Date.now() / 1000) + 60
-			)
-		);
-		expect(saved.length).to.equal(1);
-		// ...but the in-memory fallbacks do follow the newest announcement.
-		expect(internal.peerManager.getAnnouncedAddresses(peerPub)).to.deep.equal([
-			{ host: '203.0.113.8', port: 9735 }
-		]);
-		node.destroy();
+	it('ignores an older valid node_announcement', function () {
+		const h = makeCaptureHarness();
+		h.announce([ADDR_2], 2000);
+		// Validly signed but stale: a replay must not regress the addresses.
+		h.announce([ADDR_1], 1000);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.8', port: 9735 }]);
+		expect(h.recorded.announcedSaves.length).to.equal(1);
+		h.node.destroy();
+	});
+
+	it('ignores a duplicate timestamp', function () {
+		const h = makeCaptureHarness();
+		h.announce([ADDR_1], 1000);
+		h.announce([ADDR_2], 1000);
+		expect(h.announced()).to.deep.equal([{ host: '203.0.113.7', port: 9735 }]);
+		expect(h.recorded.announcedSaves.length).to.equal(1);
+		h.node.destroy();
+	});
+
+	it('a newer announcement with no usable addresses clears the fallbacks', function () {
+		const h = makeCaptureHarness();
+		h.announce([ADDR_1], 1000);
+		expect(h.announced().length).to.equal(1);
+		// The peer withdraws its addresses: the newest signed announcement
+		// supersedes down to an empty list.
+		h.announce([], 2000);
+		expect(h.announced()).to.deep.equal([]);
+		expect(h.recorded.announcedSaves[1]).to.deep.equal({
+			pubkey: h.peerPub,
+			timestamp: 2000,
+			addresses: []
+		});
+		h.node.destroy();
 	});
 
 	it('ignores announcements from nodes we have no channel with', function () {
-		const saved: Array<{ pubkey: string; host: string; port: number }> = [];
-		const node = makeNode({ storage: storageStub(saved) });
+		const recorded = {
+			peerSaves: [] as Array<{ pubkey: string; host: string; port: number }>,
+			announcedSaves: [] as IAnnouncedSave[]
+		};
+		const node = makeNode({ storage: storageStub(recorded) });
 		const peerKey = crypto.randomBytes(32);
 		const internal = node as unknown as {
 			handleNodeAnnouncement(payload: Buffer): void;
 			peerManager: PeerManager;
 		};
-		internal.handleNodeAnnouncement(
-			makeAnnouncement(peerKey, [
-				{ type: ADDRESS_TYPE_IPV4, host: '203.0.113.7', port: 9735 }
-			])
-		);
+		internal.handleNodeAnnouncement(makeAnnouncement(peerKey, [ADDR_1], 1000));
 		expect(
 			internal.peerManager.getAnnouncedAddresses(
 				getPublicKey(peerKey).toString('hex')
 			)
 		).to.deep.equal([]);
-		expect(saved).to.deep.equal([]);
+		expect(recorded.announcedSaves).to.deep.equal([]);
+		expect(recorded.peerSaves).to.deep.equal([]);
 		node.destroy();
+	});
+});
+
+// ── SqliteStorage: announced peer address round-trip ───────────────
+
+describe('SqliteStorage: announced peer addresses', function () {
+	it('round-trips announced address sets, newest write wins', function () {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const pubkey = crypto.randomBytes(33).toString('hex');
+		storage.saveAnnouncedPeerAddresses(pubkey, 1000, [
+			{ host: '203.0.113.7', port: 9735 }
+		]);
+		storage.saveAnnouncedPeerAddresses(pubkey, 2000, []);
+		expect(storage.loadAllAnnouncedPeerAddresses()).to.deep.equal([
+			{ pubkey, timestamp: 2000, addresses: [] }
+		]);
+	});
+});
+
+// ── PeerManager: cross-dial race safety ────────────────────────────
+
+describe('PeerManager: simultaneous cross-dial handling', function () {
+	it('a stale close does not tear down the live replacement connection', function () {
+		const pm = new PeerManager({
+			localPrivateKey: crypto.randomBytes(32),
+			autoReconnect: true
+		});
+		const pubkey = crypto.randomBytes(33).toString('hex');
+		const internal = pm as unknown as {
+			setupPeerListeners(pubkey: string, peer: unknown): void;
+			peers: Map<string, unknown>;
+		};
+		const stale = new EventEmitter();
+		internal.setupPeerListeners(pubkey, stale);
+		const live = { marker: 'live', disconnect: (): void => {} };
+		internal.peers.set(pubkey, live);
+		let disconnects = 0;
+		pm.on('peer:disconnect', () => disconnects++);
+
+		// The stale instance closes after losing a cross-dial race. It must
+		// not delete the live connection's bookkeeping or emit a spurious
+		// peer:disconnect (which would also schedule a needless reconnect).
+		stale.emit('close');
+		expect(internal.peers.get(pubkey)).to.equal(live);
+		expect(disconnects).to.equal(0);
+		pm.destroy();
+	});
+
+	it('an outbound dial that loses the race to an inbound connection is discarded', async function () {
+		this.timeout(20_000);
+		const aKey = crypto.randomBytes(32);
+		const bKey = crypto.randomBytes(32);
+		const bPub = getPublicKey(bKey).toString('hex');
+		const pmA = new PeerManager({ localPrivateKey: aKey });
+		const pmB = new PeerManager({ localPrivateKey: bKey });
+		try {
+			await pmB.listen(0);
+			const bPort = (
+				pmB as unknown as { server: { address(): { port: number } } }
+			).server.address().port;
+
+			const aInternal = pmA as unknown as {
+				dialPeer(pubkey: string, host: string, port: number): Promise<void>;
+				peers: Map<string, unknown>;
+			};
+			let connects = 0;
+			pmA.on('peer:connect', () => connects++);
+
+			// Start the outbound handshake, then let an "inbound" connection
+			// register for the same pubkey while it is in flight.
+			const dial = aInternal.dialPeer(bPub, '127.0.0.1', bPort);
+			const inboundWinner = {
+				marker: 'inbound-winner',
+				disconnect: (): void => {}
+			};
+			aInternal.peers.set(bPub, inboundWinner);
+			await dial;
+
+			// The completed inbound connection keeps its registration; the
+			// outbound loser is torn down without a peer:connect.
+			expect(aInternal.peers.get(bPub)).to.equal(inboundWinner);
+			expect(connects).to.equal(0);
+			// B observes the discarded outbound connection close.
+			await waitFor(() => pmB.listPeers().length === 0);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
 	});
 });
 

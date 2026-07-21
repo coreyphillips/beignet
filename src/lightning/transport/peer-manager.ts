@@ -284,6 +284,17 @@ export class PeerManager extends EventEmitter {
 			}
 			throw err;
 		}
+		// The peer may have dialed US while our handshake was in flight (both
+		// sides auto-reconnect after a drop, so simultaneous cross-dials are
+		// routine over Tor). BOLT 1 wants a single connection per peer: keep
+		// the inbound one that already registered and discard ours quietly —
+		// no peer:connect for it, and no peer:disconnect when it closes.
+		const raceWinner = this.peers.get(pubkey);
+		if (raceWinner && raceWinner !== peer) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			return;
+		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
 		// immediately — otherwise a peer that drops right after connecting keeps
@@ -642,6 +653,12 @@ export class PeerManager extends EventEmitter {
 		});
 
 		peer.on('close', () => {
+			// Only the currently registered instance may tear down the peer's
+			// bookkeeping. A connection that lost a cross-dial race (or was
+			// replaced by a fresh inbound) closes later; keying the map by
+			// pubkey alone would let that stale close delete the live
+			// replacement's entry and emit a spurious peer:disconnect.
+			if (this.peers.get(pubkey) !== peer) return;
 			captureWireEvent('close', pubkey);
 			this.peers.delete(pubkey);
 			// A short-lived connection: don't let it reset the backoff.
