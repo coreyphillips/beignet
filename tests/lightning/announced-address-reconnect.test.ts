@@ -417,42 +417,253 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 		pm.destroy();
 	});
 
-	it('an outbound dial that loses the race to an inbound connection is discarded', async function () {
+	/** Two keys ordered by their compressed pubkey hex, plus the pubkeys. */
+	function orderedKeyPair(): {
+		lowKey: Buffer;
+		lowPub: string;
+		highKey: Buffer;
+		highPub: string;
+	} {
+		const k1 = crypto.randomBytes(32);
+		const k2 = crypto.randomBytes(32);
+		const p1 = getPublicKey(k1).toString('hex');
+		const p2 = getPublicKey(k2).toString('hex');
+		if (p1 === p2) return orderedKeyPair();
+		return p1 < p2
+			? { lowKey: k1, lowPub: p1, highKey: k2, highPub: p2 }
+			: { lowKey: k2, lowPub: p2, highKey: k1, highPub: p1 };
+	}
+
+	function pmPort(pm: PeerManager): number {
+		return (
+			pm as unknown as { server: { address(): { port: number } } }
+		).server.address().port;
+	}
+
+	interface IPmInternal {
+		dialPeer(pubkey: string, host: string, port: number): Promise<void>;
+		peers: Map<string, unknown>;
+		inboundPeerSet: Set<string>;
+		inboundPeerCount: number;
+	}
+
+	it('larger-pubkey side: an outbound dial losing the race to an inbound connection is discarded', async function () {
 		this.timeout(20_000);
-		const aKey = crypto.randomBytes(32);
-		const bKey = crypto.randomBytes(32);
-		const bPub = getPublicKey(bKey).toString('hex');
-		const pmA = new PeerManager({ localPrivateKey: aKey });
-		const pmB = new PeerManager({ localPrivateKey: bKey });
+		// The local (dialing) node has the larger pubkey, so it prefers the
+		// inbound connection in a cross-direction collision.
+		const { lowKey, lowPub, highKey } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: highKey });
+		const pmB = new PeerManager({ localPrivateKey: lowKey });
 		try {
 			await pmB.listen(0);
-			const bPort = (
-				pmB as unknown as { server: { address(): { port: number } } }
-			).server.address().port;
-
-			const aInternal = pmA as unknown as {
-				dialPeer(pubkey: string, host: string, port: number): Promise<void>;
-				peers: Map<string, unknown>;
-			};
+			const aInternal = pmA as unknown as IPmInternal;
 			let connects = 0;
 			pmA.on('peer:connect', () => connects++);
 
 			// Start the outbound handshake, then let an "inbound" connection
 			// register for the same pubkey while it is in flight.
-			const dial = aInternal.dialPeer(bPub, '127.0.0.1', bPort);
+			const dial = aInternal.dialPeer(lowPub, '127.0.0.1', pmPort(pmB));
 			const inboundWinner = {
 				marker: 'inbound-winner',
-				disconnect: (): void => {}
+				disconnect: (): void => {},
+				removeAllListeners: (): void => {}
 			};
-			aInternal.peers.set(bPub, inboundWinner);
+			aInternal.peers.set(lowPub, inboundWinner);
+			aInternal.inboundPeerSet.add(lowPub);
+			aInternal.inboundPeerCount++;
 			await dial;
 
 			// The completed inbound connection keeps its registration; the
 			// outbound loser is torn down without a peer:connect.
-			expect(aInternal.peers.get(bPub)).to.equal(inboundWinner);
+			expect(aInternal.peers.get(lowPub)).to.equal(inboundWinner);
 			expect(connects).to.equal(0);
 			// B observes the discarded outbound connection close.
 			await waitFor(() => pmB.listPeers().length === 0);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
+	});
+
+	it('smaller-pubkey side: a completed outbound dial replaces the inbound race winner', async function () {
+		this.timeout(20_000);
+		const { lowKey, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: lowKey });
+		const pmB = new PeerManager({ localPrivateKey: highKey });
+		try {
+			await pmB.listen(0);
+			const aInternal = pmA as unknown as IPmInternal;
+			let connects = 0;
+			let disconnects = 0;
+			pmA.on('peer:connect', () => connects++);
+			pmA.on('peer:disconnect', () => disconnects++);
+
+			const dial = aInternal.dialPeer(highPub, '127.0.0.1', pmPort(pmB));
+			let winnerClosed = false;
+			const inboundWinner = {
+				marker: 'inbound-winner',
+				disconnect: (): void => {
+					winnerClosed = true;
+				},
+				removeAllListeners: (): void => {}
+			};
+			aInternal.peers.set(highPub, inboundWinner);
+			aInternal.inboundPeerSet.add(highPub);
+			aInternal.inboundPeerCount++;
+			await dial;
+
+			// Our outbound wins the tie-break: the inbound registration is
+			// torn down (one peer:disconnect) and replaced by the outbound
+			// connection (one peer:connect), with the inbound bookkeeping
+			// cleaned up.
+			expect(aInternal.peers.get(highPub)).to.not.equal(inboundWinner);
+			expect(winnerClosed).to.equal(true);
+			expect(disconnects).to.equal(1);
+			expect(connects).to.equal(1);
+			expect(aInternal.inboundPeerSet.has(highPub)).to.equal(false);
+			expect(pmA.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
+	});
+
+	it('smaller-pubkey side: an inbound connection is rejected while its outbound is registered', async function () {
+		this.timeout(20_000);
+		const { lowKey, lowPub, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: lowKey });
+		const pmB = new PeerManager({ localPrivateKey: highKey });
+		const pmB2 = new PeerManager({ localPrivateKey: highKey });
+		try {
+			await pmA.listen(0);
+			await pmB.listen(0);
+			await pmA.connectPeer(highPub, '127.0.0.1', pmPort(pmB));
+			const original = (pmA as unknown as IPmInternal).peers.get(highPub);
+			let disconnects = 0;
+			pmA.on('peer:disconnect', () => disconnects++);
+
+			// The peer cross-dials while our outbound connection stands. We
+			// have the smaller pubkey, so the outbound is kept and the fresh
+			// inbound is dropped.
+			try {
+				await pmB2.connectPeer(lowPub, '127.0.0.1', pmPort(pmA));
+			} catch {
+				// The rejected dial may fail at B2's end; either way it must
+				// not displace A's outbound connection.
+			}
+			await waitFor(() => pmB2.listPeers().length === 0);
+			await new Promise((r) => setTimeout(r, 200));
+			expect((pmA as unknown as IPmInternal).peers.get(highPub)).to.equal(
+				original
+			);
+			expect(disconnects).to.equal(0);
+			expect(pmA.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			pmB2.destroy();
+		}
+	});
+
+	it('larger-pubkey side: an inbound connection replaces its registered outbound', async function () {
+		this.timeout(20_000);
+		const { lowKey, lowPub, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: highKey });
+		const pmB = new PeerManager({ localPrivateKey: lowKey });
+		const pmB2 = new PeerManager({ localPrivateKey: lowKey });
+		try {
+			await pmA.listen(0);
+			await pmB.listen(0);
+			await pmA.connectPeer(lowPub, '127.0.0.1', pmPort(pmB));
+			let disconnects = 0;
+			pmA.on('peer:disconnect', () => disconnects++);
+
+			// We have the larger pubkey, so the peer's inbound connection wins
+			// the cross-direction tie-break and replaces our outbound.
+			await pmB2.connectPeer(highPub, '127.0.0.1', pmPort(pmA));
+			await waitFor(() => disconnects === 1 && pmA.listPeers().length === 1);
+			expect(
+				(pmA as unknown as IPmInternal).inboundPeerSet.has(lowPub)
+			).to.equal(true);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			pmB2.destroy();
+		}
+	});
+
+	it('same-direction re-dial still replaces a stale inbound (Tor stale-socket recovery)', async function () {
+		this.timeout(20_000);
+		// The local node prefers outbound, but the collision is inbound vs
+		// inbound: the deterministic tie-break must NOT apply, or a peer
+		// re-dialing past its silently-dead connection would be locked out.
+		const { lowKey, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: lowKey });
+		const pmB = new PeerManager({ localPrivateKey: highKey });
+		const pmB2 = new PeerManager({ localPrivateKey: highKey });
+		try {
+			await pmA.listen(0);
+			await pmB.connectPeer(
+				getPublicKey(lowKey).toString('hex'),
+				'127.0.0.1',
+				pmPort(pmA)
+			);
+			await waitFor(() => pmA.listPeers().length === 1);
+			let disconnects = 0;
+			pmA.on('peer:disconnect', () => disconnects++);
+
+			// The same node re-dials (its first connection is stale on its
+			// side). Newest wins: the fresh inbound replaces the old one.
+			await pmB2.connectPeer(
+				getPublicKey(lowKey).toString('hex'),
+				'127.0.0.1',
+				pmPort(pmA)
+			);
+			await waitFor(() => disconnects === 1);
+			expect(pmA.listPeers().length).to.equal(1);
+			expect(
+				(pmA as unknown as IPmInternal).inboundPeerSet.has(highPub)
+			).to.equal(true);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			pmB2.destroy();
+		}
+	});
+
+	it('simultaneous cross-dials converge on a single stable connection', async function () {
+		this.timeout(20_000);
+		const { lowKey, lowPub, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: lowKey });
+		const pmB = new PeerManager({ localPrivateKey: highKey });
+		try {
+			await pmA.listen(0);
+			await pmB.listen(0);
+			const aPort = pmPort(pmA);
+			const bPort = pmPort(pmB);
+
+			// Whatever the interleaving, both managers must end up holding the
+			// same physical connection. If they ever selected opposite sockets
+			// each side would close the one the other kept, and with
+			// auto-reconnect off both counts would drop to zero for good.
+			for (let round = 0; round < 5; round++) {
+				await Promise.allSettled([
+					pmA.connectPeer(highPub, '127.0.0.1', bPort),
+					pmB.connectPeer(lowPub, '127.0.0.1', aPort)
+				]);
+				await waitFor(
+					() => pmA.listPeers().length === 1 && pmB.listPeers().length === 1
+				);
+				await new Promise((r) => setTimeout(r, 400));
+				expect(pmA.listPeers().length).to.equal(1);
+				expect(pmB.listPeers().length).to.equal(1);
+
+				pmA.disconnectPeer(highPub);
+				pmB.disconnectPeer(lowPub);
+				await waitFor(
+					() => pmA.listPeers().length === 0 && pmB.listPeers().length === 0
+				);
+			}
 		} finally {
 			pmA.destroy();
 			pmB.destroy();

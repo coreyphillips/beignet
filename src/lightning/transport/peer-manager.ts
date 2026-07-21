@@ -11,6 +11,7 @@
 import { EventEmitter } from 'events';
 import net from 'net';
 import { SocksClient } from 'socks';
+import { getPublicKey } from '../crypto/ecdh';
 import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
 import { IInitMessage } from '../message/init';
@@ -135,6 +136,7 @@ type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
 export class PeerManager extends EventEmitter {
 	private localPrivateKey: Buffer;
+	private localPubkeyHex: string;
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private peers: Map<string, Peer> = new Map();
@@ -173,6 +175,7 @@ export class PeerManager extends EventEmitter {
 	constructor(options: IPeerManagerOptions) {
 		super();
 		this.localPrivateKey = options.localPrivateKey;
+		this.localPubkeyHex = getPublicKey(options.localPrivateKey).toString('hex');
 		this.localFeatures = options.localFeatures || FeatureFlags.empty();
 		this.networks = options.networks;
 		this.autoReconnect = options.autoReconnect ?? false;
@@ -284,16 +287,33 @@ export class PeerManager extends EventEmitter {
 			}
 			throw err;
 		}
-		// The peer may have dialed US while our handshake was in flight (both
-		// sides auto-reconnect after a drop, so simultaneous cross-dials are
-		// routine over Tor). BOLT 1 wants a single connection per peer: keep
-		// the inbound one that already registered and discard ours quietly —
-		// no peer:connect for it, and no peer:disconnect when it closes.
+		// The peer may have dialed US while our handshake was in flight. Apply
+		// the deterministic tie-break (see preferOutboundTo): if the registered
+		// connection is inbound and we are the smaller-pubkey side, our
+		// outbound wins — replace it with the same teardown bookkeeping the
+		// newest-wins inbound path uses. Otherwise discard ours quietly: no
+		// peer:connect for it, and no peer:disconnect when it closes. A
+		// same-direction winner (two concurrent local dials) is never
+		// replaced — the connections are interchangeable, keep the first.
 		const raceWinner = this.peers.get(pubkey);
 		if (raceWinner && raceWinner !== peer) {
-			peer.removeAllListeners();
-			peer.disconnect();
-			return;
+			const winnerIsInbound = this.inboundPeerSet.has(pubkey);
+			if (!winnerIsInbound || !this.preferOutboundTo(pubkey)) {
+				peer.removeAllListeners();
+				peer.disconnect();
+				return;
+			}
+			raceWinner.removeAllListeners();
+			raceWinner.disconnect();
+			this.peers.delete(pubkey);
+			this.clearStabilityTimer(pubkey);
+			this.inboundPeerCount--;
+			this.inboundPeerSet.delete(pubkey);
+			captureWireEvent('close', pubkey);
+			// Emitted before our peer:connect below, mirroring the inbound
+			// replacement path: channels mark AWAITING_REESTABLISH first, then
+			// the connect handler re-drives channel_reestablish.
+			this.emit('peer:disconnect', pubkey);
 		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
@@ -317,6 +337,22 @@ export class PeerManager extends EventEmitter {
 			clearTimeout(t);
 			this.stabilityTimers.delete(pubkey);
 		}
+	}
+
+	/**
+	 * Deterministic direction preference for simultaneous cross-dials (both
+	 * nodes reconnecting to each other at once, routine after a drop when both
+	 * sides auto-reconnect). Each side keeping "its" connection can select
+	 * OPPOSITE physical sockets — A keeps the one B just discarded and vice
+	 * versa — killing both. The convention (LND uses the same shape): the node
+	 * with the lexicographically smaller pubkey keeps its outbound connection,
+	 * the other keeps its inbound one, so both ends independently converge on
+	 * the same socket (BOLT 1: a single connection per peer). Only applied to
+	 * cross-DIRECTION collisions; same-direction ones are not ambiguous
+	 * between the ends and keep their existing rules.
+	 */
+	private preferOutboundTo(remotePubkey: string): boolean {
+		return this.localPubkeyHex < remotePubkey;
 	}
 
 	/**
@@ -585,15 +621,35 @@ export class PeerManager extends EventEmitter {
 			.then(() => {
 				const pubkey = peer.remotePublicKey.toString('hex');
 
-				// Newest wins (matches LND/CLN/LDK): when a peer's old connection
-				// dies on its side (common over Tor circuits), the remote re-dials
-				// before our ping/pong timeout notices the stale socket. Rejecting
-				// the fresh connection keeps the dead one, and inbound peers store
-				// no dialable address (their TCP source port is ephemeral), so the
-				// only self-recovery is a gossip-announced fallback that may not
-				// exist: channels could sit in AWAITING_REESTABLISH until a human
-				// forces a reconnect.
 				const existing = this.peers.get(pubkey);
+
+				// Cross-direction collision (we hold an outbound connection or
+				// dial to this peer): resolve deterministically so both ends
+				// keep the SAME socket (see preferOutboundTo). When we are the
+				// smaller-pubkey side our outbound wins — drop this inbound; the
+				// peer's dialPeer discards its outbound symmetrically. This
+				// intentionally covers a possibly-stale outbound too (matching
+				// LND): rejecting the re-dial costs at most one ping cycle
+				// before the dead socket is noticed, whereas newest-wins on
+				// cross-direction collisions lets the two ends select opposite
+				// sockets and kill both.
+				if (
+					existing &&
+					!this.inboundPeerSet.has(pubkey) &&
+					this.preferOutboundTo(pubkey)
+				) {
+					peer.disconnect();
+					return;
+				}
+
+				// Newest wins (matches LND/CLN/LDK): when a peer's old inbound
+				// connection dies on its side (common over Tor circuits), the
+				// remote re-dials before our ping/pong timeout notices the stale
+				// socket. Rejecting the fresh connection keeps the dead one, and
+				// inbound peers store no dialable address (their TCP source port
+				// is ephemeral), so the only self-recovery is a gossip-announced
+				// fallback that may not exist: channels could sit in
+				// AWAITING_REESTABLISH until a human forces a reconnect.
 				if (existing) {
 					// Tear the old connection down synchronously with our own
 					// bookkeeping. Its 'close' event fires on a later tick, so the
