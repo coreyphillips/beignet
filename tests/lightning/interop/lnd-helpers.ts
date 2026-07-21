@@ -41,10 +41,13 @@ export {
 
 // ── Constants ──────────────────────────────────────────────────
 
-export const LND_REST_HOST = '127.0.0.1';
-export const LND_REST_PORT = 8081;
-export const LND_P2P_HOST = '127.0.0.1';
-export const LND_P2P_PORT = 9735;
+// Overridable so the interop stack can be brought up on free ports when the
+// defaults collide with something else already running on the host. Point these
+// at whatever docker/docker-compose.override.yml publishes.
+export const LND_REST_HOST = process.env.LND_REST_HOST ?? '127.0.0.1';
+export const LND_REST_PORT = Number(process.env.LND_REST_PORT ?? 8081);
+export const LND_P2P_HOST = process.env.LND_P2P_HOST ?? '127.0.0.1';
+export const LND_P2P_PORT = Number(process.env.LND_P2P_PORT ?? 9735);
 
 // ── LND Availability ───────────────────────────────────────────
 
