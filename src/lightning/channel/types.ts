@@ -182,10 +182,26 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 
+/** Largest value encodable in a wire u64 field. */
+export const U64_MAX = 0xffffffffffffffffn;
+
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
-	maxHtlcValueInFlightMsat: 500_000_000n,
+	// "No artificial limit" (CLN advertises the same U64 max). The value is
+	// advertised as configured on every open/accept path, v1 and v2, and is
+	// never clamped to capacity: the advertisement is immutable for the life
+	// of the channel while capacity is not (splice), so clamping at open
+	// would bake the initial capacity in as a permanent ceiling. Peers take
+	// min(capacity, value) as the effective limit, balance/reserve rules
+	// bound what can actually be in flight, and the gossip htlc_maximum_msat
+	// is clamped to current capacity at channel_update build time. A fixed
+	// default here (formerly 500k sat) capped the usable in-flight amount of
+	// every larger channel: CLN and LDK compute effective capacity as
+	// min(capacity, this value), so a wumbo channel was treated as a 500k-sat
+	// one and peers with a min-capacity policy above it rejected our opens at
+	// any funding size.
+	maxHtlcValueInFlightMsat: U64_MAX,
 	channelReserveSatoshis: 10_000n,
 	htlcMinimumMsat: 1_000n,
 	toSelfDelay: 144,

@@ -88,6 +88,7 @@ import {
 	deriveV2TemporaryChannelId,
 	validateOpenChannelParams,
 	validateAcceptChannelParams,
+	validateU64,
 	isValidShutdownScript
 } from './validation';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -655,6 +656,14 @@ export class Channel {
 			];
 		}
 
+		const maxHtlcErr = validateU64(
+			this._state.localConfig.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (maxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: maxHtlcErr }];
+		}
+
 		const firstPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
 			0n
@@ -686,6 +695,13 @@ export class Channel {
 			this._state.localConfig.dustLimitSatoshis
 		);
 
+		// max_htlc_value_in_flight_msat is advertised as configured, NOT
+		// clamped to capacity: the advertisement is immutable for the life of
+		// the channel while capacity is not (splice-in), so clamping would
+		// bake the initial capacity in as a permanent ceiling. Over-capacity
+		// values are interop-safe (CLN always advertises U64 max); peers take
+		// min(capacity, value) and balance/reserve rules bound what can
+		// actually be in flight.
 		const msg: IOpenChannelMessage = {
 			chainHash: chainHash || BITCOIN_CHAIN_HASH,
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -1283,6 +1299,17 @@ export class Channel {
 					message: `our dust_limit ${this._state.localConfig.dustLimitSatoshis} exceeds opener channel_reserve ${msg.channelReserveSatoshis}`
 				}
 			];
+		}
+
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// clamped to the opener's capacity (see initiateOpen: the
+		// advertisement outlives the current capacity).
+		const acceptMaxHtlcErr = validateU64(
+			this._state.localConfig.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (acceptMaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: acceptMaxHtlcErr }];
 		}
 
 		const acceptMsg: IAcceptChannelMessage = {
@@ -7900,6 +7927,14 @@ export class Channel {
 	 * adoption paths.
 	 */
 	private _finishCompleteSplice(): void {
+		// localConfig.maxHtlcValueInFlightMsat is deliberately NOT re-clamped to
+		// the post-splice capacity: it is the limit we NEGOTIATED at open, and
+		// the peer holds us to it across splices. Lowering it after a splice-out
+		// would make us reject in-flight totals the peer is entitled to once a
+		// later splice-in restores capacity. While capacity is low, balance and
+		// reserve rules already bound what can actually be in flight, and the
+		// gossip htlc_maximum_msat is clamped against current capacity at
+		// channel_update build time.
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
 		// spliced channel. After a restart the in-memory copy is gone but the
@@ -8475,6 +8510,14 @@ export class Channel {
 			];
 		}
 
+		const v2MaxHtlcErr = validateU64(
+			params.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (v2MaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
+		}
+
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = params.commitmentFeeratePerkw;
 		this._state.fundingLocktime = params.locktime;
@@ -8528,6 +8571,17 @@ export class Channel {
 			];
 		}
 
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped (final v2 capacity is unknown here anyway; see
+		// initiateOpen for why clamping is wrong in general). v2 params arrive
+		// separately from the state config, so mirror the value from the BUILT
+		// message into localConfig after the session accepted the open: our
+		// inbound enforcement reads localConfig, and if it were lower than
+		// what we advertised we would reject in-flight totals the peer is
+		// entitled to send.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			result.message.maxHtlcValueInFlightMsat;
+
 		this._state.dualFundingSession = session;
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
@@ -8551,6 +8605,14 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected open_channel2' }
 			];
+		}
+
+		const acceptV2MaxHtlcErr = validateU64(
+			localParams.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (acceptV2MaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
 		}
 
 		this._state.fundingVersion = 2;
@@ -8587,7 +8649,6 @@ export class Channel {
 				)
 			}
 		};
-
 		const session = new DualFundingSession(
 			false,
 			this._state.temporaryChannelId,
@@ -8602,6 +8663,15 @@ export class Channel {
 				}
 			];
 		}
+
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped (a will_fund lease fee can still grow capacity
+		// after this message; see initiateOpen). Mirror the value from the
+		// BUILT accept_channel2 into localConfig after the session accepted
+		// the open, so enforcement matches the advertisement exactly (see
+		// initiateOpenV2).
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			result.message.maxHtlcValueInFlightMsat;
 
 		this._state.dualFundingSession = session;
 		this._state.remoteBasepoints = session.getRemoteBasepoints();

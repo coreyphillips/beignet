@@ -646,9 +646,16 @@ describe('Channel State Machine', function () {
 
 		it('should reject HTLC exceeding max value in flight', function () {
 			const { opener } = getToNormal();
-			const hugeAmount = FUNDING_SATOSHIS * 1000n; // exceeds max in-flight (500M msat)
+			// The default limit is clamped to capacity, and anything above
+			// capacity trips the balance check first. Pin the peer's advertised
+			// limit below our spendable balance so the in-flight check is the
+			// one that rejects.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(opener as any)._state.remoteConfig.maxHtlcValueInFlightMsat =
+				500_000_000n;
+			const amount = 600_000_000n; // above the 500M limit, below balance
 			const actions = opener.addHtlc(
-				hugeAmount,
+				amount,
 				crypto.randomBytes(32),
 				500000,
 				crypto.randomBytes(1366)
