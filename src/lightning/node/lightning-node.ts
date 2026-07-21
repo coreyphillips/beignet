@@ -109,6 +109,7 @@ import {
 	INVALID_ONION_BLINDING,
 	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
+	REQUIRED_CHANNEL_FEATURE_MISSING,
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT,
 	TEMPORARY_CHANNEL_FAILURE,
@@ -215,7 +216,11 @@ import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
-import { isTaprootChannel, isAnchorChannel } from '../channel/types';
+import {
+	isTaprootChannel,
+	isAnchorChannel,
+	hasScidAliasChannelType
+} from '../channel/types';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -847,7 +852,7 @@ export class LightningNode extends EventEmitter {
 		for (const { state } of this.storage.loadAllChannels()) {
 			const scid = state.shortChannelId;
 			if (!scid || !state.channelId) continue;
-			if (!this.shouldExposeRealScid(state)) continue;
+			if (!this.shouldAcceptRealScid(state)) continue;
 			if (this.scidToChannelId.has(scid.toString('hex'))) continue;
 			this.registerChannelScid(state.channelId, scid);
 		}
@@ -1188,7 +1193,7 @@ export class LightningNode extends EventEmitter {
 			'channel:scid-assigned',
 			(channelId: Buffer, scid: Buffer) => {
 				const channel = this.channelManager.getChannel(channelId);
-				if (!channel || !this.shouldExposeRealScid(channel.getFullState())) {
+				if (!channel || !this.shouldAcceptRealScid(channel.getFullState())) {
 					return;
 				}
 				this.registerChannelScid(channelId, scid);
@@ -5212,21 +5217,27 @@ export class LightningNode extends EventEmitter {
 		// Register the real confirmed SCID. Null until the funding reaches
 		// announcement depth, so this is also driven by 'channel:scid-assigned'.
 		const state = channel.getFullState();
-		if (state.shortChannelId && this.shouldExposeRealScid(state)) {
+		if (state.shortChannelId && this.shouldAcceptRealScid(state)) {
 			this.registerChannelScid(channelId, state.shortChannelId);
 		}
 	}
 
 	/**
-	 * Whether this channel may be addressed by its real SCID for forwarding.
+	 * Whether incoming HTLCs may address this channel by its real SCID.
 	 *
-	 * BOLT 2 option_scid_alias: an UNANNOUNCED channel must only be addressable by
-	 * its alias, because honouring the real SCID reveals the funding outpoint and
-	 * defeats the alias entirely. An announced channel is already public, so it
-	 * must accept the SCID it published.
+	 * BOLT 2 conditions this on the negotiated CHANNEL TYPE, not on
+	 * announce_channel: only when channel_type includes option_scid_alias must a
+	 * node refuse the real short_channel_id. Gating on announceChannel instead
+	 * would reject every private channel, including ones that never negotiated
+	 * option_scid_alias, and those are routinely addressed by their real SCID via
+	 * invoice route hints (buildRoutingHintForChannel prefers the real SCID over
+	 * the alias, so this node's own private invoices would be unpayable).
+	 *
+	 * An announced channel is unaffected: BOLT 2 forbids pairing option_scid_alias
+	 * with announce_channel, so an announced channel never trips this.
 	 */
-	private shouldExposeRealScid(state: IChannelState): boolean {
-		return state.announceChannel === true;
+	private shouldAcceptRealScid(state: IChannelState): boolean {
+		return !hasScidAliasChannelType(state.channelType);
 	}
 
 	// ─────────────── Gossip Propagation ───────────────
@@ -8573,8 +8584,10 @@ export class LightningNode extends EventEmitter {
 	 * eventually leaving no route at all.
 	 *
 	 * Channel-scoped failures are those carrying the UPDATE flag (0x1000), which by
-	 * definition describe the outgoing channel, plus unknown_next_peer, which is
-	 * PERM and carries no channel_update but still means "my link onward is gone".
+	 * definition describe the outgoing channel, plus the two BOLT 4 failures that
+	 * also describe the outgoing channel but carry no channel_update and therefore
+	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
+	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
 	 */
 	private getCulpableHopScid(payment: IPaymentInfo): string | undefined {
 		const index = payment.failureSourceIndex;
@@ -8582,12 +8595,24 @@ export class LightningNode extends EventEmitter {
 		const code = payment.failureCode;
 		if (code === undefined) return undefined;
 
-		const isChannelScoped = (code & 0x1000) !== 0 || code === UNKNOWN_NEXT_PEER;
-		if (!isChannelScoped) return undefined;
+		if (!this.isChannelScopedFailure(code)) return undefined;
 
 		// The final hop has no outgoing channel, so there is nothing to blame.
 		const outgoingHop = payment.route.hops[index + 1];
 		return outgoingHop?.shortChannelId.toString('hex');
+	}
+
+	/**
+	 * Whether an onion failure code describes the erring node's OUTGOING CHANNEL
+	 * (as opposed to the node itself, or the payment as seen by the final hop).
+	 */
+	private isChannelScopedFailure(code: number): boolean {
+		// NODE (0x2000) failures describe the node, never one of its channels.
+		if ((code & 0x2000) !== 0) return false;
+		if ((code & 0x1000) !== 0) return true;
+		return (
+			code === UNKNOWN_NEXT_PEER || code === REQUIRED_CHANNEL_FEATURE_MISSING
+		);
 	}
 
 	/**

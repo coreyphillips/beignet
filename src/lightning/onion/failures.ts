@@ -26,6 +26,7 @@ import {
 	INCORRECT_CLTV_EXPIRY,
 	EXPIRY_TOO_SOON,
 	UNKNOWN_NEXT_PEER,
+	REQUIRED_CHANNEL_FEATURE_MISSING,
 	TEMPORARY_CHANNEL_FAILURE,
 	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
 	FINAL_INCORRECT_CLTV_EXPIRY,
@@ -247,6 +248,10 @@ export function decodeFailureCode(code: number): {
 		},
 		[EXPIRY_TOO_SOON]: { name: 'expiry_too_soon', hasChannelUpdate: true },
 		[UNKNOWN_NEXT_PEER]: { name: 'unknown_next_peer', hasChannelUpdate: false },
+		[REQUIRED_CHANNEL_FEATURE_MISSING]: {
+			name: 'required_channel_feature_missing',
+			hasChannelUpdate: false
+		},
 		[TEMPORARY_CHANNEL_FAILURE]: {
 			name: 'temporary_channel_failure',
 			hasChannelUpdate: true

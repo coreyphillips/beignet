@@ -32,6 +32,19 @@ export function isTaprootChannel(channelType: Buffer | null): boolean {
 	);
 }
 
+/**
+ * Check whether a negotiated channel_type includes option_scid_alias.
+ *
+ * BOLT 2 conditions the "MUST NOT allow incoming HTLCs using the real
+ * short_channel_id" rule on the CHANNEL TYPE, not on announce_channel. A private
+ * channel that did not negotiate option_scid_alias may still be addressed by its
+ * real SCID, and peers routinely do so via invoice route hints.
+ */
+export function hasScidAliasChannelType(channelType: Buffer | null): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	return FeatureFlags.fromBuffer(channelType).hasFeature(Feature.SCID_ALIAS);
+}
+
 export enum ChannelState {
 	NONE = 'NONE',
 	SENT_OPEN = 'SENT_OPEN',
