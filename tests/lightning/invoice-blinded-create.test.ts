@@ -66,7 +66,10 @@ function injectNormalChannel(node: LightningNode): {
 	});
 	state.state = ChannelState.NORMAL;
 	state.channelId = channelId;
-	state.scidAlias = scid;
+	// The SCID a peer resolves is the alias the PEER generated and sent us,
+	// which we store as remoteScidAlias (BOLT 2). A real channel_ready exchange
+	// populates this; injecting only our own scidAlias would not.
+	state.remoteScidAlias = scid;
 
 	const channel = new Channel(state);
 	const cm = (node as any).channelManager;

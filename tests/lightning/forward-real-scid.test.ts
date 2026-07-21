@@ -372,6 +372,136 @@ describe('Forwarding by real SCID: handleForwardHtlc', function () {
 	});
 });
 
+// ── Which SCID we advertise to payers ──────────────────────────────
+
+/**
+ * The receive side of the same rule. Registration decides which SCIDs we ACCEPT;
+ * this decides which SCID we ADVERTISE in BOLT 11 r fields, blinded paths and
+ * direct channel_updates. The two must agree, or we hand payers a route our own
+ * forwarding side rejects.
+ *
+ * Direction matters and is easy to invert. BOLT 2: the SENDER of an alias "MUST
+ * always recognize the alias as a short_channel_id for incoming HTLCs", so the
+ * generator resolves it. The peer therefore resolves the alias IT sent us
+ * (remoteScidAlias), never the one we sent it (scidAlias).
+ */
+describe('Peer-addressable SCID selection', function () {
+	let node: LightningNode;
+
+	beforeEach(function () {
+		node = makeNode();
+	});
+
+	afterEach(function () {
+		node.destroy();
+	});
+
+	function stateWith(opts: {
+		channelType: Buffer;
+		realScid: Buffer | null;
+		scidAlias: Buffer | null;
+		remoteScidAlias: Buffer | null;
+	}): any {
+		return {
+			channelType: opts.channelType,
+			shortChannelId: opts.realScid,
+			scidAlias: opts.scidAlias,
+			remoteScidAlias: opts.remoteScidAlias
+		};
+	}
+
+	const realScid = encodeShortChannelId({
+		block: 900_000,
+		txIndex: 42,
+		outputIndex: 0
+	});
+	const ourAlias = Buffer.from('00000a0000050003', 'hex');
+	const peerAlias = Buffer.from('00000b0000060004', 'hex');
+
+	function selected(state: any): Buffer | null {
+		return (node as any).getPeerAddressableScid(state);
+	}
+
+	it('option_scid_alias + confirmed: uses the peer alias, never the real SCID', function () {
+		const scid = selected(
+			stateWith({
+				channelType: scidAliasChannelType(),
+				realScid,
+				scidAlias: ourAlias,
+				remoteScidAlias: peerAlias
+			})
+		);
+
+		expect(scid).to.not.be.null;
+		expect(
+			scid!.equals(realScid),
+			'BOLT 2 forbids the real SCID in r fields for an option_scid_alias channel'
+		).to.be.false;
+		expect(scid!.equals(peerAlias)).to.be.true;
+	});
+
+	it('private, no option_scid_alias, confirmed: may use the real SCID', function () {
+		const scid = selected(
+			stateWith({
+				channelType: plainChannelType(),
+				realScid,
+				scidAlias: ourAlias,
+				remoteScidAlias: peerAlias
+			})
+		);
+
+		expect(scid!.equals(realScid)).to.be.true;
+	});
+
+	it('before a real SCID exists: uses the peer alias, not our own', function () {
+		const scid = selected(
+			stateWith({
+				channelType: plainChannelType(),
+				realScid: null,
+				scidAlias: ourAlias,
+				remoteScidAlias: peerAlias
+			})
+		);
+
+		expect(
+			scid!.equals(ourAlias),
+			'our own alias is what WE resolve, so the peer need not honour it'
+		).to.be.false;
+		expect(scid!.equals(peerAlias)).to.be.true;
+	});
+
+	it('nothing addressable: returns null rather than a hint the peer cannot resolve', function () {
+		const scid = selected(
+			stateWith({
+				channelType: scidAliasChannelType(),
+				realScid,
+				scidAlias: ourAlias,
+				remoteScidAlias: null
+			})
+		);
+
+		expect(scid).to.be.null;
+	});
+
+	it('agrees with the forwarding side: what we advertise, we accept', function () {
+		// The invariant the two halves of this PR must jointly satisfy.
+		const { channelId, realScid: chanScid } = installChannel(node, {
+			channelType: plainChannelType()
+		});
+		(node as any).registerChannelScids(channelId);
+
+		const channel = (node as any).channelManager.getChannel(channelId);
+		const advertised = selected(channel.getFullState());
+
+		expect(advertised).to.not.be.null;
+		expect(advertised!.equals(chanScid)).to.be.true;
+		expect(
+			registeredScids(node).has(advertised!.toString('hex')),
+			'we must accept forwards addressed by the SCID we advertise'
+		).to.be.true;
+	});
+});
+
 // ── Failure attribution ────────────────────────────────────────────
 
 describe('Payment failure attribution', function () {

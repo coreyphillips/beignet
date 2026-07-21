@@ -72,7 +72,10 @@ describe('BOLT 12 async offer (M2.4)', function () {
 		});
 		state.state = ChannelState.NORMAL;
 		state.channelId = channelId;
-		state.scidAlias = scid;
+		// The SCID a peer resolves is the alias the PEER generated and sent us,
+		// which we store as remoteScidAlias (BOLT 2). A real channel_ready exchange
+		// populates this; injecting only our own scidAlias would not.
+		state.remoteScidAlias = scid;
 		const cm = (node as any).channelManager;
 		cm.channels.set(channelId.toString('hex'), new Channel(state));
 		cm.channelPeers.set(channelId.toString('hex'), lspPubkey.toString('hex'));

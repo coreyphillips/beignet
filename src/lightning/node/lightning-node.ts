@@ -4169,14 +4169,15 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Build and sign a channel_update for an UNANNOUNCED channel, addressed by
-	 * the real SCID once confirmed or else the alias we gave the peer (the SCID
-	 * it routes to us with, per option_scid_alias).
+	 * the SCID the peer routes to us with (see getPeerAddressableScid): the real
+	 * SCID once confirmed, or the alias the peer gave us, and never the real SCID
+	 * on an option_scid_alias channel.
 	 */
 	private buildDirectChannelUpdate(channelId: Buffer): Buffer | null {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return null;
 		const state = channel.getFullState();
-		const scid = state.shortChannelId ?? state.scidAlias;
+		const scid = this.getPeerAddressableScid(state);
 		if (!scid) return null;
 		const peerHex = this.channelManager.getPeerForChannel(channelId);
 		if (!peerHex) return null;
@@ -5240,6 +5241,36 @@ export class LightningNode extends EventEmitter {
 		return !hasScidAliasChannelType(state.channelType);
 	}
 
+	/**
+	 * The short_channel_id a PEER uses to address this channel when routing an
+	 * HTLC to us: the SCID for BOLT 11 r fields, blinded-path hops, and the
+	 * channel_update we send directly over an unannounced channel.
+	 *
+	 * The alias direction matters and is easy to get backwards. BOLT 2 says the
+	 * SENDER of an alias in channel_ready "MUST always recognize the alias as a
+	 * short_channel_id for incoming HTLCs to this channel", so the node that
+	 * generated an alias is the node that resolves it. Our peer therefore resolves
+	 * the alias IT generated and sent to us, which we store as remoteScidAlias.
+	 * Our own scidAlias is what WE resolve, so advertising it would name an SCID
+	 * the peer is not required to recognise. BOLT 2 matches this from the other
+	 * side: the receiver "MAY use any of the alias it received, in BOLT 11 r
+	 * fields".
+	 *
+	 * With option_scid_alias in channel_type the real SCID is not an option at
+	 * all: BOLT 2 says a node "MUST NOT use the real short_channel_id in BOLT 11 r
+	 * fields", and shouldAcceptRealScid means our own forwarding side would refuse
+	 * it anyway. Advertising it would hand payers a route we reject.
+	 *
+	 * Returns null when nothing addressable exists yet, which is correct: a hint
+	 * the peer cannot resolve is worse than no hint.
+	 */
+	private getPeerAddressableScid(state: IChannelState): Buffer | null {
+		if (hasScidAliasChannelType(state.channelType)) {
+			return state.remoteScidAlias;
+		}
+		return state.shortChannelId ?? state.remoteScidAlias;
+	}
+
 	// ─────────────── Gossip Propagation ───────────────
 
 	/**
@@ -5464,11 +5495,11 @@ export class LightningNode extends EventEmitter {
 		if (!peerPubkeyHex) return null;
 
 		// SCID for the peer→us hop = the SCID the peer uses to forward HTLCs to
-		// us. Per option_scid_alias the alias WE sent in channel_ready is what
-		// the peer accepts for incoming HTLCs to us, so use the real SCID (once
-		// confirmed) or OUR own scidAlias — NOT remoteScidAlias (the peer's
-		// alias, which we use to route to them, the wrong direction).
-		const scid = state.shortChannelId || state.scidAlias;
+		// us, which is the real SCID once confirmed or else the alias the PEER
+		// generated and sent us. See getPeerAddressableScid: BOLT 2 makes the
+		// alias generator the alias resolver, so our own scidAlias is the wrong
+		// direction here.
+		const scid = this.getPeerAddressableScid(state);
 		if (!scid) return null;
 
 		const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
@@ -5581,7 +5612,8 @@ export class LightningNode extends EventEmitter {
 			if (!channelId) continue;
 			const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
 			if (!peerPubkeyHex) continue;
-			const scid = state.shortChannelId || state.scidAlias;
+			// Same SCID selection as routing hints: the SCID the peer resolves.
+			const scid = this.getPeerAddressableScid(state);
 			if (!scid) continue;
 			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
 
