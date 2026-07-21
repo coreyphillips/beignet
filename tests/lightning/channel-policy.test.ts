@@ -297,9 +297,9 @@ describe('Channel Routing Policy (M3)', function () {
 			expect(policy.htlcMinimumMsat).to.equal(
 				DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat
 			);
-			expect(policy.htlcMaximumMsat).to.equal(
-				DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat
-			);
+			// Capacity of the 1M sat test channel: the default in-flight limit
+			// is clamped to capacity at open/accept.
+			expect(policy.htlcMaximumMsat).to.equal(1_000_000_000n);
 		});
 
 		it('override takes precedence, unset fields fall back to defaults', function () {
@@ -518,9 +518,9 @@ describe('Channel Routing Policy (M3)', function () {
 				expect(dec1.htlcMinimumMsat).to.equal(
 					DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat
 				);
-				expect(dec1.htlcMaximumMsat).to.equal(
-					DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat
-				);
+				// Capacity of the 1M sat test channel: the default in-flight limit
+				// is clamped to capacity at open/accept.
+				expect(dec1.htlcMaximumMsat).to.equal(1_000_000_000n);
 				expect(dec1.signature.equals(Buffer.alloc(64)), 'signed').to.be.false;
 
 				alice.setChannelPolicy(channelId, {
@@ -763,9 +763,9 @@ describe('Channel Routing Policy (M3)', function () {
 				expect(before.htlcMinimumMsat).to.equal(
 					DEFAULT_CHANNEL_CONFIG.htlcMinimumMsat
 				);
-				expect(before.htlcMaximumMsat).to.equal(
-					DEFAULT_CHANNEL_CONFIG.maxHtlcValueInFlightMsat
-				);
+				// Capacity of the 1M sat test channel: the default in-flight limit
+				// is clamped to capacity at open/accept.
+				expect(before.htlcMaximumMsat).to.equal(1_000_000_000n);
 
 				alice.setChannelPolicy(channelId, {
 					feeBaseMsat: 42,

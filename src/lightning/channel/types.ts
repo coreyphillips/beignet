@@ -185,13 +185,35 @@ export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
-	maxHtlcValueInFlightMsat: 500_000_000n,
+	// "No artificial limit" (CLN advertises the same U64 max). The advertised
+	// value is clamped to channel capacity at every open/accept build via
+	// clampMaxHtlcValueInFlightMsat, so the default resolves to the capacity
+	// of each channel. A fixed default here (formerly 500k sat) capped the
+	// usable in-flight amount of every larger channel: CLN and LDK compute a
+	// channel's effective capacity as min(capacity, this value), so a wumbo
+	// channel was treated as a 500k-sat one and peers with a min-capacity
+	// policy above it rejected our opens at any funding size.
+	maxHtlcValueInFlightMsat: 0xffffffffffffffffn,
 	channelReserveSatoshis: 10_000n,
 	htlcMinimumMsat: 1_000n,
 	toSelfDelay: 144,
 	maxAcceptedHtlcs: 483,
 	feeratePerKw: 253
 };
+
+/**
+ * Cap a max_htlc_value_in_flight_msat at the channel's capacity. An in-flight
+ * limit above capacity is meaningless (nothing larger can ever be in flight),
+ * and a configured value below capacity is a deliberate policy, so this only
+ * ever clamps downward.
+ */
+export function clampMaxHtlcValueInFlightMsat(
+	valueMsat: bigint,
+	capacitySat: bigint
+): bigint {
+	const capacityMsat = capacitySat * 1000n;
+	return valueMsat > capacityMsat ? capacityMsat : valueMsat;
+}
 
 /** Result type for ChannelManager operations that may fail. */
 export interface ChannelResult {

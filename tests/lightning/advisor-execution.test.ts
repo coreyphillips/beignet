@@ -616,9 +616,11 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 				expect(plans).to.have.length(1);
 				expect(plans[0].fromChannelId).to.equal(abChannelId.toString('hex'));
 				expect(plans[0].toChannelId).to.equal(caChannelId.toString('hex'));
-				// Half the capacity (500k) clamped to one HTLC's carrying capacity:
-				// 99% of the 500M msat max_htlc_value_in_flight (fee headroom).
-				expect(plans[0].amountSats).to.equal(495_000n);
+				// Half the capacity (500k). The one-HTLC carrying cap (99% of
+				// max_htlc_value_in_flight) no longer binds now that the
+				// in-flight limit is clamped to capacity instead of a fixed
+				// 500M msat: 99% of the 1M sat channel is 990k.
+				expect(plans[0].amountSats).to.equal(500_000n);
 
 				const summary = await alice.executeRebalanceRecommendations({
 					budgetSatsPerDay: 10
@@ -630,7 +632,7 @@ describe('Advisor Execution (M3 phases 1+2)', function () {
 				expect(summary.budgetRemainingMsat).to.equal(
 					10_000n - summary.feeSpentMsat
 				);
-				expect(localMsat(alice, caChannelId)).to.equal(495_000_000n);
+				expect(localMsat(alice, caChannelId)).to.equal(500_000_000n);
 
 				// Budget spend persisted (survives restart within the same day).
 				const raw = storage.loadMetadata('advisor:rebalance-budget');

@@ -73,7 +73,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
-	MAX_FUNDING_SATOSHIS
+	MAX_FUNDING_SATOSHIS,
+	clampMaxHtlcValueInFlightMsat
 } from './types';
 import {
 	IChannelState,
@@ -686,6 +687,14 @@ export class Channel {
 			this._state.localConfig.dustLimitSatoshis
 		);
 
+		// Written back to localConfig (not just the wire message) so our own
+		// inbound in-flight enforcement matches what we advertise.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			clampMaxHtlcValueInFlightMsat(
+				this._state.localConfig.maxHtlcValueInFlightMsat,
+				this._state.fundingSatoshis
+			);
+
 		const msg: IOpenChannelMessage = {
 			chainHash: chainHash || BITCOIN_CHAIN_HASH,
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -1284,6 +1293,15 @@ export class Channel {
 				}
 			];
 		}
+
+		// Capacity is known here (set from the opener's funding_satoshis when
+		// open_channel was received). Written back to localConfig so our own
+		// inbound in-flight enforcement matches what we advertise.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			clampMaxHtlcValueInFlightMsat(
+				this._state.localConfig.maxHtlcValueInFlightMsat,
+				this._state.fundingSatoshis
+			);
 
 		const acceptMsg: IAcceptChannelMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -7900,6 +7918,15 @@ export class Channel {
 	 * adoption paths.
 	 */
 	private _finishCompleteSplice(): void {
+		// A splice-out shrinks capacity below what was negotiated at open. The
+		// advertised max_htlc_value_in_flight cannot be renegotiated post-open,
+		// but our own inbound enforcement must track the new capacity. Only
+		// ever clamps downward, so a splice-in changes nothing.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			clampMaxHtlcValueInFlightMsat(
+				this._state.localConfig.maxHtlcValueInFlightMsat,
+				this._state.fundingSatoshis
+			);
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
 		// spliced channel. After a restart the in-memory copy is gone but the
@@ -8498,6 +8525,18 @@ export class Channel {
 				)
 			}
 		};
+		// Our own contribution is a floor on the final v2 capacity (the acceptor
+		// may add more), so clamping to it can only be conservative. Mirrored
+		// into localConfig so inbound enforcement matches what we advertise.
+		params = {
+			...params,
+			maxHtlcValueInFlightMsat: clampMaxHtlcValueInFlightMsat(
+				params.maxHtlcValueInFlightMsat,
+				params.fundingSatoshis
+			)
+		};
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			params.maxHtlcValueInFlightMsat;
 		if (params.channelType) {
 			this._state.channelType = Buffer.from(params.channelType);
 		} else {
@@ -8587,6 +8626,18 @@ export class Channel {
 				)
 			}
 		};
+		// The v2 capacity is both contributions (a will_fund lease fee can only
+		// add to it later). Mirrored into localConfig so inbound enforcement
+		// matches what we advertise in accept_channel2.
+		localParams = {
+			...localParams,
+			maxHtlcValueInFlightMsat: clampMaxHtlcValueInFlightMsat(
+				localParams.maxHtlcValueInFlightMsat,
+				msg.fundingSatoshis + localParams.fundingSatoshis
+			)
+		};
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			localParams.maxHtlcValueInFlightMsat;
 
 		const session = new DualFundingSession(
 			false,
