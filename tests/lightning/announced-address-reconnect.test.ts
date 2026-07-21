@@ -403,7 +403,11 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 		};
 		const stale = new EventEmitter();
 		internal.setupPeerListeners(pubkey, stale);
-		const live = { marker: 'live', disconnect: (): void => {} };
+		const live = {
+			marker: 'live',
+			disconnect: (): void => {},
+			removeAllListeners: (): void => {}
+		};
 		internal.peers.set(pubkey, live);
 		let disconnects = 0;
 		pm.on('peer:disconnect', () => disconnects++);
@@ -663,10 +667,95 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 				await waitFor(
 					() => pmA.listPeers().length === 0 && pmB.listPeers().length === 0
 				);
+				// Direction bookkeeping must return to zero every round: it
+				// feeds the tie-break, so a stale entry here would corrupt the
+				// NEXT round's collision decision.
+				for (const pm of [pmA, pmB]) {
+					const internal = pm as unknown as IPmInternal;
+					expect(internal.inboundPeerSet.size).to.equal(0);
+					expect(internal.inboundPeerCount).to.equal(0);
+				}
 			}
 		} finally {
 			pmA.destroy();
 			pmB.destroy();
+		}
+	});
+
+	it('explicit disconnect of an inbound peer clears the direction bookkeeping', async function () {
+		this.timeout(20_000);
+		const aKey = crypto.randomBytes(32);
+		const bKey = crypto.randomBytes(32);
+		const bPub = getPublicKey(bKey).toString('hex');
+		const pmA = new PeerManager({ localPrivateKey: aKey });
+		const pmB = new PeerManager({ localPrivateKey: bKey });
+		try {
+			await pmA.listen(0);
+			await pmB.connectPeer(
+				getPublicKey(aKey).toString('hex'),
+				'127.0.0.1',
+				pmPort(pmA)
+			);
+			await waitFor(() => pmA.listPeers().length === 1);
+			const aInternal = pmA as unknown as IPmInternal;
+			expect(aInternal.inboundPeerSet.has(bPub)).to.equal(true);
+			expect(aInternal.inboundPeerCount).to.equal(1);
+
+			pmA.disconnectPeer(bPub);
+			expect(aInternal.inboundPeerSet.has(bPub)).to.equal(false);
+			expect(aInternal.inboundPeerCount).to.equal(0);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
+	});
+
+	it('stale direction state cannot flip a later collision decision', async function () {
+		this.timeout(20_000);
+		// Regression for the disconnectPeer bookkeeping leak: A (smaller
+		// pubkey) hosts B inbound, explicitly disconnects it, then dials B
+		// outbound. When B cross-dials, A must recognize its registered
+		// connection as OUTBOUND and reject the inbound per the tie-break. A
+		// leftover inboundPeerSet entry would misclassify it and let
+		// newest-wins replace the outbound, re-opening the double-kill.
+		const { lowKey, lowPub, highKey, highPub } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: lowKey });
+		const pmB = new PeerManager({ localPrivateKey: highKey });
+		const pmB2 = new PeerManager({ localPrivateKey: highKey });
+		try {
+			await pmA.listen(0);
+			await pmB.listen(0);
+
+			// Round 1: B is inbound at A, then explicitly disconnected.
+			await pmB.connectPeer(lowPub, '127.0.0.1', pmPort(pmA));
+			await waitFor(() => pmA.listPeers().length === 1);
+			pmA.disconnectPeer(highPub);
+			await waitFor(() => pmB.listPeers().length === 0);
+
+			// Round 2: A dials B outbound, then B cross-dials.
+			await pmA.connectPeer(highPub, '127.0.0.1', pmPort(pmB));
+			const aInternal = pmA as unknown as IPmInternal;
+			const outbound = aInternal.peers.get(highPub);
+			let disconnects = 0;
+			pmA.on('peer:disconnect', () => disconnects++);
+
+			try {
+				await pmB2.connectPeer(lowPub, '127.0.0.1', pmPort(pmA));
+			} catch {
+				// The rejected cross-dial may fail at B2's end.
+			}
+			await waitFor(() => pmB2.listPeers().length === 0);
+			await new Promise((r) => setTimeout(r, 200));
+
+			// Exactly one connection survives: A's outbound, untouched.
+			expect(aInternal.peers.get(highPub)).to.equal(outbound);
+			expect(disconnects).to.equal(0);
+			expect(pmA.listPeers().length).to.equal(1);
+			expect(pmB.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			pmB2.destroy();
 		}
 	});
 });

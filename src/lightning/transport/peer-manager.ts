@@ -303,17 +303,10 @@ export class PeerManager extends EventEmitter {
 				peer.disconnect();
 				return;
 			}
-			raceWinner.removeAllListeners();
-			raceWinner.disconnect();
-			this.peers.delete(pubkey);
-			this.clearStabilityTimer(pubkey);
-			this.inboundPeerCount--;
-			this.inboundPeerSet.delete(pubkey);
-			captureWireEvent('close', pubkey);
-			// Emitted before our peer:connect below, mirroring the inbound
-			// replacement path: channels mark AWAITING_REESTABLISH first, then
-			// the connect handler re-drives channel_reestablish.
-			this.emit('peer:disconnect', pubkey);
+			// peer:disconnect is emitted before our peer:connect below, mirroring
+			// the inbound replacement path: channels mark AWAITING_REESTABLISH
+			// first, then the connect handler re-drives channel_reestablish.
+			this.removeRegisteredPeer(pubkey, raceWinner);
 		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
@@ -356,6 +349,29 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Tear down the registered connection for a peer, synchronously and with
+	 * ALL its bookkeeping. Every removal path must go through here: the
+	 * direction bookkeeping (inboundPeerSet/inboundPeerCount) feeds the
+	 * cross-dial tie-break, so a path that forgets it leaves a stale entry
+	 * that can flip a later collision decision (and leak the inbound count
+	 * toward maxInboundPeers). Listeners are detached first: the Peer's
+	 * 'close' fires on a later tick and must never act on a pubkey whose
+	 * registration has already moved on.
+	 */
+	private removeRegisteredPeer(pubkey: string, peer: Peer): void {
+		if (this.peers.get(pubkey) !== peer) return;
+		peer.removeAllListeners();
+		peer.disconnect();
+		this.peers.delete(pubkey);
+		this.clearStabilityTimer(pubkey);
+		if (this.inboundPeerSet.delete(pubkey)) {
+			this.inboundPeerCount--;
+		}
+		captureWireEvent('close', pubkey);
+		this.emit('peer:disconnect', pubkey);
+	}
+
+	/**
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
@@ -369,9 +385,7 @@ export class PeerManager extends EventEmitter {
 
 		const peer = this.peers.get(pubkey);
 		if (peer) {
-			peer.disconnect();
-			this.peers.delete(pubkey);
-			this.emit('peer:disconnect', pubkey);
+			this.removeRegisteredPeer(pubkey, peer);
 		}
 	}
 
@@ -652,24 +666,11 @@ export class PeerManager extends EventEmitter {
 				// AWAITING_REESTABLISH until a human forces a reconnect.
 				if (existing) {
 					// Tear the old connection down synchronously with our own
-					// bookkeeping. Its 'close' event fires on a later tick, so the
-					// normal close handler must be detached first or it would delete
-					// the replacement from the peer map and emit a spurious
-					// out-of-order peer:disconnect. disconnect() also strips the
-					// socket listeners, so the old Peer can never emit again.
-					existing.removeAllListeners();
-					existing.disconnect();
-					this.peers.delete(pubkey);
-					this.clearStabilityTimer(pubkey);
-					if (this.inboundPeerSet.has(pubkey)) {
-						this.inboundPeerCount--;
-						this.inboundPeerSet.delete(pubkey);
-					}
-					captureWireEvent('close', pubkey);
-					// Emitted before the replacement's peer:connect so channels are
-					// marked AWAITING_REESTABLISH first and the connect handler then
+					// bookkeeping. peer:disconnect is emitted before the
+					// replacement's peer:connect so channels are marked
+					// AWAITING_REESTABLISH first and the connect handler then
 					// re-drives channel_reestablish over the new connection.
-					this.emit('peer:disconnect', pubkey);
+					this.removeRegisteredPeer(pubkey, existing);
 				}
 
 				this.setupPeerListeners(pubkey, peer);
