@@ -221,6 +221,7 @@ export interface IChannelManagerConfig {
  * - 'channel:opened' (channelId: Buffer)
  * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
  * - 'channel:ready' (channelId: Buffer)
+ * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
  * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:closed' (channelId: Buffer)
@@ -3794,6 +3795,9 @@ export class ChannelManager extends EventEmitter {
 		// didn't fire announcement:depth), signal that signing is needed so
 		// LightningNode can trigger it with the funding private key.
 		const updated = channel.getFullState();
+		if (updated.shortChannelId) {
+			this.emit('channel:scid-assigned', msg.channelId, updated.shortChannelId);
+		}
 		if (
 			updated.announcementSigsReceived &&
 			!updated.announcementSigsSent &&
@@ -3840,6 +3844,14 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		this.processActions(peerPubkey, channel, actions);
+
+		// handleAnnouncementDepthReached is where the real SCID is first computed,
+		// for private channels too (it assigns before returning early on those).
+		// LightningNode needs it to accept forwards addressed by the SCID we publish.
+		const scid = channel.getFullState().shortChannelId;
+		if (scid) {
+			this.emit('channel:scid-assigned', channelId, scid);
+		}
 	}
 
 	private handleErrorMsg(_peerPubkey: string, payload: Buffer): void {

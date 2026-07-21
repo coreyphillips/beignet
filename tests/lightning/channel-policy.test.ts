@@ -562,12 +562,15 @@ describe('Channel Routing Policy (M3)', function () {
 					txIndex: 2,
 					outputIndex: 0
 				});
-				// Give both sides an SCID alias for the channel: bob addresses his
-				// direct update with it, carol matches it to her channel state.
+				// Models carol generating scidBC and sending it in channel_ready:
+				// carol keeps it as her own scidAlias, bob stores it as
+				// remoteScidAlias. BOLT 7 says bob's direct channel_update must name
+				// an alias RECEIVED from the peer, so bob addresses it with
+				// remoteScidAlias and carol matches it against her own.
 				bob
 					.getChannelManager()
 					.getChannel(bcChannelId)!
-					.getFullState().scidAlias = scidBC;
+					.getFullState().remoteScidAlias = scidBC;
 				carol
 					.getChannelManager()
 					.getChannel(bcChannelId)!
@@ -627,11 +630,12 @@ describe('Channel Routing Policy (M3)', function () {
 			bob.registerChannelScid(abChannelId, scidAB);
 			bob.registerChannelScid(bcChannelId, scidBC);
 			alice.registerChannelScid(abChannelId, scidAB);
-			// Charlie's hint names the SCID Bob forwards over
+			// Charlie's hint names the SCID Bob forwards over, which per BOLT 2 is
+			// the alias BOB generated and sent charlie, stored as remoteScidAlias.
 			charlie
 				.getChannelManager()
 				.getChannel(bcChannelId)!
-				.getFullState().scidAlias = scidBC;
+				.getFullState().remoteScidAlias = scidBC;
 
 			addGraphChannel(alice, scidAB, nodePubkey(1), nodePubkey(2));
 			return { alice, bob, charlie, bcChannelId };
@@ -707,10 +711,11 @@ describe('Channel Routing Policy (M3)', function () {
 					txIndex: 2,
 					outputIndex: 0
 				});
+				// Bob's direct channel_update names an alias received from the peer.
 				bob
 					.getChannelManager()
 					.getChannel(bcChannelId)!
-					.getFullState().scidAlias = scidBC;
+					.getFullState().remoteScidAlias = scidBC;
 
 				bob.setChannelPolicy(bcChannelId, {
 					feeBaseMsat: 5000,

@@ -109,6 +109,7 @@ import {
 	INVALID_ONION_BLINDING,
 	PERMANENT_CHANNEL_FAILURE,
 	UNKNOWN_NEXT_PEER,
+	REQUIRED_CHANNEL_FEATURE_MISSING,
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT,
 	TEMPORARY_CHANNEL_FAILURE,
@@ -215,7 +216,11 @@ import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
 import { createTaprootFundingScript } from '../script/funding-taproot';
-import { isTaprootChannel, isAnchorChannel } from '../channel/types';
+import {
+	isTaprootChannel,
+	isAnchorChannel,
+	hasScidAliasChannelType
+} from '../channel/types';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -840,6 +845,18 @@ export class LightningNode extends EventEmitter {
 			this.scidToChannelId.set(scidHex, channelId);
 		}
 
+		// Backfill real SCIDs for channels that were already open before this node
+		// learned to register them. Without this, an existing announced channel stays
+		// unforwardable until it is reopened. registerChannelScid persists the mapping,
+		// so this is a one-time repair rather than work repeated every boot.
+		for (const { state } of this.storage.loadAllChannels()) {
+			const scid = state.shortChannelId;
+			if (!scid || !state.channelId) continue;
+			if (!this.shouldAcceptRealScid(state)) continue;
+			if (this.scidToChannelId.has(scid.toString('hex'))) continue;
+			this.registerChannelScid(state.channelId, scid);
+		}
+
 		// Restore HTLC payment mappings
 		for (const {
 			key,
@@ -1169,8 +1186,21 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 		);
+		// The real SCID only exists once the funding reaches announcement depth,
+		// which is long after channel:ready. Register it the moment it is assigned
+		// so we can forward HTLCs addressed by the SCID we publish to the graph.
+		this.channelManager.on(
+			'channel:scid-assigned',
+			(channelId: Buffer, scid: Buffer) => {
+				const channel = this.channelManager.getChannel(channelId);
+				if (!channel || !this.shouldAcceptRealScid(channel.getFullState())) {
+					return;
+				}
+				this.registerChannelScid(channelId, scid);
+			}
+		);
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
-			this.registerChannelAliases(channelId);
+			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
 			this._stuckChannelTracker.delete(
@@ -4139,14 +4169,15 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Build and sign a channel_update for an UNANNOUNCED channel, addressed by
-	 * the real SCID once confirmed or else the alias we gave the peer (the SCID
-	 * it routes to us with, per option_scid_alias).
+	 * the SCID the peer routes to us with (see getPeerAddressableScid): the real
+	 * SCID once confirmed, or the alias the peer gave us, and never the real SCID
+	 * on an option_scid_alias channel.
 	 */
 	private buildDirectChannelUpdate(channelId: Buffer): Buffer | null {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return null;
 		const state = channel.getFullState();
-		const scid = state.shortChannelId ?? state.scidAlias;
+		const scid = this.getPeerAddressableScid(state);
 		if (!scid) return null;
 		const peerHex = this.channelManager.getPeerForChannel(channelId);
 		if (!peerHex) return null;
@@ -5160,7 +5191,15 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	private registerChannelAliases(channelId: Buffer): void {
+	/**
+	 * Register every short_channel_id by which a peer may address this channel when
+	 * asking us to FORWARD: both SCID aliases and, for announced channels, the real
+	 * confirmed SCID. Senders route from the public gossip graph, which carries the
+	 * real SCID, so without that entry every forward through us fails the lookup in
+	 * handleForward() and is failed back as unknown_next_peer while direct payments
+	 * (whose final hop payload has no short_channel_id at all) still succeed.
+	 */
+	private registerChannelScids(channelId: Buffer): void {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 
@@ -5175,6 +5214,61 @@ export class LightningNode extends EventEmitter {
 		if (remoteAlias) {
 			this.registerChannelScid(channelId, remoteAlias);
 		}
+
+		// Register the real confirmed SCID. Null until the funding reaches
+		// announcement depth, so this is also driven by 'channel:scid-assigned'.
+		const state = channel.getFullState();
+		if (state.shortChannelId && this.shouldAcceptRealScid(state)) {
+			this.registerChannelScid(channelId, state.shortChannelId);
+		}
+	}
+
+	/**
+	 * Whether incoming HTLCs may address this channel by its real SCID.
+	 *
+	 * BOLT 2 conditions this on the negotiated CHANNEL TYPE, not on
+	 * announce_channel: only when channel_type includes option_scid_alias must a
+	 * node refuse the real short_channel_id. Gating on announceChannel instead
+	 * would reject every private channel, including ones that never negotiated
+	 * option_scid_alias, and those are routinely addressed by their real SCID via
+	 * invoice route hints (buildRoutingHintForChannel prefers the real SCID over
+	 * the alias, so this node's own private invoices would be unpayable).
+	 *
+	 * An announced channel is unaffected: BOLT 2 forbids pairing option_scid_alias
+	 * with announce_channel, so an announced channel never trips this.
+	 */
+	private shouldAcceptRealScid(state: IChannelState): boolean {
+		return !hasScidAliasChannelType(state.channelType);
+	}
+
+	/**
+	 * The short_channel_id a PEER uses to address this channel when routing an
+	 * HTLC to us: the SCID for BOLT 11 r fields, blinded-path hops, and the
+	 * channel_update we send directly over an unannounced channel.
+	 *
+	 * The alias direction matters and is easy to get backwards. BOLT 2 says the
+	 * SENDER of an alias in channel_ready "MUST always recognize the alias as a
+	 * short_channel_id for incoming HTLCs to this channel", so the node that
+	 * generated an alias is the node that resolves it. Our peer therefore resolves
+	 * the alias IT generated and sent to us, which we store as remoteScidAlias.
+	 * Our own scidAlias is what WE resolve, so advertising it would name an SCID
+	 * the peer is not required to recognise. BOLT 2 matches this from the other
+	 * side: the receiver "MAY use any of the alias it received, in BOLT 11 r
+	 * fields".
+	 *
+	 * With option_scid_alias in channel_type the real SCID is not an option at
+	 * all: BOLT 2 says a node "MUST NOT use the real short_channel_id in BOLT 11 r
+	 * fields", and shouldAcceptRealScid means our own forwarding side would refuse
+	 * it anyway. Advertising it would hand payers a route we reject.
+	 *
+	 * Returns null when nothing addressable exists yet, which is correct: a hint
+	 * the peer cannot resolve is worse than no hint.
+	 */
+	private getPeerAddressableScid(state: IChannelState): Buffer | null {
+		if (hasScidAliasChannelType(state.channelType)) {
+			return state.remoteScidAlias;
+		}
+		return state.shortChannelId ?? state.remoteScidAlias;
 	}
 
 	// ─────────────── Gossip Propagation ───────────────
@@ -5401,11 +5495,11 @@ export class LightningNode extends EventEmitter {
 		if (!peerPubkeyHex) return null;
 
 		// SCID for the peer→us hop = the SCID the peer uses to forward HTLCs to
-		// us. Per option_scid_alias the alias WE sent in channel_ready is what
-		// the peer accepts for incoming HTLCs to us, so use the real SCID (once
-		// confirmed) or OUR own scidAlias — NOT remoteScidAlias (the peer's
-		// alias, which we use to route to them, the wrong direction).
-		const scid = state.shortChannelId || state.scidAlias;
+		// us, which is the real SCID once confirmed or else the alias the PEER
+		// generated and sent us. See getPeerAddressableScid: BOLT 2 makes the
+		// alias generator the alias resolver, so our own scidAlias is the wrong
+		// direction here.
+		const scid = this.getPeerAddressableScid(state);
 		if (!scid) return null;
 
 		const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
@@ -5518,7 +5612,8 @@ export class LightningNode extends EventEmitter {
 			if (!channelId) continue;
 			const peerPubkeyHex = this.channelManager.getPeerForChannel(channelId);
 			if (!peerPubkeyHex) continue;
-			const scid = state.shortChannelId || state.scidAlias;
+			// Same SCID selection as routing hints: the SCID the peer resolves.
+			const scid = this.getPeerAddressableScid(state);
 			if (!scid) continue;
 			const peerPubkey = Buffer.from(peerPubkeyHex, 'hex');
 
@@ -8416,14 +8511,9 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Record failure in MissionControl for future pathfinding
-		if (payment.route && payment.failureSourceIndex !== undefined) {
-			const failingHop = payment.route.hops[payment.failureSourceIndex];
-			if (failingHop) {
-				this.missionControl.recordFailure(
-					failingHop.shortChannelId.toString('hex'),
-					payment.amountMsat
-				);
-			}
+		const culpableScid = this.getCulpableHopScid(payment);
+		if (culpableScid) {
+			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
 
 		// Extract and apply embedded channel_update from failure data
@@ -8457,13 +8547,8 @@ export class LightningNode extends EventEmitter {
 			!this.isPermanentFailure(payment.failureCode)
 		) {
 			// Exclude the failing channel's SCID from future routes
-			if (payment.route && payment.failureSourceIndex !== undefined) {
-				const failingHop = payment.route.hops[payment.failureSourceIndex];
-				if (failingHop) {
-					retryCtx.excludedChannels.add(
-						failingHop.shortChannelId.toString('hex')
-					);
-				}
+			if (culpableScid) {
+				retryCtx.excludedChannels.add(culpableScid);
 			}
 
 			// First-hop diversification: also exclude previous first hop on retries
@@ -8516,6 +8601,50 @@ export class LightningNode extends EventEmitter {
 			this.persistChannel(channelId);
 		}
 		this.emit('payment:failed', payment);
+	}
+
+	/**
+	 * The short_channel_id to blame for a failed payment, or undefined when the
+	 * failure implicates a node rather than a channel.
+	 *
+	 * decryptFailureMessage returns the index of the ERRING HOP, and a route hop's
+	 * shortChannelId is the channel used to REACH that hop (see buildRoute in
+	 * pathfinding). The channel at fault is therefore the erring node's OUTGOING
+	 * one, hops[index + 1], not hops[index]. Blaming hops[index] penalises the
+	 * channel that worked, and for a failure at hop 0 that is our own channel to
+	 * our peer, which MissionControl then scores down and retries exclude,
+	 * eventually leaving no route at all.
+	 *
+	 * Channel-scoped failures are those carrying the UPDATE flag (0x1000), which by
+	 * definition describe the outgoing channel, plus the two BOLT 4 failures that
+	 * also describe the outgoing channel but carry no channel_update and therefore
+	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
+	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
+	 */
+	private getCulpableHopScid(payment: IPaymentInfo): string | undefined {
+		const index = payment.failureSourceIndex;
+		if (!payment.route || index === undefined) return undefined;
+		const code = payment.failureCode;
+		if (code === undefined) return undefined;
+
+		if (!this.isChannelScopedFailure(code)) return undefined;
+
+		// The final hop has no outgoing channel, so there is nothing to blame.
+		const outgoingHop = payment.route.hops[index + 1];
+		return outgoingHop?.shortChannelId.toString('hex');
+	}
+
+	/**
+	 * Whether an onion failure code describes the erring node's OUTGOING CHANNEL
+	 * (as opposed to the node itself, or the payment as seen by the final hop).
+	 */
+	private isChannelScopedFailure(code: number): boolean {
+		// NODE (0x2000) failures describe the node, never one of its channels.
+		if ((code & 0x2000) !== 0) return false;
+		if ((code & 0x1000) !== 0) return true;
+		return (
+			code === UNKNOWN_NEXT_PEER || code === REQUIRED_CHANNEL_FEATURE_MISSING
+		);
 	}
 
 	/**
@@ -8795,7 +8924,12 @@ export class LightningNode extends EventEmitter {
 	probeRoute(
 		destination: string,
 		amountSats: number
-	): { success: boolean; feeSats?: number; hops?: number } {
+	): {
+		success: boolean;
+		feeSats?: number;
+		hops?: number;
+		path?: Array<{ pubkey: string; shortChannelId: string }>;
+	} {
 		try {
 			const amountMsat = BigInt(amountSats) * 1000n;
 			const destBuf = Buffer.from(destination, 'hex');
@@ -8828,7 +8962,14 @@ export class LightningNode extends EventEmitter {
 			return {
 				success: true,
 				feeSats: Number(route.totalFeeMsat / 1000n),
-				hops: route.hops.length
+				hops: route.hops.length,
+				// A hop's shortChannelId is the channel used to REACH it, so this is
+				// exactly the set of SCIDs the onion will name. Surfacing them is what
+				// makes an unknown_next_peer diagnosable without reproducing it.
+				path: route.hops.map((h) => ({
+					pubkey: h.pubkey.toString('hex'),
+					shortChannelId: h.shortChannelId.toString('hex')
+				}))
 			};
 		} catch {
 			return { success: false };

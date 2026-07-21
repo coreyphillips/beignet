@@ -200,7 +200,13 @@ describe('Agent Review: Routing Hints', () => {
 		expect(hintPeers).to.include.members([bob.getNodeId(), carol.getNodeId()]);
 	});
 
-	it('should use scidAlias for private channels without confirmed SCID', () => {
+	it("should use the PEER's alias for private channels without confirmed SCID", () => {
+		// BOLT 2: the sender of an alias in channel_ready "MUST always recognize the
+		// alias as a short_channel_id for incoming HTLCs", so the peer resolves the
+		// alias IT generated, which we store as remoteScidAlias. Our own scidAlias
+		// is what WE resolve, so a hint naming it points at nothing the peer must
+		// honour. The two are set to different values here so the direction is
+		// actually proven rather than coincidentally satisfied.
 		const alice = createNode(308);
 		const bob = createNode(309);
 		connectNodes(alice, bob);
@@ -212,13 +218,14 @@ describe('Agent Review: Routing Hints', () => {
 		state.announceChannel = false;
 		state.shortChannelId = null;
 		state.scidAlias = Buffer.from('00000a0000050003', 'hex');
+		state.remoteScidAlias = Buffer.from('00000b0000060004', 'hex');
 
 		const inv = alice.createInvoice({ description: 'test', amountMsat: 1000n });
 		const decoded = decodeInvoice(inv.bolt11);
 		expect(decoded.routingHints).to.exist;
 		expect(decoded.routingHints!.length).to.equal(1);
 		expect(decoded.routingHints![0][0].shortChannelId.toString('hex')).to.equal(
-			'00000a0000050003'
+			'00000b0000060004'
 		);
 	});
 
