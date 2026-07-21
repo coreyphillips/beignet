@@ -923,9 +923,14 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
+			// A bare failure code cannot be acted on: the same code means very
+			// different things depending on WHICH hop returned it. Log the erring hop
+			// and the channel it was asked to forward over, so a route failure can be
+			// told apart from a destination failure without reproducing it.
 			this.log('warn', 'Payment failed', {
 				paymentHash: pi.paymentHash,
-				failureCode: pi.failureCode
+				failureCode: pi.failureCode,
+				...this.describeFailureSource(info)
 			});
 			this.emit('payment:failed', pi);
 		});
@@ -3821,6 +3826,43 @@ export class BeignetNode extends EventEmitter {
 		return { ok: true };
 	}
 
+	/**
+	 * Structured log fields naming the hop that returned an onion failure and the
+	 * channel it was asked to forward over. failureSourceIndex is the index of the
+	 * ERRING hop; a route hop's shortChannelId is the channel used to REACH it, so
+	 * the channel the hop could not use is the NEXT hop's. Empty when the route or
+	 * source index is unknown (an undecryptable failure, or a local send error).
+	 */
+	private describeFailureSource(p: IPaymentInfo): {
+		failureSourceIndex?: number;
+		failureSourceNode?: string;
+		failureOutgoingScid?: string;
+	} {
+		const index = p.failureSourceIndex;
+		if (index === undefined || !p.route) return {};
+
+		const fields: {
+			failureSourceIndex?: number;
+			failureSourceNode?: string;
+			failureOutgoingScid?: string;
+		} = { failureSourceIndex: index };
+
+		const erringHop = p.route.hops[index];
+		if (erringHop) {
+			fields.failureSourceNode = erringHop.pubkey.toString('hex');
+		}
+		const outgoingHop = p.route.hops[index + 1];
+		if (outgoingHop) {
+			try {
+				fields.failureOutgoingScid = formatScid(outgoingHop.shortChannelId);
+			} catch {
+				// Non-decodable SCID (e.g. a random alias), so hex is still useful.
+				fields.failureOutgoingScid = outgoingHop.shortChannelId.toString('hex');
+			}
+		}
+		return fields;
+	}
+
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			paymentHash: p.paymentHash.toString('hex'),
@@ -4621,8 +4663,21 @@ export class BeignetNode extends EventEmitter {
 	probeRoute(
 		destination: string,
 		amountSats: number
-	): { success: boolean; feeSats?: number; hops?: number } {
-		return this.node.probeRoute(destination, amountSats);
+	): {
+		success: boolean;
+		feeSats?: number;
+		hops?: number;
+		path?: Array<{ pubkey: string; shortChannelId: string }>;
+	} {
+		const result = this.node.probeRoute(destination, amountSats);
+		if (!result.path) return result;
+		return {
+			...result,
+			path: result.path.map((hop) => ({
+				pubkey: hop.pubkey,
+				shortChannelId: formatScid(Buffer.from(hop.shortChannelId, 'hex'))
+			}))
+		};
 	}
 
 	// ─────────────── Graph Queries ───────────────
