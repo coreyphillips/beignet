@@ -546,9 +546,12 @@ export class LightningNode extends EventEmitter {
 		) {
 			localFeatures.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
 		}
-		// option_wumbo: advertise large_channels only when explicitly enabled:
-		// the bit invites peers to propose > 2^24 sat fundings.
-		this.largeChannels = config.largeChannels ?? false;
+		// option_wumbo: advertise large_channels by default, matching LND, CLN and
+		// Eclair, which all default to wumbo. The bit only invites peers to propose
+		// > 2^24 sat fundings; the cap is lifted for a given peer only when wumbo is
+		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer still
+		// gets the 2^24 cap. Opt out with largeChannels: false.
+		this.largeChannels = config.largeChannels ?? true;
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
@@ -9249,10 +9252,11 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
+		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
+		// default (largeChannels defaults to true), so it is advertised unless
+		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.
+		//
 		// Defined in Feature but intentionally not advertised by default:
-		//  - LARGE_CHANNELS (18): advertised only when the largeChannels config
-		//    flag opts in (the constructor sets the bit); default keeps the
-		//    2^24 sat funding cap.
 		//  - ANCHOR_OUTPUTS (20): legacy anchors, superseded by bit 22 above.
 		//  - GOSSIP_QUERIES_EX (10): extended queries not implemented.
 		//  - UPFRONT_SHUTDOWN_SCRIPT (4): parsed from channel-open messages but
