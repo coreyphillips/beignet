@@ -8612,9 +8612,7 @@ export class Channel {
 			'max_htlc_value_in_flight_msat'
 		);
 		if (acceptV2MaxHtlcErr) {
-			return [
-				{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }
-			];
+			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
 		}
 
 		this._state.fundingVersion = 2;
