@@ -1628,10 +1628,79 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Established-channel messages that lead with a 32-byte channel_id and are
+	 * only ever valid from the peer that owns that channel. Dispatching one from
+	 * any other peer must be refused BEFORE it reaches the channel state machine:
+	 * several of these can drive the machine to emit a BOLT 1 error (a bad
+	 * commitment signature, a reestablish with next_commitment_number 0), which
+	 * now force-closes the channel. Resolving the channel globally by id would
+	 * let peer X close peer Y's channel with a single forged message. Opens and
+	 * interactive-tx messages are excluded: those resolve temporary channels, not
+	 * entries in `channels`, so this guard never matches them and their own
+	 * handlers keep their existing checks. ERROR/WARNING are excluded too, since
+	 * handleErrorMsg has its own BOLT 1 ownership and all-channels handling.
+	 */
+	private static readonly OWNED_CHANNEL_MESSAGES: ReadonlySet<number> =
+		new Set<number>([
+			MessageType.CHANNEL_READY,
+			MessageType.UPDATE_ADD_HTLC,
+			MessageType.UPDATE_FULFILL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+			MessageType.COMMITMENT_SIGNED,
+			MessageType.REVOKE_AND_ACK,
+			MessageType.UPDATE_FEE,
+			MessageType.UPDATE_BLOCKHEIGHT,
+			MessageType.SHUTDOWN,
+			MessageType.CLOSING_SIGNED,
+			MessageType.CLOSING_COMPLETE,
+			MessageType.CLOSING_SIG,
+			MessageType.CHANNEL_REESTABLISH,
+			MessageType.STFU,
+			MessageType.SPLICE,
+			MessageType.SPLICE_ACK,
+			MessageType.SPLICE_LOCKED,
+			MessageType.START_BATCH,
+			MessageType.ANNOUNCEMENT_SIGNATURES
+		]);
+
+	/**
+	 * Refuse an established-channel message that names a channel the sending
+	 * peer does not own. Only fires when the channel_id resolves to a permanent
+	 * channel bound to a DIFFERENT peer; unknown ids (temp/interactive opens,
+	 * post-splice ids not yet promoted) fall through to the handler, which does
+	 * its own resolution. Returns true when the message should be dropped.
+	 */
+	private isForeignChannelMessage(
+		peerPubkey: string,
+		type: number,
+		payload: Buffer
+	): boolean {
+		if (!ChannelManager.OWNED_CHANNEL_MESSAGES.has(type)) return false;
+		if (payload.length < 32) return false;
+		const idHex = payload.subarray(0, 32).toString('hex');
+		if (!this.channels.has(idHex)) return false;
+		const owner = this.channelPeers.get(idHex);
+		return owner !== undefined && owner !== peerPubkey;
+	}
+
+	/**
 	 * Central message dispatch handler.
 	 */
 	handleMessage(peerPubkey: string, type: number, payload: Buffer): void {
 		try {
+			if (this.isForeignChannelMessage(peerPubkey, type, payload)) {
+				// A peer quoting another peer's channel_id: drop it silently. BOLT 1
+				// only requires an error reply for our own closed/unknown channels,
+				// and replying here would leak that the channel exists and hand the
+				// sender a second way to provoke traffic about it.
+				this.emit(
+					'error',
+					payload.subarray(0, 32),
+					`Ignoring ${type} for a channel owned by another peer`
+				);
+				return;
+			}
 			switch (type) {
 				case MessageType.OPEN_CHANNEL:
 					this.handleOpenChannel(peerPubkey, payload);

@@ -27,6 +27,8 @@ import {
 	decodeErrorMessage,
 	encodeErrorMessage
 } from '../../src/lightning/message/error';
+import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { encodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 
 // ─── Helpers (model: errored-channel-backstops.test.ts) ───
 
@@ -205,6 +207,67 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 
 		// Bob quotes the Alice-Carol channel id in his error.
 		sendErrorToAlice(fx, carolChannelId);
+
+		const carolState = (fx.alice as any).channelManager
+			.getChannel(carolChannelId)
+			.getFullState().state;
+		expect(carolState).to.equal(ChannelState.NORMAL);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	it('ignores channel_reestablish for a channel owned by another peer', () => {
+		// The dangerous variant: a next_commitment_number of 0 drives
+		// handleReestablish into _failChannelWithWireError, which now
+		// force-closes. Bob must not be able to trigger that on Alice's channel
+		// with Carol by quoting its id.
+		const fx = setup(93);
+		const carol = createNode(95);
+		connectNodes(fx.alice, carol);
+		const carolChannelId = openReadyChannel(fx.alice, carol);
+
+		fx.alice.handlePeerMessage(
+			fx.bob.getNodeId(),
+			MessageType.CHANNEL_REESTABLISH,
+			encodeChannelReestablishMessage({
+				channelId: carolChannelId,
+				nextCommitmentNumber: 0n,
+				nextRevocationNumber: 0n,
+				yourLastPerCommitmentSecret: Buffer.alloc(32),
+				myCurrentPerCommitmentPoint: Buffer.alloc(33)
+			})
+		);
+
+		const carolState = (fx.alice as any).channelManager
+			.getChannel(carolChannelId)
+			.getFullState().state;
+		expect(carolState).to.equal(ChannelState.NORMAL);
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	it('ignores commitment_signed for a channel owned by another peer', () => {
+		// The generic route: a bad commitment signature drives
+		// _failChannelWithWireError → automatic force-close. The ownership
+		// boundary must protect that path, not only channel_reestablish.
+		const fx = setup(97);
+		const carol = createNode(99);
+		connectNodes(fx.alice, carol);
+		const carolChannelId = openReadyChannel(fx.alice, carol);
+
+		fx.alice.handlePeerMessage(
+			fx.bob.getNodeId(),
+			MessageType.COMMITMENT_SIGNED,
+			encodeCommitmentSignedMessage({
+				channelId: carolChannelId,
+				signature: Buffer.alloc(64),
+				htlcSignatures: []
+			})
+		);
 
 		const carolState = (fx.alice as any).channelManager
 			.getChannel(carolChannelId)
