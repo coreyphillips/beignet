@@ -9192,7 +9192,16 @@ export class LightningNode extends EventEmitter {
 		for (const channel of channels) {
 			const state = channel.getFullState();
 			const effectiveState = state.preReestablishState ?? state.state;
-			if (effectiveState !== ChannelState.NORMAL) continue;
+			// ERRORED is admitted for the on-chain claim backstop below: a failed
+			// channel is exactly the one whose peer cannot be trusted to resolve an
+			// HTLC we hold the preimage for, so disarming the backstop there is
+			// backwards. markForReestablish never wraps ERRORED, so the literal
+			// state is the whole story. dataLossDetected stays excluded: our
+			// commitment is provably stale and broadcasting it forfeits the whole
+			// balance to the justice path.
+			const errored =
+				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 
 			for (const [key, htlc] of state.htlcs) {
 				if (!key.startsWith('received-')) continue;
@@ -9241,6 +9250,12 @@ export class LightningNode extends EventEmitter {
 				)
 					continue;
 
+				// BOLT 2 forbids further updates once the channel has failed, so the
+				// off-chain fail below is for operational channels only. An inbound
+				// HTLC we cannot claim costs us nothing to leave: the upstream
+				// refunds itself via its HTLC-timeout once the commitment confirms.
+				if (errored) continue;
+
 				if (htlc.cltvExpiry - blockHeight <= this.htlcSafetyMargin) {
 					const channelId = state.channelId || state.temporaryChannelId;
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
@@ -9279,7 +9294,13 @@ export class LightningNode extends EventEmitter {
 
 		for (const channel of channels) {
 			const state = channel.getFullState();
-			if (state.state !== ChannelState.NORMAL) continue;
+			// ERRORED is admitted for the force-close path only: no further updates
+			// are allowed on a failed channel, so on-chain is the sole way to
+			// resolve a forwarded HTLC stuck on it. dataLossDetected must never
+			// broadcast; the peer's commitment resolves those channels.
+			const errored =
+				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+			if (state.state !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
 			for (const [key, htlc] of state.htlcs) {
@@ -9316,7 +9337,10 @@ export class LightningNode extends EventEmitter {
 					outgoingFailed = outHtlc?.state === HtlcState.FAILED;
 				}
 
-				if (outgoingFailed) {
+				// An errored inbound channel cannot carry the update_fail_htlc even
+				// when the outbound leg failed cleanly, so it always takes the
+				// force-close path below.
+				if (outgoingFailed && !errored) {
 					// Safe: complete the failure upstream off-chain.
 					const htlcSecretKey = `${channelId.toString('hex')}:${htlc.id}`;
 					const blindedRole = this.blindedIncomingHtlcs.get(htlcSecretKey);
@@ -9861,7 +9885,13 @@ export class LightningNode extends EventEmitter {
 		for (const channel of channels) {
 			const state = channel.getFullState();
 			const effectiveState = state.preReestablishState ?? state.state;
-			if (effectiveState !== ChannelState.NORMAL) continue;
+			// ERRORED is admitted so the force-close backstop below still guards an
+			// offered HTLC on a failed channel: the value is OURS, and the
+			// downstream can claim it with the preimage whether or not the channel
+			// is operational. dataLossDetected must never broadcast.
+			const errored =
+				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
 			for (const [key, htlc] of state.htlcs) {
@@ -9895,15 +9925,18 @@ export class LightningNode extends EventEmitter {
 				// On-chain backstop: if the peer has not signed away an offered HTLC
 				// well past its expiry, the downstream can still claim it with the
 				// preimage while we hold nothing. Force-close to claim the HTLC via
-				// the timeout path before that window closes.
-				if (
-					blockHeight >=
-					htlc.cltvExpiry + LightningNode.OFFERED_HTLC_FORCE_CLOSE_GRACE_BLOCKS
-				) {
+				// the timeout path before that window closes. The grace period only
+				// exists to give the off-chain fail a chance to complete; a failed
+				// channel has no off-chain path, so waiting would just extend the
+				// downstream's preimage-claim window for nothing.
+				const graceBlocks = errored
+					? 0
+					: LightningNode.OFFERED_HTLC_FORCE_CLOSE_GRACE_BLOCKS;
+				if (blockHeight >= htlc.cltvExpiry + graceBlocks) {
 					this.emit('node:error', {
 						code: 'HTLC_EXPIRY_FORCE_CLOSE',
 						channelId,
-						message: `offered HTLC ${htlc.id} still active ${LightningNode.OFFERED_HTLC_FORCE_CLOSE_GRACE_BLOCKS} blocks past expiry (${htlc.cltvExpiry}); force-closing to claim via timeout path`,
+						message: `offered HTLC ${htlc.id} still active ${graceBlocks} blocks past expiry (${htlc.cltvExpiry}); force-closing to claim via timeout path`,
 						timestamp: Date.now()
 					} as ILightningError);
 					this.channelManager.forceClose(
@@ -10336,6 +10369,7 @@ export class LightningNode extends EventEmitter {
 	 * Scan for channels stuck in intermediate states for too long.
 	 * AWAITING_FUNDING_CONFIRMED > 2016 blocks → abandon channel
 	 * SHUTTING_DOWN/NEGOTIATING_CLOSING > 1 hour (converted to blocks ~6/hr) → force-close
+	 * ERRORED with a funded channel > reestablishTimeoutBlocks → force-close
 	 */
 	private scanStuckChannels(blockHeight: number): void {
 		const channels = this.channelManager.listChannels();
@@ -10403,6 +10437,43 @@ export class LightningNode extends EventEmitter {
 								)} stuck in AWAITING_REESTABLISH for > ${
 									this.reestablishTimeoutBlocks
 								} blocks, force-closing`,
+								timestamp: Date.now()
+							} as ILightningError);
+						} catch {
+							// Ignore force-close errors
+						}
+					}
+				}
+			}
+
+			// A failed (ERRORED) channel: markErrored leaves resolution to the
+			// peer's force-close, but nothing guarantees the peer ever broadcasts
+			// (LND's ErrRecoveryError, for one, waits for US to close). Give it the
+			// same patience as a vanished peer, then broadcast our commitment to
+			// recover the funds. dataLossDetected never reaches here (skipped at the
+			// top), and a channel that died before funding broadcast has nothing on
+			// chain to close. HTLC-bearing errored channels are handled sooner by
+			// the HTLC scanners; this is the catch-all for the quiet ones.
+			if (state.state === ChannelState.ERRORED && state.fundingTxid) {
+				const erroredKey = `errored:${channelId.toString('hex')}`;
+				if (!this._stuckChannelTracker.has(erroredKey)) {
+					this._stuckChannelTracker.set(erroredKey, blockHeight);
+				} else {
+					const startHeight = this._stuckChannelTracker.get(erroredKey)!;
+					if (blockHeight - startHeight > this.reestablishTimeoutBlocks) {
+						try {
+							this.channelManager.forceClose(
+								channelId,
+								this.getSweepDestinationScript(),
+								this.resolveForceCloseFeeRatePerVbyte()
+							);
+							this._stuckChannelTracker.delete(erroredKey);
+							this.emit('node:error', {
+								code: 'ERRORED_TIMEOUT_FORCE_CLOSED',
+								channelId,
+								message: `Channel ${channelId.toString('hex')} ERRORED for > ${
+									this.reestablishTimeoutBlocks
+								} blocks with no close from the peer; force-closing to recover funds`,
 								timestamp: Date.now()
 							} as ILightningError);
 						} catch {
