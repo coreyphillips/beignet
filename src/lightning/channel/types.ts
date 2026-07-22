@@ -147,6 +147,28 @@ export interface IHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+
+	/**
+	 * RECEIVED entries: set once handleRevokeAndAck has handed this HTLC to the
+	 * node layer with an HTLC_FORWARDED action. The dispatch is edge-triggered
+	 * (once per HTLC), not level-triggered: an entry stays COMMITTED for as long
+	 * as the forward is in flight downstream, so without this marker every later
+	 * revoke_and_ack on the channel re-dispatches it and the node layer offers a
+	 * duplicate outgoing HTLC for one inbound payment.
+	 *
+	 * Persisted, because the node layer has no dedup of its own: an unpersisted
+	 * marker would re-dispatch every in-flight HTLC on each restart and offer a
+	 * duplicate outgoing one. The cost is that the marker reaches disk before the
+	 * node layer has acted, so a restart in that window would strand the HTLC.
+	 * LightningNode.redispatchUnresolvedReceivedHtlcs closes that window on
+	 * startup by re-dispatching committed received HTLCs that have no durable
+	 * resolution in flight.
+	 *
+	 * Optional: absent (legacy persisted states and hand-built fixtures) means
+	 * "not yet dispatched", so an entry written before this field existed is
+	 * dispatched by the next revoke_and_ack rather than being skipped forever.
+	 */
+	forwardEmitted?: boolean;
 }
 
 /**
