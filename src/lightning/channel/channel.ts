@@ -3595,18 +3595,15 @@ export class Channel {
 		// exactly as a splice_locked exchange would — the peer's signatures are
 		// over commitment N regardless of whether splice_locked ever crossed).
 		//
-		// Judged by EFFECTIVE state: the production shape of "peer vanished" is
-		// a disconnect wrapping SPLICING in AWAITING_REESTABLISH (that is where
-		// the chain watcher records the confirmation it could not announce),
-		// and the reestablish-timeout auto-close arrives in exactly that state.
-		const spliceEffState =
-			this._state.state === ChannelState.AWAITING_REESTABLISH
-				? this._state.preReestablishState
-				: this._state.state;
-		if (
-			spliceEffState === ChannelState.SPLICING &&
-			this._state.spliceInFlight?.confirmed === true
-		) {
+		// Judged by the CONFIRMED record alone, never by channel state: the
+		// production shapes are a disconnect wrapping SPLICING in
+		// AWAITING_REESTABLISH (where the chain watcher records the confirmation
+		// it could not announce), and a BOLT 1 error landing mid-splice, where
+		// markErrored has already replaced SPLICING with ERRORED by the time the
+		// close is driven. A state-based gate would skip adoption in the latter
+		// and broadcast against the spent pre-splice funding.
+		const preAdoptionState = this._state.state;
+		if (this._state.spliceInFlight?.confirmed === true) {
 			// Capture the adoption target BEFORE completeSplice nulls the record.
 			const expectedTxid = Buffer.from(this._state.spliceInFlight.spliceTxid);
 			const expectedOutputIndex =
@@ -3631,7 +3628,12 @@ export class Channel {
 					}
 				];
 			}
-			if (this._state.state === ChannelState.NORMAL) {
+			if (preAdoptionState === ChannelState.ERRORED) {
+				// completeSplice restores NORMAL exactly as a splice_locked
+				// exchange would; a channel failed by a BOLT 1 error stays failed.
+				this._state.state = ChannelState.ERRORED;
+				this._state.preReestablishState = null;
+			} else if (this._state.state === ChannelState.NORMAL) {
 				// Adoption succeeded from inside the reestablish wrapper: the
 				// wrapper's return-to state no longer exists.
 				this._state.preReestablishState = null;

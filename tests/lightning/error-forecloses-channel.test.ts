@@ -175,13 +175,61 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 		fx.bob.destroy();
 	});
 
-	it('leaves every channel alone on a connection-wide error', () => {
+	it('fails every channel with the sender on an all-zero error, and only those', () => {
+		// BOLT 1: an all-zero channel_id refers to ALL channels with the
+		// sending node, each of which must be failed.
 		const fx = setup(75);
+		const secondChannelId = openReadyChannel(fx.alice, fx.bob);
+		const carol = createNode(85);
+		connectNodes(fx.alice, carol);
+		const carolChannelId = openReadyChannel(fx.alice, carol);
+		const stateOf = (id: Buffer): ChannelState =>
+			(fx.alice as any).channelManager.getChannel(id).getFullState().state;
 
 		sendErrorToAlice(fx, Buffer.alloc(32));
 
-		expect(fx.aliceState()).to.equal(ChannelState.NORMAL);
+		expect(fx.aliceState()).to.equal(ChannelState.FORCE_CLOSED);
+		expect(stateOf(secondChannelId)).to.equal(ChannelState.FORCE_CLOSED);
+		// A control channel with an unrelated peer must be untouched.
+		expect(stateOf(carolChannelId)).to.equal(ChannelState.NORMAL);
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	it('ignores an error quoting a channel id the sender does not own', () => {
+		const fx = setup(87);
+		const carol = createNode(89);
+		connectNodes(fx.alice, carol);
+		const carolChannelId = openReadyChannel(fx.alice, carol);
+
+		// Bob quotes the Alice-Carol channel id in his error.
+		sendErrorToAlice(fx, carolChannelId);
+
+		const carolState = (fx.alice as any).channelManager
+			.getChannel(carolChannelId)
+			.getFullState().state;
+		expect(carolState).to.equal(ChannelState.NORMAL);
 		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	it('reports a failed force-close instead of claiming the channel closed', () => {
+		const fx = setup(91);
+		const mgr = (fx.alice as any).channelManager;
+		mgr.forceClose = (): { ok: boolean; actions: []; error: string } => ({
+			ok: false,
+			actions: [],
+			error: 'no usable remote commitment signature'
+		});
+
+		sendErrorToAlice(fx, fx.channelId);
+
+		expect(fx.events).to.include('CHANNEL_FAILED_FORCE_CLOSE_FAILED');
+		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		expect(fx.aliceState()).to.equal(ChannelState.ERRORED);
 		fx.alice.destroy();
 		fx.bob.destroy();
 	});

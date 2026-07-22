@@ -3040,7 +3040,14 @@ export class ChannelManager extends EventEmitter {
 			// and say so instead of claiming the channel is unknown, since this
 			// text is often the only diagnostic the peer's operator sees.
 			const failedNotClosed = deadState === ChannelState.ERRORED;
-			if (failedNotClosed) {
+			// Only the channel's own peer may trigger the close: a reestablish
+			// quoting another peer's channel id still gets the error reply, but
+			// must not drive a broadcast.
+			const senderOwnsIt =
+				channel !== undefined &&
+				this.getPeerForChannel(channel.getChannelId() || msg.channelId) ===
+					peerPubkey;
+			if (failedNotClosed && senderOwnsIt) {
 				this.emit(
 					'channel:errored',
 					channel!.getChannelId() || msg.channelId,
@@ -3873,46 +3880,70 @@ export class ChannelManager extends EventEmitter {
 		}
 	}
 
-	private handleErrorMsg(_peerPubkey: string, payload: Buffer): void {
+	private handleErrorMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');
+		const errorText = msg.data.toString('utf8');
 
-		// Clean up temp channel if this error references one
-		if (this.tempChannels.has(channelIdHex)) {
+		// BOLT 1: an all-zero (or absent) channel_id refers to ALL channels with
+		// the sending node, and every one of them must be failed. Only the
+		// sender's own channels: an error from one peer must never touch a
+		// channel belonging to another.
+		const isConnectionWide =
+			msg.channelId.length === 0 || msg.channelId.every((b) => b === 0);
+		if (isConnectionWide) {
+			for (const channel of this.getChannelsByPeer(peerPubkey)) {
+				this.failChannelByError(channel, `Remote error: ${errorText}`);
+			}
+			// Unfunded negotiations with this peer die too; nothing is on chain,
+			// so they are simply forgotten.
+			for (const tempId of [...this.tempChannels.keys()]) {
+				if (this.channelPeers.get(tempId) !== peerPubkey) continue;
+				this.tempChannels.delete(tempId);
+				this.channelPeers.delete(tempId);
+			}
+			this.emit('error', msg.channelId, `Remote error: ${errorText}`);
+			return;
+		}
+
+		// Clean up a temp channel if this error references one the sender owns
+		if (
+			this.tempChannels.has(channelIdHex) &&
+			this.channelPeers.get(channelIdHex) === peerPubkey
+		) {
 			this.tempChannels.delete(channelIdHex);
 			this.channelPeers.delete(channelIdHex);
 		}
 
-		// BOLT 1: an error referencing a specific channel means fail that channel.
-		// Mark it ERRORED so we stop sending channel_reestablish for it on every
-		// reconnect (which the peer just rejects again → disconnect storm). An
-		// all-zeroes channel_id is a connection-level error, not channel-specific,
-		// so we leave channels untouched in that case.
-		const isConnectionWide =
-			msg.channelId.length === 0 || msg.channelId.every((b) => b === 0);
+		// BOLT 1: an error referencing a specific channel means fail that
+		// channel, provided it belongs to the sender: a peer must not be able to
+		// fail another peer's channel by quoting its id. While a tx_abort
+		// exchange for a forgotten splice is pending, the peer's error is part
+		// of that dance (CLN's channeld errors/restarts around it) — failing the
+		// channel here would kill it right before it recovers.
 		const channel = this.channels.get(channelIdHex);
-		// While a tx_abort exchange for a forgotten splice is pending, the peer's
-		// error is part of that dance (CLN's channeld errors/restarts around it) —
-		// failing the channel here would kill it right before it recovers.
+		const senderOwnsIt = this.channelPeers.get(channelIdHex) === peerPubkey;
 		const inAbortDance = channel?.isSpliceAbortPending() ?? false;
-		const errorText = msg.data.toString('utf8');
-		if (
-			!isConnectionWide &&
-			channel &&
-			!inAbortDance &&
-			channel.markErrored()
-		) {
-			const channelId = channel.getChannelId() || msg.channelId;
-			this.emit('channel:persist', channelId);
-			// BOLT 1: the receiver of an error MUST fail the channel it names.
-			// ERRORED alone leaves that to the peer's broadcast, which may never
-			// come (LND's ErrRecoveryError explicitly waits for us to close). The
-			// node drives the actual force-close: it owns the sweep script and
-			// fee estimate, and it must skip dataLossDetected channels.
-			this.emit('channel:errored', channelId, `Remote error: ${errorText}`);
+		if (channel && senderOwnsIt && !inAbortDance) {
+			this.failChannelByError(channel, `Remote error: ${errorText}`);
 		}
 
 		this.emit('error', msg.channelId, `Remote error: ${errorText}`);
+	}
+
+	/**
+	 * Fail a channel per BOLT 1 error handling: mark it ERRORED, persist, and
+	 * hand the on-chain close to the node via channel:errored. ERRORED alone
+	 * would leave resolution to the peer's broadcast, which may never come
+	 * (LND's ErrRecoveryError explicitly waits for us to close). The node
+	 * drives the actual force-close: it owns the sweep script and fee
+	 * estimate, and it skips dataLossDetected channels.
+	 */
+	private failChannelByError(channel: Channel, reason: string): void {
+		if (!channel.markErrored()) return;
+		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		this.emit('channel:persist', channelId);
+		this.emit('channel:errored', channelId, reason);
 	}
 
 	private handleWarningMsg(_peerPubkey: string, payload: Buffer): void {

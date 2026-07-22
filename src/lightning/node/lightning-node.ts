@@ -9187,6 +9187,28 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
+		const result = this.channelManager.forceClose(
+			channelId,
+			this.getSweepDestinationScript(),
+			this.resolveForceCloseFeeRatePerVbyte()
+		);
+		if (!result.ok) {
+			// Say what actually happened: the channel is still ERRORED and
+			// nothing was broadcast. Claiming a close here would point an
+			// operator away from the real problem.
+			this.emit('node:error', {
+				code: 'CHANNEL_FAILED_FORCE_CLOSE_FAILED',
+				channelId,
+				message: `channel failed (${reason}); unable to force-close: ${result.error}`,
+				timestamp: Date.now()
+			} as ILightningError);
+			this.emitStructuredLog('channel', 'errored_force_close_failed', {
+				channelId: channelId.toString('hex'),
+				reason,
+				error: result.error
+			});
+			return;
+		}
 		this.emit('node:error', {
 			code: 'CHANNEL_FAILED_FORCE_CLOSED',
 			channelId,
@@ -9197,11 +9219,6 @@ export class LightningNode extends EventEmitter {
 			channelId: channelId.toString('hex'),
 			reason
 		});
-		this.channelManager.forceClose(
-			channelId,
-			this.getSweepDestinationScript(),
-			this.resolveForceCloseFeeRatePerVbyte()
-		);
 	}
 
 	/**
