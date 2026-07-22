@@ -297,6 +297,23 @@ const GOSSIP_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
 const HELD_HTLC_EXPIRY_MARGIN = 18;
 
 /**
+ * Largest block-height overshoot we will act on from a peer's
+ * incorrect_or_unknown_payment_details. A final node a block or two ahead of us is
+ * ordinary propagation skew, but believing an unbounded claim would let a peer
+ * inflate the CLTV expiry of everything we send, so cap it to a realistic window.
+ */
+const MAX_TRUSTED_PEER_HEIGHT_SKEW = 6;
+
+/**
+ * Blocks of padding added to the final CLTV delta of an outgoing payment, on top
+ * of whatever the payee advertised. We apply that delta against OUR block height,
+ * so when our height is briefly behind the payee's the unpadded expiry lands below
+ * what a strict payee accepts and the payment fails permanently. Mirrors LND's
+ * BlockPadding.
+ */
+const FINAL_CLTV_EXPIRY_PADDING = 3;
+
+/**
  * Fallback sat/vB feerate for a force-close package when we have no live fee data
  * at all (no fee estimator / no samples). Matches the historical default so nodes
  * without a fee estimator behave exactly as before.
@@ -348,6 +365,13 @@ export class LightningNode extends EventEmitter {
 	private chainWatcher: ChainWatcher | null = null;
 	private _chainWatcherEventsWired = false;
 	private currentBlockHeight = 0;
+	/**
+	 * Highest block height a final node has reported to us in a failure, when it
+	 * was ahead of our own. Used ONLY to raise the CLTV expiry we send (see
+	 * cltvBaseHeight), never as our view of the chain: letting a peer advance
+	 * currentBlockHeight would drive on-chain timeout and force-close decisions.
+	 */
+	private peerReportedBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
@@ -4777,7 +4801,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const ourNodeId = getPublicKey(this.nodePrivkey);
-		const finalCltvExpiry = DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		// The toChannel peer charges its forwarding fee on the amount it relays
 		// to us, and needs its CLTV delta of headroom above our final expiry.
 		const toPeerFeeMsat = calculateFee(
@@ -6310,8 +6334,9 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		const finalCltvExpiry =
-			invoice.minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		const finalCltvExpiry = this.paddedFinalCltvExpiry(
+			invoice.minFinalCltvExpiry
+		);
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
 		// Route blinding: if the invoice advertises blinded paths, route through
@@ -6475,7 +6500,7 @@ export class LightningNode extends EventEmitter {
 		// outgoing_cltv_value on the wire must be ABSOLUTE (current block height +
 		// accumulated delta), otherwise the final node rejects the HTLC as
 		// "cltv expiry too soon" (incorrect_or_unknown_payment_details).
-		const baseHeight = this.currentBlockHeight;
+		const baseHeight = this.cltvBaseHeight();
 
 		// Convert route hops to onion hop payloads.
 		// For intermediate hops: the payload tells the hop what to FORWARD (next hop's
@@ -6623,6 +6648,55 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Final CLTV delta to send an outgoing payment with, given the payee's
+	 * advertised min_final_cltv_expiry_delta (or our default when it advertised
+	 * none), plus padding for block-height skew. See FINAL_CLTV_EXPIRY_PADDING.
+	 */
+	private paddedFinalCltvExpiry(minFinalCltvExpiry?: number): number {
+		return (
+			(minFinalCltvExpiry ?? DEFAULT_MIN_FINAL_CLTV_EXPIRY) +
+			FINAL_CLTV_EXPIRY_PADDING
+		);
+	}
+
+	/**
+	 * Block height to convert relative route CLTV deltas into absolute wire values.
+	 *
+	 * Normally our own height, but a final node that already failed a payment for
+	 * being ahead of us has told us its height, and sending against our stale view
+	 * again would fail identically. Taking the max only ever raises the expiry,
+	 * which is the safe direction.
+	 */
+	private cltvBaseHeight(): number {
+		return Math.max(this.currentBlockHeight, this.peerReportedBlockHeight);
+	}
+
+	/**
+	 * Recognise the transient half of the overloaded PERM|15 failure: a final node
+	 * rejecting our expiry because its block height is ahead of ours, rather than
+	 * because the payment hash is unknown. Records the reported height so a retry
+	 * is built against it, and reports whether the failure is worth retrying.
+	 */
+	private noteHeightSkewFailure(
+		failureCode?: number,
+		failureData?: Buffer
+	): boolean {
+		if (failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) return false;
+		// [u64 htlc_msat][u32 height]; older peers may send it empty.
+		if (!failureData || failureData.length < 12) return false;
+
+		const reportedHeight = failureData.readUInt32BE(8);
+		const skew = reportedHeight - this.currentBlockHeight;
+		if (skew <= 0 || skew > MAX_TRUSTED_PEER_HEIGHT_SKEW) return false;
+
+		this.peerReportedBlockHeight = Math.max(
+			this.peerReportedBlockHeight,
+			reportedHeight
+		);
+		return true;
+	}
+
+	/**
 	 * Send a keysend (spontaneous) payment — bLIP-0003.
 	 *
 	 * The sender generates a random preimage, includes it in the final hop
@@ -6665,7 +6739,7 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		const finalCltvExpiry = DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
 		const route = findRoute(
@@ -6698,7 +6772,7 @@ export class LightningNode extends EventEmitter {
 
 		const hops = route.hops;
 		// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
-		const baseHeight = this.currentBlockHeight;
+		const baseHeight = this.cltvBaseHeight();
 
 		// Build onion hop payloads — final hop gets keysend TLV
 		const keysendRecords = new Map<number, Buffer>();
@@ -6870,7 +6944,7 @@ export class LightningNode extends EventEmitter {
 			const hops = partRoute.hops;
 			if (hops.length === 0) continue;
 			// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
-			const baseHeight = this.currentBlockHeight;
+			const baseHeight = this.cltvBaseHeight();
 
 			// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
 			const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
@@ -7161,10 +7235,16 @@ export class LightningNode extends EventEmitter {
 				});
 				return fail(FINAL_INCORRECT_CLTV_EXPIRY);
 			}
-			// expiry-too-soon: the cltv_expiry must leave at least min_final_cltv
-			// blocks, or we could reveal the preimage yet fail to claim on-chain in
-			// time. Reported as INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS (avoid leaking
-			// which condition failed).
+			// expiry-too-soon. BOLT 4 is explicit here: "if incoming cltv_expiry <
+			// current_block_height + min_final_cltv_expiry_delta: MUST fail the
+			// HTLC". We advertise DEFAULT_MIN_FINAL_CLTV_EXPIRY, so that is what we
+			// enforce, and relaxing it would both break conformance and leave us
+			// short of the headroom we need to win an on-chain claim race.
+			//
+			// This condition is transient when it is simply block-height skew, so
+			// the failure carries our height (see incorrectPaymentDetailsData) and
+			// the SENDER is responsible for noticing and retrying. Do not "fix" a
+			// skew-induced failure by lowering this bound.
 			if (
 				this.currentBlockHeight > 0 &&
 				incomingCltvExpiry <
@@ -8571,9 +8651,21 @@ export class LightningNode extends EventEmitter {
 			payment.failureReason = 'Peer failed the HTLC with an empty reason';
 		}
 
-		// Record failure in MissionControl for future pathfinding
+		// PERM|15 is overloaded, so the PERM bit alone does not mean "give up":
+		// BOLT 4 returns the final node's height precisely so we can spot the
+		// transient case, where it rejected our expiry only because it is ahead of
+		// us. This records that height so the retry below is built against it
+		// rather than repeating the same stale expiry.
+		const heightSkew = this.noteHeightSkewFailure(
+			payment.failureCode,
+			failureData
+		);
+
+		// Record failure in MissionControl for future pathfinding. Skipped for
+		// height skew: no channel misbehaved, our expiry was stale, so penalising
+		// the route would degrade pathfinding over an innocent channel.
 		const culpableScid = this.getCulpableHopScid(payment);
-		if (culpableScid) {
+		if (culpableScid && !heightSkew) {
 			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
 
@@ -8599,21 +8691,25 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Attempt payment retry for temporary failures
+		// Attempt payment retry for temporary failures, plus the height-skew case
+		// detected above.
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
 		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
 		if (
 			retryCtx &&
 			retryCtx.retryCount < maxRetries &&
-			!this.isPermanentFailure(payment.failureCode)
+			(heightSkew || !this.isPermanentFailure(payment.failureCode))
 		) {
-			// Exclude the failing channel's SCID from future routes
-			if (culpableScid) {
+			// Exclude the failing channel's SCID from future routes. Skipped for
+			// height skew: the route is fine, our expiry was stale, and banning a
+			// healthy channel would push the retry onto a worse path.
+			if (culpableScid && !heightSkew) {
 				retryCtx.excludedChannels.add(culpableScid);
 			}
 
 			// First-hop diversification: also exclude previous first hop on retries
 			if (
+				!heightSkew &&
 				retryCtx.retryCount > 0 &&
 				payment.route &&
 				payment.route.hops.length > 0
@@ -9771,7 +9867,7 @@ export class LightningNode extends EventEmitter {
 
 		const destination = invoice.nodeId;
 		const amountMsat = invoice.amount;
-		const finalCltvExpiry = DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
 		// Route blinding: BOLT 12 invoices natively carry blinded payment paths.

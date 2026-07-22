@@ -13,7 +13,10 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { Network } from '../../src/lightning/invoice/types';
+import {
+	Network,
+	DEFAULT_MIN_FINAL_CLTV_EXPIRY
+} from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -208,5 +211,140 @@ describe('incorrect_or_unknown_payment_details carries htlc_msat and height', ()
 		expect(data.readUInt32BE(8), 'our block height').to.equal(800_000);
 
 		node.destroy();
+	});
+});
+
+/**
+ * Regression: a payment failed permanently with incorrect_or_unknown_payment_details
+ * whenever the recipient's block height was even one block ahead of the sender's.
+ *
+ * The sender builds the final expiry as senderHeight + min_final_cltv_expiry, and the
+ * receiver MUST reject anything below receiverHeight + min_final_cltv_expiry_delta.
+ * Together those require senderHeight >= receiverHeight. The receiver side is what
+ * BOLT 4 mandates, so the fix belongs on the sender: pad the delta, and treat a
+ * PERM|15 whose reported height is ahead of ours as transient instead of fatal.
+ *
+ * Note these tests set real block heights via handleNewBlock(). The receiver check
+ * is guarded by `currentBlockHeight > 0`, so a test that leaves the height at 0
+ * (as the rest of the suite does) never exercises this path at all.
+ */
+describe('Block-height skew is handled by the sender, not by relaxing the check', () => {
+	function safetyCheck(
+		node: LightningNode,
+		incomingCltvExpiry: number
+	): Buffer | null {
+		return (
+			node as unknown as {
+				finalHopSafetyFailure: (...a: unknown[]) => Buffer | null;
+			}
+		).finalHopSafetyFailure(
+			undefined,
+			{ amountToForwardMsat: 1000n, outgoingCltvValue: 0 },
+			incomingCltvExpiry,
+			1000n,
+			'ab'.repeat(32)
+		);
+	}
+
+	// BOLT 4: "if incoming cltv_expiry < current_block_height +
+	// min_final_cltv_expiry_delta: MUST fail the HTLC". We advertise
+	// DEFAULT_MIN_FINAL_CLTV_EXPIRY, so we enforce exactly that.
+	it('enforces the full advertised min_final_cltv_expiry_delta', () => {
+		const node = makeNode();
+		node.handleNewBlock(800_000);
+		const threshold = 800_000 + DEFAULT_MIN_FINAL_CLTV_EXPIRY;
+		expect(safetyCheck(node, threshold), 'at the boundary').to.be.null;
+		expect(safetyCheck(node, threshold - 1), 'one short').to.not.be.null;
+		node.destroy();
+	});
+
+	it('pads the final CLTV delta on outgoing payments', () => {
+		const node = makeNode();
+		const padded = (
+			node as unknown as { paddedFinalCltvExpiry: (m?: number) => number }
+		).paddedFinalCltvExpiry.bind(node);
+		expect(padded(40), 'advertised delta is padded').to.be.greaterThan(40);
+		expect(padded(), 'default delta is padded').to.be.greaterThan(
+			DEFAULT_MIN_FINAL_CLTV_EXPIRY
+		);
+		node.destroy();
+	});
+
+	describe('noteHeightSkewFailure', () => {
+		function note(node: LightningNode, code: number, data?: Buffer): boolean {
+			return (
+				node as unknown as {
+					noteHeightSkewFailure: (c?: number, d?: Buffer) => boolean;
+				}
+			).noteHeightSkewFailure(code, data);
+		}
+
+		function failureData(amountMsat: bigint, height: number): Buffer {
+			const buf = Buffer.alloc(12);
+			buf.writeBigUInt64BE(amountMsat, 0);
+			buf.writeUInt32BE(height, 8);
+			return buf;
+		}
+
+		it('treats a final node ahead of us as transient and raises our CLTV base', () => {
+			const node = makeNode();
+			node.handleNewBlock(800_000);
+			expect(
+				note(
+					node,
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					failureData(1000n, 800_002)
+				)
+			).to.be.true;
+			// Later sends must build against the height the payee reported, or the
+			// retry would repeat the same stale expiry and fail identically.
+			const base = (
+				node as unknown as { cltvBaseHeight: () => number }
+			).cltvBaseHeight.call(node);
+			expect(base).to.equal(800_002);
+			node.destroy();
+		});
+
+		it('does not treat an unknown payment hash as transient', () => {
+			const node = makeNode();
+			node.handleNewBlock(800_000);
+			// Same code, but the payee is at or behind us: nothing to re-sync, so
+			// this is the genuinely permanent half of PERM|15.
+			expect(
+				note(
+					node,
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					failureData(1000n, 800_000)
+				)
+			).to.be.false;
+			node.destroy();
+		});
+
+		it('ignores an implausible height claim', () => {
+			const node = makeNode();
+			node.handleNewBlock(800_000);
+			// A peer must not be able to inflate every expiry we send.
+			expect(
+				note(
+					node,
+					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					failureData(1000n, 900_000)
+				)
+			).to.be.false;
+			expect(
+				(
+					node as unknown as { cltvBaseHeight: () => number }
+				).cltvBaseHeight.call(node)
+			).to.equal(800_000);
+			node.destroy();
+		});
+
+		it('ignores a peer that omits the height field', () => {
+			const node = makeNode();
+			node.handleNewBlock(800_000);
+			expect(note(node, INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS, Buffer.alloc(0)))
+				.to.be.false;
+			node.destroy();
+		});
 	});
 });

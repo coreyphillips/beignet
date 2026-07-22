@@ -657,6 +657,89 @@ describe('Keysend: Receive Keysend', () => {
 	});
 });
 
+// ────────── Section 4b: Block-height skew (regression) ──────────
+
+/**
+ * A payment used to fail permanently with incorrect_or_unknown_payment_details
+ * (0x4000 | 15) whenever the receiver's block height was ahead of the sender's:
+ * the sender builds the final expiry from ITS height, while the receiver demanded
+ * a full min_final_cltv_expiry against ITS OWN height.
+ *
+ * Every other test in this file leaves the height at 0, and the receiver check is
+ * guarded by `currentBlockHeight > 0`, so without handleNewBlock() below this code
+ * path is never exercised.
+ */
+describe('Keysend: block-height skew between sender and receiver', () => {
+	// Sender padding absorbs skew up to FINAL_CLTV_EXPIRY_PADDING with no
+	// round trip at all. The receiver still enforces its full advertised
+	// min_final_cltv_expiry_delta, per BOLT 4.
+	for (const skew of [0, 1, 2, 3]) {
+		it(`keysend settles outright with the receiver ${skew} block(s) ahead`, () => {
+			const { alice, bob } = setupKeysendPair(760 + skew * 2, 761 + skew * 2);
+			alice.handleNewBlock(800_000);
+			bob.handleNewBlock(800_000 + skew);
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+
+			const result = alice.sendKeysend({
+				destination: Buffer.from(bob.getNodeId(), 'hex'),
+				amountMsat: 50000n
+			});
+
+			expect(result.failureCode, 'no onion failure').to.be.undefined;
+			expect(result.status).to.equal(PaymentStatus.COMPLETED);
+			expect(received, 'receiver accepted the keysend').to.be.true;
+		});
+	}
+
+	it('an invoice payment beyond the padding is retried, not abandoned', () => {
+		const { alice, bob } = setupKeysendPair(790, 791);
+		alice.handleNewBlock(800_000);
+		bob.handleNewBlock(800_005); // beyond the sender padding
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50000n,
+			description: 'skew'
+		});
+		const result = alice.sendPayment(invoice.bolt11);
+
+		// The first attempt is rejected with PERM|15. Because the failure carries
+		// bob's height, alice recognises the transient case and retries against it
+		// instead of treating the PERM bit as fatal. The retry registers a fresh
+		// record for the same hash, so read that rather than the stale handle.
+		const settled = alice
+			.listPayments()
+			.find((p) => p.paymentHash.equals(result.paymentHash));
+		expect(settled, 'payment record exists').to.not.be.undefined;
+		expect(settled!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled!.retryCount, 'took a retry to settle').to.be.greaterThan(0);
+	});
+
+	it('a keysend beyond the padding teaches us the payee height', () => {
+		const { alice, bob } = setupKeysendPair(794, 795);
+		alice.handleNewBlock(800_000);
+		bob.handleNewBlock(800_004); // beyond the sender padding
+
+		// Keysend has no retry context (each attempt derives a fresh preimage), so
+		// this attempt fails, but the reported height is recorded...
+		const first = alice.sendKeysend({
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n
+		});
+		expect(first.status).to.equal(PaymentStatus.FAILED);
+
+		// ...so the next one is built against bob's height and settles.
+		const second = alice.sendKeysend({
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n
+		});
+		expect(second.status).to.equal(PaymentStatus.COMPLETED);
+	});
+});
+
 // ─────────────── Section 5: BeignetNode Wrappers ───────────────
 
 describe('Keysend: BeignetNode Wrappers', () => {
