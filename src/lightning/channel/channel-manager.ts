@@ -3776,7 +3776,60 @@ export class ChannelManager extends EventEmitter {
 		const hasError = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (!hasError) {
 			this.emit('channel:accepted', channel, peerPubkey);
+			this.autoFundDualFundedOpen(channel, peerPubkey);
 		}
+	}
+
+	/**
+	 * Fund the INITIATOR's side of a v2 open from the wallet, mirroring the
+	 * lease-seller path in handleOpenChannel2: source wallet inputs + change
+	 * via the funding provider, register them as the channel's contribution,
+	 * and kick off the interactive tx (BOLT 2: the initiator sends the first
+	 * tx_add_input, so without this the open stalls right after
+	 * accept_channel2). Without a funding provider the legacy behavior holds:
+	 * the embedder drives the contribution itself via addTxInput.
+	 *
+	 * The on-chain contribution is our funding share plus the lease fee when
+	 * we are leasing inbound liquidity, which is paid through the funding
+	 * transaction (see handleAcceptChannel2), not from channel balance.
+	 */
+	private autoFundDualFundedOpen(channel: Channel, peerPubkey: string): void {
+		const fp = this.fundingProvider;
+		if (!fp?.selectSpliceInputs) return;
+		const session = channel.getDualFundingSession();
+		const local = session?.getLocalParams();
+		if (!session || !session.isInitiator() || !local) return;
+
+		const state = channel.getFullState();
+		const contributionSats = local.fundingSatoshis + (state.leaseFeeSats ?? 0n);
+		const feeratePerKw = local.fundingFeeratePerkw;
+
+		fp.selectSpliceInputs(contributionSats, feeratePerKw)
+			.then(({ inputs, changeScript }) => {
+				channel.setDualFundingContribution(
+					inputs,
+					changeScript,
+					contributionSats,
+					feeratePerKw
+				);
+				const driveActions = channel.beginDualFundingContribution();
+				this.processActions(peerPubkey, channel, driveActions);
+			})
+			.catch((err) => {
+				// Unlike the lease seller, the opener cannot downgrade to a
+				// zero contribution: the channel cannot exist without our
+				// funding. Surface the reason and abort the negotiation so the
+				// peer forgets the channel instead of waiting on us.
+				this.emit(
+					'error',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					`v2 open not funded: ${(err as Error)?.message ?? err}`
+				);
+				const abortActions = channel.abortDualFunding(
+					`opener funding unavailable: ${(err as Error)?.message ?? err}`
+				);
+				this.processActions(peerPubkey, channel, abortActions);
+			});
 	}
 
 	private handleTxAddInput(peerPubkey: string, payload: Buffer): void {

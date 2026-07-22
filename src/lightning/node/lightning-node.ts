@@ -1496,11 +1496,15 @@ export class LightningNode extends EventEmitter {
 			});
 		});
 
-		// Auto-funding: build funding tx when accept_channel is received
+		// Auto-funding: build funding tx when accept_channel is received. A v2
+		// (dual-funded) accept is funded through the interactive tx instead —
+		// ChannelManager.autoFundDualFundedOpen — and single-funder v1 funding
+		// built here would disagree with the negotiated funding outpoint.
 		this.channelManager.on(
 			'channel:accepted',
 			(channel: Channel, peerPubkey: string) => {
 				if (!this.fundingProvider) return;
+				if (channel.getFullState().dualFundingSession) return;
 				this.handleAutoFunding(channel, peerPubkey);
 			}
 		);
@@ -3751,6 +3755,18 @@ export class LightningNode extends EventEmitter {
 
 	// ─────────────── Channel Management ───────────────
 
+	/**
+	 * Whether option_dual_fund is negotiated with this peer: both sides must
+	 * advertise it (BOLT 9). Ours comes from localFeatures (the default set
+	 * advertises it), the peer's from the init it sent on connect. A peer we
+	 * hold no init for counts as not negotiated.
+	 */
+	private peerNegotiatedDualFund(peerPubkey: string): boolean {
+		if (!this.localFeatures.hasFeature(Feature.DUAL_FUND)) return false;
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		return init ? init.features.hasFeature(Feature.DUAL_FUND) : false;
+	}
+
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
@@ -3790,6 +3806,34 @@ export class LightningNode extends EventEmitter {
 			throw new Error(
 				'max funding requires a pinned satsPerVbyte (the rate the max amount was quoted at)'
 			);
+		}
+		// BOLT 2: once option_dual_fund is negotiated with a peer, a v1
+		// open_channel must not be used; dual-fund peers reject it outright
+		// (CLN: "OPT_DUAL_FUND: cannot use open_channel"). Our default features
+		// advertise option_dual_fund, so route the open through the v2 flow and
+		// keep this one entry point working against both kinds of peer. A peer
+		// we have no init from (not connected yet) falls through to v1, which is
+		// what the peer will negotiate when the connection completes.
+		if (this.peerNegotiatedDualFund(peerPubkey)) {
+			if (pushMsat !== undefined && pushMsat > 0n) {
+				throw new Error(
+					'push is not possible on a dual-funded (v2) open: open_channel2 has no push_msat. Open without a push and pay the peer once the channel is ready.'
+				);
+			}
+			if (fundMax) {
+				throw new Error(
+					'max funding is not yet supported on a dual-funded (v2) open; pass an explicit amount for this peer'
+				);
+			}
+			return this.openChannelV2(peerPubkey, {
+				fundingSatoshis,
+				// The caller quotes sat/vB; interactive tx construction prices in
+				// sat/kw (1 vB = 4 weight units, so 1 sat/vB = 250 sat/kw). The
+				// caller's rate is honoured unclamped, matching the v1 path where
+				// a requested rate is stored raw for handleAutoFunding.
+				fundingFeeratePerkw:
+					satsPerVbyte !== undefined ? Math.ceil(satsPerVbyte * 250) : undefined
+			});
 		}
 		const channel = this.channelManager.openChannel(
 			peerPubkey,

@@ -9520,13 +9520,19 @@ export class Channel {
 		const session = this._state.dualFundingSession;
 		const c = this._dualFundingContribution;
 		if (!session || !c) return 'No dual-funding contribution registered';
+		const initiator = session.isInitiator();
 
 		// P2WPKH input ≈ 272 WU (outpoint+scriptlen+sequence 164 + witness
 		// ~108); P2WPKH output = 124 WU. Reserve a small cushion above that —
 		// the peer's interactive-tx balance check (CLN) estimates our witness
 		// weight before seeing it, and under-reserving fails the negotiation
 		// while a few extra sats simply shrink the change.
-		const weight = 320 * c.inputs.length + 140;
+		let weight = 320 * c.inputs.length + 140;
+		// BOLT 2: the initiator additionally pays the feerate over the common
+		// transaction fields (~42 WU) and the shared funding output it
+		// contributes (P2WSH/P2TR output = 172 WU), with the same cushion
+		// rationale as above.
+		if (initiator) weight += 240;
 		const feeSats = spliceFeeSats(weight, c.feeratePerKw);
 
 		let walletTotal = 0n;
@@ -9543,6 +9549,40 @@ export class Channel {
 					sequence: w.sequence,
 					prevTx: w.prevTx,
 					prevTxVout: w.prevOutputIndex
+				}
+			});
+		}
+
+		// BOLT 2: the initiator adds the shared funding output, sized to the
+		// FULL negotiated capacity — both sides' funding plus any lease fee,
+		// which handleAcceptChannel2 has already folded into fundingSatoshis.
+		if (initiator) {
+			if (!this._state.remoteBasepoints) {
+				return 'Cannot build funding output before accept_channel2';
+			}
+			const taproot = isTaprootChannel(session.getOpenChannelType() ?? null);
+			let fundingSpk: Buffer;
+			if (taproot) {
+				const {
+					createTaprootFundingScript
+				} = require('../script/funding-taproot');
+				fundingSpk = createTaprootFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+				).p2trOutput;
+			} else {
+				const { createFundingScript } = require('../script/funding');
+				fundingSpk = createFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+				).p2wshOutput;
+			}
+			this._dualFundingContribs.push({
+				kind: 'output',
+				output: {
+					serialId: session.nextSerialId(),
+					amountSats: this._state.fundingSatoshis,
+					scriptPubkey: fundingSpk
 				}
 			});
 		}
@@ -9566,17 +9606,18 @@ export class Channel {
 	}
 
 	/**
-	 * Acceptor-side interactive-tx drive for a v2 open with a contribution:
-	 * on each of our turns send the next wallet input / change output, then
-	 * tx_complete (re-sent whenever the peer keeps adding, exactly like the
-	 * splice acceptor drive). Without a registered contribution this is a
+	 * Interactive-tx drive for a v2 open with a registered contribution: on
+	 * each of our turns send the next wallet input / funding or change output,
+	 * then tx_complete (re-sent whenever the peer keeps adding, exactly like
+	 * the splice acceptor drive). Works for both roles: the acceptor's share
+	 * is inputs + change (lease selling), the initiator's additionally carries
+	 * the shared funding output. Without a registered contribution this is a
 	 * no-op and the legacy caller-driven flow applies.
 	 */
 	private _driveDualFunding(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (
 			!session ||
-			session.isInitiator() ||
 			!this._dualFundingContribution ||
 			session.getState() !== DualFundingState.TX_NEGOTIATION
 		) {
@@ -9641,6 +9682,17 @@ export class Channel {
 			return this.sendTxComplete();
 		}
 		return [];
+	}
+
+	/**
+	 * Kick off the INITIATOR's interactive-tx contribution once a contribution
+	 * has been registered (setDualFundingContribution) after accept_channel2.
+	 * BOLT 2: the initiator sends the first tx_add_input, so nothing moves
+	 * until this runs; the peer's replies then pull the rest of the
+	 * contribution out turn by turn via the handleTx* paths.
+	 */
+	beginDualFundingContribution(): ChannelAction[] {
+		return this._driveDualFunding();
 	}
 
 	sendTxComplete(): ChannelAction[] {
