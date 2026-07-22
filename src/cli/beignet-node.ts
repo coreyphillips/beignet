@@ -192,6 +192,12 @@ export interface BeignetNodeOptions {
 	 */
 	autoUpdateChannelFees?: boolean;
 	/**
+	 * Relay third-party HTLCs, i.e. act as a routing hop (default true). Set false
+	 * for a wallet that should not route: every forward is declined up front with
+	 * temporary_channel_failure. Does not affect the node's own sends/receives.
+	 */
+	forwardingEnabled?: boolean;
+	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
 	 * multi-hop payments to destinations beyond its direct peers.
@@ -847,6 +853,7 @@ export class BeignetNode extends EventEmitter {
 			enableNetworking: true,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
+			forwardingEnabled: opts.forwardingEnabled ?? true,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,
@@ -1022,7 +1029,27 @@ export class BeignetNode extends EventEmitter {
 		);
 
 		// HTLC-level events (high volume; the daemon only exposes these over
-		// SSE/webhooks when htlcEvents is enabled).
+		// SSE/webhooks when htlcEvents is enabled). Forwards ALSO get a daemon
+		// log line: relaying other people's money through our channels should be
+		// as visible in the log as a payment is. Without this a node can forward
+		// continuously and the log shows nothing, which made the #173 incident
+		// expensive to diagnose.
+		this.node.on(
+			'htlc:forward',
+			(
+				inChannelId: Buffer,
+				outChannelId: Buffer,
+				amountMsat: bigint,
+				paymentHash: Buffer
+			) => {
+				this.log('info', 'HTLC forward', {
+					paymentHash: paymentHash.toString('hex'),
+					inChannelId: inChannelId.toString('hex'),
+					outChannelId: outChannelId.toString('hex'),
+					amountSats: (amountMsat / 1000n).toString()
+				});
+			}
+		);
 		this.node.on(
 			'htlc:forwarded',
 			(data: {
@@ -1032,6 +1059,13 @@ export class BeignetNode extends EventEmitter {
 				amountOutMsat: bigint;
 				feeMsat: bigint;
 			}) => {
+				this.log('info', 'HTLC forwarded', {
+					inChannelId: data.inChannelId.toString('hex'),
+					outChannelId: data.outChannelId.toString('hex'),
+					amountInSats: (data.amountInMsat / 1000n).toString(),
+					amountOutSats: (data.amountOutMsat / 1000n).toString(),
+					feeMsat: data.feeMsat.toString()
+				});
 				this.emit('htlc:forwarded', {
 					inChannelId: data.inChannelId.toString('hex'),
 					outChannelId: data.outChannelId.toString('hex'),

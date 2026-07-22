@@ -349,6 +349,7 @@ export class LightningNode extends EventEmitter {
 	private _chainWatcherEventsWired = false;
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
+	private forwardingEnabled: boolean;
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
 	private forwardingFeePropMillionths: number;
@@ -512,6 +513,7 @@ export class LightningNode extends EventEmitter {
 		};
 
 		this.htlcSafetyMargin = config.htlcSafetyMargin ?? 6;
+		this.forwardingEnabled = config.forwardingEnabled ?? true;
 		this.forwardingCltvDelta = config.forwardingCltvDelta ?? 40;
 		this.forwardingFeeBaseMsat = config.forwardingFeeBaseMsat ?? 1000;
 		this.forwardingFeePropMillionths = config.forwardingFeePropMillionths ?? 1;
@@ -8025,6 +8027,35 @@ export class LightningNode extends EventEmitter {
 			);
 		};
 
+		// Forwarding opt-out: a node that does not want to be a routing hop
+		// declines every forward up front, before any onward lookup or policy
+		// work. temporary_channel_failure is the well-defined "cannot relay right
+		// now" code (a blinded hop still fails as invalid_onion_blinding via
+		// failIncoming, so we do not leak that the decline was policy).
+		if (!this.forwardingEnabled) {
+			this.emitStructuredLog('htlc', 'forward_declined', {
+				paymentHash: paymentHash.toString('hex'),
+				inChannelId: inChannelId.toString('hex'),
+				inHtlcId: Number(inHtlcId),
+				amountInMsat: Number(incomingAmountMsat),
+				reason: 'forwarding_disabled'
+			});
+			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			return;
+		}
+
+		// A relay moving other people's money through our channels should be as
+		// visible in the log as a payment is. Log the ATTEMPT here (resolution is
+		// logged from recordForwardingEvent / the failure paths).
+		this.emitStructuredLog('htlc', 'forward_attempt', {
+			paymentHash: paymentHash.toString('hex'),
+			inChannelId: inChannelId.toString('hex'),
+			inHtlcId: Number(inHtlcId),
+			amountInMsat: Number(incomingAmountMsat),
+			outgoingScid: outgoingScid?.toString('hex'),
+			blinded: isBlindedForward
+		});
+
 		if (!outgoingScid) {
 			failIncoming(UNKNOWN_NEXT_PEER);
 			return;
@@ -8399,6 +8430,17 @@ export class LightningNode extends EventEmitter {
 			amountInMsat,
 			amountOutMsat,
 			feeMsat: amountInMsat - amountOutMsat
+		});
+		// Resolution counterpart to the forward_attempt log, at the same level as
+		// a settled payment: a completed relay should leave a trace, not just an
+		// SSE event no log consumer sees.
+		this.emitStructuredLog('htlc', 'forwarded', {
+			paymentHash: inHtlc.paymentHash?.toString('hex'),
+			inChannelId: forward.inChannelId.toString('hex'),
+			outChannelId: outChannelId.toString('hex'),
+			amountInMsat: Number(amountInMsat),
+			amountOutMsat: Number(amountOutMsat),
+			feeMsat: Number(amountInMsat - amountOutMsat)
 		});
 		if (
 			!this.storage ||
@@ -9514,6 +9556,7 @@ export class LightningNode extends EventEmitter {
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
+			forwardingEnabled?: boolean;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
 			autoRebalance?: IAutoRebalanceConfig;
@@ -9565,6 +9608,7 @@ export class LightningNode extends EventEmitter {
 			enableNetworking: options?.enableNetworking,
 			autoReconnect: options?.autoReconnect,
 			autoUpdateChannelFees: options?.autoUpdateChannelFees,
+			forwardingEnabled: options?.forwardingEnabled,
 			localFeatures: options?.localFeatures,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,
