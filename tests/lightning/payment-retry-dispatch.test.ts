@@ -15,7 +15,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { INodeConfig } from '../../src/lightning/node/types';
+import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -161,12 +161,16 @@ function setupPair(
  * Make bob reject every incoming HTLC with a TEMPORARY failure, which is
  * explicitly retryable (no PERM bit), and count how many arrive.
  */
-function failEveryHtlcTemporarily(bob: LightningNode): () => number {
+function failEveryHtlcTemporarily(
+	bob: LightningNode,
+	onAttempt?: (attempt: number) => void
+): () => number {
 	let attempts = 0;
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const node = bob as any;
 	node.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
 		attempts++;
+		onAttempt?.(attempts);
 		const key = `${channelId.toString('hex')}:${htlcId}`;
 		const sharedSecret = node.receivedHtlcSharedSecrets.get(key);
 		node.channelManager.failHtlc(
@@ -217,6 +221,73 @@ describe('Payment retry actually dispatches', () => {
 		// retryCount incremented even when nothing was redispatched, so it used to
 		// claim a retry that never happened.
 		expect(settled!.retryCount ?? 0).to.equal(attempts() - 1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// Each attempt gets its own channel/htlc id and its own htlcPaymentMap entry.
+	// The cleanup used to live only on the give-up path, so a retry that
+	// dispatched returned early and left the failed attempt mapped forever.
+	it('releases the failed attempt htlcPaymentMap entry when a retry dispatches', () => {
+		const { alice, bob } = setupPair(904, 905);
+		failEveryHtlcTemporarily(bob);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'mapping'
+		});
+		alice.sendPayment(invoice.bolt11);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const map = (alice as any).htlcPaymentMap as Map<string, string>;
+		expect(
+			map.size,
+			'no failed attempt is left mapped to the payment hash'
+		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// The retry used to clear failureCode/failureSourceIndex/failureReason before
+	// dispatching, then "restore" that same wiped object when dispatch threw, so a
+	// payment could end FAILED explaining nothing at all.
+	it('keeps the original failure when the retry cannot be dispatched', () => {
+		const { alice, bob } = setupPair(906, 907);
+		failEveryHtlcTemporarily(bob, (attempt) => {
+			if (attempt === 1) {
+				// Make the retry fail to leave the node: no outgoing channel.
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const a = alice as any;
+				a.findChannelForPeer = (): null => null;
+				a.findLocalChannelByScid = (): null => null;
+			}
+		});
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'diagnostics'
+		});
+		const sent = alice.sendPayment(invoice.bolt11);
+
+		const failed = alice
+			.listPayments()
+			.find((p) => p.paymentHash.equals(sent.paymentHash));
+		expect(failed, 'payment record exists').to.not.be.undefined;
+		expect(failed!.status).to.equal(PaymentStatus.FAILED);
+		expect(
+			failed!.failureCode,
+			'the onion failure that actually happened survives'
+		).to.equal(TEMPORARY_NODE_FAILURE);
+		expect(
+			(failed!.failureReason ?? '').toLowerCase(),
+			'and the retry error is reported, not swallowed'
+		).to.contain('retry not dispatched');
+		expect(
+			failed!.failureReason ?? '',
+			'naming the actual dispatch error'
+		).to.contain('No channel to first hop');
 
 		alice.destroy();
 		bob.destroy();

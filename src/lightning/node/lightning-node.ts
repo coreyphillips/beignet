@@ -3619,10 +3619,16 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Phase 3: Clean stale htlcPaymentMap entries
+		// Phase 3: Clean stale htlcPaymentMap entries. Drop the persisted row with
+		// it, otherwise the mapping outlives the payment it points at and is loaded
+		// straight back into memory on the next restart.
 		for (const [key, hashHex] of this.htlcPaymentMap) {
 			if (!this.payments.has(hashHex)) {
 				this.htlcPaymentMap.delete(key);
+				this.safeStorage(
+					() => this.storage!.deleteHtlcPaymentMapping(key),
+					'deleteHtlcPaymentMapping'
+				);
 			}
 		}
 
@@ -8589,21 +8595,26 @@ export class LightningNode extends EventEmitter {
 			}
 
 			retryCtx.retryCount++;
-			payment.retryCount = retryCtx.retryCount;
 
-			// Reset payment status for retry
-			payment.status = PaymentStatus.PENDING;
-			payment.failureCode = undefined;
-			payment.failureSourceIndex = undefined;
-			payment.failureReason = undefined;
-			payment.completedAt = undefined;
+			// This HTLC attempt is over whatever happens next, and a retry gets its
+			// own channel and htlc id, so release this attempt's mapping here rather
+			// than only on the give-up path below. Otherwise a retry that succeeds
+			// returns early and leaves the failed attempt mapped to this payment
+			// hash forever, in memory and in storage.
+			this.htlcPaymentMap.delete(key);
+			this.safeStorage(
+				() => this.storage!.deleteHtlcPaymentMapping(key),
+				'deleteHtlcPaymentMapping'
+			);
 
 			// sendPayment() rejects a second payment for a hash that is still
-			// PENDING, and we marked this one PENDING just above, so retrying with
-			// the stale record still registered threw DUPLICATE_PAYMENT straight
-			// into the catch below: no retry ever actually dispatched. Drop the
-			// stale record first; sendPayment registers a fresh one for this hash,
-			// and we restore it if the retry could not be dispatched at all.
+			// registered, so unregister the finished attempt before redispatching.
+			// Leaving it registered is what made every retry throw
+			// DUPLICATE_PAYMENT into the catch below, so no retry ever actually
+			// dispatched. Deliberately do NOT clear this record's failure fields
+			// first: if the retry cannot be dispatched we put this exact object
+			// back and report it, and a record whose failureCode had been wiped
+			// would explain nothing about why the payment failed.
 			this.payments.delete(hashHex);
 			try {
 				const retried = this.sendPayment(
@@ -8613,11 +8624,17 @@ export class LightningNode extends EventEmitter {
 					retryCtx.amountMsat
 				);
 				retried.retryCount = retryCtx.retryCount;
-				return; // Retry initiated successfully
-			} catch {
-				// Retry could not be dispatched (e.g. no alternative route). Put the
-				// record back so the failure below is reported against it.
+				return; // Retry dispatched
+			} catch (err) {
+				// The retry never left the node. Restore the attempt that did fail,
+				// keeping its original onion failure, and append why the retry could
+				// not be sent rather than discarding that reason silently.
 				this.payments.set(hashHex, payment);
+				payment.retryCount = retryCtx.retryCount;
+				const detail = err instanceof Error ? err.message : String(err);
+				payment.failureReason = payment.failureReason
+					? `${payment.failureReason}; retry not dispatched: ${detail}`
+					: `Retry not dispatched: ${detail}`;
 			}
 		}
 
