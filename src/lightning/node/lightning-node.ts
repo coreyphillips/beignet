@@ -647,6 +647,13 @@ export class LightningNode extends EventEmitter {
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
 
+		// Seed the fee advisor from the estimator right away. Every later
+		// refresh rides a block event, but a dual-funded openChannel pins
+		// funding_feerate_perkw synchronously and refuses to run off an
+		// unseeded advisor, so a fresh node must not wait a whole block
+		// interval before its first v2 open can price itself.
+		this.warmFeeAdvisor();
+
 		this.graph = new NetworkGraph(this.chainHash());
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
@@ -1496,11 +1503,15 @@ export class LightningNode extends EventEmitter {
 			});
 		});
 
-		// Auto-funding: build funding tx when accept_channel is received
+		// Auto-funding: build funding tx when accept_channel is received. A v2
+		// (dual-funded) accept is funded through the interactive tx instead —
+		// ChannelManager.autoFundDualFundedOpen — and single-funder v1 funding
+		// built here would disagree with the negotiated funding outpoint.
 		this.channelManager.on(
 			'channel:accepted',
 			(channel: Channel, peerPubkey: string) => {
 				if (!this.fundingProvider) return;
+				if (channel.getFullState().dualFundingSession) return;
 				this.handleAutoFunding(channel, peerPubkey);
 			}
 		);
@@ -3071,6 +3082,10 @@ export class LightningNode extends EventEmitter {
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
+			// The internal watcher path does not go through handleNewBlock, so
+			// keep the fee advisor warm here too — force-closes and v2 opens
+			// both price themselves synchronously off its latest sample.
+			this.warmFeeAdvisor();
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -3751,6 +3766,18 @@ export class LightningNode extends EventEmitter {
 
 	// ─────────────── Channel Management ───────────────
 
+	/**
+	 * Whether option_dual_fund is negotiated with this peer: both sides must
+	 * advertise it (BOLT 9). Ours comes from localFeatures (the default set
+	 * advertises it), the peer's from the init it sent on connect. A peer we
+	 * hold no init for counts as not negotiated.
+	 */
+	private peerNegotiatedDualFund(peerPubkey: string): boolean {
+		if (!this.localFeatures.hasFeature(Feature.DUAL_FUND)) return false;
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		return init ? init.features.hasFeature(Feature.DUAL_FUND) : false;
+	}
+
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
@@ -3790,6 +3817,60 @@ export class LightningNode extends EventEmitter {
 			throw new Error(
 				'max funding requires a pinned satsPerVbyte (the rate the max amount was quoted at)'
 			);
+		}
+		// BOLT 2: once option_dual_fund is negotiated with a peer, a v1
+		// open_channel must not be used; dual-fund peers reject it outright
+		// (CLN: "OPT_DUAL_FUND: cannot use open_channel"). Our default features
+		// advertise option_dual_fund, so route the open through the v2 flow and
+		// keep this one entry point working against both kinds of peer. With no
+		// init from the peer there is nothing to judge by, so the open falls
+		// through to v1 — which then throws 'Not connected to peer' from
+		// ChannelManager.openChannel when a peer manager is attached; nothing
+		// is queued for later.
+		if (this.peerNegotiatedDualFund(peerPubkey)) {
+			if (pushMsat !== undefined && pushMsat > 0n) {
+				throw new Error(
+					'push is not possible on a dual-funded (v2) open: open_channel2 has no push_msat. Open without a push and pay the peer once the channel is ready.'
+				);
+			}
+			if (fundMax) {
+				throw new Error(
+					'max funding is not yet supported on a dual-funded (v2) open; pass an explicit amount for this peer'
+				);
+			}
+			// Same funding-fee policy as a v1 open, where handleAutoFunding
+			// clamps the caller's rate or asks the estimator at funding time.
+			// v2 cannot defer: open_channel2 itself carries funding_feerate_perkw,
+			// so the rate is pinned NOW from the same estimator's latest sample
+			// (the fee advisor, seeded at construction and refreshed per block),
+			// clamped identically, and converted to sat/kw (1 vB = 4 WU, so
+			// 1 sat/vB = 250 sat/kw) — the exact pattern getClosingFeeratePerKw
+			// uses.
+			const quotedSatPerVbyte =
+				satsPerVbyte !== undefined
+					? satsPerVbyte
+					: this.feeAdvisor.getCurrentRate();
+			// Two different "no rate" states must not collapse: with NO
+			// estimator configured, the static configured feerate fallback in
+			// openChannelV2 is intentional. With an estimator whose seed has
+			// not landed yet (a fresh node, milliseconds after construction),
+			// silently funding at the static default would underprice the
+			// funding tx in an elevated mempool — the exact regression a v1
+			// open avoids by asking the estimator at funding time. Refuse
+			// honestly; the seed resolves almost immediately and a retry
+			// succeeds.
+			if (quotedSatPerVbyte <= 0 && this.feeEstimator) {
+				throw new Error(
+					'fee estimate not ready yet for a dual-funded open (the estimator has not delivered its first sample); retry shortly or pass an explicit satsPerVbyte'
+				);
+			}
+			return this.openChannelV2(peerPubkey, {
+				fundingSatoshis,
+				fundingFeeratePerkw:
+					quotedSatPerVbyte > 0
+						? Math.ceil(this.clampEstimatedFeeRate(quotedSatPerVbyte) * 250)
+						: undefined
+			});
 		}
 		const channel = this.channelManager.openChannel(
 			peerPubkey,
@@ -9600,27 +9681,38 @@ export class LightningNode extends EventEmitter {
 		}
 		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
 		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.
-		if (this.feeEstimator) {
-			this.feeEstimator
-				.estimateFee(6)
-				.then((rawSatPerVbyte) => {
-					const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
-					if (satPerVbyte > 0) {
-						this.feeAdvisor.recordSample(satPerVbyte);
-						// Feed the live rate to every active monitor so the RBF
-						// re-bump floor tracks the market. Monitors created
-						// mid-session (funding spend detected by the watcher)
-						// otherwise keep their build-time rate forever.
-						// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
-						for (const monitor of this.channelManager.getMonitors().values()) {
-							monitor.updateFeeRate(satPerVbyte * 250);
-						}
+		this.warmFeeAdvisor();
+	}
+
+	/**
+	 * Record a fresh estimator sample into the fee advisor and feed the live
+	 * rate to every active chain monitor so the RBF re-bump floor tracks the
+	 * market (monitors created mid-session otherwise keep their build-time
+	 * rate forever). Non-blocking, best-effort; no-op without an estimator.
+	 *
+	 * Called at construction (initial seed), on every chain-watcher block, and
+	 * from handleNewBlock. The seed matters beyond force-closes: a dual-funded
+	 * openChannel must pin funding_feerate_perkw synchronously inside
+	 * open_channel2, so the advisor must hold a sample by the time the first
+	 * open is attempted — v1 can ask the estimator at funding time, v2 cannot.
+	 */
+	private warmFeeAdvisor(): void {
+		if (!this.feeEstimator) return;
+		this.feeEstimator
+			.estimateFee(6)
+			.then((rawSatPerVbyte) => {
+				const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
+				if (satPerVbyte > 0) {
+					this.feeAdvisor.recordSample(satPerVbyte);
+					// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
+					for (const monitor of this.channelManager.getMonitors().values()) {
+						monitor.updateFeeRate(satPerVbyte * 250);
 					}
-				})
-				.catch(() => {
-					/* best-effort; force-close falls back to the default feerate */
-				});
-		}
+				}
+			})
+			.catch(() => {
+				/* best-effort; consumers fall back to their own defaults */
+			});
 	}
 
 	getCurrentBlockHeight(): number {
