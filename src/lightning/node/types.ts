@@ -376,13 +376,29 @@ export interface IPaymentInfo {
 	 */
 	failureReason?: string;
 	retryCount?: number;
+	/**
+	 * Block height this attempt converted its relative route CLTV deltas against.
+	 * A payee reporting a height at or below this cannot be telling us anything
+	 * new, so it is what a height-skew failure must be judged against, not our
+	 * live height.
+	 */
+	cltvBaseHeight?: number;
 	createdAt: number;
 	completedAt?: number;
 	metadata?: Record<string, string>;
 }
 
+/** A keysend has no invoice to re-pay, so a retry replays these instead. */
+export interface IKeysendRetrySource {
+	options: IKeysendOptions;
+	/** Reused so the retry keeps the original payment hash. */
+	preimage: Buffer;
+}
+
 export interface IPaymentRetryContext {
-	invoiceStr: string;
+	/** Absent for keysend, which replays `keysend` instead. */
+	invoiceStr?: string;
+	keysend?: IKeysendRetrySource;
 	excludedChannels: Set<string>;
 	retryCount: number;
 	maxRetries: number;
@@ -390,6 +406,12 @@ export interface IPaymentRetryContext {
 	maxFeeMsat?: bigint;
 	/** Amount for amount-less invoices, preserved across retries */
 	amountMsat?: bigint;
+	/**
+	 * Height a payee reported when it rejected this payment for being ahead of
+	 * us. Scoped to this payment on purpose: it is what one final node claimed,
+	 * not the chain's height, so it must not steer unrelated payments.
+	 */
+	cltvBaseHeightOverride?: number;
 }
 
 export interface ICreateInvoiceOptions {

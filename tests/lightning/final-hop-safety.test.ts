@@ -270,14 +270,13 @@ describe('Block-height skew is handled by the sender, not by relaxing the check'
 		node.destroy();
 	});
 
+	/**
+	 * PERM|15 is overloaded. It is also returned for an unknown payment hash, a
+	 * wrong payment secret, underpayment and gross overpayment, so a reported
+	 * height alone must not be enough to call a failure transient.
+	 */
 	describe('noteHeightSkewFailure', () => {
-		function note(node: LightningNode, code: number, data?: Buffer): boolean {
-			return (
-				node as unknown as {
-					noteHeightSkewFailure: (c?: number, d?: Buffer) => boolean;
-				}
-			).noteHeightSkewFailure(code, data);
-		}
+		const HASH = Buffer.alloc(32, 7);
 
 		function failureData(amountMsat: bigint, height: number): Buffer {
 			const buf = Buffer.alloc(12);
@@ -286,64 +285,116 @@ describe('Block-height skew is handled by the sender, not by relaxing the check'
 			return buf;
 		}
 
-		it('treats a final node ahead of us as transient and raises our CLTV base', () => {
+		/** A 2-hop outgoing payment whose final hop is index 1. */
+		function makePayment(opts: {
+			failureSourceIndex?: number;
+			cltvBaseHeight?: number;
+		}): Record<string, unknown> {
+			return {
+				paymentHash: HASH,
+				failureCode: INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+				failureSourceIndex: opts.failureSourceIndex ?? 1,
+				cltvBaseHeight: opts.cltvBaseHeight,
+				route: {
+					hops: [{ pubkey: Buffer.alloc(33) }, { pubkey: Buffer.alloc(33) }]
+				}
+			};
+		}
+
+		function setup(height: number): {
+			node: LightningNode;
+			note: (p: Record<string, unknown>, d?: Buffer) => boolean;
+			override: () => number | undefined;
+		} {
 			const node = makeNode();
-			node.handleNewBlock(800_000);
+			node.handleNewBlock(height);
+			// A skew override is recorded on the payment's retry context.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const anyNode = node as any;
+			anyNode.paymentRetryContexts.set(HASH.toString('hex'), {
+				excludedChannels: new Set(),
+				retryCount: 0,
+				maxRetries: 3
+			});
+			return {
+				node,
+				note: (p, d): boolean => anyNode.noteHeightSkewFailure(p, d),
+				override: (): number | undefined =>
+					anyNode.paymentRetryContexts.get(HASH.toString('hex'))
+						?.cltvBaseHeightOverride
+			};
+		}
+
+		it('treats a final node ahead of this attempt as transient', () => {
+			const { node, note, override } = setup(800_000);
 			expect(
 				note(
-					node,
-					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					makePayment({ cltvBaseHeight: 800_000 }),
 					failureData(1000n, 800_002)
 				)
 			).to.be.true;
-			// Later sends must build against the height the payee reported, or the
-			// retry would repeat the same stale expiry and fail identically.
-			const base = (
-				node as unknown as { cltvBaseHeight: () => number }
-			).cltvBaseHeight.call(node);
-			expect(base).to.equal(800_002);
+			// The retry must be built against the reported height, or it would
+			// repeat the same stale expiry and fail identically.
+			expect(override()).to.equal(800_002);
 			node.destroy();
 		});
 
-		it('does not treat an unknown payment hash as transient', () => {
-			const node = makeNode();
-			node.handleNewBlock(800_000);
-			// Same code, but the payee is at or behind us: nothing to re-sync, so
-			// this is the genuinely permanent half of PERM|15.
+		it('does not treat a payee at or behind us as transient', () => {
+			const { node, note, override } = setup(800_000);
+			// The genuinely permanent half of PERM|15: unknown hash, wrong secret.
 			expect(
 				note(
-					node,
-					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					makePayment({ cltvBaseHeight: 800_000 }),
 					failureData(1000n, 800_000)
+				)
+			).to.be.false;
+			expect(override()).to.be.undefined;
+			node.destroy();
+		});
+
+		it('does not re-treat a height this attempt already used', () => {
+			const { node, note } = setup(800_000);
+			// We already retried against 800_002. The payee reporting it again is
+			// telling us nothing new, so this failure is about something else and
+			// must not burn the remaining retries.
+			expect(
+				note(
+					makePayment({ cltvBaseHeight: 800_002 }),
+					failureData(1000n, 800_002)
+				)
+			).to.be.false;
+			node.destroy();
+		});
+
+		it('ignores a height reported by a hop that is not the payee', () => {
+			const { node, note } = setup(800_000);
+			// BOLT 4 defines the field as the FINAL node's height.
+			expect(
+				note(
+					makePayment({ failureSourceIndex: 0, cltvBaseHeight: 800_000 }),
+					failureData(1000n, 800_002)
 				)
 			).to.be.false;
 			node.destroy();
 		});
 
 		it('ignores an implausible height claim', () => {
-			const node = makeNode();
-			node.handleNewBlock(800_000);
-			// A peer must not be able to inflate every expiry we send.
+			const { node, note, override } = setup(800_000);
+			// A peer must not be able to inflate the expiry of what we send.
 			expect(
 				note(
-					node,
-					INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+					makePayment({ cltvBaseHeight: 800_000 }),
 					failureData(1000n, 900_000)
 				)
 			).to.be.false;
-			expect(
-				(
-					node as unknown as { cltvBaseHeight: () => number }
-				).cltvBaseHeight.call(node)
-			).to.equal(800_000);
+			expect(override()).to.be.undefined;
 			node.destroy();
 		});
 
 		it('ignores a peer that omits the height field', () => {
-			const node = makeNode();
-			node.handleNewBlock(800_000);
-			expect(note(node, INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS, Buffer.alloc(0)))
-				.to.be.false;
+			const { node, note } = setup(800_000);
+			expect(note(makePayment({ cltvBaseHeight: 800_000 }), Buffer.alloc(0))).to
+				.be.false;
 			node.destroy();
 		});
 	});

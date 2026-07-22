@@ -365,13 +365,6 @@ export class LightningNode extends EventEmitter {
 	private chainWatcher: ChainWatcher | null = null;
 	private _chainWatcherEventsWired = false;
 	private currentBlockHeight = 0;
-	/**
-	 * Highest block height a final node has reported to us in a failure, when it
-	 * was ahead of our own. Used ONLY to raise the CLTV expiry we send (see
-	 * cltvBaseHeight), never as our view of the chain: letting a peer advance
-	 * currentBlockHeight would drive on-chain timeout and force-close decisions.
-	 */
-	private peerReportedBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingCltvDelta: number;
 	private forwardingFeeBaseMsat: number;
@@ -6500,7 +6493,7 @@ export class LightningNode extends EventEmitter {
 		// outgoing_cltv_value on the wire must be ABSOLUTE (current block height +
 		// accumulated delta), otherwise the final node rejects the HTLC as
 		// "cltv expiry too soon" (incorrect_or_unknown_payment_details).
-		const baseHeight = this.cltvBaseHeight();
+		const baseHeight = this.cltvBaseHeight(paymentHash);
 
 		// Convert route hops to onion hop payloads.
 		// For intermediate hops: the payload tells the hop what to FORWARD (next hop's
@@ -6591,6 +6584,7 @@ export class LightningNode extends EventEmitter {
 			amountMsat: amount,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
+			cltvBaseHeight: baseHeight,
 			route: route as {
 				hops: Array<{
 					pubkey: Buffer;
@@ -6662,35 +6656,60 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Block height to convert relative route CLTV deltas into absolute wire values.
 	 *
-	 * Normally our own height, but a final node that already failed a payment for
-	 * being ahead of us has told us its height, and sending against our stale view
-	 * again would fail identically. Taking the max only ever raises the expiry,
-	 * which is the safe direction.
+	 * Normally our own height, but a final node that already failed THIS payment
+	 * for being ahead of us has told us its height, and sending against our stale
+	 * view again would fail identically. Taking the max only ever raises the
+	 * expiry, which is the safe direction. Scoped per payment so one payee's claim
+	 * cannot steer unrelated payments.
 	 */
-	private cltvBaseHeight(): number {
-		return Math.max(this.currentBlockHeight, this.peerReportedBlockHeight);
+	private cltvBaseHeight(paymentHash: Buffer): number {
+		const ctx = this.paymentRetryContexts.get(paymentHash.toString('hex'));
+		return Math.max(this.currentBlockHeight, ctx?.cltvBaseHeightOverride ?? 0);
 	}
 
 	/**
 	 * Recognise the transient half of the overloaded PERM|15 failure: a final node
 	 * rejecting our expiry because its block height is ahead of ours, rather than
-	 * because the payment hash is unknown. Records the reported height so a retry
-	 * is built against it, and reports whether the failure is worth retrying.
+	 * because the payment hash is unknown, the secret is wrong, or the amount is
+	 * off. Every one of those shares this code, so the height alone is not enough
+	 * to call a failure transient:
+	 *
+	 * - it must come from the FINAL hop, since BOLT 4 defines the field as the
+	 *   final node's height, and
+	 * - it must exceed the height THIS attempt was built against, otherwise it
+	 *   tells us nothing we did not already act on and every later failure to the
+	 *   same payee would masquerade as skew until the retries ran out.
 	 */
 	private noteHeightSkewFailure(
-		failureCode?: number,
+		payment: IPaymentInfo,
 		failureData?: Buffer
 	): boolean {
-		if (failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) return false;
+		if (payment.failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) {
+			return false;
+		}
+		const finalHopIndex = (payment.route?.hops.length ?? 0) - 1;
+		if (finalHopIndex < 0 || payment.failureSourceIndex !== finalHopIndex) {
+			return false;
+		}
 		// [u64 htlc_msat][u32 height]; older peers may send it empty.
 		if (!failureData || failureData.length < 12) return false;
 
 		const reportedHeight = failureData.readUInt32BE(8);
-		const skew = reportedHeight - this.currentBlockHeight;
-		if (skew <= 0 || skew > MAX_TRUSTED_PEER_HEIGHT_SKEW) return false;
+		const attemptBase = payment.cltvBaseHeight ?? this.currentBlockHeight;
+		if (reportedHeight <= attemptBase) return false;
+		if (
+			reportedHeight - this.currentBlockHeight >
+			MAX_TRUSTED_PEER_HEIGHT_SKEW
+		) {
+			return false;
+		}
 
-		this.peerReportedBlockHeight = Math.max(
-			this.peerReportedBlockHeight,
+		const ctx = this.paymentRetryContexts.get(
+			payment.paymentHash.toString('hex')
+		);
+		if (!ctx) return false;
+		ctx.cltvBaseHeightOverride = Math.max(
+			ctx.cltvBaseHeightOverride ?? 0,
 			reportedHeight
 		);
 		return true;
@@ -6703,6 +6722,23 @@ export class LightningNode extends EventEmitter {
 	 * via TLV type 5482373484, and the recipient extracts + verifies it.
 	 */
 	sendKeysend(options: IKeysendOptions): IPaymentInfo {
+		// A fresh preimage per call, so each keysend is its own payment.
+		return this.dispatchKeysend(options, crypto.randomBytes(32));
+	}
+
+	/**
+	 * Send a keysend against a caller-supplied preimage.
+	 *
+	 * Split out from sendKeysend so a retry can replay the SAME preimage, and
+	 * therefore the same payment hash. Generating a new one would make the retry a
+	 * different payment that no longer matches the retry context, the in-flight
+	 * record, or anything the caller is waiting on.
+	 */
+	private dispatchKeysend(
+		options: IKeysendOptions,
+		preimage: Buffer,
+		excludedChannels?: Set<string>
+	): IPaymentInfo {
 		const {
 			destination,
 			amountMsat,
@@ -6725,8 +6761,6 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		// Generate random preimage and compute payment hash
-		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 		const hashHex = paymentHash.toString('hex');
 
@@ -6739,6 +6773,18 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
+		// A keysend has no invoice to re-pay, so record what a retry needs to
+		// replay it: the same preimage, and therefore the same payment hash.
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, {
+				keysend: { options, preimage },
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat
+			});
+		}
+
 		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
@@ -6749,7 +6795,7 @@ export class LightningNode extends EventEmitter {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			undefined,
+			excludedChannels,
 			this.missionControl,
 			undefined,
 			undefined,
@@ -6772,7 +6818,7 @@ export class LightningNode extends EventEmitter {
 
 		const hops = route.hops;
 		// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
-		const baseHeight = this.cltvBaseHeight();
+		const baseHeight = this.cltvBaseHeight(paymentHash);
 
 		// Build onion hop payloads — final hop gets keysend TLV
 		const keysendRecords = new Map<number, Buffer>();
@@ -6835,6 +6881,7 @@ export class LightningNode extends EventEmitter {
 			amountMsat: amount,
 			status: PaymentStatus.PENDING,
 			direction: PaymentDirection.OUTGOING,
+			cltvBaseHeight: baseHeight,
 			route: route as IPaymentInfo['route'],
 			sharedSecrets,
 			createdAt: Date.now(),
@@ -6944,7 +6991,10 @@ export class LightningNode extends EventEmitter {
 			const hops = partRoute.hops;
 			if (hops.length === 0) continue;
 			// Route CLTVs are relative deltas; the wire needs absolute (height + delta).
-			const baseHeight = this.cltvBaseHeight();
+			const baseHeight = this.cltvBaseHeight(paymentHash);
+			// Every part converts against the same height, so this records what a
+			// height-skew failure has to beat to count as new information.
+			payment.cltvBaseHeight = baseHeight;
 
 			// Each part's final hop must have paymentSecret and totalMsat = full invoice amount
 			const onionHops: { pubkey: Buffer; payload: IHopPayload }[] = hops.map(
@@ -7613,8 +7663,17 @@ export class LightningNode extends EventEmitter {
 		for (const h of held) {
 			const key = `${h.channelId.toString('hex')}:${h.htlcId}`;
 			const ss = this.receivedHtlcSharedSecrets.get(key);
+			// This path defaults to incorrect_or_unknown_payment_details, and the
+			// CLTV sweeper cancels through it with that default, so it needs the
+			// same [htlc_msat][height] payload as every other PERM|15 we send.
 			const reason = ss
-				? createFailureMessage(ss, failureCode)
+				? createFailureMessage(
+						ss,
+						failureCode,
+						failureCode === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							? this.incorrectPaymentDetailsData(h.amountMsat)
+							: undefined
+				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(key);
 			this.channelManager.failHtlc(h.channelId, h.htlcId, reason);
@@ -8440,7 +8499,7 @@ export class LightningNode extends EventEmitter {
 			payment.completedAt = Date.now();
 			// Preserve invoice string for payment proof before deleting retry context
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
-			if (retryCtx) {
+			if (retryCtx?.invoiceStr) {
 				if (!payment.metadata) payment.metadata = {};
 				payment.metadata._invoice = retryCtx.invoiceStr;
 			}
@@ -8656,10 +8715,7 @@ export class LightningNode extends EventEmitter {
 		// transient case, where it rejected our expiry only because it is ahead of
 		// us. This records that height so the retry below is built against it
 		// rather than repeating the same stale expiry.
-		const heightSkew = this.noteHeightSkewFailure(
-			payment.failureCode,
-			failureData
-		);
+		const heightSkew = this.noteHeightSkewFailure(payment, failureData);
 
 		// Record failure in MissionControl for future pathfinding. Skipped for
 		// height skew: no channel misbehaved, our expiry was stale, so penalising
@@ -8742,12 +8798,20 @@ export class LightningNode extends EventEmitter {
 			// would explain nothing about why the payment failed.
 			this.payments.delete(hashHex);
 			try {
-				const retried = this.sendPayment(
-					retryCtx.invoiceStr,
-					retryCtx.excludedChannels,
-					retryCtx.maxFeeMsat,
-					retryCtx.amountMsat
-				);
+				// A keysend has no invoice, so replay it from its original preimage
+				// to keep the same payment hash.
+				const retried = retryCtx.keysend
+					? this.dispatchKeysend(
+							retryCtx.keysend.options,
+							retryCtx.keysend.preimage,
+							retryCtx.excludedChannels
+					  )
+					: this.sendPayment(
+							retryCtx.invoiceStr!,
+							retryCtx.excludedChannels,
+							retryCtx.maxFeeMsat,
+							retryCtx.amountMsat
+					  );
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {

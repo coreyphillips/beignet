@@ -718,25 +718,50 @@ describe('Keysend: block-height skew between sender and receiver', () => {
 		expect(settled!.retryCount, 'took a retry to settle').to.be.greaterThan(0);
 	});
 
-	it('a keysend beyond the padding teaches us the payee height', () => {
+	it('a keysend beyond the padding is retried, not abandoned', () => {
 		const { alice, bob } = setupKeysendPair(794, 795);
 		alice.handleNewBlock(800_000);
 		bob.handleNewBlock(800_004); // beyond the sender padding
 
-		// Keysend has no retry context (each attempt derives a fresh preimage), so
-		// this attempt fails, but the reported height is recorded...
-		const first = alice.sendKeysend({
-			destination: Buffer.from(bob.getNodeId(), 'hex'),
-			amountMsat: 50000n
+		let received = false;
+		bob.on('payment:received', () => {
+			received = true;
 		});
-		expect(first.status).to.equal(PaymentStatus.FAILED);
 
-		// ...so the next one is built against bob's height and settles.
-		const second = alice.sendKeysend({
+		const sent = alice.sendKeysend({
 			destination: Buffer.from(bob.getNodeId(), 'hex'),
 			amountMsat: 50000n
 		});
-		expect(second.status).to.equal(PaymentStatus.COMPLETED);
+
+		// A keysend has no invoice to re-pay, so the retry replays the original
+		// preimage. That keeps the payment hash stable, which is what lets the
+		// retried attempt still be found under the hash the caller was given.
+		const settled = alice
+			.listPayments()
+			.find((p) => p.paymentHash.equals(sent.paymentHash));
+		expect(settled, 'retry kept the original payment hash').to.not.be.undefined;
+		expect(settled!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled!.retryCount, 'took a retry to settle').to.be.greaterThan(0);
+		expect(received, 'bob received the keysend').to.be.true;
+	});
+
+	it('keeps the preimage matching the hash across a keysend retry', () => {
+		const { alice, bob } = setupKeysendPair(796, 797);
+		alice.handleNewBlock(800_000);
+		bob.handleNewBlock(800_004);
+
+		const sent = alice.sendKeysend({
+			destination: Buffer.from(bob.getNodeId(), 'hex'),
+			amountMsat: 50000n
+		});
+
+		const settled = alice
+			.listPayments()
+			.find((p) => p.paymentHash.equals(sent.paymentHash));
+		// A regenerated preimage would settle against a hash the payer never sent.
+		expect(
+			crypto.createHash('sha256').update(settled!.preimage!).digest()
+		).to.deep.equal(settled!.paymentHash);
 	});
 });
 
