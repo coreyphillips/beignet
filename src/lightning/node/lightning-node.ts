@@ -8598,16 +8598,26 @@ export class LightningNode extends EventEmitter {
 			payment.failureReason = undefined;
 			payment.completedAt = undefined;
 
+			// sendPayment() rejects a second payment for a hash that is still
+			// PENDING, and we marked this one PENDING just above, so retrying with
+			// the stale record still registered threw DUPLICATE_PAYMENT straight
+			// into the catch below: no retry ever actually dispatched. Drop the
+			// stale record first; sendPayment registers a fresh one for this hash,
+			// and we restore it if the retry could not be dispatched at all.
+			this.payments.delete(hashHex);
 			try {
-				this.sendPayment(
+				const retried = this.sendPayment(
 					retryCtx.invoiceStr,
 					retryCtx.excludedChannels,
 					retryCtx.maxFeeMsat,
 					retryCtx.amountMsat
 				);
+				retried.retryCount = retryCtx.retryCount;
 				return; // Retry initiated successfully
 			} catch {
-				// Retry failed (e.g. no alternative route) — fall through to mark as failed
+				// Retry could not be dispatched (e.g. no alternative route). Put the
+				// record back so the failure below is reported against it.
+				this.payments.set(hashHex, payment);
 			}
 		}
 
