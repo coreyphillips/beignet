@@ -21,11 +21,12 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import {
 	ROUTING_INFO_LENGTH,
-	TEMPORARY_CHANNEL_FAILURE
+	TEMPORARY_NODE_FAILURE
 } from '../../src/lightning/onion/types';
 import { decryptFailureMessage } from '../../src/lightning/onion/failures';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import { IStructuredLog } from '../../src/lightning/node/types';
+import { decodeChannelUpdateMessage } from '../../src/lightning/gossip/messages';
 
 function makeBasepoints(): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -154,16 +155,19 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 		return logs.filter((l) => l.category === 'htlc').map((l) => l.action);
 	}
 
-	it('declines every forward with temporary_channel_failure when disabled', function () {
+	it('declines every forward with temporary_node_failure when disabled', function () {
 		wire(makeNode(false));
 		const { realScid } = installChannel(node);
 
 		forward(realScid);
 
 		// Declined up front: no onward add, and the incoming HTLC is failed with
-		// the well-defined temporary_channel_failure code.
+		// temporary_node_failure. This is a node-wide policy, not one channel
+		// misbehaving, and unlike temporary_channel_failure it needs no
+		// channel_update payload (BOLT 4) — a data-less temporary_channel_failure
+		// would be a malformed onion failure.
 		expect(addHtlcCalls).to.equal(0);
-		expect(failureCode()).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		expect(failureCode()).to.equal(TEMPORARY_NODE_FAILURE);
 		expect(logActions()).to.include('forward_declined');
 		expect(logActions()).to.not.include('forward_attempt');
 	});
@@ -177,7 +181,7 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 		forward(realScid);
 
 		expect(addHtlcCalls).to.equal(0);
-		expect(failureCode()).to.equal(TEMPORARY_CHANNEL_FAILURE);
+		expect(failureCode()).to.equal(TEMPORARY_NODE_FAILURE);
 	});
 
 	it('forwards and logs the attempt when enabled (default)', function () {
@@ -201,5 +205,96 @@ describe('Issue #176: forwarding opt-out and forward logging', function () {
 
 		expect(addHtlcCalls).to.equal(1);
 		expect(failureCode()).to.be.undefined;
+	});
+
+	describe('gossip disable bit (BOLT 7)', function () {
+		const DISABLE = 0x02;
+
+		it('sets the disable bit on our channel_update when forwarding is off', function () {
+			wire(makeNode(false));
+			const { channelId } = installChannel(node);
+
+			const update = (node as any).buildDirectChannelUpdate(channelId);
+			expect(update, 'built an update').to.not.equal(null);
+			const decoded = decodeChannelUpdateMessage(update);
+			expect(decoded.channelFlags & DISABLE).to.equal(DISABLE);
+		});
+
+		it('leaves the disable bit clear when forwarding is on', function () {
+			wire(makeNode(true));
+			const { channelId } = installChannel(node);
+
+			const update = (node as any).buildDirectChannelUpdate(channelId);
+			const decoded = decodeChannelUpdateMessage(update);
+			expect(decoded.channelFlags & DISABLE).to.equal(0);
+			// The direction bit and everything else are untouched.
+			expect(decoded.channelFlags & ~DISABLE).to.equal(decoded.channelFlags);
+		});
+
+		it('refreshChannelUpdate stamps the disable bit while preserving direction', function () {
+			// Build an enabled update (bit clear, direction bit set), then refresh
+			// it through a disabled node: the disable bit is set and the direction
+			// bit is preserved.
+			wire(makeNode(true));
+			const { channelId } = installChannel(node);
+			const enabledUpdate = (node as any).buildDirectChannelUpdate(channelId);
+			const direction =
+				decodeChannelUpdateMessage(enabledUpdate).channelFlags & 0x01;
+			node.destroy();
+
+			wire(makeNode(false));
+			const refreshed = (node as any).refreshChannelUpdate(
+				enabledUpdate,
+				Math.floor(Date.now() / 1000)
+			);
+			const decoded = decodeChannelUpdateMessage(refreshed);
+			expect(decoded.channelFlags & DISABLE).to.equal(DISABLE);
+			expect(decoded.channelFlags & 0x01).to.equal(direction);
+		});
+
+		it('refreshChannelUpdate clears a stale disable bit when forwarding is on', function () {
+			wire(makeNode(false));
+			const { channelId } = installChannel(node);
+			const disabledUpdate = (node as any).buildDirectChannelUpdate(channelId);
+			expect(
+				decodeChannelUpdateMessage(disabledUpdate).channelFlags & DISABLE
+			).to.equal(DISABLE);
+			node.destroy();
+
+			wire(makeNode(true));
+			const refreshed = (node as any).refreshChannelUpdate(
+				disabledUpdate,
+				Math.floor(Date.now() / 1000)
+			);
+			expect(
+				decodeChannelUpdateMessage(refreshed).channelFlags & DISABLE
+			).to.equal(0);
+		});
+	});
+
+	it('logs and emits when a forwarded HTLC fails downstream', function () {
+		wire(makeNode());
+		const inChannelId = crypto.randomBytes(32);
+		const outChannelId = crypto.randomBytes(32);
+		const outHtlcId = 4n;
+		const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
+		(node as any).forwardedHtlcs.set(outKey, { inChannelId, inHtlcId: 2n });
+		(node as any).receivedHtlcSharedSecrets.set(
+			`${inChannelId.toString('hex')}:2`,
+			crypto.randomBytes(32)
+		);
+		let failedEvent = false;
+		node.on('htlc:forward-failed', () => {
+			failedEvent = true;
+		});
+
+		(node as any).handleHtlcFailed(
+			outChannelId,
+			outHtlcId,
+			crypto.randomBytes(32)
+		);
+
+		expect(logActions()).to.include('forward_failed');
+		expect(failedEvent).to.equal(true);
 	});
 });

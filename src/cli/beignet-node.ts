@@ -1076,6 +1076,15 @@ export class BeignetNode extends EventEmitter {
 			}
 		);
 		this.node.on(
+			'htlc:forward-failed',
+			(data: { inChannelId: Buffer; outChannelId: Buffer }) => {
+				this.log('info', 'HTLC forward failed', {
+					inChannelId: data.inChannelId.toString('hex'),
+					outChannelId: data.outChannelId.toString('hex')
+				});
+			}
+		);
+		this.node.on(
 			'htlc:fulfilled',
 			(data: { channelId: Buffer; htlcId: bigint }) => {
 				this.emit('htlc:fulfilled', {

@@ -276,6 +276,7 @@ bitcoin.initEccLib(ecc);
  * - 'channel:resolved' ({ channelId: Buffer }) — close fully resolved on-chain
  * - 'message:outbound' (peerPubkey: string, type: number, payload: Buffer)
  * - 'htlc:forward' (fromChannelId: Buffer, toChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)
+ * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
  * - 'peer:connect' (pubkey: string)
  * - 'peer:disconnect' (pubkey: string)
  * - 'peer:error' (pubkey: string, error: Error)
@@ -4186,6 +4187,18 @@ export class LightningNode extends EventEmitter {
 	 * SCID once confirmed, or the alias the peer gave us, and never the real SCID
 	 * on an option_scid_alias channel.
 	 */
+	/**
+	 * BOLT 7 channel_flags with the direction bit for our side of this channel,
+	 * plus the disable bit (0x02) when forwarding is off. Disabling OUR
+	 * direction tells route finders not to route FROM us across the channel,
+	 * which is exactly the promise a forwarding opt-out makes; the peer's
+	 * opposite direction still lets payments reach us as the final recipient.
+	 */
+	private ourChannelFlags(ourNodeId: Buffer, peerNodeId: Buffer): number {
+		const direction = Buffer.compare(ourNodeId, peerNodeId) < 0 ? 0 : 1;
+		return direction | (this.forwardingEnabled ? 0 : 0x02);
+	}
+
 	private buildDirectChannelUpdate(channelId: Buffer): Buffer | null {
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return null;
@@ -4217,7 +4230,7 @@ export class LightningNode extends EventEmitter {
 				// update is for an UNANNOUNCED channel, so a peer relaying it would
 				// leak private-channel existence and policy (BOLT 7).
 				messageFlags: 0x01 | 0x02,
-				channelFlags: Buffer.compare(ourNodeId, peerNodeId) < 0 ? 0 : 1,
+				channelFlags: this.ourChannelFlags(ourNodeId, peerNodeId),
 				cltvExpiryDelta: policy.cltvExpiryDelta,
 				htlcMinimumMsat: policy.htlcMinimumMsat,
 				feeBaseMsat: policy.feeBaseMsat,
@@ -5345,6 +5358,14 @@ export class LightningNode extends EventEmitter {
 			const { encodeChannelUpdateMessage } = require('../gossip/messages');
 			const msg = decodeChannelUpdateMessage(cachedUpdate);
 			msg.timestamp = timestamp;
+			// Reflect the current forwarding policy in the BOLT 7 disable bit
+			// (0x02), preserving the direction bit and any others. A node that
+			// declines to forward must not keep advertising its direction as
+			// routable; a stale in-flight route that still reaches us is caught
+			// by the handleForwardHtlc opt-out.
+			msg.channelFlags = this.forwardingEnabled
+				? msg.channelFlags & ~0x02
+				: msg.channelFlags | 0x02;
 			const policy = channelId ? this.getChannelPolicy(channelId) : null;
 			if (policy && channelId) {
 				msg.cltvExpiryDelta = policy.cltvExpiryDelta;
@@ -8029,9 +8050,11 @@ export class LightningNode extends EventEmitter {
 
 		// Forwarding opt-out: a node that does not want to be a routing hop
 		// declines every forward up front, before any onward lookup or policy
-		// work. temporary_channel_failure is the well-defined "cannot relay right
-		// now" code (a blinded hop still fails as invalid_onion_blinding via
-		// failIncoming, so we do not leak that the decline was policy).
+		// work. temporary_node_failure is the correct code: this is a node-wide
+		// policy, not one outgoing channel misbehaving, and unlike
+		// temporary_channel_failure it carries no required channel_update payload
+		// (BOLT 4). A blinded hop still fails as invalid_onion_blinding via
+		// failIncoming, so we do not leak that the decline was policy.
 		if (!this.forwardingEnabled) {
 			this.emitStructuredLog('htlc', 'forward_declined', {
 				paymentHash: paymentHash.toString('hex'),
@@ -8040,7 +8063,7 @@ export class LightningNode extends EventEmitter {
 				amountInMsat: Number(incomingAmountMsat),
 				reason: 'forwarding_disabled'
 			});
-			failIncoming(TEMPORARY_CHANNEL_FAILURE);
+			failIncoming(TEMPORARY_NODE_FAILURE);
 			return;
 		}
 
@@ -8521,6 +8544,19 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
+			// Resolution counterpart to forward_attempt for the failure case, so
+			// every attempted forward pairs with a 'forwarded' or 'forward_failed'
+			// line rather than going silent when the downstream leg fails.
+			this.emitStructuredLog('htlc', 'forward_failed', {
+				inChannelId: forward.inChannelId.toString('hex'),
+				inHtlcId: Number(forward.inHtlcId),
+				outChannelId: channelId.toString('hex'),
+				outHtlcId: Number(htlcId)
+			});
+			this.emit('htlc:forward-failed', {
+				inChannelId: forward.inChannelId,
+				outChannelId: channelId
+			});
 			const inHtlcSecretKey = `${forward.inChannelId.toString('hex')}:${
 				forward.inHtlcId
 			}`;
