@@ -5,9 +5,10 @@
  * beignet relayed HTLCs for third parties unconditionally: handleForwardHtlc
  * declined only for route-intrinsic reasons (unknown SCID, fee/CLTV shortfall).
  * A wallet had no supported way to opt out. forwardingEnabled: false now
- * declines every forward up front with temporary_channel_failure, before any
- * onward lookup. A forward attempt and its resolution are also logged, so a
- * relay is as visible as a payment.
+ * declines every forward up front with temporary_node_failure, before any
+ * onward lookup, and advertises the BOLT 7 disable bit on our direction of
+ * every channel_update. A forward attempt and its resolution are also logged,
+ * so a relay is as visible as a payment.
  */
 
 import { expect } from 'chai';

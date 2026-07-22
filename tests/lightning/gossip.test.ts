@@ -2027,6 +2027,94 @@ describe('BOLT 7: Gossip & Routing', () => {
 				expect(route!.hops[0].pubkey).to.deep.equal(D.publicKey);
 			});
 
+			it('routes over a local channel whose own update carries the disable bit', () => {
+				// The forwarding opt-out (issue #176) sets the BOLT 7 disable bit
+				// on OUR direction of every channel_update, including the copy in
+				// our own graph. That bit is an advertisement to third parties not
+				// to route through us; it must not stop our own sends over our own
+				// channel (LND/CLN/LDK all route over local channels regardless).
+				// Without the overlay standing in, a wallet that opted out of
+				// forwarding could no longer pay anyone over an announced channel.
+				const graph = new NetworkGraph();
+				const { key1: S, key2: D } = makeOrderedKeypairs();
+				const scid = makeScid(101, 1, 0);
+				const { msg: ann } = buildChannelAnnouncement(
+					S,
+					D,
+					makeKeypair(),
+					makeKeypair(),
+					scid
+				);
+				graph.addChannelAnnouncement(ann);
+				// Both directions present: ours (direction 0) disabled, the
+				// peer's (direction 1) enabled.
+				const { msg: ours } = buildChannelUpdate(
+					S.privateKey,
+					scid,
+					1700000000,
+					0,
+					{
+						disabled: true,
+						cltvExpiryDelta: 40,
+						htlcMinimumMsat: 0n,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0,
+						htlcMaximumMsat: 1_000_000_000n
+					}
+				);
+				graph.applyChannelUpdate(ours);
+				const { msg: theirs } = buildChannelUpdate(
+					D.privateKey,
+					scid,
+					1700000000,
+					1,
+					{
+						cltvExpiryDelta: 40,
+						htlcMinimumMsat: 0n,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0,
+						htlcMaximumMsat: 1_000_000_000n
+					}
+				);
+				graph.applyChannelUpdate(theirs);
+
+				// A third party (or us, consulting only gossip) must not traverse
+				// the disabled direction.
+				const withoutLocal = findRoute(
+					graph,
+					S.publicKey,
+					D.publicKey,
+					100_000n,
+					144
+				);
+				expect(withoutLocal).to.be.null;
+
+				// With the local edge, the owner still routes over its channel.
+				const route = findRoute(
+					graph,
+					S.publicKey,
+					D.publicKey,
+					100_000n,
+					144,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					[
+						{
+							shortChannelId: scid,
+							peer: D.publicKey,
+							outboundMsat: 500_000_000n
+						}
+					]
+				);
+				expect(route).to.not.be.null;
+				expect(route!.hops).to.have.length(1);
+				expect(route!.hops[0].pubkey).to.deep.equal(D.publicKey);
+			});
+
 			it('prefers a shorter route over a longer zero-fee route (hop penalty)', () => {
 				// Pure fee-minimization would pick a long zero-fee path, which is
 				// far more likely to stall (each extra hop is a failure point). The

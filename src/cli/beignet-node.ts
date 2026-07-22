@@ -194,7 +194,8 @@ export interface BeignetNodeOptions {
 	/**
 	 * Relay third-party HTLCs, i.e. act as a routing hop (default true). Set false
 	 * for a wallet that should not route: every forward is declined up front with
-	 * temporary_channel_failure. Does not affect the node's own sends/receives.
+	 * temporary_node_failure and our channel_updates advertise the BOLT 7 disable
+	 * bit. Does not affect the node's own sends/receives.
 	 */
 	forwardingEnabled?: boolean;
 	/**
