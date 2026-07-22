@@ -3033,12 +3033,31 @@ export class ChannelManager extends EventEmitter {
 			deadState === ChannelState.CLOSED ||
 			deadState === ChannelState.ERRORED
 		) {
+			// An ERRORED channel is failed but possibly not yet on chain (a channel
+			// errored before force-close-on-error existed, or our broadcast is
+			// still pending). The peer reestablishing proves it has NOT closed
+			// either, so both sides may be waiting on the other: close ours now,
+			// and say so instead of claiming the channel is unknown, since this
+			// text is often the only diagnostic the peer's operator sees.
+			const failedNotClosed = deadState === ChannelState.ERRORED;
+			if (failedNotClosed) {
+				this.emit(
+					'channel:errored',
+					channel!.getChannelId() || msg.channelId,
+					'peer sent channel_reestablish for a failed channel'
+				);
+			}
 			this.sendMessage(
 				peerPubkey,
 				MessageType.ERROR,
 				encodeErrorMessage({
 					channelId: msg.channelId,
-					data: Buffer.from('unknown or closed channel', 'utf8')
+					data: Buffer.from(
+						failedNotClosed
+							? 'channel failed; closing on chain'
+							: 'unknown or closed channel',
+						'utf8'
+					)
 				})
 			);
 			return;
@@ -3876,16 +3895,23 @@ export class ChannelManager extends EventEmitter {
 		// error is part of that dance (CLN's channeld errors/restarts around it) —
 		// failing the channel here would kill it right before it recovers.
 		const inAbortDance = channel?.isSpliceAbortPending() ?? false;
+		const errorText = msg.data.toString('utf8');
 		if (
 			!isConnectionWide &&
 			channel &&
 			!inAbortDance &&
 			channel.markErrored()
 		) {
-			this.emit('channel:persist', channel.getChannelId() || msg.channelId);
+			const channelId = channel.getChannelId() || msg.channelId;
+			this.emit('channel:persist', channelId);
+			// BOLT 1: the receiver of an error MUST fail the channel it names.
+			// ERRORED alone leaves that to the peer's broadcast, which may never
+			// come (LND's ErrRecoveryError explicitly waits for us to close). The
+			// node drives the actual force-close: it owns the sweep script and
+			// fee estimate, and it must skip dataLossDetected channels.
+			this.emit('channel:errored', channelId, `Remote error: ${errorText}`);
 		}
 
-		const errorText = msg.data.toString('utf8');
 		this.emit('error', msg.channelId, `Remote error: ${errorText}`);
 	}
 
@@ -3951,6 +3977,21 @@ export class ChannelManager extends EventEmitter {
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
+					// BOLT 1: the SENDER of an error must fail the channel too. A
+					// channel that just emitted a wire error and sits ERRORED (peer
+					// protocol violation, DLP fell-behind) gets its close driven by
+					// the node, which skips the broadcast when dataLossDetected
+					// forbids it.
+					if (
+						action.messageType === MessageType.ERROR &&
+						channel.getState() === ChannelState.ERRORED
+					) {
+						this.emit(
+							'channel:errored',
+							channel.getChannelId() ?? channel.getTemporaryChannelId(),
+							'local wire error failed the channel'
+						);
+					}
 					break;
 				case ChannelActionType.CHANNEL_READY:
 					this.emit('channel:ready', action.channelId);

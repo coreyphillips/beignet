@@ -1318,6 +1318,17 @@ export class LightningNode extends EventEmitter {
 			this.emit('splice:complete', { channelId, fundingTxid });
 		});
 
+		// A channel was failed by a BOLT 1 error (received or sent). Drive the
+		// prescription to its conclusion: fail the channel ON CHAIN, rather than
+		// leaving ERRORED in limbo waiting for a peer broadcast that may never
+		// come.
+		this.channelManager.on(
+			'channel:errored',
+			(channelId: Buffer, reason: string) => {
+				this.handleChannelErrored(channelId, reason);
+			}
+		);
+
 		// Persist-before-send: channel state persisted via PERSIST_STATE action (Fix 2.2)
 		this.channelManager.on('channel:persist', (channelId: Buffer) => {
 			this.persistChannel(channelId);
@@ -9151,6 +9162,45 @@ export class LightningNode extends EventEmitter {
 		return Math.max(
 			Math.ceil(live * FORCE_CLOSE_FEE_MULTIPLIER),
 			FORCE_CLOSE_DEFAULT_SAT_PER_VBYTE
+		);
+	}
+
+	/**
+	 * A channel failed by a BOLT 1 error, ours or the peer's. BOLT 1 requires
+	 * the channel to be FAILED, not merely remembered as failed: broadcast our
+	 * latest commitment so resolution does not depend on the peer acting (LND's
+	 * ErrRecoveryError, for one, waits for us). Skips channels with nothing on
+	 * chain, and channels where data loss was detected, since broadcasting a
+	 * provably stale commitment would hand the peer the justice path; there we
+	 * keep waiting for the peer's commitment, which is the only safe outcome.
+	 */
+	private handleChannelErrored(channelId: Buffer, reason: string): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		if (state.state !== ChannelState.ERRORED) return;
+		if (!state.fundingTxid) return;
+		if (state.dataLossDetected) {
+			this.emitStructuredLog('channel', 'errored_awaiting_peer_close', {
+				channelId: channelId.toString('hex'),
+				reason
+			});
+			return;
+		}
+		this.emit('node:error', {
+			code: 'CHANNEL_FAILED_FORCE_CLOSED',
+			channelId,
+			message: `channel failed (${reason}); force-closing to resolve on chain`,
+			timestamp: Date.now()
+		} as ILightningError);
+		this.emitStructuredLog('channel', 'errored_force_closing', {
+			channelId: channelId.toString('hex'),
+			reason
+		});
+		this.channelManager.forceClose(
+			channelId,
+			this.getSweepDestinationScript(),
+			this.resolveForceCloseFeeRatePerVbyte()
 		);
 	}
 
