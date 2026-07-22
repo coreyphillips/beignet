@@ -293,3 +293,65 @@ describe('Payment retry actually dispatches', () => {
 		bob.destroy();
 	});
 });
+
+describe('Retry context lifecycle', () => {
+	it('a keysend dispatch that finds no route leaves no retry context', () => {
+		const alice = createNode(910);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+
+		expect(() =>
+			alice.sendKeysend({
+				destination: Buffer.concat([
+					Buffer.from([0x02]),
+					crypto.randomBytes(32)
+				]),
+				amountMsat: 50_000n
+			})
+		).to.throw(/route/i);
+		expect(
+			a.paymentRetryContexts.size,
+			'no context for a payment that never existed'
+		).to.equal(0);
+
+		alice.destroy();
+	});
+
+	it('pruneCompletedPayments drops a retry context whose payment is gone', () => {
+		const { alice, bob } = setupPair(912, 913);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+
+		// A live payment's context must survive the prune. Hold the HTLC on
+		// bob's side so the payment stays PENDING and its context registered.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(bob as any).handleFinalHopHtlc = (): void => {};
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'live'
+		});
+		alice.sendPayment(invoice.bolt11);
+		const liveContexts = a.paymentRetryContexts.size;
+		expect(liveContexts, 'the live payment registered a context').to.be.above(
+			0
+		);
+
+		// An orphaned one (its dispatch threw after registration) must not.
+		a.paymentRetryContexts.set('00'.repeat(32), {
+			invoiceStr: 'lnbcrt1invalid',
+			excludedChannels: new Set(),
+			retryCount: 0,
+			maxRetries: 3
+		});
+
+		alice.pruneCompletedPayments();
+		expect(a.paymentRetryContexts.has('00'.repeat(32))).to.be.false;
+		expect(
+			a.paymentRetryContexts.size,
+			'contexts with a payment record survive'
+		).to.equal(liveContexts);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
