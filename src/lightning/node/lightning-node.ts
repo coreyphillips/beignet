@@ -96,7 +96,6 @@ import {
 	createFailureMessage,
 	wrapFailureMessage,
 	decryptFailureMessage,
-	extractChannelUpdate,
 	FAILURE_MESSAGE_LENGTH
 } from '../onion/failures';
 import {
@@ -9009,27 +9008,19 @@ export class LightningNode extends EventEmitter {
 			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
 
-		// Extract and apply embedded channel_update from failure data
-		if (
-			payment.failureCode !== undefined &&
-			failureData &&
-			failureData.length > 0
-		) {
-			const updatePayload = extractChannelUpdate(
-				payment.failureCode,
-				failureData
-			);
-			if (updatePayload && updatePayload.length > 0) {
-				try {
-					const update = decodeChannelUpdateMessage(updatePayload);
-					if (update && this.graph) {
-						this.graph.applyChannelUpdate(update);
-					}
-				} catch {
-					// Invalid channel_update — ignore silently
-				}
-			}
-		}
+		// A channel_update embedded in the failure is NOT applied to the graph.
+		// BOLT 4: the origin node MAY consider it when calculating routes to
+		// retry this payment, but MUST NOT expose it to third parties in any
+		// other context, "including applying the channel_update to the local
+		// network graph". The rule exists because any hop on the path can forge
+		// one: the failure does not prove which channel it describes, so
+		// applying it lets one intermediate poison our view of an arbitrary
+		// channel, and graph contents are served onward via gossip queries.
+		// LDK dropped this handling for the same reason, and peers are
+		// transitioning away from embedding updates at all (we send len 0
+		// ourselves since #177). Routing around the failure is handled by the
+		// MissionControl penalty above and the retry's excludedChannels below;
+		// fresh policy arrives via ordinary gossip.
 
 		// Attempt payment retry for temporary failures, plus the height-skew case
 		// detected above.
