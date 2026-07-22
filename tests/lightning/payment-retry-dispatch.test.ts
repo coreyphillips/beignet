@@ -19,7 +19,8 @@ import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -29,7 +30,11 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { createFailureMessage } from '../../src/lightning/onion/failures';
-import { TEMPORARY_NODE_FAILURE } from '../../src/lightning/onion/types';
+import {
+	TEMPORARY_NODE_FAILURE,
+	FEE_INSUFFICIENT
+} from '../../src/lightning/onion/types';
+import { encodeChannelUpdateMessage } from '../../src/lightning/gossip/messages';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -350,6 +355,109 @@ describe('Retry context lifecycle', () => {
 			a.paymentRetryContexts.size,
 			'contexts with a payment record survive'
 		).to.equal(liveContexts);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+describe('Issue #182: failure-embedded channel_update never reaches the graph', () => {
+	it('keeps the graph policy when a failure carries a forged channel_update', () => {
+		const { alice, bob } = setupPair(920, 921);
+
+		// Install a channel in alice's graph on HER chain (the node is regtest,
+		// so setupPair's mainnet-hash announcement never lands in the graph; the
+		// direct payments in this file route over local channel edges instead).
+		// This is the graph entry a forged update would poison.
+		const scid = encodeShortChannelId({
+			block: 501,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const apk = Buffer.from(alice.getNodeId(), 'hex');
+		const bpk = Buffer.from(bob.getNodeId(), 'hex');
+		const aliceIsNode1 = Buffer.compare(apk, bpk) < 0;
+		alice.getGraph().addChannelAnnouncement({
+			nodeSignature1: Buffer.alloc(64),
+			nodeSignature2: Buffer.alloc(64),
+			bitcoinSignature1: Buffer.alloc(64),
+			bitcoinSignature2: Buffer.alloc(64),
+			features: Buffer.alloc(0),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: scid,
+			nodeId1: aliceIsNode1 ? apk : bpk,
+			nodeId2: aliceIsNode1 ? bpk : apk,
+			bitcoinKey1: Buffer.alloc(33, 2),
+			bitcoinKey2: Buffer.alloc(33, 3)
+		});
+		const gossiped: IChannelUpdateMessage = {
+			signature: Buffer.alloc(64),
+			chainHash: REGTEST_CHAIN_HASH,
+			shortChannelId: scid,
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 1,
+			channelFlags: 0,
+			cltvExpiryDelta: 40,
+			htlcMinimumMsat: 1000n,
+			feeBaseMsat: 1000,
+			feeProportionalMillionths: 1,
+			htlcMaximumMsat: 1_000_000_000n
+		};
+		expect(alice.getGraph().applyChannelUpdate(gossiped), 'baseline update').to
+			.be.true;
+		expect(
+			alice.getGraph().applyChannelUpdate({ ...gossiped, channelFlags: 1 }),
+			'baseline update, other direction'
+		).to.be.true;
+
+		// Bob answers the HTLC with FEE_INSUFFICIENT whose failure data embeds a
+		// channel_update claiming an absurd fee for that channel, strictly newer
+		// than the gossiped one. Any hop on a route can forge exactly this:
+		// nothing in the failure proves the update describes the channel it
+		// claims to. BOLT 4 therefore says the origin MUST NOT apply it to the
+		// local network graph.
+		const forged: IChannelUpdateMessage = {
+			...gossiped,
+			timestamp: gossiped.timestamp + 600,
+			feeBaseMsat: 999_999,
+			feeProportionalMillionths: 999_999
+		};
+		const forgedBytes = encodeChannelUpdateMessage(forged);
+		// fee_insufficient: [u64 htlc_msat][u16 len][channel_update]
+		const failureData = Buffer.alloc(10 + forgedBytes.length);
+		failureData.writeBigUInt64BE(50_000n, 0);
+		failureData.writeUInt16BE(forgedBytes.length, 8);
+		forgedBytes.copy(failureData, 10);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const b = bob as any;
+		b.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
+			const key = `${channelId.toString('hex')}:${htlcId}`;
+			const sharedSecret = b.receivedHtlcSharedSecrets.get(key);
+			b.channelManager.failHtlc(
+				channelId,
+				htlcId,
+				createFailureMessage(sharedSecret, FEE_INSUFFICIENT, failureData)
+			);
+		};
+
+		const invoice = bob.createInvoice({
+			amountMsat: 50_000n,
+			description: 'poison attempt'
+		});
+		alice.sendPayment(invoice.bolt11);
+
+		// The graph keeps the policy it learned from gossip in setupPair
+		// (base 1000, 1 ppm), in both directions.
+		const channel = alice.getGraph().getChannel(scid);
+		expect(channel, 'channel still in graph').to.not.be.undefined;
+		for (const update of [channel!.update1, channel!.update2]) {
+			expect(update, 'direction update present').to.not.be.undefined;
+			expect(update!.feeBaseMsat, 'gossip fee, not the forged one').to.equal(
+				1000
+			);
+			expect(update!.feeProportionalMillionths).to.equal(1);
+		}
 
 		alice.destroy();
 		bob.destroy();
