@@ -1127,6 +1127,72 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Re-dispatch received HTLCs that were irrevocably committed before the last
+	 * shutdown but whose resolution did not survive it.
+	 *
+	 * HTLC_FORWARDED is emitted once per HTLC, by handleRevokeAndAck, and the
+	 * marker making it once-only is persisted with the channel. Once-only is
+	 * correct while the process is up: it is what stops one inbound payment being
+	 * re-forwarded on every later commitment round. But the marker reaches disk
+	 * before the node layer has done anything with the HTLC, so a restart in that
+	 * window would otherwise leave the HTLC COMMITTED with nothing left to act on
+	 * it. The channel never re-emits, and scanForwardTimeouts skips any received
+	 * HTLC with no outgoing leg, which is exactly the stranded shape. It would sit
+	 * until its CLTV backstop fired: failed back late for a forward, or, because
+	 * we hold the preimage for our own invoice, a force close for a final hop.
+	 *
+	 * The node-side state that does not survive a restart is what needs rebuilding
+	 * here: in-flight MPP part sets and LSP-held forwards are both in-memory only.
+	 * Anything whose resolution IS durable is skipped, so this is a repair pass
+	 * rather than a second dispatch.
+	 *
+	 * Driven from channel:ready rather than from restoreFromStorage, because a
+	 * just-restored channel is in AWAITING_REESTABLISH and can send nothing: both
+	 * the onward add and the fail-back would be refused for wrong state. Every
+	 * channel passes through channel:ready once reestablish completes, and the
+	 * guards below make a repeat run a no-op.
+	 */
+	private redispatchUnresolvedReceivedHtlcs(channelId: Buffer): void {
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) return;
+
+		for (const [key, htlc] of channel.getFullState().htlcs) {
+			if (!key.startsWith('received-')) continue;
+			// Only an irrevocably committed HTLC is safe to act on, and one we
+			// already fulfilled or failed is resolved by definition.
+			if (htlc.state !== HtlcState.COMMITTED) continue;
+			// Never dispatched in the first place: handleRevokeAndAck still owes it
+			// a dispatch and will emit when the round completes.
+			if (htlc.forwardEmitted !== true) continue;
+			// A forward already went out and its mapping was restored from storage.
+			// The downstream leg resolves it; re-dispatching would offer a second
+			// outgoing HTLC for one inbound payment, the very duplication the
+			// marker exists to prevent.
+			if (this.findOutgoingLeg(channelId, htlc.id)) continue;
+			// Parked against a hold invoice. settle/cancel drives it, not the
+			// forwarding machinery.
+			if (this.isHeldHtlc(channelId, htlc.id)) continue;
+
+			this.handleIncomingHtlc(
+				channelId,
+				htlc.id,
+				htlc.amountMsat,
+				htlc.paymentHash
+			);
+		}
+	}
+
+	/** True when this received HTLC is parked awaiting a hold-invoice decision. */
+	private isHeldHtlc(channelId: Buffer, htlcId: bigint): boolean {
+		for (const held of this.heldHtlcs.values()) {
+			for (const h of held) {
+				if (h.htlcId === htlcId && h.channelId.equals(channelId)) return true;
+			}
+		}
+		return false;
+	}
+
 	// ─────────────── Storage Persist Helpers ───────────────
 
 	private persistChannel(channelId: Buffer): void {
@@ -1222,6 +1288,10 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
+			// The channel can carry updates again. Pick up any received HTLC that
+			// was dispatched before a restart but whose node-side handling did not
+			// survive it (see redispatchUnresolvedReceivedHtlcs).
+			this.redispatchUnresolvedReceivedHtlcs(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
 			this._stuckChannelTracker.delete(
 				`reestablish:${channelId.toString('hex')}`
@@ -6681,6 +6751,17 @@ export class LightningNode extends EventEmitter {
 			// that string is what makes a local failure look like a mystery.
 			payment.failureReason =
 				result.error ?? 'Local failure: could not add HTLC to the channel';
+			// htlcKey was derived from localHtlcCounter before the add, and a refused
+			// add does not consume that id, so the mapping written above now points
+			// at an id a later unrelated HTLC will take. Drop it in both places, and
+			// persist the FAILED status so storage does not keep the PENDING row
+			// written moments ago.
+			this.htlcPaymentMap.delete(htlcKey);
+			this.safeStorage(
+				() => this.storage!.deleteHtlcPaymentMapping(htlcKey),
+				'deleteHtlcPaymentMapping'
+			);
+			this.persistPayment(paymentHash);
 			this.emit('payment:failed', payment);
 		}
 
@@ -6965,6 +7046,13 @@ export class LightningNode extends EventEmitter {
 			// that string is what makes a local failure look like a mystery.
 			payment.failureReason =
 				result.error ?? 'Local failure: could not add HTLC to the channel';
+			// Same stale-mapping and unpersisted-status cleanup as sendPayment.
+			this.htlcPaymentMap.delete(htlcKey);
+			this.safeStorage(
+				() => this.storage!.deleteHtlcPaymentMapping(htlcKey),
+				'deleteHtlcPaymentMapping'
+			);
+			this.persistPayment(paymentHash);
 			this.emit('payment:failed', payment);
 		}
 
@@ -7119,16 +7207,23 @@ export class LightningNode extends EventEmitter {
 				onionBuf
 			);
 			if (!result.ok) {
-				// Rollback all previously dispatched parts
-				for (const dispatched of mppState.parts) {
-					if (dispatched.status === PaymentStatus.PENDING) {
-						this.channelManager.failHtlc(
-							dispatched.channelId,
-							dispatched.htlcId,
-							createFailureMessage(Buffer.alloc(32), TEMPORARY_CHANNEL_FAILURE)
-						);
-					}
-				}
+				// No rollback of the parts already dispatched: BOLT 2 gives no way to
+				// withdraw an update_add_htlc we have sent. Only the downstream peer
+				// can fail it back, or it times out. The loop that used to stand here
+				// called failHtlc with these OFFERED ids and the default RECEIVED
+				// direction, which at best errored and at worst cancelled an unrelated
+				// inbound HTLC that happened to share the numeric id. It was
+				// unreachable until addHtlc started reporting refusals honestly.
+				//
+				// The dispatched parts settle themselves: the payee cannot claim an
+				// incomplete MPP set, so it fails them back on its own MPP timeout.
+				this.htlcPaymentMap.delete(mppHtlcKey);
+				this.safeStorage(
+					() => this.storage!.deleteHtlcPaymentMapping(mppHtlcKey),
+					'deleteHtlcPaymentMapping'
+				);
+				mppState.parts.pop();
+
 				// Part failed to dispatch — mark payment failed
 				payment.status = PaymentStatus.FAILED;
 				payment.completedAt = Date.now();
@@ -7136,6 +7231,7 @@ export class LightningNode extends EventEmitter {
 					result.error ?? 'unknown reason'
 				})`;
 				this.outboundMppPayments.delete(hashHex);
+				this.persistPayment(paymentHash);
 				this.emit('payment:failed', payment);
 				return payment;
 			}
@@ -8347,8 +8443,16 @@ export class LightningNode extends EventEmitter {
 			);
 
 			if (!result.ok) {
-				// Forward failed — fail the incoming HTLC back
+				// Forward failed — fail the incoming HTLC back. Drop the persisted
+				// row too, not just the in-memory one: the outgoing id was read off
+				// localHtlcCounter before the add, and a refused add does not consume
+				// it, so a surviving row maps an id a later unrelated HTLC will take
+				// onto this inbound leg and would settle it against the wrong payment.
 				this.forwardedHtlcs.delete(outKey);
+				this.safeStorage(
+					() => this.storage!.deleteForwardedHtlc(outKey),
+					'deleteForwardedHtlc'
+				);
 				failIncoming(TEMPORARY_CHANNEL_FAILURE);
 				return;
 			}

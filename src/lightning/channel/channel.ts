@@ -1938,6 +1938,46 @@ export class Channel {
 	}
 
 	/**
+	 * BOLT 2 send-side guard: a received HTLC we have already settled must not be
+	 * settled a second time. The peer removes an HTLC from its update log as soon
+	 * as it accepts our update_fulfill/update_fail, so a repeat names an id the
+	 * peer no longer holds, and a peer answers that by failing the channel.
+	 *
+	 * A repeat of the SAME resolution is a no-op, mirroring the receive-side
+	 * dedup in handleUpdateFulfillHtlc: that is the harmless shape of this
+	 * mistake (an honest retransmission), and callers reasonably fire twice.
+	 *
+	 * The CROSS transition is an error rather than a no-op, because it moves
+	 * money. Failing an HTLC we already fulfilled would overwrite entry.state and
+	 * send the value to remoteBalanceMsat on the next revoke_and_ack, giving away
+	 * value whose preimage we have already revealed. Fulfilling one we already
+	 * failed reveals a preimage for value we have told the peer to take back.
+	 *
+	 * Returns the actions the caller should return, or null to proceed.
+	 */
+	private _guardRepeatSettle(
+		entry: IHtlcEntry,
+		htlcId: bigint,
+		intent: HtlcState.FULFILLED | HtlcState.FAILED
+	): ChannelAction[] | null {
+		if (entry.state === intent) {
+			return [];
+		}
+		if (
+			entry.state === HtlcState.FULFILLED ||
+			entry.state === HtlcState.FAILED
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC ${htlcId} already ${entry.state.toLowerCase()}`
+				}
+			];
+		}
+		return null;
+	}
+
+	/**
 	 * Fulfill a received HTLC with a preimage.
 	 */
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
@@ -1962,12 +2002,19 @@ export class Channel {
 			];
 		}
 
-		// Verify preimage
+		// Verify preimage. Checked before the repeat guard so a caller passing a
+		// preimage that does not hash to this HTLC is told so either way, rather
+		// than getting a silent no-op because the entry happens to be settled.
 		const hash = crypto.createHash('sha256').update(paymentPreimage).digest();
 		if (!hash.equals(entry.paymentHash)) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Invalid preimage for HTLC' }
 			];
+		}
+
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FULFILLED);
+		if (repeat) {
+			return repeat;
 		}
 
 		entry.state = HtlcState.FULFILLED;
@@ -2118,6 +2165,11 @@ export class Channel {
 			];
 		}
 
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FAILED);
+		if (repeat) {
+			return repeat;
+		}
+
 		entry.state = HtlcState.FAILED;
 		// Two-phase: the peer's signatures still include this HTLC until it
 		// revokes for our removal — buildLocalCommitment keeps it present.
@@ -2183,6 +2235,11 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${htlcId} not found` }
 			];
+		}
+
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FAILED);
+		if (repeat) {
+			return repeat;
 		}
 
 		entry.state = HtlcState.FAILED;
@@ -3108,15 +3165,27 @@ export class Channel {
 		}
 
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
-		// processed yet. This happens AFTER the full commitment round-trip
+		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
 		// is fully committed on both sides before we try to settle it.
+		//
+		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
+		// "needs dispatching" state: a received HTLC sits in it for the entire
+		// time its forward is in flight downstream, and only leaves it once we
+		// fulfill or fail it. Re-scanning the whole map on every revoke_and_ack
+		// therefore re-dispatched every unsettled inbound HTLC on every later
+		// commitment round, so the node layer offered a fresh outgoing HTLC each
+		// time for one inbound payment — draining outbound liquidity until adds
+		// started failing, and leaving several outgoing legs mapped to the same
+		// inbound leg.
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
 				entry.state === HtlcState.COMMITTED &&
-				entry.direction === HtlcDirection.RECEIVED
+				entry.direction === HtlcDirection.RECEIVED &&
+				entry.forwardEmitted !== true
 			) {
+				entry.forwardEmitted = true;
 				htlcActions.push({
 					type: ChannelActionType.HTLC_FORWARDED,
 					htlcId: entry.id,

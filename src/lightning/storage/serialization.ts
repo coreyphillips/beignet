@@ -137,6 +137,8 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
+	forwardEmitted?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -179,6 +181,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.removalLocallyRevoked !== undefined
 			? { removalLocallyRevoked: e.removalLocallyRevoked }
+			: {}),
+		...(e.forwardEmitted !== undefined
+			? { forwardEmitted: e.forwardEmitted }
 			: {})
 	};
 }
@@ -214,6 +219,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.removalLocallyRevoked !== undefined
 				? { removalLocallyRevoked: s.removalLocallyRevoked }
+				: {}),
+			...(s.forwardEmitted !== undefined
+				? { forwardEmitted: s.forwardEmitted }
 				: {})
 		}
 	};

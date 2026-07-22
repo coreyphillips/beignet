@@ -683,6 +683,29 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Derive a ChannelResult from the actions a Channel returned.
+	 *
+	 * A Channel refuses an update by returning an ERROR action, not by throwing,
+	 * so a wrapper that hardcodes ok:true reports every refusal as a success.
+	 * That is how a forward whose outgoing add was refused (for want of outbound
+	 * liquidity, or because the channel was no longer usable) still looked
+	 * delivered to the node layer, which then never failed the incoming HTLC
+	 * back. Callers already branch on ok; this makes the flag mean what they
+	 * assume it means. Matches the shape used by initiateShutdown and forceClose.
+	 */
+	private resultFromActions(actions: ChannelAction[]): ChannelResult {
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Add an HTLC to a channel.
 	 */
 	addHtlc(
@@ -723,7 +746,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -768,7 +791,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -805,7 +828,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -844,7 +867,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -871,7 +894,7 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.signCommitment(signature, htlcSignatures);
 		this.processActions(peerPubkey, channel, actions);
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
