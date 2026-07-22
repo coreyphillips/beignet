@@ -17,7 +17,11 @@ import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
-import { KEYSEND_TLV_TYPE } from '../../src/lightning/onion/types';
+import {
+	KEYSEND_TLV_TYPE,
+	INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+} from '../../src/lightning/onion/types';
+import { decryptFailureMessage } from '../../src/lightning/onion/failures';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const k = (i: number): Buffer =>
@@ -163,6 +167,46 @@ describe('BOLT 4 final-hop safety (S-4.M3/M4/M5)', () => {
 
 		expect(failed, 'keysend HTLC was failed').to.have.length(1);
 		expect(fulfilled, 'preimage was NOT revealed').to.have.length(0);
+		node.destroy();
+	});
+});
+
+/**
+ * BOLT 4 requires incorrect_or_unknown_payment_details to carry
+ * [`u64`:`htlc_msat`][`u32`:`height`]. We previously sent it with empty failure
+ * data, so a sender had no way to tell a transient block-height disagreement
+ * apart from a genuinely unknown payment hash.
+ */
+describe('incorrect_or_unknown_payment_details carries htlc_msat and height', () => {
+	it('reports our block height and the HTLC amount', () => {
+		const node = makeNode();
+		node.handleNewBlock(800_000);
+
+		const sharedSecret = crypto.randomBytes(32);
+		const reason = (
+			node as unknown as {
+				finalHopSafetyFailure: (...a: unknown[]) => Buffer | null;
+			}
+		).finalHopSafetyFailure(
+			sharedSecret,
+			{ amountToForwardMsat: 1000n, outgoingCltvValue: 0 },
+			800_001, // far inside any final-expiry requirement
+			1000n,
+			'ab'.repeat(32)
+		);
+		expect(reason, 'a too-soon expiry is failed').to.not.be.null;
+
+		const decoded = decryptFailureMessage([sharedSecret], reason!);
+		expect(decoded, 'failure decrypts').to.not.be.null;
+		expect(decoded!.failure.failureCode).to.equal(
+			INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+		);
+
+		const data = decoded!.failure.failureData;
+		expect(data.length, 'htlc_msat(8) + height(4)').to.equal(12);
+		expect(data.readBigUInt64BE(0), 'htlc_msat').to.equal(1000n);
+		expect(data.readUInt32BE(8), 'our block height').to.equal(800_000);
+
 		node.destroy();
 	});
 });

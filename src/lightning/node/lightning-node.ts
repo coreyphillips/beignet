@@ -7108,6 +7108,24 @@ export class LightningNode extends EventEmitter {
 	 * and invoice), run before any preimage is revealed. Returns a failure reason
 	 * buffer if the HTLC must be failed, or null if it is safe to proceed.
 	 */
+	/**
+	 * BOLT 4 failure data for incorrect_or_unknown_payment_details:
+	 * [`u64`:`htlc_msat`][`u32`:`height`], where height is our best known block
+	 * height when the HTLC arrived.
+	 *
+	 * The height is not decoration. PERM|15 is overloaded: it covers a genuinely
+	 * unknown payment hash (permanent) and an expiry that no longer meets our
+	 * min_final_cltv_expiry_delta (transient, and usually just block-height skew).
+	 * Returning our height is what lets the sender tell those apart instead of
+	 * abandoning a payment that would succeed on retry.
+	 */
+	private incorrectPaymentDetailsData(amountMsat: bigint): Buffer {
+		const data = Buffer.alloc(12);
+		data.writeBigUInt64BE(amountMsat, 0);
+		data.writeUInt32BE(this.currentBlockHeight, 8);
+		return data;
+	}
+
 	private finalHopSafetyFailure(
 		sharedSecret: Buffer | undefined,
 		hopPayload: IHopPayload | undefined,
@@ -7117,7 +7135,13 @@ export class LightningNode extends EventEmitter {
 	): Buffer | null {
 		const fail = (code: number): Buffer =>
 			sharedSecret
-				? createFailureMessage(sharedSecret, code)
+				? createFailureMessage(
+						sharedSecret,
+						code,
+						code === INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							? this.incorrectPaymentDetailsData(amountMsat)
+							: undefined
+				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 
 		if (incomingCltvExpiry !== undefined) {
@@ -7210,7 +7234,8 @@ export class LightningNode extends EventEmitter {
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -7225,7 +7250,8 @@ export class LightningNode extends EventEmitter {
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -7270,7 +7296,8 @@ export class LightningNode extends EventEmitter {
 			const reason = sharedSecret
 				? createFailureMessage(
 						sharedSecret,
-						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
 				  )
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -7296,7 +7323,8 @@ export class LightningNode extends EventEmitter {
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
@@ -7337,7 +7365,8 @@ export class LightningNode extends EventEmitter {
 				const reason = sharedSecret
 					? createFailureMessage(
 							sharedSecret,
-							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
 					  )
 					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 				this.cleanupHtlcSharedSecret(htlcSecretKey);
