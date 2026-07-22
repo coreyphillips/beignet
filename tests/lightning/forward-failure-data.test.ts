@@ -185,7 +185,7 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 		);
 	});
 
-	it('incorrect_cltv_expiry carries [cltv_expiry][u16 len=0]', function () {
+	it('incorrect_cltv_expiry carries [outgoing cltv_expiry][u16 len=0]', function () {
 		const { realScid } = installChannel(node);
 		// Default forwarding delta is 40; 20 blocks of headroom is short.
 		forward(realScid, 2_000_000n, 700_020, 1_000_000n, 700_000);
@@ -193,8 +193,10 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 		const { failureCode, failureData } = decodedFailure();
 		expect(failureCode).to.equal(INCORRECT_CLTV_EXPIRY);
 		expect(failureData.length, '[u32][u16]').to.equal(6);
-		expect(failureData.readUInt32BE(0), 'incoming cltv_expiry').to.equal(
-			700_020
+		// BOLT 4: "report the cltv_expiry of the outgoing HTLC" — the onion's
+		// outgoing_cltv_value (700_000), NOT the incoming HTLC's 700_020.
+		expect(failureData.readUInt32BE(0), 'outgoing cltv_expiry').to.equal(
+			700_000
 		);
 		expect(failureData.readUInt16BE(4), 'zero-length channel_update').to.equal(
 			0
@@ -245,5 +247,10 @@ describe('Issue #177: forwarding failures carry their BOLT 4 data', function () 
 		).to.equal(4);
 		// Codes without defined data must not grow any.
 		expect(data(UNKNOWN_NEXT_PEER)).to.be.undefined;
+		// Required fields must never silently default: a zeroed amount or expiry
+		// would be a syntactically valid but semantically bogus BOLT failure.
+		expect(() => data(FEE_INSUFFICIENT)).to.throw(/htlcMsat/);
+		expect(() => data(AMOUNT_BELOW_MINIMUM)).to.throw(/htlcMsat/);
+		expect(() => data(INCORRECT_CLTV_EXPIRY)).to.throw(/cltvExpiry/);
 	});
 });

@@ -7421,15 +7421,26 @@ export class LightningNode extends EventEmitter {
 				return Buffer.alloc(2);
 			case AMOUNT_BELOW_MINIMUM:
 			case FEE_INSUFFICIENT: {
-				// [u64 htlc_msat][u16 len]
+				// [u64 htlc_msat][u16 len]. Throw rather than default a missing
+				// amount to zero: a syntactically valid but semantically bogus
+				// failure would mislead the payer, and a missing field here is a
+				// caller bug, not a runtime condition.
+				if (fields.htlcMsat === undefined) {
+					throw new Error(`Missing htlcMsat for failure code ${failureCode}`);
+				}
 				const data = Buffer.alloc(10);
-				data.writeBigUInt64BE(fields.htlcMsat ?? 0n, 0);
+				data.writeBigUInt64BE(fields.htlcMsat, 0);
 				return data;
 			}
 			case INCORRECT_CLTV_EXPIRY: {
-				// [u32 cltv_expiry][u16 len]
+				// [u32 cltv_expiry][u16 len]. Per BOLT 4 this is the cltv_expiry of
+				// the OUTGOING HTLC (the onion's outgoing_cltv_value), not the
+				// incoming one. Same no-silent-default rule as htlcMsat above.
+				if (fields.cltvExpiry === undefined) {
+					throw new Error('Missing cltvExpiry for INCORRECT_CLTV_EXPIRY');
+				}
 				const data = Buffer.alloc(6);
-				data.writeUInt32BE(fields.cltvExpiry ?? 0, 0);
+				data.writeUInt32BE(fields.cltvExpiry, 0);
 				return data;
 			}
 			case CHANNEL_DISABLED:
@@ -8451,17 +8462,20 @@ export class LightningNode extends EventEmitter {
 			) {
 				// A blinded hop converts this to invalid_onion_blinding inside
 				// failIncoming, but pass the fields anyway so a future non-blinded
-				// caller of this branch cannot produce a fieldless failure.
+				// caller of this branch cannot produce a fieldless failure. BOLT 4:
+				// the reported cltv_expiry is the OUTGOING HTLC's.
 				failIncoming(INCORRECT_CLTV_EXPIRY, {
-					cltvExpiry: incomingCltvExpiry
+					cltvExpiry: forwardCltv
 				});
 				return;
 			}
 		} else {
 			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
 			if (incomingCltvExpiry < forwardCltv + outPolicy.cltvExpiryDelta) {
+				// BOLT 4: "report the cltv_expiry of the outgoing HTLC", i.e. the
+				// onion's outgoing_cltv_value, not the incoming HTLC's expiry.
 				failIncoming(INCORRECT_CLTV_EXPIRY, {
-					cltvExpiry: incomingCltvExpiry
+					cltvExpiry: forwardCltv
 				});
 				return;
 			}
