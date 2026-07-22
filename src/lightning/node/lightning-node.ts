@@ -3649,6 +3649,18 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// Phase 4: Drop retry contexts whose payment record is gone. A dispatch
+		// that throws after registering its context (route found but the add was
+		// refused, say) leaves one behind with nothing to retry, and the success
+		// and give-up paths only delete the context for payments that ran their
+		// course. Dispatch-then-reregister during a retry is synchronous, so a
+		// context can never be observed here without its payment mid-flight.
+		for (const hashHex of this.paymentRetryContexts.keys()) {
+			if (!this.payments.has(hashHex)) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+		}
+
 		return pruned;
 	}
 
@@ -6773,18 +6785,6 @@ export class LightningNode extends EventEmitter {
 			);
 		}
 
-		// A keysend has no invoice to re-pay, so record what a retry needs to
-		// replay it: the same preimage, and therefore the same payment hash.
-		if (!this.paymentRetryContexts.has(hashHex)) {
-			this.paymentRetryContexts.set(hashHex, {
-				keysend: { options, preimage },
-				excludedChannels: excludedChannels ?? new Set(),
-				retryCount: 0,
-				maxRetries: this.maxPaymentRetries,
-				maxFeeMsat
-			});
-		}
-
 		const finalCltvExpiry = this.paddedFinalCltvExpiry();
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
@@ -6814,6 +6814,21 @@ export class LightningNode extends EventEmitter {
 				LightningErrorCode.FEE_EXCEEDS_MAX,
 				'Route fee exceeds maximum'
 			);
+		}
+
+		// A keysend has no invoice to re-pay, so record what a retry needs to
+		// replay it: the same preimage, and therefore the same payment hash.
+		// Registered only after the route and fee checks pass, mirroring
+		// sendPayment: a dispatch that throws above must not leave a context
+		// behind for a payment that never existed.
+		if (!this.paymentRetryContexts.has(hashHex)) {
+			this.paymentRetryContexts.set(hashHex, {
+				keysend: { options, preimage },
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries,
+				maxFeeMsat
+			});
 		}
 
 		const hops = route.hops;
