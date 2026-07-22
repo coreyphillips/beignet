@@ -29,13 +29,16 @@ function makeBasepoints(): IChannelBasepoints {
 	};
 }
 
-function makeNode(): LightningNode {
+function makeNode(
+	extra: Partial<ConstructorParameters<typeof LightningNode>[0]> = {}
+): LightningNode {
 	const node = new LightningNode({
 		nodePrivateKey: crypto.randomBytes(32),
 		perCommitmentSeed: crypto.randomBytes(32),
 		channelBasepoints: makeBasepoints(),
 		fundingPrivkey: crypto.randomBytes(32),
-		localFeatures: LightningNode.defaultFeatures()
+		localFeatures: LightningNode.defaultFeatures(),
+		...extra
 	});
 	node.on('error', () => {});
 	return node;
@@ -162,6 +165,47 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		expect(v2Calls.length).to.equal(1);
 		// MAX_FEE_RATE_SAT_PER_VBYTE = 5000 sat/vB = 1_250_000 sat/kw
 		expect(v2Calls[0].fundingFeeratePerkw).to.equal(1_250_000);
+	});
+
+	it('a fresh node with a real fee estimator prices its first v2 open from it', async function () {
+		// The invariant behind the estimator test above, WITHOUT mocking the
+		// advisor: the constructor seeds the advisor from the estimator, so by
+		// the time the node is usable its first dual-funded open carries the
+		// estimated, clamped rate rather than falling back to the static
+		// configured feerate. This is what a v1 open gets by asking the
+		// estimator at funding time.
+		const fresh = makeNode({
+			feeEstimator: { estimateFee: async (): Promise<number> => 20 }
+		});
+		// Let the constructor's non-blocking seed land.
+		await new Promise((resolve) => setImmediate(resolve));
+		const saved = node;
+		node = fresh; // reuse wirePeer/afterEach against this node
+		wirePeer(true);
+		node.openChannel(peerPubkey, 100_000n);
+		expect(v2Calls.length).to.equal(1);
+		expect(v2Calls[0].fundingFeeratePerkw).to.equal(20 * 250);
+		saved.destroy();
+	});
+
+	it('refuses a v2 open while a configured estimator is still unsampled', function () {
+		// "Estimator configured but not yet sampled" must not collapse into
+		// the "no estimator" static fallback: that silently underprices the
+		// funding tx. The open fails honestly instead; the seed resolves
+		// almost immediately in practice and a retry succeeds.
+		const fresh = makeNode({
+			feeEstimator: {
+				estimateFee: (): Promise<number> => new Promise(() => {})
+			}
+		});
+		const saved = node;
+		node = fresh;
+		wirePeer(true);
+		expect(() => node.openChannel(peerPubkey, 100_000n)).to.throw(
+			/fee estimate not ready/i
+		);
+		expect(v2Calls.length).to.equal(0);
+		saved.destroy();
 	});
 
 	it('leaves the rate unset when neither caller nor estimator has one', function () {

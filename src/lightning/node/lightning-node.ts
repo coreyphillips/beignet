@@ -647,6 +647,13 @@ export class LightningNode extends EventEmitter {
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
 
+		// Seed the fee advisor from the estimator right away. Every later
+		// refresh rides a block event, but a dual-funded openChannel pins
+		// funding_feerate_perkw synchronously and refuses to run off an
+		// unseeded advisor, so a fresh node must not wait a whole block
+		// interval before its first v2 open can price itself.
+		this.warmFeeAdvisor();
+
 		this.graph = new NetworkGraph(this.chainHash());
 
 		this.onionMessageManager = new OnionMessageManager(config.nodePrivateKey);
@@ -3075,6 +3082,10 @@ export class LightningNode extends EventEmitter {
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
+			// The internal watcher path does not go through handleNewBlock, so
+			// keep the fee advisor warm here too — force-closes and v2 opens
+			// both price themselves synchronously off its latest sample.
+			this.warmFeeAdvisor();
 		});
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
@@ -3831,14 +3842,28 @@ export class LightningNode extends EventEmitter {
 			// clamps the caller's rate or asks the estimator at funding time.
 			// v2 cannot defer: open_channel2 itself carries funding_feerate_perkw,
 			// so the rate is pinned NOW from the same estimator's latest sample
-			// (the fee advisor), clamped identically, and converted to sat/kw
-			// (1 vB = 4 WU, so 1 sat/vB = 250 sat/kw) — the exact pattern
-			// getClosingFeeratePerKw uses. With no rate from either source,
-			// openChannelV2 falls back to the configured commitment feerate.
+			// (the fee advisor, seeded at construction and refreshed per block),
+			// clamped identically, and converted to sat/kw (1 vB = 4 WU, so
+			// 1 sat/vB = 250 sat/kw) — the exact pattern getClosingFeeratePerKw
+			// uses.
 			const quotedSatPerVbyte =
 				satsPerVbyte !== undefined
 					? satsPerVbyte
 					: this.feeAdvisor.getCurrentRate();
+			// Two different "no rate" states must not collapse: with NO
+			// estimator configured, the static configured feerate fallback in
+			// openChannelV2 is intentional. With an estimator whose seed has
+			// not landed yet (a fresh node, milliseconds after construction),
+			// silently funding at the static default would underprice the
+			// funding tx in an elevated mempool — the exact regression a v1
+			// open avoids by asking the estimator at funding time. Refuse
+			// honestly; the seed resolves almost immediately and a retry
+			// succeeds.
+			if (quotedSatPerVbyte <= 0 && this.feeEstimator) {
+				throw new Error(
+					'fee estimate not ready yet for a dual-funded open (the estimator has not delivered its first sample); retry shortly or pass an explicit satsPerVbyte'
+				);
+			}
 			return this.openChannelV2(peerPubkey, {
 				fundingSatoshis,
 				fundingFeeratePerkw:
@@ -9656,27 +9681,38 @@ export class LightningNode extends EventEmitter {
 		}
 		// Keep the fee advisor warm so a (synchronous) force-close can resolve a live
 		// feerate for its commitment CPFP + time-sensitive HTLC txs (H2). Non-blocking.
-		if (this.feeEstimator) {
-			this.feeEstimator
-				.estimateFee(6)
-				.then((rawSatPerVbyte) => {
-					const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
-					if (satPerVbyte > 0) {
-						this.feeAdvisor.recordSample(satPerVbyte);
-						// Feed the live rate to every active monitor so the RBF
-						// re-bump floor tracks the market. Monitors created
-						// mid-session (funding spend detected by the watcher)
-						// otherwise keep their build-time rate forever.
-						// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
-						for (const monitor of this.channelManager.getMonitors().values()) {
-							monitor.updateFeeRate(satPerVbyte * 250);
-						}
+		this.warmFeeAdvisor();
+	}
+
+	/**
+	 * Record a fresh estimator sample into the fee advisor and feed the live
+	 * rate to every active chain monitor so the RBF re-bump floor tracks the
+	 * market (monitors created mid-session otherwise keep their build-time
+	 * rate forever). Non-blocking, best-effort; no-op without an estimator.
+	 *
+	 * Called at construction (initial seed), on every chain-watcher block, and
+	 * from handleNewBlock. The seed matters beyond force-closes: a dual-funded
+	 * openChannel must pin funding_feerate_perkw synchronously inside
+	 * open_channel2, so the advisor must hold a sample by the time the first
+	 * open is attempted — v1 can ask the estimator at funding time, v2 cannot.
+	 */
+	private warmFeeAdvisor(): void {
+		if (!this.feeEstimator) return;
+		this.feeEstimator
+			.estimateFee(6)
+			.then((rawSatPerVbyte) => {
+				const satPerVbyte = this.clampEstimatedFeeRate(rawSatPerVbyte);
+				if (satPerVbyte > 0) {
+					this.feeAdvisor.recordSample(satPerVbyte);
+					// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
+					for (const monitor of this.channelManager.getMonitors().values()) {
+						monitor.updateFeeRate(satPerVbyte * 250);
 					}
-				})
-				.catch(() => {
-					/* best-effort; force-close falls back to the default feerate */
-				});
-		}
+				}
+			})
+			.catch(() => {
+				/* best-effort; consumers fall back to their own defaults */
+			});
 	}
 
 	getCurrentBlockHeight(): number {
