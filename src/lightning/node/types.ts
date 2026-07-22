@@ -173,6 +173,15 @@ export interface INodeConfig {
 	chainBackend?: IChainBackend;
 	/** HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) */
 	htlcSafetyMargin?: number;
+	/**
+	 * Whether to relay third-party HTLCs (be a routing hop). Default true, which
+	 * preserves the historical behaviour: any node with an announced channel
+	 * forwards. Set false to decline all forwards (a wallet that does not want to
+	 * route); declined forwards fail back promptly with temporary_node_failure,
+	 * and our channel_updates advertise the BOLT 7 disable bit so route finders
+	 * stop selecting us. Does not affect our own sends or receives.
+	 */
+	forwardingEnabled?: boolean;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */

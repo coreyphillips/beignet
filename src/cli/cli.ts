@@ -378,6 +378,7 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
 	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
 	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
+	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
 	const backupPathFlag = parseFlag('--backup-path');
@@ -456,6 +457,7 @@ async function handleStart(): Promise<void> {
 			announceAddresses: config.announceAddresses,
 			watchtowers: config.watchtowers,
 			htlcEvents: config.htlcEvents,
+			forwardingEnabled: config.forwardingEnabled,
 			logLevel: config.logLevel
 		});
 
@@ -2331,6 +2333,9 @@ Start flags:
   --htlc-events                          Relay per-HTLC events (htlc:forwarded/
                                          fulfilled/failed) over SSE + webhooks
                                          (off by default: high volume on routers)
+  --no-forwarding                        Decline to relay third-party HTLCs, i.e.
+                                         do not act as a routing hop (forwarding
+                                         is on by default)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

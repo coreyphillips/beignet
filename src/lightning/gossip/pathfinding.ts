@@ -321,18 +321,27 @@ function buildEdgeOverlay(
 
 	if (localChannels) {
 		for (const lc of localChannels) {
-			// If the channel is announced AND its graph entry carries an update
-			// for our outgoing direction, the gossip graph handles it. An entry
-			// without our update (the peer's announcement landed but our own
-			// channel_update did not survive a restart or has not been applied
-			// yet) is untraversable from our side, so the overlay must stand in:
-			// this is the one channel we are authoritative about. The overlay
-			// SCID shadows the graph copy during traversal (see hintDestMap
-			// filtering in the route loops).
+			// If the channel is announced AND its graph entry carries a USABLE
+			// update for our outgoing direction, the gossip graph handles it. Two
+			// cases make the graph copy untraversable from our side, and then the
+			// overlay must stand in (this is the one channel we are authoritative
+			// about): our update is missing (the peer's announcement landed but
+			// our own channel_update did not survive a restart or has not been
+			// applied yet), or our update carries the BOLT 7 disable bit. The
+			// disable bit is an advertisement to THIRD PARTIES not to route
+			// through us (e.g. the forwarding opt-out sets it on every channel);
+			// the owner always routes over its own channels regardless, matching
+			// LND/CLN/LDK. The overlay SCID shadows the graph copy during
+			// traversal (see hintDestMap filtering in the route loops).
 			const gc = graph.getChannel(lc.shortChannelId);
 			if (gc) {
 				const ourUpdate = source.equals(gc.nodeId1) ? gc.update1 : gc.update2;
-				if (ourUpdate) continue;
+				if (
+					ourUpdate &&
+					(ourUpdate.channelFlags & CHANNEL_FLAG_DISABLED) === 0
+				) {
+					continue;
+				}
 				shadowedScids.add(lc.shortChannelId.toString('hex'));
 			}
 			const peerHex = lc.peer.toString('hex');
