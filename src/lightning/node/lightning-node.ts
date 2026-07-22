@@ -3811,9 +3811,11 @@ export class LightningNode extends EventEmitter {
 		// open_channel must not be used; dual-fund peers reject it outright
 		// (CLN: "OPT_DUAL_FUND: cannot use open_channel"). Our default features
 		// advertise option_dual_fund, so route the open through the v2 flow and
-		// keep this one entry point working against both kinds of peer. A peer
-		// we have no init from (not connected yet) falls through to v1, which is
-		// what the peer will negotiate when the connection completes.
+		// keep this one entry point working against both kinds of peer. With no
+		// init from the peer there is nothing to judge by, so the open falls
+		// through to v1 — which then throws 'Not connected to peer' from
+		// ChannelManager.openChannel when a peer manager is attached; nothing
+		// is queued for later.
 		if (this.peerNegotiatedDualFund(peerPubkey)) {
 			if (pushMsat !== undefined && pushMsat > 0n) {
 				throw new Error(
@@ -3825,14 +3827,24 @@ export class LightningNode extends EventEmitter {
 					'max funding is not yet supported on a dual-funded (v2) open; pass an explicit amount for this peer'
 				);
 			}
+			// Same funding-fee policy as a v1 open, where handleAutoFunding
+			// clamps the caller's rate or asks the estimator at funding time.
+			// v2 cannot defer: open_channel2 itself carries funding_feerate_perkw,
+			// so the rate is pinned NOW from the same estimator's latest sample
+			// (the fee advisor), clamped identically, and converted to sat/kw
+			// (1 vB = 4 WU, so 1 sat/vB = 250 sat/kw) — the exact pattern
+			// getClosingFeeratePerKw uses. With no rate from either source,
+			// openChannelV2 falls back to the configured commitment feerate.
+			const quotedSatPerVbyte =
+				satsPerVbyte !== undefined
+					? satsPerVbyte
+					: this.feeAdvisor.getCurrentRate();
 			return this.openChannelV2(peerPubkey, {
 				fundingSatoshis,
-				// The caller quotes sat/vB; interactive tx construction prices in
-				// sat/kw (1 vB = 4 weight units, so 1 sat/vB = 250 sat/kw). The
-				// caller's rate is honoured unclamped, matching the v1 path where
-				// a requested rate is stored raw for handleAutoFunding.
 				fundingFeeratePerkw:
-					satsPerVbyte !== undefined ? Math.ceil(satsPerVbyte * 250) : undefined
+					quotedSatPerVbyte > 0
+						? Math.ceil(this.clampEstimatedFeeRate(quotedSatPerVbyte) * 250)
+						: undefined
 			});
 		}
 		const channel = this.channelManager.openChannel(

@@ -3547,13 +3547,24 @@ export class ChannelManager extends EventEmitter {
 		// acceptor path in handleOpenChannel2). In the common case (no per-channel
 		// key deriver) these are already equal.
 		// CLN requires the channel_type TLV on open_channel2 (tx_abort: "open_channel2
-		// missing channel_type"). Default it exactly like the legacy open.
+		// missing channel_type"). Default it exactly like the legacy open
+		// (Channel.initiateOpen): a taproot channel_type is the single
+		// OPTION_TAPROOT bit — the taproot bit implies anchor-style commitments
+		// and static_remotekey, and any extra bit makes peers reject the type —
+		// otherwise static_remotekey plus anchors when preferred. Without the
+		// taproot branch, an openChannel routed here by the peer's dual-fund
+		// feature would silently open a different channel type than the same
+		// call against a v1 peer.
 		let channelType = params.channelType;
 		if (!channelType) {
 			const typeFlags = FeatureFlags.empty();
-			typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			if (this.config.preferAnchors) {
-				typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			if (this.config.preferTaproot) {
+				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
+			} else {
+				typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+				if (this.config.preferAnchors) {
+					typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+				}
 			}
 			channelType = typeFlags.toBuffer();
 		}
