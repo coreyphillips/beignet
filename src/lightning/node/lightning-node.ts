@@ -3895,51 +3895,53 @@ export class LightningNode extends EventEmitter {
 						: undefined
 			});
 		}
-		const channel = this.channelManager.openChannel(
+		// The fee rate and max marker are remembered against the temporary
+		// channel id and consumed by handleAutoFunding when the peer accepts.
+		// They MUST be recorded via the beforeNegotiate hook, not after
+		// openChannel returns: with a synchronous transport the peer's
+		// accept_channel — and therefore auto-funding — runs INSIDE the
+		// openChannel call, and entries recorded after it returns are recorded
+		// too late (the open then funds at the estimator default and as a
+		// fixed-amount send even when a max sweep was requested).
+		return this.channelManager.openChannel(
 			peerPubkey,
 			fundingSatoshis,
-			pushMsat
+			pushMsat,
+			(channel) => {
+				const tempId = channel.getTemporaryChannelId().toString('hex');
+				if (satsPerVbyte !== undefined) {
+					// An open that is accepted, or that fails, takes its entry with
+					// it. One the peer neither accepts nor refuses leaves it behind,
+					// so the map is bounded rather than trusting every open to end
+					// in a way we hear about.
+					if (
+						this.requestedFundingFeeRates.size >=
+						LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
+					) {
+						const oldest = this.requestedFundingFeeRates.keys().next().value;
+						if (oldest !== undefined) {
+							this.requestedFundingFeeRates.delete(oldest);
+						}
+					}
+					this.requestedFundingFeeRates.set(tempId, satsPerVbyte);
+				}
+				// Same lifecycle as the fee rate: consumed when the peer accepts,
+				// so funding sweeps instead of building a fixed-amount tx that
+				// cannot cover its own change output at the max.
+				if (fundMax) {
+					if (
+						this.fundingMaxRequests.size >=
+						LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
+					) {
+						const oldest = this.fundingMaxRequests.values().next().value;
+						if (oldest !== undefined) {
+							this.fundingMaxRequests.delete(oldest);
+						}
+					}
+					this.fundingMaxRequests.add(tempId);
+				}
+			}
 		);
-		// Remembered against the temporary channel id, which is all the channel has
-		// until funding is created. handleAutoFunding picks it up when the peer
-		// accepts; until then the funding transaction does not exist and there is
-		// nothing to apply it to.
-		if (satsPerVbyte !== undefined) {
-			// An open that is accepted, or that fails, takes its entry with it. One
-			// the peer neither accepts nor refuses leaves it behind, so the map is
-			// bounded rather than trusting every open to end in a way we hear about.
-			if (
-				this.requestedFundingFeeRates.size >=
-				LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
-			) {
-				const oldest = this.requestedFundingFeeRates.keys().next().value;
-				if (oldest !== undefined) {
-					this.requestedFundingFeeRates.delete(oldest);
-				}
-			}
-			this.requestedFundingFeeRates.set(
-				channel.getTemporaryChannelId().toString('hex'),
-				satsPerVbyte
-			);
-		}
-		// Same lifecycle as the fee rate: remembered against the temporary id and
-		// consumed when the peer accepts, so funding sweeps instead of building a
-		// fixed-amount tx that cannot cover its own change output at the max.
-		if (fundMax) {
-			if (
-				this.fundingMaxRequests.size >=
-				LightningNode.MAX_REQUESTED_FUNDING_FEE_RATES
-			) {
-				const oldest = this.fundingMaxRequests.values().next().value;
-				if (oldest !== undefined) {
-					this.fundingMaxRequests.delete(oldest);
-				}
-			}
-			this.fundingMaxRequests.add(
-				channel.getTemporaryChannelId().toString('hex')
-			);
-		}
-		return channel;
 	}
 
 	/**
