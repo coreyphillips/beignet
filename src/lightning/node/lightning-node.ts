@@ -114,6 +114,8 @@ import {
 	FEE_INSUFFICIENT,
 	TEMPORARY_CHANNEL_FAILURE,
 	EXPIRY_TOO_SOON,
+	AMOUNT_BELOW_MINIMUM,
+	CHANNEL_DISABLED,
 	MPP_TIMEOUT,
 	TEMPORARY_NODE_FAILURE,
 	EXPIRY_TOO_FAR
@@ -7395,6 +7397,49 @@ export class LightningNode extends EventEmitter {
 		return data;
 	}
 
+	/**
+	 * BOLT 4 failure data for the UPDATE-flagged failures a forwarding node
+	 * returns. Each carries fixed fields (the HTLC amount or CLTV the check was
+	 * judged against) followed by [`u16`:`len`][`len*byte`:`channel_update`].
+	 *
+	 * We send the fixed fields with len = 0. The channel_update itself is no
+	 * longer mandatory: BOLT 4 now says nodes "are expected to transition away
+	 * from including it" and that a node not providing one sets len to zero,
+	 * which is what Eclair and LDK already do. What we must not do is what we
+	 * did before this existed: send the failure with EMPTY data, which omits
+	 * the fixed fields too and leaves the payer unable to tell what amount or
+	 * expiry was rejected.
+	 */
+	private updateFlaggedFailureData(
+		failureCode: number,
+		fields: { htlcMsat?: bigint; cltvExpiry?: number } = {}
+	): Buffer | undefined {
+		switch (failureCode) {
+			case TEMPORARY_CHANNEL_FAILURE:
+			case EXPIRY_TOO_SOON:
+				// [u16 len]
+				return Buffer.alloc(2);
+			case AMOUNT_BELOW_MINIMUM:
+			case FEE_INSUFFICIENT: {
+				// [u64 htlc_msat][u16 len]
+				const data = Buffer.alloc(10);
+				data.writeBigUInt64BE(fields.htlcMsat ?? 0n, 0);
+				return data;
+			}
+			case INCORRECT_CLTV_EXPIRY: {
+				// [u32 cltv_expiry][u16 len]
+				const data = Buffer.alloc(6);
+				data.writeUInt32BE(fields.cltvExpiry ?? 0, 0);
+				return data;
+			}
+			case CHANNEL_DISABLED:
+				// [u16 disabled_flags][u16 len]
+				return Buffer.alloc(4);
+			default:
+				return undefined;
+		}
+	}
+
 	private finalHopSafetyFailure(
 		sharedSecret: Buffer | undefined,
 		hopPayload: IHopPayload | undefined,
@@ -8315,7 +8360,13 @@ export class LightningNode extends EventEmitter {
 
 		// Fail the incoming HTLC with the given code — or, inside a blinded
 		// route, with invalid_onion_blinding regardless of the local cause.
-		const failIncoming = (failureCode: number): void => {
+		// UPDATE-flagged codes carry the BOLT 4 fixed fields for that code (see
+		// updateFlaggedFailureData); without them the payer cannot tell what
+		// amount or expiry was rejected.
+		const failIncoming = (
+			failureCode: number,
+			fields?: { htlcMsat?: bigint; cltvExpiry?: number }
+		): void => {
 			if (inBlindedRole) {
 				this.failBlindedIncomingHtlc(
 					inChannelId,
@@ -8329,7 +8380,11 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.failHtlc(
 				inChannelId,
 				inHtlcId,
-				createFailureMessage(sharedSecret, failureCode)
+				createFailureMessage(
+					sharedSecret,
+					failureCode,
+					this.updateFlaggedFailureData(failureCode, fields)
+				)
 			);
 		};
 
@@ -8394,13 +8449,20 @@ export class LightningNode extends EventEmitter {
 				incomingCltvExpiry - forwardCltv < outPolicy.cltvExpiryDelta ||
 				(blindedMaxCltv !== undefined && incomingCltvExpiry > blindedMaxCltv)
 			) {
-				failIncoming(INCORRECT_CLTV_EXPIRY);
+				// A blinded hop converts this to invalid_onion_blinding inside
+				// failIncoming, but pass the fields anyway so a future non-blinded
+				// caller of this branch cannot produce a fieldless failure.
+				failIncoming(INCORRECT_CLTV_EXPIRY, {
+					cltvExpiry: incomingCltvExpiry
+				});
 				return;
 			}
 		} else {
 			// CLTV delta enforcement: incoming CLTV must exceed outgoing by our delta
 			if (incomingCltvExpiry < forwardCltv + outPolicy.cltvExpiryDelta) {
-				failIncoming(INCORRECT_CLTV_EXPIRY);
+				failIncoming(INCORRECT_CLTV_EXPIRY, {
+					cltvExpiry: incomingCltvExpiry
+				});
 				return;
 			}
 			// Fee enforcement: incoming amount must cover outgoing amount + our fee
@@ -8409,7 +8471,7 @@ export class LightningNode extends EventEmitter {
 				(forwardAmount * BigInt(outPolicy.feeProportionalMillionths)) /
 					1_000_000n;
 			if (incomingAmountMsat < forwardAmount + requiredFee) {
-				failIncoming(FEE_INSUFFICIENT);
+				failIncoming(FEE_INSUFFICIENT, { htlcMsat: incomingAmountMsat });
 				return;
 			}
 		}
@@ -9747,7 +9809,11 @@ export class LightningNode extends EventEmitter {
 					const htlcSharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = htlcSharedSecret
-						? createFailureMessage(htlcSharedSecret, EXPIRY_TOO_SOON)
+						? createFailureMessage(
+								htlcSharedSecret,
+								EXPIRY_TOO_SOON,
+								this.updateFlaggedFailureData(EXPIRY_TOO_SOON)
+						  )
 						: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
@@ -9832,7 +9898,11 @@ export class LightningNode extends EventEmitter {
 					const sharedSecret =
 						this.receivedHtlcSharedSecrets.get(htlcSecretKey);
 					const reason = sharedSecret
-						? createFailureMessage(sharedSecret, EXPIRY_TOO_SOON)
+						? createFailureMessage(
+								sharedSecret,
+								EXPIRY_TOO_SOON,
+								this.updateFlaggedFailureData(EXPIRY_TOO_SOON)
+						  )
 						: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 					this.cleanupHtlcSharedSecret(htlcSecretKey);
 					this.channelManager.failHtlc(channelId, htlc.id, reason);
