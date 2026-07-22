@@ -563,6 +563,41 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Tear down a negotiated-but-unfunded channel after local funding failed
+	 * (buildFundingTransaction threw: insufficient funds, broadcast failure,
+	 * the max-funding mismatch guard). The channel is still keyed by its
+	 * temporary id; without this it sits in SENT_OPEN/SENT_ACCEPT forever, the
+	 * local channel list accumulates un-fundable entries, and the peer holds a
+	 * half-open channel it will never see funded.
+	 *
+	 * Sends a BOLT 1 error for the temporary channel id so the peer forgets
+	 * the channel, marks it ERRORED locally, removes it from the temp map, and
+	 * emits channel:aborted. A no-op once the channel has been promoted to its
+	 * permanent id (funding_created already went out; failing it here would be
+	 * wrong) or was already cleaned up.
+	 */
+	abortPendingOpen(channel: Channel, reason: string): void {
+		const tempIdBuf = channel.getTemporaryChannelId();
+		const tempId = tempIdBuf?.toString('hex');
+		if (!tempId || !this.tempChannels.has(tempId)) return;
+		const peerPubkey = this.channelPeers.get(tempId);
+		channel.markErrored();
+		if (peerPubkey) {
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: tempIdBuf,
+					data: Buffer.from(reason, 'utf8')
+				})
+			);
+		}
+		this.tempChannels.delete(tempId);
+		this.channelPeers.delete(tempId);
+		this.emit('channel:aborted', tempIdBuf, reason);
+	}
+
+	/**
 	 * Create funding for a channel and send funding_created.
 	 * Returns the permanent channel ID.
 	 */

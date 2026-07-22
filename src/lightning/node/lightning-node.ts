@@ -275,6 +275,7 @@ bitcoin.initEccLib(ecc);
  * - 'channel:ready' ({ channelId: Buffer })
  * - 'channel:closed' ({ channelId: Buffer })
  * - 'channel:resolved' ({ channelId: Buffer }) — close fully resolved on-chain
+ * - 'channel:aborted' (temporaryChannelId: Buffer, reason: string) — a negotiated-but-unfunded open was torn down (funding failed after accept_channel)
  * - 'message:outbound' (peerPubkey: string, type: number, payload: Buffer)
  * - 'htlc:forward' (fromChannelId: Buffer, toChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)
  * - 'htlc:forward-failed' ({ inChannelId: Buffer, outChannelId: Buffer }) — a forwarded HTLC failed downstream
@@ -1427,6 +1428,20 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// A negotiated-but-unfunded open was torn down (funding failed after
+		// accept_channel). Nothing on-chain exists, so unlike channel:errored
+		// there is nothing to fail on-chain — just surface it to listeners.
+		this.channelManager.on(
+			'channel:aborted',
+			(temporaryChannelId: Buffer, reason: string) => {
+				this.emit('channel:aborted', temporaryChannelId, reason);
+				this.emitStructuredLog('channel', 'open_aborted', {
+					temporaryChannelId: temporaryChannelId.toString('hex'),
+					reason
+				});
+			}
+		);
+
 		// Persist-before-send: channel state persisted via PERSIST_STATE action (Fix 2.2)
 		this.channelManager.on('channel:persist', (channelId: Buffer) => {
 			this.persistChannel(channelId);
@@ -2317,6 +2332,14 @@ export class LightningNode extends EventEmitter {
 					message: (err as Error).message,
 					timestamp: Date.now()
 				} as ILightningError);
+				// A funding failure after accept_channel must not strand the
+				// negotiated channel in SENT_OPEN/SENT_ACCEPT: tear it down and
+				// tell the peer, so neither side keeps a half-open channel that
+				// can never fund. No-op if funding_created already went out.
+				this.channelManager.abortPendingOpen(
+					channel,
+					`funding failed: ${(err as Error).message}`
+				);
 			});
 	}
 
