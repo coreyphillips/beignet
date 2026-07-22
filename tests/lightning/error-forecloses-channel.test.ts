@@ -29,6 +29,10 @@ import {
 } from '../../src/lightning/message/error';
 import { encodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { encodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import {
+	encodeTxAbortMessage,
+	encodeTxAddInputMessage
+} from '../../src/lightning/message/interactive-tx';
 
 // ─── Helpers (model: errored-channel-backstops.test.ts) ───
 
@@ -274,6 +278,82 @@ describe('Issue #175: a BOLT 1 error fails the channel on chain', function () {
 			.getFullState().state;
 		expect(carolState).to.equal(ChannelState.NORMAL);
 		expect(fx.events).to.not.include('CHANNEL_FAILED_FORCE_CLOSED');
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	// Drive an Alice-Carol channel into an active splice, so a foreign
+	// interactive-tx message from Bob has a live session to attack.
+	function setupSplicingCarolChannel(seedBase: number): {
+		fx: IFixture;
+		carol: LightningNode;
+		carolChannelId: Buffer;
+		carolChannel: any;
+	} {
+		const fx = setup(seedBase);
+		const carol = createNode(seedBase + 4);
+		connectNodes(fx.alice, carol);
+		const carolChannelId = openReadyChannel(fx.alice, carol);
+		const carolChannel = (fx.alice as any).channelManager.getChannel(
+			carolChannelId
+		);
+		// Quiesce, then initiate a splice: SPLICING with a live session.
+		carolChannel.initiateQuiescence();
+		carolChannel.handleStfuMessage({
+			channelId: carolChannelId,
+			initiator: false
+		});
+		carolChannel.initiateSplice(100_000n, 253);
+		expect(carolChannel.getState()).to.equal(ChannelState.SPLICING);
+		expect(carolChannel.getSpliceSession()).to.not.equal(null);
+		return { fx, carol, carolChannelId, carolChannel };
+	}
+
+	it('ignores tx_abort for a splicing channel owned by another peer', () => {
+		// Splicing reuses interactive-tx on a permanent channel, so a foreign
+		// tx_abort would otherwise cancel Alice and Carol's live splice.
+		const { fx, carol, carolChannelId, carolChannel } =
+			setupSplicingCarolChannel(101);
+
+		fx.alice.handlePeerMessage(
+			fx.bob.getNodeId(),
+			MessageType.TX_ABORT,
+			encodeTxAbortMessage({
+				channelId: carolChannelId,
+				data: Buffer.from('abort', 'utf8')
+			})
+		);
+
+		expect(carolChannel.getState()).to.equal(ChannelState.SPLICING);
+		expect(carolChannel.getSpliceSession()).to.not.equal(null);
+		fx.alice.destroy();
+		fx.bob.destroy();
+		carol.destroy();
+	});
+
+	it('ignores tx_add_input for a splicing channel owned by another peer', () => {
+		// Stronger proof: a foreign peer must not be able to MUTATE another
+		// peer's interactive splice session, not merely abort it.
+		const { fx, carol, carolChannelId, carolChannel } =
+			setupSplicingCarolChannel(107);
+		const sessionBefore = carolChannel.getSpliceSession();
+
+		fx.alice.handlePeerMessage(
+			fx.bob.getNodeId(),
+			MessageType.TX_ADD_INPUT,
+			encodeTxAddInputMessage({
+				channelId: carolChannelId,
+				serialId: 2n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			})
+		);
+
+		expect(carolChannel.getState()).to.equal(ChannelState.SPLICING);
+		// Same session object, untouched by the foreign input.
+		expect(carolChannel.getSpliceSession()).to.equal(sessionBefore);
 		fx.alice.destroy();
 		fx.bob.destroy();
 		carol.destroy();

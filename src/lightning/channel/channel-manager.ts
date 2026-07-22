@@ -1634,14 +1634,23 @@ export class ChannelManager extends EventEmitter {
 	 * several of these can drive the machine to emit a BOLT 1 error (a bad
 	 * commitment signature, a reestablish with next_commitment_number 0), which
 	 * now force-closes the channel. Resolving the channel globally by id would
-	 * let peer X close peer Y's channel with a single forged message. Opens and
-	 * interactive-tx messages are excluded: those resolve temporary channels, not
-	 * entries in `channels`, so this guard never matches them and their own
-	 * handlers keep their existing checks. ERROR/WARNING are excluded too, since
-	 * handleErrorMsg has its own BOLT 1 ownership and all-channels handling.
+	 * let peer X close peer Y's channel with a single forged message.
+	 *
+	 * The interactive-tx family is included because beignet reuses it for
+	 * SPLICING on existing permanent channels: their handlers search the
+	 * permanent `channels` map first, so a foreign tx_abort could cancel, and a
+	 * foreign tx_add_input could mutate, another peer's live splice. The guard
+	 * only refuses ids that resolve to a permanent channel owned by someone
+	 * else, so a v2 open still negotiating in `tempChannels` is untouched (its
+	 * id is not in `channels`) and reaches its existing handler unchanged.
+	 *
+	 * ERROR/WARNING are excluded, since handleErrorMsg has its own BOLT 1
+	 * ownership and all-channels handling. OPEN_CHANNEL(2) and ACCEPT_CHANNEL
+	 * do not lead with a permanent channel_id, so they are omitted.
 	 */
 	private static readonly OWNED_CHANNEL_MESSAGES: ReadonlySet<number> =
 		new Set<number>([
+			MessageType.FUNDING_SIGNED,
 			MessageType.CHANNEL_READY,
 			MessageType.UPDATE_ADD_HTLC,
 			MessageType.UPDATE_FULFILL_HTLC,
@@ -1661,7 +1670,18 @@ export class ChannelManager extends EventEmitter {
 			MessageType.SPLICE_ACK,
 			MessageType.SPLICE_LOCKED,
 			MessageType.START_BATCH,
-			MessageType.ANNOUNCEMENT_SIGNATURES
+			MessageType.ANNOUNCEMENT_SIGNATURES,
+			// Interactive-tx: dual-use for v2 opens (temp channels, not matched
+			// here) and splices (permanent channels, matched and guarded).
+			MessageType.TX_ADD_INPUT,
+			MessageType.TX_ADD_OUTPUT,
+			MessageType.TX_REMOVE_INPUT,
+			MessageType.TX_REMOVE_OUTPUT,
+			MessageType.TX_COMPLETE,
+			MessageType.TX_SIGNATURES,
+			MessageType.TX_INIT_RBF,
+			MessageType.TX_ACK_RBF,
+			MessageType.TX_ABORT
 		]);
 
 	/**
