@@ -5145,6 +5145,39 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
+		it('force-close after a peer error mid-splice (markErrored) exits on the confirmed NEW funding', function () {
+			// A BOLT 1 error lands after the splice confirmed but before
+			// splice_locked completed: markErrored replaces SPLICING with ERRORED
+			// and tears down the in-memory session, then the error path drives
+			// forceClose. Adoption must be judged by the confirmed record, not the
+			// channel state, or the exit would spend the spent pre-splice funding
+			// and never confirm.
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
+
+			openerChannel.markSpliceConfirmed();
+			expect(openerChannel.markErrored()).to.equal(true);
+			expect(openerChannel.getState()).to.equal(ChannelState.ERRORED);
+
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			const bc = findAction(res.actions, ChannelActionType.BROADCAST_TX);
+			expect(bc, 'commitment broadcast').to.not.equal(undefined);
+			const tx = bitcoin.Transaction.fromBuffer(bc.tx);
+			expect(
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'force-close after markErrored must spend the confirmed NEW funding'
+			).to.equal(true);
+			expect(openerChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		});
+
 		it('refuses a taproot splice ON THE WIRE: tx_abort, quiescence unwound, channel stays usable', function () {
 			// The splice commitment machinery is ECDSA-only. The refusal must be
 			// a real protocol answer, not a local error: the initiator gets
