@@ -3,6 +3,7 @@
 Replicated, cryptographically versioned state continuity for Lightning channels, with channel-preserving restore and split-brain fencing.
 
 Status: proposed, not started
+Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -53,7 +54,7 @@ channel_reestablish      existing DLP/SCB path
 channels RESUME          safe force close
 ```
 
-`channel_reestablish` remains the final oracle before any restored channel is allowed to transact. A restored node never sends anything except `channel_reestablish` until state agreement is proven (section 5.9).
+`channel_reestablish` is the protocol-consistency gate before any restored channel is allowed to transact, but it is not a generic proof that a recovered database is exact. The division of labor is precise: recovery storage certifies "this is the highest state this node was permitted to expose to the peer" (sections 5.5 and 5.6), and `channel_reestablish` verifies "this persisted protocol boundary is compatible with the peer's boundary". Only both together permit a channel to go Active. A restored node never sends anything except `channel_reestablish` until that check passes (section 5.7).
 
 ## 3. Verified current state of the codebase
 
@@ -319,18 +320,52 @@ export interface GuardianReceipt {
 }
 ```
 
+Epoch acquisition is a compare-and-swap takeover, not a bare increment:
+
+```ts
+export interface AcquireEpochRequest {
+  nodeId: Buffer;
+  expectedHead: RecoveryHead;   // CAS guard: the head the caller reconciled
+  newEpoch: bigint;             // must equal expectedHead.writerEpoch + 1
+  newWriterPublicKey: Buffer;
+}
+
+export interface TakeoverCertificate {
+  guardianId: Buffer;
+  takeoverHead: RecoveryHead;   // the now-immutable FINAL head of the superseded epoch
+  newEpoch: bigint;
+  newWriterPublicKey: Buffer;
+  signature: Buffer;
+}
+```
+
 Guardian invariants (enforced server-side):
 
 ```text
-accept PUT iff:
+accept PUT_STATE iff:
   epoch == current epoch for nodeId
   writerPublicKey == the writer bound to that epoch
   sequence == stored sequence + 1
   previousHash == stored frameHash
 reject everything else, including any write from a superseded epoch
+
+accept ACQUIRE_EPOCH iff:
+  expectedHead == the guardian's current stored head for nodeId
+  newEpoch == expectedHead.writerEpoch + 1
+on mismatch: reject and return the current head so the caller can
+refetch and retry the CAS
+
+PUT_STATE and ACQUIRE_EPOCH for one nodeId are linearized through a
+single per-node state machine. A takeover and an old-epoch append can
+never interleave, and once a takeover commits, the superseded epoch's
+head is immutable forever. This is a hard requirement, not an
+implementation detail: if the two verbs were independent database
+operations, a still-live old writer could append a certified state
+concurrently with a takeover, and the two sides would disagree about
+the final head of the superseded epoch.
 ```
 
-Verbs: `PUT_STATE`, `GET_STATE`, `GET_HEAD`, `ACQUIRE_EPOCH`. Transport: either a dedicated authenticated protocol or BOLT 8 custom messages to a guardian node; decide during Phase 4 design review (open question 12.1).
+Verbs: `PUT_STATE`, `GET_STATE`, `GET_HEAD`, `ACQUIRE_EPOCH`. Transport: either a dedicated authenticated protocol or BOLT 8 custom messages to a guardian node; decide during Phase 4 design review (open question 11.1). Whichever transport is chosen, it must preserve the per-node linearization above.
 
 The signed `RecoveryHead` is the anti-rollback anchor missing from a bare hash chain: a restoring device fetches heads from the quorum and refuses any replica whose tip is behind the highest quorum-certified head.
 
@@ -352,7 +387,7 @@ export interface WriterLease {
 }
 ```
 
-`ACQUIRE_EPOCH` (used at first setup and at every restore): the device generates a fresh ephemeral writer key, requests `epoch = current + 1` from the quorum, and on quorum certification the guardians permanently reject all writes from prior epochs. Binding the epoch to a writer public key (not just a number) is what prevents a second device from racing into the same epoch.
+`ACQUIRE_EPOCH` (used at first setup and at every restore): the device generates a fresh ephemeral writer key, queries heads from the guardians, reconciles the highest quorum-consistent head, and issues `AcquireEpochRequest` with that head as the CAS guard (5.5). If any guardian reports a newer head, the CAS fails, the device refetches, and retries. On quorum certification the device holds a set of `TakeoverCertificate`s fixing the superseded epoch's final head, and the guardians permanently reject all writes from prior epochs. Binding the epoch to a writer public key (not just a number) prevents a second device from racing into the same epoch; binding acquisition to `expectedHead` prevents the fetch-then-fence race described in 5.7.
 
 The fencing story, precisely:
 
@@ -385,18 +420,27 @@ derive node keys + recovery keys
       |
 retrieve peer_storage capsules from storage peers
       |
-capsule -> guardian locators -> fetch frames + quorum-certified head
+capsule -> guardian locators -> query guardian heads
       |
-verify: AEAD, sequence continuity, hash chain, head signatures
+reconcile the highest quorum-consistent head
+      |
+ACQUIRE_EPOCH(expectedHead): compare-and-swap takeover (5.5, 5.6)
+      |     CAS failure: refetch the newer head, retry
+      |
+takeover certificates fix the superseded epoch's FINAL head
+      |
+download frames through takeoverHead
+      |
+verify: AEAD, sequence continuity, hash chain, head + certificate signatures
       |
 reconstruct SQLite from snapshot + deltas (5.3)
-      |
-ACQUIRE_EPOCH (new writer key, epoch + 1)
       |
 QUARANTINE: connect peers, send ONLY channel_reestablish
       |
 per channel, classify the reestablish outcome
 ```
+
+Fence before restore, never the reverse. If reconstruction happened before the takeover, a still-live old device could certify one more state between the restoring device's fetch and its epoch acquisition. The restored node would then hold a stale head while believing it is current. Quarantine keeps such a node from transacting, but a node that believes it is current may later make a unilateral force-close decision with what is actually a revoked commitment if the peer stays unreachable. With the CAS takeover first, the superseded epoch's head is immutable before any state is downloaded, so what the new device reconstructs is provably the final certified state of the old epoch.
 
 Per-channel recovery status, richer than a binary exact/stale:
 
@@ -406,13 +450,13 @@ export enum ChannelRecoveryStatus {
   Reestablishing,   // counters agree, normal resume
   ReplayRequired,   // peer needs retransmission; serve exact bytes from the outbox
   LocalDataLoss,    // peer proved we are stale: existing DLP path, no broadcast
-  StateUncertain,   // inconsistent reestablish: force close via existing error path
+  StateUncertain,   // cannot prove our state is current: never broadcast, peer closes
   Active,
   ForceClosing,
 }
 ```
 
-`ReplayRequired` is where the outbox (5.2) pays off: BOLT 2's counters say what to retransmit; the outbox supplies exactly what was sent before the crash, preserving `commitment_signed` / `revoke_and_ack` relative order. `LocalDataLoss` and `StateUncertain` route into the existing, already-tested DLP/SCB machinery (3.4). Splice and funding reestablish disagreements route to the existing splice reestablish handling (`_handleReestablishSplice`).
+`ReplayRequired` is where the outbox (5.2) pays off: BOLT 2's counters say what to retransmit; the outbox supplies exactly what was sent before the crash, preserving `commitment_signed` / `revoke_and_ack` relative order. `LocalDataLoss` and `StateUncertain` route into the existing, already-tested DLP/SCB machinery (3.4), with one invariant stated explicitly: a channel in either state must never broadcast the stored local commitment, even if the peer stays unreachable indefinitely. Unilateral force close from these states is forbidden; the only safe exits are the peer closing (DLP) or the operator explicitly accepting the risk through a separate, clearly-labeled escape hatch that is out of scope here. This matches BOLT 2's rule that a fallen-behind node shown a later revocation secret must not broadcast its commitment. Splice and funding reestablish disagreements route to the existing splice reestablish handling (`_handleReestablishSplice`).
 
 ### 5.8 Durability policies and barriers (Phase 6)
 
@@ -529,7 +573,7 @@ Phase 4: guardian protocol + reference guardian.
 Done when: a reference guardian implementation (usable in tests, runnable standalone) enforces the invariants in 5.5; receipts verify; a restore test resumes from guardian replicas; the truncation attack (stale replica serving a shorter valid chain) is defeated by head verification.
 
 Phase 5: writer epochs + startup quarantine.
-Done when: epoch acquisition works; a two-instance test proves the stale instance freezes before sending any channel message; quarantine holds channels until ownership confirmation; all `ChannelRecoveryStatus` branches have tests, including `ReplayRequired` serving outbox bytes and `LocalDataLoss` routing to the existing DLP path.
+Done when: epoch acquisition works as a CAS takeover; a two-instance test proves the stale instance freezes before sending any channel message; a takeover-race test has the old writer append a certified state between the restoring device's head fetch and its `ACQUIRE_EPOCH`, and asserts the CAS fails, the retry lands on the newer head, and the restored state includes it; quarantine holds channels until ownership confirmation; all `ChannelRecoveryStatus` branches have tests, including `ReplayRequired` serving outbox bytes, `LocalDataLoss` routing to the existing DLP path, and `StateUncertain` provably never broadcasting the stored commitment.
 
 Phase 6: quorum barriers.
 Done when: in quorum mode, no revoke_and_ack, fulfill, or irreversible splice message precedes its quorum receipt; guardian latency does not stall unrelated channels or non-critical writes; barrier timeout behavior (freeze, not proceed) is tested.
@@ -549,7 +593,7 @@ Tests: mocha + ts-node under `tests/lightning/` per repo convention; interop sce
 
 ## 11. Open questions for design review
 
-1. Guardian transport: dedicated TLS/Noise service vs BOLT 8 custom messages to guardian Lightning nodes. The latter reuses connection code and Tor routing; the former is simpler to host.
+1. Guardian transport: dedicated TLS/Noise service vs BOLT 8 custom messages to guardian Lightning nodes. The latter reuses connection code and Tor routing; the former is simpler to host. Decided regardless of transport: `PUT_STATE` and `ACQUIRE_EPOCH` are linearized per node through one state machine (5.5); the transport choice may not relax that.
 2. AEAD choice for frames: XChaCha20-Poly1305 vs staying uniform with the existing AES-256-GCM. Uniformity has maintenance value; either is acceptable.
 3. Whether `async-remote` should auto-escalate specific transitions (first revocation after restore, splice commitment) to quorum semantics when guardians are configured.
 4. Capsule refresh policy when a node has many storage peers: same capsule to all, or head-only to some to reduce write amplification.
