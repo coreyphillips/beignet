@@ -4562,16 +4562,29 @@ export class BeignetNode extends EventEmitter {
 		// channels, the same figure canSend() reports. Surfacing both lets callers
 		// show a true "can send" (zero while still below the reserve) instead of the
 		// raw local balance, which overstates it.
+		//
+		// Routable means NORMAL or htlcUsable: a channel paying through its splice
+		// still sends, so it must keep counting. Filtering on NORMAL alone zeroed
+		// the sendable figure for the whole splice window, which read as having no
+		// funds while a payment would in fact go through. Mid-splice the spendable
+		// side is the conservative min of the live and settle-to balances,
+		// mirroring the balance side of the channel's own add gate. (The true
+		// per-add ceiling, getSpendableOutboundMsat, additionally reserves the
+		// funder's commitment fee; this aggregation, like the NORMAL-channel
+		// figure before it, prices only balance minus reserve.)
 		let reserveMsat = 0n;
 		let sendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
-			if (ch.state !== ChannelState.NORMAL) continue;
+			if (ch.state !== ChannelState.NORMAL && !ch.htlcUsable) continue;
 			const chReserveMsat = ch.localReserveMsat ?? 0n;
 			reserveMsat += chReserveMsat;
+			const effLocalMsat =
+				ch.pendingSpliceLocalBalanceMsat !== undefined &&
+				ch.pendingSpliceLocalBalanceMsat < ch.localBalanceMsat
+					? ch.pendingSpliceLocalBalanceMsat
+					: ch.localBalanceMsat;
 			sendableMsat +=
-				ch.localBalanceMsat > chReserveMsat
-					? ch.localBalanceMsat - chReserveMsat
-					: 0n;
+				effLocalMsat > chReserveMsat ? effLocalMsat - chReserveMsat : 0n;
 		}
 		return {
 			totalLocalBalanceSats: snapshot.totalLocalBalanceSats,
