@@ -1,23 +1,30 @@
 /**
- * Interop: issue #159 — the production wallet funding path, end to end.
+ * Integration: issue #159 — the production wallet funding path, end to end.
  *
- * Every other interop test funds channels through BitcoindFundingProvider
- * (bitcoind wallet RPCs). The path the daemon actually uses in production —
- * a real Electrum-backed beignet Wallet wrapped in WalletFundingProvider,
- * coin selection, fee handling, wallet.send / wallet.sendMax, and the
+ * Every interop test funds channels through BitcoindFundingProvider (bitcoind
+ * wallet RPCs). The path the daemon actually uses in production — a real
+ * Electrum-backed beignet Wallet wrapped in WalletFundingProvider, coin
+ * selection, fee handling, wallet.send / wallet.sendMax, and the
  * funding-output construction — was covered only by unit tests with mocked
  * wallets. The #156 max-sweep fix lives entirely in that path and had no
  * suite coverage at all.
  *
- * Two tiers here, both against the regtest Electrum (docker `electrum` on
- * 60001) and polar bitcoind:
+ * This lives in integration/ (NOT interop/) deliberately: it needs only
+ * bitcoind + Electrum, which CI already boots and waits for, and no
+ * LND/CLN/Eclair containers. test:lightning therefore picks it up and every
+ * PR runs it; the interop/** exclusion applies to the external-implementation
+ * tests only.
+ *
+ * Two tiers, both against the regtest Electrum (docker `electrum` on 60001)
+ * and polar bitcoind:
  *  1. a fixed-amount open auto-funded by the real wallet reaches NORMAL on
  *     both sides with the funding tx actually on the network, and
  *  2. a max open sweeps the whole spendable balance into the funding output
  *     (quoted with the same sendMax pricing the provider uses), reaches
  *     NORMAL, and leaves the on-chain balance at zero.
  *
- * Auto-skips when bitcoind or Electrum is unreachable.
+ * Missing infrastructure is an auto-skip locally, but a FAILURE under CI: a
+ * regression test that silently skips in CI protects nothing.
  */
 
 import BitcoinJsonRpc from 'bitcoin-json-rpc';
@@ -41,7 +48,7 @@ import {
 	initWaitForElectrumToSync,
 	TWaitForElectrum
 } from '../../utils';
-import { bitcoinRpc } from './shared-helpers';
+import { bitcoinRpc } from '../interop/shared-helpers';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import { WalletFundingProvider } from '../../../src/lightning/wallet/wallet-funding-provider';
 import {
@@ -111,7 +118,7 @@ function wire(a: LightningNode, b: LightningNode): void {
 	});
 }
 
-describe('Interop: WalletFundingProvider funds real channels (regtest)', function () {
+describe('Integration: WalletFundingProvider funds real channels (regtest)', function () {
 	this.timeout(180_000);
 
 	const rpc = new BitcoinJsonRpc(bitcoinURL);
@@ -134,7 +141,18 @@ describe('Interop: WalletFundingProvider funds real channels (regtest)', functio
 				bitcoinURL
 			);
 			await waitForElectrum();
-		} catch {
+		} catch (err) {
+			// CI boots bitcoind + Electrum before the suite and this test is a
+			// regression gate: unreachable infrastructure there is a broken
+			// pipeline, and skipping would silently disarm the gate. Locally,
+			// skip like the interop tests do.
+			if (process.env.CI) {
+				throw new Error(
+					`bitcoind/electrum not reachable in CI: ${
+						(err as Error)?.message ?? err
+					}`
+				);
+			}
 			skipAll = true;
 			console.log('    [skip] bitcoind/electrum not reachable');
 			this.skip();

@@ -3907,8 +3907,8 @@ export class LightningNode extends EventEmitter {
 			peerPubkey,
 			fundingSatoshis,
 			pushMsat,
-			(channel) => {
-				const tempId = channel.getTemporaryChannelId().toString('hex');
+			(temporaryChannelId) => {
+				const tempId = temporaryChannelId.toString('hex');
 				if (satsPerVbyte !== undefined) {
 					// An open that is accepted, or that fails, takes its entry with
 					// it. One the peer neither accepts nor refuses leaves it behind,

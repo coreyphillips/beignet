@@ -520,7 +520,7 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
-		beforeNegotiate?: (channel: Channel) => void
+		beforeNegotiate?: (temporaryChannelId: Buffer) => void
 	): Channel {
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
@@ -557,8 +557,9 @@ export class ChannelManager extends EventEmitter {
 		// marker). With a synchronous transport, the peer's accept_channel — and
 		// therefore channel:accepted and auto-funding — fires INSIDE
 		// processActions below, so state recorded only after this method returns
-		// is recorded too late and the open funds with defaults.
-		beforeNegotiate?.(channel);
+		// is recorded too late and the open funds with defaults. Only the id is
+		// exposed: the caller has no business mutating the channel here.
+		beforeNegotiate?.(state.temporaryChannelId);
 
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
