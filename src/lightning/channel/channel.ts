@@ -8,6 +8,7 @@
 
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
+import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import {
 	encodeOpenChannelMessage,
 	IOpenChannelMessage,
@@ -1846,6 +1847,7 @@ export class Channel {
 			// with the sender's own live-rate arithmetic whenever the two rates
 			// drifted apart, and a boundary HTLC then failed the channel over a
 			// sats-scale formula difference between two honest nodes (#193).
+			const anchor = isAnchorChannel(this._state.channelType);
 			const feeMsat =
 				BigInt(
 					calculateCommitmentFee(
@@ -1854,10 +1856,16 @@ export class Channel {
 							getRemoteCommitmentFeeRate(this._state)
 						),
 						this._countActiveHtlcs() + 1,
-						isAnchorChannel(this._state.channelType)
+						anchor
 					)
 				) * 1000n;
 			remoteRequiredMsat += feeMsat;
+			// The commitment builder deducts the two 330-sat anchor outputs
+			// from the funder's output separately from the fee; the funder must
+			// afford those above its reserve too.
+			if (anchor) {
+				remoteRequiredMsat += ANCHOR_TOTAL_COST * 1000n;
+			}
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			return [
@@ -3253,14 +3261,15 @@ export class Channel {
 		}
 
 		// Reject a feerate that would drain our (the opener's) balance below reserve,
-		// matching the acceptor's reserve guard.
+		// matching the acceptor's reserve guard. On anchor channels the builder
+		// deducts the two anchor outputs from the funder separately from the fee
+		// (#193), so the guard must count them or the promoted rate produces a
+		// commitment the reserve check would have refused.
 		const activeHtlcCount = this._countActiveHtlcs();
 		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee = calculateCommitmentFee(
-			feeratePerKw,
-			activeHtlcCount,
-			anchor
-		);
+		const newFee =
+			calculateCommitmentFee(feeratePerKw, activeHtlcCount, anchor) +
+			(anchor ? ANCHOR_TOTAL_COST : 0n);
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
 		if (newFee * 1000n > this._state.localBalanceMsat - reserveMsat) {
 			return [
@@ -3389,14 +3398,14 @@ export class Channel {
 			];
 		}
 
-		// Check if new fee rate would drain opener below channel reserve
+		// Check if new fee rate would drain opener below channel reserve. Anchor
+		// channels: the builder takes the two anchor outputs from the funder on
+		// top of the fee, so require those too (#193).
 		const activeHtlcCount = this._countActiveHtlcs();
 		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee = calculateCommitmentFee(
-			msg.feeratePerKw,
-			activeHtlcCount,
-			anchor
-		);
+		const newFee =
+			calculateCommitmentFee(msg.feeratePerKw, activeHtlcCount, anchor) +
+			(anchor ? ANCHOR_TOTAL_COST : 0n);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
 		if (newFee * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
@@ -7203,6 +7212,7 @@ export class Channel {
 					getLocalCommitmentFeeRate(this._state),
 					getRemoteCommitmentFeeRate(this._state)
 				);
+				const anchor = isAnchorChannel(this._state.channelType);
 				// Fee-spike buffer (LND-style, #193): as funder, retain the
 				// commitment fee at TWICE the live rate with room for one more
 				// HTLC beyond the one being added. An HTLC offered at the exact
@@ -7210,18 +7220,27 @@ export class Channel {
 				// arithmetic matching ours to the satoshi: the two formulas
 				// count active HTLCs from different books, so a sats-scale
 				// disagreement turns a boundary offer into a protocol violation
-				// the peer MUST fail the channel over (observed live: a
-				// 10,001-sat send at the exact ceiling force-closed an
-				// otherwise healthy channel). The buffer also absorbs genuine
-				// feerate spikes between now and the commitment that matters.
+				// the peer may fail the channel over — the sender's unaffordable
+				// offer is the BOLT 2 MUST NOT (observed live: a 10,001-sat send
+				// at the exact ceiling force-closed an otherwise healthy
+				// channel). The buffer also absorbs genuine feerate spikes
+				// between now and the commitment that matters.
 				requiredMsat +=
 					BigInt(
 						calculateCommitmentFee(
 							feeratePerKw * 2,
 							this._countActiveHtlcs() + 2,
-							isAnchorChannel(this._state.channelType)
+							anchor
 						)
 					) * 1000n;
+				// On anchor channels the commitment builder deducts the two
+				// 330-sat anchor outputs from the FUNDER's output, separately
+				// from the fee. The ceiling must retain them too, or an
+				// exact-ceiling add leaves the funder's commitment output below
+				// its negotiated reserve once the builder takes its 660 sats.
+				if (anchor) {
+					requiredMsat += ANCHOR_TOTAL_COST * 1000n;
+				}
 			}
 			const spendable = localMsat - requiredMsat;
 			return spendable > 0n ? spendable : 0n;

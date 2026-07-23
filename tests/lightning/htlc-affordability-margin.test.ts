@@ -7,13 +7,15 @@
  * agreed to the satoshi. The sender priced its retained commitment fee at the
  * live feerate; the receiver priced its demand at the static open-time
  * localConfig.feeratePerKw and counted active HTLCs from its own book. At the
- * boundary, a sats-scale formula disagreement becomes a protocol violation
- * the receiver MUST fail the channel over (BOLT 2).
+ * boundary, a sats-scale formula disagreement becomes a protocol violation:
+ * offering an unaffordable HTLC is the sender's BOLT 2 MUST NOT, and the
+ * receiver may respond by failing the channel, as beignet does.
  *
- * Two-part fix under test: the receiver now prices at the live commitment
- * feerate (same source as the sender), and the sender retains an LND-style
- * fee-spike buffer (commitment fee at twice the live rate with one extra
- * HTLC slot), so an offer at the ceiling always clears the receiver's margin.
+ * Fix under test: the receiver prices at the live commitment feerate (same
+ * source as the sender), the sender retains an LND-style fee-spike buffer
+ * (commitment fee at twice the live rate with one extra HTLC slot), and on
+ * anchor channels both sides count the two 330-sat anchor outputs the
+ * commitment builder deducts from the funder separately from the fee.
  */
 
 import { expect } from 'chai';
@@ -24,6 +26,7 @@ import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { calculateCommitmentFee } from '../../src/lightning/channel/commitment-builder';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -215,13 +218,55 @@ describe('Issue #193: HTLCs at the spendable ceiling never trip the receiver', f
 		// margin, not just the one-commitment fee the old formula kept.
 		const singleFeeCeiling = state.localBalanceMsat - reserveMsat;
 		expect(spendable < singleFeeCeiling, 'buffer applied').to.equal(true);
-		// And the margin exceeds what a SINGLE commitment fee explains: at the
-		// default 253 sat/kw a one-HTLC non-anchor commitment costs ~326 sats,
-		// which is all the old formula retained. The 2x-rate, extra-slot buffer
-		// must hold back meaningfully more.
+		// And the margin exceeds what a SINGLE commitment fee explains: these
+		// harness channels are NON-anchor (preferAnchors unset), where a
+		// one-HTLC commitment at the default 253 sat/kw costs ~226 sats, which
+		// is all the old formula retained. The 2x-rate, extra-slot buffer must
+		// hold back meaningfully more.
 		expect(
 			singleFeeCeiling - spendable > 400_000n, // > 400 sats
 			'margin beyond a single commitment fee'
 		).to.equal(true);
+	});
+
+	it('an ANCHOR channel ceiling leaves the funder at or above reserve after fee and anchors', function () {
+		// Beignet's default channel type in production is anchors, where the
+		// commitment builder deducts the two 330-sat anchor outputs from the
+		// FUNDER's output separately from the fee. A ceiling that ignores the
+		// 660 sats leaves the funder's commitment output below its negotiated
+		// reserve once the builder takes them — the receiver-side check missed
+		// it too (both formulas shared the omission), so the books stayed in
+		// agreement while both drifted below the reserve floor the builder
+		// actually enforces.
+		alice = createNode(7, { preferAnchors: true });
+		bob = createNode(8, { preferAnchors: true });
+		wire(alice, bob);
+		const channelId = openChannel(alice, bob);
+
+		const channel = alice.getChannelManager().getChannel(channelId)!;
+		const state = channel.getFullState();
+		expect(
+			state.channelType && state.channelType.length > 0,
+			'anchor channel negotiated'
+		).to.equal(true);
+
+		const ceiling = channel.getSpendableOutboundMsat();
+		const reserveMsat = state.remoteConfig.channelReserveSatoshis * 1000n;
+		// After the ceiling add, the funder must still cover the ACTUAL next
+		// commitment: fee at the live rate with the new HTLC, plus 660 sats of
+		// anchor outputs, all above the reserve.
+		const liveFee =
+			BigInt(calculateCommitmentFee(state.localConfig.feeratePerKw, 1, true)) *
+			1000n;
+		const anchorsMsat = 660_000n;
+		expect(
+			state.localBalanceMsat - ceiling - liveFee - anchorsMsat >= reserveMsat,
+			'funder stays at or above reserve after fee + anchors'
+		).to.equal(true);
+
+		// And the whole flow works at that ceiling.
+		const { status, affordabilityErrors } = payAtCeiling(alice, bob, channelId);
+		expect(affordabilityErrors).to.deep.equal([]);
+		expect(status).to.equal(PaymentStatus.COMPLETED);
 	});
 });
