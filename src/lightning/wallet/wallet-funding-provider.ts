@@ -13,6 +13,7 @@ import { ISpliceWalletInput } from '../channel/channel';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
+	dualFundingContributionWeight,
 	outputWeight,
 	P2WPKH_INPUT_WEIGHT,
 	P2WPKH_DUST_LIMIT
@@ -332,6 +333,51 @@ export class WalletFundingProvider implements IFundingProvider {
 			maxAmountSats,
 			inputCount: candidates.length
 		};
+	}
+
+	/**
+	 * Price a max (sweep-everything) dual-funded open: every spendable P2WPKH
+	 * UTXO goes in, and the committed funding amount is what remains after the
+	 * initiator's interactive-tx fee share. Priced with the SAME weight formula
+	 * the channel's contribution computation applies, so at funding time the
+	 * derived change is exactly zero and the funding tx has no change output.
+	 */
+	quoteDualFundingMax(feeratePerKw: number): {
+		fundingSatoshis: bigint;
+		spendableSats: bigint;
+		feeSats: bigint;
+		inputCount: number;
+	} {
+		const candidates = this.spendableP2wpkhUtxos();
+		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+		const feeSats = spliceFeeSats(
+			dualFundingContributionWeight(candidates.length, true),
+			feeratePerKw
+		);
+		return {
+			fundingSatoshis: spendableSats > feeSats ? spendableSats - feeSats : 0n,
+			spendableSats,
+			feeSats,
+			inputCount: candidates.length
+		};
+	}
+
+	/**
+	 * Select EVERY spendable P2WPKH UTXO for a max dual-funded open, with the
+	 * same signing closures as splice-in. The change script is still returned
+	 * for the channel's derivation, which nets change out to zero when the
+	 * balance matches the quote.
+	 */
+	async selectMaxDualFundingInputs(): Promise<{
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+	}> {
+		// Target the full spendable balance so selection takes every UTXO.
+		const total = this.spendableP2wpkhUtxos().reduce(
+			(s, u) => s + BigInt(u.value),
+			0n
+		);
+		return this.gatherWalletInputs('max-funded v2 open', () => total);
 	}
 
 	/**

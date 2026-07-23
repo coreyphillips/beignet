@@ -129,6 +129,7 @@ import { SpliceSession, SpliceState, ISpliceSessionParams } from './splice';
 import {
 	estimateSpliceTxWeight,
 	spliceFeeSats,
+	dualFundingContributionWeight,
 	P2WPKH_DUST_LIMIT,
 	SPLICE_TX_BASE_WEIGHT,
 	SHARED_FUNDING_INPUT_WEIGHT,
@@ -9560,18 +9561,26 @@ export class Channel {
 		if (!session || !c) return 'No dual-funding contribution registered';
 		const initiator = session.isInitiator();
 
-		// P2WPKH input ≈ 272 WU (outpoint+scriptlen+sequence 164 + witness
-		// ~108); P2WPKH output = 124 WU. Reserve a small cushion above that —
-		// the peer's interactive-tx balance check (CLN) estimates our witness
-		// weight before seeing it, and under-reserving fails the negotiation
-		// while a few extra sats simply shrink the change.
-		let weight = 320 * c.inputs.length + 140;
-		// BOLT 2: the initiator additionally pays the feerate over the common
-		// transaction fields (~42 WU) and the shared funding output it
-		// contributes (P2WSH/P2TR output = 172 WU), with the same cushion
-		// rationale as above.
-		if (initiator) weight += 240;
-		const feeSats = spliceFeeSats(weight, c.feeratePerKw);
+		// A zero contribution (a plain v2 accept: no inputs, no funding share)
+		// adds nothing to the transaction, so it owes no fee and produces no
+		// outputs — the drive goes straight to tx_complete on our turns.
+		// Without this early exit the change derivation below reserves the
+		// change-output cushion against inputs that do not exist and fails
+		// every plain accept as "underfunded".
+		if (!initiator && c.inputs.length === 0 && c.contributionSats === 0n) {
+			this._dualFundingContribs = [];
+			return null;
+		}
+
+		// BOLT 2: each side pays the feerate over the weight of what IT adds;
+		// the initiator additionally pays for the common transaction fields and
+		// the shared funding output. Cushioned figures — see
+		// dualFundingContributionWeight, which the funding provider's max-open
+		// quote shares so a max contribution nets out to exactly zero change.
+		const feeSats = spliceFeeSats(
+			dualFundingContributionWeight(c.inputs.length, initiator),
+			c.feeratePerKw
+		);
 
 		let walletTotal = 0n;
 		this._dualFundingContribs = [];

@@ -3872,9 +3872,32 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 			if (fundMax) {
-				throw new Error(
-					'max funding is not yet supported on a dual-funded (v2) open; pass an explicit amount for this peer'
+				// A v2 max cannot reuse the caller's committed amount: a v1 max is
+				// quoted from the sweep transaction's actual vbytes, while a v2
+				// initiator pays the cushioned interactive-tx weight formula — the
+				// two disagree by design. Recompute the committed amount here from
+				// the same provider and formula that will fund it, at the pinned
+				// rate (required above), so funding nets out to zero change.
+				const fp = this.fundingProvider;
+				if (!fp?.quoteDualFundingMax || !fp.selectMaxDualFundingInputs) {
+					throw new Error(
+						'max funding on a dual-funded (v2) open requires a funding provider with quoteDualFundingMax and selectMaxDualFundingInputs'
+					);
+				}
+				const feeratePerKw = Math.ceil(
+					this.clampEstimatedFeeRate(satsPerVbyte!) * 250
 				);
+				const quote = fp.quoteDualFundingMax(feeratePerKw);
+				if (quote.fundingSatoshis <= 0n) {
+					throw new Error(
+						`insufficient funds for a max dual-funded open: ${quote.spendableSats} sats spendable cannot cover the ${quote.feeSats} sat funding fee`
+					);
+				}
+				return this.openChannelV2(peerPubkey, {
+					fundingSatoshis: quote.fundingSatoshis,
+					fundingFeeratePerkw: feeratePerKw,
+					fundMax: true
+				});
 			}
 			// Same funding-fee policy as a v1 open, where handleAutoFunding
 			// clamps the caller's rate or asks the estimator at funding time.
@@ -4005,6 +4028,13 @@ export class LightningNode extends EventEmitter {
 			 * to_remote lease CLTV cannot ride a non-anchor P2WPKH output.
 			 */
 			channelType?: Buffer;
+			/**
+			 * Max (sweep-everything) open: fundingSatoshis must have been quoted
+			 * via the funding provider's quoteDualFundingMax at
+			 * fundingFeeratePerkw; funding then contributes every spendable UTXO
+			 * (selectMaxDualFundingInputs) so change nets out to zero.
+			 */
+			fundMax?: boolean;
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -4020,6 +4050,14 @@ export class LightningNode extends EventEmitter {
 		if (params.requestFunds && !params.maxLeaseRates) {
 			throw new Error(
 				'requestFunds requires maxLeaseRates (buyer fee ceiling)'
+			);
+		}
+		// A lease fee is only known once the seller answers will_fund, but a max
+		// open must commit the ENTIRE balance minus fees in open_channel2 —
+		// there is nothing left to absorb the fee later.
+		if (params.fundMax && params.requestFunds) {
+			throw new Error(
+				'max funding cannot be combined with requestFunds (the lease fee is not known when the max is committed)'
 			);
 		}
 
@@ -4049,7 +4087,8 @@ export class LightningNode extends EventEmitter {
 			),
 			requestFunds: params.requestFunds,
 			maxLeaseRates: params.maxLeaseRates,
-			channelType: params.channelType
+			channelType: params.channelType,
+			fundMax: params.fundMax
 		};
 
 		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams);
@@ -5412,7 +5451,16 @@ export class LightningNode extends EventEmitter {
 		const channelId = state.channelId || state.temporaryChannelId;
 		const info: IChannelInfo = {
 			channelId,
-			peerPubkey: this.channelManager.getPeerForChannel(channelId) ?? '',
+			// A v2 open carries its derived channel_id from accept_channel2 on,
+			// but the peer map keeps the temporary-id key until the channel is
+			// promoted (AWAITING_FUNDING_CONFIRMED). Fall back to the temp id so
+			// a mid-negotiation channel still reports its peer instead of an
+			// empty pubkey (which the dashboard renders as an unknown, offline
+			// peer with a Reconnect button that cannot work).
+			peerPubkey:
+				this.channelManager.getPeerForChannel(channelId) ??
+				this.channelManager.getPeerForChannel(state.temporaryChannelId) ??
+				'',
 			state: state.state,
 			localBalanceMsat: balances.localMsat,
 			remoteBalanceMsat: balances.remoteMsat,

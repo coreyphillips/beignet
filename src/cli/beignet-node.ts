@@ -2432,7 +2432,10 @@ export class BeignetNode extends EventEmitter {
 			state: state.state as import('./types').ChannelStateString,
 			localBalanceSats: Number(balances.localMsat / 1000n),
 			remoteBalanceSats: Number(balances.remoteMsat / 1000n),
-			capacitySats: amountSats,
+			// From the channel state, not the caller's amountSats: a max open
+			// toward a dual-fund peer commits the engine's own quote, which is
+			// what the channel is actually funded at.
+			capacitySats: Number(state.fundingSatoshis),
 			isAnchor: isAnchorChannel(state.channelType)
 		};
 	}
@@ -2578,8 +2581,14 @@ export class BeignetNode extends EventEmitter {
 		if (!channel) return null;
 
 		const state = channel.getFullState();
+		// Mid-negotiation v2 channels are keyed by temporary id in the peer map
+		// (see buildChannelInfo); fall back so diagnostics name the peer too.
 		const peerPubkey =
-			this.node.getChannelManager().getPeerForChannel(channelIdBuf) || '';
+			this.node.getChannelManager().getPeerForChannel(channelIdBuf) ||
+			this.node
+				.getChannelManager()
+				.getPeerForChannel(channel.getTemporaryChannelId()) ||
+			'';
 		const isPeerConnected = this.listPeers().some(
 			(p) => p.pubkey === peerPubkey
 		);
