@@ -24,6 +24,7 @@ import { ILogger, TLogLevel, LOG_LEVEL_PRIORITY } from '../logger';
 import { generateMnemonic, getBitcoinJsNetwork } from '../utils/helpers';
 import { btcToSats } from '../utils/conversion';
 import {
+	EAddressType,
 	EAvailableNetworks,
 	EBoostType,
 	EPaymentType,
@@ -173,6 +174,11 @@ export interface BeignetNodeOptions {
 	 * falls back to HTTP when Electrum is unavailable.
 	 */
 	feeEstimationSource?: 'electrum' | 'http' | 'auto';
+	/**
+	 * On-chain address type for the wallet (default 'p2wpkh'). 'p2tr' gives
+	 * taproot deposit addresses; channel funding/splices can spend both kinds.
+	 */
+	addressType?: 'p2wpkh' | 'p2tr';
 	listenPort?: number;
 	/**
 	 * Accept inbound Lightning peers over WebSocket (RFC 6455) on this port.
@@ -196,6 +202,11 @@ export interface BeignetNodeOptions {
 	 * SCIDs, open a zero-conf channel to the wallet, then forward.
 	 */
 	jitReceive?: import('../lightning/liquidity/jit-receive').IJitReceiveConfig;
+	/**
+	 * Zero-conf splices with trusted peers: splice_locked at broadcast, so a
+	 * splice is usable in seconds. Same trust model as zero-conf opens.
+	 */
+	trustedZeroConfSplice?: boolean;
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -721,6 +732,9 @@ export class BeignetNode extends EventEmitter {
 		const walletResult = await Wallet.create({
 			mnemonic: this.mnemonic,
 			network: beignetNetwork,
+			...(opts.addressType
+				? { addressType: opts.addressType as EAddressType }
+				: {}),
 			...(opts.feeEstimationSource
 				? { feeEstimationSource: opts.feeEstimationSource }
 				: {}),
@@ -874,6 +888,7 @@ export class BeignetNode extends EventEmitter {
 			largeChannels: opts.largeChannels,
 			leaseRates: opts.leaseRates,
 			jitReceive: opts.jitReceive,
+			trustedZeroConfSplice: opts.trustedZeroConfSplice,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			logger: this.logger,
@@ -962,6 +977,14 @@ export class BeignetNode extends EventEmitter {
 			this.log('info', 'Channel closed', { channelId });
 			this.refreshStaticChannelBackup();
 			this.emit('channel:closed', { channelId });
+		});
+		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
+			const channelId = data.channelId.toString('hex');
+			this.log('warn', 'Channel voided — funding tx vanished before confirming', {
+				channelId
+			});
+			this.refreshStaticChannelBackup();
+			this.emit('channel:voided', { channelId });
 		});
 		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
 		// so refresh here too even though the event is not re-emitted.
@@ -2660,6 +2683,7 @@ export class BeignetNode extends EventEmitter {
 		fundingSatoshis: bigint;
 		channelType?: Buffer | null;
 		fundingTxid?: string;
+		fundingOutputIndex?: number;
 		shortChannelId?: string;
 		feeratePerKw?: number;
 		htlcCount?: number;
@@ -2688,6 +2712,9 @@ export class BeignetNode extends EventEmitter {
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
 		};
 		if (ch.fundingTxid) info.fundingTxid = ch.fundingTxid;
+		if (ch.fundingOutputIndex !== undefined) {
+			info.fundingOutputIndex = ch.fundingOutputIndex;
+		}
 		if (ch.shortChannelId) info.shortChannelId = ch.shortChannelId;
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;
 		if (ch.htlcCount !== undefined) info.htlcCount = ch.htlcCount;

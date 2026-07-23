@@ -3811,6 +3811,45 @@ export class ChannelManager extends EventEmitter {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/**
+	 * Void a channel whose funding tx vanished from mempool AND chain before
+	 * confirming (evicted or an input double-spent): the channel never existed
+	 * on the network, so there is nothing to close — it is simply dropped.
+	 * The coins contributed to the funding remain (or return) onchain.
+	 * Returns false if the channel is unknown.
+	 */
+	voidChannel(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) return false;
+		this.channels.delete(idHex);
+		this.channelPeers.delete(idHex);
+		return true;
+	}
+
+	/**
+	 * Abort a pending (pre-funding) channel after a local failure — e.g. the
+	 * opener's auto-funding could not source inputs. Sends a BOLT 1 error for
+	 * the temporary channel id so the peer discards its half, and forgets the
+	 * local temp channel. No-op once the channel has progressed to a permanent
+	 * id (funding_created sent) — aborting then goes through the close paths.
+	 */
+	abortPendingChannel(temporaryChannelId: Buffer, reason: string): void {
+		const tempIdHex = temporaryChannelId.toString('hex');
+		const peerPubkey = this.channelPeers.get(tempIdHex);
+		if (!this.tempChannels.has(tempIdHex) || !peerPubkey) return;
+		this.tempChannels.delete(tempIdHex);
+		this.channelPeers.delete(tempIdHex);
+		this.sendMessage(
+			peerPubkey,
+			MessageType.ERROR,
+			encodeErrorMessage({
+				channelId: temporaryChannelId,
+				data: Buffer.from(reason, 'utf8')
+			})
+		);
+	}
+
 	private handleErrorMsg(_peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');

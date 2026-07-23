@@ -72,6 +72,8 @@ export interface ChannelInfo {
 	isAnchor: boolean;
 	isPrivate?: boolean;
 	fundingTxid?: string;
+	/** Output index of the funding outpoint in fundingTxid. */
+	fundingOutputIndex?: number;
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
@@ -765,6 +767,9 @@ export interface BeignetNodeEvents {
 		initiator: 'local' | 'remote';
 	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
+	/** The channel's funding tx vanished from mempool and chain before
+	 *  confirming — the channel was dropped; its coins remain onchain. */
+	'channel:voided': (data: { channelId: string }) => void;
 	'htlc:forwarded': (data: {
 		inChannelId: string;
 		outChannelId: string;

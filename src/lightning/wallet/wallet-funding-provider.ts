@@ -21,6 +21,38 @@ import {
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
 
+/** Classify a scriptPubKey as one of the spendable kinds, or null. */
+export function scriptKind(script: Buffer): 'p2wpkh' | 'p2tr' | null {
+	if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
+		return 'p2wpkh';
+	}
+	if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+		return 'p2tr';
+	}
+	return null;
+}
+
+/**
+ * BIP 86/341 key-path tweak: negate the private key when its point has an
+ * odd Y, then add taggedHash("TapTweak", xonly(P)).
+ */
+export function taprootTweakPrivateKey(
+	privKey: Buffer,
+	pubkey: Buffer
+): Buffer {
+	const xOnly = pubkey.length === 33 ? pubkey.subarray(1, 33) : pubkey;
+	let priv: Uint8Array = privKey;
+	if (pubkey.length === 33 && pubkey[0] === 0x03) {
+		const negated = ecc.privateNegate(priv);
+		if (!negated) throw new Error('taproot tweak: privateNegate failed');
+		priv = negated;
+	}
+	const tweak = bitcoin.crypto.taggedHash('TapTweak', Buffer.from(xOnly));
+	const tweaked = ecc.privateAdd(priv, tweak);
+	if (!tweaked) throw new Error('taproot tweak: privateAdd failed');
+	return Buffer.from(tweaked);
+}
+
 /**
  * Minimal Result-like interface matching beignet's Result<T> union type.
  * Both Ok and Err satisfy this via structural typing.
@@ -103,6 +135,21 @@ export interface IWalletLike {
 	getChangeAddress?(): Promise<IResult>;
 	/** 'bitcoin' | 'testnet' | 'regtest' (beignet EAvailableNetworks). */
 	network?: string;
+	/** UTXO freeze API — used to pledge inputs to in-flight fundings so two
+	 *  concurrent fundings can never select (and double-spend) the same coin. */
+	isUtxoFrozen?(txid: string, index: number): boolean;
+	freezeUtxo?(params: {
+		txid: string;
+		index: number;
+		tag?: string;
+	}): Promise<IResult>;
+	unfreezeUtxo?(params: { txid: string; index: number }): Promise<IResult>;
+	listFrozenUtxos?(): Array<{
+		tx_hash: string;
+		tx_pos: number;
+		freezeTag?: string;
+		frozenAt?: number;
+	}>;
 }
 
 /**
@@ -117,8 +164,85 @@ export interface IWalletLike {
 export class WalletFundingProvider implements IFundingProvider {
 	private wallet: IWalletLike;
 
+	/**
+	 * Outpoints pledged to an in-flight funding ("txid:vout" → pledge time).
+	 * A pledged coin is frozen in the wallet so NO other selection path —
+	 * neither gatherWalletInputs (v2 lease contributions, splices) nor
+	 * wallet.send (v1/JIT funding txs) — can pick it while its funding tx is
+	 * still unbroadcast/unconfirmed. Without this, two fundings in quick
+	 * succession can spend the same coin and the second (RBF-signaling) tx
+	 * silently replaces the first — orphaning a zero-conf channel that both
+	 * peers already consider NORMAL.
+	 *
+	 * Pledges are pruned when the wallet stops listing the outpoint (the
+	 * funding tx spent it) or after PLEDGE_TTL_MS (the funding session was
+	 * aborted before broadcast). Pledge freezes persist in the wallet with a
+	 * PLEDGE_TAG; on restart, tagged entries this instance doesn't know are
+	 * adopted (with their original timestamp) so they age out through the same
+	 * TTL/spent pruning instead of locking coins forever after a crash.
+	 */
+	private pledged = new Map<string, number>();
+	private adoptedStale = false;
+	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
+	private static readonly PLEDGE_TAG = 'funding-pledge';
+
 	constructor(wallet: IWalletLike) {
 		this.wallet = wallet;
+	}
+
+	/** Freeze the outpoint and remember when we pledged it. */
+	private async pledge(txid: string, vout: number): Promise<void> {
+		this.pledged.set(`${txid}:${vout}`, Date.now());
+		await this.wallet.freezeUtxo?.({
+			txid,
+			index: vout,
+			tag: WalletFundingProvider.PLEDGE_TAG
+		});
+	}
+
+	/**
+	 * Adopt pledge-tagged freezes left over from a previous run (crash between
+	 * freeze and broadcast). They enter the pledged map with their persisted
+	 * timestamp — an entry with no timestamp is treated as already expired —
+	 * and the regular pruning unfreezes them. User freezes (no tag) are never
+	 * touched.
+	 */
+	private adoptStalePledges(): void {
+		if (this.adoptedStale) return;
+		this.adoptedStale = true;
+		const frozen = this.wallet.listFrozenUtxos?.() ?? [];
+		for (const f of frozen) {
+			if (f.freezeTag !== WalletFundingProvider.PLEDGE_TAG) continue;
+			const key = `${f.tx_hash}:${f.tx_pos}`;
+			if (this.pledged.has(key)) continue;
+			this.pledged.set(key, f.frozenAt ?? 0);
+		}
+	}
+
+	/** Unfreeze pledges whose funding tx spent them or that timed out. */
+	private async prunePledges(): Promise<void> {
+		this.adoptStalePledges();
+		if (this.pledged.size === 0 || !this.wallet.listUtxos) return;
+		const utxos = this.wallet.listUtxos();
+		// An empty UTXO list is indistinguishable from a wallet that has not
+		// loaded/refreshed yet — treating everything as spent would mass-
+		// unfreeze valid pledges, and with no coins there is nothing a pledge
+		// could block anyway.
+		if (utxos.length === 0) return;
+		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+		const now = Date.now();
+		for (const [key, ts] of [...this.pledged]) {
+			const spent = !live.has(key);
+			const expired = now - ts > WalletFundingProvider.PLEDGE_TTL_MS;
+			if (spent || expired) {
+				this.pledged.delete(key);
+				const sep = key.lastIndexOf(':');
+				await this.wallet.unfreezeUtxo?.({
+					txid: key.slice(0, sep),
+					index: Number(key.slice(sep + 1))
+				});
+			}
+		}
 	}
 
 	async buildFundingTransaction(
@@ -142,6 +266,7 @@ export class WalletFundingProvider implements IFundingProvider {
 			sendParams.satsPerByte = satsPerByte;
 		}
 
+		await this.prunePledges();
 		const result = await this.wallet.send(sendParams);
 		if (result.isErr()) {
 			throw new Error(
@@ -151,6 +276,14 @@ export class WalletFundingProvider implements IFundingProvider {
 
 		const txHex = (result as IResultOk<string>).value;
 		const tx = bitcoin.Transaction.fromHex(txHex);
+
+		// Pledge the built tx's inputs: the tx is broadcast later (after the
+		// channel handshake), and until the wallet sees that spend these coins
+		// must be off-limits to every other funding.
+		for (const input of tx.ins) {
+			const txid = Buffer.from(input.hash).reverse().toString('hex');
+			await this.pledge(txid, input.index);
+		}
 
 		// Find the output that pays to the P2WSH funding address
 		const targetScript = bitcoin.address.toOutputScript(
@@ -269,15 +402,26 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		const network = this.bitcoinJsNetwork();
+		await this.prunePledges();
 
-		// P2WPKH UTXOs only — the signing recipe below is P2WPKH-specific.
-		let candidates = wallet.listUtxos().filter((u) => {
+		// P2WPKH and P2TR (key-path) UTXOs — the two script types this
+		// provider knows how to sign.
+		const signable = wallet.listUtxos().filter((u) => {
 			try {
-				return bitcoin.address.toOutputScript(u.address, network).length === 22;
+				return scriptKind(
+					bitcoin.address.toOutputScript(u.address, network)
+				) !== null;
 			} catch {
 				return false;
 			}
 		});
+		// Frozen coins (pledged to an in-flight funding, or frozen by the
+		// user) are excluded from AUTOMATIC selection; listUtxos() itself does
+		// not filter them. Caller-directed refs below may still name a frozen
+		// coin explicitly (e.g. a deposit re-attempt after an aborted open).
+		let candidates = signable.filter(
+			(u) => !wallet.isUtxoFrozen?.(u.tx_hash, u.tx_pos)
+		);
 		// Confirmed before unconfirmed, then largest first within each group.
 		candidates.sort((a, b) => {
 			const aConf = a.height > 0 ? 0 : 1;
@@ -295,12 +439,12 @@ export class WalletFundingProvider implements IFundingProvider {
 		// when explicitly allowed.
 		if (opts?.utxos && opts.utxos.length > 0) {
 			for (const ref of opts.utxos) {
-				const match = candidates.find(
+				const match = signable.find(
 					(u) => u.tx_hash === ref.txid && u.tx_pos === ref.vout
 				);
 				if (!match) {
 					throw new Error(
-						`${purpose}: requested UTXO ${ref.txid}:${ref.vout} not found among spendable P2WPKH wallet UTXOs`
+						`${purpose}: requested UTXO ${ref.txid}:${ref.vout} not found among spendable wallet UTXOs`
 					);
 				}
 				selected.push(match);
@@ -330,7 +474,7 @@ export class WalletFundingProvider implements IFundingProvider {
 			throw new Error(
 				`insufficient wallet funds for ${purpose}: need ${
 					target > 0n ? target : 0n
-				} sats (amount + fee), have ${have} sats in spendable P2WPKH UTXOs`
+				} sats (amount + fee), have ${have} sats in spendable UTXOs`
 			);
 		}
 
@@ -372,14 +516,51 @@ export class WalletFundingProvider implements IFundingProvider {
 				);
 			}
 			const privKey = Buffer.from(keyPair.privateKey!);
-			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+			const outputScript = bitcoin.address.toOutputScript(
+				utxo.address,
+				network
+			);
+			const kind = scriptKind(outputScript);
 
-			return {
+			const base = {
 				prevTx: Buffer.from(hex, 'hex'),
 				prevOutputIndex: utxo.tx_pos,
 				value: BigInt(utxo.value),
 				sequence: 0xfffffffd,
-				confirmed: utxo.height > 0,
+				confirmed: utxo.height > 0
+			};
+
+			if (kind === 'p2tr') {
+				// BIP 86 key-path spend: sign with the taproot-tweaked key over
+				// the BIP 341 sighash (needs every input's prevout).
+				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
+				return {
+					...base,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number,
+						_value: bigint,
+						prevouts?: { scripts: Buffer[]; values: bigint[] }
+					): Buffer[] => {
+						if (!prevouts) {
+							throw new Error(
+								'P2TR input needs the full prevout set to sign (BIP 341)'
+							);
+						}
+						const sighash = tx.hashForWitnessV1(
+							inputIndex,
+							prevouts.scripts,
+							prevouts.values.map((v) => Number(v)),
+							bitcoin.Transaction.SIGHASH_DEFAULT
+						);
+						return [Buffer.from(ecc.signSchnorr(sighash, tweakedPriv))];
+					}
+				};
+			}
+
+			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+			return {
+				...base,
 				signWitness: (
 					tx: bitcoin.Transaction,
 					inputIndex: number,
@@ -412,6 +593,13 @@ export class WalletFundingProvider implements IFundingProvider {
 		const changeAddress = (changeRes as IResultOk<{ address: string }>).value
 			.address;
 		const changeScript = bitcoin.address.toOutputScript(changeAddress, network);
+
+		// Pledge every selected coin: it now belongs to a funding negotiation
+		// whose tx may not broadcast for a while, and no concurrent funding
+		// (this method OR wallet.send) may double-spend it in the meantime.
+		for (const utxo of selected) {
+			await this.pledge(utxo.tx_hash, utxo.tx_pos);
+		}
 
 		return { inputs, changeScript };
 	}

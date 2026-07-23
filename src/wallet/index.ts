@@ -2434,10 +2434,15 @@ export class Wallet {
 	 */
 	public async freezeUtxo({
 		txid,
-		index
+		index,
+		tag
 	}: {
 		txid: string;
 		index: number;
+		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
+		 *  entry so automated freezers can recognize — and recover — their own
+		 *  freezes after a restart without touching user-frozen coins. */
+		tag?: string;
 	}): Promise<Result<string>> {
 		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
 			return err('txid must be a 64-character hex string.');
@@ -2457,7 +2462,10 @@ export class Wallet {
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
 		void keyPair;
-		this._data.blacklistedUtxos.push(frozen);
+		this._data.blacklistedUtxos.push({
+			...frozen,
+			...(tag !== undefined ? { freezeTag: tag, frozenAt: Date.now() } : {})
+		});
 		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
 		return ok(`UTXO ${txid}:${index} frozen.`);
 	}
@@ -3359,9 +3367,14 @@ export class Wallet {
 		const inputs: { tx_hash: string; vout: number }[] = [];
 		transactions.forEach(({ result }) => {
 			if (result?.vin) {
-				result.vin.forEach((v) =>
-					inputs.push({ tx_hash: v.txid, vout: v.vout })
-				);
+				result.vin.forEach((v) => {
+					// A coinbase input has no previous output to fetch (its vin
+					// carries `coinbase` instead of txid/vout) — e.g. mining
+					// directly to a wallet address on regtest. Requesting it
+					// spams the Electrum server with invalid-params errors.
+					if (v?.txid === undefined || v?.vout === undefined) return;
+					inputs.push({ tx_hash: v.txid, vout: v.vout });
+				});
 			}
 		});
 		const inputDataResponse = await this.getInputData({
@@ -3524,6 +3537,11 @@ export class Wallet {
 		inputs: { tx_hash: string; vout: number }[];
 	}): Promise<Result<InputData>> {
 		try {
+			// Defense-in-depth: never ask the server for a prevout that does not
+			// exist (coinbase inputs surface as undefined tx_hash/vout).
+			inputs = inputs.filter(
+				(i) => i.tx_hash !== undefined && i.vout !== undefined
+			);
 			const inputData: InputData = {};
 			const failedRequests: { tx_hash: string; vout: number }[] = [];
 

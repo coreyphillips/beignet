@@ -410,6 +410,12 @@ export class LightningNode extends EventEmitter {
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
 	private receivedHtlcSharedSecrets: Map<string, Buffer> = new Map();
 	/**
+	 * LSPS2-style fee allowances, keyed by payment hash hex: the receiver
+	 * agreed its LSP may deduct up to this many msat from the delivered
+	 * amount of a JIT receive, so the final-hop checks accept the shortfall.
+	 */
+	private jitFeeAllowances: Map<string, bigint> = new Map();
+	/**
 	 * Incoming HTLCs we are relaying inside a blinded route, keyed like
 	 * receivedHtlcSharedSecrets. BOLT 4: ANY failure on these must surface as
 	 * invalid_onion_blinding — via update_fail_malformed_htlc at a hop whose
@@ -474,6 +480,8 @@ export class LightningNode extends EventEmitter {
 	private localFeatures: FeatureFlags;
 	// option_wumbo (large_channels): lift the 2^24 sat funding cap
 	private largeChannels: boolean;
+	/** Zero-conf splices with trusted peers (splice_locked at broadcast). */
+	private trustedZeroConfSpliceEnabled = false;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
 	// Watchtower client (LND altruist wtwire). Null when no towers configured.
@@ -565,6 +573,7 @@ export class LightningNode extends EventEmitter {
 		// option_wumbo: advertise large_channels only when explicitly enabled:
 		// the bit invites peers to propose > 2^24 sat fundings.
 		this.largeChannels = config.largeChannels ?? false;
+		this.trustedZeroConfSpliceEnabled = config.trustedZeroConfSplice ?? false;
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
@@ -637,7 +646,12 @@ export class LightningNode extends EventEmitter {
 						return !!peer && this.channelManager.isTrustedPeer(peer);
 					},
 					spliceInAndWait: (channelId, amountSats, timeoutMs) =>
-						this.spliceInAndWait(channelId, amountSats, timeoutMs)
+						this.spliceInAndWait(channelId, amountSats, timeoutMs),
+					// Durable intents + held-HTLC metadata: a restart restores
+					// intents and fails pre-restart held HTLCs upstream cleanly.
+					storage: this.storage ?? undefined,
+					failRestoredHtlc: (inChannelIdHex, inHtlcId) =>
+						this.failRestoredHeldHtlc(inChannelIdHex, inHtlcId)
 				},
 				config.jitReceive
 			);
@@ -703,6 +717,9 @@ export class LightningNode extends EventEmitter {
 		// Restore from storage if available
 		if (this.storage) {
 			this.restoreFromStorage();
+			// JIT engine: restore live intents; queue pre-restart held HTLCs to
+			// be failed upstream cleanly once their channels reestablish.
+			this.jitReceiveManager?.restore();
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
@@ -1406,12 +1423,36 @@ export class LightningNode extends EventEmitter {
 			if (txHex && this.fundingProvider) {
 				this.pendingFundingTxs.delete(txidHex);
 				this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
+					this.emitStructuredLog('chain', 'broadcast_failed', {
+						txid: txidHex,
+						error: (err as Error).message
+					});
 					this.emit('node:error', {
 						code: 'FUNDING_BROADCAST_FAILED',
 						message: (err as Error).message,
 						timestamp: Date.now()
 					} as ILightningError);
 				});
+			}
+			// Register the funding output with the chain watcher NOW, not only
+			// on restart: live confirmation detection, announcement depth, and
+			// the funding-missing watchdog (critical for zero-conf channels,
+			// whose state machine no longer waits for the chain) all key off
+			// this watch.
+			this.registerFundingWatch(fundingTxid).catch((err) => {
+				this.emitStructuredLog('chain', 'funding_watch_failed', {
+					txid: txidHex,
+					error: (err as Error).message
+				});
+			});
+			// Trusted zero-conf splice: treat the just-broadcast splice tx as
+			// locked immediately (instead of after 1 conf) for trusted peers.
+			if (this.trustedZeroConfSpliceEnabled) {
+				this.maybeSendEarlySpliceLocked(fundingTxid);
+				// Same trust model for dual-funded (v2) OPENS: send channel_ready
+				// at broadcast so the channel is usable in seconds — the last
+				// flow that otherwise required mining.
+				this.maybeSendEarlyV2ChannelReady(fundingTxid);
 			}
 		});
 
@@ -1540,6 +1581,13 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
 			if (this.chainWatcher) {
 				this.chainWatcher.broadcastTransaction(tx).catch((err) => {
+					// A swallowed failure here leaves channel state (zero-conf
+					// NORMAL, splice_locked) describing a tx that does not exist
+					// on the network — log loudly, never silently.
+					this.emitStructuredLog('chain', 'broadcast_failed', {
+						txid: bitcoin.Transaction.fromBuffer(tx).getId(),
+						error: (err as Error).message
+					});
 					this.emit('node:error', {
 						code: 'BROADCAST_FAILED',
 						message: (err as Error).message,
@@ -2102,6 +2150,13 @@ export class LightningNode extends EventEmitter {
 				);
 			})
 			.catch((err) => {
+				// The channel never reached funding_created — abort it on BOTH
+				// sides (BOLT 1 error for the temp id) so no half-open channel
+				// lingers at the peer while the caller retries with a fresh open.
+				this.channelManager.abortPendingChannel(
+					channel.getTemporaryChannelId(),
+					`auto-funding failed: ${(err as Error).message}`
+				);
 				this.emit('node:error', {
 					code: 'AUTO_FUNDING_FAILED',
 					message: (err as Error).message,
@@ -2891,6 +2946,48 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// The funding tx of a not-yet-confirmed channel vanished from mempool
+		// AND chain (evicted or an input was double-spent). For a zero-conf
+		// channel that is already NORMAL, every balance shown against it is
+		// fiction — alarm, then VOID the channel: it never existed on the
+		// network, so there is nothing to close and the contributed coins
+		// remain onchain. 'channel:voided' lets the embedder re-handle them.
+		this.chainWatcher.on(
+			'funding:missing',
+			(channelId: Buffer, txid: string) => {
+				this.emitStructuredLog('chain', 'funding_missing', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				this.emit('node:error', {
+					code: 'FUNDING_MISSING',
+					channelId,
+					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
+					timestamp: Date.now()
+				} as ILightningError);
+
+				const channel = this.channelManager.getChannel(channelId);
+				if (!channel) return;
+				// A vanished SPLICE tx is different: the pre-splice channel is
+				// real and confirmed — voiding it would destroy a live channel.
+				// Alarm only; splice rollback is a separate (future) path.
+				if (channel.getFullState().spliceInFlight) return;
+				if (this.channelManager.voidChannel(channelId)) {
+					const idHex = channelId.toString('hex');
+					this.chainWatcher?.removeWatchedFunding(channelId);
+					this.safeStorage(
+						() => this.storage!.deleteChannel(idHex),
+						'deleteChannel'
+					);
+					this.emitStructuredLog('channel', 'channel_voided', {
+						channelId: idHex,
+						txid
+					});
+					this.emit('channel:voided', { channelId });
+				}
+			}
+		);
+
 		// Wire announcement depth event — triggers channel announcement signing
 		this.chainWatcher.on(
 			'announcement:depth',
@@ -3175,6 +3272,95 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Arm the chain watch for a funding (or splice) tx that was JUST created
+	 * live — the watch:funding hook calls this so confirmation detection,
+	 * announcement depth, spend/breach detection and the funding-missing
+	 * watchdog work without a restart (restoreChainWatches only re-arms
+	 * persisted channels on startup). Matches the channel by funding txid,
+	 * the same way the zero-conf early paths do.
+	 */
+	private async registerFundingWatch(fundingTxid: Buffer): Promise<void> {
+		if (!this.chainWatcher) return;
+		const networkMap: Record<string, bitcoin.Network> = {
+			[Network.MAINNET]: bitcoin.networks.bitcoin,
+			[Network.TESTNET]: bitcoin.networks.testnet,
+			[Network.REGTEST]: bitcoin.networks.regtest,
+			[Network.SIGNET]: bitcoin.networks.testnet
+		};
+		const btcNetwork = networkMap[this.network] || bitcoin.networks.regtest;
+		const txidHex = Buffer.from(fundingTxid).reverse().toString('hex');
+
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.localBasepoints) continue;
+			const channelId = channel.getChannelId() ?? state.temporaryChannelId;
+
+			const inflight = state.spliceInFlight;
+			if (inflight && Buffer.from(inflight.spliceTxid).equals(fundingTxid)) {
+				const spliceFunding = createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					inflight.remoteFundingPubkey,
+					btcNetwork
+				);
+				// Keyed by channelId, this REPLACES the original funding watch —
+				// so re-arm spend detection on the old outpoint separately (the
+				// splice tx legitimately spends it; anything else is a breach),
+				// exactly as restoreChainWatches does.
+				await this.chainWatcher.watchFundingOutput(
+					channelId,
+					txidHex,
+					inflight.newFundingOutputIndex,
+					state.minimumDepth ?? 3,
+					spliceFunding.p2wshOutput
+				);
+				if (state.fundingTxid && state.remoteBasepoints) {
+					const oldFundingScript = isTaprootChannel(state.channelType)
+						? createTaprootFundingScript(
+								state.localBasepoints.fundingPubkey,
+								state.remoteBasepoints.fundingPubkey,
+								btcNetwork
+						  ).p2trOutput
+						: createFundingScript(
+								state.localBasepoints.fundingPubkey,
+								state.remoteBasepoints.fundingPubkey,
+								btcNetwork
+						  ).p2wshOutput;
+					await this.chainWatcher.watchFundingSpendDuringSplice(
+						channelId,
+						Buffer.from(state.fundingTxid).reverse().toString('hex'),
+						state.fundingOutputIndex,
+						oldFundingScript,
+						txidHex
+					);
+				}
+				return;
+			}
+
+			if (!state.fundingTxid?.equals(fundingTxid)) continue;
+			if (!state.remoteBasepoints) continue;
+			const fundingScript = isTaprootChannel(state.channelType)
+				? createTaprootFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2trOutput
+				: createFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2wshOutput;
+			await this.chainWatcher.watchFundingOutput(
+				channelId,
+				txidHex,
+				state.fundingOutputIndex,
+				state.minimumDepth ?? 3,
+				fundingScript
+			);
+			return;
+		}
+	}
+
+	/**
 	 * Arm the funding-outpoint watch for a channel reconstructed from a static
 	 * channel backup. The backup does not carry the peer's funding pubkey, so
 	 * the 2-of-2 funding scriptPubkey cannot be rebuilt locally the way
@@ -3310,24 +3496,42 @@ export class LightningNode extends EventEmitter {
 		if (!channel) {
 			throw new Error('openZeroConfChannel failed (peer not trusted?)');
 		}
-		const start = Date.now();
-		// The channel id changes from temporary to funding-derived during the
-		// open, so readiness is detected by peer + NORMAL state, not by id.
-		while (Date.now() - start < timeoutMs) {
-			for (const c of this.channelManager.listChannels()) {
-				const cid = c.getChannelId();
-				if (!cid) continue;
-				const cidHex = cid.toString('hex');
-				if (before.has(cidHex)) continue;
-				if (c.getFullState().state !== ChannelState.NORMAL) continue;
-				if (this.channelManager.getPeerForChannel(cid) !== peerPubkey) continue;
-				return cid;
+		// Auto-funding runs asynchronously after accept_channel and reports
+		// failure only via node:error — without watching for it, a funding
+		// failure (e.g. no spendable coins while another funding's inputs are
+		// pledged) would make this wait spin to its full timeout instead of
+		// failing fast so the caller can retry.
+		let fundingErr: string | undefined;
+		const onErr = (e: ILightningError): void => {
+			if (e.code === 'AUTO_FUNDING_FAILED') fundingErr = e.message;
+		};
+		this.on('node:error', onErr);
+		try {
+			const start = Date.now();
+			// The channel id changes from temporary to funding-derived during the
+			// open, so readiness is detected by peer + NORMAL state, not by id.
+			while (Date.now() - start < timeoutMs) {
+				if (fundingErr) {
+					throw new Error(`auto-funding failed: ${fundingErr}`);
+				}
+				for (const c of this.channelManager.listChannels()) {
+					const cid = c.getChannelId();
+					if (!cid) continue;
+					const cidHex = cid.toString('hex');
+					if (before.has(cidHex)) continue;
+					if (c.getFullState().state !== ChannelState.NORMAL) continue;
+					if (this.channelManager.getPeerForChannel(cid) !== peerPubkey)
+						continue;
+					return cid;
+				}
+				await new Promise((r) => setTimeout(r, 250));
 			}
-			await new Promise((r) => setTimeout(r, 250));
+			throw new Error(
+				`zero-conf channel to ${peerPubkey.slice(0, 12)} not ready within ${timeoutMs}ms`
+			);
+		} finally {
+			this.removeListener('node:error', onErr);
 		}
-		throw new Error(
-			`zero-conf channel to ${peerPubkey.slice(0, 12)} not ready within ${timeoutMs}ms`
-		);
 	}
 
 	/**
@@ -3349,6 +3553,129 @@ export class LightningNode extends EventEmitter {
 			prevOutputIndex,
 			witness
 		);
+	}
+
+	/**
+	 * Trusted zero-conf splice: if the just-broadcast tx is a pending splice
+	 * on a channel with a TRUSTED peer, send splice_locked immediately — the
+	 * channel becomes usable in seconds instead of after a confirmation. The
+	 * trust exposure matches zero-conf opens (the splice could be evicted or
+	 * its inputs double-spent before confirming), hence the trusted-set gate.
+	 * The confirmation-triggered path stays in place and no-ops afterwards.
+	 */
+	private maybeSendEarlySpliceLocked(spliceTxid: Buffer): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.spliceFundingTxid?.equals(spliceTxid)) continue;
+			if (!channel.getSpliceSession()) return;
+			const channelId = channel.getChannelId();
+			if (!channelId) return;
+			const peer = this.channelManager.getPeerForChannel(channelId);
+			if (!peer || !this.channelManager.isTrustedPeer(peer)) return;
+			// Defer a tick so the broadcast (queued in the same action batch)
+			// reaches the network before the lock is announced.
+			setTimeout(() => {
+				const result = this.channelManager.sendSpliceLocked(channelId);
+				if (result.ok) {
+					this.persistChannel(channelId);
+					this.emitStructuredLog('channel', 'splice_locked_zero_conf', {
+						channelId: channelId.toString('hex')
+					});
+				}
+			}, 50);
+			return;
+		}
+	}
+
+	/**
+	 * Trusted zero-conf v2 open: if the just-broadcast tx is the funding of a
+	 * dual-funded channel with a TRUSTED peer, treat it as confirmed now —
+	 * fundingConfirmed() sends channel_ready (with an SCID alias) and the
+	 * channel goes NORMAL the moment both sides do this. The exposure matches
+	 * zero-conf v1 opens/splices: either side could double-spend its funding
+	 * inputs before confirmation, hence the trusted-set gate.
+	 */
+	private maybeSendEarlyV2ChannelReady(
+		fundingTxid: Buffer,
+		attempt = 0
+	): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingVersion !== 2) continue;
+			if (!state.fundingTxid?.equals(fundingTxid)) continue;
+			const channelId = channel.getChannelId();
+			if (!channelId) return;
+			// The side that releases tx_signatures FIRST hits this hook before
+			// the peer's signatures arrive: the state is still
+			// AWAITING_TX_SIGNATURES and the channel may not be promoted yet
+			// (peer lookup by permanent id fails until promotion). Retry
+			// briefly until the pair completes. AWAITING_CHANNEL_READY also
+			// qualifies: the (equally trusting) peer's channel_ready may land
+			// before our retry — fundingConfirmed() handles both states.
+			const peer = this.channelManager.getPeerForChannel(channelId);
+			const pairComplete =
+				state.state === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+				state.state === ChannelState.AWAITING_CHANNEL_READY;
+			if (!peer || !pairComplete) {
+				if (attempt < 20) {
+					setTimeout(
+						() => this.maybeSendEarlyV2ChannelReady(fundingTxid, attempt + 1),
+						500
+					);
+				}
+				return;
+			}
+			if (!this.channelManager.isTrustedPeer(peer)) return;
+			// Defer a tick so the broadcast (queued in the same action batch)
+			// reaches the network before channel_ready goes out.
+			setTimeout(() => {
+				this.channelManager.handleFundingConfirmed(channelId);
+				this.persistChannel(channelId);
+				this.emitStructuredLog('channel', 'v2_ready_zero_conf', {
+					channelId: channelId.toString('hex')
+				});
+			}, 50);
+			return;
+		}
+	}
+
+	/**
+	 * Fail an incoming HTLC that was held by the JIT engine BEFORE a restart.
+	 * The channel state (including the committed HTLC) and its shared secret
+	 * were restored from storage; once the channel is back to NORMAL the
+	 * failure is delivered like any other upstream fail. Returns false while
+	 * the channel is not ready yet — the caller retries on the block tick.
+	 */
+	private failRestoredHeldHtlc(
+		inChannelIdHex: string,
+		inHtlcId: bigint
+	): boolean {
+		const channelId = Buffer.from(inChannelIdHex, 'hex');
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			// Channel gone entirely (closed while we were down) — nothing to fail.
+			return true;
+		}
+		if (channel.getState() !== ChannelState.NORMAL) {
+			return false; // not reestablished yet — retry later
+		}
+		// The HTLC may have already been resolved (e.g. peer failed it during
+		// reestablish) — treat a missing HTLC as done.
+		const htlc = channel.getFullState().htlcs.get(`received-${inHtlcId}`);
+		if (!htlc) return true;
+
+		const secretKey = `${inChannelIdHex}:${inHtlcId}`;
+		const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+		const reason = sharedSecret
+			? createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+			: Buffer.alloc(290);
+		this.cleanupHtlcSharedSecret(secretKey);
+		const result = this.channelManager.failHtlc(channelId, inHtlcId, reason);
+		this.emitStructuredLog('htlc', 'jit_restored_failed_upstream', {
+			channelId: inChannelIdHex,
+			htlcId: inHtlcId.toString()
+		});
+		return result.ok !== false;
 	}
 
 	/**
@@ -3395,6 +3722,17 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * LSPS2-style fee deduction: record that the LSP may deduct up to
+	 * `maxFeeMsat` from the delivered amount of the JIT receive for this
+	 * payment hash. The final-hop checks then accept the shortfall (and the
+	 * received payment records the actual delivered amount).
+	 */
+	registerJitFeeAllowance(paymentHash: Buffer, maxFeeMsat: bigint): void {
+		if (maxFeeMsat <= 0n) return;
+		this.jitFeeAllowances.set(paymentHash.toString('hex'), maxFeeMsat);
+	}
+
+	/**
 	 * Wallet side of JIT receive: register a receive intent with the LSP and
 	 * return the routing hint (LSP → synthetic intercept SCID) to embed in the
 	 * invoice via createInvoice({ extraRoutingHints }).
@@ -3409,7 +3747,13 @@ export class LightningNode extends EventEmitter {
 			expirySeconds?: number;
 			timeoutMs?: number;
 		}
-	): Promise<{ interceptScid: Buffer; hint: IRoutingHintHop }> {
+	): Promise<{
+		interceptScid: Buffer;
+		hint: IRoutingHintHop;
+		/** LSPS2-style opening fee the LSP will deduct from the delivery. */
+		flatFeeSat: bigint;
+		feePpm: number;
+	}> {
 		const pubkeyErr = validateHexPubkey(lspPubkeyHex, 'lspPubkeyHex');
 		if (pubkeyErr) throw new Error(pubkeyErr);
 		const interceptScid = allocateInterceptScid();
@@ -3464,7 +3808,9 @@ export class LightningNode extends EventEmitter {
 				feeBaseMsat: 0,
 				feeProportionalMillionths: 0,
 				cltvExpiryDelta: 80
-			}
+			},
+			flatFeeSat: ack.flatFeeSat,
+			feePpm: ack.feePpm
 		};
 	}
 
@@ -5142,10 +5488,12 @@ export class LightningNode extends EventEmitter {
 			fundingSatoshis: state.fundingSatoshis,
 			channelType: state.channelType
 		};
-		if (state.fundingTxid)
+		if (state.fundingTxid) {
 			info.fundingTxid = Buffer.from(state.fundingTxid)
 				.reverse()
 				.toString('hex');
+			info.fundingOutputIndex = state.fundingOutputIndex;
+		}
 		if (state.shortChannelId)
 			info.shortChannelId = state.shortChannelId.toString('hex');
 		info.feeratePerKw = state.localConfig.feeratePerKw;
@@ -6990,9 +7338,13 @@ export class LightningNode extends EventEmitter {
 		// final_incorrect_htlc_amount: the HTLC amount MUST be >= the onion's
 		// amt_to_forward. This catches a hop that skimmed the amount even for
 		// keysend / zero-amount invoices, which have no invoice-amount check.
+		// Exception (LSPS2 fee deduction): the receiver may have agreed that
+		// its LSP deducts a bounded fee from a JIT receive — accept a
+		// shortfall within that registered allowance.
+		const jitAllowanceMsat = this.jitFeeAllowances.get(hashHex) ?? 0n;
 		if (
 			hopPayload?.amountToForwardMsat !== undefined &&
-			amountMsat < hopPayload.amountToForwardMsat
+			amountMsat + jitAllowanceMsat < hopPayload.amountToForwardMsat
 		) {
 			this.emitStructuredLog('htlc', 'final_incorrect_htlc_amount', {
 				paymentHash: hashHex,
@@ -7157,8 +7509,9 @@ export class LightningNode extends EventEmitter {
 			const isMpp =
 				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
 			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;
+			const feeAllowanceMsat = this.jitFeeAllowances.get(hashHex) ?? 0n;
 			if (
-				claimedTotal < finalInvoice.amountMsat ||
+				claimedTotal + feeAllowanceMsat < finalInvoice.amountMsat ||
 				claimedTotal > finalInvoice.amountMsat * 2n
 			) {
 				this.emitStructuredLog('htlc', 'incorrect_payment_amount', {
@@ -7614,8 +7967,9 @@ export class LightningNode extends EventEmitter {
 			totalReceived += p.amountMsat;
 		}
 
-		// Check if we have enough
-		if (totalReceived >= pending.totalMsat) {
+		// Check if we have enough (minus any agreed LSPS2-style JIT fee).
+		const mppFeeAllowance = this.jitFeeAllowances.get(hashHex) ?? 0n;
+		if (totalReceived + mppFeeAllowance >= pending.totalMsat) {
 			// Deliver the preimage to the chain monitors BEFORE fulfilling any part,
 			// so every part's received HTLC can still be claimed on-chain if a channel
 			// force-closes mid-settlement. recordPreimage keys on the payment hash and
@@ -7689,6 +8043,7 @@ export class LightningNode extends EventEmitter {
 
 		// Clean up payment secret after successful fulfillment
 		this.paymentSecrets.delete(hashHex);
+		this.jitFeeAllowances.delete(hashHex);
 
 		const payment = this.payments.get(hashHex);
 		if (payment) {
@@ -8972,6 +9327,8 @@ export class LightningNode extends EventEmitter {
 		this.scanExpiringOfferedHtlcs(blockHeight);
 		this.scanExpiringHeldHtlcs(blockHeight);
 		this.scanExpiringHeldForwards(blockHeight);
+		// Retry failing pre-restart held HTLCs (no-op once the queue drains).
+		this.jitReceiveManager?.sweep();
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.scanStuckPayments();
@@ -9300,6 +9657,7 @@ export class LightningNode extends EventEmitter {
 			largeChannels?: boolean;
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
+			trustedZeroConfSplice?: boolean;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
@@ -9367,6 +9725,7 @@ export class LightningNode extends EventEmitter {
 			largeChannels: options?.largeChannels,
 			leaseRates: options?.leaseRates,
 			jitReceive: options?.jitReceive,
+			trustedZeroConfSplice: options?.trustedZeroConfSplice,
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
 			peerStorageEnabled: options?.peerStorageEnabled,

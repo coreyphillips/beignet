@@ -213,6 +213,14 @@ export interface INodeConfig {
 	 */
 	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/**
+	 * Zero-conf splices with TRUSTED peers: send splice_locked the moment the
+	 * splice tx is broadcast instead of waiting for confirmation, so the
+	 * channel is usable again in seconds. Same trust model as zero-conf opens
+	 * (the peer could double-spend the splice inputs before it confirms) —
+	 * gated on the zero-conf trusted-peer set. Both peers should enable it.
+	 */
+	trustedZeroConfSplice?: boolean;
+	/**
 	 * Propose simple taproot channels (option_taproot) when opening channels.
 	 * MuSig2 funding and commitment signing (deterministic verification nonces)
 	 * are fully wired into the live state machine; the complete lifecycle
@@ -440,6 +448,8 @@ export interface IChannelInfo {
 	fundingSatoshis: bigint;
 	channelType: Buffer | null;
 	fundingTxid?: string;
+	/** Output index of the funding outpoint in fundingTxid. */
+	fundingOutputIndex?: number;
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
