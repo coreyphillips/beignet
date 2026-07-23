@@ -4133,14 +4133,18 @@ describe('Splice', function () {
 		it('getSpendableOutboundMsat is the addHtlc ceiling, and dips to the spliced side during a splice-out', function () {
 			// NORMAL: the helper is exactly the addHtlc arithmetic — local
 			// balance minus the peer-required reserve minus the opener's
-			// commitment fee with one more HTLC.
+			// fee-spike buffer: the commitment fee at TWICE the live rate with
+			// one extra HTLC slot beyond the add (#193 — a ceiling offer must
+			// never sit at the receiver's exact affordability boundary).
 			const fresh = createNormalChannelPair();
 			const spendable = fresh.openerChannel.getSpendableOutboundMsat();
 			const st = fresh.openerChannel.getFullState();
 			const expected =
 				st.localBalanceMsat -
 				st.remoteConfig.channelReserveSatoshis * 1000n -
-				BigInt(calculateCommitmentFee(st.localConfig.feeratePerKw, 1, false)) *
+				BigInt(
+					calculateCommitmentFee(st.localConfig.feeratePerKw * 2, 2, false)
+				) *
 					1000n;
 			expect(spendable).to.equal(expected);
 			expect(spendable > 0n).to.be.true;
@@ -4206,10 +4210,13 @@ describe('Splice', function () {
 			const oldRate = st.localConfig.feeratePerKw;
 			st.pendingFeeratePerKw = oldRate * 4;
 			const after = pair.openerChannel.getSpendableOutboundMsat();
+			// The retained figure is the fee-spike buffer (2x rate, one extra
+			// HTLC slot — #193), so the staged rate moves it by the buffered
+			// difference.
 			const delta =
 				BigInt(
-					calculateCommitmentFee(oldRate * 4, 1, false) -
-						calculateCommitmentFee(oldRate, 1, false)
+					calculateCommitmentFee(oldRate * 4 * 2, 2, false) -
+						calculateCommitmentFee(oldRate * 2, 2, false)
 				) * 1000n;
 			expect(after).to.equal(before - delta);
 			delete st.pendingFeeratePerKw;

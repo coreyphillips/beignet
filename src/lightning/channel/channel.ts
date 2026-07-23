@@ -1840,11 +1840,19 @@ export class Channel {
 		let remoteRequiredMsat = remoteReserveMsat;
 		if (this._state.role === ChannelRole.ACCEPTOR) {
 			// We are the acceptor, so the remote is the funder and must also cover
-			// the commitment fee above its reserve.
+			// the commitment fee above its reserve — priced at the LIVE commitment
+			// feerate, the rate real commitments are built at. Pricing it at the
+			// static open-time localConfig.feeratePerKw made this check disagree
+			// with the sender's own live-rate arithmetic whenever the two rates
+			// drifted apart, and a boundary HTLC then failed the channel over a
+			// sats-scale formula difference between two honest nodes (#193).
 			const feeMsat =
 				BigInt(
 					calculateCommitmentFee(
-						this._state.localConfig.feeratePerKw,
+						Math.max(
+							getLocalCommitmentFeeRate(this._state),
+							getRemoteCommitmentFeeRate(this._state)
+						),
 						this._countActiveHtlcs() + 1,
 						isAnchorChannel(this._state.channelType)
 					)
@@ -7195,11 +7203,22 @@ export class Channel {
 					getLocalCommitmentFeeRate(this._state),
 					getRemoteCommitmentFeeRate(this._state)
 				);
+				// Fee-spike buffer (LND-style, #193): as funder, retain the
+				// commitment fee at TWICE the live rate with room for one more
+				// HTLC beyond the one being added. An HTLC offered at the exact
+				// single-fee ceiling bets the channel on the receiver's margin
+				// arithmetic matching ours to the satoshi: the two formulas
+				// count active HTLCs from different books, so a sats-scale
+				// disagreement turns a boundary offer into a protocol violation
+				// the peer MUST fail the channel over (observed live: a
+				// 10,001-sat send at the exact ceiling force-closed an
+				// otherwise healthy channel). The buffer also absorbs genuine
+				// feerate spikes between now and the commitment that matters.
 				requiredMsat +=
 					BigInt(
 						calculateCommitmentFee(
-							feeratePerKw,
-							this._countActiveHtlcs() + 1,
+							feeratePerKw * 2,
+							this._countActiveHtlcs() + 2,
 							isAnchorChannel(this._state.channelType)
 						)
 					) * 1000n;
