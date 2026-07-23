@@ -647,6 +647,21 @@ export class LightningNode extends EventEmitter {
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
 		this.channelManager.setFundingProvider(this.fundingProvider);
+		// A wallet-owned sweep destination handed in at CONSTRUCTION must reach
+		// the channel manager too: its shutdown-script logic only learned the
+		// wallet address through setSweepDestinationScript, a path taken when
+		// the address resolves late. On the happy path (daemon resolved the
+		// wallet address BEFORE building the node), the manager stayed on its
+		// P2WPKH(funding_pubkey) fallback, so a REMOTE-initiated cooperative
+		// close paid its whole payout to an address the on-chain wallet never
+		// scans. The funds sat confirmed but invisible until the startup
+		// fallback-recovery sweep, an extra transaction and fee that this
+		// forwarding makes unnecessary.
+		if (config.sweepDestinationScript) {
+			this.channelManager.setMonitorDestinationScript(
+				config.sweepDestinationScript
+			);
+		}
 
 		// Seed the fee advisor from the estimator right away. Every later
 		// refresh rides a block event, but a dual-funded openChannel pins
