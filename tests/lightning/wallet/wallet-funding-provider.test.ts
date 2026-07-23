@@ -290,6 +290,36 @@ describe('WalletFundingProvider', () => {
 			}
 		});
 
+		it('throws when a fixed-amount send comes back short of the committed amount', async () => {
+			// Near the balance ceiling the wallet quietly REDUCES a fixed send
+			// instead of failing when amount + fee exceeds the balance (observed
+			// live: 499170 requested, 499004 funded, no change output). The
+			// commitment is signed against the committed funding_satoshis, so a
+			// short funding output produces a channel the peer's on-chain check
+			// rejects; the provider must refuse rather than fund it.
+			const { txHex } = buildFakeFundingTx(fundingAddress, 499_004, network);
+			const wallet: IWalletLike = {
+				send: async () => mockOk(txHex),
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					499_170n,
+					2,
+					false
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not match committed funding amount'
+				);
+				expect((err as Error).message).to.include('altered the send amount');
+			}
+		});
+
 		it('throws when max funding is requested but the wallet cannot sweep', async () => {
 			const wallet = createMockWallet({ txHex: '' }); // legacy mock, no sendMax
 			const provider = new WalletFundingProvider(wallet);

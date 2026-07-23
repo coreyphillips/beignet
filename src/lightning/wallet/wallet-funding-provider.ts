@@ -184,17 +184,25 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 
 		// The commitment is built against the committed funding_satoshis, so the
-		// on-chain funding output must equal it exactly. A max sweep is priced from
-		// the same balance and rate as the amount already committed, so they match;
-		// guard the rare drift (a UTXO arriving or spent between quote and funding)
-		// rather than sign a commitment against a mismatched output.
-		if (max) {
-			const fundedValue = tx.outs[outputIndex].value;
-			if (fundedValue !== Number(amountSats)) {
-				throw new Error(
-					`Max funding output (${fundedValue} sats) does not match committed funding amount (${amountSats} sats); on-chain balance changed since the amount was quoted`
-				);
-			}
+		// on-chain funding output must equal it exactly — for EVERY open, not
+		// just max sweeps. A max sweep is priced from the same balance and rate
+		// as the amount already committed, so a mismatch means the balance
+		// drifted between quote and funding. A fixed-amount send can also come
+		// back short: near the balance ceiling the wallet quietly reduces the
+		// amount instead of failing when amount + fee exceeds the balance
+		// (observed live: 499170 requested, 499004 funded, no change output).
+		// Signing a commitment against a short output produces a channel whose
+		// funding the peer's on-chain check rejects; failing here instead
+		// aborts the open cleanly.
+		const fundedValue = tx.outs[outputIndex].value;
+		if (fundedValue !== Number(amountSats)) {
+			throw new Error(
+				`Funding output (${fundedValue} sats) does not match committed funding amount (${amountSats} sats); ${
+					max
+						? 'on-chain balance changed since the amount was quoted'
+						: 'the wallet altered the send amount (likely insufficient balance for amount + fee)'
+				}`
+			);
 		}
 
 		// getHash() returns txid in internal byte order (per BOLT 2)
