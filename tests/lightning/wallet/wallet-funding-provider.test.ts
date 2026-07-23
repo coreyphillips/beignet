@@ -640,6 +640,72 @@ describe('WalletFundingProvider', () => {
 				expect(q.maxAmountSats).to.equal(0n);
 			});
 		});
+
+		describe('max dual-funded open (quote + selection)', () => {
+			const {
+				spliceFeeSats,
+				dualFundingContributionWeight
+			} = require('../../../src/lightning/channel/splice-weight');
+
+			it('quotes the whole spendable balance minus the initiator fee share', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 60_000 }, { valueSats: 19_772 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteDualFundingMax(2500);
+				expect(q.inputCount).to.equal(2);
+				expect(q.spendableSats).to.equal(79_772n);
+				// The exact formula the channel's contribution computation uses,
+				// so funding derives a change of exactly zero.
+				expect(q.feeSats).to.equal(
+					spliceFeeSats(dualFundingContributionWeight(2, true), 2500)
+				);
+				expect(q.fundingSatoshis).to.equal(q.spendableSats - q.feeSats);
+			});
+
+			it('selection returns EVERY spendable UTXO, matching the quote inputCount', async () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [
+						{ valueSats: 60_000 },
+						{ valueSats: 19_772 },
+						{ valueSats: 100_000, nonP2wpkh: true } // excluded, like the quote
+					]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteDualFundingMax(1000);
+				const { inputs } = await provider.selectMaxDualFundingInputs();
+				expect(inputs.length).to.equal(q.inputCount);
+				expect(inputs.reduce((s, i) => s + i.value, 0n)).to.equal(
+					q.spendableSats
+				);
+			});
+
+			it('quotes zero funding when the fee exceeds the balance', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 200 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteDualFundingMax(50_000);
+				expect(q.fundingSatoshis).to.equal(0n);
+			});
+
+			it('selection with no spendable UTXOs throws a clear error', async () => {
+				const { wallet } = createSpliceMockWallet({ utxos: [] });
+				const provider = new WalletFundingProvider(wallet);
+
+				try {
+					await provider.selectMaxDualFundingInputs();
+					expect.fail('Should have thrown');
+				} catch (err) {
+					expect((err as Error).message).to.include(
+						'insufficient wallet funds for max-funded v2 open'
+					);
+				}
+			});
+		});
 	});
 
 	describe('network detection', () => {

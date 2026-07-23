@@ -72,3 +72,28 @@ export function estimateSpliceTxWeight(opts: {
 export function spliceFeeSats(weight: number, feeratePerKw: number): bigint {
 	return BigInt(Math.ceil((weight * feeratePerKw) / 1000));
 }
+
+/**
+ * Interactive-tx (v2 open) contribution weight for OUR side, cushioned.
+ *
+ * P2WPKH input ≈ 272 WU cushioned to 320 (the peer's balance check estimates
+ * our witness weight before seeing it; under-reserving fails the negotiation,
+ * a few extra sats simply shrink the change), plus a change output (124 WU
+ * cushioned to 140). The initiator additionally pays the common transaction
+ * fields (~42 WU) and the shared P2WSH/P2TR funding output (172 WU),
+ * cushioned to 240 together.
+ *
+ * The channel's contribution computation derives change as
+ * inputs - contribution - fee(this weight), and a max-open quote derives the
+ * committed funding amount as inputs - fee(this weight) — both MUST use this
+ * function, never a re-derived constant, or a max open either fails as
+ * underfunded or strands sats in an unintended change output.
+ */
+export function dualFundingContributionWeight(
+	inputCount: number,
+	initiator: boolean
+): number {
+	let weight = 320 * inputCount + 140;
+	if (initiator) weight += 240;
+	return weight;
+}
