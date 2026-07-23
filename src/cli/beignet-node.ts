@@ -755,7 +755,7 @@ export class BeignetNode extends EventEmitter {
 		if (opts.electrumServers && opts.electrumServers.length > 1) {
 			let currentServerIndex = 0;
 			const servers = opts.electrumServers;
-			electrumBackend.onFailoverNeeded = async () => {
+			electrumBackend.onFailoverNeeded = async (): Promise<void> => {
 				if (this._failoverInProgress) return;
 				this._failoverInProgress = true;
 				const startIndex = currentServerIndex;
@@ -2493,7 +2493,7 @@ export class BeignetNode extends EventEmitter {
 		for (let i = 0; i < suggestions.length && openedCount < needed; i++) {
 			const suggestion = suggestions[i];
 			openedCount++;
-			const promise = (async () => {
+			const promise = (async (): Promise<void> => {
 				try {
 					// Look up address from gossip graph
 					const graphNode = graph.getNode(

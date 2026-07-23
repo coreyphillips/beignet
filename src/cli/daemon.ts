@@ -268,6 +268,7 @@ export async function startDaemon(
 				filter.metadataValue = query.get('metadataValue');
 			return success(
 				node.listPayments(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; listPayments tolerates unknown values
 					Object.keys(filter).length > 0 ? (filter as any) : undefined
 				)
 			);
@@ -281,6 +282,7 @@ export async function startDaemon(
 			if (query.get('channelId')) filter.channelId = query.get('channelId');
 			return success(
 				node.listForwards(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; listForwards tolerates unknown values
 					Object.keys(filter).length > 0 ? (filter as any) : undefined
 				)
 			);
@@ -420,6 +422,7 @@ export async function startDaemon(
 			if (query.get('limit')) options.limit = Number(query.get('limit'));
 			return success(
 				node.getActionLog(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; getActionLog tolerates unknown values
 					Object.keys(options).length > 0 ? (options as any) : undefined
 				)
 			);

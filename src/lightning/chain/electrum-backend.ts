@@ -134,7 +134,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		// Install stable delegate exactly once to prevent callback stacking on resubscribe
 		if (!this._originalOnReceive) {
 			this._originalOnReceive = this.electrum.onReceive;
-			this.electrum.onReceive = (data: unknown) => {
+			this.electrum.onReceive = (data: unknown): void => {
 				if (this._originalOnReceive) {
 					this._originalOnReceive(data);
 				}
@@ -370,6 +370,7 @@ export class ElectrumBackend implements IChainBackend, IFeeEstimator {
 		);
 		// rn-electrum-client wraps responses: { id, error, method, data: { pos, ... }, network }
 		// The TypeScript declaration claims { merkle, block_height, pos } but runtime wraps it
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime shape differs from the library's declaration (see comment above)
 		const res = result as any;
 		const pos = res?.data?.pos ?? res?.pos ?? 0;
 		return {
