@@ -207,6 +207,12 @@ export interface BeignetNodeOptions {
 	 * splice is usable in seconds. Same trust model as zero-conf opens.
 	 */
 	trustedZeroConfSplice?: boolean;
+	/**
+	 * Zero reserve with trusted peers: channels with peers in the zero-conf
+	 * trusted set negotiate channel_reserve 0 on both sides, so the whole
+	 * balance is spendable. Both peers should enable it.
+	 */
+	zeroReserve?: boolean;
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -897,6 +903,7 @@ export class BeignetNode extends EventEmitter {
 			leaseRates: opts.leaseRates,
 			jitReceive: opts.jitReceive,
 			trustedZeroConfSplice: opts.trustedZeroConfSplice,
+			zeroReserve: opts.zeroReserve,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			logger: this.logger,
@@ -2659,16 +2666,27 @@ export class BeignetNode extends EventEmitter {
 		return opened;
 	}
 
-	closeChannel(channelId: string): { ok: boolean; error?: string } {
+	async closeChannel(channelId: string): Promise<{ ok: boolean; error?: string }> {
 		const idBuf = Buffer.from(channelId, 'hex');
-		// Derive a P2WPKH script from the funding address for the closing output
-		const address = this.node.getFundingAddress();
-		const bitcoin = require('bitcoinjs-lib');
-		const scriptPubkey = bitcoin.address.toOutputScript(
-			address,
-			this.getBitcoinNetwork()
+		// Pay the cooperative-close output to an address the on-chain wallet
+		// actually scans. The old funding-address script was invisible to the
+		// wallet: the payout sat confirmed on-chain while the balance read zero
+		// until recoverFallbackFunds swept it (a second transaction and fee).
+		// Prefer a fresh wallet address per close; fall back to the sweep script
+		// resolved at startup, and only then to the funding-key address, which
+		// recoverFallbackFunds can still rescue.
+		let scriptPubkey = await this.resolveWalletSweepScript().catch(
+			() => undefined
 		);
-		return this.node.closeChannel(idBuf, scriptPubkey);
+		if (!scriptPubkey) scriptPubkey = this.sweepDestinationScript;
+		if (!scriptPubkey) {
+			const bitcoin = require('bitcoinjs-lib');
+			scriptPubkey = bitcoin.address.toOutputScript(
+				this.node.getFundingAddress(),
+				this.getBitcoinNetwork()
+			);
+		}
+		return this.node.closeChannel(idBuf, scriptPubkey!);
 	}
 
 	forceCloseChannel(channelId: string): {

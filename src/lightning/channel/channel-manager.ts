@@ -164,6 +164,12 @@ export interface IChannelManagerConfig {
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) */
 	preferAnchors?: boolean;
 	/**
+	 * Zero reserve with TRUSTED peers: channels with peers in the zero-conf
+	 * trusted set negotiate channel_reserve 0 on both sides, so the whole
+	 * balance is spendable. Ignored for untrusted peers.
+	 */
+	zeroReserve?: boolean;
+	/**
 	 * Propose simple taproot channels (option_taproot). MuSig2 funding and
 	 * commitment signing (deterministic verification nonces) are fully wired;
 	 * the complete lifecycle is validated against LND on regtest. Off by
@@ -513,6 +519,7 @@ export class ChannelManager extends EventEmitter {
 		state.zeroConfEnabled = true;
 		state.trustedPeer = true;
 		state.minimumDepth = 0;
+		if (this.config.zeroReserve) state.zeroReserve = true;
 
 		const signer = this.makeSigner(
 			chKeys.channelIndex,
@@ -2030,6 +2037,7 @@ export class ChannelManager extends EventEmitter {
 			channelState.trustedPeer = true;
 			channelState.zeroConfEnabled = true;
 			channelState.minimumDepth = 0;
+			if (this.config.zeroReserve) channelState.zeroReserve = true;
 		}
 
 		const actions = channel.handleOpenChannel(msg);

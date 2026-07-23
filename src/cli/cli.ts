@@ -446,6 +446,7 @@ async function handleStart(): Promise<void> {
 			daemonHost: config.daemonHost,
 			preferAnchors: config.preferAnchors,
 			largeChannels: config.largeChannels,
+			zeroReserve: config.zeroReserve,
 			apiToken: config.apiToken,
 			apiKeys: config.apiKeys,
 			backupPath: config.backupPath,

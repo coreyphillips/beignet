@@ -119,6 +119,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_LARGE_CHANNELS === 'true'
 				: undefined) ??
 			file.largeChannels,
+		zeroReserve:
+			cliFlags.zeroReserve ??
+			(process.env.BEIGNET_ZERO_RESERVE !== undefined
+				? process.env.BEIGNET_ZERO_RESERVE === 'true'
+				: undefined) ??
+			file.zeroReserve,
 		apiToken:
 			cliFlags.apiToken || process.env.BEIGNET_API_TOKEN || file.apiToken,
 		apiKeys: cliFlags.apiKeys || parseApiKeysEnv() || file.apiKeys,

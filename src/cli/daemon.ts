@@ -623,10 +623,10 @@ export async function startDaemon(
 				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte)
 			);
 		},
-		'POST /channel/close': (body) => {
+		'POST /channel/close': async (body) => {
 			const { channelId } = body as { channelId: string };
 			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
-			const result = node.closeChannel(channelId);
+			const result = await node.closeChannel(channelId);
 			if (!result.ok)
 				return failure('CLOSE_FAILED', result.error || 'Close failed');
 			return success({ closed: true });

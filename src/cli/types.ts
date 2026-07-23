@@ -407,6 +407,13 @@ export interface BeignetConfig {
 	preferAnchors?: boolean;
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
+	/**
+	 * Zero reserve for TRUSTED peers: channels with peers in the zero-conf
+	 * trusted set negotiate a channel_reserve of 0 on both sides, so the whole
+	 * balance is spendable. Same trust model as zero-conf opens; both peers
+	 * should enable it.
+	 */
+	zeroReserve?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */
 	apiToken?: string;
 	/** Named API keys with permission scopes (readonly/invoice/admin).

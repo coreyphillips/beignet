@@ -341,6 +341,14 @@ export interface IChannelState {
 	zeroConfEnabled: boolean;
 	/** Zero-conf: peer is trusted for zero-conf */
 	trustedPeer: boolean;
+	/**
+	 * Full trust: neither side requires a channel reserve of the other, so the
+	 * whole local balance is spendable. Negotiated as channel_reserve_satoshis
+	 * of 0 in open_channel/accept_channel; only ever set for trusted peers
+	 * (the reserve is what makes cheating unprofitable, so dropping it is
+	 * safe only when the peer is ours).
+	 */
+	zeroReserve?: boolean;
 
 	/** Quiescence state */
 	quiescenceState: string;

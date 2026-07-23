@@ -376,6 +376,7 @@ export interface ISerializedChannelState {
 	remoteScidAlias: string | null;
 	zeroConfEnabled?: boolean;
 	trustedPeer?: boolean;
+	zeroReserve?: boolean;
 	quiescenceState?: string;
 	quiescenceInitiator?: boolean;
 	spliceFundingTxid?: string | null;
@@ -628,6 +629,7 @@ export function serializeChannelState(
 		remoteScidAlias: bufToHex(s.remoteScidAlias),
 		zeroConfEnabled: s.zeroConfEnabled,
 		trustedPeer: s.trustedPeer,
+		zeroReserve: s.zeroReserve,
 		quiescenceState: s.quiescenceState,
 		quiescenceInitiator: s.quiescenceInitiator,
 		spliceFundingTxid: bufToHex(s.spliceFundingTxid),
@@ -801,6 +803,7 @@ export function deserializeChannelState(
 		remoteScidAlias: hexToBuf(s.remoteScidAlias),
 		zeroConfEnabled: s.zeroConfEnabled ?? false,
 		trustedPeer: s.trustedPeer ?? false,
+		zeroReserve: s.zeroReserve ?? false,
 		quiescenceState: s.quiescenceState ?? 'NORMAL',
 		quiescenceInitiator: s.quiescenceInitiator ?? false,
 		spliceFundingTxid: s.spliceFundingTxid
