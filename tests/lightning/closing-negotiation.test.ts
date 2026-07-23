@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	Channel,
 	createOpenerChannel
@@ -20,12 +21,14 @@ import { decodeClosingSignedMessage } from '../../src/lightning/message/channel-
 
 function makeBasepoints(): IChannelBasepoints {
 	return {
-		fundingPubkey: crypto.randomBytes(33),
-		revocationBasepoint: crypto.randomBytes(33),
-		paymentBasepoint: crypto.randomBytes(33),
-		delayedPaymentBasepoint: crypto.randomBytes(33),
-		htlcBasepoint: crypto.randomBytes(33),
-		firstPerCommitmentPoint: crypto.randomBytes(33)
+		// Real curve points: open/accept validation now rejects off-curve
+		// basepoints (BOLT 2 LOW hardening).
+		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
+		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
+		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
 
@@ -208,6 +211,73 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 			});
 			const actions = opener.proposeClosingFee(crypto.randomBytes(64));
 			expect(findErrorAction(actions)).to.include('wrong state');
+		});
+
+		it('prices the close from the real tx weight, clearing a CLN-style fee floor (mainnet regression)', function () {
+			// Live-node regression: an anchors channel carries the 253 sat/kw
+			// commitment-feerate floor, and the old 170-WU shortcut priced the
+			// closing tx at 44 sat. CLN's minimum acceptable close fee was 139
+			// sat, and with closingFeeMax capped at 2x ideal (88 sat) the
+			// negotiation could NEVER succeed: warning + disconnect, forever.
+			// The real closing tx weight (~674 WU with two P2WPKH outputs) at
+			// the same 253 sat/kw clears that floor.
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const actions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const decoded = decodeClosingSignedMessage(
+				findSendAction(actions, MessageType.CLOSING_SIGNED)!
+			);
+			expect(decoded.feeSatoshis >= 139n, 'ideal fee clears CLN floor').to.be
+				.true;
+
+			// The peer counters at its 139-sat floor; that must now fall inside
+			// our acceptable range and complete the close.
+			const counter = opener.handleClosingSigned(
+				{
+					channelId: opener.getChannelId()!,
+					feeSatoshis: 139n,
+					signature: crypto.randomBytes(64)
+				},
+				signFn
+			);
+			expect(hasAction(counter, ChannelActionType.CHANNEL_CLOSED)).to.be.true;
+		});
+
+		it('uses an injected live closing feerate over the commitment floor', function () {
+			const { opener } = setupNegotiatingChannels();
+			opener.handleShutdown({
+				channelId: opener.getChannelId()!,
+				scriptPubkey: Buffer.from('0014' + '0'.repeat(40), 'hex')
+			});
+
+			const floorActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const floorFee = decodeClosingSignedMessage(
+				findSendAction(floorActions, MessageType.CLOSING_SIGNED)!
+			).feeSatoshis;
+
+			// 10 sat/vB live rate = 2500 sat/kw; the effective closing feerate
+			// takes the higher of live and commitment.
+			opener.setClosingFeeratePerKw(2500);
+			expect(opener.getClosingFeeratePerKw()).to.equal(2500);
+			const liveActions = opener.proposeClosingFee(crypto.randomBytes(64));
+			const liveFee = decodeClosingSignedMessage(
+				findSendAction(liveActions, MessageType.CLOSING_SIGNED)!
+			).feeSatoshis;
+
+			expect(liveFee > floorFee, 'live rate raises the fee').to.be.true;
+			// 2500/253 ≈ 9.9x; allow rounding.
+			expect(Number(liveFee)).to.be.closeTo(
+				Number(floorFee) * (2500 / 253),
+				20
+			);
+
+			// A live rate BELOW the commitment feerate never lowers the fee.
+			opener.setClosingFeeratePerKw(100);
+			expect(opener.getClosingFeeratePerKw()).to.equal(253);
 		});
 	});
 

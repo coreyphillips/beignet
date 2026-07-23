@@ -214,14 +214,21 @@ describe('BOLT 12: Offers', () => {
 			expect(decoded.metadata!.toString()).to.equal('metadata123');
 		});
 
-		it('should throw on missing description', () => {
-			// Manually create TLV without description
-			const records: ITlvRecord[] = [
-				{ type: BigInt(OfferTlvType.ISSUER_ID), value: pubkey1 }
-			];
+		it('requires description only when an amount is set (BOLT 12)', () => {
 			const { encodeTlvStream } = require('../../src/lightning/message/tlv');
-			const data = encodeTlvStream(records);
-			expect(() => decodeOfferTlv(data)).to.throw(
+			// A minimal offer (issuer_id only, no amount) is valid without a
+			// description.
+			const minimal = encodeTlvStream([
+				{ type: BigInt(OfferTlvType.ISSUER_ID), value: pubkey1 }
+			] as ITlvRecord[]);
+			expect(decodeOfferTlv(minimal).offer.description).to.equal('');
+
+			// An amount without a description must be rejected.
+			const amountNoDesc = encodeTlvStream([
+				{ type: BigInt(OfferTlvType.AMOUNT), value: Buffer.from([0x64]) },
+				{ type: BigInt(OfferTlvType.ISSUER_ID), value: pubkey1 }
+			] as ITlvRecord[]);
+			expect(() => decodeOfferTlv(amountNoDesc)).to.throw(
 				'missing required description'
 			);
 		});
@@ -1074,8 +1081,11 @@ describe('BOLT 12: Offers', () => {
 			const requestTlv = makeSignedRequestTlv({ amount: 50_000n }, offer);
 
 			const invoice = mgr.handleInvoiceRequest(requestTlv)!;
-			// Tamper with amount
-			invoice.amount = 99_000n;
+			// Tamper with the WIRE record for invoice_amount (type 170): the
+			// signature commits to the full record set (invoice.records is the
+			// source of truth for verification, not the structural fields).
+			const amountRecord = invoice.records!.find((r) => r.type === 170n)!;
+			amountRecord.value = Buffer.from([0xff, 0xff, 0xff]);
 
 			const valid = mgr.verifyInvoiceSignature(invoice);
 			expect(valid).to.be.false;

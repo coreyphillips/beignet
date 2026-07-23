@@ -98,37 +98,37 @@ function buildThreeHopRoute(): {
 
 describe('BOLT 4: HTLC Failure Messages', () => {
 	describe('createFailureMessage', () => {
-		it('should produce a 290-byte encrypted message for TEMPORARY_CHANNEL_FAILURE', () => {
+		it('should produce a 292-byte encrypted message for TEMPORARY_CHANNEL_FAILURE', () => {
 			const sharedSecret = crypto.randomBytes(32);
 			const msg = createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
-		it('should produce a 290-byte encrypted message for UNKNOWN_NEXT_PEER', () => {
+		it('should produce a 292-byte encrypted message for UNKNOWN_NEXT_PEER', () => {
 			const sharedSecret = crypto.randomBytes(32);
 			const msg = createFailureMessage(sharedSecret, UNKNOWN_NEXT_PEER);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
-		it('should produce a 290-byte encrypted message for INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', () => {
+		it('should produce a 292-byte encrypted message for INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS', () => {
 			const sharedSecret = crypto.randomBytes(32);
 			const msg = createFailureMessage(
 				sharedSecret,
 				INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS
 			);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
-		it('should produce a 290-byte encrypted message for FEE_INSUFFICIENT', () => {
+		it('should produce a 292-byte encrypted message for FEE_INSUFFICIENT', () => {
 			const sharedSecret = crypto.randomBytes(32);
 			const msg = createFailureMessage(sharedSecret, FEE_INSUFFICIENT);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
-		it('should produce a 290-byte encrypted message for MPP_TIMEOUT', () => {
+		it('should produce a 292-byte encrypted message for MPP_TIMEOUT', () => {
 			const sharedSecret = crypto.randomBytes(32);
 			const msg = createFailureMessage(sharedSecret, MPP_TIMEOUT);
-			expect(msg.length).to.equal(290);
+			expect(msg.length).to.equal(292);
 		});
 
 		it('should produce different ciphertext for different shared secrets', () => {
@@ -409,7 +409,7 @@ describe('BOLT 4: HTLC Failure Messages', () => {
 				const nodeSecret = ecdh(nodeKey, ephemeralKeys[0]);
 
 				const msg = createFailureMessage(nodeSecret, code);
-				expect(msg.length).to.equal(290);
+				expect(msg.length).to.equal(292);
 
 				const result = decryptFailureMessage(sharedSecrets, msg);
 				expect(result).to.not.be.null;

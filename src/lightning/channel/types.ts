@@ -32,6 +32,19 @@ export function isTaprootChannel(channelType: Buffer | null): boolean {
 	);
 }
 
+/**
+ * Check whether a negotiated channel_type includes option_scid_alias.
+ *
+ * BOLT 2 conditions the "MUST NOT allow incoming HTLCs using the real
+ * short_channel_id" rule on the CHANNEL TYPE, not on announce_channel. A private
+ * channel that did not negotiate option_scid_alias may still be addressed by its
+ * real SCID, and peers routinely do so via invoice route hints.
+ */
+export function hasScidAliasChannelType(channelType: Buffer | null): boolean {
+	if (!channelType || channelType.length === 0) return false;
+	return FeatureFlags.fromBuffer(channelType).hasFeature(Feature.SCID_ALIAS);
+}
+
 export enum ChannelState {
 	NONE = 'NONE',
 	SENT_OPEN = 'SENT_OPEN',
@@ -134,6 +147,28 @@ export interface IHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+
+	/**
+	 * RECEIVED entries: set once handleRevokeAndAck has handed this HTLC to the
+	 * node layer with an HTLC_FORWARDED action. The dispatch is edge-triggered
+	 * (once per HTLC), not level-triggered: an entry stays COMMITTED for as long
+	 * as the forward is in flight downstream, so without this marker every later
+	 * revoke_and_ack on the channel re-dispatches it and the node layer offers a
+	 * duplicate outgoing HTLC for one inbound payment.
+	 *
+	 * Persisted, because the node layer has no dedup of its own: an unpersisted
+	 * marker would re-dispatch every in-flight HTLC on each restart and offer a
+	 * duplicate outgoing one. The cost is that the marker reaches disk before the
+	 * node layer has acted, so a restart in that window would strand the HTLC.
+	 * LightningNode.redispatchUnresolvedReceivedHtlcs closes that window on
+	 * startup by re-dispatching committed received HTLCs that have no durable
+	 * resolution in flight.
+	 *
+	 * Optional: absent (legacy persisted states and hand-built fixtures) means
+	 * "not yet dispatched", so an entry written before this field existed is
+	 * dispatched by the next revoke_and_ack rather than being skipped forever.
+	 */
+	forwardEmitted?: boolean;
 }
 
 /**
@@ -161,8 +196,9 @@ export interface IChannelConfig {
 /** BOLT 2: Maximum allowed number of pending HTLCs per direction */
 export const MAX_ACCEPTED_HTLCS = 483;
 
-/** BOLT 2: Maximum channel funding size (2^24 satoshis without wumbo) */
-export const MAX_FUNDING_SATOSHIS = 16777216n;
+/** BOLT 2: maximum channel funding without wumbo. The spec bound is
+ *  funding_satoshis < 2^24, so the largest VALID value is 2^24 - 1. */
+export const MAX_FUNDING_SATOSHIS = 16777215n;
 
 /** Funding ceiling when option_wumbo (large_channels, bit 18) is negotiated:
  *  10 BTC. Wumbo lifts the 2^24 cap, but an unbounded channel is a fat-finger
@@ -181,10 +217,26 @@ export const MIN_DUST_LIMIT_SATOSHIS = 354n;
  *  our to_remote output out of every commitment we sign (see FS-1). */
 export const MAX_DUST_LIMIT_SATOSHIS = 1062n;
 
+/** Largest value encodable in a wire u64 field. */
+export const U64_MAX = 0xffffffffffffffffn;
+
 /** Default channel configuration */
 export const DEFAULT_CHANNEL_CONFIG: IChannelConfig = {
 	dustLimitSatoshis: 354n,
-	maxHtlcValueInFlightMsat: 500_000_000n,
+	// "No artificial limit" (CLN advertises the same U64 max). The value is
+	// advertised as configured on every open/accept path, v1 and v2, and is
+	// never clamped to capacity: the advertisement is immutable for the life
+	// of the channel while capacity is not (splice), so clamping at open
+	// would bake the initial capacity in as a permanent ceiling. Peers take
+	// min(capacity, value) as the effective limit, balance/reserve rules
+	// bound what can actually be in flight, and the gossip htlc_maximum_msat
+	// is clamped to current capacity at channel_update build time. A fixed
+	// default here (formerly 500k sat) capped the usable in-flight amount of
+	// every larger channel: CLN and LDK compute effective capacity as
+	// min(capacity, this value), so a wumbo channel was treated as a 500k-sat
+	// one and peers with a min-capacity policy above it rejected our opens at
+	// any funding size.
+	maxHtlcValueInFlightMsat: U64_MAX,
 	channelReserveSatoshis: 10_000n,
 	htlcMinimumMsat: 1_000n,
 	toSelfDelay: 144,

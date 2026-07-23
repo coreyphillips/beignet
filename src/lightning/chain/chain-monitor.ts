@@ -29,7 +29,7 @@ import {
 	resolveRevokedSecondLevelOutput
 } from './output-resolver';
 import { estimateSweepVbytes } from './sweep';
-import { leaseExpiryFromToRemoteScript } from '../script/anchor';
+import { leaseCsvFromToRemoteScript } from '../script/anchor';
 import { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
@@ -440,6 +440,20 @@ export class ChainMonitor {
 				continue;
 			}
 
+			// The PEER's to_remote on OUR commitment is tracked (classification
+			// completeness) but only the peer can spend it. A vanished peer would
+			// otherwise pin the monitor in RESOLVING forever, so an unspent one
+			// does not block full resolution; once the peer does spend it, the
+			// normal SPEND_CONFIRMED path below applies.
+			if (
+				this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.OUR_COMMITMENT &&
+				output.outputType === OutputType.TO_REMOTE &&
+				output.status === OutputStatus.CONFIRMED
+			) {
+				continue;
+			}
+
 			// Check if confirmed spend has reached irrevocable depth
 			if (
 				output.status === OutputStatus.SPEND_CONFIRMED &&
@@ -593,10 +607,10 @@ export class ChainMonitor {
 					);
 					const vbytes = estimateSweepVbytes(
 						output.outputType,
-						// Lease-locked to_remote (liquidity ads): CLTV clause adds ~2 vb.
+						// Lease-locked to_remote (liquidity ads): multi-byte CSV adds ~1 vb.
 						output.outputType === OutputType.TO_REMOTE &&
 							!!output.witnessScript &&
-							leaseExpiryFromToRemoteScript(output.witnessScript) !== undefined
+							leaseCsvFromToRemoteScript(output.witnessScript) !== undefined
 					);
 					const feeSatoshis = BigInt(Math.ceil(bumpedRate * vbytes));
 
@@ -1425,7 +1439,8 @@ export class ChainMonitor {
 						feeRatePerVbyte,
 						this._revocationBasepointSecret,
 						this._paymentPrivkey,
-						this._network
+						this._network,
+						this._currentBlockHeight
 					);
 					break;
 				}
@@ -1482,18 +1497,27 @@ export class ChainMonitor {
 			this._feeRatePerVbyte,
 			this._revocationBasepointSecret,
 			this._paymentPrivkey,
-			this._network
+			this._network,
+			// Lets the resolver split a near-cltv-deadline HTLC input into its
+			// own penalty tx (independent broadcast + fee-bump fate).
+			this._currentBlockHeight
 		);
 
+		// A batched penalty produces one resolved entry PER INPUT sharing the
+		// same tx; broadcast each distinct tx once (the deadline split can also
+		// yield several distinct txs here).
+		const broadcastTxids = new Set<string>();
 		for (const r of resolved) {
 			if (r.spendTx) {
-				// Penalty tx already has witnesses set
 				const txBuf = r.spendTx.toBuffer();
-				actions.push({
-					type: ChainActionType.BROADCAST_TX,
-					tx: txBuf,
-					description: 'penalty sweep (revoked commitment)'
-				});
+				if (!broadcastTxids.has(r.spendTx.getId())) {
+					broadcastTxids.add(r.spendTx.getId());
+					actions.push({
+						type: ChainActionType.BROADCAST_TX,
+						tx: txBuf,
+						description: 'penalty sweep (revoked commitment)'
+					});
+				}
 				r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
 				r.trackedOutput.broadcastHeight = this._currentBlockHeight;
 				r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;

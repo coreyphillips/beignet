@@ -117,8 +117,12 @@ function makePrevTx(valueSats: number): Buffer {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 	tx.addInput(crypto.randomBytes(32), 0);
-	// A 22-byte placeholder scriptPubkey; only the value is read by the flow.
-	tx.addOutput(Buffer.alloc(22, 0x00), valueSats);
+	// A native-segwit (P2WPKH-shaped) scriptPubkey: the receive side now
+	// enforces segwit-only spends (S-2.H3 anti-malleability).
+	tx.addOutput(
+		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+		valueSats
+	);
 	return tx.toBuffer();
 }
 

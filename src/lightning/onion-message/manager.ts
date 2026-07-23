@@ -5,6 +5,7 @@
  * Handles construction, processing, forwarding, and rate limiting.
  */
 
+import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import {
 	IOnionMessage,
@@ -16,20 +17,17 @@ import {
 	encodeOnionMessage as encodeOnionMessageWire,
 	decodeOnionMessage as decodeOnionMessageWire
 } from './codec';
-import {
-	constructSimpleOnionMessage,
-	constructMultiHopOnionMessage,
-	constructReplyOnionMessage
-} from './construct';
+import { constructReplyOnionMessage } from './construct';
 import { processOnionMessage } from './process';
-import { IBlindedPath } from '../onion/blinded-path';
+import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
 
 /** TLV type handler callback */
 type TlvHandler = (
 	fromPeer: string,
 	tlvType: number,
 	data: Buffer,
-	replyPath?: IBlindedPath
+	replyPath?: IBlindedPath,
+	pathId?: Buffer
 ) => void;
 
 /**
@@ -99,40 +97,35 @@ export class OnionMessageManager extends EventEmitter {
 	/**
 	 * Send an onion message to a destination.
 	 *
+	 * BOLT 4: onion messages are ALWAYS route-blinded (the sphinx layer is
+	 * addressed to blinded node ids and every hop carries encrypted_data), so
+	 * this builds a 1-hop blinded path to the destination — a raw unblinded
+	 * send is silently dropped by CLN/LND. The receiver peels with its
+	 * blinded key derived from the path_key.
+	 *
 	 * @param destination - 33-byte destination node public key
 	 * @param messageData - Application data as Map<tlvType, value>
-	 * @param options - Optional: reply path
+	 * @param options - Optional: reply path, path_id
 	 */
 	sendOnionMessage(
 		destination: Buffer,
 		messageData: Map<number, Buffer>,
 		options?: ISendOnionMessageOptions
 	): void {
-		if (!this.sendMessage) {
-			throw new Error('Send function not configured');
-		}
-
-		const msg = constructSimpleOnionMessage(
-			destination,
-			messageData,
-			undefined,
-			options
-		);
-		const wirePayload = encodeOnionMessageWire(msg);
-
-		// For single-hop messages, send directly to the destination
-		const destHex = destination.toString('hex');
-		this.sendMessage(destHex, 513, wirePayload);
-		this.emit('message:send', destHex, 513, wirePayload);
+		this.sendMultiHopOnionMessage([], destination, messageData, options);
 	}
 
 	/**
-	 * Send a multi-hop onion message through intermediate nodes.
+	 * Send a route-blinded onion message through intermediate forwarding
+	 * nodes. A blinded path is constructed over [intermediates..., destination]
+	 * (each hop's encrypted_data carries the next real node id; the final
+	 * hop optionally carries options.pathId), and the sphinx onion is
+	 * addressed to the blinded node ids, exactly like a spec reply path.
 	 *
-	 * @param intermediateNodes - Array of intermediate node public keys
-	 * @param destination - Final destination public key
+	 * @param intermediateNodes - Real node ids of the forwarding hops (may be empty)
+	 * @param destination - Final destination's real node id
 	 * @param messageData - Application data for the final hop
-	 * @param options - Optional: reply path
+	 * @param options - Optional: reply path, path_id
 	 */
 	sendMultiHopOnionMessage(
 		intermediateNodes: Buffer[],
@@ -144,20 +137,26 @@ export class OnionMessageManager extends EventEmitter {
 			throw new Error('Send function not configured');
 		}
 
-		const msg = constructMultiHopOnionMessage(
-			intermediateNodes,
-			destination,
+		const nodeIds = [...intermediateNodes, destination];
+		const hopData = nodeIds.map((_, i) =>
+			i < nodeIds.length - 1
+				? { nextNodeId: nodeIds[i + 1] }
+				: options?.pathId
+				? { pathId: options.pathId }
+				: {}
+		);
+		const path = constructBlindedPath(crypto.randomBytes(32), nodeIds, hopData);
+		const msg = constructReplyOnionMessage(
+			path,
 			messageData,
 			undefined,
 			options
 		);
 		const wirePayload = encodeOnionMessageWire(msg);
 
-		// Send to the first node in the path
-		const firstHop =
-			intermediateNodes.length > 0
-				? intermediateNodes[0].toString('hex')
-				: destination.toString('hex');
+		// The first hop is addressed by its REAL id on the transport; only the
+		// sphinx layer uses the blinded ids.
+		const firstHop = path.introductionNodeId.toString('hex');
 		this.sendMessage(firstHop, 513, wirePayload);
 		this.emit('message:send', firstHop, 513, wirePayload);
 	}
@@ -168,12 +167,21 @@ export class OnionMessageManager extends EventEmitter {
 	 * @param replyPath - The blinded path received in the original message
 	 * @param messageData - Application data for the reply
 	 */
-	sendReply(replyPath: IBlindedPath, messageData: Map<number, Buffer>): void {
+	sendReply(
+		replyPath: IBlindedPath,
+		messageData: Map<number, Buffer>,
+		options?: ISendOnionMessageOptions
+	): void {
 		if (!this.sendMessage) {
 			throw new Error('Send function not configured');
 		}
 
-		const msg = constructReplyOnionMessage(replyPath, messageData);
+		const msg = constructReplyOnionMessage(
+			replyPath,
+			messageData,
+			undefined,
+			options
+		);
 		const wirePayload = encodeOnionMessageWire(msg);
 
 		// Send to the introduction node
@@ -213,9 +221,11 @@ export class OnionMessageManager extends EventEmitter {
 			);
 
 			if (result.type === 'delivery') {
-				// Final destination — emit event and invoke TLV handlers
+				// Final destination — emit event and invoke TLV handlers. The
+				// pathId (ERD type 6, decrypted-data only) lets handlers verify
+				// the message arrived over a blinded path WE issued.
 				this.emit('message:received', fromPeer, result.payload);
-				this.invokeTlvHandlers(fromPeer, result.payload);
+				this.invokeTlvHandlers(fromPeer, result.payload, result.pathId);
 			} else {
 				// Intermediate — forward to next hop
 				const nextNodeHex = result.nextNodeId.toString('hex');
@@ -303,13 +313,14 @@ export class OnionMessageManager extends EventEmitter {
 	 */
 	private invokeTlvHandlers(
 		fromPeer: string,
-		payload: IOnionMessagePayload
+		payload: IOnionMessagePayload,
+		pathId?: Buffer
 	): void {
 		for (const [tlvType, data] of payload.messageTlvs) {
 			const handlers = this.tlvHandlers.get(tlvType);
 			if (handlers) {
 				for (const handler of handlers) {
-					handler(fromPeer, tlvType, data, payload.replyPath);
+					handler(fromPeer, tlvType, data, payload.replyPath, pathId);
 				}
 			}
 		}

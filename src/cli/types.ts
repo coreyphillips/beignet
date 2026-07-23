@@ -26,6 +26,16 @@ export interface NodeInfo {
 	 * being recovered on-chain — typically needs a force-close to resolve.
 	 */
 	erroredBalanceSats: number;
+	/**
+	 * Splice-in-transit funds. For a channel paying through its splice
+	 * (pay-during-splice, ECDSA pending-lock), the canonical lightning balance
+	 * already counts it at the conservative side of its two fundings, and this
+	 * bucket holds only what is still arriving (a splice-in's added sats until
+	 * the lock). For a parked mid-splice channel (taproot, or before the point
+	 * of no return), the whole settle-to balance sits here. Rejoins
+	 * lightningBalanceSats at splice_locked.
+	 */
+	splicingBalanceSats: number;
 	channelCount: number;
 	peerCount: number;
 	listening: boolean;
@@ -77,6 +87,19 @@ export interface ChannelInfo {
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
+	/**
+	 * Local balance this channel settles to when its in-flight splice locks.
+	 * Present only while a splice is past its point of no return; the live
+	 * localBalanceSats stays pre-splice until splice_locked.
+	 */
+	pendingSpliceLocalBalanceSats?: number;
+	/** Whether the channel can carry HTLC traffic right now (0.6.0+). */
+	htlcUsable?: boolean;
+	/**
+	 * Present exactly when mid-splice by effective state: true = paying
+	 * through the splice (counted in the canonical balance), false = parked.
+	 */
+	payThroughSplice?: boolean;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;
@@ -314,8 +337,18 @@ export interface ConsolidateResult {
 export interface BalanceInfo {
 	onchain: number;
 	lightning: number;
+	/**
+	 * Currently spendable funds: onchain + lightning. Deliberately excludes
+	 * splicingSats (and pending-close funds): those are accounted for but not
+	 * spendable until their transitions complete.
+	 */
 	total: number;
 	unsettledSats?: number;
+	/**
+	 * Splice-in-transit funds (see NodeInfo.splicingBalanceSats). Rejoins
+	 * lightning at splice_locked.
+	 */
+	splicingSats?: number;
 }
 
 export interface OfferInfo {
@@ -401,6 +434,9 @@ export interface BeignetConfig {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
+	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
+	forwardingEnabled?: boolean;
 	/** Daemon diagnostic log level ('debug' | 'info' | 'warn' | 'error' |
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */
@@ -586,6 +622,11 @@ export interface LiquiditySnapshot {
 	activeChannelCount: number;
 	outboundLiquidityPct: number;
 	inboundLiquidityPct: number;
+	/** Total local balance held back as channel reserve, unspendable (sats). */
+	reserveSats: number;
+	/** Local balance above the reserve, i.e. what can actually be sent (sats).
+	 *  Zero while a channel's balance is still below its reserve. */
+	sendableSats: number;
 	recommendations: LiquidityRecommendation[];
 }
 

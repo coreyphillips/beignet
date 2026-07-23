@@ -51,6 +51,14 @@ export function decodeUintFromWords(words: number[]): number {
  */
 export function encodeTaggedField(type: number, dataWords: number[]): number[] {
 	const len = dataWords.length;
+	// BOLT 11: data_length is a 10-bit field (two 5-bit words, max 1023). A
+	// longer field would have its high bits masked off, silently corrupting
+	// the invoice; fail loudly instead.
+	if (len > 1023) {
+		throw new Error(
+			`Tagged field data length ${len} exceeds the BOLT 11 maximum of 1023 words`
+		);
+	}
 	return [type, (len >> 5) & 0x1f, len & 0x1f, ...dataWords];
 }
 

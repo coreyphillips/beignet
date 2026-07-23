@@ -295,6 +295,12 @@ export class SqliteStorage implements IStorageBackend {
 				last_connected INTEGER NOT NULL DEFAULT 0
 			);
 
+			CREATE TABLE IF NOT EXISTS announced_peer_addresses (
+				pubkey TEXT PRIMARY KEY,
+				announcement_timestamp INTEGER NOT NULL,
+				addresses_json TEXT NOT NULL
+			);
+
 			CREATE TABLE IF NOT EXISTS channel_key_indices (
 				channel_id TEXT PRIMARY KEY,
 				channel_index INTEGER NOT NULL
@@ -908,6 +914,44 @@ export class SqliteStorage implements IStorageBackend {
 		this.db.prepare('DELETE FROM peer_addresses WHERE pubkey = ?').run(pubkey);
 	}
 
+	// ─── Announced Peer Addresses ───
+
+	saveAnnouncedPeerAddresses(
+		pubkey: string,
+		timestamp: number,
+		addresses: Array<{ host: string; port: number }>
+	): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO announced_peer_addresses (pubkey, announcement_timestamp, addresses_json) VALUES (?, ?, ?)'
+			)
+			.run(pubkey, timestamp, JSON.stringify(addresses));
+	}
+
+	loadAllAnnouncedPeerAddresses(): Array<{
+		pubkey: string;
+		timestamp: number;
+		addresses: Array<{ host: string; port: number }>;
+	}> {
+		const rows = this.db
+			.prepare(
+				'SELECT pubkey, announcement_timestamp, addresses_json FROM announced_peer_addresses'
+			)
+			.all() as Array<{
+			pubkey: string;
+			announcement_timestamp: number;
+			addresses_json: string;
+		}>;
+		return rows.map((row) => ({
+			pubkey: row.pubkey,
+			timestamp: row.announcement_timestamp,
+			addresses: JSON.parse(row.addresses_json) as Array<{
+				host: string;
+				port: number;
+			}>
+		}));
+	}
+
 	// ─── Channel Key Indices ───
 
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void {
@@ -1067,7 +1111,7 @@ export class SqliteStorage implements IStorageBackend {
 		const migrations: Array<(db: Database.Database) => void> = [
 			// Migration 0→1: Add peer_addresses, channel_key_indices tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
-			(db) => {
+			(db): void => {
 				// Ensure column exists on pre-existing channels table
 				try {
 					db.exec(
@@ -1079,13 +1123,13 @@ export class SqliteStorage implements IStorageBackend {
 			},
 			// Migration 1→2: Add webhooks and payment_queue tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
-			() => {
+			(): void => {
 				// No-op — tables created by CREATE IF NOT EXISTS above
 			},
 			// Migration 2->3: encryption-at-rest rollout. Structurally a no-op;
 			// the data rewrite happens in _encryptExistingData() during open()
 			// whenever an encryptionKey is provided (lazy-safe for plaintext rows)
-			() => {
+			(): void => {
 				// No-op
 			},
 			// Migration 3->4: channel_policies table (routing-policy overrides).

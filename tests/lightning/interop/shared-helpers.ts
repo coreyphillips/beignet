@@ -28,6 +28,11 @@ const BITCOIN_RPC_HOST = '127.0.0.1';
 const BITCOIN_RPC_PORT = 43782;
 const BITCOIN_RPC_USER = 'polaruser';
 const BITCOIN_RPC_PASS = 'polarpass';
+// The shared bitcoind container can have wallets loaded by OTHER projects;
+// wallet-scoped RPCs sent to the root path then fail with code -19
+// ("Multiple wallets are loaded"). Always target our wallet explicitly via
+// the /wallet/<name> URI (the historical default wallet has the empty name).
+const BITCOIN_RPC_WALLET = process.env.BITCOIN_RPC_WALLET ?? '';
 
 /**
  * Deterministic test mnemonic for reproducible interop testing.
@@ -97,7 +102,9 @@ export async function bitcoinRpc(
 		const options = {
 			hostname: BITCOIN_RPC_HOST,
 			port: BITCOIN_RPC_PORT,
-			path: '/',
+			// Wallet-scoped path: node-level RPCs work here too, and wallet RPCs
+			// keep working when other projects load extra wallets on the node.
+			path: `/wallet/${BITCOIN_RPC_WALLET}`,
 			method: 'POST',
 			headers: {
 				'Content-Type': 'application/json',
@@ -272,7 +279,7 @@ export function setupRoutingForChannel(
 			bitcoinSignature1: Buffer.alloc(64),
 			bitcoinSignature2: Buffer.alloc(64),
 			features: Buffer.alloc(0),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			nodeId1:
 				Buffer.compare(nodePubBuf, remotePubBuf) < 0
@@ -291,7 +298,7 @@ export function setupRoutingForChannel(
 
 		graph.applyChannelUpdate({
 			signature: Buffer.alloc(64),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			timestamp: ts,
 			messageFlags: 0x01,
@@ -305,7 +312,7 @@ export function setupRoutingForChannel(
 
 		graph.applyChannelUpdate({
 			signature: Buffer.alloc(64),
-			chainHash: Buffer.alloc(32),
+			chainHash: REGTEST_CHAIN_HASH,
 			shortChannelId,
 			timestamp: ts,
 			messageFlags: 0x01,

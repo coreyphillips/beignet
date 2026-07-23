@@ -17,6 +17,14 @@ import {
 export class NetworkGraph {
 	private _channels: Map<string, IGraphChannel> = new Map();
 	private _nodes: Map<string, IGraphNode> = new Map();
+	// BOLT 7: announcements are chain-scoped. The graph accepts only its own
+	// chain — previously hardcoded to mainnet, which silently discarded every
+	// announcement on regtest/testnet/signet (S-7.M1).
+	private readonly _chainHash: Buffer;
+
+	constructor(chainHash: Buffer = BITCOIN_CHAIN_HASH) {
+		this._chainHash = chainHash;
+	}
 
 	getChannelCount(): number {
 		return this._channels.size;
@@ -31,8 +39,8 @@ export class NetworkGraph {
 	 * Validates that nodeId1 < nodeId2 lexicographically and chain_hash matches.
 	 */
 	addChannelAnnouncement(msg: IChannelAnnouncementMessage): boolean {
-		// Validate chain hash
-		if (!msg.chainHash.equals(BITCOIN_CHAIN_HASH)) {
+		// Validate chain hash against OUR chain (not hardcoded mainnet).
+		if (!msg.chainHash.equals(this._chainHash)) {
 			return false;
 		}
 

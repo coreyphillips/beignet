@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	Channel,
 	createOpenerChannel
@@ -26,12 +27,14 @@ import {
 
 function makeBasepoints(): IChannelBasepoints {
 	return {
-		fundingPubkey: crypto.randomBytes(33),
-		revocationBasepoint: crypto.randomBytes(33),
-		paymentBasepoint: crypto.randomBytes(33),
-		delayedPaymentBasepoint: crypto.randomBytes(33),
-		htlcBasepoint: crypto.randomBytes(33),
-		firstPerCommitmentPoint: crypto.randomBytes(33)
+		// Real curve points: open/accept validation now rejects off-curve
+		// basepoints (BOLT 2 LOW hardening).
+		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
+		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
+		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
 

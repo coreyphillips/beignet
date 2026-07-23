@@ -198,10 +198,11 @@ describe('Liquidity ads lessor safety', function () {
 		});
 		const feeMsat = computeLeaseFeeSat(RATES, 300_000n, 1000) * 1000n;
 		const st = channel.getFullState();
-		// Seller (local) gained the leased funds + the fee; buyer (remote) paid it.
-		// remote started at 200k (buyer contribution); local at 300k (our funding).
+		// CLN lease accounting (validated live): the buyer pays the fee through
+		// the funding tx, so our (seller) balance is credited contribution +
+		// fee and the buyer's balance stays its full contribution.
 		expect(st.localBalanceMsat).to.equal(300_000n * 1000n + feeMsat);
-		expect(st.remoteBalanceMsat).to.equal(200_000n * 1000n - feeMsat);
+		expect(st.remoteBalanceMsat).to.equal(200_000n * 1000n);
 		// Sanity: the full-request fee is strictly larger, so the min() matters.
 		expect(
 			computeLeaseFeeSat(RATES, 500_000n, 1000) >

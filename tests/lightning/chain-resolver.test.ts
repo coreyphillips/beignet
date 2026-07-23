@@ -569,13 +569,16 @@ describe('Output Resolver (Phase 4B)', function () {
 		// reconstruction must include it too or the output is never matched:
 		// force-close classification returns UNKNOWN (or silently drops the
 		// to_local) and the leased balance is never swept.
-		const LEASE_EXPIRY = 800_000;
+		const LEASE_EXPIRY = 804_032;
+		const LEASE_COMMIT_BH = 800_000;
+		const LEASE_CSV = LEASE_EXPIRY - LEASE_COMMIT_BH; // 4032, CLN pure-CSV model
 
 		it('classifies our leased (lessor) commitment and tracks the locked to_local', function () {
 			const { opener } = setupNormalChannels();
 			const state = opener.getFullState();
 			state.isLessor = true;
 			state.leaseExpiry = LEASE_EXPIRY;
+			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
 
 			const perCommitmentSecret = generateFromSeed(
 				state.localPerCommitmentSeed,
@@ -599,7 +602,12 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(toLocal).to.exist;
 			expect(toLocal!.witnessScript).to.not.be.undefined;
 			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
-			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+			// CLN pure-CSV: no CLTV; the CSV number is max(to_self_delay, lease_csv).
+			expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
+			const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
+			expect(bitcoin.script.number.decode(ops[csvIdx - 1] as Buffer)).to.equal(
+				Math.max(state.remoteConfig.toSelfDelay, LEASE_CSV)
+			);
 			// The stored witnessScript must hash to the actual on-chain output.
 			const p2wsh = bitcoin.payments.p2wsh({
 				redeem: { output: toLocal!.witnessScript! }
@@ -614,6 +622,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			const state = opener.getFullState();
 			state.isLessor = false;
 			state.leaseExpiry = LEASE_EXPIRY;
+			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
 
 			const remotePerCommitmentPoint = state.remoteCurrentPerCommitmentPoint!;
 			const built = buildRemoteCommitment(state, remotePerCommitmentPoint);
@@ -631,7 +640,11 @@ describe('Output Resolver (Phase 4B)', function () {
 			expect(toLocal).to.exist;
 			expect(toLocal!.witnessScript).to.not.be.undefined;
 			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
-			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+			expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
+			const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
+			expect(bitcoin.script.number.decode(ops[csvIdx - 1] as Buffer)).to.equal(
+				Math.max(state.localConfig.toSelfDelay, LEASE_CSV)
+			);
 		});
 
 		it('penalizes the locked to_local of a revoked leased peer commitment', function () {
@@ -639,6 +652,7 @@ describe('Output Resolver (Phase 4B)', function () {
 			const preState = opener.getFullState();
 			preState.isLessor = false;
 			preState.leaseExpiry = LEASE_EXPIRY;
+			preState.leaseCommitBlockheight = LEASE_COMMIT_BH;
 
 			// Peer (lessor) commitment #0, built before it is revoked below.
 			const peerPoint0 = preState.remoteCurrentPerCommitmentPoint!;
@@ -663,7 +677,12 @@ describe('Output Resolver (Phase 4B)', function () {
 			);
 			expect(toLocal).to.exist;
 			const ops = bitcoin.script.decompile(toLocal!.witnessScript!)!;
-			expect(ops).to.include(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+			// CLN pure-CSV lease: no CLTV on the peer's leased to_local.
+			expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
+			const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
+			expect(bitcoin.script.number.decode(ops[csvIdx - 1] as Buffer)).to.equal(
+				Math.max(state.localConfig.toSelfDelay, LEASE_CSV)
+			);
 
 			const destScript = Buffer.concat([
 				Buffer.from([0x00, 0x14]),
@@ -691,11 +710,12 @@ describe('Output Resolver (Phase 4B)', function () {
 		// Audit HIGH-3: the lessor's own to_local sweep must set nLockTime =
 		// lease_expiry, otherwise the OP_CHECKLOCKTIMEVERIFY in the CLTV-locked
 		// witnessScript fails (BIP65) and the entire lessor to_local is stranded.
-		it('builds our lessor to_local sweep with nLockTime = lease_expiry', function () {
+		it('builds our lessor to_local sweep with input sequence = lease_csv, no nLockTime', function () {
 			const { opener } = setupNormalChannels();
 			const state = opener.getFullState();
 			state.isLessor = true;
 			state.leaseExpiry = LEASE_EXPIRY;
+			state.leaseCommitBlockheight = LEASE_COMMIT_BH;
 
 			const perCommitmentSecret = generateFromSeed(
 				state.localPerCommitmentSeed,
@@ -730,11 +750,10 @@ describe('Output Resolver (Phase 4B)', function () {
 			);
 			expect(toLocal).to.exist;
 			expect(toLocal!.spendTx).to.exist;
-			// Before the fix this was 0, making the sweep consensus-invalid forever.
-			expect(toLocal!.spendTx!.locktime).to.equal(LEASE_EXPIRY);
-			// The CSV input sequence must remain (locktime stays enforced).
+			// CLN pure-CSV: no nLockTime; input sequence is max(to_self_delay, lease_csv).
+			expect(toLocal!.spendTx!.locktime).to.equal(0);
 			expect(toLocal!.spendTx!.ins[0].sequence).to.equal(
-				state.remoteConfig.toSelfDelay
+				Math.max(state.remoteConfig.toSelfDelay, LEASE_CSV)
 			);
 		});
 	});

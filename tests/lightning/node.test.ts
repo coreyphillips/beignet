@@ -12,7 +12,7 @@ import { Network } from '../../src/lightning/invoice/types';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH,
+	REGTEST_CHAIN_HASH,
 	HtlcState,
 	HtlcDirection
 } from '../../src/lightning/channel/types';
@@ -207,7 +207,7 @@ function createSignedChannelAnnouncement(
 		bitcoinSignature1: Buffer.alloc(64),
 		bitcoinSignature2: Buffer.alloc(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		nodeId1: np1,
 		nodeId2: np2,
@@ -244,7 +244,7 @@ function createSignedChannelUpdate(
 ): Buffer {
 	const msg: IChannelUpdateMessage = {
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1, // htlc_maximum_msat present
@@ -1627,7 +1627,7 @@ describe('Lightning Node', function () {
 				bitcoinSignature1: Buffer.alloc(64),
 				bitcoinSignature2: Buffer.alloc(64),
 				features: Buffer.alloc(0),
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: REGTEST_CHAIN_HASH,
 				shortChannelId: scidAB,
 				nodeId1: abIs1 ? alicePub : bobPub,
 				nodeId2: abIs1 ? bobPub : alicePub,
@@ -1637,7 +1637,7 @@ describe('Lightning Node', function () {
 			for (const dir of [0, 1]) {
 				alice.getGraph().applyChannelUpdate({
 					signature: Buffer.alloc(64),
-					chainHash: BITCOIN_CHAIN_HASH,
+					chainHash: REGTEST_CHAIN_HASH,
 					shortChannelId: scidAB,
 					timestamp: Math.floor(Date.now() / 1000),
 					messageFlags: 1,
@@ -1779,7 +1779,7 @@ describe('Lightning Node', function () {
 				bitcoinSignature1: Buffer.alloc(64),
 				bitcoinSignature2: Buffer.alloc(64),
 				features: Buffer.alloc(0),
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: REGTEST_CHAIN_HASH,
 				shortChannelId: scidBC,
 				nodeId1: bcIs1 ? bobPub : carolPub,
 				nodeId2: bcIs1 ? carolPub : bobPub,
@@ -1788,7 +1788,7 @@ describe('Lightning Node', function () {
 			});
 			dave.getGraph().applyChannelUpdate({
 				signature: Buffer.alloc(64),
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: REGTEST_CHAIN_HASH,
 				shortChannelId: scidBC,
 				timestamp: Math.floor(Date.now() / 1000),
 				messageFlags: 1,
@@ -1808,7 +1808,7 @@ describe('Lightning Node', function () {
 				bitcoinSignature1: Buffer.alloc(64),
 				bitcoinSignature2: Buffer.alloc(64),
 				features: Buffer.alloc(0),
-				chainHash: BITCOIN_CHAIN_HASH,
+				chainHash: REGTEST_CHAIN_HASH,
 				shortChannelId: scidAB,
 				nodeId1: abIs1 ? alicePub : bobPub,
 				nodeId2: abIs1 ? bobPub : alicePub,
@@ -1818,7 +1818,7 @@ describe('Lightning Node', function () {
 			for (const dir of [0, 1]) {
 				alice.getGraph().applyChannelUpdate({
 					signature: Buffer.alloc(64),
-					chainHash: BITCOIN_CHAIN_HASH,
+					chainHash: REGTEST_CHAIN_HASH,
 					shortChannelId: scidAB,
 					timestamp: Math.floor(Date.now() / 1000),
 					messageFlags: 1,
@@ -3023,7 +3023,7 @@ function buildDirectGraph(
 		bitcoinSignature1: Buffer.alloc(64),
 		bitcoinSignature2: Buffer.alloc(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		nodeId1,
 		nodeId2,
@@ -3036,7 +3036,7 @@ function buildDirectGraph(
 	// Add channel updates for both directions
 	const update1: IChannelUpdateMessage = {
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scid,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1,
@@ -3091,7 +3091,7 @@ function buildThreeNodeGraph(
 		bitcoinSignature1: Buffer.alloc(64),
 		bitcoinSignature2: Buffer.alloc(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidAB,
 		nodeId1: abNodeId1,
 		nodeId2: abNodeId2,
@@ -3101,7 +3101,7 @@ function buildThreeNodeGraph(
 
 	alice.getGraph().applyChannelUpdate({
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidAB,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1,
@@ -3115,7 +3115,7 @@ function buildThreeNodeGraph(
 
 	alice.getGraph().applyChannelUpdate({
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidAB,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1,
@@ -3138,7 +3138,7 @@ function buildThreeNodeGraph(
 		bitcoinSignature1: Buffer.alloc(64),
 		bitcoinSignature2: Buffer.alloc(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidBC,
 		nodeId1: bcNodeId1,
 		nodeId2: bcNodeId2,
@@ -3148,7 +3148,7 @@ function buildThreeNodeGraph(
 
 	alice.getGraph().applyChannelUpdate({
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidBC,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1,
@@ -3162,7 +3162,7 @@ function buildThreeNodeGraph(
 
 	alice.getGraph().applyChannelUpdate({
 		signature: Buffer.alloc(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash: REGTEST_CHAIN_HASH,
 		shortChannelId: scidBC,
 		timestamp: Math.floor(Date.now() / 1000),
 		messageFlags: 1,

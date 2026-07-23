@@ -30,6 +30,8 @@ import {
 } from '../keys/derivation';
 import { buildToLocalScript } from '../script/commitment';
 import { buildToRemoteAnchorScript } from '../script/anchor';
+import { leaseCsvBlocks } from '../channel/liquidity-ads';
+import { isDustOutput } from '../chain/closing';
 import {
 	buildTaprootToLocalOutput,
 	buildTaprootToRemoteOutput,
@@ -105,6 +107,7 @@ export interface IJusticeContext {
 	 */
 	isLessor?: boolean;
 	leaseExpiry?: number;
+	leaseCommitBlockheight?: number;
 }
 
 /** Negotiated per-session parameters that shape the justice transaction. */
@@ -143,6 +146,15 @@ export function buildJusticeBackup(
 	ctx: IJusticeContext,
 	policy: ISessionPolicy
 ): IJusticeBackup {
+	// BOLT: the user-supplied sweep script MUST be a standard witness program
+	// (P2WPKH=22 / P2WSH=34 here); an off-spec length makes LND's tower error
+	// at breach time, silently voiding protection. Checked up front, before any
+	// key derivation, so a misconfiguration fails loudly at session setup.
+	if (ctx.sweepScript.length !== 22 && ctx.sweepScript.length !== 34) {
+		throw new Error(
+			`watchtower: sweep script must be 22 or 34 bytes, got ${ctx.sweepScript.length}`
+		);
+	}
 	return ctx.isTaproot
 		? buildJusticeBackupV1(ctx, policy)
 		: buildJusticeBackupV0(ctx, policy);
@@ -177,7 +189,7 @@ function buildJusticeBackupV0(
 						keys.revocationPubkey,
 						keys.theirDelayedPubkey,
 						ctx.toSelfDelay,
-						ctx.leaseExpiry
+						leaseCsvBlocks(ctx.leaseExpiry, ctx.leaseCommitBlockheight)
 					)
 				},
 				network: ctx.network
@@ -444,6 +456,15 @@ function buildJusticeTx(
 	const sweepAmt = totalAmt - fee;
 	if (sweepAmt <= 0n) {
 		throw new Error('watchtower: justice fee exceeds swept value');
+	}
+	// A dust justice output is unredeemable: the tower ships a blob that can
+	// never be mined, so a tiny channel silently loses breach protection.
+	// The floor depends on the sweep script type (P2WPKH 294 / P2WSH 330 /
+	// other witness programs 354), so use the shared per-script check.
+	if (isDustOutput(ctx.sweepScript, sweepAmt)) {
+		throw new Error(
+			`watchtower: justice sweep output ${sweepAmt} sat is below the dust limit for the sweep script`
+		);
 	}
 
 	const tx = new bitcoin.Transaction();

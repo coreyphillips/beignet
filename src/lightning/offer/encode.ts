@@ -9,43 +9,51 @@
  * The data portion is the TLV stream converted to 5-bit words.
  */
 
-import { bech32m } from 'bech32';
 import { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
+import { ITlvRecord, encodeTlvStream } from '../message/tlv';
 import {
 	encodeOfferTlv,
 	encodeInvoiceRequestTlv,
 	encodeInvoiceTlv
 } from './tlv';
-
-/** Maximum bech32m encoding length (generous limit for offers) */
-const BECH32M_MAX_LIMIT = 65535;
+import { encodeNoChecksum } from './bech32-nochecksum';
 
 /**
- * Encode an IOffer as a bech32m string with "lno" prefix.
+ * Encode an IOffer as a checksum-less bech32 string with "lno" prefix
+ * (BOLT 12 strings carry NO checksum; see bech32-nochecksum.ts).
  */
 export function encodeOffer(offer: IOffer): string {
-	const tlvData = encodeOfferTlv(offer);
-	const words = bech32m.toWords(tlvData);
-	return bech32m.encode('lno', words, BECH32M_MAX_LIMIT);
+	return encodeNoChecksum('lno', encodeOfferTlv(offer));
 }
 
 /**
- * Encode an IInvoiceRequest as a bech32m string with "lnr" prefix.
+ * Encode an IInvoiceRequest as a checksum-less bech32 string ("lnr" prefix).
  */
 export function encodeInvoiceRequest(
 	request: IInvoiceRequest,
 	offerTlvData?: Buffer
 ): string {
-	const tlvData = encodeInvoiceRequestTlv(request, offerTlvData);
-	const words = bech32m.toWords(tlvData);
-	return bech32m.encode('lnr', words, BECH32M_MAX_LIMIT);
+	return encodeNoChecksum(
+		'lnr',
+		encodeInvoiceRequestTlv(request, offerTlvData)
+	);
 }
 
 /**
- * Encode an IBolt12Invoice as a bech32m string with "lni" prefix.
+ * Encode an IBolt12Invoice as a checksum-less bech32 string ("lni" prefix).
+ *
+ * When the invoice carries its full wire `records` (set on decode and on
+ * issuance) they are re-encoded verbatim — the BOLT 12 mirror of the
+ * invoice_request and any unknown TLVs live only there, and the signature
+ * commits to them. `mirrorRecords` overrides for callers assembling a fresh
+ * invoice against known invreq records.
  */
-export function encodeBolt12Invoice(invoice: IBolt12Invoice): string {
-	const tlvData = encodeInvoiceTlv(invoice);
-	const words = bech32m.toWords(tlvData);
-	return bech32m.encode('lni', words, BECH32M_MAX_LIMIT);
+export function encodeBolt12Invoice(
+	invoice: IBolt12Invoice,
+	mirrorRecords?: ITlvRecord[]
+): string {
+	if (!mirrorRecords && invoice.records) {
+		return encodeNoChecksum('lni', encodeTlvStream(invoice.records));
+	}
+	return encodeNoChecksum('lni', encodeInvoiceTlv(invoice, mirrorRecords));
 }

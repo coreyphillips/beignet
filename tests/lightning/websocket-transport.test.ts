@@ -1199,6 +1199,15 @@ describe('WebSocket transport (offline)', function () {
 		function makeNode(seedId: number): LightningNode {
 			const seed = makeSeed(seedId);
 			const { basepoints, secrets } = makeBasepoints(seed);
+			// This suite exercises the WS TRANSPORT over the manually-driven v1
+			// funding flow (createFunding below). With default features on both
+			// ends the peers would negotiate option_dual_fund and openChannel
+			// would correctly route to the v2 interactive flow (issue #158),
+			// which this harness does not drive. Pin features without dual fund
+			// so the v1 open stays under test.
+			const features = LightningNode.defaultFeatures();
+			features.clearBit(28); // option_dual_fund, compulsory bit
+			features.clearBit(29); // option_dual_fund, optional bit
 			const config: INodeConfig = {
 				nodePrivateKey: crypto
 					.createHash('sha256')
@@ -1211,7 +1220,8 @@ describe('WebSocket transport (offline)', function () {
 				perCommitmentSeed: makeSeed(seedId + 100),
 				fundingPrivkey: secrets[0],
 				htlcBasepointSecret: secrets[4],
-				enableNetworking: true
+				enableNetworking: true,
+				localFeatures: features
 			};
 			const node = new LightningNode(config);
 			node.on('error', () => {});

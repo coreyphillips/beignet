@@ -20,7 +20,7 @@ import {
 	deriveBlindingSharedSecret,
 	deriveNextBlindingKey
 } from './blinding';
-import { privateMultiply } from '../crypto/ecdh';
+import { privateMultiply, isValidPublicKey } from '../crypto/ecdh';
 import { encodeTlvStream, decodeTlvStream } from '../message/tlv';
 
 export interface IBlindedHop {
@@ -62,6 +62,21 @@ export interface IBlindedHopData {
 	 * release_held_htlc onion message before forwarding.
 	 */
 	holdHtlc?: boolean;
+	/**
+	 * path_id (BOLT 4 encrypted_recipient_data type 6): a private, recipient-
+	 * chosen identifier placed in the FINAL hop of a blinded path. The
+	 * recipient checks the decrypted path_id matches one it published, proving
+	 * the message arrived via the intended path (and not a probe/replay).
+	 */
+	pathId?: Buffer;
+	/**
+	 * next_path_key_override (BOLT 4 encrypted_recipient_data type 8): the
+	 * path key to forward to the next hop INSTEAD of the standard derivation.
+	 * Set at the seam where two blinded routes are concatenated (e.g. a
+	 * sender-prepended segment joining a recipient-built path), so the next
+	 * hop unblinds with the key its own route creator chose.
+	 */
+	nextPathKeyOverride?: Buffer;
 	/** Padding for uniform hop sizes */
 	padding?: Buffer;
 }
@@ -70,6 +85,8 @@ export interface IBlindedHopData {
 const ERD_PADDING = 1n;
 const ERD_SHORT_CHANNEL_ID = 2n;
 const ERD_NEXT_NODE_ID = 4n;
+const ERD_PATH_ID = 6n;
+const ERD_NEXT_PATH_KEY_OVERRIDE = 8n;
 const ERD_PAYMENT_RELAY = 10n;
 const ERD_PAYMENT_CONSTRAINTS = 12n;
 /**
@@ -117,6 +134,15 @@ export function encodeBlindedHopData(data: IBlindedHopData): Buffer {
 	if (data.nextNodeId) {
 		records.push({ type: ERD_NEXT_NODE_ID, value: data.nextNodeId });
 	}
+	if (data.pathId) {
+		records.push({ type: ERD_PATH_ID, value: data.pathId });
+	}
+	if (data.nextPathKeyOverride) {
+		records.push({
+			type: ERD_NEXT_PATH_KEY_OVERRIDE,
+			value: data.nextPathKeyOverride
+		});
+	}
 	if (data.paymentRelay) {
 		const head = Buffer.alloc(6);
 		head.writeUInt16BE(data.paymentRelay.cltvExpiryDelta, 0);
@@ -163,6 +189,10 @@ export function decodeBlindedHopData(buf: Buffer): IBlindedHopData {
 			data.shortChannelId = Buffer.from(r.value);
 		} else if (r.type === ERD_NEXT_NODE_ID) {
 			data.nextNodeId = Buffer.from(r.value);
+		} else if (r.type === ERD_PATH_ID) {
+			data.pathId = Buffer.from(r.value);
+		} else if (r.type === ERD_NEXT_PATH_KEY_OVERRIDE) {
+			data.nextPathKeyOverride = Buffer.from(r.value);
 		} else if (r.type === ERD_PAYMENT_RELAY) {
 			data.paymentRelay = {
 				cltvExpiryDelta: r.value.readUInt16BE(0),
@@ -273,12 +303,27 @@ export interface IBlindedPaymentPath {
 }
 
 /**
- * Encode a single blinded path.
- * Format: intro_node_id(33) || blinding_point(33) || num_hops(1) ||
- *         [blinded_node_id(33) || enc_data_len(2) || encrypted_data(...)] ...
+ * Encode a single blinded path (BOLT 4 `blinded_path` subtype):
+ *   sciddir_or_pubkey:first_node_id || point(33):first_path_key ||
+ *   byte:num_hops || num_hops * [ point(33) || u16:enclen || enc_data ]
+ *
+ * `introductionNodeId` is a `sciddir_or_pubkey`: 33 bytes when the leading
+ * byte is 0x02/0x03 (a node pubkey), 9 bytes when it is 0x00/0x01 (a
+ * direction byte + 8-byte short_channel_id referencing node_1/node_2).
  */
 export function encodeBlindedPath(path: IBlindedPath): Buffer {
-	const parts: Buffer[] = [path.introductionNodeId, path.blindingPoint];
+	const first = path.introductionNodeId;
+	if (
+		!(
+			(first.length === 33 && (first[0] === 0x02 || first[0] === 0x03)) ||
+			(first.length === 9 && (first[0] === 0x00 || first[0] === 0x01))
+		)
+	) {
+		throw new Error(
+			`blinded_path first_node_id is not a valid sciddir_or_pubkey (len=${first.length}, first byte=${first[0]})`
+		);
+	}
+	const parts: Buffer[] = [first, path.blindingPoint];
 	const numHops = Buffer.alloc(1);
 	numHops[0] = path.blindedHops.length;
 	parts.push(numHops);
@@ -297,17 +342,57 @@ export function decodeBlindedPath(
 	buf: Buffer,
 	offset: number
 ): { path: IBlindedPath; offset: number } {
-	const introductionNodeId = Buffer.from(buf.subarray(offset, offset + 33));
-	offset += 33;
+	// sciddir_or_pubkey: 0x00/0x01 -> 9 bytes (scid+direction), 0x02/0x03 ->
+	// 33-byte point. Assuming 33 bytes unconditionally mis-parsed every
+	// spec-built path using the scid-dir form (S-4.H4).
+	const disc = buf[offset];
+	let firstLen: number;
+	if (disc === 0x02 || disc === 0x03) {
+		firstLen = 33;
+	} else if (disc === 0x00 || disc === 0x01) {
+		firstLen = 9;
+	} else {
+		throw new Error(
+			`blinded_path first_node_id has invalid sciddir_or_pubkey discriminator ${disc}`
+		);
+	}
+	if (offset + firstLen + 33 + 1 > buf.length) {
+		throw new Error('blinded_path truncated');
+	}
+	const introductionNodeId = Buffer.from(
+		buf.subarray(offset, offset + firstLen)
+	);
+	// BOLT 12: a reader MUST reject invalid points; a 33-byte first_node_id is
+	// a pubkey (the 9-byte form is scid+direction, no point to validate).
+	if (firstLen === 33 && !isValidPublicKey(introductionNodeId)) {
+		throw new Error('blinded_path first_node_id is not a valid point');
+	}
+	offset += firstLen;
 	const blindingPoint = Buffer.from(buf.subarray(offset, offset + 33));
+	if (!isValidPublicKey(blindingPoint)) {
+		throw new Error('blinded_path path_key is not a valid point');
+	}
 	offset += 33;
 	const numHops = buf[offset++];
+	// A path with no hops routes nowhere; BOLT 12 rejects it outright.
+	if (numHops === 0) {
+		throw new Error('blinded_path has zero hops');
+	}
 	const blindedHops: IBlindedHop[] = [];
 	for (let j = 0; j < numHops; j++) {
+		if (offset + 33 + 2 > buf.length) {
+			throw new Error('blinded_path truncated at hop');
+		}
 		const blindedNodeId = Buffer.from(buf.subarray(offset, offset + 33));
+		if (!isValidPublicKey(blindedNodeId)) {
+			throw new Error('blinded_path blinded_node_id is not a valid point');
+		}
 		offset += 33;
 		const encLen = buf.readUInt16BE(offset);
 		offset += 2;
+		if (offset + encLen > buf.length) {
+			throw new Error('blinded_path truncated at hop encrypted data');
+		}
 		const encryptedData = Buffer.from(buf.subarray(offset, offset + encLen));
 		offset += encLen;
 		blindedHops.push({ blindedNodeId, encryptedData });
@@ -315,19 +400,21 @@ export function decodeBlindedPath(
 	return { path: { introductionNodeId, blindingPoint, blindedHops }, offset };
 }
 
-/** Encode an array of blinded paths: num_paths(1) || path... */
+/**
+ * Encode an array of blinded paths (BOLT 12 `[...*blinded_path]`): the paths
+ * are concatenated with NO count prefix — the array fills the TLV length.
+ * (The 1-byte count beignet used to add made every offer/invreq/invoice path
+ * field unreadable by spec decoders, S-4.H4.)
+ */
 export function encodeBlindedPaths(paths: IBlindedPath[]): Buffer {
-	const numPaths = Buffer.alloc(1);
-	numPaths[0] = paths.length;
-	return Buffer.concat([numPaths, ...paths.map(encodeBlindedPath)]);
+	return Buffer.concat(paths.map(encodeBlindedPath));
 }
 
-/** Decode an array of blinded paths produced by encodeBlindedPaths. */
+/** Decode a `[...*blinded_path]` array: paths until the buffer is consumed. */
 export function decodeBlindedPaths(buf: Buffer): IBlindedPath[] {
 	let offset = 0;
-	const numPaths = buf[offset++];
 	const paths: IBlindedPath[] = [];
-	for (let i = 0; i < numPaths; i++) {
+	while (offset < buf.length) {
 		const decoded = decodeBlindedPath(buf, offset);
 		paths.push(decoded.path);
 		offset = decoded.offset;
@@ -335,15 +422,24 @@ export function decodeBlindedPaths(buf: Buffer): IBlindedPath[] {
 	return paths;
 }
 
-/** Encode one pay-info record (fixed 28 bytes). */
+/**
+ * Encode one pay-info record (BOLT 12 `blinded_payinfo` subtype):
+ *   u32:fee_base_msat || u32:fee_proportional_millionths ||
+ *   u16:cltv_expiry_delta || u64:htlc_minimum_msat || u64:htlc_maximum_msat ||
+ *   u16:flen || flen*byte:features
+ * (beignet used to put the u16 length between htlc_minimum and htlc_maximum
+ * and never serialized features — unreadable by spec decoders, S-4.H4.)
+ */
 export function encodeBlindedPayInfo(info: IBlindedPayInfo): Buffer {
-	const buf = Buffer.alloc(28);
+	const features = info.features ?? Buffer.alloc(0);
+	const buf = Buffer.alloc(28 + features.length);
 	buf.writeUInt32BE(info.feeBaseMsat, 0);
 	buf.writeUInt32BE(info.feeProportionalMillionths, 4);
 	buf.writeUInt16BE(info.cltvExpiryDelta, 8);
 	buf.writeBigUInt64BE(info.htlcMinimumMsat, 10);
-	buf.writeUInt16BE(0, 18); // reserved / features length placeholder
-	buf.writeBigUInt64BE(info.htlcMaximumMsat, 20);
+	buf.writeBigUInt64BE(info.htlcMaximumMsat, 18);
+	buf.writeUInt16BE(features.length, 26);
+	features.copy(buf, 28);
 	return buf;
 }
 
@@ -352,37 +448,43 @@ export function decodeBlindedPayInfo(
 	buf: Buffer,
 	offset: number
 ): { info: IBlindedPayInfo; offset: number } {
+	if (offset + 28 > buf.length) {
+		throw new Error('blinded_payinfo truncated');
+	}
 	const feeBaseMsat = buf.readUInt32BE(offset);
 	const feeProportionalMillionths = buf.readUInt32BE(offset + 4);
 	const cltvExpiryDelta = buf.readUInt16BE(offset + 8);
 	const htlcMinimumMsat = buf.readBigUInt64BE(offset + 10);
-	// offset + 18..20 reserved
-	const htlcMaximumMsat = buf.readBigUInt64BE(offset + 20);
-	return {
-		info: {
-			feeBaseMsat,
-			feeProportionalMillionths,
-			cltvExpiryDelta,
-			htlcMinimumMsat,
-			htlcMaximumMsat
-		},
-		offset: offset + 28
+	const htlcMaximumMsat = buf.readBigUInt64BE(offset + 18);
+	const flen = buf.readUInt16BE(offset + 26);
+	if (offset + 28 + flen > buf.length) {
+		throw new Error('blinded_payinfo truncated at features');
+	}
+	const features = Buffer.from(buf.subarray(offset + 28, offset + 28 + flen));
+	const info: IBlindedPayInfo = {
+		feeBaseMsat,
+		feeProportionalMillionths,
+		cltvExpiryDelta,
+		htlcMinimumMsat,
+		htlcMaximumMsat
 	};
+	if (flen > 0) info.features = features;
+	return { info, offset: offset + 28 + flen };
 }
 
-/** Encode an array of pay-info records: count(1) || payinfo(28)... */
+/**
+ * Encode a `[...*blinded_payinfo]` array: records concatenated with NO count
+ * prefix — the array fills the TLV length (BOLT 12).
+ */
 export function encodeBlindedPayInfos(infos: IBlindedPayInfo[]): Buffer {
-	const count = Buffer.alloc(1);
-	count[0] = infos.length;
-	return Buffer.concat([count, ...infos.map(encodeBlindedPayInfo)]);
+	return Buffer.concat(infos.map(encodeBlindedPayInfo));
 }
 
-/** Decode an array of pay-info records produced by encodeBlindedPayInfos. */
+/** Decode a `[...*blinded_payinfo]` array: records until the buffer ends. */
 export function decodeBlindedPayInfos(buf: Buffer): IBlindedPayInfo[] {
 	let offset = 0;
-	const count = buf[offset++];
 	const infos: IBlindedPayInfo[] = [];
-	for (let i = 0; i < count; i++) {
+	while (offset < buf.length) {
 		const decoded = decodeBlindedPayInfo(buf, offset);
 		infos.push(decoded.info);
 		offset = decoded.offset;
@@ -391,10 +493,11 @@ export function decodeBlindedPayInfos(buf: Buffer): IBlindedPayInfo[] {
 }
 
 /**
- * Encode blinded payment paths for a BOLT 11 invoice tagged field: each entry
- * is a self-delimiting blinded path immediately followed by its 28-byte pay
- * info, prefixed by the entry count.
- *   num(1) || [ blinded_path || pay_info(28) ] ...
+ * Encode blinded payment paths for a BOLT 11 invoice tagged field (a
+ * beignet-specific tag-25 extension, NOT a spec format): each entry is a
+ * self-delimiting blinded path immediately followed by its (variable-length)
+ * pay info, prefixed by the entry count.
+ *   num(1) || [ blinded_path || pay_info ] ...
  */
 export function encodeInvoiceBlindedPaymentPaths(
 	entries: IBlindedPaymentPath[]
@@ -449,8 +552,12 @@ export function processBlindedHop(
 	// Decode hop data
 	const hopData = decodeBlindedHopData(plaintext);
 
-	// Derive next blinding key
-	const nextBlindingKey = deriveNextBlindingKey(blindingKey, sharedSecret);
+	// Derive the next blinding key. BOLT 4: next_path_key_override (from the
+	// DECRYPTED data, so it is creator-authenticated) replaces the standard
+	// derivation at a concatenated-route seam.
+	const nextBlindingKey =
+		hopData.nextPathKeyOverride ??
+		deriveNextBlindingKey(blindingKey, sharedSecret);
 
 	return { hopData, nextBlindingKey };
 }

@@ -45,6 +45,59 @@ describe('LiquidityAdvisor', () => {
 		expect(result.activeChannelCount).to.equal(2);
 	});
 
+	it('keeps counting a channel that pays through its splice', () => {
+		// Splicing every channel used to zero the whole snapshot (balances,
+		// capacity, active count) for the splice window, despite sats being
+		// sendable throughout. htlcUsable marks the pay-through case active.
+		const result = advisor.analyze([
+			makeChannel({ channelId: 'ch1', state: 'SPLICING', htlcUsable: true })
+		]);
+		expect(result.activeChannelCount).to.equal(1);
+		expect(result.totalLocalBalanceSats).to.equal(500_000);
+		expect(result.totalCapacitySats).to.equal(1_000_000);
+		// An active, funded channel must not read as "no active channels".
+		expect(
+			result.recommendations.some((r) => /No active channels/.test(r.reason))
+		).to.equal(false);
+	});
+
+	it('still excludes a parked splice (no pay-through)', () => {
+		const result = advisor.analyze([
+			makeChannel({ channelId: 'ch1', state: 'SPLICING' })
+		]);
+		expect(result.activeChannelCount).to.equal(0);
+		expect(result.totalLocalBalanceSats).to.equal(0);
+	});
+
+	it('judges a splice-out at its settle-to balance, not the live one', () => {
+		// The node feeds the advisor the effective min(live, settle-to) balance
+		// for a pay-through splice. A splice-out with a flush live balance
+		// (500k of 1M) settling to 50k must read as ~5% outbound and trigger
+		// the low-outbound recommendation, not read as 50% and suppress it —
+		// the live figure is exactly what the channel can no longer spend.
+		const result = advisor.analyze([
+			makeChannel({
+				channelId: 'ch1',
+				state: 'SPLICING',
+				htlcUsable: true,
+				// What LightningNode.getLiquiditySnapshot hands over: the
+				// settle-to side of the splice-out, already the min.
+				localBalanceMsat: 50_000_000n,
+				remoteBalanceMsat: 500_000_000n
+			})
+		]);
+		expect(result.totalLocalBalanceSats).to.equal(50_000);
+		expect(
+			result.recommendations.some(
+				(r) =>
+					r.type === RecommendationType.OPEN_CHANNEL &&
+					r.priority === RecommendationPriority.HIGH &&
+					/less than 10% outbound/.test(r.reason)
+			),
+			'low-outbound advice fires on the settle-to figure'
+		).to.equal(true);
+	});
+
 	it('calculates outbound/inbound percentages correctly', () => {
 		const result = advisor.analyze([
 			makeChannel({
@@ -290,5 +343,84 @@ describe('LiquidityAdvisor', () => {
 		expect(closeRecs.length).to.be.at.least(2);
 		expect(closeRecs.some((r) => r.channelId === 'empty_ch')).to.be.true;
 		expect(closeRecs.some((r) => r.channelId === 'stuck_ch')).to.be.true;
+	});
+});
+
+describe('LightningNode.getLiquiditySnapshot splice mapping', () => {
+	// The advisor judges whatever balance the node hands it, so the node must
+	// hand over the effective mid-splice figure. Passing the raw live balance
+	// let a splice-out (live 500k, settling to 50k) read as 50% outbound and
+	// suppress the low-outbound recommendation exactly when it applied.
+	function makeNode(): import('../../src/lightning/node/lightning-node').LightningNode {
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const crypto = require('crypto');
+		const {
+			LightningNode
+			// eslint-disable-next-line @typescript-eslint/no-var-requires
+		} = require('../../src/lightning/node/lightning-node');
+		// eslint-disable-next-line @typescript-eslint/no-var-requires
+		const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
+		const keys: Buffer[] = [];
+		for (let i = 0; i < 5; i++) keys.push(crypto.randomBytes(32));
+		const node = new LightningNode({
+			nodePrivateKey: crypto.randomBytes(32),
+			perCommitmentSeed: crypto.randomBytes(32),
+			channelBasepoints: {
+				fundingPubkey: getPublicKey(keys[0]),
+				revocationBasepoint: getPublicKey(keys[1]),
+				paymentBasepoint: getPublicKey(keys[2]),
+				delayedPaymentBasepoint: getPublicKey(keys[3]),
+				htlcBasepoint: getPublicKey(keys[4]),
+				firstPerCommitmentPoint: Buffer.alloc(33)
+			},
+			fundingPrivkey: crypto.randomBytes(32)
+		});
+		node.on('error', () => {});
+		return node;
+	}
+
+	it('hands the advisor min(live, settle-to) for a pay-through splice-out', () => {
+		const node = makeNode();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(node as any).listChannels = (): unknown[] => [
+			{
+				channelId: Buffer.alloc(32, 1),
+				state: 'SPLICING',
+				localBalanceMsat: 500_000_000n,
+				remoteBalanceMsat: 500_000_000n,
+				fundingSatoshis: 1_000_000n,
+				peerPubkey: '02' + 'aa'.repeat(32),
+				htlcUsable: true,
+				pendingSpliceLocalBalanceMsat: 50_000_000n
+			}
+		];
+		const snap = node.getLiquiditySnapshot();
+		expect(snap.activeChannelCount).to.equal(1);
+		expect(snap.totalLocalBalanceSats).to.equal(50_000);
+		expect(
+			snap.recommendations.some((r) => /less than 10% outbound/.test(r.reason)),
+			'low-outbound advice fires on the settle-to figure'
+		).to.equal(true);
+		node.destroy();
+	});
+
+	it('keeps the live balance for a splice-in (settle-to is higher)', () => {
+		const node = makeNode();
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(node as any).listChannels = (): unknown[] => [
+			{
+				channelId: Buffer.alloc(32, 2),
+				state: 'SPLICING',
+				localBalanceMsat: 200_000_000n,
+				remoteBalanceMsat: 300_000_000n,
+				fundingSatoshis: 1_000_000n,
+				peerPubkey: '02' + 'bb'.repeat(32),
+				htlcUsable: true,
+				pendingSpliceLocalBalanceMsat: 700_000_000n
+			}
+		];
+		const snap = node.getLiquiditySnapshot();
+		expect(snap.totalLocalBalanceSats).to.equal(200_000);
+		node.destroy();
 	});
 });

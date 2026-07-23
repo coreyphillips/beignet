@@ -173,6 +173,13 @@ export function encodeNodeAnnouncementMessage(
 ): Buffer {
 	const flen = msg.features.length;
 
+	// BOLT 7: a node_announcement MUST NOT include more than one address of
+	// type 5 (DNS hostname).
+	if (msg.addresses.filter((a) => a.type === ADDRESS_TYPE_DNS).length > 1) {
+		throw new Error(
+			'node_announcement MUST NOT include more than one DNS address (type 5)'
+		);
+	}
 	// Encode addresses first to know total length
 	const addrParts: Buffer[] = [];
 	for (const addr of msg.addresses) {
@@ -627,6 +634,23 @@ export function nodeAddressToHostPort(
 		default:
 			return null;
 	}
+}
+
+/**
+ * Dialable reconnect candidates from a node_announcement address list.
+ * Converts each descriptor to host:port, dropping Tor v2 (network retired,
+ * dials can never succeed), zero ports (not connectable) and unknown types.
+ */
+export function announcedDialableAddresses(
+	addresses: INodeAddress[]
+): Array<{ host: string; port: number }> {
+	const out: Array<{ host: string; port: number }> = [];
+	for (const addr of addresses) {
+		if (addr.type === ADDRESS_TYPE_TORV2 || addr.port === 0) continue;
+		const hostPort = nodeAddressToHostPort(addr);
+		if (hostPort) out.push(hostPort);
+	}
+	return out;
 }
 
 function expandIpv6(host: string): string {

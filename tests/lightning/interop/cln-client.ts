@@ -230,13 +230,35 @@ export class ClnRestClient {
 		return this.request('POST', '/v1/listpeerchannels');
 	}
 
+	/**
+	 * Buy an inbound-liquidity lease while opening (bLIP-0051): v2 open with
+	 * request_amt; compact_lease is the hex lease_rates we expect the seller
+	 * to sign (CLN aborts if the peer's will_fund rates differ).
+	 */
+	async fundChannelLease(
+		id: string,
+		amount: number,
+		requestAmt: number,
+		compactLease: string
+	): Promise<IClnFundChannelResponse> {
+		return this.request('POST', '/v1/fundchannel', {
+			id,
+			amount: String(amount),
+			request_amt: String(requestAmt),
+			compact_lease: compactLease
+		});
+	}
+
 	async closeChannel(
 		id: string,
-		opts?: { unilateraltimeout?: number }
+		opts?: { unilateraltimeout?: number; destination?: string }
 	): Promise<IClnCloseResponse> {
 		const body: Record<string, unknown> = { id };
 		if (opts?.unilateraltimeout !== undefined) {
 			body.unilateraltimeout = opts.unilateraltimeout;
+		}
+		if (opts?.destination !== undefined) {
+			body.destination = opts.destination;
 		}
 		return this.request('POST', '/v1/close', body);
 	}

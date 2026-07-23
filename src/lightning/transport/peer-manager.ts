@@ -11,6 +11,7 @@
 import { EventEmitter } from 'events';
 import net from 'net';
 import { SocksClient } from 'socks';
+import { getPublicKey } from '../crypto/ecdh';
 import { Peer } from './peer';
 import { FeatureFlags } from '../features/flags';
 import { IInitMessage } from '../message/init';
@@ -48,6 +49,51 @@ const DEFAULT_INITIAL_RECONNECT_DELAY_MS = 1_000; // 1 second
 // resets the backoff every cycle and reconnects in a tight 1s loop forever.
 const STABLE_CONNECTION_MS = 60_000;
 const DEFAULT_TOR_PROXY = { host: '127.0.0.1', port: 9050 };
+// Cap on gossip-announced reconnect candidates kept per peer. Announcements
+// are peer-controlled input; without a cap a peer could make every reconnect
+// round crawl through a long list of dead addresses.
+const MAX_ANNOUNCED_ADDRESSES = 5;
+
+/**
+ * True for hosts that must be dialed directly and never through the SOCKS5/Tor
+ * proxy: localhost, loopback, and RFC1918 / link-local / unique-local IPs.
+ *
+ * Tor refuses to proxy connections to private and loopback addresses
+ * ("Rejecting SOCKS request for anonymous connection to private address"), so
+ * with a proxy configured, routing a LAN or localhost peer through it turns
+ * every dial and every auto-reconnect into a hard failure. A user who enables
+ * Tor to gain privacy on public peers should not thereby lose the channel peer
+ * that lives on their own network. Onion routing is decided by the caller; this
+ * only classifies literal IP addresses (and `localhost`). A hostname that
+ * happens to resolve to a private address is not caught here, because that would
+ * require resolving it first; peers on a LAN are addressed by IP in practice.
+ */
+export function isPrivateOrLoopbackHost(host: string): boolean {
+	const h = host.trim().toLowerCase();
+	if (h === '' || h === 'localhost') return h === 'localhost';
+
+	// IPv6: drop brackets and any zone id, then match the reserved ranges.
+	const v6 = h.replace(/^\[/, '').replace(/\]$/, '').split('%')[0];
+	if (v6 === '::1' || v6 === '::') return true;
+	if (/^fe[89ab][0-9a-f]:/.test(v6)) return true; // fe80::/10 link-local
+	if (/^f[cd][0-9a-f]{2}:/.test(v6)) return true; // fc00::/7  unique-local
+	// IPv4-mapped IPv6 (e.g. ::ffff:192.168.1.2) reduces to the IPv4 check.
+	const mapped = v6.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+
+	const v4 = mapped ? mapped[1] : h;
+	const m = v4.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+	if (!m) return false;
+	const parts = m.slice(1).map(Number);
+	if (parts.some((n) => n > 255)) return false;
+	const [a, b] = parts;
+	if (a === 0) return true; // 0.0.0.0/8 "this host on this network"
+	if (a === 127) return true; // 127.0.0.0/8 loopback
+	if (a === 10) return true; // 10.0.0.0/8
+	if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
+	if (a === 192 && b === 168) return true; // 192.168.0.0/16
+	if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local
+	return false;
+}
 
 export interface IPeerManagerOptions {
 	/** Local node private key (32 bytes) */
@@ -90,12 +136,22 @@ type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
 export class PeerManager extends EventEmitter {
 	private localPrivateKey: Buffer;
+	private localPubkeyHex: string;
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private peers: Map<string, Peer> = new Map();
 	private peerAddresses: Map<
 		string,
 		{ host: string; port: number; transport?: IPeerTransportOptions }
+	> = new Map();
+	// Addresses learned from a peer's signature-verified node_announcement.
+	// Reconnect fallbacks only: a peer that has only ever connected inbound
+	// exposes no dialable address (its TCP source port is ephemeral), so these
+	// are the one self-recovery path for its channels. Never dialed before the
+	// last-known-good outbound address in peerAddresses.
+	private announcedAddresses: Map<
+		string,
+		Array<{ host: string; port: number }>
 	> = new Map();
 	private messageHandlers: Map<number, MessageHandler[]> = new Map();
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -119,6 +175,7 @@ export class PeerManager extends EventEmitter {
 	constructor(options: IPeerManagerOptions) {
 		super();
 		this.localPrivateKey = options.localPrivateKey;
+		this.localPubkeyHex = getPublicKey(options.localPrivateKey).toString('hex');
 		this.localFeatures = options.localFeatures || FeatureFlags.empty();
 		this.networks = options.networks;
 		this.autoReconnect = options.autoReconnect ?? false;
@@ -140,6 +197,27 @@ export class PeerManager extends EventEmitter {
 	 *                    WebSocket (url defaults to ws://host:port).
 	 */
 	async connectPeer(
+		pubkey: string,
+		host: string,
+		port: number,
+		transport?: IPeerTransportOptions
+	): Promise<void> {
+		try {
+			await this.dialPeer(pubkey, host, port, transport);
+		} catch (err) {
+			if (this.autoReconnect) {
+				this.scheduleReconnect(pubkey);
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Single dial attempt. Unlike connectPeer, a failure does NOT schedule a
+	 * reconnect — the reconnect loop tries several candidate addresses per round
+	 * and must control when the next round starts.
+	 */
+	private async dialPeer(
 		pubkey: string,
 		host: string,
 		port: number,
@@ -174,10 +252,16 @@ export class PeerManager extends EventEmitter {
 			createSocket = (): Promise<IDuplexTransport> =>
 				connectWebSocket(url, { webSocketImpl });
 		} else {
-			// Use explicit proxy, or auto-detect .onion → default Tor SOCKS5 proxy
-			const proxy =
-				this.socks5Proxy ??
-				(host.endsWith('.onion') ? DEFAULT_TOR_PROXY : undefined);
+			// Route selection for the outbound socket:
+			//   .onion           → always via Tor (explicit proxy, else the default)
+			//   private/loopback → always direct; Tor rejects these, so proxying a
+			//                      LAN or localhost peer would only ever fail
+			//   public clearnet  → via the configured proxy (privacy), else direct
+			const proxy = host.endsWith('.onion')
+				? this.socks5Proxy ?? DEFAULT_TOR_PROXY
+				: isPrivateOrLoopbackHost(host)
+				? undefined
+				: this.socks5Proxy;
 			createSocket = proxy ? this.buildSocks5Factory(proxy) : undefined;
 		}
 
@@ -201,10 +285,28 @@ export class PeerManager extends EventEmitter {
 			if (previousAddress) {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
-			if (this.autoReconnect) {
-				this.scheduleReconnect(pubkey);
-			}
 			throw err;
+		}
+		// The peer may have dialed US while our handshake was in flight. Apply
+		// the deterministic tie-break (see preferOutboundTo): if the registered
+		// connection is inbound and we are the smaller-pubkey side, our
+		// outbound wins — replace it with the same teardown bookkeeping the
+		// newest-wins inbound path uses. Otherwise discard ours quietly: no
+		// peer:connect for it, and no peer:disconnect when it closes. A
+		// same-direction winner (two concurrent local dials) is never
+		// replaced — the connections are interchangeable, keep the first.
+		const raceWinner = this.peers.get(pubkey);
+		if (raceWinner && raceWinner !== peer) {
+			const winnerIsInbound = this.inboundPeerSet.has(pubkey);
+			if (!winnerIsInbound || !this.preferOutboundTo(pubkey)) {
+				peer.removeAllListeners();
+				peer.disconnect();
+				return;
+			}
+			// peer:disconnect is emitted before our peer:connect below, mirroring
+			// the inbound replacement path: channels mark AWAITING_REESTABLISH
+			// first, then the connect handler re-drives channel_reestablish.
+			this.removeRegisteredPeer(pubkey, raceWinner);
 		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
@@ -231,6 +333,45 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Deterministic direction preference for simultaneous cross-dials (both
+	 * nodes reconnecting to each other at once, routine after a drop when both
+	 * sides auto-reconnect). Each side keeping "its" connection can select
+	 * OPPOSITE physical sockets — A keeps the one B just discarded and vice
+	 * versa — killing both. The convention (LND uses the same shape): the node
+	 * with the lexicographically smaller pubkey keeps its outbound connection,
+	 * the other keeps its inbound one, so both ends independently converge on
+	 * the same socket (BOLT 1: a single connection per peer). Only applied to
+	 * cross-DIRECTION collisions; same-direction ones are not ambiguous
+	 * between the ends and keep their existing rules.
+	 */
+	private preferOutboundTo(remotePubkey: string): boolean {
+		return this.localPubkeyHex < remotePubkey;
+	}
+
+	/**
+	 * Tear down the registered connection for a peer, synchronously and with
+	 * ALL its bookkeeping. Every removal path must go through here: the
+	 * direction bookkeeping (inboundPeerSet/inboundPeerCount) feeds the
+	 * cross-dial tie-break, so a path that forgets it leaves a stale entry
+	 * that can flip a later collision decision (and leak the inbound count
+	 * toward maxInboundPeers). Listeners are detached first: the Peer's
+	 * 'close' fires on a later tick and must never act on a pubkey whose
+	 * registration has already moved on.
+	 */
+	private removeRegisteredPeer(pubkey: string, peer: Peer): void {
+		if (this.peers.get(pubkey) !== peer) return;
+		peer.removeAllListeners();
+		peer.disconnect();
+		this.peers.delete(pubkey);
+		this.clearStabilityTimer(pubkey);
+		if (this.inboundPeerSet.delete(pubkey)) {
+			this.inboundPeerCount--;
+		}
+		captureWireEvent('close', pubkey);
+		this.emit('peer:disconnect', pubkey);
+	}
+
+	/**
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
@@ -244,9 +385,7 @@ export class PeerManager extends EventEmitter {
 
 		const peer = this.peers.get(pubkey);
 		if (peer) {
-			peer.disconnect();
-			this.peers.delete(pubkey);
-			this.emit('peer:disconnect', pubkey);
+			this.removeRegisteredPeer(pubkey, peer);
 		}
 	}
 
@@ -294,6 +433,59 @@ export class PeerManager extends EventEmitter {
 	 */
 	getPeerAddress(pubkey: string): { host: string; port: number } | undefined {
 		return this.peerAddresses.get(pubkey);
+	}
+
+	/**
+	 * Record dialable addresses learned from the peer's signature-verified
+	 * node_announcement, used as reconnect fallbacks after the last-known-good
+	 * outbound address (if any). Replaces any previous set for the peer; an
+	 * empty list clears it.
+	 */
+	setAnnouncedAddresses(
+		pubkey: string,
+		addresses: Array<{ host: string; port: number }>
+	): void {
+		if (addresses.length === 0) {
+			this.announcedAddresses.delete(pubkey);
+			return;
+		}
+		this.announcedAddresses.set(
+			pubkey,
+			addresses
+				.slice(0, MAX_ANNOUNCED_ADDRESSES)
+				.map((a) => ({ host: a.host, port: a.port }))
+		);
+	}
+
+	/**
+	 * Gossip-announced reconnect fallbacks currently held for a peer.
+	 */
+	getAnnouncedAddresses(pubkey: string): Array<{ host: string; port: number }> {
+		return [...(this.announcedAddresses.get(pubkey) ?? [])];
+	}
+
+	/**
+	 * Addresses a reconnect round dials, in order: the last-known-good outbound
+	 * address first, then gossip-announced fallbacks (deduplicated against it).
+	 */
+	private reconnectCandidates(
+		pubkey: string
+	): Array<{ host: string; port: number; transport?: IPeerTransportOptions }> {
+		const candidates: Array<{
+			host: string;
+			port: number;
+			transport?: IPeerTransportOptions;
+		}> = [];
+		const dialed = this.peerAddresses.get(pubkey);
+		if (dialed) candidates.push(dialed);
+		for (const addr of this.announcedAddresses.get(pubkey) ?? []) {
+			if (
+				!candidates.some((c) => c.host === addr.host && c.port === addr.port)
+			) {
+				candidates.push(addr);
+			}
+		}
+		return candidates;
 	}
 
 	/**
@@ -413,6 +605,7 @@ export class PeerManager extends EventEmitter {
 		}
 		this.reconnectTimers.clear();
 		this.reconnectDelays.clear();
+		this.announcedAddresses.clear();
 		for (const timer of this.stabilityTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -442,10 +635,42 @@ export class PeerManager extends EventEmitter {
 			.then(() => {
 				const pubkey = peer.remotePublicKey.toString('hex');
 
-				// Reject if already connected
-				if (this.peers.has(pubkey)) {
+				const existing = this.peers.get(pubkey);
+
+				// Cross-direction collision (we hold an outbound connection or
+				// dial to this peer): resolve deterministically so both ends
+				// keep the SAME socket (see preferOutboundTo). When we are the
+				// smaller-pubkey side our outbound wins — drop this inbound; the
+				// peer's dialPeer discards its outbound symmetrically. This
+				// intentionally covers a possibly-stale outbound too (matching
+				// LND): rejecting the re-dial costs at most one ping cycle
+				// before the dead socket is noticed, whereas newest-wins on
+				// cross-direction collisions lets the two ends select opposite
+				// sockets and kill both.
+				if (
+					existing &&
+					!this.inboundPeerSet.has(pubkey) &&
+					this.preferOutboundTo(pubkey)
+				) {
 					peer.disconnect();
 					return;
+				}
+
+				// Newest wins (matches LND/CLN/LDK): when a peer's old inbound
+				// connection dies on its side (common over Tor circuits), the
+				// remote re-dials before our ping/pong timeout notices the stale
+				// socket. Rejecting the fresh connection keeps the dead one, and
+				// inbound peers store no dialable address (their TCP source port
+				// is ephemeral), so the only self-recovery is a gossip-announced
+				// fallback that may not exist: channels could sit in
+				// AWAITING_REESTABLISH until a human forces a reconnect.
+				if (existing) {
+					// Tear the old connection down synchronously with our own
+					// bookkeeping. peer:disconnect is emitted before the
+					// replacement's peer:connect so channels are marked
+					// AWAITING_REESTABLISH first and the connect handler then
+					// re-drives channel_reestablish over the new connection.
+					this.removeRegisteredPeer(pubkey, existing);
 				}
 
 				this.setupPeerListeners(pubkey, peer);
@@ -485,6 +710,12 @@ export class PeerManager extends EventEmitter {
 		});
 
 		peer.on('close', () => {
+			// Only the currently registered instance may tear down the peer's
+			// bookkeeping. A connection that lost a cross-dial race (or was
+			// replaced by a fresh inbound) closes later; keying the map by
+			// pubkey alone would let that stale close delete the live
+			// replacement's entry and emit a spurious peer:disconnect.
+			if (this.peers.get(pubkey) !== peer) return;
 			captureWireEvent('close', pubkey);
 			this.peers.delete(pubkey);
 			// A short-lived connection: don't let it reset the backoff.
@@ -496,7 +727,7 @@ export class PeerManager extends EventEmitter {
 			}
 			this.emit('peer:disconnect', pubkey);
 
-			if (this.autoReconnect && this.peerAddresses.has(pubkey)) {
+			if (this.autoReconnect && this.reconnectCandidates(pubkey).length > 0) {
 				this.scheduleReconnect(pubkey);
 			}
 		});
@@ -523,8 +754,7 @@ export class PeerManager extends EventEmitter {
 
 	private scheduleReconnect(pubkey: string): void {
 		if (this.reconnectTimers.has(pubkey)) return; // already scheduled
-		const addr = this.peerAddresses.get(pubkey);
-		if (!addr) return;
+		if (this.reconnectCandidates(pubkey).length === 0) return;
 
 		const baseDelay =
 			this.reconnectDelays.get(pubkey) || DEFAULT_INITIAL_RECONNECT_DELAY_MS;
@@ -536,11 +766,20 @@ export class PeerManager extends EventEmitter {
 
 		const timer = setTimeout(async () => {
 			this.reconnectTimers.delete(pubkey);
-			try {
-				await this.connectPeer(pubkey, addr.host, addr.port, addr.transport);
-			} catch {
-				// connectPeer re-schedules when autoReconnect is enabled
+			// The peer may have re-dialed us while we waited (common over Tor).
+			if (this.peers.has(pubkey)) return;
+			// Candidates are re-read at fire time so addresses learned while
+			// waiting (e.g. a fresh node_announcement) are included.
+			for (const addr of this.reconnectCandidates(pubkey)) {
+				try {
+					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
+					return;
+				} catch {
+					// try the next candidate
+				}
 			}
+			// Every candidate failed: next round with a larger backoff.
+			this.scheduleReconnect(pubkey);
 		}, actualDelay);
 
 		this.reconnectTimers.set(pubkey, timer);

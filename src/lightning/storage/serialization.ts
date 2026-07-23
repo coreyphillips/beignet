@@ -137,6 +137,8 @@ export interface ISerializedHtlcEntry {
 	commitCoverPending?: boolean;
 	addLocallyRevoked?: boolean;
 	removalLocallyRevoked?: boolean;
+	/** Edge-trigger marker for HTLC_FORWARDED dispatch (see IHtlcEntry). */
+	forwardEmitted?: boolean;
 }
 
 export interface ISerializedHtlcSnapshot {
@@ -179,6 +181,9 @@ export function serializeHtlcEntry(
 			: {}),
 		...(e.removalLocallyRevoked !== undefined
 			? { removalLocallyRevoked: e.removalLocallyRevoked }
+			: {}),
+		...(e.forwardEmitted !== undefined
+			? { forwardEmitted: e.forwardEmitted }
 			: {})
 	};
 }
@@ -214,6 +219,9 @@ export function deserializeHtlcEntry(s: ISerializedHtlcEntry): {
 				: {}),
 			...(s.removalLocallyRevoked !== undefined
 				? { removalLocallyRevoked: s.removalLocallyRevoked }
+				: {}),
+			...(s.forwardEmitted !== undefined
+				? { forwardEmitted: s.forwardEmitted }
 				: {})
 		}
 	};
@@ -294,6 +302,17 @@ export interface ISerializedChannelState {
 	 * Optional for backward compatibility.
 	 */
 	lastSignedCommitFeeratePerKw?: number;
+	/**
+	 * Two-phase update_blockheight (bLIP-0051 leases): staged height, its
+	 * phases, the height the current signed local commitment was built at,
+	 * and every distinct committed height (old-commitment classification).
+	 * All optional for backward compatibility.
+	 */
+	pendingLeaseBlockheight?: number;
+	pendingLeaseBlockheightSignable?: boolean;
+	pendingLeaseBlockheightCommitted?: boolean;
+	lastSignedCommitLeaseBlockheight?: number;
+	leaseHeightHistory?: number[];
 	localBalanceMsat: string;
 	remoteBalanceMsat: string;
 	shaChainData: { entries: ISerializedShaChainEntry[]; knownCount: string };
@@ -380,6 +399,7 @@ export interface ISerializedChannelState {
 	// signature no longer validates, and our whole balance becomes unbroadcastable.
 	isLessor?: boolean;
 	leaseExpiry?: number;
+	leaseCommitBlockheight?: number;
 	// Cooperative close: fully-signed mutual-close tx (hex). Persisted so a restart
 	// in the pre-confirmation window can rebroadcast it and re-arm the funding watch.
 	lastCooperativeCloseTxHex?: string;
@@ -405,6 +425,8 @@ export interface ISerializedSpliceInFlight {
 	ourWalletInputIndices: number[];
 	remoteCommitmentSig: string | null;
 	remoteCommitmentSigFeeratePerKw?: number;
+	remoteCommitmentSigLeaseBlockheight?: number;
+	remoteHtlcSignatures?: string[];
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
 	localSpliceLocked: boolean;
@@ -432,6 +454,8 @@ export function serializeSpliceInFlight(
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: f.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: f.remoteCommitmentSigLeaseBlockheight,
+		remoteHtlcSignatures: f.remoteHtlcSignatures?.map((b) => b.toString('hex')),
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
 		localSpliceLocked: f.localSpliceLocked,
@@ -460,6 +484,10 @@ export function deserializeSpliceInFlight(
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: s.remoteCommitmentSigFeeratePerKw,
+		remoteCommitmentSigLeaseBlockheight: s.remoteCommitmentSigLeaseBlockheight,
+		remoteHtlcSignatures: s.remoteHtlcSignatures?.map((h) =>
+			Buffer.from(h, 'hex')
+		),
 		sentTxSignatures: s.sentTxSignatures,
 		receivedTxSignatures: s.receivedTxSignatures,
 		localSpliceLocked: s.localSpliceLocked,
@@ -520,6 +548,11 @@ export function serializeChannelState(
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
 		localBalanceMsat: bigintToStr(s.localBalanceMsat),
 		remoteBalanceMsat: bigintToStr(s.remoteBalanceMsat),
 		shaChainData: serializeShaChainEntries(s.shaChainStore),
@@ -622,6 +655,7 @@ export function serializeChannelState(
 		fundingLocktime: s.fundingLocktime,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
@@ -683,6 +717,11 @@ export function deserializeChannelState(
 		pendingFeerateSignable: s.pendingFeerateSignable,
 		pendingFeerateCommitted: s.pendingFeerateCommitted,
 		lastSignedCommitFeeratePerKw: s.lastSignedCommitFeeratePerKw,
+		pendingLeaseBlockheight: s.pendingLeaseBlockheight,
+		pendingLeaseBlockheightSignable: s.pendingLeaseBlockheightSignable,
+		pendingLeaseBlockheightCommitted: s.pendingLeaseBlockheightCommitted,
+		lastSignedCommitLeaseBlockheight: s.lastSignedCommitLeaseBlockheight,
+		leaseHeightHistory: s.leaseHeightHistory,
 		localBalanceMsat: strToBigint(s.localBalanceMsat),
 		remoteBalanceMsat: strToBigint(s.remoteBalanceMsat),
 		shaChainStore: deserializeShaChainStore(s.shaChainData),
@@ -792,6 +831,7 @@ export function deserializeChannelState(
 		fundingLocktime: s.fundingLocktime ?? 0,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
+		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		dlpRemotePerCommitmentPoint:
@@ -811,6 +851,7 @@ export interface ISerializedPaymentInfo {
 	sharedSecrets?: string[]; // hex
 	failureCode?: number;
 	failureSourceIndex?: number;
+	failureReason?: string;
 	createdAt: number;
 	completedAt?: number;
 	metadata?: Record<string, string>;
@@ -839,6 +880,7 @@ export function serializePaymentInfo(p: IPaymentInfo): ISerializedPaymentInfo {
 		sharedSecrets: p.sharedSecrets?.map((b) => b.toString('hex')),
 		failureCode: p.failureCode,
 		failureSourceIndex: p.failureSourceIndex,
+		failureReason: p.failureReason,
 		createdAt: p.createdAt,
 		completedAt: p.completedAt,
 		metadata: p.metadata
@@ -868,6 +910,7 @@ export function deserializePaymentInfo(
 		sharedSecrets: s.sharedSecrets?.map((h) => Buffer.from(h, 'hex')),
 		failureCode: s.failureCode,
 		failureSourceIndex: s.failureSourceIndex,
+		failureReason: s.failureReason,
 		createdAt: s.createdAt,
 		completedAt: s.completedAt,
 		metadata: s.metadata

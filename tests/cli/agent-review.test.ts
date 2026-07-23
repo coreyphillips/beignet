@@ -102,6 +102,143 @@ describe('Agent Review: canSend reserve math', () => {
 	});
 });
 
+describe('Agent Review: liquidity snapshot reserve aggregation', () => {
+	// Mirrors BeignetNode.getLiquiditySnapshot(): reserveSats and sendableSats
+	// are summed over routable channels (NORMAL, or htlcUsable — a channel
+	// paying through its splice still sends), sendable clamped at zero per
+	// channel so a balance below its reserve contributes nothing sendable while
+	// its reserve still counts. Mid-splice the spendable side is the
+	// conservative min of the live and settle-to balances, mirroring the
+	// balance side of the channel's add gate (the true per-add ceiling also
+	// reserves the funder's commitment fee; this aggregation prices balance
+	// minus reserve, as it always has for NORMAL channels). Aggregated here in
+	// isolation because getLiquiditySnapshot() needs a real wallet, matching
+	// how canSend's math is covered above.
+	type Ch = {
+		state: string;
+		localBalanceMsat: bigint;
+		localReserveMsat?: bigint;
+		htlcUsable?: boolean;
+		pendingSpliceLocalBalanceMsat?: bigint;
+	};
+	const aggregate = (
+		channels: Ch[]
+	): { reserveSats: number; sendableSats: number } => {
+		let reserveMsat = 0n;
+		let sendableMsat = 0n;
+		for (const ch of channels) {
+			if (ch.state !== 'NORMAL' && !ch.htlcUsable) continue;
+			const r = ch.localReserveMsat ?? 0n;
+			reserveMsat += r;
+			const effLocalMsat =
+				ch.pendingSpliceLocalBalanceMsat !== undefined &&
+				ch.pendingSpliceLocalBalanceMsat < ch.localBalanceMsat
+					? ch.pendingSpliceLocalBalanceMsat
+					: ch.localBalanceMsat;
+			sendableMsat += effLocalMsat > r ? effLocalMsat - r : 0n;
+		}
+		return {
+			reserveSats: Number(reserveMsat / 1000n),
+			sendableSats: Number(sendableMsat / 1000n)
+		};
+	};
+
+	it('sums reserve and sendable across NORMAL channels', () => {
+		const res = aggregate([
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 500_000_000n,
+				localReserveMsat: 10_000_000n
+			},
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 200_000_000n,
+				localReserveMsat: 5_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(15_000);
+		expect(res.sendableSats).to.equal(685_000); // 490k + 195k
+	});
+
+	it('counts a below-reserve channel reserve but zero sendable', () => {
+		const res = aggregate([
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 12_000_000n,
+				localReserveMsat: 20_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(20_000);
+		expect(res.sendableSats).to.equal(0);
+	});
+
+	it('ignores non-NORMAL channels', () => {
+		const res = aggregate([
+			{
+				state: 'AWAITING_FUNDING_CONFIRMED',
+				localBalanceMsat: 500_000_000n,
+				localReserveMsat: 10_000_000n
+			},
+			{
+				state: 'NORMAL',
+				localBalanceMsat: 100_000_000n,
+				localReserveMsat: 4_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(4_000);
+		expect(res.sendableSats).to.equal(96_000);
+	});
+
+	it('treats a missing reserve as zero', () => {
+		const res = aggregate([{ state: 'NORMAL', localBalanceMsat: 30_000_000n }]);
+		expect(res.reserveSats).to.equal(0);
+		expect(res.sendableSats).to.equal(30_000);
+	});
+
+	it('keeps counting a channel that pays through its splice', () => {
+		// The field report: splicing every channel zeroed the liquidity card
+		// even though sats were still sendable mid-splice. A SPLICING channel
+		// with pay-through active stays in the sums, at the conservative
+		// min(live, settle-to) balance side of the channel's add gate.
+		const res = aggregate([
+			{
+				state: 'SPLICING',
+				htlcUsable: true,
+				localBalanceMsat: 500_000_000n,
+				pendingSpliceLocalBalanceMsat: 300_000_000n, // splice-out settles lower
+				localReserveMsat: 10_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(10_000);
+		expect(res.sendableSats).to.equal(290_000); // min(500k, 300k) - 10k
+	});
+
+	it('a splice-in keeps the live (lower) balance until lock', () => {
+		const res = aggregate([
+			{
+				state: 'SPLICING',
+				htlcUsable: true,
+				localBalanceMsat: 200_000_000n,
+				pendingSpliceLocalBalanceMsat: 700_000_000n, // splice-in settles higher
+				localReserveMsat: 5_000_000n
+			}
+		]);
+		expect(res.sendableSats).to.equal(195_000); // min(200k, 700k) - 5k
+	});
+
+	it('still ignores a parked splice (no pay-through)', () => {
+		const res = aggregate([
+			{
+				state: 'SPLICING',
+				localBalanceMsat: 500_000_000n,
+				localReserveMsat: 10_000_000n
+			}
+		]);
+		expect(res.reserveSats).to.equal(0);
+		expect(res.sendableSats).to.equal(0);
+	});
+});
+
 describe('Agent Review: IChannelInfo reserve fields', () => {
 	it('IChannelInfo should accept localReserveMsat and remoteReserveMsat', () => {
 		// Verify the interface accepts the new fields

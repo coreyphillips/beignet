@@ -268,6 +268,7 @@ export async function startDaemon(
 				filter.metadataValue = query.get('metadataValue');
 			return success(
 				node.listPayments(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; listPayments tolerates unknown values
 					Object.keys(filter).length > 0 ? (filter as any) : undefined
 				)
 			);
@@ -281,6 +282,7 @@ export async function startDaemon(
 			if (query.get('channelId')) filter.channelId = query.get('channelId');
 			return success(
 				node.listForwards(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; listForwards tolerates unknown values
 					Object.keys(filter).length > 0 ? (filter as any) : undefined
 				)
 			);
@@ -420,6 +422,7 @@ export async function startDaemon(
 			if (query.get('limit')) options.limit = Number(query.get('limit'));
 			return success(
 				node.getActionLog(
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; getActionLog tolerates unknown values
 					Object.keys(options).length > 0 ? (options as any) : undefined
 				)
 			);
@@ -734,7 +737,8 @@ export async function startDaemon(
 				port: peerPort,
 				amountSats,
 				pushSats,
-				satsPerVbyte
+				satsPerVbyte,
+				max
 			} = body as {
 				pubkey: string;
 				host: string;
@@ -742,6 +746,7 @@ export async function startDaemon(
 				amountSats: number;
 				pushSats?: number;
 				satsPerVbyte?: number;
+				max?: boolean;
 			};
 			if (!pubkey || !peerHost || !peerPort || amountSats === undefined) {
 				return failure(
@@ -755,7 +760,7 @@ export async function startDaemon(
 					peerHost,
 					peerPort,
 					amountSats,
-					{ pushSats, satsPerVbyte }
+					{ pushSats, satsPerVbyte, max }
 				)
 			);
 		},
@@ -1077,6 +1082,23 @@ export async function startDaemon(
 		},
 
 		// ── Splicing ──
+		'POST /channel/splice-quote': (body) => {
+			const { channelId, direction, feeratePerkw } = body as {
+				channelId: string;
+				direction: 'in' | 'out';
+				feeratePerkw: number;
+			};
+			if (
+				!channelId ||
+				(direction !== 'in' && direction !== 'out') ||
+				feeratePerkw === undefined
+			)
+				return failure(
+					'INVALID_PARAMS',
+					"channelId, direction ('in' or 'out') and feeratePerkw required"
+				);
+			return success(node.spliceQuote(channelId, direction, feeratePerkw));
+		},
 		'POST /channel/splice-in': (body) => {
 			const { channelId, amountSats, feeratePerkw } = body as {
 				channelId: string;

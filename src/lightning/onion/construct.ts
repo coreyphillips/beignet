@@ -16,7 +16,8 @@ import {
 import {
 	computeSharedSecrets,
 	deriveHopKeys,
-	generateCipherStream
+	generateCipherStream,
+	generateKey
 } from './sphinx-crypto';
 import { encodeHopPayload } from './hop-payload';
 
@@ -92,11 +93,10 @@ export function constructOnionPacket(
 	// session key — generate_key("pad", session_key) — so the unused tail of
 	// the onion is indistinguishable from real hop data and the final recipient
 	// cannot infer the route length. Zero-init would leak that structure.
-	const padKey = crypto
-		.createHmac('sha256', Buffer.from('pad', 'ascii'))
-		.update(sessionKey)
-		.digest();
-	let routingInfo = generateCipherStream(padKey, ROUTING_INFO_LENGTH);
+	let routingInfo = generateCipherStream(
+		generateKey('pad', sessionKey),
+		ROUTING_INFO_LENGTH
+	);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
 	// Build right-to-left (last hop first)

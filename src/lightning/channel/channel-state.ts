@@ -45,12 +45,24 @@ export interface ISpliceInFlight {
 	/** Peer's signature on OUR spliced commitment (adopted at completeSplice). */
 	remoteCommitmentSig: Buffer | null;
 	/**
+	 * Peer's second-level HTLC signatures on OUR spliced commitment, parallel
+	 * to remoteCommitmentSig. Present when committed HTLCs ride through the
+	 * splice (S-2.M8); absent/empty for an HTLC-free splice.
+	 */
+	remoteHtlcSignatures?: Buffer[];
+	/**
 	 * The committed commitment feerate that remoteCommitmentSig was produced
 	 * at. force-close rebuilds the spliced commitment at THIS rate, not a
 	 * feerate that may have been staged (update_fee) but not yet covered by the
 	 * adopted signature.
 	 */
 	remoteCommitmentSigFeeratePerKw?: number;
+	/**
+	 * Lease blockheight covered by remoteCommitmentSig, captured with it for
+	 * the same reason as the feerate: force-close reconstruction must never
+	 * derive a signed commitment's parameters from mutable current state.
+	 */
+	remoteCommitmentSigLeaseBlockheight?: number;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
 	localSpliceLocked: boolean;
@@ -370,6 +382,46 @@ export interface IChannelState {
 	 * CSV-locked until leaseExpiry. The lessee (buyer) leaves this false/undefined.
 	 */
 	isLessor?: boolean;
+	/**
+	 * Liquidity ads (buyer side): the lease fee in satoshis, paid THROUGH the
+	 * funding transaction — the funding output must total opener_funds +
+	 * seller_funds + this fee (CLN model, validated live). The tx-building
+	 * caller adds it to the funding output amount. Transient during opening.
+	 */
+	leaseFeeSats?: bigint;
+	/**
+	 * Liquidity ads: the blockheight both sides agreed on at open
+	 * (request_funds.blockheight). Commitment lease CSV =
+	 * leaseExpiry - this (CLN model); advanced only by update_blockheight.
+	 */
+	leaseCommitBlockheight?: number;
+	/**
+	 * Two-phase update_blockheight (bLIP-0051, mirrors the pendingFeerate
+	 * machine): the OPENER's staged blockheight. From receipt it applies to
+	 * verifying the opener's signatures over OUR commitment; it applies to
+	 * commitments WE sign only once signable, and is promoted to
+	 * leaseCommitBlockheight when the round finalizes.
+	 */
+	pendingLeaseBlockheight?: number;
+	pendingLeaseBlockheightSignable?: boolean;
+	pendingLeaseBlockheightCommitted?: boolean;
+	/**
+	 * The lease blockheight the CURRENT SIGNED local commitment was verified
+	 * at (mirrors lastSignedCommitFeeratePerKw): mid-blockheight-round the
+	 * in-flight value can differ from the committed one, and rebuilding the
+	 * signed commitment (force-close) with the wrong height changes the
+	 * lease-locked scripts and invalidates the stored signature.
+	 */
+	lastSignedCommitLeaseBlockheight?: number;
+	/**
+	 * Every DISTINCT leaseCommitBlockheight this channel has ever committed
+	 * (in promotion order, incl. the value at open). On-chain classification
+	 * of an OLD (revoked) commitment must rebuild its lease-locked scripts
+	 * with the blockheight in effect when THAT commitment was signed, so
+	 * matchers try these as candidates. Grows only when the opener's
+	 * update_blockheight rounds actually land (lessor side).
+	 */
+	leaseHeightHistory?: number[];
 	/**
 	 * Liquidity ads (bLIP-0051): the routing-fee caps the lessor signed into its
 	 * will_fund. While the lease is active the lessor MUST NOT advertise a

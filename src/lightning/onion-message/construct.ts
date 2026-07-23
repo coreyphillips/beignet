@@ -17,10 +17,11 @@ import { ONION_VERSION, ROUTING_INFO_LENGTH } from '../onion/types';
 import {
 	computeSharedSecrets,
 	deriveHopKeys,
-	generateCipherStream
+	generateCipherStream,
+	generateKey
 } from '../onion/sphinx-crypto';
 import { getPublicKey } from '../crypto/ecdh';
-import { IBlindedPath, encodeBlindedHopData } from '../onion/blinded-path';
+import { IBlindedPath } from '../onion/blinded-path';
 import { encodeOnionPacket } from '../onion/construct';
 
 /**
@@ -86,8 +87,15 @@ export function constructOnionMessagePacket(
 	// Generate filler
 	const filler = generateFiller(sharedSecrets, payloadSizes);
 
-	// Initialize routing info with zeros
-	let routingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+	// BOLT 4: initialize routing_info from the pseudo-random `pad`-key stream
+	// keyed by the SESSION private key, NOT zeros and NOT any per-hop secret.
+	// Zero-init leaves the trailing padding recognizable after each hop
+	// decrypts (leaking hop count); keying from a hop's shared secret would let
+	// that hop regenerate the stream and locate the padding boundary.
+	let routingInfo = generateCipherStream(
+		generateKey('pad', sessionKey),
+		ROUTING_INFO_LENGTH
+	);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
 	// Build right-to-left (last hop first)
@@ -197,50 +205,6 @@ export function constructSimpleOnionMessage(
 }
 
 /**
- * Construct a multi-hop onion message through intermediate nodes to a destination.
- *
- * @param intermediateNodes - Array of intermediate node public keys
- * @param destination - Final destination public key
- * @param messageData - Application data for the final hop
- * @param sessionKey - Optional session key
- * @param options - Optional: reply path, etc.
- * @returns The complete IOnionMessage
- */
-export function constructMultiHopOnionMessage(
-	intermediateNodes: Buffer[],
-	destination: Buffer,
-	messageData: Map<number, Buffer>,
-	sessionKey?: Buffer,
-	options?: ISendOnionMessageOptions
-): IOnionMessage {
-	const sessKey = sessionKey || crypto.randomBytes(32);
-
-	const path = [...intermediateNodes, destination];
-	const payloads: Buffer[] = [];
-
-	// Intermediate hops need encrypted_recipient_data with next_node_id
-	for (let i = 0; i < intermediateNodes.length; i++) {
-		const nextNode =
-			i < intermediateNodes.length - 1 ? intermediateNodes[i + 1] : destination;
-		const hopData = encodeBlindedHopData({ nextNodeId: nextNode });
-		const intermediatePayload: IOnionMessagePayload = {
-			encryptedRecipientData: hopData,
-			messageTlvs: new Map()
-		};
-		payloads.push(encodeOnionMessagePayload(intermediatePayload));
-	}
-
-	// Final hop gets the message data and optional reply path
-	const finalPayload: IOnionMessagePayload = {
-		replyPath: options?.replyPath,
-		messageTlvs: messageData
-	};
-	payloads.push(encodeOnionMessagePayload(finalPayload));
-
-	return constructOnionMessage(sessKey, path, payloads);
-}
-
-/**
  * Construct a reply onion message using a blinded reply path.
  *
  * @param replyPath - The blinded path received in the original message
@@ -251,7 +215,8 @@ export function constructMultiHopOnionMessage(
 export function constructReplyOnionMessage(
 	replyPath: IBlindedPath,
 	messageData: Map<number, Buffer>,
-	sessionKey?: Buffer
+	sessionKey?: Buffer,
+	options?: ISendOnionMessageOptions
 ): IOnionMessage {
 	const sessKey = sessionKey || crypto.randomBytes(32);
 
@@ -270,10 +235,21 @@ export function constructReplyOnionMessage(
 	// 1-hop reply path the introduction node IS the recipient, so it must also
 	// receive the message body; hard-coding an empty TLV map here made every
 	// reply over a 1-hop path arrive empty.
-	path.push(replyPath.introductionNodeId);
+	//
+	// BOLT 4 route blinding: the sphinx onion is encrypted to each hop's
+	// BLINDED node id — including the introduction node's (path_hops[0]) —
+	// and every hop derives its blinded key from the path_key on receipt.
+	// Sphinx-addressing the intro by its real id (the old behavior) produced
+	// onions no spec implementation (CLN/LND) could peel.
+	path.push(replyPath.blindedHops[0].blindedNodeId);
 	const introIsRecipient = replyPath.blindedHops.length === 1;
 	const introPayload: IOnionMessagePayload = {
 		encryptedRecipientData: replyPath.blindedHops[0].encryptedData,
+		// The recipient hop also carries OUR reply path when the message
+		// expects an answer (e.g. invoice_request over an offer's path).
+		...(introIsRecipient && options?.replyPath
+			? { replyPath: options.replyPath }
+			: {}),
 		messageTlvs: introIsRecipient ? messageData : new Map()
 	};
 	payloads.push(encodeOnionMessagePayload(introPayload));
@@ -286,6 +262,7 @@ export function constructReplyOnionMessage(
 		const isLast = i === replyPath.blindedHops.length - 1;
 		const hopPayload: IOnionMessagePayload = {
 			encryptedRecipientData: hop.encryptedData,
+			...(isLast && options?.replyPath ? { replyPath: options.replyPath } : {}),
 			messageTlvs: isLast ? messageData : new Map()
 		};
 		payloads.push(encodeOnionMessagePayload(hopPayload));

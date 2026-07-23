@@ -178,6 +178,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_HTLC_EVENTS === 'true'
 				: undefined) ??
 			file.htlcEvents,
+		forwardingEnabled:
+			cliFlags.forwardingEnabled ??
+			(process.env.BEIGNET_FORWARDING_ENABLED !== undefined
+				? process.env.BEIGNET_FORWARDING_ENABLED === 'true'
+				: undefined) ??
+			file.forwardingEnabled,
 		logLevel:
 			parseLogLevel(cliFlags.logLevel) ||
 			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||

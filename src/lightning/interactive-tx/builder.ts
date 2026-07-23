@@ -16,8 +16,11 @@ import {
 	validateSerialIdParity,
 	validatePeerSerialIdParity,
 	validateInteractiveTx,
+	validatePeerInputPrevTx,
 	MAX_INTERACTIVE_TX_INPUTS,
 	MAX_INTERACTIVE_TX_OUTPUTS,
+	MAX_INTERACTIVE_TX_MSGS,
+	MAX_INTERACTIVE_TX_SEQUENCE,
 	MAX_MONEY_SATS
 } from './validation';
 
@@ -126,11 +129,36 @@ export class InteractiveTxBuilder {
 			return 'Session is already complete';
 		}
 
+		// BOLT 2 DoS cap: every received tx_add_input counts (including ones
+		// rejected below and re-adds after tx_remove_input).
+		this.session.peerAddInputMsgs = (this.session.peerAddInputMsgs ?? 0) + 1;
+		if (this.session.peerAddInputMsgs > MAX_INTERACTIVE_TX_MSGS) {
+			return `Peer exceeded ${MAX_INTERACTIVE_TX_MSGS} tx_add_input messages`;
+		}
+
 		const parityErr = validatePeerSerialIdParity(
 			input.serialId,
 			this.session.isInitiator
 		);
 		if (parityErr) return parityErr;
+
+		// BOLT 2: locktime/RBF signaling must stay enforceable on the
+		// collaborative transaction.
+		if (input.sequence > MAX_INTERACTIVE_TX_SEQUENCE) {
+			return `tx_add_input sequence ${input.sequence} must be <= 0xfffffffd`;
+		}
+
+		// BOLT 2 receive-side prevtx checks (validity, vout range, segwit-only
+		// anti-malleability). The splice shared input has no prevtx by design;
+		// its outpoint is validated against the channel funding outpoint by the
+		// splice layer instead.
+		if (!input.isShared) {
+			const prevTxErr = validatePeerInputPrevTx(
+				input.prevTx,
+				input.prevTxVout ?? input.prevOutputIndex
+			);
+			if (prevTxErr) return prevTxErr;
+		}
 
 		// BOLT 2 interactive-tx: a peer may contribute at most 252 inputs.
 		if (
@@ -195,6 +223,12 @@ export class InteractiveTxBuilder {
 		}
 		if (this.session.state === InteractiveTxState.COMPLETE) {
 			return 'Session is already complete';
+		}
+
+		// BOLT 2 DoS cap: every received tx_add_output counts.
+		this.session.peerAddOutputMsgs = (this.session.peerAddOutputMsgs ?? 0) + 1;
+		if (this.session.peerAddOutputMsgs > MAX_INTERACTIVE_TX_MSGS) {
+			return `Peer exceeded ${MAX_INTERACTIVE_TX_MSGS} tx_add_output messages`;
 		}
 
 		const parityErr = validatePeerSerialIdParity(

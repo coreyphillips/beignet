@@ -378,6 +378,7 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
 	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
 	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
+	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
 	const backupPathFlag = parseFlag('--backup-path');
@@ -456,6 +457,7 @@ async function handleStart(): Promise<void> {
 			announceAddresses: config.announceAddresses,
 			watchtowers: config.watchtowers,
 			htlcEvents: config.htlcEvents,
+			forwardingEnabled: config.forwardingEnabled,
 			logLevel: config.logLevel
 		});
 
@@ -744,6 +746,14 @@ async function handleChannel(): Promise<void> {
 						: undefined
 				})
 			);
+		case 'splice-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/splice-quote', {
+					channelId: filteredArgs[2],
+					direction: filteredArgs[3],
+					feeratePerkw: parseInt(filteredArgs[4], 10)
+				})
+			);
 		case 'splice-in':
 			return outputResult(
 				await httpRequest('POST', '/channel/splice-in', {
@@ -807,7 +817,8 @@ async function handleChannel(): Promise<void> {
 			);
 		case 'ready':
 			return outputResult(await httpRequest('GET', '/channels/ready'));
-		case 'connect-and-open':
+		case 'connect-and-open': {
+			const cnoRate = parseFlag('--sats-per-vbyte');
 			return outputResult(
 				await httpRequest('POST', '/channel/connect-and-open', {
 					pubkey: filteredArgs[2],
@@ -816,9 +827,13 @@ async function handleChannel(): Promise<void> {
 					amountSats: filteredArgs[5]
 						? parseInt(filteredArgs[5], 10)
 						: undefined,
-					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined
+					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined,
+					satsPerVbyte: cnoRate ? parseInt(cnoRate, 10) : undefined,
+					// Sweep the whole on-chain balance into the channel (no change).
+					max: hasFlag('--max') || undefined
 				})
 			);
+		}
 		case 'open-and-wait': {
 			const timeout = parseFlag('--timeout');
 			return outputResult(
@@ -889,7 +904,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -2167,10 +2182,12 @@ Channels:
   channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
   channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
                                          Open channel + block until NORMAL
-  channel connect-and-open <pubkey> <host> <port> <sats> [push]
+  channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max]
                                          Connect to peer + open in one call
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
+  channel splice-quote <id> <in|out> <feerate>
+                                         Quote a splice: fee + max amount
   channel splice-in <id> <sats> <feerate>   Add funds to channel
   channel splice-out <id> <sats> <feerate>  Withdraw funds from channel
   channel ensure-minimum <count> <sats>  Auto-open channels to minimum count
@@ -2316,6 +2333,9 @@ Start flags:
   --htlc-events                          Relay per-HTLC events (htlc:forwarded/
                                          fulfilled/failed) over SSE + webhooks
                                          (off by default: high volume on routers)
+  --no-forwarding                        Decline to relay third-party HTLCs, i.e.
+                                         do not act as a routing hop (forwarding
+                                         is on by default)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)

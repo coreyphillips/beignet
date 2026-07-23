@@ -216,6 +216,13 @@ export interface BeignetNodeOptions {
 	 */
 	autoUpdateChannelFees?: boolean;
 	/**
+	 * Relay third-party HTLCs, i.e. act as a routing hop (default true). Set false
+	 * for a wallet that should not route: every forward is declined up front with
+	 * temporary_node_failure and our channel_updates advertise the BOLT 7 disable
+	 * bit. Does not affect the node's own sends/receives.
+	 */
+	forwardingEnabled?: boolean;
+	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
 	 * multi-hop payments to destinations beyond its direct peers.
@@ -780,7 +787,7 @@ export class BeignetNode extends EventEmitter {
 		if (opts.electrumServers && opts.electrumServers.length > 1) {
 			let currentServerIndex = 0;
 			const servers = opts.electrumServers;
-			electrumBackend.onFailoverNeeded = async () => {
+			electrumBackend.onFailoverNeeded = async (): Promise<void> => {
 				if (this._failoverInProgress) return;
 				this._failoverInProgress = true;
 				const startIndex = currentServerIndex;
@@ -879,6 +886,7 @@ export class BeignetNode extends EventEmitter {
 			enableNetworking: true,
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
+			forwardingEnabled: opts.forwardingEnabled ?? true,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,
@@ -958,9 +966,20 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('payment:failed', (info: IPaymentInfo) => {
 			const pi = this.toPaymentInfo(info);
+			// A bare failure code cannot be acted on: the same code means very
+			// different things depending on WHICH hop returned it. Log the erring hop
+			// and the channel it was asked to forward over, so a route failure can be
+			// told apart from a destination failure without reproducing it.
+			//
+			// failureCode is absent entirely when the payment failed LOCALLY and the
+			// HTLC never reached the network. That used to log as a lone
+			// "failureCode: undefined", which reads like a decoding bug rather than
+			// "your peer is unreachable", so carry the reason instead.
 			this.log('warn', 'Payment failed', {
 				paymentHash: pi.paymentHash,
-				failureCode: pi.failureCode
+				failureCode: pi.failureCode,
+				...(info.failureReason ? { reason: info.failureReason } : {}),
+				...this.describeFailureSource(info)
 			});
 			this.emit('payment:failed', pi);
 		});
@@ -1054,7 +1073,27 @@ export class BeignetNode extends EventEmitter {
 		);
 
 		// HTLC-level events (high volume; the daemon only exposes these over
-		// SSE/webhooks when htlcEvents is enabled).
+		// SSE/webhooks when htlcEvents is enabled). Forwards ALSO get a daemon
+		// log line: relaying other people's money through our channels should be
+		// as visible in the log as a payment is. Without this a node can forward
+		// continuously and the log shows nothing, which made the #173 incident
+		// expensive to diagnose.
+		this.node.on(
+			'htlc:forward',
+			(
+				inChannelId: Buffer,
+				outChannelId: Buffer,
+				amountMsat: bigint,
+				paymentHash: Buffer
+			) => {
+				this.log('info', 'HTLC forward', {
+					paymentHash: paymentHash.toString('hex'),
+					inChannelId: inChannelId.toString('hex'),
+					outChannelId: outChannelId.toString('hex'),
+					amountSats: (amountMsat / 1000n).toString()
+				});
+			}
+		);
 		this.node.on(
 			'htlc:forwarded',
 			(data: {
@@ -1064,12 +1103,28 @@ export class BeignetNode extends EventEmitter {
 				amountOutMsat: bigint;
 				feeMsat: bigint;
 			}) => {
+				this.log('info', 'HTLC forwarded', {
+					inChannelId: data.inChannelId.toString('hex'),
+					outChannelId: data.outChannelId.toString('hex'),
+					amountInSats: (data.amountInMsat / 1000n).toString(),
+					amountOutSats: (data.amountOutMsat / 1000n).toString(),
+					feeMsat: data.feeMsat.toString()
+				});
 				this.emit('htlc:forwarded', {
 					inChannelId: data.inChannelId.toString('hex'),
 					outChannelId: data.outChannelId.toString('hex'),
 					amountInMsat: data.amountInMsat.toString(),
 					amountOutMsat: data.amountOutMsat.toString(),
 					feeMsat: data.feeMsat.toString()
+				});
+			}
+		);
+		this.node.on(
+			'htlc:forward-failed',
+			(data: { inChannelId: Buffer; outChannelId: Buffer }) => {
+				this.log('info', 'HTLC forward failed', {
+					inChannelId: data.inChannelId.toString('hex'),
+					outChannelId: data.outChannelId.toString('hex')
 				});
 			}
 		);
@@ -1383,6 +1438,7 @@ export class BeignetNode extends EventEmitter {
 			lightningBalanceSats: lightningBalance,
 			pendingCloseBalanceSats: this.getPendingCloseBalanceSats(),
 			erroredBalanceSats: this.getErroredBalanceSats(),
+			splicingBalanceSats: this.getSplicingBalanceSats(),
 			channelCount: info.channelCount,
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
@@ -1437,7 +1493,14 @@ export class BeignetNode extends EventEmitter {
 		const lnBalance = this.node.getBalance();
 		const lightning = Number(lnBalance.localBalanceMsat / 1000n);
 		const unsettledSats = Number(lnBalance.unsettledBalanceMsat / 1000n);
-		return { onchain, lightning, total: onchain + lightning, unsettledSats };
+		const splicingSats = this.getSplicingBalanceSats();
+		return {
+			onchain,
+			lightning,
+			total: onchain + lightning,
+			unsettledSats,
+			splicingSats
+		};
 	}
 
 	/**
@@ -1472,6 +1535,45 @@ export class BeignetNode extends EventEmitter {
 		for (const ch of this.node.listChannels()) {
 			if (ch.state === ChannelState.ERRORED) {
 				totalMsat += ch.localBalanceMsat;
+			}
+		}
+		return Number(totalMsat / 1000n);
+	}
+
+	/**
+	 * Local balance in channels with a splice in flight: the balance each
+	 * channel SETTLES TO when its splice locks, not the live pre-splice figure.
+	 * The distinction is the whole point: the live localBalanceMsat stays
+	 * pre-splice until splice_locked, so after a max splice-in the newly added
+	 * sats would appear in no bucket at all (on-chain swept, lightning
+	 * excludes SPLICING, and the old local balance never contained them), and
+	 * after a splice-out the bucket would overstate what rejoins Lightning.
+	 * Falls back to the live balance for a channel still negotiating (before
+	 * the point of no return), when the wallet inputs are still visible in the
+	 * on-chain balance.
+	 */
+	private getSplicingBalanceSats(): number {
+		let totalMsat = 0n;
+		for (const ch of this.node.listChannels()) {
+			// payThroughSplice is present exactly when the channel is mid-splice
+			// by EFFECTIVE state — including one disconnected mid-splice, whose
+			// in-transit funds must not vanish from the bucket while the peer is
+			// away.
+			if (ch.payThroughSplice === undefined) continue;
+			const pending = ch.pendingSpliceLocalBalanceMsat ?? ch.localBalanceMsat;
+			if (ch.payThroughSplice) {
+				// Pay-during-splice: the canonical balance already counts this
+				// channel at min(live, settle-to); the bucket holds only what is
+				// still in transit — a splice-in's arriving sats. A splice-out's
+				// departing sats surface on the on-chain side once the splice tx
+				// is seen, not here.
+				const counted =
+					pending < ch.localBalanceMsat ? pending : ch.localBalanceMsat;
+				totalMsat += pending - counted;
+			} else {
+				// Parked channel (taproot, or pre point-of-no-return): the whole
+				// settle-to balance is out of the canonical figure until the lock.
+				totalMsat += pending;
 			}
 		}
 		return Number(totalMsat / 1000n);
@@ -2441,7 +2543,8 @@ export class BeignetNode extends EventEmitter {
 		pubkey: string,
 		amountSats: number,
 		pushSats?: number,
-		satsPerVbyte?: number
+		satsPerVbyte?: number,
+		max = false
 	): ChannelInfo {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
@@ -2450,7 +2553,8 @@ export class BeignetNode extends EventEmitter {
 			pubkey,
 			fundingSatoshis,
 			pushMsat,
-			satsPerVbyte
+			satsPerVbyte,
+			max
 		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -2484,14 +2588,15 @@ export class BeignetNode extends EventEmitter {
 		host: string,
 		port: number,
 		amountSats: number,
-		opts?: { pushSats?: number; satsPerVbyte?: number }
+		opts?: { pushSats?: number; satsPerVbyte?: number; max?: boolean }
 	): Promise<ChannelInfo> {
 		await this.connectPeer(pubkey, host, port);
 		return this.openChannel(
 			pubkey,
 			amountSats,
 			opts?.pushSats,
-			opts?.satsPerVbyte
+			opts?.satsPerVbyte,
+			opts?.max
 		);
 	}
 
@@ -2522,7 +2627,7 @@ export class BeignetNode extends EventEmitter {
 		for (let i = 0; i < suggestions.length && openedCount < needed; i++) {
 			const suggestion = suggestions[i];
 			openedCount++;
-			const promise = (async () => {
+			const promise = (async (): Promise<void> => {
 				try {
 					// Look up address from gossip graph
 					const graphNode = graph.getNode(
@@ -2628,11 +2733,18 @@ export class BeignetNode extends EventEmitter {
 			issues.push(
 				'NO_USABLE_SCID: No SCID the remote peer recognizes. Need 6 confirmations for real SCID, or remote must send alias in channel_ready. Routing hints will be skipped — invoice will have no route.'
 			);
-		if (state.state !== 'NORMAL' && state.preReestablishState !== 'NORMAL') {
+		// Pay-during-splice (0.6.0): a channel paying through its splice is
+		// fully usable — hints generate, payments flow — so it is not an issue.
+		const htlcUsableThrough = channel.isHtlcUsable(true);
+		if (
+			state.state !== 'NORMAL' &&
+			state.preReestablishState !== 'NORMAL' &&
+			!htlcUsableThrough
+		) {
 			issues.push(
 				`NOT_NORMAL: Channel state is ${state.state} (pre-reestablish: ${
 					state.preReestablishState || 'none'
-				}). Routing hints require NORMAL state.`
+				}). Routing hints require a usable channel.`
 			);
 		}
 		if (!state.announceChannel)
@@ -2667,7 +2779,9 @@ export class BeignetNode extends EventEmitter {
 			effectiveScid: effectiveScid?.toString('hex') || null,
 			willGenerateRoutingHint:
 				!!effectiveScid &&
-				(state.state === 'NORMAL' || state.preReestablishState === 'NORMAL'),
+				(state.state === 'NORMAL' ||
+					state.preReestablishState === 'NORMAL' ||
+					htlcUsableThrough),
 			localBalanceSats: Number(state.localBalanceMsat / 1000n),
 			remoteBalanceSats: Number(state.remoteBalanceMsat / 1000n),
 			issues
@@ -2687,6 +2801,9 @@ export class BeignetNode extends EventEmitter {
 		shortChannelId?: string;
 		feeratePerKw?: number;
 		htlcCount?: number;
+		pendingSpliceLocalBalanceMsat?: bigint;
+		htlcUsable?: boolean;
+		payThroughSplice?: boolean;
 		localReserveMsat?: bigint;
 		remoteReserveMsat?: bigint;
 		isPrivate?: boolean;
@@ -2718,6 +2835,16 @@ export class BeignetNode extends EventEmitter {
 		if (ch.shortChannelId) info.shortChannelId = ch.shortChannelId;
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;
 		if (ch.htlcCount !== undefined) info.htlcCount = ch.htlcCount;
+		if (ch.pendingSpliceLocalBalanceMsat !== undefined)
+			info.pendingSpliceLocalBalanceSats = Number(
+				ch.pendingSpliceLocalBalanceMsat / 1000n
+			);
+		// The dashboard's Send gating reads these off the wire; dropping them
+		// here re-parked every mid-splice channel in the UI while the daemon
+		// happily paid through the window.
+		if (ch.htlcUsable !== undefined) info.htlcUsable = ch.htlcUsable;
+		if (ch.payThroughSplice !== undefined)
+			info.payThroughSplice = ch.payThroughSplice;
 		if (ch.isPrivate !== undefined) info.isPrivate = ch.isPrivate;
 		if (ch.feeBaseMsat !== undefined) info.feeBaseMsat = ch.feeBaseMsat;
 		if (ch.feeProportionalMillionths !== undefined)
@@ -3887,6 +4014,43 @@ export class BeignetNode extends EventEmitter {
 		return { ok: true };
 	}
 
+	/**
+	 * Structured log fields naming the hop that returned an onion failure and the
+	 * channel it was asked to forward over. failureSourceIndex is the index of the
+	 * ERRING hop; a route hop's shortChannelId is the channel used to REACH it, so
+	 * the channel the hop could not use is the NEXT hop's. Empty when the route or
+	 * source index is unknown (an undecryptable failure, or a local send error).
+	 */
+	private describeFailureSource(p: IPaymentInfo): {
+		failureSourceIndex?: number;
+		failureSourceNode?: string;
+		failureOutgoingScid?: string;
+	} {
+		const index = p.failureSourceIndex;
+		if (index === undefined || !p.route) return {};
+
+		const fields: {
+			failureSourceIndex?: number;
+			failureSourceNode?: string;
+			failureOutgoingScid?: string;
+		} = { failureSourceIndex: index };
+
+		const erringHop = p.route.hops[index];
+		if (erringHop) {
+			fields.failureSourceNode = erringHop.pubkey.toString('hex');
+		}
+		const outgoingHop = p.route.hops[index + 1];
+		if (outgoingHop) {
+			try {
+				fields.failureOutgoingScid = formatScid(outgoingHop.shortChannelId);
+			} catch {
+				// Non-decodable SCID (e.g. a random alias), so hex is still useful.
+				fields.failureOutgoingScid = outgoingHop.shortChannelId.toString('hex');
+			}
+		}
+		return fields;
+	}
+
 	private toPaymentInfo(p: IPaymentInfo): PaymentInfo {
 		const info: PaymentInfo = {
 			paymentHash: p.paymentHash.toString('hex'),
@@ -3900,6 +4064,10 @@ export class BeignetNode extends EventEmitter {
 		if (p.failureCode !== undefined) {
 			info.failureCode = p.failureCode;
 			info.failureDescription = describeFailureCode(p.failureCode);
+		} else if (p.failureReason) {
+			// A local failure has no onion code, so without this the API reports a
+			// FAILED payment with nothing at all to explain it.
+			info.failureDescription = p.failureReason;
 		}
 		if (p.route?.totalFeeMsat !== undefined) {
 			info.feeSats = Number(p.route.totalFeeMsat / 1000n);
@@ -4074,6 +4242,18 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	// ─────────────── Splicing ───────────────
+
+	spliceQuote(
+		channelId: string,
+		direction: 'in' | 'out',
+		feeratePerkw: number
+	): ReturnType<LightningNode['spliceQuote']> {
+		return this.node.spliceQuote(
+			Buffer.from(channelId, 'hex'),
+			direction,
+			feeratePerkw
+		);
+	}
 
 	spliceIn(
 		channelId: string,
@@ -4318,20 +4498,38 @@ export class BeignetNode extends EventEmitter {
 		const electrumConnected =
 			this.wallet?.electrum?.connectedToElectrum ?? false;
 		const channels = this.node.listChannels();
-		const readyChannels = channels.filter((ch) => ch.state === 'NORMAL');
+		const readyChannels = channels.filter(
+			(ch) => ch.state === ChannelState.NORMAL
+		);
 		const peerCount = this.node.listPeers().length;
 		const graph = this.node.getGraph();
+
+		// Only channels that were fully established and should be operational
+		// right now get a vote on "degraded". A channel mid-open, mid-splice or
+		// in a cooperative shutdown is a deliberate operation in progress, not a
+		// fault: a wallet whose only channel is waiting on funding confirmations
+		// is doing exactly what it was asked to. AWAITING_REESTABLISH and
+		// ERRORED are the states that mean an established channel is broken.
+		const operating = channels.filter(
+			(ch) =>
+				ch.state === ChannelState.NORMAL || ch.state === ChannelState.SPLICING
+		);
+		const broken = channels.filter(
+			(ch) =>
+				ch.state === ChannelState.AWAITING_REESTABLISH ||
+				ch.state === ChannelState.ERRORED
+		);
 
 		let status: HealthInfo['status'] = 'ready';
 		if (!electrumConnected) {
 			status = 'degraded';
 		} else if (blockHeight === 0) {
 			status = 'syncing';
-		} else if (channels.length > 0 && readyChannels.length === 0) {
-			// Has channels but none operational
+		} else if (broken.length > 0 && operating.length === 0) {
+			// Every established channel is broken
 			status = 'degraded';
-		} else if (peerCount === 0 && channels.length > 0) {
-			// Has channels but no peers connected
+		} else if (peerCount === 0 && operating.length > 0) {
+			// Has operational channels but no peers connected to use them with
 			status = 'degraded';
 		}
 
@@ -4530,6 +4728,35 @@ export class BeignetNode extends EventEmitter {
 
 	getLiquiditySnapshot(): LiquiditySnapshot {
 		const snapshot = this.node.getLiquiditySnapshot();
+		// The reserve every channel holds back on our side is unspendable, so what
+		// can actually be sent is the local balance above it, summed over routable
+		// channels, the same figure canSend() reports. Surfacing both lets callers
+		// show a true "can send" (zero while still below the reserve) instead of the
+		// raw local balance, which overstates it.
+		//
+		// Routable means NORMAL or htlcUsable: a channel paying through its splice
+		// still sends, so it must keep counting. Filtering on NORMAL alone zeroed
+		// the sendable figure for the whole splice window, which read as having no
+		// funds while a payment would in fact go through. Mid-splice the spendable
+		// side is the conservative min of the live and settle-to balances,
+		// mirroring the balance side of the channel's own add gate. (The true
+		// per-add ceiling, getSpendableOutboundMsat, additionally reserves the
+		// funder's commitment fee; this aggregation, like the NORMAL-channel
+		// figure before it, prices only balance minus reserve.)
+		let reserveMsat = 0n;
+		let sendableMsat = 0n;
+		for (const ch of this.node.listChannels()) {
+			if (ch.state !== ChannelState.NORMAL && !ch.htlcUsable) continue;
+			const chReserveMsat = ch.localReserveMsat ?? 0n;
+			reserveMsat += chReserveMsat;
+			const effLocalMsat =
+				ch.pendingSpliceLocalBalanceMsat !== undefined &&
+				ch.pendingSpliceLocalBalanceMsat < ch.localBalanceMsat
+					? ch.pendingSpliceLocalBalanceMsat
+					: ch.localBalanceMsat;
+			sendableMsat +=
+				effLocalMsat > chReserveMsat ? effLocalMsat - chReserveMsat : 0n;
+		}
 		return {
 			totalLocalBalanceSats: snapshot.totalLocalBalanceSats,
 			totalRemoteBalanceSats: snapshot.totalRemoteBalanceSats,
@@ -4538,6 +4765,8 @@ export class BeignetNode extends EventEmitter {
 			activeChannelCount: snapshot.activeChannelCount,
 			outboundLiquidityPct: snapshot.outboundLiquidityPct,
 			inboundLiquidityPct: snapshot.inboundLiquidityPct,
+			reserveSats: Number(reserveMsat / 1000n),
+			sendableSats: Number(sendableMsat / 1000n),
 			recommendations: snapshot.recommendations
 		};
 	}
@@ -4672,8 +4901,21 @@ export class BeignetNode extends EventEmitter {
 	probeRoute(
 		destination: string,
 		amountSats: number
-	): { success: boolean; feeSats?: number; hops?: number } {
-		return this.node.probeRoute(destination, amountSats);
+	): {
+		success: boolean;
+		feeSats?: number;
+		hops?: number;
+		path?: Array<{ pubkey: string; shortChannelId: string }>;
+	} {
+		const result = this.node.probeRoute(destination, amountSats);
+		if (!result.path) return result;
+		return {
+			...result,
+			path: result.path.map((hop) => ({
+				pubkey: hop.pubkey,
+				shortChannelId: formatScid(Buffer.from(hop.shortChannelId, 'hex'))
+			}))
+		};
 	}
 
 	// ─────────────── Graph Queries ───────────────

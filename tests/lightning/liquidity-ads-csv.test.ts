@@ -1,10 +1,9 @@
 /**
- * M3.3 — on-chain lease enforcement: the lessor's to_local script + sweep.
- *
- * Encoding follows LND's script-enforced lease (LeaseCommitScriptToSelf): the
- * normal to_self_delay CSV is kept and an absolute `<lease_expiry>
- * OP_CHECKLOCKTIMEVERIFY OP_DROP` is prepended to the delay branch, so the
- * lessor cannot reclaim its funds before the lease expires.
+ * On-chain lease enforcement (bLIP-0051, CLN model): the lessor's to_local is a
+ * PURE CSV lock. The CSV number becomes max(to_self_delay, lease_csv), where
+ * lease_csv = lease_expiry - the blockheight agreed at open. No CLTV clause; the
+ * sweep sets no nLockTime. Second-level HTLC outputs are NEVER lease-locked
+ * (CLN's htlc_tx has no lease param). Validated live against CLN.
  */
 
 import { expect } from 'chai';
@@ -17,57 +16,77 @@ import {
 } from '../../src/lightning/script/htlc';
 import {
 	buildToLocalSweepTx,
-	buildToLocalDelayedWitness,
-	buildSecondLevelSweepTx
+	buildToLocalDelayedWitness
 } from '../../src/lightning/chain/sweep';
-import { computeLeaseExpiry } from '../../src/lightning/channel/liquidity-ads';
+import { leaseCsvBlocks } from '../../src/lightning/channel/liquidity-ads';
 
-describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
+describe('Liquidity ads lessor on-chain lock (CLN CSV model)', function () {
 	const revocationPubkey = crypto.randomBytes(33);
 	const delayedPubkey = crypto.randomBytes(33);
-	const leaseExpiry = computeLeaseExpiry(800000); // 804032
+	const toSelfDelay = 144;
+	// At open, lease_csv = LEASE_DURATION_BLOCKS = 4032 (> to_self_delay).
+	const leaseCsv = leaseCsvBlocks(804032, 800000)!;
 
-	it('plain to_local has no CLTV; leased to_local prepends the lease CLTV', function () {
-		const plain = buildToLocalScript(revocationPubkey, delayedPubkey, 144);
+	it('leaseCsvBlocks derives lease_expiry - agreed_blockheight', function () {
+		expect(leaseCsv).to.equal(4032);
+		// Legacy state with no agreed blockheight falls back to the duration.
+		expect(leaseCsvBlocks(804032, undefined)).to.equal(4032);
+		// Non-lease channel.
+		expect(leaseCsvBlocks(undefined, 800000)).to.be.undefined;
+	});
+
+	it('plain to_local uses the to_self_delay CSV; leased raises it to lease_csv', function () {
+		const plain = buildToLocalScript(
+			revocationPubkey,
+			delayedPubkey,
+			toSelfDelay
+		);
 		const leased = buildToLocalScript(
 			revocationPubkey,
 			delayedPubkey,
-			144,
-			leaseExpiry
+			toSelfDelay,
+			leaseCsv
 		);
 		expect(leased.equals(plain)).to.be.false;
 
 		const ops = bitcoin.script.decompile(leased)!;
-		// Expected ELSE branch order: <lease_expiry> CLTV DROP <to_self_delay> CSV DROP <key>
-		const cltvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
+		// No CLTV anywhere (pure CSV, CLN model).
+		expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
 		const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
-		expect(cltvIdx).to.be.greaterThan(0);
-		expect(csvIdx).to.be.greaterThan(cltvIdx); // CLTV comes before CSV
-		// The value pushed before CLTV is the absolute lease_expiry.
-		expect(bitcoin.script.number.decode(ops[cltvIdx - 1] as Buffer)).to.equal(
-			leaseExpiry
-		);
-		// The value pushed before CSV is still the to_self_delay.
+		expect(csvIdx).to.be.greaterThan(0);
+		// The CSV number is max(to_self_delay, lease_csv) = 4032.
 		expect(bitcoin.script.number.decode(ops[csvIdx - 1] as Buffer)).to.equal(
-			144
+			Math.max(toSelfDelay, leaseCsv)
 		);
 	});
 
-	it('exactly matches the hand-built LeaseCommitScriptToSelf layout', function () {
+	it('the CSV number is max(to_self_delay, lease_csv)', function () {
+		// A lease shorter than the delay keeps the delay.
+		const shortLease = buildToLocalScript(
+			revocationPubkey,
+			delayedPubkey,
+			2016,
+			144
+		);
+		const ops = bitcoin.script.decompile(shortLease)!;
+		const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
+		expect(bitcoin.script.number.decode(ops[csvIdx - 1] as Buffer)).to.equal(
+			2016
+		);
+	});
+
+	it('exactly matches CLN bitcoin_wscript_to_local', function () {
 		const leased = buildToLocalScript(
 			revocationPubkey,
 			delayedPubkey,
-			144,
-			leaseExpiry
+			toSelfDelay,
+			leaseCsv
 		);
 		const expected = bitcoin.script.compile([
 			bitcoin.opcodes.OP_IF,
 			revocationPubkey,
 			bitcoin.opcodes.OP_ELSE,
-			bitcoin.script.number.encode(leaseExpiry),
-			bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY,
-			bitcoin.opcodes.OP_DROP,
-			bitcoin.script.number.encode(144),
+			bitcoin.script.number.encode(Math.max(toSelfDelay, leaseCsv)),
 			bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY,
 			bitcoin.opcodes.OP_DROP,
 			delayedPubkey,
@@ -77,29 +96,28 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 		expect(leased.equals(expected)).to.be.true;
 	});
 
-	it('the lessor sweep sets nLockTime = lease_expiry (CLTV enforced)', function () {
+	it('the lessor sweep sets input sequence = the lease CSV, no nLockTime', function () {
 		const witnessScript = buildToLocalScript(
 			revocationPubkey,
 			delayedPubkey,
-			144,
-			leaseExpiry
+			toSelfDelay,
+			leaseCsv
 		);
+		const csv = Math.max(toSelfDelay, leaseCsv);
 		const tx = buildToLocalSweepTx({
 			commitmentTxid: crypto.randomBytes(32).toString('hex'),
 			outputIndex: 0,
 			amount: 100_000n,
 			witnessScript,
-			toSelfDelay: 144,
+			toSelfDelay: csv, // caller passes the effective CSV
 			destinationScript: bitcoin.payments.p2wpkh({
 				hash: crypto.randomBytes(20)
 			}).output!,
-			feeSatoshis: 500n,
-			leaseExpiry
+			feeSatoshis: 500n
 		});
-		expect(tx.locktime).to.equal(leaseExpiry);
-		// Input sequence is the CSV (144), not 0xffffffff, so locktime is enforced.
-		expect(tx.ins[0].sequence).to.equal(144);
-		// Witness still selects the delayed (OP_ELSE) branch.
+		// Pure CSV: no nLockTime, input sequence is the CSV.
+		expect(tx.locktime).to.equal(0);
+		expect(tx.ins[0].sequence).to.equal(csv);
 		const witness = buildToLocalDelayedWitness(
 			crypto.randomBytes(72),
 			witnessScript
@@ -107,38 +125,14 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 		expect(witness[witness.length - 1].equals(witnessScript)).to.be.true;
 	});
 
-	it('lessor second-level HTLC output also prepends the lease CLTV', function () {
+	it('second-level HTLC outputs are NEVER lease-locked (CLN)', function () {
+		// buildHtlcOutputScript has no lease param; a lessor HTLC-success tx
+		// output equals the plain second-level output.
 		const plain = buildHtlcOutputScript(revocationPubkey, delayedPubkey, 144);
-		const leased = buildHtlcOutputScript(
-			revocationPubkey,
-			delayedPubkey,
-			144,
-			leaseExpiry
-		);
-		expect(leased.equals(plain)).to.be.false;
-		const ops = bitcoin.script.decompile(leased)!;
-		const cltvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY);
-		const csvIdx = ops.indexOf(bitcoin.opcodes.OP_CHECKSEQUENCEVERIFY);
-		expect(cltvIdx).to.be.greaterThan(0);
-		expect(csvIdx).to.be.greaterThan(cltvIdx);
-		expect(bitcoin.script.number.decode(ops[cltvIdx - 1] as Buffer)).to.equal(
-			leaseExpiry
-		);
-	});
+		const ops = bitcoin.script.decompile(plain)!;
+		expect(ops.indexOf(bitcoin.opcodes.OP_CHECKLOCKTIMEVERIFY)).to.equal(-1);
 
-	it('buildHtlcSuccessTx output carries the lease CLTV for the lessor', function () {
-		const leasedTx = buildHtlcSuccessTx(
-			crypto.randomBytes(32).toString('hex'),
-			0,
-			100_000n,
-			revocationPubkey,
-			delayedPubkey,
-			144,
-			500n,
-			false,
-			leaseExpiry
-		);
-		const plainTx = buildHtlcSuccessTx(
+		const tx = buildHtlcSuccessTx(
 			crypto.randomBytes(32).toString('hex'),
 			0,
 			100_000n,
@@ -148,64 +142,30 @@ describe('Liquidity ads lessor on-chain lock (M3.3)', function () {
 			500n,
 			false
 		);
-		// The second-level OUTPUT (P2WSH of the leased script) differs.
-		const leasedOut = leasedTx.outs[0].script;
-		const plainOut = plainTx.outs[0].script;
-		expect(leasedOut.equals(plainOut)).to.be.false;
-		// And its witness program == sha256 of the leased output script.
 		const expected = bitcoin.payments.p2wsh({
-			redeem: {
-				output: buildHtlcOutputScript(
-					revocationPubkey,
-					delayedPubkey,
-					144,
-					leaseExpiry
-				)
-			}
+			redeem: { output: plain }
 		}).output!;
-		expect(leasedOut.equals(expected)).to.be.true;
+		expect(tx.outs[0].script.equals(expected)).to.be.true;
 	});
 
-	it('second-level sweep sets nLockTime = lease_expiry for the lessor', function () {
-		const witnessScript = buildHtlcOutputScript(
-			revocationPubkey,
-			delayedPubkey,
-			144,
-			leaseExpiry
-		);
-		const tx = buildSecondLevelSweepTx({
-			htlcTxid: crypto.randomBytes(32).toString('hex'),
-			outputIndex: 0,
-			amount: 90_000n,
-			witnessScript,
-			toSelfDelay: 144,
-			destinationScript: bitcoin.payments.p2wpkh({
-				hash: crypto.randomBytes(20)
-			}).output!,
-			feeSatoshis: 500n,
-			leaseExpiry
-		});
-		expect(tx.locktime).to.equal(leaseExpiry);
-		expect(tx.ins[0].sequence).to.equal(144);
-	});
-
-	it('a non-leased sweep keeps nLockTime = 0', function () {
+	it('a non-leased sweep keeps input sequence = to_self_delay and no nLockTime', function () {
 		const witnessScript = buildToLocalScript(
 			revocationPubkey,
 			delayedPubkey,
-			144
+			toSelfDelay
 		);
 		const tx = buildToLocalSweepTx({
 			commitmentTxid: crypto.randomBytes(32).toString('hex'),
 			outputIndex: 0,
 			amount: 100_000n,
 			witnessScript,
-			toSelfDelay: 144,
+			toSelfDelay,
 			destinationScript: bitcoin.payments.p2wpkh({
 				hash: crypto.randomBytes(20)
 			}).output!,
 			feeSatoshis: 500n
 		});
 		expect(tx.locktime).to.equal(0);
+		expect(tx.ins[0].sequence).to.equal(toSelfDelay);
 	});
 });

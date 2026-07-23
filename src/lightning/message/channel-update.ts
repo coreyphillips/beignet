@@ -70,6 +70,16 @@ export interface IUpdateFeeMessage {
 	feeratePerKw: number;
 }
 
+/**
+ * bLIP-0051 / CLN `update_blockheight` (type 137): on a leased channel the
+ * OPENER advances the blockheight both sides agreed on at open, shrinking the
+ * lessor's remaining-lease CSV (lease_csv = lease_expiry - blockheight).
+ */
+export interface IUpdateBlockheightMessage {
+	channelId: Buffer;
+	blockheight: number;
+}
+
 const UPDATE_ADD_HTLC_LENGTH = 1450; // 32 + 8 + 8 + 32 + 4 + 1366
 const UPDATE_FULFILL_HTLC_LENGTH = 72; // 32 + 8 + 32
 const UPDATE_FAIL_HTLC_FIXED_LENGTH = 42; // 32 + 8 + 2
@@ -317,4 +327,36 @@ export function decodeUpdateFeeMessage(payload: Buffer): IUpdateFeeMessage {
 	const feeratePerKw = payload.readUInt32BE(32);
 
 	return { channelId, feeratePerKw };
+}
+
+const UPDATE_BLOCKHEIGHT_LENGTH = 36; // 32 + 4
+
+/**
+ * Encode an `update_blockheight` message payload (bLIP-0051, type 137).
+ */
+export function encodeUpdateBlockheightMessage(
+	msg: IUpdateBlockheightMessage
+): Buffer {
+	const buf = Buffer.alloc(UPDATE_BLOCKHEIGHT_LENGTH);
+	msg.channelId.copy(buf, 0);
+	buf.writeUInt32BE(msg.blockheight, 32);
+	return buf;
+}
+
+/**
+ * Decode an `update_blockheight` message payload (bLIP-0051, type 137).
+ */
+export function decodeUpdateBlockheightMessage(
+	payload: Buffer
+): IUpdateBlockheightMessage {
+	if (payload.length < UPDATE_BLOCKHEIGHT_LENGTH) {
+		throw new Error(
+			`update_blockheight too short: need ${UPDATE_BLOCKHEIGHT_LENGTH} bytes, got ${payload.length}`
+		);
+	}
+
+	const channelId = Buffer.from(payload.subarray(0, 32));
+	const blockheight = payload.readUInt32BE(32);
+
+	return { channelId, blockheight };
 }

@@ -20,7 +20,8 @@ import {
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	HtlcState
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -86,7 +87,14 @@ function makeConfig(seedId: number): IChannelManagerConfig {
 		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
 		localBasepoints: makeBasepoints(seed),
 		localPerCommitmentSeed: makeSeed(seedId + 100),
-		localFundingPrivkey: fundingPrivkey
+		localFundingPrivkey: fundingPrivkey,
+		// Matches makeBasepoints keys[4]; without it commitment_signed fails
+		// 'Invalid HTLC signature' once an HTLC exists.
+		htlcBasepointSecret: crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from([4]))
+			.digest()
 	};
 }
 
@@ -782,6 +790,60 @@ describe('Quiescence (STFU)', function () {
 			// Both should be quiescent
 			expect(aliceChannel.isQuiescent()).to.be.true;
 			expect(bobChannel.isQuiescent()).to.be.true;
+		});
+
+		it('accepts quiescence with a COMMITTED live HTLC (S-2.M8)', function () {
+			const { alice, bob, channelId } = openAndReadyChannel();
+			const aliceChannel = alice.getChannel(channelId)!;
+			const bobChannel = bob.getChannel(channelId)!;
+
+			// A fully committed live HTLC: added and driven through both
+			// commitment rounds by the loopback, NOT fulfilled.
+			const res = alice.addHtlc(
+				channelId,
+				20_000_000n,
+				crypto.randomBytes(32),
+				500_000,
+				crypto.randomBytes(1366)
+			);
+			expect(res.ok).to.be.true;
+			const entry = [...aliceChannel.getFullState().htlcs.values()][0];
+			expect(entry.state, 'HTLC fully committed').to.equal(HtlcState.COMMITTED);
+
+			// BOLT 2: a committed HTLC is NOT a pending update — stfu MUST be
+			// accepted (the old gate rejected it, stalling CLN/eclair-initiated
+			// quiescence and splicing on any busy channel until their timeout
+			// disconnected us).
+			const q = alice.initiateQuiescence(channelId);
+			expect(q.ok, q.error).to.be.true;
+			expect(aliceChannel.isQuiescent()).to.be.true;
+			expect(bobChannel.isQuiescent()).to.be.true;
+		});
+
+		it('still rejects quiescence while an update is genuinely pending', function () {
+			const { alice, bob, channelId } = openAndReadyChannel();
+			const bobChannel = bob.getChannel(channelId)!;
+
+			// Deliver ONLY the update_add_htlc to Bob (no commitment round), so
+			// Bob holds a genuinely PENDING update, then ask Bob to quiesce.
+			const aliceChannel = alice.getChannel(channelId)!;
+			const addActions = aliceChannel.addHtlc(
+				5_000_000n,
+				crypto.randomBytes(32),
+				500_000,
+				crypto.randomBytes(1366)
+			);
+			const addMsg = findSendAction(addActions, MessageType.UPDATE_ADD_HTLC);
+			expect(addMsg).to.exist;
+			bob.handleMessage(
+				alicePubkey,
+				MessageType.UPDATE_ADD_HTLC,
+				addMsg.payload
+			);
+
+			const q = bob.initiateQuiescence(channelId);
+			expect(q.ok).to.be.false;
+			expect(bobChannel.isQuiescent()).to.be.false;
 		});
 
 		it('should block HTLC additions during quiescence', function () {

@@ -67,10 +67,17 @@ export function clampFeeRateSatPerVbyte(
 }
 
 export interface IFundingProvider {
+	/**
+	 * Build (but do not broadcast) the channel funding transaction.
+	 * @param max When true, sweep the whole balance into the funding output (no
+	 *   change). The caller must have committed funding_satoshis equal to the swept
+	 *   amount; the provider verifies the output matches.
+	 */
 	buildFundingTransaction(
 		address: string,
 		amountSats: bigint,
-		satsPerByte?: number
+		satsPerByte?: number,
+		max?: boolean
 	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }>;
 
 	broadcastTransaction(txHex: string): Promise<string>;
@@ -94,6 +101,18 @@ export interface IFundingProvider {
 		inputs: import('../channel/channel').ISpliceWalletInput[];
 		changeScript: Buffer;
 	}>;
+
+	/**
+	 * Price a splice-in without performing one (optional): the fee and the
+	 * largest fundable amount at this feerate, computed with the same UTXO
+	 * filter and weight formula selectSpliceInputs will use.
+	 */
+	quoteSpliceIn?(feeratePerKw: number): {
+		spendableSats: bigint;
+		feeSats: bigint;
+		maxAmountSats: bigint;
+		inputCount: number;
+	};
 
 	/**
 	 * Anchor fee-bumping (optional): select wallet UTXOs to fund a fee bump and
@@ -160,6 +179,15 @@ export interface INodeConfig {
 	chainBackend?: IChainBackend;
 	/** HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) */
 	htlcSafetyMargin?: number;
+	/**
+	 * Whether to relay third-party HTLCs (be a routing hop). Default true, which
+	 * preserves the historical behaviour: any node with an announced channel
+	 * forwards. Set false to decline all forwards (a wallet that does not want to
+	 * route); declined forwards fail back promptly with temporary_node_failure,
+	 * and our channel_updates advertise the BOLT 7 disable bit so route finders
+	 * stop selecting us. Does not affect our own sends or receives.
+	 */
+	forwardingEnabled?: boolean;
 	/** CLTV delta for forwarding (default 40) */
 	forwardingCltvDelta?: number;
 	/** Base fee in msat for forwarding (default 1000) */
@@ -200,13 +228,6 @@ export interface INodeConfig {
 	 */
 	largeChannels?: boolean;
 	/**
-	 * Liquidity ads (bLIP-0051) seller side: when set, this node sells inbound
-	 * liquidity at these rates — it answers a buyer's request_funds with a
-	 * signed will_fund and contributes the requested funds as the acceptor
-	 * (requires a funding provider with selectSpliceInputs).
-	 */
-	leaseRates?: import('../gossip/types').ILeaseRates;
-	/**
 	 * JIT channel receive (LSP role): hold HTLCs addressed to registered
 	 * intercept SCIDs, open a zero-conf channel to the wallet, then forward.
 	 * The wallet peer must be in this node's zero-conf trusted set.
@@ -230,6 +251,13 @@ export interface INodeConfig {
 	 * mainnet balances yet.
 	 */
 	preferTaproot?: boolean;
+	/**
+	 * Liquidity ads (bLIP-0051) SELLER policy: when set, an inbound
+	 * open_channel2 carrying request_funds is answered with a signed will_fund
+	 * at these rates and the requested contribution is funded from the node's
+	 * on-chain wallet (fundingProvider). Leave unset to never sell leases.
+	 */
+	leaseRates?: import('../gossip/types').ILeaseRates;
 	/**
 	 * BOLT 1 peer storage (option_provide_storage, default true): store the
 	 * latest peer_storage blob per channel/trusted peer and return it on
@@ -369,14 +397,37 @@ export interface IPaymentInfo {
 	sharedSecrets?: Buffer[];
 	failureCode?: number;
 	failureSourceIndex?: number;
+	/**
+	 * Why a payment failed when no onion failure code is available: it failed
+	 * LOCALLY, before the HTLC ever reached the network, or a peer's failure came
+	 * back undecryptable. Without this a local failure is indistinguishable from a
+	 * remote one, since both surface only as an absent failureCode.
+	 */
+	failureReason?: string;
 	retryCount?: number;
+	/**
+	 * Block height this attempt converted its relative route CLTV deltas against.
+	 * A payee reporting a height at or below this cannot be telling us anything
+	 * new, so it is what a height-skew failure must be judged against, not our
+	 * live height.
+	 */
+	cltvBaseHeight?: number;
 	createdAt: number;
 	completedAt?: number;
 	metadata?: Record<string, string>;
 }
 
+/** A keysend has no invoice to re-pay, so a retry replays these instead. */
+export interface IKeysendRetrySource {
+	options: IKeysendOptions;
+	/** Reused so the retry keeps the original payment hash. */
+	preimage: Buffer;
+}
+
 export interface IPaymentRetryContext {
-	invoiceStr: string;
+	/** Absent for keysend, which replays `keysend` instead. */
+	invoiceStr?: string;
+	keysend?: IKeysendRetrySource;
 	excludedChannels: Set<string>;
 	retryCount: number;
 	maxRetries: number;
@@ -384,6 +435,12 @@ export interface IPaymentRetryContext {
 	maxFeeMsat?: bigint;
 	/** Amount for amount-less invoices, preserved across retries */
 	amountMsat?: bigint;
+	/**
+	 * Height a payee reported when it rejected this payment for being ahead of
+	 * us. Scoped to this payment on purpose: it is what one final node claimed,
+	 * not the chain's height, so it must not steer unrelated payments.
+	 */
+	cltvBaseHeightOverride?: number;
 }
 
 export interface ICreateInvoiceOptions {
@@ -412,6 +469,14 @@ export interface ICreateInvoiceOptions {
 	 * extension entirely.
 	 */
 	blindedPathNumHops?: number;
+	/**
+	 * With `useBlindedPaths`, ALSO emit cleartext BOLT 11 routing hints (tag 3)
+	 * for private channels, so a payer that does not understand the non-spec
+	 * blinded-paths tag (25) can still route (e.g. CLN/LND paying a private
+	 * channel). Off by default: a cleartext hint exposes the node id that
+	 * blinding is meant to hide, so this trades that privacy for routability.
+	 */
+	includeCleartextHintsWithBlinded?: boolean;
 	/**
 	 * Hold invoice: park matching HTLCs instead of settling immediately. The
 	 * payment is held until settleHeldHtlc() (reveals the preimage) or
@@ -453,6 +518,24 @@ export interface IChannelInfo {
 	shortChannelId?: string;
 	feeratePerKw?: number;
 	htlcCount?: number;
+	/**
+	 * Local balance the channel settles to when its in-flight splice locks.
+	 * Present only while a splice is past its point of no return; the live
+	 * localBalanceMsat stays pre-splice until splice_locked.
+	 */
+	pendingSpliceLocalBalanceMsat?: bigint;
+	/**
+	 * Whether the channel can carry HTLC traffic right now (NORMAL, or ECDSA
+	 * pending-lock mid-splice with pay-during-splice active).
+	 */
+	htlcUsable?: boolean;
+	/**
+	 * Present exactly when the channel is mid-splice by effective state
+	 * (looking through a reconnect): true = pay-through accounting (counted in
+	 * the canonical balance at min(live, settle-to)); false = parked (its
+	 * settle-to balance lives entirely in the splicing bucket).
+	 */
+	payThroughSplice?: boolean;
 	/** Reserve we must maintain (set by remote peer), in msat */
 	localReserveMsat?: bigint;
 	/** Reserve remote must maintain (set by us), in msat */

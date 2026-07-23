@@ -122,6 +122,7 @@ describe('CLI types', () => {
 			lightningBalanceSats: 10000,
 			pendingCloseBalanceSats: 0,
 			erroredBalanceSats: 0,
+			splicingBalanceSats: 0,
 			channelCount: 1,
 			peerCount: 2,
 			listening: true
@@ -634,6 +635,10 @@ describe('BeignetNode new methods', () => {
 
 	it('should have openChannelV2 method', () => {
 		expect(typeof BeignetNode.prototype.openChannelV2).to.equal('function');
+	});
+
+	it('should have spliceQuote method', () => {
+		expect(typeof BeignetNode.prototype.spliceQuote).to.equal('function');
 	});
 
 	it('should have spliceIn method', () => {

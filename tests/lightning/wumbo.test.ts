@@ -304,7 +304,7 @@ describe('option_wumbo (large_channels)', function () {
 	});
 
 	describe('feature-bit advertising', function () {
-		function nodeConfigFeatures(largeChannels: boolean): FeatureFlags {
+		function nodeConfigFeatures(largeChannels?: boolean): FeatureFlags {
 			const seed = makeSeed(50);
 			const flags = LightningNode.defaultFeatures();
 			const node = new LightningNode({
@@ -329,10 +329,17 @@ describe('option_wumbo (large_channels)', function () {
 			return flags;
 		}
 
-		it('advertises large_channels in init features only when enabled', function () {
+		it('advertises large_channels by default and when enabled, but not when opted out', function () {
+			// Default (no largeChannels config): wumbo is advertised, matching the
+			// major implementations.
+			expect(
+				nodeConfigFeatures().hasFeature(Feature.LARGE_CHANNELS),
+				'default advertises large_channels'
+			).to.equal(true);
 			expect(
 				nodeConfigFeatures(true).hasFeature(Feature.LARGE_CHANNELS)
 			).to.equal(true);
+			// Explicit opt-out still works.
 			expect(
 				nodeConfigFeatures(false).hasFeature(Feature.LARGE_CHANNELS)
 			).to.equal(false);

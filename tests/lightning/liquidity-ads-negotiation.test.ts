@@ -162,11 +162,16 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 		// Lease fee: base 500 + 1% of 500k (5000) + weight 1000*1000/1000 (1000) = 6500.
 		const feeMsat = computeLeaseFeeSat(RATES, 500_000n, 1000) * 1000n;
 
-		// Buyer funded 200k, seller leased 500k; buyer paid the seller the lease fee.
+		// Buyer funded 200k, seller leased 500k. CLN's lease accounting
+		// (validated live vs CLN): the fee rides in the FUNDING TX, so the
+		// capacity is both contributions PLUS the fee, the seller's balance is
+		// credited contribution + fee, and the buyer's balance stays intact.
+		const feeSats = feeMsat / 1000n;
 		const bState = buyerChannel.getFullState();
-		expect(bState.fundingSatoshis).to.equal(700_000n);
-		expect(bState.localBalanceMsat).to.equal(200_000n * 1000n - feeMsat);
+		expect(bState.fundingSatoshis).to.equal(700_000n + feeSats);
+		expect(bState.localBalanceMsat).to.equal(200_000n * 1000n);
 		expect(bState.remoteBalanceMsat).to.equal(500_000n * 1000n + feeMsat);
+		expect(bState.leaseFeeSats).to.equal(feeSats);
 
 		// Seller's mirror view: it owns the leased funds + the fee; its to_local is
 		// CSV-locked until the lease expiry (blockheight + LEASE_DURATION).
@@ -174,9 +179,9 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 		const sellerChannel = (seller as any).tempChannels.get(tempId);
 		expect(sellerChannel, 'seller has the channel').to.exist;
 		const sState = sellerChannel.getFullState();
-		expect(sState.fundingSatoshis).to.equal(700_000n);
+		expect(sState.fundingSatoshis).to.equal(700_000n + feeSats);
 		expect(sState.localBalanceMsat).to.equal(500_000n * 1000n + feeMsat);
-		expect(sState.remoteBalanceMsat).to.equal(200_000n * 1000n - feeMsat);
+		expect(sState.remoteBalanceMsat).to.equal(200_000n * 1000n);
 		expect(sState.leaseExpiry).to.equal(800000 + 4032);
 		// Both sides agree on the lease expiry.
 		expect(bState.leaseExpiry).to.equal(800000 + 4032);

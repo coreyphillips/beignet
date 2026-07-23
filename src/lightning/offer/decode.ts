@@ -1,10 +1,10 @@
 /**
- * BOLT 12: Bech32m Decoding for Offers, Invoice Requests, and Invoices.
+ * BOLT 12: String Decoding for Offers, Invoice Requests, and Invoices.
  *
- * Decodes bech32m-encoded strings back into their BOLT 12 type representations.
+ * BOLT 12 strings use the bech32 character set with NO checksum (and may be
+ * split with `+`); see bech32-nochecksum.ts.
  */
 
-import { bech32m } from 'bech32';
 import { IOffer, IInvoiceRequest, IBolt12Invoice } from './types';
 import {
 	decodeOfferTlv,
@@ -12,20 +12,17 @@ import {
 	decodeInvoiceTlv
 } from './tlv';
 import { computeOfferId } from './merkle';
-
-/** Maximum bech32m encoding length */
-const BECH32M_MAX_LIMIT = 65535;
+import { decodeNoChecksum } from './bech32-nochecksum';
 
 /**
- * Decode a bech32m offer string ("lno" prefix) into an IOffer.
+ * Decode a BOLT 12 offer string ("lno" prefix) into an IOffer.
  */
 export function decodeOffer(str: string): IOffer {
-	const decoded = bech32m.decode(str, BECH32M_MAX_LIMIT);
-	if (decoded.prefix !== 'lno') {
-		throw new Error(`Expected 'lno' prefix, got '${decoded.prefix}'`);
+	const decoded = decodeNoChecksum(str);
+	if (decoded.hrp !== 'lno') {
+		throw new Error(`Expected 'lno' prefix, got '${decoded.hrp}'`);
 	}
-	const data = Buffer.from(bech32m.fromWords(decoded.words));
-	const { offer, records } = decodeOfferTlv(data);
+	const { offer, records } = decodeOfferTlv(decoded.data);
 
 	// Compute offerId from the TLV records (merkle root)
 	const offerId = computeOfferId(records);
@@ -37,12 +34,11 @@ export function decodeOffer(str: string): IOffer {
  * Decode a bech32m invoice request string ("lnr" prefix) into an IInvoiceRequest.
  */
 export function decodeInvoiceRequest(str: string): IInvoiceRequest {
-	const decoded = bech32m.decode(str, BECH32M_MAX_LIMIT);
-	if (decoded.prefix !== 'lnr') {
-		throw new Error(`Expected 'lnr' prefix, got '${decoded.prefix}'`);
+	const decoded = decodeNoChecksum(str);
+	if (decoded.hrp !== 'lnr') {
+		throw new Error(`Expected 'lnr' prefix, got '${decoded.hrp}'`);
 	}
-	const data = Buffer.from(bech32m.fromWords(decoded.words));
-	const { request, records } = decodeInvoiceRequestTlv(data);
+	const { request, records } = decodeInvoiceRequestTlv(decoded.data);
 
 	// Compute offerId from the offer TLV records (types <= 22)
 	const offerRecords = records.filter((r) => Number(r.type) <= 22);
@@ -57,12 +53,11 @@ export function decodeInvoiceRequest(str: string): IInvoiceRequest {
  * Decode a bech32m invoice string ("lni" prefix) into an IBolt12Invoice.
  */
 export function decodeBolt12Invoice(str: string): IBolt12Invoice {
-	const decoded = bech32m.decode(str, BECH32M_MAX_LIMIT);
-	if (decoded.prefix !== 'lni') {
-		throw new Error(`Expected 'lni' prefix, got '${decoded.prefix}'`);
+	const decoded = decodeNoChecksum(str);
+	if (decoded.hrp !== 'lni') {
+		throw new Error(`Expected 'lni' prefix, got '${decoded.hrp}'`);
 	}
-	const data = Buffer.from(bech32m.fromWords(decoded.words));
-	const { invoice } = decodeInvoiceTlv(data);
+	const { invoice } = decodeInvoiceTlv(decoded.data);
 	return invoice;
 }
 

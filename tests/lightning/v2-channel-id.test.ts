@@ -7,6 +7,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
 import * as secp from '@noble/secp256k1';
 import {
 	deriveV2ChannelId,
@@ -171,11 +172,22 @@ describe('v2 channel_id: two-manager open + interactive-tx routing', () => {
 		// An interactive-tx message now carries the final channel_id; feeding it to
 		// the acceptor manager must route to the acceptor channel (via the
 		// derived-id temp lookup) and land in its session, not be dropped.
+		// A valid native-segwit prev_tx: the receive side now enforces prevtx
+		// validity + segwit-only spends (S-2.H3).
+		const prevTx = new bitcoin.Transaction();
+		prevTx.version = 2;
+		prevTx.addInput(crypto.randomBytes(32), 0);
+		prevTx.addOutput(
+			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+			100_000
+		);
 		const inputActions = openerChannel.addTxInput({
 			serialId: 0n,
-			prevTxid: crypto.randomBytes(32),
+			prevTxid: Buffer.from(prevTx.getHash()),
 			prevOutputIndex: 0,
-			sequence: 0xfffffffd
+			sequence: 0xfffffffd,
+			prevTx: prevTx.toBuffer(),
+			prevTxVout: 0
 		});
 		const sendAction = inputActions.find(
 			(a) => a.type === ChannelActionType.SEND_MESSAGE

@@ -297,9 +297,14 @@ function buildEdgeOverlay(
 ): {
 	syntheticEdges: Map<string, IGraphChannel[]>;
 	hintDestMap: Map<string, string>;
+	shadowedScids: Set<string>;
 } {
 	const syntheticEdges = new Map<string, IGraphChannel[]>();
 	const hintDestMap = new Map<string, string>();
+	// SCIDs whose graph copy must be skipped during traversal because a local
+	// overlay edge replaces it. Only local channels ever shadow a graph entry;
+	// routing hints defer to the graph when the SCID is announced.
+	const shadowedScids = new Set<string>();
 
 	if (routingHints) {
 		for (const [k, v] of buildSyntheticEdges(
@@ -316,8 +321,29 @@ function buildEdgeOverlay(
 
 	if (localChannels) {
 		for (const lc of localChannels) {
-			// If the channel is already announced, the gossip graph handles it.
-			if (graph.getChannel(lc.shortChannelId)) continue;
+			// If the channel is announced AND its graph entry carries a USABLE
+			// update for our outgoing direction, the gossip graph handles it. Two
+			// cases make the graph copy untraversable from our side, and then the
+			// overlay must stand in (this is the one channel we are authoritative
+			// about): our update is missing (the peer's announcement landed but
+			// our own channel_update did not survive a restart or has not been
+			// applied yet), or our update carries the BOLT 7 disable bit. The
+			// disable bit is an advertisement to THIRD PARTIES not to route
+			// through us (e.g. the forwarding opt-out sets it on every channel);
+			// the owner always routes over its own channels regardless, matching
+			// LND/CLN/LDK. The overlay SCID shadows the graph copy during
+			// traversal (see hintDestMap filtering in the route loops).
+			const gc = graph.getChannel(lc.shortChannelId);
+			if (gc) {
+				const ourUpdate = source.equals(gc.nodeId1) ? gc.update1 : gc.update2;
+				if (
+					ourUpdate &&
+					(ourUpdate.channelFlags & CHANNEL_FLAG_DISABLED) === 0
+				) {
+					continue;
+				}
+				shadowedScids.add(lc.shortChannelId.toString('hex'));
+			}
 			const peerHex = lc.peer.toString('hex');
 			const edge = makeLocalChannelEdge(source, lc);
 			syntheticEdges.set(peerHex, [
@@ -328,7 +354,7 @@ function buildEdgeOverlay(
 		}
 	}
 
-	return { syntheticEdges, hintDestMap };
+	return { syntheticEdges, hintDestMap, shadowedScids };
 }
 
 // ── Route Finding ───────────────────────────────────────────────────
@@ -382,7 +408,7 @@ export function findRoute(
 
 	// Overlay edges: routing-hint private channels + our own local channels
 	// (so a direct payment to a channel peer routes even when unannounced).
-	const { syntheticEdges, hintDestMap } = buildEdgeOverlay(
+	const { syntheticEdges, hintDestMap, shadowedScids } = buildEdgeOverlay(
 		graph,
 		source,
 		destination,
@@ -425,9 +451,18 @@ export function findRoute(
 			continue;
 		}
 
-		// Explore all adjacent channels — merge gossip graph + synthetic hint edges
+		// Explore all adjacent channels — merge gossip graph + synthetic hint edges.
+		// An overlay edge claims its SCID: skip the graph copy so the synthetic
+		// edge (a private hint, or a local channel shadowing a graph entry that
+		// is missing our own update) is the single description of that channel.
 		const nodeIdBuf = Buffer.from(current.nodeId, 'hex');
-		const graphChannels = graph.getNodeChannels(nodeIdBuf);
+		const allGraphChannels = graph.getNodeChannels(nodeIdBuf);
+		const graphChannels =
+			shadowedScids.size > 0
+				? allGraphChannels.filter(
+						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
+				  )
+				: allGraphChannels;
 		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
 		const channels =
 			hintChannels.length > 0
@@ -714,7 +749,7 @@ function findRouteWithCapacityLimits(
 	if (sourceHex === destHex) return null;
 
 	// Overlay edges: routing-hint private channels + our own local channels.
-	const { syntheticEdges, hintDestMap } = buildEdgeOverlay(
+	const { syntheticEdges, hintDestMap, shadowedScids } = buildEdgeOverlay(
 		graph,
 		source,
 		destination,
@@ -745,7 +780,14 @@ function findRouteWithCapacityLimits(
 		if (current.hops >= maxHops) continue;
 
 		const nodeIdBuf = Buffer.from(current.nodeId, 'hex');
-		const graphChannels = graph.getNodeChannels(nodeIdBuf);
+		// Overlay SCIDs shadow their graph copies (see findRoute).
+		const allGraphChannels = graph.getNodeChannels(nodeIdBuf);
+		const graphChannels =
+			shadowedScids.size > 0
+				? allGraphChannels.filter(
+						(ch) => !shadowedScids.has(ch.shortChannelId.toString('hex'))
+				  )
+				: allGraphChannels;
 		const hintChannels = syntheticEdges?.get(current.nodeId) ?? [];
 		const channels =
 			hintChannels.length > 0

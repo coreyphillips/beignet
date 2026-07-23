@@ -23,7 +23,8 @@ import {
 	decodeUpdateFulfillHtlcMessage,
 	decodeUpdateFailHtlcMessage,
 	decodeUpdateFailMalformedHtlcMessage,
-	decodeUpdateFeeMessage
+	decodeUpdateFeeMessage,
+	decodeUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
 	decodeCommitmentSignedMessage,
@@ -201,6 +202,15 @@ export interface IChannelManagerConfig {
 	 * default: every open/accept/v2/splice keeps the BOLT 2 cap.
 	 */
 	largeChannels?: boolean;
+	/**
+	 * Live on-chain feerate (sat/kw) for cooperative closing transactions.
+	 * Called at each closing entry point. Anchor channels pin the commitment
+	 * feerate to the 253 sat/kw floor, so without this the closing fee is
+	 * derived from that floor and spec peers reject the negotiation as below
+	 * their minimum acceptable fee. When absent (or returning undefined) the
+	 * channel falls back to its commitment feerate.
+	 */
+	getClosingFeeratePerKw?: () => number | undefined;
 }
 
 /**
@@ -211,6 +221,7 @@ export interface IChannelManagerConfig {
  * - 'channel:opened' (channelId: Buffer)
  * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
  * - 'channel:ready' (channelId: Buffer)
+ * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
  * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:closed' (channelId: Buffer)
@@ -400,6 +411,7 @@ export class ChannelManager extends EventEmitter {
 			MessageType.COMMITMENT_SIGNED,
 			MessageType.REVOKE_AND_ACK,
 			MessageType.UPDATE_FEE,
+			MessageType.UPDATE_BLOCKHEIGHT,
 			MessageType.SHUTDOWN,
 			MessageType.CLOSING_SIGNED,
 			MessageType.CLOSING_COMPLETE,
@@ -508,6 +520,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
@@ -531,7 +546,8 @@ export class ChannelManager extends EventEmitter {
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
-		pushMsat?: bigint
+		pushMsat?: bigint,
+		beforeNegotiate?: (temporaryChannelId: Buffer) => void
 	): Channel {
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
@@ -554,11 +570,23 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = state.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
+
+		// Give the caller its ONLY safe point to attach per-open state keyed by
+		// the temporary channel id (the requested funding fee rate, a max-funding
+		// marker). With a synchronous transport, the peer's accept_channel — and
+		// therefore channel:accepted and auto-funding — fires INSIDE
+		// processActions below, so state recorded only after this method returns
+		// is recorded too late and the open funds with defaults. Only the id is
+		// exposed: the caller has no business mutating the channel here.
+		beforeNegotiate?.(state.temporaryChannelId);
 
 		const actions = channel.initiateOpen(
 			this.config.chainHash,
@@ -569,6 +597,53 @@ export class ChannelManager extends EventEmitter {
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
 		return channel;
+	}
+
+	/**
+	 * Tear down a negotiated-but-unfunded channel after local funding failed
+	 * (buildFundingTransaction threw: insufficient funds, the max-funding
+	 * mismatch guard). The channel is still keyed by its temporary id; without
+	 * this it sits in SENT_OPEN/SENT_ACCEPT forever, the local channel list
+	 * accumulates un-fundable entries, and the peer holds a half-open channel
+	 * it will never see funded.
+	 *
+	 * Sends a BOLT 1 error for the temporary channel id so the peer forgets
+	 * the channel, marks it ERRORED locally, removes it from the temp map, and
+	 * emits channel:aborted. A no-op once the channel has been promoted to its
+	 * permanent id (funding_created already went out; failing it here would be
+	 * wrong) or was already cleaned up.
+	 */
+	abortPendingOpen(channel: Channel, reason: string): void {
+		const tempIdBuf = channel.getTemporaryChannelId();
+		const tempId = tempIdBuf?.toString('hex');
+		if (!tempId || this.tempChannels.get(tempId) !== channel) return;
+		// Temp-map membership alone does not prove the open is still pending:
+		// handleAutoFunding's catch covers everything downstream of
+		// buildFundingTransaction, and with a synchronous transport the whole
+		// funding_created -> funding_signed -> permanent-map promotion chain
+		// can run (and then a listener can throw) before createFunding unwinds
+		// and deletes the temp entry. The reliable boundary is the permanent
+		// channel id, which exists exactly from createFunding onward. Once
+		// funding_created is out, BOLT 2 has switched the channel to that id
+		// (a temp-id error would be misaddressed), and after funding_signed we
+		// are obliged to broadcast — either way, no longer an abortable
+		// pending open.
+		if (channel.getChannelId()) return;
+		const peerPubkey = this.channelPeers.get(tempId);
+		channel.markErrored();
+		if (peerPubkey) {
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: tempIdBuf,
+					data: Buffer.from(reason, 'utf8')
+				})
+			);
+		}
+		this.tempChannels.delete(tempId);
+		this.channelPeers.delete(tempId);
+		this.emit('channel:aborted', tempIdBuf, reason);
 	}
 
 	/**
@@ -692,6 +767,29 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Derive a ChannelResult from the actions a Channel returned.
+	 *
+	 * A Channel refuses an update by returning an ERROR action, not by throwing,
+	 * so a wrapper that hardcodes ok:true reports every refusal as a success.
+	 * That is how a forward whose outgoing add was refused (for want of outbound
+	 * liquidity, or because the channel was no longer usable) still looked
+	 * delivered to the node layer, which then never failed the incoming HTLC
+	 * back. Callers already branch on ok; this makes the flag mean what they
+	 * assume it means. Matches the shape used by initiateShutdown and forceClose.
+	 */
+	private resultFromActions(actions: ChannelAction[]): ChannelResult {
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Add an HTLC to a channel.
 	 */
 	addHtlc(
@@ -744,7 +842,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -789,7 +887,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -826,7 +924,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -865,7 +963,7 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) {
 			this.autoSignAndSendCommitment(channel.getChannelId()!);
 		}
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -892,7 +990,7 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.signCommitment(signature, htlcSignatures);
 		this.processActions(peerPubkey, channel, actions);
-		return { ok: true, actions };
+		return this.resultFromActions(actions);
 	}
 
 	/**
@@ -1148,6 +1246,9 @@ export class ChannelManager extends EventEmitter {
 		peerPubkey: string,
 		keyIndex?: number | null
 	): void {
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		const channelId = channel.getChannelId();
 		if (channelId) {
 			// Wire signer — use per-channel keys when available
@@ -1646,10 +1747,99 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Established-channel messages that lead with a 32-byte channel_id and are
+	 * only ever valid from the peer that owns that channel. Dispatching one from
+	 * any other peer must be refused BEFORE it reaches the channel state machine:
+	 * several of these can drive the machine to emit a BOLT 1 error (a bad
+	 * commitment signature, a reestablish with next_commitment_number 0), which
+	 * now force-closes the channel. Resolving the channel globally by id would
+	 * let peer X close peer Y's channel with a single forged message.
+	 *
+	 * The interactive-tx family is included because beignet reuses it for
+	 * SPLICING on existing permanent channels: their handlers search the
+	 * permanent `channels` map first, so a foreign tx_abort could cancel, and a
+	 * foreign tx_add_input could mutate, another peer's live splice. The guard
+	 * only refuses ids that resolve to a permanent channel owned by someone
+	 * else, so a v2 open still negotiating in `tempChannels` is untouched (its
+	 * id is not in `channels`) and reaches its existing handler unchanged.
+	 *
+	 * ERROR/WARNING are excluded, since handleErrorMsg has its own BOLT 1
+	 * ownership and all-channels handling. OPEN_CHANNEL(2) and ACCEPT_CHANNEL
+	 * do not lead with a permanent channel_id, so they are omitted.
+	 */
+	private static readonly OWNED_CHANNEL_MESSAGES: ReadonlySet<number> =
+		new Set<number>([
+			MessageType.FUNDING_SIGNED,
+			MessageType.CHANNEL_READY,
+			MessageType.UPDATE_ADD_HTLC,
+			MessageType.UPDATE_FULFILL_HTLC,
+			MessageType.UPDATE_FAIL_HTLC,
+			MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+			MessageType.COMMITMENT_SIGNED,
+			MessageType.REVOKE_AND_ACK,
+			MessageType.UPDATE_FEE,
+			MessageType.UPDATE_BLOCKHEIGHT,
+			MessageType.SHUTDOWN,
+			MessageType.CLOSING_SIGNED,
+			MessageType.CLOSING_COMPLETE,
+			MessageType.CLOSING_SIG,
+			MessageType.CHANNEL_REESTABLISH,
+			MessageType.STFU,
+			MessageType.SPLICE,
+			MessageType.SPLICE_ACK,
+			MessageType.SPLICE_LOCKED,
+			MessageType.START_BATCH,
+			MessageType.ANNOUNCEMENT_SIGNATURES,
+			// Interactive-tx: dual-use for v2 opens (temp channels, not matched
+			// here) and splices (permanent channels, matched and guarded).
+			MessageType.TX_ADD_INPUT,
+			MessageType.TX_ADD_OUTPUT,
+			MessageType.TX_REMOVE_INPUT,
+			MessageType.TX_REMOVE_OUTPUT,
+			MessageType.TX_COMPLETE,
+			MessageType.TX_SIGNATURES,
+			MessageType.TX_INIT_RBF,
+			MessageType.TX_ACK_RBF,
+			MessageType.TX_ABORT
+		]);
+
+	/**
+	 * Refuse an established-channel message that names a channel the sending
+	 * peer does not own. Only fires when the channel_id resolves to a permanent
+	 * channel bound to a DIFFERENT peer; unknown ids (temp/interactive opens,
+	 * post-splice ids not yet promoted) fall through to the handler, which does
+	 * its own resolution. Returns true when the message should be dropped.
+	 */
+	private isForeignChannelMessage(
+		peerPubkey: string,
+		type: number,
+		payload: Buffer
+	): boolean {
+		if (!ChannelManager.OWNED_CHANNEL_MESSAGES.has(type)) return false;
+		if (payload.length < 32) return false;
+		const idHex = payload.subarray(0, 32).toString('hex');
+		if (!this.channels.has(idHex)) return false;
+		const owner = this.channelPeers.get(idHex);
+		return owner !== undefined && owner !== peerPubkey;
+	}
+
+	/**
 	 * Central message dispatch handler.
 	 */
 	handleMessage(peerPubkey: string, type: number, payload: Buffer): void {
 		try {
+			if (this.isForeignChannelMessage(peerPubkey, type, payload)) {
+				// A peer quoting another peer's channel_id: drop it silently. BOLT 1
+				// only requires an error reply for our own closed/unknown channels,
+				// and replying here would leak that the channel exists and hand the
+				// sender a second way to provoke traffic about it.
+				this.emit(
+					'error',
+					payload.subarray(0, 32),
+					`Ignoring ${type} for a channel owned by another peer`
+				);
+				return;
+			}
 			switch (type) {
 				case MessageType.OPEN_CHANNEL:
 					this.handleOpenChannel(peerPubkey, payload);
@@ -1686,6 +1876,9 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.UPDATE_FEE:
 					this.handleUpdateFeeMsg(peerPubkey, payload);
+					break;
+				case MessageType.UPDATE_BLOCKHEIGHT:
+					this.handleUpdateBlockheightMsg(peerPubkey, payload);
 					break;
 				case MessageType.SHUTDOWN:
 					this.handleShutdownMsg(peerPubkey, payload);
@@ -1822,6 +2015,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.temporaryChannelId.toString('hex');
@@ -2094,6 +2290,18 @@ export class ChannelManager extends EventEmitter {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	private handleUpdateBlockheightMsg(
+		peerPubkey: string,
+		payload: Buffer
+	): void {
+		const msg = decodeUpdateBlockheightMessage(payload);
+		const channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleUpdateBlockheight(msg);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
 	private handleShutdownMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeShutdownMessage(payload);
 		const channel = this.findChannelByChannelId(msg.channelId);
@@ -2131,6 +2339,7 @@ export class ChannelManager extends EventEmitter {
 
 		// BOLT 2: opener must send first closing_signed after both shutdowns exchanged
 		if (channel.getRole() === ChannelRole.OPENER) {
+			this.applyClosingFeerate(channel);
 			const closingActions = channel.proposeClosingFee((feeSatoshis: bigint) =>
 				this.signClosingTx(channel, feeSatoshis)
 			);
@@ -2160,6 +2369,9 @@ export class ChannelManager extends EventEmitter {
 		const channel = this.findChannelByChannelId(msg.channelId);
 		if (!channel) return;
 
+		// Responder side: the acceptable-fee range is initialized lazily on the
+		// first closing_signed, so the live feerate must be in place first.
+		this.applyClosingFeerate(channel);
 		const actions = channel.handleClosingSigned(
 			msg,
 			(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis),
@@ -2532,14 +2744,27 @@ export class ChannelManager extends EventEmitter {
 	 * cover a relayable fee — we then simply act as closee for the peer's
 	 * closing_complete.
 	 */
+	/**
+	 * Inject the live closing feerate (when a provider is configured) so the
+	 * closing fee is priced for the CURRENT chain, not the channel's
+	 * commitment feerate (pinned to the 253 sat/kw floor on anchors).
+	 */
+	private applyClosingFeerate(channel: Channel): void {
+		const rate = this.config.getClosingFeeratePerKw?.();
+		if (rate !== undefined && rate > 0) {
+			channel.setClosingFeeratePerKw(rate);
+		}
+	}
+
 	private startSimpleClose(peerPubkey: string, channel: Channel): void {
 		const { estimateSimpleCloseFee } = require('../chain/closing');
+		this.applyClosingFeerate(channel);
 		const state = channel.getFullState();
 		const localScript = state.localShutdownScript;
 		const remoteScript = state.remoteShutdownScript;
 		if (!localScript || localScript.length === 0 || !remoteScript) return;
 
-		const feeratePerKw = state.localConfig.feeratePerKw || 253;
+		const feeratePerKw = channel.getClosingFeeratePerKw();
 		const fee: bigint = estimateSimpleCloseFee(
 			feeratePerKw,
 			localScript.length,
@@ -2995,6 +3220,7 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		this.applyClosingFeerate(channel);
 		const actions = channel.proposeClosingFee(signature);
 		this.processActions(peerPubkey, channel, actions);
 		return { ok: true, actions };
@@ -3015,12 +3241,38 @@ export class ChannelManager extends EventEmitter {
 			deadState === ChannelState.CLOSED ||
 			deadState === ChannelState.ERRORED
 		) {
+			// An ERRORED channel is failed but possibly not yet on chain (a channel
+			// errored before force-close-on-error existed, or our broadcast is
+			// still pending). The peer reestablishing proves it has NOT closed
+			// either, so both sides may be waiting on the other: close ours now,
+			// and say so instead of claiming the channel is unknown, since this
+			// text is often the only diagnostic the peer's operator sees.
+			const failedNotClosed = deadState === ChannelState.ERRORED;
+			// Only the channel's own peer may trigger the close: a reestablish
+			// quoting another peer's channel id still gets the error reply, but
+			// must not drive a broadcast.
+			const senderOwnsIt =
+				channel !== undefined &&
+				this.getPeerForChannel(channel.getChannelId() || msg.channelId) ===
+					peerPubkey;
+			if (failedNotClosed && senderOwnsIt) {
+				this.emit(
+					'channel:errored',
+					channel!.getChannelId() || msg.channelId,
+					'peer sent channel_reestablish for a failed channel'
+				);
+			}
 			this.sendMessage(
 				peerPubkey,
 				MessageType.ERROR,
 				encodeErrorMessage({
 					channelId: msg.channelId,
-					data: Buffer.from('unknown or closed channel', 'utf8')
+					data: Buffer.from(
+						failedNotClosed
+							? 'channel failed; closing on chain'
+							: 'unknown or closed channel',
+						'utf8'
+					)
 				})
 			);
 			return;
@@ -3070,6 +3322,9 @@ export class ChannelManager extends EventEmitter {
 					this.startSimpleClose(peerPubkey, channel);
 				} else if (channel.getRole() === ChannelRole.OPENER) {
 					// Opener re-proposes closing_signed to resume fee negotiation
+					// (proposeClosingFee re-derives the fee range, so a range
+					// persisted from a stale/too-low feerate is replaced here).
+					this.applyClosingFeerate(channel);
 					const closingActions = channel.proposeClosingFee(
 						(feeSatoshis: bigint) => this.signClosingTx(channel, feeSatoshis)
 					);
@@ -3376,6 +3631,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 
 		// The channel signs with chKeys, so it MUST advertise chKeys on the wire —
@@ -3385,13 +3643,24 @@ export class ChannelManager extends EventEmitter {
 		// acceptor path in handleOpenChannel2). In the common case (no per-channel
 		// key deriver) these are already equal.
 		// CLN requires the channel_type TLV on open_channel2 (tx_abort: "open_channel2
-		// missing channel_type"). Default it exactly like the legacy open.
+		// missing channel_type"). Default it exactly like the legacy open
+		// (Channel.initiateOpen): a taproot channel_type is the single
+		// OPTION_TAPROOT bit — the taproot bit implies anchor-style commitments
+		// and static_remotekey, and any extra bit makes peers reject the type —
+		// otherwise static_remotekey plus anchors when preferred. Without the
+		// taproot branch, an openChannel routed here by the peer's dual-fund
+		// feature would silently open a different channel type than the same
+		// call against a v1 peer.
 		let channelType = params.channelType;
 		if (!channelType) {
 			const typeFlags = FeatureFlags.empty();
-			typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			if (this.config.preferAnchors) {
-				typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			if (this.config.preferTaproot) {
+				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
+			} else {
+				typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+				if (this.config.preferAnchors) {
+					typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+				}
 			}
 			channelType = typeFlags.toBuffer();
 		}
@@ -3473,6 +3742,9 @@ export class ChannelManager extends EventEmitter {
 			chKeys.htlcBasepointSecret
 		);
 		const channel = new Channel(state, signer);
+		if (this.config.chainHash) {
+			channel.announcementChainHash = this.config.chainHash;
+		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
 		const tempId = msg.channelId.toString('hex');
@@ -3513,6 +3785,9 @@ export class ChannelManager extends EventEmitter {
 		// on a taproot channel; open it as a normal (unleased) taproot channel instead.
 		if (
 			msg.requestFunds &&
+			// A 0-sat request is a degenerate lease: nothing to contribute,
+			// nothing to charge for — accept as a plain (unleased) open.
+			msg.requestFunds.requestedSats > 0n &&
 			this.config.leaseRates &&
 			this.config.nodePrivateKey &&
 			!isTaprootChannel(msg.channelType ?? null)
@@ -3526,42 +3801,58 @@ export class ChannelManager extends EventEmitter {
 			localParams.willFund = { signature, leaseRates: this.config.leaseRates };
 			localParams.fundingSatoshis = msg.requestFunds.requestedSats;
 
-			// Selling liquidity means actually contributing the leased amount:
-			// source wallet inputs BEFORE accept_channel2 goes out, so our
-			// interactive-tx turns can add them (the buyer validates that our
-			// inputs cover our declared funding). Without a funding provider,
-			// fall through with the paper lease only (hosts that fund manually,
-			// and unit tests).
-			if (this.fundingProvider?.selectSpliceInputs) {
-				this.fundingProvider
-					.selectSpliceInputs(
-						msg.requestFunds.requestedSats,
-						msg.fundingFeeratePerkw
-					)
+			// The funded contribution itself is sourced below via
+			// setDualFundingContribution (upstream lease-selling path), which
+			// degrades to a plain zero-contribution accept when the wallet
+			// cannot cover the lease.
+		}
+
+		// Take our interactive-tx turns automatically so an inbound v2 open
+		// completes without manual driving. When a funded lease contribution is
+		// registered below, the dual-funding driver takes precedence over the
+		// plain auto-responder (see the turn dispatch in channel.ts).
+		channel.enableV2AutoResponder();
+
+		if (localParams.willFund && msg.requestFunds) {
+			// The lease contribution must actually be FUNDED: source wallet
+			// inputs + change for it, register them on the channel (the
+			// interactive-tx drive contributes and later signs them), and only
+			// then answer with will_fund. No wallet coverage: withdraw the
+			// offer and accept as a plain zero-contribution acceptor rather
+			// than negotiating a funding tx we cannot fund.
+			const requested = msg.requestFunds.requestedSats;
+			const fp = this.fundingProvider;
+			if (fp?.selectSpliceInputs) {
+				fp.selectSpliceInputs(requested, msg.fundingFeeratePerkw)
 					.then(({ inputs, changeScript }) => {
-						channel.setV2FundingInputs(inputs, changeScript);
+						channel.setDualFundingContribution(
+							inputs,
+							changeScript,
+							requested,
+							msg.fundingFeeratePerkw
+						);
 						const actions = channel.handleOpenChannel2(msg, localParams);
 						this.processActions(peerPubkey, channel, actions);
 					})
 					.catch((err) => {
-						this.tempChannels.delete(tempId);
-						this.channelPeers.delete(tempId);
 						this.emit(
 							'error',
-							null,
-							`Liquidity lease funding failed: ${
-								err instanceof Error ? err.message : String(err)
-							}`
+							msg.channelId,
+							`Lease contribution not funded (${
+								(err as Error)?.message ?? err
+							}); accepting without will_fund`
 						);
+						delete localParams.willFund;
+						localParams.fundingSatoshis = 0n;
+						const actions = channel.handleOpenChannel2(msg, localParams);
+						this.processActions(peerPubkey, channel, actions);
 					});
 				return;
 			}
+			// No funding provider: keep the legacy behavior (the embedder — or a
+			// test harness — drives the contribution itself via addTxInput).
 		}
 
-		// Take our interactive-tx turns automatically so an inbound v2 open
-		// completes without manual driving (contributing nothing unless funded
-		// above).
-		channel.enableV2AutoResponder();
 		const actions = channel.handleOpenChannel2(msg, localParams);
 		this.processActions(peerPubkey, channel, actions);
 	}
@@ -3606,7 +3897,64 @@ export class ChannelManager extends EventEmitter {
 		const hasError = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (!hasError) {
 			this.emit('channel:accepted', channel, peerPubkey);
+			this.autoFundDualFundedOpen(channel, peerPubkey);
 		}
+	}
+
+	/**
+	 * Fund the INITIATOR's side of a v2 open from the wallet, mirroring the
+	 * lease-seller path in handleOpenChannel2: source wallet inputs + change
+	 * via the funding provider, register them as the channel's contribution,
+	 * and kick off the interactive tx (BOLT 2: the initiator sends the first
+	 * tx_add_input, so without this the open stalls right after
+	 * accept_channel2). Without a funding provider the legacy behavior holds:
+	 * the embedder drives the contribution itself via addTxInput.
+	 *
+	 * The on-chain contribution is our funding share plus the lease fee when
+	 * we are leasing inbound liquidity, which is paid through the funding
+	 * transaction (see handleAcceptChannel2), not from channel balance.
+	 */
+	private autoFundDualFundedOpen(channel: Channel, peerPubkey: string): void {
+		const fp = this.fundingProvider;
+		if (!fp?.selectSpliceInputs) return;
+		const session = channel.getDualFundingSession();
+		const local = session?.getLocalParams();
+		if (!session || !session.isInitiator() || !local) return;
+		// The embedder already funded this open via setV2FundingInputs (e.g.
+		// openDualFundedChannel's autoFund with caller-directed UTXOs) — a
+		// second contribution here would corrupt the funding output.
+		if (channel.hasV2AutoFunding()) return;
+
+		const state = channel.getFullState();
+		const contributionSats = local.fundingSatoshis + (state.leaseFeeSats ?? 0n);
+		const feeratePerKw = local.fundingFeeratePerkw;
+
+		fp.selectSpliceInputs(contributionSats, feeratePerKw)
+			.then(({ inputs, changeScript }) => {
+				channel.setDualFundingContribution(
+					inputs,
+					changeScript,
+					contributionSats,
+					feeratePerKw
+				);
+				const driveActions = channel.beginDualFundingContribution();
+				this.processActions(peerPubkey, channel, driveActions);
+			})
+			.catch((err) => {
+				// Unlike the lease seller, the opener cannot downgrade to a
+				// zero contribution: the channel cannot exist without our
+				// funding. Surface the reason and abort the negotiation so the
+				// peer forgets the channel instead of waiting on us.
+				this.emit(
+					'error',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					`v2 open not funded: ${(err as Error)?.message ?? err}`
+				);
+				const abortActions = channel.abortDualFunding(
+					`opener funding unavailable: ${(err as Error)?.message ?? err}`
+				);
+				this.processActions(peerPubkey, channel, abortActions);
+			});
 	}
 
 	private handleTxAddInput(peerPubkey: string, payload: Buffer): void {
@@ -3763,6 +4111,9 @@ export class ChannelManager extends EventEmitter {
 		// didn't fire announcement:depth), signal that signing is needed so
 		// LightningNode can trigger it with the funding private key.
 		const updated = channel.getFullState();
+		if (updated.shortChannelId) {
+			this.emit('channel:scid-assigned', msg.channelId, updated.shortChannelId);
+		}
 		if (
 			updated.announcementSigsReceived &&
 			!updated.announcementSigsSent &&
@@ -3809,6 +4160,14 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		this.processActions(peerPubkey, channel, actions);
+
+		// handleAnnouncementDepthReached is where the real SCID is first computed,
+		// for private channels too (it assigns before returning early on those).
+		// LightningNode needs it to accept forwards addressed by the SCID we publish.
+		const scid = channel.getFullState().shortChannelId;
+		if (scid) {
+			this.emit('channel:scid-assigned', channelId, scid);
+		}
 	}
 
 	/**
@@ -3827,62 +4186,70 @@ export class ChannelManager extends EventEmitter {
 		return true;
 	}
 
-	/**
-	 * Abort a pending (pre-funding) channel after a local failure — e.g. the
-	 * opener's auto-funding could not source inputs. Sends a BOLT 1 error for
-	 * the temporary channel id so the peer discards its half, and forgets the
-	 * local temp channel. No-op once the channel has progressed to a permanent
-	 * id (funding_created sent) — aborting then goes through the close paths.
-	 */
-	abortPendingChannel(temporaryChannelId: Buffer, reason: string): void {
-		const tempIdHex = temporaryChannelId.toString('hex');
-		const peerPubkey = this.channelPeers.get(tempIdHex);
-		if (!this.tempChannels.has(tempIdHex) || !peerPubkey) return;
-		this.tempChannels.delete(tempIdHex);
-		this.channelPeers.delete(tempIdHex);
-		this.sendMessage(
-			peerPubkey,
-			MessageType.ERROR,
-			encodeErrorMessage({
-				channelId: temporaryChannelId,
-				data: Buffer.from(reason, 'utf8')
-			})
-		);
-	}
-
-	private handleErrorMsg(_peerPubkey: string, payload: Buffer): void {
+	private handleErrorMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');
+		const errorText = msg.data.toString('utf8');
 
-		// Clean up temp channel if this error references one
-		if (this.tempChannels.has(channelIdHex)) {
+		// BOLT 1: an all-zero (or absent) channel_id refers to ALL channels with
+		// the sending node, and every one of them must be failed. Only the
+		// sender's own channels: an error from one peer must never touch a
+		// channel belonging to another.
+		const isConnectionWide =
+			msg.channelId.length === 0 || msg.channelId.every((b) => b === 0);
+		if (isConnectionWide) {
+			for (const channel of this.getChannelsByPeer(peerPubkey)) {
+				this.failChannelByError(channel, `Remote error: ${errorText}`);
+			}
+			// Unfunded negotiations with this peer die too; nothing is on chain,
+			// so they are simply forgotten.
+			for (const tempId of [...this.tempChannels.keys()]) {
+				if (this.channelPeers.get(tempId) !== peerPubkey) continue;
+				this.tempChannels.delete(tempId);
+				this.channelPeers.delete(tempId);
+			}
+			this.emit('error', msg.channelId, `Remote error: ${errorText}`);
+			return;
+		}
+
+		// Clean up a temp channel if this error references one the sender owns
+		if (
+			this.tempChannels.has(channelIdHex) &&
+			this.channelPeers.get(channelIdHex) === peerPubkey
+		) {
 			this.tempChannels.delete(channelIdHex);
 			this.channelPeers.delete(channelIdHex);
 		}
 
-		// BOLT 1: an error referencing a specific channel means fail that channel.
-		// Mark it ERRORED so we stop sending channel_reestablish for it on every
-		// reconnect (which the peer just rejects again → disconnect storm). An
-		// all-zeroes channel_id is a connection-level error, not channel-specific,
-		// so we leave channels untouched in that case.
-		const isConnectionWide =
-			msg.channelId.length === 0 || msg.channelId.every((b) => b === 0);
+		// BOLT 1: an error referencing a specific channel means fail that
+		// channel, provided it belongs to the sender: a peer must not be able to
+		// fail another peer's channel by quoting its id. While a tx_abort
+		// exchange for a forgotten splice is pending, the peer's error is part
+		// of that dance (CLN's channeld errors/restarts around it) — failing the
+		// channel here would kill it right before it recovers.
 		const channel = this.channels.get(channelIdHex);
-		// While a tx_abort exchange for a forgotten splice is pending, the peer's
-		// error is part of that dance (CLN's channeld errors/restarts around it) —
-		// failing the channel here would kill it right before it recovers.
+		const senderOwnsIt = this.channelPeers.get(channelIdHex) === peerPubkey;
 		const inAbortDance = channel?.isSpliceAbortPending() ?? false;
-		if (
-			!isConnectionWide &&
-			channel &&
-			!inAbortDance &&
-			channel.markErrored()
-		) {
-			this.emit('channel:persist', channel.getChannelId() || msg.channelId);
+		if (channel && senderOwnsIt && !inAbortDance) {
+			this.failChannelByError(channel, `Remote error: ${errorText}`);
 		}
 
-		const errorText = msg.data.toString('utf8');
 		this.emit('error', msg.channelId, `Remote error: ${errorText}`);
+	}
+
+	/**
+	 * Fail a channel per BOLT 1 error handling: mark it ERRORED, persist, and
+	 * hand the on-chain close to the node via channel:errored. ERRORED alone
+	 * would leave resolution to the peer's broadcast, which may never come
+	 * (LND's ErrRecoveryError explicitly waits for us to close). The node
+	 * drives the actual force-close: it owns the sweep script and fee
+	 * estimate, and it skips dataLossDetected channels.
+	 */
+	private failChannelByError(channel: Channel, reason: string): void {
+		if (!channel.markErrored()) return;
+		const channelId = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		this.emit('channel:persist', channelId);
+		this.emit('channel:errored', channelId, reason);
 	}
 
 	private handleWarningMsg(_peerPubkey: string, payload: Buffer): void {
@@ -3947,6 +4314,21 @@ export class ChannelManager extends EventEmitter {
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
+					// BOLT 1: the SENDER of an error must fail the channel too. A
+					// channel that just emitted a wire error and sits ERRORED (peer
+					// protocol violation, DLP fell-behind) gets its close driven by
+					// the node, which skips the broadcast when dataLossDetected
+					// forbids it.
+					if (
+						action.messageType === MessageType.ERROR &&
+						channel.getState() === ChannelState.ERRORED
+					) {
+						this.emit(
+							'channel:errored',
+							channel.getChannelId() ?? channel.getTemporaryChannelId(),
+							'local wire error failed the channel'
+						);
+					}
 					break;
 				case ChannelActionType.CHANNEL_READY:
 					this.emit('channel:ready', action.channelId);

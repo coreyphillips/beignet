@@ -29,18 +29,23 @@ function makeKeypair(): Buffer {
 	return privKey;
 }
 
+/** A real compressed point: the decoder validates every path pubkey. */
+function makePoint(): Buffer {
+	return Buffer.from(secp.getPublicKey(makeKeypair(), true));
+}
+
 function makeBlindedPaymentPath(numHops: number): IBlindedPaymentPath {
 	const blindedHops: IBlindedHop[] = [];
 	for (let i = 0; i < numHops; i++) {
 		blindedHops.push({
-			blindedNodeId: crypto.randomBytes(33),
+			blindedNodeId: makePoint(),
 			encryptedData: crypto.randomBytes(20 + i) // variable length on purpose
 		});
 	}
 	return {
 		path: {
-			introductionNodeId: crypto.randomBytes(33),
-			blindingPoint: crypto.randomBytes(33),
+			introductionNodeId: makePoint(),
+			blindingPoint: makePoint(),
 			blindedHops
 		},
 		payInfo: {
@@ -119,13 +124,14 @@ describe('BOLT 11 blinded paths (M1.1)', function () {
 		const entry = makeBlindedPaymentPath(2);
 
 		// The combined BOLT 11 blob begins with num(1) then the same path bytes
-		// the BOLT 12 array serializer produces for that single path.
+		// the BOLT 12 array serializer produces for that single path. The
+		// BOLT 12 array itself carries NO count prefix (S-4.H4: [...*blinded_path]
+		// fills the TLV length).
 		const combined = encodeInvoiceBlindedPaymentPaths([entry]);
 		const pathsOnly = encodeBlindedPaths([entry.path]);
-		// combined: [num=1][path][payinfo28]; pathsOnly: [num=1][path]
+		// combined: [num=1][path][payinfo(28, no features)]; pathsOnly: [path]
 		const combinedPathBytes = combined.subarray(1, combined.length - 28);
-		const offerPathBytes = pathsOnly.subarray(1);
-		expect(combinedPathBytes).to.deep.equal(offerPathBytes);
+		expect(combinedPathBytes).to.deep.equal(pathsOnly);
 
 		// And the path decodes identically through either decoder.
 		expect(decodeBlindedPaths(pathsOnly)[0].introductionNodeId).to.deep.equal(

@@ -206,6 +206,138 @@ describe('WalletFundingProvider', () => {
 			const tx = bitcoin.Transaction.fromHex(txHex);
 			expect(result.txid.equals(Buffer.from(tx.getHash()))).to.be.true;
 		});
+
+		it('sweeps via sendMax (not send) when max is set', async () => {
+			const { txHex } = buildFakeFundingTx(fundingAddress, 100_000, network);
+			let sendCalled = false;
+			let sendMaxCalled = false;
+			let capturedRate: number | undefined;
+			let capturedBroadcast: boolean | undefined;
+			const wallet: IWalletLike = {
+				send: async () => {
+					sendCalled = true;
+					return mockOk(txHex);
+				},
+				sendMax: async (p) => {
+					sendMaxCalled = true;
+					capturedRate = p.satsPerByte;
+					capturedBroadcast = p.broadcast;
+					return mockOk(txHex);
+				},
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			const res = await provider.buildFundingTransaction(
+				fundingAddress,
+				100_000n,
+				7,
+				true
+			);
+			expect(sendMaxCalled, 'used sendMax').to.be.true;
+			expect(sendCalled, 'did not use fixed send').to.be.false;
+			expect(capturedRate).to.equal(7);
+			expect(capturedBroadcast).to.equal(false);
+			expect(res.outputIndex).to.equal(1);
+		});
+
+		it('still uses fixed send when max is not set', async () => {
+			const { txHex } = buildFakeFundingTx(fundingAddress, 100_000, network);
+			let sendCalled = false;
+			let sendMaxCalled = false;
+			const wallet: IWalletLike = {
+				send: async () => {
+					sendCalled = true;
+					return mockOk(txHex);
+				},
+				sendMax: async () => {
+					sendMaxCalled = true;
+					return mockOk(txHex);
+				},
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			await provider.buildFundingTransaction(fundingAddress, 100_000n);
+			expect(sendCalled).to.be.true;
+			expect(sendMaxCalled).to.be.false;
+		});
+
+		it('throws when the swept output does not match the committed amount', async () => {
+			// The sweep produced 90k but the caller committed 100k as funding_satoshis
+			// (balance changed between quote and funding): signing the commitment
+			// against a mismatched output would break the channel, so it must fail.
+			const { txHex } = buildFakeFundingTx(fundingAddress, 90_000, network);
+			const wallet: IWalletLike = {
+				send: async () => mockOk(txHex),
+				sendMax: async () => mockOk(txHex),
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					100_000n,
+					undefined,
+					true
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not match committed funding amount'
+				);
+			}
+		});
+
+		it('throws when a fixed-amount send comes back short of the committed amount', async () => {
+			// Near the balance ceiling the wallet quietly REDUCES a fixed send
+			// instead of failing when amount + fee exceeds the balance (observed
+			// live: 499170 requested, 499004 funded, no change output). The
+			// commitment is signed against the committed funding_satoshis, so a
+			// short funding output produces a channel the peer's on-chain check
+			// rejects; the provider must refuse rather than fund it.
+			const { txHex } = buildFakeFundingTx(fundingAddress, 499_004, network);
+			const wallet: IWalletLike = {
+				send: async () => mockOk(txHex),
+				electrum: { broadcastTransaction: async () => mockOk('') }
+			};
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					499_170n,
+					2,
+					false
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not match committed funding amount'
+				);
+				expect((err as Error).message).to.include('altered the send amount');
+			}
+		});
+
+		it('throws when max funding is requested but the wallet cannot sweep', async () => {
+			const wallet = createMockWallet({ txHex: '' }); // legacy mock, no sendMax
+			const provider = new WalletFundingProvider(wallet);
+
+			try {
+				await provider.buildFundingTransaction(
+					fundingAddress,
+					100_000n,
+					undefined,
+					true
+				);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include(
+					'does not support max funding'
+				);
+			}
+		});
 	});
 
 	describe('broadcastTransaction', () => {
@@ -459,6 +591,54 @@ describe('WalletFundingProvider', () => {
 			} catch (err) {
 				expect((err as Error).message).to.include('does not support splice-in');
 			}
+		});
+
+		describe('quoteSpliceIn', () => {
+			it('quotes a max the selection will actually fund', async () => {
+				// The regression this guards: a UI computed its own "max" from the
+				// total balance and an approximate fee, and the daemon then rejected
+				// it as unfundable. The quoted max must round-trip through the real
+				// selection.
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 60_000 }, { valueSats: 19_772 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(2500);
+				expect(q.inputCount).to.equal(2);
+				expect(q.spendableSats).to.equal(79_772n);
+				expect(q.maxAmountSats).to.equal(q.spendableSats - q.feeSats);
+
+				const { inputs } = await provider.selectSpliceInputs(
+					q.maxAmountSats,
+					2500
+				);
+				expect(inputs.length).to.equal(2);
+			});
+
+			it('excludes non-P2WPKH UTXOs from the spendable total', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [
+						{ valueSats: 40_000 },
+						{ valueSats: 100_000, nonP2wpkh: true }
+					]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(253);
+				expect(q.inputCount).to.equal(1);
+				expect(q.spendableSats).to.equal(40_000n);
+			});
+
+			it('quotes zero max when the fee exceeds the balance', () => {
+				const { wallet } = createSpliceMockWallet({
+					utxos: [{ valueSats: 200 }]
+				});
+				const provider = new WalletFundingProvider(wallet);
+
+				const q = provider.quoteSpliceIn(50_000);
+				expect(q.maxAmountSats).to.equal(0n);
+			});
 		});
 	});
 

@@ -8,6 +8,7 @@
 
 import crypto from 'crypto';
 import { MessageType } from '../message/types';
+import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import {
 	encodeOpenChannelMessage,
 	IOpenChannelMessage,
@@ -32,10 +33,12 @@ import {
 	encodeUpdateFailMalformedHtlcMessage,
 	IUpdateFailMalformedHtlcMessage,
 	encodeUpdateFeeMessage,
-	IUpdateFeeMessage
+	IUpdateFeeMessage,
+	IUpdateBlockheightMessage
 } from '../message/channel-update';
 import {
 	encodeCommitmentSignedMessage,
+	decodeCommitmentSignedMessage,
 	ICommitmentSignedMessage,
 	encodeRevokeAndAckMessage,
 	IRevokeAndAckMessage
@@ -86,6 +89,7 @@ import {
 	deriveV2TemporaryChannelId,
 	validateOpenChannelParams,
 	validateAcceptChannelParams,
+	validateU64,
 	isValidShutdownScript
 } from './validation';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -103,6 +107,8 @@ import {
 	calculateCommitmentFee,
 	getCommitmentFeeRate,
 	getLocalCommitmentFeeRate,
+	getRemoteCommitmentFeeRate,
+	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import { isAnchorChannel, isTaprootChannel } from './types';
@@ -213,6 +219,10 @@ const MIN_CHANNEL_RESERVE_SATOSHIS = 546n; // LND enforces P2PKH dust limit as m
  */
 const LEASE_BLOCKHEIGHT_PAST_TOLERANCE = 6;
 const LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE = 144;
+function bigIntMax(a: bigint, b: bigint): bigint {
+	return a > b ? a : b;
+}
+
 function computeChannelReserve(
 	fundingSatoshis: bigint,
 	dustLimitSatoshis: bigint
@@ -370,6 +380,11 @@ export class Channel {
 		witnesses: Buffer[][];
 	} | null = null;
 	private _spliceRemoteCommitmentSig: Buffer | null = null;
+	// Peer's second-level HTLC sigs paired with _spliceRemoteCommitmentSig:
+	// committed HTLCs riding through the splice (S-2.M8) put HTLC outputs on
+	// the spliced commitment, and a force-close on the new funding needs
+	// these to claim them.
+	private _spliceRemoteHtlcSigs: Buffer[] | null = null;
 	// start_batch collection: while a fully-signed splice awaits confirmation,
 	// every commitment update arrives as a batch of commitment_signed messages
 	// (one per active funding output) announced by start_batch and answered by
@@ -403,6 +418,14 @@ export class Channel {
 	// connection). While set, the peer's tx_abort is an ack — not an error — and
 	// a remote `error` for this channel is part of the abort dance, not a
 	// channel failure.
+	/**
+	 * BOLT 7 chain scope for the channel_announcement / channel_update this
+	 * channel builds AND signs (buildAnnouncementData is both the signing
+	 * digest and the emitted message). Set by the ChannelManager from its
+	 * configured chain; the previous hardcoded mainnet made every non-mainnet
+	 * announcement invalid for the actual chain (S-7.M1).
+	 */
+	announcementChainHash: Buffer = BITCOIN_CHAIN_HASH;
 	private _spliceAbortPending = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
@@ -446,6 +469,26 @@ export class Channel {
 	// Direct funding: witnesses delivered by third-party input owners,
 	// keyed "txidHex:vout".
 	private _v2ExternalWitnesses = new Map<string, Buffer[]>();
+	// Dual-funding ACCEPTOR contribution (v2 open, e.g. a bLIP-0051 lease we
+	// sell): wallet inputs funding our fundingSatoshis share, the change
+	// script, and the contribution amount. Same wallet-closure model as
+	// _spliceInInputs — the wallet signs its own inputs.
+	private _dualFundingContribution: {
+		inputs: ISpliceWalletInput[];
+		changeScript: Buffer;
+		contributionSats: bigint;
+		feeratePerKw: number;
+	} | null = null;
+	// The ordered interactive-tx contributions derived from the above, sent
+	// one per turn (interactive-tx alternation) by _driveDualFunding.
+	private _dualFundingContribs: Array<
+		| { kind: 'input'; input: IInteractiveTxInput }
+		| { kind: 'output'; output: IInteractiveTxOutput }
+	> | null = null;
+	private _dualFundingContribIndex = 0;
+	// Set once our v2 tx_signatures witnesses have been provided to the
+	// session, so later flushes never re-provide.
+	private _v2TxSigsReleased = false;
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -472,6 +515,8 @@ export class Channel {
 	// Sign-once latch: our closing nonce signs exactly ONE sighash. Set when we
 	// produce our closing partial; cleared only when fresh nonces arrive.
 	private _hasSignedClosing = false;
+	/** Live closing feerate (sat/kw) injected by the manager; ephemeral. */
+	private _closingFeeratePerKw: number | null = null;
 	// Opaque cache managed by the ChannelManager: the MuSig2 signing session,
 	// unsigned closing tx and our partial at a specific fee. Invalidated here
 	// whenever the nonces refresh (the channel owns the nonce lifecycle).
@@ -649,6 +694,14 @@ export class Channel {
 			];
 		}
 
+		const maxHtlcErr = validateU64(
+			this._state.localConfig.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (maxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: maxHtlcErr }];
+		}
+
 		const firstPoint = getPerCommitmentPoint(
 			this._state.localPerCommitmentSeed,
 			0n
@@ -680,6 +733,13 @@ export class Channel {
 			this._state.localConfig.dustLimitSatoshis
 		);
 
+		// max_htlc_value_in_flight_msat is advertised as configured, NOT
+		// clamped to capacity: the advertisement is immutable for the life of
+		// the channel while capacity is not (splice-in), so clamping would
+		// bake the initial capacity in as a permanent ceiling. Over-capacity
+		// values are interop-safe (CLN always advertises U64 max); peers take
+		// min(capacity, value) and balance/reserve rules bound what can
+		// actually be in flight.
 		const msg: IOpenChannelMessage = {
 			chainHash: chainHash || BITCOIN_CHAIN_HASH,
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -978,6 +1038,18 @@ export class Channel {
 					}
 				];
 			}
+		} else if (this._state.channelType && !msg.channelType) {
+			// BOLT 2: if open_channel set channel_type, accept_channel MUST set it
+			// to the exact same type. An omission is a violation, not an implicit
+			// agreement — silently keeping our own type risks the two sides
+			// building different commitment formats.
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'accept_channel omitted channel_type after open_channel set it'
+				}
+			];
 		}
 		if (msg.channelType) {
 			this._state.channelType = msg.channelType;
@@ -1119,6 +1191,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
@@ -1241,10 +1315,40 @@ export class Channel {
 			this._state.channelType = defaultType.toBuffer();
 		}
 
-		const channelReserve = computeChannelReserve(
-			this._state.fundingSatoshis,
-			this._state.localConfig.dustLimitSatoshis
+		// BOLT 2 couplings for the accept_channel WE build: our channel_reserve
+		// MUST be >= the opener's dust_limit (else the opener's below-reserve
+		// balance could be trimmed as dust), so raise it if our formula lands
+		// lower. And our dust_limit MUST be <= the opener's channel_reserve; we
+		// will not lower our own dust floor, so reject the open instead of
+		// emitting a non-compliant accept_channel the opener must then fail.
+		const channelReserve = bigIntMax(
+			computeChannelReserve(
+				this._state.fundingSatoshis,
+				this._state.localConfig.dustLimitSatoshis
+			),
+			msg.dustLimitSatoshis
 		);
+		if (
+			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `our dust_limit ${this._state.localConfig.dustLimitSatoshis} exceeds opener channel_reserve ${msg.channelReserveSatoshis}`
+				}
+			];
+		}
+
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// clamped to the opener's capacity (see initiateOpen: the
+		// advertisement outlives the current capacity).
+		const acceptMaxHtlcErr = validateU64(
+			this._state.localConfig.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (acceptMaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: acceptMaxHtlcErr }];
+		}
 
 		const acceptMsg: IAcceptChannelMessage = {
 			temporaryChannelId: this._state.temporaryChannelId,
@@ -1371,6 +1475,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		const signedMsg: IFundingSignedMessage = {
 			channelId: this._state.channelId,
@@ -1531,7 +1637,13 @@ export class Channel {
 		onionRoutingPacket: Buffer,
 		blindingPoint?: Buffer
 	): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		// Pending-lock (tx_signatures crossed both ways, splice_locked not yet):
+		// update traffic has resumed per the splicing extension, and every add
+		// is mirrored onto both fundings by the start_batch commitment round.
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1546,6 +1658,18 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Cannot add HTLC: channel is quiescing'
+				}
+			];
+		}
+
+		// BOLT 2: cltv_expiry MUST be < 500000000 (values at or above are
+		// interpreted as unix timestamps, not block heights). Send-side check so
+		// we never emit an update_add_htlc a conformant peer must fail.
+		if (cltvExpiry >= 500_000_000) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${cltvExpiry} is not a block height (>= 500000000)`
 				}
 			];
 		}
@@ -1580,25 +1704,13 @@ export class Channel {
 			];
 		}
 
-		// Check we have enough balance (including reserve the remote requires us to
-		// maintain). When we are the funder we must ALSO be able to pay the
-		// commitment fee on top of the reserve (BOLT 2), or the commitment we build
-		// would silently clamp our output to 0 / be rejected by the peer. The
-		// update_fee path already enforces this; mirror it here for adding HTLCs.
-		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
-		let requiredMsat = reserveMsat;
-		if (this._state.role === ChannelRole.OPENER) {
-			const feeMsat =
-				BigInt(
-					calculateCommitmentFee(
-						this._state.localConfig.feeratePerKw,
-						this._countActiveHtlcs() + 1,
-						isAnchorChannel(this._state.channelType)
-					)
-				) * 1000n;
-			requiredMsat += feeMsat;
-		}
-		if (this._state.localBalanceMsat - amountMsat < requiredMsat) {
+		// Check we have enough balance (including reserve the remote requires us
+		// to maintain, plus the funder's commitment fee — BOLT 2). Delegated to
+		// getSpendableOutboundMsat so the same ceiling that gates an add here is
+		// the one accounting/routing surfaces report, and so a pending splice's
+		// lower-balance commitment (when the gates allow adds mid-splice) is
+		// automatically respected.
+		if (amountMsat > this.getSpendableOutboundMsat()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -1669,7 +1781,10 @@ export class Channel {
 	 * Handle update_add_htlc from remote (received HTLC).
 	 */
 	handleUpdateAddHtlc(msg: IUpdateAddHtlcMessage): ChannelAction[] {
-		if (this._state.state !== ChannelState.NORMAL) {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected update_add_htlc' }
 			];
@@ -1763,16 +1878,31 @@ export class Channel {
 		let remoteRequiredMsat = remoteReserveMsat;
 		if (this._state.role === ChannelRole.ACCEPTOR) {
 			// We are the acceptor, so the remote is the funder and must also cover
-			// the commitment fee above its reserve.
+			// the commitment fee above its reserve — priced at the LIVE commitment
+			// feerate, the rate real commitments are built at. Pricing it at the
+			// static open-time localConfig.feeratePerKw made this check disagree
+			// with the sender's own live-rate arithmetic whenever the two rates
+			// drifted apart, and a boundary HTLC then failed the channel over a
+			// sats-scale formula difference between two honest nodes (#193).
+			const anchor = isAnchorChannel(this._state.channelType);
 			const feeMsat =
 				BigInt(
 					calculateCommitmentFee(
-						this._state.localConfig.feeratePerKw,
+						Math.max(
+							getLocalCommitmentFeeRate(this._state),
+							getRemoteCommitmentFeeRate(this._state)
+						),
 						this._countActiveHtlcs() + 1,
-						isAnchorChannel(this._state.channelType)
+						anchor
 					)
 				) * 1000n;
 			remoteRequiredMsat += feeMsat;
+			// The commitment builder deducts the two 330-sat anchor outputs
+			// from the funder's output separately from the fee; the funder must
+			// afford those above its reserve too.
+			if (anchor) {
+				remoteRequiredMsat += ANCHOR_TOTAL_COST * 1000n;
+			}
 		}
 		if (this._state.remoteBalanceMsat - msg.amountMsat < remoteRequiredMsat) {
 			return [
@@ -1794,6 +1924,18 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Dust HTLC exposure limit exceeded'
+				}
+			];
+		}
+
+		// BOLT 2: cltv_expiry >= 500000000 is a unix timestamp, not a block
+		// height — always invalid, independent of whether we know the current
+		// block height.
+		if (msg.cltvExpiry >= 500_000_000) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC cltv_expiry ${msg.cltvExpiry} is not a block height (>= 500000000)`
 				}
 			];
 		}
@@ -1849,12 +1991,53 @@ export class Channel {
 	}
 
 	/**
+	 * BOLT 2 send-side guard: a received HTLC we have already settled must not be
+	 * settled a second time. The peer removes an HTLC from its update log as soon
+	 * as it accepts our update_fulfill/update_fail, so a repeat names an id the
+	 * peer no longer holds, and a peer answers that by failing the channel.
+	 *
+	 * A repeat of the SAME resolution is a no-op, mirroring the receive-side
+	 * dedup in handleUpdateFulfillHtlc: that is the harmless shape of this
+	 * mistake (an honest retransmission), and callers reasonably fire twice.
+	 *
+	 * The CROSS transition is an error rather than a no-op, because it moves
+	 * money. Failing an HTLC we already fulfilled would overwrite entry.state and
+	 * send the value to remoteBalanceMsat on the next revoke_and_ack, giving away
+	 * value whose preimage we have already revealed. Fulfilling one we already
+	 * failed reveals a preimage for value we have told the peer to take back.
+	 *
+	 * Returns the actions the caller should return, or null to proceed.
+	 */
+	private _guardRepeatSettle(
+		entry: IHtlcEntry,
+		htlcId: bigint,
+		intent: HtlcState.FULFILLED | HtlcState.FAILED
+	): ChannelAction[] | null {
+		if (entry.state === intent) {
+			return [];
+		}
+		if (
+			entry.state === HtlcState.FULFILLED ||
+			entry.state === HtlcState.FAILED
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `HTLC ${htlcId} already ${entry.state.toLowerCase()}`
+				}
+			];
+		}
+		return null;
+	}
+
+	/**
 	 * Fulfill a received HTLC with a preimage.
 	 */
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -1872,12 +2055,19 @@ export class Channel {
 			];
 		}
 
-		// Verify preimage
+		// Verify preimage. Checked before the repeat guard so a caller passing a
+		// preimage that does not hash to this HTLC is told so either way, rather
+		// than getting a silent no-op because the entry happens to be settled.
 		const hash = crypto.createHash('sha256').update(paymentPreimage).digest();
 		if (!hash.equals(entry.paymentHash)) {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Invalid preimage for HTLC' }
 			];
+		}
+
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FULFILLED);
+		if (repeat) {
+			return repeat;
 		}
 
 		entry.state = HtlcState.FULFILLED;
@@ -1913,7 +2103,8 @@ export class Channel {
 	handleUpdateFulfillHtlc(msg: IUpdateFulfillHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -1996,7 +2187,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2024,6 +2216,11 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${htlcId} not found` }
 			];
+		}
+
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FAILED);
+		if (repeat) {
+			return repeat;
 		}
 
 		entry.state = HtlcState.FAILED;
@@ -2065,7 +2262,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2090,6 +2288,11 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: `HTLC ${htlcId} not found` }
 			];
+		}
+
+		const repeat = this._guardRepeatSettle(entry, htlcId, HtlcState.FAILED);
+		if (repeat) {
+			return repeat;
 		}
 
 		entry.state = HtlcState.FAILED;
@@ -2120,7 +2323,8 @@ export class Channel {
 	handleUpdateFailHtlc(msg: IUpdateFailHtlcMessage): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2173,7 +2377,8 @@ export class Channel {
 	): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
-			this._state.state !== ChannelState.SHUTTING_DOWN
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
 		) {
 			return [
 				{
@@ -2433,6 +2638,15 @@ export class Channel {
 			this._state.pendingFeerateCommitted = true;
 		}
 
+		// update_blockheight, same machine: a signable staged height is baked
+		// into this signature; the answering revoke_and_ack promotes it.
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightSignable === true
+		) {
+			this._state.pendingLeaseBlockheightCommitted = true;
+		}
+
 		// Two-phase updates: stamp every entry whose phase THIS signature
 		// advances — the peer's answering revoke_and_ack promotes them
 		// (addRemoteCommitted / removalRemoteCommitted) in handleRevokeAndAck.
@@ -2652,12 +2866,11 @@ export class Channel {
 					const cid = (
 						this._state.channelId || this._state.temporaryChannelId
 					).toString('hex');
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: `Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
-						}
-					];
+					// BOLT 2: MUST fail the channel — send the wire error so the
+					// peer force-closes; continuing would wedge on desynced state.
+					return this._failChannelWithWireError(
+						`Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
+					);
 				}
 			}
 
@@ -2674,9 +2887,8 @@ export class Channel {
 					msg.htlcSignatures
 				);
 				if (!htlcSigsValid) {
-					return [
-						{ type: ChannelActionType.ERROR, message: 'Invalid HTLC signature' }
-					];
+					// BOLT 2: MUST fail the channel (see above).
+					return this._failChannelWithWireError('Invalid HTLC signature');
 				}
 			}
 
@@ -2692,6 +2904,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 
 		// Two-phase update_fee, acceptor side: this commitment_signed from the
 		// opener covers its staged update_fee (the update always precedes its
@@ -2708,6 +2922,18 @@ export class Channel {
 			this._state.pendingFeerateSignable !== true
 		) {
 			this._state.pendingFeerateSignable = true;
+			this._state.needsCommitment = true;
+		}
+
+		// update_blockheight, same machine: this commitment_signed from the
+		// opener covers its staged height; only NOW may it be baked into
+		// commitments WE sign, and we owe a commitment_signed at it.
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.role === ChannelRole.ACCEPTOR &&
+			this._state.pendingLeaseBlockheightSignable !== true
+		) {
+			this._state.pendingLeaseBlockheightSignable = true;
 			this._state.needsCommitment = true;
 		}
 
@@ -2835,13 +3061,11 @@ export class Channel {
 				msg.perCommitmentSecret
 			);
 			if (!revealedPoint.equals(this._state.remoteCurrentPerCommitmentPoint)) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'revoke_and_ack secret does not match committed per-commitment point'
-					}
-				];
+				// BOLT 2: MUST fail the channel — a fake revocation means the peer
+				// can still cheat with the "revoked" commitment.
+				return this._failChannelWithWireError(
+					'revoke_and_ack secret does not match committed per-commitment point'
+				);
 			}
 		}
 
@@ -2868,12 +3092,10 @@ export class Channel {
 			msg.perCommitmentSecret
 		);
 		if (!stored) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Invalid per-commitment secret'
-				}
-			];
+			// BOLT 2: an unverifiable revocation secret means the peer can cheat
+			// with the "revoked" commitment — MUST fail the channel with a wire
+			// error, never keep exchanging updates on top of it.
+			return this._failChannelWithWireError('Invalid per-commitment secret');
 		}
 
 		// The oldest outstanding commitment is now revoked.
@@ -2982,16 +3204,41 @@ export class Channel {
 			this._state.pendingFeerateCommitted = false;
 		}
 
+		// update_blockheight, same machine: a staged height we SIGNED at is now
+		// irrevocably committed on both sides — promote it (and record it in
+		// the height history for on-chain classification of old commitments).
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightCommitted === true
+		) {
+			this._promoteLeaseBlockheight(this._state.pendingLeaseBlockheight);
+			this._state.pendingLeaseBlockheight = undefined;
+			this._state.pendingLeaseBlockheightSignable = false;
+			this._state.pendingLeaseBlockheightCommitted = false;
+		}
+
 		// Emit HTLC_FORWARDED for committed received HTLCs that haven't been
-		// processed yet. This happens AFTER the full commitment round-trip
+		// dispatched yet. This happens AFTER the full commitment round-trip
 		// (commitment_signed → revoke_and_ack both ways), ensuring the HTLC
 		// is fully committed on both sides before we try to settle it.
+		//
+		// forwardEmitted makes the dispatch edge-triggered. COMMITTED is not a
+		// "needs dispatching" state: a received HTLC sits in it for the entire
+		// time its forward is in flight downstream, and only leaves it once we
+		// fulfill or fail it. Re-scanning the whole map on every revoke_and_ack
+		// therefore re-dispatched every unsettled inbound HTLC on every later
+		// commitment round, so the node layer offered a fresh outgoing HTLC each
+		// time for one inbound payment — draining outbound liquidity until adds
+		// started failing, and leaving several outgoing legs mapped to the same
+		// inbound leg.
 		const htlcActions: ChannelAction[] = [];
 		for (const entry of this._state.htlcs.values()) {
 			if (
 				entry.state === HtlcState.COMMITTED &&
-				entry.direction === HtlcDirection.RECEIVED
+				entry.direction === HtlcDirection.RECEIVED &&
+				entry.forwardEmitted !== true
 			) {
+				entry.forwardEmitted = true;
 				htlcActions.push({
 					type: ChannelActionType.HTLC_FORWARDED,
 					htlcId: entry.id,
@@ -3051,14 +3298,15 @@ export class Channel {
 		}
 
 		// Reject a feerate that would drain our (the opener's) balance below reserve,
-		// matching the acceptor's reserve guard.
+		// matching the acceptor's reserve guard. On anchor channels the builder
+		// deducts the two anchor outputs from the funder separately from the fee
+		// (#193), so the guard must count them or the promoted rate produces a
+		// commitment the reserve check would have refused.
 		const activeHtlcCount = this._countActiveHtlcs();
 		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee = calculateCommitmentFee(
-			feeratePerKw,
-			activeHtlcCount,
-			anchor
-		);
+		const newFee =
+			calculateCommitmentFee(feeratePerKw, activeHtlcCount, anchor) +
+			(anchor ? ANCHOR_TOTAL_COST : 0n);
 		const reserveMsat = this._state.remoteConfig.channelReserveSatoshis * 1000n;
 		if (newFee * 1000n > this._state.localBalanceMsat - reserveMsat) {
 			return [
@@ -3187,14 +3435,14 @@ export class Channel {
 			];
 		}
 
-		// Check if new fee rate would drain opener below channel reserve
+		// Check if new fee rate would drain opener below channel reserve. Anchor
+		// channels: the builder takes the two anchor outputs from the funder on
+		// top of the fee, so require those too (#193).
 		const activeHtlcCount = this._countActiveHtlcs();
 		const anchor = isAnchorChannel(this._state.channelType);
-		const newFee = calculateCommitmentFee(
-			msg.feeratePerKw,
-			activeHtlcCount,
-			anchor
-		);
+		const newFee =
+			calculateCommitmentFee(msg.feeratePerKw, activeHtlcCount, anchor) +
+			(anchor ? ANCHOR_TOTAL_COST : 0n);
 		const reserveMsat = this._state.localConfig.channelReserveSatoshis * 1000n;
 		// Remote is the opener (we are acceptor), so check their balance
 		if (newFee * 1000n > this._state.remoteBalanceMsat - reserveMsat) {
@@ -3258,6 +3506,120 @@ export class Channel {
 		this._state.pendingFeerateSignable = false;
 		this._state.pendingFeerateCommitted = false;
 		return [];
+	}
+
+	/**
+	 * bLIP-0051 update_blockheight (type 137): the OPENER of a leased channel
+	 * advances the agreed blockheight, shrinking the lessor's remaining-lease
+	 * CSV (lease_csv = lease_expiry - blockheight) in the commitment scripts.
+	 * We only ever RECEIVE this (the lessor is always the acceptor); the staged
+	 * height runs the same two-phase machine as update_fee — it applies to the
+	 * opener's signatures immediately and to commitments WE sign only once
+	 * signable, and is promoted on round completion. Ignoring the message (the
+	 * old behavior: type 137 is odd, so it was dropped) desynced every
+	 * subsequent commitment script against a CLN buyer.
+	 */
+	handleUpdateBlockheight(msg: IUpdateBlockheightMessage): ChannelAction[] {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.isSplicePendingLock()
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Unexpected update_blockheight'
+				}
+			];
+		}
+
+		// Only the opener sends update_blockheight (CLN channeld enforces the
+		// same on both sides).
+		if (this._state.role !== ChannelRole.ACCEPTOR) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Only the opener can send update_blockheight'
+				}
+			];
+		}
+
+		// Only meaningful on a leased channel where WE are the lessor: the
+		// height feeds our lease CSV. CLN fails the channel for it too.
+		if (this._state.leaseExpiry === undefined || !this._state.isLessor) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'update_blockheight on a non-leased channel'
+				}
+			];
+		}
+
+		// Monotonic: the agreed blockheight never decreases (CLN warns and
+		// fails). An equal height is a harmless no-op.
+		const current =
+			this._state.pendingLeaseBlockheight ??
+			this._state.leaseCommitBlockheight ??
+			0;
+		if (msg.blockheight < current) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_blockheight decreased (${msg.blockheight} < ${current})`
+				}
+			];
+		}
+		if (msg.blockheight === current) {
+			return [];
+		}
+
+		// Staleness (CLN parity): a height more than 1008 blocks behind our own
+		// tip means the opener's view is unusably old.
+		if (
+			this._currentBlockHeight > 0 &&
+			msg.blockheight + 1008 < this._currentBlockHeight
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `update_blockheight too old (${msg.blockheight} vs tip ${this._currentBlockHeight})`
+				}
+			];
+		}
+
+		// A NEW update while a previous staged height already reached the
+		// signable phase: the previous height is locked into the exchange —
+		// promote it before staging the replacement (mirrors update_fee).
+		if (
+			this._state.pendingLeaseBlockheight !== undefined &&
+			this._state.pendingLeaseBlockheightSignable === true
+		) {
+			this._promoteLeaseBlockheight(this._state.pendingLeaseBlockheight);
+		}
+		this._state.pendingLeaseBlockheight = msg.blockheight;
+		this._state.pendingLeaseBlockheightSignable = false;
+		this._state.pendingLeaseBlockheightCommitted = false;
+		return [];
+	}
+
+	/**
+	 * Promote a lease blockheight to the committed config and record it in the
+	 * height history (on-chain classification of OLD commitments needs every
+	 * height that was ever committed to rebuild their lease-locked scripts).
+	 */
+	private _promoteLeaseBlockheight(height: number): void {
+		if (this._state.leaseCommitBlockheight !== height) {
+			const history = this._state.leaseHeightHistory ?? [];
+			if (
+				this._state.leaseCommitBlockheight !== undefined &&
+				history[history.length - 1] !== this._state.leaseCommitBlockheight
+			) {
+				history.push(this._state.leaseCommitBlockheight);
+			}
+			history.push(height);
+			this._state.leaseHeightHistory = history;
+		}
+		this._state.leaseCommitBlockheight = height;
 	}
 
 	// ─────────────── Closing ───────────────
@@ -3345,6 +3707,60 @@ export class Channel {
 					message: 'Cannot force close: wrong state'
 				}
 			];
+		}
+
+		// A splice tx that CONFIRMED makes the old funding output unspendable —
+		// the live-state commitment below would spend a spent outpoint and can
+		// never confirm, leaving no unilateral exit. The only valid exit is the
+		// commitment on the NEW funding, whose peer signatures the
+		// point-of-no-return record carries; adopt the spliced view first
+		// (completeSplice swaps the outpoint, balances and signature material,
+		// exactly as a splice_locked exchange would — the peer's signatures are
+		// over commitment N regardless of whether splice_locked ever crossed).
+		//
+		// Judged by the CONFIRMED record alone, never by channel state: the
+		// production shapes are a disconnect wrapping SPLICING in
+		// AWAITING_REESTABLISH (where the chain watcher records the confirmation
+		// it could not announce), and a BOLT 1 error landing mid-splice, where
+		// markErrored has already replaced SPLICING with ERRORED by the time the
+		// close is driven. A state-based gate would skip adoption in the latter
+		// and broadcast against the spent pre-splice funding.
+		const preAdoptionState = this._state.state;
+		if (this._state.spliceInFlight?.confirmed === true) {
+			// Capture the adoption target BEFORE completeSplice nulls the record.
+			const expectedTxid = Buffer.from(this._state.spliceInFlight.spliceTxid);
+			const expectedOutputIndex =
+				this._state.spliceInFlight.newFundingOutputIndex;
+			// After a restart the in-memory splice session may not be rebuilt
+			// yet; restore is a no-op when it already exists.
+			this.restoreSpliceInFlight();
+			this.completeSplice();
+			// Never knowingly broadcast a commitment against the spent
+			// pre-splice funding: if the session could not be rebuilt and the
+			// adoption no-oped, refuse rather than produce an unconfirmable
+			// exit and transition toward FORCE_CLOSED on the strength of it.
+			if (
+				!this._state.fundingTxid?.equals(expectedTxid) ||
+				this._state.fundingOutputIndex !== expectedOutputIndex
+			) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot force close: confirmed splice funding could not be adopted'
+					}
+				];
+			}
+			if (preAdoptionState === ChannelState.ERRORED) {
+				// completeSplice restores NORMAL exactly as a splice_locked
+				// exchange would; a channel failed by a BOLT 1 error stays failed.
+				this._state.state = ChannelState.ERRORED;
+				this._state.preReestablishState = null;
+			} else if (this._state.state === ChannelState.NORMAL) {
+				// Adoption succeeded from inside the reestablish wrapper: the
+				// wrapper's return-to state no longer exists.
+				this._state.preReestablishState = null;
+			}
 		}
 
 		if (!this._state.fundingTxid || !this._state.remoteBasepoints) {
@@ -4071,20 +4487,40 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Inject a live on-chain feerate (sat/kw) for cooperative-close fee
+	 * calculation. Anchor channels pin the COMMITMENT feerate to the 253
+	 * sat/kw floor (fees ride on CPFP), so deriving the closing fee from it
+	 * produces offers below the peer's minimum acceptable close fee; CLN
+	 * warns ("Feerange ... below minimum acceptable") and disconnects, and
+	 * the close retries forever. The effective closing feerate is the higher
+	 * of this and the commitment feerate.
+	 */
+	setClosingFeeratePerKw(feeratePerKw: number): void {
+		if (feeratePerKw > 0) this._closingFeeratePerKw = feeratePerKw;
+	}
+
+	/** Effective feerate (sat/kw) for cooperative closing transactions. */
+	getClosingFeeratePerKw(): number {
+		const commitmentRate = this._state.localConfig.feeratePerKw || 253;
+		return Math.max(this._closingFeeratePerKw ?? 0, commitmentRate);
+	}
+
 	private calculateIdealClosingFee(): bigint {
-		const feeRate = this._state.localConfig.feeratePerKw || 253;
-		// Taproot single-round close: the responder accepts our fee verbatim, so
-		// it must make the tx actually relayable. Use the SAME weight model as
-		// the tx builder (chain/closing.ts) with the 66-WU key-spend witness.
-		if (isTaprootChannel(this._state.channelType)) {
-			const localLen = this._state.localShutdownScript?.length ?? 22;
-			const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
-			return calculateClosingFee(feeRate, localLen, remoteLen, true);
-		}
-		// A typical closing tx is ~170 weight units (simplified calculation)
-		// fee = weight * feeratePerKw / 1000
-		const weight = 170;
-		return BigInt(Math.ceil((weight * feeRate) / 1000));
+		const feeRate = this.getClosingFeeratePerKw();
+		// The fee must make the closing tx actually relayable, so use the SAME
+		// weight model as the tx builder (chain/closing.ts): 2-of-2 P2WSH
+		// funding input + both shutdown outputs (66-WU key-spend witness on
+		// taproot). The old 170-WU shortcut priced the tx at a quarter of its
+		// real weight.
+		const localLen = this._state.localShutdownScript?.length ?? 22;
+		const remoteLen = this._state.remoteShutdownScript?.length ?? 22;
+		return calculateClosingFee(
+			feeRate,
+			localLen,
+			remoteLen,
+			isTaprootChannel(this._state.channelType)
+		);
 	}
 
 	private initClosingFeeRange(idealFee: bigint): void {
@@ -4641,6 +5077,12 @@ export class Channel {
 		this._spliceAbortPending = false;
 		this._reestablishRetransmitted = false;
 
+		// A partially collected start_batch is connection-scoped: the peer
+		// re-announces the batch (with fresh framing) when it retransmits after
+		// reestablish, and appending post-reconnect commitments to a stale
+		// half-collected batch would pair signatures across two deliveries.
+		this._pendingBatch = null;
+
 		// Quiescence never survives a disconnect (BOLT 2 quiescence).
 		this._quiescence.reset();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
@@ -4708,6 +5150,44 @@ export class Channel {
 				this._state.pendingLocalUpdates ?? []
 			).filter((u) => u.type !== MessageType.UPDATE_FEE);
 		}
+
+		// Roll back an uncommitted staged update_blockheight for the same
+		// reason (the opener re-sends a fresh one after reconnect; a
+		// signable/committed height is covered by exchanged signatures and
+		// survives to finish its round).
+		if (
+			this._state.pendingLeaseBlockheightSignable !== true &&
+			this._state.pendingLeaseBlockheightCommitted !== true
+		) {
+			this._state.pendingLeaseBlockheight = undefined;
+		}
+	}
+
+	/**
+	 * BOLT 1 "fail the channel" for a peer protocol violation: send a wire
+	 * error scoped to this channel (a conformant peer force-closes and stops
+	 * using it), mark the channel ERRORED so no further updates are exchanged
+	 * over provably-desynced state, persist FIRST, and surface the app-level
+	 * error. Generalizes the DLP fell-behind pattern in handleReestablish.
+	 *
+	 * ONLY for violations by the PEER (invalid signatures, bad revocation
+	 * secrets, ...): a wire error kills the channel at the peer, so local API
+	 * misuse must keep returning plain ERROR actions.
+	 */
+	private _failChannelWithWireError(message: string): ChannelAction[] {
+		this._state.state = ChannelState.ERRORED;
+		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId,
+					data: Buffer.from(message, 'ascii')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message }
+		];
 	}
 
 	/**
@@ -5062,6 +5542,7 @@ export class Channel {
 		this._spliceReceivedCommitment = true;
 		this._spliceSentTxSigs = inflight.sentTxSignatures;
 		this._spliceRemoteCommitmentSig = inflight.remoteCommitmentSig;
+		this._spliceRemoteHtlcSigs = inflight.remoteHtlcSignatures ?? null;
 	}
 
 	/**
@@ -5088,6 +5569,17 @@ export class Channel {
 	handleReestablish(msg: IChannelReestablishMessage): ChannelAction[] {
 		const actions: ChannelAction[] = [];
 
+		// BOLT 2: next_commitment_number MUST NOT be 0 — the initial commitment
+		// (number 0) is delivered inside funding_created/funding_signed, so the
+		// first commitment_signed a peer can expect is number 1. Zero means the
+		// peer's state is corrupt or hostile; fail the channel loudly rather
+		// than fall through the retransmission logic with it.
+		if (msg.nextCommitmentNumber === 0n) {
+			return this._failChannelWithWireError(
+				'channel_reestablish next_commitment_number is 0'
+			);
+		}
+
 		// ── Data loss protection: validate yourLastPerCommitmentSecret ──
 		if (msg.nextRevocationNumber > 0n) {
 			const expectedSecret = getPerCommitmentSecret(
@@ -5098,12 +5590,11 @@ export class Channel {
 				!msg.yourLastPerCommitmentSecret.equals(Buffer.alloc(32)) &&
 				!msg.yourLastPerCommitmentSecret.equals(expectedSecret)
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid per-commitment secret in channel_reestablish'
-					}
-				];
+				// BOLT 2: MUST fail the channel — the peer is lying about (or has
+				// corrupted) our revocation chain. Wire error like the DLP path.
+				return this._failChannelWithWireError(
+					'Invalid per-commitment secret in channel_reestablish'
+				);
 			}
 		}
 
@@ -5227,7 +5718,19 @@ export class Channel {
 		// traffic has resumed and commitments flow as start_batch batches, which
 		// DO need the generic un-acked-update replay + a batch-aware retransmit.
 		const spliceActive = !!(this._spliceSession || this._state.spliceInFlight);
-		const pendingLock = this.isSplicePendingLock();
+		// isSplicePendingLock() requires state === SPLICING, but at this point
+		// in the handshake the channel still sits in AWAITING_REESTABLISH (the
+		// restore-state block runs further down) — look through it via
+		// preReestablishState, or the pending-lock replays below can never fire
+		// on reconnect and a round interrupted by the disconnect never resumes.
+		const effectiveState =
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: this._state.state;
+		const pendingLock =
+			effectiveState === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.sentTxSignatures === true &&
+			this._state.spliceInFlight?.receivedTxSignatures === true;
 
 		// ── Retransmit un-acked update messages (BOLT 2) ──
 		// Every queued update the peer has not acknowledged with a
@@ -5250,15 +5753,71 @@ export class Channel {
 		// wire bytes verbatim (idempotent — same signatures, no nonce reuse).
 		if (
 			pendingLock &&
-			this._lastSentBatch &&
 			msg.nextCommitmentNumber <= this._state.remoteCommitmentNumber &&
 			this._state.remoteCommitmentNumber > 0n
 		) {
-			actions.push(
-				sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
-			);
-			for (const c of this._lastSentBatch.commitments) {
-				actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+			if (this._lastSentBatch) {
+				actions.push(
+					sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+				);
+				for (const c of this._lastSentBatch.commitments) {
+					actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+				}
+			} else if (
+				this._signer &&
+				this._state.channelId &&
+				this._state.spliceInFlight &&
+				this._state.lastSentCommitmentSigned &&
+				!isTaprootChannel(this._state.channelType)
+			) {
+				// Restart mid-round: the cached wire bytes died with the process.
+				// Rebuild the batch from persisted material. The current-funding
+				// half replays the persisted signature bytes; the splice-side
+				// half is RE-SIGNED, which is exact for ECDSA (RFC 6979 is
+				// deterministic) over the spliced view at the same commitment
+				// number — and the same per-commitment point, because no
+				// revoke_and_ack arrived to rotate it.
+				const spliced = this._splicedState();
+				const point =
+					this._state.remoteNextPerCommitmentPoint ??
+					this._state.remoteCurrentPerCommitmentPoint;
+				if (spliced && point) {
+					try {
+						const spliceSigned = signRemoteCommitment(
+							spliced,
+							this._signer,
+							point,
+							this._state.remoteCommitmentNumber
+						);
+						const startBatchBytes = encodeStartBatchMessage({
+							channelId: this._state.channelId,
+							batchSize: 2,
+							messageType: MessageType.COMMITMENT_SIGNED
+						});
+						const currentBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: this._state.lastSentCommitmentSigned,
+							htlcSignatures: this._state.lastSentHtlcSignatures ?? []
+						});
+						const spliceBytes = encodeCommitmentSignedMessage({
+							channelId: this._state.channelId,
+							signature: spliceSigned.signature,
+							htlcSignatures: spliceSigned.htlcSignatures,
+							fundingTxid: Buffer.from(this._state.spliceInFlight.spliceTxid)
+						});
+						actions.push(sendMsg(MessageType.START_BATCH, startBatchBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, currentBytes));
+						actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, spliceBytes));
+						// Cache for any further replay on this connection.
+						this._lastSentBatch = {
+							startBatch: startBatchBytes,
+							commitments: [currentBytes, spliceBytes]
+						};
+					} catch {
+						// Unrebuildable: leave retransmission to the peer's
+						// next_funding retransmit flags, as before this change.
+					}
+				}
 			}
 		}
 
@@ -5327,10 +5886,16 @@ export class Channel {
 		actions.push(...this._handleReestablishSplice(msg));
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
-		// Per spec: on reconnection, if a node sent channel_ready, it MUST retransmit it.
+		// Spec trigger: the peer's next_commitment_number == 1 proves it never
+		// processed anything past the initial commitment, i.e. it may have
+		// missed our channel_ready — retransmit REGARDLESS of our local state
+		// (we may already have advanced to NORMAL). The local-state condition
+		// is kept as a belt-and-braces fallback for peers that omit the field
+		// semantics (pre-ready states always retransmit).
 		if (
 			this._state.localChannelReady &&
-			(this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
+			(msg.nextCommitmentNumber === 1n ||
+				this._state.state === ChannelState.AWAITING_CHANNEL_READY ||
 				this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED)
 		) {
 			const secondPoint = getPerCommitmentPoint(
@@ -5536,6 +6101,22 @@ export class Channel {
 			];
 		}
 
+		// The splice commitment machinery is ECDSA-only: the mid-splice round
+		// signs with signRemoteCommitment, which would produce garbage for a
+		// MuSig2 funding and wedge the negotiation against a real peer. Refuse
+		// up front with a real answer instead. Taproot splicing (aggregate key
+		// for the new funding, nonce lifecycle across the splice, batched
+		// partials) is tracked separately.
+		if (isTaprootChannel(this._state.channelType)) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot splice: taproot (MuSig2) channels do not support splicing yet'
+				}
+			];
+		}
+
 		if (!this._state.channelId) {
 			return [
 				{
@@ -5660,6 +6241,35 @@ export class Channel {
 					message: 'Cannot accept splice: channel must be quiescent'
 				}
 			];
+		}
+
+		// Mirror of initiateSplice: the ECDSA-only splice commitment machinery
+		// cannot serve a MuSig2 funding. Refuse ON THE WIRE (tx_abort) so the
+		// peer stops waiting for splice_ack, and unwind the quiescence the
+		// handshake already established so this side resumes normal operation
+		// instead of sitting silently quiescent on a splice it rejected.
+		if (isTaprootChannel(this._state.channelType)) {
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+			const abort: ChannelAction[] = [];
+			if (this._state.channelId) {
+				abort.push(
+					sendMsg(
+						MessageType.TX_ABORT,
+						encodeTxAbortMessage({
+							channelId: this._state.channelId,
+							data: Buffer.from('taproot splicing unsupported', 'utf8')
+						})
+					)
+				);
+			}
+			abort.push({
+				type: ChannelActionType.ERROR,
+				message:
+					'Cannot accept splice: taproot (MuSig2) channels do not support splicing yet'
+			});
+			return abort;
 		}
 
 		if (!this._state.channelId) {
@@ -5843,6 +6453,16 @@ export class Channel {
 	}
 
 	/**
+	 * Whether a local (setV2FundingInputs-style) contribution is registered.
+	 * The channel manager's opener auto-funding must not fund a channel the
+	 * embedder already funded this way — doubling the contribution corrupts
+	 * the negotiated funding output.
+	 */
+	hasV2AutoFunding(): boolean {
+		return this._v2FundingInputs !== null;
+	}
+
+	/**
 	 * Acceptor: automatically take our interactive-tx turns (contributions or
 	 * tx_complete) during a v2 open instead of requiring manual driving. On by
 	 * itself this contributes nothing — pair with setV2FundingInputs to fund.
@@ -5944,7 +6564,15 @@ export class Channel {
 				weight += SPLICE_TX_BASE_WEIGHT + outputWeight(fundingScriptLen);
 			}
 			const feeSats = spliceFeeSats(weight, feeratePerKw);
-			const changeSats = walletTotal - ourFundingSats - feeSats;
+			// Lease buyer (lessee initiator): the lease fee rides in the funding
+			// output (fundingSatoshis was bumped by it at accept_channel2), so
+			// our change must fund it as well or outputs exceed inputs.
+			const leaseFeeSats =
+				isInitiator && !this._state.isLessor
+					? this._state.leaseFeeSats ?? 0n
+					: 0n;
+			const changeSats =
+				walletTotal - ourFundingSats - feeSats - leaseFeeSats;
 			// Drop dust change (it implicitly becomes extra fee).
 			if (changeSats > P2WPKH_DUST_LIMIT) {
 				this._v2AutoContributions.push({
@@ -6907,6 +7535,7 @@ export class Channel {
 		this._spliceSentCommitment = false;
 		this._spliceReceivedCommitment = false;
 		this._spliceRemoteCommitmentSig = null;
+		this._spliceRemoteHtlcSigs = null;
 		this._lastSentBatch = null;
 		this._pendingBatch = null;
 		this._spliceOutDestination = null;
@@ -6955,6 +7584,27 @@ export class Channel {
 			};
 		}
 		Object.assign(this._state.spliceInFlight, changes);
+
+		// The splice negotiation is over once tx_signatures have crossed both
+		// ways; per the splicing extension quiescence ends with it, and update
+		// traffic (HTLCs, fees) resumes while the splice awaits its lock, with
+		// every update mirrored onto both fundings via start_batch commitment
+		// rounds. Exiting here (not at splice_locked) is what makes
+		// pay-during-splice possible; completeSplice's exit remains as the
+		// backstop for states persisted before this change.
+		// Taproot channels stay parked (quiescent) for the whole splice: the
+		// manager's MuSig2 auto-sign path cannot batch both fundings yet, so
+		// resuming update traffic would start rounds it cannot finish. Matches
+		// canUpdateHtlcsDuringSplice's ECDSA-only restriction.
+		if (
+			this.isSplicePendingLock() &&
+			this._quiescence.isQuiescent() &&
+			!isTaprootChannel(this._state.channelType)
+		) {
+			this._quiescence.exitQuiescence();
+			this._state.quiescenceState = QuiescenceState.NORMAL;
+			this._state.quiescenceInitiator = false;
+		}
 	}
 
 	/**
@@ -6963,6 +7613,104 @@ export class Channel {
 	 * commitment during the mid-splice commitment round WITHOUT mutating the live
 	 * state (the old commitment must stay valid until splice_locked).
 	 */
+	/**
+	 * The local balance this channel will settle to when the in-flight splice
+	 * locks, or null when no splice is past its point of no return. Uses the
+	 * same arithmetic as the spliced commitment (_splicedState), so accounting
+	 * surfaces can report the pending balance without reconstructing splice
+	 * semantics: the live localBalanceMsat stays pre-splice until splice_locked,
+	 * which would make a max splice-in's newly added sats vanish from every
+	 * reported figure during the confirmation window.
+	 *
+	 * Gated on spliceInFlight (recorded at the point of no return): before
+	 * that, splice-in wallet UTXOs are still visible in the on-chain balance,
+	 * and counting the post-splice figure would double-count them.
+	 */
+	getPendingSpliceLocalBalanceMsat(): bigint | null {
+		if (!this._state.spliceInFlight) return null;
+		const spliced = this._splicedState();
+		if (spliced) return spliced.localBalanceMsat;
+		// The in-memory session is not rebuilt yet (e.g. shortly after a
+		// restart): net-change accounting from the persisted record, matching
+		// completeSplice's fallback (does not subtract the on-chain fee).
+		return (
+			this._state.localBalanceMsat +
+			this._state.spliceInFlight.localRelativeSatoshis * 1000n
+		);
+	}
+
+	/**
+	 * A conservative ceiling on the outbound HTLC value this channel can add
+	 * right now, in msat: local balance minus the reserve the peer requires,
+	 * minus (for the opener) the commitment fee with one more HTLC. This is
+	 * the arithmetic addHtlc enforces. Conservative in one respect: the fee
+	 * counts every active HTLC, while the builder fees only the untrimmed set,
+	 * so this can under-report by the trimmed HTLCs' fee share — it never
+	 * over-admits.
+	 *
+	 * Phase-aware on fees: during an update_fee round the next local and
+	 * remote commitments can transiently build at different rates (the
+	 * builder's own accessors), and the HTLC must be affordable on whichever
+	 * is higher — a staged fee increase gates adds immediately, before the
+	 * round completes.
+	 *
+	 * While a splice awaits its lock, every update is mirrored onto BOTH
+	 * commitments (current funding + pending splice funding), so the
+	 * constraint is the minimum across the live and pending-splice local
+	 * balances: a splice-out's candidate commitment has less to spend, and an
+	 * HTLC the live commitment could afford would make the spliced one
+	 * unbuildable.
+	 */
+	getSpendableOutboundMsat(): bigint {
+		const spendableFor = (localMsat: bigint): bigint => {
+			const reserveMsat =
+				this._state.remoteConfig.channelReserveSatoshis * 1000n;
+			let requiredMsat = reserveMsat;
+			if (this._state.role === ChannelRole.OPENER) {
+				const feeratePerKw = Math.max(
+					getLocalCommitmentFeeRate(this._state),
+					getRemoteCommitmentFeeRate(this._state)
+				);
+				const anchor = isAnchorChannel(this._state.channelType);
+				// Fee-spike buffer (LND-style, #193): as funder, retain the
+				// commitment fee at TWICE the live rate with room for one more
+				// HTLC beyond the one being added. An HTLC offered at the exact
+				// single-fee ceiling bets the channel on the receiver's margin
+				// arithmetic matching ours to the satoshi: the two formulas
+				// count active HTLCs from different books, so a sats-scale
+				// disagreement turns a boundary offer into a protocol violation
+				// the peer may fail the channel over — the sender's unaffordable
+				// offer is the BOLT 2 MUST NOT (observed live: a 10,001-sat send
+				// at the exact ceiling force-closed an otherwise healthy
+				// channel). The buffer also absorbs genuine feerate spikes
+				// between now and the commitment that matters.
+				requiredMsat +=
+					BigInt(
+						calculateCommitmentFee(
+							feeratePerKw * 2,
+							this._countActiveHtlcs() + 2,
+							anchor
+						)
+					) * 1000n;
+				// On anchor channels the commitment builder deducts the two
+				// 330-sat anchor outputs from the FUNDER's output, separately
+				// from the fee. The ceiling must retain them too, or an
+				// exact-ceiling add leaves the funder's commitment output below
+				// its negotiated reserve once the builder takes its 660 sats.
+				if (anchor) {
+					requiredMsat += ANCHOR_TOTAL_COST * 1000n;
+				}
+			}
+			const spendable = localMsat - requiredMsat;
+			return spendable > 0n ? spendable : 0n;
+		};
+		const live = spendableFor(this._state.localBalanceMsat);
+		const pendingSplice = this.getPendingSpliceLocalBalanceMsat();
+		if (pendingSplice === null) return live;
+		const spliced = spendableFor(pendingSplice);
+		return spliced < live ? spliced : live;
+	}
+
 	private _splicedState(): IChannelState | null {
 		if (!this._spliceTx || !this._spliceSession) return null;
 		const session = this._spliceSession;
@@ -6985,7 +7733,31 @@ export class Channel {
 			this._state.localBalanceMsat +
 			session.getLocalRelativeSatoshis() * 1000n -
 			myFeeMsat;
-		const theirNewMsat = newCapacity * 1000n - myNewLocalMsat;
+		// HTLCs riding through the splice (S-2.M8) hold value in NEITHER
+		// balance, so the peer's balance is the remainder of the new capacity
+		// AFTER the in-flight HTLC value. Without this each side attributes
+		// every HTLC's value to the OTHER side and the two build different
+		// commitments ("Invalid splice commitment signature").
+		//
+		// Summing EVERY entry is correct for in-flight adds and removals too,
+		// not just settled committed HTLCs: an HTLC's value leaves a balance at
+		// add time and re-enters one only when its entry is DELETED (settlement
+		// finalized at removal-commit in handleRevokeAndAck), so
+		//   localBalanceMsat + remoteBalanceMsat + Σ(htlcs) = capacity
+		// holds continuously, and the commitment builder makes its own
+		// per-commitment adjustments for mid-lifecycle entries from the shared
+		// htlcs map (buildLocalCommitment / buildRemoteCommitment). The spliced
+		// state only needs its base balances to satisfy the same invariant
+		// against the NEW capacity, which the remainder computation provides.
+		// This is what lets pending-lock commitment rounds (and, with the
+		// HTLC gates lifted, pay-during-splice) mirror updates onto both
+		// fundings without divergence.
+		let htlcInFlightMsat = 0n;
+		for (const e of this._state.htlcs.values()) {
+			htlcInFlightMsat += e.amountMsat;
+		}
+		const theirNewMsat =
+			newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
 
 		// The spliced commitment spends the NEW funding 2-of-2, which uses the
 		// funding pubkeys negotiated in splice_init/splice_ack — NOT necessarily
@@ -7099,6 +7871,45 @@ export class Channel {
 	 * one plus the pending splice), announced by start_batch and acknowledged
 	 * with a single revoke_and_ack.
 	 */
+	/**
+	 * True when HTLC update traffic may flow during the splice's pending-lock
+	 * window. Restricted to ECDSA channels for now: the manager's taproot
+	 * (MuSig2) auto-sign path does not batch-sign both fundings yet, so a
+	 * taproot channel adding HTLCs mid-splice would commit them on only one
+	 * commitment — the exact divergence the batch exists to prevent. Taproot
+	 * channels keep the pre-#139 behavior (parked until splice_locked).
+	 */
+	canUpdateHtlcsDuringSplice(): boolean {
+		return (
+			this.isSplicePendingLock() && !isTaprootChannel(this._state.channelType)
+		);
+	}
+
+	/**
+	 * Whether this channel can carry HTLC traffic right now: NORMAL, or
+	 * mid-splice with update traffic flowing (ECDSA pending-lock). This is the
+	 * predicate node-level consumers (router edges, forwarding, invoice hints,
+	 * balance) share, so "the router will use it" and "the channel will accept
+	 * it" can never disagree. With lookThroughReestablish, a disconnected
+	 * channel is judged by the state it will return to — for surfaces like
+	 * invoice routing hints that describe the channel rather than use it
+	 * immediately.
+	 */
+	isHtlcUsable(lookThroughReestablish = false): boolean {
+		const eff =
+			lookThroughReestablish &&
+			this._state.state === ChannelState.AWAITING_REESTABLISH
+				? this._state.preReestablishState
+				: this._state.state;
+		if (eff === ChannelState.NORMAL) return true;
+		return (
+			eff === ChannelState.SPLICING &&
+			this._state.spliceInFlight?.sentTxSignatures === true &&
+			this._state.spliceInFlight?.receivedTxSignatures === true &&
+			!isTaprootChannel(this._state.channelType)
+		);
+	}
+
 	isSplicePendingLock(): boolean {
 		return (
 			this._state.state === ChannelState.SPLICING &&
@@ -7122,7 +7933,19 @@ export class Channel {
 	 * commitment_signed messages form one logical update.
 	 */
 	handleStartBatch(msg: IStartBatchMessage): ChannelAction[] {
-		if (!this.isSplicePendingLock()) {
+		// splice_locked can race a commitment round: the peer may have built a
+		// batch (old + new funding) before observing our splice_locked, and it
+		// arrives after we completed the splice. Per the splicing spec the
+		// receiver filters by funding_txid rather than failing — so accept the
+		// batch framing post-completion too (the completed splice leaves
+		// fundingTxid === spliceFundingTxid) and let the batch handler drop the
+		// obsolete old-funding commitment.
+		const postSpliceNormal =
+			this._state.state === ChannelState.NORMAL &&
+			this._state.spliceFundingTxid !== null &&
+			this._state.fundingTxid !== null &&
+			this._state.spliceFundingTxid.equals(this._state.fundingTxid);
+		if (!this.isSplicePendingLock() && !postSpliceNormal) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -7169,12 +7992,26 @@ export class Channel {
 	): ChannelAction[] {
 		const inflight = this._state.spliceInFlight;
 		if (!inflight) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Commitment batch without a pending splice'
-				}
-			];
+			// The batch raced our splice_locked: the peer built it before
+			// observing the lock. The commitment for the funding that is now
+			// current goes through the standard single-commitment path; the
+			// obsolete old-funding commitment is ignored (splicing spec).
+			const current = msgs.find(
+				(m) =>
+					m.fundingTxid &&
+					this._state.fundingTxid &&
+					m.fundingTxid.equals(this._state.fundingTxid)
+			);
+			if (!current) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Commitment batch without a pending splice or a current-funding commitment'
+					}
+				];
+			}
+			return this.handleCommitmentSigned(current);
 		}
 
 		let currentMsg: ICommitmentSignedMessage | null = null;
@@ -7283,17 +8120,35 @@ export class Channel {
 				}
 			];
 		}
-		// HTLC traffic is rejected during the pending-lock window (splices begin
-		// quiescent, i.e. with no HTLCs, and new adds are refused until the
-		// splice locks), so both commitments are HTLC-free here. Reject a peer
-		// that nonetheless attaches HTLC sigs to a splice commitment.
-		if (spliceMsg.htlcSignatures.length > 0) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Unexpected HTLC signatures in a pending-lock batch'
-				}
-			];
+		// Committed HTLCs may ride through a splice (S-2.M8): the spliced
+		// commitment then carries HTLC outputs, and the peer's second-level
+		// sigs over them must verify BEFORE the standard path reveals any
+		// revocation secret (they are the force-close witness material for the
+		// new funding). An HTLC-free splice yields an empty list and this
+		// verifies trivially; a count/sig mismatch fails the batch.
+		{
+			const htlcSigsValid = isTaprootChannel(this._state.channelType)
+				? verifyRemoteHtlcSignaturesTaproot(
+						spliced,
+						ourPoint,
+						spliceMsg.htlcSignatures,
+						nextNum
+				  )
+				: verifyRemoteHtlcSignatures(
+						spliced,
+						this._signer,
+						ourPoint,
+						spliceMsg.htlcSignatures,
+						nextNum
+				  );
+			if (!htlcSigsValid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid HTLC signature in a pending-lock batch'
+					}
+				];
+			}
 		}
 		// The rate the spliced commitment was verified at (before the standard
 		// path commits any staged update_fee) — force-close must rebuild at this
@@ -7319,9 +8174,16 @@ export class Channel {
 			// feerate it was made at) so a force-close after the splice confirms
 			// uses the latest state at the matching rate.
 			this._spliceRemoteCommitmentSig = Buffer.from(spliceMsg.signature);
+			this._spliceRemoteHtlcSigs = spliceMsg.htlcSignatures.map((s) =>
+				Buffer.from(s)
+			);
 			this._syncSpliceInFlight({
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
-				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw
+				remoteCommitmentSigFeeratePerKw: spliceSigFeeratePerKw,
+				remoteCommitmentSigLeaseBlockheight: getLocalCommitmentLeaseBlockheight(
+					this._state
+				),
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs
 			});
 		}
 		return actions;
@@ -7392,15 +8254,50 @@ export class Channel {
 					}
 				];
 			}
+			// Committed HTLCs riding through the splice (S-2.M8) put HTLC
+			// outputs on the spliced commitment; verify the peer's second-level
+			// sigs over them before caching anything (they are the force-close
+			// witness material for the new funding).
+			const htlcSigsValid = isTaprootChannel(this._state.channelType)
+				? verifyRemoteHtlcSignaturesTaproot(
+						spliced,
+						ourPoint,
+						msg.htlcSignatures,
+						this._state.localCommitmentNumber
+				  )
+				: verifyRemoteHtlcSignatures(
+						spliced,
+						this._signer,
+						ourPoint,
+						msg.htlcSignatures,
+						this._state.localCommitmentNumber
+				  );
+			if (!htlcSigsValid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid splice commitment HTLC signature'
+					}
+				];
+			}
 		}
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
+		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
 		this._spliceReceivedCommitment = true;
 		// Keep the persisted in-flight record in sync (it may already exist from
 		// our own commitment send): the peer's commitment sig must survive a
 		// crash, and reestablish derives retransmit_flags from it.
 		if (this._state.spliceInFlight) {
 			this._syncSpliceInFlight({
-				remoteCommitmentSig: this._spliceRemoteCommitmentSig
+				remoteCommitmentSig: this._spliceRemoteCommitmentSig,
+				remoteHtlcSignatures: this._spliceRemoteHtlcSigs,
+				// The exact parameters this signature covers. Without them a
+				// force-close after e.g. an update_fee staged mid-window would
+				// rebuild the commitment at the newer rate and attach a
+				// signature made for the older one.
+				remoteCommitmentSigFeeratePerKw: getLocalCommitmentFeeRate(spliced),
+				remoteCommitmentSigLeaseBlockheight:
+					getLocalCommitmentLeaseBlockheight(spliced)
 			});
 		}
 
@@ -7510,7 +8407,51 @@ export class Channel {
 	 * Complete the splice: update channel funding outpoint, balances, and exit quiescence.
 	 */
 	private completeSplice(): void {
-		if (!this._spliceSession) return;
+		const inflight = this._state.spliceInFlight;
+		if (!this._spliceSession && !inflight) return;
+
+		if (!this._spliceSession) {
+			// Session-free adoption from the persisted point-of-no-return record:
+			// the worst-case restart where the in-memory session could not be
+			// rebuilt. The record carries everything the swap needs — beignet
+			// reuses its own local funding pubkey across a splice, the peer's is
+			// stored, and the balance arithmetic mirrors _splicedState exactly
+			// (fee borne by the initiator; in-flight HTLC value in neither
+			// balance).
+			const newCapacity = inflight!.newFundingSatoshis;
+			const feeFromChannelSats =
+				this._state.fundingSatoshis +
+				inflight!.localRelativeSatoshis +
+				inflight!.remoteRelativeSatoshis -
+				newCapacity;
+			const myFeeMsat = inflight!.isInitiator ? feeFromChannelSats * 1000n : 0n;
+			const myNewLocalMsat =
+				this._state.localBalanceMsat +
+				inflight!.localRelativeSatoshis * 1000n -
+				myFeeMsat;
+			let htlcInFlightMsat = 0n;
+			for (const e of this._state.htlcs.values()) {
+				htlcInFlightMsat += e.amountMsat;
+			}
+			const theirNewMsat =
+				newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
+
+			this._state.spliceFundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.spliceFundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingTxid = Buffer.from(inflight!.spliceTxid);
+			this._state.fundingOutputIndex = inflight!.newFundingOutputIndex;
+			this._state.fundingSatoshis = newCapacity;
+			this._state.localBalanceMsat = myNewLocalMsat;
+			this._state.remoteBalanceMsat = theirNewMsat;
+			if (this._state.remoteBasepoints) {
+				this._state.remoteBasepoints = {
+					...this._state.remoteBasepoints,
+					fundingPubkey: Buffer.from(inflight!.remoteFundingPubkey)
+				};
+			}
+			this._finishCompleteSplice();
+			return;
+		}
 
 		// Capture the fee-adjusted new outpoint/capacity/balances from the actual
 		// splice transaction before the driver is reset.
@@ -7543,21 +8484,51 @@ export class Channel {
 				this._spliceSession.getRemoteRelativeSatoshis() * 1000n;
 		}
 
+		this._finishCompleteSplice();
+	}
+
+	/**
+	 * The funding-independent tail of completeSplice: adopt the peer's
+	 * splice-side signatures, reset announcement state for the new funding
+	 * generation, exit quiescence, return to NORMAL and clear the splice
+	 * bookkeeping. Shared by the session-driven and session-free (post-restart)
+	 * adoption paths.
+	 */
+	private _finishCompleteSplice(): void {
+		// localConfig.maxHtlcValueInFlightMsat is deliberately NOT re-clamped to
+		// the post-splice capacity: it is the limit we NEGOTIATED at open, and
+		// the peer holds us to it across splices. Lowering it after a splice-out
+		// would make us reject in-flight totals the peer is entitled to once a
+		// later splice-in restores capacity. While capacity is low, balance and
+		// reserve rules already bound what can actually be in flight, and the
+		// gossip htlc_maximum_msat is clamped against current capacity at
+		// channel_update build time.
 		// Adopt the peer's signature on our NEW commitment (exchanged during the
 		// mid-splice commitment_signed round) so we can unilaterally close the
-		// spliced channel. If for some reason no mid-splice commitment was
-		// exchanged, fall back to driving a post-splice commitment round.
-		if (this._spliceRemoteCommitmentSig) {
-			this._state.remoteCommitmentSignature = this._spliceRemoteCommitmentSig;
-			// The splice window is HTLC-free (splices start quiescent and new
-			// HTLCs are refused until the lock), so the post-splice commitment
-			// carries no HTLC outputs.
-			this._state.remoteHtlcSignatures = [];
+		// spliced channel. After a restart the in-memory copy is gone but the
+		// point-of-no-return record still holds it. If no mid-splice commitment
+		// was ever exchanged, fall back to driving a post-splice round.
+		const adoptedSig =
+			this._spliceRemoteCommitmentSig ??
+			this._state.spliceInFlight?.remoteCommitmentSig ??
+			null;
+		if (adoptedSig) {
+			this._state.remoteCommitmentSignature = Buffer.from(adoptedSig);
+			// Committed HTLCs that rode through the splice (S-2.M8) keep their
+			// outputs on the post-splice commitment; adopt the peer's verified
+			// second-level sigs over them (empty for an HTLC-free splice).
+			this._state.remoteHtlcSignatures =
+				this._spliceRemoteHtlcSigs ??
+				this._state.spliceInFlight?.remoteHtlcSignatures ??
+				[];
 			// Rebuild at the rate the adopted signature was actually made at, not
 			// a feerate that may have been staged (update_fee) but not yet signed.
 			this._state.lastSignedCommitFeeratePerKw =
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
 				getLocalCommitmentFeeRate(this._state);
+			this._state.lastSignedCommitLeaseBlockheight =
+				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
+				getLocalCommitmentLeaseBlockheight(this._state);
 		} else {
 			this._state.needsCommitment = true;
 		}
@@ -7580,6 +8551,28 @@ export class Channel {
 		this._state.fundingConfirmationHeight = 0;
 		this._state.fundingTxIndex = 0;
 
+		// A batch round can be outstanding at the lock: our commitment_signed
+		// pair went out, the peer's revoke_and_ack has not arrived. The generic
+		// reestablish retransmit rebuilds from lastSentCommitmentSigned, which
+		// still holds the OLD funding's signature; promote the cached
+		// splice-side signature (the funding that is current from here on) so a
+		// reconnect retransmits a commitment the peer can verify.
+		if (this._lastSentBatch && this._lastSentBatch.commitments.length === 2) {
+			try {
+				const spliceSigned = decodeCommitmentSignedMessage(
+					this._lastSentBatch.commitments[1]
+				);
+				this._state.lastSentCommitmentSigned = Buffer.from(
+					spliceSigned.signature
+				);
+				this._state.lastSentHtlcSignatures = spliceSigned.htlcSignatures.map(
+					(h) => Buffer.from(h)
+				);
+			} catch {
+				// Undecodable cache: keep the existing material rather than corrupt it.
+			}
+		}
+
 		// Exit quiescence and restore normal operation
 		this._quiescence.exitQuiescence();
 		this._state.quiescenceState = QuiescenceState.NORMAL;
@@ -7592,11 +8585,39 @@ export class Channel {
 		this._resetSpliceDriver();
 	}
 
+	/**
+	 * BOLT 2 quiescence gate: stfu may only be sent (or honored) when no
+	 * UPDATES are pending, i.e. nothing is between "sent" and "irrevocably
+	 * committed by both sides". A fully-committed live HTLC is NOT a pending
+	 * update — rejecting stfu for one (the old behavior) made CLN/eclair
+	 * initiated quiescence (and thus splicing) on any busy channel stall until
+	 * the peer's quiescence timeout disconnected us (S-2.M8).
+	 */
 	private hasPendingHtlcs(): boolean {
+		if (this.needsCommitment()) {
+			return true;
+		}
 		for (const entry of this._state.htlcs.values()) {
+			// An add not yet committed by both sides.
+			if (entry.state === HtlcState.PENDING) {
+				return true;
+			}
+			// A removal in flight: fulfilled/failed entries are deleted once the
+			// removal is fully committed, so their presence means it is not.
 			if (
-				entry.state === HtlcState.PENDING ||
-				entry.state === HtlcState.COMMITTED
+				entry.state === HtlcState.FULFILLED ||
+				entry.state === HtlcState.FAILED
+			) {
+				return true;
+			}
+			// Two-phase flags mid-flight (false = the covering commitment round
+			// has not completed; absent/true = settled).
+			if (
+				entry.addRemoteCommitted === false ||
+				entry.addLocallyRevoked === false ||
+				entry.removalRemoteCommitted === false ||
+				entry.removalLocallyRevoked === false ||
+				entry.commitCoverPending === true
 			) {
 				return true;
 			}
@@ -7951,7 +8972,7 @@ export class Channel {
 		const flen = Buffer.alloc(2);
 		const parts = [
 			flen,
-			BITCOIN_CHAIN_HASH,
+			this.announcementChainHash,
 			this._state.shortChannelId!,
 			nodeId1,
 			nodeId2,
@@ -7995,7 +9016,7 @@ export class Channel {
 				? this._state.remoteAnnouncementBitcoinSig
 				: localBitcoinSig,
 			features: Buffer.alloc(0),
-			chainHash: BITCOIN_CHAIN_HASH,
+			chainHash: this.announcementChainHash,
 			shortChannelId: this._state.shortChannelId!,
 			nodeId1: isNode1 ? localNodeId : remoteNodeId,
 			nodeId2: isNode1 ? remoteNodeId : localNodeId,
@@ -8015,7 +9036,7 @@ export class Channel {
 
 		const channelUpdate = encodeChannelUpdateMessage({
 			signature: Buffer.alloc(64), // placeholder — caller should sign
-			chainHash: BITCOIN_CHAIN_HASH,
+			chainHash: this.announcementChainHash,
 			shortChannelId: this._state.shortChannelId!,
 			timestamp: Math.floor(Date.now() / 1000),
 			messageFlags: 0x01,
@@ -8055,6 +9076,14 @@ export class Channel {
 					message: 'Cannot initiate v2 open: wrong state'
 				}
 			];
+		}
+
+		const v2MaxHtlcErr = validateU64(
+			params.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (v2MaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
 		}
 
 		this._state.fundingVersion = 2;
@@ -8110,6 +9139,17 @@ export class Channel {
 			];
 		}
 
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped (final v2 capacity is unknown here anyway; see
+		// initiateOpen for why clamping is wrong in general). v2 params arrive
+		// separately from the state config, so mirror the value from the BUILT
+		// message into localConfig after the session accepted the open: our
+		// inbound enforcement reads localConfig, and if it were lower than
+		// what we advertised we would reject in-flight totals the peer is
+		// entitled to send.
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			result.message.maxHtlcValueInFlightMsat;
+
 		this._state.dualFundingSession = session;
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
@@ -8133,6 +9173,14 @@ export class Channel {
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected open_channel2' }
 			];
+		}
+
+		const acceptV2MaxHtlcErr = validateU64(
+			localParams.maxHtlcValueInFlightMsat,
+			'max_htlc_value_in_flight_msat'
+		);
+		if (acceptV2MaxHtlcErr) {
+			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
 		}
 
 		this._state.fundingVersion = 2;
@@ -8169,7 +9217,6 @@ export class Channel {
 				)
 			}
 		};
-
 		const session = new DualFundingSession(
 			false,
 			this._state.temporaryChannelId,
@@ -8184,6 +9231,15 @@ export class Channel {
 				}
 			];
 		}
+
+		// max_htlc_value_in_flight_msat is advertised as configured, not
+		// capacity-clamped (a will_fund lease fee can still grow capacity
+		// after this message; see initiateOpen). Mirror the value from the
+		// BUILT accept_channel2 into localConfig after the session accepted
+		// the open, so enforcement matches the advertisement exactly (see
+		// initiateOpenV2).
+		this._state.localConfig.maxHtlcValueInFlightMsat =
+			result.message.maxHtlcValueInFlightMsat;
 
 		this._state.dualFundingSession = session;
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
@@ -8315,20 +9371,19 @@ export class Channel {
 					leasedSats,
 					msg.fundingFeeratePerkw
 				) * 1000n;
-			if (feeMsat > this._state.remoteBalanceMsat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Buyer balance cannot cover the lease fee'
-					}
-				];
-			}
+			// CLN's lease accounting (validated live): the buyer pays the fee
+			// through the FUNDING TX — the funding output totals both
+			// contributions PLUS the fee, our (seller) channel balance is
+			// credited contribution + fee, and the buyer's balance stays its
+			// full contribution. Mirrors the buyer side in handleAcceptChannel2.
+			this._state.fundingSatoshis += feeMsat / 1000n;
 			this._state.localBalanceMsat += feeMsat;
-			this._state.remoteBalanceMsat -= feeMsat;
+			this._state.leaseFeeSats = feeMsat / 1000n;
 			// We are the lessor: our to_local is CSV-locked until the lease expires.
 			this._state.leaseExpiry = computeLeaseExpiry(
 				msg.requestFunds.blockheight
 			);
+			this._state.leaseCommitBlockheight = msg.requestFunds.blockheight;
 			this._state.isLessor = true;
 			// Remember the routing-fee caps we signed: while the lease is active we
 			// MUST NOT advertise a channel_update exceeding them (the buyer paid
@@ -8510,18 +9565,20 @@ export class Channel {
 					}
 				];
 			}
+			// CLN's lease accounting (validated live): the buyer pays the fee
+			// through the FUNDING TRANSACTION — the funding output must total
+			// opener_funds + seller_funds + lease_fee, and the seller's CHANNEL
+			// balance is credited seller_funds + lease_fee while the opener's
+			// balance stays opener_funds. Deducting the fee from the opener's
+			// channel balance instead (the old model) makes both the funding
+			// output and the initial commitment disagree with the seller
+			// ("Insufficiently funded funding tx" tx_abort from CLN).
 			const feeMsat = leaseFeeSat * 1000n;
-			if (feeMsat > this._state.localBalanceMsat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Cannot cover the lease fee from our balance'
-					}
-				];
-			}
-			this._state.localBalanceMsat -= feeMsat;
+			this._state.fundingSatoshis += leaseFeeSat;
 			this._state.remoteBalanceMsat += feeMsat;
+			this._state.leaseFeeSats = leaseFeeSat;
 			this._state.leaseExpiry = computeLeaseExpiry(requestFunds.blockheight);
+			this._state.leaseCommitBlockheight = requestFunds.blockheight;
 		}
 
 		// Auto-funded opens: the interactive-tx negotiation starts with us (the
@@ -8588,22 +9645,69 @@ export class Channel {
 			// shared_input_txid TLV with an empty prevTx; use it so both sides build
 			// the identical transaction. For ordinary inputs the txid comes from the
 			// provided prevTx.
-			const prevTxid = msg.sharedInputTxid
-				? Buffer.from(msg.sharedInputTxid)
-				: msg.prevTx && msg.prevTx.length >= 32
-				? extractTxidFromPrevTx(msg.prevTx)
-				: Buffer.alloc(32);
+			//
+			// The shared input MUST be the channel's own funding outpoint: a
+			// mismatched shared input would make each side sign commitments
+			// against a different splice txid. Fail the negotiation with tx_abort
+			// (the existing channel is unaffected) rather than a channel error.
+			if (msg.sharedInputTxid) {
+				if (
+					!this._state.fundingTxid ||
+					!msg.sharedInputTxid.equals(this._state.fundingTxid) ||
+					msg.prevTxVout !== this._state.fundingOutputIndex
+				) {
+					return [
+						sendMsg(
+							MessageType.TX_ABORT,
+							encodeTxAbortMessage({
+								channelId: this._state.channelId!,
+								data: Buffer.from(
+									'splice shared input does not match the channel funding outpoint',
+									'utf8'
+								)
+							})
+						),
+						...this.abortSplice(
+							'peer splice shared input does not match the channel funding outpoint'
+						)
+					];
+				}
+			}
+			let prevTxid = Buffer.alloc(32);
+			if (msg.sharedInputTxid) {
+				prevTxid = Buffer.from(msg.sharedInputTxid);
+			} else if (msg.prevTx && msg.prevTx.length >= 32) {
+				try {
+					prevTxid = extractTxidFromPrevTx(msg.prevTx);
+				} catch {
+					// Unparseable prev_tx: rejected by the builder's prevtx checks.
+				}
+			}
 			const input: IInteractiveTxInput = {
 				serialId: msg.serialId,
 				prevTxid,
 				prevOutputIndex: msg.prevTxVout,
 				sequence: msg.sequence,
 				prevTx: msg.prevTx,
-				prevTxVout: msg.prevTxVout
+				prevTxVout: msg.prevTxVout,
+				isShared: !!msg.sharedInputTxid
 			};
 			const err = this._spliceSession!.addPeerInput(input);
 			if (err) {
-				return [{ type: ChannelActionType.ERROR, message: err }];
+				// BOLT 2: an invalid tx_add_input fails the NEGOTIATION. For a
+				// splice that means tx_abort + unwind; the channel keeps operating
+				// on the existing funding output.
+				return [
+					sendMsg(
+						MessageType.TX_ABORT,
+						encodeTxAbortMessage({
+							channelId: this._state.channelId!,
+							data: Buffer.from(err, 'utf8')
+						})
+					),
+					...this.abortSplice(err),
+					{ type: ChannelActionType.ERROR, message: `splice aborted: ${err}` }
+				];
 			}
 			return this._driveSplice();
 		}
@@ -8623,7 +9727,7 @@ export class Channel {
 			try {
 				prevTxid = extractTxidFromPrevTx(msg.prevTx);
 			} catch {
-				// Unparseable prev_tx: keep zeros (strict enforcement is S-2.H3).
+				// Unparseable prev_tx: rejected by the builder's prevtx checks.
 			}
 		}
 		const input: IInteractiveTxInput = {
@@ -8645,8 +9749,15 @@ export class Channel {
 			];
 		}
 
-		// Auto-funded opens: peer took its turn — take ours.
-		return this._driveV2Funding();
+		// Our turn. A registered dual-funding contribution (lease selling /
+		// upstream auto-funding) is driven by _driveDualFunding; the local
+		// auto-funded/auto-respond machinery (opener auto-fund, direct-funding
+		// external inputs, plain acceptor) drives via _driveV2Funding. Each
+		// no-ops without its state; a channel only ever arms one of them.
+		return this._dualFundingContribution !== null ||
+			this._dualFundingContribs !== null
+			? this._driveDualFunding()
+			: this._driveV2Funding();
 	}
 
 	/**
@@ -8740,8 +9851,15 @@ export class Channel {
 			];
 		}
 
-		// Auto-funded opens: peer took its turn — take ours.
-		return this._driveV2Funding();
+		// Our turn. A registered dual-funding contribution (lease selling /
+		// upstream auto-funding) is driven by _driveDualFunding; the local
+		// auto-funded/auto-respond machinery (opener auto-fund, direct-funding
+		// external inputs, plain acceptor) drives via _driveV2Funding. Each
+		// no-ops without its state; a channel only ever arms one of them.
+		return this._dualFundingContribution !== null ||
+			this._dualFundingContribs !== null
+			? this._driveDualFunding()
+			: this._driveV2Funding();
 	}
 
 	/**
@@ -8882,6 +10000,214 @@ export class Channel {
 	/**
 	 * Signal tx_complete during interactive TX construction.
 	 */
+	/**
+	 * Register the wallet inputs funding OUR side of a v2 open we ACCEPT (the
+	 * lessor's contribution on a bLIP-0051 lease). The interactive-tx drive
+	 * then contributes them automatically on our turns, and tx_signatures
+	 * signs them via each input's wallet closure.
+	 */
+	setDualFundingContribution(
+		inputs: ISpliceWalletInput[],
+		changeScript: Buffer,
+		contributionSats: bigint,
+		feeratePerKw: number
+	): void {
+		this._dualFundingContribution = {
+			inputs,
+			changeScript,
+			contributionSats,
+			feeratePerKw
+		};
+		this._dualFundingContribs = null;
+		this._dualFundingContribIndex = 0;
+	}
+
+	/**
+	 * Derive the ordered interactive-tx contributions for our acceptor share:
+	 * each wallet input, then a change output (walletTotal - contribution -
+	 * our interactive-tx fee share). BOLT 2: each side pays the feerate over
+	 * the weight of what IT adds — for us that is the P2WPKH inputs and the
+	 * change output (the opener pays for the shared funding output).
+	 */
+	private _computeDualFundingContributions(): string | null {
+		const session = this._state.dualFundingSession;
+		const c = this._dualFundingContribution;
+		if (!session || !c) return 'No dual-funding contribution registered';
+		const initiator = session.isInitiator();
+
+		// P2WPKH input ≈ 272 WU (outpoint+scriptlen+sequence 164 + witness
+		// ~108); P2WPKH output = 124 WU. Reserve a small cushion above that —
+		// the peer's interactive-tx balance check (CLN) estimates our witness
+		// weight before seeing it, and under-reserving fails the negotiation
+		// while a few extra sats simply shrink the change.
+		let weight = 320 * c.inputs.length + 140;
+		// BOLT 2: the initiator additionally pays the feerate over the common
+		// transaction fields (~42 WU) and the shared funding output it
+		// contributes (P2WSH/P2TR output = 172 WU), with the same cushion
+		// rationale as above.
+		if (initiator) weight += 240;
+		const feeSats = spliceFeeSats(weight, c.feeratePerKw);
+
+		let walletTotal = 0n;
+		this._dualFundingContribs = [];
+		this._dualFundingContribIndex = 0;
+		for (const w of c.inputs) {
+			walletTotal += w.value;
+			this._dualFundingContribs.push({
+				kind: 'input',
+				input: {
+					serialId: session.nextSerialId(),
+					prevTxid: extractTxidFromPrevTx(w.prevTx),
+					prevOutputIndex: w.prevOutputIndex,
+					sequence: w.sequence,
+					prevTx: w.prevTx,
+					prevTxVout: w.prevOutputIndex
+				}
+			});
+		}
+
+		// BOLT 2: the initiator adds the shared funding output, sized to the
+		// FULL negotiated capacity — both sides' funding plus any lease fee,
+		// which handleAcceptChannel2 has already folded into fundingSatoshis.
+		if (initiator) {
+			if (!this._state.remoteBasepoints) {
+				return 'Cannot build funding output before accept_channel2';
+			}
+			const taproot = isTaprootChannel(session.getOpenChannelType() ?? null);
+			let fundingSpk: Buffer;
+			if (taproot) {
+				const {
+					createTaprootFundingScript
+				} = require('../script/funding-taproot');
+				fundingSpk = createTaprootFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+				).p2trOutput;
+			} else {
+				const { createFundingScript } = require('../script/funding');
+				fundingSpk = createFundingScript(
+					this._state.localBasepoints.fundingPubkey,
+					this._state.remoteBasepoints.fundingPubkey
+				).p2wshOutput;
+			}
+			this._dualFundingContribs.push({
+				kind: 'output',
+				output: {
+					serialId: session.nextSerialId(),
+					amountSats: this._state.fundingSatoshis,
+					scriptPubkey: fundingSpk
+				}
+			});
+		}
+
+		const changeSats = walletTotal - c.contributionSats - feeSats;
+		if (changeSats < 0n) {
+			return `Dual-funding contribution underfunded: inputs ${walletTotal} < contribution ${c.contributionSats} + fee ${feeSats}`;
+		}
+		// A sub-dust change simply becomes extra fee (mirrors splice-in).
+		if (changeSats > P2WPKH_DUST_LIMIT) {
+			this._dualFundingContribs.push({
+				kind: 'output',
+				output: {
+					serialId: session.nextSerialId(),
+					amountSats: changeSats,
+					scriptPubkey: c.changeScript
+				}
+			});
+		}
+		return null;
+	}
+
+	/**
+	 * Interactive-tx drive for a v2 open with a registered contribution: on
+	 * each of our turns send the next wallet input / funding or change output,
+	 * then tx_complete (re-sent whenever the peer keeps adding, exactly like
+	 * the splice acceptor drive). Works for both roles: the acceptor's share
+	 * is inputs + change (lease selling), the initiator's additionally carries
+	 * the shared funding output. Without a registered contribution this is a
+	 * no-op and the legacy caller-driven flow applies.
+	 */
+	private _driveDualFunding(): ChannelAction[] {
+		const session = this._state.dualFundingSession;
+		if (
+			!session ||
+			!this._dualFundingContribution ||
+			session.getState() !== DualFundingState.TX_NEGOTIATION
+		) {
+			return [];
+		}
+
+		if (!this._dualFundingContribs) {
+			const err = this._computeDualFundingContributions();
+			if (err) return [{ type: ChannelActionType.ERROR, message: err }];
+		}
+
+		if (this._dualFundingContribIndex < this._dualFundingContribs!.length) {
+			const c = this._dualFundingContribs![this._dualFundingContribIndex++];
+			if (c.kind === 'input') {
+				const result = session.addInput(c.input);
+				if (!result.ok) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: result.error || 'Failed to add contribution input'
+						}
+					];
+				}
+				const msg: ITxAddInputMessage = {
+					channelId: this._v2ChannelId(),
+					serialId: c.input.serialId,
+					prevTx: c.input.prevTx || Buffer.alloc(0),
+					prevTxVout: c.input.prevOutputIndex,
+					sequence: c.input.sequence
+				};
+				return [
+					sendMsg(MessageType.TX_ADD_INPUT, encodeTxAddInputMessage(msg))
+				];
+			}
+			const result = session.addOutput(c.output);
+			if (!result.ok) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: result.error || 'Failed to add contribution output'
+					}
+				];
+			}
+			const outMsg: ITxAddOutputMessage = {
+				channelId: this._v2ChannelId(),
+				serialId: c.output.serialId,
+				amountSats: c.output.amountSats,
+				scriptPubkey: c.output.scriptPubkey
+			};
+			return [
+				sendMsg(MessageType.TX_ADD_OUTPUT, encodeTxAddOutputMessage(outMsg))
+			];
+		}
+
+		// Contributions exhausted: (re)send tx_complete whenever the builder is
+		// back in a state where our completion is outstanding.
+		const builderState = session.getTxBuilder()?.getState();
+		if (
+			builderState === InteractiveTxState.COLLECTING ||
+			builderState === InteractiveTxState.RECEIVED_COMPLETE
+		) {
+			return this.sendTxComplete();
+		}
+		return [];
+	}
+
+	/**
+	 * Kick off the INITIATOR's interactive-tx contribution once a contribution
+	 * has been registered (setDualFundingContribution) after accept_channel2.
+	 * BOLT 2: the initiator sends the first tx_add_input, so nothing moves
+	 * until this runs; the peer's replies then pull the rest of the
+	 * contribution out turn by turn via the handleTx* paths.
+	 */
+	beginDualFundingContribution(): ChannelAction[] {
+		return this._driveDualFunding();
+	}
+
 	sendTxComplete(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
@@ -8985,9 +10311,15 @@ export class Channel {
 			return this._maybeSendV2Commitment();
 		}
 
-		// Peer completed but we have not: our turn (auto-funded opens add any
-		// remaining contributions, then complete; manual callers get []).
-		return this._driveV2Funding();
+		// Our turn. A registered dual-funding contribution (lease selling /
+		// upstream auto-funding) is driven by _driveDualFunding; the local
+		// auto-funded/auto-respond machinery (opener auto-fund, direct-funding
+		// external inputs, plain acceptor) drives via _driveV2Funding. Each
+		// no-ops without its state; a channel only ever arms one of them.
+		return this._dualFundingContribution !== null ||
+			this._dualFundingContribs !== null
+			? this._driveDualFunding()
+			: this._driveV2Funding();
 	}
 
 	/**
@@ -9125,7 +10457,10 @@ export class Channel {
 		});
 	}
 
-	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+	private _v2NegotiatedTx(): {
+		tx: import('bitcoinjs-lib').Transaction;
+		outputIndex: number;
+	} | null {
 		const session = this._state.dualFundingSession;
 		if (!session || !this._state.remoteBasepoints) return null;
 		const built = session.buildTransaction();
@@ -9168,7 +10503,16 @@ export class Channel {
 		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
 			return null;
 		}
-		return { txid: Buffer.from(tx.getHash()), outputIndex };
+		return { tx, outputIndex };
+	}
+
+	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+		const built = this._v2NegotiatedTx();
+		if (!built) return null;
+		return {
+			txid: Buffer.from(built.tx.getHash()),
+			outputIndex: built.outputIndex
+		};
 	}
 
 	/**
@@ -9280,6 +10624,8 @@ export class Channel {
 		this._state.lastSignedCommitFeeratePerKw = getLocalCommitmentFeeRate(
 			this._state
 		);
+		this._state.lastSignedCommitLeaseBlockheight =
+			getLocalCommitmentLeaseBlockheight(this._state);
 		this._v2ReceivedCommitment = true;
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
 		// Commitment round complete — release tx_signatures if ordering allows.
@@ -9336,8 +10682,45 @@ export class Channel {
 			return [];
 		}
 		if (!this._v2SentCommitment || !this._v2ReceivedCommitment) return [];
+		// Witnesses go out exactly once; later flushes (e.g. the peer's own
+		// tx_signatures arriving after ours) must not re-provide.
+		if (this._v2TxSigsReleased) return [];
 		const peerSigned = session.getRemoteWitnesses() !== null;
 		if (!peerSigned && !this._v2ShouldSignFirst()) return [];
+
+		if (!this._v2PendingTxSigs && this._dualFundingContribution) {
+			// We contributed wallet inputs (acceptor lease share): sign each via
+			// its wallet closure over the negotiated tx, exactly like splice-in
+			// (buildAndSignSpliceTx), and release them as our tx_signatures.
+			const built = this._v2NegotiatedTx();
+			if (!built) return [];
+			// BIP 341: P2TR wallet inputs sign over ALL prevouts; P2WPKH
+			// closures ignore the extra argument.
+			const prevouts = this._collectPrevouts(
+				built.tx,
+				session.getTxBuilder()?.getInputs() ?? []
+			);
+			if (!prevouts) return [];
+			const witnesses: Buffer[][] = [];
+			for (let i = 0; i < built.tx.ins.length; i++) {
+				const prevTxid = Buffer.from(built.tx.ins[i].hash);
+				const vout = built.tx.ins[i].index;
+				const w = this._dualFundingContribution.inputs.find(
+					(wi) =>
+						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+						wi.prevOutputIndex === vout
+				);
+				if (!w) continue;
+				const witness = w.signWitness(built.tx, i, w.value, prevouts);
+				built.tx.setWitness(i, witness);
+				witnesses.push(witness);
+			}
+			this._v2PendingTxSigs = {
+				txid: Buffer.from(built.tx.getHash()),
+				outputIndex: built.outputIndex,
+				witnesses
+			};
+		}
 
 		// A side that contributed no inputs has nothing to sign: auto-fill an
 		// empty witness set so a zero-contribution acceptor needs no wallet.
@@ -9367,6 +10750,7 @@ export class Channel {
 			];
 		}
 		this._v2PendingTxSigs = null;
+		this._v2TxSigsReleased = true;
 
 		// Funding info was already set when the commitment round started; keep
 		// the assignment idempotent for callers that reached here another way.
@@ -9579,12 +10963,69 @@ export class Channel {
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
+			// When WE contributed inputs (lease selling) both witness sets are
+			// now in hand: assemble and broadcast the funding tx ourselves
+			// (mirrors the splice path; the opener usually broadcasts too, and
+			// a duplicate broadcast is harmless).
+			if (this._dualFundingContribution) {
+				const assembled = this._assembleV2FundingTx();
+				if (assembled) {
+					actions.push({
+						type: ChannelActionType.BROADCAST_TX,
+						tx: assembled
+					});
+				}
+			}
 		}
 
 		// Both signature sets known → put the funding tx on the network.
 		actions.push(...this._broadcastV2FundingIfReady());
 
 		return actions;
+	}
+
+	/**
+	 * Assemble the fully-signed v2 funding tx: our wallet witnesses (re-signed
+	 * via the wallet closures) on our inputs, the peer's tx_signatures
+	 * witnesses on theirs (both in ascending-serial input order).
+	 */
+	private _assembleV2FundingTx(): Buffer | null {
+		const session = this._state.dualFundingSession;
+		const c = this._dualFundingContribution;
+		if (!session || !c) return null;
+		const built = this._v2NegotiatedTx();
+		if (!built) return null;
+		const builder = session.getTxBuilder();
+		if (!builder) return null;
+		const sorted = [...builder.getInputs()].sort((a, b) =>
+			a.serialId < b.serialId ? -1 : 1
+		);
+		if (sorted.length !== built.tx.ins.length) return null;
+		// BIP 341: P2TR wallet inputs sign over ALL prevouts.
+		const prevouts = this._collectPrevouts(built.tx, sorted);
+		if (!prevouts) return null;
+		const remote = session.getRemoteWitnesses() ?? [];
+		let r = 0;
+		for (let i = 0; i < built.tx.ins.length; i++) {
+			// BOLT 2: initiator uses even serial ids, the acceptor odd.
+			const ourInput =
+				(sorted[i].serialId % 2n === 0n) === session.isInitiator();
+			if (ourInput) {
+				const prevTxid = Buffer.from(built.tx.ins[i].hash);
+				const vout = built.tx.ins[i].index;
+				const w = c.inputs.find(
+					(wi) =>
+						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+						wi.prevOutputIndex === vout
+				);
+				if (!w) return null;
+				built.tx.setWitness(i, w.signWitness(built.tx, i, w.value, prevouts));
+			} else {
+				if (r >= remote.length) return null;
+				built.tx.setWitness(i, remote[r++]);
+			}
+		}
+		return built.tx.toBuffer();
 	}
 
 	/**
@@ -9626,6 +11067,23 @@ export class Channel {
 	 * Handle tx_init_rbf from peer (acceptor side).
 	 */
 	handleTxInitRbf(msg: ITxInitRbfMessage): ChannelAction[] {
+		// BOLT 2: the receiver of tx_init_rbf MUST respond with tx_ack_rbf or
+		// tx_abort. A splice uses _spliceSession, not a dual-funding session;
+		// we do not support RBF of a splice yet, so refuse it properly with
+		// tx_abort (the channel itself is unaffected) instead of a generic
+		// error the peer cannot interpret.
+		if (this._spliceSession && !this._spliceSession.isComplete()) {
+			return [
+				sendMsg(
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: this._state.channelId ?? msg.channelId,
+						data: Buffer.from('splice RBF not supported', 'utf8')
+					})
+				)
+			];
+		}
+
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			return [
@@ -9635,7 +11093,16 @@ export class Channel {
 
 		const result = session.handleRbf(msg.feerate, msg.locktime);
 		if (!result.ok) {
+			// Spec-conformant refusal: tx_abort with the reason, plus the
+			// app-level error for observability.
 			return [
+				sendMsg(
+					MessageType.TX_ABORT,
+					encodeTxAbortMessage({
+						channelId: this._v2ChannelId(),
+						data: Buffer.from(result.error || 'Failed to handle RBF', 'utf8')
+					})
+				),
 				{
 					type: ChannelActionType.ERROR,
 					message: result.error || 'Failed to handle RBF'
@@ -9698,8 +11165,22 @@ export class Channel {
 
 		// A splice tx_abort unwinds the splice and returns the channel to normal
 		// operation (the existing channel is unaffected), rather than erroring it.
+		// BOLT 2: a node receiving tx_abort that has not itself sent one MUST
+		// echo tx_abort back — the peer treats the echo as the ack that both
+		// sides have forgotten the transaction.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
-			return this.abortSplice('peer sent tx_abort');
+			const echo = this._state.channelId
+				? [
+						sendMsg(
+							MessageType.TX_ABORT,
+							encodeTxAbortMessage({
+								channelId: this._state.channelId,
+								data: Buffer.alloc(0)
+							})
+						)
+				  ]
+				: [];
+			return [...echo, ...this.abortSplice('peer sent tx_abort')];
 		}
 
 		const session = this._state.dualFundingSession;
@@ -9724,7 +11205,17 @@ export class Channel {
 
 		session.abort();
 		this._state.state = ChannelState.ERRORED;
-		return [];
+		// Echo the tx_abort (BOLT 2 ack) — we had an active session and had not
+		// sent tx_abort ourselves.
+		return [
+			sendMsg(
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: this._v2ChannelId(),
+					data: Buffer.alloc(0)
+				})
+			)
+		];
 	}
 }
 

@@ -209,13 +209,18 @@ function setupForwarding(bobStorage?: SqliteStorage): IForwardSetup {
 	bob.registerChannelScid(bcChannelId, scidBC);
 	alice.registerChannelScid(abChannelId, scidAB);
 	// SCID aliases on both BC sides so Bob's policy update reaches Charlie and
-	// the invoice hint names the channel Bob forwards over
-	bob.getChannelManager().getChannel(bcChannelId)!.getFullState().scidAlias =
-		scidBC;
+	// the invoice hint names the channel Bob forwards over. Both are
+	// remoteScidAlias: BOLT 7 has Bob address his direct channel_update with an
+	// alias RECEIVED from the peer, and BOLT 2 has Charlie's invoice hint name the
+	// alias Bob generated. Bob resolves scidBC via the registerChannelScid above.
+	bob
+		.getChannelManager()
+		.getChannel(bcChannelId)!
+		.getFullState().remoteScidAlias = scidBC;
 	charlie
 		.getChannelManager()
 		.getChannel(bcChannelId)!
-		.getFullState().scidAlias = scidBC;
+		.getFullState().remoteScidAlias = scidBC;
 
 	addGraphChannel(alice, scidAB, nodePubkey(1), nodePubkey(2));
 

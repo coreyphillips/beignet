@@ -4,6 +4,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import {
 	Channel,
 	createOpenerChannel
@@ -28,12 +29,14 @@ import {
 
 function makeBasepoints(): IChannelBasepoints {
 	return {
-		fundingPubkey: crypto.randomBytes(33),
-		revocationBasepoint: crypto.randomBytes(33),
-		paymentBasepoint: crypto.randomBytes(33),
-		delayedPaymentBasepoint: crypto.randomBytes(33),
-		htlcBasepoint: crypto.randomBytes(33),
-		firstPerCommitmentPoint: crypto.randomBytes(33)
+		// Real curve points: open/accept validation now rejects off-curve
+		// basepoints (BOLT 2 LOW hardening).
+		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
+		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
+		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
+		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
 
@@ -498,7 +501,6 @@ describe('Channel Announcements (Phase 6)', function () {
 			const { opener } = setupNormalChannels();
 			const { nodeId1, nodeId2 } = makeOrderedNodeIds();
 			const { ChannelSigner } = require('../../src/lightning/keys/signer');
-			const { getPublicKey } = require('../../src/lightning/crypto/ecdh');
 			const ecc = require('@bitcoinerlab/secp256k1');
 
 			// Real funding keypair + signer on the channel (the announcement

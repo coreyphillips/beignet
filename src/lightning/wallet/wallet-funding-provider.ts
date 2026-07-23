@@ -119,6 +119,18 @@ export interface IWalletLike {
 		broadcast?: boolean;
 		shuffleOutputs?: boolean;
 	}): Promise<IResult>;
+	/**
+	 * Sweep the whole spendable balance to `address` (no change output). Used to
+	 * fund a "max" channel: the funding output then equals inputs minus fee, which
+	 * is exactly the amount the sweep quote computed, so it matches the committed
+	 * funding_satoshis. Optional so minimal/legacy wallets can omit it; a max
+	 * funding request against a wallet without it is rejected rather than guessed.
+	 */
+	sendMax?(params: {
+		address: string;
+		satsPerByte?: number;
+		broadcast?: boolean;
+	}): Promise<IResult>;
 	electrum: {
 		broadcastTransaction(params: {
 			rawTx: string;
@@ -248,26 +260,48 @@ export class WalletFundingProvider implements IFundingProvider {
 	async buildFundingTransaction(
 		address: string,
 		amountSats: bigint,
-		satsPerByte?: number
+		satsPerByte?: number,
+		max = false
 	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }> {
-		const sendParams: {
-			address: string;
-			amount: number;
-			broadcast: boolean;
-			shuffleOutputs: boolean;
-			satsPerByte?: number;
-		} = {
-			address,
-			amount: Number(amountSats),
-			broadcast: false,
-			shuffleOutputs: true
-		};
-		if (satsPerByte !== undefined) {
-			sendParams.satsPerByte = satsPerByte;
-		}
-
+		// Refresh pledges BEFORE coin selection: expired/spent freezes must be
+		// lifted and live ones enforced when the wallet picks inputs.
 		await this.prunePledges();
-		const result = await this.wallet.send(sendParams);
+		let result: IResult;
+		if (max) {
+			// A max channel sweeps the whole balance into the funding output. Funding
+			// it as a fixed-amount send instead adds a change output whose fee the
+			// swept balance cannot cover, so the fixed path fails at the exact max
+			// ("New total amount exceeds the available balance"). Sweeping produces a
+			// no-change tx whose output is inputs minus fee, i.e. the amount the
+			// caller already committed as funding_satoshis.
+			if (!this.wallet.sendMax) {
+				throw new Error(
+					'Wallet does not support max funding (sendMax unavailable)'
+				);
+			}
+			result = await this.wallet.sendMax({
+				address,
+				broadcast: false,
+				...(satsPerByte !== undefined ? { satsPerByte } : {})
+			});
+		} else {
+			const sendParams: {
+				address: string;
+				amount: number;
+				broadcast: boolean;
+				shuffleOutputs: boolean;
+				satsPerByte?: number;
+			} = {
+				address,
+				amount: Number(amountSats),
+				broadcast: false,
+				shuffleOutputs: true
+			};
+			if (satsPerByte !== undefined) {
+				sendParams.satsPerByte = satsPerByte;
+			}
+			result = await this.wallet.send(sendParams);
+		}
 		if (result.isErr()) {
 			throw new Error(
 				`Wallet send failed: ${(result as IResultErr).error.message}`
@@ -300,6 +334,28 @@ export class WalletFundingProvider implements IFundingProvider {
 
 		if (outputIndex === -1) {
 			throw new Error('Funding output not found in transaction');
+		}
+
+		// The commitment is built against the committed funding_satoshis, so the
+		// on-chain funding output must equal it exactly — for EVERY open, not
+		// just max sweeps. A max sweep is priced from the same balance and rate
+		// as the amount already committed, so a mismatch means the balance
+		// drifted between quote and funding. A fixed-amount send can also come
+		// back short: near the balance ceiling the wallet quietly reduces the
+		// amount instead of failing when amount + fee exceeds the balance
+		// (observed live: 499170 requested, 499004 funded, no change output).
+		// Signing a commitment against a short output produces a channel whose
+		// funding the peer's on-chain check rejects; failing here instead
+		// aborts the open cleanly.
+		const fundedValue = tx.outs[outputIndex].value;
+		if (fundedValue !== Number(amountSats)) {
+			throw new Error(
+				`Funding output (${fundedValue} sats) does not match committed funding amount (${amountSats} sats); ${
+					max
+						? 'on-chain balance changed since the amount was quoted'
+						: 'the wallet altered the send amount (likely insufficient balance for amount + fee)'
+				}`
+			);
 		}
 
 		// getHash() returns txid in internal byte order (per BOLT 2)
@@ -374,6 +430,63 @@ export class WalletFundingProvider implements IFundingProvider {
 				) +
 				P2WPKH_DUST_LIMIT
 		);
+	}
+
+	/**
+	 * The UTXOs a splice-in (or fee bump) may spend: P2WPKH only, since the
+	 * signing recipe in gatherWalletInputs is P2WPKH-specific. Confirmed before
+	 * unconfirmed, then largest first within each group.
+	 */
+	private spendableP2wpkhUtxos(): ISpliceUtxo[] {
+		if (!this.wallet.listUtxos) return [];
+		const network = this.bitcoinJsNetwork();
+		const candidates = this.wallet.listUtxos().filter((u) => {
+			try {
+				return bitcoin.address.toOutputScript(u.address, network).length === 22;
+			} catch {
+				return false;
+			}
+		});
+		candidates.sort((a, b) => {
+			const aConf = a.height > 0 ? 0 : 1;
+			const bConf = b.height > 0 ? 0 : 1;
+			if (aConf !== bConf) return aConf - bConf;
+			return b.value - a.value;
+		});
+		return candidates;
+	}
+
+	/**
+	 * Price a splice-in without performing one: what the wallet could add to a
+	 * channel at this feerate. Uses the SAME UTXO filter and weight formula as
+	 * selectSpliceInputs, so the quoted maximum is an amount the selection will
+	 * actually fund rather than a guess reconstructed in a UI. The maximum
+	 * sweeps every spendable UTXO; the change output the weight includes is
+	 * dropped as dust by the channel, a slight, safe overestimate of the fee.
+	 */
+	quoteSpliceIn(feeratePerKw: number): {
+		spendableSats: bigint;
+		feeSats: bigint;
+		maxAmountSats: bigint;
+		inputCount: number;
+	} {
+		const candidates = this.spendableP2wpkhUtxos();
+		const spendableSats = candidates.reduce((s, u) => s + BigInt(u.value), 0n);
+		const feeSats = spliceFeeSats(
+			estimateSpliceTxWeight({
+				walletInputCount: Math.max(1, candidates.length),
+				changeScriptLen: 22
+			}),
+			feeratePerKw
+		);
+		const maxAmountSats =
+			spendableSats > feeSats ? spendableSats - feeSats : 0n;
+		return {
+			spendableSats,
+			feeSats,
+			maxAmountSats,
+			inputCount: candidates.length
+		};
 	}
 
 	/**

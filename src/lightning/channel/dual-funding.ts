@@ -29,6 +29,18 @@ import {
 import { IChannelBasepoints } from '../keys/derivation';
 import { ILeaseRates } from '../gossip/types';
 
+/**
+ * BOLT 2: the minimum feerate for an RBF attempt is 25/24 of the previous
+ * funding feerate. At tiny feerates the 25/24 ratio rounds down to the
+ * previous value, so the floor is never below a strict +1 increase.
+ */
+export function rbfFeerateFloor(previousFeeratePerkw: number): number {
+	return Math.max(
+		Math.floor((previousFeeratePerkw * 25) / 24),
+		previousFeeratePerkw + 1
+	);
+}
+
 /** Dual-funding session states */
 export enum DualFundingState {
 	/** Initial state before open_channel2 sent/received */
@@ -390,7 +402,9 @@ export class DualFundingSession {
 			firstPerCommitmentPoint:
 				localParams.localBasepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: localParams.secondPerCommitmentPoint,
-			channelType: localParams.channelType,
+			// BOLT 2: the accepter echoes the channel_type it is accepting. CLN
+			// REQUIRES the echo (and refuses a lease without one).
+			channelType: localParams.channelType ?? msg.channelType,
 			willFund: localParams.willFund
 		};
 
@@ -744,10 +758,16 @@ export class DualFundingSession {
 			return { ok: false, error: 'Cannot initiate RBF: wrong state' };
 		}
 
-		// Fee rate must increase
+		// BOLT 2: the RBF feerate MUST be at least 25/24 of the previous funding
+		// feerate (a strict increase alone allows 1 sat/kw bumps that never
+		// improve the replacement's mempool position).
 		const currentFeerate = this._localParams?.fundingFeeratePerkw ?? 0;
-		if (newFeeratePerkw <= currentFeerate) {
-			return { ok: false, error: 'RBF fee rate must be higher than current' };
+		const minRbfFeerate = rbfFeerateFloor(currentFeerate);
+		if (newFeeratePerkw < minRbfFeerate) {
+			return {
+				ok: false,
+				error: `RBF fee rate ${newFeeratePerkw} below the 25/24 floor ${minRbfFeerate}`
+			};
 		}
 
 		const locktime = newLocktime ?? this._localParams?.locktime ?? 0;
@@ -784,10 +804,14 @@ export class DualFundingSession {
 			return { ok: false, error: 'Cannot handle RBF: wrong state' };
 		}
 
-		// Fee rate must increase
+		// BOLT 2: the RBF feerate MUST be at least 25/24 of the previous one.
 		const currentFeerate = this._remoteParams?.fundingFeeratePerkw ?? 0;
-		if (feerate <= currentFeerate) {
-			return { ok: false, error: 'RBF fee rate must be higher than current' };
+		const minRbfFeerate = rbfFeerateFloor(currentFeerate);
+		if (feerate < minRbfFeerate) {
+			return {
+				ok: false,
+				error: `RBF fee rate ${feerate} below the 25/24 floor ${minRbfFeerate}`
+			};
 		}
 
 		// Reset TX builder

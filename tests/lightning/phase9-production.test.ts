@@ -153,7 +153,7 @@ describe('Phase 9: Production Wiring', function () {
 			pm.destroy();
 		});
 
-		it('should reject duplicate inbound connections', async function () {
+		it('should replace an existing connection on duplicate inbound (newest wins)', async function () {
 			this.timeout(10_000);
 			const serverKey = crypto.randomBytes(32);
 			const pm = new PeerManager({
@@ -168,6 +168,7 @@ describe('Phase 9: Production Wiring', function () {
 			// getPublicKey imported at top
 			const serverPubkey = getPublicKey(serverKey);
 			const clientKey = crypto.randomBytes(32);
+			const clientPubkey = getPublicKey(clientKey).toString('hex');
 
 			// First connection
 			const client1 = new Peer({
@@ -183,8 +184,12 @@ describe('Phase 9: Production Wiring', function () {
 			});
 			await client1.connect();
 			await firstConnect;
+			const oldPeer = pm.getPeer(clientPubkey);
+			expect(oldPeer).to.exist;
 
-			// Second connection with same key — should be rejected
+			// Second connection with the same key while the first is still held:
+			// simulates a peer re-dialing after its side of the connection died
+			// (e.g. a collapsed Tor circuit) before our pong timeout fires.
 			const client2 = new Peer({
 				localPrivateKey: clientKey,
 				remotePublicKey: serverPubkey,
@@ -193,12 +198,31 @@ describe('Phase 9: Production Wiring', function () {
 				localFeatures: FeatureFlags.empty()
 			});
 
-			// Wait briefly for the second connection attempt to be processed
+			// The replacement must emit peer:disconnect (old) before
+			// peer:connect (new) so channels are marked AWAITING_REESTABLISH
+			// before reestablish is re-driven over the new connection.
+			const events: string[] = [];
+			pm.on('peer:disconnect', () => events.push('disconnect'));
+			pm.on('peer:connect', () => events.push('connect'));
+			const secondConnect = new Promise<void>((resolve) => {
+				pm.once('peer:connect', () => resolve());
+			});
 			await client2.connect();
-			await new Promise((r) => setTimeout(r, 200));
+			await secondConnect;
 
-			// Should still have only one peer
+			expect(events).to.deep.equal(['disconnect', 'connect']);
+
+			// Exactly one peer remains and it is the new connection.
 			expect(pm.listPeers().length).to.equal(1);
+			expect(pm.getPeer(clientPubkey)).to.exist;
+			expect(pm.getPeer(clientPubkey)).to.not.equal(oldPeer);
+			expect((pm as any).inboundPeerCount).to.equal(1);
+
+			// The old peer's late socket 'close' must not evict the replacement.
+			await new Promise((r) => setTimeout(r, 200));
+			expect(pm.listPeers().length).to.equal(1);
+			expect(pm.getPeer(clientPubkey)).to.not.equal(oldPeer);
+			expect((pm as any).inboundPeerCount).to.equal(1);
 
 			client1.disconnect();
 			client2.disconnect();

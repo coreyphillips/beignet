@@ -26,7 +26,10 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	ChannelState,
+	HtlcDirection,
+	HtlcState
 } from '../../src/lightning/channel/types';
 import {
 	IChannelAnnouncementMessage,
@@ -1018,6 +1021,128 @@ describe('Crash-Safe State Persistence', function () {
 
 			alice.destroy();
 			bob.destroy();
+		});
+	});
+
+	describe('Stranded received HTLC replay on restore', function () {
+		// HTLC_FORWARDED is dispatched once per HTLC and the marker making it
+		// once-only is persisted, so a crash between the dispatch and the node-side
+		// handling would leave the HTLC committed with nothing left to act on it.
+		// restoreFromStorage re-dispatches those, and only those.
+		function strandOneHtlc(
+			storage: MockStorage,
+			channelId: Buffer,
+			forwardEmitted: boolean
+		): void {
+			const stored = storage.channels.get(channelId.toString('hex'));
+			expect(stored, 'expected the channel to have been persisted').to.exist;
+			stored!.state.htlcs.set('received-0', {
+				id: 0n,
+				amountMsat: 100_000n,
+				paymentHash: crypto.randomBytes(32),
+				cltvExpiry: 800_000,
+				onionRoutingPacket: Buffer.alloc(1366),
+				direction: HtlcDirection.RECEIVED,
+				state: HtlcState.COMMITTED,
+				...(forwardEmitted ? { forwardEmitted: true } : {})
+			});
+		}
+
+		// A restored channel comes back in AWAITING_REESTABLISH and can send
+		// nothing. Stand in for a completed reconnect: put it back in NORMAL and
+		// fire the channel:ready the reestablish would have produced.
+		function reconnect(node: LightningNode, channelId: Buffer): void {
+			const channel = node.getChannelManager().getChannel(channelId);
+			expect(channel, 'expected the channel to have been restored').to.exist;
+			channel!.getFullState().state = ChannelState.NORMAL;
+			node.getChannelManager().emit('channel:ready', channelId);
+		}
+
+		function receivedHtlcState(
+			node: LightningNode,
+			channelId: Buffer
+		): string | undefined {
+			return node
+				.getChannelManager()
+				.getChannel(channelId)
+				?.getFullState()
+				.htlcs.get('received-0')?.state;
+		}
+
+		it('acts on a committed received HTLC that was dispatched but never handled', function () {
+			const storage = new MockStorage();
+			const alice = createTestNodeWithId(1);
+			const bob = createTestNodeWithId(2, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+
+			bob.destroy();
+			strandOneHtlc(storage, channelId, true);
+
+			const bob2 = createTestNodeWithId(2, storage);
+			bob2.on('node:error', () => {});
+			reconnect(bob2, channelId);
+
+			// The onion is unpeelable, so the node fails it back. What matters is
+			// that it acted at all: without the replay the entry stays COMMITTED
+			// forever, because handleRevokeAndAck will never re-emit it and the
+			// forward sweeper skips a received HTLC that has no outgoing leg.
+			expect(receivedHtlcState(bob2, channelId)).to.not.equal(
+				HtlcState.COMMITTED
+			);
+
+			bob2.destroy();
+			alice.destroy();
+		});
+
+		it('leaves alone an HTLC whose forward is already in flight', function () {
+			const storage = new MockStorage();
+			const alice = createTestNodeWithId(1);
+			const bob = createTestNodeWithId(2, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+
+			bob.destroy();
+			strandOneHtlc(storage, channelId, true);
+
+			// A restored forward mapping means the outgoing leg went out before the
+			// crash. Re-dispatching would offer a second outgoing HTLC for one
+			// inbound payment, which is the duplication the marker exists to stop.
+			storage.forwardedHtlcs.set(
+				`${crypto.randomBytes(32).toString('hex')}:offered-0`,
+				{ inChannelId: channelId, inHtlcId: 0n }
+			);
+
+			const bob2 = createTestNodeWithId(2, storage);
+			bob2.on('node:error', () => {});
+			reconnect(bob2, channelId);
+
+			expect(receivedHtlcState(bob2, channelId)).to.equal(HtlcState.COMMITTED);
+
+			bob2.destroy();
+			alice.destroy();
+		});
+
+		it('leaves alone an HTLC that was never dispatched', function () {
+			const storage = new MockStorage();
+			const alice = createTestNodeWithId(1);
+			const bob = createTestNodeWithId(2, storage);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+
+			bob.destroy();
+			// No forwardEmitted marker: handleRevokeAndAck still owes it a dispatch,
+			// so the replay must not pre-empt it.
+			strandOneHtlc(storage, channelId, false);
+
+			const bob2 = createTestNodeWithId(2, storage);
+			bob2.on('node:error', () => {});
+			reconnect(bob2, channelId);
+
+			expect(receivedHtlcState(bob2, channelId)).to.equal(HtlcState.COMMITTED);
+
+			bob2.destroy();
+			alice.destroy();
 		});
 	});
 });

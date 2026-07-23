@@ -58,6 +58,22 @@ import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 
 // ─────────────── Helpers ───────────────
 
+/**
+ * A minimal VALID previous transaction paying `valueSats` to a P2WPKH at
+ * vout 0, for peer tx_add_input fixtures (S-2.H3: the receive side now
+ * enforces prevtx validity + native-segwit spends).
+ */
+function makePeerPrevTx(valueSats = 100_000): Buffer {
+	const tx = new bitcoin.Transaction();
+	tx.version = 2;
+	tx.addInput(crypto.randomBytes(32), 0);
+	tx.addOutput(
+		bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!,
+		valueSats
+	);
+	return tx.toBuffer();
+}
+
 function makeBasepoints(): IChannelBasepoints {
 	const privkey = crypto.randomBytes(32);
 	const pub = getPublicKey(privkey);
@@ -655,7 +671,9 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 					serialId: 1n, // odd = acceptor
 					prevTxid: crypto.randomBytes(32),
 					prevOutputIndex: 0,
-					sequence: 0xfffffffd
+					sequence: 0xfffffffd,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0
 				});
 
 				expect(result.ok).to.be.true;
@@ -719,7 +737,9 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 					serialId: 1n,
 					prevTxid: crypto.randomBytes(32),
 					prevOutputIndex: 0,
-					sequence: 0xfffffffd
+					sequence: 0xfffffffd,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0
 				});
 
 				const result = opener.removePeerInput(1n);
@@ -951,7 +971,16 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				const { opener } = makeRbfReadySession();
 				const result = opener.initiateRbf(500);
 				expect(result.ok).to.be.false;
-				expect(result.error).to.contain('higher');
+				expect(result.error).to.contain('25/24 floor');
+			});
+
+			it('should reject a fee rate above current but below the 25/24 floor', () => {
+				// BOLT 2: RBF requires >= 25/24 of the previous feerate, not a
+				// bare strict increase. 1040 > 1000 but < floor(1000 * 25 / 24).
+				const { opener } = makeRbfReadySession();
+				const result = opener.initiateRbf(1040);
+				expect(result.ok).to.be.false;
+				expect(result.error).to.contain('25/24 floor');
 			});
 
 			it('should reject equal fee rate', () => {
@@ -1418,8 +1447,19 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2(params);
 
-			channel.handleTxAbort();
+			const actions = channel.handleTxAbort();
 			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			// BOLT 2: the receiver of tx_abort MUST echo tx_abort back as the
+			// ack when it has not itself sent one.
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType: MessageType }).messageType ===
+							MessageType.TX_ABORT
+				),
+				'tx_abort echoed'
+			).to.be.true;
 		});
 
 		it('should handle RBF initiation', () => {

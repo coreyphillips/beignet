@@ -2,7 +2,10 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import net from 'net';
 import { Peer } from '../../src/lightning/transport/peer';
-import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import {
+	PeerManager,
+	isPrivateOrLoopbackHost
+} from '../../src/lightning/transport/peer-manager';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
 describe('SOCKS5 Proxy Support', function () {
@@ -109,6 +112,48 @@ describe('SOCKS5 Proxy Support', function () {
 		});
 	});
 
+	describe('isPrivateOrLoopbackHost', function () {
+		it('Classifies loopback and localhost as private', function () {
+			for (const h of ['localhost', '127.0.0.1', '127.5.6.7', '::1', '[::1]']) {
+				expect(isPrivateOrLoopbackHost(h), h).to.be.true;
+			}
+		});
+
+		it('Classifies RFC1918 and link-local ranges as private', function () {
+			for (const h of [
+				'10.0.0.1',
+				'10.21.21.200',
+				'172.16.0.1',
+				'172.31.255.254',
+				'192.168.4.20',
+				'169.254.1.1',
+				'0.0.0.0',
+				'fe80::1',
+				'fd00::1',
+				'::ffff:192.168.1.2'
+			]) {
+				expect(isPrivateOrLoopbackHost(h), h).to.be.true;
+			}
+		});
+
+		it('Classifies public addresses and hostnames as not private', function () {
+			for (const h of [
+				'8.8.8.8',
+				'1.2.3.4',
+				'84.21.100.4',
+				'172.32.0.1', // just outside 172.16.0.0/12
+				'172.15.0.1', // just below it
+				'193.168.0.1', // not 192.168
+				'ln.acinq.co',
+				'clearnet.example.com',
+				'abc123.onion',
+				'2001:4860:4860::8888'
+			]) {
+				expect(isPrivateOrLoopbackHost(h), h).to.be.false;
+			}
+		});
+	});
+
 	describe('PeerManager with socks5Proxy', function () {
 		it('Should use explicit socks5Proxy for all connections', async function () {
 			// Fail fast and deterministically: this connects to a (normally absent)
@@ -139,6 +184,82 @@ describe('SOCKS5 Proxy Support', function () {
 			}
 
 			pm.destroy();
+		});
+
+		it('Should dial private/LAN peers directly, bypassing the proxy', async function () {
+			// A configured proxy must NOT be used for a private address: Tor rejects
+			// those, so a LAN channel peer would otherwise be unreachable the moment
+			// Tor is enabled. Prove it by pointing the proxy at a server that flags
+			// any contact, then dialing a private target and asserting it was never
+			// touched (the dial goes straight to the dead target port instead).
+			this.timeout(5000);
+			let proxyContacted = false;
+			const proxy = net.createServer((s) => {
+				proxyContacted = true;
+				s.destroy();
+			});
+			await new Promise<void>((resolve) =>
+				proxy.listen(0, '127.0.0.1', resolve)
+			);
+			const proxyPort = (proxy.address() as net.AddressInfo).port;
+
+			const localKey = crypto.randomBytes(32);
+			const remotePub = getPublicKey(crypto.randomBytes(32));
+			const pm = new PeerManager({
+				localPrivateKey: localKey,
+				socks5Proxy: { host: '127.0.0.1', port: proxyPort },
+				socks5TimeoutMs: 500
+			});
+
+			try {
+				// Port 1 is closed, so a direct dial fails fast with ECONNREFUSED.
+				await pm.connectPeer(remotePub.toString('hex'), '127.0.0.1', 1);
+				expect.fail('Should have thrown');
+			} catch (err) {
+				expect((err as Error).message).to.include('ECONNREFUSED');
+			}
+
+			expect(proxyContacted, 'proxy should not be contacted for a private host')
+				.to.be.false;
+
+			pm.destroy();
+			await new Promise<void>((resolve) => proxy.close(() => resolve()));
+		});
+
+		it('Should still route public clearnet peers through the proxy', async function () {
+			// The privacy path stays intact: a public address with a proxy set goes
+			// through it. Same flag server, but this time we expect it contacted.
+			this.timeout(5000);
+			let proxyContacted = false;
+			const proxy = net.createServer((s) => {
+				proxyContacted = true;
+				s.destroy();
+			});
+			await new Promise<void>((resolve) =>
+				proxy.listen(0, '127.0.0.1', resolve)
+			);
+			const proxyPort = (proxy.address() as net.AddressInfo).port;
+
+			const localKey = crypto.randomBytes(32);
+			const remotePub = getPublicKey(crypto.randomBytes(32));
+			const pm = new PeerManager({
+				localPrivateKey: localKey,
+				socks5Proxy: { host: '127.0.0.1', port: proxyPort },
+				socks5TimeoutMs: 500
+			});
+
+			try {
+				await pm.connectPeer(remotePub.toString('hex'), '93.184.216.34', 9735);
+			} catch {
+				// The flag server speaks no SOCKS, so negotiation fails, which is fine.
+				// The point is that the dial was aimed at the proxy at all.
+			}
+
+			expect(proxyContacted, 'proxy should be contacted for a public host').to
+				.be.true;
+
+			pm.destroy();
+			await new Promise<void>((resolve) => proxy.close(() => resolve()));
 		});
 
 		it('Should auto-detect .onion and route through default Tor proxy', async function () {

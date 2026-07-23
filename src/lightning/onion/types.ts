@@ -16,6 +16,13 @@ export interface IHopPayload {
 	encryptedRecipientData?: Buffer;
 	/** TLV type 12: blinding_point (33-byte ephemeral key for blinded hops) */
 	blindingPoint?: Buffer;
+	/**
+	 * TLV type 18: total_amount_msat — REQUIRED on the FINAL hop of a blinded
+	 * payment path (payment_data/payment_secret is not used there; the
+	 * encrypted path_id authenticates instead). CLN fails the HTLC with
+	 * invalid_onion_payload when it is missing.
+	 */
+	totalAmountMsat?: bigint;
 	/** Custom TLV records (e.g. keysend preimage at type 5482373484) */
 	customRecords?: Map<number, Buffer>;
 	/**
@@ -88,4 +95,10 @@ export const EXPIRY_TOO_FAR = 21;
 export const CHANNEL_DISABLED = 0x1000 | 20;
 export const PERMANENT_NODE_FAILURE = 0x4000 | 0x2000 | 2;
 export const PERMANENT_CHANNEL_FAILURE = 0x4000 | 0x1000 | 8;
+/**
+ * BOLT 4 PERM|9. Note this describes the OUTGOING channel of the erring node,
+ * like permanent_channel_failure, but unlike it carries no UPDATE flag, so it
+ * cannot be classified as channel-scoped by that flag alone.
+ */
+export const REQUIRED_CHANNEL_FEATURE_MISSING = 0x4000 | 9;
 export const REQUIRED_NODE_FEATURE_MISSING = 0x4000 | 0x2000 | 3;

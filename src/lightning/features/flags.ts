@@ -297,16 +297,59 @@ export function hasUnsupportedRequiredFeatures(
 ): number[] {
 	const unsupported: number[] = [];
 	const maxBit = remoteFeatures.maxBit();
+	// BOLT 1: the disconnect test is whether we UNDERSTAND the required
+	// feature, not whether this node instance chose to advertise it —
+	// advertising is config-gated (anchors, wumbo, ...) and some implemented
+	// features (upfront_shutdown_script, route_blinding) are not advertised
+	// at all. Comparing against the advertised set alone disconnected peers
+	// requiring features we fully implement (S-7 LOW).
+	const implemented = implementedFeatures();
 
 	for (let bit = 0; bit <= maxBit; bit += 2) {
 		// Even bit = required/compulsory
 		if (remoteFeatures.hasBit(bit)) {
 			// We support this feature if we have either the even or odd bit set
-			if (!localFeatures.hasBit(bit) && !localFeatures.hasBit(bit + 1)) {
+			if (
+				!localFeatures.hasBit(bit) &&
+				!localFeatures.hasBit(bit + 1) &&
+				!implemented.hasBit(bit) &&
+				!implemented.hasBit(bit + 1)
+			) {
 				unsupported.push(bit);
 			}
 		}
 	}
 
 	return unsupported;
+}
+
+/**
+ * Every feature this implementation understands, independent of what a node
+ * instance advertises. ONLY for the unknown-required-feature disconnect test
+ * above — never advertise from this set.
+ */
+export function implementedFeatures(): FeatureFlags {
+	const flags = FeatureFlags.empty();
+	flags.setOptional(Feature.DATA_LOSS_PROTECT);
+	flags.setOptional(Feature.UPFRONT_SHUTDOWN_SCRIPT);
+	flags.setOptional(Feature.GOSSIP_QUERIES);
+	flags.setOptional(Feature.TLV_ONION);
+	flags.setOptional(Feature.STATIC_REMOTE_KEY);
+	flags.setOptional(Feature.PAYMENT_SECRET);
+	flags.setOptional(Feature.BASIC_MPP);
+	flags.setOptional(Feature.LARGE_CHANNELS);
+	flags.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
+	flags.setOptional(Feature.ROUTE_BLINDING);
+	flags.setOptional(Feature.SHUTDOWN_ANY_SEGWIT);
+	flags.setOptional(Feature.DUAL_FUND);
+	flags.setOptional(Feature.QUIESCE);
+	flags.setOptional(Feature.ONION_MESSAGES);
+	flags.setOptional(Feature.CHANNEL_TYPE);
+	flags.setOptional(Feature.SCID_ALIAS);
+	flags.setOptional(Feature.ZERO_CONF);
+	flags.setOptional(Feature.KEYSEND);
+	flags.setOptional(Feature.SPLICE);
+	flags.setOptional(Feature.SIMPLE_CLOSE);
+	flags.setOptional(Feature.PROVIDE_STORAGE);
+	return flags;
 }

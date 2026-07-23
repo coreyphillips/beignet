@@ -28,7 +28,6 @@ import {
 	constructOnionMessagePacket,
 	constructOnionMessage,
 	constructSimpleOnionMessage,
-	constructMultiHopOnionMessage,
 	constructReplyOnionMessage
 } from '../../src/lightning/onion-message/construct';
 import { processOnionMessage } from '../../src/lightning/onion-message/process';
@@ -45,7 +44,8 @@ import {
 import {
 	IBlindedPath,
 	constructBlindedPath,
-	processBlindedHop
+	processBlindedHop,
+	encodeBlindedHopData
 } from '../../src/lightning/onion/blinded-path';
 import { deriveBlindingKeyChain } from '../../src/lightning/onion/blinding';
 import { MessageType } from '../../src/lightning/message/types';
@@ -277,7 +277,7 @@ describe('Onion Messages (Phase 8)', () => {
 
 		it('should reject truncated blinded path', () => {
 			expect(() => decodeBlindedPathTlv(Buffer.alloc(10))).to.throw(
-				'too short'
+				'truncated'
 			);
 		});
 	});
@@ -362,23 +362,31 @@ describe('Onion Messages (Phase 8)', () => {
 		});
 	});
 
-	// ── Construction: Multi-Hop ──────────────────────────
+	// ── Construction: Multi-Hop (route-blinded) ──────────
 
-	describe('Construction: Multi-Hop', () => {
-		it('should construct a multi-hop onion message', () => {
+	describe('Construction: Multi-Hop (blinded)', () => {
+		/** A route-blinded 2-hop path [node1 -> dest] carrying msgData. */
+		function buildBlindedTwoHop(
+			node1: { privkey: Buffer; pubkey: Buffer },
+			dest: { privkey: Buffer; pubkey: Buffer },
+			msgData: Map<number, Buffer>
+		): IOnionMessage {
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[node1.pubkey, dest.pubkey],
+				[{ nextNodeId: dest.pubkey }, {}]
+			);
+			return constructReplyOnionMessage(path, msgData);
+		}
+
+		it('should construct a blinded multi-hop onion message', () => {
 			const node1 = generateKeyPair();
-			const node2 = generateKeyPair();
 			const dest = generateKeyPair();
 
 			const msgData = new Map<number, Buffer>();
 			msgData.set(64, Buffer.from('multi-hop message'));
 
-			const msg = constructMultiHopOnionMessage(
-				[node1.pubkey, node2.pubkey],
-				dest.pubkey,
-				msgData
-			);
-
+			const msg = buildBlindedTwoHop(node1, dest, msgData);
 			expect(msg.blindingPoint.length).to.equal(33);
 			expect(msg.onionRoutingPacket.length).to.equal(
 				ONION_MESSAGE_PACKET_LENGTH
@@ -392,16 +400,14 @@ describe('Onion Messages (Phase 8)', () => {
 			const msgData = new Map<number, Buffer>();
 			msgData.set(64, Buffer.from('two-hop test'));
 
-			const sessionKey = crypto.randomBytes(32);
-			const msg = constructMultiHopOnionMessage(
-				[node1.pubkey],
-				dest.pubkey,
-				msgData,
-				sessionKey
-			);
+			const msg = buildBlindedTwoHop(node1, dest, msgData);
 
-			// First node peels a layer
-			const result = processOnionMessage(msg.onionRoutingPacket, node1.privkey);
+			// First node peels a layer (with the path's blinding point).
+			const result = processOnionMessage(
+				msg.onionRoutingPacket,
+				node1.privkey,
+				msg.blindingPoint
+			);
 			expect(result.type).to.equal('forward');
 		});
 
@@ -412,26 +418,24 @@ describe('Onion Messages (Phase 8)', () => {
 			const msgData = new Map<number, Buffer>();
 			msgData.set(64, Buffer.from('end-to-end'));
 
-			const sessionKey = crypto.randomBytes(32);
-			const msg = constructMultiHopOnionMessage(
-				[node1.pubkey],
-				dest.pubkey,
-				msgData,
-				sessionKey
-			);
+			const msg = buildBlindedTwoHop(node1, dest, msgData);
 
 			// First hop peels
 			const result1 = processOnionMessage(
 				msg.onionRoutingPacket,
-				node1.privkey
+				node1.privkey,
+				msg.blindingPoint
 			);
 			expect(result1.type).to.equal('forward');
 
 			if (result1.type === 'forward') {
-				// Destination processes
+				// Forwarded to the REAL next node id from the decrypted data.
+				expect(result1.nextNodeId.equals(dest.pubkey)).to.be.true;
+				// Destination processes with the advanced blinding point.
 				const result2 = processOnionMessage(
 					result1.nextOnionMessage.onionRoutingPacket,
-					dest.privkey
+					dest.privkey,
+					result1.nextOnionMessage.blindingPoint
 				);
 				expect(result2.type).to.equal('delivery');
 				if (result2.type === 'delivery') {
@@ -440,6 +444,36 @@ describe('Onion Messages (Phase 8)', () => {
 					);
 				}
 			}
+		});
+
+		it('refuses to forward plaintext (unblinded) recipient data', () => {
+			const node1 = generateKeyPair();
+			const dest = generateKeyPair();
+
+			// The removed pre-route-blinding form: intermediate hop data as a
+			// PLAINTEXT next_node_id blob, sphinx to the raw node ids, no
+			// blinding point. Forwarding this must now fail.
+			const intermediatePayload: IOnionMessagePayload = {
+				encryptedRecipientData: encodeBlindedHopData({
+					nextNodeId: dest.pubkey
+				}),
+				messageTlvs: new Map()
+			};
+			const finalPayload: IOnionMessagePayload = {
+				messageTlvs: new Map([[64, Buffer.from('legacy')]])
+			};
+			const msg = constructOnionMessage(
+				crypto.randomBytes(32),
+				[node1.pubkey, dest.pubkey],
+				[
+					encodeOnionMessagePayload(intermediatePayload),
+					encodeOnionMessagePayload(finalPayload)
+				]
+			);
+
+			expect(() =>
+				processOnionMessage(msg.onionRoutingPacket, node1.privkey)
+			).to.throw('no blinding point');
 		});
 	});
 
@@ -934,7 +968,7 @@ describe('Onion Messages (Phase 8)', () => {
 			mgr.destroy();
 		});
 
-		it('should send multi-hop message to first hop', () => {
+		it('should send a blinded multi-hop message to the introduction node', () => {
 			const nodePrivkey = generateKeyPair().privkey;
 			const mgr = new OnionMessageManager(nodePrivkey);
 
@@ -945,7 +979,12 @@ describe('Onion Messages (Phase 8)', () => {
 
 			const node1 = generateKeyPair();
 			const dest = generateKeyPair();
-			mgr.sendMultiHopOnionMessage([node1.pubkey], dest.pubkey, new Map());
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[node1.pubkey, dest.pubkey],
+				[{ nextNodeId: dest.pubkey }, {}]
+			);
+			mgr.sendReply(path, new Map());
 
 			expect(sent.length).to.equal(1);
 			expect(sent[0].peer).to.equal(node1.pubkey.toString('hex'));
@@ -1022,9 +1061,13 @@ describe('Onion Messages (Phase 8)', () => {
 			replyData.set(64, Buffer.from('reply body'));
 
 			const reply = constructReplyOnionMessage(replyPath, replyData);
+			// Spec route blinding: the packet is sphinx-encrypted to the blinded
+			// node id, so the recipient peels with the path_key (blinding point)
+			// exactly as the wire handler does.
 			const result = processOnionMessage(
 				reply.onionRoutingPacket,
-				replyDest.privkey
+				replyDest.privkey,
+				reply.blindingPoint
 			);
 			expect(result.type).to.equal('delivery');
 			if (result.type === 'delivery') {
@@ -1182,7 +1225,7 @@ describe('Onion Messages (Phase 8)', () => {
 	// ── Manager: Forwarding ──────────────────────────────
 
 	describe('Manager: Forwarding', () => {
-		it('should emit message:forwarded for intermediate hops', () => {
+		it('should emit message:forwarded for intermediate blinded hops', () => {
 			const node1 = generateKeyPair();
 			const dest = generateKeyPair();
 			const mgr = new OnionMessageManager(node1.privkey);
@@ -1198,20 +1241,141 @@ describe('Onion Messages (Phase 8)', () => {
 				sent.push(payload);
 			});
 
-			// Build a multi-hop message where node1 is an intermediate
+			// Build a route-blinded message where node1 is the intermediate hop.
 			const msgData = new Map<number, Buffer>();
 			msgData.set(64, Buffer.from('forward me'));
-			const msg = constructMultiHopOnionMessage(
-				[node1.pubkey],
-				dest.pubkey,
-				msgData
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[node1.pubkey, dest.pubkey],
+				[{ nextNodeId: dest.pubkey }, {}]
 			);
+			const msg = constructReplyOnionMessage(path, msgData);
 			const wirePayload = encodeOnionMessage(msg);
 
 			mgr.handleMessage('sender', wirePayload);
 
 			expect(forwarded.length).to.equal(1);
+			// Forwarded to the REAL next node id (decrypted from the blob).
+			expect(forwarded[0]).to.equal(dest.pubkey.toString('hex'));
 			expect(sent.length).to.equal(1); // Should have forwarded the message
+
+			mgr.destroy();
+		});
+
+		it('sendMultiHopOnionMessage delivers end to end through a blinded intermediate', () => {
+			const sender = generateKeyPair();
+			const mid = generateKeyPair();
+			const dest = generateKeyPair();
+			const senderMgr = new OnionMessageManager(sender.privkey);
+			const midMgr = new OnionMessageManager(mid.privkey);
+			const destMgr = new OnionMessageManager(dest.privkey);
+			const byId = new Map<string, OnionMessageManager>([
+				[mid.pubkey.toString('hex'), midMgr],
+				[dest.pubkey.toString('hex'), destMgr]
+			]);
+			for (const [self, mgr] of [
+				[sender, senderMgr],
+				[mid, midMgr],
+				[dest, destMgr]
+			] as const) {
+				mgr.setSendFunction((peer, _type, payload) => {
+					byId.get(peer)?.handleMessage(self.pubkey.toString('hex'), payload);
+				});
+			}
+
+			const forwarded: string[] = [];
+			midMgr.on('message:forwarded', (_f: string, next: string) =>
+				forwarded.push(next)
+			);
+			const seen: { data: Buffer; pathId?: Buffer }[] = [];
+			destMgr.registerTlvHandler(64, (_f, _t, data, _replyPath, pathId) => {
+				seen.push({ data, pathId });
+			});
+
+			const pathId = crypto.randomBytes(32);
+			const msgData = new Map<number, Buffer>();
+			msgData.set(64, Buffer.from('blinded multi-hop'));
+			senderMgr.sendMultiHopOnionMessage([mid.pubkey], dest.pubkey, msgData, {
+				pathId
+			});
+
+			// The intermediate forwarded to the REAL destination id (decrypted
+			// from its blob), and the destination got the body + path_id.
+			expect(forwarded).to.deep.equal([dest.pubkey.toString('hex')]);
+			expect(seen.length).to.equal(1);
+			expect(seen[0].data.toString()).to.equal('blinded multi-hop');
+			expect(seen[0].pathId).to.exist;
+			expect(seen[0].pathId!.equals(pathId)).to.be.true;
+
+			senderMgr.destroy();
+			midMgr.destroy();
+			destMgr.destroy();
+		});
+
+		it('single-hop sendOnionMessage is route-blinded (raw peel fails)', () => {
+			const sender = generateKeyPair();
+			const dest = generateKeyPair();
+			const mgr = new OnionMessageManager(sender.privkey);
+
+			let wire: Buffer | null = null;
+			mgr.setSendFunction((_peer, _type, payload) => {
+				wire = payload;
+			});
+			const msgData = new Map<number, Buffer>();
+			msgData.set(64, Buffer.from('blinded single-hop'));
+			mgr.sendOnionMessage(dest.pubkey, msgData);
+			expect(wire).to.not.be.null;
+
+			const decoded = decodeOnionMessage(wire!);
+			// Without the path_key the sphinx is unpeelable (it is addressed to
+			// the BLINDED node id, not the raw one)...
+			expect(() =>
+				processOnionMessage(decoded.onionRoutingPacket, dest.privkey)
+			).to.throw('HMAC');
+			// ...and with it, the destination decrypts the body.
+			const result = processOnionMessage(
+				decoded.onionRoutingPacket,
+				dest.privkey,
+				decoded.blindingPoint
+			);
+			expect(result.type).to.equal('delivery');
+			if (result.type === 'delivery') {
+				expect(result.payload.messageTlvs.get(64)!.toString()).to.equal(
+					'blinded single-hop'
+				);
+			}
+
+			mgr.destroy();
+		});
+
+		it('surfaces path_id to TLV handlers on final delivery', () => {
+			const sender = generateKeyPair();
+			const recipient = generateKeyPair();
+			const mgr = new OnionMessageManager(recipient.privkey);
+			mgr.setSendFunction(() => {});
+
+			const seen: (Buffer | undefined)[] = [];
+			mgr.registerTlvHandler(
+				64,
+				(_from, _tlvType, _data, _replyPath, pathId) => {
+					seen.push(pathId);
+				}
+			);
+
+			const pathId = crypto.randomBytes(32);
+			const path = constructBlindedPath(
+				crypto.randomBytes(32),
+				[recipient.pubkey],
+				[{ pathId }]
+			);
+			const msgData = new Map<number, Buffer>();
+			msgData.set(64, Buffer.from('bound to path'));
+			const msg = constructReplyOnionMessage(path, msgData);
+			mgr.handleMessage(sender.pubkey.toString('hex'), encodeOnionMessage(msg));
+
+			expect(seen.length).to.equal(1);
+			expect(seen[0]).to.exist;
+			expect(seen[0]!.equals(pathId)).to.be.true;
 
 			mgr.destroy();
 		});

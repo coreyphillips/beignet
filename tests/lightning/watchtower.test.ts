@@ -530,6 +530,39 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		expect(Number(backup.sweptSats)).to.be.greaterThan(built.toLocalValue);
 	});
 
+	it('applies the P2WSH dust floor (330 sat) to a P2WSH sweep script', function () {
+		// A 34-byte P2WSH sweep: the dust floor is 330 sat, not the P2WPKH 294
+		// the old check hardcoded for every script type.
+		const sweepScript = Buffer.concat([
+			Buffer.from([0x00, 0x20]),
+			crypto.randomBytes(32)
+		]);
+		const built = buildRevokedContext(sweepScript);
+		// Sweep only to_local so the justice tx weight is deterministic.
+		const ctx: IJusticeContext = {
+			...built.ctx,
+			localPaymentPubkey: undefined,
+			paymentBasepointSecret: undefined
+		};
+		// Probe at 1 sat/wu (rate 1000): fee == weight, so the weight falls out.
+		const probe = buildJusticeBackup(ctx, {
+			blobType: BlobType.ALTRUIST_COMMIT,
+			sweepFeeRate: 1000n
+		});
+		const weight = BigInt(built.toLocalValue) - probe.sweptSats;
+		// Aim the sweep output at ~300 sat: above the P2WPKH floor (294) so the
+		// old flat check passed it, below the P2WSH floor (330) that actually
+		// applies to this script.
+		const targetFee = BigInt(built.toLocalValue) - 300n;
+		const rate = (targetFee * 1000n) / weight;
+		expect(() =>
+			buildJusticeBackup(ctx, {
+				blobType: BlobType.ALTRUIST_COMMIT,
+				sweepFeeRate: rate
+			})
+		).to.throw(/below the dust limit/);
+	});
+
 	it('the channel caches the revoked tx and returns it by revealed secret', function () {
 		const pair = freshPair();
 		// Two rounds: the first revoke reveals the funding-state point (never
@@ -629,8 +662,10 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 	it('names the blob limitation for a lessee-side lease-locked to_local (S-L.H4)', function () {
 		const built = buildRevokedContext(p2wpkhScript());
 		const leaseExpiry = 804032;
+		const leaseCommitBlockheight = 800000;
+		const leaseCsv = leaseExpiry - leaseCommitBlockheight; // 4032, CLN model
 		// We are the LESSEE: the peer (lessor) commitment's to_local carries the
-		// lease CLTV. Rebuild the revoked tx's to_local as the lease variant.
+		// lease CSV. Rebuild the revoked tx's to_local as the lease variant.
 		const plainToLocalSpk = bitcoin.payments.p2wsh({
 			redeem: {
 				output: buildToLocalScript(
@@ -647,7 +682,7 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 					built.revocationPubkey,
 					built.theirDelayed,
 					built.toSelfDelay,
-					leaseExpiry
+					leaseCsv
 				)
 			},
 			network
@@ -655,7 +690,12 @@ describe('watchtower justice against a REAL revoked commitment', function () {
 		for (const out of built.ctx.revokedTx.outs) {
 			if (out.script.equals(plainToLocalSpk)) out.script = leaseToLocalSpk;
 		}
-		const ctx = { ...built.ctx, isAnchor: true, leaseExpiry };
+		const ctx = {
+			...built.ctx,
+			isAnchor: true,
+			leaseExpiry,
+			leaseCommitBlockheight
+		};
 		expect(() =>
 			buildJusticeBackup(ctx, {
 				blobType: BlobType.ALTRUIST_COMMIT,

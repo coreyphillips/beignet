@@ -20,12 +20,11 @@ import {
 } from '../../src/lightning/channel/types';
 import { IOpenChannelMessage } from '../../src/lightning/message/channel-open';
 import { IAcceptChannelMessage } from '../../src/lightning/message/channel-open';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
+// Must be a REAL curve point: validation now rejects off-curve basepoints.
 function fakePubkey(): Buffer {
-	const buf = Buffer.alloc(33);
-	buf[0] = 0x02;
-	crypto.randomBytes(32).copy(buf, 1);
-	return buf;
+	return getPublicKey(crypto.randomBytes(32));
 }
 
 function makeValidOpenMsg(): IOpenChannelMessage {
@@ -104,7 +103,7 @@ describe('Channel Types and Validation', function () {
 		});
 
 		it('should have correct max funding', function () {
-			expect(MAX_FUNDING_SATOSHIS).to.equal(16777216n);
+			expect(MAX_FUNDING_SATOSHIS).to.equal(16777215n);
 		});
 
 		it('should have correct min dust limit', function () {

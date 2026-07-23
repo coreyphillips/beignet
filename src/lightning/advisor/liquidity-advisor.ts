@@ -40,6 +40,12 @@ export interface IChannelSnapshot {
 	stuckBlocks?: number;
 	/** Timestamp of last activity on this channel (optional) */
 	lastActivityAt?: number;
+	/**
+	 * Whether the channel can carry HTLC traffic right now. NORMAL channels
+	 * are usable; a SPLICING channel is too when pay-during-splice is active.
+	 * Absent means unknown, and only the state is judged.
+	 */
+	htlcUsable?: boolean;
 }
 
 export interface ILiquiditySnapshot {
@@ -64,7 +70,14 @@ export class LiquidityAdvisor {
 		let activeCount = 0;
 		const recommendations: ILiquidityRecommendation[] = [];
 
-		const activeChannels = channels.filter((ch) => ch.state === 'NORMAL');
+		// Active means "can move sats right now", not "state is NORMAL": a
+		// channel paying through its splice still routes and still holds the
+		// balances it reports, so it must keep counting. Filtering on NORMAL
+		// alone zeroed the liquidity figures for the whole time a splice ran,
+		// which read as having no funds mid-splice.
+		const activeChannels = channels.filter(
+			(ch) => ch.state === 'NORMAL' || ch.htlcUsable === true
+		);
 		activeCount = activeChannels.length;
 
 		for (const ch of activeChannels) {

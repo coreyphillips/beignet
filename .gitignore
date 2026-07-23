@@ -96,3 +96,6 @@ Thumbs.db
 # Tests
 example/walletData
 example/lightningData
+
+# Local-only docker port remapping (see docker/docker-compose.override.yml)
+docker/docker-compose.override.yml

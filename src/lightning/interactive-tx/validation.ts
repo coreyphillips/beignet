@@ -9,6 +9,7 @@
  * - Fee must be sufficient
  */
 
+import * as bitcoin from 'bitcoinjs-lib';
 import { IInteractiveTxInput, IInteractiveTxOutput } from './types';
 
 const DUST_LIMIT_SATS = 546n;
@@ -16,6 +17,60 @@ const DUST_LIMIT_SATS = 546n;
 /** BOLT 2 interactive-tx: each peer may add at most 252 inputs / 252 outputs. */
 export const MAX_INTERACTIVE_TX_INPUTS = 252;
 export const MAX_INTERACTIVE_TX_OUTPUTS = 252;
+/**
+ * BOLT 2 interactive-tx DoS cap: fail the negotiation once 4096 tx_add_input
+ * (or tx_add_output) messages have been received in one session.
+ */
+export const MAX_INTERACTIVE_TX_MSGS = 4096;
+/**
+ * BOLT 2 interactive-tx: senders MUST set nSequence <= 0xFFFFFFFD; receivers
+ * MUST fail on 0xFFFFFFFE/0xFFFFFFFF (locktime and RBF signaling must stay
+ * enforceable on the collaborative transaction).
+ */
+export const MAX_INTERACTIVE_TX_SEQUENCE = 0xfffffffd;
+
+/**
+ * BOLT 2 interactive-tx receive-side checks on a peer's tx_add_input prevtx:
+ * it must parse as a valid transaction, prevtx_vout must be in range, and the
+ * spent output MUST be a native segwit program (OP_0..OP_16 followed by a
+ * 2..40-byte push). The segwit-only rule is the anti-malleability MUST: a
+ * legacy or wrapped input lets the contributor malleate the txid after both
+ * sides signed commitments against it, so the confirmed funding/splice would
+ * sit at an outpoint with no valid commitment signature (no unilateral exit).
+ */
+export function validatePeerInputPrevTx(
+	prevTx: Buffer | undefined,
+	prevTxVout: number
+): string | null {
+	if (!prevTx || prevTx.length === 0) {
+		return 'tx_add_input is missing prev_tx';
+	}
+	let tx: bitcoin.Transaction;
+	try {
+		tx = bitcoin.Transaction.fromBuffer(prevTx);
+	} catch {
+		return 'tx_add_input prev_tx does not parse as a valid transaction';
+	}
+	if (!Number.isInteger(prevTxVout) || prevTxVout < 0) {
+		return `tx_add_input prev_tx_vout ${prevTxVout} is invalid`;
+	}
+	if (prevTxVout >= tx.outs.length) {
+		return `tx_add_input prev_tx_vout ${prevTxVout} is out of range (prev_tx has ${tx.outs.length} outputs)`;
+	}
+	const script = tx.outs[prevTxVout].script;
+	const version = script[0];
+	const isVersionOp = version === 0x00 || (version >= 0x51 && version <= 0x60); // OP_0..OP_16
+	const pushLen = script.length >= 2 ? script[1] : 0;
+	if (
+		!isVersionOp ||
+		pushLen < 2 ||
+		pushLen > 40 ||
+		script.length !== pushLen + 2
+	) {
+		return 'tx_add_input spends a non-native-segwit output (txid malleable after signing)';
+	}
+	return null;
+}
 /** Consensus money cap: 21M BTC in satoshis. */
 export const MAX_MONEY_SATS = 2_100_000_000_000_000n;
 /** Standardness cap: a heavier tx will not relay, stranding the channel. */

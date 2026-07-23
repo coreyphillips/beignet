@@ -229,6 +229,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /channels/ensure-minimum': [],
 	'POST /channel/close': [],
 	'POST /channel/forceclose': [],
+	'POST /channel/splice-quote': ['readonly'],
 	'POST /channel/splice-in': [],
 	'POST /channel/splice-out': [],
 	'POST /channel/update-commitment-feerate': [],

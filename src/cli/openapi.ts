@@ -661,7 +661,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						host: 'string',
 						port: 'number',
 						amountSats: 'number',
-						pushSats: 'number?'
+						pushSats: 'number?',
+						satsPerVbyte: 'number?',
+						max: 'boolean?'
 					}),
 					responses: {
 						'200': {
@@ -2052,6 +2054,40 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/channel/splice-quote': {
+				post: {
+					summary:
+						'Quote a splice: the on-chain fee and the largest amount that can move at this feerate (splice-in prices against spendable wallet UTXOs, splice-out against local balance net of the peer-set channel reserve)',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						channelId: 'string',
+						direction: 'string',
+						feeratePerkw: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Splice quote',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									direction: { type: 'string', enum: ['in', 'out'] },
+									feeSats: { type: 'number' },
+									spendableSats: { type: 'number' },
+									maxAmountSats: { type: 'number' },
+									reserveSats: {
+										type: 'number',
+										description: 'splice-out only'
+									},
+									inputCount: {
+										type: 'number',
+										description: 'splice-in only'
+									}
+								}
+							})
+						}
+					}
+				}
+			},
 			'/channel/splice-in': {
 				post: {
 					summary: 'Splice funds into a channel',
@@ -2429,6 +2465,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						lightningBalanceSats: { type: 'integer' },
 						pendingCloseBalanceSats: { type: 'integer' },
 						erroredBalanceSats: { type: 'integer' },
+						splicingBalanceSats: {
+							type: 'integer',
+							description:
+								'Splice-in-transit funds: for channels paying through their splice, only what is still arriving; for parked mid-splice channels, the whole settle-to balance. Rejoins lightningBalanceSats at splice_locked'
+						},
 						channelCount: { type: 'integer' },
 						peerCount: { type: 'integer' },
 						listening: { type: 'boolean' }
@@ -2440,7 +2481,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						onchain: { type: 'integer' },
 						lightning: { type: 'integer' },
 						total: { type: 'integer' },
-						unsettledSats: { type: 'integer' }
+						unsettledSats: { type: 'integer' },
+						splicingSats: {
+							type: 'integer',
+							description:
+								'Splice-in-transit funds (see splicingBalanceSats); rejoins lightning at splice_locked. Excluded from total, which counts only currently spendable funds'
+						}
 					}
 				},
 				OnchainTxInfo: {
@@ -2598,6 +2644,21 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						shortChannelId: { type: 'string' },
 						feeratePerKw: { type: 'integer' },
 						htlcCount: { type: 'integer' },
+						pendingSpliceLocalBalanceSats: {
+							type: 'integer',
+							description:
+								'Local balance the channel settles to when its in-flight splice locks; present only mid-splice (localBalanceSats stays pre-splice until splice_locked)'
+						},
+						htlcUsable: {
+							type: 'boolean',
+							description:
+								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+						},
+						payThroughSplice: {
+							type: 'boolean',
+							description:
+								'Present exactly when mid-splice by effective state: true = paying through the splice, false = parked'
+						},
 						feeBaseMsat: { type: 'integer' },
 						feeProportionalMillionths: { type: 'integer' },
 						cltvExpiryDelta: { type: 'integer' },
@@ -3007,6 +3068,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						inboundLiquidityPct: {
 							type: 'integer',
 							description: 'Inbound liquidity percentage (0-100)'
+						},
+						reserveSats: {
+							type: 'integer',
+							description:
+								'Total local balance held back as channel reserve, unspendable (sats)'
+						},
+						sendableSats: {
+							type: 'integer',
+							description:
+								'Local balance above the reserve, i.e. what can actually be sent (sats); zero while below the reserve'
 						},
 						recommendations: {
 							type: 'array',

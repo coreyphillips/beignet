@@ -17,7 +17,10 @@ import {
 import { decodeOnionPacket, encodeOnionPacket } from '../onion/construct';
 import { decodeOnionMessagePayload } from './codec';
 import { OnionMessageProcessResult } from './types';
-import { decodeBlindedHopData } from '../onion/blinded-path';
+import {
+	decodeBlindedHopData,
+	deriveBlindedPrivkey
+} from '../onion/blinded-path';
 import {
 	deriveBlindingSharedSecret,
 	deriveBlindingEncryptionKey,
@@ -48,17 +51,37 @@ export function processOnionMessage(
 		throw new Error(`Invalid onion version: ${packet.version}`);
 	}
 
-	// Compute shared secret with the onion ephemeral key
-	const sharedSecret = ecdh(nodePrivkey, packet.ephemeralKey);
-	const keys = deriveHopKeys(sharedSecret);
+	// BOLT 4 route blinding: a spec onion message is sphinx-encrypted to our
+	// BLINDED node id, so the packet must be peeled with the blinded private
+	// key derived from the path_key (this is how CLN/LND always send). Try
+	// that first, then fall back to the raw node key for beignet's own
+	// single-hop direct sends (sendOnionMessage, which carries no blinding).
+	const candidateKeys: Buffer[] = [];
+	if (blindingPoint) {
+		try {
+			candidateKeys.push(deriveBlindedPrivkey(blindingPoint, nodePrivkey));
+		} catch {
+			// Invalid blinding point — fall through to the raw key.
+		}
+	}
+	candidateKeys.push(nodePrivkey);
 
-	// Verify HMAC on the encrypted routing info
-	const expectedHmac = crypto
-		.createHmac('sha256', keys.mu)
-		.update(packet.routingInfo)
-		.digest();
-
-	if (!packet.hmac.equals(expectedHmac)) {
+	let sharedSecret: Buffer | null = null;
+	let keys: ReturnType<typeof deriveHopKeys> | null = null;
+	for (const candidate of candidateKeys) {
+		const ss = ecdh(candidate, packet.ephemeralKey);
+		const k = deriveHopKeys(ss);
+		const expectedHmac = crypto
+			.createHmac('sha256', k.mu)
+			.update(packet.routingInfo)
+			.digest();
+		if (packet.hmac.equals(expectedHmac)) {
+			sharedSecret = ss;
+			keys = k;
+			break;
+		}
+	}
+	if (!sharedSecret || !keys) {
 		throw new Error('HMAC verification failed');
 	}
 
@@ -97,10 +120,31 @@ export function processOnionMessage(
 	const isFinal = nextHmac.equals(Buffer.alloc(32));
 
 	if (isFinal) {
-		// Final delivery — return the decoded payload
+		// Final delivery — surface the blinded-path path_id (BOLT 4) so the
+		// recipient can verify the message arrived via a path it published.
+		// Only trust a path_id from SUCCESSFULLY DECRYPTED recipient data:
+		// unencrypted/plaintext hop data is attacker-forgeable.
+		let pathId: Buffer | undefined;
+		if (hopPayload.encryptedRecipientData && blindingPoint) {
+			try {
+				const blindingSharedSecret = deriveBlindingSharedSecret(
+					blindingPoint,
+					nodePrivkey
+				);
+				const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
+				const plaintext = decryptBlindedData(
+					encKey,
+					hopPayload.encryptedRecipientData
+				);
+				pathId = decodeBlindedHopData(plaintext).pathId;
+			} catch {
+				// Undecryptable final-hop recipient data: no verifiable path_id.
+			}
+		}
 		return {
 			type: 'delivery',
-			payload: hopPayload
+			payload: hopPayload,
+			...(pathId ? { pathId } : {})
 		};
 	}
 
@@ -109,12 +153,11 @@ export function processOnionMessage(
 		throw new Error('Cannot determine next hop: no encrypted_recipient_data');
 	}
 
-	// Resolve next hop: try blinded decryption first, fall back to raw decode
+	// Resolve next hop from the DECRYPTED recipient data only.
 	const resolved = resolveNextHop(
 		hopPayload.encryptedRecipientData,
 		nodePrivkey,
-		blindingPoint,
-		nextEphemeralKey
+		blindingPoint
 	);
 	const nextNodeId = resolved.nextNodeId;
 	const nextBlindingKey = resolved.nextBlindingKey;
@@ -139,49 +182,42 @@ export function processOnionMessage(
 }
 
 /**
- * Resolve next hop from encrypted_recipient_data.
- * Attempts blinded path decryption first; falls back to raw hop data decoding.
+ * Resolve next hop from encrypted_recipient_data (BOLT 4 route blinding).
+ * Forwarding REQUIRES a blinding point and decryptable recipient data: the
+ * plaintext next_node_id fallback (beignet's pre-route-blinding multi-hop
+ * form) is gone — a plaintext blob is attacker-forgeable and no spec
+ * implementation emits one.
  */
 function resolveNextHop(
 	encryptedRecipientData: Buffer,
 	nodePrivkey: Buffer,
-	blindingPoint: Buffer | undefined,
-	fallbackBlindingKey: Buffer
+	blindingPoint: Buffer | undefined
 ): { nextNodeId: Buffer; nextBlindingKey: Buffer } {
-	// Try blinded path decryption if blinding point is available
-	if (blindingPoint) {
-		try {
-			const blindingSharedSecret = deriveBlindingSharedSecret(
-				blindingPoint,
-				nodePrivkey
-			);
-			const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
-			const plaintext = decryptBlindedData(encKey, encryptedRecipientData);
-			const blindedHopData = decodeBlindedHopData(plaintext);
-
-			if (blindedHopData.nextNodeId) {
-				return {
-					nextNodeId: blindedHopData.nextNodeId,
-					nextBlindingKey: deriveNextBlindingKey(
-						blindingPoint,
-						blindingSharedSecret
-					)
-				};
-			}
-		} catch {
-			// Blinded decryption failed — try raw decode
-		}
+	if (!blindingPoint) {
+		throw new Error(
+			'Cannot determine next hop: onion message carries no blinding point'
+		);
 	}
+	const blindingSharedSecret = deriveBlindingSharedSecret(
+		blindingPoint,
+		nodePrivkey
+	);
+	const encKey = deriveBlindingEncryptionKey(blindingSharedSecret);
+	const plaintext = decryptBlindedData(encKey, encryptedRecipientData);
+	const blindedHopData = decodeBlindedHopData(plaintext);
 
-	// Fallback: parse raw (unencrypted) hop data
-	const data = decodeBlindedHopData(encryptedRecipientData);
-	if (!data.nextNodeId) {
+	if (!blindedHopData.nextNodeId) {
 		throw new Error(
 			'Cannot determine next hop: no next_node_id in encrypted_recipient_data'
 		);
 	}
+	// BOLT 4: next_path_key_override (ERD type 8, creator-authenticated by the
+	// decryption) replaces the standard derivation at the seam where two
+	// blinded routes were concatenated.
 	return {
-		nextNodeId: data.nextNodeId,
-		nextBlindingKey: blindingPoint || fallbackBlindingKey
+		nextNodeId: blindedHopData.nextNodeId,
+		nextBlindingKey:
+			blindedHopData.nextPathKeyOverride ??
+			deriveNextBlindingKey(blindingPoint, blindingSharedSecret)
 	};
 }
