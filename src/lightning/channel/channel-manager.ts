@@ -571,6 +571,18 @@ export class ChannelManager extends EventEmitter {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
+		// A trusted peer gets zero-conf on ANY open, not just the dedicated
+		// openZeroConfChannel path. openChannel is the route that knows how to
+		// fund at a requested rate and to sweep the whole balance (max), and a
+		// trusted open that still waited a block for the opener's own funding
+		// watch defeated the point of trusting the peer.
+		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+			state.zeroConfEnabled = true;
+			state.trustedPeer = true;
+			state.minimumDepth = 0;
+			if (this.config.zeroReserve) state.zeroReserve = true;
+		}
+
 		const signer = this.makeSigner(
 			chKeys.channelIndex,
 			chKeys.fundingPrivkey,
