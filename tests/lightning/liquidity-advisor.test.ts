@@ -45,6 +45,30 @@ describe('LiquidityAdvisor', () => {
 		expect(result.activeChannelCount).to.equal(2);
 	});
 
+	it('keeps counting a channel that pays through its splice', () => {
+		// Splicing every channel used to zero the whole snapshot (balances,
+		// capacity, active count) for the splice window, despite sats being
+		// sendable throughout. htlcUsable marks the pay-through case active.
+		const result = advisor.analyze([
+			makeChannel({ channelId: 'ch1', state: 'SPLICING', htlcUsable: true })
+		]);
+		expect(result.activeChannelCount).to.equal(1);
+		expect(result.totalLocalBalanceSats).to.equal(500_000);
+		expect(result.totalCapacitySats).to.equal(1_000_000);
+		// An active, funded channel must not read as "no active channels".
+		expect(
+			result.recommendations.some((r) => /No active channels/.test(r.reason))
+		).to.equal(false);
+	});
+
+	it('still excludes a parked splice (no pay-through)', () => {
+		const result = advisor.analyze([
+			makeChannel({ channelId: 'ch1', state: 'SPLICING' })
+		]);
+		expect(result.activeChannelCount).to.equal(0);
+		expect(result.totalLocalBalanceSats).to.equal(0);
+	});
+
 	it('calculates outbound/inbound percentages correctly', () => {
 		const result = advisor.analyze([
 			makeChannel({

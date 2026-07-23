@@ -4864,7 +4864,10 @@ export class LightningNode extends EventEmitter {
 				remoteBalanceMsat: ch.remoteBalanceMsat,
 				capacitySats: Number(ch.fundingSatoshis),
 				peerPubkey: ch.peerPubkey,
-				stuckBlocks
+				stuckBlocks,
+				// Lets the advisor keep counting a channel that pays through its
+				// splice instead of zeroing the liquidity for the splice window.
+				htlcUsable: ch.htlcUsable
 			};
 		});
 		return this.liquidityAdvisor.analyze(snapshots);
