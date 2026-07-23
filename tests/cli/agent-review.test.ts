@@ -108,10 +108,12 @@ describe('Agent Review: liquidity snapshot reserve aggregation', () => {
 	// paying through its splice still sends), sendable clamped at zero per
 	// channel so a balance below its reserve contributes nothing sendable while
 	// its reserve still counts. Mid-splice the spendable side is the
-	// conservative min of the live and settle-to balances, the same ceiling
-	// addHtlc enforces. Aggregated here in isolation because
-	// getLiquiditySnapshot() needs a real wallet, matching how canSend's math
-	// is covered above.
+	// conservative min of the live and settle-to balances, mirroring the
+	// balance side of the channel's add gate (the true per-add ceiling also
+	// reserves the funder's commitment fee; this aggregation prices balance
+	// minus reserve, as it always has for NORMAL channels). Aggregated here in
+	// isolation because getLiquiditySnapshot() needs a real wallet, matching
+	// how canSend's math is covered above.
 	type Ch = {
 		state: string;
 		localBalanceMsat: bigint;
@@ -197,7 +199,7 @@ describe('Agent Review: liquidity snapshot reserve aggregation', () => {
 		// The field report: splicing every channel zeroed the liquidity card
 		// even though sats were still sendable mid-splice. A SPLICING channel
 		// with pay-through active stays in the sums, at the conservative
-		// min(live, settle-to) the channel itself enforces on adds.
+		// min(live, settle-to) balance side of the channel's add gate.
 		const res = aggregate([
 			{
 				state: 'SPLICING',

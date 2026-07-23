@@ -4857,10 +4857,22 @@ export class LightningNode extends EventEmitter {
 				trackedHeight !== undefined
 					? this.currentBlockHeight - trackedHeight
 					: undefined;
+			// A pay-through splice is judged at the conservative min of its live
+			// and settle-to balances, the same figure the send path prices
+			// against. Handing the advisor the raw live balance would let a
+			// splice-out read as flush (live 500k, settling to 50k reads as 50%
+			// outbound) and suppress the low-outbound recommendation exactly
+			// when it applies.
+			const effectiveLocalMsat =
+				ch.htlcUsable &&
+				ch.pendingSpliceLocalBalanceMsat !== undefined &&
+				ch.pendingSpliceLocalBalanceMsat < ch.localBalanceMsat
+					? ch.pendingSpliceLocalBalanceMsat
+					: ch.localBalanceMsat;
 			return {
 				channelId: channelIdHex,
 				state: ch.state as string,
-				localBalanceMsat: ch.localBalanceMsat,
+				localBalanceMsat: effectiveLocalMsat,
 				remoteBalanceMsat: ch.remoteBalanceMsat,
 				capacitySats: Number(ch.fundingSatoshis),
 				peerPubkey: ch.peerPubkey,

@@ -4567,8 +4567,11 @@ export class BeignetNode extends EventEmitter {
 		// still sends, so it must keep counting. Filtering on NORMAL alone zeroed
 		// the sendable figure for the whole splice window, which read as having no
 		// funds while a payment would in fact go through. Mid-splice the spendable
-		// side is the conservative min of the live and settle-to balances, the
-		// same ceiling addHtlc enforces.
+		// side is the conservative min of the live and settle-to balances,
+		// mirroring the balance side of the channel's own add gate. (The true
+		// per-add ceiling, getSpendableOutboundMsat, additionally reserves the
+		// funder's commitment fee; this aggregation, like the NORMAL-channel
+		// figure before it, prices only balance minus reserve.)
 		let reserveMsat = 0n;
 		let sendableMsat = 0n;
 		for (const ch of this.node.listChannels()) {
