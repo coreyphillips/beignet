@@ -302,6 +302,127 @@ describe('Channel Routing Policy (M3)', function () {
 			expect(policy.htlcMaximumMsat).to.equal(1_000_000_000n);
 		});
 
+		it('derives the advertised htlc max from the REMOTE in-flight limit, not our own', function () {
+			// A channel opened under the old 500k-sat max_htlc_value_in_flight
+			// default persists that value in its LOCAL config for life. That
+			// figure bounds the PEER's HTLCs toward us — it says nothing about
+			// what we can send — yet the advertised htlc_maximum_msat used to
+			// derive from it, freezing a 500k ceiling into gossip that route
+			// finders (including our own) enforced against our outbound
+			// payments. Observed live: 1M sats refused as NO_ROUTE on a 4.05M
+			// channel holding 1.27M spendable. The ceiling must come from the
+			// remote's limit on OUR HTLCs, clamped to capacity.
+			const relicAlice = new LightningNode({
+				...makeNodeConfig(9),
+				channelConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					maxHtlcValueInFlightMsat: 500_000_000n // the old default
+				}
+			});
+			relicAlice.on('node:error', () => {});
+			const relicBob = createNode(10);
+			connectNodes(relicAlice, relicBob);
+			const relicChannelId = openReadyChannel(relicAlice, relicBob);
+
+			const policy = relicAlice.getChannelPolicy(relicChannelId)!;
+			// Bob (remote) accepts up to U64 max, so the ceiling is the full
+			// 1M-sat capacity — NOT the 500k relic from our own local config.
+			expect(policy.htlcMaximumMsat).to.equal(1_000_000_000n);
+
+			relicAlice.destroy();
+			relicBob.destroy();
+		});
+
+		it('advertises the remote htlc minimum, matching outbound enforcement', function () {
+			// Our directional channel_update describes HTLCs WE send, and
+			// addHtlc refuses amounts below the REMOTE's htlc_minimum_msat. The
+			// advertisement must agree, or a payer is invited to build a route
+			// the channel then rejects.
+			const fussyBob = new LightningNode({
+				...makeNodeConfig(12),
+				channelConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					htlcMinimumMsat: 5_000n
+				}
+			});
+			fussyBob.on('node:error', () => {});
+			const plainAlice = createNode(11);
+			connectNodes(plainAlice, fussyBob);
+			const chId = openReadyChannel(plainAlice, fussyBob);
+
+			const policy = plainAlice.getChannelPolicy(chId)!;
+			expect(policy.htlcMinimumMsat, "the peer's minimum, not ours").to.equal(
+				5_000n
+			);
+
+			plainAlice.destroy();
+			fussyBob.destroy();
+		});
+
+		it('the advertised max tracks capacity across splices while the remote limit stays fixed', function () {
+			// completeSplice installs the new fundingSatoshis but deliberately
+			// does NOT renegotiate the peer's max_htlc_value_in_flight (it is
+			// negotiated at open and fixed for the channel's life). The policy
+			// derivation must therefore move with capacity and stay capped by
+			// the fixed remote limit. Capacity is mutated directly here — the
+			// same field completeSplice writes — to cover all three shapes
+			// without the full splice dance.
+			const bounded = new LightningNode({
+				...makeNodeConfig(14),
+				channelConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					maxHtlcValueInFlightMsat: 1_500_000_000n // finite remote limit
+				}
+			});
+			bounded.on('node:error', () => {});
+			const splicer = createNode(13);
+			connectNodes(splicer, bounded);
+			const chId = openReadyChannel(splicer, bounded);
+			const state = splicer
+				.getChannelManager()
+				.getChannel(chId)!
+				.getFullState();
+
+			// Baseline: 1M-sat capacity below the peer's 1.5M-sat limit.
+			expect(splicer.getChannelPolicy(chId)!.htlcMaximumMsat).to.equal(
+				1_000_000_000n
+			);
+
+			// Splice-in grows capacity above the finite remote limit: the
+			// advertisement stays capped at the peer's limit.
+			state.fundingSatoshis = 2_000_000n;
+			expect(splicer.getChannelPolicy(chId)!.htlcMaximumMsat).to.equal(
+				1_500_000_000n
+			);
+
+			// Splice-out shrinks capacity back below the limit: the
+			// advertisement shrinks with it.
+			state.fundingSatoshis = 800_000n;
+			expect(splicer.getChannelPolicy(chId)!.htlcMaximumMsat).to.equal(
+				800_000_000n
+			);
+
+			splicer.destroy();
+			bounded.destroy();
+
+			// And with an effectively unlimited peer (today's U64 default), a
+			// splice-in grows the advertisement to the full new capacity.
+			const roomy = createNode(15);
+			const grower = createNode(16);
+			connectNodes(grower, roomy);
+			const growId = openReadyChannel(grower, roomy);
+			const growState = grower
+				.getChannelManager()
+				.getChannel(growId)!
+				.getFullState();
+			growState.fundingSatoshis = 2_000_000n;
+			expect(grower.getChannelPolicy(growId)!.htlcMaximumMsat).to.equal(
+				2_000_000_000n
+			);
+			grower.destroy();
+			roomy.destroy();
+		});
+
 		it('override takes precedence, unset fields fall back to defaults', function () {
 			alice.setChannelPolicy(channelId, {
 				feeBaseMsat: 2500,

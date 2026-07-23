@@ -4219,20 +4219,37 @@ export class LightningNode extends EventEmitter {
 		if (!channel) return null;
 		const state = channel.getFullState();
 		const override = this.channelPolicies.get(channelId.toString('hex'));
-		// Same defaults the initial channel_update advertises: the channel's
-		// negotiated htlc_minimum_msat and capacity-capped max-in-flight.
+		// Same defaults the initial channel_update advertises. Our directional
+		// channel_update describes HTLCs WE send outbound over this channel, so
+		// both bounds come from what the REMOTE will accept, mirroring exactly
+		// what addHtlc enforces:
+		// - htlc_maximum_msat: the advertised single-HTLC policy ceiling,
+		//   bounded by capacity and the peer's negotiated aggregate
+		//   max_htlc_value_in_flight (BOLT 7 requires the advertisement not to
+		//   exceed it; a single HTLC can never exceed the aggregate either).
+		// - htlc_minimum_msat: the peer's minimum, the smallest HTLC it will
+		//   accept from us.
+		// Deriving either from our LOCAL config was the wrong side (that
+		// bounds the peer's HTLCs toward us) and froze open-time history into
+		// gossip: a channel opened under the old 500k-sat in-flight default
+		// advertised a 500k ceiling for life, so route finders — including our
+		// own — refused payments the channel could easily carry. Observed
+		// live: 1M sats refused as NO_ROUTE on a 4.05M channel holding 1.27M
+		// spendable. Remote-derived, both bounds self-heal on the next
+		// channel_update refresh, and a splice updates the capacity clamp
+		// while the peer's negotiated limits stay fixed, as they should.
 		const capacityMsat = state.fundingSatoshis * 1000n;
 		const defaultHtlcMax =
-			state.localConfig.maxHtlcValueInFlightMsat > capacityMsat
+			state.remoteConfig.maxHtlcValueInFlightMsat > capacityMsat
 				? capacityMsat
-				: state.localConfig.maxHtlcValueInFlightMsat;
+				: state.remoteConfig.maxHtlcValueInFlightMsat;
 		return {
 			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
 			feeProportionalMillionths:
 				override?.feeProportionalMillionths ?? this.forwardingFeePropMillionths,
 			cltvExpiryDelta: override?.cltvExpiryDelta ?? this.forwardingCltvDelta,
 			htlcMinimumMsat:
-				override?.htlcMinimumMsat ?? state.localConfig.htlcMinimumMsat,
+				override?.htlcMinimumMsat ?? state.remoteConfig.htlcMinimumMsat,
 			htlcMaximumMsat: override?.htlcMaximumMsat ?? defaultHtlcMax,
 			source:
 				override && Object.keys(override).length > 0 ? 'override' : 'default'
