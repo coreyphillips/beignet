@@ -1111,7 +1111,7 @@ export class SqliteStorage implements IStorageBackend {
 		const migrations: Array<(db: Database.Database) => void> = [
 			// Migration 0→1: Add peer_addresses, channel_key_indices tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
-			(db) => {
+			(db): void => {
 				// Ensure column exists on pre-existing channels table
 				try {
 					db.exec(
@@ -1123,13 +1123,13 @@ export class SqliteStorage implements IStorageBackend {
 			},
 			// Migration 1→2: Add webhooks and payment_queue tables
 			// (tables already created in _createTables via CREATE IF NOT EXISTS)
-			() => {
+			(): void => {
 				// No-op — tables created by CREATE IF NOT EXISTS above
 			},
 			// Migration 2->3: encryption-at-rest rollout. Structurally a no-op;
 			// the data rewrite happens in _encryptExistingData() during open()
 			// whenever an encryptionKey is provided (lazy-safe for plaintext rows)
-			() => {
+			(): void => {
 				// No-op
 			},
 			// Migration 3->4: channel_policies table (routing-policy overrides).

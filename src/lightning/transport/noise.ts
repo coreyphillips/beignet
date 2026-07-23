@@ -400,9 +400,10 @@ export function createInitiatorHandshake(
 	return {
 		state,
 		act1,
-		processAct2: (act2: Buffer) => initiatorProcessAct2(state, act2),
-		createAct3: () => initiatorAct3(state),
-		deriveTransport: () => deriveTransportCipher(state.ck, true)
+		processAct2: (act2: Buffer): void => initiatorProcessAct2(state, act2),
+		createAct3: (): Buffer => initiatorAct3(state),
+		deriveTransport: (): TransportCipher =>
+			deriveTransportCipher(state.ck, true)
 	};
 }
 
@@ -428,10 +429,11 @@ export function createResponderHandshake(
 
 	return {
 		state,
-		processAct1: (act1: Buffer) => responderProcessAct1(state, act1),
-		createAct2: () => responderAct2(state, ephemeralPriv),
-		processAct3: (act3: Buffer) => responderProcessAct3(state, act3),
-		deriveTransport: () => deriveTransportCipher(state.ck, false)
+		processAct1: (act1: Buffer): void => responderProcessAct1(state, act1),
+		createAct2: (): Buffer => responderAct2(state, ephemeralPriv),
+		processAct3: (act3: Buffer): Buffer => responderProcessAct3(state, act3),
+		deriveTransport: (): TransportCipher =>
+			deriveTransportCipher(state.ck, false)
 	};
 }
 

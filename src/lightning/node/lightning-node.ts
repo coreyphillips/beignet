@@ -637,7 +637,7 @@ export class LightningNode extends EventEmitter {
 			// Cooperative closes are priced from the LIVE feerate, not the
 			// commitment feerate (pinned to the 253 sat/kw floor on anchors,
 			// where fees ride on CPFP — a closing tx has no anchor to bump).
-			getClosingFeeratePerKw: () => {
+			getClosingFeeratePerKw: (): number | undefined => {
 				const satPerVbyte = this.feeAdvisor.getCurrentRate();
 				return satPerVbyte > 0
 					? Math.ceil(this.clampEstimatedFeeRate(satPerVbyte) * 250)
@@ -1747,7 +1747,7 @@ export class LightningNode extends EventEmitter {
 	private makeAnnouncementSigner(
 		channelId: Buffer
 	): (data: Buffer) => { nodeSig: Buffer; bitcoinSig: Buffer } {
-		return (data: Buffer) => {
+		return (data: Buffer): { nodeSig: Buffer; bitcoinSig: Buffer } => {
 			const hash = crypto
 				.createHash('sha256')
 				.update(crypto.createHash('sha256').update(data).digest())
@@ -10143,7 +10143,9 @@ export class LightningNode extends EventEmitter {
 			const seed = bip39.mnemonicToSeedSync(mnemonic, options?.passphrase);
 			const BIP32Factory = bip32Lib.BIP32Factory(ecc);
 			const root = BIP32Factory.fromSeed(seed);
-			channelKeyDeriver = (channelIndex: number) => {
+			channelKeyDeriver = (
+				channelIndex: number
+			): ReturnType<NonNullable<INodeConfig['channelKeyDeriver']>> => {
 				const ck = deriveChannelKeys(root, coinType, channelIndex);
 				return {
 					fundingPrivkey: ck.fundingPrivkey,

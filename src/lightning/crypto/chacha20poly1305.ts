@@ -26,8 +26,10 @@ export function encrypt(
 		throw new Error(`Nonce must be ${NONCE_LENGTH} bytes, got ${nonce.length}`);
 	}
 
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Node's createCipheriv overloads omit chacha20-poly1305 + authTagLength; runtime supports both
 	const cipher = crypto.createCipheriv(ALGORITHM as any, key, nonce, {
 		authTagLength: TAG_LENGTH
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
 	} as any) as crypto.CipherGCM;
 	cipher.setAAD(aad);
 
@@ -68,8 +70,10 @@ export function decrypt(
 	);
 	const tag = ciphertextWithTag.subarray(ciphertextWithTag.length - TAG_LENGTH);
 
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- Node's createDecipheriv overloads omit chacha20-poly1305 + authTagLength; runtime supports both
 	const decipher = crypto.createDecipheriv(ALGORITHM as any, key, nonce, {
 		authTagLength: TAG_LENGTH
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- see above
 	} as any) as crypto.DecipherGCM;
 	decipher.setAAD(aad);
 	decipher.setAuthTag(tag);
