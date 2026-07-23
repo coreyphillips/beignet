@@ -11,7 +11,7 @@ jobs:
 
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 1
 
@@ -27,7 +27,7 @@ jobs:
         run: wait-for-it -h 127.0.0.1 -p 60001 -t 60
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: 'npm'
