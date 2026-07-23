@@ -504,7 +504,9 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					requestBody: bodyContent({
 						pubkey: 'string',
 						amountSats: 'number',
-						pushSats: 'number?'
+						pushSats: 'number?',
+						satsPerVbyte: 'number?',
+						max: 'boolean?'
 					}),
 					responses: {
 						'200': {

@@ -107,6 +107,14 @@ export interface IDualFundingParams {
 	maxLeaseRates?: ILeaseRates;
 	/** Liquidity ads (bLIP-0051): seller's signed will_fund commitment (acceptor). */
 	willFund?: IWillFund;
+	/**
+	 * Max (sweep-everything) open: fundingSatoshis was quoted as the whole
+	 * spendable balance minus the interactive-tx fee, and funding contributes
+	 * EVERY spendable UTXO so the change nets out to zero. Local-only (NOT
+	 * sent on the wire); consumed by autoFundDualFundedOpen to select all
+	 * inputs instead of covering a fixed amount.
+	 */
+	fundMax?: boolean;
 }
 
 /** Result of a dual-funding operation */

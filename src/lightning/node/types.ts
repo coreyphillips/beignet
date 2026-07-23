@@ -109,6 +109,38 @@ export interface IFundingProvider {
 	};
 
 	/**
+	 * Price a max (sweep-everything) dual-funded v2 open (optional; required,
+	 * with selectMaxDualFundingInputs, for openChannel with fundMax toward a
+	 * dual-fund peer). Synchronous because open_channel2 commits
+	 * funding_satoshis up front. The quote prices contributing EVERY spendable
+	 * UTXO as the initiator at this feerate using the SAME weight formula the
+	 * channel's contribution computation applies
+	 * (dualFundingContributionWeight), so the committed amount leaves exactly
+	 * the interactive-tx fee behind and the funding transaction carries no
+	 * change output.
+	 */
+	quoteDualFundingMax?(feeratePerKw: number): {
+		/** spendableSats minus feeSats (0n when the fee exceeds the balance). */
+		fundingSatoshis: bigint;
+		spendableSats: bigint;
+		feeSats: bigint;
+		inputCount: number;
+	};
+
+	/**
+	 * Select EVERY spendable wallet UTXO for a max dual-funded open (optional,
+	 * paired with quoteDualFundingMax). The channel derives change as
+	 * inputs - contribution - fee, which lands on exactly zero when the
+	 * balance is unchanged since the quote; a deposit that lands in between
+	 * simply becomes change (or extra fee below the dust limit), and a spend
+	 * in between aborts the open as underfunded rather than guessing.
+	 */
+	selectMaxDualFundingInputs?(): Promise<{
+		inputs: import('../channel/channel').ISpliceWalletInput[];
+		changeScript: Buffer;
+	}>;
+
+	/**
 	 * Anchor fee-bumping (optional): select wallet UTXOs to fund a fee bump and
 	 * return them (each with prevTx, value and a witness-signing closure) plus a
 	 * change script. Used to attach a fee input to a zero-fee second-level HTLC

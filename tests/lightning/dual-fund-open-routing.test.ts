@@ -228,12 +228,93 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		expect(v2Calls.length).to.equal(0);
 	});
 
-	it('rejects max funding on a dual-funded open with an honest error', function () {
+	it('a max open toward a dual-fund peer commits the provider v2 quote', function () {
+		// The caller's amount is v1 sweep math (actual tx vbytes); a v2
+		// initiator pays the interactive-tx weight formula, so the engine
+		// recommits the funding provider's own quote at the pinned rate.
+		wirePeer(true);
+		const quoteCalls: number[] = [];
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(node as any).fundingProvider = {
+			quoteDualFundingMax: (feeratePerKw: number) => {
+				quoteCalls.push(feeratePerKw);
+				return {
+					fundingSatoshis: 123_456n,
+					spendableSats: 125_000n,
+					feeSats: 1_544n,
+					inputCount: 2
+				};
+			},
+			selectMaxDualFundingInputs: async () => ({
+				inputs: [],
+				changeScript: Buffer.alloc(0)
+			})
+		};
+		node.openChannel(peerPubkey, 100_000n, undefined, 5, true);
+		expect(v2Calls.length, 'v2 used').to.equal(1);
+		expect(quoteCalls, 'quoted at the pinned rate in sat/kw').to.deep.equal([
+			1250
+		]);
+		expect(v2Calls[0].fundingSatoshis, 'quote committed').to.equal(123_456n);
+		expect(v2Calls[0].fundingFeeratePerkw).to.equal(1250);
+		expect(
+			(v2Calls[0] as { fundMax?: boolean }).fundMax,
+			'max marker forwarded'
+		).to.equal(true);
+	});
+
+	it('a max open without provider max support fails honestly', function () {
 		wirePeer(true);
 		expect(() =>
 			node.openChannel(peerPubkey, 100_000n, undefined, 5, true)
-		).to.throw(/max funding.*not yet supported/i);
+		).to.throw(/requires a funding provider with quoteDualFundingMax/i);
 		expect(v2Calls.length).to.equal(0);
+	});
+
+	it('a max open on an empty wallet fails honestly', function () {
+		wirePeer(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(node as any).fundingProvider = {
+			quoteDualFundingMax: () => ({
+				fundingSatoshis: 0n,
+				spendableSats: 100n,
+				feeSats: 700n,
+				inputCount: 1
+			}),
+			selectMaxDualFundingInputs: async () => ({
+				inputs: [],
+				changeScript: Buffer.alloc(0)
+			})
+		};
+		expect(() =>
+			node.openChannel(peerPubkey, 100_000n, undefined, 5, true)
+		).to.throw(/insufficient funds for a max dual-funded open/i);
+		expect(v2Calls.length).to.equal(0);
+	});
+
+	it('a max open still requires a pinned rate, v1 and v2 alike', function () {
+		wirePeer(true);
+		expect(() =>
+			node.openChannel(peerPubkey, 100_000n, undefined, undefined, true)
+		).to.throw(/max funding requires a pinned satsPerVbyte/i);
+		expect(v2Calls.length).to.equal(0);
+	});
+
+	it('listChannels names the peer for a v2 channel mid-negotiation', function () {
+		// accept_channel2 swaps the temporary id for the derived v2 channel_id,
+		// but the peer map keeps the temporary-id key until promotion. The
+		// listing must fall back to the temp id — an empty peerPubkey renders
+		// in the dashboard as an unknown, offline peer whose Reconnect button
+		// sends an empty pubkey.
+		const channel = node.openChannelV2(peerPubkey, {
+			fundingSatoshis: 100_000n
+		});
+		channel.getFullState().channelId = crypto.randomBytes(32);
+		const infos = node.listChannels();
+		expect(infos.length).to.equal(1);
+		expect(infos[0].peerPubkey, 'peer resolved via temp id').to.equal(
+			peerPubkey
+		);
 	});
 
 	it('a zero push routes to v2 rather than erroring', function () {

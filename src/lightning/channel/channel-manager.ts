@@ -3791,6 +3791,15 @@ export class ChannelManager extends EventEmitter {
 						);
 						delete localParams.willFund;
 						localParams.fundingSatoshis = 0n;
+						// Withdrawn lease → plain zero-contribution accept; register
+						// the empty contribution so the drive still answers the
+						// opener's turns (see below).
+						channel.setDualFundingContribution(
+							[],
+							Buffer.alloc(0),
+							0n,
+							msg.fundingFeeratePerkw
+						);
 						const actions = channel.handleOpenChannel2(msg, localParams);
 						this.processActions(peerPubkey, channel, actions);
 					});
@@ -3798,6 +3807,21 @@ export class ChannelManager extends EventEmitter {
 			}
 			// No funding provider: keep the legacy behavior (the embedder — or a
 			// test harness — drives the contribution itself via addTxInput).
+		} else {
+			// Plain zero-contribution accept. Register the EMPTY contribution so
+			// the interactive-tx drive takes our turns: with nothing to add it
+			// answers each opener message with tx_complete. Without a registered
+			// contribution the drive is a no-op (reserved for the legacy
+			// embedder-driven flow), the acceptor never completes, and the
+			// negotiation deadlocks with both sides parked in DUAL_FUNDING_V2 —
+			// which is exactly how every beignet-to-beignet v2 open hung (CLN
+			// acceptors reply on their own, so interop tests never caught it).
+			channel.setDualFundingContribution(
+				[],
+				Buffer.alloc(0),
+				0n,
+				msg.fundingFeeratePerkw
+			);
 		}
 
 		const actions = channel.handleOpenChannel2(msg, localParams);
@@ -3863,16 +3887,26 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private autoFundDualFundedOpen(channel: Channel, peerPubkey: string): void {
 		const fp = this.fundingProvider;
-		if (!fp?.selectSpliceInputs) return;
 		const session = channel.getDualFundingSession();
 		const local = session?.getLocalParams();
 		if (!session || !session.isInitiator() || !local) return;
+		// A max open contributes EVERY spendable UTXO (change nets out to zero
+		// against the committed amount); a fixed open covers amount + fee.
+		// Without the matching provider method the legacy behavior holds: the
+		// embedder drives the contribution itself via addTxInput.
+		const fundMax = local.fundMax === true;
+		if (fundMax ? !fp?.selectMaxDualFundingInputs : !fp?.selectSpliceInputs) {
+			return;
+		}
 
 		const state = channel.getFullState();
 		const contributionSats = local.fundingSatoshis + (state.leaseFeeSats ?? 0n);
 		const feeratePerKw = local.fundingFeeratePerkw;
 
-		fp.selectSpliceInputs(contributionSats, feeratePerKw)
+		(fundMax
+			? fp!.selectMaxDualFundingInputs!()
+			: fp!.selectSpliceInputs!(contributionSats, feeratePerKw)
+		)
 			.then(({ inputs, changeScript }) => {
 				channel.setDualFundingContribution(
 					inputs,

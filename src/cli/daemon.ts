@@ -611,16 +611,17 @@ export async function startDaemon(
 		},
 
 		'POST /channel/open': (body) => {
-			const { pubkey, amountSats, pushSats, satsPerVbyte } = body as {
+			const { pubkey, amountSats, pushSats, satsPerVbyte, max } = body as {
 				pubkey: string;
 				amountSats: number;
 				pushSats?: number;
 				satsPerVbyte?: number;
+				max?: boolean;
 			};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
 			return success(
-				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte)
+				node.openChannel(pubkey, amountSats, pushSats, satsPerVbyte, max)
 			);
 		},
 		'POST /channel/close': (body) => {

@@ -699,14 +699,19 @@ async function handlePeer(): Promise<void> {
 async function handleChannel(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
-		case 'open':
+		case 'open': {
+			const openRate = parseFlag('--sats-per-vbyte');
 			return outputResult(
 				await httpRequest('POST', '/channel/open', {
 					pubkey: filteredArgs[2],
 					amountSats: parseInt(filteredArgs[3], 10),
-					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined
+					pushSats: filteredArgs[4] ? parseInt(filteredArgs[4], 10) : undefined,
+					satsPerVbyte: openRate ? parseInt(openRate, 10) : undefined,
+					// Sweep the whole on-chain balance into the channel (no change).
+					max: hasFlag('--max') || undefined
 				})
 			);
+		}
 		case 'close':
 			return outputResult(
 				await httpRequest('POST', '/channel/close', {
@@ -2177,7 +2182,8 @@ Trusted Peers (Zero-Conf):
   trusted-peer list                      List trusted peers
 
 Channels:
-  channel open <pubkey> <sats> [push]    Open channel (auto-funded)
+  channel open <pubkey> <sats> [push] [--sats-per-vbyte N] [--max]
+                                         Open channel (auto-funded)
   channel open-zeroconf <pk> <sats> [push]  Open zero-conf channel
   channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
   channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
