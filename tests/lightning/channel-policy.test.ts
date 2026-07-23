@@ -302,6 +302,37 @@ describe('Channel Routing Policy (M3)', function () {
 			expect(policy.htlcMaximumMsat).to.equal(1_000_000_000n);
 		});
 
+		it('derives the advertised htlc max from the REMOTE in-flight limit, not our own', function () {
+			// A channel opened under the old 500k-sat max_htlc_value_in_flight
+			// default persists that value in its LOCAL config for life. That
+			// figure bounds the PEER's HTLCs toward us — it says nothing about
+			// what we can send — yet the advertised htlc_maximum_msat used to
+			// derive from it, freezing a 500k ceiling into gossip that route
+			// finders (including our own) enforced against our outbound
+			// payments. Observed live: 1M sats refused as NO_ROUTE on a 4.05M
+			// channel holding 1.27M spendable. The ceiling must come from the
+			// remote's limit on OUR HTLCs, clamped to capacity.
+			const relicAlice = new LightningNode({
+				...makeNodeConfig(9),
+				channelConfig: {
+					...DEFAULT_CHANNEL_CONFIG,
+					maxHtlcValueInFlightMsat: 500_000_000n // the old default
+				}
+			});
+			relicAlice.on('node:error', () => {});
+			const relicBob = createNode(10);
+			connectNodes(relicAlice, relicBob);
+			const relicChannelId = openReadyChannel(relicAlice, relicBob);
+
+			const policy = relicAlice.getChannelPolicy(relicChannelId)!;
+			// Bob (remote) accepts up to U64 max, so the ceiling is the full
+			// 1M-sat capacity — NOT the 500k relic from our own local config.
+			expect(policy.htlcMaximumMsat).to.equal(1_000_000_000n);
+
+			relicAlice.destroy();
+			relicBob.destroy();
+		});
+
 		it('override takes precedence, unset fields fall back to defaults', function () {
 			alice.setChannelPolicy(channelId, {
 				feeBaseMsat: 2500,

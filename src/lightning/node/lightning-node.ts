@@ -4205,12 +4205,22 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		const override = this.channelPolicies.get(channelId.toString('hex'));
 		// Same defaults the initial channel_update advertises: the channel's
-		// negotiated htlc_minimum_msat and capacity-capped max-in-flight.
+		// negotiated htlc_minimum_msat, and for htlc_maximum_msat the largest
+		// HTLC the channel can actually carry OUTBOUND: capacity capped by the
+		// REMOTE's max_htlc_value_in_flight (the peer's limit on HTLCs we
+		// offer). Deriving it from our LOCAL config was the wrong side (that
+		// bounds the peer's HTLCs toward us, not ours toward the peer) and it
+		// froze open-time history into gossip: a channel opened under the old
+		// 500k-sat default advertised a 500k ceiling for life, so route
+		// finders — including our own — refused payments the channel could
+		// easily carry. Observed live: 1M sats refused as NO_ROUTE on a
+		// 4.05M channel holding 1.27M spendable. Remote-derived, the ceiling
+		// self-heals on the next channel_update refresh.
 		const capacityMsat = state.fundingSatoshis * 1000n;
 		const defaultHtlcMax =
-			state.localConfig.maxHtlcValueInFlightMsat > capacityMsat
+			state.remoteConfig.maxHtlcValueInFlightMsat > capacityMsat
 				? capacityMsat
-				: state.localConfig.maxHtlcValueInFlightMsat;
+				: state.remoteConfig.maxHtlcValueInFlightMsat;
 		return {
 			feeBaseMsat: override?.feeBaseMsat ?? this.forwardingFeeBaseMsat,
 			feeProportionalMillionths:
