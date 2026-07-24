@@ -83,6 +83,11 @@ export interface IUtxo {
 	value: number;
 	publicKey: string;
 	keyPair?: BIP32Interface | ECPairInterface;
+	/** Set on frozen (blacklisted) entries created with a tag: who froze the
+	 *  coin (e.g. 'funding-pledge') and when, so automated freezers can
+	 *  recover their own stale freezes after a restart. */
+	freezeTag?: string;
+	frozenAt?: number;
 }
 
 export interface IVin {

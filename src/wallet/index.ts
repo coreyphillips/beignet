@@ -2434,10 +2434,15 @@ export class Wallet {
 	 */
 	public async freezeUtxo({
 		txid,
-		index
+		index,
+		tag
 	}: {
 		txid: string;
 		index: number;
+		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
+		 *  entry so automated freezers can recognize, and recover, their own
+		 *  freezes after a restart without touching user-frozen coins. */
+		tag?: string;
 	}): Promise<Result<string>> {
 		if (typeof txid !== 'string' || !/^[0-9a-fA-F]{64}$/.test(txid)) {
 			return err('txid must be a 64-character hex string.');
@@ -2457,7 +2462,10 @@ export class Wallet {
 		// keyPair must never be persisted with the frozen entry.
 		const { keyPair, ...frozen } = utxo;
 		void keyPair;
-		this._data.blacklistedUtxos.push(frozen);
+		this._data.blacklistedUtxos.push({
+			...frozen,
+			...(tag !== undefined ? { freezeTag: tag, frozenAt: Date.now() } : {})
+		});
 		await this.saveWalletData('blacklistedUtxos', this._data.blacklistedUtxos);
 		return ok(`UTXO ${txid}:${index} frozen.`);
 	}
