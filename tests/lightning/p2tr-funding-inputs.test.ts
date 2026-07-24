@@ -133,15 +133,18 @@ describe('P2TR funding inputs', function () {
 		const prevouts = { scripts: prevoutScripts, values: prevoutValues };
 
 		for (let i = 0; i < inputs.length; i++) {
-			const witness = inputs[i].signWitness(spend, i, inputs[i].value, prevouts);
+			const witness = inputs[i].signWitness(
+				spend,
+				i,
+				inputs[i].value,
+				prevouts
+			);
 			spend.setWitness(i, witness);
 		}
 
 		// The taproot input carries exactly one 64-byte Schnorr signature that
 		// verifies against the output key of the funded address.
-		const trIndex = prevoutScripts.findIndex(
-			(s) => scriptKind(s) === 'p2tr'
-		);
+		const trIndex = prevoutScripts.findIndex((s) => scriptKind(s) === 'p2tr');
 		const trWitness = spend.ins[trIndex].witness;
 		expect(trWitness.length).to.equal(1);
 		expect(trWitness[0].length).to.equal(64);
@@ -165,7 +168,9 @@ describe('P2TR funding inputs', function () {
 		const { inputs } = await provider.selectSpliceInputs!(100_000n, 1000);
 		const trInput = inputs.find((i) => {
 			const prev = bitcoin.Transaction.fromBuffer(i.prevTx);
-			return scriptKind(Buffer.from(prev.outs[i.prevOutputIndex].script)) === 'p2tr';
+			return (
+				scriptKind(Buffer.from(prev.outs[i.prevOutputIndex].script)) === 'p2tr'
+			);
 		})!;
 		const spend = new bitcoin.Transaction();
 		spend.version = 2;
@@ -177,6 +182,32 @@ describe('P2TR funding inputs', function () {
 		);
 	});
 
+	it('fee-bump selection never picks P2TR coins', async function () {
+		// The fee-bump attach paths (sweep.ts) sign wallet inputs with
+		// (tx, index, value) only and cannot supply the prevout set a BIP 341
+		// sighash commits to, so selectFeeBumpInputs must stay P2WPKH-only.
+		const { wallet } = makeWallet();
+		const provider = new WalletFundingProvider(wallet as never);
+
+		// A small target is covered by the P2WPKH coin alone.
+		const { inputs } = await provider.selectFeeBumpInputs!(10_000n, 1000);
+		for (const input of inputs) {
+			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+			expect(
+				scriptKind(Buffer.from(prev.outs[input.prevOutputIndex].script))
+			).to.equal('p2wpkh');
+		}
+
+		// A target beyond the P2WPKH balance must fail honestly instead of
+		// reaching for the taproot coin it cannot sign.
+		try {
+			await provider.selectFeeBumpInputs!(100_000n, 1000);
+			expect.fail('expected insufficient-funds error');
+		} catch (err) {
+			expect((err as Error).message).to.contain('insufficient wallet funds');
+		}
+	});
+
 	it('taproot key tweak matches the address output key', function () {
 		const key = ECPair.makeRandom({ network });
 		const pub = Buffer.from(key.publicKey);
@@ -184,10 +215,7 @@ describe('P2TR funding inputs', function () {
 			internalPubkey: pub.subarray(1, 33),
 			network
 		});
-		const tweaked = taprootTweakPrivateKey(
-			Buffer.from(key.privateKey!),
-			pub
-		);
+		const tweaked = taprootTweakPrivateKey(Buffer.from(key.privateKey!), pub);
 		const msg = crypto.randomBytes(32);
 		const sig = Buffer.from(ecc.signSchnorr(msg, tweaked));
 		const outputKey = payment.output!.subarray(2);

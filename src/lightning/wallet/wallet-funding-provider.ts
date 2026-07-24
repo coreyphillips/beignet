@@ -298,6 +298,9 @@ export class WalletFundingProvider implements IFundingProvider {
 		targetFeeSats: bigint,
 		feeratePerKw: number
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		// P2WPKH only: the fee-bump attach paths (sweep.ts) sign wallet inputs
+		// with (tx, index, value) and cannot supply the full prevout set a
+		// P2TR input's BIP 341 sighash commits to.
 		return this.gatherWalletInputs(
 			'fee-bump',
 			(selectedCount) =>
@@ -306,27 +309,32 @@ export class WalletFundingProvider implements IFundingProvider {
 					selectedCount * P2WPKH_INPUT_WEIGHT + outputWeight(22),
 					feeratePerKw
 				) +
-				P2WPKH_DUST_LIMIT
+				P2WPKH_DUST_LIMIT,
+			true
 		);
 	}
 
 	/**
-	 * The UTXOs a splice-in (or fee bump) may spend: P2WPKH only, since the
-	 * signing recipe in gatherWalletInputs is P2WPKH-specific. Confirmed before
-	 * unconfirmed, then largest first within each group.
+	 * The UTXOs a splice-in (or fee bump) may spend. P2WPKH and P2TR
+	 * (key-path) coins: the two script kinds this provider knows how to
+	 * sign. Weight estimation stays on the P2WPKH figure, which
+	 * over-estimates a taproot input, so fees err on the safe side.
+	 * Confirmed before unconfirmed, then largest first within each group.
+	 *
+	 * `p2wpkhOnly` restricts selection to P2WPKH for callers whose signing
+	 * path cannot supply the full prevout set a BIP 341 sighash commits to
+	 * (the fee-bump attach paths in sweep.ts sign with (tx, index, value)
+	 * only, so a P2TR input would throw at signing time).
 	 */
-	private spendableP2wpkhUtxos(): ISpliceUtxo[] {
+	private spendableP2wpkhUtxos(p2wpkhOnly = false): ISpliceUtxo[] {
 		if (!this.wallet.listUtxos) return [];
 		const network = this.bitcoinJsNetwork();
-		// P2WPKH and P2TR (key-path) UTXOs: the two script kinds this provider
-		// knows how to sign. Weight estimation stays on the P2WPKH figure,
-		// which over-estimates a taproot input, so fees err on the safe side.
 		const candidates = this.wallet.listUtxos().filter((u) => {
 			try {
-				return (
-					scriptKind(bitcoin.address.toOutputScript(u.address, network)) !==
-					null
+				const kind = scriptKind(
+					bitcoin.address.toOutputScript(u.address, network)
 				);
+				return p2wpkhOnly ? kind === 'p2wpkh' : kind !== null;
 			} catch {
 				return false;
 			}
@@ -419,7 +427,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/**
-	 * Shared P2WPKH UTXO selection used by splice-in and fee bumping.
+	 * Shared wallet UTXO selection used by splice-in, v2 funding and fee
+	 * bumping.
 	 *
 	 * Selects confirmed-first, largest-first until the running total covers
 	 * `computeTarget(selectedCount)` — recomputed per added input because each
@@ -428,7 +437,8 @@ export class WalletFundingProvider implements IFundingProvider {
 	 */
 	private async gatherWalletInputs(
 		purpose: string,
-		computeTarget: (selectedCount: number) => bigint
+		computeTarget: (selectedCount: number) => bigint,
+		p2wpkhOnly = false
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
 		const wallet = this.wallet;
 		if (
@@ -442,7 +452,7 @@ export class WalletFundingProvider implements IFundingProvider {
 			);
 		}
 
-		const candidates = this.spendableP2wpkhUtxos();
+		const candidates = this.spendableP2wpkhUtxos(p2wpkhOnly);
 		const network = this.bitcoinJsNetwork();
 
 		const selected: ISpliceUtxo[] = [];
