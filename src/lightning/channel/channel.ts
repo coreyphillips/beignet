@@ -691,10 +691,15 @@ export class Channel {
 		}
 		// Trusted-peer zero-conf: the intent must be carried in channel_type
 		// (BOLT 2 feature 50) or the peer treats this as an ordinary open and
-		// waits for confirmation. Note the extra bit makes an LND taproot peer
-		// reject the type (exact-match validation); zero-conf opens are only
-		// ever made toward trusted peers, where that combination does not arise.
-		if (this._state.zeroConfEnabled && this._state.trustedPeer) {
+		// waits for confirmation. BOLT 9 makes option_zeroconf depend on
+		// option_scid_alias, and a feature vector MUST include its transitive
+		// dependencies, so both bits ride together. Note the extra bits make an
+		// LND taproot peer reject the type (exact-match validation); zero-conf
+		// opens are only ever made toward trusted peers, where that combination
+		// does not arise.
+		const zeroConf = this._state.zeroConfEnabled && this._state.trustedPeer;
+		if (zeroConf) {
+			channelTypeFlags.setCompulsory(Feature.SCID_ALIAS);
 			channelTypeFlags.setCompulsory(Feature.ZERO_CONF);
 		}
 		const channelType = channelTypeFlags.toBuffer();
@@ -734,10 +739,18 @@ export class Channel {
 			firstPerCommitmentPoint: firstPoint,
 			// announce_channel bit. Simple taproot channels MUST be unannounced —
 			// LND rejects a public taproot channel ("taproot channel type for public
-			// channel"), so force the private flag for taproot.
-			channelFlags: preferTaproot ? 0x00 : 0x01,
+			// channel"), so force the private flag for taproot. Same for zero-conf:
+			// BOLT 2 forbids a channel_type containing option_scid_alias when
+			// announce_channel is set.
+			channelFlags: preferTaproot || zeroConf ? 0x00 : 0x01,
 			channelType
 		};
+
+		// Keep our own record in step with what went on the wire, so the
+		// announcement machinery never tries to announce a private channel.
+		if (zeroConf) {
+			this._state.announceChannel = false;
+		}
 
 		// option_taproot: attach our MuSig2 public nonce for the first commitment.
 		if (preferTaproot) {

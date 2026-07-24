@@ -3525,21 +3525,28 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Open a zero-conf channel with a trusted peer.
-	 * Channel becomes usable immediately after funding_signed, before confirmation.
+	 * Channel becomes usable immediately after funding, before confirmation.
+	 *
+	 * @deprecated Prefer openChannel(..., trusted = true). This wrapper routes
+	 * through it so the open honors the negotiated funding protocol: BOLT 2
+	 * forbids a v1 open_channel once option_dual_fund is negotiated, which the
+	 * old direct-to-v1 path violated between two default-featured beignet
+	 * nodes. A nonzero push toward a dual-fund peer is rejected (open_channel2
+	 * has no push_msat) rather than smuggled through an illegal v1 open.
+	 * Throws instead of returning null on an untrusted peer.
 	 */
 	openZeroConfChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint
 	): Channel | null {
-		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
-		if (pubkeyErr) throw new Error(pubkeyErr);
-		const satsErr = validatePositiveBigint(fundingSatoshis, 'fundingSatoshis');
-		if (satsErr) throw new Error(satsErr);
-		return this.channelManager.openZeroConfChannel(
+		return this.openChannel(
 			peerPubkey,
 			fundingSatoshis,
-			pushMsat
+			pushMsat,
+			undefined,
+			false,
+			true
 		);
 	}
 
@@ -3817,6 +3824,31 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether option_zeroconf (and its BOLT 9 dependency option_scid_alias)
+	 * is negotiated with this peer. BOLT 2 says a node SHOULD NOT propose a
+	 * channel type carrying features that were not negotiated, so a trusted
+	 * open checks this up front and fails clearly instead of sending a
+	 * mandatory channel-type bit the peer never advertised (e.g. an older
+	 * daemon in a mixed-version own-node deployment). Without a peer manager
+	 * (in-process harnesses) there is no init to consult and the check
+	 * passes, mirroring how openChannel skips its connectivity check.
+	 */
+	private peerNegotiatedZeroConf(peerPubkey: string): boolean {
+		if (
+			!this.localFeatures.hasFeature(Feature.ZERO_CONF) ||
+			!this.localFeatures.hasFeature(Feature.SCID_ALIAS)
+		) {
+			return false;
+		}
+		if (!this.peerManager) return true;
+		const init = this.peerManager.getPeer(peerPubkey)?.getRemoteInit();
+		return Boolean(
+			init?.features.hasFeature(Feature.ZERO_CONF) &&
+				init.features.hasFeature(Feature.SCID_ALIAS)
+		);
+	}
+
+	/**
 	 * Open a channel with a peer.
 	 *
 	 * trusted opens a zero-conf channel toward a peer in the zero-conf trusted
@@ -3866,6 +3898,16 @@ export class LightningNode extends EventEmitter {
 		if (fundMax && satsPerVbyte === undefined) {
 			throw new Error(
 				'max funding requires a pinned satsPerVbyte (the rate the max amount was quoted at)'
+			);
+		}
+		// A trusted open proposes a mandatory zero_conf + scid_alias channel
+		// type; BOLT 2 says not to propose channel-type features the peer never
+		// negotiated. Fail clearly here (an older daemon that does not
+		// advertise them, say) instead of sending a proposal the peer must
+		// reject with an opaque channel-type error.
+		if (trusted && !this.peerNegotiatedZeroConf(peerPubkey)) {
+			throw new Error(
+				`Peer ${peerPubkey} did not negotiate option_zeroconf and option_scid_alias; a trusted (zero-conf) open needs both in its init features`
 			);
 		}
 		// BOLT 2: once option_dual_fund is negotiated with a peer, a v1

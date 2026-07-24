@@ -133,7 +133,7 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 		).to.throw('not in the trusted set');
 	});
 
-	it('open_channel carries the zero_conf channel type and a standard reserve', function () {
+	it('open_channel carries zero_conf + scid_alias, private, standard reserve', function () {
 		const { alice, bob } = createConnectedManagerPair();
 		alice.addTrustedPeer(bobPubkey);
 		bob.addTrustedPeer(alicePubkey);
@@ -146,9 +146,13 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 			}
 		);
 
-		alice.openChannel(bobPubkey, 1_000_000n, undefined, undefined, {
-			trusted: true
-		});
+		const channel = alice.openChannel(
+			bobPubkey,
+			1_000_000n,
+			undefined,
+			undefined,
+			{ trusted: true }
+		);
 
 		expect(openPayload).to.not.be.null;
 		const open = decodeOpenChannelMessage(openPayload!);
@@ -157,6 +161,14 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 		expect(open.channelType).to.exist;
 		const bits = FeatureFlags.fromBuffer(open.channelType!);
 		expect(bits.hasFeature(Feature.ZERO_CONF)).to.be.true;
+		// BOLT 9: option_zeroconf depends on option_scid_alias; the vector must
+		// carry its transitive dependencies.
+		expect(bits.hasFeature(Feature.SCID_ALIAS)).to.be.true;
+		// BOLT 2: a channel_type carrying option_scid_alias must not be
+		// announced, so the open goes out private on both the wire and our own
+		// record of it.
+		expect(open.channelFlags & 0x01).to.equal(0);
+		expect(channel.getFullState().announceChannel).to.be.false;
 	});
 
 	it('trusted acceptor answers minimum_depth 0; reserves stay standard', function () {
@@ -182,6 +194,8 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 		expect(acceptorState.zeroConfEnabled).to.be.true;
 		expect(acceptorState.minimumDepth).to.equal(0);
 		expect(acceptorState.localConfig.channelReserveSatoshis).to.equal(10_000n);
+		// The acceptor recorded the private announce_channel bit from the wire.
+		expect(acceptorState.announceChannel).to.be.false;
 	});
 
 	it('an untrusted acceptor rejects the zero_conf proposal', function () {
@@ -316,6 +330,9 @@ describe('Trusted channel opens (zero-conf, v1 path)', function () {
 			? FeatureFlags.fromBuffer(open.channelType)
 			: FeatureFlags.empty();
 		expect(bits.hasFeature(Feature.ZERO_CONF)).to.be.false;
+		expect(bits.hasFeature(Feature.SCID_ALIAS)).to.be.false;
+		// Ordinary opens keep announcing.
+		expect(open.channelFlags & 0x01).to.equal(1);
 		expect(channel.getFullState().zeroConfEnabled).to.be.false;
 	});
 
@@ -410,6 +427,68 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		)!;
 		return { alice, bob, channelId };
 	}
+
+	it('the legacy openZeroConfChannel routes through the trusted open path', function () {
+		// The old helper went straight to a v1 open_channel, which violates
+		// BOLT 2 once option_dual_fund is negotiated. It now delegates to
+		// openChannel(..., trusted), inheriting the v1/v2 routing, the
+		// zero_conf + scid_alias channel type, and the private announce bit.
+		const alice = new LightningNode(makeNodeConfig(1));
+		const bob = new LightningNode(makeNodeConfig(2));
+		for (const n of [alice, bob]) {
+			n.on('error', () => {});
+			n.on('node:error', () => {});
+		}
+		alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+			if (pk === bob.getNodeId()) {
+				bob.handlePeerMessage(alice.getNodeId(), t, p);
+			}
+		});
+		bob.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+			if (pk === alice.getNodeId()) {
+				alice.handlePeerMessage(bob.getNodeId(), t, p);
+			}
+		});
+		alice.addTrustedPeer(bob.getNodeId());
+		bob.addTrustedPeer(alice.getNodeId());
+
+		const channel = alice.openZeroConfChannel(bob.getNodeId(), 1_000_000n)!;
+		const st = channel.getFullState();
+		expect(st.zeroConfEnabled).to.be.true;
+		expect(st.minimumDepth).to.equal(0);
+		expect(st.announceChannel).to.be.false;
+		const bits = FeatureFlags.fromBuffer(st.channelType!);
+		expect(bits.hasFeature(Feature.ZERO_CONF)).to.be.true;
+		expect(bits.hasFeature(Feature.SCID_ALIAS)).to.be.true;
+
+		// An untrusted peer now throws (the routed path validates trust up
+		// front) instead of the old emit-error-and-return-null behavior.
+		const carol = new LightningNode(makeNodeConfig(3));
+		carol.on('error', () => {});
+		expect(() =>
+			carol.openZeroConfChannel(alice.getNodeId(), 1_000_000n)
+		).to.throw('not in the trusted set');
+	});
+
+	it('a trusted open fails clearly when zero-conf features are not negotiated', function () {
+		// BOLT 2: do not propose channel-type features the peer never
+		// negotiated. A node whose own init lacks option_zeroconf/scid_alias
+		// (stand-in for an older peer in a mixed-version deployment) must
+		// refuse up front, not send a proposal the peer rejects opaquely.
+		const bare = LightningNode.defaultFeatures();
+		bare.clearBit(Feature.ZERO_CONF);
+		bare.clearBit(Feature.ZERO_CONF + 1);
+		const alice = new LightningNode({
+			...makeNodeConfig(1),
+			localFeatures: bare
+		});
+		alice.on('error', () => {});
+		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		alice.addTrustedPeer(peer);
+		expect(() =>
+			alice.openChannel(peer, 1_000_000n, undefined, undefined, false, true)
+		).to.throw('did not negotiate option_zeroconf');
+	});
 
 	it('a payment settles before the funding tx confirms', function () {
 		const { alice, bob, channelId } = nodePair();

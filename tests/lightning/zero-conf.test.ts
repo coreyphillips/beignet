@@ -1114,7 +1114,10 @@ describe('Zero-Conf Channels', function () {
 			node.destroy();
 		});
 
-		it('openZeroConfChannel returns null for untrusted peer', function () {
+		it('openZeroConfChannel throws for untrusted peer', function () {
+			// The legacy helper now routes through openChannel(..., trusted),
+			// which validates trust up front and throws, rather than the old
+			// emit-error-and-return-null.
 			const config = makeNodeConfig(4);
 			const node = new LightningNode({
 				nodePrivateKey: config.nodePrivateKey,
@@ -1126,8 +1129,9 @@ describe('Zero-Conf Channels', function () {
 
 			const peerPubkey = makeValidPubkey(95);
 			// Don't add as trusted
-			const result = node.openZeroConfChannel(peerPubkey, 1_000_000n);
-			expect(result).to.be.null;
+			expect(() => node.openZeroConfChannel(peerPubkey, 1_000_000n)).to.throw(
+				'not in the trusted set'
+			);
 
 			node.destroy();
 		});

@@ -329,13 +329,17 @@ describe('trusted zero-conf v2 open (dual-funded)', function () {
 		expect(chB, 'acceptor has the channel').to.exist;
 		expect(chB!.getState()).to.equal(ChannelState.NORMAL);
 
-		// Both sides negotiated the zero_conf channel type and a 0 depth.
+		// Both sides negotiated the zero_conf channel type (with its BOLT 9
+		// scid_alias dependency) and a 0 depth, and the channel is private:
+		// BOLT 2 forbids announcing a type that carries option_scid_alias.
 		for (const ch of [chA, chB!]) {
 			const st = ch.getFullState();
 			expect(st.minimumDepth).to.equal(0);
 			expect(st.channelType, 'channel type recorded').to.exist;
 			const bits = FeatureFlags.fromBuffer(st.channelType!);
 			expect(bits.hasFeature(Feature.ZERO_CONF)).to.equal(true);
+			expect(bits.hasFeature(Feature.SCID_ALIAS)).to.equal(true);
+			expect(st.announceChannel).to.equal(false);
 		}
 	});
 

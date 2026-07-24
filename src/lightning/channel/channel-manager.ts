@@ -461,6 +461,13 @@ export class ChannelManager extends EventEmitter {
 	/**
 	 * Open a zero-conf channel with a peer.
 	 * Peer must be in the trusted set.
+	 *
+	 * LOW-LEVEL, v1-ONLY primitive: this always sends a v1 open_channel and
+	 * MUST NOT be called for a peer that negotiated option_dual_fund (BOLT 2
+	 * forbids open_channel after that). Callers go through
+	 * LightningNode.openChannel(..., trusted = true), which routes v1/v2 by
+	 * the negotiated features; this stays public only for embedders and tests
+	 * that drive v1 negotiation directly.
 	 */
 	openZeroConfChannel(
 		peerPubkey: string,
@@ -3667,17 +3674,25 @@ export class ChannelManager extends EventEmitter {
 		}
 		// Trusted zero-conf: the intent must ride in channel_type (BOLT 2
 		// feature 50) or the acceptor treats this as an ordinary open and
-		// answers with a real confirmation depth.
+		// answers with a real confirmation depth. BOLT 9 makes option_zeroconf
+		// depend on option_scid_alias (a vector MUST include its transitive
+		// dependencies), and BOLT 2 forbids announcing a channel whose type
+		// carries option_scid_alias, so the open goes out private.
+		let channelFlags = params.channelFlags;
 		if (opts?.trusted) {
 			const typeFlags = FeatureFlags.fromBuffer(channelType);
+			typeFlags.setCompulsory(Feature.SCID_ALIAS);
 			typeFlags.setCompulsory(Feature.ZERO_CONF);
 			channelType = typeFlags.toBuffer();
+			channelFlags = (channelFlags ?? 0x01) & ~0x01;
+			state.announceChannel = false;
 		}
 
 		const alignedParams: IDualFundingParams = {
 			...params,
 			chainHash: params.chainHash ?? this.config.chainHash,
 			channelType,
+			channelFlags,
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed,
 			secondPerCommitmentPoint: perCommitmentPointFromSecret(
