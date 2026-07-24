@@ -22,6 +22,38 @@ import {
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
 
+/** Classify a scriptPubKey as one of the spendable kinds, or null. */
+export function scriptKind(script: Buffer): 'p2wpkh' | 'p2tr' | null {
+	if (script.length === 22 && script[0] === 0x00 && script[1] === 0x14) {
+		return 'p2wpkh';
+	}
+	if (script.length === 34 && script[0] === 0x51 && script[1] === 0x20) {
+		return 'p2tr';
+	}
+	return null;
+}
+
+/**
+ * BIP 86/341 key-path tweak: negate the private key when its point has an
+ * odd Y, then add taggedHash("TapTweak", xonly(P)).
+ */
+export function taprootTweakPrivateKey(
+	privKey: Buffer,
+	pubkey: Buffer
+): Buffer {
+	const xOnly = pubkey.length === 33 ? pubkey.subarray(1, 33) : pubkey;
+	let priv: Uint8Array = privKey;
+	if (pubkey.length === 33 && pubkey[0] === 0x03) {
+		const negated = ecc.privateNegate(priv);
+		if (!negated) throw new Error('taproot tweak: privateNegate failed');
+		priv = negated;
+	}
+	const tweak = bitcoin.crypto.taggedHash('TapTweak', Buffer.from(xOnly));
+	const tweaked = ecc.privateAdd(priv, tweak);
+	if (!tweaked) throw new Error('taproot tweak: privateAdd failed');
+	return Buffer.from(tweaked);
+}
+
 /**
  * Minimal Result-like interface matching beignet's Result<T> union type.
  * Both Ok and Err satisfy this via structural typing.
@@ -286,9 +318,15 @@ export class WalletFundingProvider implements IFundingProvider {
 	private spendableP2wpkhUtxos(): ISpliceUtxo[] {
 		if (!this.wallet.listUtxos) return [];
 		const network = this.bitcoinJsNetwork();
+		// P2WPKH and P2TR (key-path) UTXOs: the two script kinds this provider
+		// knows how to sign. Weight estimation stays on the P2WPKH figure,
+		// which over-estimates a taproot input, so fees err on the safe side.
 		const candidates = this.wallet.listUtxos().filter((u) => {
 			try {
-				return bitcoin.address.toOutputScript(u.address, network).length === 22;
+				return (
+					scriptKind(bitcoin.address.toOutputScript(u.address, network)) !==
+					null
+				);
 			} catch {
 				return false;
 			}
@@ -464,14 +502,51 @@ export class WalletFundingProvider implements IFundingProvider {
 				);
 			}
 			const privKey = Buffer.from(keyPair.privateKey!);
-			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+			const outputScript = bitcoin.address.toOutputScript(
+				utxo.address,
+				network
+			);
+			const kind = scriptKind(outputScript);
 
-			return {
+			const base = {
 				prevTx: Buffer.from(hex, 'hex'),
 				prevOutputIndex: utxo.tx_pos,
 				value: BigInt(utxo.value),
 				sequence: 0xfffffffd,
-				confirmed: utxo.height > 0,
+				confirmed: utxo.height > 0
+			};
+
+			if (kind === 'p2tr') {
+				// BIP 86 key-path spend: sign with the taproot-tweaked key over
+				// the BIP 341 sighash, which commits to every input's prevout.
+				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
+				return {
+					...base,
+					signWitness: (
+						tx: bitcoin.Transaction,
+						inputIndex: number,
+						_value: bigint,
+						prevouts?: { scripts: Buffer[]; values: bigint[] }
+					): Buffer[] => {
+						if (!prevouts) {
+							throw new Error(
+								'P2TR input needs the full prevout set to sign (BIP 341)'
+							);
+						}
+						const sighash = tx.hashForWitnessV1(
+							inputIndex,
+							prevouts.scripts,
+							prevouts.values.map((v) => Number(v)),
+							bitcoin.Transaction.SIGHASH_DEFAULT
+						);
+						return [Buffer.from(ecc.signSchnorr(sighash, tweakedPriv))];
+					}
+				};
+			}
+
+			const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
+			return {
+				...base,
 				signWitness: (
 					tx: bitcoin.Transaction,
 					inputIndex: number,
