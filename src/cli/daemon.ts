@@ -17,6 +17,11 @@ import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
 import { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
+import * as bitcoinjs from 'bitcoinjs-lib';
+import {
+	attachDirectFundingReceiver,
+	sendDirectFunding
+} from './direct-funding';
 import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
@@ -241,7 +246,76 @@ export async function startDaemon(
 		query: URLSearchParams
 	) => unknown;
 
+	// Beignet-native 1-tx direct funding: the recipient side is armed at
+	// startup and answers offers as soon as an LSP is configured (at runtime,
+	// via POST /direct-funding/configure). A beignet-aware sender's onchain
+	// payment then becomes this node's channel-funding transaction directly.
+	const directFundingState: { lspPubkey?: string; targetInboundSat: number } =
+		{ targetInboundSat: 0 };
+	const btcNetwork =
+		opts.network === 'mainnet'
+			? bitcoinjs.networks.bitcoin
+			: opts.network === 'testnet'
+			? bitcoinjs.networks.testnet
+			: bitcoinjs.networks.regtest;
+	attachDirectFundingReceiver(node, {
+		getLspPubkey: () => directFundingState.lspPubkey,
+		getTargetInboundSat: () => directFundingState.targetInboundSat,
+		network: btcNetwork,
+		onEvent: (kind, detail) => {
+			process.stderr.write(`direct-funding ${kind}: ${detail}\n`);
+		}
+	});
+
 	const routes: Record<string, RouteHandler> = {
+		// ── Direct funding (1-tx receive) ──
+		'POST /direct-funding/configure': (body) => {
+			const { lspPubkey, targetInboundSat } = body as {
+				lspPubkey?: string;
+				targetInboundSat?: number;
+			};
+			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			directFundingState.lspPubkey = lspPubkey;
+			if (targetInboundSat !== undefined) {
+				directFundingState.targetInboundSat = targetInboundSat;
+			}
+			return success({
+				lspPubkey: directFundingState.lspPubkey,
+				targetInboundSat: directFundingState.targetInboundSat
+			});
+		},
+		'GET /direct-funding/config': () =>
+			success({
+				lspPubkey: directFundingState.lspPubkey ?? null,
+				targetInboundSat: directFundingState.targetInboundSat
+			}),
+		// Sender side: pay a beignet recipient onchain by funding their channel
+		// directly from one of our UTXOs — one transaction, no deposit hop.
+		'POST /direct-funding/send': async (body) => {
+			const { pubkey, host, port, amountSats, feeHeadroomSats } = body as {
+				pubkey?: string;
+				host?: string;
+				port?: number;
+				amountSats?: number;
+				feeHeadroomSats?: number;
+			};
+			if (!pubkey || amountSats === undefined)
+				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
+			if (host && port) {
+				await node.connectPeer(pubkey, host, port).catch(() => {
+					/* may already be connected */
+				});
+			}
+			return success(
+				await sendDirectFunding(
+					node,
+					btcNetwork,
+					pubkey,
+					amountSats,
+					feeHeadroomSats ?? 1000
+				)
+			);
+		},
 		'GET /info': () => success(node.getInfo()),
 		'GET /mnemonic': () => {
 			if (!authenticator.enabled) {
