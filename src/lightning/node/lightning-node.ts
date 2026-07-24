@@ -426,6 +426,14 @@ export class LightningNode extends EventEmitter {
 	// keys, breaking penalty/to_remote/HTLC claims after a restart (audit H2).
 	private revocationBasepointSecret: Buffer | undefined;
 	private paymentBasepointSecret: Buffer | undefined;
+	/**
+	 * Signed funding txs we are OBLIGATED to broadcast (BOLT 2: once
+	 * funding_signed is received the funder must broadcast), keyed by funding
+	 * txid in internal byte order. An entry lives until the funding CONFIRMS,
+	 * not merely until one broadcast succeeds: a transient broadcast failure
+	 * or a later mempool eviction is retried on every new block, and the map
+	 * is persisted so a restart resumes the obligation.
+	 */
 	private pendingFundingTxs: Map<string, string> = new Map();
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -970,6 +978,10 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 		}
+
+		// Restore funding txs still awaiting broadcast/confirmation so the
+		// BOLT 2 broadcast obligation survives a restart.
+		this.restorePendingFundingTxs();
 
 		// Restore parked hold-invoice HTLCs so settle/cancel survive restart.
 		const heldJson = this.storage.loadMetadata('held_htlcs');
@@ -1550,17 +1562,7 @@ export class LightningNode extends EventEmitter {
 		// pendingFundingTxs is keyed by funding txid hex
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
-			const txHex = this.pendingFundingTxs.get(txidHex);
-			if (txHex && this.fundingProvider) {
-				this.pendingFundingTxs.delete(txidHex);
-				this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
-					this.emit('node:error', {
-						code: 'FUNDING_BROADCAST_FAILED',
-						message: (err as Error).message,
-						timestamp: Date.now()
-					} as ILightningError);
-				});
-			}
+			this.broadcastPendingFundingTx(txidHex);
 			// Register the funding output with the chain watcher NOW, not only
 			// on restart: live confirmation detection, announcement depth,
 			// breach detection and the funding-missing watchdog (critical for
@@ -2344,7 +2346,7 @@ export class LightningNode extends EventEmitter {
 
 				// Store pending tx BEFORE createFunding — the synchronous message chain
 				// (funding_created → funding_signed → watch:funding) completes during the call
-				this.pendingFundingTxs.set(txid.toString('hex'), txHex);
+				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
 				// Send funding_created — triggers synchronous chain that broadcasts via watch:funding
 				this.channelManager.createFunding(
@@ -2369,6 +2371,149 @@ export class LightningNode extends EventEmitter {
 					`funding failed: ${(err as Error).message}`
 				);
 			});
+	}
+
+	/**
+	 * Void a channel whose funding tx vanished before confirming and cannot
+	 * (or can no longer) be rebroadcast: drop it from the manager, retire its
+	 * watch, its persisted state and any retained funding tx, and tell the
+	 * embedder via channel:voided.
+	 */
+	private voidMissingFundingChannel(channelId: Buffer, txid: string): void {
+		if (!this.channelManager.voidChannel(channelId)) return;
+		const idHex = channelId.toString('hex');
+		this.chainWatcher?.removeWatchedFunding(channelId);
+		this.safeStorage(() => this.storage!.deleteChannel(idHex), 'deleteChannel');
+		this.deletePendingFundingTx(
+			Buffer.from(txid, 'hex').reverse().toString('hex')
+		);
+		this.emitStructuredLog('channel', 'channel_voided', {
+			channelId: idHex,
+			txid
+		});
+		this.emit('channel:voided', { channelId });
+	}
+
+	// ─────────────── Pending funding broadcasts ───────────────
+
+	/** Metadata key holding the persisted pending funding tx map. */
+	private static readonly PENDING_FUNDING_TXS_KEY = 'pending_funding_txs';
+
+	/** Persist the pending funding tx map (best-effort). */
+	private persistPendingFundingTxs(): void {
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					LightningNode.PENDING_FUNDING_TXS_KEY,
+					JSON.stringify(
+						[...this.pendingFundingTxs].map(([txid, txHex]) => ({
+							txid,
+							txHex
+						}))
+					)
+				),
+			'savePendingFundingTxs'
+		);
+	}
+
+	/** Record a signed funding tx we are obligated to broadcast. */
+	private setPendingFundingTx(txidHex: string, txHex: string): void {
+		this.pendingFundingTxs.set(txidHex, txHex);
+		this.persistPendingFundingTxs();
+	}
+
+	/** Drop a broadcast obligation (confirmed, or its channel is gone). */
+	private deletePendingFundingTx(txidHex: string): void {
+		if (this.pendingFundingTxs.delete(txidHex)) {
+			this.persistPendingFundingTxs();
+		}
+	}
+
+	/**
+	 * Broadcast the pending funding tx with this txid (internal byte order
+	 * hex). The entry is NOT removed on success: it lives until the funding
+	 * confirms, so a later mempool eviction can be answered by rebroadcast
+	 * (re-sending a tx already in the mempool is accepted and idempotent).
+	 * On failure the entry survives for the per-block retry; the error is
+	 * surfaced but the obligation stands.
+	 */
+	private broadcastPendingFundingTx(txidHex: string): void {
+		const txHex = this.pendingFundingTxs.get(txidHex);
+		if (!txHex || !this.fundingProvider) return;
+		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
+			const message = (err as Error)?.message ?? String(err);
+			// A tx that is already mined cannot be re-sent; that is success,
+			// and funding:confirmed will retire the entry.
+			if (/already in block ?chain|already known|txn-already/i.test(message)) {
+				return;
+			}
+			this.emitStructuredLog('chain', 'funding_broadcast_failed', {
+				txid: txidHex,
+				error: message
+			});
+			this.emit('node:error', {
+				code: 'FUNDING_BROADCAST_FAILED',
+				message: `${message} (funding tx ${txidHex} retained; will retry)`,
+				timestamp: Date.now()
+			} as ILightningError);
+		});
+	}
+
+	/**
+	 * Retry every pending funding broadcast whose channel is still alive and
+	 * unconfirmed, and retire entries whose channel is gone (aborted, closed
+	 * or voided before confirmation): broadcasting a funding tx for a dead
+	 * channel would lock coins in a 2-of-2 nobody will use. Runs on every new
+	 * block and once at startup after channels are restored.
+	 */
+	private retryPendingFundingBroadcasts(): void {
+		if (this.pendingFundingTxs.size === 0) return;
+		const deadStates = new Set([
+			ChannelState.CLOSED,
+			ChannelState.FORCE_CLOSED,
+			ChannelState.ERRORED
+		]);
+		const liveByTxid = new Map<string, ChannelState>();
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid) {
+				liveByTxid.set(state.fundingTxid.toString('hex'), state.state);
+			}
+		}
+		for (const [txidHex] of [...this.pendingFundingTxs]) {
+			const channelState = liveByTxid.get(txidHex);
+			if (channelState === undefined || deadStates.has(channelState)) {
+				this.emitStructuredLog('chain', 'pending_funding_retired', {
+					txid: txidHex,
+					reason: channelState === undefined ? 'no channel' : channelState
+				});
+				this.deletePendingFundingTx(txidHex);
+				continue;
+			}
+			this.broadcastPendingFundingTx(txidHex);
+		}
+	}
+
+	/** Restore the persisted pending funding tx map (called at startup). */
+	private restorePendingFundingTxs(): void {
+		if (!this.storage) return;
+		const json = this.storage.loadMetadata(
+			LightningNode.PENDING_FUNDING_TXS_KEY
+		);
+		if (!json) return;
+		try {
+			const entries = JSON.parse(json) as Array<{
+				txid: string;
+				txHex: string;
+			}>;
+			for (const entry of entries) {
+				if (entry?.txid && entry?.txHex) {
+					this.pendingFundingTxs.set(entry.txid, entry.txHex);
+				}
+			}
+		} catch {
+			/* ignore corrupted pending-funding metadata */
+		}
 	}
 
 	// ─────────────── Node Info ───────────────
@@ -3207,19 +3352,37 @@ export class LightningNode extends EventEmitter {
 				// real and confirmed, and voiding it would destroy a live
 				// channel. Alarm only; splice rollback is a separate path.
 				if (channel.getFullState().spliceInFlight) return;
-				if (this.channelManager.voidChannel(channelId)) {
-					const idHex = channelId.toString('hex');
-					this.chainWatcher?.removeWatchedFunding(channelId);
-					this.safeStorage(
-						() => this.storage!.deleteChannel(idHex),
-						'deleteChannel'
-					);
-					this.emitStructuredLog('channel', 'channel_voided', {
-						channelId: idHex,
-						txid
-					});
-					this.emit('channel:voided', { channelId });
+
+				// Rebroadcast before voiding: BOLT 2 obliges the funder to get
+				// the funding tx confirmed, and a mempool-evicted tx is still
+				// valid. Only when we hold the signed tx and the network
+				// REJECTS it (an input was double-spent, or it conflicts with
+				// a confirmed tx) is the channel truly fiction.
+				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
+				const pendingHex = this.pendingFundingTxs.get(internalHex);
+				if (pendingHex && this.fundingProvider) {
+					this.fundingProvider
+						.broadcastTransaction(pendingHex)
+						.then(() => {
+							// Back in the mempool: the watcher sees it on its
+							// next check, resets the absence counter and
+							// re-arms the alarm. The channel stays.
+							this.emitStructuredLog('chain', 'funding_rebroadcast', {
+								channelId: channelId.toString('hex'),
+								txid
+							});
+						})
+						.catch((err) => {
+							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
+								channelId: channelId.toString('hex'),
+								txid,
+								error: (err as Error).message
+							});
+							this.voidMissingFundingChannel(channelId, txid);
+						});
+					return;
 				}
+				this.voidMissingFundingChannel(channelId, txid);
 			}
 		);
 
@@ -3227,6 +3390,11 @@ export class LightningNode extends EventEmitter {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
 			const state = channel.getFullState();
+			// The funding is mined: the BOLT 2 broadcast obligation is met and
+			// the retained signed tx (kept for eviction rebroadcasts) retires.
+			if (state.fundingTxid) {
+				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+			}
 			if (!state.spliceFundingTxid || !channel.getSpliceSession()) return;
 			// sendSpliceLocked self-validates the splice state; ignore if not ready.
 			const result = this.channelManager.sendSpliceLocked(channelId);
@@ -3257,6 +3425,10 @@ export class LightningNode extends EventEmitter {
 			await this.chainWatcher.start();
 			// Re-watch funding outputs for all restored channels
 			await this.restoreChainWatches();
+			// Resume the broadcast obligation for signed funding txs that never
+			// confirmed (crash between funding_signed and broadcast, or an
+			// eviction while we were down). Retries again on every new block.
+			this.retryPendingFundingBroadcasts();
 			// Start reconnect monitor on ElectrumBackend to resume subscriptions after drops
 			if (
 				this._chainBackend &&
@@ -9986,6 +10158,10 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		// Funding txs we are obligated to broadcast (BOLT 2) but which have
+		// not confirmed yet: retry, so a transient failure at watch:funding
+		// or a mempool eviction never orphans a signed funding.
+		this.retryPendingFundingBroadcasts();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
