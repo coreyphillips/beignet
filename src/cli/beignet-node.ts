@@ -137,7 +137,8 @@ import {
 	AdvisorRecommendations,
 	RebalanceResult,
 	RebalanceExecutionSummary,
-	TOnchainQuote
+	TOnchainQuote,
+	TChannelFundingQuote
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -1881,6 +1882,68 @@ export class BeignetNode extends EventEmitter {
 			Buffer.concat([Buffer.from([0x00, 0x20]), Buffer.alloc(32)]),
 			this.getBitcoinNetwork()
 		);
+	}
+
+	/**
+	 * Peer-aware max channel-funding quote. Decides v1 vs v2 exactly the way
+	 * openChannel does (both inits advertising option_dual_fund), then prices
+	 * the max open with the SAME arithmetic that funding path will commit:
+	 *
+	 * - v2 peer: the engine's quoteDualFundingMaxOpen (clamped rate converted
+	 *   to sat/kw, the cushioned interactive-tx weight formula, zero change).
+	 * - v1 peer, or a peer we hold no init for (peerKnown false): the
+	 *   existing sweep-based quote from the actual transaction vbytes.
+	 *
+	 * The two formulas disagree by a few sats by design, which is the whole
+	 * reason a UI cannot reconstruct this number: it must ask the daemon.
+	 * Read-only, like quoteOnchain.
+	 */
+	async quoteChannelFunding({
+		peerPubkey,
+		satsPerVbyte
+	}: {
+		peerPubkey: string;
+		satsPerVbyte?: number;
+	}): Promise<TChannelFundingQuote> {
+		if (!/^[0-9a-fA-F]{66}$/.test(peerPubkey ?? '')) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'peerPubkey must be a 66-character hex pubkey'
+			);
+		}
+		const satsPerByte =
+			satsPerVbyte === undefined
+				? this.wallet.feeEstimates.normal
+				: requirePositiveFiniteNumber(satsPerVbyte, 'satsPerVbyte');
+
+		const { peerKnown, dualFund } = this.node.peerFundingInfo(peerPubkey);
+		if (dualFund) {
+			const quote = this.node.quoteDualFundingMaxOpen(satsPerByte);
+			return {
+				method: 'v2',
+				peerKnown,
+				satsPerVbyte: satsPerByte,
+				feeratePerKw: quote.feeratePerKw,
+				fundingSatoshis: Number(quote.fundingSatoshis),
+				feeSats: Number(quote.feeSats),
+				spendableSats: Number(quote.spendableSats),
+				inputCount: quote.inputCount
+			};
+		}
+		const sweep = await this.quoteOnchain({
+			satsPerVbyte: satsPerByte,
+			max: true,
+			channelFunding: true
+		});
+		return {
+			method: 'v1',
+			peerKnown,
+			satsPerVbyte: sweep.satsPerVbyte,
+			fundingSatoshis: sweep.maxSendSats ?? 0,
+			feeSats: sweep.feeSats,
+			vsize: sweep.vsize,
+			maxSatsPerVbyte: sweep.maxSatsPerVbyte
+		};
 	}
 
 	/**
