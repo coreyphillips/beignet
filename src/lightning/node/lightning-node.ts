@@ -519,7 +519,6 @@ export class LightningNode extends EventEmitter {
 	// option_wumbo (large_channels): lift the 2^24 sat funding cap
 	private largeChannels: boolean;
 	/** Zero-conf splices with trusted peers (splice_locked at broadcast). */
-	private trustedZeroConfSpliceEnabled = false;
 	// SOCKS5 proxy config, kept for connect-by-node-id Tor address gating
 	private socks5Proxy: { host: string; port: number } | null;
 	// Watchtower client (LND altruist wtwire). Null when no towers configured.
@@ -615,7 +614,6 @@ export class LightningNode extends EventEmitter {
 		// advertised on BOTH sides (see maxFundingForPeer), so a non-wumbo peer still
 		// gets the 2^24 cap. Opt out with largeChannels: false.
 		this.largeChannels = config.largeChannels ?? true;
-		this.trustedZeroConfSpliceEnabled = config.trustedZeroConfSplice ?? false;
 		if (this.largeChannels) {
 			localFeatures.setOptional(Feature.LARGE_CHANNELS);
 		}
@@ -1528,6 +1526,14 @@ export class LightningNode extends EventEmitter {
 					temporaryChannelId: temporaryChannelId.toString('hex'),
 					reason
 				});
+				// A pre-funding v2 negotiation may have persisted state via
+				// PERSIST_STATE; the aborted open no longer exists anywhere,
+				// so its row must not resurrect as an ERRORED ghost on restart.
+				this.safeStorage(
+					() =>
+						this.storage!.deleteChannel(temporaryChannelId.toString('hex')),
+					'deleteChannel'
+				);
 			}
 		);
 
@@ -1653,11 +1659,6 @@ export class LightningNode extends EventEmitter {
 					error: (err as Error).message
 				});
 			});
-			// Trusted zero-conf splice: treat the just-broadcast splice tx as
-			// locked immediately (instead of after 1 conf) for trusted peers.
-			if (this.trustedZeroConfSpliceEnabled) {
-				this.maybeSendEarlySpliceLocked(fundingTxid);
-			}
 		});
 
 		// Persist chain monitor state on updates
@@ -3831,6 +3832,13 @@ export class LightningNode extends EventEmitter {
 		let fundingErr: string | undefined;
 		const onErr = (e: ILightningError): void => {
 			if (e.code === 'AUTO_FUNDING_FAILED') fundingErr = e.message;
+			// The v2 route funds the opener via autoFundDualFundedOpen, whose
+			// failure aborts the negotiation and surfaces as a generic channel
+			// error; without matching it the wait spins to its full timeout and
+			// the caller's retry loop (e.g. JIT) never gets a chance.
+			else if (e.code === 'CHANNEL_ERROR' && /v2 open not funded/.test(e.message)) {
+				fundingErr = e.message;
+			}
 		};
 		this.on('node:error', onErr);
 		try {
@@ -3882,37 +3890,6 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	/**
-	 * Trusted zero-conf splice: if the just-broadcast tx is a pending splice
-	 * on a channel with a TRUSTED peer, send splice_locked immediately — the
-	 * channel becomes usable in seconds instead of after a confirmation. The
-	 * trust exposure matches zero-conf opens (the splice could be evicted or
-	 * its inputs double-spent before confirming), hence the trusted-set gate.
-	 * The confirmation-triggered path stays in place and no-ops afterwards.
-	 */
-	private maybeSendEarlySpliceLocked(spliceTxid: Buffer): void {
-		for (const channel of this.channelManager.listChannels()) {
-			const state = channel.getFullState();
-			if (!state.spliceFundingTxid?.equals(spliceTxid)) continue;
-			if (!channel.getSpliceSession()) return;
-			const channelId = channel.getChannelId();
-			if (!channelId) return;
-			const peer = this.channelManager.getPeerForChannel(channelId);
-			if (!peer || !this.channelManager.isTrustedPeer(peer)) return;
-			// Defer a tick so the broadcast (queued in the same action batch)
-			// reaches the network before the lock is announced.
-			setTimeout(() => {
-				const result = this.channelManager.sendSpliceLocked(channelId);
-				if (result.ok) {
-					this.persistChannel(channelId);
-					this.emitStructuredLog('channel', 'splice_locked_zero_conf', {
-						channelId: channelId.toString('hex')
-					});
-				}
-			}, 50);
-			return;
-		}
-	}
 
 	/**
 	 * Fail an incoming HTLC that was held by the JIT engine BEFORE a restart.

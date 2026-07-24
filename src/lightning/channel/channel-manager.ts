@@ -591,12 +591,11 @@ export class ChannelManager extends EventEmitter {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
-		// A trusted peer gets zero-conf on ANY open, not just the dedicated
-		// openZeroConfChannel path — a trusted open that still waited a block
-		// for the opener's own funding watch defeated the point of trusting
-		// the peer. Callers can also request it per-open (opts.trusted)
-		// without pre-registering the peer in the zero-conf trust set.
-		if (opts?.trusted || this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+		// Explicit opt-in only (upstream #197 semantics): trust-set membership
+		// alone must not change how ordinary opens validate. A trusted open
+		// proposes the zero_conf channel type on the wire; the acceptor honors
+		// the negotiated type, never bare membership.
+		if (opts?.trusted) {
 			state.zeroConfEnabled = true;
 			state.trustedPeer = true;
 			state.minimumDepth = 0;
@@ -4079,6 +4078,10 @@ export class ChannelManager extends EventEmitter {
 					`opener funding unavailable: ${(err as Error)?.message ?? err}`
 				);
 				this.processActions(peerPubkey, channel, abortActions);
+				this.forgetAbortedDualFund(
+					channel,
+					`opener funding unavailable: ${(err as Error)?.message ?? err}`
+				);
 			});
 	}
 
@@ -4204,6 +4207,35 @@ export class ChannelManager extends EventEmitter {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	/**
+	 * Forget a dual-funded open that aborted BEFORE any funding transaction
+	 * existed. Nothing is on chain and nothing can be recovered, so keeping
+	 * the entry as an ERRORED channel only pollutes the channel list (and the
+	 * errored-balance bucket) on both peers; the v1 abort path
+	 * (abortPendingOpen) forgets its half the same way. No-op when a funding
+	 * tx exists (there is something to watch or sweep) or when the abort was
+	 * a SPLICE abort (the pre-splice channel is live and returns to NORMAL).
+	 */
+	private forgetAbortedDualFund(channel: Channel, reason: string): void {
+		const state = channel.getFullState();
+		if (state.state !== ChannelState.ERRORED) return;
+		if (!state.dualFundingSession) return;
+		if (state.fundingTxid) return;
+		const ids: Buffer[] = [];
+		const channelId = channel.getChannelId();
+		if (channelId) ids.push(channelId);
+		if (state.temporaryChannelId) ids.push(state.temporaryChannelId);
+		for (const id of ids) {
+			const hex = id.toString('hex');
+			this.channels.delete(hex);
+			this.tempChannels.delete(hex);
+			this.channelPeers.delete(hex);
+		}
+		if (ids.length > 0) {
+			this.emit('channel:aborted', ids[0], reason);
+		}
+	}
+
 	private handleTxAbortMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeTxAbortMessage(payload);
 		const channel =
@@ -4214,6 +4246,7 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleTxAbort();
 		this.processActions(peerPubkey, channel, actions);
+		this.forgetAbortedDualFund(channel, 'peer aborted the open (tx_abort)');
 	}
 
 	private handleAnnouncementSignaturesMsg(

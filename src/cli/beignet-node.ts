@@ -4300,6 +4300,14 @@ export class BeignetNode extends EventEmitter {
 				utxos?: Array<{ txid: string; vout: number }>;
 				allowTopUp?: boolean;
 			};
+			/**
+			 * Trusted zero-conf open: negotiate option_zeroconf (and its
+			 * scid_alias dependency, so the channel goes private) and treat the
+			 * channel as usable at broadcast. Requires the peer to be in the
+			 * zero-conf trusted set. Splices on the resulting channel lock at
+			 * the tx_signatures exchange as well.
+			 */
+			trusted?: boolean;
 		}
 	): ChannelInfo {
 		const channel = this.node.openChannelV2(peerPubkey, {
@@ -4316,7 +4324,8 @@ export class BeignetNode extends EventEmitter {
 				  }
 				: {}),
 			maxLeaseRates: params.maxLeaseRates,
-			autoFund: params.autoFund
+			autoFund: params.autoFund,
+			trusted: params.trusted
 		});
 		const state = channel.getFullState();
 		const balances = channel.getBalances();

@@ -266,11 +266,10 @@ export interface INodeConfig {
 	 */
 	jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 	/**
-	 * Zero-conf splices with TRUSTED peers: send splice_locked the moment the
-	 * splice tx is broadcast instead of waiting for confirmation, so the
-	 * channel is usable again in seconds. Same trust model as zero-conf opens
-	 * (the peer could double-spend the splice inputs before it confirms) —
-	 * gated on the zero-conf trusted-peer set. Both peers should enable it.
+	 * Superseded: zero-conf splices are governed by the channel's negotiated
+	 * option_zeroconf channel_type (trusted opens negotiate it automatically),
+	 * and lock at the splice tx_signatures exchange. The flag is accepted for
+	 * configuration compatibility and has no effect.
 	 */
 	trustedZeroConfSplice?: boolean;
 	/**
