@@ -2544,7 +2544,8 @@ export class BeignetNode extends EventEmitter {
 		amountSats: number,
 		pushSats?: number,
 		satsPerVbyte?: number,
-		max = false
+		max = false,
+		trusted = false
 	): ChannelInfo {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
@@ -2554,7 +2555,8 @@ export class BeignetNode extends EventEmitter {
 			fundingSatoshis,
 			pushMsat,
 			satsPerVbyte,
-			max
+			max,
+			trusted
 		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -2591,15 +2593,26 @@ export class BeignetNode extends EventEmitter {
 		host: string,
 		port: number,
 		amountSats: number,
-		opts?: { pushSats?: number; satsPerVbyte?: number; max?: boolean }
+		opts?: {
+			pushSats?: number;
+			satsPerVbyte?: number;
+			max?: boolean;
+			trusted?: boolean;
+		}
 	): Promise<ChannelInfo> {
 		await this.connectPeer(pubkey, host, port);
+		// A trusted open requires the peer in the trusted set; the caller asking
+		// for a trusted open IS the trust declaration, so register it here.
+		if (opts?.trusted) {
+			this.node.addTrustedPeer(pubkey);
+		}
 		return this.openChannel(
 			pubkey,
 			amountSats,
 			opts?.pushSats,
 			opts?.satsPerVbyte,
-			opts?.max
+			opts?.max,
+			opts?.trusted ?? false
 		);
 	}
 

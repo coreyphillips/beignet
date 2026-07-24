@@ -207,6 +207,7 @@ function buildSyntheticEdges(
  */
 function buildHintDestinationMap(
 	hints: IRoutingHintHop[][],
+	graph: NetworkGraph,
 	destination: Buffer
 ): Map<string, string> {
 	const destMap = new Map<string, string>();
@@ -215,6 +216,13 @@ function buildHintDestinationMap(
 	for (const hintRoute of hints) {
 		for (let i = 0; i < hintRoute.length; i++) {
 			const hop = hintRoute[i];
+			// Announced channel: buildSyntheticEdges deferred to the graph and
+			// made no synthetic edge, so the SCID must not be claimed here
+			// either. A stale claim flips the graph copy into hint-edge
+			// semantics during traversal (upstream = nodeId1), which turns the
+			// edge into a dead self-loop whenever the destination IS nodeId1,
+			// killing the very channel the hint advertises.
+			if (graph.getChannel(hop.shortChannelId)) continue;
 			// The node this hop leads to: next hop in the hint, or the final destination
 			const nextNodeHex =
 				i < hintRoute.length - 1
@@ -314,7 +322,11 @@ function buildEdgeOverlay(
 		)) {
 			syntheticEdges.set(k, [...(syntheticEdges.get(k) ?? []), ...v]);
 		}
-		for (const [k, v] of buildHintDestinationMap(routingHints, destination)) {
+		for (const [k, v] of buildHintDestinationMap(
+			routingHints,
+			graph,
+			destination
+		)) {
 			hintDestMap.set(k, v);
 		}
 	}

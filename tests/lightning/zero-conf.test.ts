@@ -897,7 +897,9 @@ describe('Zero-Conf Channels', function () {
 		it('zero-conf channel: funding_signed triggers immediate channel_ready', function () {
 			const managers = createConnectedManagerPair();
 			const alice = managers.alice;
-			void managers.bob; // needed for loopback routing
+			// The open now carries the zero_conf channel type on the wire, so the
+			// acceptor must trust the opener too or it rejects the proposal.
+			managers.bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const channel = alice.openZeroConfChannel(bobPubkey, 1_000_000n);
@@ -921,7 +923,8 @@ describe('Zero-Conf Channels', function () {
 		it('zero-conf channel: emits channel:zero-conf-ready event', function () {
 			const managers = createConnectedManagerPair();
 			const alice = managers.alice;
-			void managers.bob; // needed for loopback routing
+			// Mutual trust: the zero_conf channel type is rejected otherwise.
+			managers.bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const events: Buffer[] = [];
@@ -986,6 +989,8 @@ describe('Zero-Conf Channels', function () {
 
 		it('zero-conf channel reaches NORMAL after full flow', function () {
 			const { alice, bob } = createConnectedManagerPair();
+			// Mutual trust: the zero_conf channel type is rejected otherwise.
+			bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const channel = alice.openZeroConfChannel(bobPubkey, 1_000_000n);
@@ -1109,7 +1114,10 @@ describe('Zero-Conf Channels', function () {
 			node.destroy();
 		});
 
-		it('openZeroConfChannel returns null for untrusted peer', function () {
+		it('openZeroConfChannel throws for untrusted peer', function () {
+			// The legacy helper now routes through openChannel(..., trusted),
+			// which validates trust up front and throws, rather than the old
+			// emit-error-and-return-null.
 			const config = makeNodeConfig(4);
 			const node = new LightningNode({
 				nodePrivateKey: config.nodePrivateKey,
@@ -1121,8 +1129,9 @@ describe('Zero-Conf Channels', function () {
 
 			const peerPubkey = makeValidPubkey(95);
 			// Don't add as trusted
-			const result = node.openZeroConfChannel(peerPubkey, 1_000_000n);
-			expect(result).to.be.null;
+			expect(() => node.openZeroConfChannel(peerPubkey, 1_000_000n)).to.throw(
+				'not in the trusted set'
+			);
 
 			node.destroy();
 		});
