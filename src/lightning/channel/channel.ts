@@ -7994,10 +7994,22 @@ export class Channel {
 			witnesses: this._spliceTx!.ourWalletWitnesses,
 			sharedInputSignature: signed.signature
 		};
-		return [
+		const actions: ChannelAction[] = [
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.TX_SIGNATURES, encodeTxSignaturesMessage(msg))
 		];
+		// Zero-conf: when the peer's tx_signatures arrived before ours (this
+		// send was deferred behind the commitment round), the exchange is
+		// complete the moment ours leave — lock immediately (BOLT 2). The
+		// mirror ordering (ours first, peer's arrive later) locks in
+		// handleTxSignatures.
+		if (
+			this._isZeroConfChannelType() &&
+			this._state.spliceInFlight?.receivedTxSignatures
+		) {
+			actions.push(...this.sendSpliceLocked());
+		}
+		return actions;
 	}
 
 	/**
@@ -10514,10 +10526,16 @@ export class Channel {
 				minimumDepth: this._state.minimumDepth
 			});
 
-			// If the splice tx confirmed while we were missing the peer's signatures
-			// (e.g. the peer completed and broadcast during a disconnect), the
-			// confirmation arrived before we could send splice_locked — send it now.
-			if (this._state.spliceInFlight?.confirmed) {
+			// Zero-conf channels lock the splice immediately after tx_signatures
+			// (BOLT 2): confirmation gating would idle the channel in exactly the
+			// window zero-conf exists for. Ordinary channels lock at depth; the
+			// confirmed check covers a confirmation that arrived while we were
+			// missing the peer's signatures (e.g. it completed and broadcast
+			// during a disconnect).
+			if (
+				this._isZeroConfChannelType() ||
+				this._state.spliceInFlight?.confirmed
+			) {
 				actions.push(...this.sendSpliceLocked());
 			}
 			return actions;
@@ -10634,12 +10652,38 @@ export class Channel {
 	}
 
 	/**
+	 * Whether the negotiated channel_type carries option_zeroconf. RBF and
+	 * splice-lock behavior both key off it: replacing an unconfirmed funding
+	 * lineage that the peers already treat as usable creates fund-loss
+	 * ambiguity, so BOLT 2 forbids tx_init_rbf on these channels and has the
+	 * splice lock immediately after tx_signatures instead of at depth.
+	 */
+	private _isZeroConfChannelType(): boolean {
+		return (
+			this._state.channelType !== null &&
+			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
+				Feature.ZERO_CONF
+			)
+		);
+	}
+
+	/**
 	 * Initiate RBF on the funding transaction (opener only).
 	 */
 	initiateTxRbf(
 		newFeeratePerkw: number,
 		newLocktime?: number
 	): ChannelAction[] {
+		// BOLT 2: a node MUST NOT send tx_init_rbf on an option_zeroconf
+		// channel. Local misuse, so a plain ERROR action (no wire error).
+		if (this._isZeroConfChannelType()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'tx_init_rbf is forbidden on an option_zeroconf channel'
+				}
+			];
+		}
 		const session = this._state.dualFundingSession;
 		if (!session) {
 			return [
@@ -10672,6 +10716,17 @@ export class Channel {
 	 * Handle tx_init_rbf from peer (acceptor side).
 	 */
 	handleTxInitRbf(msg: ITxInitRbfMessage): ChannelAction[] {
+		// BOLT 2: on an option_zeroconf channel the peer MUST NOT send
+		// tx_init_rbf at all (funding or splice): both sides already treat the
+		// unconfirmed lineage as usable, and replacing it creates fund-loss
+		// ambiguity. The prescribed response is a warning + disconnect or an
+		// error that fails the channel; a mere tx_abort would leave a channel
+		// alive whose peer has proven it will try to replace live fundings.
+		if (this._isZeroConfChannelType()) {
+			return this._failChannelWithWireError(
+				'tx_init_rbf is forbidden on an option_zeroconf channel'
+			);
+		}
 		// BOLT 2: the receiver of tx_init_rbf MUST respond with tx_ack_rbf or
 		// tx_abort. A splice uses _spliceSession, not a dual-funding session;
 		// we do not support RBF of a splice yet, so refuse it properly with

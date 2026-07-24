@@ -36,6 +36,7 @@ import { INodeConfig, PaymentStatus } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { encodeShortChannelId } from '../../src/lightning/gossip/types';
 import { MessageType } from '../../src/lightning/message/types';
+import { SpliceState } from '../../src/lightning/channel/splice';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 
@@ -470,6 +471,31 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		).to.throw('not in the trusted set');
 	});
 
+	it('a trusted open fails clearly when the REMOTE init lacks the features', function () {
+		// The mixed-version case proper: our features are fine, the stored
+		// remote init (an older daemon) is missing option_zeroconf/scid_alias.
+		const alice = new LightningNode(makeNodeConfig(1));
+		alice.on('error', () => {});
+		const peer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		alice.addTrustedPeer(peer);
+
+		const oldPeerFeatures = LightningNode.defaultFeatures();
+		oldPeerFeatures.clearBit(Feature.ZERO_CONF);
+		oldPeerFeatures.clearBit(Feature.ZERO_CONF + 1);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(alice as any).peerManager = {
+			getPeer: (pubkey: string) =>
+				pubkey === peer
+					? { getRemoteInit: () => ({ features: oldPeerFeatures }) }
+					: undefined,
+			destroy: (): void => {}
+		};
+
+		expect(() =>
+			alice.openChannel(peer, 1_000_000n, undefined, undefined, false, true)
+		).to.throw('did not negotiate option_zeroconf');
+	});
+
 	it('a trusted open fails clearly when zero-conf features are not negotiated', function () {
 		// BOLT 2: do not propose channel-type features the peer never
 		// negotiated. A node whose own init lacks option_zeroconf/scid_alias
@@ -562,5 +588,269 @@ describe('Trusted channel payments (LightningNode level)', function () {
 		});
 		const res = alice.sendPayment(inv.bolt11);
 		expect(res.status).to.equal(PaymentStatus.COMPLETED);
+	});
+});
+
+describe('Zero-conf splice semantics (BOLT 2)', function () {
+	const aliceConfig = makeConfig(11);
+	const bobConfig = makeConfig(12);
+	const alicePubkey = aliceConfig.localBasepoints.fundingPubkey.toString('hex');
+	const bobPubkey = bobConfig.localBasepoints.fundingPubkey.toString('hex');
+
+	function wiredPair(trusted: boolean): {
+		alice: ChannelManager;
+		bob: ChannelManager;
+	} {
+		const alice = new ChannelManager(aliceConfig);
+		const bob = new ChannelManager(bobConfig);
+		alice.on('error', () => {});
+		bob.on('error', () => {});
+		alice.on(
+			'message:outbound',
+			(peerPubkey: string, type: number, payload: Buffer) => {
+				if (peerPubkey === bobPubkey) {
+					bob.handleMessage(alicePubkey, type, payload);
+				}
+			}
+		);
+		bob.on(
+			'message:outbound',
+			(peerPubkey: string, type: number, payload: Buffer) => {
+				if (peerPubkey === alicePubkey) {
+					alice.handleMessage(bobPubkey, type, payload);
+				}
+			}
+		);
+		if (trusted) {
+			alice.addTrustedPeer(bobPubkey);
+			bob.addTrustedPeer(alicePubkey);
+		}
+		return { alice, bob };
+	}
+
+	/** A NORMAL channel on alice's side: zero-conf via a trusted open, or an
+	 *  ordinary confirmed one. */
+	function normalChannel(trusted: boolean): {
+		manager: ChannelManager;
+		channelId: Buffer;
+	} {
+		const { alice, bob } = wiredPair(trusted);
+		const channel = alice.openChannel(
+			bobPubkey,
+			1_000_000n,
+			undefined,
+			undefined,
+			trusted ? { trusted: true } : undefined
+		);
+		const channelId = alice.createFunding(
+			channel,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		)!;
+		if (!trusted) {
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+		}
+		expect(alice.getChannel(channelId)!.getState()).to.equal(
+			ChannelState.NORMAL
+		);
+		return { manager: alice, channelId };
+	}
+
+	/** Put a stubbed in-flight splice on the channel: interactive tx done,
+	 *  commitment round done, waiting on tx_signatures. */
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	function stubSplice(ch: any, overrides: Record<string, unknown> = {}): void {
+		ch._state.state = ChannelState.SPLICING;
+		ch._spliceTx = { newFundingOutputIndex: 0, ourWalletWitnesses: [] };
+		ch._state.spliceInFlight = {
+			spliceTxid: crypto.randomBytes(32),
+			newFundingOutputIndex: 0,
+			newFundingSatoshis: 1_000_000n,
+			spliceTxHex: '',
+			fullySigned: false,
+			isInitiator: true,
+			localRelativeSatoshis: 0n,
+			remoteRelativeSatoshis: 0n,
+			remoteFundingPubkey: crypto.randomBytes(33),
+			ourSharedInputSig: Buffer.alloc(64),
+			ourWalletWitnesses: [],
+			ourWalletInputIndices: [],
+			remoteCommitmentSig: null,
+			sentTxSignatures: false,
+			receivedTxSignatures: false,
+			localSpliceLocked: false,
+			remoteSpliceLocked: false,
+			confirmed: false,
+			...overrides
+		};
+		ch._spliceSession = {
+			getState: () => SpliceState.AWAITING_TX_SIGNATURES,
+			isComplete: () => false,
+			hasSentSpliceLocked: () => false,
+			sendSpliceLocked: () => ({
+				ok: true,
+				message: {
+					channelId: ch._state.channelId,
+					fundingTxid: crypto.randomBytes(32)
+				}
+			})
+		};
+	}
+
+	function spliceLockedIn(actions: unknown[]): unknown {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		return (actions as any[]).find(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.SPLICE_LOCKED
+		);
+	}
+
+	it('zero-conf: splice_locked goes out immediately when the peer tx_signatures arrive', function () {
+		const { manager, channelId } = normalChannel(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ch = manager.getChannel(channelId)! as any;
+		stubSplice(ch, { sentTxSignatures: true });
+		ch._spliceSentTxSigs = true; // ours already sent
+		const fakeTx = {
+			getHash: () => crypto.randomBytes(32),
+			toHex: () => '00',
+			toBuffer: () => Buffer.alloc(1)
+		};
+		ch.applyPeerSpliceSignature = (): unknown => fakeTx;
+
+		const actions = ch.handleTxSignatures({
+			channelId: ch._state.channelId,
+			txid: crypto.randomBytes(32),
+			witnesses: [],
+			sharedInputSignature: Buffer.alloc(64)
+		});
+
+		// The splice tx has NOT confirmed; the lock rides tx_signatures alone.
+		expect(ch._state.spliceInFlight.confirmed).to.equal(false);
+		expect(spliceLockedIn(actions), 'splice_locked sent immediately').to.exist;
+	});
+
+	it('ordinary channel: splice_locked still waits for confirmation', function () {
+		const { manager, channelId } = normalChannel(false);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ch = manager.getChannel(channelId)! as any;
+		stubSplice(ch, { sentTxSignatures: true });
+		ch._spliceSentTxSigs = true;
+		const fakeTx = {
+			getHash: () => crypto.randomBytes(32),
+			toHex: () => '00',
+			toBuffer: () => Buffer.alloc(1)
+		};
+		ch.applyPeerSpliceSignature = (): unknown => fakeTx;
+
+		const actions = ch.handleTxSignatures({
+			channelId: ch._state.channelId,
+			txid: crypto.randomBytes(32),
+			witnesses: [],
+			sharedInputSignature: Buffer.alloc(64)
+		});
+
+		expect(spliceLockedIn(actions), 'no early splice_locked').to.not.exist;
+	});
+
+	it('zero-conf: our deferred tx_signatures flush also locks immediately', function () {
+		// Peer signed first; our tx_signatures were held behind the commitment
+		// round. The exchange completes the moment ours leave.
+		const { manager, channelId } = normalChannel(true);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ch = manager.getChannel(channelId)! as any;
+		stubSplice(ch, { receivedTxSignatures: true });
+		ch._spliceSession.getState = (): SpliceState =>
+			SpliceState.AWAITING_TX_SIGNATURES;
+		ch._spliceSentCommitment = true;
+		ch._spliceReceivedCommitment = true;
+		ch._spliceSentTxSigs = false;
+		ch.buildAndSignSpliceTx = (): unknown => ({
+			spliceTxid: crypto.randomBytes(32),
+			newFundingOutputIndex: 0,
+			signature: Buffer.alloc(64)
+		});
+
+		const actions = ch._maybeSendSpliceTxSigs();
+
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(actions as any[]).find(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.TX_SIGNATURES
+			),
+			'tx_signatures sent'
+		).to.exist;
+		expect(spliceLockedIn(actions), 'splice_locked follows immediately').to
+			.exist;
+	});
+
+	it('zero-conf: tx_init_rbf fails the channel with a wire error', function () {
+		const { manager, channelId } = normalChannel(true);
+		const ch = manager.getChannel(channelId)!;
+
+		const actions = ch.handleTxInitRbf({
+			channelId,
+			locktime: 0,
+			feerate: 1000
+		});
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const wireError = (actions as any[]).find(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				a.messageType === MessageType.ERROR
+		);
+		expect(wireError, 'BOLT error sent to the peer').to.exist;
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(actions as any[]).find((a) => a.type === ChannelActionType.ERROR),
+			'app-level error surfaced'
+		).to.exist;
+		expect(ch.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('ordinary channel: tx_init_rbf during a splice still answers tx_abort', function () {
+		const { manager, channelId } = normalChannel(false);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const ch = manager.getChannel(channelId)! as any;
+		ch._spliceSession = { isComplete: () => false };
+
+		const actions = ch.handleTxInitRbf({
+			channelId,
+			locktime: 0,
+			feerate: 1000
+		});
+
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(actions as any[]).find(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					a.messageType === MessageType.TX_ABORT
+			),
+			'tx_abort answered'
+		).to.exist;
+		expect(ch.getState()).to.not.equal(ChannelState.ERRORED);
+	});
+
+	it('zero-conf: initiating RBF locally is refused without touching the channel', function () {
+		const { manager, channelId } = normalChannel(true);
+		const ch = manager.getChannel(channelId)!;
+
+		const actions = ch.initiateTxRbf(2000);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const err = (actions as any[]).find(
+			(a) => a.type === ChannelActionType.ERROR
+		);
+		expect(err, 'local error returned').to.exist;
+		expect(err.message).to.include('forbidden');
+		// Local misuse: no wire error, channel stays usable.
+		expect(ch.getState()).to.equal(ChannelState.NORMAL);
 	});
 });

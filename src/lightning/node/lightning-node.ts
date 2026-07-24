@@ -3539,7 +3539,7 @@ export class LightningNode extends EventEmitter {
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint
-	): Channel | null {
+	): Channel {
 		return this.openChannel(
 			peerPubkey,
 			fundingSatoshis,
