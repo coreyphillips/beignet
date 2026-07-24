@@ -420,6 +420,25 @@ export interface BeignetConfig {
 	 * model as zero-conf opens; both peers should enable it.
 	 */
 	trustedZeroConfSplice?: boolean;
+	/**
+	 * JIT receive, LSP role: intercept HTLCs on synthetic SCIDs registered by
+	 * wallet peers, open a zero-conf channel to them, forward, and deduct the
+	 * LSPS2-style opening fee. Numbers here (config/env level) are converted
+	 * to the engine's bigint fee fields at startup.
+	 */
+	jitReceive?: { enabled?: boolean; flatFeeSat?: number; feePpm?: number };
+	/**
+	 * Liquidity ads seller policy (bLIP-51): when set, this node answers
+	 * request_funds with a signed will_fund at these rates and contributes
+	 * the requested inbound as the acceptor of dual-funded opens.
+	 */
+	leaseRates?: {
+		fundingWeightWitness: number;
+		leaseFeeBasis: number;
+		leaseFeeBaseSat: number;
+		channelFeeMaxBaseMsat: number;
+		channelFeeMaxProportionalThousandths: number;
+	};
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */
 	apiToken?: string;
 	/** Named API keys with permission scopes (readonly/invoice/admin).

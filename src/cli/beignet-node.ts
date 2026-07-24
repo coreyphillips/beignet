@@ -2891,7 +2891,8 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		description?: string,
 		expirySecs?: number,
-		descriptionHash?: Buffer
+		descriptionHash?: Buffer,
+		minFinalCltvExpiry?: number
 	): InvoiceInfo {
 		const amountMsat =
 			amountSats !== undefined && amountSats !== 0
@@ -2901,7 +2902,12 @@ export class BeignetNode extends EventEmitter {
 			amountMsat,
 			description: descriptionHash ? undefined : description || '',
 			descriptionHash,
-			expiry: expirySecs
+			expiry: expirySecs,
+			// Callers whose settlement may involve on-the-fly funding (a JIT
+			// open or an LSP splice) ask for extra final-CLTV headroom, so
+			// blocks mined during funding cannot push the HTLC under the
+			// receiver's minimum.
+			...(minFinalCltvExpiry !== undefined ? { minFinalCltvExpiry } : {})
 		});
 		const info: InvoiceInfo = {
 			bolt11: result.bolt11,
@@ -2911,6 +2917,59 @@ export class BeignetNode extends EventEmitter {
 		};
 		if (expirySecs !== undefined) info.expiry = expirySecs;
 		return info;
+	}
+
+	/**
+	 * Wallet side of JIT receive, end to end: register the intent with the
+	 * LSP over the beignet custom-message protocol, build an invoice whose
+	 * extra route runs through the returned synthetic SCID, and accept the
+	 * agreed LSPS2-style opening fee for that payment hash. The invoice is
+	 * payable although the channel does not exist yet: the LSP intercepts
+	 * the HTLC on the synthetic SCID, opens a zero-conf channel, forwards,
+	 * and the fee is deducted from the delivery.
+	 */
+	async createJitInvoice(opts: {
+		lspPubkey: string;
+		amountSats?: number;
+		description?: string;
+		expirySecs?: number;
+		/** Inbound the wallet wants left over after the receive (sat). */
+		targetRemainingInboundSat?: number;
+	}): Promise<InvoiceInfo & { flatFeeSat: number; feePpm: number }> {
+		const amountMsat =
+			opts.amountSats !== undefined && opts.amountSats !== 0
+				? BigInt(opts.amountSats) * 1000n
+				: undefined;
+		// Amount-less invoices are authorized up to the LSP's customary cap;
+		// fixed-amount ones up to exactly their amount.
+		const maxAmountMsat = amountMsat ?? 1_000_000_000n;
+		const grant = await this.node.requestJitReceive(opts.lspPubkey, {
+			maxAmountMsat,
+			...(amountMsat !== undefined ? { expectedTotalMsat: amountMsat } : {}),
+			targetRemainingInboundSat: BigInt(opts.targetRemainingInboundSat ?? 0),
+			expirySeconds: opts.expirySecs ?? 3600
+		});
+		const result = this.node.createInvoice({
+			amountMsat,
+			description: opts.description || '',
+			expiry: opts.expirySecs ?? 3600,
+			// Settlement funds the channel on the fly; leave CLTV headroom.
+			minFinalCltvExpiry: 72,
+			extraRoutingHints: [[grant.hint]]
+		});
+		const feeMsat =
+			grant.flatFeeSat * 1000n +
+			(maxAmountMsat * BigInt(grant.feePpm)) / 1_000_000n;
+		this.node.registerJitFeeAllowance(result.paymentHash, feeMsat);
+		return {
+			bolt11: result.bolt11,
+			paymentHash: result.paymentHash.toString('hex'),
+			paymentSecret: result.paymentSecret.toString('hex'),
+			amountSats: opts.amountSats || undefined,
+			expiry: opts.expirySecs ?? 3600,
+			flatFeeSat: Number(grant.flatFeeSat),
+			feePpm: grant.feePpm
+		};
 	}
 
 	/**

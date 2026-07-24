@@ -448,6 +448,18 @@ async function handleStart(): Promise<void> {
 			largeChannels: config.largeChannels,
 			zeroReserve: config.zeroReserve,
 			trustedZeroConfSplice: config.trustedZeroConfSplice,
+			jitReceive: config.jitReceive?.enabled
+				? {
+						enabled: true,
+						...(config.jitReceive.flatFeeSat !== undefined
+							? { flatFeeSat: BigInt(config.jitReceive.flatFeeSat) }
+							: {}),
+						...(config.jitReceive.feePpm !== undefined
+							? { feePpm: config.jitReceive.feePpm }
+							: {})
+				  }
+				: undefined,
+			leaseRates: config.leaseRates,
 			apiToken: config.apiToken,
 			apiKeys: config.apiKeys,
 			backupPath: config.backupPath,

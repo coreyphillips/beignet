@@ -131,6 +131,26 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_TRUSTED_ZERO_CONF_SPLICE === 'true'
 				: undefined) ??
 			file.trustedZeroConfSplice,
+		jitReceive:
+			cliFlags.jitReceive ??
+			(process.env.BEIGNET_JIT_RECEIVE !== undefined
+				? {
+						enabled: process.env.BEIGNET_JIT_RECEIVE === 'true',
+						...(process.env.BEIGNET_JIT_FLAT_FEE_SAT
+							? { flatFeeSat: parseInt(process.env.BEIGNET_JIT_FLAT_FEE_SAT, 10) }
+							: {}),
+						...(process.env.BEIGNET_JIT_FEE_PPM
+							? { feePpm: parseInt(process.env.BEIGNET_JIT_FEE_PPM, 10) }
+							: {})
+				  }
+				: undefined) ??
+			file.jitReceive,
+		leaseRates:
+			cliFlags.leaseRates ??
+			(process.env.BEIGNET_LEASE_RATES
+				? JSON.parse(process.env.BEIGNET_LEASE_RATES)
+				: undefined) ??
+			file.leaseRates,
 		apiToken:
 			cliFlags.apiToken || process.env.BEIGNET_API_TOKEN || file.apiToken,
 		apiKeys: cliFlags.apiKeys || parseApiKeysEnv() || file.apiKeys,

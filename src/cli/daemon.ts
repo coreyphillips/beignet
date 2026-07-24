@@ -775,17 +775,56 @@ export async function startDaemon(
 			return success(node.validatePayment(bolt11, amountSats));
 		},
 		'POST /invoice/create': (body) => {
-			const { amountSats, description, expirySecs, descriptionHash } = body as {
-				amountSats?: number;
-				description?: string;
-				expirySecs?: number;
-				descriptionHash?: string;
-			};
+			const { amountSats, description, expirySecs, descriptionHash, minFinalCltvExpiry } =
+				body as {
+					amountSats?: number;
+					description?: string;
+					expirySecs?: number;
+					descriptionHash?: string;
+					/** Extra final-CLTV headroom for receives whose settlement may
+					 *  fund a channel on the fly (LSP splice). */
+					minFinalCltvExpiry?: number;
+				};
 			const hashBuf = descriptionHash
 				? Buffer.from(descriptionHash, 'hex')
 				: undefined;
 			return success(
-				node.createInvoice(amountSats, description, expirySecs, hashBuf)
+				node.createInvoice(
+					amountSats,
+					description,
+					expirySecs,
+					hashBuf,
+					minFinalCltvExpiry
+				)
+			);
+		},
+		// Wallet side of JIT receive: registers the intent with the LSP over
+		// the beignet custom-message protocol and returns an invoice payable
+		// through a channel that does not exist yet. Requires the LSP peer to
+		// be connected and running with jitReceive enabled.
+		'POST /jit/invoice': async (body) => {
+			const {
+				lspPubkey,
+				amountSats,
+				description,
+				expirySecs,
+				targetRemainingInboundSat
+			} = body as {
+				lspPubkey?: string;
+				amountSats?: number;
+				description?: string;
+				expirySecs?: number;
+				targetRemainingInboundSat?: number;
+			};
+			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
+			return success(
+				await node.createJitInvoice({
+					lspPubkey,
+					amountSats,
+					description,
+					expirySecs,
+					targetRemainingInboundSat
+				})
 			);
 		},
 		'POST /invoice/create-hold': (body) => {
@@ -1062,22 +1101,43 @@ export async function startDaemon(
 				amountSats,
 				fundingFeeratePerkw,
 				commitmentFeeratePerkw,
-				locktime
+				locktime,
+				requestFunds,
+				maxLeaseRates
 			} = body as {
 				pubkey: string;
 				amountSats: number;
 				fundingFeeratePerkw?: number;
 				commitmentFeeratePerkw?: number;
 				locktime?: number;
+				/** bLIP-51 buyer: ask the peer to lease this much inbound into
+				 *  the channel being opened. */
+				requestFunds?: { requestedSats: number; blockheight: number };
+				/** Buyer's price ceiling for the lease (required with
+				 *  requestFunds); the open aborts if the seller asks more. */
+				maxLeaseRates?: {
+					fundingWeightWitness: number;
+					leaseFeeBasis: number;
+					leaseFeeBaseSat: number;
+					channelFeeMaxBaseMsat: number;
+					channelFeeMaxProportionalThousandths: number;
+				};
 			};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
+			if (requestFunds && !maxLeaseRates)
+				return failure(
+					'INVALID_PARAMS',
+					'maxLeaseRates required with requestFunds'
+				);
 			return success(
 				node.openChannelV2(pubkey, {
 					amountSats,
 					fundingFeeratePerkw,
 					commitmentFeeratePerkw,
-					locktime
+					locktime,
+					requestFunds,
+					maxLeaseRates
 				})
 			);
 		},

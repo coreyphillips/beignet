@@ -10508,6 +10508,15 @@ export class LightningNode extends EventEmitter {
 				) {
 					const auth = decodeJitAuthorization(msg.payload);
 					const ack = this.jitReceiveManager.registerIntent(pubkey, auth);
+					// Accepting the intent IS the zero-conf trust decision for this
+					// wallet: the coming JIT channel is funded with the LSP's own
+					// coins (bounded by its own funding cap), and openZeroConfChannel
+					// refuses peers outside the trusted set. Without this the
+					// intercept fired and the open then failed with "peer is not
+					// trusted", stranding the held HTLC.
+					if (ack.accepted) {
+						this.channelManager.addTrustedPeer(pubkey);
+					}
 					this.sendCustomMessage(
 						pubkey,
 						BeignetCustomSubtype.JIT_RECEIVE_ACK,
