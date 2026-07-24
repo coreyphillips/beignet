@@ -3816,6 +3816,10 @@ export class ChannelManager extends EventEmitter {
 		// on a taproot channel; open it as a normal (unleased) taproot channel instead.
 		if (
 			msg.requestFunds &&
+			// A 0-sat request is a degenerate lease: nothing to contribute and
+			// nothing to charge for. Accept as a plain (unleased) open instead
+			// of signing a will_fund and then failing to fund zero.
+			msg.requestFunds.requestedSats > 0n &&
 			this.config.leaseRates &&
 			this.config.nodePrivateKey &&
 			!isTaprootChannel(msg.channelType ?? null)
