@@ -835,7 +835,9 @@ async function handleChannel(): Promise<void> {
 					pushSats: filteredArgs[6] ? parseInt(filteredArgs[6], 10) : undefined,
 					satsPerVbyte: cnoRate ? parseInt(cnoRate, 10) : undefined,
 					// Sweep the whole on-chain balance into the channel (no change).
-					max: hasFlag('--max') || undefined
+					max: hasFlag('--max') || undefined,
+					// Trusted peer: zero-conf, usable before the funding confirms.
+					trusted: hasFlag('--trusted') || undefined
 				})
 			);
 		}
@@ -2188,8 +2190,10 @@ Channels:
   channel open-v2 <pubkey> <sats> [feerate]  Open dual-funded v2 channel
   channel open-and-wait <pubkey> <sats> [push] [--timeout ms]
                                          Open channel + block until NORMAL
-  channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max]
+  channel connect-and-open <pubkey> <host> <port> <sats> [push] [--sats-per-vbyte N] [--max] [--trusted]
                                          Connect to peer + open in one call
+                                         --trusted: zero-conf, usable before
+                                         confirmation (trusted peers only)
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
   channel splice-quote <id> <in|out> <feerate>

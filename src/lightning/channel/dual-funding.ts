@@ -89,6 +89,11 @@ export interface IDualFundingParams {
 	channelFlags?: number;
 	/** Channel type feature bitmap */
 	channelType?: Buffer;
+	/**
+	 * Acceptor only: minimum_depth advertised in accept_channel2. Defaults to
+	 * 3; a zero_conf channel type requires 0 (BOLT 2).
+	 */
+	minimumDepth?: number;
 	/** Second per-commitment point */
 	secondPerCommitmentPoint: Buffer;
 	/** Liquidity ads (bLIP-0051): buyer's inbound-liquidity request (opener). */
@@ -398,7 +403,7 @@ export class DualFundingSession {
 			dustLimitSatoshis: localParams.dustLimitSatoshis,
 			maxHtlcValueInFlightMsat: localParams.maxHtlcValueInFlightMsat,
 			htlcMinimumMsat: localParams.htlcMinimumMsat,
-			minimumDepth: 3,
+			minimumDepth: localParams.minimumDepth ?? 3,
 			toSelfDelay: localParams.toSelfDelay,
 			maxAcceptedHtlcs: localParams.maxAcceptedHtlcs,
 			fundingPubkey: localParams.localBasepoints.fundingPubkey,
