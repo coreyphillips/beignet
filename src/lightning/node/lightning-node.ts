@@ -3816,12 +3816,24 @@ export class LightningNode extends EventEmitter {
 		return init ? init.features.hasFeature(Feature.DUAL_FUND) : false;
 	}
 
+	/**
+	 * Open a channel with a peer.
+	 *
+	 * trusted opens a zero-conf channel toward a peer in the zero-conf trusted
+	 * set (addTrustedPeer): the zero_conf channel type goes on the wire and
+	 * both sides fast-track channel_ready, so the channel is usable before the
+	 * funding confirms. Only use toward a peer you control or trust
+	 * completely: unconfirmed funding can be double-spent by the opener.
+	 * Everything else stays standard BOLT 2, including the v1/v2 routing:
+	 * a trusted open toward a dual-fund peer rides open_channel2.
+	 */
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		satsPerVbyte?: number,
-		fundMax = false
+		fundMax = false,
+		trusted = false
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -3896,7 +3908,8 @@ export class LightningNode extends EventEmitter {
 				return this.openChannelV2(peerPubkey, {
 					fundingSatoshis: quote.fundingSatoshis,
 					fundingFeeratePerkw: feeratePerKw,
-					fundMax: true
+					fundMax: true,
+					trusted
 				});
 			}
 			// Same funding-fee policy as a v1 open, where handleAutoFunding
@@ -3930,7 +3943,8 @@ export class LightningNode extends EventEmitter {
 				fundingFeeratePerkw:
 					quotedSatPerVbyte > 0
 						? Math.ceil(this.clampEstimatedFeeRate(quotedSatPerVbyte) * 250)
-						: undefined
+						: undefined,
+				trusted
 			});
 		}
 		// The fee rate and max marker are remembered against the temporary
@@ -3978,7 +3992,8 @@ export class LightningNode extends EventEmitter {
 					}
 					this.fundingMaxRequests.add(tempId);
 				}
-			}
+			},
+			{ trusted }
 		);
 	}
 
@@ -4035,6 +4050,12 @@ export class LightningNode extends EventEmitter {
 			 * (selectMaxDualFundingInputs) so change nets out to zero.
 			 */
 			fundMax?: boolean;
+			/**
+			 * Zero-conf trusted open: adds the zero_conf channel type (BOLT 2
+			 * feature 50) and fast-tracks channel_ready after tx_signatures.
+			 * Requires the peer in the zero-conf trusted set.
+			 */
+			trusted?: boolean;
 		}
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
@@ -4091,7 +4112,9 @@ export class LightningNode extends EventEmitter {
 			fundMax: params.fundMax
 		};
 
-		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams);
+		return this.channelManager.createDualFundedChannel(peerPubkey, dualParams, {
+			trusted: params.trusted
+		});
 	}
 
 	createFunding(
