@@ -318,6 +318,14 @@ export class ChannelManager extends EventEmitter {
 	): void {
 		channel.provideV2ExternalWitness(prevTxid, prevOutputIndex, witness);
 		const actions = channel.flushV2TxSignatures();
+		// The flush can be the LAST tx_signatures step of the open (the peer's
+		// already arrived while we waited for the external witness), and every
+		// other completion path promotes the channel out of tempChannels here.
+		// Without this the channel stayed keyed by its temporary id: the peer's
+		// early channel_ready missed ("unknown channel_id") and confirmations
+		// were never dispatched to it, so a direct-funded open could stall in
+		// AWAITING_FUNDING_CONFIRMED forever.
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -2187,7 +2195,19 @@ export class ChannelManager extends EventEmitter {
 
 	private handleChannelReady(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeChannelReadyMessage(payload);
-		const channel = this.findChannelByChannelId(msg.channelId);
+		// A trusted peer's EARLY channel_ready (zero-conf, sent at broadcast)
+		// can outrun this side's promotion out of tempChannels, so the lookup
+		// falls back to the temp map and promotes when the open has reached
+		// AWAITING_FUNDING_CONFIRMED. Dropping the message instead stalled the
+		// channel until something else happened to re-send it.
+		let channel = this.findChannelByChannelId(msg.channelId);
+		if (!channel) {
+			const ch = this.findChannelByChannelIdInTemp(msg.channelId);
+			if (ch) {
+				this._promoteV2ChannelIfReady(peerPubkey, ch);
+				channel = ch;
+			}
+		}
 		if (!channel) {
 			this.emit('error', msg.channelId, 'Unknown channel_id in channel_ready');
 			return;

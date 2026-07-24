@@ -147,8 +147,11 @@ export async function sendDirectFunding(
 	recipientPubkey: string,
 	amountSat: number,
 	feeHeadroomSat: number
-): Promise<{ offerId: string; spentTxid: string }> {
+): Promise<{ offerId: string; spentTxid: string; fundingTxid?: string }> {
 	const wallet = node.onchainWallet;
+	// The funding txid is known the moment we sign the negotiated tx; returned
+	// so the sender can show WHICH transaction became the recipient's channel.
+	let fundingTxid: string | undefined;
 
 	// One UTXO covering amount + our fee share (no multi-input offers).
 	const utxo = (wallet.listUtxos() ?? [])
@@ -224,6 +227,7 @@ export async function sendDirectFunding(
 					) as SignRequestMsg;
 					if (req.offerId !== offerId) return;
 					const tx = bitcoin.Transaction.fromHex(req.rawTxHex);
+					fundingTxid = tx.getId();
 
 					// Verify OUR input is spent by this exact tx…
 					const ourIndex = tx.ins.findIndex(
@@ -342,7 +346,7 @@ export async function sendDirectFunding(
 	} as OfferMsg);
 
 	await done;
-	return { offerId, spentTxid: utxo.tx_hash };
+	return { offerId, spentTxid: utxo.tx_hash, fundingTxid };
 }
 
 // ─────────────── Recipient side ───────────────
