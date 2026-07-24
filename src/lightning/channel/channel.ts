@@ -283,11 +283,15 @@ export interface ISpliceWalletInput {
 	value: bigint;
 	/** nSequence for this input. */
 	sequence: number;
-	/** Produce the witness stack for this input on the given (unsigned) tx. */
+	/** Produce the witness stack for this input on the given (unsigned) tx.
+	 *  P2TR inputs need every input's prevout script and value for the
+	 *  BIP 341 sighash; callers supply them via `prevouts` (aligned with
+	 *  tx.ins). P2WPKH signers ignore the argument. */
 	signWitness: (
 		tx: import('bitcoinjs-lib').Transaction,
 		inputIndex: number,
-		value: bigint
+		value: bigint,
+		prevouts?: { scripts: Buffer[]; values: bigint[] }
 	) => Buffer[];
 	/**
 	 * Whether the spent output is confirmed. Used to honor the peer's
@@ -6776,10 +6780,24 @@ export class Channel {
 
 		// Sign any wallet inputs we contributed (splice-in) and apply their
 		// witnesses directly to the tx. Collect them (in tx-input order) so we can
-		// send them in tx_signatures.
+		// send them in tx_signatures. P2TR inputs need the full prevout set
+		// (shared funding input included) for the BIP 341 sighash.
 		const ourWalletWitnesses: Buffer[][] = [];
 		const ourWalletInputIndices: number[] = [];
 		if (this._spliceInInputs) {
+			const p2wshScript = require('bitcoinjs-lib').payments.p2wsh({
+				redeem: { output: oldFunding.witnessScript }
+			}).output as Buffer;
+			const prevouts = this._collectPrevouts(
+				tx,
+				[...this._spliceInInputs.inputs, ...built.inputs],
+				{
+					index: sharedInputIndex,
+					script: p2wshScript,
+					value: this._state.fundingSatoshis
+				}
+			);
+			if (!prevouts) return null;
 			for (let i = 0; i < tx.ins.length; i++) {
 				if (i === sharedInputIndex) continue;
 				const prevTxid = Buffer.from(tx.ins[i].hash);
@@ -6790,7 +6808,7 @@ export class Channel {
 						wi.prevOutputIndex === vout
 				);
 				if (!w) continue;
-				const witness = w.signWitness(tx, i, w.value);
+				const witness = w.signWitness(tx, i, w.value, prevouts);
 				tx.setWitness(i, witness);
 				ourWalletWitnesses.push(witness);
 				ourWalletInputIndices.push(i);
@@ -10309,6 +10327,13 @@ export class Channel {
 			// (buildAndSignSpliceTx), and release them as our tx_signatures.
 			const built = this._v2NegotiatedTx();
 			if (!built) return [];
+			// BIP 341: P2TR wallet inputs sign over ALL prevouts; P2WPKH
+			// closures ignore the extra argument.
+			const prevouts = this._collectPrevouts(
+				built.tx,
+				session.getTxBuilder()?.getInputs() ?? []
+			);
+			if (!prevouts) return [];
 			const witnesses: Buffer[][] = [];
 			for (let i = 0; i < built.tx.ins.length; i++) {
 				const prevTxid = Buffer.from(built.tx.ins[i].hash);
@@ -10319,7 +10344,7 @@ export class Channel {
 						wi.prevOutputIndex === vout
 				);
 				if (!w) continue;
-				const witness = w.signWitness(built.tx, i, w.value);
+				const witness = w.signWitness(built.tx, i, w.value, prevouts);
 				built.tx.setWitness(i, witness);
 				witnesses.push(witness);
 			}
@@ -10611,6 +10636,57 @@ export class Channel {
 	}
 
 	/**
+	 * Assemble the full prevout set (script and value per input, in tx input
+	 * order) for a negotiated transaction. Every interactive-tx input carries
+	 * its serialized prev_tx, so the set can always be derived; the shared
+	 * funding input of a splice has no prev_tx entry and is supplied via
+	 * `sharedOverride`. Returns null when any prevout cannot be resolved,
+	 * in which case nothing must be signed (BIP 341 sighashes commit to ALL
+	 * prevouts).
+	 */
+	private _collectPrevouts(
+		tx: import('bitcoinjs-lib').Transaction,
+		inputs: Array<{
+			prevTx?: Buffer;
+			prevTxid?: Buffer;
+			prevOutputIndex: number;
+			prevTxVout?: number;
+		}>,
+		sharedOverride?: { index: number; script: Buffer; value: bigint }
+	): { scripts: Buffer[]; values: bigint[] } | null {
+		const bitcoin = require('bitcoinjs-lib');
+		const scripts: Buffer[] = [];
+		const values: bigint[] = [];
+		for (let i = 0; i < tx.ins.length; i++) {
+			if (sharedOverride && sharedOverride.index === i) {
+				scripts.push(sharedOverride.script);
+				values.push(sharedOverride.value);
+				continue;
+			}
+			const txid = Buffer.from(tx.ins[i].hash);
+			const vout = tx.ins[i].index;
+			const source = inputs.find((inp) => {
+				if (!inp.prevTx || inp.prevTx.length < 32) return false;
+				return (
+					extractTxidFromPrevTx(inp.prevTx).equals(txid) &&
+					(inp.prevTxVout ?? inp.prevOutputIndex) === vout
+				);
+			});
+			if (!source) return null;
+			try {
+				const prev = bitcoin.Transaction.fromBuffer(source.prevTx!);
+				const out = prev.outs[vout];
+				if (!out) return null;
+				scripts.push(Buffer.from(out.script));
+				values.push(BigInt(out.value));
+			} catch {
+				return null;
+			}
+		}
+		return { scripts, values };
+	}
+
+	/**
 	 * Assemble the fully-signed v2 funding tx: our wallet witnesses (re-signed
 	 * via the wallet closures) on our inputs, the peer's tx_signatures
 	 * witnesses on theirs (both in ascending-serial input order).
@@ -10627,6 +10703,9 @@ export class Channel {
 			a.serialId < b.serialId ? -1 : 1
 		);
 		if (sorted.length !== built.tx.ins.length) return null;
+		// BIP 341: P2TR wallet inputs sign over ALL prevouts.
+		const prevouts = this._collectPrevouts(built.tx, sorted);
+		if (!prevouts) return null;
 		const remote = session.getRemoteWitnesses() ?? [];
 		let r = 0;
 		for (let i = 0; i < built.tx.ins.length; i++) {
@@ -10642,7 +10721,7 @@ export class Channel {
 						wi.prevOutputIndex === vout
 				);
 				if (!w) return null;
-				built.tx.setWitness(i, w.signWitness(built.tx, i, w.value));
+				built.tx.setWitness(i, w.signWitness(built.tx, i, w.value, prevouts));
 			} else {
 				if (r >= remote.length) return null;
 				built.tx.setWitness(i, remote[r++]);
