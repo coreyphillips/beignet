@@ -962,6 +962,18 @@ export class BeignetNode extends EventEmitter {
 			this.refreshStaticChannelBackup();
 			this.emit('channel:closed', { channelId });
 		});
+		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
+			const channelId = data.channelId.toString('hex');
+			this.log(
+				'warn',
+				'Channel voided: funding tx vanished before confirming',
+				{
+					channelId
+				}
+			);
+			this.refreshStaticChannelBackup();
+			this.emit('channel:voided', { channelId });
+		});
 		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
 		// so refresh here too even though the event is not re-emitted.
 		this.node.on('channel:resolved', () => {

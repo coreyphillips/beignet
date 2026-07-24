@@ -1561,6 +1561,19 @@ export class LightningNode extends EventEmitter {
 					} as ILightningError);
 				});
 			}
+			// Register the funding output with the chain watcher NOW, not only
+			// on restart: live confirmation detection, announcement depth,
+			// breach detection and the funding-missing watchdog (critical for
+			// zero-conf channels, whose state machine no longer waits for the
+			// chain) all key off this watch. Previously chain watches were only
+			// armed by restoreChainWatches at startup, so a live-opened channel
+			// had none of this coverage until the node restarted.
+			this.registerFundingWatch(fundingTxid).catch((err) => {
+				this.emitStructuredLog('chain', 'funding_watch_failed', {
+					txid: txidHex,
+					error: (err as Error).message
+				});
+			});
 		});
 
 		// Persist chain monitor state on updates
@@ -3168,6 +3181,48 @@ export class LightningNode extends EventEmitter {
 		// Splice confirmation: when a pending splice transaction reaches the
 		// required depth, send splice_locked. Initial-funding confirmation is
 		// handled elsewhere; we only act when a splice is in flight.
+		// The funding tx of a not-yet-confirmed channel vanished from mempool
+		// AND chain (evicted or an input was double-spent). For a zero-conf
+		// channel that is already NORMAL, every balance shown against it is
+		// fiction: alarm, then VOID the channel. It never existed on the
+		// network, so there is nothing to close and the contributed coins
+		// remain onchain. 'channel:voided' lets the embedder re-handle them.
+		this.chainWatcher.on(
+			'funding:missing',
+			(channelId: Buffer, txid: string) => {
+				this.emitStructuredLog('chain', 'funding_missing', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				this.emit('node:error', {
+					code: 'FUNDING_MISSING',
+					channelId,
+					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
+					timestamp: Date.now()
+				} as ILightningError);
+
+				const channel = this.channelManager.getChannel(channelId);
+				if (!channel) return;
+				// A vanished SPLICE tx is different: the pre-splice channel is
+				// real and confirmed, and voiding it would destroy a live
+				// channel. Alarm only; splice rollback is a separate path.
+				if (channel.getFullState().spliceInFlight) return;
+				if (this.channelManager.voidChannel(channelId)) {
+					const idHex = channelId.toString('hex');
+					this.chainWatcher?.removeWatchedFunding(channelId);
+					this.safeStorage(
+						() => this.storage!.deleteChannel(idHex),
+						'deleteChannel'
+					);
+					this.emitStructuredLog('channel', 'channel_voided', {
+						channelId: idHex,
+						txid
+					});
+					this.emit('channel:voided', { channelId });
+				}
+			}
+		);
+
 		this.chainWatcher.on('funding:confirmed', (channelId: Buffer) => {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
@@ -3428,6 +3483,96 @@ export class LightningNode extends EventEmitter {
 				state.minimumDepth ?? 3,
 				fundingScript
 			);
+		}
+	}
+
+	/**
+	 * Arm the chain watches for the channel whose funding tx this is, exactly
+	 * as restoreChainWatches would on the next restart: confirmation and
+	 * announcement depth detection, breach (spend) detection, and the
+	 * funding-missing watchdog. Called live from watch:funding so a channel
+	 * opened in this session has coverage without a restart. A splice funding
+	 * re-arms the watch on the NEW outpoint and keeps spend detection on the
+	 * old one (the splice tx legitimately spends it; anything else is a
+	 * breach).
+	 */
+	private async registerFundingWatch(fundingTxid: Buffer): Promise<void> {
+		if (!this.chainWatcher) return;
+		const networkMap: Record<string, bitcoin.Network> = {
+			[Network.MAINNET]: bitcoin.networks.bitcoin,
+			[Network.TESTNET]: bitcoin.networks.testnet,
+			[Network.REGTEST]: bitcoin.networks.regtest,
+			[Network.SIGNET]: bitcoin.networks.testnet
+		};
+		const btcNetwork = networkMap[this.network] || bitcoin.networks.regtest;
+		const txidHex = Buffer.from(fundingTxid).reverse().toString('hex');
+
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.localBasepoints) continue;
+			const channelId = channel.getChannelId() ?? state.temporaryChannelId;
+
+			const inflight = state.spliceInFlight;
+			if (inflight && Buffer.from(inflight.spliceTxid).equals(fundingTxid)) {
+				const spliceFunding = createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					inflight.remoteFundingPubkey,
+					btcNetwork
+				);
+				// Keyed by channelId, this REPLACES the original funding watch,
+				// so re-arm spend detection on the old outpoint separately,
+				// exactly as restoreChainWatches does.
+				await this.chainWatcher.watchFundingOutput(
+					channelId,
+					txidHex,
+					inflight.newFundingOutputIndex,
+					state.minimumDepth ?? 3,
+					spliceFunding.p2wshOutput
+				);
+				if (state.fundingTxid && state.remoteBasepoints) {
+					const oldFundingScript = isTaprootChannel(state.channelType)
+						? createTaprootFundingScript(
+								state.localBasepoints.fundingPubkey,
+								state.remoteBasepoints.fundingPubkey,
+								btcNetwork
+						  ).p2trOutput
+						: createFundingScript(
+								state.localBasepoints.fundingPubkey,
+								state.remoteBasepoints.fundingPubkey,
+								btcNetwork
+						  ).p2wshOutput;
+					await this.chainWatcher.watchFundingSpendDuringSplice(
+						channelId,
+						Buffer.from(state.fundingTxid).reverse().toString('hex'),
+						state.fundingOutputIndex,
+						oldFundingScript,
+						txidHex
+					);
+				}
+				return;
+			}
+
+			if (!state.fundingTxid?.equals(fundingTxid)) continue;
+			if (!state.remoteBasepoints) continue;
+			const fundingScript = isTaprootChannel(state.channelType)
+				? createTaprootFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2trOutput
+				: createFundingScript(
+						state.localBasepoints.fundingPubkey,
+						state.remoteBasepoints.fundingPubkey,
+						btcNetwork
+				  ).p2wshOutput;
+			await this.chainWatcher.watchFundingOutput(
+				channelId,
+				txidHex,
+				state.fundingOutputIndex,
+				state.minimumDepth ?? 3,
+				fundingScript
+			);
+			return;
 		}
 	}
 
