@@ -964,9 +964,13 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
-			this.log('warn', 'Channel voided: funding tx vanished before confirming', {
-				channelId
-			});
+			this.log(
+				'warn',
+				'Channel voided: funding tx vanished before confirming',
+				{
+					channelId
+				}
+			);
 			this.refreshStaticChannelBackup();
 			this.emit('channel:voided', { channelId });
 		});

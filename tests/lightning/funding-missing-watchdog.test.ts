@@ -133,7 +133,13 @@ describe('Funding-missing watchdog', function () {
 		// Registration performs an immediate check; make it see the tx present
 		// so the absence count afterwards is exact.
 		backend.history = [{ txid: fundingTxid, height: 0 }];
-		await watcher.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
+		await watcher.watchFundingOutput(
+			channelId,
+			fundingTxid,
+			0,
+			1,
+			fundingScript
+		);
 		await tick();
 		backend.history = [];
 
@@ -148,7 +154,13 @@ describe('Funding-missing watchdog', function () {
 
 	it('a reappearing tx resets the counter and the alarm can fire again', async function () {
 		backend.history = [{ txid: fundingTxid, height: 0 }];
-		await watcher.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
+		await watcher.watchFundingOutput(
+			channelId,
+			fundingTxid,
+			0,
+			1,
+			fundingScript
+		);
 		await tick();
 		backend.history = [];
 
@@ -168,7 +180,13 @@ describe('Funding-missing watchdog', function () {
 
 	it('a merely unconfirmed (mempool) tx never alarms', async function () {
 		backend.history = [{ txid: fundingTxid, height: 0 }];
-		await watcher.watchFundingOutput(channelId, fundingTxid, 0, 1, fundingScript);
+		await watcher.watchFundingOutput(
+			channelId,
+			fundingTxid,
+			0,
+			1,
+			fundingScript
+		);
 		await recheck(5);
 		expect(missing.length).to.equal(0);
 	});
