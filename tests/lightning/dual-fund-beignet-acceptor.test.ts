@@ -31,6 +31,8 @@ import {
 	ISpliceWalletInput
 } from '../../src/lightning/channel/channel';
 import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
+import { decodeAcceptChannel2Message } from '../../src/lightning/message/dual-funding';
+import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import {
 	IChannelBasepoints,
 	perCommitmentPointFromSecret
@@ -298,6 +300,114 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 			`underfunded abort reported (got: ${h.errors.join(' | ')})`
 		).to.equal(true);
 		expect(chA.getState()).to.not.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+});
+
+describe('trusted zero-conf v2 open (dual-funded)', function () {
+	this.timeout(10_000);
+
+	it('mutual trust: zero_conf channel type negotiates and both sides reach NORMAL unconfirmed', async function () {
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		h.mgrA.addTrustedPeer(h.sideB.pubkey);
+		h.mgrB.addTrustedPeer(h.sideA.pubkey);
+
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA),
+			{ trusted: true }
+		);
+
+		// NORMAL without any funding confirmation on either side: tx_signatures
+		// alone brought the channel up (zero-conf fast-track).
+		await settle(() => chA.getState() === ChannelState.NORMAL);
+
+		expect(h.errors, 'no negotiation errors').to.deep.equal([]);
+		expect(chA.getState()).to.equal(ChannelState.NORMAL);
+		const chB = acceptorChannel(h);
+		expect(chB, 'acceptor has the channel').to.exist;
+		expect(chB!.getState()).to.equal(ChannelState.NORMAL);
+
+		// Both sides negotiated the zero_conf channel type and a 0 depth.
+		for (const ch of [chA, chB!]) {
+			const st = ch.getFullState();
+			expect(st.minimumDepth).to.equal(0);
+			expect(st.channelType, 'channel type recorded').to.exist;
+			const bits = FeatureFlags.fromBuffer(st.channelType!);
+			expect(bits.hasFeature(Feature.ZERO_CONF)).to.equal(true);
+		}
+	});
+
+	it('the accept_channel2 advertises minimum_depth 0 on a zero_conf open', async function () {
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		h.mgrA.addTrustedPeer(h.sideB.pubkey);
+		h.mgrB.addTrustedPeer(h.sideA.pubkey);
+
+		let acceptDepth: number | null = null;
+		h.mgrB.on(
+			'message:outbound',
+			(_peer: string, type: number, payload: Buffer) => {
+				// 65 = accept_channel2
+				if (type === 65) {
+					acceptDepth = decodeAcceptChannel2Message(payload).minimumDepth;
+				}
+			}
+		);
+
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA),
+			{ trusted: true }
+		);
+		await settle(() => chA.getState() === ChannelState.NORMAL);
+
+		expect(acceptDepth, 'accept_channel2 observed').to.not.be.null;
+		expect(acceptDepth).to.equal(0);
+	});
+
+	it('an untrusted acceptor rejects the zero_conf v2 proposal', async function () {
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		// Only the opener declares trust.
+		h.mgrA.addTrustedPeer(h.sideB.pubkey);
+
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA),
+			{ trusted: true }
+		);
+
+		await settle(() => h.errors.length > 0);
+		expect(h.errors.some((e) => /trusted peer/.test(e))).to.equal(true);
+		expect(chA.getState()).to.not.equal(ChannelState.NORMAL);
+	});
+
+	it('a trusted open toward an untrusted-by-us peer throws up front', function () {
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		expect(() =>
+			h.mgrA.createDualFundedChannel(h.sideB.pubkey, openerParams(h.sideA), {
+				trusted: true
+			})
+		).to.throw('not in the trusted set');
+	});
+
+	it('a plain v2 open between trusted peers stays confirmation-gated', async function () {
+		// Trust-set membership alone must not fast-track an ordinary open.
+		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		h.mgrA.addTrustedPeer(h.sideB.pubkey);
+		h.mgrB.addTrustedPeer(h.sideA.pubkey);
+
+		const chA = h.mgrA.createDualFundedChannel(
+			h.sideB.pubkey,
+			openerParams(h.sideA)
+		);
+		await settle(
+			() => chA.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		expect(h.errors, 'no negotiation errors').to.deep.equal([]);
+		expect(chA.getState()).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
+		expect(acceptorChannel(h)!.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 	});

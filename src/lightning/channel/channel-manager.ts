@@ -515,16 +515,28 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Open a new channel with a peer.
+	 *
+	 * opts.trusted opens a zero-conf channel: the zero_conf channel type goes
+	 * on the wire and both sides fast-track channel_ready, so the channel is
+	 * usable before the funding confirms. The peer must already be in the
+	 * zero-conf trusted set. All other parameters (reserve included) stay
+	 * standard BOLT 2.
 	 */
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
-		beforeNegotiate?: (temporaryChannelId: Buffer) => void
+		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
+		opts?: { trusted?: boolean }
 	): Channel {
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
+		}
+		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+			throw new Error(
+				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
+			);
 		}
 
 		const chKeys = this.deriveKeysForNewChannel();
@@ -536,6 +548,12 @@ export class ChannelManager extends EventEmitter {
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
+
+		if (opts?.trusted) {
+			state.zeroConfEnabled = true;
+			state.trustedPeer = true;
+			state.minimumDepth = 0;
+		}
 
 		const signer = this.makeSigner(
 			chKeys.channelIndex,
@@ -1985,12 +2003,12 @@ export class ChannelManager extends EventEmitter {
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
 
-		// Enable zero-conf if peer is trusted
+		// Record trust-set membership only. Zero-conf semantics (minimum_depth 0,
+		// fast-tracked channel_ready) are flipped by handleOpenChannel itself and
+		// ONLY when the opener explicitly proposed the zero_conf channel type:
+		// membership alone must not change how ordinary opens validate.
 		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-			const channelState = channel.getFullState();
-			channelState.trustedPeer = true;
-			channelState.zeroConfEnabled = true;
-			channelState.minimumDepth = 0;
+			channel.getFullState().trustedPeer = true;
 		}
 
 		const actions = channel.handleOpenChannel(msg);
@@ -2128,7 +2146,12 @@ export class ChannelManager extends EventEmitter {
 
 	private handleChannelReady(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeChannelReadyMessage(payload);
-		const channel = this.findChannelByChannelId(msg.channelId);
+		// A zero-conf v2 peer sends channel_ready right behind tx_signatures,
+		// while the channel still lives in tempChannels (keyed by its derived
+		// channelId) — fall back to the temp lookup and promote it.
+		const channel =
+			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId);
 		if (!channel) {
 			this.emit('error', msg.channelId, 'Unknown channel_id in channel_ready');
 			return;
@@ -2136,6 +2159,7 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleChannelReady(msg);
 		this.processActions(peerPubkey, channel, actions);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
 	}
 
 	private handleUpdateAddHtlc(peerPubkey: string, payload: Buffer): void {
@@ -3571,11 +3595,21 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Open a dual-funded channel (v2) with a peer.
+	 *
+	 * opts.trusted opens it zero-conf (see openChannel): the zero_conf channel
+	 * type is added to the negotiated type and both sides fast-track
+	 * channel_ready after tx_signatures. Requires the peer in the trusted set.
 	 */
 	createDualFundedChannel(
 		peerPubkey: string,
-		params: IDualFundingParams
+		params: IDualFundingParams,
+		opts?: { trusted?: boolean }
 	): Channel {
+		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+			throw new Error(
+				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
+			);
+		}
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
@@ -3585,6 +3619,12 @@ export class ChannelManager extends EventEmitter {
 			localBasepoints: chKeys.basepoints,
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
+
+		if (opts?.trusted) {
+			state.zeroConfEnabled = true;
+			state.trustedPeer = true;
+			state.minimumDepth = 0;
+		}
 
 		const signer = this.makeSigner(
 			chKeys.channelIndex,
@@ -3623,6 +3663,14 @@ export class ChannelManager extends EventEmitter {
 					typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
 				}
 			}
+			channelType = typeFlags.toBuffer();
+		}
+		// Trusted zero-conf: the intent must ride in channel_type (BOLT 2
+		// feature 50) or the acceptor treats this as an ordinary open and
+		// answers with a real confirmation depth.
+		if (opts?.trusted) {
+			const typeFlags = FeatureFlags.fromBuffer(channelType);
+			typeFlags.setCompulsory(Feature.ZERO_CONF);
 			channelType = typeFlags.toBuffer();
 		}
 
@@ -3711,6 +3759,13 @@ export class ChannelManager extends EventEmitter {
 		const tempId = msg.channelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
+
+		// Trust-set membership only; handleOpenChannel2 flips zero-conf
+		// semantics when (and only when) the opener proposed the zero_conf
+		// channel type. Mirrors the v1 acceptor path.
+		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+			state.trustedPeer = true;
+		}
 
 		// Generate per-commitment points for local params
 		const localParams: IDualFundingParams = {
@@ -4024,7 +4079,17 @@ export class ChannelManager extends EventEmitter {
 	private _promoteV2ChannelIfReady(peerPubkey: string, channel: Channel): void {
 		const cid = channel.getChannelId();
 		if (!cid) return;
-		if (channel.getState() !== ChannelState.AWAITING_FUNDING_CONFIRMED) return;
+		// A zero-conf v2 open fast-tracks channel_ready inside the same action
+		// batch that completes the funding, so by promotion time the channel may
+		// already be past AWAITING_FUNDING_CONFIRMED.
+		const st = channel.getState();
+		if (
+			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			st !== ChannelState.AWAITING_CHANNEL_READY &&
+			st !== ChannelState.NORMAL
+		) {
+			return;
+		}
 		const permId = cid.toString('hex');
 		if (this.channels.has(permId)) return;
 		const tempId = channel.getTemporaryChannelId()?.toString('hex');

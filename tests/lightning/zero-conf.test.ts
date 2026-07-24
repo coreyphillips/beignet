@@ -897,7 +897,9 @@ describe('Zero-Conf Channels', function () {
 		it('zero-conf channel: funding_signed triggers immediate channel_ready', function () {
 			const managers = createConnectedManagerPair();
 			const alice = managers.alice;
-			void managers.bob; // needed for loopback routing
+			// The open now carries the zero_conf channel type on the wire, so the
+			// acceptor must trust the opener too or it rejects the proposal.
+			managers.bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const channel = alice.openZeroConfChannel(bobPubkey, 1_000_000n);
@@ -921,7 +923,8 @@ describe('Zero-Conf Channels', function () {
 		it('zero-conf channel: emits channel:zero-conf-ready event', function () {
 			const managers = createConnectedManagerPair();
 			const alice = managers.alice;
-			void managers.bob; // needed for loopback routing
+			// Mutual trust: the zero_conf channel type is rejected otherwise.
+			managers.bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const events: Buffer[] = [];
@@ -986,6 +989,8 @@ describe('Zero-Conf Channels', function () {
 
 		it('zero-conf channel reaches NORMAL after full flow', function () {
 			const { alice, bob } = createConnectedManagerPair();
+			// Mutual trust: the zero_conf channel type is rejected otherwise.
+			bob.addTrustedPeer(alicePubkey);
 			alice.addTrustedPeer(bobPubkey);
 
 			const channel = alice.openZeroConfChannel(bobPubkey, 1_000_000n);

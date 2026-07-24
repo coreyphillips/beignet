@@ -689,6 +689,14 @@ export class Channel {
 				channelTypeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
 			}
 		}
+		// Trusted-peer zero-conf: the intent must be carried in channel_type
+		// (BOLT 2 feature 50) or the peer treats this as an ordinary open and
+		// waits for confirmation. Note the extra bit makes an LND taproot peer
+		// reject the type (exact-match validation); zero-conf opens are only
+		// ever made toward trusted peers, where that combination does not arise.
+		if (this._state.zeroConfEnabled && this._state.trustedPeer) {
+			channelTypeFlags.setCompulsory(Feature.ZERO_CONF);
+		}
 		const channelType = channelTypeFlags.toBuffer();
 		this._state.channelType = channelType;
 
@@ -981,7 +989,27 @@ export class Channel {
 			firstPerCommitmentPoint: msg.firstPerCommitmentPoint
 		};
 
-		this._state.minimumDepth = msg.minimumDepth;
+		// BOLT 2: when the channel type is option_zeroconf the accepter MUST set
+		// minimum_depth to zero. We forced 0 locally when initiating the trusted
+		// open; a peer answering with a confirmation wait is a state-machine
+		// disagreement to surface, not to paper over.
+		if (
+			this._state.channelType &&
+			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
+				Feature.ZERO_CONF
+			)
+		) {
+			if (msg.minimumDepth !== 0) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `zero_conf accept_channel must use minimum_depth 0, got ${msg.minimumDepth}`
+					}
+				];
+			}
+		} else {
+			this._state.minimumDepth = msg.minimumDepth;
+		}
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
 
 		// Validate channel type if provided — compare semantic feature bits,
@@ -1259,17 +1287,20 @@ export class Channel {
 			}
 			// A zero_conf channel type commits us to minimum_depth 0 (BOLT 2), so
 			// only accept it from peers in the trusted set (unconfirmed funding can
-			// be double-spent by the opener).
-			if (
-				proposedFlags.hasFeature(Feature.ZERO_CONF) &&
-				!(this._state.zeroConfEnabled && this._state.trustedPeer)
-			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Proposed zero_conf channel type requires a trusted peer'
-					}
-				];
+			// be double-spent by the opener). The flip is driven by the EXPLICIT
+			// channel type, never by trust-set membership alone: a stale trusted
+			// entry must not change how ordinary opens from that peer validate.
+			if (proposedFlags.hasFeature(Feature.ZERO_CONF)) {
+				if (!this._state.trustedPeer) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Proposed zero_conf channel type requires a trusted peer'
+						}
+					];
+				}
+				this._state.zeroConfEnabled = true;
+				this._state.minimumDepth = 0;
 			}
 			this._state.channelType = msg.channelType;
 		} else {
@@ -1450,7 +1481,7 @@ export class Channel {
 
 		this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 
-		return [
+		const actions: ChannelAction[] = [
 			// Persist channel state BEFORE sending funding_signed — funds are now at risk
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(
@@ -1464,6 +1495,17 @@ export class Channel {
 				minimumDepth: this._state.minimumDepth
 			}
 		];
+
+		// Zero-conf acceptor: send channel_ready right behind funding_signed
+		// instead of waiting for confirmation, mirroring the opener, which
+		// fast-tracks on funding_signed. Without this the acceptor never reaches
+		// NORMAL until the funding tx confirms and the channel is unusable in
+		// exactly the window zero-conf exists for.
+		if (this._state.zeroConfEnabled && this._state.trustedPeer) {
+			actions.push(...this.fundingConfirmed());
+		}
+
+		return actions;
 	}
 
 	// ─────────────── Channel Ready ───────────────
@@ -8730,19 +8772,24 @@ export class Channel {
 		this._state.fundingLocktime = msg.locktime;
 
 		// Same trusted-peer gate as the v1 path: a zero_conf channel type commits
-		// us to minimum_depth 0, which we only extend to trusted peers.
+		// us to minimum_depth 0, which we only extend to trusted peers. As on v1,
+		// the flip is driven by the EXPLICIT channel type, never by trust-set
+		// membership alone, and the accept_channel2 we build must advertise the
+		// zero minimum_depth (BOLT 2 MUST for option_zeroconf).
 		if (msg.channelType) {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
-			if (
-				proposedFlags.hasFeature(Feature.ZERO_CONF) &&
-				!(this._state.zeroConfEnabled && this._state.trustedPeer)
-			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Proposed zero_conf channel type requires a trusted peer'
-					}
-				];
+			if (proposedFlags.hasFeature(Feature.ZERO_CONF)) {
+				if (!this._state.trustedPeer) {
+					return [
+						{
+							type: ChannelActionType.ERROR,
+							message: 'Proposed zero_conf channel type requires a trusted peer'
+						}
+					];
+				}
+				this._state.zeroConfEnabled = true;
+				this._state.minimumDepth = 0;
+				localParams = { ...localParams, minimumDepth: 0 };
 			}
 		}
 
@@ -8967,6 +9014,23 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: result.error || 'Failed to handle accept_channel2'
+				}
+			];
+		}
+
+		// BOLT 2: when the channel type is option_zeroconf the accepter MUST set
+		// minimum_depth to zero. Surface a disagreement instead of ignoring it.
+		if (
+			this._state.channelType &&
+			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
+				Feature.ZERO_CONF
+			) &&
+			msg.minimumDepth !== 0
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`
 				}
 			];
 		}
@@ -10288,7 +10352,7 @@ export class Channel {
 			witnesses
 		};
 
-		return [
+		const actions: ChannelAction[] = [
 			// Point of no return — the peer can broadcast once this leaves.
 			// Persist BEFORE sending.
 			{ type: ChannelActionType.PERSIST_STATE },
@@ -10300,6 +10364,19 @@ export class Channel {
 				minimumDepth: this._state.minimumDepth
 			}
 		];
+
+		// Zero-conf v2: send channel_ready right behind tx_signatures instead of
+		// waiting for confirmation, mirroring the v1 fast-tracks on
+		// funding_signed. Only meaningful once the funding negotiation is done.
+		if (
+			this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+			this._state.zeroConfEnabled &&
+			this._state.trustedPeer
+		) {
+			actions.push(...this.fundingConfirmed());
+		}
+
+		return actions;
 	}
 
 	/**
@@ -10491,6 +10568,11 @@ export class Channel {
 						tx: assembled
 					});
 				}
+			}
+			// Zero-conf v2: channel_ready right behind tx_signatures, mirroring
+			// the v1 fast-tracks on funding_signed.
+			if (this._state.zeroConfEnabled && this._state.trustedPeer) {
+				actions.push(...this.fundingConfirmed());
 			}
 		}
 
