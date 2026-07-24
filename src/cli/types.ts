@@ -229,6 +229,35 @@ export type TOnchainQuote = {
 	maxSatsPerVbyte: number;
 };
 
+/**
+ * A peer-aware max channel-funding quote: the daemon decides v1 vs v2 the
+ * same way openChannel does, so the previewed amount is the amount the
+ * channel actually commits.
+ */
+export type TChannelFundingQuote = {
+	/** Which funding flow openChannel would use toward this peer. */
+	method: 'v1' | 'v2';
+	/** False when the peer sent no init (not connected): the v2 judgment
+	 *  cannot be made and the quote falls back to the v1 sweep. */
+	peerKnown: boolean;
+	/** The rate the quote was made at. */
+	satsPerVbyte: number;
+	/** The exact amount a max open commits as funding_satoshis. */
+	fundingSatoshis: number;
+	/** The funding fee at this rate. */
+	feeSats: number;
+	/** v2 only: the pinned interactive-tx rate in sat/kw. */
+	feeratePerKw?: number;
+	/** v2 only: the wallet balance the quote drew on. */
+	spendableSats?: number;
+	/** Inputs the funding would spend. */
+	inputCount?: number;
+	/** v1 only: sweep tx virtual size. */
+	vsize?: number;
+	/** v1 only: the highest rate the sweep could pay. */
+	maxSatsPerVbyte?: number;
+};
+
 export interface OnchainTxInfo {
 	txid: string;
 	type: 'sent' | 'received';

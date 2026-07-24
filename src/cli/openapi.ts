@@ -2057,6 +2057,50 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/channel/funding-quote': {
+				post: {
+					summary:
+						'Peer-aware max channel-funding quote: decides v1 vs v2 the same way openChannel does (both inits advertising option_dual_fund) and prices the max open with the exact formula that flow commits, so the previewed amount matches the opened channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						peerPubkey: 'string',
+						satsPerVbyte: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel funding quote',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									method: { type: 'string', enum: ['v1', 'v2'] },
+									peerKnown: {
+										type: 'boolean',
+										description:
+											'false when the peer sent no init (not connected); the quote then falls back to the v1 sweep'
+									},
+									satsPerVbyte: { type: 'number' },
+									fundingSatoshis: { type: 'number' },
+									feeSats: { type: 'number' },
+									feeratePerKw: {
+										type: 'number',
+										description: 'v2 only'
+									},
+									spendableSats: {
+										type: 'number',
+										description: 'v2 only'
+									},
+									inputCount: { type: 'number' },
+									vsize: { type: 'number', description: 'v1 only' },
+									maxSatsPerVbyte: {
+										type: 'number',
+										description: 'v1 only'
+									}
+								}
+							})
+						}
+					}
+				}
+			},
 			'/channel/splice-quote': {
 				post: {
 					summary:

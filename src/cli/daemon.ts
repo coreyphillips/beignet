@@ -1084,6 +1084,20 @@ export async function startDaemon(
 			);
 		},
 
+		// Peer-aware max funding preview. A client cannot decide this itself:
+		// whether the open rides v1 or v2 depends on the peer's init features,
+		// and the two flows price a max open with different formulas.
+		'POST /channel/funding-quote': async (body) => {
+			const { peerPubkey, satsPerVbyte } = body as {
+				peerPubkey: string;
+				satsPerVbyte?: number;
+			};
+			if (!peerPubkey) return failure('INVALID_PARAMS', 'peerPubkey required');
+			return success(
+				await node.quoteChannelFunding({ peerPubkey, satsPerVbyte })
+			);
+		},
+
 		// ── Splicing ──
 		'POST /channel/splice-quote': (body) => {
 			const { channelId, direction, feeratePerkw } = body as {

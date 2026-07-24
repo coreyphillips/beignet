@@ -3994,6 +3994,54 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Public view of the v1/v2 routing decision openChannel will make for
+	 * this peer: dualFund mirrors peerNegotiatedDualFund exactly, and
+	 * peerKnown says whether there is an init to judge by at all (a peer we
+	 * are not connected to yields peerKnown false and dualFund false, which
+	 * openChannel would route to v1).
+	 */
+	peerFundingInfo(peerPubkey: string): {
+		peerKnown: boolean;
+		dualFund: boolean;
+	} {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		return {
+			peerKnown: Boolean(init),
+			dualFund: this.peerNegotiatedDualFund(peerPubkey)
+		};
+	}
+
+	/**
+	 * The exact quote a max dual-funded open would commit at this rate: the
+	 * SAME clamp, sat/kw conversion and provider formula as openChannel's
+	 * fundMax path, so a UI previewing this number previews the amount the
+	 * channel actually opens with.
+	 */
+	quoteDualFundingMaxOpen(satsPerVbyte: number): {
+		feeratePerKw: number;
+		fundingSatoshis: bigint;
+		spendableSats: bigint;
+		feeSats: bigint;
+		inputCount: number;
+	} {
+		if (!Number.isFinite(satsPerVbyte) || satsPerVbyte <= 0) {
+			throw new Error(
+				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
+			);
+		}
+		const fp = this.fundingProvider;
+		if (!fp?.quoteDualFundingMax) {
+			throw new Error(
+				'quoting a max dual-funded (v2) open requires a funding provider with quoteDualFundingMax'
+			);
+		}
+		const feeratePerKw = Math.ceil(
+			this.clampEstimatedFeeRate(satsPerVbyte) * 250
+		);
+		return { feeratePerKw, ...fp.quoteDualFundingMax(feeratePerKw) };
+	}
+
+	/**
 	 * Open a channel with a peer.
 	 *
 	 * trusted opens a zero-conf channel toward a peer in the zero-conf trusted
