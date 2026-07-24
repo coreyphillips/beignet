@@ -447,6 +447,7 @@ async function handleStart(): Promise<void> {
 			preferAnchors: config.preferAnchors,
 			largeChannels: config.largeChannels,
 			zeroReserve: config.zeroReserve,
+			trustedZeroConfSplice: config.trustedZeroConfSplice,
 			apiToken: config.apiToken,
 			apiKeys: config.apiKeys,
 			backupPath: config.backupPath,

@@ -125,6 +125,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_ZERO_RESERVE === 'true'
 				: undefined) ??
 			file.zeroReserve,
+		trustedZeroConfSplice:
+			cliFlags.trustedZeroConfSplice ??
+			(process.env.BEIGNET_TRUSTED_ZERO_CONF_SPLICE !== undefined
+				? process.env.BEIGNET_TRUSTED_ZERO_CONF_SPLICE === 'true'
+				: undefined) ??
+			file.trustedZeroConfSplice,
 		apiToken:
 			cliFlags.apiToken || process.env.BEIGNET_API_TOKEN || file.apiToken,
 		apiKeys: cliFlags.apiKeys || parseApiKeysEnv() || file.apiKeys,

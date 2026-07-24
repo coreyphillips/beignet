@@ -414,6 +414,12 @@ export interface BeignetConfig {
 	 * should enable it.
 	 */
 	zeroReserve?: boolean;
+	/**
+	 * Zero-conf splices with TRUSTED peers: splice_locked at broadcast, so a
+	 * splice is usable in seconds instead of after a confirmation. Same trust
+	 * model as zero-conf opens; both peers should enable it.
+	 */
+	trustedZeroConfSplice?: boolean;
 	/** Legacy single API bearer token. Still honored with implicit admin scope. */
 	apiToken?: string;
 	/** Named API keys with permission scopes (readonly/invoice/admin).

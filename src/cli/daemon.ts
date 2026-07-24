@@ -1114,17 +1114,21 @@ export async function startDaemon(
 			return success(node.spliceIn(channelId, amountSats, feeratePerkw));
 		},
 		'POST /channel/splice-out': (body) => {
-			const { channelId, amountSats, feeratePerkw } = body as {
+			const { channelId, amountSats, feeratePerkw, address } = body as {
 				channelId: string;
 				amountSats: number;
 				feeratePerkw: number;
+				/** Optional external destination: the splice tx pays this address
+				 *  directly, so channel funds reach a third party in one
+				 *  transaction with no wallet hop. Defaults to the wallet. */
+				address?: string;
 			};
 			if (!channelId || amountSats === undefined || feeratePerkw === undefined)
 				return failure(
 					'INVALID_PARAMS',
 					'channelId, amountSats, and feeratePerkw required'
 				);
-			return success(node.spliceOut(channelId, amountSats, feeratePerkw));
+			return success(node.spliceOut(channelId, amountSats, feeratePerkw, address));
 		},
 
 		// ── Wait APIs ──
