@@ -408,13 +408,6 @@ export interface BeignetConfig {
 	/** option_wumbo: advertise large_channels and lift the 2^24 sat funding cap. */
 	largeChannels?: boolean;
 	/**
-	 * Zero reserve for TRUSTED peers: channels with peers in the zero-conf
-	 * trusted set negotiate a channel_reserve of 0 on both sides, so the whole
-	 * balance is spendable. Same trust model as zero-conf opens; both peers
-	 * should enable it.
-	 */
-	zeroReserve?: boolean;
-	/**
 	 * Zero-conf splices with TRUSTED peers: splice_locked at broadcast, so a
 	 * splice is usable in seconds instead of after a confirmation. Same trust
 	 * model as zero-conf opens; both peers should enable it.

@@ -151,8 +151,7 @@ function validateChannelPoints(
  */
 export function validateOpenChannelParams(
 	msg: IOpenChannelMessage,
-	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS,
-	allowZeroReserve = false
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
 ): string | null {
 	// funding_satoshis must be > 0
 	if (msg.fundingSatoshis === 0n) {
@@ -181,13 +180,8 @@ export function validateOpenChannelParams(
 		return `max_accepted_htlcs ${msg.maxAcceptedHtlcs} exceeds maximum ${MAX_ACCEPTED_HTLCS}`;
 	}
 
-	// channel_reserve must be >= dust_limit. Zero-reserve channels (trusted
-	// peers, negotiated as a reserve of exactly 0) have no reserve for the
-	// dust limit to be measured against, so the coupling is waived for them.
-	if (
-		msg.channelReserveSatoshis < msg.dustLimitSatoshis &&
-		!(allowZeroReserve && msg.channelReserveSatoshis === 0n)
-	) {
+	// channel_reserve must be >= dust_limit
+	if (msg.channelReserveSatoshis < msg.dustLimitSatoshis) {
 		return 'channel_reserve_satoshis must be >= dust_limit_satoshis';
 	}
 
@@ -281,21 +275,13 @@ export function validateAcceptChannelParams(
 		return `max_accepted_htlcs ${accept.maxAcceptedHtlcs} exceeds maximum ${MAX_ACCEPTED_HTLCS}`;
 	}
 
-	// Zero-reserve channels (trusted peers): both sides advertised a reserve
-	// of 0, so the dust-vs-reserve couplings have nothing to protect and are
-	// skipped. Reaching this state requires the opener to have proposed 0 and
-	// the acceptor to have agreed, which only happens inside the trusted set.
-	const zeroReserve =
-		open.channelReserveSatoshis === 0n &&
-		accept.channelReserveSatoshis === 0n;
-
 	// channel_reserve must be >= dust_limit of the opener
-	if (!zeroReserve && accept.channelReserveSatoshis < open.dustLimitSatoshis) {
+	if (accept.channelReserveSatoshis < open.dustLimitSatoshis) {
 		return 'acceptor channel_reserve must be >= opener dust_limit';
 	}
 
 	// opener channel_reserve must be >= acceptor dust_limit
-	if (!zeroReserve && open.channelReserveSatoshis < accept.dustLimitSatoshis) {
+	if (open.channelReserveSatoshis < accept.dustLimitSatoshis) {
 		return 'opener channel_reserve must be >= acceptor dust_limit';
 	}
 

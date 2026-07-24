@@ -207,12 +207,6 @@ export interface BeignetNodeOptions {
 	 * splice is usable in seconds. Same trust model as zero-conf opens.
 	 */
 	trustedZeroConfSplice?: boolean;
-	/**
-	 * Zero reserve with trusted peers: channels with peers in the zero-conf
-	 * trusted set negotiate channel_reserve 0 on both sides, so the whole
-	 * balance is spendable. Both peers should enable it.
-	 */
-	zeroReserve?: boolean;
 	autoBootstrap?: boolean;
 	/** Enable auto-reconnection to peers (default true) */
 	autoReconnect?: boolean;
@@ -903,7 +897,6 @@ export class BeignetNode extends EventEmitter {
 			leaseRates: opts.leaseRates,
 			jitReceive: opts.jitReceive,
 			trustedZeroConfSplice: opts.trustedZeroConfSplice,
-			zeroReserve: opts.zeroReserve,
 			chainBackend: electrumBackend,
 			feeEstimator: electrumBackend,
 			logger: this.logger,

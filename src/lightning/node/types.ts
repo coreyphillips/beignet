@@ -274,14 +274,6 @@ export interface INodeConfig {
 	 */
 	trustedZeroConfSplice?: boolean;
 	/**
-	 * Zero reserve with TRUSTED peers: channels with peers in the zero-conf
-	 * trusted set negotiate channel_reserve 0 on both sides, so the whole
-	 * balance is spendable. The reserve exists to make cheating unprofitable,
-	 * so dropping it is only safe when both nodes are run by the same party.
-	 * Both peers should enable it.
-	 */
-	zeroReserve?: boolean;
-	/**
 	 * Propose simple taproot channels (option_taproot) when opening channels.
 	 * MuSig2 funding and commitment signing (deterministic verification nonces)
 	 * are fully wired into the live state machine; the complete lifecycle

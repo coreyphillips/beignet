@@ -729,23 +729,10 @@ export class Channel {
 		const channelType = channelTypeFlags.toBuffer();
 		this._state.channelType = channelType;
 
-		// Zero reserve (trusted peers only): advertise a reserve of 0 for the
-		// peer and enforce none ourselves, so their whole balance is spendable.
-		// localConfig is replaced, not mutated: the manager hands every channel
-		// the same shared default config object.
-		const zeroReserve = !!this._state.zeroReserve && this._state.trustedPeer;
-		if (zeroReserve) {
-			this._state.localConfig = {
-				...this._state.localConfig,
-				channelReserveSatoshis: 0n
-			};
-		}
-		const channelReserve = zeroReserve
-			? 0n
-			: computeChannelReserve(
-					this._state.fundingSatoshis,
-					this._state.localConfig.dustLimitSatoshis
-			  );
+		const channelReserve = computeChannelReserve(
+			this._state.fundingSatoshis,
+			this._state.localConfig.dustLimitSatoshis
+		);
 
 		// max_htlc_value_in_flight_msat is advertised as configured, NOT
 		// clamped to capacity: the advertisement is immutable for the life of
@@ -792,11 +779,7 @@ export class Channel {
 			firstPerCommitmentPoint: firstPoint
 		};
 
-		const error = validateOpenChannelParams(
-			msg,
-			this._maxFundingSatoshis,
-			zeroReserve
-		);
+		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -1251,14 +1234,7 @@ export class Channel {
 			];
 		}
 
-		// The manager sets the trust flags before handing over the message, so a
-		// trusted opener proposing a reserve of 0 is accepted here and answered
-		// with a 0 of our own further down.
-		const error = validateOpenChannelParams(
-			msg,
-			this._maxFundingSatoshis,
-			!!this._state.zeroReserve && this._state.trustedPeer
-		);
+		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -1340,38 +1316,20 @@ export class Channel {
 			this._state.channelType = defaultType.toBuffer();
 		}
 
-		// Zero reserve (trusted peers only): a trusted opener advertising a
-		// reserve of 0 gets a 0 back, and the dust-vs-reserve couplings below
-		// are BOLT 2 rules for reserves that exist; with no reserve on either
-		// side there is nothing for dust to be trimmed against.
-		const zeroReserve =
-			!!this._state.zeroReserve &&
-			this._state.trustedPeer &&
-			msg.channelReserveSatoshis === 0n;
-		if (zeroReserve) {
-			this._state.localConfig = {
-				...this._state.localConfig,
-				channelReserveSatoshis: 0n
-			};
-		}
-
 		// BOLT 2 couplings for the accept_channel WE build: our channel_reserve
 		// MUST be >= the opener's dust_limit (else the opener's below-reserve
 		// balance could be trimmed as dust), so raise it if our formula lands
 		// lower. And our dust_limit MUST be <= the opener's channel_reserve; we
 		// will not lower our own dust floor, so reject the open instead of
 		// emitting a non-compliant accept_channel the opener must then fail.
-		const channelReserve = zeroReserve
-			? 0n
-			: bigIntMax(
-					computeChannelReserve(
-						this._state.fundingSatoshis,
-						this._state.localConfig.dustLimitSatoshis
-					),
-					msg.dustLimitSatoshis
-			  );
+		const channelReserve = bigIntMax(
+			computeChannelReserve(
+				this._state.fundingSatoshis,
+				this._state.localConfig.dustLimitSatoshis
+			),
+			msg.dustLimitSatoshis
+		);
 		if (
-			!zeroReserve &&
 			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
 		) {
 			return [

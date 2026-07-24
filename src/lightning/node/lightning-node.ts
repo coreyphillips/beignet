@@ -650,9 +650,6 @@ export class LightningNode extends EventEmitter {
 			// nonces but funding cannot yet complete (commitment-round MuSig2 nonce
 			// rotation is not wired into the live state machine). Off by default.
 			preferTaproot: config.preferTaproot,
-			// Zero reserve for trusted peers: negotiated per channel, gated on
-			// the zero-conf trusted set inside the manager.
-			zeroReserve: config.zeroReserve,
 			// Default to the node's OWN network's chain hash, never mainnet: a
 			// regtest/testnet node without explicit chainHashes previously opened
 			// channels (and announced) with the mainnet hash (S-7.M1).
@@ -11022,7 +11019,6 @@ export class LightningNode extends EventEmitter {
 			leaseRates?: import('../gossip/types').ILeaseRates;
 			jitReceive?: import('../liquidity/jit-receive').IJitReceiveConfig;
 			trustedZeroConfSplice?: boolean;
-			zeroReserve?: boolean;
 			chainBackend?: import('../chain/chain-watcher').IChainBackend;
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
@@ -11095,7 +11091,6 @@ export class LightningNode extends EventEmitter {
 			leaseRates: options?.leaseRates,
 			jitReceive: options?.jitReceive,
 			trustedZeroConfSplice: options?.trustedZeroConfSplice,
-			zeroReserve: options?.zeroReserve,
 			chainBackend: options?.chainBackend,
 			sweepDestinationScript: options?.sweepDestinationScript,
 			peerStorageEnabled: options?.peerStorageEnabled,
