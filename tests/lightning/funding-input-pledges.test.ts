@@ -100,7 +100,9 @@ function makeWallet(values: number[]) {
 	return { wallet, utxos, frozen, unfrozenLog, payment };
 }
 
-const outpoints = (inputs: Array<{ prevTx: Buffer; prevOutputIndex: number }>) =>
+const outpoints = (
+	inputs: Array<{ prevTx: Buffer; prevOutputIndex: number }>
+) =>
 	inputs.map((i) => {
 		const tx = bitcoin.Transaction.fromBuffer(i.prevTx);
 		return `${tx.getId()}:${i.prevOutputIndex}`;
@@ -120,6 +122,34 @@ describe('Funding input pledges', function () {
 		expect(b.length).to.be.greaterThan(0);
 		for (const op of b) {
 			expect(a, 'no outpoint reused across concurrent fundings').to.not.include(
+				op
+			);
+		}
+	});
+
+	it('truly concurrent selections (Promise.all) never share a coin', async function () {
+		// Force interleaving: the prev-tx fetch yields to the event loop, so
+		// without serialization both selections would pick the same coins
+		// before either pledge lands.
+		const { wallet } = makeWallet([100_000, 100_000, 100_000]);
+		const slowGet = wallet.electrum.getTransactions;
+		wallet.electrum.getTransactions = async (params) => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			return slowGet(params);
+		};
+		const provider = new WalletFundingProvider(wallet as never);
+
+		const [first, second] = await Promise.all([
+			provider.selectSpliceInputs!(80_000n, 1000),
+			provider.selectSpliceInputs!(80_000n, 1000)
+		]);
+
+		const a = outpoints(first.inputs);
+		const b = outpoints(second.inputs);
+		expect(a.length).to.be.greaterThan(0);
+		expect(b.length).to.be.greaterThan(0);
+		for (const op of b) {
+			expect(a, 'no outpoint shared by interleaved fundings').to.not.include(
 				op
 			);
 		}

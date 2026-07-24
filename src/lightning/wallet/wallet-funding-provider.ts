@@ -141,8 +141,26 @@ export class WalletFundingProvider implements IFundingProvider {
 	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
 	private static readonly PLEDGE_TAG = 'funding-pledge';
 
+	/**
+	 * Serializes every selection-then-pledge sequence. Selection excludes
+	 * frozen coins, but the freeze lands only after async work (wallet.send's
+	 * internal selection, the electrum prev-tx fetch), so two interleaved
+	 * fundings could both select a coin before either froze it. The exact
+	 * scenario pledging exists for (two fundings triggered by concurrent
+	 * network events) is also the one that interleaves, so the whole
+	 * select-and-pledge critical section runs under one lock.
+	 */
+	private selectionLock: Promise<unknown> = Promise.resolve();
+
 	constructor(wallet: IWalletLike) {
 		this.wallet = wallet;
+	}
+
+	/** Run fn after every previously queued selection has finished. */
+	private runSelection<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.selectionLock.then(fn, fn);
+		this.selectionLock = run.catch(() => undefined);
+		return run;
 	}
 
 	/** Freeze the outpoint and remember when we pledged it. */
@@ -201,6 +219,17 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	async buildFundingTransaction(
+		address: string,
+		amountSats: bigint,
+		satsPerByte?: number,
+		max = false
+	): Promise<{ txHex: string; txid: Buffer; outputIndex: number }> {
+		return this.runSelection(() =>
+			this.buildFundingTransactionLocked(address, amountSats, satsPerByte, max)
+		);
+	}
+
+	private async buildFundingTransactionLocked(
 		address: string,
 		amountSats: bigint,
 		satsPerByte?: number,
@@ -488,6 +517,15 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * signWitness closure so wallet keys never leave this method.
 	 */
 	private async gatherWalletInputs(
+		purpose: string,
+		computeTarget: (selectedCount: number) => bigint
+	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
+		return this.runSelection(() =>
+			this.gatherWalletInputsLocked(purpose, computeTarget)
+		);
+	}
+
+	private async gatherWalletInputsLocked(
 		purpose: string,
 		computeTarget: (selectedCount: number) => bigint
 	): Promise<{ inputs: ISpliceWalletInput[]; changeScript: Buffer }> {
