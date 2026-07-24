@@ -61,6 +61,15 @@ interface IWatchedFunding {
 	 * different txid and must trigger the breach path.
 	 */
 	ignoreSpendTxid?: string;
+	/**
+	 * Consecutive confirmation checks in which the funding tx was absent from
+	 * the script's history entirely (neither mempool nor chain). A zero-conf
+	 * channel is NORMAL the moment both sides trust it; if its funding tx is
+	 * evicted or replaced, the channel silently becomes fiction, so absence is
+	 * alarmed via 'funding:missing' after a debounce.
+	 */
+	missingChecks?: number;
+	missingReported?: boolean;
 }
 
 /** A generic output being watched for spends */
@@ -115,6 +124,8 @@ export function computeScriptHash(scriptPubkey: Buffer): string {
  * Events:
  * - 'funding:confirmed' (channelId: Buffer)
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
+ * - 'funding:missing' (channelId: Buffer, txid: string): the watched funding
+ *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
  * - 'broadcast:success' (txid: string)
  * - 'broadcast:failure' (error: Error)
  * - 'error' (error: Error)
@@ -714,7 +725,23 @@ export class ChainWatcher extends EventEmitter {
 
 		// Find our funding tx in the history
 		const entry = history.find((h) => h.txid === watched.txid);
-		if (!entry || entry.height <= 0) return; // not yet confirmed
+		if (!entry) {
+			// The funding tx is in neither the mempool nor a block: it was
+			// evicted or replaced (e.g. one of its inputs double-spent). For a
+			// zero-conf channel that is already NORMAL this means the channel
+			// no longer exists on the network. Alarm after a debounce so a
+			// transient Electrum hiccup does not cry wolf.
+			watched.missingChecks = (watched.missingChecks ?? 0) + 1;
+			if (watched.missingChecks >= 3 && !watched.missingReported) {
+				watched.missingReported = true;
+				this.emit('funding:missing', watched.channelId, watched.txid);
+			}
+			return;
+		}
+		// Present again (mempool or chain): a reorg can bounce a tx back.
+		watched.missingChecks = 0;
+		watched.missingReported = false;
+		if (entry.height <= 0) return; // in the mempool, not yet confirmed
 
 		// Calculate confirmations
 		const confirmations = this.currentBlockHeight - entry.height + 1;

@@ -790,6 +790,8 @@ export interface BeignetNodeEvents {
 		initiator: 'local' | 'remote';
 	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
+	/** An unconfirmed channel's funding tx vanished from mempool and chain; the channel was dropped (nothing to close). */
+	'channel:voided': (data: { channelId: string }) => void;
 	'htlc:forwarded': (data: {
 		inChannelId: string;
 		outChannelId: string;

@@ -4227,6 +4227,22 @@ export class ChannelManager extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Void a channel whose funding tx vanished from mempool AND chain before
+	 * confirming (evicted or an input double-spent): the channel never existed
+	 * on the network, so there is nothing to close and it is simply dropped.
+	 * The coins contributed to the funding remain (or return) onchain.
+	 * Returns false if the channel is unknown.
+	 */
+	voidChannel(channelId: Buffer): boolean {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) return false;
+		this.channels.delete(idHex);
+		this.channelPeers.delete(idHex);
+		return true;
+	}
+
 	private handleErrorMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeErrorMessage(payload);
 		const channelIdHex = msg.channelId.toString('hex');
