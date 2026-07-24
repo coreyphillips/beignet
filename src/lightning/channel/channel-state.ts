@@ -341,6 +341,23 @@ export interface IChannelState {
 	zeroConfEnabled: boolean;
 	/** Zero-conf: peer is trusted for zero-conf */
 	trustedPeer: boolean;
+	/**
+	 * EXPERIMENTAL beignet extension (not BOLT 2): both sides advertised a
+	 * 0 sat channel_reserve on the open, so either side may spend its balance
+	 * to zero. Requires trustedPeer plus the experimental_zero_reserve init
+	 * capability on both sides: without a reserve the peer has nothing at
+	 * stake to lose by broadcasting a revoked commitment. Optional so states
+	 * persisted before the field existed stay valid; absent means false.
+	 * Persisted.
+	 */
+	zeroReserve?: boolean;
+	/**
+	 * Handshake-transient acceptor gate, set by ChannelManager before
+	 * handleOpenChannel: the peer is trusted AND both sides advertise the
+	 * experimental_zero_reserve capability, so a 0 reserve in its open_channel
+	 * may be accepted. Never persisted; recomputed per open.
+	 */
+	zeroReserveAllowed?: boolean;
 
 	/** Quiescence state */
 	quiescenceState: string;

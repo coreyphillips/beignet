@@ -700,10 +700,15 @@ export class Channel {
 		const channelType = channelTypeFlags.toBuffer();
 		this._state.channelType = channelType;
 
-		const channelReserve = computeChannelReserve(
-			this._state.fundingSatoshis,
-			this._state.localConfig.dustLimitSatoshis
-		);
+		// Experimental zero-reserve open: advertise 0 so the peer may spend down
+		// to zero. localConfig.channelReserveSatoshis was zeroed alongside the
+		// zeroReserve flag, keeping the advertised and enforced values equal.
+		const channelReserve = this._state.zeroReserve
+			? 0n
+			: computeChannelReserve(
+					this._state.fundingSatoshis,
+					this._state.localConfig.dustLimitSatoshis
+			  );
 
 		// max_htlc_value_in_flight_msat is advertised as configured, NOT
 		// clamped to capacity: the advertisement is immutable for the life of
@@ -750,7 +755,11 @@ export class Channel {
 			firstPerCommitmentPoint: firstPoint
 		};
 
-		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
+		const error = validateOpenChannelParams(
+			msg,
+			this._maxFundingSatoshis,
+			this._state.zeroReserve
+		);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
 		}
@@ -957,7 +966,8 @@ export class Channel {
 				channelReserveSatoshis: this._state.localConfig.channelReserveSatoshis,
 				fundingSatoshis: this._state.fundingSatoshis
 			},
-			msg
+			msg,
+			this._state.zeroReserve
 		);
 		if (acceptError) {
 			return [
@@ -1225,9 +1235,37 @@ export class Channel {
 			];
 		}
 
-		const error = validateOpenChannelParams(msg, this._maxFundingSatoshis);
+		// The experimental zero-reserve gate: trusted peer AND both sides
+		// advertised the capability (zeroReserveAllowed is set per-open by
+		// ChannelManager from the trust set and the peer's init features).
+		const zeroReserveOk =
+			this._state.trustedPeer && this._state.zeroReserveAllowed === true;
+		const error = validateOpenChannelParams(
+			msg,
+			this._maxFundingSatoshis,
+			zeroReserveOk
+		);
 		if (error) {
 			return [{ type: ChannelActionType.ERROR, message: error }];
+		}
+
+		// A 0 reserve is only ever accepted through the explicit gate; reaching
+		// here with one and no gate means validateOpenChannelParams let it
+		// through for another reason, so fail closed.
+		if (msg.channelReserveSatoshis === 0n) {
+			if (!zeroReserveOk) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'zero channel_reserve requires a trusted peer with the experimental_zero_reserve capability'
+					}
+				];
+			}
+			// Reciprocate: both sides run with no reserve, and our enforced value
+			// must match what we put on the wire (localConfig is per-channel).
+			this._state.zeroReserve = true;
+			this._state.localConfig.channelReserveSatoshis = 0n;
 		}
 
 		// Store remote config
@@ -1316,15 +1354,18 @@ export class Channel {
 		// lower. And our dust_limit MUST be <= the opener's channel_reserve; we
 		// will not lower our own dust floor, so reject the open instead of
 		// emitting a non-compliant accept_channel the opener must then fail.
-		const channelReserve = bigIntMax(
-			computeChannelReserve(
-				this._state.fundingSatoshis,
-				this._state.localConfig.dustLimitSatoshis
-			),
-			msg.dustLimitSatoshis
-		);
+		const channelReserve = this._state.zeroReserve
+			? 0n
+			: bigIntMax(
+					computeChannelReserve(
+						this._state.fundingSatoshis,
+						this._state.localConfig.dustLimitSatoshis
+					),
+					msg.dustLimitSatoshis
+			  );
 		if (
-			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis
+			this._state.localConfig.dustLimitSatoshis > msg.channelReserveSatoshis &&
+			!this._state.zeroReserve
 		) {
 			return [
 				{

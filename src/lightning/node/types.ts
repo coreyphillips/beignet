@@ -247,6 +247,15 @@ export interface INodeConfig {
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) when opening channels */
 	preferAnchors?: boolean;
 	/**
+	 * EXPERIMENTAL beignet extension (not BOLT 2): allow negotiating a 0 sat
+	 * channel_reserve with trusted peers that also advertise the
+	 * experimental_zero_reserve init capability. Default true; the capability
+	 * is still gated per-peer on the trust set and the peer's init features,
+	 * and only ever engages on an explicit zeroReserve open. Set false to
+	 * refuse the extension entirely and stop advertising the bit.
+	 */
+	experimentalZeroReserve?: boolean;
+	/**
 	 * option_wumbo (large_channels, bit 18, default false): advertise the bit
 	 * and lift the BOLT 2 2^24 sat funding cap to MAX_WUMBO_FUNDING_SATOSHIS
 	 * (10 BTC) for peers that also advertise it. Opens/accepts/splices with

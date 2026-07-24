@@ -164,6 +164,14 @@ export interface IChannelManagerConfig {
 	/** Prefer anchor channels (option_anchors_zero_fee_htlc_tx) */
 	preferAnchors?: boolean;
 	/**
+	 * EXPERIMENTAL beignet extension (not BOLT 2): allow negotiating a 0 sat
+	 * channel_reserve with trusted peers that also advertise the
+	 * experimental_zero_reserve init capability. Default true (the capability
+	 * is still gated per-peer on the trust set and the peer's init features);
+	 * set false to refuse the extension entirely, inbound and outbound.
+	 */
+	experimentalZeroReserve?: boolean;
+	/**
 	 * Propose simple taproot channels (option_taproot). MuSig2 funding and
 	 * commitment signing (deterministic verification nonces) are fully wired;
 	 * the complete lifecycle is validated against LND on regtest. Off by
@@ -459,6 +467,24 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Whether the EXPERIMENTAL zero-reserve extension may be used with this
+	 * peer: enabled in config, peer in the trusted set, and (when a peer
+	 * manager is attached) the peer's init advertised the
+	 * experimental_zero_reserve capability. Without a peer manager
+	 * (in-process harnesses) the init check is vacuous, mirroring how
+	 * openChannel skips its connectivity check.
+	 */
+	peerSupportsZeroReserve(peerPubkey: string): boolean {
+		if (this.config.experimentalZeroReserve === false) return false;
+		if (!this.zeroConfManager.isTrustedPeer(peerPubkey)) return false;
+		if (!this.peerManager) return true;
+		const init = this.peerManager.getPeer(peerPubkey)?.getRemoteInit();
+		return init
+			? init.features.hasFeature(Feature.EXPERIMENTAL_ZERO_RESERVE)
+			: false;
+	}
+
+	/**
 	 * Open a zero-conf channel with a peer.
 	 * Peer must be in the trusted set.
 	 */
@@ -521,21 +547,34 @@ export class ChannelManager extends EventEmitter {
 	 * usable before the funding confirms. The peer must already be in the
 	 * zero-conf trusted set. All other parameters (reserve included) stay
 	 * standard BOLT 2.
+	 *
+	 * opts.zeroReserve (EXPERIMENTAL, implies trusted) additionally advertises
+	 * a 0 sat channel_reserve, waiving the BOLT 2 reserve on both sides. It
+	 * requires the peer to advertise the experimental_zero_reserve init
+	 * capability, and the caller must have arranged a connection on which
+	 * option_dual_fund was NOT negotiated (a zero reserve cannot be expressed
+	 * on the v2 open path).
 	 */
 	openChannel(
 		peerPubkey: string,
 		fundingSatoshis: bigint,
 		pushMsat?: bigint,
 		beforeNegotiate?: (temporaryChannelId: Buffer) => void,
-		opts?: { trusted?: boolean }
+		opts?: { trusted?: boolean; zeroReserve?: boolean }
 	): Channel {
 		// Verify peer is connected before creating channel state
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
 		}
-		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
+		const trusted = opts?.trusted || opts?.zeroReserve;
+		if (trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
 			throw new Error(
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
+			);
+		}
+		if (opts?.zeroReserve && !this.peerSupportsZeroReserve(peerPubkey)) {
+			throw new Error(
+				`Peer ${peerPubkey} did not advertise the experimental_zero_reserve capability (or the extension is disabled)`
 			);
 		}
 
@@ -549,10 +588,16 @@ export class ChannelManager extends EventEmitter {
 			localPerCommitmentSeed: chKeys.perCommitmentSeed
 		});
 
-		if (opts?.trusted) {
+		if (trusted) {
 			state.zeroConfEnabled = true;
 			state.trustedPeer = true;
 			state.minimumDepth = 0;
+		}
+		if (opts?.zeroReserve) {
+			state.zeroReserve = true;
+			// Advertised and enforced reserve must agree (initiateOpen puts 0 on
+			// the wire); localConfig is a per-channel copy, safe to mutate.
+			state.localConfig.channelReserveSatoshis = 0n;
 		}
 
 		const signer = this.makeSigner(
@@ -2006,9 +2051,14 @@ export class ChannelManager extends EventEmitter {
 		// Record trust-set membership only. Zero-conf semantics (minimum_depth 0,
 		// fast-tracked channel_ready) are flipped by handleOpenChannel itself and
 		// ONLY when the opener explicitly proposed the zero_conf channel type:
-		// membership alone must not change how ordinary opens validate.
+		// membership alone must not change how ordinary opens validate. The
+		// zero-reserve gate likewise only ARMS here; it takes effect only when
+		// the opener actually advertises a 0 reserve.
 		if (this.zeroConfManager.isTrustedPeer(peerPubkey)) {
-			channel.getFullState().trustedPeer = true;
+			const channelState = channel.getFullState();
+			channelState.trustedPeer = true;
+			channelState.zeroReserveAllowed =
+				this.peerSupportsZeroReserve(peerPubkey);
 		}
 
 		const actions = channel.handleOpenChannel(msg);

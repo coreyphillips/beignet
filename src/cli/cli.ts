@@ -837,7 +837,11 @@ async function handleChannel(): Promise<void> {
 					// Sweep the whole on-chain balance into the channel (no change).
 					max: hasFlag('--max') || undefined,
 					// Trusted peer: zero-conf, usable before the funding confirms.
-					trusted: hasFlag('--trusted') || undefined
+					trusted: hasFlag('--trusted') || undefined,
+					// EXPERIMENTAL beignet extension (implies --trusted): 0 sat
+					// reserves on both sides. Both peers must be beignet nodes
+					// advertising the capability and trusting each other.
+					zeroReserve: hasFlag('--zero-reserve') || undefined
 				})
 			);
 		}
@@ -2194,6 +2198,9 @@ Channels:
                                          Connect to peer + open in one call
                                          --trusted: zero-conf, usable before
                                          confirmation (trusted peers only)
+                                         --zero-reserve: EXPERIMENTAL, 0 sat
+                                         reserves (beignet-to-beignet only,
+                                         implies --trusted)
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
   channel splice-quote <id> <in|out> <feerate>

@@ -72,6 +72,16 @@ export interface IPeerOptions {
 	connectTimeout?: number;
 	/** Noise handshake + init exchange timeout in ms (default 30000) */
 	handshakeTimeout?: number;
+	/**
+	 * Per-peer init feature customization, applied when the init message is
+	 * built (after the Noise handshake, so the remote pubkey is known for
+	 * inbound connections too). Returns the features to advertise; must not
+	 * mutate the input.
+	 */
+	initFeatureFilter?: (
+		remotePubkeyHex: string,
+		features: FeatureFlags
+	) => FeatureFlags;
 }
 
 export interface IPeerEvents {
@@ -123,6 +133,26 @@ export class Peer extends EventEmitter {
 	private connectTimeoutMs: number;
 	private handshakeTimeoutMs: number;
 
+	// Per-peer init feature customization (see IPeerOptions)
+	private initFeatureFilter?: (
+		remotePubkeyHex: string,
+		features: FeatureFlags
+	) => FeatureFlags;
+
+	// The features THIS connection's init actually advertised (localFeatures
+	// after the filter). Null until the init exchange runs.
+	private advertisedFeatures: FeatureFlags | null = null;
+
+	/**
+	 * The features our init advertised on this connection, which is what
+	 * feature negotiation must be judged against (the per-peer filter may
+	 * have withheld bits the node otherwise supports). Falls back to the
+	 * full local set before the init exchange has run.
+	 */
+	getAdvertisedFeatures(): FeatureFlags {
+		return this.advertisedFeatures ?? this.localFeatures;
+	}
+
 	constructor(options: IPeerOptions) {
 		super();
 		this.localPrivateKey = options.localPrivateKey;
@@ -136,6 +166,7 @@ export class Peer extends EventEmitter {
 		this.createSocketFn = options.createSocket;
 		this.connectTimeoutMs = options.connectTimeout ?? 15_000;
 		this.handshakeTimeoutMs = options.handshakeTimeout ?? 30_000;
+		this.initFeatureFilter = options.initFeatureFilter;
 	}
 
 	getState(): PeerState {
@@ -430,9 +461,19 @@ export class Peer extends EventEmitter {
 	private async exchangeInit(): Promise<void> {
 		this.state = 'init';
 
-		// Send our init message
+		// Send our init message. The filter runs here, after the handshake, so
+		// the remote pubkey is known even for inbound connections. What was
+		// actually advertised is recorded: feature-negotiation checks must ask
+		// this connection, not the node's full feature set.
+		const advertised = this.initFeatureFilter
+			? this.initFeatureFilter(
+					this.remotePublicKey.toString('hex'),
+					this.localFeatures
+			  )
+			: this.localFeatures;
+		this.advertisedFeatures = advertised;
 		const initPayload = encodeInitMessage({
-			features: this.localFeatures,
+			features: advertised,
 			networks: this.networks
 		});
 		const initMsg = encodeMessage(MessageType.INIT, initPayload);

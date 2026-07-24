@@ -2411,7 +2411,8 @@ export class BeignetNode extends EventEmitter {
 		pushSats?: number,
 		satsPerVbyte?: number,
 		max = false,
-		trusted = false
+		trusted = false,
+		zeroReserve = false
 	): ChannelInfo {
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
@@ -2422,7 +2423,8 @@ export class BeignetNode extends EventEmitter {
 			pushMsat,
 			satsPerVbyte,
 			max,
-			trusted
+			trusted,
+			zeroReserve
 		);
 		const state = channel.getFullState();
 		const balances = channel.getBalances();
@@ -2464,13 +2466,27 @@ export class BeignetNode extends EventEmitter {
 			satsPerVbyte?: number;
 			max?: boolean;
 			trusted?: boolean;
+			zeroReserve?: boolean;
 		}
 	): Promise<ChannelInfo> {
-		await this.connectPeer(pubkey, host, port);
 		// A trusted open requires the peer in the trusted set; the caller asking
-		// for a trusted open IS the trust declaration, so register it here.
-		if (opts?.trusted) {
+		// for a trusted open IS the trust declaration, so register it BEFORE
+		// connecting. A zero-reserve open additionally marks the peer so this
+		// connection's init withholds option_dual_fund: the extension is
+		// v1-only, and BOLT 2 forbids a v1 open once dual_fund is negotiated.
+		const trusted = (opts?.trusted || opts?.zeroReserve) ?? false;
+		if (trusted) {
 			this.node.addTrustedPeer(pubkey);
+		}
+		if (opts?.zeroReserve) {
+			this.node.markZeroReservePeer(pubkey);
+		}
+		await this.connectPeer(pubkey, host, port);
+		// An existing connection may predate the mark, with dual_fund already
+		// negotiated: reconnect once so the init re-exchanges without it.
+		if (opts?.zeroReserve && this.node.peerNegotiatedDualFund(pubkey)) {
+			this.node.disconnectPeer(pubkey);
+			await this.connectPeer(pubkey, host, port);
 		}
 		return this.openChannel(
 			pubkey,
@@ -2478,7 +2494,8 @@ export class BeignetNode extends EventEmitter {
 			opts?.pushSats,
 			opts?.satsPerVbyte,
 			opts?.max,
-			opts?.trusted ?? false
+			trusted,
+			opts?.zeroReserve ?? false
 		);
 	}
 

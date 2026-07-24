@@ -666,7 +666,8 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						pushSats: 'number?',
 						satsPerVbyte: 'number?',
 						max: 'boolean?',
-						trusted: 'boolean?'
+						trusted: 'boolean?',
+						zeroReserve: 'boolean?'
 					}),
 					responses: {
 						'200': {

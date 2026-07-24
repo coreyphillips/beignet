@@ -606,6 +606,13 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
+		// Experimental zero-reserve: advertising the bit is what makes the
+		// extension explicitly negotiated; a node with it disabled must not
+		// advertise a capability it will refuse.
+		if (config.experimentalZeroReserve === false) {
+			localFeatures.clearBit(Feature.EXPERIMENTAL_ZERO_RESERVE);
+			localFeatures.clearBit(Feature.EXPERIMENTAL_ZERO_RESERVE + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -619,6 +626,7 @@ export class LightningNode extends EventEmitter {
 			paymentBasepointSecret: config.paymentBasepointSecret,
 			delayedPaymentBasepointSecret: config.delayedPaymentBasepointSecret,
 			preferAnchors,
+			experimentalZeroReserve: config.experimentalZeroReserve,
 			// EXPERIMENTAL (option_taproot): negotiates the taproot channel type +
 			// nonces but funding cannot yet complete (commitment-round MuSig2 nonce
 			// rotation is not wired into the live state machine). Off by default.
@@ -698,7 +706,13 @@ export class LightningNode extends EventEmitter {
 				autoReconnect: config.autoReconnect ?? config.enableNetworking ?? false,
 				maxReconnectDelay: config.maxReconnectDelay,
 				socks5Proxy: config.socks5Proxy,
-				webSocketImpl: config.webSocketImpl
+				webSocketImpl: config.webSocketImpl,
+				// Zero-reserve peers get DUAL_FUND withheld from our init (see
+				// markZeroReservePeer): a 0 reserve is only expressible on the v1
+				// open path, and BOLT 2 forbids open_channel once option_dual_fund
+				// is negotiated, so the compliant route is to not negotiate it.
+				initFeatureFilter: (pubkeyHex, features) =>
+					this.initFeaturesFor(pubkeyHex, features)
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
 			this.registerGossipHandlers();
@@ -3523,6 +3537,51 @@ export class LightningNode extends EventEmitter {
 		return this.channelManager.listTrustedPeers();
 	}
 
+	// ─────────────── Experimental Zero-Reserve Extension ───────────────
+
+	/** Peers marked for experimental zero-reserve opens. In-memory, like the
+	 *  zero-conf trusted set. */
+	private readonly zeroReservePeers = new Set<string>();
+
+	/**
+	 * Features to advertise in init toward a specific peer (peer-manager
+	 * hook). Zero-reserve peers get DUAL_FUND withheld: a 0 reserve is only
+	 * expressible on the v1 open path, and BOLT 2 forbids open_channel once
+	 * option_dual_fund is negotiated, so the compliant route is to not
+	 * negotiate it on connections to those peers in the first place.
+	 */
+	initFeaturesFor(pubkeyHex: string, features: FeatureFlags): FeatureFlags {
+		if (!this.zeroReservePeers.has(pubkeyHex)) return features;
+		const filtered = FeatureFlags.fromBuffer(features.toBuffer());
+		filtered.clearBit(Feature.DUAL_FUND);
+		filtered.clearBit(Feature.DUAL_FUND + 1);
+		return filtered;
+	}
+
+	/**
+	 * Mark a peer for EXPERIMENTAL zero-reserve opens. Takes effect on the
+	 * next connection to the peer (the init exchange is per-connection); an
+	 * existing connection that already negotiated option_dual_fund must be
+	 * reconnected before a zero-reserve open, which
+	 * peerNegotiatedDualFund() lets the caller detect.
+	 */
+	markZeroReservePeer(pubkeyHex: string): void {
+		const pubkeyErr = validateHexPubkey(pubkeyHex, 'pubkeyHex');
+		if (pubkeyErr) throw new Error(pubkeyErr);
+		this.zeroReservePeers.add(pubkeyHex);
+	}
+
+	/** Remove a peer from the zero-reserve set (next connection re-advertises
+	 *  the full feature set). */
+	unmarkZeroReservePeer(pubkeyHex: string): void {
+		this.zeroReservePeers.delete(pubkeyHex);
+	}
+
+	/** List peers marked for zero-reserve opens. */
+	listZeroReservePeers(): string[] {
+		return [...this.zeroReservePeers];
+	}
+
 	/**
 	 * Open a zero-conf channel with a trusted peer.
 	 * Channel becomes usable immediately after funding_signed, before confirmation.
@@ -3806,13 +3865,23 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * Whether option_dual_fund is negotiated with this peer: both sides must
-	 * advertise it (BOLT 9). Ours comes from localFeatures (the default set
-	 * advertises it), the peer's from the init it sent on connect. A peer we
+	 * advertise it (BOLT 9). Ours comes from the features THIS CONNECTION's
+	 * init actually advertised (the per-peer filter withholds DUAL_FUND from
+	 * zero-reserve peers, and a connection that predates the mark still
+	 * advertised it), the peer's from the init it sent on connect. A peer we
 	 * hold no init for counts as not negotiated.
 	 */
-	private peerNegotiatedDualFund(peerPubkey: string): boolean {
-		if (!this.localFeatures.hasFeature(Feature.DUAL_FUND)) return false;
-		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+	peerNegotiatedDualFund(peerPubkey: string): boolean {
+		const peer = this.peerManager?.getPeer(peerPubkey);
+		// Duck-typed guard: test doubles and older embedder Peer stubs predate
+		// getAdvertisedFeatures; for those the full local set is the advertised
+		// set (no per-peer filter existed).
+		const advertised =
+			peer && typeof peer.getAdvertisedFeatures === 'function'
+				? peer.getAdvertisedFeatures()
+				: this.localFeatures;
+		if (!advertised.hasFeature(Feature.DUAL_FUND)) return false;
+		const init = peer?.getRemoteInit();
 		return init ? init.features.hasFeature(Feature.DUAL_FUND) : false;
 	}
 
@@ -3826,6 +3895,13 @@ export class LightningNode extends EventEmitter {
 	 * completely: unconfirmed funding can be double-spent by the opener.
 	 * Everything else stays standard BOLT 2, including the v1/v2 routing:
 	 * a trusted open toward a dual-fund peer rides open_channel2.
+	 *
+	 * zeroReserve (EXPERIMENTAL beignet extension, implies trusted)
+	 * additionally advertises a 0 sat channel_reserve, waiving the BOLT 2
+	 * reserve on both sides. Requires the peer marked via markZeroReservePeer
+	 * BEFORE the connection was made (so option_dual_fund was not negotiated;
+	 * the v2 open path cannot express a zero reserve) and the peer's init to
+	 * carry the experimental_zero_reserve capability.
 	 */
 	openChannel(
 		peerPubkey: string,
@@ -3833,7 +3909,8 @@ export class LightningNode extends EventEmitter {
 		pushMsat?: bigint,
 		satsPerVbyte?: number,
 		fundMax = false,
-		trusted = false
+		trusted = false,
+		zeroReserve = false
 	): Channel {
 		const pubkeyErr = validateHexPubkey(peerPubkey, 'peerPubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
@@ -3877,6 +3954,16 @@ export class LightningNode extends EventEmitter {
 		// through to v1 — which then throws 'Not connected to peer' from
 		// ChannelManager.openChannel when a peer manager is attached; nothing
 		// is queued for later.
+		// A zero-reserve open cannot ride v2 (open_channel2 has no reserve field
+		// to waive; the v2 reserve is fixed at 1%), and BOLT 2 forbids a v1
+		// open_channel once option_dual_fund is negotiated. The peer must have
+		// been marked (markZeroReservePeer) before connecting so this connection
+		// never negotiated dual_fund; refuse loudly rather than violate either.
+		if (zeroReserve && this.peerNegotiatedDualFund(peerPubkey)) {
+			throw new Error(
+				'zero-reserve open requires a connection without option_dual_fund: markZeroReservePeer first, then reconnect to the peer'
+			);
+		}
 		if (this.peerNegotiatedDualFund(peerPubkey)) {
 			if (pushMsat !== undefined && pushMsat > 0n) {
 				throw new Error(
@@ -3993,7 +4080,7 @@ export class LightningNode extends EventEmitter {
 					this.fundingMaxRequests.add(tempId);
 				}
 			},
-			{ trusted }
+			{ trusted: trusted || zeroReserve, zeroReserve }
 		);
 	}
 
@@ -10351,6 +10438,12 @@ export class LightningNode extends EventEmitter {
 		// channel backup from us (and vice versa). Gated by peerStorageEnabled;
 		// the constructor clears the bit when that config flag is false.
 		flags.setOptional(Feature.PROVIDE_STORAGE);
+		// Beignet-specific EXPERIMENTAL zero-reserve capability (see the Feature
+		// doc): advertising is what makes the extension explicitly negotiated.
+		// Inert to other implementations (odd bit); a 0 reserve is still refused
+		// unless the peer is ALSO in the trusted set. The constructor clears the
+		// bit when experimentalZeroReserve is configured false.
+		flags.setOptional(Feature.EXPERIMENTAL_ZERO_RESERVE);
 		// LARGE_CHANNELS (18) is not set here but the constructor sets it by
 		// default (largeChannels defaults to true), so it is advertised unless
 		// opted out; the > 2^24 cap is still only lifted with a wumbo peer.

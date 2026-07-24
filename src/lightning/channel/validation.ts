@@ -151,7 +151,8 @@ function validateChannelPoints(
  */
 export function validateOpenChannelParams(
 	msg: IOpenChannelMessage,
-	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS
+	maxFundingSatoshis: bigint = MAX_FUNDING_SATOSHIS,
+	allowZeroReserve = false
 ): string | null {
 	// funding_satoshis must be > 0
 	if (msg.fundingSatoshis === 0n) {
@@ -180,8 +181,14 @@ export function validateOpenChannelParams(
 		return `max_accepted_htlcs ${msg.maxAcceptedHtlcs} exceeds maximum ${MAX_ACCEPTED_HTLCS}`;
 	}
 
-	// channel_reserve must be >= dust_limit
-	if (msg.channelReserveSatoshis < msg.dustLimitSatoshis) {
+	// channel_reserve must be >= dust_limit (BOLT 2). The experimental
+	// zero-reserve extension waives the reserve ENTIRELY (exactly 0, only when
+	// the caller negotiated the capability with a trusted peer); any other
+	// sub-dust value is still invalid.
+	if (
+		msg.channelReserveSatoshis < msg.dustLimitSatoshis &&
+		!(allowZeroReserve && msg.channelReserveSatoshis === 0n)
+	) {
 		return 'channel_reserve_satoshis must be >= dust_limit_satoshis';
 	}
 
@@ -251,7 +258,8 @@ export function validateOpenChannelParams(
  */
 export function validateAcceptChannelParams(
 	open: IProposedOpenParams,
-	accept: IAcceptChannelMessage
+	accept: IAcceptChannelMessage,
+	allowZeroReserve = false
 ): string | null {
 	// temporary_channel_id must match
 	if (!open.temporaryChannelId.equals(accept.temporaryChannelId)) {
@@ -275,13 +283,21 @@ export function validateAcceptChannelParams(
 		return `max_accepted_htlcs ${accept.maxAcceptedHtlcs} exceeds maximum ${MAX_ACCEPTED_HTLCS}`;
 	}
 
-	// channel_reserve must be >= dust_limit of the opener
-	if (accept.channelReserveSatoshis < open.dustLimitSatoshis) {
+	// channel_reserve must be >= dust_limit of the opener (BOLT 2). On an
+	// experimental zero-reserve open either side may waive its reserve
+	// (exactly 0); any other sub-dust value is still invalid.
+	if (
+		accept.channelReserveSatoshis < open.dustLimitSatoshis &&
+		!(allowZeroReserve && accept.channelReserveSatoshis === 0n)
+	) {
 		return 'acceptor channel_reserve must be >= opener dust_limit';
 	}
 
 	// opener channel_reserve must be >= acceptor dust_limit
-	if (open.channelReserveSatoshis < accept.dustLimitSatoshis) {
+	if (
+		open.channelReserveSatoshis < accept.dustLimitSatoshis &&
+		!(allowZeroReserve && open.channelReserveSatoshis === 0n)
+	) {
 		return 'opener channel_reserve must be >= acceptor dust_limit';
 	}
 

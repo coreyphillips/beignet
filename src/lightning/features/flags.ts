@@ -88,7 +88,20 @@ export enum Feature {
 	 * leases inbound liquidity (rates carried in node_announcement). Experimental
 	 * bit pending a spec assignment.
 	 */
-	OPTION_WILL_FUND = 112
+	OPTION_WILL_FUND = 112,
+	/**
+	 * Beignet-specific EXPERIMENTAL extension, NOT part of BOLT 2/9: this node
+	 * is willing to negotiate a 0 sat channel_reserve on a v1 open with a peer
+	 * in its zero-conf trusted set. A zero reserve deliberately waives the
+	 * BOLT 2 requirement that each side keep something at stake against
+	 * broadcasting a revoked commitment, which is only tenable when one owner
+	 * operates both nodes. Both peers must advertise this bit AND hold each
+	 * other in their trusted sets before a 0 reserve is proposed or accepted.
+	 * Unassigned high bit chosen to stay clear of spec and de-facto
+	 * experimental assignments (taproot staging 180, will_fund 112, trampoline
+	 * 148, keysend 54).
+	 */
+	EXPERIMENTAL_ZERO_RESERVE = 460
 }
 
 /**
@@ -351,5 +364,9 @@ export function implementedFeatures(): FeatureFlags {
 	flags.setOptional(Feature.SPLICE);
 	flags.setOptional(Feature.SIMPLE_CLOSE);
 	flags.setOptional(Feature.PROVIDE_STORAGE);
+	// Beignet-specific experimental capability (see the Feature doc): only
+	// meaningful toward another beignet that also advertises it, inert to
+	// every other implementation (odd bit).
+	flags.setOptional(Feature.EXPERIMENTAL_ZERO_RESERVE);
 	return flags;
 }

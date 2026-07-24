@@ -120,6 +120,15 @@ export interface IPeerManagerOptions {
 	 *  globalThis.WebSocket in browsers. Only consulted when a peer is
 	 *  dialed with transport {type: 'ws'}. */
 	webSocketImpl?: WebSocketConstructor;
+	/**
+	 * Per-peer init feature customization, evaluated when each connection's
+	 * init message is built (after the handshake, so it applies to inbound
+	 * connections too). Returns the features to advertise to that peer.
+	 */
+	initFeatureFilter?: (
+		remotePubkeyHex: string,
+		features: FeatureFlags
+	) => FeatureFlags;
 }
 
 export interface IPeerInfo {
@@ -171,6 +180,10 @@ export class PeerManager extends EventEmitter {
 	private inboundPeerCount = 0;
 	private inboundPeerSet: Set<string> = new Set();
 	private webSocketImpl?: WebSocketConstructor;
+	private initFeatureFilter?: (
+		remotePubkeyHex: string,
+		features: FeatureFlags
+	) => FeatureFlags;
 
 	constructor(options: IPeerManagerOptions) {
 		super();
@@ -185,6 +198,18 @@ export class PeerManager extends EventEmitter {
 		this.socks5TimeoutMs = options.socks5TimeoutMs ?? 20_000;
 		this.maxInboundPeers = options.maxInboundPeers ?? 125;
 		this.webSocketImpl = options.webSocketImpl;
+		this.initFeatureFilter = options.initFeatureFilter;
+	}
+
+	/**
+	 * Install or replace the per-peer init feature filter. Applies to
+	 * connections made after the call; an already-connected peer keeps the
+	 * init it exchanged (reconnect to renegotiate).
+	 */
+	setInitFeatureFilter(
+		filter?: (remotePubkeyHex: string, features: FeatureFlags) => FeatureFlags
+	): void {
+		this.initFeatureFilter = filter;
 	}
 
 	/**
@@ -272,7 +297,8 @@ export class PeerManager extends EventEmitter {
 			port,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
-			createSocket
+			createSocket,
+			initFeatureFilter: this.initFeatureFilter
 		});
 
 		this.setupPeerListeners(pubkey, peer);
@@ -621,13 +647,16 @@ export class PeerManager extends EventEmitter {
 		}
 
 		// Create peer with placeholder pubkey — discovered during Noise handshake
+		// (the init feature filter runs after the handshake, so it still sees
+		// the real pubkey).
 		const peer = new Peer({
 			localPrivateKey: this.localPrivateKey,
 			remotePublicKey: Buffer.alloc(33, 0),
 			host: socket.remoteAddress || 'unknown',
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
-			networks: this.networks
+			networks: this.networks,
+			initFeatureFilter: this.initFeatureFilter
 		});
 
 		peer

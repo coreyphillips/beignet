@@ -740,7 +740,8 @@ export async function startDaemon(
 				pushSats,
 				satsPerVbyte,
 				max,
-				trusted
+				trusted,
+				zeroReserve
 			} = body as {
 				pubkey: string;
 				host: string;
@@ -750,6 +751,7 @@ export async function startDaemon(
 				satsPerVbyte?: number;
 				max?: boolean;
 				trusted?: boolean;
+				zeroReserve?: boolean;
 			};
 			if (!pubkey || !peerHost || !peerPort || amountSats === undefined) {
 				return failure(
@@ -763,7 +765,7 @@ export async function startDaemon(
 					peerHost,
 					peerPort,
 					amountSats,
-					{ pushSats, satsPerVbyte, max, trusted }
+					{ pushSats, satsPerVbyte, max, trusted, zeroReserve }
 				)
 			);
 		},
