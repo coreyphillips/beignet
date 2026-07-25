@@ -7,6 +7,7 @@
 import * as http from 'http';
 import * as https from 'https';
 import * as fs from 'fs';
+import * as path from 'path';
 import { Console } from 'console';
 import { BeignetNode, BeignetNodeOptions } from './beignet-node';
 import { ILogger, createConsoleLogger } from '../logger';
@@ -302,6 +303,9 @@ export async function startDaemon(
 				expiresAt: number;
 				requestId: string;
 				encryptionPrivateKeyPem: string;
+				/** Seed of the request's swarm Noise identity, so a restart
+				 *  re-arms the SAME key the envelope pinned. */
+				swarmSeedHex?: string;
 			}
 		>;
 		requestsById: Map<string, string>;
@@ -313,6 +317,28 @@ export async function startDaemon(
 	};
 	const DIRECT_FUNDING_REQUEST_TTL_MS = 60 * 60 * 1000;
 	let swarmReceiver: ISwarmReceiver | null = null;
+	// Outstanding requests survive a daemon restart: every envelope handed
+	// out stays payable for its full hour. The file holds request secrets
+	// (preimages, encryption keys, identity seeds) and lives next to the
+	// wallet's other private state.
+	const requestsFile = opts.dataDir
+		? path.join(opts.dataDir, 'direct-funding-requests.json')
+		: null;
+	const persistRequests = (): void => {
+		if (!requestsFile) return;
+		try {
+			const entries = [...directFundingState.receipts.entries()].map(
+				([hash, e]) => ({ hash, ...e })
+			);
+			fs.writeFileSync(requestsFile, JSON.stringify(entries), {
+				mode: 0o600
+			});
+		} catch (err) {
+			process.stderr.write(
+				`direct-funding: could not persist requests: ${(err as Error).message}\n`
+			);
+		}
+	};
 	// A used or expired request leaves its rendezvous topic: the receiver's
 	// DHT footprint shrinks to "only while a request is outstanding".
 	const retireRequest = (hashHex: string): void => {
@@ -323,6 +349,7 @@ export async function startDaemon(
 		if (swarmReceiver) {
 			swarmReceiver.removeRequest(rendezvousTopic(entry.rendezvousSecretHex));
 		}
+		persistRequests();
 	};
 	const pruneExpiredRequests = (): void => {
 		const now = Date.now();
@@ -362,8 +389,16 @@ export async function startDaemon(
 	// Blind relay (opt-in, LSP role): forward sealed frames between connected
 	// peers. The relay stamps sender identity and reads nothing else.
 	if (opts.dfRelay) {
-		attachRelayForwarder(node, (l) => process.stderr.write(`${l}\n`));
+		attachRelayForwarder(node);
 	}
+	// All onion-message direct-funding frames a wallet receives arrive from
+	// ONE peer (its introduction node), and an LSP forwards for many senders
+	// over each wallet connection, so the conservative per-peer default
+	// aggregates across every concurrent exchange. Raise it to a level that
+	// throttles abuse, not payments.
+	node.lightningNode
+		.getOnionMessageManager()
+		.setRateLimitConfig({ maxPerWindow: 120 });
 	// Swarm listener (opt-in): announce on a DHT topic derived from the node
 	// pubkey, so senders holding only the pubkey from a payment request can
 	// reach this node with no dialable address.
@@ -375,6 +410,48 @@ export async function startDaemon(
 		} catch (err) {
 			process.stderr.write(
 				`swarm listener failed to start: ${(err as Error).message}\n`
+			);
+		}
+	}
+	// Restore outstanding requests from disk: entries reload into the maps
+	// and each request's swarm identity re-arms from its persisted seed, so
+	// the Noise key the envelope pinned answers again. Expired entries are
+	// dropped on the way in.
+	if (requestsFile && fs.existsSync(requestsFile)) {
+		try {
+			const raw = JSON.parse(fs.readFileSync(requestsFile, 'utf8')) as Array<{
+				hash: string;
+				preimageHex: string;
+				rendezvousSecretHex: string;
+				expiresAt: number;
+				requestId: string;
+				encryptionPrivateKeyPem: string;
+				swarmSeedHex?: string;
+			}>;
+			const now = Date.now();
+			let restored = 0;
+			for (const e of raw) {
+				if (!e?.hash || e.expiresAt <= now) continue;
+				const { hash, ...entry } = e;
+				directFundingState.receipts.set(hash, entry);
+				directFundingState.requestsById.set(entry.requestId, hash);
+				if (swarmReceiver && entry.swarmSeedHex) {
+					swarmReceiver.addRequest(
+						rendezvousTopic(entry.rendezvousSecretHex),
+						Buffer.from(entry.swarmSeedHex, 'hex')
+					);
+				}
+				restored++;
+			}
+			persistRequests();
+			if (restored > 0) {
+				process.stderr.write(
+					`direct-funding: restored ${restored} outstanding request(s)\n`
+				);
+			}
+		} catch (err) {
+			process.stderr.write(
+				`direct-funding: could not restore requests: ${(err as Error).message}\n`
 			);
 		}
 	}
@@ -476,14 +553,19 @@ export async function startDaemon(
 					port: directFundingState.lspPort
 				});
 			}
+			let swarmSeedHex: string | undefined;
 			if (swarmReceiver) {
 				// A fresh Noise identity (and DHT node) exists for this request
-				// alone; the envelope pins it, and it dies with the request.
+				// alone; the envelope pins it, and it dies with the request. The
+				// seed is persisted so a daemon restart re-arms the same key.
+				const seed = nodeCrypto.randomBytes(32);
+				swarmSeedHex = seed.toString('hex');
 				transports.push({
 					type: 'swarm',
 					rendezvous: rendezvousSecretHex,
 					noiseKey: swarmReceiver.addRequest(
-						rendezvousTopic(rendezvousSecretHex)
+						rendezvousTopic(rendezvousSecretHex),
+						seed
 					)
 				});
 			}
@@ -505,9 +587,11 @@ export async function startDaemon(
 				rendezvousSecretHex,
 				expiresAt,
 				requestId,
-				encryptionPrivateKeyPem: encryption.privateKeyPem
+				encryptionPrivateKeyPem: encryption.privateKeyPem,
+				...(swarmSeedHex ? { swarmSeedHex } : {})
 			});
 			directFundingState.requestsById.set(requestId, hash);
+			persistRequests();
 			return success({
 				paymentHash: hash,
 				expiresAt,
@@ -550,14 +634,34 @@ export async function startDaemon(
 				feeHeadroomSat: feeHeadroomSats ?? 1000,
 				receiptHashHex: env.receiptHash
 			};
+			// One retry with a short pause absorbs transient connect failures
+			// (a peer mid-restart, a listener racing up) without changing the
+			// exactly-once protocol semantics: retries happen strictly BEFORE
+			// any frame flows, never after.
+			const connectWithRetry = async (
+				peerId: string,
+				host: string,
+				port: number
+			): Promise<boolean> => {
+				for (let attempt = 0; attempt < 2; attempt++) {
+					const ok = await node
+						.connectPeer(peerId, host, port)
+						.then(() => true)
+						.catch(() => node.listPeers().some((p) => p.pubkey === peerId));
+					if (ok) return true;
+					if (attempt === 0) {
+						await new Promise((r) => setTimeout(r, 1500));
+					}
+				}
+				return false;
+			};
 			const ln = env.transports.find((t) => t.type === 'ln');
 			if (ln?.host && ln?.port) {
-				const connected = await node
-					.connectPeer(env.receiverNodeId, ln.host, ln.port)
-					.then(() => true)
-					.catch(() =>
-						node.listPeers().some((p) => p.pubkey === env.receiverNodeId)
-					);
+				const connected = await connectWithRetry(
+					env.receiverNodeId,
+					ln.host,
+					ln.port
+				);
 				if (connected) {
 					return success(
 						await sendDirectFunding(
@@ -591,10 +695,7 @@ export async function startDaemon(
 				}
 				if (onionPath) {
 					const introId = onionPath.introductionNodeId.toString('hex');
-					const introUp = await node
-						.connectPeer(introId, on.host, on.port)
-						.then(() => true)
-						.catch(() => node.listPeers().some((p) => p.pubkey === introId));
+					const introUp = await connectWithRetry(introId, on.host, on.port);
 					if (introUp) {
 						const dispatcher = onionDfDispatcher(node);
 						const localPathId = nodeCrypto.randomBytes(16).toString('hex');
@@ -624,10 +725,7 @@ export async function startDaemon(
 			// connection failures fall through to the next transport.
 			const lsp = env.transports.find((t) => t.type === 'lsp');
 			if (lsp?.nodeId && lsp.host && lsp.port) {
-				const relayUp = await node
-					.connectPeer(lsp.nodeId, lsp.host, lsp.port)
-					.then(() => true)
-					.catch(() => node.listPeers().some((p) => p.pubkey === lsp.nodeId));
+				const relayUp = await connectWithRetry(lsp.nodeId, lsp.host, lsp.port);
 				if (relayUp) {
 					return success(
 						await sendDirectFunding(

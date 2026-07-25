@@ -140,12 +140,11 @@ export function relayTransport(
  * authenticated sending connection. The relay never parses `p`: it is
  * sealed to a request key only the endpoints hold. Frames whose target is
  * not connected are dropped silently, which is all a store-nothing relay
- * can honestly do.
+ * can honestly do. The forwarder logs NOTHING per frame: the relay's
+ * unavoidable metadata view (who talked to whom, when) is not additionally
+ * written to disk.
  */
-export function attachRelayForwarder(
-	node: BeignetNode,
-	log: (line: string) => void
-): void {
+export function attachRelayForwarder(node: BeignetNode): void {
 	node.lightningNode.on(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
@@ -167,11 +166,6 @@ export function attachRelayForwarder(
 						'utf8'
 					)
 				);
-				if (frame.t === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
-					log(
-						`relayed direct-funding offer ${msg.peerPubkey.slice(0, 8)} -> ${frame.to.slice(0, 8)}`
-					);
-				}
 			} catch {
 				/* malformed relay frame: drop */
 			}

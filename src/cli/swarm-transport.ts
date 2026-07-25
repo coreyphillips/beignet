@@ -79,8 +79,9 @@ export function socketTransport(socket: {
 export interface ISwarmReceiver {
 	/** Announce a rendezvous topic under a fresh Noise identity minted for
 	 *  this request alone; returns that identity's public key (hex) for the
-	 *  envelope to pin. */
-	addRequest: (topic: Buffer) => string;
+	 *  envelope to pin. A seed makes the identity deterministic, so a
+	 *  persisted request re-arms with the SAME key its envelope pinned. */
+	addRequest: (topic: Buffer, seed?: Buffer) => string;
 	/** Stop announcing and schedule the request's swarm, DHT node, and
 	 *  Noise identity for teardown. The teardown is delayed a grace period
 	 *  so a receipt frame still in flight on an open socket can drain. */
@@ -107,9 +108,9 @@ export function startSwarmReceiver(
 	};
 	log('direct-funding swarm ready (per-request rendezvous and identity)');
 	return {
-		addRequest: (topic: Buffer): string => {
+		addRequest: (topic: Buffer, seed?: Buffer): string => {
 			if (stopped) throw new Error('swarm receiver is stopped');
-			const swarm = new Hyperswarm();
+			const swarm = new Hyperswarm(seed ? { seed } : {});
 			swarm.on('connection', (socket: any) => {
 				const transport = socketTransport(socket);
 				socket.on('error', () => {
