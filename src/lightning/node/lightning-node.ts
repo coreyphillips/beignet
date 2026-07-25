@@ -11616,9 +11616,17 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
-			// Auto-force-close channels stuck in AWAITING_REESTABLISH for too long
-			if (state.state === ChannelState.AWAITING_REESTABLISH) {
-				const reestablishKey = `reestablish:${channelId.toString('hex')}`;
+			// Auto-force-close channels stuck in AWAITING_REESTABLISH for too long.
+			// The tracker must measure CONTIGUOUS blocks in the state: a successful
+			// reestablish of an established channel emits no channel:ready (that
+			// only fires at initial establishment), so the entry stamped during an
+			// earlier disconnect survives the reconnect. Without the else-cleanup
+			// below, once that stale entry is reestablishTimeoutBlocks old, the
+			// next transient disconnect is force-closed on the very next block.
+			const reestablishKey = `reestablish:${channelId.toString('hex')}`;
+			if (state.state !== ChannelState.AWAITING_REESTABLISH) {
+				this._stuckChannelTracker.delete(reestablishKey);
+			} else {
 				if (!this._stuckChannelTracker.has(reestablishKey)) {
 					this._stuckChannelTracker.set(reestablishKey, blockHeight);
 				} else {
@@ -11659,8 +11667,11 @@ export class LightningNode extends EventEmitter {
 			// top), and a channel that died before funding broadcast has nothing on
 			// chain to close. HTLC-bearing errored channels are handled sooner by
 			// the HTLC scanners; this is the catch-all for the quiet ones.
-			if (state.state === ChannelState.ERRORED && state.fundingTxid) {
-				const erroredKey = `errored:${channelId.toString('hex')}`;
+			const erroredKey = `errored:${channelId.toString('hex')}`;
+			if (state.state !== ChannelState.ERRORED) {
+				// Same contiguity rule as the reestablish tracker above.
+				this._stuckChannelTracker.delete(erroredKey);
+			} else if (state.fundingTxid) {
 				if (!this._stuckChannelTracker.has(erroredKey)) {
 					this._stuckChannelTracker.set(erroredKey, blockHeight);
 				} else {
@@ -11688,14 +11699,17 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
+			const shutdownKey = `stuck:${channelId.toString('hex')}`;
 			if (
-				effectiveState === ChannelState.SHUTTING_DOWN ||
-				effectiveState === ChannelState.NEGOTIATING_CLOSING
+				effectiveState !== ChannelState.SHUTTING_DOWN &&
+				effectiveState !== ChannelState.NEGOTIATING_CLOSING
 			) {
+				// Same contiguity rule as the reestablish tracker above.
+				this._stuckChannelTracker.delete(shutdownKey);
+			} else {
 				// Approximate: if channel has been shutting down for > ~10 blocks (~1 hour)
 				// We use a createdAt-based check since we don't have a shutdownStartBlock field
 				// Use block height heuristic: if current height advanced by 10 from when we last saw this state
-				const shutdownKey = `stuck:${channelId.toString('hex')}`;
 				if (!this._stuckChannelTracker.has(shutdownKey)) {
 					this._stuckChannelTracker.set(shutdownKey, blockHeight);
 				} else {
