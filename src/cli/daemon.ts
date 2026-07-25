@@ -362,17 +362,27 @@ export async function startDaemon(
 				...(receiptHash ? { receiptHashHex: receiptHash } : {})
 			};
 			if (host && port) {
-				await node.connectPeer(pubkey, host, port).catch(() => {
-					/* may already be connected */
-				});
-				return success(
-					await sendDirectFunding(
-						node,
-						btcNetwork,
-						lnTransport(node, pubkey),
-						sendOpts
-					)
-				);
+				// The host is a HINT: same-app and LAN senders reach it and get
+				// the identified Lightning transport (which unlocks the
+				// receiver's trusted zero-conf and home-channel splices). A
+				// sender that cannot reach it falls through to the DHT rather
+				// than dying on someone else's network topology.
+				const connected = await node
+					.connectPeer(pubkey, host, port)
+					.then(() => true)
+					.catch(() =>
+						node.listPeers().some((p) => p.pubkey === pubkey)
+					);
+				if (connected) {
+					return success(
+						await sendDirectFunding(
+							node,
+							btcNetwork,
+							lnTransport(node, pubkey),
+							sendOpts
+						)
+					);
+				}
 			}
 			const { transport, close } = await swarmConnect(pubkey);
 			try {
