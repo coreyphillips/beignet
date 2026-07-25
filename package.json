@@ -1,6 +1,6 @@
 {
   "name": "beignet",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "description": "A self-custodial, JS Bitcoin wallet + Lightning Network management library.",
   "main": "dist/index.js",
   "bin": {
