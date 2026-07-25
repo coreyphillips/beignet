@@ -136,7 +136,8 @@ export function decodeAndVerifyRequestEnvelope(
 
 // ─────────────── Per-request encryption ───────────────
 
-const HKDF_INFO = 'beignet-df-v1';
+const HKDF_INFO_S2R = 'beignet-df-v1/sender-to-receiver';
+const HKDF_INFO_R2S = 'beignet-df-v1/receiver-to-sender';
 
 function x25519PublicFromRaw(raw: Buffer): crypto.KeyObject {
 	return crypto.createPublicKey({
@@ -163,13 +164,26 @@ export function mintRequestEncryptionKeys(): IRequestEncryptionKeys {
 	};
 }
 
-function deriveKey(sharedSecret: Buffer, requestIdHex: string): Buffer {
+/** Send and receive keys for one endpoint of a sealed lane. Directional
+ *  keys mean a frame reflected back at its author fails authentication:
+ *  nothing sealed under the sender-to-receiver key ever opens under it on
+ *  the way back, and vice versa. */
+export interface ILaneKeys {
+	sendKey: Buffer;
+	recvKey: Buffer;
+}
+
+function deriveDirectional(
+	sharedSecret: Buffer,
+	requestIdHex: string,
+	info: string
+): Buffer {
 	return Buffer.from(
 		crypto.hkdfSync(
 			'sha256',
 			sharedSecret,
 			Buffer.from(requestIdHex, 'hex'),
-			HKDF_INFO,
+			info,
 			32
 		)
 	);
@@ -179,7 +193,7 @@ function deriveKey(sharedSecret: Buffer, requestIdHex: string): Buffer {
 export function senderDeriveKey(
 	requestPublicKeyHex: string,
 	requestIdHex: string
-): { key: Buffer; ephemeralPublicHex: string } {
+): { keys: ILaneKeys; ephemeralPublicHex: string } {
 	const eph = crypto.generateKeyPairSync('x25519');
 	const shared = crypto.diffieHellman({
 		privateKey: eph.privateKey,
@@ -187,7 +201,10 @@ export function senderDeriveKey(
 	});
 	const jwk = eph.publicKey.export({ format: 'jwk' }) as { x: string };
 	return {
-		key: deriveKey(shared, requestIdHex),
+		keys: {
+			sendKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_S2R),
+			recvKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_R2S)
+		},
 		ephemeralPublicHex: Buffer.from(jwk.x, 'base64url').toString('hex')
 	};
 }
@@ -197,12 +214,15 @@ export function receiverDeriveKey(
 	privateKeyPem: string,
 	ephemeralPublicHex: string,
 	requestIdHex: string
-): Buffer {
+): ILaneKeys {
 	const shared = crypto.diffieHellman({
 		privateKey: crypto.createPrivateKey(privateKeyPem),
 		publicKey: x25519PublicFromRaw(Buffer.from(ephemeralPublicHex, 'hex'))
 	});
-	return deriveKey(shared, requestIdHex);
+	return {
+		sendKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_R2S),
+		recvKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_S2R)
+	};
 }
 
 function aad(requestIdHex: string, subtype: number): Buffer {
@@ -253,14 +273,18 @@ export function open(
  */
 export function encryptedTransport(
 	inner: DfTransport,
-	key: Buffer,
+	keys: ILaneKeys,
 	requestIdHex: string,
 	firstFrame?: { ephemeralPublicHex: string }
 ): DfTransport {
 	let first = firstFrame;
 	return {
 		send: (subtype, payload) => {
-			const sealed = seal(key, requestIdHex, subtype, payload);
+			// Nonces are 96 random bits per frame; at this protocol's frame
+			// counts (a dozen per request) collision odds are negligible, and
+			// a retransmitted logical frame re-seals under a FRESH nonce, so
+			// no nonce ever carries two different or two identical plaintexts.
+			const sealed = seal(keys.sendKey, requestIdHex, subtype, payload);
 			if (first) {
 				inner.send(subtype, {
 					requestId: requestIdHex,
@@ -279,7 +303,7 @@ export function encryptedTransport(
 					if (typeof frame?.n !== 'string' || typeof frame?.c !== 'string') {
 						return; // not a sealed frame for this lane
 					}
-					cb(subtype, open(key, requestIdHex, subtype, frame));
+					cb(subtype, open(keys.recvKey, requestIdHex, subtype, frame));
 				} catch {
 					// Tampered or foreign frame: drop it. GCM authenticated it away.
 				}

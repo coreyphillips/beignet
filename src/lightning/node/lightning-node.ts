@@ -3759,6 +3759,11 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.addTrustedPeer(pubkeyHex);
 	}
 
+	/** Whether a node id is in this node's zero-conf trusted set. */
+	isTrustedPeer(pubkeyHex: string): boolean {
+		return this.channelManager.isTrustedPeer(pubkeyHex);
+	}
+
 	/**
 	 * Remove a peer from the zero-conf trusted set.
 	 */

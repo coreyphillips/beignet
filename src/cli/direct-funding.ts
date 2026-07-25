@@ -266,6 +266,44 @@ function ownershipMessage(
 
 const OFFER_TIMEOUT_MS = 60_000;
 const RECEIPT_TIMEOUT_MS = 20_000;
+const OFFER_RESEND_DELAYS_MS = [7_000, 14_000];
+const OFFER_SESSION_TTL_MS = 15 * 60 * 1000;
+const OUTPOINT_RESERVATION_TTL_MS = 10 * 60 * 1000;
+const MAX_INFLIGHT_OFFER_SESSIONS = 4;
+
+/**
+ * Receiver-side offer idempotence. Offers are AT-LEAST-ONCE: a sender whose
+ * ack or sign request was lost re-sends the same offer, and a duplicate must
+ * replay the recorded responses instead of opening a second channel session.
+ * Keyed by offer id; the payload hash pins the id to one exact offer.
+ */
+interface IOfferSession {
+	payloadHash: string;
+	outbound: Array<[number, object]>;
+	inflight: boolean;
+	expiresAt: number;
+}
+const offerSessions = new Map<string, IOfferSession>();
+
+/**
+ * One outpoint funds one session at a time: an attacker holding a single
+ * UTXO cannot fan it into many concurrent channel-open sessions, which is
+ * what prices session DoS at one real coin per concurrent session.
+ */
+const outpointReservations = new Map<
+	string,
+	{ offerId: string; expiresAt: number }
+>();
+
+function pruneOfferState(): void {
+	const now = Date.now();
+	for (const [k, v] of offerSessions) {
+		if (v.expiresAt <= now) offerSessions.delete(k);
+	}
+	for (const [k, v] of outpointReservations) {
+		if (v.expiresAt <= now) outpointReservations.delete(k);
+	}
+}
 
 /** Buyer-side price ceiling used when the receiver buys inbound alongside. */
 export const DEFAULT_MAX_LEASE_RATES: ILeaseRates = {
@@ -362,15 +400,55 @@ export async function sendDirectFunding(
 	const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
 	const prevTxid = bitcoin.Transaction.fromHex(prevTxHex).getHash();
 
+	// Input-ownership proof: sign the offer context with the key that
+	// controls the offered UTXO, so the recipient never starts a channel
+	// open for a coin the sender cannot actually spend.
+	const ownMsg = ownershipMessage(offerId, utxo.tx_hash, utxo.tx_pos, amountSat);
+	const ownership =
+		kind === 'p2tr'
+			? {
+					pubkeyHex: pubkey.toString('hex'),
+					sigHex: Buffer.from(
+						ecc.signSchnorr(ownMsg, taprootTweakPrivateKey(privKey, pubkey))
+					).toString('hex')
+			  }
+			: {
+					pubkeyHex: pubkey.toString('hex'),
+					sigHex: Buffer.from(ecc.sign(ownMsg, privKey)).toString('hex')
+			  };
+	const sendOffer = (): void =>
+		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER, {
+			offerId,
+			amountSat,
+			txidHex: utxo.tx_hash,
+			vout: utxo.tx_pos,
+			valueSat: utxo.value,
+			sequence: 0xfffffffd,
+			changeScriptHex: changeScript.toString('hex'),
+			ownership,
+			...(opts.receiptHashHex ? { receiptHashHex: opts.receiptHashHex } : {})
+		} as OfferMsg);
+
+	// Sender-side safety invariant: once the witness has left this device,
+	// this promise NEVER rejects. Every later problem (lost receipt, junk
+	// frame, timeout) resolves with what is known, because the funding may
+	// already be broadcast and an error here could prompt the caller into a
+	// SECOND payment for the same request.
 	const done = new Promise<string | null>((resolve, reject) => {
 		let witnessSent = false;
-		const timer = setTimeout(() => {
+		let signRequestSeen = false;
+		const resendTimers: NodeJS.Timeout[] = [];
+		const failUnlessCommitted = (err: Error): void => {
 			cleanup();
 			if (witnessSent) resolve(null);
-			else reject(new Error('direct funding timed out'));
+			else reject(err);
+		};
+		const timer = setTimeout(() => {
+			failUnlessCommitted(new Error('direct funding timed out'));
 		}, OFFER_TIMEOUT_MS);
 		let receiptTimer: NodeJS.Timeout | undefined;
 		const unsubscribe = transport.onMessage((subtype, payload) => {
+			void (async () => {
 			try {
 				if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK) {
 					const ack = JSON.parse(payload.toString('utf8')) as AckMsg;
@@ -379,7 +457,10 @@ export async function sendDirectFunding(
 						cleanup();
 						reject(new Error(`recipient declined: ${ack.reason ?? ''}`));
 					}
-					return; // accepted — wait for the sign request
+					// Accepted: stop re-sending the offer, wait for the sign
+					// request.
+					while (resendTimers.length) clearTimeout(resendTimers.pop()!);
+					return;
 				}
 				if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT) {
 					const r = JSON.parse(payload.toString('utf8')) as ReceiptMsg;
@@ -397,6 +478,8 @@ export async function sendDirectFunding(
 				}
 				const req = JSON.parse(payload.toString('utf8')) as SignRequestMsg;
 				if (req.offerId !== offerId) return;
+				if (signRequestSeen) return; // duplicate: witness already handled
+				signRequestSeen = true;
 				const tx = bitcoin.Transaction.fromHex(req.rawTxHex);
 
 				// Verify OUR input is spent by this exact tx…
@@ -405,8 +488,9 @@ export async function sendDirectFunding(
 						Buffer.from(i.hash).equals(prevTxid) && i.index === utxo.tx_pos
 				);
 				if (ourIndex < 0) {
-					cleanup();
-					reject(new Error('negotiated tx does not spend our input'));
+					failUnlessCommitted(
+						new Error('negotiated tx does not spend our input')
+					);
 					return;
 				}
 				// …our change comes back: everything above amount + a bounded
@@ -416,8 +500,7 @@ export async function sendDirectFunding(
 					.reduce((s, o) => s + Number(o.value), 0);
 				const minChange = utxo.value - amountSat - feeHeadroomSat;
 				if (minChange > 294 && changeValue < minChange) {
-					cleanup();
-					reject(
+					failUnlessCommitted(
 						new Error(
 							`negotiated tx shorts our change: got ${changeValue}, expected >= ${minChange}`
 						)
@@ -431,8 +514,9 @@ export async function sendDirectFunding(
 				// it, the transaction we sign is delivery by construction.
 				const att = req.attestation;
 				if (!att) {
-					cleanup();
-					reject(new Error('sign request carries no recipient attestation'));
+					failUnlessCommitted(
+						new Error('sign request carries no recipient attestation')
+					);
 					return;
 				}
 				const fundingOut = tx.outs[att.fundingOutputIndex];
@@ -445,8 +529,9 @@ export async function sendDirectFunding(
 					!fundingOut ||
 					!Buffer.from(fundingOut.script).equals(expected.p2wshOutput)
 				) {
-					cleanup();
-					reject(new Error('funding output does not match the attested 2-of-2'));
+					failUnlessCommitted(
+						new Error('funding output does not match the attested 2-of-2')
+					);
 					return;
 				}
 				if (typeof req.sharedInputIndex === 'number') {
@@ -462,8 +547,7 @@ export async function sendDirectFunding(
 							expected.p2wshOutput
 						)
 					) {
-						cleanup();
-						reject(
+						failUnlessCommitted(
 							new Error(
 								'shared input is not the attested channel funding'
 							)
@@ -474,15 +558,15 @@ export async function sendDirectFunding(
 						Number(fundingOut.value) <
 						shared.valueSat + amountSat - feeHeadroomSat
 					) {
-						cleanup();
-						reject(
+						failUnlessCommitted(
 							new Error('new funding output shorts the spliced amount')
 						);
 						return;
 					}
 				} else if (Number(fundingOut.value) < amountSat) {
-					cleanup();
-					reject(new Error('funding output holds less than the amount paid'));
+					failUnlessCommitted(
+						new Error('funding output holds less than the amount paid')
+					);
 					return;
 				}
 				const verdict = verifyMessageSignature(
@@ -495,13 +579,13 @@ export async function sendDirectFunding(
 					att.sigHex
 				);
 				if (!verdict.valid || !verdict.pubkey) {
-					cleanup();
-					reject(new Error('recipient attestation signature is invalid'));
+					failUnlessCommitted(
+						new Error('recipient attestation signature is invalid')
+					);
 					return;
 				}
 				if (verdict.pubkey.toString('hex') !== recipientPubkey) {
-					cleanup();
-					reject(
+					failUnlessCommitted(
 						new Error(
 							'attestation signed by a different node than the payment request named'
 						)
@@ -513,18 +597,67 @@ export async function sendDirectFunding(
 
 				let witnessHex: string[];
 				if (kind === 'p2tr') {
-					// BIP 341 sighash needs every input's prevout — the recipient
-					// supplied them; verify OUR entry against our own UTXO before
-					// trusting the rest.
+					// BIP 341 SIGHASH_DEFAULT commits to the amounts and scripts
+					// of EVERY input, so every supplied prevout is signing input,
+					// not metadata. Verify each one against our own chain source;
+					// a receiver feeding false prevouts would otherwise make us
+					// compute a signature that can never validate.
 					const prevouts = req.prevouts ?? [];
 					if (
 						prevouts.length !== tx.ins.length ||
 						prevouts[ourIndex]?.scriptHex !== ourScript.toString('hex') ||
 						prevouts[ourIndex]?.valueSat !== utxo.value
 					) {
-						cleanup();
-						reject(new Error('sign request prevouts do not match our input'));
+						failUnlessCommitted(
+							new Error('sign request prevouts do not match our input')
+						);
 						return;
+					}
+					const foreignHashes = tx.ins
+						.map((inp, i) => ({ i, inp }))
+						.filter(({ i }) => i !== ourIndex)
+						.map(({ inp }) => ({
+							tx_hash: Buffer.from(inp.hash).reverse().toString('hex')
+						}));
+					if (foreignHashes.length > 0) {
+						const chainRes = await wallet.electrum
+							.getTransactions({ txHashes: foreignHashes })
+							.catch(() => null);
+						if (!chainRes || chainRes.isErr()) {
+							failUnlessCommitted(
+								new Error('could not verify prevouts against the chain')
+							);
+							return;
+						}
+						const byId = new Map<string, bitcoin.Transaction>();
+						for (const item of chainRes.value.data ?? []) {
+							const hex = (item?.result?.hex ?? '') as string;
+							if (hex) {
+								const t = bitcoin.Transaction.fromHex(hex);
+								byId.set(t.getId(), t);
+							}
+						}
+						for (let i = 0; i < tx.ins.length; i++) {
+							if (i === ourIndex) continue;
+							const txid = Buffer.from(tx.ins[i].hash)
+								.reverse()
+								.toString('hex');
+							const chainTx = byId.get(txid);
+							const chainOut = chainTx?.outs[tx.ins[i].index];
+							if (
+								!chainOut ||
+								Buffer.from(chainOut.script).toString('hex') !==
+									prevouts[i]?.scriptHex ||
+								Number(chainOut.value) !== prevouts[i]?.valueSat
+							) {
+								failUnlessCommitted(
+									new Error(
+										'sign request prevouts do not match chain truth'
+									)
+								);
+								return;
+							}
+						}
 					}
 					const sighash = tx.hashForWitnessV1(
 						ourIndex,
@@ -566,45 +699,31 @@ export async function sendDirectFunding(
 					resolve(null); // delivery already chain-atomic; receipt is bonus
 				}, RECEIPT_TIMEOUT_MS);
 			} catch (e) {
-				cleanup();
-				reject(e);
+				failUnlessCommitted(e as Error);
 			}
+			})();
 		});
 		const cleanup = (): void => {
 			clearTimeout(timer);
 			if (receiptTimer) clearTimeout(receiptTimer);
+			while (resendTimers.length) clearTimeout(resendTimers.pop()!);
 			unsubscribe();
 		};
+		// Offers are idempotent at the receiver, so re-sending one lost in
+		// transit is safe: a duplicate replays the recorded responses and
+		// opens nothing twice. This is what makes the fire-and-forget onion
+		// lane reliable in practice: at-least-once delivery of the offer,
+		// exactly-once effects behind it.
+		for (const delay of OFFER_RESEND_DELAYS_MS) {
+			const t = setTimeout(() => {
+				if (!signRequestSeen && !witnessSent) sendOffer();
+			}, delay);
+			t.unref?.();
+			resendTimers.push(t);
+		}
 	});
 
-	// Input-ownership proof: sign the offer context with the key that
-	// controls the offered UTXO, so the recipient never starts a channel
-	// open for a coin the sender cannot actually spend.
-	const ownMsg = ownershipMessage(offerId, utxo.tx_hash, utxo.tx_pos, amountSat);
-	const ownership =
-		kind === 'p2tr'
-			? {
-					pubkeyHex: pubkey.toString('hex'),
-					sigHex: Buffer.from(
-						ecc.signSchnorr(ownMsg, taprootTweakPrivateKey(privKey, pubkey))
-					).toString('hex')
-			  }
-			: {
-					pubkeyHex: pubkey.toString('hex'),
-					sigHex: Buffer.from(ecc.sign(ownMsg, privKey)).toString('hex')
-			  };
-
-	transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER, {
-		offerId,
-		amountSat,
-		txidHex: utxo.tx_hash,
-		vout: utxo.tx_pos,
-		valueSat: utxo.value,
-		sequence: 0xfffffffd,
-		changeScriptHex: changeScript.toString('hex'),
-		ownership,
-		...(opts.receiptHashHex ? { receiptHashHex: opts.receiptHashHex } : {})
-	} as OfferMsg);
+	sendOffer();
 
 	const receiptPreimageHex = await done;
 	return {
@@ -622,6 +741,11 @@ export interface IDirectFundingReceiverDeps {
 	getLspPubkey: () => string | undefined;
 	/** PKCS8 PEM of a request's X25519 private key, for sealed offers. */
 	getRequestEncryptionPem?: (requestId: string) => string | undefined;
+	/** Map a blinded-path path_id (the request's PRIVATE path secret, never
+	 *  present in the envelope) to its request id. BOLT 4: path_id content
+	 *  must be unknowable to the payer, or anyone holding the request could
+	 *  mint their own blinded route that passes the issued-path check. */
+	resolveOnionPathSecret?: (pathSecretHex: string) => string | undefined;
 	/** Inbound to BUY from the LSP alongside (0 = plain v2, nothing bought). */
 	getTargetInboundSat: () => number;
 	/** Negotiate option_zeroconf into the open (LSP must trust this node). */
@@ -655,7 +779,13 @@ export function attachDirectFundingReceiver(
 		sealedOffer: object,
 		replyPath?: unknown
 	): void => {
-		if (!deps.getRequestEncryptionPem?.(pathIdHex)) return;
+		// The path_id is a per-request secret the payer never sees; only a
+		// path THIS node minted can carry it. It must also name the same
+		// request the offer is sealed to, or the frame is mismatched noise.
+		const requestId = deps.resolveOnionPathSecret?.(pathIdHex);
+		if (!requestId) return;
+		const sealedRequestId = (sealedOffer as { requestId?: string }).requestId;
+		if (sealedRequestId !== requestId) return;
 		if (!replyPath) return;
 		const lane = onion.createOnionLane(node, onionDispatcher, pathIdHex, {
 			initialPeerReplyPath: replyPath
@@ -674,14 +804,19 @@ export function attachDirectFundingReceiver(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
 			if (msg.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
+				// A Lightning connection AUTHENTICATES the sender; it does not
+				// make them trusted. Zero-conf usability and home-channel
+				// splices are reserved for PAIRED senders: node ids the
+				// operator explicitly placed in this wallet's trusted set.
+				// Every other sender, however it connected, gets the anonymous
+				// policy (plain v2 open, confirmations required).
+				const paired = node.lightningNode.isTrustedPeer(msg.peerPubkey);
 				void dispatchOffer(
 					node,
 					deps,
 					lnTransport(node, msg.peerPubkey),
 					msg.payload,
-					// A Lightning-connected sender has a persistent node identity;
-					// the receiver's trust configuration decides from here.
-					{ senderAnonymous: false }
+					{ senderAnonymous: !paired }
 				).catch((e) => {
 					deps.onEvent?.('direct-funding-failed', e.message);
 				});
@@ -746,14 +881,14 @@ export async function dispatchOffer(
 		}
 		const pem = deps.getRequestEncryptionPem?.(frame.requestId);
 		if (!pem) return; // not our request: say nothing
-		const key = envelope.receiverDeriveKey(pem, frame.eph, frame.requestId);
+		const keys = envelope.receiverDeriveKey(pem, frame.eph, frame.requestId);
 		payload = envelope.open(
-			key,
+			keys.recvKey,
 			frame.requestId,
 			BeignetCustomSubtype.DIRECT_FUNDING_OFFER,
 			{ n: frame.n, c: frame.c }
 		);
-		lane = envelope.encryptedTransport(transport, key, frame.requestId);
+		lane = envelope.encryptedTransport(transport, keys, frame.requestId);
 	} catch {
 		return; // undecryptable: tampered or foreign, drop
 	}
@@ -781,21 +916,75 @@ export async function handleOffer(
 ): Promise<void> {
 	const offer = JSON.parse(payload.toString('utf8')) as OfferMsg;
 	const lsp = deps.getLspPubkey();
+	pruneOfferState();
+
+	// Duplicate of an offer already being (or already) served: replay the
+	// recorded responses on this transport and do nothing else. Same id with
+	// DIFFERENT content is refused outright.
+	const payloadHash = crypto
+		.createHash('sha256')
+		.update(payload)
+		.digest('hex');
+	const existing = offerSessions.get(offer.offerId);
+	if (existing) {
+		if (existing.payloadHash !== payloadHash) {
+			transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK, {
+				offerId: offer.offerId,
+				accepted: false,
+				reason: 'offer id reused with different content'
+			} as AckMsg);
+			return;
+		}
+		for (const [subtype, frame] of existing.outbound) {
+			transport.send(subtype, frame);
+		}
+		return;
+	}
+
+	const offerSession: IOfferSession = {
+		payloadHash,
+		outbound: [],
+		inflight: true,
+		expiresAt: Date.now() + OFFER_SESSION_TTL_MS
+	};
+	// Record everything we send so a duplicate offer replays it verbatim,
+	// including the receipt if the exchange already completed.
+	const rawSend = transport.send.bind(transport);
+	transport = {
+		send: (subtype, frame) => {
+			offerSession.outbound.push([subtype, frame]);
+			rawSend(subtype, frame);
+		},
+		onMessage: transport.onMessage.bind(transport)
+	};
 	const ack = (accepted: boolean, reason?: string): void =>
 		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK, {
 			offerId: offer.offerId,
 			accepted,
 			...(reason ? { reason } : {})
 		} as AckMsg);
+	const declineWithoutSession = (reason: string): void => {
+		// Declines are not sessions: forget them so a corrected retry with
+		// the same offer id is judged fresh.
+		offerSessions.delete(offer.offerId);
+		ack(false, reason);
+	};
+	offerSessions.set(offer.offerId, offerSession);
 
-	if (!lsp) return ack(false, 'no liquidity peer');
+	const inflightCount = [...offerSessions.values()].filter(
+		(o) => o.inflight
+	).length;
+	if (inflightCount > MAX_INFLIGHT_OFFER_SESSIONS) {
+		return declineWithoutSession('too many concurrent funding sessions');
+	}
+	if (!lsp) return declineWithoutSession('no liquidity peer');
 	// A receipt hash we never handed out means the sender is paying a request
 	// that is not ours (or a stale one): decline before any channel work.
 	const receiptPreimage = offer.receiptHashHex
 		? deps.getReceiptPreimage(offer.receiptHashHex)
 		: undefined;
 	if (offer.receiptHashHex && !receiptPreimage) {
-		return ack(false, 'unknown receipt hash');
+		return declineWithoutSession('unknown receipt hash');
 	}
 	// The offer names only an outpoint; the transaction comes from OUR chain
 	// source, so the values below are chain truth rather than sender claims.
@@ -807,12 +996,12 @@ export async function handleOffer(
 			? ((prevTxRes.value.data?.[0]?.result?.hex ?? '') as string)
 			: '';
 	if (!prevTxHex) {
-		return ack(false, 'offered transaction not found on chain');
+		return declineWithoutSession('offered transaction not found on chain');
 	}
 	const prevTx = bitcoin.Transaction.fromHex(prevTxHex);
 	const out = prevTx.outs[offer.vout];
 	if (!out || Number(out.value) !== offer.valueSat) {
-		return ack(false, 'offer value does not match prev tx');
+		return declineWithoutSession('offer value does not match prev tx');
 	}
 	// Input-ownership proof: the offered UTXO's key must have signed the
 	// offer context AND control the UTXO's script — otherwise we would burn a
@@ -849,7 +1038,25 @@ export async function handleOffer(
 		}
 		return null;
 	})();
-	if (ownErr) return ack(false, ownErr);
+	if (ownErr) return declineWithoutSession(ownErr);
+
+	// One session per outpoint: reserve it for this offer id before any
+	// channel work. A duplicate offer never reaches here (replayed above),
+	// so a conflicting reservation means a DIFFERENT offer wants the coin.
+	const outpoint = `${prevTx.getId()}:${offer.vout}`;
+	const reserved = outpointReservations.get(outpoint);
+	if (reserved && reserved.offerId !== offer.offerId) {
+		return declineWithoutSession('input already committed to another offer');
+	}
+	outpointReservations.set(outpoint, {
+		offerId: offer.offerId,
+		expiresAt: Date.now() + OUTPOINT_RESERVATION_TTL_MS
+	});
+
+	// Everything past this point counts against the in-flight session cap
+	// until it settles, succeeds or fails, so a stalled or failed session
+	// cannot pin a slot for its whole TTL.
+	try {
 
 	// Our "wallet input" IS the sender's input; its change returns to the
 	// sender. Our contribution equals the amount they are paying us.
@@ -885,17 +1092,21 @@ export async function handleOffer(
 				'channelizing',
 				`incoming direct funding (${offer.amountSat.toLocaleString('en-US')} sats) — splicing the home channel bigger from the sender's transaction`
 			);
-			await handleSpliceOffer(
-				node,
-				deps,
-				transport,
-				offer,
-				receiptPreimage,
-				externalInput,
-				prevTx,
-				home.channelId,
-				lsp
-			);
+			try {
+				await handleSpliceOffer(
+					node,
+					deps,
+					transport,
+					offer,
+					receiptPreimage,
+					externalInput,
+					prevTx,
+					home.channelId,
+					lsp
+				);
+			} finally {
+				offerSession.inflight = false;
+			}
 			return;
 		}
 	}
@@ -1041,6 +1252,9 @@ export async function handleOffer(
 		'channelized',
 		'direct funding complete — one transaction, funds are lightning-ready'
 	);
+	} finally {
+		offerSession.inflight = false;
+	}
 }
 
 const DEFAULT_SPLICE_FEERATE_PERKW = 500;

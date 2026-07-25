@@ -306,14 +306,21 @@ export async function startDaemon(
 				/** Seed of the request's swarm Noise identity, so a restart
 				 *  re-arms the SAME key the envelope pinned. */
 				swarmSeedHex?: string;
+				/** Private path_id of the request's blinded onion path. Never
+				 *  present in the envelope: BOLT 4 path_id must be unknowable
+				 *  to the payer, or anyone holding the request could mint a
+				 *  route that passes the issued-path check. */
+				onionPathSecretHex?: string;
 			}
 		>;
 		requestsById: Map<string, string>;
+		requestsByPathSecret: Map<string, string>;
 	} = {
 		targetInboundSat: 0,
 		trusted: false,
 		receipts: new Map(),
-		requestsById: new Map()
+		requestsById: new Map(),
+		requestsByPathSecret: new Map()
 	};
 	const DIRECT_FUNDING_REQUEST_TTL_MS = 60 * 60 * 1000;
 	let swarmReceiver: ISwarmReceiver | null = null;
@@ -346,6 +353,9 @@ export async function startDaemon(
 		if (!entry) return;
 		directFundingState.receipts.delete(hashHex);
 		directFundingState.requestsById.delete(entry.requestId);
+		if (entry.onionPathSecretHex) {
+			directFundingState.requestsByPathSecret.delete(entry.onionPathSecretHex);
+		}
 		if (swarmReceiver) {
 			swarmReceiver.removeRequest(rendezvousTopic(entry.rendezvousSecretHex));
 		}
@@ -379,6 +389,13 @@ export async function startDaemon(
 			const entry = directFundingState.receipts.get(hash);
 			if (!entry || entry.expiresAt <= Date.now()) return undefined;
 			return entry.encryptionPrivateKeyPem;
+		},
+		resolveOnionPathSecret: (pathSecretHex) => {
+			const hash = directFundingState.requestsByPathSecret.get(pathSecretHex);
+			if (!hash) return undefined;
+			const entry = directFundingState.receipts.get(hash);
+			if (!entry || entry.expiresAt <= Date.now()) return undefined;
+			return entry.requestId;
 		},
 		network: btcNetwork,
 		onEvent: (kind, detail) => {
@@ -427,6 +444,7 @@ export async function startDaemon(
 				requestId: string;
 				encryptionPrivateKeyPem: string;
 				swarmSeedHex?: string;
+				onionPathSecretHex?: string;
 			}>;
 			const now = Date.now();
 			let restored = 0;
@@ -435,6 +453,12 @@ export async function startDaemon(
 				const { hash, ...entry } = e;
 				directFundingState.receipts.set(hash, entry);
 				directFundingState.requestsById.set(entry.requestId, hash);
+				if (entry.onionPathSecretHex) {
+					directFundingState.requestsByPathSecret.set(
+						entry.onionPathSecretHex,
+						hash
+					);
+				}
 				if (swarmReceiver && entry.swarmSeedHex) {
 					swarmReceiver.addRequest(
 						rendezvousTopic(entry.rendezvousSecretHex),
@@ -521,6 +545,8 @@ export async function startDaemon(
 			const encryption = mintRequestEncryptionKeys();
 			const expiresAt = Date.now() + DIRECT_FUNDING_REQUEST_TTL_MS;
 			const transports: IDfTransportDescriptor[] = [];
+			let swarmSeedHex: string | undefined;
+			let onionPathSecretHex: string | undefined;
 			if (host && port) transports.push({ type: 'ln', host, port });
 			if (
 				directFundingState.lspPubkey &&
@@ -528,9 +554,11 @@ export async function startDaemon(
 				directFundingState.lspPort
 			) {
 				// Onion path first: same reach as the relay (via the LSP), none
-				// of the metadata. The path_id inside the blinded path is the
-				// request id, which is how delivery proves the path is ours.
+				// of the metadata. The path_id inside the blinded path is a
+				// PRIVATE per-request secret (not the request id the payer
+				// holds), so only a path this node minted can carry it.
 				try {
+					onionPathSecretHex = nodeCrypto.randomBytes(32).toString('hex');
 					transports.push({
 						type: 'onion',
 						host: directFundingState.lspHost,
@@ -539,11 +567,12 @@ export async function startDaemon(
 							mintDfBlindedPath(
 								directFundingState.lspPubkey,
 								node.getInfo().nodeId,
-								requestId
+								onionPathSecretHex
 							)
 						)
 					});
 				} catch {
+					onionPathSecretHex = undefined;
 					/* blinded path minting failed: request still works via relay */
 				}
 				transports.push({
@@ -553,7 +582,6 @@ export async function startDaemon(
 					port: directFundingState.lspPort
 				});
 			}
-			let swarmSeedHex: string | undefined;
 			if (swarmReceiver) {
 				// A fresh Noise identity (and DHT node) exists for this request
 				// alone; the envelope pins it, and it dies with the request. The
@@ -588,9 +616,13 @@ export async function startDaemon(
 				expiresAt,
 				requestId,
 				encryptionPrivateKeyPem: encryption.privateKeyPem,
-				...(swarmSeedHex ? { swarmSeedHex } : {})
+				...(swarmSeedHex ? { swarmSeedHex } : {}),
+				...(onionPathSecretHex ? { onionPathSecretHex } : {})
 			});
 			directFundingState.requestsById.set(requestId, hash);
+			if (onionPathSecretHex) {
+				directFundingState.requestsByPathSecret.set(onionPathSecretHex, hash);
+			}
 			persistRequests();
 			return success({
 				paymentHash: hash,
@@ -624,7 +656,7 @@ export async function startDaemon(
 					'INVALID_PARAMS',
 					`the request fixes the amount at ${env.amountSat} sats`
 				);
-			const { key, ephemeralPublicHex } = senderDeriveKey(
+			const { keys, ephemeralPublicHex } = senderDeriveKey(
 				env.encryptionKey,
 				env.requestId
 			);
@@ -669,7 +701,7 @@ export async function startDaemon(
 							btcNetwork,
 							encryptedTransport(
 								lnTransport(node, env.receiverNodeId),
-								key,
+								keys,
 								env.requestId,
 								{ ephemeralPublicHex }
 							),
@@ -711,7 +743,7 @@ export async function startDaemon(
 							await sendDirectFunding(
 								node,
 								btcNetwork,
-								encryptedTransport(lane, key, env.requestId, {
+								encryptedTransport(lane, keys, env.requestId, {
 									ephemeralPublicHex
 								}),
 								sendOpts
@@ -733,7 +765,7 @@ export async function startDaemon(
 							btcNetwork,
 							encryptedTransport(
 								relayTransport(node, lsp.nodeId, env.receiverNodeId),
-								key,
+								keys,
 								env.requestId,
 								{ ephemeralPublicHex }
 							),
@@ -757,7 +789,7 @@ export async function startDaemon(
 					await sendDirectFunding(
 						node,
 						btcNetwork,
-						encryptedTransport(transport, key, env.requestId, {
+						encryptedTransport(transport, keys, env.requestId, {
 							ephemeralPublicHex
 						}),
 						sendOpts
