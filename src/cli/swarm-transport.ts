@@ -73,14 +73,30 @@ export function socketTransport(socket: {
  * Receiver side: announce on this node's topic and answer funding offers
  * arriving over swarm sockets. Returns a stop handle.
  */
+export interface ISwarmReceiver {
+	stop: () => Promise<void>;
+	/** This instance's Noise public key (hex). Payment requests pin it so a
+	 *  sender refuses to talk to a topic squatter. Stable across requests for
+	 *  now; per-request Noise identities are a documented later stage. */
+	noisePublicKeyHex: string;
+	/** Announce a per-request rendezvous topic. */
+	join: (topic: Buffer) => void;
+	/** Stop announcing a topic (existing sockets keep their own lifecycle;
+	 *  the request-level receipt check already rejects stale offers). */
+	leave: (topic: Buffer) => Promise<void>;
+}
+
 export function startSwarmReceiver(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps,
 	nodePubkeyHex: string,
 	log: (line: string) => void
-): { stop: () => Promise<void> } {
+): ISwarmReceiver {
 	const swarm = new Hyperswarm();
 	swarm.on('connection', (socket: any) => {
+		// One swarm serves every topic; hyperswarm does not say which topic
+		// produced a connection. Requests are identified by the OFFER content
+		// (receipt hash), so the ambiguity costs nothing.
 		const transport = socketTransport(socket);
 		socket.on('error', () => {
 			/* peer went away; nothing to do */
@@ -94,9 +110,22 @@ export function startSwarmReceiver(
 			});
 		});
 	});
+	// Legacy static topic (pubkey-derived): kept for requests without a
+	// rendezvous secret; retires at envelope v1.
 	swarm.join(dfTopic(nodePubkeyHex), { server: true, client: false });
 	log(`direct-funding swarm listener up (topic from ${nodePubkeyHex.slice(0, 12)})`);
 	return {
+		noisePublicKeyHex: Buffer.from(swarm.keyPair.publicKey).toString('hex'),
+		join: (topic: Buffer) => {
+			swarm.join(topic, { server: true, client: false });
+		},
+		leave: async (topic: Buffer) => {
+			try {
+				await swarm.leave(topic);
+			} catch {
+				/* already left */
+			}
+		},
 		stop: async () => {
 			try {
 				await swarm.destroy();
@@ -112,8 +141,14 @@ export function startSwarmReceiver(
  * transport over the first connection. The caller closes when done.
  */
 export function swarmConnect(
-	recipientPubkeyHex: string,
-	timeoutMs = 30_000
+	topic: Buffer,
+	opts: {
+		/** Receiver's Noise public key from the payment request. When set, a
+		 *  connection from any OTHER key is dropped and the search continues:
+		 *  a topic squatter never receives a single protocol byte. */
+		expectedNoiseKeyHex?: string;
+		timeoutMs?: number;
+	} = {}
 ): Promise<{ transport: DfTransport; close: () => Promise<void> }> {
 	const swarm = new Hyperswarm();
 	const close = async (): Promise<void> => {
@@ -123,22 +158,51 @@ export function swarmConnect(
 			/* already down */
 		}
 	};
+	const expected = opts.expectedNoiseKeyHex
+		? Buffer.from(opts.expectedNoiseKeyHex, 'hex')
+		: null;
 	return new Promise((resolve, reject) => {
+		let done = false;
 		const timer = setTimeout(() => {
+			done = true;
 			void close();
 			reject(
 				new Error(
-					'could not find the recipient on the network (is their wallet online?)'
+					expected
+						? 'could not reach the receiver identified in the payment request (identity-checked; squatters were ignored)'
+						: 'could not find the recipient on the network (is their wallet online?)'
 				)
 			);
-		}, timeoutMs);
+		}, opts.timeoutMs ?? 30_000);
 		swarm.on('connection', (socket: any) => {
+			if (done) return;
+			if (expected) {
+				const remote: Buffer | undefined = socket.remotePublicKey;
+				if (
+					!remote ||
+					remote.length !== expected.length ||
+					!nodeCryptoTimingSafeEqual(remote, expected)
+				) {
+					// Not the receiver the request named: say nothing, keep looking.
+					try {
+						socket.destroy();
+					} catch {
+						/* gone */
+					}
+					return;
+				}
+			}
+			done = true;
 			clearTimeout(timer);
 			socket.on('error', () => {
 				/* handled by protocol timeouts */
 			});
 			resolve({ transport: socketTransport(socket), close });
 		});
-		swarm.join(dfTopic(recipientPubkeyHex), { server: false, client: true });
+		swarm.join(topic, { server: false, client: true });
 	});
 }
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodeCryptoTimingSafeEqual: (a: Buffer, b: Buffer) => boolean =
+	require('crypto').timingSafeEqual;

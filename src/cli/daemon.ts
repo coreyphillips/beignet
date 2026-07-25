@@ -23,9 +23,15 @@ import {
 	attachDirectFundingReceiver,
 	sendDirectFunding,
 	lnTransport,
+	dfTopic,
+	rendezvousTopic,
 	IDirectFundingReceiverDeps
 } from './direct-funding';
-import { startSwarmReceiver, swarmConnect } from './swarm-transport';
+import {
+	startSwarmReceiver,
+	swarmConnect,
+	ISwarmReceiver
+} from './swarm-transport';
 import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
@@ -263,8 +269,29 @@ export async function startDaemon(
 		lspPubkey?: string;
 		targetInboundSat: number;
 		trusted: boolean;
-		receipts: Map<string, string>;
+		receipts: Map<
+			string,
+			{ preimageHex: string; rendezvousSecretHex: string; expiresAt: number }
+		>;
 	} = { targetInboundSat: 0, trusted: false, receipts: new Map() };
+	const DIRECT_FUNDING_REQUEST_TTL_MS = 60 * 60 * 1000;
+	let swarmReceiver: ISwarmReceiver | null = null;
+	// A used or expired request leaves its rendezvous topic: the receiver's
+	// DHT footprint shrinks to "only while a request is outstanding".
+	const retireRequest = (hashHex: string): void => {
+		const entry = directFundingState.receipts.get(hashHex);
+		if (!entry) return;
+		directFundingState.receipts.delete(hashHex);
+		if (swarmReceiver) {
+			void swarmReceiver.leave(rendezvousTopic(entry.rendezvousSecretHex));
+		}
+	};
+	const pruneExpiredRequests = (): void => {
+		const now = Date.now();
+		for (const [hash, entry] of directFundingState.receipts) {
+			if (entry.expiresAt <= now) retireRequest(hash);
+		}
+	};
 	const btcNetwork =
 		opts.network === 'mainnet'
 			? bitcoinjs.networks.bitcoin
@@ -275,8 +302,12 @@ export async function startDaemon(
 		getLspPubkey: () => directFundingState.lspPubkey,
 		getTargetInboundSat: () => directFundingState.targetInboundSat,
 		getTrusted: () => directFundingState.trusted,
-		getReceiptPreimage: (hashHex) => directFundingState.receipts.get(hashHex),
-		onReceiptUsed: (hashHex) => directFundingState.receipts.delete(hashHex),
+		getReceiptPreimage: (hashHex) => {
+			const entry = directFundingState.receipts.get(hashHex);
+			if (!entry || entry.expiresAt <= Date.now()) return undefined;
+			return entry.preimageHex;
+		},
+		onReceiptUsed: (hashHex) => retireRequest(hashHex),
 		network: btcNetwork,
 		onEvent: (kind, detail) => {
 			process.stderr.write(`direct-funding ${kind}: ${detail}\n`);
@@ -288,8 +319,11 @@ export async function startDaemon(
 	// reach this node with no dialable address.
 	if (opts.swarm) {
 		try {
-			startSwarmReceiver(node, directFundingDeps, node.getInfo().nodeId, (l) =>
-				process.stderr.write(`${l}\n`)
+			swarmReceiver = startSwarmReceiver(
+				node,
+				directFundingDeps,
+				node.getInfo().nodeId,
+				(l) => process.stderr.write(`${l}\n`)
 			);
 		} catch (err) {
 			process.stderr.write(
@@ -331,28 +365,59 @@ export async function startDaemon(
 		// answered with the preimage after broadcast — a provable delivery
 		// receipt bound to the request.
 		'POST /direct-funding/request': () => {
+			pruneExpiredRequests();
 			const preimage = nodeCrypto.randomBytes(32);
 			const hash = nodeCrypto
 				.createHash('sha256')
 				.update(preimage)
 				.digest('hex');
-			directFundingState.receipts.set(hash, preimage.toString('hex'));
-			return success({ paymentHash: hash });
+			// Dedicated rendezvous secret, separate from the receipt hash:
+			// discovery and receipt semantics get independent lifecycles.
+			const rendezvousSecretHex = nodeCrypto.randomBytes(32).toString('hex');
+			const expiresAt = Date.now() + DIRECT_FUNDING_REQUEST_TTL_MS;
+			directFundingState.receipts.set(hash, {
+				preimageHex: preimage.toString('hex'),
+				rendezvousSecretHex,
+				expiresAt
+			});
+			if (swarmReceiver) {
+				swarmReceiver.join(rendezvousTopic(rendezvousSecretHex));
+			}
+			return success({
+				paymentHash: hash,
+				rendezvousSecret: rendezvousSecretHex,
+				noisePublicKey: swarmReceiver ? swarmReceiver.noisePublicKeyHex : null,
+				expiresAt
+			});
 		},
 		// Sender side: pay a beignet recipient onchain by funding their channel
 		// directly from one of our UTXOs — one transaction, no deposit hop.
 		// With host+port the frames ride a Lightning peer connection; with only
 		// the pubkey the recipient is found on the DHT by topic.
 		'POST /direct-funding/send': async (body) => {
-			const { pubkey, host, port, amountSats, feeHeadroomSats, receiptHash } =
-				body as {
-					pubkey?: string;
-					host?: string;
-					port?: number;
-					amountSats?: number;
-					feeHeadroomSats?: number;
-					receiptHash?: string;
-				};
+			const {
+				pubkey,
+				host,
+				port,
+				amountSats,
+				feeHeadroomSats,
+				receiptHash,
+				rendezvousSecret,
+				noiseKey
+			} = body as {
+				pubkey?: string;
+				host?: string;
+				port?: number;
+				amountSats?: number;
+				feeHeadroomSats?: number;
+				receiptHash?: string;
+				/** Per-request rendezvous secret from the payment request; the
+				 *  DHT topic derives from it instead of the pubkey. */
+				rendezvousSecret?: string;
+				/** Receiver's Noise public key from the payment request; pinned
+				 *  so topic squatters never receive the offer. */
+				noiseKey?: string;
+			};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
 			const sendOpts = {
@@ -384,7 +449,10 @@ export async function startDaemon(
 					);
 				}
 			}
-			const { transport, close } = await swarmConnect(pubkey);
+			const { transport, close } = await swarmConnect(
+				rendezvousSecret ? rendezvousTopic(rendezvousSecret) : dfTopic(pubkey),
+				{ expectedNoiseKeyHex: noiseKey }
+			);
 			try {
 				return success(
 					await sendDirectFunding(node, btcNetwork, transport, sendOpts)

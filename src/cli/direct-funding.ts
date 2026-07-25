@@ -87,7 +87,11 @@ export function lnTransport(node: BeignetNode, peerPubkey: string): DfTransport 
 interface OfferMsg {
 	offerId: string;
 	amountSat: number;
-	prevTxHex: string;
+	/** Display-order txid of the transaction holding the offered output. The
+	 *  receiver fetches the full transaction from its OWN chain source, which
+	 *  both keeps offers small (onion-message friendly) and verifies the
+	 *  offer against chain truth instead of sender-supplied bytes. */
+	txidHex: string;
 	vout: number;
 	valueSat: number;
 	sequence: number;
@@ -503,7 +507,7 @@ export async function sendDirectFunding(
 	transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER, {
 		offerId,
 		amountSat,
-		prevTxHex,
+		txidHex: utxo.tx_hash,
 		vout: utxo.tx_pos,
 		valueSat: utxo.value,
 		sequence: 0xfffffffd,
@@ -603,7 +607,19 @@ export async function handleOffer(
 	if (offer.receiptHashHex && !receiptPreimage) {
 		return ack(false, 'unknown receipt hash');
 	}
-	const prevTx = bitcoin.Transaction.fromHex(offer.prevTxHex);
+	// The offer names only an outpoint; the transaction comes from OUR chain
+	// source, so the values below are chain truth rather than sender claims.
+	const prevTxRes = await node.onchainWallet.electrum
+		.getTransactions({ txHashes: [{ tx_hash: offer.txidHex }] })
+		.catch(() => null);
+	const prevTxHex =
+		prevTxRes && !prevTxRes.isErr()
+			? ((prevTxRes.value.data?.[0]?.result?.hex ?? '') as string)
+			: '';
+	if (!prevTxHex) {
+		return ack(false, 'offered transaction not found on chain');
+	}
+	const prevTx = bitcoin.Transaction.fromHex(prevTxHex);
 	const out = prevTx.outs[offer.vout];
 	if (!out || Number(out.value) !== offer.valueSat) {
 		return ack(false, 'offer value does not match prev tx');
@@ -686,6 +702,7 @@ export async function handleOffer(
 				offer,
 				receiptPreimage,
 				externalInput,
+				prevTx,
 				home.channelId,
 				lsp
 			);
@@ -850,13 +867,13 @@ async function handleSpliceOffer(
 	offer: OfferMsg,
 	receiptPreimage: string | undefined,
 	externalInput: ISpliceWalletInput,
+	prevTx: bitcoin.Transaction,
 	channelIdHex: string,
 	lsp: string
 ): Promise<void> {
 	const channelId = Buffer.from(channelIdHex, 'hex');
 	const channel = node.lightningNode.getRawChannel(channelId);
 	if (!channel) throw new Error('home channel disappeared');
-	const prevTx = bitcoin.Transaction.fromHex(offer.prevTxHex);
 
 	const res = node.lightningNode.spliceInWithInputs(
 		channelId,
@@ -987,11 +1004,34 @@ async function handleSpliceOffer(
 	);
 }
 
-/** DHT topic a node listens on for direct-funding connections by pubkey. */
+/**
+ * LEGACY DHT topic derived from the node pubkey. Static and derivable by
+ * anyone who knows the pubkey, so it doubles as a presence oracle; kept only
+ * for requests that carry no rendezvous secret. New requests use
+ * rendezvousTopic and will retire this at envelope v1.
+ */
 export function dfTopic(nodePubkeyHex: string): Buffer {
 	return crypto
 		.createHash('sha256')
 		.update(`beignet-direct-funding:${nodePubkeyHex}`)
+		.digest();
+}
+
+/**
+ * Per-request DHT topic from a dedicated random rendezvous secret carried in
+ * the payment request. Unpredictable to anyone without the request, unlinkable
+ * to the node identity, and single-use: the receiver leaves the topic when
+ * the request is used or expires.
+ */
+export function rendezvousTopic(rendezvousSecretHex: string): Buffer {
+	return crypto
+		.createHash('sha256')
+		.update(
+			Buffer.concat([
+				Buffer.from('beignet/direct-funding/topic/v1', 'utf8'),
+				Buffer.from(rendezvousSecretHex, 'hex')
+			])
+		)
 		.digest();
 }
 
