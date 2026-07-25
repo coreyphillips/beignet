@@ -2,8 +2,7 @@ import { BeignetNode } from './beignet-node';
 import {
 	DfTransport,
 	IDirectFundingReceiverDeps,
-	handleOffer,
-	dfTopic
+	dispatchOffer
 } from './direct-funding';
 import { BeignetCustomSubtype } from '../lightning/message/custom';
 
@@ -89,7 +88,6 @@ export interface ISwarmReceiver {
 export function startSwarmReceiver(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps,
-	nodePubkeyHex: string,
 	log: (line: string) => void
 ): ISwarmReceiver {
 	const swarm = new Hyperswarm();
@@ -103,17 +101,17 @@ export function startSwarmReceiver(
 		});
 		transport.onMessage((subtype, payload) => {
 			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void handleOffer(node, deps, transport, payload, {
+			void dispatchOffer(node, deps, transport, payload, {
 				senderAnonymous: true
 			}).catch((e) => {
 				deps.onEvent?.('direct-funding-failed', e.message);
 			});
 		});
 	});
-	// Legacy static topic (pubkey-derived): kept for requests without a
-	// rendezvous secret; retires at envelope v1.
-	swarm.join(dfTopic(nodePubkeyHex), { server: true, client: false });
-	log(`direct-funding swarm listener up (topic from ${nodePubkeyHex.slice(0, 12)})`);
+	// No standing topic: rendezvous topics are joined per outstanding
+	// request and left on use or expiry, so this node has no static DHT
+	// presence at all.
+	log('direct-funding swarm ready (per-request rendezvous only)');
 	return {
 		noisePublicKeyHex: Buffer.from(swarm.keyPair.publicKey).toString('hex'),
 		join: (topic: Buffer) => {

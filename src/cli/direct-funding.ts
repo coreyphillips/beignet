@@ -13,6 +13,10 @@ import {
 import { createFundingScript } from '../lightning/script/funding';
 import { verifyMessageSignature } from '../lightning/crypto/message-signing';
 import { ILeaseRates } from '../lightning/gossip/types';
+// Envelope helpers loaded lazily: df-envelope imports our DfTransport TYPE
+// only, so the runtime dependency is one-directional.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const envelope = require('./df-envelope') as typeof import('./df-envelope');
 
 bitcoin.initEccLib(ecc);
 const ECPair = ECPairFactory(ecc);
@@ -530,6 +534,8 @@ export async function sendDirectFunding(
 
 export interface IDirectFundingReceiverDeps {
 	getLspPubkey: () => string | undefined;
+	/** PKCS8 PEM of a request's X25519 private key, for sealed offers. */
+	getRequestEncryptionPem?: (requestId: string) => string | undefined;
 	/** Inbound to BUY from the LSP alongside (0 = plain v2, nothing bought). */
 	getTargetInboundSat: () => number;
 	/** Negotiate option_zeroconf into the open (LSP must trust this node). */
@@ -555,7 +561,7 @@ export function attachDirectFundingReceiver(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
 			if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void handleOffer(
+			void dispatchOffer(
 				node,
 				deps,
 				lnTransport(node, msg.peerPubkey),
@@ -568,6 +574,49 @@ export function attachDirectFundingReceiver(
 			});
 		}
 	);
+}
+
+/**
+ * Route an inbound offer, transparently unsealing envelope-v1 traffic.
+ * A sealed first frame carries the request id and the sender's ephemeral
+ * X25519 key in the clear; the request's private key derives the shared
+ * key, the offer decrypts, and the rest of the exchange rides an
+ * encrypted wrapper over the same transport. An offer sealed to a request
+ * this node never minted is dropped without an answer.
+ */
+export async function dispatchOffer(
+	node: BeignetNode,
+	deps: IDirectFundingReceiverDeps,
+	transport: DfTransport,
+	rawPayload: Buffer,
+	opts: { senderAnonymous: boolean }
+): Promise<void> {
+	let payload: Buffer;
+	let lane: DfTransport;
+	try {
+		const frame = JSON.parse(rawPayload.toString('utf8'));
+		if (
+			!frame ||
+			typeof frame.requestId !== 'string' ||
+			typeof frame.eph !== 'string' ||
+			typeof frame.c !== 'string'
+		) {
+			return; // every offer is sealed to a request; anything else is noise
+		}
+		const pem = deps.getRequestEncryptionPem?.(frame.requestId);
+		if (!pem) return; // not our request: say nothing
+		const key = envelope.receiverDeriveKey(pem, frame.eph, frame.requestId);
+		payload = envelope.open(
+			key,
+			frame.requestId,
+			BeignetCustomSubtype.DIRECT_FUNDING_OFFER,
+			{ n: frame.n, c: frame.c }
+		);
+		lane = envelope.encryptedTransport(transport, key, frame.requestId);
+	} catch {
+		return; // undecryptable: tampered or foreign, drop
+	}
+	return handleOffer(node, deps, lane, payload, opts);
 }
 
 /**
@@ -1002,19 +1051,6 @@ async function handleSpliceOffer(
 		'channelized',
 		'direct-funded splice complete — one transaction, the home channel grew'
 	);
-}
-
-/**
- * LEGACY DHT topic derived from the node pubkey. Static and derivable by
- * anyone who knows the pubkey, so it doubles as a presence oracle; kept only
- * for requests that carry no rendezvous secret. New requests use
- * rendezvousTopic and will retire this at envelope v1.
- */
-export function dfTopic(nodePubkeyHex: string): Buffer {
-	return crypto
-		.createHash('sha256')
-		.update(`beignet-direct-funding:${nodePubkeyHex}`)
-		.digest();
 }
 
 /**
