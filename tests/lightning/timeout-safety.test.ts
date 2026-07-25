@@ -417,7 +417,9 @@ describe('Phase 6: Timeout Safety Nets', () => {
 
 			const reestablishPayload = (channel: typeof rawAlice): Buffer => {
 				const action = channel.createReestablish().find(
-					(a): a is {
+					(
+						a
+					): a is {
 						type: ChannelActionType.SEND_MESSAGE;
 						messageType: MessageType;
 						payload: Buffer;
