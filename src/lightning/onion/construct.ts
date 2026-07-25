@@ -150,25 +150,34 @@ export function constructOnionPacket(
  * Format: version(1) + ephemeralKey(33) + routingInfo(1300) + hmac(32)
  */
 export function encodeOnionPacket(packet: IOnionPacket): Buffer {
-	const buf = Buffer.alloc(1366);
+	// Total = version(1) + ephemeralKey(33) + routingInfo(n) + hmac(32).
+	// Payment onions always carry n = 1300 (1366 total); onion messages may
+	// use the BOLT 4 large form, n = 32768 (32834 total).
+	const riLen = packet.routingInfo.length;
+	const buf = Buffer.alloc(66 + riLen);
 	buf[0] = packet.version;
 	packet.ephemeralKey.copy(buf, 1);
 	packet.routingInfo.copy(buf, 34);
-	packet.hmac.copy(buf, 1334);
+	packet.hmac.copy(buf, 34 + riLen);
 	return buf;
 }
 
 /**
- * Deserialize a 1366-byte buffer into an onion packet.
+ * Deserialize an onion packet. The routing-info length is derived from the
+ * buffer: 1366-byte packets carry 1300 (payments and standard onion
+ * messages), 32834-byte packets carry the BOLT 4 large form's 32768.
  */
 export function decodeOnionPacket(buf: Buffer): IOnionPacket {
-	if (buf.length !== 1366) {
-		throw new Error(`Onion packet must be 1366 bytes, got ${buf.length}`);
+	if (buf.length !== 1366 && buf.length !== 32834) {
+		throw new Error(
+			`Onion packet must be 1366 or 32834 bytes, got ${buf.length}`
+		);
 	}
+	const riLen = buf.length - 66;
 	return {
 		version: buf[0],
 		ephemeralKey: Buffer.from(buf.subarray(1, 34)),
-		routingInfo: Buffer.from(buf.subarray(34, 1334)),
-		hmac: Buffer.from(buf.subarray(1334, 1366))
+		routingInfo: Buffer.from(buf.subarray(34, 34 + riLen)),
+		hmac: Buffer.from(buf.subarray(34 + riLen, 66 + riLen))
 	};
 }

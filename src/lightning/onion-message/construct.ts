@@ -14,6 +14,7 @@ import {
 } from './types';
 import { encodeOnionMessagePayload } from './codec';
 import { ONION_VERSION, ROUTING_INFO_LENGTH } from '../onion/types';
+import { ONION_MESSAGE_LARGE_ROUTING_INFO_LENGTH } from './types';
 import {
 	computeSharedSecrets,
 	deriveHopKeys,
@@ -30,18 +31,19 @@ import { encodeOnionPacket } from '../onion/construct';
  */
 function generateFiller(
 	sharedSecrets: Buffer[],
-	payloadSizes: number[]
+	payloadSizes: number[],
+	routingInfoLength: number
 ): Buffer {
 	let filler = Buffer.alloc(0);
 
 	for (let i = 0; i < sharedSecrets.length - 1; i++) {
 		const hopSize = payloadSizes[i] + 32; // payload + HMAC
-		const fillerStart = ROUTING_INFO_LENGTH - filler.length;
+		const fillerStart = routingInfoLength - filler.length;
 
 		const keys = deriveHopKeys(sharedSecrets[i]);
 		const stream = generateCipherStream(
 			keys.rho,
-			ROUTING_INFO_LENGTH + hopSize
+			routingInfoLength + hopSize
 		);
 
 		// Extend filler by hopSize zeros
@@ -84,8 +86,23 @@ export function constructOnionMessagePacket(
 
 	const payloadSizes = hops.map((h) => h.payload.length);
 
+	// BOLT 4 gives onion messages two fixed sizes: the standard 1300-byte
+	// routing info, or the large 32768-byte form when the payloads need it.
+	// Exactly two sizes (not arbitrary) so packet length leaks at most one
+	// bit about the content.
+	const needed = payloadSizes.reduce((a, b) => a + b + 32, 0);
+	const routingInfoLength =
+		needed <= ROUTING_INFO_LENGTH
+			? ROUTING_INFO_LENGTH
+			: ONION_MESSAGE_LARGE_ROUTING_INFO_LENGTH;
+	if (needed > routingInfoLength) {
+		throw new Error(
+			`onion message payloads need ${needed} bytes, exceeding the large form (${routingInfoLength})`
+		);
+	}
+
 	// Generate filler
-	const filler = generateFiller(sharedSecrets, payloadSizes);
+	const filler = generateFiller(sharedSecrets, payloadSizes, routingInfoLength);
 
 	// BOLT 4: initialize routing_info from the pseudo-random `pad`-key stream
 	// keyed by the SESSION private key, NOT zeros and NOT any per-hop secret.
@@ -94,7 +111,7 @@ export function constructOnionMessagePacket(
 	// that hop regenerate the stream and locate the padding boundary.
 	let routingInfo = generateCipherStream(
 		generateKey('pad', sessionKey),
-		ROUTING_INFO_LENGTH
+		routingInfoLength
 	);
 	let currentHmac = Buffer.alloc(32); // Start with zero HMAC (last hop marker)
 
@@ -105,26 +122,26 @@ export function constructOnionMessagePacket(
 		const shiftSize = payloadBytes.length + 32; // payload + HMAC
 
 		// Right-shift routing info to make room
-		const newRoutingInfo = Buffer.alloc(ROUTING_INFO_LENGTH);
+		const newRoutingInfo = Buffer.alloc(routingInfoLength);
 		payloadBytes.copy(newRoutingInfo, 0);
 		currentHmac.copy(newRoutingInfo, payloadBytes.length);
 		routingInfo.copy(
 			newRoutingInfo,
 			shiftSize,
 			0,
-			ROUTING_INFO_LENGTH - shiftSize
+			routingInfoLength - shiftSize
 		);
 		routingInfo = newRoutingInfo;
 
 		// XOR with cipher stream
-		const stream = generateCipherStream(keys.rho, ROUTING_INFO_LENGTH);
-		for (let j = 0; j < ROUTING_INFO_LENGTH; j++) {
+		const stream = generateCipherStream(keys.rho, routingInfoLength);
+		for (let j = 0; j < routingInfoLength; j++) {
 			routingInfo[j] ^= stream[j];
 		}
 
 		// For the innermost hop, apply filler AFTER XOR
 		if (i === hops.length - 1 && filler.length > 0) {
-			filler.copy(routingInfo, ROUTING_INFO_LENGTH - filler.length);
+			filler.copy(routingInfo, routingInfoLength - filler.length);
 		}
 
 		// Compute HMAC for this hop
@@ -133,7 +150,7 @@ export function constructOnionMessagePacket(
 		);
 	}
 
-	// Serialize to 1366-byte onion packet
+	// Serialize (1366 bytes standard, 32834 large)
 	return encodeOnionPacket({
 		version: ONION_VERSION,
 		ephemeralKey: ephemeralKeys[0],

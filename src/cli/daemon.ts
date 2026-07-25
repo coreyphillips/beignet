@@ -34,6 +34,13 @@ import {
 	ISwarmReceiver
 } from './swarm-transport';
 import {
+	onionDfDispatcher,
+	createOnionLane,
+	mintDfBlindedPath,
+	serializeBlindedPath,
+	deserializeBlindedPath
+} from './df-onion';
+import {
 	IDfRequestEnvelope,
 	IDfTransportDescriptor,
 	canonicalRequestMessage,
@@ -443,6 +450,25 @@ export async function startDaemon(
 				directFundingState.lspHost &&
 				directFundingState.lspPort
 			) {
+				// Onion path first: same reach as the relay (via the LSP), none
+				// of the metadata. The path_id inside the blinded path is the
+				// request id, which is how delivery proves the path is ours.
+				try {
+					transports.push({
+						type: 'onion',
+						host: directFundingState.lspHost,
+						port: directFundingState.lspPort,
+						path: serializeBlindedPath(
+							mintDfBlindedPath(
+								directFundingState.lspPubkey,
+								node.getInfo().nodeId,
+								requestId
+							)
+						)
+					});
+				} catch {
+					/* blinded path minting failed: request still works via relay */
+				}
 				transports.push({
 					type: 'lsp',
 					nodeId: directFundingState.lspPubkey,
@@ -545,6 +571,51 @@ export async function startDaemon(
 							sendOpts
 						)
 					);
+				}
+			}
+			// Onion transport: route sealed frames through the introduction
+			// node as onion messages over the request's blinded path, with our
+			// own blinded reply path attached to every frame. The intro node
+			// forwards fixed-size onions it cannot read; the receiver never
+			// learns our node id. An unusable descriptor or an unreachable
+			// intro node falls through; once frames flow the attempt commits.
+			const on = env.transports.find((t) => t.type === 'onion');
+			if (on?.host && on.port && on.path) {
+				let onionPath: ReturnType<typeof deserializeBlindedPath> | null =
+					null;
+				try {
+					onionPath = deserializeBlindedPath(on.path);
+				} catch {
+					onionPath = null;
+				}
+				if (onionPath) {
+					const introId = onionPath.introductionNodeId.toString('hex');
+					const introUp = await node
+						.connectPeer(introId, on.host, on.port)
+						.then(() => true)
+						.catch(() => node.listPeers().some((p) => p.pubkey === introId));
+					if (introUp) {
+						const dispatcher = onionDfDispatcher(node);
+						const localPathId = nodeCrypto.randomBytes(16).toString('hex');
+						const lane = createOnionLane(node, dispatcher, localPathId, {
+							sendPath: onionPath,
+							includeReplyPath: mintDfBlindedPath(
+								introId,
+								node.getInfo().nodeId,
+								localPathId
+							)
+						});
+						return success(
+							await sendDirectFunding(
+								node,
+								btcNetwork,
+								encryptedTransport(lane, key, env.requestId, {
+									ephemeralPublicHex
+								}),
+								sendOpts
+							)
+						);
+					}
 				}
 			}
 			// Relay transport: connect to the receiver's LSP and route sealed

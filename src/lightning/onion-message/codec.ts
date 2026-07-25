@@ -32,15 +32,16 @@ export function encodeOnionMessage(msg: IOnionMessage): Buffer {
 			`blinding_point must be 33 bytes, got ${msg.blindingPoint.length}`
 		);
 	}
-	if (msg.onionRoutingPacket.length !== ONION_MESSAGE_PACKET_LENGTH) {
+	const packetLen = msg.onionRoutingPacket.length;
+	if (packetLen !== ONION_MESSAGE_PACKET_LENGTH && packetLen !== 32834) {
 		throw new Error(
-			`onion_routing_packet must be ${ONION_MESSAGE_PACKET_LENGTH} bytes, got ${msg.onionRoutingPacket.length}`
+			`onion_routing_packet must be ${ONION_MESSAGE_PACKET_LENGTH} or 32834 bytes, got ${packetLen}`
 		);
 	}
 
-	const buf = Buffer.alloc(33 + 2 + ONION_MESSAGE_PACKET_LENGTH);
+	const buf = Buffer.alloc(33 + 2 + packetLen);
 	msg.blindingPoint.copy(buf, 0);
-	buf.writeUInt16BE(ONION_MESSAGE_PACKET_LENGTH, 33);
+	buf.writeUInt16BE(packetLen, 33);
 	msg.onionRoutingPacket.copy(buf, 35);
 	return buf;
 }

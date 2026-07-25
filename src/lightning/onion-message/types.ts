@@ -20,6 +20,10 @@ export const ONION_MESSAGE_PACKET_LENGTH = 1366;
 /** Routing info length within the onion packet */
 export const ONION_MESSAGE_ROUTING_INFO_LENGTH = 1300;
 
+/** BOLT 4 large onion message form: 32768-byte routing info (32834 total).
+ *  Used automatically when hop payloads exceed the standard form. */
+export const ONION_MESSAGE_LARGE_ROUTING_INFO_LENGTH = 32768;
+
 // ── TLV Type Constants for Onion Message Payloads ────────────────
 
 /** TLV type for encrypted_recipient_data (same as payment TLV type 10) */

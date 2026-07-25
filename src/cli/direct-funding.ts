@@ -649,6 +649,33 @@ export function attachDirectFundingReceiver(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps
 ): void {
+	// Offers arriving over blinded onion paths. The path_id IS the request
+	// id, and the onion layer authenticated it (decrypted recipient data of
+	// a path this node minted), so an unknown id is silence, as everywhere.
+	// Onion senders are anonymous by construction: that is the transport's
+	// point, and the trust policy follows.
+	const onion = require('./df-onion');
+	const onionDispatcher = onion.onionDfDispatcher(node);
+	onionDispatcher.offerSink = (
+		pathIdHex: string,
+		sealedOffer: object,
+		replyPath?: unknown
+	): void => {
+		if (!deps.getRequestEncryptionPem?.(pathIdHex)) return;
+		if (!replyPath) return;
+		const lane = onion.createOnionLane(node, onionDispatcher, pathIdHex, {
+			initialPeerReplyPath: replyPath
+		});
+		void dispatchOffer(
+			node,
+			deps,
+			lane,
+			Buffer.from(JSON.stringify(sealedOffer), 'utf8'),
+			{ senderAnonymous: true }
+		).catch((e) => {
+			deps.onEvent?.('direct-funding-failed', e.message);
+		});
+	};
 	node.lightningNode.on(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {

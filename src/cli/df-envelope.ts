@@ -22,14 +22,24 @@ import { DfTransport } from './direct-funding';
  * HKDF, with the request id and message subtype bound as associated data.
  */
 
+/** A blinded path in envelope form: all fields hex. */
+export interface ISerializedBlindedPath {
+	intro: string;
+	blinding: string;
+	hops: Array<{ id: string; data: string }>;
+}
+
 export interface IDfTransportDescriptor {
-	type: 'ln' | 'lsp' | 'swarm';
+	type: 'ln' | 'onion' | 'lsp' | 'swarm';
 	/** ln: a host hint the sender may reach for the identified peer path.
+	 *  onion: the introduction node's reachable address.
 	 *  lsp: the relay's reachable address. */
 	host?: string;
 	port?: number;
 	/** lsp: the relay's Lightning node id; frames route through it blind. */
 	nodeId?: string;
+	/** onion: blinded path to the receiver; path_id is the request id. */
+	path?: ISerializedBlindedPath;
 	/** swarm: rendezvous secret (hex) the DHT topic derives from. */
 	rendezvous?: string;
 	/** swarm: receiver's Noise public key (hex), pinned by the sender. */
@@ -58,6 +68,16 @@ export function canonicalRequestMessage(
 	const transports = env.transports
 		.map((t) => {
 			if (t.type === 'ln') return `ln,${t.host ?? ''},${t.port ?? ''}`;
+			if (t.type === 'onion') {
+				const path = t.path
+					? [
+							t.path.intro,
+							t.path.blinding,
+							...t.path.hops.map((h) => `${h.id}~${h.data}`)
+					  ].join('~')
+					: '';
+				return `onion,${t.host ?? ''},${t.port ?? ''},${path}`;
+			}
 			if (t.type === 'lsp')
 				return `lsp,${t.nodeId ?? ''},${t.host ?? ''},${t.port ?? ''}`;
 			return `swarm,${t.rendezvous ?? ''},${t.noiseKey ?? ''}`;

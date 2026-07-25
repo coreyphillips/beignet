@@ -123,7 +123,7 @@ describe('Onion Messages (Phase 8)', () => {
 					blindingPoint: kp.pubkey,
 					onionRoutingPacket: Buffer.alloc(100)
 				})
-			).to.throw('onion_routing_packet must be 1366 bytes');
+			).to.throw('onion_routing_packet must be 1366 or 32834 bytes');
 		});
 
 		it('should reject truncated wire message', () => {
