@@ -575,12 +575,19 @@ export async function startDaemon(
 					onionPathSecretHex = undefined;
 					/* blinded path minting failed: request still works via relay */
 				}
-				transports.push({
-					type: 'lsp',
-					nodeId: directFundingState.lspPubkey,
-					host: directFundingState.lspHost,
-					port: directFundingState.lspPort
-				});
+				// The relay is the onion path's introduction node, so when the
+				// onion descriptor is present a separate lsp descriptor would
+				// duplicate it byte for byte; the sender synthesizes the relay
+				// fallback from the onion intro instead. Emitted only when the
+				// blinded path could not be minted.
+				if (!onionPathSecretHex) {
+					transports.push({
+						type: 'lsp',
+						nodeId: directFundingState.lspPubkey,
+						host: directFundingState.lspHost,
+						port: directFundingState.lspPort
+					});
+				}
 			}
 			if (swarmReceiver) {
 				// A fresh Noise identity (and DHT node) exists for this request
@@ -598,7 +605,7 @@ export async function startDaemon(
 				});
 			}
 			const unsigned: Omit<IDfRequestEnvelope, 'sig'> = {
-				v: 1,
+				v: 2,
 				requestId,
 				receiverNodeId: node.getInfo().nodeId,
 				expiresAt,
@@ -755,7 +762,17 @@ export async function startDaemon(
 			// Relay transport: connect to the receiver's LSP and route sealed
 			// frames through it. Frames stay opaque to the relay; only
 			// connection failures fall through to the next transport.
-			const lsp = env.transports.find((t) => t.type === 'lsp');
+			const onionDesc = env.transports.find((t) => t.type === 'onion');
+			const lsp =
+				env.transports.find((t) => t.type === 'lsp') ??
+				(onionDesc?.path && onionDesc.host && onionDesc.port
+					? {
+							type: 'lsp' as const,
+							nodeId: onionDesc.path.intro,
+							host: onionDesc.host,
+							port: onionDesc.port
+					  }
+					: undefined);
 			if (lsp?.nodeId && lsp.host && lsp.port) {
 				const relayUp = await connectWithRetry(lsp.nodeId, lsp.host, lsp.port);
 				if (relayUp) {

@@ -1,5 +1,9 @@
 import * as crypto from 'crypto';
-import { verifyMessageSignature } from '../lightning/crypto/message-signing';
+import {
+	verifyMessageSignature,
+	zbase32Encode,
+	zbase32Decode
+} from '../lightning/crypto/message-signing';
 import { DfTransport } from './direct-funding';
 
 /**
@@ -47,7 +51,7 @@ export interface IDfTransportDescriptor {
 }
 
 export interface IDfRequestEnvelope {
-	v: 1;
+	v: 2;
 	requestId: string;
 	receiverNodeId: string;
 	expiresAt: number;
@@ -61,33 +65,126 @@ export interface IDfRequestEnvelope {
 	sig: string;
 }
 
-/** The exact string the receiver's node key signs. Deterministic. */
+// ─────────────── Compact binary encoding ───────────────
+//
+// The envelope rides in a BIP 21 param that must fit a scannable QR, so it
+// is encoded as compact binary, base64url once. The JSON-of-hex form cost
+// about 2.7x the bytes and pushed real requests toward the QR ceiling.
+//
+//   u8   version (2)
+//   16B  requestId
+//   33B  receiverNodeId
+//   u48  expiresAt (ms)
+//   u8   flags (bit0: amountSat present)
+//   [u64 amountSat]
+//   32B  receiptHash
+//   32B  encryptionKey
+//   u8   transport count, then per transport a u8 type tag:
+//     1 ln:    u8 hostLen, host, u16 port
+//     2 onion: u8 hostLen, host, u16 port, 33B intro, 33B blinding,
+//              u8 hopCount, per hop: 33B id, u16 dataLen, data
+//     3 lsp:   33B nodeId, u8 hostLen, host, u16 port
+//     4 swarm: 32B rendezvous, 32B noiseKey
+//   65B  sig (compact recoverable, the zbase32 signature decoded)
+
+const TRANSPORT_TAGS: Record<string, number> = {
+	ln: 1,
+	onion: 2,
+	lsp: 3,
+	swarm: 4
+};
+
+function encodeUnsignedBytes(env: Omit<IDfRequestEnvelope, 'sig'>): Buffer {
+	const parts: Buffer[] = [];
+	const u8 = (n: number): Buffer => Buffer.from([n]);
+	const u16 = (n: number): Buffer => {
+		const b = Buffer.alloc(2);
+		b.writeUInt16BE(n);
+		return b;
+	};
+	const hostField = (host?: string, port?: number): Buffer => {
+		const h = Buffer.from(host ?? '', 'utf8');
+		if (h.length > 255) throw new Error('host too long');
+		return Buffer.concat([u8(h.length), h, u16(port ?? 0)]);
+	};
+	parts.push(u8(2));
+	parts.push(Buffer.from(env.requestId, 'hex'));
+	parts.push(Buffer.from(env.receiverNodeId, 'hex'));
+	const exp = Buffer.alloc(6);
+	exp.writeUIntBE(env.expiresAt, 0, 6);
+	parts.push(exp);
+	parts.push(u8(env.amountSat ? 1 : 0));
+	if (env.amountSat) {
+		const amt = Buffer.alloc(8);
+		amt.writeBigUInt64BE(BigInt(env.amountSat));
+		parts.push(amt);
+	}
+	parts.push(Buffer.from(env.receiptHash, 'hex'));
+	parts.push(Buffer.from(env.encryptionKey, 'hex'));
+	parts.push(u8(env.transports.length));
+	for (const t of env.transports) {
+		const tag = TRANSPORT_TAGS[t.type];
+		if (!tag) throw new Error(`unknown transport type ${t.type}`);
+		parts.push(u8(tag));
+		if (t.type === 'ln') {
+			parts.push(hostField(t.host, t.port));
+		} else if (t.type === 'onion') {
+			if (!t.path) throw new Error('onion transport without path');
+			parts.push(hostField(t.host, t.port));
+			parts.push(Buffer.from(t.path.intro, 'hex'));
+			parts.push(Buffer.from(t.path.blinding, 'hex'));
+			parts.push(u8(t.path.hops.length));
+			for (const hop of t.path.hops) {
+				const data = Buffer.from(hop.data, 'hex');
+				parts.push(Buffer.from(hop.id, 'hex'), u16(data.length), data);
+			}
+		} else if (t.type === 'lsp') {
+			parts.push(Buffer.from(t.nodeId ?? '', 'hex'));
+			parts.push(hostField(t.host, t.port));
+		} else {
+			parts.push(Buffer.from(t.rendezvous ?? '', 'hex'));
+			parts.push(Buffer.from(t.noiseKey ?? '', 'hex'));
+		}
+	}
+	return Buffer.concat(parts);
+}
+
+/** The exact string the receiver's node key signs: the version tag plus
+ *  the full unsigned binary body, so every field is covered. */
 export function canonicalRequestMessage(
 	env: Omit<IDfRequestEnvelope, 'sig'>
 ): string {
-	const transports = env.transports
-		.map((t) => {
-			if (t.type === 'ln') return `ln,${t.host ?? ''},${t.port ?? ''}`;
-			if (t.type === 'onion') {
-				const path = t.path
-					? [
-							t.path.intro,
-							t.path.blinding,
-							...t.path.hops.map((h) => `${h.id}~${h.data}`)
-					  ].join('~')
-					: '';
-				return `onion,${t.host ?? ''},${t.port ?? ''},${path}`;
-			}
-			if (t.type === 'lsp')
-				return `lsp,${t.nodeId ?? ''},${t.host ?? ''},${t.port ?? ''}`;
-			return `swarm,${t.rendezvous ?? ''},${t.noiseKey ?? ''}`;
-		})
-		.join('|');
-	return `beignet-df-req:v1:${env.requestId}:${env.receiverNodeId}:${env.expiresAt}:${env.amountSat ?? ''}:${env.receiptHash}:${env.encryptionKey}:${transports}`;
+	return `beignet-df-req:v2:${encodeUnsignedBytes(env).toString('base64url')}`;
 }
 
 export function encodeRequestEnvelope(env: IDfRequestEnvelope): string {
-	return Buffer.from(JSON.stringify(env), 'utf8').toString('base64url');
+	const sig = zbase32Decode(env.sig);
+	if (!sig || sig.length !== 65) {
+		throw new Error('envelope signature is not a valid node signature');
+	}
+	return Buffer.concat([encodeUnsignedBytes(env), sig]).toString('base64url');
+}
+
+class ByteReader {
+	private off = 0;
+	constructor(private readonly buf: Buffer) {}
+	take(n: number): Buffer {
+		if (this.off + n > this.buf.length) {
+			throw new Error('payment request is malformed');
+		}
+		const out = this.buf.subarray(this.off, this.off + n);
+		this.off += n;
+		return out;
+	}
+	u8(): number {
+		return this.take(1)[0];
+	}
+	u16(): number {
+		return this.take(2).readUInt16BE();
+	}
+	remaining(): number {
+		return this.buf.length - this.off;
+	}
 }
 
 /**
@@ -99,30 +196,86 @@ export function encodeRequestEnvelope(env: IDfRequestEnvelope): string {
 export function decodeAndVerifyRequestEnvelope(
 	encoded: string
 ): IDfRequestEnvelope {
-	let env: IDfRequestEnvelope;
+	let env: Omit<IDfRequestEnvelope, 'sig'>;
+	let sigBytes: Buffer;
 	try {
-		env = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-	} catch {
-		throw new Error('payment request is not decodable');
-	}
-	if (env.v !== 1) throw new Error(`unsupported payment request version ${env.v}`);
-	if (
-		!/^[0-9a-f]{32}$/.test(env.requestId ?? '') ||
-		!/^[0-9a-f]{66}$/.test(env.receiverNodeId ?? '') ||
-		!/^[0-9a-f]{64}$/.test(env.receiptHash ?? '') ||
-		!/^[0-9a-f]{64}$/.test(env.encryptionKey ?? '') ||
-		!Array.isArray(env.transports) ||
-		typeof env.expiresAt !== 'number'
-	) {
-		throw new Error('payment request is malformed');
+		const raw = Buffer.from(encoded, 'base64url');
+		const r = new ByteReader(raw);
+		const v = r.u8();
+		if (v !== 2) {
+			throw new Error(`unsupported payment request version ${v}`);
+		}
+		const requestId = r.take(16).toString('hex');
+		const receiverNodeId = r.take(33).toString('hex');
+		const expiresAt = r.take(6).readUIntBE(0, 6);
+		const flags = r.u8();
+		const amountSat =
+			flags & 1 ? Number(r.take(8).readBigUInt64BE()) : undefined;
+		const receiptHash = r.take(32).toString('hex');
+		const encryptionKey = r.take(32).toString('hex');
+		const count = r.u8();
+		const transports: IDfTransportDescriptor[] = [];
+		for (let i = 0; i < count; i++) {
+			const tag = r.u8();
+			if (tag === 1) {
+				const host = r.take(r.u8()).toString('utf8');
+				transports.push({ type: 'ln', host, port: r.u16() });
+			} else if (tag === 2) {
+				const host = r.take(r.u8()).toString('utf8');
+				const port = r.u16();
+				const intro = r.take(33).toString('hex');
+				const blinding = r.take(33).toString('hex');
+				const hopCount = r.u8();
+				const hops: Array<{ id: string; data: string }> = [];
+				for (let h = 0; h < hopCount; h++) {
+					const id = r.take(33).toString('hex');
+					hops.push({ id, data: r.take(r.u16()).toString('hex') });
+				}
+				transports.push({
+					type: 'onion',
+					host,
+					port,
+					path: { intro, blinding, hops }
+				});
+			} else if (tag === 3) {
+				const nodeId = r.take(33).toString('hex');
+				const host = r.take(r.u8()).toString('utf8');
+				transports.push({ type: 'lsp', nodeId, host, port: r.u16() });
+			} else if (tag === 4) {
+				transports.push({
+					type: 'swarm',
+					rendezvous: r.take(32).toString('hex'),
+					noiseKey: r.take(32).toString('hex')
+				});
+			} else {
+				throw new Error('payment request is malformed');
+			}
+		}
+		sigBytes = Buffer.from(r.take(65));
+		if (r.remaining() !== 0) {
+			throw new Error('payment request is malformed');
+		}
+		env = {
+			v: 2,
+			requestId,
+			receiverNodeId,
+			expiresAt,
+			...(amountSat !== undefined ? { amountSat } : {}),
+			receiptHash,
+			encryptionKey,
+			transports
+		};
+	} catch (e) {
+		const msg = (e as Error).message;
+		throw new Error(
+			msg.startsWith('unsupported') ? msg : 'payment request is not decodable'
+		);
 	}
 	if (Date.now() > env.expiresAt) {
 		throw new Error('payment request has expired; ask the receiver for a fresh one');
 	}
-	const verdict = verifyMessageSignature(
-		canonicalRequestMessage(env),
-		env.sig
-	);
+	const sig = zbase32Encode(sigBytes);
+	const verdict = verifyMessageSignature(canonicalRequestMessage(env), sig);
 	if (!verdict.valid || !verdict.pubkey) {
 		throw new Error('payment request signature is invalid');
 	}
@@ -131,7 +284,7 @@ export function decodeAndVerifyRequestEnvelope(
 			'payment request signature does not match the receiver it names'
 		);
 	}
-	return env;
+	return { ...env, sig };
 }
 
 // ─────────────── Per-request encryption ───────────────
