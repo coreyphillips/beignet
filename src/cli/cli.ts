@@ -447,6 +447,7 @@ async function handleStart(): Promise<void> {
 			preferAnchors: config.preferAnchors,
 			largeChannels: config.largeChannels,
 			trustedZeroConfSplice: config.trustedZeroConfSplice,
+			swarm: config.swarm,
 			jitReceive: config.jitReceive?.enabled
 				? {
 						enabled: true,

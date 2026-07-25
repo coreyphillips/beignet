@@ -125,6 +125,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_TRUSTED_ZERO_CONF_SPLICE === 'true'
 				: undefined) ??
 			file.trustedZeroConfSplice,
+		swarm:
+			cliFlags.swarm ??
+			(process.env.BEIGNET_SWARM !== undefined
+				? process.env.BEIGNET_SWARM === 'true'
+				: undefined) ??
+			file.swarm,
 		jitReceive:
 			cliFlags.jitReceive ??
 			(process.env.BEIGNET_JIT_RECEIVE !== undefined

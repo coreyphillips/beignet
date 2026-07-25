@@ -94,6 +94,7 @@
     "bitcoin-units": "0.3.0",
     "bitcoinjs-lib": "6.1.4",
     "ecpair": "2.1.0",
+    "hyperswarm": "^4.17.0",
     "lodash.clonedeep": "4.5.0",
     "net": "1.0.2",
     "rn-electrum-client": "0.0.22",

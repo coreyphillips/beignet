@@ -1,5 +1,6 @@
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
+import * as crypto from 'crypto';
 import { ECPairFactory } from 'ecpair';
 import { BeignetNode } from './beignet-node';
 import { BeignetCustomSubtype } from '../lightning/message/custom';
@@ -9,6 +10,8 @@ import {
 	scriptKind,
 	taprootTweakPrivateKey
 } from '../lightning/wallet/wallet-funding-provider';
+import { createFundingScript } from '../lightning/script/funding';
+import { verifyMessageSignature } from '../lightning/crypto/message-signing';
 import { ILeaseRates } from '../lightning/gossip/types';
 
 bitcoin.initEccLib(ecc);
@@ -30,16 +33,57 @@ const ECPair = ECPairFactory(ecc);
  *     │<── SIGN_REQUEST ─────┤ negotiated raw tx        │
  *     │  verify + sign       │                          │
  *     ├──── WITNESS ────────>│ merge → tx_signatures    │
- *     │                      │ broadcast — ONE chain tx │
+ *     │<──── RECEIPT ────────┤ broadcast — ONE chain tx │
  *
- * Trust stance (beignet↔beignet only): the sender verifies its own input and
- * change in the exact tx it signs, and checks the recipient's node-key
- * attestation over the funding output; witness withholding just times the
- * session out. All payloads are JSON over the single odd custom message type,
- * so non-beignet peers silently ignore the whole protocol.
+ * Trust stance: the sender verifies, in the EXACT transaction it signs, that
+ * (a) its own input and change are honest, and (b) the funding output is the
+ * 2-of-2 attested by the recipient's NODE key — which must be the node the
+ * payment request named. Delivery is then chain-atomic: the transaction
+ * either confirms with the sats inside the recipient's channel, or nothing
+ * moves. The receipt preimage (revealed after broadcast, against the hash
+ * the request carried) is a provable delivery receipt on top.
+ *
+ * All payloads are JSON over the single odd custom message type (or a swarm
+ * socket carrying the same frames), so non-beignet peers ignore the whole
+ * protocol and legacy senders just pay the plain address.
  */
 
-/** Message payloads (JSON over custom subtypes 16-19). */
+/**
+ * A duplex lane for direct-funding frames. Lightning custom messages when
+ * the peers share a connection; a hyperswarm socket when the sender only
+ * knows the recipient's pubkey from the payment request.
+ */
+export interface DfTransport {
+	send(subtype: number, payload: object): void;
+	/** Subscribe to inbound frames; returns the unsubscribe. */
+	onMessage(cb: (subtype: number, payload: Buffer) => void): () => void;
+}
+
+/** Direct-funding frames over an existing Lightning peer connection. */
+export function lnTransport(node: BeignetNode, peerPubkey: string): DfTransport {
+	return {
+		send: (subtype, payload) =>
+			node.lightningNode.sendCustomMessage(
+				peerPubkey,
+				subtype,
+				Buffer.from(JSON.stringify(payload), 'utf8')
+			),
+		onMessage: (cb) => {
+			const onMsg = (msg: {
+				peerPubkey: string;
+				subtype: number;
+				payload: Buffer;
+			}): void => {
+				if (msg.peerPubkey !== peerPubkey) return;
+				cb(msg.subtype, msg.payload);
+			};
+			node.lightningNode.on('custom-message', onMsg);
+			return () => node.lightningNode.removeListener('custom-message', onMsg);
+		}
+	};
+}
+
+/** Message payloads (JSON over custom subtypes 16-21). */
 interface OfferMsg {
 	offerId: string;
 	amountSat: number;
@@ -54,6 +98,9 @@ interface OfferMsg {
 		pubkeyHex: string;
 		sigHex: string;
 	};
+	/** Hash from the payment request; the receiver must hold its preimage
+	 *  and reveals it after broadcast as the delivery receipt. */
+	receiptHashHex?: string;
 }
 
 interface AckMsg {
@@ -84,6 +131,12 @@ interface WitnessMsg {
 	witnessHex: string[];
 }
 
+interface ReceiptMsg {
+	offerId: string;
+	preimageHex: string;
+	fundingTxidHex: string;
+}
+
 /** The exact string a recipient's node key signs for an attestation. */
 function attestationMessage(
 	offerId: string,
@@ -111,6 +164,7 @@ function ownershipMessage(
 }
 
 const OFFER_TIMEOUT_MS = 60_000;
+const RECEIPT_TIMEOUT_MS = 20_000;
 
 /** Buyer-side price ceiling used when the receiver buys inbound alongside. */
 export const DEFAULT_MAX_LEASE_RATES: ILeaseRates = {
@@ -121,37 +175,44 @@ export const DEFAULT_MAX_LEASE_RATES: ILeaseRates = {
 	channelFeeMaxProportionalThousandths: 3
 };
 
-function send(
-	node: BeignetNode,
-	peer: string,
-	subtype: number,
-	payload: object
-): void {
-	node.lightningNode.sendCustomMessage(
-		peer,
-		subtype,
-		Buffer.from(JSON.stringify(payload), 'utf8')
-	);
-}
-
 // ─────────────── Sender side ───────────────
+
+export interface IDirectFundingSendResult {
+	offerId: string;
+	spentTxid: string;
+	fundingTxid?: string;
+	/** True once the recipient's node-key attestation over the funding output
+	 *  verified against the pubkey the payment request named. */
+	attested: boolean;
+	/** The delivery receipt: preimage of the request's receipt hash, revealed
+	 *  by the receiver after broadcast. Null when no hash was in play or the
+	 *  receipt did not arrive in time (delivery is still chain-atomic). */
+	receiptPreimageHex: string | null;
+}
 
 /**
  * Fund the recipient's channel directly from one of our UTXOs. Resolves once
- * our witness is delivered (the recipient broadcasts). Throws when we lack a
- * single UTXO covering the amount, or the recipient declines/times out.
+ * our witness is delivered and the receipt (when requested) arrives. Throws
+ * when we lack a single UTXO covering the amount, the recipient declines or
+ * times out, or the sign request fails verification — in every throw path
+ * nothing was signed or spent.
  */
 export async function sendDirectFunding(
 	node: BeignetNode,
 	network: bitcoin.Network,
-	recipientPubkey: string,
-	amountSat: number,
-	feeHeadroomSat: number
-): Promise<{ offerId: string; spentTxid: string; fundingTxid?: string }> {
+	transport: DfTransport,
+	opts: {
+		/** Node the payment request named; the attestation MUST verify to it. */
+		recipientPubkey: string;
+		amountSat: number;
+		feeHeadroomSat: number;
+		receiptHashHex?: string;
+	}
+): Promise<IDirectFundingSendResult> {
+	const { recipientPubkey, amountSat, feeHeadroomSat } = opts;
 	const wallet = node.onchainWallet;
-	// The funding txid is known the moment we sign the negotiated tx; returned
-	// so the sender can show WHICH transaction became the recipient's channel.
 	let fundingTxid: string | undefined;
+	let attested = false;
 
 	// One UTXO covering amount + our fee share (no multi-input offers).
 	const utxo = (wallet.listUtxos() ?? [])
@@ -200,20 +261,18 @@ export async function sendDirectFunding(
 	const scriptCode = bitcoin.payments.p2pkh({ pubkey, network }).output!;
 	const prevTxid = bitcoin.Transaction.fromHex(prevTxHex).getHash();
 
-	const done = new Promise<void>((resolve, reject) => {
+	const done = new Promise<string | null>((resolve, reject) => {
+		let witnessSent = false;
 		const timer = setTimeout(() => {
 			cleanup();
-			reject(new Error('direct funding timed out'));
+			if (witnessSent) resolve(null);
+			else reject(new Error('direct funding timed out'));
 		}, OFFER_TIMEOUT_MS);
-		const onMsg = (msg: {
-			peerPubkey: string;
-			subtype: number;
-			payload: Buffer;
-		}): void => {
-			if (msg.peerPubkey !== recipientPubkey) return;
+		let receiptTimer: NodeJS.Timeout | undefined;
+		const unsubscribe = transport.onMessage((subtype, payload) => {
 			try {
-				if (msg.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK) {
-					const ack = JSON.parse(msg.payload.toString('utf8')) as AckMsg;
+				if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK) {
+					const ack = JSON.parse(payload.toString('utf8')) as AckMsg;
 					if (ack.offerId !== offerId) return;
 					if (!ack.accepted) {
 						cleanup();
@@ -221,100 +280,169 @@ export async function sendDirectFunding(
 					}
 					return; // accepted — wait for the sign request
 				}
-				if (msg.subtype === BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST) {
-					const req = JSON.parse(
-						msg.payload.toString('utf8')
-					) as SignRequestMsg;
-					if (req.offerId !== offerId) return;
-					const tx = bitcoin.Transaction.fromHex(req.rawTxHex);
-					fundingTxid = tx.getId();
-
-					// Verify OUR input is spent by this exact tx…
-					const ourIndex = tx.ins.findIndex(
-						(i) =>
-							Buffer.from(i.hash).equals(prevTxid) && i.index === utxo.tx_pos
-					);
-					if (ourIndex < 0) {
-						cleanup();
-						reject(new Error('negotiated tx does not spend our input'));
-						return;
-					}
-					// …and our change comes back: everything above amount + a bounded
-					// fee must return to our change script.
-					const changeValue = tx.outs
-						.filter((o) => o.script.equals(changeScript))
-						.reduce((s, o) => s + Number(o.value), 0);
-					const minChange = utxo.value - amountSat - feeHeadroomSat;
-					if (minChange > 294 && changeValue < minChange) {
-						cleanup();
-						reject(
-							new Error(
-								`negotiated tx shorts our change: got ${changeValue}, expected >= ${minChange}`
-							)
-						);
-						return;
-					}
-
-					let witnessHex: string[];
-					if (kind === 'p2tr') {
-						// BIP 341 sighash needs every input's prevout — the recipient
-						// supplied them; verify OUR entry against our own UTXO before
-						// trusting the rest.
-						const prevouts = req.prevouts ?? [];
-						if (
-							prevouts.length !== tx.ins.length ||
-							prevouts[ourIndex]?.scriptHex !== ourScript.toString('hex') ||
-							prevouts[ourIndex]?.valueSat !== utxo.value
-						) {
-							cleanup();
-							reject(new Error('sign request prevouts do not match our input'));
-							return;
-						}
-						const sighash = tx.hashForWitnessV1(
-							ourIndex,
-							prevouts.map((o) => Buffer.from(o.scriptHex, 'hex')),
-							prevouts.map((o) => o.valueSat),
-							bitcoin.Transaction.SIGHASH_DEFAULT
-						);
-						const tweaked = taprootTweakPrivateKey(privKey, pubkey);
-						witnessHex = [
-							Buffer.from(ecc.signSchnorr(sighash, tweaked)).toString('hex')
-						];
-					} else {
-						const sighash = tx.hashForWitnessV0(
-							ourIndex,
-							scriptCode,
-							utxo.value,
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						const der = bitcoin.script.signature.encode(
-							Buffer.from(ecc.sign(sighash, privKey)),
-							bitcoin.Transaction.SIGHASH_ALL
-						);
-						witnessHex = [der.toString('hex'), pubkey.toString('hex')];
-					}
-					send(
-						node,
-						recipientPubkey,
-						BeignetCustomSubtype.DIRECT_FUNDING_WITNESS,
-						{
-							offerId,
-							witnessHex
-						} as WitnessMsg
-					);
+				if (subtype === BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT) {
+					const r = JSON.parse(payload.toString('utf8')) as ReceiptMsg;
+					if (r.offerId !== offerId || !opts.receiptHashHex) return;
+					const hash = bitcoin.crypto
+						.sha256(Buffer.from(r.preimageHex, 'hex'))
+						.toString('hex');
+					if (hash !== opts.receiptHashHex) return; // forged receipt: ignore
 					cleanup();
-					resolve();
+					resolve(r.preimageHex);
+					return;
 				}
+				if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST) {
+					return;
+				}
+				const req = JSON.parse(payload.toString('utf8')) as SignRequestMsg;
+				if (req.offerId !== offerId) return;
+				const tx = bitcoin.Transaction.fromHex(req.rawTxHex);
+
+				// Verify OUR input is spent by this exact tx…
+				const ourIndex = tx.ins.findIndex(
+					(i) =>
+						Buffer.from(i.hash).equals(prevTxid) && i.index === utxo.tx_pos
+				);
+				if (ourIndex < 0) {
+					cleanup();
+					reject(new Error('negotiated tx does not spend our input'));
+					return;
+				}
+				// …our change comes back: everything above amount + a bounded
+				// fee must return to our change script…
+				const changeValue = tx.outs
+					.filter((o) => o.script.equals(changeScript))
+					.reduce((s, o) => s + Number(o.value), 0);
+				const minChange = utxo.value - amountSat - feeHeadroomSat;
+				if (minChange > 294 && changeValue < minChange) {
+					cleanup();
+					reject(
+						new Error(
+							`negotiated tx shorts our change: got ${changeValue}, expected >= ${minChange}`
+						)
+					);
+					return;
+				}
+				// …and the funding output is the recipient's channel: the exact
+				// 2-of-2 built from the attested funding pubkeys, holding at
+				// least the amount we are paying, signed by the NODE the payment
+				// request named. Without this, "delivery" would be a claim; with
+				// it, the transaction we sign is delivery by construction.
+				const att = req.attestation;
+				if (!att) {
+					cleanup();
+					reject(new Error('sign request carries no recipient attestation'));
+					return;
+				}
+				const fundingOut = tx.outs[att.fundingOutputIndex];
+				const expected = createFundingScript(
+					Buffer.from(att.localFundingPubkeyHex, 'hex'),
+					Buffer.from(att.remoteFundingPubkeyHex, 'hex'),
+					network
+				);
+				if (
+					!fundingOut ||
+					!Buffer.from(fundingOut.script).equals(expected.p2wshOutput)
+				) {
+					cleanup();
+					reject(new Error('funding output does not match the attested 2-of-2'));
+					return;
+				}
+				if (Number(fundingOut.value) < amountSat) {
+					cleanup();
+					reject(new Error('funding output holds less than the amount paid'));
+					return;
+				}
+				const verdict = verifyMessageSignature(
+					attestationMessage(
+						offerId,
+						req.rawTxHex,
+						att.fundingOutputIndex,
+						att.localFundingPubkeyHex
+					),
+					att.sigHex
+				);
+				if (!verdict.valid || !verdict.pubkey) {
+					cleanup();
+					reject(new Error('recipient attestation signature is invalid'));
+					return;
+				}
+				if (verdict.pubkey.toString('hex') !== recipientPubkey) {
+					cleanup();
+					reject(
+						new Error(
+							'attestation signed by a different node than the payment request named'
+						)
+					);
+					return;
+				}
+				attested = true;
+				fundingTxid = tx.getId();
+
+				let witnessHex: string[];
+				if (kind === 'p2tr') {
+					// BIP 341 sighash needs every input's prevout — the recipient
+					// supplied them; verify OUR entry against our own UTXO before
+					// trusting the rest.
+					const prevouts = req.prevouts ?? [];
+					if (
+						prevouts.length !== tx.ins.length ||
+						prevouts[ourIndex]?.scriptHex !== ourScript.toString('hex') ||
+						prevouts[ourIndex]?.valueSat !== utxo.value
+					) {
+						cleanup();
+						reject(new Error('sign request prevouts do not match our input'));
+						return;
+					}
+					const sighash = tx.hashForWitnessV1(
+						ourIndex,
+						prevouts.map((o) => Buffer.from(o.scriptHex, 'hex')),
+						prevouts.map((o) => o.valueSat),
+						bitcoin.Transaction.SIGHASH_DEFAULT
+					);
+					const tweaked = taprootTweakPrivateKey(privKey, pubkey);
+					witnessHex = [
+						Buffer.from(ecc.signSchnorr(sighash, tweaked)).toString('hex')
+					];
+				} else {
+					const sighash = tx.hashForWitnessV0(
+						ourIndex,
+						scriptCode,
+						utxo.value,
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					const der = bitcoin.script.signature.encode(
+						Buffer.from(ecc.sign(sighash, privKey)),
+						bitcoin.Transaction.SIGHASH_ALL
+					);
+					witnessHex = [der.toString('hex'), pubkey.toString('hex')];
+				}
+				transport.send(BeignetCustomSubtype.DIRECT_FUNDING_WITNESS, {
+					offerId,
+					witnessHex
+				} as WitnessMsg);
+				witnessSent = true;
+				if (!opts.receiptHashHex) {
+					cleanup();
+					resolve(null);
+					return;
+				}
+				// Witness delivered; give the receipt its own (shorter) window.
+				clearTimeout(timer);
+				receiptTimer = setTimeout(() => {
+					cleanup();
+					resolve(null); // delivery already chain-atomic; receipt is bonus
+				}, RECEIPT_TIMEOUT_MS);
 			} catch (e) {
 				cleanup();
 				reject(e);
 			}
-		};
+		});
 		const cleanup = (): void => {
 			clearTimeout(timer);
-			node.lightningNode.removeListener('custom-message', onMsg);
+			if (receiptTimer) clearTimeout(receiptTimer);
+			unsubscribe();
 		};
-		node.lightningNode.on('custom-message', onMsg);
 	});
 
 	// Input-ownership proof: sign the offer context with the key that
@@ -334,7 +462,7 @@ export async function sendDirectFunding(
 					sigHex: Buffer.from(ecc.sign(ownMsg, privKey)).toString('hex')
 			  };
 
-	send(node, recipientPubkey, BeignetCustomSubtype.DIRECT_FUNDING_OFFER, {
+	transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER, {
 		offerId,
 		amountSat,
 		prevTxHex,
@@ -342,11 +470,18 @@ export async function sendDirectFunding(
 		valueSat: utxo.value,
 		sequence: 0xfffffffd,
 		changeScriptHex: changeScript.toString('hex'),
-		ownership
+		ownership,
+		...(opts.receiptHashHex ? { receiptHashHex: opts.receiptHashHex } : {})
 	} as OfferMsg);
 
-	await done;
-	return { offerId, spentTxid: utxo.tx_hash, fundingTxid };
+	const receiptPreimageHex = await done;
+	return {
+		offerId,
+		spentTxid: utxo.tx_hash,
+		fundingTxid,
+		attested,
+		receiptPreimageHex
+	};
 }
 
 // ─────────────── Recipient side ───────────────
@@ -355,15 +490,20 @@ export interface IDirectFundingReceiverDeps {
 	getLspPubkey: () => string | undefined;
 	/** Inbound to BUY from the LSP alongside (0 = plain v2, nothing bought). */
 	getTargetInboundSat: () => number;
+	/** Negotiate option_zeroconf into the open (LSP must trust this node). */
+	getTrusted: () => boolean;
+	/** Preimage (hex) for a receipt hash this node handed out, if any. */
+	getReceiptPreimage: (hashHex: string) => string | undefined;
+	onReceiptUsed?: (hashHex: string) => void;
 	network: bitcoin.Network;
 	maxLeaseRates?: ILeaseRates;
 	onEvent?: (kind: string, detail: string) => void;
 }
 
 /**
- * Handle inbound FUNDING_OFFERs: turn the sender's UTXO into our channel
- * funding via a v2 open to the LSP (sender's input marked external), then
- * relay the sign request/witness. Call once at daemon startup.
+ * Handle inbound FUNDING_OFFERs arriving over the Lightning peer transport.
+ * Call once at daemon startup; swarm connections route into the same
+ * handleOffer with their own transport.
  */
 export function attachDirectFundingReceiver(
 	node: BeignetNode,
@@ -373,29 +513,47 @@ export function attachDirectFundingReceiver(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
 			if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void handleOffer(node, deps, msg.peerPubkey, msg.payload).catch((e) => {
+			void handleOffer(
+				node,
+				deps,
+				lnTransport(node, msg.peerPubkey),
+				msg.payload
+			).catch((e) => {
 				deps.onEvent?.('direct-funding-failed', e.message);
 			});
 		}
 	);
 }
 
-async function handleOffer(
+/**
+ * Turn a sender's offered UTXO into our channel funding via a v2 open to the
+ * LSP (sender's input marked external), relay the sign request/witness, and
+ * reveal the receipt preimage after broadcast.
+ */
+export async function handleOffer(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps,
-	senderPubkey: string,
+	transport: DfTransport,
 	payload: Buffer
 ): Promise<void> {
 	const offer = JSON.parse(payload.toString('utf8')) as OfferMsg;
 	const lsp = deps.getLspPubkey();
 	const ack = (accepted: boolean, reason?: string): void =>
-		send(node, senderPubkey, BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK, {
+		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_OFFER_ACK, {
 			offerId: offer.offerId,
 			accepted,
 			...(reason ? { reason } : {})
 		} as AckMsg);
 
 	if (!lsp) return ack(false, 'no liquidity peer');
+	// A receipt hash we never handed out means the sender is paying a request
+	// that is not ours (or a stale one): decline before any channel work.
+	const receiptPreimage = offer.receiptHashHex
+		? deps.getReceiptPreimage(offer.receiptHashHex)
+		: undefined;
+	if (offer.receiptHashHex && !receiptPreimage) {
+		return ack(false, 'unknown receipt hash');
+	}
 	const prevTx = bitcoin.Transaction.fromHex(offer.prevTxHex);
 	const out = prevTx.outs[offer.vout];
 	if (!out || Number(out.value) !== offer.valueSat) {
@@ -460,6 +618,9 @@ async function handleOffer(
 	const targetInboundSat = deps.getTargetInboundSat();
 	const channel = node.lightningNode.openChannelV2(lsp, {
 		fundingSatoshis: BigInt(offer.amountSat),
+		// Zero-conf is explicit opt-in (upstream semantics): negotiated into
+		// the channel type only when the LSP trusts this node.
+		...(deps.getTrusted() ? { trusted: true } : {}),
 		// Buying inbound alongside is optional: a primary that does not sell
 		// leases still accepts the plain v2 open.
 		...(targetInboundSat > 0
@@ -520,7 +681,7 @@ async function handleOffer(
 			valueSat: Number(sourceOut.value)
 		};
 	});
-	send(node, senderPubkey, BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST, {
+	transport.send(BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST, {
 		offerId: offer.offerId,
 		rawTxHex: rawTx.toHex(),
 		prevouts,
@@ -545,15 +706,10 @@ async function handleOffer(
 			cleanup();
 			reject(new Error('sender never delivered its witness'));
 		}, OFFER_TIMEOUT_MS);
-		const onMsg = (msg: {
-			peerPubkey: string;
-			subtype: number;
-			payload: Buffer;
-		}): void => {
-			if (msg.peerPubkey !== senderPubkey) return;
-			if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_WITNESS) return;
+		const unsubscribe = transport.onMessage((subtype, msgPayload) => {
+			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_WITNESS) return;
 			try {
-				const w = JSON.parse(msg.payload.toString('utf8')) as WitnessMsg;
+				const w = JSON.parse(msgPayload.toString('utf8')) as WitnessMsg;
 				if (w.offerId !== offer.offerId) return;
 				node.lightningNode.provideV2ExternalWitness(
 					lsp,
@@ -568,17 +724,38 @@ async function handleOffer(
 				cleanup();
 				reject(e);
 			}
-		};
+		});
 		const cleanup = (): void => {
 			clearTimeout(timer);
-			node.lightningNode.removeListener('custom-message', onMsg);
+			unsubscribe();
 		};
-		node.lightningNode.on('custom-message', onMsg);
 	});
+
+	// Broadcast is on its way; reveal the receipt preimage — the sender's
+	// provable delivery receipt against the hash its payment request carried.
+	if (offer.receiptHashHex && receiptPreimage) {
+		const fundingTxidHex = Buffer.from(chanState.fundingTxid!)
+			.reverse()
+			.toString('hex');
+		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT, {
+			offerId: offer.offerId,
+			preimageHex: receiptPreimage,
+			fundingTxidHex
+		} as ReceiptMsg);
+		deps.onReceiptUsed?.(offer.receiptHashHex);
+	}
 	deps.onEvent?.(
 		'channelized',
 		'direct funding complete — one transaction, funds are lightning-ready'
 	);
+}
+
+/** DHT topic a node listens on for direct-funding connections by pubkey. */
+export function dfTopic(nodePubkeyHex: string): Buffer {
+	return crypto
+		.createHash('sha256')
+		.update(`beignet-direct-funding:${nodePubkeyHex}`)
+		.digest();
 }
 
 /** Rebuild the negotiated tx exactly as the channel does (serial-id order). */

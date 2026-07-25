@@ -18,10 +18,14 @@ import { PaymentQueue } from './payment-queue';
 import { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
 import * as bitcoinjs from 'bitcoinjs-lib';
+import * as nodeCrypto from 'crypto';
 import {
 	attachDirectFundingReceiver,
-	sendDirectFunding
+	sendDirectFunding,
+	lnTransport,
+	IDirectFundingReceiverDeps
 } from './direct-funding';
+import { startSwarmReceiver, swarmConnect } from './swarm-transport';
 import {
 	ApiKeyAuthenticator,
 	ApiKeyDefinition,
@@ -49,6 +53,9 @@ export interface DaemonOptions extends BeignetNodeOptions {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Announce on a DHT topic derived from the node pubkey so senders can
+	 *  reach this node for direct funding with the pubkey alone. */
+	swarm?: boolean;
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
@@ -250,71 +257,131 @@ export async function startDaemon(
 	// startup and answers offers as soon as an LSP is configured (at runtime,
 	// via POST /direct-funding/configure). A beignet-aware sender's onchain
 	// payment then becomes this node's channel-funding transaction directly.
-	const directFundingState: { lspPubkey?: string; targetInboundSat: number } =
-		{ targetInboundSat: 0 };
+	// Receipt hashes minted via /direct-funding/request live here until their
+	// preimage is revealed as the delivery receipt.
+	const directFundingState: {
+		lspPubkey?: string;
+		targetInboundSat: number;
+		trusted: boolean;
+		receipts: Map<string, string>;
+	} = { targetInboundSat: 0, trusted: false, receipts: new Map() };
 	const btcNetwork =
 		opts.network === 'mainnet'
 			? bitcoinjs.networks.bitcoin
 			: opts.network === 'testnet'
 			? bitcoinjs.networks.testnet
 			: bitcoinjs.networks.regtest;
-	attachDirectFundingReceiver(node, {
+	const directFundingDeps: IDirectFundingReceiverDeps = {
 		getLspPubkey: () => directFundingState.lspPubkey,
 		getTargetInboundSat: () => directFundingState.targetInboundSat,
+		getTrusted: () => directFundingState.trusted,
+		getReceiptPreimage: (hashHex) => directFundingState.receipts.get(hashHex),
+		onReceiptUsed: (hashHex) => directFundingState.receipts.delete(hashHex),
 		network: btcNetwork,
 		onEvent: (kind, detail) => {
 			process.stderr.write(`direct-funding ${kind}: ${detail}\n`);
 		}
-	});
+	};
+	attachDirectFundingReceiver(node, directFundingDeps);
+	// Swarm listener (opt-in): announce on a DHT topic derived from the node
+	// pubkey, so senders holding only the pubkey from a payment request can
+	// reach this node with no dialable address.
+	if (opts.swarm) {
+		try {
+			startSwarmReceiver(node, directFundingDeps, node.getInfo().nodeId, (l) =>
+				process.stderr.write(`${l}\n`)
+			);
+		} catch (err) {
+			process.stderr.write(
+				`swarm listener failed to start: ${(err as Error).message}\n`
+			);
+		}
+	}
 
 	const routes: Record<string, RouteHandler> = {
 		// ── Direct funding (1-tx receive) ──
 		'POST /direct-funding/configure': (body) => {
-			const { lspPubkey, targetInboundSat } = body as {
+			const { lspPubkey, targetInboundSat, trusted } = body as {
 				lspPubkey?: string;
 				targetInboundSat?: number;
+				/** Negotiate option_zeroconf into direct-funded opens (the LSP
+				 *  must trust this node). */
+				trusted?: boolean;
 			};
 			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
 			directFundingState.lspPubkey = lspPubkey;
 			if (targetInboundSat !== undefined) {
 				directFundingState.targetInboundSat = targetInboundSat;
 			}
+			if (trusted !== undefined) directFundingState.trusted = trusted;
 			return success({
 				lspPubkey: directFundingState.lspPubkey,
-				targetInboundSat: directFundingState.targetInboundSat
+				targetInboundSat: directFundingState.targetInboundSat,
+				trusted: directFundingState.trusted
 			});
 		},
 		'GET /direct-funding/config': () =>
 			success({
 				lspPubkey: directFundingState.lspPubkey ?? null,
-				targetInboundSat: directFundingState.targetInboundSat
+				targetInboundSat: directFundingState.targetInboundSat,
+				trusted: directFundingState.trusted
 			}),
+		// Mint a receipt hash for an onchain payment request. The preimage
+		// stays here; a beignet sender's direct funding carrying this hash is
+		// answered with the preimage after broadcast — a provable delivery
+		// receipt bound to the request.
+		'POST /direct-funding/request': () => {
+			const preimage = nodeCrypto.randomBytes(32);
+			const hash = nodeCrypto
+				.createHash('sha256')
+				.update(preimage)
+				.digest('hex');
+			directFundingState.receipts.set(hash, preimage.toString('hex'));
+			return success({ paymentHash: hash });
+		},
 		// Sender side: pay a beignet recipient onchain by funding their channel
 		// directly from one of our UTXOs — one transaction, no deposit hop.
+		// With host+port the frames ride a Lightning peer connection; with only
+		// the pubkey the recipient is found on the DHT by topic.
 		'POST /direct-funding/send': async (body) => {
-			const { pubkey, host, port, amountSats, feeHeadroomSats } = body as {
-				pubkey?: string;
-				host?: string;
-				port?: number;
-				amountSats?: number;
-				feeHeadroomSats?: number;
-			};
+			const { pubkey, host, port, amountSats, feeHeadroomSats, receiptHash } =
+				body as {
+					pubkey?: string;
+					host?: string;
+					port?: number;
+					amountSats?: number;
+					feeHeadroomSats?: number;
+					receiptHash?: string;
+				};
 			if (!pubkey || amountSats === undefined)
 				return failure('INVALID_PARAMS', 'pubkey and amountSats required');
+			const sendOpts = {
+				recipientPubkey: pubkey,
+				amountSat: amountSats,
+				feeHeadroomSat: feeHeadroomSats ?? 1000,
+				...(receiptHash ? { receiptHashHex: receiptHash } : {})
+			};
 			if (host && port) {
 				await node.connectPeer(pubkey, host, port).catch(() => {
 					/* may already be connected */
 				});
+				return success(
+					await sendDirectFunding(
+						node,
+						btcNetwork,
+						lnTransport(node, pubkey),
+						sendOpts
+					)
+				);
 			}
-			return success(
-				await sendDirectFunding(
-					node,
-					btcNetwork,
-					pubkey,
-					amountSats,
-					feeHeadroomSats ?? 1000
-				)
-			);
+			const { transport, close } = await swarmConnect(pubkey);
+			try {
+				return success(
+					await sendDirectFunding(node, btcNetwork, transport, sendOpts)
+				);
+			} finally {
+				void close();
+			}
 		},
 		'GET /info': () => success(node.getInfo()),
 		'GET /mnemonic': () => {

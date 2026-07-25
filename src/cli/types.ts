@@ -414,6 +414,12 @@ export interface BeignetConfig {
 	 */
 	trustedZeroConfSplice?: boolean;
 	/**
+	 * Announce this node on a DHT topic derived from its pubkey so beignet
+	 * senders holding only the pubkey from a payment request can reach it for
+	 * direct funding (hyperswarm; NAT hole-punching included).
+	 */
+	swarm?: boolean;
+	/**
 	 * JIT receive, LSP role: intercept HTLCs on synthetic SCIDs registered by
 	 * wallet peers, open a zero-conf channel to them, forward, and deduct the
 	 * LSPS2-style opening fee. Numbers here (config/env level) are converted

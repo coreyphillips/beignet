@@ -26,7 +26,10 @@ export enum BeignetCustomSubtype {
 	DIRECT_FUNDING_OFFER_ACK = 17,
 	DIRECT_FUNDING_SIGN_REQUEST = 18,
 	DIRECT_FUNDING_WITNESS = 19,
-	DIRECT_FUNDING_ABORT = 20
+	DIRECT_FUNDING_ABORT = 20,
+	/** Receiver → sender after broadcast: reveals the preimage of the receipt
+	 *  hash the sender's offer carried, a provable delivery receipt. */
+	DIRECT_FUNDING_RECEIPT = 21
 }
 
 export interface ICustomMessage {
