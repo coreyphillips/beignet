@@ -321,7 +321,7 @@ export async function startDaemon(
 		directFundingState.receipts.delete(hashHex);
 		directFundingState.requestsById.delete(entry.requestId);
 		if (swarmReceiver) {
-			void swarmReceiver.leave(rendezvousTopic(entry.rendezvousSecretHex));
+			swarmReceiver.removeRequest(rendezvousTopic(entry.rendezvousSecretHex));
 		}
 	};
 	const pruneExpiredRequests = (): void => {
@@ -477,10 +477,14 @@ export async function startDaemon(
 				});
 			}
 			if (swarmReceiver) {
+				// A fresh Noise identity (and DHT node) exists for this request
+				// alone; the envelope pins it, and it dies with the request.
 				transports.push({
 					type: 'swarm',
 					rendezvous: rendezvousSecretHex,
-					noiseKey: swarmReceiver.noisePublicKeyHex
+					noiseKey: swarmReceiver.addRequest(
+						rendezvousTopic(rendezvousSecretHex)
+					)
 				});
 			}
 			const unsigned: Omit<IDfRequestEnvelope, 'sig'> = {
@@ -504,9 +508,6 @@ export async function startDaemon(
 				encryptionPrivateKeyPem: encryption.privateKeyPem
 			});
 			directFundingState.requestsById.set(requestId, hash);
-			if (swarmReceiver) {
-				swarmReceiver.join(rendezvousTopic(rendezvousSecretHex));
-			}
 			return success({
 				paymentHash: hash,
 				expiresAt,

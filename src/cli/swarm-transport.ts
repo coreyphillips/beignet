@@ -69,67 +69,89 @@ export function socketTransport(socket: {
 }
 
 /**
- * Receiver side: announce on this node's topic and answer funding offers
- * arriving over swarm sockets. Returns a stop handle.
+ * Receiver side: one Hyperswarm instance PER OUTSTANDING REQUEST, each with
+ * a fresh Noise keypair and its own DHT node. Two of this wallet's requests
+ * therefore share no observable identity: an active observer who connects
+ * to both rendezvous topics meets two unrelated Noise keys, and nothing
+ * links them to each other or to the Lightning node. A wallet with no
+ * outstanding requests runs no swarm and no DHT node at all.
  */
 export interface ISwarmReceiver {
+	/** Announce a rendezvous topic under a fresh Noise identity minted for
+	 *  this request alone; returns that identity's public key (hex) for the
+	 *  envelope to pin. */
+	addRequest: (topic: Buffer) => string;
+	/** Stop announcing and schedule the request's swarm, DHT node, and
+	 *  Noise identity for teardown. The teardown is delayed a grace period
+	 *  so a receipt frame still in flight on an open socket can drain. */
+	removeRequest: (topic: Buffer) => void;
 	stop: () => Promise<void>;
-	/** This instance's Noise public key (hex). Payment requests pin it so a
-	 *  sender refuses to talk to a topic squatter. Stable across requests for
-	 *  now; per-request Noise identities are a documented later stage. */
-	noisePublicKeyHex: string;
-	/** Announce a per-request rendezvous topic. */
-	join: (topic: Buffer) => void;
-	/** Stop announcing a topic (existing sockets keep their own lifecycle;
-	 *  the request-level receipt check already rejects stale offers). */
-	leave: (topic: Buffer) => Promise<void>;
 }
+
+const TEARDOWN_GRACE_MS = 30_000;
 
 export function startSwarmReceiver(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps,
 	log: (line: string) => void
 ): ISwarmReceiver {
-	const swarm = new Hyperswarm();
-	swarm.on('connection', (socket: any) => {
-		// One swarm serves every topic; hyperswarm does not say which topic
-		// produced a connection. Requests are identified by the OFFER content
-		// (receipt hash), so the ambiguity costs nothing.
-		const transport = socketTransport(socket);
-		socket.on('error', () => {
-			/* peer went away; nothing to do */
-		});
-		transport.onMessage((subtype, payload) => {
-			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void dispatchOffer(node, deps, transport, payload, {
-				senderAnonymous: true
-			}).catch((e) => {
-				deps.onEvent?.('direct-funding-failed', e.message);
-			});
-		});
-	});
-	// No standing topic: rendezvous topics are joined per outstanding
-	// request and left on use or expiry, so this node has no static DHT
-	// presence at all.
-	log('direct-funding swarm ready (per-request rendezvous only)');
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any -- hyperswarm is untyped
+	const swarms = new Map<string, any>();
+	let stopped = false;
+	const destroySwarm = async (swarm: any): Promise<void> => {
+		try {
+			await swarm.destroy();
+		} catch {
+			/* already down */
+		}
+	};
+	log('direct-funding swarm ready (per-request rendezvous and identity)');
 	return {
-		noisePublicKeyHex: Buffer.from(swarm.keyPair.publicKey).toString('hex'),
-		join: (topic: Buffer) => {
+		addRequest: (topic: Buffer): string => {
+			if (stopped) throw new Error('swarm receiver is stopped');
+			const swarm = new Hyperswarm();
+			swarm.on('connection', (socket: any) => {
+				const transport = socketTransport(socket);
+				socket.on('error', () => {
+					/* peer went away; nothing to do */
+				});
+				transport.onMessage((subtype, payload) => {
+					if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
+					void dispatchOffer(node, deps, transport, payload, {
+						senderAnonymous: true
+					}).catch((e) => {
+						deps.onEvent?.('direct-funding-failed', e.message);
+					});
+				});
+			});
 			swarm.join(topic, { server: true, client: false });
+			swarms.set(topic.toString('hex'), swarm);
+			return Buffer.from(swarm.keyPair.publicKey).toString('hex');
 		},
-		leave: async (topic: Buffer) => {
-			try {
-				await swarm.leave(topic);
-			} catch {
-				/* already left */
-			}
+		removeRequest: (topic: Buffer): void => {
+			const key = topic.toString('hex');
+			const swarm = swarms.get(key);
+			if (!swarm) return;
+			swarms.delete(key);
+			// Stop announcing right away; destroy after a grace period so the
+			// final receipt frame can drain to a connected sender.
+			void (async () => {
+				try {
+					await swarm.leave(topic);
+				} catch {
+					/* already left */
+				}
+			})();
+			const timer = setTimeout(() => {
+				void destroySwarm(swarm);
+			}, TEARDOWN_GRACE_MS);
+			timer.unref?.();
 		},
 		stop: async () => {
-			try {
-				await swarm.destroy();
-			} catch {
-				/* already down */
-			}
+			stopped = true;
+			const all = [...swarms.values()];
+			swarms.clear();
+			await Promise.all(all.map(destroySwarm));
 		}
 	};
 }
