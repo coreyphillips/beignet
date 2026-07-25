@@ -517,7 +517,10 @@ export function attachDirectFundingReceiver(
 				node,
 				deps,
 				lnTransport(node, msg.peerPubkey),
-				msg.payload
+				msg.payload,
+				// A Lightning-connected sender has a persistent node identity;
+				// the receiver's trust configuration decides from here.
+				{ senderAnonymous: false }
 			).catch((e) => {
 				deps.onEvent?.('direct-funding-failed', e.message);
 			});
@@ -534,7 +537,15 @@ export async function handleOffer(
 	node: BeignetNode,
 	deps: IDirectFundingReceiverDeps,
 	transport: DfTransport,
-	payload: Buffer
+	payload: Buffer,
+	opts: {
+		/** True when the sender arrived over the DHT and has no identity we
+		 *  can hold anything against. Zero-conf usability is NEVER extended
+		 *  to a channel funded by an anonymous sender's unconfirmed input:
+		 *  the double-spend risk zero-conf trust accepts is the FUNDER's,
+		 *  and here the funder is the sender, not the trusted LSP. */
+		senderAnonymous: boolean;
+	}
 ): Promise<void> {
 	const offer = JSON.parse(payload.toString('utf8')) as OfferMsg;
 	const lsp = deps.getLspPubkey();
@@ -619,8 +630,10 @@ export async function handleOffer(
 	const channel = node.lightningNode.openChannelV2(lsp, {
 		fundingSatoshis: BigInt(offer.amountSat),
 		// Zero-conf is explicit opt-in (upstream semantics): negotiated into
-		// the channel type only when the LSP trusts this node.
-		...(deps.getTrusted() ? { trusted: true } : {}),
+		// the channel type only when the LSP trusts this node AND the funder
+		// is not anonymous. An anonymous sender's input could be double-spent
+		// before it confirms, so their channel waits for a confirmation.
+		...(deps.getTrusted() && !opts.senderAnonymous ? { trusted: true } : {}),
 		// Buying inbound alongside is optional: a primary that does not sell
 		// leases still accepts the plain v2 open.
 		...(targetInboundSat > 0

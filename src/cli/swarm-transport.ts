@@ -87,7 +87,9 @@ export function startSwarmReceiver(
 		});
 		transport.onMessage((subtype, payload) => {
 			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void handleOffer(node, deps, transport, payload).catch((e) => {
+			void handleOffer(node, deps, transport, payload, {
+				senderAnonymous: true
+			}).catch((e) => {
 				deps.onEvent?.('direct-funding-failed', e.message);
 			});
 		});
