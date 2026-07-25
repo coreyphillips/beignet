@@ -324,6 +324,25 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Direct-funded splice: supply a third-party sender's witness for an
+	 * external splice input and release the held tx_signatures.
+	 */
+	provideSpliceExternalWitness(
+		peerPubkey: string,
+		channel: Channel,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): void {
+		const actions = channel.provideSpliceExternalWitness(
+			prevTxid,
+			prevOutputIndex,
+			witness
+		);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
 	 * Get the next channel index (for per-channel key derivation).
 	 */
 	get nextChannelIndex(): number {

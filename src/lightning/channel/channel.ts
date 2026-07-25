@@ -356,6 +356,10 @@ export class Channel {
 	// our new commitment (adopted as remoteCommitmentSignature at completeSplice).
 	private _spliceSentCommitment = false;
 	private _spliceReceivedCommitment = false;
+	// Direct-funded splice: witnesses for external (third-party sender) splice
+	// inputs, keyed by "txid:vout" (txid internal byte order, hex). Our
+	// tx_signatures are held until every external input has one.
+	private _spliceExternalWitnesses = new Map<string, Buffer[]>();
 	// BOLT 2 v2 establishment: after both tx_completes the peers exchange
 	// commitment_signed for commitment #0 of the new funding output, and only
 	// then tx_signatures (lower-total-input-sats side first). In-memory only:
@@ -7250,6 +7254,20 @@ export class Channel {
 						wi.prevOutputIndex === vout
 				);
 				if (!w) continue;
+				if (w.external) {
+					// Third-party input (direct funding): the witness arrives
+					// out-of-band via provideSpliceExternalWitness. Apply it when
+					// present; _maybeSendSpliceTxSigs defers until it is.
+					const ext = this._spliceExternalWitnesses.get(
+						`${prevTxid.toString('hex')}:${vout}`
+					);
+					if (ext) {
+						tx.setWitness(i, ext);
+						ourWalletWitnesses.push(ext);
+						ourWalletInputIndices.push(i);
+					}
+					continue;
+				}
 				const witness = w.signWitness(tx, i, w.value, prevouts ?? undefined);
 				tx.setWitness(i, witness);
 				ourWalletWitnesses.push(witness);
@@ -8397,6 +8415,127 @@ export class Channel {
 		return this._localNodeIdLower ?? !session.isInitiator();
 	}
 
+	/** True when no external splice input is still missing its witness. */
+	private _spliceExternalWitnessesReady(): boolean {
+		if (!this._spliceInInputs) return true;
+		for (const wi of this._spliceInInputs.inputs) {
+			if (!wi.external) continue;
+			const key = `${extractTxidFromPrevTx(wi.prevTx).toString('hex')}:${wi.prevOutputIndex}`;
+			if (!this._spliceExternalWitnesses.has(key)) return false;
+		}
+		return true;
+	}
+
+	/**
+	 * Direct-funded splice: supply the witness for an external (third-party
+	 * sender) splice input, collected out-of-band. Releases our held
+	 * tx_signatures when the rest of the exchange is already complete;
+	 * ordering rules are respected exactly as for locally-funded splices.
+	 */
+	provideSpliceExternalWitness(
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): ChannelAction[] {
+		this._spliceExternalWitnesses.set(
+			`${prevTxid.toString('hex')}:${prevOutputIndex}`,
+			witness
+		);
+		// The splice tx is built ONCE and cached (the commitment round
+		// references it; buildAndSignSpliceTx returns the cache thereafter), so
+		// a witness arriving after the build must be applied to the cached tx
+		// directly, and recorded among our wallet witnesses in tx-input order
+		// for the tx_signatures message.
+		const st = this._spliceTx;
+		if (st) {
+			for (let i = 0; i < st.tx.ins.length; i++) {
+				const input = st.tx.ins[i];
+				if (
+					!Buffer.from(input.hash).equals(prevTxid) ||
+					input.index !== prevOutputIndex
+				) {
+					continue;
+				}
+				if (st.ourWalletInputIndices.includes(i)) break; // already applied
+				st.tx.setWitness(i, witness);
+				let pos = st.ourWalletInputIndices.findIndex((x) => x > i);
+				if (pos === -1) pos = st.ourWalletInputIndices.length;
+				st.ourWalletInputIndices.splice(pos, 0, i);
+				st.ourWalletWitnesses.splice(pos, 0, witness);
+				break;
+			}
+		}
+		if (this._state.spliceInFlight?.receivedTxSignatures) {
+			// The peer signed first: applyPeerSpliceSignature already advanced
+			// the session past AWAITING_TX_SIGNATURES, so the ordinary send path
+			// (gated on that state) can never run again. Send our tx_signatures
+			// directly from the cached splice state, then broadcast, watch, and
+			// (zero-conf) lock, exactly as the tx_signatures handler would have.
+			const actions: ChannelAction[] = [];
+			if (
+				st &&
+				this._spliceExternalWitnessesReady() &&
+				this._state.channelId &&
+				!this._spliceSentTxSigs
+			) {
+				this._spliceSentTxSigs = true;
+				const spliceTxid = Buffer.from(st.tx.getHash());
+				this._state.spliceFundingTxid = spliceTxid;
+				this._state.spliceFundingOutputIndex = st.newFundingOutputIndex;
+				this._syncSpliceInFlight({
+					sentTxSignatures: true,
+					fullySigned: true,
+					spliceTxHex: st.tx.toHex()
+				});
+				actions.push({ type: ChannelActionType.PERSIST_STATE });
+				actions.push(
+					sendMsg(
+						MessageType.TX_SIGNATURES,
+						encodeTxSignaturesMessage({
+							channelId: this._state.channelId,
+							txid: spliceTxid,
+							witnesses: st.ourWalletWitnesses,
+							sharedInputSignature: st.localSig
+						})
+					)
+				);
+				actions.push({
+					type: ChannelActionType.BROADCAST_TX,
+					tx: st.tx.toBuffer()
+				});
+				actions.push({
+					type: ChannelActionType.WATCH_FUNDING,
+					fundingTxid: spliceTxid,
+					fundingOutputIndex: st.newFundingOutputIndex,
+					minimumDepth: this._state.minimumDepth
+				});
+				if (
+					this._isZeroConfChannelType() ||
+					this._state.spliceInFlight?.confirmed
+				) {
+					actions.push(...this.sendSpliceLocked());
+				}
+			}
+			return actions;
+		}
+		return this._maybeSendSpliceTxSigsOrdered();
+	}
+
+	/** The negotiated (possibly not fully signed) splice tx, for inspection
+	 *  by direct-funding hosts building a sender sign request. */
+	getPendingSpliceTx(): {
+		tx: import('bitcoinjs-lib').Transaction;
+		sharedInputIndex: number;
+		newFundingOutputIndex: number;
+	} | null {
+		if (!this._spliceTx) return null;
+		return {
+			tx: this._spliceTx.tx,
+			sharedInputIndex: this._spliceTx.sharedInputIndex,
+			newFundingOutputIndex: this._spliceTx.newFundingOutputIndex
+		};
+	}
+
 	private _maybeSendSpliceTxSigsOrdered(): ChannelAction[] {
 		const session = this._spliceSession;
 		if (!session) return [];
@@ -8421,7 +8560,10 @@ export class Channel {
 			!this._state.channelId ||
 			// tx_signatures only after the commitment_signed round has completed.
 			!this._spliceSentCommitment ||
-			!this._spliceReceivedCommitment
+			!this._spliceReceivedCommitment ||
+			// Direct funding: every external input's witness must have arrived,
+			// or our tx_signatures would carry an unsigned third-party input.
+			!this._spliceExternalWitnessesReady()
 		) {
 			// No signer / commitment round not done: defer rather than erroring.
 			return [];
@@ -11002,16 +11144,26 @@ export class Channel {
 
 			// Record the splice outpoint and broadcast + watch it. Persist BEFORE
 			// broadcasting so a crash cannot lose a splice tx the network has seen.
+			// Direct funding: when an external (third-party) input's witness has
+			// not arrived yet, the tx is NOT fully signed — broadcasting it would
+			// be rejected by the network, and locking would advance the splice on
+			// a tx that cannot exist. Record the peer's signatures and stop; the
+			// witness delivery (provideSpliceExternalWitness) broadcasts and
+			// locks when it completes the set.
+			const externalReady = this._spliceExternalWitnessesReady();
 			const spliceTxid = Buffer.from(tx.getHash());
 			this._state.spliceFundingTxid = spliceTxid;
 			this._state.spliceFundingOutputIndex =
 				this._spliceTx!.newFundingOutputIndex;
 			this._syncSpliceInFlight({
 				receivedTxSignatures: true,
-				fullySigned: true,
+				fullySigned: externalReady,
 				spliceTxHex: tx.toHex()
 			});
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
+			if (!externalReady) {
+				return actions;
+			}
 			actions.push({ type: ChannelActionType.BROADCAST_TX, tx: tx.toBuffer() });
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,

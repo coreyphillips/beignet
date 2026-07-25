@@ -115,6 +115,13 @@ interface SignRequestMsg {
 	/** Prevout script+value per input (tx order) — required for P2TR (BIP 341). */
 	prevouts: Array<{ scriptHex: string; valueSat: number }>;
 	/**
+	 * Present when the negotiated tx is a SPLICE of an existing channel: the
+	 * input index spending the old funding outpoint. The sender then checks
+	 * that input against the attested 2-of-2 and requires the new funding
+	 * output to carry the old value plus the amount.
+	 */
+	sharedInputIndex?: number;
+	/**
 	 * Recipient attestation: binds the recipient's NODE identity to the
 	 * funding output the sender is asked to pay into.
 	 */
@@ -348,7 +355,38 @@ export async function sendDirectFunding(
 					reject(new Error('funding output does not match the attested 2-of-2'));
 					return;
 				}
-				if (Number(fundingOut.value) < amountSat) {
+				if (typeof req.sharedInputIndex === 'number') {
+					// Splice of an existing channel: the shared input must itself
+					// be the attested 2-of-2 (the OLD channel funding), and the
+					// new funding output must carry its value plus our amount, so
+					// the receiver's prior balance and our payment both land in
+					// the channel we verified.
+					const shared = (req.prevouts ?? [])[req.sharedInputIndex];
+					if (
+						!shared ||
+						!Buffer.from(shared.scriptHex, 'hex').equals(
+							expected.p2wshOutput
+						)
+					) {
+						cleanup();
+						reject(
+							new Error(
+								'shared input is not the attested channel funding'
+							)
+						);
+						return;
+					}
+					if (
+						Number(fundingOut.value) <
+						shared.valueSat + amountSat - feeHeadroomSat
+					) {
+						cleanup();
+						reject(
+							new Error('new funding output shorts the spliced amount')
+						);
+						return;
+					}
+				} else if (Number(fundingOut.value) < amountSat) {
 					cleanup();
 					reject(new Error('funding output holds less than the amount paid'));
 					return;
@@ -606,11 +644,6 @@ export async function handleOffer(
 		return null;
 	})();
 	if (ownErr) return ack(false, ownErr);
-	ack(true);
-	deps.onEvent?.(
-		'channelizing',
-		`incoming direct funding (${offer.amountSat.toLocaleString('en-US')} sats) — opening channel from the sender's transaction`
-	);
 
 	// Our "wallet input" IS the sender's input; its change returns to the
 	// sender. Our contribution equals the amount they are paying us.
@@ -625,6 +658,46 @@ export async function handleOffer(
 			throw new Error('external input — witness comes from the sender');
 		}
 	};
+
+	// ONE home channel: when a usable channel with the LSP already exists and
+	// the sender is identified, the payment SPLICES it bigger instead of
+	// stacking a second channel. Anonymous senders keep the open path: a
+	// zero-conf home channel would lock their splice at broadcast, and the
+	// double-spend risk of an unconfirmed third-party input is theirs to
+	// carry, not the channel's.
+	if (!opts.senderAnonymous) {
+		const home = node
+			.listChannels()
+			.find(
+				(c) =>
+					c.peerPubkey === lsp &&
+					(c.htlcUsable != null ? c.htlcUsable : c.state === 'NORMAL')
+			);
+		if (home) {
+			ack(true);
+			deps.onEvent?.(
+				'channelizing',
+				`incoming direct funding (${offer.amountSat.toLocaleString('en-US')} sats) — splicing the home channel bigger from the sender's transaction`
+			);
+			await handleSpliceOffer(
+				node,
+				deps,
+				transport,
+				offer,
+				receiptPreimage,
+				externalInput,
+				home.channelId,
+				lsp
+			);
+			return;
+		}
+	}
+
+	ack(true);
+	deps.onEvent?.(
+		'channelizing',
+		`incoming direct funding (${offer.amountSat.toLocaleString('en-US')} sats) — opening channel from the sender's transaction`
+	);
 
 	const targetInboundSat = deps.getTargetInboundSat();
 	const channel = node.lightningNode.openChannelV2(lsp, {
@@ -760,6 +833,157 @@ export async function handleOffer(
 	deps.onEvent?.(
 		'channelized',
 		'direct funding complete — one transaction, funds are lightning-ready'
+	);
+}
+
+const DEFAULT_SPLICE_FEERATE_PERKW = 500;
+
+/**
+ * Splice variant of the offer: the sender's UTXO funds a splice-in on the
+ * existing home channel. Wire legs (sign request, witness, receipt) are the
+ * ones the open path uses; only the channel operation differs.
+ */
+async function handleSpliceOffer(
+	node: BeignetNode,
+	deps: IDirectFundingReceiverDeps,
+	transport: DfTransport,
+	offer: OfferMsg,
+	receiptPreimage: string | undefined,
+	externalInput: ISpliceWalletInput,
+	channelIdHex: string,
+	lsp: string
+): Promise<void> {
+	const channelId = Buffer.from(channelIdHex, 'hex');
+	const channel = node.lightningNode.getRawChannel(channelId);
+	if (!channel) throw new Error('home channel disappeared');
+	const prevTx = bitcoin.Transaction.fromHex(offer.prevTxHex);
+
+	const res = node.lightningNode.spliceInWithInputs(
+		channelId,
+		BigInt(offer.amountSat),
+		DEFAULT_SPLICE_FEERATE_PERKW,
+		[externalInput],
+		Buffer.from(offer.changeScriptHex, 'hex')
+	);
+	if (!res.ok) {
+		throw new Error(`splice initiation failed: ${res.error}`);
+	}
+
+	// Wait for the negotiated splice tx. buildAndSignSpliceTx is idempotent
+	// and, with an unsigned external input, simply leaves that witness slot
+	// for the sender; premature calls fail harmlessly until the interactive
+	// round completes.
+	const deadline = Date.now() + OFFER_TIMEOUT_MS;
+	let pending = channel.getPendingSpliceTx();
+	while (!pending && Date.now() < deadline) {
+		await new Promise((r) => setTimeout(r, 250));
+		try {
+			channel.buildAndSignSpliceTx();
+		} catch {
+			/* interactive round not complete yet */
+		}
+		pending = channel.getPendingSpliceTx();
+	}
+	if (!pending) throw new Error('splice negotiation did not complete');
+
+	const rawTx = pending.tx;
+	const chanState = channel.getFullState();
+	const localFundingPubkeyHex =
+		chanState.localBasepoints.fundingPubkey.toString('hex');
+	const remoteFundingPubkeyHex =
+		chanState.remoteBasepoints!.fundingPubkey.toString('hex');
+	const oldFundingScript = createFundingScript(
+		chanState.localBasepoints.fundingPubkey,
+		chanState.remoteBasepoints!.fundingPubkey,
+		deps.network
+	);
+
+	// Prevout script+value per input (tx order): the sender's from its own
+	// offer, the shared old-funding input from the channel state.
+	const senderTxid = prevTx.getHash();
+	const prevouts = rawTx.ins.map((input, i) => {
+		if (i === pending!.sharedInputIndex) {
+			return {
+				scriptHex: oldFundingScript.p2wshOutput.toString('hex'),
+				valueSat: Number(chanState.fundingSatoshis)
+			};
+		}
+		if (
+			Buffer.from(input.hash).equals(senderTxid) &&
+			input.index === offer.vout
+		) {
+			const out = prevTx.outs[offer.vout];
+			return {
+				scriptHex: Buffer.from(out.script).toString('hex'),
+				valueSat: Number(out.value)
+			};
+		}
+		throw new Error('direct-funded splice: unexpected extra input');
+	});
+
+	transport.send(BeignetCustomSubtype.DIRECT_FUNDING_SIGN_REQUEST, {
+		offerId: offer.offerId,
+		rawTxHex: rawTx.toHex(),
+		prevouts,
+		sharedInputIndex: pending.sharedInputIndex,
+		attestation: {
+			fundingOutputIndex: pending.newFundingOutputIndex,
+			localFundingPubkeyHex,
+			remoteFundingPubkeyHex,
+			sigHex: node.signMessage(
+				attestationMessage(
+					offer.offerId,
+					rawTx.toHex(),
+					pending.newFundingOutputIndex,
+					localFundingPubkeyHex
+				)
+			).signature
+		}
+	} as SignRequestMsg);
+
+	// Merge the sender's witness when it arrives; this releases our held
+	// tx_signatures and the splice completes.
+	await new Promise<void>((resolve, reject) => {
+		const timer = setTimeout(() => {
+			cleanup();
+			reject(new Error('sender never delivered its witness'));
+		}, OFFER_TIMEOUT_MS);
+		const unsubscribe = transport.onMessage((subtype, msgPayload) => {
+			if (subtype !== BeignetCustomSubtype.DIRECT_FUNDING_WITNESS) return;
+			try {
+				const w = JSON.parse(msgPayload.toString('utf8')) as WitnessMsg;
+				if (w.offerId !== offer.offerId) return;
+				node.lightningNode.provideSpliceExternalWitness(
+					lsp,
+					channel,
+					prevTx.getHash(),
+					offer.vout,
+					w.witnessHex.map((h) => Buffer.from(h, 'hex'))
+				);
+				cleanup();
+				resolve();
+			} catch (e) {
+				cleanup();
+				reject(e);
+			}
+		});
+		const cleanup = (): void => {
+			clearTimeout(timer);
+			unsubscribe();
+		};
+	});
+
+	if (offer.receiptHashHex && receiptPreimage) {
+		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT, {
+			offerId: offer.offerId,
+			preimageHex: receiptPreimage,
+			fundingTxidHex: rawTx.getId()
+		} as ReceiptMsg);
+		deps.onReceiptUsed?.(offer.receiptHashHex);
+	}
+	deps.onEvent?.(
+		'channelized',
+		'direct-funded splice complete — one transaction, the home channel grew'
 	);
 }
 

@@ -3890,6 +3890,66 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Raw channel object by id, for hosts that drive protocol extensions
+	 * (direct funding) against the state machine directly.
+	 */
+	getRawChannel(channelId: Buffer): Channel | null {
+		return this.channelManager.getChannel(channelId) ?? null;
+	}
+
+	/** Direct-funded splice: forward a sender's external-input witness. */
+	provideSpliceExternalWitness(
+		peerPubkeyHex: string,
+		channel: Channel,
+		prevTxid: Buffer,
+		prevOutputIndex: number,
+		witness: Buffer[]
+	): void {
+		this.channelManager.provideSpliceExternalWitness(
+			peerPubkeyHex,
+			channel,
+			prevTxid,
+			prevOutputIndex,
+			witness
+		);
+	}
+
+	/**
+	 * Splice-in funded by CALLER-SUPPLIED inputs (direct funding: a third
+	 * party's UTXO with an out-of-band witness) instead of wallet sourcing.
+	 * The change script belongs to whoever owns the inputs.
+	 */
+	spliceInWithInputs(
+		channelId: Buffer,
+		amountSats: bigint,
+		fundingFeeratePerkw: number,
+		inputs: import('../channel/channel').ISpliceWalletInput[],
+		changeScript: Buffer
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const satsErr = validatePositiveBigint(amountSats, 'amountSats');
+		if (satsErr) throw new Error(satsErr);
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			return {
+				ok: false,
+				error: `Channel not found: ${channelId.toString('hex')}`
+			};
+		}
+		const spliceInErr = this._validateSpliceRequest(channelId, amountSats);
+		if (spliceInErr) {
+			return { ok: false, error: spliceInErr };
+		}
+		channel.setSpliceInInputs(inputs, changeScript);
+		return this.channelManager.initiateSplice(
+			channelId,
+			amountSats,
+			fundingFeeratePerkw
+		);
+	}
+
 
 	/**
 	 * Fail an incoming HTLC that was held by the JIT engine BEFORE a restart.
