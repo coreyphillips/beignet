@@ -20,6 +20,9 @@ import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { MessageType } from '../../src/lightning/message/types';
+import { decodeChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Network } from '../../src/lightning/invoice/types';
@@ -392,6 +395,77 @@ describe('Phase 6: Timeout Safety Nets', () => {
 				number
 			>;
 			expect(tracker.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('does not force-close a briefly disconnected channel off a tracker entry from a long-past reconnect', () => {
+			const alice = createTestNode(40);
+			const bob = createTestNode(41);
+			connectNodes(alice, bob);
+
+			const channelId = openReadyChannel(alice, bob);
+			const rawAlice = alice
+				.getChannelManager()
+				.listChannels()
+				.find((c) => c.getFullState().channelId?.equals(channelId))!;
+			const rawBob = bob
+				.getChannelManager()
+				.listChannels()
+				.find((c) => c.getFullState().channelId?.equals(channelId))!;
+
+			const reestablishPayload = (channel: typeof rawAlice): Buffer => {
+				const action = channel.createReestablish().find(
+					(a): a is {
+						type: ChannelActionType.SEND_MESSAGE;
+						messageType: MessageType;
+						payload: Buffer;
+					} =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						a.messageType === MessageType.CHANNEL_REESTABLISH
+				);
+				expect(action).to.exist;
+				return action!.payload;
+			};
+
+			// First disconnect: a block arrives while the channel awaits
+			// reestablish, so the watchdog stamps its tracker entry.
+			alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+			bob.getChannelManager().handlePeerDisconnected(alice.getNodeId());
+			expect(rawAlice.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+			alice.handleNewBlock(1000);
+
+			// Reconnect: exchange channel_reestablish (driven at the channel level;
+			// the node relay is synchronous and would deliver one side's message
+			// before the other side has built its own).
+			const bobMsg = decodeChannelReestablishMessage(
+				reestablishPayload(rawBob)
+			);
+			const aliceMsg = decodeChannelReestablishMessage(
+				reestablishPayload(rawAlice)
+			);
+			rawAlice.handleReestablish(bobMsg);
+			rawBob.handleReestablish(aliceMsg);
+			expect(rawAlice.getState()).to.equal(ChannelState.NORMAL);
+
+			// A long healthy stretch: more than reestablishTimeoutBlocks (2016)
+			// pass with the channel NORMAL and the daemon running throughout.
+			alice.handleNewBlock(3500);
+
+			// Second disconnect, one block long. The watchdog must measure
+			// contiguous blocks in AWAITING_REESTABLISH, not distance from the
+			// entry stamped before the successful reconnect.
+			alice.getChannelManager().handlePeerDisconnected(bob.getNodeId());
+			const errors: ILightningError[] = [];
+			alice.on('node:error', (err: ILightningError) => errors.push(err));
+			alice.handleNewBlock(3501);
+
+			expect(
+				errors.filter((e) => e.code === 'REESTABLISH_TIMEOUT_FORCE_CLOSED')
+					.length
+			).to.equal(0);
+			expect(rawAlice.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
 
 			alice.destroy();
 			bob.destroy();
