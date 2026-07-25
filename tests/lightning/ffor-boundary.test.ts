@@ -117,8 +117,8 @@ describe('FFOR M6: boundary epochs (§8/§11.4)', function () {
 
 	it('fractional-msat settlement: non-whole-satoshi delegated payments settle and reconcile exactly', function () {
 		// FFOR settlement composes with fractional-msat HTLC amounts end to
-		// end: fractional upstream HTLCs, fractional vouchers (BOLT 3 keeps
-		// the sub-satoshi remainder with the offerer), and a fractional
+		// end: fractional upstream HTLCs, fractional vouchers (whose sub-satoshi
+		// remainder goes to the on-chain fee per BOLT 3), and a fractional
 		// rejected payment failed upstream mid-epoch.
 		const t = createTriple({
 			prefix: 'bound-frac',

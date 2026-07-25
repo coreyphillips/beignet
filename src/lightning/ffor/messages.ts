@@ -122,9 +122,19 @@ export interface IFforErrorMessage extends IFforHeader {
 
 // ---- Signature helpers ----
 
+/** Domain-separation tag for FFOR signed-message digests (spec §7). */
+const FFOR_MSG_TAG = Buffer.from('ffor/msg', 'ascii');
+
 /**
- * Digest a signed FFOR message: SHA256 over the 2-byte big-endian message type
- * followed by every body byte preceding the final-64-byte signature field.
+ * Digest a signed FFOR message, per spec §7:
+ *
+ *   SHA256("ffor/msg" || message_type || body_excluding_the_signature)
+ *
+ * The tag is normative. These signatures are the whole of §12.2's
+ * non-repudiation layer and are made with the same node key that signs BOLT 7
+ * gossip, so the digest is domain-separated rather than left to an argument
+ * about which other node-key signing surface could collide with it. §9.4's
+ * tower fetch digest is tagged the same way.
  */
 export function fforMessageDigest(type: number, payload: Buffer): Buffer {
 	if (payload.length < FF_HEADER_LEN + SIG_LEN) {
@@ -134,6 +144,7 @@ export function fforMessageDigest(type: number, payload: Buffer): Buffer {
 	typeBuf.writeUInt16BE(type, 0);
 	return crypto
 		.createHash('sha256')
+		.update(FFOR_MSG_TAG)
 		.update(typeBuf)
 		.update(payload.subarray(0, payload.length - SIG_LEN))
 		.digest();

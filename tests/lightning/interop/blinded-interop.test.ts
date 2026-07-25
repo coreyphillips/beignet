@@ -16,9 +16,16 @@
  * Real conformance fixes landed from this work: rho encryption key, blinded-hop
  * SCID omission, blinded-intermediate amt/cltv omission, ROUTE_BLINDING feature,
  * findRouteToBlindedPath local edges, and a fractional-msat HTLC commitment fix
- * (the sub-satoshi remainder must stay with the offerer's to_local per BOLT 3 —
- * verified against LND: the commitment now signs cleanly where it previously
- * failed with "Invalid commitment signature").
+ * (the offered/received remainder mapping was inconsistent between the local and
+ * remote commitments, so the two sides signed different transactions and LND
+ * rejected ours with "Invalid commitment signature").
+ *
+ * NOTE: that fix originally also RETAINED the sub-satoshi remainder with the
+ * offerer, attributed here to LND. That half was wrong and has since been
+ * removed: BOLT 3 floors every output and lets the remainder raise the on-chain
+ * fee, which is what CLN, LDK and LND all do (LND lnwallet/commitment.go passes
+ * ourBalance.ToSatoshis(), a plain truncation). The consistent-mapping half is
+ * what made the signature verify. Worth re-running this harness to confirm.
  *
  * REMAINING: LND still returns invalid_onion_blinding after decrypting — a deeper
  * LND-specific blinded-relay validation requirement that needs LND debug-level

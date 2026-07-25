@@ -29,6 +29,7 @@ import {
 	IFforEpochStateData,
 	IFforHandleResult,
 	IFforSend,
+	FFOR_ESCAPE_DELAY_BLOCKS,
 	FFOR_RECONCILE_MARGIN_BLOCKS,
 	FFOR_BEGIN_MAX_HEIGHT_SKEW
 } from './types';
@@ -51,7 +52,8 @@ import {
 	encodeFforBeginMessage,
 	encodeFforEndMessage,
 	encodeFforErrorMessage,
-	verifyFforMessageSignature
+	verifyFforMessageSignature,
+	fforMessageDigest
 } from './messages';
 
 /**
@@ -159,6 +161,20 @@ export function validateFforEpochParams(
 		return (
 			`voucher_expiry ${params.voucherExpiry} too close to settlement_deadline ` +
 			`${params.settlementDeadline}: need at least ${FFOR_RECONCILE_MARGIN_BLOCKS} blocks of reconcile margin`
+		);
+	}
+	// §7.1/§10: with escapes in use, T_exp MUST also satisfy
+	// T_exp <= D + escape_delay. Otherwise S's escape window opens while R still
+	// has a legitimate reconciliation window, and §11.2's "S cannot have escaped
+	// yet" invariant is false.
+	if (
+		params.escapeGranularityMsat > 0n &&
+		params.voucherExpiry > params.settlementDeadline + FFOR_ESCAPE_DELAY_BLOCKS
+	) {
+		return (
+			`voucher_expiry ${params.voucherExpiry} exceeds settlement_deadline ` +
+			`${params.settlementDeadline} + escape_delay ${FFOR_ESCAPE_DELAY_BLOCKS}: ` +
+			`S's escape window would open before R's reconciliation window closes`
 		);
 	}
 	// The deadline must be in the future (when we know the tip).
@@ -425,7 +441,7 @@ export class FforEpoch {
 		// covers type + body-without-signature (identical bytes regardless of
 		// what currently sits in the 64-byte signature slot).
 		const digestPayload = encodeFforInitMessage(msg);
-		const sig = ctx.signFn(fforDigestForSend(FF_INIT_TYPE, digestPayload));
+		const sig = ctx.signFn(fforMessageDigest(FF_INIT_TYPE, digestPayload));
 		sig.copy(digestPayload, digestPayload.length - 64);
 
 		const data: IFforEpochStateData = {
@@ -569,7 +585,7 @@ export class FforEpoch {
 			signature: Buffer.alloc(64)
 		};
 		const acceptPayload = encodeFforAcceptMessage(acceptMsg);
-		const sig = ctx.signFn(fforDigestForSend(FF_ACCEPT_TYPE, acceptPayload));
+		const sig = ctx.signFn(fforMessageDigest(FF_ACCEPT_TYPE, acceptPayload));
 		sig.copy(acceptPayload, acceptPayload.length - 64);
 
 		const data: IFforEpochStateData = {
@@ -1069,19 +1085,4 @@ export class FforEpoch {
 			buildFforError(ctx.channelId, this.data.epochId, reason)
 		]);
 	}
-}
-
-/**
- * Digest for signing an outgoing ✍ message whose signature slot is still a
- * placeholder: identical bytes to messages.fforMessageDigest (the digest never
- * covers the final 64 bytes, whatever they currently contain).
- */
-function fforDigestForSend(type: number, payload: Buffer): Buffer {
-	const typeBuf = Buffer.alloc(2);
-	typeBuf.writeUInt16BE(type, 0);
-	return crypto
-		.createHash('sha256')
-		.update(typeBuf)
-		.update(payload.subarray(0, payload.length - 64))
-		.digest();
 }

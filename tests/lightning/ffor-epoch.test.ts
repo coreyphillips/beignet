@@ -383,6 +383,47 @@ describe('FFOR epoch establishment (M1)', function () {
 		expectRejected(pair, 'too close to settlement_deadline');
 	});
 
+	it('rejects T_exp beyond D + escape_delay when escapes are in use', function () {
+		// §7.1/§10: with G > 0, T_exp MUST be <= D + escape_delay (2016), so that
+		// S's escape window cannot open while R still has a legitimate
+		// reconciliation window. Without the bound §11.2's "S cannot have escaped
+		// yet" invariant is simply false.
+		const pair = createNormalChannelPair();
+		injectInit(
+			pair,
+			paramsA({
+				escapeGranularityMsat: 1_000_000n,
+				voucherExpiry: 1000 + 2017 // D + escape_delay + 1
+			})
+		);
+		expectRejected(pair, 'escape window would open');
+	});
+
+	it('accepts T_exp exactly at D + escape_delay with escapes in use', function () {
+		const pair = createNormalChannelPair();
+		injectInit(
+			pair,
+			paramsA({
+				escapeGranularityMsat: 1_000_000n,
+				voucherExpiry: 1000 + 2016 // the boundary is inclusive
+			})
+		);
+		expect(pair.sChannel.getFforEpoch(), pair.sErrors.join('; ')).to.not.equal(
+			null
+		);
+	});
+
+	it('leaves T_exp unbounded above when escapes are disabled (G = 0)', function () {
+		const pair = createNormalChannelPair();
+		injectInit(
+			pair,
+			paramsA({ escapeGranularityMsat: 0n, voucherExpiry: 1000 + 5000 })
+		);
+		expect(pair.sChannel.getFforEpoch(), pair.sErrors.join('; ')).to.not.equal(
+			null
+		);
+	});
+
 	it('rejects min_payment_msat below the voucher dust floor', function () {
 		const pair = createNormalChannelPair();
 		// Anchor channel: floor = dust_limit (354 sat) = 354_000 msat.

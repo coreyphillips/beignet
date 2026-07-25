@@ -199,29 +199,33 @@ function filterUntrimmedHtlcs<
 	});
 }
 
-/**
- * Sum the sub-satoshi msat remainders of untrimmed HTLC outputs, grouped by the
- * HTLC's INVARIANT direction (OFFERED = we offered, RECEIVED = they offered).
- * Per BOLT 3 the truncated remainder stays with the party that offered the HTLC;
- * the caller maps offered/received onto the correct to_local/to_remote side
- * (which differs between the local and the remote commitment).
+/*
+ * A note on sub-satoshi millisatoshi remainders, because this file used to get
+ * it backwards.
+ *
+ * BOLT 3 "Commitment Transaction Construction": the offerer's balance is reduced
+ * by the FULL millisatoshi HTLC amount, the HTLC output is floor(amount / 1000),
+ * and "The amounts for each output MUST be rounded down to whole satoshis." The
+ * truncated remainder is NOT returned to the offerer; it raises the commitment
+ * transaction's on-chain fee above the BOLT 3 base fee.
+ *
+ * All three reference implementations do exactly this and nothing else:
+ *   - CLN   channeld/commit_tx.c   amount_msat_to_sat_round_down(self_pay), over
+ *                                  balances that already had the full msat removed
+ *   - LDK   sign/tx_builder.rs     value_to_self_msat.checked_sub(local_htlc_total_msat)
+ *                                  with the full msat totals, then floor
+ *   - LND   lnwallet/commitment.go CreateCommitTx(..., ourBalance.ToSatoshis(),
+ *                                  theirBalance.ToSatoshis(), ...), a plain truncation
+ *
+ * An earlier revision added the remainders back to the offerer and attributed
+ * that to LND. It is not what LND does, and it could not be: a 1-sat divergence
+ * on fractional-msat HTLCs would break every LND-to-CLN channel that ever
+ * forwarded a proportional-fee payment.
+ *
+ * BOLT 3's own Appendix C vectors use whole-satoshi HTLC amounts throughout, so
+ * they do not exercise this path. tests/lightning/commitment-builder.test.ts
+ * covers it directly instead.
  */
-function sumHtlcRemainders(
-	htlcOutputs: { amountMsat: bigint; direction: HtlcDirection }[]
-): { offeredRemainderMsat: bigint; receivedRemainderMsat: bigint } {
-	let offeredRemainderMsat = 0n;
-	let receivedRemainderMsat = 0n;
-	for (const o of htlcOutputs) {
-		const remainder = o.amountMsat % 1000n;
-		if (remainder === 0n) continue;
-		if (o.direction === HtlcDirection.OFFERED) {
-			offeredRemainderMsat += remainder;
-		} else {
-			receivedRemainderMsat += remainder;
-		}
-	}
-	return { offeredRemainderMsat, receivedRemainderMsat };
-}
 
 /**
  * Get the fee rate for the commitment tx.
@@ -418,19 +422,12 @@ export function buildLocalCommitment(
 		isTaprootChannel(state.channelType)
 	);
 
-	// BOLT 3: an untrimmed HTLC output is floored to whole satoshis; the truncated
-	// sub-satoshi msat remainder stays with the party that OFFERED the HTLC (in its
-	// to_local), it is NOT dropped to fee. On any commitment, an OFFERED-direction
-	// output is one offered by that commitment's owner (whose balance is to_local),
-	// so its remainder belongs to the to_local side; RECEIVED to the to_remote side.
-	// Omitting this diverges from LND by 1 sat whenever an HTLC has fractional msat.
-	const { offeredRemainderMsat, receivedRemainderMsat } =
-		sumHtlcRemainders(htlcOutputs);
-
-	// Deduct fee from opener's balance
+	// Deduct fee from opener's balance.
 	// Local commitment: localAmount = our balance, remoteAmount = their balance.
-	// Our offered HTLCs' remainder stays with us; their offered (our received)
-	// with them.
+	// The balances below are already net of the FULL millisatoshi amount of every
+	// live HTLC; each output is floored independently and the sub-satoshi
+	// remainders are left to the on-chain fee, per BOLT 3 (see the note on
+	// sub-satoshi remainders near the top of this file).
 	// Adjust balances for FULFILLED/FAILED HTLCs (excluded from outputs above,
 	// but balance updates were deferred until revoke_and_ack). This MUST happen
 	// in millisatoshis BEFORE flooring to whole satoshis: once the removal is
@@ -439,8 +436,8 @@ export function buildLocalCommitment(
 	// a fractional-msat amount rejoins a balance carrying the matching
 	// sub-satoshi residue (e.g. a failed HTLC refunding its offerer). That 1-sat
 	// skew made the two sides of a removal round sign different commitments.
-	let localMsat = state.localBalanceMsat + offeredRemainderMsat;
-	let remoteMsat = state.remoteBalanceMsat + receivedRemainderMsat;
+	let localMsat = state.localBalanceMsat;
+	let remoteMsat = state.remoteBalanceMsat;
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
@@ -584,20 +581,16 @@ export function buildRemoteCommitment(
 		isTaprootChannel(state.channelType)
 	);
 
-	// BOLT 3 sub-satoshi HTLC remainder stays with the offerer (see buildLocal).
-	// The HTLC meta direction is INVARIANT (not swapped), but the to_local/to_remote
-	// sides ARE swapped on the remote commitment: their offered (RECEIVED) remainder
-	// goes to their to_local; our offered (OFFERED) to our to_remote.
-	const { offeredRemainderMsat, receivedRemainderMsat } =
-		sumHtlcRemainders(htlcOutputs);
-
-	// Deduct fee from opener's balance
+	// Deduct fee from opener's balance.
+	// Sub-satoshi HTLC remainders go to the on-chain fee, not back to the offerer
+	// (see the note near the top of this file). Both sides must therefore floor
+	// identically, which is what keeps the two commitments in a round in sync.
 	// Remote commitment: localAmount = their balance (to_local), remoteAmount = our balance (to_remote)
 	// Adjust balances for FULFILLED/FAILED HTLCs in MILLISATOSHIS before the
 	// whole-satoshi floor — see buildLocalCommitment for why flooring the parts
 	// separately desyncs the two sides of a removal round by 1 sat.
-	let localMsat = state.remoteBalanceMsat + receivedRemainderMsat;
-	let remoteMsat = state.localBalanceMsat + offeredRemainderMsat;
+	let localMsat = state.remoteBalanceMsat;
+	let remoteMsat = state.localBalanceMsat;
 	for (const entry of state.htlcs.values()) {
 		if (entry.state === HtlcState.FULFILLED) {
 			if (entry.direction === HtlcDirection.RECEIVED) {
