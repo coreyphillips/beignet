@@ -23,10 +23,13 @@ import { DfTransport } from './direct-funding';
  */
 
 export interface IDfTransportDescriptor {
-	type: 'ln' | 'swarm';
-	/** ln: a host hint the sender may reach for the identified peer path. */
+	type: 'ln' | 'lsp' | 'swarm';
+	/** ln: a host hint the sender may reach for the identified peer path.
+	 *  lsp: the relay's reachable address. */
 	host?: string;
 	port?: number;
+	/** lsp: the relay's Lightning node id; frames route through it blind. */
+	nodeId?: string;
 	/** swarm: rendezvous secret (hex) the DHT topic derives from. */
 	rendezvous?: string;
 	/** swarm: receiver's Noise public key (hex), pinned by the sender. */
@@ -53,11 +56,12 @@ export function canonicalRequestMessage(
 	env: Omit<IDfRequestEnvelope, 'sig'>
 ): string {
 	const transports = env.transports
-		.map((t) =>
-			t.type === 'ln'
-				? `ln,${t.host ?? ''},${t.port ?? ''}`
-				: `swarm,${t.rendezvous ?? ''},${t.noiseKey ?? ''}`
-		)
+		.map((t) => {
+			if (t.type === 'ln') return `ln,${t.host ?? ''},${t.port ?? ''}`;
+			if (t.type === 'lsp')
+				return `lsp,${t.nodeId ?? ''},${t.host ?? ''},${t.port ?? ''}`;
+			return `swarm,${t.rendezvous ?? ''},${t.noiseKey ?? ''}`;
+		})
 		.join('|');
 	return `beignet-df-req:v1:${env.requestId}:${env.receiverNodeId}:${env.expiresAt}:${env.amountSat ?? ''}:${env.receiptHash}:${env.encryptionKey}:${transports}`;
 }

@@ -29,7 +29,12 @@ export enum BeignetCustomSubtype {
 	DIRECT_FUNDING_ABORT = 20,
 	/** Receiver → sender after broadcast: reveals the preimage of the receipt
 	 *  hash the sender's offer carried, a provable delivery receipt. */
-	DIRECT_FUNDING_RECEIPT = 21
+	DIRECT_FUNDING_RECEIPT = 21,
+	/** Blind relay envelope: {to, t, p} from a sender, forwarded by the LSP
+	 *  to a connected peer as {from, t, p} with `from` stamped by the LSP
+	 *  itself, so neither party can spoof the other. Payloads are sealed to
+	 *  the request key; the relay reads nothing. */
+	DIRECT_FUNDING_RELAY = 22
 }
 
 export interface ICustomMessage {

@@ -87,6 +87,98 @@ export function lnTransport(node: BeignetNode, peerPubkey: string): DfTransport 
 	};
 }
 
+/**
+ * Direct-funding frames relayed BLIND through a shared Lightning peer (the
+ * receiver's LSP). Outbound frames ride RELAY envelopes `{to, t, p}` to the
+ * relay; inbound frames arrive from the relay as `{from, t, p}` where `from`
+ * was stamped by the relay itself from its authenticated connection, so
+ * neither endpoint can claim to be someone it is not. Payloads stay sealed
+ * to the per-request key: the relay moves bytes it cannot read.
+ */
+export function relayTransport(
+	node: BeignetNode,
+	viaPubkey: string,
+	counterpartyPubkey: string
+): DfTransport {
+	return {
+		send: (subtype, payload) =>
+			node.lightningNode.sendCustomMessage(
+				viaPubkey,
+				BeignetCustomSubtype.DIRECT_FUNDING_RELAY,
+				Buffer.from(
+					JSON.stringify({ to: counterpartyPubkey, t: subtype, p: payload }),
+					'utf8'
+				)
+			),
+		onMessage: (cb) => {
+			const onMsg = (msg: {
+				peerPubkey: string;
+				subtype: number;
+				payload: Buffer;
+			}): void => {
+				if (msg.peerPubkey !== viaPubkey) return;
+				if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_RELAY) return;
+				try {
+					const frame = JSON.parse(msg.payload.toString('utf8'));
+					if (frame?.from !== counterpartyPubkey) return;
+					if (typeof frame.t !== 'number') return;
+					cb(frame.t, Buffer.from(JSON.stringify(frame.p), 'utf8'));
+				} catch {
+					/* malformed relay frame: drop */
+				}
+			};
+			node.lightningNode.on('custom-message', onMsg);
+			return () => node.lightningNode.removeListener('custom-message', onMsg);
+		}
+	};
+}
+
+/**
+ * Make this node a blind direct-funding relay. Any connected peer may hand
+ * it a RELAY envelope `{to, t, p}`; if `to` is also a connected peer the
+ * frame is forwarded as `{from, t, p}` with `from` stamped from the
+ * authenticated sending connection. The relay never parses `p`: it is
+ * sealed to a request key only the endpoints hold. Frames whose target is
+ * not connected are dropped silently, which is all a store-nothing relay
+ * can honestly do.
+ */
+export function attachRelayForwarder(
+	node: BeignetNode,
+	log: (line: string) => void
+): void {
+	node.lightningNode.on(
+		'custom-message',
+		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
+			if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_RELAY) return;
+			try {
+				const frame = JSON.parse(msg.payload.toString('utf8'));
+				// Only originator frames carry `to`; forwarded frames carry `from`
+				// instead, so a forwarded frame can never be forwarded again.
+				if (typeof frame?.to !== 'string' || frame.from !== undefined) return;
+				const target = node.lightningNode
+					.listPeers()
+					.find((p) => p.pubkey === frame.to);
+				if (!target) return;
+				node.lightningNode.sendCustomMessage(
+					frame.to,
+					BeignetCustomSubtype.DIRECT_FUNDING_RELAY,
+					Buffer.from(
+						JSON.stringify({ from: msg.peerPubkey, t: frame.t, p: frame.p }),
+						'utf8'
+					)
+				);
+				if (frame.t === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
+					log(
+						`relayed direct-funding offer ${msg.peerPubkey.slice(0, 8)} -> ${frame.to.slice(0, 8)}`
+					);
+				}
+			} catch {
+				/* malformed relay frame: drop */
+			}
+		}
+	);
+}
+
 /** Message payloads (JSON over custom subtypes 16-21). */
 interface OfferMsg {
 	offerId: string;
@@ -560,18 +652,46 @@ export function attachDirectFundingReceiver(
 	node.lightningNode.on(
 		'custom-message',
 		(msg: { peerPubkey: string; subtype: number; payload: Buffer }) => {
-			if (msg.subtype !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
-			void dispatchOffer(
-				node,
-				deps,
-				lnTransport(node, msg.peerPubkey),
-				msg.payload,
-				// A Lightning-connected sender has a persistent node identity;
-				// the receiver's trust configuration decides from here.
-				{ senderAnonymous: false }
-			).catch((e) => {
-				deps.onEvent?.('direct-funding-failed', e.message);
-			});
+			if (msg.subtype === BeignetCustomSubtype.DIRECT_FUNDING_OFFER) {
+				void dispatchOffer(
+					node,
+					deps,
+					lnTransport(node, msg.peerPubkey),
+					msg.payload,
+					// A Lightning-connected sender has a persistent node identity;
+					// the receiver's trust configuration decides from here.
+					{ senderAnonymous: false }
+				).catch((e) => {
+					deps.onEvent?.('direct-funding-failed', e.message);
+				});
+				return;
+			}
+			if (msg.subtype === BeignetCustomSubtype.DIRECT_FUNDING_RELAY) {
+				try {
+					const frame = JSON.parse(msg.payload.toString('utf8'));
+					// Only forwarded frames (relay-stamped `from`) are offers for us;
+					// frames still carrying `to` belong to the forwarder, not here.
+					if (typeof frame?.from !== 'string' || frame.to !== undefined) {
+						return;
+					}
+					if (frame.t !== BeignetCustomSubtype.DIRECT_FUNDING_OFFER) return;
+					void dispatchOffer(
+						node,
+						deps,
+						relayTransport(node, msg.peerPubkey, frame.from),
+						Buffer.from(JSON.stringify(frame.p), 'utf8'),
+						// The relay stamps the sender's node id, but that identity is
+						// vouched for by the relay, not observed by this node, so the
+						// sender gets the anonymous trust policy: no zero-conf, no
+						// splice into the home channel, confirmations required.
+						{ senderAnonymous: true }
+					).catch((e) => {
+						deps.onEvent?.('direct-funding-failed', e.message);
+					});
+				} catch {
+					/* malformed relay frame: drop */
+				}
+			}
 		}
 	);
 }

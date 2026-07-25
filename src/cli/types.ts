@@ -420,6 +420,12 @@ export interface BeignetConfig {
 	 */
 	swarm?: boolean;
 	/**
+	 * Blind direct-funding relay, LSP role: forward sealed RELAY frames
+	 * between connected peers, stamping the sender identity onto forwarded
+	 * frames. The relay cannot read the frames it moves.
+	 */
+	dfRelay?: boolean;
+	/**
 	 * JIT receive, LSP role: intercept HTLCs on synthetic SCIDs registered by
 	 * wallet peers, open a zero-conf channel to them, forward, and deduct the
 	 * LSPS2-style opening fee. Numbers here (config/env level) are converted

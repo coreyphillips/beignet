@@ -131,6 +131,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_SWARM === 'true'
 				: undefined) ??
 			file.swarm,
+		dfRelay:
+			cliFlags.dfRelay ??
+			(process.env.BEIGNET_DF_RELAY !== undefined
+				? process.env.BEIGNET_DF_RELAY === 'true'
+				: undefined) ??
+			file.dfRelay,
 		jitReceive:
 			cliFlags.jitReceive ??
 			(process.env.BEIGNET_JIT_RECEIVE !== undefined

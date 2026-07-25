@@ -21,8 +21,10 @@ import * as bitcoinjs from 'bitcoinjs-lib';
 import * as nodeCrypto from 'crypto';
 import {
 	attachDirectFundingReceiver,
+	attachRelayForwarder,
 	sendDirectFunding,
 	lnTransport,
+	relayTransport,
 	rendezvousTopic,
 	IDirectFundingReceiverDeps
 } from './direct-funding';
@@ -71,6 +73,9 @@ export interface DaemonOptions extends BeignetNodeOptions {
 	/** Announce on a DHT topic derived from the node pubkey so senders can
 	 *  reach this node for direct funding with the pubkey alone. */
 	swarm?: boolean;
+	/** Act as a blind direct-funding relay: forward sealed RELAY frames
+	 *  between connected peers, stamping the sender identity. For LSPs. */
+	dfRelay?: boolean;
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
@@ -276,6 +281,10 @@ export async function startDaemon(
 	// preimage is revealed as the delivery receipt.
 	const directFundingState: {
 		lspPubkey?: string;
+		/** The LSP's reachable address, signed into requests as the relay
+		 *  transport so senders can route sealed frames through it. */
+		lspHost?: string;
+		lspPort?: number;
 		targetInboundSat: number;
 		trusted: boolean;
 		receipts: Map<
@@ -343,6 +352,11 @@ export async function startDaemon(
 		}
 	};
 	attachDirectFundingReceiver(node, directFundingDeps);
+	// Blind relay (opt-in, LSP role): forward sealed frames between connected
+	// peers. The relay stamps sender identity and reads nothing else.
+	if (opts.dfRelay) {
+		attachRelayForwarder(node, (l) => process.stderr.write(`${l}\n`));
+	}
 	// Swarm listener (opt-in): announce on a DHT topic derived from the node
 	// pubkey, so senders holding only the pubkey from a payment request can
 	// reach this node with no dialable address.
@@ -361,21 +375,31 @@ export async function startDaemon(
 	const routes: Record<string, RouteHandler> = {
 		// ── Direct funding (1-tx receive) ──
 		'POST /direct-funding/configure': (body) => {
-			const { lspPubkey, targetInboundSat, trusted } = body as {
-				lspPubkey?: string;
-				targetInboundSat?: number;
-				/** Negotiate option_zeroconf into direct-funded opens (the LSP
-				 *  must trust this node). */
-				trusted?: boolean;
-			};
+			const { lspPubkey, lspHost, lspPort, targetInboundSat, trusted } =
+				body as {
+					lspPubkey?: string;
+					/** Where the LSP is reachable; signed into payment requests as
+					 *  the relay transport (the production default for senders that
+					 *  cannot reach the receiver directly). */
+					lspHost?: string;
+					lspPort?: number;
+					targetInboundSat?: number;
+					/** Negotiate option_zeroconf into direct-funded opens (the LSP
+					 *  must trust this node). */
+					trusted?: boolean;
+				};
 			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
 			directFundingState.lspPubkey = lspPubkey;
+			if (lspHost !== undefined) directFundingState.lspHost = lspHost;
+			if (lspPort !== undefined) directFundingState.lspPort = lspPort;
 			if (targetInboundSat !== undefined) {
 				directFundingState.targetInboundSat = targetInboundSat;
 			}
 			if (trusted !== undefined) directFundingState.trusted = trusted;
 			return success({
 				lspPubkey: directFundingState.lspPubkey,
+				lspHost: directFundingState.lspHost ?? null,
+				lspPort: directFundingState.lspPort ?? null,
 				targetInboundSat: directFundingState.targetInboundSat,
 				trusted: directFundingState.trusted
 			});
@@ -383,6 +407,8 @@ export async function startDaemon(
 		'GET /direct-funding/config': () =>
 			success({
 				lspPubkey: directFundingState.lspPubkey ?? null,
+				lspHost: directFundingState.lspHost ?? null,
+				lspPort: directFundingState.lspPort ?? null,
 				targetInboundSat: directFundingState.targetInboundSat,
 				trusted: directFundingState.trusted
 			}),
@@ -412,6 +438,18 @@ export async function startDaemon(
 			const expiresAt = Date.now() + DIRECT_FUNDING_REQUEST_TTL_MS;
 			const transports: IDfTransportDescriptor[] = [];
 			if (host && port) transports.push({ type: 'ln', host, port });
+			if (
+				directFundingState.lspPubkey &&
+				directFundingState.lspHost &&
+				directFundingState.lspPort
+			) {
+				transports.push({
+					type: 'lsp',
+					nodeId: directFundingState.lspPubkey,
+					host: directFundingState.lspHost,
+					port: directFundingState.lspPort
+				});
+			}
 			if (swarmReceiver) {
 				transports.push({
 					type: 'swarm',
@@ -500,6 +538,31 @@ export async function startDaemon(
 							btcNetwork,
 							encryptedTransport(
 								lnTransport(node, env.receiverNodeId),
+								key,
+								env.requestId,
+								{ ephemeralPublicHex }
+							),
+							sendOpts
+						)
+					);
+				}
+			}
+			// Relay transport: connect to the receiver's LSP and route sealed
+			// frames through it. Frames stay opaque to the relay; only
+			// connection failures fall through to the next transport.
+			const lsp = env.transports.find((t) => t.type === 'lsp');
+			if (lsp?.nodeId && lsp.host && lsp.port) {
+				const relayUp = await node
+					.connectPeer(lsp.nodeId, lsp.host, lsp.port)
+					.then(() => true)
+					.catch(() => node.listPeers().some((p) => p.pubkey === lsp.nodeId));
+				if (relayUp) {
+					return success(
+						await sendDirectFunding(
+							node,
+							btcNetwork,
+							encryptedTransport(
+								relayTransport(node, lsp.nodeId, env.receiverNodeId),
 								key,
 								env.requestId,
 								{ ephemeralPublicHex }
