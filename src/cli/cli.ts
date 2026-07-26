@@ -449,6 +449,10 @@ async function handleStart(): Promise<void> {
 			trustedZeroConfSplice: config.trustedZeroConfSplice,
 			swarm: config.swarm,
 			dfRelay: config.dfRelay,
+			routingFeeBaseMsat: config.routingFeeBaseMsat,
+			routingFeePpm: config.routingFeePpm,
+			routingCltvDelta: config.routingCltvDelta,
+			dfMinAmountSat: config.dfMinAmountSat,
 			jitReceive: config.jitReceive?.enabled
 				? {
 						enabled: true,

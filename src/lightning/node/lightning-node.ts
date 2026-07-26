@@ -11071,6 +11071,9 @@ export class LightningNode extends EventEmitter {
 			autoReconnect?: boolean;
 			autoUpdateChannelFees?: boolean;
 			forwardingEnabled?: boolean;
+			forwardingFeeBaseMsat?: number;
+			forwardingFeePropMillionths?: number;
+			forwardingCltvDelta?: number;
 			sweepDestinationScript?: Buffer;
 			peerStorageEnabled?: boolean;
 			autoRebalance?: IAutoRebalanceConfig;
@@ -11125,6 +11128,9 @@ export class LightningNode extends EventEmitter {
 			autoReconnect: options?.autoReconnect,
 			autoUpdateChannelFees: options?.autoUpdateChannelFees,
 			forwardingEnabled: options?.forwardingEnabled,
+			forwardingFeeBaseMsat: options?.forwardingFeeBaseMsat,
+			forwardingFeePropMillionths: options?.forwardingFeePropMillionths,
+			forwardingCltvDelta: options?.forwardingCltvDelta,
 			localFeatures: options?.localFeatures,
 			chainHashes: options?.chainHashes,
 			alias: options?.alias,

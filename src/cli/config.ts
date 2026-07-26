@@ -137,6 +137,30 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_DF_RELAY === 'true'
 				: undefined) ??
 			file.dfRelay,
+		routingFeeBaseMsat:
+			cliFlags.routingFeeBaseMsat ??
+			(process.env.BEIGNET_FEE_BASE_MSAT !== undefined
+				? parseInt(process.env.BEIGNET_FEE_BASE_MSAT, 10)
+				: undefined) ??
+			file.routingFeeBaseMsat,
+		routingFeePpm:
+			cliFlags.routingFeePpm ??
+			(process.env.BEIGNET_FEE_PPM !== undefined
+				? parseInt(process.env.BEIGNET_FEE_PPM, 10)
+				: undefined) ??
+			file.routingFeePpm,
+		routingCltvDelta:
+			cliFlags.routingCltvDelta ??
+			(process.env.BEIGNET_CLTV_DELTA !== undefined
+				? parseInt(process.env.BEIGNET_CLTV_DELTA, 10)
+				: undefined) ??
+			file.routingCltvDelta,
+		dfMinAmountSat:
+			cliFlags.dfMinAmountSat ??
+			(process.env.BEIGNET_DF_MIN_AMOUNT !== undefined
+				? parseInt(process.env.BEIGNET_DF_MIN_AMOUNT, 10)
+				: undefined) ??
+			file.dfMinAmountSat,
 		jitReceive:
 			cliFlags.jitReceive ??
 			(process.env.BEIGNET_JIT_RECEIVE !== undefined

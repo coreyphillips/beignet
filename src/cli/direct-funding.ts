@@ -280,7 +280,11 @@ const OFFER_RESEND_DELAYS_MS = [7_000, 14_000];
 const OFFER_SESSION_TTL_MS = 60 * 60 * 1000;
 const OUTPOINT_RESERVATION_TTL_MS = 10 * 60 * 1000;
 const MAX_INFLIGHT_OFFER_SESSIONS = 4;
-const MIN_OFFER_AMOUNT_SAT = 20_000;
+/** Absolute floor for direct-funding offers, comfortably above dust,
+ *  channel reserve mechanics, and commitment fee overhead. Operator
+ *  minimums below this (including 0) clamp up to it; the DEFAULT is the
+ *  floor itself, the most permissive safe setting. */
+export const HARD_MIN_OFFER_AMOUNT_SAT = 5_000;
 const MAX_REQUEST_ATTEMPTS = 3;
 
 /**
@@ -836,6 +840,8 @@ export interface IDirectFundingReceiverDeps {
 	resolveOnionPathSecret?: (pathSecretHex: string) => string | undefined;
 	/** Inbound to BUY from the LSP alongside (0 = plain v2, nothing bought). */
 	getTargetInboundSat: () => number;
+	/** Receiver's minimum offer amount (sats); clamped to the hard floor. */
+	getMinAmountSat?: () => number;
 	/** Negotiate option_zeroconf into the open (LSP must trust this node). */
 	getTrusted: () => boolean;
 	/** Preimage (hex) for a receipt hash this node handed out, if any. */
@@ -1079,9 +1085,13 @@ export async function handleOffer(
 	if (!receiptPreimage) {
 		return declineWithoutSession('unknown receipt hash');
 	}
-	if (offer.amountSat < MIN_OFFER_AMOUNT_SAT) {
+	const minAmount = Math.max(
+		deps.getMinAmountSat?.() ?? HARD_MIN_OFFER_AMOUNT_SAT,
+		HARD_MIN_OFFER_AMOUNT_SAT
+	);
+	if (offer.amountSat < minAmount) {
 		return declineWithoutSession(
-			`amount below the ${MIN_OFFER_AMOUNT_SAT} sat direct funding minimum`
+			`amount below this receiver's ${minAmount} sat direct funding minimum`
 		);
 	}
 	const reqTrack = requestAttempts.get(offer.receiptHashHex) ?? {

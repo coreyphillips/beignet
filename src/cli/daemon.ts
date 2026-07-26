@@ -21,6 +21,7 @@ import { encodeBip21 } from '../utils/transaction';
 import * as bitcoinjs from 'bitcoinjs-lib';
 import * as nodeCrypto from 'crypto';
 import {
+	HARD_MIN_OFFER_AMOUNT_SAT,
 	attachDirectFundingReceiver,
 	attachRelayForwarder,
 	sendDirectFunding,
@@ -289,6 +290,7 @@ export async function startDaemon(
 	// Receipt hashes minted via /direct-funding/request live here until their
 	// preimage is revealed as the delivery receipt.
 	const directFundingState: {
+		minAmountSat: number;
 		lspPubkey?: string;
 		/** The LSP's reachable address, signed into requests as the relay
 		 *  transport so senders can route sealed frames through it. */
@@ -317,6 +319,10 @@ export async function startDaemon(
 		requestsById: Map<string, string>;
 		requestsByPathSecret: Map<string, string>;
 	} = {
+		minAmountSat: Math.max(
+			opts.dfMinAmountSat ?? HARD_MIN_OFFER_AMOUNT_SAT,
+			HARD_MIN_OFFER_AMOUNT_SAT
+		),
 		targetInboundSat: 0,
 		trusted: false,
 		receipts: new Map(),
@@ -377,6 +383,7 @@ export async function startDaemon(
 	const directFundingDeps: IDirectFundingReceiverDeps = {
 		getLspPubkey: () => directFundingState.lspPubkey,
 		getTargetInboundSat: () => directFundingState.targetInboundSat,
+		getMinAmountSat: () => directFundingState.minAmountSat,
 		getTrusted: () => directFundingState.trusted,
 		getReceiptPreimage: (hashHex) => {
 			const entry = directFundingState.receipts.get(hashHex);
@@ -484,7 +491,7 @@ export async function startDaemon(
 	const routes: Record<string, RouteHandler> = {
 		// ── Direct funding (1-tx receive) ──
 		'POST /direct-funding/configure': (body) => {
-			const { lspPubkey, lspHost, lspPort, targetInboundSat, trusted } =
+			const { lspPubkey, lspHost, lspPort, targetInboundSat, trusted, minAmountSat } =
 				body as {
 					lspPubkey?: string;
 					/** Where the LSP is reachable; signed into payment requests as
@@ -496,6 +503,9 @@ export async function startDaemon(
 					/** Negotiate option_zeroconf into direct-funded opens (the LSP
 					 *  must trust this node). */
 					trusted?: boolean;
+					/** Minimum offer amount (sats); values below the hard floor,
+					 *  including 0, clamp up to it. */
+					minAmountSat?: number;
 				};
 			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
 			directFundingState.lspPubkey = lspPubkey;
@@ -505,7 +515,14 @@ export async function startDaemon(
 				directFundingState.targetInboundSat = targetInboundSat;
 			}
 			if (trusted !== undefined) directFundingState.trusted = trusted;
+			if (minAmountSat !== undefined) {
+				directFundingState.minAmountSat = Math.max(
+					minAmountSat,
+					HARD_MIN_OFFER_AMOUNT_SAT
+				);
+			}
 			return success({
+				minAmountSat: directFundingState.minAmountSat,
 				lspPubkey: directFundingState.lspPubkey,
 				lspHost: directFundingState.lspHost ?? null,
 				lspPort: directFundingState.lspPort ?? null,
@@ -515,6 +532,7 @@ export async function startDaemon(
 		},
 		'GET /direct-funding/config': () =>
 			success({
+				minAmountSat: directFundingState.minAmountSat,
 				lspPubkey: directFundingState.lspPubkey ?? null,
 				lspHost: directFundingState.lspHost ?? null,
 				lspPort: directFundingState.lspPort ?? null,

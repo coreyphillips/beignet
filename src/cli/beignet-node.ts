@@ -222,6 +222,13 @@ export interface BeignetNodeOptions {
 	 * bit. Does not affect the node's own sends/receives.
 	 */
 	forwardingEnabled?: boolean;
+	/** Node-wide default routing fee policy advertised in channel_update.
+	 *  Per-channel overrides via updateChannelPolicy win. */
+	routingFeeBaseMsat?: number;
+	routingFeePpm?: number;
+	routingCltvDelta?: number;
+	/** Minimum direct-funding offer amount (sats), clamped to a hard floor. */
+	dfMinAmountSat?: number;
 	/**
 	 * Request a gossip graph sync from each peer on connect (default true).
 	 * Without this the node only knows its own channels and cannot route
@@ -887,6 +894,9 @@ export class BeignetNode extends EventEmitter {
 			autoReconnect: opts.autoReconnect ?? true,
 			autoUpdateChannelFees: opts.autoUpdateChannelFees ?? false,
 			forwardingEnabled: opts.forwardingEnabled ?? true,
+			forwardingFeeBaseMsat: opts.routingFeeBaseMsat,
+			forwardingFeePropMillionths: opts.routingFeePpm,
+			forwardingCltvDelta: opts.routingCltvDelta,
 			localFeatures: LightningNode.defaultFeatures(),
 			chainHashes: [chainHash],
 			alias: opts.alias,

@@ -474,6 +474,14 @@ export interface BeignetConfig {
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
+	/** Node-wide default routing fee policy advertised in channel_update.
+	 *  Per-channel overrides via POST /channel/update-policy win. */
+	routingFeeBaseMsat?: number;
+	routingFeePpm?: number;
+	routingCltvDelta?: number;
+	/** Minimum direct-funding offer amount (sats). Clamped to a hard floor
+	 *  above dust; raise it to price sessions higher. */
+	dfMinAmountSat?: number;
 	/** Daemon diagnostic log level ('debug' | 'info' | 'warn' | 'error' |
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */
