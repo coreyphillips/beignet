@@ -42,6 +42,7 @@ import {
 	deserializeBlindedPath
 } from './df-onion';
 import {
+	CHAIN_HASHES,
 	IDfRequestEnvelope,
 	IDfTransportDescriptor,
 	canonicalRequestMessage,
@@ -302,7 +303,7 @@ export async function startDaemon(
 				rendezvousSecretHex: string;
 				expiresAt: number;
 				requestId: string;
-				encryptionPrivateKeyPem: string;
+				encryptionPrivateKeyHex: string;
 				/** Seed of the request's swarm Noise identity, so a restart
 				 *  re-arms the SAME key the envelope pinned. */
 				swarmSeedHex?: string;
@@ -383,12 +384,12 @@ export async function startDaemon(
 			return entry.preimageHex;
 		},
 		onReceiptUsed: (hashHex) => retireRequest(hashHex),
-		getRequestEncryptionPem: (requestId) => {
+		getRequestEncryptionKey: (requestId) => {
 			const hash = directFundingState.requestsById.get(requestId);
 			if (!hash) return undefined;
 			const entry = directFundingState.receipts.get(hash);
 			if (!entry || entry.expiresAt <= Date.now()) return undefined;
-			return entry.encryptionPrivateKeyPem;
+			return entry.encryptionPrivateKeyHex;
 		},
 		resolveOnionPathSecret: (pathSecretHex) => {
 			const hash = directFundingState.requestsByPathSecret.get(pathSecretHex);
@@ -442,7 +443,7 @@ export async function startDaemon(
 				rendezvousSecretHex: string;
 				expiresAt: number;
 				requestId: string;
-				encryptionPrivateKeyPem: string;
+				encryptionPrivateKeyHex: string;
 				swarmSeedHex?: string;
 				onionPathSecretHex?: string;
 			}>;
@@ -605,8 +606,9 @@ export async function startDaemon(
 				});
 			}
 			const unsigned: Omit<IDfRequestEnvelope, 'sig'> = {
-				v: 2,
+				v: 3,
 				requestId,
+				chainHash: CHAIN_HASHES[opts.network ?? 'mainnet'],
 				receiverNodeId: node.getInfo().nodeId,
 				expiresAt,
 				...(amountSats && amountSats > 0 ? { amountSat: amountSats } : {}),
@@ -622,7 +624,7 @@ export async function startDaemon(
 				rendezvousSecretHex,
 				expiresAt,
 				requestId,
-				encryptionPrivateKeyPem: encryption.privateKeyPem,
+				encryptionPrivateKeyHex: encryption.privateKeyHex,
 				...(swarmSeedHex ? { swarmSeedHex } : {}),
 				...(onionPathSecretHex ? { onionPathSecretHex } : {})
 			});
@@ -652,6 +654,12 @@ export async function startDaemon(
 			if (!request)
 				return failure('INVALID_PARAMS', 'request (payment request) required');
 			const env = decodeAndVerifyRequestEnvelope(request);
+			if (env.chainHash !== CHAIN_HASHES[opts.network ?? 'mainnet']) {
+				return failure(
+					'WRONG_CHAIN',
+					'the payment request is for a different chain than this wallet'
+				);
+			}
 			const amount = env.amountSat ?? amountSats;
 			if (!amount || amount <= 0)
 				return failure(

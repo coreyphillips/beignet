@@ -124,6 +124,8 @@ export function computeScriptHash(scriptPubkey: Buffer): string {
  * Events:
  * - 'funding:confirmed' (channelId: Buffer)
  * - 'funding:spent' (channelId: Buffer, spendingTx: Transaction)
+ * - 'funding:recovered' (channelId: Buffer, txid: string) — a previously
+ *   missing funding tx is visible again (mempool or chain).
  * - 'funding:missing' (channelId: Buffer, txid: string) — the watched funding
  *   tx disappeared from mempool AND chain before confirming (evicted/replaced)
  * - 'broadcast:success' (txid: string)
@@ -740,7 +742,10 @@ export class ChainWatcher extends EventEmitter {
 		}
 		// Present again (mempool or chain) — a reorg can bounce a tx back.
 		watched.missingChecks = 0;
-		watched.missingReported = false;
+		if (watched.missingReported) {
+			watched.missingReported = false;
+			this.emit('funding:recovered', watched.channelId, watched.txid);
+		}
 		if (entry.height <= 0) return; // in the mempool, not yet confirmed
 
 		// Calculate confirmations

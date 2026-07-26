@@ -3268,11 +3268,13 @@ export class LightningNode extends EventEmitter {
 		);
 
 		// The funding tx of a not-yet-confirmed channel vanished from mempool
-		// AND chain (evicted or an input was double-spent). For a zero-conf
-		// channel that is already NORMAL, every balance shown against it is
-		// fiction — alarm, then VOID the channel: it never existed on the
-		// network, so there is nothing to close and the contributed coins
-		// remain onchain. 'channel:voided' lets the embedder re-handle them.
+		// AND chain (evicted, or an input was double-spent). Mempool absence
+		// is NOT proof of permanent invalidity: the tx (or a copy held by a
+		// counterparty) can be rebroadcast or mined later. So the channel is
+		// QUARANTINED, never deleted: balances stop being usable, every key,
+		// commitment, and watch is retained, and if the tx reappears the
+		// quarantine lifts. Permanent abandonment is an operator decision
+		// (close/void) once a conflicting spend has actually confirmed.
 		this.chainWatcher.on(
 			'funding:missing',
 			(channelId: Buffer, txid: string) => {
@@ -3283,29 +3285,25 @@ export class LightningNode extends EventEmitter {
 				this.emit('node:error', {
 					code: 'FUNDING_MISSING',
 					channelId,
-					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
+					message: `funding tx ${txid} disappeared from mempool and chain before confirming; channel quarantined until it returns or a conflict confirms`,
 					timestamp: Date.now()
 				} as ILightningError);
 
 				const channel = this.channelManager.getChannel(channelId);
 				if (!channel) return;
-				// A vanished SPLICE tx is different: the pre-splice channel is
-				// real and confirmed — voiding it would destroy a live channel.
-				// Alarm only; splice rollback is a separate (future) path.
-				if (channel.getFullState().spliceInFlight) return;
-				if (this.channelManager.voidChannel(channelId)) {
-					const idHex = channelId.toString('hex');
-					this.chainWatcher?.removeWatchedFunding(channelId);
-					this.safeStorage(
-						() => this.storage!.deleteChannel(idHex),
-						'deleteChannel'
-					);
-					this.emitStructuredLog('channel', 'channel_voided', {
-						channelId: idHex,
-						txid
-					});
-					this.emit('channel:voided', { channelId });
-				}
+				channel.setFundingMissing(true);
+			}
+		);
+		this.chainWatcher.on(
+			'funding:recovered',
+			(channelId: Buffer, txid: string) => {
+				this.emitStructuredLog('chain', 'funding_recovered', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				const channel = this.channelManager.getChannel(channelId);
+				if (!channel) return;
+				channel.setFundingMissing(false);
 			}
 		);
 

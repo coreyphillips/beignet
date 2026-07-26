@@ -187,6 +187,10 @@ interface OfferMsg {
 	sequence: number;
 	/** Sender's change script (hex) — change from its input returns here. */
 	changeScriptHex: string;
+	/** The sender's fee ceiling: its cost above amountSat must not exceed
+	 *  this. Enforced by the sender at sign time; declared here so the
+	 *  receiver can build a transaction that will pass. */
+	maxTotalFeeSat?: number;
 	/** Input-ownership proof: the UTXO's key signs the offer context. */
 	ownership: {
 		pubkeyHex: string;
@@ -236,6 +240,9 @@ interface ReceiptMsg {
 	offerId: string;
 	preimageHex: string;
 	fundingTxidHex: string;
+	/** The complete broadcast transaction when the receiver could fetch it,
+	 *  so the sender can rebroadcast independently. */
+	rawTxHex?: string;
 }
 
 /** The exact string a recipient's node key signs for an attestation. */
@@ -267,9 +274,14 @@ function ownershipMessage(
 const OFFER_TIMEOUT_MS = 60_000;
 const RECEIPT_TIMEOUT_MS = 20_000;
 const OFFER_RESEND_DELAYS_MS = [7_000, 14_000];
-const OFFER_SESSION_TTL_MS = 15 * 60 * 1000;
+// Terminal offer records (tombstones) live as long as a request can: a
+// duplicate offer inside the request's lifetime replays the recorded
+// responses instead of re-executing effects.
+const OFFER_SESSION_TTL_MS = 60 * 60 * 1000;
 const OUTPOINT_RESERVATION_TTL_MS = 10 * 60 * 1000;
 const MAX_INFLIGHT_OFFER_SESSIONS = 4;
+const MIN_OFFER_AMOUNT_SAT = 20_000;
+const MAX_REQUEST_ATTEMPTS = 3;
 
 /**
  * Receiver-side offer idempotence. Offers are AT-LEAST-ONCE: a sender whose
@@ -295,6 +307,17 @@ const outpointReservations = new Map<
 	{ offerId: string; expiresAt: number }
 >();
 
+/**
+ * Per-request throttles: one active funding attempt at a time and a
+ * bounded number of attempts over the request's life. A UTXO owner can
+ * prove ownership endlessly at no cost; what it cannot do is grief the
+ * receiver through unbounded sequential sessions against one request.
+ */
+const requestAttempts = new Map<
+	string,
+	{ attempts: number; activeOfferId?: string; expiresAt: number }
+>();
+
 function pruneOfferState(): void {
 	const now = Date.now();
 	for (const [k, v] of offerSessions) {
@@ -302,6 +325,9 @@ function pruneOfferState(): void {
 	}
 	for (const [k, v] of outpointReservations) {
 		if (v.expiresAt <= now) outpointReservations.delete(k);
+	}
+	for (const [k, v] of requestAttempts) {
+		if (v.expiresAt <= now) requestAttempts.delete(k);
 	}
 }
 
@@ -327,6 +353,11 @@ export interface IDirectFundingSendResult {
 	 *  by the receiver after broadcast. Null when no hash was in play or the
 	 *  receipt did not arrive in time (delivery is still chain-atomic). */
 	receiptPreimageHex: string | null;
+	/** The negotiated funding transaction we signed (unsigned form). */
+	rawTxHex?: string;
+	/** The fully signed funding transaction, when the receipt carried it:
+	 *  lets the sender rebroadcast independently. */
+	broadcastTxHex?: string;
 }
 
 /**
@@ -352,6 +383,8 @@ export async function sendDirectFunding(
 	const wallet = node.onchainWallet;
 	let fundingTxid: string | undefined;
 	let attested = false;
+	let rawTxHex: string | undefined;
+	let broadcastTxHex: string | undefined;
 
 	// One UTXO covering amount + our fee share (no multi-input offers).
 	const utxo = (wallet.listUtxos() ?? [])
@@ -387,8 +420,14 @@ export async function sendDirectFunding(
 		network
 	);
 
-	const offerId = Buffer.from(`${utxo.tx_hash}:${utxo.tx_pos}:${amountSat}`)
-		.toString('hex')
+	// Deterministic over the offer's full content: the same logical payment
+	// retries under the same id (idempotent at the receiver), while any
+	// change of amount or coin is a different offer. A string prefix would
+	// truncate before the amount; hash the whole context.
+	const offerId = crypto
+		.createHash('sha256')
+		.update(`${utxo.tx_hash}:${utxo.tx_pos}:${amountSat}`)
+		.digest('hex')
 		.slice(0, 32);
 
 	// Signing materials for later.
@@ -425,6 +464,7 @@ export async function sendDirectFunding(
 			valueSat: utxo.value,
 			sequence: 0xfffffffd,
 			changeScriptHex: changeScript.toString('hex'),
+			maxTotalFeeSat: feeHeadroomSat,
 			ownership,
 			...(opts.receiptHashHex ? { receiptHashHex: opts.receiptHashHex } : {})
 		} as OfferMsg);
@@ -469,6 +509,7 @@ export async function sendDirectFunding(
 						.sha256(Buffer.from(r.preimageHex, 'hex'))
 						.toString('hex');
 					if (hash !== opts.receiptHashHex) return; // forged receipt: ignore
+					if (r.rawTxHex) broadcastTxHex = r.rawTxHex;
 					cleanup();
 					resolve(r.preimageHex);
 					return;
@@ -482,14 +523,45 @@ export async function sendDirectFunding(
 				signRequestSeen = true;
 				const tx = bitcoin.Transaction.fromHex(req.rawTxHex);
 
-				// Verify OUR input is spent by this exact tx…
+				// Verify OUR input is spent by this exact tx, exactly once, with
+				// exactly the sequence the offer committed to, in a transaction
+				// whose shape is bounded and sane. Every check runs against the
+				// exact bytes we would sign; nothing is taken on trust.
+				const ourMatches = tx.ins.filter(
+					(i) =>
+						Buffer.from(i.hash).equals(prevTxid) && i.index === utxo.tx_pos
+				);
 				const ourIndex = tx.ins.findIndex(
 					(i) =>
 						Buffer.from(i.hash).equals(prevTxid) && i.index === utxo.tx_pos
 				);
-				if (ourIndex < 0) {
+				if (ourMatches.length !== 1) {
 					failUnlessCommitted(
-						new Error('negotiated tx does not spend our input')
+						new Error('negotiated tx does not spend our input exactly once')
+					);
+					return;
+				}
+				if (tx.ins[ourIndex].sequence !== 0xfffffffd) {
+					failUnlessCommitted(
+						new Error('negotiated tx changes our input sequence')
+					);
+					return;
+				}
+				if (tx.version !== 2) {
+					failUnlessCommitted(
+						new Error('unexpected funding transaction version')
+					);
+					return;
+				}
+				if (tx.locktime >= 500_000_000) {
+					failUnlessCommitted(
+						new Error('time-based locktime refused in direct funding')
+					);
+					return;
+				}
+				if (tx.ins.length > 16 || tx.outs.length > 8) {
+					failUnlessCommitted(
+						new Error('funding transaction exceeds direct funding bounds')
 					);
 					return;
 				}
@@ -687,6 +759,17 @@ export async function sendDirectFunding(
 					witnessHex
 				} as WitnessMsg);
 				witnessSent = true;
+				rawTxHex = req.rawTxHex;
+				// The witness is out: the funding may broadcast at any moment.
+				// Freeze the offered UTXO so this wallet's own coin selection
+				// cannot accidentally double-spend it while the funding is
+				// unconfirmed. If the funding confirms the coin is gone anyway;
+				// if the payment is abandoned, unfreezing is a deliberate act.
+				void node
+					.freezeUtxo(utxo.tx_hash, utxo.tx_pos)
+					.catch(() => {
+						/* freezing is protective, not critical */
+					});
 				if (!opts.receiptHashHex) {
 					cleanup();
 					resolve(null);
@@ -731,7 +814,12 @@ export async function sendDirectFunding(
 		spentTxid: utxo.tx_hash,
 		fundingTxid,
 		attested,
-		receiptPreimageHex
+		receiptPreimageHex,
+		// The negotiated transaction (and, when the receipt carried it, the
+		// fully signed broadcast form): everything a caller needs to persist
+		// for post-witness monitoring and independent rebroadcast.
+		rawTxHex,
+		broadcastTxHex
 	};
 }
 
@@ -739,8 +827,8 @@ export async function sendDirectFunding(
 
 export interface IDirectFundingReceiverDeps {
 	getLspPubkey: () => string | undefined;
-	/** PKCS8 PEM of a request's X25519 private key, for sealed offers. */
-	getRequestEncryptionPem?: (requestId: string) => string | undefined;
+	/** Hex secp256k1 private key of a request, for sealed offers. */
+	getRequestEncryptionKey?: (requestId: string) => string | undefined;
 	/** Map a blinded-path path_id (the request's PRIVATE path secret, never
 	 *  present in the envelope) to its request id. BOLT 4: path_id content
 	 *  must be unknowable to the payer, or anyone holding the request could
@@ -879,9 +967,9 @@ export async function dispatchOffer(
 		) {
 			return; // every offer is sealed to a request; anything else is noise
 		}
-		const pem = deps.getRequestEncryptionPem?.(frame.requestId);
-		if (!pem) return; // not our request: say nothing
-		const keys = envelope.receiverDeriveKey(pem, frame.eph, frame.requestId);
+		const priv = deps.getRequestEncryptionKey?.(frame.requestId);
+		if (!priv) return; // not our request: say nothing
+		const keys = envelope.receiverDeriveKey(priv, frame.eph, frame.requestId);
 		payload = envelope.open(
 			keys.recvKey,
 			frame.requestId,
@@ -983,8 +1071,28 @@ export async function handleOffer(
 	const receiptPreimage = offer.receiptHashHex
 		? deps.getReceiptPreimage(offer.receiptHashHex)
 		: undefined;
-	if (offer.receiptHashHex && !receiptPreimage) {
+	if (!offer.receiptHashHex) {
+		// Envelope-only world: every offer pays a minted request. An offer
+		// with no receipt hash is not paying anything this node issued.
+		return declineWithoutSession('missing receipt hash');
+	}
+	if (!receiptPreimage) {
 		return declineWithoutSession('unknown receipt hash');
+	}
+	if (offer.amountSat < MIN_OFFER_AMOUNT_SAT) {
+		return declineWithoutSession(
+			`amount below the ${MIN_OFFER_AMOUNT_SAT} sat direct funding minimum`
+		);
+	}
+	const reqTrack = requestAttempts.get(offer.receiptHashHex) ?? {
+		attempts: 0,
+		expiresAt: Date.now() + OFFER_SESSION_TTL_MS
+	};
+	if (reqTrack.activeOfferId && reqTrack.activeOfferId !== offer.offerId) {
+		return declineWithoutSession('request already has an active funding attempt');
+	}
+	if (reqTrack.attempts >= MAX_REQUEST_ATTEMPTS) {
+		return declineWithoutSession('too many attempts for this request');
 	}
 	// The offer names only an outpoint; the transaction comes from OUR chain
 	// source, so the values below are chain truth rather than sender claims.
@@ -1052,6 +1160,9 @@ export async function handleOffer(
 		offerId: offer.offerId,
 		expiresAt: Date.now() + OUTPOINT_RESERVATION_TTL_MS
 	});
+	reqTrack.attempts += 1;
+	reqTrack.activeOfferId = offer.offerId;
+	requestAttempts.set(offer.receiptHashHex, reqTrack);
 
 	// Everything past this point counts against the in-flight session cap
 	// until it settles, succeeds or fails, so a stalled or failed session
@@ -1106,6 +1217,9 @@ export async function handleOffer(
 				);
 			} finally {
 				offerSession.inflight = false;
+				if (reqTrack.activeOfferId === offer.offerId) {
+					reqTrack.activeOfferId = undefined;
+				}
 			}
 			return;
 		}
@@ -1241,10 +1355,23 @@ export async function handleOffer(
 		const fundingTxidHex = Buffer.from(chanState.fundingTxid!)
 			.reverse()
 			.toString('hex');
+		let receiptRawTxHex: string | undefined;
+		try {
+			const bres = await node.onchainWallet.electrum.getTransactions({
+				txHashes: [{ tx_hash: fundingTxidHex }]
+			});
+			if (!bres.isErr()) {
+				receiptRawTxHex =
+					((bres.value.data?.[0]?.result?.hex ?? '') as string) || undefined;
+			}
+		} catch {
+			/* receipt still valid without the raw tx */
+		}
 		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT, {
 			offerId: offer.offerId,
 			preimageHex: receiptPreimage,
-			fundingTxidHex
+			fundingTxidHex,
+			...(receiptRawTxHex ? { rawTxHex: receiptRawTxHex } : {})
 		} as ReceiptMsg);
 		deps.onReceiptUsed?.(offer.receiptHashHex);
 	}
@@ -1254,6 +1381,9 @@ export async function handleOffer(
 	);
 	} finally {
 		offerSession.inflight = false;
+		if (reqTrack.activeOfferId === offer.offerId) {
+			reqTrack.activeOfferId = undefined;
+		}
 	}
 }
 
@@ -1395,10 +1525,23 @@ async function handleSpliceOffer(
 	});
 
 	if (offer.receiptHashHex && receiptPreimage) {
+		let receiptRawTxHex: string | undefined;
+		try {
+			const bres = await node.onchainWallet.electrum.getTransactions({
+				txHashes: [{ tx_hash: rawTx.getId() }]
+			});
+			if (!bres.isErr()) {
+				receiptRawTxHex =
+					((bres.value.data?.[0]?.result?.hex ?? '') as string) || undefined;
+			}
+		} catch {
+			/* receipt still valid without the raw tx */
+		}
 		transport.send(BeignetCustomSubtype.DIRECT_FUNDING_RECEIPT, {
 			offerId: offer.offerId,
 			preimageHex: receiptPreimage,
-			fundingTxidHex: rawTx.getId()
+			fundingTxidHex: rawTx.getId(),
+			...(receiptRawTxHex ? { rawTxHex: receiptRawTxHex } : {})
 		} as ReceiptMsg);
 		deps.onReceiptUsed?.(offer.receiptHashHex);
 	}

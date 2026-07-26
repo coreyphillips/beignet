@@ -7970,7 +7970,20 @@ export class Channel {
 	 * invoice routing hints that describe the channel rather than use it
 	 * immediately.
 	 */
+	/** Funding tx currently absent from mempool and chain (may return). While
+	 *  set, the channel is quarantined: no HTLCs, balances not creditable. */
+	private _fundingMissing = false;
+
+	setFundingMissing(missing: boolean): void {
+		this._fundingMissing = missing;
+	}
+
+	isFundingMissing(): boolean {
+		return this._fundingMissing;
+	}
+
 	isHtlcUsable(lookThroughReestablish = false): boolean {
+		if (this._fundingMissing) return false;
 		const eff =
 			lookThroughReestablish &&
 			this._state.state === ChannelState.AWAITING_REESTABLISH

@@ -4,6 +4,11 @@ import {
 	zbase32Encode,
 	zbase32Decode
 } from '../lightning/crypto/message-signing';
+import {
+	ecdh,
+	getPublicKey,
+	isValidPrivateKey
+} from '../lightning/crypto/ecdh';
 import { DfTransport } from './direct-funding';
 
 /**
@@ -22,8 +27,9 @@ import { DfTransport } from './direct-funding';
  * layer with key separation from the Lightning identity key: the same
  * sealed envelope can travel over a swarm socket, a Lightning peer relay,
  * or store-and-forward infrastructure without replumbing. Frames are
- * AES-256-GCM, keyed by ECDH(ephemeral sender key, request key) through
- * HKDF, with the request id and message subtype bound as associated data.
+ * ChaCha20-Poly1305, keyed per direction by secp256k1
+ * ECDH(ephemeral sender key, request key) through HKDF-SHA256, with the
+ * request id and message subtype bound as associated data.
  */
 
 /** A blinded path in envelope form: all fields hex. */
@@ -50,15 +56,28 @@ export interface IDfTransportDescriptor {
 	noiseKey?: string;
 }
 
+/** BOLT chain_hash values (genesis hash, internal byte order). */
+export const CHAIN_HASHES: Record<string, string> = {
+	mainnet: '6fe28c0ab6f1b372c1a6a246ae63f74f931e8365e15a089c68d6190000000000',
+	testnet: '43497fd7f826957108f4a30fd9cec3aeba79972084e90ead01ea330900000000',
+	signet: 'f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000',
+	regtest: '06226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f'
+};
+
 export interface IDfRequestEnvelope {
-	v: 2;
+	v: 3;
 	requestId: string;
+	/** BOLT chain_hash of the intended chain. A node key reused across
+	 *  networks cannot have a request replayed onto the wrong chain. */
+	chainHash: string;
 	receiverNodeId: string;
 	expiresAt: number;
 	/** Optional fixed amount the request asks for (sats). */
 	amountSat?: number;
 	receiptHash: string;
-	/** Per-request X25519 public key (hex, raw 32 bytes). */
+	/** Per-request secp256k1 public key (hex, 33 bytes compressed). Chosen
+	 *  over X25519 so implementations need no primitives beyond what
+	 *  Lightning already requires (secp256k1 ECDH, HKDF, ChaCha20). */
 	encryptionKey: string;
 	transports: IDfTransportDescriptor[];
 	/** Receiver node-key signature over canonicalRequestMessage(...). */
@@ -71,21 +90,26 @@ export interface IDfRequestEnvelope {
 // is encoded as compact binary, base64url once. The JSON-of-hex form cost
 // about 2.7x the bytes and pushed real requests toward the QR ceiling.
 //
-//   u8   version (2)
+//   u8   version (3)
 //   16B  requestId
+//   32B  chainHash (BOLT chain_hash of the intended chain)
 //   33B  receiverNodeId
 //   u48  expiresAt (ms)
 //   u8   flags (bit0: amountSat present)
 //   [u64 amountSat]
 //   32B  receiptHash
-//   32B  encryptionKey
-//   u8   transport count, then per transport a u8 type tag:
+//   33B  encryptionKey (secp256k1 compressed)
+//   u8   transport count, then per transport:
+//     u8 type tag, u16 value length, value
+//   65B  sig (compact recoverable, the zbase32 signature decoded)
+//
+// The outer length on every descriptor makes unknown types skippable, so
+// new transports can be added without breaking old decoders. Values:
 //     1 ln:    u8 hostLen, host, u16 port
 //     2 onion: u8 hostLen, host, u16 port, 33B intro, 33B blinding,
 //              u8 hopCount, per hop: 33B id, u16 dataLen, data
 //     3 lsp:   33B nodeId, u8 hostLen, host, u16 port
 //     4 swarm: 32B rendezvous, 32B noiseKey
-//   65B  sig (compact recoverable, the zbase32 signature decoded)
 
 const TRANSPORT_TAGS: Record<string, number> = {
 	ln: 1,
@@ -107,8 +131,9 @@ function encodeUnsignedBytes(env: Omit<IDfRequestEnvelope, 'sig'>): Buffer {
 		if (h.length > 255) throw new Error('host too long');
 		return Buffer.concat([u8(h.length), h, u16(port ?? 0)]);
 	};
-	parts.push(u8(2));
+	parts.push(u8(3));
 	parts.push(Buffer.from(env.requestId, 'hex'));
+	parts.push(Buffer.from(env.chainHash, 'hex'));
 	parts.push(Buffer.from(env.receiverNodeId, 'hex'));
 	const exp = Buffer.alloc(6);
 	exp.writeUIntBE(env.expiresAt, 0, 6);
@@ -125,26 +150,28 @@ function encodeUnsignedBytes(env: Omit<IDfRequestEnvelope, 'sig'>): Buffer {
 	for (const t of env.transports) {
 		const tag = TRANSPORT_TAGS[t.type];
 		if (!tag) throw new Error(`unknown transport type ${t.type}`);
-		parts.push(u8(tag));
+		const value: Buffer[] = [];
 		if (t.type === 'ln') {
-			parts.push(hostField(t.host, t.port));
+			value.push(hostField(t.host, t.port));
 		} else if (t.type === 'onion') {
 			if (!t.path) throw new Error('onion transport without path');
-			parts.push(hostField(t.host, t.port));
-			parts.push(Buffer.from(t.path.intro, 'hex'));
-			parts.push(Buffer.from(t.path.blinding, 'hex'));
-			parts.push(u8(t.path.hops.length));
+			value.push(hostField(t.host, t.port));
+			value.push(Buffer.from(t.path.intro, 'hex'));
+			value.push(Buffer.from(t.path.blinding, 'hex'));
+			value.push(u8(t.path.hops.length));
 			for (const hop of t.path.hops) {
 				const data = Buffer.from(hop.data, 'hex');
-				parts.push(Buffer.from(hop.id, 'hex'), u16(data.length), data);
+				value.push(Buffer.from(hop.id, 'hex'), u16(data.length), data);
 			}
 		} else if (t.type === 'lsp') {
-			parts.push(Buffer.from(t.nodeId ?? '', 'hex'));
-			parts.push(hostField(t.host, t.port));
+			value.push(Buffer.from(t.nodeId ?? '', 'hex'));
+			value.push(hostField(t.host, t.port));
 		} else {
-			parts.push(Buffer.from(t.rendezvous ?? '', 'hex'));
-			parts.push(Buffer.from(t.noiseKey ?? '', 'hex'));
+			value.push(Buffer.from(t.rendezvous ?? '', 'hex'));
+			value.push(Buffer.from(t.noiseKey ?? '', 'hex'));
 		}
+		const v = Buffer.concat(value);
+		parts.push(u8(tag), u16(v.length), v);
 	}
 	return Buffer.concat(parts);
 }
@@ -154,7 +181,7 @@ function encodeUnsignedBytes(env: Omit<IDfRequestEnvelope, 'sig'>): Buffer {
 export function canonicalRequestMessage(
 	env: Omit<IDfRequestEnvelope, 'sig'>
 ): string {
-	return `beignet-df-req:v2:${encodeUnsignedBytes(env).toString('base64url')}`;
+	return `beignet-df-req:v3:${encodeUnsignedBytes(env).toString('base64url')}`;
 }
 
 export function encodeRequestEnvelope(env: IDfRequestEnvelope): string {
@@ -202,34 +229,36 @@ export function decodeAndVerifyRequestEnvelope(
 		const raw = Buffer.from(encoded, 'base64url');
 		const r = new ByteReader(raw);
 		const v = r.u8();
-		if (v !== 2) {
+		if (v !== 3) {
 			throw new Error(`unsupported payment request version ${v}`);
 		}
 		const requestId = r.take(16).toString('hex');
+		const chainHash = r.take(32).toString('hex');
 		const receiverNodeId = r.take(33).toString('hex');
 		const expiresAt = r.take(6).readUIntBE(0, 6);
 		const flags = r.u8();
 		const amountSat =
 			flags & 1 ? Number(r.take(8).readBigUInt64BE()) : undefined;
 		const receiptHash = r.take(32).toString('hex');
-		const encryptionKey = r.take(32).toString('hex');
+		const encryptionKey = r.take(33).toString('hex');
 		const count = r.u8();
 		const transports: IDfTransportDescriptor[] = [];
 		for (let i = 0; i < count; i++) {
 			const tag = r.u8();
+			const value = new ByteReader(Buffer.from(r.take(r.u16())));
 			if (tag === 1) {
-				const host = r.take(r.u8()).toString('utf8');
-				transports.push({ type: 'ln', host, port: r.u16() });
+				const host = value.take(value.u8()).toString('utf8');
+				transports.push({ type: 'ln', host, port: value.u16() });
 			} else if (tag === 2) {
-				const host = r.take(r.u8()).toString('utf8');
-				const port = r.u16();
-				const intro = r.take(33).toString('hex');
-				const blinding = r.take(33).toString('hex');
-				const hopCount = r.u8();
+				const host = value.take(value.u8()).toString('utf8');
+				const port = value.u16();
+				const intro = value.take(33).toString('hex');
+				const blinding = value.take(33).toString('hex');
+				const hopCount = value.u8();
 				const hops: Array<{ id: string; data: string }> = [];
 				for (let h = 0; h < hopCount; h++) {
-					const id = r.take(33).toString('hex');
-					hops.push({ id, data: r.take(r.u16()).toString('hex') });
+					const id = value.take(33).toString('hex');
+					hops.push({ id, data: value.take(value.u16()).toString('hex') });
 				}
 				transports.push({
 					type: 'onion',
@@ -238,26 +267,27 @@ export function decodeAndVerifyRequestEnvelope(
 					path: { intro, blinding, hops }
 				});
 			} else if (tag === 3) {
-				const nodeId = r.take(33).toString('hex');
-				const host = r.take(r.u8()).toString('utf8');
-				transports.push({ type: 'lsp', nodeId, host, port: r.u16() });
+				const nodeId = value.take(33).toString('hex');
+				const host = value.take(value.u8()).toString('utf8');
+				transports.push({ type: 'lsp', nodeId, host, port: value.u16() });
 			} else if (tag === 4) {
 				transports.push({
 					type: 'swarm',
-					rendezvous: r.take(32).toString('hex'),
-					noiseKey: r.take(32).toString('hex')
+					rendezvous: value.take(32).toString('hex'),
+					noiseKey: value.take(32).toString('hex')
 				});
-			} else {
-				throw new Error('payment request is malformed');
 			}
+			// Unknown tags: the outer length already skipped the value, so a
+			// decoder simply does not gain that transport. Forward compatible.
 		}
 		sigBytes = Buffer.from(r.take(65));
 		if (r.remaining() !== 0) {
 			throw new Error('payment request is malformed');
 		}
 		env = {
-			v: 2,
+			v: 3,
 			requestId,
+			chainHash,
 			receiverNodeId,
 			expiresAt,
 			...(amountSat !== undefined ? { amountSat } : {}),
@@ -289,31 +319,27 @@ export function decodeAndVerifyRequestEnvelope(
 
 // ─────────────── Per-request encryption ───────────────
 
-const HKDF_INFO_S2R = 'beignet-df-v1/sender-to-receiver';
-const HKDF_INFO_R2S = 'beignet-df-v1/receiver-to-sender';
-
-function x25519PublicFromRaw(raw: Buffer): crypto.KeyObject {
-	return crypto.createPublicKey({
-		key: { kty: 'OKP', crv: 'X25519', x: raw.toString('base64url') },
-		format: 'jwk'
-	});
-}
+const HKDF_INFO_S2R = 'beignet-df:v3:sender-to-receiver';
+const HKDF_INFO_R2S = 'beignet-df:v3:receiver-to-sender';
 
 export interface IRequestEncryptionKeys {
-	/** Raw public key hex, published in the envelope. */
+	/** Compressed secp256k1 public key hex, published in the envelope. */
 	publicKeyHex: string;
-	/** PKCS8 PEM of the private key, held by the receiver until expiry. */
-	privateKeyPem: string;
+	/** 32-byte private key hex, held by the receiver until expiry. */
+	privateKeyHex: string;
 }
 
+/** secp256k1 keeps the primitive set to what Lightning implementations
+ *  already carry: secp256k1 ECDH, HKDF-SHA256, ChaCha20-Poly1305. The
+ *  node identity key still never encrypts anything. */
 export function mintRequestEncryptionKeys(): IRequestEncryptionKeys {
-	const { publicKey, privateKey } = crypto.generateKeyPairSync('x25519');
-	const jwk = publicKey.export({ format: 'jwk' }) as { x: string };
+	let priv: Buffer;
+	do {
+		priv = crypto.randomBytes(32);
+	} while (!isValidPrivateKey(priv));
 	return {
-		publicKeyHex: Buffer.from(jwk.x, 'base64url').toString('hex'),
-		privateKeyPem: privateKey
-			.export({ type: 'pkcs8', format: 'pem' })
-			.toString()
+		publicKeyHex: getPublicKey(priv).toString('hex'),
+		privateKeyHex: priv.toString('hex')
 	};
 }
 
@@ -347,31 +373,30 @@ export function senderDeriveKey(
 	requestPublicKeyHex: string,
 	requestIdHex: string
 ): { keys: ILaneKeys; ephemeralPublicHex: string } {
-	const eph = crypto.generateKeyPairSync('x25519');
-	const shared = crypto.diffieHellman({
-		privateKey: eph.privateKey,
-		publicKey: x25519PublicFromRaw(Buffer.from(requestPublicKeyHex, 'hex'))
-	});
-	const jwk = eph.publicKey.export({ format: 'jwk' }) as { x: string };
+	let eph: Buffer;
+	do {
+		eph = crypto.randomBytes(32);
+	} while (!isValidPrivateKey(eph));
+	const shared = ecdh(eph, Buffer.from(requestPublicKeyHex, 'hex'));
 	return {
 		keys: {
 			sendKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_S2R),
 			recvKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_R2S)
 		},
-		ephemeralPublicHex: Buffer.from(jwk.x, 'base64url').toString('hex')
+		ephemeralPublicHex: getPublicKey(eph).toString('hex')
 	};
 }
 
 /** Receiver side: the request's private key against the sender ephemeral. */
 export function receiverDeriveKey(
-	privateKeyPem: string,
+	privateKeyHex: string,
 	ephemeralPublicHex: string,
 	requestIdHex: string
 ): ILaneKeys {
-	const shared = crypto.diffieHellman({
-		privateKey: crypto.createPrivateKey(privateKeyPem),
-		publicKey: x25519PublicFromRaw(Buffer.from(ephemeralPublicHex, 'hex'))
-	});
+	const shared = ecdh(
+		Buffer.from(privateKeyHex, 'hex'),
+		Buffer.from(ephemeralPublicHex, 'hex')
+	);
 	return {
 		sendKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_R2S),
 		recvKey: deriveDirectional(shared, requestIdHex, HKDF_INFO_S2R)
@@ -391,10 +416,15 @@ export function seal(
 	payload: object
 ): { n: string; c: string } {
 	const nonce = crypto.randomBytes(12);
-	const cipher = crypto.createCipheriv('aes-256-gcm', key, nonce);
-	cipher.setAAD(aad(requestIdHex, subtype));
+	const plaintext = Buffer.from(JSON.stringify(payload), 'utf8');
+	const cipher = crypto.createCipheriv('chacha20-poly1305', key, nonce, {
+		authTagLength: 16
+	});
+	cipher.setAAD(aad(requestIdHex, subtype), {
+		plaintextLength: plaintext.length
+	});
 	const ct = Buffer.concat([
-		cipher.update(Buffer.from(JSON.stringify(payload), 'utf8')),
+		cipher.update(plaintext),
 		cipher.final(),
 		cipher.getAuthTag()
 	]);
@@ -411,8 +441,12 @@ export function open(
 	const ct = Buffer.from(frame.c, 'hex');
 	const tag = ct.subarray(ct.length - 16);
 	const body = ct.subarray(0, ct.length - 16);
-	const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
-	decipher.setAAD(aad(requestIdHex, subtype));
+	const decipher = crypto.createDecipheriv('chacha20-poly1305', key, nonce, {
+		authTagLength: 16
+	});
+	decipher.setAAD(aad(requestIdHex, subtype), {
+		plaintextLength: body.length
+	});
 	decipher.setAuthTag(tag);
 	return Buffer.concat([decipher.update(body), decipher.final()]);
 }
