@@ -507,8 +507,12 @@ export async function startDaemon(
 					 *  including 0, clamp up to it. */
 					minAmountSat?: number;
 				};
-			if (!lspPubkey) return failure('INVALID_PARAMS', 'lspPubkey required');
-			directFundingState.lspPubkey = lspPubkey;
+			// Partial updates are fine once an LSP is set: policy fields like
+			// minAmountSat adjust without restating the pairing.
+			if (!lspPubkey && !directFundingState.lspPubkey) {
+				return failure('INVALID_PARAMS', 'lspPubkey required');
+			}
+			if (lspPubkey) directFundingState.lspPubkey = lspPubkey;
 			if (lspHost !== undefined) directFundingState.lspHost = lspHost;
 			if (lspPort !== undefined) directFundingState.lspPort = lspPort;
 			if (targetInboundSat !== undefined) {
