@@ -21,6 +21,7 @@ import {
 } from './types';
 import {
 	encodeOfferTlv,
+	decodeOfferTlv,
 	encodeInvoiceRequestTlv,
 	decodeInvoiceRequestTlv,
 	encodeInvoiceTlv,
@@ -37,7 +38,9 @@ import {
 } from './merkle';
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
+import { decodeNoChecksum } from './bech32-nochecksum';
 import { ITlvRecord } from '../message/tlv';
+import type { IStorageBackend } from '../storage/types';
 import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
@@ -133,6 +136,8 @@ export class OfferManager extends EventEmitter {
 	 */
 	private invoicePreimages: Map<string, Buffer> = new Map();
 	private invoiceRequestTimeoutMs: number;
+	/** Persistent backend for offers; null keeps the manager memory-only. */
+	private storage: IStorageBackend | null = null;
 
 	constructor(
 		nodePrivkey: Buffer,
@@ -148,6 +153,54 @@ export class OfferManager extends EventEmitter {
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
+		}
+	}
+
+	/**
+	 * Attach persistent storage and rehydrate offers from previous runs.
+	 *
+	 * An offer is a long-lived payment code: the shared string keeps
+	 * circulating whether or not this process restarted, so the node must
+	 * keep answering invoice_requests for it. Without this, a restart made
+	 * every previously shared offer unpayable (answered "Unknown offer").
+	 *
+	 * The stored bech32m encoding is authoritative: the TLV bytes come
+	 * straight out of it (so invreq mirroring sees the original bytes), and
+	 * the offer id is recomputed and checked against the row key, skipping
+	 * anything corrupt. Offers already in memory win over rows. Offers whose
+	 * absoluteExpiry has passed are deleted instead of loaded;
+	 * handleInvoiceRequest would refuse them anyway.
+	 */
+	attachStorage(storage: IStorageBackend): void {
+		this.storage = storage;
+		const rows = storage.loadAllOffers?.() ?? [];
+		const now = BigInt(Math.floor(Date.now() / 1000));
+		for (const row of rows) {
+			try {
+				const decoded = decodeNoChecksum(row.encoded);
+				if (decoded.hrp !== 'lno') continue;
+				const tlvData = decoded.data;
+				const { offer: bare, records } = decodeOfferTlv(tlvData);
+				const offerId = computeOfferId(records);
+				const offerIdHex = offerId.toString('hex');
+				if (offerIdHex !== row.offerIdHex) continue;
+				const offer: IOffer = { ...bare, offerId };
+				if (offer.absoluteExpiry !== undefined && now >= offer.absoluteExpiry) {
+					storage.deleteOffer?.(row.offerIdHex);
+					continue;
+				}
+				if (this.offers.has(offerIdHex)) continue;
+				this.offers.set(offerIdHex, {
+					offer,
+					encoded: row.encoded,
+					tlvData,
+					pathId: row.pathId ?? undefined
+				});
+			} catch {
+				// A row that cannot be decoded cannot be turned back into an
+				// offer; leave it in place and load the rest.
+				continue;
+			}
 		}
 	}
 
@@ -219,6 +272,12 @@ export class OfferManager extends EventEmitter {
 			tlvData,
 			pathId: options.pathId
 		});
+		this.storage?.saveOffer?.(
+			offerId.toString('hex'),
+			encoded,
+			options.pathId ?? null,
+			Date.now()
+		);
 
 		this.emit('offer:created', offer, encoded);
 		return { offer, encoded };
@@ -252,9 +311,10 @@ export class OfferManager extends EventEmitter {
 	}
 
 	/**
-	 * Remove a stored offer.
+	 * Remove a stored offer, from memory and from persistent storage.
 	 */
 	removeOffer(offerId: Buffer): boolean {
+		this.storage?.deleteOffer?.(offerId.toString('hex'));
 		return this.offers.delete(offerId.toString('hex'));
 	}
 

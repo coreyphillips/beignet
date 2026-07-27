@@ -126,7 +126,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 9;
+	static readonly CURRENT_SCHEMA_VERSION = 10;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -184,7 +184,13 @@ export class SqliteStorage implements IStorageBackend {
 		// On-chain wallet state (addresses, UTXOs, transactions, balance) is
 		// privacy-sensitive: a stolen DB file must not reveal the wallet's
 		// holdings or address set.
-		{ table: 'wallet_data', pk: 'key', columns: ['value'] }
+		{ table: 'wallet_data', pk: 'key', columns: ['value'] },
+		// A BOLT 12 offer is made to be shared, but the set of offers a node
+		// issued is still its payment identity, and path_id is the secret that
+		// authenticates invoice_requests arriving over the offer's blinded
+		// paths (null for offers without one; null columns are skipped by the
+		// encryption rollout).
+		{ table: 'offers', pk: 'offer_id', columns: ['encoded', 'path_id'] }
 	];
 
 	/**
@@ -308,6 +314,13 @@ export class SqliteStorage implements IStorageBackend {
 
 			CREATE TABLE IF NOT EXISTS schema_version (
 				version INTEGER PRIMARY KEY
+			);
+
+			CREATE TABLE IF NOT EXISTS offers (
+				offer_id TEXT PRIMARY KEY,
+				encoded TEXT NOT NULL,
+				path_id TEXT,
+				created_at INTEGER NOT NULL
 			);
 
 			CREATE TABLE IF NOT EXISTS metadata (
@@ -1188,6 +1201,14 @@ export class SqliteStorage implements IStorageBackend {
 				} catch {
 					// Column may already exist
 				}
+			},
+			// Migration 9->10: offers table (BOLT 12 offer persistence, so a
+			// shared offer survives a restart instead of dying with the
+			// process). Created via CREATE IF NOT EXISTS above; encoded and
+			// path_id are in ENCRYPTED_COLUMNS so they are encrypted at rest
+			// when a key is set.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1314,6 +1335,68 @@ export class SqliteStorage implements IStorageBackend {
 		this.db
 			.prepare('DELETE FROM peer_storage_blobs WHERE peer_pubkey = ?')
 			.run(peerPubkey);
+	}
+
+	// ─── BOLT 12 Offers ───
+
+	saveOffer(
+		offerIdHex: string,
+		encoded: string,
+		pathId: Buffer | null,
+		createdAt: number
+	): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO offers (offer_id, encoded, path_id, created_at) VALUES (?, ?, ?, ?)'
+			)
+			.run(
+				offerIdHex,
+				this._enc(encoded),
+				pathId ? this._enc(pathId.toString('hex')) : null,
+				createdAt
+			);
+	}
+
+	loadAllOffers(): Array<{
+		offerIdHex: string;
+		encoded: string;
+		pathId: Buffer | null;
+		createdAt: number;
+	}> {
+		const rows = this.db
+			.prepare('SELECT offer_id, encoded, path_id, created_at FROM offers')
+			.all() as Array<{
+			offer_id: string;
+			encoded: string;
+			path_id: string | null;
+			created_at: number;
+		}>;
+		const results: Array<{
+			offerIdHex: string;
+			encoded: string;
+			pathId: Buffer | null;
+			createdAt: number;
+		}> = [];
+		for (const row of rows) {
+			try {
+				results.push({
+					offerIdHex: row.offer_id,
+					encoded: this._dec(row.encoded),
+					pathId: row.path_id
+						? Buffer.from(this._dec(row.path_id), 'hex')
+						: null,
+					createdAt: row.created_at
+				});
+			} catch (err) {
+				// Skip corrupted row
+				this.reportCorruptRow(err);
+			}
+		}
+		return results;
+	}
+
+	deleteOffer(offerIdHex: string): void {
+		this.db.prepare('DELETE FROM offers WHERE offer_id = ?').run(offerIdHex);
 	}
 
 	// ─── Watchtower (LND altruist client) ───
