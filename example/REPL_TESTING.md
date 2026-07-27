@@ -1,4 +1,4 @@
-# Beignet Lightning REPL — Testing Walkthrough
+# Beignet Lightning REPL: Testing Walkthrough
 
 Copy-paste sequences for exercising a live `BeignetNode` from the REPL.
 
@@ -13,6 +13,44 @@ Inside the REPL the node is bound to `node`. Type `help()` for the full command 
 
 > Tip: every command below assumes the `beignet>` prompt. Anything returning a
 > Promise is shown with `await`.
+
+---
+
+## REPL flags
+
+Everything after `--` is passed to `example/lightning.ts`. Positional args are
+order-independent: a recognized network name sets the network, and any other bare
+words are collected as the mnemonic.
+
+| Flag | Effect |
+|------|--------|
+| `mainnet` \| `testnet` \| `regtest` | Network (default `mainnet`). The example does not wire up signet |
+| `<12 or 24 bare words>` | Reuse a mnemonic. Omit to generate a fresh one |
+| `--alias <name>` | Node alias advertised in `node_announcement` (max 32 bytes UTF-8) |
+| `--electrum-host <host>` | Electrum server host (default: the network's public server) |
+| `--electrum-port <port>` | Electrum server port |
+| `--electrum-ssl` | Force TLS to Electrum |
+| `--electrum-tcp` / `--electrum-no-ssl` | Force plaintext TCP to Electrum |
+| `--tor-proxy <host:port>` | Route outbound peer connections through a SOCKS5 proxy, e.g. `127.0.0.1:9050`. Required to reach peers that only advertise a `.onion` address. The proxy is probed at startup and the example exits if it is unreachable |
+| `--full-graph` | Also bootstrap to DNS-seed peers for live p2p gossip, so the node can route to arbitrary public destinations rather than just its own channel peers. On mainnet, Rapid Gossip Sync already downloads the graph in the background without this |
+| `--low-level` | Drive `LightningNode` directly instead of `BeignetNode`: bigint msat, Buffer IDs, manual funding. Prompt becomes `lightning>` and state goes to `example/lightningData/node.db` |
+| `--payment-flow` | Non-interactive: spins up two `BeignetNode`s on regtest and walks the payment API (invoice creation, decode, `canSend`, health, mainnet readiness), then shuts down. It opens no channels, so no payment is actually settled |
+
+Examples:
+
+```bash
+# named regtest node against a local Electrum server
+npm run example:lightning -- regtest --electrum-host 127.0.0.1 --electrum-port 60001 --alias mynode
+
+# mainnet node over Tor with the full network graph
+npm run example:lightning -- "<YOUR MNEMONIC>" mainnet --tor-proxy 127.0.0.1:9050 --full-graph
+
+# protocol-layer REPL
+npm run example:lightning -- regtest --low-level
+```
+
+`BeignetNode` state lives in a SQLite DB under `~/.beignet/data/<hash-of-mnemonic>/`,
+so the same mnemonic always reopens the same node.
 
 ---
 
@@ -49,7 +87,7 @@ await node.sendMaxOnchain('<address>', 5)    // sweep at 5 sats/vB
 ## 2. Connect to a peer
 
 ```js
-// Synonym/Blocktank node (example — swap in your own target):
+// Synonym/Blocktank node (example only: swap in your own target):
 await node.connectPeer(
   '028a8910b0048630d4eb17af25668cdd7ea6f2d8ae20956e7a06e2ae46ebcb69fc',
   '34.65.86.104',
