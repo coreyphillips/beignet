@@ -886,6 +886,19 @@ describe('BOLT 12: Offers', () => {
 			mgr.destroy();
 		});
 
+		it('should list offers with the encoding a payer needs', () => {
+			const mgr = new OfferManager(privkey1);
+			const created = mgr.createOffer({ description: 'shareable' });
+
+			const entries = mgr.listOfferEntries();
+			expect(entries).to.have.length(1);
+			expect(entries[0].offer.offerId.equals(created.offer.offerId)).to.be.true;
+			expect(entries[0].encoded).to.equal(created.encoded);
+			expect(entries[0].encoded.startsWith('lno1')).to.be.true;
+
+			mgr.destroy();
+		});
+
 		it('should remove an offer', () => {
 			const mgr = new OfferManager(privkey1);
 			const { offer } = mgr.createOffer({ description: 'removable' });

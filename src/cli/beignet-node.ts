@@ -4255,7 +4255,11 @@ export class BeignetNode extends EventEmitter {
 
 	listOffers(): OfferInfo[] {
 		const mgr = this.node.getOfferManager();
-		return mgr.listOffers().map((offer) => this.toOfferInfo(offer));
+		// The encoding rides along: it is the string a payer needs, and
+		// without it a listing can only show the offer id.
+		return mgr
+			.listOfferEntries()
+			.map(({ offer, encoded }) => this.toOfferInfo(offer, encoded));
 	}
 
 	async payOffer(
