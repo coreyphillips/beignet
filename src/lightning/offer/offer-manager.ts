@@ -240,6 +240,18 @@ export class OfferManager extends EventEmitter {
 	}
 
 	/**
+	 * List all stored offers together with their bech32m encodings. The
+	 * encoding is what a payer needs handed to them; a listing meant for
+	 * display uses this rather than re-encoding from the offer.
+	 */
+	listOfferEntries(): Array<{ offer: IOffer; encoded: string }> {
+		return Array.from(this.offers.values()).map((e) => ({
+			offer: e.offer,
+			encoded: e.encoded
+		}));
+	}
+
+	/**
 	 * Remove a stored offer.
 	 */
 	removeOffer(offerId: Buffer): boolean {
