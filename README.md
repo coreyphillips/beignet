@@ -598,6 +598,24 @@ npm run test:all           # Lightning + CLI + interop (needs Docker + Electrum)
 
 Counts are floors, not snapshots. Run the suites for exact numbers.
 
+The on-chain wallet suites live in `tests/*.test.ts` and connect to **live public
+Electrum servers**, so they need network access and can fail on a server outage
+rather than on your change. Each script runs `yarn build` first, so yarn has to be
+installed:
+
+```bash
+npm run test:wallet        # also test:transaction, test:electrum, test:storage,
+                           # test:derivation, test:receive, test:boost
+npm test                   # everything: build, on-chain, Lightning, CLI, interop
+```
+
+The on-chain files without a dedicated script (multisig, PSBT, watch-only,
+descriptors, signet and others) run through mocha directly:
+
+```bash
+npx mocha --exit -r ts-node/register 'tests/multisig.test.ts'
+```
+
 `test:conformance` runs the official BOLT test vectors (BOLT 1 bigsize/TLV, BOLT 3 commitments and anchors and per-commitment secrets, BOLT 4 onion/route-blinding/onion-errors, BOLT 7 extended queries, BOLT 8 transport, BOLT 11 invoices, BOLT 12 offers/signatures) under `tests/lightning/conformance/`.
 
 <details>

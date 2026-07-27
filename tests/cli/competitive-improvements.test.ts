@@ -528,20 +528,27 @@ describe('Documentation Accuracy', () => {
 	// Every one of them had drifted below reality, so the test was enforcing
 	// documentation that was already wrong. Counts in the README are now
 	// floors, and the assertions below guard structure instead of prose.
-	it('README.md documents every primary test suite', () => {
+	it('README.md documents every test suite script', () => {
 		const readme = fs.readFileSync(
 			path.join(__dirname, '../../README.md'),
 			'utf-8'
 		);
-		const suites = [
-			'test:lightning',
-			'test:cli',
-			'test:conformance',
-			'test:integration',
-			'test:interop',
-			'test:all'
-		];
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf-8')
+		);
+		// Derived from package.json rather than hardcoded, so adding a suite
+		// without documenting it fails here.
+		const suites = Object.keys(pkg.scripts).filter((s) =>
+			s.startsWith('test:')
+		);
+		expect(suites.length).to.be.greaterThan(0);
 		for (const suite of suites) {
+			expect(readme, `README should mention the ${suite} script`).to.include(
+				suite
+			);
+		}
+		// The suites run directly by name must show their invocation.
+		for (const suite of ['test:lightning', 'test:cli', 'test:interop']) {
 			expect(readme, `README should document npm run ${suite}`).to.include(
 				`npm run ${suite}`
 			);
