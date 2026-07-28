@@ -325,11 +325,20 @@ export const getByteCount = (
 					return parseInt(item);
 				});
 
-				totalWeight += types.inputs[newKey] * count;
+				const multisigWeight = types.inputs[newKey];
+				if (multisigWeight === undefined)
+					throw new Error('invalid input: ' + key);
+				totalWeight += multisigWeight * count;
 				const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
 				totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
 			} else {
-				totalWeight += types.inputs[key] * count;
+				// An unknown key used to make totalWeight NaN, and NaN fails the
+				// minByteCount comparison below, so the function returned NaN
+				// instead of the fallback its catch provides. types.inputs has no
+				// plain P2WSH entry, which is the reachable case.
+				const weight = types.inputs[key];
+				if (weight === undefined) throw new Error('invalid input: ' + key);
+				totalWeight += weight * count;
 			}
 			inputCount += count;
 			// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
@@ -343,14 +352,25 @@ export const getByteCount = (
 			const count = outputs[originalKey];
 			const key = originalKey.toUpperCase();
 			checkUInt53(count);
-			totalWeight += types.outputs[key] * count;
+			const weight = types.outputs[key];
+			if (weight === undefined) throw new Error('invalid output: ' + key);
+			totalWeight += weight * count;
 			outputCount += count;
 		});
 
 		if (hasWitness) totalWeight += 2;
 		if (message?.length) {
-			// Multiply by 2 to help ensure Electrum servers will broadcast the tx.
-			totalWeight += message.length * 2;
+			// The message becomes an OP_RETURN output: (value:8) + (script_len:1)
+			// + (OP_RETURN:1) + (pushdata:1, or 2 above 75 bytes) + payload, priced
+			// in weight units like everything else here. It was previously added as
+			// message.length * 2 weight units, which is half the payload in vbytes
+			// once totalWeight is divided by 4, so messaged transactions were
+			// under-priced by roughly 2x the payload plus the output overhead.
+			// createPsbtFromTransactionData pads a message below 5 bytes, so price
+			// at least that.
+			const payloadLength = Math.max(5, Buffer.byteLength(message, 'utf8'));
+			const pushdataLength = payloadLength <= 75 ? 1 : 2;
+			totalWeight += (8 + 1 + 1 + pushdataLength + payloadLength) * 4;
 		}
 
 		totalWeight += 8 * 4;
