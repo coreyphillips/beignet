@@ -33,7 +33,7 @@ import {
 	Transaction,
 	Wallet
 } from '../src';
-import { getByteCount } from '../src/utils/transaction';
+import { createOpReturnScript, getByteCount } from '../src/utils/transaction';
 import { getDefaultSendTransaction } from '../src/shapes/wallet';
 import {
 	IFormattedTransaction,
@@ -101,6 +101,69 @@ describe('fee estimation defects', function () {
 		it('accounts for the second pushdata byte above 75 bytes', function () {
 			const message = 'a'.repeat(80);
 			expect(base(message) - base()).to.equal(80 + 12);
+		});
+
+		// The estimator and the PSBT builder now go through createOpReturnScript,
+		// so what is priced is the script that gets embedded. Pricing a second
+		// copy of the serialization rules is what let them drift: the builder
+		// padded on character count while the estimate clamped byte length, so a
+		// short multibyte message was built at 6 or 7 bytes and priced at 5.
+		[
+			{ name: 'plain ascii', message: 'hello there' },
+			{ name: 'short ascii, padded', message: 'ab' },
+			{ name: 'short multibyte', message: 'é' },
+			{ name: 'emoji', message: '😀' },
+			{ name: 'multibyte above the pad', message: 'ééééééé' },
+			{ name: 'at the pushdata boundary', message: 'a'.repeat(75) },
+			{ name: 'over the pushdata boundary', message: 'a'.repeat(76) }
+		].forEach(({ name, message }) => {
+			it(`prices the exact script it embeds: ${name}`, function () {
+				const script = createOpReturnScript(message);
+				if (!script) throw new Error('expected a script');
+				// The output is serialized as (value:8) + (script_len varint) + script.
+				const outputSize = 8 + (script.length < 0xfd ? 1 : 3) + script.length;
+				expect(base(message) - base()).to.equal(outputSize);
+			});
+		});
+
+		it('pads to five bytes rather than five characters', function () {
+			// 'é' is one character and two bytes; the emoji is two UTF-16 units and
+			// four bytes. Padding on character count produced 6 and 7 byte payloads
+			// against a 5 byte estimate.
+			expect(createOpReturnScript('é')?.length).to.equal(2 + 5);
+			expect(createOpReturnScript('😀')?.length).to.equal(2 + 5);
+			expect(createOpReturnScript('abcde')?.length).to.equal(2 + 5);
+		});
+
+		it('charges nothing for a message that is never embedded', function () {
+			// createPsbtFromTransactionData skips a whitespace-only message, so
+			// pricing one was charging for an output that never appears.
+			expect(createOpReturnScript('   ')).to.equal(undefined);
+			expect(base('   ') - base()).to.equal(0);
+			expect(base('') - base()).to.equal(0);
+		});
+
+		it('counts the OP_RETURN in the output count varint', function () {
+			// 252 outputs fit a 1 byte CompactSize; the OP_RETURN makes 253, which
+			// needs 3. The message block used to add its weight without ever
+			// touching outputCount.
+			const message = 'a'.repeat(40);
+			const withMessage = getByteCount(
+				{ P2WPKH: 1 },
+				{ P2WPKH: 252 },
+				message,
+				0
+			);
+			const withoutMessage = getByteCount(
+				{ P2WPKH: 1 },
+				{ P2WPKH: 252 },
+				'',
+				0
+			);
+			const script = createOpReturnScript(message);
+			if (!script) throw new Error('expected a script');
+			const outputSize = 8 + 1 + script.length;
+			expect(withMessage - withoutMessage).to.equal(outputSize + 2);
 		});
 	});
 

@@ -219,6 +219,31 @@ export const constructByteCountParam = (
 	}
 };
 
+// Patch for https://github.com/coreyphillips/moonshine/issues/52: an OP_RETURN
+// payload shorter than this is padded out with spaces.
+const MIN_OP_RETURN_PAYLOAD_BYTES = 5;
+
+/**
+ * Builds the OP_RETURN script for a message, or undefined when there is no
+ * message to embed. Both the PSBT builder and getByteCount go through this, so
+ * the fee estimate cannot drift from the script that actually gets built.
+ * @param {string} [message]
+ * @returns {Buffer | undefined}
+ */
+export const createOpReturnScript = (message?: string): Buffer | undefined => {
+	if (!message || message.trim() === '') {
+		return undefined;
+	}
+	let payload = Buffer.from(message, 'utf8');
+	if (payload.length < MIN_OP_RETURN_PAYLOAD_BYTES) {
+		payload = Buffer.concat([
+			payload,
+			Buffer.alloc(MIN_OP_RETURN_PAYLOAD_BYTES - payload.length, 0x20)
+		]);
+	}
+	return bitcoin.payments.embed({ data: [payload] }).output;
+};
+
 /*
 	Adapted from: https://gist.github.com/junderw/b43af3253ea5865ed52cb51c200ac19c
 	Usage:
@@ -359,18 +384,15 @@ export const getByteCount = (
 		});
 
 		if (hasWitness) totalWeight += 2;
-		if (message?.length) {
-			// The message becomes an OP_RETURN output: (value:8) + (script_len:1)
-			// + (OP_RETURN:1) + (pushdata:1, or 2 above 75 bytes) + payload, priced
-			// in weight units like everything else here. It was previously added as
-			// message.length * 2 weight units, which is half the payload in vbytes
-			// once totalWeight is divided by 4, so messaged transactions were
-			// under-priced by roughly 2x the payload plus the output overhead.
-			// createPsbtFromTransactionData pads a message below 5 bytes, so price
-			// at least that.
-			const payloadLength = Math.max(5, Buffer.byteLength(message, 'utf8'));
-			const pushdataLength = payloadLength <= 75 ? 1 : 2;
-			totalWeight += (8 + 1 + 1 + pushdataLength + payloadLength) * 4;
+		// Price the exact script the PSBT builder will embed, rather than a second
+		// copy of its serialization rules. The message was previously added as
+		// message.length * 2 weight units, which is half the payload in vbytes
+		// once totalWeight is divided by 4, and nothing for the output itself.
+		const opReturnScript = createOpReturnScript(message);
+		if (opReturnScript) {
+			totalWeight +=
+				(8 + varIntLength(opReturnScript.length) + opReturnScript.length) * 4;
+			outputCount += 1;
 		}
 
 		totalWeight += 8 * 4;

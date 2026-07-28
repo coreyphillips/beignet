@@ -25,7 +25,7 @@ import {
 	generateMnemonic,
 	Wallet
 } from '../';
-import { getByteCount } from '../src/utils/transaction';
+import { createOpReturnScript, getByteCount } from '../src/utils/transaction';
 import { getDefaultSendTransaction } from '../src/shapes/wallet';
 import { ISendTransaction } from '../src/types/wallet';
 import {
@@ -202,6 +202,70 @@ describe('On-chain fee quoting', function () {
 				rbf: true
 			});
 			if (sent.isErr()) throw new Error(sent.error.message);
+
+			expect(await feePaid(sent.value)).to.equal(quote.value.totalFee);
+		});
+
+		it('quotes a messaged send, including the OP_RETURN it embeds', async () => {
+			const dest = await rpc.getNewAddress();
+			const satsPerByte = 12;
+			const amount = 1_000_000;
+			// One character, two bytes in utf8, so it is short enough to be padded
+			// and multibyte enough that padding on character count and padding on
+			// byte length disagree. The quote is compared against the fee a real
+			// transaction paid, so the estimate and the embedded script have to
+			// agree on the OP_RETURN down to the byte.
+			const message = 'é';
+
+			const quote = wallet.getFeeInfo({
+				satsPerByte,
+				message,
+				transaction: quoteTransaction(dest, amount, satsPerByte)
+			});
+			if (quote.isErr()) throw quote.error;
+
+			// send() carries its message as a label, so stage the transaction
+			// directly to get the message onto the chain.
+			const setup = await wallet.transaction.setupTransaction({ rbf: true });
+			if (setup.isErr()) throw setup.error;
+			const staged = wallet.transaction.updateSendTransaction({
+				transaction: {
+					message,
+					outputs: [{ address: dest, value: amount, index: 0 }]
+				}
+			});
+			if (staged.isErr()) throw staged.error;
+			const feeRes = wallet.transaction.updateFee({ satsPerByte });
+			if (feeRes.isErr()) throw feeRes.error;
+
+			const created = await wallet.transaction.createTransaction({});
+			if (created.isErr()) throw created.error;
+			const sent = await wallet.electrum.broadcastTransaction({
+				rawTx: created.value.hex
+			});
+			if (sent.isErr()) throw new Error(sent.error.message);
+
+			const tx = await rpc.getRawTransactionAsObject(sent.value);
+			// 0x6a is OP_RETURN.
+			const opReturn = tx.vout.find((out) =>
+				String(out.scriptPubKey?.hex ?? '').startsWith('6a')
+			);
+			const onChainScript = opReturn?.scriptPubKey?.hex;
+			if (!onChainScript)
+				throw new Error('the message never reached the chain');
+
+			// The script the estimator prices is the script that got broadcast.
+			const script = createOpReturnScript(message);
+			expect(onChainScript).to.equal(script?.toString('hex'));
+
+			// And it charged for that output at its real serialized size:
+			// (value:8) + (script_len:1) + script. Padding on character count put
+			// six bytes on chain against an estimate of five.
+			const scriptBytes = onChainScript.length / 2;
+			const priced =
+				getByteCount({ P2WPKH: 1 }, { P2WPKH: 1 }, message, 0) -
+				getByteCount({ P2WPKH: 1 }, { P2WPKH: 1 }, undefined, 0);
+			expect(priced).to.equal(8 + 1 + scriptBytes);
 
 			expect(await feePaid(sent.value)).to.equal(quote.value.totalFee);
 		});

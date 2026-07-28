@@ -28,6 +28,7 @@ import { btcToSats } from '../utils/conversion';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
+	createOpReturnScript,
 	getByteCount,
 	getDustThreshold,
 	setReplaceByFee
@@ -668,8 +669,8 @@ export class Transaction {
 		bip32Interface?: BIP32Interface;
 		shuffleTargets?: boolean;
 	}): Promise<Result<Psbt>> => {
-		const { inputs, outputs, fee, rbf } = transactionData;
-		let { changeAddress, message } = transactionData;
+		const { inputs, outputs, fee, rbf, message } = transactionData;
+		let { changeAddress } = transactionData;
 
 		//Get balance of current inputs.
 		const balance = this.getTransactionInputValue({
@@ -717,20 +718,15 @@ export class Transaction {
 			}
 		}
 
-		//Embed any OP_RETURN messages.
-		if (message.trim() !== '') {
-			const messageLength = message.length;
-			const lengthMin = 5;
-			//This is a patch for the following: https://github.com/coreyphillips/moonshine/issues/52
-			if (messageLength > 0 && messageLength < lengthMin) {
-				message += ' '.repeat(lengthMin - messageLength);
-			}
-			const data = Buffer.from(message, 'utf8');
-			const embed = bitcoin.payments.embed({
-				data: [data],
-				network
+		//Embed any OP_RETURN messages. getByteCount prices this same script, so
+		//the padding and push rules live in one place.
+		const opReturnScript = createOpReturnScript(message);
+		if (opReturnScript) {
+			targets.push({
+				script: opReturnScript,
+				value: 0,
+				index: targets.length
 			});
-			targets.push({ script: embed.output!, value: 0, index: targets.length });
 		}
 
 		// Watch-only wallets cannot produce a signing root; inputs only need
