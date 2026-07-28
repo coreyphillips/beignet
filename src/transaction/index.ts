@@ -1714,14 +1714,17 @@ export class Transaction {
 			if (!outputs || !outputs?.length) {
 				return err('No outputs provided');
 			}
-			// The fallback belongs to the term, not the sum. Written as
-			// `acc + Number(cur?.value) || 0` it parsed as
-			// `(acc + Number(cur?.value)) || 0`, so a single output with a missing
-			// or non-numeric value reset the entire running total to 0. That made
-			// amountToSend falsy, which selects every UTXO in the wallet below.
-			const amountToSend = outputs.reduce((acc, cur) => {
-				return acc + (Number(cur?.value) || 0);
-			}, 0);
+			// A malformed output value must not become 0. amountToSend being falsy
+			// takes the consolidate branch below, which selects every UTXO in the
+			// wallet, and applyAutoCoinSelect persists that selection before
+			// validateTransaction ever sees the transaction. reduceValue tells a
+			// genuine 0, which legitimately means "spend everything", apart from
+			// non-numeric data, which does not.
+			const amountToSendRes = reduceValue({ arr: outputs, value: 'value' });
+			if (amountToSendRes.isErr()) {
+				return err(amountToSendRes.error);
+			}
+			const amountToSend = amountToSendRes.value;
 
 			switch (coinSelectPreference) {
 				case 'large':

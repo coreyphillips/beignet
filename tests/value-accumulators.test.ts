@@ -153,35 +153,58 @@ describe('value accumulators', function () {
 			index: 1
 		};
 
-		it('selects for the amount asked for when a later output is malformed', function () {
+		// Erring rather than treating the term as 0: a falsy amountToSend takes
+		// the consolidate branch, and createTransaction({runCoinSelect: true})
+		// persists that selection through applyAutoCoinSelect before
+		// validateTransaction ever runs. The full-wallet selection would already
+		// be saved by the time anything downstream complained.
+		it('rejects a malformed output instead of consolidating the wallet', function () {
+			const res = select([malformed]);
+			expect(res.isErr(), 'a malformed-only output set is an error').to.equal(
+				true
+			);
+		});
+
+		it('rejects a malformed output mixed with a valid one', function () {
 			const res = select([
 				{ address: ADDRESS, value: 10_000, index: 0 },
 				malformed
 			]);
-
-			if (res.isErr()) throw res.error;
-			// `(acc + NaN) || 0` reset the total to 0, and a falsy amountToSend
-			// takes the consolidate branch, which adds every UTXO in the wallet.
-			expect(
-				res.value.inputs.length,
-				'did not fall through to a full consolidation'
-			).to.be.lessThan(inputs.length);
-			expect(res.value.inputs.length).to.be.greaterThan(0);
+			expect(res.isErr()).to.equal(true);
 		});
 
-		it('behaves the same when the malformed output comes first', function () {
+		it('rejects it in either order', function () {
 			const res = select([
 				{ ...malformed, index: 0 },
 				{ address: ADDRESS, value: 10_000, index: 1 }
 			]);
-
-			if (res.isErr()) throw res.error;
-			expect(res.value.inputs.length).to.be.lessThan(inputs.length);
+			expect(res.isErr()).to.equal(true);
 		});
 
-		it('still consolidates when there is genuinely no amount to send', function () {
+		it('rejects NaN, Infinity and non-numeric output values', function () {
+			expect(
+				select([{ address: ADDRESS, value: Number.NaN, index: 0 }]).isErr()
+			).to.equal(true);
+			expect(
+				select([
+					{ address: ADDRESS, value: Number.POSITIVE_INFINITY, index: 0 }
+				]).isErr()
+			).to.equal(true);
+			expect(
+				select([
+					{
+						address: ADDRESS,
+						value: 'not a number' as unknown as number,
+						index: 0
+					}
+				]).isErr()
+			).to.equal(true);
+		});
+
+		it('still consolidates for an explicitly zero-valued output', function () {
 			// A zero total is the documented signal for "spend everything", and
-			// that behaviour is unchanged.
+			// that behaviour is unchanged. This is the line the fix has to hold:
+			// reject malformed, keep a genuine 0.
 			const res = select([{ address: ADDRESS, value: 0, index: 0 }]);
 
 			if (res.isErr()) throw res.error;
