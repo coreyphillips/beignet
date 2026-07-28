@@ -191,6 +191,17 @@ export class ChainWatcher extends EventEmitter {
 	}
 
 	/**
+	 * Every internal 'error' emit goes through here. EventEmitter THROWS when
+	 * 'error' is emitted with no listener, and this class emits it from a dozen
+	 * promise catches that can land at any time, including after teardown. A
+	 * background chain failure must not become a process crash.
+	 */
+	private emitError(err: Error): void {
+		if (this.listenerCount('error') === 0) return;
+		this.emit('error', err);
+	}
+
+	/**
 	 * Update the destination script used when a force-close is detected and a
 	 * new monitor is created. Lets the node redirect sweeps to a wallet-owned
 	 * address once one becomes available (e.g. after Electrum connects).
@@ -205,6 +216,10 @@ export class ChainWatcher extends EventEmitter {
 	async start(): Promise<void> {
 		if (this.started) return;
 		this.started = true;
+
+		// stop() detaches the ChannelManager subscriptions, so a restarted
+		// watcher has to re-arm them or it never sees another channel event.
+		this.wireChannelManagerEvents();
 
 		await this.backend.subscribeToHeaders((height: number) => {
 			this.handleNewBlock(height);
@@ -258,13 +273,11 @@ export class ChainWatcher extends EventEmitter {
 		// Re-check unconfirmed fundings and watched output spends directly.
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
-				this.checkFundingConfirmation(key).catch((err) =>
-					this.emit('error', err)
-				);
+				this.checkFundingConfirmation(key).catch((err) => this.emitError(err));
 			}
 		}
 		for (const key of this.watchedOutputs.keys()) {
-			this.checkOutputSpend(key).catch((err) => this.emit('error', err));
+			this.checkOutputSpend(key).catch((err) => this.emitError(err));
 		}
 	}
 
@@ -290,7 +303,17 @@ export class ChainWatcher extends EventEmitter {
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
-		this.removeAllListeners();
+
+		// Detach from the ChannelManager, so a stopped watcher stops acting on
+		// channel events. It used to keep broadcasting after node.destroy().
+		// start() re-arms these.
+		this.unwireChannelManagerEvents();
+
+		// Deliberately NOT removeAllListeners(): those are the consumer's
+		// handlers, including the node's 'error' handler, and in-flight chain
+		// requests still reject after stop(). Removing them turned an ordinary
+		// shutdown into a crash, and left the watcher permanently deaf if it was
+		// ever restarted.
 	}
 
 	/**
@@ -330,7 +353,7 @@ export class ChainWatcher extends EventEmitter {
 		try {
 			await this.backend.subscribeToScriptHash(scriptHash, () => {
 				this.checkFundingConfirmation(key).catch((err) => {
-					this.emit('error', err);
+					this.emitError(err);
 				});
 			});
 		} catch {
@@ -352,7 +375,7 @@ export class ChainWatcher extends EventEmitter {
 		try {
 			await this.checkFundingConfirmation(key);
 		} catch (err) {
-			this.emit('error', err);
+			this.emitError(err);
 		}
 	}
 
@@ -417,7 +440,7 @@ export class ChainWatcher extends EventEmitter {
 		try {
 			await this.backend.subscribeToScriptHash(scriptHash, () => {
 				this.checkOutputSpend(key).catch((err) => {
-					this.emit('error', err);
+					this.emitError(err);
 				});
 			});
 		} catch {
@@ -466,112 +489,119 @@ export class ChainWatcher extends EventEmitter {
 
 	// ─────────────── Private ───────────────
 
-	private wireChannelManagerEvents(): void {
-		// Watch funding outputs when channels enter AWAITING_FUNDING_CONFIRMED
-		this.channelManager.on(
-			'watch:funding',
-			(
-				fundingTxid: Buffer,
-				fundingOutputIndex: number,
-				minimumDepth: number
-			) => {
-				// Convert to display byte order without mutating the source Buffer
-				const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
+	/**
+	 * ChannelManager subscriptions are held as named handlers so stop() can
+	 * detach them. Registered inline, a stopped watcher kept receiving channel
+	 * events and still broadcast transactions after the node was destroyed.
+	 */
+	private onWatchFunding = (
+		fundingTxid: Buffer,
+		fundingOutputIndex: number,
+		minimumDepth: number
+	): void => {
+		// Convert to display byte order without mutating the source Buffer
+		const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
 
-				// Find the channel matching this funding outpoint
-				const channel = this.findChannelByFunding(
-					displayTxid,
-					fundingOutputIndex
-				);
-				if (!channel) {
-					this.emit(
-						'error',
-						new Error(
-							`watch:funding: no channel found for ${displayTxid}:${fundingOutputIndex}`
-						)
-					);
-					return;
-				}
+		// Find the channel matching this funding outpoint
+		const channel = this.findChannelByFunding(displayTxid, fundingOutputIndex);
+		if (!channel) {
+			this.emitError(
+				new Error(
+					`watch:funding: no channel found for ${displayTxid}:${fundingOutputIndex}`
+				)
+			);
+			return;
+		}
 
-				const state = channel.getFullState();
-				if (!state.remoteBasepoints) {
-					this.emit(
-						'error',
-						new Error(
-							`watch:funding: channel missing remoteBasepoints for ${displayTxid}:${fundingOutputIndex}`
-						)
-					);
-					return;
-				}
+		const state = channel.getFullState();
+		if (!state.remoteBasepoints) {
+			this.emitError(
+				new Error(
+					`watch:funding: channel missing remoteBasepoints for ${displayTxid}:${fundingOutputIndex}`
+				)
+			);
+			return;
+		}
 
-				// Reconstruct the funding scriptPubKey. Simple-taproot channels fund a
-				// P2TR MuSig2 key-spend output, so watching the witness-v0 P2WSH
-				// scripthash would never match and the funding spend would go
-				// undetected.
-				const fundingScript = isTaprootChannel(state.channelType)
-					? createTaprootFundingScript(
-							state.localBasepoints.fundingPubkey,
-							state.remoteBasepoints.fundingPubkey
-					  ).p2trOutput
-					: createFundingScript(
-							state.localBasepoints.fundingPubkey,
-							state.remoteBasepoints.fundingPubkey
-					  ).p2wshOutput;
+		// Reconstruct the funding scriptPubKey. Simple-taproot channels fund a
+		// P2TR MuSig2 key-spend output, so watching the witness-v0 P2WSH
+		// scripthash would never match and the funding spend would go
+		// undetected.
+		const fundingScript = isTaprootChannel(state.channelType)
+			? createTaprootFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey
+			  ).p2trOutput
+			: createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey
+			  ).p2wshOutput;
 
-				const channelId = state.channelId || state.temporaryChannelId;
-				this.watchFundingOutput(
-					channelId,
-					displayTxid,
-					fundingOutputIndex,
-					minimumDepth,
-					fundingScript
-				).catch((err) => {
-					this.emit('error', err);
-				});
-			}
-		);
-
-		// Broadcast transactions (closing/sweep txs)
-		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
-			if (!Buffer.isBuffer(tx)) {
-				// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
-				// hex-encodes to "[object Object]" and cannot be broadcast; drop it
-				// loudly instead of letting the failure path below throw an unhandled
-				// rejection when it calls Transaction.fromBuffer on a non-Buffer.
-				this.emit(
-					'broadcast:failure',
-					new Error('broadcast:tx received a non-Buffer payload; dropped')
-				);
-				return;
-			}
-			this.broadcastTransaction(tx).catch((err) => {
-				// Queue for retry on next block. Guard the decode so a malformed
-				// payload is logged and dropped rather than throwing an unhandled
-				// rejection inside this catch handler (which would crash the process).
-				try {
-					const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
-					// Dedup by txid
-					if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
-						this.failedBroadcasts.push({
-							rawTx: Buffer.from(tx),
-							txidHex,
-							retryCount: 0
-						});
-					}
-				} catch {
-					// Not a decodable transaction; nothing to queue for retry.
-				}
-				this.emit('broadcast:failure', err);
-			});
+		const channelId = state.channelId || state.temporaryChannelId;
+		this.watchFundingOutput(
+			channelId,
+			displayTxid,
+			fundingOutputIndex,
+			minimumDepth,
+			fundingScript
+		).catch((err) => {
+			this.emitError(err);
 		});
+	};
 
-		// Watch outputs (from chain monitor)
-		this.channelManager.on(
-			'watch:output',
-			(txid: string, outputIndex: number) => {
-				this.emit('watch:output:requested', txid, outputIndex);
+	private onBroadcastTx = (tx: Buffer): void => {
+		if (!Buffer.isBuffer(tx)) {
+			// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
+			// hex-encodes to "[object Object]" and cannot be broadcast; drop it
+			// loudly instead of letting the failure path below throw an unhandled
+			// rejection when it calls Transaction.fromBuffer on a non-Buffer.
+			this.emit(
+				'broadcast:failure',
+				new Error('broadcast:tx received a non-Buffer payload; dropped')
+			);
+			return;
+		}
+		this.broadcastTransaction(tx).catch((err) => {
+			// Queue for retry on next block. Guard the decode so a malformed
+			// payload is logged and dropped rather than throwing an unhandled
+			// rejection inside this catch handler (which would crash the process).
+			try {
+				const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
+				// Dedup by txid
+				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
+					this.failedBroadcasts.push({
+						rawTx: Buffer.from(tx),
+						txidHex,
+						retryCount: 0
+					});
+				}
+			} catch {
+				// Not a decodable transaction; nothing to queue for retry.
 			}
-		);
+			this.emit('broadcast:failure', err);
+		});
+	};
+
+	private onWatchOutput = (txid: string, outputIndex: number): void => {
+		this.emit('watch:output:requested', txid, outputIndex);
+	};
+
+	private wireChannelManagerEvents(): void {
+		// Detach first: start() re-wires after a stop(), and registering the same
+		// handler twice would broadcast twice.
+		this.unwireChannelManagerEvents();
+		// Watch funding outputs when channels enter AWAITING_FUNDING_CONFIRMED
+		this.channelManager.on('watch:funding', this.onWatchFunding);
+		// Broadcast transactions (closing/sweep txs)
+		this.channelManager.on('broadcast:tx', this.onBroadcastTx);
+		// Watch outputs (from chain monitor)
+		this.channelManager.on('watch:output', this.onWatchOutput);
+	}
+
+	private unwireChannelManagerEvents(): void {
+		this.channelManager.off('watch:funding', this.onWatchFunding);
+		this.channelManager.off('broadcast:tx', this.onBroadcastTx);
+		this.channelManager.off('watch:output', this.onWatchOutput);
 	}
 
 	private handleNewBlock(height: number): void {
@@ -644,7 +674,7 @@ export class ChainWatcher extends EventEmitter {
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
 				this.checkFundingConfirmation(key).catch((err) => {
-					this.emit('error', err);
+					this.emitError(err);
 				});
 			} else if (
 				!watched.announcementTriggered &&
@@ -655,7 +685,7 @@ export class ChainWatcher extends EventEmitter {
 				if (depth >= 6) {
 					watched.announcementTriggered = true;
 					this.triggerAnnouncementDepth(watched).catch((err) => {
-						this.emit('error', err);
+						this.emitError(err);
 					});
 				}
 			}
@@ -692,7 +722,7 @@ export class ChainWatcher extends EventEmitter {
 			) {
 				watched.announcementTriggered = true;
 				this.triggerAnnouncementDepth(watched).catch((err) => {
-					this.emit('error', err);
+					this.emitError(err);
 				});
 			}
 		}
@@ -754,7 +784,7 @@ export class ChainWatcher extends EventEmitter {
 
 			// Now watch for the funding output being spent (force close detection)
 			this.watchFundingSpend(watched).catch((err) => {
-				this.emit('error', err);
+				this.emitError(err);
 			});
 		}
 	}
@@ -763,7 +793,7 @@ export class ChainWatcher extends EventEmitter {
 		// Subscribe to detect when the funding output is spent
 		await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
 			this.checkFundingSpent(watched).catch((err) => {
-				this.emit('error', err);
+				this.emitError(err);
 			});
 		});
 

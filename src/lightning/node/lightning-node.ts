@@ -366,7 +366,15 @@ export class LightningNode extends EventEmitter {
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
 	private chainWatcher: ChainWatcher | null = null;
-	private _chainWatcherEventsWired = false;
+	/**
+	 * The watcher instance these events are wired to, rather than a one-shot
+	 * boolean. A boolean could never be reset, so a watcher that was stopped and
+	 * started again was left with no listeners at all: no block, no error, no
+	 * watch:output:requested reached the node, and it silently stopped tracking
+	 * the chain. Keyed on the instance, a replacement watcher is always wired and
+	 * the same one is never wired twice.
+	 */
+	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
@@ -3278,8 +3286,10 @@ export class LightningNode extends EventEmitter {
 	}
 
 	private wireChainWatcherEvents(): void {
-		if (!this.chainWatcher || this._chainWatcherEventsWired) return;
-		this._chainWatcherEventsWired = true;
+		if (!this.chainWatcher || this._wiredChainWatcher === this.chainWatcher) {
+			return;
+		}
+		this._wiredChainWatcher = this.chainWatcher;
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
