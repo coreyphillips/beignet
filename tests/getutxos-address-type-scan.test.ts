@@ -121,12 +121,68 @@ describe('getUtxos address-type scan', function () {
 			).addresses
 		).map((a) => a.address);
 
+		// Wallet.create kicks off refreshWallet without awaiting it, so guard
+		// against a background repopulation of p2sh turning this into a vacuous
+		// pass: if p2sh came back, the precondition never held and we want a loud
+		// failure rather than a green tick.
+		expect(
+			Object.keys(wallet.data.addresses[EAddressType.p2sh]).length,
+			'p2sh was still empty when the scan ran'
+		).to.equal(0);
+
 		const p2trScanned = p2trAddresses.filter((a) =>
 			scanned.includes(a.address)
 		);
 		expect(
 			p2trScanned.length,
 			'p2tr addresses survived the empty p2sh type ahead of them'
+		).to.be.greaterThan(0);
+	});
+
+	it('scans a type holding only change addresses', async function () {
+		const electrum = wallet.electrum;
+
+		// getChangeAddress generates with `addressAmount: 0`, so this state is
+		// reachable through the public API: change addresses with no receiving
+		// addresses. Keying the skip on the receiving side alone dropped them.
+		wallet.data.addresses[EAddressType.p2sh] = {};
+		const p2shChange = Object.values(
+			wallet.data.changeAddresses[EAddressType.p2sh]
+		);
+		expect(
+			p2shChange.length,
+			'p2sh still has change addresses'
+		).to.be.greaterThan(0);
+
+		const stub = sinon
+			.stub(
+				electrum as unknown as {
+					listUnspentAddressScriptHashes: (a: unknown) => unknown;
+				},
+				'listUnspentAddressScriptHashes'
+			)
+			.resolves({
+				isOk: (): boolean => true,
+				value: { utxos: [], balance: 0 }
+			});
+		(
+			electrum as unknown as { connectedToElectrum: boolean }
+		).connectedToElectrum = true;
+
+		await electrum.getUtxos({});
+
+		const scanned = Object.values(
+			(
+				stub.firstCall.args[0] as {
+					addresses: Record<string, { address: string }>;
+				}
+			).addresses
+		).map((a) => a.address);
+
+		const found = p2shChange.filter((a) => scanned.includes(a.address));
+		expect(
+			found.length,
+			'change addresses of a receive-empty type were still scanned'
 		).to.be.greaterThan(0);
 	});
 
@@ -158,7 +214,7 @@ describe('getUtxos address-type scan', function () {
 			).addresses
 		).map((a) => a.address);
 
-		for (const type of [EAddressType.p2wpkh, EAddressType.p2tr]) {
+		for (const type of MONITORED) {
 			const some = Object.values(wallet.data.addresses[type]).some((a) =>
 				scanned.includes(a.address)
 			);
