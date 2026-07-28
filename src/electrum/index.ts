@@ -658,8 +658,13 @@ export class Electrum {
 					?.length;
 
 				// Check if addresses of this type have been generated. If not, skip.
+				// `continue`, not `break`: address types are independent, and a
+				// `break` here dropped every LATER type from the query. Since p2tr
+				// is last in EAddressType, a wallet with no p2sh addresses returned
+				// zero UTXOs for its own p2tr addresses, indistinguishable from
+				// having no funds.
 				if (addressCount <= 0) {
-					break;
+					continue;
 				}
 
 				// Grab all addresses and change addresses.
