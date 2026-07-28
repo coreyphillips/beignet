@@ -599,9 +599,16 @@ export class Transaction {
 				if (response.isOk()) {
 					return response.value;
 				}
+				// 0 is also what an empty input set returns, so a failure here is
+				// invisible to the caller. Say so rather than only returning it.
+				this._wallet?.logger?.error(
+					'Failed to total the transaction inputs.',
+					response.error
+				);
 			}
 			return 0;
 		} catch (e) {
+			this._wallet?.logger?.error('Failed to total the transaction inputs.', e);
 			return 0;
 		}
 	};
@@ -1200,8 +1207,18 @@ export class Transaction {
 			if (response.isOk()) {
 				return response.value;
 			}
+			// See getTransactionInputValue: 0 is a legitimate total, so a silent 0
+			// on failure is indistinguishable from an empty output set.
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				response.error
+			);
 			return 0;
-		} catch {
+		} catch (e) {
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				e
+			);
 			return 0;
 		}
 	};
@@ -1697,8 +1714,13 @@ export class Transaction {
 			if (!outputs || !outputs?.length) {
 				return err('No outputs provided');
 			}
+			// The fallback belongs to the term, not the sum. Written as
+			// `acc + Number(cur?.value) || 0` it parsed as
+			// `(acc + Number(cur?.value)) || 0`, so a single output with a missing
+			// or non-numeric value reset the entire running total to 0. That made
+			// amountToSend falsy, which selects every UTXO in the wallet below.
 			const amountToSend = outputs.reduce((acc, cur) => {
-				return acc + Number(cur?.value) || 0;
+				return acc + (Number(cur?.value) || 0);
 			}, 0);
 
 			switch (coinSelectPreference) {

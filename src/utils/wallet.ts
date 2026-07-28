@@ -246,11 +246,18 @@ export const reduceValue = <T>({
 		if (!value) {
 			return err('No value specified.');
 		}
-		return ok(
-			arr.reduce((acc, cur) => {
-				return acc + Number(cur[value]);
-			}, 0) || 0
-		);
+		const total = arr.reduce((acc, cur) => {
+			return acc + Number(cur[value]);
+		}, 0);
+		// The trailing `|| 0` this replaces turned a NaN total, which one missing
+		// or non-numeric entry produces, into a clean 0. Zero is a legitimate
+		// total here, so the failure was indistinguishable from an empty set.
+		if (!Number.isFinite(total)) {
+			return err(
+				`Non-numeric value encountered while summing "${String(value)}".`
+			);
+		}
+		return ok(total);
 	} catch (e) {
 		return err(e);
 	}
