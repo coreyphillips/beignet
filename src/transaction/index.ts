@@ -599,9 +599,16 @@ export class Transaction {
 				if (response.isOk()) {
 					return response.value;
 				}
+				// 0 is also what an empty input set returns, so a failure here is
+				// invisible to the caller. Say so rather than only returning it.
+				this._wallet?.logger?.error(
+					'Failed to total the transaction inputs.',
+					response.error
+				);
 			}
 			return 0;
 		} catch (e) {
+			this._wallet?.logger?.error('Failed to total the transaction inputs.', e);
 			return 0;
 		}
 	};
@@ -1200,8 +1207,18 @@ export class Transaction {
 			if (response.isOk()) {
 				return response.value;
 			}
+			// See getTransactionInputValue: 0 is a legitimate total, so a silent 0
+			// on failure is indistinguishable from an empty output set.
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				response.error
+			);
 			return 0;
-		} catch {
+		} catch (e) {
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				e
+			);
 			return 0;
 		}
 	};
@@ -1697,9 +1714,17 @@ export class Transaction {
 			if (!outputs || !outputs?.length) {
 				return err('No outputs provided');
 			}
-			const amountToSend = outputs.reduce((acc, cur) => {
-				return acc + Number(cur?.value) || 0;
-			}, 0);
+			// A malformed output value must not become 0. amountToSend being falsy
+			// takes the consolidate branch below, which selects every UTXO in the
+			// wallet, and applyAutoCoinSelect persists that selection before
+			// validateTransaction ever sees the transaction. reduceValue tells a
+			// genuine 0, which legitimately means "spend everything", apart from
+			// non-numeric data, which does not.
+			const amountToSendRes = reduceValue({ arr: outputs, value: 'value' });
+			if (amountToSendRes.isErr()) {
+				return err(amountToSendRes.error);
+			}
+			const amountToSend = amountToSendRes.value;
 
 			switch (coinSelectPreference) {
 				case 'large':
