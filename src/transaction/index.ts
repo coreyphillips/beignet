@@ -28,7 +28,6 @@ import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
 	getByteCount,
-	removeDustOutputs,
 	setReplaceByFee
 } from '../utils';
 import {
@@ -499,9 +498,6 @@ export class Transaction {
 		shuffleOutputs = true,
 		runCoinSelect = false
 	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		let transaction = transactionData;
 		if (runCoinSelect) {
 			const coinSelectRes = this.autoCoinSelect({
@@ -834,9 +830,6 @@ export class Transaction {
 		transactionData?: ISendTransaction;
 		shuffleOutputs?: boolean;
 	} = {}): Promise<Result<Psbt>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		const inputValue = this.getTransactionInputValue({
 			inputs: transactionData.inputs
 		});

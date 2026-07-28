@@ -383,7 +383,7 @@ export const removeDustOutputs = (outputs: IOutput[]): IOutput[] => {
 export const validateTransaction = (
 	transaction: ISendTransaction
 ): Result<string> => {
-	const baseFee = TRANSACTION_DEFAULTS.recommendedBaseFee;
+	const dustLimit = TRANSACTION_DEFAULTS.dustLimit;
 
 	try {
 		if (!transaction.fee) {
@@ -404,9 +404,12 @@ export const validateTransaction = (
 			if (!isValid) {
 				return err(`Invalid Address: ${address}`);
 			}
-			if (value < baseFee) {
+			// Matches the guard in Transaction.addOutput. Erring here keeps a
+			// sub-dust output from reaching the PSBT, where it would either make
+			// the transaction unrelayable or be handed to the miner as fee.
+			if (value < dustLimit) {
 				return err(
-					`Output value for ${address} must be greater than or equal to ${baseFee} sats`
+					`Output value for ${address} must be greater than or equal to the dust limit of ${dustLimit} sats`
 				);
 			}
 			if (!Number.isInteger(value)) {
