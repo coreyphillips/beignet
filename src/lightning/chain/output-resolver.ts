@@ -33,6 +33,7 @@ import {
 	encodeWitnessSignature
 } from './sweep';
 import { buildToLocalScript, csvFromToLocalScript } from '../script/commitment';
+import { isDustOutput } from './closing';
 import {
 	buildToRemoteAnchorOutput,
 	leaseCsvFromToRemoteScript
@@ -1024,6 +1025,35 @@ function matchHtlcOutput(
 // from (state, commitmentNumber), exactly like the witness-v0 path re-derives
 // keys; only outputType + HTLC metadata + htlcSigIndex are recorded.
 
+/**
+ * Value left for the destination after fees, or null when the fee eats the
+ * output or leaves only dust.
+ *
+ * bitcoinjs `addOutput` typeforces a non-negative Satoshi, so handing it
+ * `amount - fee` when the fee is larger throws. Several of the taproot
+ * builders below run inside a loop over one commitment's outputs, so an
+ * unguarded throw abandoned the sweeps for every output AFTER the offending
+ * one, not just that output's own.
+ *
+ * The dust check is the second half: a positive but sub-dust sweep is a
+ * transaction no node will relay, which fails just as silently. isDustOutput
+ * picks the threshold from the destination script type, the same way the
+ * watchtower justice builder and the simple-close path do.
+ *
+ * Mirrors the guards already present in sweep.ts (buildToLocalSweepTx and
+ * siblings) and in the revoked-path taproot resolvers further down this file.
+ */
+function sweepOutputValue(
+	amount: bigint,
+	feeSatoshis: bigint,
+	destinationScript: Buffer
+): number | null {
+	const value = amount - feeSatoshis;
+	if (value <= 0n) return null;
+	if (isDustOutput(destinationScript, value)) return null;
+	return Number(value);
+}
+
 interface ITaprootCommitKeys {
 	revocationPubkey: Buffer;
 	delayedPubkey: Buffer;
@@ -1501,11 +1531,14 @@ export function resolveSecondLevelHtlcOutput(
 		const feeSatoshis = BigInt(
 			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_LOCAL))
 		);
+		const sweepValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		// Nothing left after fees: there is no sweep to build.
+		if (sweepValue === null) return null;
 		const htlcTxid = htlcTx.getId();
 		const sweepTx = new bitcoin.Transaction();
 		sweepTx.version = 2;
 		sweepTx.addInput(Buffer.from(htlcTxid, 'hex').reverse(), 0, toSelfDelay);
-		sweepTx.addOutput(destinationScript, Number(amount - feeSatoshis));
+		sweepTx.addOutput(destinationScript, sweepValue);
 		const delayedBasepointSecret =
 			delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
 		const delayedPrivkey = derivePrivateKey(
@@ -1669,6 +1702,17 @@ function resolveOurTaprootCommitmentOutputs(
 			const feeSatoshis = BigInt(
 				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
 			);
+			const sweepValue = sweepOutputValue(
+				output.amount,
+				feeSatoshis,
+				destinationScript
+			);
+			if (sweepValue === null) {
+				// Not economical to sweep. Track it without a spend so the rest of
+				// this commitment's outputs still resolve.
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			const sweepTx = new bitcoin.Transaction();
 			sweepTx.version = 2;
 			sweepTx.addInput(
@@ -1676,7 +1720,7 @@ function resolveOurTaprootCommitmentOutputs(
 				output.outputIndex,
 				toSelfDelay // CSV: the to_local delay leaf requires this relative timelock
 			);
-			sweepTx.addOutput(destinationScript, Number(output.amount - feeSatoshis));
+			sweepTx.addOutput(destinationScript, sweepValue);
 			const delayedBasepointSecret =
 				delayedPaymentBasepointSecret || state.localPerCommitmentSeed;
 			const delayedPrivkey = derivePrivateKey(
@@ -1862,10 +1906,17 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 		extraWitness: Buffer[],
 		nLockTime: number,
 		nSequence: number
-	): bitcoin.Transaction => {
+	): bitcoin.Transaction | null => {
 		const feeSatoshis = BigInt(
 			Math.ceil(feeRatePerVbyte * estimateSweepVbytes(output.outputType))
 		);
+		const sweepValue = sweepOutputValue(
+			output.amount,
+			feeSatoshis,
+			destinationScript
+		);
+		// Not economical to spend; the caller tracks the output without a spend.
+		if (sweepValue === null) return null;
 		const tx = new bitcoin.Transaction();
 		tx.version = 2;
 		tx.locktime = nLockTime;
@@ -1874,7 +1925,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			output.outputIndex,
 			nSequence
 		);
-		tx.addOutput(destinationScript, Number(output.amount - feeSatoshis));
+		tx.addOutput(destinationScript, sweepValue);
 		const sighash = tx.hashForWitnessV1(
 			0,
 			[spk],
@@ -1907,6 +1958,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				0,
 				1 // 1-block CSV
 			);
+			if (!tx) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
@@ -1940,6 +1995,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				output.cltvExpiry || 0,
 				1 // received-timeout leaf now has OP_1 CSV (+ CLTV via nLockTime)
 			);
+			if (!tx) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
@@ -1975,6 +2034,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				0,
 				1 // offered-success leaf now has OP_1 CSV
 			);
+			if (!tx) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			resolved.push({
 				trackedOutput: output,
 				spendTx: tx,
@@ -2625,6 +2688,14 @@ function resolveRevokedTaprootCommitmentOutputs(
 			const feeSatoshis = BigInt(
 				Math.ceil(feeRatePerVbyte * estimateSweepVbytes(OutputType.TO_REMOTE))
 			);
+			const claimValue = sweepOutputValue(
+				o.amount,
+				feeSatoshis,
+				destinationScript
+			);
+			// Not economical to claim. Skip it rather than abandoning the penalty
+			// spends for the remaining outputs of this revoked commitment.
+			if (claimValue === null) continue;
 			const claimTx = new bitcoin.Transaction();
 			claimTx.version = 2;
 			claimTx.addInput(
@@ -2632,7 +2703,7 @@ function resolveRevokedTaprootCommitmentOutputs(
 				o.outputIndex,
 				1 // 1-block CSV
 			);
-			claimTx.addOutput(destinationScript, Number(o.amount - feeSatoshis));
+			claimTx.addOutput(destinationScript, claimValue);
 			const sighash = claimTx.hashForWitnessV1(
 				0,
 				[tr.output],
@@ -2856,11 +2927,16 @@ export function resolveRevokedSecondLevelOutput(
 			const out = spendingTx.outs[i];
 			if (!sl.output.equals(out.script)) continue;
 			const amount = BigInt(out.value);
-			if (amount <= feeSatoshis) continue;
+			const claimValue = sweepOutputValue(
+				amount,
+				feeSatoshis,
+				destinationScript
+			);
+			if (claimValue === null) continue;
 			const claimTx = new bitcoin.Transaction();
 			claimTx.version = 2;
 			claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
-			claimTx.addOutput(destinationScript, Number(amount - feeSatoshis));
+			claimTx.addOutput(destinationScript, claimValue);
 			const sighash = claimTx.hashForWitnessV1(
 				0,
 				[sl.output],
@@ -2914,13 +2990,14 @@ export function resolveRevokedSecondLevelOutput(
 		}
 		if (!witnessScript) continue;
 		const amount = BigInt(out.value);
-		if (amount <= feeSatoshis) continue;
+		const claimValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
+		if (claimValue === null) continue;
 		// Revocation branch: no CSV/CLTV — spend immediately (default sequence,
 		// locktime 0, matching buildPenaltyTx's convention).
 		const claimTx = new bitcoin.Transaction();
 		claimTx.version = 2;
 		claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
-		claimTx.addOutput(destinationScript, Number(amount - feeSatoshis));
+		claimTx.addOutput(destinationScript, claimValue);
 		const sig = signPenaltyInput(
 			claimTx,
 			0,
