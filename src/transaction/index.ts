@@ -28,6 +28,7 @@ import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
 	getByteCount,
+	getDustThreshold,
 	setReplaceByFee
 } from '../utils';
 import {
@@ -1166,8 +1167,11 @@ export class Transaction {
 		value,
 		index = 0
 	}: IOutput): Promise<Result<string>> => {
-		if (value < TRANSACTION_DEFAULTS.dustLimit) {
-			return err('Output value is below dust limit.');
+		const dustThreshold = getDustThreshold(address);
+		if (value < dustThreshold) {
+			return err(
+				`Output value is below the dust threshold of ${dustThreshold} sats.`
+			);
 		}
 		if (!this.data.inputs?.length) {
 			const setupRes = await this.setupTransaction();
