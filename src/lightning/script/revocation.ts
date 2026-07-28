@@ -73,6 +73,41 @@ export interface IPenaltyTxParams {
  *
  * @returns The penalty transaction (unsigned — signatures added separately)
  */
+/**
+ * Fee a penalty transaction over these inputs would pay, in satoshis.
+ *
+ * Estimated per BOLT 3. Each penalty input spends a P2WSH output whose witness
+ * is [signature, <branch selector>, witnessScript]: the selector is a 1-byte
+ * OP_TRUE for to_local or a 33-byte revocation pubkey for HTLC outputs (use 33
+ * as a safe upper bound). The flat 160-vbyte/input figure previously used
+ * roughly doubled the true cost (~81 vb to_local / ~102 vb HTLC) and over-paid
+ * materially when sweeping many outputs.
+ *
+ * Exported so a caller can decide whether a batch is worth building BEFORE
+ * calling buildPenaltyTx, which throws on an unaffordable one.
+ */
+export function estimatePenaltyTxFee(
+	outputIndices: number[],
+	witnessScripts: Map<number, Buffer>,
+	feeRatePerVbyte: number
+): number {
+	let weightWu =
+		4 * 4 /* nVersion */ +
+		4 * 4 /* nLockTime */ +
+		2 /* segwit marker + flag */ +
+		1 * 4 /* input count (varint, assume < 253) */ +
+		1 * 4; /* output count */
+	for (const idx of outputIndices) {
+		const scriptLen = witnessScripts.get(idx)?.length ?? 83;
+		const scriptPrefix = scriptLen < 253 ? 1 : 3;
+		weightWu += 41 * 4; // outpoint (36) + empty scriptSig len (1) + sequence (4)
+		// witness: item count (1) + sig (1 + 73) + selector (1 + 33) + script (prefix + len)
+		weightWu += 1 + (1 + 73) + (1 + 33) + (scriptPrefix + scriptLen);
+	}
+	weightWu += 31 * 4; // single P2WPKH-sized output (value 8 + len 1 + script 22)
+	return Math.ceil(weightWu / 4) * feeRatePerVbyte;
+}
+
 export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 	const {
 		revokedTx,
@@ -100,28 +135,11 @@ export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 		totalValue += revokedTx.outs[idx].value;
 	}
 
-	// Estimate weight per BOLT 3. Each penalty input spends a P2WSH output whose
-	// witness is [signature, <branch selector>, witnessScript]: the selector is a
-	// 1-byte OP_TRUE for to_local or a 33-byte revocation pubkey for HTLC outputs
-	// (use 33 as a safe upper bound). The flat 160-vbyte/input figure previously
-	// used roughly doubled the true cost (~81 vb to_local / ~102 vb HTLC) and
-	// over-paid materially when sweeping many outputs.
-	let weightWu =
-		4 * 4 /* nVersion */ +
-		4 * 4 /* nLockTime */ +
-		2 /* segwit marker + flag */ +
-		1 * 4 /* input count (varint, assume < 253) */ +
-		1 * 4; /* output count */
-	for (const idx of outputIndices) {
-		const scriptLen = witnessScripts.get(idx)?.length ?? 83;
-		const scriptPrefix = scriptLen < 253 ? 1 : 3;
-		weightWu += 41 * 4; // outpoint (36) + empty scriptSig len (1) + sequence (4)
-		// witness: item count (1) + sig (1 + 73) + selector (1 + 33) + script (prefix + len)
-		weightWu += 1 + (1 + 73) + (1 + 33) + (scriptPrefix + scriptLen);
-	}
-	weightWu += 31 * 4; // single P2WPKH-sized output (value 8 + len 1 + script 22)
-	const estimatedVbytes = Math.ceil(weightWu / 4);
-	const fee = estimatedVbytes * feeRatePerVbyte;
+	const fee = estimatePenaltyTxFee(
+		outputIndices,
+		witnessScripts,
+		feeRatePerVbyte
+	);
 
 	const outputValue = totalValue - fee;
 	if (outputValue <= 0) {
