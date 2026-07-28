@@ -28,7 +28,7 @@ import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
 	getByteCount,
-	removeDustOutputs,
+	getDustThreshold,
 	setReplaceByFee
 } from '../utils';
 import {
@@ -499,9 +499,6 @@ export class Transaction {
 		shuffleOutputs = true,
 		runCoinSelect = false
 	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		let transaction = transactionData;
 		if (runCoinSelect) {
 			const coinSelectRes = this.autoCoinSelect({
@@ -834,9 +831,6 @@ export class Transaction {
 		transactionData?: ISendTransaction;
 		shuffleOutputs?: boolean;
 	} = {}): Promise<Result<Psbt>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		const inputValue = this.getTransactionInputValue({
 			inputs: transactionData.inputs
 		});
@@ -1173,8 +1167,11 @@ export class Transaction {
 		value,
 		index = 0
 	}: IOutput): Promise<Result<string>> => {
-		if (value < TRANSACTION_DEFAULTS.dustLimit) {
-			return err('Output value is below dust limit.');
+		const dustThreshold = getDustThreshold(address);
+		if (value < dustThreshold) {
+			return err(
+				`Output value is below the dust threshold of ${dustThreshold} sats.`
+			);
 		}
 		if (!this.data.inputs?.length) {
 			const setupRes = await this.setupTransaction();

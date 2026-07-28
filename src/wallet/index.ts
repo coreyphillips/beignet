@@ -3920,7 +3920,7 @@ export class Wallet {
 				}
 			});
 			if (updateSendTransactionRes.isErr())
-				err(updateSendTransactionRes.error.message);
+				return err(updateSendTransactionRes.error.message);
 			index++;
 		}
 
@@ -3933,9 +3933,10 @@ export class Wallet {
 						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
 					);
 				}
-			} else {
-				return err(updateFeeRes.error.message);
 			}
+			// The fee probe above only refines the message. Either way the fee was
+			// never updated, so never fall through to build and broadcast.
+			return err(updateFeeRes.error.message);
 		}
 
 		const createRes = await this.transaction.createTransaction({
@@ -4903,11 +4904,12 @@ export class Wallet {
 			const txData = this.transaction.data;
 			const inputs = txData?.inputs ?? [];
 			const newInputs = [...inputs, input];
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					inputs: newInputs
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to add transaction input.', e);
@@ -4929,11 +4931,12 @@ export class Wallet {
 					return txInput;
 				}
 			});
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					inputs: newInputs
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to remove transaction input.', e);
@@ -4951,12 +4954,13 @@ export class Wallet {
 			const txData = this.transaction.data;
 			let tags = [...txData.tags, tag];
 			tags = [...new Set(tags)]; // remove duplicates
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					...txData,
 					tags
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok('Tag successfully added');
 		} catch (e) {
 			this.logger.error('Failed to add transaction tag.', e);
@@ -4975,13 +4979,14 @@ export class Wallet {
 			const tags = txData.tags;
 			const newTags = tags.filter((t) => t !== tag);
 
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					...txData,
 					tags: newTags
 				}
 			});
-			return ok('Tag successfully added');
+			if (updateRes.isErr()) return err(updateRes.error.message);
+			return ok('Tag successfully removed');
 		} catch (e) {
 			this.logger.error('Failed to remove transaction tag.', e);
 			return err(e);

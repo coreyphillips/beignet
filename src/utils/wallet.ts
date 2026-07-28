@@ -274,9 +274,16 @@ export const getDataFallback: TGetData = async <K extends keyof IWalletData>(
 	key: string
 ): Promise<Result<IWalletData[K]>> => {
 	try {
-		return ok(cloneDeep(defaultWalletData[getKeyValue(key)]));
+		const dataKey = getKeyValue(key);
+		// An unknown key has no default to fall back to, so say so instead of
+		// handing the caller ok(undefined). Own properties only: `in` would
+		// accept inherited names like toString and constructor.
+		if (!Object.prototype.hasOwnProperty.call(defaultWalletData, dataKey)) {
+			return err(`Unable to get data for unknown key: ${key}`);
+		}
+		return ok(cloneDeep(defaultWalletData[dataKey]));
 	} catch (e) {
-		return ok(getDefaultWalletData()[key]);
+		return err(e);
 	}
 };
 
