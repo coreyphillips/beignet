@@ -219,6 +219,29 @@ export interface IStorageBackend {
 	loadPendingWatchtowerUpdates?(): Array<IWatchtowerUpdate & { id: number }>;
 	/** Mark a queued update acked at the given sequence number. */
 	markWatchtowerUpdateAcked?(id: number, seqNum: number): void;
+
+	// ─── BOLT 12 Offers (optional) ───
+	/**
+	 * Persist a created offer. The bech32m encoding is the authoritative
+	 * artifact (offer, TLV bytes and offer id are all re-derived from it on
+	 * load); pathId is the secret bound into the offer's blinded paths, null
+	 * for offers without one.
+	 */
+	saveOffer?(
+		offerIdHex: string,
+		encoded: string,
+		pathId: Buffer | null,
+		createdAt: number
+	): void;
+	/** Load every persisted offer. */
+	loadAllOffers?(): Array<{
+		offerIdHex: string;
+		encoded: string;
+		pathId: Buffer | null;
+		createdAt: number;
+	}>;
+	/** Delete a persisted offer. */
+	deleteOffer?(offerIdHex: string): void;
 }
 
 /**

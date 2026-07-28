@@ -979,6 +979,10 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// Restore BOLT 12 offers so a shared offer keeps answering
+		// invoice_requests after a restart instead of dying with the process.
+		this.offerManager.attachStorage(this.storage);
+
 		// Restore funding txs still awaiting broadcast/confirmation so the
 		// BOLT 2 broadcast obligation survives a restart.
 		this.restorePendingFundingTxs();
