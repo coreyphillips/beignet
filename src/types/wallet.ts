@@ -106,14 +106,18 @@ export interface IFormattedTransaction {
 	blockhash?: string;
 	height?: number;
 	scriptHash: string;
-	totalInputValue: number;
-	matchedInputValue: number;
-	totalOutputValue: number;
-	matchedOutputValue: number;
-	fee: number;
+	// The value fields below are denominated in BTC, not sats, because they are
+	// taken from the decoded raw transaction. Convert with btcToSats before
+	// comparing them against anything in sats. ISendTransaction.fee and
+	// IRbfData.fee are sats.
+	totalInputValue: number; // BTC
+	matchedInputValue: number; // BTC
+	totalOutputValue: number; // BTC
+	matchedOutputValue: number; // BTC
+	fee: number; // BTC
 	satsPerByte: number;
 	type: EPaymentType;
-	value: number;
+	value: number; // BTC
 	txid: string;
 	messages: string[];
 	vin: IVin[];
