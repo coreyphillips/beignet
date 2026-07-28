@@ -654,17 +654,28 @@ export class Electrum {
 			const existingUtxos: { [key: string]: IUtxo } = {};
 
 			for (const addressType of addressTypesToCheck) {
-				const addressCount = Object.keys(currentWallet.addresses[addressType])
-					?.length;
-
-				// Check if addresses of this type have been generated. If not, skip.
-				if (addressCount <= 0) {
-					break;
-				}
-
 				// Grab all addresses and change addresses.
-				const allAddresses = currentWallet.addresses[addressType];
-				const allChangeAddresses = currentWallet.changeAddresses[addressType];
+				const allAddresses = currentWallet.addresses[addressType] ?? {};
+				const allChangeAddresses =
+					currentWallet.changeAddresses[addressType] ?? {};
+
+				// Skip a type only when NEITHER collection has been generated.
+				// Two things to note here:
+				//   - `continue`, not `break`: address types are independent, and a
+				//     `break` dropped every LATER type from the query. Since p2tr is
+				//     last in EAddressType, a wallet with no p2sh addresses returned
+				//     zero UTXOs for its own p2tr addresses, indistinguishable from
+				//     having no funds.
+				//   - both collections are checked: getChangeAddress generates with
+				//     `addressAmount: 0`, so a type can hold change addresses and no
+				//     receiving addresses. Testing only the receiving side skipped
+				//     those change addresses, dropping real UTXOs from the scan.
+				if (
+					Object.keys(allAddresses).length === 0 &&
+					Object.keys(allChangeAddresses).length === 0
+				) {
+					continue;
+				}
 
 				if (scanningStrategy === EScanningStrategy.all) {
 					addresses = { ...addresses, ...allAddresses };
