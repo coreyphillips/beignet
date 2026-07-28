@@ -63,6 +63,7 @@ import {
 } from '../script/htlc-taproot';
 import {
 	buildPenaltyTx,
+	estimatePenaltyTxFee,
 	signPenaltyInput,
 	buildToLocalPenaltyWitness,
 	buildHtlcPenaltyWitness
@@ -1024,6 +1025,15 @@ function matchHtlcOutput(
 // per-output leaf data is NOT stored — resolution re-derives it deterministically
 // from (state, commitmentNumber), exactly like the witness-v0 path re-derives
 // keys; only outputType + HTLC metadata + htlcSigIndex are recorded.
+
+/**
+ * Rough taproot penalty transaction sizing. A penalty input is either a
+ * key-path spend (~58 vB) or a script-path spend (~70 vB); 75 covers both with
+ * a little slack so the result clears min-relay rather than falling under it.
+ */
+const TAPROOT_PENALTY_BASE_VBYTES = 50;
+const TAPROOT_PENALTY_PER_INPUT_VBYTES = 75;
+const TAPROOT_PENALTY_OUTPUT_VBYTES = 43;
 
 /**
  * Value left for the destination after fees, or null when the fee eats the
@@ -2518,6 +2528,25 @@ export function resolveRevokedCommitmentOutputs(
 	// Build ONE penalty tx over the given indices, sign every input, and push
 	// a resolved entry per input (all sharing that tx).
 	const buildAndSignPenalty = (outputIndices: number[]): void => {
+		// buildPenaltyTx throws when the fee exceeds the batch. The deadline split
+		// below calls this once per urgent input and once for the batch, so an
+		// unaffordable expiring HTLC used to throw out of the whole resolver and
+		// take the batched penalty (holding their to_local) with it. Decide here
+		// instead, using the same estimator buildPenaltyTx uses.
+		let totalIn = 0n;
+		for (const idx of outputIndices) {
+			totalIn += BigInt(revokedTx.outs[idx].value);
+		}
+		const fee = BigInt(
+			estimatePenaltyTxFee(
+				outputIndices,
+				witnessScripts,
+				feeRatePerVbyte,
+				destinationScript
+			)
+		);
+		if (sweepOutputValue(totalIn, fee, destinationScript) === null) return;
+
 		const penaltyTx = buildPenaltyTx({
 			revokedTx,
 			revocationPrivkey,
@@ -2784,19 +2813,31 @@ function resolveRevokedTaprootCommitmentOutputs(
 	const buildAndSignPenalty = (ins: IPenaltyIn[]): void => {
 		const penaltyTx = new bitcoin.Transaction();
 		penaltyTx.version = 2;
-		let totalIn = 0;
+		// bigint like every other on-chain amount in this file. This was the one
+		// aggregate summed as a number, which is also how it came to be the one
+		// missing an underflow guard.
+		let totalIn = 0n;
 		for (const pin of ins) {
 			penaltyTx.addInput(
 				Buffer.from(pin.output.txid, 'hex').reverse(),
 				pin.output.outputIndex
 			);
-			totalIn += pin.value;
+			totalIn += BigInt(pin.value);
 		}
-		// Rough taproot penalty vbytes: ~43 base + per-input (~58 key-path / ~70
-		// script-path) + ~43 output. Overestimate slightly so we clear min-relay.
-		const estVbytes = 50 + ins.length * 75 + 43;
-		const fee = Math.ceil(feeRatePerVbyte * estVbytes);
-		penaltyTx.addOutput(destinationScript, totalIn - fee);
+		const estVbytes =
+			TAPROOT_PENALTY_BASE_VBYTES +
+			ins.length * TAPROOT_PENALTY_PER_INPUT_VBYTES +
+			TAPROOT_PENALTY_OUTPUT_VBYTES;
+		const fee = BigInt(Math.ceil(feeRatePerVbyte * estVbytes));
+		const penaltyValue = sweepOutputValue(totalIn, fee, destinationScript);
+		if (penaltyValue === null) {
+			// This batch cannot pay for itself. Return rather than handing
+			// addOutput a negative value: the caller splits urgent inputs into
+			// their own batch, and a throw here would abandon the remaining
+			// batches (including the one holding their to_local) along with it.
+			return;
+		}
+		penaltyTx.addOutput(destinationScript, penaltyValue);
 
 		const prevScripts = ins.map((p) => p.spk);
 		const values = ins.map((p) => p.value);

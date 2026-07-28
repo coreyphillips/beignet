@@ -613,3 +613,42 @@ describe('Per-output penalty fallback near expiry', function () {
 		expect(batch.ins.map((i) => i.index).sort()).to.deep.equal([0, 2]);
 	});
 });
+
+describe('Penalty batch affordability (witness-v0)', function () {
+	const HEIGHT = 750_000;
+
+	it('an unaffordable urgent HTLC no longer aborts the batched to_local penalty', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		// Starve ONLY the near-deadline HTLC, which the split isolates into its own
+		// penalty tx. Their to_local (index 0) stays large and must still be claimed.
+		s.revokedTx.outs[1].value = 500;
+		s.trackedOutputs[1].amount = 500n;
+
+		const resolved = resolveRevokedCommitmentOutputs(
+			s.state,
+			s.trackedOutputs,
+			0n,
+			s.revokedTx,
+			s.destScript,
+			50,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network,
+			HEIGHT
+		);
+
+		const byIndex = new Map(
+			resolved.map((r) => [r.trackedOutput.outputIndex, r])
+		);
+		expect(
+			byIndex.get(0),
+			'their to_local penalty survived the unaffordable HTLC'
+		).to.exist;
+		expect(byIndex.get(0)!.spendTx, 'and carries a real spend').to.exist;
+		expect(byIndex.get(2), 'the far HTLC is still batched with it').to.exist;
+		expect(
+			byIndex.get(1),
+			'the starved HTLC produced no penalty of its own'
+		).to.equal(undefined);
+	});
+});
