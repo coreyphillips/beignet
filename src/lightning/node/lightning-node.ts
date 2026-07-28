@@ -1703,17 +1703,18 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		// Wire broadcast:tx from ChannelManager (closing txs, force-close commitment txs)
+		// Relay broadcast:tx from ChannelManager (closing txs, force-close
+		// commitment txs) to our own consumers.
+		//
+		// This listener must NOT broadcast. ChainWatcher's constructor already
+		// subscribes to the same event and owns the broadcast, along with the
+		// non-Buffer guard, the txid dedup and the block-driven retry queue.
+		// Broadcasting here too sent every closing tx, sweep and CPFP child to
+		// the backend twice: the loser came back "already in mempool", was
+		// queued for MAX_BROADCAST_RETRIES blocks and surfaced as a permanent
+		// false BROADCAST_FAILED. The genuine failures are wired from the
+		// watcher's own broadcast:failure event in wireChainWatcherEvents().
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
-			if (this.chainWatcher) {
-				this.chainWatcher.broadcastTransaction(tx).catch((err) => {
-					this.emit('node:error', {
-						code: 'BROADCAST_FAILED',
-						message: (err as Error).message,
-						timestamp: Date.now()
-					} as ILightningError);
-				});
-			}
 			this.emit('broadcast:tx', tx);
 		});
 	}
@@ -3290,6 +3291,16 @@ export class LightningNode extends EventEmitter {
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
 				code: 'CHAIN_WATCHER_ERROR',
+				message: err.message,
+				timestamp: Date.now()
+			} as ILightningError);
+		});
+		// The watcher owns the broadcast; surface its failures under the code
+		// consumers already watch for. It re-queues and retries on the next
+		// block, so this is a warning rather than a terminal outcome.
+		this.chainWatcher.on('broadcast:failure', (err: Error) => {
+			this.emit('node:error', {
+				code: 'BROADCAST_FAILED',
 				message: err.message,
 				timestamp: Date.now()
 			} as ILightningError);
