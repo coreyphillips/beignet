@@ -39,6 +39,7 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelState } from '../../src/lightning/channel/channel-state';
+import { estimatePenaltyTxFee } from '../../src/lightning/script/revocation';
 
 bitcoin.initEccLib(ecc);
 const NETWORK = bitcoin.networks.regtest;
@@ -317,5 +318,55 @@ describe('taproot penalty fee guard', function () {
 			'the output is the SUM of both inputs minus the fee, not just one'
 		).to.be.greaterThan(totalIn - 50_000);
 		expect(tx.outs[0].value, 'and it does pay a fee').to.be.lessThan(totalIn);
+
+		// The estimate exists to clear min-relay, so check that property against
+		// the serialized size rather than settling for "some fee was deducted".
+		// The tx is fully witnessed at this point, so virtualSize is the real one.
+		const actualFee = totalIn - tx.outs[0].value;
+		const requiredFee = Math.ceil(tx.virtualSize() * 5);
+		expect(
+			actualFee,
+			'the fee covers the requested rate at the tx it actually produced'
+		).to.be.at.least(requiredFee);
+	});
+
+	it('returns a whole-satoshi fee for a fractional feerate', function () {
+		// estimatePenaltyTxFee is exported and takes an arbitrary number.
+		// Rounding vbytes before applying the rate left a fractional fee, which
+		// the witness-v0 affordability check cannot convert to bigint. Assert on
+		// the estimator directly so the case does not depend on whether a
+		// particular batch happens to have an even vbyte count.
+		const witnessScripts = new Map<number, Buffer>([
+			[0, Buffer.alloc(83)],
+			[1, Buffer.alloc(139)]
+		]);
+
+		for (const rate of [0.3, 1.7, 2.5, 3.33]) {
+			const fee = estimatePenaltyTxFee([0, 1], witnessScripts, rate);
+			expect(
+				Number.isInteger(fee),
+				`fee for ${rate} sat/vB is a whole number of satoshis`
+			).to.equal(true);
+			expect(
+				() => BigInt(fee),
+				`BigInt(${fee}) is representable`
+			).to.not.throw();
+		}
+	});
+
+	it('prices a larger destination script into the fee', function () {
+		const witnessScripts = new Map<number, Buffer>([[0, Buffer.alloc(83)]]);
+		const p2wpkh = Buffer.alloc(22);
+		const p2tr = Buffer.alloc(34);
+
+		const feeP2wpkh = estimatePenaltyTxFee([0], witnessScripts, 10, p2wpkh);
+		const feeP2tr = estimatePenaltyTxFee([0], witnessScripts, 10, p2tr);
+
+		// 12 extra script bytes at 10 sat/vB.
+		expect(feeP2tr - feeP2wpkh).to.equal(120);
+		expect(
+			estimatePenaltyTxFee([0], witnessScripts, 10),
+			'omitting the script keeps the P2WPKH default'
+		).to.equal(feeP2wpkh);
 	});
 });

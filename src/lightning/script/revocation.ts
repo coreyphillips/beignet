@@ -85,11 +85,16 @@ export interface IPenaltyTxParams {
  *
  * Exported so a caller can decide whether a batch is worth building BEFORE
  * calling buildPenaltyTx, which throws on an unaffordable one.
+ *
+ * destinationScript sizes the single output. Omitting it assumes P2WPKH, which
+ * under-prices a larger destination: a P2TR output is 43 vbytes against
+ * P2WPKH's 31, so the transaction would pay below the requested feerate.
  */
 export function estimatePenaltyTxFee(
 	outputIndices: number[],
 	witnessScripts: Map<number, Buffer>,
-	feeRatePerVbyte: number
+	feeRatePerVbyte: number,
+	destinationScript?: Buffer
 ): number {
 	let weightWu =
 		4 * 4 /* nVersion */ +
@@ -104,8 +109,12 @@ export function estimatePenaltyTxFee(
 		// witness: item count (1) + sig (1 + 73) + selector (1 + 33) + script (prefix + len)
 		weightWu += 1 + (1 + 73) + (1 + 33) + (scriptPrefix + scriptLen);
 	}
-	weightWu += 31 * 4; // single P2WPKH-sized output (value 8 + len 1 + script 22)
-	return Math.ceil(weightWu / 4) * feeRatePerVbyte;
+	// value (8) + script len varint (1) + script. 22 is P2WPKH, the default.
+	weightWu += (8 + 1 + (destinationScript?.length ?? 22)) * 4;
+	// Round AFTER applying the rate. Rounding the vbytes first leaves a
+	// fractional fee for a fractional feerate, which a caller converting to
+	// bigint cannot represent.
+	return Math.ceil((weightWu / 4) * feeRatePerVbyte);
 }
 
 export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
@@ -135,10 +144,18 @@ export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 		totalValue += revokedTx.outs[idx].value;
 	}
 
+	// Resolve the destination before estimating so the fee sizes the real output
+	// rather than assuming P2WPKH.
+	const destOutput = bitcoin.address.toOutputScript(
+		destinationAddress,
+		network
+	);
+
 	const fee = estimatePenaltyTxFee(
 		outputIndices,
 		witnessScripts,
-		feeRatePerVbyte
+		feeRatePerVbyte,
+		destOutput
 	);
 
 	const outputValue = totalValue - fee;
@@ -146,10 +163,6 @@ export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 		throw new Error('Fee exceeds available value');
 	}
 
-	const destOutput = bitcoin.address.toOutputScript(
-		destinationAddress,
-		network
-	);
 	tx.addOutput(destOutput, outputValue);
 
 	return tx;

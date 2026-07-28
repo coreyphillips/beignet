@@ -2538,7 +2538,12 @@ export function resolveRevokedCommitmentOutputs(
 			totalIn += BigInt(revokedTx.outs[idx].value);
 		}
 		const fee = BigInt(
-			estimatePenaltyTxFee(outputIndices, witnessScripts, feeRatePerVbyte)
+			estimatePenaltyTxFee(
+				outputIndices,
+				witnessScripts,
+				feeRatePerVbyte,
+				destinationScript
+			)
 		);
 		if (sweepOutputValue(totalIn, fee, destinationScript) === null) return;
 
