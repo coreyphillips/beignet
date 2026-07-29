@@ -144,6 +144,15 @@ export class OfferManager extends EventEmitter {
 	/** Insertion deadlines for invoicePreimages (ms epoch); entries past
 	 *  their deadline are pruned on the next insert. */
 	private invoicePreimageDeadlines: Map<string, number> = new Map();
+	/**
+	 * path_id embedded in the final hop of the blinded payment path(s) of each
+	 * BOLT 12 invoice WE issued, keyed by payment_hash hex. BOLT 12 defines no
+	 * payment_secret TLV: the encrypted path_id is what authenticates an
+	 * incoming payment — the node compares it against the decrypted final-hop
+	 * recipient data before fulfilling. Registered together with the preimage
+	 * and pruned in step with it.
+	 */
+	private invoicePathIds: Map<string, Buffer> = new Map();
 	private invoiceRequestTimeoutMs: number;
 	/**
 	 * Allow a sole pending request with no reply-path binding to be resolved
@@ -410,6 +419,7 @@ export class OfferManager extends EventEmitter {
 			if (now >= deadline) {
 				this.invoicePreimages.delete(hashHex);
 				this.invoicePreimageDeadlines.delete(hashHex);
+				this.invoicePathIds.delete(hashHex);
 			}
 		}
 		while (this.invoicePreimages.size >= MAX_INVOICE_PREIMAGES) {
@@ -419,6 +429,7 @@ export class OfferManager extends EventEmitter {
 			if (oldest === undefined) break;
 			this.invoicePreimages.delete(oldest);
 			this.invoicePreimageDeadlines.delete(oldest);
+			this.invoicePathIds.delete(oldest);
 		}
 	}
 
@@ -652,7 +663,7 @@ export class OfferManager extends EventEmitter {
 		// Create invoice
 		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
-		const paymentSecret = crypto.randomBytes(32);
+		const paymentHashHex = paymentHash.toString('hex');
 
 		// Retain the preimage so the node can fulfill the incoming HTLC for this
 		// invoice (it never leaves the issuer — not part of the BOLT 12 invoice).
@@ -661,29 +672,43 @@ export class OfferManager extends EventEmitter {
 		// memory amplification target. Entries expire with the invoice (plus
 		// grace for an HTLC already in flight at expiry) under a hard cap.
 		this.pruneInvoicePreimages();
-		this.invoicePreimages.set(paymentHash.toString('hex'), preimage);
+		this.invoicePreimages.set(paymentHashHex, preimage);
 		this.invoicePreimageDeadlines.set(
-			paymentHash.toString('hex'),
+			paymentHashHex,
 			Date.now() + INVOICE_PREIMAGE_TTL_MS
 		);
 
 		// BOLT 12: the invoice MUST include invoice_paths (one or more blinded
-		// paths to us) with exactly one blinded_payinfo per path. Reuse the
-		// offer's paths when it has them; a direct (announced-node) offer gets a
-		// minimal 1-hop path terminating at us — the payer treats the
-		// introduction node as the destination.
-		const invoicePaths =
-			matchedOffer.paths && matchedOffer.paths.length > 0
-				? matchedOffer.paths
-				: [
-						{
-							introductionNodeId: this.nodeId,
-							blindingPoint: getPublicKey(crypto.randomBytes(32)),
-							blindedHops: [
-								{ blindedNodeId: this.nodeId, encryptedData: Buffer.alloc(0) }
-							]
-						}
-				  ];
+		// paths to us) with exactly one blinded_payinfo per path, and the
+		// payment is authenticated by the path's ENCRYPTED path_id — BOLT 12
+		// defines no payment_secret TLV, so a secret minted here could never
+		// reach the payer, and registering one made every issued invoice
+		// unpayable (#252). Reuse the offer's paths when it has them (an
+		// async-hold offer's hold flag must survive into the payment path);
+		// otherwise build a real single-hop blinded path terminating at us —
+		// the same shape CLN issues for a node without announced channels —
+		// carrying a fresh per-invoice path_id.
+		let invoicePaths: IBlindedPath[];
+		let invoicePathId: Buffer | undefined;
+		if (matchedOffer.paths && matchedOffer.paths.length > 0) {
+			invoicePaths = matchedOffer.paths;
+			// A payment over an offer path surfaces the OFFER's path_id (absent
+			// for externally supplied paths whose contents we never saw).
+			invoicePathId = this.offers.get(matchedOfferIdHex!)?.pathId;
+		} else {
+			const freshPathId = crypto.randomBytes(32);
+			invoicePaths = [
+				constructBlindedPath(
+					crypto.randomBytes(32),
+					[this.nodeId],
+					[{ pathId: freshPathId }]
+				)
+			];
+			invoicePathId = freshPathId;
+		}
+		if (invoicePathId) {
+			this.invoicePathIds.set(paymentHashHex, invoicePathId);
+		}
 		const invoicePayInfo = invoicePaths.map(() => ({
 			feeBaseMsat: 0,
 			feeProportionalMillionths: 0,
@@ -698,7 +723,6 @@ export class OfferManager extends EventEmitter {
 			description: matchedOffer.description,
 			createdAt: BigInt(Math.floor(Date.now() / 1000)),
 			relativeExpiry: 7200, // 2 hours
-			paymentSecret,
 			nodeId: this.nodeId,
 			paths: invoicePaths,
 			blindedPayInfo: invoicePayInfo
@@ -741,6 +765,17 @@ export class OfferManager extends EventEmitter {
 	 */
 	getInvoicePreimage(paymentHash: Buffer): Buffer | undefined {
 		return this.invoicePreimages.get(paymentHash.toString('hex'));
+	}
+
+	/**
+	 * The path_id embedded in the blinded payment path(s) of a BOLT 12 invoice
+	 * WE issued, or undefined when the hash is not ours (or the entry aged
+	 * out). The node requires an incoming HTLC's decrypted final-hop path_id
+	 * to equal this before fulfilling — the BOLT 12 analogue of the BOLT 11
+	 * payment_secret check.
+	 */
+	getInvoicePathId(paymentHash: Buffer): Buffer | undefined {
+		return this.invoicePathIds.get(paymentHash.toString('hex'));
 	}
 
 	/**

@@ -8108,14 +8108,19 @@ export class LightningNode extends EventEmitter {
 		}
 
 		if (isFinalHop(processed.nextPacket)) {
-			// We are the final destination
+			// We are the final destination. htlcEntry.blindingPoint is the
+			// update_add_htlc path key a downstream blinded final hop received
+			// (absent when we are the path's introduction node, which gets the
+			// path key inside the onion as TLV 12) — needed to decrypt our own
+			// final-hop recipient data for the BOLT 12 path_id check.
 			this.handleFinalHopHtlc(
 				channelId,
 				htlcId,
 				amountMsat,
 				paymentHash,
 				processed.hopPayload,
-				htlcEntry.cltvExpiry
+				htlcEntry.cltvExpiry,
+				htlcEntry.blindingPoint
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -8294,7 +8299,8 @@ export class LightningNode extends EventEmitter {
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
-		incomingCltvExpiry?: number
+		incomingCltvExpiry?: number,
+		incomingBlindingPoint?: Buffer
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -8409,6 +8415,47 @@ export class LightningNode extends EventEmitter {
 				!hopPayload.paymentSecret.equals(expectedSecret)
 			) {
 				this.emitStructuredLog('htlc', 'payment_secret_mismatch', {
+					paymentHash: hashHex
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+		}
+
+		// BOLT 12: an invoice we issued binds its payment to the path_id we
+		// encrypted into the final hop of the invoice's blinded payment path
+		// (BOLT 12 has no payment_secret TLV). Recover the path_id from THIS
+		// HTLC's final-hop recipient data — the path key is the onion's TLV 12
+		// when we are the path's introduction node, or the update_add_htlc
+		// path key when the path had upstream hops — and require an exact
+		// match before any preimage is revealed. An HTLC for the hash sent
+		// OUTSIDE the path (probe, forged, or leaked hash) fails exactly like
+		// a payment_secret mismatch, so the sender learns nothing.
+		const expectedPathId = this.offerManager.getInvoicePathId(paymentHash);
+		if (expectedPathId) {
+			let receivedPathId: Buffer | undefined;
+			const pathKey = hopPayload?.blindingPoint ?? incomingBlindingPoint;
+			if (pathKey && hopPayload?.encryptedRecipientData?.length) {
+				try {
+					receivedPathId = processBlindedHop(
+						pathKey,
+						this.nodePrivkey,
+						hopPayload.encryptedRecipientData
+					).hopData.pathId;
+				} catch {
+					// Undecryptable recipient data: treated as an absent path_id.
+				}
+			}
+			if (!receivedPathId || !receivedPathId.equals(expectedPathId)) {
+				this.emitStructuredLog('htlc', 'payment_path_id_mismatch', {
 					paymentHash: hashHex
 				});
 				const reason = sharedSecret
@@ -11154,7 +11201,9 @@ export class LightningNode extends EventEmitter {
 				blindedRoute,
 				invoice.paymentHash,
 				finalCltvExpiry,
-				invoice.paymentSecret,
+				// BOLT 12 has no payment_secret: the blinded path's encrypted
+				// path_id authenticates this payment at the recipient.
+				undefined,
 				amountMsat
 			);
 		}
@@ -11181,7 +11230,7 @@ export class LightningNode extends EventEmitter {
 			route,
 			invoice.paymentHash,
 			finalCltvExpiry,
-			invoice.paymentSecret,
+			undefined,
 			amountMsat
 		);
 	}
@@ -11212,18 +11261,20 @@ export class LightningNode extends EventEmitter {
 			this.emit('bolt12:invoice:received', invoice);
 		});
 		// Issuer side: a BOLT 12 invoice we created in response to an invoice_request.
-		// Register its preimage/payment_secret/amount into the SAME stores the BOLT 11
-		// receive path uses, so an incoming HTLC for this payment_hash is validated
-		// and fulfilled (without this the preimage lived only in OfferManager and the
-		// HTLC was failed with unknown_payment_hash).
+		// Register its preimage/amount into the SAME stores the BOLT 11 receive
+		// path uses, so an incoming HTLC for this payment_hash is validated and
+		// fulfilled (without this the preimage lived only in OfferManager and the
+		// HTLC was failed with unknown_payment_hash). NO payment_secret is
+		// registered: BOLT 12 defines no payment_secret TLV, so a secret minted
+		// at issuance could never reach the payer, and enforcing one failed
+		// every incoming HTLC for the invoice (#252). The blinded payment
+		// path's path_id authenticates instead (checked in handleFinalHopHtlc
+		// against OfferManager.getInvoicePathId).
 		this.offerManager.on(
 			'invoice:issued',
 			(invoice: IBolt12Invoice, preimage: Buffer) => {
 				const hashHex = invoice.paymentHash.toString('hex');
 				this.preimages.set(hashHex, preimage);
-				if (invoice.paymentSecret) {
-					this.paymentSecrets.set(hashHex, invoice.paymentSecret);
-				}
 				const invoiceInfo: IInvoiceInfo = {
 					paymentHash: hashHex,
 					bolt11: '',
@@ -11245,12 +11296,7 @@ export class LightningNode extends EventEmitter {
 						createdAt: Date.now()
 					});
 				}
-				this.persistInvoiceRecords(
-					invoice.paymentHash,
-					invoiceInfo,
-					preimage,
-					invoice.paymentSecret
-				);
+				this.persistInvoiceRecords(invoice.paymentHash, invoiceInfo, preimage);
 				this.emit('bolt12:invoice:issued', invoice);
 			}
 		);

@@ -84,8 +84,6 @@ export interface IBolt12Invoice {
 	createdAt: bigint;
 	/** Relative expiry in seconds from created_at */
 	relativeExpiry?: number;
-	/** Payment secret (32 bytes) */
-	paymentSecret?: Buffer;
 	/** Blinded paths for payment delivery */
 	paths?: IBlindedPath[];
 	/** Blinded payment info (parallel array with paths) */
