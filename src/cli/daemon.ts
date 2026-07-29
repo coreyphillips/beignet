@@ -1504,16 +1504,26 @@ export async function startDaemon(
 
 		// ── BOLT 12 Offers ──
 		'POST /offer/create': (body) => {
-			const { description, amountSats, issuer } = body as {
+			const { description, amountSats, issuer, expirySecs } = body as {
 				description: string;
 				amountSats?: number;
 				issuer?: string;
+				expirySecs?: number;
 			};
 			if (!description)
 				return failure('INVALID_PARAMS', 'description required');
-			return success(node.createOffer({ description, amountSats, issuer }));
+			return success(
+				node.createOffer({ description, amountSats, issuer, expirySecs })
+			);
 		},
 		'GET /offers': () => success(node.listOffers()),
+		'DELETE /offer': (_body, query) => {
+			const offerId = query.get('offerId');
+			if (!offerId) return failure('INVALID_PARAMS', 'offerId required');
+			const removed = node.removeOffer(offerId);
+			if (!removed) return failure('NOT_FOUND', 'Offer not found');
+			return success({ removed: true });
+		},
 		'POST /offer/pay': async (body) => {
 			const { offer, amountSats, timeoutMs } = body as {
 				offer: string;

@@ -11197,6 +11197,17 @@ export class LightningNode extends EventEmitter {
 		this.offerManager.on('offer:created', (offer: IOffer) => {
 			this.emit('offer:created', offer);
 		});
+		// A stored offer row that failed its integrity check or decode at
+		// load: surfaced so corruption is visible instead of silently skipped.
+		this.offerManager.on(
+			'offer:corrupt',
+			(info: { offerIdHex: string; reason: string }) => {
+				this.emitStructuredLog('error', 'offer_corrupt_row', {
+					offerId: info.offerIdHex,
+					reason: info.reason
+				});
+			}
+		);
 		this.offerManager.on('invoice:received', (invoice: IBolt12Invoice) => {
 			this.emit('bolt12:invoice:received', invoice);
 		});
