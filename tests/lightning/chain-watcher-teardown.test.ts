@@ -126,6 +126,10 @@ class ControllableBackend implements IChainBackend {
 		for (const s of settlers) s.resolve(raw);
 	}
 
+	subscriptionCount(): number {
+		return this.scriptHashCallbacks.length;
+	}
+
 	/** Fire every scripthash subscription, as an Electrum status change would. */
 	fireScriptHashes(): void {
 		for (const cb of this.scriptHashCallbacks) cb();
@@ -301,6 +305,92 @@ describe('ChainWatcher teardown at node level', function () {
 		).to.equal(501);
 
 		node.destroy();
+	});
+
+	it('does not install a recovered funding watch when its transaction fetch resolves after destroy', async function () {
+		const backend = new ControllableBackend();
+		const config = makeNodeConfig(crypto.randomBytes(32));
+		config.chainBackend = backend;
+		const node = new LightningNode(config);
+		node.on('node:error', () => {});
+
+		const watcher = node.getChainWatcher();
+		if (!watcher) throw new Error('expected a chain watcher');
+		watcher.on('error', () => {});
+
+		let managerTouched = 0;
+		const manager = (
+			node as unknown as {
+				channelManager: {
+					handleFundingConfirmed: (id: Buffer) => void;
+					handleFundingSpent: () => void;
+				};
+			}
+		).channelManager;
+		manager.handleFundingConfirmed = (): void => {
+			managerTouched++;
+		};
+		manager.handleFundingSpent = (): void => {
+			managerTouched++;
+		};
+
+		await node.startChainWatcher();
+		backend.simulateNewBlock(600);
+
+		// The funding tx whose output the recovery path re-watches.
+		const fundingTx = new bitcoin.Transaction();
+		fundingTx.version = 2;
+		fundingTx.addInput(crypto.randomBytes(32), 0);
+		const pubkey = Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!);
+		const script = bitcoin.payments.p2wpkh({ pubkey }).output as Buffer;
+		fundingTx.addOutput(script, 100_000);
+		const fundingTxid = fundingTx.getId();
+		// Already confirmed, so any check that runs will act on it.
+		backend.historyResponse = [{ txid: fundingTxid, height: 590 }];
+
+		const subscriptionsBefore = backend.subscriptionCount();
+
+		// This is the boundary restoreChainWatches crosses for an SCB-recovered
+		// channel: an await inside LightningNode, then a first call into the
+		// watcher afterwards. Driven directly here rather than assembling a
+		// data-loss channel, since the await is what matters.
+		backend.deferGetTransaction = true;
+		const pending = (
+			node as unknown as {
+				watchRecoveredFundingOutput: (
+					channelId: Buffer,
+					state: unknown
+				) => Promise<void>;
+			}
+		)
+			.watchRecoveredFundingOutput(crypto.randomBytes(32), {
+				fundingTxid: Buffer.from(fundingTxid, 'hex').reverse(),
+				fundingOutputIndex: 0,
+				minimumDepth: 1
+			})
+			.catch(() => {
+				/* not the subject */
+			});
+		await tick();
+		expect(backend.pendingTxCount(), 'the fetch is in flight').to.equal(1);
+
+		node.destroy();
+		backend.deferGetTransaction = false;
+		backend.resolvePendingTx(fundingTx.toBuffer());
+		await pending;
+		await tick();
+		await tick();
+
+		expect(
+			backend.subscriptionCount() - subscriptionsBefore,
+			'no subscription was installed after destroy'
+		).to.equal(0);
+		expect(
+			(watcher as unknown as { watchedFundings: Map<string, unknown> })
+				.watchedFundings.size,
+			'no funding watch was registered after destroy'
+		).to.equal(0);
+		expect(managerTouched, 'the ChannelManager was not touched').to.equal(0);
 	});
 });
 
@@ -892,6 +982,36 @@ describe('ChainWatcher teardown', function () {
 				'the queue stop() cleared stayed clear'
 			).to.equal(0);
 		});
+	});
+
+	it('rejects new watch registration after stop until restarted', async function () {
+		const watchedOutputs = (
+			watcher as unknown as { watchedOutputs: Map<string, unknown> }
+		).watchedOutputs;
+		const script = bitcoin.payments.p2wpkh({
+			pubkey: Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!)
+		}).output as Buffer;
+
+		// Never started: registration is a documented, supported use.
+		await watcher.watchOutput('ab'.repeat(32), 0, script);
+		expect(watchedOutputs.size, 'registered before any start()').to.equal(1);
+
+		await watcher.start();
+		watcher.stop();
+		expect(watchedOutputs.size, 'stop() cleared the watches').to.equal(0);
+
+		// Explicitly stopped: a NEW registration arriving now belongs to an
+		// operation that began before the stop, and takes the post-stop
+		// generation by default, so the generation check alone would pass it.
+		await watcher.watchOutput('cd'.repeat(32), 0, script);
+		expect(watchedOutputs.size, 'refused while stopped').to.equal(0);
+		expect(backend.subscriptionCount(), 'no subscription installed').to.equal(
+			1
+		);
+
+		await watcher.start();
+		await watcher.watchOutput('ef'.repeat(32), 0, script);
+		expect(watchedOutputs.size, 'accepted again after restart').to.equal(1);
 	});
 
 	it('re-registers its ChannelManager handlers on restart, exactly once', async function () {

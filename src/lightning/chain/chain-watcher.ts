@@ -192,6 +192,18 @@ export class ChainWatcher extends EventEmitter {
 	 * not enough for the second case.
 	 */
 	private lifecycleGeneration = 0;
+	/**
+	 * Whether the watcher will accept NEW chain work. True from construction, so
+	 * registration on a watcher that has never been started keeps working, false
+	 * from an explicit stop() until the next start().
+	 *
+	 * The generation alone cannot express this: it retires work that was already
+	 * inside the watcher, but an operation that crosses its own await OUTSIDE
+	 * the watcher (LightningNode.watchRecoveredFundingOutput fetching a funding
+	 * tx, say) and calls in for the first time afterwards would default to the
+	 * post-stop generation and pass every check.
+	 */
+	private acceptingWork = true;
 	private destinationScript: Buffer;
 	private getSweepFeeRatePerVbyte?: () => number;
 	private _recheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -231,6 +243,7 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	async start(): Promise<void> {
 		if (this.started) return;
+		this.acceptingWork = true;
 		this.started = true;
 		const generation = ++this.lifecycleGeneration;
 
@@ -249,7 +262,12 @@ export class ChainWatcher extends EventEmitter {
 			});
 		} catch (err) {
 			if (this.lifecycleGeneration === generation) {
+				// A watcher with no header subscription and no recheck timer would
+				// accept watches it can never check, so it stops accepting work
+				// until a start() succeeds. The throw is the loud half of this.
 				this.started = false;
+				this.acceptingWork = false;
+				++this.lifecycleGeneration;
 				this.unwireChannelManagerEvents();
 			}
 			throw err;
@@ -282,7 +300,7 @@ export class ChainWatcher extends EventEmitter {
 	 * needs retiring is retired either way.
 	 */
 	private isCurrentGeneration(generation: number): boolean {
-		return this.lifecycleGeneration === generation;
+		return this.acceptingWork && this.lifecycleGeneration === generation;
 	}
 
 	/**
@@ -341,6 +359,10 @@ export class ChainWatcher extends EventEmitter {
 	 * Stop watching. Clears all watched outputs.
 	 */
 	stop(): void {
+		// Refuses new work as well as retiring work already in flight: an outer
+		// operation that began before stop() can still call in for the first
+		// time afterwards, and it would otherwise be handed this new generation.
+		this.acceptingWork = false;
 		this.started = false;
 		// Retires every in-flight operation: anything that resolves from here on
 		// sees a generation it does not own and returns without acting.
