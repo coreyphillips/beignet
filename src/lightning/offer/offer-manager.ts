@@ -136,6 +136,14 @@ export class OfferManager extends EventEmitter {
 	 */
 	private invoicePreimages: Map<string, Buffer> = new Map();
 	private invoiceRequestTimeoutMs: number;
+	/**
+	 * Allow a sole pending request with no reply-path binding to be resolved
+	 * by an invoice that arrived outside any reply path we issued. Off by
+	 * default: such an invoice cannot be proven to answer the request, and a
+	 * forged one would consume it (settle rejects on validation failure).
+	 * Only hand-fed flows (no onion wiring) should opt in.
+	 */
+	private allowUnboundInvoiceFallback: boolean;
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
 
@@ -144,12 +152,15 @@ export class OfferManager extends EventEmitter {
 		options?: {
 			onionMessageManager?: OnionMessageManager;
 			invoiceRequestTimeoutMs?: number;
+			allowUnboundInvoiceFallback?: boolean;
 		}
 	) {
 		super();
 		this.nodePrivkey = nodePrivkey;
 		this.nodeId = getPublicKey(nodePrivkey);
 		this.invoiceRequestTimeoutMs = options?.invoiceRequestTimeoutMs ?? 30_000;
+		this.allowUnboundInvoiceFallback =
+			options?.allowUnboundInvoiceFallback ?? false;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
@@ -225,9 +236,12 @@ export class OfferManager extends EventEmitter {
 			}
 		);
 
-		mgr.registerTlvHandler(TLV_INVOICE_ERROR, (_fromPeer, _tlvType, data) => {
-			this.handleIncomingInvoiceError(data);
-		});
+		mgr.registerTlvHandler(
+			TLV_INVOICE_ERROR,
+			(_fromPeer, _tlvType, data, _replyPath, pathId) => {
+				this.handleIncomingInvoiceError(data, pathId);
+			}
+		);
 	}
 
 	/**
@@ -814,13 +828,24 @@ export class OfferManager extends EventEmitter {
 			}
 		}
 
-		// Fallback: if only one pending request (without a reply-path binding),
-		// resolve it (backward compat)
+		// A sole pending request with no reply-path binding may resolve an
+		// unbound invoice only under the explicit allowUnboundInvoiceFallback
+		// opt-in (hand-fed flows with no onion wiring). By default nothing
+		// proves the invoice answers this request, and settling would let a
+		// forged one consume it (settle rejects on validation failure), so it
+		// is surfaced without cancelling anything.
 		if (this.pendingInvoiceRequests.size === 1) {
 			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
 				.value!;
 			if (!pending.replyPathId) {
-				settle(offerIdHex, pending);
+				if (this.allowUnboundInvoiceFallback) {
+					settle(offerIdHex, pending);
+					return;
+				}
+				this.emit('invoice:error', {
+					error:
+						'unbound invoice ignored: the pending invoice_request has no reply-path binding'
+				});
 				return;
 			}
 			this.emit('invoice:error', {
@@ -833,15 +858,24 @@ export class OfferManager extends EventEmitter {
 		this.emit('invoice:received', invoice);
 	}
 
-	private handleIncomingInvoiceError(data: Buffer): void {
+	private handleIncomingInvoiceError(data: Buffer, pathId?: Buffer): void {
 		const error = decodeInvoiceErrorTlv(data);
 
-		// Reject the first pending request
-		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-			clearTimeout(pending.timer);
-			this.pendingInvoiceRequests.delete(offerIdHex);
-			pending.reject(new Error(`Invoice error: ${error.error}`));
-			break;
+		// invoice_error is attacker-reachable (any peer can onion-message us),
+		// so it may only cancel the request it is bound to: the issuer sends
+		// it back over OUR blinded reply path, whose decrypted recipient data
+		// surfaces the path_id we embedded for that request. An error bound to
+		// no pending request is surfaced but cancels nothing; the request
+		// keeps waiting and times out on its own timer.
+		if (pathId) {
+			for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
+				if (pending.replyPathId?.equals(pathId)) {
+					clearTimeout(pending.timer);
+					this.pendingInvoiceRequests.delete(offerIdHex);
+					pending.reject(new Error(`Invoice error: ${error.error}`));
+					break;
+				}
+			}
 		}
 
 		this.emit('invoice:error', error);
