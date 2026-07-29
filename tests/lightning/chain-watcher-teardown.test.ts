@@ -26,6 +26,10 @@ import {
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { INodeConfig } from '../../src/lightning/node/types';
+import { Network } from '../../src/lightning/invoice/types';
+import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 
 bitcoin.initEccLib(ecc);
 
@@ -55,6 +59,12 @@ class ControllableBackend implements IChainBackend {
 	broadcastCalls: string[] = [];
 	/** Rejects every pending and future getScriptHashHistory call. */
 	private historyRejecters: Array<(err: Error) => void> = [];
+	private historyResolvers: Array<
+		(entries: Array<{ txid: string; height: number }>) => void
+	> = [];
+	/** When set, history calls resolve immediately with this. */
+	historyResponse: Array<{ txid: string; height: number }> | null = null;
+	transactions: Map<string, Buffer> = new Map();
 	broadcastShouldFail = false;
 
 	async subscribeToHeaders(
@@ -65,19 +75,33 @@ class ControllableBackend implements IChainBackend {
 		this.headerCallback = onNewBlock;
 	}
 
-	async subscribeToScriptHash(): Promise<void> {
-		// Accepted, never fires.
+	private scriptHashCallbacks: Array<() => void> = [];
+
+	async subscribeToScriptHash(
+		_scriptHash: string,
+		onChange: () => void
+	): Promise<void> {
+		this.scriptHashCallbacks.push(onChange);
+	}
+
+	/** Fire every scripthash subscription, as an Electrum status change would. */
+	fireScriptHashes(): void {
+		for (const cb of this.scriptHashCallbacks) cb();
 	}
 
 	getScriptHashHistory(): Promise<Array<{ txid: string; height: number }>> {
+		if (this.historyResponse) return Promise.resolve(this.historyResponse);
 		// Stays pending until the test settles it.
-		return new Promise((_resolve, reject) => {
+		return new Promise((resolve, reject) => {
+			this.historyResolvers.push(resolve);
 			this.historyRejecters.push(reject);
 		});
 	}
 
-	async getTransaction(): Promise<Buffer> {
-		throw new Error('not used');
+	async getTransaction(txid: string): Promise<Buffer> {
+		const tx = this.transactions.get(txid);
+		if (!tx) throw new Error(`no tx ${txid}`);
+		return tx;
 	}
 
 	async broadcastTransaction(rawTxHex: string): Promise<string> {
@@ -91,10 +115,21 @@ class ControllableBackend implements IChainBackend {
 			.toString('hex');
 	}
 
+	/** Resolve everything in flight with the given history. */
+	resolvePendingHistory(
+		entries: Array<{ txid: string; height: number }>
+	): void {
+		const resolvers = this.historyResolvers;
+		this.historyResolvers = [];
+		this.historyRejecters = [];
+		for (const resolve of resolvers) resolve(entries);
+	}
+
 	/** Reject everything the watcher has in flight against this backend. */
 	failPendingHistory(): void {
 		const rejecters = this.historyRejecters;
 		this.historyRejecters = [];
+		this.historyResolvers = [];
 		for (const reject of rejecters) {
 			reject(new Error('backend went away'));
 		}
@@ -143,6 +178,62 @@ const captureUnhandledRejections = (): {
 		}
 	};
 };
+
+function makeNodeConfig(seed: Buffer): INodeConfig {
+	return {
+		nodePrivateKey: crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from('node-identity'))
+			.digest(),
+		network: Network.REGTEST,
+		channelConfig: { ...DEFAULT_CHANNEL_CONFIG },
+		channelBasepoints: makeBasepoints(seed),
+		perCommitmentSeed: crypto.createHash('sha256').update(seed).digest(),
+		fundingPrivkey: crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from([0]))
+			.digest()
+	};
+}
+
+describe('ChainWatcher teardown at node level', function () {
+	this.timeout(20000);
+
+	it('tracks block height again after the watcher is restarted', async function () {
+		const backend = new ControllableBackend();
+		const config = makeNodeConfig(crypto.randomBytes(32));
+		config.chainBackend = backend;
+		const node = new LightningNode(config);
+		node.on('node:error', () => {});
+
+		const watcher = node.getChainWatcher();
+		if (!watcher) throw new Error('expected a chain watcher');
+
+		await node.startChainWatcher();
+		backend.simulateNewBlock(500);
+		expect(
+			(node as unknown as { currentBlockHeight: number }).currentBlockHeight,
+			'height tracked while running'
+		).to.equal(500);
+
+		// A backend failover or a long outage stops and restarts the watcher.
+		watcher.stop();
+		await node.startChainWatcher();
+		backend.simulateNewBlock(501);
+
+		// The one-shot _chainWatcherEventsWired flag meant the node's listeners
+		// were never re-registered after a stop(), so it stopped tracking the
+		// chain with nothing surfaced.
+		expect(
+			(node as unknown as { currentBlockHeight: number }).currentBlockHeight,
+			'height tracked again after restart'
+		).to.equal(501);
+
+		node.destroy();
+	});
+});
 
 describe('ChainWatcher teardown', function () {
 	this.timeout(20000);
@@ -330,6 +421,183 @@ describe('ChainWatcher teardown', function () {
 		expect(blocks, 'the restarted watcher still reports blocks').to.deep.equal([
 			100, 101
 		]);
+	});
+
+	describe('in-flight work after stop()', function () {
+		// stop() detaching the wiring is not enough: a request that was already
+		// on the wire resolves afterwards, and acting on it advances the
+		// ChannelManager for a watcher that is no longer watching.
+
+		it('does not process a funding check that resolves after stop', async function () {
+			let confirmed = 0;
+			(
+				channelManager as unknown as {
+					handleFundingConfirmed: (id: Buffer) => void;
+				}
+			).handleFundingConfirmed = (): void => {
+				confirmed++;
+			};
+			const events: Buffer[] = [];
+			watcher.on('funding:confirmed', (id: Buffer) => events.push(id));
+			watcher.on('error', () => {});
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+
+			const fundingTxid = 'ab'.repeat(32);
+			const scriptPubkey = bitcoin.payments.p2wpkh({
+				pubkey: Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!)
+			}).output as Buffer;
+			const pending = watcher
+				.watchFundingOutput(
+					crypto.randomBytes(32),
+					fundingTxid,
+					0,
+					1,
+					scriptPubkey
+				)
+				.catch(() => {
+					/* not the subject */
+				});
+
+			await tick();
+			expect(
+				backend.pendingHistoryCount(),
+				'the confirmation check is in flight'
+			).to.be.greaterThan(0);
+
+			watcher.stop();
+			// The funding confirmed, as far as the backend is concerned.
+			backend.resolvePendingHistory([{ txid: fundingTxid, height: 190 }]);
+			await pending;
+			await tick();
+
+			expect(confirmed, 'the ChannelManager was not advanced').to.equal(0);
+			expect(events.length, 'no funding:confirmed after stop').to.equal(0);
+		});
+
+		it('does not process an output-spend check that resolves after stop', async function () {
+			let spent = 0;
+			(
+				channelManager as unknown as {
+					handleOutputSpent: () => void;
+				}
+			).handleOutputSpent = (): void => {
+				spent++;
+			};
+			watcher.on('output:spent', () => spent++);
+			watcher.on('error', () => {});
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+
+			// A spend of the watched output, ready for the check to find.
+			const watchedTxid = 'cd'.repeat(32);
+			const spendTx = new bitcoin.Transaction();
+			spendTx.version = 2;
+			spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+			const pubkey = Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!);
+			const script = bitcoin.payments.p2wpkh({ pubkey }).output as Buffer;
+			spendTx.addOutput(script, 10_000);
+			backend.transactions.set(spendTx.getId(), spendTx.toBuffer());
+
+			await watcher.watchOutput(watchedTxid, 0, script);
+			// watchOutput only subscribes; the check runs when the scripthash
+			// status changes.
+			backend.fireScriptHashes();
+			await tick();
+			expect(
+				backend.pendingHistoryCount(),
+				'the spend check is in flight'
+			).to.be.greaterThan(0);
+
+			watcher.stop();
+			backend.resolvePendingHistory([{ txid: spendTx.getId(), height: 195 }]);
+			await tick();
+			await tick();
+
+			expect(spent, 'the spend was not reported after stop').to.equal(0);
+		});
+
+		it('does not advance the ChannelManager on a header received after stop', async function () {
+			const heights: number[] = [];
+			(
+				channelManager as unknown as {
+					handleNewBlock: (h: number) => unknown[];
+				}
+			).handleNewBlock = (h: number): unknown[] => {
+				heights.push(h);
+				return [];
+			};
+			const blocks: number[] = [];
+			watcher.on('block', (h: number) => blocks.push(h));
+
+			await watcher.start();
+			backend.simulateNewBlock(300);
+			expect(heights, 'delivered while running').to.deep.equal([300]);
+
+			watcher.stop();
+			// ElectrumBackend keeps its header callback across a watcher stop, so
+			// the next header still arrives here.
+			backend.simulateNewBlock(301);
+
+			expect(heights, 'no advance after stop').to.deep.equal([300]);
+			expect(blocks, 'no block event after stop').to.deep.equal([300]);
+		});
+
+		it('does not report a funding spend detected after stop', async function () {
+			let spent = 0;
+			(
+				channelManager as unknown as {
+					handleFundingConfirmed: (id: Buffer) => void;
+					handleFundingSpent: () => void;
+				}
+			).handleFundingSpent = (): void => {
+				spent++;
+			};
+			watcher.on('funding:spent', () => spent++);
+			watcher.on('error', () => {});
+
+			await watcher.start();
+			backend.simulateNewBlock(200);
+
+			const fundingTxid = 'ef'.repeat(32);
+			const closeTx = new bitcoin.Transaction();
+			closeTx.version = 2;
+			closeTx.addInput(Buffer.from(fundingTxid, 'hex').reverse(), 0);
+			const pubkey = Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!);
+			const script = bitcoin.payments.p2wpkh({ pubkey }).output as Buffer;
+			closeTx.addOutput(script, 10_000);
+			backend.transactions.set(closeTx.getId(), closeTx.toBuffer());
+
+			const pending = watcher
+				.watchFundingSpendDuringSplice(
+					crypto.randomBytes(32),
+					fundingTxid,
+					0,
+					script,
+					// A splice txid to ignore; the close below is a different tx.
+					'11'.repeat(32)
+				)
+				.catch(() => {
+					/* not the subject */
+				});
+			await tick();
+			expect(
+				backend.pendingHistoryCount(),
+				'the spend check is in flight'
+			).to.be.greaterThan(0);
+
+			watcher.stop();
+			backend.resolvePendingHistory([{ txid: closeTx.getId(), height: 199 }]);
+			await pending;
+			await tick();
+			await tick();
+
+			expect(spent, 'the funding spend was not reported after stop').to.equal(
+				0
+			);
+		});
 	});
 
 	it('re-registers its ChannelManager handlers on restart, exactly once', async function () {
