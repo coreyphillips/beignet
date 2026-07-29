@@ -662,7 +662,9 @@ export function findMultiPathRoute(
 	missionControl?: MissionControl,
 	routingHints?: IRoutingHintHop[][],
 	currentTimestamp?: number,
-	localChannels?: ILocalChannelEdge[]
+	localChannels?: ILocalChannelEdge[],
+	excludedChannels?: Set<string>,
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
 ): IMultiPathRoute | null {
 	// Track used capacity per SCID to avoid reusing same liquidity
 	const usedCapacity = new Map<string, bigint>();
@@ -682,7 +684,9 @@ export function findMultiPathRoute(
 			missionControl,
 			routingHints,
 			currentTimestamp,
-			localChannels
+			localChannels,
+			excludedChannels,
+			maxCltvExpiry
 		);
 
 		// If that fails, try halving the amount until we find a path or give up
@@ -700,7 +704,9 @@ export function findMultiPathRoute(
 					missionControl,
 					routingHints,
 					currentTimestamp,
-					localChannels
+					localChannels,
+					excludedChannels,
+					maxCltvExpiry
 				);
 				if (route) break;
 				tryAmount = tryAmount / 2n;
@@ -753,7 +759,9 @@ function findRouteWithCapacityLimits(
 	missionControl?: MissionControl,
 	routingHints?: IRoutingHintHop[][],
 	currentTimestamp?: number,
-	localChannels?: ILocalChannelEdge[]
+	localChannels?: ILocalChannelEdge[],
+	excludedChannels?: Set<string>,
+	maxCltvExpiry: number = DEFAULT_MAX_CLTV_EXPIRY
 ): IRoute | null {
 	const sourceHex = source.toString('hex');
 	const destHex = destination.toString('hex');
@@ -808,6 +816,10 @@ function findRouteWithCapacityLimits(
 
 		for (const channel of channels) {
 			const scidHex = channel.shortChannelId.toString('hex');
+
+			// Skip excluded channels (used for payment retry)
+			if (excludedChannels && excludedChannels.has(scidHex)) continue;
+
 			const hintDest = hintDestMap?.get(scidHex);
 			let upstreamNodeHex: string;
 			let update: typeof channel.update1;
@@ -852,6 +864,10 @@ function findRouteWithCapacityLimits(
 			);
 			const newAmount = current.amountMsat + fee;
 			const newCltv = current.cltvValue + update.cltvExpiryDelta;
+
+			// CLTV budget check: prune routes exceeding max lockup (see findRoute)
+			if (newCltv > maxCltvExpiry) continue;
+
 			const penalty = missionControl ? missionControl.getPenalty(scidHex) : 0n;
 			// Accumulate a per-hop penalty so shorter, more reliable routes win.
 			const newCost =
@@ -907,6 +923,9 @@ function findRouteWithCapacityLimits(
 	}
 
 	if (hops.length === 0) return null;
+
+	// Final CLTV budget check on the reconstructed route (see findRoute)
+	if (hops[0].outgoingCltvValue > maxCltvExpiry) return null;
 
 	const totalAmountMsat = hops[0].amountToForwardMsat;
 	const deliveredMsat = hops[hops.length - 1].amountToForwardMsat;

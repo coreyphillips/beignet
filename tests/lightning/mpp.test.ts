@@ -211,6 +211,93 @@ describe('MPP (Phase 7)', function () {
 			// totalFeeMsat should be non-negative
 			expect(Number(result!.totalFeeMsat)).to.be.greaterThanOrEqual(0);
 		});
+
+		it('excludes retry-failed channels from every part', function () {
+			const { graph, source, dest } = buildParallelGraph();
+			const excludedScid = makeScid(100, 1, 0).toString('hex');
+
+			// Path 1's first channel is excluded: the part must take path 2.
+			const result = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Set([excludedScid])
+			);
+			expect(result).to.not.be.null;
+			for (const part of result!.parts) {
+				for (const hop of part.hops) {
+					expect(hop.shortChannelId.toString('hex')).to.not.equal(excludedScid);
+				}
+			}
+
+			// 80k needs both paths; with path 1 excluded only 50k is reachable,
+			// so the split must fail rather than route through the exclusion.
+			const tooBig = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				80_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Set([excludedScid])
+			);
+			expect(tooBig).to.be.null;
+		});
+
+		it('enforces the CLTV lockup budget on every part', function () {
+			const { graph, source, dest } = buildParallelGraph();
+
+			// Two 40-delta hops over a 40-block final expiry accumulate 120
+			// blocks of lockup at the source edge; a 100-block budget must
+			// refuse every route rather than dispatch an over-budget part.
+			const capped = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				100
+			);
+			expect(capped).to.be.null;
+
+			// A budget that covers the lockup routes normally.
+			const roomy = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				150
+			);
+			expect(roomy).to.not.be.null;
+		});
 	});
 
 	describe('MPP Receiver Aggregation', function () {

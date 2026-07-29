@@ -7221,7 +7221,9 @@ export class LightningNode extends EventEmitter {
 			invoice.paymentSecret &&
 			invoice.featureBits?.hasFeature(Feature.BASIC_MPP)
 		) {
-			// Try multi-path routing as fallback
+			// Try multi-path routing as fallback. Retries re-enter here with the
+			// retry context's exclusion set, so failed SCIDs must be excluded
+			// from MPP parts exactly as they are from single-path routes.
 			const multiRoute = findMultiPathRoute(
 				this.graph,
 				sourceNodeId,
@@ -7233,7 +7235,8 @@ export class LightningNode extends EventEmitter {
 				this.missionControl,
 				invoice.routingHints,
 				undefined,
-				localChannels
+				localChannels,
+				excludedChannels
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -7246,7 +7249,8 @@ export class LightningNode extends EventEmitter {
 					invoiceStr,
 					invoice,
 					multiRoute,
-					finalCltvExpiry
+					finalCltvExpiry,
+					excludedChannels
 				);
 			}
 		}
@@ -7791,7 +7795,8 @@ export class LightningNode extends EventEmitter {
 			totalAmountMsat: bigint;
 			totalFeeMsat: bigint;
 		},
-		_finalCltvExpiry: number
+		_finalCltvExpiry: number,
+		excludedChannels?: Set<string>
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -7807,11 +7812,13 @@ export class LightningNode extends EventEmitter {
 		};
 		this.payments.set(hashHex, payment);
 
-		// Store retry context
+		// Store retry context. Seed it with the exclusions this attempt was
+		// routed under so a retry keeps avoiding those SCIDs and the failure
+		// handler accumulates onto the same set.
 		if (!this.paymentRetryContexts.has(hashHex)) {
 			this.paymentRetryContexts.set(hashHex, {
 				invoiceStr,
-				excludedChannels: new Set(),
+				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries
 			});
@@ -9792,9 +9799,13 @@ export class LightningNode extends EventEmitter {
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
-				// The retry never left the node. Restore the attempt that did fail,
-				// keeping its original onion failure, and append why the retry could
-				// not be sent rather than discarding that reason silently.
+				// The retry never left the node. Roll the counter back so
+				// retryCount keeps meaning "retries actually dispatched" (with
+				// exclusions honored by MPP too, an exhausted graph lands here
+				// routinely). Restore the attempt that did fail, keeping its
+				// original onion failure, and append why the retry could not be
+				// sent rather than discarding that reason silently.
+				retryCtx.retryCount--;
 				this.payments.set(hashHex, payment);
 				payment.retryCount = retryCtx.retryCount;
 				const detail = err instanceof Error ? err.message : String(err);
