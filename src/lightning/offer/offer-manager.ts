@@ -333,27 +333,32 @@ export class OfferManager extends EventEmitter {
 
 		const encoded = encodeOffer(offer);
 
-		// Store offer (with the expected path_id when its paths carry one)
-		this.offers.set(offerId.toString('hex'), {
+		// The offer id is deterministic, so re-creating an identical offer
+		// updates an existing entry. The in-memory path_id must follow the
+		// same rule as the storage upsert (a non-null stored path_id is
+		// preserved when the new call omits one): handleInvoiceRequest
+		// enforces authentication from THIS entry, so dropping it here would
+		// silently disable the offer's blinded-path auth until restart.
+		const offerIdHex = offerId.toString('hex');
+		const previous = this.offers.get(offerIdHex);
+		const effectivePathId = options.pathId ?? previous?.pathId;
+
+		// Persist FIRST (saveOffer is synchronous): if it throws, memory is
+		// untouched, so a fresh create is fully rolled back and a re-create
+		// keeps its previous, still-persisted entry. Half-created (live and
+		// payable now, silently gone after restart) is the worst outcome.
+		this.storage?.saveOffer?.(
+			offerIdHex,
+			encoded,
+			effectivePathId ?? null,
+			Date.now()
+		);
+		this.offers.set(offerIdHex, {
 			offer,
 			encoded,
 			tlvData,
-			pathId: options.pathId
+			pathId: effectivePathId
 		});
-		try {
-			this.storage?.saveOffer?.(
-				offerId.toString('hex'),
-				encoded,
-				options.pathId ?? null,
-				Date.now()
-			);
-		} catch (err) {
-			// Half-created is the worst outcome: live and payable in this
-			// process, silently gone after restart. Roll the memory entry back
-			// and surface the failure to the caller instead.
-			this.offers.delete(offerId.toString('hex'));
-			throw err;
-		}
 
 		this.emit('offer:created', offer, encoded);
 		return { offer, encoded };

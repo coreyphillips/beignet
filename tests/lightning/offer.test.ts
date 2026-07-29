@@ -1106,6 +1106,80 @@ describe('BOLT 12: Offers', () => {
 			}
 		});
 
+		it('preserves in-memory path authentication when recreating an offer', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				const { offer } = mgr.createOffer({
+					description: 'guarded',
+					amount: 5_000n,
+					pathId
+				});
+
+				// Recreate the identical offer WITHOUT a pathId: the entry the
+				// request handler enforces from must keep the original secret,
+				// or authentication is silently disabled until restart.
+				mgr.createOffer({ description: 'guarded', amount: 5_000n });
+
+				const requestTlv = makeSignedRequestTlv({ amount: 5_000n }, offer);
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, undefined),
+					'request without path_id still rejected'
+				).to.be.null;
+				expect(
+					mgr.handleInvoiceRequest(
+						requestTlv,
+						undefined,
+						crypto.randomBytes(32)
+					),
+					'request with a wrong path_id still rejected'
+				).to.be.null;
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, pathId),
+					'original path_id still accepted'
+				).to.not.be.null;
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('restores an existing offer when an upsert fails', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				const { offer } = mgr.createOffer({
+					description: 'sturdy',
+					amount: 7_000n,
+					pathId
+				});
+
+				storage.saveOffer = (): void => {
+					throw new Error('disk full');
+				};
+				// The failed re-create must not evict the previous, valid,
+				// still-persisted entry.
+				expect(() =>
+					mgr.createOffer({ description: 'sturdy', amount: 7_000n })
+				).to.throw('disk full');
+				expect(mgr.listOffers()).to.have.length(1);
+				const requestTlv = makeSignedRequestTlv({ amount: 7_000n }, offer);
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, pathId),
+					'previous entry still answers'
+				).to.not.be.null;
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
 		it('removeOffer does not delete the row of an unknown offer', () => {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();

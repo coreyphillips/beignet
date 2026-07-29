@@ -4291,9 +4291,11 @@ export class BeignetNode extends EventEmitter {
 			options.amountSats !== undefined
 				? BigInt(options.amountSats) * 1000n
 				: undefined;
+		// Sum in bigint: expirySecs alone is a safe integer, but the sum with
+		// now can exceed 2^53 and round before a number-based conversion.
 		const absoluteExpiry =
 			options.expirySecs !== undefined
-				? BigInt(Math.floor(Date.now() / 1000) + options.expirySecs)
+				? BigInt(Math.floor(Date.now() / 1000)) + BigInt(options.expirySecs)
 				: undefined;
 		const { offer, encoded } = this.node.createOffer({
 			description: options.description,
