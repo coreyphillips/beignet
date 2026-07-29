@@ -5,6 +5,7 @@
  */
 
 import * as http from 'http';
+import * as net from 'net';
 import * as https from 'https';
 import * as fs from 'fs';
 import { Console } from 'console';
@@ -245,8 +246,12 @@ export async function startDaemon(
 	// /send, /channel/forceclose and /mnemonic to the whole network segment;
 	// wildcard CORS without authentication lets any page the operator visits
 	// drive those same routes. `insecure: true` is the deliberate escape.
+	// A literal loopback IP or the localhost name only: a HOSTNAME beginning
+	// with "127." (e.g. 127.example.com) could resolve anywhere.
 	const isLoopbackHost =
-		host === 'localhost' || host === '::1' || host.startsWith('127.');
+		host === 'localhost' ||
+		host === '::1' ||
+		(net.isIPv4(host) && host.startsWith('127.'));
 	if (!isLoopbackHost && !authenticator.enabled && opts.insecure !== true) {
 		throw new BeignetError(
 			'INVALID_PARAMS',
@@ -396,9 +401,7 @@ export async function startDaemon(
 		'GET /readiness': () => success(node.getMainnetReadiness()),
 		'GET /openapi.json': () => getOpenApiSpec(),
 		'GET /stats': (_body, query) => {
-			const windowMs = query.get('window')
-				? Number(query.get('window'))
-				: undefined;
+			const windowMs = parseIntParam(query, 'window', { min: 0 });
 			return success(node.getStats(windowMs));
 		},
 		'GET /spend-limit': () => success(node.getDailySpendInfo()),
@@ -502,18 +505,20 @@ export async function startDaemon(
 		'GET /address/labels': () => success(node.listAddressLabels()),
 		'GET /wallet/descriptors': () => success(node.exportDescriptors()),
 		'GET /channel/suggestions': (_body, query) => {
-			const count = query.get('count') ? Number(query.get('count')) : undefined;
+			const count = parseIntParam(query, 'count', { min: 1 });
 			return success(node.getChannelSuggestions(count));
 		},
 
 		'GET /logs': (_body, query) => {
 			const options: Record<string, unknown> = {};
 			if (query.get('category')) options.category = query.get('category');
-			if (query.get('since')) options.since = Number(query.get('since'));
-			if (query.get('limit')) options.limit = Number(query.get('limit'));
+			const since = parseIntParam(query, 'since', { min: 0 });
+			if (since !== undefined) options.since = since;
+			const limit = parseIntParam(query, 'limit', { min: 0 });
+			if (limit !== undefined) options.limit = limit;
 			return success(
 				node.getActionLog(
-					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; getActionLog tolerates unknown values
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- remaining string params pass through; integers are validated above
 					Object.keys(options).length > 0 ? (options as any) : undefined
 				)
 			);
@@ -1859,9 +1864,18 @@ export async function startDaemon(
 				// Unknown throw: log the detail server-side and answer with a
 				// generic message. Raw messages leak filesystem paths and
 				// database layout; HTTP 200 on errors blinds every proxy and
-				// health check in front of the daemon.
-				const msg = err instanceof Error ? err.message : String(err);
-				logger?.error(`Unhandled error on ${routeKey}: ${msg}`);
+				// health check in front of the daemon. An unhandled exception
+				// is worth a stderr line even when logging is not configured;
+				// discarding it makes the generic 500 undiagnosable.
+				const detail =
+					err instanceof Error ? err.stack ?? err.message : String(err);
+				if (logger) {
+					logger.error(`Unhandled error on ${routeKey}: ${detail}`);
+				} else {
+					process.stderr.write(
+						`[beignet-daemon] Unhandled error on ${routeKey}: ${detail}\n`
+					);
+				}
 				res.statusCode = 500;
 				res.end(
 					JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))

@@ -698,6 +698,20 @@ describe('Daemon auth middleware', () => {
 			);
 			expect(goodAmount.status).to.equal(200);
 
+			// The audit/history and advisor routes validate too.
+			const badWindow = await httpGet(addr.port, '/stats?window=abc', auth);
+			expect(badWindow.status).to.equal(400);
+			const badCount = await httpGet(
+				addr.port,
+				'/channel/suggestions?count=abc',
+				auth
+			);
+			expect(badCount.status).to.equal(400);
+			const badLogsSince = await httpGet(addr.port, '/logs?since=abc', auth);
+			expect(badLogsSince.status).to.equal(400);
+			const badLogsLimit = await httpGet(addr.port, '/logs?limit=1.5', auth);
+			expect(badLogsLimit.status).to.equal(400);
+
 			// A returned failure envelope carries its mapped status too.
 			const notFound = await httpGet(
 				addr.port,

@@ -1643,14 +1643,14 @@ All responses include `X-API-Version: 1` header. Non-prefixed routes continue to
 
 ### CORS
 
-Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions:
+Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk.
 
 ```typescript
-startDaemon({ cors: true });    // Access-Control-Allow-Origin: *
-startDaemon({ cors: 'https://myapp.com' });  // specific origin
+startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *
+startDaemon({ cors: 'https://myapp.com' });    // specific origin
 ```
 
-Handles `OPTIONS` preflight requests automatically.
+Handles `OPTIONS` preflight requests automatically (`GET, POST, DELETE, OPTIONS`).
 
 ---
 
