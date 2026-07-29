@@ -89,6 +89,12 @@ export interface IWatchtowerClientOptions {
 	connectTimeoutMs?: number;
 }
 
+/** An in-flight awaitReply, tracked so stop/close can settle it early. */
+interface IReplyWaiter {
+	timer: NodeJS.Timeout;
+	reject: (err: Error) => void;
+}
+
 /** One per-blob-type session (and its dedicated tower connection). */
 interface ISessionSlot {
 	blobType: number;
@@ -102,6 +108,8 @@ interface ISessionSlot {
 	reconnectTimer: NodeJS.Timeout | null;
 	/** One-shot reply resolver keyed by expected wtwire type. */
 	pending: Map<number, (payload: Buffer) => void> | null;
+	/** Reply waits in flight on this slot's connection. */
+	replyWaiters: Set<IReplyWaiter>;
 	draining: boolean;
 	negotiating: boolean;
 	/** Tower rejected CreateSession for this blob type (cleared on reconnect). */
@@ -203,6 +211,7 @@ export class WatchtowerClient extends EventEmitter {
 			for (const slot of state.slots.values()) {
 				if (slot.reconnectTimer) clearTimeout(slot.reconnectTimer);
 				slot.reconnectTimer = null;
+				this.failReplyWaiters(slot, 'watchtower client stopped');
 				slot.transport?.close();
 				slot.transport = null;
 			}
@@ -231,6 +240,7 @@ export class WatchtowerClient extends EventEmitter {
 		state.stopped = true;
 		for (const slot of state.slots.values()) {
 			if (slot.reconnectTimer) clearTimeout(slot.reconnectTimer);
+			this.failReplyWaiters(slot, 'watchtower removed');
 			slot.transport?.close();
 		}
 		this.towers.delete(uri);
@@ -304,7 +314,16 @@ export class WatchtowerClient extends EventEmitter {
 				hint: update.hint,
 				sweptSats: sweptSats.toString()
 			});
-			void this.drainSlot(state, slot);
+			// Ship failures are handled inside the drain loop; this catch is a
+			// backstop so nothing this call raises can escape as an unhandled
+			// rejection and take the process down mid-backup. No channel is
+			// named: the drain covers the whole backlog, not just this update.
+			this.drainSlot(state, slot).catch((err) => {
+				this.emitLog('backup_failed', {
+					tower: state.address.uri,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			});
 		}
 	}
 
@@ -338,6 +357,7 @@ export class WatchtowerClient extends EventEmitter {
 			reconnectDelay: MIN_RECONNECT_MS,
 			reconnectTimer: null,
 			pending: null,
+			replyWaiters: new Set(),
 			draining: false,
 			negotiating: false,
 			rejected: false
@@ -434,6 +454,9 @@ export class WatchtowerClient extends EventEmitter {
 	private onClose(state: ITowerState, slot: ISessionSlot): void {
 		slot.transport = null;
 		slot.pending = null;
+		// Reply waits can never be answered on a dead connection; settle them
+		// now rather than letting each one reject 30s later.
+		this.failReplyWaiters(slot, 'watchtower: connection closed');
 		slot.draining = false;
 		slot.negotiating = false;
 		if (state.stopped || !this.started) return;
@@ -546,7 +569,22 @@ export class WatchtowerClient extends EventEmitter {
 			for (const update of state.backlog) {
 				if (update.acked || update.blobType !== slot.blobType) continue;
 				if (!slot.transport?.isConnected() || !slot.session) break;
-				await this.shipUpdate(state, slot, update);
+				try {
+					await this.shipUpdate(state, slot, update);
+				} catch (err) {
+					// A failed ship aborts the drain: after a resync or session
+					// rotation the remaining updates must wait for the next
+					// drain rather than go out with stale sequence numbers.
+					// The update stays queued (fund safety). Logged here, where
+					// the failing update is known: the backlog spans channels,
+					// so the caller's channel would be the wrong attribution.
+					this.emitLog('backup_failed', {
+						tower: state.address.uri,
+						channelId: update.channelId,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					break;
+				}
 			}
 		} finally {
 			slot.draining = false;
@@ -640,15 +678,33 @@ export class WatchtowerClient extends EventEmitter {
 				reject(new Error('watchtower: no active connection'));
 				return;
 			}
-			const timer = setTimeout(() => {
-				slot.pending?.delete(type);
-				reject(new Error('watchtower: reply timeout'));
-			}, REPLY_TIMEOUT_MS);
+			const waiter: IReplyWaiter = {
+				timer: setTimeout(() => {
+					slot.replyWaiters.delete(waiter);
+					slot.pending?.delete(type);
+					reject(new Error('watchtower: reply timeout'));
+				}, REPLY_TIMEOUT_MS),
+				reject
+			};
+			slot.replyWaiters.add(waiter);
 			slot.pending.set(type, (payload) => {
-				clearTimeout(timer);
+				clearTimeout(waiter.timer);
+				slot.replyWaiters.delete(waiter);
 				resolve(payload);
 			});
 		});
+	}
+
+	/**
+	 * Settle every in-flight reply wait on the slot now, instead of leaving
+	 * its 30s timeout scheduled (and rejecting) after shutdown or disconnect.
+	 */
+	private failReplyWaiters(slot: ISessionSlot, reason: string): void {
+		for (const waiter of slot.replyWaiters) {
+			clearTimeout(waiter.timer);
+			waiter.reject(new Error(reason));
+		}
+		slot.replyWaiters.clear();
 	}
 
 	private lastAckFor(state: ITowerState): number | null {
