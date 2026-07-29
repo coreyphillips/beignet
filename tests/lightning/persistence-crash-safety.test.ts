@@ -20,6 +20,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -1142,6 +1143,173 @@ describe('Crash-Safe State Persistence', function () {
 			expect(receivedHtlcState(bob2, channelId)).to.equal(HtlcState.COMMITTED);
 
 			bob2.destroy();
+			alice.destroy();
+		});
+	});
+
+	describe('Atomic paired persistence (real SQLite rollback)', function () {
+		it('persistChannel writes channel state and key index in one transaction', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(1, storage);
+			const bob = createTestNodeWithId(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			const channelIdHex = channelId.toString('hex');
+
+			// The channel needs a key index so the paired write actually runs.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const channel = (alice as any).channelManager.getChannel(channelId);
+			channel.channelKeyIndex = 7;
+
+			// Start from no persisted row, then fail the SECOND write of the
+			// pair. Without a transaction the channel row lands alone, which
+			// is a channel that signs its force-close with the wrong key
+			// after restore, and nothing at restore time flags it.
+			storage.deleteChannel(channelIdHex);
+			const originalSave = storage.saveChannelKeyIndex.bind(storage);
+			storage.saveChannelKeyIndex = (): void => {
+				throw new Error('disk full');
+			};
+			const errors: Array<{ code: string }> = [];
+			alice.on('node:error', (e: { code: string }) => errors.push(e));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+
+			expect(storage.loadChannel(channelIdHex), 'rolled back').to.be.null;
+			expect(errors.some((e) => e.code === 'PERSISTENCE_ERROR')).to.be.true;
+
+			// With the fault removed the pair lands together.
+			storage.saveChannelKeyIndex = originalSave;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+			expect(storage.loadChannel(channelIdHex)).to.not.be.null;
+			expect(storage.loadChannelKeyIndex(channelIdHex)).to.equal(7);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('createInvoice persists preimage, secret and invoice atomically', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(3, storage);
+
+			// Fail the LAST write of the trio: without a transaction the
+			// preimage and secret land without their invoice row.
+			storage.saveInvoice = (): void => {
+				throw new Error('disk full');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'atomic invoice'
+			});
+
+			const hashHex = invoice.paymentHash.toString('hex');
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+
+			alice.destroy();
+		});
+
+		/** All four invoice records must be absent for the given hash. */
+		function expectNoInvoiceRecords(
+			storage: SqliteStorage,
+			hashHex: string
+		): void {
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex),
+				'invoice rolled back'
+			).to.be.false;
+			expect(storage.loadPayment(hashHex), 'payment rolled back').to.be.null;
+		}
+
+		it('createInvoice rolls back all four records when savePayment fails', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(4, storage);
+
+			// persistPayment swallows storage errors, so a transaction wrapping
+			// it could commit preimage/secret/invoice with NO payment row; the
+			// throwing variant must abort the whole set instead.
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity'
+			});
+			expectNoInvoiceRecords(storage, invoice.paymentHash.toString('hex'));
+
+			// With the fault removed all four records land together.
+			storage.savePayment = originalSavePayment;
+			const ok = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity ok'
+			});
+			const okHex = ok.paymentHash.toString('hex');
+			expect(storage.loadPreimage(okHex)).to.not.be.null;
+			expect(storage.loadPayment(okHex)).to.not.be.null;
+
+			alice.destroy();
+		});
+
+		it('BOLT 12 invoice:issued rolls back all four records when savePayment fails', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(5, storage);
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const hashHex = paymentHash.toString('hex');
+			const bolt12Invoice = {
+				paymentHash,
+				paymentSecret: crypto.randomBytes(32),
+				amount: 5_000n,
+				description: 'b12 atomicity',
+				createdAt: BigInt(Math.floor(Date.now() / 1000))
+			};
+
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage
+			);
+			expectNoInvoiceRecords(storage, hashHex);
+
+			// The path itself works once the fault is removed: both invoice
+			// persistence paths go through the same shared helper.
+			storage.savePayment = originalSavePayment;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage
+			);
+			expect(storage.loadPreimage(hashHex)).to.not.be.null;
+			expect(storage.loadPayment(hashHex)).to.not.be.null;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex)
+			).to.be.true;
+
 			alice.destroy();
 		});
 	});

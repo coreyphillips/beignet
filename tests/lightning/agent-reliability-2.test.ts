@@ -578,7 +578,8 @@ describe('Fix 2.5: Emit errors on persistence failures', () => {
 				throw new Error('disk full');
 			},
 			savePayment: () => {},
-			saveMissionControl: () => {}
+			saveMissionControl: () => {},
+			transaction: <T>(fn: () => T): T => fn()
 		};
 
 		const node = createTestNode({ storage: failingStorage as IStorageBackend });
