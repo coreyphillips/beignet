@@ -1015,6 +1015,59 @@ describe('watchtower client session state machine (fake tower)', function () {
 		expect(failure!.error).to.match(/stopped/);
 		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
 	});
+
+	it('backup_failed names the channel of the update that failed, not the trigger', async function () {
+		// An older queued update for another channel sits at the head of the
+		// backlog; a fresh backup for 'wt-test' triggers the drain, the head
+		// update fails first, and the log must attribute the failure to the
+		// head update's channel.
+		const store = new InMemoryStore();
+		store.sessions.push({
+			session: {
+				towerUri: TOWER_URI,
+				towerPubkey: parseTowerUri(TOWER_URI).pubkey,
+				sessionId: getPublicKey(crypto.randomBytes(32)).toString('hex'),
+				blobType: BlobType.ALTRUIST_COMMIT,
+				maxUpdates: 1024,
+				sweepFeeRate: '2500',
+				seqNum: 0,
+				lastApplied: 0,
+				createdAt: Date.now()
+			},
+			sessionKey: crypto.randomBytes(32)
+		});
+		store.updates.push({
+			id: 1,
+			towerUri: TOWER_URI,
+			channelId: 'older-queued-channel',
+			blobType: BlobType.ALTRUIST_COMMIT,
+			hint: crypto.randomBytes(16).toString('hex'),
+			encryptedBlob: crypto.randomBytes(314).toString('hex'),
+			seqNum: 0,
+			acked: false,
+			createdAt: Date.now()
+		});
+
+		const fake = new FakeTower(parseTowerUri(TOWER_URI));
+		fake.behaviour.updateCode = (): number =>
+			StateUpdateCode.SEQ_NUM_OUT_OF_ORDER;
+		const client = makeClient(fake, store);
+		const logs: Array<{ event: string; channelId?: string }> = [];
+		client.on('log', (e: { event: string; channelId?: string }) =>
+			logs.push(e)
+		);
+		await client.start();
+		await tick(20);
+
+		logs.length = 0;
+		client.backupRevokedState(contextForClient());
+		await tick(20);
+
+		const failure = logs.find((l) => l.event === 'backup_failed');
+		expect(failure).to.not.equal(undefined);
+		expect(failure!.channelId).to.equal('older-queued-channel');
+		client.stop();
+	});
 });
 
 describe('watchtower persistence round-trip', function () {

@@ -476,27 +476,6 @@ async function handleStart(): Promise<void> {
 		process.on('SIGINT', shutdown);
 		process.on('SIGTERM', shutdown);
 
-		// Process-level safety net. A stray rejection from a background
-		// component (a slow watchtower, a dropped peer socket) must not take
-		// down a running node: log it and keep serving. A truly uncaught
-		// synchronous exception leaves unknown state, so log it and shut down
-		// cleanly instead; process.exit still runs the exit handlers that
-		// release the pid file and the storage instance lock.
-		process.on('unhandledRejection', (reason) => {
-			console.error(
-				'[beignet] unhandled promise rejection:',
-				reason instanceof Error
-					? reason.stack ?? reason.message
-					: String(reason)
-			);
-		});
-		process.on('uncaughtException', (err) => {
-			console.error('[beignet] uncaught exception:', err.stack ?? err.message);
-			removePidFile();
-			server.close();
-			process.exit(1);
-		});
-
 		if (isDaemon) {
 			// Keep running
 		} else {

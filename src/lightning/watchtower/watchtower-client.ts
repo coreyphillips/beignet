@@ -314,15 +314,13 @@ export class WatchtowerClient extends EventEmitter {
 				hint: update.hint,
 				sweptSats: sweptSats.toString()
 			});
-			// A tower being slow, refusing an update, or dropping the connection
-			// is a normal operating condition. The drain must reject to abort
-			// the ship loop, but that rejection must never escape as an
-			// unhandled rejection and take the process down; the update stays
-			// queued and the next drain retries it.
+			// Ship failures are handled inside the drain loop; this catch is a
+			// backstop so nothing this call raises can escape as an unhandled
+			// rejection and take the process down mid-backup. No channel is
+			// named: the drain covers the whole backlog, not just this update.
 			this.drainSlot(state, slot).catch((err) => {
 				this.emitLog('backup_failed', {
 					tower: state.address.uri,
-					channelId: ctx.channelId,
 					error: err instanceof Error ? err.message : String(err)
 				});
 			});
@@ -571,7 +569,22 @@ export class WatchtowerClient extends EventEmitter {
 			for (const update of state.backlog) {
 				if (update.acked || update.blobType !== slot.blobType) continue;
 				if (!slot.transport?.isConnected() || !slot.session) break;
-				await this.shipUpdate(state, slot, update);
+				try {
+					await this.shipUpdate(state, slot, update);
+				} catch (err) {
+					// A failed ship aborts the drain: after a resync or session
+					// rotation the remaining updates must wait for the next
+					// drain rather than go out with stale sequence numbers.
+					// The update stays queued (fund safety). Logged here, where
+					// the failing update is known: the backlog spans channels,
+					// so the caller's channel would be the wrong attribution.
+					this.emitLog('backup_failed', {
+						tower: state.address.uri,
+						channelId: update.channelId,
+						error: err instanceof Error ? err.message : String(err)
+					});
+					break;
+				}
 			}
 		} finally {
 			slot.draining = false;
