@@ -1010,6 +1010,41 @@ describe('BOLT 12: Offers', () => {
 			}
 		});
 
+		it('asyncHold survives a restart with the offer', () => {
+			// Post-restart invoice issuance must keep building LSP hold
+			// payment paths; losing the flag would silently issue non-hold
+			// paths and break async receive for the offer's lifetime.
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer: holdOffer } = mgrA.createOffer({
+					description: 'held after restart',
+					asyncHold: true
+				});
+				const { offer: plainOffer } = mgrA.createOffer({
+					description: 'plain'
+				});
+				mgrA.destroy();
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				const holdEntry = (mgrB as any).offers.get(
+					holdOffer.offerId.toString('hex')
+				);
+				const plainEntry = (mgrB as any).offers.get(
+					plainOffer.offerId.toString('hex')
+				);
+				expect(holdEntry?.asyncHold, 'hold flag restored').to.be.true;
+				expect(plainEntry?.asyncHold ?? false, 'plain offer stays plain').to.be
+					.false;
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
 		it('removeOffer deletes the persisted row too', () => {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();

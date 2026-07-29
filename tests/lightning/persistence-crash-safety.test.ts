@@ -38,6 +38,17 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	encodeOfferTlv,
+	encodeInvoiceRequestTlv,
+	getTlvRecords,
+	computeMerkleRootFromRecords,
+	computeSignatureHash,
+	schnorrSign,
+	IInvoiceRequest,
+	IBolt12Invoice
+} from '../../src/lightning/offer';
 
 // ─────────────── Mock Storage ───────────────
 
@@ -1267,7 +1278,7 @@ describe('Crash-Safe State Persistence', function () {
 			alice.destroy();
 		});
 
-		it('BOLT 12 invoice:issued rolls back all four records when savePayment fails', function () {
+		it('BOLT 12 invoice:issued rolls back all records when savePayment fails, path_id included', function () {
 			const storage = new SqliteStorage(':memory:');
 			storage.open();
 			const alice = createTestNodeWithId(5, storage);
@@ -1275,9 +1286,9 @@ describe('Crash-Safe State Persistence', function () {
 			const preimage = crypto.randomBytes(32);
 			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
 			const hashHex = paymentHash.toString('hex');
+			const pathId = crypto.randomBytes(32);
 			const bolt12Invoice = {
 				paymentHash,
-				paymentSecret: crypto.randomBytes(32),
 				amount: 5_000n,
 				description: 'b12 atomicity',
 				createdAt: BigInt(Math.floor(Date.now() / 1000))
@@ -1291,9 +1302,20 @@ describe('Crash-Safe State Persistence', function () {
 			(alice as any).offerManager.emit(
 				'invoice:issued',
 				bolt12Invoice,
-				preimage
+				preimage,
+				pathId
 			);
 			expectNoInvoiceRecords(storage, hashHex);
+			// The authentication path_id must roll back WITH the preimage: a
+			// claimable payment persisted without its path_id would come back
+			// from a restart unpayable (fail closed), and one persisted with a
+			// path_id but no preimage could never settle.
+			expect(
+				storage
+					.loadAllInvoicePathIds()
+					.some((r) => r.paymentHashHex === hashHex),
+				'path_id rolled back'
+			).to.be.false;
 
 			// The path itself works once the fault is removed: both invoice
 			// persistence paths go through the same shared helper.
@@ -1302,15 +1324,194 @@ describe('Crash-Safe State Persistence', function () {
 			(alice as any).offerManager.emit(
 				'invoice:issued',
 				bolt12Invoice,
-				preimage
+				preimage,
+				pathId
 			);
 			expect(storage.loadPreimage(hashHex)).to.not.be.null;
 			expect(storage.loadPayment(hashHex)).to.not.be.null;
 			expect(
 				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex)
 			).to.be.true;
+			expect(
+				storage
+					.loadAllInvoicePathIds()
+					.some((r) => r.paymentHashHex === hashHex && r.pathId.equals(pathId)),
+				'path_id landed with the preimage'
+			).to.be.true;
 
 			alice.destroy();
+		});
+	});
+
+	describe('BOLT 12 receive authentication across restart', function () {
+		// Stand in for a completed reconnect on a restored channel: put it back
+		// in NORMAL and fire the channel:ready the reestablish would produce.
+		function reconnect(node: LightningNode, channelId: Buffer): void {
+			const channel = node.getChannelManager().getChannel(channelId);
+			expect(channel, 'expected the channel to have been restored').to.exist;
+			channel!.getFullState().state = ChannelState.NORMAL;
+			node.getChannelManager().emit('channel:ready', channelId);
+		}
+
+		// Issue a BOLT 12 invoice on `issuer` for a pathless offer, exactly as
+		// the onion-message handler would (signed invoice_request).
+		function issueBolt12Invoice(
+			issuer: LightningNode,
+			payerPriv: Buffer,
+			amountMsat: bigint
+		): IBolt12Invoice | null {
+			const offerMgr = issuer.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'restart survival',
+				amount: amountMsat
+			});
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			return offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			);
+		}
+
+		it('restores the expected path_id and settles a post-restart payment over the invoice path', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+				expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+				const hashHex = b12.paymentHash.toString('hex');
+				const pathIdBefore = bob
+					.getOfferManager()
+					.getInvoicePathId(b12.paymentHash);
+				expect(pathIdBefore, 'path_id registered at issuance').to.exist;
+
+				// The authentication path_id landed in storage in the same
+				// transaction as the preimage.
+				expect(
+					storage
+						.loadAllInvoicePathIds()
+						.some((r) => r.paymentHashHex === hashHex)
+				).to.be.true;
+
+				// Crash + restart the issuer over the same storage. bob is
+				// abandoned, NOT destroyed: destroy() closes the shared SQLite
+				// handle, and a crash closes nothing.
+				alice.removeAllListeners('message:outbound');
+				const bob2 = createTestNodeWithId(2, storage);
+				bob2.on('node:error', () => {});
+				reconnect(bob2, channelId);
+				connectNodes(alice, bob2);
+
+				// The expected path_id survived the restart...
+				const restored = bob2
+					.getOfferManager()
+					.getInvoicePathId(b12.paymentHash);
+				expect(restored, 'path_id restored from storage').to.exist;
+				expect(restored!.equals(pathIdBefore!)).to.be.true;
+				// ...and so did the invoice's bolt12 marker + preimage.
+				expect(bob2['invoices'].get(hashHex)?.bolt12).to.be.true;
+				expect(bob2['preimages'].has(hashHex)).to.be.true;
+
+				// The payment through the invoice's blinded path settles.
+				let received = false;
+				bob2.on('payment:received', () => {
+					received = true;
+				});
+				const sent = alice.payBolt12Invoice(b12);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(received, 'restarted bob settled the payment').to.be.true;
+
+				alice.destroy();
+				bob2.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob2.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('fails a post-restart HTLC for the same hash sent outside the invoice path', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+
+				// Crash: abandon bob without destroy (destroy closes the shared
+				// SQLite handle; a crash closes nothing).
+				alice.removeAllListeners('message:outbound');
+				const bob2 = createTestNodeWithId(2, storage);
+				bob2.on('node:error', () => {});
+				reconnect(bob2, channelId);
+				connectNodes(alice, bob2);
+
+				// Same hash, no blinded path: the restored preimage must NOT be
+				// revealed for an out-of-path HTLC (fail closed after restart).
+				const bolt11 = encodeInvoice({
+					network: Network.REGTEST,
+					amountMsat,
+					paymentHash: b12.paymentHash,
+					paymentSecret: crypto.randomBytes(32),
+					description: 'outside the path, after restart',
+					privateKey: makeNodeConfig(2).nodePrivateKey
+				});
+				let received = false;
+				bob2.on('payment:received', () => {
+					received = true;
+				});
+				const sent = alice.sendPayment(bolt11);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.FAILED
+				);
+				expect(received, 'restarted bob must not fulfill out-of-path').to.be
+					.false;
+
+				alice.destroy();
+				bob2.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob2.destroy() already closed the shared handle
+				}
+			}
 		});
 	});
 });
