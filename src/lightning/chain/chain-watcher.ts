@@ -129,6 +129,14 @@ export function computeScriptHash(scriptPubkey: Buffer): string {
  * - 'broadcast:success' (txid: string)
  * - 'broadcast:failure' (error: Error)
  * - 'error' (error: Error)
+ *
+ * CONTRACT: register an 'error' listener. Chain failures are reported there
+ * and NOWHERE else, and with no listener attached they are dropped rather than
+ * thrown. EventEmitter's default is to throw on an unhandled 'error', which for
+ * a component that emits from a dozen promise catches means a background chain
+ * failure terminates the process, including during shutdown. LightningNode
+ * registers one (surfaced as node:error with code CHAIN_WATCHER_ERROR); a
+ * consumer driving ChainWatcher directly must do the same.
  */
 /** A failed funding watch queued for retry */
 interface IFailedFundingWatch {
@@ -176,6 +184,26 @@ export class ChainWatcher extends EventEmitter {
 	private failedBroadcasts: IFailedBroadcast[] = [];
 	private currentBlockHeight = 0;
 	private started = false;
+	/**
+	 * Bumped on every start() and stop(). Chain work captures the generation it
+	 * began in and re-checks it after every await, so a request that resolves
+	 * after teardown cannot advance the ChannelManager, and a stale callback
+	 * from a previous run cannot act on a restarted watcher. `started` alone is
+	 * not enough for the second case.
+	 */
+	private lifecycleGeneration = 0;
+	/**
+	 * Whether the watcher will accept NEW chain work. True from construction, so
+	 * registration on a watcher that has never been started keeps working, false
+	 * from an explicit stop() until the next start().
+	 *
+	 * The generation alone cannot express this: it retires work that was already
+	 * inside the watcher, but an operation that crosses its own await OUTSIDE
+	 * the watcher (LightningNode.watchRecoveredFundingOutput fetching a funding
+	 * tx, say) and calls in for the first time afterwards would default to the
+	 * post-stop generation and pass every check.
+	 */
+	private acceptingWork = true;
 	private destinationScript: Buffer;
 	private getSweepFeeRatePerVbyte?: () => number;
 	private _recheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -188,6 +216,17 @@ export class ChainWatcher extends EventEmitter {
 		this.getSweepFeeRatePerVbyte = config.getSweepFeeRatePerVbyte;
 
 		this.wireChannelManagerEvents();
+	}
+
+	/**
+	 * Every internal 'error' emit goes through here. EventEmitter THROWS when
+	 * 'error' is emitted with no listener, and this class emits it from a dozen
+	 * promise catches that can land at any time, including after teardown. A
+	 * background chain failure must not become a process crash.
+	 */
+	private emitError(err: Error): void {
+		if (this.listenerCount('error') === 0) return;
+		this.emit('error', err);
 	}
 
 	/**
@@ -204,11 +243,37 @@ export class ChainWatcher extends EventEmitter {
 	 */
 	async start(): Promise<void> {
 		if (this.started) return;
+		this.acceptingWork = true;
 		this.started = true;
+		const generation = ++this.lifecycleGeneration;
 
-		await this.backend.subscribeToHeaders((height: number) => {
-			this.handleNewBlock(height);
-		});
+		// stop() detaches the ChannelManager subscriptions, so a restarted
+		// watcher has to re-arm them or it never sees another channel event.
+		this.wireChannelManagerEvents();
+
+		try {
+			// The backend keeps this callback: ElectrumBackend holds one header
+			// callback and re-invokes it across reconnects, and stopping the
+			// watcher does not clear it. Gate it on the generation, or headers
+			// arriving after teardown still advance the ChannelManager.
+			await this.backend.subscribeToHeaders((height: number) => {
+				if (!this.isCurrentGeneration(generation)) return;
+				this.handleNewBlock(height);
+			});
+		} catch (err) {
+			if (this.lifecycleGeneration === generation) {
+				// A watcher with no header subscription and no recheck timer would
+				// accept watches it can never check, so it stops accepting work
+				// until a start() succeeds. The throw is the loud half of this.
+				this.started = false;
+				this.acceptingWork = false;
+				++this.lifecycleGeneration;
+				this.unwireChannelManagerEvents();
+			}
+			throw err;
+		}
+
+		if (!this.isCurrentGeneration(generation)) return;
 
 		// Safety net: periodically re-check watched funding outputs even without a
 		// new-block event, so a confirmation missed during an Electrum outage is
@@ -216,10 +281,26 @@ export class ChainWatcher extends EventEmitter {
 		// the header subscription itself failed to (re)establish).
 		if (!this._recheckTimer) {
 			this._recheckTimer = setInterval(() => {
+				if (!this.isCurrentGeneration(generation)) return;
 				this.recheckAllWatches();
 			}, RECHECK_INTERVAL_MS);
 			if (this._recheckTimer.unref) this._recheckTimer.unref();
 		}
+	}
+
+	/**
+	 * True while the watcher is still in the lifecycle generation the caller
+	 * began in. Chain work must re-check this after every await before touching
+	 * the ChannelManager or emitting.
+	 *
+	 * Deliberately not gated on `started`: watchFundingOutput, watchOutputByTxid
+	 * and rearmAnnouncementTracking are public and documented to work on a
+	 * watcher that has never been started, and requiring `started` would turn
+	 * those into silent no-ops. stop() bumps the generation, so anything that
+	 * needs retiring is retired either way.
+	 */
+	private isCurrentGeneration(generation: number): boolean {
+		return this.acceptingWork && this.lifecycleGeneration === generation;
 	}
 
 	/**
@@ -258,13 +339,11 @@ export class ChainWatcher extends EventEmitter {
 		// Re-check unconfirmed fundings and watched output spends directly.
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
-				this.checkFundingConfirmation(key).catch((err) =>
-					this.emit('error', err)
-				);
+				this.checkFundingConfirmation(key).catch((err) => this.emitError(err));
 			}
 		}
 		for (const key of this.watchedOutputs.keys()) {
-			this.checkOutputSpend(key).catch((err) => this.emit('error', err));
+			this.checkOutputSpend(key).catch((err) => this.emitError(err));
 		}
 	}
 
@@ -280,7 +359,14 @@ export class ChainWatcher extends EventEmitter {
 	 * Stop watching. Clears all watched outputs.
 	 */
 	stop(): void {
+		// Refuses new work as well as retiring work already in flight: an outer
+		// operation that began before stop() can still call in for the first
+		// time afterwards, and it would otherwise be handed this new generation.
+		this.acceptingWork = false;
 		this.started = false;
+		// Retires every in-flight operation: anything that resolves from here on
+		// sees a generation it does not own and returns without acting.
+		++this.lifecycleGeneration;
 		if (this._recheckTimer) {
 			clearInterval(this._recheckTimer);
 			this._recheckTimer = null;
@@ -290,7 +376,17 @@ export class ChainWatcher extends EventEmitter {
 		this.failedFundingWatches.length = 0;
 		this.failedOutputWatches.length = 0;
 		this.failedBroadcasts.length = 0;
-		this.removeAllListeners();
+
+		// Detach from the ChannelManager, so a stopped watcher stops acting on
+		// channel events. It used to keep broadcasting after node.destroy().
+		// start() re-arms these.
+		this.unwireChannelManagerEvents();
+
+		// Deliberately NOT removeAllListeners(): those are the consumer's
+		// handlers, including the node's 'error' handler, and in-flight chain
+		// requests still reject after stop(). Removing them turned an ordinary
+		// shutdown into a crash, and left the watcher permanently deaf if it was
+		// ever restarted.
 	}
 
 	/**
@@ -308,8 +404,12 @@ export class ChainWatcher extends EventEmitter {
 		txid: string,
 		outputIndex: number,
 		minimumDepth: number,
-		scriptPubkey: Buffer
+		scriptPubkey: Buffer,
+		// Captured by whatever operation is registering this watch, so a stop()
+		// during either await retires the whole registration.
+		generation: number = this.lifecycleGeneration
 	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
 		const key = channelId.toString('hex');
 
@@ -329,19 +429,41 @@ export class ChainWatcher extends EventEmitter {
 		// Subscribe to the funding script hash — queue for retry on failure
 		try {
 			await this.backend.subscribeToScriptHash(scriptHash, () => {
-				this.checkFundingConfirmation(key).catch((err) => {
-					this.emit('error', err);
+				// The backend retains this callback across reconnects, so a
+				// callback registered before a stop() must not start a check that
+				// captures the current generation and passes every guard.
+				if (!this.isCurrentGeneration(generation)) return;
+				this.checkFundingConfirmation(key, generation).catch((err) => {
+					this.emitError(err);
 				});
 			});
 		} catch {
-			// Queue for retry on next block
-			this.failedFundingWatches.push({
-				channelId,
-				txid,
-				outputIndex,
-				minimumDepth,
-				scriptPubkey
-			});
+			// Queue for retry on next block, unless the watch was retired while
+			// the subscription was in flight: stop() clears this queue, and
+			// repopulating it afterwards revives a stale watch on the next start.
+			if (
+				this.isCurrentGeneration(generation) &&
+				this.watchedFundings.get(key) === watched
+			) {
+				this.failedFundingWatches.push({
+					channelId,
+					txid,
+					outputIndex,
+					minimumDepth,
+					scriptPubkey
+				});
+			}
+			return;
+		}
+
+		if (
+			!this.isCurrentGeneration(generation) ||
+			this.watchedFundings.get(key) !== watched
+		) {
+			if (this.watchedFundings.get(key) === watched) {
+				this.watchedFundings.delete(key);
+			}
+			return;
 		}
 
 		// Immediately check current status. Electrum's scripthash subscription only
@@ -350,9 +472,9 @@ export class ChainWatcher extends EventEmitter {
 		// not be reconciled until the next new block arrives. This mirrors the
 		// immediate checkFundingSpent() in watchFundingSpend().
 		try {
-			await this.checkFundingConfirmation(key);
+			await this.checkFundingConfirmation(key, generation);
 		} catch (err) {
-			this.emit('error', err);
+			this.emitError(err);
 		}
 	}
 
@@ -401,28 +523,56 @@ export class ChainWatcher extends EventEmitter {
 		// this seed watched.spendTxid is undefined and the eviction branch never
 		// fires, hiding a reorg-then-theft of a penalty / HTLC claim.
 		spendTxid?: string,
-		spendHeight?: number
+		spendHeight?: number,
+		// Taken at the start of whatever operation is registering this watch, so
+		// a stop() during either await retires the whole registration rather
+		// than just the part that had not started yet.
+		generation: number = this.lifecycleGeneration
 	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		const scriptHash = computeScriptHash(scriptPubkey);
 		const key = `${txid}:${outputIndex}`;
 
-		this.watchedOutputs.set(key, {
+		const watched: IWatchedOutput = {
 			txid,
 			outputIndex,
 			scriptHash,
 			spendTxid,
 			spendHeight
-		});
+		};
+		this.watchedOutputs.set(key, watched);
 
 		try {
 			await this.backend.subscribeToScriptHash(scriptHash, () => {
-				this.checkOutputSpend(key).catch((err) => {
-					this.emit('error', err);
+				// The backend retains this callback and re-invokes it across
+				// reconnects; stop() cannot reach into it. Without this check a
+				// callback registered before a stop could start a fresh check that
+				// captured the CURRENT generation and passed every guard.
+				if (!this.isCurrentGeneration(generation)) return;
+				this.checkOutputSpend(key, generation).catch((err) => {
+					this.emitError(err);
 				});
 			});
 		} catch {
-			// Queue for retry on next block
-			this.failedOutputWatches.push({ txid, outputIndex, scriptPubkey });
+			// Queue for retry on next block, unless the watch was retired while
+			// the subscription was in flight: stop() clears this queue, and
+			// repopulating it afterwards revives a stale watch on the next start.
+			if (
+				this.isCurrentGeneration(generation) &&
+				this.watchedOutputs.get(key) === watched
+			) {
+				this.failedOutputWatches.push({ txid, outputIndex, scriptPubkey });
+			}
+			return;
+		}
+
+		// Retired while subscribing: drop our own entry if it somehow outlived
+		// the clear in stop(). Never touch an entry a later generation owns.
+		if (
+			!this.isCurrentGeneration(generation) &&
+			this.watchedOutputs.get(key) === watched
+		) {
+			this.watchedOutputs.delete(key);
 		}
 	}
 
@@ -438,7 +588,12 @@ export class ChainWatcher extends EventEmitter {
 		spendTxid?: string,
 		spendHeight?: number
 	): Promise<void> {
+		// Captured before the fetch: resolving after a stop() and then installing
+		// a fresh watch would hand checkOutputSpend a map entry and a generation
+		// that both look current, so every downstream guard would pass.
+		const generation = this.lifecycleGeneration;
 		const rawTx = await this.backend.getTransaction(txid);
+		if (!this.isCurrentGeneration(generation)) return;
 		const tx = bitcoin.Transaction.fromBuffer(rawTx);
 		if (outputIndex >= tx.outs.length) {
 			throw new Error(
@@ -451,7 +606,8 @@ export class ChainWatcher extends EventEmitter {
 			outputIndex,
 			scriptPubkey,
 			spendTxid,
-			spendHeight
+			spendHeight,
+			generation
 		);
 	}
 
@@ -459,122 +615,144 @@ export class ChainWatcher extends EventEmitter {
 	 * Broadcast a transaction via the chain backend.
 	 */
 	async broadcastTransaction(rawTx: Buffer): Promise<string> {
+		const generation = this.lifecycleGeneration;
 		const txid = await this.backend.broadcastTransaction(rawTx.toString('hex'));
-		this.emit('broadcast:success', txid);
+		// The txid still goes back to the caller; only the event is suppressed,
+		// so a stop() mid-broadcast does not announce a success to consumers that
+		// have already torn down.
+		if (this.isCurrentGeneration(generation)) {
+			this.emit('broadcast:success', txid);
+		}
 		return txid;
 	}
 
 	// ─────────────── Private ───────────────
 
-	private wireChannelManagerEvents(): void {
-		// Watch funding outputs when channels enter AWAITING_FUNDING_CONFIRMED
-		this.channelManager.on(
-			'watch:funding',
-			(
-				fundingTxid: Buffer,
-				fundingOutputIndex: number,
-				minimumDepth: number
-			) => {
-				// Convert to display byte order without mutating the source Buffer
-				const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
+	/**
+	 * ChannelManager subscriptions are held as named handlers so stop() can
+	 * detach them. Registered inline, a stopped watcher kept receiving channel
+	 * events and still broadcast transactions after the node was destroyed.
+	 */
+	private onWatchFunding = (
+		fundingTxid: Buffer,
+		fundingOutputIndex: number,
+		minimumDepth: number
+	): void => {
+		// Convert to display byte order without mutating the source Buffer
+		const displayTxid = Buffer.from(fundingTxid).reverse().toString('hex');
 
-				// Find the channel matching this funding outpoint
-				const channel = this.findChannelByFunding(
-					displayTxid,
-					fundingOutputIndex
-				);
-				if (!channel) {
-					this.emit(
-						'error',
-						new Error(
-							`watch:funding: no channel found for ${displayTxid}:${fundingOutputIndex}`
-						)
-					);
-					return;
-				}
+		// Find the channel matching this funding outpoint
+		const channel = this.findChannelByFunding(displayTxid, fundingOutputIndex);
+		if (!channel) {
+			this.emitError(
+				new Error(
+					`watch:funding: no channel found for ${displayTxid}:${fundingOutputIndex}`
+				)
+			);
+			return;
+		}
 
-				const state = channel.getFullState();
-				if (!state.remoteBasepoints) {
-					this.emit(
-						'error',
-						new Error(
-							`watch:funding: channel missing remoteBasepoints for ${displayTxid}:${fundingOutputIndex}`
-						)
-					);
-					return;
-				}
+		const state = channel.getFullState();
+		if (!state.remoteBasepoints) {
+			this.emitError(
+				new Error(
+					`watch:funding: channel missing remoteBasepoints for ${displayTxid}:${fundingOutputIndex}`
+				)
+			);
+			return;
+		}
 
-				// Reconstruct the funding scriptPubKey. Simple-taproot channels fund a
-				// P2TR MuSig2 key-spend output, so watching the witness-v0 P2WSH
-				// scripthash would never match and the funding spend would go
-				// undetected.
-				const fundingScript = isTaprootChannel(state.channelType)
-					? createTaprootFundingScript(
-							state.localBasepoints.fundingPubkey,
-							state.remoteBasepoints.fundingPubkey
-					  ).p2trOutput
-					: createFundingScript(
-							state.localBasepoints.fundingPubkey,
-							state.remoteBasepoints.fundingPubkey
-					  ).p2wshOutput;
+		// Reconstruct the funding scriptPubKey. Simple-taproot channels fund a
+		// P2TR MuSig2 key-spend output, so watching the witness-v0 P2WSH
+		// scripthash would never match and the funding spend would go
+		// undetected.
+		const fundingScript = isTaprootChannel(state.channelType)
+			? createTaprootFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey
+			  ).p2trOutput
+			: createFundingScript(
+					state.localBasepoints.fundingPubkey,
+					state.remoteBasepoints.fundingPubkey
+			  ).p2wshOutput;
 
-				const channelId = state.channelId || state.temporaryChannelId;
-				this.watchFundingOutput(
-					channelId,
-					displayTxid,
-					fundingOutputIndex,
-					minimumDepth,
-					fundingScript
-				).catch((err) => {
-					this.emit('error', err);
-				});
-			}
-		);
-
-		// Broadcast transactions (closing/sweep txs)
-		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
-			if (!Buffer.isBuffer(tx)) {
-				// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
-				// hex-encodes to "[object Object]" and cannot be broadcast; drop it
-				// loudly instead of letting the failure path below throw an unhandled
-				// rejection when it calls Transaction.fromBuffer on a non-Buffer.
-				this.emit(
-					'broadcast:failure',
-					new Error('broadcast:tx received a non-Buffer payload; dropped')
-				);
-				return;
-			}
-			this.broadcastTransaction(tx).catch((err) => {
-				// Queue for retry on next block. Guard the decode so a malformed
-				// payload is logged and dropped rather than throwing an unhandled
-				// rejection inside this catch handler (which would crash the process).
-				try {
-					const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
-					// Dedup by txid
-					if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
-						this.failedBroadcasts.push({
-							rawTx: Buffer.from(tx),
-							txidHex,
-							retryCount: 0
-						});
-					}
-				} catch {
-					// Not a decodable transaction; nothing to queue for retry.
-				}
-				this.emit('broadcast:failure', err);
-			});
+		const channelId = state.channelId || state.temporaryChannelId;
+		this.watchFundingOutput(
+			channelId,
+			displayTxid,
+			fundingOutputIndex,
+			minimumDepth,
+			fundingScript
+		).catch((err) => {
+			this.emitError(err);
 		});
+	};
 
-		// Watch outputs (from chain monitor)
-		this.channelManager.on(
-			'watch:output',
-			(txid: string, outputIndex: number) => {
-				this.emit('watch:output:requested', txid, outputIndex);
+	private onBroadcastTx = (tx: Buffer): void => {
+		if (!Buffer.isBuffer(tx)) {
+			// A non-Buffer payload (e.g. a bitcoin.Transaction emitted by mistake)
+			// hex-encodes to "[object Object]" and cannot be broadcast; drop it
+			// loudly instead of letting the failure path below throw an unhandled
+			// rejection when it calls Transaction.fromBuffer on a non-Buffer.
+			this.emit(
+				'broadcast:failure',
+				new Error('broadcast:tx received a non-Buffer payload; dropped')
+			);
+			return;
+		}
+		const generation = this.lifecycleGeneration;
+		this.broadcastTransaction(tx).catch((err) => {
+			// A rejection that lands after teardown must not repopulate the retry
+			// queue of a watcher that is no longer retrying anything.
+			if (!this.isCurrentGeneration(generation)) return;
+			// Queue for retry on next block. Guard the decode so a malformed
+			// payload is logged and dropped rather than throwing an unhandled
+			// rejection inside this catch handler (which would crash the process).
+			try {
+				const txidHex = bitcoin.Transaction.fromBuffer(tx).getId();
+				// Dedup by txid
+				if (!this.failedBroadcasts.some((fb) => fb.txidHex === txidHex)) {
+					this.failedBroadcasts.push({
+						rawTx: Buffer.from(tx),
+						txidHex,
+						retryCount: 0
+					});
+				}
+			} catch {
+				// Not a decodable transaction; nothing to queue for retry.
 			}
-		);
+			this.emit('broadcast:failure', err);
+		});
+	};
+
+	private onWatchOutput = (txid: string, outputIndex: number): void => {
+		this.emit('watch:output:requested', txid, outputIndex);
+	};
+
+	private wireChannelManagerEvents(): void {
+		// Detach first: start() re-wires after a stop(), and registering the same
+		// handler twice would broadcast twice.
+		this.unwireChannelManagerEvents();
+		// Watch funding outputs when channels enter AWAITING_FUNDING_CONFIRMED
+		this.channelManager.on('watch:funding', this.onWatchFunding);
+		// Broadcast transactions (closing/sweep txs)
+		this.channelManager.on('broadcast:tx', this.onBroadcastTx);
+		// Watch outputs (from chain monitor)
+		this.channelManager.on('watch:output', this.onWatchOutput);
+	}
+
+	private unwireChannelManagerEvents(): void {
+		this.channelManager.off('watch:funding', this.onWatchFunding);
+		this.channelManager.off('broadcast:tx', this.onBroadcastTx);
+		this.channelManager.off('watch:output', this.onWatchOutput);
 	}
 
 	private handleNewBlock(height: number): void {
+		// A retained backend header callback can fire after teardown. Advancing
+		// the ChannelManager then would resolve HTLCs and drive closes for a
+		// watcher that is no longer watching.
+		if (!this.started) return;
+		const generation = this.lifecycleGeneration;
 		this.currentBlockHeight = height;
 
 		// Retry failed funding watch subscriptions
@@ -625,6 +803,9 @@ export class ChainWatcher extends EventEmitter {
 					continue;
 				}
 				this.broadcastTransaction(fb.rawTx).catch(() => {
+					// A rejection landing after teardown must not repopulate the
+					// queue stop() just cleared, or the next start retries it.
+					if (!this.isCurrentGeneration(generation)) return;
 					// Still failing — re-queue with dedup
 					if (
 						!this.failedBroadcasts.some(
@@ -643,8 +824,8 @@ export class ChainWatcher extends EventEmitter {
 		// Check all watched fundings for confirmation and announcement depth
 		for (const [key, watched] of this.watchedFundings) {
 			if (!watched.confirmed) {
-				this.checkFundingConfirmation(key).catch((err) => {
-					this.emit('error', err);
+				this.checkFundingConfirmation(key, generation).catch((err) => {
+					this.emitError(err);
 				});
 			} else if (
 				!watched.announcementTriggered &&
@@ -655,7 +836,7 @@ export class ChainWatcher extends EventEmitter {
 				if (depth >= 6) {
 					watched.announcementTriggered = true;
 					this.triggerAnnouncementDepth(watched).catch((err) => {
-						this.emit('error', err);
+						this.emitError(err);
 					});
 				}
 			}
@@ -692,7 +873,7 @@ export class ChainWatcher extends EventEmitter {
 			) {
 				watched.announcementTriggered = true;
 				this.triggerAnnouncementDepth(watched).catch((err) => {
-					this.emit('error', err);
+					this.emitError(err);
 				});
 			}
 		}
@@ -701,12 +882,14 @@ export class ChainWatcher extends EventEmitter {
 	private async triggerAnnouncementDepth(
 		watched: IWatchedFunding
 	): Promise<void> {
+		const generation = this.lifecycleGeneration;
 		let txIndex = 0;
 		if (this.backend.getTransactionMerkleProof) {
 			const proof = await this.backend.getTransactionMerkleProof(
 				watched.txid,
 				watched.confirmationHeight
 			);
+			if (!this.isCurrentGeneration(generation)) return;
 			txIndex = proof.txIndex;
 		}
 		this.emit(
@@ -717,11 +900,28 @@ export class ChainWatcher extends EventEmitter {
 		);
 	}
 
-	private async checkFundingConfirmation(key: string): Promise<void> {
+	private async checkFundingConfirmation(
+		key: string,
+		// Defaults to the current generation for callers that ARE the start of
+		// the operation; callers reached through an earlier await pass theirs.
+		generation: number = this.lifecycleGeneration
+	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		const watched = this.watchedFundings.get(key);
 		if (!watched || watched.confirmed) return;
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+
+		// stop() may have run while that request was in flight. Acting now would
+		// advance the ChannelManager for a watcher that is no longer watching,
+		// and the map identity check catches the entry being replaced by a
+		// restart rather than merely cleared.
+		if (
+			!this.isCurrentGeneration(generation) ||
+			this.watchedFundings.get(key) !== watched
+		) {
+			return;
+		}
 
 		// Find our funding tx in the history
 		const entry = history.find((h) => h.txid === watched.txid);
@@ -753,27 +953,45 @@ export class ChainWatcher extends EventEmitter {
 			this.emit('funding:confirmed', watched.channelId);
 
 			// Now watch for the funding output being spent (force close detection)
-			this.watchFundingSpend(watched).catch((err) => {
-				this.emit('error', err);
+			this.watchFundingSpend(watched, generation).catch((err) => {
+				this.emitError(err);
 			});
 		}
 	}
 
-	private async watchFundingSpend(watched: IWatchedFunding): Promise<void> {
+	private async watchFundingSpend(
+		watched: IWatchedFunding,
+		generation: number = this.lifecycleGeneration
+	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		// Subscribe to detect when the funding output is spent
 		await this.backend.subscribeToScriptHash(watched.scriptHash, () => {
-			this.checkFundingSpent(watched).catch((err) => {
-				this.emit('error', err);
+			if (!this.isCurrentGeneration(generation)) return;
+			this.checkFundingSpent(watched, generation).catch((err) => {
+				this.emitError(err);
 			});
 		});
 
+		// A stop() during the subscribe would otherwise let the check below start
+		// fresh and capture the post-stop generation, passing every guard.
+		if (!this.isCurrentGeneration(generation)) return;
+
 		// Immediately check if the output was already spent (e.g., after restart
 		// where the force-close tx was confirmed while we were offline)
-		await this.checkFundingSpent(watched);
+		await this.checkFundingSpent(watched, generation);
 	}
 
-	private async checkFundingSpent(watched: IWatchedFunding): Promise<void> {
+	private async checkFundingSpent(
+		watched: IWatchedFunding,
+		// Splice watches are deliberately not held in watchedFundings, so the
+		// generation is the only check available here, which makes it important
+		// that the caller passes the one it started in rather than letting this
+		// capture a fresh one after a stop().
+		generation: number = this.lifecycleGeneration
+	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		if (!this.isCurrentGeneration(generation)) return;
 
 		// Look for the transaction that spends our funding output. The script's
 		// history can contain MULTIPLE non-spending entries sharing the same
@@ -791,6 +1009,7 @@ export class ChainWatcher extends EventEmitter {
 			}
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
+			if (!this.isCurrentGeneration(generation)) return;
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
 			// Verify this tx actually spends our funding output
@@ -851,11 +1070,21 @@ export class ChainWatcher extends EventEmitter {
 		return undefined;
 	}
 
-	private async checkOutputSpend(key: string): Promise<void> {
+	private async checkOutputSpend(
+		key: string,
+		generation: number = this.lifecycleGeneration
+	): Promise<void> {
+		if (!this.isCurrentGeneration(generation)) return;
 		const watched = this.watchedOutputs.get(key);
 		if (!watched) return;
 
 		const history = await this.backend.getScriptHashHistory(watched.scriptHash);
+		if (
+			!this.isCurrentGeneration(generation) ||
+			this.watchedOutputs.get(key) !== watched
+		) {
+			return;
+		}
 
 		// Find the confirmed spend of our output. The script's history may contain
 		// several non-spending entries with the same script (address reuse — e.g.
@@ -869,6 +1098,12 @@ export class ChainWatcher extends EventEmitter {
 			if (entry.txid === watched.txid || entry.height <= 0) continue;
 
 			const rawTx = await this.backend.getTransaction(entry.txid);
+			if (
+				!this.isCurrentGeneration(generation) ||
+				this.watchedOutputs.get(key) !== watched
+			) {
+				return;
+			}
 			const spendingTx = bitcoin.Transaction.fromBuffer(rawTx);
 
 			const spendsOurs = spendingTx.ins.some((input) => {

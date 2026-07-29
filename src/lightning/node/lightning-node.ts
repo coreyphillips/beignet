@@ -366,7 +366,15 @@ export class LightningNode extends EventEmitter {
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
 	private chainWatcher: ChainWatcher | null = null;
-	private _chainWatcherEventsWired = false;
+	/**
+	 * The watcher instance these events are wired to, rather than a one-shot
+	 * boolean. A boolean could never be reset, so a watcher that was stopped and
+	 * started again was left with no listeners at all: no block, no error, no
+	 * watch:output:requested reached the node, and it silently stopped tracking
+	 * the chain. Keyed on the instance, a replacement watcher is always wired and
+	 * the same one is never wired twice.
+	 */
+	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
@@ -465,6 +473,16 @@ export class LightningNode extends EventEmitter {
 	private _reconnectTimers: Set<ReturnType<typeof setTimeout>> = new Set();
 	private _activeWaitCleanups: Set<() => void> = new Set();
 	private _destroyed = false;
+	/**
+	 * Bumped by destroy() and by each startChainWatcher(). The chain startup
+	 * sequence is a long chain of awaits (watcher start, then a restore loop
+	 * doing network work per channel), and destroy() cannot reach into it: a
+	 * continuation resuming afterwards would restart the reconnect monitor
+	 * destroy() just stopped, rebroadcast transactions and retry funding
+	 * broadcasts for a node that is gone. Every step re-checks the generation
+	 * it started in, which also retires a superseded startChainWatcher().
+	 */
+	private chainStartupGeneration = 0;
 	private missionControlTimer: ReturnType<typeof setInterval> | null = null;
 	private onionMessageManager: OnionMessageManager;
 	private offerManager: OfferManager;
@@ -3277,9 +3295,19 @@ export class LightningNode extends EventEmitter {
 		return this.chainWatcher;
 	}
 
+	/**
+	 * True while the chain startup operation that began in this generation is
+	 * still the current one and the node is alive.
+	 */
+	private isCurrentChainStartup(generation: number): boolean {
+		return !this._destroyed && this.chainStartupGeneration === generation;
+	}
+
 	private wireChainWatcherEvents(): void {
-		if (!this.chainWatcher || this._chainWatcherEventsWired) return;
-		this._chainWatcherEventsWired = true;
+		if (!this.chainWatcher || this._wiredChainWatcher === this.chainWatcher) {
+			return;
+		}
+		this._wiredChainWatcher = this.chainWatcher;
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
@@ -3426,10 +3454,12 @@ export class LightningNode extends EventEmitter {
 	}
 
 	async startChainWatcher(): Promise<void> {
+		const generation = ++this.chainStartupGeneration;
 		// Bring up the watchtower client alongside on-chain monitoring: restore the
 		// persisted backlog and connect to towers (no-op when none configured).
 		if (this.watchtowerClient) {
 			this.watchtowerClient.start().catch((err) => {
+				if (!this.isCurrentChainStartup(generation)) return;
 				this.emitStructuredLog('watchtower', 'start_failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
@@ -3438,8 +3468,13 @@ export class LightningNode extends EventEmitter {
 		if (this.chainWatcher) {
 			this.wireChainWatcherEvents();
 			await this.chainWatcher.start();
+			if (!this.isCurrentChainStartup(generation)) return;
 			// Re-watch funding outputs for all restored channels
-			await this.restoreChainWatches();
+			await this.restoreChainWatches(generation);
+			// destroy() during the restore must not let the rest of startup run:
+			// it would retry funding broadcasts and restart the reconnect monitor
+			// that destroy() just stopped.
+			if (!this.isCurrentChainStartup(generation)) return;
 			// Resume the broadcast obligation for signed funding txs that never
 			// confirmed (crash between funding_signed and broadcast, or an
 			// eviction while we were down). Retries again on every new block.
@@ -3454,8 +3489,10 @@ export class LightningNode extends EventEmitter {
 				// On reconnect/resubscribe, re-scan watched fundings immediately so a
 				// confirmation that landed while disconnected is picked up at once
 				// (the chain watcher's periodic timer is the slower safety net).
-				backend.onResubscribed = (): void =>
+				backend.onResubscribed = (): void => {
+					if (!this.isCurrentChainStartup(generation)) return;
 					this.chainWatcher?.recheckAllWatches();
+				};
 				backend.startReconnectMonitor();
 			}
 		}
@@ -3465,8 +3502,12 @@ export class LightningNode extends EventEmitter {
 	 * Re-watch funding outputs for all restored channels that need monitoring.
 	 * Called after startChainWatcher() to resume chain monitoring for persisted channels.
 	 */
-	async restoreChainWatches(): Promise<void> {
-		if (!this.chainWatcher) return;
+	async restoreChainWatches(
+		// Defaults to the current generation for direct callers; startChainWatcher
+		// passes the one its whole sequence began in.
+		generation: number = this.chainStartupGeneration
+	): Promise<void> {
+		if (!this.chainWatcher || !this.isCurrentChainStartup(generation)) return;
 
 		const networkMap: Record<string, bitcoin.Network> = {
 			[Network.MAINNET]: bitcoin.networks.bitcoin,
@@ -3477,6 +3518,8 @@ export class LightningNode extends EventEmitter {
 		const btcNetwork = networkMap[this.network] || bitcoin.networks.regtest;
 
 		for (const channel of this.channelManager.listChannels()) {
+			// Each iteration does network work, so re-check before starting another.
+			if (!this.isCurrentChainStartup(generation)) return;
 			const state = channel.getFullState();
 			// Only watch channels that have funding info and are not yet closed
 			if (!state.fundingTxid || state.fundingOutputIndex === undefined)
@@ -3517,7 +3560,13 @@ export class LightningNode extends EventEmitter {
 						}
 					}
 				}
-				if (state.lastCooperativeCloseTxHex && this._chainBackend) {
+				if (
+					state.lastCooperativeCloseTxHex &&
+					this._chainBackend &&
+					// A direct backend broadcast is not covered by the watcher's own
+					// lifecycle gate, so it needs the node's.
+					this.isCurrentChainStartup(generation)
+				) {
 					try {
 						await this._chainBackend.broadcastTransaction(
 							state.lastCooperativeCloseTxHex
@@ -3650,7 +3699,11 @@ export class LightningNode extends EventEmitter {
 					fundingScript,
 					spliceTxidHex
 				);
-				if (inflight.fullySigned && this._chainBackend) {
+				if (
+					inflight.fullySigned &&
+					this._chainBackend &&
+					this.isCurrentChainStartup(generation)
+				) {
 					try {
 						await this._chainBackend.broadcastTransaction(inflight.spliceTxHex);
 					} catch {
@@ -3884,6 +3937,8 @@ export class LightningNode extends EventEmitter {
 
 	destroy(): void {
 		this._destroyed = true;
+		// Retires any chain startup sequence still working through its awaits.
+		++this.chainStartupGeneration;
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -3996,6 +4051,7 @@ export class LightningNode extends EventEmitter {
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
 		// Stop accepting new operations
 		this._destroyed = true;
+		++this.chainStartupGeneration;
 
 		// Wait for in-flight HTLCs to settle
 		const hasInFlightHtlcs = (): boolean => {
