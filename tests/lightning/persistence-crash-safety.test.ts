@@ -20,6 +20,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -1142,6 +1143,77 @@ describe('Crash-Safe State Persistence', function () {
 			expect(receivedHtlcState(bob2, channelId)).to.equal(HtlcState.COMMITTED);
 
 			bob2.destroy();
+			alice.destroy();
+		});
+	});
+
+	describe('Atomic paired persistence (real SQLite rollback)', function () {
+		it('persistChannel writes channel state and key index in one transaction', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(1, storage);
+			const bob = createTestNodeWithId(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			const channelIdHex = channelId.toString('hex');
+
+			// The channel needs a key index so the paired write actually runs.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const channel = (alice as any).channelManager.getChannel(channelId);
+			channel.channelKeyIndex = 7;
+
+			// Start from no persisted row, then fail the SECOND write of the
+			// pair. Without a transaction the channel row lands alone, which
+			// is a channel that signs its force-close with the wrong key
+			// after restore, and nothing at restore time flags it.
+			storage.deleteChannel(channelIdHex);
+			const originalSave = storage.saveChannelKeyIndex.bind(storage);
+			storage.saveChannelKeyIndex = (): void => {
+				throw new Error('disk full');
+			};
+			const errors: Array<{ code: string }> = [];
+			alice.on('node:error', (e: { code: string }) => errors.push(e));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+
+			expect(storage.loadChannel(channelIdHex), 'rolled back').to.be.null;
+			expect(errors.some((e) => e.code === 'PERSISTENCE_ERROR')).to.be.true;
+
+			// With the fault removed the pair lands together.
+			storage.saveChannelKeyIndex = originalSave;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+			expect(storage.loadChannel(channelIdHex)).to.not.be.null;
+			expect(storage.loadChannelKeyIndex(channelIdHex)).to.equal(7);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('createInvoice persists preimage, secret and invoice atomically', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(3, storage);
+
+			// Fail the LAST write of the trio: without a transaction the
+			// preimage and secret land without their invoice row.
+			storage.saveInvoice = (): void => {
+				throw new Error('disk full');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'atomic invoice'
+			});
+
+			const hashHex = invoice.paymentHash.toString('hex');
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+
 			alice.destroy();
 		});
 	});

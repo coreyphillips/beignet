@@ -1261,13 +1261,18 @@ export class LightningNode extends EventEmitter {
 		if (!peer) return;
 		try {
 			const channelIdHex = channelId.toString('hex');
-			this.storage.saveChannel(channelIdHex, channel.getFullState(), peer);
-			// Persist per-channel key index so the correct signing key
-			// is restored after restart (fixes force-close signature mismatch)
 			const keyIndex = channel.channelKeyIndex;
-			if (keyIndex != null) {
-				this.storage.saveChannelKeyIndex(channelIdHex, keyIndex);
-			}
+			// One transaction: channel state persisted without its key index
+			// restores a channel that signs its force-close with the wrong
+			// key, and the row looks complete so nothing flags it.
+			this.storage.transaction(() => {
+				this.storage!.saveChannel(channelIdHex, channel.getFullState(), peer);
+				// Persist per-channel key index so the correct signing key
+				// is restored after restart (fixes force-close signature mismatch)
+				if (keyIndex != null) {
+					this.storage!.saveChannelKeyIndex(channelIdHex, keyIndex);
+				}
+			});
 		} catch (err) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
@@ -6995,24 +7000,28 @@ export class LightningNode extends EventEmitter {
 		// Persist
 		const createdAtSecs = Math.floor(Date.now() / 1000);
 
+		// One transaction: an invoice row without its preimage/secret (or the
+		// reverse) is a half-claimable payment hash that nothing flags.
 		this.safeStorage(() => {
-			if (preimage) {
-				this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
-			}
-			this.storage!.savePaymentSecret(
-				paymentHash.toString('hex'),
-				paymentSecret
-			);
-			this.storage!.saveInvoice(paymentHash.toString('hex'), {
-				paymentHash: paymentHash.toString('hex'),
-				bolt11: invoiceStr,
-				amountMsat: options.amountMsat,
-				description: options.description,
-				expiry: options.expiry ?? DEFAULT_EXPIRY,
-				createdAt: createdAtSecs,
-				hold: options.hold
+			this.storage!.transaction(() => {
+				if (preimage) {
+					this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
+				}
+				this.storage!.savePaymentSecret(
+					paymentHash.toString('hex'),
+					paymentSecret
+				);
+				this.storage!.saveInvoice(paymentHash.toString('hex'), {
+					paymentHash: paymentHash.toString('hex'),
+					bolt11: invoiceStr,
+					amountMsat: options.amountMsat,
+					description: options.description,
+					expiry: options.expiry ?? DEFAULT_EXPIRY,
+					createdAt: createdAtSecs,
+					hold: options.hold
+				});
+				this.persistPayment(paymentHash);
 			});
-			this.persistPayment(paymentHash);
 		}, 'saveInvoiceData');
 
 		// Store invoice info
@@ -11194,13 +11203,17 @@ export class LightningNode extends EventEmitter {
 						createdAt: Date.now()
 					});
 				}
+				// One transaction (see createInvoice): preimage, secret and
+				// invoice row must land together or not at all.
 				this.safeStorage(() => {
-					this.storage!.savePreimage(hashHex, preimage);
-					if (invoice.paymentSecret) {
-						this.storage!.savePaymentSecret(hashHex, invoice.paymentSecret);
-					}
-					this.storage!.saveInvoice(hashHex, invoiceInfo);
-					this.persistPayment(invoice.paymentHash);
+					this.storage!.transaction(() => {
+						this.storage!.savePreimage(hashHex, preimage);
+						if (invoice.paymentSecret) {
+							this.storage!.savePaymentSecret(hashHex, invoice.paymentSecret);
+						}
+						this.storage!.saveInvoice(hashHex, invoiceInfo);
+						this.persistPayment(invoice.paymentHash);
+					});
 				}, 'saveBolt12Invoice');
 				this.emit('bolt12:invoice:issued', invoice);
 			}
