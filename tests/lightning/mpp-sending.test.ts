@@ -15,7 +15,12 @@ import {
 	IOutboundMppState
 } from '../../src/lightning/node/types';
 import { createFailureMessage } from '../../src/lightning/onion/failures';
-import { TEMPORARY_NODE_FAILURE } from '../../src/lightning/onion/types';
+import {
+	TEMPORARY_NODE_FAILURE,
+	TEMPORARY_CHANNEL_FAILURE
+} from '../../src/lightning/onion/types';
+import { PaymentDirection } from '../../src/lightning/node/types';
+import { IRoute } from '../../src/lightning/gossip/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -763,6 +768,108 @@ describe('MPP Sending (Phase 5)', function () {
 			// Every part resolved and dispatch finished: state is dropped.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a channel-scoped failure on the second part penalizes that part culpable SCID', function () {
+			// Handler-level regression for per-part attribution: a failure
+			// returned on the SECOND part must be decrypted with that part's
+			// secrets and blamed against that part's route. The parts are
+			// installed directly so part 2 can have a two-hop route whose
+			// first hop errs with a channel-scoped code, which blames the
+			// erring node's OUTGOING channel (part 2's second hop).
+			const alice = createNode(66);
+			const bob = createNode(67);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob, 200_000n);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			const hash = crypto.randomBytes(32);
+			const hashHex = hash.toString('hex');
+
+			const mkRoute = (scids: Buffer[]): IRoute => ({
+				hops: scids.map((scid) => ({
+					pubkey: crypto.randomBytes(33),
+					shortChannelId: scid,
+					amountToForwardMsat: 50_000_000n,
+					outgoingCltvValue: 40,
+					cltvExpiryDelta: 40,
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0
+				})),
+				totalAmountMsat: 50_000_000n,
+				totalCltvDelta: 40,
+				totalFeeMsat: 0n
+			});
+			const part1Scid = makeScid(920, 1, 0);
+			const part2FirstScid = makeScid(920, 2, 0);
+			const part2CulpableScid = makeScid(920, 3, 0);
+			const part1Secrets = [crypto.randomBytes(32)];
+			const part2Secrets = [crypto.randomBytes(32), crypto.randomBytes(32)];
+
+			aliceAny.payments.set(hashHex, {
+				paymentHash: hash,
+				amountMsat: 100_000_000n,
+				status: PaymentStatus.PENDING,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now(),
+				// Payment-level metadata is the FIRST part's, as sendPaymentMpp
+				// stores it; attribution must not fall back to it.
+				sharedSecrets: part1Secrets,
+				route: mkRoute([part1Scid])
+			});
+			aliceAny.outboundMppPayments.set(hashHex, {
+				paymentHash: hash,
+				totalMsat: 100_000_000n,
+				createdAt: Date.now(),
+				dispatchComplete: true,
+				parts: [
+					{
+						route: mkRoute([part1Scid]),
+						channelId,
+						htlcId: 1n,
+						amountMsat: 50_000_000n,
+						status: PaymentStatus.PENDING,
+						sharedSecrets: part1Secrets
+					},
+					{
+						route: mkRoute([part2FirstScid, part2CulpableScid]),
+						channelId,
+						htlcId: 2n,
+						amountMsat: 50_000_000n,
+						status: PaymentStatus.PENDING,
+						sharedSecrets: part2Secrets
+					}
+				]
+			});
+			aliceAny.htlcPaymentMap.set(
+				`${channelId.toString('hex')}:offered-2`,
+				hashHex
+			);
+
+			// The failure originates at part 2's first hop (origin index 0).
+			const reason = createFailureMessage(
+				part2Secrets[0],
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			aliceAny.handleHtlcFailed(channelId, 2n, reason);
+
+			const payment = aliceAny.payments.get(hashHex);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			// Decrypted with part 2's secrets: code and origin recovered.
+			expect(payment.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
+			expect(payment.failureSourceIndex).to.equal(0);
+
+			// The penalty landed on part 2's culpable outgoing SCID, and NOT
+			// on the first part's route (the old attribution target).
+			const mc = aliceAny.missionControl;
+			expect(
+				Number(mc.getPenalty(part2CulpableScid.toString('hex')))
+			).to.be.greaterThan(0);
+			expect(Number(mc.getPenalty(part1Scid.toString('hex')))).to.equal(0);
 
 			alice.destroy();
 			bob.destroy();
