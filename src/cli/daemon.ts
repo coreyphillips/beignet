@@ -1568,6 +1568,22 @@ export async function startDaemon(
 			return;
 		}
 
+		// ── Rate limiting (opt-in) ──
+		// Runs before every auth check (including the SSE endpoint's) so
+		// failed authentication attempts count against the bucket; keyed on
+		// the peer address because the Authorization header is
+		// caller-controlled and varying it would mint a fresh bucket per
+		// guess.
+		if (rateLimiter && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
+			const clientKey = req.socket.remoteAddress || 'unknown';
+			if (!rateLimiter.isAllowed(clientKey)) {
+				res.setHeader('Content-Type', 'application/json');
+				res.statusCode = 429;
+				res.end(JSON.stringify(failure('RATE_LIMITED', 'Too many requests')));
+				return;
+			}
+		}
+
 		// ── SSE endpoint ──
 		if (routeKey === 'GET /events') {
 			if (authenticator.enabled) {
@@ -1651,17 +1667,6 @@ export async function startDaemon(
 						failure('FORBIDDEN', insufficientScopeMessage(auth, routeKey))
 					)
 				);
-				return;
-			}
-		}
-
-		// ── Rate limiting (opt-in) ──
-		if (rateLimiter && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
-			const clientKey =
-				req.headers['authorization'] || req.socket.remoteAddress || 'unknown';
-			if (!rateLimiter.isAllowed(clientKey)) {
-				res.statusCode = 429;
-				res.end(JSON.stringify(failure('RATE_LIMITED', 'Too many requests')));
 				return;
 			}
 		}

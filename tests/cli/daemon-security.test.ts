@@ -411,6 +411,106 @@ describe('Daemon auth middleware', () => {
 		}
 	}).timeout(30000);
 
+	it('failed auth attempts are throttled by the rate limiter', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'brute-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			// Each guess must consume budget: the limiter runs before auth.
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/info', {
+					Authorization: 'Bearer wrong-guess'
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/info', {
+				Authorization: 'Bearer wrong-guess'
+			});
+			expect(throttled.status).to.equal(429);
+			expect((throttled.body.error as { code: string }).code).to.equal(
+				'RATE_LIMITED'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('varying the Authorization header does not mint fresh rate-limit buckets', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'bucket-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			// A distinct token per request previously keyed a distinct bucket,
+			// so a brute forcer never saw a 429. All guesses from one peer
+			// must now share the same budget.
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/info', {
+					Authorization: `Bearer distinct-guess-${i}`
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/info', {
+				Authorization: 'Bearer distinct-guess-final'
+			});
+			expect(throttled.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('SSE endpoint auth failures are throttled by the rate limiter', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'sse-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/events', {
+					Authorization: 'Bearer wrong-guess'
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/events', {
+				Authorization: 'Bearer wrong-guess'
+			});
+			expect(throttled.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
 	it('GET /health does not require authentication', async () => {
 		const { server, node } = await startDaemon({
 			mnemonic:
