@@ -715,6 +715,8 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 		createCode?: number;
 		updateCode?: (seqNum: number) => number;
 		clientBehindTo?: number;
+		/** Never answer STATE_UPDATE (a stalled tower). */
+		silentUpdates?: boolean;
 	} = {};
 
 	constructor(public addr: ITowerAddress) {
@@ -759,6 +761,7 @@ class FakeTower extends EventEmitter implements ITowerTransport {
 					})
 				);
 			} else if (type === WtMessageType.STATE_UPDATE) {
+				if (this.behaviour.silentUpdates) return;
 				const upd = decodeStateUpdate(payload);
 				const code = this.behaviour.updateCode
 					? this.behaviour.updateCode(upd.seqNum)
@@ -937,6 +940,80 @@ describe('watchtower client session state machine (fake tower)', function () {
 		expect(store.updates[0].acked).to.be.true;
 		expect(client.getHealth()[0].pendingBacklog).to.equal(0);
 		client.stop();
+	});
+
+	/**
+	 * Run fn while observing unhandled promise rejections. Existing listeners
+	 * (mocha's) are detached for the duration so the probe sees every event,
+	 * then restored.
+	 */
+	async function captureUnhandledRejections(
+		fn: () => Promise<void>
+	): Promise<unknown[]> {
+		const prior = process.listeners('unhandledRejection');
+		process.removeAllListeners('unhandledRejection');
+		const seen: unknown[] = [];
+		const probe = (reason: unknown): void => {
+			seen.push(reason);
+		};
+		process.on('unhandledRejection', probe);
+		try {
+			await fn();
+		} finally {
+			process.removeListener('unhandledRejection', probe);
+			for (const listener of prior) {
+				process.on('unhandledRejection', listener);
+			}
+		}
+		return seen;
+	}
+
+	it('a rejected update logs backup_failed instead of an unhandled rejection', async function () {
+		const fake = new FakeTower(parseTowerUri(TOWER_URI));
+		fake.behaviour.updateCode = (): number =>
+			StateUpdateCode.SEQ_NUM_OUT_OF_ORDER;
+		const client = makeClient(fake);
+		const logs: Array<{ event: string; error?: string }> = [];
+		client.on('log', (e: { event: string; error?: string }) => logs.push(e));
+
+		const rejections = await captureUnhandledRejections(async () => {
+			await client.start();
+			await tick();
+			client.backupRevokedState(contextForClient());
+			await tick(20);
+		});
+
+		expect(rejections).to.deep.equal([]);
+		expect(logs.some((l) => l.event === 'backup_failed')).to.be.true;
+		// Fund safety: the refused update stays queued for retry.
+		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
+		client.stop();
+	});
+
+	it('stop() settles an in-flight reply wait immediately', async function () {
+		const fake = new FakeTower(parseTowerUri(TOWER_URI));
+		fake.behaviour.silentUpdates = true;
+		const client = makeClient(fake);
+		const logs: Array<{ event: string; error?: string }> = [];
+		client.on('log', (e: { event: string; error?: string }) => logs.push(e));
+
+		const rejections = await captureUnhandledRejections(async () => {
+			await client.start();
+			await tick();
+			// The ship stalls awaiting a reply the tower never sends.
+			client.backupRevokedState(contextForClient());
+			await tick();
+			// Without waiter tracking this wait would sit on its 30s timer and
+			// reject long after shutdown; stop() must settle it now.
+			client.stop();
+			await tick();
+		});
+
+		expect(rejections).to.deep.equal([]);
+		const failure = logs.find((l) => l.event === 'backup_failed');
+		expect(failure, 'drain failure surfaced promptly').to.not.equal(undefined);
+		expect(failure!.error).to.match(/stopped/);
+		expect(client.getHealth()[0].pendingBacklog).to.equal(1);
 	});
 });
 
