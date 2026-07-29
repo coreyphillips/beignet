@@ -4263,17 +4263,61 @@ export class BeignetNode extends EventEmitter {
 		description: string;
 		amountSats?: number;
 		issuer?: string;
+		expirySecs?: number;
 	}): OfferInfo {
+		if (
+			options.amountSats !== undefined &&
+			(typeof options.amountSats !== 'number' ||
+				!Number.isSafeInteger(options.amountSats) ||
+				options.amountSats < 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'amountSats must be a non-negative integer number of satoshis'
+			);
+		}
+		if (
+			options.expirySecs !== undefined &&
+			(typeof options.expirySecs !== 'number' ||
+				!Number.isSafeInteger(options.expirySecs) ||
+				options.expirySecs <= 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'expirySecs must be a positive integer number of seconds'
+			);
+		}
 		const amountMsat =
 			options.amountSats !== undefined
 				? BigInt(options.amountSats) * 1000n
 				: undefined;
+		// Sum in bigint: expirySecs alone is a safe integer, but the sum with
+		// now can exceed 2^53 and round before a number-based conversion.
+		const absoluteExpiry =
+			options.expirySecs !== undefined
+				? BigInt(Math.floor(Date.now() / 1000)) + BigInt(options.expirySecs)
+				: undefined;
 		const { offer, encoded } = this.node.createOffer({
 			description: options.description,
 			amount: amountMsat,
-			issuer: options.issuer
+			issuer: options.issuer,
+			absoluteExpiry
 		});
 		return this.toOfferInfo(offer, encoded);
+	}
+
+	/**
+	 * Remove a stored offer by its hex id, from memory and storage. Returns
+	 * false when no such offer exists.
+	 */
+	removeOffer(offerId: string): boolean {
+		if (!/^[0-9a-f]{64}$/i.test(offerId)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'offerId must be 64 hex characters'
+			);
+		}
+		return this.node.getOfferManager().removeOffer(Buffer.from(offerId, 'hex'));
 	}
 
 	listOffers(): OfferInfo[] {

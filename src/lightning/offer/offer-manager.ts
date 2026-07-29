@@ -52,6 +52,12 @@ export const TLV_INVOICE = 66;
 /** TLV type for BOLT 12 invoice error in onion messages */
 export const TLV_INVOICE_ERROR = 68;
 
+/** Issued invoices carry relativeExpiry 7200s; keep the preimage for the
+ *  invoice's life plus an hour of grace for an HTLC in flight at expiry. */
+const INVOICE_PREIMAGE_TTL_MS = (7200 + 3600) * 1000;
+/** Hard cap on retained preimages: requests are remote-driven. */
+const MAX_INVOICE_PREIMAGES = 10_000;
+
 // BOLT 12 signature tags are "lightning" || messagename || fieldname (the field
 // is always the "signature" field, type 240). A bare "lightning" tag made every
 // signature incompatible with CLN/eclair/LDK in both directions.
@@ -135,6 +141,9 @@ export class OfferManager extends EventEmitter {
 	 * Surfaced via the `invoice:issued` event and {@link getInvoicePreimage}.
 	 */
 	private invoicePreimages: Map<string, Buffer> = new Map();
+	/** Insertion deadlines for invoicePreimages (ms epoch); entries past
+	 *  their deadline are pruned on the next insert. */
+	private invoicePreimageDeadlines: Map<string, number> = new Map();
 	private invoiceRequestTimeoutMs: number;
 	/**
 	 * Allow a sole pending request with no reply-path binding to be resolved
@@ -146,6 +155,7 @@ export class OfferManager extends EventEmitter {
 	private allowUnboundInvoiceFallback: boolean;
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
+	private storageAttached = false;
 
 	constructor(
 		nodePrivkey: Buffer,
@@ -183,21 +193,47 @@ export class OfferManager extends EventEmitter {
 	 * handleInvoiceRequest would refuse them anyway.
 	 */
 	attachStorage(storage: IStorageBackend): void {
+		// Re-entrancy guard: a second attach would re-run rehydration against
+		// a now-populated map and re-prune rows out from under it.
+		if (this.storageAttached) return;
+		this.storageAttached = true;
 		this.storage = storage;
 		const rows = storage.loadAllOffers?.() ?? [];
 		const now = BigInt(Math.floor(Date.now() / 1000));
+		// Rows to delete are collected and removed in ONE transaction at the
+		// end: with synchronous=FULL each separate DELETE is its own fsync.
+		const prune: string[] = [];
 		for (const row of rows) {
 			try {
 				const decoded = decodeNoChecksum(row.encoded);
-				if (decoded.hrp !== 'lno') continue;
+				if (decoded.hrp !== 'lno') {
+					// Not an offer encoding at all; the row can never load.
+					this.emit('offer:corrupt', {
+						offerIdHex: row.offerIdHex,
+						reason: 'stored blob is not an offer encoding'
+					});
+					prune.push(row.offerIdHex);
+					continue;
+				}
 				const tlvData = decoded.data;
 				const { offer: bare, records } = decodeOfferTlv(tlvData);
 				const offerId = computeOfferId(records);
 				const offerIdHex = offerId.toString('hex');
-				if (offerIdHex !== row.offerIdHex) continue;
+				if (offerIdHex !== row.offerIdHex) {
+					// The encoding is checksum-free by design, so the recomputed
+					// offer id is the ONLY integrity check on the stored blob. A
+					// mismatch means the row is garbage; deleting it stops it
+					// being re-parsed (and silently skipped) on every start.
+					this.emit('offer:corrupt', {
+						offerIdHex: row.offerIdHex,
+						reason: 'recomputed offer id does not match the row key'
+					});
+					prune.push(row.offerIdHex);
+					continue;
+				}
 				const offer: IOffer = { ...bare, offerId };
 				if (offer.absoluteExpiry !== undefined && now >= offer.absoluteExpiry) {
-					storage.deleteOffer?.(row.offerIdHex);
+					prune.push(row.offerIdHex);
 					continue;
 				}
 				if (this.offers.has(offerIdHex)) continue;
@@ -207,10 +243,28 @@ export class OfferManager extends EventEmitter {
 					tlvData,
 					pathId: row.pathId ?? undefined
 				});
-			} catch {
-				// A row that cannot be decoded cannot be turned back into an
-				// offer; leave it in place and load the rest.
+			} catch (err) {
+				// A row that cannot be decoded is LEFT IN PLACE: a decode throw
+				// can mean version skew (an offer written by a newer version,
+				// read after a downgrade), and deleting would destroy it. It is
+				// surfaced instead of silently skipped.
+				this.emit('offer:corrupt', {
+					offerIdHex: row.offerIdHex,
+					reason: `row failed to decode: ${
+						err instanceof Error ? err.message : String(err)
+					}`
+				});
 				continue;
+			}
+		}
+		if (prune.length > 0 && storage.deleteOffer) {
+			const deleteAll = (): void => {
+				for (const offerIdHex of prune) storage.deleteOffer!(offerIdHex);
+			};
+			if (typeof storage.transaction === 'function') {
+				storage.transaction(deleteAll);
+			} else {
+				deleteAll();
 			}
 		}
 	}
@@ -279,19 +333,32 @@ export class OfferManager extends EventEmitter {
 
 		const encoded = encodeOffer(offer);
 
-		// Store offer (with the expected path_id when its paths carry one)
-		this.offers.set(offerId.toString('hex'), {
+		// The offer id is deterministic, so re-creating an identical offer
+		// updates an existing entry. The in-memory path_id must follow the
+		// same rule as the storage upsert (a non-null stored path_id is
+		// preserved when the new call omits one): handleInvoiceRequest
+		// enforces authentication from THIS entry, so dropping it here would
+		// silently disable the offer's blinded-path auth until restart.
+		const offerIdHex = offerId.toString('hex');
+		const previous = this.offers.get(offerIdHex);
+		const effectivePathId = options.pathId ?? previous?.pathId;
+
+		// Persist FIRST (saveOffer is synchronous): if it throws, memory is
+		// untouched, so a fresh create is fully rolled back and a re-create
+		// keeps its previous, still-persisted entry. Half-created (live and
+		// payable now, silently gone after restart) is the worst outcome.
+		this.storage?.saveOffer?.(
+			offerIdHex,
+			encoded,
+			effectivePathId ?? null,
+			Date.now()
+		);
+		this.offers.set(offerIdHex, {
 			offer,
 			encoded,
 			tlvData,
-			pathId: options.pathId
+			pathId: effectivePathId
 		});
-		this.storage?.saveOffer?.(
-			offerId.toString('hex'),
-			encoded,
-			options.pathId ?? null,
-			Date.now()
-		);
 
 		this.emit('offer:created', offer, encoded);
 		return { offer, encoded };
@@ -328,8 +395,31 @@ export class OfferManager extends EventEmitter {
 	 * Remove a stored offer, from memory and from persistent storage.
 	 */
 	removeOffer(offerId: Buffer): boolean {
-		this.storage?.deleteOffer?.(offerId.toString('hex'));
-		return this.offers.delete(offerId.toString('hex'));
+		const offerIdHex = offerId.toString('hex');
+		// Check first: deleting the row for an unknown offer and then
+		// reporting "not found" is a failure report that destroyed data.
+		if (!this.offers.has(offerIdHex)) return false;
+		this.storage?.deleteOffer?.(offerIdHex);
+		return this.offers.delete(offerIdHex);
+	}
+
+	/** Drop expired preimages, then oldest-first down to the hard cap. */
+	private pruneInvoicePreimages(): void {
+		const now = Date.now();
+		for (const [hashHex, deadline] of this.invoicePreimageDeadlines) {
+			if (now >= deadline) {
+				this.invoicePreimages.delete(hashHex);
+				this.invoicePreimageDeadlines.delete(hashHex);
+			}
+		}
+		while (this.invoicePreimages.size >= MAX_INVOICE_PREIMAGES) {
+			const oldest = this.invoicePreimages.keys().next().value as
+				| string
+				| undefined;
+			if (oldest === undefined) break;
+			this.invoicePreimages.delete(oldest);
+			this.invoicePreimageDeadlines.delete(oldest);
+		}
 	}
 
 	/**
@@ -566,7 +656,16 @@ export class OfferManager extends EventEmitter {
 
 		// Retain the preimage so the node can fulfill the incoming HTLC for this
 		// invoice (it never leaves the issuer — not part of the BOLT 12 invoice).
+		// Every valid invoice_request mints one of these, and requests are
+		// remote-driven: without a bound, one shared offer is a permanent
+		// memory amplification target. Entries expire with the invoice (plus
+		// grace for an HTLC already in flight at expiry) under a hard cap.
+		this.pruneInvoicePreimages();
 		this.invoicePreimages.set(paymentHash.toString('hex'), preimage);
+		this.invoicePreimageDeadlines.set(
+			paymentHash.toString('hex'),
+			Date.now() + INVOICE_PREIMAGE_TTL_MS
+		);
 
 		// BOLT 12: the invoice MUST include invoice_paths (one or more blinded
 		// paths to us) with exactly one blinded_payinfo per path. Reuse the
@@ -726,6 +825,7 @@ export class OfferManager extends EventEmitter {
 		this.pendingInvoiceRequests.clear();
 		this.offers.clear();
 		this.invoicePreimages.clear();
+		this.invoicePreimageDeadlines.clear();
 		this.onionMessageManager = null;
 		this.removeAllListeners();
 	}

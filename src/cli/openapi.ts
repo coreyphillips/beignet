@@ -915,12 +915,34 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					requestBody: bodyContent({
 						description: 'string',
 						amountSats: 'number?',
-						issuer: 'string?'
+						issuer: 'string?',
+						expirySecs: 'number?'
 					}),
 					responses: {
 						'200': {
 							description: 'Offer info',
 							content: jsonContent({ $ref: '#/components/schemas/OfferInfo' })
+						}
+					}
+				}
+			},
+			'/offer': {
+				delete: {
+					summary: 'Remove a stored offer',
+					tags: ['Offers'],
+					parameters: [
+						{
+							name: 'offerId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description: 'Offer id (64 hex characters)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Removal result',
+							content: jsonContent({ removed: 'boolean' })
 						}
 					}
 				}

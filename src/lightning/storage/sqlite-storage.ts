@@ -1345,9 +1345,17 @@ export class SqliteStorage implements IStorageBackend {
 		pathId: Buffer | null,
 		createdAt: number
 	): void {
+		// The offer id is a deterministic merkle over the TLVs, so re-creating
+		// an identical offer hits the same primary key. INSERT OR REPLACE reset
+		// created_at and could null out a stored path_id, silently downgrading
+		// the offer's blinded-path authentication; the upsert preserves both.
 		this.db
 			.prepare(
-				'INSERT OR REPLACE INTO offers (offer_id, encoded, path_id, created_at) VALUES (?, ?, ?, ?)'
+				`INSERT INTO offers (offer_id, encoded, path_id, created_at)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT(offer_id) DO UPDATE SET
+					encoded = excluded.encoded,
+					path_id = COALESCE(excluded.path_id, offers.path_id)`
 			)
 			.run(
 				offerIdHex,

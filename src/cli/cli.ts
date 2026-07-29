@@ -1825,6 +1825,13 @@ async function handleOffer(): Promise<void> {
 			);
 		case 'list':
 			return outputResult(await httpRequest('GET', '/offers'));
+		case 'remove':
+			return outputResult(
+				await httpRequest(
+					'DELETE',
+					`/offer?offerId=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
 		case 'decode':
 			return outputResult(
 				await httpRequest('POST', '/offer/decode', {
@@ -1845,7 +1852,7 @@ async function handleOffer(): Promise<void> {
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet offer [create|list|decode|pay]'
+					message: 'Usage: beignet offer [create|list|remove|decode|pay]'
 				}
 			});
 			process.exitCode = 1;

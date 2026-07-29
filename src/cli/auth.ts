@@ -179,6 +179,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /invoice/settle-hold': ['invoice'],
 	'POST /invoice/cancel-hold': ['invoice'],
 	'POST /offer/create': ['invoice'],
+	'DELETE /offer': ['invoice'],
 	'POST /address/new': ['invoice'],
 
 	// ── Admin-only: secrets / sensitive management surface ──
