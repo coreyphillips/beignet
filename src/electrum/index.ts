@@ -193,14 +193,23 @@ export class Electrum {
 			connected = true;
 			break;
 		}
-		if (!connected && !this.wallet.isSwitchingNetworks) return err(lastError);
+		// A network switch needs the network fields updated even when the new
+		// network has no reachable server, but that must never be reported as
+		// success: every Electrum call gates on connectedToElectrum, and a
+		// false success leaves them all believing a connection exists.
 		this.network = network;
 		this.electrumNetwork = electrumNetwork;
 		if (customPeers.length) {
 			this.servers = customPeers;
 		}
+		if (!connected) {
+			this.publishConnectionChange(false);
+			return err(lastError);
+		}
 		this.publishConnectionChange(true);
-		this.subscribeToHeader().then();
+		this.subscribeToHeader().catch(() => {
+			// Best-effort: the header subscription is rebuilt on reconnect.
+		});
 		return ok('Connected to Electrum server.');
 	}
 
