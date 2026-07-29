@@ -41,7 +41,11 @@ import { encodeOffer } from './encode';
 import { decodeNoChecksum } from './bech32-nochecksum';
 import { ITlvRecord } from '../message/tlv';
 import type { IStorageBackend } from '../storage/types';
-import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
+import {
+	IBlindedPath,
+	IBlindedPaymentPath,
+	constructBlindedPath
+} from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 
@@ -92,6 +96,13 @@ export interface ICreateOfferOptions {
 	 * rejected. Omit for externally built paths without one.
 	 */
 	pathId?: Buffer;
+	/**
+	 * Async receive: payments for invoices issued from this offer must be
+	 * parked by the LSP. Invoice payment paths are rebuilt per invoice with
+	 * the hold_htlc flag via the node-injected hold-path builder. Persisted
+	 * with the offer so a restart keeps issuing hold paths.
+	 */
+	asyncHold?: boolean;
 }
 
 export interface IRequestInvoiceOptions {
@@ -110,7 +121,13 @@ export class OfferManager extends EventEmitter {
 	private nodeId: Buffer;
 	private offers: Map<
 		string,
-		{ offer: IOffer; encoded: string; tlvData: Buffer; pathId?: Buffer }
+		{
+			offer: IOffer;
+			encoded: string;
+			tlvData: Buffer;
+			pathId?: Buffer;
+			asyncHold?: boolean;
+		}
 	> = new Map();
 	private onionMessageManager: OnionMessageManager | null = null;
 	private pendingInvoiceRequests: Map<
@@ -162,6 +179,16 @@ export class OfferManager extends EventEmitter {
 	 * Only hand-fed flows (no onion wiring) should opt in.
 	 */
 	private allowUnboundInvoiceFallback: boolean;
+	/**
+	 * Node-injected builder for the payment paths of an invoice issued from an
+	 * ASYNC-HOLD offer: real blinded paths through the LSP carrying the
+	 * hold_htlc flag, the given per-invoice path_id in the final hop, and the
+	 * true aggregate payinfo. Without it (bare OfferManager, or no usable
+	 * channel at issuance) the invoice falls back to the single-hop self path.
+	 */
+	private buildHoldPaymentPaths:
+		| ((pathId: Buffer) => IBlindedPaymentPath[])
+		| null = null;
 	/** Persistent backend for offers; null keeps the manager memory-only. */
 	private storage: IStorageBackend | null = null;
 	private storageAttached = false;
@@ -172,6 +199,7 @@ export class OfferManager extends EventEmitter {
 			onionMessageManager?: OnionMessageManager;
 			invoiceRequestTimeoutMs?: number;
 			allowUnboundInvoiceFallback?: boolean;
+			buildHoldPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 		}
 	) {
 		super();
@@ -180,6 +208,7 @@ export class OfferManager extends EventEmitter {
 		this.invoiceRequestTimeoutMs = options?.invoiceRequestTimeoutMs ?? 30_000;
 		this.allowUnboundInvoiceFallback =
 			options?.allowUnboundInvoiceFallback ?? false;
+		this.buildHoldPaymentPaths = options?.buildHoldPaymentPaths ?? null;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
@@ -250,7 +279,8 @@ export class OfferManager extends EventEmitter {
 					offer,
 					encoded: row.encoded,
 					tlvData,
-					pathId: row.pathId ?? undefined
+					pathId: row.pathId ?? undefined,
+					asyncHold: row.asyncHold || undefined
 				});
 			} catch (err) {
 				// A row that cannot be decoded is LEFT IN PLACE: a decode throw
@@ -275,6 +305,21 @@ export class OfferManager extends EventEmitter {
 			} else {
 				deleteAll();
 			}
+		}
+
+		// Re-register the expected path_ids of issued-but-unpaid BOLT 12
+		// invoices. The receive path FAILS CLOSED on a BOLT 12 invoice whose
+		// expected path_id is unknown, so without this every invoice issued
+		// before the restart would become unpayable while its preimage is
+		// still claimable. Restored entries get a fresh retention deadline;
+		// over-retention only delays cap eviction, it cannot weaken
+		// authentication.
+		for (const row of storage.loadAllInvoicePathIds?.() ?? []) {
+			this.invoicePathIds.set(row.paymentHashHex, row.pathId);
+			this.invoicePreimageDeadlines.set(
+				row.paymentHashHex,
+				Date.now() + INVOICE_PREIMAGE_TTL_MS
+			);
 		}
 	}
 
@@ -351,6 +396,7 @@ export class OfferManager extends EventEmitter {
 		const offerIdHex = offerId.toString('hex');
 		const previous = this.offers.get(offerIdHex);
 		const effectivePathId = options.pathId ?? previous?.pathId;
+		const effectiveAsyncHold = options.asyncHold ?? previous?.asyncHold;
 
 		// Persist FIRST (saveOffer is synchronous): if it throws, memory is
 		// untouched, so a fresh create is fully rolled back and a re-create
@@ -360,13 +406,15 @@ export class OfferManager extends EventEmitter {
 			offerIdHex,
 			encoded,
 			effectivePathId ?? null,
-			Date.now()
+			Date.now(),
+			effectiveAsyncHold ?? false
 		);
 		this.offers.set(offerIdHex, {
 			offer,
 			encoded,
 			tlvData,
-			pathId: effectivePathId
+			pathId: effectivePathId,
+			asyncHold: effectiveAsyncHold
 		});
 
 		this.emit('offer:created', offer, encoded);
@@ -683,39 +731,44 @@ export class OfferManager extends EventEmitter {
 		// payment is authenticated by the path's ENCRYPTED path_id — BOLT 12
 		// defines no payment_secret TLV, so a secret minted here could never
 		// reach the payer, and registering one made every issued invoice
-		// unpayable (#252). Reuse the offer's paths when it has them (an
-		// async-hold offer's hold flag must survive into the payment path);
-		// otherwise build a real single-hop blinded path terminating at us —
-		// the same shape CLN issues for a node without announced channels —
-		// carrying a fresh per-invoice path_id.
+		// unpayable (#252). invoice_paths are ALWAYS built fresh for this
+		// invoice, never reused from the offer: offer paths exist to deliver
+		// invoice_requests, and reusing them for payment would advertise
+		// fabricated payinfo for hops with real relay fees (and a
+		// caller-supplied path we cannot see inside would leave the payment
+		// unauthenticatable). An async-hold offer gets fresh LSP hold paths
+		// with their true aggregate payinfo; anything else gets a real
+		// single-hop path terminating at us — the same shape CLN issues for a
+		// node without announced channels.
+		const invoicePathId = crypto.randomBytes(32);
+		let holdPaths: IBlindedPaymentPath[] = [];
+		if (this.offers.get(matchedOfferIdHex!)?.asyncHold) {
+			holdPaths = this.buildHoldPaymentPaths?.(invoicePathId) ?? [];
+		}
 		let invoicePaths: IBlindedPath[];
-		let invoicePathId: Buffer | undefined;
-		if (matchedOffer.paths && matchedOffer.paths.length > 0) {
-			invoicePaths = matchedOffer.paths;
-			// A payment over an offer path surfaces the OFFER's path_id (absent
-			// for externally supplied paths whose contents we never saw).
-			invoicePathId = this.offers.get(matchedOfferIdHex!)?.pathId;
+		let invoicePayInfo: IBolt12Invoice['blindedPayInfo'];
+		if (holdPaths.length > 0) {
+			invoicePaths = holdPaths.map((p) => p.path);
+			invoicePayInfo = holdPaths.map((p) => p.payInfo);
 		} else {
-			const freshPathId = crypto.randomBytes(32);
 			invoicePaths = [
 				constructBlindedPath(
 					crypto.randomBytes(32),
 					[this.nodeId],
-					[{ pathId: freshPathId }]
+					[{ pathId: invoicePathId }]
 				)
 			];
-			invoicePathId = freshPathId;
+			invoicePayInfo = [
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 18,
+					htlcMinimumMsat: 1n,
+					htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
+				}
+			];
 		}
-		if (invoicePathId) {
-			this.invoicePathIds.set(paymentHashHex, invoicePathId);
-		}
-		const invoicePayInfo = invoicePaths.map(() => ({
-			feeBaseMsat: 0,
-			feeProportionalMillionths: 0,
-			cltvExpiryDelta: 18,
-			htlcMinimumMsat: 1n,
-			htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
-		}));
+		this.invoicePathIds.set(paymentHashHex, invoicePathId);
 
 		const invoice: IBolt12Invoice = {
 			paymentHash,
@@ -750,10 +803,12 @@ export class OfferManager extends EventEmitter {
 		}
 
 		// `invoice:issued` carries the preimage so the node can register it for
-		// settlement (the issuer side — we will RECEIVE this payment). Distinct from
-		// `invoice:received`, which also fires when we are the PAYER and hold no
-		// preimage.
-		this.emit('invoice:issued', invoice, preimage);
+		// settlement (the issuer side — we will RECEIVE this payment), and the
+		// expected path_id so the node can persist it transactionally with the
+		// preimage: receive-side authentication must never be lost while the
+		// payment stays claimable. Distinct from `invoice:received`, which also
+		// fires when we are the PAYER and hold no preimage.
+		this.emit('invoice:issued', invoice, preimage, invoicePathId);
 		this.emit('invoice:received', invoice);
 		return invoice;
 	}

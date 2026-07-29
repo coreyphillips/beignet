@@ -80,6 +80,16 @@ export interface IStorageBackend {
 	loadAllPaymentSecrets(): Array<{ paymentHashHex: string; secret: Buffer }>;
 	deletePaymentSecret(paymentHashHex: string): void;
 
+	/**
+	 * Persist the expected blinded-path path_id of a BOLT 12 invoice WE issued,
+	 * the receive-side authentication analogue of a BOLT 11 payment secret.
+	 * Written in the same transaction as the invoice's preimage so
+	 * authentication state can never be lost while the payment stays claimable.
+	 */
+	saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void;
+	loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer }>;
+	deleteInvoicePathId?(paymentHashHex: string): void;
+
 	// ─── Invoices ───
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void;
 	loadAllInvoices(): Array<{ paymentHashHex: string; invoice: IInvoiceInfo }>;
@@ -231,7 +241,8 @@ export interface IStorageBackend {
 		offerIdHex: string,
 		encoded: string,
 		pathId: Buffer | null,
-		createdAt: number
+		createdAt: number,
+		asyncHold?: boolean
 	): void;
 	/** Load every persisted offer. */
 	loadAllOffers?(): Array<{
@@ -239,6 +250,7 @@ export interface IStorageBackend {
 		encoded: string;
 		pathId: Buffer | null;
 		createdAt: number;
+		asyncHold?: boolean;
 	}>;
 	/** Delete a persisted offer. */
 	deleteOffer?(offerIdHex: string): void;
@@ -300,6 +312,12 @@ export interface IInvoiceInfo {
 	createdAt: number;
 	/** Hold invoice — matching HTLCs are parked until settle/cancel. */
 	hold?: boolean;
+	/**
+	 * BOLT 12-issued invoice (created for an offer's invoice_request). The
+	 * receive path authenticates these by blinded-path path_id, never by
+	 * payment secret, and FAILS CLOSED when the expected path_id is missing.
+	 */
+	bolt12?: boolean;
 	/**
 	 * Hold invoice cancelled (ms timestamp). Kept so a restart does not
 	 * re-arm parking for a hash the operator already cancelled.

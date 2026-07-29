@@ -702,7 +702,14 @@ export class LightningNode extends EventEmitter {
 		this.wireOnionMessageEvents();
 
 		this.offerManager = new OfferManager(config.nodePrivateKey, {
-			onionMessageManager: this.onionMessageManager
+			onionMessageManager: this.onionMessageManager,
+			// Invoices issued from an async-hold offer get fresh per-invoice
+			// payment paths through the LSP: hold flag intact, the given
+			// path_id in the final hop, and the TRUE aggregate payinfo
+			// (reusing the offer's message paths advertised fabricated zero
+			// fees, leaving the payment underfunded at the LSP hop).
+			buildHoldPaymentPaths: (pathId: Buffer) =>
+				this.buildBlindedPaymentPaths(true, 3, pathId)
 		});
 		this.wireOfferManagerEvents();
 
@@ -1325,7 +1332,8 @@ export class LightningNode extends EventEmitter {
 		paymentHash: Buffer,
 		invoiceInfo: IInvoiceInfo,
 		preimage?: Buffer,
-		paymentSecret?: Buffer
+		paymentSecret?: Buffer,
+		bolt12PathId?: Buffer
 	): void {
 		this.safeStorage(() => {
 			this.storage!.transaction(() => {
@@ -1333,6 +1341,11 @@ export class LightningNode extends EventEmitter {
 				if (preimage) this.storage!.savePreimage(hashHex, preimage);
 				if (paymentSecret) {
 					this.storage!.savePaymentSecret(hashHex, paymentSecret);
+				}
+				// Same transaction as the preimage: a BOLT 12 invoice must never
+				// persist as claimable without its authentication path_id.
+				if (bolt12PathId) {
+					this.storage!.saveInvoicePathId?.(hashHex, bolt12PathId);
 				}
 				this.storage!.saveInvoice(hashHex, invoiceInfo);
 				this.persistPaymentOrThrow(paymentHash);
@@ -8439,8 +8452,14 @@ export class LightningNode extends EventEmitter {
 		// match before any preimage is revealed. An HTLC for the hash sent
 		// OUTSIDE the path (probe, forged, or leaked hash) fails exactly like
 		// a payment_secret mismatch, so the sender learns nothing.
+		//
+		// FAIL CLOSED: the check triggers on the invoice's persisted bolt12
+		// marker OR a registered expectation, and a BOLT 12 invoice whose
+		// expected path_id is unknown (evicted, or state loss) is rejected. A
+		// missing expectation must never skip authentication while the
+		// preimage is still claimable.
 		const expectedPathId = this.offerManager.getInvoicePathId(paymentHash);
-		if (expectedPathId) {
+		if (expectedPathId || this.invoices.get(hashHex)?.bolt12) {
 			let receivedPathId: Buffer | undefined;
 			const pathKey = hopPayload?.blindingPoint ?? incomingBlindingPoint;
 			if (pathKey && hopPayload?.encryptedRecipientData?.length) {
@@ -8454,9 +8473,14 @@ export class LightningNode extends EventEmitter {
 					// Undecryptable recipient data: treated as an absent path_id.
 				}
 			}
-			if (!receivedPathId || !receivedPathId.equals(expectedPathId)) {
+			if (
+				!expectedPathId ||
+				!receivedPathId ||
+				!receivedPathId.equals(expectedPathId)
+			) {
 				this.emitStructuredLog('htlc', 'payment_path_id_mismatch', {
-					paymentHash: hashHex
+					paymentHash: hashHex,
+					expectationKnown: !!expectedPathId
 				});
 				const reason = sharedSecret
 					? createFailureMessage(
@@ -11100,14 +11124,17 @@ export class LightningNode extends EventEmitter {
 	 * LSP parks an inbound HTLC until we come online and release it (async
 	 * receive). Caller-supplied `paths` take precedence over the auto-built one.
 	 */
-	createOffer(options: ICreateOfferOptions & { asyncHold?: boolean }): {
+	createOffer(options: ICreateOfferOptions): {
 		offer: IOffer;
 		encoded: string;
 	} {
-		const { asyncHold, ...createOpts } = options;
-		if (asyncHold && !createOpts.paths) {
+		const createOpts = { ...options };
+		if (createOpts.asyncHold && !createOpts.paths) {
 			// One path_id shared by every path of this offer: invoice_requests
 			// must arrive over one of them (verified in handleInvoiceRequest).
+			// These are the offer's MESSAGE paths; the payment paths of each
+			// issued invoice are rebuilt fresh at issuance (asyncHold is
+			// persisted with the offer so that survives a restart).
 			const pathId = crypto.randomBytes(32);
 			const paths = this.buildBlindedPaymentPaths(true, 3, pathId).map(
 				(p) => p.path
@@ -11272,16 +11299,20 @@ export class LightningNode extends EventEmitter {
 		// against OfferManager.getInvoicePathId).
 		this.offerManager.on(
 			'invoice:issued',
-			(invoice: IBolt12Invoice, preimage: Buffer) => {
+			(invoice: IBolt12Invoice, preimage: Buffer, pathId: Buffer) => {
 				const hashHex = invoice.paymentHash.toString('hex');
 				this.preimages.set(hashHex, preimage);
+				// bolt12 marks the invoice for the receive path's FAIL-CLOSED
+				// path_id check: a BOLT 12 invoice whose expected path_id is
+				// missing is rejected, never fulfilled unauthenticated.
 				const invoiceInfo: IInvoiceInfo = {
 					paymentHash: hashHex,
 					bolt11: '',
 					amountMsat: invoice.amount,
 					description: invoice.description,
 					expiry: invoice.relativeExpiry ?? DEFAULT_EXPIRY,
-					createdAt: Number(invoice.createdAt)
+					createdAt: Number(invoice.createdAt),
+					bolt12: true
 				};
 				this.invoices.set(hashHex, invoiceInfo);
 				// Track an INCOMING payment so the receive path emits payment:received
@@ -11296,7 +11327,13 @@ export class LightningNode extends EventEmitter {
 						createdAt: Date.now()
 					});
 				}
-				this.persistInvoiceRecords(invoice.paymentHash, invoiceInfo, preimage);
+				this.persistInvoiceRecords(
+					invoice.paymentHash,
+					invoiceInfo,
+					preimage,
+					undefined,
+					pathId
+				);
 				this.emit('bolt12:invoice:issued', invoice);
 			}
 		);

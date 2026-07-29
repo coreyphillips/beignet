@@ -126,7 +126,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 10;
+	static readonly CURRENT_SCHEMA_VERSION = 11;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -190,7 +190,15 @@ export class SqliteStorage implements IStorageBackend {
 		// authenticates invoice_requests arriving over the offer's blinded
 		// paths (null for offers without one; null columns are skipped by the
 		// encryption rollout).
-		{ table: 'offers', pk: 'offer_id', columns: ['encoded', 'path_id'] }
+		{ table: 'offers', pk: 'offer_id', columns: ['encoded', 'path_id'] },
+		// The expected path_id of an issued BOLT 12 invoice is the secret that
+		// authenticates the incoming payment (the BOLT 12 analogue of a
+		// payment secret), so it gets the same at-rest protection.
+		{
+			table: 'invoice_path_ids',
+			pk: 'payment_hash_hex',
+			columns: ['path_id']
+		}
 	];
 
 	/**
@@ -320,7 +328,13 @@ export class SqliteStorage implements IStorageBackend {
 				offer_id TEXT PRIMARY KEY,
 				encoded TEXT NOT NULL,
 				path_id TEXT,
-				created_at INTEGER NOT NULL
+				created_at INTEGER NOT NULL,
+				async_hold INTEGER NOT NULL DEFAULT 0
+			);
+
+			CREATE TABLE IF NOT EXISTS invoice_path_ids (
+				payment_hash_hex TEXT PRIMARY KEY,
+				path_id TEXT NOT NULL
 			);
 
 			CREATE TABLE IF NOT EXISTS metadata (
@@ -823,6 +837,45 @@ export class SqliteStorage implements IStorageBackend {
 			.run(paymentHashHex);
 	}
 
+	// ─── BOLT 12 Invoice Path IDs ───
+	// The expected blinded-path path_id of an issued BOLT 12 invoice: the
+	// receive-side authentication secret (BOLT 12 analogue of a payment
+	// secret). Persisted in the same transaction as the preimage so the
+	// fail-closed receive check keeps working across restarts.
+
+	saveInvoicePathId(paymentHashHex: string, pathId: Buffer): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO invoice_path_ids (payment_hash_hex, path_id) VALUES (?, ?)'
+			)
+			.run(paymentHashHex, this._enc(pathId.toString('hex')));
+	}
+
+	loadAllInvoicePathIds(): Array<{ paymentHashHex: string; pathId: Buffer }> {
+		const rows = this.db
+			.prepare('SELECT payment_hash_hex, path_id FROM invoice_path_ids')
+			.all() as Array<{ payment_hash_hex: string; path_id: string }>;
+		const results: Array<{ paymentHashHex: string; pathId: Buffer }> = [];
+		for (const row of rows) {
+			try {
+				results.push({
+					paymentHashHex: row.payment_hash_hex,
+					pathId: Buffer.from(this._dec(row.path_id), 'hex')
+				});
+			} catch (err) {
+				// Skip corrupted row
+				this.reportCorruptRow(err);
+			}
+		}
+		return results;
+	}
+
+	deleteInvoicePathId(paymentHashHex: string): void {
+		this.db
+			.prepare('DELETE FROM invoice_path_ids WHERE payment_hash_hex = ?')
+			.run(paymentHashHex);
+	}
+
 	// ─── Invoices ───
 
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void {
@@ -837,6 +890,7 @@ export class SqliteStorage implements IStorageBackend {
 			expiry: invoice.expiry,
 			createdAt: invoice.createdAt,
 			hold: invoice.hold,
+			bolt12: invoice.bolt12,
 			cancelledAt: invoice.cancelledAt
 		});
 		this.db
@@ -868,6 +922,7 @@ export class SqliteStorage implements IStorageBackend {
 						expiry: parsed.expiry,
 						createdAt: parsed.createdAt,
 						hold: parsed.hold,
+						bolt12: parsed.bolt12,
 						cancelledAt: parsed.cancelledAt
 					}
 				});
@@ -1209,6 +1264,21 @@ export class SqliteStorage implements IStorageBackend {
 			// when a key is set.
 			(): void => {
 				// No-op
+			},
+			// Migration 10->11: invoice_path_ids table (expected path_id of an
+			// issued BOLT 12 invoice, persisted so receive-side authentication
+			// survives a restart; created via CREATE IF NOT EXISTS above, the
+			// path_id column encrypted at rest via ENCRYPTED_COLUMNS) and
+			// offers.async_hold (an async-hold offer must keep issuing LSP
+			// hold payment paths after a restart).
+			(db): void => {
+				try {
+					db.exec(
+						'ALTER TABLE offers ADD COLUMN async_hold INTEGER NOT NULL DEFAULT 0'
+					);
+				} catch {
+					// Column may already exist (fresh DBs create it in _createTables)
+				}
 			}
 		];
 
@@ -1343,7 +1413,8 @@ export class SqliteStorage implements IStorageBackend {
 		offerIdHex: string,
 		encoded: string,
 		pathId: Buffer | null,
-		createdAt: number
+		createdAt: number,
+		asyncHold?: boolean
 	): void {
 		// The offer id is a deterministic merkle over the TLVs, so re-creating
 		// an identical offer hits the same primary key. INSERT OR REPLACE reset
@@ -1351,17 +1422,19 @@ export class SqliteStorage implements IStorageBackend {
 		// the offer's blinded-path authentication; the upsert preserves both.
 		this.db
 			.prepare(
-				`INSERT INTO offers (offer_id, encoded, path_id, created_at)
-				 VALUES (?, ?, ?, ?)
+				`INSERT INTO offers (offer_id, encoded, path_id, created_at, async_hold)
+				 VALUES (?, ?, ?, ?, ?)
 				 ON CONFLICT(offer_id) DO UPDATE SET
 					encoded = excluded.encoded,
-					path_id = COALESCE(excluded.path_id, offers.path_id)`
+					path_id = COALESCE(excluded.path_id, offers.path_id),
+					async_hold = excluded.async_hold`
 			)
 			.run(
 				offerIdHex,
 				this._enc(encoded),
 				pathId ? this._enc(pathId.toString('hex')) : null,
-				createdAt
+				createdAt,
+				asyncHold ? 1 : 0
 			);
 	}
 
@@ -1370,20 +1443,25 @@ export class SqliteStorage implements IStorageBackend {
 		encoded: string;
 		pathId: Buffer | null;
 		createdAt: number;
+		asyncHold: boolean;
 	}> {
 		const rows = this.db
-			.prepare('SELECT offer_id, encoded, path_id, created_at FROM offers')
+			.prepare(
+				'SELECT offer_id, encoded, path_id, created_at, async_hold FROM offers'
+			)
 			.all() as Array<{
 			offer_id: string;
 			encoded: string;
 			path_id: string | null;
 			created_at: number;
+			async_hold: number;
 		}>;
 		const results: Array<{
 			offerIdHex: string;
 			encoded: string;
 			pathId: Buffer | null;
 			createdAt: number;
+			asyncHold: boolean;
 		}> = [];
 		for (const row of rows) {
 			try {
@@ -1393,7 +1471,8 @@ export class SqliteStorage implements IStorageBackend {
 					pathId: row.path_id
 						? Buffer.from(this._dec(row.path_id), 'hex')
 						: null,
-					createdAt: row.created_at
+					createdAt: row.created_at,
+					asyncHold: !!row.async_hold
 				});
 			} catch (err) {
 				// Skip corrupted row

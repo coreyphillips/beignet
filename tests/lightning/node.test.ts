@@ -1120,6 +1120,126 @@ describe('Lightning Node', function () {
 			expect(received, 'bob must not fulfill an out-of-path HTLC').to.be.false;
 		});
 
+		it('fails closed when the expected path_id is lost, even over the correct path', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat
+			});
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			)!;
+			const hashHex = b12.paymentHash.toString('hex');
+
+			// Simulate authentication-state loss (TTL/cap eviction, a wiped
+			// row) while the preimage stays claimable. The invoice's bolt12
+			// marker must force rejection, not skip the check: an unknown
+			// expectation is a reason to fail, never a pass.
+			offerMgr['invoicePathIds'].delete(hashHex);
+			expect(bob['preimages'].has(hashHex), 'preimage still claimable').to.be
+				.true;
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+
+			const sent = alice.payBolt12Invoice(b12);
+
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			expect(received, 'bob must fail closed without the expected path_id').to
+				.be.false;
+		});
+
+		it('issues fresh authenticated payment paths for an offer with caller-supplied paths', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			// A caller-supplied offer path whose contents we never saw (no
+			// pathId handed over): it must be used only for invoice_request
+			// delivery, never as the invoice's payment path, or the payment
+			// could not be authenticated.
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+			const externalPath = constructBlindedPath(
+				crypto.randomBytes(32),
+				[bobPub],
+				[{}]
+			);
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat,
+				paths: [externalPath]
+			});
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			)!;
+			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+
+			// The invoice's payment path is freshly built (not the opaque
+			// caller path) and carries a registered per-invoice path_id.
+			expect(b12.paths).to.have.length(1);
+			expect(b12.paths![0].blindingPoint).to.not.deep.equal(
+				externalPath.blindingPoint
+			);
+			expect(offerMgr.getInvoicePathId(b12.paymentHash)).to.exist;
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+			const sent = alice.payBolt12Invoice(b12);
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(received, 'payment over the fresh path settled').to.be.true;
+		});
+
 		it('consumes an on-chain-learned preimage: seeds monitors + fulfills the inbound leg (H3)', function () {
 			const alice = createNode(1);
 			const bob = createNode(2); // bob = the forwarding node
