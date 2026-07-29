@@ -14,6 +14,8 @@ import {
 	PaymentStatus,
 	IOutboundMppState
 } from '../../src/lightning/node/types';
+import { createFailureMessage } from '../../src/lightning/onion/failures';
+import { TEMPORARY_NODE_FAILURE } from '../../src/lightning/onion/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -672,6 +674,98 @@ describe('MPP Sending (Phase 5)', function () {
 				PaymentStatus.COMPLETED,
 				PaymentStatus.FAILED
 			]);
+		});
+
+		it('a failed part never redispatches the full invoice and decrypts with its own secrets', async function () {
+			// Non-dust HTLCs need real HTLC signatures in the loopback harness.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(64),
+				htlcBasepointSecret: htlcSecretFor(64)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(65),
+				htlcBasepointSecret: htlcSecretFor(65)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			// Two real channels; the amount below fits neither alone, so the
+			// payment must split over both local-channel edges.
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			// Bob rejects every incoming part with a retryable failure and
+			// counts what arrives. Anything above the original part count
+			// means the whole invoice was redispatched after a part failure,
+			// which lets the receiver hold old + new parts summing past
+			// total_msat and overpay the invoice.
+			let attempts = 0;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			bobAny.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
+				attempts++;
+				const key = `${channelId.toString('hex')}:${htlcId}`;
+				const sharedSecret = bobAny.receivedHtlcSharedSecrets.get(key);
+				bobAny.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				);
+			};
+
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// Manual invoice: createInvoice would embed a routing hint, and a
+			// hint edge carries no capacity, letting a single-path route
+			// swallow the full amount. Bob fails every part before invoice
+			// lookup, so the random payment hash never matters.
+			const bobConfig = makeNodeConfig(65);
+			const feats = FeatureFlags.empty();
+			feats.setCompulsory(Feature.TLV_ONION);
+			feats.setCompulsory(Feature.PAYMENT_SECRET);
+			feats.setCompulsory(Feature.BASIC_MPP);
+			const invoiceStr = encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'mpp failed part',
+				amountMsat: 250_000_000n,
+				payeeNodeKey: getPublicKey(bobConfig.nodePrivateKey),
+				privateKey: bobConfig.nodePrivateKey,
+				featureBits: feats
+			});
+
+			const payment = alice.sendPayment(invoiceStr);
+			const attemptsAtReturn = attempts;
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(attemptsAtReturn, 'exactly the original two parts').to.equal(2);
+			expect(attempts, 'no redispatch after the failures settled').to.equal(2);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+
+			// The failure returned on the SECOND part is a distinct onion; it
+			// only decrypts with that part's own secrets. With the first
+			// part's secrets no hop HMAC matches and the code is lost.
+			expect(payment.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
+			expect(payment.failureReason ?? '').to.not.match(
+				/could not be decrypted/
+			);
+
+			// Every part resolved and dispatch finished: state is dropped.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
 		});
 
 		it('should not attempt MPP when the invoice does not advertise basic_mpp (S-4.M8)', function () {

@@ -257,13 +257,15 @@ describe('MPP (Phase 7)', function () {
 			expect(tooBig).to.be.null;
 		});
 
-		it('enforces the CLTV lockup budget on every part', function () {
+		it('enforces the CLTV lockup budget on every part at the exact boundary', function () {
 			const { graph, source, dest } = buildParallelGraph();
 
-			// Two 40-delta hops over a 40-block final expiry accumulate 120
-			// blocks of lockup at the source edge; a 100-block budget must
-			// refuse every route rather than dispatch an over-budget part.
-			const capped = findMultiPathRoute(
+			// source -> mid -> dest with 40-delta channels and a 40-block final
+			// expiry: the source's outgoing HTLC locks 40 (final) + 40 (mid's
+			// delta) = 80 blocks. The source applies no delta of its own, so a
+			// 79-block budget must refuse the route and an 80-block budget must
+			// accept it.
+			const tooSmall = findMultiPathRoute(
 				graph,
 				source,
 				dest,
@@ -276,12 +278,11 @@ describe('MPP (Phase 7)', function () {
 				undefined,
 				undefined,
 				undefined,
-				100
+				79
 			);
-			expect(capped).to.be.null;
+			expect(tooSmall).to.be.null;
 
-			// A budget that covers the lockup routes normally.
-			const roomy = findMultiPathRoute(
+			const exact = findMultiPathRoute(
 				graph,
 				source,
 				dest,
@@ -294,9 +295,78 @@ describe('MPP (Phase 7)', function () {
 				undefined,
 				undefined,
 				undefined,
-				150
+				80
 			);
-			expect(roomy).to.not.be.null;
+			expect(exact).to.not.be.null;
+			expect(exact!.parts[0].hops[0].outgoingCltvValue).to.equal(80);
+		});
+
+		it('does not count the local channel delta against a direct payment', function () {
+			// One direct channel source -> dest with a 40 delta: the sender
+			// never applies its own channel's delta, so a 40-block final expiry
+			// fits a 40-block budget exactly.
+			const graph = new NetworkGraph();
+			const source = makeNodeId(0x01);
+			const dest = makeNodeId(0xff);
+			const scid = makeScid(200, 1, 0);
+			graph.addChannelAnnouncement(makeAnnouncement(scid, source, dest));
+			const isN1First = Buffer.compare(source, dest) < 0;
+			graph.applyChannelUpdate(
+				makeUpdate(scid, isN1First ? 0 : 1, 50_000_000n)
+			);
+			graph.applyChannelUpdate(
+				makeUpdate(scid, isN1First ? 1 : 0, 50_000_000n)
+			);
+
+			const direct = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				10_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				40
+			);
+			expect(direct).to.not.be.null;
+			expect(direct!.parts[0].hops[0].outgoingCltvValue).to.equal(40);
+		});
+
+		it('findRoute applies the same source-edge CLTV accounting', function () {
+			const { graph, source, dest } = buildParallelGraph();
+
+			// Same boundary as the MPP case: 80 blocks of real lockup.
+			const tooSmall = findRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				79
+			);
+			expect(tooSmall).to.be.null;
+
+			const exact = findRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				80
+			);
+			expect(exact).to.not.be.null;
+			expect(exact!.hops[0].outgoingCltvValue).to.equal(80);
 		});
 	});
 

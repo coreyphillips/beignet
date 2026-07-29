@@ -542,7 +542,13 @@ export function findRoute(
 				update.feeProportionalMillionths
 			);
 			const newAmount = current.amountMsat + fee;
-			const newCltv = current.cltvValue + update.cltvExpiryDelta;
+			// The sender applies no delta of its own: its outgoing HTLC uses the
+			// downstream node's CLTV directly, so the source edge adds nothing
+			// to the lockup.
+			const newCltv =
+				upstreamNodeHex === sourceHex
+					? current.cltvValue
+					: current.cltvValue + update.cltvExpiryDelta;
 
 			// CLTV budget check: prune routes exceeding max lockup (Fix 3.4)
 			if (newCltv > maxCltvExpiry) continue;
@@ -863,7 +869,11 @@ function findRouteWithCapacityLimits(
 				update.feeProportionalMillionths
 			);
 			const newAmount = current.amountMsat + fee;
-			const newCltv = current.cltvValue + update.cltvExpiryDelta;
+			// The sender applies no delta of its own (see findRoute).
+			const newCltv =
+				upstreamNodeHex === sourceHex
+					? current.cltvValue
+					: current.cltvValue + update.cltvExpiryDelta;
 
 			// CLTV budget check: prune routes exceeding max lockup (see findRoute)
 			if (newCltv > maxCltvExpiry) continue;
