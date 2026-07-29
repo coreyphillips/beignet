@@ -76,12 +76,54 @@ class ControllableBackend implements IChainBackend {
 	}
 
 	private scriptHashCallbacks: Array<() => void> = [];
+	private subscribeSettlers: Array<{
+		resolve: () => void;
+		reject: (err: Error) => void;
+	}> = [];
+	/** When true, subscribeToScriptHash stays pending until settled by the test. */
+	deferSubscribe = false;
+	private txSettlers: Array<{
+		resolve: (raw: Buffer) => void;
+		reject: (err: Error) => void;
+	}> = [];
+	/** When true, getTransaction stays pending until settled by the test. */
+	deferGetTransaction = false;
 
-	async subscribeToScriptHash(
+	subscribeToScriptHash(
 		_scriptHash: string,
 		onChange: () => void
 	): Promise<void> {
 		this.scriptHashCallbacks.push(onChange);
+		if (!this.deferSubscribe) return Promise.resolve();
+		return new Promise((resolve, reject) => {
+			this.subscribeSettlers.push({ resolve, reject });
+		});
+	}
+
+	pendingSubscribeCount(): number {
+		return this.subscribeSettlers.length;
+	}
+
+	resolvePendingSubscribes(): void {
+		const settlers = this.subscribeSettlers;
+		this.subscribeSettlers = [];
+		for (const s of settlers) s.resolve();
+	}
+
+	failPendingSubscribes(): void {
+		const settlers = this.subscribeSettlers;
+		this.subscribeSettlers = [];
+		for (const s of settlers) s.reject(new Error('subscribe refused'));
+	}
+
+	pendingTxCount(): number {
+		return this.txSettlers.length;
+	}
+
+	resolvePendingTx(raw: Buffer): void {
+		const settlers = this.txSettlers;
+		this.txSettlers = [];
+		for (const s of settlers) s.resolve(raw);
 	}
 
 	/** Fire every scripthash subscription, as an Electrum status change would. */
@@ -98,14 +140,41 @@ class ControllableBackend implements IChainBackend {
 		});
 	}
 
-	async getTransaction(txid: string): Promise<Buffer> {
+	getTransaction(txid: string): Promise<Buffer> {
+		if (this.deferGetTransaction) {
+			return new Promise((resolve, reject) => {
+				this.txSettlers.push({ resolve, reject });
+			});
+		}
 		const tx = this.transactions.get(txid);
-		if (!tx) throw new Error(`no tx ${txid}`);
-		return tx;
+		if (!tx) return Promise.reject(new Error(`no tx ${txid}`));
+		return Promise.resolve(tx);
+	}
+
+	private broadcastSettlers: Array<{
+		resolve: (txid: string) => void;
+		reject: (err: Error) => void;
+	}> = [];
+	/** When true, broadcastTransaction stays pending until settled. */
+	deferBroadcast = false;
+
+	pendingBroadcastCount(): number {
+		return this.broadcastSettlers.length;
+	}
+
+	failPendingBroadcasts(): void {
+		const settlers = this.broadcastSettlers;
+		this.broadcastSettlers = [];
+		for (const s of settlers) s.reject(new Error('broadcast refused'));
 	}
 
 	async broadcastTransaction(rawTxHex: string): Promise<string> {
 		this.broadcastCalls.push(rawTxHex);
+		if (this.deferBroadcast) {
+			return new Promise((resolve, reject) => {
+				this.broadcastSettlers.push({ resolve, reject });
+			});
+		}
 		if (this.broadcastShouldFail) throw new Error('broadcast refused');
 		return crypto
 			.createHash('sha256')
@@ -597,6 +666,231 @@ describe('ChainWatcher teardown', function () {
 			expect(spent, 'the funding spend was not reported after stop').to.equal(
 				0
 			);
+		});
+	});
+
+	describe('operations that start before stop() and finish after', function () {
+		// The generation has to be captured at the START of the whole operation.
+		// Capturing it inside a downstream method does not help when that method
+		// is reached through an earlier, unguarded await: it captures the CURRENT
+		// generation and every guard passes.
+
+		it('does not install an output watch when getTransaction resolves after stop', async function () {
+			let reported = 0;
+			const manager = channelManager as unknown as {
+				handleOutputSpent: () => void;
+				handleOutputUnspent: () => void;
+			};
+			manager.handleOutputSpent = (): void => {
+				reported++;
+			};
+			manager.handleOutputUnspent = (): void => {
+				reported++;
+			};
+			watcher.on('output:spent', () => reported++);
+			watcher.on('error', () => {});
+
+			await watcher.start();
+			backend.simulateNewBlock(400);
+
+			// The tx whose output is being watched, and a later spend of it.
+			const watchedTx = new bitcoin.Transaction();
+			watchedTx.version = 2;
+			watchedTx.addInput(crypto.randomBytes(32), 0);
+			const pubkey = Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!);
+			const script = bitcoin.payments.p2wpkh({ pubkey }).output as Buffer;
+			watchedTx.addOutput(script, 20_000);
+			const watchedTxid = watchedTx.getId();
+
+			const spendTx = new bitcoin.Transaction();
+			spendTx.version = 2;
+			spendTx.addInput(Buffer.from(watchedTxid, 'hex').reverse(), 0);
+			spendTx.addOutput(script, 10_000);
+			backend.transactions.set(spendTx.getId(), spendTx.toBuffer());
+
+			backend.deferGetTransaction = true;
+			const pending = watcher.watchOutputByTxid(watchedTxid, 0).catch(() => {
+				/* not the subject */
+			});
+			await tick();
+			expect(backend.pendingTxCount(), 'the fetch is in flight').to.equal(1);
+
+			watcher.stop();
+			backend.deferGetTransaction = false;
+			backend.resolvePendingTx(watchedTx.toBuffer());
+			await pending;
+			await tick();
+
+			expect(
+				(watcher as unknown as { watchedOutputs: Map<string, unknown> })
+					.watchedOutputs.size,
+				'no watch was installed after stop'
+			).to.equal(0);
+
+			// The dangerous consequence, not just the internal map: a retained
+			// scripthash callback firing must not drive the ChannelManager.
+			backend.historyResponse = [{ txid: spendTx.getId(), height: 399 }];
+			backend.fireScriptHashes();
+			await tick();
+			await tick();
+			expect(reported, 'nothing was reported to the ChannelManager').to.equal(
+				0
+			);
+		});
+
+		it('does not begin a funding-spend check when the subscription resolves after stop', async function () {
+			let spent = 0;
+			(
+				channelManager as unknown as { handleFundingSpent: () => void }
+			).handleFundingSpent = (): void => {
+				spent++;
+			};
+			watcher.on('funding:spent', () => spent++);
+			watcher.on('error', () => {});
+
+			await watcher.start();
+			backend.simulateNewBlock(400);
+
+			const fundingTxid = 'ab'.repeat(32);
+			const closeTx = new bitcoin.Transaction();
+			closeTx.version = 2;
+			closeTx.addInput(Buffer.from(fundingTxid, 'hex').reverse(), 0);
+			const pubkey = Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!);
+			const script = bitcoin.payments.p2wpkh({ pubkey }).output as Buffer;
+			closeTx.addOutput(script, 10_000);
+			backend.transactions.set(closeTx.getId(), closeTx.toBuffer());
+			// The spend is already visible, so any check that runs will find it.
+			backend.historyResponse = [{ txid: closeTx.getId(), height: 399 }];
+
+			backend.deferSubscribe = true;
+			const pending = watcher
+				.watchFundingSpendDuringSplice(
+					crypto.randomBytes(32),
+					fundingTxid,
+					0,
+					script,
+					'11'.repeat(32)
+				)
+				.catch(() => {
+					/* not the subject */
+				});
+			await tick();
+			expect(
+				backend.pendingSubscribeCount(),
+				'the subscription is in flight'
+			).to.equal(1);
+
+			watcher.stop();
+			// checkFundingSpent runs only after this resolves, so it would capture
+			// the post-stop generation and consider itself current.
+			backend.resolvePendingSubscribes();
+			await pending;
+			await tick();
+			await tick();
+
+			expect(spent, 'the check did not run after stop').to.equal(0);
+		});
+
+		it('does not requeue a funding watch when its subscription rejects after stop', async function () {
+			watcher.on('error', () => {});
+			await watcher.start();
+
+			const script = bitcoin.payments.p2wpkh({
+				pubkey: Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!)
+			}).output as Buffer;
+
+			backend.deferSubscribe = true;
+			const pending = watcher
+				.watchFundingOutput(
+					crypto.randomBytes(32),
+					'cd'.repeat(32),
+					0,
+					1,
+					script
+				)
+				.catch(() => {
+					/* not the subject */
+				});
+			await tick();
+			expect(backend.pendingSubscribeCount()).to.equal(1);
+
+			watcher.stop();
+			backend.failPendingSubscribes();
+			await pending;
+			await tick();
+
+			expect(
+				(watcher as unknown as { failedFundingWatches: unknown[] })
+					.failedFundingWatches.length,
+				'the queue stop() cleared stayed clear'
+			).to.equal(0);
+		});
+
+		it('does not requeue an output watch when its subscription rejects after stop', async function () {
+			watcher.on('error', () => {});
+			await watcher.start();
+
+			const script = bitcoin.payments.p2wpkh({
+				pubkey: Buffer.from(ecc.pointFromScalar(crypto.randomBytes(32))!)
+			}).output as Buffer;
+
+			backend.deferSubscribe = true;
+			const pending = watcher
+				.watchOutput('ef'.repeat(32), 0, script)
+				.catch(() => {
+					/* not the subject */
+				});
+			await tick();
+			expect(backend.pendingSubscribeCount()).to.equal(1);
+
+			watcher.stop();
+			backend.failPendingSubscribes();
+			await pending;
+			await tick();
+
+			expect(
+				(watcher as unknown as { failedOutputWatches: unknown[] })
+					.failedOutputWatches.length,
+				'the queue stop() cleared stayed clear'
+			).to.equal(0);
+		});
+
+		it('does not restore a failed broadcast when its retry rejects after stop', async function () {
+			watcher.on('broadcast:failure', () => {});
+			watcher.on('error', () => {});
+			await watcher.start();
+
+			// Seed the retry queue as a failed broadcast would.
+			const tx = makeTx();
+			const entry = {
+				rawTx: tx,
+				txidHex: bitcoin.Transaction.fromBuffer(tx).getId(),
+				retryCount: 0
+			};
+			(
+				watcher as unknown as { failedBroadcasts: unknown[] }
+			).failedBroadcasts.push(entry);
+
+			// The retry runs on the next block and fails.
+			backend.broadcastShouldFail = true;
+			backend.deferBroadcast = true;
+			backend.simulateNewBlock(500);
+			await tick();
+			expect(
+				backend.pendingBroadcastCount(),
+				'the retry is in flight'
+			).to.equal(1);
+
+			watcher.stop();
+			backend.failPendingBroadcasts();
+			await tick();
+			await tick();
+
+			expect(
+				(watcher as unknown as { failedBroadcasts: unknown[] }).failedBroadcasts
+					.length,
+				'the queue stop() cleared stayed clear'
+			).to.equal(0);
 		});
 	});
 
