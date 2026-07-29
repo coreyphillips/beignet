@@ -7221,7 +7221,9 @@ export class LightningNode extends EventEmitter {
 			invoice.paymentSecret &&
 			invoice.featureBits?.hasFeature(Feature.BASIC_MPP)
 		) {
-			// Try multi-path routing as fallback
+			// Try multi-path routing as fallback. Retries re-enter here with the
+			// retry context's exclusion set, so failed SCIDs must be excluded
+			// from MPP parts exactly as they are from single-path routes.
 			const multiRoute = findMultiPathRoute(
 				this.graph,
 				sourceNodeId,
@@ -7233,7 +7235,8 @@ export class LightningNode extends EventEmitter {
 				this.missionControl,
 				invoice.routingHints,
 				undefined,
-				localChannels
+				localChannels,
+				excludedChannels
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -7246,7 +7249,8 @@ export class LightningNode extends EventEmitter {
 					invoiceStr,
 					invoice,
 					multiRoute,
-					finalCltvExpiry
+					finalCltvExpiry,
+					excludedChannels
 				);
 			}
 		}
@@ -7512,12 +7516,13 @@ export class LightningNode extends EventEmitter {
 	 */
 	private noteHeightSkewFailure(
 		payment: IPaymentInfo,
-		failureData?: Buffer
+		failureData?: Buffer,
+		route: IPaymentInfo['route'] = payment.route
 	): boolean {
 		if (payment.failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) {
 			return false;
 		}
-		const finalHopIndex = (payment.route?.hops.length ?? 0) - 1;
+		const finalHopIndex = (route?.hops.length ?? 0) - 1;
 		if (finalHopIndex < 0 || payment.failureSourceIndex !== finalHopIndex) {
 			return false;
 		}
@@ -7791,7 +7796,8 @@ export class LightningNode extends EventEmitter {
 			totalAmountMsat: bigint;
 			totalFeeMsat: bigint;
 		},
-		_finalCltvExpiry: number
+		_finalCltvExpiry: number,
+		excludedChannels?: Set<string>
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -7807,11 +7813,13 @@ export class LightningNode extends EventEmitter {
 		};
 		this.payments.set(hashHex, payment);
 
-		// Store retry context
+		// Store retry context. Seed it with the exclusions this attempt was
+		// routed under so a retry keeps avoiding those SCIDs and the failure
+		// handler accumulates onto the same set.
 		if (!this.paymentRetryContexts.has(hashHex)) {
 			this.paymentRetryContexts.set(hashHex, {
 				invoiceStr,
-				excludedChannels: new Set(),
+				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries
 			});
@@ -7888,7 +7896,9 @@ export class LightningNode extends EventEmitter {
 				'saveHtlcPaymentMapping'
 			);
 
-			// Store shared secrets on the first part for failure decryption
+			// The first part doubles as the payment-level route/secrets (display
+			// and single-path fallbacks); every part keeps its own for failure
+			// decryption, since each part is a distinct onion.
 			if (!payment.sharedSecrets) {
 				payment.sharedSecrets = sharedSecrets;
 				payment.route = partRoute as IPaymentInfo['route'];
@@ -7899,7 +7909,8 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				htlcId,
 				amountMsat: amount,
-				status: PaymentStatus.PENDING
+				status: PaymentStatus.PENDING,
+				sharedSecrets
 			});
 
 			const result = this.channelManager.addHtlc(
@@ -7938,6 +7949,14 @@ export class LightningNode extends EventEmitter {
 				this.emit('payment:failed', payment);
 				return payment;
 			}
+		}
+
+		// With a synchronous transport a part can fail back before the next
+		// part is even dispatched, so resolution-time cleanup is deferred
+		// until here (see IOutboundMppState.dispatchComplete).
+		mppState.dispatchComplete = true;
+		if (mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)) {
+			this.outboundMppPayments.delete(hashHex);
 		}
 
 		return payment;
@@ -9676,10 +9695,22 @@ export class LightningNode extends EventEmitter {
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return;
 
+		// MPP: every part is a distinct onion, so a returned failure decrypts
+		// only with the secrets of the part it came back on, and its culpable
+		// hop lives on that part's route. The first part's secrets on the
+		// payment record are wrong for every later part.
+		const mppState = this.outboundMppPayments.get(hashHex);
+		const failedPart = mppState?.parts.find(
+			(part) => part.htlcId === htlcId && part.channelId.equals(channelId)
+		);
+		if (failedPart) failedPart.status = PaymentStatus.FAILED;
+		const failureSecrets = failedPart?.sharedSecrets ?? payment.sharedSecrets;
+		const failureRoute = failedPart?.route ?? payment.route;
+
 		// Decrypt failure message if we have shared secrets
 		let failureData: Buffer | undefined;
-		if (payment.sharedSecrets && reason.length > 0) {
-			const result = decryptFailureMessage(payment.sharedSecrets, reason);
+		if (failureSecrets && reason.length > 0) {
+			const result = decryptFailureMessage(failureSecrets, reason);
 			if (result) {
 				payment.failureCode = result.failure.failureCode;
 				payment.failureSourceIndex = result.originIndex;
@@ -9700,12 +9731,16 @@ export class LightningNode extends EventEmitter {
 		// transient case, where it rejected our expiry only because it is ahead of
 		// us. This records that height so the retry below is built against it
 		// rather than repeating the same stale expiry.
-		const heightSkew = this.noteHeightSkewFailure(payment, failureData);
+		const heightSkew = this.noteHeightSkewFailure(
+			payment,
+			failureData,
+			failureRoute
+		);
 
 		// Record failure in MissionControl for future pathfinding. Skipped for
 		// height skew: no channel misbehaved, our expiry was stale, so penalising
 		// the route would degrade pathfinding over an innocent channel.
-		const culpableScid = this.getCulpableHopScid(payment);
+		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
 		if (culpableScid && !heightSkew) {
 			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
@@ -9728,8 +9763,17 @@ export class LightningNode extends EventEmitter {
 		// detected above.
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
 		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
+		// MPP payments are never auto-retried here: redispatching the FULL
+		// invoice while sibling parts are still held by the recipient lets the
+		// old parts and the retry's parts sum past total_msat, and the
+		// recipient fulfills every held part, overpaying the invoice. Until a
+		// part-level retry exists, a failed part fails the payment; the
+		// recipient releases the sibling holds at its own MPP timeout. The
+		// culpable SCID is still recorded in MissionControl above, and the
+		// exclusion set still serves manual re-sends.
 		if (
 			retryCtx &&
+			!mppState &&
 			retryCtx.retryCount < maxRetries &&
 			(heightSkew || !this.isPermanentFailure(payment.failureCode))
 		) {
@@ -9792,9 +9836,13 @@ export class LightningNode extends EventEmitter {
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
-				// The retry never left the node. Restore the attempt that did fail,
-				// keeping its original onion failure, and append why the retry could
-				// not be sent rather than discarding that reason silently.
+				// The retry never left the node. Roll the counter back so
+				// retryCount keeps meaning "retries actually dispatched" (with
+				// exclusions honored by MPP too, an exhausted graph lands here
+				// routinely). Restore the attempt that did fail, keeping its
+				// original onion failure, and append why the retry could not be
+				// sent rather than discarding that reason silently.
+				retryCtx.retryCount--;
 				this.payments.set(hashHex, payment);
 				payment.retryCount = retryCtx.retryCount;
 				const detail = err instanceof Error ? err.message : String(err);
@@ -9804,10 +9852,23 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// No retry or retry exhausted — mark as permanently failed
+		// No retry or retry exhausted — mark as permanently failed. Sibling
+		// MPP parts fail back one at a time, each landing here with its own
+		// htlc mapping; the payment-level transition (timestamp + event) must
+		// happen only once.
 		this.paymentRetryContexts.delete(hashHex);
+		const firstFailure = payment.status !== PaymentStatus.FAILED;
 		payment.status = PaymentStatus.FAILED;
-		payment.completedAt = Date.now();
+		if (firstFailure) payment.completedAt = Date.now();
+		// Keep the MPP state until dispatch has finished and every part has
+		// resolved, so each sibling failure still decrypts with its own
+		// part's secrets; then drop it.
+		if (
+			mppState?.dispatchComplete &&
+			mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)
+		) {
+			this.outboundMppPayments.delete(hashHex);
+		}
 		// Clean up HTLC payment mapping
 		this.htlcPaymentMap.delete(key);
 		if (this.storage) {
@@ -9820,7 +9881,7 @@ export class LightningNode extends EventEmitter {
 			this.persistPayment(payment.paymentHash);
 			this.persistChannel(channelId);
 		}
-		this.emit('payment:failed', payment);
+		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
 	/**
@@ -9841,16 +9902,19 @@ export class LightningNode extends EventEmitter {
 	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
 	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
 	 */
-	private getCulpableHopScid(payment: IPaymentInfo): string | undefined {
+	private getCulpableHopScid(
+		payment: IPaymentInfo,
+		route: IPaymentInfo['route'] = payment.route
+	): string | undefined {
 		const index = payment.failureSourceIndex;
-		if (!payment.route || index === undefined) return undefined;
+		if (!route || index === undefined) return undefined;
 		const code = payment.failureCode;
 		if (code === undefined) return undefined;
 
 		if (!this.isChannelScopedFailure(code)) return undefined;
 
 		// The final hop has no outgoing channel, so there is nothing to blame.
-		const outgoingHop = payment.route.hops[index + 1];
+		const outgoingHop = route.hops[index + 1];
 		return outgoingHop?.shortChannelId.toString('hex');
 	}
 

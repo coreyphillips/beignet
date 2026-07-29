@@ -624,6 +624,12 @@ export interface IOutboundMppPart {
 	htlcId: bigint;
 	amountMsat: bigint;
 	status: PaymentStatus;
+	/**
+	 * This part's own onion shared secrets. Every part is a distinct onion,
+	 * so a returned failure can only be decrypted (and its culpable hop
+	 * attributed) with the secrets of the part it came back on.
+	 */
+	sharedSecrets: Buffer[];
 }
 
 export interface ILightningBalance {
@@ -643,6 +649,13 @@ export interface IOutboundMppState {
 	totalMsat: bigint;
 	parts: IOutboundMppPart[];
 	createdAt: number;
+	/**
+	 * Set once every part has been dispatched. In a synchronous transport a
+	 * part can fail back while later parts are still being sent; the state
+	 * must not be dropped until dispatch has finished AND every part has
+	 * resolved, or the late parts' failures lose their decryption context.
+	 */
+	dispatchComplete?: boolean;
 }
 
 // ─── Typed Payment Errors ───

@@ -211,6 +211,163 @@ describe('MPP (Phase 7)', function () {
 			// totalFeeMsat should be non-negative
 			expect(Number(result!.totalFeeMsat)).to.be.greaterThanOrEqual(0);
 		});
+
+		it('excludes retry-failed channels from every part', function () {
+			const { graph, source, dest } = buildParallelGraph();
+			const excludedScid = makeScid(100, 1, 0).toString('hex');
+
+			// Path 1's first channel is excluded: the part must take path 2.
+			const result = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Set([excludedScid])
+			);
+			expect(result).to.not.be.null;
+			for (const part of result!.parts) {
+				for (const hop of part.hops) {
+					expect(hop.shortChannelId.toString('hex')).to.not.equal(excludedScid);
+				}
+			}
+
+			// 80k needs both paths; with path 1 excluded only 50k is reachable,
+			// so the split must fail rather than route through the exclusion.
+			const tooBig = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				80_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				new Set([excludedScid])
+			);
+			expect(tooBig).to.be.null;
+		});
+
+		it('enforces the CLTV lockup budget on every part at the exact boundary', function () {
+			const { graph, source, dest } = buildParallelGraph();
+
+			// source -> mid -> dest with 40-delta channels and a 40-block final
+			// expiry: the source's outgoing HTLC locks 40 (final) + 40 (mid's
+			// delta) = 80 blocks. The source applies no delta of its own, so a
+			// 79-block budget must refuse the route and an 80-block budget must
+			// accept it.
+			const tooSmall = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				79
+			);
+			expect(tooSmall).to.be.null;
+
+			const exact = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				80
+			);
+			expect(exact).to.not.be.null;
+			expect(exact!.parts[0].hops[0].outgoingCltvValue).to.equal(80);
+		});
+
+		it('does not count the local channel delta against a direct payment', function () {
+			// One direct channel source -> dest with a 40 delta: the sender
+			// never applies its own channel's delta, so a 40-block final expiry
+			// fits a 40-block budget exactly.
+			const graph = new NetworkGraph();
+			const source = makeNodeId(0x01);
+			const dest = makeNodeId(0xff);
+			const scid = makeScid(200, 1, 0);
+			graph.addChannelAnnouncement(makeAnnouncement(scid, source, dest));
+			const isN1First = Buffer.compare(source, dest) < 0;
+			graph.applyChannelUpdate(
+				makeUpdate(scid, isN1First ? 0 : 1, 50_000_000n)
+			);
+			graph.applyChannelUpdate(
+				makeUpdate(scid, isN1First ? 1 : 0, 50_000_000n)
+			);
+
+			const direct = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				10_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				40
+			);
+			expect(direct).to.not.be.null;
+			expect(direct!.parts[0].hops[0].outgoingCltvValue).to.equal(40);
+		});
+
+		it('findRoute applies the same source-edge CLTV accounting', function () {
+			const { graph, source, dest } = buildParallelGraph();
+
+			// Same boundary as the MPP case: 80 blocks of real lockup.
+			const tooSmall = findRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				79
+			);
+			expect(tooSmall).to.be.null;
+
+			const exact = findRoute(
+				graph,
+				source,
+				dest,
+				40_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				80
+			);
+			expect(exact).to.not.be.null;
+			expect(exact!.hops[0].outgoingCltvValue).to.equal(80);
+		});
 	});
 
 	describe('MPP Receiver Aggregation', function () {

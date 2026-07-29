@@ -14,6 +14,13 @@ import {
 	PaymentStatus,
 	IOutboundMppState
 } from '../../src/lightning/node/types';
+import { createFailureMessage } from '../../src/lightning/onion/failures';
+import {
+	TEMPORARY_NODE_FAILURE,
+	TEMPORARY_CHANNEL_FAILURE
+} from '../../src/lightning/onion/types';
+import { PaymentDirection } from '../../src/lightning/node/types';
+import { IRoute } from '../../src/lightning/gossip/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -672,6 +679,200 @@ describe('MPP Sending (Phase 5)', function () {
 				PaymentStatus.COMPLETED,
 				PaymentStatus.FAILED
 			]);
+		});
+
+		it('a failed part never redispatches the full invoice and decrypts with its own secrets', async function () {
+			// Non-dust HTLCs need real HTLC signatures in the loopback harness.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(64),
+				htlcBasepointSecret: htlcSecretFor(64)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(65),
+				htlcBasepointSecret: htlcSecretFor(65)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			// Two real channels; the amount below fits neither alone, so the
+			// payment must split over both local-channel edges.
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			// Bob rejects every incoming part with a retryable failure and
+			// counts what arrives. Anything above the original part count
+			// means the whole invoice was redispatched after a part failure,
+			// which lets the receiver hold old + new parts summing past
+			// total_msat and overpay the invoice.
+			let attempts = 0;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const bobAny = bob as any;
+			bobAny.handleFinalHopHtlc = (channelId: Buffer, htlcId: bigint): void => {
+				attempts++;
+				const key = `${channelId.toString('hex')}:${htlcId}`;
+				const sharedSecret = bobAny.receivedHtlcSharedSecrets.get(key);
+				bobAny.channelManager.failHtlc(
+					channelId,
+					htlcId,
+					createFailureMessage(sharedSecret, TEMPORARY_NODE_FAILURE)
+				);
+			};
+
+			let failedEvents = 0;
+			alice.on('payment:failed', () => failedEvents++);
+
+			// Manual invoice: createInvoice would embed a routing hint, and a
+			// hint edge carries no capacity, letting a single-path route
+			// swallow the full amount. Bob fails every part before invoice
+			// lookup, so the random payment hash never matters.
+			const bobConfig = makeNodeConfig(65);
+			const feats = FeatureFlags.empty();
+			feats.setCompulsory(Feature.TLV_ONION);
+			feats.setCompulsory(Feature.PAYMENT_SECRET);
+			feats.setCompulsory(Feature.BASIC_MPP);
+			const invoiceStr = encodeInvoice({
+				network: Network.REGTEST,
+				paymentHash: crypto.randomBytes(32),
+				paymentSecret: crypto.randomBytes(32),
+				description: 'mpp failed part',
+				amountMsat: 250_000_000n,
+				payeeNodeKey: getPublicKey(bobConfig.nodePrivateKey),
+				privateKey: bobConfig.nodePrivateKey,
+				featureBits: feats
+			});
+
+			const payment = alice.sendPayment(invoiceStr);
+			const attemptsAtReturn = attempts;
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(attemptsAtReturn, 'exactly the original two parts').to.equal(2);
+			expect(attempts, 'no redispatch after the failures settled').to.equal(2);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			expect(failedEvents, 'payment:failed emitted once').to.equal(1);
+
+			// The failure returned on the SECOND part is a distinct onion; it
+			// only decrypts with that part's own secrets. With the first
+			// part's secrets no hop HMAC matches and the code is lost.
+			expect(payment.failureCode).to.equal(TEMPORARY_NODE_FAILURE);
+			expect(payment.failureReason ?? '').to.not.match(
+				/could not be decrypted/
+			);
+
+			// Every part resolved and dispatch finished: state is dropped.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a channel-scoped failure on the second part penalizes that part culpable SCID', function () {
+			// Handler-level regression for per-part attribution: a failure
+			// returned on the SECOND part must be decrypted with that part's
+			// secrets and blamed against that part's route. The parts are
+			// installed directly so part 2 can have a two-hop route whose
+			// first hop errs with a channel-scoped code, which blames the
+			// erring node's OUTGOING channel (part 2's second hop).
+			const alice = createNode(66);
+			const bob = createNode(67);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob, 200_000n);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const aliceAny = alice as any;
+			const hash = crypto.randomBytes(32);
+			const hashHex = hash.toString('hex');
+
+			const mkRoute = (scids: Buffer[]): IRoute => ({
+				hops: scids.map((scid) => ({
+					pubkey: crypto.randomBytes(33),
+					shortChannelId: scid,
+					amountToForwardMsat: 50_000_000n,
+					outgoingCltvValue: 40,
+					cltvExpiryDelta: 40,
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0
+				})),
+				totalAmountMsat: 50_000_000n,
+				totalCltvDelta: 40,
+				totalFeeMsat: 0n
+			});
+			const part1Scid = makeScid(920, 1, 0);
+			const part2FirstScid = makeScid(920, 2, 0);
+			const part2CulpableScid = makeScid(920, 3, 0);
+			const part1Secrets = [crypto.randomBytes(32)];
+			const part2Secrets = [crypto.randomBytes(32), crypto.randomBytes(32)];
+
+			aliceAny.payments.set(hashHex, {
+				paymentHash: hash,
+				amountMsat: 100_000_000n,
+				status: PaymentStatus.PENDING,
+				direction: PaymentDirection.OUTGOING,
+				createdAt: Date.now(),
+				// Payment-level metadata is the FIRST part's, as sendPaymentMpp
+				// stores it; attribution must not fall back to it.
+				sharedSecrets: part1Secrets,
+				route: mkRoute([part1Scid])
+			});
+			aliceAny.outboundMppPayments.set(hashHex, {
+				paymentHash: hash,
+				totalMsat: 100_000_000n,
+				createdAt: Date.now(),
+				dispatchComplete: true,
+				parts: [
+					{
+						route: mkRoute([part1Scid]),
+						channelId,
+						htlcId: 1n,
+						amountMsat: 50_000_000n,
+						status: PaymentStatus.PENDING,
+						sharedSecrets: part1Secrets
+					},
+					{
+						route: mkRoute([part2FirstScid, part2CulpableScid]),
+						channelId,
+						htlcId: 2n,
+						amountMsat: 50_000_000n,
+						status: PaymentStatus.PENDING,
+						sharedSecrets: part2Secrets
+					}
+				]
+			});
+			aliceAny.htlcPaymentMap.set(
+				`${channelId.toString('hex')}:offered-2`,
+				hashHex
+			);
+
+			// The failure originates at part 2's first hop (origin index 0).
+			const reason = createFailureMessage(
+				part2Secrets[0],
+				TEMPORARY_CHANNEL_FAILURE
+			);
+			aliceAny.handleHtlcFailed(channelId, 2n, reason);
+
+			const payment = aliceAny.payments.get(hashHex);
+			expect(payment.status).to.equal(PaymentStatus.FAILED);
+			// Decrypted with part 2's secrets: code and origin recovered.
+			expect(payment.failureCode).to.equal(TEMPORARY_CHANNEL_FAILURE);
+			expect(payment.failureSourceIndex).to.equal(0);
+
+			// The penalty landed on part 2's culpable outgoing SCID, and NOT
+			// on the first part's route (the old attribution target).
+			const mc = aliceAny.missionControl;
+			expect(
+				Number(mc.getPenalty(part2CulpableScid.toString('hex')))
+			).to.be.greaterThan(0);
+			expect(Number(mc.getPenalty(part1Scid.toString('hex')))).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
 		});
 
 		it('should not attempt MPP when the invoice does not advertise basic_mpp (S-4.M8)', function () {
