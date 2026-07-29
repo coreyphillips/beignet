@@ -29,7 +29,10 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG
+} from '../../src/lightning/channel/types';
 
 bitcoin.initEccLib(ecc);
 
@@ -128,6 +131,20 @@ class ControllableBackend implements IChainBackend {
 
 	subscriptionCount(): number {
 		return this.scriptHashCallbacks.length;
+	}
+
+	// ElectrumBackend surface the node reaches for after restoration. Present
+	// here so the startup continuation can be observed.
+	reconnectMonitorStarts = 0;
+	reconnectMonitorStops = 0;
+	onResubscribed: (() => void) | null = null;
+
+	startReconnectMonitor(): void {
+		this.reconnectMonitorStarts++;
+	}
+
+	stopReconnectMonitor(): void {
+		this.reconnectMonitorStops++;
 	}
 
 	/** Fire every scripthash subscription, as an Electrum status change would. */
@@ -391,6 +408,87 @@ describe('ChainWatcher teardown at node level', function () {
 			'no funding watch was registered after destroy'
 		).to.equal(0);
 		expect(managerTouched, 'the ChannelManager was not touched').to.equal(0);
+	});
+
+	it('does not resume chain startup when restoration resolves after destroy', async function () {
+		const backend = new ControllableBackend();
+		const config = makeNodeConfig(crypto.randomBytes(32));
+		config.chainBackend = backend;
+		const node = new LightningNode(config);
+		node.on('node:error', () => {});
+
+		const watcher = node.getChainWatcher();
+		if (!watcher) throw new Error('expected a chain watcher');
+		watcher.on('error', () => {});
+
+		// One channel in the restore loop, closed with a stored mutual close, so
+		// restoration reaches a DIRECT backend broadcast. That call is outside
+		// the watcher entirely, so the watcher's own lifecycle gate cannot stop
+		// it; only the node's can.
+		const closeTxHex = makeTx().toString('hex');
+		const fundingTxBuf = makeTx();
+		const fundingTx = bitcoin.Transaction.fromBuffer(fundingTxBuf);
+		const fakeChannel = {
+			getFullState: (): Record<string, unknown> => ({
+				channelId: crypto.randomBytes(32),
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingTxid: Buffer.from(fundingTx.getId(), 'hex').reverse(),
+				fundingOutputIndex: 0,
+				minimumDepth: 1,
+				state: ChannelState.CLOSED,
+				lastCooperativeCloseTxHex: closeTxHex,
+				remoteBasepoints: undefined,
+				dataLossDetected: true
+			})
+		};
+		const manager = (
+			node as unknown as {
+				channelManager: {
+					listChannels: () => unknown[];
+					getMonitor: () => undefined;
+				};
+			}
+		).channelManager;
+		manager.listChannels = (): unknown[] => [fakeChannel];
+		manager.getMonitor = (): undefined => undefined;
+
+		// Hold the recovered-funding fetch open so destroy() lands mid-restore.
+		backend.deferGetTransaction = true;
+		const startup = node.startChainWatcher().catch(() => {
+			/* not the subject */
+		});
+		await tick();
+		await tick();
+		expect(
+			backend.pendingTxCount(),
+			'restoration is mid-flight'
+		).to.be.greaterThan(0);
+		const broadcastsBefore = backend.broadcastCalls.length;
+
+		node.destroy();
+		expect(
+			backend.reconnectMonitorStops,
+			'destroy stopped the reconnect monitor'
+		).to.equal(1);
+
+		backend.deferGetTransaction = false;
+		backend.resolvePendingTx(fundingTxBuf);
+		await startup;
+		await tick();
+		await tick();
+
+		expect(
+			backend.reconnectMonitorStarts,
+			'the reconnect monitor destroy() stopped was not restarted'
+		).to.equal(0);
+		expect(
+			backend.onResubscribed,
+			'no resubscribe callback was installed'
+		).to.equal(null);
+		expect(
+			backend.broadcastCalls.length - broadcastsBefore,
+			'nothing was broadcast after destroy'
+		).to.equal(0);
 	});
 });
 
