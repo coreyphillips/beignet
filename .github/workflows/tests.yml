@@ -54,6 +54,11 @@ jobs:
       - name: Run CLI unit tests
         run: npm run test:cli
 
+      # daemon-security and daemon-integration need the live Electrum the
+      # regtest stack already provides; test:cli deliberately excludes them.
+      - name: Run daemon security and integration tests
+        run: npm run test:integration
+
       - name: Dump docker logs on failure
         if: failure()
         uses: jwalton/gh-docker-logs@v2

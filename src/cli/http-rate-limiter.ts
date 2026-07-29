@@ -1,6 +1,7 @@
 /**
  * HttpRateLimiter: Token bucket rate limiter for the HTTP daemon.
- * Keyed by client identifier (API token or IP address).
+ * Keyed by peer address; the daemon consults it before authentication so
+ * failed auth attempts are throttled too.
  * Opt-in — disabled by default unless rateLimit is configured.
  */
 
