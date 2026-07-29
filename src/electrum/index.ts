@@ -1186,14 +1186,18 @@ export class Electrum {
 	}
 
 	private publishConnectionChange(isConnected: boolean): void {
-		if (
-			this.latestConnectionState !== isConnected &&
-			!this.wallet.isSwitchingNetworks
-		) {
-			this.sendMessage('connectedToElectrum', isConnected);
-			this.connectedToElectrum = isConnected;
-			this.latestConnectionState = isConnected;
-		}
+		const stateChanged = this.latestConnectionState !== isConnected;
+		// Internal truth always tracks, including mid-switch: the reconnect
+		// guards read connectedToElectrum, and a stale true would survive a
+		// failed switch connect otherwise.
+		this.connectedToElectrum = isConnected;
+		// Externally observable transition events stay suppressed during a
+		// switch. latestConnectionState is deliberately left alone then, so
+		// the first check after the switch announces the final state instead
+		// of assuming it was already published.
+		if (this.wallet.isSwitchingNetworks || !stateChanged) return;
+		this.sendMessage('connectedToElectrum', isConnected);
+		this.latestConnectionState = isConnected;
 	}
 
 	public async disconnect(): Promise<void> {
