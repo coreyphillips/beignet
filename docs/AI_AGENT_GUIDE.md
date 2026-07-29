@@ -672,7 +672,7 @@ await node.gracefulShutdown();
 - **Spending Limits**: Set `dailySpendLimitSats` to cap daily agent spending
 - **Idempotency Keys**: Use `X-Idempotency-Key` header on payment requests to prevent duplicates
 - **Webhook Secrets**: Use HMAC-SHA256 verification (secrets are hashed in storage, never stored plaintext)
-- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Health and metrics endpoints are exempt.
+- **Rate Limiting**: Enable `rateLimit` option to protect against runaway agent loops (429 `RATE_LIMITED` response). Health endpoints are exempt; `/metrics` is auth-gated (it reports balances) unless `metricsPublic` is set.
 
 ## Mainnet Checklist
 

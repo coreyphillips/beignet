@@ -5,6 +5,7 @@
  */
 
 import * as http from 'http';
+import * as net from 'net';
 import * as https from 'https';
 import * as fs from 'fs';
 import { Console } from 'console';
@@ -44,6 +45,14 @@ export interface DaemonOptions extends BeignetNodeOptions {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Serve GET /metrics without authentication (balances, channel and peer
+	 *  counts). Off by default: metrics disclose finances to anyone who can
+	 *  reach the port. */
+	metricsPublic?: boolean;
+	/** Escape hatch for deliberately insecure setups: allows a non-loopback
+	 *  bind without authentication and wildcard CORS without authentication,
+	 *  both refused at startup otherwise. */
+	insecure?: boolean;
 }
 
 const MAX_BODY_BYTES = 1_048_576; // 1 MB
@@ -111,7 +120,12 @@ export async function parseBody(
 			try {
 				resolve(JSON.parse(Buffer.concat(chunks).toString()));
 			} catch {
-				resolve({});
+				// A truncated payment body must be a parse error, not an empty
+				// body that answers "bolt11 required" and collides every
+				// malformed request onto one idempotency bodyHash.
+				reject(
+					new BeignetError('INVALID_JSON', 'Request body is not valid JSON')
+				);
 			}
 		});
 		req.on('error', () => {
@@ -126,13 +140,65 @@ export async function parseBody(
 	});
 }
 
-// Routes exempt from authentication
+// Routes exempt from authentication. GET /metrics is deliberately absent:
+// it reports balances, so it is auth-gated unless metricsPublic opts out.
 export const AUTH_EXEMPT_ROUTES = new Set([
 	'GET /health',
 	'GET /ready',
-	'GET /openapi.json',
-	'GET /metrics'
+	'GET /openapi.json'
 ]);
+
+/** HTTP status for a failure envelope; unmapped codes are server faults. */
+const STATUS_BY_ERROR_CODE: Record<string, number> = {
+	INVALID_PARAMS: 400,
+	INVALID_JSON: 400,
+	UNAUTHORIZED: 401,
+	FORBIDDEN: 403,
+	MNEMONIC_REQUIRES_AUTH: 403,
+	NOT_FOUND: 404,
+	IDEMPOTENCY_CONFLICT: 409,
+	BODY_TOO_LARGE: 413,
+	RATE_LIMITED: 429
+};
+
+function statusForErrorCode(code: string): number {
+	return STATUS_BY_ERROR_CODE[code] ?? 500;
+}
+
+/** End the response, mapping a failure envelope to its HTTP status. */
+function endWithResult(res: http.ServerResponse, result: unknown): void {
+	const failureLike = result as { ok?: boolean; error?: { code?: string } };
+	if (failureLike?.ok === false && failureLike.error?.code) {
+		res.statusCode = statusForErrorCode(failureLike.error.code);
+	}
+	res.end(JSON.stringify(result));
+}
+
+/**
+ * Read an optional integer query parameter, throwing INVALID_PARAMS on a
+ * non-integer value instead of letting NaN silently change query semantics
+ * (a NaN bound in SQLite matches nothing, which reads as an empty ledger
+ * rather than an invalid query).
+ */
+export function parseIntParam(
+	query: URLSearchParams,
+	name: string,
+	opts: { min?: number; max?: number } = {}
+): number | undefined {
+	const raw = query.get(name);
+	if (raw === null || raw === '') return undefined;
+	const value = Number(raw);
+	if (!Number.isFinite(value) || !Number.isInteger(value)) {
+		throw new BeignetError('INVALID_PARAMS', `${name} must be an integer`);
+	}
+	if (opts.min !== undefined && value < opts.min) {
+		throw new BeignetError('INVALID_PARAMS', `${name} must be >= ${opts.min}`);
+	}
+	if (opts.max !== undefined && value > opts.max) {
+		throw new BeignetError('INVALID_PARAMS', `${name} must be <= ${opts.max}`);
+	}
+	return value;
+}
 
 /**
  * Node events relayed to SSE clients and webhooks. Per-HTLC events are opt-in
@@ -175,6 +241,29 @@ export async function startDaemon(
 	// Validates apiKeys (names/keys/scopes) up front; throws INVALID_PARAMS
 	// on bad config before the node is created.
 	const authenticator = new ApiKeyAuthenticator(opts.apiToken, opts.apiKeys);
+	// Refuse plainly dangerous configurations before the node is created. A
+	// wallet daemon reachable beyond loopback with no authentication hands
+	// /send, /channel/forceclose and /mnemonic to the whole network segment;
+	// wildcard CORS without authentication lets any page the operator visits
+	// drive those same routes. `insecure: true` is the deliberate escape.
+	// A literal loopback IP or the localhost name only: a HOSTNAME beginning
+	// with "127." (e.g. 127.example.com) could resolve anywhere.
+	const isLoopbackHost =
+		host === 'localhost' ||
+		host === '::1' ||
+		(net.isIPv4(host) && host.startsWith('127.'));
+	if (!isLoopbackHost && !authenticator.enabled && opts.insecure !== true) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			`Refusing to bind ${host} without authentication. Configure apiToken or apiKeys, or set insecure: true to accept the risk.`
+		);
+	}
+	if (opts.cors === true && !authenticator.enabled && opts.insecure !== true) {
+		throw new BeignetError(
+			'INVALID_PARAMS',
+			'Refusing wildcard CORS without authentication. Configure apiToken or apiKeys, set an explicit cors origin, or set insecure: true to accept the risk.'
+		);
+	}
 	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
 	// logLevel creates a console logger on stderr (stdout stays reserved for
 	// command output). With neither, the daemon stays silent as before.
@@ -259,9 +348,12 @@ export async function startDaemon(
 			const filter: Record<string, unknown> = {};
 			if (query.get('status')) filter.status = query.get('status');
 			if (query.get('direction')) filter.direction = query.get('direction');
-			if (query.get('since')) filter.since = Number(query.get('since'));
-			if (query.get('limit')) filter.limit = Number(query.get('limit'));
-			if (query.get('offset')) filter.offset = Number(query.get('offset'));
+			const since = parseIntParam(query, 'since', { min: 0 });
+			if (since !== undefined) filter.since = since;
+			const limit = parseIntParam(query, 'limit', { min: 0 });
+			if (limit !== undefined) filter.limit = limit;
+			const offset = parseIntParam(query, 'offset', { min: 0 });
+			if (offset !== undefined) filter.offset = offset;
 			if (query.get('metadataKey'))
 				filter.metadataKey = query.get('metadataKey');
 			if (query.get('metadataValue'))
@@ -275,10 +367,14 @@ export async function startDaemon(
 		},
 		'GET /forwards': (_body, query) => {
 			const filter: Record<string, unknown> = {};
-			if (query.get('since')) filter.since = Number(query.get('since'));
-			if (query.get('until')) filter.until = Number(query.get('until'));
-			if (query.get('limit')) filter.limit = Number(query.get('limit'));
-			if (query.get('offset')) filter.offset = Number(query.get('offset'));
+			const since = parseIntParam(query, 'since', { min: 0 });
+			if (since !== undefined) filter.since = since;
+			const until = parseIntParam(query, 'until', { min: 0 });
+			if (until !== undefined) filter.until = until;
+			const limit = parseIntParam(query, 'limit', { min: 0 });
+			if (limit !== undefined) filter.limit = limit;
+			const offset = parseIntParam(query, 'offset', { min: 0 });
+			if (offset !== undefined) filter.offset = offset;
 			if (query.get('channelId')) filter.channelId = query.get('channelId');
 			return success(
 				node.listForwards(
@@ -288,7 +384,7 @@ export async function startDaemon(
 			);
 		},
 		'GET /forwards/summary': (_body, query) => {
-			const since = query.get('since') ? Number(query.get('since')) : undefined;
+			const since = parseIntParam(query, 'since', { min: 0 });
 			return success(node.getForwardingSummary(since));
 		},
 		'GET /invoices': () => success(node.listInvoices()),
@@ -305,9 +401,7 @@ export async function startDaemon(
 		'GET /readiness': () => success(node.getMainnetReadiness()),
 		'GET /openapi.json': () => getOpenApiSpec(),
 		'GET /stats': (_body, query) => {
-			const windowMs = query.get('window')
-				? Number(query.get('window'))
-				: undefined;
+			const windowMs = parseIntParam(query, 'window', { min: 0 });
 			return success(node.getStats(windowMs));
 		},
 		'GET /spend-limit': () => success(node.getDailySpendInfo()),
@@ -411,18 +505,20 @@ export async function startDaemon(
 		'GET /address/labels': () => success(node.listAddressLabels()),
 		'GET /wallet/descriptors': () => success(node.exportDescriptors()),
 		'GET /channel/suggestions': (_body, query) => {
-			const count = query.get('count') ? Number(query.get('count')) : undefined;
+			const count = parseIntParam(query, 'count', { min: 1 });
 			return success(node.getChannelSuggestions(count));
 		},
 
 		'GET /logs': (_body, query) => {
 			const options: Record<string, unknown> = {};
 			if (query.get('category')) options.category = query.get('category');
-			if (query.get('since')) options.since = Number(query.get('since'));
-			if (query.get('limit')) options.limit = Number(query.get('limit'));
+			const since = parseIntParam(query, 'since', { min: 0 });
+			if (since !== undefined) options.since = since;
+			const limit = parseIntParam(query, 'limit', { min: 0 });
+			if (limit !== undefined) options.limit = limit;
 			return success(
 				node.getActionLog(
-					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- query params are unvalidated strings; getActionLog tolerates unknown values
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any -- remaining string params pass through; integers are validated above
 					Object.keys(options).length > 0 ? (options as any) : undefined
 				)
 			);
@@ -1199,11 +1295,11 @@ export async function startDaemon(
 		// ── Channel Readiness ──
 		'GET /channels/ready': () => success(node.getReadyChannels()),
 		'GET /can-send': (_body, query) => {
-			const amountSats = Number(query.get('amountSats') || '0');
+			const amountSats = parseIntParam(query, 'amountSats', { min: 0 }) ?? 0;
 			return success(node.canSend(amountSats));
 		},
 		'GET /can-receive': (_body, query) => {
-			const amountSats = Number(query.get('amountSats') || '0');
+			const amountSats = parseIntParam(query, 'amountSats', { min: 0 }) ?? 0;
 			return success(node.canReceive(amountSats));
 		},
 
@@ -1554,7 +1650,10 @@ export async function startDaemon(
 		// ── CORS headers ──
 		if (corsOrigin) {
 			res.setHeader('Access-Control-Allow-Origin', corsOrigin);
-			res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+			res.setHeader(
+				'Access-Control-Allow-Methods',
+				'GET, POST, DELETE, OPTIONS'
+			);
 			res.setHeader(
 				'Access-Control-Allow-Headers',
 				'Content-Type, Authorization'
@@ -1574,7 +1673,10 @@ export async function startDaemon(
 		// the peer address because the Authorization header is
 		// caller-controlled and varying it would mint a fresh bucket per
 		// guess.
-		if (rateLimiter && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
+		const authExempt =
+			AUTH_EXEMPT_ROUTES.has(routeKey) ||
+			(routeKey === 'GET /metrics' && opts.metricsPublic === true);
+		if (rateLimiter && !authExempt) {
 			const clientKey = req.socket.remoteAddress || 'unknown';
 			if (!rateLimiter.isAllowed(clientKey)) {
 				res.setHeader('Content-Type', 'application/json');
@@ -1616,7 +1718,8 @@ export async function startDaemon(
 			};
 			if (corsOrigin) {
 				sseHeaders['Access-Control-Allow-Origin'] = corsOrigin;
-				sseHeaders['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS';
+				sseHeaders['Access-Control-Allow-Methods'] =
+					'GET, POST, DELETE, OPTIONS';
 				sseHeaders['Access-Control-Allow-Headers'] =
 					'Content-Type, Authorization';
 			}
@@ -1636,20 +1739,13 @@ export async function startDaemon(
 			return;
 		}
 
-		// ── Prometheus metrics endpoint (text/plain) ──
-		if (routeKey === 'GET /metrics') {
-			res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
-			res.end(node.getMetrics());
-			return;
-		}
-
 		res.setHeader('Content-Type', 'application/json');
 
 		// ── Auth middleware ──
 		// 401 for a bad/absent key, 403 for a valid key without the required
 		// scope. Unclassified routes fail closed to admin-only (see
 		// ROUTE_SCOPES in auth.ts and the drift test that keeps it complete).
-		if (authenticator.enabled && !AUTH_EXEMPT_ROUTES.has(routeKey)) {
+		if (authenticator.enabled && !authExempt) {
 			const auth = authenticator.authenticate(req.headers['authorization']);
 			if (!auth.ok) {
 				res.statusCode = 401;
@@ -1669,6 +1765,16 @@ export async function startDaemon(
 				);
 				return;
 			}
+		}
+
+		// ── Prometheus metrics endpoint (text/plain) ──
+		// Sits behind the auth middleware: it reports balances, channel and
+		// peer counts, which are finances, not liveness (metricsPublic opts
+		// back into the old unauthenticated behavior).
+		if (routeKey === 'GET /metrics') {
+			res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+			res.end(node.getMetrics());
+			return;
 		}
 
 		// Handle /stop specially — graceful shutdown
@@ -1735,7 +1841,7 @@ export async function startDaemon(
 						);
 						return;
 					}
-					res.end(JSON.stringify(cached.response));
+					endWithResult(res, cached.response);
 					return;
 				}
 				const result = await handler(body, query);
@@ -1744,21 +1850,36 @@ export async function startDaemon(
 					bodyHash: bodyHash,
 					expiresAt: Date.now() + IDEMPOTENCY_TTL_MS
 				});
-				res.end(JSON.stringify(result));
+				endWithResult(res, result);
 				return;
 			}
 
 			const result = await handler(body, query);
-			res.end(JSON.stringify(result));
+			endWithResult(res, result);
 		} catch (err: unknown) {
 			if (err instanceof BeignetError) {
-				if (err.code === 'BODY_TOO_LARGE') {
-					res.statusCode = 413;
-				}
+				res.statusCode = statusForErrorCode(err.code);
 				res.end(JSON.stringify(failure(err.code, err.message)));
 			} else {
-				const msg = err instanceof Error ? err.message : String(err);
-				res.end(JSON.stringify(failure('INTERNAL_ERROR', msg)));
+				// Unknown throw: log the detail server-side and answer with a
+				// generic message. Raw messages leak filesystem paths and
+				// database layout; HTTP 200 on errors blinds every proxy and
+				// health check in front of the daemon. An unhandled exception
+				// is worth a stderr line even when logging is not configured;
+				// discarding it makes the generic 500 undiagnosable.
+				const detail =
+					err instanceof Error ? err.stack ?? err.message : String(err);
+				if (logger) {
+					logger.error(`Unhandled error on ${routeKey}: ${detail}`);
+				} else {
+					process.stderr.write(
+						`[beignet-daemon] Unhandled error on ${routeKey}: ${detail}\n`
+					);
+				}
+				res.statusCode = 500;
+				res.end(
+					JSON.stringify(failure('INTERNAL_ERROR', 'Internal server error'))
+				);
 			}
 		}
 	};
