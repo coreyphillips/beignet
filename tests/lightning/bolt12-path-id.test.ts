@@ -342,10 +342,13 @@ describe('BOLT 12 invoice_error binding', function () {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
 				string,
-				{ replyPathId?: Buffer }
+				{ replyPathId?: Buffer; offerIdHex: string }
 			>;
-			const boundPathId = pendingMap.get(offerB.offerId.toString('hex'))!
-				.replyPathId!;
+			// The map is keyed by per-request id (#250), so find B's entry by
+			// the offer recorded on it.
+			const boundPathId = [...pendingMap.values()].find(
+				(p) => p.offerIdHex === offerB.offerId.toString('hex')
+			)!.replyPathId!;
 
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			(payer.mgr as any).handleIncomingInvoiceError(
@@ -358,6 +361,135 @@ describe('BOLT 12 invoice_error binding', function () {
 			expect((outcomeB as Error).message).to.match(
 				/Invoice error: amount too low/
 			);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('invoice:error carries matchedPendingRequest telemetry', async function () {
+		const parties = setupParties(400);
+		const { payer, issuer } = parties;
+		try {
+			payer.omm.setSendFunction(() => {});
+			const { offer } = issuer.mgr.createOffer({
+				description: 'telemetry target',
+				amount: 1000n
+			});
+			const events: Array<{ error: string; matchedPendingRequest?: boolean }> =
+				[];
+			payer.mgr.on(
+				'invoice:error',
+				(e: { error: string; matchedPendingRequest?: boolean }) =>
+					events.push(e)
+			);
+			const pending = payer.mgr.requestInvoice(offer).catch((e) => e);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
+				string,
+				{ replyPathId?: Buffer }
+			>;
+			const boundPathId = [...pendingMap.values()][0].replyPathId!;
+
+			// Unbound error first: surfaced with matchedPendingRequest false,
+			// cancels nothing.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'unbound noise' }),
+				crypto.randomBytes(32)
+			);
+			// Bound error second: rejects the request, flagged true.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'bound rejection' }),
+				boundPathId
+			);
+
+			const outcome = await pending;
+			expect((outcome as Error).message).to.match(
+				/Invoice error: bound rejection/
+			);
+			const unbound = events.find((e) => e.error === 'unbound noise');
+			const bound = events.find((e) => e.error === 'bound rejection');
+			expect(unbound?.matchedPendingRequest, 'unbound flagged false').to.equal(
+				false
+			);
+			expect(bound?.matchedPendingRequest, 'bound flagged true').to.equal(true);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+});
+
+describe('BOLT 12 concurrent invoice requests for the SAME offer (#250)', function () {
+	it('two concurrent requests coexist and both resolve (E2E)', async function () {
+		const parties = setupParties();
+		const { payer, issuer } = parties;
+		try {
+			// One reusable offer, two live requests: keying the pending map by
+			// offer id made the second overwrite the first, so the first could
+			// only time out.
+			const { offer } = issuer.mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+			const [invoiceA, invoiceB] = await Promise.all([
+				payer.mgr.requestInvoice(offer),
+				payer.mgr.requestInvoice(offer)
+			]);
+			expect(invoiceA.description).to.equal('tip jar');
+			expect(invoiceB.description).to.equal('tip jar');
+			// Two distinct invoices (the issuer mints a fresh preimage per
+			// invoice_request), each resolving its own request.
+			expect(invoiceA.paymentHash.equals(invoiceB.paymentHash)).to.be.false;
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it("a timed-out request's timer evicts only its own entry", async function () {
+		const parties = setupParties(500);
+		const { payer, issuer } = parties;
+		try {
+			const { offer } = issuer.mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+
+			// Request A's invreq is dropped (it will time out); request B's is
+			// HELD and delivered only after A's timeout fires. Before the fix,
+			// A's stale timer deleted B's map entry (same offer-id key), so
+			// the invoice arriving over B's reply path matched nothing.
+			let heldDelivery: (() => void) | null = null;
+			let sendCount = 0;
+			payer.omm.setSendFunction((peer, _type, payload) => {
+				sendCount++;
+				if (sendCount === 1) return; // drop A's invoice_request
+				heldDelivery = (): void => {
+					issuer.omm.handleMessage(payer.pubkey.toString('hex'), payload);
+				};
+			});
+
+			const pendingA = payer.mgr.requestInvoice(offer).catch((e) => e);
+			// Stagger B so its own deadline is comfortably after A's.
+			await new Promise((r) => setTimeout(r, 250));
+			const pendingB = payer.mgr.requestInvoice(offer);
+
+			const outcomeA = await pendingA;
+			expect((outcomeA as Error).message).to.match(/timed out/);
+
+			// B's entry survived A's timeout...
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
+				string,
+				unknown
+			>;
+			expect(pendingMap.size, 'B still pending after A timed out').to.equal(1);
+
+			// ...and B still resolves once its invoice_request goes through.
+			expect(heldDelivery, 'B sent an invoice_request').to.not.be.null;
+			heldDelivery!();
+			const invoiceB = await pendingB;
+			expect(invoiceB.description).to.equal('tip jar');
 		} finally {
 			destroyParties(parties);
 		}

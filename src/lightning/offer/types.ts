@@ -127,4 +127,11 @@ export interface IInvoiceError {
 	suggestedValue?: Buffer;
 	/** Human-readable error string */
 	error: string;
+	/**
+	 * Payer-side `invoice:error` events only: true when the error rejected a
+	 * pending invoice_request of ours, false when it was unbound and cancelled
+	 * nothing (observability only). Absent on issuer-side errors, and never
+	 * put on the wire.
+	 */
+	matchedPendingRequest?: boolean;
 }
