@@ -1216,5 +1216,101 @@ describe('Crash-Safe State Persistence', function () {
 
 			alice.destroy();
 		});
+
+		/** All four invoice records must be absent for the given hash. */
+		function expectNoInvoiceRecords(
+			storage: SqliteStorage,
+			hashHex: string
+		): void {
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex),
+				'invoice rolled back'
+			).to.be.false;
+			expect(storage.loadPayment(hashHex), 'payment rolled back').to.be.null;
+		}
+
+		it('createInvoice rolls back all four records when savePayment fails', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(4, storage);
+
+			// persistPayment swallows storage errors, so a transaction wrapping
+			// it could commit preimage/secret/invoice with NO payment row; the
+			// throwing variant must abort the whole set instead.
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity'
+			});
+			expectNoInvoiceRecords(storage, invoice.paymentHash.toString('hex'));
+
+			// With the fault removed all four records land together.
+			storage.savePayment = originalSavePayment;
+			const ok = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity ok'
+			});
+			const okHex = ok.paymentHash.toString('hex');
+			expect(storage.loadPreimage(okHex)).to.not.be.null;
+			expect(storage.loadPayment(okHex)).to.not.be.null;
+
+			alice.destroy();
+		});
+
+		it('BOLT 12 invoice:issued rolls back all four records when savePayment fails', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(5, storage);
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const hashHex = paymentHash.toString('hex');
+			const bolt12Invoice = {
+				paymentHash,
+				paymentSecret: crypto.randomBytes(32),
+				amount: 5_000n,
+				description: 'b12 atomicity',
+				createdAt: BigInt(Math.floor(Date.now() / 1000))
+			};
+
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage
+			);
+			expectNoInvoiceRecords(storage, hashHex);
+
+			// The path itself works once the fault is removed: both invoice
+			// persistence paths go through the same shared helper.
+			storage.savePayment = originalSavePayment;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage
+			);
+			expect(storage.loadPreimage(hashHex)).to.not.be.null;
+			expect(storage.loadPayment(hashHex)).to.not.be.null;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex)
+			).to.be.true;
+
+			alice.destroy();
+		});
 	});
 });

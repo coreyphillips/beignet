@@ -1301,6 +1301,46 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Persist the payment record, THROWING on any failure. For use inside a
+	 * storage transaction, where a swallowed error would let the transaction
+	 * commit the other writes without this one (persistPayment catches, so a
+	 * transaction wrapping it can never roll back on its account).
+	 */
+	private persistPaymentOrThrow(paymentHash: Buffer): void {
+		if (!this.storage) throw new Error('storage is not configured');
+		const hashHex = paymentHash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (!payment) throw new Error(`payment record missing: ${hashHex}`);
+		this.storage.savePayment(hashHex, payment);
+	}
+
+	/**
+	 * Persist an invoice's full record set (preimage, payment secret, invoice
+	 * row, payment record) in ONE transaction: all four land or none do. A
+	 * partial set is a half-claimable payment hash that restore never flags
+	 * (invoices and payments are restored independently, so a missing payment
+	 * row breaks receive accounting while the hash stays fulfillable).
+	 */
+	private persistInvoiceRecords(
+		paymentHash: Buffer,
+		invoiceInfo: IInvoiceInfo,
+		preimage?: Buffer,
+		paymentSecret?: Buffer
+	): void {
+		this.safeStorage(() => {
+			this.storage!.transaction(() => {
+				const hashHex = paymentHash.toString('hex');
+				if (preimage) this.storage!.savePreimage(hashHex, preimage);
+				if (paymentSecret) {
+					this.storage!.savePaymentSecret(hashHex, paymentSecret);
+				}
+				this.storage!.saveInvoice(hashHex, invoiceInfo);
+				this.persistPaymentOrThrow(paymentHash);
+			});
+		}, 'persistInvoiceRecords');
+	}
+
+	/**
 	 * Wrap a storage operation in try/catch, emitting node:error on failure.
 	 * Prevents disk-full or locked-DB from crashing a long-running node.
 	 */
@@ -7000,29 +7040,20 @@ export class LightningNode extends EventEmitter {
 		// Persist
 		const createdAtSecs = Math.floor(Date.now() / 1000);
 
-		// One transaction: an invoice row without its preimage/secret (or the
-		// reverse) is a half-claimable payment hash that nothing flags.
-		this.safeStorage(() => {
-			this.storage!.transaction(() => {
-				if (preimage) {
-					this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
-				}
-				this.storage!.savePaymentSecret(
-					paymentHash.toString('hex'),
-					paymentSecret
-				);
-				this.storage!.saveInvoice(paymentHash.toString('hex'), {
-					paymentHash: paymentHash.toString('hex'),
-					bolt11: invoiceStr,
-					amountMsat: options.amountMsat,
-					description: options.description,
-					expiry: options.expiry ?? DEFAULT_EXPIRY,
-					createdAt: createdAtSecs,
-					hold: options.hold
-				});
-				this.persistPayment(paymentHash);
-			});
-		}, 'saveInvoiceData');
+		this.persistInvoiceRecords(
+			paymentHash,
+			{
+				paymentHash: paymentHash.toString('hex'),
+				bolt11: invoiceStr,
+				amountMsat: options.amountMsat,
+				description: options.description,
+				expiry: options.expiry ?? DEFAULT_EXPIRY,
+				createdAt: createdAtSecs,
+				hold: options.hold
+			},
+			preimage,
+			paymentSecret
+		);
 
 		// Store invoice info
 		this.invoices.set(paymentHash.toString('hex'), {
@@ -11203,18 +11234,12 @@ export class LightningNode extends EventEmitter {
 						createdAt: Date.now()
 					});
 				}
-				// One transaction (see createInvoice): preimage, secret and
-				// invoice row must land together or not at all.
-				this.safeStorage(() => {
-					this.storage!.transaction(() => {
-						this.storage!.savePreimage(hashHex, preimage);
-						if (invoice.paymentSecret) {
-							this.storage!.savePaymentSecret(hashHex, invoice.paymentSecret);
-						}
-						this.storage!.saveInvoice(hashHex, invoiceInfo);
-						this.persistPayment(invoice.paymentHash);
-					});
-				}, 'saveBolt12Invoice');
+				this.persistInvoiceRecords(
+					invoice.paymentHash,
+					invoiceInfo,
+					preimage,
+					invoice.paymentSecret
+				);
 				this.emit('bolt12:invoice:issued', invoice);
 			}
 		);
