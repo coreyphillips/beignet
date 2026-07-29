@@ -378,6 +378,8 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
 	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
 	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
+	if (hasFlag('--metrics-public')) cliFlags.metricsPublic = true;
+	if (hasFlag('--insecure')) cliFlags.insecure = true;
 	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
@@ -457,6 +459,8 @@ async function handleStart(): Promise<void> {
 			announceAddresses: config.announceAddresses,
 			watchtowers: config.watchtowers,
 			htlcEvents: config.htlcEvents,
+			metricsPublic: config.metricsPublic,
+			insecure: config.insecure,
 			forwardingEnabled: config.forwardingEnabled,
 			logLevel: config.logLevel
 		});

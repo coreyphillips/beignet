@@ -104,6 +104,9 @@ export type AuthResult = AuthSuccess | AuthFailure;
  */
 export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// ── Read-only monitoring (GET) ──
+	// /metrics is served outside the routes table but goes through the same
+	// auth middleware (it reports balances; metricsPublic opts out of auth).
+	'GET /metrics': ['readonly'],
 	'GET /info': ['readonly'],
 	'GET /balance': ['readonly'],
 	'GET /peers': ['readonly'],

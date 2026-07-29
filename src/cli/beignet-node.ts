@@ -2488,6 +2488,29 @@ export class BeignetNode extends EventEmitter {
 		max = false,
 		trusted = false
 	): ChannelInfo {
+		// Guard before BigInt(): a fractional amount throws an uncaught
+		// RangeError, and a string amount reaches the spend-limit math where
+		// + concatenates instead of adding.
+		if (typeof amountSats !== 'number' || !Number.isSafeInteger(amountSats)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'amountSats must be an integer number of satoshis'
+			);
+		}
+		if (amountSats < 0) {
+			throw new BeignetError('INVALID_PARAMS', 'amountSats must be >= 0');
+		}
+		if (
+			pushSats !== undefined &&
+			(typeof pushSats !== 'number' ||
+				!Number.isSafeInteger(pushSats) ||
+				pushSats < 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'pushSats must be a non-negative integer number of satoshis'
+			);
+		}
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;

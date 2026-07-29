@@ -178,6 +178,18 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_HTLC_EVENTS === 'true'
 				: undefined) ??
 			file.htlcEvents,
+		metricsPublic:
+			cliFlags.metricsPublic ??
+			(process.env.BEIGNET_METRICS_PUBLIC !== undefined
+				? process.env.BEIGNET_METRICS_PUBLIC === 'true'
+				: undefined) ??
+			file.metricsPublic,
+		insecure:
+			cliFlags.insecure ??
+			(process.env.BEIGNET_INSECURE !== undefined
+				? process.env.BEIGNET_INSECURE === 'true'
+				: undefined) ??
+			file.insecure,
 		forwardingEnabled:
 			cliFlags.forwardingEnabled ??
 			(process.env.BEIGNET_FORWARDING_ENABLED !== undefined

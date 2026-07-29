@@ -534,6 +534,255 @@ describe('Daemon auth middleware', () => {
 			server.close();
 		}
 	}).timeout(30000);
+
+	it('GET /metrics requires auth (it reports balances), metricsPublic opts out', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'metricstest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const noAuth = await httpGet(addr.port, '/metrics');
+			expect(noAuth.status).to.equal(401);
+			const withAuth = await httpGet(addr.port, '/metrics', {
+				Authorization: 'Bearer metricstest'
+			});
+			expect(withAuth.status).to.equal(200);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /metrics is open when metricsPublic is set', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'metricspublic',
+			metricsPublic: true,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/metrics');
+			expect(resp.status).to.equal(200);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('refuses a non-loopback bind without authentication', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				daemonHost: '0.0.0.0',
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false
+			});
+			expect.fail('Should have refused the bind');
+		} catch (err: unknown) {
+			expect((err as { code?: string }).code).to.equal('INVALID_PARAMS');
+			expect((err as Error).message).to.include('authentication');
+		}
+	}).timeout(30000);
+
+	it('refuses wildcard CORS without authentication', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				cors: true,
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false
+			});
+			expect.fail('Should have refused wildcard CORS');
+		} catch (err: unknown) {
+			expect((err as { code?: string }).code).to.equal('INVALID_PARAMS');
+			expect((err as Error).message).to.include('CORS');
+		}
+	}).timeout(30000);
+
+	it('CORS preflight allows DELETE (watchtower and webhook routes use it)', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'corstest',
+			cors: true,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const allowMethods = await new Promise<string>((resolve, reject) => {
+				const req = http.request(
+					{
+						hostname: '127.0.0.1',
+						port: addr.port,
+						path: '/webhooks/unregister',
+						method: 'OPTIONS'
+					},
+					(res) => {
+						res.resume();
+						resolve(String(res.headers['access-control-allow-methods'] ?? ''));
+					}
+				);
+				req.on('error', reject);
+				req.end();
+			});
+			expect(allowMethods).to.include('DELETE');
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('maps error envelopes to HTTP statuses and rejects bad input', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'statustest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer statustest' };
+		try {
+			// NaN would bind into SQL and silently match nothing: reject it.
+			const badSince = await httpGet(addr.port, '/forwards?since=abc', auth);
+			expect(badSince.status).to.equal(400);
+			expect((badSince.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+
+			const badAmount = await httpGet(
+				addr.port,
+				'/can-send?amountSats=abc',
+				auth
+			);
+			expect(badAmount.status).to.equal(400);
+
+			const goodAmount = await httpGet(
+				addr.port,
+				'/can-send?amountSats=1000',
+				auth
+			);
+			expect(goodAmount.status).to.equal(200);
+
+			// A returned failure envelope carries its mapped status too.
+			const notFound = await httpGet(
+				addr.port,
+				`/invoice?paymentHash=${'ab'.repeat(32)}`,
+				auth
+			);
+			expect(notFound.status).to.equal(404);
+
+			// Fractional sats used to throw an uncaught RangeError at BigInt()
+			// and surface as a 200 INTERNAL_ERROR.
+			const fractional = await httpPost(
+				addr.port,
+				'/channel/open',
+				{ pubkey: '02' + 'ab'.repeat(32), amountSats: 1.5 },
+				auth
+			);
+			expect(fractional.status).to.equal(400);
+			expect((fractional.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('rejects malformed JSON bodies with 400 instead of treating them as empty', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'jsontest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await new Promise<{
+				status: number;
+				body: Record<string, unknown>;
+			}>((resolve, reject) => {
+				const payload = '{"bolt11": "lnbc1..';
+				const req = http.request(
+					{
+						hostname: '127.0.0.1',
+						port: addr.port,
+						path: '/invoice/pay',
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+							'Content-Length': Buffer.byteLength(payload),
+							Authorization: 'Bearer jsontest'
+						}
+					},
+					(res) => {
+						const chunks: Buffer[] = [];
+						res.on('data', (c: Buffer) => chunks.push(c));
+						res.on('end', () => {
+							try {
+								resolve({
+									status: res.statusCode!,
+									body: JSON.parse(Buffer.concat(chunks).toString())
+								});
+							} catch {
+								resolve({ status: res.statusCode!, body: {} });
+							}
+						});
+					}
+				);
+				req.on('error', reject);
+				req.write(payload);
+				req.end();
+			});
+			expect(resp.status).to.equal(400);
+			expect((resp.body.error as { code: string }).code).to.equal(
+				'INVALID_JSON'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
 });
 
 // ─────────────── Config apiToken Tests ───────────────

@@ -452,6 +452,10 @@ export interface BeignetConfig {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Serve GET /metrics without authentication (default false). */
+	metricsPublic?: boolean;
+	/** Allow non-loopback bind / wildcard CORS without auth (default false). */
+	insecure?: boolean;
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;

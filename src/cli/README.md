@@ -1569,7 +1569,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/fees` | -- | On-chain fee trend analysis |
 | GET | `/logs` | `?category=&since=&limit=` | Query persistent action log |
 | GET | `/readiness` | -- | Mainnet readiness checklist (11 checks) |
-| GET | `/metrics` | -- | Prometheus text exposition format metrics (auth-exempt) |
+| GET | `/metrics` | readonly | Prometheus text exposition format metrics (auth-gated: reports balances; `metricsPublic: true` serves it without auth) |
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
