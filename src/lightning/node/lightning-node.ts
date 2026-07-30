@@ -7090,6 +7090,20 @@ export class LightningNode extends EventEmitter {
 	 * peer — even when the channel is not in the public gossip graph (private or
 	 * not yet announced). Matches LND/CLN/LDK behaviour.
 	 */
+	/**
+	 * The channel sendPaymentToRoute would select for this route's first hop
+	 * (same selection order: route SCID first, then peer + amount), so a
+	 * pre-dispatch check compares against exactly what a dispatch would use.
+	 */
+	private firstHopChannelFor(route: IRoute): Channel | undefined {
+		const firstHop = route.hops[0];
+		const firstHopPubkey = firstHop.pubkey.toString('hex');
+		return (
+			this.findLocalChannelByScid(firstHop.shortChannelId, firstHopPubkey) ??
+			this.findChannelForPeer(firstHopPubkey, route.totalAmountMsat)
+		);
+	}
+
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
@@ -7102,20 +7116,27 @@ export class LightningNode extends EventEmitter {
 			// A splice keeps using its pre-splice scid until the lock.
 			const scid = st.shortChannelId ?? st.scidAlias;
 			if (!scid) continue;
-			// Mid-splice, the ceiling is the min across both fundings (a
-			// splice-out's candidate commitment has less to spend) — the same
-			// figure addHtlc enforces, so the router never offers a route the
-			// channel then refuses. NORMAL channels keep the historical
-			// upper-bound (the add enforces reserve/in-flight limits).
-			const outboundMsat =
-				st.state === ChannelState.SPLICING
-					? channel.getSpendableOutboundMsat()
-					: st.localBalanceMsat;
+			// The ceiling is the channel's spendable liquidity — reserve,
+			// in-flight HTLCs and commit fee subtracted, and mid-splice the min
+			// across both fundings — so the router does not size a route or an
+			// MPP part past what addHtlc admits on liquidity grounds (addHtlc
+			// still enforces more: HTLC minimums, in-flight count/value caps,
+			// dust exposure, channel state). The raw localBalanceMsat bound
+			// previously used for NORMAL channels let a near-balance single
+			// path or MPP part through that could only die locally in addHtlc
+			// as "insufficient balance" (#254).
+			const outboundMsat = channel.getSpendableOutboundMsat();
 			if (outboundMsat <= 0n) continue;
 			edges.push({
 				shortChannelId: scid,
 				peer: Buffer.from(peerHex, 'hex'),
-				outboundMsat
+				outboundMsat,
+				// The PEER's htlc_minimum_msat: addHtlc refuses an outgoing HTLC
+				// below it, so the router must not plan one (the overlay edge
+				// otherwise defaults the minimum to zero, and since local edges
+				// shadow announced graph copies, the graph's advertised minimum
+				// no longer applies either).
+				htlcMinimumMsat: st.remoteConfig.htlcMinimumMsat
 			});
 		}
 		return edges;
@@ -7253,7 +7274,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const localChannels = this.getLocalChannelEdges();
-		const route = findRoute(
+		let route = findRoute(
 			this.graph,
 			sourceNodeId,
 			destination,
@@ -7267,6 +7288,24 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			localChannels
 		);
+		// The router can bound our first hop looser than what addHtlc enforces
+		// (a graph update's advertised maximum, or a race against in-flight
+		// HTLCs), so a single-path route the outgoing channel cannot actually
+		// carry would only die locally in addHtlc as "insufficient balance".
+		// When the selected channel exists but cannot carry the total, treat
+		// the route as unroutable up front so the MPP fallback below can split
+		// the payment across channels (#254). When NO channel is found at all,
+		// keep the route: MPP could not dispatch either, and sendPaymentToRoute
+		// reports the precise no-channel failure.
+		if (route) {
+			const firstHopChannel = this.firstHopChannelFor(route);
+			if (
+				firstHopChannel &&
+				firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
+			) {
+				route = null;
+			}
+		}
 		// MPP requires the recipient to advertise basic_mpp (BOLT 4): splitting
 		// to a non-MPP recipient locks every part until the mpp_timeout.
 		if (
@@ -7930,11 +7969,13 @@ export class LightningNode extends EventEmitter {
 			);
 			const onionBuf = encodeOnionPacket(onionPacket);
 
-			const firstHopPubkey = hops[0].pubkey.toString('hex');
-			const outChannel = this.findChannelForPeer(
-				firstHopPubkey,
-				hops[0].amountToForwardMsat
-			);
+			// Honor the planner's channel: MPP capacity was accounted per SCID,
+			// so each part must leave over the channel it was sized for.
+			// Peer-based selection could reseat the part on a sibling channel
+			// (chosen by balance) that cannot actually carry it, and a locally
+			// refused part cannot be rolled back once earlier parts are out.
+			// Same selection rule as sendPaymentToRoute.
+			const outChannel = this.firstHopChannelFor(partRoute);
 			if (!outChannel) continue;
 
 			const channelId = outChannel.getChannelId()!;
@@ -12192,24 +12233,22 @@ export class LightningNode extends EventEmitter {
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];
 
-		// Sort by local balance descending
-		normalChannels.sort((a, b) => {
-			const balA = a.getFullState().localBalanceMsat;
-			const balB = b.getFullState().localBalanceMsat;
-			if (balA > balB) return -1;
-			if (balA < balB) return 1;
-			return 0;
-		});
-
-		// If amount specified, prefer a channel with sufficient balance
-		if (amountMsat !== undefined) {
-			const sufficient = normalChannels.find(
-				(ch) => ch.getFullState().localBalanceMsat >= amountMsat
+		// Rank by SPENDABLE outbound, not raw local balance: reserve, commit
+		// fee and in-flight HTLCs can make the bigger-balance channel exactly
+		// the one that refuses the HTLC (#254 review).
+		const bySpendable = normalChannels
+			.map((ch) => ({ ch, spendable: ch.getSpendableOutboundMsat() }))
+			.sort((a, b) =>
+				a.spendable > b.spendable ? -1 : a.spendable < b.spendable ? 1 : 0
 			);
-			if (sufficient) return sufficient;
+
+		// If amount specified, prefer a channel that can actually carry it
+		if (amountMsat !== undefined) {
+			const sufficient = bySpendable.find((e) => e.spendable >= amountMsat);
+			if (sufficient) return sufficient.ch;
 		}
 
-		// Fall back to largest balance channel
-		return normalChannels[0];
+		// Fall back to the most spendable channel
+		return bySpendable[0].ch;
 	}
 }
