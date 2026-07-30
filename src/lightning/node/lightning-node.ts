@@ -8546,13 +8546,23 @@ export class LightningNode extends EventEmitter {
 		// (final-hop cltv/amount safety was validated up front, before any
 		// preimage was revealed — see finalHopSafetyFailure.)
 
+		// The sender-declared multi-part total. BOLT 11 payment_data carries it
+		// in total_msat; a blinded final hop carries no payment_data at all and
+		// declares it in total_amount_msat (TLV 18) instead, with the path_id
+		// check above as the per-part authenticity gate. Recognising only the
+		// payment_data field made every part of a split BOLT 12 payment look
+		// like a standalone underpaying HTLC, so a spec-compliant MPP payer
+		// could not pay a beignet-issued offer (#262).
+		const declaredTotalMsat =
+			hopPayload?.totalMsat ?? hopPayload?.totalAmountMsat;
+
 		// Validate the received amount against the invoice (BOLT 4). The final
 		// node MUST NOT fulfill (and reveal the preimage) for less than the
 		// invoiced amount, and SHOULD reject gross overpayment (> 2x). Without
 		// this, a payer can settle a large invoice with a tiny HTLC and still
-		// obtain the proof-of-payment. For MPP the sender-declared total_msat is
+		// obtain the proof-of-payment. For MPP the sender-declared total is
 		// what the parts accumulate toward, so validating it here (and the
-		// existing handleMppPart accumulation to total_msat) bounds the real
+		// existing handleMppPart accumulation to that total) bounds the real
 		// received total. Zero-amount ("any amount") invoices are exempt.
 		const finalInvoice = this.invoices.get(hashHex);
 		if (
@@ -8560,9 +8570,10 @@ export class LightningNode extends EventEmitter {
 			finalInvoice.amountMsat &&
 			finalInvoice.amountMsat > 0n
 		) {
-			const isMpp =
-				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
-			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;
+			const claimedTotal =
+				declaredTotalMsat !== undefined && declaredTotalMsat > amountMsat
+					? declaredTotalMsat
+					: amountMsat;
 			if (
 				claimedTotal < finalInvoice.amountMsat ||
 				claimedTotal > finalInvoice.amountMsat * 2n
@@ -8600,15 +8611,18 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// MPP: if payment_data has totalMsat > amountMsat, this is a multi-part payment
-		if (hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat) {
+		// MPP: a declared total above this part's amount marks a multi-part
+		// payment, whether declared via payment_data (BOLT 11) or
+		// total_amount_msat on a blinded final hop (BOLT 12).
+		if (declaredTotalMsat !== undefined && declaredTotalMsat > amountMsat) {
 			this.handleMppPart(
 				channelId,
 				htlcId,
 				amountMsat,
 				paymentHash,
-				hopPayload,
-				preimage!
+				hopPayload!,
+				preimage!,
+				declaredTotalMsat
 			);
 			return;
 		}
@@ -8992,13 +9006,22 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Accumulate one part of a multi-part payment. Parts group by payment
+	 * hash; each part's authenticity was already enforced upstream in
+	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
+	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
+	 * declaredTotalMsat is the sender-declared total this part accumulates
+	 * toward: payment_data total_msat or blinded-final total_amount_msat.
+	 */
 	private handleMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload: IHopPayload,
-		preimage: Buffer
+		preimage: Buffer,
+		declaredTotalMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 
@@ -9006,16 +9029,15 @@ export class LightningNode extends EventEmitter {
 		let pending = this.pendingMppPayments.get(hashHex);
 		if (!pending) {
 			pending = {
-				paymentSecret: hopPayload.paymentSecret!,
-				totalMsat: hopPayload.totalMsat!,
+				// Absent for blinded-final parts: BOLT 12 has no payment_secret,
+				// the per-part path_id check upstream authenticates instead.
+				paymentSecret: hopPayload.paymentSecret,
+				totalMsat: declaredTotalMsat,
 				receivedParts: [],
 				createdAt: Date.now()
 			};
 			this.pendingMppPayments.set(hashHex, pending);
-		} else if (
-			hopPayload.totalMsat !== undefined &&
-			hopPayload.totalMsat !== pending.totalMsat
-		) {
+		} else if (declaredTotalMsat !== pending.totalMsat) {
 			// BOLT 4: every part of a multi-part payment MUST carry the same
 			// total_msat. A part disagreeing with the set is
 			// final_incorrect_htlc_amount; fail just this part and keep the set

@@ -606,7 +606,11 @@ export interface IPaymentPart {
 }
 
 export interface IPendingMppPayment {
-	paymentSecret: Buffer;
+	/**
+	 * Absent for blinded-final (BOLT 12) parts, which carry no payment_data:
+	 * their per-part authenticity is the blinded path_id check instead.
+	 */
+	paymentSecret?: Buffer;
 	totalMsat: bigint;
 	receivedParts: IPaymentPart[];
 	createdAt: number;
