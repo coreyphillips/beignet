@@ -5,11 +5,65 @@
  * Opt-in — disabled by default unless rateLimit is configured.
  */
 
+import * as net from 'net';
+
 export interface RateLimitOptions {
 	/** Maximum requests per window (default 100) */
 	maxRequests?: number;
 	/** Time window in milliseconds (default 60000 = 1 minute) */
 	windowMs?: number;
+	/**
+	 * Reverse-proxy addresses (exact IPs) whose X-Forwarded-For header may be
+	 * used for bucket keying. Without this, every request arriving through a
+	 * proxy shares the proxy's single bucket. The header is only consulted
+	 * when the direct peer is listed here — trusting it unconditionally would
+	 * let any direct caller mint fresh buckets and dodge the pre-auth
+	 * throttle by rotating fake addresses.
+	 */
+	trustedProxies?: string[];
+}
+
+/**
+ * Lowercase, trim, and unmap IPv4-mapped IPv6 (::ffff:1.2.3.4 -> 1.2.3.4) so
+ * socket addresses compare equal to their configured spellings.
+ */
+function normalizeAddress(addr: string): string {
+	let normalized = addr.trim().toLowerCase();
+	if (normalized.startsWith('::ffff:') && net.isIPv4(normalized.slice(7))) {
+		normalized = normalized.slice(7);
+	}
+	return normalized;
+}
+
+/**
+ * Derive the rate-limit bucket key for a request. When the direct peer is a
+ * trusted proxy, walk X-Forwarded-For right to left past trusted hops and key
+ * on the first untrusted entry — the address the nearest trusted proxy saw.
+ * Entries further left are caller-controlled and never consulted. Falls back
+ * to the peer address when the header is absent or every hop is trusted.
+ */
+export function clientKeyForRequest(
+	remoteAddress: string | undefined,
+	forwardedFor: string | string[] | undefined,
+	trustedProxies?: string[]
+): string {
+	const peer = remoteAddress ? normalizeAddress(remoteAddress) : 'unknown';
+	if (!trustedProxies || trustedProxies.length === 0) return peer;
+	const trusted = new Set(trustedProxies.map(normalizeAddress));
+	if (!trusted.has(peer)) return peer;
+
+	const headerValue = Array.isArray(forwardedFor)
+		? forwardedFor.join(',')
+		: forwardedFor;
+	if (!headerValue) return peer;
+	const hops = headerValue
+		.split(',')
+		.map(normalizeAddress)
+		.filter((hop) => hop.length > 0);
+	for (let i = hops.length - 1; i >= 0; i--) {
+		if (!trusted.has(hops[i])) return hops[i];
+	}
+	return peer;
 }
 
 interface TokenBucket {
