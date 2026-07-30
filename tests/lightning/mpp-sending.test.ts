@@ -24,7 +24,8 @@ import { IRoute } from '../../src/lightning/gossip/types';
 import { Network } from '../../src/lightning/invoice/types';
 import {
 	DEFAULT_CHANNEL_CONFIG,
-	BITCOIN_CHAIN_HASH
+	BITCOIN_CHAIN_HASH,
+	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -47,6 +48,7 @@ import {
 	signChannelUpdate
 } from '../../src/lightning/gossip/validation';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
 import { IRoutingHintHop } from '../../src/lightning/invoice/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
@@ -893,6 +895,235 @@ describe('MPP Sending (Phase 5)', function () {
 			);
 			expect(fits, 'routable within local capacity').to.not.be.null;
 			expect(fits!.hops[0].shortChannelId.equals(localScid)).to.be.true;
+		});
+
+		it('announced channels: MPP splits by local spendable, not the advertised maximum (#254)', async function () {
+			// The graph copy of our own channel advertises htlc_maximum_msat, a
+			// public ceiling routinely far above CURRENT spendable liquidity.
+			// Planning against it produced single-path routes AND single
+			// oversized MPP parts that addHtlc then refused: the local edge
+			// (real spendable) must shadow the announced copy.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(72),
+				htlcBasepointSecret: htlcSecretFor(72)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(73),
+				htlcBasepointSecret: htlcSecretFor(73)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			const channelIds = [
+				openReadyChannel(alice, bob, 100_000n),
+				openReadyChannel(alice, bob, 100_000n)
+			];
+
+			// Announce BOTH channels at their REAL scids, both directions
+			// enabled, with a wildly overstated maximum.
+			const aliceGraph = alice.getGraph();
+			const alicePub = Buffer.from(alice.getNodeId(), 'hex');
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+			const [n1, n2] =
+				Buffer.compare(alicePub, bobPub) < 0
+					? [alicePub, bobPub]
+					: [bobPub, alicePub];
+			for (const channelId of channelIds) {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const st = (alice as any).channelManager
+					.getChannel(channelId)
+					.getFullState();
+				const scid = (st.shortChannelId ?? st.scidAlias) as Buffer;
+				expect(scid, 'channel has an scid').to.exist;
+				const ann: IChannelAnnouncementMessage = {
+					nodeSignature1: crypto.randomBytes(64),
+					nodeSignature2: crypto.randomBytes(64),
+					bitcoinSignature1: crypto.randomBytes(64),
+					bitcoinSignature2: crypto.randomBytes(64),
+					features: Buffer.alloc(0),
+					chainHash: REGTEST_CHAIN_HASH,
+					shortChannelId: scid,
+					nodeId1: n1,
+					nodeId2: n2,
+					bitcoinKey1: crypto.randomBytes(33),
+					bitcoinKey2: crypto.randomBytes(33)
+				};
+				expect(
+					aliceGraph.addChannelAnnouncement(ann),
+					'announcement entered the graph'
+				).to.be.true;
+				for (const direction of [0, 1]) {
+					const upd: IChannelUpdateMessage = {
+						signature: crypto.randomBytes(64),
+						chainHash: REGTEST_CHAIN_HASH,
+						shortChannelId: scid,
+						timestamp: Math.floor(Date.now() / 1000),
+						messageFlags: 1,
+						channelFlags: direction,
+						cltvExpiryDelta: 40,
+						htlcMinimumMsat: 1n,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0,
+						htlcMaximumMsat: 1_000_000_000n
+					};
+					expect(aliceGraph.applyChannelUpdate(upd), 'update entered the graph')
+						.to.be.true;
+				}
+			}
+
+			const invoice = bob.createInvoice({
+				description: 'advertised max vs spendable',
+				amountMsat: 150_000_000n
+			});
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const cm = (alice as any).channelManager;
+			const dispatched: string[] = [];
+			const origAdd = cm.addHtlc.bind(cm);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cm.addHtlc = (cid: Buffer, ...rest: any[]): unknown => {
+				dispatched.push(cid.toString('hex'));
+				return origAdd(cid, ...rest);
+			};
+
+			const payment = alice.sendPayment(invoice.bolt11);
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(alice.getPayment(payment.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(
+				dispatched.length,
+				'split into two parts sized by spendable'
+			).to.equal(2);
+			expect(
+				new Set(dispatched).size,
+				'parts left over distinct channels'
+			).to.equal(2);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('MPP dispatch honors the planner-selected SCID for each part (#254)', async function () {
+			// Capacity is accounted per SCID during planning, so each part must
+			// leave over the channel it was sized for. Peer-based selection
+			// ranked sibling channels by balance and could reseat a part on a
+			// channel that cannot actually carry it, with no way to roll back
+			// parts already sent.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(74),
+				htlcBasepointSecret: htlcSecretFor(74)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(75),
+				htlcBasepointSecret: htlcSecretFor(75)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			const smallChannelId = openReadyChannel(alice, bob, 200_000n);
+			const bigChannelId = openReadyChannel(alice, bob, 500_000n);
+			const scidOf = (channelId: Buffer): Buffer => {
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				const st = (alice as any).channelManager
+					.getChannel(channelId)
+					.getFullState();
+				return (st.shortChannelId ?? st.scidAlias) as Buffer;
+			};
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+
+			const invoice = bob.createInvoice({
+				description: 'scid honor',
+				amountMsat: 100_000_000n
+			});
+			const decoded = decodeInvoice(invoice.bolt11);
+
+			const mkPart = (
+				scid: Buffer
+			): {
+				hops: Array<{
+					pubkey: Buffer;
+					shortChannelId: Buffer;
+					amountToForwardMsat: bigint;
+					outgoingCltvValue: number;
+					cltvExpiryDelta: number;
+					feeBaseMsat: number;
+					feeProportionalMillionths: number;
+				}>;
+				totalAmountMsat: bigint;
+				totalCltvDelta: number;
+				totalFeeMsat: bigint;
+			} => ({
+				hops: [
+					{
+						pubkey: bobPub,
+						shortChannelId: scid,
+						amountToForwardMsat: 50_000_000n,
+						outgoingCltvValue: 40,
+						cltvExpiryDelta: 40,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0
+					}
+				],
+				totalAmountMsat: 50_000_000n,
+				totalCltvDelta: 40,
+				totalFeeMsat: 0n
+			});
+			// Part 1 deliberately planned on the SMALLER channel: pre-fix,
+			// balance-ranked peer selection reseated it on the bigger one.
+			const multiRoute = {
+				parts: [mkPart(scidOf(smallChannelId)), mkPart(scidOf(bigChannelId))],
+				totalAmountMsat: 100_000_000n,
+				totalFeeMsat: 0n
+			};
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const cm = (alice as any).channelManager;
+			const dispatched: string[] = [];
+			const origAdd = cm.addHtlc.bind(cm);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			cm.addHtlc = (cid: Buffer, ...rest: any[]): unknown => {
+				dispatched.push(cid.toString('hex'));
+				return origAdd(cid, ...rest);
+			};
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const payment = (alice as any).sendPaymentMpp(
+				invoice.bolt11,
+				{
+					paymentHash: decoded.paymentHash,
+					paymentSecret: decoded.paymentSecret,
+					amountMsat: decoded.amountMsat
+				},
+				multiRoute,
+				40
+			);
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(dispatched, 'each part left on its planned channel').to.deep.equal(
+				[smallChannelId.toString('hex'), bigChannelId.toString('hex')]
+			);
+			expect(alice.getPayment(payment.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+
+			alice.destroy();
+			bob.destroy();
 		});
 
 		it('a channel-scoped failure on the second part penalizes that part culpable SCID', function () {

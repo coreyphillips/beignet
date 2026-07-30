@@ -7116,13 +7116,15 @@ export class LightningNode extends EventEmitter {
 			// A splice keeps using its pre-splice scid until the lock.
 			const scid = st.shortChannelId ?? st.scidAlias;
 			if (!scid) continue;
-			// The ceiling is what addHtlc will actually accept — reserve,
+			// The ceiling is the channel's spendable liquidity — reserve,
 			// in-flight HTLCs and commit fee subtracted, and mid-splice the min
-			// across both fundings — so the router never offers a route (or
-			// sizes an MPP part) the channel then refuses. The raw
-			// localBalanceMsat bound previously used for NORMAL channels let a
-			// near-balance single path or MPP part through that could only die
-			// locally in addHtlc as "insufficient balance" (#254).
+			// across both fundings — so the router does not size a route or an
+			// MPP part past what addHtlc admits on liquidity grounds (addHtlc
+			// still enforces more: HTLC minimums, in-flight count/value caps,
+			// dust exposure, channel state). The raw localBalanceMsat bound
+			// previously used for NORMAL channels let a near-balance single
+			// path or MPP part through that could only die locally in addHtlc
+			// as "insufficient balance" (#254).
 			const outboundMsat = channel.getSpendableOutboundMsat();
 			if (outboundMsat <= 0n) continue;
 			edges.push({
@@ -7961,11 +7963,13 @@ export class LightningNode extends EventEmitter {
 			);
 			const onionBuf = encodeOnionPacket(onionPacket);
 
-			const firstHopPubkey = hops[0].pubkey.toString('hex');
-			const outChannel = this.findChannelForPeer(
-				firstHopPubkey,
-				hops[0].amountToForwardMsat
-			);
+			// Honor the planner's channel: MPP capacity was accounted per SCID,
+			// so each part must leave over the channel it was sized for.
+			// Peer-based selection could reseat the part on a sibling channel
+			// (chosen by balance) that cannot actually carry it, and a locally
+			// refused part cannot be rolled back once earlier parts are out.
+			// Same selection rule as sendPaymentToRoute.
+			const outChannel = this.firstHopChannelFor(partRoute);
 			if (!outChannel) continue;
 
 			const channelId = outChannel.getChannelId()!;
@@ -12223,24 +12227,22 @@ export class LightningNode extends EventEmitter {
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];
 
-		// Sort by local balance descending
-		normalChannels.sort((a, b) => {
-			const balA = a.getFullState().localBalanceMsat;
-			const balB = b.getFullState().localBalanceMsat;
-			if (balA > balB) return -1;
-			if (balA < balB) return 1;
-			return 0;
-		});
-
-		// If amount specified, prefer a channel with sufficient balance
-		if (amountMsat !== undefined) {
-			const sufficient = normalChannels.find(
-				(ch) => ch.getFullState().localBalanceMsat >= amountMsat
+		// Rank by SPENDABLE outbound, not raw local balance: reserve, commit
+		// fee and in-flight HTLCs can make the bigger-balance channel exactly
+		// the one that refuses the HTLC (#254 review).
+		const bySpendable = normalChannels
+			.map((ch) => ({ ch, spendable: ch.getSpendableOutboundMsat() }))
+			.sort((a, b) =>
+				a.spendable > b.spendable ? -1 : a.spendable < b.spendable ? 1 : 0
 			);
-			if (sufficient) return sufficient;
+
+		// If amount specified, prefer a channel that can actually carry it
+		if (amountMsat !== undefined) {
+			const sufficient = bySpendable.find((e) => e.spendable >= amountMsat);
+			if (sufficient) return sufficient.ch;
 		}
 
-		// Fall back to largest balance channel
-		return normalChannels[0];
+		// Fall back to the most spendable channel
+		return bySpendable[0].ch;
 	}
 }
