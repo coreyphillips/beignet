@@ -7,6 +7,7 @@
  */
 
 import { Network } from '../invoice/types';
+import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
 import { IRoute, INodeAddress } from '../gossip/types';
@@ -437,9 +438,15 @@ export interface IKeysendRetrySource {
 }
 
 export interface IPaymentRetryContext {
-	/** Absent for keysend, which replays `keysend` instead. */
+	/** Absent for keysend and BOLT 12, which replay their own sources. */
 	invoiceStr?: string;
 	keysend?: IKeysendRetrySource;
+	/**
+	 * A BOLT 12 payment has no invoice string to re-pay, so a retry
+	 * re-dispatches the decoded invoice through payBolt12Invoice with the
+	 * accumulated channel exclusions.
+	 */
+	bolt12Invoice?: IBolt12Invoice;
 	excludedChannels: Set<string>;
 	retryCount: number;
 	maxRetries: number;
