@@ -48,7 +48,14 @@ import {
 	decodeSpliceLockedMessage,
 	decodeStartBatchMessage
 } from '../message/splice';
-import { ChannelAction, ChannelActionType } from './channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType,
+	IChannelPersistRequest,
+	ISendMessageAction,
+	RETRANSMITTABLE_MESSAGE_TYPES,
+	SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
+} from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChainMonitor } from '../chain/chain-monitor';
 import {
@@ -2246,6 +2253,19 @@ export class ChannelManager extends EventEmitter {
 		// commitment tx (if we cached it) to any listener so it can ship justice
 		// data to towers before the peer can broadcast the breach.
 		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
+
+		// Recovery outbox: the peer's revocation proves it holds every update we
+		// sent and the commitment_signed that covered them, so BOLT 2 can never
+		// ask us to retransmit them again. This mirrors channel.ts clearing its
+		// in-memory _lastSentBatch on the same event, and is what keeps the
+		// table bounded to roughly one commitment round per channel.
+		if (!hadError && channel.getChannelId()) {
+			this.emit(
+				'outbox:superseded',
+				channel.getChannelId()!.toString('hex'),
+				SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
+			);
+		}
 		if (!hadError) {
 			const revokedTx = channel.takeRevokedCommitmentTx(
 				msg.perCommitmentSecret
@@ -4371,9 +4391,79 @@ export class ChannelManager extends EventEmitter {
 					0
 			);
 		}
+
+		// ── Structural persist-before-send (Recovery Protocol 5.1/5.2) ──
+		// Every retransmittable SEND_MESSAGE that FOLLOWS the batch's
+		// PERSIST_STATE is authorized by the state that persist writes, so its
+		// exact wire bytes are handed to the persist listener and committed in
+		// the SAME transaction. Ordering safety no longer rests on each handler
+		// happening to place PERSIST_STATE before its sends: a send whose
+		// justifying state failed to commit is withheld outright.
+		const batchChannelId = channel.getChannelId();
+		const persistIndex = actions.findIndex(
+			(a) => a.type === ChannelActionType.PERSIST_STATE
+		);
+		const persistRequest: IChannelPersistRequest | null =
+			persistIndex >= 0 && batchChannelId
+				? {
+						outbound: actions
+							.slice(persistIndex + 1)
+							.filter(
+								(a): a is ISendMessageAction =>
+									a.type === ChannelActionType.SEND_MESSAGE &&
+									RETRANSMITTABLE_MESSAGE_TYPES.has(a.messageType)
+							)
+							.map((a) => ({
+								peerId: peerPubkey,
+								channelId: batchChannelId.toString('hex'),
+								messageType: a.messageType,
+								wireMessage: a.payload,
+								disposition: 'pending_send' as const
+							})),
+						committed: true,
+						outboxIds: []
+				  }
+				: null;
+		// Set once a persist fails: nothing that persist authorized may go out.
+		let sendsBlocked = false;
+
+		this.emit('transition:begin', batchChannelId?.toString('hex') ?? null);
+		try {
+			this._dispatchActions(
+				peerPubkey,
+				channel,
+				actions,
+				persistRequest,
+				() => sendsBlocked,
+				(blocked: boolean) => {
+					sendsBlocked = blocked;
+				}
+			);
+			if (!sendsBlocked && persistRequest && persistRequest.outboxIds.length) {
+				this.emit('outbox:sent', persistRequest.outboxIds);
+			}
+		} finally {
+			this.emit('transition:end', batchChannelId?.toString('hex') ?? null);
+		}
+	}
+
+	private _dispatchActions(
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[],
+		persistRequest: IChannelPersistRequest | null,
+		sendsBlocked: () => boolean,
+		setSendsBlocked: (blocked: boolean) => void
+	): void {
+		let persistSeen = false;
 		for (const action of actions) {
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
+					// A message the failed persist authorized must not reach the
+					// peer: the state that justifies it is not on disk.
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
 					// BOLT 1: the SENDER of an error must fail the channel too. A
 					// channel that just emitted a wire error and sits ERRORED (peer
@@ -4480,10 +4570,17 @@ export class ChannelManager extends EventEmitter {
 					);
 					break;
 				case ChannelActionType.PERSIST_STATE:
+					persistSeen = true;
 					this.emit(
 						'channel:persist',
-						channel.getChannelId() || channel.getTemporaryChannelId()
+						channel.getChannelId() || channel.getTemporaryChannelId(),
+						persistRequest ?? undefined
 					);
+					// No listener (or no storage) leaves committed true, which is
+					// the pre-outbox behavior for a node that persists nothing.
+					if (persistRequest && !persistRequest.committed) {
+						setSendsBlocked(true);
+					}
 					break;
 				case ChannelActionType.SPLICE_COMPLETE:
 					this.emit('splice:complete', channel.getChannelId());
