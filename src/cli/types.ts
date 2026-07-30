@@ -813,11 +813,18 @@ export interface BeignetNodeEvents {
 		amountSats: number;
 	}) => void;
 	/**
-	 * An on-chain transaction touching the wallet appeared (usually still
-	 * unconfirmed) or confirmed. Fires for both directions; `info.type` says
-	 * which. Initial-sync history does not replay as events.
+	 * On-chain lifecycle, one appearance and at most one confirmation per
+	 * transaction. `transaction:received` fires when an incoming transaction
+	 * first appears, `transaction:sent` when an outgoing one does; either may
+	 * already carry a height when the transaction was found at a catch-up
+	 * sync after downtime, and no separate confirmation fires for that case.
+	 * `transaction:confirmed` fires only for the transition, a transaction
+	 * the wallet already held moving from the mempool into a block, in
+	 * either direction with `info.type` saying which. Initial-sync history
+	 * does not replay as events.
 	 */
 	'transaction:received': (info: OnchainTxInfo) => void;
+	'transaction:sent': (info: OnchainTxInfo) => void;
 	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;

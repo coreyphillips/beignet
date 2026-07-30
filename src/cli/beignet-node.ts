@@ -2288,25 +2288,30 @@ export class BeignetNode extends EventEmitter {
 		key: K,
 		data: TMessageDataMap[K]
 	): void {
-		if (key !== 'transactionReceived' && key !== 'transactionConfirmed') {
-			return;
-		}
+		const relayed = {
+			transactionReceived: {
+				event: 'transaction:received',
+				label: 'Transaction received'
+			},
+			transactionSent: {
+				event: 'transaction:sent',
+				label: 'Transaction sent'
+			},
+			transactionConfirmed: {
+				event: 'transaction:confirmed',
+				label: 'Transaction confirmed'
+			}
+		} as const;
+		if (!(key in relayed)) return;
+		const { event, label } = relayed[key as keyof typeof relayed];
 		const { transaction } = data as TMessageDataMap['transactionReceived'];
 		const info = this.toOnchainTxInfo(transaction);
-		const received = key === 'transactionReceived';
-		this.log(
-			'info',
-			received ? 'Transaction received' : 'Transaction confirmed',
-			{
-				txid: info.txid,
-				type: info.type,
-				valueSats: info.valueSats
-			}
-		);
-		this.emit(
-			received ? 'transaction:received' : 'transaction:confirmed',
-			info
-		);
+		this.log('info', label, {
+			txid: info.txid,
+			type: info.type,
+			valueSats: info.valueSats
+		});
+		this.emit(event, info);
 	}
 
 	// IFormattedTransaction stores value/fee in BTC (see wallet formatting),

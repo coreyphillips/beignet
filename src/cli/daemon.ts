@@ -218,8 +218,10 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'invoice:settled',
 		// On-chain money movements, sourced from the wallet rather than the
 		// lightning node. Without these an on-chain receive is invisible until
-		// a client polls /transactions for the difference.
+		// a client polls /transactions for the difference. Appearance events
+		// are per direction; the confirmation is a transition and covers both.
 		'transaction:received',
+		'transaction:sent',
 		'transaction:confirmed',
 		'channel:opening',
 		'channel:ready',

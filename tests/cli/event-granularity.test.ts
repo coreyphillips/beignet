@@ -77,7 +77,11 @@ describe('Event granularity (M4 batch 2b)', () => {
 	// and until now nothing listened, so an on-chain receive changed
 	// /transactions and said nothing. These pin the whole relay chain.
 	describe('transaction events (wallet-sourced)', () => {
-		const TX_EVENTS = ['transaction:received', 'transaction:confirmed'];
+		const TX_EVENTS = [
+			'transaction:received',
+			'transaction:sent',
+			'transaction:confirmed'
+		];
 
 		it('relays them, with and without htlc events', () => {
 			for (const e of TX_EVENTS) {
@@ -143,13 +147,30 @@ describe('Event granularity (M4 batch 2b)', () => {
 			expect(emitted[1][0]).to.equal('transaction:confirmed');
 			expect(emitted[1][1].confirmed).to.equal(true);
 
+			(BeignetNode.prototype as any).onWalletMessage.call(
+				fake,
+				'transactionSent',
+				{
+					transaction: {
+						...message.transaction,
+						type: EPaymentType.sent,
+						value: -0.0005,
+						fee: 0.00000141
+					}
+				}
+			);
+			expect(emitted).to.have.length(3);
+			expect(emitted[2][0]).to.equal('transaction:sent');
+			expect(emitted[2][1].type).to.equal('sent');
+			expect(emitted[2][1].feeSats).to.equal(141);
+
 			// The keys not relayed stay silent rather than half-translated.
 			(BeignetNode.prototype as any).onWalletMessage.call(
 				fake,
 				'connectedToElectrum',
 				true
 			);
-			expect(emitted).to.have.length(2);
+			expect(emitted).to.have.length(3);
 		});
 	});
 

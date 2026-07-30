@@ -2850,11 +2850,10 @@ export class Wallet {
 		const sentTxs: TTransactionMessage[] = [];
 
 		Object.keys(transactions).forEach((txid) => {
+			const stored = storedTransactions[txid];
+			const isNew = !stored;
 			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (
-				!storedTransactions[txid] ||
-				storedTransactions[txid].height !== transactions[txid].height
-			) {
+			if (isNew || stored.height !== transactions[txid].height) {
 				formattedTransactions[txid] = {
 					...transactions[txid],
 					// Keep the previous timestamp if the tx is not new.
@@ -2863,12 +2862,27 @@ export class Wallet {
 						transactions[txid]?.timestamp ??
 						Date.now()
 				};
-				if ((formattedTransactions[txid]?.height ?? 0) > 0)
+				// A confirmation is a transition: a transaction the wallet already
+				// held moving from the mempool into a block. A transaction first
+				// discovered with a height, found at a catch-up sync after
+				// downtime, is one piece of news and not two; its appearance
+				// message already carries the height, and announcing its
+				// confirmation as well produced two messages for one discovery,
+				// in reverse order, since confirmations are sent before
+				// appearances below. A height moving between blocks in a reorg
+				// is not a confirmation either, and the reorg path has its own
+				// message.
+				if (
+					!isNew &&
+					(stored.height ?? 0) <= 0 &&
+					(formattedTransactions[txid]?.height ?? 0) > 0
+				) {
 					confirmedTxs.push({ transaction: formattedTransactions[txid] });
+				}
 			}
 
 			// if the tx is new, incoming but not from a transfer - show notification
-			if (!(txid in storedTransactions)) {
+			if (isNew) {
 				if (transactions[txid].type === EPaymentType.received) {
 					receivedTxs.push({ transaction: transactions[txid] });
 				} else if (transactions[txid].type === EPaymentType.sent) {
