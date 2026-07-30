@@ -5402,6 +5402,23 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether a peer negotiated the features splicing needs, option_splice and
+	 * option_quiesce, on its current connection. Null when there is nothing to
+	 * read: the peer is not connected, or its init has not arrived yet. This is
+	 * the same answer _validateSpliceRequest enforces, exposed so a client can
+	 * know before it asks; a UI offering splice controls against an LND peer is
+	 * offering an action the daemon will refuse every time.
+	 */
+	peerSupportsSplicing(peerPubkey: string): boolean | null {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return null;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.SPLICE)
+		);
+	}
+
+	/**
 	 * Shared splice pre-flight checks: dust-level amounts and peer feature
 	 * support (option_splice + option_quiesce). Returns an error string or null.
 	 */
@@ -5413,15 +5430,11 @@ export class LightningNode extends EventEmitter {
 			return `splice amount ${amountSats} sats is at or below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
-		if (peerPubkey && this.peerManager) {
-			const init = this.peerManager.getPeer(peerPubkey)?.getRemoteInit();
-			if (
-				init &&
-				(!init.features.hasFeature(Feature.QUIESCE) ||
-					!init.features.hasFeature(Feature.SPLICE))
-			) {
-				return 'peer does not support splicing (option_splice/option_quiesce not negotiated)';
-			}
+		// Unknown support (no init to read) passes, as it always has: the
+		// splice will fail on its own if the peer truly cannot, and refusing on
+		// ignorance would block splices on reconnecting channels.
+		if (peerPubkey && this.peerSupportsSplicing(peerPubkey) === false) {
+			return 'peer does not support splicing (option_splice/option_quiesce not negotiated)';
 		}
 		return null;
 	}

@@ -14,6 +14,7 @@ import {
 	estimateSpliceTxWeight,
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
+import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -186,6 +187,57 @@ describe('LightningNode splice validation', function () {
 		);
 		expect(channel._spliceOutDestination.script.equals(externalScript)).to.be
 			.true;
+		node.destroy();
+	});
+});
+
+describe('LightningNode peerSupportsSplicing', function () {
+	const PEER = '02'.padEnd(66, 'ab');
+	const withInit = (node: LightningNode, features: FeatureFlags | null) => {
+		(node as any).peerManager = {
+			getPeer: () =>
+				features === null ? undefined : { getRemoteInit: () => ({ features }) },
+			destroy: () => {}
+		};
+	};
+
+	it('is null when there is nothing to read', function () {
+		const node = createTestNode();
+		expect(node.peerSupportsSplicing(PEER), 'no peer manager yet').to.be.null;
+		withInit(node, null);
+		expect(node.peerSupportsSplicing(PEER), 'peer not connected').to.be.null;
+		node.destroy();
+	});
+
+	it('reads the negotiated features, not a guess', function () {
+		const node = createTestNode();
+		const both = new FeatureFlags();
+		both.setOptional(Feature.QUIESCE);
+		both.setOptional(Feature.SPLICE);
+		withInit(node, both);
+		expect(node.peerSupportsSplicing(PEER)).to.be.true;
+
+		// splice without quiesce is not splicing support: stfu is the first
+		// message of every splice, so both bits are required, same as the
+		// validation this mirrors.
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		withInit(node, spliceOnly);
+		expect(node.peerSupportsSplicing(PEER)).to.be.false;
+
+		withInit(node, new FeatureFlags());
+		expect(node.peerSupportsSplicing(PEER)).to.be.false;
+		node.destroy();
+	});
+
+	it('is what the splice pre-flight enforces: an LND-shaped peer refuses', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// LND advertises neither option_splice nor option_quiesce.
+		withInit(node, new FeatureFlags());
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.ok).to.be.false;
+		expect(result.error).to.include('does not support splicing');
 		node.destroy();
 	});
 });
