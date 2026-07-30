@@ -130,12 +130,26 @@ export class OfferManager extends EventEmitter {
 		}
 	> = new Map();
 	private onionMessageManager: OnionMessageManager | null = null;
+	/**
+	 * In-flight requestInvoice calls, keyed by a UNIQUE per-request id: the
+	 * reply path's path_id (hex) when the request went out with one, a random
+	 * id otherwise. NEVER keyed by offer id — an offer is a reusable payment
+	 * code, so two live requests for the same offer are normal, and an
+	 * offer-id key made the second overwrite the first while the first's
+	 * stale timer then evicted the second (#250).
+	 */
 	private pendingInvoiceRequests: Map<
 		string,
 		{
 			resolve: (invoice: IBolt12Invoice) => void;
 			reject: (err: Error) => void;
 			timer: ReturnType<typeof setTimeout>;
+			/**
+			 * Offer this request was made against — carried per entry (it is
+			 * NOT the map key) for the legacy description/issuer match of
+			 * invoices that arrive without a reply-path binding.
+			 */
+			offerIdHex: string;
 			/**
 			 * The signed invreq records we sent, retained so the invoice's
 			 * mirrored fields can be checked (BOLT 12: the reader MUST reject an
@@ -584,20 +598,25 @@ export class OfferManager extends EventEmitter {
 
 		this.emit('invoice:requested', request);
 
-		// Wait for invoice response
+		// Wait for invoice response. The map key is a unique per-request id
+		// (see pendingInvoiceRequests), so concurrent requests for the same
+		// offer coexist and this timer deletes exactly its own entry.
 		return new Promise<IBolt12Invoice>((resolve, reject) => {
-			const offerIdHex = offer.offerId.toString('hex');
+			const requestIdHex = (replyPathId ?? crypto.randomBytes(32)).toString(
+				'hex'
+			);
 			const timer = setTimeout(() => {
-				this.pendingInvoiceRequests.delete(offerIdHex);
+				this.pendingInvoiceRequests.delete(requestIdHex);
 				reject(new Error('Invoice request timed out'));
 			}, this.invoiceRequestTimeoutMs);
 
-			this.pendingInvoiceRequests.set(offerIdHex, {
+			this.pendingInvoiceRequests.set(requestIdHex, {
 				resolve,
 				reject,
 				timer,
 				sentRecords,
-				replyPathId
+				replyPathId,
+				offerIdHex: offer.offerId.toString('hex')
 			});
 		});
 	}
@@ -933,23 +952,30 @@ export class OfferManager extends EventEmitter {
 	private handleIncomingInvoice(data: Buffer, pathId?: Buffer): void {
 		const { invoice, records } = decodeInvoiceTlv(data);
 
-		// BOLT 12 reader checks (S-4.H3): the signature commits to the FULL
-		// record set (mirrored + unknown fields included), the invoice MUST
-		// carry blinded payment paths with exactly one payinfo per path, and
-		// its invreq-range fields MUST byte-match the request we sent.
-		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null => {
+		// BOLT 12 reader checks (S-4.H3), split in two. The request-independent
+		// part — the signature commits to the FULL record set (mirrored +
+		// unknown fields included), and the invoice MUST carry blinded payment
+		// paths with exactly one payinfo per path — is memoized so candidate
+		// scanning runs it once. The per-request part checks the invoice's
+		// invreq-range fields byte-match the records THAT request sent.
+		let globalReasonMemo: string | null | undefined;
+		const globalReason = (): string | null => {
+			if (globalReasonMemo !== undefined) return globalReasonMemo;
 			if (!this.verifyInvoiceSignature(invoice, records)) {
-				return 'invalid invoice signature';
-			}
-			if (!invoice.paths || invoice.paths.length === 0) {
-				return 'invoice_paths missing or empty';
-			}
-			if (
+				globalReasonMemo = 'invalid invoice signature';
+			} else if (!invoice.paths || invoice.paths.length === 0) {
+				globalReasonMemo = 'invoice_paths missing or empty';
+			} else if (
 				!invoice.blindedPayInfo ||
 				invoice.blindedPayInfo.length !== invoice.paths.length
 			) {
-				return 'invoice_blindedpay must carry one payinfo per path';
+				globalReasonMemo = 'invoice_blindedpay must carry one payinfo per path';
+			} else {
+				globalReasonMemo = null;
 			}
+			return globalReasonMemo;
+		};
+		const mirrorReason = (sentRecords?: ITlvRecord[]): string | null => {
 			if (sentRecords) {
 				for (const sent of sentRecords) {
 					if (sent.type === 240n) continue; // signature not mirrored
@@ -961,19 +987,24 @@ export class OfferManager extends EventEmitter {
 			}
 			return null;
 		};
+		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null =>
+			globalReason() ?? mirrorReason(sentRecords);
 
 		const settle = (
-			offerIdHex: string,
+			requestIdHex: string,
 			pending: NonNullable<
 				ReturnType<(typeof this.pendingInvoiceRequests)['get']>
 			>
 		): void => {
 			const reason = validateAgainstSent(pending.sentRecords);
 			clearTimeout(pending.timer);
-			this.pendingInvoiceRequests.delete(offerIdHex);
+			this.pendingInvoiceRequests.delete(requestIdHex);
 			if (reason) {
 				pending.reject(new Error(`Rejected BOLT 12 invoice: ${reason}`));
-				this.emit('invoice:error', { error: reason });
+				this.emit('invoice:error', {
+					error: reason,
+					matchedPendingRequest: true
+				});
 				return;
 			}
 			pending.resolve(invoice);
@@ -982,18 +1013,22 @@ export class OfferManager extends EventEmitter {
 
 		// BOLT 4: an invoice delivered over one of OUR blinded reply paths
 		// surfaces the path_id we embedded — the strongest possible binding to
-		// the request that issued it. Match on it first; a path_id that matches
+		// the request that issued it, and (by construction) exactly that
+		// request's map key, so the lookup is direct. A path_id that matches
 		// no pending request means the message did not come over a path we
-		// issued for a live request, so ignore it entirely.
+		// issued for a live request, so ignore it entirely. A validation
+		// failure here DOES reject the bound request: the invoice provably
+		// answers it, and it is invalid.
 		if (pathId) {
-			for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-				if (pending.replyPathId && pending.replyPathId.equals(pathId)) {
-					settle(offerIdHex, pending);
-					return;
-				}
+			const requestIdHex = pathId.toString('hex');
+			const pending = this.pendingInvoiceRequests.get(requestIdHex);
+			if (pending?.replyPathId?.equals(pathId)) {
+				settle(requestIdHex, pending);
+				return;
 			}
 			this.emit('invoice:error', {
-				error: 'invoice path_id matches no pending invoice_request'
+				error: 'invoice path_id matches no pending invoice_request',
+				matchedPendingRequest: false
 			});
 			return;
 		}
@@ -1001,21 +1036,41 @@ export class OfferManager extends EventEmitter {
 		// No path_id: the invoice did NOT arrive over a blinded reply path we
 		// issued. A pending request that sent one (replyPathId set) must only be
 		// resolved via that path, so it is skipped here; legacy pendings created
-		// without an onion send (no reply path) keep the description/issuer match.
-		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
+		// without an onion send (no reply path) keep the description/issuer match
+		// (the offer comes from the entry's offerIdHex — the map key is the
+		// per-request id).
+		//
+		// Matching is NON-destructive across candidates: two live requests for
+		// the same offer look identical at the offer level, so an out-of-order
+		// invoice must not consume (and reject) the first compatible entry.
+		// It settles only the request whose SENT records it actually mirrors;
+		// a miss leaves every pending untouched for the invoice that does
+		// belong to it (#250). Only when some candidate matched the offer but
+		// none validated is the invoice surfaced as unmatchable — cancelling
+		// nothing.
+		let sawCompatibleOffer = false;
+		for (const [requestIdHex, pending] of this.pendingInvoiceRequests) {
 			if (pending.replyPathId) continue;
-			const offerEntry = this.offers.get(offerIdHex);
-			if (offerEntry) {
-				// Match by description and issuer
-				const descMatch = offerEntry.offer.description === invoice.description;
-				const issuerMatch =
-					!offerEntry.offer.issuerId ||
-					invoice.nodeId.equals(offerEntry.offer.issuerId);
-				if (descMatch && issuerMatch) {
-					settle(offerIdHex, pending);
-					return;
-				}
-			}
+			const offerEntry = this.offers.get(pending.offerIdHex);
+			if (!offerEntry) continue;
+			// Match by description and issuer
+			const descMatch = offerEntry.offer.description === invoice.description;
+			const issuerMatch =
+				!offerEntry.offer.issuerId ||
+				invoice.nodeId.equals(offerEntry.offer.issuerId);
+			if (!descMatch || !issuerMatch) continue;
+			sawCompatibleOffer = true;
+			if (validateAgainstSent(pending.sentRecords) !== null) continue;
+			settle(requestIdHex, pending);
+			return;
+		}
+		if (sawCompatibleOffer) {
+			this.emit('invoice:error', {
+				error:
+					'invoice matches a pending request offer but validates against none of them',
+				matchedPendingRequest: false
+			});
+			return;
 		}
 
 		// A sole pending request with no reply-path binding may resolve an
@@ -1025,21 +1080,24 @@ export class OfferManager extends EventEmitter {
 		// forged one consume it (settle rejects on validation failure), so it
 		// is surfaced without cancelling anything.
 		if (this.pendingInvoiceRequests.size === 1) {
-			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
-				.value!;
+			const [requestIdHex, pending] = this.pendingInvoiceRequests
+				.entries()
+				.next().value!;
 			if (!pending.replyPathId) {
 				if (this.allowUnboundInvoiceFallback) {
-					settle(offerIdHex, pending);
+					settle(requestIdHex, pending);
 					return;
 				}
 				this.emit('invoice:error', {
 					error:
-						'unbound invoice ignored: the pending invoice_request has no reply-path binding'
+						'unbound invoice ignored: the pending invoice_request has no reply-path binding',
+					matchedPendingRequest: false
 				});
 				return;
 			}
 			this.emit('invoice:error', {
-				error: 'invoice lacks the path_id of its pending invoice_request'
+				error: 'invoice lacks the path_id of its pending invoice_request',
+				matchedPendingRequest: false
 			});
 			return;
 		}
@@ -1057,17 +1115,22 @@ export class OfferManager extends EventEmitter {
 		// surfaces the path_id we embedded for that request. An error bound to
 		// no pending request is surfaced but cancels nothing; the request
 		// keeps waiting and times out on its own timer.
+		let matchedPendingRequest = false;
 		if (pathId) {
-			for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-				if (pending.replyPathId?.equals(pathId)) {
-					clearTimeout(pending.timer);
-					this.pendingInvoiceRequests.delete(offerIdHex);
-					pending.reject(new Error(`Invoice error: ${error.error}`));
-					break;
-				}
+			// A wired request is keyed by its reply path's path_id, so the
+			// bound entry (if any) is a direct lookup.
+			const requestIdHex = pathId.toString('hex');
+			const pending = this.pendingInvoiceRequests.get(requestIdHex);
+			if (pending?.replyPathId?.equals(pathId)) {
+				clearTimeout(pending.timer);
+				this.pendingInvoiceRequests.delete(requestIdHex);
+				pending.reject(new Error(`Invoice error: ${error.error}`));
+				matchedPendingRequest = true;
 			}
 		}
 
-		this.emit('invoice:error', error);
+		// The flag lets consumers tell "my request failed" from "an unrelated
+		// error was observed" (#250); it is local telemetry, never wire data.
+		this.emit('invoice:error', { ...error, matchedPendingRequest });
 	}
 }
