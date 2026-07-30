@@ -127,11 +127,18 @@ export interface IInvoiceError {
 	suggestedValue?: Buffer;
 	/** Human-readable error string */
 	error: string;
+}
+
+/**
+ * Payload of a payer-side `invoice:error` event: the wire-level error plus
+ * local-only telemetry. Kept as a separate type from IInvoiceError so event
+ * metadata can never end up serialized into an outgoing invoice_error TLV
+ * (issuer-side emits carry the bare IInvoiceError and no flag).
+ */
+export interface IInvoiceErrorEvent extends IInvoiceError {
 	/**
-	 * Payer-side `invoice:error` events only: true when the error rejected a
-	 * pending invoice_request of ours, false when it was unbound and cancelled
-	 * nothing (observability only). Absent on issuer-side errors, and never
-	 * put on the wire.
+	 * True when the error rejected a pending invoice_request of ours; false
+	 * when it was unbound and cancelled nothing (observability only).
 	 */
-	matchedPendingRequest?: boolean;
+	matchedPendingRequest: boolean;
 }

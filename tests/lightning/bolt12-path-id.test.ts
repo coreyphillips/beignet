@@ -16,7 +16,13 @@ import {
 	TLV_INVOICE_REQUEST,
 	TLV_INVOICE
 } from '../../src/lightning/offer/offer-manager';
-import { encodeInvoiceErrorTlv } from '../../src/lightning/offer';
+import {
+	encodeInvoiceErrorTlv,
+	encodeOfferTlv,
+	encodeInvoiceRequestTlv,
+	IInvoiceRequest
+} from '../../src/lightning/offer';
+import { encodeTlvStream } from '../../src/lightning/message/tlv';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 
@@ -492,6 +498,54 @@ describe('BOLT 12 concurrent invoice requests for the SAME offer (#250)', functi
 			expect(invoiceB.description).to.equal('tip jar');
 		} finally {
 			destroyParties(parties);
+		}
+	});
+
+	it('pathless requests: out-of-order invoices settle their own request (non-destructive matching)', async function () {
+		// No onion manager: requests carry no reply path, so matching falls to
+		// the legacy description/issuer scan. Two live requests for the same
+		// offer are indistinguishable at the offer level; delivery order must
+		// not decide which one survives — the invoice may only settle the
+		// request whose sent records it mirrors, without consuming any other.
+		const { privkey } = generateKeyPair();
+		const mgr = new OfferManager(privkey);
+		try {
+			const { offer } = mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+			const captured: IInvoiceRequest[] = [];
+			mgr.on('invoice:requested', (r: IInvoiceRequest) => captured.push(r));
+
+			const pendingA = mgr.requestInvoice(offer);
+			const pendingB = mgr.requestInvoice(offer);
+			expect(captured).to.have.length(2);
+
+			// The same manager is the issuer (the offer is its own), so it can
+			// mint a valid mirrored invoice answering each request.
+			const offerTlv = encodeOfferTlv(offer);
+			const invoiceA = mgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(captured[0], offerTlv)
+			)!;
+			const invoiceB = mgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(captured[1], offerTlv)
+			)!;
+			expect(invoiceA, 'invoice for request A issued').to.not.be.null;
+			expect(invoiceB, 'invoice for request B issued').to.not.be.null;
+
+			// Deliver B first, then A: reversed relative to request order.
+			// Destructive first-compatible matching would validate invoice B
+			// against request A's records, reject A, and discard the invoice.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(mgr as any).handleIncomingInvoice(encodeTlvStream(invoiceB.records!));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(mgr as any).handleIncomingInvoice(encodeTlvStream(invoiceA.records!));
+
+			const [resolvedA, resolvedB] = await Promise.all([pendingA, pendingB]);
+			expect(resolvedA.paymentHash.equals(invoiceA.paymentHash)).to.be.true;
+			expect(resolvedB.paymentHash.equals(invoiceB.paymentHash)).to.be.true;
+		} finally {
+			mgr.destroy();
 		}
 	});
 });

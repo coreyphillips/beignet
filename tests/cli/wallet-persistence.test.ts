@@ -69,9 +69,10 @@ function readWalletRows(dbPath: string): Array<{ key: string; value: string }> {
 describe('Daemon on-chain wallet persistence', function () {
 	this.timeout(180_000);
 
-	it('SqliteStorage schema version is 10', () => {
-		// v10 added the offers table (BOLT 12 offer persistence).
-		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(10);
+	it('SqliteStorage schema version is 11', () => {
+		// v11 added the invoice_path_ids table (BOLT 12 receive-side path_id
+		// authentication) and offers.async_hold.
+		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(11);
 	});
 
 	describe('encrypted mode (default)', () => {
@@ -121,13 +122,13 @@ describe('Daemon on-chain wallet persistence', function () {
 			expect(raw.includes(markerUtxo.address)).to.equal(false);
 		});
 
-		it('recorded schema version is 10', () => {
+		it('recorded schema version is 11', () => {
 			const db = new Database(dbPath, { readonly: true });
 			try {
 				const row = db
 					.prepare('SELECT MAX(version) as v FROM schema_version')
 					.get() as { v: number };
-				expect(row.v).to.equal(10);
+				expect(row.v).to.equal(11);
 			} finally {
 				db.close();
 			}
