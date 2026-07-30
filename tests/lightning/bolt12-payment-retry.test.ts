@@ -33,6 +33,7 @@ import {
 	IInvoiceRequest,
 	IBolt12Invoice
 } from '../../src/lightning/offer';
+import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -307,6 +308,160 @@ describe('BOLT 12 payment retry (issue #261)', () => {
 			contexts.size,
 			'no context for a payment that never existed'
 		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('rotates to another blinded path when the blinded segment fails', () => {
+		const { alice, bob } = setupPair(948, 949);
+		const invoice = issueBolt12Invoice(bob, 948, 50_000n);
+
+		// Prepend a decoy path whose PUBLIC prefix is fine (bob, the
+		// introduction node, is reachable) but whose blinded tail is broken:
+		// bob must relay onward to a phantom hop he has no channel to, and
+		// fails the HTLC with invalid_onion_blinding. Channel exclusion cannot
+		// route around that (the erring hop's SCID is opaque), so without path
+		// exclusion every retry re-selected this path and the payment died
+		// without ever trying the invoice's working path.
+		const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+		const phantomPub = getPublicKey(crypto.randomBytes(32));
+		const brokenPath = constructBlindedPath(
+			crypto.randomBytes(32),
+			[bobPub, phantomPub],
+			[
+				{
+					shortChannelId: Buffer.alloc(8, 9),
+					paymentRelay: {
+						cltvExpiryDelta: 40,
+						feeProportionalMillionths: 0,
+						feeBaseMsat: 0
+					}
+				},
+				{ pathId: crypto.randomBytes(32) }
+			]
+		);
+		invoice.paths = [brokenPath, ...invoice.paths!];
+		invoice.blindedPayInfo = [
+			{
+				feeBaseMsat: 0,
+				feeProportionalMillionths: 0,
+				cltvExpiryDelta: 40,
+				htlcMinimumMsat: 0n,
+				htlcMaximumMsat: 50_000n
+			},
+			...invoice.blindedPayInfo!
+		];
+
+		// Count how often the broken path is attempted (it terminates in a
+		// forward on bob; the working single-hop path terminates at bob).
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobAny = bob as any;
+		const realForward = bobAny.handleForwardHtlc.bind(bob);
+		let forwardAttempts = 0;
+		bobAny.handleForwardHtlc = (...args: unknown[]): void => {
+			forwardAttempts++;
+			realForward(...args);
+		};
+
+		let received = false;
+		bob.on('payment:received', () => {
+			received = true;
+		});
+
+		alice.payBolt12Invoice(invoice);
+
+		const settled = alice
+			.listPayments()
+			.find((p) => p.paymentHash.equals(invoice.paymentHash));
+		expect(settled, 'payment record exists').to.not.be.undefined;
+		expect(settled!.status).to.equal(PaymentStatus.COMPLETED);
+		expect(settled!.retryCount, 'recovered on the first retry').to.equal(1);
+		expect(forwardAttempts, 'the broken path was tried exactly once').to.equal(
+			1
+		);
+		expect(received, "settled over the invoice's working path").to.be.true;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a dispatch exception after route construction leaves no retry context', () => {
+		const { alice, bob } = setupPair(950, 951);
+		const invoice = issueBolt12Invoice(bob, 950, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		const contexts = a.paymentRetryContexts as Map<string, unknown>;
+
+		// Route construction succeeds; resolving the first-hop channel fails,
+		// so sendPaymentToRoute throws AFTER the context was registered. A
+		// local failure never reaches the onion failure handler, so nothing
+		// else would clean the context up.
+		a.findChannelForPeer = (): null => null;
+		a.findLocalChannelByScid = (): null => null;
+
+		expect(() => alice.payBolt12Invoice(invoice)).to.throw(
+			/No channel to first hop/
+		);
+		expect(
+			contexts.size,
+			'no context survives a local dispatch exception'
+		).to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a local HTLC refusal after route construction leaves no retry context', () => {
+		const { alice, bob } = setupPair(952, 953);
+		const invoice = issueBolt12Invoice(bob, 952, 50_000n);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const a = alice as any;
+		const contexts = a.paymentRetryContexts as Map<string, unknown>;
+
+		// addHtlc refuses the HTLC: sendPaymentToRoute returns a FAILED
+		// payment instead of throwing, again without any onion failure to
+		// drive the retry machinery.
+		a.channelManager.addHtlc = (): { ok: boolean; error: string } => ({
+			ok: false,
+			error: 'test: HTLC refused locally'
+		});
+
+		const failed = alice.payBolt12Invoice(invoice);
+		expect(failed.status).to.equal(PaymentStatus.FAILED);
+		expect(contexts.size, 'no context survives a local HTLC refusal').to.equal(
+			0
+		);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('fails a pending BOLT 12 payment once its invoice expires', () => {
+		const { alice, bob } = setupPair(954, 955);
+		const invoice = issueBolt12Invoice(bob, 954, 50_000n);
+		// Issued two hours ago with a one-hour expiry.
+		invoice.createdAt = BigInt(Math.floor(Date.now() / 1000) - 7200);
+		invoice.relativeExpiry = 3600;
+		// Bob parks the HTLC so the payment stays PENDING past its expiry.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(bob as any).handleFinalHopHtlc = (): void => {};
+
+		alice.payBolt12Invoice(invoice);
+		expect(alice.getPayment(invoice.paymentHash)!.status).to.equal(
+			PaymentStatus.PENDING
+		);
+
+		// The expiry scanner previously only understood BOLT 11 invoice
+		// strings, so a BOLT 12 context was silently skipped here forever.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(alice as any).scanExpiredPendingPayments();
+
+		const payment = alice.getPayment(invoice.paymentHash)!;
+		expect(payment.status).to.equal(PaymentStatus.FAILED);
+		expect(payment.failureReason ?? '').to.contain('expired');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		expect((alice as any).paymentRetryContexts.size).to.equal(0);
 
 		alice.destroy();
 		bob.destroy();
