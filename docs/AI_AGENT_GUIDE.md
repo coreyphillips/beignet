@@ -616,6 +616,63 @@ curl http://localhost:2112/spend-limit -H "Authorization: Bearer $TOKEN"
 # { "ok": true, "result": { "limitSats": 100000, "spentSats": 42000, "remainingSats": 58000, "resetsAt": 1709078400000 } }
 ```
 
+## Paying for APIs with L402
+
+L402 (formerly LSAT) is the Lightning-native way to buy HTTP API access: no
+signup, no API key, no account. The server answers an unauthenticated request
+with `402 Payment Required` plus a macaroon and an invoice; the client pays and
+retries with the macaroon and the preimage.
+
+```typescript
+const result = await node.l402Fetch(
+  'https://api.example/v1/data',
+  { method: 'GET' },
+  { maxPriceSats: 50 }   // hard cap on what ONE challenge may cost
+);
+
+console.log(result.status, result.body);
+console.log('paid:', result.paid, 'cost:', result.amountPaidSats, 'sats');
+```
+
+What the client guarantees before any payment leaves:
+
+- The invoice's payment hash matches the hash the macaroon commits to. A server
+  cannot bill for one hash and hand you a token bound to another.
+- The price is known and under `maxPriceSats`. An amountless invoice is refused
+  outright, since its cost cannot be capped, and a sub-satoshi price rounds up
+  rather than down.
+- A macaroon that cannot be parsed is refused, so an unverifiable commitment is
+  never paid. `allowUnverifiedMacaroon: true` overrides this and should stay off.
+- At most one payment happens per call. A server that keeps returning 402 gets
+  paid once and the 402 is handed back to you.
+
+`maxPriceSats` is per request; your `dailySpendLimitSats` and `maxPaymentSats`
+still apply underneath it. An unattended agent wants both: one bounds a single
+purchase, the other bounds the wallet.
+
+Paid credentials are reused for the rest of the process lifetime, scoped per
+origin, so a paid API is paid for once rather than per request:
+
+```typescript
+node.listL402Credentials();          // what has been paid for
+node.forgetL402Credential(scope);    // drop one, so the next call pays again
+```
+
+Via HTTP:
+```bash
+curl -X POST http://localhost:2112/l402/fetch -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://api.example/v1/data","maxPriceSats":50}'
+```
+
+Via CLI:
+```bash
+beignet l402 fetch https://api.example/v1/data --max-price 50
+beignet l402 credentials
+```
+
+Serving L402-gated endpoints from your own node is not supported yet; this is
+the client half.
+
 ## Idempotency Keys
 
 Prevent duplicate payments from agent retry loops by adding the `X-Idempotency-Key` header to payment requests:

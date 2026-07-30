@@ -201,6 +201,11 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /keysend': [],
 	'POST /keysend/safe': [],
 	'POST /offer/pay': [],
+	// L402: fetch spends, and a credential IS a bearer token for paid access,
+	// so reading or dropping one is admin work too, not readonly.
+	'POST /l402/fetch': [],
+	'GET /l402/credentials': [],
+	'DELETE /l402/credential': [],
 	'POST /payment/send-to-route': [],
 	'POST /payment/cancel': [],
 	'POST /queue/add': [],

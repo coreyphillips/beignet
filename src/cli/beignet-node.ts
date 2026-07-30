@@ -33,6 +33,12 @@ import {
 import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import {
+	l402Fetch,
+	IL402Credential,
+	IL402RequestInit,
+	MemoryL402CredentialStore
+} from '../lightning/l402';
 import { IPaymentInfo } from '../lightning/node/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
@@ -589,6 +595,12 @@ export class BeignetNode extends EventEmitter {
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	private _maxPaymentSats?: number;
+	/**
+	 * Paid L402 credentials, so a gated API is paid for once rather than per
+	 * request. In memory by design: a credential is a bearer token for paid
+	 * access, and where a durable copy lands is a deployment decision.
+	 */
+	private readonly _l402Credentials = new MemoryL402CredentialStore();
 	private _draining = false;
 	private peerStorageEnabled = true;
 	/** Epoch ms of the last gossip/RGS sync completed this session. */
@@ -3923,6 +3935,80 @@ export class BeignetNode extends EventEmitter {
 	/** Remove a watchtower and drop its persisted sessions + backlog. */
 	removeWatchtower(uri: string): void {
 		this.node.removeWatchtower(uri);
+	}
+
+	// ─────────────── L402 (Lightning HTTP 402) ───────────────
+
+	/**
+	 * Fetch an L402-gated URL, paying the challenge if the server issues one.
+	 *
+	 * Payment goes through `payInvoice`, so the node's existing per-payment
+	 * maximum and daily spend limit apply on top of the per-call
+	 * `maxPriceSats` cap. That layering is deliberate: `maxPriceSats` bounds
+	 * what THIS request may cost, and the wallet policy bounds what the node
+	 * may spend at all. An unattended agent needs both.
+	 *
+	 * Credentials are reused across calls for the lifetime of the process, so
+	 * a paid API is paid for once rather than per request.
+	 */
+	async l402Fetch(
+		url: string,
+		init: IL402RequestInit = {},
+		options: {
+			maxPriceSats: number;
+			maxFeeSats?: number;
+			timeoutMs?: number;
+			scopePerPath?: boolean;
+			allowUnverifiedMacaroon?: boolean;
+		}
+	): Promise<{
+		status: number;
+		body: string;
+		paid: boolean;
+		amountPaidSats: number;
+		paymentHash?: string;
+	}> {
+		this._checkDraining();
+		const result = await l402Fetch(url, init, {
+			...options,
+			credentials: this._l402Credentials,
+			payer: {
+				payInvoice: async (
+					bolt11: string,
+					payOptions
+				): Promise<{ preimage: Buffer }> => {
+					const info = await this.payInvoice(
+						bolt11,
+						payOptions.timeoutMs ?? 60_000,
+						payOptions.maxFeeSats
+					);
+					if (!info.preimage) {
+						throw new BeignetError(
+							'PAYMENT_FAILED',
+							'L402 payment completed without a preimage, so no credential can be built'
+						);
+					}
+					return { preimage: Buffer.from(info.preimage, 'hex') };
+				}
+			}
+		});
+		return {
+			status: result.response.status,
+			body: await result.response.text(),
+			paid: result.paid,
+			amountPaidSats: result.amountPaidSats,
+			paymentHash: result.credential?.paymentHash
+		};
+	}
+
+	/** Paid L402 credentials held by this process. */
+	listL402Credentials(): IL402Credential[] {
+		return this._l402Credentials.list();
+	}
+
+	/** Forget a paid credential, so the next request pays again. */
+	forgetL402Credential(scope: string): void {
+		this._l402Credentials.delete(scope);
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {

@@ -776,6 +776,89 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/l402/fetch': {
+				post: {
+					summary:
+						'Fetch an L402-gated URL, paying the challenge under a price cap',
+					description:
+						'Parses the WWW-Authenticate L402 challenge, verifies the invoice payment hash against the macaroon commitment, pays under maxPriceSats (on top of the node spend limits), then retries with the paid credential. Pays at most once per call.',
+					tags: ['Payments'],
+					requestBody: {
+						required: true,
+						content: jsonContent({
+							type: 'object',
+							required: ['url', 'maxPriceSats'],
+							properties: {
+								url: { type: 'string' },
+								method: { type: 'string' },
+								headers: { type: 'object', additionalProperties: true },
+								body: { type: 'string' },
+								maxPriceSats: {
+									type: 'number',
+									description:
+										'Required satoshi cap on what one challenge may cost'
+								},
+								maxFeeSats: { type: 'number' },
+								timeoutMs: { type: 'number' },
+								scopePerPath: { type: 'boolean' },
+								allowUnverifiedMacaroon: {
+									type: 'boolean',
+									description:
+										'Unsafe: pay a challenge whose macaroon could not be parsed, so its payment hash commitment is unchecked'
+								}
+							}
+						})
+					},
+					responses: {
+						'200': {
+							description: 'Response from the gated resource',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									status: { type: 'number' },
+									body: { type: 'string' },
+									paid: { type: 'boolean' },
+									amountPaidSats: { type: 'number' },
+									paymentHash: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/l402/credentials': {
+				get: {
+					summary: 'List paid L402 credentials held by this process',
+					tags: ['Payments'],
+					responses: {
+						'200': {
+							description: 'Held credentials',
+							content: jsonContent({ type: 'array', items: { type: 'object' } })
+						}
+					}
+				}
+			},
+			'/l402/credential': {
+				delete: {
+					summary:
+						'Forget a paid L402 credential so the next request pays again',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'scope',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Credential forgotten',
+							content: jsonContent({ type: 'object' })
+						}
+					}
+				}
+			},
 			'/payment/proof': {
 				get: {
 					summary: 'Get cryptographic payment proof',

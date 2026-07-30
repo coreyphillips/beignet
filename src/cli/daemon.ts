@@ -12,6 +12,7 @@ import { Console } from 'console';
 import { BeignetNode, BeignetNodeOptions } from './beignet-node';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
+import { L402Error } from '../lightning/l402';
 import { ApiResponse, RouteHop } from './types';
 import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
@@ -1113,6 +1114,66 @@ export async function startDaemon(
 			const p = node.getPayment(paymentHash);
 			if (!p) return failure('NOT_FOUND', 'Payment not found');
 			return success(p);
+		},
+		'POST /l402/fetch': async (body) => {
+			const {
+				url,
+				method,
+				headers,
+				body: requestBody,
+				maxPriceSats,
+				maxFeeSats,
+				timeoutMs,
+				scopePerPath,
+				allowUnverifiedMacaroon
+			} = body as {
+				url: string;
+				method?: string;
+				headers?: Record<string, string>;
+				body?: string;
+				maxPriceSats?: number;
+				maxFeeSats?: number;
+				timeoutMs?: number;
+				scopePerPath?: boolean;
+				allowUnverifiedMacaroon?: boolean;
+			};
+			if (!url) return failure('INVALID_PARAMS', 'url required');
+			// The cap is mandatory over HTTP, not defaulted: a remote response
+			// header triggers the payment, so the price ceiling has to be a
+			// deliberate choice by the caller rather than one we invent.
+			if (typeof maxPriceSats !== 'number' || !Number.isFinite(maxPriceSats)) {
+				return failure(
+					'INVALID_PARAMS',
+					'maxPriceSats required (satoshi cap on what one challenge may cost)'
+				);
+			}
+			try {
+				return success(
+					await node.l402Fetch(
+						url,
+						{ method, headers, body: requestBody },
+						{
+							maxPriceSats,
+							maxFeeSats,
+							timeoutMs,
+							scopePerPath,
+							allowUnverifiedMacaroon
+						}
+					)
+				);
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				const code =
+					err instanceof L402Error ? `L402_${err.code}` : 'L402_FETCH_FAILED';
+				return failure(code, msg);
+			}
+		},
+		'GET /l402/credentials': () => success(node.listL402Credentials()),
+		'DELETE /l402/credential': (_body, query) => {
+			const scope = query.get('scope');
+			if (!scope) return failure('INVALID_PARAMS', 'scope required');
+			node.forgetL402Credential(scope);
+			return success({ scope, forgotten: true });
 		},
 		'GET /payment/proof': (_body, query) => {
 			const paymentHash = query.get('paymentHash');
