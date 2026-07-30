@@ -797,6 +797,71 @@ describe('Daemon auth middleware', () => {
 			server.close();
 		}
 	}).timeout(30000);
+
+	it('answers mistyped offer and invoice pastes with 400 and the parser message, not a scrubbed 500', async () => {
+		const errorLines: string[] = [];
+		const captureLogger = {
+			debug: (): void => {},
+			info: (): void => {},
+			warn: (): void => {},
+			error: (message: string): void => {
+				errorLines.push(message);
+			}
+		};
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'decodetest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			logger: captureLogger
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer decodetest' };
+		try {
+			const badOffer = await httpPost(
+				addr.port,
+				'/offer/decode',
+				{ offer: 'lno1garbage' },
+				auth
+			);
+			expect(badOffer.status).to.equal(400);
+			const offerErr = badOffer.body.error as {
+				code: string;
+				message: string;
+			};
+			expect(offerErr.code).to.equal('INVALID_OFFER');
+			expect(offerErr.message).to.include('Invalid offer:');
+			expect(offerErr.message).to.not.include('Internal server error');
+
+			const badInvoice = await httpPost(
+				addr.port,
+				'/invoice/decode',
+				{ bolt11: 'lnbc1garbage' },
+				auth
+			);
+			expect(badInvoice.status).to.equal(400);
+			const invoiceErr = badInvoice.body.error as {
+				code: string;
+				message: string;
+			};
+			expect(invoiceErr.code).to.equal('INVALID_INVOICE');
+			expect(invoiceErr.message).to.include('Invalid invoice:');
+			expect(invoiceErr.message).to.not.include('Internal server error');
+
+			// A typo is user input, not a daemon bug: nothing may reach the
+			// log as an unhandled server fault.
+			const unhandled = errorLines.filter((m) => m.includes('Unhandled error'));
+			expect(unhandled).to.deep.equal([]);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
 });
 
 // ─────────────── Config apiToken Tests ───────────────

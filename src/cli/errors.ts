@@ -20,6 +20,10 @@ export enum BeignetErrorCode {
 	PAYMENT_TIMEOUT = 'PAYMENT_TIMEOUT',
 	INVOICE_EXPIRED = 'INVOICE_EXPIRED',
 	NO_ROUTE = 'NO_ROUTE',
+	/** User-supplied BOLT 11 string failed to parse. */
+	INVALID_INVOICE = 'INVALID_INVOICE',
+	/** User-supplied BOLT 12 offer string failed to parse. */
+	INVALID_OFFER = 'INVALID_OFFER',
 
 	// Channels
 	CHANNEL_NOT_FOUND = 'CHANNEL_NOT_FOUND',
@@ -87,6 +91,8 @@ export function isRetryableError(err: BeignetError): boolean {
 	// Permanent error codes — never retry
 	const permanentCodes: Set<string> = new Set([
 		BeignetErrorCode.INVALID_PARAMS,
+		BeignetErrorCode.INVALID_INVOICE,
+		BeignetErrorCode.INVALID_OFFER,
 		BeignetErrorCode.NODE_DESTROYED,
 		BeignetErrorCode.INVOICE_EXPIRED,
 		BeignetErrorCode.DUPLICATE_PAYMENT,

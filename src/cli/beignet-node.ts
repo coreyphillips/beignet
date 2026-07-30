@@ -363,6 +363,45 @@ export function parseScid(scid: string): Buffer {
 	);
 }
 
+/**
+ * Decode a user-supplied BOLT 11 string. The parser throws plain Error, which
+ * the daemon scrubs to a generic 500 and logs as an unhandled server fault;
+ * a typed INVALID_INVOICE keeps the parser's message and answers 400.
+ */
+export function decodeInvoiceInput(
+	bolt11: string
+): ReturnType<typeof decodeInvoice> {
+	try {
+		return decodeInvoice(bolt11);
+	} catch (err: unknown) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_INVOICE,
+			`Invalid invoice: ${
+				err instanceof Error ? err.message : 'failed to decode'
+			}`
+		);
+	}
+}
+
+/**
+ * Decode a user-supplied BOLT 12 offer string. Same contract as
+ * decodeInvoiceInput: parse failures become a typed INVALID_OFFER (400).
+ */
+export function decodeOfferInput(
+	offerStr: string
+): ReturnType<typeof decodeOffer> {
+	try {
+		return decodeOffer(offerStr);
+	} catch (err: unknown) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_OFFER,
+			`Invalid offer: ${
+				err instanceof Error ? err.message : 'failed to decode'
+			}`
+		);
+	}
+}
+
 /** Convert pathfinding route hops to the JSON shape used by the daemon/CLI. */
 export function routeHopsToJson(route: IRoute): RouteHop[] {
 	return route.hops.map((hop, idx) => {
@@ -2985,7 +3024,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	decodeInvoice(bolt11: string): DecodedInvoice {
-		const inv = decodeInvoice(bolt11);
+		const inv = decodeInvoiceInput(bolt11);
 		const result: DecodedInvoice = {
 			network: inv.network,
 			timestamp: inv.timestamp,
@@ -3385,7 +3424,7 @@ export class BeignetNode extends EventEmitter {
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Decode to get paymentHash for event matching
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 
 		// Per-payment and daily spending limit checks
@@ -3550,7 +3589,7 @@ export class BeignetNode extends EventEmitter {
 	): Promise<RetryPaymentResult> {
 		const maxRetries = opts.maxRetries ?? 3;
 		const backoffMs = opts.backoffMs ?? 2000;
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 		let lastError: BeignetError | undefined;
 
@@ -3669,7 +3708,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		metadata?: Record<string, string>
 	): { paymentHash: string; status: 'PENDING' } {
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const maxFeeMsat =
 			maxFeeSats !== undefined ? BigInt(maxFeeSats) * 1000n : undefined;
 		const amountMsat =
@@ -4255,7 +4294,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── BOLT 12 Offers ───────────────
 
 	decodeOfferString(offerStr: string): OfferInfo {
-		const offer = decodeOffer(offerStr);
+		const offer = decodeOfferInput(offerStr);
 		return this.toOfferInfo(offer, offerStr);
 	}
 
@@ -4334,7 +4373,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
-		const offer = decodeOffer(offerStr);
+		const offer = decodeOfferInput(offerStr);
 
 		// Request invoice from the offer
 		const requestOptions =

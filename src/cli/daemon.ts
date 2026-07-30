@@ -152,6 +152,8 @@ export const AUTH_EXEMPT_ROUTES = new Set([
 const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	INVALID_PARAMS: 400,
 	INVALID_JSON: 400,
+	INVALID_INVOICE: 400,
+	INVALID_OFFER: 400,
 	UNAUTHORIZED: 401,
 	FORBIDDEN: 403,
 	MNEMONIC_REQUIRES_AUTH: 403,
@@ -161,7 +163,7 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	RATE_LIMITED: 429
 };
 
-function statusForErrorCode(code: string): number {
+export function statusForErrorCode(code: string): number {
 	return STATUS_BY_ERROR_CODE[code] ?? 500;
 }
 
