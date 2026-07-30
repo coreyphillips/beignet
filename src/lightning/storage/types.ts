@@ -38,6 +38,15 @@ export interface IStorageBackend {
 	savePreimage(paymentHash: string, preimage: Buffer): void;
 	loadPreimage(paymentHash: string): Buffer | null;
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }>;
+	/**
+	 * Delete a stored preimage. Used by the issued-invoice sweep for expired,
+	 * never-paid BOLT 12 invoices; a settled payment's preimage is never
+	 * deleted this way. REQUIRED (not optional): a backend that skipped it
+	 * would leave an orphaned preimage row that a restart restores without
+	 * the invoice's bolt12 marker or expected path_id, making the hash
+	 * claimable outside the fail-closed path-id check.
+	 */
+	deletePreimage(paymentHash: string): void;
 
 	// ─── SCID Mappings ───
 	saveScidMapping(scidHex: string, channelId: Buffer): void;
@@ -88,7 +97,13 @@ export interface IStorageBackend {
 	 */
 	saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void;
 	loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer }>;
-	deleteInvoicePathId?(paymentHashHex: string): void;
+	/**
+	 * REQUIRED even though save/load are optional: a backend that persisted
+	 * path_ids but could not delete them would accumulate rows forever, the
+	 * amplification the issued-invoice sweep exists to stop. Backends that do
+	 * not persist path_ids implement this as a no-op.
+	 */
+	deleteInvoicePathId(paymentHashHex: string): void;
 
 	// ─── Invoices ───
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void;

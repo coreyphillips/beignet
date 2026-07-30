@@ -585,6 +585,12 @@ export class SqliteStorage implements IStorageBackend {
 		return results;
 	}
 
+	deletePreimage(paymentHash: string): void {
+		this.db
+			.prepare('DELETE FROM preimages WHERE payment_hash = ?')
+			.run(paymentHash);
+	}
+
 	// ─── SCID Mappings ───
 
 	saveScidMapping(scidHex: string, channelId: Buffer): void {

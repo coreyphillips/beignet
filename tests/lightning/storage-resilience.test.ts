@@ -63,6 +63,8 @@ function makeThrowingStorage(): IStorageBackend {
 		savePreimage: throwFn,
 		loadPreimage: () => null,
 		loadAllPreimages: () => [],
+		deletePreimage: (): void => {},
+		deleteInvoicePathId: (): void => {},
 		savePaymentSecret: throwFn,
 		loadAllPaymentSecrets: () => [],
 		deletePaymentSecret: throwFn,
