@@ -38,6 +38,12 @@ export interface IStorageBackend {
 	savePreimage(paymentHash: string, preimage: Buffer): void;
 	loadPreimage(paymentHash: string): Buffer | null;
 	loadAllPreimages(): Array<{ paymentHash: string; preimage: Buffer }>;
+	/**
+	 * Delete a stored preimage. Used by the issued-invoice sweep for expired,
+	 * never-paid BOLT 12 invoices; a settled payment's preimage is never
+	 * deleted this way.
+	 */
+	deletePreimage?(paymentHash: string): void;
 
 	// ─── SCID Mappings ───
 	saveScidMapping(scidHex: string, channelId: Buffer): void;

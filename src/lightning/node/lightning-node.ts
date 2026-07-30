@@ -308,6 +308,13 @@ const HELD_HTLC_EXPIRY_MARGIN = 18;
 const MAX_TRUSTED_PEER_HEIGHT_SKEW = 6;
 
 /**
+ * Grace past an issued BOLT 12 invoice's expiry before its never-paid state
+ * is swept, covering an HTLC already in flight at expiry (mirrors the
+ * OfferManager preimage retention grace).
+ */
+const ISSUED_INVOICE_SWEEP_GRACE_SECONDS = 3600;
+
+/**
  * Blocks of padding added to the final CLTV delta of an outgoing payment, on top
  * of whatever the payee advertised. We apply that delta against OUR block height,
  * so when our height is briefly behind the payee's the unpadded expiry lands below
@@ -10510,6 +10517,7 @@ export class LightningNode extends EventEmitter {
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.scanStuckPayments();
+		this.sweepExpiredIssuedInvoices();
 		if (blockHeight % 10 === 0) {
 			this.scanExpiredPendingPayments();
 		}
@@ -11376,6 +11384,13 @@ export class LightningNode extends EventEmitter {
 					pathId
 				);
 				this.emit('bolt12:invoice:issued', invoice);
+				// Issuance is remote-driven (any invoice_request mints one), so
+				// the sweep must also run BETWEEN blocks: every 256th issuance
+				// bounds the overshoot past the cap to 255 entries during a
+				// flood while keeping the per-issuance cost amortized (#259).
+				if (++this.issuedInvoiceSweepCounter % 256 === 0) {
+					this.sweepExpiredIssuedInvoices();
+				}
 			}
 		);
 		this.offerManager.on('invoice:error', (error: { error: string }) => {
@@ -11388,6 +11403,101 @@ export class LightningNode extends EventEmitter {
 	}
 
 	// ─────────────── Phase 2: HTLC Timeout + Payment Cleanup ───────────────
+
+	/**
+	 * Cap on issued-but-unpaid BOLT 12 invoices retained inside the expiry
+	 * window (mirrors OfferManager's preimage bound). Past it the sweep
+	 * evicts oldest-first down to 90% (hysteresis, so a sustained flood does
+	 * not resweep on every issuance).
+	 */
+	private bolt12IssuedInvoiceCap = 10_000;
+	/** Issuances since start; every 256th triggers a sweep between blocks. */
+	private issuedInvoiceSweepCounter = 0;
+
+	/**
+	 * Sweep issued-but-unpaid BOLT 12 invoices whose expiry has passed.
+	 *
+	 * Every valid remote invoice_request mints an invoice whose preimage,
+	 * invoice info, PENDING payment record (and, for legacy rows, payment
+	 * secret) are copied into the node's receive stores and persisted, and
+	 * nothing cleaned them up unless an HTLC actually arrived and resolved.
+	 * Requests are remote-driven and free to send, so a single shared offer
+	 * was a permanent memory AND database amplification target (#259).
+	 *
+	 * Removal is expiry-based: created_at + expiry plus a grace window for
+	 * an HTLC in flight at expiry. The sweep never touches a hold invoice, a
+	 * hash with a parked HTLC or a partially accumulated MPP set, or any
+	 * payment record that is not a PENDING incoming placeholder, and it
+	 * deletes the persisted rows of a batch in one transaction (preimage,
+	 * legacy payment secret, path_id, invoice, payment). A hard cap
+	 * backstops the unexpired window; evicting an entry only makes that
+	 * invoice unpayable (the receive path fails closed), never
+	 * unauthenticated. BOLT 11 invoices are NOT swept: they are
+	 * operator-created and finite, and wallets expect them to stay
+	 * queryable, matching LND/CLN retention.
+	 */
+	private sweepExpiredIssuedInvoices(): void {
+		const nowSec = Math.floor(Date.now() / 1000);
+		const expired: string[] = [];
+		const unexpired: Array<{ hashHex: string; createdAt: number }> = [];
+		for (const [hashHex, inv] of this.invoices) {
+			if (!inv.bolt12) continue;
+			if (inv.hold) continue;
+			if (this.heldHtlcs.has(hashHex)) continue;
+			if (this.pendingMppPayments.has(hashHex)) continue;
+			const payment = this.payments.get(hashHex);
+			if (
+				payment &&
+				(payment.status !== PaymentStatus.PENDING ||
+					payment.direction !== PaymentDirection.INCOMING)
+			) {
+				continue;
+			}
+			if (
+				nowSec >=
+				inv.createdAt + inv.expiry + ISSUED_INVOICE_SWEEP_GRACE_SECONDS
+			) {
+				expired.push(hashHex);
+			} else {
+				unexpired.push({ hashHex, createdAt: inv.createdAt });
+			}
+		}
+
+		const toRemove = expired;
+		if (unexpired.length > this.bolt12IssuedInvoiceCap) {
+			const evictTo = Math.floor(this.bolt12IssuedInvoiceCap * 0.9);
+			unexpired.sort((a, b) => a.createdAt - b.createdAt);
+			const excess = unexpired.length - evictTo;
+			for (let i = 0; i < excess; i++) {
+				toRemove.push(unexpired[i].hashHex);
+			}
+		}
+		if (toRemove.length === 0) return;
+
+		for (const hashHex of toRemove) {
+			this.preimages.delete(hashHex);
+			this.paymentSecrets.delete(hashHex);
+			this.invoices.delete(hashHex);
+			this.payments.delete(hashHex);
+			this.offerManager.removeInvoiceState(hashHex);
+		}
+		this.safeStorage(() => {
+			this.storage!.transaction(() => {
+				for (const hashHex of toRemove) {
+					this.storage!.deletePreimage?.(hashHex);
+					this.storage!.deletePaymentSecret(hashHex);
+					this.storage!.deleteInvoicePathId?.(hashHex);
+					this.storage!.deleteInvoice(hashHex);
+					this.storage!.deletePayment(hashHex);
+				}
+			});
+		}, 'sweepExpiredIssuedInvoices');
+		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
+			removed: toRemove.length,
+			expired: expired.length,
+			capEvicted: toRemove.length - expired.length
+		});
+	}
 
 	/**
 	 * Scan offered HTLCs whose CLTV has expired at the current block height.

@@ -1343,6 +1343,38 @@ describe('Crash-Safe State Persistence', function () {
 		});
 	});
 
+	// Issue a BOLT 12 invoice on `issuer` for a pathless offer, exactly as
+	// the onion-message handler would (signed invoice_request).
+	function issueBolt12Invoice(
+		issuer: LightningNode,
+		payerPriv: Buffer,
+		amountMsat: bigint
+	): IBolt12Invoice | null {
+		const offerMgr = issuer.getOfferManager();
+		const { offer } = offerMgr.createOffer({
+			description: 'issued invoice',
+			amount: amountMsat
+		});
+		const request: IInvoiceRequest = {
+			payerKey: getPublicKey(payerPriv),
+			offerId: offer.offerId,
+			amount: amountMsat,
+			metadata: crypto.randomBytes(16)
+		};
+		const offerTlv = encodeOfferTlv(offer);
+		const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+		request.signature = schnorrSign(
+			computeSignatureHash(
+				'lightninginvoice_requestsignature',
+				computeMerkleRootFromRecords(getTlvRecords(unsigned))
+			),
+			payerPriv
+		);
+		return offerMgr.handleInvoiceRequest(
+			encodeInvoiceRequestTlv(request, offerTlv)
+		);
+	}
+
 	describe('BOLT 12 receive authentication across restart', function () {
 		// Stand in for a completed reconnect on a restored channel: put it back
 		// in NORMAL and fire the channel:ready the reestablish would produce.
@@ -1351,38 +1383,6 @@ describe('Crash-Safe State Persistence', function () {
 			expect(channel, 'expected the channel to have been restored').to.exist;
 			channel!.getFullState().state = ChannelState.NORMAL;
 			node.getChannelManager().emit('channel:ready', channelId);
-		}
-
-		// Issue a BOLT 12 invoice on `issuer` for a pathless offer, exactly as
-		// the onion-message handler would (signed invoice_request).
-		function issueBolt12Invoice(
-			issuer: LightningNode,
-			payerPriv: Buffer,
-			amountMsat: bigint
-		): IBolt12Invoice | null {
-			const offerMgr = issuer.getOfferManager();
-			const { offer } = offerMgr.createOffer({
-				description: 'restart survival',
-				amount: amountMsat
-			});
-			const request: IInvoiceRequest = {
-				payerKey: getPublicKey(payerPriv),
-				offerId: offer.offerId,
-				amount: amountMsat,
-				metadata: crypto.randomBytes(16)
-			};
-			const offerTlv = encodeOfferTlv(offer);
-			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
-			request.signature = schnorrSign(
-				computeSignatureHash(
-					'lightninginvoice_requestsignature',
-					computeMerkleRootFromRecords(getTlvRecords(unsigned))
-				),
-				payerPriv
-			);
-			return offerMgr.handleInvoiceRequest(
-				encodeInvoiceRequestTlv(request, offerTlv)
-			);
 		}
 
 		it('restores the expected path_id and settles a post-restart payment over the invoice path', function () {
@@ -1512,6 +1512,176 @@ describe('Crash-Safe State Persistence', function () {
 					// bob2.destroy() already closed the shared handle
 				}
 			}
+		});
+	});
+
+	describe('Issued-but-unpaid BOLT 12 invoice sweep (#259)', function () {
+		const EXPIRY = 7200;
+		const GRACE = 3600;
+
+		// Age an issued invoice past its expiry + grace so the sweep sees it.
+		function backdate(node: LightningNode, hashHex: string): void {
+			const inv = node['invoices'].get(hashHex)!;
+			inv.createdAt = Math.floor(Date.now() / 1000) - (EXPIRY + GRACE + 60);
+		}
+
+		it('sweeps expired never-paid invoices from every store while a paid one survives', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const payerPriv = makeNodeConfig(1).nodePrivateKey;
+				const unpaidA = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const unpaidB = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const paid = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const sent = alice.payBolt12Invoice(paid);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+
+				// Everything (paid included) is aged past expiry + grace: only
+				// the never-paid entries may go.
+				for (const b12 of [unpaidA, unpaidB, paid]) {
+					backdate(bob, b12.paymentHash.toString('hex'));
+				}
+
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				for (const b12 of [unpaidA, unpaidB]) {
+					const h = b12.paymentHash.toString('hex');
+					expect(bob['invoices'].has(h), 'invoice entry swept').to.be.false;
+					expect(bob['preimages'].has(h), 'preimage swept').to.be.false;
+					expect(bob['payments'].has(h), 'payment placeholder swept').to.be
+						.false;
+					expect(
+						bob.getOfferManager().getInvoicePathId(b12.paymentHash),
+						'expected path_id dropped'
+					).to.be.undefined;
+					expect(storage.loadPreimage(h), 'preimage row deleted').to.be.null;
+					expect(storage.loadPayment(h), 'payment row deleted').to.be.null;
+					expect(
+						storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+						'invoice row deleted'
+					).to.be.false;
+					expect(
+						storage.loadAllInvoicePathIds().some((r) => r.paymentHashHex === h),
+						'path_id row deleted'
+					).to.be.false;
+				}
+
+				const paidHex = paid.paymentHash.toString('hex');
+				expect(bob['invoices'].has(paidHex), 'paid invoice retained').to.be
+					.true;
+				expect(bob['payments'].get(paidHex)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(storage.loadPreimage(paidHex), 'paid preimage row retained').to
+					.not.be.null;
+				expect(storage.loadPayment(paidHex), 'paid payment row retained').to.not
+					.be.null;
+
+				alice.destroy();
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('never sweeps a hash with a parked HTLC or a partial MPP set', function () {
+			const bob = createTestNodeWithId(3);
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const held = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const mpp = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const heldHex = held.paymentHash.toString('hex');
+			const mppHex = mpp.paymentHash.toString('hex');
+			backdate(bob, heldHex);
+			backdate(bob, mppHex);
+
+			// A parked HTLC (async hold) and a partially accumulated MPP set:
+			// value may still arrive for these hashes, so expiry must not
+			// reap them out from under the in-flight state.
+			bob['heldHtlcs'].set(heldHex, []);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).pendingMppPayments.set(mppHex, { parts: [] });
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).sweepExpiredIssuedInvoices();
+
+			expect(bob['invoices'].has(heldHex), 'parked hash retained').to.be.true;
+			expect(bob['preimages'].has(heldHex)).to.be.true;
+			expect(bob['invoices'].has(mppHex), 'partial MPP hash retained').to.be
+				.true;
+			expect(bob['preimages'].has(mppHex)).to.be.true;
+
+			bob.destroy();
+		});
+
+		it('cap backstop evicts the oldest unexpired invoices down to the floor', function () {
+			const bob = createTestNodeWithId(4);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).bolt12IssuedInvoiceCap = 3; // floor = 2
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const issued = Array.from(
+				{ length: 5 },
+				() => issueBolt12Invoice(bob, payerPriv, 1_000n)!
+			);
+			// Distinct, UNEXPIRED ages so oldest-first eviction is deterministic.
+			const nowSec = Math.floor(Date.now() / 1000);
+			issued.forEach((b12, i) => {
+				bob['invoices'].get(b12.paymentHash.toString('hex'))!.createdAt =
+					nowSec - 100 + i;
+			});
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).sweepExpiredIssuedInvoices();
+
+			const remaining = issued.filter((b12) =>
+				bob['invoices'].has(b12.paymentHash.toString('hex'))
+			);
+			expect(remaining.length, 'evicted down to 90% of the cap').to.equal(2);
+			expect(remaining[0]).to.equal(issued[3]);
+			expect(remaining[1]).to.equal(issued[4]);
+
+			bob.destroy();
+		});
+
+		it('sweeps on the issuance counter and on new blocks', function () {
+			const bob = createTestNodeWithId(5);
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+
+			const first = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const firstHex = first.paymentHash.toString('hex');
+			backdate(bob, firstHex);
+			// The next issuance is the 256th tick: it must run the sweep.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).issuedInvoiceSweepCounter = 255;
+			const second = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			expect(
+				bob['invoices'].has(firstHex),
+				'issuance-triggered sweep removed the expired invoice'
+			).to.be.false;
+
+			// And every new block sweeps.
+			const secondHex = second.paymentHash.toString('hex');
+			backdate(bob, secondHex);
+			bob.handleNewBlock(100);
+			expect(
+				bob['invoices'].has(secondHex),
+				'block-triggered sweep removed the expired invoice'
+			).to.be.false;
+
+			bob.destroy();
 		});
 	});
 });

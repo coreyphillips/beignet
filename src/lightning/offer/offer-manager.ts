@@ -853,6 +853,19 @@ export class OfferManager extends EventEmitter {
 	}
 
 	/**
+	 * Drop the retained issuance state (preimage, expected path_id, retention
+	 * deadline) for one issued invoice. Called by the node's issued-invoice
+	 * sweep when an expired, never-paid BOLT 12 invoice is removed; the
+	 * invoice becomes unpayable (the receive path fails closed), never
+	 * unauthenticated.
+	 */
+	removeInvoiceState(paymentHashHex: string): void {
+		this.invoicePreimages.delete(paymentHashHex);
+		this.invoicePreimageDeadlines.delete(paymentHashHex);
+		this.invoicePathIds.delete(paymentHashHex);
+	}
+
+	/**
 	 * Validate a BOLT 12 invoice signature.
 	 *
 	 * When the raw decoded `records` are available (any invoice received off
