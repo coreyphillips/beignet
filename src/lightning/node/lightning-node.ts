@@ -11470,7 +11470,10 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		const toRemove = expired;
+		// Copy before appending cap evictions: aliasing the expired array made
+		// the telemetry below count evictions as expiries (capEvicted always 0).
+		const expiredCount = expired.length;
+		const toRemove = [...expired];
 		if (unexpired.length > this.bolt12IssuedInvoiceCap) {
 			const evictTo = Math.floor(this.bolt12IssuedInvoiceCap * 0.9);
 			unexpired.sort((a, b) => a.createdAt - b.createdAt);
@@ -11483,21 +11486,20 @@ export class LightningNode extends EventEmitter {
 
 		// Durable rows FIRST: if the transaction fails, the in-memory copies
 		// are kept too, so runtime and persisted state never diverge and the
-		// next sweep retries the whole batch. deletePreimage is REQUIRED (no
-		// optional chaining): a backend that skipped it would leave an
-		// orphaned preimage row that a restart restores WITHOUT the invoice's
-		// bolt12 marker or expected path_id, making the hash claimable
-		// outside the fail-closed path check. deleteInvoicePathId may stay
-		// optional: an orphaned path_id row only re-arms the expectation
-		// while the preimage is gone, and a preimage-less hash fails as
-		// unknown_payment_hash.
+		// next sweep retries the whole batch. All five deletes are REQUIRED
+		// interface members (no optional chaining): a backend skipping
+		// deletePreimage would leave an orphaned preimage row that a restart
+		// restores WITHOUT the invoice's bolt12 marker or expected path_id,
+		// making the hash claimable outside the fail-closed path check, and
+		// one skipping deleteInvoicePathId would accumulate path_id rows
+		// forever, the amplification this sweep exists to stop.
 		if (this.storage) {
 			try {
 				this.storage.transaction(() => {
 					for (const hashHex of toRemove) {
 						this.storage!.deletePreimage(hashHex);
 						this.storage!.deletePaymentSecret(hashHex);
-						this.storage!.deleteInvoicePathId?.(hashHex);
+						this.storage!.deleteInvoicePathId(hashHex);
 						this.storage!.deleteInvoice(hashHex);
 						this.storage!.deletePayment(hashHex);
 					}
@@ -11520,8 +11522,8 @@ export class LightningNode extends EventEmitter {
 		}
 		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
 			removed: toRemove.length,
-			expired: expired.length,
-			capEvicted: toRemove.length - expired.length
+			expired: expiredCount,
+			capEvicted: toRemove.length - expiredCount
 		});
 	}
 

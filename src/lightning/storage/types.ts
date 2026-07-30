@@ -97,7 +97,13 @@ export interface IStorageBackend {
 	 */
 	saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void;
 	loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer }>;
-	deleteInvoicePathId?(paymentHashHex: string): void;
+	/**
+	 * REQUIRED even though save/load are optional: a backend that persisted
+	 * path_ids but could not delete them would accumulate rows forever, the
+	 * amplification the issued-invoice sweep exists to stop. Backends that do
+	 * not persist path_ids implement this as a no-op.
+	 */
+	deleteInvoicePathId(paymentHashHex: string): void;
 
 	// ─── Invoices ───
 	saveInvoice(paymentHashHex: string, invoice: IInvoiceInfo): void;

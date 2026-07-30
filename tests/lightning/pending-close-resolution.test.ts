@@ -239,6 +239,7 @@ class MockStorage implements IStorageBackend {
 		return [];
 	}
 	deletePreimage(): void {}
+	deleteInvoicePathId(): void {}
 	saveScidMapping(): void {}
 	loadAllScidMappings(): Array<any> {
 		return [];

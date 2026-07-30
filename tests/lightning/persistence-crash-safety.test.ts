@@ -119,6 +119,7 @@ class MockStorage implements IStorageBackend {
 	deletePreimage(paymentHash: string): void {
 		this.preimages.delete(paymentHash);
 	}
+	deleteInvoicePathId(): void {}
 
 	saveScidMapping(scidHex: string, channelId: Buffer): void {
 		this.scidMappings.set(scidHex, channelId);
@@ -1751,6 +1752,17 @@ describe('Crash-Safe State Persistence', function () {
 					nowSec - 100 + i;
 			});
 
+			const sweepLogs: Array<{
+				action: string;
+				data: Record<string, unknown>;
+			}> = [];
+			bob.on(
+				'log',
+				(log: { action: string; data: Record<string, unknown> }) => {
+					if (log.action === 'issued_invoice_sweep') sweepLogs.push(log);
+				}
+			);
+
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			(bob as any).sweepExpiredIssuedInvoices();
 
@@ -1760,6 +1772,13 @@ describe('Crash-Safe State Persistence', function () {
 			expect(remaining.length, 'evicted down to 90% of the cap').to.equal(2);
 			expect(remaining[0]).to.equal(issued[3]);
 			expect(remaining[1]).to.equal(issued[4]);
+
+			// Telemetry distinguishes eviction from expiry: nothing here was
+			// expired, all three removals are cap pressure.
+			expect(sweepLogs).to.have.length(1);
+			expect(sweepLogs[0].data.removed).to.equal(3);
+			expect(sweepLogs[0].data.expired).to.equal(0);
+			expect(sweepLogs[0].data.capEvicted).to.equal(3);
 
 			bob.destroy();
 		});

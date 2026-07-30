@@ -192,6 +192,7 @@ function createMockStorage(): IStorageBackend & {
 		deletePreimage(paymentHash: string): void {
 			preimages.delete(paymentHash);
 		},
+		deleteInvoicePathId(): void {},
 
 		saveScidMapping(scidHex: string, channelId: Buffer): void {
 			scidMappings.set(scidHex, channelId);

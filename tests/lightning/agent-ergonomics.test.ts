@@ -188,6 +188,8 @@ class MockStorage implements IStorageBackend {
 		this.preimages.delete(paymentHash);
 	}
 
+	deleteInvoicePathId(): void {}
+
 	saveScidMapping(scidHex: string, channelId: Buffer): void {
 		this.scidMappings.set(scidHex, channelId);
 	}
