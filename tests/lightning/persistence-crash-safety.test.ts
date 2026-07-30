@@ -116,6 +116,9 @@ class MockStorage implements IStorageBackend {
 		}
 		return result;
 	}
+	deletePreimage(paymentHash: string): void {
+		this.preimages.delete(paymentHash);
+	}
 
 	saveScidMapping(scidHex: string, channelId: Buffer): void {
 		this.scidMappings.set(scidHex, channelId);
@@ -1588,6 +1591,111 @@ describe('Crash-Safe State Persistence', function () {
 					.be.null;
 
 				alice.destroy();
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('a settled invoice pruned from memory is never swept from durable history', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const paid = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+				const sent = alice.payBolt12Invoice(paid);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				const h = paid.paymentHash.toString('hex');
+
+				// The retention TTL passes: the completed payment and preimage
+				// leave MEMORY (their durable rows remain), and the invoice then
+				// ages past expiry + grace.
+				bob['payments'].get(h)!.completedAt = Date.now() - 86_400_000 - 60_000;
+				bob.pruneCompletedPayments();
+				expect(bob['payments'].has(h), 'payment pruned from memory').to.be
+					.false;
+				expect(bob['preimages'].has(h), 'preimage pruned from memory').to.be
+					.false;
+				backdate(bob, h);
+
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				// A MISSING payment record must never read as "never paid": the
+				// durable settled-payment history stays intact.
+				expect(storage.loadPayment(h), 'payment row retained').to.not.be.null;
+				expect(storage.loadPreimage(h), 'preimage row retained').to.not.be.null;
+				expect(
+					storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+					'invoice row retained'
+				).to.be.true;
+
+				alice.destroy();
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('a failed storage transaction leaves the in-memory state for a retry', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const bob = createTestNodeWithId(6, storage);
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					1_000n
+				)!;
+				const h = b12.paymentHash.toString('hex');
+				backdate(bob, h);
+
+				// Rows are deleted BEFORE memory: when the transaction fails,
+				// nothing may be removed anywhere, so runtime and persisted
+				// state never diverge and the next sweep retries the batch.
+				const originalDeleteInvoice = storage.deleteInvoice.bind(storage);
+				storage.deleteInvoice = (): void => {
+					throw new Error('injected deleteInvoice failure');
+				};
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				expect(bob['invoices'].has(h), 'in-memory invoice kept').to.be.true;
+				expect(bob['preimages'].has(h), 'in-memory preimage kept').to.be.true;
+				expect(storage.loadPreimage(h), 'preimage row rolled back').to.not.be
+					.null;
+				expect(
+					storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+					'invoice row rolled back'
+				).to.be.true;
+
+				// With the fault removed, the retry clears everything.
+				storage.deleteInvoice = originalDeleteInvoice;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+				expect(bob['invoices'].has(h)).to.be.false;
+				expect(storage.loadPreimage(h)).to.be.null;
+
 				bob.destroy();
 			} finally {
 				try {

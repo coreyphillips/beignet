@@ -41,9 +41,12 @@ export interface IStorageBackend {
 	/**
 	 * Delete a stored preimage. Used by the issued-invoice sweep for expired,
 	 * never-paid BOLT 12 invoices; a settled payment's preimage is never
-	 * deleted this way.
+	 * deleted this way. REQUIRED (not optional): a backend that skipped it
+	 * would leave an orphaned preimage row that a restart restores without
+	 * the invoice's bolt12 marker or expected path_id, making the hash
+	 * claimable outside the fail-closed path-id check.
 	 */
-	deletePreimage?(paymentHash: string): void;
+	deletePreimage(paymentHash: string): void;
 
 	// ─── SCID Mappings ───
 	saveScidMapping(scidHex: string, channelId: Buffer): void;

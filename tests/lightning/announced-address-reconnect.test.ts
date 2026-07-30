@@ -211,6 +211,7 @@ describe('LightningNode: channel peer address capture', function () {
 			loadAllChannels: () => [],
 			loadAllPayments: () => [],
 			loadAllPreimages: () => [],
+			deletePreimage: (): void => {},
 			loadAllScidMappings: () => [],
 			loadAllHtlcPaymentMappings: () => [],
 			loadAllForwardedHtlcs: () => [],

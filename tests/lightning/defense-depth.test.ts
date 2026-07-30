@@ -189,6 +189,9 @@ function createMockStorage(): IStorageBackend & {
 				preimage
 			}));
 		},
+		deletePreimage(paymentHash: string): void {
+			preimages.delete(paymentHash);
+		},
 
 		saveScidMapping(scidHex: string, channelId: Buffer): void {
 			scidMappings.set(scidHex, channelId);

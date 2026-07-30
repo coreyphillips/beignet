@@ -11445,11 +11445,18 @@ export class LightningNode extends EventEmitter {
 			if (inv.hold) continue;
 			if (this.heldHtlcs.has(hashHex)) continue;
 			if (this.pendingMppPayments.has(hashHex)) continue;
+			// AFFIRMATIVE never-paid check: only the PENDING incoming
+			// placeholder minted at issuance marks an invoice as never paid. A
+			// MISSING record is not license to sweep: pruneCompletedPayments
+			// drops settled payments (and their preimages) from MEMORY after
+			// their TTL while the durable rows remain, so "no record" can mean
+			// "paid, then pruned", and sweeping then would destroy the
+			// persisted payment history and preimage of a settled payment.
 			const payment = this.payments.get(hashHex);
 			if (
-				payment &&
-				(payment.status !== PaymentStatus.PENDING ||
-					payment.direction !== PaymentDirection.INCOMING)
+				!payment ||
+				payment.status !== PaymentStatus.PENDING ||
+				payment.direction !== PaymentDirection.INCOMING
 			) {
 				continue;
 			}
@@ -11474,6 +11481,36 @@ export class LightningNode extends EventEmitter {
 		}
 		if (toRemove.length === 0) return;
 
+		// Durable rows FIRST: if the transaction fails, the in-memory copies
+		// are kept too, so runtime and persisted state never diverge and the
+		// next sweep retries the whole batch. deletePreimage is REQUIRED (no
+		// optional chaining): a backend that skipped it would leave an
+		// orphaned preimage row that a restart restores WITHOUT the invoice's
+		// bolt12 marker or expected path_id, making the hash claimable
+		// outside the fail-closed path check. deleteInvoicePathId may stay
+		// optional: an orphaned path_id row only re-arms the expectation
+		// while the preimage is gone, and a preimage-less hash fails as
+		// unknown_payment_hash.
+		if (this.storage) {
+			try {
+				this.storage.transaction(() => {
+					for (const hashHex of toRemove) {
+						this.storage!.deletePreimage(hashHex);
+						this.storage!.deletePaymentSecret(hashHex);
+						this.storage!.deleteInvoicePathId?.(hashHex);
+						this.storage!.deleteInvoice(hashHex);
+						this.storage!.deletePayment(hashHex);
+					}
+				});
+			} catch (err) {
+				this.emit('node:error', {
+					code: 'PERSISTENCE_ERROR',
+					message: `sweepExpiredIssuedInvoices: ${(err as Error).message}`,
+					timestamp: Date.now()
+				} as ILightningError);
+				return;
+			}
+		}
 		for (const hashHex of toRemove) {
 			this.preimages.delete(hashHex);
 			this.paymentSecrets.delete(hashHex);
@@ -11481,17 +11518,6 @@ export class LightningNode extends EventEmitter {
 			this.payments.delete(hashHex);
 			this.offerManager.removeInvoiceState(hashHex);
 		}
-		this.safeStorage(() => {
-			this.storage!.transaction(() => {
-				for (const hashHex of toRemove) {
-					this.storage!.deletePreimage?.(hashHex);
-					this.storage!.deletePaymentSecret(hashHex);
-					this.storage!.deleteInvoicePathId?.(hashHex);
-					this.storage!.deleteInvoice(hashHex);
-					this.storage!.deletePayment(hashHex);
-				}
-			});
-		}, 'sweepExpiredIssuedInvoices');
 		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
 			removed: toRemove.length,
 			expired: expired.length,
