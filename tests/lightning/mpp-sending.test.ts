@@ -47,6 +47,7 @@ import {
 	signChannelUpdate
 } from '../../src/lightning/gossip/validation';
 import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import { IRoutingHintHop } from '../../src/lightning/invoice/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
 // ─────────────── Helpers ───────────────
@@ -771,6 +772,127 @@ describe('MPP Sending (Phase 5)', function () {
 
 			alice.destroy();
 			bob.destroy();
+		});
+
+		it('splits a hinted createInvoice payment across two channels instead of failing locally (#254)', async function () {
+			// The REAL createInvoice embeds routing hints for bob's channels,
+			// and for a direct peer the hint's forwarding node is alice
+			// herself. The synthetic hint edge carried no capacity bound, so
+			// findRoute sent the full amount down one 200k-sat channel, the
+			// local addHtlc refused it, and the MPP fallback (gated on
+			// findRoute returning null) never ran: the payment failed even
+			// though it fits across the two channels.
+			const htlcSecretFor = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from([4]))
+					.digest();
+			const alice = new LightningNode({
+				...makeNodeConfig(68),
+				htlcBasepointSecret: htlcSecretFor(68)
+			});
+			alice.on('error', () => {});
+			const bob = new LightningNode({
+				...makeNodeConfig(69),
+				htlcBasepointSecret: htlcSecretFor(69)
+			});
+			bob.on('error', () => {});
+			connectNodes(alice, bob);
+
+			openReadyChannel(alice, bob, 200_000n);
+			openReadyChannel(alice, bob, 200_000n);
+
+			const invoice = bob.createInvoice({
+				description: 'hinted mpp split',
+				amountMsat: 250_000_000n
+			});
+
+			const payment = alice.sendPayment(invoice.bolt11);
+			await new Promise((r) => setTimeout(r, 50));
+
+			expect(alice.getPayment(payment.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			const bobPayment = bob.getPayment(payment.paymentHash);
+			expect(bobPayment, 'bob recorded the payment').to.exist;
+			expect(bobPayment!.status).to.equal(PaymentStatus.COMPLETED);
+			// Dispatch finished: no MPP state left behind.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((alice as any).outboundMppPayments.size).to.equal(0);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a routing hint whose forwarding node is the sender cannot bypass the local capacity bound (#254)', function () {
+			// Unit-level companion to the test above: the synthetic edge for a
+			// hint hop naming the SENDER as forwarder must not exist — the
+			// bounded local-channel edge is authoritative for source → peer.
+			const graph = new NetworkGraph();
+			const source = getPublicKey(makeNodeConfig(80).nodePrivateKey);
+			const dest = getPublicKey(makeNodeConfig(81).nodePrivateKey);
+			const localScid = encodeShortChannelId({
+				block: 810,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const hintScid = encodeShortChannelId({
+				block: 810,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			const localChannels = [
+				{ shortChannelId: localScid, peer: dest, outboundMsat: 100_000_000n }
+			];
+			// The destination's invoice hints its side of the channel: the
+			// forwarding node is the SOURCE itself.
+			const hints: IRoutingHintHop[][] = [
+				[
+					{
+						pubkey: source,
+						shortChannelId: hintScid,
+						feeBaseMsat: 0,
+						feeProportionalMillionths: 0,
+						cltvExpiryDelta: 40
+					}
+				]
+			];
+
+			// Above the local bound: the unbounded hint edge used to admit it.
+			const oversized = findRoute(
+				graph,
+				source,
+				dest,
+				150_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				hints,
+				undefined,
+				localChannels
+			);
+			expect(oversized, 'no single-path route above local capacity').to.be.null;
+
+			// Within the bound it still routes, over the LOCAL edge.
+			const fits = findRoute(
+				graph,
+				source,
+				dest,
+				50_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				hints,
+				undefined,
+				localChannels
+			);
+			expect(fits, 'routable within local capacity').to.not.be.null;
+			expect(fits!.hops[0].shortChannelId.equals(localScid)).to.be.true;
 		});
 
 		it('a channel-scoped failure on the second part penalizes that part culpable SCID', function () {

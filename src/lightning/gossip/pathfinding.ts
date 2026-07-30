@@ -315,15 +315,37 @@ function buildEdgeOverlay(
 	const shadowedScids = new Set<string>();
 
 	if (routingHints) {
+		// A hint route can begin at the SENDER itself: invoices hint the
+		// destination's channels, so when we are the destination's direct peer
+		// the hint's forwarding node is us. A synthetic edge for that hop
+		// carries no capacity bound, so it would admit ANY amount across our
+		// own channel, bypassing the bounded local-channel edges that model
+		// what we can actually send — the payment then dies locally in
+		// addHtlc instead of splitting via MPP (#254). Drop leading self-hops:
+		// the local edges cover source → peer authoritatively, and a route
+		// through the remaining tail (if any) reaches its entry point over
+		// graph/local edges.
+		const trimmedHints: IRoutingHintHop[][] = [];
+		for (const hintRoute of routingHints) {
+			let start = 0;
+			while (
+				start < hintRoute.length &&
+				hintRoute[start].pubkey.equals(source)
+			) {
+				start++;
+			}
+			const rest = start === 0 ? hintRoute : hintRoute.slice(start);
+			if (rest.length > 0) trimmedHints.push(rest);
+		}
 		for (const [k, v] of buildSyntheticEdges(
-			routingHints,
+			trimmedHints,
 			graph,
 			destination
 		)) {
 			syntheticEdges.set(k, [...(syntheticEdges.get(k) ?? []), ...v]);
 		}
 		for (const [k, v] of buildHintDestinationMap(
-			routingHints,
+			trimmedHints,
 			graph,
 			destination
 		)) {

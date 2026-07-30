@@ -7090,6 +7090,20 @@ export class LightningNode extends EventEmitter {
 	 * peer — even when the channel is not in the public gossip graph (private or
 	 * not yet announced). Matches LND/CLN/LDK behaviour.
 	 */
+	/**
+	 * The channel sendPaymentToRoute would select for this route's first hop
+	 * (same selection order: route SCID first, then peer + amount), so a
+	 * pre-dispatch check compares against exactly what a dispatch would use.
+	 */
+	private firstHopChannelFor(route: IRoute): Channel | undefined {
+		const firstHop = route.hops[0];
+		const firstHopPubkey = firstHop.pubkey.toString('hex');
+		return (
+			this.findLocalChannelByScid(firstHop.shortChannelId, firstHopPubkey) ??
+			this.findChannelForPeer(firstHopPubkey, route.totalAmountMsat)
+		);
+	}
+
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
@@ -7102,15 +7116,14 @@ export class LightningNode extends EventEmitter {
 			// A splice keeps using its pre-splice scid until the lock.
 			const scid = st.shortChannelId ?? st.scidAlias;
 			if (!scid) continue;
-			// Mid-splice, the ceiling is the min across both fundings (a
-			// splice-out's candidate commitment has less to spend) — the same
-			// figure addHtlc enforces, so the router never offers a route the
-			// channel then refuses. NORMAL channels keep the historical
-			// upper-bound (the add enforces reserve/in-flight limits).
-			const outboundMsat =
-				st.state === ChannelState.SPLICING
-					? channel.getSpendableOutboundMsat()
-					: st.localBalanceMsat;
+			// The ceiling is what addHtlc will actually accept — reserve,
+			// in-flight HTLCs and commit fee subtracted, and mid-splice the min
+			// across both fundings — so the router never offers a route (or
+			// sizes an MPP part) the channel then refuses. The raw
+			// localBalanceMsat bound previously used for NORMAL channels let a
+			// near-balance single path or MPP part through that could only die
+			// locally in addHtlc as "insufficient balance" (#254).
+			const outboundMsat = channel.getSpendableOutboundMsat();
 			if (outboundMsat <= 0n) continue;
 			edges.push({
 				shortChannelId: scid,
@@ -7253,7 +7266,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const localChannels = this.getLocalChannelEdges();
-		const route = findRoute(
+		let route = findRoute(
 			this.graph,
 			sourceNodeId,
 			destination,
@@ -7267,6 +7280,24 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			localChannels
 		);
+		// The router can bound our first hop looser than what addHtlc enforces
+		// (a graph update's advertised maximum, or a race against in-flight
+		// HTLCs), so a single-path route the outgoing channel cannot actually
+		// carry would only die locally in addHtlc as "insufficient balance".
+		// When the selected channel exists but cannot carry the total, treat
+		// the route as unroutable up front so the MPP fallback below can split
+		// the payment across channels (#254). When NO channel is found at all,
+		// keep the route: MPP could not dispatch either, and sendPaymentToRoute
+		// reports the precise no-channel failure.
+		if (route) {
+			const firstHopChannel = this.firstHopChannelFor(route);
+			if (
+				firstHopChannel &&
+				firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
+			) {
+				route = null;
+			}
+		}
 		// MPP requires the recipient to advertise basic_mpp (BOLT 4): splitting
 		// to a non-MPP recipient locks every part until the mpp_timeout.
 		if (
