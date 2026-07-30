@@ -7,6 +7,7 @@
  */
 
 import { Network } from '../invoice/types';
+import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
 import { IRoute, INodeAddress } from '../gossip/types';
@@ -437,9 +438,25 @@ export interface IKeysendRetrySource {
 }
 
 export interface IPaymentRetryContext {
-	/** Absent for keysend, which replays `keysend` instead. */
+	/** Absent for keysend and BOLT 12, which replay their own sources. */
 	invoiceStr?: string;
 	keysend?: IKeysendRetrySource;
+	/**
+	 * A BOLT 12 payment has no invoice string to re-pay, so a retry
+	 * re-dispatches the decoded invoice through payBolt12Invoice with the
+	 * accumulated channel exclusions.
+	 */
+	bolt12Invoice?: IBolt12Invoice;
+	/** Index into bolt12Invoice.paths used by the current attempt. */
+	bolt12PathIndex?: number;
+	/**
+	 * Indices of bolt12Invoice.paths whose BLINDED segment failed. Channel
+	 * exclusion cannot route around a blinded hop (its SCID is opaque), so
+	 * route selection skips these paths entirely and a retry rotates to the
+	 * invoice's other paths (BOLT 4: on a failure from a blinded hop the
+	 * origin SHOULD use a different blinded path).
+	 */
+	bolt12ExcludedPathIndices?: Set<number>;
 	excludedChannels: Set<string>;
 	retryCount: number;
 	maxRetries: number;

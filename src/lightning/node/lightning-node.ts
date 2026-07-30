@@ -60,6 +60,7 @@ import {
 	INodeAnnouncementMessage,
 	INodeAddress,
 	IRoute,
+	IRouteHop,
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3
 } from '../gossip/types';
@@ -7650,6 +7651,56 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Record a blinded-path-level failure for a BOLT 12 payment, and report
+	 * whether rotating to another of the invoice's paths is possible.
+	 *
+	 * A failure sourced at or beyond the introduction node but BEFORE the
+	 * final hop failed inside the blinded segment: the erring "channel" is
+	 * opaque (zeroed SCID), so only skipping the whole path can route around
+	 * it. The final hop is the recipient, whose failures judge the payment
+	 * itself (wrong amount, unknown hash) rather than the path, with one
+	 * exception: invalid_onion_blinding, which BOLT 4 has every blinded hop,
+	 * final included, return for any error inside a blinded path. Height
+	 * skew is excluded outright, since there the path did nothing wrong.
+	 *
+	 * When the criterion holds, the attempt's path index is added to the
+	 * context's excluded set. Returns true only if a non-excluded path
+	 * remains, which is what justifies retrying a code whose PERM bits
+	 * would otherwise end the payment.
+	 */
+	private noteBolt12BlindedPathFailure(
+		ctx: IPaymentRetryContext | undefined,
+		payment: IPaymentInfo,
+		route: IPaymentInfo['route'],
+		heightSkew: boolean
+	): boolean {
+		if (!ctx?.bolt12Invoice || heightSkew) return false;
+		if (ctx.bolt12PathIndex === undefined) return false;
+		const hops = route?.hops as IRouteHop[] | undefined;
+		if (!hops || payment.failureSourceIndex === undefined) return false;
+		const introIndex = hops.findIndex(
+			(hop) =>
+				hop.encryptedRecipientData !== undefined ||
+				hop.blindingPoint !== undefined
+		);
+		if (introIndex < 0 || payment.failureSourceIndex < introIndex) {
+			return false;
+		}
+		const blindedSegmentFailure =
+			payment.failureSourceIndex < hops.length - 1 ||
+			payment.failureCode === INVALID_ONION_BLINDING;
+		if (!blindedSegmentFailure) return false;
+		if (!ctx.bolt12ExcludedPathIndices) {
+			ctx.bolt12ExcludedPathIndices = new Set();
+		}
+		ctx.bolt12ExcludedPathIndices.add(ctx.bolt12PathIndex);
+		return (
+			ctx.bolt12ExcludedPathIndices.size <
+			(ctx.bolt12Invoice.paths?.length ?? 0)
+		);
+	}
+
+	/**
 	 * Send a keysend (spontaneous) payment — bLIP-0003.
 	 *
 	 * The sender generates a random preimage, includes it in the final hop
@@ -9922,6 +9973,22 @@ export class LightningNode extends EventEmitter {
 		// detected above.
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
 		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
+
+		// A failure INSIDE the blinded segment of a BOLT 12 payment implicates
+		// the blinded path rather than any public channel: its hops are opaque
+		// and their SCIDs zeroed, so the channel exclusion below cannot route
+		// around it. Exclude the path index instead, so the retry rotates to
+		// the invoice's other paths. When another path remains this also
+		// justifies a retry for invalid_onion_blinding, whose PERM|BADONION
+		// bits would otherwise read as final: it is the one code every blinded
+		// hop returns for any error, precisely so the sender learns nothing
+		// beyond "use a different blinded path" (BOLT 4).
+		const bolt12PathFailover = this.noteBolt12BlindedPathFailure(
+			retryCtx,
+			payment,
+			failureRoute,
+			heightSkew
+		);
 		// MPP payments are never auto-retried here: redispatching the FULL
 		// invoice while sibling parts are still held by the recipient lets the
 		// old parts and the retry's parts sum past total_msat, and the
@@ -9934,7 +10001,9 @@ export class LightningNode extends EventEmitter {
 			retryCtx &&
 			!mppState &&
 			retryCtx.retryCount < maxRetries &&
-			(heightSkew || !this.isPermanentFailure(payment.failureCode))
+			(heightSkew ||
+				bolt12PathFailover ||
+				!this.isPermanentFailure(payment.failureCode))
 		) {
 			// Exclude the failing channel's SCID from future routes. Skipped for
 			// height skew: the route is fine, our expiry was stale, and banning a
@@ -9979,19 +10048,30 @@ export class LightningNode extends EventEmitter {
 			this.payments.delete(hashHex);
 			try {
 				// A keysend has no invoice, so replay it from its original preimage
-				// to keep the same payment hash.
-				const retried = retryCtx.keysend
-					? this.dispatchKeysend(
-							retryCtx.keysend.options,
-							retryCtx.keysend.preimage,
-							retryCtx.excludedChannels
-					  )
-					: this.sendPayment(
-							retryCtx.invoiceStr!,
-							retryCtx.excludedChannels,
-							retryCtx.maxFeeMsat,
-							retryCtx.amountMsat
-					  );
+				// to keep the same payment hash. A BOLT 12 payment has no invoice
+				// STRING, so re-dispatch its decoded invoice; re-entering
+				// payBolt12Invoice re-routes with the exclusions (rotating to the
+				// invoice's other blinded paths when the failed one is unusable).
+				let retried: IPaymentInfo;
+				if (retryCtx.keysend) {
+					retried = this.dispatchKeysend(
+						retryCtx.keysend.options,
+						retryCtx.keysend.preimage,
+						retryCtx.excludedChannels
+					);
+				} else if (retryCtx.bolt12Invoice) {
+					retried = this.payBolt12Invoice(
+						retryCtx.bolt12Invoice,
+						retryCtx.excludedChannels
+					);
+				} else {
+					retried = this.sendPayment(
+						retryCtx.invoiceStr!,
+						retryCtx.excludedChannels,
+						retryCtx.maxFeeMsat,
+						retryCtx.amountMsat
+					);
+				}
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
@@ -11235,9 +11315,24 @@ export class LightningNode extends EventEmitter {
 	 * Pay a BOLT 12 invoice by extracting payment info and delegating to sendPayment.
 	 * This creates a BOLT 11-like payment flow using the BOLT 12 invoice details.
 	 */
-	payBolt12Invoice(invoice: IBolt12Invoice): IPaymentInfo {
+	payBolt12Invoice(
+		invoice: IBolt12Invoice,
+		excludedChannels?: Set<string>
+	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
+		}
+
+		// Payment deduplication, as in sendPayment: a second dispatch for a
+		// hash still in flight would fight the first attempt's retry context
+		// and in-flight record.
+		const dedupHashHex = invoice.paymentHash.toString('hex');
+		const existingPayment = this.payments.get(dedupHashHex);
+		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
 		}
 
 		const destination = invoice.nodeId;
@@ -11246,41 +11341,52 @@ export class LightningNode extends EventEmitter {
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
 		// Route blinding: BOLT 12 invoices natively carry blinded payment paths.
-		// Route through one (shared blinded sender with the BOLT 11 path).
+		// Route through one (shared blinded sender with the BOLT 11 path). Try
+		// each advertised path in turn, skipping paths whose blinded segment
+		// already failed: a retry re-enters here with the failed channels and
+		// path indices excluded, so a path that is no longer usable rotates to
+		// the invoice's other paths instead of failing the payment.
 		if (invoice.paths && invoice.paths.length > 0) {
-			const payInfo = invoice.blindedPayInfo?.[0] ?? {
-				feeBaseMsat: 0,
-				feeProportionalMillionths: 0,
-				cltvExpiryDelta: 0,
-				htlcMinimumMsat: 0n,
-				htlcMaximumMsat: amountMsat
-			};
-			const blindedRoute = findRouteToBlindedPath(
-				this.graph,
-				sourceNodeId,
-				invoice.paths[0],
-				payInfo,
-				amountMsat,
-				finalCltvExpiry,
-				undefined,
-				undefined,
-				this.missionControl,
-				// Our own channels: a direct channel to the introduction node must
-				// be routable even when it never entered the public gossip graph
-				// (private channels; a fresh interop channel paying a CLN offer).
-				this.getLocalChannelEdges()
-			);
+			const excludedPaths = this.paymentRetryContexts.get(
+				invoice.paymentHash.toString('hex')
+			)?.bolt12ExcludedPathIndices;
+			let blindedRoute: IRoute | null = null;
+			let pathIndex = 0;
+			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
+				if (excludedPaths?.has(i)) continue;
+				const payInfo = invoice.blindedPayInfo?.[i] ?? {
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: amountMsat
+				};
+				blindedRoute = findRouteToBlindedPath(
+					this.graph,
+					sourceNodeId,
+					invoice.paths[i],
+					payInfo,
+					amountMsat,
+					finalCltvExpiry,
+					undefined,
+					excludedChannels,
+					this.missionControl,
+					// Our own channels: a direct channel to the introduction node must
+					// be routable even when it never entered the public gossip graph
+					// (private channels; a fresh interop channel paying a CLN offer).
+					this.getLocalChannelEdges()
+				);
+				if (blindedRoute) pathIndex = i;
+			}
 			if (!blindedRoute) {
 				throw new Error('No route to BOLT 12 blinded path introduction node');
 			}
-			return this.sendPaymentToRoute(
+			return this.dispatchBolt12Route(
 				blindedRoute,
-				invoice.paymentHash,
+				invoice,
 				finalCltvExpiry,
-				// BOLT 12 has no payment_secret: the blinded path's encrypted
-				// path_id authenticates this payment at the recipient.
-				undefined,
-				amountMsat
+				excludedChannels,
+				pathIndex
 			);
 		}
 
@@ -11291,8 +11397,8 @@ export class LightningNode extends EventEmitter {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			undefined,
-			undefined,
+			excludedChannels,
+			this.missionControl,
 			undefined,
 			undefined,
 			undefined,
@@ -11302,13 +11408,67 @@ export class LightningNode extends EventEmitter {
 			throw new Error('No route found to BOLT 12 invoice destination');
 		}
 
-		return this.sendPaymentToRoute(
+		return this.dispatchBolt12Route(
 			route,
-			invoice.paymentHash,
+			invoice,
 			finalCltvExpiry,
-			undefined,
-			amountMsat
+			excludedChannels
 		);
+	}
+
+	/**
+	 * Register the retry context for a BOLT 12 dispatch and send along the
+	 * route, so the failure handler can re-route a transient failure and the
+	 * height-skew recovery applies exactly as it does to BOLT 11 and keysend
+	 * payments. There is no invoice string to re-pay, so the context carries
+	 * the decoded invoice and a retry re-enters payBolt12Invoice with the
+	 * accumulated exclusions; the blinded path index used by this attempt is
+	 * recorded so a failure inside the blinded segment can exclude the path.
+	 *
+	 * The context is registered only after a route was found, and a context
+	 * created HERE is removed again when the dispatch fails locally (an
+	 * exception, or addHtlc refusing the HTLC): a local failure never
+	 * reaches the onion failure handler, so nothing else would clean it up
+	 * and nothing can retry it. A pre-existing context is left alone; during
+	 * a retry the failure handler owns its rollback and give-up behavior.
+	 */
+	private dispatchBolt12Route(
+		route: IRoute,
+		invoice: IBolt12Invoice,
+		finalCltvExpiry: number,
+		excludedChannels?: Set<string>,
+		pathIndex?: number
+	): IPaymentInfo {
+		const hashHex = invoice.paymentHash.toString('hex');
+		const created = !this.paymentRetryContexts.has(hashHex);
+		if (created) {
+			this.paymentRetryContexts.set(hashHex, {
+				bolt12Invoice: invoice,
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries
+			});
+		}
+		const ctx = this.paymentRetryContexts.get(hashHex)!;
+		ctx.bolt12PathIndex = pathIndex;
+		try {
+			const payment = this.sendPaymentToRoute(
+				route,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				// BOLT 12 has no payment_secret: the blinded path's encrypted
+				// path_id authenticates this payment at the recipient.
+				undefined,
+				invoice.amount
+			);
+			if (created && payment.status === PaymentStatus.FAILED) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+			return payment;
+		} catch (err) {
+			if (created) this.paymentRetryContexts.delete(hashHex);
+			throw err;
+		}
 	}
 
 	/**
@@ -11675,7 +11835,10 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan for PENDING outbound payments whose invoice has expired.
+	 * Scan for PENDING outbound payments whose invoice has expired. The
+	 * expiry comes from the retry context's payment source: the decoded
+	 * BOLT 11 invoice string, or the BOLT 12 invoice's created_at plus
+	 * relative_expiry. A keysend has no invoice and therefore no expiry.
 	 */
 	private scanExpiredPendingPayments(): void {
 		const now = Math.floor(Date.now() / 1000);
@@ -11686,19 +11849,25 @@ export class LightningNode extends EventEmitter {
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
 			if (!retryCtx) continue;
 
-			try {
-				const { decode } = require('../invoice/decode');
-				const decoded = decode(retryCtx.invoiceStr);
-				const expiryTimestamp =
-					(decoded.timestamp || 0) + (decoded.expiry || 3600);
-				if (now > expiryTimestamp) {
-					this.failPayment(
-						payment.paymentHash,
-						'Invoice expired while the payment was still in flight'
-					);
+			let expiryTimestamp: number | undefined;
+			if (retryCtx.bolt12Invoice) {
+				expiryTimestamp =
+					Number(retryCtx.bolt12Invoice.createdAt) +
+					(retryCtx.bolt12Invoice.relativeExpiry ?? DEFAULT_EXPIRY);
+			} else if (retryCtx.invoiceStr) {
+				try {
+					const { decode } = require('../invoice/decode');
+					const decoded = decode(retryCtx.invoiceStr);
+					expiryTimestamp = (decoded.timestamp || 0) + (decoded.expiry || 3600);
+				} catch {
+					// Can't decode invoice — skip
 				}
-			} catch {
-				// Can't decode invoice — skip
+			}
+			if (expiryTimestamp !== undefined && now > expiryTimestamp) {
+				this.failPayment(
+					payment.paymentHash,
+					'Invoice expired while the payment was still in flight'
+				);
 			}
 		}
 	}
