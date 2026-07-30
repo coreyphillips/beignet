@@ -303,18 +303,220 @@ describe('Blinded final hop MPP receive (issue #262)', () => {
 		});
 
 		payBlindedPart(alice, invoice, 5_000_000n, AMOUNT);
-		// BOLT 4: every part MUST carry the same total. A disagreeing part is
-		// failed alone; the conformant part stays parked.
+		// BOLT 4: every part MUST carry the same total, and on disagreement
+		// the receiver SHOULD fail the ENTIRE HTLC set: the declared total is
+		// ambiguous, and the parked part must not stay locked until the MPP
+		// timeout.
 		payBlindedPart(alice, invoice, 5_000_000n, 12_000_000n);
 
 		const payment = alice.getPayment(invoice.paymentHash)!;
 		expect(payment.status).to.equal(PaymentStatus.FAILED);
 		expect(payment.failureCode).to.equal(FINAL_INCORRECT_HTLC_AMOUNT);
 		expect(
-			pendingMpp(bob).get(invoice.paymentHash.toString('hex'))?.receivedParts,
-			'the conformant part is still parked'
-		).to.have.length(1);
+			pendingMpp(bob).size,
+			'the entire set is failed and cleared, not just the new part'
+		).to.equal(0);
 		expect(received, 'no settlement').to.be.false;
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	// ─── Direct-drive payload-shape tests ───
+	// These drive bob's final-hop handler with crafted payloads reusing the
+	// issued invoice's REAL blinded path data (encrypted path_id and path
+	// key), so the authenticity gate passes and only the shape under test
+	// differs from a conformant payer. fail/fulfill are counted via stubs.
+
+	function driveFinalHop(
+		bob: LightningNode,
+		invoice: IBolt12Invoice,
+		hopPayload: Record<string, unknown>,
+		incomingAmountMsat: bigint
+	): { failed: number; fulfilled: number } {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const bobAny = bob as any;
+		const outcome = { failed: 0, fulfilled: 0 };
+		const cm = bobAny.channelManager;
+		const realFail = cm.failHtlc;
+		const realFulfill = cm.fulfillHtlc;
+		cm.failHtlc = (): void => {
+			outcome.failed++;
+		};
+		cm.fulfillHtlc = (): void => {
+			outcome.fulfilled++;
+		};
+		try {
+			bobAny.handleFinalHopHtlc(
+				crypto.randomBytes(32),
+				1n,
+				incomingAmountMsat,
+				invoice.paymentHash,
+				hopPayload,
+				100_000
+			);
+		} finally {
+			cm.failHtlc = realFail;
+			cm.fulfillHtlc = realFulfill;
+		}
+		return outcome;
+	}
+
+	function blindedFinalPayload(
+		invoice: IBolt12Invoice,
+		fields: Record<string, unknown>
+	): Record<string, unknown> {
+		return {
+			outgoingCltvValue: 0,
+			encryptedRecipientData: invoice.paths![0].blindedHops[0].encryptedData,
+			blindingPoint: invoice.paths![0].blindingPoint,
+			...fields
+		};
+	}
+
+	it('rejects a blinded final payload without total_amount_msat', () => {
+		const { alice, bob } = setupPair(956, 957);
+		const invoice = issueBolt12Invoice(bob, 956, AMOUNT);
+
+		// BOLT 4 makes total_amount_msat REQUIRED on a blinded final hop.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, { amountToForwardMsat: AMOUNT }),
+			AMOUNT
+		);
+
+		expect(outcome.failed, 'rejected').to.equal(1);
+		expect(outcome.fulfilled, 'no preimage revealed').to.equal(0);
+		expect(pendingMpp(bob).size, 'nothing parked').to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('rejects a blinded final payload carrying payment_data', () => {
+		const { alice, bob } = setupPair(958, 959);
+		const invoice = issueBolt12Invoice(bob, 958, AMOUNT);
+
+		// BOLT 4 forbids payment_data on a blinded final payload; BOLT 12 has
+		// no payment_secret at all.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, {
+				amountToForwardMsat: AMOUNT,
+				totalAmountMsat: AMOUNT,
+				paymentSecret: crypto.randomBytes(32)
+			}),
+			AMOUNT
+		);
+
+		expect(outcome.failed, 'rejected').to.equal(1);
+		expect(outcome.fulfilled, 'no preimage revealed').to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('rejects a blinded final payload declaring both total mechanisms', () => {
+		const { alice, bob } = setupPair(960, 961);
+		const invoice = issueBolt12Invoice(bob, 960, AMOUNT);
+
+		// A payload carrying payment_data total_msat AND total_amount_msat
+		// would let the sender choose which total the receiver validates.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, {
+				amountToForwardMsat: 6_000_000n,
+				totalMsat: 6_000_000n,
+				totalAmountMsat: AMOUNT
+			}),
+			6_000_000n
+		);
+
+		expect(outcome.failed, 'rejected').to.equal(1);
+		expect(outcome.fulfilled, 'no preimage revealed').to.equal(0);
+		expect(pendingMpp(bob).size, 'nothing parked').to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('does not count incoming HTLC overfunding toward MPP completion', () => {
+		const { alice, bob } = setupPair(962, 963);
+		const invoice = issueBolt12Invoice(bob, 962, AMOUNT);
+
+		// The incoming HTLC covers the whole invoice, but the onion declares
+		// only 6M of the 10M total as this part's amount. Settling on the
+		// incoming value would release the preimage for a payment whose
+		// declared parts never summed to the total.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, {
+				amountToForwardMsat: 6_000_000n,
+				totalAmountMsat: AMOUNT
+			}),
+			AMOUNT
+		);
+
+		expect(outcome.fulfilled, 'not settled as a single part').to.equal(0);
+		expect(outcome.failed, 'part is accepted, not failed').to.equal(0);
+		const pending = pendingMpp(bob).get(invoice.paymentHash.toString('hex'));
+		expect(pending?.receivedParts, 'parked as an MPP part').to.have.length(1);
+		expect(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(pending!.receivedParts[0] as any).amountMsat,
+			'accumulated at amt_to_forward, not the incoming HTLC value'
+		).to.equal(6_000_000n);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('rejects a declared total below the invoice even when the incoming HTLC covers it', () => {
+		const { alice, bob } = setupPair(964, 965);
+		const invoice = issueBolt12Invoice(bob, 964, AMOUNT);
+
+		// The declared total is the claim; the (overfunded) incoming value
+		// must not stand in for it.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, {
+				amountToForwardMsat: 6_000_000n,
+				totalAmountMsat: 6_000_000n
+			}),
+			AMOUNT
+		);
+
+		expect(outcome.failed, 'rejected').to.equal(1);
+		expect(outcome.fulfilled, 'no preimage revealed').to.equal(0);
+		expect(pendingMpp(bob).size, 'nothing parked').to.equal(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('rejects a declared total below the part amt_to_forward', () => {
+		const { alice, bob } = setupPair(966, 967);
+		const invoice = issueBolt12Invoice(bob, 966, AMOUNT);
+
+		// A total below its own part contradicts itself.
+		const outcome = driveFinalHop(
+			bob,
+			invoice,
+			blindedFinalPayload(invoice, {
+				amountToForwardMsat: 8_000_000n,
+				totalAmountMsat: 6_000_000n
+			}),
+			8_000_000n
+		);
+
+		expect(outcome.failed, 'rejected').to.equal(1);
+		expect(outcome.fulfilled, 'no preimage revealed').to.equal(0);
+		expect(pendingMpp(bob).size, 'nothing parked').to.equal(0);
 
 		alice.destroy();
 		bob.destroy();
