@@ -2723,6 +2723,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
 						},
+						peerSupportsSplicing: {
+							type: 'boolean',
+							description:
+								'Whether the connected peer negotiated option_splice + option_quiesce. Absent when the peer is disconnected or mid-handshake: absence means unknown, never unsupported'
+						},
 						payThroughSplice: {
 							type: 'boolean',
 							description:

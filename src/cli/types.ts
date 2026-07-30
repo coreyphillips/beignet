@@ -89,6 +89,12 @@ export interface ChannelInfo {
 	 * through the splice (counted in the canonical balance), false = parked.
 	 */
 	payThroughSplice?: boolean;
+	/**
+	 * Whether the connected peer negotiated option_splice + option_quiesce.
+	 * Absent when the peer is disconnected or its init has not arrived, so
+	 * absence means "unknown", never "unsupported".
+	 */
+	peerSupportsSplicing?: boolean;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;

@@ -2852,6 +2852,16 @@ export class BeignetNode extends EventEmitter {
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
 		};
+		// What the connected peer's init negotiated, read rather than guessed:
+		// a client deciding whether to offer splice controls has no other way
+		// to know, and reconstructing feature bits client-side is exactly the
+		// kind of daemon arithmetic the UI is not supposed to redo. Omitted
+		// when there is no init to read (peer disconnected), which a client
+		// should treat as "offer it and let the daemon answer".
+		if (peerPubkey) {
+			const splice = this.node.peerSupportsSplicing(peerPubkey);
+			if (splice !== null) info.peerSupportsSplicing = splice;
+		}
 		if (ch.fundingTxid) info.fundingTxid = ch.fundingTxid;
 		if (ch.shortChannelId) info.shortChannelId = ch.shortChannelId;
 		if (ch.feeratePerKw !== undefined) info.feeratePerKw = ch.feeratePerKw;

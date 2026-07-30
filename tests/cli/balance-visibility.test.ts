@@ -147,7 +147,8 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		const info = (BeignetNode.prototype as any).toChannelInfo.call(
 			{
 				node: {
-					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' })
+					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+					peerSupportsSplicing: () => null
 				}
 			},
 			{
@@ -172,7 +173,8 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		const info = (BeignetNode.prototype as any).toChannelInfo.call(
 			{
 				node: {
-					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' })
+					getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+					peerSupportsSplicing: () => null
 				}
 			},
 			{
@@ -187,6 +189,43 @@ describe('Channel listing wire fields (GET /channels JSON)', () => {
 		);
 		expect(info.htlcUsable).to.equal(undefined);
 		expect(info.payThroughSplice).to.equal(undefined);
+	});
+
+	// The dashboard hides its splice buttons on `false` alone, so the
+	// distinction between false and absent is load-bearing: absent means the
+	// peer is disconnected and support is unknowable, and hiding on unknown
+	// would strip the buttons from every channel whose peer blinked.
+	it('toChannelInfo carries the peer splice support the node read', () => {
+		const base = {
+			channelId: Buffer.alloc(32, 3),
+			peerPubkey: 'peerpk',
+			state: 'NORMAL',
+			localBalanceMsat: 1_000_000n,
+			remoteBalanceMsat: 0n,
+			fundingSatoshis: 1_000n,
+			channelType: null
+		};
+		const withSupport = (answer: boolean | null) => ({
+			node: {
+				getChannelManager: () => ({ getPeerForChannel: () => 'peerpk' }),
+				peerSupportsSplicing: () => answer
+			}
+		});
+		const yes = (BeignetNode.prototype as any).toChannelInfo.call(
+			withSupport(true),
+			{ ...base }
+		);
+		expect(yes.peerSupportsSplicing).to.equal(true);
+		const no = (BeignetNode.prototype as any).toChannelInfo.call(
+			withSupport(false),
+			{ ...base }
+		);
+		expect(no.peerSupportsSplicing).to.equal(false);
+		const unknown = (BeignetNode.prototype as any).toChannelInfo.call(
+			withSupport(null),
+			{ ...base }
+		);
+		expect(unknown.peerSupportsSplicing).to.equal(undefined);
 	});
 });
 
