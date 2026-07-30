@@ -306,6 +306,7 @@ function buildEdgeOverlay(
 	syntheticEdges: Map<string, IGraphChannel[]>;
 	hintDestMap: Map<string, string>;
 	shadowedScids: Set<string>;
+	localFirstHopScids: Set<string> | null;
 } {
 	const syntheticEdges = new Map<string, IGraphChannel[]>();
 	const hintDestMap = new Map<string, string>();
@@ -313,6 +314,19 @@ function buildEdgeOverlay(
 	// overlay edge replaces it. Only local channels ever shadow a graph entry;
 	// routing hints defer to the graph when the SCID is announced.
 	const shadowedScids = new Set<string>();
+	// When a NON-EMPTY local-channel overlay is supplied, it is the COMPLETE
+	// set of first hops the source can use: a graph edge leaving the source
+	// whose SCID is not a current local channel is stale (closed, spliced
+	// away, or never ours), and using it plans routes and MPP parts against
+	// gossip capacity the source cannot dispatch on. Null when no overlay was
+	// given OR it is empty: advisory surfaces (queryRoute, estimatePayment)
+	// legitimately compute hypothetical graph-only routes for a node holding
+	// no usable channels, and an empty set would turn every such query into
+	// no-route.
+	const localFirstHopScids: Set<string> | null =
+		localChannels && localChannels.length > 0
+			? new Set(localChannels.map((lc) => lc.shortChannelId.toString('hex')))
+			: null;
 
 	if (routingHints) {
 		// A hint route can begin at the SENDER itself: invoices hint the
@@ -380,7 +394,7 @@ function buildEdgeOverlay(
 		}
 	}
 
-	return { syntheticEdges, hintDestMap, shadowedScids };
+	return { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids };
 }
 
 // ── Route Finding ───────────────────────────────────────────────────
@@ -434,13 +448,8 @@ export function findRoute(
 
 	// Overlay edges: routing-hint private channels + our own local channels
 	// (so a direct payment to a channel peer routes even when unannounced).
-	const { syntheticEdges, hintDestMap, shadowedScids } = buildEdgeOverlay(
-		graph,
-		source,
-		destination,
-		routingHints,
-		localChannels
-	);
+	const { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids } =
+		buildEdgeOverlay(graph, source, destination, routingHints, localChannels);
 
 	// Best known cost to reach each node (working backwards from dest)
 	const bestCost = new Map<string, bigint>();
@@ -526,6 +535,19 @@ export function findRoute(
 
 				// The upstream node uses the update for its direction.
 				update = isCurrentNode2 ? channel.update1 : channel.update2;
+
+				// With a local overlay, only CURRENT local channels may serve as
+				// the source's first hop: a stale source-adjacent graph entry
+				// (closed or spliced-away SCID the graph has not pruned) would
+				// otherwise size the hop by advertised gossip capacity the
+				// source cannot dispatch on.
+				if (
+					localFirstHopScids !== null &&
+					upstreamNodeHex === sourceHex &&
+					!localFirstHopScids.has(scidHex)
+				) {
+					continue;
+				}
 			}
 
 			if (!update) continue;
@@ -789,13 +811,8 @@ function findRouteWithCapacityLimits(
 	if (sourceHex === destHex) return null;
 
 	// Overlay edges: routing-hint private channels + our own local channels.
-	const { syntheticEdges, hintDestMap, shadowedScids } = buildEdgeOverlay(
-		graph,
-		source,
-		destination,
-		routingHints,
-		localChannels
-	);
+	const { syntheticEdges, hintDestMap, shadowedScids, localFirstHopScids } =
+		buildEdgeOverlay(graph, source, destination, routingHints, localChannels);
 
 	const bestCost = new Map<string, bigint>();
 	const predecessors = new Map<string, IPredecessor>();
@@ -854,6 +871,18 @@ function findRouteWithCapacityLimits(
 				const isCurrentNode2 = current.nodeId === node2Hex;
 				upstreamNodeHex = isCurrentNode2 ? node1Hex : node2Hex;
 				update = isCurrentNode2 ? channel.update1 : channel.update2;
+
+				// Only CURRENT local channels may serve as the source's first
+				// hop when a local overlay is supplied (see findRoute): a stale
+				// source-adjacent graph SCID would let MPP size a part by
+				// gossip capacity the source cannot dispatch on.
+				if (
+					localFirstHopScids !== null &&
+					upstreamNodeHex === sourceHex &&
+					!localFirstHopScids.has(scidHex)
+				) {
+					continue;
+				}
 			}
 
 			if (!update) continue;

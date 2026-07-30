@@ -7130,7 +7130,13 @@ export class LightningNode extends EventEmitter {
 			edges.push({
 				shortChannelId: scid,
 				peer: Buffer.from(peerHex, 'hex'),
-				outboundMsat
+				outboundMsat,
+				// The PEER's htlc_minimum_msat: addHtlc refuses an outgoing HTLC
+				// below it, so the router must not plan one (the overlay edge
+				// otherwise defaults the minimum to zero, and since local edges
+				// shadow announced graph copies, the graph's advertised minimum
+				// no longer applies either).
+				htlcMinimumMsat: st.remoteConfig.htlcMinimumMsat
 			});
 		}
 		return edges;

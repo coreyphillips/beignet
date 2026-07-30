@@ -897,6 +897,200 @@ describe('MPP Sending (Phase 5)', function () {
 			expect(fits!.hops[0].shortChannelId.equals(localScid)).to.be.true;
 		});
 
+		it('the local edge enforces the peer HTLC minimum, shadowed graph copy included (#254)', function () {
+			// addHtlc refuses an outgoing HTLC below the PEER's
+			// htlc_minimum_msat; the overlay edge defaulted the minimum to
+			// zero, so the router could plan a first hop the channel then
+			// refused. And since local edges shadow announced graph copies,
+			// the graph's advertised minimum no longer applies either: the
+			// local edge must carry the real constraint itself.
+			const graph = new NetworkGraph();
+			const source = getPublicKey(makeNodeConfig(82).nodePrivateKey);
+			const dest = getPublicKey(makeNodeConfig(83).nodePrivateKey);
+			const scid = makeScid(820, 1, 0);
+			// The channel is ALSO announced, claiming a zero minimum.
+			const [n1, n2] =
+				Buffer.compare(source, dest) < 0 ? [source, dest] : [dest, source];
+			graph.addChannelAnnouncement({
+				nodeSignature1: crypto.randomBytes(64),
+				nodeSignature2: crypto.randomBytes(64),
+				bitcoinSignature1: crypto.randomBytes(64),
+				bitcoinSignature2: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scid,
+				nodeId1: n1,
+				nodeId2: n2,
+				bitcoinKey1: crypto.randomBytes(33),
+				bitcoinKey2: crypto.randomBytes(33)
+			});
+			for (const direction of [0, 1]) {
+				graph.applyChannelUpdate({
+					signature: crypto.randomBytes(64),
+					chainHash: BITCOIN_CHAIN_HASH,
+					shortChannelId: scid,
+					timestamp: Math.floor(Date.now() / 1000),
+					messageFlags: 1,
+					channelFlags: direction,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 0n,
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					htlcMaximumMsat: 1_000_000_000n
+				});
+			}
+			const localChannels = [
+				{
+					shortChannelId: scid,
+					peer: dest,
+					outboundMsat: 100_000_000n,
+					htlcMinimumMsat: 100_000n
+				}
+			];
+
+			const below = findRoute(
+				graph,
+				source,
+				dest,
+				50_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				localChannels
+			);
+			expect(below, 'below the peer minimum is not routable').to.be.null;
+
+			const above = findRoute(
+				graph,
+				source,
+				dest,
+				150_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				localChannels
+			);
+			expect(above, 'above the peer minimum routes').to.not.be.null;
+		});
+
+		it('getLocalChannelEdges populates the peer HTLC minimum from remoteConfig (#254)', function () {
+			const alice = createNode(84);
+			const bob = createNode(85);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob, 100_000n);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const st = (alice as any).channelManager
+				.getChannel(channelId)
+				.getFullState();
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const edges = (alice as any).getLocalChannelEdges();
+			expect(edges).to.have.length(1);
+			expect(edges[0].htlcMinimumMsat).to.equal(
+				st.remoteConfig.htlcMinimumMsat
+			);
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('a stale source-adjacent graph SCID is never a first hop when a local overlay exists (#254)', function () {
+			// The graph keeps channels until pruned, so an old SCID of ours
+			// (closed or spliced away) can survive with advertised capacity we
+			// cannot dispatch on. With a local overlay supplied, only CURRENT
+			// local channels may serve as the source's first hop, for both
+			// single-path and MPP planning.
+			const graph = new NetworkGraph();
+			const source = getPublicKey(makeNodeConfig(86).nodePrivateKey);
+			const dest = getPublicKey(makeNodeConfig(87).nodePrivateKey);
+			const staleScid = makeScid(830, 1, 0);
+			const currentScid1 = makeScid(830, 2, 0);
+			const currentScid2 = makeScid(830, 3, 0);
+			const [n1, n2] =
+				Buffer.compare(source, dest) < 0 ? [source, dest] : [dest, source];
+			graph.addChannelAnnouncement({
+				nodeSignature1: crypto.randomBytes(64),
+				nodeSignature2: crypto.randomBytes(64),
+				bitcoinSignature1: crypto.randomBytes(64),
+				bitcoinSignature2: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: staleScid,
+				nodeId1: n1,
+				nodeId2: n2,
+				bitcoinKey1: crypto.randomBytes(33),
+				bitcoinKey2: crypto.randomBytes(33)
+			});
+			for (const direction of [0, 1]) {
+				graph.applyChannelUpdate({
+					signature: crypto.randomBytes(64),
+					chainHash: BITCOIN_CHAIN_HASH,
+					shortChannelId: staleScid,
+					timestamp: Math.floor(Date.now() / 1000),
+					messageFlags: 1,
+					channelFlags: direction,
+					cltvExpiryDelta: 40,
+					htlcMinimumMsat: 1n,
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					htlcMaximumMsat: 1_000_000_000n
+				});
+			}
+			const localChannels = [
+				{ shortChannelId: currentScid1, peer: dest, outboundMsat: 96_000_000n },
+				{ shortChannelId: currentScid2, peer: dest, outboundMsat: 96_000_000n }
+			];
+
+			// Single path: the stale 1B-msat edge must not admit what the
+			// current channels cannot carry.
+			const single = findRoute(
+				graph,
+				source,
+				dest,
+				150_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				localChannels
+			);
+			expect(single, 'stale SCID does not admit an oversized single path').to.be
+				.null;
+
+			// MPP: the amount fits across the current channels, and no part may
+			// ride the stale SCID.
+			const multi = findMultiPathRoute(
+				graph,
+				source,
+				dest,
+				150_000_000n,
+				40,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				undefined,
+				localChannels
+			);
+			expect(multi, 'splits across the current channels').to.not.be.null;
+			expect(multi!.parts.length).to.be.greaterThan(1);
+			for (const part of multi!.parts) {
+				expect(
+					part.hops[0].shortChannelId.equals(staleScid),
+					'no part uses the stale SCID'
+				).to.be.false;
+			}
+		});
+
 		it('announced channels: MPP splits by local spendable, not the advertised maximum (#254)', async function () {
 			// The graph copy of our own channel advertises htlc_maximum_msat, a
 			// public ceiling routinely far above CURRENT spendable liquidity.
