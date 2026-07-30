@@ -10,6 +10,8 @@ import * as path from 'path';
 import { expect } from 'chai';
 import { getRelayedEvents } from '../../src/cli/daemon';
 import { WebhookManager } from '../../src/cli/webhooks';
+import { BeignetNode } from '../../src/cli/beignet-node';
+import { EPaymentType } from '../../src/types/wallet';
 
 const NEW_EVENTS = [
 	'invoice:settled',
@@ -67,6 +69,87 @@ describe('Event granularity (M4 batch 2b)', () => {
 		it('relays node:error, with and without htlc events', () => {
 			expect(getRelayedEvents()).to.include('node:error');
 			expect(getRelayedEvents(true)).to.include('node:error');
+		});
+	});
+
+	// On-chain events come from the WALLET, not the lightning node: the
+	// wallet has reported transactionReceived/transactionConfirmed all along,
+	// and until now nothing listened, so an on-chain receive changed
+	// /transactions and said nothing. These pin the whole relay chain.
+	describe('transaction events (wallet-sourced)', () => {
+		const TX_EVENTS = ['transaction:received', 'transaction:confirmed'];
+
+		it('relays them, with and without htlc events', () => {
+			for (const e of TX_EVENTS) {
+				expect(getRelayedEvents(), e).to.include(e);
+				expect(getRelayedEvents(true), e).to.include(e);
+			}
+		});
+
+		it('BeignetNode wires the wallet message handler', () => {
+			const src = fs.readFileSync(
+				path.join(__dirname, '../../src/cli/beignet-node.ts'),
+				'utf8'
+			);
+			expect(src).to.include('onMessage: (key, data) => this.onWalletMessage');
+			for (const e of TX_EVENTS) {
+				expect(src, e).to.include(`'${e}'`);
+			}
+		});
+
+		it('converts the wallet message to the wire shape and emits', () => {
+			const emitted: Array<[string, Record<string, unknown>]> = [];
+			const logged: string[] = [];
+			const fake = {
+				log: (_level: string, msg: string) => logged.push(msg),
+				emit: (name: string, info: Record<string, unknown>) => {
+					emitted.push([name, info]);
+					return true;
+				},
+				toOnchainTxInfo: (BeignetNode.prototype as any).toOnchainTxInfo
+			};
+			const message = {
+				transaction: {
+					txid: 'a'.repeat(64),
+					type: EPaymentType.received,
+					value: 0.0005,
+					fee: 0,
+					satsPerByte: 0,
+					address: 'bc1qexample',
+					height: 0,
+					timestamp: 1753900000000
+				}
+			};
+			(BeignetNode.prototype as any).onWalletMessage.call(
+				fake,
+				'transactionReceived',
+				message
+			);
+			expect(emitted).to.have.length(1);
+			const [name, info] = emitted[0];
+			expect(name).to.equal('transaction:received');
+			expect(info.txid).to.equal('a'.repeat(64));
+			expect(info.type).to.equal('received');
+			expect(info.valueSats, 'BTC converted to sats').to.equal(50_000);
+			expect(info.confirmed, 'height 0 is unconfirmed').to.equal(false);
+			expect(logged).to.deep.equal(['Transaction received']);
+
+			(BeignetNode.prototype as any).onWalletMessage.call(
+				fake,
+				'transactionConfirmed',
+				{ transaction: { ...message.transaction, height: 908214 } }
+			);
+			expect(emitted).to.have.length(2);
+			expect(emitted[1][0]).to.equal('transaction:confirmed');
+			expect(emitted[1][1].confirmed).to.equal(true);
+
+			// The keys not relayed stay silent rather than half-translated.
+			(BeignetNode.prototype as any).onWalletMessage.call(
+				fake,
+				'connectedToElectrum',
+				true
+			);
+			expect(emitted).to.have.length(2);
 		});
 	});
 

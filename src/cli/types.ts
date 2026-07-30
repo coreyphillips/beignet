@@ -812,6 +812,13 @@ export interface BeignetNodeEvents {
 		bolt11: string;
 		amountSats: number;
 	}) => void;
+	/**
+	 * An on-chain transaction touching the wallet appeared (usually still
+	 * unconfirmed) or confirmed. Fires for both directions; `info.type` says
+	 * which. Initial-sync history does not replay as events.
+	 */
+	'transaction:received': (info: OnchainTxInfo) => void;
+	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {
