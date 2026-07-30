@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { parseBody, startDaemon } from '../../src/cli/daemon';
+import { BeignetError } from '../../src/cli/errors';
 import { resolveConfig } from '../../src/cli/config';
 import { Readable } from 'stream';
 import { IncomingMessage } from 'http';
@@ -860,6 +861,110 @@ describe('Daemon auth middleware', () => {
 		} finally {
 			await node.destroy();
 			server.close();
+		}
+	}).timeout(30000);
+
+	it('rate limiter keys per forwarded client behind a trusted proxy and ignores the header otherwise', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'ratelimittest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			rateLimit: {
+				maxRequests: 3,
+				windowMs: 60_000,
+				trustedProxies: ['127.0.0.1', '::1']
+			}
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer ratelimittest' };
+		try {
+			// Exhaust client A's bucket through the trusted loopback "proxy".
+			const clientA = { ...auth, 'X-Forwarded-For': '203.0.113.10' };
+			let lastStatus = 0;
+			for (let i = 0; i < 4; i++) {
+				const resp = await httpGet(addr.port, '/info', clientA);
+				lastStatus = resp.status;
+			}
+			expect(lastStatus).to.equal(429);
+
+			// A different forwarded client still has a full bucket.
+			const clientB = { ...auth, 'X-Forwarded-For': '203.0.113.11' };
+			const other = await httpGet(addr.port, '/info', clientB);
+			expect(other.status).to.equal(200);
+
+			// Fakes prepended by the client do not mint a fresh bucket: the
+			// rightmost untrusted entry is still client A.
+			const spoof = {
+				...auth,
+				'X-Forwarded-For': '198.51.100.99, 203.0.113.10'
+			};
+			const spoofed = await httpGet(addr.port, '/info', spoof);
+			expect(spoofed.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('rate limiter shares one bucket for proxied clients without trustedProxies', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'ratelimittest2',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			rateLimit: { maxRequests: 3, windowMs: 60_000 }
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer ratelimittest2' };
+		try {
+			for (let i = 0; i < 3; i++) {
+				await httpGet(addr.port, '/info', {
+					...auth,
+					'X-Forwarded-For': `203.0.113.${i}`
+				});
+			}
+			// Varying the header did not vary the bucket: the peer is spent.
+			const resp = await httpGet(addr.port, '/info', {
+				...auth,
+				'X-Forwarded-For': '203.0.113.99'
+			});
+			expect(resp.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('refuses startup when a trustedProxies entry is not an IP address', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				apiToken: 'ratelimittest3',
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false,
+				rateLimit: { trustedProxies: ['proxy.internal'] }
+			});
+			expect.fail('startDaemon should have thrown');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(BeignetError);
+			expect((err as BeignetError).code).to.equal('INVALID_PARAMS');
+			expect((err as BeignetError).message).to.include('proxy.internal');
 		}
 	}).timeout(30000);
 });

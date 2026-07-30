@@ -16,7 +16,11 @@ import { ApiResponse, RouteHop } from './types';
 import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
 import { PaymentQueue } from './payment-queue';
-import { HttpRateLimiter, RateLimitOptions } from './http-rate-limiter';
+import {
+	HttpRateLimiter,
+	RateLimitOptions,
+	clientKeyForRequest
+} from './http-rate-limiter';
 import { encodeBip21 } from '../utils/transaction';
 import {
 	ApiKeyAuthenticator,
@@ -265,6 +269,16 @@ export async function startDaemon(
 			'INVALID_PARAMS',
 			'Refusing wildcard CORS without authentication. Configure apiToken or apiKeys, set an explicit cors origin, or set insecure: true to accept the risk.'
 		);
+	}
+	// A typo here would silently fall back to socket-address keying, so a
+	// non-IP entry is a config error, not something to skip over.
+	for (const proxy of opts.rateLimit?.trustedProxies ?? []) {
+		if (net.isIP(proxy.trim()) === 0) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`rateLimit.trustedProxies entry is not an IP address: ${proxy}`
+			);
+		}
 	}
 	// Diagnostic logger: an injected opts.logger wins; otherwise a configured
 	// logLevel creates a console logger on stderr (stdout stays reserved for
@@ -1684,12 +1698,17 @@ export async function startDaemon(
 		// failed authentication attempts count against the bucket; keyed on
 		// the peer address because the Authorization header is
 		// caller-controlled and varying it would mint a fresh bucket per
-		// guess.
+		// guess. X-Forwarded-For is honored only from configured
+		// trustedProxies; otherwise a proxy's clients share its bucket.
 		const authExempt =
 			AUTH_EXEMPT_ROUTES.has(routeKey) ||
 			(routeKey === 'GET /metrics' && opts.metricsPublic === true);
 		if (rateLimiter && !authExempt) {
-			const clientKey = req.socket.remoteAddress || 'unknown';
+			const clientKey = clientKeyForRequest(
+				req.socket.remoteAddress,
+				req.headers['x-forwarded-for'],
+				opts.rateLimit?.trustedProxies
+			);
 			if (!rateLimiter.isAllowed(clientKey)) {
 				res.setHeader('Content-Type', 'application/json');
 				res.statusCode = 429;
