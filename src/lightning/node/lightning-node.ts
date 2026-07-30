@@ -8559,6 +8559,40 @@ export class LightningNode extends EventEmitter {
 		// preimage is still claimable.
 		const expectedPathId = this.offerManager.getInvoicePathId(paymentHash);
 		if (expectedPathId || this.invoices.get(hashHex)?.bolt12) {
+			// BOLT 4: the final payload of a blinded path carries EXACTLY
+			// amt_to_forward, outgoing_cltv_value, total_amount_msat and
+			// encrypted_recipient_data (plus current_path_key when we are the
+			// introduction node). total_amount_msat is REQUIRED, and
+			// payment_data MUST NOT appear (BOLT 12 has no payment_secret).
+			// Accepting a payload that mixes both total mechanisms would let
+			// the sender pick whichever total the receiver validates against,
+			// so malformed shapes are rejected before any preimage can be
+			// revealed. Scoped to BOLT 12 receives: blinded paths in BOLT 11
+			// invoices are a non-spec beignet construct whose payments
+			// legitimately authenticate via payment_data.
+			if (
+				hopPayload?.paymentSecret !== undefined ||
+				hopPayload?.totalMsat !== undefined ||
+				hopPayload?.totalAmountMsat === undefined
+			) {
+				this.emitStructuredLog('htlc', 'malformed_blinded_final_payload', {
+					paymentHash: hashHex,
+					hasPaymentData:
+						hopPayload?.paymentSecret !== undefined ||
+						hopPayload?.totalMsat !== undefined,
+					hasTotalAmountMsat: hopPayload?.totalAmountMsat !== undefined
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
 			let receivedPathId: Buffer | undefined;
 			const pathKey = hopPayload?.blindingPoint ?? incomingBlindingPoint;
 			if (pathKey && hopPayload?.encryptedRecipientData?.length) {
@@ -8597,13 +8631,74 @@ export class LightningNode extends EventEmitter {
 		// (final-hop cltv/amount safety was validated up front, before any
 		// preimage was revealed — see finalHopSafetyFailure.)
 
+		// BOLT 4: total_amount_msat exists only inside a blinded final
+		// payload. On a cleartext final payload it is a field no conformant
+		// sender emits, and accepting it would give unauthenticated payments
+		// a second, unvalidated total mechanism.
+		if (
+			hopPayload?.totalAmountMsat !== undefined &&
+			!hopPayload.encryptedRecipientData?.length
+		) {
+			this.emitStructuredLog('htlc', 'total_amount_msat_outside_blinded', {
+				paymentHash: hashHex
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
+		// The part's amount is the onion-declared amt_to_forward. The incoming
+		// HTLC only has to COVER it (validated up front in
+		// finalHopSafetyFailure) and may legitimately exceed it, so
+		// classifying or accumulating by the incoming amount would count HTLC
+		// overfunding as payment progress and could settle a set whose onion
+		// amounts never reached the declared total.
+		const partAmountMsat = hopPayload?.amountToForwardMsat ?? amountMsat;
+
+		// The sender-declared multi-part total. BOLT 11 payment_data carries it
+		// in total_msat; a blinded final hop carries no payment_data at all and
+		// declares it in total_amount_msat (TLV 18) instead, with the path_id
+		// check above as the per-part authenticity gate. Recognising only the
+		// payment_data field made every part of a split BOLT 12 payment look
+		// like a standalone underpaying HTLC, so a spec-compliant MPP payer
+		// could not pay a beignet-issued offer (#262). The precedence is safe:
+		// a BOLT 12 payload carrying payment_data was rejected above, so both
+		// fields coexist only on the non-spec BOLT 11 blinded path, where
+		// payment_data governs.
+		const declaredTotalMsat =
+			hopPayload?.totalMsat ?? hopPayload?.totalAmountMsat;
+
+		// A total below its own part contradicts itself;
+		// final_incorrect_htlc_amount is the BOLT 4 code for a part whose
+		// amounts are inconsistent.
+		if (declaredTotalMsat !== undefined && declaredTotalMsat < partAmountMsat) {
+			this.emitStructuredLog('htlc', 'declared_total_below_part', {
+				paymentHash: hashHex,
+				declaredTotal: declaredTotalMsat.toString(),
+				partAmount: partAmountMsat.toString()
+			});
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
 		// Validate the received amount against the invoice (BOLT 4). The final
 		// node MUST NOT fulfill (and reveal the preimage) for less than the
 		// invoiced amount, and SHOULD reject gross overpayment (> 2x). Without
 		// this, a payer can settle a large invoice with a tiny HTLC and still
-		// obtain the proof-of-payment. For MPP the sender-declared total_msat is
+		// obtain the proof-of-payment. For MPP the sender-declared total is
 		// what the parts accumulate toward, so validating it here (and the
-		// existing handleMppPart accumulation to total_msat) bounds the real
+		// existing handleMppPart accumulation to that total) bounds the real
 		// received total. Zero-amount ("any amount") invoices are exempt.
 		const finalInvoice = this.invoices.get(hashHex);
 		if (
@@ -8611,12 +8706,16 @@ export class LightningNode extends EventEmitter {
 			finalInvoice.amountMsat &&
 			finalInvoice.amountMsat > 0n
 		) {
-			const isMpp =
-				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
-			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;
+			// A present declared total is validated AS the claim, never
+			// silently replaced by the (possibly larger) incoming HTLC value:
+			// otherwise an HTLC overfunded up to the invoice amount could
+			// smuggle through a declared total below it. The incoming amount
+			// is additionally bounded against gross overpayment on its own.
+			const claimedTotal = declaredTotalMsat ?? partAmountMsat;
 			if (
 				claimedTotal < finalInvoice.amountMsat ||
-				claimedTotal > finalInvoice.amountMsat * 2n
+				claimedTotal > finalInvoice.amountMsat * 2n ||
+				amountMsat > finalInvoice.amountMsat * 2n
 			) {
 				this.emitStructuredLog('htlc', 'incorrect_payment_amount', {
 					paymentHash: hashHex,
@@ -8651,15 +8750,18 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// MPP: if payment_data has totalMsat > amountMsat, this is a multi-part payment
-		if (hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat) {
+		// MPP: a declared total above this part's amount marks a multi-part
+		// payment, whether declared via payment_data (BOLT 11) or
+		// total_amount_msat on a blinded final hop (BOLT 12).
+		if (declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat) {
 			this.handleMppPart(
 				channelId,
 				htlcId,
-				amountMsat,
+				partAmountMsat,
 				paymentHash,
-				hopPayload,
-				preimage!
+				hopPayload!,
+				preimage!,
+				declaredTotalMsat
 			);
 			return;
 		}
@@ -9043,13 +9145,24 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Accumulate one part of a multi-part payment. Parts group by payment
+	 * hash; each part's authenticity was already enforced upstream in
+	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
+	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
+	 * amountMsat is the part's onion-declared amt_to_forward, NOT the
+	 * incoming HTLC value, which may exceed it; declaredTotalMsat is the
+	 * sender-declared total the parts accumulate toward: payment_data
+	 * total_msat or blinded-final total_amount_msat.
+	 */
 	private handleMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload: IHopPayload,
-		preimage: Buffer
+		preimage: Buffer,
+		declaredTotalMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 
@@ -9057,20 +9170,33 @@ export class LightningNode extends EventEmitter {
 		let pending = this.pendingMppPayments.get(hashHex);
 		if (!pending) {
 			pending = {
-				paymentSecret: hopPayload.paymentSecret!,
-				totalMsat: hopPayload.totalMsat!,
+				// Absent for blinded-final parts: BOLT 12 has no payment_secret,
+				// the per-part path_id check upstream authenticates instead.
+				paymentSecret: hopPayload.paymentSecret,
+				totalMsat: declaredTotalMsat,
 				receivedParts: [],
 				createdAt: Date.now()
 			};
 			this.pendingMppPayments.set(hashHex, pending);
-		} else if (
-			hopPayload.totalMsat !== undefined &&
-			hopPayload.totalMsat !== pending.totalMsat
-		) {
+		} else if (declaredTotalMsat !== pending.totalMsat) {
 			// BOLT 4: every part of a multi-part payment MUST carry the same
-			// total_msat. A part disagreeing with the set is
-			// final_incorrect_htlc_amount; fail just this part and keep the set
-			// intact (the payer may still complete with conformant parts).
+			// total, and on disagreement the receiver SHOULD fail the ENTIRE
+			// HTLC set with final_incorrect_htlc_amount: the set's declared
+			// total is now ambiguous, keeping parked parts alive locks the
+			// payer's funds until the MPP timeout, and a sender could keep
+			// injecting mismatched parts to hold state open indefinitely.
+			for (const p of pending.receivedParts) {
+				if (p.status !== PaymentStatus.PENDING) continue;
+				p.status = PaymentStatus.FAILED;
+				const partKey = `${p.channelId.toString('hex')}:${p.htlcId}`;
+				const partSecret = this.receivedHtlcSharedSecrets.get(partKey);
+				const partReason = partSecret
+					? createFailureMessage(partSecret, FINAL_INCORRECT_HTLC_AMOUNT)
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(partKey);
+				this.channelManager.failHtlc(p.channelId, p.htlcId, partReason);
+			}
+			this.pendingMppPayments.delete(hashHex);
 			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
