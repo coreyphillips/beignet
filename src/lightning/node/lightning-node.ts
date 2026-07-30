@@ -5402,17 +5402,23 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Whether a peer negotiated the features splicing needs, option_splice and
-	 * option_quiesce, on its current connection. Null when there is nothing to
-	 * read: the peer is not connected, or its init has not arrived yet. This is
-	 * the same answer _validateSpliceRequest enforces, exposed so a client can
-	 * know before it asks; a UI offering splice controls against an LND peer is
-	 * offering an action the daemon will refuse every time.
+	 * Whether splicing is negotiated with a peer: option_splice and
+	 * option_quiesce on BOTH feature vectors, ours and the one its current
+	 * connection's init carries. Negotiation is mutual, and the local half is
+	 * not hypothetical: localFeatures is caller configuration, and a node
+	 * configured without splicing must not report a channel as spliceable just
+	 * because the peer across it is willing. Null when there is nothing to
+	 * read: the peer is not connected, or its init has not arrived yet. This
+	 * is the same answer _validateSpliceRequest enforces, exposed so a client
+	 * can know before it asks; a UI offering splice controls against an LND
+	 * peer is offering an action the daemon will refuse every time.
 	 */
 	peerSupportsSplicing(peerPubkey: string): boolean | null {
 		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
 		if (!init) return null;
 		return (
+			this.localFeatures.hasFeature(Feature.QUIESCE) &&
+			this.localFeatures.hasFeature(Feature.SPLICE) &&
 			init.features.hasFeature(Feature.QUIESCE) &&
 			init.features.hasFeature(Feature.SPLICE)
 		);
@@ -5433,8 +5439,12 @@ export class LightningNode extends EventEmitter {
 		// Unknown support (no init to read) passes, as it always has: the
 		// splice will fail on its own if the peer truly cannot, and refusing on
 		// ignorance would block splices on reconnecting channels.
+		// Not negotiated is the honest phrasing: the missing half can be the
+		// peer's (an LND node) or our own (localFeatures configured without
+		// splicing), and blaming the peer for a local configuration sends
+		// whoever reads the error to debug the wrong node.
 		if (peerPubkey && this.peerSupportsSplicing(peerPubkey) === false) {
-			return 'peer does not support splicing (option_splice/option_quiesce not negotiated)';
+			return 'splicing is not negotiated with this peer (option_splice/option_quiesce required on both sides)';
 		}
 		return null;
 	}

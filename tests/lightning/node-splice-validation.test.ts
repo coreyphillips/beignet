@@ -39,7 +39,7 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 
 const FUNDING_SATOSHIS = 1_000_000n;
 
-function createTestNode(): LightningNode {
+function createTestNode(localFeatures?: FeatureFlags): LightningNode {
 	const seed = crypto
 		.createHash('sha256')
 		.update('splice-validation-node')
@@ -56,7 +56,8 @@ function createTestNode(): LightningNode {
 			.update(seed)
 			.update(Buffer.from([0]))
 			.digest(),
-		network: Network.REGTEST
+		network: Network.REGTEST,
+		...(localFeatures ? { localFeatures } : {})
 	});
 	node.on('error', () => {});
 	node.on('node:error', () => {});
@@ -237,7 +238,38 @@ describe('LightningNode peerSupportsSplicing', function () {
 		withInit(node, new FeatureFlags());
 		const result = node.spliceIn(channelId, 100_000n, 253);
 		expect(result.ok).to.be.false;
-		expect(result.error).to.include('does not support splicing');
+		expect(result.error).to.include('not negotiated');
 		node.destroy();
+	});
+
+	// Negotiation is mutual. localFeatures is caller configuration, so a node
+	// configured without splicing must not report a channel spliceable just
+	// because the peer across it is willing: the daemon would advertise a
+	// capability its own init never offered, and the splice would die at stfu.
+	it('is false when the remote is willing but our own features are not', () => {
+		const remote = new FeatureFlags();
+		remote.setOptional(Feature.QUIESCE);
+		remote.setOptional(Feature.SPLICE);
+
+		const noQuiesce = new FeatureFlags();
+		noQuiesce.setOptional(Feature.SPLICE);
+		const nodeNoQuiesce = createTestNode(noQuiesce);
+		withInit(nodeNoQuiesce, remote);
+		expect(nodeNoQuiesce.peerSupportsSplicing(PEER)).to.be.false;
+		nodeNoQuiesce.destroy();
+
+		const noSplice = new FeatureFlags();
+		noSplice.setOptional(Feature.QUIESCE);
+		const nodeNoSplice = createTestNode(noSplice);
+		withInit(nodeNoSplice, remote);
+		expect(nodeNoSplice.peerSupportsSplicing(PEER)).to.be.false;
+		nodeNoSplice.destroy();
+
+		// And the default features do negotiate it, so a stock node against a
+		// willing peer still answers true.
+		const stock = createTestNode();
+		withInit(stock, remote);
+		expect(stock.peerSupportsSplicing(PEER)).to.be.true;
+		stock.destroy();
 	});
 });
