@@ -28,7 +28,28 @@ Phase 1 makes it structural, in three parts:
 3. If that transaction rolls back, the request comes back `committed: false` and
    `_dispatchActions` (`channel-manager.ts:4450`) withholds the sends it
    authorized. A message whose justifying state is not on disk never reaches
-   the peer.
+   the peer. The gate covers `BROADCAST_TX` and `FORCE_CLOSE` too: a splice or
+   funding transaction whose justifying state missed disk must not reach the
+   network either.
+
+A batch commits exactly once, no matter how many `PERSIST_STATE` markers it
+carries. Channel methods mutate state while BUILDING the action array, so every
+marker in one batch describes identical state; the flows composed from helpers
+that each lead with their own persist (v2 open, splice signing) would otherwise
+re-commit the same outbound list per marker and duplicate its outbox rows.
+
+Outbox rows are retired transactionally, never eagerly. The supersede that a
+peer's `revoke_and_ack` proves is staged by `handleRevokeAndAck` and rides the
+SAME commit as the revoke's channel state (an `outbox_supersede` mutation): on
+rollback the rows survive alongside the pre-revoke state that still needs them.
+`splice:complete` retires the splice negotiation rows (`splice`/`splice_ack`),
+which nothing else ever acknowledges.
+
+A blocked transition does not stall silently. The withheld messages are gone
+from that connection (nothing re-queues them); the reestablish exchange after a
+reconnect is what retries the persist and replays them from durable state. So
+`transition:blocked` fires and the node forces the disconnect, rather than
+leaving a live connection deadlocked on the peer's own timeout.
 
 Causally linked caller-side state joins the transition through
 `withStagedMutations` (`lightning-node.ts:1449`): a preimage staged before
@@ -47,7 +68,11 @@ Failure has one more rule. When a channel transition rolls back, its chain
 monitor delta is re-armed but explicitly NOT flushed on its own
 (`monitorsAwaitingChannel`): committing it alone would put the revocation on
 disk while the channel state that caused it stayed behind, which is the exact
-disagreement 5.1 exists to prevent. It waits for a transition that commits.
+disagreement 5.1 exists to prevent. The hold is not a dead end: the next
+standalone monitor attempt (the next block, in practice) retries it as a
+COMBINED channel+monitor commit, so one transient storage error on a closing
+channel cannot park sweep and justice progress until a channel message that
+never comes.
 
 ## 2. The matrix
 

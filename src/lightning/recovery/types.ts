@@ -76,7 +76,16 @@ export type RecoveryMutation =
 	| { type: 'payment_state'; paymentHash: string; payment: IPaymentInfo }
 	| { type: 'payment_secret'; paymentHash: string; secret: Buffer }
 	| { type: 'delete_payment_secret'; paymentHash: string }
-	| { type: 'channel_closed'; channelId: string };
+	| { type: 'channel_closed'; channelId: string }
+	/**
+	 * Delete a channel's outbox rows (all of them, or only the given message
+	 * types) INSIDE the transition's transaction. This is how a peer-proven
+	 * supersede (its revoke_and_ack acknowledged the rows) rides the same
+	 * commit as the state that processed the proof: on rollback the rows
+	 * survive, so disk can never hold pre-revoke state whose retransmission
+	 * bytes are already gone.
+	 */
+	| { type: 'outbox_supersede'; channelId: string; messageTypes?: number[] };
 
 /**
  * The outbound message and row shapes live in the storage layer that owns the

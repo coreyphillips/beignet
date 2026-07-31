@@ -1593,6 +1593,13 @@ export class SqliteStorage implements IStorageBackend {
 		return results;
 	}
 
+	countOutboxMessages(channelId: string): number {
+		const row = this.db
+			.prepare('SELECT COUNT(*) as n FROM recovery_outbox WHERE channel_id = ?')
+			.get(channelId) as { n: number };
+		return row.n;
+	}
+
 	setOutboxDisposition(
 		id: number,
 		disposition: RecoveryOutboxDisposition

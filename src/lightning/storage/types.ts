@@ -257,6 +257,12 @@ export interface IStorageBackend {
 	saveOutboxMessage?(message: IRecoveryOutboxMessage): number;
 	/** Load retained rows, oldest first, optionally for one channel. */
 	loadOutboxMessages?(channelId?: string): IRecoveryOutboxStoredMessage[];
+	/**
+	 * Count a channel's retained rows. Kept separate from loadOutboxMessages
+	 * so the per-channel row cap can be enforced without decrypting every
+	 * retained wire message just to take the length of the result.
+	 */
+	countOutboxMessages?(channelId: string): number;
 	/** Advance one row's disposition (e.g. after the socket write). */
 	setOutboxDisposition?(
 		id: number,

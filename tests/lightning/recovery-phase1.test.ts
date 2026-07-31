@@ -13,6 +13,14 @@
  * 8. Outbox rows are written for a real commitment round and superseded on
  *    the peer's revoke_and_ack
  * 9. Exact retransmission bytes survive a restart (the taproot D2 case)
+ * 10. One commit per batch: repeated PERSIST_STATE markers do not re-commit
+ * 11. A failed persist withholds broadcasts, not just wire messages
+ * 12. The revoke supersede rides the persist transaction (rolls back with it)
+ * 13. A blocked transition is surfaced so the node can force a reconnect
+ * 14. A held-back monitor delta retries as a combined channel+monitor commit
+ * 15. Staged mutations survive a failed standalone flush
+ * 16. Restart restores the LAST start_batch group from stored rows
+ * 17. splice:complete retires the splice negotiation rows
  */
 
 import { expect } from 'chai';
@@ -22,9 +30,11 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import {
 	RecoveryManager,
-	RecoveryCriticality
+	RecoveryCriticality,
+	RecoveryMutation
 } from '../../src/lightning/recovery';
 import { Channel } from '../../src/lightning/channel/channel';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { Network } from '../../src/lightning/invoice/types';
@@ -39,7 +49,11 @@ import {
 	createOpenerState
 } from '../../src/lightning/channel/channel-state';
 import { MessageType } from '../../src/lightning/message/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType,
+	IChannelPersistRequest
+} from '../../src/lightning/channel/channel-actions';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
@@ -933,6 +947,519 @@ describe('Recovery phase 1: a failed transition strands nothing on disk', () => 
 
 		node.destroy();
 		bob.destroy();
+		storage.close();
+	});
+});
+
+// ─────────────── 10-11. Batch dispatch invariants ───────────────
+
+describe('Recovery phase 1: batch dispatch invariants', () => {
+	function stubChannel(channelId: Buffer): Channel {
+		return {
+			getChannelId: (): Buffer => channelId,
+			getTemporaryChannelId: (): Buffer | null => null,
+			getState: (): ChannelState => ChannelState.NORMAL
+		} as unknown as Channel;
+	}
+
+	function makeManager(): ChannelManager {
+		return new ChannelManager(
+			{} as unknown as ConstructorParameters<typeof ChannelManager>[0]
+		);
+	}
+
+	function dispatch(
+		manager: ChannelManager,
+		channel: Channel,
+		actions: ChannelAction[]
+	): void {
+		(
+			manager as unknown as {
+				processActions(
+					peerPubkey: string,
+					channel: Channel,
+					actions: ChannelAction[]
+				): void;
+			}
+		).processActions('aa'.repeat(33), channel, actions);
+	}
+
+	it('emits ONE persist per batch no matter how many markers it carries', () => {
+		// The v2 open and splice signing flows compose helpers that each lead
+		// with their own PERSIST_STATE. Channel methods mutate state while
+		// BUILDING the action array, so every marker would write identical
+		// state; re-emitting used to re-commit the same outbound list per
+		// marker and duplicate its outbox rows.
+		const manager = makeManager();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		const persists: IChannelPersistRequest[] = [];
+		manager.on(
+			'channel:persist',
+			(_id: Buffer, request?: IChannelPersistRequest) => {
+				if (request) persists.push(request);
+			}
+		);
+		const sent: number[] = [];
+		manager.on('message:outbound', (_pk: string, type: number) => {
+			sent.push(type);
+		});
+
+		dispatch(manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.COMMITMENT_SIGNED,
+				payload: Buffer.from([1])
+			},
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.UPDATE_ADD_HTLC,
+				payload: Buffer.from([2])
+			},
+			{ type: ChannelActionType.PERSIST_STATE }
+		]);
+
+		expect(persists).to.have.length(1);
+		// The one commit still covers EVERY send in the batch.
+		expect(persists[0].outbound.map((m) => m.messageType)).to.deep.equal([
+			MessageType.COMMITMENT_SIGNED,
+			MessageType.UPDATE_ADD_HTLC
+		]);
+		expect(sent).to.deep.equal([
+			MessageType.COMMITMENT_SIGNED,
+			MessageType.UPDATE_ADD_HTLC
+		]);
+	});
+
+	it('withholds broadcasts and force-close alongside the sends of a failed persist', () => {
+		// The persist-first comments at the splice/funding producers promise the
+		// network never sees a tx whose justifying state missed disk; the gate
+		// must therefore cover BROADCAST_TX and FORCE_CLOSE, not just wire
+		// messages.
+		const manager = makeManager();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		manager.on(
+			'channel:persist',
+			(_id: Buffer, request?: IChannelPersistRequest) => {
+				if (request) request.committed = false;
+			}
+		);
+		const leaked: string[] = [];
+		manager.on('message:outbound', () => leaked.push('send'));
+		manager.on('broadcast:tx', () => leaked.push('broadcast'));
+		manager.on('force:close', () => leaked.push('force-close'));
+		const blocked: string[] = [];
+		manager.on('transition:blocked', (peerPubkey: string) => {
+			blocked.push(peerPubkey);
+		});
+
+		dispatch(manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.COMMITMENT_SIGNED,
+				payload: Buffer.from([1])
+			},
+			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([2]) },
+			{
+				type: ChannelActionType.FORCE_CLOSE,
+				commitmentTx: Buffer.from([3]),
+				channelId: channel.getChannelId()!
+			}
+		]);
+
+		expect(leaked).to.deep.equal([]);
+		// The block is surfaced so the node can force the reconnect that
+		// retries the persist and replays the withheld messages.
+		expect(blocked).to.deep.equal(['aa'.repeat(33)]);
+	});
+
+	it('raises no blocked signal when the persist commits', () => {
+		const manager = makeManager();
+		const channel = stubChannel(crypto.randomBytes(32));
+		manager.on(
+			'channel:persist',
+			(_id: Buffer, request?: IChannelPersistRequest) => {
+				if (request) request.committed = true;
+			}
+		);
+		let blockedCount = 0;
+		manager.on('transition:blocked', () => {
+			blockedCount++;
+		});
+		dispatch(manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.SEND_MESSAGE,
+				messageType: MessageType.REVOKE_AND_ACK,
+				payload: Buffer.from([1])
+			}
+		]);
+		expect(blockedCount).to.equal(0);
+	});
+});
+
+// ─────────────── 12. Supersede rides the persist transaction ───────────────
+
+describe('Recovery phase 1: revoke supersede is transactional', () => {
+	it('keeps the outbox rows when the revoke transition fails to commit', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const alice = createNode(1, storage);
+		const bob = createNode(2);
+
+		// Bridge that breaks alice's storage for exactly the delivery of bob's
+		// first revoke_and_ack, then DROPS everything after it: the crashed-
+		// after-failed-persist shape. The rows the revoke would have retired
+		// must survive, because the state that processed the proof rolled back
+		// with the transaction.
+		let broke = false;
+		const originalTransaction = storage.transaction.bind(storage);
+		alice.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+			if (pk === bob.getNodeId() && !broke) {
+				bob.handlePeerMessage(alice.getNodeId(), t, p);
+			}
+		});
+		bob.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+			if (pk !== alice.getNodeId() || broke) return;
+			if (t === MessageType.REVOKE_AND_ACK) {
+				(storage as unknown as { transaction: unknown }).transaction =
+					(): never => {
+						throw new Error('disk on fire');
+					};
+				try {
+					alice.handlePeerMessage(bob.getNodeId(), t, p);
+				} finally {
+					(storage as unknown as { transaction: unknown }).transaction =
+						originalTransaction;
+					broke = true;
+				}
+				return;
+			}
+			alice.handlePeerMessage(bob.getNodeId(), t, p);
+		});
+
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 10_000n,
+			description: 'supersede-transactional'
+		});
+		try {
+			alice.sendPayment(invoice.bolt11);
+		} catch {
+			// The stalled payment is expected; the rows are what matters.
+		}
+
+		const left = storage
+			.loadOutboxMessages(channelId.toString('hex'))
+			.map((r) => r.messageType);
+		expect(
+			left,
+			'rows the failed transition would have retired must survive'
+		).to.include(MessageType.UPDATE_ADD_HTLC);
+		expect(left).to.include(MessageType.COMMITMENT_SIGNED);
+
+		alice.destroy();
+		bob.destroy();
+		storage.close();
+	});
+
+	it('deletes acknowledged rows on commit and never lets the count cache drift', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const channelId = 'cd'.repeat(32);
+		const manager = new RecoveryManager(storage);
+		const row = (messageType: number): void => {
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [],
+				outboundMessages: [
+					{
+						peerId: 'aa'.repeat(33),
+						channelId,
+						messageType,
+						wireMessage: crypto.randomBytes(60),
+						disposition: 'pending_send'
+					}
+				]
+			});
+		};
+		row(MessageType.COMMITMENT_SIGNED);
+		row(MessageType.UPDATE_ADD_HTLC);
+
+		// Success path: the supersede mutation deletes inside the commit.
+		const committed = manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'outbox_supersede',
+					channelId,
+					messageTypes: [MessageType.COMMITMENT_SIGNED]
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		expect(
+			storage.loadOutboxMessages(channelId).map((r) => r.messageType)
+		).to.deep.equal([MessageType.UPDATE_ADD_HTLC]);
+
+		// Rollback path, SAME manager instance: the supersede ran its deletes
+		// mid-transaction and reseeded the cached count from the post-delete
+		// table, so the rollback must also throw that cache away or the next
+		// insert under-counts against the row cap.
+		const originalSave = storage.saveChannel.bind(storage);
+		(storage as unknown as { saveChannel: unknown }).saveChannel =
+			(): never => {
+				throw new Error('disk on fire');
+			};
+		const rolledBack = manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'outbox_supersede',
+					channelId,
+					messageTypes: [MessageType.UPDATE_ADD_HTLC]
+				},
+				{
+					type: 'channel_state',
+					channelId,
+					state: makeChannelState(Buffer.from(channelId, 'hex')),
+					peerPubkey: 'aa'.repeat(33)
+				}
+			],
+			outboundMessages: []
+		});
+		(storage as unknown as { saveChannel: unknown }).saveChannel = originalSave;
+		expect(rolledBack.committed).to.equal(false);
+		expect(storage.loadOutboxMessages(channelId)).to.have.length(1);
+
+		row(MessageType.UPDATE_FULFILL_HTLC);
+		expect(storage.loadOutboxMessages(channelId)).to.have.length(2);
+		storage.close();
+	});
+});
+
+// ─────────────── 13-15. Failure recovery paths ───────────────
+
+describe('Recovery phase 1: failure recovery paths', () => {
+	it('a held-back monitor delta retries as a combined channel commit', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const alice = createNode(1, storage);
+		const bob = createNode(2);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const idHex = channelId.toString('hex');
+
+		// Simulate a transition that failed with its monitor delta on board.
+		const internals = alice as unknown as {
+			dirtyMonitors: Set<string>;
+			monitorsAwaitingChannel: Set<string>;
+			persistMonitorAlone(idHex: string): void;
+		};
+		internals.dirtyMonitors.add(idHex);
+		internals.monitorsAwaitingChannel.add(idHex);
+
+		let channelSaves = 0;
+		const originalSave = storage.saveChannel.bind(storage);
+		storage.saveChannel = (id, state, peer): void => {
+			channelSaves++;
+			originalSave(id, state, peer);
+		};
+
+		// The next standalone monitor attempt (a new block, in production) must
+		// retry the COMBINED commit instead of refusing forever.
+		internals.persistMonitorAlone(idHex);
+
+		expect(channelSaves, 'channel state rode the retry').to.be.greaterThan(0);
+		expect(internals.monitorsAwaitingChannel.has(idHex)).to.equal(false);
+		expect(internals.dirtyMonitors.has(idHex)).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+		storage.close();
+	});
+
+	it('staged mutations survive a failed standalone flush and commit on retry', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = createNode(1, storage);
+		const hashHex = 'ab'.repeat(32);
+
+		const internals = node as unknown as {
+			stagedMutations: RecoveryMutation[];
+			flushStagedMutations(): void;
+		};
+		internals.stagedMutations.push({
+			type: 'payment_preimage',
+			paymentHash: hashHex,
+			preimage: Buffer.alloc(32, 7)
+		});
+
+		const originalTransaction = storage.transaction.bind(storage);
+		(storage as unknown as { transaction: unknown }).transaction =
+			(): never => {
+				throw new Error('disk on fire');
+			};
+		internals.flushStagedMutations();
+		expect(
+			internals.stagedMutations,
+			'a failed flush re-arms instead of dropping'
+		).to.have.length(1);
+		expect(storage.loadPreimage(hashHex)).to.equal(null);
+
+		(storage as unknown as { transaction: unknown }).transaction =
+			originalTransaction;
+		internals.flushStagedMutations();
+		expect(internals.stagedMutations).to.have.length(0);
+		expect(storage.loadPreimage(hashHex)).to.not.equal(null);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('releases the monitor hold when the channel is gone from the manager', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = createNode(1, storage);
+		const idHex = 'ab'.repeat(32);
+		const internals = node as unknown as {
+			dirtyMonitors: Set<string>;
+			monitorsAwaitingChannel: Set<string>;
+			persistMonitorAlone(idHex: string): void;
+		};
+		internals.dirtyMonitors.add(idHex);
+		internals.monitorsAwaitingChannel.add(idHex);
+
+		internals.persistMonitorAlone(idHex);
+
+		// No channel left to pair with is not a reason to park the flag
+		// forever: the hold must release rather than survive to block every
+		// later monitor write for a reused id.
+		expect(internals.monitorsAwaitingChannel.has(idHex)).to.equal(false);
+
+		node.destroy();
+		storage.close();
+	});
+});
+
+// ─────────────── 16-17. Outbox lifecycle end to end ───────────────
+
+describe('Recovery phase 1: outbox lifecycle end to end', () => {
+	it('restores the LAST start_batch group from stored rows on restart', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const channelId = crypto.randomBytes(32);
+		const idHex = channelId.toString('hex');
+		storage.saveChannel(idHex, makeChannelState(channelId), 'aa'.repeat(33));
+
+		const staleBatch = crypto.randomBytes(40);
+		const liveBatch = crypto.randomBytes(40);
+		const liveCommitments = [crypto.randomBytes(90), crypto.randomBytes(90)];
+		const rows: Array<{ messageType: number; wireMessage: Buffer }> = [
+			{ messageType: MessageType.START_BATCH, wireMessage: staleBatch },
+			{
+				messageType: MessageType.COMMITMENT_SIGNED,
+				wireMessage: crypto.randomBytes(90)
+			},
+			{ messageType: MessageType.START_BATCH, wireMessage: liveBatch },
+			{
+				messageType: MessageType.COMMITMENT_SIGNED,
+				wireMessage: liveCommitments[0]
+			},
+			{
+				messageType: MessageType.COMMITMENT_SIGNED,
+				wireMessage: liveCommitments[1]
+			}
+		];
+		for (const row of rows) {
+			storage.saveOutboxMessage({
+				peerId: 'aa'.repeat(33),
+				channelId: idHex,
+				messageType: row.messageType,
+				wireMessage: row.wireMessage,
+				disposition: 'sent_unacked'
+			});
+		}
+
+		// A restart: the node restores channels from storage in its constructor.
+		const node = createNode(1, storage);
+		const channel = node.getChannelManager().getChannel(channelId);
+		expect(channel).to.not.equal(undefined);
+		const restored = (
+			channel as unknown as {
+				_lastSentBatch: { startBatch: Buffer; commitments: Buffer[] } | null;
+			}
+		)._lastSentBatch;
+		expect(restored, 'the un-acked batch came back').to.not.equal(null);
+		expect(restored!.startBatch.equals(liveBatch)).to.equal(true);
+		expect(restored!.commitments).to.have.length(2);
+		expect(restored!.commitments[0].equals(liveCommitments[0])).to.equal(true);
+		expect(restored!.commitments[1].equals(liveCommitments[1])).to.equal(true);
+
+		node.destroy();
+		storage.close();
+	});
+
+	it('splice:complete retires the splice negotiation rows', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const alice = createNode(1, storage);
+		const bob = createNode(2);
+		connectNodes(alice, bob);
+		const channelId = openReadyChannel(alice, bob);
+		const idHex = channelId.toString('hex');
+
+		for (const messageType of [
+			MessageType.SPLICE,
+			MessageType.SPLICE_ACK,
+			MessageType.SPLICE_LOCKED
+		]) {
+			storage.saveOutboxMessage({
+				peerId: bob.getNodeId(),
+				channelId: idHex,
+				messageType,
+				wireMessage: Buffer.from([messageType & 0xff]),
+				disposition: 'sent_unacked'
+			});
+		}
+
+		// Nothing else ever retires splice/splice_ack: no revoke acknowledges
+		// them, and they never supersede their own kind (one splice at a time).
+		alice.getChannelManager().emit('splice:complete', channelId);
+
+		const left = storage.loadOutboxMessages(idHex).map((r) => r.messageType);
+		expect(left).to.not.include(MessageType.SPLICE);
+		expect(left).to.not.include(MessageType.SPLICE_ACK);
+		// splice_locked stays: BOLT 2 can still ask for it after a reconnect.
+		expect(left).to.include(MessageType.SPLICE_LOCKED);
+
+		alice.destroy();
+		bob.destroy();
+		storage.close();
+	});
+
+	it('counts rows without loading them', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const idHex = 'cd'.repeat(32);
+		for (let i = 0; i < 5; i++) {
+			storage.saveOutboxMessage({
+				peerId: 'aa'.repeat(33),
+				channelId: idHex,
+				messageType: MessageType.UPDATE_ADD_HTLC,
+				wireMessage: Buffer.from([i]),
+				disposition: 'pending_send'
+			});
+		}
+		expect(storage.countOutboxMessages(idHex)).to.equal(5);
+		expect(storage.countOutboxMessages('ef'.repeat(32))).to.equal(0);
 		storage.close();
 	});
 });

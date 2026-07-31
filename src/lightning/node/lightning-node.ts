@@ -957,8 +957,11 @@ export class LightningNode extends EventEmitter {
 		} of this.storage.loadAllChannels()) {
 			const channel = new Channel(state);
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
-			this.restoreOutboxRetransmission(channelId, channel);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
+			// AFTER restoreChannel: markForReestablish resets the splice driver
+			// for non-splicing channels, and that reset clears _lastSentBatch,
+			// so bytes restored before it would be silently wiped.
+			this.restoreOutboxRetransmission(channelId, channel);
 		}
 
 		// Restore payments
@@ -1365,6 +1368,16 @@ export class LightningNode extends EventEmitter {
 		}
 		const monitorMutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (monitorMutation) mutations.push(monitorMutation);
+		// A peer-proven outbox supersede (its revoke_and_ack acknowledged the
+		// rows) deletes IN this same transaction: on rollback the rows survive
+		// alongside the pre-revoke state that still needs them.
+		if (request?.supersede) {
+			mutations.push({
+				type: 'outbox_supersede',
+				channelId: channelIdHex,
+				messageTypes: request.supersede.messageTypes
+			});
+		}
 		// Whatever the caller staged for this transition (preimage before a
 		// fulfill, linkage before a forward) commits with it or not at all.
 		const staged = this.takeStagedMutations();
@@ -1383,14 +1396,18 @@ export class LightningNode extends EventEmitter {
 		}
 		if (!result.committed) {
 			// Everything rolled back together: re-arm the monitor delta and put
-			// the staged mutations back so the next transition retries them,
-			// rather than dropping writes the caller believes it made.
+			// the staged mutations back rather than dropping writes the caller
+			// believes it made. Staged mutations are retried immediately by the
+			// enclosing withStagedMutations flush (standalone durability now if
+			// storage recovered) and stay staged for the next transition if
+			// that fails too.
 			//
-			// Re-armed, NOT flushed on its own: writing the monitor delta by
-			// itself now would put the revocation on disk while the channel
+			// The monitor delta is re-armed, NOT flushed on its own: writing it
+			// by itself now would put the revocation on disk while the channel
 			// state that produced it stayed behind, which is precisely the
 			// channel/monitor disagreement this whole path exists to prevent.
-			// It waits for a channel transition that commits.
+			// It retries as a COMBINED channel+monitor commit on the next
+			// monitor update (see persistMonitorAlone) or channel transition.
 			if (monitorMutation) {
 				this.dirtyMonitors.add(channelIdHex);
 				this.monitorsAwaitingChannel.add(channelIdHex);
@@ -1492,11 +1509,19 @@ export class LightningNode extends EventEmitter {
 	private flushStagedMutations(): void {
 		const mutations = this.takeStagedMutations();
 		if (mutations.length === 0 || !this.recovery) return;
-		this.recovery.commit({
+		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
 			mutations,
 			outboundMessages: []
 		});
+		if (!result.committed) {
+			// Keep them staged so the next transition (or the next flush)
+			// retries, rather than silently dropping writes the caller believes
+			// it made. The failure itself is surfaced by the manager's onError
+			// hook; what must not happen is a preimage for value already paid
+			// downstream evaporating because one standalone commit failed.
+			this.stagedMutations.unshift(...mutations);
+		}
 	}
 
 	/**
@@ -1527,9 +1552,27 @@ export class LightningNode extends EventEmitter {
 	 */
 	private persistMonitorAlone(channelIdHex: string): void {
 		if (!this.recovery) return;
-		// Held back for a channel transition to carry: see persistChannel's
-		// failure branch.
-		if (this.monitorsAwaitingChannel.has(channelIdHex)) return;
+		// Held back by a failed channel transition: retry as a COMBINED
+		// channel+monitor commit instead of refusing outright. On a closing
+		// channel this monitor update (the next block) may be the only event
+		// that ever fires again, so refusing here would park every sweep and
+		// justice delta in memory until a channel message that never comes;
+		// the combined commit keeps the no-monitor-ahead-of-channel invariant
+		// AND gives the failed persist its retry.
+		if (this.monitorsAwaitingChannel.has(channelIdHex)) {
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			if (
+				this.channelManager.getChannel(channelId) &&
+				this.channelManager.getPeerForChannel(channelId)
+			) {
+				this.persistChannel(channelId);
+				return;
+			}
+			// The channel is gone from the manager, so there is no channel
+			// state left to pair with; release the hold and let the monitor
+			// commit on its own below.
+			this.monitorsAwaitingChannel.delete(channelIdHex);
+		}
 		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (!mutation) return;
 		this.recovery.commit({
@@ -1741,6 +1784,11 @@ export class LightningNode extends EventEmitter {
 			// commitment material sitting encrypted in the database with no
 			// consumer, kept for the lifetime of the node.
 			this.recovery?.clearChannelOutbox(channelId.toString('hex'));
+			// A terminal channel also retires its monitor bookkeeping: a
+			// lingering awaiting-channel hold would otherwise block standalone
+			// monitor commits for this id forever.
+			this.dirtyMonitors.delete(channelId.toString('hex'));
+			this.monitorsAwaitingChannel.delete(channelId.toString('hex'));
 			// Every output of the close is irrevocably resolved — a commitment
 			// swap is no longer possible, so the funding watch can be retired
 			// (memory cleanup for long-lived nodes).
@@ -1762,6 +1810,14 @@ export class LightningNode extends EventEmitter {
 		// announcement_signatures first.
 		this.channelManager.on('splice:complete', (channelId: Buffer) => {
 			this.persistChannel(channelId);
+			// The splice negotiation is over: its splice/splice_ack rows can
+			// never be retransmitted again (reestablish resumes a splice from
+			// channel state, never from these bytes), and nothing else retires
+			// them, so a long-lived channel would accrue one pair per splice.
+			this.recovery?.supersedeChannelOutbox(channelId.toString('hex'), [
+				MessageType.SPLICE,
+				MessageType.SPLICE_ACK
+			]);
 			this.emitStructuredLog('channel', 'splice_complete', {
 				channelId: channelId.toString('hex')
 			});
@@ -1826,8 +1882,15 @@ export class LightningNode extends EventEmitter {
 			this.openTransitions.pop();
 			// The batch produced a monitor change but no PERSIST_STATE to carry
 			// it. Flush it now, still inside the same synchronous turn, so
-			// nothing is deferred past the actions that caused it.
-			if (channelIdHex && this.dirtyMonitors.has(channelIdHex)) {
+			// nothing is deferred past the actions that caused it. NOT while an
+			// ENCLOSING transition for the same channel is still open (nested
+			// batches re-enter): its persist has not run yet, and flushing here
+			// would commit the monitor ahead of the channel state it belongs to.
+			if (
+				channelIdHex &&
+				this.dirtyMonitors.has(channelIdHex) &&
+				!this.openTransitions.includes(channelIdHex)
+			) {
 				this.persistMonitorAlone(channelIdHex);
 			}
 		});
@@ -1837,11 +1900,30 @@ export class LightningNode extends EventEmitter {
 			this.recovery?.markSent(ids);
 		});
 
-		// The peer proved it holds these; they can never be retransmitted again.
+		// A failed persist withheld a batch's sends. Nothing re-queues them on
+		// this connection; the reestablish exchange after a reconnect is what
+		// retries the persist and replays them from durable state. Force that
+		// reconnect rather than deadlocking a live connection on the PEER's
+		// commitment timeout: the peer may wait indefinitely for a revoke or
+		// commitment we withheld, riding every in-flight HTLC to its CLTV.
 		this.channelManager.on(
-			'outbox:superseded',
-			(channelIdHex: string, messageTypes: number[]) => {
-				this.recovery?.supersedeChannelOutbox(channelIdHex, messageTypes);
+			'transition:blocked',
+			(peerPubkey: string, channelId: Buffer | null) => {
+				this.emitStructuredLog('channel', 'transition_blocked', {
+					peerPubkey,
+					channelId: channelId?.toString('hex')
+				});
+				if (!this.peerManager) return;
+				// Deferred: the blocked batch may still be unwinding through
+				// nested dispatches; tearing the peer down mid-turn would pull
+				// state out from under them.
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
 			}
 		);
 
@@ -1958,9 +2040,12 @@ export class LightningNode extends EventEmitter {
 			'monitor:updated',
 			(channelIdHex: string, _monitor: ChainMonitor) => {
 				this.dirtyMonitors.add(channelIdHex);
-				const openTransition =
-					this.openTransitions[this.openTransitions.length - 1];
-				if (openTransition === channelIdHex) return;
+				// ANY open transition for this channel claims the delta, not just
+				// the innermost: a nested batch for another channel can sit on
+				// top of the stack while this channel's own transition is still
+				// open below it, and committing the monitor standalone then
+				// would put it ahead of the channel state it belongs to.
+				if (this.openTransitions.includes(channelIdHex)) return;
 				this.persistMonitorAlone(channelIdHex);
 			}
 		);

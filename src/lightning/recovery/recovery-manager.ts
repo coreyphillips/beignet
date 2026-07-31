@@ -102,11 +102,29 @@ export class RecoveryManager {
 			});
 			// The transaction rolled back, so any counter we bumped for rows that
 			// no longer exist has to come back down; drop the cached counts for
-			// the touched channels and let them re-seed from storage.
+			// the touched channels and let them re-seed from storage. An
+			// outbox_supersede also touched the cache mid-transaction (its
+			// deletes re-seeded the count), so its channel drops too.
 			for (const message of outboundMessages) {
 				if (message.channelId) this.outboxCounts.delete(message.channelId);
 			}
+			for (const mutation of mutations) {
+				if (
+					mutation.type === 'outbox_supersede' ||
+					mutation.type === 'channel_closed'
+				) {
+					this.outboxCounts.delete(mutation.channelId);
+				}
+			}
 			return { committed: false, released: [], error: error as Error };
+		}
+
+		// channel_closed deleted the channel's outbox rows with it (the storage
+		// layer cascades); a stale cached count would survive the row deletion.
+		for (const mutation of mutations) {
+			if (mutation.type === 'channel_closed') {
+				this.outboxCounts.delete(mutation.channelId);
+			}
 		}
 
 		return {
@@ -209,7 +227,13 @@ export class RecoveryManager {
 	private countFor(channelId: string): number {
 		const cached = this.outboxCounts.get(channelId);
 		if (cached !== undefined) return cached;
-		const seeded = this.storage.loadOutboxMessages
+		// Prefer the dedicated count: the cache goes cold on every same-kind
+		// supersede (once per commitment round on a busy channel), and seeding
+		// through loadOutboxMessages would decrypt every retained row just to
+		// take .length of the result.
+		const seeded = this.storage.countOutboxMessages
+			? this.storage.countOutboxMessages(channelId)
+			: this.storage.loadOutboxMessages
 			? this.storage.loadOutboxMessages(channelId).length
 			: 0;
 		this.outboxCounts.set(channelId, seeded);
@@ -273,6 +297,19 @@ export class RecoveryManager {
 				break;
 			case 'channel_closed':
 				this.storage.deleteChannel(mutation.channelId);
+				break;
+			case 'outbox_supersede':
+				// Runs INSIDE the caller's transaction: the peer-proven row
+				// deletions commit with the state that processed the proof, or
+				// roll back with it. The cache drops so any insert later in
+				// this same transaction re-seeds against the post-delete table.
+				if (this.storage.deleteOutboxMessages) {
+					this.storage.deleteOutboxMessages(
+						mutation.channelId,
+						mutation.messageTypes
+					);
+					this.outboxCounts.delete(mutation.channelId);
+				}
 				break;
 		}
 	}

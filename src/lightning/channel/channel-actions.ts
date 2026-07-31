@@ -210,6 +210,14 @@ export interface IChannelPersistRequest {
 	committed: boolean;
 	/** Row ids written for `outbound`, same order; empty without an outbox. */
 	outboxIds: Array<number | null>;
+	/**
+	 * Outbox rows of these message types are proven held by the peer (its
+	 * revoke_and_ack acknowledged them) and must be deleted IN the same
+	 * transaction as this batch's state. In-transaction rather than eager so a
+	 * failed persist (or a crash before it) cannot leave disk holding
+	 * pre-revoke state whose retransmission bytes are already gone.
+	 */
+	supersede?: { messageTypes: number[] };
 }
 
 export type ChannelAction =
