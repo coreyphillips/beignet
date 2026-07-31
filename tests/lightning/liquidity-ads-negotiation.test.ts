@@ -188,6 +188,40 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 		expect(buyerId).to.be.a('string');
 	});
 
+	it('treats a request_funds of 0 sats as no lease', function () {
+		const { buyer, seller, sellerId } = setup(true);
+
+		let lease: any = null;
+		buyer.on('channel:lease', (l: any) => {
+			lease = l;
+		});
+
+		const buyerChannel = buyer.createDualFundedChannel(
+			sellerId,
+			makeParams({
+				fundingSatoshis: 200_000n,
+				channelType: ANCHOR_CHANNEL_TYPE,
+				requestFunds: { requestedSats: 0n, blockheight: 800000 },
+				maxLeaseRates: RATES
+			})
+		);
+
+		// The seller must not sign a will_fund for nothing: no lease event,
+		// no lease fee, and the negotiated capacity is the buyer's
+		// contribution alone.
+		expect(lease, 'no channel:lease for a 0-sat request').to.be.null;
+		const bState = buyerChannel.getFullState();
+		expect(bState.fundingSatoshis).to.equal(200_000n);
+		expect(bState.leaseFeeSats ?? 0n).to.equal(0n);
+
+		const tempId = buyerChannel.getTemporaryChannelId().toString('hex');
+		const sellerChannel = (seller as any).tempChannels.get(tempId);
+		expect(sellerChannel, 'seller accepted the plain open').to.exist;
+		const sState = sellerChannel.getFullState();
+		expect(sState.fundingSatoshis).to.equal(200_000n);
+		expect(sState.isLessor ?? false).to.equal(false);
+	});
+
 	it('no will_fund when the seller does not sell liquidity', function () {
 		const { buyer, sellerId } = setup(false);
 

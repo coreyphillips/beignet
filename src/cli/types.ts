@@ -100,6 +100,12 @@ export interface ChannelInfo {
 	 * through the splice (counted in the canonical balance), false = parked.
 	 */
 	payThroughSplice?: boolean;
+	/**
+	 * Whether the connected peer negotiated option_splice + option_quiesce.
+	 * Absent when the peer is disconnected or its init has not arrived, so
+	 * absence means "unknown", never "unsupported".
+	 */
+	peerSupportsSplicing?: boolean;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;
@@ -238,6 +244,35 @@ export type TOnchainQuote = {
 	maxSendSats?: number;
 	/** The highest rate this transaction can pay without the fee taking half the balance. */
 	maxSatsPerVbyte: number;
+};
+
+/**
+ * A peer-aware max channel-funding quote: the daemon decides v1 vs v2 the
+ * same way openChannel does, so the previewed amount is the amount the
+ * channel actually commits.
+ */
+export type TChannelFundingQuote = {
+	/** Which funding flow openChannel would use toward this peer. */
+	method: 'v1' | 'v2';
+	/** False when the peer sent no init (not connected): the v2 judgment
+	 *  cannot be made and the quote falls back to the v1 sweep. */
+	peerKnown: boolean;
+	/** The rate the quote was made at. */
+	satsPerVbyte: number;
+	/** The exact amount a max open commits as funding_satoshis. */
+	fundingSatoshis: number;
+	/** The funding fee at this rate. */
+	feeSats: number;
+	/** v2 only: the pinned interactive-tx rate in sat/kw. */
+	feeratePerKw?: number;
+	/** v2 only: the wallet balance the quote drew on. */
+	spendableSats?: number;
+	/** Inputs the funding would spend. */
+	inputCount?: number;
+	/** v1 only: sweep tx virtual size. */
+	vsize?: number;
+	/** v1 only: the highest rate the sweep could pay. */
+	maxSatsPerVbyte?: number;
 };
 
 export interface OnchainTxInfo {
@@ -471,6 +506,10 @@ export interface BeignetConfig {
 	/** Relay per-HTLC events (htlc:forwarded/fulfilled/failed) over SSE and
 	 *  webhooks. Off by default: routing nodes generate one event per HTLC. */
 	htlcEvents?: boolean;
+	/** Serve GET /metrics without authentication (default false). */
+	metricsPublic?: boolean;
+	/** Allow non-loopback bind / wildcard CORS without auth (default false). */
+	insecure?: boolean;
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
@@ -842,6 +881,20 @@ export interface BeignetNodeEvents {
 		bolt11: string;
 		amountSats: number;
 	}) => void;
+	/**
+	 * On-chain lifecycle, one appearance and at most one confirmation per
+	 * transaction. `transaction:received` fires when an incoming transaction
+	 * first appears, `transaction:sent` when an outgoing one does; either may
+	 * already carry a height when the transaction was found at a catch-up
+	 * sync after downtime, and no separate confirmation fires for that case.
+	 * `transaction:confirmed` fires only for the transition, a transaction
+	 * the wallet already held moving from the mempool into a block, in
+	 * either direction with `info.type` saying which. Initial-sync history
+	 * does not replay as events.
+	 */
+	'transaction:received': (info: OnchainTxInfo) => void;
+	'transaction:sent': (info: OnchainTxInfo) => void;
+	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {
@@ -853,8 +906,7 @@ export interface BeignetNodeEvents {
 		initiator: 'local' | 'remote';
 	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
-	/** The channel's funding tx vanished from mempool and chain before
-	 *  confirming — the channel was dropped; its coins remain onchain. */
+	/** An unconfirmed channel's funding tx vanished from mempool and chain; the channel was dropped (nothing to close). */
 	'channel:voided': (data: { channelId: string }) => void;
 	'htlc:forwarded': (data: {
 		inChannelId: string;

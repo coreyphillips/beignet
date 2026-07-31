@@ -73,6 +73,50 @@ export interface IPenaltyTxParams {
  *
  * @returns The penalty transaction (unsigned — signatures added separately)
  */
+/**
+ * Fee a penalty transaction over these inputs would pay, in satoshis.
+ *
+ * Estimated per BOLT 3. Each penalty input spends a P2WSH output whose witness
+ * is [signature, <branch selector>, witnessScript]: the selector is a 1-byte
+ * OP_TRUE for to_local or a 33-byte revocation pubkey for HTLC outputs (use 33
+ * as a safe upper bound). The flat 160-vbyte/input figure previously used
+ * roughly doubled the true cost (~81 vb to_local / ~102 vb HTLC) and over-paid
+ * materially when sweeping many outputs.
+ *
+ * Exported so a caller can decide whether a batch is worth building BEFORE
+ * calling buildPenaltyTx, which throws on an unaffordable one.
+ *
+ * destinationScript sizes the single output. Omitting it assumes P2WPKH, which
+ * under-prices a larger destination: a P2TR output is 43 vbytes against
+ * P2WPKH's 31, so the transaction would pay below the requested feerate.
+ */
+export function estimatePenaltyTxFee(
+	outputIndices: number[],
+	witnessScripts: Map<number, Buffer>,
+	feeRatePerVbyte: number,
+	destinationScript?: Buffer
+): number {
+	let weightWu =
+		4 * 4 /* nVersion */ +
+		4 * 4 /* nLockTime */ +
+		2 /* segwit marker + flag */ +
+		1 * 4 /* input count (varint, assume < 253) */ +
+		1 * 4; /* output count */
+	for (const idx of outputIndices) {
+		const scriptLen = witnessScripts.get(idx)?.length ?? 83;
+		const scriptPrefix = scriptLen < 253 ? 1 : 3;
+		weightWu += 41 * 4; // outpoint (36) + empty scriptSig len (1) + sequence (4)
+		// witness: item count (1) + sig (1 + 73) + selector (1 + 33) + script (prefix + len)
+		weightWu += 1 + (1 + 73) + (1 + 33) + (scriptPrefix + scriptLen);
+	}
+	// value (8) + script len varint (1) + script. 22 is P2WPKH, the default.
+	weightWu += (8 + 1 + (destinationScript?.length ?? 22)) * 4;
+	// Round AFTER applying the rate. Rounding the vbytes first leaves a
+	// fractional fee for a fractional feerate, which a caller converting to
+	// bigint cannot represent.
+	return Math.ceil((weightWu / 4) * feeRatePerVbyte);
+}
+
 export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 	const {
 		revokedTx,
@@ -100,38 +144,25 @@ export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 		totalValue += revokedTx.outs[idx].value;
 	}
 
-	// Estimate weight per BOLT 3. Each penalty input spends a P2WSH output whose
-	// witness is [signature, <branch selector>, witnessScript]: the selector is a
-	// 1-byte OP_TRUE for to_local or a 33-byte revocation pubkey for HTLC outputs
-	// (use 33 as a safe upper bound). The flat 160-vbyte/input figure previously
-	// used roughly doubled the true cost (~81 vb to_local / ~102 vb HTLC) and
-	// over-paid materially when sweeping many outputs.
-	let weightWu =
-		4 * 4 /* nVersion */ +
-		4 * 4 /* nLockTime */ +
-		2 /* segwit marker + flag */ +
-		1 * 4 /* input count (varint, assume < 253) */ +
-		1 * 4; /* output count */
-	for (const idx of outputIndices) {
-		const scriptLen = witnessScripts.get(idx)?.length ?? 83;
-		const scriptPrefix = scriptLen < 253 ? 1 : 3;
-		weightWu += 41 * 4; // outpoint (36) + empty scriptSig len (1) + sequence (4)
-		// witness: item count (1) + sig (1 + 73) + selector (1 + 33) + script (prefix + len)
-		weightWu += 1 + (1 + 73) + (1 + 33) + (scriptPrefix + scriptLen);
-	}
-	weightWu += 31 * 4; // single P2WPKH-sized output (value 8 + len 1 + script 22)
-	const estimatedVbytes = Math.ceil(weightWu / 4);
-	const fee = estimatedVbytes * feeRatePerVbyte;
+	// Resolve the destination before estimating so the fee sizes the real output
+	// rather than assuming P2WPKH.
+	const destOutput = bitcoin.address.toOutputScript(
+		destinationAddress,
+		network
+	);
+
+	const fee = estimatePenaltyTxFee(
+		outputIndices,
+		witnessScripts,
+		feeRatePerVbyte,
+		destOutput
+	);
 
 	const outputValue = totalValue - fee;
 	if (outputValue <= 0) {
 		throw new Error('Fee exceeds available value');
 	}
 
-	const destOutput = bitcoin.address.toOutputScript(
-		destinationAddress,
-		network
-	);
 	tx.addOutput(destOutput, outputValue);
 
 	return tx;

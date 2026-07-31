@@ -199,6 +199,7 @@ describe('Audit HIGH-2: restored watch stays reorg-eviction aware', function () 
 		let unspentCalls = 0;
 		const channelManager = {
 			on: (): void => {},
+			off: (): void => {},
 			handleOutputSpent: (): void => {},
 			handleOutputUnspent: (): void => {
 				unspentCalls++;

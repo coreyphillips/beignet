@@ -20,6 +20,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IStorageBackend } from '../../src/lightning/storage/types';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { PaymentStatus } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
@@ -37,6 +38,17 @@ import {
 	encodeShortChannelId
 } from '../../src/lightning/gossip/types';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import { encode as encodeInvoice } from '../../src/lightning/invoice/encode';
+import {
+	encodeOfferTlv,
+	encodeInvoiceRequestTlv,
+	getTlvRecords,
+	computeMerkleRootFromRecords,
+	computeSignatureHash,
+	schnorrSign,
+	IInvoiceRequest,
+	IBolt12Invoice
+} from '../../src/lightning/offer';
 
 // ─────────────── Mock Storage ───────────────
 
@@ -104,6 +116,10 @@ class MockStorage implements IStorageBackend {
 		}
 		return result;
 	}
+	deletePreimage(paymentHash: string): void {
+		this.preimages.delete(paymentHash);
+	}
+	deleteInvoicePathId(): void {}
 
 	saveScidMapping(scidHex: string, channelId: Buffer): void {
 		this.scidMappings.set(scidHex, channelId);
@@ -1143,6 +1159,656 @@ describe('Crash-Safe State Persistence', function () {
 
 			bob2.destroy();
 			alice.destroy();
+		});
+	});
+
+	describe('Atomic paired persistence (real SQLite rollback)', function () {
+		it('persistChannel writes channel state and key index in one transaction', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(1, storage);
+			const bob = createTestNodeWithId(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			const channelIdHex = channelId.toString('hex');
+
+			// The channel needs a key index so the paired write actually runs.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const channel = (alice as any).channelManager.getChannel(channelId);
+			channel.channelKeyIndex = 7;
+
+			// Start from no persisted row, then fail the SECOND write of the
+			// pair. Without a transaction the channel row lands alone, which
+			// is a channel that signs its force-close with the wrong key
+			// after restore, and nothing at restore time flags it.
+			storage.deleteChannel(channelIdHex);
+			const originalSave = storage.saveChannelKeyIndex.bind(storage);
+			storage.saveChannelKeyIndex = (): void => {
+				throw new Error('disk full');
+			};
+			const errors: Array<{ code: string }> = [];
+			alice.on('node:error', (e: { code: string }) => errors.push(e));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+
+			expect(storage.loadChannel(channelIdHex), 'rolled back').to.be.null;
+			expect(errors.some((e) => e.code === 'PERSISTENCE_ERROR')).to.be.true;
+
+			// With the fault removed the pair lands together.
+			storage.saveChannelKeyIndex = originalSave;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).persistChannel(channelId);
+			expect(storage.loadChannel(channelIdHex)).to.not.be.null;
+			expect(storage.loadChannelKeyIndex(channelIdHex)).to.equal(7);
+
+			alice.destroy();
+			bob.destroy();
+		});
+
+		it('createInvoice persists preimage, secret and invoice atomically', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(3, storage);
+
+			// Fail the LAST write of the trio: without a transaction the
+			// preimage and secret land without their invoice row.
+			storage.saveInvoice = (): void => {
+				throw new Error('disk full');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'atomic invoice'
+			});
+
+			const hashHex = invoice.paymentHash.toString('hex');
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+
+			alice.destroy();
+		});
+
+		/** All four invoice records must be absent for the given hash. */
+		function expectNoInvoiceRecords(
+			storage: SqliteStorage,
+			hashHex: string
+		): void {
+			expect(storage.loadPreimage(hashHex), 'preimage rolled back').to.be.null;
+			expect(
+				storage
+					.loadAllPaymentSecrets()
+					.some((s) => s.paymentHashHex === hashHex),
+				'secret rolled back'
+			).to.be.false;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex),
+				'invoice rolled back'
+			).to.be.false;
+			expect(storage.loadPayment(hashHex), 'payment rolled back').to.be.null;
+		}
+
+		it('createInvoice rolls back all four records when savePayment fails', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(4, storage);
+
+			// persistPayment swallows storage errors, so a transaction wrapping
+			// it could commit preimage/secret/invoice with NO payment row; the
+			// throwing variant must abort the whole set instead.
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			const invoice = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity'
+			});
+			expectNoInvoiceRecords(storage, invoice.paymentHash.toString('hex'));
+
+			// With the fault removed all four records land together.
+			storage.savePayment = originalSavePayment;
+			const ok = alice.createInvoice({
+				amountMsat: 10_000n,
+				description: 'payment-row atomicity ok'
+			});
+			const okHex = ok.paymentHash.toString('hex');
+			expect(storage.loadPreimage(okHex)).to.not.be.null;
+			expect(storage.loadPayment(okHex)).to.not.be.null;
+
+			alice.destroy();
+		});
+
+		it('BOLT 12 invoice:issued rolls back all records when savePayment fails, path_id included', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const alice = createTestNodeWithId(5, storage);
+
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			const hashHex = paymentHash.toString('hex');
+			const pathId = crypto.randomBytes(32);
+			const bolt12Invoice = {
+				paymentHash,
+				amount: 5_000n,
+				description: 'b12 atomicity',
+				createdAt: BigInt(Math.floor(Date.now() / 1000))
+			};
+
+			const originalSavePayment = storage.savePayment.bind(storage);
+			storage.savePayment = (): void => {
+				throw new Error('injected savePayment failure');
+			};
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage,
+				pathId
+			);
+			expectNoInvoiceRecords(storage, hashHex);
+			// The authentication path_id must roll back WITH the preimage: a
+			// claimable payment persisted without its path_id would come back
+			// from a restart unpayable (fail closed), and one persisted with a
+			// path_id but no preimage could never settle.
+			expect(
+				storage
+					.loadAllInvoicePathIds()
+					.some((r) => r.paymentHashHex === hashHex),
+				'path_id rolled back'
+			).to.be.false;
+
+			// The path itself works once the fault is removed: both invoice
+			// persistence paths go through the same shared helper.
+			storage.savePayment = originalSavePayment;
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(alice as any).offerManager.emit(
+				'invoice:issued',
+				bolt12Invoice,
+				preimage,
+				pathId
+			);
+			expect(storage.loadPreimage(hashHex)).to.not.be.null;
+			expect(storage.loadPayment(hashHex)).to.not.be.null;
+			expect(
+				storage.loadAllInvoices().some((i) => i.paymentHashHex === hashHex)
+			).to.be.true;
+			expect(
+				storage
+					.loadAllInvoicePathIds()
+					.some((r) => r.paymentHashHex === hashHex && r.pathId.equals(pathId)),
+				'path_id landed with the preimage'
+			).to.be.true;
+
+			alice.destroy();
+		});
+	});
+
+	// Issue a BOLT 12 invoice on `issuer` for a pathless offer, exactly as
+	// the onion-message handler would (signed invoice_request).
+	function issueBolt12Invoice(
+		issuer: LightningNode,
+		payerPriv: Buffer,
+		amountMsat: bigint
+	): IBolt12Invoice | null {
+		const offerMgr = issuer.getOfferManager();
+		const { offer } = offerMgr.createOffer({
+			description: 'issued invoice',
+			amount: amountMsat
+		});
+		const request: IInvoiceRequest = {
+			payerKey: getPublicKey(payerPriv),
+			offerId: offer.offerId,
+			amount: amountMsat,
+			metadata: crypto.randomBytes(16)
+		};
+		const offerTlv = encodeOfferTlv(offer);
+		const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+		request.signature = schnorrSign(
+			computeSignatureHash(
+				'lightninginvoice_requestsignature',
+				computeMerkleRootFromRecords(getTlvRecords(unsigned))
+			),
+			payerPriv
+		);
+		return offerMgr.handleInvoiceRequest(
+			encodeInvoiceRequestTlv(request, offerTlv)
+		);
+	}
+
+	describe('BOLT 12 receive authentication across restart', function () {
+		// Stand in for a completed reconnect on a restored channel: put it back
+		// in NORMAL and fire the channel:ready the reestablish would produce.
+		function reconnect(node: LightningNode, channelId: Buffer): void {
+			const channel = node.getChannelManager().getChannel(channelId);
+			expect(channel, 'expected the channel to have been restored').to.exist;
+			channel!.getFullState().state = ChannelState.NORMAL;
+			node.getChannelManager().emit('channel:ready', channelId);
+		}
+
+		it('restores the expected path_id and settles a post-restart payment over the invoice path', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+				expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+				const hashHex = b12.paymentHash.toString('hex');
+				const pathIdBefore = bob
+					.getOfferManager()
+					.getInvoicePathId(b12.paymentHash);
+				expect(pathIdBefore, 'path_id registered at issuance').to.exist;
+
+				// The authentication path_id landed in storage in the same
+				// transaction as the preimage.
+				expect(
+					storage
+						.loadAllInvoicePathIds()
+						.some((r) => r.paymentHashHex === hashHex)
+				).to.be.true;
+
+				// Crash + restart the issuer over the same storage. bob is
+				// abandoned, NOT destroyed: destroy() closes the shared SQLite
+				// handle, and a crash closes nothing.
+				alice.removeAllListeners('message:outbound');
+				const bob2 = createTestNodeWithId(2, storage);
+				bob2.on('node:error', () => {});
+				reconnect(bob2, channelId);
+				connectNodes(alice, bob2);
+
+				// The expected path_id survived the restart...
+				const restored = bob2
+					.getOfferManager()
+					.getInvoicePathId(b12.paymentHash);
+				expect(restored, 'path_id restored from storage').to.exist;
+				expect(restored!.equals(pathIdBefore!)).to.be.true;
+				// ...and so did the invoice's bolt12 marker + preimage.
+				expect(bob2['invoices'].get(hashHex)?.bolt12).to.be.true;
+				expect(bob2['preimages'].has(hashHex)).to.be.true;
+
+				// The payment through the invoice's blinded path settles.
+				let received = false;
+				bob2.on('payment:received', () => {
+					received = true;
+				});
+				const sent = alice.payBolt12Invoice(b12);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(received, 'restarted bob settled the payment').to.be.true;
+
+				alice.destroy();
+				bob2.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob2.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('fails a post-restart HTLC for the same hash sent outside the invoice path', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+
+				// Crash: abandon bob without destroy (destroy closes the shared
+				// SQLite handle; a crash closes nothing).
+				alice.removeAllListeners('message:outbound');
+				const bob2 = createTestNodeWithId(2, storage);
+				bob2.on('node:error', () => {});
+				reconnect(bob2, channelId);
+				connectNodes(alice, bob2);
+
+				// Same hash, no blinded path: the restored preimage must NOT be
+				// revealed for an out-of-path HTLC (fail closed after restart).
+				const bolt11 = encodeInvoice({
+					network: Network.REGTEST,
+					amountMsat,
+					paymentHash: b12.paymentHash,
+					paymentSecret: crypto.randomBytes(32),
+					description: 'outside the path, after restart',
+					privateKey: makeNodeConfig(2).nodePrivateKey
+				});
+				let received = false;
+				bob2.on('payment:received', () => {
+					received = true;
+				});
+				const sent = alice.sendPayment(bolt11);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.FAILED
+				);
+				expect(received, 'restarted bob must not fulfill out-of-path').to.be
+					.false;
+
+				alice.destroy();
+				bob2.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob2.destroy() already closed the shared handle
+				}
+			}
+		});
+	});
+
+	describe('Issued-but-unpaid BOLT 12 invoice sweep (#259)', function () {
+		const EXPIRY = 7200;
+		const GRACE = 3600;
+
+		// Age an issued invoice past its expiry + grace so the sweep sees it.
+		function backdate(node: LightningNode, hashHex: string): void {
+			const inv = node['invoices'].get(hashHex)!;
+			inv.createdAt = Math.floor(Date.now() / 1000) - (EXPIRY + GRACE + 60);
+		}
+
+		it('sweeps expired never-paid invoices from every store while a paid one survives', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const payerPriv = makeNodeConfig(1).nodePrivateKey;
+				const unpaidA = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const unpaidB = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const paid = issueBolt12Invoice(bob, payerPriv, amountMsat)!;
+				const sent = alice.payBolt12Invoice(paid);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+
+				// Everything (paid included) is aged past expiry + grace: only
+				// the never-paid entries may go.
+				for (const b12 of [unpaidA, unpaidB, paid]) {
+					backdate(bob, b12.paymentHash.toString('hex'));
+				}
+
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				for (const b12 of [unpaidA, unpaidB]) {
+					const h = b12.paymentHash.toString('hex');
+					expect(bob['invoices'].has(h), 'invoice entry swept').to.be.false;
+					expect(bob['preimages'].has(h), 'preimage swept').to.be.false;
+					expect(bob['payments'].has(h), 'payment placeholder swept').to.be
+						.false;
+					expect(
+						bob.getOfferManager().getInvoicePathId(b12.paymentHash),
+						'expected path_id dropped'
+					).to.be.undefined;
+					expect(storage.loadPreimage(h), 'preimage row deleted').to.be.null;
+					expect(storage.loadPayment(h), 'payment row deleted').to.be.null;
+					expect(
+						storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+						'invoice row deleted'
+					).to.be.false;
+					expect(
+						storage.loadAllInvoicePathIds().some((r) => r.paymentHashHex === h),
+						'path_id row deleted'
+					).to.be.false;
+				}
+
+				const paidHex = paid.paymentHash.toString('hex');
+				expect(bob['invoices'].has(paidHex), 'paid invoice retained').to.be
+					.true;
+				expect(bob['payments'].get(paidHex)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				expect(storage.loadPreimage(paidHex), 'paid preimage row retained').to
+					.not.be.null;
+				expect(storage.loadPayment(paidHex), 'paid payment row retained').to.not
+					.be.null;
+
+				alice.destroy();
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('a settled invoice pruned from memory is never swept from durable history', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const alice = createTestNodeWithId(1);
+				const bob = createTestNodeWithId(2, storage);
+				connectNodes(alice, bob);
+				const channelId = openReadyChannel(alice, bob);
+				buildDirectGraph(alice, bob, channelId);
+
+				const amountMsat = 5_000_000n;
+				const paid = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					amountMsat
+				)!;
+				const sent = alice.payBolt12Invoice(paid);
+				expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+					PaymentStatus.COMPLETED
+				);
+				const h = paid.paymentHash.toString('hex');
+
+				// The retention TTL passes: the completed payment and preimage
+				// leave MEMORY (their durable rows remain), and the invoice then
+				// ages past expiry + grace.
+				bob['payments'].get(h)!.completedAt = Date.now() - 86_400_000 - 60_000;
+				bob.pruneCompletedPayments();
+				expect(bob['payments'].has(h), 'payment pruned from memory').to.be
+					.false;
+				expect(bob['preimages'].has(h), 'preimage pruned from memory').to.be
+					.false;
+				backdate(bob, h);
+
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				// A MISSING payment record must never read as "never paid": the
+				// durable settled-payment history stays intact.
+				expect(storage.loadPayment(h), 'payment row retained').to.not.be.null;
+				expect(storage.loadPreimage(h), 'preimage row retained').to.not.be.null;
+				expect(
+					storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+					'invoice row retained'
+				).to.be.true;
+
+				alice.destroy();
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('a failed storage transaction leaves the in-memory state for a retry', function () {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const bob = createTestNodeWithId(6, storage);
+				const b12 = issueBolt12Invoice(
+					bob,
+					makeNodeConfig(1).nodePrivateKey,
+					1_000n
+				)!;
+				const h = b12.paymentHash.toString('hex');
+				backdate(bob, h);
+
+				// Rows are deleted BEFORE memory: when the transaction fails,
+				// nothing may be removed anywhere, so runtime and persisted
+				// state never diverge and the next sweep retries the batch.
+				const originalDeleteInvoice = storage.deleteInvoice.bind(storage);
+				storage.deleteInvoice = (): void => {
+					throw new Error('injected deleteInvoice failure');
+				};
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+
+				expect(bob['invoices'].has(h), 'in-memory invoice kept').to.be.true;
+				expect(bob['preimages'].has(h), 'in-memory preimage kept').to.be.true;
+				expect(storage.loadPreimage(h), 'preimage row rolled back').to.not.be
+					.null;
+				expect(
+					storage.loadAllInvoices().some((r) => r.paymentHashHex === h),
+					'invoice row rolled back'
+				).to.be.true;
+
+				// With the fault removed, the retry clears everything.
+				storage.deleteInvoice = originalDeleteInvoice;
+				// eslint-disable-next-line @typescript-eslint/no-explicit-any
+				(bob as any).sweepExpiredIssuedInvoices();
+				expect(bob['invoices'].has(h)).to.be.false;
+				expect(storage.loadPreimage(h)).to.be.null;
+
+				bob.destroy();
+			} finally {
+				try {
+					storage.close();
+				} catch {
+					// bob.destroy() already closed the shared handle
+				}
+			}
+		});
+
+		it('never sweeps a hash with a parked HTLC or a partial MPP set', function () {
+			const bob = createTestNodeWithId(3);
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const held = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const mpp = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const heldHex = held.paymentHash.toString('hex');
+			const mppHex = mpp.paymentHash.toString('hex');
+			backdate(bob, heldHex);
+			backdate(bob, mppHex);
+
+			// A parked HTLC (async hold) and a partially accumulated MPP set:
+			// value may still arrive for these hashes, so expiry must not
+			// reap them out from under the in-flight state.
+			bob['heldHtlcs'].set(heldHex, []);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).pendingMppPayments.set(mppHex, { parts: [] });
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).sweepExpiredIssuedInvoices();
+
+			expect(bob['invoices'].has(heldHex), 'parked hash retained').to.be.true;
+			expect(bob['preimages'].has(heldHex)).to.be.true;
+			expect(bob['invoices'].has(mppHex), 'partial MPP hash retained').to.be
+				.true;
+			expect(bob['preimages'].has(mppHex)).to.be.true;
+
+			bob.destroy();
+		});
+
+		it('cap backstop evicts the oldest unexpired invoices down to the floor', function () {
+			const bob = createTestNodeWithId(4);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).bolt12IssuedInvoiceCap = 3; // floor = 2
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const issued = Array.from(
+				{ length: 5 },
+				() => issueBolt12Invoice(bob, payerPriv, 1_000n)!
+			);
+			// Distinct, UNEXPIRED ages so oldest-first eviction is deterministic.
+			const nowSec = Math.floor(Date.now() / 1000);
+			issued.forEach((b12, i) => {
+				bob['invoices'].get(b12.paymentHash.toString('hex'))!.createdAt =
+					nowSec - 100 + i;
+			});
+
+			const sweepLogs: Array<{
+				action: string;
+				data: Record<string, unknown>;
+			}> = [];
+			bob.on(
+				'log',
+				(log: { action: string; data: Record<string, unknown> }) => {
+					if (log.action === 'issued_invoice_sweep') sweepLogs.push(log);
+				}
+			);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).sweepExpiredIssuedInvoices();
+
+			const remaining = issued.filter((b12) =>
+				bob['invoices'].has(b12.paymentHash.toString('hex'))
+			);
+			expect(remaining.length, 'evicted down to 90% of the cap').to.equal(2);
+			expect(remaining[0]).to.equal(issued[3]);
+			expect(remaining[1]).to.equal(issued[4]);
+
+			// Telemetry distinguishes eviction from expiry: nothing here was
+			// expired, all three removals are cap pressure.
+			expect(sweepLogs).to.have.length(1);
+			expect(sweepLogs[0].data.removed).to.equal(3);
+			expect(sweepLogs[0].data.expired).to.equal(0);
+			expect(sweepLogs[0].data.capEvicted).to.equal(3);
+
+			bob.destroy();
+		});
+
+		it('sweeps on the issuance counter and on new blocks', function () {
+			const bob = createTestNodeWithId(5);
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+
+			const first = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			const firstHex = first.paymentHash.toString('hex');
+			backdate(bob, firstHex);
+			// The next issuance is the 256th tick: it must run the sweep.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(bob as any).issuedInvoiceSweepCounter = 255;
+			const second = issueBolt12Invoice(bob, payerPriv, 1_000n)!;
+			expect(
+				bob['invoices'].has(firstHex),
+				'issuance-triggered sweep removed the expired invoice'
+			).to.be.false;
+
+			// And every new block sweeps.
+			const secondHex = second.paymentHash.toString('hex');
+			backdate(bob, secondHex);
+			bob.handleNewBlock(100);
+			expect(
+				bob['invoices'].has(secondHex),
+				'block-triggered sweep removed the expired invoice'
+			).to.be.false;
+
+			bob.destroy();
 		});
 	});
 });

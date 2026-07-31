@@ -24,11 +24,13 @@ import {
 	isP2trPrefix
 } from '../utils';
 import { getBitcoinJsNetwork, reduceValue, shuffleArray } from '../utils';
+import { btcToSats } from '../utils/conversion';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
 import {
 	constructByteCountParam,
+	createOpReturnScript,
 	getByteCount,
-	removeDustOutputs,
+	getDustThreshold,
 	setReplaceByFee
 } from '../utils';
 import {
@@ -499,9 +501,6 @@ export class Transaction {
 		shuffleOutputs = true,
 		runCoinSelect = false
 	}: ICreateTransaction = {}): Promise<Result<{ id: string; hex: string }>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		let transaction = transactionData;
 		if (runCoinSelect) {
 			const coinSelectRes = this.autoCoinSelect({
@@ -600,9 +599,16 @@ export class Transaction {
 				if (response.isOk()) {
 					return response.value;
 				}
+				// 0 is also what an empty input set returns, so a failure here is
+				// invisible to the caller. Say so rather than only returning it.
+				this._wallet?.logger?.error(
+					'Failed to total the transaction inputs.',
+					response.error
+				);
 			}
 			return 0;
 		} catch (e) {
+			this._wallet?.logger?.error('Failed to total the transaction inputs.', e);
 			return 0;
 		}
 	};
@@ -670,8 +676,8 @@ export class Transaction {
 		bip32Interface?: BIP32Interface;
 		shuffleTargets?: boolean;
 	}): Promise<Result<Psbt>> => {
-		const { inputs, outputs, fee, rbf } = transactionData;
-		let { changeAddress, message } = transactionData;
+		const { inputs, outputs, fee, rbf, message } = transactionData;
+		let { changeAddress } = transactionData;
 
 		//Get balance of current inputs.
 		const balance = this.getTransactionInputValue({
@@ -719,20 +725,15 @@ export class Transaction {
 			}
 		}
 
-		//Embed any OP_RETURN messages.
-		if (message.trim() !== '') {
-			const messageLength = message.length;
-			const lengthMin = 5;
-			//This is a patch for the following: https://github.com/coreyphillips/moonshine/issues/52
-			if (messageLength > 0 && messageLength < lengthMin) {
-				message += ' '.repeat(lengthMin - messageLength);
-			}
-			const data = Buffer.from(message, 'utf8');
-			const embed = bitcoin.payments.embed({
-				data: [data],
-				network
+		//Embed any OP_RETURN messages. getByteCount prices this same script, so
+		//the padding and push rules live in one place.
+		const opReturnScript = createOpReturnScript(message);
+		if (opReturnScript) {
+			targets.push({
+				script: opReturnScript,
+				value: 0,
+				index: targets.length
 			});
-			targets.push({ script: embed.output!, value: 0, index: targets.length });
 		}
 
 		// Watch-only wallets cannot produce a signing root; inputs only need
@@ -834,9 +835,6 @@ export class Transaction {
 		transactionData?: ISendTransaction;
 		shuffleOutputs?: boolean;
 	} = {}): Promise<Result<Psbt>> => {
-		//Remove any outputs that are below the dust limit and apply them to the fee.
-		removeDustOutputs(transactionData.outputs);
-
 		const inputValue = this.getTransactionInputValue({
 			inputs: transactionData.inputs
 		});
@@ -1173,8 +1171,11 @@ export class Transaction {
 		value,
 		index = 0
 	}: IOutput): Promise<Result<string>> => {
-		if (value < TRANSACTION_DEFAULTS.dustLimit) {
-			return err('Output value is below dust limit.');
+		const dustThreshold = getDustThreshold(address);
+		if (value < dustThreshold) {
+			return err(
+				`Output value is below the dust threshold of ${dustThreshold} sats.`
+			);
 		}
 		if (!this.data.inputs?.length) {
 			const setupRes = await this.setupTransaction();
@@ -1206,8 +1207,18 @@ export class Transaction {
 			if (response.isOk()) {
 				return response.value;
 			}
+			// See getTransactionInputValue: 0 is a legitimate total, so a silent 0
+			// on failure is indistinguishable from an empty output set.
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				response.error
+			);
 			return 0;
-		} catch {
+		} catch (e) {
+			this._wallet?.logger?.error(
+				'Failed to total the transaction outputs.',
+				e
+			);
 			return 0;
 		}
 	};
@@ -1547,11 +1558,24 @@ export class Transaction {
 					const parentVsize = parent.vsize;
 					const childVsize = 141; // assume segwit 1 input 1 output
 					const { fast, normal } = this._wallet.feeEstimates;
-					satsPerByte = Math.ceil(
-						(fast * (parentVsize + childVsize) - parent.fee) / childVsize
+					// IFormattedTransaction.fee is denominated in BTC. Subtracting it
+					// from a sat figure took roughly 0.00001 off where it meant to take
+					// 1000, so the parent's paid fee was effectively ignored and the
+					// child overpaid by that fee spread across its own vsize.
+					const parentFeeSats = btcToSats(parent.fee);
+					// A parent that already paid above the target rate can drive these
+					// below 1 sat/vB, which is not a broadcastable rate.
+					satsPerByte = Math.max(
+						1,
+						Math.ceil(
+							(fast * (parentVsize + childVsize) - parentFeeSats) / childVsize
+						)
 					);
-					minFee = Math.ceil(
-						(normal * (parentVsize + childVsize) - parent.fee) / childVsize
+					minFee = Math.max(
+						1,
+						Math.ceil(
+							(normal * (parentVsize + childVsize) - parentFeeSats) / childVsize
+						)
 					);
 				}
 			}
@@ -1690,9 +1714,17 @@ export class Transaction {
 			if (!outputs || !outputs?.length) {
 				return err('No outputs provided');
 			}
-			const amountToSend = outputs.reduce((acc, cur) => {
-				return acc + Number(cur?.value) || 0;
-			}, 0);
+			// A malformed output value must not become 0. amountToSend being falsy
+			// takes the consolidate branch below, which selects every UTXO in the
+			// wallet, and applyAutoCoinSelect persists that selection before
+			// validateTransaction ever sees the transaction. reduceValue tells a
+			// genuine 0, which legitimately means "spend everything", apart from
+			// non-numeric data, which does not.
+			const amountToSendRes = reduceValue({ arr: outputs, value: 'value' });
+			if (amountToSendRes.isErr()) {
+				return err(amountToSendRes.error);
+			}
+			const amountToSend = amountToSendRes.value;
 
 			switch (coinSelectPreference) {
 				case 'large':
@@ -1762,24 +1794,10 @@ export class Transaction {
 				}
 			}
 
-			// Get all input and output address types for fee calculation.
-			const addressTypes = {
-				inputs: {},
-				outputs: {}
-			} as IAddressTypesIO;
+			// Output address types for the fee calculation. Input types are counted
+			// per selection in calculateFee below, since the selection can grow.
+			const outputTypes = {} as IAddressTypesIO['outputs'];
 
-			newInputs.forEach(({ address }) => {
-				const validateResponse = getAddressInfo(address);
-				if (!validateResponse) {
-					return;
-				}
-				const type = validateResponse.type.toUpperCase();
-				if (type in addressTypes.inputs) {
-					addressTypes.inputs[type] = addressTypes.inputs[type] + 1;
-				} else {
-					addressTypes.inputs[type] = 1;
-				}
-			});
 			const outputAddresses = outputs.map(({ address }) => address);
 			if (changeAddress) {
 				outputAddresses.push(changeAddress);
@@ -1793,37 +1811,58 @@ export class Transaction {
 					return;
 				}
 				const type = validateResponse.type.toUpperCase();
-				if (type in addressTypes.outputs) {
-					addressTypes.outputs[type] = addressTypes.outputs[type] + 1;
+				if (type in outputTypes) {
+					outputTypes[type] = outputTypes[type] + 1;
 				} else {
-					addressTypes.outputs[type] = 1;
+					outputTypes[type] = 1;
 				}
 			});
 
-			let baseFee = getByteCount(
-				this.applyMultisigInputWeights(addressTypes.inputs),
-				addressTypes.outputs,
-				message
-			);
-			if (satsPerByte < 2) {
-				const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
-				if (baseFee < minByteCount) baseFee = minByteCount;
-			}
-			const fee = baseFee * satsPerByte;
-
-			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
-			const totalTxCost = amountToSend + fee;
-			if (amountToSend && inputAmount < totalTxCost) {
-				oldInputs.forEach((input) => {
-					if (inputAmount < totalTxCost) {
-						inputAmount += input.value;
-						newInputs.push(input);
+			//Price the current selection. Every input added costs weight, so this
+			//has to be recomputed whenever the selection changes.
+			const calculateFee = (selected: IUtxo[]): number => {
+				const inputTypes = {} as IAddressTypesIO['inputs'];
+				selected.forEach(({ address }) => {
+					const validateResponse = getAddressInfo(address);
+					if (!validateResponse) {
+						return;
+					}
+					const type = validateResponse.type.toUpperCase();
+					if (type in inputTypes) {
+						inputTypes[type] = inputTypes[type] + 1;
+					} else {
+						inputTypes[type] = 1;
 					}
 				});
+				let baseFee = getByteCount(
+					this.applyMultisigInputWeights(inputTypes),
+					outputTypes,
+					message
+				);
+				if (satsPerByte < 2) {
+					const minByteCount = TRANSACTION_DEFAULTS.recommendedBaseFee;
+					if (baseFee < minByteCount) baseFee = minByteCount;
+				}
+				return baseFee * satsPerByte;
+			};
+
+			let fee = calculateFee(newInputs);
+
+			//Ensure we can still cover the transaction with the previously selected UTXO's. Add more UTXO's if not.
+			//Repricing after each addition matters: the fee the top-up is measured
+			//against used to be the one calculated before any of these inputs
+			//existed, so their weight (~68 vB each for P2WPKH) went unpaid.
+			if (amountToSend) {
+				for (const input of oldInputs) {
+					if (inputAmount >= amountToSend + fee) break;
+					inputAmount += input.value;
+					newInputs.push(input);
+					fee = calculateFee(newInputs);
+				}
 			}
 
 			//The provided UTXO's do not have enough to cover the transaction.
-			if (inputAmount < totalTxCost || !newInputs?.length) {
+			if (inputAmount < amountToSend + fee || !newInputs?.length) {
 				return err('Not enough funds');
 			}
 			return ok({ inputs: newInputs, outputs, fee });

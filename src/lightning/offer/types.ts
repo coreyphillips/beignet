@@ -84,8 +84,6 @@ export interface IBolt12Invoice {
 	createdAt: bigint;
 	/** Relative expiry in seconds from created_at */
 	relativeExpiry?: number;
-	/** Payment secret (32 bytes) */
-	paymentSecret?: Buffer;
 	/** Blinded paths for payment delivery */
 	paths?: IBlindedPath[];
 	/** Blinded payment info (parallel array with paths) */
@@ -129,4 +127,18 @@ export interface IInvoiceError {
 	suggestedValue?: Buffer;
 	/** Human-readable error string */
 	error: string;
+}
+
+/**
+ * Payload of a payer-side `invoice:error` event: the wire-level error plus
+ * local-only telemetry. Kept as a separate type from IInvoiceError so event
+ * metadata can never end up serialized into an outgoing invoice_error TLV
+ * (issuer-side emits carry the bare IInvoiceError and no flag).
+ */
+export interface IInvoiceErrorEvent extends IInvoiceError {
+	/**
+	 * True when the error rejected a pending invoice_request of ours; false
+	 * when it was unbound and cancelled nothing (observability only).
+	 */
+	matchedPendingRequest: boolean;
 }

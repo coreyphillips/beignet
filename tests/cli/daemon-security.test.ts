@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { parseBody, startDaemon } from '../../src/cli/daemon';
+import { BeignetError } from '../../src/cli/errors';
 import { resolveConfig } from '../../src/cli/config';
 import { Readable } from 'stream';
 import { IncomingMessage } from 'http';
@@ -411,6 +412,106 @@ describe('Daemon auth middleware', () => {
 		}
 	}).timeout(30000);
 
+	it('failed auth attempts are throttled by the rate limiter', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'brute-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			// Each guess must consume budget: the limiter runs before auth.
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/info', {
+					Authorization: 'Bearer wrong-guess'
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/info', {
+				Authorization: 'Bearer wrong-guess'
+			});
+			expect(throttled.status).to.equal(429);
+			expect((throttled.body.error as { code: string }).code).to.equal(
+				'RATE_LIMITED'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('varying the Authorization header does not mint fresh rate-limit buckets', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'bucket-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			// A distinct token per request previously keyed a distinct bucket,
+			// so a brute forcer never saw a 429. All guesses from one peer
+			// must now share the same budget.
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/info', {
+					Authorization: `Bearer distinct-guess-${i}`
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/info', {
+				Authorization: 'Bearer distinct-guess-final'
+			});
+			expect(throttled.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('SSE endpoint auth failures are throttled by the rate limiter', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'sse-target',
+			rateLimit: { maxRequests: 5, windowMs: 60_000 },
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			for (let i = 0; i < 5; i++) {
+				const resp = await httpGet(addr.port, '/events', {
+					Authorization: 'Bearer wrong-guess'
+				});
+				expect(resp.status).to.equal(401);
+			}
+			const throttled = await httpGet(addr.port, '/events', {
+				Authorization: 'Bearer wrong-guess'
+			});
+			expect(throttled.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
 	it('GET /health does not require authentication', async () => {
 		const { server, node } = await startDaemon({
 			mnemonic:
@@ -432,6 +533,438 @@ describe('Daemon auth middleware', () => {
 		} finally {
 			await node.destroy();
 			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /metrics requires auth (it reports balances), metricsPublic opts out', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'metricstest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const noAuth = await httpGet(addr.port, '/metrics');
+			expect(noAuth.status).to.equal(401);
+			const withAuth = await httpGet(addr.port, '/metrics', {
+				Authorization: 'Bearer metricstest'
+			});
+			expect(withAuth.status).to.equal(200);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /metrics is open when metricsPublic is set', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'metricspublic',
+			metricsPublic: true,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/metrics');
+			expect(resp.status).to.equal(200);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('refuses a non-loopback bind without authentication', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				daemonHost: '0.0.0.0',
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false
+			});
+			expect.fail('Should have refused the bind');
+		} catch (err: unknown) {
+			expect((err as { code?: string }).code).to.equal('INVALID_PARAMS');
+			expect((err as Error).message).to.include('authentication');
+		}
+	}).timeout(30000);
+
+	it('refuses wildcard CORS without authentication', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				cors: true,
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false
+			});
+			expect.fail('Should have refused wildcard CORS');
+		} catch (err: unknown) {
+			expect((err as { code?: string }).code).to.equal('INVALID_PARAMS');
+			expect((err as Error).message).to.include('CORS');
+		}
+	}).timeout(30000);
+
+	it('CORS preflight allows DELETE (watchtower and webhook routes use it)', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'corstest',
+			cors: true,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const allowMethods = await new Promise<string>((resolve, reject) => {
+				const req = http.request(
+					{
+						hostname: '127.0.0.1',
+						port: addr.port,
+						path: '/webhooks/unregister',
+						method: 'OPTIONS'
+					},
+					(res) => {
+						res.resume();
+						resolve(String(res.headers['access-control-allow-methods'] ?? ''));
+					}
+				);
+				req.on('error', reject);
+				req.end();
+			});
+			expect(allowMethods).to.include('DELETE');
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('maps error envelopes to HTTP statuses and rejects bad input', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'statustest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer statustest' };
+		try {
+			// NaN would bind into SQL and silently match nothing: reject it.
+			const badSince = await httpGet(addr.port, '/forwards?since=abc', auth);
+			expect(badSince.status).to.equal(400);
+			expect((badSince.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+
+			const badAmount = await httpGet(
+				addr.port,
+				'/can-send?amountSats=abc',
+				auth
+			);
+			expect(badAmount.status).to.equal(400);
+
+			const goodAmount = await httpGet(
+				addr.port,
+				'/can-send?amountSats=1000',
+				auth
+			);
+			expect(goodAmount.status).to.equal(200);
+
+			// The audit/history and advisor routes validate too.
+			const badWindow = await httpGet(addr.port, '/stats?window=abc', auth);
+			expect(badWindow.status).to.equal(400);
+			const badCount = await httpGet(
+				addr.port,
+				'/channel/suggestions?count=abc',
+				auth
+			);
+			expect(badCount.status).to.equal(400);
+			const badLogsSince = await httpGet(addr.port, '/logs?since=abc', auth);
+			expect(badLogsSince.status).to.equal(400);
+			const badLogsLimit = await httpGet(addr.port, '/logs?limit=1.5', auth);
+			expect(badLogsLimit.status).to.equal(400);
+
+			// A returned failure envelope carries its mapped status too.
+			const notFound = await httpGet(
+				addr.port,
+				`/invoice?paymentHash=${'ab'.repeat(32)}`,
+				auth
+			);
+			expect(notFound.status).to.equal(404);
+
+			// Fractional sats used to throw an uncaught RangeError at BigInt()
+			// and surface as a 200 INTERNAL_ERROR.
+			const fractional = await httpPost(
+				addr.port,
+				'/channel/open',
+				{ pubkey: '02' + 'ab'.repeat(32), amountSats: 1.5 },
+				auth
+			);
+			expect(fractional.status).to.equal(400);
+			expect((fractional.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('rejects malformed JSON bodies with 400 instead of treating them as empty', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'jsontest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await new Promise<{
+				status: number;
+				body: Record<string, unknown>;
+			}>((resolve, reject) => {
+				const payload = '{"bolt11": "lnbc1..';
+				const req = http.request(
+					{
+						hostname: '127.0.0.1',
+						port: addr.port,
+						path: '/invoice/pay',
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/json',
+							'Content-Length': Buffer.byteLength(payload),
+							Authorization: 'Bearer jsontest'
+						}
+					},
+					(res) => {
+						const chunks: Buffer[] = [];
+						res.on('data', (c: Buffer) => chunks.push(c));
+						res.on('end', () => {
+							try {
+								resolve({
+									status: res.statusCode!,
+									body: JSON.parse(Buffer.concat(chunks).toString())
+								});
+							} catch {
+								resolve({ status: res.statusCode!, body: {} });
+							}
+						});
+					}
+				);
+				req.on('error', reject);
+				req.write(payload);
+				req.end();
+			});
+			expect(resp.status).to.equal(400);
+			expect((resp.body.error as { code: string }).code).to.equal(
+				'INVALID_JSON'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('answers mistyped offer and invoice pastes with 400 and the parser message, not a scrubbed 500', async () => {
+		const errorLines: string[] = [];
+		const captureLogger = {
+			debug: (): void => {},
+			info: (): void => {},
+			warn: (): void => {},
+			error: (message: string): void => {
+				errorLines.push(message);
+			}
+		};
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'decodetest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			logger: captureLogger
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer decodetest' };
+		try {
+			const badOffer = await httpPost(
+				addr.port,
+				'/offer/decode',
+				{ offer: 'lno1garbage' },
+				auth
+			);
+			expect(badOffer.status).to.equal(400);
+			const offerErr = badOffer.body.error as {
+				code: string;
+				message: string;
+			};
+			expect(offerErr.code).to.equal('INVALID_OFFER');
+			expect(offerErr.message).to.include('Invalid offer:');
+			expect(offerErr.message).to.not.include('Internal server error');
+
+			const badInvoice = await httpPost(
+				addr.port,
+				'/invoice/decode',
+				{ bolt11: 'lnbc1garbage' },
+				auth
+			);
+			expect(badInvoice.status).to.equal(400);
+			const invoiceErr = badInvoice.body.error as {
+				code: string;
+				message: string;
+			};
+			expect(invoiceErr.code).to.equal('INVALID_INVOICE');
+			expect(invoiceErr.message).to.include('Invalid invoice:');
+			expect(invoiceErr.message).to.not.include('Internal server error');
+
+			// A typo is user input, not a daemon bug: nothing may reach the
+			// log as an unhandled server fault.
+			const unhandled = errorLines.filter((m) => m.includes('Unhandled error'));
+			expect(unhandled).to.deep.equal([]);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('rate limiter keys per forwarded client behind a trusted proxy and ignores the header otherwise', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'ratelimittest',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			rateLimit: {
+				maxRequests: 3,
+				windowMs: 60_000,
+				trustedProxies: ['127.0.0.1', '::1']
+			}
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer ratelimittest' };
+		try {
+			// Exhaust client A's bucket through the trusted loopback "proxy".
+			const clientA = { ...auth, 'X-Forwarded-For': '203.0.113.10' };
+			let lastStatus = 0;
+			for (let i = 0; i < 4; i++) {
+				const resp = await httpGet(addr.port, '/info', clientA);
+				lastStatus = resp.status;
+			}
+			expect(lastStatus).to.equal(429);
+
+			// A different forwarded client still has a full bucket.
+			const clientB = { ...auth, 'X-Forwarded-For': '203.0.113.11' };
+			const other = await httpGet(addr.port, '/info', clientB);
+			expect(other.status).to.equal(200);
+
+			// Fakes prepended by the client do not mint a fresh bucket: the
+			// rightmost untrusted entry is still client A.
+			const spoof = {
+				...auth,
+				'X-Forwarded-For': '198.51.100.99, 203.0.113.10'
+			};
+			const spoofed = await httpGet(addr.port, '/info', spoof);
+			expect(spoofed.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('rate limiter shares one bucket for proxied clients without trustedProxies', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic:
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			apiToken: 'ratelimittest2',
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false,
+			rateLimit: { maxRequests: 3, windowMs: 60_000 }
+		});
+		const addr = server.address() as { port: number };
+		const auth = { Authorization: 'Bearer ratelimittest2' };
+		try {
+			for (let i = 0; i < 3; i++) {
+				await httpGet(addr.port, '/info', {
+					...auth,
+					'X-Forwarded-For': `203.0.113.${i}`
+				});
+			}
+			// Varying the header did not vary the bucket: the peer is spent.
+			const resp = await httpGet(addr.port, '/info', {
+				...auth,
+				'X-Forwarded-For': '203.0.113.99'
+			});
+			expect(resp.status).to.equal(429);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('refuses startup when a trustedProxies entry is not an IP address', async () => {
+		try {
+			await startDaemon({
+				mnemonic:
+					'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				network: 'regtest',
+				dataDir: tmpDir,
+				daemonPort: 0,
+				apiToken: 'ratelimittest3',
+				electrumHost: '127.0.0.1',
+				electrumPort: 60001,
+				electrumTls: false,
+				rateLimit: { trustedProxies: ['proxy.internal'] }
+			});
+			expect.fail('startDaemon should have thrown');
+		} catch (err: unknown) {
+			expect(err).to.be.instanceOf(BeignetError);
+			expect((err as BeignetError).code).to.equal('INVALID_PARAMS');
+			expect((err as BeignetError).message).to.include('proxy.internal');
 		}
 	}).timeout(30000);
 });

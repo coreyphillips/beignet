@@ -972,25 +972,21 @@ describe('Lightning Node', function () {
 			expect(eventFired).to.be.true;
 		});
 
-		it('settles an incoming HTLC for a BOLT 12 offer invoice (preimage wired from OfferManager)', function () {
+		it('pays a beignet-issued BOLT 12 offer end to end (path_id, no payment_secret)', function () {
 			const alice = createNode(1);
 			const bob = createNode(2);
 			connectNodes(alice, bob);
 			const channelId = openReadyChannel(alice, bob);
 			buildDirectGraph(alice, bob, channelId);
 
-			// Bob publishes a BOLT 12 offer and issues an invoice in response to an
-			// invoice_request (the RECEIVE side). The fix wires the issued preimage
-			// from the OfferManager into Bob's node receive stores so an incoming HTLC
-			// for this payment_hash can actually be fulfilled.
+			// Bob publishes a BOLT 12 offer and issues an invoice in response to a
+			// signed invoice_request, exactly as the onion-message handler would.
 			const amountMsat = 10_000_000n;
 			const offerMgr = bob.getOfferManager();
 			const { offer } = offerMgr.createOffer({
 				description: 'bolt12 receive',
 				amount: amountMsat
 			});
-			// A signed invoice_request (handleInvoiceRequest requires metadata + a
-			// valid payer signature per BOLT 12).
 			const payerPriv = makeNodeConfig(1).nodePrivateKey;
 			const request: IInvoiceRequest = {
 				payerKey: getPublicKey(payerPriv),
@@ -1012,42 +1008,44 @@ describe('Lightning Node', function () {
 			)!;
 			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
 
-			// The wiring registered the preimage + secret + amount into the SAME
-			// stores the BOLT 11 receive path consults (these were previously absent,
-			// so the HTLC was failed with unknown_payment_hash).
+			// The invoice carries a REAL single-hop blinded path terminating at
+			// bob (not the old zero-length placeholder) whose encrypted data
+			// holds the path_id that authenticates the payment. No payment
+			// secret is minted: BOLT 12 has no payment_secret TLV, so the one
+			// beignet used to register could never reach the payer, and every
+			// payment failed with incorrect_or_unknown_payment_details (#252).
 			const hashHex = b12.paymentHash.toString('hex');
 			expect(bob['preimages'].has(hashHex), 'preimage registered').to.be.true;
-			expect(bob['paymentSecrets'].has(hashHex), 'secret registered').to.be
-				.true;
+			expect(
+				bob['paymentSecrets'].has(hashHex),
+				'no untransmittable payment secret registered'
+			).to.be.false;
 			expect(bob['invoices'].has(hashHex), 'invoice registered').to.be.true;
-
-			// Alice has no BOLT 12 send pipeline in this harness, so transport the
-			// invoice's (payment_hash, payment_secret, amount) to her sender via a
-			// BOLT 11 string signed by Bob. Bob only ever sees the resulting HTLC,
-			// which it settles from the OfferManager-issued preimage now in its store.
-			const bolt11 = encodeInvoice({
-				network: Network.REGTEST,
-				amountMsat,
-				paymentHash: b12.paymentHash,
-				paymentSecret: b12.paymentSecret!,
-				description: 'bolt12 receive',
-				privateKey: makeNodeConfig(2).nodePrivateKey
-			});
+			expect(b12.paths, 'invoice carries a blinded path').to.have.length(1);
+			expect(b12.paths![0].introductionNodeId).to.deep.equal(
+				Buffer.from(bob.getNodeId(), 'hex')
+			);
+			expect(
+				b12.paths![0].blindedHops[0].encryptedData.length,
+				'final hop carries real encrypted recipient data'
+			).to.be.greaterThan(0);
+			expect(
+				offerMgr.getInvoicePathId(b12.paymentHash),
+				'issuer registered the expected path_id'
+			).to.exist;
 
 			let received: IPaymentInfo | null = null;
 			bob.on('payment:received', (p: IPaymentInfo) => {
 				received = p;
 			});
 
-			const sent = alice.sendPayment(bolt11);
+			// Alice pays the BOLT 12 invoice itself over its blinded path — the
+			// beignet-to-beignet direction that always failed before the fix.
+			const sent = alice.payBolt12Invoice(b12);
 
-			// Alice's payment COMPLETED ⇒ Bob revealed the preimage, i.e. Bob
-			// fulfilled the HTLC from the OfferManager-issued preimage now wired into
-			// its receive store (without the fix this HTLC would be failed).
 			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
 				PaymentStatus.COMPLETED
 			);
-			// Bob emitted payment:received and recorded the incoming payment.
 			expect(received, 'bob received the BOLT 12 payment').to.not.be.null;
 			expect(received!.status).to.equal(PaymentStatus.COMPLETED);
 			const bobPayment = bob.getPayment(b12.paymentHash);
@@ -1059,6 +1057,187 @@ describe('Lightning Node', function () {
 				.digest();
 			expect(hash.equals(b12.paymentHash), 'preimage hashes to invoice hash').to
 				.be.true;
+		});
+
+		it('fails an HTLC for a BOLT 12 hash sent outside the invoice blinded path', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat
+			});
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			)!;
+			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+
+			// A payment for the same hash arriving OUTSIDE the blinded path (a
+			// probe, or a sender who learned the hash out of band), transported
+			// here via a BOLT 11 invoice signed by bob. Its final-hop payload
+			// carries no encrypted path_id, so bob must reject it BEFORE
+			// revealing the preimage.
+			const bolt11 = encodeInvoice({
+				network: Network.REGTEST,
+				amountMsat,
+				paymentHash: b12.paymentHash,
+				paymentSecret: crypto.randomBytes(32),
+				description: 'outside the path',
+				privateKey: makeNodeConfig(2).nodePrivateKey
+			});
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+
+			const sent = alice.sendPayment(bolt11);
+
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			expect(received, 'bob must not fulfill an out-of-path HTLC').to.be.false;
+		});
+
+		it('fails closed when the expected path_id is lost, even over the correct path', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat
+			});
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			)!;
+			const hashHex = b12.paymentHash.toString('hex');
+
+			// Simulate authentication-state loss (TTL/cap eviction, a wiped
+			// row) while the preimage stays claimable. The invoice's bolt12
+			// marker must force rejection, not skip the check: an unknown
+			// expectation is a reason to fail, never a pass.
+			offerMgr['invoicePathIds'].delete(hashHex);
+			expect(bob['preimages'].has(hashHex), 'preimage still claimable').to.be
+				.true;
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+
+			const sent = alice.payBolt12Invoice(b12);
+
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.FAILED
+			);
+			expect(received, 'bob must fail closed without the expected path_id').to
+				.be.false;
+		});
+
+		it('issues fresh authenticated payment paths for an offer with caller-supplied paths', function () {
+			const alice = createNode(1);
+			const bob = createNode(2);
+			connectNodes(alice, bob);
+			const channelId = openReadyChannel(alice, bob);
+			buildDirectGraph(alice, bob, channelId);
+
+			// A caller-supplied offer path whose contents we never saw (no
+			// pathId handed over): it must be used only for invoice_request
+			// delivery, never as the invoice's payment path, or the payment
+			// could not be authenticated.
+			const bobPub = Buffer.from(bob.getNodeId(), 'hex');
+			const externalPath = constructBlindedPath(
+				crypto.randomBytes(32),
+				[bobPub],
+				[{}]
+			);
+			const amountMsat = 10_000_000n;
+			const offerMgr = bob.getOfferManager();
+			const { offer } = offerMgr.createOffer({
+				description: 'bolt12 receive',
+				amount: amountMsat,
+				paths: [externalPath]
+			});
+			const payerPriv = makeNodeConfig(1).nodePrivateKey;
+			const request: IInvoiceRequest = {
+				payerKey: getPublicKey(payerPriv),
+				offerId: offer.offerId,
+				amount: amountMsat,
+				metadata: crypto.randomBytes(16)
+			};
+			const offerTlv = encodeOfferTlv(offer);
+			const unsigned = encodeInvoiceRequestTlv(request, offerTlv);
+			request.signature = schnorrSign(
+				computeSignatureHash(
+					'lightninginvoice_requestsignature',
+					computeMerkleRootFromRecords(getTlvRecords(unsigned))
+				),
+				payerPriv
+			);
+			const b12 = offerMgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(request, offerTlv)
+			)!;
+			expect(b12, 'bob issued a BOLT 12 invoice').to.not.be.null;
+
+			// The invoice's payment path is freshly built (not the opaque
+			// caller path) and carries a registered per-invoice path_id.
+			expect(b12.paths).to.have.length(1);
+			expect(b12.paths![0].blindingPoint).to.not.deep.equal(
+				externalPath.blindingPoint
+			);
+			expect(offerMgr.getInvoicePathId(b12.paymentHash)).to.exist;
+
+			let received = false;
+			bob.on('payment:received', () => {
+				received = true;
+			});
+			const sent = alice.payBolt12Invoice(b12);
+			expect(alice.getPayment(sent.paymentHash)!.status).to.equal(
+				PaymentStatus.COMPLETED
+			);
+			expect(received, 'payment over the fresh path settled').to.be.true;
 		});
 
 		it('consumes an on-chain-learned preimage: seeds monitors + fulfills the inbound leg (H3)', function () {

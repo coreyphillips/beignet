@@ -21,6 +21,7 @@ import {
 } from './types';
 import {
 	encodeOfferTlv,
+	decodeOfferTlv,
 	encodeInvoiceRequestTlv,
 	decodeInvoiceRequestTlv,
 	encodeInvoiceTlv,
@@ -37,8 +38,14 @@ import {
 } from './merkle';
 import { schnorrSign, schnorrVerify, toXOnlyPubkey } from './schnorr';
 import { encodeOffer } from './encode';
+import { decodeNoChecksum } from './bech32-nochecksum';
 import { ITlvRecord } from '../message/tlv';
-import { IBlindedPath, constructBlindedPath } from '../onion/blinded-path';
+import type { IStorageBackend } from '../storage/types';
+import {
+	IBlindedPath,
+	IBlindedPaymentPath,
+	constructBlindedPath
+} from '../onion/blinded-path';
 import { OnionMessageManager } from '../onion-message/manager';
 import { getPublicKey } from '../crypto/ecdh';
 
@@ -48,6 +55,12 @@ export const TLV_INVOICE_REQUEST = 64;
 export const TLV_INVOICE = 66;
 /** TLV type for BOLT 12 invoice error in onion messages */
 export const TLV_INVOICE_ERROR = 68;
+
+/** Issued invoices carry relativeExpiry 7200s; keep the preimage for the
+ *  invoice's life plus an hour of grace for an HTLC in flight at expiry. */
+const INVOICE_PREIMAGE_TTL_MS = (7200 + 3600) * 1000;
+/** Hard cap on retained preimages: requests are remote-driven. */
+const MAX_INVOICE_PREIMAGES = 10_000;
 
 // BOLT 12 signature tags are "lightning" || messagename || fieldname (the field
 // is always the "signature" field, type 240). A bare "lightning" tag made every
@@ -83,6 +96,13 @@ export interface ICreateOfferOptions {
 	 * rejected. Omit for externally built paths without one.
 	 */
 	pathId?: Buffer;
+	/**
+	 * Async receive: payments for invoices issued from this offer must be
+	 * parked by the LSP. Invoice payment paths are rebuilt per invoice with
+	 * the hold_htlc flag via the node-injected hold-path builder. Persisted
+	 * with the offer so a restart keeps issuing hold paths.
+	 */
+	asyncHold?: boolean;
 }
 
 export interface IRequestInvoiceOptions {
@@ -101,15 +121,35 @@ export class OfferManager extends EventEmitter {
 	private nodeId: Buffer;
 	private offers: Map<
 		string,
-		{ offer: IOffer; encoded: string; tlvData: Buffer; pathId?: Buffer }
+		{
+			offer: IOffer;
+			encoded: string;
+			tlvData: Buffer;
+			pathId?: Buffer;
+			asyncHold?: boolean;
+		}
 	> = new Map();
 	private onionMessageManager: OnionMessageManager | null = null;
+	/**
+	 * In-flight requestInvoice calls, keyed by a UNIQUE per-request id: the
+	 * reply path's path_id (hex) when the request went out with one, a random
+	 * id otherwise. NEVER keyed by offer id — an offer is a reusable payment
+	 * code, so two live requests for the same offer are normal, and an
+	 * offer-id key made the second overwrite the first while the first's
+	 * stale timer then evicted the second (#250).
+	 */
 	private pendingInvoiceRequests: Map<
 		string,
 		{
 			resolve: (invoice: IBolt12Invoice) => void;
 			reject: (err: Error) => void;
 			timer: ReturnType<typeof setTimeout>;
+			/**
+			 * Offer this request was made against — carried per entry (it is
+			 * NOT the map key) for the legacy description/issuer match of
+			 * invoices that arrive without a reply-path binding.
+			 */
+			offerIdHex: string;
 			/**
 			 * The signed invreq records we sent, retained so the invoice's
 			 * mirrored fields can be checked (BOLT 12: the reader MUST reject an
@@ -132,22 +172,168 @@ export class OfferManager extends EventEmitter {
 	 * Surfaced via the `invoice:issued` event and {@link getInvoicePreimage}.
 	 */
 	private invoicePreimages: Map<string, Buffer> = new Map();
+	/** Insertion deadlines for invoicePreimages (ms epoch); entries past
+	 *  their deadline are pruned on the next insert. */
+	private invoicePreimageDeadlines: Map<string, number> = new Map();
+	/**
+	 * path_id embedded in the final hop of the blinded payment path(s) of each
+	 * BOLT 12 invoice WE issued, keyed by payment_hash hex. BOLT 12 defines no
+	 * payment_secret TLV: the encrypted path_id is what authenticates an
+	 * incoming payment — the node compares it against the decrypted final-hop
+	 * recipient data before fulfilling. Registered together with the preimage
+	 * and pruned in step with it.
+	 */
+	private invoicePathIds: Map<string, Buffer> = new Map();
 	private invoiceRequestTimeoutMs: number;
+	/**
+	 * Allow a sole pending request with no reply-path binding to be resolved
+	 * by an invoice that arrived outside any reply path we issued. Off by
+	 * default: such an invoice cannot be proven to answer the request, and a
+	 * forged one would consume it (settle rejects on validation failure).
+	 * Only hand-fed flows (no onion wiring) should opt in.
+	 */
+	private allowUnboundInvoiceFallback: boolean;
+	/**
+	 * Node-injected builder for the payment paths of an invoice issued from an
+	 * ASYNC-HOLD offer: real blinded paths through the LSP carrying the
+	 * hold_htlc flag, the given per-invoice path_id in the final hop, and the
+	 * true aggregate payinfo. Without it (bare OfferManager, or no usable
+	 * channel at issuance) the invoice falls back to the single-hop self path.
+	 */
+	private buildHoldPaymentPaths:
+		| ((pathId: Buffer) => IBlindedPaymentPath[])
+		| null = null;
+	/** Persistent backend for offers; null keeps the manager memory-only. */
+	private storage: IStorageBackend | null = null;
+	private storageAttached = false;
 
 	constructor(
 		nodePrivkey: Buffer,
 		options?: {
 			onionMessageManager?: OnionMessageManager;
 			invoiceRequestTimeoutMs?: number;
+			allowUnboundInvoiceFallback?: boolean;
+			buildHoldPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 		}
 	) {
 		super();
 		this.nodePrivkey = nodePrivkey;
 		this.nodeId = getPublicKey(nodePrivkey);
 		this.invoiceRequestTimeoutMs = options?.invoiceRequestTimeoutMs ?? 30_000;
+		this.allowUnboundInvoiceFallback =
+			options?.allowUnboundInvoiceFallback ?? false;
+		this.buildHoldPaymentPaths = options?.buildHoldPaymentPaths ?? null;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
+		}
+	}
+
+	/**
+	 * Attach persistent storage and rehydrate offers from previous runs.
+	 *
+	 * An offer is a long-lived payment code: the shared string keeps
+	 * circulating whether or not this process restarted, so the node must
+	 * keep answering invoice_requests for it. Without this, a restart made
+	 * every previously shared offer unpayable (answered "Unknown offer").
+	 *
+	 * The stored bech32m encoding is authoritative: the TLV bytes come
+	 * straight out of it (so invreq mirroring sees the original bytes), and
+	 * the offer id is recomputed and checked against the row key, skipping
+	 * anything corrupt. Offers already in memory win over rows. Offers whose
+	 * absoluteExpiry has passed are deleted instead of loaded;
+	 * handleInvoiceRequest would refuse them anyway.
+	 */
+	attachStorage(storage: IStorageBackend): void {
+		// Re-entrancy guard: a second attach would re-run rehydration against
+		// a now-populated map and re-prune rows out from under it.
+		if (this.storageAttached) return;
+		this.storageAttached = true;
+		this.storage = storage;
+		const rows = storage.loadAllOffers?.() ?? [];
+		const now = BigInt(Math.floor(Date.now() / 1000));
+		// Rows to delete are collected and removed in ONE transaction at the
+		// end: with synchronous=FULL each separate DELETE is its own fsync.
+		const prune: string[] = [];
+		for (const row of rows) {
+			try {
+				const decoded = decodeNoChecksum(row.encoded);
+				if (decoded.hrp !== 'lno') {
+					// Not an offer encoding at all; the row can never load.
+					this.emit('offer:corrupt', {
+						offerIdHex: row.offerIdHex,
+						reason: 'stored blob is not an offer encoding'
+					});
+					prune.push(row.offerIdHex);
+					continue;
+				}
+				const tlvData = decoded.data;
+				const { offer: bare, records } = decodeOfferTlv(tlvData);
+				const offerId = computeOfferId(records);
+				const offerIdHex = offerId.toString('hex');
+				if (offerIdHex !== row.offerIdHex) {
+					// The encoding is checksum-free by design, so the recomputed
+					// offer id is the ONLY integrity check on the stored blob. A
+					// mismatch means the row is garbage; deleting it stops it
+					// being re-parsed (and silently skipped) on every start.
+					this.emit('offer:corrupt', {
+						offerIdHex: row.offerIdHex,
+						reason: 'recomputed offer id does not match the row key'
+					});
+					prune.push(row.offerIdHex);
+					continue;
+				}
+				const offer: IOffer = { ...bare, offerId };
+				if (offer.absoluteExpiry !== undefined && now >= offer.absoluteExpiry) {
+					prune.push(row.offerIdHex);
+					continue;
+				}
+				if (this.offers.has(offerIdHex)) continue;
+				this.offers.set(offerIdHex, {
+					offer,
+					encoded: row.encoded,
+					tlvData,
+					pathId: row.pathId ?? undefined,
+					asyncHold: row.asyncHold || undefined
+				});
+			} catch (err) {
+				// A row that cannot be decoded is LEFT IN PLACE: a decode throw
+				// can mean version skew (an offer written by a newer version,
+				// read after a downgrade), and deleting would destroy it. It is
+				// surfaced instead of silently skipped.
+				this.emit('offer:corrupt', {
+					offerIdHex: row.offerIdHex,
+					reason: `row failed to decode: ${
+						err instanceof Error ? err.message : String(err)
+					}`
+				});
+				continue;
+			}
+		}
+		if (prune.length > 0 && storage.deleteOffer) {
+			const deleteAll = (): void => {
+				for (const offerIdHex of prune) storage.deleteOffer!(offerIdHex);
+			};
+			if (typeof storage.transaction === 'function') {
+				storage.transaction(deleteAll);
+			} else {
+				deleteAll();
+			}
+		}
+
+		// Re-register the expected path_ids of issued-but-unpaid BOLT 12
+		// invoices. The receive path FAILS CLOSED on a BOLT 12 invoice whose
+		// expected path_id is unknown, so without this every invoice issued
+		// before the restart would become unpayable while its preimage is
+		// still claimable. Restored entries get a fresh retention deadline;
+		// over-retention only delays cap eviction, it cannot weaken
+		// authentication.
+		for (const row of storage.loadAllInvoicePathIds?.() ?? []) {
+			this.invoicePathIds.set(row.paymentHashHex, row.pathId);
+			this.invoicePreimageDeadlines.set(
+				row.paymentHashHex,
+				Date.now() + INVOICE_PREIMAGE_TTL_MS
+			);
 		}
 	}
 
@@ -172,9 +358,12 @@ export class OfferManager extends EventEmitter {
 			}
 		);
 
-		mgr.registerTlvHandler(TLV_INVOICE_ERROR, (_fromPeer, _tlvType, data) => {
-			this.handleIncomingInvoiceError(data);
-		});
+		mgr.registerTlvHandler(
+			TLV_INVOICE_ERROR,
+			(_fromPeer, _tlvType, data, _replyPath, pathId) => {
+				this.handleIncomingInvoiceError(data, pathId);
+			}
+		);
 	}
 
 	/**
@@ -212,12 +401,34 @@ export class OfferManager extends EventEmitter {
 
 		const encoded = encodeOffer(offer);
 
-		// Store offer (with the expected path_id when its paths carry one)
-		this.offers.set(offerId.toString('hex'), {
+		// The offer id is deterministic, so re-creating an identical offer
+		// updates an existing entry. The in-memory path_id must follow the
+		// same rule as the storage upsert (a non-null stored path_id is
+		// preserved when the new call omits one): handleInvoiceRequest
+		// enforces authentication from THIS entry, so dropping it here would
+		// silently disable the offer's blinded-path auth until restart.
+		const offerIdHex = offerId.toString('hex');
+		const previous = this.offers.get(offerIdHex);
+		const effectivePathId = options.pathId ?? previous?.pathId;
+		const effectiveAsyncHold = options.asyncHold ?? previous?.asyncHold;
+
+		// Persist FIRST (saveOffer is synchronous): if it throws, memory is
+		// untouched, so a fresh create is fully rolled back and a re-create
+		// keeps its previous, still-persisted entry. Half-created (live and
+		// payable now, silently gone after restart) is the worst outcome.
+		this.storage?.saveOffer?.(
+			offerIdHex,
+			encoded,
+			effectivePathId ?? null,
+			Date.now(),
+			effectiveAsyncHold ?? false
+		);
+		this.offers.set(offerIdHex, {
 			offer,
 			encoded,
 			tlvData,
-			pathId: options.pathId
+			pathId: effectivePathId,
+			asyncHold: effectiveAsyncHold
 		});
 
 		this.emit('offer:created', offer, encoded);
@@ -240,10 +451,48 @@ export class OfferManager extends EventEmitter {
 	}
 
 	/**
-	 * Remove a stored offer.
+	 * List all stored offers together with their bech32m encodings. The
+	 * encoding is what a payer needs handed to them; a listing meant for
+	 * display uses this rather than re-encoding from the offer.
+	 */
+	listOfferEntries(): Array<{ offer: IOffer; encoded: string }> {
+		return Array.from(this.offers.values()).map((e) => ({
+			offer: e.offer,
+			encoded: e.encoded
+		}));
+	}
+
+	/**
+	 * Remove a stored offer, from memory and from persistent storage.
 	 */
 	removeOffer(offerId: Buffer): boolean {
-		return this.offers.delete(offerId.toString('hex'));
+		const offerIdHex = offerId.toString('hex');
+		// Check first: deleting the row for an unknown offer and then
+		// reporting "not found" is a failure report that destroyed data.
+		if (!this.offers.has(offerIdHex)) return false;
+		this.storage?.deleteOffer?.(offerIdHex);
+		return this.offers.delete(offerIdHex);
+	}
+
+	/** Drop expired preimages, then oldest-first down to the hard cap. */
+	private pruneInvoicePreimages(): void {
+		const now = Date.now();
+		for (const [hashHex, deadline] of this.invoicePreimageDeadlines) {
+			if (now >= deadline) {
+				this.invoicePreimages.delete(hashHex);
+				this.invoicePreimageDeadlines.delete(hashHex);
+				this.invoicePathIds.delete(hashHex);
+			}
+		}
+		while (this.invoicePreimages.size >= MAX_INVOICE_PREIMAGES) {
+			const oldest = this.invoicePreimages.keys().next().value as
+				| string
+				| undefined;
+			if (oldest === undefined) break;
+			this.invoicePreimages.delete(oldest);
+			this.invoicePreimageDeadlines.delete(oldest);
+			this.invoicePathIds.delete(oldest);
+		}
 	}
 
 	/**
@@ -349,20 +598,25 @@ export class OfferManager extends EventEmitter {
 
 		this.emit('invoice:requested', request);
 
-		// Wait for invoice response
+		// Wait for invoice response. The map key is a unique per-request id
+		// (see pendingInvoiceRequests), so concurrent requests for the same
+		// offer coexist and this timer deletes exactly its own entry.
 		return new Promise<IBolt12Invoice>((resolve, reject) => {
-			const offerIdHex = offer.offerId.toString('hex');
+			const requestIdHex = (replyPathId ?? crypto.randomBytes(32)).toString(
+				'hex'
+			);
 			const timer = setTimeout(() => {
-				this.pendingInvoiceRequests.delete(offerIdHex);
+				this.pendingInvoiceRequests.delete(requestIdHex);
 				reject(new Error('Invoice request timed out'));
 			}, this.invoiceRequestTimeoutMs);
 
-			this.pendingInvoiceRequests.set(offerIdHex, {
+			this.pendingInvoiceRequests.set(requestIdHex, {
 				resolve,
 				reject,
 				timer,
 				sentRecords,
-				replyPathId
+				replyPathId,
+				offerIdHex: offer.offerId.toString('hex')
 			});
 		});
 	}
@@ -476,36 +730,64 @@ export class OfferManager extends EventEmitter {
 		// Create invoice
 		const preimage = crypto.randomBytes(32);
 		const paymentHash = crypto.createHash('sha256').update(preimage).digest();
-		const paymentSecret = crypto.randomBytes(32);
+		const paymentHashHex = paymentHash.toString('hex');
 
 		// Retain the preimage so the node can fulfill the incoming HTLC for this
 		// invoice (it never leaves the issuer — not part of the BOLT 12 invoice).
-		this.invoicePreimages.set(paymentHash.toString('hex'), preimage);
+		// Every valid invoice_request mints one of these, and requests are
+		// remote-driven: without a bound, one shared offer is a permanent
+		// memory amplification target. Entries expire with the invoice (plus
+		// grace for an HTLC already in flight at expiry) under a hard cap.
+		this.pruneInvoicePreimages();
+		this.invoicePreimages.set(paymentHashHex, preimage);
+		this.invoicePreimageDeadlines.set(
+			paymentHashHex,
+			Date.now() + INVOICE_PREIMAGE_TTL_MS
+		);
 
 		// BOLT 12: the invoice MUST include invoice_paths (one or more blinded
-		// paths to us) with exactly one blinded_payinfo per path. Reuse the
-		// offer's paths when it has them; a direct (announced-node) offer gets a
-		// minimal 1-hop path terminating at us — the payer treats the
-		// introduction node as the destination.
-		const invoicePaths =
-			matchedOffer.paths && matchedOffer.paths.length > 0
-				? matchedOffer.paths
-				: [
-						{
-							introductionNodeId: this.nodeId,
-							blindingPoint: getPublicKey(crypto.randomBytes(32)),
-							blindedHops: [
-								{ blindedNodeId: this.nodeId, encryptedData: Buffer.alloc(0) }
-							]
-						}
-				  ];
-		const invoicePayInfo = invoicePaths.map(() => ({
-			feeBaseMsat: 0,
-			feeProportionalMillionths: 0,
-			cltvExpiryDelta: 18,
-			htlcMinimumMsat: 1n,
-			htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
-		}));
+		// paths to us) with exactly one blinded_payinfo per path, and the
+		// payment is authenticated by the path's ENCRYPTED path_id — BOLT 12
+		// defines no payment_secret TLV, so a secret minted here could never
+		// reach the payer, and registering one made every issued invoice
+		// unpayable (#252). invoice_paths are ALWAYS built fresh for this
+		// invoice, never reused from the offer: offer paths exist to deliver
+		// invoice_requests, and reusing them for payment would advertise
+		// fabricated payinfo for hops with real relay fees (and a
+		// caller-supplied path we cannot see inside would leave the payment
+		// unauthenticatable). An async-hold offer gets fresh LSP hold paths
+		// with their true aggregate payinfo; anything else gets a real
+		// single-hop path terminating at us — the same shape CLN issues for a
+		// node without announced channels.
+		const invoicePathId = crypto.randomBytes(32);
+		let holdPaths: IBlindedPaymentPath[] = [];
+		if (this.offers.get(matchedOfferIdHex!)?.asyncHold) {
+			holdPaths = this.buildHoldPaymentPaths?.(invoicePathId) ?? [];
+		}
+		let invoicePaths: IBlindedPath[];
+		let invoicePayInfo: IBolt12Invoice['blindedPayInfo'];
+		if (holdPaths.length > 0) {
+			invoicePaths = holdPaths.map((p) => p.path);
+			invoicePayInfo = holdPaths.map((p) => p.payInfo);
+		} else {
+			invoicePaths = [
+				constructBlindedPath(
+					crypto.randomBytes(32),
+					[this.nodeId],
+					[{ pathId: invoicePathId }]
+				)
+			];
+			invoicePayInfo = [
+				{
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 18,
+					htlcMinimumMsat: 1n,
+					htlcMaximumMsat: 21_000_000n * 100_000_000n * 1000n
+				}
+			];
+		}
+		this.invoicePathIds.set(paymentHashHex, invoicePathId);
 
 		const invoice: IBolt12Invoice = {
 			paymentHash,
@@ -513,7 +795,6 @@ export class OfferManager extends EventEmitter {
 			description: matchedOffer.description,
 			createdAt: BigInt(Math.floor(Date.now() / 1000)),
 			relativeExpiry: 7200, // 2 hours
-			paymentSecret,
 			nodeId: this.nodeId,
 			paths: invoicePaths,
 			blindedPayInfo: invoicePayInfo
@@ -541,10 +822,12 @@ export class OfferManager extends EventEmitter {
 		}
 
 		// `invoice:issued` carries the preimage so the node can register it for
-		// settlement (the issuer side — we will RECEIVE this payment). Distinct from
-		// `invoice:received`, which also fires when we are the PAYER and hold no
-		// preimage.
-		this.emit('invoice:issued', invoice, preimage);
+		// settlement (the issuer side — we will RECEIVE this payment), and the
+		// expected path_id so the node can persist it transactionally with the
+		// preimage: receive-side authentication must never be lost while the
+		// payment stays claimable. Distinct from `invoice:received`, which also
+		// fires when we are the PAYER and hold no preimage.
+		this.emit('invoice:issued', invoice, preimage, invoicePathId);
 		this.emit('invoice:received', invoice);
 		return invoice;
 	}
@@ -556,6 +839,30 @@ export class OfferManager extends EventEmitter {
 	 */
 	getInvoicePreimage(paymentHash: Buffer): Buffer | undefined {
 		return this.invoicePreimages.get(paymentHash.toString('hex'));
+	}
+
+	/**
+	 * The path_id embedded in the blinded payment path(s) of a BOLT 12 invoice
+	 * WE issued, or undefined when the hash is not ours (or the entry aged
+	 * out). The node requires an incoming HTLC's decrypted final-hop path_id
+	 * to equal this before fulfilling — the BOLT 12 analogue of the BOLT 11
+	 * payment_secret check.
+	 */
+	getInvoicePathId(paymentHash: Buffer): Buffer | undefined {
+		return this.invoicePathIds.get(paymentHash.toString('hex'));
+	}
+
+	/**
+	 * Drop the retained issuance state (preimage, expected path_id, retention
+	 * deadline) for one issued invoice. Called by the node's issued-invoice
+	 * sweep when an expired, never-paid BOLT 12 invoice is removed; the
+	 * invoice becomes unpayable (the receive path fails closed), never
+	 * unauthenticated.
+	 */
+	removeInvoiceState(paymentHashHex: string): void {
+		this.invoicePreimages.delete(paymentHashHex);
+		this.invoicePreimageDeadlines.delete(paymentHashHex);
+		this.invoicePathIds.delete(paymentHashHex);
 	}
 
 	/**
@@ -640,6 +947,7 @@ export class OfferManager extends EventEmitter {
 		this.pendingInvoiceRequests.clear();
 		this.offers.clear();
 		this.invoicePreimages.clear();
+		this.invoicePreimageDeadlines.clear();
 		this.onionMessageManager = null;
 		this.removeAllListeners();
 	}
@@ -657,23 +965,30 @@ export class OfferManager extends EventEmitter {
 	private handleIncomingInvoice(data: Buffer, pathId?: Buffer): void {
 		const { invoice, records } = decodeInvoiceTlv(data);
 
-		// BOLT 12 reader checks (S-4.H3): the signature commits to the FULL
-		// record set (mirrored + unknown fields included), the invoice MUST
-		// carry blinded payment paths with exactly one payinfo per path, and
-		// its invreq-range fields MUST byte-match the request we sent.
-		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null => {
+		// BOLT 12 reader checks (S-4.H3), split in two. The request-independent
+		// part — the signature commits to the FULL record set (mirrored +
+		// unknown fields included), and the invoice MUST carry blinded payment
+		// paths with exactly one payinfo per path — is memoized so candidate
+		// scanning runs it once. The per-request part checks the invoice's
+		// invreq-range fields byte-match the records THAT request sent.
+		let globalReasonMemo: string | null | undefined;
+		const globalReason = (): string | null => {
+			if (globalReasonMemo !== undefined) return globalReasonMemo;
 			if (!this.verifyInvoiceSignature(invoice, records)) {
-				return 'invalid invoice signature';
-			}
-			if (!invoice.paths || invoice.paths.length === 0) {
-				return 'invoice_paths missing or empty';
-			}
-			if (
+				globalReasonMemo = 'invalid invoice signature';
+			} else if (!invoice.paths || invoice.paths.length === 0) {
+				globalReasonMemo = 'invoice_paths missing or empty';
+			} else if (
 				!invoice.blindedPayInfo ||
 				invoice.blindedPayInfo.length !== invoice.paths.length
 			) {
-				return 'invoice_blindedpay must carry one payinfo per path';
+				globalReasonMemo = 'invoice_blindedpay must carry one payinfo per path';
+			} else {
+				globalReasonMemo = null;
 			}
+			return globalReasonMemo;
+		};
+		const mirrorReason = (sentRecords?: ITlvRecord[]): string | null => {
 			if (sentRecords) {
 				for (const sent of sentRecords) {
 					if (sent.type === 240n) continue; // signature not mirrored
@@ -685,19 +1000,24 @@ export class OfferManager extends EventEmitter {
 			}
 			return null;
 		};
+		const validateAgainstSent = (sentRecords?: ITlvRecord[]): string | null =>
+			globalReason() ?? mirrorReason(sentRecords);
 
 		const settle = (
-			offerIdHex: string,
+			requestIdHex: string,
 			pending: NonNullable<
 				ReturnType<(typeof this.pendingInvoiceRequests)['get']>
 			>
 		): void => {
 			const reason = validateAgainstSent(pending.sentRecords);
 			clearTimeout(pending.timer);
-			this.pendingInvoiceRequests.delete(offerIdHex);
+			this.pendingInvoiceRequests.delete(requestIdHex);
 			if (reason) {
 				pending.reject(new Error(`Rejected BOLT 12 invoice: ${reason}`));
-				this.emit('invoice:error', { error: reason });
+				this.emit('invoice:error', {
+					error: reason,
+					matchedPendingRequest: true
+				});
 				return;
 			}
 			pending.resolve(invoice);
@@ -706,18 +1026,22 @@ export class OfferManager extends EventEmitter {
 
 		// BOLT 4: an invoice delivered over one of OUR blinded reply paths
 		// surfaces the path_id we embedded — the strongest possible binding to
-		// the request that issued it. Match on it first; a path_id that matches
+		// the request that issued it, and (by construction) exactly that
+		// request's map key, so the lookup is direct. A path_id that matches
 		// no pending request means the message did not come over a path we
-		// issued for a live request, so ignore it entirely.
+		// issued for a live request, so ignore it entirely. A validation
+		// failure here DOES reject the bound request: the invoice provably
+		// answers it, and it is invalid.
 		if (pathId) {
-			for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-				if (pending.replyPathId && pending.replyPathId.equals(pathId)) {
-					settle(offerIdHex, pending);
-					return;
-				}
+			const requestIdHex = pathId.toString('hex');
+			const pending = this.pendingInvoiceRequests.get(requestIdHex);
+			if (pending?.replyPathId?.equals(pathId)) {
+				settle(requestIdHex, pending);
+				return;
 			}
 			this.emit('invoice:error', {
-				error: 'invoice path_id matches no pending invoice_request'
+				error: 'invoice path_id matches no pending invoice_request',
+				matchedPendingRequest: false
 			});
 			return;
 		}
@@ -725,34 +1049,68 @@ export class OfferManager extends EventEmitter {
 		// No path_id: the invoice did NOT arrive over a blinded reply path we
 		// issued. A pending request that sent one (replyPathId set) must only be
 		// resolved via that path, so it is skipped here; legacy pendings created
-		// without an onion send (no reply path) keep the description/issuer match.
-		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
+		// without an onion send (no reply path) keep the description/issuer match
+		// (the offer comes from the entry's offerIdHex — the map key is the
+		// per-request id).
+		//
+		// Matching is NON-destructive across candidates: two live requests for
+		// the same offer look identical at the offer level, so an out-of-order
+		// invoice must not consume (and reject) the first compatible entry.
+		// It settles only the request whose SENT records it actually mirrors;
+		// a miss leaves every pending untouched for the invoice that does
+		// belong to it (#250). Only when some candidate matched the offer but
+		// none validated is the invoice surfaced as unmatchable — cancelling
+		// nothing.
+		let sawCompatibleOffer = false;
+		for (const [requestIdHex, pending] of this.pendingInvoiceRequests) {
 			if (pending.replyPathId) continue;
-			const offerEntry = this.offers.get(offerIdHex);
-			if (offerEntry) {
-				// Match by description and issuer
-				const descMatch = offerEntry.offer.description === invoice.description;
-				const issuerMatch =
-					!offerEntry.offer.issuerId ||
-					invoice.nodeId.equals(offerEntry.offer.issuerId);
-				if (descMatch && issuerMatch) {
-					settle(offerIdHex, pending);
-					return;
-				}
-			}
+			const offerEntry = this.offers.get(pending.offerIdHex);
+			if (!offerEntry) continue;
+			// Match by description and issuer
+			const descMatch = offerEntry.offer.description === invoice.description;
+			const issuerMatch =
+				!offerEntry.offer.issuerId ||
+				invoice.nodeId.equals(offerEntry.offer.issuerId);
+			if (!descMatch || !issuerMatch) continue;
+			sawCompatibleOffer = true;
+			if (validateAgainstSent(pending.sentRecords) !== null) continue;
+			settle(requestIdHex, pending);
+			return;
+		}
+		if (sawCompatibleOffer) {
+			this.emit('invoice:error', {
+				error:
+					'invoice matches a pending request offer but validates against none of them',
+				matchedPendingRequest: false
+			});
+			return;
 		}
 
-		// Fallback: if only one pending request (without a reply-path binding),
-		// resolve it (backward compat)
+		// A sole pending request with no reply-path binding may resolve an
+		// unbound invoice only under the explicit allowUnboundInvoiceFallback
+		// opt-in (hand-fed flows with no onion wiring). By default nothing
+		// proves the invoice answers this request, and settling would let a
+		// forged one consume it (settle rejects on validation failure), so it
+		// is surfaced without cancelling anything.
 		if (this.pendingInvoiceRequests.size === 1) {
-			const [offerIdHex, pending] = this.pendingInvoiceRequests.entries().next()
-				.value!;
+			const [requestIdHex, pending] = this.pendingInvoiceRequests
+				.entries()
+				.next().value!;
 			if (!pending.replyPathId) {
-				settle(offerIdHex, pending);
+				if (this.allowUnboundInvoiceFallback) {
+					settle(requestIdHex, pending);
+					return;
+				}
+				this.emit('invoice:error', {
+					error:
+						'unbound invoice ignored: the pending invoice_request has no reply-path binding',
+					matchedPendingRequest: false
+				});
 				return;
 			}
 			this.emit('invoice:error', {
-				error: 'invoice lacks the path_id of its pending invoice_request'
+				error: 'invoice lacks the path_id of its pending invoice_request',
+				matchedPendingRequest: false
 			});
 			return;
 		}
@@ -761,17 +1119,31 @@ export class OfferManager extends EventEmitter {
 		this.emit('invoice:received', invoice);
 	}
 
-	private handleIncomingInvoiceError(data: Buffer): void {
+	private handleIncomingInvoiceError(data: Buffer, pathId?: Buffer): void {
 		const error = decodeInvoiceErrorTlv(data);
 
-		// Reject the first pending request
-		for (const [offerIdHex, pending] of this.pendingInvoiceRequests) {
-			clearTimeout(pending.timer);
-			this.pendingInvoiceRequests.delete(offerIdHex);
-			pending.reject(new Error(`Invoice error: ${error.error}`));
-			break;
+		// invoice_error is attacker-reachable (any peer can onion-message us),
+		// so it may only cancel the request it is bound to: the issuer sends
+		// it back over OUR blinded reply path, whose decrypted recipient data
+		// surfaces the path_id we embedded for that request. An error bound to
+		// no pending request is surfaced but cancels nothing; the request
+		// keeps waiting and times out on its own timer.
+		let matchedPendingRequest = false;
+		if (pathId) {
+			// A wired request is keyed by its reply path's path_id, so the
+			// bound entry (if any) is a direct lookup.
+			const requestIdHex = pathId.toString('hex');
+			const pending = this.pendingInvoiceRequests.get(requestIdHex);
+			if (pending?.replyPathId?.equals(pathId)) {
+				clearTimeout(pending.timer);
+				this.pendingInvoiceRequests.delete(requestIdHex);
+				pending.reject(new Error(`Invoice error: ${error.error}`));
+				matchedPendingRequest = true;
+			}
 		}
 
-		this.emit('invoice:error', error);
+		// The flag lets consumers tell "my request failed" from "an unrelated
+		// error was observed" (#250); it is local telemetry, never wire data.
+		this.emit('invoice:error', { ...error, matchedPendingRequest });
 	}
 }

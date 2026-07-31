@@ -196,7 +196,7 @@ describe('Production Hardening 10 — Agent DX', () => {
 			expect(daemonSrc).to.include('decodeOfferString');
 		});
 
-		it('decodeOfferString uses imported decodeOffer', () => {
+		it('decodeOfferString uses the shared offer decoder', () => {
 			const bnSrc = fs.readFileSync(
 				path.join(__dirname, '../../src/cli/beignet-node.ts'),
 				'utf8'
@@ -206,7 +206,9 @@ describe('Production Hardening 10 — Agent DX', () => {
 				bnSrc.indexOf('decodeOfferString(offerStr'),
 				bnSrc.indexOf('createOffer(')
 			);
-			expect(method).to.include('decodeOffer(offerStr)');
+			// decodeOfferInput wraps decodeOffer, converting parse throws into
+			// a typed INVALID_OFFER so the daemon answers 400, not a 500.
+			expect(method).to.include('decodeOfferInput(offerStr)');
 		});
 	});
 

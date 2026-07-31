@@ -1569,7 +1569,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | GET | `/fees` | -- | On-chain fee trend analysis |
 | GET | `/logs` | `?category=&since=&limit=` | Query persistent action log |
 | GET | `/readiness` | -- | Mainnet readiness checklist (11 checks) |
-| GET | `/metrics` | -- | Prometheus text exposition format metrics (auth-exempt) |
+| GET | `/metrics` | readonly | Prometheus text exposition format metrics (auth-gated: reports balances; `metricsPublic: true` serves it without auth) |
 | POST | `/webhooks/register` | `{ url, events, secret? }` | Register webhook callback |
 | DELETE | `/webhooks/unregister` | `{ id }` | Remove webhook |
 | GET | `/webhooks` | -- | List registered webhooks |
@@ -1643,14 +1643,14 @@ All responses include `X-API-Version: 1` header. Non-prefixed routes continue to
 
 ### CORS
 
-Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions:
+Enable CORS with `cors: true` (allows all origins) or `cors: 'https://myapp.com'` (specific origin) in DaemonOptions. Wildcard CORS requires authentication: with `apiToken`/`apiKeys` unset, `cors: true` is refused at startup (any page the operator visits could otherwise drive the API); pass an explicit origin, configure auth, or set `insecure: true` to accept the risk.
 
 ```typescript
-startDaemon({ cors: true });    // Access-Control-Allow-Origin: *
-startDaemon({ cors: 'https://myapp.com' });  // specific origin
+startDaemon({ cors: true, apiToken: '...' });  // Access-Control-Allow-Origin: *
+startDaemon({ cors: 'https://myapp.com' });    // specific origin
 ```
 
-Handles `OPTIONS` preflight requests automatically.
+Handles `OPTIONS` preflight requests automatically (`GET, POST, DELETE, OPTIONS`).
 
 ---
 

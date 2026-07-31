@@ -326,6 +326,18 @@ Explicitly parked. Revisit each quarter or on ecosystem demand.
 - 2026-07-09 (cont.): PR #40 merged. M1 closers queued: wallet storage encryption
   wrapper + peer storage (option_provide_storage).
 - 2026-07-09 (cont.): PR #42 merged, M1 fully closed. M3 resumed: forwarding history.
+- 2026-07-24: Issue/PR triage session. All four open PRs reviewed, hardened and
+  merged: #205 (0-sat request_funds treated as no lease), #206 (P2TR wallet
+  inputs on funding paths; added fee-bump P2WPKH-only guard since the sweep
+  attach paths cannot supply BIP 341 prevouts), #207 (funding-input pledges;
+  added a selection lock closing an interleaved-selection double-spend race),
+  #208 (funding-missing watchdog + live funding watches + channel voiding).
+  New PRs from open issues: #209 merged (issue #186: funding broadcasts retained
+  and retried until confirmation, persisted across restart, rebroadcast-first on
+  funding:missing before voiding), #210 open (issue #196: peer-aware
+  /channel/funding-quote endpoint). Issue #150 updated: eclair v0.14 ships
+  taproot channels WITH splicing (interop target now exists, CLN still has no
+  taproot channels); #190 recovery-protocol tracker left open (phased work).
 - 2026-07-11: CLN update_fee desync FIXED (this PR): the commitment state
   machine applied remote update_fee (and peer HTLC updates) to commitments we
   sign at receipt instead of after revoking for the covering

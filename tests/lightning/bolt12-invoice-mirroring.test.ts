@@ -125,7 +125,11 @@ describe('S-4.H3: BOLT 12 invoice mirrors the invoice_request', function () {
 	});
 
 	it('the payer rejects an invoice that does not mirror its request', async function () {
-		const payer = new OfferManager(payerPriv);
+		// No onion wiring here: the invoice is fed by hand, so the payer must
+		// opt in to resolving it against its unbound pending request.
+		const payer = new OfferManager(payerPriv, {
+			allowUnboundInvoiceFallback: true
+		});
 		const issuer = new OfferManager(issuerPriv);
 		const { offer } = issuer.createOffer({
 			description: 'strict payer',
@@ -156,7 +160,11 @@ describe('S-4.H3: BOLT 12 invoice mirrors the invoice_request', function () {
 	});
 
 	it('the payer rejects an invoice without blinded paths', async function () {
-		const payer = new OfferManager(payerPriv);
+		// No onion wiring here: the invoice is fed by hand, so the payer must
+		// opt in to resolving it against its unbound pending request.
+		const payer = new OfferManager(payerPriv, {
+			allowUnboundInvoiceFallback: true
+		});
 		const issuer = new OfferManager(issuerPriv);
 		const { offer } = issuer.createOffer({
 			description: 'needs paths',
@@ -193,6 +201,75 @@ describe('S-4.H3: BOLT 12 invoice mirrors the invoice_request', function () {
 			rejected = e.message;
 		});
 		expect(rejected).to.match(/invoice_paths/);
+		payer.destroy();
+		issuer.destroy();
+	});
+
+	it('without the opt-in, an unbound invoice does not consume the pending request', async function () {
+		const payer = new OfferManager(payerPriv, {
+			invoiceRequestTimeoutMs: 400
+		});
+		const issuer = new OfferManager(issuerPriv);
+		const { offer } = issuer.createOffer({
+			description: 'default strict',
+			amount: 5_000n
+		});
+		const errors: string[] = [];
+		payer.on('invoice:error', (e: { error: string }) => errors.push(e.error));
+		const pending = payer.requestInvoice(offer, { amount: 5_000n });
+		pending.catch(() => {});
+
+		// A forged answer to a request the payer never sent. With the fallback
+		// off it must not consume (and thereby kill) the pending request.
+		const forged = issuer.handleInvoiceRequest(
+			makeSignedRequestTlv({ amount: 5_000n }, offer)
+		)!;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(payer as any).handleIncomingInvoice(encodeTlvStream(forged.records!));
+
+		let rejected = '';
+		await pending.catch((e: Error) => {
+			rejected = e.message;
+		});
+		expect(rejected).to.match(/timed out/);
+		expect(errors.some((e) => e.includes('unbound invoice ignored'))).to.equal(
+			true
+		);
+		payer.destroy();
+		issuer.destroy();
+	});
+
+	it('with the opt-in, a valid unbound invoice still resolves the pending request', async function () {
+		const payer = new OfferManager(payerPriv, {
+			allowUnboundInvoiceFallback: true
+		});
+		const issuer = new OfferManager(issuerPriv);
+		const { offer } = issuer.createOffer({
+			description: 'opted in',
+			amount: 5_000n
+		});
+
+		// Capture the payer's actual signed request so the issuer can answer
+		// it with a properly mirrored invoice.
+		let sentRequest: IInvoiceRequest | null = null;
+		payer.on('invoice:requested', (r: IInvoiceRequest) => {
+			sentRequest = r;
+		});
+		const pending = payer.requestInvoice(offer, { amount: 5_000n });
+		pending.catch(() => {});
+		expect(sentRequest).to.not.equal(null);
+
+		const requestTlv = encodeInvoiceRequestTlv(
+			sentRequest!,
+			encodeOfferTlv(offer)
+		);
+		const invoice = issuer.handleInvoiceRequest(requestTlv)!;
+		expect(invoice).to.not.equal(null);
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(payer as any).handleIncomingInvoice(encodeTlvStream(invoice.records!));
+
+		const resolved = await pending;
+		expect(resolved.description).to.equal('opted in');
 		payer.destroy();
 		issuer.destroy();
 	});

@@ -140,7 +140,8 @@ import {
 	AdvisorRecommendations,
 	RebalanceResult,
 	RebalanceExecutionSummary,
-	TOnchainQuote
+	TOnchainQuote,
+	TChannelFundingQuote
 } from './types';
 
 export type LogLevel = TLogLevel;
@@ -391,6 +392,45 @@ export function parseScid(scid: string): Buffer {
 		BeignetErrorCode.INVALID_PARAMS,
 		`Invalid short channel id: ${scid} (expected <block>x<txIndex>x<output> or 16-char hex)`
 	);
+}
+
+/**
+ * Decode a user-supplied BOLT 11 string. The parser throws plain Error, which
+ * the daemon scrubs to a generic 500 and logs as an unhandled server fault;
+ * a typed INVALID_INVOICE keeps the parser's message and answers 400.
+ */
+export function decodeInvoiceInput(
+	bolt11: string
+): ReturnType<typeof decodeInvoice> {
+	try {
+		return decodeInvoice(bolt11);
+	} catch (err: unknown) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_INVOICE,
+			`Invalid invoice: ${
+				err instanceof Error ? err.message : 'failed to decode'
+			}`
+		);
+	}
+}
+
+/**
+ * Decode a user-supplied BOLT 12 offer string. Same contract as
+ * decodeInvoiceInput: parse failures become a typed INVALID_OFFER (400).
+ */
+export function decodeOfferInput(
+	offerStr: string
+): ReturnType<typeof decodeOffer> {
+	try {
+		return decodeOffer(offerStr);
+	} catch (err: unknown) {
+		throw new BeignetError(
+			BeignetErrorCode.INVALID_OFFER,
+			`Invalid offer: ${
+				err instanceof Error ? err.message : 'failed to decode'
+			}`
+		);
+	}
 }
 
 /** Convert pathfinding route hops to the JSON shape used by the daemon/CLI. */
@@ -1009,9 +1049,13 @@ export class BeignetNode extends EventEmitter {
 		});
 		this.node.on('channel:voided', (data: { channelId: Buffer }) => {
 			const channelId = data.channelId.toString('hex');
-			this.log('warn', 'Channel voided — funding tx vanished before confirming', {
-				channelId
-			});
+			this.log(
+				'warn',
+				'Channel voided: funding tx vanished before confirming',
+				{
+					channelId
+				}
+			);
 			this.refreshStaticChannelBackup();
 			this.emit('channel:voided', { channelId });
 		});
@@ -1330,6 +1374,21 @@ export class BeignetNode extends EventEmitter {
 		key: K,
 		data: TMessageDataMap[K]
 	): void {
+		// Upstream's public event surface (SSE/webhooks list these names) is
+		// emitted alongside our internal onchain:* events the node manager's
+		// auto-channelization listens to.
+		const publicEvents = {
+			transactionReceived: 'transaction:received',
+			transactionConfirmed: 'transaction:confirmed',
+			transactionSent: 'transaction:sent'
+		} as const;
+		if (key in publicEvents) {
+			const tx = (data as TTransactionMessage).transaction;
+			this.emit(
+				publicEvents[key as keyof typeof publicEvents],
+				this.toOnchainTxInfo(tx)
+			);
+		}
 		switch (key) {
 			case 'transactionReceived': {
 				const tx = (data as TTransactionMessage).transaction;
@@ -2016,6 +2075,68 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	/**
+	 * Peer-aware max channel-funding quote. Decides v1 vs v2 exactly the way
+	 * openChannel does (both inits advertising option_dual_fund), then prices
+	 * the max open with the SAME arithmetic that funding path will commit:
+	 *
+	 * - v2 peer: the engine's quoteDualFundingMaxOpen (clamped rate converted
+	 *   to sat/kw, the cushioned interactive-tx weight formula, zero change).
+	 * - v1 peer, or a peer we hold no init for (peerKnown false): the
+	 *   existing sweep-based quote from the actual transaction vbytes.
+	 *
+	 * The two formulas disagree by a few sats by design, which is the whole
+	 * reason a UI cannot reconstruct this number: it must ask the daemon.
+	 * Read-only, like quoteOnchain.
+	 */
+	async quoteChannelFunding({
+		peerPubkey,
+		satsPerVbyte
+	}: {
+		peerPubkey: string;
+		satsPerVbyte?: number;
+	}): Promise<TChannelFundingQuote> {
+		if (!/^[0-9a-fA-F]{66}$/.test(peerPubkey ?? '')) {
+			throw new BeignetError(
+				BeignetErrorCode.INVALID_PARAMS,
+				'peerPubkey must be a 66-character hex pubkey'
+			);
+		}
+		const satsPerByte =
+			satsPerVbyte === undefined
+				? this.wallet.feeEstimates.normal
+				: requirePositiveFiniteNumber(satsPerVbyte, 'satsPerVbyte');
+
+		const { peerKnown, dualFund } = this.node.peerFundingInfo(peerPubkey);
+		if (dualFund) {
+			const quote = this.node.quoteDualFundingMaxOpen(satsPerByte);
+			return {
+				method: 'v2',
+				peerKnown,
+				satsPerVbyte: satsPerByte,
+				feeratePerKw: quote.feeratePerKw,
+				fundingSatoshis: Number(quote.fundingSatoshis),
+				feeSats: Number(quote.feeSats),
+				spendableSats: Number(quote.spendableSats),
+				inputCount: quote.inputCount
+			};
+		}
+		const sweep = await this.quoteOnchain({
+			satsPerVbyte: satsPerByte,
+			max: true,
+			channelFunding: true
+		});
+		return {
+			method: 'v1',
+			peerKnown,
+			satsPerVbyte: sweep.satsPerVbyte,
+			fundingSatoshis: sweep.maxSendSats ?? 0,
+			feeSats: sweep.feeSats,
+			vsize: sweep.vsize,
+			maxSatsPerVbyte: sweep.maxSatsPerVbyte
+		};
+	}
+
+	/**
 	 * Sweep the entire spendable on-chain balance to one address. The output
 	 * value is balance minus fee; the wallet rejects rates where the fee would
 	 * consume the whole balance.
@@ -2299,6 +2420,7 @@ export class BeignetNode extends EventEmitter {
 		}
 	}
 
+
 	// IFormattedTransaction stores value/fee in BTC (see wallet formatting),
 	// so both need conversion to satisfy the *Sats field names.
 	private toOnchainTxInfo(tx: IFormattedTransaction): OnchainTxInfo {
@@ -2557,6 +2679,29 @@ export class BeignetNode extends EventEmitter {
 		max = false,
 		trusted = false
 	): ChannelInfo {
+		// Guard before BigInt(): a fractional amount throws an uncaught
+		// RangeError, and a string amount reaches the spend-limit math where
+		// + concatenates instead of adding.
+		if (typeof amountSats !== 'number' || !Number.isSafeInteger(amountSats)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'amountSats must be an integer number of satoshis'
+			);
+		}
+		if (amountSats < 0) {
+			throw new BeignetError('INVALID_PARAMS', 'amountSats must be >= 0');
+		}
+		if (
+			pushSats !== undefined &&
+			(typeof pushSats !== 'number' ||
+				!Number.isSafeInteger(pushSats) ||
+				pushSats < 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'pushSats must be a non-negative integer number of satoshis'
+			);
+		}
 		const fundingSatoshis = BigInt(amountSats);
 		const pushMsat =
 			pushSats !== undefined ? BigInt(pushSats) * 1000n : undefined;
@@ -2871,6 +3016,16 @@ export class BeignetNode extends EventEmitter {
 			capacitySats: Number(ch.fundingSatoshis),
 			isAnchor: isAnchorChannel(ch.channelType ?? null)
 		};
+		// What the connected peer's init negotiated, read rather than guessed:
+		// a client deciding whether to offer splice controls has no other way
+		// to know, and reconstructing feature bits client-side is exactly the
+		// kind of daemon arithmetic the UI is not supposed to redo. Omitted
+		// when there is no init to read (peer disconnected), which a client
+		// should treat as "offer it and let the daemon answer".
+		if (peerPubkey) {
+			const splice = this.node.peerSupportsSplicing(peerPubkey);
+			if (splice !== null) info.peerSupportsSplicing = splice;
+		}
 		if (ch.fundingTxid) info.fundingTxid = ch.fundingTxid;
 		if (ch.fundingOutputIndex !== undefined) {
 			info.fundingOutputIndex = ch.fundingOutputIndex;
@@ -3105,7 +3260,7 @@ export class BeignetNode extends EventEmitter {
 	}
 
 	decodeInvoice(bolt11: string): DecodedInvoice {
-		const inv = decodeInvoice(bolt11);
+		const inv = decodeInvoiceInput(bolt11);
 		const result: DecodedInvoice = {
 			network: inv.network,
 			timestamp: inv.timestamp,
@@ -3505,7 +3660,7 @@ export class BeignetNode extends EventEmitter {
 	): Promise<PaymentInfo> {
 		this._checkDraining();
 		// Decode to get paymentHash for event matching
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 
 		// Per-payment and daily spending limit checks
@@ -3670,7 +3825,7 @@ export class BeignetNode extends EventEmitter {
 	): Promise<RetryPaymentResult> {
 		const maxRetries = opts.maxRetries ?? 3;
 		const backoffMs = opts.backoffMs ?? 2000;
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const paymentHashHex = decoded.paymentHash.toString('hex');
 		let lastError: BeignetError | undefined;
 
@@ -3789,7 +3944,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		metadata?: Record<string, string>
 	): { paymentHash: string; status: 'PENDING' } {
-		const decoded = decodeInvoice(bolt11);
+		const decoded = decodeInvoiceInput(bolt11);
 		const maxFeeMsat =
 			maxFeeSats !== undefined ? BigInt(maxFeeSats) * 1000n : undefined;
 		const amountMsat =
@@ -4417,7 +4572,7 @@ export class BeignetNode extends EventEmitter {
 	// ─────────────── BOLT 12 Offers ───────────────
 
 	decodeOfferString(offerStr: string): OfferInfo {
-		const offer = decodeOffer(offerStr);
+		const offer = decodeOfferInput(offerStr);
 		return this.toOfferInfo(offer, offerStr);
 	}
 
@@ -4425,22 +4580,70 @@ export class BeignetNode extends EventEmitter {
 		description: string;
 		amountSats?: number;
 		issuer?: string;
+		expirySecs?: number;
 	}): OfferInfo {
+		if (
+			options.amountSats !== undefined &&
+			(typeof options.amountSats !== 'number' ||
+				!Number.isSafeInteger(options.amountSats) ||
+				options.amountSats < 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'amountSats must be a non-negative integer number of satoshis'
+			);
+		}
+		if (
+			options.expirySecs !== undefined &&
+			(typeof options.expirySecs !== 'number' ||
+				!Number.isSafeInteger(options.expirySecs) ||
+				options.expirySecs <= 0)
+		) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'expirySecs must be a positive integer number of seconds'
+			);
+		}
 		const amountMsat =
 			options.amountSats !== undefined
 				? BigInt(options.amountSats) * 1000n
 				: undefined;
+		// Sum in bigint: expirySecs alone is a safe integer, but the sum with
+		// now can exceed 2^53 and round before a number-based conversion.
+		const absoluteExpiry =
+			options.expirySecs !== undefined
+				? BigInt(Math.floor(Date.now() / 1000)) + BigInt(options.expirySecs)
+				: undefined;
 		const { offer, encoded } = this.node.createOffer({
 			description: options.description,
 			amount: amountMsat,
-			issuer: options.issuer
+			issuer: options.issuer,
+			absoluteExpiry
 		});
 		return this.toOfferInfo(offer, encoded);
 	}
 
+	/**
+	 * Remove a stored offer by its hex id, from memory and storage. Returns
+	 * false when no such offer exists.
+	 */
+	removeOffer(offerId: string): boolean {
+		if (!/^[0-9a-f]{64}$/i.test(offerId)) {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				'offerId must be 64 hex characters'
+			);
+		}
+		return this.node.getOfferManager().removeOffer(Buffer.from(offerId, 'hex'));
+	}
+
 	listOffers(): OfferInfo[] {
 		const mgr = this.node.getOfferManager();
-		return mgr.listOffers().map((offer) => this.toOfferInfo(offer));
+		// The encoding rides along: it is the string a payer needs, and
+		// without it a listing can only show the offer id.
+		return mgr
+			.listOfferEntries()
+			.map(({ offer, encoded }) => this.toOfferInfo(offer, encoded));
 	}
 
 	async payOffer(
@@ -4448,7 +4651,7 @@ export class BeignetNode extends EventEmitter {
 		amountSats?: number,
 		timeoutMs = 60_000
 	): Promise<PaymentInfo> {
-		const offer = decodeOffer(offerStr);
+		const offer = decodeOfferInput(offerStr);
 
 		// Request invoice from the offer
 		const requestOptions =

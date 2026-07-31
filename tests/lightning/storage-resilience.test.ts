@@ -63,6 +63,8 @@ function makeThrowingStorage(): IStorageBackend {
 		savePreimage: throwFn,
 		loadPreimage: () => null,
 		loadAllPreimages: () => [],
+		deletePreimage: (): void => {},
+		deleteInvoicePathId: (): void => {},
 		savePaymentSecret: throwFn,
 		loadAllPaymentSecrets: () => [],
 		deletePaymentSecret: throwFn,
@@ -234,7 +236,7 @@ describe('Storage Failure Resilience', () => {
 		node.createInvoice({ amountMsat: 1000n, description: 'test' });
 
 		// Verify error message includes operation name
-		expect(errors.some((m) => m.includes('saveInvoiceData'))).to.be.true;
+		expect(errors.some((m) => m.includes('persistInvoiceRecords'))).to.be.true;
 		expect(errors.some((m) => m.includes('disk full'))).to.be.true;
 
 		node.destroy();

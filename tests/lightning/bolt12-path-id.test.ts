@@ -16,6 +16,13 @@ import {
 	TLV_INVOICE_REQUEST,
 	TLV_INVOICE
 } from '../../src/lightning/offer/offer-manager';
+import {
+	encodeInvoiceErrorTlv,
+	encodeOfferTlv,
+	encodeInvoiceRequestTlv,
+	IInvoiceRequest
+} from '../../src/lightning/offer';
+import { encodeTlvStream } from '../../src/lightning/message/tlv';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { constructBlindedPath } from '../../src/lightning/onion/blinded-path';
 
@@ -230,6 +237,315 @@ describe('BOLT 12 path_id verification', function () {
 			).to.not.be.null;
 		} finally {
 			destroyParties(parties);
+		}
+	});
+});
+
+describe('BOLT 12 invoice_error binding', function () {
+	it('a real invoice_error returning over the reply path rejects the bound request (E2E)', async function () {
+		const parties = setupParties();
+		const { payer, issuer } = parties;
+		try {
+			// An offer the wired issuer never created: same issuer key, so the
+			// invreq routes to it, but the offerId is unknown there and it
+			// answers with an invoice_error over our blinded reply path.
+			const detached = new OfferManager(issuer.privkey);
+			const { offer } = detached.createOffer({
+				description: 'nobody home',
+				amount: 1000n
+			});
+			detached.destroy();
+
+			const outcome = await payer.mgr.requestInvoice(offer).catch((e) => e);
+			expect(outcome).to.be.instanceOf(Error);
+			expect((outcome as Error).message).to.match(
+				/Invoice error: Unknown offer/
+			);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('an invoice_error bound to no pending request cancels nothing', async function () {
+		const parties = setupParties(400);
+		const { payer, issuer } = parties;
+		try {
+			// Two pending requests over a dead wire.
+			payer.omm.setSendFunction(() => {});
+			const { offer: offerA } = issuer.mgr.createOffer({
+				description: 'victim A',
+				amount: 1000n
+			});
+			const { offer: offerB } = issuer.mgr.createOffer({
+				description: 'victim B',
+				amount: 2000n
+			});
+			const errors: string[] = [];
+			payer.mgr.on('invoice:error', (e: { error: string }) =>
+				errors.push(e.error)
+			);
+			const pendingA = payer.mgr.requestInvoice(offerA).catch((e) => e);
+			const pendingB = payer.mgr.requestInvoice(offerB).catch((e) => e);
+
+			// An attacker who can onion-message us delivers an invoice_error
+			// bound to a path_id we never issued. It must not cancel either
+			// pending request.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'go away' }),
+				crypto.randomBytes(32)
+			);
+
+			const [outcomeA, outcomeB] = await Promise.all([pendingA, pendingB]);
+			expect((outcomeA as Error).message).to.match(/timed out/);
+			expect((outcomeB as Error).message).to.match(/timed out/);
+			// Surfaced for observability, without cancelling anything.
+			expect(errors.some((e) => e.includes('go away'))).to.be.true;
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('a pathless invoice_error cancels nothing', async function () {
+		const parties = setupParties(400);
+		const { payer, issuer } = parties;
+		try {
+			payer.omm.setSendFunction(() => {});
+			const { offer } = issuer.mgr.createOffer({
+				description: 'pathless error target',
+				amount: 1000n
+			});
+			const pending = payer.mgr.requestInvoice(offer).catch((e) => e);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'unbound' })
+			);
+
+			const outcome = await pending;
+			expect((outcome as Error).message).to.match(/timed out/);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('an invoice_error bound to the second request rejects only that one', async function () {
+		const parties = setupParties(400);
+		const { payer, issuer } = parties;
+		try {
+			payer.omm.setSendFunction(() => {});
+			const { offer: offerA } = issuer.mgr.createOffer({
+				description: 'kept',
+				amount: 1000n
+			});
+			const { offer: offerB } = issuer.mgr.createOffer({
+				description: 'errored',
+				amount: 2000n
+			});
+			const pendingA = payer.mgr.requestInvoice(offerA).catch((e) => e);
+			const pendingB = payer.mgr.requestInvoice(offerB).catch((e) => e);
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
+				string,
+				{ replyPathId?: Buffer; offerIdHex: string }
+			>;
+			// The map is keyed by per-request id (#250), so find B's entry by
+			// the offer recorded on it.
+			const boundPathId = [...pendingMap.values()].find(
+				(p) => p.offerIdHex === offerB.offerId.toString('hex')
+			)!.replyPathId!;
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'amount too low' }),
+				boundPathId
+			);
+
+			const [outcomeA, outcomeB] = await Promise.all([pendingA, pendingB]);
+			expect((outcomeA as Error).message).to.match(/timed out/);
+			expect((outcomeB as Error).message).to.match(
+				/Invoice error: amount too low/
+			);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('invoice:error carries matchedPendingRequest telemetry', async function () {
+		const parties = setupParties(400);
+		const { payer, issuer } = parties;
+		try {
+			payer.omm.setSendFunction(() => {});
+			const { offer } = issuer.mgr.createOffer({
+				description: 'telemetry target',
+				amount: 1000n
+			});
+			const events: Array<{ error: string; matchedPendingRequest?: boolean }> =
+				[];
+			payer.mgr.on(
+				'invoice:error',
+				(e: { error: string; matchedPendingRequest?: boolean }) =>
+					events.push(e)
+			);
+			const pending = payer.mgr.requestInvoice(offer).catch((e) => e);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
+				string,
+				{ replyPathId?: Buffer }
+			>;
+			const boundPathId = [...pendingMap.values()][0].replyPathId!;
+
+			// Unbound error first: surfaced with matchedPendingRequest false,
+			// cancels nothing.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'unbound noise' }),
+				crypto.randomBytes(32)
+			);
+			// Bound error second: rejects the request, flagged true.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(payer.mgr as any).handleIncomingInvoiceError(
+				encodeInvoiceErrorTlv({ error: 'bound rejection' }),
+				boundPathId
+			);
+
+			const outcome = await pending;
+			expect((outcome as Error).message).to.match(
+				/Invoice error: bound rejection/
+			);
+			const unbound = events.find((e) => e.error === 'unbound noise');
+			const bound = events.find((e) => e.error === 'bound rejection');
+			expect(unbound?.matchedPendingRequest, 'unbound flagged false').to.equal(
+				false
+			);
+			expect(bound?.matchedPendingRequest, 'bound flagged true').to.equal(true);
+		} finally {
+			destroyParties(parties);
+		}
+	});
+});
+
+describe('BOLT 12 concurrent invoice requests for the SAME offer (#250)', function () {
+	it('two concurrent requests coexist and both resolve (E2E)', async function () {
+		const parties = setupParties();
+		const { payer, issuer } = parties;
+		try {
+			// One reusable offer, two live requests: keying the pending map by
+			// offer id made the second overwrite the first, so the first could
+			// only time out.
+			const { offer } = issuer.mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+			const [invoiceA, invoiceB] = await Promise.all([
+				payer.mgr.requestInvoice(offer),
+				payer.mgr.requestInvoice(offer)
+			]);
+			expect(invoiceA.description).to.equal('tip jar');
+			expect(invoiceB.description).to.equal('tip jar');
+			// Two distinct invoices (the issuer mints a fresh preimage per
+			// invoice_request), each resolving its own request.
+			expect(invoiceA.paymentHash.equals(invoiceB.paymentHash)).to.be.false;
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it("a timed-out request's timer evicts only its own entry", async function () {
+		const parties = setupParties(500);
+		const { payer, issuer } = parties;
+		try {
+			const { offer } = issuer.mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+
+			// Request A's invreq is dropped (it will time out); request B's is
+			// HELD and delivered only after A's timeout fires. Before the fix,
+			// A's stale timer deleted B's map entry (same offer-id key), so
+			// the invoice arriving over B's reply path matched nothing.
+			let heldDelivery: (() => void) | null = null;
+			let sendCount = 0;
+			payer.omm.setSendFunction((peer, _type, payload) => {
+				sendCount++;
+				if (sendCount === 1) return; // drop A's invoice_request
+				heldDelivery = (): void => {
+					issuer.omm.handleMessage(payer.pubkey.toString('hex'), payload);
+				};
+			});
+
+			const pendingA = payer.mgr.requestInvoice(offer).catch((e) => e);
+			// Stagger B so its own deadline is comfortably after A's.
+			await new Promise((r) => setTimeout(r, 250));
+			const pendingB = payer.mgr.requestInvoice(offer);
+
+			const outcomeA = await pendingA;
+			expect((outcomeA as Error).message).to.match(/timed out/);
+
+			// B's entry survived A's timeout...
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const pendingMap = (payer.mgr as any).pendingInvoiceRequests as Map<
+				string,
+				unknown
+			>;
+			expect(pendingMap.size, 'B still pending after A timed out').to.equal(1);
+
+			// ...and B still resolves once its invoice_request goes through.
+			expect(heldDelivery, 'B sent an invoice_request').to.not.be.null;
+			heldDelivery!();
+			const invoiceB = await pendingB;
+			expect(invoiceB.description).to.equal('tip jar');
+		} finally {
+			destroyParties(parties);
+		}
+	});
+
+	it('pathless requests: out-of-order invoices settle their own request (non-destructive matching)', async function () {
+		// No onion manager: requests carry no reply path, so matching falls to
+		// the legacy description/issuer scan. Two live requests for the same
+		// offer are indistinguishable at the offer level; delivery order must
+		// not decide which one survives — the invoice may only settle the
+		// request whose sent records it mirrors, without consuming any other.
+		const { privkey } = generateKeyPair();
+		const mgr = new OfferManager(privkey);
+		try {
+			const { offer } = mgr.createOffer({
+				description: 'tip jar',
+				amount: 1000n
+			});
+			const captured: IInvoiceRequest[] = [];
+			mgr.on('invoice:requested', (r: IInvoiceRequest) => captured.push(r));
+
+			const pendingA = mgr.requestInvoice(offer);
+			const pendingB = mgr.requestInvoice(offer);
+			expect(captured).to.have.length(2);
+
+			// The same manager is the issuer (the offer is its own), so it can
+			// mint a valid mirrored invoice answering each request.
+			const offerTlv = encodeOfferTlv(offer);
+			const invoiceA = mgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(captured[0], offerTlv)
+			)!;
+			const invoiceB = mgr.handleInvoiceRequest(
+				encodeInvoiceRequestTlv(captured[1], offerTlv)
+			)!;
+			expect(invoiceA, 'invoice for request A issued').to.not.be.null;
+			expect(invoiceB, 'invoice for request B issued').to.not.be.null;
+
+			// Deliver B first, then A: reversed relative to request order.
+			// Destructive first-compatible matching would validate invoice B
+			// against request A's records, reject A, and discard the invoice.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(mgr as any).handleIncomingInvoice(encodeTlvStream(invoiceB.records!));
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(mgr as any).handleIncomingInvoice(encodeTlvStream(invoiceA.records!));
+
+			const [resolvedA, resolvedB] = await Promise.all([pendingA, pendingB]);
+			expect(resolvedA.paymentHash.equals(invoiceA.paymentHash)).to.be.true;
+			expect(resolvedB.paymentHash.equals(invoiceB.paymentHash)).to.be.true;
+		} finally {
+			mgr.destroy();
 		}
 	});
 });

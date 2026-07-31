@@ -3,7 +3,10 @@
  */
 
 import { expect } from 'chai';
-import { HttpRateLimiter } from '../../src/cli/http-rate-limiter';
+import {
+	HttpRateLimiter,
+	clientKeyForRequest
+} from '../../src/cli/http-rate-limiter';
 import { BeignetErrorCode } from '../../src/cli/errors';
 
 describe('HttpRateLimiter', () => {
@@ -108,5 +111,69 @@ describe('HttpRateLimiter', () => {
 		expect(allowed).to.equal(10);
 		expect(blocked).to.equal(5);
 		limiter.destroy();
+	});
+});
+
+describe('clientKeyForRequest', () => {
+	it('keys on the peer address when no trusted proxies are configured', () => {
+		expect(clientKeyForRequest('10.0.0.5', '1.2.3.4')).to.equal('10.0.0.5');
+		expect(clientKeyForRequest('10.0.0.5', '1.2.3.4', [])).to.equal('10.0.0.5');
+	});
+
+	it('falls back to "unknown" without a remote address', () => {
+		expect(clientKeyForRequest(undefined, undefined)).to.equal('unknown');
+	});
+
+	it('ignores X-Forwarded-For from an untrusted peer', () => {
+		expect(clientKeyForRequest('10.0.0.5', '1.2.3.4', ['127.0.0.1'])).to.equal(
+			'10.0.0.5'
+		);
+	});
+
+	it('keys on the forwarded client when the peer is a trusted proxy', () => {
+		expect(clientKeyForRequest('127.0.0.1', '1.2.3.4', ['127.0.0.1'])).to.equal(
+			'1.2.3.4'
+		);
+	});
+
+	it('walks past trusted hops to the rightmost untrusted entry', () => {
+		// Client-controlled fakes sit leftmost and must never be consulted.
+		expect(
+			clientKeyForRequest('127.0.0.1', 'fake1, fake2, 9.9.9.9, 10.0.0.2', [
+				'127.0.0.1',
+				'10.0.0.2'
+			])
+		).to.equal('9.9.9.9');
+	});
+
+	it('keys on the proxy when the header is missing or every hop is trusted', () => {
+		expect(clientKeyForRequest('127.0.0.1', undefined, ['127.0.0.1'])).to.equal(
+			'127.0.0.1'
+		);
+		expect(clientKeyForRequest('127.0.0.1', '', ['127.0.0.1'])).to.equal(
+			'127.0.0.1'
+		);
+		expect(
+			clientKeyForRequest('127.0.0.1', '10.0.0.2', ['127.0.0.1', '10.0.0.2'])
+		).to.equal('127.0.0.1');
+	});
+
+	it('normalizes IPv4-mapped IPv6 socket addresses against configured IPs', () => {
+		expect(
+			clientKeyForRequest('::ffff:127.0.0.1', '1.2.3.4', ['127.0.0.1'])
+		).to.equal('1.2.3.4');
+		expect(
+			clientKeyForRequest('127.0.0.1', '::ffff:1.2.3.4', ['127.0.0.1'])
+		).to.equal('1.2.3.4');
+	});
+
+	it('joins repeated header instances before parsing', () => {
+		expect(
+			clientKeyForRequest(
+				'127.0.0.1',
+				['1.2.3.4', '10.0.0.2'],
+				['127.0.0.1', '10.0.0.2']
+			)
+		).to.equal('1.2.3.4');
 	});
 });

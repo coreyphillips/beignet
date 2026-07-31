@@ -4,6 +4,7 @@ Replicated, cryptographically versioned state continuity for Lightning channels,
 
 Status: proposed, not started
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
+Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -266,6 +267,13 @@ New tables: `recovery_frames(sequence PRIMARY KEY, writer_epoch, frame_hash, pre
 
 Deterministic reconstruction: `reconstructFromFrames(snapshot, deltas)` rebuilds every safety-critical table byte-identically. This must be property-tested (section 10).
 
+Ordering decision (revision 3): the journal keeps a single node-wide sequence. Per-channel journals were considered and rejected for v1: a forward atomically links an incoming HTLC on one channel to an outgoing HTLC on another (5.1), so partitioned journals would need cross-journal transaction records, and reconstruction would become a partial-order merge instead of a linear replay. The cost of the single sequence is potential head-of-line coupling: guardians enforce sequence continuity (5.5), so frame N+1 cannot be accepted before frame N. Two requirements keep that coupling from becoming per-frame latency:
+
+- Appends are pipelined. The writer streams frames to each guardian in sequence order without waiting for the previous receipt.
+- Receipts are cumulative. A receipt for head sequence S certifies every frame at or below S in that epoch, so one receipt can release many pending barriers at once.
+
+With those two rules, a slow receipt for channel A's frame N does not add a round trip to channel B's frame N+1; the receipt covering N+1 satisfies both barriers. The residual coupling is real and documented: in quorum mode, when the quorum is genuinely unreachable, every SafetyCritical barrier on the node stalls, whatever the channel. That is inherent to quorum durability, not to the ordering choice; async-remote and local modes have no barrier and no cross-channel stall. If profiling under load ever shows barrier convoys beyond this, the revisit path is per-channel journals plus a node epoch journal with cross-journal forward records, and the frame format's sequence field would become a (stream, sequence) pair; the v1 format does not build this.
+
 ### 5.4 Recovery Capsule over peer_storage (Phase 3)
 
 Do not put full snapshots in peer_storage by default. BOLT 1 limits the blob to 65531 bytes, stores only the latest blob, permits providers to rate-limit persistence (beignet's own server side already enforces 60 seconds), and explicitly warns not to expect the latest blob back. So peer_storage carries a capsule, not the journal:
@@ -345,6 +353,7 @@ Guardian invariants (enforced server-side):
 accept PUT_STATE iff:
   epoch == current epoch for nodeId
   writerPublicKey == the writer bound to that epoch
+  writerSignature verifies over the record under writerPublicKey
   sequence == stored sequence + 1
   previousHash == stored frameHash
 reject everything else, including any write from a superseded epoch
@@ -365,7 +374,40 @@ concurrently with a takeover, and the two sides would disagree about
 the final head of the superseded epoch.
 ```
 
-Verbs: `PUT_STATE`, `GET_STATE`, `GET_HEAD`, `ACQUIRE_EPOCH`. Transport: either a dedicated authenticated protocol or BOLT 8 custom messages to a guardian node; decide during Phase 4 design review (open question 11.1). Whichever transport is chosen, it must preserve the per-node linearization above.
+Acceptance is record-level, not connection-level: a record is valid because its writer signature, epoch binding, and chain position verify, not because of who delivered it. Transport authentication exists for anti-DoS and privacy, never as a substitute for record verification. This is what makes backfill by a restore device possible (below) after the original writer's ephemeral key is gone.
+
+Guardian durability invariants (revision 3). Crash-fault tolerant means a crashed guardian retains every acknowledged receipt, head, and epoch after restart:
+
+```text
+a guardian makes the record, the updated head, and the epoch state
+durable (fsync or equivalent) BEFORE issuing a GuardianReceipt or a
+TakeoverCertificate
+
+a guardian restart never loses an acknowledged record, head, epoch,
+or issued receipt
+
+a guardian that cannot prove its store is intact (corruption detected,
+restored from its own backup, missing epoch state) refuses PUT_STATE
+and ACQUIRE_EPOCH until repaired through SYNC_RECORD and SYNC_EPOCH;
+it may keep serving GET_HEAD and GET_STATE with an explicit
+possibly-stale flag
+
+receipts are cumulative: a receipt for head sequence S certifies every
+frame at or below S in that epoch
+
+guardians persist the receipts and takeover certificates they issue,
+and GET_HEAD returns the current head together with the takeover
+certificates the guardian knows for prior epochs
+```
+
+Backfill and epoch synchronization (revision 3). Two verbs let anyone holding valid artifacts repair a lagging guardian; both are needed because the superseded writer's private epoch key dies with the lost device:
+
+- `SYNC_RECORD(record)`: relays an already-signed record to a guardian that missed it. The guardian applies the normal PUT_STATE acceptance rules (writer signature, epoch binding, sequence continuity from its own stored head) and appends. The submitter is not required to be the writer; records are self-authenticating.
+- `SYNC_EPOCH(certificates)`: presents a quorum set of `TakeoverCertificate`s to a guardian that missed a takeover. The guardian verifies the threshold of guardian signatures, adopts the new epoch and writer key, fixes the superseded epoch's final head at `takeoverHead`, and discards any stored frames of the superseded epoch above `takeoverHead`. Discarding is safe in quorum mode: a frame above the certified final head reached at most `required - 1` receipts, so the wire message depending on it was never released. In async-remote mode such a frame may have escaped to the wire; that is the already-documented async fencing window (5.6), and the discarded tail is exactly what the `channel_reestablish` safety net exists for.
+
+A threshold bundle of receipts for one head (a quorum certificate) is evidence that the head was committed. In the v1 crash-fault model it is used for restore diagnostics only; record acceptance rests on writer signatures and chain continuity. If the threat model is ever upgraded toward Byzantine tolerance, SYNC_RECORD and SYNC_EPOCH acceptance must additionally require quorum certificates, and the quorum geometry changes per the threat model note below.
+
+Verbs: `PUT_STATE`, `GET_STATE`, `GET_HEAD`, `ACQUIRE_EPOCH`, `SYNC_RECORD`, `SYNC_EPOCH`. Transport: either a dedicated authenticated protocol or BOLT 8 custom messages to a guardian node; decide during Phase 4 design review (open question 11.1). Whichever transport is chosen, it must preserve the per-node linearization above.
 
 The signed `RecoveryHead` is the anti-rollback anchor missing from a bare hash chain: a restoring device fetches heads from the quorum and refuses any replica whose tip is behind the highest quorum-certified head.
 
@@ -440,6 +482,43 @@ QUARANTINE: connect peers, send ONLY channel_reestablish
 per channel, classify the reestablish outcome
 ```
 
+Head reconciliation and stale-guardian repair (revision 3). "Reconcile the highest quorum-consistent head" is an algorithm, not a hope:
+
+```text
+1. read heads from all reachable guardians; proceed only when at least
+   `required` (default 2) respond. Any commit quorum intersects any
+   read set of that size, so the highest committed head is always
+   visible among the responses.
+
+2. adopt the highest head whose writer signature verifies, and when
+   epochs differ, the highest epoch backed by a quorum of takeover
+   certificates. Higher-than-committed is safe to adopt: a frame that
+   never reached quorum is still a state the writer produced, its
+   outbox rows are pending_send, and reestablish reconciles it with
+   the peer. Adopting anything lower than a committed head is never
+   safe.
+
+3. repair lagging guardians: replay missing frames with SYNC_RECORD
+   (fetched from an up-to-date guardian) and missed takeovers with
+   SYNC_EPOCH, until at least `required` guardians share the adopted
+   head.
+
+4. issue ACQUIRE_EPOCH with the now-common head as the CAS guard.
+
+5. fewer than `required` reachable guardians: refuse the Tier 3
+   takeover. Without a quorum there is no fencing and no recency
+   proof. The operator waits, or falls back to the SCB/DLP path, or
+   uses the explicitly-labeled escape hatch (below), which must state
+   that it cannot fence the old writer.
+
+6. two distinct records at the same (epoch, sequence), or conflicting
+   takeover certificates for one epoch: outside the crash-fault model
+   (a Byzantine writer or guardian). Halt the restore, surface both
+   artifacts to the operator, take no channel action.
+```
+
+Worked example, the divergent-head case from the revision 3 design review. Guardians G1, G2, G3, quorum 2-of-3. Frame N was committed with receipts from G1 and G2; G3 was offline at N-1. The device dies; at restore time G1 is unreachable. The restore device reads G2 (head N) and G3 (head N-1): read set of 2 is met, N is adopted (highest valid head), N is replayed to G3 with SYNC_RECORD, and ACQUIRE_EPOCH(expectedHead = N) then succeeds on both G2 and G3. Without SYNC_RECORD the CAS could never assemble a quorum: G3 would reject expectedHead N, and G2 would reject expectedHead N-1 as a rollback. Durability 2-of-3 therefore does not mean "the exact two guardians that acked the last frame must both be reachable"; it means any `required`-sized read set plus repair.
+
 Fence before restore, never the reverse. If reconstruction happened before the takeover, a still-live old device could certify one more state between the restoring device's fetch and its epoch acquisition. The restored node would then hold a stale head while believing it is current. Quarantine keeps such a node from transacting, but a node that believes it is current may later make a unilateral force-close decision with what is actually a revoked commitment if the peer stays unreachable. With the CAS takeover first, the superseded epoch's head is immutable before any state is downloaded, so what the new device reconstructs is provably the final certified state of the old epoch.
 
 Per-channel recovery status, richer than a binary exact/stale:
@@ -491,7 +570,7 @@ Implementation note: rather than sprinkling barrier calls through `channel.ts`, 
 
 ### 5.9 The safety transition matrix (the implementation spec)
 
-Before writing Phase 1 code, produce `docs/RECOVERY-TRANSITION-MATRIX.md` enumerating every site that sends or receives `commitment_signed`, `revoke_and_ack`, `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`, `update_fail_malformed_htlc`, `channel_reestablish`, and splice messages, and for each: what must be atomically persisted, at what criticality, before which wire message. Starting anchor list (verified, re-check lines):
+Before writing Phase 1 code, produce `docs/RECOVERY-TRANSITION-MATRIX.md` enumerating every site that sends or receives `commitment_signed`, `revoke_and_ack`, `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`, `update_fail_malformed_htlc`, `channel_reestablish`, and splice messages, and for each: what must be atomically persisted, at what criticality, before which wire message. The matrix must also classify every ephemeral signing session and transient state item in 5.10 with one of the four dispositions defined there. Starting anchor list (verified, re-check lines):
 
 | Site | Location | Today | Required transition |
 |---|---|---|---|
@@ -505,6 +584,33 @@ Before writing Phase 1 code, produce `docs/RECOVERY-TRANSITION-MATRIX.md` enumer
 | reestablish retransmit decision | same, uses lastSentWasRevoke | in-memory + persisted flags | outbox supplies exact retransmission bytes |
 | splice transitions | `channel-manager.ts` handleSpliceMsg/Ack/Locked (~3391-3437), `channel.ts` _handleReestablishSplice (~5299) | persist via action order | SafetyCritical per irreversible splice step |
 | channel restore | `lightning-node.ts` recoverFromStaticChannelBackup (~2468-2589) | existing SCB path | becomes the LocalDataLoss fallback branch |
+
+### 5.10 Ephemeral signing sessions and transient state (revision 3)
+
+The single invariant, from which everything in this section follows: a restored signer must never use a secret nonce to sign different material than the nonce was originally bound to. Every ephemeral signing session and every piece of transient state gets exactly one of four dispositions, recorded per item in the transition matrix (5.9):
+
+```text
+D1 persist-before-emit   the session state is journaled in the same
+                         transition as the message that exposes it
+                         (or is deterministically re-derivable from
+                         state that is)
+D2 retransmit-exact      the session is NOT restored; the outbox (5.2)
+                         serves the exact prior bytes, so no secret is
+                         ever reused on new material
+D3 abandon-and-restart   the session dies with the process by design
+                         and restarts with fresh randomness after
+                         reestablish
+D4 force-close           safe continuation cannot be demonstrated
+```
+
+Verified classifications as of 0.7.5 (re-verify before Phase 1):
+
+- Taproot verification nonces (`localNonce` / `localNextNonce` in `channel-state.ts` around lines 444-464): deterministic per commitment height from the persisted per-commitment seed (`_deriveVerificationNonce` in `channel.ts` around line 798), re-derived identically on restart, each signs exactly one commitment once. D1 by determinism: no extra journaling needed beyond the channel state the derivation reads, which already rides in `channel_state` mutations.
+- Commitment co-signing nonce (`signCommitmentPartial` in `channel-manager.ts` around line 741): fresh random, signs one sighash, discarded inside the same call; the partial signature and public nonce travel inside the `commitment_signed` wire bytes. D2: reestablish retransmission serves the exact bytes from the outbox, so the secret nonce is never needed again. This is a load-bearing reason the outbox stores encoded bytes rather than re-encoding from state.
+- Taproot cooperative close session (`_ourClosingNonce`, `_remoteClosingNonce`, `_hasSignedClosing`, `_taprootClosingCache` in `channel.ts` around lines 474-491): in-memory only by explicit design; every shutdown (re)transmission carries a fresh closing nonce and the sign-once latch prevents one nonce from signing two sighashes. D3. The recovery journal must NOT persist these fields: persisting a secret closing nonce and reviving it after restart against a different closing fee would be exactly the nonce reuse this section forbids.
+- `lastCooperativeCloseTxHex`: a fully-signed transaction, not a live session. D1 as an ordinary `channel_state` mutation, as today.
+
+The matrix must additionally enumerate, each with a disposition and a Phase 7 kill-point test: interactive transaction construction and `tx_signatures` for splice (`src/lightning/message/interactive-tx.ts` and the splice paths in `channel-manager.ts`), splice RBF negotiation, on-chain wallet UTXO selection and change state backing a pending funding or splice, chain monitor pending sweep and justice transactions, temporary channel ID to permanent ID promotion, held or intercepted HTLC decisions, and every retransmittable message that is not covered by the commitment rows in 5.9. Prose classification is not acceptance; each disposition is enforced by a test that kills the process inside the session and asserts the disposition's outcome.
 
 ## 6. What this feature does and does not guarantee
 
@@ -570,16 +676,16 @@ Phase 3: Recovery Capsule over peer_storage.
 Done when: capsules are composed, padded, distributed, and refreshed within rate limits; a restore integration test (model on `tests/lightning/scb-restore.test.ts` and the regtest interop tests) restores a small node from capsules alone and resumes a channel via reestablish; oversized state degrades gracefully to SCB + locator capsule.
 
 Phase 4: guardian protocol + reference guardian.
-Done when: a reference guardian implementation (usable in tests, runnable standalone) enforces the invariants in 5.5; receipts verify; a restore test resumes from guardian replicas; the truncation attack (stale replica serving a shorter valid chain) is defeated by head verification.
+Done when: a reference guardian implementation (usable in tests, runnable standalone) enforces the invariants in 5.5, including the durability invariants; receipts verify and are cumulative; a restore test resumes from guardian replicas; the truncation attack (stale replica serving a shorter valid chain) is defeated by head verification; a backfill test repairs a lagging guardian through SYNC_RECORD and a missed takeover through SYNC_EPOCH; durability tests SIGKILL the reference guardian between accept and receipt and again after receipt, restart it, and prove no acknowledged state was lost and that a guardian with a damaged store refuses writes until repaired; the exact wire specification exists as `docs/RECOVERY-GUARDIAN-WIRE.md` (canonical encodings and endianness, hash and signature algorithms, domain separation tags for every signed object, AEAD choice and nonce construction, version negotiation, request idempotency and replay rules, maximum object sizes, error codes, transport authentication); the written comparison against LDK's Versioned Storage Service (section 12) is completed before the transport decision.
 
 Phase 5: writer epochs + startup quarantine.
-Done when: epoch acquisition works as a CAS takeover; a two-instance test proves the stale instance freezes before sending any channel message; a takeover-race test has the old writer append a certified state between the restoring device's head fetch and its `ACQUIRE_EPOCH`, and asserts the CAS fails, the retry lands on the newer head, and the restored state includes it; quarantine holds channels until ownership confirmation; all `ChannelRecoveryStatus` branches have tests, including `ReplayRequired` serving outbox bytes, `LocalDataLoss` routing to the existing DLP path, and `StateUncertain` provably never broadcasting the stored commitment.
+Done when: epoch acquisition works as a CAS takeover; a two-instance test proves the stale instance freezes before sending any channel message; a takeover-race test has the old writer append a certified state between the restoring device's head fetch and its `ACQUIRE_EPOCH`, and asserts the CAS fails, the retry lands on the newer head, and the restored state includes it; a divergent-head restore test (one guardian unreachable, one guardian stale) proves head reconciliation, SYNC_RECORD repair, and CAS takeover on the repaired quorum per the 5.7 worked example; a lagging-guardian test proves SYNC_EPOCH adopts the certified takeover head and discards an uncommitted superseded-epoch tail above it; a sub-quorum restore attempt refuses the takeover; quarantine holds channels until ownership confirmation; all `ChannelRecoveryStatus` branches have tests, including `ReplayRequired` serving outbox bytes, `LocalDataLoss` routing to the existing DLP path, and `StateUncertain` provably never broadcasting the stored commitment.
 
 Phase 6: quorum barriers.
-Done when: in quorum mode, no revoke_and_ack, fulfill, or irreversible splice message precedes its quorum receipt; guardian latency does not stall unrelated channels or non-critical writes; barrier timeout behavior (freeze, not proceed) is tested.
+Done when: in quorum mode, no revoke_and_ack, fulfill, or irreversible splice message precedes its quorum receipt; guardian latency does not stall unrelated channels or non-critical writes; appends pipeline and receipts are cumulative (a delayed receipt for frame N adds no per-frame round trip, and a single receipt at or above N releases every barrier at or below it); barrier timeout behavior (freeze, not proceed) is tested.
 
 Phase 7: chaos testing.
-Done when: a harness (extending the existing teardown/reconstruct restart pattern in the interop tests, plus process-level SIGKILL for the CLI daemon) kills the node before and after every DB commit, guardian ACK, and socket send around commitment_signed, revoke_and_ack, fulfill, fail, splice, and reconnect, across all three durability modes, and every run ends in exact resumption or provably safe DLP fallback, never a broadcastable stale state and never a lost preimage for a forwarded HTLC.
+Done when: a harness (extending the existing teardown/reconstruct restart pattern in the interop tests, plus process-level SIGKILL for the CLI daemon) kills the node before and after every DB commit, guardian ACK, and socket send around commitment_signed, revoke_and_ack, fulfill, fail, splice, and reconnect, and inside every ephemeral signing session classified in 5.10, across all three durability modes, and every run ends in exact resumption or provably safe DLP fallback, never a broadcastable stale state, never a lost preimage for a forwarded HTLC, and never a secret nonce signing two different sighashes across a restart.
 
 Tests: mocha + ts-node under `tests/lightning/` per repo convention; interop scenarios under `tests/lightning/interop/` against real LND/CLN/Eclair peers, since reestablish/DLP behavior against other implementations is the actual acceptance bar.
 
@@ -598,3 +704,22 @@ Tests: mocha + ts-node under `tests/lightning/` per repo convention; interop sce
 3. Whether `async-remote` should auto-escalate specific transitions (first revocation after restore, splice commitment) to quorum semantics when guardians are configured.
 4. Capsule refresh policy when a node has many storage peers: same capsule to all, or head-only to some to reduce write amplification.
 5. Guardian economics and deployment (who runs them) is out of scope for the library but the descriptor format should not preclude LSP-hosted, self-hosted, or paid third-party guardians.
+6. Guardian receipt-key rotation: how a guardian rotates its signing key without invalidating stored receipts and takeover certificates, and how the descriptor format carries key generations.
+7. Whether GET_HEAD returns the guardian's stored receipt set (the committedness evidence bundle) always, or only on request.
+
+## 12. Prior art and standardization path
+
+Added in revision 3, prompted by an external design review.
+
+Prior art that must shape Phase 4, not be discovered after it:
+
+- LDK's `ChannelMonitorUpdateStatus::InProgress` is the established form of the persistence barrier in 5.8: channel processing freezes until durable persistence completes. Already cited there; the quorum barrier is that contract with a remote acknowledgment added.
+- LDK's Versioned Storage Service (VSS, `lightningdevkit/vss-server`) is the closest existing service to the guardian protocol: client-side encrypted, versioned key-value storage with a strongly consistent API, per-object versions, a global-version compare-and-swap, and atomic multi-item puts. What VSS does not provide today: signed monotonic receipts, quorum acknowledgment across independent operators, takeover certificates, and the record-level self-authentication that backfill requires. Before the Phase 4 transport decision, produce a written comparison that either expresses the guardian verbs as a VSS extension or states precisely which requirements VSS cannot express and why. Shipping an incompatible service without that analysis is the kind of ecosystem fragmentation reviewers will rightly object to.
+
+Standardization path, if any of this is later proposed upstream. Three separable pieces, deliberately not one monolith:
+
+1. Recovery Capsule over BOLT 1 `peer_storage` (5.4): capsule versioning, encryption, padding, refresh semantics. Narrow, transport-level, interoperable.
+2. Versioned guardian storage with writer-epoch fencing (5.5, 5.6): records, receipts, takeover certificates, backfill, durability obligations. Strongest standalone candidate, ideally aligned with or extending VSS.
+3. An informational safety contract for exact-state recovery: persist before send, recover before connect, fence before signing, reconcile through `channel_reestablish`, never guess uncertain state, fall back to DLP when exactness is unprovable. Implementation-neutral by construction.
+
+The `RecoveryMutation` schema, the SQLite reconstruction, and everything else in 5.1-5.3 stay implementation-specific and are explicitly out of scope for any standard; other implementations would journal their own opaque encrypted records through the same guardian protocol.

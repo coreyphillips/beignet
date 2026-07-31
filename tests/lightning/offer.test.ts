@@ -60,6 +60,7 @@ import {
 	TLV_INVOICE_ERROR
 } from '../../src/lightning/offer';
 import { ITlvRecord } from '../../src/lightning/message/tlv';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { OnionMessageManager } from '../../src/lightning/onion-message/manager';
 import { findRouteToBlindedPath } from '../../src/lightning/gossip/pathfinding';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
@@ -886,6 +887,19 @@ describe('BOLT 12: Offers', () => {
 			mgr.destroy();
 		});
 
+		it('should list offers with the encoding a payer needs', () => {
+			const mgr = new OfferManager(privkey1);
+			const created = mgr.createOffer({ description: 'shareable' });
+
+			const entries = mgr.listOfferEntries();
+			expect(entries).to.have.length(1);
+			expect(entries[0].offer.offerId.equals(created.offer.offerId)).to.be.true;
+			expect(entries[0].encoded).to.equal(created.encoded);
+			expect(entries[0].encoded.startsWith('lno1')).to.be.true;
+
+			mgr.destroy();
+		});
+
 		it('should remove an offer', () => {
 			const mgr = new OfferManager(privkey1);
 			const { offer } = mgr.createOffer({ description: 'removable' });
@@ -923,6 +937,402 @@ describe('BOLT 12: Offers', () => {
 			mgr2.destroy();
 
 			expect(offer1.offerId.equals(offer2.offerId)).to.be.true;
+		});
+	});
+
+	// ── OfferManager Persistence (issue #216) ───────────────────────
+
+	describe('OfferManager persistence', () => {
+		it('offers survive into a fresh manager on the same storage', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const created = mgrA.createOffer({
+					description: 'durable',
+					amount: 21_000_000n,
+					pathId
+				});
+				const idHex = created.offer.offerId.toString('hex');
+				const entryA = (mgrA as any).offers.get(idHex);
+				mgrA.destroy();
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				const entries = mgrB.listOfferEntries();
+				expect(entries).to.have.length(1);
+				expect(entries[0].encoded).to.equal(created.encoded);
+				expect(entries[0].offer.offerId.equals(created.offer.offerId)).to.be
+					.true;
+				expect(entries[0].offer.description).to.equal('durable');
+				expect(entries[0].offer.amount).to.equal(21_000_000n);
+
+				// The restored entry keeps the ORIGINAL TLV bytes (invreq
+				// mirroring compares against them) and the path_id secret
+				// (request-over-blinded-path enforcement).
+				const entryB = (mgrB as any).offers.get(idHex);
+				expect(entryB.tlvData.equals(entryA.tlvData)).to.be.true;
+				expect(entryB.pathId.equals(pathId)).to.be.true;
+
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('a restored offer still answers an invoice request', () => {
+			// The exact failure from issue #216: after a restart, a request
+			// for a previously shared offer was answered "Unknown offer".
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer } = mgrA.createOffer({
+					description: 'shared before restart',
+					amount: 50_000n
+				});
+				mgrA.destroy();
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				const invoice = mgrB.handleInvoiceRequest(
+					makeSignedRequestTlv({ amount: 50_000n }, offer)
+				);
+				expect(invoice).to.not.be.null;
+				expect(invoice!.amount).to.equal(50_000n);
+				expect(invoice!.nodeId.equals(pubkey1)).to.be.true;
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('asyncHold survives a restart with the offer', () => {
+			// Post-restart invoice issuance must keep building LSP hold
+			// payment paths; losing the flag would silently issue non-hold
+			// paths and break async receive for the offer's lifetime.
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer: holdOffer } = mgrA.createOffer({
+					description: 'held after restart',
+					asyncHold: true
+				});
+				const { offer: plainOffer } = mgrA.createOffer({
+					description: 'plain'
+				});
+				mgrA.destroy();
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				const holdEntry = (mgrB as any).offers.get(
+					holdOffer.offerId.toString('hex')
+				);
+				const plainEntry = (mgrB as any).offers.get(
+					plainOffer.offerId.toString('hex')
+				);
+				expect(holdEntry?.asyncHold, 'hold flag restored').to.be.true;
+				expect(plainEntry?.asyncHold ?? false, 'plain offer stays plain').to.be
+					.false;
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('removeOffer deletes the persisted row too', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer } = mgrA.createOffer({ description: 'revoked' });
+				expect(mgrA.removeOffer(offer.offerId)).to.be.true;
+				mgrA.destroy();
+
+				expect(storage.loadAllOffers()).to.have.length(0);
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				expect(mgrB.listOffers()).to.have.length(0);
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('an expired offer is pruned at load, not resurrected', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				mgrA.createOffer({
+					description: 'bygone',
+					absoluteExpiry: BigInt(Math.floor(Date.now() / 1000) - 10)
+				});
+				mgrA.destroy();
+				expect(storage.loadAllOffers()).to.have.length(1);
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				expect(mgrB.listOffers()).to.have.length(0);
+				// Pruned from the table as well, not just skipped
+				expect(storage.loadAllOffers()).to.have.length(0);
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('a saveOffer failure rolls the offer back instead of leaving it live', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				const originalSave = storage.saveOffer.bind(storage);
+				storage.saveOffer = (): void => {
+					throw new Error('disk full');
+				};
+				expect(() => mgr.createOffer({ description: 'doomed' })).to.throw(
+					'disk full'
+				);
+				// Live-but-unpersisted is the bad outcome: payable now, gone
+				// after restart. The offer must not be left in memory.
+				expect(mgr.listOffers()).to.have.length(0);
+				storage.saveOffer = originalSave;
+				mgr.createOffer({ description: 'fine now' });
+				expect(mgr.listOffers()).to.have.length(1);
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('re-creating an identical offer preserves path_id and created_at', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				mgr.createOffer({ description: 'same', amount: 1000n, pathId });
+				const first = storage.loadAllOffers()[0];
+
+				// Identical TLVs, same offer id, but no pathId this time: the
+				// old INSERT OR REPLACE nulled path_id (silently downgrading
+				// the blinded-path authentication) and reset created_at.
+				mgr.createOffer({ description: 'same', amount: 1000n });
+				const rows = storage.loadAllOffers();
+				expect(rows).to.have.length(1);
+				expect(rows[0].pathId, 'path_id preserved').to.not.be.null;
+				expect(rows[0].pathId!.equals(pathId)).to.be.true;
+				expect(rows[0].createdAt, 'created_at preserved').to.equal(
+					first.createdAt
+				);
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('preserves in-memory path authentication when recreating an offer', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				const { offer } = mgr.createOffer({
+					description: 'guarded',
+					amount: 5_000n,
+					pathId
+				});
+
+				// Recreate the identical offer WITHOUT a pathId: the entry the
+				// request handler enforces from must keep the original secret,
+				// or authentication is silently disabled until restart.
+				mgr.createOffer({ description: 'guarded', amount: 5_000n });
+
+				const requestTlv = makeSignedRequestTlv({ amount: 5_000n }, offer);
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, undefined),
+					'request without path_id still rejected'
+				).to.be.null;
+				expect(
+					mgr.handleInvoiceRequest(
+						requestTlv,
+						undefined,
+						crypto.randomBytes(32)
+					),
+					'request with a wrong path_id still rejected'
+				).to.be.null;
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, pathId),
+					'original path_id still accepted'
+				).to.not.be.null;
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('restores an existing offer when an upsert fails', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const pathId = crypto.randomBytes(32);
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				const { offer } = mgr.createOffer({
+					description: 'sturdy',
+					amount: 7_000n,
+					pathId
+				});
+
+				storage.saveOffer = (): void => {
+					throw new Error('disk full');
+				};
+				// The failed re-create must not evict the previous, valid,
+				// still-persisted entry.
+				expect(() =>
+					mgr.createOffer({ description: 'sturdy', amount: 7_000n })
+				).to.throw('disk full');
+				expect(mgr.listOffers()).to.have.length(1);
+				const requestTlv = makeSignedRequestTlv({ amount: 7_000n }, offer);
+				expect(
+					mgr.handleInvoiceRequest(requestTlv, undefined, pathId),
+					'previous entry still answers'
+				).to.not.be.null;
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('removeOffer does not delete the row of an unknown offer', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer } = mgrA.createOffer({ description: 'kept' });
+				// A different manager that never loaded this offer: the old
+				// code deleted the row and then reported "not found".
+				const mgrB = new OfferManager(privkey1);
+				expect(mgrB.removeOffer(offer.offerId)).to.be.false;
+				expect(storage.loadAllOffers()).to.have.length(1);
+				mgrA.destroy();
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('an id-mismatched row is reported and pruned; a garbage row is reported and kept', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer } = mgrA.createOffer({ description: 'real' });
+				const realRow = storage
+					.loadAllOffers()
+					.find((r) => r.offerIdHex === offer.offerId.toString('hex'))!;
+				mgrA.destroy();
+
+				// A valid encoding stored under the WRONG key: fails the only
+				// integrity check the checksum-free encoding has.
+				storage.saveOffer('ab'.repeat(32), realRow.encoded, null, 1);
+				// A blob that cannot decode at all: could be version skew, so
+				// it is surfaced but never deleted.
+				storage.saveOffer('cd'.repeat(32), 'lno1notanoffer', null, 1);
+
+				const corrupt: Array<{ offerIdHex: string; reason: string }> = [];
+				const mgrB = new OfferManager(privkey1);
+				mgrB.on(
+					'offer:corrupt',
+					(info: { offerIdHex: string; reason: string }) => corrupt.push(info)
+				);
+				mgrB.attachStorage(storage);
+
+				expect(mgrB.listOffers()).to.have.length(1);
+				expect(corrupt.map((c) => c.offerIdHex)).to.have.members([
+					'ab'.repeat(32),
+					'cd'.repeat(32)
+				]);
+				const remaining = storage.loadAllOffers().map((r) => r.offerIdHex);
+				expect(remaining).to.include(realRow.offerIdHex);
+				expect(remaining).to.include('cd'.repeat(32));
+				expect(remaining).to.not.include('ab'.repeat(32));
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('a second attachStorage is a no-op', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				const mgr = new OfferManager(privkey1);
+				mgr.attachStorage(storage);
+				mgr.createOffer({ description: 'once' });
+				mgr.attachStorage(storage);
+				expect(mgr.listOffers()).to.have.length(1);
+				mgr.destroy();
+			} finally {
+				storage.close();
+			}
+		});
+
+		it('invoice preimages expire and are capped', () => {
+			const mgr = new OfferManager(privkey1);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const mgrAny = mgr as any;
+			// TTL: an entry past its deadline is pruned.
+			mgrAny.invoicePreimages.set('aa', Buffer.alloc(32));
+			mgrAny.invoicePreimageDeadlines.set('aa', Date.now() - 1);
+			mgrAny.pruneInvoicePreimages();
+			expect(mgrAny.invoicePreimages.has('aa')).to.be.false;
+
+			// Cap: at the limit, the oldest entries are evicted.
+			for (let i = 0; i < 10_000; i++) {
+				const key = i.toString(16).padStart(8, '0');
+				mgrAny.invoicePreimages.set(key, Buffer.alloc(1));
+				mgrAny.invoicePreimageDeadlines.set(key, Date.now() + 60_000);
+			}
+			mgrAny.pruneInvoicePreimages();
+			expect(mgrAny.invoicePreimages.size).to.be.lessThan(10_000);
+			expect(mgrAny.invoicePreimages.has('00000000'), 'oldest evicted').to.be
+				.false;
+			mgr.destroy();
+		});
+
+		it('a corrupt row is skipped and the rest still load', () => {
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			try {
+				storage.saveOffer('deadbeef', 'lno1notanoffer', null, 0);
+				const mgrA = new OfferManager(privkey1);
+				mgrA.attachStorage(storage);
+				const { offer } = mgrA.createOffer({ description: 'intact' });
+				mgrA.destroy();
+
+				const mgrB = new OfferManager(privkey1);
+				mgrB.attachStorage(storage);
+				const offers = mgrB.listOffers();
+				expect(offers).to.have.length(1);
+				expect(offers[0].offerId.equals(offer.offerId)).to.be.true;
+				mgrB.destroy();
+			} finally {
+				storage.close();
+			}
 		});
 	});
 

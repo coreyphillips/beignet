@@ -378,6 +378,8 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--anchors')) cliFlags.preferAnchors = true;
 	if (hasFlag('--large-channels')) cliFlags.largeChannels = true;
 	if (hasFlag('--htlc-events')) cliFlags.htlcEvents = true;
+	if (hasFlag('--metrics-public')) cliFlags.metricsPublic = true;
+	if (hasFlag('--insecure')) cliFlags.insecure = true;
 	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
@@ -476,6 +478,8 @@ async function handleStart(): Promise<void> {
 			announceAddresses: config.announceAddresses,
 			watchtowers: config.watchtowers,
 			htlcEvents: config.htlcEvents,
+			metricsPublic: config.metricsPublic,
+			insecure: config.insecure,
 			forwardingEnabled: config.forwardingEnabled,
 			logLevel: config.logLevel
 		});
@@ -770,6 +774,15 @@ async function handleChannel(): Promise<void> {
 						: undefined
 				})
 			);
+		case 'funding-quote':
+			return outputResult(
+				await httpRequest('POST', '/channel/funding-quote', {
+					peerPubkey: filteredArgs[2],
+					satsPerVbyte: filteredArgs[3]
+						? parseFloat(filteredArgs[3])
+						: undefined
+				})
+			);
 		case 'splice-quote':
 			return outputResult(
 				await httpRequest('POST', '/channel/splice-quote', {
@@ -930,7 +943,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -1831,6 +1844,13 @@ async function handleOffer(): Promise<void> {
 			);
 		case 'list':
 			return outputResult(await httpRequest('GET', '/offers'));
+		case 'remove':
+			return outputResult(
+				await httpRequest(
+					'DELETE',
+					`/offer?offerId=${encodeURIComponent(filteredArgs[2] || '')}`
+				)
+			);
 		case 'decode':
 			return outputResult(
 				await httpRequest('POST', '/offer/decode', {
@@ -1851,7 +1871,7 @@ async function handleOffer(): Promise<void> {
 				ok: false,
 				error: {
 					code: 'UNKNOWN_COMMAND',
-					message: 'Usage: beignet offer [create|list|decode|pay]'
+					message: 'Usage: beignet offer [create|list|remove|decode|pay]'
 				}
 			});
 			process.exitCode = 1;
@@ -2215,6 +2235,9 @@ Channels:
                                          confirmation (trusted peers only)
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
+  channel funding-quote <pubkey> [satsPerVbyte]
+                                         Peer-aware max open preview: v1 or
+                                         v2 decided like openChannel would
   channel splice-quote <id> <in|out> <feerate>
                                          Quote a splice: fee + max amount
   channel splice-in <id> <sats> <feerate>   Add funds to channel

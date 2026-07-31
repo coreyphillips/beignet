@@ -1,35 +1,39 @@
 # Beignet Lightning Module
 
-A pure-TypeScript Lightning Network implementation covering BOLTs 1-5, 7-8, and 10-12. Built for `bitcoinjs-lib` and Node.js.
+A pure-TypeScript Lightning Network implementation covering BOLTs 1-5 and 7-12, plus bLIP-51 liquidity ads. Built on `bitcoinjs-lib` for Node.js.
+
+This is the protocol layer. For the higher-level, satoshi-denominated API (`BeignetNode`), the HTTP daemon, and the project's current limitations, see the [root README](../../README.md).
+
+**Contents:** [Overview](#overview) · [Architecture](#architecture) · [Import paths](#import-paths) · [Quick start](#quick-start) · [Usage guide](#usage-guide) · [Events](#events-reference) · [Errors](#typed-payment-errors) · [Module reference](#module-reference) · [Testing](#testing) · [BOLT coverage](#bolt-specification-coverage)
 
 ## Overview
 
-This module implements the core Lightning Network protocols:
-
-- **BOLT 1** -- Base protocol (init, error, ping/pong)
-- **BOLT 2** -- Channel management (open, close, HTLCs, dual-funding, quiescence, splicing, zero-conf)
-- **BOLT 3** -- Transaction scripts (funding, commitment, HTLC, revocation, anchor outputs)
-- **BOLT 4** -- Onion routing (Sphinx packets, route blinding, onion messages)
-- **BOLT 5** -- On-chain transaction handling (force close, sweep, output resolution)
-- **BOLT 7** -- Gossip protocol (channel/node announcements, pathfinding)
-- **BOLT 8** -- Encrypted transport (Noise_XK handshake, ChaCha20-Poly1305 framing)
-- **BOLT 10** -- DNS-based peer discovery (SRV records, seed nodes)
-- **BOLT 11** -- Invoice encoding/decoding (bech32, amount, signatures, features)
-- **BOLT 12** -- Offers (reusable payment requests, TLV encoding, Schnorr signing)
+- **BOLT 1** Base protocol (init, error, ping/pong, peer storage)
+- **BOLT 2** Channel management (open, close, HTLCs, dual funding, quiescence, splicing, zero-conf)
+- **BOLT 3** Transaction scripts (funding, commitment, HTLC, revocation, anchors, taproot/MuSig2)
+- **BOLT 4** Onion routing (Sphinx packets, route blinding, onion messages)
+- **BOLT 5** On-chain handling (force close, sweep, output resolution, anchor fee bumping)
+- **BOLT 7** Gossip (channel/node announcements, pathfinding, gossip sync, Rapid Gossip Sync)
+- **BOLT 8** Encrypted transport (Noise_XK handshake, ChaCha20-Poly1305 framing)
+- **BOLT 9** Feature flags (bitmap manipulation, init negotiation)
+- **BOLT 10** DNS-based peer discovery (SRV records, seed nodes)
+- **BOLT 11** Invoice encoding/decoding (bech32, amount, signatures, features, hold invoices)
+- **BOLT 12** Offers (reusable payment requests, TLV encoding, Schnorr signing)
+- **bLIP-51** Liquidity ads (lease rates, will_fund, CLTV-locked lessor output)
 
 ## Architecture
 
 ```
 src/lightning/
 ├── bootstrap/       BOLT 10 DNS peer discovery, seed nodes
-├── crypto/          ECDH, HKDF, ChaCha20-Poly1305
+├── crypto/          ECDH, HKDF, ChaCha20-Poly1305, MuSig2 (BIP 327)
 ├── message/         Wire protocol codec, TLV, all message types
 ├── features/        Feature flag bit manipulation
-├── transport/       BOLT 8 Noise handshake, encrypted Peer, PeerManager
+├── transport/       BOLT 8 Noise handshake, encrypted Peer, PeerManager, WebSocket
 ├── keys/            Key derivation, shachain, channel signer, wallet keys
-├── script/          Funding, commitment, HTLC, revocation, anchor scripts
+├── script/          Funding, commitment, HTLC, revocation, anchor, taproot scripts
 ├── channel/         Channel state machine, commitment builder, ChannelManager,
-│                    zero-conf, quiescence, dual-funding, splicing
+│                    zero-conf, quiescence, dual-funding, splicing, liquidity ads
 ├── interactive-tx/  Collaborative TX construction (types 66-74)
 ├── chain/           Chain monitor, closing tx, sweep tx, output resolver
 ├── invoice/         BOLT 11 encode/decode, amount, signing
@@ -37,6 +41,9 @@ src/lightning/
 ├── onion/           Sphinx crypto, hop payloads, packet construction, route blinding
 ├── onion-message/   Type 513 onion messages, rate limiting
 ├── offer/           BOLT 12 offers, TLV encode/decode, Schnorr, merkle tree
+├── async-payments/  Hold invoices, AsyncPaymentManager (LSP held-forward, wake)
+├── watchtower/      Altruist watchtower client (LND wtwire, justice blobs)
+├── backup/          Static channel backup (SCB) export/import
 ├── storage/         SQLite persistence, serialization
 ├── wallet/          Wallet funding provider integration
 ├── node/            LightningNode orchestrator
@@ -49,7 +56,7 @@ src/lightning/
 
 ```
 LightningNode
- ├── PeerManager (optional) ─── Peer ─── TCP + BOLT 8 encryption
+ ├── PeerManager (optional) ─── Peer ─── TCP/WebSocket + BOLT 8 encryption
  ├── ChannelManager ─── Channel[] ─── CommitmentBuilder
  │    ├── ChainMonitor ─── OutputResolver
  │    ├── ZeroConfManager ─── trusted peer set
@@ -60,6 +67,8 @@ LightningNode
  ├── Onion (Sphinx) ─── construct / process / failures / blinding
  ├── OnionMessageManager ─── send / receive / forward (type 513)
  ├── OfferManager ─── create / request / pay (BOLT 12)
+ ├── AsyncPaymentManager ─── hold invoices, held-forward, wake
+ ├── WatchtowerClient (optional) ─── justice kits per revocation
  ├── Invoice ─── encode / decode (BOLT 11)
  ├── Bootstrap ─── DNS seed resolution (BOLT 10)
  └── Advisor ─── LiquidityAdvisor, FeeAdvisor, ChannelSuggestions
@@ -73,25 +82,42 @@ When `PeerManager` is enabled, `ChannelManager.sendMessage()` routes through `Pe
 
 `OnionMessageManager` and `OfferManager` are both `EventEmitter` instances. `LightningNode` re-emits their events through the unified node event API.
 
-## Installation
+## Import paths
 
-The lightning module is part of the beignet package:
+`beignet/lightning` exports one **namespace per module**, not flat symbols. There is no `import { LightningNode } from 'beignet/lightning'`.
 
 ```typescript
+// Namespaces (this is the shape of the barrel)
+import { node, channel, gossip, invoice, onion, offer } from 'beignet/lightning';
+
+const n = node.LightningNode.fromMnemonic(mnemonic, { network: invoice.Network.REGTEST });
+const route = gossip.findRoute(graph, source, destination, amountMsat, finalCltv);
+const decoded = invoice.decode(bolt11);
+
+// Or grab the whole thing
 import * as lightning from 'beignet/lightning';
 
-// Or import specific sub-modules
-import { LightningNode } from 'beignet/lightning';
-import { ChannelManager } from 'beignet/lightning';
-import { NetworkGraph } from 'beignet/lightning';
-import { OfferManager } from 'beignet/lightning';
+// Types live in the same namespaces
+import { node as ln } from 'beignet/lightning';
+const config: ln.INodeConfig = { /* ... */ };
+```
+
+Every example below assumes `node` is a `LightningNode` instance and uses these namespace aliases:
+
+```typescript
+import {
+  gossip as gsp,
+  invoice as inv,
+  node as ln,
+  features as feat
+} from 'beignet/lightning';
 ```
 
 ### Prerequisites
 
-- Node.js with `crypto` module
+- Node.js 18+ with the `crypto` module
 - `bitcoinjs-lib` with `@bitcoinerlab/secp256k1`
-- `bech32` (for BOLT 11 invoices)
+- `bech32` (BOLT 11 invoices), `better-sqlite3` (storage backend)
 
 ## Quick Start
 
@@ -99,16 +125,15 @@ import { OfferManager } from 'beignet/lightning';
 > if lost. Always derive keys from a BIP39 mnemonic via `LightningNode.fromMnemonic()`.
 
 ```typescript
-import { LightningNode } from 'beignet/lightning';
+import { invoice as inv, node as ln } from 'beignet/lightning';
 
-// Recommended: derive all keys from a BIP39 mnemonic
-// fromMnemonic() is synchronous — returns a LightningNode directly
-const node = LightningNode.fromMnemonic(
+// Recommended: derive all keys from a BIP39 mnemonic.
+// fromMnemonic() is synchronous and returns a LightningNode directly.
+const node = ln.LightningNode.fromMnemonic(
   'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
-  { network: 'bcrt', enableNetworking: true },
+  { network: inv.Network.REGTEST, enableNetworking: true }
 );
 
-// Listen for events
 node.on('payment:received', (payment) => {
   console.log('Received payment:', payment.paymentHash.toString('hex'));
 });
@@ -118,11 +143,13 @@ node.on('payment:sent', (payment) => {
 });
 ```
 
+`network` is the `Network` enum (`Network.MAINNET` = `'bc'`, `TESTNET` = `'tb'`, `REGTEST` = `'bcrt'`, `SIGNET` = `'tbs'`), not a bare string.
+
 > **Important**: `sendPayment()` returns synchronously with PENDING status.
-> For AI agents and async workflows, use `sendPaymentAsync()` which returns a
+> For AI agents and async workflows, use `sendPaymentAsync()`, which returns a
 > Promise that resolves on settlement or rejects on failure/timeout.
 
-For simpler usage (AI agents, quick prototyping), see the `BeignetNode` wrapper in `src/cli/beignet-node.ts`:
+For simpler usage (AI agents, quick prototyping), use the `BeignetNode` wrapper in `src/cli/beignet-node.ts`:
 
 ```typescript
 import { BeignetNode } from 'beignet/cli';
@@ -132,33 +159,36 @@ const invoice = node.createInvoice(1000, 'test payment');
 // invoice => { bolt11: "lnbcrt10n1...", paymentHash: "ab12...", amountSats: 1000 }
 
 const payment = await node.payInvoice(invoice.bolt11);
-node.destroy();
+await node.destroy();
 ```
 
 ## Usage Guide
 
 ### Creating a LightningNode
 
-```typescript
-import { INodeConfig } from 'beignet/lightning';
+`fromMnemonic()` covers most cases. Use the constructor when you need a config field it does not expose (for example `channelConfig`, `reestablishTimeoutBlocks`, `htlcSafetyMargin`, `signerFactory`, `resourceConfig`, or the individual basepoint secrets).
 
-const config: INodeConfig = {
+```typescript
+const config: ln.INodeConfig = {
   nodePrivateKey,                      // 32-byte private key
-  network: 'bcrt',                     // 'bc' | 'tb' | 'bcrt'
-  channelConfig: { /* optional */ },   // IChannelConfig overrides
+  network: inv.Network.REGTEST,        // Network enum
   channelBasepoints,                   // IChannelBasepoints
   perCommitmentSeed,                   // 32-byte seed for per-commitment keys
   fundingPrivkey,                      // 32-byte funding key
 
+  // Optional. IChannelConfig is NOT a partial: supply every field or omit it
+  // entirely to take the defaults.
+  // channelConfig: { dustLimitSatoshis, maxHtlcValueInFlightMsat, ... },
+
   // Networking (optional)
   enableNetworking: true,              // create PeerManager
-  localFeatures: FeatureFlags.empty(), // feature flags for init
+  localFeatures: feat.FeatureFlags.empty(), // feature flags for init
   chainHashes: [chainHash],            // chain hashes for init
   autoReconnect: true,                 // auto-reconnect on disconnect
-  maxReconnectDelay: 300_000,          // max 5 min between retries
+  maxReconnectDelay: 300_000           // max 5 min between retries
 };
 
-const node = new LightningNode(config);
+const node = new ln.LightningNode(config);
 ```
 
 ### DNS Bootstrap (BOLT 10)
@@ -173,10 +203,10 @@ const connected = await node.connectToSeeds(3); // connect up to 3
 // => string[] of connected pubkey hex strings
 
 // Custom DNS seeds
-const peers = await node.bootstrapPeers({
+const custom = await node.bootstrapPeers({
   seeds: [{ hostname: 'nodes.lightning.directory' }],
   maxPeers: 10,
-  timeoutMs: 5000,
+  timeoutMs: 5000
 });
 ```
 
@@ -222,14 +252,15 @@ nodeB.on('message:outbound', (pubkey, type, payload) => {
 // 1. Open channel (sends open_channel message)
 const channel = node.openChannel(peerPubkey, 1_000_000n); // 1M sats
 
-// 2. Create funding transaction
+// 2. Create funding transaction (skip when a fundingProvider is configured:
+//    it builds, signs and broadcasts the funding tx for you)
 const channelId = node.createFunding(channel, fundingTxid, outputIndex, signature);
 
 // 3. Confirm funding (after tx is mined)
 node.handleFundingConfirmed(channelId);
 // Emits 'channel:ready' when both sides confirm
 
-// 4. Normal operation -- send/receive HTLCs
+// 4. Normal operation: send/receive HTLCs
 
 // 5. Cooperative close
 node.closeChannel(channelId, scriptPubkey);
@@ -240,7 +271,7 @@ node.forceCloseChannel(channelId, destinationScript);
 
 ### Zero-Conf Channels
 
-Open channels that are usable immediately before the funding transaction confirms. Only use with trusted peers.
+Open channels that are usable immediately, before the funding transaction confirms. Only use with trusted peers.
 
 ```typescript
 // Add a trusted peer for zero-conf
@@ -262,17 +293,22 @@ Anchor channels (`option_anchors_zero_fee_htlc_tx`, BOLT 3) add two 330-sat anch
 **Anchors are the default channel type** (matching LND/CLN/Eclair). When a funding provider is configured, beignet attaches wallet-funded fee bumps so anchor force-closes confirm: zero-fee second-level HTLC txs get a wallet fee input attached, and the commitment is CPFP-bumped via its local anchor output.
 
 ```typescript
-// Anchors are negotiated by default — no config needed.
-const node = new LightningNode({ ...config });
+// Anchors are negotiated by default, no config needed.
+const node = new ln.LightningNode({ ...config });
 
 // Escape hatch: force legacy static_remotekey (non-anchor) channels.
-const legacyNode = new LightningNode({
-  ...config,
-  preferAnchors: false,
-});
+const legacyNode = new ln.LightningNode({ ...config, preferAnchors: false });
 
-// Channels negotiate anchor channel_type with peers that also support it,
+// Channels negotiate the anchor channel_type with peers that also support it,
 // and fall back to non-anchor with peers that don't.
+```
+
+### Simple Taproot Channels
+
+`preferTaproot: true` negotiates `option_taproot` channels: MuSig2 funding output, taproot commitments and Schnorr HTLC signatures. Experimental, and the feature bit is still in staging upstream. Not recommended for mainnet balances.
+
+```typescript
+const node = new ln.LightningNode({ ...config, preferTaproot: true });
 ```
 
 ### Dual-Funded Channels (v2)
@@ -280,16 +316,34 @@ const legacyNode = new LightningNode({
 Open channels where both peers contribute funding.
 
 ```typescript
-// Open a dual-funded channel
 const channel = node.openChannelV2(peerPubkey, {
   fundingSatoshis: 1_000_000n,       // our contribution
   fundingFeeratePerkw: 253,          // optional, defaults to channel config
   commitmentFeeratePerkw: 253,       // optional
-  locktime: 0,                       // optional
+  locktime: 0                        // optional
 });
 // Negotiation proceeds: open_channel2 -> accept_channel2
 // -> interactive TX construction (tx_add_input, tx_add_output, tx_complete)
 // -> tx_signatures -> channel_ready
+```
+
+### Liquidity Ads (bLIP-51)
+
+Set `leaseRates` to advertise as a lessor: peers can then request funds in an
+open_channel2 and beignet replies with `will_fund`, contributes the leased
+capacity, and CLTV-locks its own `to_local` output for the lease term.
+
+```typescript
+const lessor = new ln.LightningNode({
+  ...config,
+  leaseRates: {
+    fundingWeightWitness: 666,   // per-input funding weight, for the mining-fee share
+    leaseFeeBasis: 100,          // proportional lease fee, in 1/10_000 of the lease
+    leaseFeeBaseSat: 500,        // flat lease fee, satoshis
+    channelFeeMaxBaseMsat: 1000, // max routing base fee we may charge over the term
+    channelFeeMaxProportionalThousandths: 10
+  }
+});
 ```
 
 ### Splicing
@@ -298,11 +352,11 @@ Add or remove funds from an existing channel without closing it. Requires quiesc
 
 ```typescript
 // Splice-in: add 100,000 sats to the channel
-const result = node.spliceIn(channelId, 100_000n, 253);
+const inResult = node.spliceIn(channelId, 100_000n, 253);
 // => { ok: boolean; error?: string }
 
 // Splice-out: withdraw 50,000 sats from the channel
-const result = node.spliceOut(channelId, 50_000n, 253);
+const outResult = node.spliceOut(channelId, 50_000n, 253);
 // => { ok: boolean; error?: string }
 
 // Flow: STFU exchange -> splice/splice_ack -> interactive TX
@@ -312,12 +366,12 @@ const result = node.spliceOut(channelId, 50_000n, 253);
 ### Invoice Management
 
 ```typescript
-// Create an invoice — returns { bolt11, paymentHash, paymentSecret }
+// Create an invoice, returning { bolt11, paymentHash, paymentSecret }
 const result = node.createInvoice({
-  amountMsat: 50_000_000n,    // 50,000 sats
+  amountMsat: 50_000_000n,     // 50,000 sats
   description: 'Coffee',
   expiry: 3600,                // optional, default 3600s
-  minFinalCltvExpiry: 40,      // optional, default 40
+  minFinalCltvExpiry: 40       // optional, default 40
 });
 // result.bolt11 => "lnbcrt500u1..."
 // result.paymentHash => Buffer (32 bytes)
@@ -329,13 +383,41 @@ const metadata = JSON.stringify({ orderId: '12345', items: ['...'] });
 const descHash = crypto.createHash('sha256').update(metadata).digest();
 const result2 = node.createInvoice({
   amountMsat: 50_000_000n,
-  descriptionHash: descHash,
+  descriptionHash: descHash
 });
 
 // Decode any BOLT 11 invoice
-import { decode } from 'beignet/lightning';
-const invoice = decode(result.bolt11);
+const decoded = inv.decode(result.bolt11);
 // => { paymentHash, amountMsat, description, network, ... }
+```
+
+### Hold Invoices & Async Receive
+
+A hold invoice parks matching HTLCs instead of settling them, which underpins escrow-style flows and async receive for an offline recipient.
+
+```typescript
+// Park incoming HTLCs instead of settling. Omit paymentHash to let the node
+// generate the preimage; supply one when the preimage is held elsewhere.
+const held = node.createInvoice({
+  amountMsat: 50_000_000n,
+  description: 'Escrow',
+  hold: true
+});
+
+node.on('htlc:held', (info) => console.log('parked', info));
+
+node.settleHeldHtlc(held.paymentHash);      // reveal the preimage, settle
+node.cancelHoldInvoice(held.paymentHash);   // fail the HTLCs back
+node.listHoldInvoices();                    // hold invoices + their state
+
+// Async receive: mark the LSP hop of a blinded path with hold_htlc so the
+// always-online LSP parks the HTLC until this node comes back and releases it.
+node.createInvoice({
+  amountMsat: 50_000_000n,
+  description: 'Async',
+  useBlindedPaths: true,
+  asyncHold: true
+});
 ```
 
 ### BOLT 12 Offers
@@ -348,15 +430,15 @@ const { offer, encoded } = node.createOffer({
   amount: 50_000_000n,         // optional: omit for "any amount"
   description: 'Coffee',
   issuer: 'My Shop',           // optional
-  absoluteExpiry: 1700000000n, // optional
+  absoluteExpiry: 1700000000n  // optional
 });
-// encoded => "lno1..." (bech32m with lno prefix)
+// encoded => "lno1..." (bech32 with lno prefix)
 
 // Request an invoice for an offer (sent via onion message)
 const invoice = await node.requestInvoice(offer, {
   amount: 50_000_000n,         // required if offer has no amount
   quantity: 2n,                // optional
-  payerNote: 'Table 5',        // optional
+  payerNote: 'Table 5'         // optional
 });
 
 // Pay the BOLT 12 invoice
@@ -393,8 +475,11 @@ manager.registerTlvHandler(42, (fromPeer, tlvType, data, replyPath) => {
 const payment = node.sendPayment(invoiceStr);
 // => IPaymentInfo { status, paymentHash, preimage, ... }
 
+// Same, but await settlement instead of getting a PENDING result back
+const settled = await node.sendPaymentAsync(invoiceStr);
+
 // Manual route: specify exact path
-const payment = node.sendPaymentToRoute(route, paymentHash, finalCltvExpiry);
+const routed = node.sendPaymentToRoute(route, paymentHash, finalCltvExpiry);
 ```
 
 ### Waiting for Payments
@@ -404,13 +489,13 @@ const payment = node.sendPaymentToRoute(route, paymentHash, finalCltvExpiry);
 const result = node.createInvoice({ amountMsat: 50_000_000n, description: 'Coffee' });
 const payment = await node.waitForPayment(result.paymentHash, 30_000);
 // Resolves immediately if already settled, or waits up to 30s
-// Rejects with timeout error if not received in time
+// Rejects with a timeout error if not received in time
 ```
 
 ### Balance
 
 ```typescript
-// Get aggregate Lightning balance across all active channels
+// Aggregate Lightning balance across all active channels
 const balance = node.getBalance();
 // => { localBalanceMsat: bigint, remoteBalanceMsat: bigint, unsettledBalanceMsat: bigint }
 ```
@@ -418,7 +503,7 @@ const balance = node.getBalance();
 ### Channel Health Assessment
 
 ```typescript
-// Get liquidity health for a specific channel
+// Liquidity health for a specific channel
 const health = node.getChannelHealth(channelId);
 // => IChannelHealth {
 //   channelId: string, state: string,
@@ -439,23 +524,23 @@ const health = node.getChannelHealth(channelId);
 Critical operations emit structured log events for observability:
 
 ```typescript
-node.on('log', (entry: IStructuredLog) => {
+node.on('log', (entry) => {
   // entry.category: 'payment' | 'channel' | 'htlc' | 'fee' | 'peer' | 'chain'
   // entry.action: e.g. 'sent', 'received', 'failed', 'ready', 'closed'
   // entry.timestamp: unix ms
-  // entry.data: operation-specific fields (paymentHash, channelId, amountMsat, etc.)
+  // entry.data: operation-specific fields (paymentHash, channelId, amountMsat, ...)
   console.log(`[${entry.category}:${entry.action}]`, entry.data);
 });
-
-// Emitted on: payment sent/received/failed, channel ready/closed
 ```
+
+Every entry is also mirrored to the injected `ILogger` at debug level as `logger.debug('category:action', data)`. `INodeConfig.logger` defaults to `noopLogger`, so the node prints nothing unless you supply one.
 
 ### Receiving Payments
 
-Incoming payments are auto-fulfilled when the preimage is known (from `createInvoice`):
+Incoming payments are auto-fulfilled when the preimage is known (from `createInvoice`), unless the invoice was created with `hold: true`:
 
 ```typescript
-node.on('payment:received', (payment: IPaymentInfo) => {
+node.on('payment:received', (payment) => {
   console.log('Received', payment.amountMsat, 'msat');
   console.log('Hash:', payment.paymentHash.toString('hex'));
 });
@@ -473,18 +558,16 @@ node.handlePeerMessage(pubkey, MessageType.NODE_ANNOUNCEMENT, payload);
 const graph = node.getGraph();
 graph.getChannelCount();
 graph.getNodeCount();
-graph.getChannel(scid);
-graph.getNode(pubkey);
+graph.getChannel(scid);        // scid: 8-byte Buffer
+graph.getNode(nodeId);         // nodeId: 33-byte Buffer
 
 // Find a route
-import { findRoute } from 'beignet/lightning';
-const route = findRoute(graph, source, destination, amountMsat, finalCltv);
+const route = gsp.findRoute(graph, source, destination, amountMsat, finalCltv);
 // => { hops: [...], totalAmountMsat, totalCltvDelta, totalFeeMsat }
 
 // With routing hints (for invoices with private channels):
-import { IRoutingHintHop } from 'beignet/lightning';
-const route = findRoute(graph, source, destination, amountMsat, finalCltv,
-  undefined, undefined, undefined, undefined, invoice.routingHints);
+const hinted = gsp.findRoute(graph, source, destination, amountMsat, finalCltv,
+  undefined, undefined, undefined, undefined, decoded.routingHints);
 // Routing hints inject synthetic edges for private channels not in the gossip graph
 ```
 
@@ -497,19 +580,49 @@ Multi-hop payments are forwarded automatically. Register SCIDs to enable forward
 node.registerChannelScid(channelId, scid);
 
 // Listen for forwarding events
-node.on('htlc:forward', (fromChannelId, toChannelId, amountMsat, paymentHash) => {
-  console.log('Forwarded HTLC:', amountMsat, 'msat');
+node.on('htlc:forwarded', (info) => {
+  console.log('Forwarded HTLC:', info);
 });
 ```
+
+Set `forwardingEnabled: false` to decline all third-party forwards: they fail back promptly with `temporary_node_failure` and our `channel_update`s advertise the BOLT 7 disable bit. This does not affect our own sends and receives.
 
 ### Chain Monitoring
 
 ```typescript
-// Handle funding output being spent (force close detection)
-node.handleFundingSpent(channelId, spendingTx, blockHeight, destinationScript);
+import { Transaction } from 'bitcoinjs-lib';
+
+// Handle the funding output being spent (force-close detection).
+// spendingTx is a bitcoinjs-lib Transaction, not a raw Buffer.
+node.handleFundingSpent(channelId, Transaction.fromHex(rawHex), blockHeight, destinationScript);
 
 // Advance block height (triggers timelock checks)
 node.handleNewBlock(blockHeight);
+```
+
+### Watchtowers
+
+Ship an encrypted justice kit to remote altruist towers at every revocation, so a breach is punished even while this node is offline. Towers speak LND's `wtwire` protocol; sessions are `reward = 0`. Legacy and anchor channels only (taproot is not backed up yet), client side only.
+
+```typescript
+const node = ln.LightningNode.fromMnemonic(mnemonic, {
+  watchtowers: ['03abc...@tower.example.com:9911']
+});
+
+node.addWatchtower('03def...@tower2.example.com:9911');
+node.removeWatchtower('03def...@tower2.example.com:9911');
+node.getWatchtowers();  // per-tower health, session state, backlog depth
+```
+
+### Static Channel Backup (SCB)
+
+An SCB is an on-chain recovery path, not a state backup: on restore, peers are asked to force-close and the funds are swept to the wallet.
+
+```typescript
+const scb = node.buildStaticChannelBackupData();
+// persist scb somewhere durable (it is encrypted at rest by the daemon)
+
+const result = await node.recoverFromStaticChannelBackup(scb.channels);
 ```
 
 ## Events Reference
@@ -519,10 +632,21 @@ node.handleNewBlock(blockHeight);
 | `payment:received` | `(payment: IPaymentInfo)` | Incoming HTLC fulfilled |
 | `payment:sent` | `(payment: IPaymentInfo)` | Outgoing payment completed |
 | `payment:failed` | `(payment: IPaymentInfo)` | Outgoing payment failed |
-| `channel:ready` | `(channelId: Buffer)` | Channel reached NORMAL state |
-| `channel:closed` | `(channelId: Buffer)` | Channel closed |
+| `preimage:learned` | `(paymentHash: Buffer, preimage: Buffer)` | Preimage recorded (forwarding/settlement chokepoint) |
+| `invoice:settled` | `({ paymentHash, bolt11, amountMsat })` | Invoice we issued was settled |
+| `channel:opening` | `({ channelId, fundingTxid })` | Funding flow started |
+| `channel:ready` | `({ channelId })` | Channel reached NORMAL state |
+| `channel:closed` | `({ channelId })` | Channel closed |
+| `channel:resolved` | `({ channelId })` | All on-chain outputs resolved |
+| `channel:aborted` | `(temporaryChannelId: Buffer, reason: string)` | Open aborted before funding |
+| `channel:voided` | `({ channelId })` | Unfunded/abandoned channel discarded |
+| `splice:complete` | `({ channelId, fundingTxid })` | splice_locked exchanged both ways |
+| `announcement:ready` | `(channelId: Buffer)` | Channel eligible for announcement |
 | `message:outbound` | `(peerPubkey: string, type: number, payload: Buffer)` | Message to send to peer |
-| `htlc:forward` | `(fromChannelId: Buffer, toChannelId: Buffer, amountMsat: bigint, paymentHash: Buffer)` | HTLC forwarded |
+| `htlc:forwarded` | `({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat })` | HTLC relayed to the next hop |
+| `htlc:fulfilled` | `({ channelId, htlcId })` | Forwarded HTLC fulfilled |
+| `htlc:failed` | `({ channelId, htlcId })` | Forwarded HTLC failed |
+| `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice |
 | `peer:connect` | `(pubkey: string)` | Peer connected (networking mode) |
 | `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode) |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode) |
@@ -530,8 +654,14 @@ node.handleNewBlock(blockHeight);
 | `onion:received` | `(payload: IOnionMessagePayload)` | Onion message received (type 513) |
 | `offer:created` | `(offer: IOffer)` | BOLT 12 offer created |
 | `bolt12:invoice:received` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice received |
+| `bolt12:invoice:issued` | `(invoice: IBolt12Invoice)` | BOLT 12 invoice issued to a payer |
+| `log` | `(entry: IStructuredLog)` | Structured action log entry |
 | `node:error` | `(error: ILightningError)` | Operational error (non-fatal) |
 | `node:ready` | `()` | Node fully operational (peers reconnected, channels restored) |
+
+Channel-scoped events carry an **object**, not a bare id: `node.on('channel:ready', ({ channelId }) => ...)`, where `channelId` is a 32-byte Buffer. `announcement:ready` is the exception and passes the Buffer directly. `BeignetNode` normalizes all of these to hex strings.
+
+`LightningNode` reports operational problems through `node:error` and never emits the bare `'error'` event. `ChannelManager` does emit `'error'` as `(channelId: Buffer | null, error: string)`, so code that drives a `ChannelManager` directly (most unit tests) should attach a listener, even a noop, to avoid unhandled-error throws.
 
 ## Typed Payment Errors
 
@@ -546,15 +676,14 @@ node.handleNewBlock(blockHeight);
 | `MISSING_AMOUNT` | Amount-less invoice with no `amountMsat` override |
 | `INVALID_INVOICE` | Cannot determine payee from invoice |
 | `INVOICE_EXPIRED` | Invoice has expired |
+| `INVALID_KEYSEND` | Keysend options failed validation |
 
 ```typescript
-import { LightningPaymentError, LightningErrorCode } from 'beignet/lightning';
-
 try {
-  node.sendPayment(invoice);
+  node.sendPayment(invoiceStr);
 } catch (err) {
-  if (err instanceof LightningPaymentError) {
-    console.log(err.code); // e.g. LightningErrorCode.NO_ROUTE
+  if (err instanceof ln.LightningPaymentError) {
+    console.log(err.code); // e.g. ln.LightningErrorCode.NO_ROUTE
   }
 }
 ```
@@ -564,124 +693,112 @@ try {
 After creating a node with `fromMnemonic()` or restoring from storage, use `waitForReady()` to block until peers are reconnected and channels are restored:
 
 ```typescript
-const node = LightningNode.fromMnemonic(mnemonic, { storage, enableNetworking: true });
+const node = ln.LightningNode.fromMnemonic(mnemonic, { storage, enableNetworking: true });
 await node.waitForReady(30_000); // resolves when peers reconnected, or after 30s timeout
 ```
 
 The `node:ready` event fires once when the node is fully operational. If no peers need reconnection, it fires immediately via `process.nextTick()`.
 
-## INodeConfig: `reestablishTimeoutBlocks`
+## Stuck-Channel Timeout: `reestablishTimeoutBlocks`
 
-Channels stuck in `AWAITING_REESTABLISH` (peer disappeared permanently) are auto-force-closed after `reestablishTimeoutBlocks` blocks (default: 2016, ~2 weeks). Configure via `INodeConfig`:
+Channels stuck in `AWAITING_REESTABLISH` (peer disappeared permanently) are auto-force-closed after `reestablishTimeoutBlocks` blocks (default 2016, roughly 2 weeks). This is an `INodeConfig` field, so it goes through the constructor: `fromMnemonic()` does not expose it.
 
 ```typescript
-const node = LightningNode.fromMnemonic(mnemonic, {
-  reestablishTimeoutBlocks: 1008, // ~1 week instead of default 2 weeks
+const node = new ln.LightningNode({
+  ...config,
+  reestablishTimeoutBlocks: 1008 // ~1 week instead of the default 2 weeks
 });
 ```
 
 ## Module Reference
 
-| Module | Files | Key Exports | BOLT |
-|--------|-------|-------------|------|
-| `bootstrap` | 4 | `bootstrapPeers`, `resolveDnsSeed`, `DEFAULT_DNS_SEEDS` | 10 |
-| `crypto` | 4 | `chacha20poly1305`, `ecdh`, `hkdf` | 8 |
-| `message` | 17 | Message encode/decode for all types, `codec`, `tlv`, `stfu`, interactive-tx, dual-funding, splice | 1, 2 |
-| `features` | 2 | `FeatureFlags` | 9 |
-| `transport` | 5 | `Peer`, `PeerManager`, `CipherState`, `NoiseState` | 8 |
-| `keys` | 5 | `derivation`, `shachain`, `signer`, `wallet-keys` | 3 |
-| `script` | 6 | `funding`, `commitment`, `htlc`, `revocation`, `anchor` | 3 |
-| `channel` | 12 | `Channel`, `ChannelManager`, `CommitmentBuilder`, `ZeroConfManager`, `QuiescenceManager`, `DualFundingSession`, `SpliceSession` | 2 |
-| `interactive-tx` | 4 | `InteractiveTxBuilder`, serial ID validation | 2 |
-| `chain` | 8 | `ChainMonitor`, `OutputResolver`, `ChainWatcher`, `closing`, `sweep` | 5 |
-| `invoice` | 7 | `encode`, `decode`, `amount`, `signing`, `words` | 11 |
-| `gossip` | 9 | `NetworkGraph`, `findRoute`, `GossipSyncManager`, `messages`, `validation` | 7 |
-| `onion` | 9 | `constructOnionPacket`, `processOnionPacket`, `failures`, `constructBlindedPath`, `processBlindedHop` | 4 |
-| `onion-message` | 6 | `OnionMessageManager`, `constructSimpleOnionMessage`, `processOnionMessage` | 4 |
-| `offer` | 8 | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
-| `node` | 3 | `LightningNode` | -- |
-| `storage` | 4 | `SqliteStorage`, `IStorageBackend`, `serialization` | -- |
-| `wallet` | 2 | `WalletFundingProvider`, `IFundingProvider` | -- |
-| `advisor` | 3 | `LiquidityAdvisor`, `FeeAdvisor`, `ChannelSuggestions` | -- |
-| `validation` | 1 | Input validation utilities | -- |
+23 modules. Per-module file counts are deliberately omitted here: they went stale
+faster than anything else in this document. Use `ls src/lightning/<module>` instead.
 
-**Total: 120 implementation files across 20 modules.**
+| Module | Key Exports | BOLT |
+|--------|-------------|------|
+| `bootstrap` | `bootstrapPeers`, `resolveDnsSeed`, `DEFAULT_DNS_SEEDS` | 10 |
+| `crypto` | `chacha20poly1305`, `ecdh`, `hkdf`, MuSig2 (BIP 327) | 8, 3 |
+| `message` | Message encode/decode for all types, `codec`, `tlv`, `stfu`, interactive-tx, dual-funding, splice | 1, 2 |
+| `features` | `FeatureFlags` | 9 |
+| `transport` | `Peer`, `PeerManager`, `CipherState`, `NoiseState`, WebSocket transport, wire capture | 8 |
+| `keys` | `derivation`, `shachain`, `signer`, `wallet-keys` | 3 |
+| `script` | `funding`, `commitment`, `htlc`, `revocation`, `anchor`, taproot commitment/HTLC | 3 |
+| `channel` | `Channel`, `ChannelManager`, `CommitmentBuilder`, `ZeroConfManager`, `QuiescenceManager`, `DualFundingSession`, `SpliceSession`, liquidity ads | 2, bLIP-51 |
+| `interactive-tx` | `InteractiveTxBuilder`, serial ID validation | 2 |
+| `chain` | `ChainMonitor`, `OutputResolver`, `ChainWatcher`, `closing`, `sweep` | 5 |
+| `invoice` | `encode`, `decode`, `amount`, `signing`, `words`, `Network` | 11 |
+| `gossip` | `NetworkGraph`, `findRoute`, `GossipSyncManager`, `messages`, `validation` | 7 |
+| `onion` | `constructOnionPacket`, `processOnionPacket`, `failures`, `constructBlindedPath`, `processBlindedHop` | 4 |
+| `onion-message` | `OnionMessageManager`, `constructSimpleOnionMessage`, `processOnionMessage` | 4 |
+| `offer` | `OfferManager`, `encodeOffer`, `decodeOffer`, TLV, Schnorr, merkle | 12 |
+| `async-payments` | `AsyncPaymentManager` (held forward, release_held_htlc, wake) | 4, 11 |
+| `watchtower` | `WatchtowerClient`, `wtwire`, justice blob, tower connection | -- |
+| `backup` | Static channel backup (SCB) encode/decode | -- |
+| `node` | `LightningNode`, `INodeConfig`, rate limiter | -- |
+| `storage` | `SqliteStorage`, `IStorageBackend`, `serialization` | -- |
+| `wallet` | `WalletFundingProvider`, `IFundingProvider` | -- |
+| `advisor` | `LiquidityAdvisor`, `FeeAdvisor`, `ChannelSuggestions`, rebalance/fee executors | -- |
+| `validation` | Input validation utilities | -- |
+
+`async-payments` and `watchtower` are not yet re-exported as namespaces from `beignet/lightning`; import them from their source paths. Everything else is on the barrel.
 
 ## Testing
 
 ```bash
-# Run lightning unit tests (excludes interop — no Docker needed)
+# Lightning unit tests, interop excluded (no Docker needed)
 npm run test:lightning
 
-# Run interop tests against LND/CLN/Eclair (requires Docker)
+# Official BOLT test vectors (a subset of test:lightning)
+npm run test:conformance
+
+# Interop tests against LND/CLN/Eclair (requires Docker)
 npm run test:interop
 
-# Run everything (unit + interop)
+# Lightning + CLI + interop
 npm run test:all
 
-# Run specific module tests
+# A single module's tests
 npx mocha --exit -r ts-node/register 'tests/lightning/node.test.ts'
-npx mocha --exit -r ts-node/register 'tests/lightning/channel.test.ts'
+npx mocha --exit -r ts-node/register 'tests/lightning/channel-manager.test.ts'
 npx mocha --exit -r ts-node/register 'tests/lightning/offer.test.ts'
 npx mocha --exit -r ts-node/register 'tests/lightning/dual-funding.test.ts'
 ```
 
-### Test Patterns
+| Suite | Cases | Notes |
+|-------|-------|-------|
+| `test:lightning` | 4000+ | No infrastructure required |
+| `test:conformance` | 250+ | Official BOLT vectors, included in the count above |
+| `test:interop` | 190+ | Live LND/CLN/Eclair on regtest, Docker required |
 
-- **Two-party simulation**: Nodes are wired via `message:outbound` event loopback -- no TCP required
-- **Synchronous loopback**: The entire HTLC fulfill chain completes synchronously during `addHtlc()`
-- **Graph population**: Tests inject gossip data directly into `NetworkGraph` rather than using signed messages
-- **Crypto verification**: Signed gossip messages use real cryptographic signatures for validation tests
-- **Docker interop**: LND, CLN, and Eclair interop tests auto-skip when Docker containers are unavailable
-
-### Test Coverage
-
-| Phase | Module | Tests |
-|-------|--------|-------|
-| 0 | Crypto & Messages | 115 |
-| 1 | Transport (BOLT 8) | 73 |
-| 2 | Keys & Scripts (BOLT 3) | -- |
-| 3 | Channel State Machine (BOLT 2) | 161 |
-| 4 | Chain Monitor (BOLT 5) | 67 |
-| 5 | Invoices (BOLT 11) | 98 |
-| 6 | Gossip & Routing (BOLT 7) | 104 |
-| 7 | Onion & Payments (BOLT 4) | 83 |
-| 8-9 | Node API + PeerManager | 68 |
-| 10 | Interop (LND + CLN + Eclair) | 87 |
-| 11 | Production Hardening | -- |
-| -- | Bootstrap (BOLT 10) | 41 |
-| -- | Zero-Conf Channels | 54 |
-| -- | Quiescence (STFU) | 46 |
-| -- | Interactive TX | 107 |
-| -- | Dual-Funding (v2) | 95 |
-| -- | Splicing | 115 |
-| -- | Route Blinding | 45 |
-| -- | Onion Messages | 69 |
-| -- | Offers (BOLT 12) | 102 |
-| -- | Production Hardening 7 | 45 |
-| -- | Production Hardening 8 | 18 |
-| -- | Production Hardening 9-10 | 62 |
-| -- | Electrum Timeouts | 12 |
-| -- | Storage Resilience | 8 |
-| -- | Memory Cleanup | 7 |
-| **Total** | | **2580+** |
-
-Counts are individual test cases (`it(...)` blocks) across ~136 test files, not file counts.
+Counts are floors, not snapshots. Run the suites for exact numbers.
 
 Interop tests are excluded from `npm run test:lightning`. Use `npm run test:interop` to run them with Docker.
 
+### Test Patterns
+
+- **Two-party simulation**: nodes are wired via `message:outbound` event loopback, no TCP required
+- **Synchronous loopback**: the entire HTLC fulfill chain completes synchronously during `addHtlc()`, so store state BEFORE calling it
+- **Graph population**: tests inject gossip data directly into `NetworkGraph` rather than using signed messages
+- **Crypto verification**: signed gossip messages use real cryptographic signatures for validation tests
+- **Conformance vectors**: `tests/lightning/conformance/vectors` holds the official BOLT vectors, expanded into cases at runtime
+- **Docker interop**: LND, CLN and Eclair interop tests auto-skip when the containers are unavailable
+
 ## BOLT Specification Coverage
 
-| BOLT | Name | Status |
-|------|------|--------|
-| 1 | Base Protocol | Complete (init, error, ping/pong) |
-| 2 | Channel Management | Complete (full state machine, 20+ message types, dual-funding, quiescence, splicing, zero-conf) |
-| 3 | Transactions | Complete (funding, commitment, HTLC, revocation, anchor scripts) |
-| 4 | Onion Routing | Complete (Sphinx, hop payloads, failure handling, route blinding, onion messages) |
-| 5 | On-chain Handling | Complete (force close, sweep, output resolution, chain watcher) |
-| 7 | Gossip Protocol | Complete (announcements, graph, Dijkstra pathfinding, gossip sync) |
-| 8 | Transport | Complete (Noise_XK, ChaCha20-Poly1305 framing) |
-| 9 | Feature Flags | Complete (bit manipulation, init negotiation) |
-| 10 | DNS Bootstrap | Complete (SRV resolution, seed nodes, peer discovery) |
-| 11 | Invoices | Complete (encode, decode, signing, amount parsing) |
-| 12 | Offers | Complete (TLV encode/decode, Schnorr signing, merkle tree, bech32m, lno/lnr/lni prefixes) |
+| BOLT | Name | Coverage |
+|------|------|----------|
+| 1 | Base Protocol | init, error, warning, ping/pong, peer storage |
+| 2 | Channel Management | Full state machine, 20+ message types, dual funding, quiescence, splicing, zero-conf |
+| 3 | Transactions | Funding, commitment, HTLC, revocation, anchor scripts; taproot channels via MuSig2 (experimental) |
+| 4 | Onion Routing | Sphinx, hop payloads, failure handling, route blinding, onion messages |
+| 5 | On-chain Handling | Force close, sweep, output resolution, chain watcher, wallet-funded anchor fee bumping |
+| 7 | Gossip Protocol | Announcements, graph, Dijkstra pathfinding, gossip sync, Rapid Gossip Sync |
+| 8 | Transport | Noise_XK, ChaCha20-Poly1305 framing, key rotation |
+| 9 | Feature Flags | Bit manipulation, init negotiation |
+| 10 | DNS Bootstrap | SRV resolution, seed nodes, peer discovery |
+| 11 | Invoices | Encode, decode, signing, amount parsing, hold invoices |
+| 12 | Offers | TLV encode/decode, Schnorr signing, merkle tree, bech32, lno/lnr/lni prefixes, async payment offers |
+| bLIP-51 | Liquidity Ads | lease_rates, request_funds, will_fund, lease fee accounting, CLTV-locked lessor output |
+
+Validated against the official BOLT vectors (`npm run test:conformance`) and against live LND, Core Lightning and Eclair (`npm run test:interop`). Not implemented: trampoline routing, LSPS0/1/2, watchtower server mode. See the root README's [status and limitations](../../README.md#status--limitations) for caveats that apply per feature.

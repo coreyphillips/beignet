@@ -106,7 +106,8 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 				amountMsat: bigint,
 				paymentHash: Buffer,
 				hopPayload: unknown,
-				preimage: Buffer
+				preimage: Buffer,
+				declaredTotalMsat: bigint
 			) => void;
 		};
 
@@ -117,7 +118,8 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 			600n,
 			paymentHash,
 			hopPayload,
-			preimage
+			preimage,
+			totalMsat
 		);
 		expect(calls.length, 'no preimage recorded before MPP completes').to.equal(
 			0
@@ -130,7 +132,8 @@ describe('C4 regression: preimage → ChainMonitor wiring', function () {
 			600n,
 			paymentHash,
 			hopPayload,
-			preimage
+			preimage,
+			totalMsat
 		);
 
 		expect(

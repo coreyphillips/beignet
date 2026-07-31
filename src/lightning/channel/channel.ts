@@ -284,8 +284,9 @@ export interface ISpliceWalletInput {
 	/** nSequence for this input. */
 	sequence: number;
 	/** Produce the witness stack for this input on the given (unsigned) tx.
-	 *  P2TR inputs need every input's prevout script+value for the BIP 341
-	 *  sighash — callers supply them via `prevouts` (aligned with tx.ins). */
+	 *  P2TR inputs need every input's prevout script and value for the
+	 *  BIP 341 sighash; callers supply them via `prevouts` (aligned with
+	 *  tx.ins). P2WPKH signers ignore the argument. */
 	signWitness: (
 		tx: import('bitcoinjs-lib').Transaction,
 		inputIndex: number,
@@ -7244,6 +7245,7 @@ export class Channel {
 					value: this._state.fundingSatoshis
 				}
 			);
+			if (!prevouts) return null;
 			for (let i = 0; i < tx.ins.length; i++) {
 				if (i === sharedInputIndex) continue;
 				const prevTxid = Buffer.from(tx.ins[i].hash);
@@ -7268,7 +7270,7 @@ export class Channel {
 					}
 					continue;
 				}
-				const witness = w.signWitness(tx, i, w.value, prevouts ?? undefined);
+				const witness = w.signWitness(tx, i, w.value, prevouts);
 				tx.setWitness(i, witness);
 				ourWalletWitnesses.push(witness);
 				ourWalletInputIndices.push(i);
@@ -11271,6 +11273,7 @@ export class Channel {
 
 		return actions;
 	}
+
 
 	/**
 	 * Assemble the fully-signed v2 funding tx: our wallet witnesses (re-signed

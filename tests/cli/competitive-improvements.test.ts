@@ -524,34 +524,71 @@ describe('Drain Mode', () => {
 // ─────────────── Documentation ───────────────
 
 describe('Documentation Accuracy', () => {
-	it('README.md contains updated test count', () => {
+	// These used to pin exact figures ('2740+', '129 interop', '720 CLI').
+	// Every one of them had drifted below reality, so the test was enforcing
+	// documentation that was already wrong. Counts in the README are now
+	// floors, and the assertions below guard structure instead of prose.
+	it('README.md documents every test suite script', () => {
 		const readme = fs.readFileSync(
 			path.join(__dirname, '../../README.md'),
 			'utf-8'
 		);
-		expect(readme).to.include('2740+');
-		expect(readme).to.include('129 interop');
-		expect(readme).to.include('720 CLI');
+		const pkg = JSON.parse(
+			fs.readFileSync(path.join(__dirname, '../../package.json'), 'utf-8')
+		);
+		// Derived from package.json rather than hardcoded, so adding a suite
+		// without documenting it fails here.
+		const suites = Object.keys(pkg.scripts).filter((s) =>
+			s.startsWith('test:')
+		);
+		expect(suites.length).to.be.greaterThan(0);
+		for (const suite of suites) {
+			expect(readme, `README should mention the ${suite} script`).to.include(
+				suite
+			);
+		}
+		// The suites run directly by name must show their invocation.
+		for (const suite of ['test:lightning', 'test:cli', 'test:interop']) {
+			expect(readme, `README should document npm run ${suite}`).to.include(
+				`npm run ${suite}`
+			);
+		}
+		// Stated counts must be floors ('4000+'), never exact snapshots, so a
+		// passing suite can never be described by a number that is too high.
+		const countClaims = readme.match(/\b\d{3,}\+? (?=Lightning|CLI|official)/g);
+		for (const claim of countClaims ?? []) {
+			expect(claim.trim(), 'test counts must be written as floors').to.match(
+				/\+$/
+			);
+		}
 	});
 
-	it('README.md module table includes advisor/', () => {
+	it('README.md module table covers every src/lightning module', () => {
 		const readme = fs.readFileSync(
 			path.join(__dirname, '../../README.md'),
 			'utf-8'
 		);
-		expect(readme).to.include('`advisor/`');
-		expect(readme).to.include(
-			'Liquidity, fee, and channel suggestion advisors'
-		);
+		const lightningDir = path.join(__dirname, '../../src/lightning');
+		const modules = fs
+			.readdirSync(lightningDir, { withFileTypes: true })
+			.filter((entry) => entry.isDirectory())
+			.map((entry) => entry.name);
+		expect(modules.length).to.be.greaterThan(0);
+		for (const mod of modules) {
+			expect(readme, `README module table should list \`${mod}/\``).to.include(
+				`\`${mod}/\``
+			);
+		}
 	});
 
-	it('README.md TOC says "Interop Testing" (not "Interop Testing with LND")', () => {
+	it('README.md documents interop testing against real implementations', () => {
 		const readme = fs.readFileSync(
 			path.join(__dirname, '../../README.md'),
 			'utf-8'
 		);
-		expect(readme).to.include('[Interop Testing](#interop-testing)');
-		expect(readme).not.to.include('[Interop Testing with LND]');
+		expect(readme).to.include('npm run test:interop');
+		expect(readme).to.include('docker/docker-compose.yml');
+		expect(readme.toLowerCase()).to.include('interop');
 	});
 
 	it('README.md includes Node.js 18+ requirement', () => {

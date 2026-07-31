@@ -261,14 +261,23 @@ export class Electrum {
 			connected = true;
 			break;
 		}
-		if (!connected && !this.wallet.isSwitchingNetworks) return err(lastError);
+		// A network switch needs the network fields updated even when the new
+		// network has no reachable server, but that must never be reported as
+		// success: every Electrum call gates on connectedToElectrum, and a
+		// false success leaves them all believing a connection exists.
 		this.network = network;
 		this.electrumNetwork = electrumNetwork;
 		if (customPeers.length) {
 			this.servers = customPeers;
 		}
+		if (!connected) {
+			this.publishConnectionChange(false);
+			return err(lastError);
+		}
 		this.publishConnectionChange(true);
-		this.subscribeToHeader().then();
+		this.subscribeToHeader().catch(() => {
+			// Best-effort: the header subscription is rebuilt on reconnect.
+		});
 		return ok('Connected to Electrum server.');
 	}
 
@@ -722,17 +731,28 @@ export class Electrum {
 			const existingUtxos: { [key: string]: IUtxo } = {};
 
 			for (const addressType of addressTypesToCheck) {
-				const addressCount = Object.keys(currentWallet.addresses[addressType])
-					?.length;
-
-				// Check if addresses of this type have been generated. If not, skip.
-				if (addressCount <= 0) {
-					break;
-				}
-
 				// Grab all addresses and change addresses.
-				const allAddresses = currentWallet.addresses[addressType];
-				const allChangeAddresses = currentWallet.changeAddresses[addressType];
+				const allAddresses = currentWallet.addresses[addressType] ?? {};
+				const allChangeAddresses =
+					currentWallet.changeAddresses[addressType] ?? {};
+
+				// Skip a type only when NEITHER collection has been generated.
+				// Two things to note here:
+				//   - `continue`, not `break`: address types are independent, and a
+				//     `break` dropped every LATER type from the query. Since p2tr is
+				//     last in EAddressType, a wallet with no p2sh addresses returned
+				//     zero UTXOs for its own p2tr addresses, indistinguishable from
+				//     having no funds.
+				//   - both collections are checked: getChangeAddress generates with
+				//     `addressAmount: 0`, so a type can hold change addresses and no
+				//     receiving addresses. Testing only the receiving side skipped
+				//     those change addresses, dropping real UTXOs from the scan.
+				if (
+					Object.keys(allAddresses).length === 0 &&
+					Object.keys(allChangeAddresses).length === 0
+				) {
+					continue;
+				}
 
 				if (scanningStrategy === EScanningStrategy.all) {
 					addresses = { ...addresses, ...allAddresses };
@@ -1259,14 +1279,18 @@ export class Electrum {
 	}
 
 	private publishConnectionChange(isConnected: boolean): void {
-		if (
-			this.latestConnectionState !== isConnected &&
-			!this.wallet.isSwitchingNetworks
-		) {
-			this.sendMessage('connectedToElectrum', isConnected);
-			this.connectedToElectrum = isConnected;
-			this.latestConnectionState = isConnected;
-		}
+		const stateChanged = this.latestConnectionState !== isConnected;
+		// Internal truth always tracks, including mid-switch: the reconnect
+		// guards read connectedToElectrum, and a stale true would survive a
+		// failed switch connect otherwise.
+		this.connectedToElectrum = isConnected;
+		// Externally observable transition events stay suppressed during a
+		// switch. latestConnectionState is deliberately left alone then, so
+		// the first check after the switch announces the final state instead
+		// of assuming it was already published.
+		if (this.wallet.isSwitchingNetworks || !stateChanged) return;
+		this.sendMessage('connectedToElectrum', isConnected);
+		this.latestConnectionState = isConnected;
 	}
 
 	public async disconnect(): Promise<void> {

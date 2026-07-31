@@ -10,7 +10,7 @@ import {
 	TGetByteCountInputs,
 	TGetByteCountOutputs
 } from '../types';
-import { reduceValue } from './wallet';
+import { availableNetworks, reduceValue } from './wallet';
 import validate, { getAddressInfo } from 'bitcoin-address-validation';
 import * as bip21 from 'bip21';
 import { TRANSACTION_DEFAULTS } from '../wallet/constants';
@@ -219,6 +219,31 @@ export const constructByteCountParam = (
 	}
 };
 
+// Patch for https://github.com/coreyphillips/moonshine/issues/52: an OP_RETURN
+// payload shorter than this is padded out with spaces.
+const MIN_OP_RETURN_PAYLOAD_BYTES = 5;
+
+/**
+ * Builds the OP_RETURN script for a message, or undefined when there is no
+ * message to embed. Both the PSBT builder and getByteCount go through this, so
+ * the fee estimate cannot drift from the script that actually gets built.
+ * @param {string} [message]
+ * @returns {Buffer | undefined}
+ */
+export const createOpReturnScript = (message?: string): Buffer | undefined => {
+	if (!message || message.trim() === '') {
+		return undefined;
+	}
+	let payload = Buffer.from(message, 'utf8');
+	if (payload.length < MIN_OP_RETURN_PAYLOAD_BYTES) {
+		payload = Buffer.concat([
+			payload,
+			Buffer.alloc(MIN_OP_RETURN_PAYLOAD_BYTES - payload.length, 0x20)
+		]);
+	}
+	return bitcoin.payments.embed({ data: [payload] }).output;
+};
+
 /*
 	Adapted from: https://gist.github.com/junderw/b43af3253ea5865ed52cb51c200ac19c
 	Usage:
@@ -325,11 +350,20 @@ export const getByteCount = (
 					return parseInt(item);
 				});
 
-				totalWeight += types.inputs[newKey] * count;
+				const multisigWeight = types.inputs[newKey];
+				if (multisigWeight === undefined)
+					throw new Error('invalid input: ' + key);
+				totalWeight += multisigWeight * count;
 				const multiplyer = newKey === 'MULTISIG-P2SH' ? 4 : 1;
 				totalWeight += (73 * mAndN[0] + 34 * mAndN[1]) * multiplyer * count;
 			} else {
-				totalWeight += types.inputs[key] * count;
+				// An unknown key used to make totalWeight NaN, and NaN fails the
+				// minByteCount comparison below, so the function returned NaN
+				// instead of the fallback its catch provides. types.inputs has no
+				// plain P2WSH entry, which is the reachable case.
+				const weight = types.inputs[key];
+				if (weight === undefined) throw new Error('invalid input: ' + key);
+				totalWeight += weight * count;
 			}
 			inputCount += count;
 			// Any segwit input needs the 2-WU marker+flag. P2TR is segwit (v1) but
@@ -343,14 +377,22 @@ export const getByteCount = (
 			const count = outputs[originalKey];
 			const key = originalKey.toUpperCase();
 			checkUInt53(count);
-			totalWeight += types.outputs[key] * count;
+			const weight = types.outputs[key];
+			if (weight === undefined) throw new Error('invalid output: ' + key);
+			totalWeight += weight * count;
 			outputCount += count;
 		});
 
 		if (hasWitness) totalWeight += 2;
-		if (message?.length) {
-			// Multiply by 2 to help ensure Electrum servers will broadcast the tx.
-			totalWeight += message.length * 2;
+		// Price the exact script the PSBT builder will embed, rather than a second
+		// copy of its serialization rules. The message was previously added as
+		// message.length * 2 weight units, which is half the payload in vbytes
+		// once totalWeight is divided by 4, and nothing for the output itself.
+		const opReturnScript = createOpReturnScript(message);
+		if (opReturnScript) {
+			totalWeight +=
+				(8 + varIntLength(opReturnScript.length) + opReturnScript.length) * 4;
+			outputCount += 1;
 		}
 
 		totalWeight += 8 * 4;
@@ -364,14 +406,60 @@ export const getByteCount = (
 	}
 };
 
+// Bitcoin Core prices dust at three sats per vbyte (the default dust relay
+// fee) over the serialized output plus the cost of spending it: 67 vbytes for
+// a witness program, 148 for anything else. See GetDustThreshold in
+// src/policy/policy.cpp.
+const DUST_RELAY_SATS_PER_VBYTE = 3;
+const WITNESS_SPEND_VBYTES = 67;
+const LEGACY_SPEND_VBYTES = 148;
+// 8 byte value + 1 byte script length prefix.
+const OUTPUT_SERIALIZE_OVERHEAD = 9;
+
 /**
- * Removes outputs that are below the dust limit.
+ * Returns the dust threshold in sats for the given address. An output below it
+ * is non-standard and will not relay. The value depends on the output script:
+ * 294 for P2WPKH, 330 for P2TR and P2WSH, 540 for P2SH and 546 for P2PKH.
+ * @param {string} address
+ * @returns {number}
+ */
+export const getDustThreshold = (address: string): number => {
+	try {
+		// OP_<witness version> + push byte + witness program.
+		const { data } = bitcoin.address.fromBech32(address);
+		return (
+			DUST_RELAY_SATS_PER_VBYTE *
+			(OUTPUT_SERIALIZE_OVERHEAD + 2 + data.length + WITNESS_SPEND_VBYTES)
+		);
+	} catch {
+		// Not a segwit address. Fall through to base58.
+	}
+	try {
+		const { version } = bitcoin.address.fromBase58Check(address);
+		const isP2sh = availableNetworks().some(
+			(network) => getBitcoinJsNetwork(network).scriptHash === version
+		);
+		// P2SH is OP_HASH160 <20 bytes> OP_EQUAL. P2PKH wraps the same hash in
+		// OP_DUP, OP_HASH160, OP_EQUALVERIFY and OP_CHECKSIG.
+		const scriptSize = isP2sh ? 23 : 25;
+		return (
+			DUST_RELAY_SATS_PER_VBYTE *
+			(OUTPUT_SERIALIZE_OVERHEAD + scriptSize + LEGACY_SPEND_VBYTES)
+		);
+	} catch {
+		// Unrecognized format. Fall back to the most conservative threshold.
+		return TRANSACTION_DEFAULTS.dustLimit;
+	}
+};
+
+/**
+ * Removes outputs that are below the dust threshold of their address type.
  * @param {IOutput[]} outputs
  * @returns {IOutput[]}
  */
 export const removeDustOutputs = (outputs: IOutput[]): IOutput[] => {
 	return outputs.filter((output) => {
-		return output.value >= TRANSACTION_DEFAULTS.dustLimit;
+		return output.value >= getDustThreshold(output.address);
 	});
 };
 
@@ -383,8 +471,6 @@ export const removeDustOutputs = (outputs: IOutput[]): IOutput[] => {
 export const validateTransaction = (
 	transaction: ISendTransaction
 ): Result<string> => {
-	const baseFee = TRANSACTION_DEFAULTS.recommendedBaseFee;
-
 	try {
 		if (!transaction.fee) {
 			return err('No transaction fee provided.');
@@ -404,9 +490,13 @@ export const validateTransaction = (
 			if (!isValid) {
 				return err(`Invalid Address: ${address}`);
 			}
-			if (value < baseFee) {
+			// Erring here keeps a sub-dust output from reaching the PSBT, where it
+			// would make the transaction unrelayable. Dropping it instead would
+			// hand the caller's payment to the miner as fee.
+			const dustThreshold = getDustThreshold(address);
+			if (value < dustThreshold) {
 				return err(
-					`Output value for ${address} must be greater than or equal to ${baseFee} sats`
+					`Output value for ${address} must be greater than or equal to the dust threshold of ${dustThreshold} sats`
 				);
 			}
 			if (!Number.isInteger(value)) {

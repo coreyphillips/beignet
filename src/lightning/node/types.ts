@@ -7,6 +7,7 @@
  */
 
 import { Network } from '../invoice/types';
+import { IBolt12Invoice } from '../offer/types';
 import { IChannelConfig, ChannelState } from '../channel/types';
 import { IChannelBasepoints } from '../keys/derivation';
 import { IRoute, INodeAddress } from '../gossip/types';
@@ -456,9 +457,25 @@ export interface IKeysendRetrySource {
 }
 
 export interface IPaymentRetryContext {
-	/** Absent for keysend, which replays `keysend` instead. */
+	/** Absent for keysend and BOLT 12, which replay their own sources. */
 	invoiceStr?: string;
 	keysend?: IKeysendRetrySource;
+	/**
+	 * A BOLT 12 payment has no invoice string to re-pay, so a retry
+	 * re-dispatches the decoded invoice through payBolt12Invoice with the
+	 * accumulated channel exclusions.
+	 */
+	bolt12Invoice?: IBolt12Invoice;
+	/** Index into bolt12Invoice.paths used by the current attempt. */
+	bolt12PathIndex?: number;
+	/**
+	 * Indices of bolt12Invoice.paths whose BLINDED segment failed. Channel
+	 * exclusion cannot route around a blinded hop (its SCID is opaque), so
+	 * route selection skips these paths entirely and a retry rotates to the
+	 * invoice's other paths (BOLT 4: on a failure from a blinded hop the
+	 * origin SHOULD use a different blinded path).
+	 */
+	bolt12ExcludedPathIndices?: Set<number>;
 	excludedChannels: Set<string>;
 	retryCount: number;
 	maxRetries: number;
@@ -633,7 +650,11 @@ export interface IPaymentPart {
 }
 
 export interface IPendingMppPayment {
-	paymentSecret: Buffer;
+	/**
+	 * Absent for blinded-final (BOLT 12) parts, which carry no payment_data:
+	 * their per-part authenticity is the blinded path_id check instead.
+	 */
+	paymentSecret?: Buffer;
 	totalMsat: bigint;
 	receivedParts: IPaymentPart[];
 	createdAt: number;
@@ -651,6 +672,12 @@ export interface IOutboundMppPart {
 	htlcId: bigint;
 	amountMsat: bigint;
 	status: PaymentStatus;
+	/**
+	 * This part's own onion shared secrets. Every part is a distinct onion,
+	 * so a returned failure can only be decrypted (and its culpable hop
+	 * attributed) with the secrets of the part it came back on.
+	 */
+	sharedSecrets: Buffer[];
 }
 
 export interface ILightningBalance {
@@ -670,6 +697,13 @@ export interface IOutboundMppState {
 	totalMsat: bigint;
 	parts: IOutboundMppPart[];
 	createdAt: number;
+	/**
+	 * Set once every part has been dispatched. In a synchronous transport a
+	 * part can fail back while later parts are still being sent; the state
+	 * must not be dropped until dispatch has finished AND every part has
+	 * resolved, or the late parts' failures lose their decryption context.
+	 */
+	dispatchComplete?: boolean;
 }
 
 // ─── Typed Payment Errors ───

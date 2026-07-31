@@ -2440,7 +2440,7 @@ export class Wallet {
 		txid: string;
 		index: number;
 		/** Optional origin marker (e.g. 'funding-pledge') persisted with the
-		 *  entry so automated freezers can recognize — and recover — their own
+		 *  entry so automated freezers can recognize, and recover, their own
 		 *  freezes after a restart without touching user-frozen coins. */
 		tag?: string;
 	}): Promise<Result<string>> {
@@ -2850,11 +2850,10 @@ export class Wallet {
 		const sentTxs: TTransactionMessage[] = [];
 
 		Object.keys(transactions).forEach((txid) => {
+			const stored = storedTransactions[txid];
+			const isNew = !stored;
 			//If the tx is new or the tx now has a block height (state changed to confirmed)
-			if (
-				!storedTransactions[txid] ||
-				storedTransactions[txid].height !== transactions[txid].height
-			) {
+			if (isNew || stored.height !== transactions[txid].height) {
 				formattedTransactions[txid] = {
 					...transactions[txid],
 					// Keep the previous timestamp if the tx is not new.
@@ -2863,12 +2862,27 @@ export class Wallet {
 						transactions[txid]?.timestamp ??
 						Date.now()
 				};
-				if ((formattedTransactions[txid]?.height ?? 0) > 0)
+				// A confirmation is a transition: a transaction the wallet already
+				// held moving from the mempool into a block. A transaction first
+				// discovered with a height, found at a catch-up sync after
+				// downtime, is one piece of news and not two; its appearance
+				// message already carries the height, and announcing its
+				// confirmation as well produced two messages for one discovery,
+				// in reverse order, since confirmations are sent before
+				// appearances below. A height moving between blocks in a reorg
+				// is not a confirmation either, and the reorg path has its own
+				// message.
+				if (
+					!isNew &&
+					(stored.height ?? 0) <= 0 &&
+					(formattedTransactions[txid]?.height ?? 0) > 0
+				) {
 					confirmedTxs.push({ transaction: formattedTransactions[txid] });
+				}
 			}
 
 			// if the tx is new, incoming but not from a transfer - show notification
-			if (!(txid in storedTransactions)) {
+			if (isNew) {
 				if (transactions[txid].type === EPaymentType.received) {
 					receivedTxs.push({ transaction: transactions[txid] });
 				} else if (transactions[txid].type === EPaymentType.sent) {
@@ -3930,7 +3944,7 @@ export class Wallet {
 				}
 			});
 			if (updateSendTransactionRes.isErr())
-				err(updateSendTransactionRes.error.message);
+				return err(updateSendTransactionRes.error.message);
 			index++;
 		}
 
@@ -3943,9 +3957,10 @@ export class Wallet {
 						`Fee is too high. The maximum fee for this transaction is ${feeInfo.value.maxSatPerByte}`
 					);
 				}
-			} else {
-				return err(updateFeeRes.error.message);
 			}
+			// The fee probe above only refines the message. Either way the fee was
+			// never updated, so never fall through to build and broadcast.
+			return err(updateFeeRes.error.message);
 		}
 
 		const createRes = await this.transaction.createTransaction({
@@ -4913,11 +4928,12 @@ export class Wallet {
 			const txData = this.transaction.data;
 			const inputs = txData?.inputs ?? [];
 			const newInputs = [...inputs, input];
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					inputs: newInputs
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to add transaction input.', e);
@@ -4939,11 +4955,12 @@ export class Wallet {
 					return txInput;
 				}
 			});
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					inputs: newInputs
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok(newInputs);
 		} catch (e) {
 			this.logger.error('Failed to remove transaction input.', e);
@@ -4961,12 +4978,13 @@ export class Wallet {
 			const txData = this.transaction.data;
 			let tags = [...txData.tags, tag];
 			tags = [...new Set(tags)]; // remove duplicates
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					...txData,
 					tags
 				}
 			});
+			if (updateRes.isErr()) return err(updateRes.error.message);
 			return ok('Tag successfully added');
 		} catch (e) {
 			this.logger.error('Failed to add transaction tag.', e);
@@ -4985,13 +5003,14 @@ export class Wallet {
 			const tags = txData.tags;
 			const newTags = tags.filter((t) => t !== tag);
 
-			this.transaction.updateSendTransaction({
+			const updateRes = this.transaction.updateSendTransaction({
 				transaction: {
 					...txData,
 					tags: newTags
 				}
 			});
-			return ok('Tag successfully added');
+			if (updateRes.isErr()) return err(updateRes.error.message);
+			return ok('Tag successfully removed');
 		} catch (e) {
 			this.logger.error('Failed to remove transaction tag.', e);
 			return err(e);

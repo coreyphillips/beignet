@@ -915,12 +915,34 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					requestBody: bodyContent({
 						description: 'string',
 						amountSats: 'number?',
-						issuer: 'string?'
+						issuer: 'string?',
+						expirySecs: 'number?'
 					}),
 					responses: {
 						'200': {
 							description: 'Offer info',
 							content: jsonContent({ $ref: '#/components/schemas/OfferInfo' })
+						}
+					}
+				}
+			},
+			'/offer': {
+				delete: {
+					summary: 'Remove a stored offer',
+					tags: ['Offers'],
+					parameters: [
+						{
+							name: 'offerId',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' },
+							description: 'Offer id (64 hex characters)'
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Removal result',
+							content: jsonContent({ removed: 'boolean' })
 						}
 					}
 				}
@@ -1754,7 +1776,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2053,6 +2075,50 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						'200': {
 							description: 'Channel info',
 							content: jsonContent({ $ref: '#/components/schemas/ChannelInfo' })
+						}
+					}
+				}
+			},
+			'/channel/funding-quote': {
+				post: {
+					summary:
+						'Peer-aware max channel-funding quote: decides v1 vs v2 the same way openChannel does (both inits advertising option_dual_fund) and prices the max open with the exact formula that flow commits, so the previewed amount matches the opened channel',
+					tags: ['Channels'],
+					requestBody: bodyContent({
+						peerPubkey: 'string',
+						satsPerVbyte: 'number'
+					}),
+					responses: {
+						'200': {
+							description: 'Channel funding quote',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									method: { type: 'string', enum: ['v1', 'v2'] },
+									peerKnown: {
+										type: 'boolean',
+										description:
+											'false when the peer sent no init (not connected); the quote then falls back to the v1 sweep'
+									},
+									satsPerVbyte: { type: 'number' },
+									fundingSatoshis: { type: 'number' },
+									feeSats: { type: 'number' },
+									feeratePerKw: {
+										type: 'number',
+										description: 'v2 only'
+									},
+									spendableSats: {
+										type: 'number',
+										description: 'v2 only'
+									},
+									inputCount: { type: 'number' },
+									vsize: { type: 'number', description: 'v1 only' },
+									maxSatsPerVbyte: {
+										type: 'number',
+										description: 'v1 only'
+									}
+								}
+							})
 						}
 					}
 				}
@@ -2656,6 +2722,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'boolean',
 							description:
 								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+						},
+						peerSupportsSplicing: {
+							type: 'boolean',
+							description:
+								'Whether the connected peer negotiated option_splice + option_quiesce. Absent when the peer is disconnected or mid-handshake: absence means unknown, never unsupported'
 						},
 						payThroughSplice: {
 							type: 'boolean',

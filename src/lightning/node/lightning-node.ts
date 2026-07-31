@@ -60,6 +60,7 @@ import {
 	INodeAnnouncementMessage,
 	INodeAddress,
 	IRoute,
+	IRouteHop,
 	ADDRESS_TYPE_TORV2,
 	ADDRESS_TYPE_TORV3
 } from '../gossip/types';
@@ -324,6 +325,13 @@ const HELD_HTLC_EXPIRY_MARGIN = 18;
 const MAX_TRUSTED_PEER_HEIGHT_SKEW = 6;
 
 /**
+ * Grace past an issued BOLT 12 invoice's expiry before its never-paid state
+ * is swept, covering an HTLC already in flight at expiry (mirrors the
+ * OfferManager preimage retention grace).
+ */
+const ISSUED_INVOICE_SWEEP_GRACE_SECONDS = 3600;
+
+/**
  * Blocks of padding added to the final CLTV delta of an outgoing payment, on top
  * of whatever the payee advertised. We apply that delta against OUR block height,
  * so when our height is briefly behind the payee's the unpadded expiry lands below
@@ -382,7 +390,15 @@ export class LightningNode extends EventEmitter {
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
 	private chainWatcher: ChainWatcher | null = null;
-	private _chainWatcherEventsWired = false;
+	/**
+	 * The watcher instance these events are wired to, rather than a one-shot
+	 * boolean. A boolean could never be reset, so a watcher that was stopped and
+	 * started again was left with no listeners at all: no block, no error, no
+	 * watch:output:requested reached the node, and it silently stopped tracking
+	 * the chain. Keyed on the instance, a replacement watcher is always wired and
+	 * the same one is never wired twice.
+	 */
+	private _wiredChainWatcher: ChainWatcher | null = null;
 	private currentBlockHeight = 0;
 	private htlcSafetyMargin: number;
 	private forwardingEnabled: boolean;
@@ -442,6 +458,14 @@ export class LightningNode extends EventEmitter {
 	// keys, breaking penalty/to_remote/HTLC claims after a restart (audit H2).
 	private revocationBasepointSecret: Buffer | undefined;
 	private paymentBasepointSecret: Buffer | undefined;
+	/**
+	 * Signed funding txs we are OBLIGATED to broadcast (BOLT 2: once
+	 * funding_signed is received the funder must broadcast), keyed by funding
+	 * txid in internal byte order. An entry lives until the funding CONFIRMS,
+	 * not merely until one broadcast succeeds: a transient broadcast failure
+	 * or a later mempool eviction is retried on every new block, and the map
+	 * is persisted so a restart resumes the obligation.
+	 */
 	private pendingFundingTxs: Map<string, string> = new Map();
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -479,6 +503,16 @@ export class LightningNode extends EventEmitter {
 	private _reconnectTimers: Set<ReturnType<typeof setTimeout>> = new Set();
 	private _activeWaitCleanups: Set<() => void> = new Set();
 	private _destroyed = false;
+	/**
+	 * Bumped by destroy() and by each startChainWatcher(). The chain startup
+	 * sequence is a long chain of awaits (watcher start, then a restore loop
+	 * doing network work per channel), and destroy() cannot reach into it: a
+	 * continuation resuming afterwards would restart the reconnect monitor
+	 * destroy() just stopped, rebroadcast transactions and retry funding
+	 * broadcasts for a node that is gone. Every step re-checks the generation
+	 * it started in, which also retires a superseded startChainWatcher().
+	 */
+	private chainStartupGeneration = 0;
 	private missionControlTimer: ReturnType<typeof setInterval> | null = null;
 	private onionMessageManager: OnionMessageManager;
 	private offerManager: OfferManager;
@@ -701,7 +735,14 @@ export class LightningNode extends EventEmitter {
 		this.wireOnionMessageEvents();
 
 		this.offerManager = new OfferManager(config.nodePrivateKey, {
-			onionMessageManager: this.onionMessageManager
+			onionMessageManager: this.onionMessageManager,
+			// Invoices issued from an async-hold offer get fresh per-invoice
+			// payment paths through the LSP: hold flag intact, the given
+			// path_id in the final hop, and the TRUE aggregate payinfo
+			// (reusing the offer's message paths advertised fabricated zero
+			// fees, leaving the payment underfunded at the LSP hop).
+			buildHoldPaymentPaths: (pathId: Buffer) =>
+				this.buildBlindedPaymentPaths(true, 3, pathId)
 		});
 		this.wireOfferManagerEvents();
 
@@ -1043,6 +1084,14 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// Restore BOLT 12 offers so a shared offer keeps answering
+		// invoice_requests after a restart instead of dying with the process.
+		this.offerManager.attachStorage(this.storage);
+
+		// Restore funding txs still awaiting broadcast/confirmation so the
+		// BOLT 2 broadcast obligation survives a restart.
+		this.restorePendingFundingTxs();
+
 		// Restore parked hold-invoice HTLCs so settle/cancel survive restart.
 		const heldJson = this.storage.loadMetadata('held_htlcs');
 		if (heldJson) {
@@ -1299,13 +1348,18 @@ export class LightningNode extends EventEmitter {
 		if (!peer) return;
 		try {
 			const channelIdHex = channelId.toString('hex');
-			this.storage.saveChannel(channelIdHex, channel.getFullState(), peer);
-			// Persist per-channel key index so the correct signing key
-			// is restored after restart (fixes force-close signature mismatch)
 			const keyIndex = channel.channelKeyIndex;
-			if (keyIndex != null) {
-				this.storage.saveChannelKeyIndex(channelIdHex, keyIndex);
-			}
+			// One transaction: channel state persisted without its key index
+			// restores a channel that signs its force-close with the wrong
+			// key, and the row looks complete so nothing flags it.
+			this.storage.transaction(() => {
+				this.storage!.saveChannel(channelIdHex, channel.getFullState(), peer);
+				// Persist per-channel key index so the correct signing key
+				// is restored after restart (fixes force-close signature mismatch)
+				if (keyIndex != null) {
+					this.storage!.saveChannelKeyIndex(channelIdHex, keyIndex);
+				}
+			});
 		} catch (err) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
@@ -1331,6 +1385,52 @@ export class LightningNode extends EventEmitter {
 				} as ILightningError);
 			}
 		}
+	}
+
+	/**
+	 * Persist the payment record, THROWING on any failure. For use inside a
+	 * storage transaction, where a swallowed error would let the transaction
+	 * commit the other writes without this one (persistPayment catches, so a
+	 * transaction wrapping it can never roll back on its account).
+	 */
+	private persistPaymentOrThrow(paymentHash: Buffer): void {
+		if (!this.storage) throw new Error('storage is not configured');
+		const hashHex = paymentHash.toString('hex');
+		const payment = this.payments.get(hashHex);
+		if (!payment) throw new Error(`payment record missing: ${hashHex}`);
+		this.storage.savePayment(hashHex, payment);
+	}
+
+	/**
+	 * Persist an invoice's full record set (preimage, payment secret, invoice
+	 * row, payment record) in ONE transaction: all four land or none do. A
+	 * partial set is a half-claimable payment hash that restore never flags
+	 * (invoices and payments are restored independently, so a missing payment
+	 * row breaks receive accounting while the hash stays fulfillable).
+	 */
+	private persistInvoiceRecords(
+		paymentHash: Buffer,
+		invoiceInfo: IInvoiceInfo,
+		preimage?: Buffer,
+		paymentSecret?: Buffer,
+		bolt12PathId?: Buffer
+	): void {
+		this.safeStorage(() => {
+			this.storage!.transaction(() => {
+				const hashHex = paymentHash.toString('hex');
+				if (preimage) this.storage!.savePreimage(hashHex, preimage);
+				if (paymentSecret) {
+					this.storage!.savePaymentSecret(hashHex, paymentSecret);
+				}
+				// Same transaction as the preimage: a BOLT 12 invoice must never
+				// persist as claimable without its authentication path_id.
+				if (bolt12PathId) {
+					this.storage!.saveInvoicePathId?.(hashHex, bolt12PathId);
+				}
+				this.storage!.saveInvoice(hashHex, invoiceInfo);
+				this.persistPaymentOrThrow(paymentHash);
+			});
+		}, 'persistInvoiceRecords');
 	}
 
 	/**
@@ -1633,26 +1733,14 @@ export class LightningNode extends EventEmitter {
 		// pendingFundingTxs is keyed by funding txid hex
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
-			const txHex = this.pendingFundingTxs.get(txidHex);
-			if (txHex && this.fundingProvider) {
-				this.pendingFundingTxs.delete(txidHex);
-				this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
-					this.emitStructuredLog('chain', 'broadcast_failed', {
-						txid: txidHex,
-						error: (err as Error).message
-					});
-					this.emit('node:error', {
-						code: 'FUNDING_BROADCAST_FAILED',
-						message: (err as Error).message,
-						timestamp: Date.now()
-					} as ILightningError);
-				});
-			}
+			this.broadcastPendingFundingTx(txidHex);
 			// Register the funding output with the chain watcher NOW, not only
-			// on restart: live confirmation detection, announcement depth, and
-			// the funding-missing watchdog (critical for zero-conf channels,
-			// whose state machine no longer waits for the chain) all key off
-			// this watch.
+			// on restart: live confirmation detection, announcement depth,
+			// breach detection and the funding-missing watchdog (critical for
+			// zero-conf channels, whose state machine no longer waits for the
+			// chain) all key off this watch. Previously chain watches were only
+			// armed by restoreChainWatches at startup, so a live-opened channel
+			// had none of this coverage until the node restarted.
 			this.registerFundingWatch(fundingTxid).catch((err) => {
 				this.emitStructuredLog('chain', 'funding_watch_failed', {
 					txid: txidHex,
@@ -1782,24 +1870,18 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		// Wire broadcast:tx from ChannelManager (closing txs, force-close commitment txs)
+		// Relay broadcast:tx from ChannelManager (closing txs, force-close
+		// commitment txs) to our own consumers.
+		//
+		// This listener must NOT broadcast. ChainWatcher's constructor already
+		// subscribes to the same event and owns the broadcast, along with the
+		// non-Buffer guard, the txid dedup and the block-driven retry queue.
+		// Broadcasting here too sent every closing tx, sweep and CPFP child to
+		// the backend twice: the loser came back "already in mempool", was
+		// queued for MAX_BROADCAST_RETRIES blocks and surfaced as a permanent
+		// false BROADCAST_FAILED. The genuine failures are wired from the
+		// watcher's own broadcast:failure event in wireChainWatcherEvents().
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
-			if (this.chainWatcher) {
-				this.chainWatcher.broadcastTransaction(tx).catch((err) => {
-					// A swallowed failure here leaves channel state (zero-conf
-					// NORMAL, splice_locked) describing a tx that does not exist
-					// on the network — log loudly, never silently.
-					this.emitStructuredLog('chain', 'broadcast_failed', {
-						txid: bitcoin.Transaction.fromBuffer(tx).getId(),
-						error: (err as Error).message
-					});
-					this.emit('node:error', {
-						code: 'BROADCAST_FAILED',
-						message: (err as Error).message,
-						timestamp: Date.now()
-					} as ILightningError);
-				});
-			}
 			this.emit('broadcast:tx', tx);
 		});
 	}
@@ -2448,7 +2530,7 @@ export class LightningNode extends EventEmitter {
 
 				// Store pending tx BEFORE createFunding — the synchronous message chain
 				// (funding_created → funding_signed → watch:funding) completes during the call
-				this.pendingFundingTxs.set(txid.toString('hex'), txHex);
+				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
 				// Send funding_created — triggers synchronous chain that broadcasts via watch:funding
 				this.channelManager.createFunding(
@@ -2475,6 +2557,149 @@ export class LightningNode extends EventEmitter {
 					`funding failed: ${(err as Error).message}`
 				);
 			});
+	}
+
+	/**
+	 * Void a channel whose funding tx vanished before confirming and cannot
+	 * (or can no longer) be rebroadcast: drop it from the manager, retire its
+	 * watch, its persisted state and any retained funding tx, and tell the
+	 * embedder via channel:voided.
+	 */
+	private voidMissingFundingChannel(channelId: Buffer, txid: string): void {
+		if (!this.channelManager.voidChannel(channelId)) return;
+		const idHex = channelId.toString('hex');
+		this.chainWatcher?.removeWatchedFunding(channelId);
+		this.safeStorage(() => this.storage!.deleteChannel(idHex), 'deleteChannel');
+		this.deletePendingFundingTx(
+			Buffer.from(txid, 'hex').reverse().toString('hex')
+		);
+		this.emitStructuredLog('channel', 'channel_voided', {
+			channelId: idHex,
+			txid
+		});
+		this.emit('channel:voided', { channelId });
+	}
+
+	// ─────────────── Pending funding broadcasts ───────────────
+
+	/** Metadata key holding the persisted pending funding tx map. */
+	private static readonly PENDING_FUNDING_TXS_KEY = 'pending_funding_txs';
+
+	/** Persist the pending funding tx map (best-effort). */
+	private persistPendingFundingTxs(): void {
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					LightningNode.PENDING_FUNDING_TXS_KEY,
+					JSON.stringify(
+						[...this.pendingFundingTxs].map(([txid, txHex]) => ({
+							txid,
+							txHex
+						}))
+					)
+				),
+			'savePendingFundingTxs'
+		);
+	}
+
+	/** Record a signed funding tx we are obligated to broadcast. */
+	private setPendingFundingTx(txidHex: string, txHex: string): void {
+		this.pendingFundingTxs.set(txidHex, txHex);
+		this.persistPendingFundingTxs();
+	}
+
+	/** Drop a broadcast obligation (confirmed, or its channel is gone). */
+	private deletePendingFundingTx(txidHex: string): void {
+		if (this.pendingFundingTxs.delete(txidHex)) {
+			this.persistPendingFundingTxs();
+		}
+	}
+
+	/**
+	 * Broadcast the pending funding tx with this txid (internal byte order
+	 * hex). The entry is NOT removed on success: it lives until the funding
+	 * confirms, so a later mempool eviction can be answered by rebroadcast
+	 * (re-sending a tx already in the mempool is accepted and idempotent).
+	 * On failure the entry survives for the per-block retry; the error is
+	 * surfaced but the obligation stands.
+	 */
+	private broadcastPendingFundingTx(txidHex: string): void {
+		const txHex = this.pendingFundingTxs.get(txidHex);
+		if (!txHex || !this.fundingProvider) return;
+		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
+			const message = (err as Error)?.message ?? String(err);
+			// A tx that is already mined cannot be re-sent; that is success,
+			// and funding:confirmed will retire the entry.
+			if (/already in block ?chain|already known|txn-already/i.test(message)) {
+				return;
+			}
+			this.emitStructuredLog('chain', 'funding_broadcast_failed', {
+				txid: txidHex,
+				error: message
+			});
+			this.emit('node:error', {
+				code: 'FUNDING_BROADCAST_FAILED',
+				message: `${message} (funding tx ${txidHex} retained; will retry)`,
+				timestamp: Date.now()
+			} as ILightningError);
+		});
+	}
+
+	/**
+	 * Retry every pending funding broadcast whose channel is still alive and
+	 * unconfirmed, and retire entries whose channel is gone (aborted, closed
+	 * or voided before confirmation): broadcasting a funding tx for a dead
+	 * channel would lock coins in a 2-of-2 nobody will use. Runs on every new
+	 * block and once at startup after channels are restored.
+	 */
+	private retryPendingFundingBroadcasts(): void {
+		if (this.pendingFundingTxs.size === 0) return;
+		const deadStates = new Set([
+			ChannelState.CLOSED,
+			ChannelState.FORCE_CLOSED,
+			ChannelState.ERRORED
+		]);
+		const liveByTxid = new Map<string, ChannelState>();
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid) {
+				liveByTxid.set(state.fundingTxid.toString('hex'), state.state);
+			}
+		}
+		for (const [txidHex] of [...this.pendingFundingTxs]) {
+			const channelState = liveByTxid.get(txidHex);
+			if (channelState === undefined || deadStates.has(channelState)) {
+				this.emitStructuredLog('chain', 'pending_funding_retired', {
+					txid: txidHex,
+					reason: channelState === undefined ? 'no channel' : channelState
+				});
+				this.deletePendingFundingTx(txidHex);
+				continue;
+			}
+			this.broadcastPendingFundingTx(txidHex);
+		}
+	}
+
+	/** Restore the persisted pending funding tx map (called at startup). */
+	private restorePendingFundingTxs(): void {
+		if (!this.storage) return;
+		const json = this.storage.loadMetadata(
+			LightningNode.PENDING_FUNDING_TXS_KEY
+		);
+		if (!json) return;
+		try {
+			const entries = JSON.parse(json) as Array<{
+				txid: string;
+				txHex: string;
+			}>;
+			for (const entry of entries) {
+				if (entry?.txid && entry?.txHex) {
+					this.pendingFundingTxs.set(entry.txid, entry.txHex);
+				}
+			}
+		} catch {
+			/* ignore corrupted pending-funding metadata */
+		}
 	}
 
 	// ─────────────── Node Info ───────────────
@@ -3233,9 +3458,19 @@ export class LightningNode extends EventEmitter {
 		return this.chainWatcher;
 	}
 
+	/**
+	 * True while the chain startup operation that began in this generation is
+	 * still the current one and the node is alive.
+	 */
+	private isCurrentChainStartup(generation: number): boolean {
+		return !this._destroyed && this.chainStartupGeneration === generation;
+	}
+
 	private wireChainWatcherEvents(): void {
-		if (!this.chainWatcher || this._chainWatcherEventsWired) return;
-		this._chainWatcherEventsWired = true;
+		if (!this.chainWatcher || this._wiredChainWatcher === this.chainWatcher) {
+			return;
+		}
+		this._wiredChainWatcher = this.chainWatcher;
 
 		this.chainWatcher.on('block', (height: number) => {
 			this.currentBlockHeight = height;
@@ -3247,6 +3482,16 @@ export class LightningNode extends EventEmitter {
 		this.chainWatcher.on('error', (err: Error) => {
 			this.emit('node:error', {
 				code: 'CHAIN_WATCHER_ERROR',
+				message: err.message,
+				timestamp: Date.now()
+			} as ILightningError);
+		});
+		// The watcher owns the broadcast; surface its failures under the code
+		// consumers already watch for. It re-queues and retries on the next
+		// block, so this is a warning rather than a terminal outcome.
+		this.chainWatcher.on('broadcast:failure', (err: Error) => {
+			this.emit('node:error', {
+				code: 'BROADCAST_FAILED',
 				message: err.message,
 				timestamp: Date.now()
 			} as ILightningError);
@@ -3267,33 +3512,6 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		// The funding tx of a not-yet-confirmed channel vanished from mempool
-		// AND chain (evicted, or an input was double-spent). Mempool absence
-		// is NOT proof of permanent invalidity: the tx (or a copy held by a
-		// counterparty) can be rebroadcast or mined later. So the channel is
-		// QUARANTINED, never deleted: balances stop being usable, every key,
-		// commitment, and watch is retained, and if the tx reappears the
-		// quarantine lifts. Permanent abandonment is an operator decision
-		// (close/void) once a conflicting spend has actually confirmed.
-		this.chainWatcher.on(
-			'funding:missing',
-			(channelId: Buffer, txid: string) => {
-				this.emitStructuredLog('chain', 'funding_missing', {
-					channelId: channelId.toString('hex'),
-					txid
-				});
-				this.emit('node:error', {
-					code: 'FUNDING_MISSING',
-					channelId,
-					message: `funding tx ${txid} disappeared from mempool and chain before confirming; channel quarantined until it returns or a conflict confirms`,
-					timestamp: Date.now()
-				} as ILightningError);
-
-				const channel = this.channelManager.getChannel(channelId);
-				if (!channel) return;
-				channel.setFundingMissing(true);
-			}
-		);
 		this.chainWatcher.on(
 			'funding:recovered',
 			(channelId: Buffer, txid: string) => {
@@ -3327,10 +3545,95 @@ export class LightningNode extends EventEmitter {
 		// Splice confirmation: when a pending splice transaction reaches the
 		// required depth, send splice_locked. Initial-funding confirmation is
 		// handled elsewhere; we only act when a splice is in flight.
+		// The funding tx of a not-yet-confirmed channel vanished from mempool
+		// AND chain (evicted or an input was double-spent). For a zero-conf
+		// channel that is already NORMAL, every balance shown against it is
+		// fiction: alarm, then VOID the channel. It never existed on the
+		// network, so there is nothing to close and the contributed coins
+		// remain onchain. 'channel:voided' lets the embedder re-handle them.
+		this.chainWatcher.on(
+			'funding:missing',
+			(channelId: Buffer, txid: string) => {
+				this.emitStructuredLog('chain', 'funding_missing', {
+					channelId: channelId.toString('hex'),
+					txid
+				});
+				this.emit('node:error', {
+					code: 'FUNDING_MISSING',
+					channelId,
+					message: `funding tx ${txid} disappeared from mempool and chain before confirming`,
+					timestamp: Date.now()
+				} as ILightningError);
+
+				const channel = this.channelManager.getChannel(channelId);
+				if (!channel) return;
+				// A vanished SPLICE tx is different: the pre-splice channel is
+				// real and confirmed, and voiding it would destroy a live
+				// channel. Alarm only; splice rollback is a separate path.
+				if (channel.getFullState().spliceInFlight) return;
+
+				// Rebroadcast before voiding: BOLT 2 obliges the funder to get
+				// the funding tx confirmed, and a mempool-evicted tx is still
+				// valid. Only when we hold the signed tx and the network
+				// REJECTS it (an input was double-spent, or it conflicts with
+				// a confirmed tx) is the channel truly fiction.
+				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
+				const pendingHex = this.pendingFundingTxs.get(internalHex);
+				if (pendingHex && this.fundingProvider) {
+					this.fundingProvider
+						.broadcastTransaction(pendingHex)
+						.then(() => {
+							// Back in the mempool: the watcher sees it on its
+							// next check, resets the absence counter and
+							// re-arms the alarm. The channel stays.
+							this.emitStructuredLog('chain', 'funding_rebroadcast', {
+								channelId: channelId.toString('hex'),
+								txid
+							});
+						})
+						.catch((err) => {
+							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
+								channelId: channelId.toString('hex'),
+								txid,
+								error: (err as Error).message
+							});
+							// A rejection proves permanence only when the inputs are
+							// gone (spent by a CONFIRMED conflict). Anything else
+							// (mempool conflict, fee policy, backend hiccup) can
+							// still resolve in the channel's favor, so the channel
+							// is QUARANTINED, not voided: balances unusable, every
+							// key, commitment and watch retained, quarantine lifted
+							// automatically if the tx reappears.
+							const msg = (err as Error).message.toLowerCase();
+							if (
+								msg.includes('missing-inputs') ||
+								msg.includes('missingorspent') ||
+								msg.includes('bad-txns-inputs')
+							) {
+								this.voidMissingFundingChannel(channelId, txid);
+							} else {
+								channel.setFundingMissing(true);
+							}
+						});
+					return;
+				}
+				// No retained signed tx to rebroadcast: the tx may still exist
+				// with the counterparty or a sender, so quarantine rather than
+				// void. Permanent abandonment is a deliberate act once a
+				// conflicting spend has actually confirmed.
+				channel.setFundingMissing(true);
+			}
+		);
+
 		this.chainWatcher.on('funding:confirmed', (channelId: Buffer) => {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
 			const state = channel.getFullState();
+			// The funding is mined: the BOLT 2 broadcast obligation is met and
+			// the retained signed tx (kept for eviction rebroadcasts) retires.
+			if (state.fundingTxid) {
+				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
+			}
 			if (!state.spliceFundingTxid || !channel.getSpliceSession()) return;
 			// sendSpliceLocked self-validates the splice state; ignore if not ready.
 			const result = this.channelManager.sendSpliceLocked(channelId);
@@ -3347,10 +3650,12 @@ export class LightningNode extends EventEmitter {
 	}
 
 	async startChainWatcher(): Promise<void> {
+		const generation = ++this.chainStartupGeneration;
 		// Bring up the watchtower client alongside on-chain monitoring: restore the
 		// persisted backlog and connect to towers (no-op when none configured).
 		if (this.watchtowerClient) {
 			this.watchtowerClient.start().catch((err) => {
+				if (!this.isCurrentChainStartup(generation)) return;
 				this.emitStructuredLog('watchtower', 'start_failed', {
 					error: err instanceof Error ? err.message : String(err)
 				});
@@ -3359,8 +3664,17 @@ export class LightningNode extends EventEmitter {
 		if (this.chainWatcher) {
 			this.wireChainWatcherEvents();
 			await this.chainWatcher.start();
+			if (!this.isCurrentChainStartup(generation)) return;
 			// Re-watch funding outputs for all restored channels
-			await this.restoreChainWatches();
+			await this.restoreChainWatches(generation);
+			// destroy() during the restore must not let the rest of startup run:
+			// it would retry funding broadcasts and restart the reconnect monitor
+			// that destroy() just stopped.
+			if (!this.isCurrentChainStartup(generation)) return;
+			// Resume the broadcast obligation for signed funding txs that never
+			// confirmed (crash between funding_signed and broadcast, or an
+			// eviction while we were down). Retries again on every new block.
+			this.retryPendingFundingBroadcasts();
 			// Start reconnect monitor on ElectrumBackend to resume subscriptions after drops
 			if (
 				this._chainBackend &&
@@ -3371,8 +3685,10 @@ export class LightningNode extends EventEmitter {
 				// On reconnect/resubscribe, re-scan watched fundings immediately so a
 				// confirmation that landed while disconnected is picked up at once
 				// (the chain watcher's periodic timer is the slower safety net).
-				backend.onResubscribed = (): void =>
+				backend.onResubscribed = (): void => {
+					if (!this.isCurrentChainStartup(generation)) return;
 					this.chainWatcher?.recheckAllWatches();
+				};
 				backend.startReconnectMonitor();
 			}
 		}
@@ -3382,8 +3698,12 @@ export class LightningNode extends EventEmitter {
 	 * Re-watch funding outputs for all restored channels that need monitoring.
 	 * Called after startChainWatcher() to resume chain monitoring for persisted channels.
 	 */
-	async restoreChainWatches(): Promise<void> {
-		if (!this.chainWatcher) return;
+	async restoreChainWatches(
+		// Defaults to the current generation for direct callers; startChainWatcher
+		// passes the one its whole sequence began in.
+		generation: number = this.chainStartupGeneration
+	): Promise<void> {
+		if (!this.chainWatcher || !this.isCurrentChainStartup(generation)) return;
 
 		const networkMap: Record<string, bitcoin.Network> = {
 			[Network.MAINNET]: bitcoin.networks.bitcoin,
@@ -3394,6 +3714,8 @@ export class LightningNode extends EventEmitter {
 		const btcNetwork = networkMap[this.network] || bitcoin.networks.regtest;
 
 		for (const channel of this.channelManager.listChannels()) {
+			// Each iteration does network work, so re-check before starting another.
+			if (!this.isCurrentChainStartup(generation)) return;
 			const state = channel.getFullState();
 			// Only watch channels that have funding info and are not yet closed
 			if (!state.fundingTxid || state.fundingOutputIndex === undefined)
@@ -3434,7 +3756,13 @@ export class LightningNode extends EventEmitter {
 						}
 					}
 				}
-				if (state.lastCooperativeCloseTxHex && this._chainBackend) {
+				if (
+					state.lastCooperativeCloseTxHex &&
+					this._chainBackend &&
+					// A direct backend broadcast is not covered by the watcher's own
+					// lifecycle gate, so it needs the node's.
+					this.isCurrentChainStartup(generation)
+				) {
 					try {
 						await this._chainBackend.broadcastTransaction(
 							state.lastCooperativeCloseTxHex
@@ -3567,7 +3895,11 @@ export class LightningNode extends EventEmitter {
 					fundingScript,
 					spliceTxidHex
 				);
-				if (inflight.fullySigned && this._chainBackend) {
+				if (
+					inflight.fullySigned &&
+					this._chainBackend &&
+					this.isCurrentChainStartup(generation)
+				) {
 					try {
 						await this._chainBackend.broadcastTransaction(inflight.spliceTxHex);
 					} catch {
@@ -3591,12 +3923,14 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Arm the chain watch for a funding (or splice) tx that was JUST created
-	 * live — the watch:funding hook calls this so confirmation detection,
-	 * announcement depth, spend/breach detection and the funding-missing
-	 * watchdog work without a restart (restoreChainWatches only re-arms
-	 * persisted channels on startup). Matches the channel by funding txid,
-	 * the same way the zero-conf early paths do.
+	 * Arm the chain watches for the channel whose funding tx this is, exactly
+	 * as restoreChainWatches would on the next restart: confirmation and
+	 * announcement depth detection, breach (spend) detection, and the
+	 * funding-missing watchdog. Called live from watch:funding so a channel
+	 * opened in this session has coverage without a restart. A splice funding
+	 * re-arms the watch on the NEW outpoint and keeps spend detection on the
+	 * old one (the splice tx legitimately spends it; anything else is a
+	 * breach).
 	 */
 	private async registerFundingWatch(fundingTxid: Buffer): Promise<void> {
 		if (!this.chainWatcher) return;
@@ -3621,9 +3955,8 @@ export class LightningNode extends EventEmitter {
 					inflight.remoteFundingPubkey,
 					btcNetwork
 				);
-				// Keyed by channelId, this REPLACES the original funding watch —
-				// so re-arm spend detection on the old outpoint separately (the
-				// splice tx legitimately spends it; anything else is a breach),
+				// Keyed by channelId, this REPLACES the original funding watch,
+				// so re-arm spend detection on the old outpoint separately,
 				// exactly as restoreChainWatches does.
 				await this.chainWatcher.watchFundingOutput(
 					channelId,
@@ -4131,6 +4464,8 @@ export class LightningNode extends EventEmitter {
 
 	destroy(): void {
 		this._destroyed = true;
+		// Retires any chain startup sequence still working through its awaits.
+		++this.chainStartupGeneration;
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -4243,6 +4578,7 @@ export class LightningNode extends EventEmitter {
 	async gracefulShutdown(timeoutMs = 30_000): Promise<void> {
 		// Stop accepting new operations
 		this._destroyed = true;
+		++this.chainStartupGeneration;
 
 		// Wait for in-flight HTLCs to settle
 		const hasInFlightHtlcs = (): boolean => {
@@ -4425,6 +4761,54 @@ export class LightningNode extends EventEmitter {
 			init?.features.hasFeature(Feature.ZERO_CONF) &&
 				init.features.hasFeature(Feature.SCID_ALIAS)
 		);
+	}
+
+	/**
+	 * Public view of the v1/v2 routing decision openChannel will make for
+	 * this peer: dualFund mirrors peerNegotiatedDualFund exactly, and
+	 * peerKnown says whether there is an init to judge by at all (a peer we
+	 * are not connected to yields peerKnown false and dualFund false, which
+	 * openChannel would route to v1).
+	 */
+	peerFundingInfo(peerPubkey: string): {
+		peerKnown: boolean;
+		dualFund: boolean;
+	} {
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		return {
+			peerKnown: Boolean(init),
+			dualFund: this.peerNegotiatedDualFund(peerPubkey)
+		};
+	}
+
+	/**
+	 * The exact quote a max dual-funded open would commit at this rate: the
+	 * SAME clamp, sat/kw conversion and provider formula as openChannel's
+	 * fundMax path, so a UI previewing this number previews the amount the
+	 * channel actually opens with.
+	 */
+	quoteDualFundingMaxOpen(satsPerVbyte: number): {
+		feeratePerKw: number;
+		fundingSatoshis: bigint;
+		spendableSats: bigint;
+		feeSats: bigint;
+		inputCount: number;
+	} {
+		if (!Number.isFinite(satsPerVbyte) || satsPerVbyte <= 0) {
+			throw new Error(
+				`satsPerVbyte (${satsPerVbyte}) must be a positive finite rate`
+			);
+		}
+		const fp = this.fundingProvider;
+		if (!fp?.quoteDualFundingMax) {
+			throw new Error(
+				'quoting a max dual-funded (v2) open requires a funding provider with quoteDualFundingMax'
+			);
+		}
+		const feeratePerKw = Math.ceil(
+			this.clampEstimatedFeeRate(satsPerVbyte) * 250
+		);
+		return { feeratePerKw, ...fp.quoteDualFundingMax(feeratePerKw) };
 	}
 
 	/**
@@ -5549,6 +5933,36 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether splicing is negotiated with a peer: option_splice and
+	 * option_quiesce on BOTH feature vectors, ours and the one its current
+	 * connection's init carries. Negotiation is mutual, and the local half is
+	 * not hypothetical: localFeatures is caller configuration, and a node
+	 * configured without splicing must not report a channel as spliceable just
+	 * because the peer across it is willing. Null when there is nothing to
+	 * read: the peer is not connected, or its init has not arrived yet. This
+	 * is the same answer _validateSpliceRequest enforces, exposed so a client
+	 * can know before it asks; a UI offering splice controls against an LND
+	 * peer is offering an action the daemon will refuse every time.
+	 */
+	peerSupportsSplicing(peerPubkey: string): boolean | null {
+		// The local half is known without asking anyone, so it is decided
+		// first: a node that did not negotiate quiescence cannot splice with
+		// any peer, and answering null here would misreport a certainty as
+		// unknown, leaving clients to keep offering what the pre-flight is
+		// certain to refuse.
+		const localSupportsSplicing =
+			this.localFeatures.hasFeature(Feature.QUIESCE) &&
+			this.localFeatures.hasFeature(Feature.SPLICE);
+		if (!localSupportsSplicing) return false;
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return null;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.SPLICE)
+		);
+	}
+
+	/**
 	 * Shared splice pre-flight checks: dust-level amounts and peer feature
 	 * support (option_splice + option_quiesce). Returns an error string or null.
 	 */
@@ -5560,15 +5974,15 @@ export class LightningNode extends EventEmitter {
 			return `splice amount ${amountSats} sats is at or below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
-		if (peerPubkey && this.peerManager) {
-			const init = this.peerManager.getPeer(peerPubkey)?.getRemoteInit();
-			if (
-				init &&
-				(!init.features.hasFeature(Feature.QUIESCE) ||
-					!init.features.hasFeature(Feature.SPLICE))
-			) {
-				return 'peer does not support splicing (option_splice/option_quiesce not negotiated)';
-			}
+		// Unknown support (no init to read) passes, as it always has: the
+		// splice will fail on its own if the peer truly cannot, and refusing on
+		// ignorance would block splices on reconnecting channels.
+		// Not negotiated is the honest phrasing: the missing half can be the
+		// peer's (an LND node) or our own (localFeatures configured without
+		// splicing), and blaming the peer for a local configuration sends
+		// whoever reads the error to debug the wrong node.
+		if (peerPubkey && this.peerSupportsSplicing(peerPubkey) === false) {
+			return 'splicing is not negotiated with this peer (option_splice/option_quiesce required on both sides)';
 		}
 		return null;
 	}
@@ -7216,15 +7630,9 @@ export class LightningNode extends EventEmitter {
 		// Persist
 		const createdAtSecs = Math.floor(Date.now() / 1000);
 
-		this.safeStorage(() => {
-			if (preimage) {
-				this.storage!.savePreimage(paymentHash.toString('hex'), preimage);
-			}
-			this.storage!.savePaymentSecret(
-				paymentHash.toString('hex'),
-				paymentSecret
-			);
-			this.storage!.saveInvoice(paymentHash.toString('hex'), {
+		this.persistInvoiceRecords(
+			paymentHash,
+			{
 				paymentHash: paymentHash.toString('hex'),
 				bolt11: invoiceStr,
 				amountMsat: options.amountMsat,
@@ -7232,9 +7640,10 @@ export class LightningNode extends EventEmitter {
 				expiry: options.expiry ?? DEFAULT_EXPIRY,
 				createdAt: createdAtSecs,
 				hold: options.hold
-			});
-			this.persistPayment(paymentHash);
-		}, 'saveInvoiceData');
+			},
+			preimage,
+			paymentSecret
+		);
 
 		// Store invoice info
 		this.invoices.set(paymentHash.toString('hex'), {
@@ -7258,6 +7667,20 @@ export class LightningNode extends EventEmitter {
 	 * peer — even when the channel is not in the public gossip graph (private or
 	 * not yet announced). Matches LND/CLN/LDK behaviour.
 	 */
+	/**
+	 * The channel sendPaymentToRoute would select for this route's first hop
+	 * (same selection order: route SCID first, then peer + amount), so a
+	 * pre-dispatch check compares against exactly what a dispatch would use.
+	 */
+	private firstHopChannelFor(route: IRoute): Channel | undefined {
+		const firstHop = route.hops[0];
+		const firstHopPubkey = firstHop.pubkey.toString('hex');
+		return (
+			this.findLocalChannelByScid(firstHop.shortChannelId, firstHopPubkey) ??
+			this.findChannelForPeer(firstHopPubkey, route.totalAmountMsat)
+		);
+	}
+
 	private getLocalChannelEdges(): ILocalChannelEdge[] {
 		const edges: ILocalChannelEdge[] = [];
 		for (const channel of this.channelManager.listChannels()) {
@@ -7270,20 +7693,27 @@ export class LightningNode extends EventEmitter {
 			// A splice keeps using its pre-splice scid until the lock.
 			const scid = st.shortChannelId ?? st.scidAlias;
 			if (!scid) continue;
-			// Mid-splice, the ceiling is the min across both fundings (a
-			// splice-out's candidate commitment has less to spend) — the same
-			// figure addHtlc enforces, so the router never offers a route the
-			// channel then refuses. NORMAL channels keep the historical
-			// upper-bound (the add enforces reserve/in-flight limits).
-			const outboundMsat =
-				st.state === ChannelState.SPLICING
-					? channel.getSpendableOutboundMsat()
-					: st.localBalanceMsat;
+			// The ceiling is the channel's spendable liquidity — reserve,
+			// in-flight HTLCs and commit fee subtracted, and mid-splice the min
+			// across both fundings — so the router does not size a route or an
+			// MPP part past what addHtlc admits on liquidity grounds (addHtlc
+			// still enforces more: HTLC minimums, in-flight count/value caps,
+			// dust exposure, channel state). The raw localBalanceMsat bound
+			// previously used for NORMAL channels let a near-balance single
+			// path or MPP part through that could only die locally in addHtlc
+			// as "insufficient balance" (#254).
+			const outboundMsat = channel.getSpendableOutboundMsat();
 			if (outboundMsat <= 0n) continue;
 			edges.push({
 				shortChannelId: scid,
 				peer: Buffer.from(peerHex, 'hex'),
-				outboundMsat
+				outboundMsat,
+				// The PEER's htlc_minimum_msat: addHtlc refuses an outgoing HTLC
+				// below it, so the router must not plan one (the overlay edge
+				// otherwise defaults the minimum to zero, and since local edges
+				// shadow announced graph copies, the graph's advertised minimum
+				// no longer applies either).
+				htlcMinimumMsat: st.remoteConfig.htlcMinimumMsat
 			});
 		}
 		return edges;
@@ -7421,7 +7851,7 @@ export class LightningNode extends EventEmitter {
 		}
 
 		const localChannels = this.getLocalChannelEdges();
-		const route = findRoute(
+		let route = findRoute(
 			this.graph,
 			sourceNodeId,
 			destination,
@@ -7435,6 +7865,24 @@ export class LightningNode extends EventEmitter {
 			undefined,
 			localChannels
 		);
+		// The router can bound our first hop looser than what addHtlc enforces
+		// (a graph update's advertised maximum, or a race against in-flight
+		// HTLCs), so a single-path route the outgoing channel cannot actually
+		// carry would only die locally in addHtlc as "insufficient balance".
+		// When the selected channel exists but cannot carry the total, treat
+		// the route as unroutable up front so the MPP fallback below can split
+		// the payment across channels (#254). When NO channel is found at all,
+		// keep the route: MPP could not dispatch either, and sendPaymentToRoute
+		// reports the precise no-channel failure.
+		if (route) {
+			const firstHopChannel = this.firstHopChannelFor(route);
+			if (
+				firstHopChannel &&
+				firstHopChannel.getSpendableOutboundMsat() < route.totalAmountMsat
+			) {
+				route = null;
+			}
+		}
 		// MPP requires the recipient to advertise basic_mpp (BOLT 4): splitting
 		// to a non-MPP recipient locks every part until the mpp_timeout.
 		if (
@@ -7442,7 +7890,9 @@ export class LightningNode extends EventEmitter {
 			invoice.paymentSecret &&
 			invoice.featureBits?.hasFeature(Feature.BASIC_MPP)
 		) {
-			// Try multi-path routing as fallback
+			// Try multi-path routing as fallback. Retries re-enter here with the
+			// retry context's exclusion set, so failed SCIDs must be excluded
+			// from MPP parts exactly as they are from single-path routes.
 			const multiRoute = findMultiPathRoute(
 				this.graph,
 				sourceNodeId,
@@ -7454,7 +7904,8 @@ export class LightningNode extends EventEmitter {
 				this.missionControl,
 				invoice.routingHints,
 				undefined,
-				localChannels
+				localChannels,
+				excludedChannels
 			);
 			if (multiRoute) {
 				if (maxFeeMsat !== undefined && multiRoute.totalFeeMsat > maxFeeMsat) {
@@ -7467,7 +7918,8 @@ export class LightningNode extends EventEmitter {
 					invoiceStr,
 					invoice,
 					multiRoute,
-					finalCltvExpiry
+					finalCltvExpiry,
+					excludedChannels
 				);
 			}
 		}
@@ -7733,12 +8185,13 @@ export class LightningNode extends EventEmitter {
 	 */
 	private noteHeightSkewFailure(
 		payment: IPaymentInfo,
-		failureData?: Buffer
+		failureData?: Buffer,
+		route: IPaymentInfo['route'] = payment.route
 	): boolean {
 		if (payment.failureCode !== INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS) {
 			return false;
 		}
-		const finalHopIndex = (payment.route?.hops.length ?? 0) - 1;
+		const finalHopIndex = (route?.hops.length ?? 0) - 1;
 		if (finalHopIndex < 0 || payment.failureSourceIndex !== finalHopIndex) {
 			return false;
 		}
@@ -7764,6 +8217,56 @@ export class LightningNode extends EventEmitter {
 			reportedHeight
 		);
 		return true;
+	}
+
+	/**
+	 * Record a blinded-path-level failure for a BOLT 12 payment, and report
+	 * whether rotating to another of the invoice's paths is possible.
+	 *
+	 * A failure sourced at or beyond the introduction node but BEFORE the
+	 * final hop failed inside the blinded segment: the erring "channel" is
+	 * opaque (zeroed SCID), so only skipping the whole path can route around
+	 * it. The final hop is the recipient, whose failures judge the payment
+	 * itself (wrong amount, unknown hash) rather than the path, with one
+	 * exception: invalid_onion_blinding, which BOLT 4 has every blinded hop,
+	 * final included, return for any error inside a blinded path. Height
+	 * skew is excluded outright, since there the path did nothing wrong.
+	 *
+	 * When the criterion holds, the attempt's path index is added to the
+	 * context's excluded set. Returns true only if a non-excluded path
+	 * remains, which is what justifies retrying a code whose PERM bits
+	 * would otherwise end the payment.
+	 */
+	private noteBolt12BlindedPathFailure(
+		ctx: IPaymentRetryContext | undefined,
+		payment: IPaymentInfo,
+		route: IPaymentInfo['route'],
+		heightSkew: boolean
+	): boolean {
+		if (!ctx?.bolt12Invoice || heightSkew) return false;
+		if (ctx.bolt12PathIndex === undefined) return false;
+		const hops = route?.hops as IRouteHop[] | undefined;
+		if (!hops || payment.failureSourceIndex === undefined) return false;
+		const introIndex = hops.findIndex(
+			(hop) =>
+				hop.encryptedRecipientData !== undefined ||
+				hop.blindingPoint !== undefined
+		);
+		if (introIndex < 0 || payment.failureSourceIndex < introIndex) {
+			return false;
+		}
+		const blindedSegmentFailure =
+			payment.failureSourceIndex < hops.length - 1 ||
+			payment.failureCode === INVALID_ONION_BLINDING;
+		if (!blindedSegmentFailure) return false;
+		if (!ctx.bolt12ExcludedPathIndices) {
+			ctx.bolt12ExcludedPathIndices = new Set();
+		}
+		ctx.bolt12ExcludedPathIndices.add(ctx.bolt12PathIndex);
+		return (
+			ctx.bolt12ExcludedPathIndices.size <
+			(ctx.bolt12Invoice.paths?.length ?? 0)
+		);
 	}
 
 	/**
@@ -8012,7 +8515,8 @@ export class LightningNode extends EventEmitter {
 			totalAmountMsat: bigint;
 			totalFeeMsat: bigint;
 		},
-		_finalCltvExpiry: number
+		_finalCltvExpiry: number,
+		excludedChannels?: Set<string>
 	): IPaymentInfo {
 		const paymentHash = invoice.paymentHash;
 		const hashHex = paymentHash.toString('hex');
@@ -8028,11 +8532,13 @@ export class LightningNode extends EventEmitter {
 		};
 		this.payments.set(hashHex, payment);
 
-		// Store retry context
+		// Store retry context. Seed it with the exclusions this attempt was
+		// routed under so a retry keeps avoiding those SCIDs and the failure
+		// handler accumulates onto the same set.
 		if (!this.paymentRetryContexts.has(hashHex)) {
 			this.paymentRetryContexts.set(hashHex, {
 				invoiceStr,
-				excludedChannels: new Set(),
+				excludedChannels: excludedChannels ?? new Set(),
 				retryCount: 0,
 				maxRetries: this.maxPaymentRetries
 			});
@@ -8090,11 +8596,13 @@ export class LightningNode extends EventEmitter {
 			);
 			const onionBuf = encodeOnionPacket(onionPacket);
 
-			const firstHopPubkey = hops[0].pubkey.toString('hex');
-			const outChannel = this.findChannelForPeer(
-				firstHopPubkey,
-				hops[0].amountToForwardMsat
-			);
+			// Honor the planner's channel: MPP capacity was accounted per SCID,
+			// so each part must leave over the channel it was sized for.
+			// Peer-based selection could reseat the part on a sibling channel
+			// (chosen by balance) that cannot actually carry it, and a locally
+			// refused part cannot be rolled back once earlier parts are out.
+			// Same selection rule as sendPaymentToRoute.
+			const outChannel = this.firstHopChannelFor(partRoute);
 			if (!outChannel) continue;
 
 			const channelId = outChannel.getChannelId()!;
@@ -8109,7 +8617,9 @@ export class LightningNode extends EventEmitter {
 				'saveHtlcPaymentMapping'
 			);
 
-			// Store shared secrets on the first part for failure decryption
+			// The first part doubles as the payment-level route/secrets (display
+			// and single-path fallbacks); every part keeps its own for failure
+			// decryption, since each part is a distinct onion.
 			if (!payment.sharedSecrets) {
 				payment.sharedSecrets = sharedSecrets;
 				payment.route = partRoute as IPaymentInfo['route'];
@@ -8120,7 +8630,8 @@ export class LightningNode extends EventEmitter {
 				channelId,
 				htlcId,
 				amountMsat: amount,
-				status: PaymentStatus.PENDING
+				status: PaymentStatus.PENDING,
+				sharedSecrets
 			});
 
 			const result = this.channelManager.addHtlc(
@@ -8159,6 +8670,14 @@ export class LightningNode extends EventEmitter {
 				this.emit('payment:failed', payment);
 				return payment;
 			}
+		}
+
+		// With a synchronous transport a part can fail back before the next
+		// part is even dispatched, so resolution-time cleanup is deferred
+		// until here (see IOutboundMppState.dispatchComplete).
+		mppState.dispatchComplete = true;
+		if (mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)) {
+			this.outboundMppPayments.delete(hashHex);
 		}
 
 		return payment;
@@ -8270,14 +8789,19 @@ export class LightningNode extends EventEmitter {
 		}
 
 		if (isFinalHop(processed.nextPacket)) {
-			// We are the final destination
+			// We are the final destination. htlcEntry.blindingPoint is the
+			// update_add_htlc path key a downstream blinded final hop received
+			// (absent when we are the path's introduction node, which gets the
+			// path key inside the onion as TLV 12) — needed to decrypt our own
+			// final-hop recipient data for the BOLT 12 path_id check.
 			this.handleFinalHopHtlc(
 				channelId,
 				htlcId,
 				amountMsat,
 				paymentHash,
 				processed.hopPayload,
-				htlcEntry.cltvExpiry
+				htlcEntry.cltvExpiry,
+				htlcEntry.blindingPoint
 			);
 		} else {
 			// Forward to next hop — pass incoming HTLC details for CLTV/fee enforcement.
@@ -8460,7 +8984,8 @@ export class LightningNode extends EventEmitter {
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload?: IHopPayload,
-		incomingCltvExpiry?: number
+		incomingCltvExpiry?: number,
+		incomingBlindingPoint?: Buffer
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
@@ -8590,16 +9115,163 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
+		// BOLT 12: an invoice we issued binds its payment to the path_id we
+		// encrypted into the final hop of the invoice's blinded payment path
+		// (BOLT 12 has no payment_secret TLV). Recover the path_id from THIS
+		// HTLC's final-hop recipient data — the path key is the onion's TLV 12
+		// when we are the path's introduction node, or the update_add_htlc
+		// path key when the path had upstream hops — and require an exact
+		// match before any preimage is revealed. An HTLC for the hash sent
+		// OUTSIDE the path (probe, forged, or leaked hash) fails exactly like
+		// a payment_secret mismatch, so the sender learns nothing.
+		//
+		// FAIL CLOSED: the check triggers on the invoice's persisted bolt12
+		// marker OR a registered expectation, and a BOLT 12 invoice whose
+		// expected path_id is unknown (evicted, or state loss) is rejected. A
+		// missing expectation must never skip authentication while the
+		// preimage is still claimable.
+		const expectedPathId = this.offerManager.getInvoicePathId(paymentHash);
+		if (expectedPathId || this.invoices.get(hashHex)?.bolt12) {
+			// BOLT 4: the final payload of a blinded path carries EXACTLY
+			// amt_to_forward, outgoing_cltv_value, total_amount_msat and
+			// encrypted_recipient_data (plus current_path_key when we are the
+			// introduction node). total_amount_msat is REQUIRED, and
+			// payment_data MUST NOT appear (BOLT 12 has no payment_secret).
+			// Accepting a payload that mixes both total mechanisms would let
+			// the sender pick whichever total the receiver validates against,
+			// so malformed shapes are rejected before any preimage can be
+			// revealed. Scoped to BOLT 12 receives: blinded paths in BOLT 11
+			// invoices are a non-spec beignet construct whose payments
+			// legitimately authenticate via payment_data.
+			if (
+				hopPayload?.paymentSecret !== undefined ||
+				hopPayload?.totalMsat !== undefined ||
+				hopPayload?.totalAmountMsat === undefined
+			) {
+				this.emitStructuredLog('htlc', 'malformed_blinded_final_payload', {
+					paymentHash: hashHex,
+					hasPaymentData:
+						hopPayload?.paymentSecret !== undefined ||
+						hopPayload?.totalMsat !== undefined,
+					hasTotalAmountMsat: hopPayload?.totalAmountMsat !== undefined
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+			let receivedPathId: Buffer | undefined;
+			const pathKey = hopPayload?.blindingPoint ?? incomingBlindingPoint;
+			if (pathKey && hopPayload?.encryptedRecipientData?.length) {
+				try {
+					receivedPathId = processBlindedHop(
+						pathKey,
+						this.nodePrivkey,
+						hopPayload.encryptedRecipientData
+					).hopData.pathId;
+				} catch {
+					// Undecryptable recipient data: treated as an absent path_id.
+				}
+			}
+			if (
+				!expectedPathId ||
+				!receivedPathId ||
+				!receivedPathId.equals(expectedPathId)
+			) {
+				this.emitStructuredLog('htlc', 'payment_path_id_mismatch', {
+					paymentHash: hashHex,
+					expectationKnown: !!expectedPathId
+				});
+				const reason = sharedSecret
+					? createFailureMessage(
+							sharedSecret,
+							INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+							this.incorrectPaymentDetailsData(amountMsat)
+					  )
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(htlcSecretKey);
+				this.channelManager.failHtlc(channelId, htlcId, reason);
+				return;
+			}
+		}
+
 		// (final-hop cltv/amount safety was validated up front, before any
 		// preimage was revealed — see finalHopSafetyFailure.)
+
+		// BOLT 4: total_amount_msat exists only inside a blinded final
+		// payload. On a cleartext final payload it is a field no conformant
+		// sender emits, and accepting it would give unauthenticated payments
+		// a second, unvalidated total mechanism.
+		if (
+			hopPayload?.totalAmountMsat !== undefined &&
+			!hopPayload.encryptedRecipientData?.length
+		) {
+			this.emitStructuredLog('htlc', 'total_amount_msat_outside_blinded', {
+				paymentHash: hashHex
+			});
+			const reason = sharedSecret
+				? createFailureMessage(
+						sharedSecret,
+						INCORRECT_OR_UNKNOWN_PAYMENT_DETAILS,
+						this.incorrectPaymentDetailsData(amountMsat)
+				  )
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
+		// The part's amount is the onion-declared amt_to_forward. The incoming
+		// HTLC only has to COVER it (validated up front in
+		// finalHopSafetyFailure) and may legitimately exceed it, so
+		// classifying or accumulating by the incoming amount would count HTLC
+		// overfunding as payment progress and could settle a set whose onion
+		// amounts never reached the declared total.
+		const partAmountMsat = hopPayload?.amountToForwardMsat ?? amountMsat;
+
+		// The sender-declared multi-part total. BOLT 11 payment_data carries it
+		// in total_msat; a blinded final hop carries no payment_data at all and
+		// declares it in total_amount_msat (TLV 18) instead, with the path_id
+		// check above as the per-part authenticity gate. Recognising only the
+		// payment_data field made every part of a split BOLT 12 payment look
+		// like a standalone underpaying HTLC, so a spec-compliant MPP payer
+		// could not pay a beignet-issued offer (#262). The precedence is safe:
+		// a BOLT 12 payload carrying payment_data was rejected above, so both
+		// fields coexist only on the non-spec BOLT 11 blinded path, where
+		// payment_data governs.
+		const declaredTotalMsat =
+			hopPayload?.totalMsat ?? hopPayload?.totalAmountMsat;
+
+		// A total below its own part contradicts itself;
+		// final_incorrect_htlc_amount is the BOLT 4 code for a part whose
+		// amounts are inconsistent.
+		if (declaredTotalMsat !== undefined && declaredTotalMsat < partAmountMsat) {
+			this.emitStructuredLog('htlc', 'declared_total_below_part', {
+				paymentHash: hashHex,
+				declaredTotal: declaredTotalMsat.toString(),
+				partAmount: partAmountMsat.toString()
+			});
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, FINAL_INCORRECT_HTLC_AMOUNT)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.cleanupHtlcSharedSecret(htlcSecretKey);
+			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
 
 		// Validate the received amount against the invoice (BOLT 4). The final
 		// node MUST NOT fulfill (and reveal the preimage) for less than the
 		// invoiced amount, and SHOULD reject gross overpayment (> 2x). Without
 		// this, a payer can settle a large invoice with a tiny HTLC and still
-		// obtain the proof-of-payment. For MPP the sender-declared total_msat is
+		// obtain the proof-of-payment. For MPP the sender-declared total is
 		// what the parts accumulate toward, so validating it here (and the
-		// existing handleMppPart accumulation to total_msat) bounds the real
+		// existing handleMppPart accumulation to that total) bounds the real
 		// received total. Zero-amount ("any amount") invoices are exempt.
 		const finalInvoice = this.invoices.get(hashHex);
 		if (
@@ -8607,13 +9279,16 @@ export class LightningNode extends EventEmitter {
 			finalInvoice.amountMsat &&
 			finalInvoice.amountMsat > 0n
 		) {
-			const isMpp =
-				!!hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat;
-			const claimedTotal = isMpp ? hopPayload!.totalMsat! : amountMsat;
-			const feeAllowanceMsat = this.jitFeeAllowances.get(hashHex) ?? 0n;
+			// A present declared total is validated AS the claim, never
+			// silently replaced by the (possibly larger) incoming HTLC value:
+			// otherwise an HTLC overfunded up to the invoice amount could
+			// smuggle through a declared total below it. The incoming amount
+			// is additionally bounded against gross overpayment on its own.
+			const claimedTotal = declaredTotalMsat ?? partAmountMsat;
 			if (
-				claimedTotal + feeAllowanceMsat < finalInvoice.amountMsat ||
-				claimedTotal > finalInvoice.amountMsat * 2n
+				claimedTotal < finalInvoice.amountMsat ||
+				claimedTotal > finalInvoice.amountMsat * 2n ||
+				amountMsat > finalInvoice.amountMsat * 2n
 			) {
 				this.emitStructuredLog('htlc', 'incorrect_payment_amount', {
 					paymentHash: hashHex,
@@ -8648,15 +9323,18 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
-		// MPP: if payment_data has totalMsat > amountMsat, this is a multi-part payment
-		if (hopPayload?.totalMsat && hopPayload.totalMsat > amountMsat) {
+		// MPP: a declared total above this part's amount marks a multi-part
+		// payment, whether declared via payment_data (BOLT 11) or
+		// total_amount_msat on a blinded final hop (BOLT 12).
+		if (declaredTotalMsat !== undefined && declaredTotalMsat > partAmountMsat) {
 			this.handleMppPart(
 				channelId,
 				htlcId,
-				amountMsat,
+				partAmountMsat,
 				paymentHash,
-				hopPayload,
-				preimage!
+				hopPayload!,
+				preimage!,
+				declaredTotalMsat
 			);
 			return;
 		}
@@ -9040,13 +9718,24 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Accumulate one part of a multi-part payment. Parts group by payment
+	 * hash; each part's authenticity was already enforced upstream in
+	 * handleFinalHopHtlc (the payment_secret match for BOLT 11 parts, the
+	 * blinded path_id match for BOLT 12 parts, which have no payment_data).
+	 * amountMsat is the part's onion-declared amt_to_forward, NOT the
+	 * incoming HTLC value, which may exceed it; declaredTotalMsat is the
+	 * sender-declared total the parts accumulate toward: payment_data
+	 * total_msat or blinded-final total_amount_msat.
+	 */
 	private handleMppPart(
 		channelId: Buffer,
 		htlcId: bigint,
 		amountMsat: bigint,
 		paymentHash: Buffer,
 		hopPayload: IHopPayload,
-		preimage: Buffer
+		preimage: Buffer,
+		declaredTotalMsat: bigint
 	): void {
 		const hashHex = paymentHash.toString('hex');
 
@@ -9054,20 +9743,33 @@ export class LightningNode extends EventEmitter {
 		let pending = this.pendingMppPayments.get(hashHex);
 		if (!pending) {
 			pending = {
-				paymentSecret: hopPayload.paymentSecret!,
-				totalMsat: hopPayload.totalMsat!,
+				// Absent for blinded-final parts: BOLT 12 has no payment_secret,
+				// the per-part path_id check upstream authenticates instead.
+				paymentSecret: hopPayload.paymentSecret,
+				totalMsat: declaredTotalMsat,
 				receivedParts: [],
 				createdAt: Date.now()
 			};
 			this.pendingMppPayments.set(hashHex, pending);
-		} else if (
-			hopPayload.totalMsat !== undefined &&
-			hopPayload.totalMsat !== pending.totalMsat
-		) {
+		} else if (declaredTotalMsat !== pending.totalMsat) {
 			// BOLT 4: every part of a multi-part payment MUST carry the same
-			// total_msat. A part disagreeing with the set is
-			// final_incorrect_htlc_amount; fail just this part and keep the set
-			// intact (the payer may still complete with conformant parts).
+			// total, and on disagreement the receiver SHOULD fail the ENTIRE
+			// HTLC set with final_incorrect_htlc_amount: the set's declared
+			// total is now ambiguous, keeping parked parts alive locks the
+			// payer's funds until the MPP timeout, and a sender could keep
+			// injecting mismatched parts to hold state open indefinitely.
+			for (const p of pending.receivedParts) {
+				if (p.status !== PaymentStatus.PENDING) continue;
+				p.status = PaymentStatus.FAILED;
+				const partKey = `${p.channelId.toString('hex')}:${p.htlcId}`;
+				const partSecret = this.receivedHtlcSharedSecrets.get(partKey);
+				const partReason = partSecret
+					? createFailureMessage(partSecret, FINAL_INCORRECT_HTLC_AMOUNT)
+					: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+				this.cleanupHtlcSharedSecret(partKey);
+				this.channelManager.failHtlc(p.channelId, p.htlcId, partReason);
+			}
+			this.pendingMppPayments.delete(hashHex);
 			const secretKey = `${channelId.toString('hex')}:${htlcId}`;
 			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
 			const reason = sharedSecret
@@ -9965,10 +10667,22 @@ export class LightningNode extends EventEmitter {
 		const payment = this.payments.get(hashHex);
 		if (!payment || payment.direction !== PaymentDirection.OUTGOING) return;
 
+		// MPP: every part is a distinct onion, so a returned failure decrypts
+		// only with the secrets of the part it came back on, and its culpable
+		// hop lives on that part's route. The first part's secrets on the
+		// payment record are wrong for every later part.
+		const mppState = this.outboundMppPayments.get(hashHex);
+		const failedPart = mppState?.parts.find(
+			(part) => part.htlcId === htlcId && part.channelId.equals(channelId)
+		);
+		if (failedPart) failedPart.status = PaymentStatus.FAILED;
+		const failureSecrets = failedPart?.sharedSecrets ?? payment.sharedSecrets;
+		const failureRoute = failedPart?.route ?? payment.route;
+
 		// Decrypt failure message if we have shared secrets
 		let failureData: Buffer | undefined;
-		if (payment.sharedSecrets && reason.length > 0) {
-			const result = decryptFailureMessage(payment.sharedSecrets, reason);
+		if (failureSecrets && reason.length > 0) {
+			const result = decryptFailureMessage(failureSecrets, reason);
 			if (result) {
 				payment.failureCode = result.failure.failureCode;
 				payment.failureSourceIndex = result.originIndex;
@@ -9989,12 +10703,16 @@ export class LightningNode extends EventEmitter {
 		// transient case, where it rejected our expiry only because it is ahead of
 		// us. This records that height so the retry below is built against it
 		// rather than repeating the same stale expiry.
-		const heightSkew = this.noteHeightSkewFailure(payment, failureData);
+		const heightSkew = this.noteHeightSkewFailure(
+			payment,
+			failureData,
+			failureRoute
+		);
 
 		// Record failure in MissionControl for future pathfinding. Skipped for
 		// height skew: no channel misbehaved, our expiry was stale, so penalising
 		// the route would degrade pathfinding over an innocent channel.
-		const culpableScid = this.getCulpableHopScid(payment);
+		const culpableScid = this.getCulpableHopScid(payment, failureRoute);
 		if (culpableScid && !heightSkew) {
 			this.missionControl.recordFailure(culpableScid, payment.amountMsat);
 		}
@@ -10017,10 +10735,37 @@ export class LightningNode extends EventEmitter {
 		// detected above.
 		const retryCtx = this.paymentRetryContexts.get(hashHex);
 		const maxRetries = retryCtx?.maxRetries ?? this.maxPaymentRetries;
+
+		// A failure INSIDE the blinded segment of a BOLT 12 payment implicates
+		// the blinded path rather than any public channel: its hops are opaque
+		// and their SCIDs zeroed, so the channel exclusion below cannot route
+		// around it. Exclude the path index instead, so the retry rotates to
+		// the invoice's other paths. When another path remains this also
+		// justifies a retry for invalid_onion_blinding, whose PERM|BADONION
+		// bits would otherwise read as final: it is the one code every blinded
+		// hop returns for any error, precisely so the sender learns nothing
+		// beyond "use a different blinded path" (BOLT 4).
+		const bolt12PathFailover = this.noteBolt12BlindedPathFailure(
+			retryCtx,
+			payment,
+			failureRoute,
+			heightSkew
+		);
+		// MPP payments are never auto-retried here: redispatching the FULL
+		// invoice while sibling parts are still held by the recipient lets the
+		// old parts and the retry's parts sum past total_msat, and the
+		// recipient fulfills every held part, overpaying the invoice. Until a
+		// part-level retry exists, a failed part fails the payment; the
+		// recipient releases the sibling holds at its own MPP timeout. The
+		// culpable SCID is still recorded in MissionControl above, and the
+		// exclusion set still serves manual re-sends.
 		if (
 			retryCtx &&
+			!mppState &&
 			retryCtx.retryCount < maxRetries &&
-			(heightSkew || !this.isPermanentFailure(payment.failureCode))
+			(heightSkew ||
+				bolt12PathFailover ||
+				!this.isPermanentFailure(payment.failureCode))
 		) {
 			// Exclude the failing channel's SCID from future routes. Skipped for
 			// height skew: the route is fine, our expiry was stale, and banning a
@@ -10065,25 +10810,40 @@ export class LightningNode extends EventEmitter {
 			this.payments.delete(hashHex);
 			try {
 				// A keysend has no invoice, so replay it from its original preimage
-				// to keep the same payment hash.
-				const retried = retryCtx.keysend
-					? this.dispatchKeysend(
-							retryCtx.keysend.options,
-							retryCtx.keysend.preimage,
-							retryCtx.excludedChannels
-					  )
-					: this.sendPayment(
-							retryCtx.invoiceStr!,
-							retryCtx.excludedChannels,
-							retryCtx.maxFeeMsat,
-							retryCtx.amountMsat
-					  );
+				// to keep the same payment hash. A BOLT 12 payment has no invoice
+				// STRING, so re-dispatch its decoded invoice; re-entering
+				// payBolt12Invoice re-routes with the exclusions (rotating to the
+				// invoice's other blinded paths when the failed one is unusable).
+				let retried: IPaymentInfo;
+				if (retryCtx.keysend) {
+					retried = this.dispatchKeysend(
+						retryCtx.keysend.options,
+						retryCtx.keysend.preimage,
+						retryCtx.excludedChannels
+					);
+				} else if (retryCtx.bolt12Invoice) {
+					retried = this.payBolt12Invoice(
+						retryCtx.bolt12Invoice,
+						retryCtx.excludedChannels
+					);
+				} else {
+					retried = this.sendPayment(
+						retryCtx.invoiceStr!,
+						retryCtx.excludedChannels,
+						retryCtx.maxFeeMsat,
+						retryCtx.amountMsat
+					);
+				}
 				retried.retryCount = retryCtx.retryCount;
 				return; // Retry dispatched
 			} catch (err) {
-				// The retry never left the node. Restore the attempt that did fail,
-				// keeping its original onion failure, and append why the retry could
-				// not be sent rather than discarding that reason silently.
+				// The retry never left the node. Roll the counter back so
+				// retryCount keeps meaning "retries actually dispatched" (with
+				// exclusions honored by MPP too, an exhausted graph lands here
+				// routinely). Restore the attempt that did fail, keeping its
+				// original onion failure, and append why the retry could not be
+				// sent rather than discarding that reason silently.
+				retryCtx.retryCount--;
 				this.payments.set(hashHex, payment);
 				payment.retryCount = retryCtx.retryCount;
 				const detail = err instanceof Error ? err.message : String(err);
@@ -10093,10 +10853,23 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// No retry or retry exhausted — mark as permanently failed
+		// No retry or retry exhausted — mark as permanently failed. Sibling
+		// MPP parts fail back one at a time, each landing here with its own
+		// htlc mapping; the payment-level transition (timestamp + event) must
+		// happen only once.
 		this.paymentRetryContexts.delete(hashHex);
+		const firstFailure = payment.status !== PaymentStatus.FAILED;
 		payment.status = PaymentStatus.FAILED;
-		payment.completedAt = Date.now();
+		if (firstFailure) payment.completedAt = Date.now();
+		// Keep the MPP state until dispatch has finished and every part has
+		// resolved, so each sibling failure still decrypts with its own
+		// part's secrets; then drop it.
+		if (
+			mppState?.dispatchComplete &&
+			mppState.parts.every((part) => part.status !== PaymentStatus.PENDING)
+		) {
+			this.outboundMppPayments.delete(hashHex);
+		}
 		// Clean up HTLC payment mapping
 		this.htlcPaymentMap.delete(key);
 		if (this.storage) {
@@ -10109,7 +10882,7 @@ export class LightningNode extends EventEmitter {
 			this.persistPayment(payment.paymentHash);
 			this.persistChannel(channelId);
 		}
-		this.emit('payment:failed', payment);
+		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
 	/**
@@ -10130,16 +10903,19 @@ export class LightningNode extends EventEmitter {
 	 * no UPDATE flag: unknown_next_peer and required_channel_feature_missing.
 	 * permanent_channel_failure needs no special case, it is PERM|UPDATE|8.
 	 */
-	private getCulpableHopScid(payment: IPaymentInfo): string | undefined {
+	private getCulpableHopScid(
+		payment: IPaymentInfo,
+		route: IPaymentInfo['route'] = payment.route
+	): string | undefined {
 		const index = payment.failureSourceIndex;
-		if (!payment.route || index === undefined) return undefined;
+		if (!route || index === undefined) return undefined;
 		const code = payment.failureCode;
 		if (code === undefined) return undefined;
 
 		if (!this.isChannelScopedFailure(code)) return undefined;
 
 		// The final hop has no outgoing channel, so there is nothing to blame.
-		const outgoingHop = payment.route.hops[index + 1];
+		const outgoingHop = route.hops[index + 1];
 		return outgoingHop?.shortChannelId.toString('hex');
 	}
 
@@ -10627,6 +11403,10 @@ export class LightningNode extends EventEmitter {
 	handleNewBlock(blockHeight: number): void {
 		this.currentBlockHeight = blockHeight;
 		this.channelManager.handleNewBlock(blockHeight);
+		// Funding txs we are obligated to broadcast (BOLT 2) but which have
+		// not confirmed yet: retry, so a transient failure at watch:funding
+		// or a mempool eviction never orphans a signed funding.
+		this.retryPendingFundingBroadcasts();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
@@ -10642,6 +11422,7 @@ export class LightningNode extends EventEmitter {
 		this.scanForwardTimeouts(blockHeight);
 		this.scanStuckChannels(blockHeight);
 		this.scanStuckPayments();
+		this.sweepExpiredIssuedInvoices();
 		if (blockHeight % 10 === 0) {
 			this.scanExpiredPendingPayments();
 		}
@@ -11309,14 +12090,17 @@ export class LightningNode extends EventEmitter {
 	 * LSP parks an inbound HTLC until we come online and release it (async
 	 * receive). Caller-supplied `paths` take precedence over the auto-built one.
 	 */
-	createOffer(options: ICreateOfferOptions & { asyncHold?: boolean }): {
+	createOffer(options: ICreateOfferOptions): {
 		offer: IOffer;
 		encoded: string;
 	} {
-		const { asyncHold, ...createOpts } = options;
-		if (asyncHold && !createOpts.paths) {
+		const createOpts = { ...options };
+		if (createOpts.asyncHold && !createOpts.paths) {
 			// One path_id shared by every path of this offer: invoice_requests
 			// must arrive over one of them (verified in handleInvoiceRequest).
+			// These are the offer's MESSAGE paths; the payment paths of each
+			// issued invoice are rebuilt fresh at issuance (asyncHold is
+			// persisted with the offer so that survives a restart).
 			const pathId = crypto.randomBytes(32);
 			const paths = this.buildBlindedPaymentPaths(true, 3, pathId).map(
 				(p) => p.path
@@ -11368,9 +12152,24 @@ export class LightningNode extends EventEmitter {
 	 * Pay a BOLT 12 invoice by extracting payment info and delegating to sendPayment.
 	 * This creates a BOLT 11-like payment flow using the BOLT 12 invoice details.
 	 */
-	payBolt12Invoice(invoice: IBolt12Invoice): IPaymentInfo {
+	payBolt12Invoice(
+		invoice: IBolt12Invoice,
+		excludedChannels?: Set<string>
+	): IPaymentInfo {
 		if (!invoice.paymentHash || !invoice.amount || !invoice.nodeId) {
 			throw new Error('BOLT 12 invoice missing required fields');
+		}
+
+		// Payment deduplication, as in sendPayment: a second dispatch for a
+		// hash still in flight would fight the first attempt's retry context
+		// and in-flight record.
+		const dedupHashHex = invoice.paymentHash.toString('hex');
+		const existingPayment = this.payments.get(dedupHashHex);
+		if (existingPayment && existingPayment.status === PaymentStatus.PENDING) {
+			throw new LightningPaymentError(
+				LightningErrorCode.DUPLICATE_PAYMENT,
+				'Payment already in flight for this invoice'
+			);
 		}
 
 		const destination = invoice.nodeId;
@@ -11379,39 +12178,52 @@ export class LightningNode extends EventEmitter {
 		const sourceNodeId = getPublicKey(this.nodePrivkey);
 
 		// Route blinding: BOLT 12 invoices natively carry blinded payment paths.
-		// Route through one (shared blinded sender with the BOLT 11 path).
+		// Route through one (shared blinded sender with the BOLT 11 path). Try
+		// each advertised path in turn, skipping paths whose blinded segment
+		// already failed: a retry re-enters here with the failed channels and
+		// path indices excluded, so a path that is no longer usable rotates to
+		// the invoice's other paths instead of failing the payment.
 		if (invoice.paths && invoice.paths.length > 0) {
-			const payInfo = invoice.blindedPayInfo?.[0] ?? {
-				feeBaseMsat: 0,
-				feeProportionalMillionths: 0,
-				cltvExpiryDelta: 0,
-				htlcMinimumMsat: 0n,
-				htlcMaximumMsat: amountMsat
-			};
-			const blindedRoute = findRouteToBlindedPath(
-				this.graph,
-				sourceNodeId,
-				invoice.paths[0],
-				payInfo,
-				amountMsat,
-				finalCltvExpiry,
-				undefined,
-				undefined,
-				this.missionControl,
-				// Our own channels: a direct channel to the introduction node must
-				// be routable even when it never entered the public gossip graph
-				// (private channels; a fresh interop channel paying a CLN offer).
-				this.getLocalChannelEdges()
-			);
+			const excludedPaths = this.paymentRetryContexts.get(
+				invoice.paymentHash.toString('hex')
+			)?.bolt12ExcludedPathIndices;
+			let blindedRoute: IRoute | null = null;
+			let pathIndex = 0;
+			for (let i = 0; i < invoice.paths.length && !blindedRoute; i++) {
+				if (excludedPaths?.has(i)) continue;
+				const payInfo = invoice.blindedPayInfo?.[i] ?? {
+					feeBaseMsat: 0,
+					feeProportionalMillionths: 0,
+					cltvExpiryDelta: 0,
+					htlcMinimumMsat: 0n,
+					htlcMaximumMsat: amountMsat
+				};
+				blindedRoute = findRouteToBlindedPath(
+					this.graph,
+					sourceNodeId,
+					invoice.paths[i],
+					payInfo,
+					amountMsat,
+					finalCltvExpiry,
+					undefined,
+					excludedChannels,
+					this.missionControl,
+					// Our own channels: a direct channel to the introduction node must
+					// be routable even when it never entered the public gossip graph
+					// (private channels; a fresh interop channel paying a CLN offer).
+					this.getLocalChannelEdges()
+				);
+				if (blindedRoute) pathIndex = i;
+			}
 			if (!blindedRoute) {
 				throw new Error('No route to BOLT 12 blinded path introduction node');
 			}
-			return this.sendPaymentToRoute(
+			return this.dispatchBolt12Route(
 				blindedRoute,
-				invoice.paymentHash,
+				invoice,
 				finalCltvExpiry,
-				invoice.paymentSecret,
-				amountMsat
+				excludedChannels,
+				pathIndex
 			);
 		}
 
@@ -11422,8 +12234,8 @@ export class LightningNode extends EventEmitter {
 			amountMsat,
 			finalCltvExpiry,
 			undefined,
-			undefined,
-			undefined,
+			excludedChannels,
+			this.missionControl,
 			undefined,
 			undefined,
 			undefined,
@@ -11433,13 +12245,67 @@ export class LightningNode extends EventEmitter {
 			throw new Error('No route found to BOLT 12 invoice destination');
 		}
 
-		return this.sendPaymentToRoute(
+		return this.dispatchBolt12Route(
 			route,
-			invoice.paymentHash,
+			invoice,
 			finalCltvExpiry,
-			invoice.paymentSecret,
-			amountMsat
+			excludedChannels
 		);
+	}
+
+	/**
+	 * Register the retry context for a BOLT 12 dispatch and send along the
+	 * route, so the failure handler can re-route a transient failure and the
+	 * height-skew recovery applies exactly as it does to BOLT 11 and keysend
+	 * payments. There is no invoice string to re-pay, so the context carries
+	 * the decoded invoice and a retry re-enters payBolt12Invoice with the
+	 * accumulated exclusions; the blinded path index used by this attempt is
+	 * recorded so a failure inside the blinded segment can exclude the path.
+	 *
+	 * The context is registered only after a route was found, and a context
+	 * created HERE is removed again when the dispatch fails locally (an
+	 * exception, or addHtlc refusing the HTLC): a local failure never
+	 * reaches the onion failure handler, so nothing else would clean it up
+	 * and nothing can retry it. A pre-existing context is left alone; during
+	 * a retry the failure handler owns its rollback and give-up behavior.
+	 */
+	private dispatchBolt12Route(
+		route: IRoute,
+		invoice: IBolt12Invoice,
+		finalCltvExpiry: number,
+		excludedChannels?: Set<string>,
+		pathIndex?: number
+	): IPaymentInfo {
+		const hashHex = invoice.paymentHash.toString('hex');
+		const created = !this.paymentRetryContexts.has(hashHex);
+		if (created) {
+			this.paymentRetryContexts.set(hashHex, {
+				bolt12Invoice: invoice,
+				excludedChannels: excludedChannels ?? new Set(),
+				retryCount: 0,
+				maxRetries: this.maxPaymentRetries
+			});
+		}
+		const ctx = this.paymentRetryContexts.get(hashHex)!;
+		ctx.bolt12PathIndex = pathIndex;
+		try {
+			const payment = this.sendPaymentToRoute(
+				route,
+				invoice.paymentHash,
+				finalCltvExpiry,
+				// BOLT 12 has no payment_secret: the blinded path's encrypted
+				// path_id authenticates this payment at the recipient.
+				undefined,
+				invoice.amount
+			);
+			if (created && payment.status === PaymentStatus.FAILED) {
+				this.paymentRetryContexts.delete(hashHex);
+			}
+			return payment;
+		} catch (err) {
+			if (created) this.paymentRetryContexts.delete(hashHex);
+			throw err;
+		}
 	}
 
 	/**
@@ -11453,29 +12319,46 @@ export class LightningNode extends EventEmitter {
 		this.offerManager.on('offer:created', (offer: IOffer) => {
 			this.emit('offer:created', offer);
 		});
+		// A stored offer row that failed its integrity check or decode at
+		// load: surfaced so corruption is visible instead of silently skipped.
+		this.offerManager.on(
+			'offer:corrupt',
+			(info: { offerIdHex: string; reason: string }) => {
+				this.emitStructuredLog('error', 'offer_corrupt_row', {
+					offerId: info.offerIdHex,
+					reason: info.reason
+				});
+			}
+		);
 		this.offerManager.on('invoice:received', (invoice: IBolt12Invoice) => {
 			this.emit('bolt12:invoice:received', invoice);
 		});
 		// Issuer side: a BOLT 12 invoice we created in response to an invoice_request.
-		// Register its preimage/payment_secret/amount into the SAME stores the BOLT 11
-		// receive path uses, so an incoming HTLC for this payment_hash is validated
-		// and fulfilled (without this the preimage lived only in OfferManager and the
-		// HTLC was failed with unknown_payment_hash).
+		// Register its preimage/amount into the SAME stores the BOLT 11 receive
+		// path uses, so an incoming HTLC for this payment_hash is validated and
+		// fulfilled (without this the preimage lived only in OfferManager and the
+		// HTLC was failed with unknown_payment_hash). NO payment_secret is
+		// registered: BOLT 12 defines no payment_secret TLV, so a secret minted
+		// at issuance could never reach the payer, and enforcing one failed
+		// every incoming HTLC for the invoice (#252). The blinded payment
+		// path's path_id authenticates instead (checked in handleFinalHopHtlc
+		// against OfferManager.getInvoicePathId).
 		this.offerManager.on(
 			'invoice:issued',
-			(invoice: IBolt12Invoice, preimage: Buffer) => {
+			(invoice: IBolt12Invoice, preimage: Buffer, pathId: Buffer) => {
 				const hashHex = invoice.paymentHash.toString('hex');
 				this.preimages.set(hashHex, preimage);
-				if (invoice.paymentSecret) {
-					this.paymentSecrets.set(hashHex, invoice.paymentSecret);
-				}
+				// bolt12 marks the invoice for the receive path's FAIL-CLOSED
+				// path_id check: a BOLT 12 invoice whose expected path_id is
+				// missing is rejected, never fulfilled unauthenticated.
 				const invoiceInfo: IInvoiceInfo = {
 					paymentHash: hashHex,
 					bolt11: '',
 					amountMsat: invoice.amount,
 					description: invoice.description,
 					expiry: invoice.relativeExpiry ?? DEFAULT_EXPIRY,
-					createdAt: Number(invoice.createdAt)
+					createdAt: Number(invoice.createdAt),
+					bolt12: true
 				};
 				this.invoices.set(hashHex, invoiceInfo);
 				// Track an INCOMING payment so the receive path emits payment:received
@@ -11490,15 +12373,21 @@ export class LightningNode extends EventEmitter {
 						createdAt: Date.now()
 					});
 				}
-				this.safeStorage(() => {
-					this.storage!.savePreimage(hashHex, preimage);
-					if (invoice.paymentSecret) {
-						this.storage!.savePaymentSecret(hashHex, invoice.paymentSecret);
-					}
-					this.storage!.saveInvoice(hashHex, invoiceInfo);
-					this.persistPayment(invoice.paymentHash);
-				}, 'saveBolt12Invoice');
+				this.persistInvoiceRecords(
+					invoice.paymentHash,
+					invoiceInfo,
+					preimage,
+					undefined,
+					pathId
+				);
 				this.emit('bolt12:invoice:issued', invoice);
+				// Issuance is remote-driven (any invoice_request mints one), so
+				// the sweep must also run BETWEEN blocks: every 256th issuance
+				// bounds the overshoot past the cap to 255 entries during a
+				// flood while keeping the per-issuance cost amortized (#259).
+				if (++this.issuedInvoiceSweepCounter % 256 === 0) {
+					this.sweepExpiredIssuedInvoices();
+				}
 			}
 		);
 		this.offerManager.on('invoice:error', (error: { error: string }) => {
@@ -11511,6 +12400,129 @@ export class LightningNode extends EventEmitter {
 	}
 
 	// ─────────────── Phase 2: HTLC Timeout + Payment Cleanup ───────────────
+
+	/**
+	 * Cap on issued-but-unpaid BOLT 12 invoices retained inside the expiry
+	 * window (mirrors OfferManager's preimage bound). Past it the sweep
+	 * evicts oldest-first down to 90% (hysteresis, so a sustained flood does
+	 * not resweep on every issuance).
+	 */
+	private bolt12IssuedInvoiceCap = 10_000;
+	/** Issuances since start; every 256th triggers a sweep between blocks. */
+	private issuedInvoiceSweepCounter = 0;
+
+	/**
+	 * Sweep issued-but-unpaid BOLT 12 invoices whose expiry has passed.
+	 *
+	 * Every valid remote invoice_request mints an invoice whose preimage,
+	 * invoice info, PENDING payment record (and, for legacy rows, payment
+	 * secret) are copied into the node's receive stores and persisted, and
+	 * nothing cleaned them up unless an HTLC actually arrived and resolved.
+	 * Requests are remote-driven and free to send, so a single shared offer
+	 * was a permanent memory AND database amplification target (#259).
+	 *
+	 * Removal is expiry-based: created_at + expiry plus a grace window for
+	 * an HTLC in flight at expiry. The sweep never touches a hold invoice, a
+	 * hash with a parked HTLC or a partially accumulated MPP set, or any
+	 * payment record that is not a PENDING incoming placeholder, and it
+	 * deletes the persisted rows of a batch in one transaction (preimage,
+	 * legacy payment secret, path_id, invoice, payment). A hard cap
+	 * backstops the unexpired window; evicting an entry only makes that
+	 * invoice unpayable (the receive path fails closed), never
+	 * unauthenticated. BOLT 11 invoices are NOT swept: they are
+	 * operator-created and finite, and wallets expect them to stay
+	 * queryable, matching LND/CLN retention.
+	 */
+	private sweepExpiredIssuedInvoices(): void {
+		const nowSec = Math.floor(Date.now() / 1000);
+		const expired: string[] = [];
+		const unexpired: Array<{ hashHex: string; createdAt: number }> = [];
+		for (const [hashHex, inv] of this.invoices) {
+			if (!inv.bolt12) continue;
+			if (inv.hold) continue;
+			if (this.heldHtlcs.has(hashHex)) continue;
+			if (this.pendingMppPayments.has(hashHex)) continue;
+			// AFFIRMATIVE never-paid check: only the PENDING incoming
+			// placeholder minted at issuance marks an invoice as never paid. A
+			// MISSING record is not license to sweep: pruneCompletedPayments
+			// drops settled payments (and their preimages) from MEMORY after
+			// their TTL while the durable rows remain, so "no record" can mean
+			// "paid, then pruned", and sweeping then would destroy the
+			// persisted payment history and preimage of a settled payment.
+			const payment = this.payments.get(hashHex);
+			if (
+				!payment ||
+				payment.status !== PaymentStatus.PENDING ||
+				payment.direction !== PaymentDirection.INCOMING
+			) {
+				continue;
+			}
+			if (
+				nowSec >=
+				inv.createdAt + inv.expiry + ISSUED_INVOICE_SWEEP_GRACE_SECONDS
+			) {
+				expired.push(hashHex);
+			} else {
+				unexpired.push({ hashHex, createdAt: inv.createdAt });
+			}
+		}
+
+		// Copy before appending cap evictions: aliasing the expired array made
+		// the telemetry below count evictions as expiries (capEvicted always 0).
+		const expiredCount = expired.length;
+		const toRemove = [...expired];
+		if (unexpired.length > this.bolt12IssuedInvoiceCap) {
+			const evictTo = Math.floor(this.bolt12IssuedInvoiceCap * 0.9);
+			unexpired.sort((a, b) => a.createdAt - b.createdAt);
+			const excess = unexpired.length - evictTo;
+			for (let i = 0; i < excess; i++) {
+				toRemove.push(unexpired[i].hashHex);
+			}
+		}
+		if (toRemove.length === 0) return;
+
+		// Durable rows FIRST: if the transaction fails, the in-memory copies
+		// are kept too, so runtime and persisted state never diverge and the
+		// next sweep retries the whole batch. All five deletes are REQUIRED
+		// interface members (no optional chaining): a backend skipping
+		// deletePreimage would leave an orphaned preimage row that a restart
+		// restores WITHOUT the invoice's bolt12 marker or expected path_id,
+		// making the hash claimable outside the fail-closed path check, and
+		// one skipping deleteInvoicePathId would accumulate path_id rows
+		// forever, the amplification this sweep exists to stop.
+		if (this.storage) {
+			try {
+				this.storage.transaction(() => {
+					for (const hashHex of toRemove) {
+						this.storage!.deletePreimage(hashHex);
+						this.storage!.deletePaymentSecret(hashHex);
+						this.storage!.deleteInvoicePathId(hashHex);
+						this.storage!.deleteInvoice(hashHex);
+						this.storage!.deletePayment(hashHex);
+					}
+				});
+			} catch (err) {
+				this.emit('node:error', {
+					code: 'PERSISTENCE_ERROR',
+					message: `sweepExpiredIssuedInvoices: ${(err as Error).message}`,
+					timestamp: Date.now()
+				} as ILightningError);
+				return;
+			}
+		}
+		for (const hashHex of toRemove) {
+			this.preimages.delete(hashHex);
+			this.paymentSecrets.delete(hashHex);
+			this.invoices.delete(hashHex);
+			this.payments.delete(hashHex);
+			this.offerManager.removeInvoiceState(hashHex);
+		}
+		this.emitStructuredLog('payment', 'issued_invoice_sweep', {
+			removed: toRemove.length,
+			expired: expiredCount,
+			capEvicted: toRemove.length - expiredCount
+		});
+	}
 
 	/**
 	 * Scan offered HTLCs whose CLTV has expired at the current block height.
@@ -11660,7 +12672,10 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Scan for PENDING outbound payments whose invoice has expired.
+	 * Scan for PENDING outbound payments whose invoice has expired. The
+	 * expiry comes from the retry context's payment source: the decoded
+	 * BOLT 11 invoice string, or the BOLT 12 invoice's created_at plus
+	 * relative_expiry. A keysend has no invoice and therefore no expiry.
 	 */
 	private scanExpiredPendingPayments(): void {
 		const now = Math.floor(Date.now() / 1000);
@@ -11671,19 +12686,25 @@ export class LightningNode extends EventEmitter {
 			const retryCtx = this.paymentRetryContexts.get(hashHex);
 			if (!retryCtx) continue;
 
-			try {
-				const { decode } = require('../invoice/decode');
-				const decoded = decode(retryCtx.invoiceStr);
-				const expiryTimestamp =
-					(decoded.timestamp || 0) + (decoded.expiry || 3600);
-				if (now > expiryTimestamp) {
-					this.failPayment(
-						payment.paymentHash,
-						'Invoice expired while the payment was still in flight'
-					);
+			let expiryTimestamp: number | undefined;
+			if (retryCtx.bolt12Invoice) {
+				expiryTimestamp =
+					Number(retryCtx.bolt12Invoice.createdAt) +
+					(retryCtx.bolt12Invoice.relativeExpiry ?? DEFAULT_EXPIRY);
+			} else if (retryCtx.invoiceStr) {
+				try {
+					const { decode } = require('../invoice/decode');
+					const decoded = decode(retryCtx.invoiceStr);
+					expiryTimestamp = (decoded.timestamp || 0) + (decoded.expiry || 3600);
+				} catch {
+					// Can't decode invoice — skip
 				}
-			} catch {
-				// Can't decode invoice — skip
+			}
+			if (expiryTimestamp !== undefined && now > expiryTimestamp) {
+				this.failPayment(
+					payment.paymentHash,
+					'Invoice expired while the payment was still in flight'
+				);
 			}
 		}
 	}
@@ -12047,9 +13068,17 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
-			// Auto-force-close channels stuck in AWAITING_REESTABLISH for too long
-			if (state.state === ChannelState.AWAITING_REESTABLISH) {
-				const reestablishKey = `reestablish:${channelId.toString('hex')}`;
+			// Auto-force-close channels stuck in AWAITING_REESTABLISH for too long.
+			// The tracker must measure CONTIGUOUS blocks in the state: a successful
+			// reestablish of an established channel emits no channel:ready (that
+			// only fires at initial establishment), so the entry stamped during an
+			// earlier disconnect survives the reconnect. Without the else-cleanup
+			// below, once that stale entry is reestablishTimeoutBlocks old, the
+			// next transient disconnect is force-closed on the very next block.
+			const reestablishKey = `reestablish:${channelId.toString('hex')}`;
+			if (state.state !== ChannelState.AWAITING_REESTABLISH) {
+				this._stuckChannelTracker.delete(reestablishKey);
+			} else {
 				if (!this._stuckChannelTracker.has(reestablishKey)) {
 					this._stuckChannelTracker.set(reestablishKey, blockHeight);
 				} else {
@@ -12090,8 +13119,11 @@ export class LightningNode extends EventEmitter {
 			// top), and a channel that died before funding broadcast has nothing on
 			// chain to close. HTLC-bearing errored channels are handled sooner by
 			// the HTLC scanners; this is the catch-all for the quiet ones.
-			if (state.state === ChannelState.ERRORED && state.fundingTxid) {
-				const erroredKey = `errored:${channelId.toString('hex')}`;
+			const erroredKey = `errored:${channelId.toString('hex')}`;
+			if (state.state !== ChannelState.ERRORED) {
+				// Same contiguity rule as the reestablish tracker above.
+				this._stuckChannelTracker.delete(erroredKey);
+			} else if (state.fundingTxid) {
 				if (!this._stuckChannelTracker.has(erroredKey)) {
 					this._stuckChannelTracker.set(erroredKey, blockHeight);
 				} else {
@@ -12119,14 +13151,17 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
+			const shutdownKey = `stuck:${channelId.toString('hex')}`;
 			if (
-				effectiveState === ChannelState.SHUTTING_DOWN ||
-				effectiveState === ChannelState.NEGOTIATING_CLOSING
+				effectiveState !== ChannelState.SHUTTING_DOWN &&
+				effectiveState !== ChannelState.NEGOTIATING_CLOSING
 			) {
+				// Same contiguity rule as the reestablish tracker above.
+				this._stuckChannelTracker.delete(shutdownKey);
+			} else {
 				// Approximate: if channel has been shutting down for > ~10 blocks (~1 hour)
 				// We use a createdAt-based check since we don't have a shutdownStartBlock field
 				// Use block height heuristic: if current height advanced by 10 from when we last saw this state
-				const shutdownKey = `stuck:${channelId.toString('hex')}`;
 				if (!this._stuckChannelTracker.has(shutdownKey)) {
 					this._stuckChannelTracker.set(shutdownKey, blockHeight);
 				} else {
@@ -12342,24 +13377,22 @@ export class LightningNode extends EventEmitter {
 		if (normalChannels.length === 0) return undefined;
 		if (normalChannels.length === 1) return normalChannels[0];
 
-		// Sort by local balance descending
-		normalChannels.sort((a, b) => {
-			const balA = a.getFullState().localBalanceMsat;
-			const balB = b.getFullState().localBalanceMsat;
-			if (balA > balB) return -1;
-			if (balA < balB) return 1;
-			return 0;
-		});
-
-		// If amount specified, prefer a channel with sufficient balance
-		if (amountMsat !== undefined) {
-			const sufficient = normalChannels.find(
-				(ch) => ch.getFullState().localBalanceMsat >= amountMsat
+		// Rank by SPENDABLE outbound, not raw local balance: reserve, commit
+		// fee and in-flight HTLCs can make the bigger-balance channel exactly
+		// the one that refuses the HTLC (#254 review).
+		const bySpendable = normalChannels
+			.map((ch) => ({ ch, spendable: ch.getSpendableOutboundMsat() }))
+			.sort((a, b) =>
+				a.spendable > b.spendable ? -1 : a.spendable < b.spendable ? 1 : 0
 			);
-			if (sufficient) return sufficient;
+
+		// If amount specified, prefer a channel that can actually carry it
+		if (amountMsat !== undefined) {
+			const sufficient = bySpendable.find((e) => e.spendable >= amountMsat);
+			if (sufficient) return sufficient.ch;
 		}
 
-		// Fall back to largest balance channel
-		return normalChannels[0];
+		// Fall back to the most spendable channel
+		return bySpendable[0].ch;
 	}
 }

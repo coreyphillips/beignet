@@ -104,6 +104,9 @@ export type AuthResult = AuthSuccess | AuthFailure;
  */
 export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	// ── Read-only monitoring (GET) ──
+	// /metrics is served outside the routes table but goes through the same
+	// auth middleware (it reports balances; metricsPublic opts out of auth).
+	'GET /metrics': ['readonly'],
 	'GET /info': ['readonly'],
 	'GET /balance': ['readonly'],
 	'GET /peers': ['readonly'],
@@ -176,6 +179,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /invoice/settle-hold': ['invoice'],
 	'POST /invoice/cancel-hold': ['invoice'],
 	'POST /offer/create': ['invoice'],
+	'DELETE /offer': ['invoice'],
 	'POST /address/new': ['invoice'],
 
 	// ── Admin-only: secrets / sensitive management surface ──
@@ -229,6 +233,7 @@ export const ROUTE_SCOPES: Record<string, ApiScope[]> = {
 	'POST /channels/ensure-minimum': [],
 	'POST /channel/close': [],
 	'POST /channel/forceclose': [],
+	'POST /channel/funding-quote': ['readonly'],
 	'POST /channel/splice-quote': ['readonly'],
 	'POST /channel/splice-in': [],
 	'POST /channel/splice-out': [],

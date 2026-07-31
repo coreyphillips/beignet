@@ -3894,8 +3894,9 @@ export class ChannelManager extends EventEmitter {
 		// on a taproot channel; open it as a normal (unleased) taproot channel instead.
 		if (
 			msg.requestFunds &&
-			// A 0-sat request is a degenerate lease: nothing to contribute,
-			// nothing to charge for — accept as a plain (unleased) open.
+			// A 0-sat request is a degenerate lease: nothing to contribute and
+			// nothing to charge for. Accept as a plain (unleased) open instead
+			// of signing a will_fund and then failing to fund zero.
 			msg.requestFunds.requestedSats > 0n &&
 			this.config.leaseRates &&
 			this.config.nodePrivateKey &&
@@ -4360,7 +4361,7 @@ export class ChannelManager extends EventEmitter {
 	/**
 	 * Void a channel whose funding tx vanished from mempool AND chain before
 	 * confirming (evicted or an input double-spent): the channel never existed
-	 * on the network, so there is nothing to close — it is simply dropped.
+	 * on the network, so there is nothing to close and it is simply dropped.
 	 * The coins contributed to the funding remain (or return) onchain.
 	 * Returns false if the channel is unknown.
 	 */

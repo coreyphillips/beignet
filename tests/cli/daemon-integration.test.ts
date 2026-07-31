@@ -669,3 +669,78 @@ describe('Daemon: on-chain routes', () => {
 		}
 	}).timeout(30000);
 });
+
+// ─────────────── Offer lifecycle routes ───────────────
+
+describe('Daemon: offer delete and expiry', () => {
+	let tmpDir: string;
+	const origHome = process.env.HOME;
+
+	beforeEach(function () {
+		if (skipAll) this.skip();
+		tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-offer-'));
+		process.env.HOME = tmpDir;
+	});
+
+	afterEach(() => {
+		if (!skipAll) {
+			process.env.HOME = origHome;
+			fs.rmSync(tmpDir, { recursive: true, force: true });
+		}
+	});
+
+	it('DELETE /offer removes a created offer; unknown and malformed ids are 404/400', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const created = await httpRequest(addr.port, 'POST', '/offer/create', {
+				description: 'deletable',
+				expirySecs: 3600
+			});
+			expect(created.status).to.equal(200);
+			const info = created.body.result as {
+				offerId: string;
+				absoluteExpiry?: number;
+			};
+			expect(info.absoluteExpiry, 'expirySecs threads through').to.be.a(
+				'number'
+			);
+
+			const del = await httpRequest(
+				addr.port,
+				'DELETE',
+				`/offer?offerId=${info.offerId}`
+			);
+			expect(del.status).to.equal(200);
+			expect((del.body.result as { removed: boolean }).removed).to.be.true;
+
+			const listed = await httpRequest(addr.port, 'GET', '/offers');
+			expect((listed.body.result as unknown[]).length).to.equal(0);
+
+			const again = await httpRequest(
+				addr.port,
+				'DELETE',
+				`/offer?offerId=${info.offerId}`
+			);
+			expect(again.status).to.equal(404);
+
+			const malformed = await httpRequest(
+				addr.port,
+				'DELETE',
+				'/offer?offerId=nothex'
+			);
+			expect(malformed.status).to.equal(400);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+});

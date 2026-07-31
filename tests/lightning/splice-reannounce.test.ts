@@ -610,7 +610,8 @@ describe('Post-splice channel re-announcement', function () {
 			const fakeManager = {
 				handleNewBlock: () => [],
 				handleFundingConfirmed: () => {},
-				on: () => {}
+				on: () => {},
+				off: () => {}
 			};
 			const watcher = new ChainWatcher({
 				backend,
@@ -667,7 +668,8 @@ describe('Post-splice channel re-announcement', function () {
 			const fakeManager = {
 				handleNewBlock: () => [],
 				handleFundingConfirmed: () => {},
-				on: () => {}
+				on: () => {},
+				off: () => {}
 			};
 			const watcher = new ChainWatcher({
 				backend,
@@ -827,7 +829,8 @@ describe('Post-splice channel re-announcement', function () {
 					detected.push({ txid: spendingTx.getId(), height });
 					return [];
 				},
-				on: () => {}
+				on: () => {},
+				off: () => {}
 			};
 			const watcher = new ChainWatcher({
 				backend,
