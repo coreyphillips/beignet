@@ -30,6 +30,7 @@ import {
 	RecoveryJournal,
 	RecoveryFrame,
 	deriveRecoveryMasterKey,
+	journalSupported,
 	reconstructFromFrames,
 	encodeFrame,
 	decodeFrame,
@@ -302,10 +303,11 @@ function randomTransition(
  * Deterministic dump of every safety-critical table, for byte-identical
  * comparison between a live database and a reconstructed one.
  *
- * Outbox rows compare content in insertion order; ids and frame stamps are
- * excluded (a snapshot re-insert renumbers rows, and reconstruction replays
- * without a journal so frame_sequence is writer-side bookkeeping), as is
- * created_at. Everything else must match exactly.
+ * Outbox rows compare content in insertion order, frame_sequence stamp
+ * included: snapshot rows carry their stamp and replay re-stamps delta rows
+ * with the frame that carried them. Only the row id (AUTOINCREMENT
+ * renumbering on re-insert) and created_at (wall clock) are excluded as
+ * nonsemantic. Everything else must match exactly.
  */
 function dumpTables(storage: IStorageBackend): string {
 	const sortByFirst = <T extends { 0: string }>(rows: T[]): T[] =>
@@ -691,6 +693,83 @@ describe('Recovery phase 2: journal append', () => {
 		expect(rows[0].frameSequence).to.equal(1);
 		storage.close();
 	});
+
+	it('re-bases with a fresh snapshot on the first append of a new run', () => {
+		const storage = openStorage();
+		{
+			const { manager } = makeJournaledManager(storage);
+			const rand = mulberry32(31);
+			const channelIds = [prngBytes(rand, 32)];
+			for (let i = 0; i < 3; i++) {
+				expect(
+					manager.commit({
+						criticality: RecoveryCriticality.SafetyCritical,
+						...randomTransition(rand, channelIds)
+					}).committed
+				).to.equal(true);
+			}
+		}
+
+		// Journaling disabled for a while: a write the journal never saw.
+		storage.savePreimage('ab'.repeat(32), Buffer.alloc(32, 7));
+
+		// New process run (new journal instance): the first append must
+		// re-base on the drifted tables instead of chaining a delta onto the
+		// stale tip, or reconstruction would verify cleanly and silently miss
+		// the out-of-band write.
+		const { manager: restarted, journal } = makeJournaledManager(storage);
+		for (const fill of [8, 9]) {
+			expect(
+				restarted.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					mutations: [
+						{
+							type: 'payment_preimage',
+							paymentHash: Buffer.alloc(32, fill).toString('hex'),
+							preimage: Buffer.alloc(32, fill)
+						}
+					],
+					outboundMessages: []
+				}).committed
+			).to.equal(true);
+		}
+
+		const frames = journal.loadVerifiedFrames();
+		// First append re-based (snapshot, compaction pruned the old chain);
+		// the second was an ordinary delta again.
+		expect(frames).to.have.length(2);
+		expect(frames[0].snapshot, 're-base snapshot is the base').to.not.equal(
+			undefined
+		);
+		expect(frames[1].snapshot).to.equal(undefined);
+
+		const rebuilt = openStorage();
+		reconstructFromFrames(rebuilt, frames);
+		expect(dumpTables(rebuilt)).to.equal(dumpTables(storage));
+		// The out-of-band write is reachable from the chain again.
+		expect(
+			rebuilt.loadAllPreimages().some((p) => p.paymentHash === 'ab'.repeat(32))
+		).to.equal(true);
+		storage.close();
+		rebuilt.close();
+	});
+
+	it('journalSupported requires compaction support', () => {
+		const storage = openStorage();
+		const noCompact = new Proxy(storage, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'deleteRecoveryFramesBelow') return undefined;
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as IStorageBackend;
+		// Verification requires the retained base to BE the recorded snapshot,
+		// which only compaction guarantees; a backend without it must not
+		// qualify for journaling at all.
+		expect(journalSupported(noCompact)).to.equal(false);
+		expect(journalSupported(storage)).to.equal(true);
+		storage.close();
+	});
 });
 
 // ─────────────── 5-6. Deterministic reconstruction ───────────────
@@ -1074,6 +1153,15 @@ describe('Recovery phase 2: wiring and defaults', () => {
 		// An Important write outside any channel transition: the invoice's
 		// record set must reach the journal through the same chokepoint.
 		alice.createInvoice({ amountMsat: 25_000n, description: 'journaled' });
+		// A hold-invoice cancel journals as ONE transition: the deleted
+		// payment secret and the cancelledAt stamp must not be resurrected by
+		// a reconstruction (that would re-arm the cancelled hash).
+		const held = alice.createInvoice({
+			amountMsat: 10_000n,
+			description: 'journaled-hold',
+			hold: true
+		});
+		expect(alice.cancelHoldInvoice(held.paymentHash)).to.not.equal(null);
 
 		// Every safety transition of the real open flow journaled: frame 1 is
 		// the bootstrap snapshot, and the chain verifies end to end.
@@ -1096,6 +1184,13 @@ describe('Recovery phase 2: wiring and defaults', () => {
 		const rebuilt = openStorage();
 		reconstructFromFrames(rebuilt, frames);
 		expect(dumpTables(rebuilt)).to.equal(dumpTables(storage));
+		// The cancelled hold invoice's secret must be gone in the rebuild too,
+		// not resurrected from the frame that created it.
+		expect(
+			rebuilt
+				.loadAllPaymentSecrets()
+				.some((s) => s.paymentHashHex === held.paymentHash.toString('hex'))
+		).to.equal(false);
 
 		alice.destroy();
 		bob.destroy();

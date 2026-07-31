@@ -131,11 +131,17 @@ export function decryptFrame(
 	return Buffer.concat([decipher.update(ciphertext), decipher.final()]);
 }
 
-/** True when the backend can persist journal frames (all methods present). */
+/**
+ * True when the backend can persist journal frames. Compaction
+ * (deleteRecoveryFramesBelow) is required, not optional: verification demands
+ * the first retained frame BE the recorded snapshot, which only holds when
+ * snapshots actually prune the deltas below them.
+ */
 export function journalSupported(storage: IStorageBackend): boolean {
 	return (
 		typeof storage.saveRecoveryFrame === 'function' &&
 		typeof storage.loadRecoveryFrames === 'function' &&
+		typeof storage.deleteRecoveryFramesBelow === 'function' &&
 		typeof storage.getRecoveryMeta === 'function' &&
 		typeof storage.setRecoveryMeta === 'function'
 	);
@@ -147,6 +153,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly nodeId: Buffer;
 	private readonly snapshotInterval: number;
 	private readonly snapshotIntervalBytes: number;
+	/** Set once this run's first append has re-based the chain (see appendFrame). */
+	private rebasedThisRun = false;
 
 	constructor(
 		storage: IStorageBackend,
@@ -181,6 +189,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * taken after this transition's mutations have applied (commit order), so
 	 * it already contains their effects and the delta itself is not appended;
 	 * reconstruction applies a snapshot and only the frames AFTER it.
+	 *
+	 * The FIRST append of each process run over an existing journal also
+	 * snapshots instead of appending a delta. The journal is opt-in config, so
+	 * the tables may have drifted while it was disabled; a delta would chain
+	 * cleanly onto the stale tip and reconstruction would then verify and
+	 * silently miss the drift. Re-basing on the current tables (this
+	 * transition's effects included, exactly like bootstrap) makes a clean
+	 * verification mean a complete one again, whatever happened between runs.
 	 */
 	appendFrame(
 		mutations: RecoveryMutation[],
@@ -191,7 +207,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
 			// snapshot frame is the one that carries it.
 			this.appendSnapshotFrame(1n, GENESIS_HASH);
+			this.rebasedThisRun = true;
 			return 1n;
+		}
+		if (!this.rebasedThisRun) {
+			const rebaseSequence = BigInt(tipSequence) + 1n;
+			this.appendSnapshotFrame(
+				rebaseSequence,
+				Buffer.from(
+					this.storage.getRecoveryMeta!(META_TIP_HASH) ??
+						GENESIS_HASH.toString('hex'),
+					'hex'
+				)
+			);
+			this.rebasedThisRun = true;
+			return rebaseSequence;
 		}
 
 		const sequence = BigInt(tipSequence) + 1n;
@@ -417,7 +447,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		});
 		this.storage.setRecoveryMeta!(META_LAST_SNAPSHOT, sequence.toString());
 		this.storage.setRecoveryMeta!(META_DELTA_BYTES, '0');
-		this.storage.deleteRecoveryFramesBelow?.(Number(sequence));
+		this.storage.deleteRecoveryFramesBelow!(Number(sequence));
 	}
 
 	/** Serialize every safety-critical table (see RecoverySnapshot). */

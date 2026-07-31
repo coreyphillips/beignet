@@ -1696,7 +1696,18 @@ export class LightningNode extends EventEmitter {
 			invoice: invoiceInfo
 		});
 		const payment = this.paymentMutation(paymentHash);
-		if (payment) mutations.push(payment);
+		if (!payment) {
+			// Fail closed, as the pre-journal transaction did by throwing: a
+			// missing payment record must abort the WHOLE set, or the hash
+			// persists half-claimable with receive accounting broken.
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				message: `persistInvoiceRecords: payment record missing: ${hashHex}`,
+				timestamp: Date.now()
+			} as ILightningError);
+			return;
+		}
+		mutations.push(payment);
 		// SafetyCritical: the set carries a claimable preimage.
 		this.commitMutations(
 			'persistInvoiceRecords',
@@ -4664,18 +4675,21 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 
-		// Phase 3: Clean stale htlcPaymentMap entries. Drop the persisted row with
-		// it, otherwise the mapping outlives the payment it points at and is loaded
-		// straight back into memory on the next restart.
+		// Phase 3: Clean stale htlcPaymentMap entries. Drop the persisted rows
+		// with them, in one journaled transition, otherwise the mappings outlive
+		// the payments they point at and are loaded straight back into memory on
+		// the next restart (or resurrected by a journal reconstruction).
+		const staleMappings: RecoveryMutation[] = [];
 		for (const [key, hashHex] of this.htlcPaymentMap) {
 			if (!this.payments.has(hashHex)) {
 				this.htlcPaymentMap.delete(key);
-				this.safeStorage(
-					() => this.storage!.deleteHtlcPaymentMapping(key),
-					'deleteHtlcPaymentMapping'
-				);
+				staleMappings.push({
+					type: 'delete_htlc_payment_mapping',
+					htlcKey: key
+				});
 			}
 		}
+		this.commitMutations('prune stale HTLC mappings', staleMappings);
 
 		// Phase 4: Drop retry contexts whose payment record is gone. A dispatch
 		// that throws after registering its context (route found but the add was
@@ -8028,13 +8042,14 @@ export class LightningNode extends EventEmitter {
 			// add does not consume that id, so the mapping written above now points
 			// at an id a later unrelated HTLC will take. Drop it in both places, and
 			// persist the FAILED status so storage does not keep the PENDING row
-			// written moments ago.
+			// written moments ago. One journaled transition carries both.
 			this.htlcPaymentMap.delete(htlcKey);
-			this.safeStorage(
-				() => this.storage!.deleteHtlcPaymentMapping(htlcKey),
-				'deleteHtlcPaymentMapping'
-			);
-			this.persistPayment(paymentHash);
+			const failMutations: RecoveryMutation[] = [
+				{ type: 'delete_htlc_payment_mapping', htlcKey }
+			];
+			const failPayment = this.paymentMutation(paymentHash);
+			if (failPayment) failMutations.push(failPayment);
+			this.commitMutations('release failed HTLC mapping', failMutations);
 			this.emit('payment:failed', payment);
 		}
 
@@ -8378,11 +8393,12 @@ export class LightningNode extends EventEmitter {
 				result.error ?? 'Local failure: could not add HTLC to the channel';
 			// Same stale-mapping and unpersisted-status cleanup as sendPayment.
 			this.htlcPaymentMap.delete(htlcKey);
-			this.safeStorage(
-				() => this.storage!.deleteHtlcPaymentMapping(htlcKey),
-				'deleteHtlcPaymentMapping'
-			);
-			this.persistPayment(paymentHash);
+			const failMutations: RecoveryMutation[] = [
+				{ type: 'delete_htlc_payment_mapping', htlcKey }
+			];
+			const failPayment = this.paymentMutation(paymentHash);
+			if (failPayment) failMutations.push(failPayment);
+			this.commitMutations('release failed HTLC mapping', failMutations);
 			this.emit('payment:failed', payment);
 		}
 
@@ -8563,10 +8579,6 @@ export class LightningNode extends EventEmitter {
 				// The dispatched parts settle themselves: the payee cannot claim an
 				// incomplete MPP set, so it fails them back on its own MPP timeout.
 				this.htlcPaymentMap.delete(mppHtlcKey);
-				this.safeStorage(
-					() => this.storage!.deleteHtlcPaymentMapping(mppHtlcKey),
-					'deleteHtlcPaymentMapping'
-				);
 				mppState.parts.pop();
 
 				// Part failed to dispatch — mark payment failed
@@ -8576,7 +8588,14 @@ export class LightningNode extends EventEmitter {
 					result.error ?? 'unknown reason'
 				})`;
 				this.outboundMppPayments.delete(hashHex);
-				this.persistPayment(paymentHash);
+				// The mapping release and the FAILED record are one journaled
+				// transition, mirroring the single-path local-failure cleanup.
+				const mppFailMutations: RecoveryMutation[] = [
+					{ type: 'delete_htlc_payment_mapping', htlcKey: mppHtlcKey }
+				];
+				const mppFailPayment = this.paymentMutation(paymentHash);
+				if (mppFailPayment) mppFailMutations.push(mppFailPayment);
+				this.commitMutations('release failed MPP mapping', mppFailMutations);
 				this.emit('payment:failed', payment);
 				return payment;
 			}
@@ -8687,16 +8706,19 @@ export class LightningNode extends EventEmitter {
 		// Store the shared secret for this HTLC (used for creating proper failure messages)
 		const htlcSecretKey = `${channelId.toString('hex')}:${htlcId}`;
 		this.receivedHtlcSharedSecrets.set(htlcSecretKey, processed.sharedSecret);
-		if (this.storage) {
-			try {
-				this.storage.saveHtlcSharedSecret(
-					htlcSecretKey,
-					processed.sharedSecret
-				);
-			} catch {
-				/* best-effort */
-			}
-		}
+		// Journaled: a restore missing this secret cannot onion-encrypt a
+		// failure for the in-flight inbound HTLC (SafetyCritical linkage).
+		this.commitMutations(
+			'saveHtlcSharedSecret',
+			[
+				{
+					type: 'htlc_shared_secret',
+					key: htlcSecretKey,
+					secret: processed.sharedSecret
+				}
+			],
+			RecoveryCriticality.SafetyCritical
+		);
 
 		if (isFinalHop(processed.nextPacket)) {
 			// We are the final destination. htlcEntry.blindingPoint is the
@@ -9416,17 +9438,17 @@ export class LightningNode extends EventEmitter {
 	private markHoldInvoiceCancelled(hashHex: string): void {
 		this.preimages.delete(hashHex);
 		this.paymentSecrets.delete(hashHex);
-		this.safeStorage(
-			() => this.storage!.deletePaymentSecret(hashHex),
-			'deletePaymentSecret'
-		);
+		const mutations: RecoveryMutation[] = [
+			{ type: 'delete_payment_secret', paymentHash: hashHex }
+		];
 		const invoice = this.invoices.get(hashHex);
 		if (invoice && !invoice.cancelledAt) {
 			invoice.cancelledAt = Date.now();
-			this.safeStorage(
-				() => this.storage!.saveInvoice(hashHex, invoice),
-				'saveInvoice'
-			);
+			mutations.push({
+				type: 'invoice_state',
+				paymentHash: hashHex,
+				invoice
+			});
 		}
 		const payment = this.payments.get(hashHex);
 		if (
@@ -9435,11 +9457,17 @@ export class LightningNode extends EventEmitter {
 			payment.status !== PaymentStatus.COMPLETED
 		) {
 			payment.status = PaymentStatus.FAILED;
-			this.safeStorage(
-				() => this.persistPayment(Buffer.from(hashHex, 'hex')),
-				'persistPayment'
-			);
+			const paymentMutation = this.paymentMutation(Buffer.from(hashHex, 'hex'));
+			if (paymentMutation) mutations.push(paymentMutation);
 		}
+		// One journaled SafetyCritical transition: the secret deletion is what
+		// makes a late HTLC fail instead of settling, and a restore that
+		// resurrected it would quietly re-arm the cancelled hash.
+		this.commitMutations(
+			'markHoldInvoiceCancelled',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
 	}
 
 	/**
@@ -10089,11 +10117,12 @@ export class LightningNode extends EventEmitter {
 				// it, so a surviving row maps an id a later unrelated HTLC will take
 				// onto this inbound leg and would settle it against the wrong payment.
 				this.forwardedHtlcs.delete(outKey);
-				this.safeStorage(
-					() => this.storage!.deleteForwardedHtlc(outKey),
-					'deleteForwardedHtlc'
+				this.withStagedMutations(
+					[{ type: 'delete_forwarded_htlc', outKey }],
+					() => {
+						failIncoming(TEMPORARY_CHANNEL_FAILURE);
+					}
 				);
-				failIncoming(TEMPORARY_CHANNEL_FAILURE);
 				return;
 			}
 
@@ -10186,17 +10215,18 @@ export class LightningNode extends EventEmitter {
 						this.channelManager.fulfillHtlc(cid, htlc.id, preimage);
 					}
 				);
-				// Drop any forwarding bookkeeping for the matching outgoing leg.
+				// Drop any forwarding bookkeeping for the matching outgoing leg,
+				// riding the channel transition below as staged mutations.
+				const fwdCleanup: RecoveryMutation[] = [];
 				for (const [outKey, fwd] of this.forwardedHtlcs) {
 					if (fwd.inChannelId.equals(cid) && fwd.inHtlcId === htlc.id) {
 						this.forwardedHtlcs.delete(outKey);
-						this.safeStorage(
-							() => this.storage!.deleteForwardedHtlc(outKey),
-							'deleteForwardedHtlc'
-						);
+						fwdCleanup.push({ type: 'delete_forwarded_htlc', outKey });
 					}
 				}
-				this.persistChannel(cid);
+				this.withStagedMutations(fwdCleanup, () => {
+					this.persistChannel(cid);
+				});
 			}
 		}
 
@@ -10263,11 +10293,12 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 			this.forwardedHtlcs.delete(outKey);
-			this.safeStorage(
-				() => this.storage!.deleteForwardedHtlc(outKey),
-				'deleteForwardedHtlc'
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => {
+					this.persistChannel(forward.inChannelId);
+				}
 			);
-			this.persistChannel(forward.inChannelId);
 			break;
 		}
 	}
@@ -10534,11 +10565,12 @@ export class LightningNode extends EventEmitter {
 					blindedRole
 				);
 				this.forwardedHtlcs.delete(outKey);
-				this.safeStorage(
-					() => this.storage!.deleteForwardedHtlc(outKey),
-					'deleteForwardedHtlc'
+				this.withStagedMutations(
+					[{ type: 'delete_forwarded_htlc', outKey }],
+					() => {
+						this.persistChannel(channelId);
+					}
 				);
-				this.persistChannel(channelId);
 				return;
 			}
 			const inSharedSecret =
@@ -10553,11 +10585,12 @@ export class LightningNode extends EventEmitter {
 				wrappedReason
 			);
 			this.forwardedHtlcs.delete(outKey);
-			this.safeStorage(
-				() => this.storage!.deleteForwardedHtlc(outKey),
-				'deleteForwardedHtlc'
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => {
+					this.persistChannel(channelId);
+				}
 			);
-			this.persistChannel(channelId);
 			return;
 		}
 
@@ -10696,10 +10729,9 @@ export class LightningNode extends EventEmitter {
 			// returns early and leaves the failed attempt mapped to this payment
 			// hash forever, in memory and in storage.
 			this.htlcPaymentMap.delete(key);
-			this.safeStorage(
-				() => this.storage!.deleteHtlcPaymentMapping(key),
-				'deleteHtlcPaymentMapping'
-			);
+			this.commitMutations('release retried HTLC mapping', [
+				{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+			]);
 
 			// sendPayment() rejects a second payment for a hash that is still
 			// registered, so unregister the finished attempt before redispatching.
@@ -10772,18 +10804,18 @@ export class LightningNode extends EventEmitter {
 		) {
 			this.outboundMppPayments.delete(hashHex);
 		}
-		// Clean up HTLC payment mapping
+		// Clean up HTLC payment mapping. The mapping teardown and the failed
+		// payment record ride the channel transition as staged mutations, one
+		// journaled transaction, mirroring the settled-payment teardown.
 		this.htlcPaymentMap.delete(key);
-		if (this.storage) {
-			this.storage.transaction(() => {
-				this.storage!.deleteHtlcPaymentMapping(key);
-				this.persistPayment(payment.paymentHash);
-				this.persistChannel(channelId);
-			});
-		} else {
-			this.persistPayment(payment.paymentHash);
+		const failedTeardown: RecoveryMutation[] = [
+			{ type: 'delete_htlc_payment_mapping', htlcKey: key }
+		];
+		const failedPaymentMutation = this.paymentMutation(payment.paymentHash);
+		if (failedPaymentMutation) failedTeardown.push(failedPaymentMutation);
+		this.withStagedMutations(failedTeardown, () => {
 			this.persistChannel(channelId);
-		}
+		});
 		if (firstFailure) this.emit('payment:failed', payment);
 	}
 
@@ -13160,13 +13192,11 @@ export class LightningNode extends EventEmitter {
 	private cleanupHtlcSharedSecret(key: string): void {
 		this.receivedHtlcSharedSecrets.delete(key);
 		this.blindedIncomingHtlcs.delete(key);
-		if (this.storage) {
-			try {
-				this.storage.deleteHtlcSharedSecret(key);
-			} catch {
-				/* best-effort */
-			}
-		}
+		// Journaled, so a reconstruction does not resurrect the secret of an
+		// HTLC that already resolved.
+		this.commitMutations('deleteHtlcSharedSecret', [
+			{ type: 'delete_htlc_shared_secret', key }
+		]);
 	}
 
 	/**

@@ -287,7 +287,12 @@ export interface IStorageBackend {
 	saveRecoveryFrame?(frame: IStoredRecoveryFrame): void;
 	/** Load frames in sequence order, optionally after a given sequence. */
 	loadRecoveryFrames?(afterSequence?: number): IStoredRecoveryFrame[];
-	/** Compaction: drop every frame with sequence below the given one. */
+	/**
+	 * Compaction: drop every frame with sequence below the given one. Part of
+	 * the journalSupported contract, not a nice-to-have: verification requires
+	 * the first retained frame to BE the recorded snapshot, which only holds
+	 * when snapshots prune the deltas below them.
+	 */
 	deleteRecoveryFramesBelow?(sequence: number): void;
 	/** Stamp outbox rows with the journal frame that carried their insert. */
 	setOutboxFrameSequence?(ids: number[], frameSequence: number): void;
