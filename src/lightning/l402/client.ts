@@ -60,11 +60,24 @@ export type FetchLike = (
 	}
 ) => Promise<IL402Response>;
 
+/** A web-stream body reader, structurally (no DOM lib dependency). */
+export interface IL402BodyReader {
+	read(): Promise<{ done: boolean; value?: Uint8Array }>;
+	cancel(reason?: unknown): Promise<unknown> | void;
+}
+
 /** The parts of a Response this client uses. */
 export interface IL402Response {
 	status: number;
 	headers: { get(name: string): string | null };
 	text(): Promise<string>;
+	/**
+	 * Streaming body, when the fetch implementation provides one. Optional:
+	 * consumers that need a size bound read this incrementally via
+	 * {@link readCappedBody}; without it the only option is text(), which
+	 * buffers whatever the server chooses to send.
+	 */
+	body?: { getReader(): IL402BodyReader } | null;
 	/**
 	 * Final URL after redirects, when the fetch implementation reports one.
 	 * Load-bearing: a redirect can move the challenge to another origin, and
@@ -201,7 +214,6 @@ export async function l402Fetch(
 
 	const store = options.credentials ?? new MemoryL402CredentialStore();
 	const scope = credentialScope(url, options.scopePerPath);
-	const held = store.get(scope);
 	const request = (credential?: IL402Credential): IL402RequestInit =>
 		withTimeout(withAuthorization(init, credential), options);
 
@@ -209,12 +221,14 @@ export async function l402Fetch(
 	// that cannot be turned into a header is dropped rather than thrown over:
 	// one poisoned entry would otherwise wedge the scope for good, since the
 	// throw would land before the request that detects a dead credential.
-	let response = await doFetch(url, request(usableCredential(held, store)));
+	let usable = usableCredential(store.get(scope), store);
+	let response = await doFetch(url, request(usable));
 
 	// A held credential the server no longer accepts is dead weight: drop it
 	// and fall through to the challenge path rather than failing the call.
-	if (held && (response.status === 401 || response.status === 402)) {
+	if (usable && (response.status === 401 || response.status === 402)) {
 		store.delete(scope);
+		usable = undefined;
 		response = await doFetch(url, request(undefined));
 	}
 
@@ -222,18 +236,19 @@ export async function l402Fetch(
 		return {
 			response,
 			paid: false,
-			credential: held,
+			credential: usable,
 			amountPaidSats: 0
 		};
 	}
 
-	const challenge = parseL402Challenge(
+	const parsedChallenge = parseL402Challenge(
 		response.headers.get('www-authenticate') ?? ''
 	);
-	if (!challenge) {
+	if (!parsedChallenge) {
 		// A 402 with no L402 challenge is the server's business, not ours.
 		return { response, paid: false, amountPaidSats: 0 };
 	}
+	let challenge: IL402Challenge = parsedChallenge;
 
 	// A redirect can move the challenge to an origin the caller never named,
 	// and the response carries no hint of it beyond the final URL. Check
@@ -241,53 +256,125 @@ export async function l402Fetch(
 	// reason rather than for whatever its invoice happens to look like.
 	assertSameOrigin(url, response.url, options);
 
-	const priceSats = validateChallenge(challenge, options);
-	if (!options.payer) {
-		throw new L402Error(
-			'l402Fetch: a challenge was issued but no payer was configured',
-			'NO_PAYER'
-		);
-	}
+	// From here a payment can leave, so overlapping calls for one scope are
+	// serialized: two calls that both saw a 402 would otherwise each pay their
+	// own invoice for the same access. The lock only covers the challenge
+	// path; the steady state above (credential held, server content) runs
+	// concurrently. Callers who pass no store get no cross-call coalescing,
+	// since without shared storage the second call could not reuse the first
+	// call's credential anyway.
+	return await withScopeLock(store, scope, async () => {
+		// Another call may have paid while this one waited for the lock; its
+		// credential satisfies this request without a second payment.
+		const minted = usableCredential(store.get(scope), store);
+		if (minted) {
+			const reused = await doFetch(url, request(minted));
+			if (reused.status !== 402) {
+				return {
+					response: reused,
+					paid: false,
+					credential: minted,
+					amountPaidSats: 0
+				};
+			}
+			// The minted credential no longer satisfies the server. Drop it,
+			// and pay the freshest challenge visible: the invoice in the
+			// original one may already be settled or expired.
+			store.delete(minted.scope);
+			const fresh = parseL402Challenge(
+				reused.headers.get('www-authenticate') ?? ''
+			);
+			if (fresh) {
+				assertSameOrigin(url, reused.url, options);
+				challenge = fresh;
+				response = reused;
+			}
+		}
 
-	const paymentHash = decodeInvoice(challenge.invoice).paymentHash;
-	const { preimage } = await options.payer.payInvoice(challenge.invoice, {
-		maxFeeSats: options.maxFeeSats ?? defaultFeeCapSats(priceSats),
-		timeoutMs: options.timeoutMs
+		const priceSats = validateChallenge(challenge, options);
+		if (!options.payer) {
+			throw new L402Error(
+				'l402Fetch: a challenge was issued but no payer was configured',
+				'NO_PAYER'
+			);
+		}
+
+		const paymentHash = decodeInvoice(challenge.invoice).paymentHash;
+		const { preimage } = await options.payer.payInvoice(challenge.invoice, {
+			maxFeeSats: options.maxFeeSats ?? defaultFeeCapSats(priceSats),
+			timeoutMs: options.timeoutMs
+		});
+
+		// The preimage is what proves the payment to the server, so a payer
+		// returning one that does not open the invoice's hash has handed us a
+		// credential that cannot work. Say so instead of storing it and letting
+		// every later request fail with an opaque 401.
+		if (
+			!crypto.createHash('sha256').update(preimage).digest().equals(paymentHash)
+		) {
+			throw new L402Error(
+				'L402 payment returned a preimage that does not hash to the invoice payment hash',
+				'PREIMAGE_MISMATCH'
+			);
+		}
+
+		const credential: IL402Credential = {
+			scope,
+			macaroon: challenge.macaroon,
+			preimage: preimage.toString('hex'),
+			paymentHash: paymentHash.toString('hex'),
+			amountSats: priceSats,
+			createdAt: Date.now(),
+			scheme: challenge.scheme
+		};
+		store.set(credential);
+
+		// Exactly one retry. If it is another 402 the caller sees it and
+		// decides; this function never pays twice.
+		const retried = await doFetch(url, request(credential));
+		return {
+			response: retried,
+			paid: true,
+			credential,
+			amountPaidSats: priceSats
+		};
 	});
+}
 
-	// The preimage is what proves the payment to the server, so a payer
-	// returning one that does not open the invoice's hash has handed us a
-	// credential that cannot work. Say so instead of storing it and letting
-	// every later request fail with an opaque 401.
-	if (
-		!crypto.createHash('sha256').update(preimage).digest().equals(paymentHash)
-	) {
-		throw new L402Error(
-			'L402 payment returned a preimage that does not hash to the invoice payment hash',
-			'PREIMAGE_MISMATCH'
-		);
+/**
+ * Serialize the paid path per (store, scope). Keyed by store so unrelated
+ * stores never contend, and weakly so a discarded store takes its lock chain
+ * with it. The synchronous section below runs to completion before any queued
+ * function starts, which is what makes enqueueing race-free on one thread.
+ */
+const scopeLocks = new WeakMap<
+	IL402CredentialStore,
+	Map<string, Promise<unknown>>
+>();
+
+async function withScopeLock<T>(
+	store: IL402CredentialStore,
+	scope: string,
+	fn: () => Promise<T>
+): Promise<T> {
+	let locks = scopeLocks.get(store);
+	if (!locks) {
+		locks = new Map();
+		scopeLocks.set(store, locks);
 	}
-
-	const credential: IL402Credential = {
-		scope,
-		macaroon: challenge.macaroon,
-		preimage: preimage.toString('hex'),
-		paymentHash: paymentHash.toString('hex'),
-		amountSats: priceSats,
-		createdAt: Date.now(),
-		scheme: challenge.scheme
-	};
-	store.set(credential);
-
-	// Exactly one retry. If it is another 402 the caller sees it and decides;
-	// this function never pays twice.
-	const retried = await doFetch(url, request(credential));
-	return {
-		response: retried,
-		paid: true,
-		credential,
-		amountPaidSats: priceSats
-	};
+	const previous = locks.get(scope) ?? Promise.resolve();
+	const run = previous.then(() => fn());
+	// The stored tail never rejects, so one failed call cannot poison the
+	// queue behind it; each caller still sees its own failure through `run`.
+	const tail = run.then(
+		() => undefined,
+		() => undefined
+	);
+	locks.set(scope, tail);
+	void tail.then(() => {
+		if (locks?.get(scope) === tail) locks.delete(scope);
+	});
+	return run;
 }
 
 /**
@@ -441,5 +528,120 @@ function assertSameOrigin(
 	throw new L402Error(
 		`L402 challenge came from ${final} after a redirect from ${requested}, so it was not paid`,
 		'CROSS_ORIGIN_CHALLENGE'
+	);
+}
+
+/**
+ * Read a response body under a byte cap without ever holding more than the
+ * cap in memory. Streams when the implementation exposes a body reader and
+ * cancels the stream once the cap is crossed; falls back to text() otherwise,
+ * where the full buffer is unavoidable but the returned value is still capped.
+ * Truncation is byte-exact, so a multibyte character split at the boundary
+ * decodes as a replacement character; a cut body is marked, not exact.
+ */
+export async function readCappedBody(
+	response: IL402Response,
+	capBytes: number
+): Promise<{ body: string; truncated: boolean }> {
+	const stream = response.body;
+	if (stream && typeof stream.getReader === 'function') {
+		const reader = stream.getReader();
+		const chunks: Buffer[] = [];
+		let total = 0;
+		let truncated = false;
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value || value.byteLength === 0) continue;
+			chunks.push(
+				Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+			);
+			total += value.byteLength;
+			if (total > capBytes) {
+				truncated = true;
+				try {
+					await reader.cancel();
+				} catch {
+					// The bytes already read are the answer; a cancel failure
+					// changes nothing about them.
+				}
+				break;
+			}
+		}
+		let body = Buffer.concat(chunks);
+		if (body.length > capBytes) body = body.subarray(0, capBytes);
+		return { body: body.toString('utf8'), truncated };
+	}
+
+	const text = await response.text();
+	const bytes = Buffer.from(text, 'utf8');
+	if (bytes.length > capBytes) {
+		return {
+			body: bytes.subarray(0, capBytes).toString('utf8'),
+			truncated: true
+		};
+	}
+	return { body: text, truncated: false };
+}
+
+/**
+ * Whether a URL names a private, loopback, or link-local host, judged from
+ * the URL alone. Used by embedders whose l402Fetch is reachable over an API,
+ * where "fetch this URL for me" would otherwise reach targets only the host
+ * machine can see: localhost admin panels, RFC 1918 services, or the
+ * 169.254.169.254 cloud metadata endpoint. Name-based only: a public DNS name
+ * resolving to a private address (DNS rebinding) is out of scope here and
+ * needs resolver-level enforcement.
+ */
+export function isPrivateNetworkUrl(url: string): boolean {
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return true;
+	}
+	// URL.hostname keeps the brackets on an IPv6 literal.
+	const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+	if (!hostname) return true;
+	if (hostname === 'localhost' || hostname.endsWith('.localhost')) return true;
+	if (isIPv4(hostname)) return isPrivateIPv4(hostname);
+	if (hostname.includes(':')) return isPrivateIPv6(hostname);
+	return false;
+}
+
+function isIPv4(hostname: string): boolean {
+	const match = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+	if (!match) return false;
+	return match.slice(1).every((octet) => Number(octet) <= 255);
+}
+
+function isPrivateIPv4(ip: string): boolean {
+	const [a, b] = ip.split('.').map(Number);
+	return (
+		a === 0 || // "this network", including 0.0.0.0
+		a === 10 || // RFC 1918
+		a === 127 || // loopback
+		(a === 100 && b >= 64 && b <= 127) || // CGNAT / overlay networks
+		(a === 169 && b === 254) || // link-local, incl. cloud metadata
+		(a === 172 && b >= 16 && b <= 31) || // RFC 1918
+		(a === 192 && b === 168) // RFC 1918
+	);
+}
+
+function isPrivateIPv6(ip: string): boolean {
+	if (ip === '::' || ip === '::1') return true;
+	if (ip.startsWith('::ffff:')) {
+		// IPv4-mapped. The dotted form re-checks as IPv4; the pure-hex form is
+		// refused outright rather than decoded, erring private.
+		const mapped = ip.slice(7);
+		return isIPv4(mapped) ? isPrivateIPv4(mapped) : true;
+	}
+	return (
+		ip.startsWith('fc') || // fc00::/7 unique-local
+		ip.startsWith('fd') ||
+		ip.startsWith('fe8') || // fe80::/10 link-local
+		ip.startsWith('fe9') ||
+		ip.startsWith('fea') ||
+		ip.startsWith('feb')
 	);
 }

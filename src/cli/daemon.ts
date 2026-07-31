@@ -179,7 +179,13 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	L402_UNUSABLE_MACAROON: 402,
 	L402_CROSS_ORIGIN_CHALLENGE: 402,
 	L402_INVALID_INVOICE: 400,
-	L402_NO_PAYER: 400
+	L402_NO_PAYER: 400,
+	// The caller's response-size cap and the private-target guard are caller
+	// decisions too, and a network failure reaching the TARGET is upstream
+	// trouble, not a node fault: none of them may read as a retryable 500.
+	RESPONSE_TOO_LARGE: 413,
+	PRIVATE_NETWORK_REFUSED: 403,
+	L402_FETCH_FAILED: 502
 };
 
 export function statusForErrorCode(code: string): number {
@@ -1142,6 +1148,7 @@ export async function startDaemon(
 				scopePerPath,
 				allowUnverifiedMacaroon,
 				allowCrossOriginChallenge,
+				allowPrivateNetwork,
 				maxResponseBytes
 			} = body as {
 				url: string;
@@ -1155,17 +1162,33 @@ export async function startDaemon(
 				scopePerPath?: boolean;
 				allowUnverifiedMacaroon?: boolean;
 				allowCrossOriginChallenge?: boolean;
+				allowPrivateNetwork?: boolean;
 				maxResponseBytes?: number;
 			};
 			if (!url) return failure('INVALID_PARAMS', 'url required');
 			// The cap is mandatory over HTTP, not defaulted: a remote response
 			// header triggers the payment, so the price ceiling has to be a
-			// deliberate choice by the caller rather than one we invent.
-			if (typeof maxPriceSats !== 'number' || !Number.isFinite(maxPriceSats)) {
+			// deliberate choice by the caller rather than one we invent. It is
+			// also an integer: a fractional cap would reach BigInt() in the
+			// payer and throw an opaque server fault instead of a 400.
+			if (!Number.isInteger(maxPriceSats) || (maxPriceSats as number) < 0) {
 				return failure(
 					'INVALID_PARAMS',
-					'maxPriceSats required (satoshi cap on what one challenge may cost)'
+					'maxPriceSats required, a non-negative integer satoshi cap on what one challenge may cost'
 				);
+			}
+			for (const [name, value] of [
+				['maxFeeSats', maxFeeSats],
+				['timeoutMs', timeoutMs],
+				['fetchTimeoutMs', fetchTimeoutMs],
+				['maxResponseBytes', maxResponseBytes]
+			] as Array<[string, number | undefined]>) {
+				if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+					return failure(
+						'INVALID_PARAMS',
+						`${name} must be a non-negative integer`
+					);
+				}
 			}
 			try {
 				return success(
@@ -1173,22 +1196,32 @@ export async function startDaemon(
 						url,
 						{ method, headers, body: requestBody },
 						{
-							maxPriceSats,
+							maxPriceSats: maxPriceSats as number,
 							maxFeeSats,
 							timeoutMs,
 							fetchTimeoutMs,
 							scopePerPath,
 							allowUnverifiedMacaroon,
 							allowCrossOriginChallenge,
+							allowPrivateNetwork,
 							maxResponseBytes
 						}
 					)
 				);
 			} catch (err: unknown) {
+				if (err instanceof L402Error) {
+					return failure(`L402_${err.code}`, err.message);
+				}
+				// BeignetError codes (RESPONSE_TOO_LARGE, payment failures, the
+				// private-target guard) map to their own statuses centrally.
+				if (err instanceof BeignetError) throw err;
+				// What remains is the network layer failing to reach the target
+				// (DNS, refused, reset, timeout). The top-level message names
+				// the caller's own URL and is worth relaying; the cause chain
+				// can carry resolved addresses and socket detail, so it stays
+				// out of the envelope.
 				const msg = err instanceof Error ? err.message : String(err);
-				const code =
-					err instanceof L402Error ? `L402_${err.code}` : 'L402_FETCH_FAILED';
-				return failure(code, msg);
+				return failure('L402_FETCH_FAILED', `fetch failed: ${msg}`);
 			}
 		},
 		'GET /l402/credentials': () => success(node.listL402Credentials()),

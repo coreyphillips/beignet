@@ -126,20 +126,24 @@ function splitChallenges(header: string): IRawChallenge[] {
 	return challenges;
 }
 
-/** Record one parameter, flagging a repeat rather than picking a winner. */
+/**
+ * Record one parameter, flagging a repeat rather than picking a winner. An
+ * empty value still claims its name: `macaroon="", macaroon="x"` is the same
+ * ambiguity as two non-empty values, and skipping the empty one would let the
+ * second quietly win. An empty macaroon or invoice never parses into a
+ * challenge anyway, since both are required to be non-empty.
+ */
 function addParam(
 	challenge: IRawChallenge,
 	name: string,
 	rawValue: string
 ): void {
 	const key = name.toLowerCase();
-	const value = unquote(rawValue);
-	if (!value) return;
 	if (challenge.params.has(key)) {
 		challenge.duplicated = true;
 		return;
 	}
-	challenge.params.set(key, value);
+	challenge.params.set(key, unquote(rawValue));
 }
 
 /** Strip surrounding quotes and resolve backslash escapes inside them. */
@@ -192,10 +196,13 @@ function splitTopLevelCommas(header: string): string[] {
  * macaroon carrying a space (a server wrapping its base64, or one doing it
  * deliberately) parses fine and commits to the right hash, yet cannot be
  * echoed back. Discovering that after the payment would spend the sats and
- * throw away the purchase.
+ * throw away the purchase. A colon is rejected for the same reason: it is the
+ * `macaroon:preimage` delimiter, so a macaroon containing one would mis-split
+ * on the server. No base64 alphabet produces one, so nothing legitimate is
+ * refused.
  */
 export function isHeaderSafeMacaroon(macaroon: string): boolean {
-	return Boolean(macaroon) && !/[\s,]/.test(macaroon);
+	return Boolean(macaroon) && !/[\s,:]/.test(macaroon);
 }
 
 /**

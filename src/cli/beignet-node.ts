@@ -34,10 +34,12 @@ import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
 import {
+	isPrivateNetworkUrl,
 	l402Fetch,
 	IL402Credential,
 	IL402RequestInit,
-	MemoryL402CredentialStore
+	MemoryL402CredentialStore,
+	readCappedBody
 } from '../lightning/l402';
 import { IPaymentInfo } from '../lightning/node/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
@@ -3969,6 +3971,7 @@ export class BeignetNode extends EventEmitter {
 			scopePerPath?: boolean;
 			allowUnverifiedMacaroon?: boolean;
 			allowCrossOriginChallenge?: boolean;
+			allowPrivateNetwork?: boolean;
 			maxResponseBytes?: number;
 		}
 	): Promise<{
@@ -3980,6 +3983,12 @@ export class BeignetNode extends EventEmitter {
 		paymentHash?: string;
 	}> {
 		this._checkDraining();
+		// This method is reachable over the daemon API, which makes it a
+		// fetch-this-URL-for-me proxy running on the node's machine. Refuse
+		// targets only that machine can see (localhost, RFC 1918, the cloud
+		// metadata endpoint) unless the caller opts in, and refuse schemes
+		// fetch would happily serve from outside HTTP (file:, data:).
+		this._assertL402TargetAllowed(url, options.allowPrivateNetwork);
 		const result = await l402Fetch(url, init, {
 			...options,
 			credentials: this._l402Credentials,
@@ -4003,11 +4012,21 @@ export class BeignetNode extends EventEmitter {
 				}
 			}
 		});
-		// The body is buffered here and serialized again by the daemon, so an
-		// unbounded response is two copies of whatever a remote server decides
-		// to send. Refuse one that declares itself too large, and truncate one
-		// that turns out to be (a server can lie about content-length, so the
-		// declared size alone is not a bound).
+		// A redirect can land on a host the caller never named. The paid path
+		// already refuses cross-origin challenges, but an unpaid response that
+		// followed a redirect to a private target must not be relayed either.
+		if (result.response.url) {
+			this._assertL402TargetAllowed(
+				result.response.url,
+				options.allowPrivateNetwork
+			);
+		}
+		// The body is relayed to the daemon caller, so its size has to be
+		// bounded here. Refuse a response that declares itself too large, and
+		// stream-read the rest under the cap (a server can lie about
+		// content-length, so the declared size alone is not a bound, and
+		// buffering first then truncating would let the full body into memory
+		// anyway).
 		const cap = options.maxResponseBytes ?? DEFAULT_L402_MAX_RESPONSE_BYTES;
 		const declared = Number(result.response.headers.get('content-length'));
 		if (Number.isFinite(declared) && declared > cap) {
@@ -4016,11 +4035,10 @@ export class BeignetNode extends EventEmitter {
 				`L402 response declares ${declared} bytes, above the ${cap} byte limit`
 			);
 		}
-		const body = await result.response.text();
-		const truncated = Buffer.byteLength(body) > cap;
+		const { body, truncated } = await readCappedBody(result.response, cap);
 		return {
 			status: result.response.status,
-			body: truncated ? body.slice(0, cap) : body,
+			body,
 			truncated,
 			paid: result.paid,
 			amountPaidSats: result.amountPaidSats,
@@ -4028,9 +4046,46 @@ export class BeignetNode extends EventEmitter {
 		};
 	}
 
-	/** Paid L402 credentials held by this process. */
+	/**
+	 * Refuse an L402 fetch target outside plain HTTP or inside the private
+	 * address space, unless the caller opted in. Judged from the URL text
+	 * only; a public name resolving privately (DNS rebinding) is not caught
+	 * here.
+	 */
+	private _assertL402TargetAllowed(
+		url: string,
+		allowPrivateNetwork?: boolean
+	): void {
+		let protocol: string;
+		try {
+			protocol = new URL(url).protocol;
+		} catch {
+			throw new BeignetError('INVALID_PARAMS', `L402 fetch URL is invalid`);
+		}
+		if (protocol !== 'http:' && protocol !== 'https:') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`L402 fetch only supports http and https URLs, got ${protocol}`
+			);
+		}
+		if (!allowPrivateNetwork && isPrivateNetworkUrl(url)) {
+			throw new BeignetError(
+				'PRIVATE_NETWORK_REFUSED',
+				'L402 fetch target names a private, loopback, or link-local host; pass allowPrivateNetwork to permit it'
+			);
+		}
+	}
+
+	/**
+	 * Paid L402 credentials held by this process. The preimage is the bearer
+	 * half of the credential, so it is masked here the way webhook HMAC
+	 * secrets are: the list identifies what is held and what it cost, it does
+	 * not export usable tokens to stdout or logs.
+	 */
 	listL402Credentials(): IL402Credential[] {
-		return this._l402Credentials.list();
+		return this._l402Credentials
+			.list()
+			.map((credential) => ({ ...credential, preimage: '***' }));
 	}
 
 	/** Forget a paid credential, so the next request pays again. */

@@ -16,6 +16,7 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import {
 	buildL402AuthorizationHeader,
+	isHeaderSafeMacaroon,
 	parseL402AuthorizationHeader,
 	parseL402Challenge
 } from '../../src/lightning/l402/challenge';
@@ -26,8 +27,10 @@ import {
 } from '../../src/lightning/l402/macaroon';
 import {
 	defaultFeeCapSats,
+	isPrivateNetworkUrl,
 	L402Error,
 	l402Fetch,
+	readCappedBody,
 	validateChallenge,
 	IL402Response
 } from '../../src/lightning/l402/client';
@@ -1036,5 +1039,173 @@ describe('L402 parsing cannot be confused across challenges', () => {
 				{ maxPriceSats: 10 }
 			)
 		).to.throw(/could not be parsed/);
+	});
+});
+
+// ─────────────── Review fixes: coalescing, capping, target hygiene ───────────────
+
+describe('L402 concurrent calls and result hygiene', () => {
+	it('pays once when two calls race on the same scope', async () => {
+		const { fetchImpl, payer } = createMockL402Server({ priceSats: 3 });
+		// Yield between request and response so the calls interleave: both see
+		// their 402 before either has paid, the exact double-payment shape.
+		const slowFetch: typeof fetchImpl = async (url, init) => {
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			return fetchImpl(url, init);
+		};
+		const store = new MemoryL402CredentialStore();
+		const opts = {
+			payer,
+			maxPriceSats: 10,
+			credentials: store,
+			fetchImpl: slowFetch
+		};
+		const [a, b] = await Promise.all([
+			l402Fetch('https://api.example/data', {}, opts),
+			l402Fetch('https://api.example/data', {}, opts)
+		]);
+		expect(payer.payments).to.equal(1);
+		expect(a.response.status).to.equal(200);
+		expect(b.response.status).to.equal(200);
+		// Exactly one of the two calls carried the payment.
+		expect(Number(a.paid) + Number(b.paid)).to.equal(1);
+		expect(a.amountPaidSats + b.amountPaidSats).to.equal(3);
+	});
+
+	it('does not report a credential this call already dropped', async () => {
+		const store = new MemoryL402CredentialStore();
+		store.set({
+			scope: 'https://api.example',
+			macaroon: 'AAAA',
+			preimage: '00'.repeat(32),
+			paymentHash: '11'.repeat(32),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		let calls = 0;
+		const fetchImpl = async (): Promise<IL402Response> => {
+			calls++;
+			return calls === 1
+				? {
+						status: 401,
+						headers: { get: (): string | null => null },
+						text: async (): Promise<string> => 'no'
+				  }
+				: {
+						status: 200,
+						headers: { get: (): string | null => null },
+						text: async (): Promise<string> => 'ok'
+				  };
+		};
+		const result = await l402Fetch(
+			'https://api.example/x',
+			{},
+			{ maxPriceSats: 10, credentials: store, fetchImpl }
+		);
+		expect(result.response.status).to.equal(200);
+		expect(result.paid).to.equal(false);
+		// The held credential was rejected by the server and deleted, so the
+		// result must not present it as the one that worked.
+		expect(result.credential).to.equal(undefined);
+		expect(store.get('https://api.example')).to.equal(undefined);
+	});
+
+	it('refuses a macaroon containing the authorization delimiter', () => {
+		expect(isHeaderSafeMacaroon('mac:aroon')).to.equal(false);
+		expect(() =>
+			buildL402AuthorizationHeader('mac:aroon', '00'.repeat(32))
+		).to.throw(/header-safe/);
+	});
+
+	it('treats an empty then non-empty parameter as the same ambiguity', () => {
+		expect(
+			parseL402Challenge('L402 macaroon="", macaroon="m2", invoice="lnbc1abc"')
+		).to.equal(null);
+	});
+});
+
+describe('readCappedBody', () => {
+	it('stops reading a streaming body at the cap and cancels the stream', async () => {
+		const chunk = Buffer.alloc(1024, 0x61);
+		let reads = 0;
+		let cancelled = false;
+		const response: IL402Response = {
+			status: 200,
+			headers: { get: (): string | null => null },
+			text: async (): Promise<string> => {
+				throw new Error('text() must not be used when a stream exists');
+			},
+			body: {
+				getReader: () => ({
+					// An endless body: only the cap can stop this read loop.
+					read: async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+						reads++;
+						return { done: false, value: chunk };
+					},
+					cancel: async (): Promise<void> => {
+						cancelled = true;
+					}
+				})
+			}
+		};
+		const { body, truncated } = await readCappedBody(response, 4000);
+		expect(truncated).to.equal(true);
+		expect(cancelled).to.equal(true);
+		expect(Buffer.byteLength(body)).to.equal(4000);
+		// Memory stays bounded by the cap plus one chunk, never the whole body.
+		expect(reads).to.be.lessThan(6);
+	});
+
+	it('truncates a buffered body by bytes, not UTF-16 characters', async () => {
+		const response: IL402Response = {
+			status: 200,
+			headers: { get: (): string | null => null },
+			text: async (): Promise<string> => 'é'.repeat(10)
+		};
+		const capped = await readCappedBody(response, 8);
+		expect(capped.truncated).to.equal(true);
+		expect(Buffer.byteLength(capped.body)).to.be.at.most(8);
+		const whole = await readCappedBody(response, 100);
+		expect(whole.truncated).to.equal(false);
+		expect(whole.body).to.equal('é'.repeat(10));
+	});
+});
+
+describe('isPrivateNetworkUrl', () => {
+	it('flags loopback, private, link-local, and mapped addresses', () => {
+		for (const url of [
+			'http://localhost:3000/x',
+			'http://sub.localhost/x',
+			'http://127.0.0.1/x',
+			'http://127.8.9.10/x',
+			'http://0.0.0.0/x',
+			'http://10.1.2.3/x',
+			'http://172.16.0.1/x',
+			'http://172.31.255.255/x',
+			'http://192.168.1.1/x',
+			'http://169.254.169.254/latest/meta-data/',
+			'http://100.100.1.1/x',
+			'http://[::1]/x',
+			'http://[::ffff:10.0.0.1]/x',
+			'http://[fe80::1]/x',
+			'http://[fd00::1]/x',
+			'not a url'
+		]) {
+			expect(isPrivateNetworkUrl(url), url).to.equal(true);
+		}
+	});
+
+	it('passes public targets through', () => {
+		for (const url of [
+			'https://api.example.com/data',
+			'https://8.8.8.8/x',
+			'http://172.15.0.1/x',
+			'http://172.32.0.1/x',
+			'http://11.0.0.1/x',
+			'https://[2001:db8::1]/x'
+		]) {
+			expect(isPrivateNetworkUrl(url), url).to.equal(false);
+		}
 	});
 });

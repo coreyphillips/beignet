@@ -1486,7 +1486,7 @@ async function handleL402(): Promise<void> {
 					error: {
 						code: 'INVALID_PARAMS',
 						message:
-							'Usage: beignet l402 fetch <url> --max-price <sats> [--max-fee <sats>] [--method GET] [--header "K: V"] [--body <string>] [--scope-per-path] [--allow-unverified-macaroon]'
+							'Usage: beignet l402 fetch <url> --max-price <sats> [--max-fee <sats>] [--method GET] [--header "K: V"] [--body <string>] [--scope-per-path] [--allow-unverified-macaroon] [--allow-private-network]'
 					}
 				});
 				process.exitCode = 1;
@@ -1515,7 +1515,9 @@ async function handleL402(): Promise<void> {
 					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined,
 					scopePerPath: filteredArgs.includes('--scope-per-path') || undefined,
 					allowUnverifiedMacaroon:
-						filteredArgs.includes('--allow-unverified-macaroon') || undefined
+						filteredArgs.includes('--allow-unverified-macaroon') || undefined,
+					allowPrivateNetwork:
+						filteredArgs.includes('--allow-private-network') || undefined
 				})
 			);
 		}

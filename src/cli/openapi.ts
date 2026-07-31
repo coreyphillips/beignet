@@ -823,6 +823,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									type: 'boolean',
 									description:
 										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
+								},
+								allowPrivateNetwork: {
+									type: 'boolean',
+									description:
+										'Permit a target on a private, loopback, or link-local host, which is refused by default because this endpoint fetches on behalf of the caller from the node machine'
 								}
 							}
 						})
@@ -852,10 +857,12 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/l402/credentials': {
 				get: {
 					summary: 'List paid L402 credentials held by this process',
+					description:
+						'Preimages are masked: the list identifies what is held and what it cost, it does not export usable bearer tokens.',
 					tags: ['Payments'],
 					responses: {
 						'200': {
-							description: 'Held credentials',
+							description: 'Held credentials, preimages masked',
 							content: jsonContent({ type: 'array', items: { type: 'object' } })
 						}
 					}
