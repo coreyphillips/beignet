@@ -276,6 +276,31 @@ export interface IStorageBackend {
 	/** Keep only the newest `keepNewest` rows for a channel. */
 	pruneOutboxMessages?(channelId: string, keepNewest: number): void;
 
+	// ─── Recovery Journal (optional, docs/RECOVERY-PROTOCOL.md 5.3) ───
+	// Append-only hash-chained frames plus the journal's own metadata (tip,
+	// epoch, last snapshot). Rows are written INSIDE the same transaction as
+	// the transition they record; the ciphertext arrives already
+	// AEAD-encrypted with the per-epoch frame key, so it is deliberately NOT
+	// in ENCRYPTED_COLUMNS (a second storage-key layer would add nothing and
+	// break the AAD binding checks on load).
+	/** Append one encrypted frame. Throws if the sequence already exists. */
+	saveRecoveryFrame?(frame: IStoredRecoveryFrame): void;
+	/** Load frames in sequence order, optionally after a given sequence. */
+	loadRecoveryFrames?(afterSequence?: number): IStoredRecoveryFrame[];
+	/**
+	 * Compaction: drop every frame with sequence below the given one. Part of
+	 * the journalSupported contract, not a nice-to-have: verification requires
+	 * the first retained frame to BE the recorded snapshot, which only holds
+	 * when snapshots prune the deltas below them.
+	 */
+	deleteRecoveryFramesBelow?(sequence: number): void;
+	/** Stamp outbox rows with the journal frame that carried their insert. */
+	setOutboxFrameSequence?(ids: number[], frameSequence: number): void;
+	/** Read one journal metadata value (tip hash, epoch, snapshot marker). */
+	getRecoveryMeta?(key: string): string | null;
+	/** Write one journal metadata value. */
+	setRecoveryMeta?(key: string, value: string): void;
+
 	// ─── BOLT 12 Offers (optional) ───
 	/**
 	 * Persist a created offer. The bech32m encoding is the authoritative
@@ -325,6 +350,22 @@ export type RecoveryOutboxDisposition =
  * must be byte-identical, because re-signing would bind a fresh MuSig2 secret
  * nonce to material the peer may already hold under the old one.
  */
+/**
+ * One recovery journal frame as stored (docs/RECOVERY-PROTOCOL.md 5.3).
+ * Sequence and epoch are plain numbers at this layer (SQLite INTEGER);
+ * the journal converts to bigint at its boundary.
+ */
+export interface IStoredRecoveryFrame {
+	sequence: number;
+	writerEpoch: number;
+	/** SHA-256 of the plaintext frame bytes. */
+	frameHash: Buffer;
+	previousFrameHash: Buffer;
+	/** AES-256-GCM: iv || authTag || ciphertext, keyed per epoch. */
+	ciphertext: Buffer;
+	createdAt: number;
+}
+
 export interface IRecoveryOutboxMessage {
 	/** Peer node id, hex. */
 	peerId: string;

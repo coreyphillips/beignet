@@ -202,6 +202,23 @@ export interface INodeConfig {
 	resourceConfig?: IResourceConfig;
 	/** Storage backend for persistence */
 	storage?: IStorageBackend;
+	/**
+	 * Recovery Protocol journal (docs/RECOVERY-PROTOCOL.md 5.3, Phase 2).
+	 * Default OFF: when enabled (and the storage backend supports frames),
+	 * every safety-critical transition also appends an encrypted, hash-chained
+	 * frame in the same transaction, with periodic full-state snapshots and
+	 * compaction. Purely additive; disabling it changes nothing else.
+	 */
+	recovery?: {
+		enabled?: boolean;
+		/** Delta frames between full-state snapshots (default 256). */
+		snapshotIntervalFrames?: number;
+		/**
+		 * Delta plaintext bytes between snapshots, whichever of the two
+		 * limits trips first (default 4 MiB).
+		 */
+		snapshotIntervalBytes?: number;
+	};
 	/** Chain backend for blockchain monitoring (Electrum, Esplora, etc.) */
 	chainBackend?: IChainBackend;
 	/** HTLC safety margin in blocks before force-failing expiring HTLCs (default 6) */

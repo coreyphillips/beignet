@@ -642,6 +642,11 @@ describe('Fix 2.5: Emit errors on persistence failures', () => {
 			savePayment: () => {
 				throw new Error('db locked');
 			},
+			// persistPayment routes through RecoveryManager.commit now (the
+			// payment write is journaled), so the mock needs the transaction
+			// wrapper the commit runs inside; the failure under test is still
+			// savePayment itself.
+			transaction: <T>(fn: () => T): T => fn(),
 			saveMissionControl: () => {}
 		};
 

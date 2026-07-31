@@ -14,6 +14,7 @@ import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
 import {
 	IRecoveryCommitResult,
+	IRecoveryJournalSink,
 	IRecoveryOutboxRow,
 	RecoveryCriticality,
 	RecoveryMutation,
@@ -43,6 +44,14 @@ export interface IRecoveryManagerOptions {
 	 * retransmission, which is exactly today's behavior.
 	 */
 	maxOutboxRowsPerChannel?: number;
+	/**
+	 * Phase 2 recovery journal (docs/RECOVERY-PROTOCOL.md 5.3). When set,
+	 * every Important and SafetyCritical transition appends a frame INSIDE
+	 * its own transaction; a journal failure rolls the transition back, since
+	 * journaled durability is part of the commit, not a best-effort tail.
+	 * Reconstructable transitions are never journaled.
+	 */
+	journal?: IRecoveryJournalSink;
 }
 
 /** Rows retained per channel before the oldest are pruned. */
@@ -93,6 +102,25 @@ export class RecoveryManager {
 				}
 				for (const message of outboundMessages) {
 					outboxIds.push(this.insertOutboxRow(message));
+				}
+				// Journal the transition INSIDE its own transaction (spec 5.3):
+				// frame and transition commit or roll back as one unit. The rows
+				// this commit inserted are stamped with the frame that carries
+				// them (the frame_sequence Phase 1 left null), and stamped
+				// BEFORE the append: a snapshot captured during the append
+				// (bootstrap, or an interval snapshot right behind this delta)
+				// must already see the stamps, or reconstruction from that
+				// snapshot would resurrect the rows unstamped.
+				if (
+					this.options.journal &&
+					transition.criticality !== RecoveryCriticality.Reconstructable
+				) {
+					const sequence = this.options.journal.nextSequence();
+					const ids = outboxIds.filter((id): id is number => id != null);
+					if (ids.length && this.storage.setOutboxFrameSequence) {
+						this.storage.setOutboxFrameSequence(ids, Number(sequence));
+					}
+					this.options.journal.appendFrame(mutations, outboundMessages);
 				}
 			});
 		} catch (error) {
@@ -294,6 +322,27 @@ export class RecoveryManager {
 				break;
 			case 'delete_payment_secret':
 				this.storage.deletePaymentSecret(mutation.paymentHash);
+				break;
+			case 'delete_payment':
+				this.storage.deletePayment(mutation.paymentHash);
+				break;
+			case 'delete_preimage':
+				this.storage.deletePreimage(mutation.paymentHash);
+				break;
+			case 'invoice_state':
+				this.storage.saveInvoice(mutation.paymentHash, mutation.invoice);
+				break;
+			case 'delete_invoice':
+				this.storage.deleteInvoice(mutation.paymentHash);
+				break;
+			case 'invoice_path_id':
+				this.storage.saveInvoicePathId?.(mutation.paymentHash, mutation.pathId);
+				break;
+			case 'delete_invoice_path_id':
+				this.storage.deleteInvoicePathId(mutation.paymentHash);
+				break;
+			case 'forwarding_event':
+				this.storage.saveForwardingEvent?.(mutation.event);
 				break;
 			case 'channel_closed':
 				this.storage.deleteChannel(mutation.channelId);

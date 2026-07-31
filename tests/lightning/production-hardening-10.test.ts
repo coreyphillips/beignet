@@ -216,43 +216,45 @@ describe('Production Hardening 10', () => {
 
 	// ─── Fix 3: Persist outbound payment at creation ───
 
+	// The atomicity these two guard now comes from the Recovery Protocol
+	// safety transition layer: the payment record and the HTLC mapping are
+	// committed as ONE RecoveryManager.commit transition (which is also what
+	// journals them, docs/RECOVERY-PROTOCOL.md 5.3), instead of a raw
+	// storage.transaction wrapper.
 	describe('Fix 3: Outbound payment persistence', () => {
-		it('sendPaymentToRoute persists payment immediately via transaction', () => {
-			// Verify the source code wraps payment persist + HTLC mapping in transaction
+		it('sendPaymentToRoute persists payment immediately via a transition', () => {
 			const src = fs.readFileSync(
 				path.join(__dirname, '../../src/lightning/node/lightning-node.ts'),
 				'utf8'
 			);
-			// After "this.payments.set(paymentHash.toString('hex'), payment);"
-			// there should be a storage.transaction() block
 			const sendPaymentSection = src.substring(
 				src.indexOf('// Track offered HTLC → payment mapping'),
 				src.indexOf(
 					'// Add HTLC to channel (may trigger synchronous fulfillment'
 				)
 			);
-			expect(sendPaymentSection).to.include('storage.transaction');
-			expect(sendPaymentSection).to.include('persistPayment');
-			expect(sendPaymentSection).to.include('saveHtlcPaymentMapping');
+			expect(sendPaymentSection).to.include('commitMutations');
+			expect(sendPaymentSection).to.include('paymentMutation');
+			expect(sendPaymentSection).to.include('htlc_payment_mapping');
 		});
 
-		it('payment persist + HTLC mapping are in same transaction', () => {
+		it('payment persist + HTLC mapping are in the same transition', () => {
 			const src = fs.readFileSync(
 				path.join(__dirname, '../../src/lightning/node/lightning-node.ts'),
 				'utf8'
 			);
-			// Find the transaction block
 			const idx = src.indexOf('// Track offered HTLC → payment mapping');
-			const block = src.substring(idx, idx + 500);
-			// Both should be inside storage.transaction(() => { ... })
-			const txStart = block.indexOf('this.storage.transaction');
-			expect(txStart).to.be.greaterThan(-1);
-			const txBlock = block.substring(
-				txStart,
-				block.indexOf('});', txStart) + 3
+			const block = src.substring(idx, idx + 700);
+			// One mutations array carries both, handed to one commit.
+			const mutationsStart = block.indexOf(
+				'const mutations: RecoveryMutation[]'
 			);
-			expect(txBlock).to.include('persistPayment');
-			expect(txBlock).to.include('saveHtlcPaymentMapping');
+			expect(mutationsStart).to.be.greaterThan(-1);
+			const commitStart = block.indexOf('this.commitMutations', mutationsStart);
+			expect(commitStart).to.be.greaterThan(-1);
+			const declBlock = block.substring(mutationsStart, commitStart);
+			expect(declBlock).to.include('htlc_payment_mapping');
+			expect(declBlock).to.include('paymentMutation');
 		});
 	});
 

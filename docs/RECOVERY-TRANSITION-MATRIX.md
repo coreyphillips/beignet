@@ -126,7 +126,10 @@ make those tests meaningful.
 
 ## 4. What Phase 1 deliberately does not do
 
-- No journal, frames, snapshots or reconstruction (Phase 2).
+- No journal, frames, snapshots or reconstruction. (Since delivered by
+  Phase 2: `src/lightning/recovery/journal.ts`, opt-in via the node's
+  `recovery.enabled` config; frames append inside the same
+  `RecoveryManager.commit` transaction this document describes.)
 - No capsule, guardian, epoch or quorum barrier (Phases 3 to 6).
 - No change to SCB behavior; it remains the Tier 1 fallback.
 - `RecoveryCriticality` is recorded but not yet acted on: there is no durability

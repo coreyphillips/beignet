@@ -16,6 +16,8 @@ import { IChannelState } from '../channel/channel-state';
 import { IChainMonitorState } from '../chain/chain-monitor';
 import { IPaymentInfo } from '../node/types';
 import {
+	IForwardingEvent,
+	IInvoiceInfo,
 	IRecoveryOutboxMessage,
 	IRecoveryOutboxStoredMessage,
 	RecoveryOutboxDisposition
@@ -76,6 +78,19 @@ export type RecoveryMutation =
 	| { type: 'payment_state'; paymentHash: string; payment: IPaymentInfo }
 	| { type: 'payment_secret'; paymentHash: string; secret: Buffer }
 	| { type: 'delete_payment_secret'; paymentHash: string }
+	| { type: 'delete_payment'; paymentHash: string }
+	/**
+	 * Deleting a preimage is SAFETY-critical in its own right: the
+	 * issued-invoice sweep removes expired never-paid BOLT 12 preimages so
+	 * the hash stops being claimable, and a restore that resurrected one
+	 * would reopen exactly the amplification the sweep closes.
+	 */
+	| { type: 'delete_preimage'; paymentHash: string }
+	| { type: 'invoice_state'; paymentHash: string; invoice: IInvoiceInfo }
+	| { type: 'delete_invoice'; paymentHash: string }
+	| { type: 'invoice_path_id'; paymentHash: string; pathId: Buffer }
+	| { type: 'delete_invoice_path_id'; paymentHash: string }
+	| { type: 'forwarding_event'; event: Omit<IForwardingEvent, 'id'> }
 	| { type: 'channel_closed'; channelId: string }
 	/**
 	 * Delete a channel's outbox rows (all of them, or only the given message
@@ -134,4 +149,118 @@ export interface IRecoveryCommitResult {
 	released: Array<{ id: number | null; message: RecoveryOutboundMessage }>;
 	/** Set when the transaction threw; mutations and rows all rolled back. */
 	error?: Error;
+}
+
+// ─────────────── Phase 2: the recovery journal (spec 5.3) ───────────────
+
+/**
+ * One append-only journal record: everything an Important or SafetyCritical
+ * transition changed, hash-chained to its predecessor.
+ *
+ * Deviation from spec 5.3, same reasoning as RecoveryMutation above: the
+ * payload carries the library's typed shapes and the frame codec owns the
+ * byte encoding, so there is exactly one serializer (the storage layer's) for
+ * every state-bearing object.
+ *
+ * `snapshot` is present on full-state snapshot frames (spec 5.3, "Snapshots
+ * and compaction"): the complete safety-critical state as of this sequence,
+ * from which reconstruction starts before replaying later deltas. A snapshot
+ * frame's mutations list is empty; the snapshot IS the state.
+ */
+export interface RecoveryFrame {
+	version: 1;
+	/** Changes only when a restored device takes ownership (Phase 5). */
+	writerEpoch: bigint;
+	/** Globally monotonic across the node, starting at 1. */
+	sequence: bigint;
+	/** Hash of the previous frame's plaintext; 32 zero bytes for frame 1. */
+	previousFrameHash: Buffer;
+	timestamp: number;
+	mutations: RecoveryMutation[];
+	outboundMessages: RecoveryOutboundMessage[];
+	snapshot?: RecoverySnapshot;
+}
+
+/**
+ * A frame as stored: AEAD ciphertext plus the chain fields kept in the clear
+ * so verification and takeover can walk the chain without decrypting.
+ */
+export interface EncryptedRecoveryFrame {
+	writerEpoch: bigint;
+	sequence: bigint;
+	/** SHA-256 of the plaintext frame bytes. */
+	frameHash: Buffer;
+	previousFrameHash: Buffer;
+	/** AES-256-GCM: iv || authTag || ciphertext. */
+	ciphertext: Buffer;
+	createdAt: number;
+}
+
+/**
+ * Every journaled table, serialized whole: the tables RecoveryMutation can
+ * touch, plus the outbox. This covers both criticality classes the journal
+ * records, SafetyCritical (channels, monitors, preimages, HTLC linkage) and
+ * Important (payments, invoices and their path ids, forwarding events), per
+ * the spec's classification. Gossip and mission control stay out: they are
+ * Reconstructable. Offers remain Phase 3 capsule material; they re-derive
+ * from their bech32m encoding and issue no payment-level guarantees.
+ *
+ * Outbox note: snapshot rows keep their disposition AND the frame_sequence
+ * stamp as captured; delta frames record rows at insert time (always
+ * pending_send), and disposition advances (markSent) are deliberately NOT
+ * journaled. A reconstruction therefore restores post-snapshot rows as
+ * pending_send, which errs toward retransmission: the safe direction, since
+ * peers treat replays idempotently.
+ */
+export interface RecoverySnapshot {
+	channels: Array<{
+		channelId: string;
+		state: import('../channel/channel-state').IChannelState;
+		peerPubkey: string;
+	}>;
+	keyIndices: Array<{ channelId: string; channelIndex: number }>;
+	chainMonitors: Array<{
+		channelId: string;
+		state: import('../chain/chain-monitor').IChainMonitorState;
+	}>;
+	preimages: Array<{ paymentHash: string; preimage: Buffer }>;
+	payments: Array<{
+		paymentHash: string;
+		payment: import('../node/types').IPaymentInfo;
+	}>;
+	paymentSecrets: Array<{ paymentHash: string; secret: Buffer }>;
+	htlcPaymentMappings: Array<{ key: string; paymentHash: string }>;
+	forwardedHtlcs: Array<{
+		outKey: string;
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}>;
+	htlcSharedSecrets: Array<{ key: string; secret: Buffer }>;
+	invoices: Array<{ paymentHash: string; invoice: IInvoiceInfo }>;
+	invoicePathIds: Array<{ paymentHash: string; pathId: Buffer }>;
+	forwardingEvents: Array<Omit<IForwardingEvent, 'id'>>;
+	outbox: Array<RecoveryOutboundMessage & { frameSequence: number | null }>;
+}
+
+/**
+ * What RecoveryManager.commit calls to journal a transition, INSIDE the same
+ * storage transaction as the transition's writes. A throw here rolls the
+ * whole transition back: journaled durability is part of the commit, not a
+ * best-effort tail. Kept as an interface so the manager does not import the
+ * journal implementation (the journal imports the manager for
+ * reconstruction).
+ */
+export interface IRecoveryJournalSink {
+	/**
+	 * The sequence the NEXT appended frame will take. The manager stamps the
+	 * transition's outbox rows with it BEFORE appending, so a snapshot
+	 * captured during the append (bootstrap, or an interval snapshot behind
+	 * this delta) already sees the stamped rows.
+	 */
+	nextSequence(): bigint;
+	/** Returns the sequence of the frame that carries this transition. */
+	appendFrame(
+		mutations: RecoveryMutation[],
+		outboundMessages: RecoveryOutboundMessage[]
+	): bigint;
 }
