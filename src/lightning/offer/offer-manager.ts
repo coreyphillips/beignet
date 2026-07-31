@@ -200,6 +200,9 @@ export class OfferManager extends EventEmitter {
 	 * true aggregate payinfo. Without it (bare OfferManager, or no usable
 	 * channel at issuance) the invoice falls back to the single-hop self path.
 	 */
+	private buildPrivatePaymentPaths:
+		| ((pathId: Buffer) => IBlindedPaymentPath[])
+		| null;
 	private buildHoldPaymentPaths:
 		| ((pathId: Buffer) => IBlindedPaymentPath[])
 		| null = null;
@@ -214,6 +217,12 @@ export class OfferManager extends EventEmitter {
 			invoiceRequestTimeoutMs?: number;
 			allowUnboundInvoiceFallback?: boolean;
 			buildHoldPaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
+			/** Payment paths for an invoice issued by a node with NO announced
+			 *  channels: real blinded paths through its peers with true
+			 *  payinfo, so payers can route to the introduction node at all.
+			 *  A single-hop path terminating at an unannounced node names an
+			 *  introduction nobody can find a route to. */
+			buildPrivatePaymentPaths?: (pathId: Buffer) => IBlindedPaymentPath[];
 		}
 	) {
 		super();
@@ -223,6 +232,7 @@ export class OfferManager extends EventEmitter {
 		this.allowUnboundInvoiceFallback =
 			options?.allowUnboundInvoiceFallback ?? false;
 		this.buildHoldPaymentPaths = options?.buildHoldPaymentPaths ?? null;
+		this.buildPrivatePaymentPaths = options?.buildPrivatePaymentPaths ?? null;
 
 		if (options?.onionMessageManager) {
 			this.attachOnionMessageManager(options.onionMessageManager);
@@ -764,11 +774,22 @@ export class OfferManager extends EventEmitter {
 		if (this.offers.get(matchedOfferIdHex!)?.asyncHold) {
 			holdPaths = this.buildHoldPaymentPaths?.(invoicePathId) ?? [];
 		}
+		// A node with no announced channels gets real paths through its peers
+		// (intro = the peer, with the peer's true payinfo): the single-hop
+		// shape below names an introduction node no payer can route to when
+		// nothing about this node is in the public graph.
+		let privatePaths: IBlindedPaymentPath[] = [];
+		if (holdPaths.length === 0) {
+			privatePaths = this.buildPrivatePaymentPaths?.(invoicePathId) ?? [];
+		}
 		let invoicePaths: IBlindedPath[];
 		let invoicePayInfo: IBolt12Invoice['blindedPayInfo'];
 		if (holdPaths.length > 0) {
 			invoicePaths = holdPaths.map((p) => p.path);
 			invoicePayInfo = holdPaths.map((p) => p.payInfo);
+		} else if (privatePaths.length > 0) {
+			invoicePaths = privatePaths.map((p) => p.path);
+			invoicePayInfo = privatePaths.map((p) => p.payInfo);
 		} else {
 			invoicePaths = [
 				constructBlindedPath(
