@@ -5414,11 +5414,18 @@ export class LightningNode extends EventEmitter {
 	 * peer is offering an action the daemon will refuse every time.
 	 */
 	peerSupportsSplicing(peerPubkey: string): boolean | null {
+		// The local half is known without asking anyone, so it is decided
+		// first: a node that did not negotiate quiescence cannot splice with
+		// any peer, and answering null here would misreport a certainty as
+		// unknown, leaving clients to keep offering what the pre-flight is
+		// certain to refuse.
+		const localSupportsSplicing =
+			this.localFeatures.hasFeature(Feature.QUIESCE) &&
+			this.localFeatures.hasFeature(Feature.SPLICE);
+		if (!localSupportsSplicing) return false;
 		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
 		if (!init) return null;
 		return (
-			this.localFeatures.hasFeature(Feature.QUIESCE) &&
-			this.localFeatures.hasFeature(Feature.SPLICE) &&
 			init.features.hasFeature(Feature.QUIESCE) &&
 			init.features.hasFeature(Feature.SPLICE)
 		);

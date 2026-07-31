@@ -272,4 +272,44 @@ describe('LightningNode peerSupportsSplicing', function () {
 		expect(stock.peerSupportsSplicing(PEER)).to.be.true;
 		stock.destroy();
 	});
+
+	// A missing remote init means unknown only when the local half is capable.
+	// Local incapability is a certainty no amount of remote information can
+	// overturn, so it must not hide behind null while the peer is offline.
+	it('local incapability is false even with no remote init to read', () => {
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		const noQuiesce = createTestNode(spliceOnly);
+		expect(noQuiesce.peerSupportsSplicing(PEER)).to.be.false;
+		noQuiesce.destroy();
+
+		const quiesceOnly = new FeatureFlags();
+		quiesceOnly.setOptional(Feature.QUIESCE);
+		const noSplice = createTestNode(quiesceOnly);
+		expect(noSplice.peerSupportsSplicing(PEER)).to.be.false;
+		noSplice.destroy();
+
+		const both = new FeatureFlags();
+		both.setOptional(Feature.QUIESCE);
+		both.setOptional(Feature.SPLICE);
+		const capable = createTestNode(both);
+		expect(
+			capable.peerSupportsSplicing(PEER),
+			'a capable node with no init to read is genuinely unknown'
+		).to.be.null;
+		capable.destroy();
+	});
+
+	it('the pre-flight refuses a splice on local incapability alone', () => {
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		const node = createTestNode(spliceOnly);
+		const channelId = injectNormalChannel(node);
+		// No peer manager stub at all: the peer is unreachable, and the
+		// refusal must not wait to hear from it.
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.ok).to.be.false;
+		expect(result.error).to.include('not negotiated');
+		node.destroy();
+	});
 });
