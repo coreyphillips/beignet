@@ -39,6 +39,7 @@ import {
 	createOpenerState
 } from '../../src/lightning/channel/channel-state';
 import { MessageType } from '../../src/lightning/message/types';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import {
 	IChannelAnnouncementMessage,
 	IChannelUpdateMessage,
@@ -713,5 +714,225 @@ describe('Recovery phase 1: exact retransmission bytes', () => {
 		const restored = (channel as unknown as { _lastSentBatch: unknown | null })
 			._lastSentBatch;
 		expect(restored).to.equal(null);
+	});
+});
+
+// ─────────────── 10. Outbox retention ───────────────
+
+describe('Recovery phase 1: the outbox stays bounded', () => {
+	let storage: SqliteStorage;
+
+	beforeEach(() => {
+		storage = new SqliteStorage(':memory:');
+		storage.open();
+	});
+	afterEach(() => storage.close());
+
+	it('keeps only the newest row of a type nothing else supersedes', () => {
+		const manager = new RecoveryManager(storage);
+		const channelId = 'ab'.repeat(32);
+
+		// Three commitment rounds worth of our own revoke_and_ack. No peer
+		// message ever proves receipt of these, so without same-kind
+		// superseding they would accumulate for the life of the channel.
+		for (let i = 0; i < 3; i++) {
+			const result = manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [],
+				outboundMessages: [
+					{
+						peerId: 'aa'.repeat(33),
+						channelId,
+						messageType: MessageType.REVOKE_AND_ACK,
+						wireMessage: Buffer.from([i]),
+						disposition: 'pending_send'
+					}
+				]
+			});
+			expect(result.committed).to.equal(true);
+		}
+
+		const rows = storage.loadOutboxMessages(channelId);
+		expect(rows).to.have.length(1);
+		// The newest is the one a reconnect could ask for.
+		expect(rows[0].wireMessage[0]).to.equal(2);
+	});
+
+	it('leaves types with a real supersede trigger alone', () => {
+		const manager = new RecoveryManager(storage);
+		const channelId = 'cd'.repeat(32);
+		for (let i = 0; i < 3; i++) {
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [],
+				outboundMessages: [
+					{
+						peerId: 'aa'.repeat(33),
+						channelId,
+						messageType: MessageType.UPDATE_ADD_HTLC,
+						wireMessage: Buffer.from([i]),
+						disposition: 'pending_send'
+					}
+				]
+			});
+		}
+		// All three belong to the round in flight; the peer's revoke_and_ack
+		// retires them together.
+		expect(storage.loadOutboxMessages(channelId)).to.have.length(3);
+	});
+
+	it('counts rows without drifting when the cache is cold', () => {
+		const manager = new RecoveryManager(storage, {
+			maxOutboxRowsPerChannel: 4
+		});
+		const channelId = 'ef'.repeat(32);
+		for (let i = 0; i < 4; i++) {
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [],
+				outboundMessages: [
+					{
+						peerId: 'aa'.repeat(33),
+						channelId,
+						messageType: MessageType.UPDATE_ADD_HTLC,
+						wireMessage: Buffer.from([i]),
+						disposition: 'pending_send'
+					}
+				]
+			});
+		}
+		// Exactly at the cap, so nothing has been pruned yet: an over-count
+		// would have evicted the oldest row early.
+		expect(storage.loadOutboxMessages(channelId)).to.have.length(4);
+	});
+});
+
+// ─────────────── 11. Reconnect retransmission obeys the same gate ────────
+
+describe('Recovery phase 1: reestablish retransmission persists first', () => {
+	/** A channel with one un-acked update queued for replay. */
+	function channelWithQueuedUpdate(): Channel {
+		const state = makeChannelState(crypto.randomBytes(32));
+		state.localChannelReady = true;
+		state.pendingLocalUpdates = [
+			{ type: MessageType.UPDATE_ADD_HTLC, payload: crypto.randomBytes(64) }
+		];
+		return new Channel(state);
+	}
+
+	function reestablishMsg(channelId: Buffer): {
+		channelId: Buffer;
+		nextCommitmentNumber: bigint;
+		nextRevocationNumber: bigint;
+		yourLastPerCommitmentSecret: Buffer;
+		myCurrentPerCommitmentPoint: Buffer;
+	} {
+		return {
+			channelId,
+			nextCommitmentNumber: 1n,
+			nextRevocationNumber: 0n,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: getPublicKey(makeSeed(9))
+		};
+	}
+
+	it('puts a persist ahead of everything it retransmits', () => {
+		const channel = channelWithQueuedUpdate();
+		const actions = channel.handleReestablish(
+			reestablishMsg(channel.getChannelId()!)
+		);
+
+		const sendIndex = actions.findIndex(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE
+		);
+		expect(sendIndex, 'the reconnect replays something').to.be.greaterThan(-1);
+		// Without this the whole reconnect path bypassed the batch gate, so a
+		// transition whose commit failed could still reach the peer one
+		// connection later.
+		expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
+	});
+
+	it('marks replays so they are not written to the outbox again', () => {
+		const channel = channelWithQueuedUpdate();
+		const actions = channel.handleReestablish(
+			reestablishMsg(channel.getChannelId()!)
+		);
+
+		const sends = actions.filter(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE
+		) as Array<{ messageType: number; replay?: boolean }>;
+		expect(sends.length).to.be.greaterThan(0);
+		for (const send of sends) {
+			expect(
+				send.replay,
+				`replayed ${send.messageType} must not be re-stored`
+			).to.equal(true);
+		}
+	});
+
+	it('adds no persist action when there is nothing to send', () => {
+		const state = makeChannelState(crypto.randomBytes(32));
+		const channel = new Channel(state);
+		const actions = channel.handleReestablish(
+			reestablishMsg(channel.getChannelId()!)
+		);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		).to.equal(false);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+		).to.equal(false);
+	});
+});
+
+// ─────────────── 12. Failure leaves nothing ahead of the channel ─────────
+
+describe('Recovery phase 1: a failed transition strands nothing on disk', () => {
+	it('holds a monitor delta back rather than committing it alone', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		// Channel writes fail; monitor writes would succeed. The monitor delta
+		// must NOT slip out on its own, or disk ends up with a revocation whose
+		// causing channel state never landed.
+		const guarded = failingStorage(storage, 'saveChannel');
+		const alice = createNode(1, guarded);
+		const bob = createNode(2);
+		connectNodes(alice, bob);
+
+		openReadyChannel(alice, bob);
+
+		expect(storage.loadAllChannels()).to.have.length(0);
+		expect(storage.loadAllChainMonitors()).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+		storage.close();
+	});
+
+	it('reports one error per failed channel transition, not two', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const guarded = failingStorage(storage, 'saveChannel');
+		const node = new LightningNode(makeNodeConfig(1, guarded));
+		node.on('error', () => {});
+		const errors: string[] = [];
+		node.on('node:error', (err: { code: string; message: string }) => {
+			if (err.code === 'PERSISTENCE_ERROR') errors.push(err.message);
+		});
+		const bob = createNode(2);
+		connectNodes(node, bob);
+
+		openReadyChannel(node, bob);
+
+		expect(errors.length).to.be.greaterThan(0);
+		// Every persistence error carries the channel context; none is the
+		// bare duplicate from the manager hook.
+		for (const message of errors) {
+			expect(message).to.match(/^Failed to persist channel/);
+		}
+
+		node.destroy();
+		bob.destroy();
+		storage.close();
 	});
 });

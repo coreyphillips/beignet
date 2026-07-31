@@ -35,6 +35,20 @@ Causally linked caller-side state joins the transition through
 `fulfillHtlc`, a forward linkage staged before `addHtlc`. Anything still staged
 when the call returns is committed on its own, so nothing is silently dropped.
 
+The gate covers RECONNECTS too, not only first sends. `handleReestablish`
+returns a leading `PERSIST_STATE` whenever it retransmits, because its replays
+are built from in-memory state: without it, a transition whose commit failed
+would still reach the peer on the next reconnect, one connection later than the
+gate that withheld it. Replayed sends are marked `replay` so they are withheld
+on a failed persist like any other, but are not written to the outbox a second
+time; the row from the original send is already there.
+
+Failure has one more rule. When a channel transition rolls back, its chain
+monitor delta is re-armed but explicitly NOT flushed on its own
+(`monitorsAwaitingChannel`): committing it alone would put the revocation on
+disk while the channel state that caused it stayed behind, which is the exact
+disagreement 5.1 exists to prevent. It waits for a transition that commits.
+
 ## 2. The matrix
 
 Criticality per spec 5.1: `SafetyCritical` is journaled and, from Phase 6,
@@ -54,7 +68,7 @@ barrier-gated; `Important` is journaled but never blocks the protocol.
 | on-chain preimage → off-chain settle | `lightning-node.ts:9918` handleOnChainPreimageLearned | preimage staged into the fulfill transition | SafetyCritical | `update_fulfill_htlc` |
 | receive-side settle | `lightning-node.ts:9537` fulfillPayment | payment record + consumed payment secret staged into the fulfill transition | SafetyCritical | `update_fulfill_htlc` |
 | DLP detection | `channel.ts:5644` handleReestablish (`dataLossDetected` at 5696) | channel state with `dataLossDetected` + ERRORED | SafetyCritical | the wire `error`; the no-broadcast rule must survive any crash |
-| reestablish retransmit decision | `channel.ts:5644` handleReestablish | reads `pendingLocalUpdates` and `lastSentWasRevoke` from persisted state; exact batch bytes come from the outbox via `restoreLastSentBatch` (`channel.ts:2804`) | SafetyCritical | every retransmitted message |
+| reestablish retransmit decision | `channel.ts:5644` handleReestablish | channel state (restored state, adopted remote nonce, splice resumption) persists BEFORE any replay goes out; reads `pendingLocalUpdates` and `lastSentWasRevoke` from persisted state; exact batch bytes come from the outbox via `restoreLastSentBatch` (`channel.ts:2804`) | SafetyCritical | every retransmitted message |
 | splice transitions | `channel-manager.ts:3442` handleSpliceMsg / Ack / Locked, `channel.ts:5428` _handleReestablishSplice | channel state (`spliceInFlight`, `spliceHistory`) + splice message outbox rows | SafetyCritical | `splice_ack`, `splice_locked`, splice `commitment_signed` |
 | chain monitor, causally tied | `monitor:updated` inside an open `processActions` batch | rides in that channel's transition | SafetyCritical | whatever that batch sends |
 | chain monitor, standalone | `monitor:updated` outside a batch (new block, funding spend) | own transition via `persistMonitorAlone` (`lightning-node.ts:1507`) | SafetyCritical | n/a |

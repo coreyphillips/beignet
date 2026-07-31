@@ -204,6 +204,23 @@ function sendMsg(
 }
 
 /**
+ * A BOLT 2 reconnect retransmission: the same bytes the peer may already
+ * hold, replayed rather than newly authorized. Marked so the recovery outbox
+ * is not written again for them, while the persist gate still applies.
+ */
+function replayMsg(
+	messageType: MessageType,
+	payload: Buffer
+): ISendMessageAction {
+	return {
+		type: ChannelActionType.SEND_MESSAGE,
+		messageType,
+		payload,
+		replay: true
+	};
+}
+
+/**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
  * capped at BOLT 2 max of funding / 5 (20%).
@@ -5774,7 +5791,7 @@ export class Channel {
 					nextPerCommitmentPoint: this._state.lastSentRevokeNextPoint
 				};
 				revokeRetransmit.push(
-					sendMsg(
+					replayMsg(
 						MessageType.REVOKE_AND_ACK,
 						encodeRevokeAndAckMessage(revokeMsg)
 					)
@@ -5823,7 +5840,7 @@ export class Channel {
 		// fulfilled/failed HTLC is a no-op).
 		if (!spliceActive || pendingLock) {
 			for (const update of this._state.pendingLocalUpdates) {
-				actions.push(sendMsg(update.type as MessageType, update.payload));
+				actions.push(replayMsg(update.type as MessageType, update.payload));
 			}
 		}
 
@@ -5838,10 +5855,10 @@ export class Channel {
 		) {
 			if (this._lastSentBatch) {
 				actions.push(
-					sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+					replayMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
 				);
 				for (const c of this._lastSentBatch.commitments) {
-					actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+					actions.push(replayMsg(MessageType.COMMITMENT_SIGNED, c));
 				}
 			} else if (
 				this._signer &&
@@ -5931,7 +5948,7 @@ export class Channel {
 						: undefined
 				};
 				actions.push(
-					sendMsg(
+					replayMsg(
 						MessageType.COMMITMENT_SIGNED,
 						encodeCommitmentSignedMessage(commitMsg)
 					)
@@ -5994,8 +6011,24 @@ export class Channel {
 				readyMsg.nextLocalNonce = this._ensureLocalNextNonce();
 			}
 			actions.push(
-				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(readyMsg))
+				replayMsg(
+					MessageType.CHANNEL_READY,
+					encodeChannelReadyMessage(readyMsg)
+				)
 			);
+		}
+
+		// Persist before ANY of the above reaches the peer
+		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
+		// restored channel state, the adopted remote nonce, splice resumption)
+		// and replays messages built from in-memory state. Without a persist
+		// action the whole path bypassed the batch gate, so a transition whose
+		// commit had failed could still reach the peer on the next reconnect:
+		// exactly the case the gate exists to stop, arriving one connection
+		// later. A retransmission is only safe once what justifies it is on
+		// disk.
+		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 
 		return actions;

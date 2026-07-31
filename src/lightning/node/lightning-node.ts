@@ -389,6 +389,12 @@ export class LightningNode extends EventEmitter {
 	 */
 	private dirtyMonitors = new Set<string>();
 	/**
+	 * Channels whose monitor delta must NOT be committed on its own, because
+	 * the channel transition it belonged to failed to commit. Writing it alone
+	 * would leave the monitor ahead of the channel state that produced it.
+	 */
+	private monitorsAwaitingChannel = new Set<string>();
+	/**
 	 * Channel ids of the open processActions batches, innermost last. An action
 	 * can re-enter the manager (a forwarded HTLC triggers an add on another
 	 * channel), so this is a stack rather than a single slot.
@@ -590,7 +596,11 @@ export class LightningNode extends EventEmitter {
 		// (docs/RECOVERY-PROTOCOL.md 5.1).
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
-					onError: (err: Error): void => {
+					onError: (err: Error, context): void => {
+						// persistChannel reports its own failures with the channel id
+						// attached, which is strictly more useful; emitting here too
+						// would give a listener two events for one failure.
+						if (context.reportedByCaller) return;
 						this.emit('node:error', {
 							code: 'PERSISTENCE_ERROR',
 							message: `safety transition failed: ${err.message}`,
@@ -1363,7 +1373,8 @@ export class LightningNode extends EventEmitter {
 		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
 			mutations,
-			outboundMessages: request?.outbound ?? []
+			outboundMessages: request?.outbound ?? [],
+			reportedByCaller: true
 		});
 
 		if (request) {
@@ -1374,7 +1385,16 @@ export class LightningNode extends EventEmitter {
 			// Everything rolled back together: re-arm the monitor delta and put
 			// the staged mutations back so the next transition retries them,
 			// rather than dropping writes the caller believes it made.
-			if (monitorMutation) this.dirtyMonitors.add(channelIdHex);
+			//
+			// Re-armed, NOT flushed on its own: writing the monitor delta by
+			// itself now would put the revocation on disk while the channel
+			// state that produced it stayed behind, which is precisely the
+			// channel/monitor disagreement this whole path exists to prevent.
+			// It waits for a channel transition that commits.
+			if (monitorMutation) {
+				this.dirtyMonitors.add(channelIdHex);
+				this.monitorsAwaitingChannel.add(channelIdHex);
+			}
 			if (staged.length) this.stagedMutations.unshift(...staged);
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
@@ -1492,6 +1512,7 @@ export class LightningNode extends EventEmitter {
 			Buffer.from(channelIdHex, 'hex')
 		);
 		this.dirtyMonitors.delete(channelIdHex);
+		this.monitorsAwaitingChannel.delete(channelIdHex);
 		if (!monitor) return null;
 		return {
 			type: 'chain_monitor',
@@ -1506,6 +1527,9 @@ export class LightningNode extends EventEmitter {
 	 */
 	private persistMonitorAlone(channelIdHex: string): void {
 		if (!this.recovery) return;
+		// Held back for a channel transition to carry: see persistChannel's
+		// failure branch.
+		if (this.monitorsAwaitingChannel.has(channelIdHex)) return;
 		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (!mutation) return;
 		this.recovery.commit({
@@ -1711,6 +1735,12 @@ export class LightningNode extends EventEmitter {
 			if (transitioned) {
 				this.persistChannel(channelId);
 			}
+			// Retained wire bytes exist for one purpose, retransmission on a
+			// channel that can still exchange messages. A fully resolved close
+			// can never reestablish, so the rows are dead weight: signed
+			// commitment material sitting encrypted in the database with no
+			// consumer, kept for the lifetime of the node.
+			this.recovery?.clearChannelOutbox(channelId.toString('hex'));
 			// Every output of the close is irrevocably resolved — a commitment
 			// swap is no longer possible, so the funding watch can be retired
 			// (memory cleanup for long-lived nodes).

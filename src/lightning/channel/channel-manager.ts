@@ -2247,11 +2247,6 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleRevokeAndAck(msg);
-		this.processActions(peerPubkey, channel, actions);
-
-		// Watchtower: on a clean revocation, hand the just-revoked remote
-		// commitment tx (if we cached it) to any listener so it can ship justice
-		// data to towers before the peer can broadcast the breach.
 		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
 
 		// Recovery outbox: the peer's revocation proves it holds every update we
@@ -2259,6 +2254,12 @@ export class ChannelManager extends EventEmitter {
 		// ask us to retransmit them again. This mirrors channel.ts clearing its
 		// in-memory _lastSentBatch on the same event, and is what keeps the
 		// table bounded to roughly one commitment round per channel.
+		//
+		// Superseding BEFORE dispatch is deliberate. Dispatching this batch can
+		// re-enter the manager synchronously (a delivered HTLC settles and
+		// queues a fulfill on this same channel), and a supersede running after
+		// that would delete the row for a message we just sent and the peer has
+		// proven nothing about.
 		if (!hadError && channel.getChannelId()) {
 			this.emit(
 				'outbox:superseded',
@@ -2266,6 +2267,12 @@ export class ChannelManager extends EventEmitter {
 				SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
 			);
 		}
+
+		this.processActions(peerPubkey, channel, actions);
+
+		// Watchtower: on a clean revocation, hand the just-revoked remote
+		// commitment tx (if we cached it) to any listener so it can ship justice
+		// data to towers before the peer can broadcast the breach.
 		if (!hadError) {
 			const revokedTx = channel.takeRevokedCommitmentTx(
 				msg.perCommitmentSecret
@@ -4411,6 +4418,10 @@ export class ChannelManager extends EventEmitter {
 							.filter(
 								(a): a is ISendMessageAction =>
 									a.type === ChannelActionType.SEND_MESSAGE &&
+									// A replay is already in the outbox from its original
+									// send; storing it again on every reconnect would churn
+									// the table without making anything more recoverable.
+									a.replay !== true &&
 									RETRANSMITTABLE_MESSAGE_TYPES.has(a.messageType)
 							)
 							.map((a) => ({

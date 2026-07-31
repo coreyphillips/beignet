@@ -34,6 +34,15 @@ export interface ISendMessageAction {
 	type: ChannelActionType.SEND_MESSAGE;
 	messageType: MessageType;
 	payload: Buffer;
+	/**
+	 * A retransmission of bytes already sent once, replayed after a reconnect
+	 * per BOLT 2. It is still withheld when the batch's persist fails (the
+	 * state justifying it must be on disk before the peer sees it again), but
+	 * it is NOT written to the recovery outbox: the row from the original send
+	 * is already there, and re-inserting the same bytes on every reconnect
+	 * would churn the table for nothing.
+	 */
+	replay?: boolean;
 }
 
 export interface IBroadcastTxAction {
@@ -154,7 +163,8 @@ export const RETRANSMITTABLE_MESSAGE_TYPES: ReadonlySet<number> =
  * the commitment_signed (batched or not) that covered them. Our OWN
  * revoke_and_ack is deliberately excluded, since the peer's revocation says
  * nothing about whether it received ours; those rows are instead replaced by
- * the next revoke_and_ack for the channel, of which only the latest can ever
+ * the next revoke_and_ack for the channel (see
+ * {@link SUPERSEDES_OWN_KIND_MESSAGE_TYPES}), of which only the latest can ever
  * be requested.
  */
 export const SUPERSEDED_ON_REVOKE_MESSAGE_TYPES: readonly number[] = [
@@ -165,6 +175,23 @@ export const SUPERSEDED_ON_REVOKE_MESSAGE_TYPES: readonly number[] = [
 	MessageType.UPDATE_FEE,
 	MessageType.START_BATCH,
 	MessageType.COMMITMENT_SIGNED
+];
+
+/**
+ * Message types where only the newest row can ever be retransmitted, so
+ * writing one supersedes the channel's earlier rows of the same type.
+ *
+ * Nothing else retires these. A peer's revoke_and_ack proves nothing about our
+ * own revoke_and_ack, and no wire message acknowledges channel_ready or
+ * splice_locked at all, so without this rule they accumulate for the life of
+ * the channel until the row cap starts evicting them: one row per commitment
+ * round, forever, on a busy channel. Retransmission only ever wants the latest
+ * of each, which is exactly what this keeps.
+ */
+export const SUPERSEDES_OWN_KIND_MESSAGE_TYPES: readonly number[] = [
+	MessageType.REVOKE_AND_ACK,
+	MessageType.CHANNEL_READY,
+	MessageType.SPLICE_LOCKED
 ];
 
 /**

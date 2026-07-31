@@ -10,6 +10,7 @@
  * commit path.
  */
 
+import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
 import {
 	IRecoveryCommitResult,
@@ -29,7 +30,11 @@ export interface IRecoveryManagerOptions {
 	 */
 	onError?: (
 		error: Error,
-		context: { criticality: RecoveryCriticality }
+		context: {
+			criticality: RecoveryCriticality;
+			/** True when the caller reports this failure itself. */
+			reportedByCaller: boolean;
+		}
 	) => void;
 	/**
 	 * Per-channel cap on retained outbox rows. A peer that never reconnects
@@ -92,7 +97,8 @@ export class RecoveryManager {
 			});
 		} catch (error) {
 			this.options.onError?.(error as Error, {
-				criticality: transition.criticality
+				criticality: transition.criticality,
+				reportedByCaller: transition.reportedByCaller === true
 			});
 			// The transaction rolled back, so any counter we bumped for rows that
 			// no longer exist has to come back down; drop the cached counts for
@@ -145,7 +151,8 @@ export class RecoveryManager {
 			this.outboxCounts.delete(channelId);
 		} catch (error) {
 			this.options.onError?.(error as Error, {
-				criticality: RecoveryCriticality.Important
+				criticality: RecoveryCriticality.Important,
+				reportedByCaller: false
 			});
 		}
 	}
@@ -169,10 +176,27 @@ export class RecoveryManager {
 
 	private insertOutboxRow(message: RecoveryOutboundMessage): number | null {
 		if (!this.storage.saveOutboxMessage) return null;
-		const id = this.storage.saveOutboxMessage(message);
 		const channelId = message.channelId;
+
+		// Types where only the newest row is ever retransmitted retire the
+		// channel's older rows of the same type as they are written. This runs
+		// INSIDE the caller's transaction, so the replacement is atomic: a
+		// crash cannot leave the channel with neither the old row nor the new.
+		if (
+			channelId &&
+			this.storage.deleteOutboxMessages &&
+			SUPERSEDES_OWN_KIND_MESSAGE_TYPES.includes(message.messageType)
+		) {
+			this.storage.deleteOutboxMessages(channelId, [message.messageType]);
+			this.outboxCounts.delete(channelId);
+		}
+
+		// Counted BEFORE the insert: seeding from storage afterwards would count
+		// the new row and then add one for it again.
+		const before = channelId ? this.countFor(channelId) : 0;
+		const id = this.storage.saveOutboxMessage(message);
 		if (channelId) {
-			const count = (this.countFor(channelId) ?? 0) + 1;
+			const count = before + 1;
 			this.outboxCounts.set(channelId, count);
 			if (count > this.maxOutboxRows && this.storage.pruneOutboxMessages) {
 				this.storage.pruneOutboxMessages(channelId, this.maxOutboxRows);

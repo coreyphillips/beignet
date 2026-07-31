@@ -105,6 +105,12 @@ export interface SafetyTransition {
 	criticality: RecoveryCriticality;
 	mutations: RecoveryMutation[];
 	outboundMessages: RecoveryOutboundMessage[];
+	/**
+	 * Set by a caller that reports commit failures itself (with more context
+	 * than this layer has, such as the channel id). The manager then skips its
+	 * own error hook, so one failure does not surface as two events.
+	 */
+	reportedByCaller?: boolean;
 }
 
 /** What a caller gets back from a committed transition. */
