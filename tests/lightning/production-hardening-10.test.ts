@@ -246,7 +246,9 @@ describe('Production Hardening 10', () => {
 			const idx = src.indexOf('// Track offered HTLC → payment mapping');
 			const block = src.substring(idx, idx + 700);
 			// One mutations array carries both, handed to one commit.
-			const mutationsStart = block.indexOf('const mutations: RecoveryMutation[]');
+			const mutationsStart = block.indexOf(
+				'const mutations: RecoveryMutation[]'
+			);
 			expect(mutationsStart).to.be.greaterThan(-1);
 			const commitStart = block.indexOf('this.commitMutations', mutationsStart);
 			expect(commitStart).to.be.greaterThan(-1);
