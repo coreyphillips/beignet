@@ -798,13 +798,31 @@ export function getOpenApiSpec(): Record<string, unknown> {
 									description:
 										'Required satoshi cap on what one challenge may cost'
 								},
-								maxFeeSats: { type: 'number' },
+								maxFeeSats: {
+									type: 'number',
+									description:
+										'Routing fee cap in satoshis. Defaults to 5% of the price with a 5 sat floor, never to uncapped'
+								},
 								timeoutMs: { type: 'number' },
+								fetchTimeoutMs: {
+									type: 'number',
+									description: 'Per HTTP request timeout, default 30000'
+								},
+								maxResponseBytes: {
+									type: 'number',
+									description:
+										'Ceiling on the proxied response body, default 5242880'
+								},
 								scopePerPath: { type: 'boolean' },
 								allowUnverifiedMacaroon: {
 									type: 'boolean',
 									description:
 										'Unsafe: pay a challenge whose macaroon could not be parsed, so its payment hash commitment is unchecked'
+								},
+								allowCrossOriginChallenge: {
+									type: 'boolean',
+									description:
+										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
 								}
 							}
 						})
@@ -817,6 +835,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								properties: {
 									status: { type: 'number' },
 									body: { type: 'string' },
+									truncated: {
+										type: 'boolean',
+										description:
+											'True when the body was cut at maxResponseBytes'
+									},
 									paid: { type: 'boolean' },
 									amountPaidSats: { type: 'number' },
 									paymentHash: { type: 'string' }

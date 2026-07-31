@@ -25,6 +25,7 @@ import {
 	parseMacaroon
 } from '../../src/lightning/l402/macaroon';
 import {
+	defaultFeeCapSats,
 	L402Error,
 	l402Fetch,
 	validateChallenge,
@@ -702,5 +703,338 @@ describe('l402Fetch against a mock L402 server', () => {
 		// Oldest evicted first, so the newest survive.
 		expect(store.get('https://host4.example')).to.not.equal(undefined);
 		expect(store.get('https://host0.example')).to.equal(undefined);
+	});
+});
+
+// ─────────────── 6. Refusals that must happen BEFORE paying ───────────────
+//
+// Every case here is one where the old code paid first and discovered the
+// problem afterwards, or never bounded the spend at all. The assertion that
+// matters in each is `payments === 0`, or the cap the payer was handed.
+
+describe('l402Fetch payment safety', () => {
+	/** A payer that records what it was asked to do and settles honestly. */
+	function recordingPayer(preimage: Buffer): {
+		payments: number;
+		lastOptions?: { maxFeeSats?: number; timeoutMs?: number };
+		payInvoice: (
+			bolt11: string,
+			options: { maxFeeSats?: number; timeoutMs?: number }
+		) => Promise<{ preimage: Buffer }>;
+	} {
+		const payer = {
+			payments: 0,
+			lastOptions: undefined as
+				| { maxFeeSats?: number; timeoutMs?: number }
+				| undefined,
+			payInvoice: async (
+				_bolt11: string,
+				options: { maxFeeSats?: number; timeoutMs?: number }
+			): Promise<{ preimage: Buffer }> => {
+				payer.payments++;
+				payer.lastOptions = options;
+				return { preimage };
+			}
+		};
+		return payer;
+	}
+
+	/** A server that answers every request with one fixed challenge header. */
+	function fixedChallengeServer(
+		header: string,
+		finalUrl?: string
+	): (url: string) => Promise<IL402Response> {
+		return async (url: string): Promise<IL402Response> => ({
+			status: 402,
+			url: finalUrl ?? url,
+			headers: {
+				get: (name: string): string | null =>
+					name.toLowerCase() === 'www-authenticate' ? header : null
+			},
+			text: async (): Promise<string> => 'payment required'
+		});
+	}
+
+	it('caps the routing fee even when the caller sets none', async () => {
+		const pair = makeChallengePair(100_000n); // 100 sat
+		const payer = recordingPayer(pair.preimage);
+		await l402Fetch(
+			'https://mock.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 200,
+				fetchImpl: fixedChallengeServer(
+					`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+				)
+			}
+		);
+		// Without a default the payer would receive undefined, which disables
+		// the fee check outright and lets a hostile routing hint bill whatever
+		// the channel can pay.
+		expect(payer.lastOptions?.maxFeeSats).to.equal(defaultFeeCapSats(100));
+		expect(payer.lastOptions?.maxFeeSats).to.equal(5);
+	});
+
+	it('keeps a floor under the fee cap for sub-satoshi prices', () => {
+		expect(defaultFeeCapSats(1)).to.equal(5);
+		expect(defaultFeeCapSats(1000)).to.equal(50);
+	});
+
+	it('lets the caller set a fee cap of their own', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		await l402Fetch(
+			'https://mock.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				maxFeeSats: 3,
+				fetchImpl: fixedChallengeServer(
+					`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+				)
+			}
+		);
+		expect(payer.lastOptions?.maxFeeSats).to.equal(3);
+	});
+
+	it('refuses a macaroon it could not send back, without paying', async () => {
+		// Base64 decoding ignores whitespace, so this macaroon parses and
+		// commits to the right hash; only the header build would reject it.
+		const pair = makeChallengePair(1_000n);
+		const spaced = `${pair.macaroon.slice(0, 8)} ${pair.macaroon.slice(8)}`;
+		expect(macaroonPaymentHash(spaced)?.toString('hex')).to.equal(
+			pair.paymentHash.toString('hex')
+		);
+
+		const payer = recordingPayer(pair.preimage);
+		const store = new MemoryL402CredentialStore();
+		let error: unknown;
+		try {
+			await l402Fetch(
+				'https://mock.example/x',
+				{},
+				{
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					fetchImpl: fixedChallengeServer(
+						`L402 macaroon="${spaced}", invoice="${pair.invoice}"`
+					)
+				}
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as L402Error).code).to.equal('UNUSABLE_MACAROON');
+		expect(payer.payments).to.equal(0);
+		expect(store.list()).to.have.length(0);
+	});
+
+	it('refuses a challenge that arrived from another origin', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(pair.preimage);
+		const fetchImpl = fixedChallengeServer(
+			`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`,
+			'https://evil.example/pay'
+		);
+		let error: unknown;
+		try {
+			await l402Fetch(
+				'https://trusted.example/x',
+				{},
+				{ payer, maxPriceSats: 10, fetchImpl }
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as L402Error).code).to.equal('CROSS_ORIGIN_CHALLENGE');
+		expect(payer.payments).to.equal(0);
+
+		// Opt in and the same challenge is paid, so the refusal is a policy and
+		// not an inability.
+		const allowed = await l402Fetch(
+			'https://trusted.example/x',
+			{},
+			{
+				payer,
+				maxPriceSats: 10,
+				fetchImpl,
+				allowCrossOriginChallenge: true
+			}
+		);
+		expect(allowed.paid).to.equal(true);
+		expect(payer.payments).to.equal(1);
+	});
+
+	it('rejects a preimage that does not open the invoice hash', async () => {
+		const pair = makeChallengePair(1_000n);
+		const payer = recordingPayer(crypto.randomBytes(32)); // wrong preimage
+		const store = new MemoryL402CredentialStore();
+		let error: unknown;
+		try {
+			await l402Fetch(
+				'https://mock.example/x',
+				{},
+				{
+					payer,
+					maxPriceSats: 10,
+					credentials: store,
+					fetchImpl: fixedChallengeServer(
+						`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+					)
+				}
+			);
+		} catch (err) {
+			error = err;
+		}
+		expect((error as L402Error).code).to.equal('PREIMAGE_MISMATCH');
+		// A credential that cannot authenticate must not be stored: it would
+		// fail every later request until someone forgot it by hand.
+		expect(store.list()).to.have.length(0);
+	});
+
+	it('bounds each request with a timeout signal', async () => {
+		const pair = makeChallengePair(1_000n);
+		const signals: Array<AbortSignal | undefined> = [];
+		const fetchImpl = async (
+			url: string,
+			init?: { signal?: AbortSignal }
+		): Promise<IL402Response> => {
+			signals.push(init?.signal);
+			return {
+				status: 402,
+				url,
+				headers: {
+					get: (name: string): string | null =>
+						name.toLowerCase() === 'www-authenticate'
+							? `L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+							: null
+				},
+				text: async (): Promise<string> => 'payment required'
+			};
+		};
+		await l402Fetch(
+			'https://mock.example/x',
+			{},
+			{ payer: recordingPayer(pair.preimage), maxPriceSats: 10, fetchImpl }
+		);
+		expect(signals).to.have.length.greaterThan(0);
+		for (const signal of signals) {
+			expect(signal, 'every request carries an abort signal').to.not.equal(
+				undefined
+			);
+		}
+	});
+
+	it('drops a stored credential that cannot be turned into a header', async () => {
+		const pair = makeChallengePair(1_000n);
+		const store = new MemoryL402CredentialStore();
+		store.set({
+			scope: 'https://mock.example',
+			macaroon: 'not a header safe value',
+			preimage: 'a'.repeat(64),
+			paymentHash: 'b'.repeat(64),
+			amountSats: 1,
+			createdAt: Date.now(),
+			scheme: 'L402'
+		});
+		// The request still goes out (and is answered), rather than throwing
+		// before it and wedging the scope for the process lifetime.
+		const result = await l402Fetch(
+			'https://mock.example/x',
+			{},
+			{
+				payer: recordingPayer(pair.preimage),
+				maxPriceSats: 10,
+				credentials: store,
+				fetchImpl: fixedChallengeServer(
+					`L402 macaroon="${pair.macaroon}", invoice="${pair.invoice}"`
+				)
+			}
+		);
+		expect(result.paid).to.equal(true);
+	});
+});
+
+// ─────────────── 7. Parsing hardening ───────────────
+
+describe('L402 parsing cannot be confused across challenges', () => {
+	it('never pairs a macaroon and invoice from different challenges', () => {
+		// The macaroon belongs to the LSAT challenge and the invoice to the
+		// L402 one; pairing them produces something no server ever issued.
+		const parsed = parseL402Challenge(
+			'L402 invoice="i1", Bearer x, LSAT macaroon="m2", invoice="i2"'
+		);
+		expect(parsed!.scheme).to.equal('LSAT');
+		expect(parsed!.macaroon).to.equal('m2');
+		expect(parsed!.invoice).to.equal('i2');
+	});
+
+	it('does not read a challenge out of another scheme quoted value', () => {
+		// A server (or CDN) reflecting caller-controlled text into a realm must
+		// not be able to smuggle in a challenge of its own.
+		const parsed = parseL402Challenge(
+			'Bearer realm="foo, L402 macaroon=\\"INJECTED\\", invoice=\\"lnbcINJECT\\""'
+		);
+		expect(parsed).to.equal(null);
+	});
+
+	it('refuses a challenge that gives a parameter twice', () => {
+		expect(
+			parseL402Challenge(
+				'L402 macaroon="m1", macaroon="m2", invoice="lnbc1abc"'
+			)
+		).to.equal(null);
+	});
+
+	it('still parses the ordinary shapes', () => {
+		const spaced = parseL402Challenge(
+			'  L402   macaroon = "mac" ,  invoice = "lnbc1xyz"  '
+		);
+		expect(spaced!.macaroon).to.equal('mac');
+		expect(spaced!.invoice).to.equal('lnbc1xyz');
+	});
+
+	it('rejects a macaroon carrying a second identifier', () => {
+		// Strict server-side parsers take the FIRST identifier, so honouring
+		// the last one would check the commitment against a hash the server
+		// never bound the token to.
+		const first = crypto.randomBytes(32);
+		const second = crypto.randomBytes(32);
+		const macaroon = Buffer.concat([
+			Buffer.from([0x02]),
+			field(
+				2,
+				Buffer.concat([
+					Buffer.from([0x00, 0x00]),
+					first,
+					crypto.randomBytes(32)
+				])
+			),
+			field(
+				2,
+				Buffer.concat([
+					Buffer.from([0x00, 0x00]),
+					second,
+					crypto.randomBytes(32)
+				])
+			),
+			Buffer.from([0x00]),
+			Buffer.from([0x00]),
+			field(6, crypto.randomBytes(32))
+		]).toString('base64');
+
+		expect(() => parseMacaroon(macaroon)).to.throw(/duplicate identifier/);
+		expect(macaroonPaymentHash(macaroon)).to.equal(null);
+
+		// And a challenge carrying it is refused rather than paid.
+		expect(() =>
+			validateChallenge(
+				{ scheme: 'L402', macaroon, invoice: makeInvoice(first, 1_000n) },
+				{ maxPriceSats: 10 }
+			)
+		).to.throw(/could not be parsed/);
 	});
 });

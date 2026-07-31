@@ -30,60 +30,172 @@ export interface IL402Challenge {
 /** Longest header we will scan, to bound work on a hostile response. */
 const MAX_HEADER_LENGTH = 64 * 1024;
 
+/** RFC 7230 tchar: the characters a scheme or parameter name may use. */
+const TOKEN_CHARS = "[!#$%&'*+.^_`|~0-9A-Za-z-]+";
+
+/** One challenge as it appeared in the header, before L402 interpretation. */
+interface IRawChallenge {
+	scheme: string;
+	params: Map<string, string>;
+	/** A parameter given twice is ambiguous, so the challenge is unusable. */
+	duplicated: boolean;
+}
+
 /**
  * Pull the L402 (or LSAT) challenge out of a `WWW-Authenticate` header.
  *
- * Returns null when the header carries no L402 challenge, which is not an
- * error: a server may legitimately answer 402 with a different scheme, and
+ * Returns null when the header carries no usable L402 challenge, which is not
+ * an error: a server may legitimately answer 402 with a different scheme, and
  * the caller then simply surfaces the response.
  *
- * Tolerant of the shapes seen in the wild: either parameter order, optional
- * quoting, extra whitespace, and other schemes listed alongside. Deliberately
- * NOT tolerant of a challenge missing either parameter, since a challenge
- * without both halves cannot be acted on.
+ * The header is split into whole challenges per RFC 7235 FIRST, and both
+ * parameters must come from the SAME challenge. That is a payment-safety
+ * property, not tidiness: reading `macaroon` from one challenge and `invoice`
+ * from another produces a pair the server never issued together, and a header
+ * that merely quotes attacker-controlled text (a reflected `realm`, say) could
+ * otherwise smuggle in a challenge of its own and be paid.
+ *
+ * Still tolerant of the shapes seen in the wild: either parameter order,
+ * optional quoting, extra whitespace, and other schemes listed alongside.
+ * Deliberately NOT tolerant of a challenge missing either parameter, or of
+ * one that gives either parameter twice.
  */
 export function parseL402Challenge(header: string): IL402Challenge | null {
 	if (!header || header.length > MAX_HEADER_LENGTH) return null;
 
-	for (const scheme of L402_SCHEMES) {
-		// Match the scheme as a whole token so a value containing the word
-		// (a macaroon happening to encode "L402") cannot be mistaken for one.
-		const schemeMatch = new RegExp(`(?:^|[\\s,])${scheme}\\s+`, 'i').exec(
-			header
+	for (const raw of splitChallenges(header)) {
+		const scheme = L402_SCHEMES.find(
+			(s) => s.toLowerCase() === raw.scheme.toLowerCase()
 		);
-		if (!schemeMatch) continue;
+		if (!scheme || raw.duplicated) continue;
 
-		const rest = header.slice(schemeMatch.index + schemeMatch[0].length);
-		const macaroon = extractParam(rest, 'macaroon');
-		const invoice = extractParam(rest, 'invoice');
+		const macaroon = raw.params.get('macaroon');
+		const invoice = raw.params.get('invoice');
 		if (!macaroon || !invoice) continue;
 
-		return {
-			scheme: scheme,
-			macaroon,
-			invoice
-		};
+		return { scheme, macaroon, invoice };
 	}
 	return null;
 }
 
 /**
- * Read one `name="value"` or `name=value` parameter. Stops at a comma or
- * whitespace for unquoted values, which is what separates parameters and
- * successive challenges.
+ * Split a `WWW-Authenticate` value into its challenges.
+ *
+ * A challenge starts at a token NOT followed by `=` (the scheme); every
+ * `name=value` item after it belongs to that challenge until the next scheme
+ * token. Commas inside a quoted value are data, not separators, which is what
+ * stops a quoted parameter from being read as further challenges.
  */
-function extractParam(source: string, name: string): string | null {
-	const quoted = new RegExp(`(?:^|[\\s,])${name}\\s*=\\s*"([^"]*)"`, 'i').exec(
-		source
-	);
-	if (quoted) return quoted[1].trim() || null;
+function splitChallenges(header: string): IRawChallenge[] {
+	const challenges: IRawChallenge[] = [];
+	let current: IRawChallenge | null = null;
 
-	const bare = new RegExp(`(?:^|[\\s,])${name}\\s*=\\s*([^,\\s]+)`, 'i').exec(
-		source
-	);
-	if (bare) return bare[1].trim() || null;
+	for (const item of splitTopLevelCommas(header)) {
+		// `scheme name=value`: opens a challenge and carries its first param.
+		const withParam = new RegExp(
+			`^(${TOKEN_CHARS})\\s+(${TOKEN_CHARS})\\s*=\\s*([\\s\\S]*)$`
+		).exec(item);
+		if (withParam) {
+			current = { scheme: withParam[1], params: new Map(), duplicated: false };
+			challenges.push(current);
+			addParam(current, withParam[2], withParam[3]);
+			continue;
+		}
 
-	return null;
+		// `name=value`: another parameter of the challenge already open.
+		const param = new RegExp(`^(${TOKEN_CHARS})\\s*=\\s*([\\s\\S]*)$`).exec(
+			item
+		);
+		if (param && current) {
+			addParam(current, param[1], param[2]);
+			continue;
+		}
+
+		// Anything else opens a challenge with no parameters of its own: a bare
+		// scheme, or the token68 form (`Bearer <token>`).
+		const bare = new RegExp(`^(${TOKEN_CHARS})(?:\\s+\\S+)?$`).exec(item);
+		if (bare) {
+			current = { scheme: bare[1], params: new Map(), duplicated: false };
+			challenges.push(current);
+			continue;
+		}
+		// Unparseable item: end the current challenge rather than letting a
+		// later parameter attach to it across the gap.
+		current = null;
+	}
+	return challenges;
+}
+
+/** Record one parameter, flagging a repeat rather than picking a winner. */
+function addParam(
+	challenge: IRawChallenge,
+	name: string,
+	rawValue: string
+): void {
+	const key = name.toLowerCase();
+	const value = unquote(rawValue);
+	if (!value) return;
+	if (challenge.params.has(key)) {
+		challenge.duplicated = true;
+		return;
+	}
+	challenge.params.set(key, value);
+}
+
+/** Strip surrounding quotes and resolve backslash escapes inside them. */
+function unquote(value: string): string {
+	const trimmed = value.trim();
+	if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
+		return trimmed.slice(1, -1).replace(/\\(.)/g, '$1').trim();
+	}
+	return trimmed;
+}
+
+/** Split on commas that are not inside a quoted string. */
+function splitTopLevelCommas(header: string): string[] {
+	const items: string[] = [];
+	let current = '';
+	let inQuotes = false;
+
+	for (let i = 0; i < header.length; i++) {
+		const ch = header[i];
+		if (inQuotes) {
+			if (ch === '\\' && i + 1 < header.length) {
+				current += ch + header[i + 1];
+				i++;
+				continue;
+			}
+			if (ch === '"') inQuotes = false;
+			current += ch;
+			continue;
+		}
+		if (ch === '"') {
+			inQuotes = true;
+			current += ch;
+			continue;
+		}
+		if (ch === ',') {
+			items.push(current);
+			current = '';
+			continue;
+		}
+		current += ch;
+	}
+	items.push(current);
+
+	return items.map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
+/**
+ * Whether a macaroon can be sent back in an `Authorization` header byte for
+ * byte. Checked BEFORE paying: base64 decoding ignores whitespace, so a
+ * macaroon carrying a space (a server wrapping its base64, or one doing it
+ * deliberately) parses fine and commits to the right hash, yet cannot be
+ * echoed back. Discovering that after the payment would spend the sats and
+ * throw away the purchase.
+ */
+export function isHeaderSafeMacaroon(macaroon: string): boolean {
+	return Boolean(macaroon) && !/[\s,]/.test(macaroon);
 }
 
 /**
@@ -105,7 +217,7 @@ export function buildL402AuthorizationHeader(
 	if (!/^[0-9a-f]{64}$/.test(preimageHex)) {
 		throw new Error('L402: preimage must be 32 bytes of hex');
 	}
-	if (!macaroon || /[\s,]/.test(macaroon)) {
+	if (!isHeaderSafeMacaroon(macaroon)) {
 		throw new Error('L402: macaroon must be a non-empty header-safe token');
 	}
 	return `${scheme} ${macaroon}:${preimageHex}`;

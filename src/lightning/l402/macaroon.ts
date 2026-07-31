@@ -131,6 +131,13 @@ export function parseMacaroon(base64Macaroon: string): IParsedMacaroon {
 		if (field.type === FIELD_LOCATION) {
 			location = field.value.toString('utf8');
 		} else if (field.type === FIELD_IDENTIFIER) {
+			// A second identifier is rejected, not overwritten. Strict parsers
+			// (gopkg.in/macaroon.v2, so the server's own) take the FIRST, so
+			// letting a later one win would read a different payment hash than
+			// the server will verify against: the commitment check would pass
+			// on hash B while the token is really bound to hash A, and the
+			// payment would buy nothing.
+			if (identifier) throw new Error('macaroon: duplicate identifier');
 			identifier = field.value;
 		}
 		// Unknown header fields are skipped rather than rejected: the format

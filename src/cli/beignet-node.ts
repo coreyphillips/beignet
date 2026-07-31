@@ -473,6 +473,13 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 /** Hard page-size cap for GET /graph/describe (the graph can be huge). */
 const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
+/**
+ * Default ceiling on an L402 response body. The body is buffered and then
+ * re-serialized into the daemon's JSON envelope, so a remote server's response
+ * size is a memory cost here, not just a transfer one.
+ */
+const DEFAULT_L402_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
@@ -3958,12 +3965,16 @@ export class BeignetNode extends EventEmitter {
 			maxPriceSats: number;
 			maxFeeSats?: number;
 			timeoutMs?: number;
+			fetchTimeoutMs?: number;
 			scopePerPath?: boolean;
 			allowUnverifiedMacaroon?: boolean;
+			allowCrossOriginChallenge?: boolean;
+			maxResponseBytes?: number;
 		}
 	): Promise<{
 		status: number;
 		body: string;
+		truncated: boolean;
 		paid: boolean;
 		amountPaidSats: number;
 		paymentHash?: string;
@@ -3992,9 +4003,25 @@ export class BeignetNode extends EventEmitter {
 				}
 			}
 		});
+		// The body is buffered here and serialized again by the daemon, so an
+		// unbounded response is two copies of whatever a remote server decides
+		// to send. Refuse one that declares itself too large, and truncate one
+		// that turns out to be (a server can lie about content-length, so the
+		// declared size alone is not a bound).
+		const cap = options.maxResponseBytes ?? DEFAULT_L402_MAX_RESPONSE_BYTES;
+		const declared = Number(result.response.headers.get('content-length'));
+		if (Number.isFinite(declared) && declared > cap) {
+			throw new BeignetError(
+				'RESPONSE_TOO_LARGE',
+				`L402 response declares ${declared} bytes, above the ${cap} byte limit`
+			);
+		}
+		const body = await result.response.text();
+		const truncated = Buffer.byteLength(body) > cap;
 		return {
 			status: result.response.status,
-			body: await result.response.text(),
+			body: truncated ? body.slice(0, cap) : body,
+			truncated,
 			paid: result.paid,
 			amountPaidSats: result.amountPaidSats,
 			paymentHash: result.credential?.paymentHash

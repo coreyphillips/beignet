@@ -641,14 +641,29 @@ What the client guarantees before any payment leaves:
 - The price is known and under `maxPriceSats`. An amountless invoice is refused
   outright, since its cost cannot be capped, and a sub-satoshi price rounds up
   rather than down.
+- The routing fee is capped too. `maxFeeSats` defaults to 5% of the price with a
+  5 sat floor rather than to no cap: the invoice comes from a remote header, and
+  its routing hints set the fee, so an uncapped fee is an uncapped payment no
+  matter how small the price is.
 - A macaroon that cannot be parsed is refused, so an unverifiable commitment is
   never paid. `allowUnverifiedMacaroon: true` overrides this and should stay off.
+  A macaroon that cannot be sent back in a header (one carrying whitespace, which
+  base64 decoding would happily ignore) is refused before paying, not after.
+- The challenge came from the origin you asked for. A redirect to another origin
+  is not paid unless you pass `allowCrossOriginChallenge: true`.
+- Both halves of the challenge come from the SAME entry in the
+  `WWW-Authenticate` header, so a reflected or multi-scheme header cannot pair a
+  macaroon with someone else's invoice.
 - At most one payment happens per call. A server that keeps returning 402 gets
   paid once and the 402 is handed back to you.
 
 `maxPriceSats` is per request; your `dailySpendLimitSats` and `maxPaymentSats`
 still apply underneath it. An unattended agent wants both: one bounds a single
-purchase, the other bounds the wallet.
+purchase, the other bounds the wallet. Note that the wallet limits count the
+invoice amount, not the routing fee, which is why the fee cap above matters.
+
+Over HTTP, `POST /l402/fetch` honours `X-Idempotency-Key`, so a retried fetch
+replays the first result instead of buying a second challenge.
 
 Paid credentials are reused for the rest of the process lifetime, scoped per
 origin, so a paid API is paid for once rather than per request:

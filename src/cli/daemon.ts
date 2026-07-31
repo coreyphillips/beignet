@@ -77,6 +77,9 @@ const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay-retry',
 	'POST /keysend',
 	'POST /keysend/safe',
+	// An L402 fetch pays an invoice, and a retried fetch gets a fresh
+	// challenge with a fresh invoice, so an un-keyed retry pays twice.
+	'POST /l402/fetch',
 	// Fee-spending advisor execution: retries must not double-spend fees.
 	'POST /rebalance',
 	'POST /advisor/execute-rebalances'
@@ -165,7 +168,18 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	NOT_FOUND: 404,
 	IDEMPOTENCY_CONFLICT: 409,
 	BODY_TOO_LARGE: 413,
-	RATE_LIMITED: 429
+	RATE_LIMITED: 429,
+	// L402 refusals are decisions about the caller's request, not node faults.
+	// They must not read as 5xx, which is the class agents retry on: retrying
+	// a refused challenge just fetches a new invoice and refuses that too.
+	L402_PRICE_ABOVE_CAP: 402,
+	L402_AMOUNTLESS_INVOICE: 402,
+	L402_HASH_COMMITMENT_MISMATCH: 402,
+	L402_UNVERIFIABLE_MACAROON: 402,
+	L402_UNUSABLE_MACAROON: 402,
+	L402_CROSS_ORIGIN_CHALLENGE: 402,
+	L402_INVALID_INVOICE: 400,
+	L402_NO_PAYER: 400
 };
 
 export function statusForErrorCode(code: string): number {
@@ -1124,8 +1138,11 @@ export async function startDaemon(
 				maxPriceSats,
 				maxFeeSats,
 				timeoutMs,
+				fetchTimeoutMs,
 				scopePerPath,
-				allowUnverifiedMacaroon
+				allowUnverifiedMacaroon,
+				allowCrossOriginChallenge,
+				maxResponseBytes
 			} = body as {
 				url: string;
 				method?: string;
@@ -1134,8 +1151,11 @@ export async function startDaemon(
 				maxPriceSats?: number;
 				maxFeeSats?: number;
 				timeoutMs?: number;
+				fetchTimeoutMs?: number;
 				scopePerPath?: boolean;
 				allowUnverifiedMacaroon?: boolean;
+				allowCrossOriginChallenge?: boolean;
+				maxResponseBytes?: number;
 			};
 			if (!url) return failure('INVALID_PARAMS', 'url required');
 			// The cap is mandatory over HTTP, not defaulted: a remote response
@@ -1156,8 +1176,11 @@ export async function startDaemon(
 							maxPriceSats,
 							maxFeeSats,
 							timeoutMs,
+							fetchTimeoutMs,
 							scopePerPath,
-							allowUnverifiedMacaroon
+							allowUnverifiedMacaroon,
+							allowCrossOriginChallenge,
+							maxResponseBytes
 						}
 					)
 				);
