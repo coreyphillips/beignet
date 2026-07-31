@@ -238,6 +238,45 @@ function randomTransition(
 			channelId: idHex,
 			messageTypes: [MessageType.UPDATE_ADD_HTLC, MessageType.COMMITMENT_SIGNED]
 		});
+	} else if (roll < 0.85) {
+		mutations.push(
+			{
+				type: 'invoice_state',
+				paymentHash: hash.toString('hex'),
+				invoice: {
+					paymentHash: hash.toString('hex'),
+					bolt11: `lnbcrt1${hash.toString('hex').slice(0, 20)}`,
+					amountMsat: BigInt(Math.floor(rand() * 100_000)),
+					expiry: 3600,
+					createdAt: 1_700_000_000_000,
+					bolt12: rand() < 0.5
+				}
+			},
+			{
+				type: 'invoice_path_id',
+				paymentHash: hash.toString('hex'),
+				pathId: prngBytes(rand, 32)
+			},
+			{
+				type: 'forwarding_event',
+				event: {
+					settledAt: 1_700_000_000_000 + Math.floor(rand() * 1000),
+					inChannelId: channelIds[0].toString('hex'),
+					outChannelId: idHex,
+					amountInMsat: BigInt(1000 + Math.floor(rand() * 1000)),
+					amountOutMsat: BigInt(900 + Math.floor(rand() * 100)),
+					feeMsat: BigInt(Math.floor(rand() * 100))
+				}
+			}
+		);
+	} else if (roll < 0.95) {
+		mutations.push(
+			{ type: 'delete_preimage', paymentHash: hash.toString('hex') },
+			{ type: 'delete_payment_secret', paymentHash: hash.toString('hex') },
+			{ type: 'delete_invoice_path_id', paymentHash: hash.toString('hex') },
+			{ type: 'delete_invoice', paymentHash: hash.toString('hex') },
+			{ type: 'delete_payment', paymentHash: hash.toString('hex') }
+		);
 	}
 
 	const outboundMessages: RecoveryOutboundMessage[] = [];
@@ -344,12 +383,32 @@ function dumpTables(storage: IStorageBackend): string {
 				.loadAllHtlcSharedSecrets()
 				.map((s) => [s.key, s.secret.toString('hex')] as [string, string])
 		),
+		invoices: sortByFirst(
+			storage
+				.loadAllInvoices()
+				.map(
+					(i) =>
+						[i.paymentHashHex, JSON.stringify(i.invoice, bigintSafe)] as [
+							string,
+							string
+						]
+				)
+		),
+		invoicePathIds: sortByFirst(
+			(storage.loadAllInvoicePathIds?.() ?? []).map(
+				(i) => [i.paymentHashHex, i.pathId.toString('hex')] as [string, string]
+			)
+		),
+		forwardingEvents: (storage.listForwardingEvents?.() ?? []).map(
+			({ id: _id, ...event }) => JSON.stringify(event, bigintSafe)
+		),
 		outbox: (storage.loadOutboxMessages?.() ?? []).map((row) => [
 			row.peerId,
 			row.channelId ?? '',
 			String(row.messageType),
 			row.wireMessage.toString('hex'),
-			row.disposition
+			row.disposition,
+			String(row.frameSequence)
 		])
 	};
 	return JSON.stringify(dump);
@@ -415,6 +474,39 @@ describe('Recovery phase 2: frame codec', () => {
 					secret: prngBytes(rand, 32)
 				},
 				{ type: 'delete_payment_secret', paymentHash: '33'.repeat(32) },
+				{ type: 'delete_payment', paymentHash: '33'.repeat(32) },
+				{ type: 'delete_preimage', paymentHash: '33'.repeat(32) },
+				{
+					type: 'invoice_state',
+					paymentHash: '55'.repeat(32),
+					invoice: {
+						paymentHash: '55'.repeat(32),
+						bolt11: 'lnbcrt1example',
+						amountMsat: 42_000n,
+						expiry: 3600,
+						createdAt: 1_700_000_000_000,
+						hold: true
+					}
+				},
+				{ type: 'delete_invoice', paymentHash: '55'.repeat(32) },
+				{
+					type: 'invoice_path_id',
+					paymentHash: '55'.repeat(32),
+					pathId: prngBytes(rand, 32)
+				},
+				{ type: 'delete_invoice_path_id', paymentHash: '55'.repeat(32) },
+				{
+					type: 'forwarding_event',
+					event: {
+						settledAt: 1_700_000_000_001,
+						inChannelId: '66'.repeat(32),
+						outChannelId: '77'.repeat(32),
+						inScid: 'aabbcc',
+						amountInMsat: 10_000n,
+						amountOutMsat: 9_900n,
+						feeMsat: 100n
+					}
+				},
 				{ type: 'channel_closed', channelId: '44'.repeat(32) },
 				{
 					type: 'outbox_supersede',
@@ -771,6 +863,132 @@ describe('Recovery phase 2: corruption detection', () => {
 	});
 });
 
+// ─────────────── Verification and reconstruction fail closed ───────────────
+
+describe('Recovery phase 2: fail-closed verification', () => {
+	function compactedJournal(): {
+		storage: SqliteStorage;
+		journal: RecoveryJournal;
+	} {
+		const storage = openStorage();
+		const { manager, journal } = makeJournaledManager(storage, 4);
+		const rand = mulberry32(21);
+		const channelIds = [prngBytes(rand, 32)];
+		// 7 commits with interval 4: compaction leaves [snapshot, delta, delta],
+		// so deleting the snapshot leaves a contiguous authenticated suffix.
+		for (let i = 0; i < 7; i++) {
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				...randomTransition(rand, channelIds)
+			});
+		}
+		return { storage, journal };
+	}
+
+	it('rejects a journal whose retained base snapshot was deleted', () => {
+		const { storage, journal } = compactedJournal();
+		// The compacted base IS the first frame; deleting it leaves a
+		// contiguous, fully authenticated suffix of deltas.
+		(
+			storage as unknown as {
+				db: { prepare: (sql: string) => { run: () => unknown } };
+			}
+		).db
+			.prepare(
+				'DELETE FROM recovery_frames WHERE sequence = (SELECT MIN(sequence) FROM recovery_frames)'
+			)
+			.run();
+		expect(() => journal.loadVerifiedFrames()).to.throw(
+			/base snapshot|missing its retained/
+		);
+		storage.close();
+	});
+
+	it('rejects reconstruction without a base snapshot', () => {
+		const { storage, journal } = compactedJournal();
+		const frames = journal.loadVerifiedFrames();
+		const deltasOnly = frames.filter((f) => !f.snapshot);
+		const target = openStorage();
+		expect(() => reconstructFromFrames(target, deltasOnly)).to.throw(
+			/requires an authenticated base snapshot/
+		);
+		storage.close();
+		target.close();
+	});
+
+	it('rejects reconstruction into a dirty target', () => {
+		const { storage, journal } = compactedJournal();
+		const frames = journal.loadVerifiedFrames();
+		const target = openStorage();
+		target.savePreimage('ee'.repeat(32), Buffer.alloc(32, 9));
+		expect(() => reconstructFromFrames(target, frames)).to.throw(
+			/EMPTY target/
+		);
+		storage.close();
+		target.close();
+	});
+
+	it('snapshots on accumulated delta BYTES, not only frame count', () => {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(storage, MASTER_KEY, NODE_ID, {
+			snapshotIntervalFrames: 10_000,
+			snapshotIntervalBytes: 1
+		});
+		const manager = new RecoveryManager(storage, { journal });
+		const rand = mulberry32(22);
+		const channelIds = [prngBytes(rand, 32)];
+		// Frame 1: bootstrap snapshot. Frame 2: delta, whose plaintext alone
+		// exceeds the byte budget, so frame 3 must be a snapshot.
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, channelIds)
+		});
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, channelIds)
+		});
+		const frames = journal.loadVerifiedFrames();
+		const last = frames[frames.length - 1];
+		expect(last.snapshot, 'byte budget forced a snapshot').to.not.equal(
+			undefined
+		);
+		// And compaction pruned everything below it.
+		expect(frames[0].sequence).to.equal(last.sequence);
+		storage.close();
+	});
+});
+
+// ─────────────── Arbitrary-prefix reconstruction ───────────────
+
+describe('Recovery phase 2: every prefix reconstructs', () => {
+	it('rebuilds byte-identical tables at EVERY intermediate journal state', () => {
+		// The acceptance criterion is reconstruction from any prefix ending at
+		// a snapshot boundary plus deltas. Every intermediate journal state IS
+		// such a prefix, so verify all of them, across compaction boundaries.
+		const live = openStorage();
+		const { manager, journal } = makeJournaledManager(live, 5);
+		const rand = mulberry32(23);
+		const channelIds = [prngBytes(rand, 32), prngBytes(rand, 32)];
+
+		for (let i = 0; i < 14; i++) {
+			const result = manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				...randomTransition(rand, channelIds)
+			});
+			expect(result.committed, `step ${i}`).to.equal(true);
+
+			const frames = journal.loadVerifiedFrames();
+			const rebuilt = openStorage();
+			reconstructFromFrames(rebuilt, frames);
+			expect(dumpTables(rebuilt), `prefix after step ${i}`).to.equal(
+				dumpTables(live)
+			);
+			rebuilt.close();
+		}
+		live.close();
+	});
+});
+
 // ─────────────── 8-9. Wiring ───────────────
 
 describe('Recovery phase 2: wiring and defaults', () => {
@@ -853,6 +1071,9 @@ describe('Recovery phase 2: wiring and defaults', () => {
 		)!;
 		alice.handleFundingConfirmed(channelId);
 		bob.handleFundingConfirmed(channelId);
+		// An Important write outside any channel transition: the invoice's
+		// record set must reach the journal through the same chokepoint.
+		alice.createInvoice({ amountMsat: 25_000n, description: 'journaled' });
 
 		// Every safety transition of the real open flow journaled: frame 1 is
 		// the bootstrap snapshot, and the chain verifies end to end.

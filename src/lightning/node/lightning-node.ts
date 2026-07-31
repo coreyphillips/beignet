@@ -610,7 +610,8 @@ export class LightningNode extends EventEmitter {
 						deriveRecoveryMasterKey(config.nodePrivateKey),
 						getPublicKey(config.nodePrivateKey),
 						{
-							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames
+							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
+							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
 						}
 				  )
 				: undefined;
@@ -1603,35 +1604,50 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
-	private persistPayment(paymentHash: Buffer): void {
-		if (!this.storage) return;
-		const hashHex = paymentHash.toString('hex');
-		const payment = this.payments.get(hashHex);
-		if (payment) {
-			try {
-				this.storage.savePayment(hashHex, payment);
-			} catch (err) {
-				this.emit('node:error', {
-					code: 'PERSISTENCE_ERROR',
-					message: `Failed to persist payment: ${(err as Error).message}`,
-					timestamp: Date.now()
-				} as ILightningError);
-			}
+	/**
+	 * Commit a set of mutations as one recovery transition, reporting failure
+	 * as a node:error. This is how every write to a journaled table outside a
+	 * channel transition (payment metadata, invoices, forwarding events,
+	 * standalone preimages) reaches storage: through RecoveryManager.commit,
+	 * so the Recovery Protocol journal records it (spec 5.1/5.3, Important
+	 * and SafetyCritical writes are journaled; only Reconstructable state
+	 * like gossip may bypass).
+	 */
+	private commitMutations(
+		label: string,
+		mutations: RecoveryMutation[],
+		criticality: RecoveryCriticality = RecoveryCriticality.Important
+	): boolean {
+		if (!this.recovery || mutations.length === 0) return true;
+		const result = this.recovery.commit({
+			criticality,
+			mutations,
+			outboundMessages: [],
+			reportedByCaller: true
+		});
+		if (!result.committed) {
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				message: `${label}: ${result.error?.message}`,
+				timestamp: Date.now()
+			} as ILightningError);
 		}
+		return result.committed;
 	}
 
-	/**
-	 * Persist the payment record, THROWING on any failure. For use inside a
-	 * storage transaction, where a swallowed error would let the transaction
-	 * commit the other writes without this one (persistPayment catches, so a
-	 * transaction wrapping it can never roll back on its account).
-	 */
-	private persistPaymentOrThrow(paymentHash: Buffer): void {
-		if (!this.storage) throw new Error('storage is not configured');
+	/** The payment-state mutation for a tracked payment, or null. */
+	private paymentMutation(paymentHash: Buffer): RecoveryMutation | null {
 		const hashHex = paymentHash.toString('hex');
 		const payment = this.payments.get(hashHex);
-		if (!payment) throw new Error(`payment record missing: ${hashHex}`);
-		this.storage.savePayment(hashHex, payment);
+		if (!payment) return null;
+		return { type: 'payment_state', paymentHash: hashHex, payment };
+	}
+
+	private persistPayment(paymentHash: Buffer): void {
+		if (!this.storage) return;
+		const mutation = this.paymentMutation(paymentHash);
+		if (!mutation) return;
+		this.commitMutations('Failed to persist payment', [mutation]);
 	}
 
 	/**
@@ -1648,22 +1664,45 @@ export class LightningNode extends EventEmitter {
 		paymentSecret?: Buffer,
 		bolt12PathId?: Buffer
 	): void {
-		this.safeStorage(() => {
-			this.storage!.transaction(() => {
-				const hashHex = paymentHash.toString('hex');
-				if (preimage) this.storage!.savePreimage(hashHex, preimage);
-				if (paymentSecret) {
-					this.storage!.savePaymentSecret(hashHex, paymentSecret);
-				}
-				// Same transaction as the preimage: a BOLT 12 invoice must never
-				// persist as claimable without its authentication path_id.
-				if (bolt12PathId) {
-					this.storage!.saveInvoicePathId?.(hashHex, bolt12PathId);
-				}
-				this.storage!.saveInvoice(hashHex, invoiceInfo);
-				this.persistPaymentOrThrow(paymentHash);
+		if (!this.storage) return;
+		const hashHex = paymentHash.toString('hex');
+		const mutations: RecoveryMutation[] = [];
+		if (preimage) {
+			mutations.push({
+				type: 'payment_preimage',
+				paymentHash: hashHex,
+				preimage
 			});
-		}, 'persistInvoiceRecords');
+		}
+		if (paymentSecret) {
+			mutations.push({
+				type: 'payment_secret',
+				paymentHash: hashHex,
+				secret: paymentSecret
+			});
+		}
+		// Same transition as the preimage: a BOLT 12 invoice must never
+		// persist as claimable without its authentication path_id.
+		if (bolt12PathId) {
+			mutations.push({
+				type: 'invoice_path_id',
+				paymentHash: hashHex,
+				pathId: bolt12PathId
+			});
+		}
+		mutations.push({
+			type: 'invoice_state',
+			paymentHash: hashHex,
+			invoice: invoiceInfo
+		});
+		const payment = this.paymentMutation(paymentHash);
+		if (payment) mutations.push(payment);
+		// SafetyCritical: the set carries a claimable preimage.
+		this.commitMutations(
+			'persistInvoiceRecords',
+			mutations,
+			RecoveryCriticality.SafetyCritical
+		);
 	}
 
 	/**
@@ -7951,14 +7990,21 @@ export class LightningNode extends EventEmitter {
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		this.htlcPaymentMap.set(htlcKey, paymentHash.toString('hex'));
-		if (this.storage) {
-			this.storage.transaction(() => {
-				this.persistPayment(paymentHash);
-				this.storage!.saveHtlcPaymentMapping(
+		{
+			const mutations: RecoveryMutation[] = [
+				{
+					type: 'htlc_payment_mapping',
 					htlcKey,
-					paymentHash.toString('hex')
-				);
-			});
+					paymentHash: paymentHash.toString('hex')
+				}
+			];
+			const paymentMutation = this.paymentMutation(paymentHash);
+			if (paymentMutation) mutations.unshift(paymentMutation);
+			this.commitMutations(
+				'persist payment + HTLC mapping',
+				mutations,
+				RecoveryCriticality.SafetyCritical
+			);
 		}
 
 		// Add HTLC to channel (may trigger synchronous fulfillment via loopback)
@@ -8301,11 +8347,17 @@ export class LightningNode extends EventEmitter {
 		const htlcId = outChannel.getFullState().localHtlcCounter;
 		const htlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		this.htlcPaymentMap.set(htlcKey, hashHex);
-		if (this.storage) {
-			this.storage.transaction(() => {
-				this.persistPayment(paymentHash);
-				this.storage!.saveHtlcPaymentMapping(htlcKey, hashHex);
-			});
+		{
+			const mutations: RecoveryMutation[] = [
+				{ type: 'htlc_payment_mapping', htlcKey, paymentHash: hashHex }
+			];
+			const paymentMutation = this.paymentMutation(paymentHash);
+			if (paymentMutation) mutations.unshift(paymentMutation);
+			this.commitMutations(
+				'persist payment + HTLC mapping',
+				mutations,
+				RecoveryCriticality.SafetyCritical
+			);
 		}
 
 		const result = this.channelManager.addHtlc(
@@ -8463,9 +8515,16 @@ export class LightningNode extends EventEmitter {
 			const htlcId = outChannel.getFullState().localHtlcCounter;
 			const mppHtlcKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 			this.htlcPaymentMap.set(mppHtlcKey, hashHex);
-			this.safeStorage(
-				() => this.storage!.saveHtlcPaymentMapping(mppHtlcKey, hashHex),
-				'saveHtlcPaymentMapping'
+			this.commitMutations(
+				'saveHtlcPaymentMapping',
+				[
+					{
+						type: 'htlc_payment_mapping',
+						htlcKey: mppHtlcKey,
+						paymentHash: hashHex
+					}
+				],
+				RecoveryCriticality.SafetyCritical
 			);
 
 			// The first part doubles as the payment-level route/secrets (display
@@ -8900,14 +8959,22 @@ export class LightningNode extends EventEmitter {
 			};
 			this.payments.set(hashHex, incomingPayment);
 			if (this.storage) {
-				try {
-					this.storage.transaction(() => {
-						this.storage!.savePreimage(hashHex, keysendPreimage);
-						this.persistPayment(paymentHash);
-					});
-				} catch {
-					/* best-effort persistence */
-				}
+				this.commitMutations(
+					'keysend receive',
+					[
+						{
+							type: 'payment_preimage',
+							paymentHash: hashHex,
+							preimage: keysendPreimage
+						},
+						{
+							type: 'payment_state',
+							paymentHash: hashHex,
+							payment: incomingPayment
+						}
+					],
+					RecoveryCriticality.SafetyCritical
+				);
 			}
 			this.fulfillPayment(channelId, htlcId, paymentHash, keysendPreimage);
 			return;
@@ -9246,9 +9313,10 @@ export class LightningNode extends EventEmitter {
 		// Persist the preimage and deliver it to the chain monitors before
 		// fulfilling, so a force-close mid-settle can still claim on-chain.
 		this.preimages.set(hashHex, pre);
-		this.safeStorage(
-			() => this.storage!.savePreimage(hashHex, pre),
-			'savePreimage'
+		this.commitMutations(
+			'savePreimage',
+			[{ type: 'payment_preimage', paymentHash: hashHex, preimage: pre }],
+			RecoveryCriticality.SafetyCritical
 		);
 		this.channelManager.recordPreimage(paymentHash, pre);
 
@@ -10087,9 +10155,10 @@ export class LightningNode extends EventEmitter {
 	): void {
 		const hashHex = paymentHash.toString('hex');
 		this.preimages.set(hashHex, preimage);
-		this.safeStorage(
-			() => this.storage!.savePreimage(hashHex, preimage),
-			'savePreimage'
+		this.commitMutations(
+			'savePreimage',
+			[{ type: 'payment_preimage', paymentHash: hashHex, preimage }],
+			RecoveryCriticality.SafetyCritical
 		);
 		// Seed all monitors (on-chain claim path for every inbound HTLC of this hash).
 		this.channelManager.recordPreimage(paymentHash, preimage);
@@ -10211,9 +10280,16 @@ export class LightningNode extends EventEmitter {
 		// Persist preimage immediately (proof of payment) before any message sends
 		const preimageHash = crypto.createHash('sha256').update(preimage).digest();
 		this.preimages.set(preimageHash.toString('hex'), preimage);
-		this.safeStorage(
-			() => this.storage!.savePreimage(preimageHash.toString('hex'), preimage),
-			'savePreimage'
+		this.commitMutations(
+			'savePreimage',
+			[
+				{
+					type: 'payment_preimage',
+					paymentHash: preimageHash.toString('hex'),
+					preimage
+				}
+			],
+			RecoveryCriticality.SafetyCritical
 		);
 
 		// Check if this is a forwarded HTLC — propagate fulfillment upstream
@@ -10287,19 +10363,20 @@ export class LightningNode extends EventEmitter {
 					this.missionControl.recordSuccess(hop.shortChannelId.toString('hex'));
 				}
 			}
-			// Clean up HTLC payment mapping
+			// Clean up HTLC payment mapping. The mapping teardown, the consumed
+			// secret and the settled payment record ride the channel transition
+			// as staged mutations: one journaled transaction instead of an
+			// unjournaled wrapper around four writes.
 			this.htlcPaymentMap.delete(outKey);
-			if (this.storage) {
-				this.storage.transaction(() => {
-					this.storage!.deleteHtlcPaymentMapping(outKey);
-					this.storage!.deletePaymentSecret(hashHex);
-					this.persistPayment(paymentHash);
-					this.persistChannel(channelId);
-				});
-			} else {
-				this.persistPayment(paymentHash);
+			const settledMutations: RecoveryMutation[] = [
+				{ type: 'delete_htlc_payment_mapping', htlcKey: outKey },
+				{ type: 'delete_payment_secret', paymentHash: hashHex }
+			];
+			const settledPaymentMutation = this.paymentMutation(paymentHash);
+			if (settledPaymentMutation) settledMutations.push(settledPaymentMutation);
+			this.withStagedMutations(settledMutations, () => {
 				this.persistChannel(channelId);
-			}
+			});
 			this.emit('payment:sent', payment);
 			this.emitStructuredLog('payment', 'sent', {
 				paymentHash: hashHex,
@@ -10356,9 +10433,10 @@ export class LightningNode extends EventEmitter {
 		) {
 			return;
 		}
-		this.safeStorage(
-			() =>
-				this.storage!.saveForwardingEvent!({
+		this.commitMutations('saveForwardingEvent', [
+			{
+				type: 'forwarding_event',
+				event: {
 					settledAt: Date.now(),
 					inChannelId: forward.inChannelId.toString('hex'),
 					outChannelId: outChannelId.toString('hex'),
@@ -10367,9 +10445,9 @@ export class LightningNode extends EventEmitter {
 					amountInMsat,
 					amountOutMsat,
 					feeMsat: amountInMsat - amountOutMsat
-				}),
-			'saveForwardingEvent'
-		);
+				}
+			}
+		]);
 	}
 
 	/**
@@ -10856,10 +10934,9 @@ export class LightningNode extends EventEmitter {
 		const existing = this.payments.get(hashHex);
 		if (existing) {
 			existing.metadata = { ...existing.metadata, ...metadata };
-			this.safeStorage(
-				() => this.storage!.savePayment(hashHex, existing),
-				'savePaymentMetadata'
-			);
+			this.commitMutations('savePaymentMetadata', [
+				{ type: 'payment_state', paymentHash: hashHex, payment: existing }
+			]);
 		}
 	}
 
@@ -12240,22 +12317,26 @@ export class LightningNode extends EventEmitter {
 		// one skipping deleteInvoicePathId would accumulate path_id rows
 		// forever, the amplification this sweep exists to stop.
 		if (this.storage) {
-			try {
-				this.storage.transaction(() => {
-					for (const hashHex of toRemove) {
-						this.storage!.deletePreimage(hashHex);
-						this.storage!.deletePaymentSecret(hashHex);
-						this.storage!.deleteInvoicePathId(hashHex);
-						this.storage!.deleteInvoice(hashHex);
-						this.storage!.deletePayment(hashHex);
-					}
-				});
-			} catch (err) {
-				this.emit('node:error', {
-					code: 'PERSISTENCE_ERROR',
-					message: `sweepExpiredIssuedInvoices: ${(err as Error).message}`,
-					timestamp: Date.now()
-				} as ILightningError);
+			const mutations: RecoveryMutation[] = [];
+			for (const hashHex of toRemove) {
+				mutations.push(
+					{ type: 'delete_preimage', paymentHash: hashHex },
+					{ type: 'delete_payment_secret', paymentHash: hashHex },
+					{ type: 'delete_invoice_path_id', paymentHash: hashHex },
+					{ type: 'delete_invoice', paymentHash: hashHex },
+					{ type: 'delete_payment', paymentHash: hashHex }
+				);
+			}
+			// SafetyCritical, and journaled: a restore that resurrected a swept
+			// preimage would reopen the issued-unpaid amplification this sweep
+			// exists to close.
+			if (
+				!this.commitMutations(
+					'sweepExpiredIssuedInvoices',
+					mutations,
+					RecoveryCriticality.SafetyCritical
+				)
+			) {
 				return;
 			}
 		}

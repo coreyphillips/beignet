@@ -48,13 +48,23 @@ const META_TIP_SEQUENCE = 'journal_tip_sequence';
 const META_TIP_HASH = 'journal_tip_hash';
 const META_WRITER_EPOCH = 'journal_writer_epoch';
 const META_LAST_SNAPSHOT = 'journal_last_snapshot_sequence';
+const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
 
 /** Deltas between full-state snapshot frames. */
 const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
+/** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */
+const DEFAULT_SNAPSHOT_INTERVAL_BYTES = 4 * 1024 * 1024;
 
 export interface IRecoveryJournalOptions {
 	/** Append a snapshot frame after this many delta frames. Default 256. */
 	snapshotIntervalFrames?: number;
+	/**
+	 * Append a snapshot frame once this many delta plaintext bytes have
+	 * accumulated since the last snapshot, whichever of the two limits trips
+	 * first. Default 4 MiB. Bounds journal growth when individual transitions
+	 * are large (a busy channel's full state per frame).
+	 */
+	snapshotIntervalBytes?: number;
 }
 
 /**
@@ -136,6 +146,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly masterKey: Buffer;
 	private readonly nodeId: Buffer;
 	private readonly snapshotInterval: number;
+	private readonly snapshotIntervalBytes: number;
 
 	constructor(
 		storage: IStorageBackend,
@@ -151,6 +162,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.nodeId = nodeId;
 		this.snapshotInterval =
 			options.snapshotIntervalFrames ?? DEFAULT_SNAPSHOT_INTERVAL_FRAMES;
+		this.snapshotIntervalBytes =
+			options.snapshotIntervalBytes ?? DEFAULT_SNAPSHOT_INTERVAL_BYTES;
 	}
 
 	/**
@@ -187,7 +200,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				GENESIS_HASH.toString('hex'),
 			'hex'
 		);
-		const frameHash = this.writeFrame({
+		const { frameHash, plaintextBytes } = this.writeFrame({
 			version: 1,
 			writerEpoch: this.writerEpoch(),
 			sequence,
@@ -197,13 +210,28 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			outboundMessages
 		});
 
+		// Snapshot on whichever bound trips first (spec 5.3): N delta frames
+		// or M bytes of delta plaintext since the last snapshot.
 		const lastSnapshot = BigInt(
 			this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ?? '0'
 		);
-		if (sequence - lastSnapshot >= BigInt(this.snapshotInterval)) {
+		const deltaBytes =
+			Number(this.storage.getRecoveryMeta!(META_DELTA_BYTES) ?? '0') +
+			plaintextBytes;
+		this.storage.setRecoveryMeta!(META_DELTA_BYTES, String(deltaBytes));
+		if (
+			sequence - lastSnapshot >= BigInt(this.snapshotInterval) ||
+			deltaBytes >= this.snapshotIntervalBytes
+		) {
 			this.appendSnapshotFrame(sequence + 1n, frameHash);
 		}
 		return sequence;
+	}
+
+	/** The sequence the next appended frame will take (1 on bootstrap). */
+	nextSequence(): bigint {
+		const tip = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		return tip == null ? 1n : BigInt(tip) + 1n;
 	}
 
 	/** The journal tip, or null when nothing has been journaled. */
@@ -265,7 +293,11 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				);
 			}
 			const frame = decodeFrame(plaintext);
-			if (frame.sequence !== sequence || frame.writerEpoch !== writerEpoch) {
+			if (
+				frame.sequence !== sequence ||
+				frame.writerEpoch !== writerEpoch ||
+				!frame.previousFrameHash.equals(row.previousFrameHash)
+			) {
 				throw new Error(
 					`Recovery journal frame ${sequence} header mismatch between row and payload`
 				);
@@ -295,6 +327,31 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			throw new Error('Recovery journal has frames but no recorded tip');
 		}
 
+		// The retained base MUST be the recorded snapshot. Compaction leaves
+		// exactly one snapshot as the first frame; without this check, deleting
+		// that snapshot yields a contiguous, fully authenticated suffix of
+		// deltas that verifies cleanly and then reconstructs an INCOMPLETE
+		// database from an empty base. An authenticated chain is not enough;
+		// it must also start where the metadata says the state starts.
+		if (frames.length > 0) {
+			const first = frames[0];
+			const expectedSnapshot =
+				this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT);
+			if (!first.snapshot) {
+				throw new Error(
+					`Recovery journal is missing its retained base snapshot at frame ${first.sequence}`
+				);
+			}
+			if (
+				expectedSnapshot == null ||
+				first.sequence !== BigInt(expectedSnapshot)
+			) {
+				throw new Error(
+					`Recovery journal base snapshot mismatch: loaded ${first.sequence}, expected ${expectedSnapshot}`
+				);
+			}
+		}
+
 		return frames;
 	}
 
@@ -306,7 +363,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	}
 
 	/** Encode, hash, encrypt and store one frame; advance the tip. */
-	private writeFrame(frame: RecoveryFrame): Buffer {
+	private writeFrame(frame: RecoveryFrame): {
+		frameHash: Buffer;
+		plaintextBytes: number;
+	} {
 		const plaintext = encodeFrame(frame);
 		const frameHash = hashFrame(plaintext);
 		const key = deriveFrameKey(this.masterKey, this.nodeId, frame.writerEpoch);
@@ -332,7 +392,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				frame.writerEpoch.toString()
 			);
 		}
-		return frameHash;
+		return { frameHash, plaintextBytes: plaintext.length };
 	}
 
 	/**
@@ -356,6 +416,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			snapshot: this.captureSnapshot()
 		});
 		this.storage.setRecoveryMeta!(META_LAST_SNAPSHOT, sequence.toString());
+		this.storage.setRecoveryMeta!(META_DELTA_BYTES, '0');
 		this.storage.deleteRecoveryFramesBelow?.(Number(sequence));
 	}
 
@@ -391,12 +452,27 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			})),
 			forwardedHtlcs: storage.loadAllForwardedHtlcs(),
 			htlcSharedSecrets: storage.loadAllHtlcSharedSecrets(),
+			invoices: storage.loadAllInvoices().map((i) => ({
+				paymentHash: i.paymentHashHex,
+				invoice: i.invoice
+			})),
+			invoicePathIds: (storage.loadAllInvoicePathIds?.() ?? []).map((i) => ({
+				paymentHash: i.paymentHashHex,
+				pathId: i.pathId
+			})),
+			// listForwardingEvents returns newest first; the snapshot keeps
+			// insertion order so replaying it reproduces the ledger exactly.
+			forwardingEvents: (storage.listForwardingEvents?.() ?? [])
+				.slice()
+				.reverse()
+				.map(({ id: _id, ...event }) => event),
 			outbox: (storage.loadOutboxMessages?.() ?? []).map((row) => ({
 				peerId: row.peerId,
 				channelId: row.channelId,
 				messageType: row.messageType,
 				wireMessage: row.wireMessage,
-				disposition: row.disposition
+				disposition: row.disposition,
+				frameSequence: row.frameSequence
 			}))
 		};
 	}
@@ -427,9 +503,20 @@ export function reconstructFromFrames(
 			break;
 		}
 	}
-	if (snapshotIndex >= 0) {
-		applySnapshot(target, frames[snapshotIndex].snapshot!);
+	// A journal ALWAYS begins with a snapshot (bootstrap or compaction base),
+	// so a frame set without one is a suffix of deltas whose base was lost:
+	// replaying it into an empty database would produce an authenticated but
+	// INCOMPLETE state. Fail closed.
+	if (snapshotIndex < 0) {
+		throw new Error(
+			'Recovery reconstruction requires an authenticated base snapshot'
+		);
 	}
+	// The target must be empty: applySnapshot and replay only insert and
+	// replace, so rows already present that the journal never mentions would
+	// silently survive into the "reconstructed" state.
+	assertEmptyTarget(target);
+	applySnapshot(target, frames[snapshotIndex].snapshot!);
 
 	const manager = new RecoveryManager(target, {
 		maxOutboxRowsPerChannel: options.maxOutboxRowsPerChannel
@@ -446,6 +533,37 @@ export function reconstructFromFrames(
 				`Reconstruction failed replaying frame ${frame.sequence}: ${result.error?.message}`
 			);
 		}
+		// Preserve outbox provenance: the live path stamps rows with the
+		// frame that carried their insert, and replaying THAT frame is what
+		// just re-inserted them.
+		const ids = result.released
+			.map((r) => r.id)
+			.filter((id): id is number => id != null);
+		if (ids.length && target.setOutboxFrameSequence) {
+			target.setOutboxFrameSequence(ids, Number(frame.sequence));
+		}
+	}
+}
+
+/** Throw when the reconstruction target already holds journaled state. */
+function assertEmptyTarget(target: IStorageBackend): void {
+	const dirty =
+		target.loadAllChannels().length > 0 ||
+		target.loadAllChainMonitors().length > 0 ||
+		target.loadAllPreimages().length > 0 ||
+		target.loadAllPayments().length > 0 ||
+		target.loadAllPaymentSecrets().length > 0 ||
+		target.loadAllHtlcPaymentMappings().length > 0 ||
+		target.loadAllForwardedHtlcs().length > 0 ||
+		target.loadAllHtlcSharedSecrets().length > 0 ||
+		target.loadAllInvoices().length > 0 ||
+		(target.loadAllInvoicePathIds?.() ?? []).length > 0 ||
+		(target.listForwardingEvents?.() ?? []).length > 0 ||
+		(target.loadOutboxMessages?.() ?? []).length > 0;
+	if (dirty) {
+		throw new Error(
+			'Recovery reconstruction requires an EMPTY target database'
+		);
 	}
 }
 
@@ -481,8 +599,21 @@ function applySnapshot(
 		for (const s of snapshot.htlcSharedSecrets) {
 			target.saveHtlcSharedSecret(s.key, s.secret);
 		}
+		for (const i of snapshot.invoices) {
+			target.saveInvoice(i.paymentHash, i.invoice);
+		}
+		for (const i of snapshot.invoicePathIds) {
+			target.saveInvoicePathId?.(i.paymentHash, i.pathId);
+		}
+		for (const event of snapshot.forwardingEvents) {
+			target.saveForwardingEvent?.(event);
+		}
 		for (const row of snapshot.outbox) {
-			target.saveOutboxMessage?.(row);
+			const { frameSequence, ...message } = row;
+			const id = target.saveOutboxMessage?.(message);
+			if (id != null && frameSequence != null) {
+				target.setOutboxFrameSequence?.([id], frameSequence);
+			}
 		}
 	});
 }

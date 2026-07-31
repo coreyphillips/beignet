@@ -213,6 +213,11 @@ export interface INodeConfig {
 		enabled?: boolean;
 		/** Delta frames between full-state snapshots (default 256). */
 		snapshotIntervalFrames?: number;
+		/**
+		 * Delta plaintext bytes between snapshots, whichever of the two
+		 * limits trips first (default 4 MiB).
+		 */
+		snapshotIntervalBytes?: number;
 	};
 	/** Chain backend for blockchain monitoring (Electrum, Esplora, etc.) */
 	chainBackend?: IChainBackend;

@@ -25,7 +25,11 @@ import {
 	ISerializedChannelState,
 	ISerializedPaymentInfo
 } from '../storage/serialization';
-import { IRecoveryOutboxMessage } from '../storage/types';
+import {
+	IForwardingEvent,
+	IInvoiceInfo,
+	IRecoveryOutboxMessage
+} from '../storage/types';
 import {
 	RecoveryFrame,
 	RecoveryMutation,
@@ -65,7 +69,60 @@ interface IEncodedSnapshot {
 		inHtlcId: string;
 	}>;
 	htlcSharedSecrets: Array<{ key: string; secret: string }>;
-	outbox: IEncodedOutboundMessage[];
+	invoices: Array<{ paymentHash: string; invoice: IEncodedInvoice }>;
+	invoicePathIds: Array<{ paymentHash: string; pathId: string }>;
+	forwardingEvents: IEncodedForwardingEvent[];
+	outbox: Array<IEncodedOutboundMessage & { frameSequence: number | null }>;
+}
+
+/** IInvoiceInfo with its one bigint field made JSON-safe. */
+type IEncodedInvoice = Omit<IInvoiceInfo, 'amountMsat'> & {
+	amountMsat?: string;
+};
+
+type IEncodedForwardingEvent = Omit<
+	Omit<IForwardingEvent, 'id'>,
+	'amountInMsat' | 'amountOutMsat' | 'feeMsat'
+> & {
+	amountInMsat: string;
+	amountOutMsat: string;
+	feeMsat: string;
+};
+
+function encodeInvoice(invoice: IInvoiceInfo): IEncodedInvoice {
+	const { amountMsat, ...rest } = invoice;
+	return amountMsat != null
+		? { ...rest, amountMsat: amountMsat.toString() }
+		: { ...rest };
+}
+
+function decodeInvoice(encoded: IEncodedInvoice): IInvoiceInfo {
+	const { amountMsat, ...rest } = encoded;
+	return amountMsat != null
+		? { ...rest, amountMsat: BigInt(amountMsat) }
+		: { ...rest };
+}
+
+function encodeForwardingEvent(
+	event: Omit<IForwardingEvent, 'id'>
+): IEncodedForwardingEvent {
+	return {
+		...event,
+		amountInMsat: event.amountInMsat.toString(),
+		amountOutMsat: event.amountOutMsat.toString(),
+		feeMsat: event.feeMsat.toString()
+	};
+}
+
+function decodeForwardingEvent(
+	encoded: IEncodedForwardingEvent
+): Omit<IForwardingEvent, 'id'> {
+	return {
+		...encoded,
+		amountInMsat: BigInt(encoded.amountInMsat),
+		amountOutMsat: BigInt(encoded.amountOutMsat),
+		feeMsat: BigInt(encoded.feeMsat)
+	};
 }
 
 interface IEncodedFrame {
@@ -144,7 +201,28 @@ function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
 				secret: mutation.secret.toString('hex')
 			};
 		case 'delete_payment_secret':
+		case 'delete_payment':
+		case 'delete_preimage':
+		case 'delete_invoice':
+		case 'delete_invoice_path_id':
 			return { type: mutation.type, paymentHash: mutation.paymentHash };
+		case 'invoice_state':
+			return {
+				type: mutation.type,
+				paymentHash: mutation.paymentHash,
+				invoice: encodeInvoice(mutation.invoice)
+			};
+		case 'invoice_path_id':
+			return {
+				type: mutation.type,
+				paymentHash: mutation.paymentHash,
+				pathId: mutation.pathId.toString('hex')
+			};
+		case 'forwarding_event':
+			return {
+				type: mutation.type,
+				event: encodeForwardingEvent(mutation.event)
+			};
 		case 'channel_closed':
 			return { type: mutation.type, channelId: mutation.channelId };
 		case 'outbox_supersede':
@@ -225,7 +303,28 @@ function decodeMutation(encoded: IEncodedMutation): RecoveryMutation {
 				secret: Buffer.from(encoded.secret as string, 'hex')
 			};
 		case 'delete_payment_secret':
+		case 'delete_payment':
+		case 'delete_preimage':
+		case 'delete_invoice':
+		case 'delete_invoice_path_id':
 			return { type: encoded.type, paymentHash: encoded.paymentHash as string };
+		case 'invoice_state':
+			return {
+				type: encoded.type,
+				paymentHash: encoded.paymentHash as string,
+				invoice: decodeInvoice(encoded.invoice as IEncodedInvoice)
+			};
+		case 'invoice_path_id':
+			return {
+				type: encoded.type,
+				paymentHash: encoded.paymentHash as string,
+				pathId: Buffer.from(encoded.pathId as string, 'hex')
+			};
+		case 'forwarding_event':
+			return {
+				type: encoded.type,
+				event: decodeForwardingEvent(encoded.event as IEncodedForwardingEvent)
+			};
 		case 'channel_closed':
 			return { type: encoded.type, channelId: encoded.channelId as string };
 		case 'outbox_supersede':
@@ -299,7 +398,19 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 			key: s.key,
 			secret: s.secret.toString('hex')
 		})),
-		outbox: snapshot.outbox.map(encodeOutboundMessage)
+		invoices: snapshot.invoices.map((i) => ({
+			paymentHash: i.paymentHash,
+			invoice: encodeInvoice(i.invoice)
+		})),
+		invoicePathIds: snapshot.invoicePathIds.map((i) => ({
+			paymentHash: i.paymentHash,
+			pathId: i.pathId.toString('hex')
+		})),
+		forwardingEvents: snapshot.forwardingEvents.map(encodeForwardingEvent),
+		outbox: snapshot.outbox.map((row) => ({
+			...encodeOutboundMessage(row),
+			frameSequence: row.frameSequence
+		}))
 	};
 }
 
@@ -337,7 +448,19 @@ function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 			key: s.key,
 			secret: Buffer.from(s.secret, 'hex')
 		})),
-		outbox: encoded.outbox.map(decodeOutboundMessage)
+		invoices: encoded.invoices.map((i) => ({
+			paymentHash: i.paymentHash,
+			invoice: decodeInvoice(i.invoice)
+		})),
+		invoicePathIds: encoded.invoicePathIds.map((i) => ({
+			paymentHash: i.paymentHash,
+			pathId: Buffer.from(i.pathId, 'hex')
+		})),
+		forwardingEvents: encoded.forwardingEvents.map(decodeForwardingEvent),
+		outbox: encoded.outbox.map((row) => ({
+			...decodeOutboundMessage(row),
+			frameSequence: row.frameSequence
+		}))
 	};
 }
 
