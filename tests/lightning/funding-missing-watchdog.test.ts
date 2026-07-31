@@ -225,7 +225,7 @@ describe('Channel voiding on funding:missing', function () {
 		return { alice, bob, channelId };
 	}
 
-	it('voids the channel: dropped, watch retired, channel:voided emitted', async function () {
+	it('quarantines the channel when no retained tx exists: kept, unusable, recoverable', async function () {
 		const { alice, bob, channelId } = setupPair(900, 901);
 		await tick(60); // let the chain watcher auto-start
 
@@ -242,13 +242,69 @@ describe('Channel voiding on funding:missing', function () {
 			.getChainWatcher()!
 			.emit('funding:missing', channelId, '33'.repeat(32));
 
-		expect(voided.length, 'channel:voided emitted').to.equal(1);
-		expect(voided[0].equals(channelId)).to.equal(true);
+		// Mempool absence is not proof of permanent invalidity: with no
+		// retained signed tx to test against the network, the channel is
+		// QUARANTINED, never deleted. Balances stop being usable; every key,
+		// commitment and watch stays.
+		expect(voided.length, 'nothing voided on absence alone').to.equal(0);
 		expect(
 			alice.listChannels().length,
-			'the channel is gone entirely (nothing to close)'
-		).to.equal(0);
+			'the channel is retained under quarantine'
+		).to.equal(1);
+		expect(
+			alice.listChannels()[0].htlcUsable,
+			'quarantined channel is not usable'
+		).to.equal(false);
 		expect(errors.some((e) => e.code === 'FUNDING_MISSING')).to.equal(true);
+
+		// The tx reappearing (reorg bounce, counterparty rebroadcast) lifts
+		// the quarantine automatically.
+		alice
+			.getChainWatcher()!
+			.emit('funding:recovered', channelId, '33'.repeat(32));
+		expect(
+			alice.listChannels()[0].htlcUsable,
+			'recovery lifts the quarantine'
+		).to.equal(true);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('voids only when a retained tx is rejected as permanently unspendable', async function () {
+		const { alice, bob, channelId } = setupPair(904, 905);
+		await tick(60);
+
+		const voided: Buffer[] = [];
+		alice.removeAllListeners('node:error');
+		alice.on('node:error', () => {});
+		alice.on('channel:voided', (d: { channelId: Buffer }) =>
+			voided.push(d.channelId)
+		);
+
+		// Retain a signed funding tx and make the provider reject it the way
+		// a node rejects a tx whose inputs were spent by a CONFIRMED
+		// conflict: that rejection class is the only proof of permanence.
+		const displayTxid = '33'.repeat(32);
+		const internalHex = Buffer.from(displayTxid, 'hex')
+			.reverse()
+			.toString('hex');
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- reach into private state to stage the retained tx
+		(alice as any).pendingFundingTxs.set(internalHex, 'aa'.repeat(60));
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any -- stub provider for the rebroadcast attempt
+		(alice as any).fundingProvider = {
+			broadcastTransaction: () =>
+				Promise.reject(
+					new Error('bad-txns-inputs-missingorspent')
+				)
+		};
+
+		alice.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+		await tick(20); // let the rejected rebroadcast promise settle
+
+		expect(voided.length, 'permanent rejection voids').to.equal(1);
+		expect(voided[0].equals(channelId)).to.equal(true);
+		expect(alice.listChannels().length).to.equal(0);
 
 		alice.destroy();
 		bob.destroy();
