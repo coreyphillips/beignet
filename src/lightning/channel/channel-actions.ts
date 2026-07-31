@@ -7,6 +7,7 @@
  */
 
 import { MessageType } from '../message/types';
+import { IRecoveryOutboxMessage } from '../storage/types';
 
 export enum ChannelActionType {
 	SEND_MESSAGE = 'SEND_MESSAGE',
@@ -33,6 +34,15 @@ export interface ISendMessageAction {
 	type: ChannelActionType.SEND_MESSAGE;
 	messageType: MessageType;
 	payload: Buffer;
+	/**
+	 * A retransmission of bytes already sent once, replayed after a reconnect
+	 * per BOLT 2. It is still withheld when the batch's persist fails (the
+	 * state justifying it must be on disk before the peer sees it again), but
+	 * it is NOT written to the recovery outbox: the row from the original send
+	 * is already there, and re-inserting the same bytes on every reconnect
+	 * would churn the table for nothing.
+	 */
+	replay?: boolean;
 }
 
 export interface IBroadcastTxAction {
@@ -124,6 +134,90 @@ export interface IPersistStateAction {
  *  a NEW funding outpoint and must be re-announced with its new SCID. */
 export interface ISpliceCompleteAction {
 	type: ChannelActionType.SPLICE_COMPLETE;
+}
+
+/**
+ * Wire messages BOLT 2 can require us to retransmit after a reconnect, and so
+ * the ones worth retaining byte-exactly in the recovery outbox
+ * (docs/RECOVERY-PROTOCOL.md 5.2). Anything outside this set is either
+ * re-derivable from channel state or meaningless to replay.
+ */
+export const RETRANSMITTABLE_MESSAGE_TYPES: ReadonlySet<number> =
+	new Set<number>([
+		MessageType.CHANNEL_READY,
+		MessageType.UPDATE_ADD_HTLC,
+		MessageType.UPDATE_FULFILL_HTLC,
+		MessageType.UPDATE_FAIL_HTLC,
+		MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+		MessageType.UPDATE_FEE,
+		MessageType.START_BATCH,
+		MessageType.COMMITMENT_SIGNED,
+		MessageType.REVOKE_AND_ACK,
+		MessageType.SPLICE,
+		MessageType.SPLICE_ACK,
+		MessageType.SPLICE_LOCKED
+	]);
+
+/**
+ * The subset a peer's revoke_and_ack proves receipt of: our queued updates and
+ * the commitment_signed (batched or not) that covered them. Our OWN
+ * revoke_and_ack is deliberately excluded, since the peer's revocation says
+ * nothing about whether it received ours; those rows are instead replaced by
+ * the next revoke_and_ack for the channel (see
+ * {@link SUPERSEDES_OWN_KIND_MESSAGE_TYPES}), of which only the latest can ever
+ * be requested.
+ */
+export const SUPERSEDED_ON_REVOKE_MESSAGE_TYPES: readonly number[] = [
+	MessageType.UPDATE_ADD_HTLC,
+	MessageType.UPDATE_FULFILL_HTLC,
+	MessageType.UPDATE_FAIL_HTLC,
+	MessageType.UPDATE_FAIL_MALFORMED_HTLC,
+	MessageType.UPDATE_FEE,
+	MessageType.START_BATCH,
+	MessageType.COMMITMENT_SIGNED
+];
+
+/**
+ * Message types where only the newest row can ever be retransmitted, so
+ * writing one supersedes the channel's earlier rows of the same type.
+ *
+ * Nothing else retires these. A peer's revoke_and_ack proves nothing about our
+ * own revoke_and_ack, and no wire message acknowledges channel_ready or
+ * splice_locked at all, so without this rule they accumulate for the life of
+ * the channel until the row cap starts evicting them: one row per commitment
+ * round, forever, on a busy channel. Retransmission only ever wants the latest
+ * of each, which is exactly what this keeps.
+ */
+export const SUPERSEDES_OWN_KIND_MESSAGE_TYPES: readonly number[] = [
+	MessageType.REVOKE_AND_ACK,
+	MessageType.CHANNEL_READY,
+	MessageType.SPLICE_LOCKED
+];
+
+/**
+ * The payload of the `channel:persist` event.
+ *
+ * ChannelManager fills in `outbound` (the retransmittable messages this
+ * batch's PERSIST_STATE authorizes) and the listener that owns storage
+ * answers with `committed` plus the ids of the rows it wrote. A listener
+ * reporting `committed: false` withholds those sends: the state that
+ * justifies them is not on disk.
+ */
+export interface IChannelPersistRequest {
+	/** Messages to commit alongside the channel state, in send order. */
+	outbound: IRecoveryOutboxMessage[];
+	/** Set false by the listener when the transaction rolled back. */
+	committed: boolean;
+	/** Row ids written for `outbound`, same order; empty without an outbox. */
+	outboxIds: Array<number | null>;
+	/**
+	 * Outbox rows of these message types are proven held by the peer (its
+	 * revoke_and_ack acknowledged them) and must be deleted IN the same
+	 * transaction as this batch's state. In-transaction rather than eager so a
+	 * failed persist (or a crash before it) cannot leave disk holding
+	 * pre-revoke state whose retransmission bytes are already gone.
+	 */
+	supersede?: { messageTypes: number[] };
 }
 
 export type ChannelAction =

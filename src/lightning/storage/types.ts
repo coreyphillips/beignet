@@ -245,6 +245,37 @@ export interface IStorageBackend {
 	/** Mark a queued update acked at the given sequence number. */
 	markWatchtowerUpdateAcked?(id: number, seqNum: number): void;
 
+	// ─── Recovery Outbox (optional, docs/RECOVERY-PROTOCOL.md 5.2) ───
+	// The transactional outbox: a row commits in the SAME transaction as the
+	// state that makes its message necessary, and the socket write happens only
+	// after that commit. Optional rather than required because a backend
+	// without it degrades to reconstructing retransmissions from channel state,
+	// which is exactly the pre-outbox behavior; the atomicity fixes in
+	// RecoveryManager hold either way. Contrast deletePreimage, which is
+	// required because its absence would leave a claimable hash behind.
+	/** Persist one outbound message; returns the new row id. */
+	saveOutboxMessage?(message: IRecoveryOutboxMessage): number;
+	/** Load retained rows, oldest first, optionally for one channel. */
+	loadOutboxMessages?(channelId?: string): IRecoveryOutboxStoredMessage[];
+	/**
+	 * Count a channel's retained rows. Kept separate from loadOutboxMessages
+	 * so the per-channel row cap can be enforced without decrypting every
+	 * retained wire message just to take the length of the result.
+	 */
+	countOutboxMessages?(channelId: string): number;
+	/** Advance one row's disposition (e.g. after the socket write). */
+	setOutboxDisposition?(
+		id: number,
+		disposition: 'pending_send' | 'sent_unacked' | 'superseded'
+	): void;
+	/**
+	 * Delete a channel's rows, optionally only those of the given message
+	 * types. Used when reestablish proves the peer already holds them.
+	 */
+	deleteOutboxMessages?(channelId: string, messageTypes?: number[]): void;
+	/** Keep only the newest `keepNewest` rows for a channel. */
+	pruneOutboxMessages?(channelId: string, keepNewest: number): void;
+
 	// ─── BOLT 12 Offers (optional) ───
 	/**
 	 * Persist a created offer. The bech32m encoding is the authoritative
@@ -269,6 +300,50 @@ export interface IStorageBackend {
 	}>;
 	/** Delete a persisted offer. */
 	deleteOffer?(offerIdHex: string): void;
+}
+
+/**
+ * Lifecycle of a recovery outbox row.
+ *
+ * `pending_send`   committed, not yet written to the socket
+ * `sent_unacked`   written to the socket, peer has not proven receipt
+ * `superseded`     the reestablish exchange proved the peer holds it
+ */
+export type RecoveryOutboxDisposition =
+	| 'pending_send'
+	| 'sent_unacked'
+	| 'superseded';
+
+/**
+ * An outbound wire message whose durability is tied to the state that makes it
+ * necessary (docs/RECOVERY-PROTOCOL.md 5.2). Defined here, in the layer that
+ * owns the row, and re-exported from src/lightning/recovery under its
+ * spec name.
+ *
+ * `wireMessage` holds the EXACT encoded bytes rather than the material needed
+ * to re-encode them. That is load-bearing: a retransmitted commitment_signed
+ * must be byte-identical, because re-signing would bind a fresh MuSig2 secret
+ * nonce to material the peer may already hold under the old one.
+ */
+export interface IRecoveryOutboxMessage {
+	/** Peer node id, hex. */
+	peerId: string;
+	/** Channel this message belongs to, hex. Absent for node-level messages. */
+	channelId?: string;
+	/** BOLT message type. */
+	messageType: number;
+	/** Exact encoded wire bytes, message type prefix excluded. */
+	wireMessage: Buffer;
+	disposition: RecoveryOutboxDisposition;
+}
+
+/** A persisted outbox row: the message plus its storage identity. */
+export interface IRecoveryOutboxStoredMessage extends IRecoveryOutboxMessage {
+	id: number;
+	/** Journal frame that carried this row. Always null until Phase 2. */
+	frameSequence: number | null;
+	/** ms since epoch, for diagnostics and bounded-retention pruning. */
+	createdAt: number;
 }
 
 /**

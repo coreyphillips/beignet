@@ -259,7 +259,13 @@ describe('Production Hardening 10', () => {
 	// ─── Fix 4: fulfillPayment() transaction ───
 
 	describe('Fix 4: fulfillPayment() atomicity', () => {
-		it('fulfillPayment wraps writes in storage.transaction()', () => {
+		// The atomicity these two guard now comes from the Recovery Protocol
+		// safety transition layer (docs/RECOVERY-PROTOCOL.md 5.1): the payment
+		// record and the consumed payment secret are STAGED, so they commit in
+		// the same storage.transaction() as the channel state and the exact
+		// update_fulfill_htlc bytes, instead of in a transaction of their own
+		// that a crash could land without the send (or vice versa).
+		it('fulfillPayment stages its writes into the fulfill transition', () => {
 			const src = fs.readFileSync(
 				path.join(__dirname, '../../src/lightning/node/lightning-node.ts'),
 				'utf8'
@@ -268,13 +274,13 @@ describe('Production Hardening 10', () => {
 				src.indexOf('private fulfillPayment('),
 				src.indexOf('private handleForwardHtlc(')
 			);
-			expect(fulfillSection).to.include('storage.transaction');
-			expect(fulfillSection).to.include('deletePaymentSecret');
-			expect(fulfillSection).to.include('persistPayment');
+			expect(fulfillSection).to.include('withStagedMutations');
+			expect(fulfillSection).to.include('delete_payment_secret');
+			expect(fulfillSection).to.include('payment_state');
 			expect(fulfillSection).to.include('persistChannel');
 		});
 
-		it('critical writes are inside the transaction, channel persisted after fulfill', () => {
+		it('staged writes are committed by the transition, not a separate write', () => {
 			const src = fs.readFileSync(
 				path.join(__dirname, '../../src/lightning/node/lightning-node.ts'),
 				'utf8'
@@ -283,17 +289,33 @@ describe('Production Hardening 10', () => {
 				src.indexOf('private fulfillPayment('),
 				src.indexOf('private handleForwardHtlc(')
 			);
-			const txStart = fulfillSection.indexOf('this.storage.transaction');
-			expect(txStart).to.be.greaterThan(-1);
-			const txBlock = fulfillSection.substring(
-				txStart,
-				fulfillSection.indexOf('});', txStart) + 3
-			);
-			// Payment state persisted atomically BEFORE fulfill message
-			expect(txBlock).to.include('deletePaymentSecret');
-			expect(txBlock).to.include('persistPayment');
+			const stageStart = fulfillSection.indexOf('this.withStagedMutations');
+			expect(stageStart).to.be.greaterThan(-1);
+			// The fulfill message is sent INSIDE the staged block, so the
+			// mutations and the send belong to one transition.
+			const stagedBlock = fulfillSection.substring(stageStart);
+			expect(stagedBlock).to.include('fulfillHtlc');
+			expect(
+				stagedBlock.indexOf('delete_payment_secret'),
+				'payment secret staged before the fulfill call'
+			).to.be.lessThan(stagedBlock.indexOf('fulfillHtlc'));
 			// Channel state persisted separately AFTER fulfillHtlc (best-effort)
 			expect(fulfillSection).to.include('persistChannel');
+		});
+
+		// The staging above is only atomic if persistChannel actually folds
+		// staged mutations into its transaction; pin that wiring too.
+		it('persistChannel folds staged mutations into its transition', () => {
+			const src = fs.readFileSync(
+				path.join(__dirname, '../../src/lightning/node/lightning-node.ts'),
+				'utf8'
+			);
+			const persistSection = src.substring(
+				src.indexOf('private persistChannel('),
+				src.indexOf('private withStagedMutations(')
+			);
+			expect(persistSection).to.include('takeStagedMutations');
+			expect(persistSection).to.include('this.recovery.commit');
 		});
 	});
 

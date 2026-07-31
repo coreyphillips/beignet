@@ -574,6 +574,7 @@ LightningNode              High-level API (EventEmitter)
 | `interactive-tx/` | Interactive transaction construction for v2 dual-funded opens and splicing |
 | `watchtower/` | Altruist watchtower client: wtwire protocol, justice blobs, tower sessions |
 | `backup/` | Static channel backup (SCB) export/import |
+| `recovery/` | Safety transition layer: atomic persistence and the durable outbound-message outbox |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |
 | `bootstrap/` | DNS seed resolution for discovering initial peers |

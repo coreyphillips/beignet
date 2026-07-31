@@ -204,6 +204,23 @@ function sendMsg(
 }
 
 /**
+ * A BOLT 2 reconnect retransmission: the same bytes the peer may already
+ * hold, replayed rather than newly authorized. Marked so the recovery outbox
+ * is not written again for them, while the persist gate still applies.
+ */
+function replayMsg(
+	messageType: MessageType,
+	payload: Buffer
+): ISendMessageAction {
+	return {
+		type: ChannelActionType.SEND_MESSAGE,
+		messageType,
+		payload,
+		replay: true
+	};
+}
+
+/**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
  * capped at BOLT 2 max of funding / 5 (20%).
@@ -390,8 +407,10 @@ export class Channel {
 	} | null = null;
 	// Wire bytes of the last commitment batch WE sent during the pending-lock
 	// window, retained for verbatim retransmission on reestablish until the
-	// peer's revoke_and_ack acknowledges it. In-memory only: a batch not yet
-	// acked is re-sent from here on reconnect.
+	// peer's revoke_and_ack acknowledges it. Not part of channel state: a
+	// restart repopulates it from the recovery outbox via restoreLastSentBatch,
+	// which is the only source of the exact bytes for a taproot channel (the
+	// rebuild fallback below deliberately refuses to re-sign one).
 	private _lastSentBatch: {
 		startBatch: Buffer;
 		commitments: Buffer[];
@@ -1797,7 +1816,14 @@ export class Channel {
 		// revoke_and_ack acknowledges it — a reconnect must retransmit it.
 		this._queuePendingLocalUpdate(MessageType.UPDATE_ADD_HTLC, payload);
 
-		return [sendMsg(MessageType.UPDATE_ADD_HTLC, payload)];
+		// Persist before the add reaches the peer: the queued retransmission
+		// entry, the HTLC itself and (for a forward) the caller's staged
+		// linkage all commit together, so no crash can leave an HTLC the peer
+		// holds and we have no record of.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.UPDATE_ADD_HTLC, payload)
+		];
 	}
 
 	/**
@@ -2117,7 +2143,15 @@ export class Channel {
 		// revealed preimage) — queue it for retransmission until acked.
 		this._queuePendingLocalUpdate(MessageType.UPDATE_FULFILL_HTLC, payload);
 
-		return [sendMsg(MessageType.UPDATE_FULFILL_HTLC, payload)];
+		// Persist before the preimage reaches the peer. Previously this
+		// returned the send alone and durability of the preimage rested on
+		// every caller having saved it first; with PERSIST_STATE here, the
+		// caller's staged preimage mutation and this message commit as one
+		// unit (docs/RECOVERY-PROTOCOL.md 5.1).
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.UPDATE_FULFILL_HTLC, payload)
+		];
 	}
 
 	/**
@@ -2268,7 +2302,11 @@ export class Channel {
 		// BOLT 2 reestablish: queue for retransmission until acked.
 		this._queuePendingLocalUpdate(MessageType.UPDATE_FAIL_HTLC, payload);
 
-		return [sendMsg(MessageType.UPDATE_FAIL_HTLC, payload)];
+		// Persist the queued retransmission entry before the fail goes out.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.UPDATE_FAIL_HTLC, payload)
+		];
 	}
 
 	/**
@@ -2337,7 +2375,11 @@ export class Channel {
 			payload
 		);
 
-		return [sendMsg(MessageType.UPDATE_FAIL_MALFORMED_HTLC, payload)];
+		// Persist the queued retransmission entry before the fail goes out.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.UPDATE_FAIL_MALFORMED_HTLC, payload)
+		];
 	}
 
 	/**
@@ -2746,7 +2788,11 @@ export class Channel {
 				startBatch: startBatchBytes,
 				commitments: [currentBytes, spliceBytes]
 			};
+			// Persist first: the commitment round we just advanced (and the exact
+			// batch bytes, captured into the recovery outbox by the same
+			// transition) must be durable before the peer holds our signature.
 			return [
+				{ type: ChannelActionType.PERSIST_STATE },
 				sendMsg(MessageType.START_BATCH, startBatchBytes),
 				sendMsg(MessageType.COMMITMENT_SIGNED, currentBytes),
 				sendMsg(MessageType.COMMITMENT_SIGNED, spliceBytes)
@@ -2754,8 +2800,31 @@ export class Channel {
 		}
 
 		return [
+			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.COMMITMENT_SIGNED, encodeCommitmentSignedMessage(msg))
 		];
+	}
+
+	/**
+	 * Repopulate the un-acked commitment batch from durably stored wire bytes
+	 * after a restart (docs/RECOVERY-PROTOCOL.md 5.2, disposition D2).
+	 *
+	 * Without this the cache dies with the process, and the reestablish
+	 * fallback can only REBUILD the batch by re-signing, which it refuses to do
+	 * for a taproot channel because a fresh MuSig2 secret nonce must never sign
+	 * material the peer may already hold under the old one. Restoring the exact
+	 * bytes retransmits without signing anything again.
+	 *
+	 * Ignored once a batch is already cached: a live batch is never staler than
+	 * a stored one.
+	 */
+	restoreLastSentBatch(startBatch: Buffer, commitments: Buffer[]): void {
+		if (this._lastSentBatch) return;
+		if (!startBatch || commitments.length === 0) return;
+		this._lastSentBatch = {
+			startBatch: Buffer.from(startBatch),
+			commitments: commitments.map((c) => Buffer.from(c))
+		};
 	}
 
 	/**
@@ -3395,7 +3464,12 @@ export class Channel {
 		// (whose cached bytes were signed at the new rate).
 		this._queuePendingLocalUpdate(MessageType.UPDATE_FEE, payload);
 
-		return [sendMsg(MessageType.UPDATE_FEE, payload)];
+		// Persist the staged rate and its queued retransmission entry before
+		// the peer sees the update.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.UPDATE_FEE, payload)
+		];
 	}
 
 	/**
@@ -5717,7 +5791,7 @@ export class Channel {
 					nextPerCommitmentPoint: this._state.lastSentRevokeNextPoint
 				};
 				revokeRetransmit.push(
-					sendMsg(
+					replayMsg(
 						MessageType.REVOKE_AND_ACK,
 						encodeRevokeAndAckMessage(revokeMsg)
 					)
@@ -5766,7 +5840,7 @@ export class Channel {
 		// fulfilled/failed HTLC is a no-op).
 		if (!spliceActive || pendingLock) {
 			for (const update of this._state.pendingLocalUpdates) {
-				actions.push(sendMsg(update.type as MessageType, update.payload));
+				actions.push(replayMsg(update.type as MessageType, update.payload));
 			}
 		}
 
@@ -5781,10 +5855,10 @@ export class Channel {
 		) {
 			if (this._lastSentBatch) {
 				actions.push(
-					sendMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
+					replayMsg(MessageType.START_BATCH, this._lastSentBatch.startBatch)
 				);
 				for (const c of this._lastSentBatch.commitments) {
-					actions.push(sendMsg(MessageType.COMMITMENT_SIGNED, c));
+					actions.push(replayMsg(MessageType.COMMITMENT_SIGNED, c));
 				}
 			} else if (
 				this._signer &&
@@ -5874,7 +5948,7 @@ export class Channel {
 						: undefined
 				};
 				actions.push(
-					sendMsg(
+					replayMsg(
 						MessageType.COMMITMENT_SIGNED,
 						encodeCommitmentSignedMessage(commitMsg)
 					)
@@ -5937,8 +6011,24 @@ export class Channel {
 				readyMsg.nextLocalNonce = this._ensureLocalNextNonce();
 			}
 			actions.push(
-				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(readyMsg))
+				replayMsg(
+					MessageType.CHANNEL_READY,
+					encodeChannelReadyMessage(readyMsg)
+				)
 			);
+		}
+
+		// Persist before ANY of the above reaches the peer
+		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
+		// restored channel state, the adopted remote nonce, splice resumption)
+		// and replays messages built from in-memory state. Without a persist
+		// action the whole path bypassed the batch gate, so a transition whose
+		// commit had failed could still reach the peer on the next reconnect:
+		// exactly the case the gate exists to stop, arriving one connection
+		// later. A retransmission is only safe once what justifies it is on
+		// disk.
+		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 
 		return actions;
@@ -6236,7 +6326,12 @@ export class Channel {
 		this._state.state = ChannelState.SPLICING;
 
 		const spliceMsg = result.message as ISpliceMessage;
-		return [sendMsg(MessageType.SPLICE, encodeSpliceMessage(spliceMsg))];
+		// Persist SPLICING (and the pre-splice state it rolls back to) before
+		// the peer sees the request.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.SPLICE, encodeSpliceMessage(spliceMsg))
+		];
 	}
 
 	/**
@@ -6339,7 +6434,12 @@ export class Channel {
 		this._state.state = ChannelState.SPLICING;
 
 		const ackMsg = result.message as ISpliceAckMessage;
-		return [sendMsg(MessageType.SPLICE_ACK, encodeSpliceAckMessage(ackMsg))];
+		// Persist SPLICING (and the pre-splice state it rolls back to) before
+		// the peer sees the acceptance.
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.SPLICE_ACK, encodeSpliceAckMessage(ackMsg))
+		];
 	}
 
 	/**
@@ -7046,16 +7146,23 @@ export class Channel {
 		const actions: ChannelAction[] = [];
 		const lockedMsg = result.message as ISpliceLockedMessage;
 		this._syncSpliceInFlight({ localSpliceLocked: true });
+		// Persist BEFORE the peer sees splice_locked. Both state changes this
+		// step makes (the sent-locked flag above, and completeSplice below,
+		// which runs while this array is BUILT, not when it is dispatched) are
+		// already applied by the time the action runs, so one leading persist
+		// covers the whole step.
+		// If both sides have sent splice_locked, the splice is complete.
+		const spliceComplete = this._spliceSession.isComplete();
+		if (spliceComplete) {
+			this.completeSplice();
+		}
+		actions.push({ type: ChannelActionType.PERSIST_STATE });
 		actions.push(
 			sendMsg(MessageType.SPLICE_LOCKED, encodeSpliceLockedMessage(lockedMsg))
 		);
-
-		// If both sides have sent splice_locked, the splice is complete
-		if (this._spliceSession.isComplete()) {
-			this.completeSplice();
+		if (spliceComplete) {
 			actions.push({ type: ChannelActionType.SPLICE_COMPLETE });
 		}
-		actions.push({ type: ChannelActionType.PERSIST_STATE });
 
 		return actions;
 	}
