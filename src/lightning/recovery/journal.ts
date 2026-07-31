@@ -50,6 +50,18 @@ const META_WRITER_EPOCH = 'journal_writer_epoch';
 const META_LAST_SNAPSHOT = 'journal_last_snapshot_sequence';
 const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
 
+/**
+ * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
+ * which snapshots them alongside the stored frames so a restore can install
+ * a verifiable journal into an empty database.
+ */
+export const JOURNAL_META_KEYS = {
+	tipSequence: META_TIP_SEQUENCE,
+	tipHash: META_TIP_HASH,
+	writerEpoch: META_WRITER_EPOCH,
+	lastSnapshot: META_LAST_SNAPSHOT
+} as const;
+
 /** Deltas between full-state snapshot frames. */
 const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
 /** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */

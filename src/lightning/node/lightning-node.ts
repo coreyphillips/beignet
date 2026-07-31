@@ -197,7 +197,8 @@ import {
 	RecoveryMutation,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
-	journalSupported
+	journalSupported,
+	composeRecoveryCapsule
 } from '../recovery';
 import { IChannelPersistRequest } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
@@ -238,7 +239,7 @@ import {
 	createAcceptorState,
 	IChannelState
 } from '../channel/channel-state';
-import { IScbChannelEntry } from '../backup/scb';
+import { IScbChannelEntry, encodeScb } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
@@ -583,6 +584,10 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ blob: Buffer; receivedAt: number }
 	> = new Map();
+	/** Recovery Capsule (spec 5.4): journal configured, capsule refresh armed. */
+	private recoveryCapsuleActive = false;
+	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private capsuleLastRefreshAt = 0;
 
 	constructor(config: INodeConfig) {
 		super();
@@ -615,9 +620,16 @@ export class LightningNode extends EventEmitter {
 						}
 				  )
 				: undefined;
+		// Phase 3 (docs/RECOVERY-PROTOCOL.md 5.4): with the journal on, every
+		// journaled commit schedules a (once-per-minute throttled) refresh of
+		// the peer_storage Recovery Capsule.
+		this.recoveryCapsuleActive = journal !== undefined;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
+					onCommitted: journal
+						? (): void => this.scheduleRecoveryCapsuleRefresh()
+						: undefined,
 					onError: (err: Error, context): void => {
 						// persistChannel reports its own failures with the channel id
 						// attached, which is strictly more useful; emitting here too
@@ -848,6 +860,11 @@ export class LightningNode extends EventEmitter {
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
+
+		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
+		// before the first journaled transition still receive a current blob
+		// via sendPeerStorageOnConnect.
+		this.scheduleRecoveryCapsuleRefresh();
 
 		this.startCleanupTimer();
 
@@ -2624,6 +2641,75 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		return sent;
+	}
+
+	/**
+	 * Throttled Recovery Capsule refresh (docs/RECOVERY-PROTOCOL.md 5.4):
+	 * journaled commits (snapshots included) schedule it, but it runs at most
+	 * once per minute, respecting BOLT 1 provider rate limits. Trailing edge:
+	 * a burst of transitions inside the window still ends with exactly one
+	 * refresh, composed from whatever state is durable when it fires.
+	 */
+	private scheduleRecoveryCapsuleRefresh(): void {
+		if (!this.recoveryCapsuleActive || !this.peerStorageEnabled) return;
+		const elapsed = Date.now() - this.capsuleLastRefreshAt;
+		if (elapsed >= LightningNode.PEER_STORAGE_MIN_INTERVAL_MS) {
+			this.refreshRecoveryCapsule();
+			return;
+		}
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			this.refreshRecoveryCapsule();
+		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS - elapsed);
+		if (typeof timer.unref === 'function') timer.unref();
+		this.capsuleRefreshTimer = timer;
+	}
+
+	/**
+	 * Compose the current Recovery Capsule (spec 5.4) and push it to every
+	 * connected peer that provides storage. The blob is also remembered and
+	 * re-pushed on each future connect (distributePeerStorage semantics), so
+	 * a capsule composed with no peers connected is not wasted. Returns the
+	 * number of peers pushed to now.
+	 *
+	 * Composition reads only durable state (the SCB data and the stored
+	 * journal), so a refresh racing live transitions is simply as fresh as
+	 * the last committed one. Failures are logged, never thrown: capsule
+	 * distribution is a replica, and must not take down the node.
+	 */
+	refreshRecoveryCapsule(): number {
+		if (
+			!this.recoveryCapsuleActive ||
+			!this.peerStorageEnabled ||
+			!this.storage
+		) {
+			return 0;
+		}
+		this.capsuleLastRefreshAt = Date.now();
+		try {
+			const data = this.buildStaticChannelBackupData();
+			const encryptedScb = encodeScb(
+				{
+					version: 1,
+					network: data.network,
+					createdAt: Date.now(),
+					channels: data.channels
+				},
+				this.nodePrivkey
+			);
+			const { blob } = composeRecoveryCapsule({
+				storage: this.storage,
+				encryptedScb,
+				nodeSecret: this.nodePrivkey
+			});
+			return this.distributePeerStorage(blob);
+		} catch (err) {
+			this.emitStructuredLog('peer', 'recovery_capsule_refresh_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return 0;
+		}
 	}
 
 	/** Newest blob each peer has returned via peer_storage_retrieval. */
@@ -4484,6 +4570,10 @@ export class LightningNode extends EventEmitter {
 		}
 		this._reconnectTimers.clear();
 		// Clear deferred peer-storage flush timers
+		if (this.capsuleRefreshTimer) {
+			clearTimeout(this.capsuleRefreshTimer);
+			this.capsuleRefreshTimer = null;
+		}
 		for (const t of this.peerStorageFlushTimers.values()) {
 			clearTimeout(t);
 		}
