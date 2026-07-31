@@ -12,7 +12,10 @@ import {
 	IPersistedChannelPolicy,
 	IForwardingEvent,
 	IForwardingEventFilter,
-	IForwardingSummary
+	IForwardingSummary,
+	IRecoveryOutboxMessage,
+	IRecoveryOutboxStoredMessage,
+	RecoveryOutboxDisposition
 } from './types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
 import { IChannelState } from '../channel/channel-state';
@@ -126,7 +129,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 11;
+	static readonly CURRENT_SCHEMA_VERSION = 12;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -181,6 +184,10 @@ export class SqliteStorage implements IStorageBackend {
 			columns: ['session_key']
 		},
 		{ table: 'watchtower_updates', pk: 'id', columns: ['encrypted_blob'] },
+		// Retained outbound wire bytes (recovery outbox): signed commitment
+		// material that reveals channel activity and balances to anyone reading
+		// the database file.
+		{ table: 'recovery_outbox', pk: 'id', columns: ['wire_message'] },
 		// On-chain wallet state (addresses, UTXOs, transactions, balance) is
 		// privacy-sensitive: a stolen DB file must not reveal the wallet's
 		// holdings or address set.
@@ -336,6 +343,19 @@ export class SqliteStorage implements IStorageBackend {
 				payment_hash_hex TEXT PRIMARY KEY,
 				path_id TEXT NOT NULL
 			);
+
+			CREATE TABLE IF NOT EXISTS recovery_outbox (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				peer_pubkey TEXT NOT NULL,
+				channel_id TEXT,
+				message_type INTEGER NOT NULL,
+				wire_message TEXT NOT NULL,
+				disposition TEXT NOT NULL,
+				frame_sequence INTEGER,
+				created_at INTEGER NOT NULL
+			);
+			CREATE INDEX IF NOT EXISTS idx_recovery_outbox_channel
+				ON recovery_outbox(channel_id, id);
 
 			CREATE TABLE IF NOT EXISTS metadata (
 				key TEXT PRIMARY KEY,
@@ -498,7 +518,14 @@ export class SqliteStorage implements IStorageBackend {
 	}
 
 	deleteChannel(id: string): void {
-		this.db.prepare('DELETE FROM channels WHERE channel_id = ?').run(id);
+		// Drop the channel's retained outbound bytes with it: their only consumer
+		// is reestablish retransmission on a channel that no longer exists.
+		this.db.transaction(() => {
+			this.db.prepare('DELETE FROM channels WHERE channel_id = ?').run(id);
+			this.db
+				.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
+				.run(id);
+		})();
 	}
 
 	// ─── Payments ───
@@ -1285,6 +1312,13 @@ export class SqliteStorage implements IStorageBackend {
 				} catch {
 					// Column may already exist (fresh DBs create it in _createTables)
 				}
+			},
+			// Migration 11->12: recovery_outbox table (Recovery Protocol phase 1,
+			// docs/RECOVERY-PROTOCOL.md 5.2). Created via CREATE IF NOT EXISTS
+			// above; wire_message is in ENCRYPTED_COLUMNS, since the retained bytes
+			// are signed commitment material that reveals channel activity.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1490,6 +1524,117 @@ export class SqliteStorage implements IStorageBackend {
 
 	deleteOffer(offerIdHex: string): void {
 		this.db.prepare('DELETE FROM offers WHERE offer_id = ?').run(offerIdHex);
+	}
+
+	// ─── Recovery Outbox (docs/RECOVERY-PROTOCOL.md 5.2) ───
+	// Rows are written INSIDE the same transaction as the state that makes the
+	// message necessary; the socket write happens only after that transaction
+	// commits. wire_message is encrypted at rest (see ENCRYPTED_COLUMNS).
+
+	saveOutboxMessage(message: IRecoveryOutboxMessage): number {
+		const result = this.db
+			.prepare(
+				`INSERT INTO recovery_outbox
+					(peer_pubkey, channel_id, message_type, wire_message, disposition,
+					 frame_sequence, created_at)
+				 VALUES (?, ?, ?, ?, ?, NULL, ?)`
+			)
+			.run(
+				message.peerId,
+				message.channelId ?? null,
+				message.messageType,
+				this._enc(message.wireMessage.toString('hex')),
+				message.disposition,
+				Date.now()
+			);
+		return Number(result.lastInsertRowid);
+	}
+
+	loadOutboxMessages(channelId?: string): IRecoveryOutboxStoredMessage[] {
+		const rows = (
+			channelId
+				? this.db
+						.prepare(
+							'SELECT * FROM recovery_outbox WHERE channel_id = ? ORDER BY id ASC'
+						)
+						.all(channelId)
+				: this.db.prepare('SELECT * FROM recovery_outbox ORDER BY id ASC').all()
+		) as Array<{
+			id: number;
+			peer_pubkey: string;
+			channel_id: string | null;
+			message_type: number;
+			wire_message: string;
+			disposition: string;
+			frame_sequence: number | null;
+			created_at: number;
+		}>;
+
+		const results: IRecoveryOutboxStoredMessage[] = [];
+		for (const row of rows) {
+			try {
+				results.push({
+					id: row.id,
+					peerId: row.peer_pubkey,
+					channelId: row.channel_id ?? undefined,
+					messageType: row.message_type,
+					wireMessage: Buffer.from(this._dec(row.wire_message), 'hex'),
+					disposition: row.disposition as RecoveryOutboxDisposition,
+					frameSequence: row.frame_sequence,
+					createdAt: row.created_at
+				});
+			} catch (err) {
+				// A row we cannot decrypt or decode can only ever be used to
+				// retransmit garbage; skip it and fall back to reconstructing the
+				// retransmission from channel state.
+				this.reportCorruptRow(err);
+			}
+		}
+		return results;
+	}
+
+	countOutboxMessages(channelId: string): number {
+		const row = this.db
+			.prepare('SELECT COUNT(*) as n FROM recovery_outbox WHERE channel_id = ?')
+			.get(channelId) as { n: number };
+		return row.n;
+	}
+
+	setOutboxDisposition(
+		id: number,
+		disposition: RecoveryOutboxDisposition
+	): void {
+		this.db
+			.prepare('UPDATE recovery_outbox SET disposition = ? WHERE id = ?')
+			.run(disposition, id);
+	}
+
+	deleteOutboxMessages(channelId: string, messageTypes?: number[]): void {
+		if (messageTypes && messageTypes.length > 0) {
+			const placeholders = messageTypes.map(() => '?').join(', ');
+			this.db
+				.prepare(
+					`DELETE FROM recovery_outbox
+					 WHERE channel_id = ? AND message_type IN (${placeholders})`
+				)
+				.run(channelId, ...messageTypes);
+			return;
+		}
+		this.db
+			.prepare('DELETE FROM recovery_outbox WHERE channel_id = ?')
+			.run(channelId);
+	}
+
+	pruneOutboxMessages(channelId: string, keepNewest: number): void {
+		this.db
+			.prepare(
+				`DELETE FROM recovery_outbox
+				 WHERE channel_id = ? AND id NOT IN (
+					 SELECT id FROM recovery_outbox
+					 WHERE channel_id = ? ORDER BY id DESC LIMIT ?
+				 )`
+			)
+			.run(channelId, channelId, keepNewest);
 	}
 
 	// ─── Watchtower (LND altruist client) ───

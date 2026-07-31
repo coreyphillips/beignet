@@ -89,6 +89,12 @@ export interface ChannelInfo {
 	 * through the splice (counted in the canonical balance), false = parked.
 	 */
 	payThroughSplice?: boolean;
+	/**
+	 * Whether the connected peer negotiated option_splice + option_quiesce.
+	 * Absent when the peer is disconnected or its init has not arrived, so
+	 * absence means "unknown", never "unsupported".
+	 */
+	peerSupportsSplicing?: boolean;
 	/** Effective routing policy (per-channel override or node defaults) */
 	feeBaseMsat?: number;
 	feeProportionalMillionths?: number;
@@ -812,6 +818,20 @@ export interface BeignetNodeEvents {
 		bolt11: string;
 		amountSats: number;
 	}) => void;
+	/**
+	 * On-chain lifecycle, one appearance and at most one confirmation per
+	 * transaction. `transaction:received` fires when an incoming transaction
+	 * first appears, `transaction:sent` when an outgoing one does; either may
+	 * already carry a height when the transaction was found at a catch-up
+	 * sync after downtime, and no separate confirmation fires for that case.
+	 * `transaction:confirmed` fires only for the transition, a transaction
+	 * the wallet already held moving from the mempool into a block, in
+	 * either direction with `info.type` saying which. Initial-sync history
+	 * does not replay as events.
+	 */
+	'transaction:received': (info: OnchainTxInfo) => void;
+	'transaction:sent': (info: OnchainTxInfo) => void;
+	'transaction:confirmed': (info: OnchainTxInfo) => void;
 	'channel:opening': (data: { channelId: string; fundingTxid: string }) => void;
 	'channel:ready': (data: { channelId: string }) => void;
 	'channel:pending-close': (data: {

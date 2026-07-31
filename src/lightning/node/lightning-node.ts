@@ -22,6 +22,7 @@ import {
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
 import { ChannelManager } from '../channel/channel-manager';
+import { ChannelResult } from '../channel/types';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
 import {
@@ -190,6 +191,12 @@ import {
 	IForwardingEventFilter,
 	IForwardingSummary
 } from '../storage/types';
+import {
+	RecoveryManager,
+	RecoveryCriticality,
+	RecoveryMutation
+} from '../recovery';
+import { IChannelPersistRequest } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
 import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
@@ -373,6 +380,32 @@ export class LightningNode extends EventEmitter {
 	private resourceConfig: Required<IResourceConfig>;
 	private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 	private storage: IStorageBackend | null = null;
+	/** Safety transition committer; null when the node persists nothing. */
+	private recovery: RecoveryManager | null = null;
+	/**
+	 * Channels whose chain monitor changed inside the currently open channel
+	 * transition, so the monitor delta can ride in that same transaction rather
+	 * than landing in a second, independently-crashable write.
+	 */
+	private dirtyMonitors = new Set<string>();
+	/**
+	 * Channels whose monitor delta must NOT be committed on its own, because
+	 * the channel transition it belonged to failed to commit. Writing it alone
+	 * would leave the monitor ahead of the channel state that produced it.
+	 */
+	private monitorsAwaitingChannel = new Set<string>();
+	/**
+	 * Channel ids of the open processActions batches, innermost last. An action
+	 * can re-enter the manager (a forwarded HTLC triggers an add on another
+	 * channel), so this is a stack rather than a single slot.
+	 */
+	private openTransitions: string[] = [];
+	/**
+	 * Mutations a caller staged for the channel transition it is about to
+	 * trigger (a preimage before fulfillHtlc, a forward linkage before
+	 * addHtlc), so both halves land in one transaction.
+	 */
+	private stagedMutations: RecoveryMutation[] = [];
 	private chainWatcher: ChainWatcher | null = null;
 	/**
 	 * The watcher instance these events are wired to, rather than a one-shot
@@ -557,6 +590,25 @@ export class LightningNode extends EventEmitter {
 		this.network = config.network || Network.REGTEST;
 		this.acceptableChainHashes = config.chainHashes ?? [];
 		this.storage = config.storage || null;
+		// Recovery Protocol phase 1: the choke point every safety-critical write
+		// goes through, so channel state, its key index, its chain monitor delta
+		// and the wire bytes they authorize commit as one unit
+		// (docs/RECOVERY-PROTOCOL.md 5.1).
+		this.recovery = this.storage
+			? new RecoveryManager(this.storage, {
+					onError: (err: Error, context): void => {
+						// persistChannel reports its own failures with the channel id
+						// attached, which is strictly more useful; emitting here too
+						// would give a listener two events for one failure.
+						if (context.reportedByCaller) return;
+						this.emit('node:error', {
+							code: 'PERSISTENCE_ERROR',
+							message: `safety transition failed: ${err.message}`,
+							timestamp: Date.now()
+						} as ILightningError);
+					}
+			  })
+			: null;
 
 		this.resourceConfig = {
 			maxCompletedPayments:
@@ -906,6 +958,10 @@ export class LightningNode extends EventEmitter {
 			const channel = new Channel(state);
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
+			// AFTER restoreChannel: markForReestablish resets the splice driver
+			// for non-splicing channels, and that reset clears _lastSentBatch,
+			// so bytes restored before it would be silently wiped.
+			this.restoreOutboxRetransmission(channelId, channel);
 		}
 
 		// Restore payments
@@ -1268,34 +1324,262 @@ export class LightningNode extends EventEmitter {
 
 	// ─────────────── Storage Persist Helpers ───────────────
 
-	private persistChannel(channelId: Buffer): void {
-		if (!this.storage) return;
+	/**
+	 * Commit a channel's safety transition: its state, its key index, any chain
+	 * monitor delta that this same action produced, and the exact wire bytes
+	 * the transition authorizes, all in ONE storage transaction
+	 * (docs/RECOVERY-PROTOCOL.md 5.1).
+	 *
+	 * `request` arrives with the PERSIST_STATE action when the batch has
+	 * messages to send. On failure it is answered with `committed: false`,
+	 * which withholds those sends: a message whose justifying state is not on
+	 * disk must never reach the peer.
+	 */
+	private persistChannel(
+		channelId: Buffer,
+		request?: IChannelPersistRequest
+	): void {
+		if (!this.storage || !this.recovery) return;
 		const channel = this.channelManager.getChannel(channelId);
 		if (!channel) return;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return;
-		try {
-			const channelIdHex = channelId.toString('hex');
-			const keyIndex = channel.channelKeyIndex;
-			// One transaction: channel state persisted without its key index
-			// restores a channel that signs its force-close with the wrong
-			// key, and the row looks complete so nothing flags it.
-			this.storage.transaction(() => {
-				this.storage!.saveChannel(channelIdHex, channel.getFullState(), peer);
-				// Persist per-channel key index so the correct signing key
-				// is restored after restart (fixes force-close signature mismatch)
-				if (keyIndex != null) {
-					this.storage!.saveChannelKeyIndex(channelIdHex, keyIndex);
-				}
+
+		const channelIdHex = channelId.toString('hex');
+		const keyIndex = channel.channelKeyIndex;
+		// Channel state persisted without its key index restores a channel that
+		// signs its force-close with the wrong key, and the row looks complete
+		// so nothing flags it. Persisted without the monitor delta this same
+		// action produced, the two disagree about what has been revoked.
+		const mutations: RecoveryMutation[] = [
+			{
+				type: 'channel_state',
+				channelId: channelIdHex,
+				state: channel.getFullState(),
+				peerPubkey: peer
+			}
+		];
+		if (keyIndex != null) {
+			mutations.push({
+				type: 'channel_key_index',
+				channelId: channelIdHex,
+				channelIndex: keyIndex
 			});
-		} catch (err) {
+		}
+		const monitorMutation = this.takeDirtyMonitorMutation(channelIdHex);
+		if (monitorMutation) mutations.push(monitorMutation);
+		// A peer-proven outbox supersede (its revoke_and_ack acknowledged the
+		// rows) deletes IN this same transaction: on rollback the rows survive
+		// alongside the pre-revoke state that still needs them.
+		if (request?.supersede) {
+			mutations.push({
+				type: 'outbox_supersede',
+				channelId: channelIdHex,
+				messageTypes: request.supersede.messageTypes
+			});
+		}
+		// Whatever the caller staged for this transition (preimage before a
+		// fulfill, linkage before a forward) commits with it or not at all.
+		const staged = this.takeStagedMutations();
+		mutations.push(...staged);
+
+		const result = this.recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations,
+			outboundMessages: request?.outbound ?? [],
+			reportedByCaller: true
+		});
+
+		if (request) {
+			request.committed = result.committed;
+			request.outboxIds = result.released.map((r) => r.id);
+		}
+		if (!result.committed) {
+			// Everything rolled back together: re-arm the monitor delta and put
+			// the staged mutations back rather than dropping writes the caller
+			// believes it made. Staged mutations are retried immediately by the
+			// enclosing withStagedMutations flush (standalone durability now if
+			// storage recovered) and stay staged for the next transition if
+			// that fails too.
+			//
+			// The monitor delta is re-armed, NOT flushed on its own: writing it
+			// by itself now would put the revocation on disk while the channel
+			// state that produced it stayed behind, which is precisely the
+			// channel/monitor disagreement this whole path exists to prevent.
+			// It retries as a COMBINED channel+monitor commit on the next
+			// monitor update (see persistMonitorAlone) or channel transition.
+			if (monitorMutation) {
+				this.dirtyMonitors.add(channelIdHex);
+				this.monitorsAwaitingChannel.add(channelIdHex);
+			}
+			if (staged.length) this.stagedMutations.unshift(...staged);
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
-				message: `Failed to persist channel: ${(err as Error).message}`,
+				message: `Failed to persist channel: ${result.error?.message}`,
 				timestamp: Date.now()
 			} as ILightningError);
 		}
+	}
+
+	/**
+	 * Hand a restored channel the exact wire bytes of the un-acked commitment
+	 * batch it sent before the restart, from the recovery outbox
+	 * (docs/RECOVERY-PROTOCOL.md 5.2).
+	 *
+	 * This is the case the in-memory cache cannot cover: after a restart the
+	 * reestablish fallback can only rebuild the batch by re-signing, which it
+	 * refuses to do for a taproot channel, since a fresh MuSig2 secret nonce
+	 * must never sign material the peer may already hold under the old one.
+	 * Replaying stored bytes signs nothing.
+	 *
+	 * Only the LAST start_batch group is restored: earlier ones are, by
+	 * definition, superseded by it.
+	 */
+	private restoreOutboxRetransmission(
+		channelIdHex: string,
+		channel: Channel
+	): void {
+		if (!this.recovery) return;
+		const rows = this.recovery.getOutbox(channelIdHex);
+		if (rows.length === 0) return;
+
+		let startBatch: Buffer | null = null;
+		let commitments: Buffer[] = [];
+		for (const row of rows) {
+			if (row.messageType === MessageType.START_BATCH) {
+				// A later batch supersedes anything collected so far.
+				startBatch = row.wireMessage;
+				commitments = [];
+				continue;
+			}
+			if (startBatch && row.messageType === MessageType.COMMITMENT_SIGNED) {
+				commitments.push(row.wireMessage);
+			}
+		}
+		if (startBatch && commitments.length > 0) {
+			channel.restoreLastSentBatch(startBatch, commitments);
+			this.emitStructuredLog('channel', 'outbox_retransmission_restored', {
+				channelId: channelIdHex,
+				commitments: commitments.length
+			});
+		}
+	}
+
+	/**
+	 * Run `fn` with `mutations` staged, so the next channel transition it
+	 * triggers commits them in the SAME storage transaction as the channel
+	 * state and the wire message it authorizes.
+	 *
+	 * This is what removes the caller-discipline hazard the Recovery Protocol
+	 * calls out (5.1): a preimage saved just before fulfillHtlc, or a forward
+	 * linkage saved just before addHtlc, used to be a separate write that a
+	 * crash could land without the other half. Anything still staged when `fn`
+	 * returns is committed on its own, so a path that persists nothing else
+	 * never silently drops it.
+	 *
+	 * If `fn` re-enters and persists a DIFFERENT channel first, the staged
+	 * mutations ride with that transition instead. Atomicity is unaffected
+	 * (they still commit all-or-nothing with a channel advance); only the
+	 * grouping is less tight than the ideal.
+	 */
+	private withStagedMutations(
+		mutations: RecoveryMutation[],
+		fn: () => void
+	): void {
+		if (!this.recovery) {
+			fn();
+			return;
+		}
+		this.stagedMutations.push(...mutations);
+		try {
+			fn();
+		} finally {
+			this.flushStagedMutations();
+		}
+	}
+
+	/** Take everything staged, leaving the stage empty. */
+	private takeStagedMutations(): RecoveryMutation[] {
+		if (this.stagedMutations.length === 0) return [];
+		return this.stagedMutations.splice(0, this.stagedMutations.length);
+	}
+
+	/** Commit any mutations no channel transition picked up. */
+	private flushStagedMutations(): void {
+		const mutations = this.takeStagedMutations();
+		if (mutations.length === 0 || !this.recovery) return;
+		const result = this.recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations,
+			outboundMessages: []
+		});
+		if (!result.committed) {
+			// Keep them staged so the next transition (or the next flush)
+			// retries, rather than silently dropping writes the caller believes
+			// it made. The failure itself is surfaced by the manager's onError
+			// hook; what must not happen is a preimage for value already paid
+			// downstream evaporating because one standalone commit failed.
+			this.stagedMutations.unshift(...mutations);
+		}
+	}
+
+	/**
+	 * Pull a channel's pending chain monitor state so it can ride in that
+	 * channel's transition, clearing the dirty mark. Returns null when the
+	 * monitor has no undelivered change.
+	 */
+	private takeDirtyMonitorMutation(
+		channelIdHex: string
+	): RecoveryMutation | null {
+		if (!this.dirtyMonitors.has(channelIdHex)) return null;
+		const monitor = this.channelManager.getMonitor(
+			Buffer.from(channelIdHex, 'hex')
+		);
+		this.dirtyMonitors.delete(channelIdHex);
+		this.monitorsAwaitingChannel.delete(channelIdHex);
+		if (!monitor) return null;
+		return {
+			type: 'chain_monitor',
+			channelId: channelIdHex,
+			state: monitor.getFullState()
+		};
+	}
+
+	/**
+	 * Persist a chain monitor on its own, for updates with no causally linked
+	 * channel action (block arrival, funding spend detection).
+	 */
+	private persistMonitorAlone(channelIdHex: string): void {
+		if (!this.recovery) return;
+		// Held back by a failed channel transition: retry as a COMBINED
+		// channel+monitor commit instead of refusing outright. On a closing
+		// channel this monitor update (the next block) may be the only event
+		// that ever fires again, so refusing here would park every sweep and
+		// justice delta in memory until a channel message that never comes;
+		// the combined commit keeps the no-monitor-ahead-of-channel invariant
+		// AND gives the failed persist its retry.
+		if (this.monitorsAwaitingChannel.has(channelIdHex)) {
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			if (
+				this.channelManager.getChannel(channelId) &&
+				this.channelManager.getPeerForChannel(channelId)
+			) {
+				this.persistChannel(channelId);
+				return;
+			}
+			// The channel is gone from the manager, so there is no channel
+			// state left to pair with; release the hold and let the monitor
+			// commit on its own below.
+			this.monitorsAwaitingChannel.delete(channelIdHex);
+		}
+		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
+		if (!mutation) return;
+		this.recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [mutation],
+			outboundMessages: []
+		});
 	}
 
 	private persistPayment(paymentHash: Buffer): void {
@@ -1494,6 +1778,17 @@ export class LightningNode extends EventEmitter {
 			if (transitioned) {
 				this.persistChannel(channelId);
 			}
+			// Retained wire bytes exist for one purpose, retransmission on a
+			// channel that can still exchange messages. A fully resolved close
+			// can never reestablish, so the rows are dead weight: signed
+			// commitment material sitting encrypted in the database with no
+			// consumer, kept for the lifetime of the node.
+			this.recovery?.clearChannelOutbox(channelId.toString('hex'));
+			// A terminal channel also retires its monitor bookkeeping: a
+			// lingering awaiting-channel hold would otherwise block standalone
+			// monitor commits for this id forever.
+			this.dirtyMonitors.delete(channelId.toString('hex'));
+			this.monitorsAwaitingChannel.delete(channelId.toString('hex'));
 			// Every output of the close is irrevocably resolved — a commitment
 			// swap is no longer possible, so the funding watch can be retired
 			// (memory cleanup for long-lived nodes).
@@ -1515,6 +1810,14 @@ export class LightningNode extends EventEmitter {
 		// announcement_signatures first.
 		this.channelManager.on('splice:complete', (channelId: Buffer) => {
 			this.persistChannel(channelId);
+			// The splice negotiation is over: its splice/splice_ack rows can
+			// never be retransmitted again (reestablish resumes a splice from
+			// channel state, never from these bytes), and nothing else retires
+			// them, so a long-lived channel would accrue one pair per splice.
+			this.recovery?.supersedeChannelOutbox(channelId.toString('hex'), [
+				MessageType.SPLICE,
+				MessageType.SPLICE_ACK
+			]);
 			this.emitStructuredLog('channel', 'splice_complete', {
 				channelId: channelId.toString('hex')
 			});
@@ -1557,10 +1860,72 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
-		// Persist-before-send: channel state persisted via PERSIST_STATE action (Fix 2.2)
-		this.channelManager.on('channel:persist', (channelId: Buffer) => {
-			this.persistChannel(channelId);
+		// Persist-before-send: channel state, its key index, any monitor delta
+		// this same action produced, and the wire bytes it authorizes all commit
+		// in one transaction; the sends are released only if it commits.
+		this.channelManager.on(
+			'channel:persist',
+			(channelId: Buffer, request?: IChannelPersistRequest) => {
+				this.persistChannel(channelId, request);
+			}
+		);
+
+		// A processActions batch is open: monitor changes it causes belong in
+		// that channel's transition rather than in a second, separate write.
+		this.channelManager.on(
+			'transition:begin',
+			(channelIdHex: string | null) => {
+				this.openTransitions.push(channelIdHex ?? '');
+			}
+		);
+		this.channelManager.on('transition:end', (channelIdHex: string | null) => {
+			this.openTransitions.pop();
+			// The batch produced a monitor change but no PERSIST_STATE to carry
+			// it. Flush it now, still inside the same synchronous turn, so
+			// nothing is deferred past the actions that caused it. NOT while an
+			// ENCLOSING transition for the same channel is still open (nested
+			// batches re-enter): its persist has not run yet, and flushing here
+			// would commit the monitor ahead of the channel state it belongs to.
+			if (
+				channelIdHex &&
+				this.dirtyMonitors.has(channelIdHex) &&
+				!this.openTransitions.includes(channelIdHex)
+			) {
+				this.persistMonitorAlone(channelIdHex);
+			}
 		});
+
+		// Outbox rows reached the socket; record it for reestablish accounting.
+		this.channelManager.on('outbox:sent', (ids: Array<number | null>) => {
+			this.recovery?.markSent(ids);
+		});
+
+		// A failed persist withheld a batch's sends. Nothing re-queues them on
+		// this connection; the reestablish exchange after a reconnect is what
+		// retries the persist and replays them from durable state. Force that
+		// reconnect rather than deadlocking a live connection on the PEER's
+		// commitment timeout: the peer may wait indefinitely for a revoke or
+		// commitment we withheld, riding every in-flight HTLC to its CLTV.
+		this.channelManager.on(
+			'transition:blocked',
+			(peerPubkey: string, channelId: Buffer | null) => {
+				this.emitStructuredLog('channel', 'transition_blocked', {
+					peerPubkey,
+					channelId: channelId?.toString('hex')
+				});
+				if (!this.peerManager) return;
+				// Deferred: the blocked batch may still be unwinding through
+				// nested dispatches; tearing the peer down mid-turn would pull
+				// state out from under them.
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
+			}
+		);
 
 		this.channelManager.on(
 			'message:outbound',
@@ -1666,18 +2031,22 @@ export class LightningNode extends EventEmitter {
 			});
 		});
 
-		// Persist chain monitor state on updates
+		// Persist chain monitor state on updates. A monitor change produced by a
+		// channel action (commitment advance, HTLC resolution) is marked dirty
+		// and rides in that channel's transition, so the two can never disagree
+		// after a crash; a standalone change (new block, funding spend seen)
+		// commits immediately as its own transition, exactly as before.
 		this.channelManager.on(
 			'monitor:updated',
-			(channelIdHex: string, monitor: ChainMonitor) => {
-				this.safeStorage(
-					() =>
-						this.storage!.saveChainMonitor(
-							channelIdHex,
-							monitor.getFullState()
-						),
-					'saveChainMonitor'
-				);
+			(channelIdHex: string, _monitor: ChainMonitor) => {
+				this.dirtyMonitors.add(channelIdHex);
+				// ANY open transition for this channel claims the delta, not just
+				// the innermost: a nested batch for another channel can sit on
+				// top of the stack while this channel's own transition is still
+				// open below it, and committing the monitor standalone then
+				// would put it ahead of the channel state it belongs to.
+				if (this.openTransitions.includes(channelIdHex)) return;
+				this.persistMonitorAlone(channelIdHex);
 			}
 		);
 
@@ -5402,6 +5771,36 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Whether splicing is negotiated with a peer: option_splice and
+	 * option_quiesce on BOTH feature vectors, ours and the one its current
+	 * connection's init carries. Negotiation is mutual, and the local half is
+	 * not hypothetical: localFeatures is caller configuration, and a node
+	 * configured without splicing must not report a channel as spliceable just
+	 * because the peer across it is willing. Null when there is nothing to
+	 * read: the peer is not connected, or its init has not arrived yet. This
+	 * is the same answer _validateSpliceRequest enforces, exposed so a client
+	 * can know before it asks; a UI offering splice controls against an LND
+	 * peer is offering an action the daemon will refuse every time.
+	 */
+	peerSupportsSplicing(peerPubkey: string): boolean | null {
+		// The local half is known without asking anyone, so it is decided
+		// first: a node that did not negotiate quiescence cannot splice with
+		// any peer, and answering null here would misreport a certainty as
+		// unknown, leaving clients to keep offering what the pre-flight is
+		// certain to refuse.
+		const localSupportsSplicing =
+			this.localFeatures.hasFeature(Feature.QUIESCE) &&
+			this.localFeatures.hasFeature(Feature.SPLICE);
+		if (!localSupportsSplicing) return false;
+		const init = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		if (!init) return null;
+		return (
+			init.features.hasFeature(Feature.QUIESCE) &&
+			init.features.hasFeature(Feature.SPLICE)
+		);
+	}
+
+	/**
 	 * Shared splice pre-flight checks: dust-level amounts and peer feature
 	 * support (option_splice + option_quiesce). Returns an error string or null.
 	 */
@@ -5413,15 +5812,15 @@ export class LightningNode extends EventEmitter {
 			return `splice amount ${amountSats} sats is at or below the dust floor (${LightningNode.SPLICE_MIN_AMOUNT_SATS} sats)`;
 		}
 		const peerPubkey = this.channelManager.getPeerForChannel(channelId);
-		if (peerPubkey && this.peerManager) {
-			const init = this.peerManager.getPeer(peerPubkey)?.getRemoteInit();
-			if (
-				init &&
-				(!init.features.hasFeature(Feature.QUIESCE) ||
-					!init.features.hasFeature(Feature.SPLICE))
-			) {
-				return 'peer does not support splicing (option_splice/option_quiesce not negotiated)';
-			}
+		// Unknown support (no init to read) passes, as it always has: the
+		// splice will fail on its own if the peer truly cannot, and refusing on
+		// ignorance would block splices on reconnecting channels.
+		// Not negotiated is the honest phrasing: the missing half can be the
+		// peer's (an LND node) or our own (localFeatures configured without
+		// splicing), and blaming the peer for a local configuration sends
+		// whoever reads the error to debug the wrong node.
+		if (peerPubkey && this.peerSupportsSplicing(peerPubkey) === false) {
+			return 'splicing is not negotiated with this peer (option_splice/option_quiesce required on both sides)';
 		}
 		return null;
 	}
@@ -9305,15 +9704,28 @@ export class LightningNode extends EventEmitter {
 			payment.completedAt = Date.now();
 		}
 
-		// Persist BEFORE sending fulfill message — on crash, reestablish retransmits
-		if (this.storage) {
-			this.storage.transaction(() => {
-				this.storage!.deletePaymentSecret(hashHex);
-				this.persistPayment(paymentHash);
-			});
-		}
-
-		this.channelManager.fulfillHtlc(channelId, htlcId, preimage);
+		// Persist BEFORE sending fulfill message: on crash, reestablish
+		// retransmits. The payment record, the consumed payment secret and the
+		// fulfill message now commit as ONE transition rather than as a
+		// transaction followed by an independent send.
+		const settledPayment = this.payments.get(hashHex);
+		this.withStagedMutations(
+			[
+				{ type: 'delete_payment_secret', paymentHash: hashHex },
+				...(settledPayment
+					? [
+							{
+								type: 'payment_state' as const,
+								paymentHash: hashHex,
+								payment: settledPayment
+							}
+					  ]
+					: [])
+			],
+			() => {
+				this.channelManager.fulfillHtlc(channelId, htlcId, preimage);
+			}
+		);
 		// Note: commitment_signed is NOT sent here — it's sent by
 		// ChannelManager.handleRevokeAndAck after detecting FULFILLED HTLCs.
 		// The htlc:forwarded event fires synchronously during handleRevokeAndAck
@@ -9558,23 +9970,30 @@ export class LightningNode extends EventEmitter {
 				: 0n;
 			const outKey = `${outChannelId.toString('hex')}:offered-${outHtlcId}`;
 			this.forwardedHtlcs.set(outKey, { inChannelId, inHtlcId });
-			this.safeStorage(
-				() => this.storage!.saveForwardedHtlc(outKey, inChannelId, inHtlcId),
-				'saveForwardedHtlc'
+
+			// The linkage and the outgoing add are ONE safety transition
+			// (docs/RECOVERY-PROTOCOL.md 5.1): a crash between them would leave
+			// an HTLC in flight downstream with no record of the inbound leg it
+			// pays for, so the downstream preimage could never be applied
+			// upstream and the forwarded value would be lost.
+			let result: ChannelResult | null = null;
+			this.withStagedMutations(
+				[{ type: 'forwarded_htlc', outKey, inChannelId, inHtlcId }],
+				() => {
+					// For a blinded forward, hand the next hop its blinding point and
+					// use the payment_relay-derived amount/CLTV.
+					result = this.channelManager.addHtlc(
+						outChannelId,
+						forwardAmount,
+						paymentHash,
+						forwardCltv,
+						nextOnionBuf,
+						nextBlindingPoint
+					);
+				}
 			);
 
-			// For a blinded forward, hand the next hop its blinding point and use the
-			// payment_relay-derived amount/CLTV.
-			const result = this.channelManager.addHtlc(
-				outChannelId,
-				forwardAmount,
-				paymentHash,
-				forwardCltv,
-				nextOnionBuf,
-				nextBlindingPoint
-			);
-
-			if (!result.ok) {
+			if (!result || !(result as ChannelResult).ok) {
 				// Forward failed — fail the incoming HTLC back. Drop the persisted
 				// row too, not just the in-memory one: the outgoing id was read off
 				// localHtlcCounter before the add, and a refused add does not consume
@@ -9667,7 +10086,16 @@ export class LightningNode extends EventEmitter {
 					continue;
 				if (!htlc.paymentHash.equals(paymentHash)) continue;
 				this.cleanupHtlcSharedSecret(`${cid.toString('hex')}:${htlc.id}`);
-				this.channelManager.fulfillHtlc(cid, htlc.id, preimage);
+				// Re-stage the preimage with the fulfill it authorizes. The
+				// save above already ran, but staging makes the pairing
+				// structural instead of leaving it to the ordering of two
+				// independent writes.
+				this.withStagedMutations(
+					[{ type: 'payment_preimage', paymentHash: hashHex, preimage }],
+					() => {
+						this.channelManager.fulfillHtlc(cid, htlc.id, preimage);
+					}
+				);
 				// Drop any forwarding bookkeeping for the matching outgoing leg.
 				for (const [outKey, fwd] of this.forwardedHtlcs) {
 					if (fwd.inChannelId.equals(cid) && fwd.inHtlcId === htlc.id) {
@@ -9784,15 +10212,26 @@ export class LightningNode extends EventEmitter {
 			// Both legs of the forward settle here: record the ledger entry now,
 			// while both HTLC entries still exist (they are dropped on revoke)
 			this.recordForwardingEvent(channelId, htlcId, forward);
-			// Persist before sending upstream fulfill
-			this.safeStorage(
-				() => this.storage!.deleteForwardedHtlc(outKey),
-				'deleteForwardedHtlc'
-			);
-			this.channelManager.fulfillHtlc(
-				forward.inChannelId,
-				forward.inHtlcId,
-				preimage
+			// The preimage, the closed-out linkage and the upstream fulfill are
+			// ONE transition: this is the preimage that lets us claim the
+			// inbound leg for value we have already paid downstream, so it must
+			// never be on the wire without being on disk.
+			this.withStagedMutations(
+				[
+					{
+						type: 'payment_preimage',
+						paymentHash: preimageHash.toString('hex'),
+						preimage
+					},
+					{ type: 'delete_forwarded_htlc', outKey }
+				],
+				() => {
+					this.channelManager.fulfillHtlc(
+						forward.inChannelId,
+						forward.inHtlcId,
+						preimage
+					);
+				}
 			);
 			this.forwardedHtlcs.delete(outKey);
 			this.persistChannel(channelId);

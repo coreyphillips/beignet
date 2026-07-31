@@ -48,7 +48,14 @@ import {
 	decodeSpliceLockedMessage,
 	decodeStartBatchMessage
 } from '../message/splice';
-import { ChannelAction, ChannelActionType } from './channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType,
+	IChannelPersistRequest,
+	ISendMessageAction,
+	RETRANSMITTABLE_MESSAGE_TYPES,
+	SUPERSEDED_ON_REVOKE_MESSAGE_TYPES
+} from './channel-actions';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChainMonitor } from '../chain/chain-monitor';
 import {
@@ -273,6 +280,16 @@ export class ChannelManager extends EventEmitter {
 	private fundingProvider: IFundingProvider | null = null;
 	/** Cached local node id (pubkey) for the tx_signatures ordering tie-break. */
 	private localNodeIdCache: Buffer | null = null;
+	/**
+	 * A recovery-outbox supersede staged by handleRevokeAndAck for the batch
+	 * it is about to process, consumed by processActions into that batch's
+	 * persist request so the row deletions commit in the same transaction as
+	 * the revoke's channel state (never eagerly, never on a failed persist).
+	 */
+	private _pendingOutboxSupersede: {
+		channelIdHex: string;
+		messageTypes: number[];
+	} | null = null;
 
 	constructor(config: IChannelManagerConfig) {
 		super();
@@ -2240,12 +2257,35 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleRevokeAndAck(msg);
+		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
+
+		// Recovery outbox: the peer's revocation proves it holds every update we
+		// sent and the commitment_signed that covered them, so BOLT 2 can never
+		// ask us to retransmit them again. This mirrors channel.ts clearing its
+		// in-memory _lastSentBatch on the same event, and is what keeps the
+		// table bounded to roughly one commitment round per channel.
+		//
+		// The supersede is STAGED here rather than executed: processActions
+		// folds it into the batch's persist request, so the row deletions
+		// commit in the SAME transaction as the revoke's channel state. Deleted
+		// eagerly, a persist failure (or a crash before the commit) would leave
+		// disk holding pre-revoke state whose retransmission bytes are already
+		// gone. Staging it before dispatch also keeps the original re-entrancy
+		// property: the persist runs at the batch's leading PERSIST_STATE,
+		// before any re-entrant dispatch can insert rows for messages the peer
+		// has proven nothing about.
+		if (!hadError && channel.getChannelId()) {
+			this._pendingOutboxSupersede = {
+				channelIdHex: channel.getChannelId()!.toString('hex'),
+				messageTypes: [...SUPERSEDED_ON_REVOKE_MESSAGE_TYPES]
+			};
+		}
+
 		this.processActions(peerPubkey, channel, actions);
 
 		// Watchtower: on a clean revocation, hand the just-revoked remote
 		// commitment tx (if we cached it) to any listener so it can ship justice
 		// data to towers before the peer can broadcast the breach.
-		const hadError = actions.some((a) => a.type === ChannelActionType.ERROR);
 		if (!hadError) {
 			const revokedTx = channel.takeRevokedCommitmentTx(
 				msg.perCommitmentSecret
@@ -4371,9 +4411,109 @@ export class ChannelManager extends EventEmitter {
 					0
 			);
 		}
+
+		// ── Structural persist-before-send (Recovery Protocol 5.1/5.2) ──
+		// Every retransmittable SEND_MESSAGE that FOLLOWS the batch's
+		// PERSIST_STATE is authorized by the state that persist writes, so its
+		// exact wire bytes are handed to the persist listener and committed in
+		// the SAME transaction. Ordering safety no longer rests on each handler
+		// happening to place PERSIST_STATE before its sends: a send whose
+		// justifying state failed to commit is withheld outright.
+		const batchChannelId = channel.getChannelId();
+		const persistIndex = actions.findIndex(
+			(a) => a.type === ChannelActionType.PERSIST_STATE
+		);
+		const persistRequest: IChannelPersistRequest | null =
+			persistIndex >= 0 && batchChannelId
+				? {
+						outbound: actions
+							.slice(persistIndex + 1)
+							.filter(
+								(a): a is ISendMessageAction =>
+									a.type === ChannelActionType.SEND_MESSAGE &&
+									// A replay is already in the outbox from its original
+									// send; storing it again on every reconnect would churn
+									// the table without making anything more recoverable.
+									a.replay !== true &&
+									RETRANSMITTABLE_MESSAGE_TYPES.has(a.messageType)
+							)
+							.map((a) => ({
+								peerId: peerPubkey,
+								channelId: batchChannelId.toString('hex'),
+								messageType: a.messageType,
+								wireMessage: a.payload,
+								disposition: 'pending_send' as const
+							})),
+						committed: true,
+						outboxIds: []
+				  }
+				: null;
+		// Fold a staged revoke supersede into this batch's persist request so
+		// the row deletions ride the same transaction as the channel state.
+		// Cleared unconditionally: it was staged for exactly this batch, and a
+		// batch it cannot ride with must not delete anything (rows are only
+		// ever retired by a transition that actually committed).
+		const pendingSupersede = this._pendingOutboxSupersede;
+		this._pendingOutboxSupersede = null;
+		if (
+			pendingSupersede &&
+			persistRequest &&
+			batchChannelId &&
+			pendingSupersede.channelIdHex === batchChannelId.toString('hex')
+		) {
+			persistRequest.supersede = {
+				messageTypes: pendingSupersede.messageTypes
+			};
+		}
+		// Set once a persist fails: nothing that persist authorized may go out.
+		let sendsBlocked = false;
+
+		this.emit('transition:begin', batchChannelId?.toString('hex') ?? null);
+		try {
+			this._dispatchActions(
+				peerPubkey,
+				channel,
+				actions,
+				persistRequest,
+				() => sendsBlocked,
+				(blocked: boolean) => {
+					sendsBlocked = blocked;
+				}
+			);
+			if (!sendsBlocked && persistRequest && persistRequest.outboxIds.length) {
+				this.emit('outbox:sent', persistRequest.outboxIds);
+			}
+		} finally {
+			this.emit('transition:end', batchChannelId?.toString('hex') ?? null);
+		}
+		// A failed persist withheld this batch's sends. The messages are gone
+		// from this connection (nothing re-queues them), so the ONLY way they
+		// reach the peer is the reestablish path after a reconnect, which also
+		// retries the persist. Surface that so the node can force the
+		// disconnect instead of deadlocking a live connection on a peer
+		// timeout we do not control.
+		if (sendsBlocked) {
+			this.emit('transition:blocked', peerPubkey, batchChannelId);
+		}
+	}
+
+	private _dispatchActions(
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[],
+		persistRequest: IChannelPersistRequest | null,
+		sendsBlocked: () => boolean,
+		setSendsBlocked: (blocked: boolean) => void
+	): void {
+		let persistSeen = false;
 		for (const action of actions) {
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
+					// A message the failed persist authorized must not reach the
+					// peer: the state that justifies it is not on disk.
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
 					// BOLT 1: the SENDER of an error must fail the channel too. A
 					// channel that just emitted a wire error and sits ERRORED (peer
@@ -4457,9 +4597,20 @@ export class ChannelManager extends EventEmitter {
 					}
 					break;
 				case ChannelActionType.BROADCAST_TX:
+					// A transaction the failed persist authorized must not reach
+					// the network either: a splice or funding tx broadcast whose
+					// justifying state never hit disk is exactly the "network saw
+					// a tx we have no record of" crash the persist-first comments
+					// at the producers promise to prevent.
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
 					this.emit('broadcast:tx', action.tx);
 					break;
 				case ChannelActionType.FORCE_CLOSE:
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
 					this.emit('force:close', action.channelId, action.commitmentTx);
 					break;
 				case ChannelActionType.WATCH_OUTPUT:
@@ -4480,10 +4631,26 @@ export class ChannelManager extends EventEmitter {
 					);
 					break;
 				case ChannelActionType.PERSIST_STATE:
+					// One commit per batch. Channel methods mutate state fully
+					// while BUILDING the action array, so every PERSIST_STATE in
+					// a batch would write the identical state; batches composed
+					// from helpers that each lead with their own persist (the v2
+					// open and splice signing flows) used to re-commit the same
+					// outbound list once per marker, duplicating its outbox rows.
+					if (persistSeen) {
+						break;
+					}
+					persistSeen = true;
 					this.emit(
 						'channel:persist',
-						channel.getChannelId() || channel.getTemporaryChannelId()
+						channel.getChannelId() || channel.getTemporaryChannelId(),
+						persistRequest ?? undefined
 					);
+					// No listener (or no storage) leaves committed true, which is
+					// the pre-outbox behavior for a node that persists nothing.
+					if (persistRequest && !persistRequest.committed) {
+						setSendsBlocked(true);
+					}
 					break;
 				case ChannelActionType.SPLICE_COMPLETE:
 					this.emit('splice:complete', channel.getChannelId());

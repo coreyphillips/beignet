@@ -14,6 +14,7 @@ import {
 	estimateSpliceTxWeight,
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
+import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -38,7 +39,7 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 
 const FUNDING_SATOSHIS = 1_000_000n;
 
-function createTestNode(): LightningNode {
+function createTestNode(localFeatures?: FeatureFlags): LightningNode {
 	const seed = crypto
 		.createHash('sha256')
 		.update('splice-validation-node')
@@ -55,7 +56,8 @@ function createTestNode(): LightningNode {
 			.update(seed)
 			.update(Buffer.from([0]))
 			.digest(),
-		network: Network.REGTEST
+		network: Network.REGTEST,
+		...(localFeatures ? { localFeatures } : {})
 	});
 	node.on('error', () => {});
 	node.on('node:error', () => {});
@@ -186,6 +188,128 @@ describe('LightningNode splice validation', function () {
 		);
 		expect(channel._spliceOutDestination.script.equals(externalScript)).to.be
 			.true;
+		node.destroy();
+	});
+});
+
+describe('LightningNode peerSupportsSplicing', function () {
+	const PEER = '02'.padEnd(66, 'ab');
+	const withInit = (node: LightningNode, features: FeatureFlags | null) => {
+		(node as any).peerManager = {
+			getPeer: () =>
+				features === null ? undefined : { getRemoteInit: () => ({ features }) },
+			destroy: () => {}
+		};
+	};
+
+	it('is null when there is nothing to read', function () {
+		const node = createTestNode();
+		expect(node.peerSupportsSplicing(PEER), 'no peer manager yet').to.be.null;
+		withInit(node, null);
+		expect(node.peerSupportsSplicing(PEER), 'peer not connected').to.be.null;
+		node.destroy();
+	});
+
+	it('reads the negotiated features, not a guess', function () {
+		const node = createTestNode();
+		const both = new FeatureFlags();
+		both.setOptional(Feature.QUIESCE);
+		both.setOptional(Feature.SPLICE);
+		withInit(node, both);
+		expect(node.peerSupportsSplicing(PEER)).to.be.true;
+
+		// splice without quiesce is not splicing support: stfu is the first
+		// message of every splice, so both bits are required, same as the
+		// validation this mirrors.
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		withInit(node, spliceOnly);
+		expect(node.peerSupportsSplicing(PEER)).to.be.false;
+
+		withInit(node, new FeatureFlags());
+		expect(node.peerSupportsSplicing(PEER)).to.be.false;
+		node.destroy();
+	});
+
+	it('is what the splice pre-flight enforces: an LND-shaped peer refuses', function () {
+		const node = createTestNode();
+		const channelId = injectNormalChannel(node);
+		// LND advertises neither option_splice nor option_quiesce.
+		withInit(node, new FeatureFlags());
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.ok).to.be.false;
+		expect(result.error).to.include('not negotiated');
+		node.destroy();
+	});
+
+	// Negotiation is mutual. localFeatures is caller configuration, so a node
+	// configured without splicing must not report a channel spliceable just
+	// because the peer across it is willing: the daemon would advertise a
+	// capability its own init never offered, and the splice would die at stfu.
+	it('is false when the remote is willing but our own features are not', () => {
+		const remote = new FeatureFlags();
+		remote.setOptional(Feature.QUIESCE);
+		remote.setOptional(Feature.SPLICE);
+
+		const noQuiesce = new FeatureFlags();
+		noQuiesce.setOptional(Feature.SPLICE);
+		const nodeNoQuiesce = createTestNode(noQuiesce);
+		withInit(nodeNoQuiesce, remote);
+		expect(nodeNoQuiesce.peerSupportsSplicing(PEER)).to.be.false;
+		nodeNoQuiesce.destroy();
+
+		const noSplice = new FeatureFlags();
+		noSplice.setOptional(Feature.QUIESCE);
+		const nodeNoSplice = createTestNode(noSplice);
+		withInit(nodeNoSplice, remote);
+		expect(nodeNoSplice.peerSupportsSplicing(PEER)).to.be.false;
+		nodeNoSplice.destroy();
+
+		// And the default features do negotiate it, so a stock node against a
+		// willing peer still answers true.
+		const stock = createTestNode();
+		withInit(stock, remote);
+		expect(stock.peerSupportsSplicing(PEER)).to.be.true;
+		stock.destroy();
+	});
+
+	// A missing remote init means unknown only when the local half is capable.
+	// Local incapability is a certainty no amount of remote information can
+	// overturn, so it must not hide behind null while the peer is offline.
+	it('local incapability is false even with no remote init to read', () => {
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		const noQuiesce = createTestNode(spliceOnly);
+		expect(noQuiesce.peerSupportsSplicing(PEER)).to.be.false;
+		noQuiesce.destroy();
+
+		const quiesceOnly = new FeatureFlags();
+		quiesceOnly.setOptional(Feature.QUIESCE);
+		const noSplice = createTestNode(quiesceOnly);
+		expect(noSplice.peerSupportsSplicing(PEER)).to.be.false;
+		noSplice.destroy();
+
+		const both = new FeatureFlags();
+		both.setOptional(Feature.QUIESCE);
+		both.setOptional(Feature.SPLICE);
+		const capable = createTestNode(both);
+		expect(
+			capable.peerSupportsSplicing(PEER),
+			'a capable node with no init to read is genuinely unknown'
+		).to.be.null;
+		capable.destroy();
+	});
+
+	it('the pre-flight refuses a splice on local incapability alone', () => {
+		const spliceOnly = new FeatureFlags();
+		spliceOnly.setOptional(Feature.SPLICE);
+		const node = createTestNode(spliceOnly);
+		const channelId = injectNormalChannel(node);
+		// No peer manager stub at all: the peer is unreachable, and the
+		// refusal must not wait to hear from it.
+		const result = node.spliceIn(channelId, 100_000n, 253);
+		expect(result.ok).to.be.false;
+		expect(result.error).to.include('not negotiated');
 		node.destroy();
 	});
 });

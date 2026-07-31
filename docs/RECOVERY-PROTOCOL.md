@@ -2,7 +2,7 @@
 
 Replicated, cryptographically versioned state continuity for Lightning channels, with channel-preserving restore and split-brain fencing.
 
-Status: proposed, not started
+Status: Phase 1 implemented (safety transition layer + durable outbox); Phases 2 to 7 not started
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
@@ -66,15 +66,19 @@ These facts were audited directly and are the foundation the design builds on. T
 - Interface: `IStorageBackend` in `src/lightning/storage/types.ts`. Only implementation: `SqliteStorage` in `src/lightning/storage/sqlite-storage.ts` (better-sqlite3).
 - Durability: `journal_mode = WAL`, `synchronous = FULL` by default (overridable to NORMAL), `busy_timeout = 5000`, `foreign_keys = ON`. `checkpoint()` runs `wal_checkpoint(TRUNCATE)`. `SqliteStorage.backup(destPath)` wraps the SQLite online backup API (concrete method, not on the interface).
 - A `transaction<T>(fn)` wrapper exists on the interface (`types.ts` around line 132) and is implemented via `this.db.transaction(fn)()`.
-- Safety-critical tables: `channels`, `chain_monitors`, `preimages`, `htlc_payment_map`, `forwarded_htlcs`, `htlc_shared_secrets`, `channel_key_indices`, `payments`, `payment_secrets`. Also relevant: `peer_storage_blobs`, `watchtower_sessions`, `watchtower_updates`. Schema version constant `CURRENT_SCHEMA_VERSION = 9`.
+- Safety-critical tables: `channels`, `chain_monitors`, `preimages`, `htlc_payment_map`, `forwarded_htlcs`, `htlc_shared_secrets`, `channel_key_indices`, `payments`, `payment_secrets`. Also relevant: `peer_storage_blobs`, `watchtower_sessions`, `watchtower_updates`. Schema version constant `CURRENT_SCHEMA_VERSION` was 9 when this was written; it reached 11 before Phase 1 landed, and Phase 1 took it to 12 by adding `recovery_outbox`.
 
 ### 3.2 Known atomicity gaps (must be fixed by Phase 1)
+
+These describe the tree BEFORE Phase 1. All three are now closed: `persistChannel` routes through `RecoveryManager.commit`, monitor deltas caused by a channel action ride in that channel's transition, and causally linked caller-side writes are staged into the same transaction. The original text is kept because it is the problem statement the design answers.
 
 - `LightningNode.persistChannel` (`src/lightning/node/lightning-node.ts`, around lines 1207-1230) calls `saveChannel(...)` then `saveChannelKeyIndex(...)` as two separate statements, not wrapped in `transaction()`.
 - Chain monitor state is persisted through a completely independent path: the `monitor:updated` event listener calls `saveChainMonitor` (around lines 1552-1563). A channel and its chain monitor are never written atomically together.
 - `transaction()` is used in some payment/forward paths (for example `persistPayment` + `saveHtlcPaymentMapping` around line 6850, and others near 7149, 7726, 8374, 8897, 9233), but no transaction spans `saveChannel` + `saveChainMonitor`.
 
 ### 3.3 The persist-before-send invariant is implicit, not structural
+
+Also a pre-Phase-1 statement: it is structural as of Phase 1 (see the end of 5.1). Retained as the problem statement.
 
 Channel handlers in `src/lightning/channel/channel.ts` return an ordered `ChannelAction[]`. `ChannelManager.processActions` (`src/lightning/channel/channel-manager.ts`, around lines 4224-4359) dispatches actions in array order: `SEND_MESSAGE` goes to the wire immediately; `PERSIST_STATE` emits `'channel:persist'`, which the node handles synchronously (`lightning-node.ts` around lines 1446-1448). So ordering safety depends entirely on each handler putting `PERSIST_STATE` before `SEND_MESSAGE` in the returned array plus synchronous EventEmitter dispatch. It works, but nothing enforces it structurally.
 
@@ -167,16 +171,19 @@ Introduce a single choke point for all safety-critical persistence. New module: 
 
 ```ts
 export type RecoveryMutation =
-  | { type: 'channel_state'; channelId: string; state: Buffer }
+  | { type: 'channel_state'; channelId: string; state: IChannelState; peerPubkey: string }
   | { type: 'channel_key_index'; channelId: string; channelIndex: number }
-  | { type: 'chain_monitor'; channelId: string; state: Buffer }
+  | { type: 'chain_monitor'; channelId: string; state: IChainMonitorState }
   | { type: 'payment_preimage'; paymentHash: string; preimage: Buffer }
   | { type: 'htlc_payment_mapping'; htlcKey: string; paymentHash: string }
+  | { type: 'delete_htlc_payment_mapping'; htlcKey: string }
   | { type: 'htlc_shared_secret'; key: string; secret: Buffer }
-  | { type: 'forwarded_htlc'; outKey: string; inChannelId: string; inHtlcId: bigint }
+  | { type: 'delete_htlc_shared_secret'; key: string }
+  | { type: 'forwarded_htlc'; outKey: string; inChannelId: Buffer; inHtlcId: bigint }
   | { type: 'delete_forwarded_htlc'; outKey: string }
-  | { type: 'payment_state'; paymentHash: string; payment: Buffer }
-  | { type: 'splice_state'; channelId: string; state: Buffer }
+  | { type: 'payment_state'; paymentHash: string; payment: IPaymentInfo }
+  | { type: 'payment_secret'; paymentHash: string; secret: Buffer }
+  | { type: 'delete_payment_secret'; paymentHash: string }
   | { type: 'channel_closed'; channelId: string };
 
 export enum RecoveryCriticality {
@@ -209,6 +216,13 @@ Do not serialize unrelated channels through one lock. Each transition is atomic;
 
 Backward compatibility requirement: with recovery disabled (default off until Phase 2 is proven), `RecoveryManager.commit` degrades to exactly today's behavior plus the atomicity fixes. The atomicity fixes land unconditionally; they are correct regardless of replication.
 
+Two decisions taken when Phase 1 was implemented, recorded here because the code follows them rather than the original sketch:
+
+1. **Typed mutations, not opaque buffers.** The state-bearing variants carry the library's own typed state objects (`IChannelState`, `IChainMonitorState`, `IPaymentInfo`) instead of `Buffer`. The storage backend already owns the serialization (bigint-safe JSON plus encryption at rest); encoding here would duplicate that serializer, and drift between the two copies would be a silently corrupt restore. Phase 2 encodes frames at the journal boundary, which is where a canonical byte format belongs. The sketch's `splice_state` variant is dropped for the same reason: splice state lives inside `IChannelState` and a second copy could only diverge from it.
+2. **Staged mutations for caller-side state.** Removing the caller-discipline hazard needs a way for a caller to say "this preimage belongs to the fulfill I am about to trigger". `LightningNode.withStagedMutations(mutations, fn)` stages them; the next channel transition folds them into its transaction, and anything still staged when `fn` returns is committed on its own so no write is silently dropped. This is what makes the fulfill and forward transitions atomic without giving `ChannelManager` a storage handle.
+
+Phase 1 also makes the invariant of 3.3 structural rather than conventional. `processActions` collects every retransmittable `SEND_MESSAGE` that follows the batch's `PERSIST_STATE`, hands the exact bytes to the persist listener for commit, and WITHHOLDS those sends if the transaction rolls back. A message whose justifying state is not on disk never reaches the peer, where previously a swallowed persistence error still let the send proceed.
+
 ### 5.2 Durable outbound message journal (Phase 1)
 
 Restoring channel objects is not enough; recovery must reproduce the exact protocol boundary, including messages that BOLT 2 requires us to retransmit (`commitment_signed`, `revoke_and_ack`, with relative order preserved via the existing `lastSentWasRevoke` logic, plus splice retransmission).
@@ -225,7 +239,11 @@ export interface RecoveryOutboundMessage {
 
 Transactional-outbox pattern: the message row commits in the same SQLite transaction as the state that makes it necessary; the socket write happens only after commit (and after the durability barrier, when one applies). On restart, `pending_send` rows for still-open channels are re-evaluated against reestablish state rather than blindly replayed: `channel_reestablish` counters decide retransmission per BOLT 2, and the outbox supplies the exact bytes when retransmission is required. Rows become `superseded` when the reestablish exchange proves the peer received them.
 
-New table (schema migration to version 10): `recovery_outbox(id INTEGER PRIMARY KEY, peer_pubkey, channel_id, message_type, wire_message BLOB, disposition, frame_sequence)`.
+New table (schema migration to version 12, since the schema had already reached 11 by the time Phase 1 landed): `recovery_outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, peer_pubkey, channel_id, message_type, wire_message, disposition, frame_sequence, created_at)`, indexed on `(channel_id, id)`. `wire_message` is in `ENCRYPTED_COLUMNS`: retained bytes are signed commitment material that reveals channel activity to anyone reading the database file. `frame_sequence` stays NULL until Phase 2.
+
+Retention, decided during implementation: a superseded row is DELETED rather than parked in a terminal disposition. Its only consumer is retransmission, which by definition no longer needs it, and retaining it would reintroduce the unbounded growth the per-channel row cap exists to prevent. Rows are superseded when the peer's `revoke_and_ack` proves receipt of our updates and the `commitment_signed` that covered them (mirroring channel.ts clearing its in-memory `_lastSentBatch` on the same event), and a channel's rows are dropped with the channel. Our OWN `revoke_and_ack` rows are excluded from that sweep: the peer's revocation says nothing about whether it received ours. Instead, the types nothing else retires (`revoke_and_ack`, `channel_ready`, `splice_locked`) supersede their own kind as they are written, in the same transaction: only the newest of each can ever be retransmitted, so a channel holds one row per type rather than one per commitment round for the life of the channel. A fully resolved close clears the channel's rows outright, since a channel that can never reestablish can never retransmit. A per-channel cap prunes the oldest rows as a backstop, degrading that channel to reconstruct-from-state retransmission, which is exactly the pre-outbox behavior.
+
+The concrete case this closes today: `_lastSentBatch` in `channel.ts` is in-memory only, and the reestablish fallback can rebuild an un-acked batch only by RE-SIGNING, which it explicitly refuses to do for a taproot channel because a fresh MuSig2 secret nonce must never sign material the peer may already hold under the old one. Before Phase 1 a restart mid-batch on a taproot channel therefore had nothing to retransmit. `Channel.restoreLastSentBatch`, fed from the outbox at channel restore, supplies the exact bytes and signs nothing.
 
 ### 5.3 Recovery journal (Phase 2)
 
@@ -570,7 +588,7 @@ Implementation note: rather than sprinkling barrier calls through `channel.ts`, 
 
 ### 5.9 The safety transition matrix (the implementation spec)
 
-Before writing Phase 1 code, produce `docs/RECOVERY-TRANSITION-MATRIX.md` enumerating every site that sends or receives `commitment_signed`, `revoke_and_ack`, `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`, `update_fail_malformed_htlc`, `channel_reestablish`, and splice messages, and for each: what must be atomically persisted, at what criticality, before which wire message. The matrix must also classify every ephemeral signing session and transient state item in 5.10 with one of the four dispositions defined there. Starting anchor list (verified, re-check lines):
+Before writing Phase 1 code, produce `docs/RECOVERY-TRANSITION-MATRIX.md` (delivered with Phase 1) enumerating every site that sends or receives `commitment_signed`, `revoke_and_ack`, `update_add_htlc`, `update_fulfill_htlc`, `update_fail_htlc`, `update_fail_malformed_htlc`, `channel_reestablish`, and splice messages, and for each: what must be atomically persisted, at what criticality, before which wire message. The matrix must also classify every ephemeral signing session and transient state item in 5.10 with one of the four dispositions defined there. Starting anchor list (verified, re-check lines):
 
 | Site | Location | Today | Required transition |
 |---|---|---|---|

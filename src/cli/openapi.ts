@@ -1889,7 +1889,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2835,6 +2835,11 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							type: 'boolean',
 							description:
 								'Whether the channel can carry HTLC traffic right now (NORMAL, or paying through its splice)'
+						},
+						peerSupportsSplicing: {
+							type: 'boolean',
+							description:
+								'Whether the connected peer negotiated option_splice + option_quiesce. Absent when the peer is disconnected or mid-handshake: absence means unknown, never unsupported'
 						},
 						payThroughSplice: {
 							type: 'boolean',
