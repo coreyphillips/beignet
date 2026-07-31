@@ -28,7 +28,8 @@ import {
 	EBoostType,
 	EPaymentType,
 	IFormattedTransaction,
-	IOnchainFees
+	IOnchainFees,
+	TMessageDataMap
 } from '../types/wallet';
 import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
@@ -763,6 +764,13 @@ export class BeignetNode extends EventEmitter {
 				servers: electrumServer
 			},
 			disableMessagesOnCreate: true,
+			// The wallet's own news (a transaction arriving, a transaction
+			// confirming), relayed as daemon events. Messages stay disabled
+			// through the initial sync above, so history never replays as
+			// arrivals; what reaches the handler happened while the daemon was
+			// watching, or was found new at a catch-up sync, which is still
+			// news to whoever runs the node.
+			onMessage: (key, data) => this.onWalletMessage(key, data),
 			// Route wallet diagnostics through the injected logger when provided;
 			// otherwise keep the wallet's default console logger (status quo).
 			...(this.logger ? { logger: this.logger } : {}),
@@ -2267,6 +2275,43 @@ export class BeignetNode extends EventEmitter {
 		if (result.isErr()) {
 			throw new BeignetError('REFRESH_FAILED', result.error.message);
 		}
+	}
+
+	/**
+	 * On-chain events were the one kind of money movement the daemon never
+	 * spoke about: a Lightning payment landing emits payment:received, but an
+	 * on-chain receive changed /transactions and said nothing, leaving
+	 * clients to poll for the difference. The wallet has reported these all
+	 * along; nothing was listening.
+	 */
+	private onWalletMessage<K extends keyof TMessageDataMap>(
+		key: K,
+		data: TMessageDataMap[K]
+	): void {
+		const relayed = {
+			transactionReceived: {
+				event: 'transaction:received',
+				label: 'Transaction received'
+			},
+			transactionSent: {
+				event: 'transaction:sent',
+				label: 'Transaction sent'
+			},
+			transactionConfirmed: {
+				event: 'transaction:confirmed',
+				label: 'Transaction confirmed'
+			}
+		} as const;
+		if (!(key in relayed)) return;
+		const { event, label } = relayed[key as keyof typeof relayed];
+		const { transaction } = data as TMessageDataMap['transactionReceived'];
+		const info = this.toOnchainTxInfo(transaction);
+		this.log('info', label, {
+			txid: info.txid,
+			type: info.type,
+			valueSats: info.valueSats
+		});
+		this.emit(event, info);
 	}
 
 	// IFormattedTransaction stores value/fee in BTC (see wallet formatting),
