@@ -196,6 +196,12 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_FORWARDING_ENABLED === 'true'
 				: undefined) ??
 			file.forwardingEnabled,
+		autoReconnect:
+			cliFlags.autoReconnect ??
+			(process.env.BEIGNET_AUTO_RECONNECT !== undefined
+				? process.env.BEIGNET_AUTO_RECONNECT === 'true'
+				: undefined) ??
+			file.autoReconnect,
 		logLevel:
 			parseLogLevel(cliFlags.logLevel) ||
 			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||

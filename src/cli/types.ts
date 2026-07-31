@@ -465,6 +465,12 @@ export interface BeignetConfig {
 	/** Relay third-party HTLCs, i.e. act as a routing hop (default true). Set
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
+	/** Dial known peers (channel partners included) on start and on disconnect
+	 *  (default true). Set false and, with no listen port either, the node is
+	 *  genuinely quiet: channels stay watched on-chain but unreachable over
+	 *  the wire, which is what an operator deliberately parking a Lightning
+	 *  node wants. Env: BEIGNET_AUTO_RECONNECT. */
+	autoReconnect?: boolean;
 	/** Daemon diagnostic log level ('debug' | 'info' | 'warn' | 'error' |
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;
 	 *  unset keeps the daemon silent (status quo). */

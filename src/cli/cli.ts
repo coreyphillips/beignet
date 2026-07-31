@@ -383,6 +383,7 @@ async function handleStart(): Promise<void> {
 	if (hasFlag('--metrics-public')) cliFlags.metricsPublic = true;
 	if (hasFlag('--insecure')) cliFlags.insecure = true;
 	if (hasFlag('--no-forwarding')) cliFlags.forwardingEnabled = false;
+	if (hasFlag('--no-auto-reconnect')) cliFlags.autoReconnect = false;
 	const apiTokenFlag = parseFlag('--api-token');
 	if (apiTokenFlag) cliFlags.apiToken = apiTokenFlag;
 	const backupPathFlag = parseFlag('--backup-path');
@@ -464,6 +465,7 @@ async function handleStart(): Promise<void> {
 			metricsPublic: config.metricsPublic,
 			insecure: config.insecure,
 			forwardingEnabled: config.forwardingEnabled,
+			autoReconnect: config.autoReconnect,
 			logLevel: config.logLevel
 		});
 
