@@ -15,6 +15,7 @@ import {
 	IForwardingSummary,
 	IRecoveryOutboxMessage,
 	IRecoveryOutboxStoredMessage,
+	IStoredRecoveryFrame,
 	RecoveryOutboxDisposition
 } from './types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
@@ -129,7 +130,7 @@ export class SqliteStorage implements IStorageBackend {
 	// ─── Schema ───
 
 	/** Current schema version. Increment when adding migrations. */
-	static readonly CURRENT_SCHEMA_VERSION = 12;
+	static readonly CURRENT_SCHEMA_VERSION = 13;
 
 	/**
 	 * Row cap for forwarding_events: bounds DB growth on busy routing nodes.
@@ -356,6 +357,20 @@ export class SqliteStorage implements IStorageBackend {
 			);
 			CREATE INDEX IF NOT EXISTS idx_recovery_outbox_channel
 				ON recovery_outbox(channel_id, id);
+
+			CREATE TABLE IF NOT EXISTS recovery_frames (
+				sequence INTEGER PRIMARY KEY,
+				writer_epoch INTEGER NOT NULL,
+				frame_hash BLOB NOT NULL,
+				previous_hash BLOB NOT NULL,
+				ciphertext BLOB NOT NULL,
+				created_at INTEGER NOT NULL
+			);
+
+			CREATE TABLE IF NOT EXISTS recovery_meta (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
 
 			CREATE TABLE IF NOT EXISTS metadata (
 				key TEXT PRIMARY KEY,
@@ -1319,6 +1334,13 @@ export class SqliteStorage implements IStorageBackend {
 			// are signed commitment material that reveals channel activity.
 			(): void => {
 				// No-op
+			},
+			// Migration 12->13: recovery_frames + recovery_meta tables (Recovery
+			// Protocol phase 2, docs/RECOVERY-PROTOCOL.md 5.3). Created via CREATE
+			// IF NOT EXISTS above. ciphertext is NOT in ENCRYPTED_COLUMNS: frames
+			// arrive already AEAD-encrypted with the per-epoch frame key.
+			(): void => {
+				// No-op
 			}
 		];
 
@@ -1635,6 +1657,90 @@ export class SqliteStorage implements IStorageBackend {
 				 )`
 			)
 			.run(channelId, channelId, keepNewest);
+	}
+
+	// ─── Recovery Journal (docs/RECOVERY-PROTOCOL.md 5.3) ───
+	// Frames are appended INSIDE the transaction of the transition they record.
+	// ciphertext is already AEAD-encrypted with the per-epoch frame key, so no
+	// storage-key layer applies here (see the interface comment).
+
+	saveRecoveryFrame(frame: IStoredRecoveryFrame): void {
+		this.db
+			.prepare(
+				`INSERT INTO recovery_frames
+					(sequence, writer_epoch, frame_hash, previous_hash, ciphertext,
+					 created_at)
+				 VALUES (?, ?, ?, ?, ?, ?)`
+			)
+			.run(
+				frame.sequence,
+				frame.writerEpoch,
+				frame.frameHash,
+				frame.previousFrameHash,
+				frame.ciphertext,
+				frame.createdAt
+			);
+	}
+
+	loadRecoveryFrames(afterSequence?: number): IStoredRecoveryFrame[] {
+		const rows = (
+			afterSequence != null
+				? this.db
+						.prepare(
+							'SELECT * FROM recovery_frames WHERE sequence > ? ORDER BY sequence ASC'
+						)
+						.all(afterSequence)
+				: this.db
+						.prepare('SELECT * FROM recovery_frames ORDER BY sequence ASC')
+						.all()
+		) as Array<{
+			sequence: number;
+			writer_epoch: number;
+			frame_hash: Buffer;
+			previous_hash: Buffer;
+			ciphertext: Buffer;
+			created_at: number;
+		}>;
+		return rows.map((row) => ({
+			sequence: row.sequence,
+			writerEpoch: row.writer_epoch,
+			frameHash: Buffer.from(row.frame_hash),
+			previousFrameHash: Buffer.from(row.previous_hash),
+			ciphertext: Buffer.from(row.ciphertext),
+			createdAt: row.created_at
+		}));
+	}
+
+	setOutboxFrameSequence(ids: number[], frameSequence: number): void {
+		if (ids.length === 0) return;
+		const placeholders = ids.map(() => '?').join(', ');
+		this.db
+			.prepare(
+				`UPDATE recovery_outbox SET frame_sequence = ?
+				 WHERE id IN (${placeholders})`
+			)
+			.run(frameSequence, ...ids);
+	}
+
+	deleteRecoveryFramesBelow(sequence: number): void {
+		this.db
+			.prepare('DELETE FROM recovery_frames WHERE sequence < ?')
+			.run(sequence);
+	}
+
+	getRecoveryMeta(key: string): string | null {
+		const row = this.db
+			.prepare('SELECT value FROM recovery_meta WHERE key = ?')
+			.get(key) as { value: string } | undefined;
+		return row ? row.value : null;
+	}
+
+	setRecoveryMeta(key: string, value: string): void {
+		this.db
+			.prepare(
+				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
+			)
+			.run(key, value);
 	}
 
 	// ─── Watchtower (LND altruist client) ───

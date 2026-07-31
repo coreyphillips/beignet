@@ -135,3 +135,104 @@ export interface IRecoveryCommitResult {
 	/** Set when the transaction threw; mutations and rows all rolled back. */
 	error?: Error;
 }
+
+// ─────────────── Phase 2: the recovery journal (spec 5.3) ───────────────
+
+/**
+ * One append-only journal record: everything an Important or SafetyCritical
+ * transition changed, hash-chained to its predecessor.
+ *
+ * Deviation from spec 5.3, same reasoning as RecoveryMutation above: the
+ * payload carries the library's typed shapes and the frame codec owns the
+ * byte encoding, so there is exactly one serializer (the storage layer's) for
+ * every state-bearing object.
+ *
+ * `snapshot` is present on full-state snapshot frames (spec 5.3, "Snapshots
+ * and compaction"): the complete safety-critical state as of this sequence,
+ * from which reconstruction starts before replaying later deltas. A snapshot
+ * frame's mutations list is empty; the snapshot IS the state.
+ */
+export interface RecoveryFrame {
+	version: 1;
+	/** Changes only when a restored device takes ownership (Phase 5). */
+	writerEpoch: bigint;
+	/** Globally monotonic across the node, starting at 1. */
+	sequence: bigint;
+	/** Hash of the previous frame's plaintext; 32 zero bytes for frame 1. */
+	previousFrameHash: Buffer;
+	timestamp: number;
+	mutations: RecoveryMutation[];
+	outboundMessages: RecoveryOutboundMessage[];
+	snapshot?: RecoverySnapshot;
+}
+
+/**
+ * A frame as stored: AEAD ciphertext plus the chain fields kept in the clear
+ * so verification and takeover can walk the chain without decrypting.
+ */
+export interface EncryptedRecoveryFrame {
+	writerEpoch: bigint;
+	sequence: bigint;
+	/** SHA-256 of the plaintext frame bytes. */
+	frameHash: Buffer;
+	previousFrameHash: Buffer;
+	/** AES-256-GCM: iv || authTag || ciphertext. */
+	ciphertext: Buffer;
+	createdAt: number;
+}
+
+/**
+ * Every safety-critical table, serialized whole. Exactly the tables
+ * RecoveryMutation can touch, plus the outbox: this is the state whose loss
+ * is unrecoverable, and therefore what a snapshot must capture. Receive-side
+ * authentication extras (invoices, offers, path ids) ride the Phase 3
+ * capsule, not the journal.
+ *
+ * Outbox note: snapshot rows keep their disposition as captured; delta frames
+ * record rows at insert time (always pending_send), and disposition advances
+ * (markSent) are deliberately NOT journaled. A reconstruction therefore
+ * restores post-snapshot rows as pending_send, which errs toward
+ * retransmission: the safe direction, since peers treat replays idempotently.
+ */
+export interface RecoverySnapshot {
+	channels: Array<{
+		channelId: string;
+		state: import('../channel/channel-state').IChannelState;
+		peerPubkey: string;
+	}>;
+	keyIndices: Array<{ channelId: string; channelIndex: number }>;
+	chainMonitors: Array<{
+		channelId: string;
+		state: import('../chain/chain-monitor').IChainMonitorState;
+	}>;
+	preimages: Array<{ paymentHash: string; preimage: Buffer }>;
+	payments: Array<{
+		paymentHash: string;
+		payment: import('../node/types').IPaymentInfo;
+	}>;
+	paymentSecrets: Array<{ paymentHash: string; secret: Buffer }>;
+	htlcPaymentMappings: Array<{ key: string; paymentHash: string }>;
+	forwardedHtlcs: Array<{
+		outKey: string;
+		inChannelId: Buffer;
+		inHtlcId: bigint;
+	}>;
+	htlcSharedSecrets: Array<{ key: string; secret: Buffer }>;
+	outbox: RecoveryOutboundMessage[];
+}
+
+/**
+ * What RecoveryManager.commit calls to journal a transition, INSIDE the same
+ * storage transaction as the transition's writes. A throw here rolls the
+ * whole transition back: journaled durability is part of the commit, not a
+ * best-effort tail. Kept as an interface so the manager does not import the
+ * journal implementation (the journal imports the manager for
+ * reconstruction).
+ */
+export interface IRecoveryJournalSink {
+	/** Returns the sequence of the frame that carries this transition. */
+	appendFrame(
+		mutations: RecoveryMutation[],
+		outboundMessages: RecoveryOutboundMessage[]
+	): bigint;
+}

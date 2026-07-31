@@ -14,6 +14,7 @@ import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
 import {
 	IRecoveryCommitResult,
+	IRecoveryJournalSink,
 	IRecoveryOutboxRow,
 	RecoveryCriticality,
 	RecoveryMutation,
@@ -43,6 +44,14 @@ export interface IRecoveryManagerOptions {
 	 * retransmission, which is exactly today's behavior.
 	 */
 	maxOutboxRowsPerChannel?: number;
+	/**
+	 * Phase 2 recovery journal (docs/RECOVERY-PROTOCOL.md 5.3). When set,
+	 * every Important and SafetyCritical transition appends a frame INSIDE
+	 * its own transaction; a journal failure rolls the transition back, since
+	 * journaled durability is part of the commit, not a best-effort tail.
+	 * Reconstructable transitions are never journaled.
+	 */
+	journal?: IRecoveryJournalSink;
 }
 
 /** Rows retained per channel before the oldest are pruned. */
@@ -93,6 +102,23 @@ export class RecoveryManager {
 				}
 				for (const message of outboundMessages) {
 					outboxIds.push(this.insertOutboxRow(message));
+				}
+				// Journal the transition INSIDE its own transaction (spec 5.3):
+				// frame and transition commit or roll back as one unit. The rows
+				// this commit inserted are stamped with the frame that carried
+				// them (the frame_sequence Phase 1 left null).
+				if (
+					this.options.journal &&
+					transition.criticality !== RecoveryCriticality.Reconstructable
+				) {
+					const sequence = this.options.journal.appendFrame(
+						mutations,
+						outboundMessages
+					);
+					const ids = outboxIds.filter((id): id is number => id != null);
+					if (ids.length && this.storage.setOutboxFrameSequence) {
+						this.storage.setOutboxFrameSequence(ids, Number(sequence));
+					}
 				}
 			});
 		} catch (error) {

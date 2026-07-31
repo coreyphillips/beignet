@@ -69,12 +69,12 @@ function readWalletRows(dbPath: string): Array<{ key: string; value: string }> {
 describe('Daemon on-chain wallet persistence', function () {
 	this.timeout(180_000);
 
-	it('SqliteStorage schema version is 12', () => {
-		// v11 added the invoice_path_ids table (BOLT 12 receive-side path_id
-		// authentication) and offers.async_hold. v12 added recovery_outbox
-		// (Recovery Protocol phase 1: the transactional outbound-message
-		// outbox, docs/RECOVERY-PROTOCOL.md 5.2).
-		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(12);
+	it('SqliteStorage schema version is 13', () => {
+		// v12 added recovery_outbox (Recovery Protocol phase 1: the
+		// transactional outbound-message outbox, docs/RECOVERY-PROTOCOL.md
+		// 5.2). v13 added recovery_frames + recovery_meta (phase 2: the
+		// hash-chained recovery journal, docs/RECOVERY-PROTOCOL.md 5.3).
+		expect(SqliteStorage.CURRENT_SCHEMA_VERSION).to.equal(13);
 	});
 
 	describe('encrypted mode (default)', () => {
@@ -124,13 +124,13 @@ describe('Daemon on-chain wallet persistence', function () {
 			expect(raw.includes(markerUtxo.address)).to.equal(false);
 		});
 
-		it('recorded schema version is 12', () => {
+		it('recorded schema version is 13', () => {
 			const db = new Database(dbPath, { readonly: true });
 			try {
 				const row = db
 					.prepare('SELECT MAX(version) as v FROM schema_version')
 					.get() as { v: number };
-				expect(row.v).to.equal(12);
+				expect(row.v).to.equal(13);
 			} finally {
 				db.close();
 			}

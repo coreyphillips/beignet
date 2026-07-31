@@ -194,7 +194,10 @@ import {
 import {
 	RecoveryManager,
 	RecoveryCriticality,
-	RecoveryMutation
+	RecoveryMutation,
+	RecoveryJournal,
+	deriveRecoveryMasterKey,
+	journalSupported
 } from '../recovery';
 import { IChannelPersistRequest } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
@@ -594,8 +597,26 @@ export class LightningNode extends EventEmitter {
 		// goes through, so channel state, its key index, its chain monitor delta
 		// and the wire bytes they authorize commit as one unit
 		// (docs/RECOVERY-PROTOCOL.md 5.1).
+		// Phase 2 (docs/RECOVERY-PROTOCOL.md 5.3): the hash-chained journal.
+		// Opt-in and additive; when off, nothing changes. The journal appends
+		// inside RecoveryManager.commit's transaction, so enabling it makes the
+		// frame part of every safety transition's atomicity.
+		const journal =
+			this.storage &&
+			config.recovery?.enabled === true &&
+			journalSupported(this.storage)
+				? new RecoveryJournal(
+						this.storage,
+						deriveRecoveryMasterKey(config.nodePrivateKey),
+						getPublicKey(config.nodePrivateKey),
+						{
+							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames
+						}
+				  )
+				: undefined;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
+					journal,
 					onError: (err: Error, context): void => {
 						// persistChannel reports its own failures with the channel id
 						// attached, which is strictly more useful; emitting here too
