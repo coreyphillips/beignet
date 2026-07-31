@@ -575,6 +575,7 @@ LightningNode              High-level API (EventEmitter)
 | `watchtower/` | Altruist watchtower client: wtwire protocol, justice blobs, tower sessions |
 | `backup/` | Static channel backup (SCB) export/import |
 | `recovery/` | Safety transition layer: atomic persistence and the durable outbound-message outbox |
+| `l402/` | L402 (Lightning HTTP 402) client: challenge parsing, macaroon reading, paid credentials |
 | `node/` | LightningNode orchestrator, the main protocol-layer entry point |
 | `wallet/` | WalletFundingProvider, adapts the on-chain Wallet for auto-funded opens |
 | `bootstrap/` | DNS seed resolution for discovering initial peers |

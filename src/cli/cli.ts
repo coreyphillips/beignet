@@ -303,6 +303,8 @@ async function main(): Promise<void> {
 			return handleWebhooks();
 		case 'queue':
 			return handleQueue();
+		case 'l402':
+			return handleL402();
 		case 'auth':
 			return handleAuth();
 		case 'backup':
@@ -1472,6 +1474,88 @@ async function handleAuth(): Promise<void> {
 	}
 }
 
+async function handleL402(): Promise<void> {
+	const sub = filteredArgs[1];
+	switch (sub) {
+		case 'fetch': {
+			const url = filteredArgs[2];
+			const maxPrice = parseFlag('--max-price');
+			if (!url || maxPrice === undefined) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message:
+							'Usage: beignet l402 fetch <url> --max-price <sats> [--max-fee <sats>] [--method GET] [--header "K: V"] [--body <string>] [--scope-per-path] [--allow-unverified-macaroon] [--allow-private-network]'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			const maxFee = parseFlag('--max-fee');
+			const timeout = parseFlag('--timeout');
+			// Repeatable --header "Name: value", the curl convention.
+			const headers: Record<string, string> = {};
+			for (let i = 0; i < filteredArgs.length; i++) {
+				if (filteredArgs[i] !== '--header') continue;
+				const raw = filteredArgs[i + 1];
+				if (!raw) continue;
+				const split = raw.indexOf(':');
+				if (split <= 0) continue;
+				headers[raw.slice(0, split).trim()] = raw.slice(split + 1).trim();
+			}
+			return outputResult(
+				await httpRequest('POST', '/l402/fetch', {
+					url,
+					method: parseFlag('--method'),
+					headers: Object.keys(headers).length > 0 ? headers : undefined,
+					body: parseFlag('--body'),
+					maxPriceSats: parseInt(maxPrice, 10),
+					maxFeeSats: maxFee !== undefined ? parseInt(maxFee, 10) : undefined,
+					timeoutMs: timeout !== undefined ? parseInt(timeout, 10) : undefined,
+					scopePerPath: filteredArgs.includes('--scope-per-path') || undefined,
+					allowUnverifiedMacaroon:
+						filteredArgs.includes('--allow-unverified-macaroon') || undefined,
+					allowPrivateNetwork:
+						filteredArgs.includes('--allow-private-network') || undefined
+				})
+			);
+		}
+		case 'credentials':
+			return outputResult(await httpRequest('GET', '/l402/credentials'));
+		case 'forget': {
+			const scope = filteredArgs[2];
+			if (!scope) {
+				output({
+					ok: false,
+					error: {
+						code: 'INVALID_PARAMS',
+						message: 'Usage: beignet l402 forget <scope>'
+					}
+				});
+				process.exitCode = 1;
+				return;
+			}
+			return outputResult(
+				await httpRequest(
+					'DELETE',
+					`/l402/credential?scope=${encodeURIComponent(scope)}`
+				)
+			);
+		}
+		default:
+			output({
+				ok: false,
+				error: {
+					code: 'INVALID_PARAMS',
+					message:
+						'Usage: beignet l402 [fetch <url> --max-price <sats>|credentials|forget <scope>]'
+				}
+			});
+			process.exitCode = 1;
+	}
+}
+
 async function handleQueue(): Promise<void> {
 	const sub = filteredArgs[1];
 	switch (sub) {
@@ -2277,6 +2361,9 @@ Invoices & Payments:
                                          Enqueue a payment for ordered dispatch
   queue cancel <id>                      Cancel a queued payment
   queue list                             List the payment queue
+  l402 fetch <url> --max-price N         Fetch an L402-gated URL, paying up to N sats
+  l402 credentials                       List paid L402 credentials
+  l402 forget <scope>                    Drop a credential so the next fetch pays again
 
 Graph Queries:
   graph info                             Graph summary (node/channel counts)

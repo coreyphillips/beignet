@@ -34,6 +34,14 @@ import {
 import { createWalletStorage } from './wallet-storage';
 import { EProtocol } from '../types/electrum';
 import { LightningNode } from '../lightning/node/lightning-node';
+import {
+	isPrivateNetworkUrl,
+	l402Fetch,
+	IL402Credential,
+	IL402RequestInit,
+	MemoryL402CredentialStore,
+	readCappedBody
+} from '../lightning/l402';
 import { IPaymentInfo } from '../lightning/node/types';
 import { IPeerTransportOptions } from '../lightning/transport/duplex-transport';
 import { WalletFundingProvider } from '../lightning/wallet/wallet-funding-provider';
@@ -468,6 +476,13 @@ export function jsonToRouteHops(hops: RouteHop[]): Array<{
 /** Hard page-size cap for GET /graph/describe (the graph can be huge). */
 const GRAPH_DESCRIBE_MAX_LIMIT = 500;
 
+/**
+ * Default ceiling on an L402 response body. The body is buffered and then
+ * re-serialized into the daemon's JSON envelope, so a remote server's response
+ * size is a memory cost here, not just a transfer one.
+ */
+const DEFAULT_L402_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+
 const DEFAULT_ELECTRUM: Record<
 	string,
 	{ host: string; port: number; useTls: boolean }
@@ -590,6 +605,12 @@ export class BeignetNode extends EventEmitter {
 	private _dailySpendResetTime = 0;
 	private _pendingSpendSats = 0;
 	private _maxPaymentSats?: number;
+	/**
+	 * Paid L402 credentials, so a gated API is paid for once rather than per
+	 * request. In memory by design: a credential is a bearer token for paid
+	 * access, and where a durable copy lands is a deployment decision.
+	 */
+	private readonly _l402Credentials = new MemoryL402CredentialStore();
 	private _draining = false;
 	private peerStorageEnabled = true;
 	/** Epoch ms of the last gossip/RGS sync completed this session. */
@@ -3978,6 +3999,153 @@ export class BeignetNode extends EventEmitter {
 	/** Remove a watchtower and drop its persisted sessions + backlog. */
 	removeWatchtower(uri: string): void {
 		this.node.removeWatchtower(uri);
+	}
+
+	// ─────────────── L402 (Lightning HTTP 402) ───────────────
+
+	/**
+	 * Fetch an L402-gated URL, paying the challenge if the server issues one.
+	 *
+	 * Payment goes through `payInvoice`, so the node's existing per-payment
+	 * maximum and daily spend limit apply on top of the per-call
+	 * `maxPriceSats` cap. That layering is deliberate: `maxPriceSats` bounds
+	 * what THIS request may cost, and the wallet policy bounds what the node
+	 * may spend at all. An unattended agent needs both.
+	 *
+	 * Credentials are reused across calls for the lifetime of the process, so
+	 * a paid API is paid for once rather than per request.
+	 */
+	async l402Fetch(
+		url: string,
+		init: IL402RequestInit = {},
+		options: {
+			maxPriceSats: number;
+			maxFeeSats?: number;
+			timeoutMs?: number;
+			fetchTimeoutMs?: number;
+			scopePerPath?: boolean;
+			allowUnverifiedMacaroon?: boolean;
+			allowCrossOriginChallenge?: boolean;
+			allowPrivateNetwork?: boolean;
+			maxResponseBytes?: number;
+		}
+	): Promise<{
+		status: number;
+		body: string;
+		truncated: boolean;
+		paid: boolean;
+		amountPaidSats: number;
+		paymentHash?: string;
+	}> {
+		this._checkDraining();
+		// This method is reachable over the daemon API, which makes it a
+		// fetch-this-URL-for-me proxy running on the node's machine. Refuse
+		// targets only that machine can see (localhost, RFC 1918, the cloud
+		// metadata endpoint) unless the caller opts in, and refuse schemes
+		// fetch would happily serve from outside HTTP (file:, data:).
+		this._assertL402TargetAllowed(url, options.allowPrivateNetwork);
+		const result = await l402Fetch(url, init, {
+			...options,
+			credentials: this._l402Credentials,
+			payer: {
+				payInvoice: async (
+					bolt11: string,
+					payOptions
+				): Promise<{ preimage: Buffer }> => {
+					const info = await this.payInvoice(
+						bolt11,
+						payOptions.timeoutMs ?? 60_000,
+						payOptions.maxFeeSats
+					);
+					if (!info.preimage) {
+						throw new BeignetError(
+							'PAYMENT_FAILED',
+							'L402 payment completed without a preimage, so no credential can be built'
+						);
+					}
+					return { preimage: Buffer.from(info.preimage, 'hex') };
+				}
+			}
+		});
+		// A redirect can land on a host the caller never named. The paid path
+		// already refuses cross-origin challenges, but an unpaid response that
+		// followed a redirect to a private target must not be relayed either.
+		if (result.response.url) {
+			this._assertL402TargetAllowed(
+				result.response.url,
+				options.allowPrivateNetwork
+			);
+		}
+		// The body is relayed to the daemon caller, so its size has to be
+		// bounded here. Refuse a response that declares itself too large, and
+		// stream-read the rest under the cap (a server can lie about
+		// content-length, so the declared size alone is not a bound, and
+		// buffering first then truncating would let the full body into memory
+		// anyway).
+		const cap = options.maxResponseBytes ?? DEFAULT_L402_MAX_RESPONSE_BYTES;
+		const declared = Number(result.response.headers.get('content-length'));
+		if (Number.isFinite(declared) && declared > cap) {
+			throw new BeignetError(
+				'RESPONSE_TOO_LARGE',
+				`L402 response declares ${declared} bytes, above the ${cap} byte limit`
+			);
+		}
+		const { body, truncated } = await readCappedBody(result.response, cap);
+		return {
+			status: result.response.status,
+			body,
+			truncated,
+			paid: result.paid,
+			amountPaidSats: result.amountPaidSats,
+			paymentHash: result.credential?.paymentHash
+		};
+	}
+
+	/**
+	 * Refuse an L402 fetch target outside plain HTTP or inside the private
+	 * address space, unless the caller opted in. Judged from the URL text
+	 * only; a public name resolving privately (DNS rebinding) is not caught
+	 * here.
+	 */
+	private _assertL402TargetAllowed(
+		url: string,
+		allowPrivateNetwork?: boolean
+	): void {
+		let protocol: string;
+		try {
+			protocol = new URL(url).protocol;
+		} catch {
+			throw new BeignetError('INVALID_PARAMS', `L402 fetch URL is invalid`);
+		}
+		if (protocol !== 'http:' && protocol !== 'https:') {
+			throw new BeignetError(
+				'INVALID_PARAMS',
+				`L402 fetch only supports http and https URLs, got ${protocol}`
+			);
+		}
+		if (!allowPrivateNetwork && isPrivateNetworkUrl(url)) {
+			throw new BeignetError(
+				'PRIVATE_NETWORK_REFUSED',
+				'L402 fetch target names a private, loopback, or link-local host; pass allowPrivateNetwork to permit it'
+			);
+		}
+	}
+
+	/**
+	 * Paid L402 credentials held by this process. The preimage is the bearer
+	 * half of the credential, so it is masked here the way webhook HMAC
+	 * secrets are: the list identifies what is held and what it cost, it does
+	 * not export usable tokens to stdout or logs.
+	 */
+	listL402Credentials(): IL402Credential[] {
+		return this._l402Credentials
+			.list()
+			.map((credential) => ({ ...credential, preimage: '***' }));
+	}
+
+	/** Forget a paid credential, so the next request pays again. */
+	forgetL402Credential(scope: string): void {
+		this._l402Credentials.delete(scope);
 	}
 
 	getPaymentProof(paymentHash: string): PaymentProof | null {

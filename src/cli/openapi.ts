@@ -776,6 +776,119 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/l402/fetch': {
+				post: {
+					summary:
+						'Fetch an L402-gated URL, paying the challenge under a price cap',
+					description:
+						'Parses the WWW-Authenticate L402 challenge, verifies the invoice payment hash against the macaroon commitment, pays under maxPriceSats (on top of the node spend limits), then retries with the paid credential. Pays at most once per call.',
+					tags: ['Payments'],
+					requestBody: {
+						required: true,
+						content: jsonContent({
+							type: 'object',
+							required: ['url', 'maxPriceSats'],
+							properties: {
+								url: { type: 'string' },
+								method: { type: 'string' },
+								headers: { type: 'object', additionalProperties: true },
+								body: { type: 'string' },
+								maxPriceSats: {
+									type: 'number',
+									description:
+										'Required satoshi cap on what one challenge may cost'
+								},
+								maxFeeSats: {
+									type: 'number',
+									description:
+										'Routing fee cap in satoshis. Defaults to 5% of the price with a 5 sat floor, never to uncapped'
+								},
+								timeoutMs: { type: 'number' },
+								fetchTimeoutMs: {
+									type: 'number',
+									description: 'Per HTTP request timeout, default 30000'
+								},
+								maxResponseBytes: {
+									type: 'number',
+									description:
+										'Ceiling on the proxied response body, default 5242880'
+								},
+								scopePerPath: { type: 'boolean' },
+								allowUnverifiedMacaroon: {
+									type: 'boolean',
+									description:
+										'Unsafe: pay a challenge whose macaroon could not be parsed, so its payment hash commitment is unchecked'
+								},
+								allowCrossOriginChallenge: {
+									type: 'boolean',
+									description:
+										'Unsafe: pay a challenge served from a different origin than requested, after a redirect'
+								},
+								allowPrivateNetwork: {
+									type: 'boolean',
+									description:
+										'Permit a target on a private, loopback, or link-local host, which is refused by default because this endpoint fetches on behalf of the caller from the node machine'
+								}
+							}
+						})
+					},
+					responses: {
+						'200': {
+							description: 'Response from the gated resource',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									status: { type: 'number' },
+									body: { type: 'string' },
+									truncated: {
+										type: 'boolean',
+										description:
+											'True when the body was cut at maxResponseBytes'
+									},
+									paid: { type: 'boolean' },
+									amountPaidSats: { type: 'number' },
+									paymentHash: { type: 'string' }
+								}
+							})
+						}
+					}
+				}
+			},
+			'/l402/credentials': {
+				get: {
+					summary: 'List paid L402 credentials held by this process',
+					description:
+						'Preimages are masked: the list identifies what is held and what it cost, it does not export usable bearer tokens.',
+					tags: ['Payments'],
+					responses: {
+						'200': {
+							description: 'Held credentials, preimages masked',
+							content: jsonContent({ type: 'array', items: { type: 'object' } })
+						}
+					}
+				}
+			},
+			'/l402/credential': {
+				delete: {
+					summary:
+						'Forget a paid L402 credential so the next request pays again',
+					tags: ['Payments'],
+					parameters: [
+						{
+							name: 'scope',
+							in: 'query',
+							required: true,
+							schema: { type: 'string' }
+						}
+					],
+					responses: {
+						'200': {
+							description: 'Credential forgotten',
+							content: jsonContent({ type: 'object' })
+						}
+					}
+				}
+			},
 			'/payment/proof': {
 				get: {
 					summary: 'Get cryptographic payment proof',

@@ -12,6 +12,7 @@ import { Console } from 'console';
 import { BeignetNode, BeignetNodeOptions } from './beignet-node';
 import { ILogger, createConsoleLogger } from '../logger';
 import { BeignetError } from './errors';
+import { L402Error } from '../lightning/l402';
 import { ApiResponse, RouteHop } from './types';
 import { getOpenApiSpec } from './openapi';
 import { WebhookManager } from './webhooks';
@@ -76,6 +77,9 @@ const IDEMPOTENT_ROUTES = new Set([
 	'POST /invoice/pay-retry',
 	'POST /keysend',
 	'POST /keysend/safe',
+	// An L402 fetch pays an invoice, and a retried fetch gets a fresh
+	// challenge with a fresh invoice, so an un-keyed retry pays twice.
+	'POST /l402/fetch',
 	// Fee-spending advisor execution: retries must not double-spend fees.
 	'POST /rebalance',
 	'POST /advisor/execute-rebalances'
@@ -164,7 +168,24 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	NOT_FOUND: 404,
 	IDEMPOTENCY_CONFLICT: 409,
 	BODY_TOO_LARGE: 413,
-	RATE_LIMITED: 429
+	RATE_LIMITED: 429,
+	// L402 refusals are decisions about the caller's request, not node faults.
+	// They must not read as 5xx, which is the class agents retry on: retrying
+	// a refused challenge just fetches a new invoice and refuses that too.
+	L402_PRICE_ABOVE_CAP: 402,
+	L402_AMOUNTLESS_INVOICE: 402,
+	L402_HASH_COMMITMENT_MISMATCH: 402,
+	L402_UNVERIFIABLE_MACAROON: 402,
+	L402_UNUSABLE_MACAROON: 402,
+	L402_CROSS_ORIGIN_CHALLENGE: 402,
+	L402_INVALID_INVOICE: 400,
+	L402_NO_PAYER: 400,
+	// The caller's response-size cap and the private-target guard are caller
+	// decisions too, and a network failure reaching the TARGET is upstream
+	// trouble, not a node fault: none of them may read as a retryable 500.
+	RESPONSE_TOO_LARGE: 413,
+	PRIVATE_NETWORK_REFUSED: 403,
+	L402_FETCH_FAILED: 502
 };
 
 export function statusForErrorCode(code: string): number {
@@ -1120,6 +1141,102 @@ export async function startDaemon(
 			const p = node.getPayment(paymentHash);
 			if (!p) return failure('NOT_FOUND', 'Payment not found');
 			return success(p);
+		},
+		'POST /l402/fetch': async (body) => {
+			const {
+				url,
+				method,
+				headers,
+				body: requestBody,
+				maxPriceSats,
+				maxFeeSats,
+				timeoutMs,
+				fetchTimeoutMs,
+				scopePerPath,
+				allowUnverifiedMacaroon,
+				allowCrossOriginChallenge,
+				allowPrivateNetwork,
+				maxResponseBytes
+			} = body as {
+				url: string;
+				method?: string;
+				headers?: Record<string, string>;
+				body?: string;
+				maxPriceSats?: number;
+				maxFeeSats?: number;
+				timeoutMs?: number;
+				fetchTimeoutMs?: number;
+				scopePerPath?: boolean;
+				allowUnverifiedMacaroon?: boolean;
+				allowCrossOriginChallenge?: boolean;
+				allowPrivateNetwork?: boolean;
+				maxResponseBytes?: number;
+			};
+			if (!url) return failure('INVALID_PARAMS', 'url required');
+			// The cap is mandatory over HTTP, not defaulted: a remote response
+			// header triggers the payment, so the price ceiling has to be a
+			// deliberate choice by the caller rather than one we invent. It is
+			// also an integer: a fractional cap would reach BigInt() in the
+			// payer and throw an opaque server fault instead of a 400.
+			if (!Number.isInteger(maxPriceSats) || (maxPriceSats as number) < 0) {
+				return failure(
+					'INVALID_PARAMS',
+					'maxPriceSats required, a non-negative integer satoshi cap on what one challenge may cost'
+				);
+			}
+			for (const [name, value] of [
+				['maxFeeSats', maxFeeSats],
+				['timeoutMs', timeoutMs],
+				['fetchTimeoutMs', fetchTimeoutMs],
+				['maxResponseBytes', maxResponseBytes]
+			] as Array<[string, number | undefined]>) {
+				if (value !== undefined && (!Number.isInteger(value) || value < 0)) {
+					return failure(
+						'INVALID_PARAMS',
+						`${name} must be a non-negative integer`
+					);
+				}
+			}
+			try {
+				return success(
+					await node.l402Fetch(
+						url,
+						{ method, headers, body: requestBody },
+						{
+							maxPriceSats: maxPriceSats as number,
+							maxFeeSats,
+							timeoutMs,
+							fetchTimeoutMs,
+							scopePerPath,
+							allowUnverifiedMacaroon,
+							allowCrossOriginChallenge,
+							allowPrivateNetwork,
+							maxResponseBytes
+						}
+					)
+				);
+			} catch (err: unknown) {
+				if (err instanceof L402Error) {
+					return failure(`L402_${err.code}`, err.message);
+				}
+				// BeignetError codes (RESPONSE_TOO_LARGE, payment failures, the
+				// private-target guard) map to their own statuses centrally.
+				if (err instanceof BeignetError) throw err;
+				// What remains is the network layer failing to reach the target
+				// (DNS, refused, reset, timeout). The top-level message names
+				// the caller's own URL and is worth relaying; the cause chain
+				// can carry resolved addresses and socket detail, so it stays
+				// out of the envelope.
+				const msg = err instanceof Error ? err.message : String(err);
+				return failure('L402_FETCH_FAILED', `fetch failed: ${msg}`);
+			}
+		},
+		'GET /l402/credentials': () => success(node.listL402Credentials()),
+		'DELETE /l402/credential': (_body, query) => {
+			const scope = query.get('scope');
+			if (!scope) return failure('INVALID_PARAMS', 'scope required');
+			node.forgetL402Credential(scope);
+			return success({ scope, forgotten: true });
 		},
 		'GET /payment/proof': (_body, query) => {
 			const paymentHash = query.get('paymentHash');
