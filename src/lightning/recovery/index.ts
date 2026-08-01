@@ -13,3 +13,4 @@ export * from './recovery-manager';
 export * from './frame-codec';
 export * from './journal';
 export * from './capsule';
+export * from './guardian-wire';
