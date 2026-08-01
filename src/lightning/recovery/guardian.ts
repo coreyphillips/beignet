@@ -243,6 +243,11 @@ export interface IGuardianRepairEvidenceResponse {
 }
 
 export interface IGuardianAlarm {
+	/**
+	 * EMPTY for a store-level alarm: when the recovery_id cell itself is
+	 * not a 32-byte BLOB, there is no namespace identity to attribute the
+	 * damage to, and fabricating one would be worse than saying so.
+	 */
 	recoveryId: Buffer;
 	status: GuardianStatus;
 	detail: string;
@@ -480,6 +485,23 @@ export class ReferenceGuardian {
 	): void {
 		if (this.onAlarm) {
 			this.onAlarm({ recoveryId: Buffer.from(recoveryId), status, detail });
+		}
+	}
+
+	/**
+	 * Report damage that cannot be attributed to an addressable namespace:
+	 * the recovery_id cell itself is not a 32-byte BLOB, so there is no key
+	 * to quarantine by and no Buffer to hand to consumers. The row is left
+	 * untouched; it is unreachable by every verb anyway, because no 32-byte
+	 * key can ever match it.
+	 */
+	private storeAlarm(detail: string): void {
+		if (this.onAlarm) {
+			this.onAlarm({
+				recoveryId: Buffer.alloc(0),
+				status: GuardianStatus.ERR_STORE_UNCERTAIN,
+				detail
+			});
 		}
 	}
 
@@ -1845,24 +1867,38 @@ export class ReferenceGuardian {
 	 */
 	private verifyStoreAtOpen(): void {
 		for (const ns of this.store.listNamespaces()) {
-			const key = ns.recoveryId.toString('hex');
-			if (
-				!isLen(ns.guardianSetId, 32) ||
-				!ns.guardianSetId.equals(this.guardianSetId)
-			) {
-				// Misconfiguration or column rot; nothing under this namespace
-				// is provably ours either way, so quarantine it UNTOUCHED: a
-				// healthy store opened under the wrong configuration must not
-				// be rolled back, archived, or tombstoned by mistake.
-				this.quarantined.add(key);
-				this.alarm(
-					ns.recoveryId,
-					GuardianStatus.ERR_STORE_UNCERTAIN,
-					'namespace is not registered under this guardian set; quarantined untouched'
+			// The identity cell itself is untrusted: a non-STRICT table can
+			// hold an INTEGER or TEXT where the 32-byte BLOB belongs, and any
+			// Buffer operation on such a value throws OUTSIDE the containment
+			// below. Validate it before touching it; a row whose identity is
+			// unreadable is reported at store level and left untouched (it is
+			// unreachable by every verb, since no 32-byte key can match it).
+			if (!isLen(ns.recoveryId, 32)) {
+				this.storeAlarm(
+					'namespace row has a malformed recovery_id storage class or width; left untouched'
 				);
 				continue;
 			}
+			const recoveryId = ns.recoveryId;
+			const key = recoveryId.toString('hex');
 			try {
+				if (
+					!isLen(ns.guardianSetId, 32) ||
+					!ns.guardianSetId.equals(this.guardianSetId)
+				) {
+					// Misconfiguration or column rot; nothing under this
+					// namespace is provably ours either way, so quarantine it
+					// UNTOUCHED: a healthy store opened under the wrong
+					// configuration must not be rolled back, archived, or
+					// tombstoned by mistake.
+					this.quarantined.add(key);
+					this.alarm(
+						recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						'namespace is not registered under this guardian set; quarantined untouched'
+					);
+					continue;
+				}
 				this.store.write(() => this.verifyNamespaceAtOpen(ns));
 			} catch (error) {
 				// The walk and rollback are non-throwing over persisted bytes;
@@ -1871,7 +1907,7 @@ export class ReferenceGuardian {
 				const message = error instanceof Error ? error.message : String(error);
 				this.quarantined.add(key);
 				this.alarm(
-					ns.recoveryId,
+					recoveryId,
 					GuardianStatus.ERR_STORE_UNCERTAIN,
 					`namespace verification could not complete (${message}); quarantined`
 				);

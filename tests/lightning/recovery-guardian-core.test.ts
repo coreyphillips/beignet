@@ -1768,6 +1768,106 @@ describe('Guardian core: structural corruption containment', () => {
 		raw.close();
 		expect(count.n).to.equal(2);
 	});
+
+	it('a non-BLOB recovery_id cannot brick startup; other namespaces keep serving', () => {
+		const file = path.join(dir, 'integer-recovery-id.sqlite');
+		const guardian = makeGuardian(0, file);
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) guardian.putState({ record });
+
+		const root2 = deriveRecoveryRoot(sha('core-node-secret-3'));
+		const state2: GuardianState = {
+			recoveryId: root2.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: WRITER_1.pub },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		const registration2: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState: state2,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, state2),
+				root2.rootSecret
+			)
+		};
+		expect(guardian.register(registration2).status).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		// A non-STRICT table accepts an INTEGER where the 32-byte BLOB primary
+		// key belongs; before the fix, recoveryId.toString('hex') on the
+		// resulting number threw OUTSIDE the per-namespace containment and the
+		// constructor closed the database and rethrew.
+		corrupt(
+			file,
+			'UPDATE guardian_namespaces SET recovery_id = 1 WHERE recovery_id = ?',
+			ROOT.recoveryId
+		);
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = reopen(file, alarms);
+		const storeAlarms = alarms.filter((a) => a.recoveryId.length === 0);
+		expect(storeAlarms.length).to.equal(1);
+		expect(storeAlarms[0].detail).to.contain('recovery_id');
+		// The damaged row is unreachable by any 32-byte key; the healthy
+		// namespace is untouched and fully serviceable.
+		expect(reopened.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		const healthy = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: root2.recoveryId
+		});
+		expect(healthy.status).to.equal(GuardianStatus.OK);
+		expect(healthy.possiblyStale).to.equal(false);
+		reopened.close();
+
+		// The report repeats on every open (the row stays, untouched, until
+		// an operator repairs it), and startup keeps succeeding.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(
+			laterAlarms.filter((a) => a.recoveryId.length === 0).length
+		).to.equal(1);
+		expect(
+			again.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: root2.recoveryId
+			}).status
+		).to.equal(GuardianStatus.OK);
+		again.close();
+	});
+
+	it('a same-width TEXT recovery_id is reported at store level, not thrown', () => {
+		const fixture = shapeFixture('text-recovery-id.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?',
+			'y'.repeat(32),
+			ROOT.recoveryId
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some(
+				(a) => a.recoveryId.length === 0 && a.detail.includes('recovery_id')
+			)
+		).to.equal(true);
+		expect(guardian.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(
+			laterAlarms.filter((a) => a.recoveryId.length === 0).length
+		).to.equal(1);
+		again.close();
+	});
 });
 
 describe('Guardian core: INFO', () => {
