@@ -23,6 +23,7 @@ import {
 	recordTranscriptHash,
 	registerTranscriptHash,
 	signTranscript,
+	parseStateBytes,
 	stateBytes,
 	statesEqual,
 	takeoverTranscriptHash,
@@ -117,6 +118,27 @@ describe('Guardian wire: canonical transcripts', () => {
 		);
 		expect(statesEqual(state, vectorState())).to.equal(true);
 		expect(isGenesisLogHead(state.logHead)).to.equal(true);
+	});
+
+	it('parseStateBytes inverts stateBytes byte-exactly and rejects bad lengths', () => {
+		const state = vectorState();
+		state.lease.epoch = 7n;
+		state.logHead = {
+			sequence: 41n,
+			frameHash: sha('frame-41'),
+			ciphertextHash: sha('ciphertext-41'),
+			recordEpoch: 6n
+		};
+		const bytes = stateBytes(state);
+		const parsed = parseStateBytes(bytes);
+		expect(statesEqual(parsed, state)).to.equal(true);
+		expect(stateBytes(parsed).equals(bytes)).to.equal(true);
+		expect(parsed.lease.epoch).to.equal(7n);
+		expect(parsed.logHead.recordEpoch).to.equal(6n);
+		expect(() => parseStateBytes(bytes.subarray(0, 191))).to.throw(/192/);
+		expect(() =>
+			parseStateBytes(Buffer.concat([bytes, Buffer.alloc(1)]))
+		).to.throw(/192/);
 	});
 
 	it('every signed object round-trips and rejects tampering', () => {

@@ -264,6 +264,41 @@ export function statesEqual(a: GuardianState, b: GuardianState): boolean {
 	return stateBytes(a).equals(stateBytes(b));
 }
 
+/**
+ * Inverse of stateBytes: parse a 192-byte canonical STATE. The guardian
+ * persists states in exactly this byte form, so storage round trips are
+ * byte-exact by construction.
+ */
+export function parseStateBytes(buf: Buffer): GuardianState {
+	if (buf.length !== 192) {
+		throw new Error(`canonical STATE must be 192 bytes, got ${buf.length}`);
+	}
+	let offset = 0;
+	const take = (n: number): Buffer => {
+		const piece = Buffer.from(buf.subarray(offset, offset + n));
+		offset += n;
+		return piece;
+	};
+	const takeU64 = (): bigint => {
+		const value = buf.readBigUInt64BE(offset);
+		offset += 8;
+		return value;
+	};
+	const recoveryId = take(32);
+	const lease: WriterLease = { epoch: takeU64(), writerPublicKey: take(32) };
+	const origin: ChainOrigin = {
+		firstSequence: takeU64(),
+		previousHash: take(32)
+	};
+	const logHead: LogHead = {
+		sequence: takeU64(),
+		frameHash: take(32),
+		ciphertextHash: take(32),
+		recordEpoch: takeU64()
+	};
+	return { recoveryId, lease, origin, logHead };
+}
+
 function prefixBytes(guardianSetId: Buffer): Buffer {
 	return Buffer.concat([
 		u16(GUARDIAN_PROTOCOL_VERSION),

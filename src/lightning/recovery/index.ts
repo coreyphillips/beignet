@@ -14,3 +14,5 @@ export * from './frame-codec';
 export * from './journal';
 export * from './capsule';
 export * from './guardian-wire';
+export * from './guardian-store';
+export * from './guardian';
