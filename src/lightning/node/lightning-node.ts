@@ -197,6 +197,7 @@ import {
 	RecoveryMutation,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
+	deriveRecoveryRoot,
 	journalSupported,
 	composeRecoveryCapsule
 } from '../recovery';
@@ -618,6 +619,9 @@ export class LightningNode extends EventEmitter {
 						this.storage,
 						deriveRecoveryMasterKey(config.nodePrivateKey),
 						getPublicKey(config.nodePrivateKey),
+						// The guardian namespace keys the deterministic frame IV
+						// (wire spec 1.1, 3.2); never the public node id.
+						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
 							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes

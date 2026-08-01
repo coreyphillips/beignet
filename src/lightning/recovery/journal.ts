@@ -24,7 +24,8 @@
  * originals, which is what makes the rebuilt tables byte-identical.
  */
 
-import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
+import { createCipheriv, createDecipheriv } from 'crypto';
+import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
@@ -114,12 +115,25 @@ function frameAad(
 	return Buffer.concat([nodeId, numbers, previousFrameHash]);
 }
 
+/**
+ * Encrypt one frame under an EXPLICIT 96-bit IV. From wire spec revision 4
+ * the journal derives it deterministically (deriveFrameIv over recovery_id,
+ * epoch, sequence and frame hash) instead of drawing it from the CSPRNG: a
+ * VM snapshot rollback that replays RNG state can repeat a random IV under
+ * the same key across DIFFERENT plaintexts, while the deterministic form
+ * can only collide by encrypting the identical plaintext at the identical
+ * position, which is harmless. The IV travels with the ciphertext, so
+ * frames written before the switch stay decryptable forever.
+ */
 export function encryptFrame(
 	frameKey: Buffer,
 	plaintext: Buffer,
-	aad: Buffer
+	aad: Buffer,
+	iv: Buffer
 ): Buffer {
-	const iv = randomBytes(IV_LENGTH);
+	if (iv.length !== IV_LENGTH) {
+		throw new Error(`Frame IV must be ${IV_LENGTH} bytes, got ${iv.length}`);
+	}
 	const cipher = createCipheriv('aes-256-gcm', frameKey, iv);
 	cipher.setAAD(aad);
 	const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
@@ -163,23 +177,37 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly storage: IStorageBackend;
 	private readonly masterKey: Buffer;
 	private readonly nodeId: Buffer;
+	private readonly recoveryId: Buffer;
 	private readonly snapshotInterval: number;
 	private readonly snapshotIntervalBytes: number;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
 
+	/**
+	 * @param recoveryId The guardian namespace (wire spec 1.1): the x-only
+	 *   recovery root public key. It keys the DETERMINISTIC frame IV
+	 *   (wire 3.2) and is deliberately NOT the Lightning node id: every
+	 *   other IV input is visible in a stored record, so a node-id-keyed IV
+	 *   would let anyone test a candidate Lightning identity against a
+	 *   record and break unlinkability.
+	 */
 	constructor(
 		storage: IStorageBackend,
 		masterKey: Buffer,
 		nodeId: Buffer,
+		recoveryId: Buffer,
 		options: IRecoveryJournalOptions = {}
 	) {
 		if (!journalSupported(storage)) {
 			throw new Error('Storage backend does not support the recovery journal');
 		}
+		if (recoveryId.length !== 32) {
+			throw new Error('recoveryId must be 32 bytes (x-only recovery root)');
+		}
 		this.storage = storage;
 		this.masterKey = masterKey;
 		this.nodeId = nodeId;
+		this.recoveryId = recoveryId;
 		this.snapshotInterval =
 			options.snapshotIntervalFrames ?? DEFAULT_SNAPSHOT_INTERVAL_FRAMES;
 		this.snapshotIntervalBytes =
@@ -358,12 +386,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			frame.sequence,
 			frame.previousFrameHash
 		);
+		// Deterministic IV (wire 3.2): namespace-bound, RNG-rollback-proof,
+		// and collision-free except for the identical plaintext at the
+		// identical position, which re-encrypts identically.
+		const iv = deriveFrameIv(
+			this.recoveryId,
+			frame.writerEpoch,
+			frame.sequence,
+			frameHash
+		);
 		this.storage.saveRecoveryFrame!({
 			sequence: Number(frame.sequence),
 			writerEpoch: Number(frame.writerEpoch),
 			frameHash,
 			previousFrameHash: frame.previousFrameHash,
-			ciphertext: encryptFrame(key, plaintext, aad),
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
 			createdAt: frame.timestamp
 		});
 		this.storage.setRecoveryMeta!(META_TIP_SEQUENCE, frame.sequence.toString());

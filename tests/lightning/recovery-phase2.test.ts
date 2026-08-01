@@ -30,6 +30,11 @@ import {
 	RecoveryJournal,
 	RecoveryFrame,
 	deriveRecoveryMasterKey,
+	deriveRecoveryRoot,
+	deriveFrameIv,
+	deriveFrameKey,
+	encryptFrame,
+	decryptFrame,
 	journalSupported,
 	reconstructFromFrames,
 	encodeFrame,
@@ -139,6 +144,7 @@ function prngBytes(rand: () => number, length: number): Buffer {
 const NODE_SECRET = makeSeed(9);
 const NODE_ID = getPublicKey(NODE_SECRET);
 const MASTER_KEY = deriveRecoveryMasterKey(NODE_SECRET);
+const RECOVERY_ID = deriveRecoveryRoot(NODE_SECRET).recoveryId;
 
 function openStorage(): SqliteStorage {
 	const storage = new SqliteStorage(':memory:');
@@ -150,9 +156,15 @@ function makeJournaledManager(
 	storage: SqliteStorage,
 	snapshotIntervalFrames = 1000
 ): { manager: RecoveryManager; journal: RecoveryJournal } {
-	const journal = new RecoveryJournal(storage, MASTER_KEY, NODE_ID, {
-		snapshotIntervalFrames
-	});
+	const journal = new RecoveryJournal(
+		storage,
+		MASTER_KEY,
+		NODE_ID,
+		RECOVERY_ID,
+		{
+			snapshotIntervalFrames
+		}
+	);
 	const manager = new RecoveryManager(storage, { journal });
 	return { manager, journal };
 }
@@ -609,6 +621,58 @@ describe('Recovery phase 2: journal append', () => {
 		storage.close();
 	});
 
+	it('derives every frame IV deterministically from the recovery namespace (wire 3.2)', () => {
+		const storage = openStorage();
+		const { manager, journal } = makeJournaledManager(storage);
+		const rand = mulberry32(11);
+		const channelIds = [prngBytes(rand, 32)];
+		for (let i = 0; i < 4; i++) {
+			const t = randomTransition(rand, channelIds);
+			expect(
+				manager.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					...t
+				}).committed
+			).to.equal(true);
+		}
+		expect(journal.loadVerifiedFrames().length).to.be.greaterThan(0);
+		// The stored IV (first 12 ciphertext bytes) is exactly the tagged-hash
+		// derivation over (recovery_id, epoch, sequence, frameHash): no RNG
+		// anywhere, so a VM-snapshot RNG rollback cannot repeat a (key, IV)
+		// pair across different plaintexts.
+		for (const row of storage.loadRecoveryFrames()) {
+			const expected = deriveFrameIv(
+				RECOVERY_ID,
+				BigInt(row.writerEpoch),
+				BigInt(row.sequence),
+				row.frameHash
+			);
+			expect(row.ciphertext.subarray(0, 12).equals(expected)).to.equal(true);
+			// And never keyed by the PUBLIC node id: that would be an offline
+			// linkage oracle against the stored record (wire 1.1).
+			const nodeKeyed = deriveFrameIv(
+				NODE_ID.subarray(1),
+				BigInt(row.writerEpoch),
+				BigInt(row.sequence),
+				row.frameHash
+			);
+			expect(row.ciphertext.subarray(0, 12).equals(nodeKeyed)).to.equal(false);
+		}
+		storage.close();
+	});
+
+	it('keeps frames written under the old random IVs decryptable', () => {
+		// Pre-revision-4 frames drew the IV from the CSPRNG; the IV travels
+		// with the ciphertext and decryption never re-derives it, so they
+		// stay readable forever.
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, 1n);
+		const plaintext = Buffer.from('a legacy frame payload', 'utf8');
+		const aad = Buffer.concat([NODE_ID, Buffer.alloc(16)]);
+		const randomIv = Buffer.from('0102030405060708090a0b0c', 'hex');
+		const legacy = encryptFrame(key, plaintext, aad, randomIv);
+		expect(decryptFrame(key, legacy, aad).equals(plaintext)).to.equal(true);
+	});
+
 	it('journals nothing when the transition fails', () => {
 		const storage = openStorage();
 		const { manager, journal } = makeJournaledManager(storage);
@@ -640,7 +704,9 @@ describe('Recovery phase 2: journal append', () => {
 					return typeof value === 'function' ? value.bind(target) : value;
 				}
 			}) as IStorageBackend,
-			{ journal: new RecoveryJournal(storage, MASTER_KEY, NODE_ID) }
+			{
+				journal: new RecoveryJournal(storage, MASTER_KEY, NODE_ID, RECOVERY_ID)
+			}
 		);
 		const result = broken.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
@@ -1009,10 +1075,16 @@ describe('Recovery phase 2: fail-closed verification', () => {
 
 	it('snapshots on accumulated delta BYTES, not only frame count', () => {
 		const storage = openStorage();
-		const journal = new RecoveryJournal(storage, MASTER_KEY, NODE_ID, {
-			snapshotIntervalFrames: 10_000,
-			snapshotIntervalBytes: 1
-		});
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				snapshotIntervalFrames: 10_000,
+				snapshotIntervalBytes: 1
+			}
+		);
 		const manager = new RecoveryManager(storage, { journal });
 		const rand = mulberry32(22);
 		const channelIds = [prngBytes(rand, 32)];
@@ -1175,7 +1247,8 @@ describe('Recovery phase 2: wiring and defaults', () => {
 		const journal = new RecoveryJournal(
 			storage,
 			deriveRecoveryMasterKey(aliceKey),
-			Buffer.from(alice.getNodeId(), 'hex')
+			Buffer.from(alice.getNodeId(), 'hex'),
+			deriveRecoveryRoot(aliceKey).recoveryId
 		);
 		const frames = journal.loadVerifiedFrames();
 		expect(frames.length).to.be.greaterThan(1);
