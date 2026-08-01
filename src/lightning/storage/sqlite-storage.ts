@@ -1763,6 +1763,10 @@ export class SqliteStorage implements IStorageBackend {
 			.run(key, this._enc(value));
 	}
 
+	deleteRecoveryMeta(key: string): void {
+		this.db.prepare('DELETE FROM recovery_meta WHERE key = ?').run(key);
+	}
+
 	// ─── Watchtower (LND altruist client) ───
 	// session_key + encrypted_blob are encrypted at rest (see ENCRYPTED_COLUMNS).
 

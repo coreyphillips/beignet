@@ -7,9 +7,9 @@
  * are never seed-derived; the private half never sits in plaintext, and
  * never reaches storage that cannot protect it; the lease is ONE atomic
  * artifact, so no crash yields a new epoch beside an old key; confirmation
- * is identity-bound and never inherited; and a damaged lease fails CLOSED
- * rather than reading as "no lease", which would authorize a fresh
- * registration over live state.
+ * is identity-bound and never inherited; a damaged lease fails CLOSED; a
+ * MISSING lease is evidence rather than proof of first registration; and
+ * nothing this module accepts can fail to reload.
  */
 
 import { expect } from 'chai';
@@ -116,7 +116,7 @@ describe('Recovery phase 5: writer lease', () => {
 
 	it('round trips through storage and shares the journal epoch key', () => {
 		const storage = openStorage();
-		expect(loadWriterLease(storage).state).to.equal('absent');
+		expect(loadWriterLease(storage).state).to.equal('missing');
 
 		const writer = generateWriterKey();
 		saveWriterLease(storage, leaseOf(7n, writer));
@@ -298,7 +298,7 @@ describe('Recovery phase 5: writer lease', () => {
 		expect(() => saveWriterLease(storage, leaseOf(0n, writer))).to.throw(
 			/epoch is outside/
 		);
-		expect(loadWriterLease(storage).state).to.equal('absent');
+		expect(loadWriterLease(storage).state).to.equal('missing');
 		storage.close();
 	});
 
@@ -313,7 +313,7 @@ describe('Recovery phase 5: writer lease', () => {
 			expect(() => saveWriterLease(storage, leaseOf(1n, writer))).to.throw(
 				/encryption at rest/
 			);
-			expect(loadWriterLease(storage).state).to.equal('absent');
+			expect(loadWriterLease(storage).state).to.equal('missing');
 			// The operator can accept the risk explicitly, and only explicitly.
 			saveWriterLease(storage, leaseOf(1n, writer), {
 				allowUnencryptedSecrets: true
@@ -489,6 +489,92 @@ describe('Recovery phase 5: writer lease', () => {
 				ROOT.rootSecret
 			)
 		).to.throw(/does not belong/);
+	});
+
+	it('reports a missing lease as evidence, never as proof of first registration', () => {
+		const storage = openStorage();
+		const writer = generateWriterKey();
+		saveWriterLease(storage, leaseOf(1n, writer));
+
+		// Lose the lease row while the journal epoch survives. Epoch 1 is
+		// genuinely ambiguous, because the journal writes epoch 1 itself on
+		// its first frame: a guardian-disabled node and a node that lost its
+		// genesis lease are indistinguishable HERE. So the loader reports
+		// missing plus the evidence, and the caller must consult the guardian
+		// quorum before concluding anything.
+		storage.deleteRecoveryMeta!(LEASE_META_KEYS.lease);
+		const loaded = loadWriterLease(storage);
+		expect(loaded.state).to.equal('missing');
+		expect(
+			(loaded as { state: 'missing'; journalEpoch: bigint | null }).journalEpoch
+		).to.equal(1n);
+
+		// Above epoch 1 there is no ambiguity: only a lease acquisition ever
+		// advances that key, so the key material provably went missing.
+		saveWriterLease(storage, leaseOf(2n, writer));
+		storage.deleteRecoveryMeta!(LEASE_META_KEYS.lease);
+		expect(() => loadWriterLease(storage)).to.throw(CorruptWriterLeaseError);
+
+		// A journal epoch of 0, or anything nonnumeric, is corruption rather
+		// than a default.
+		const zeroed = openStorage();
+		zeroed.setRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch, '0');
+		expect(() => loadWriterLease(zeroed)).to.throw(CorruptWriterLeaseError);
+		zeroed.setRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch, 'not-a-number');
+		expect(() => loadWriterLease(zeroed)).to.throw(CorruptWriterLeaseError);
+		zeroed.close();
+
+		// Storage that cannot answer is "cannot determine", not "never
+		// registered": it must throw rather than report a fact it lacks.
+		const unsupported = {} as IStorageBackend;
+		expect(() => loadWriterLease(unsupported)).to.throw(/does not support/);
+		storage.close();
+	});
+
+	it('never persists a lease or confirmation its own loader would reject', () => {
+		const storage = openStorage();
+		const writer = generateWriterKey();
+		saveWriterLease(storage, leaseOf(1n, writer));
+
+		for (const invalid of [-1n, 0x1_0000_0000_0000_0000n]) {
+			expect(() =>
+				markLeaseConfirmed(
+					storage,
+					{ epoch: 1n, writerPublicKey: writer.publicKey },
+					invalid
+				)
+			).to.throw(/u64 range/);
+			// The rejected value never reached the blob.
+			expect(presentLease(storage).confirmedAt).to.equal(null);
+		}
+		expect(() =>
+			saveWriterLease(storage, leaseOf(1n, writer, 0x1_0000_0000_0000_0000n))
+		).to.throw(/u64 range/);
+
+		// A structurally broken certificate is refused on the way IN, not
+		// discovered on the way out: an untrusted guardian response reaches
+		// this module through a hand-rolled decoder that can hand back short
+		// or empty buffers.
+		const broken = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			guardianId: GUARDIAN_IDS[0],
+			supersededState: {
+				recoveryId: ROOT.recoveryId,
+				lease: { epoch: 1n, writerPublicKey: writer.publicKey },
+				origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+				logHead: genesisLogHead()
+			},
+			newEpoch: 1n,
+			newWriterPublicKey: writer.publicKey,
+			issuedAt: 5n,
+			signature: Buffer.alloc(0)
+		} as IGuardianTakeoverCertificate;
+		expect(() =>
+			saveWriterLease(storage, leaseOf(1n, writer, null, [broken]))
+		).to.throw(/signature is not 64 bytes/);
+		expect(presentLease(storage).guardianCertificates).to.have.length(0);
+		storage.close();
 	});
 
 	it('never writes the writer secret in plaintext when storage is encrypted', () => {

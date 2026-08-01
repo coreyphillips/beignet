@@ -300,6 +300,8 @@ export interface IStorageBackend {
 	getRecoveryMeta?(key: string): string | null;
 	/** Write one journal metadata value. */
 	setRecoveryMeta?(key: string, value: string): void;
+	/** Remove one journal metadata value. */
+	deleteRecoveryMeta?(key: string): void;
 	/**
 	 * Whether secrets written through this backend are protected at rest.
 	 * The writer lease (recovery 5.6) keeps a signing key, so it refuses to

@@ -22,8 +22,14 @@
  *   replacing the lease clears it, and confirming names the pair it
  *   expects, so a late callback cannot bless whatever lease is current.
  * - Loading FAILS CLOSED. A partial, malformed, or self-inconsistent lease
- *   throws rather than reading as "absent", because absent means "register
- *   fresh" and that is the one conclusion corruption must never produce.
+ *   throws rather than reading as missing, and storage that cannot answer
+ *   throws rather than reporting a fact it does not have. A missing lease
+ *   is EVIDENCE, never a conclusion: it can never authorize a fresh
+ *   registration on its own, because a lost genesis lease and a
+ *   guardian-disabled node are indistinguishable locally.
+ * - Every artifact this module accepts must be one it can read back. Both
+ *   write paths validate exactly what the loader demands, so no accepted
+ *   write can produce a lease that fails to load.
  * - The private half is written only into storage that can protect it at
  *   rest, and never leaves the device.
  */
@@ -90,9 +96,30 @@ export interface IWriterLeaseIdentity {
 	writerPublicKey: Buffer;
 }
 
-/** Absent is a fact; corruption throws rather than masquerading as absent. */
+/**
+ * The load result. `missing` deliberately does NOT claim "never registered":
+ * local absence proves nothing on its own, because the journal writes its
+ * own `writerEpoch` on its first frame, so a guardian-disabled node and a
+ * node that lost its genesis lease look identical on disk. Corruption
+ * throws rather than arriving here.
+ *
+ * The startup driver decides what missing MEANS, and it may never conclude
+ * "register fresh" from local state alone (spec 5.6, 5.7):
+ *
+ * ```text
+ * missing + guardians disabled  -> ordinary journal-only operation
+ * missing + guardians configured
+ *     -> quarantine, then ask the guardian quorum:
+ *        quorum reports the namespace unknown -> REGISTER_NODE
+ *        the namespace exists                 -> restore or ACQUIRE_EPOCH
+ *        no quorum                            -> stay quarantined
+ * ```
+ *
+ * `journalEpoch` is the evidence that decision starts from: null when no
+ * journal has ever written, otherwise the epoch its frames carry.
+ */
 export type WriterLeaseLoad =
-	| { state: 'absent' }
+	| { state: 'missing'; journalEpoch: bigint | null }
 	| { state: 'present'; lease: IWriterLeaseKeys };
 
 export interface IWriterLeasePersistOptions {
@@ -336,13 +363,112 @@ function decodeCertificate(
  * sufficiency is not judged here (it needs the configured guardian set);
  * that belongs to the guardian integration layer.
  */
+function assertU64(
+	value: bigint,
+	field: string,
+	fail: (m: string) => Error,
+	min = 0n
+): void {
+	if (typeof value !== 'bigint' || value < min || value > U64_MAX) {
+		throw fail(`${field} is outside its allowed u64 range`);
+	}
+}
+
+function assertBuffer(
+	value: Buffer,
+	bytes: number,
+	field: string,
+	fail: (m: string) => Error
+): void {
+	if (!Buffer.isBuffer(value) || value.length !== bytes) {
+		throw fail(`${field} is not ${bytes} bytes`);
+	}
+}
+
+/**
+ * Structural validity of a certificate as an ARTIFACT, applied on the way in
+ * as well as on the way out. Certificates arrive from untrusted guardians
+ * through a hand-rolled decoder that can hand back empty or short buffers,
+ * so satisfying the TypeScript interface proves nothing about the bytes.
+ */
+function assertCertificateStructure(
+	cert: IGuardianTakeoverCertificate,
+	index: number,
+	fail: (m: string) => Error
+): void {
+	if (!Number.isInteger(cert.protocolVersion) || cert.protocolVersion < 1) {
+		throw fail(`certificate ${index} has no protocol version`);
+	}
+	assertBuffer(
+		cert.guardianSetId,
+		32,
+		`certificate ${index} guardianSetId`,
+		fail
+	);
+	assertBuffer(cert.guardianId, 32, `certificate ${index} guardianId`, fail);
+	assertBuffer(
+		cert.newWriterPublicKey,
+		32,
+		`certificate ${index} newWriterPublicKey`,
+		fail
+	);
+	assertBuffer(cert.signature, 64, `certificate ${index} signature`, fail);
+	assertU64(cert.newEpoch, `certificate ${index} newEpoch`, fail, 1n);
+	assertU64(cert.issuedAt, `certificate ${index} issuedAt`, fail);
+	const state = cert.supersededState;
+	if (typeof state !== 'object' || state === null) {
+		throw fail(`certificate ${index} has no superseded state`);
+	}
+	assertBuffer(state.recoveryId, 32, `certificate ${index} recoveryId`, fail);
+	assertU64(
+		state.lease.epoch,
+		`certificate ${index} superseded epoch`,
+		fail,
+		1n
+	);
+	assertBuffer(
+		state.lease.writerPublicKey,
+		32,
+		`certificate ${index} superseded writer key`,
+		fail
+	);
+	assertU64(
+		state.origin.firstSequence,
+		`certificate ${index} origin firstSequence`,
+		fail,
+		1n
+	);
+	assertBuffer(
+		state.origin.previousHash,
+		32,
+		`certificate ${index} origin previousHash`,
+		fail
+	);
+	assertU64(state.logHead.sequence, `certificate ${index} head sequence`, fail);
+	assertU64(
+		state.logHead.recordEpoch,
+		`certificate ${index} head recordEpoch`,
+		fail
+	);
+	assertBuffer(
+		state.logHead.frameHash,
+		32,
+		`certificate ${index} head frameHash`,
+		fail
+	);
+	assertBuffer(
+		state.logHead.ciphertextHash,
+		32,
+		`certificate ${index} head ciphertextHash`,
+		fail
+	);
+}
+
 function assertConsistent(
 	lease: IWriterLeaseKeys,
 	fail: (m: string) => Error
 ): void {
-	if (lease.epoch < 1n || lease.epoch > U64_MAX) {
-		throw fail('epoch is outside its allowed range');
-	}
+	assertU64(lease.epoch, 'epoch', fail, 1n);
 	if (lease.writerSecret.length !== 32 || !ecc.isPrivate(lease.writerSecret)) {
 		throw fail('writer secret is not a valid secp256k1 scalar');
 	}
@@ -352,10 +478,16 @@ function assertConsistent(
 	if (!xOnlyFromSecret(lease.writerSecret).equals(lease.writerPublicKey)) {
 		throw fail('writer public key does not belong to the writer secret');
 	}
-	if (lease.confirmedAt !== null && lease.confirmedAt < 0n) {
-		throw fail('confirmedAt is negative');
+	if (lease.confirmedAt !== null) {
+		assertU64(lease.confirmedAt, 'confirmedAt', fail);
+	}
+	if (!Array.isArray(lease.guardianCertificates)) {
+		throw fail('certificates are not an array');
 	}
 	for (const [index, cert] of lease.guardianCertificates.entries()) {
+		// Structure first: an artifact this module cannot re-read is an
+		// artifact it must never write. Everything accepted here must load.
+		assertCertificateStructure(cert, index, fail);
 		if (cert.newEpoch !== lease.epoch) {
 			throw fail(`certificate ${index} grants a different epoch`);
 		}
@@ -368,25 +500,33 @@ function assertConsistent(
 // ─────────────── persistence ───────────────
 
 /**
- * Read the persisted lease. `absent` means this installation has never held
- * one (guardians disabled, or enabled but not yet registered). Anything
- * present but unreadable throws: absent authorizes a fresh registration,
- * and corruption must never be allowed to authorize that.
+ * Read the persisted lease. Storage that cannot answer at all THROWS rather
+ * than reporting missing: "cannot determine" is not "never registered".
+ * Anything stored but unreadable throws too. See {@link WriterLeaseLoad} for
+ * why a missing lease is evidence rather than a conclusion.
  */
 export function loadWriterLease(storage: IStorageBackend): WriterLeaseLoad {
-	if (!leaseStorageSupported(storage)) return { state: 'absent' };
+	requireLeaseStorage(storage);
 	const raw = storage.getRecoveryMeta!(META_WRITER_LEASE);
 	const epochRaw = storage.getRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch);
+	// Strict: a journal epoch of 0, a negative value, or anything nonnumeric
+	// is corruption, not a default.
+	const journalEpoch =
+		epochRaw == null ? null : decodeU64(epochRaw, 'journal epoch', 1n);
 	if (raw == null) {
-		// The journal's default epoch (1, with no lease) is ordinary: the
-		// journal may run without guardians. An epoch ABOVE the default with
-		// no lease means key material was lost, which is not absence.
-		if (epochRaw != null && BigInt(epochRaw) > 1n) {
+		// Epoch 1 with no lease is genuinely ambiguous and MUST stay that way:
+		// the journal itself writes epoch 1 on its first frame (journal.ts),
+		// so a guardian-disabled node and a node that lost its genesis lease
+		// are indistinguishable here. Only the guardian quorum can tell them
+		// apart, which is why missing never authorizes registration by
+		// itself. An epoch ABOVE 1 is different: only a lease acquisition
+		// ever advances it, so key material provably went missing.
+		if (journalEpoch !== null && journalEpoch > 1n) {
 			throw new CorruptWriterLeaseError(
-				`journal epoch ${epochRaw} has no lease; writer key material is missing`
+				`journal epoch ${journalEpoch} has no lease; writer key material is missing`
 			);
 		}
-		return { state: 'absent' };
+		return { state: 'missing', journalEpoch };
 	}
 
 	let parsed: IPersistedWriterLeaseV1;
@@ -478,6 +618,13 @@ export function markLeaseConfirmed(
 	confirmedAt: bigint
 ): void {
 	requireLeaseStorage(storage);
+	// Anything this module accepts must reload: validate before writing,
+	// never after.
+	assertU64(
+		confirmedAt,
+		'confirmedAt',
+		(m) => new Error(`refusing to confirm lease: ${m}`)
+	);
 	storage.transaction(() => {
 		const loaded = loadWriterLease(storage);
 		if (loaded.state !== 'present') {
@@ -494,10 +641,12 @@ export function markLeaseConfirmed(
 					'was not the one confirmed'
 			);
 		}
-		storage.setRecoveryMeta!(
-			META_WRITER_LEASE,
-			encodeWriterLease({ ...current, confirmedAt })
+		const confirmed: IWriterLeaseKeys = { ...current, confirmedAt };
+		assertConsistent(
+			confirmed,
+			(m) => new Error(`refusing to confirm lease: ${m}`)
 		);
+		storage.setRecoveryMeta!(META_WRITER_LEASE, encodeWriterLease(confirmed));
 	});
 }
 
