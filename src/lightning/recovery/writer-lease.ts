@@ -133,6 +133,27 @@ export interface IWriterLeasePersistOptions {
 	allowUnencryptedSecrets?: boolean;
 }
 
+/**
+ * Refuse to write a writer secret into storage that cannot protect it.
+ * Shared by every artifact that holds one: the lease itself, and the
+ * pending registration and acquisition records that carry a key before it
+ * becomes a lease. An artifact holding a signing key must never be easier
+ * to steal than the lease it will become.
+ */
+export function requireEncryptedSecretStorage(
+	storage: IStorageBackend,
+	allowUnencryptedSecrets?: boolean
+): void {
+	if (allowUnencryptedSecrets) return;
+	if (storage.secretsEncryptedAtRest?.() === true) return;
+	throw new Error(
+		'refusing to persist a writer signing key into storage that cannot ' +
+			'guarantee encryption at rest; configure a storage encryption key, ' +
+			'or set allowUnencryptedSecrets when the database is protected by ' +
+			'other means'
+	);
+}
+
 export function leaseStorageSupported(storage: IStorageBackend): boolean {
 	return (
 		typeof storage.getRecoveryMeta === 'function' &&
@@ -584,17 +605,7 @@ export function saveWriterLease(
 ): void {
 	requireLeaseStorage(storage);
 	assertConsistent(lease, (m) => new Error(`refusing to persist lease: ${m}`));
-	if (
-		!options.allowUnencryptedSecrets &&
-		storage.secretsEncryptedAtRest?.() !== true
-	) {
-		throw new Error(
-			'refusing to persist the writer signing key into storage that cannot ' +
-				'guarantee encryption at rest; configure a storage encryption key, ' +
-				'or set allowUnencryptedSecrets when the database is protected by ' +
-				'other means'
-		);
-	}
+	requireEncryptedSecretStorage(storage, options.allowUnencryptedSecrets);
 	const encoded = encodeWriterLease(lease);
 	storage.transaction(() => {
 		storage.setRecoveryMeta!(META_WRITER_LEASE, encoded);

@@ -24,6 +24,7 @@ import {
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
+	GuardianTransportError,
 	GuardianState,
 	GuardianStatus,
 	IBoundGuardianClient,
@@ -37,7 +38,11 @@ import {
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	generateWriterKey,
+	REPLICATION_META_KEYS,
+	decodeGetHeadResponse,
+	encodeGetHeadResponse,
 	loadWriterLease,
+	nodeGuardianTransport,
 	signAcquisition,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
@@ -229,6 +234,82 @@ describe('Recovery phase 5: namespace establishment', () => {
 		await shutdown(served);
 		first.storage.close();
 		second.storage.close();
+	});
+
+	it('resumes a partial registration with the SAME writer key', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const { storage } = journaledStorage(1);
+
+		// G1 accepts the registration; G2 and G3 lose it. Generating a fresh
+		// key on the next attempt would leave this device permanently unable
+		// to write under the genesis lease G1 already granted, because only a
+		// byte-identical REGISTER_NODE is idempotent (wire 5.1).
+		let blockRegister = true;
+		const flaky = (index: number): IBoundGuardianClient => ({
+			expectedGuardianId: served[index].id,
+			client: new GuardianClient({
+				url: served[index].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (blockRegister && url.endsWith('/register_node')) {
+						throw new GuardianTransportError('registration lost in transit');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		});
+		const guardians: IBoundGuardianClient[] = [
+			{ expectedGuardianId: served[0].id, client: served[0].client },
+			flaky(1),
+			flaky(2)
+		];
+
+		const first = await replicator(storage, guardians).ensureNamespace();
+		expect(first.outcome).to.equal('inconsistent');
+		// No lease was written, but the attempt and its key were remembered.
+		expect(loadWriterLease(storage).state).to.equal('missing');
+		const pendingRaw = storage.getRecoveryMeta!(
+			REPLICATION_META_KEYS.pendingRegistration
+		);
+		expect(
+			pendingRaw,
+			'the registration was persisted before it was sent'
+		).to.not.equal(null);
+		const pending = JSON.parse(pendingRaw as string) as {
+			writerPublicKey: string;
+		};
+		const g1 = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(g1.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+
+		// A NEW replicator resumes once registration works again: same key,
+		// G1 answers OK_DUPLICATE, the quorum forms, epoch stays 1.
+		blockRegister = false;
+		const second = await replicator(storage, guardians).ensureNamespace();
+		expect(second.outcome).to.equal('registered');
+		const lease = (second as { lease: IWriterLeaseKeys }).lease;
+		expect(lease.epoch).to.equal(1n);
+		expect(lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		// The pending record retires with the lease, in one transaction.
+		expect(
+			storage.getRecoveryMeta!(REPLICATION_META_KEYS.pendingRegistration)
+		).to.equal(null);
+		for (const entry of served) {
+			const head = (await entry.client.getHead(ROOT.recoveryId))
+				.state as GuardianState;
+			expect(head.lease.writerPublicKey.equals(lease.writerPublicKey)).to.equal(
+				true
+			);
+		}
+		await shutdown(served);
+		storage.close();
 	});
 
 	it('refuses to register without a read quorum', async () => {
@@ -436,6 +517,54 @@ describe('Recovery phase 5: record replication', () => {
 		expect(events.some((e) => e.type === 'writer:fenced')).to.equal(true);
 		// Durability already proven is not retracted by the freeze.
 		expect(result.replicatedThrough).to.equal(rep.replicatedThrough());
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('never counts a receipt that does not cover the state beside it', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const { storage } = journaledStorage(1);
+		const rep = replicator(storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+
+		// A guardian answers with a VALID receipt over state A while the
+		// response body carries a different state B. B is signed by nobody,
+		// so it must not confirm anything: the startup gate releases peer
+		// connections on this answer.
+		const honest = await served[0].client.getHead(ROOT.recoveryId);
+		const forgedState: GuardianState = {
+			...(honest.state as GuardianState),
+			lease: {
+				epoch: (honest.state as GuardianState).lease.epoch,
+				writerPublicKey: generateWriterKey().publicKey
+			}
+		};
+		const lying: IBoundGuardianClient[] = served.map((entry) => ({
+			expectedGuardianId: entry.id,
+			client: new GuardianClient({
+				url: entry.client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					const response = await nodeGuardianTransport()(url, init);
+					if (!url.endsWith('/get_head')) return response;
+					const decoded = decodeGetHeadResponse(response.body);
+					// Keep the real receipt; swap the accompanying state.
+					return {
+						status: response.status,
+						body: encodeGetHeadResponse({ ...decoded, state: forgedState })
+					};
+				}
+			})
+		}));
+		const confirmed = await replicator(storage, lying).confirmOwnership({
+			...lease,
+			writerPublicKey: forgedState.lease.writerPublicKey
+		});
+		expect(confirmed.confirming).to.equal(0);
 		await shutdown(served);
 		storage.close();
 	});

@@ -39,7 +39,8 @@ import {
 	GuardianState,
 	parseStateBytes,
 	stateBytes,
-	statesEqual
+	statesEqual,
+	xOnlyFromSecret
 } from './guardian-wire';
 import {
 	GuardianStatus,
@@ -66,9 +67,53 @@ import { RecoveryFrame } from './types';
 import {
 	IWriterLeaseKeys,
 	generateWriterKey,
+	requireEncryptedSecretStorage,
 	saveWriterLease,
 	signAcquisition
 } from './writer-lease';
+import * as ecc from '@bitcoinerlab/secp256k1';
+
+/**
+ * A stored acquisition attempt is unreadable. This is NEVER equivalent to
+ * "no attempt exists": a guardian may already be bound to the attempt it
+ * described, and generating a fresh key would strand that epoch.
+ */
+export class CorruptPendingAcquisitionError extends Error {
+	constructor(message: string) {
+		super(`pending acquisition is corrupt: ${message}`);
+		this.name = 'CorruptPendingAcquisitionError';
+	}
+}
+
+function requirePendingStorage(storage: IStorageBackend): void {
+	if (
+		typeof storage.getRecoveryMeta !== 'function' ||
+		typeof storage.setRecoveryMeta !== 'function' ||
+		typeof storage.deleteRecoveryMeta !== 'function' ||
+		typeof storage.transaction !== 'function'
+	) {
+		throw new Error(
+			'restore target cannot store a resumable acquisition; it must support ' +
+				'recovery metadata reads, writes, deletes and transactions'
+		);
+	}
+}
+
+function decodePendingHex(
+	value: unknown,
+	bytes: number,
+	field: string
+): Buffer {
+	if (typeof value !== 'string' || value.length !== bytes * 2) {
+		throw new CorruptPendingAcquisitionError(
+			`${field} is not ${bytes} hex bytes`
+		);
+	}
+	if (!/^[0-9a-f]*$/i.test(value)) {
+		throw new CorruptPendingAcquisitionError(`${field} is not hexadecimal`);
+	}
+	return Buffer.from(value, 'hex');
+}
 
 /** Where an interrupted acquisition is remembered (see IPendingAcquisition). */
 const META_PENDING_ACQUISITION = 'restore_pending_acquisition_v1';
@@ -210,33 +255,76 @@ export class RestoreDriver {
 
 	// ─────────────── pending acquisition ───────────────
 
+	/**
+	 * Read a persisted attempt. A stored-but-unreadable attempt THROWS: null
+	 * here means "no attempt exists, generate a fresh key", and if a guardian
+	 * already accepted the corrupted attempt that conclusion silently
+	 * recreates the stranded-epoch failure this record exists to prevent.
+	 */
 	private loadPending(): IPendingAttempt | null {
-		const raw = this.config.target.getRecoveryMeta?.(META_PENDING_ACQUISITION);
+		requirePendingStorage(this.config.target);
+		const raw = this.config.target.getRecoveryMeta!(META_PENDING_ACQUISITION);
 		if (raw == null) return null;
 		let parsed: IPersistedAcquisitionV1;
 		try {
 			parsed = JSON.parse(raw) as IPersistedAcquisitionV1;
 		} catch {
-			return null;
+			throw new CorruptPendingAcquisitionError('stored blob is not valid JSON');
 		}
-		if (parsed.version !== 1) return null;
-		try {
-			return {
-				expectedState: parseStateBytes(
-					Buffer.from(parsed.expectedState, 'hex')
-				),
-				newEpoch: BigInt(parsed.newEpoch),
-				writer: {
-					secret: Buffer.from(parsed.writerSecret, 'hex'),
-					publicKey: Buffer.from(parsed.writerPublicKey, 'hex')
-				}
-			};
-		} catch {
-			return null;
+		if (typeof parsed !== 'object' || parsed === null) {
+			throw new CorruptPendingAcquisitionError('stored blob is not an object');
 		}
+		if (parsed.version !== 1) {
+			throw new CorruptPendingAcquisitionError(
+				`unsupported stored version ${String(parsed.version)}`
+			);
+		}
+		const secret = decodePendingHex(parsed.writerSecret, 32, 'writerSecret');
+		const publicKey = decodePendingHex(
+			parsed.writerPublicKey,
+			32,
+			'writerPublicKey'
+		);
+		if (!ecc.isPrivate(secret)) {
+			throw new CorruptPendingAcquisitionError(
+				'writer secret is not a valid secp256k1 scalar'
+			);
+		}
+		if (!xOnlyFromSecret(secret).equals(publicKey)) {
+			throw new CorruptPendingAcquisitionError(
+				'writer public key does not belong to the writer secret'
+			);
+		}
+		if (typeof parsed.newEpoch !== 'string' || !/^\d+$/.test(parsed.newEpoch)) {
+			throw new CorruptPendingAcquisitionError('newEpoch is not a u64 string');
+		}
+		const newEpoch = BigInt(parsed.newEpoch);
+		if (newEpoch < 1n || newEpoch > 0xffffffffffffffffn) {
+			throw new CorruptPendingAcquisitionError('newEpoch is out of range');
+		}
+		const expectedState = parseStateBytes(
+			decodePendingHex(parsed.expectedState, 192, 'expectedState')
+		);
+		if (newEpoch !== expectedState.lease.epoch + 1n) {
+			throw new CorruptPendingAcquisitionError(
+				`newEpoch ${newEpoch} does not follow the guarded epoch ${expectedState.lease.epoch}`
+			);
+		}
+		if (!expectedState.recoveryId.equals(this.config.recoveryRoot.recoveryId)) {
+			throw new CorruptPendingAcquisitionError(
+				'the guarded state belongs to a different recovery namespace'
+			);
+		}
+		return { expectedState, newEpoch, writer: { secret, publicKey } };
 	}
 
 	private savePending(attempt: IPendingAttempt): void {
+		requirePendingStorage(this.config.target);
+		// This record holds a signing key, so it gets the lease's protection.
+		requireEncryptedSecretStorage(
+			this.config.target,
+			this.config.allowUnencryptedSecrets
+		);
 		const payload: IPersistedAcquisitionV1 = {
 			version: 1,
 			expectedState: stateBytes(attempt.expectedState).toString('hex'),
@@ -244,7 +332,7 @@ export class RestoreDriver {
 			writerSecret: attempt.writer.secret.toString('hex'),
 			writerPublicKey: attempt.writer.publicKey.toString('hex')
 		};
-		this.config.target.setRecoveryMeta?.(
+		this.config.target.setRecoveryMeta!(
 			META_PENDING_ACQUISITION,
 			JSON.stringify(payload)
 		);

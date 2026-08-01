@@ -26,10 +26,15 @@ import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import {
 	GuardianState,
 	genesisLogHead,
+	parseStateBytes,
 	recordTranscriptHash,
 	registerTranscriptHash,
-	signTranscript
+	signTranscript,
+	stateBytes,
+	statesEqual,
+	xOnlyFromSecret
 } from './guardian-wire';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	GuardianStatus,
 	IGuardianRecord,
@@ -48,15 +53,55 @@ import {
 	IWriterLeaseKeys,
 	generateWriterKey,
 	loadWriterLease,
+	requireEncryptedSecretStorage,
 	saveWriterLease
 } from './writer-lease';
 
 /** How far replication has provably got, for catch-up after a restart. */
 const META_REPLICATED_THROUGH = 'guardian_replicated_through';
+/** A registration already sent to at least one guardian (see below). */
+const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
 
 export const REPLICATION_META_KEYS = {
-	replicatedThrough: META_REPLICATED_THROUGH
+	replicatedThrough: META_REPLICATED_THROUGH,
+	pendingRegistration: META_PENDING_REGISTRATION
 } as const;
+
+/**
+ * A stored registration attempt is unreadable. Like a corrupt acquisition,
+ * this is NEVER equivalent to "no attempt": a guardian may already have
+ * registered the namespace under the key it described, and only the
+ * byte-identical registration can complete that.
+ */
+export class CorruptPendingRegistrationError extends Error {
+	constructor(message: string) {
+		super(`pending registration is corrupt: ${message}`);
+		this.name = 'CorruptPendingRegistrationError';
+	}
+}
+
+interface IPersistedRegistrationV1 {
+	version: 1;
+	initialState: string;
+	writerSecret: string;
+	writerPublicKey: string;
+}
+
+function decodeRegistrationHex(
+	value: unknown,
+	bytes: number,
+	field: string
+): Buffer {
+	if (typeof value !== 'string' || value.length !== bytes * 2) {
+		throw new CorruptPendingRegistrationError(
+			`${field} is not ${bytes} hex bytes`
+		);
+	}
+	if (!/^[0-9a-f]*$/i.test(value)) {
+		throw new CorruptPendingRegistrationError(`${field} is not hexadecimal`);
+	}
+	return Buffer.from(value, 'hex');
+}
 
 function sha256(data: Buffer): Buffer {
 	return createHash('sha256').update(data).digest();
@@ -176,6 +221,94 @@ export class GuardianReplicator {
 	}
 
 	/**
+	 * Read a persisted registration attempt, or null when none exists. A
+	 * stored-but-unreadable attempt THROWS, for the same reason a corrupt
+	 * acquisition does: concluding "none" would generate a NEW writer key,
+	 * and a guardian that already accepted the old one would leave this
+	 * device permanently unable to write under the genesis lease it holds.
+	 */
+	private loadPendingRegistration(): {
+		initialState: GuardianState;
+		writer: { secret: Buffer; publicKey: Buffer };
+	} | null {
+		const raw = this.config.storage.getRecoveryMeta?.(
+			META_PENDING_REGISTRATION
+		);
+		if (raw == null) return null;
+		let parsed: IPersistedRegistrationV1;
+		try {
+			parsed = JSON.parse(raw) as IPersistedRegistrationV1;
+		} catch {
+			throw new CorruptPendingRegistrationError(
+				'stored blob is not valid JSON'
+			);
+		}
+		if (typeof parsed !== 'object' || parsed === null) {
+			throw new CorruptPendingRegistrationError('stored blob is not an object');
+		}
+		if (parsed.version !== 1) {
+			throw new CorruptPendingRegistrationError(
+				`unsupported stored version ${String(parsed.version)}`
+			);
+		}
+		const secret = decodeRegistrationHex(
+			parsed.writerSecret,
+			32,
+			'writerSecret'
+		);
+		const publicKey = decodeRegistrationHex(
+			parsed.writerPublicKey,
+			32,
+			'writerPublicKey'
+		);
+		if (!ecc.isPrivate(secret)) {
+			throw new CorruptPendingRegistrationError(
+				'writer secret is not a valid secp256k1 scalar'
+			);
+		}
+		if (!xOnlyFromSecret(secret).equals(publicKey)) {
+			throw new CorruptPendingRegistrationError(
+				'writer public key does not belong to the writer secret'
+			);
+		}
+		const initialState = parseStateBytes(
+			decodeRegistrationHex(parsed.initialState, 192, 'initialState')
+		);
+		if (!initialState.lease.writerPublicKey.equals(publicKey)) {
+			throw new CorruptPendingRegistrationError(
+				'the registered state names a different writer key'
+			);
+		}
+		if (!initialState.recoveryId.equals(this.config.recoveryRoot.recoveryId)) {
+			throw new CorruptPendingRegistrationError(
+				'the registered state belongs to a different recovery namespace'
+			);
+		}
+		return { initialState, writer: { secret, publicKey } };
+	}
+
+	private savePendingRegistration(
+		initialState: GuardianState,
+		writer: { secret: Buffer; publicKey: Buffer }
+	): void {
+		// Holds a signing key, so it gets the lease's storage protection.
+		requireEncryptedSecretStorage(
+			this.config.storage,
+			this.config.allowUnencryptedSecrets
+		);
+		const payload: IPersistedRegistrationV1 = {
+			version: 1,
+			initialState: stateBytes(initialState).toString('hex'),
+			writerSecret: writer.secret.toString('hex'),
+			writerPublicKey: writer.publicKey.toString('hex')
+		};
+		this.config.storage.setRecoveryMeta?.(
+			META_PENDING_REGISTRATION,
+			JSON.stringify(payload)
+		);
+	}
+
+	/**
 	 * The origin this namespace must be registered with (wire 4.1): a fresh
 	 * journal starts at sequence 1 with a zero predecessor; a node enabling
 	 * guardians MID-JOURNAL registers its retained base position instead, so
@@ -247,19 +380,31 @@ export class GuardianReplicator {
 				entry.result?.status !== GuardianStatus.OK
 		);
 
-		if (existing.length > 0) {
-			// The namespace exists. Restore or takeover decides what happens
-			// next; registering over it would be a second genesis.
+		// A registration this device already sent may be the very thing those
+		// guardians are holding. That is a PARTIAL REGISTRATION, not someone
+		// else's namespace, and it is completed by re-sending the
+		// byte-identical request, never by a restore.
+		const pendingRegistration = this.loadPendingRegistration();
+		const existingStates = existing.map(
+			(entry) => entry.result?.state as GuardianState
+		);
+		const ourPartial =
+			pendingRegistration !== null &&
+			existingStates.length > 0 &&
+			existingStates.every((state) =>
+				statesEqual(state, pendingRegistration.initialState)
+			);
+		if (existing.length > 0 && !ourPartial) {
+			// The namespace exists and it is not this device's half-finished
+			// registration. Restore or takeover decides what happens next;
+			// registering over it would be a second genesis.
 			this.emit({
 				type: 'namespace:exists',
 				detail: `${existing.length} guardians already serve this namespace`
 			});
-			return {
-				outcome: 'exists-remotely',
-				states: existing.map((entry) => entry.result?.state as GuardianState)
-			};
+			return { outcome: 'exists-remotely', states: existingStates };
 		}
-		if (unknown.size < this.config.required) {
+		if (!ourPartial && unknown.size < this.config.required) {
 			const detail =
 				other.length > 0
 					? `guardians answered with status ${other
@@ -271,13 +416,30 @@ export class GuardianReplicator {
 		}
 
 		// A quorum says the namespace does not exist: this is first setup.
-		const writer = generateWriterKey();
-		const initialState: GuardianState = {
-			recoveryId: Buffer.from(recoveryId),
-			lease: { epoch: 1n, writerPublicKey: writer.publicKey },
-			origin: this.chainOrigin(),
-			logHead: genesisLogHead()
-		};
+		// An attempt already sent is RESUMED with its original key, because
+		// only the byte-identical registration is idempotent (wire 5.1): a
+		// guardian that accepted the first one is permanently bound to that
+		// writer key, and a fresh key would be a different, rejected genesis
+		// that this device could never write under.
+		const resumed = pendingRegistration;
+		const writer = resumed ? resumed.writer : generateWriterKey();
+		const initialState: GuardianState = resumed
+			? resumed.initialState
+			: {
+					recoveryId: Buffer.from(recoveryId),
+					lease: { epoch: 1n, writerPublicKey: writer.publicKey },
+					origin: this.chainOrigin(),
+					logHead: genesisLogHead()
+			  };
+		if (!resumed) {
+			// Persisted BEFORE the request leaves, exactly as an acquisition is.
+			this.savePendingRegistration(initialState, writer);
+		} else {
+			this.emit({
+				type: 'namespace:registered',
+				detail: `resuming the registration of epoch 1 with its original writer key`
+			});
+		}
 		const request: IGuardianRegisterNodeRequest = {
 			protocolVersion: 1,
 			guardianSetId: Buffer.from(this.config.context.guardianSetId),
@@ -297,7 +459,11 @@ export class GuardianReplicator {
 				error: entry.error
 			})),
 			this.config.context,
-			(state) => state.lease.epoch === 1n && state.logHead.sequence === 0n
+			// Byte-identical or nothing: only an exact match proves the
+			// guardian registered THIS state, with this writer key, this
+			// recovery id, and this origin. Shape checks would accept a
+			// receipt for someone else's genesis.
+			(state) => statesEqual(state, initialState)
 		);
 		if (accepted < this.config.required) {
 			const detail = `registration reached ${accepted} of ${this.config.required} required guardians`;
@@ -306,7 +472,9 @@ export class GuardianReplicator {
 		}
 
 		// The lease is persisted only after a quorum acknowledged the
-		// registration: a lease nobody granted must never exist on disk.
+		// registration: a lease nobody granted must never exist on disk. The
+		// pending record retires in the SAME transaction, so the writer key
+		// is never absent from storage while a guardian is bound to it.
 		const lease: IWriterLeaseKeys = {
 			epoch: 1n,
 			writerSecret: writer.secret,
@@ -314,8 +482,11 @@ export class GuardianReplicator {
 			guardianCertificates: [],
 			confirmedAt: this.clock()
 		};
-		saveWriterLease(this.config.storage, lease, {
-			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+		this.config.storage.transaction(() => {
+			saveWriterLease(this.config.storage, lease, {
+				allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+			});
+			this.config.storage.deleteRecoveryMeta?.(META_PENDING_REGISTRATION);
 		});
 		this.emit({
 			type: 'namespace:registered',
@@ -512,6 +683,15 @@ export class GuardianReplicator {
 			if (!verifyGuardianReceipt(receipt, this.config.context)) continue;
 			// And it must be signed by the guardian this endpoint is bound to.
 			if (!receipt.guardianId.equals(entry.guardianId as Buffer)) continue;
+			// A receipt over state A returned beside an unsigned state B makes
+			// B nothing at all: the signature must cover the state being used,
+			// and that state must be THIS namespace. The startup gate releases
+			// peer connections on this answer, so an unbound state here would
+			// let a node act on something no guardian ever signed.
+			if (!statesEqual(receipt.state, state)) continue;
+			if (!state.recoveryId.equals(this.config.recoveryRoot.recoveryId)) {
+				continue;
+			}
 			states.push(state);
 			if (
 				state.lease.epoch === lease.epoch &&
