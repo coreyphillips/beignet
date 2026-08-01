@@ -17,6 +17,7 @@ import {
 	deriveFrameIv,
 	deriveRecoveryRoot,
 	genesisLogHead,
+	guardianTaggedHash,
 	isGenesisLogHead,
 	receiptTranscriptHash,
 	recordTranscriptHash,
@@ -137,6 +138,11 @@ describe('Guardian wire: canonical transcripts', () => {
 			ciphertextHash: sha('ciphertext')
 		};
 		const recHash = recordTranscriptHash(setId, record);
+		// Frozen vector (independently recomputed from the wire spec during
+		// review): any tag, field-order or width drift breaks here.
+		expect(recHash.toString('hex')).to.equal(
+			'e898f2d3bc7e75e086317c97032f0ff778da4f3d55c9d9ebaaf04494c75a6a5e'
+		);
 		const recSig = signTranscript(recHash, WRITER_SECRET);
 		expect(
 			verifyTranscript(recHash, recSig, xOnlyFromSecret(WRITER_SECRET))
@@ -156,6 +162,9 @@ describe('Guardian wire: canonical transcripts', () => {
 			state,
 			1_700_000_000_000n
 		);
+		expect(receiptHash.toString('hex')).to.equal(
+			'6417a9546edec614c2a1c10c7359968687f1976a7a398165874e360cb70c6916'
+		);
 		const receiptSig = signTranscript(receiptHash, GUARDIAN_SECRETS[0]);
 		expect(verifyTranscript(receiptHash, receiptSig, GUARDIAN_IDS[0])).to.equal(
 			true
@@ -167,6 +176,9 @@ describe('Guardian wire: canonical transcripts', () => {
 
 		const newWriter = xOnlyFromSecret(sha('writer-2'));
 		const acqHash = acquireTranscriptHash(setId, state, 2n, newWriter);
+		expect(acqHash.toString('hex')).to.equal(
+			'4376c9262a2c275c0e14cd3e1d63d124fd0f6af08e9497671919e7f5d67874d2'
+		);
 		const rootAcqSig = signTranscript(acqHash, rootSecret);
 		const writerAcqSig = signTranscript(acqHash, sha('writer-2'));
 		expect(verifyTranscript(acqHash, rootAcqSig, recoveryId)).to.equal(true);
@@ -180,12 +192,51 @@ describe('Guardian wire: canonical transcripts', () => {
 			newWriter,
 			1_700_000_000_001n
 		);
+		expect(takeHash.toString('hex')).to.equal(
+			'41c63165f05dbc67fe7aec6b76c29d07c8af9506bbe6f42ab98522b6d70b5a89'
+		);
 		const takeSig = signTranscript(takeHash, GUARDIAN_SECRETS[1]);
 		expect(verifyTranscript(takeHash, takeSig, GUARDIAN_IDS[1])).to.equal(true);
 
-		// Domain separation: identical field bytes under different tags never
-		// collide, so a receipt can never be replayed as a takeover.
-		expect(receiptHash.equals(takeHash)).to.equal(false);
+		// Domain separation over the SAME payload bytes: only the tag differs,
+		// so a receipt can never be replayed as a takeover.
+		const payload = Buffer.alloc(64, 0x42);
+		expect(
+			guardianTaggedHash('beignet/recovery/receipt/v1', payload).equals(
+				guardianTaggedHash('beignet/recovery/takeover/v1', payload)
+			)
+		).to.equal(false);
+	});
+
+	it('rejects malformed cryptographic inputs loudly', () => {
+		const record = {
+			recoveryId: deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			epoch: 1n,
+			sequence: 1n,
+			previousHash: Buffer.alloc(32),
+			frameHash: Buffer.alloc(32, 0xab),
+			ciphertextHash: sha('ciphertext')
+		};
+		expect(() =>
+			recordTranscriptHash(setId, { ...record, epoch: -1n })
+		).to.throw(/u64 range/);
+		expect(() =>
+			recordTranscriptHash(setId, { ...record, sequence: 1n << 64n })
+		).to.throw(/u64 range/);
+		// The zero scalar is rejected (the ecc library throws its own
+		// validation error before our null check can).
+		expect(() => xOnlyFromSecret(Buffer.alloc(32))).to.throw(
+			/invalid secp256k1 secret|Expected Private/
+		);
+		// A 32-byte value that is not a curve point cannot join a guardian set.
+		expect(() =>
+			computeGuardianSetId({
+				...CRASH_V1_PROFILE,
+				guardianIds: [GUARDIAN_IDS[0], GUARDIAN_IDS[1], Buffer.alloc(32, 0xff)]
+			})
+		).to.throw(/x-only secp256k1 point/);
+		// The exported profile object is frozen; mutation cannot relax v1.
+		expect(Object.isFrozen(CRASH_V1_PROFILE)).to.equal(true);
 	});
 });
 

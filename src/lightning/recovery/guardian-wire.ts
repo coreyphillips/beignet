@@ -22,8 +22,19 @@ const CURVE_ORDER = BigInt(
 
 export const GUARDIAN_PROTOCOL_VERSION = 1;
 
+// Validation compares against these PRIVATE constants, so even deliberate
+// mutation of the exported convenience object (or an unsafe cast) cannot
+// alter what protocol v1 accepts.
+const CRASH_V1_PROFILE_ID = 1;
+const CRASH_V1_REQUIRED = 2;
+const CRASH_V1_TOTAL = 3;
+
 /** The only profile in protocol v1 (wire spec section 4). */
-export const CRASH_V1_PROFILE = { profileId: 1, required: 2, total: 3 };
+export const CRASH_V1_PROFILE = Object.freeze({
+	profileId: CRASH_V1_PROFILE_ID,
+	required: CRASH_V1_REQUIRED,
+	total: CRASH_V1_TOTAL
+});
 
 const ZERO32 = Buffer.alloc(32);
 
@@ -46,6 +57,9 @@ function u16(value: number): Buffer {
 }
 
 function u64(value: bigint): Buffer {
+	if (value < 0n || value > 0xffffffffffffffffn) {
+		throw new Error(`transcript integer out of u64 range: ${value}`);
+	}
 	const b = Buffer.alloc(8);
 	b.writeBigUInt64BE(value);
 	return b;
@@ -117,21 +131,30 @@ export interface IGuardianSetProfile {
  */
 export function computeGuardianSetId(profile: IGuardianSetProfile): Buffer {
 	if (
-		profile.profileId !== CRASH_V1_PROFILE.profileId ||
-		profile.required !== CRASH_V1_PROFILE.required ||
-		profile.total !== CRASH_V1_PROFILE.total
+		profile.profileId !== CRASH_V1_PROFILE_ID ||
+		profile.required !== CRASH_V1_REQUIRED ||
+		profile.total !== CRASH_V1_TOTAL
 	) {
 		throw new Error(
 			`unsupported guardian profile: only crash-v1 (1, 2-of-3) exists in protocol v1`
 		);
 	}
-	if (profile.guardianIds.length !== profile.total) {
+	if (profile.guardianIds.length !== CRASH_V1_TOTAL) {
 		throw new Error(
-			`guardian set carries ${profile.guardianIds.length} members, profile requires ${profile.total}`
+			`guardian set carries ${profile.guardianIds.length} members, profile requires ${CRASH_V1_TOTAL}`
 		);
 	}
+	// Set members come from local configuration: demand REAL x-only points
+	// here, not just 32 bytes (untrusted wire-side keys are validated by the
+	// guardian state machine before acceptance instead).
 	const sorted = [...profile.guardianIds]
-		.map((id) => expect32('guardianId', id))
+		.map((id) => {
+			expect32('guardianId', id);
+			if (!ecc.isXOnlyPoint(id)) {
+				throw new Error('guardianId is not a valid x-only secp256k1 point');
+			}
+			return id;
+		})
 		.sort(Buffer.compare);
 	for (let i = 1; i < sorted.length; i++) {
 		if (sorted[i - 1].equals(sorted[i])) {
@@ -363,10 +386,11 @@ export function verifyTranscript(
 
 /**
  * The 96-bit AES-GCM IV for a journal frame, deterministic from revision 4
- * on: first 12 bytes of a tagged hash over (recovery_id, writerEpoch,
- * sequence, frameHash). recovery_id, NEVER the Lightning node id: every
- * other input plus the IV is visible in a stored record, so a node-id-keyed
- * IV would be an offline linkage oracle. A (key, IV) collision requires the
+ * on: first 12 bytes of an UNKEYED tagged hash over (recovery_id,
+ * writerEpoch, sequence, frameHash), i.e. namespace-bound, derived from the
+ * public recovery_id, NEVER from the Lightning node id: every other input
+ * plus the IV is visible in a stored record, so a node-id-derived IV would
+ * be an offline linkage oracle. A (key, IV) collision requires the
  * identical plaintext at the identical position, which re-encrypts to the
  * identical ciphertext: harmless. Robust against RNG-state rollback where
  * random IVs are not.
