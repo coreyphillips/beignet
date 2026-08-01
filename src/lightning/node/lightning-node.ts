@@ -540,6 +540,7 @@ export class LightningNode extends EventEmitter {
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
 	private reestablishTimeoutBlocks: number;
+	private readonly autoReconnect: boolean;
 	private walCheckpointTimer: ReturnType<typeof setInterval> | null = null;
 	private _readyEmitted = false;
 	private _pendingReconnects = 0;
@@ -805,12 +806,18 @@ export class LightningNode extends EventEmitter {
 			this.emit('payment:async-wake', paymentHash);
 		});
 
+		// Resolved once and held: the PeerManager's disconnect-time redials and
+		// the startup recovery below must answer to the same switch, or turning
+		// auto-reconnect off silences one and not the other.
+		this.autoReconnect =
+			config.autoReconnect ?? config.enableNetworking ?? false;
+
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
 				localPrivateKey: config.nodePrivateKey,
 				localFeatures,
 				networks: config.chainHashes,
-				autoReconnect: config.autoReconnect ?? config.enableNetworking ?? false,
+				autoReconnect: this.autoReconnect,
 				maxReconnectDelay: config.maxReconnectDelay,
 				socks5Proxy: config.socks5Proxy,
 				webSocketImpl: config.webSocketImpl
@@ -2678,7 +2685,12 @@ export class LightningNode extends EventEmitter {
 	 * Auto-reconnect peers after crash recovery. Staggered to avoid thundering herd.
 	 */
 	private autoReconnectPeers(): void {
-		if (!this.storage || !this.peerManager) {
+		// With auto-reconnect off this whole path is off: startup recovery
+		// dials channel partners directly, on its own timers, so gating only
+		// the PeerManager would leave a parked node redialing its peers on
+		// every start. The ready lifecycle is this method's to complete on
+		// every exit, so the disabled branch still emits it.
+		if (!this.autoReconnect || !this.storage || !this.peerManager) {
 			this.emitReady();
 			return;
 		}

@@ -196,6 +196,20 @@ export function resolveConfig(cliFlags: Partial<BeignetConfig>): BeignetConfig {
 				? process.env.BEIGNET_FORWARDING_ENABLED === 'true'
 				: undefined) ??
 			file.forwardingEnabled,
+		// Exact 'true'/'false' only; anything else is ignored rather than
+		// guessed at, per the standing rule that a typo never crashes the
+		// daemon. Ignored falls back to the node default (reconnect ON), which
+		// is the safe direction for this switch: a malformed value must not
+		// silently park a node whose unreachable channels the reestablish
+		// watchdog would eventually force-close.
+		autoReconnect:
+			cliFlags.autoReconnect ??
+			(process.env.BEIGNET_AUTO_RECONNECT === 'true'
+				? true
+				: process.env.BEIGNET_AUTO_RECONNECT === 'false'
+				? false
+				: undefined) ??
+			file.autoReconnect,
 		logLevel:
 			parseLogLevel(cliFlags.logLevel) ||
 			parseLogLevel(process.env.BEIGNET_LOG_LEVEL) ||
