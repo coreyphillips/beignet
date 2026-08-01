@@ -2679,6 +2679,17 @@ export class LightningNode extends EventEmitter {
 		this.capsuleRefreshTimer = timer;
 	}
 
+	/** Arm one deferred refresh on the throttle cadence (re-base retry). */
+	private scheduleCapsuleRetry(): void {
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			this.refreshRecoveryCapsule();
+		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS);
+		if (typeof timer.unref === 'function') timer.unref();
+		this.capsuleRefreshTimer = timer;
+	}
+
 	/**
 	 * Compose the current Recovery Capsule (spec 5.4) and push it to every
 	 * connected peer that provides storage. The blob is also remembered and
@@ -2749,7 +2760,17 @@ export class LightningNode extends EventEmitter {
 					error: inlineError
 				});
 			}
-			this.capsuleDirty = false;
+			if (allowInline) {
+				this.capsuleDirty = false;
+			} else {
+				// A transient re-base failure heals when the next journaled
+				// append retries the snapshot, but a quiet node may not
+				// transition for a while. Retry on the throttle cadence so
+				// exact-backup coverage returns as soon as the failure
+				// clears, and stay dirty so a connecting provider retries
+				// the compose too.
+				this.scheduleCapsuleRetry();
+			}
 			return blob;
 		} catch (err) {
 			this.emitStructuredLog('peer', 'recovery_capsule_refresh_failed', {

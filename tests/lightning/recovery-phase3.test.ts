@@ -989,6 +989,15 @@ describe('Recovery phase 3: review regressions', () => {
 			makeNodeConfig(6).nodePrivateKey
 		);
 		expect(result.tier).to.equal(1);
+		// The failure arms a self-healing retry: the capsule stays dirty for
+		// connecting providers, and a deferred refresh is scheduled so
+		// Tier 2 coverage returns without new Lightning activity.
+		expect(
+			(run3 as unknown as { capsuleDirty: boolean }).capsuleDirty
+		).to.equal(true);
+		expect(
+			(run3 as unknown as { capsuleRefreshTimer: unknown }).capsuleRefreshTimer
+		).to.not.equal(null);
 		run3.destroy();
 		target.close();
 	});

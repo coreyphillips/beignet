@@ -78,7 +78,14 @@ export interface RecoveryCapsule {
 	writerEpoch: bigint;
 	latestSequence: bigint;
 	frameHash: Buffer;
-	/** Frame hash of the retained base snapshot (zeros when none). */
+	/**
+	 * Frame hash of the retained base snapshot. Zeros mean "no verified base
+	 * snapshot claim": either no journal exists yet, or the capsule composed
+	 * degraded (allowInline false after a failed re-base) and deliberately
+	 * did not read the frame store. Consumers (guardian retrieval, external
+	 * Tier 2 storage from Phase 4 on) must treat zeros as unavailable, never
+	 * as a real hash.
+	 */
 	snapshotHash: Buffer;
 	/** How to find the real replicated state (empty until Phase 4). */
 	guardians: GuardianDescriptor[];
