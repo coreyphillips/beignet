@@ -228,6 +228,14 @@ describe('Guardian wire: canonical transcripts', () => {
 		expect(() => xOnlyFromSecret(Buffer.alloc(32))).to.throw(
 			/invalid secp256k1 secret|Expected Private/
 		);
+		// A truncated or invalid identity secret must not silently derive a
+		// permanently different guardian namespace.
+		expect(() => deriveRecoveryRoot(Buffer.alloc(31))).to.throw(
+			/valid 32-byte secp256k1 identity secret/
+		);
+		expect(() => deriveRecoveryRoot(Buffer.alloc(32))).to.throw(
+			/valid 32-byte secp256k1 identity secret/
+		);
 		// A 32-byte value that is not a curve point cannot join a guardian set.
 		expect(() =>
 			computeGuardianSetId({

@@ -85,6 +85,13 @@ export function deriveRecoveryRoot(nodeSecret: Buffer): {
 	rootSecret: Buffer;
 	recoveryId: Buffer;
 } {
+	// A truncated or otherwise invalid identity secret must fail HERE, not
+	// silently derive a permanently different guardian namespace.
+	if (nodeSecret.length !== 32 || !ecc.isPrivate(nodeSecret)) {
+		throw new Error(
+			'nodeSecret must be a valid 32-byte secp256k1 identity secret'
+		);
+	}
 	const okm = Buffer.from(
 		hkdfSync(
 			'sha256',
