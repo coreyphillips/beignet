@@ -759,7 +759,23 @@ describe('Guardian transport: client hardening', () => {
 					auth: { type: 'bearer', token: 'leaky' }
 				})
 		).to.throw(/plaintext/);
-		// Loopback and onion targets are not plaintext-to-network.
+		// A bare .onion suffix is not evidence of a Tor destination: the
+		// exemption demands the same v3 hostname shape as endpoint selection.
+		expect(
+			() =>
+				new GuardianClient({
+					url: 'http://abc.onion',
+					guardianSetId: SET_ID,
+					auth: { type: 'bearer', token: 'leaky' }
+				})
+		).to.throw(/plaintext/);
+		const onion = new GuardianClient({
+			url: `http://${'a'.repeat(56)}.onion`,
+			guardianSetId: SET_ID,
+			auth: { type: 'bearer', token: 'fine' }
+		});
+		expect(onion.url).to.contain('.onion');
+		// Loopback targets are not plaintext-to-network either.
 		const loopback = new GuardianClient({
 			url: 'http://127.0.0.1:9911',
 			guardianSetId: SET_ID,

@@ -285,10 +285,13 @@ export class GuardianClient {
 		}
 		if (this.headers.Authorization && !options.allowUnencryptedAuth) {
 			const parsed = new URL(this.url);
+			// The onion exemption demands the same v3 hostname validation as
+			// endpoint selection: a bare .onion suffix is not evidence of a
+			// Tor-encrypted destination.
 			if (
 				parsed.protocol === 'http:' &&
 				!isLoopbackHostname(parsed.hostname) &&
-				!parsed.hostname.endsWith('.onion')
+				!ONION_V3_HOSTNAME.test(parsed.hostname)
 			) {
 				throw new GuardianTransportError(
 					'refusing to send a bearer or macaroon credential over plaintext ' +

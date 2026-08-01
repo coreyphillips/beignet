@@ -294,12 +294,15 @@ function logHeadsEqual(a: LogHead, b: LogHead): boolean {
 /**
  * Non-throwing u64 read for PERSISTED bytes. The open-time verifier judges
  * stored data; stored data must never escape it as an exception, or one
- * malformed column would stop the guardian from starting instead of rolling
- * the affected namespace back (wire 5.10 repairs per namespace).
+ * malformed column would stop the repair path instead of entering it
+ * (wire 5.10 repairs per namespace). The parameter is unknown ON PURPOSE:
+ * these are ordinary, non-STRICT SQLite tables, so BLOB affinity does not
+ * guarantee the BLOB storage class, and a TEXT value of length eight would
+ * pass a bare length check and then throw on readBigUInt64BE.
  */
-function tryReadU64(buf: Buffer | null): bigint | null {
-	if (!buf || buf.length !== 8) return null;
-	return buf.readBigUInt64BE(0);
+function tryReadU64(value: unknown): bigint | null {
+	if (!Buffer.isBuffer(value) || value.length !== 8) return null;
+	return value.readBigUInt64BE(0);
 }
 
 /** Structural (width-only) validity of a stored record row. */

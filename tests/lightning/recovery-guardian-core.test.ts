@@ -1567,6 +1567,138 @@ describe('Guardian core: structural corruption containment', () => {
 		guardian.close();
 	});
 
+	// SQLite storage-class corruption: these are ordinary (non-STRICT)
+	// tables, so a TEXT value can occupy a BLOB-affinity column. A
+	// same-width TEXT value defeats bare length checks, decodes to no
+	// Buffer, and sorts BEFORE every blob so range deletes miss it. Each
+	// case must contain, repair where applicable, and NOT re-alarm on the
+	// next open.
+
+	it('a same-width TEXT sequence is contained, swept, and repairable', () => {
+		const fixture = shapeFixture('text-sequence.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET sequence = ? WHERE sequence = ?',
+			'12345678',
+			u64be(3n)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		expect(guardian.syncRecord({ record: fixture.chain[2] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(guardian.syncRecord({ record: fixture.chain[3] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
+
+	it('a same-width TEXT writer signature is contained and swept', () => {
+		const fixture = shapeFixture('text-writer-sig.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET writer_signature = ? WHERE sequence = ?',
+			'x'.repeat(64),
+			u64be(2n)
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(1n);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT certificate issuedAt is contained and swept', () => {
+		const { file } = takeoverFixture('text-cert-issued-at.sqlite');
+		corrupt(
+			file,
+			'UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?',
+			'12345678',
+			u64be(2n)
+		);
+		const guardian = reopen(file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).lease.epoch).to.equal(1n);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT cumulative-receipt issuedAt repairs instead of quarantining', () => {
+		const fixture = shapeFixture('text-receipt-issued-at.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET receipt_issued_at = ?',
+			'12345678'
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		// Before the storage-class fix this THREW inside the verifier and the
+		// namespace landed in quarantine; the intended path is the ordinary
+		// rollback with a fresh verifying receipt over the intact chain.
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		expectValidReceipt(head.receipt, 0, fixture.finalState);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT registration-receipt issuedAt is replaced, once', () => {
+		const fixture = shapeFixture('text-reg-receipt.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET registration_receipt_issued_at = ?',
+			'12345678'
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.detail.includes('registration receipt'))
+		).to.equal(true);
+		expect(guardian.getHead(headRequest()).possiblyStale).to.equal(true);
+		const replay = guardian.register(fixture.registration);
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expectValidReceipt(replay.receipt, 0, fixture.registration.initialState);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
 	it('a foreign guardian_set_id quarantines one namespace, untouched, while others serve', () => {
 		const file = path.join(dir, 'set-id-quarantine.sqlite');
 		const guardian = makeGuardian(0, file);

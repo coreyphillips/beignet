@@ -455,22 +455,28 @@ export class GuardianStore {
 	}
 
 	/**
-	 * Sweep structurally malformed record rows (wrong column widths) into the
-	 * orphan archive. Range deletes key on the sequence BLOB, and a row whose
-	 * sequence blob is not eight bytes sorts arbitrarily and can dodge them;
-	 * the open-time rollback therefore sweeps by SHAPE as well, so a damaged
-	 * row can never survive to re-fail verification on the next open.
+	 * Sweep structurally malformed record rows into the orphan archive.
+	 * Malformed means the wrong STORAGE CLASS as well as the wrong width:
+	 * these are ordinary (non-STRICT) tables, so BLOB affinity does not
+	 * guarantee the BLOB storage class, and a same-length TEXT value passes
+	 * a bare length() check while decoding to no Buffer at all. TEXT also
+	 * sorts BEFORE every BLOB, so such a row dodges the blob-keyed range
+	 * deletes; this shape sweep, mirroring the in-process validators
+	 * exactly, is what keeps rollback idempotent: a damaged row can never
+	 * survive to re-fail verification on the next open.
 	 */
 	archiveMalformedRecords(
 		recoveryId: Buffer,
 		reason: string,
 		archivedAt: Buffer
 	): number {
+		const bad = (column: string, width: number): string =>
+			`(typeof(${column}) != 'blob' OR length(${column}) != ${width})`;
 		const predicate = `(
-			length(sequence) != 8 OR length(epoch) != 8 OR
-			length(previous_hash) != 32 OR length(frame_hash) != 32 OR
-			length(ciphertext_hash) != 32 OR length(writer_signature) != 64 OR
-			length(ciphertext) < 1
+			${bad('sequence', 8)} OR ${bad('epoch', 8)} OR
+			${bad('previous_hash', 32)} OR ${bad('frame_hash', 32)} OR
+			${bad('ciphertext_hash', 32)} OR ${bad('writer_signature', 64)} OR
+			typeof(ciphertext) != 'blob' OR length(ciphertext) < 1
 		)`;
 		const moved = this.db
 			.prepare(
@@ -493,16 +499,20 @@ export class GuardianStore {
 
 	/** The epoch-row counterpart of archiveMalformedRecords. */
 	deleteMalformedEpochs(recoveryId: Buffer): number {
+		const bad = (column: string, width: number): string =>
+			`(typeof(${column}) != 'blob' OR length(${column}) != ${width})`;
+		const badNullable = (column: string, width: number): string =>
+			`(${column} IS NOT NULL AND ${bad(column, width)})`;
 		return this.db
 			.prepare(
 				`DELETE FROM guardian_epochs WHERE recovery_id = ? AND (
-					length(epoch) != 8 OR length(writer_public_key) != 32 OR
-					(cert_superseded_state IS NOT NULL AND length(cert_superseded_state) != 192) OR
-					(cert_issued_at IS NOT NULL AND length(cert_issued_at) != 8) OR
-					(cert_signature IS NOT NULL AND length(cert_signature) != 64) OR
-					(receipt_state IS NOT NULL AND length(receipt_state) != 192) OR
-					(receipt_issued_at IS NOT NULL AND length(receipt_issued_at) != 8) OR
-					(receipt_signature IS NOT NULL AND length(receipt_signature) != 64)
+					${bad('epoch', 8)} OR ${bad('writer_public_key', 32)} OR
+					${badNullable('cert_superseded_state', 192)} OR
+					${badNullable('cert_issued_at', 8)} OR
+					${badNullable('cert_signature', 64)} OR
+					${badNullable('receipt_state', 192)} OR
+					${badNullable('receipt_issued_at', 8)} OR
+					${badNullable('receipt_signature', 64)}
 				)`
 			)
 			.run(recoveryId).changes;
