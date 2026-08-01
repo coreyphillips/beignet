@@ -49,6 +49,7 @@ import {
 	IGuardianEpochRow,
 	IGuardianNamespaceRow,
 	IGuardianOrphanRow,
+	IGuardianRecordRow,
 	readU64be,
 	u64be
 } from './guardian-store';
@@ -242,6 +243,11 @@ export interface IGuardianRepairEvidenceResponse {
 }
 
 export interface IGuardianAlarm {
+	/**
+	 * EMPTY for a store-level alarm: when the recovery_id cell itself is
+	 * not a 32-byte BLOB, there is no namespace identity to attribute the
+	 * damage to, and fabricating one would be worse than saying so.
+	 */
 	recoveryId: Buffer;
 	status: GuardianStatus;
 	detail: string;
@@ -290,6 +296,70 @@ function logHeadsEqual(a: LogHead, b: LogHead): boolean {
 	);
 }
 
+/**
+ * Non-throwing u64 read for PERSISTED bytes. The open-time verifier judges
+ * stored data; stored data must never escape it as an exception, or one
+ * malformed column would stop the repair path instead of entering it
+ * (wire 5.10 repairs per namespace). The parameter is unknown ON PURPOSE:
+ * these are ordinary, non-STRICT SQLite tables, so BLOB affinity does not
+ * guarantee the BLOB storage class, and a TEXT value of length eight would
+ * pass a bare length check and then throw on readBigUInt64BE.
+ */
+function tryReadU64(value: unknown): bigint | null {
+	if (!Buffer.isBuffer(value) || value.length !== 8) return null;
+	return value.readBigUInt64BE(0);
+}
+
+/** Structural (width-only) validity of a stored record row. */
+function recordRowProblem(row: IGuardianRecordRow): string | null {
+	if (!isLen(row.sequence, 8)) return 'sequence column malformed';
+	if (!isLen(row.epoch, 8)) return 'epoch column malformed';
+	if (!isLen(row.previousHash, 32)) return 'previous hash column malformed';
+	if (!isLen(row.frameHash, 32)) return 'frame hash column malformed';
+	if (!isLen(row.ciphertextHash, 32)) return 'ciphertext hash column malformed';
+	if (!isLen(row.writerSignature, 64))
+		return 'writer signature column malformed';
+	if (!Buffer.isBuffer(row.ciphertext) || row.ciphertext.length === 0) {
+		return 'ciphertext column malformed';
+	}
+	return null;
+}
+
+/**
+ * Structural (width-only) validity of a stored epoch row. Deliberately
+ * mirrors the SQL predicate of deleteMalformedEpochs: every row this filter
+ * rejects, the rollback sweep can also remove, so a damaged row never
+ * survives to re-fail verification on the next open. Mixed null and present
+ * artifact columns are NOT flagged here; applyTakeover fails those on the
+ * walk, where the ordinary range delete reaches them.
+ */
+function epochRowProblem(row: IGuardianEpochRow): string | null {
+	if (!isLen(row.epoch, 8)) return 'epoch column malformed';
+	if (!isLen(row.writerPublicKey, 32)) return 'writer key column malformed';
+	if (
+		row.certSupersededState !== null &&
+		!isLen(row.certSupersededState, 192)
+	) {
+		return 'superseded state column malformed';
+	}
+	if (row.certIssuedAt !== null && !isLen(row.certIssuedAt, 8)) {
+		return 'certificate issuedAt column malformed';
+	}
+	if (row.certSignature !== null && !isLen(row.certSignature, 64)) {
+		return 'certificate signature column malformed';
+	}
+	if (row.receiptState !== null && !isLen(row.receiptState, 192)) {
+		return 'receipt state column malformed';
+	}
+	if (row.receiptIssuedAt !== null && !isLen(row.receiptIssuedAt, 8)) {
+		return 'receipt issuedAt column malformed';
+	}
+	if (row.receiptSignature !== null && !isLen(row.receiptSignature, 64)) {
+		return 'receipt signature column malformed';
+	}
+	return null;
+}
+
 function tryParseState(buf: Buffer | null): GuardianState | null {
 	if (!buf) return null;
 	try {
@@ -319,6 +389,17 @@ export class ReferenceGuardian {
 	private readonly maxRecordsPerGet: number;
 	private readonly clock: () => bigint;
 	private readonly onAlarm?: (alarm: IGuardianAlarm) => void;
+	/**
+	 * Namespaces this process refuses to serve or touch: a stored
+	 * guardian_set_id that is not the configured one (misconfiguration or
+	 * column rot; either way nothing under it is provably ours), or a
+	 * verification pass that failed in a way the non-throwing walk could not
+	 * classify (I/O errors). Quarantine is deliberately NON-destructive and
+	 * per namespace: every verb answers ERR_STORE_UNCERTAIN, nothing is
+	 * rolled back or archived, and one damaged namespace can never prevent
+	 * the guardian from starting or serving its healthy ones.
+	 */
+	private readonly quarantined = new Set<string>();
 
 	constructor(config: IReferenceGuardianConfig) {
 		if (
@@ -407,12 +488,37 @@ export class ReferenceGuardian {
 		}
 	}
 
+	/**
+	 * Report damage that cannot be attributed to an addressable namespace:
+	 * the recovery_id cell itself is not a 32-byte BLOB, so there is no key
+	 * to quarantine by and no Buffer to hand to consumers. The row is left
+	 * untouched; it is unreachable by every verb anyway, because no 32-byte
+	 * key can ever match it.
+	 */
+	private storeAlarm(detail: string): void {
+		if (this.onAlarm) {
+			this.onAlarm({
+				recoveryId: Buffer.alloc(0),
+				status: GuardianStatus.ERR_STORE_UNCERTAIN,
+				detail
+			});
+		}
+	}
+
 	private safeVerify(hash: Buffer, signature: Buffer, key: Buffer): boolean {
 		try {
 			return verifyTranscript(hash, signature, key);
 		} catch {
 			return false;
 		}
+	}
+
+	private quarantineGate(recoveryId: Buffer): IErr | null {
+		if (!this.quarantined.has(recoveryId.toString('hex'))) return null;
+		return err(
+			GuardianStatus.ERR_STORE_UNCERTAIN,
+			'namespace is quarantined; resolve the guardian store or configuration'
+		);
 	}
 
 	private versionAndSetProblem(
@@ -638,6 +744,8 @@ export class ReferenceGuardian {
 				);
 			}
 
+			const quarantine = this.quarantineGate(state.recoveryId);
+			if (quarantine) return quarantine;
 			const stateBuf = stateBytes(state);
 			const outcome = this.store.write(() => {
 				const ns = this.store.getNamespace(state.recoveryId);
@@ -647,6 +755,33 @@ export class ReferenceGuardian {
 					}
 					return { kind: 'already' as const, ns };
 				}
+				// Corruption can strand records or epoch rows under an identity
+				// whose namespace row was lost or mis-keyed; a fresh
+				// registration must never fail on their leftovers with a
+				// primary-key conflict. Archive and clear them, and keep the
+				// namespace uncertain: history existed here, so writability
+				// needs quorum evidence (wire 5.10), and SYNC_RECORD replays
+				// the content the orphan archive preserves.
+				let strandedHistory = false;
+				if (!ns) {
+					const strayRecords = this.store.deleteAllRecords(
+						state.recoveryId,
+						'rollback',
+						u64be(this.clock())
+					);
+					const strayEpochs = this.store.listEpochs(state.recoveryId);
+					if (strayEpochs.length > 0) {
+						this.store.deleteAllEpochs(state.recoveryId);
+					}
+					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
+					if (strandedHistory) {
+						this.alarm(
+							state.recoveryId,
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'registration found stranded history under this identity; archived, namespace uncertain'
+						);
+					}
+				}
 				// Fresh namespace, or a checkpointless tombstone re-anchoring on a
 				// root-signed registration (wire 5.10 step 1): the tombstone keeps
 				// possibly_stale, so writability still needs quorum evidence.
@@ -655,7 +790,7 @@ export class ReferenceGuardian {
 					recoveryId: Buffer.from(state.recoveryId),
 					guardianSetId: Buffer.from(this.guardianSetId),
 					state: stateBuf,
-					possiblyStale: ns ? ns.possiblyStale : false,
+					possiblyStale: ns ? ns.possiblyStale : strandedHistory,
 					registrationState: stateBuf,
 					registrationSignature: Buffer.from(request.rootSignature),
 					registrationReceiptIssuedAt: u64be(receipt.issuedAt),
@@ -790,6 +925,8 @@ export class ReferenceGuardian {
 				);
 			}
 			const ciphertextHash = sha256(record.ciphertext);
+			const quarantine = this.quarantineGate(record.recoveryId);
+			if (quarantine) return quarantine;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(record.recoveryId);
@@ -994,6 +1131,8 @@ export class ReferenceGuardian {
 					'recovery_id must be 32 bytes'
 				);
 			}
+			const quarantine = this.quarantineGate(request.recoveryId);
+			if (quarantine) return quarantine;
 			return this.store.read(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns) {
@@ -1059,6 +1198,8 @@ export class ReferenceGuardian {
 				request.maxRecords === 0
 					? this.maxRecordsPerGet
 					: Math.min(request.maxRecords, this.maxRecordsPerGet);
+			const quarantine = this.quarantineGate(request.recoveryId);
+			if (quarantine) return quarantine;
 			return this.store.read(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
 				if (!ns) {
@@ -1163,6 +1304,8 @@ export class ReferenceGuardian {
 					'new writer signature over the ACQUIRE transcript failed'
 				);
 			}
+			const quarantine = this.quarantineGate(expected.recoveryId);
+			if (quarantine) return quarantine;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(expected.recoveryId);
@@ -1419,6 +1562,8 @@ export class ReferenceGuardian {
 
 			const certified = reference.supersededState;
 			const recoveryId = certified.recoveryId;
+			const quarantine = this.quarantineGate(recoveryId);
+			if (quarantine) return quarantine;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(recoveryId);
@@ -1699,6 +1844,8 @@ export class ReferenceGuardian {
 					`quorum evidence requires ${this.required} distinct guardians; got ${signers.size}`
 				);
 			}
+			const quarantine = this.quarantineGate(request.recoveryId);
+			if (quarantine) return quarantine;
 
 			return this.store.write(() => {
 				const ns = this.store.getNamespace(request.recoveryId);
@@ -1747,13 +1894,119 @@ export class ReferenceGuardian {
 	 */
 	private verifyStoreAtOpen(): void {
 		for (const ns of this.store.listNamespaces()) {
-			if (!ns.guardianSetId.equals(this.guardianSetId)) {
-				throw new Error(
-					'guardian store contains a namespace registered under a different guardian set'
+			// The identity cell itself is untrusted: a non-STRICT table can
+			// hold an INTEGER or TEXT where the 32-byte BLOB belongs, and any
+			// Buffer operation on such a value throws OUTSIDE the containment
+			// below. Validate it before touching it; a row whose identity is
+			// unreadable is reported at store level and left untouched (it is
+			// unreachable by every verb, since no 32-byte key can match it).
+			if (!isLen(ns.recoveryId, 32)) {
+				this.storeAlarm(
+					'namespace row has a malformed recovery_id storage class or width; left untouched'
+				);
+				continue;
+			}
+			let target = ns;
+			let key = ns.recoveryId.toString('hex');
+			try {
+				if (
+					!isLen(ns.guardianSetId, 32) ||
+					!ns.guardianSetId.equals(this.guardianSetId)
+				) {
+					// Misconfiguration or column rot; nothing under this
+					// namespace is provably ours either way, so quarantine it
+					// UNTOUCHED: a healthy store opened under the wrong
+					// configuration must not be rolled back, archived, or
+					// tombstoned by mistake.
+					this.quarantined.add(key);
+					this.alarm(
+						ns.recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						'namespace is not registered under this guardian set; quarantined untouched'
+					);
+					continue;
+				}
+				// A WELL-shaped but WRONG identity: the root-signed
+				// registration authoritatively names the real namespace, and
+				// tombstoning under the corrupted key would strand the records
+				// and epochs still stored under the signed one.
+				const outcome = this.store.write(() => this.healNamespaceIdentity(ns));
+				if (outcome !== null && 'conflict' in outcome) {
+					this.quarantined.add(key);
+					this.alarm(
+						ns.recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						'namespace key does not match its root-signed registration and the signed identity is occupied; quarantined untouched'
+					);
+					continue;
+				}
+				if (outcome !== null) {
+					target = outcome.healed;
+					key = target.recoveryId.toString('hex');
+				}
+				this.store.write(() => this.verifyNamespaceAtOpen(target));
+			} catch (error) {
+				// The walk and rollback are non-throwing over persisted bytes;
+				// anything that still escapes (I/O failure, disk full) contains
+				// to THIS namespace instead of stopping the guardian.
+				const message = error instanceof Error ? error.message : String(error);
+				this.quarantined.add(key);
+				this.alarm(
+					target.recoveryId,
+					GuardianStatus.ERR_STORE_UNCERTAIN,
+					`namespace verification could not complete (${message}); quarantined`
 				);
 			}
-			this.store.write(() => this.verifyNamespaceAtOpen(ns));
 		}
+	}
+
+	/**
+	 * Repair a namespace whose primary key no longer matches the identity
+	 * inside its root-signed registration (identity-column bit corruption):
+	 * the registration is the AUTHORITATIVE name (wire 5.1), so when it
+	 * verifies under its own recovery_id and that identity is unoccupied,
+	 * the row is re-keyed back to it and the namespace goes uncertain until
+	 * quorum evidence says otherwise. Records and epochs carry their own
+	 * recovery_id and were never mis-keyed, so the ordinary verifier then
+	 * judges the reunited namespace. Returns null when no identity repair
+	 * applies; a conflict marker when the signed identity already has a row
+	 * of its own (nothing is touched in that case).
+	 */
+	private healNamespaceIdentity(
+		ns: IGuardianNamespaceRow
+	): { healed: IGuardianNamespaceRow } | { conflict: true } | null {
+		const regState = tryParseState(ns.registrationState);
+		if (regState === null) return null;
+		if (regState.recoveryId.equals(ns.recoveryId)) return null;
+		const authoritative =
+			ns.registrationSignature !== null &&
+			isLen(ns.registrationSignature, 64) &&
+			regState.lease.epoch >= 1n &&
+			regState.origin.firstSequence >= 1n &&
+			isGenesisLogHead(regState.logHead) &&
+			this.safeVerify(
+				registerTranscriptHash(this.guardianSetId, regState),
+				ns.registrationSignature,
+				regState.recoveryId
+			);
+		// Without a verifying registration there is no authority to re-key
+		// under; the ordinary no-checkpoint tombstone path judges the row.
+		if (!authoritative) return null;
+		if (this.store.getNamespace(regState.recoveryId) !== null) {
+			return { conflict: true };
+		}
+		this.store.rekeyNamespace(ns.recoveryId, regState.recoveryId);
+		this.store.setPossiblyStale(regState.recoveryId, true);
+		this.alarm(
+			regState.recoveryId,
+			GuardianStatus.ERR_STORE_UNCERTAIN,
+			'namespace identity restored from the root-signed registration; store uncertain'
+		);
+		const healed = this.store.getNamespace(regState.recoveryId);
+		if (healed === null) {
+			throw new Error('namespace identity repair failed to persist');
+		}
+		return { healed };
 	}
 
 	private verifyNamespaceAtOpen(ns: IGuardianNamespaceRow): void {
@@ -1789,6 +2042,46 @@ export class ReferenceGuardian {
 			return;
 		}
 
+		// The registration receipt is an issued artifact the duplicate path
+		// returns verbatim; prove it, or replace it and go uncertain. An
+		// unverifiable stored receipt would otherwise survive startup and be
+		// handed to the next byte-identical REGISTER_NODE.
+		const regReceiptIssuedAt = tryReadU64(ns.registrationReceiptIssuedAt);
+		const regReceiptValid =
+			regReceiptIssuedAt !== null &&
+			ns.registrationReceiptSignature !== null &&
+			isLen(ns.registrationReceiptSignature, 64) &&
+			this.safeVerify(
+				receiptTranscriptHash(
+					this.guardianSetId,
+					this.guardianId,
+					regState,
+					regReceiptIssuedAt
+				),
+				ns.registrationReceiptSignature,
+				this.guardianId
+			);
+		if (!regReceiptValid) {
+			// The EXACT original artifact can no longer be proven. Issue an
+			// honest replacement over the same initial state and treat the
+			// store as uncertain until quorum evidence says otherwise:
+			// duplicates must return a VERIFYING receipt, and both a rotten
+			// signature and a permanent internal error are worse than a
+			// replacement plus an alarm and the stale gate.
+			const replacement = this.signReceipt(regState);
+			this.store.updateRegistrationReceipt(
+				recoveryId,
+				u64be(replacement.issuedAt),
+				replacement.signature
+			);
+			this.store.setPossiblyStale(recoveryId, true);
+			this.alarm(
+				recoveryId,
+				GuardianStatus.ERR_STORE_UNCERTAIN,
+				'stored registration receipt could not be verified; replacement issued, namespace uncertain'
+			);
+		}
+
 		const declared = tryParseState(ns.state);
 		const declaredValid =
 			declared !== null &&
@@ -1815,6 +2108,16 @@ export class ReferenceGuardian {
 	): { checkpoint: GuardianState; reason: string } | null {
 		const recoveryId = ns.recoveryId;
 		let sim = this.cloneState(regState);
+		// Rows that cannot belong to ANY valid history are filtered out so the
+		// walk judges what remains, and their mere existence fails the
+		// namespace at the end; the rollback then removes them, so the
+		// failure does not recur on the next open. Two kinds qualify: wrong
+		// column shape or storage class (undecodable, meaningless sort
+		// position), and well-shaped rows at semantically impossible
+		// positions (records below the root-committed origin, epochs below
+		// the registration epoch), which sort FIRST and would otherwise sit
+		// beneath every above-checkpoint range operation forever.
+		let impossibleRows = false;
 		const fail = (
 			reason: string
 		): { checkpoint: GuardianState; reason: string } => ({
@@ -1822,10 +2125,19 @@ export class ReferenceGuardian {
 			reason
 		});
 
-		const epochRows = this.store.listEpochs(recoveryId);
+		const epochRows: IGuardianEpochRow[] = [];
+		for (const row of this.store.listEpochs(recoveryId)) {
+			if (epochRowProblem(row)) {
+				impossibleRows = true;
+			} else if ((tryReadU64(row.epoch) as bigint) < regState.lease.epoch) {
+				impossibleRows = true;
+			} else {
+				epochRows.push(row);
+			}
+		}
 		if (
 			epochRows.length === 0 ||
-			readU64be(epochRows[0].epoch) !== regState.lease.epoch ||
+			tryReadU64(epochRows[0].epoch) !== regState.lease.epoch ||
 			!epochRows[0].writerPublicKey.equals(regState.lease.writerPublicKey) ||
 			epochRows[0].certSignature !== null
 		) {
@@ -1903,8 +2215,18 @@ export class ReferenceGuardian {
 		};
 
 		for (const record of this.store.iterateRecords(recoveryId)) {
+			if (recordRowProblem(record)) {
+				impossibleRows = true;
+				continue;
+			}
 			const sequence = readU64be(record.sequence);
 			const recordEpoch = readU64be(record.epoch);
+			if (sequence < regState.origin.firstSequence) {
+				// Sequence zero never carries a record, and records below the
+				// origin do not exist for this namespace (wire 4.1).
+				impossibleRows = true;
+				continue;
+			}
 			if (walkTarget && sequence > walkTarget.logHead.sequence) {
 				return fail('stored records extend beyond the declared head');
 			}
@@ -1971,21 +2293,26 @@ export class ReferenceGuardian {
 		if (!statesEqual(sim, walkTarget)) {
 			return fail('replayed history stops short of the declared state');
 		}
+		const receiptIssuedAt = tryReadU64(ns.receiptIssuedAt);
 		if (
-			ns.receiptIssuedAt === null ||
+			receiptIssuedAt === null ||
 			ns.receiptSignature === null ||
+			!isLen(ns.receiptSignature, 64) ||
 			!this.safeVerify(
 				receiptTranscriptHash(
 					this.guardianSetId,
 					this.guardianId,
 					walkTarget,
-					readU64be(ns.receiptIssuedAt)
+					receiptIssuedAt
 				),
 				ns.receiptSignature,
 				this.guardianId
 			)
 		) {
 			return fail('stored cumulative receipt does not verify');
+		}
+		if (impossibleRows) {
+			return fail('impossible rows present alongside the chain');
 		}
 		return null;
 	}
@@ -2003,7 +2330,28 @@ export class ReferenceGuardian {
 			'rollback',
 			u64be(this.clock())
 		);
-		this.store.deleteEpochsAbove(recoveryId, u64be(checkpoint.lease.epoch));
+		// Shape sweeps: rows with malformed column widths sort arbitrarily and
+		// can dodge the range operations above; removing them here is what
+		// keeps this rollback IDEMPOTENT instead of re-failing on every open.
+		this.store.archiveRecordsBelow(
+			recoveryId,
+			u64be(regState.origin.firstSequence),
+			'rollback',
+			u64be(this.clock())
+		);
+		this.store.archiveMalformedRecords(
+			recoveryId,
+			'rollback',
+			u64be(this.clock())
+		);
+		// Retain exactly the checkpoint prefix of epochs: below the
+		// registration epoch is as impossible as above the checkpoint.
+		this.store.deleteEpochsOutsideRange(
+			recoveryId,
+			u64be(regState.lease.epoch),
+			u64be(checkpoint.lease.epoch)
+		);
+		this.store.deleteMalformedEpochs(recoveryId);
 		// The registration epoch row is derived from the root-signed
 		// registration itself; if it was the damaged part, rebuild it.
 		const regRow = this.store.getEpoch(recoveryId, u64be(regState.lease.epoch));

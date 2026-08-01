@@ -454,6 +454,98 @@ export class GuardianStore {
 		return moved;
 	}
 
+	/**
+	 * Sweep structurally malformed record rows into the orphan archive.
+	 * Malformed means the wrong STORAGE CLASS as well as the wrong width:
+	 * these are ordinary (non-STRICT) tables, so BLOB affinity does not
+	 * guarantee the BLOB storage class, and a same-length TEXT value passes
+	 * a bare length() check while decoding to no Buffer at all. TEXT also
+	 * sorts BEFORE every BLOB, so such a row dodges the blob-keyed range
+	 * deletes; this shape sweep, mirroring the in-process validators
+	 * exactly, is what keeps rollback idempotent: a damaged row can never
+	 * survive to re-fail verification on the next open.
+	 */
+	archiveMalformedRecords(
+		recoveryId: Buffer,
+		reason: string,
+		archivedAt: Buffer
+	): number {
+		const bad = (column: string, width: number): string =>
+			`(typeof(${column}) != 'blob' OR length(${column}) != ${width})`;
+		const predicate = `(
+			${bad('sequence', 8)} OR ${bad('epoch', 8)} OR
+			${bad('previous_hash', 32)} OR ${bad('frame_hash', 32)} OR
+			${bad('ciphertext_hash', 32)} OR ${bad('writer_signature', 64)} OR
+			typeof(ciphertext) != 'blob' OR length(ciphertext) < 1
+		)`;
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ? AND ${predicate}`
+			)
+			.run(archivedAt, reason, recoveryId).changes;
+		this.db
+			.prepare(
+				`DELETE FROM guardian_records WHERE recovery_id = ? AND ${predicate}`
+			)
+			.run(recoveryId);
+		return moved;
+	}
+
+	/** The epoch-row counterpart of archiveMalformedRecords. */
+	deleteMalformedEpochs(recoveryId: Buffer): number {
+		const bad = (column: string, width: number): string =>
+			`(typeof(${column}) != 'blob' OR length(${column}) != ${width})`;
+		const badNullable = (column: string, width: number): string =>
+			`(${column} IS NOT NULL AND ${bad(column, width)})`;
+		return this.db
+			.prepare(
+				`DELETE FROM guardian_epochs WHERE recovery_id = ? AND (
+					${bad('epoch', 8)} OR ${bad('writer_public_key', 32)} OR
+					${badNullable('cert_superseded_state', 192)} OR
+					${badNullable('cert_issued_at', 8)} OR
+					${badNullable('cert_signature', 64)} OR
+					${badNullable('receipt_state', 192)} OR
+					${badNullable('receipt_issued_at', 8)} OR
+					${badNullable('receipt_signature', 64)}
+				)`
+			)
+			.run(recoveryId).changes;
+	}
+
+	/**
+	 * Restore a namespace primary key that corruption re-pointed at the
+	 * wrong 32-byte value. The records and epochs tables carry their own
+	 * recovery_id and were never re-keyed, so only the namespace row moves.
+	 */
+	rekeyNamespace(fromRecoveryId: Buffer, toRecoveryId: Buffer): void {
+		this.db
+			.prepare(
+				'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?'
+			)
+			.run(toRecoveryId, fromRecoveryId);
+	}
+
+	/** Replace a registration receipt whose stored artifact failed to verify. */
+	updateRegistrationReceipt(
+		recoveryId: Buffer,
+		issuedAt: Buffer,
+		signature: Buffer
+	): void {
+		this.db
+			.prepare(
+				`UPDATE guardian_namespaces
+				SET registration_receipt_issued_at = ?, registration_receipt_signature = ?
+				WHERE recovery_id = ?`
+			)
+			.run(issuedAt, signature, recoveryId);
+	}
+
 	listOrphans(recoveryId: Buffer): IGuardianOrphanRow[] {
 		const rows = this.db
 			.prepare(
@@ -536,12 +628,84 @@ export class GuardianStore {
 			.run(recoveryId, epochExclusive);
 	}
 
+	/**
+	 * Retain exactly the checkpoint prefix of epoch rows: everything below
+	 * the root-signed registration epoch or above the verified checkpoint is
+	 * impossible history and goes. An upper bound alone is not enough,
+	 * because a well-shaped row with an epoch of zero (or anything below a
+	 * registration that starts above one) sorts FIRST, breaks the
+	 * registration-row check, and sits beneath every above-checkpoint
+	 * delete forever.
+	 */
+	deleteEpochsOutsideRange(
+		recoveryId: Buffer,
+		minInclusive: Buffer,
+		maxInclusive: Buffer
+	): void {
+		this.db
+			.prepare(
+				'DELETE FROM guardian_epochs WHERE recovery_id = ? AND (epoch < ? OR epoch > ?)'
+			)
+			.run(recoveryId, minInclusive, maxInclusive);
+	}
+
+	/**
+	 * The below-origin counterpart of archiveRecordsAbove: sequence zero
+	 * never carries a record (wire 4.1) and records below the origin do not
+	 * exist for the namespace, yet a well-shaped row down there survives
+	 * every above-checkpoint archive.
+	 */
+	archiveRecordsBelow(
+		recoveryId: Buffer,
+		sequenceExclusive: Buffer,
+		reason: string,
+		archivedAt: Buffer
+	): number {
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ? AND sequence < ?`
+			)
+			.run(archivedAt, reason, recoveryId, sequenceExclusive).changes;
+		this.db
+			.prepare(
+				'DELETE FROM guardian_records WHERE recovery_id = ? AND sequence < ?'
+			)
+			.run(recoveryId, sequenceExclusive);
+		return moved;
+	}
+
+	/**
+	 * Archive EVERY record of the namespace, whatever its shape, class, or
+	 * position: tombstoning and fresh-registration cleanup must leave no row
+	 * behind, including sequence zero and storage-class rot that predicated
+	 * operations would miss.
+	 */
 	deleteAllRecords(
 		recoveryId: Buffer,
 		reason: string,
 		archivedAt: Buffer
-	): void {
-		this.archiveRecordsAbove(recoveryId, u64be(0n), reason, archivedAt);
+	): number {
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ?`
+			)
+			.run(archivedAt, reason, recoveryId).changes;
+		this.db
+			.prepare('DELETE FROM guardian_records WHERE recovery_id = ?')
+			.run(recoveryId);
+		return moved;
 	}
 
 	deleteAllEpochs(recoveryId: Buffer): void {

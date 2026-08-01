@@ -1317,6 +1317,770 @@ describe('Guardian core: damaged store, rollback, replay, quorum re-entry', () =
 	});
 });
 
+describe('Guardian core: structural corruption containment', () => {
+	let dir: string;
+	before(() => {
+		dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-guardian-shape-'));
+	});
+	after(() => {
+		fs.rmSync(dir, { recursive: true, force: true });
+	});
+
+	function corrupt(file: string, sql: string, ...params: unknown[]): void {
+		const raw = new Database(file);
+		raw.prepare(sql).run(...params);
+		raw.close();
+	}
+
+	interface IShapeFixture {
+		file: string;
+		registration: IGuardianRegisterNodeRequest;
+		chain: IGuardianRecord[];
+		finalState: GuardianState;
+		evidence: IGuardianReceipt[];
+	}
+
+	/** File-backed guardian holding 1..4; B and C receipts serve as evidence. */
+	function shapeFixture(name: string): IShapeFixture {
+		const file = path.join(dir, name);
+		const a = makeGuardian(0, file);
+		const b = makeGuardian(1);
+		const c = makeGuardian(2);
+		const registration = buildRegistration();
+		for (const g of [a, b, c]) g.register(registration);
+		const chain = buildChain(registration.initialState, 4);
+		const evidence: IGuardianReceipt[] = [];
+		for (const record of chain) {
+			a.putState({ record });
+			const rb = b.syncRecord({ record });
+			const rc = c.syncRecord({ record });
+			if (record === chain[chain.length - 1]) {
+				evidence.push(
+					rb.receipt as IGuardianReceipt,
+					rc.receipt as IGuardianReceipt
+				);
+			}
+		}
+		const finalState = headOf(a);
+		a.close();
+		b.close();
+		c.close();
+		return { file, registration, chain, finalState, evidence };
+	}
+
+	function reopen(file: string, alarms?: IGuardianAlarm[]): ReferenceGuardian {
+		const capture = alarms
+			? (a: IGuardianAlarm): void => {
+					alarms.push(a);
+			  }
+			: undefined;
+		return makeGuardian(0, file, capture);
+	}
+
+	function headRequest(): {
+		protocolVersion: number;
+		guardianSetId: Buffer;
+		recoveryId: Buffer;
+	} {
+		return {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: ROOT.recoveryId
+		};
+	}
+
+	it('a malformed record sequence rolls back the namespace instead of stopping the guardian', () => {
+		const fixture = shapeFixture('bad-sequence.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET sequence = ? WHERE sequence = ?',
+			Buffer.from([0, 0, 0, 0, 0, 0, 3]),
+			u64be(3n)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		// The malformed row was SWEPT, not left behind to re-fail every open.
+		expect(guardian.listOrphanedRecords(ROOT.recoveryId).length).to.equal(2);
+		expect(guardian.syncRecord({ record: fixture.chain[2] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(guardian.syncRecord({ record: fixture.chain[3] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		// A second reopen finds a fully verifying store: no rollback, still
+		// writable.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		const after = again.getHead(headRequest());
+		expect(after.possiblyStale).to.equal(false);
+		expect(
+			again.putState({ record: buildChain(fixture.finalState, 1)[0] }).status
+		).to.equal(GuardianStatus.OK);
+		again.close();
+	});
+
+	it('a malformed record epoch rolls back to the last decodable prefix', () => {
+		const fixture = shapeFixture('bad-record-epoch.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET epoch = ? WHERE sequence = ?',
+			Buffer.alloc(9, 1),
+			u64be(3n)
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		guardian.close();
+	});
+
+	it('a truncated writer signature is a shape failure, not a crash', () => {
+		const fixture = shapeFixture('bad-writer-sig.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET writer_signature = ? WHERE sequence = ?',
+			Buffer.alloc(63, 7),
+			u64be(2n)
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(1n);
+		expect(guardian.putState({ record: fixture.chain[1] }).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		guardian.close();
+	});
+
+	function takeoverFixture(name: string): { file: string } {
+		const file = path.join(dir, name);
+		const a = makeGuardian(0, file);
+		const registration = buildRegistration();
+		a.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) a.putState({ record });
+		const acquired = a.acquireEpoch(buildAcquire(headOf(a), WRITER_2));
+		expect(acquired.status).to.equal(GuardianStatus.OK);
+		const continued = buildRecord({
+			epoch: 2n,
+			sequence: 3n,
+			previousHash: chain[1].frameHash,
+			writerSecret: WRITER_2.secret
+		});
+		expect(a.putState({ record: continued }).status).to.equal(
+			GuardianStatus.OK
+		);
+		a.close();
+		return { file };
+	}
+
+	it('a malformed epoch-row epoch rolls the lease back and sweeps the row', () => {
+		const { file } = takeoverFixture('bad-epoch-row.sqlite');
+		corrupt(
+			file,
+			'UPDATE guardian_epochs SET epoch = ? WHERE epoch = ?',
+			Buffer.from([0, 0, 0, 0, 0, 0, 2]),
+			u64be(2n)
+		);
+		const guardian = reopen(file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).lease.epoch).to.equal(1n);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		guardian.close();
+		// Idempotent: the swept row cannot re-fail the next open.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a malformed certificate issuedAt rolls back to before the takeover', () => {
+		const { file } = takeoverFixture('bad-cert-issued-at.sqlite');
+		corrupt(
+			file,
+			'UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?',
+			Buffer.alloc(7, 1),
+			u64be(2n)
+		);
+		const guardian = reopen(file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).lease.epoch).to.equal(1n);
+		guardian.close();
+	});
+
+	it('a malformed cumulative receipt goes stale with a fresh verifying receipt', () => {
+		const fixture = shapeFixture('bad-receipt-issued-at.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET receipt_issued_at = ?',
+			Buffer.alloc(7, 2)
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		// The chain itself was intact: nothing was lost, only distrusted.
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		expectValidReceipt(head.receipt, 0, fixture.finalState);
+		guardian.close();
+	});
+
+	it('an unverifiable registration receipt is replaced and the namespace goes uncertain', () => {
+		const fixture = shapeFixture('bad-registration-receipt.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET registration_receipt_signature = ?',
+			Buffer.alloc(64)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.detail.includes('registration receipt'))
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		// The duplicate path must return a VERIFYING receipt again: the exact
+		// original is unprovable, so an honest replacement stands in for it.
+		const replay = guardian.register(fixture.registration);
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expectValidReceipt(replay.receipt, 0, fixture.registration.initialState);
+		guardian.close();
+	});
+
+	// SQLite storage-class corruption: these are ordinary (non-STRICT)
+	// tables, so a TEXT value can occupy a BLOB-affinity column. A
+	// same-width TEXT value defeats bare length checks, decodes to no
+	// Buffer, and sorts BEFORE every blob so range deletes miss it. Each
+	// case must contain, repair where applicable, and NOT re-alarm on the
+	// next open.
+
+	it('a same-width TEXT sequence is contained, swept, and repairable', () => {
+		const fixture = shapeFixture('text-sequence.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET sequence = ? WHERE sequence = ?',
+			'12345678',
+			u64be(3n)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		expect(guardian.syncRecord({ record: fixture.chain[2] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(guardian.syncRecord({ record: fixture.chain[3] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
+
+	it('a same-width TEXT writer signature is contained and swept', () => {
+		const fixture = shapeFixture('text-writer-sig.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET writer_signature = ? WHERE sequence = ?',
+			'x'.repeat(64),
+			u64be(2n)
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(1n);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT certificate issuedAt is contained and swept', () => {
+		const { file } = takeoverFixture('text-cert-issued-at.sqlite');
+		corrupt(
+			file,
+			'UPDATE guardian_epochs SET cert_issued_at = ? WHERE epoch = ?',
+			'12345678',
+			u64be(2n)
+		);
+		const guardian = reopen(file);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).lease.epoch).to.equal(1n);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT cumulative-receipt issuedAt repairs instead of quarantining', () => {
+		const fixture = shapeFixture('text-receipt-issued-at.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET receipt_issued_at = ?',
+			'12345678'
+		);
+		const guardian = reopen(fixture.file);
+		const head = guardian.getHead(headRequest());
+		// Before the storage-class fix this THREW inside the verifier and the
+		// namespace landed in quarantine; the intended path is the ordinary
+		// rollback with a fresh verifying receipt over the intact chain.
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		expectValidReceipt(head.receipt, 0, fixture.finalState);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a same-width TEXT registration-receipt issuedAt is replaced, once', () => {
+		const fixture = shapeFixture('text-reg-receipt.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET registration_receipt_issued_at = ?',
+			'12345678'
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.detail.includes('registration receipt'))
+		).to.equal(true);
+		expect(guardian.getHead(headRequest()).possiblyStale).to.equal(true);
+		const replay = guardian.register(fixture.registration);
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expectValidReceipt(replay.receipt, 0, fixture.registration.initialState);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		again.close();
+	});
+
+	it('a foreign guardian_set_id quarantines one namespace, untouched, while others serve', () => {
+		const file = path.join(dir, 'set-id-quarantine.sqlite');
+		const guardian = makeGuardian(0, file);
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) guardian.putState({ record });
+
+		// A second, independent namespace in the same store.
+		const root2 = deriveRecoveryRoot(sha('core-node-secret-2'));
+		const state2: GuardianState = {
+			recoveryId: root2.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: WRITER_1.pub },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		const registration2: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState: state2,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, state2),
+				root2.rootSecret
+			)
+		};
+		expect(guardian.register(registration2).status).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		corrupt(
+			file,
+			'UPDATE guardian_namespaces SET guardian_set_id = ? WHERE recovery_id = ?',
+			sha('a-different-set'),
+			ROOT.recoveryId
+		);
+
+		// The guardian STARTS; the damaged namespace is quarantined without a
+		// single row modified; the healthy one keeps serving.
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = reopen(file, alarms);
+		expect(alarms.some((a) => a.detail.includes('quarantined'))).to.equal(true);
+		expect(reopened.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		expect(reopened.putState({ record: chain[0] }).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		expect(reopened.register(registration).status).to.equal(
+			GuardianStatus.ERR_STORE_UNCERTAIN
+		);
+		const healthy = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: root2.recoveryId
+		});
+		expect(healthy.status).to.equal(GuardianStatus.OK);
+		expect(healthy.possiblyStale).to.equal(false);
+		reopened.close();
+
+		// Quarantine is non-destructive: every row of the damaged namespace
+		// is still on disk, byte for byte.
+		const raw = new Database(file);
+		const count = raw
+			.prepare(
+				'SELECT COUNT(*) AS n FROM guardian_records WHERE recovery_id = ?'
+			)
+			.get(ROOT.recoveryId) as { n: number };
+		raw.close();
+		expect(count.n).to.equal(2);
+	});
+
+	it('a non-BLOB recovery_id cannot brick startup; other namespaces keep serving', () => {
+		const file = path.join(dir, 'integer-recovery-id.sqlite');
+		const guardian = makeGuardian(0, file);
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) guardian.putState({ record });
+
+		const root2 = deriveRecoveryRoot(sha('core-node-secret-3'));
+		const state2: GuardianState = {
+			recoveryId: root2.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: WRITER_1.pub },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		const registration2: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState: state2,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, state2),
+				root2.rootSecret
+			)
+		};
+		expect(guardian.register(registration2).status).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		// A non-STRICT table accepts an INTEGER where the 32-byte BLOB primary
+		// key belongs; before the fix, recoveryId.toString('hex') on the
+		// resulting number threw OUTSIDE the per-namespace containment and the
+		// constructor closed the database and rethrew.
+		corrupt(
+			file,
+			'UPDATE guardian_namespaces SET recovery_id = 1 WHERE recovery_id = ?',
+			ROOT.recoveryId
+		);
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = reopen(file, alarms);
+		const storeAlarms = alarms.filter((a) => a.recoveryId.length === 0);
+		expect(storeAlarms.length).to.equal(1);
+		expect(storeAlarms[0].detail).to.contain('recovery_id');
+		// The damaged row is unreachable by any 32-byte key; the healthy
+		// namespace is untouched and fully serviceable.
+		expect(reopened.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		const healthy = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: root2.recoveryId
+		});
+		expect(healthy.status).to.equal(GuardianStatus.OK);
+		expect(healthy.possiblyStale).to.equal(false);
+		reopened.close();
+
+		// The report repeats on every open (the row stays, untouched, until
+		// an operator repairs it), and startup keeps succeeding.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(
+			laterAlarms.filter((a) => a.recoveryId.length === 0).length
+		).to.equal(1);
+		expect(
+			again.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: root2.recoveryId
+			}).status
+		).to.equal(GuardianStatus.OK);
+		again.close();
+	});
+
+	it('a same-width TEXT recovery_id is reported at store level, not thrown', () => {
+		const fixture = shapeFixture('text-recovery-id.sqlite');
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?',
+			'y'.repeat(32),
+			ROOT.recoveryId
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some(
+				(a) => a.recoveryId.length === 0 && a.detail.includes('recovery_id')
+			)
+		).to.equal(true);
+		expect(guardian.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(
+			laterAlarms.filter((a) => a.recoveryId.length === 0).length
+		).to.equal(1);
+		again.close();
+	});
+
+	it('a wrong 32-byte identity is re-keyed from the root-signed registration', () => {
+		const file = path.join(dir, 'rekeyed-identity.sqlite');
+		const guardian = makeGuardian(0, file);
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) guardian.putState({ record });
+		// A healthy second namespace proves isolation throughout.
+		const rootH = deriveRecoveryRoot(sha('core-node-secret-4'));
+		const stateH: GuardianState = {
+			recoveryId: rootH.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: WRITER_1.pub },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		const registrationH: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState: stateH,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, stateH),
+				rootH.rootSecret
+			)
+		};
+		expect(guardian.register(registrationH).status).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		// Identity-column bit corruption: the primary key becomes ANOTHER
+		// valid 32-byte value while records and epochs stay under the real
+		// one. Before the fix this tombstoned under the wrong key, stranded
+		// the history, and every later REGISTER_NODE for the real identity
+		// died on the surviving epoch row with ERR_INTERNAL.
+		const wrongId = sha('a-wrong-identity');
+		corrupt(
+			file,
+			'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?',
+			wrongId,
+			ROOT.recoveryId
+		);
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = reopen(file, alarms);
+		expect(alarms.some((a) => a.detail.includes('identity restored'))).to.equal(
+			true
+		);
+		// The root-signed registration named the real namespace; the row is
+		// back under it, the chain verified, and the store is uncertain.
+		const head = reopened.getHead(headRequest());
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		// Nothing was tombstoned under the corrupted key.
+		expect(
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: wrongId
+			}).status
+		).to.equal(GuardianStatus.ERR_UNKNOWN_NODE);
+		// The advertised re-anchor path works: a byte-identical registration
+		// is a duplicate with a verifying receipt, never ERR_INTERNAL.
+		const replay = reopened.register(registration);
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expectValidReceipt(replay.receipt, 0, registration.initialState);
+		// The healthy namespace stayed readable and writable.
+		const headH = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: rootH.recoveryId
+		});
+		expect(headH.status).to.equal(GuardianStatus.OK);
+		expect(headH.possiblyStale).to.equal(false);
+		reopened.close();
+
+		// Idempotent: the healed key matches its registration, so the second
+		// open finds an ordinary (stale) namespace and repairs nothing.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(true);
+		again.close();
+	});
+
+	it('REGISTER_NODE never fails on rows stranded without a namespace row', () => {
+		const fixture = shapeFixture('stranded-history.sqlite');
+		// Lose ONLY the namespace row; records and the epoch row survive.
+		corrupt(
+			fixture.file,
+			'DELETE FROM guardian_namespaces WHERE recovery_id = ?',
+			ROOT.recoveryId
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		// The identity is simply unknown now; the strays are unreachable.
+		expect(guardian.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		// Re-registration must absorb the leftovers instead of dying on the
+		// epoch primary key, and the namespace comes back UNCERTAIN because
+		// history provably existed here.
+		const registered = guardian.register(fixture.registration);
+		expect(registered.status).to.equal(GuardianStatus.OK);
+		expect(alarms.some((a) => a.detail.includes('stranded history'))).to.equal(
+			true
+		);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(0n);
+		expect(guardian.listOrphanedRecords(ROOT.recoveryId).length).to.equal(4);
+		// SYNC replay rebuilds and quorum evidence lifts, as everywhere else.
+		for (const record of fixture.chain) {
+			expect(guardian.syncRecord({ record }).status).to.equal(
+				GuardianStatus.OK
+			);
+		}
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		expect(guardian.getHead(headRequest()).possiblyStale).to.equal(false);
+		guardian.close();
+	});
+
+	it('a well-shaped sequence-zero record is swept and repair is durable', () => {
+		const fixture = shapeFixture('sequence-zero.sqlite');
+		// Sequence zero never carries a record (wire 4.1), but an 8-byte
+		// zero BLOB passes every shape check, sorts FIRST, and sits below
+		// every above-checkpoint archive: before the fix it re-failed
+		// verification and re-flagged the namespace on every open.
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET sequence = ? WHERE sequence = ?',
+			u64be(0n),
+			u64be(3n)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		// Repair: replay the missing tail, lift on quorum evidence.
+		expect(guardian.syncRecord({ record: fixture.chain[2] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(guardian.syncRecord({ record: fixture.chain[3] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+		// Durable: the zero row is gone, so the next open repairs nothing and
+		// the namespace STAYS healthy.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
+
+	it('a well-shaped epoch below the registration epoch is swept and repair is durable', () => {
+		const fixture = shapeFixture('epoch-below-registration.sqlite');
+		// A valid-width epoch-zero row sorts before the registration row,
+		// broke the registration-row check, and sat below every
+		// above-checkpoint delete: before the fix it rolled the namespace
+		// back to genesis and re-flagged it on every open.
+		corrupt(
+			fixture.file,
+			'INSERT INTO guardian_epochs (recovery_id, epoch, writer_public_key) VALUES (?, ?, ?)',
+			ROOT.recoveryId,
+			u64be(0n),
+			WRITER_1.pub
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		// The intact chain was retained: the impossible row alone was the
+		// problem, so the checkpoint is the full declared head.
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
+});
+
 describe('Guardian core: INFO', () => {
 	it('advertises identity, versions, sets and limits', () => {
 		const guardian = makeGuardian(1);

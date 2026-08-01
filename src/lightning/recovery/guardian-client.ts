@@ -154,17 +154,44 @@ export interface IGuardianEndpointSelection {
 	transportType: 'onion-http' | 'https' | 'local-http';
 }
 
+/** A Tor v3 onion service hostname: 56 base32 characters plus .onion. */
+const ONION_V3_HOSTNAME = /^[a-z2-7]{56}\.onion$/;
+
+/** Strictly loopback; container hostnames need explicit approval. */
+export function isLoopbackHostname(hostname: string): boolean {
+	return hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
+}
+
+export interface IGuardianEndpointOptions {
+	torEnabled: boolean;
+	/** Permits local-http to LOOPBACK hosts only. */
+	allowLocalHttp?: boolean;
+	/**
+	 * Approves specific NON-loopback local-http hostnames, for deployments
+	 * where an orchestrator genuinely guarantees network isolation (the
+	 * Umbrel container case). Providing this also enables loopback. A plain
+	 * boolean cannot express this safely: bearer and macaroon credentials
+	 * ride the Authorization header, so a stale or hostile descriptor
+	 * naming a clearnet http URL would otherwise receive them in plaintext.
+	 */
+	allowLocalHttpHost?: (hostname: string) => boolean;
+}
+
 /**
  * Selection rule: Tor enabled means the first onion-http endpoint (falling
  * back to https when the guardian advertises no onion one); otherwise the
- * first https endpoint; local-http only when explicitly allowed. A
+ * first https endpoint; local-http only when explicitly configured, and
+ * then only to loopback or individually approved isolated-network hosts
+ * (wire 2.3: a general LAN or clearnet address never qualifies). A
  * descriptor with no usable transport is an error surfaced to the operator,
  * never a silent skip.
  */
 export function selectGuardianEndpoint(
 	descriptor: GuardianDescriptor,
-	options: { torEnabled: boolean; allowLocalHttp?: boolean }
+	options: IGuardianEndpointOptions
 ): IGuardianEndpointSelection {
+	const localEnabled =
+		options.allowLocalHttp === true || options.allowLocalHttpHost !== undefined;
 	const usable = (
 		type: 'onion-http' | 'https' | 'local-http'
 	): IGuardianEndpointSelection | null => {
@@ -177,9 +204,20 @@ export function selectGuardianEndpoint(
 				continue;
 			}
 			if (type === 'https' && parsed.protocol !== 'https:') continue;
-			if (type === 'local-http' && parsed.protocol !== 'http:') continue;
-			if (type === 'onion-http' && !parsed.hostname.endsWith('.onion'))
+			if (type === 'local-http') {
+				if (parsed.protocol !== 'http:') continue;
+				const approved =
+					isLoopbackHostname(parsed.hostname) ||
+					options.allowLocalHttpHost?.(parsed.hostname) === true;
+				if (!approved) continue;
+			}
+			if (
+				type === 'onion-http' &&
+				(parsed.protocol !== 'http:' ||
+					!ONION_V3_HOSTNAME.test(parsed.hostname))
+			) {
 				continue;
+			}
 			return { url: transport.url, transportType: type };
 		}
 		return null;
@@ -187,16 +225,14 @@ export function selectGuardianEndpoint(
 	const order: Array<'onion-http' | 'https' | 'local-http'> = options.torEnabled
 		? ['onion-http', 'https']
 		: ['https'];
-	if (options.allowLocalHttp) order.push('local-http');
+	if (localEnabled) order.push('local-http');
 	for (const type of order) {
 		const selected = usable(type);
 		if (selected) return selected;
 	}
 	throw new GuardianTransportError(
 		`guardian ${descriptor.guardianId} advertises no usable transport ` +
-			`(torEnabled=${options.torEnabled}, allowLocalHttp=${Boolean(
-				options.allowLocalHttp
-			)})`
+			`(torEnabled=${options.torEnabled}, localHttp=${localEnabled})`
 	);
 }
 
@@ -216,6 +252,13 @@ export interface IGuardianClientOptions {
 	transport?: GuardianHttpTransport;
 	timeoutMs?: number;
 	maxResponseBytes?: number;
+	/**
+	 * Permit a bearer or macaroon credential over plain http to a
+	 * NON-loopback, non-onion host. Off by default: that is a plaintext
+	 * credential on the wire, defensible only where an orchestrator
+	 * guarantees network isolation (the local-http container case).
+	 */
+	allowUnencryptedAuth?: boolean;
 }
 
 export class GuardianClient {
@@ -225,6 +268,7 @@ export class GuardianClient {
 	private readonly headers: Record<string, string>;
 	private readonly timeoutMs: number;
 	private readonly maxResponseBytes: number;
+	private versionGate: Promise<IGuardianInfoResponse> | null = null;
 
 	constructor(options: IGuardianClientOptions) {
 		this.url = options.url.replace(/\/+$/, '');
@@ -239,6 +283,52 @@ export class GuardianClient {
 		} else if (options.auth?.type === 'macaroon') {
 			this.headers.Authorization = `Macaroon ${options.auth.macaroon}`;
 		}
+		if (this.headers.Authorization && !options.allowUnencryptedAuth) {
+			const parsed = new URL(this.url);
+			// The onion exemption demands the same v3 hostname validation as
+			// endpoint selection: a bare .onion suffix is not evidence of a
+			// Tor-encrypted destination.
+			if (
+				parsed.protocol === 'http:' &&
+				!isLoopbackHostname(parsed.hostname) &&
+				!ONION_V3_HOSTNAME.test(parsed.hostname)
+			) {
+				throw new GuardianTransportError(
+					'refusing to send a bearer or macaroon credential over plaintext ' +
+						'HTTP to a non-local host; set allowUnencryptedAuth only for an ' +
+						'isolated container network'
+				);
+			}
+		}
+	}
+
+	/**
+	 * The advertised-range gate (wire 10), enforced rather than advisory:
+	 * every verb awaits one cached INFO exchange before sending anything, so
+	 * a guardian outside the supported protocol range is rejected without
+	 * ever receiving signed material. A failed probe clears the cache so a
+	 * transient outage does not wedge the client.
+	 */
+	private ensureCompatible(): Promise<IGuardianInfoResponse> {
+		if (!this.versionGate) {
+			this.versionGate = (async (): Promise<IGuardianInfoResponse> => {
+				const info = await this.info();
+				if (
+					info.minProtocolVersion > GUARDIAN_PROTOCOL_VERSION ||
+					info.maxProtocolVersion < GUARDIAN_PROTOCOL_VERSION
+				) {
+					throw new GuardianTransportError(
+						`guardian supports protocol ${info.minProtocolVersion}..` +
+							`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`
+					);
+				}
+				return info;
+			})().catch((error) => {
+				this.versionGate = null;
+				throw error;
+			});
+		}
+		return this.versionGate;
 	}
 
 	private async exchange(verb: string | null, body?: Buffer): Promise<Buffer> {
@@ -269,39 +359,29 @@ export class GuardianClient {
 		return decodeInfoResponse(await this.exchange(null));
 	}
 
-	/**
-	 * Version gating (wire 10): reject a guardian whose advertised range
-	 * excludes this protocol version before sending it anything signed.
-	 */
+	/** The public face of the gate; shares its cache with every verb. */
 	async checkVersion(): Promise<IGuardianInfoResponse> {
-		const info = await this.info();
-		if (
-			info.minProtocolVersion > GUARDIAN_PROTOCOL_VERSION ||
-			info.maxProtocolVersion < GUARDIAN_PROTOCOL_VERSION
-		) {
-			throw new GuardianTransportError(
-				`guardian supports protocol ${info.minProtocolVersion}..` +
-					`${info.maxProtocolVersion}, not ${GUARDIAN_PROTOCOL_VERSION}`
-			);
-		}
-		return info;
+		return this.ensureCompatible();
 	}
 
 	async register(
 		request: IGuardianRegisterNodeRequest
 	): Promise<IGuardianRegisterNodeResponse> {
+		await this.ensureCompatible();
 		return decodeRegisterNodeResponse(
 			await this.exchange('register_node', encodeRegisterNodeRequest(request))
 		);
 	}
 
 	async putState(record: IGuardianRecord): Promise<IGuardianPutStateResponse> {
+		await this.ensureCompatible();
 		return decodePutStateResponse(
 			await this.exchange('put_state', encodePutStateRequest({ record }))
 		);
 	}
 
 	async getHead(recoveryId: Buffer): Promise<IGuardianGetHeadResponse> {
+		await this.ensureCompatible();
 		return decodeGetHeadResponse(
 			await this.exchange(
 				'get_head',
@@ -319,6 +399,7 @@ export class GuardianClient {
 		fromSequence: bigint,
 		maxRecords = 0
 	): Promise<IGuardianGetStateResponse> {
+		await this.ensureCompatible();
 		return decodeGetStateResponse(
 			await this.exchange(
 				'get_state',
@@ -336,6 +417,7 @@ export class GuardianClient {
 	async acquireEpoch(
 		request: IGuardianAcquireEpochRequest
 	): Promise<IGuardianAcquireEpochResponse> {
+		await this.ensureCompatible();
 		return decodeAcquireEpochResponse(
 			await this.exchange('acquire_epoch', encodeAcquireEpochRequest(request))
 		);
@@ -344,6 +426,7 @@ export class GuardianClient {
 	async syncRecord(
 		record: IGuardianRecord
 	): Promise<IGuardianSyncRecordResponse> {
+		await this.ensureCompatible();
 		return decodeSyncRecordResponse(
 			await this.exchange('sync_record', encodeSyncRecordRequest({ record }))
 		);
@@ -352,6 +435,7 @@ export class GuardianClient {
 	async syncEpoch(
 		certificates: IGuardianTakeoverCertificate[]
 	): Promise<IGuardianSyncEpochResponse> {
+		await this.ensureCompatible();
 		return decodeSyncEpochResponse(
 			await this.exchange(
 				'sync_epoch',
