@@ -16,3 +16,6 @@ export * from './capsule';
 export * from './guardian-wire';
 export * from './guardian-store';
 export * from './guardian';
+export * from './guardian-proto';
+export * from './guardian-http';
+export * from './guardian-client';

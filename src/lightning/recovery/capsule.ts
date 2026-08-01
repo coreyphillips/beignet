@@ -56,6 +56,17 @@ const ZERO_HASH = Buffer.alloc(32);
 export const CAPSULE_MAX_BYTES = PEER_STORAGE_MAX_BYTES - 8;
 
 /**
+ * A recoverable transport credential (wire spec 2.4). Safe to carry here
+ * precisely because the whole capsule is encrypted under the seed-derived
+ * capsule key: storage peers never see credentials, and a seed restore
+ * recovers them together with the endpoints they unlock.
+ */
+export type GuardianAuth =
+	| { type: 'bearer'; token: string }
+	| { type: 'macaroon'; macaroon: string }
+	| { type: 'tor-v3-client-auth'; privateKey: string };
+
+/**
  * How to reach one guardian (Phase 4). Shape fixed now so the capsule format
  * does not break when guardians arrive: transports follow the section 12
  * decision record, onion-HTTP and clearnet HTTPS both first-class, and a
