@@ -628,12 +628,84 @@ export class GuardianStore {
 			.run(recoveryId, epochExclusive);
 	}
 
+	/**
+	 * Retain exactly the checkpoint prefix of epoch rows: everything below
+	 * the root-signed registration epoch or above the verified checkpoint is
+	 * impossible history and goes. An upper bound alone is not enough,
+	 * because a well-shaped row with an epoch of zero (or anything below a
+	 * registration that starts above one) sorts FIRST, breaks the
+	 * registration-row check, and sits beneath every above-checkpoint
+	 * delete forever.
+	 */
+	deleteEpochsOutsideRange(
+		recoveryId: Buffer,
+		minInclusive: Buffer,
+		maxInclusive: Buffer
+	): void {
+		this.db
+			.prepare(
+				'DELETE FROM guardian_epochs WHERE recovery_id = ? AND (epoch < ? OR epoch > ?)'
+			)
+			.run(recoveryId, minInclusive, maxInclusive);
+	}
+
+	/**
+	 * The below-origin counterpart of archiveRecordsAbove: sequence zero
+	 * never carries a record (wire 4.1) and records below the origin do not
+	 * exist for the namespace, yet a well-shaped row down there survives
+	 * every above-checkpoint archive.
+	 */
+	archiveRecordsBelow(
+		recoveryId: Buffer,
+		sequenceExclusive: Buffer,
+		reason: string,
+		archivedAt: Buffer
+	): number {
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ? AND sequence < ?`
+			)
+			.run(archivedAt, reason, recoveryId, sequenceExclusive).changes;
+		this.db
+			.prepare(
+				'DELETE FROM guardian_records WHERE recovery_id = ? AND sequence < ?'
+			)
+			.run(recoveryId, sequenceExclusive);
+		return moved;
+	}
+
+	/**
+	 * Archive EVERY record of the namespace, whatever its shape, class, or
+	 * position: tombstoning and fresh-registration cleanup must leave no row
+	 * behind, including sequence zero and storage-class rot that predicated
+	 * operations would miss.
+	 */
 	deleteAllRecords(
 		recoveryId: Buffer,
 		reason: string,
 		archivedAt: Buffer
-	): void {
-		this.archiveRecordsAbove(recoveryId, u64be(0n), reason, archivedAt);
+	): number {
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ?`
+			)
+			.run(archivedAt, reason, recoveryId).changes;
+		this.db
+			.prepare('DELETE FROM guardian_records WHERE recovery_id = ?')
+			.run(recoveryId);
+		return moved;
 	}
 
 	deleteAllEpochs(recoveryId: Buffer): void {

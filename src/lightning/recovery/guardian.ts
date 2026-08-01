@@ -764,23 +764,15 @@ export class ReferenceGuardian {
 				// the content the orphan archive preserves.
 				let strandedHistory = false;
 				if (!ns) {
-					const strayRecords =
-						this.store.archiveRecordsAbove(
-							state.recoveryId,
-							u64be(0n),
-							'rollback',
-							u64be(this.clock())
-						) +
-						this.store.archiveMalformedRecords(
-							state.recoveryId,
-							'rollback',
-							u64be(this.clock())
-						);
+					const strayRecords = this.store.deleteAllRecords(
+						state.recoveryId,
+						'rollback',
+						u64be(this.clock())
+					);
 					const strayEpochs = this.store.listEpochs(state.recoveryId);
 					if (strayEpochs.length > 0) {
 						this.store.deleteAllEpochs(state.recoveryId);
 					}
-					this.store.deleteMalformedEpochs(state.recoveryId);
 					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
 					if (strandedHistory) {
 						this.alarm(
@@ -2116,12 +2108,16 @@ export class ReferenceGuardian {
 	): { checkpoint: GuardianState; reason: string } | null {
 		const recoveryId = ns.recoveryId;
 		let sim = this.cloneState(regState);
-		// Rows whose column WIDTHS are wrong cannot even be decoded, and their
-		// blob sort position is meaningless; they are filtered out here so the
+		// Rows that cannot belong to ANY valid history are filtered out so the
 		// walk judges what remains, and their mere existence fails the
-		// namespace at the end (the rollback's shape sweep removes them, so
-		// the failure does not recur on the next open).
-		let malformedRows = false;
+		// namespace at the end; the rollback then removes them, so the
+		// failure does not recur on the next open. Two kinds qualify: wrong
+		// column shape or storage class (undecodable, meaningless sort
+		// position), and well-shaped rows at semantically impossible
+		// positions (records below the root-committed origin, epochs below
+		// the registration epoch), which sort FIRST and would otherwise sit
+		// beneath every above-checkpoint range operation forever.
+		let impossibleRows = false;
 		const fail = (
 			reason: string
 		): { checkpoint: GuardianState; reason: string } => ({
@@ -2131,8 +2127,13 @@ export class ReferenceGuardian {
 
 		const epochRows: IGuardianEpochRow[] = [];
 		for (const row of this.store.listEpochs(recoveryId)) {
-			if (epochRowProblem(row)) malformedRows = true;
-			else epochRows.push(row);
+			if (epochRowProblem(row)) {
+				impossibleRows = true;
+			} else if ((tryReadU64(row.epoch) as bigint) < regState.lease.epoch) {
+				impossibleRows = true;
+			} else {
+				epochRows.push(row);
+			}
 		}
 		if (
 			epochRows.length === 0 ||
@@ -2215,11 +2216,17 @@ export class ReferenceGuardian {
 
 		for (const record of this.store.iterateRecords(recoveryId)) {
 			if (recordRowProblem(record)) {
-				malformedRows = true;
+				impossibleRows = true;
 				continue;
 			}
 			const sequence = readU64be(record.sequence);
 			const recordEpoch = readU64be(record.epoch);
+			if (sequence < regState.origin.firstSequence) {
+				// Sequence zero never carries a record, and records below the
+				// origin do not exist for this namespace (wire 4.1).
+				impossibleRows = true;
+				continue;
+			}
 			if (walkTarget && sequence > walkTarget.logHead.sequence) {
 				return fail('stored records extend beyond the declared head');
 			}
@@ -2304,8 +2311,8 @@ export class ReferenceGuardian {
 		) {
 			return fail('stored cumulative receipt does not verify');
 		}
-		if (malformedRows) {
-			return fail('structurally malformed rows present alongside the chain');
+		if (impossibleRows) {
+			return fail('impossible rows present alongside the chain');
 		}
 		return null;
 	}
@@ -2326,12 +2333,24 @@ export class ReferenceGuardian {
 		// Shape sweeps: rows with malformed column widths sort arbitrarily and
 		// can dodge the range operations above; removing them here is what
 		// keeps this rollback IDEMPOTENT instead of re-failing on every open.
+		this.store.archiveRecordsBelow(
+			recoveryId,
+			u64be(regState.origin.firstSequence),
+			'rollback',
+			u64be(this.clock())
+		);
 		this.store.archiveMalformedRecords(
 			recoveryId,
 			'rollback',
 			u64be(this.clock())
 		);
-		this.store.deleteEpochsAbove(recoveryId, u64be(checkpoint.lease.epoch));
+		// Retain exactly the checkpoint prefix of epochs: below the
+		// registration epoch is as impossible as above the checkpoint.
+		this.store.deleteEpochsOutsideRange(
+			recoveryId,
+			u64be(regState.lease.epoch),
+			u64be(checkpoint.lease.epoch)
+		);
 		this.store.deleteMalformedEpochs(recoveryId);
 		// The registration epoch row is derived from the root-signed
 		// registration itself; if it was the damaged part, rebuild it.

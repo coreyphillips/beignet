@@ -1995,6 +1995,90 @@ describe('Guardian core: structural corruption containment', () => {
 		expect(guardian.getHead(headRequest()).possiblyStale).to.equal(false);
 		guardian.close();
 	});
+
+	it('a well-shaped sequence-zero record is swept and repair is durable', () => {
+		const fixture = shapeFixture('sequence-zero.sqlite');
+		// Sequence zero never carries a record (wire 4.1), but an 8-byte
+		// zero BLOB passes every shape check, sorts FIRST, and sits below
+		// every above-checkpoint archive: before the fix it re-failed
+		// verification and re-flagged the namespace on every open.
+		corrupt(
+			fixture.file,
+			'UPDATE guardian_records SET sequence = ? WHERE sequence = ?',
+			u64be(0n),
+			u64be(3n)
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		// Repair: replay the missing tail, lift on quorum evidence.
+		expect(guardian.syncRecord({ record: fixture.chain[2] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(guardian.syncRecord({ record: fixture.chain[3] }).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+		// Durable: the zero row is gone, so the next open repairs nothing and
+		// the namespace STAYS healthy.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
+
+	it('a well-shaped epoch below the registration epoch is swept and repair is durable', () => {
+		const fixture = shapeFixture('epoch-below-registration.sqlite');
+		// A valid-width epoch-zero row sorts before the registration row,
+		// broke the registration-row check, and sat below every
+		// above-checkpoint delete: before the fix it rolled the namespace
+		// back to genesis and re-flagged it on every open.
+		corrupt(
+			fixture.file,
+			'INSERT INTO guardian_epochs (recovery_id, epoch, writer_public_key) VALUES (?, ?, ?)',
+			ROOT.recoveryId,
+			u64be(0n),
+			WRITER_1.pub
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		expect(
+			alarms.some((a) => a.status === GuardianStatus.ERR_STORE_UNCERTAIN)
+		).to.equal(true);
+		// The intact chain was retained: the impossible row alone was the
+		// problem, so the checkpoint is the full declared head.
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(4n);
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		guardian.close();
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(fixture.file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(false);
+		again.close();
+	});
 });
 
 describe('Guardian core: INFO', () => {
