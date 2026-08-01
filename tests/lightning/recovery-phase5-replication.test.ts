@@ -26,6 +26,7 @@ import {
 	GuardianReplicator,
 	GuardianState,
 	GuardianStatus,
+	IBoundGuardianClient,
 	IGuardianReplicationEvent,
 	IWriterLeaseKeys,
 	RecoveryCriticality,
@@ -64,6 +65,15 @@ interface IServed {
 	guardian: ReferenceGuardian;
 	server: GuardianHttpServer;
 	client: GuardianClient;
+	id: Buffer;
+}
+
+/** Guardians bound to the identity each endpoint must prove it holds. */
+function bind(served: IServed[]): IBoundGuardianClient[] {
+	return served.map((entry) => ({
+		client: entry.client,
+		expectedGuardianId: entry.id
+	}));
 }
 
 async function serve(index: number): Promise<IServed> {
@@ -79,7 +89,7 @@ async function serve(index: number): Promise<IServed> {
 		url: `http://127.0.0.1:${port}`,
 		guardianSetId: SET_ID
 	});
-	return { guardian, server, client };
+	return { guardian, server, client, id: GUARDIAN_IDS[index] };
 }
 
 async function shutdown(served: IServed[]): Promise<void> {
@@ -128,12 +138,12 @@ function journaledStorage(count: number): {
 
 function replicator(
 	storage: SqliteStorage,
-	clients: GuardianClient[],
+	guardians: IBoundGuardianClient[],
 	events: IGuardianReplicationEvent[] = []
 ): GuardianReplicator {
 	return new GuardianReplicator({
 		storage,
-		clients,
+		guardians,
 		context: CONTEXT,
 		required: CRASH_V1_PROFILE.required,
 		recoveryRoot: ROOT,
@@ -149,11 +159,7 @@ describe('Recovery phase 5: namespace establishment', () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(2);
 		const events: IGuardianReplicationEvent[] = [];
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client),
-			events
-		);
+		const rep = replicator(storage, bind(served), events);
 
 		const decision = await rep.ensureNamespace();
 		expect(decision.outcome).to.equal('registered');
@@ -192,10 +198,7 @@ describe('Recovery phase 5: namespace establishment', () => {
 		const base = frames[0];
 		expect(base.sequence).to.be.greaterThan(0);
 
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client)
-		);
+		const rep = replicator(storage, bind(served));
 		expect((await rep.ensureNamespace()).outcome).to.equal('registered');
 
 		const head = await served[0].client.getHead(ROOT.recoveryId);
@@ -211,21 +214,14 @@ describe('Recovery phase 5: namespace establishment', () => {
 	it('refuses to register when the namespace already exists remotely', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const first = journaledStorage(1);
-		const firstRep = replicator(
-			first.storage,
-			served.map((s) => s.client)
-		);
+		const firstRep = replicator(first.storage, bind(served));
 		expect((await firstRep.ensureNamespace()).outcome).to.equal('registered');
 
 		// A SECOND device with the same seed but no local lease must not
 		// register a second genesis over the live namespace.
 		const second = journaledStorage(1);
 		const events: IGuardianReplicationEvent[] = [];
-		const secondRep = replicator(
-			second.storage,
-			served.map((s) => s.client),
-			events
-		);
+		const secondRep = replicator(second.storage, bind(served), events);
 		const decision = await secondRep.ensureNamespace();
 		expect(decision.outcome).to.equal('exists-remotely');
 		expect(events.some((e) => e.type === 'namespace:exists')).to.equal(true);
@@ -243,11 +239,7 @@ describe('Recovery phase 5: namespace establishment', () => {
 		await served[2].server.close();
 		const { storage } = journaledStorage(1);
 		const events: IGuardianReplicationEvent[] = [];
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client),
-			events
-		);
+		const rep = replicator(storage, bind(served), events);
 		const decision = await rep.ensureNamespace();
 		expect(decision.outcome).to.equal('no-quorum');
 		expect((decision as { responded: number }).responded).to.equal(1);
@@ -265,11 +257,7 @@ describe('Recovery phase 5: record replication', () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage, manager } = journaledStorage(3);
 		const events: IGuardianReplicationEvent[] = [];
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client),
-			events
-		);
+		const rep = replicator(storage, bind(served), events);
 		const decision = await rep.ensureNamespace();
 		expect(decision.outcome).to.equal('registered');
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
@@ -318,10 +306,7 @@ describe('Recovery phase 5: record replication', () => {
 	it('keeps the high-water mark honest when the quorum is not reached', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(2);
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client)
-		);
+		const rep = replicator(storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 
@@ -331,7 +316,7 @@ describe('Recovery phase 5: record replication', () => {
 		const events: IGuardianReplicationEvent[] = [];
 		const degraded = new GuardianReplicator({
 			storage,
-			clients: served.map((s) => s.client),
+			guardians: bind(served),
 			context: CONTEXT,
 			required: CRASH_V1_PROFILE.required,
 			recoveryRoot: ROOT,
@@ -358,10 +343,7 @@ describe('Recovery phase 5: record replication', () => {
 	it('reports ownership confirmation and being superseded', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(1);
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client)
-		);
+		const rep = replicator(storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 
@@ -398,13 +380,70 @@ describe('Recovery phase 5: record replication', () => {
 		storage.close();
 	});
 
+	it('treats a superseded epoch as a terminal fenced outcome', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const { storage, manager } = journaledStorage(1);
+		const events: IGuardianReplicationEvent[] = [];
+		const rep = replicator(storage, bind(served), events);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		expect((await rep.replicatePending(lease)).outcome).to.equal('replicated');
+
+		// Another device takes the epoch while this one is still RUNNING.
+		// Startup confirmation cannot help here: only the replication path
+		// can notice, and spec 5.6 makes a definitive epoch rejection a hard
+		// freeze signal rather than a retryable error.
+		const head = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		const newWriter = generateWriterKey();
+		for (const entry of served) {
+			await entry.client.acquireEpoch({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				expectedState: head,
+				newEpoch: head.lease.epoch + 1n,
+				newWriterPublicKey: newWriter.publicKey,
+				...signAcquisition(
+					SET_ID,
+					head,
+					head.lease.epoch + 1n,
+					newWriter,
+					ROOT.rootSecret
+				)
+			});
+		}
+
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 77).toString('hex'),
+					preimage: Buffer.alloc(32, 77)
+				}
+			],
+			outboundMessages: []
+		});
+		const result = await rep.replicatePending(lease);
+		expect(result.outcome).to.equal('fenced');
+		expect(result.localEpoch).to.equal(lease.epoch);
+		// The newer state is PROVEN through a signed head, not taken from the
+		// rejection itself.
+		expect(result.verifiedCurrentState).to.not.equal(undefined);
+		expect((result.verifiedCurrentState as GuardianState).lease.epoch).to.equal(
+			lease.epoch + 1n
+		);
+		expect(events.some((e) => e.type === 'writer:fenced')).to.equal(true);
+		// Durability already proven is not retracted by the freeze.
+		expect(result.replicatedThrough).to.equal(rep.replicatedThrough());
+		await shutdown(served);
+		storage.close();
+	});
+
 	it('signs records the guardian accepts under the lease key alone', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(1);
-		const rep = replicator(
-			storage,
-			served.map((s) => s.client)
-		);
+		const rep = replicator(storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 		const frame = storage.loadRecoveryFrames()[0];

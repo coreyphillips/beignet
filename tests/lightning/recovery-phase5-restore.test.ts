@@ -21,14 +21,17 @@ import {
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
+	GuardianTransportError,
 	GuardianState,
 	GuardianStatus,
+	IBoundGuardianClient,
 	IRestoreEvent,
 	IWriterLeaseKeys,
 	RecoveryCriticality,
 	RecoveryJournal,
 	RecoveryManager,
 	ReferenceGuardian,
+	RESTORE_META_KEYS,
 	RestoreDriver,
 	RestoreRefusedError,
 	computeGuardianSetId,
@@ -36,6 +39,7 @@ import {
 	deriveRecoveryRoot,
 	generateWriterKey,
 	loadWriterLease,
+	nodeGuardianTransport,
 	signAcquisition,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
@@ -65,6 +69,15 @@ interface IServed {
 	guardian: ReferenceGuardian;
 	server: GuardianHttpServer;
 	client: GuardianClient;
+	id: Buffer;
+}
+
+/** Guardians bound to the identity each endpoint must prove it holds. */
+function bind(served: IServed[]): IBoundGuardianClient[] {
+	return served.map((entry) => ({
+		client: entry.client,
+		expectedGuardianId: entry.id
+	}));
 }
 
 async function serve(index: number): Promise<IServed> {
@@ -79,6 +92,7 @@ async function serve(index: number): Promise<IServed> {
 	return {
 		guardian,
 		server,
+		id: GUARDIAN_IDS[index],
 		client: new GuardianClient({
 			url: `http://127.0.0.1:${port}`,
 			guardianSetId: SET_ID
@@ -163,11 +177,11 @@ function liveNode(transitions: number): {
 
 function replicatorFor(
 	storage: SqliteStorage,
-	clients: GuardianClient[]
+	guardians: IBoundGuardianClient[]
 ): GuardianReplicator {
 	return new GuardianReplicator({
 		storage,
-		clients,
+		guardians,
 		context: CONTEXT,
 		required: CRASH_V1_PROFILE.required,
 		recoveryRoot: ROOT,
@@ -177,12 +191,12 @@ function replicatorFor(
 
 function driverFor(
 	target: IStorageBackend,
-	clients: GuardianClient[],
+	guardians: IBoundGuardianClient[],
 	events: IRestoreEvent[] = []
 ): RestoreDriver {
 	return new RestoreDriver({
 		target,
-		clients,
+		guardians,
 		context: CONTEXT,
 		required: CRASH_V1_PROFILE.required,
 		recoveryRoot: ROOT,
@@ -201,7 +215,7 @@ describe('Recovery phase 5: restore driver', () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(3);
-		const rep = replicatorFor(live.storage, clients);
+		const rep = replicatorFor(live.storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 		await rep.replicatePending(lease);
@@ -210,7 +224,7 @@ describe('Recovery phase 5: restore driver', () => {
 		// The device is lost. A fresh install restores from the guardians.
 		const events: IRestoreEvent[] = [];
 		const target = openStorage();
-		const driver = driverFor(target, clients, events);
+		const driver = driverFor(target, bind(served), events);
 		const result = await driver.restore();
 
 		// The fence landed BEFORE the download: the events are ordered, and
@@ -252,7 +266,7 @@ describe('Recovery phase 5: restore driver', () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);
-		const rep = replicatorFor(live.storage, clients);
+		const rep = replicatorFor(live.storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 
@@ -277,7 +291,7 @@ describe('Recovery phase 5: restore driver', () => {
 		await served[0].server.close();
 		const events: IRestoreEvent[] = [];
 		const target = openStorage();
-		const driver = driverFor(target, clients, events);
+		const driver = driverFor(target, bind(served), events);
 		const result = await driver.restore();
 
 		expect(result.certifiedState.logHead.sequence).to.equal(
@@ -299,7 +313,7 @@ describe('Recovery phase 5: restore driver', () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);
-		const rep = replicatorFor(live.storage, clients);
+		const rep = replicatorFor(live.storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 		await rep.replicatePending(lease);
@@ -309,7 +323,7 @@ describe('Recovery phase 5: restore driver', () => {
 		// first CAS must fail and the retry must land on the NEWER state.
 		const target = openStorage();
 		const events: IRestoreEvent[] = [];
-		const driver = driverFor(target, clients, events);
+		const driver = driverFor(target, bind(served), events);
 		const stolen = await clients[0].getHead(ROOT.recoveryId);
 		const stolenState = stolen.state as GuardianState;
 		const competitor = generateWriterKey();
@@ -341,11 +355,88 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
+	it('picks up a record the old writer appended mid-restore', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const headBefore = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		// The acceptance criterion from #190: the still-live old writer
+		// APPENDS a new record and gets quorum receipts for it between the
+		// restore's first head read and its acquisition. The CAS against the
+		// older head must fail, the refetch must find N+1, and the restored
+		// database must CONTAIN that record.
+		let raced = false;
+		const target = openStorage();
+		const events: IRestoreEvent[] = [];
+		const driver = new RestoreDriver({
+			target,
+			guardians: bind(served),
+			context: CONTEXT,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot: ROOT,
+			nodeSecret: NODE_SECRET,
+			nodeId: NODE_ID,
+			clock,
+			pageSize: 2,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+		const originalReadHeads = (
+			driver as unknown as { readHeads: () => Promise<unknown> }
+		).readHeads.bind(driver);
+		(driver as unknown as { readHeads: () => Promise<unknown> }).readHeads =
+			async (): Promise<unknown> => {
+				const readings = await originalReadHeads();
+				if (!raced) {
+					raced = true;
+					// The old device is still alive and commits one more
+					// transition, replicating it to a quorum.
+					live.manager.commit({
+						criticality: RecoveryCriticality.SafetyCritical,
+						mutations: [
+							{
+								type: 'payment_preimage',
+								paymentHash: Buffer.alloc(32, 55).toString('hex'),
+								preimage: Buffer.alloc(32, 55)
+							}
+						],
+						outboundMessages: []
+					});
+					const appended = await rep.replicatePending(lease);
+					expect(appended.durable).to.be.greaterThan(0);
+				}
+				return readings;
+			};
+
+		const result = await driver.restore();
+		// The CAS against the stale head failed and the retry landed on the
+		// head that now includes the raced record.
+		expect(events.some((e) => e.type === 'epoch:cas-retry')).to.equal(true);
+		expect(
+			result.certifiedState.logHead.sequence > headBefore.logHead.sequence
+		).to.equal(true);
+		// The restored database contains the record appended mid-restore.
+		expect(dumpTables(target)).to.equal(dumpTables(live.storage));
+		expect(
+			target
+				.loadAllPreimages()
+				.some((p) => p.paymentHash === Buffer.alloc(32, 55).toString('hex'))
+		).to.equal(true);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
 	it('refuses without a read quorum, and for an unknown namespace', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
-		const clients = served.map((s) => s.client);
 		const live = liveNode(1);
-		const rep = replicatorFor(live.storage, clients);
+		const rep = replicatorFor(live.storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
 
@@ -355,7 +446,7 @@ describe('Recovery phase 5: restore driver', () => {
 		await served[2].server.close();
 		const target = openStorage();
 		try {
-			await driverFor(target, clients).restore();
+			await driverFor(target, bind(served)).restore();
 			expect.fail('a sub-quorum restore must be refused');
 		} catch (error) {
 			expect(error).to.be.instanceOf(RestoreRefusedError);
@@ -368,10 +459,7 @@ describe('Recovery phase 5: restore driver', () => {
 		const fresh = await Promise.all([serve(0), serve(1), serve(2)]);
 		const emptyTarget = openStorage();
 		try {
-			await driverFor(
-				emptyTarget,
-				fresh.map((s) => s.client)
-			).restore();
+			await driverFor(emptyTarget, bind(fresh)).restore();
 			expect.fail('restoring an unregistered namespace must be refused');
 		} catch (error) {
 			expect(error).to.be.instanceOf(RestoreRefusedError);
@@ -385,11 +473,179 @@ describe('Recovery phase 5: restore driver', () => {
 		emptyTarget.close();
 	});
 
+	it('finishes a partial acquisition with the SAME key instead of chasing epochs', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+		const beforeEpoch = (
+			(await served[0].client.getHead(ROOT.recoveryId)).state as GuardianState
+		).lease.epoch;
+
+		// G1 accepts the acquisition; G2 and G3 lose only the ACQUIRE
+		// exchange (reads still work, so the head read succeeds). Regenerating
+		// the writer key on retry would strand the epoch G1 accepted and chase
+		// the log upward one guardian at a time, never forming a quorum.
+		let blockAcquire = true;
+		const flaky = (index: number): IBoundGuardianClient => ({
+			expectedGuardianId: served[index].id,
+			client: new GuardianClient({
+				url: served[index].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					if (blockAcquire && url.endsWith('/acquire_epoch')) {
+						throw new GuardianTransportError('acquire lost in transit');
+					}
+					return nodeGuardianTransport()(url, init);
+				}
+			})
+		});
+		const guardians: IBoundGuardianClient[] = [
+			{ expectedGuardianId: served[0].id, client: served[0].client },
+			flaky(1),
+			flaky(2)
+		];
+
+		const target = openStorage();
+		try {
+			await driverFor(target, guardians).restore();
+			expect.fail('the takeover cannot complete against one guardian');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal('cas-exhausted');
+		}
+
+		// The attempt is remembered, key and all, and G1 is bound to it.
+		const pendingRaw = target.getRecoveryMeta!(
+			RESTORE_META_KEYS.pendingAcquisition
+		);
+		expect(
+			pendingRaw,
+			'the acquisition was persisted before it was sent'
+		).to.not.equal(null);
+		const pending = JSON.parse(pendingRaw as string) as {
+			newEpoch: string;
+			writerPublicKey: string;
+		};
+		expect(BigInt(pending.newEpoch)).to.equal(beforeEpoch + 1n);
+		const g1After = (
+			(await served[0].client.getHead(ROOT.recoveryId)).state as GuardianState
+		).lease;
+		expect(g1After.epoch).to.equal(beforeEpoch + 1n);
+		expect(g1After.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+
+		// A NEW driver resumes once the acquire path works again: the SAME
+		// epoch and key are retried, G1 answers OK_DUPLICATE, the quorum
+		// forms, and no extra epoch was consumed.
+		blockAcquire = false;
+		const resumeEvents: IRestoreEvent[] = [];
+		const result = await driverFor(target, guardians, resumeEvents).restore();
+		expect(resumeEvents.some((e) => e.type === 'epoch:resumed')).to.equal(true);
+		expect(result.lease.epoch).to.equal(beforeEpoch + 1n);
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition)
+		).to.equal(null);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('adopts a higher epoch only when a quorum certified it', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const shared = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		// ONE guardian accepts an acquisition nobody else saw. Its higher
+		// epoch is not proof that the epoch was acquired: it is exactly what a
+		// half-finished takeover leaves behind, so it must not be adopted.
+		const orphanWriter = generateWriterKey();
+		const orphan = await served[2].client.acquireEpoch({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			expectedState: shared,
+			newEpoch: shared.lease.epoch + 1n,
+			newWriterPublicKey: orphanWriter.publicKey,
+			...signAcquisition(
+				SET_ID,
+				shared,
+				shared.lease.epoch + 1n,
+				orphanWriter,
+				ROOT.rootSecret
+			)
+		});
+		expect(orphan.status).to.equal(GuardianStatus.OK);
+
+		const target = openStorage();
+		const result = await driverFor(target, bind(served)).restore();
+		// The restore built on the epoch the SET agreed on, not on the orphan.
+		expect(result.certifiedState.lease.epoch).to.equal(shared.lease.epoch);
+		expect(result.lease.epoch).to.equal(shared.lease.epoch + 1n);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('does not count a possibly-stale guardian toward the read set', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(3);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+
+		// G1 damages its store and confesses (possibly_stale); G3 is down.
+		// Two answers arrive, but only ONE proves recency, so the takeover
+		// must be refused rather than built on an uncertain head.
+		const stale = served[0].guardian.listOrphanedRecords(ROOT.recoveryId);
+		expect(stale.length).to.equal(0);
+		served[0].guardian.close();
+		const damaged = new ReferenceGuardian({
+			path: ':memory:',
+			guardianSecret: GUARDIAN_SECRETS[0],
+			members: GUARDIAN_IDS,
+			clock
+		});
+		// A fresh empty store for G1: it now knows nothing of the namespace.
+		served[0].guardian = damaged;
+		await served[2].server.close();
+		const target = openStorage();
+		try {
+			await driverFor(target, bind(served)).restore();
+			expect.fail('an unusable read set must refuse the restore');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+		}
+		damaged.close();
+		await served[1].server.close();
+		served[1].guardian.close();
+		try {
+			await served[0].server.close();
+		} catch {
+			// already closed
+		}
+		served[2].guardian.close();
+		live.storage.close();
+		target.close();
+	});
+
 	it('halts on a crash-fault-model breach instead of guessing', async () => {
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);
-		const rep = replicatorFor(live.storage, clients);
+		const rep = replicatorFor(live.storage, bind(served));
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 		const frames = live.storage.loadRecoveryFrames();
@@ -415,7 +671,7 @@ describe('Recovery phase 5: restore driver', () => {
 
 		const target = openStorage();
 		try {
-			await driverFor(target, clients).restore();
+			await driverFor(target, bind(served)).restore();
 			expect.fail('a divergent record at one position must halt the restore');
 		} catch (error) {
 			expect(error).to.be.instanceOf(RestoreRefusedError);

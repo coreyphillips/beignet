@@ -503,12 +503,134 @@ export function verifyGuardianCertificate(
 	}
 }
 
+// ─────────────── bound guardians ───────────────
+
+/**
+ * A client bound to the guardian identity it is supposed to be talking to.
+ *
+ * Quorum counting is only meaningful over DISTINCT guardians, and a URL is
+ * not an identity: two configured endpoints can point at the same guardian
+ * (a duplicated descriptor, a load balancer, a mistake), and unsigned
+ * negative answers like ERR_UNKNOWN_NODE carry no signature to dedupe by.
+ * Binding the expected id, and verifying it against INFO before any of it
+ * counts, is what makes "two guardians said so" mean two guardians.
+ */
+export interface IBoundGuardianClient {
+	client: GuardianClient;
+	/** 32-byte x-only key this endpoint must prove it holds. */
+	expectedGuardianId: Buffer;
+}
+
+export class GuardianBindingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'GuardianBindingError';
+	}
+}
+
+/**
+ * Configuration validity, checked without touching the network: identities
+ * must be distinct and must be members of the committed set. Both are
+ * always operator errors, so both throw.
+ */
+export function assertDistinctGuardianMembers(
+	bound: IBoundGuardianClient[],
+	context: IGuardianSetContext
+): void {
+	const seen = new Set<string>();
+	for (const entry of bound) {
+		const key = entry.expectedGuardianId.toString('hex');
+		if (seen.has(key)) {
+			throw new GuardianBindingError(
+				`guardian ${key} is configured more than once; distinct guardians are ` +
+					'what a quorum counts'
+			);
+		}
+		seen.add(key);
+		if (!context.members.some((m) => m.equals(entry.expectedGuardianId))) {
+			throw new GuardianBindingError(
+				`guardian ${key} is not a member of the committed set`
+			);
+		}
+	}
+}
+
+/**
+ * Prove each REACHABLE endpoint is the guardian it is bound to, using its
+ * own INFO. An endpoint that answers with a different identity, or that
+ * does not serve the configured set, is a configuration error and throws:
+ * counting it would let one guardian masquerade as two.
+ *
+ * Unreachability is NOT an error here, deliberately. Tolerating a down
+ * guardian is the whole point of a 2-of-3 set, and an endpoint that cannot
+ * answer INFO cannot answer anything else either, so it contributes
+ * nothing to any quorum regardless. The returned set names the identities
+ * that were positively verified, so unsigned negative answers can be
+ * counted only for guardians that proved who they are.
+ */
+export async function verifyGuardianBindings(
+	bound: IBoundGuardianClient[],
+	context: IGuardianSetContext
+): Promise<Set<string>> {
+	assertDistinctGuardianMembers(bound, context);
+	const verified = new Set<string>();
+	for (const entry of bound) {
+		const key = entry.expectedGuardianId.toString('hex');
+		let info;
+		try {
+			info = await entry.client.info();
+		} catch {
+			continue;
+		}
+		if (!info.guardianId.equals(entry.expectedGuardianId)) {
+			throw new GuardianBindingError(
+				`endpoint ${entry.client.url} announces ${info.guardianId.toString(
+					'hex'
+				)}, not the expected ${key}`
+			);
+		}
+		if (!info.guardianSetIds.some((id) => id.equals(context.guardianSetId))) {
+			throw new GuardianBindingError(
+				`guardian ${key} does not serve the configured guardian set`
+			);
+		}
+		verified.add(key);
+	}
+	return verified;
+}
+
 // ─────────────── quorum fan-out primitives ───────────────
 
 export interface IGuardianFanOutResult<T> {
 	client: GuardianClient;
 	result?: T;
 	error?: Error;
+	/** Present when the fan-out ran over bound clients. */
+	guardianId?: Buffer;
+}
+
+/** Fan out over bound clients, carrying each guardian's identity through. */
+export async function boundFanOut<T>(
+	bound: IBoundGuardianClient[],
+	operation: (client: GuardianClient) => Promise<T>
+): Promise<Array<IGuardianFanOutResult<T>>> {
+	return Promise.all(
+		bound.map(async (entry) => {
+			try {
+				return {
+					client: entry.client,
+					guardianId: entry.expectedGuardianId,
+					result: await operation(entry.client)
+				};
+			} catch (error) {
+				return {
+					client: entry.client,
+					guardianId: entry.expectedGuardianId,
+					error: error instanceof Error ? error : new Error(String(error))
+				};
+			}
+		})
+	);
 }
 
 /**

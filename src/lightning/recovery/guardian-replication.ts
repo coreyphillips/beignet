@@ -36,10 +36,11 @@ import {
 	IGuardianRegisterNodeRequest
 } from './guardian';
 import {
-	GuardianClient,
+	IBoundGuardianClient,
 	IGuardianSetContext,
+	boundFanOut,
 	countReceiptQuorum,
-	guardianFanOut,
+	verifyGuardianBindings,
 	verifyGuardianReceipt
 } from './guardian-client';
 import { JOURNAL_META_KEYS } from './journal';
@@ -86,7 +87,8 @@ export type NamespaceDecision =
 
 export interface IGuardianReplicationConfig {
 	storage: IStorageBackend;
-	clients: GuardianClient[];
+	/** Guardians bound to the identities they must prove they hold. */
+	guardians: IBoundGuardianClient[];
 	/** The committed set: id plus member keys, for verifying receipts. */
 	context: IGuardianSetContext;
 	/** Distinct receipts that make a record durable (2 in crash-v1). */
@@ -109,7 +111,8 @@ export interface IGuardianReplicationEvent {
 		| 'namespace:inconsistent'
 		| 'record:replicated'
 		| 'record:under-replicated'
-		| 'record:rejected';
+		| 'record:rejected'
+		| 'writer:fenced';
 	detail: string;
 	sequence?: bigint;
 	/** Distinct verified receipts a record collected. */
@@ -117,27 +120,55 @@ export interface IGuardianReplicationEvent {
 }
 
 export interface IReplicationResult {
+	/**
+	 * `fenced` is TERMINAL and is the async-mode hard-freeze signal from
+	 * spec 5.6: another device took the epoch while this one was running, so
+	 * this writer must stop before any further channel activity. Startup
+	 * confirmation protects a device that is starting; only this protects a
+	 * device that was already running when it was superseded.
+	 */
+	outcome: 'replicated' | 'under-replicated' | 'fenced';
 	/** Frames attempted in this pass. */
 	attempted: number;
 	/** Frames that reached `required` distinct verified receipts. */
 	durable: number;
 	/** Highest sequence that reached the quorum, contiguously from the start. */
 	replicatedThrough: bigint;
+	/** On `fenced`: the newer state, proven by a verified receipt. */
+	verifiedCurrentState?: GuardianState;
+	/** On `fenced`: the epoch this node believed it held. */
+	localEpoch?: bigint;
 }
 
 export class GuardianReplicator {
 	private readonly config: IGuardianReplicationConfig;
 	private readonly clock: () => bigint;
 
+	private verifiedBindings: Set<string> | null = null;
+
 	constructor(config: IGuardianReplicationConfig) {
-		if (config.clients.length === 0) {
-			throw new Error('guardian replication needs at least one client');
+		if (config.guardians.length === 0) {
+			throw new Error('guardian replication needs at least one guardian');
 		}
-		if (config.required < 1 || config.required > config.clients.length) {
-			throw new Error('required quorum is outside the configured client set');
+		if (config.required < 1 || config.required > config.guardians.length) {
+			throw new Error('required quorum is outside the configured guardian set');
 		}
 		this.config = config;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
+	}
+
+	/**
+	 * Prove every endpoint is the guardian it claims to be before any of its
+	 * answers count. Quorums are over DISTINCT guardians, and a URL is not
+	 * an identity.
+	 */
+	private async ensureBindings(): Promise<Set<string>> {
+		if (this.verifiedBindings) return this.verifiedBindings;
+		this.verifiedBindings = await verifyGuardianBindings(
+			this.config.guardians,
+			this.config.context
+		);
+		return this.verifiedBindings;
 	}
 
 	private emit(event: IGuardianReplicationEvent): void {
@@ -174,21 +205,37 @@ export class GuardianReplicator {
 			return { outcome: 'already-held', lease: held.lease };
 		}
 
+		const verified = await this.ensureBindings();
 		const recoveryId = this.config.recoveryRoot.recoveryId;
-		const heads = await guardianFanOut(this.config.clients, (client) =>
+		const heads = await boundFanOut(this.config.guardians, (client) =>
 			client.getHead(recoveryId)
 		);
-		const answered = heads.filter((entry) => entry.result !== undefined);
-		if (answered.length < this.config.required) {
+		// A possibly_stale guardian cannot prove its store intact (wire 5.3),
+		// so it never counts toward a decision about what exists.
+		const answered = heads.filter(
+			(entry) =>
+				entry.result !== undefined && entry.result.possiblyStale !== true
+		);
+		const distinct = new Set(
+			answered.map((entry) => (entry.guardianId as Buffer).toString('hex'))
+		);
+		if (distinct.size < this.config.required) {
 			this.emit({
 				type: 'namespace:no-quorum',
-				detail: `only ${answered.length} of ${this.config.clients.length} guardians answered`
+				detail: `only ${distinct.size} of ${this.config.guardians.length} distinct guardians answered usefully`
 			});
-			return { outcome: 'no-quorum', responded: answered.length };
+			return { outcome: 'no-quorum', responded: distinct.size };
 		}
 
-		const unknown = answered.filter(
-			(entry) => entry.result?.status === GuardianStatus.ERR_UNKNOWN_NODE
+		// Negative answers carry no signature, so they count by BOUND identity,
+		// and only for endpoints that PROVED that identity through INFO.
+		const unknown = new Set(
+			answered
+				.filter(
+					(entry) => entry.result?.status === GuardianStatus.ERR_UNKNOWN_NODE
+				)
+				.map((entry) => (entry.guardianId as Buffer).toString('hex'))
+				.filter((id) => verified.has(id))
 		);
 		const existing = answered.filter(
 			(entry) =>
@@ -212,7 +259,7 @@ export class GuardianReplicator {
 				states: existing.map((entry) => entry.result?.state as GuardianState)
 			};
 		}
-		if (unknown.length < this.config.required) {
+		if (unknown.size < this.config.required) {
 			const detail =
 				other.length > 0
 					? `guardians answered with status ${other
@@ -240,7 +287,7 @@ export class GuardianReplicator {
 				this.config.recoveryRoot.rootSecret
 			)
 		};
-		const registrations = await guardianFanOut(this.config.clients, (client) =>
+		const registrations = await boundFanOut(this.config.guardians, (client) =>
 			client.register(request)
 		);
 		const accepted = countReceiptQuorum(
@@ -334,9 +381,47 @@ export class GuardianReplicator {
 		for (const frame of frames) {
 			const sequence = BigInt(frame.sequence);
 			const record = this.signRecord(frame, lease);
-			const results = await guardianFanOut(this.config.clients, (client) =>
+			const results = await boundFanOut(this.config.guardians, (client) =>
 				client.putState(record)
 			);
+			// A definitive epoch rejection is TERMINAL, not noise: another
+			// device holds the lease, so this writer must stop before it does
+			// anything else (spec 5.6 async-mode hard freeze). The newer state
+			// is then proven through a signed GET_HEAD rather than taken from
+			// the rejection itself.
+			if (
+				results.some(
+					(entry) =>
+						entry.result?.status === GuardianStatus.ERR_EPOCH_SUPERSEDED
+				)
+			) {
+				const proof = await this.confirmOwnership(lease);
+				const newer = proof.states.find(
+					(state) => state.lease.epoch > lease.epoch
+				);
+				this.emit({
+					type: 'writer:fenced',
+					detail:
+						`epoch ${lease.epoch} was superseded` +
+						(newer ? ` by epoch ${newer.lease.epoch}` : '') +
+						'; replication stopped and the writer must freeze',
+					sequence
+				});
+				if (contiguousThrough > from) {
+					storage.setRecoveryMeta?.(
+						META_REPLICATED_THROUGH,
+						contiguousThrough.toString()
+					);
+				}
+				return {
+					outcome: 'fenced',
+					attempted: frames.indexOf(frame) + 1,
+					durable,
+					replicatedThrough: contiguousThrough,
+					verifiedCurrentState: newer,
+					localEpoch: lease.epoch
+				};
+			}
 			const rejected = results.filter(
 				(entry) =>
 					entry.result !== undefined &&
@@ -386,6 +471,10 @@ export class GuardianReplicator {
 			);
 		}
 		return {
+			outcome:
+				contiguous && durable === frames.length
+					? 'replicated'
+					: 'under-replicated',
 			attempted: frames.length,
 			durable,
 			replicatedThrough: contiguousThrough
@@ -404,7 +493,8 @@ export class GuardianReplicator {
 		superseded: boolean;
 		states: GuardianState[];
 	}> {
-		const heads = await guardianFanOut(this.config.clients, (client) =>
+		await this.ensureBindings();
+		const heads = await boundFanOut(this.config.guardians, (client) =>
 			client.getHead(this.config.recoveryRoot.recoveryId)
 		);
 		const states: GuardianState[] = [];
@@ -413,11 +503,15 @@ export class GuardianReplicator {
 		for (const entry of heads) {
 			const response = entry.result;
 			if (!response || response.status !== GuardianStatus.OK) continue;
+			// An uncertain store cannot confirm ownership (wire 5.3).
+			if (response.possiblyStale === true) continue;
 			const state = response.state;
 			const receipt = response.receipt;
 			if (!state || !receipt) continue;
 			// The receipt is what makes the state evidence rather than a claim.
 			if (!verifyGuardianReceipt(receipt, this.config.context)) continue;
+			// And it must be signed by the guardian this endpoint is bound to.
+			if (!receipt.guardianId.equals(entry.guardianId as Buffer)) continue;
 			states.push(state);
 			if (
 				state.lease.epoch === lease.epoch &&
