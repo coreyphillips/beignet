@@ -755,6 +755,41 @@ export class ReferenceGuardian {
 					}
 					return { kind: 'already' as const, ns };
 				}
+				// Corruption can strand records or epoch rows under an identity
+				// whose namespace row was lost or mis-keyed; a fresh
+				// registration must never fail on their leftovers with a
+				// primary-key conflict. Archive and clear them, and keep the
+				// namespace uncertain: history existed here, so writability
+				// needs quorum evidence (wire 5.10), and SYNC_RECORD replays
+				// the content the orphan archive preserves.
+				let strandedHistory = false;
+				if (!ns) {
+					const strayRecords =
+						this.store.archiveRecordsAbove(
+							state.recoveryId,
+							u64be(0n),
+							'rollback',
+							u64be(this.clock())
+						) +
+						this.store.archiveMalformedRecords(
+							state.recoveryId,
+							'rollback',
+							u64be(this.clock())
+						);
+					const strayEpochs = this.store.listEpochs(state.recoveryId);
+					if (strayEpochs.length > 0) {
+						this.store.deleteAllEpochs(state.recoveryId);
+					}
+					this.store.deleteMalformedEpochs(state.recoveryId);
+					strandedHistory = strayRecords > 0 || strayEpochs.length > 0;
+					if (strandedHistory) {
+						this.alarm(
+							state.recoveryId,
+							GuardianStatus.ERR_STORE_UNCERTAIN,
+							'registration found stranded history under this identity; archived, namespace uncertain'
+						);
+					}
+				}
 				// Fresh namespace, or a checkpointless tombstone re-anchoring on a
 				// root-signed registration (wire 5.10 step 1): the tombstone keeps
 				// possibly_stale, so writability still needs quorum evidence.
@@ -763,7 +798,7 @@ export class ReferenceGuardian {
 					recoveryId: Buffer.from(state.recoveryId),
 					guardianSetId: Buffer.from(this.guardianSetId),
 					state: stateBuf,
-					possiblyStale: ns ? ns.possiblyStale : false,
+					possiblyStale: ns ? ns.possiblyStale : strandedHistory,
 					registrationState: stateBuf,
 					registrationSignature: Buffer.from(request.rootSignature),
 					registrationReceiptIssuedAt: u64be(receipt.issuedAt),
@@ -1879,8 +1914,8 @@ export class ReferenceGuardian {
 				);
 				continue;
 			}
-			const recoveryId = ns.recoveryId;
-			const key = recoveryId.toString('hex');
+			let target = ns;
+			let key = ns.recoveryId.toString('hex');
 			try {
 				if (
 					!isLen(ns.guardianSetId, 32) ||
@@ -1893,13 +1928,31 @@ export class ReferenceGuardian {
 					// tombstoned by mistake.
 					this.quarantined.add(key);
 					this.alarm(
-						recoveryId,
+						ns.recoveryId,
 						GuardianStatus.ERR_STORE_UNCERTAIN,
 						'namespace is not registered under this guardian set; quarantined untouched'
 					);
 					continue;
 				}
-				this.store.write(() => this.verifyNamespaceAtOpen(ns));
+				// A WELL-shaped but WRONG identity: the root-signed
+				// registration authoritatively names the real namespace, and
+				// tombstoning under the corrupted key would strand the records
+				// and epochs still stored under the signed one.
+				const outcome = this.store.write(() => this.healNamespaceIdentity(ns));
+				if (outcome !== null && 'conflict' in outcome) {
+					this.quarantined.add(key);
+					this.alarm(
+						ns.recoveryId,
+						GuardianStatus.ERR_STORE_UNCERTAIN,
+						'namespace key does not match its root-signed registration and the signed identity is occupied; quarantined untouched'
+					);
+					continue;
+				}
+				if (outcome !== null) {
+					target = outcome.healed;
+					key = target.recoveryId.toString('hex');
+				}
+				this.store.write(() => this.verifyNamespaceAtOpen(target));
 			} catch (error) {
 				// The walk and rollback are non-throwing over persisted bytes;
 				// anything that still escapes (I/O failure, disk full) contains
@@ -1907,12 +1960,61 @@ export class ReferenceGuardian {
 				const message = error instanceof Error ? error.message : String(error);
 				this.quarantined.add(key);
 				this.alarm(
-					recoveryId,
+					target.recoveryId,
 					GuardianStatus.ERR_STORE_UNCERTAIN,
 					`namespace verification could not complete (${message}); quarantined`
 				);
 			}
 		}
+	}
+
+	/**
+	 * Repair a namespace whose primary key no longer matches the identity
+	 * inside its root-signed registration (identity-column bit corruption):
+	 * the registration is the AUTHORITATIVE name (wire 5.1), so when it
+	 * verifies under its own recovery_id and that identity is unoccupied,
+	 * the row is re-keyed back to it and the namespace goes uncertain until
+	 * quorum evidence says otherwise. Records and epochs carry their own
+	 * recovery_id and were never mis-keyed, so the ordinary verifier then
+	 * judges the reunited namespace. Returns null when no identity repair
+	 * applies; a conflict marker when the signed identity already has a row
+	 * of its own (nothing is touched in that case).
+	 */
+	private healNamespaceIdentity(
+		ns: IGuardianNamespaceRow
+	): { healed: IGuardianNamespaceRow } | { conflict: true } | null {
+		const regState = tryParseState(ns.registrationState);
+		if (regState === null) return null;
+		if (regState.recoveryId.equals(ns.recoveryId)) return null;
+		const authoritative =
+			ns.registrationSignature !== null &&
+			isLen(ns.registrationSignature, 64) &&
+			regState.lease.epoch >= 1n &&
+			regState.origin.firstSequence >= 1n &&
+			isGenesisLogHead(regState.logHead) &&
+			this.safeVerify(
+				registerTranscriptHash(this.guardianSetId, regState),
+				ns.registrationSignature,
+				regState.recoveryId
+			);
+		// Without a verifying registration there is no authority to re-key
+		// under; the ordinary no-checkpoint tombstone path judges the row.
+		if (!authoritative) return null;
+		if (this.store.getNamespace(regState.recoveryId) !== null) {
+			return { conflict: true };
+		}
+		this.store.rekeyNamespace(ns.recoveryId, regState.recoveryId);
+		this.store.setPossiblyStale(regState.recoveryId, true);
+		this.alarm(
+			regState.recoveryId,
+			GuardianStatus.ERR_STORE_UNCERTAIN,
+			'namespace identity restored from the root-signed registration; store uncertain'
+		);
+		const healed = this.store.getNamespace(regState.recoveryId);
+		if (healed === null) {
+			throw new Error('namespace identity repair failed to persist');
+		}
+		return { healed };
 	}
 
 	private verifyNamespaceAtOpen(ns: IGuardianNamespaceRow): void {

@@ -1868,6 +1868,133 @@ describe('Guardian core: structural corruption containment', () => {
 		).to.equal(1);
 		again.close();
 	});
+
+	it('a wrong 32-byte identity is re-keyed from the root-signed registration', () => {
+		const file = path.join(dir, 'rekeyed-identity.sqlite');
+		const guardian = makeGuardian(0, file);
+		const registration = buildRegistration();
+		guardian.register(registration);
+		const chain = buildChain(registration.initialState, 2);
+		for (const record of chain) guardian.putState({ record });
+		// A healthy second namespace proves isolation throughout.
+		const rootH = deriveRecoveryRoot(sha('core-node-secret-4'));
+		const stateH: GuardianState = {
+			recoveryId: rootH.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: WRITER_1.pub },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		const registrationH: IGuardianRegisterNodeRequest = {
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState: stateH,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, stateH),
+				rootH.rootSecret
+			)
+		};
+		expect(guardian.register(registrationH).status).to.equal(GuardianStatus.OK);
+		guardian.close();
+
+		// Identity-column bit corruption: the primary key becomes ANOTHER
+		// valid 32-byte value while records and epochs stay under the real
+		// one. Before the fix this tombstoned under the wrong key, stranded
+		// the history, and every later REGISTER_NODE for the real identity
+		// died on the surviving epoch row with ERR_INTERNAL.
+		const wrongId = sha('a-wrong-identity');
+		corrupt(
+			file,
+			'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?',
+			wrongId,
+			ROOT.recoveryId
+		);
+
+		const alarms: IGuardianAlarm[] = [];
+		const reopened = reopen(file, alarms);
+		expect(alarms.some((a) => a.detail.includes('identity restored'))).to.equal(
+			true
+		);
+		// The root-signed registration named the real namespace; the row is
+		// back under it, the chain verified, and the store is uncertain.
+		const head = reopened.getHead(headRequest());
+		expect(head.status).to.equal(GuardianStatus.OK);
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(2n);
+		// Nothing was tombstoned under the corrupted key.
+		expect(
+			reopened.getHead({
+				protocolVersion: 1,
+				guardianSetId: SET_ID,
+				recoveryId: wrongId
+			}).status
+		).to.equal(GuardianStatus.ERR_UNKNOWN_NODE);
+		// The advertised re-anchor path works: a byte-identical registration
+		// is a duplicate with a verifying receipt, never ERR_INTERNAL.
+		const replay = reopened.register(registration);
+		expect(replay.status).to.equal(GuardianStatus.OK_DUPLICATE);
+		expectValidReceipt(replay.receipt, 0, registration.initialState);
+		// The healthy namespace stayed readable and writable.
+		const headH = reopened.getHead({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			recoveryId: rootH.recoveryId
+		});
+		expect(headH.status).to.equal(GuardianStatus.OK);
+		expect(headH.possiblyStale).to.equal(false);
+		reopened.close();
+
+		// Idempotent: the healed key matches its registration, so the second
+		// open finds an ordinary (stale) namespace and repairs nothing.
+		const laterAlarms: IGuardianAlarm[] = [];
+		const again = reopen(file, laterAlarms);
+		expect(laterAlarms.length).to.equal(0);
+		expect(again.getHead(headRequest()).possiblyStale).to.equal(true);
+		again.close();
+	});
+
+	it('REGISTER_NODE never fails on rows stranded without a namespace row', () => {
+		const fixture = shapeFixture('stranded-history.sqlite');
+		// Lose ONLY the namespace row; records and the epoch row survive.
+		corrupt(
+			fixture.file,
+			'DELETE FROM guardian_namespaces WHERE recovery_id = ?',
+			ROOT.recoveryId
+		);
+		const alarms: IGuardianAlarm[] = [];
+		const guardian = reopen(fixture.file, alarms);
+		// The identity is simply unknown now; the strays are unreachable.
+		expect(guardian.getHead(headRequest()).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		// Re-registration must absorb the leftovers instead of dying on the
+		// epoch primary key, and the namespace comes back UNCERTAIN because
+		// history provably existed here.
+		const registered = guardian.register(fixture.registration);
+		expect(registered.status).to.equal(GuardianStatus.OK);
+		expect(alarms.some((a) => a.detail.includes('stranded history'))).to.equal(
+			true
+		);
+		const head = guardian.getHead(headRequest());
+		expect(head.possiblyStale).to.equal(true);
+		expect((head.state as GuardianState).logHead.sequence).to.equal(0n);
+		expect(guardian.listOrphanedRecords(ROOT.recoveryId).length).to.equal(4);
+		// SYNC replay rebuilds and quorum evidence lifts, as everywhere else.
+		for (const record of fixture.chain) {
+			expect(guardian.syncRecord({ record }).status).to.equal(
+				GuardianStatus.OK
+			);
+		}
+		expect(
+			guardian.submitRepairEvidence({
+				recoveryId: ROOT.recoveryId,
+				target: fixture.finalState,
+				receipts: fixture.evidence,
+				certificates: []
+			}).status
+		).to.equal(GuardianStatus.OK);
+		expect(guardian.getHead(headRequest()).possiblyStale).to.equal(false);
+		guardian.close();
+	});
 });
 
 describe('Guardian core: INFO', () => {

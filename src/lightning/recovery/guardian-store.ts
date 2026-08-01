@@ -518,6 +518,19 @@ export class GuardianStore {
 			.run(recoveryId).changes;
 	}
 
+	/**
+	 * Restore a namespace primary key that corruption re-pointed at the
+	 * wrong 32-byte value. The records and epochs tables carry their own
+	 * recovery_id and were never re-keyed, so only the namespace row moves.
+	 */
+	rekeyNamespace(fromRecoveryId: Buffer, toRecoveryId: Buffer): void {
+		this.db
+			.prepare(
+				'UPDATE guardian_namespaces SET recovery_id = ? WHERE recovery_id = ?'
+			)
+			.run(toRecoveryId, fromRecoveryId);
+	}
+
 	/** Replace a registration receipt whose stored artifact failed to verify. */
 	updateRegistrationReceipt(
 		recoveryId: Buffer,
