@@ -12,8 +12,8 @@ and architecture decisions this wire format implements. Revision 4 review
 refinements incorporated here: a registration operation under a dedicated
 recovery root (2.6, 4.1), the writer lease separated from the log head
 (4.2), a normative AEAD nonce construction (3.2), an exact SYNC_EPOCH
-validation algorithm (5.7), and the honest v1 scope of guardian-set
-rotation (5.9).
+validation algorithm (5.7), guardian-set replacement declared a literal v1
+non-feature (5.9), and uncertain-store rollback-and-replay repair (5.10).
 
 Style: no em-dashes anywhere, per the repo rule.
 
@@ -270,8 +270,16 @@ STATE   = recovery_id(32) || LEASE || LOGHEAD
   hashes, and the epoch THAT RECORD was written under. After a takeover,
   `recordEpoch < lease.epoch` until the new writer's first append.
 - Genesis LOGHEAD is `sequence = 0`, both hashes all zeros,
-  `recordEpoch = 0`. Sequence 0 never carries a record; the first record
-  of a namespace is sequence 1 with `previousHash` = 32 zero bytes.
+  `recordEpoch = 0`. Sequence 0 never carries a record.
+- The FIRST record appended to a genesis namespace fixes the chain
+  origin: any `sequence >= 1` and any `previousHash` are accepted for
+  it, and continuity is enforced from then on. This is what lets an
+  EXISTING node enable guardians mid-journal: the node-wide journal
+  sequence (spec 5.3) is already at some K, and the upload starts at the
+  retained base snapshot with the journal's real numbering rather than
+  renumbering from 1. The origin is writer-signed, so it is the writer's
+  own claim about its own chain; anti-rollback protection anchors at the
+  origin receipt exactly as it would at sequence 1.
 
 ### 4.2 Transcripts
 
@@ -281,8 +289,8 @@ REGISTER   tag 'beignet/recovery/register/v1'
   PREFIX || STATE                the initial state: lease.epoch >= 1, a
                                  fresh writer key, and a GENESIS LOGHEAD,
                                  always (registration never claims
-                                 records the guardian does not hold; see
-                                 5.9 for what replaces set migration)
+                                 records the guardian does not hold; set
+                                 replacement is a v1 non-feature, 5.9)
 
 RECORD     tag 'beignet/recovery/record/v1'
            signed by the writer key of lease.epoch
@@ -361,8 +369,10 @@ signature. Acceptance, atomically per the linearization rule:
 ```text
 epoch == lease.epoch
 writer signature verifies under lease.writerPublicKey
-sequence == logHead.sequence + 1
-previousHash == logHead.frameHash        (zeros for sequence 1)
+if logHead is genesis: any sequence >= 1 and any previousHash fix the
+                       chain origin (4.1)
+else:                  sequence == logHead.sequence + 1
+                       previousHash == logHead.frameHash
 ciphertextHash == SHA-256(ciphertext)
 ciphertext within advertised size limits
 ```
@@ -441,6 +451,13 @@ identical to 5.2 because records are self-authenticating. Used by restore
 devices to repair lagging guardians before a CAS (spec 5.7 worked
 example). Response: the guardian's cumulative RECEIPT after the append.
 
+SYNC_RECORD only ever APPENDS at the guardian's current state; it never
+inserts a historical record behind it and never crosses an epoch
+boundary the guardian has not reached. A guardian missing or corrupting
+HISTORY (a record from an epoch below its current lease) cannot be
+patched in place: that is the uncertain-store case, repaired by the
+rollback-and-replay procedure in 5.10.
+
 ### 5.7 SYNC_EPOCH
 
 Request: a set of TAKEOVER certificates for one takeover. Exact
@@ -482,42 +499,89 @@ certificate (issued now if it never issued one) and a fresh RECEIPT.
 fields, the guardian_set_ids served, size limits, and rate-limit hints.
 Discovery only; nothing in INFO is signed or load-bearing for safety.
 
-### 5.9 Guardian-set rotation: UNSUPPORTED in protocol v1
-
-There is no guardian-set migration in v1, full stop. The reasons are
-structural, not a missing feature: every signed object carries its
-guardian_set_id inside the signed transcript, so records and receipts of
-the old set can never validate under the new one; a registration that
-claimed a non-genesis head would make the guardian sign a receipt over a
-record it does not hold; and nothing cryptographically fences the old set
-against a still-live writer appending there after a partial migration.
-A dedicated ROTATE_SET object (old set id, new set id, quorum-certified
-final state, migration snapshot, chain anchor, old-set retirement
-semantics) is reserved for a future protocol version.
-
-What a deployment does in v1 instead, exactly:
+### 5.9 Guardian-set replacement: UNSUPPORTED in protocol v1, literally
 
 ```text
-1  the operator provisions the new set and computes its guardian_set_id
-2  REGISTER_NODE on each new guardian at GENESIS, authorized by the
-   recovery root (same recovery_id; the namespace key is the pair
-   (recovery_id, guardian_set_id))
-3  the writer's FIRST record under the new set (sequence 1) is a
-   complete migration snapshot of the current state, exactly like the
-   journal's own re-base snapshot
-4  capsules and descriptors are refreshed to advertise the new set;
-   quorum barriers move to the new set once its snapshot is durable
-5  the old set is decommissioned operationally
+Guardian-set replacement while journaled state is preserved is
+UNSUPPORTED in protocol v1.
+
+A node MUST NOT begin a journal for its recovery_id under a second
+guardian set while any journaled state exists under a first. Exactly ONE
+guardian set ever carries a given namespace's journal in v1.
+
+Loss or replacement of the configured set degrades recovery to the
+SCB/DLP path (Tier 1) until a channel-preserving ROTATE_SET exists in a
+future protocol version.
 ```
 
-No receipt, record, or certificate from the former set is portable, and
-none is needed: the new chain is self-sufficient from its snapshot. The
-honest residual, stated plainly: between step 3 completing and step 5, a
-stale device could still append to the old set, and a restore that only
-consults the old set restores to the migration point. The capsule always
-names the CURRENT set, so a restore that can read any capsule follows it
-to the new set; one that cannot is in Tier 1 territory anyway, and
-channel_reestablish plus DLP remain the safety net.
+The structural reasons, so nobody reintroduces a workaround: every
+signed object carries its guardian_set_id inside the signed transcript,
+so nothing from an old set can validate under a new one; writerEpoch and
+sequence order states WITHIN one set and cannot order two independent
+sets; peer_storage explicitly may return stale capsules, so after any
+two-set period the Phase 3 restore selection (highest writerEpoch, then
+sequence) can prefer a stale old-set capsule over a younger new-set one;
+and nothing cryptographically fences the old set, because a stale device
+holds the seed and therefore the recovery root, and could acquire
+further old-set epochs. Only a root-signed monotonic set-generation
+object ordered ABOVE (writerEpoch, sequence) can resolve that, and that
+object is ROTATE_SET (old and new set ids, generations, the
+quorum-certified final state, a migration snapshot anchor, retirement
+semantics), reserved for a future protocol version rather than shipped
+piecemeal.
+
+What v1 DOES support, for clarity against the prohibition above:
+
+- First-time enablement of guardians on an existing node is NOT a
+  replacement: no prior set carries the namespace, the upload starts at
+  the retained journal base with the journal's real sequence numbering
+  (the 4.1 origin rule), and Phase 3 capsule ordering stays monotonic
+  across enablement because the node-wide journal numbering never
+  resets.
+- Replacing an individual FAILED guardian machine behind the SAME
+  guardianId and set (restore its store, then repair through
+  SYNC_RECORD and SYNC_EPOCH per 5.10) is operational maintenance, not
+  set replacement.
+- Abandoning guardians entirely (operator decision) is Tier 1
+  degradation, stated in the box above.
+
+### 5.10 Uncertain-store repair: rollback, then replay
+
+The durability rules (spec 5.5) make a guardian that cannot prove its
+store intact refuse writes until repaired. Repair semantics, exactly,
+per namespace:
+
+```text
+1  the guardian identifies its LAST INTERNALLY CONSISTENT CHECKPOINT:
+   the longest prefix of its stored records, takeover certificates and
+   issued receipts that verifies completely (chain continuity, epoch
+   continuity through its stored certificates, signatures)
+2  it DISCARDS all per-namespace state after that checkpoint: records,
+   lease changes, and its own issued receipts beyond it (receipts
+   already handed out remain valid statements about what WAS stored;
+   discarding the local copies does not and cannot revoke them)
+3  it re-enters service in the checkpoint state, still refusing
+   ordinary writes, flagged possibly_stale on reads
+4  repair replays history in CHRONOLOGICAL order from the checkpoint:
+   SYNC_RECORD for records under the lease epoch current at each point,
+   SYNC_EPOCH for each takeover in sequence, then SYNC_RECORD again
+   under the new epoch, and so on to the present
+5  once the replayed state matches a quorum-certified current state
+   (a GET_HEAD receipt bundle from `required` peer guardians, or the
+   writer's own resubmission reaching the current head), the guardian
+   lifts possibly_stale and resumes accepting PUT_STATE and
+   ACQUIRE_EPOCH
+```
+
+This keeps the state machine strictly append-only: there is no
+insert-behind-head operation anywhere in the protocol, and the epoch
+acceptance rules of 5.2 and 5.7 hold unmodified at every step of the
+replay, because the guardian's lease at each replay step is the lease
+that was current at that point in history. A guardian at lease epoch 8
+missing an epoch-7 record is exactly this case: it rolls back to its
+last consistent state within epoch 7 (or earlier), replays the epoch-7
+records, replays the 7 to 8 takeover through SYNC_EPOCH, and replays
+forward.
 
 ## 6. Protobuf envelope
 
