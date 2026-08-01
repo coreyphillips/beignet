@@ -52,6 +52,12 @@ export interface IRecoveryManagerOptions {
 	 * Reconstructable transitions are never journaled.
 	 */
 	journal?: IRecoveryJournalSink;
+	/**
+	 * Called after a transition COMMITS with a journal frame (never for
+	 * Reconstructable or journal-less commits). Runs outside the transaction;
+	 * a throw is swallowed. The capsule refresh hangs off this (spec 5.4).
+	 */
+	onCommitted?: () => void;
 }
 
 /** Rows retained per channel before the oldest are pruned. */
@@ -95,6 +101,7 @@ export class RecoveryManager {
 		}
 
 		const outboxIds: Array<number | null> = [];
+		let journaled = false;
 		try {
 			this.storage.transaction(() => {
 				for (const mutation of mutations) {
@@ -121,6 +128,7 @@ export class RecoveryManager {
 						this.storage.setOutboxFrameSequence(ids, Number(sequence));
 					}
 					this.options.journal.appendFrame(mutations, outboundMessages);
+					journaled = true;
 				}
 			});
 		} catch (error) {
@@ -152,6 +160,17 @@ export class RecoveryManager {
 		for (const mutation of mutations) {
 			if (mutation.type === 'channel_closed') {
 				this.outboxCounts.delete(mutation.channelId);
+			}
+		}
+
+		// A frame was durably appended: let the owner refresh derived replicas
+		// (the peer_storage capsule, spec 5.4). Outside the transaction, after
+		// commit, and never allowed to fail the transition it observed.
+		if (journaled && this.options.onCommitted) {
+			try {
+				this.options.onCommitted();
+			} catch {
+				/* observer only */
 			}
 		}
 

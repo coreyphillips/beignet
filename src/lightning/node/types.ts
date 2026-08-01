@@ -207,7 +207,11 @@ export interface INodeConfig {
 	 * Default OFF: when enabled (and the storage backend supports frames),
 	 * every safety-critical transition also appends an encrypted, hash-chained
 	 * frame in the same transaction, with periodic full-state snapshots and
-	 * compaction. Purely additive; disabling it changes nothing else.
+	 * compaction. With `peerStorageEnabled` too, the node also distributes a
+	 * Recovery Capsule over peer_storage (5.4, Phase 3): SCB + journal
+	 * locator, with the full journal inline whenever it fits, refreshed on
+	 * journaled commits at most once per minute. Purely additive; disabling
+	 * it changes nothing else.
 	 */
 	recovery?: {
 		enabled?: boolean;

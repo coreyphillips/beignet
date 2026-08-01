@@ -197,7 +197,8 @@ import {
 	RecoveryMutation,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
-	journalSupported
+	journalSupported,
+	composeRecoveryCapsule
 } from '../recovery';
 import { IChannelPersistRequest } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
@@ -238,7 +239,7 @@ import {
 	createAcceptorState,
 	IChannelState
 } from '../channel/channel-state';
-import { IScbChannelEntry } from '../backup/scb';
+import { IScbChannelEntry, encodeScb } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
@@ -584,6 +585,13 @@ export class LightningNode extends EventEmitter {
 		string,
 		{ blob: Buffer; receivedAt: number }
 	> = new Map();
+	/** Recovery Capsule (spec 5.4): journal configured, capsule refresh armed. */
+	private recoveryCapsuleActive = false;
+	private recoveryJournal: RecoveryJournal | undefined;
+	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+	private capsuleLastRefreshAt = 0;
+	/** A journaled commit landed after the last compose (see connect path). */
+	private capsuleDirty = false;
 
 	constructor(config: INodeConfig) {
 		super();
@@ -616,9 +624,17 @@ export class LightningNode extends EventEmitter {
 						}
 				  )
 				: undefined;
+		// Phase 3 (docs/RECOVERY-PROTOCOL.md 5.4): with the journal on, every
+		// journaled commit schedules a (once-per-minute throttled) refresh of
+		// the peer_storage Recovery Capsule.
+		this.recoveryCapsuleActive = journal !== undefined;
+		this.recoveryJournal = journal;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
+					onCommitted: journal
+						? (): void => this.scheduleRecoveryCapsuleRefresh()
+						: undefined,
 					onError: (err: Error, context): void => {
 						// persistChannel reports its own failures with the channel id
 						// attached, which is strictly more useful; emitting here too
@@ -855,6 +871,11 @@ export class LightningNode extends EventEmitter {
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
+
+		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
+		// before the first journaled transition still receive a current blob
+		// via sendPeerStorageOnConnect.
+		this.scheduleRecoveryCapsuleRefresh();
 
 		this.startCleanupTimer();
 
@@ -2568,6 +2589,14 @@ export class LightningNode extends EventEmitter {
 					encodePeerStorageRetrievalMessage({ blob: held.blob })
 				);
 			}
+			// A journaled commit may have landed inside the refresh-throttle
+			// window. The throttle exists for PROVIDER rate limits, and a newly
+			// connecting provider has no history with us, so it gets a freshly
+			// composed capsule instead of the cached (up to a minute stale) blob.
+			if (this.capsuleDirty && this.peerAdvertisesPeerStorage(pubkey)) {
+				const fresh = this.composeRecoveryCapsuleBlob();
+				if (fresh) this.ourPeerStorageBlob = fresh;
+			}
 			// Client direction: our current blob, only to peers advertising the bit.
 			if (this.ourPeerStorageBlob && this.peerAdvertisesPeerStorage(pubkey)) {
 				this.peerManager.sendToPeer(
@@ -2631,6 +2660,131 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		return sent;
+	}
+
+	/**
+	 * Throttled Recovery Capsule refresh (docs/RECOVERY-PROTOCOL.md 5.4):
+	 * journaled commits (snapshots included) schedule it, but it runs at most
+	 * once per minute, respecting BOLT 1 provider rate limits. Trailing edge:
+	 * a burst of transitions inside the window still ends with exactly one
+	 * refresh, composed from whatever state is durable when it fires.
+	 */
+	private scheduleRecoveryCapsuleRefresh(): void {
+		if (!this.recoveryCapsuleActive || !this.peerStorageEnabled) return;
+		this.capsuleDirty = true;
+		const elapsed = Date.now() - this.capsuleLastRefreshAt;
+		if (elapsed >= LightningNode.PEER_STORAGE_MIN_INTERVAL_MS) {
+			this.refreshRecoveryCapsule();
+			return;
+		}
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			this.refreshRecoveryCapsule();
+		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS - elapsed);
+		if (typeof timer.unref === 'function') timer.unref();
+		this.capsuleRefreshTimer = timer;
+	}
+
+	/** Arm one deferred refresh on the throttle cadence (re-base retry). */
+	private scheduleCapsuleRetry(): void {
+		if (this.capsuleRefreshTimer) return;
+		const timer = setTimeout(() => {
+			this.capsuleRefreshTimer = null;
+			this.refreshRecoveryCapsule();
+		}, LightningNode.PEER_STORAGE_MIN_INTERVAL_MS);
+		if (typeof timer.unref === 'function') timer.unref();
+		this.capsuleRefreshTimer = timer;
+	}
+
+	/**
+	 * Compose the current Recovery Capsule (spec 5.4) and push it to every
+	 * connected peer that provides storage. The blob is also remembered and
+	 * re-pushed on each future connect (distributePeerStorage semantics), so
+	 * a capsule composed with no peers connected is not wasted. Returns the
+	 * number of peers pushed to now.
+	 *
+	 * Composition reads only durable state (the SCB data and the stored
+	 * journal), so a refresh racing live transitions is simply as fresh as
+	 * the last committed one. Failures are logged, never thrown: capsule
+	 * distribution is a replica, and must not take down the node.
+	 */
+	refreshRecoveryCapsule(): number {
+		const blob = this.composeRecoveryCapsuleBlob();
+		if (!blob) return 0;
+		this.capsuleLastRefreshAt = Date.now();
+		return this.distributePeerStorage(blob);
+	}
+
+	/**
+	 * Compose the current capsule blob, or null when inactive or failed.
+	 *
+	 * The journal re-bases FIRST (prepareForReplication): a journal left
+	 * stale by a recovery-disabled period must never be replicated, or the
+	 * capsule's SCB and its inline Tier 2 journal would describe different
+	 * points in time. A FAILED re-base prohibits inlining outright
+	 * (allowInline false): a failed snapshot write leaves the old chain
+	 * internally valid yet possibly stale, and staleness is exactly what
+	 * composition's chain verification cannot see. The SCB and the locator
+	 * head fields still go out; both failure modes are logged.
+	 */
+	private composeRecoveryCapsuleBlob(): Buffer | null {
+		if (
+			!this.recoveryCapsuleActive ||
+			!this.peerStorageEnabled ||
+			!this.storage
+		) {
+			return null;
+		}
+		let allowInline = true;
+		try {
+			this.recoveryJournal?.prepareForReplication();
+		} catch (err) {
+			allowInline = false;
+			this.emitStructuredLog('peer', 'recovery_capsule_rebase_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
+		try {
+			const data = this.buildStaticChannelBackupData();
+			const encryptedScb = encodeScb(
+				{
+					version: 1,
+					network: data.network,
+					createdAt: Date.now(),
+					channels: data.channels
+				},
+				this.nodePrivkey
+			);
+			const { blob, inlineError } = composeRecoveryCapsule({
+				storage: this.storage,
+				encryptedScb,
+				nodeSecret: this.nodePrivkey,
+				allowInline
+			});
+			if (inlineError) {
+				this.emitStructuredLog('peer', 'recovery_capsule_inline_dropped', {
+					error: inlineError
+				});
+			}
+			if (allowInline) {
+				this.capsuleDirty = false;
+			} else {
+				// A transient re-base failure heals when the next journaled
+				// append retries the snapshot, but a quiet node may not
+				// transition for a while. Retry on the throttle cadence so
+				// exact-backup coverage returns as soon as the failure
+				// clears, and stay dirty so a connecting provider retries
+				// the compose too.
+				this.scheduleCapsuleRetry();
+			}
+			return blob;
+		} catch (err) {
+			this.emitStructuredLog('peer', 'recovery_capsule_refresh_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+			return null;
+		}
 	}
 
 	/** Newest blob each peer has returned via peer_storage_retrieval. */
@@ -4496,6 +4650,10 @@ export class LightningNode extends EventEmitter {
 		}
 		this._reconnectTimers.clear();
 		// Clear deferred peer-storage flush timers
+		if (this.capsuleRefreshTimer) {
+			clearTimeout(this.capsuleRefreshTimer);
+			this.capsuleRefreshTimer = null;
+		}
 		for (const t of this.peerStorageFlushTimers.values()) {
 			clearTimeout(t);
 		}
