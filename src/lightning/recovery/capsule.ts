@@ -79,6 +79,14 @@ export interface GuardianDescriptor {
 		type: 'onion-http' | 'https' | 'local-http';
 		url: string;
 	}>;
+	/**
+	 * Transport credential for guardians whose transport requires one
+	 * (wire 2.4): non-local transports MANDATE authentication, so the
+	 * credential must survive catastrophic restoration or the records
+	 * behind it are unreachable exactly when they matter. Optional and
+	 * additive; Phase 3 capsules without it stay valid.
+	 */
+	auth?: GuardianAuth;
 }
 
 export interface RecoveryCapsule {

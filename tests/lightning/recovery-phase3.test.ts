@@ -38,7 +38,8 @@ import {
 	restoreFromRecoveryCapsule,
 	restoreBestRecoveryCapsule,
 	selectRecoveryCapsule,
-	deriveRecoveryMasterKey
+	deriveRecoveryMasterKey,
+	deriveRecoveryRoot
 } from '../../src/lightning/recovery';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodePeerStorageMessage } from '../../src/lightning/message/peer-storage';
@@ -240,7 +241,8 @@ function journaledStorage(
 	const journal = new RecoveryJournal(
 		storage,
 		deriveRecoveryMasterKey(NODE_SECRET),
-		getPublicKey(NODE_SECRET)
+		getPublicKey(NODE_SECRET),
+		deriveRecoveryRoot(NODE_SECRET).recoveryId
 	);
 	const manager = new RecoveryManager(storage, { journal });
 	for (let i = 0; i < transitions; i++) {
@@ -387,6 +389,44 @@ describe('Recovery phase 3: capsule crypto', () => {
 			decoded!.inlineRecoveryState!.equals(capsule.inlineRecoveryState!)
 		).to.equal(true);
 		expect(decoded!.encryptedScb).to.equal(capsule.encryptedScb);
+	});
+
+	it('carries optional guardian auth credentials through the encrypted capsule', () => {
+		// Wire 2.4: non-local transports REQUIRE authentication, so the
+		// credential must survive catastrophic restoration inside the
+		// seed-encrypted capsule. Optional and additive: descriptors without
+		// it (every Phase 3 capsule) stay valid.
+		const capsule = sampleCapsule();
+		capsule.guardians = [
+			{
+				guardianId: 'ab'.repeat(32),
+				transports: [{ type: 'https', url: 'https://guardian.example.com' }],
+				auth: { type: 'bearer', token: 'restore-me-with-the-seed' }
+			},
+			{
+				guardianId: 'cd'.repeat(32),
+				transports: [{ type: 'onion-http', url: 'http://guardianx.onion' }],
+				auth: {
+					type: 'tor-v3-client-auth',
+					privateKey: 'descriptor-x25519-private'
+				}
+			},
+			{
+				guardianId: 'ef'.repeat(32),
+				transports: [{ type: 'local-http', url: 'http://127.0.0.1:9911' }]
+			}
+		];
+		const decoded = decodeRecoveryCapsuleBlob(
+			encryptRecoveryCapsule(capsule, NODE_SECRET),
+			NODE_SECRET
+		);
+		expect(decoded).to.not.equal(null);
+		expect(decoded!.guardians).to.deep.equal(capsule.guardians);
+		expect(decoded!.guardians[0].auth).to.deep.equal({
+			type: 'bearer',
+			token: 'restore-me-with-the-seed'
+		});
+		expect(decoded!.guardians[2].auth).to.equal(undefined);
 	});
 
 	it('returns null for foreign, tampered and wrong-key blobs', () => {
