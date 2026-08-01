@@ -362,8 +362,10 @@ export interface GuardianState {
 export interface GuardianRecord {
   recoveryId: Buffer;
   epoch: bigint;             // must equal lease.epoch at acceptance
-  sequence: bigint;          // must equal logHead.sequence + 1
-  previousHash: Buffer;      // must equal logHead.frameHash
+  sequence: bigint;          // first record: origin.firstSequence;
+                             // later: logHead.sequence + 1
+  previousHash: Buffer;      // first record: origin.previousHash;
+                             // later: logHead.frameHash
   frameHash: Buffer;
   ciphertext: Buffer;        // opaque to the guardian
   writerSignature: Buffer;   // BIP340 over the RECORD transcript

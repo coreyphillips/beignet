@@ -339,7 +339,20 @@ Receipts sign the complete STATE and are cumulative: a receipt whose
 LOGHEAD carries sequence S certifies every stored record from
 ORIGIN.firstSequence through S inclusive, across every intervening writer
 epoch. Records below the origin do not exist for this namespace and no
-receipt ever speaks for them. `ciphertextHash` binds the exact bytes of the
+receipt ever speaks for them.
+
+What a receipt certifies, precisely: the guardian's canonical state AS OF
+ISSUANCE. A record covered only by a MINORITY of receipts (fewer than
+`required` distinct guardians) may later be removed from the canonical
+log by a valid threshold-certified takeover that fixes an earlier final
+head (5.7 truncation); such a receipt remains valid evidence that the
+guardian acknowledged and stored the record, but not that the record
+remains canonical. A record whose receipts reached the threshold can
+never be superseded this way, because a takeover CAS against an earlier
+state cannot assemble a quorum past it; that is the durability the
+barrier discipline (spec 5.3) counts. Guardians MAY retain discarded
+minority-tail records in an orphan archive for auditing, but MUST
+exclude them from GET_STATE and from every STATE they sign. `ciphertextHash` binds the exact bytes of the
 record at S, so retention is provable and attributable: a guardian cannot
 claim to hold what it never stored, and a writer can prove which bytes a
 receipt covered. `issuedAt` (unix milliseconds) is informational:
@@ -808,9 +821,12 @@ codec stays tractable, and signatures never depend on the envelope.
                             recovery_id; current state attached
 20  ERR_EPOCH_SUPERSEDED    write or acquire from a fenced epoch;
                             current state and certificates attached
-21  ERR_SEQUENCE_GAP        sequence != logHead.sequence + 1; current
-                            state attached
-22  ERR_PREV_HASH_MISMATCH  previousHash != logHead.frameHash
+21  ERR_SEQUENCE_GAP        sequence != logHead.sequence + 1 (or, for the
+                            first record of a genesis namespace,
+                            != ORIGIN.firstSequence); current state
+                            attached
+22  ERR_PREV_HASH_MISMATCH  previousHash != logHead.frameHash (or, for
+                            the first record, != ORIGIN.previousHash)
 23  ERR_BAD_SIGNATURE       writer, root, new-writer, or certificate
                             signature failed
 24  ERR_CAS_FAILED          expectedState != stored state; current state
