@@ -4,9 +4,12 @@
  * The lease is what makes fencing possible: an epoch, the FRESH RANDOM
  * writer key that epoch is bound to, and the guardian certificates that
  * granted it. These tests pin the properties the protocol leans on: keys
- * are never seed-derived, the private half never sits in plaintext in the
- * database, the persisted epoch and the journal's stamped epoch are the
- * same value, and an acquisition carries both signatures.
+ * are never seed-derived; the private half never sits in plaintext, and
+ * never reaches storage that cannot protect it; the lease is ONE atomic
+ * artifact, so no crash yields a new epoch beside an old key; confirmation
+ * is identity-bound and never inherited; and a damaged lease fails CLOSED
+ * rather than reading as "no lease", which would authorize a fresh
+ * registration over live state.
  */
 
 import { expect } from 'chai';
@@ -16,11 +19,14 @@ import os from 'os';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { IStorageBackend } from '../../src/lightning/storage/types';
 import { deriveStorageKey } from '../../src/lightning/storage/encryption';
 import {
 	CRASH_V1_PROFILE,
+	CorruptWriterLeaseError,
 	GuardianState,
 	IGuardianTakeoverCertificate,
+	IWriterLeaseKeys,
 	JOURNAL_META_KEYS,
 	LEASE_META_KEYS,
 	ReferenceGuardian,
@@ -59,6 +65,38 @@ function openStorage(): SqliteStorage {
 	return storage;
 }
 
+function leaseOf(
+	epoch: bigint,
+	writer = generateWriterKey(),
+	confirmedAt: bigint | null = null,
+	certificates: IGuardianTakeoverCertificate[] = []
+): IWriterLeaseKeys {
+	return {
+		epoch,
+		writerSecret: writer.secret,
+		writerPublicKey: writer.publicKey,
+		guardianCertificates: certificates,
+		confirmedAt
+	};
+}
+
+function presentLease(storage: IStorageBackend): IWriterLeaseKeys {
+	const loaded = loadWriterLease(storage);
+	expect(loaded.state).to.equal('present');
+	return (loaded as { state: 'present'; lease: IWriterLeaseKeys }).lease;
+}
+
+/** Rewrite the stored blob with one field mangled. */
+function mangleStoredLease(
+	storage: IStorageBackend,
+	mutate: (parsed: Record<string, unknown>) => void
+): void {
+	const raw = storage.getRecoveryMeta!(LEASE_META_KEYS.lease) as string;
+	const parsed = JSON.parse(raw) as Record<string, unknown>;
+	mutate(parsed);
+	storage.setRecoveryMeta!(LEASE_META_KEYS.lease, JSON.stringify(parsed));
+}
+
 describe('Recovery phase 5: writer lease', () => {
 	it('generates fresh random keys, never seed-derived', () => {
 		const a = generateWriterKey();
@@ -78,36 +116,218 @@ describe('Recovery phase 5: writer lease', () => {
 
 	it('round trips through storage and shares the journal epoch key', () => {
 		const storage = openStorage();
-		expect(loadWriterLease(storage)).to.equal(null);
+		expect(loadWriterLease(storage).state).to.equal('absent');
 
 		const writer = generateWriterKey();
-		saveWriterLease(storage, {
-			epoch: 7n,
-			writerSecret: writer.secret,
-			writerPublicKey: writer.publicKey,
-			guardianCertificates: [],
-			confirmedAt: null
-		});
-		const loaded = loadWriterLease(storage);
-		expect(loaded).to.not.equal(null);
-		expect(loaded!.epoch).to.equal(7n);
-		expect(loaded!.writerSecret.equals(writer.secret)).to.equal(true);
-		expect(loaded!.writerPublicKey.equals(writer.publicKey)).to.equal(true);
-		expect(loaded!.guardianCertificates).to.have.length(0);
-		expect(loaded!.confirmedAt).to.equal(null);
+		saveWriterLease(storage, leaseOf(7n, writer));
+		const loaded = presentLease(storage);
+		expect(loaded.epoch).to.equal(7n);
+		expect(loaded.writerSecret.equals(writer.secret)).to.equal(true);
+		expect(loaded.writerPublicKey.equals(writer.publicKey)).to.equal(true);
+		expect(loaded.guardianCertificates).to.have.length(0);
+		expect(loaded.confirmedAt).to.equal(null);
 		// The lease epoch IS the journal's writerEpoch: a frame can never be
 		// stamped with an epoch the lease does not claim.
 		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch)).to.equal(
 			'7'
 		);
 		expect(LEASE_META_KEYS.writerEpoch).to.equal(JOURNAL_META_KEYS.writerEpoch);
-
-		markLeaseConfirmed(storage, 1_800_000_000_123n);
-		expect(loadWriterLease(storage)!.confirmedAt).to.equal(1_800_000_000_123n);
-
-		const view = publicLease(loadWriterLease(storage)!);
-		expect(Object.keys(view)).to.not.include('writerSecret');
 		storage.close();
+	});
+
+	it('does not carry confirmation into a replacement lease', () => {
+		const storage = openStorage();
+		const first = generateWriterKey();
+		saveWriterLease(storage, leaseOf(7n, first, 123n));
+		expect(presentLease(storage).confirmedAt).to.equal(123n);
+
+		const second = generateWriterKey();
+		saveWriterLease(storage, leaseOf(8n, second));
+		const loaded = presentLease(storage);
+		expect(loaded.epoch).to.equal(8n);
+		// A new epoch has NOT been confirmed by anyone yet; inheriting the old
+		// timestamp would let the startup gate pass on stale evidence.
+		expect(loaded.confirmedAt).to.equal(null);
+		expect(loaded.writerPublicKey.equals(second.publicKey)).to.equal(true);
+		storage.close();
+	});
+
+	it('binds confirmation to the exact epoch and writer key', () => {
+		const storage = openStorage();
+		const writer = generateWriterKey();
+		saveWriterLease(storage, leaseOf(4n, writer));
+
+		// A late callback for a superseded epoch must not bless this lease.
+		expect(() =>
+			markLeaseConfirmed(
+				storage,
+				{ epoch: 3n, writerPublicKey: writer.publicKey },
+				999n
+			)
+		).to.throw(/refusing to confirm/);
+		// Nor one naming a different writer key at the right epoch.
+		expect(() =>
+			markLeaseConfirmed(
+				storage,
+				{ epoch: 4n, writerPublicKey: generateWriterKey().publicKey },
+				999n
+			)
+		).to.throw(/refusing to confirm/);
+		expect(presentLease(storage).confirmedAt).to.equal(null);
+
+		markLeaseConfirmed(
+			storage,
+			{ epoch: 4n, writerPublicKey: writer.publicKey },
+			1_800_000_000_123n
+		);
+		expect(presentLease(storage).confirmedAt).to.equal(1_800_000_000_123n);
+		storage.close();
+	});
+
+	it('replaces the lease atomically under a failing transaction', () => {
+		const storage = openStorage();
+		const first = generateWriterKey();
+		saveWriterLease(storage, leaseOf(5n, first, 500n));
+
+		// Fail the second write of the replacement: the whole transaction must
+		// roll back, leaving the COMPLETE old lease, never a new epoch beside
+		// an old key.
+		const second = generateWriterKey();
+		let writes = 0;
+		const failing = new Proxy(storage, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'setRecoveryMeta') {
+					return (key: string, value: string): void => {
+						writes += 1;
+						if (writes === 2) throw new Error('disk full');
+						target.setRecoveryMeta!(key, value);
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as IStorageBackend;
+		expect(() => saveWriterLease(failing, leaseOf(6n, second))).to.throw(
+			/disk full/
+		);
+
+		const loaded = presentLease(storage);
+		expect(loaded.epoch).to.equal(5n);
+		expect(loaded.writerSecret.equals(first.secret)).to.equal(true);
+		expect(loaded.confirmedAt).to.equal(500n);
+		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch)).to.equal(
+			'5'
+		);
+		storage.close();
+	});
+
+	it('fails closed on partial, malformed, or inconsistent state', () => {
+		const storage = openStorage();
+		const writer = generateWriterKey();
+		saveWriterLease(storage, leaseOf(9n, writer));
+
+		// A journal epoch beyond the default with NO lease is lost key
+		// material, not a fresh install; reading it as absent would authorize
+		// a re-registration over live state.
+		const orphaned = openStorage();
+		orphaned.setRecoveryMeta!(JOURNAL_META_KEYS.writerEpoch, '4');
+		expect(() => loadWriterLease(orphaned)).to.throw(CorruptWriterLeaseError);
+		orphaned.close();
+
+		// Malformed JSON.
+		storage.setRecoveryMeta!(LEASE_META_KEYS.lease, '{not json');
+		expect(() => loadWriterLease(storage)).to.throw(/not valid JSON/);
+
+		// Bad hex width.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.writerPublicKey = 'ab'.repeat(31);
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/32 hex bytes/);
+
+		// Secret and public half that do not belong together.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.writerPublicKey = generateWriterKey().publicKey.toString('hex');
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/does not belong/);
+
+		// A secret that is not a valid scalar at all.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.writerSecret = '00'.repeat(32);
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/valid secp256k1/);
+
+		// Certificates that speak about a different lease.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.epoch = '10';
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/disagrees with lease/);
+
+		// Unknown blob version.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.version = 2;
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/unsupported stored lease/);
+
+		// Certificates that are not even an array.
+		saveWriterLease(storage, leaseOf(9n, writer));
+		mangleStoredLease(storage, (p) => {
+			p.guardianCertificates = 'nope';
+		});
+		expect(() => loadWriterLease(storage)).to.throw(/not an array/);
+		storage.close();
+	});
+
+	it('refuses to persist a lease whose parts disagree', () => {
+		const storage = openStorage();
+		const writer = generateWriterKey();
+		const other = generateWriterKey();
+		expect(() =>
+			saveWriterLease(storage, {
+				epoch: 1n,
+				writerSecret: writer.secret,
+				writerPublicKey: other.publicKey,
+				guardianCertificates: [],
+				confirmedAt: null
+			})
+		).to.throw(/does not belong/);
+		expect(() => saveWriterLease(storage, leaseOf(0n, writer))).to.throw(
+			/epoch is outside/
+		);
+		expect(loadWriterLease(storage).state).to.equal('absent');
+		storage.close();
+	});
+
+	it('refuses storage that cannot protect the signing key at rest', () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-p5-plain-'));
+		try {
+			const dbPath = path.join(dir, 'plain.sqlite');
+			const storage = new SqliteStorage(dbPath);
+			storage.open();
+			expect(storage.secretsEncryptedAtRest()).to.equal(false);
+			const writer = generateWriterKey();
+			expect(() => saveWriterLease(storage, leaseOf(1n, writer))).to.throw(
+				/encryption at rest/
+			);
+			expect(loadWriterLease(storage).state).to.equal('absent');
+			// The operator can accept the risk explicitly, and only explicitly.
+			saveWriterLease(storage, leaseOf(1n, writer), {
+				allowUnencryptedSecrets: true
+			});
+			expect(presentLease(storage).epoch).to.equal(1n);
+			storage.close();
+
+			// An in-memory database has no file to steal, so it qualifies.
+			const memory = openStorage();
+			expect(memory.secretsEncryptedAtRest()).to.equal(true);
+			memory.close();
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it('preserves guardian certificates across a round trip', () => {
@@ -151,14 +371,11 @@ describe('Recovery phase 5: writer lease', () => {
 		const certificate = acquired.certificate as IGuardianTakeoverCertificate;
 		expect(certificate).to.not.equal(undefined);
 
-		saveWriterLease(storage, {
-			epoch: 2n,
-			writerSecret: newWriter.secret,
-			writerPublicKey: newWriter.publicKey,
-			guardianCertificates: [certificate],
-			confirmedAt: 1_800_000_000_000n
-		});
-		const restored = loadWriterLease(storage)!;
+		saveWriterLease(
+			storage,
+			leaseOf(2n, newWriter, 1_800_000_000_000n, [certificate])
+		);
+		const restored = presentLease(storage);
 		expect(restored.guardianCertificates).to.have.length(1);
 		const round = restored.guardianCertificates[0];
 		expect(round.guardianId.equals(certificate.guardianId)).to.equal(true);
@@ -167,6 +384,66 @@ describe('Recovery phase 5: writer lease', () => {
 		expect(round.signature.equals(certificate.signature)).to.equal(true);
 		expect(
 			statesEqual(round.supersededState, certificate.supersededState)
+		).to.equal(true);
+
+		// A certificate that grants a DIFFERENT epoch than the lease claims is
+		// not evidence for this lease.
+		expect(() =>
+			saveWriterLease(storage, leaseOf(3n, newWriter, null, [certificate]))
+		).to.throw(/different epoch/);
+		storage.close();
+		guardian.close();
+	});
+
+	it('publicLease hands out a deep copy, not a handle on the lease', () => {
+		const storage = openStorage();
+		const guardian = new ReferenceGuardian({
+			path: ':memory:',
+			guardianSecret: GUARDIAN_SECRETS[1],
+			members: GUARDIAN_IDS
+		});
+		const initialState: GuardianState = {
+			recoveryId: ROOT.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: generateWriterKey().publicKey },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		guardian.register({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			initialState,
+			rootSignature: signTranscript(
+				registerTranscriptHash(SET_ID, initialState),
+				ROOT.rootSecret
+			)
+		});
+		const newWriter = generateWriterKey();
+		const acquired = guardian.acquireEpoch({
+			protocolVersion: 1,
+			guardianSetId: SET_ID,
+			expectedState: initialState,
+			newEpoch: 2n,
+			newWriterPublicKey: newWriter.publicKey,
+			...signAcquisition(SET_ID, initialState, 2n, newWriter, ROOT.rootSecret)
+		});
+		const certificate = acquired.certificate as IGuardianTakeoverCertificate;
+		const lease = leaseOf(2n, newWriter, null, [certificate]);
+		saveWriterLease(storage, lease);
+
+		const view = publicLease(lease);
+		expect(Object.keys(view)).to.not.include('writerSecret');
+		view.writerPublicKey.fill(0);
+		view.guardianCertificates[0].signature.fill(0);
+		view.guardianCertificates[0].supersededState.logHead.frameHash.fill(0);
+		// Mutating the view must not touch the lease it came from.
+		expect(lease.writerPublicKey.equals(newWriter.publicKey)).to.equal(true);
+		expect(
+			lease.guardianCertificates[0].signature.equals(certificate.signature)
+		).to.equal(true);
+		expect(
+			lease.guardianCertificates[0].supersededState.logHead.frameHash.equals(
+				certificate.supersededState.logHead.frameHash
+			)
 		).to.equal(true);
 		storage.close();
 		guardian.close();
@@ -202,6 +479,16 @@ describe('Recovery phase 5: writer lease', () => {
 		expect(
 			verifyTranscript(hash, newWriterSignature, ROOT.recoveryId)
 		).to.equal(false);
+		// A mismatched pair fails locally instead of at the guardian.
+		expect(() =>
+			signAcquisition(
+				SET_ID,
+				state,
+				5n,
+				{ secret: newWriter.secret, publicKey: generateWriterKey().publicKey },
+				ROOT.rootSecret
+			)
+		).to.throw(/does not belong/);
 	});
 
 	it('never writes the writer secret in plaintext when storage is encrypted', () => {
@@ -214,16 +501,10 @@ describe('Recovery phase 5: writer lease', () => {
 			});
 			storage.open();
 			const writer = generateWriterKey();
-			saveWriterLease(storage, {
-				epoch: 3n,
-				writerSecret: writer.secret,
-				writerPublicKey: writer.publicKey,
-				guardianCertificates: [],
-				confirmedAt: null
-			});
-			expect(
-				loadWriterLease(storage)!.writerSecret.equals(writer.secret)
-			).to.equal(true);
+			saveWriterLease(storage, leaseOf(3n, writer));
+			expect(presentLease(storage).writerSecret.equals(writer.secret)).to.equal(
+				true
+			);
 			storage.close();
 
 			// Read the raw file: the signing secret must not appear anywhere.
@@ -232,8 +513,8 @@ describe('Recovery phase 5: writer lease', () => {
 				.prepare('SELECT key, value FROM recovery_meta')
 				.all() as Array<{ key: string; value: string }>;
 			raw.close();
-			const stored = rows.find((r) => r.key === LEASE_META_KEYS.writerSecret);
-			expect(stored, 'writer secret row present').to.not.equal(undefined);
+			const stored = rows.find((r) => r.key === LEASE_META_KEYS.lease);
+			expect(stored, 'lease row present').to.not.equal(undefined);
 			expect(stored!.value.startsWith('enc1:')).to.equal(true);
 			expect(stored!.value).to.not.contain(writer.secret.toString('hex'));
 			const fileBytes = fs.readFileSync(dbPath);

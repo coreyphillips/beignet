@@ -44,6 +44,7 @@ import {
 
 export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
+	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
 	private encryptionKey?: Buffer;
 
@@ -64,8 +65,20 @@ export class SqliteStorage implements IStorageBackend {
 		opts?: { encryptionKey?: Buffer }
 	) {
 		this.db = new Database(dbPath);
+		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
+	}
+
+	/**
+	 * True when a secret written here cannot be read out of the stored
+	 * artifact: either an encryption key is configured, or the database is
+	 * purely in memory and has no file to steal. Consulted by the writer
+	 * lease (recovery 5.6), which refuses to persist its signing key into a
+	 * file-backed database with no key configured.
+	 */
+	secretsEncryptedAtRest(): boolean {
+		return this.encryptionKey !== undefined || this.dbPath === ':memory:';
 	}
 
 	private reportCorruptRow(error: unknown): void {
