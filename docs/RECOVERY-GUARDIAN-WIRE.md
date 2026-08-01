@@ -48,11 +48,17 @@ The guardian namespace is NOT the public Lightning node id. Each node
 derives a dedicated recovery root from its identity secret:
 
 ```text
-recovery_root_secret = HKDF-SHA256(nodeSecret, info = 'beignet-recovery-root-v1')
-recovery_id          = xonly(pubkey(recovery_root_secret))     32 bytes
+okm                  = HKDF-SHA256(ikm = nodeSecret, salt = empty,
+                                   info = 'beignet-recovery-root-v1', L = 32)
+recovery_root_secret = (int_be(okm) mod (n - 1)) + 1        n = secp256k1 order
+recovery_id          = xonly(pubkey(recovery_root_secret))  32 bytes
 ```
 
-The info string is verified non-colliding with 3.6, 5.3 and 5.4. The
+The scalar reduction is exact: interpret the 32 output bytes as a
+big-endian integer, reduce modulo n - 1, add 1. The result is always a
+valid nonzero scalar, deterministically, with no retry loop and no
+implementation-defined behavior on the negligible out-of-range case. The
+info string is verified non-colliding with 3.6, 5.3 and 5.4. The
 recovery root authorizes exactly two things: initial registration and epoch
 acquisition (takeover). It never signs records and never acts as a writer
 key. Consequences, both load-bearing:
@@ -109,13 +115,35 @@ deployment, where the orchestrator guarantees isolation). A general LAN
 address does NOT qualify; anything beyond loopback or an isolated
 container network MUST use one of the authenticated transports above.
 
-### 2.4 Endpoint descriptors
+### 2.4 Endpoint descriptors and recoverable credentials
 
 Guardians are addressed by descriptor (the capsule's GuardianDescriptor,
 spec 5.4). Selection rule: Tor enabled means the first onion-http
 endpoint; otherwise the first https endpoint; local-http only when
 explicitly configured. A descriptor with no usable transport is an error
 surfaced to the operator, never a silent skip.
+
+Because non-local transports REQUIRE authentication (section 9), the
+credential must survive catastrophic restoration or the records behind it
+are unreachable exactly when they matter. The descriptor therefore
+carries an optional auth member, and a wallet MUST include it in the
+capsule for every guardian whose transport needs one:
+
+```ts
+auth?:
+  | { type: 'bearer';   token: string }
+  | { type: 'macaroon'; macaroon: string }         // base64
+  | { type: 'tor-v3-client-auth'; privateKey: string }  // base32/64 x25519
+```
+
+This is safe precisely because the whole capsule is encrypted under the
+seed-derived capsule key (spec 5.4): storage peers never see credentials,
+and a seed restore recovers them together with the endpoints. The field
+is optional and additive, so Phase 3 capsules without it stay valid. A
+derived-credential scheme (per-guardian secrets from the recovery root,
+registered as commitments at provisioning) is deliberately deferred: it
+needs its own bootstrap and challenge protocol, and encrypted capsule
+credentials already close the restore gap in v1.
 
 ### 2.5 HTTP mapping
 
@@ -163,13 +191,26 @@ The 96-bit IV is DETERMINISTIC from revision 4 on:
 ```text
 iv = first_12_bytes(
     TaggedHash('beignet/recovery/aes-gcm-iv/v1',
-        nodeId(33)            the journal's AAD node identifier (5.3)
+        recovery_id(32)
         || writerEpoch(8)
         || sequence(8)
         || frameHash(32)))
 ```
 
-Uniqueness argument: the frame key is per (nodeId, writerEpoch), so a
+The derivation input is recovery_id, NEVER the Lightning node id: epoch,
+sequence, frameHash and the IV itself are all visible in a stored record,
+so an IV derived from the node id would let anyone test a candidate
+Lightning identity against a record and break the unlinkability property
+of 1.1. recovery_id is already known to the guardian as the namespace, so
+deriving from it reveals nothing new to anyone. (A keyed derivation from
+the frame key would hide even cross-record structure, but the unkeyed
+recovery_id form already delivers the stated privacy property and keeps
+the IV computable without touching key material.) The journal receives
+recovery_id at construction when the Phase 4 implementation lands; its
+frame keys and AAD (5.3) are unaffected, and neither is testable without
+the secret master key.
+
+Uniqueness argument: the frame key is per (node, writerEpoch), so a
 (key, IV) collision requires equal epoch, equal sequence AND equal
 frameHash, which means the identical plaintext, and re-encrypting the
 identical plaintext under the same key and IV yields the identical
@@ -238,9 +279,10 @@ STATE   = recovery_id(32) || LEASE || LOGHEAD
 REGISTER   tag 'beignet/recovery/register/v1'
            signed by the recovery root
   PREFIX || STATE                the initial state: lease.epoch >= 1, a
-                                 fresh writer key, and a LOGHEAD that is
-                                 genesis for new nodes (MAY be non-zero
-                                 for set migration, 5.9)
+                                 fresh writer key, and a GENESIS LOGHEAD,
+                                 always (registration never claims
+                                 records the guardian does not hold; see
+                                 5.9 for what replaces set migration)
 
 RECORD     tag 'beignet/recovery/record/v1'
            signed by the writer key of lease.epoch
@@ -301,7 +343,8 @@ Request: the REGISTER transcript fields plus the recovery root public key
 recovery_id not yet registered for this guardian_set_id
 root signature verifies over the REGISTER transcript under recovery_id
 initial lease.epoch >= 1, writer key well-formed
-LOGHEAD is genesis, OR the registration is a set migration (5.9)
+LOGHEAD is genesis, always: a guardian never signs a receipt over a
+head whose record it does not hold
 ```
 
 Response: a RECEIPT over the initial STATE. Idempotency: re-registering
@@ -439,31 +482,42 @@ certificate (issued now if it never issued one) and a fresh RECEIPT.
 fields, the guardian_set_ids served, size limits, and rate-limit hints.
 Discovery only; nothing in INFO is signed or load-bearing for safety.
 
-### 5.9 Guardian-set rotation, v1 scope
+### 5.9 Guardian-set rotation: UNSUPPORTED in protocol v1
 
-There is NO in-protocol handoff object between guardian sets in v1;
-`ROTATE_SET` is reserved for a future version. What v1 supports, exactly:
+There is no guardian-set migration in v1, full stop. The reasons are
+structural, not a missing feature: every signed object carries its
+guardian_set_id inside the signed transcript, so records and receipts of
+the old set can never validate under the new one; a registration that
+claimed a non-genesis head would make the guardian sign a receipt over a
+record it does not hold; and nothing cryptographically fences the old set
+against a still-live writer appending there after a partial migration.
+A dedicated ROTATE_SET object (old set id, new set id, quorum-certified
+final state, migration snapshot, chain anchor, old-set retirement
+semantics) is reserved for a future protocol version.
+
+What a deployment does in v1 instead, exactly:
 
 ```text
 1  the operator provisions the new set and computes its guardian_set_id
-2  REGISTER_NODE on each new guardian, authorized by the recovery root,
-   whose initial STATE carries the node's CURRENT lease and log head
-   (this is the set-migration case of 5.1: a non-genesis registration)
-3  the record history the new set needs is backfilled with SYNC_RECORD
-   (records are self-authenticating; the old set or the writer supplies
-   them)
-4  the writer resumes appends against the new set; capsules and
-   descriptors are refreshed to advertise it
+2  REGISTER_NODE on each new guardian at GENESIS, authorized by the
+   recovery root (same recovery_id; the namespace key is the pair
+   (recovery_id, guardian_set_id))
+3  the writer's FIRST record under the new set (sequence 1) is a
+   complete migration snapshot of the current state, exactly like the
+   journal's own re-base snapshot
+4  capsules and descriptors are refreshed to advertise the new set;
+   quorum barriers move to the new set once its snapshot is durable
 5  the old set is decommissioned operationally
 ```
 
-Signed objects never mix sets: everything under the new set is signed
-with the new guardian_set_id in PREFIX from registration on. Certificates
-and receipts of the old set stay valid history for that set and are not
-portable. During a migration window the writer MAY hold quorum barriers
-against BOTH sets; restore-time candidates from a decommissioned set lose
-on (writerEpoch, sequence) once the new set advances, and a restore that
-only finds the old set still restores correctly to the migration point.
+No receipt, record, or certificate from the former set is portable, and
+none is needed: the new chain is self-sufficient from its snapshot. The
+honest residual, stated plainly: between step 3 completing and step 5, a
+stale device could still append to the old set, and a restore that only
+consults the old set restores to the migration point. The capsule always
+names the CURRENT set, so a restore that can read any capsule follows it
+to the new set; one that cannot is in Tier 1 territory anyway, and
+channel_reestablish plus DLP remain the safety net.
 
 ## 6. Protobuf envelope
 
