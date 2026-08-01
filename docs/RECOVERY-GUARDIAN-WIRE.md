@@ -260,26 +260,33 @@ single "head" carries this pair:
 ```text
 LEASE   = epoch(8) || writerPublicKey(32)
 
+ORIGIN  = firstSequence(8) || previousHash(32)
+
 LOGHEAD = sequence(8) || frameHash(32) || ciphertextHash(32) || recordEpoch(8)
 
-STATE   = recovery_id(32) || LEASE || LOGHEAD
+STATE   = recovery_id(32) || LEASE || ORIGIN || LOGHEAD
 ```
 
 - LEASE is who may write now.
+- ORIGIN is the IMMUTABLE, root-committed chain origin, fixed at
+  registration and never changing for the life of the namespace. For a
+  fresh node it is `firstSequence = 1, previousHash = 32 zero bytes`.
+  For an EXISTING node enabling guardians mid-journal, it is the
+  retained base snapshot's real position: `firstSequence = K,
+  previousHash = the journal hash preceding K`. This is what lets the
+  node-wide journal numbering (spec 5.3) carry over without renumbering,
+  while making the origin independently authenticated: it is inside the
+  root-signed REGISTER transcript, not inferred from whichever record
+  happens to survive in a database. A guardian whose earliest stored
+  record does not sit on a verified chain from ORIGIN knows it has lost
+  history (5.10); a bare surviving record can never masquerade as an
+  origin.
 - LOGHEAD is the tip of the record log: the last stored record's sequence,
   hashes, and the epoch THAT RECORD was written under. After a takeover,
   `recordEpoch < lease.epoch` until the new writer's first append.
 - Genesis LOGHEAD is `sequence = 0`, both hashes all zeros,
-  `recordEpoch = 0`. Sequence 0 never carries a record.
-- The FIRST record appended to a genesis namespace fixes the chain
-  origin: any `sequence >= 1` and any `previousHash` are accepted for
-  it, and continuity is enforced from then on. This is what lets an
-  EXISTING node enable guardians mid-journal: the node-wide journal
-  sequence (spec 5.3) is already at some K, and the upload starts at the
-  retained base snapshot with the journal's real numbering rather than
-  renumbering from 1. The origin is writer-signed, so it is the writer's
-  own claim about its own chain; anti-rollback protection anchors at the
-  origin receipt exactly as it would at sequence 1.
+  `recordEpoch = 0`, meaning "no records stored yet"; the ORIGIN says
+  where the first one must land. Sequence 0 never carries a record.
 
 ### 4.2 Transcripts
 
@@ -287,10 +294,13 @@ STATE   = recovery_id(32) || LEASE || LOGHEAD
 REGISTER   tag 'beignet/recovery/register/v1'
            signed by the recovery root
   PREFIX || STATE                the initial state: lease.epoch >= 1, a
-                                 fresh writer key, and a GENESIS LOGHEAD,
-                                 always (registration never claims
-                                 records the guardian does not hold; set
-                                 replacement is a v1 non-feature, 5.9)
+                                 fresh writer key, the IMMUTABLE ORIGIN
+                                 (fresh node: 1 and zeros; existing node:
+                                 the retained base position), and a
+                                 GENESIS LOGHEAD, always (registration
+                                 never claims records the guardian does
+                                 not hold; set replacement is a v1
+                                 non-feature, 5.9)
 
 RECORD     tag 'beignet/recovery/record/v1'
            signed by the writer key of lease.epoch
@@ -326,8 +336,10 @@ TAKEOVER   tag 'beignet/recovery/takeover/v1'
 ```
 
 Receipts sign the complete STATE and are cumulative: a receipt whose
-LOGHEAD carries sequence S certifies every stored record with sequence at
-or below S, across epochs. `ciphertextHash` binds the exact bytes of the
+LOGHEAD carries sequence S certifies every stored record from
+ORIGIN.firstSequence through S inclusive, across every intervening writer
+epoch. Records below the origin do not exist for this namespace and no
+receipt ever speaks for them. `ciphertextHash` binds the exact bytes of the
 record at S, so retention is provable and attributable: a guardian cannot
 claim to hold what it never stored, and a writer can prove which bytes a
 receipt covered. `issuedAt` (unix milliseconds) is informational:
@@ -351,9 +363,17 @@ Request: the REGISTER transcript fields plus the recovery root public key
 recovery_id not yet registered for this guardian_set_id
 root signature verifies over the REGISTER transcript under recovery_id
 initial lease.epoch >= 1, writer key well-formed
+ORIGIN.firstSequence >= 1 (fresh node: 1 with zero previousHash;
+existing node: the retained base position)
 LOGHEAD is genesis, always: a guardian never signs a receipt over a
 head whose record it does not hold
 ```
+
+The guardian persists the root-signed registration itself, durably,
+alongside the state: it is the independently verifiable proof of which
+origin was authorized, and GET_HEAD returns it (5.3), so a guardian
+recovering from damaged storage, or a restore device, never has to infer
+the origin from surviving records.
 
 Response: a RECEIPT over the initial STATE. Idempotency: re-registering
 the byte-identical initial state returns `OK_DUPLICATE` with the stored
@@ -369,9 +389,9 @@ signature. Acceptance, atomically per the linearization rule:
 ```text
 epoch == lease.epoch
 writer signature verifies under lease.writerPublicKey
-if logHead is genesis: any sequence >= 1 and any previousHash fix the
-                       chain origin (4.1)
-else:                  sequence == logHead.sequence + 1
+if logHead is genesis: sequence     == ORIGIN.firstSequence
+                       previousHash == ORIGIN.previousHash
+else:                  sequence     == logHead.sequence + 1
                        previousHash == logHead.frameHash
 ciphertextHash == SHA-256(ciphertext)
 ciphertext within advertised size limits
@@ -395,8 +415,9 @@ nothing.
 ### 5.3 GET_HEAD
 
 Request: recovery_id. Response: the guardian's current STATE, its
-cumulative RECEIPT over that state, and every TAKEOVER certificate it
-knows for prior epochs of this namespace. Returning the bundle always
+cumulative RECEIPT over that state, every TAKEOVER certificate it knows
+for prior epochs of this namespace, and the stored root-signed
+REGISTRATION (the origin proof, 5.1). Returning the bundle always
 settles spec open question 11.7. A guardian whose store is uncertain
 (spec 5.5 durability rules) sets `possibly_stale = true` and MUST still
 refuse writes.
@@ -533,11 +554,11 @@ piecemeal.
 What v1 DOES support, for clarity against the prohibition above:
 
 - First-time enablement of guardians on an existing node is NOT a
-  replacement: no prior set carries the namespace, the upload starts at
-  the retained journal base with the journal's real sequence numbering
-  (the 4.1 origin rule), and Phase 3 capsule ordering stays monotonic
-  across enablement because the node-wide journal numbering never
-  resets.
+  replacement: no prior set carries the namespace, the root-committed
+  ORIGIN registered for it is the retained journal base with the
+  journal's real sequence numbering (4.1), and Phase 3 capsule ordering
+  stays monotonic across enablement because the node-wide journal
+  numbering never resets.
 - Replacing an individual FAILED guardian machine behind the SAME
   guardianId and set (restore its store, then repair through
   SYNC_RECORD and SYNC_EPOCH per 5.10) is operational maintenance, not
@@ -554,8 +575,12 @@ per namespace:
 ```text
 1  the guardian identifies its LAST INTERNALLY CONSISTENT CHECKPOINT:
    the longest prefix of its stored records, takeover certificates and
-   issued receipts that verifies completely (chain continuity, epoch
-   continuity through its stored certificates, signatures)
+   issued receipts that verifies completely, ANCHORED AT THE ROOT-SIGNED
+   ORIGIN (chain continuity from ORIGIN.firstSequence and
+   ORIGIN.previousHash, epoch continuity through its stored
+   certificates, signatures). A surviving suffix of records that does
+   not chain from the origin is NOT a checkpoint; without the stored
+   registration itself, there is no checkpoint at all
 2  it DISCARDS all per-namespace state after that checkpoint: records,
    lease changes, and its own issued receipts beyond it (receipts
    already handed out remain valid statements about what WAS stored;
@@ -566,11 +591,22 @@ per namespace:
    SYNC_RECORD for records under the lease epoch current at each point,
    SYNC_EPOCH for each takeover in sequence, then SYNC_RECORD again
    under the new epoch, and so on to the present
-5  once the replayed state matches a quorum-certified current state
-   (a GET_HEAD receipt bundle from `required` peer guardians, or the
-   writer's own resubmission reaching the current head), the guardian
-   lifts possibly_stale and resumes accepting PUT_STATE and
-   ACQUIRE_EPOCH
+5  the guardian lifts possibly_stale and resumes accepting PUT_STATE
+   and ACQUIRE_EPOCH ONLY when the replayed state exactly matches a
+   target GuardianState supported by a valid THRESHOLD BUNDLE: receipts
+   and takeover certificates from at least `required` DISTINCT
+   guardians of the set, all covering that target. The artifacts are
+   self-authenticating, so anyone may supply them, including retained
+   copies from the writer or a restore device; what never suffices is
+   writer POSSESSION alone. A writer replaying its own records and
+   declaring its own head current could resurrect a superseded epoch on
+   a rolled-back guardian and make it contradict a takeover certificate
+   it issued before losing its store; fencing is permanent, so recency
+   must be proven by quorum evidence, not asserted
+6  when no quorum-certified target can be assembled, the guardian
+   REMAINS read-only (possibly_stale) indefinitely, and recovery for
+   the affected node degrades to the SCB/DLP path. Restrictive, and
+   exactly the fencing guarantee this protocol exists to provide
 ```
 
 This keeps the state machine strictly append-only: there is no
@@ -609,10 +645,16 @@ message LogHead {
   uint64 record_epoch    = 4;
 }
 
+message ChainOrigin {
+  uint64 first_sequence = 1;     // >= 1
+  bytes  previous_hash  = 2;     // 32; zeros for a fresh node
+}
+
 message GuardianState {
-  bytes   recovery_id = 1;       // 32
-  Lease   lease       = 2;
-  LogHead log_head    = 3;
+  bytes       recovery_id = 1;   // 32
+  Lease       lease       = 2;
+  ChainOrigin origin      = 3;   // immutable, root-committed at registration
+  LogHead     log_head    = 4;
 }
 
 message Record {
@@ -680,6 +722,7 @@ message GetHeadResponse {
   Receipt       receipt        = 4;
   repeated TakeoverCertificate certificates = 5;
   bool          possibly_stale = 6;
+  RegisterNodeRequest registration = 7; // the stored origin proof (5.1)
 }
 
 message GetStateRequest {

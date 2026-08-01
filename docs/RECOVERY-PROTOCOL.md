@@ -5,7 +5,7 @@ Replicated, cryptographically versioned state continuity for Lightning channels,
 Status: Phases 1 to 3 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279); Phases 4 to 7 not started
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
-Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed. Applied three external design review rounds of the wire draft: an explicit REGISTER_NODE genesis operation under a dedicated seed-derived recovery root (which is also the guardian namespace, keeping the Lightning node id out of the protocol, including out of the IV derivation), the writer lease separated from the log head so the post-takeover state is fully defined, a deterministic AES-GCM nonce construction keyed by recovery_id, an exact SYNC_EPOCH validation algorithm, per-verb protobuf responses with 32-byte x-only keys throughout, mandatory transport authentication for non-local deployments with credentials recoverable from the encrypted capsule, guardian-set replacement made a LITERAL v1 non-feature (one set per namespace ever; loss degrades to SCB/DLP; ROTATE_SET reserved; a chain-origin rule keeps first-time enablement of existing nodes possible), uncertain-store repair defined as rollback-then-replay with no insert-behind-head anywhere in the protocol, and the obsolete 5.5 sketches replaced rather than annotated
+Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed. Applied four external design review rounds of the wire draft: an explicit REGISTER_NODE genesis operation under a dedicated seed-derived recovery root (which is also the guardian namespace, keeping the Lightning node id out of the protocol, including out of the IV derivation), the writer lease separated from the log head so the post-takeover state is fully defined, an IMMUTABLE root-committed ChainOrigin inside the registration so an existing node enables guardians mid-journal without renumbering while a truncated store can never pass a surviving record off as its origin, a deterministic AES-GCM nonce construction keyed by recovery_id, an exact SYNC_EPOCH validation algorithm, per-verb protobuf responses with 32-byte x-only keys throughout, mandatory transport authentication for non-local deployments with credentials recoverable from the encrypted capsule, guardian-set replacement made a LITERAL v1 non-feature (one set per namespace ever; loss degrades to SCB/DLP; ROTATE_SET reserved), uncertain-store repair defined as rollback-then-replay anchored at the origin proof with re-entry to writability ONLY on quorum evidence (writer possession never proves recency), receipts certifying origin-through-head across epochs, and the obsolete 5.5 sketches replaced rather than annotated
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -265,7 +265,7 @@ export interface EncryptedRecoveryFrame {
   writerEpoch: bigint;
   sequence: bigint;
   frameHash: Buffer;        // hash of the plaintext frame
-  ciphertext: Buffer;       // XChaCha20-Poly1305 or AES-256-GCM
+  ciphertext: Buffer;       // AES-256-GCM (decided, 11.2)
 }
 ```
 
@@ -289,7 +289,7 @@ Deterministic reconstruction: `reconstructFromFrames(snapshot, deltas)` rebuilds
 Ordering decision (revision 3): the journal keeps a single node-wide sequence. Per-channel journals were considered and rejected for v1: a forward atomically links an incoming HTLC on one channel to an outgoing HTLC on another (5.1), so partitioned journals would need cross-journal transaction records, and reconstruction would become a partial-order merge instead of a linear replay. The cost of the single sequence is potential head-of-line coupling: guardians enforce sequence continuity (5.5), so frame N+1 cannot be accepted before frame N. Two requirements keep that coupling from becoming per-frame latency:
 
 - Appends are pipelined. The writer streams frames to each guardian in sequence order without waiting for the previous receipt.
-- Receipts are cumulative. A receipt for head sequence S certifies every frame at or below S in that epoch, so one receipt can release many pending barriers at once.
+- Receipts are cumulative. A receipt for head sequence S certifies every stored record from the root-committed origin through S, across writer epochs, so one receipt can release many pending barriers at once.
 
 With those two rules, a slow receipt for channel A's frame N does not add a round trip to channel B's frame N+1; the receipt covering N+1 satisfies both barriers. The residual coupling is real and documented: in quorum mode, when the quorum is genuinely unreachable, every SafetyCritical barrier on the node stalls, whatever the channel. That is inherent to quorum durability, not to the ordering choice; async-remote and local modes have no barrier and no cross-channel stall. If profiling under load ever shows barrier convoys beyond this, the revisit path is per-channel journals plus a node epoch journal with cross-journal forward records, and the frame format's sequence field would become a (stream, sequence) pair; the v1 format does not build this.
 
@@ -310,7 +310,7 @@ export interface RecoveryCapsule {
 }
 ```
 
-Encryption: HKDF info `'beignet-recovery-capsule-v1'`, then the existing `padOwnPeerStorageBlob` framing (no size leak). Push via the existing `distributePeerStorage`; refresh on every snapshot, on guardian-set change, and at most once per minute to respect provider rate limits.
+Encryption: HKDF info `'beignet-recovery-capsule-v1'`, then the existing `padOwnPeerStorageBlob` framing (no size leak). Push via the existing `distributePeerStorage`; refresh on every snapshot, on initial guardian enablement or descriptor and credential changes (set replacement does not exist in v1, see 12.1), and at most once per minute to respect provider rate limits.
 
 For small wallets (one or two channels), the complete recovery state will often fit inline, making Tier 2 restore possible from peer_storage alone with zero new infrastructure. That alone justifies Phase 3 shipping before guardians exist.
 
@@ -336,8 +336,15 @@ export interface WriterLease {
   writerPublicKey: Buffer;   // 32-byte x-only, fresh random per epoch (5.6)
 }
 
+export interface ChainOrigin {
+  firstSequence: bigint;     // fresh node: 1; existing node: the retained
+                             // journal base position. Immutable, committed
+                             // inside the root-signed registration.
+  previousHash: Buffer;      // 32 zero bytes for a fresh node
+}
+
 export interface LogHead {
-  sequence: bigint;          // 0 at genesis; first record is sequence 1
+  sequence: bigint;          // 0 at genesis ("no records stored yet")
   frameHash: Buffer;         // 32 zero bytes at genesis
   ciphertextHash: Buffer;    // 32 zero bytes at genesis
   recordEpoch: bigint;       // the epoch the tip record was written under
@@ -346,6 +353,9 @@ export interface LogHead {
 export interface GuardianState {
   recoveryId: Buffer;        // 32-byte x-only recovery root public key
   lease: WriterLease;
+  origin: ChainOrigin;       // where the first record MUST land; a bare
+                             // surviving record can never masquerade as
+                             // an origin
   logHead: LogHead;
 }
 
@@ -393,13 +403,18 @@ Guardian invariants (enforced server-side):
 accept REGISTER_NODE iff:
   (recoveryId, guardian_set_id) not yet registered
   root signature verifies under recoveryId
+  origin.firstSequence >= 1 (immutable for the namespace's life; the
+  guardian durably persists the root-signed registration as the origin
+  proof and returns it via GET_HEAD)
   logHead is genesis (a guardian never certifies a record it lacks)
 
 accept PUT_STATE iff:
   record.epoch == lease.epoch for recoveryId
   writerSignature verifies under lease.writerPublicKey
-  sequence == logHead.sequence + 1
-  previousHash == logHead.frameHash (zeros for sequence 1)
+  first record: sequence == origin.firstSequence
+                previousHash == origin.previousHash
+  later:        sequence == logHead.sequence + 1
+                previousHash == logHead.frameHash
 reject everything else, including any write from a superseded epoch
 
 accept ACQUIRE_EPOCH iff:
@@ -442,7 +457,8 @@ docs/RECOVERY-GUARDIAN-WIRE.md 5.10); it may keep serving GET_HEAD and
 GET_STATE with an explicit possibly-stale flag until repaired
 
 receipts are cumulative: a receipt for head sequence S certifies every
-frame at or below S in that epoch
+stored record from the root-committed origin through S inclusive,
+across every intervening writer epoch
 
 guardians persist the receipts and takeover certificates they issue,
 and GET_HEAD returns the current head together with the takeover
