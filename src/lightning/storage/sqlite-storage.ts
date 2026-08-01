@@ -206,7 +206,12 @@ export class SqliteStorage implements IStorageBackend {
 			table: 'invoice_path_ids',
 			pk: 'payment_hash_hex',
 			columns: ['path_id']
-		}
+		},
+		// Recovery journal metadata, which from Phase 5 on holds the WRITER
+		// LEASE: the private half of the ephemeral writer key that signs
+		// guardian records. That is signing material and must never sit in
+		// plaintext in a stolen database file.
+		{ table: 'recovery_meta', pk: 'key', columns: ['value'] }
 	];
 
 	/**
@@ -1728,11 +1733,13 @@ export class SqliteStorage implements IStorageBackend {
 			.run(sequence);
 	}
 
+	// value is encrypted at rest (see ENCRYPTED_COLUMNS): from Phase 5 the
+	// writer lease keeps its signing secret here.
 	getRecoveryMeta(key: string): string | null {
 		const row = this.db
 			.prepare('SELECT value FROM recovery_meta WHERE key = ?')
 			.get(key) as { value: string } | undefined;
-		return row ? row.value : null;
+		return row ? this._dec(row.value) : null;
 	}
 
 	setRecoveryMeta(key: string, value: string): void {
@@ -1740,7 +1747,7 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
 			)
-			.run(key, value);
+			.run(key, this._enc(value));
 	}
 
 	// ─── Watchtower (LND altruist client) ───
