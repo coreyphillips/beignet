@@ -39,11 +39,12 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
-	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	journalSupported,
-	reconstructFromFrames
+	reconstructFromFrames,
+	verifyFrameChain
 } from './journal';
+import { RecoveryFrame } from './types';
 
 const CAPSULE_HKDF_INFO = 'beignet-recovery-capsule-v1';
 const CAPSULE_MAGIC = 'bRC1';
@@ -226,9 +227,11 @@ export function decodeRecoveryCapsuleBlob(
 }
 
 /**
- * Pick the best capsule from decrypted candidates: highest (writerEpoch,
- * latestSequence), per the restore rule in spec 5.4. Ties are fine; any of
- * the tied capsules describes the same head.
+ * Raw head comparator over decrypted candidates: highest (writerEpoch,
+ * latestSequence). This does NOT validate inline journals; the restore flow
+ * must use restoreBestRecoveryCapsule, which selects only among candidates
+ * whose hash chain fully verifies (spec 5.4) and fails closed on conflicting
+ * equal heads.
  */
 export function selectRecoveryCapsule(
 	capsules: RecoveryCapsule[]
@@ -268,14 +271,19 @@ export interface IComposedCapsule {
 	capsule: RecoveryCapsule;
 	/** Whether the full journal fit inline (Tier 2 from peer_storage alone). */
 	inline: boolean;
+	/** Set when a journal existed but failed verification and was dropped. */
+	inlineError?: string;
 }
 
 /**
  * Compose and encrypt the current capsule. Tries the full inline journal
  * first; if the encrypted blob would not fit the peer-storage budget, falls
  * back to SCB + locator (spec 5.4: oversized state degrades gracefully).
- * Throws only when even the SCB-only capsule is oversized, which mirrors
- * distributePeerStorage's own loud failure on oversized blobs.
+ * A journal that fails verification is never inlined either: restore PREFERS
+ * Tier 2, so replicating a broken chain would be strictly worse than SCB +
+ * locator (the failure is reported via inlineError). Throws only when even
+ * the SCB-only capsule is oversized, which mirrors distributePeerStorage's
+ * own loud failure on oversized blobs.
  */
 export function composeRecoveryCapsule(
 	options: IComposeCapsuleOptions
@@ -304,6 +312,25 @@ export function composeRecoveryCapsule(
 		frames = storage.loadRecoveryFrames?.() ?? [];
 		const base = frames.find((row) => String(row.sequence) === lastSnapshot);
 		if (base) capsule.snapshotHash = base.frameHash;
+	}
+
+	let inlineError: string | undefined;
+	if (frames.length > 0) {
+		try {
+			verifyFrameChain(
+				frames,
+				{
+					tipSequence: tipSequence ?? null,
+					tipHash: tipHash ?? null,
+					lastSnapshotSequence: lastSnapshot ?? null
+				},
+				deriveRecoveryMasterKey(options.nodeSecret),
+				getPublicKey(options.nodeSecret)
+			);
+		} catch (err) {
+			inlineError = err instanceof Error ? err.message : String(err);
+			frames = [];
+		}
 	}
 
 	if (frames.length > 0) {
@@ -339,7 +366,7 @@ export function composeRecoveryCapsule(
 			`recovery capsule oversized even without inline state: ${blob.length} > ${maxBytes} bytes`
 		);
 	}
-	return { blob, capsule, inline: false };
+	return { blob, capsule, inline: false, inlineError };
 }
 
 export interface ICapsuleRestoreResult {
@@ -351,15 +378,82 @@ export interface ICapsuleRestoreResult {
 	framesApplied: number;
 }
 
+/** Parse an inline Tier 2 payload back into stored rows plus chain metadata. */
+function parseInlineState(inline: Buffer): {
+	encoded: IEncodedInlineState;
+	rows: IStoredRecoveryFrame[];
+} {
+	let encoded: IEncodedInlineState;
+	try {
+		encoded = JSON.parse(inline.toString('utf8')) as IEncodedInlineState;
+	} catch {
+		throw new Error('recovery capsule inline state is not valid JSON');
+	}
+	if (!Array.isArray(encoded.frames) || encoded.frames.length === 0) {
+		throw new Error('recovery capsule inline state carries no frames');
+	}
+	return {
+		encoded,
+		rows: encoded.frames.map((row) => ({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash: Buffer.from(row.frameHash, 'hex'),
+			previousFrameHash: Buffer.from(row.previousFrameHash, 'hex'),
+			ciphertext: Buffer.from(row.ciphertext, 'base64'),
+			createdAt: row.createdAt
+		}))
+	};
+}
+
+/**
+ * Verify a capsule's inline journal COMPLETELY, without touching any
+ * storage: the full Phase 2 chain verification (verifyFrameChain) over the
+ * inline rows and metadata, plus the head binding: the chain must end
+ * exactly at the head the capsule advertises, or the payload is not the
+ * journal this capsule described (stale or spliced). Throws on the first
+ * violation; returns the decoded frames on success.
+ */
+function verifyInlineJournal(
+	capsule: RecoveryCapsule,
+	nodeSecret: Buffer
+): {
+	encoded: IEncodedInlineState;
+	rows: IStoredRecoveryFrame[];
+	frames: RecoveryFrame[];
+} {
+	const { encoded, rows } = parseInlineState(capsule.inlineRecoveryState!);
+	const frames = verifyFrameChain(
+		rows,
+		{
+			tipSequence: encoded.meta.tipSequence,
+			tipHash: encoded.meta.tipHash,
+			lastSnapshotSequence: encoded.meta.lastSnapshot
+		},
+		deriveRecoveryMasterKey(nodeSecret),
+		getPublicKey(nodeSecret)
+	);
+	const last = frames[frames.length - 1];
+	const lastRow = rows[rows.length - 1];
+	if (
+		last.sequence !== capsule.latestSequence ||
+		last.writerEpoch !== capsule.writerEpoch ||
+		!lastRow.frameHash.equals(capsule.frameHash)
+	) {
+		throw new Error(
+			'recovery capsule head does not match its inline journal (stale or spliced payload)'
+		);
+	}
+	return { encoded, rows, frames };
+}
+
 /**
  * Restore from a decrypted capsule into an EMPTY target database.
  *
- * Tier 2 path (inline journal present and the target supports frames):
- * install the stored frame rows and journal metadata, then run the exact
- * Phase 2 verification and reconstruction (loadVerifiedFrames +
- * reconstructFromFrames). The capsule's own head fields must match the
- * installed chain's tip; a mismatch means the inline payload is not the
- * journal this capsule described, and the restore fails closed. On ANY
+ * Tier 2 path (inline journal present and the target supports frames): the
+ * inline journal is verified COMPLETELY before anything touches the target
+ * (verifyInlineJournal: the exact Phase 2 chain checks plus the capsule head
+ * binding). Only then are the stored frame rows and journal metadata
+ * installed and the deltas replayed through reconstructFromFrames. On ANY
  * tier 2 throw the target must be discarded; partial installs are not
  * cleaned up.
  *
@@ -379,68 +473,146 @@ export function restoreFromRecoveryCapsule(
 		return { tier: 1, scb, framesApplied: 0 };
 	}
 
-	let inline: IEncodedInlineState;
-	try {
-		inline = JSON.parse(
-			capsule.inlineRecoveryState.toString('utf8')
-		) as IEncodedInlineState;
-	} catch {
-		throw new Error('recovery capsule inline state is not valid JSON');
-	}
-	if (!Array.isArray(inline.frames) || inline.frames.length === 0) {
-		throw new Error('recovery capsule inline state carries no frames');
-	}
+	// Validate the candidate COMPLETELY before the first write to the target.
+	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
 
 	target.transaction(() => {
-		for (const row of inline.frames) {
-			target.saveRecoveryFrame!({
-				sequence: row.sequence,
-				writerEpoch: row.writerEpoch,
-				frameHash: Buffer.from(row.frameHash, 'hex'),
-				previousFrameHash: Buffer.from(row.previousFrameHash, 'hex'),
-				ciphertext: Buffer.from(row.ciphertext, 'base64'),
-				createdAt: row.createdAt
-			});
+		for (const row of rows) {
+			target.saveRecoveryFrame!(row);
 		}
 		target.setRecoveryMeta!(
 			JOURNAL_META_KEYS.tipSequence,
-			inline.meta.tipSequence
+			encoded.meta.tipSequence
 		);
-		target.setRecoveryMeta!(JOURNAL_META_KEYS.tipHash, inline.meta.tipHash);
+		target.setRecoveryMeta!(JOURNAL_META_KEYS.tipHash, encoded.meta.tipHash);
 		target.setRecoveryMeta!(
 			JOURNAL_META_KEYS.writerEpoch,
-			inline.meta.writerEpoch
+			encoded.meta.writerEpoch
 		);
 		target.setRecoveryMeta!(
 			JOURNAL_META_KEYS.lastSnapshot,
-			inline.meta.lastSnapshot
+			encoded.meta.lastSnapshot
 		);
 	});
-
-	const journal = new RecoveryJournal(
-		target,
-		deriveRecoveryMasterKey(nodeSecret),
-		getPublicKey(nodeSecret)
-	);
-	const frames = journal.loadVerifiedFrames();
-	const last = frames[frames.length - 1];
-	// The capsule binds the chain: its head fields are the recency anchor the
-	// restore selected on, so the installed chain must END there.
-	if (
-		last.sequence !== capsule.latestSequence ||
-		last.writerEpoch !== capsule.writerEpoch ||
-		!hashOfLastFrame(target).equals(capsule.frameHash)
-	) {
-		throw new Error(
-			'recovery capsule head does not match its inline journal (stale or spliced payload)'
-		);
-	}
 	reconstructFromFrames(target, frames);
 	return { tier: 2, scb, framesApplied: frames.length };
 }
 
-/** Stored hash of the highest-sequence frame row in the target. */
-function hashOfLastFrame(target: IStorageBackend): Buffer {
-	const rows = target.loadRecoveryFrames!();
-	return rows.length ? rows[rows.length - 1].frameHash : ZERO_HASH;
+export interface IBestCapsuleRestore extends ICapsuleRestoreResult {
+	/** The winning capsule. */
+	capsule: RecoveryCapsule;
+	/** The highest head seen among ALL decrypted candidates. When the
+	 *  restored tier or head is below this, newer state existed somewhere
+	 *  and could not be validated; integrations should surface that. */
+	newestSeenHead: { writerEpoch: bigint; latestSequence: bigint };
+	/** Decrypted candidates that were not used (invalid or superseded). */
+	rejectedCandidates: number;
+}
+
+/**
+ * The spec 5.4 restore rule as ONE validated operation: decrypt every
+ * candidate blob, keep the ones that parse under this node's key, and
+ * restore the highest (writerEpoch, latestSequence) whose inline hash chain
+ * FULLY validates, falling back to the highest candidate's SCB (Tier 1)
+ * when no inline journal validates. Selection never trusts an unvalidated
+ * candidate, and nothing touches the target until its candidate has been
+ * verified end to end.
+ *
+ * Equal (writerEpoch, latestSequence) with DIFFERING head hashes is a
+ * conflict this phase cannot adjudicate (writer fencing arrives in Phase
+ * 5): two seed-identical writers advanced independently from the same
+ * state. Fail closed; an operator who knows which device was authoritative
+ * can restore that specific capsule via restoreFromRecoveryCapsule.
+ */
+export function restoreBestRecoveryCapsule(
+	blobs: Buffer[],
+	target: IStorageBackend,
+	nodeSecret: Buffer
+): IBestCapsuleRestore {
+	const candidates = blobs
+		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
+		.filter((c): c is RecoveryCapsule => c !== null);
+	if (candidates.length === 0) {
+		throw new Error(
+			`no recovery capsule among ${blobs.length} candidate blobs`
+		);
+	}
+	// Highest head first.
+	const sorted = [...candidates].sort((a, b) => {
+		if (a.writerEpoch !== b.writerEpoch) {
+			return a.writerEpoch > b.writerEpoch ? -1 : 1;
+		}
+		if (a.latestSequence !== b.latestSequence) {
+			return a.latestSequence > b.latestSequence ? -1 : 1;
+		}
+		return 0;
+	});
+	const newestSeenHead = {
+		writerEpoch: sorted[0].writerEpoch,
+		latestSequence: sorted[0].latestSequence
+	};
+
+	for (let i = 0; i < sorted.length; ) {
+		// One group of candidates claiming the same (epoch, sequence).
+		let j = i;
+		while (
+			j < sorted.length &&
+			sorted[j].writerEpoch === sorted[i].writerEpoch &&
+			sorted[j].latestSequence === sorted[i].latestSequence
+		) {
+			j++;
+		}
+		const group = sorted.slice(i, j);
+		for (const other of group) {
+			if (!other.frameHash.equals(group[0].frameHash)) {
+				throw new Error(
+					`conflicting recovery capsule heads at epoch ${group[0].writerEpoch} sequence ${group[0].latestSequence}: two histories share the same height, refusing to choose`
+				);
+			}
+		}
+		// Same head, same hash: prefer the candidate carrying the inline
+		// journal (a peer may hold a degraded SCB + locator twin).
+		const candidate = group.find((c) => c.inlineRecoveryState) ?? group[0];
+		if (candidate.inlineRecoveryState && journalSupported(target)) {
+			try {
+				verifyInlineJournal(candidate, nodeSecret);
+			} catch {
+				// Invalid Tier 2 at this height: the next-highest head gets
+				// its turn (spec 5.4: highest WHOSE HASH CHAIN VALIDATES).
+				i = j;
+				continue;
+			}
+			const result = restoreFromRecoveryCapsule(candidate, target, nodeSecret);
+			return {
+				...result,
+				capsule: candidate,
+				newestSeenHead,
+				rejectedCandidates: candidates.length - 1
+			};
+		}
+		i = j;
+	}
+
+	// No inline journal validated at any height: Tier 1 from the highest
+	// head whose SCB authenticates. channel_reestablish and the DLP path
+	// remain the safety net, exactly as for a plain SCB restore.
+	for (const candidate of sorted) {
+		let scb: IStaticChannelBackup;
+		try {
+			scb = decodeScb(candidate.encryptedScb, nodeSecret);
+		} catch {
+			continue;
+		}
+		return {
+			tier: 1,
+			scb,
+			framesApplied: 0,
+			capsule: candidate,
+			newestSeenHead,
+			rejectedCandidates: candidates.length - 1
+		};
+	}
+	throw new Error(
+		'no recovery capsule candidate validates: every inline journal failed verification and no SCB decodes'
+	);
 }

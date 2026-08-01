@@ -18,6 +18,9 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Network } from '../../src/lightning/invoice/types';
 import { INodeConfig } from '../../src/lightning/node/types';
@@ -33,9 +36,13 @@ import {
 	decodeRecoveryCapsuleBlob,
 	encryptRecoveryCapsule,
 	restoreFromRecoveryCapsule,
+	restoreBestRecoveryCapsule,
 	selectRecoveryCapsule,
 	deriveRecoveryMasterKey
 } from '../../src/lightning/recovery';
+import { MessageType } from '../../src/lightning/message/types';
+import { decodePeerStorageMessage } from '../../src/lightning/message/peer-storage';
+import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
 import {
 	encodeScb,
 	IStaticChannelBackup
@@ -215,10 +222,19 @@ function makeScb(): string {
 	return encodeScb(backup, NODE_SECRET);
 }
 
-/** A journaled storage with a few committed transitions. */
-function journaledStorage(transitions = 3): {
+/**
+ * A journaled storage with a few committed transitions. `salt` varies the
+ * committed content, so two storages with the same salt produce identical
+ * chains and different salts produce different frame hashes at the same
+ * heights (the conflicting-heads case).
+ */
+function journaledStorage(
+	transitions = 3,
+	salt = 0
+): {
 	storage: SqliteStorage;
 	journal: RecoveryJournal;
+	manager: RecoveryManager;
 } {
 	const storage = openStorage();
 	const journal = new RecoveryJournal(
@@ -233,15 +249,15 @@ function journaledStorage(transitions = 3): {
 			mutations: [
 				{
 					type: 'payment_preimage',
-					paymentHash: Buffer.alloc(32, i + 1).toString('hex'),
-					preimage: Buffer.alloc(32, i + 1)
+					paymentHash: Buffer.alloc(32, i + 1 + salt).toString('hex'),
+					preimage: Buffer.alloc(32, i + 1 + salt)
 				}
 			],
 			outboundMessages: []
 		});
 		expect(result.committed).to.equal(true);
 	}
-	return { storage, journal };
+	return { storage, journal, manager };
 }
 
 /**
@@ -586,28 +602,21 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 			.ourPeerStorageBlob;
 		expect(blob, 'capsule blob composed and remembered').to.not.equal(null);
 
-		// Restore side: scan candidates like a real restore would; the foreign
-		// garbage blob is ignored, ours decodes.
-		const candidates = [crypto.randomBytes(300), blob!]
-			.map((b) =>
-				decodeRecoveryCapsuleBlob(b, makeNodeConfig(1).nodePrivateKey)
-			)
-			.filter((c): c is RecoveryCapsule => c !== null);
-		expect(candidates).to.have.length(1);
-		const capsule = selectRecoveryCapsule(candidates)!;
-		expect(
-			capsule.inlineRecoveryState,
-			'small wallet fits inline'
-		).to.not.equal(undefined);
-
-		// Tier 2: byte-identical restore into a fresh database.
+		// Restore side: ONE validated operation over the raw candidate blobs
+		// (spec 5.4); the foreign garbage blob is ignored, ours validates,
+		// wins, and rebuilds byte-identically into a fresh database.
 		const restoredStorage = openStorage();
-		const result = restoreFromRecoveryCapsule(
-			capsule,
+		const result = restoreBestRecoveryCapsule(
+			[crypto.randomBytes(300), blob!],
 			restoredStorage,
 			makeNodeConfig(1).nodePrivateKey
 		);
 		expect(result.tier).to.equal(2);
+		expect(
+			result.capsule.inlineRecoveryState,
+			'small wallet fits inline'
+		).to.not.equal(undefined);
+		expect(result.rejectedCandidates).to.equal(0);
 		expect(dumpTables(restoredStorage)).to.equal(dumpTables(liveStorage));
 		// The Tier 1 material is present and lists the channel too.
 		expect(result.scb.channels).to.have.length(1);
@@ -685,6 +694,242 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 			(node as unknown as { ourPeerStorageBlob: Buffer | null })
 				.ourPeerStorageBlob
 		).to.equal(null);
+		node.destroy();
+		storage.close();
+	});
+});
+
+// ─────────────── Review regressions: stale startup, validated selection,
+// new-provider freshness ───────────────
+
+describe('Recovery phase 3: review regressions', () => {
+	it('startup capsule re-bases a journal left stale by a disabled period', () => {
+		// node.destroy() closes its storage, so the three runs share a
+		// file-backed database instead of one ':memory:' handle.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-p3-stale-')),
+			'stale.db'
+		);
+		const openFile = (): SqliteStorage => {
+			const s = new SqliteStorage(dbPath);
+			s.open();
+			return s;
+		};
+
+		// Run 1: recovery enabled; state A journaled.
+		const run1 = createNode(4, openFile(), true);
+		run1.createInvoice({ amountMsat: 1_000n, description: 'state-a' });
+		run1.destroy();
+
+		// Run 2: recovery disabled; state advances to B, journal stays at A.
+		const run2 = createNode(4, openFile(), false);
+		run2.createInvoice({ amountMsat: 2_000n, description: 'state-b' });
+		run2.destroy();
+
+		// Run 3: recovery enabled again. The INITIAL capsule, captured before
+		// any new transition, must already describe state B: the constructor
+		// re-bases the journal before composing. A capsule whose SCB and
+		// inline Tier 2 journal describe different points in time is exactly
+		// the stale-restore bug.
+		const run3Storage = openFile();
+		const run3 = createNode(4, run3Storage, true);
+		const blob = (run3 as unknown as { ourPeerStorageBlob: Buffer | null })
+			.ourPeerStorageBlob;
+		expect(blob, 'initial capsule composed').to.not.equal(null);
+		const capsule = decodeRecoveryCapsuleBlob(
+			blob!,
+			makeNodeConfig(4).nodePrivateKey
+		)!;
+		expect(capsule.inlineRecoveryState).to.not.equal(undefined);
+
+		const restored = openStorage();
+		const result = restoreFromRecoveryCapsule(
+			capsule,
+			restored,
+			makeNodeConfig(4).nodePrivateKey
+		);
+		expect(result.tier).to.equal(2);
+		// BOTH invoices are present: state B, not the stale state A.
+		expect(restored.loadAllInvoices()).to.have.length(2);
+		expect(dumpTables(restored)).to.equal(dumpTables(run3Storage));
+		run3.destroy();
+		restored.close();
+	});
+
+	/** Tamper one inline frame of a composed capsule and re-encrypt it. */
+	function tamperInline(capsule: RecoveryCapsule, nodeSecret: Buffer): Buffer {
+		const inline = JSON.parse(
+			capsule.inlineRecoveryState!.toString('utf8')
+		) as { frames: Array<{ ciphertext: string }> };
+		const ct = Buffer.from(inline.frames[0].ciphertext, 'base64');
+		ct[ct.length - 1] ^= 0x01;
+		inline.frames[0].ciphertext = ct.toString('base64');
+		return encryptRecoveryCapsule(
+			{
+				...capsule,
+				inlineRecoveryState: Buffer.from(JSON.stringify(inline), 'utf8')
+			},
+			nodeSecret
+		);
+	}
+
+	it('restores the highest candidate WHOSE CHAIN VALIDATES, not the raw highest', () => {
+		const { storage, manager } = journaledStorage(2);
+		const older = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const olderState = dumpTables(storage);
+
+		// The journal advances, and the NEWER capsule's inline is corrupted.
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, 9).toString('hex'),
+						preimage: Buffer.alloc(32, 9)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const newer = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const tamperedNewer = tamperInline(newer.capsule, NODE_SECRET);
+
+		const target = openStorage();
+		const result = restoreBestRecoveryCapsule(
+			[tamperedNewer, older.blob],
+			target,
+			NODE_SECRET
+		);
+		// The raw-highest candidate is invalid; the validated lower one wins.
+		expect(result.tier).to.equal(2);
+		expect(result.capsule.latestSequence).to.equal(
+			older.capsule.latestSequence
+		);
+		expect(dumpTables(target)).to.equal(olderState);
+		// And the newer, unvalidatable head is surfaced, not hidden.
+		expect(result.newestSeenHead.latestSequence).to.equal(
+			newer.capsule.latestSequence
+		);
+		storage.close();
+		target.close();
+	});
+
+	it('fails closed on equal heads with conflicting hashes', () => {
+		// Two seed-identical writers advanced independently to the same
+		// height: same (epoch, sequence), different frame hashes.
+		const a = journaledStorage(2, 0);
+		const b = journaledStorage(2, 100);
+		const blobA = composeRecoveryCapsule({
+			storage: a.storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		const blobB = composeRecoveryCapsule({
+			storage: b.storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		const target = openStorage();
+		expect(() =>
+			restoreBestRecoveryCapsule([blobA, blobB], target, NODE_SECRET)
+		).to.throw(/conflicting/);
+		a.storage.close();
+		b.storage.close();
+		target.close();
+	});
+
+	it('falls back to Tier 1 when no inline journal validates', () => {
+		const { storage } = journaledStorage(2);
+		const composed = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const tampered = tamperInline(composed.capsule, NODE_SECRET);
+		const target = openStorage();
+		const result = restoreBestRecoveryCapsule([tampered], target, NODE_SECRET);
+		expect(result.tier).to.equal(1);
+		expect(result.scb.version).to.equal(1);
+		// Nothing touched the target on the failed Tier 2 attempt.
+		expect(target.loadAllPreimages()).to.have.length(0);
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		storage.close();
+		target.close();
+	});
+
+	it('never inlines a journal that fails verification at compose time', () => {
+		const { storage } = journaledStorage(3);
+		// Corrupt one stored frame on disk.
+		(
+			storage as unknown as {
+				db: { prepare: (sql: string) => { run: () => unknown } };
+			}
+		).db
+			.prepare(
+				'UPDATE recovery_frames SET ciphertext = zeroblob(64) WHERE sequence = 2'
+			)
+			.run();
+		const { capsule, inline, inlineError } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		// SCB + locator go out; the broken chain does not.
+		expect(inline).to.equal(false);
+		expect(capsule.inlineRecoveryState).to.equal(undefined);
+		expect(inlineError).to.match(/failed authentication|truncated/);
+		storage.close();
+	});
+
+	it('a provider connecting inside the throttle window gets a FRESH capsule', () => {
+		const storage = openStorage();
+		const node = createNode(5, storage, true);
+		const nodeKey = makeNodeConfig(5).nodePrivateKey;
+		// Startup composed and consumed the throttle window; this commit
+		// lands inside it, so the cached blob stays at the startup head.
+		node.createInvoice({ amountMsat: 3_000n, description: 'inside-window' });
+		const cached = decodeRecoveryCapsuleBlob(
+			(node as unknown as { ourPeerStorageBlob: Buffer | null })
+				.ourPeerStorageBlob!,
+			nodeKey
+		)!;
+
+		const capablePk = '03'.repeat(33);
+		const capableFeatures = FeatureFlags.empty();
+		capableFeatures.setOptional(Feature.PROVIDE_STORAGE);
+		const sent: Array<{ pubkey: string; type: number; payload: Buffer }> = [];
+		(node as unknown as { peerManager: unknown }).peerManager = {
+			listPeers: (): unknown[] => [{ pubkey: capablePk }],
+			getPeer: (): unknown => ({
+				getRemoteInit: (): unknown => ({ features: capableFeatures })
+			}),
+			sendToPeer: (pubkey: string, type: number, payload: Buffer): void => {
+				sent.push({ pubkey, type, payload });
+			},
+			destroy: (): void => {}
+		};
+		(
+			node as unknown as { sendPeerStorageOnConnect: (pk: string) => void }
+		).sendPeerStorageOnConnect(capablePk);
+
+		const push = sent.find((m) => m.type === MessageType.PEER_STORAGE);
+		expect(push, 'capsule pushed on connect').to.not.equal(undefined);
+		const framed = decodePeerStorageMessage(push!.payload).blob;
+		// Unwrap the bPS1 privacy framing to the raw capsule blob.
+		expect(framed.toString('ascii', 0, 4)).to.equal('bPS1');
+		const blob = framed.subarray(8, 8 + framed.readUInt32BE(4));
+		const fresh = decodeRecoveryCapsuleBlob(Buffer.from(blob), nodeKey)!;
+		// The new provider got the post-commit head, not the throttled cache.
+		expect(fresh.latestSequence > cached.latestSequence).to.equal(true);
 		node.destroy();
 		storage.close();
 	});

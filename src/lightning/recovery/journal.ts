@@ -26,7 +26,7 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { hkdfKey } from '../storage/encryption';
-import { IStorageBackend } from '../storage/types';
+import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
 import { RecoveryManager } from './recovery-manager';
 import {
@@ -294,107 +294,47 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * first violation; returns the decoded frames on success.
 	 */
 	loadVerifiedFrames(): RecoveryFrame[] {
-		const stored = this.storage.loadRecoveryFrames!();
-		const frames: RecoveryFrame[] = [];
-		let previousHash: Buffer | null = null;
-		let previousSequence: bigint | null = null;
+		return verifyFrameChain(
+			this.storage.loadRecoveryFrames!(),
+			{
+				tipSequence: this.storage.getRecoveryMeta!(META_TIP_SEQUENCE),
+				tipHash: this.storage.getRecoveryMeta!(META_TIP_HASH),
+				lastSnapshotSequence: this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT)
+			},
+			this.masterKey,
+			this.nodeId
+		);
+	}
 
-		for (const row of stored) {
-			const sequence = BigInt(row.sequence);
-			const writerEpoch = BigInt(row.writerEpoch);
-			if (previousSequence != null && sequence !== previousSequence + 1n) {
-				throw new Error(
-					`Recovery journal gap: frame ${previousSequence} is followed by ${sequence}`
+	/**
+	 * Re-base the chain on the current tables NOW, in its own transaction,
+	 * instead of waiting for this run's first append to do it. Called before
+	 * the first capsule of a run is composed (spec 5.4): a journal left stale
+	 * by a recovery-disabled period must never be replicated, or the capsule's
+	 * SCB and its inline Tier 2 journal would describe different points in
+	 * time and a restore inside the refresh-throttle window would resurrect
+	 * the stale state. Idempotent per run; appendFrame's own per-run re-base
+	 * is skipped once this ran. Throws when the frame store cannot accept the
+	 * snapshot (corrupt metadata); callers degrade to an SCB-only capsule.
+	 */
+	prepareForReplication(): void {
+		if (this.rebasedThisRun) return;
+		this.storage.transaction(() => {
+			const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+			if (tipSequence == null) {
+				this.appendSnapshotFrame(1n, GENESIS_HASH);
+			} else {
+				this.appendSnapshotFrame(
+					BigInt(tipSequence) + 1n,
+					Buffer.from(
+						this.storage.getRecoveryMeta!(META_TIP_HASH) ??
+							GENESIS_HASH.toString('hex'),
+						'hex'
+					)
 				);
 			}
-			// The first loaded frame may follow compaction, so its predecessor
-			// hash cannot be checked against a loaded frame; every later one is.
-			if (previousHash != null && !row.previousFrameHash.equals(previousHash)) {
-				throw new Error(
-					`Recovery journal chain break at frame ${sequence}: previous hash mismatch`
-				);
-			}
-			const key = deriveFrameKey(this.masterKey, this.nodeId, writerEpoch);
-			const aad = frameAad(
-				this.nodeId,
-				writerEpoch,
-				sequence,
-				row.previousFrameHash
-			);
-			let plaintext: Buffer;
-			try {
-				plaintext = decryptFrame(key, row.ciphertext, aad);
-			} catch {
-				throw new Error(
-					`Recovery journal frame ${sequence} failed authentication (tampered, reordered, or wrong key)`
-				);
-			}
-			if (!hashFrame(plaintext).equals(row.frameHash)) {
-				throw new Error(
-					`Recovery journal frame ${sequence} hash mismatch (stored hash does not cover this payload)`
-				);
-			}
-			const frame = decodeFrame(plaintext);
-			if (
-				frame.sequence !== sequence ||
-				frame.writerEpoch !== writerEpoch ||
-				!frame.previousFrameHash.equals(row.previousFrameHash)
-			) {
-				throw new Error(
-					`Recovery journal frame ${sequence} header mismatch between row and payload`
-				);
-			}
-			frames.push(frame);
-			previousHash = row.frameHash;
-			previousSequence = sequence;
-		}
-
-		const tip = this.getTip();
-		if (tip) {
-			if (frames.length === 0) {
-				throw new Error(
-					'Recovery journal truncated: a tip is recorded but no frames exist'
-				);
-			}
-			const last = frames[frames.length - 1];
-			if (
-				last.sequence !== tip.sequence ||
-				!previousHash!.equals(tip.frameHash)
-			) {
-				throw new Error(
-					`Recovery journal truncated: chain ends at ${last.sequence}, recorded tip is ${tip.sequence}`
-				);
-			}
-		} else if (frames.length > 0) {
-			throw new Error('Recovery journal has frames but no recorded tip');
-		}
-
-		// The retained base MUST be the recorded snapshot. Compaction leaves
-		// exactly one snapshot as the first frame; without this check, deleting
-		// that snapshot yields a contiguous, fully authenticated suffix of
-		// deltas that verifies cleanly and then reconstructs an INCOMPLETE
-		// database from an empty base. An authenticated chain is not enough;
-		// it must also start where the metadata says the state starts.
-		if (frames.length > 0) {
-			const first = frames[0];
-			const expectedSnapshot =
-				this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT);
-			if (!first.snapshot) {
-				throw new Error(
-					`Recovery journal is missing its retained base snapshot at frame ${first.sequence}`
-				);
-			}
-			if (
-				expectedSnapshot == null ||
-				first.sequence !== BigInt(expectedSnapshot)
-			) {
-				throw new Error(
-					`Recovery journal base snapshot mismatch: loaded ${first.sequence}, expected ${expectedSnapshot}`
-				);
-			}
-		}
-
-		return frames;
+		});
+		this.rebasedThisRun = true;
 	}
 
 	// ─────────────── internals ───────────────
@@ -518,6 +458,132 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			}))
 		};
 	}
+}
+
+/** The journal metadata a chain verification runs against. */
+export interface IFrameChainMeta {
+	tipSequence: string | null;
+	tipHash: string | null;
+	lastSnapshotSequence: string | null;
+}
+
+/**
+ * Decrypt and verify a stored frame chain against its recorded metadata.
+ * Pure function over (rows, meta): the journal's own loadVerifiedFrames and
+ * the capsule's inline-journal validation (spec 5.4) both run EXACTLY these
+ * checks, so a capsule candidate is held to the same standard as local disk.
+ *
+ * Detects: a tampered payload (AEAD failure), a reordered or transplanted
+ * frame (AAD sequence binding plus previousFrameHash linkage), a frame whose
+ * plaintext does not match its recorded hash, a gap in the sequence, a
+ * truncated tail against the recorded tip, and a first retained frame that
+ * is not the recorded base snapshot. Throws on the first violation.
+ */
+export function verifyFrameChain(
+	rows: IStoredRecoveryFrame[],
+	meta: IFrameChainMeta,
+	masterKey: Buffer,
+	nodeId: Buffer
+): RecoveryFrame[] {
+	const frames: RecoveryFrame[] = [];
+	let previousHash: Buffer | null = null;
+	let previousSequence: bigint | null = null;
+
+	for (const row of rows) {
+		const sequence = BigInt(row.sequence);
+		const writerEpoch = BigInt(row.writerEpoch);
+		if (previousSequence != null && sequence !== previousSequence + 1n) {
+			throw new Error(
+				`Recovery journal gap: frame ${previousSequence} is followed by ${sequence}`
+			);
+		}
+		// The first loaded frame may follow compaction, so its predecessor
+		// hash cannot be checked against a loaded frame; every later one is.
+		if (previousHash != null && !row.previousFrameHash.equals(previousHash)) {
+			throw new Error(
+				`Recovery journal chain break at frame ${sequence}: previous hash mismatch`
+			);
+		}
+		const key = deriveFrameKey(masterKey, nodeId, writerEpoch);
+		const aad = frameAad(nodeId, writerEpoch, sequence, row.previousFrameHash);
+		let plaintext: Buffer;
+		try {
+			plaintext = decryptFrame(key, row.ciphertext, aad);
+		} catch {
+			throw new Error(
+				`Recovery journal frame ${sequence} failed authentication (tampered, reordered, or wrong key)`
+			);
+		}
+		if (!hashFrame(plaintext).equals(row.frameHash)) {
+			throw new Error(
+				`Recovery journal frame ${sequence} hash mismatch (stored hash does not cover this payload)`
+			);
+		}
+		const frame = decodeFrame(plaintext);
+		if (
+			frame.sequence !== sequence ||
+			frame.writerEpoch !== writerEpoch ||
+			!frame.previousFrameHash.equals(row.previousFrameHash)
+		) {
+			throw new Error(
+				`Recovery journal frame ${sequence} header mismatch between row and payload`
+			);
+		}
+		frames.push(frame);
+		previousHash = row.frameHash;
+		previousSequence = sequence;
+	}
+
+	const tip =
+		meta.tipSequence != null && meta.tipHash != null
+			? {
+					sequence: BigInt(meta.tipSequence),
+					frameHash: Buffer.from(meta.tipHash, 'hex')
+			  }
+			: null;
+	if (tip) {
+		if (frames.length === 0) {
+			throw new Error(
+				'Recovery journal truncated: a tip is recorded but no frames exist'
+			);
+		}
+		const last = frames[frames.length - 1];
+		if (
+			last.sequence !== tip.sequence ||
+			!previousHash!.equals(tip.frameHash)
+		) {
+			throw new Error(
+				`Recovery journal truncated: chain ends at ${last.sequence}, recorded tip is ${tip.sequence}`
+			);
+		}
+	} else if (frames.length > 0) {
+		throw new Error('Recovery journal has frames but no recorded tip');
+	}
+
+	// The retained base MUST be the recorded snapshot. Compaction leaves
+	// exactly one snapshot as the first frame; without this check, deleting
+	// that snapshot yields a contiguous, fully authenticated suffix of
+	// deltas that verifies cleanly and then reconstructs an INCOMPLETE
+	// database from an empty base. An authenticated chain is not enough;
+	// it must also start where the metadata says the state starts.
+	if (frames.length > 0) {
+		const first = frames[0];
+		if (!first.snapshot) {
+			throw new Error(
+				`Recovery journal is missing its retained base snapshot at frame ${first.sequence}`
+			);
+		}
+		if (
+			meta.lastSnapshotSequence == null ||
+			first.sequence !== BigInt(meta.lastSnapshotSequence)
+		) {
+			throw new Error(
+				`Recovery journal base snapshot mismatch: loaded ${first.sequence}, expected ${meta.lastSnapshotSequence}`
+			);
+		}
+	}
+
+	return frames;
 }
 
 /**

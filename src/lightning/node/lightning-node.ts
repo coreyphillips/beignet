@@ -586,8 +586,11 @@ export class LightningNode extends EventEmitter {
 	> = new Map();
 	/** Recovery Capsule (spec 5.4): journal configured, capsule refresh armed. */
 	private recoveryCapsuleActive = false;
+	private recoveryJournal: RecoveryJournal | undefined;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private capsuleLastRefreshAt = 0;
+	/** A journaled commit landed after the last compose (see connect path). */
+	private capsuleDirty = false;
 
 	constructor(config: INodeConfig) {
 		super();
@@ -624,6 +627,7 @@ export class LightningNode extends EventEmitter {
 		// journaled commit schedules a (once-per-minute throttled) refresh of
 		// the peer_storage Recovery Capsule.
 		this.recoveryCapsuleActive = journal !== undefined;
+		this.recoveryJournal = journal;
 		this.recovery = this.storage
 			? new RecoveryManager(this.storage, {
 					journal,
@@ -2578,6 +2582,14 @@ export class LightningNode extends EventEmitter {
 					encodePeerStorageRetrievalMessage({ blob: held.blob })
 				);
 			}
+			// A journaled commit may have landed inside the refresh-throttle
+			// window. The throttle exists for PROVIDER rate limits, and a newly
+			// connecting provider has no history with us, so it gets a freshly
+			// composed capsule instead of the cached (up to a minute stale) blob.
+			if (this.capsuleDirty && this.peerAdvertisesPeerStorage(pubkey)) {
+				const fresh = this.composeRecoveryCapsuleBlob();
+				if (fresh) this.ourPeerStorageBlob = fresh;
+			}
 			// Client direction: our current blob, only to peers advertising the bit.
 			if (this.ourPeerStorageBlob && this.peerAdvertisesPeerStorage(pubkey)) {
 				this.peerManager.sendToPeer(
@@ -2652,6 +2664,7 @@ export class LightningNode extends EventEmitter {
 	 */
 	private scheduleRecoveryCapsuleRefresh(): void {
 		if (!this.recoveryCapsuleActive || !this.peerStorageEnabled) return;
+		this.capsuleDirty = true;
 		const elapsed = Date.now() - this.capsuleLastRefreshAt;
 		if (elapsed >= LightningNode.PEER_STORAGE_MIN_INTERVAL_MS) {
 			this.refreshRecoveryCapsule();
@@ -2679,14 +2692,37 @@ export class LightningNode extends EventEmitter {
 	 * distribution is a replica, and must not take down the node.
 	 */
 	refreshRecoveryCapsule(): number {
+		const blob = this.composeRecoveryCapsuleBlob();
+		if (!blob) return 0;
+		this.capsuleLastRefreshAt = Date.now();
+		return this.distributePeerStorage(blob);
+	}
+
+	/**
+	 * Compose the current capsule blob, or null when inactive or failed.
+	 *
+	 * The journal re-bases FIRST (prepareForReplication): a journal left
+	 * stale by a recovery-disabled period must never be replicated, or the
+	 * capsule's SCB and its inline Tier 2 journal would describe different
+	 * points in time. If the re-base itself fails (corrupt journal store),
+	 * composition's own verification drops the inline journal and an
+	 * SCB-only capsule goes out instead; both failures are logged.
+	 */
+	private composeRecoveryCapsuleBlob(): Buffer | null {
 		if (
 			!this.recoveryCapsuleActive ||
 			!this.peerStorageEnabled ||
 			!this.storage
 		) {
-			return 0;
+			return null;
 		}
-		this.capsuleLastRefreshAt = Date.now();
+		try {
+			this.recoveryJournal?.prepareForReplication();
+		} catch (err) {
+			this.emitStructuredLog('peer', 'recovery_capsule_rebase_failed', {
+				error: err instanceof Error ? err.message : String(err)
+			});
+		}
 		try {
 			const data = this.buildStaticChannelBackupData();
 			const encryptedScb = encodeScb(
@@ -2698,17 +2734,23 @@ export class LightningNode extends EventEmitter {
 				},
 				this.nodePrivkey
 			);
-			const { blob } = composeRecoveryCapsule({
+			const { blob, inlineError } = composeRecoveryCapsule({
 				storage: this.storage,
 				encryptedScb,
 				nodeSecret: this.nodePrivkey
 			});
-			return this.distributePeerStorage(blob);
+			if (inlineError) {
+				this.emitStructuredLog('peer', 'recovery_capsule_inline_dropped', {
+					error: inlineError
+				});
+			}
+			this.capsuleDirty = false;
+			return blob;
 		} catch (err) {
 			this.emitStructuredLog('peer', 'recovery_capsule_refresh_failed', {
 				error: err instanceof Error ? err.message : String(err)
 			});
-			return 0;
+			return null;
 		}
 	}
 
