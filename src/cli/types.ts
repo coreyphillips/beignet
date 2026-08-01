@@ -466,10 +466,12 @@ export interface BeignetConfig {
 	 *  false so a wallet declines all forwards. Env: BEIGNET_FORWARDING_ENABLED. */
 	forwardingEnabled?: boolean;
 	/** Dial known peers (channel partners included) on start and on disconnect
-	 *  (default true). Set false and, with no listen port either, the node is
-	 *  genuinely quiet: channels stay watched on-chain but unreachable over
-	 *  the wire, which is what an operator deliberately parking a Lightning
-	 *  node wants. Env: BEIGNET_AUTO_RECONNECT. */
+	 *  (default true). Set false and, with neither listenPort nor
+	 *  websocketPort configured, the node is genuinely quiet: channels stay
+	 *  watched on-chain but unreachable over the wire, which is what an
+	 *  operator deliberately parking a Lightning node wants. Env:
+	 *  BEIGNET_AUTO_RECONNECT, exact 'true' or 'false'; anything else is
+	 *  ignored and the default (reconnect on) rules. */
 	autoReconnect?: boolean;
 	/** Daemon diagnostic log level ('debug' | 'info' | 'warn' | 'error' |
 	 *  'silent'). When set, the daemon prints leveled diagnostics to stderr;

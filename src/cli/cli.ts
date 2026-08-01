@@ -2458,6 +2458,10 @@ Start flags:
   --no-forwarding                        Decline to relay third-party HTLCs, i.e.
                                          do not act as a routing hop (forwarding
                                          is on by default)
+  --no-auto-reconnect                    Do not dial known peers, channel partners
+                                         included, on start or disconnect. With no
+                                         listen/websocket port either, the node is
+                                         genuinely quiet (reconnect is on by default)
 
 Pay-retry flags:
   --max-retries <N>                      Max retry attempts (default: 3)
