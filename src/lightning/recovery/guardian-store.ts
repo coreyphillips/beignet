@@ -454,6 +454,75 @@ export class GuardianStore {
 		return moved;
 	}
 
+	/**
+	 * Sweep structurally malformed record rows (wrong column widths) into the
+	 * orphan archive. Range deletes key on the sequence BLOB, and a row whose
+	 * sequence blob is not eight bytes sorts arbitrarily and can dodge them;
+	 * the open-time rollback therefore sweeps by SHAPE as well, so a damaged
+	 * row can never survive to re-fail verification on the next open.
+	 */
+	archiveMalformedRecords(
+		recoveryId: Buffer,
+		reason: string,
+		archivedAt: Buffer
+	): number {
+		const predicate = `(
+			length(sequence) != 8 OR length(epoch) != 8 OR
+			length(previous_hash) != 32 OR length(frame_hash) != 32 OR
+			length(ciphertext_hash) != 32 OR length(writer_signature) != 64 OR
+			length(ciphertext) < 1
+		)`;
+		const moved = this.db
+			.prepare(
+				`INSERT OR REPLACE INTO guardian_orphan_records (
+					recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, archived_at, reason
+				)
+				SELECT recovery_id, epoch, sequence, previous_hash, frame_hash,
+					ciphertext_hash, ciphertext, writer_signature, ?, ?
+				FROM guardian_records WHERE recovery_id = ? AND ${predicate}`
+			)
+			.run(archivedAt, reason, recoveryId).changes;
+		this.db
+			.prepare(
+				`DELETE FROM guardian_records WHERE recovery_id = ? AND ${predicate}`
+			)
+			.run(recoveryId);
+		return moved;
+	}
+
+	/** The epoch-row counterpart of archiveMalformedRecords. */
+	deleteMalformedEpochs(recoveryId: Buffer): number {
+		return this.db
+			.prepare(
+				`DELETE FROM guardian_epochs WHERE recovery_id = ? AND (
+					length(epoch) != 8 OR length(writer_public_key) != 32 OR
+					(cert_superseded_state IS NOT NULL AND length(cert_superseded_state) != 192) OR
+					(cert_issued_at IS NOT NULL AND length(cert_issued_at) != 8) OR
+					(cert_signature IS NOT NULL AND length(cert_signature) != 64) OR
+					(receipt_state IS NOT NULL AND length(receipt_state) != 192) OR
+					(receipt_issued_at IS NOT NULL AND length(receipt_issued_at) != 8) OR
+					(receipt_signature IS NOT NULL AND length(receipt_signature) != 64)
+				)`
+			)
+			.run(recoveryId).changes;
+	}
+
+	/** Replace a registration receipt whose stored artifact failed to verify. */
+	updateRegistrationReceipt(
+		recoveryId: Buffer,
+		issuedAt: Buffer,
+		signature: Buffer
+	): void {
+		this.db
+			.prepare(
+				`UPDATE guardian_namespaces
+				SET registration_receipt_issued_at = ?, registration_receipt_signature = ?
+				WHERE recovery_id = ?`
+			)
+			.run(issuedAt, signature, recoveryId);
+	}
+
 	listOrphans(recoveryId: Buffer): IGuardianOrphanRow[] {
 		const rows = this.db
 			.prepare(

@@ -811,7 +811,7 @@ export class LightningNode extends EventEmitter {
 			// path_id in the final hop, and the TRUE aggregate payinfo
 			// (reusing the offer's message paths advertised fabricated zero
 			// fees, leaving the payment underfunded at the LSP hop).
-			buildHoldPaymentPaths: (pathId: Buffer) =>
+			buildHoldPaymentPaths: (pathId: Buffer): IBlindedPaymentPath[] =>
 				this.buildBlindedPaymentPaths(true, 3, pathId)
 		});
 		this.wireOfferManagerEvents();

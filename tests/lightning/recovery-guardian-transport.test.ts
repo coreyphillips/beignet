@@ -42,6 +42,7 @@ import {
 	encodeGetHeadResponse,
 	encodeGuardianState,
 	encodeInfoResponse,
+	encodePutStateResponse,
 	encodeRecord,
 	encodeRegisterNodeRequest,
 	encodeSyncEpochRequest,
@@ -616,6 +617,163 @@ describe('Guardian transport: endpoint selection', () => {
 				{ torEnabled: true }
 			)
 		).to.throw(/no usable transport/);
+	});
+
+	it('confines local-http to loopback and individually approved hosts', () => {
+		// A stale or hostile descriptor labelling a clearnet URL local-http
+		// must never be selected: the client would attach its credential to
+		// plaintext HTTP (wire 2.3: a general LAN address does not qualify).
+		const clearnetLocal = {
+			type: 'local-http' as const,
+			url: 'http://public-host.example'
+		};
+		expect(() =>
+			selectGuardianEndpoint(descriptor([clearnetLocal]), {
+				torEnabled: false,
+				allowLocalHttp: true
+			})
+		).to.throw(/no usable transport/);
+		// An isolated-container hostname needs explicit, per-host approval.
+		const container = {
+			type: 'local-http' as const,
+			url: 'http://guardian-container:3000'
+		};
+		expect(() =>
+			selectGuardianEndpoint(descriptor([container]), {
+				torEnabled: false,
+				allowLocalHttp: true
+			})
+		).to.throw(/no usable transport/);
+		expect(
+			selectGuardianEndpoint(descriptor([container]), {
+				torEnabled: false,
+				allowLocalHttpHost: (hostname) => hostname === 'guardian-container'
+			}).transportType
+		).to.equal('local-http');
+		// Providing the approval callback also enables plain loopback.
+		expect(
+			selectGuardianEndpoint(descriptor([local]), {
+				torEnabled: false,
+				allowLocalHttpHost: () => false
+			}).transportType
+		).to.equal('local-http');
+	});
+
+	it('requires a plausible v3 onion hostname and the http scheme', () => {
+		expect(() =>
+			selectGuardianEndpoint(
+				descriptor([{ type: 'onion-http', url: 'http://abc.onion' }]),
+				{ torEnabled: true }
+			)
+		).to.throw(/no usable transport/);
+		expect(() =>
+			selectGuardianEndpoint(
+				descriptor([
+					{ type: 'onion-http', url: `https://${'a'.repeat(56)}.onion` }
+				]),
+				{ torEnabled: true }
+			)
+		).to.throw(/no usable transport/);
+	});
+});
+
+describe('Guardian transport: client hardening', () => {
+	it('gates every verb on the advertised version range, once', async () => {
+		const calls: string[] = [];
+		const incompatible = new GuardianClient({
+			url: 'http://127.0.0.1:1',
+			guardianSetId: SET_ID,
+			transport: async (url): Promise<{ status: number; body: Buffer }> => {
+				calls.push(url);
+				return {
+					status: 200,
+					body: encodeInfoResponse({
+						guardianId: GUARDIAN_IDS[0],
+						minProtocolVersion: 2,
+						maxProtocolVersion: 3,
+						guardianSetIds: [SET_ID],
+						maxCiphertextBytes: 1024,
+						maxRecordsPerGet: 16,
+						rateLimitPerMinute: 0
+					})
+				};
+			}
+		});
+		const record = buildRecord({
+			epoch: 1n,
+			sequence: 1n,
+			previousHash: Buffer.alloc(32),
+			writerSecret: WRITER_1.secret
+		});
+		try {
+			await incompatible.putState(record);
+			expect.fail('signed material must not reach an incompatible guardian');
+		} catch (error) {
+			expect(error).to.be.instanceOf(GuardianTransportError);
+		}
+		expect(calls.length).to.equal(1);
+		expect(calls[0].endsWith('/info')).to.equal(true);
+
+		// A compatible guardian is probed exactly once across many verbs.
+		const okCalls: string[] = [];
+		const compatible = new GuardianClient({
+			url: 'http://127.0.0.1:1',
+			guardianSetId: SET_ID,
+			transport: async (url): Promise<{ status: number; body: Buffer }> => {
+				okCalls.push(url);
+				if (url.endsWith('/info')) {
+					return {
+						status: 200,
+						body: encodeInfoResponse({
+							guardianId: GUARDIAN_IDS[0],
+							minProtocolVersion: 1,
+							maxProtocolVersion: 1,
+							guardianSetIds: [SET_ID],
+							maxCiphertextBytes: 1024,
+							maxRecordsPerGet: 16,
+							rateLimitPerMinute: 0
+						})
+					};
+				}
+				return {
+					status: 200,
+					body: encodePutStateResponse({ status: GuardianStatus.OK })
+				};
+			}
+		});
+		expect((await compatible.putState(record)).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect((await compatible.putState(record)).status).to.equal(
+			GuardianStatus.OK
+		);
+		expect(okCalls.filter((u) => u.endsWith('/info')).length).to.equal(1);
+	});
+
+	it('refuses plaintext credentials to non-local hosts unless explicitly allowed', () => {
+		expect(
+			() =>
+				new GuardianClient({
+					url: 'http://203.0.113.9:8080',
+					guardianSetId: SET_ID,
+					auth: { type: 'bearer', token: 'leaky' }
+				})
+		).to.throw(/plaintext/);
+		// Loopback and onion targets are not plaintext-to-network.
+		const loopback = new GuardianClient({
+			url: 'http://127.0.0.1:9911',
+			guardianSetId: SET_ID,
+			auth: { type: 'bearer', token: 'fine' }
+		});
+		expect(loopback.url).to.contain('127.0.0.1');
+		// An isolated container network is an explicit, named exception.
+		const container = new GuardianClient({
+			url: 'http://guardian-container:3000',
+			guardianSetId: SET_ID,
+			auth: { type: 'macaroon', macaroon: 'AA==' },
+			allowUnencryptedAuth: true
+		});
+		expect(container.url).to.contain('guardian-container');
 	});
 });
 
