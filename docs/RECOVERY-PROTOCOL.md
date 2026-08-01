@@ -5,7 +5,7 @@ Replicated, cryptographically versioned state continuity for Lightning channels,
 Status: Phases 1 to 3 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279); Phases 4 to 7 not started
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
-Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed
+Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed. Applied an external design review of the wire draft: an explicit REGISTER_NODE genesis operation under a dedicated seed-derived recovery root (which is also the guardian namespace, keeping the Lightning node id out of the protocol), the writer lease separated from the log head so the post-takeover state is fully defined, a deterministic AES-GCM nonce construction, an exact SYNC_EPOCH validation algorithm, per-verb protobuf responses with 32-byte x-only keys throughout, mandatory transport authentication for non-local deployments, and guardian-set rotation honestly scoped to root re-registration plus SYNC_RECORD backfill
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -347,6 +347,8 @@ export interface GuardianReceipt {
 }
 ```
 
+Revision 4 refinement (from the wire specification review; exact bytes in docs/RECOVERY-GUARDIAN-WIRE.md): the sketches above conflate two separable pieces of guardian state, the WRITER LEASE (epoch, writer key) and the LOG HEAD (last record's sequence, hashes, and the epoch that record was written under). A takeover changes the lease and leaves the log head untouched, so between ACQUIRE_EPOCH and the new writer's first append the log head's recordEpoch lawfully trails the lease epoch; receipts sign the complete (lease, log head) state, which also gives genesis a clean zero-log-head encoding. Additionally, the guardian namespace is NOT the public Lightning node id: a dedicated seed-derived recovery root (HKDF info 'beignet-recovery-root-v1') authorizes an explicit REGISTER_NODE operation and every ACQUIRE_EPOCH, so a namespace can never be squatted by whoever asks first, and knowing a Lightning node id does not let anyone query its guardian history.
+
 Epoch acquisition is a compare-and-swap takeover, not a bare increment:
 
 ```ts
@@ -676,7 +678,8 @@ CLI daemon (`src/cli/`), for embedders such as beignet-umbrel, following the exi
 ```text
 BEIGNET_RECOVERY_MODE = off | peer-storage | async-remote | quorum
 BEIGNET_RECOVERY_GUARDIANS = comma-separated guardian URIs
-BEIGNET_RECOVERY_QUORUM = e.g. 2/3
+BEIGNET_RECOVERY_PROFILE = crash-v1 (the only accepted value in v1; no
+free-form quorum tuples, per 12.1)
 ```
 
 Plus REST endpoints on the daemon: `GET /recovery/status`, `POST /recovery/restore`.
@@ -753,7 +756,9 @@ Settled before Phase 4 implementation, as section 9 requires. Ratified on the tr
 4. The guardian is a VSS semantic extension, a VSS-compatible sibling service, never a client-side convention over generic VSS: a generic global-version compare-and-swap fences VERSIONS, not WRITERS; only a server-enforced epoch state machine revokes a superseded writer's lease permanently, and the receipt must be a signed, durable, cumulative object persisted in the same transaction as the record (see 12.2).
 5. Fault model v1: the named profile crash-v1 (2-of-3, crash-fault) only. No free-form quorum tuples. Product language says CFT quorum recovery, never trustless.
 6. Byzantine-ready encoding without Byzantine claims: guardian_set_id in every signed object, and certificate formats able to carry multiple signatures, so a future quorum system with proper intersection (for example 3-of-4) slots in without a wire break.
-7. Signing: canonical fixed-width transcripts under BIP340 tagged hashes; protobuf bytes are never signed, because protobuf serialization is not canonical. Receipts bind the record's frame hash AND the ciphertext hash, so retention is provable and attributable. Writer keys are fresh random per-epoch keys, never the node identity key and never seed-derived: a superseded device's writer key must die with it, and the seed alone must not be able to forge records for old epochs. Every request type is semantically idempotent. Guardian-set rotation in v1 is a fresh epoch acquisition under the new guardian_set_id.
+7. Signing: canonical fixed-width transcripts under BIP340 tagged hashes, all keys 32-byte x-only; protobuf bytes are never signed, because protobuf serialization is not canonical. Receipts bind the record's frame hash AND the ciphertext hash, so retention is provable and attributable. Writer keys are fresh random per-epoch keys, never the node identity key and never seed-derived: a superseded device's writer key must die with it, and the seed alone must not be able to forge records for old epochs. Every request type is semantically idempotent.
+8. Registration and namespace (revision 4 review): a dedicated seed-derived recovery root (info string 'beignet-recovery-root-v1') owns the guardian namespace. Its x-only public key IS the recovery_id; it authorizes REGISTER_NODE and co-signs every ACQUIRE_EPOCH, and it never signs records. This closes the genesis gap (nothing was defined between an empty guardian and a usable node) and keeps the Lightning node id out of the guardian protocol entirely.
+9. Guardian-set rotation in v1 is deliberately minimal and has NO in-protocol handoff object: the recovery root re-registers on the new set carrying the current lease and log head, records are backfilled via SYNC_RECORD (they are self-authenticating), and the old set is decommissioned operationally. ROTATE_SET is reserved for a future protocol version; the earlier one-line claim that rotation is just "a fresh epoch acquisition under the new set id" was not implementable as stated and is superseded by docs/RECOVERY-GUARDIAN-WIRE.md 5.9.
 
 ### 12.2 Versioned Storage Service comparison (revision 4)
 
@@ -778,10 +783,14 @@ ACQUIRE_EPOCH     global-version CAS         the CAS fences a VERSION, not a
                                              revokes the superseded writer, and
                                              no signed takeover certificate
                                              exists
-SYNC_RECORD       putObjects by a 3rd party  record-level self-authentication:
-                                             VSS authorizes CALLERS, so a
-                                             non-owner cannot repair a lagging
-                                             replica
+SYNC_RECORD       putObjects by a 3rd party  record-level VERIFICATION: a
+                                             restored client may well hold the
+                                             storage credentials, but generic
+                                             VSS cannot check writer signature,
+                                             epoch binding and chain position
+                                             before accepting a repair, so it
+                                             cannot safely accept third-party
+                                             submissions
 SYNC_EPOCH        (no equivalent)            threshold-verified adoption of a
                                              missed takeover
 ```
@@ -793,4 +802,4 @@ The four server-side extensions, precisely:
 3. Record-level self-authentication, writer signatures over canonical transcripts, so backfill by a restore device works after the original writer's key is gone (5.5).
 4. Quorum acknowledgment across INDEPENDENT operators as a client-side barrier discipline: the client counts receipts from distinct guardians of one committed set; VSS assumes a single service.
 
-What stays deliberately VSS-shaped so upstream alignment remains realistic: the server is blind to plaintext; one keyspace per node; strongly consistent read-your-writes per store; atomic multi-item semantics (record plus head advance in one transaction); and a compare-and-swap at the center of ownership transfer. If VSS later grows the four extensions, the guardian verbs become a VSS profile and the transcripts in docs/RECOVERY-GUARDIAN-WIRE.md port unchanged, because they never depended on the envelope.
+What stays deliberately VSS-shaped so upstream alignment remains realistic: the server is blind to plaintext; one keyspace per node; strongly consistent read-your-writes per store; atomic multi-item semantics (record plus head advance in one transaction); and a compare-and-swap at the center of ownership transfer. The reference guardian implementation SHOULD additionally reuse VSS deployment conventions where practical (HTTP service shape, authentication hooks, a transactional SQL store, rate limiting), and non-local deployments require authenticated access exactly as hosted VSS guidance does; open operation is reserved for local development. If VSS later grows the four extensions, the guardian verbs become a VSS profile and the transcripts in docs/RECOVERY-GUARDIAN-WIRE.md port unchanged, because they never depended on the envelope.
