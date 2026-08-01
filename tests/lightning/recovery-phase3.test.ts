@@ -933,4 +933,98 @@ describe('Recovery phase 3: review regressions', () => {
 		node.destroy();
 		storage.close();
 	});
+
+	it('never inlines a stale journal when the startup re-base fails', () => {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-p3-rebase-')),
+			'rebase.db'
+		);
+		const openFile = (): SqliteStorage => {
+			const s = new SqliteStorage(dbPath);
+			s.open();
+			return s;
+		};
+
+		// Run 1: recovery enabled; state A journaled.
+		const run1 = createNode(6, openFile(), true);
+		run1.createInvoice({ amountMsat: 1_000n, description: 'state-a' });
+		run1.destroy();
+		// Run 2: recovery disabled; state advances to B, journal stays at A.
+		const run2 = createNode(6, openFile(), false);
+		run2.createInvoice({ amountMsat: 2_000n, description: 'state-b' });
+		run2.destroy();
+
+		// Run 3: the re-base snapshot write fails (disk full). The retained
+		// journal is internally VALID but stale, which chain verification
+		// cannot see, so a failed re-base must prohibit inlining outright.
+		const run3Storage = openFile();
+		const failing = new Proxy(run3Storage, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'saveRecoveryFrame') {
+					return (): never => {
+						throw new Error('disk full');
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as IStorageBackend;
+		const run3 = createNode(6, failing, true);
+		const blob = (run3 as unknown as { ourPeerStorageBlob: Buffer | null })
+			.ourPeerStorageBlob;
+		expect(blob, 'SCB + locator capsule still composed').to.not.equal(null);
+		const capsule = decodeRecoveryCapsuleBlob(
+			blob!,
+			makeNodeConfig(6).nodePrivateKey
+		)!;
+		// The stale-but-valid journal must NOT ride; the locator still
+		// reports the stale head honestly instead of pretending none exists.
+		expect(capsule.inlineRecoveryState).to.equal(undefined);
+		expect(capsule.latestSequence > 0n).to.equal(true);
+		// And a restore of this capsule is Tier 1 only.
+		const target = openStorage();
+		const result = restoreFromRecoveryCapsule(
+			capsule,
+			target,
+			makeNodeConfig(6).nodePrivateKey
+		);
+		expect(result.tier).to.equal(1);
+		run3.destroy();
+		target.close();
+	});
+
+	it('tries every replica of a nonconflicting head before dropping lower', () => {
+		const { storage } = journaledStorage(2);
+		const good = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		// Two damaged replicas of the SAME head: one with a mangled inline
+		// payload, one with a broken SCB but a valid chain. Neither may stop
+		// the intact third replica from restoring this head, whatever the
+		// arrival order.
+		const badInline = encryptRecoveryCapsule(
+			{
+				...good.capsule,
+				inlineRecoveryState: Buffer.from('not even json', 'utf8')
+			},
+			NODE_SECRET
+		);
+		const badScb = encryptRecoveryCapsule(
+			{ ...good.capsule, encryptedScb: 'beignet-scb-v1:AAAA' },
+			NODE_SECRET
+		);
+		const target = openStorage();
+		const result = restoreBestRecoveryCapsule(
+			[badInline, badScb, good.blob],
+			target,
+			NODE_SECRET
+		);
+		expect(result.tier).to.equal(2);
+		expect(result.capsule.latestSequence).to.equal(good.capsule.latestSequence);
+		expect(dumpTables(target)).to.equal(dumpTables(storage));
+		storage.close();
+		target.close();
+	});
 });

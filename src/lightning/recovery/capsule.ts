@@ -263,6 +263,14 @@ export interface IComposeCapsuleOptions {
 	nodeSecret: Buffer;
 	/** Budget for the encrypted blob. Default CAPSULE_MAX_BYTES. */
 	maxBytes?: number;
+	/**
+	 * Permit inlining the journal (default true). Callers pass false when the
+	 * pre-compose re-base FAILED: an internally valid chain can still be
+	 * STALE relative to the live tables (a failed snapshot write leaves the
+	 * old chain fully verifiable), and staleness is exactly what chain
+	 * verification cannot see. The locator head fields still go out.
+	 */
+	allowInline?: boolean;
 }
 
 export interface IComposedCapsule {
@@ -308,7 +316,12 @@ export function composeRecoveryCapsule(
 	};
 
 	let frames: IStoredRecoveryFrame[] = [];
-	if (storage && tipSequence != null && lastSnapshot != null) {
+	if (
+		options.allowInline !== false &&
+		storage &&
+		tipSequence != null &&
+		lastSnapshot != null
+	) {
 		frames = storage.loadRecoveryFrames?.() ?? [];
 		const base = frames.find((row) => String(row.sequence) === lastSnapshot);
 		if (base) capsule.snapshotHash = base.frameHash;
@@ -570,25 +583,39 @@ export function restoreBestRecoveryCapsule(
 				);
 			}
 		}
-		// Same head, same hash: prefer the candidate carrying the inline
-		// journal (a peer may hold a degraded SCB + locator twin).
-		const candidate = group.find((c) => c.inlineRecoveryState) ?? group[0];
-		if (candidate.inlineRecoveryState && journalSupported(target)) {
-			try {
-				verifyInlineJournal(candidate, nodeSecret);
-			} catch {
-				// Invalid Tier 2 at this height: the next-highest head gets
-				// its turn (spec 5.4: highest WHOSE HASH CHAIN VALIDATES).
-				i = j;
-				continue;
+		// Same head, same hash: a peer may hold a degraded SCB + locator
+		// twin, or a damaged copy of the inline journal. EVERY replica of
+		// this nonconflicting head gets its turn before the head is given up
+		// on; which peer's blob happened to arrive first must not decide the
+		// outcome. Candidate-level defects (broken inline chain, broken SCB)
+		// move on to the next replica; only when the whole group is
+		// exhausted does the next-lower head get its turn (spec 5.4: highest
+		// WHOSE HASH CHAIN VALIDATES).
+		if (journalSupported(target)) {
+			for (const candidate of group) {
+				if (!candidate.inlineRecoveryState) continue;
+				try {
+					verifyInlineJournal(candidate, nodeSecret);
+					decodeScb(candidate.encryptedScb, nodeSecret);
+				} catch {
+					continue;
+				}
+				// Throws from here PROPAGATE: after a candidate validated,
+				// failures are target integrity problems (dirty database,
+				// write errors), not candidate defects, and trying another
+				// blob against a half-written target would be wrong.
+				const result = restoreFromRecoveryCapsule(
+					candidate,
+					target,
+					nodeSecret
+				);
+				return {
+					...result,
+					capsule: candidate,
+					newestSeenHead,
+					rejectedCandidates: candidates.length - 1
+				};
 			}
-			const result = restoreFromRecoveryCapsule(candidate, target, nodeSecret);
-			return {
-				...result,
-				capsule: candidate,
-				newestSeenHead,
-				rejectedCandidates: candidates.length - 1
-			};
 		}
 		i = j;
 	}

@@ -2704,9 +2704,11 @@ export class LightningNode extends EventEmitter {
 	 * The journal re-bases FIRST (prepareForReplication): a journal left
 	 * stale by a recovery-disabled period must never be replicated, or the
 	 * capsule's SCB and its inline Tier 2 journal would describe different
-	 * points in time. If the re-base itself fails (corrupt journal store),
-	 * composition's own verification drops the inline journal and an
-	 * SCB-only capsule goes out instead; both failures are logged.
+	 * points in time. A FAILED re-base prohibits inlining outright
+	 * (allowInline false): a failed snapshot write leaves the old chain
+	 * internally valid yet possibly stale, and staleness is exactly what
+	 * composition's chain verification cannot see. The SCB and the locator
+	 * head fields still go out; both failure modes are logged.
 	 */
 	private composeRecoveryCapsuleBlob(): Buffer | null {
 		if (
@@ -2716,9 +2718,11 @@ export class LightningNode extends EventEmitter {
 		) {
 			return null;
 		}
+		let allowInline = true;
 		try {
 			this.recoveryJournal?.prepareForReplication();
 		} catch (err) {
+			allowInline = false;
 			this.emitStructuredLog('peer', 'recovery_capsule_rebase_failed', {
 				error: err instanceof Error ? err.message : String(err)
 			});
@@ -2737,7 +2741,8 @@ export class LightningNode extends EventEmitter {
 			const { blob, inlineError } = composeRecoveryCapsule({
 				storage: this.storage,
 				encryptedScb,
-				nodeSecret: this.nodePrivkey
+				nodeSecret: this.nodePrivkey,
+				allowInline
 			});
 			if (inlineError) {
 				this.emitStructuredLog('peer', 'recovery_capsule_inline_dropped', {
