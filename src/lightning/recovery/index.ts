@@ -21,3 +21,4 @@ export * from './guardian-http';
 export * from './guardian-client';
 export * from './writer-lease';
 export * from './guardian-replication';
+export * from './restore-driver';
