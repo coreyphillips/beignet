@@ -122,6 +122,15 @@ export class Peer extends EventEmitter {
 	// Connection timeouts (Fix 3.1)
 	private connectTimeoutMs: number;
 	private handshakeTimeoutMs: number;
+	/** disconnect() was called after the current connect/accept began. */
+	private aborted = false;
+	/**
+	 * Rejects the in-flight connect/accept. destroySocket strips the socket
+	 * listeners BEFORE destroying it and net.Socket emits its close a tick
+	 * later, so an abort that relied on socket events would leave the
+	 * establishment promise pending forever.
+	 */
+	private establishmentAbort: ((err: Error) => void) | null = null;
 
 	constructor(options: IPeerOptions) {
 		super();
@@ -155,9 +164,19 @@ export class Peer extends EventEmitter {
 		}
 
 		this.state = 'connecting';
+		this.aborted = false;
 
 		if (this.createSocketFn) {
 			// Use custom socket factory (e.g. SOCKS5/Tor proxy) with handshake timeout
+			let abortEstablish: (err: Error) => void = () => undefined;
+			const abortPromise = new Promise<never>((_, reject) => {
+				abortEstablish = reject;
+			});
+			abortPromise.catch(() => {
+				// Rejection is consumed by whichever race is in flight; this
+				// guard exists for aborts that land between the races.
+			});
+			this.establishmentAbort = abortEstablish;
 			try {
 				const socketPromise = this.createSocketFn(this.host, this.port);
 				// Don't leak the socket if the factory resolves after we timed out
@@ -165,7 +184,7 @@ export class Peer extends EventEmitter {
 				let connectTimedOut = false;
 				socketPromise
 					.then((s) => {
-						if (connectTimedOut) s.destroy();
+						if (connectTimedOut || this.aborted) s.destroy();
 					})
 					.catch(() => {
 						/* connection already failed; nothing to clean up */
@@ -176,14 +195,28 @@ export class Peer extends EventEmitter {
 						rej(new Error('Connection timeout'));
 					}, this.connectTimeoutMs)
 				);
-				this.socket = await Promise.race([socketPromise, timeoutPromise]);
+				this.socket = await Promise.race([
+					socketPromise,
+					timeoutPromise,
+					abortPromise
+				]);
+				if (this.aborted) {
+					// disconnect() ran while the factory was pending; the socket
+					// only exists now, so it dies now, before any handshake byte.
+					throw new Error('Peer aborted while connecting');
+				}
 				this.socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
 				// Set handshake timeout
 				this.socket.setTimeout(this.handshakeTimeoutMs);
 				this.socket.once('timeout', () => {
 					this.socket?.destroy(new Error('Handshake timeout'));
 				});
-				await this.doHandshakeAndInit(false);
+				const handshake = this.doHandshakeAndInit(false);
+				handshake.catch(() => {
+					// Consumed via the race; without this, an abort winning the
+					// race leaves the losing handshake's rejection unhandled.
+				});
+				await Promise.race([handshake, abortPromise]);
 				this.socket.setTimeout(0); // Clear handshake timeout
 				this.state = 'ready';
 				this.setupMessageLoop();
@@ -193,10 +226,16 @@ export class Peer extends EventEmitter {
 				this.state = 'disconnected';
 				this.destroySocket();
 				throw err;
+			} finally {
+				this.establishmentAbort = null;
 			}
 		} else {
 			// Direct TCP connection with connect timeout (Fix 3.1)
 			return new Promise<void>((resolve, reject) => {
+				this.establishmentAbort = (err): void => {
+					this.state = 'disconnected';
+					reject(err);
+				};
 				this.socket = net.connect(this.port, this.host);
 
 				// Set TCP connect timeout
@@ -236,6 +275,8 @@ export class Peer extends EventEmitter {
 						reject(err);
 					}
 				});
+			}).finally(() => {
+				this.establishmentAbort = null;
 			});
 		}
 	}
@@ -252,6 +293,7 @@ export class Peer extends EventEmitter {
 
 		this.socket = socket;
 		this.state = 'handshaking';
+		this.aborted = false;
 		socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
 
 		// Set handshake timeout for inbound connections
@@ -260,8 +302,20 @@ export class Peer extends EventEmitter {
 			socket.destroy(new Error('Inbound handshake timeout'));
 		});
 
+		let abortEstablish: (err: Error) => void = () => undefined;
+		const abortPromise = new Promise<never>((_, reject) => {
+			abortEstablish = reject;
+		});
+		abortPromise.catch(() => {
+			// Consumed via the race below when an abort lands mid-handshake.
+		});
+		this.establishmentAbort = abortEstablish;
 		try {
-			await this.doHandshakeAndInit(true);
+			const handshake = this.doHandshakeAndInit(true);
+			handshake.catch(() => {
+				// Consumed via the race; see connect().
+			});
+			await Promise.race([handshake, abortPromise]);
 			this.socket!.setTimeout(0); // Clear handshake timeout
 			this.state = 'ready';
 			this.setupMessageLoop();
@@ -270,6 +324,8 @@ export class Peer extends EventEmitter {
 		} catch (err) {
 			this.destroySocket();
 			throw err;
+		} finally {
+			this.establishmentAbort = null;
 		}
 	}
 
@@ -321,6 +377,14 @@ export class Peer extends EventEmitter {
 	 * Disconnect from the peer gracefully.
 	 */
 	disconnect(): void {
+		// An in-flight connect/accept must not survive this call: the abort
+		// flag stops the handshake at its next boundary, a socket factory
+		// that resolves later destroys its socket instead of adopting it, and
+		// the establishment promise is rejected HERE, because destroySocket
+		// removes the socket listeners the failure guards depend on.
+		this.aborted = true;
+		this.establishmentAbort?.(new Error('Peer aborted'));
+		this.establishmentAbort = null;
 		this.state = 'closing';
 		this.stopPingTimer();
 		this.destroySocket();
@@ -337,6 +401,9 @@ export class Peer extends EventEmitter {
 	 * cleanly so connect()/acceptInbound() surface it.
 	 */
 	private async doHandshakeAndInit(isResponder: boolean): Promise<void> {
+		if (this.aborted) {
+			throw new Error('Peer aborted before handshake');
+		}
 		const socket = this.socket;
 		if (!socket) throw new Error('No socket for handshake');
 

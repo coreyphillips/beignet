@@ -17,6 +17,8 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import net from 'net';
+import { EventEmitter } from 'events';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	CRASH_V1_PROFILE,
@@ -43,6 +45,7 @@ import {
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import { Peer } from '../../src/lightning/transport/peer';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -174,6 +177,36 @@ async function waitFor(cond: () => boolean, timeoutMs = 8_000): Promise<void> {
 			throw new Error('waitFor timed out');
 		}
 		await new Promise((r) => setTimeout(r, 25));
+	}
+}
+
+/**
+ * Minimal IDuplexTransport that records every write and destroy, so the
+ * mid-handshake fencing tests can assert EXACTLY what left the node.
+ */
+class FakeTransport extends EventEmitter {
+	writes: Buffer[] = [];
+	destroyed = false;
+	readonly writableLength = 0;
+	readonly remoteAddress = '127.0.0.1';
+	readonly remotePort = 1;
+	write(data: Uint8Array | string, cb?: (err?: Error) => void): boolean {
+		this.writes.push(Buffer.from(data as Uint8Array));
+		cb?.();
+		return true;
+	}
+	setTimeout(_timeout: number, _callback?: () => void): this {
+		return this;
+	}
+	setKeepAlive(_enable?: boolean, _initialDelay?: number): this {
+		return this;
+	}
+	destroy(error?: Error): this {
+		if (this.destroyed) return this;
+		this.destroyed = true;
+		if (error && this.listenerCount('error') > 0) this.emit('error', error);
+		this.emit('close', Boolean(error));
+		return this;
 	}
 }
 
@@ -747,6 +780,172 @@ describe('Recovery phase 5: startup quarantine', () => {
 		} finally {
 			pmA.destroy();
 			pmB.destroy();
+		}
+	});
+
+	it('freezeConnections aborts an OUTBOUND connection mid-handshake', async function () {
+		// The race: a dial passes the gate, then the freeze lands while the
+		// socket/Noise/init sequence is still in flight. Such a connection is
+		// invisible to listPeers(), so the freeze must reach into the pending
+		// set, or the handshake completes and registers AFTER the fence. A
+		// silent TCP server stalls the dial deterministically between act 1
+		// and act 2.
+		this.timeout(20_000);
+		const pm = new PeerManager({ localPrivateKey: sha('freeze-out-local') });
+		const peerPub = getPublicKey(sha('freeze-out-remote')).toString('hex');
+		const accepted: net.Socket[] = [];
+		let bytesFromDialer = 0;
+		const silent = net.createServer((sock) => {
+			accepted.push(sock);
+			sock.on('data', (chunk) => {
+				bytesFromDialer += chunk.length;
+			});
+		});
+		await new Promise<void>((resolve) => silent.listen(0, resolve));
+		const port = (silent.address() as net.AddressInfo).port;
+		let connected = 0;
+		pm.on('peer:connect', () => {
+			connected++;
+		});
+		try {
+			const dial = pm.connectPeer(peerPub, '127.0.0.1', port);
+			dial.catch(() => {});
+			// The dial is mid-handshake: act 1 written, act 2 never coming.
+			await waitFor(() => accepted.length === 1 && bytesFromDialer > 0);
+			const bytesBeforeFreeze = bytesFromDialer;
+			expect((pm as any).pendingPeers.size).to.equal(1);
+
+			pm.freezeConnections();
+
+			let dialErr: unknown;
+			try {
+				await dial;
+			} catch (err) {
+				dialErr = err;
+			}
+			expect(dialErr).to.not.equal(undefined);
+			expect(pm.listPeers()).to.have.length(0);
+			expect((pm as any).pendingPeers.size).to.equal(0);
+			expect(connected).to.equal(0);
+			// Not one byte after the freeze.
+			await new Promise((r) => setTimeout(r, 200));
+			expect(bytesFromDialer).to.equal(bytesBeforeFreeze);
+			// And a frozen manager refuses everything, permanently.
+			let refrozen: unknown;
+			try {
+				await pm.connectPeer(peerPub, '127.0.0.1', port);
+			} catch (err) {
+				refrozen = err;
+			}
+			expect(String(refrozen)).to.match(/permanently frozen/);
+			let listenErr: unknown;
+			try {
+				await pm.listen(0);
+			} catch (err) {
+				listenErr = err;
+			}
+			expect(String(listenErr)).to.match(/permanently frozen/);
+		} finally {
+			pm.destroy();
+			await new Promise<void>((resolve) => silent.close(() => resolve()));
+			for (const sock of accepted) sock.destroy();
+		}
+	});
+
+	it('freezeConnections aborts an INBOUND connection mid-handshake', async () => {
+		// Inbound variant: the socket was accepted and the responder is
+		// waiting for act 1 when the freeze lands. The fake transport records
+		// every write and destroy, so the assertion is exact: destroyed, no
+		// registration, and not a single byte written by the responder.
+		const pm = new PeerManager({ localPrivateKey: sha('freeze-in-local') });
+		const fake = new FakeTransport();
+		try {
+			(pm as any).handleInboundConnection(fake);
+			expect((pm as any).pendingPeers.size).to.equal(1);
+			expect(fake.destroyed).to.equal(false);
+
+			pm.freezeConnections();
+
+			expect(fake.destroyed).to.equal(true);
+			expect((pm as any).pendingPeers.size).to.equal(0);
+			expect(pm.listPeers()).to.have.length(0);
+			// Release the stall: bytes arriving now draw no response.
+			fake.emit('data', Buffer.alloc(50, 7));
+			await new Promise((r) => setTimeout(r, 100));
+			expect(fake.writes).to.have.length(0);
+			expect(pm.listPeers()).to.have.length(0);
+		} finally {
+			pm.destroy();
+		}
+	});
+
+	it('a socket factory resolving after disconnect is destroyed before any byte', async () => {
+		// The sharpest late case (Tor/SOCKS/WebSocket): disconnect() lands
+		// while the factory is still pending, so there is no socket to
+		// destroy yet. The factory's socket must die the moment it exists,
+		// before act 1 is written.
+		let resolveFactory: (socket: FakeTransport) => void = () => {};
+		const peer = new Peer({
+			localPrivateKey: sha('late-factory-local'),
+			remotePublicKey: getPublicKey(sha('late-factory-remote')),
+			host: 'example.invalid',
+			port: 9735,
+			createSocket: () =>
+				new Promise<FakeTransport>((resolve) => {
+					resolveFactory = resolve;
+				})
+		});
+		const attempt = peer.connect();
+		attempt.catch(() => {});
+		peer.disconnect();
+		const fake = new FakeTransport();
+		resolveFactory(fake);
+		let err: unknown;
+		try {
+			await attempt;
+		} catch (e) {
+			err = e;
+		}
+		expect(String(err)).to.match(/aborted/i);
+		expect(fake.destroyed).to.equal(true);
+		expect(fake.writes).to.have.length(0);
+	});
+
+	it('freezeConnections clears reconnect timers for DISCONNECTED peers and disables rescheduling', async () => {
+		// disconnectPeer clears timers per pubkey, but reconnect timers also
+		// exist for peers that are currently disconnected, which no
+		// listPeers() sweep reaches; a fenced node must not wake and redial
+		// forever.
+		const pm = new PeerManager({
+			localPrivateKey: sha('freeze-timers'),
+			autoReconnect: true
+		});
+		const peerPub = getPublicKey(sha('freeze-timers-remote')).toString('hex');
+		// A port that refuses immediately: bind then close.
+		const probe = net.createServer();
+		await new Promise<void>((resolve) => probe.listen(0, resolve));
+		const deadPort = (probe.address() as net.AddressInfo).port;
+		await new Promise<void>((resolve) => probe.close(() => resolve()));
+		try {
+			let dialErr: unknown;
+			try {
+				await pm.connectPeer(peerPub, '127.0.0.1', deadPort);
+			} catch (err) {
+				dialErr = err;
+			}
+			expect(dialErr).to.not.equal(undefined);
+			// The failed dial armed a reconnect timer for a peer that is NOT
+			// in listPeers().
+			expect((pm as any).reconnectTimers.size).to.equal(1);
+			expect(pm.listPeers()).to.have.length(0);
+
+			pm.freezeConnections();
+			expect((pm as any).reconnectTimers.size).to.equal(0);
+			// Rescheduling is permanently disabled, not merely cleared once.
+			(pm as any).scheduleReconnect(peerPub);
+			expect((pm as any).reconnectTimers.size).to.equal(0);
+		} finally {
+			pm.destroy();
 		}
 	});
 

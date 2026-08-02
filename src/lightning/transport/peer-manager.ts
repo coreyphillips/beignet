@@ -223,6 +223,11 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		if (this.permanentlyFrozen) {
+			throw new Error(
+				`Connections are permanently frozen; refusing dial to peer ${pubkey}`
+			);
+		}
 		if (this.connectionGate && !this.connectionGate()) {
 			throw new Error(
 				`Connection gate refused dial to peer ${pubkey}: writer ownership is not confirmed`
@@ -281,6 +286,9 @@ export class PeerManager extends EventEmitter {
 		});
 
 		this.setupPeerListeners(pubkey, peer);
+		// Visible to freezeConnections() while establishing: a freeze aborts
+		// the handshake instead of letting it complete and register later.
+		this.pendingPeers.add(peer);
 
 		try {
 			await peer.connect();
@@ -291,6 +299,20 @@ export class PeerManager extends EventEmitter {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
 			throw err;
+		} finally {
+			this.pendingPeers.delete(peer);
+		}
+		// Recheck AFTER the async establishment: a freeze or gate closure
+		// that landed mid-handshake must win over registration.
+		if (
+			this.permanentlyFrozen ||
+			(this.connectionGate && !this.connectionGate())
+		) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			throw new Error(
+				`Connection to peer ${pubkey} was invalidated while establishing`
+			);
 		}
 		// The peer may have dialed US while our handshake was in flight. Apply
 		// the deterministic tie-break (see preferOutboundTo): if the registered
@@ -428,6 +450,47 @@ export class PeerManager extends EventEmitter {
 
 	private connectionGate: (() => boolean) | null = null;
 
+	/** freezeConnections() ran; no connection may ever be established again. */
+	private permanentlyFrozen = false;
+
+	/**
+	 * Peers whose connect/accept is still in flight. They are invisible to
+	 * listPeers() until registration, so a freeze must sweep this set or an
+	 * in-flight handshake survives it and registers afterwards.
+	 */
+	private pendingPeers = new Set<Peer>();
+
+	/**
+	 * Permanently stop ALL connection activity: close listeners, clear every
+	 * reconnect and stability timer (they can exist for peers that are
+	 * currently disconnected, which no listPeers() sweep reaches), abort
+	 * every connection still ESTABLISHING, and drop every registered peer.
+	 * Used by the recovery startup gate when a newer writer epoch is proven
+	 * (spec 5.6 hard-freeze): after this, not one more byte leaves the node
+	 * toward a Lightning peer, handshake bytes included. Irreversible.
+	 */
+	freezeConnections(): void {
+		if (this.permanentlyFrozen) return;
+		this.permanentlyFrozen = true;
+		this.stopListening();
+		for (const timer of this.reconnectTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.reconnectTimers.clear();
+		this.reconnectDelays.clear();
+		for (const timer of this.stabilityTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.stabilityTimers.clear();
+		for (const peer of [...this.pendingPeers]) {
+			peer.disconnect();
+		}
+		this.pendingPeers.clear();
+		for (const pubkey of [...this.peers.keys()]) {
+			this.disconnectPeer(pubkey);
+		}
+	}
+
 	/**
 	 * Install a gate consulted before an inbound message is dispatched to
 	 * any registered handler or the generic 'message' event. Defense in
@@ -563,6 +626,9 @@ export class PeerManager extends EventEmitter {
 	 * Start listening for inbound peer connections.
 	 */
 	async listen(port: number, host = '0.0.0.0'): Promise<void> {
+		if (this.permanentlyFrozen) {
+			throw new Error('Connections are permanently frozen; refusing to listen');
+		}
 		if (this.server) {
 			throw new Error('Already listening');
 		}
@@ -595,6 +661,9 @@ export class PeerManager extends EventEmitter {
 	 * additive: coexists with (does not replace) the TCP listener.
 	 */
 	async listenWebSocket(port: number, host = '0.0.0.0'): Promise<void> {
+		if (this.permanentlyFrozen) {
+			throw new Error('Connections are permanently frozen; refusing to listen');
+		}
 		if (this.wsServer) {
 			throw new Error('Already listening for WebSocket peers');
 		}
@@ -675,10 +744,13 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private handleInboundConnection(socket: IDuplexTransport): void {
-		// Quarantined or fenced (recovery 5.6): destroy the socket BEFORE the
-		// BOLT 8 handshake, so a node that cannot prove writer ownership
-		// never authenticates or exchanges init with anyone.
-		if (this.connectionGate && !this.connectionGate()) {
+		// Quarantined, fenced or frozen (recovery 5.6): destroy the socket
+		// BEFORE the BOLT 8 handshake, so a node that cannot prove writer
+		// ownership never authenticates or exchanges init with anyone.
+		if (
+			this.permanentlyFrozen ||
+			(this.connectionGate && !this.connectionGate())
+		) {
 			socket.destroy();
 			return;
 		}
@@ -698,9 +770,22 @@ export class PeerManager extends EventEmitter {
 			networks: this.networks
 		});
 
+		// Visible to freezeConnections() while the handshake is in flight.
+		this.pendingPeers.add(peer);
+
 		peer
 			.acceptInbound(socket)
 			.then(() => {
+				this.pendingPeers.delete(peer);
+				// Recheck AFTER the handshake: a freeze or gate closure that
+				// landed mid-establishment must win over registration.
+				if (
+					this.permanentlyFrozen ||
+					(this.connectionGate && !this.connectionGate())
+				) {
+					peer.disconnect();
+					return;
+				}
 				const pubkey = peer.remotePublicKey.toString('hex');
 
 				const existing = this.peers.get(pubkey);
@@ -753,6 +838,7 @@ export class PeerManager extends EventEmitter {
 			})
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
+				this.pendingPeers.delete(peer);
 			});
 	}
 
@@ -827,6 +913,7 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private scheduleReconnect(pubkey: string): void {
+		if (this.permanentlyFrozen) return; // frozen nodes never redial
 		if (this.reconnectTimers.has(pubkey)) return; // already scheduled
 		if (this.reconnectCandidates(pubkey).length === 0) return;
 

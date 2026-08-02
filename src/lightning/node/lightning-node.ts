@@ -2893,18 +2893,12 @@ export class LightningNode extends EventEmitter {
 		});
 		gate.onFenced(() => {
 			// Hard-freeze (spec 5.6): a superseded writer must not exchange
-			// another wire message with anyone. Message-level gates already
-			// refuse traffic; dropping connections and listeners removes the
-			// surface entirely rather than trusting per-message suppression.
-			if (!this.peerManager) return;
-			this.peerManager.stopListening();
-			for (const peer of this.peerManager.listPeers()) {
-				try {
-					this.peerManager.disconnectPeer(peer.pubkey);
-				} catch {
-					// Already gone; the goal is zero live connections.
-				}
-			}
+			// another wire message with anyone. freezeConnections is the
+			// PeerManager's own irreversible teardown: listeners, ALL
+			// reconnect timers (including ones for currently-disconnected
+			// peers), connections still mid-handshake (invisible to
+			// listPeers), and every registered peer.
+			this.peerManager?.freezeConnections();
 		});
 	}
 
