@@ -37,10 +37,13 @@ import {
 	computeGuardianSetId,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	genesisLogHead,
 	generateWriterKey,
 	loadWriterLease,
 	nodeGuardianTransport,
+	registerTranscriptHash,
 	signAcquisition,
+	signTranscript,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -637,6 +640,122 @@ describe('Recovery phase 5: restore driver', () => {
 			// already closed
 		}
 		served[2].guardian.close();
+		live.storage.close();
+		target.close();
+	});
+
+	it('resumes after a crash between the takeover and lease promotion', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(3);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+		const expectedDump = dumpTables(live.storage);
+
+		// Crash AFTER the CAS grants the epoch but BEFORE the lease is
+		// durable, by failing the installation transaction. The writer key
+		// for a granted epoch must survive in the pending record, and the
+		// partially applied install must roll back completely.
+		const target = openStorage();
+		let failInstall = true;
+		const brittle = new Proxy(target, {
+			get(t, prop, receiver): unknown {
+				if (prop === 'saveRecoveryFrame' && failInstall) {
+					return (row: unknown): void => {
+						t.saveRecoveryFrame!(row as never);
+						throw new Error('crash during installation');
+					};
+				}
+				const value = Reflect.get(t, prop, receiver);
+				return typeof value === 'function' ? value.bind(t) : value;
+			}
+		}) as IStorageBackend;
+
+		const firstEvents: IRestoreEvent[] = [];
+		try {
+			await driverFor(brittle, bind(served), firstEvents).restore();
+			expect.fail('the installation was supposed to fail');
+		} catch (error) {
+			expect((error as Error).message).to.contain('crash during installation');
+		}
+		expect(firstEvents.some((e) => e.type === 'epoch:acquired')).to.equal(true);
+		// The key for the granted epoch is still on disk...
+		const pendingRaw = target.getRecoveryMeta!(
+			RESTORE_META_KEYS.pendingAcquisition
+		);
+		expect(pendingRaw, 'the pending key survived the crash').to.not.equal(null);
+		const pending = JSON.parse(pendingRaw as string) as {
+			newEpoch: string;
+			writerPublicKey: string;
+		};
+		// ...no lease exists yet, and the install rolled back entirely.
+		expect(loadWriterLease(target).state).to.equal('missing');
+		expect(target.loadRecoveryFrames()).to.have.length(0);
+		expect(target.loadAllPreimages()).to.have.length(0);
+
+		// A NEW driver on the same database resumes: same epoch and key, no
+		// duplicate frames, byte-identical tables, and the pending record
+		// retires only once the lease exists.
+		failInstall = false;
+		const resumeEvents: IRestoreEvent[] = [];
+		const result = await driverFor(
+			target,
+			bind(served),
+			resumeEvents
+		).restore();
+		expect(resumeEvents.some((e) => e.type === 'epoch:resumed')).to.equal(true);
+		expect(result.lease.epoch).to.equal(BigInt(pending.newEpoch));
+		expect(result.lease.writerPublicKey.toString('hex')).to.equal(
+			pending.writerPublicKey
+		);
+		expect(dumpTables(target)).to.equal(expectedDump);
+		expect(loadWriterLease(target).state).to.equal('present');
+		expect(
+			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition)
+		).to.equal(null);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('does not call one holder plus two unknowns an unregistered namespace', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(1);
+		// Only G1 ever learns about the namespace: a partially replicated
+		// registration, NOT an empty guardian set. Reporting nothing-to-restore
+		// here would invite a second genesis over a live namespace.
+		const root = ROOT;
+		const writer = generateWriterKey();
+		const initialState: GuardianState = {
+			recoveryId: root.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: writer.publicKey },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		expect(
+			(
+				await served[0].client.register({
+					protocolVersion: 1,
+					guardianSetId: SET_ID,
+					initialState,
+					rootSignature: signTranscript(
+						registerTranscriptHash(SET_ID, initialState),
+						root.rootSecret
+					)
+				})
+			).status
+		).to.equal(GuardianStatus.OK);
+
+		const target = openStorage();
+		try {
+			await driverFor(target, bind(served)).restore();
+			expect.fail('an inconsistent namespace must not restore');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			// The refusal must NOT be unknown-namespace: something holds it.
+			expect((error as RestoreRefusedError).reason).to.equal('no-quorum');
+		}
+		await shutdown(served);
 		live.storage.close();
 		target.close();
 	});

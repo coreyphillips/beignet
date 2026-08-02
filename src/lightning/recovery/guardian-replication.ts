@@ -343,23 +343,22 @@ export class GuardianReplicator {
 		const heads = await boundFanOut(this.config.guardians, (client) =>
 			client.getHead(recoveryId)
 		);
-		// A possibly_stale guardian cannot prove its store intact (wire 5.3),
-		// so it never counts toward a decision about what exists.
-		const answered = heads.filter(
-			(entry) =>
-				entry.result !== undefined && entry.result.possiblyStale !== true
+		// Two DIFFERENT kinds of evidence, and conflating them is dangerous.
+		//
+		// RECENCY (what the current head and owner are) requires a guardian
+		// that can prove its store intact, so possibly_stale answers are
+		// excluded: an uncertain store cannot establish what is current.
+		//
+		// EXISTENCE (whether this namespace was ever registered) does NOT.
+		// A possibly_stale guardian holding a valid signed registration still
+		// proves the namespace exists, because a receipt remains a true
+		// statement about what that guardian stored even after a rollback
+		// (wire 4.2). Ignoring it would let two unknown guardians authorize a
+		// SECOND GENESIS for a namespace that already exists.
+		const allAnswered = heads.filter((entry) => entry.result !== undefined);
+		const answered = allAnswered.filter(
+			(entry) => entry.result?.possiblyStale !== true
 		);
-		const distinct = new Set(
-			answered.map((entry) => (entry.guardianId as Buffer).toString('hex'))
-		);
-		if (distinct.size < this.config.required) {
-			this.emit({
-				type: 'namespace:no-quorum',
-				detail: `only ${distinct.size} of ${this.config.guardians.length} distinct guardians answered usefully`
-			});
-			return { outcome: 'no-quorum', responded: distinct.size };
-		}
-
 		// Negative answers carry no signature, so they count by BOUND identity,
 		// and only for endpoints that PROVED that identity through INFO.
 		const unknown = new Set(
@@ -370,10 +369,27 @@ export class GuardianReplicator {
 				.map((entry) => (entry.guardianId as Buffer).toString('hex'))
 				.filter((id) => verified.has(id))
 		);
-		const existing = answered.filter(
-			(entry) =>
-				entry.result?.status === GuardianStatus.OK && entry.result.state
-		);
+		// EXISTENCE IS EVALUATED FIRST, before any quorum gate. A namespace
+		// that provably exists can never be re-registered, no matter how few
+		// guardians are reachable, and answering no-quorum here would be both
+		// less informative and, with a stale holder beside two unknowns, one
+		// refactor away from authorizing a second genesis.
+		// Existence evidence spans STALE guardians too, and every piece of it
+		// must be signed: a receipt that verifies under a member key, is
+		// signed by the endpoint's bound identity, covers the state beside
+		// it, and names this namespace. An unsigned state is not evidence of
+		// anything.
+		const existing = allAnswered.filter((entry) => {
+			const response = entry.result;
+			if (!response || response.status !== GuardianStatus.OK) return false;
+			const state = response.state;
+			const receipt = response.receipt;
+			if (!state || !receipt) return false;
+			if (!verifyGuardianReceipt(receipt, this.config.context)) return false;
+			if (!receipt.guardianId.equals(entry.guardianId as Buffer)) return false;
+			if (!statesEqual(receipt.state, state)) return false;
+			return state.recoveryId.equals(recoveryId);
+		});
 		const other = answered.filter(
 			(entry) =>
 				entry.result?.status !== GuardianStatus.ERR_UNKNOWN_NODE &&
@@ -395,14 +411,30 @@ export class GuardianReplicator {
 				statesEqual(state, pendingRegistration.initialState)
 			);
 		if (existing.length > 0 && !ourPartial) {
-			// The namespace exists and it is not this device's half-finished
-			// registration. Restore or takeover decides what happens next;
-			// registering over it would be a second genesis.
+			// The namespace exists, proven by at least one signed state, and
+			// it is not this device's half-finished registration. Restore or
+			// takeover decides what happens next; registering over it would be
+			// a second genesis. This holds even when the only guardian that
+			// knows is possibly_stale: it cannot tell us what is CURRENT, but
+			// it can prove the namespace is not free.
 			this.emit({
 				type: 'namespace:exists',
 				detail: `${existing.length} guardians already serve this namespace`
 			});
 			return { outcome: 'exists-remotely', states: existingStates };
+		}
+
+		// Nothing proves the namespace exists. Registering is only safe with
+		// a RECENCY quorum, which excludes uncertain stores.
+		const distinct = new Set(
+			answered.map((entry) => (entry.guardianId as Buffer).toString('hex'))
+		);
+		if (distinct.size < this.config.required) {
+			this.emit({
+				type: 'namespace:no-quorum',
+				detail: `only ${distinct.size} of ${this.config.guardians.length} distinct guardians answered usefully`
+			});
+			return { outcome: 'no-quorum', responded: distinct.size };
 		}
 		if (!ourPartial && unknown.size < this.config.required) {
 			const detail =

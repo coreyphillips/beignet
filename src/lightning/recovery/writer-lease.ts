@@ -608,12 +608,41 @@ export function saveWriterLease(
 	requireEncryptedSecretStorage(storage, options.allowUnencryptedSecrets);
 	const encoded = encodeWriterLease(lease);
 	storage.transaction(() => {
-		storage.setRecoveryMeta!(META_WRITER_LEASE, encoded);
-		storage.setRecoveryMeta!(
-			JOURNAL_META_KEYS.writerEpoch,
-			lease.epoch.toString()
-		);
+		writeLeaseRecords(storage, lease, encoded);
 	});
+}
+
+/** The lease writes themselves, for callers that own the transaction. */
+function writeLeaseRecords(
+	storage: IStorageBackend,
+	lease: IWriterLeaseKeys,
+	encoded: string
+): void {
+	storage.setRecoveryMeta!(META_WRITER_LEASE, encoded);
+	storage.setRecoveryMeta!(
+		JOURNAL_META_KEYS.writerEpoch,
+		lease.epoch.toString()
+	);
+}
+
+/**
+ * Validate and encode a lease WITHOUT writing it, so a caller can make the
+ * lease part of a larger atomic step. Used by restore promotion, where the
+ * lease must land in the same transaction that retires the pending
+ * acquisition holding the only other copy of the writer key.
+ */
+export function prepareWriterLease(
+	storage: IStorageBackend,
+	lease: IWriterLeaseKeys,
+	options: IWriterLeasePersistOptions = {}
+): (transactionalStorage: IStorageBackend) => void {
+	requireLeaseStorage(storage);
+	assertConsistent(lease, (m) => new Error(`refusing to persist lease: ${m}`));
+	requireEncryptedSecretStorage(storage, options.allowUnencryptedSecrets);
+	const encoded = encodeWriterLease(lease);
+	return (transactionalStorage: IStorageBackend): void => {
+		writeLeaseRecords(transactionalStorage, lease, encoded);
+	};
 }
 
 /**

@@ -67,8 +67,8 @@ import { RecoveryFrame } from './types';
 import {
 	IWriterLeaseKeys,
 	generateWriterKey,
+	prepareWriterLease,
 	requireEncryptedSecretStorage,
-	saveWriterLease,
 	signAcquisition
 } from './writer-lease';
 import * as ecc from '@bitcoinerlab/secp256k1';
@@ -379,7 +379,16 @@ export class RestoreDriver {
 				.map((entry) => (entry.guardianId as Buffer).toString('hex'))
 				.filter((id) => verified.has(id))
 		);
-		if (unknown.size >= this.config.required) {
+		// Only when NOBODY holds the namespace is it truly unregistered. A
+		// quorum of "unknown" beside one guardian that DOES hold it is an
+		// inconsistent or partially replicated namespace, which is a
+		// different problem: it must not be reported as nothing-to-restore,
+		// and it must never authorize a fresh genesis.
+		const anyHolds = answered.some(
+			(entry) =>
+				entry.result?.status === GuardianStatus.OK && entry.result.state
+		);
+		if (unknown.size >= this.config.required && !anyHolds) {
 			throw new RestoreRefusedError(
 				'unknown-namespace',
 				'the guardian set does not serve this namespace; there is nothing to restore'
@@ -746,7 +755,12 @@ export class RestoreDriver {
 					guardianCertificates: certificates,
 					confirmedAt: this.clock()
 				};
-				this.clearPending();
+				// The pending record is deliberately KEPT. A quorum has granted
+				// this epoch to this key, but the lease that records it is
+				// written only after the download, verification and
+				// reconstruction below; deleting the key here would lose it
+				// for a granted epoch if any of that fails. It is retired in
+				// the same transaction that promotes it to a lease.
 				this.emit(
 					'epoch:acquired',
 					`epoch ${pending.newEpoch} acquired with ${certificates.length} certificates over sequence ${pending.expectedState.logHead.sequence}`
@@ -889,7 +903,25 @@ export class RestoreDriver {
 		);
 
 		const targetStorage = this.config.target;
+		// Validate and encode the lease BEFORE opening the transaction, so a
+		// rejected lease cannot abort a half-applied installation.
+		const writeLease = prepareWriterLease(targetStorage, acquired.lease, {
+			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+		});
+		// ONE transaction installs everything: frames, journal metadata,
+		// reconstructed application state, the lease, and the retirement of
+		// the pending acquisition. Every step is synchronous, so a crash
+		// anywhere rolls the whole installation back and the restore is
+		// simply re-runnable: no duplicate frames, no half-reconstructed
+		// tables, and the writer key still on disk in the pending record
+		// until the lease that replaces it is durable.
 		targetStorage.transaction(() => {
+			// A previous interrupted attempt may have left frames behind; the
+			// install is idempotent over them because nothing is authoritative
+			// until this transaction commits.
+			targetStorage.deleteRecoveryFramesBelow?.(
+				Number(certified.logHead.sequence) + 1
+			);
 			for (const row of rows) targetStorage.saveRecoveryFrame!(row);
 			targetStorage.setRecoveryMeta!(
 				JOURNAL_META_KEYS.tipSequence,
@@ -903,12 +935,12 @@ export class RestoreDriver {
 				JOURNAL_META_KEYS.lastSnapshot,
 				String(rows[0]?.sequence ?? 0)
 			);
-		});
-		reconstructFromFrames(targetStorage, frames);
-		// The lease is written LAST and carries the new epoch, so the journal
-		// stamps every subsequent frame under the epoch this device owns.
-		saveWriterLease(targetStorage, acquired.lease, {
-			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+			reconstructFromFrames(targetStorage, frames);
+			// The lease carries the granted epoch, so the journal stamps later
+			// frames under the epoch this device owns; the pending record
+			// retires WITH it, never before.
+			writeLease(targetStorage);
+			this.clearPending();
 		});
 		this.emit(
 			'restore:complete',

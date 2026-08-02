@@ -37,13 +37,16 @@ import {
 	computeGuardianSetId,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
+	genesisLogHead,
 	generateWriterKey,
 	REPLICATION_META_KEYS,
 	decodeGetHeadResponse,
 	encodeGetHeadResponse,
 	loadWriterLease,
 	nodeGuardianTransport,
+	registerTranscriptHash,
 	signAcquisition,
+	signTranscript,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
@@ -310,6 +313,77 @@ describe('Recovery phase 5: namespace establishment', () => {
 		}
 		await shutdown(served);
 		storage.close();
+	});
+
+	it('lets a possibly-stale holder veto a fresh registration', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const first = journaledStorage(1);
+		// G1 alone holds the namespace, and it reports possibly_stale: it
+		// cannot tell anyone what is CURRENT, but its signed state still
+		// proves the namespace is not free.
+		const initialState: GuardianState = {
+			recoveryId: ROOT.recoveryId,
+			lease: { epoch: 1n, writerPublicKey: generateWriterKey().publicKey },
+			origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+			logHead: genesisLogHead()
+		};
+		expect(
+			(
+				await served[0].client.register({
+					protocolVersion: 1,
+					guardianSetId: SET_ID,
+					initialState,
+					rootSignature: signTranscript(
+						registerTranscriptHash(SET_ID, initialState),
+						ROOT.rootSecret
+					)
+				})
+			).status
+		).to.equal(GuardianStatus.OK);
+
+		// G1 confesses an uncertain store while keeping its signed state and
+		// receipt; G2 and G3 never saw the namespace. Without the existence
+		// veto, those two unknowns would form a quorum and authorize a SECOND
+		// GENESIS over a namespace that already exists.
+		const staleG1: IBoundGuardianClient = {
+			expectedGuardianId: served[0].id,
+			client: new GuardianClient({
+				url: served[0].client.url,
+				guardianSetId: SET_ID,
+				transport: async (
+					url,
+					init
+				): Promise<{ status: number; body: Buffer }> => {
+					const response = await nodeGuardianTransport()(url, init);
+					if (!url.endsWith('/get_head')) return response;
+					const decoded = decodeGetHeadResponse(response.body);
+					return {
+						status: response.status,
+						body: encodeGetHeadResponse({ ...decoded, possiblyStale: true })
+					};
+				}
+			})
+		};
+		const guardians: IBoundGuardianClient[] = [
+			staleG1,
+			{ expectedGuardianId: served[1].id, client: served[1].client },
+			{ expectedGuardianId: served[2].id, client: served[2].client }
+		];
+
+		const second = journaledStorage(1);
+		const decision = await replicator(
+			second.storage,
+			guardians
+		).ensureNamespace();
+		expect(decision.outcome).to.equal('exists-remotely');
+		expect(loadWriterLease(second.storage).state).to.equal('missing');
+		// And nobody re-registered it: G2 still knows nothing.
+		expect((await served[1].client.getHead(ROOT.recoveryId)).status).to.equal(
+			GuardianStatus.ERR_UNKNOWN_NODE
+		);
+		await shutdown(served);
+		first.storage.close();
+		second.storage.close();
 	});
 
 	it('refuses to register without a read quorum', async () => {
