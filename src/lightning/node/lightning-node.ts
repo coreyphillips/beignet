@@ -1443,6 +1443,55 @@ export class LightningNode extends EventEmitter {
 	 * which withholds those sends: a message whose justifying state is not on
 	 * disk must never reach the peer.
 	 */
+	/**
+	 * Commit a freshly reconstructed recovery channel BEFORE it is exposed
+	 * through the ChannelManager. persistChannel cannot serve here: it
+	 * resolves the channel from the manager (not yet registered) and
+	 * reports failure only through an event, while this install must gate
+	 * on durability. Returns whether the commit landed; one
+	 * PERSISTENCE_ERROR is emitted on failure.
+	 */
+	private persistRecoveredChannel(
+		channel: Channel,
+		peerPubkey: string,
+		keyIndex: number | null | undefined
+	): boolean {
+		if (!this.storage || !this.recovery) return false;
+		const channelId = channel.getChannelId();
+		if (!channelId) return false;
+		const channelIdHex = channelId.toString('hex');
+		const mutations: RecoveryMutation[] = [
+			{
+				type: 'channel_state',
+				channelId: channelIdHex,
+				state: channel.getFullState(),
+				peerPubkey
+			}
+		];
+		if (keyIndex != null) {
+			mutations.push({
+				type: 'channel_key_index',
+				channelId: channelIdHex,
+				channelIndex: keyIndex
+			});
+		}
+		const result = this.recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations,
+			outboundMessages: [],
+			reportedByCaller: true
+		});
+		if (!result.committed) {
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				channelId,
+				message: `Failed to persist recovered channel: ${result.error?.message}`,
+				timestamp: Date.now()
+			} as ILightningError);
+		}
+		return result.committed;
+	}
+
 	private persistChannel(
 		channelId: Buffer,
 		request?: IChannelPersistRequest
@@ -3669,12 +3718,29 @@ export class LightningNode extends EventEmitter {
 
 			const channel = new Channel(state);
 			channel.channelKeyIndex = entry.channelKeyIndex;
+			// Durability BEFORE visibility: committing the recovered state
+			// first means a failed commit installs nothing (the address above
+			// is the only, harmless, orphan) instead of an undurable
+			// in-memory channel reported as recovering, which a retry would
+			// then skip as already existing until a restart cleared it.
+			if (
+				!this.persistRecoveredChannel(
+					channel,
+					entry.peerNodeId,
+					entry.channelKeyIndex
+				)
+			) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: 'failed to persist recovered channel'
+				});
+				continue;
+			}
 			this.channelManager.restoreChannel(
 				channel,
 				entry.peerNodeId,
 				entry.channelKeyIndex
 			);
-			this.persistChannel(channelId);
 			recovering.push(entry.channelId);
 
 			this.emitStructuredLog('channel', 'recovery_started', {

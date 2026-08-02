@@ -482,6 +482,74 @@ describe('SCB restore', function () {
 					faulted.destroy();
 				}
 
+				// Symmetric failure path: address persistence succeeds but the
+				// CHANNEL commit fails. Durability gates visibility: nothing
+				// may be installed in the manager, recovering must not claim
+				// success, and the same node stays retryable without a
+				// restart (an undurable in-memory channel would be skipped as
+				// already existing forever).
+				const storage3 = new SqliteStorage(':memory:');
+				storage3.open();
+				const originalSaveChannel = storage3.saveChannel.bind(storage3);
+				(
+					storage3 as unknown as {
+						saveChannel: typeof storage3.saveChannel;
+					}
+				).saveChannel = (): void => {
+					throw new Error('injected channel persistence failure');
+				};
+				const chanFaulted = new LightningNode({
+					...makeNodeConfig(1),
+					storage: storage3
+				});
+				let persistenceErrors = 0;
+				chanFaulted.on('node:error', (e: { code?: string }) => {
+					if (e.code === 'PERSISTENCE_ERROR') persistenceErrors++;
+				});
+				try {
+					const failed =
+						await chanFaulted.recoverFromStaticChannelBackup(entries);
+					expect(failed.recovering).to.not.include(entries[0].channelId);
+					expect(failed.skipped).to.have.length(1);
+					expect(failed.skipped[0].reason).to.contain(
+						'failed to persist recovered channel'
+					);
+					expect(persistenceErrors).to.equal(1);
+					// Address-first ordering: only the harmless orphan address.
+					expect(
+						storage3
+							.loadAllPeerAddresses()
+							.some((a) => a.pubkey === entries[0].peerNodeId)
+					).to.equal(true);
+					expect(
+						chanFaulted.getChannelManager().getChannel(channelId)
+					).to.equal(undefined);
+					expect(
+						storage3
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(false);
+
+					// Same node, same SCB, storage recovered: retry succeeds.
+					(
+						storage3 as unknown as {
+							saveChannel: typeof storage3.saveChannel;
+						}
+					).saveChannel = originalSaveChannel;
+					const retried =
+						await chanFaulted.recoverFromStaticChannelBackup(entries);
+					expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+					expect(chanFaulted.getChannelManager().getChannel(channelId)).to
+						.exist;
+					expect(
+						storage3
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(true);
+				} finally {
+					chanFaulted.destroy();
+				}
+
 				// Funding outpoint watched: the script was fetched from the chain
 				// and its scripthash subscribed.
 				expect(backend.getTransactionCalls).to.include(fundingDisplayTxid);
