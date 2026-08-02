@@ -3634,61 +3634,25 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 
-			// Local key material: per-channel keys for the recorded index, or the
-			// node-level basepoints for legacy (null-index) channels. Using the
-			// SAME derivation as the original open is what makes the peer's DLP
-			// proof verifiable and the to_remote output ours to claim.
-			const material = this.channelManager.getRecoveryChannelMaterial(
-				entry.channelKeyIndex
-			);
-			const stateParams = {
-				temporaryChannelId: Buffer.from(channelId),
-				fundingSatoshis: BigInt(entry.fundingSatoshis),
-				pushMsat: 0n,
-				localConfig: material.localConfig,
-				localBasepoints: material.basepoints,
-				localPerCommitmentSeed: material.perCommitmentSeed
-			};
-			const state =
-				entry.role === 'ACCEPTOR'
-					? createAcceptorState({
-							...stateParams,
-							// Placeholder only - nulled right below. The peer's basepoints
-							// are not in the backup; classification and to_remote resolution
-							// intentionally work without them (see classifyCommitmentTx).
-							remoteBasepoints: material.basepoints,
-							remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
-					  })
-					: createOpenerState(stateParams);
-			state.remoteBasepoints = null;
-			state.channelId = channelId;
-			state.fundingTxid = Buffer.from(entry.fundingTxid, 'hex');
-			state.fundingOutputIndex = entry.fundingOutputIndex;
-			state.channelType = entry.channelType
-				? Buffer.from(entry.channelType, 'hex')
-				: null;
-			// Liquidity ads: restore the lease fields so the DLP classifier builds
-			// the lease-locked to_remote variant and the sweep sets its nLockTime.
-			state.leaseExpiry = entry.leaseExpiry;
-			state.isLessor = entry.isLessor;
-			state.leaseCommitBlockheight = entry.leaseCommitBlockheight;
-			state.localCommitmentNumber = 0n;
-			state.remoteCommitmentNumber = 0n;
-			// Balances are unknown after data loss; the sweep takes its amount from
-			// the on-chain to_remote output, so never report a fabricated balance.
-			state.localBalanceMsat = 0n;
-			state.remoteBalanceMsat = 0n;
-			state.announceChannel = false;
-			// We KNOW we have no usable commitment state: refuse every local
-			// broadcast (forceClose refuses, scanStuckChannels skips) and wait for
-			// the peer's force-close on-chain.
-			state.state = ChannelState.ERRORED;
-			state.dataLossDetected = true;
-			// The durable peer-close disposition (recovery 5.6): if the
-			// immediate connection attempt below fails or the process
-			// restarts, startup dialing selects this channel and reconnect
-			// regenerates the close request.
-			state.recoveryCloseReason = 'local-data-loss';
+			// Key derivation and channel construction happen behind a per-entry
+			// boundary. Structural validation cannot promise that a configured
+			// channelKeyDeriver (the caller's own callback) will not throw, and
+			// a throw here must cost THIS channel only, never the entries
+			// queued behind it.
+			let state: IChannelState;
+			let channel: Channel;
+			try {
+				state = this.buildRecoveryChannelState(entry, channelId);
+				channel = new Channel(state);
+				channel.channelKeyIndex = entry.channelKeyIndex;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				skipped.push({
+					channelId: entry.channelId,
+					reason: `failed to derive recovery channel keys: ${message}`
+				});
+				continue;
+			}
 
 			// The disposition is useless without an address to dial after a
 			// restart, and the backup's addresses were known-good persisted
@@ -3727,8 +3691,6 @@ export class LightningNode extends EventEmitter {
 				}
 			}
 
-			const channel = new Channel(state);
-			channel.channelKeyIndex = entry.channelKeyIndex;
 			// Durability BEFORE visibility: committing the recovered state
 			// first means a failed commit installs nothing (the address above
 			// is the only, harmless, orphan) instead of an undurable
@@ -3747,11 +3709,23 @@ export class LightningNode extends EventEmitter {
 				});
 				continue;
 			}
-			this.channelManager.restoreChannel(
-				channel,
-				entry.peerNodeId,
-				entry.channelKeyIndex
-			);
+			try {
+				this.channelManager.restoreChannel(
+					channel,
+					entry.peerNodeId,
+					entry.channelKeyIndex
+				);
+			} catch (err) {
+				// The state is already durable, so a restart or a retry picks
+				// this channel up; what must not happen is the registration
+				// failure taking the remaining entries down with it.
+				const message = err instanceof Error ? err.message : String(err);
+				skipped.push({
+					channelId: entry.channelId,
+					reason: `failed to register recovered channel: ${message}`
+				});
+				continue;
+			}
 			recovering.push(entry.channelId);
 
 			this.emitStructuredLog('channel', 'recovery_started', {
@@ -3790,6 +3764,74 @@ export class LightningNode extends EventEmitter {
 		}
 
 		return { recovering, skipped };
+	}
+
+	/**
+	 * Rebuild one backup entry's channel state: local key material for the
+	 * recorded index (or the node-level basepoints for a legacy null-index
+	 * channel), the funding outpoint, the channel type that decides which
+	 * to_remote variant the sweep looks for, and the broadcast-banned
+	 * recovery disposition.
+	 *
+	 * Using the SAME derivation as the original open is what makes the peer's
+	 * DLP proof verifiable and the to_remote output ours to claim. Throws are
+	 * the caller's to isolate: they belong to this entry alone.
+	 */
+	private buildRecoveryChannelState(
+		entry: IScbChannelEntry,
+		channelId: Buffer
+	): IChannelState {
+		const material = this.channelManager.getRecoveryChannelMaterial(
+			entry.channelKeyIndex
+		);
+		const stateParams = {
+			temporaryChannelId: Buffer.from(channelId),
+			fundingSatoshis: BigInt(entry.fundingSatoshis),
+			pushMsat: 0n,
+			localConfig: material.localConfig,
+			localBasepoints: material.basepoints,
+			localPerCommitmentSeed: material.perCommitmentSeed
+		};
+		const state =
+			entry.role === 'ACCEPTOR'
+				? createAcceptorState({
+						...stateParams,
+						// Placeholder only - nulled right below. The peer's basepoints
+						// are not in the backup; classification and to_remote resolution
+						// intentionally work without them (see classifyCommitmentTx).
+						remoteBasepoints: material.basepoints,
+						remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+				  })
+				: createOpenerState(stateParams);
+		state.remoteBasepoints = null;
+		state.channelId = channelId;
+		state.fundingTxid = Buffer.from(entry.fundingTxid, 'hex');
+		state.fundingOutputIndex = entry.fundingOutputIndex;
+		state.channelType = entry.channelType
+			? Buffer.from(entry.channelType, 'hex')
+			: null;
+		// Liquidity ads: restore the lease fields so the DLP classifier builds
+		// the lease-locked to_remote variant and the sweep sets its nLockTime.
+		state.leaseExpiry = entry.leaseExpiry;
+		state.isLessor = entry.isLessor;
+		state.leaseCommitBlockheight = entry.leaseCommitBlockheight;
+		state.localCommitmentNumber = 0n;
+		state.remoteCommitmentNumber = 0n;
+		// Balances are unknown after data loss; the sweep takes its amount from
+		// the on-chain to_remote output, so never report a fabricated balance.
+		state.localBalanceMsat = 0n;
+		state.remoteBalanceMsat = 0n;
+		state.announceChannel = false;
+		// We KNOW we have no usable commitment state: refuse every local
+		// broadcast (forceClose refuses, scanStuckChannels skips) and wait for
+		// the peer's force-close on-chain.
+		state.state = ChannelState.ERRORED;
+		state.dataLossDetected = true;
+		// The durable peer-close disposition (recovery 5.6): if the immediate
+		// connection attempt fails or the process restarts, startup dialing
+		// selects this channel and reconnect regenerates the close request.
+		state.recoveryCloseReason = 'local-data-loss';
+		return state;
 	}
 
 	/**

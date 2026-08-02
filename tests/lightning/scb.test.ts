@@ -378,18 +378,57 @@ describe('Static Channel Backup (SCB)', function () {
 			).to.equal(null);
 		});
 
-		it('tolerates absent ADVISORY fields, never absent recovery material', function () {
-			// Recovery is passive without addresses and reads the channel type
-			// rather than the taproot/anchor booleans, so their absence must
-			// not forfeit a channel's funds. Everything the reconstruction
-			// consumes stays mandatory.
+		it('tolerates advisory absence and the LEGACY shape, never absent recovery material', function () {
+			// Advisory: recovery is passive without addresses, and it reads the
+			// channel type rather than the taproot/anchor booleans, so their
+			// absence must not forfeit a channel's funds.
 			const advisory = { ...makeValidScbEntry() } as Record<string, unknown>;
 			delete advisory.peerAddresses;
-			delete advisory.channelType;
 			delete advisory.isTaproot;
 			delete advisory.isAnchor;
-			delete advisory.channelKeyIndex;
 			expect(validateScbEntry(advisory)).to.equal(null);
+
+			// LEGACY, not advisory: a missing channelKeyIndex means the
+			// node-level basepoints and a missing channelType means the
+			// untyped static_remotekey channel. Both are accepted because
+			// backups predating per-channel keys and channel types are still
+			// recoverable, not because the fields do not matter.
+			const legacy = { ...makeValidScbEntry() } as Record<string, unknown>;
+			delete legacy.channelKeyIndex;
+			delete legacy.channelType;
+			expect(validateScbEntry(legacy)).to.equal(null);
+
+			// A modern entry cannot claim the legacy shape AND a modern
+			// commitment format: reconstructing it would look for a
+			// static_remotekey P2WPKH its commitment never pays.
+			for (const claim of [{ isAnchor: true }, { isTaproot: true }]) {
+				expect(
+					validateScbEntry({ ...legacy, ...claim }),
+					JSON.stringify(claim)
+				).to.match(/channelType is required/);
+				expect(
+					validateScbEntry({
+						...makeValidScbEntry(),
+						...claim,
+						channelType: ''
+					})
+				).to.match(/channelType is required/);
+			}
+
+			// A hardened BIP32 path component stops at 2^31 - 1; a larger
+			// index is not a legacy channel, it is an underivable one.
+			expect(
+				validateScbEntry({
+					...makeValidScbEntry(),
+					channelKeyIndex: 0x80000000
+				})
+			).to.equal('invalid channelKeyIndex');
+			expect(
+				validateScbEntry({
+					...makeValidScbEntry(),
+					channelKeyIndex: 0x7fffffff
+				})
+			).to.equal(null);
 
 			for (const field of [
 				'channelId',

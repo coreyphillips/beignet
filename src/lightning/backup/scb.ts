@@ -37,6 +37,13 @@ const SCB_HKDF_INFO = 'beignet-scb-v1';
 const MAX_FUNDING_SATOSHIS = 21_000_000n * 100_000_000n;
 /** Bitcoin's own limit on a transaction's output count bounds the index. */
 const MAX_OUTPUT_INDEX = 0xffffffff;
+/**
+ * channelKeyIndex is a HARDENED BIP32 path component in the default deriver
+ * (m/1017'/coinType'/channelIndex'), so anything above 2^31 - 1 is not a
+ * derivable index at all: it throws inside the deriver instead of producing
+ * key material.
+ */
+const MAX_BIP32_DERIVATION_INDEX = 0x7fffffff;
 
 export interface IScbChannelEntry {
 	/** Permanent channel id (hex). */
@@ -141,6 +148,15 @@ function isIndex(value: unknown, max: number): boolean {
  * BOUNDARY: reaching the reconstruction with a garbage funding txid installs
  * a channel whose funds can never be swept, and a garbage satoshi string
  * throws out of the recovery loop, taking the channels behind it down too.
+ *
+ * Absence is tolerated for exactly two reasons, and they are different:
+ * `peerAddresses` and the taproot/anchor booleans are ADVISORY (recovery is
+ * passive without addresses, and the channel type, not the booleans, picks
+ * the output script), while an absent `channelKeyIndex` or `channelType` is
+ * the LEGACY shape of a pre-per-channel-key, pre-typed channel. A modern
+ * entry that CONTRADICTS itself, claiming taproot or anchors with no usable
+ * channel type, is refused rather than reconstructed against the wrong
+ * to_remote script.
  */
 export function validateScbEntry(entry: unknown): string | null {
 	if (!entry || typeof entry !== 'object') return 'entry is not an object';
@@ -179,12 +195,13 @@ export function validateScbEntry(entry: unknown): string | null {
 	if (funding <= 0n || funding > MAX_FUNDING_SATOSHIS) {
 		return 'fundingSatoshis out of range';
 	}
-	// null (or absent) is the legacy channel that derives from the node-level
-	// basepoints; a present index must be a real derivation index.
+	// null (or absent) is the LEGACY channel that derives from the node-level
+	// basepoints, kept working for backups written before per-channel keys;
+	// a present index must be one the deriver can actually derive.
 	if (
 		e.channelKeyIndex !== null &&
 		e.channelKeyIndex !== undefined &&
-		!isIndex(e.channelKeyIndex, Number.MAX_SAFE_INTEGER)
+		!isIndex(e.channelKeyIndex, MAX_BIP32_DERIVATION_INDEX)
 	) {
 		return 'invalid channelKeyIndex';
 	}
@@ -208,6 +225,15 @@ export function validateScbEntry(entry: unknown): string | null {
 		(e.isAnchor !== undefined && typeof e.isAnchor !== 'boolean')
 	) {
 		return 'isTaproot and isAnchor must be booleans';
+	}
+	// A channel that says it is taproot or anchor cannot ALSO be the untyped
+	// legacy shape: reconstructing it without its type would look for a
+	// static_remotekey P2WPKH that its commitment never pays.
+	if (
+		(e.isTaproot === true || e.isAnchor === true) &&
+		(typeof e.channelType !== 'string' || e.channelType.length === 0)
+	) {
+		return 'channelType is required for a taproot or anchor channel';
 	}
 	// Liquidity-ads fields are optional, but present means usable: the sweep
 	// derives a lease CSV and an nLockTime from them.

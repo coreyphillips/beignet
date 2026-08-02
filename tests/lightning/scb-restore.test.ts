@@ -830,6 +830,91 @@ describe('SCB restore', function () {
 				node.destroy();
 			}
 		});
+
+		it('isolates an underivable channel key index from later entries', async function () {
+			// channelKeyIndex is a HARDENED BIP32 component
+			// (m/1017'/coinType'/channelIndex'), so 0x80000000 is not a
+			// derivable index: on a real mnemonic node it throws inside the
+			// deriver. Reaching the deriver at all would abort the whole
+			// recovery, taking every valid channel behind it.
+			const good = backupEntries()[0];
+			const bad = {
+				...good,
+				channelId: '11'.repeat(32),
+				channelKeyIndex: 0x80000000
+			};
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = LightningNode.fromMnemonic(
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				{ network: Network.REGTEST, storage }
+			);
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([bad, good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped).to.deep.equal([
+					{ channelId: bad.channelId, reason: 'invalid channelKeyIndex' }
+				]);
+				expect(
+					node
+						.getChannelManager()
+						.getChannel(Buffer.from(good.channelId, 'hex'))
+				).to.exist;
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('isolates a THROWING key deriver from later entries', async function () {
+			// Defense in depth for the same class: channelKeyDeriver is the
+			// caller's own callback, so structural validation cannot promise
+			// it will not throw for an index it dislikes. The failure must
+			// cost that channel alone.
+			const good = backupEntries(3)[0];
+			const bad = { ...good, channelId: '22'.repeat(32), channelKeyIndex: 5 };
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const base = makeNodeConfig(1);
+			const node = new LightningNode({
+				...base,
+				storage,
+				channelKeyDeriver: (index: number) => {
+					if (index === 5) throw new Error('deriver refused index 5');
+					const privkeys = makePrivkeys(makeSeed(index + 50));
+					return {
+						fundingPrivkey: privkeys[0],
+						basepoints: makeBasepoints(privkeys),
+						perCommitmentSeed: makeSeed(index + 60),
+						htlcBasepointSecret: privkeys[4],
+						revocationBasepointSecret: privkeys[1],
+						paymentBasepointSecret: privkeys[2],
+						delayedPaymentBasepointSecret: privkeys[3]
+					};
+				}
+			});
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([bad, good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped).to.have.length(1);
+				expect(result.skipped[0].channelId).to.equal(bad.channelId);
+				expect(result.skipped[0].reason).to.contain(
+					'failed to derive recovery channel keys'
+				);
+				expect(result.skipped[0].reason).to.contain('refused index 5');
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+			} finally {
+				node.destroy();
+			}
+		});
 	});
 
 	// ───────── BeignetNode.restoreFromScb guards ─────────
