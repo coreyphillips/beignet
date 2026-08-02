@@ -844,7 +844,8 @@ describe('Recovery phase 5: restore driver', () => {
 		// Guardian replication is best effort until the Phase 6 barriers, so
 		// the certified head can trail what the lost device actually did with
 		// its peers: a restored channel must come back with its commitment
-		// broadcast forbidden until reestablish proves the state current.
+		// broadcast forbidden, and Phase 5 deliberately has NO way to skip
+		// the marking; only a Phase 6 verified provenance proof will.
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		// The channel exists BEFORE the journal's bootstrap snapshot, so the
@@ -916,91 +917,6 @@ describe('Recovery phase 5: restore driver', () => {
 		expect(storage.loadChannel(channelId)!.state.stateUncertain).to.equal(
 			undefined
 		);
-		await shutdown(served);
-		storage.close();
-		target.close();
-	});
-
-	it('a wire-safe provenance certificate leaves restored channels resumable', async () => {
-		// The Phase 6 barrier's guarantee, supplied explicitly: the writer
-		// released no wire message beyond the certified head. Only THAT, and
-		// never a compatible channel_reestablish, entitles a restored channel
-		// to resume without the StateUncertain marking.
-		const served = await Promise.all([serve(0), serve(1), serve(2)]);
-		const storage = openStorage();
-		const chanSeed = crypto
-			.createHash('sha256')
-			.update(Buffer.from('wire-safe-channel'))
-			.digest();
-		const basepointKeys = Array.from({ length: 6 }, (_, i) =>
-			crypto
-				.createHash('sha256')
-				.update(chanSeed)
-				.update(Buffer.from([i]))
-				.digest()
-		);
-		const channelState = createOpenerState({
-			temporaryChannelId: Buffer.alloc(32, 0xc6),
-			fundingSatoshis: 500_000n,
-			pushMsat: 0n,
-			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-			localBasepoints: {
-				fundingPubkey: getPublicKey(basepointKeys[0]),
-				revocationBasepoint: getPublicKey(basepointKeys[1]),
-				paymentBasepoint: getPublicKey(basepointKeys[2]),
-				delayedPaymentBasepoint: getPublicKey(basepointKeys[3]),
-				htlcBasepoint: getPublicKey(basepointKeys[4]),
-				firstPerCommitmentPoint: getPublicKey(basepointKeys[5])
-			},
-			localPerCommitmentSeed: crypto
-				.createHash('sha256')
-				.update(Buffer.from('wire-safe-seed'))
-				.digest()
-		});
-		const channelId = Buffer.alloc(32, 0xc6).toString('hex');
-		storage.saveChannel(channelId, channelState, '02'.padEnd(66, 'cd'));
-
-		const journal = new RecoveryJournal(
-			storage,
-			deriveRecoveryMasterKey(NODE_SECRET),
-			NODE_ID,
-			ROOT.recoveryId
-		);
-		const manager = new RecoveryManager(storage, { journal });
-		manager.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations: [
-				{
-					type: 'payment_preimage',
-					paymentHash: Buffer.alloc(32, 0xbb).toString('hex'),
-					preimage: Buffer.alloc(32, 0xbb)
-				}
-			],
-			outboundMessages: []
-		});
-		const rep = replicatorFor(storage, bind(served));
-		const decision = await rep.ensureNamespace();
-		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
-
-		const target = openStorage();
-		const driver = new RestoreDriver({
-			target,
-			guardians: bind(served),
-			context: CONTEXT,
-			required: CRASH_V1_PROFILE.required,
-			recoveryRoot: ROOT,
-			nodeSecret: NODE_SECRET,
-			nodeId: NODE_ID,
-			clock,
-			// Covers any certified head this small fixture can produce.
-			wireSafeThroughSequence: 1_000_000n
-		});
-		await driver.restore();
-
-		const restored = target.loadChannel(channelId);
-		expect(restored).to.not.equal(null);
-		// Proven exact by storage provenance: no uncertainty marking.
-		expect(restored!.state.stateUncertain).to.equal(undefined);
 		await shutdown(served);
 		storage.close();
 		target.close();

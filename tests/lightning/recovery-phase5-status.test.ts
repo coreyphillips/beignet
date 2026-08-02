@@ -54,6 +54,10 @@ import {
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { ChannelRecoveryStatus } from '../../src/lightning/recovery';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { Network } from '../../src/lightning/invoice/types';
 
 bitcoin.initEccLib(ecc);
 
@@ -366,6 +370,10 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(opener.getRecoveryStatus()).to.equal(
 			ChannelRecoveryStatus.LocalDataLoss
 		);
+		// The durable peer-close disposition rides the same transition.
+		expect(opener.getFullState().recoveryCloseReason).to.equal(
+			'local-data-loss'
+		);
 		// The invariant, at the action level: force close refuses.
 		const refusal = opener.forceClose(new ChannelSigner(openerPrivkeys[0]));
 		expect(refusal).to.have.length(1);
@@ -406,6 +414,9 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		const actions = opener.handleReestablish(cleanReestablishFor(opener));
 		expect(opener.getFullState().stateUncertain).to.equal(true);
 		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(opener.getFullState().recoveryCloseReason).to.equal(
+			'state-uncertain'
+		);
 		// Persist FIRST, then the wire error asking the peer to close.
 		expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
 		const errSend = findSendAction(actions, MessageType.ERROR);
@@ -546,6 +557,124 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(opener.getRecoveryStatus()).to.equal(
 			ChannelRecoveryStatus.LocalDataLoss
 		);
+	});
+
+	it('the peer-close request survives a crash and is re-sent on reconnect', function () {
+		// The reviewer's crash point: ERRORED plus the disposition commit,
+		// then the process dies BEFORE the error reaches the socket. The
+		// request must not die with it: the persisted disposition regenerates
+		// the deterministic error on the next reconnect.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		opener.getFullState().stateUncertain = true;
+		opener.markForReestablish();
+		// The exchange routes to the DLP path... and the error send is LOST.
+		opener.handleReestablish(cleanReestablishFor(opener));
+		expect(opener.getFullState().recoveryCloseReason).to.equal(
+			'state-uncertain'
+		);
+
+		// Restart from persisted state alone.
+		const restored = new Channel(
+			deserializeChannelState(serializeChannelState(opener.getFullState()))
+		);
+		expect(restored.getState()).to.equal(ChannelState.ERRORED);
+		expect(restored.getFullState().recoveryCloseReason).to.equal(
+			'state-uncertain'
+		);
+		expect(restored.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.StateUncertain
+		);
+
+		// The peer connects: the manager repeats the close request.
+		const cm = new ChannelManager({
+			localBasepoints: makeBasepoints(Buffer.alloc(32, 0x71)).basepoints,
+			localPerCommitmentSeed: crypto
+				.createHash('sha256')
+				.update(Buffer.from('close-req-seed'))
+				.digest(),
+			localFundingPrivkey: crypto
+				.createHash('sha256')
+				.update(Buffer.from('close-req-funding'))
+				.digest()
+		});
+		cm.on('error', () => {});
+		const peer = getPublicKey(Buffer.alloc(32, 0x72)).toString('hex');
+		cm.restoreChannel(restored, peer);
+		const sent: Array<{ type: MessageType; payload: Buffer }> = [];
+		cm.on('message:outbound', (_p: string, type: number, payload: Buffer) => {
+			sent.push({ type, payload });
+		});
+		let broadcasts = 0;
+		cm.on('broadcast:tx', () => {
+			broadcasts++;
+		});
+		cm.handlePeerReconnected(peer);
+
+		const errSent = sent.find((m) => m.type === MessageType.ERROR);
+		expect(errSent).to.exist;
+		expect(
+			decodeErrorMessage(errSent!.payload).data.toString('ascii')
+		).to.contain('proven current');
+		// And still nothing broadcasts, ever.
+		expect(broadcasts).to.equal(0);
+		expect(restored.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('startup dialing includes channels carrying a recovery-close disposition', function () {
+		// A crash after the disposition commit must not strand the request on
+		// a node that never dials: the auto-reconnect selection includes
+		// recovery-close channels alongside reestablish-needing ones.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		opener.getFullState().stateUncertain = true;
+		opener.markForReestablish();
+		opener.handleReestablish(cleanReestablishFor(opener));
+		const state = deserializeChannelState(
+			serializeChannelState(opener.getFullState())
+		);
+		expect(state.recoveryCloseReason).to.equal('state-uncertain');
+
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const peer = getPublicKey(Buffer.alloc(32, 0x73)).toString('hex');
+		storage.saveChannel(state.channelId!.toString('hex'), state, peer);
+		// A dead port: the dial fails, but the ATTEMPT is what is asserted.
+		storage.savePeerAddress(peer, '127.0.0.1', 9);
+
+		const seed = crypto
+			.createHash('sha256')
+			.update(Buffer.from('close-dial-node'))
+			.digest();
+		const node = new LightningNode({
+			nodePrivateKey: seed,
+			network: Network.REGTEST as Network,
+			channelBasepoints: makeBasepoints(Buffer.alloc(32, 0x74)).basepoints,
+			perCommitmentSeed: crypto
+				.createHash('sha256')
+				.update(Buffer.from('close-dial-pcs'))
+				.digest(),
+			fundingPrivkey: crypto
+				.createHash('sha256')
+				.update(Buffer.from('close-dial-funding'))
+				.digest(),
+			htlcBasepointSecret: crypto
+				.createHash('sha256')
+				.update(Buffer.from('close-dial-htlc'))
+				.digest(),
+			storage,
+			enableNetworking: true,
+			autoReconnect: true
+		});
+		node.on('error', () => {});
+		node.on('node:error', () => {});
+		// The constructor's dial pass selected the recovery-close channel's
+		// peer: a reconnect timer is armed for it.
+		expect(
+			(node as unknown as { _reconnectTimers: Set<unknown> })._reconnectTimers
+				.size
+		).to.equal(1);
+		node.destroy();
 	});
 
 	it('ForceClosing after a real force close', function () {

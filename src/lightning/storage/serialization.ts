@@ -411,6 +411,9 @@ export interface ISerializedChannelState {
 	// restart of a possibly-stale restore must not forget that broadcasting
 	// is forbidden until reestablish proves the state current.
 	stateUncertain?: boolean;
+	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
+	// error is regenerated from this on every reconnect.
+	recoveryCloseReason?: 'local-data-loss' | 'state-uncertain';
 	dlpRemotePerCommitmentPoint?: string | null;
 }
 
@@ -663,6 +666,7 @@ export function serializeChannelState(
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		stateUncertain: s.stateUncertain,
+		recoveryCloseReason: s.recoveryCloseReason,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
 	};
 }
@@ -840,6 +844,7 @@ export function deserializeChannelState(
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
 		stateUncertain: s.stateUncertain,
+		recoveryCloseReason: s.recoveryCloseReason,
 		dlpRemotePerCommitmentPoint:
 			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined
 	};

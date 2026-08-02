@@ -86,6 +86,9 @@ export interface IRemoteForwardingPolicy {
 	timestamp: number;
 }
 
+/** Why a channel is durably waiting for the PEER's force close (5.6). */
+export type RecoveryCloseReason = 'local-data-loss' | 'state-uncertain';
+
 export interface IChannelState {
 	/** Identity */
 	channelId: Buffer | null;
@@ -486,6 +489,16 @@ export interface IChannelState {
 	 * proving us stale upgrades to dataLossDetected.
 	 */
 	stateUncertain?: boolean;
+	/**
+	 * Recovery 5.6 liveness: the channel was routed to the DLP path and the
+	 * peer must force-close it. The wire error asking for that close can be
+	 * lost to a crash between the ERRORED persist and the socket, so the
+	 * DISPOSITION persists here and the request is regenerated
+	 * deterministically on every reconnect (buildRecoveryCloseActions) until
+	 * the peer's close resolves the channel on chain. Never cleared by the
+	 * wire, and never a broadcast authorization.
+	 */
+	recoveryCloseReason?: RecoveryCloseReason;
 	/**
 	 * Data loss protection: the peer's my_current_per_commitment_point from the
 	 * reestablish that proved data loss. Stored for completeness/legacy

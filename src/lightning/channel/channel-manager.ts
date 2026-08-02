@@ -1232,6 +1232,15 @@ export class ChannelManager extends EventEmitter {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
 				const actions = channel.createReestablish();
 				this.processActions(peerPubkey, channel, actions);
+			} else if (channel.getState() === ChannelState.ERRORED) {
+				// Recovery 5.6 liveness: the peer-close request survives
+				// crashes as a persisted disposition, not as a wire message.
+				// Repeat it on every reconnect until the peer's force close
+				// resolves the channel on chain; empty for ordinary errors.
+				const actions = channel.buildRecoveryCloseActions();
+				if (actions.length > 0) {
+					this.processActions(peerPubkey, channel, actions);
+				}
 			}
 		}
 	}

@@ -3062,12 +3062,18 @@ export class LightningNode extends EventEmitter {
 		const peerAddresses = this.storage.loadAllPeerAddresses();
 		const channelPeers = new Set<string>();
 
-		// Only reconnect peers that have channels needing reestablishment
+		// Only reconnect peers that have channels needing reestablishment, or
+		// carrying a durable recovery-close disposition (5.6): those must
+		// proactively reach the peer to deliver the force-close request, or a
+		// crash between the ERRORED persist and the error send would leave
+		// the channel waiting forever on a peer that never dials us.
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getState();
 			if (
 				state === ChannelState.AWAITING_REESTABLISH ||
-				state === ChannelState.AWAITING_CHANNEL_READY
+				state === ChannelState.AWAITING_CHANNEL_READY ||
+				(state === ChannelState.ERRORED &&
+					channel.getFullState().recoveryCloseReason !== undefined)
 			) {
 				const channelId = channel.getChannelId();
 				if (channelId) {
@@ -13299,8 +13305,9 @@ export class LightningNode extends EventEmitter {
 			// The never-broadcast invariant (recovery 5.6): proven stale or
 			// unprovable, auto force-closing here would broadcast a possibly
 			// revoked commitment and lose the whole balance to the justice
-			// path. The peer's force close (or, for stateUncertain, a later
-			// reestablish proof) resolves the channel; never time it out.
+			// path. StateUncertain is permanent absent independently verified
+			// storage provenance; only the peer's force close resolves the
+			// channel. Never time it out.
 			// (Channel.forceClose refuses too - this skip avoids even trying.)
 			if (mustNotBroadcastCommitment(state)) {
 				continue;

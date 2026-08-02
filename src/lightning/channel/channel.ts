@@ -3817,13 +3817,39 @@ export class Channel {
 		return ChannelRecoveryStatus.Active;
 	}
 
+	/**
+	 * The durable peer-close request (recovery 5.6). The original wire error
+	 * can be lost to a crash between the ERRORED persist and the socket
+	 * (ERROR is deliberately not in the retransmission outbox), so the
+	 * persisted DISPOSITION regenerates it deterministically on every
+	 * reconnect until the peer's close resolves the channel on chain.
+	 */
+	buildRecoveryCloseActions(): ChannelAction[] {
+		const reason = this._state.recoveryCloseReason;
+		if (!reason || !this._state.channelId) return [];
+		const data =
+			reason === 'local-data-loss'
+				? 'peer proved our channel state is stale (data loss); awaiting your force close'
+				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
+		return [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: this._state.channelId,
+					data: Buffer.from(data, 'ascii')
+				})
+			)
+		];
+	}
+
 	forceClose(signer: ISigner): ChannelAction[] {
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected) or unprovable (stateUncertain), our latest local
 		// commitment may be revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive: the
-		// peer force-closes with its newer commitment (or reestablish proves
-		// an uncertain state current) and we act from there.
+		// our entire balance to the justice path. Recovery is passive:
+		// StateUncertain is permanent absent independently verified storage
+		// provenance, so the only exit is the peer force-closing with ITS
+		// commitment; we sweep our to_remote from that.
 		if (mustNotBroadcastCommitment(this._state)) {
 			return [
 				{
@@ -5773,6 +5799,7 @@ export class Channel {
 		) {
 			this._state.dataLossDetected = true;
 			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			this._state.recoveryCloseReason = 'local-data-loss';
 			this._state.state = ChannelState.ERRORED;
 			return [
 				// Persist FIRST: a crash between the error send and the peer's
@@ -5811,6 +5838,7 @@ export class Channel {
 		// state, never broadcast; ask the peer to close with ITS commitment
 		// and sweep our to_remote from that.
 		if (this._state.stateUncertain) {
+			this._state.recoveryCloseReason = 'state-uncertain';
 			this._state.state = ChannelState.ERRORED;
 			return [
 				// Persist FIRST: a crash between the error send and the peer's
