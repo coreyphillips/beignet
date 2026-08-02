@@ -473,6 +473,16 @@ export interface IChannelState {
 	 */
 	dataLossDetected?: boolean;
 	/**
+	 * Recovery 5.6 StateUncertain: this state was restored from replicas that
+	 * cannot be proven current (guardian replication is best effort until the
+	 * Phase 6 barriers), so the stored local commitment may be revoked in the
+	 * peer's view and must never be broadcast. Cleared by a
+	 * channel_reestablish whose counters prove our state is at least as new
+	 * as the peer expects; a peer proving us actually stale upgrades to
+	 * dataLossDetected instead. Unlike dataLossDetected this is not sticky.
+	 */
+	stateUncertain?: boolean;
+	/**
 	 * Data loss protection: the peer's my_current_per_commitment_point from the
 	 * reestablish that proved data loss. Stored for completeness/legacy
 	 * commitments; static_remotekey/anchor/taproot to_remote sweeps derive from
@@ -716,4 +726,19 @@ export function createAcceptorState(params: {
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0
 	};
+}
+
+/**
+ * The recovery never-broadcast invariant (docs/RECOVERY-PROTOCOL.md 5.6):
+ * a channel whose state is proven stale (dataLossDetected) or cannot be
+ * proven current (stateUncertain) must never broadcast its stored local
+ * commitment, even if the peer stays unreachable indefinitely. Every
+ * force-close, rebroadcast and fee-bump decision consults this ONE
+ * predicate so the two flags can never drift apart.
+ */
+export function mustNotBroadcastCommitment(state: {
+	dataLossDetected?: boolean;
+	stateUncertain?: boolean;
+}): boolean {
+	return state.dataLossDetected === true || state.stateUncertain === true;
 }

@@ -937,6 +937,17 @@ export class RestoreDriver {
 				String(rows[0]?.sequence ?? 0)
 			);
 			reconstructFromFrames(targetStorage, frames);
+			// StateUncertain (5.6): guardian replication is best effort until
+			// the Phase 6 barriers, so the certified head can trail what the
+			// old device actually did with its peers. Every restored channel
+			// therefore starts with its commitment broadcast FORBIDDEN, and
+			// only a channel_reestablish whose counters prove the state
+			// current lifts the flag. Set inside the install transaction so a
+			// crash can never yield restored channels without it.
+			for (const row of targetStorage.loadAllChannels()) {
+				row.state.stateUncertain = true;
+				targetStorage.saveChannel(row.channelId, row.state, row.peerPubkey);
+			}
 			// The lease carries the granted epoch, so the journal stamps later
 			// frames under the epoch this device owns; the pending record
 			// retires WITH it, never before.

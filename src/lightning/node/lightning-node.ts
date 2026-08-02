@@ -196,6 +196,7 @@ import {
 	RecoveryCriticality,
 	RecoveryMutation,
 	GuardianStartupGate,
+	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
@@ -239,7 +240,8 @@ import {
 import {
 	createOpenerState,
 	createAcceptorState,
-	IChannelState
+	IChannelState,
+	mustNotBroadcastCommitment
 } from '../channel/channel-state';
 import { IScbChannelEntry, encodeScb } from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
@@ -2905,6 +2907,36 @@ export class LightningNode extends EventEmitter {
 	/** The gate's view, for operators and tests. */
 	getRecoveryGateState(): string {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
+	}
+
+	/**
+	 * The recovery picture in one call (spec 5.6): the startup gate plus
+	 * every open channel's ChannelRecoveryStatus. While the gate is closed
+	 * the node-level rule overrides the per-channel view: channels may not
+	 * leave quarantine before ownership confirmation, whatever their own
+	 * reestablish bookkeeping says.
+	 */
+	getRecoveryStatus(): {
+		gate: string;
+		channels: Array<{ channelId: string; status: ChannelRecoveryStatus }>;
+	} {
+		const gated = !this.recoveryPermitsPeerTraffic();
+		const channels: Array<{
+			channelId: string;
+			status: ChannelRecoveryStatus;
+		}> = [];
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.state === ChannelState.CLOSED) continue;
+			const id = state.channelId ?? state.temporaryChannelId;
+			channels.push({
+				channelId: id.toString('hex'),
+				status: gated
+					? ChannelRecoveryStatus.Quarantined
+					: channel.getRecoveryStatus()
+			});
+		}
+		return { gate: this.getRecoveryGateState(), channels };
 	}
 
 	/**
@@ -11739,7 +11771,9 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
-		if (state.dataLossDetected) {
+		if (mustNotBroadcastCommitment(state)) {
+			// Proven stale or unprovable (recovery 5.6): broadcasting our
+			// commitment is forbidden; the peer's close resolves the channel.
 			this.emitStructuredLog('channel', 'errored_awaiting_peer_close', {
 				channelId: channelId.toString('hex'),
 				reason
@@ -11826,7 +11860,8 @@ export class LightningNode extends EventEmitter {
 			// commitment is provably stale and broadcasting it forfeits the whole
 			// balance to the justice path.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 
 			for (const [key, htlc] of state.htlcs) {
@@ -11929,7 +11964,8 @@ export class LightningNode extends EventEmitter {
 			// resolve a forwarded HTLC stuck on it. dataLossDetected must never
 			// broadcast; the peer's commitment resolves those channels.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (state.state !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
@@ -12763,7 +12799,8 @@ export class LightningNode extends EventEmitter {
 			// downstream can claim it with the preimage whether or not the channel
 			// is operational. dataLossDetected must never broadcast.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
@@ -13259,12 +13296,13 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			const channelId = state.channelId || state.temporaryChannelId;
 
-			// Data loss protection: the peer proved our state is stale. Auto
-			// force-closing here would broadcast our revoked-in-their-view
-			// commitment and lose the whole balance to the justice path. The
-			// peer's force close resolves the channel; never time it out.
+			// The never-broadcast invariant (recovery 5.6): proven stale or
+			// unprovable, auto force-closing here would broadcast a possibly
+			// revoked commitment and lose the whole balance to the justice
+			// path. The peer's force close (or, for stateUncertain, a later
+			// reestablish proof) resolves the channel; never time it out.
 			// (Channel.forceClose refuses too - this skip avoids even trying.)
-			if (state.dataLossDetected) {
+			if (mustNotBroadcastCommitment(state)) {
 				continue;
 			}
 

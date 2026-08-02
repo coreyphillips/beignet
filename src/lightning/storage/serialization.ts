@@ -407,6 +407,10 @@ export interface ISerializedChannelState {
 	// behind would otherwise forget the flag and let a force-close broadcast
 	// our stale (revoked) commitment.
 	dataLossDetected?: boolean;
+	// Recovery 5.6 StateUncertain: MUST persist for the same reason - a
+	// restart of a possibly-stale restore must not forget that broadcasting
+	// is forbidden until reestablish proves the state current.
+	stateUncertain?: boolean;
 	dlpRemotePerCommitmentPoint?: string | null;
 }
 
@@ -658,6 +662,7 @@ export function serializeChannelState(
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
+		stateUncertain: s.stateUncertain,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
 	};
 }
@@ -834,6 +839,7 @@ export function deserializeChannelState(
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
 		lastCooperativeCloseTxHex: s.lastCooperativeCloseTxHex,
 		dataLossDetected: s.dataLossDetected,
+		stateUncertain: s.stateUncertain,
 		dlpRemotePerCommitmentPoint:
 			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined
 	};

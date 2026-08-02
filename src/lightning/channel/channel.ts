@@ -81,8 +81,10 @@ import {
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	mustNotBroadcastCommitment
 } from './channel-state';
+import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
 	deriveChannelId,
 	deriveV2ChannelId,
@@ -415,6 +417,12 @@ export class Channel {
 		startBatch: Buffer;
 		commitments: Buffer[];
 	} | null = null;
+	// Outcome of the last processed channel_reestablish this SESSION (recovery
+	// 5.6 status machine): 'replay' when we served retransmissions, 'clean'
+	// when the counters simply agreed. In-memory only - after a restart the
+	// channel is back in AWAITING_REESTABLISH and the status derives from
+	// that. Cleared again once fresh signed traffic proves the exchange over.
+	private _lastReestablishOutcome: 'replay' | 'clean' | null = null;
 	// Watchtower: the remote commitment transactions we have signed, keyed by the
 	// per-commitment point they use, so that when the peer later reveals that
 	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
@@ -2841,6 +2849,8 @@ export class Channel {
 	 * Returns revoke_and_ack.
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
+		// Fresh signed traffic ends the reestablish exchange (status machine).
+		this._lastReestablishOutcome = null;
 		// start_batch collection: buffer the announced batch, then process all
 		// of its commitment_signed messages as one logical update.
 		if (this._pendingBatch) {
@@ -3124,6 +3134,8 @@ export class Channel {
 	 * Handle revoke_and_ack from remote.
 	 */
 	handleRevokeAndAck(msg: IRevokeAndAckMessage): ChannelAction[] {
+		// Fresh signed traffic ends the reestablish exchange (status machine).
+		this._lastReestablishOutcome = null;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -3767,16 +3779,58 @@ export class Channel {
 	 * Force close the channel by broadcasting the latest local commitment.
 	 * Returns the commitment transaction to broadcast and a CHANNEL_CLOSED action.
 	 */
+	/**
+	 * Per-channel recovery status (docs/RECOVERY-PROTOCOL.md 5.6). Derived,
+	 * not stored: the two stale-side states come from their persisted flags,
+	 * the exchange states from where reestablish stands this session.
+	 * Precedence: proven stale beats everything (the never-broadcast
+	 * invariant rides that flag through any lifecycle state), then
+	 * unprovable, then the terminal close, then the exchange.
+	 */
+	getRecoveryStatus(): ChannelRecoveryStatus {
+		const s = this._state;
+		if (s.dataLossDetected) return ChannelRecoveryStatus.LocalDataLoss;
+		if (s.stateUncertain) return ChannelRecoveryStatus.StateUncertain;
+		if (
+			s.state === ChannelState.FORCE_CLOSED ||
+			s.state === ChannelState.ERRORED
+		) {
+			// ERRORED without a stale flag is recovered by broadcasting our
+			// latest commitment (the BOLT 1 prescription for a received
+			// error), so it is on the force-close path.
+			return ChannelRecoveryStatus.ForceClosing;
+		}
+		if (s.state === ChannelState.AWAITING_REESTABLISH) {
+			return ChannelRecoveryStatus.Quarantined;
+		}
+		if (this._lastReestablishOutcome === 'replay') {
+			return ChannelRecoveryStatus.ReplayRequired;
+		}
+		if (
+			this._lastReestablishOutcome === 'clean' &&
+			s.state !== ChannelState.NORMAL
+		) {
+			// Counters agreed but the channel resumed into a non-quiescent
+			// state (a splice mid-flight, a pending shutdown): still resuming.
+			return ChannelRecoveryStatus.Reestablishing;
+		}
+		return ChannelRecoveryStatus.Active;
+	}
+
 	forceClose(signer: ISigner): ChannelAction[] {
-		// Data loss protection: the peer proved our state is stale. Our latest
-		// local commitment is revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive: the peer
-		// force-closes with its newer commitment and we sweep our to_remote.
-		if (this._state.dataLossDetected) {
+		// The recovery never-broadcast invariant (5.6): proven stale
+		// (dataLossDetected) or unprovable (stateUncertain), our latest local
+		// commitment may be revoked in the peer's view - broadcasting it hands
+		// our entire balance to the justice path. Recovery is passive: the
+		// peer force-closes with its newer commitment (or reestablish proves
+		// an uncertain state current) and we act from there.
+		if (mustNotBroadcastCommitment(this._state)) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Refusing to broadcast stale commitment after data loss'
+					message: this._state.dataLossDetected
+						? 'Refusing to broadcast stale commitment after data loss'
+						: 'Refusing to broadcast: restored state is not proven current'
 				}
 			];
 		}
@@ -5665,6 +5719,8 @@ export class Channel {
 	 */
 	handleReestablish(msg: IChannelReestablishMessage): ChannelAction[] {
 		const actions: ChannelAction[] = [];
+		// A fresh exchange begins; the previous session's outcome is stale.
+		this._lastReestablishOutcome = null;
 
 		// BOLT 2: next_commitment_number MUST NOT be 0 — the initial commitment
 		// (number 0) is delivered inside funding_created/funding_signed, so the
@@ -6018,6 +6074,22 @@ export class Channel {
 			);
 		}
 
+		// Proof of currency (recovery 5.6): every branch that shows the peer
+		// ahead of our state returned above (data loss, invalid secret,
+		// irrecoverable gaps), so reaching here means the peer's counters are
+		// consistent with what we hold - a restore flagged possibly-stale is
+		// now proven at least as new as the peer expects.
+		let uncertaintyResolved = false;
+		if (this._state.stateUncertain) {
+			this._state.stateUncertain = false;
+			uncertaintyResolved = true;
+		}
+		this._lastReestablishOutcome = actions.some(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE && a.replay === true
+		)
+			? 'replay'
+			: 'clean';
+
 		// Persist before ANY of the above reaches the peer
 		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the
 		// restored channel state, the adopted remote nonce, splice resumption)
@@ -6026,8 +6098,12 @@ export class Channel {
 		// commit had failed could still reach the peer on the next reconnect:
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
-		// disk.
-		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+		// disk. A resolved stateUncertain flag must reach disk even with
+		// nothing to send, or a restart would re-quarantine a proven channel.
+		if (
+			uncertaintyResolved ||
+			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
+		) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 

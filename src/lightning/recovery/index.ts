@@ -23,3 +23,4 @@ export * from './writer-lease';
 export * from './guardian-replication';
 export * from './restore-driver';
 export * from './startup-gate';
+export * from './channel-status';

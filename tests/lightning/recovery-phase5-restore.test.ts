@@ -51,6 +51,8 @@ import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { serializePaymentInfo } from '../../src/lightning/storage/serialization';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
 
 const sha = (s: string): Buffer =>
 	crypto.createHash('sha256').update(s).digest();
@@ -835,6 +837,87 @@ describe('Recovery phase 5: restore driver', () => {
 		}
 		await shutdown(served);
 		live.storage.close();
+		target.close();
+	});
+
+	it('marks every restored channel StateUncertain inside the install', async () => {
+		// Guardian replication is best effort until the Phase 6 barriers, so
+		// the certified head can trail what the lost device actually did with
+		// its peers: a restored channel must come back with its commitment
+		// broadcast forbidden until reestablish proves the state current.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		// The channel exists BEFORE the journal's bootstrap snapshot, so the
+		// snapshot carries it and the restore rebuilds it.
+		const chanSeed = crypto
+			.createHash('sha256')
+			.update(Buffer.from('restore-status-channel'))
+			.digest();
+		const basepointKeys = Array.from({ length: 6 }, (_, i) =>
+			crypto
+				.createHash('sha256')
+				.update(chanSeed)
+				.update(Buffer.from([i]))
+				.digest()
+		);
+		const channelState = createOpenerState({
+			temporaryChannelId: Buffer.alloc(32, 0xc5),
+			fundingSatoshis: 500_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: {
+				fundingPubkey: getPublicKey(basepointKeys[0]),
+				revocationBasepoint: getPublicKey(basepointKeys[1]),
+				paymentBasepoint: getPublicKey(basepointKeys[2]),
+				delayedPaymentBasepoint: getPublicKey(basepointKeys[3]),
+				htlcBasepoint: getPublicKey(basepointKeys[4]),
+				firstPerCommitmentPoint: getPublicKey(basepointKeys[5])
+			},
+			localPerCommitmentSeed: crypto
+				.createHash('sha256')
+				.update(Buffer.from('restore-status-seed'))
+				.digest()
+		});
+		expect(channelState.stateUncertain).to.equal(undefined);
+		const channelId = Buffer.alloc(32, 0xc5).toString('hex');
+		storage.saveChannel(channelId, channelState, '02'.padEnd(66, 'ab'));
+
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, 0xaa).toString('hex'),
+					preimage: Buffer.alloc(32, 0xaa)
+				}
+			],
+			outboundMessages: []
+		});
+		const rep = replicatorFor(storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+
+		// Device lost; a fresh install restores from the guardians.
+		const target = openStorage();
+		const driver = driverFor(target, bind(served));
+		await driver.restore();
+
+		const restored = target.loadChannel(channelId);
+		expect(restored).to.not.equal(null);
+		expect(restored!.state.stateUncertain).to.equal(true);
+		// And the source never had the flag: it is the restore that adds it.
+		expect(storage.loadChannel(channelId)!.state.stateUncertain).to.equal(
+			undefined
+		);
+		await shutdown(served);
+		storage.close();
 		target.close();
 	});
 
