@@ -22,6 +22,7 @@ import {
 	GuardianHttpServer,
 	GuardianReplicator,
 	GuardianTransportError,
+	IGuardianReplicationEvent,
 	GuardianState,
 	GuardianStatus,
 	IBoundGuardianClient,
@@ -713,6 +714,83 @@ describe('Recovery phase 5: restore driver', () => {
 		expect(
 			target.getRecoveryMeta!(RESTORE_META_KEYS.pendingAcquisition)
 		).to.equal(null);
+		await shutdown(served);
+		live.storage.close();
+		target.close();
+	});
+
+	it('starts post-restore replication after the certified head', async () => {
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(3);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+
+		const target = openStorage();
+		const restored = await driverFor(target, bind(served)).restore();
+		const certifiedSequence = restored.certifiedState.logHead.sequence;
+		expect(certifiedSequence > 0n).to.equal(true);
+
+		// The takeover certificates prove a quorum held the log through the
+		// certified head, so replication must resume AFTER it. Starting from
+		// zero would re-sign historical frames under the new epoch, which the
+		// guardians reject at an occupied sequence: the watermark would never
+		// advance and every append would resend the whole journal.
+		const events: IGuardianReplicationEvent[] = [];
+		const resumed = new GuardianReplicator({
+			storage: target,
+			guardians: bind(served),
+			context: CONTEXT,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot: ROOT,
+			clock,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+		expect(resumed.replicatedThrough()).to.equal(certifiedSequence);
+
+		// Nothing new: no requests, no rejections, no re-sent history.
+		const idle = await resumed.replicatePending(restored.lease);
+		expect(idle.attempted).to.equal(0);
+		expect(idle.outcome).to.equal('replicated');
+		expect(events).to.have.length(0);
+
+		// One new transition under the acquired epoch replicates normally.
+		const restoredJournal = new RecoveryJournal(
+			target,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId
+		);
+		const restoredManager = new RecoveryManager(target, {
+			journal: restoredJournal
+		});
+		expect(
+			restoredManager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: Buffer.alloc(32, 66).toString('hex'),
+						preimage: Buffer.alloc(32, 66)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+
+		const next = await resumed.replicatePending(restored.lease);
+		expect(next.attempted).to.be.greaterThan(0);
+		expect(next.durable).to.equal(next.attempted);
+		expect(next.replicatedThrough > certifiedSequence).to.equal(true);
+		// No historical frame was ever rejected or under-replicated.
+		expect(
+			events.filter(
+				(e) =>
+					e.type === 'record:rejected' || e.type === 'record:under-replicated'
+			)
+		).to.have.length(0);
 		await shutdown(served);
 		live.storage.close();
 		target.close();

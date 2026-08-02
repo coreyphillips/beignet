@@ -64,6 +64,7 @@ import {
 	verifyFrameChain
 } from './journal';
 import { RecoveryFrame } from './types';
+import { REPLICATION_META_KEYS } from './guardian-replication';
 import {
 	IWriterLeaseKeys,
 	generateWriterKey,
@@ -940,6 +941,20 @@ export class RestoreDriver {
 			// frames under the epoch this device owns; the pending record
 			// retires WITH it, never before.
 			writeLease(targetStorage);
+			// Replication starts AFTER the certified head, not from zero.
+			// The takeover certificates prove a quorum held the log through
+			// exactly this head before the epoch changed (a takeover changes
+			// the lease and preserves the log head, wire 5.5), so the prefix
+			// is already durable. Leaving the watermark at zero would make
+			// every later pass re-sign historical frames under the NEW epoch,
+			// which the guardians reject at an occupied sequence: the
+			// watermark would never advance, every append would resend the
+			// whole journal, and the Phase 6 barriers that read this value
+			// would block forever.
+			targetStorage.setRecoveryMeta!(
+				REPLICATION_META_KEYS.replicatedThrough,
+				certified.logHead.sequence.toString()
+			);
 			this.clearPending();
 		});
 		this.emit(

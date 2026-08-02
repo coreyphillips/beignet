@@ -53,8 +53,8 @@ import {
 	IWriterLeaseKeys,
 	generateWriterKey,
 	loadWriterLease,
-	requireEncryptedSecretStorage,
-	saveWriterLease
+	prepareWriterLease,
+	requireEncryptedSecretStorage
 } from './writer-lease';
 
 /** How far replication has provably got, for catch-up after a restart. */
@@ -514,10 +514,16 @@ export class GuardianReplicator {
 			guardianCertificates: [],
 			confirmedAt: this.clock()
 		};
+		// prepareWriterLease validates and encodes OUTSIDE the transaction, so
+		// promotion needs no reentrant transaction support from the backend:
+		// IStorageBackend.transaction does not document reentrancy, and
+		// relying on SQLite's savepoint behaviour would make this correct only
+		// for one backend.
+		const writeLease = prepareWriterLease(this.config.storage, lease, {
+			allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
+		});
 		this.config.storage.transaction(() => {
-			saveWriterLease(this.config.storage, lease, {
-				allowUnencryptedSecrets: this.config.allowUnencryptedSecrets
-			});
+			writeLease(this.config.storage);
 			this.config.storage.deleteRecoveryMeta?.(META_PENDING_REGISTRATION);
 		});
 		this.emit({
