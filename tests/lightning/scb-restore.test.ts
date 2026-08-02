@@ -298,6 +298,11 @@ describe('SCB restore', function () {
 				// ORIGINAL state - the recovered node never has the material for it.
 				entries = alice.buildStaticChannelBackupData().channels;
 				expect(entries).to.have.length(1);
+				// The backup carries the private peer's address, exactly as a
+				// production SCB does (sourced from persisted peer addresses).
+				// Port 9 is unreachable: the immediate dial attempt fails, so
+				// only what the RESTORE PATH persisted can enable the redial.
+				entries[0].peerAddresses = ['127.0.0.1:9'];
 				commitmentTx = buildRemoteCommitment(
 					originalState,
 					makeForeignPoint('recovery-monitor-point'),
@@ -374,12 +379,21 @@ describe('SCB restore', function () {
 				expect(persisted).to.exist;
 				expect(persisted!.peerPubkey).to.equal(entries[0].peerNodeId);
 
-				// Restart liveness: the initial connection attempt failed (no
-				// networking here at all), the process restarts from storage
-				// alone, and the recovered channel's peer is selected for
-				// startup dialing; on reconnect the deterministic close
-				// request is regenerated.
-				storage.savePeerAddress(entries[0].peerNodeId, '127.0.0.1', 9);
+				// Restart liveness FROM THE PRODUCTION PATH ALONE: the backup's
+				// dial candidate must have been persisted by the recovery
+				// itself (nothing here calls savePeerAddress), the initial
+				// dial attempt failed, the process restarts from the resulting
+				// database only, the peer is selected for startup dialing, and
+				// reconnect regenerates the deterministic close request.
+				const savedAddresses = storage.loadAllPeerAddresses();
+				expect(
+					savedAddresses.some(
+						(a) =>
+							a.pubkey === entries[0].peerNodeId &&
+							a.host === '127.0.0.1' &&
+							a.port === 9
+					)
+				).to.equal(true);
 				const restarted = new LightningNode({
 					...makeNodeConfig(1),
 					storage,

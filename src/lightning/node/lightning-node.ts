@@ -3631,6 +3631,29 @@ export class LightningNode extends EventEmitter {
 			// regenerates the close request.
 			state.recoveryCloseReason = 'local-data-loss';
 
+			// The disposition is useless without an address to dial after a
+			// restart, and the backup's addresses were known-good persisted
+			// peer addresses when the SCB was written, so restore the first
+			// valid one to the same store. BEFORE the channel: an orphan
+			// address is harmless if channel persistence fails below, while
+			// the reverse ordering can strand the durable close request on a
+			// crash between the two writes. contactRecoveryPeer below is only
+			// the best-effort immediate attempt and persists nothing itself.
+			const dialCandidate = this.firstDialableRecoveryAddress(
+				entry.peerAddresses
+			);
+			if (dialCandidate && this.storage) {
+				this.safeStorage(
+					() =>
+						this.storage!.savePeerAddress(
+							entry.peerNodeId,
+							dialCandidate.host,
+							dialCandidate.port
+						),
+					'savePeerAddress'
+				);
+			}
+
 			const channel = new Channel(state);
 			channel.channelKeyIndex = entry.channelKeyIndex;
 			this.channelManager.restoreChannel(
@@ -3680,12 +3703,31 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/** Try each known address for a recovery peer until one connects. */
+	/**
+	 * First backup address entry that parses to a dialable (host, port).
+	 * 'host:port' with a possibly-bracketed IPv6 host: split on the LAST
+	 * colon. Shared by the SCB address persistence and the dial loop so the
+	 * two can never disagree about validity.
+	 */
+	private firstDialableRecoveryAddress(
+		addresses: string[]
+	): { host: string; port: number } | null {
+		for (const address of addresses) {
+			const sep = address.lastIndexOf(':');
+			if (sep <= 0) continue;
+			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
+			const port = parseInt(address.slice(sep + 1), 10);
+			if (!Number.isFinite(port) || port <= 0) continue;
+			return { host, port };
+		}
+		return null;
+	}
+
 	private async contactRecoveryPeer(
 		peerNodeId: string,
 		addresses: string[]
 	): Promise<void> {
 		for (const address of addresses) {
-			// 'host:port' with a possibly-bracketed IPv6 host: split on the LAST colon.
 			const sep = address.lastIndexOf(':');
 			if (sep <= 0) continue;
 			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
