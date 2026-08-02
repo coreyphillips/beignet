@@ -161,6 +161,18 @@ export interface IRestoreDriverConfig {
 	/** CAS rounds before giving up. Each round retries the SAME request. */
 	maxCasAttempts?: number;
 	allowUnencryptedSecrets?: boolean;
+	/**
+	 * Recovery-storage provenance (5.6): the highest journal sequence
+	 * through which the lost writer provably released NO wire message beyond
+	 * durable replication. This is the Phase 6 quorum barrier's guarantee;
+	 * nothing in Phase 5 can supply it, so it defaults to null. When present
+	 * and covering the certified head, the restored state is wire-safe and
+	 * channels resume normally; otherwise EVERY restored channel is marked
+	 * stateUncertain and resolves through the DLP path, because a compatible
+	 * channel_reestablish cannot prove exactness (the peer can under-report
+	 * while holding a newer state).
+	 */
+	wireSafeThroughSequence?: bigint | null;
 }
 
 export interface IRestoreEvent {
@@ -939,14 +951,22 @@ export class RestoreDriver {
 			reconstructFromFrames(targetStorage, frames);
 			// StateUncertain (5.6): guardian replication is best effort until
 			// the Phase 6 barriers, so the certified head can trail what the
-			// old device actually did with its peers. Every restored channel
-			// therefore starts with its commitment broadcast FORBIDDEN, and
-			// only a channel_reestablish whose counters prove the state
-			// current lifts the flag. Set inside the install transaction so a
-			// crash can never yield restored channels without it.
-			for (const row of targetStorage.loadAllChannels()) {
-				row.state.stateUncertain = true;
-				targetStorage.saveChannel(row.channelId, row.state, row.peerPubkey);
+			// old device actually did with its peers. Unless storage
+			// provenance proves the writer released no wire message beyond
+			// the certified head (wireSafeThroughSequence covering it), every
+			// restored channel starts with its commitment broadcast
+			// FORBIDDEN, permanently: a compatible reestablish is not proof
+			// of exactness, so the flag lifts only here, never on the wire.
+			// Set inside the install transaction so a crash can never yield
+			// restored channels without it.
+			const wireSafe = this.config.wireSafeThroughSequence ?? null;
+			const provenExact =
+				wireSafe !== null && wireSafe >= certified.logHead.sequence;
+			if (!provenExact) {
+				for (const row of targetStorage.loadAllChannels()) {
+					row.state.stateUncertain = true;
+					targetStorage.saveChannel(row.channelId, row.state, row.peerPubkey);
+				}
 			}
 			// The lease carries the granted epoch, so the journal stamps later
 			// frames under the epoch this device owns; the pending record

@@ -476,10 +476,14 @@ export interface IChannelState {
 	 * Recovery 5.6 StateUncertain: this state was restored from replicas that
 	 * cannot be proven current (guardian replication is best effort until the
 	 * Phase 6 barriers), so the stored local commitment may be revoked in the
-	 * peer's view and must never be broadcast. Cleared by a
-	 * channel_reestablish whose counters prove our state is at least as new
-	 * as the peer expects; a peer proving us actually stale upgrades to
-	 * dataLossDetected instead. Unlike dataLossDetected this is not sticky.
+	 * peer's view and must never be broadcast. A compatible
+	 * channel_reestablish does NOT clear it - the peer can under-report its
+	 * counters while holding a newer state, so compatibility proves nothing
+	 * about exactness; only recovery-storage provenance (a wire-safe
+	 * boundary from the Phase 6 barrier) lets the restore driver leave the
+	 * flag off. While set, reestablish routes the channel to the DLP path
+	 * (error out, the peer closes with its commitment); a peer positively
+	 * proving us stale upgrades to dataLossDetected.
 	 */
 	stateUncertain?: boolean;
 	/**

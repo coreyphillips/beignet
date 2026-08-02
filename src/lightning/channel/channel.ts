@@ -5796,6 +5796,44 @@ export class Channel {
 			];
 		}
 
+		// ── StateUncertain (recovery 5.6): unprovable restored state ──
+		// A compatible reestablish is NOT proof of currency. BOLT 2's
+		// stale-state proof only works in one direction: a valid FUTURE
+		// secret proves we fell behind (the branch above), but nothing in
+		// channel_reestablish attests the peer's HIGHEST state - a malicious
+		// peer can under-report counters compatible with our restored state
+		// while holding a newer one (it always holds our previously released
+		// secrets), wait for us to broadcast, and take everything through the
+		// justice path. Exactness must come from recovery-storage provenance
+		// (the Phase 6 wire barrier); the restore driver leaves this flag off
+		// only when it holds that proof. Without it the sole safe resolution
+		// is the DLP path: never resume, never retransmit from an unprovable
+		// state, never broadcast; ask the peer to close with ITS commitment
+		// and sweep our to_remote from that.
+		if (this._state.stateUncertain) {
+			this._state.state = ChannelState.ERRORED;
+			return [
+				// Persist FIRST: a crash between the error send and the peer's
+				// force-close must not forget that broadcasting is forbidden.
+				{ type: ChannelActionType.PERSIST_STATE },
+				sendMsg(
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: this._state.channelId!,
+						data: Buffer.from(
+							'restored channel state cannot be proven current (recovery); awaiting your force close',
+							'ascii'
+						)
+					})
+				),
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Restored state is unprovable (StateUncertain): refusing to resume or broadcast, awaiting peer force close'
+				}
+			];
+		}
+
 		// ── Commitment retransmission logic ──
 		// msg.nextCommitmentNumber is the next commitment the peer expects to RECEIVE from us.
 		// We've created up to remoteCommitmentNumber commitments for them.
@@ -6074,16 +6112,6 @@ export class Channel {
 			);
 		}
 
-		// Proof of currency (recovery 5.6): every branch that shows the peer
-		// ahead of our state returned above (data loss, invalid secret,
-		// irrecoverable gaps), so reaching here means the peer's counters are
-		// consistent with what we hold - a restore flagged possibly-stale is
-		// now proven at least as new as the peer expects.
-		let uncertaintyResolved = false;
-		if (this._state.stateUncertain) {
-			this._state.stateUncertain = false;
-			uncertaintyResolved = true;
-		}
 		this._lastReestablishOutcome = actions.some(
 			(a) => a.type === ChannelActionType.SEND_MESSAGE && a.replay === true
 		)
@@ -6098,12 +6126,8 @@ export class Channel {
 		// commit had failed could still reach the peer on the next reconnect:
 		// exactly the case the gate exists to stop, arriving one connection
 		// later. A retransmission is only safe once what justifies it is on
-		// disk. A resolved stateUncertain flag must reach disk even with
-		// nothing to send, or a restart would re-quarantine a proven channel.
-		if (
-			uncertaintyResolved ||
-			actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)
-		) {
+		// disk.
+		if (actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
 			actions.unshift({ type: ChannelActionType.PERSIST_STATE });
 		}
 

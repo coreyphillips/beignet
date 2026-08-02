@@ -7,9 +7,10 @@
  * produce a BROADCAST_TX for its stored commitment, no matter which path
  * asks (explicit force close, the errored backstop, the stuck-channel
  * scanner), even if the peer stays unreachable indefinitely. StateUncertain
- * is the restore-side half: guardian replication is best effort until the
- * Phase 6 barriers, so a restored state is unprovable until the peer's own
- * channel_reestablish counters prove it current.
+ * is the restore-side half, and its hardest property is NEGATIVE: a
+ * compatible channel_reestablish proves nothing about exactness (a peer can
+ * under-report counters while holding a newer state), so the flag never
+ * clears on the wire; only recovery-storage provenance can leave it off.
  */
 
 import { expect } from 'chai';
@@ -45,6 +46,7 @@ import {
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
 import { IChannelReestablishMessage } from '../../src/lightning/message/channel-reestablish';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
 import {
@@ -244,7 +246,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		);
 	});
 
-	it('a clean reestablish lands in Active; a resumed non-quiescent state reads Reestablishing', function () {
+	it('a clean reestablish on an exact channel lands in Active', function () {
 		const { opener, acceptor } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
 		opener.markForReestablish();
@@ -260,6 +262,35 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		).to.equal(false);
 		expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		expect(opener.getRecoveryStatus()).to.equal(ChannelRecoveryStatus.Active);
+	});
+
+	it('Reestablishing while resuming into a non-quiescent state', function () {
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		// A real non-quiescent state: shutdown initiated before the restart.
+		const script = Buffer.concat([
+			Buffer.from([0x00, 0x14]),
+			crypto
+				.createHash('sha256')
+				.update(Buffer.from('shutdown-script'))
+				.digest()
+				.subarray(0, 20)
+		]);
+		const shutdownActions = opener.initiateShutdown(script);
+		expect(findSendAction(shutdownActions, MessageType.SHUTDOWN)).to.exist;
+		expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+
+		opener.markForReestablish();
+		expect(opener.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.Quarantined
+		);
+		opener.handleReestablish(cleanReestablishFor(opener));
+		// Counters agreed, but the channel resumed into SHUTTING_DOWN, not
+		// quiescent operation: the exchange is not finished being resumed.
+		expect(opener.getState()).to.equal(ChannelState.SHUTTING_DOWN);
+		expect(opener.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.Reestablishing
+		);
 	});
 
 	it('ReplayRequired while retransmissions are being served, Active on fresh signed traffic', function () {
@@ -345,7 +376,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(true);
 	});
 
-	it('StateUncertain never broadcasts, and reestablish proof of currency clears it', function () {
+	it('StateUncertain never broadcasts, and a compatible reestablish does NOT clear it', function () {
 		const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);
 
@@ -368,15 +399,123 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(opener.getState()).to.equal(ChannelState.NORMAL);
 		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(true);
 
-		// The peer's reestablish counters agree with our state: currency is
-		// proven, the flag lifts, and the resolution is persisted even though
-		// nothing needed retransmission.
+		// Compatible counters prove NOTHING about exactness: BOLT 2's
+		// stale-state proof only works upward, and a peer can under-report.
+		// The exchange must route to the DLP path, not resume the channel.
 		opener.markForReestablish();
 		const actions = opener.handleReestablish(cleanReestablishFor(opener));
-		expect(opener.getFullState().stateUncertain).to.equal(false);
+		expect(opener.getFullState().stateUncertain).to.equal(true);
+		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		// Persist FIRST, then the wire error asking the peer to close.
 		expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
-		expect(opener.getRecoveryStatus()).to.equal(ChannelRecoveryStatus.Active);
-		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(false);
+		const errSend = findSendAction(actions, MessageType.ERROR);
+		expect(errSend).to.exist;
+		expect(
+			decodeErrorMessage(errSend!.payload).data.toString('ascii')
+		).to.contain('proven current');
+		// No retransmission and certainly no broadcast from an unprovable state.
+		expect(
+			actions.some(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					(a as unknown as { replay?: boolean }).replay === true
+			)
+		).to.equal(false);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
+		).to.equal(false);
+		expect(opener.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.StateUncertain
+		);
+		expect(mustNotBroadcastCommitment(opener.getFullState())).to.equal(true);
+	});
+
+	it('a down-reporting peer cannot launder a stale restore into Active', function () {
+		// The adversarial case the machine exists for: the peer really holds
+		// a NEWER state, but sends counters compatible with our stale restore
+		// plus an old (genuinely held) secret. Nothing in channel_reestablish
+		// attests its highest state, so this exchange must change nothing.
+		const { opener, acceptor, openerCommitmentSeed } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+
+		// Snapshot the opener at state N... then the world moves to N+1.
+		const stale = deserializeChannelState(
+			serializeChannelState(opener.getFullState())
+		);
+		exchangeCommitments(opener, acceptor);
+		expect(
+			Number(opener.getFullState().localCommitmentNumber)
+		).to.be.greaterThan(Number(stale.localCommitmentNumber));
+
+		// A fresh install restores the stale snapshot; the driver marks it.
+		stale.stateUncertain = true;
+		const restored = new Channel(stale);
+		restored.markForReestablish();
+
+		// The peer under-reports: counters compatible with N, and OUR secret
+		// at index N-1, which it legitimately holds from the honest rounds.
+		const actions = restored.handleReestablish({
+			channelId: restored.getChannelId()!,
+			nextCommitmentNumber: stale.remoteCommitmentNumber + 1n,
+			nextRevocationNumber: stale.localCommitmentNumber,
+			yourLastPerCommitmentSecret: generateFromSeed(
+				openerCommitmentSeed,
+				MAX_INDEX - (stale.localCommitmentNumber - 1n)
+			),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('down-report')).digest()
+			)
+		});
+
+		// The laundering fails: still uncertain, routed to the DLP path, and
+		// the stale commitment (revoked in the peer's true view) never flies.
+		expect(restored.getFullState().stateUncertain).to.equal(true);
+		expect(restored.getState()).to.equal(ChannelState.ERRORED);
+		expect(restored.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.StateUncertain
+		);
+		expect(
+			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
+		).to.equal(false);
+		expect(mustNotBroadcastCommitment(restored.getFullState())).to.equal(true);
+	});
+
+	it('ReplayRequired serves the exact PERSISTED bytes across a restart', function () {
+		// The spec's requirement for ReplayRequired: the peer gets exactly
+		// what was sent before the crash, from persistence, not a rebuild.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+
+		// An update goes out and is never committed; the process dies.
+		const addActions = opener.addHtlc(
+			50_000_000n,
+			crypto.createHash('sha256').update(Buffer.from('replay-htlc')).digest(),
+			500_000,
+			Buffer.alloc(1366)
+		);
+		const sentAdd = findSendAction(addActions, MessageType.UPDATE_ADD_HTLC)!;
+		const sentBytes = Buffer.from(sentAdd.payload);
+
+		// Restart: the channel is rebuilt from PERSISTED state alone.
+		const restored = new Channel(
+			deserializeChannelState(serializeChannelState(opener.getFullState()))
+		);
+		restored.markForReestablish();
+
+		const actions = restored.handleReestablish(cleanReestablishFor(restored));
+		const replayed = actions.filter(
+			(a) =>
+				a.type === ChannelActionType.SEND_MESSAGE &&
+				(a as unknown as { replay?: boolean }).replay === true &&
+				(a as unknown as { messageType: MessageType }).messageType ===
+					MessageType.UPDATE_ADD_HTLC
+		) as unknown as Array<{ payload: Buffer }>;
+		expect(replayed).to.have.length(1);
+		// Byte for byte what was sent before the crash.
+		expect(replayed[0].payload.equals(sentBytes)).to.equal(true);
+		expect(restored.getRecoveryStatus()).to.equal(
+			ChannelRecoveryStatus.ReplayRequired
+		);
 	});
 
 	it('an uncertain channel shown a future state upgrades to LocalDataLoss', function () {
