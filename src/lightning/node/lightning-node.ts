@@ -243,7 +243,12 @@ import {
 	IChannelState,
 	mustNotBroadcastCommitment
 } from '../channel/channel-state';
-import { IScbChannelEntry, encodeScb } from '../backup/scb';
+import {
+	IScbChannelEntry,
+	encodeScb,
+	parseScbAddress,
+	validateScbEntry
+} from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
@@ -3605,17 +3610,22 @@ export class LightningNode extends EventEmitter {
 		const skipped: Array<{ channelId: string; reason: string }> = [];
 
 		for (const entry of entries) {
-			const channelId = Buffer.from(entry.channelId, 'hex');
-			if (
-				channelId.length !== 32 ||
-				channelId.toString('hex') !== entry.channelId.toLowerCase()
-			) {
+			// Every field this reconstruction relies on is validated HERE, at
+			// the boundary: an entry that reaches the reconstruction malformed
+			// either installs an unsweepable channel or throws out of this
+			// loop, taking the entries behind it with it.
+			const invalid = validateScbEntry(entry);
+			if (invalid) {
 				skipped.push({
-					channelId: entry.channelId,
-					reason: 'invalid channelId (expected 32-byte hex)'
+					channelId:
+						typeof (entry as { channelId?: unknown })?.channelId === 'string'
+							? entry.channelId
+							: '',
+					reason: invalid
 				});
 				continue;
 			}
+			const channelId = Buffer.from(entry.channelId, 'hex');
 			if (this.channelManager.getChannel(channelId)) {
 				skipped.push({
 					channelId: entry.channelId,
@@ -3691,9 +3701,10 @@ export class LightningNode extends EventEmitter {
 			// (recovery is re-runnable; retry the SCB once storage recovers).
 			// contactRecoveryPeer below is only the best-effort immediate
 			// attempt and persists nothing itself.
-			const dialCandidate = this.firstDialableRecoveryAddress(
-				entry.peerAddresses
-			);
+			const peerAddresses = Array.isArray(entry.peerAddresses)
+				? entry.peerAddresses
+				: [];
+			const dialCandidate = this.firstDialableRecoveryAddress(peerAddresses);
 			if (dialCandidate && this.storage) {
 				try {
 					this.storage.savePeerAddress(
@@ -3773,49 +3784,36 @@ export class LightningNode extends EventEmitter {
 			// hit our provably-stale state, prompting it to error and force-close.
 			// Failures are non-fatal - recovery only needs the funding spend to
 			// appear on chain eventually.
-			if (this.peerManager && entry.peerAddresses.length > 0) {
-				void this.contactRecoveryPeer(entry.peerNodeId, entry.peerAddresses);
+			if (this.peerManager && peerAddresses.length > 0) {
+				void this.contactRecoveryPeer(entry.peerNodeId, peerAddresses);
 			}
 		}
 
 		return { recovering, skipped };
 	}
 
-	/** Try each known address for a recovery peer until one connects. */
 	/**
-	 * Parse one backup address entry: 'host:port' with a possibly-bracketed
-	 * IPv6 host, split on the LAST colon. The ONE parser shared by SCB
-	 * address persistence and the immediate dial loop, so the two can never
-	 * drift on what counts as valid.
+	 * First backup address entry that parses to a dialable (host, port).
+	 * `parseScbAddress` is THE parser for the format, shared with entry
+	 * validation and the dial loop below so none of them can drift.
 	 */
-	private parseRecoveryAddress(
-		address: string
-	): { host: string; port: number } | null {
-		const sep = address.lastIndexOf(':');
-		if (sep <= 0) return null;
-		const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
-		const port = parseInt(address.slice(sep + 1), 10);
-		if (!Number.isFinite(port) || port <= 0) return null;
-		return { host, port };
-	}
-
-	/** First backup address entry that parses to a dialable (host, port). */
 	private firstDialableRecoveryAddress(
 		addresses: string[]
 	): { host: string; port: number } | null {
 		for (const address of addresses) {
-			const parsed = this.parseRecoveryAddress(address);
+			const parsed = parseScbAddress(address);
 			if (parsed) return parsed;
 		}
 		return null;
 	}
 
+	/** Try each known address for a recovery peer until one connects. */
 	private async contactRecoveryPeer(
 		peerNodeId: string,
 		addresses: string[]
 	): Promise<void> {
 		for (const address of addresses) {
-			const parsed = this.parseRecoveryAddress(address);
+			const parsed = parseScbAddress(address);
 			if (!parsed) continue;
 			try {
 				await this.connectPeer(peerNodeId, parsed.host, parsed.port);

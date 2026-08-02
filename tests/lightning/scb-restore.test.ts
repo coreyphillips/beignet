@@ -43,6 +43,7 @@ import {
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	encodeScb,
+	IScbChannelEntry,
 	IStaticChannelBackup
 } from '../../src/lightning/backup/scb';
 import { BeignetNode } from '../../src/cli/beignet-node';
@@ -596,6 +597,237 @@ describe('SCB restore', function () {
 			} finally {
 				restored.destroy();
 				storage.close();
+			}
+		});
+
+		/** One real channel's backup entry, with a per-channel key index. */
+		function backupEntries(keyIndex: number | null = 7): IScbChannelEntry[] {
+			const alice = new LightningNode(makeNodeConfig(1));
+			const bob = new LightningNode(makeNodeConfig(2));
+			alice.on('node:error', () => {});
+			bob.on('node:error', () => {});
+			connectNodes(alice, bob);
+			try {
+				const { channelId } = openReadyChannel(alice, bob);
+				alice.getChannelManager().getChannel(channelId)!.channelKeyIndex =
+					keyIndex;
+				const entries = alice.buildStaticChannelBackupData().channels;
+				expect(entries).to.have.length(1);
+				return entries;
+			} finally {
+				alice.destroy();
+				bob.destroy();
+			}
+		}
+
+		function recoveryNode(storage: SqliteStorage): LightningNode {
+			const node = new LightningNode({ ...makeNodeConfig(1), storage });
+			node.on('node:error', () => {});
+			return node;
+		}
+
+		it('skips malformed entries with a reason and still recovers the valid ones', async function () {
+			const good = backupEntries()[0];
+			// Validation happens at the boundary, so a malformed entry can
+			// neither install a channel nor take the entries behind it down
+			// with it. The satoshi string goes FIRST for exactly that reason:
+			// reaching the reconstruction, it threw out of the whole loop.
+			const entries: IScbChannelEntry[] = [
+				{
+					...good,
+					channelId: '11'.repeat(32),
+					fundingSatoshis: 'not-a-number'
+				},
+				{ ...good, channelId: '22'.repeat(32), fundingTxid: 'zz'.repeat(32) },
+				{
+					...good,
+					channelId: '33'.repeat(32),
+					peerNodeId: '02' + 'bb'.repeat(32)
+				},
+				{ ...good, channelId: 'nothex' },
+				{
+					...good,
+					channelId: '44'.repeat(32),
+					role: 'INITIATOR'
+				} as unknown as IScbChannelEntry,
+				good
+			];
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = recoveryNode(storage);
+			try {
+				const result = await node.recoverFromStaticChannelBackup(entries);
+
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped.map((s) => s.channelId)).to.deep.equal([
+					'11'.repeat(32),
+					'22'.repeat(32),
+					'33'.repeat(32),
+					'nothex',
+					'44'.repeat(32)
+				]);
+				expect(result.skipped[0].reason).to.contain('fundingSatoshis');
+				expect(result.skipped[1].reason).to.contain('fundingTxid');
+				expect(result.skipped[2].reason).to.contain('valid public key');
+				expect(result.skipped[3].reason).to.contain('channelId');
+				expect(result.skipped[4].reason).to.contain('role');
+
+				// Only the valid entry exists, in memory and on disk.
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+				expect(
+					node
+						.getChannelManager()
+						.getChannel(Buffer.from(good.channelId, 'hex'))
+				).to.exist;
+				for (const id of ['11', '22', '33', '44']) {
+					expect(
+						node
+							.getChannelManager()
+							.getChannel(Buffer.from(id.repeat(32), 'hex'))
+					).to.equal(undefined);
+				}
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('persists only a strictly parseable dial candidate', async function () {
+			const good = backupEntries()[0];
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = recoveryNode(storage);
+			try {
+				// A permissive parseInt reads '9735junk' as 9735 and '0' as a
+				// port: both would persist a dial candidate nobody ever wrote,
+				// hiding the one address that can actually be reached.
+				const result = await node.recoverFromStaticChannelBackup([
+					{
+						...good,
+						peerAddresses: [
+							'127.0.0.1:9735junk',
+							'[fe80::1',
+							'198.51.100.9:0',
+							'198.51.100.9:65536',
+							'127.0.0.1:9'
+						]
+					}
+				]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				const saved = storage
+					.loadAllPeerAddresses()
+					.filter((a) => a.pubkey === good.peerNodeId);
+				expect(saved).to.have.length(1);
+				expect(saved[0].host).to.equal('127.0.0.1');
+				expect(saved[0].port).to.equal(9);
+			} finally {
+				node.destroy();
+			}
+
+			// Addresses that ALL fail to parse, or a list that is not there at
+			// all, are the empty-address case: the channel still recovers (the
+			// peer may dial us), and nothing unusable is written as a dial
+			// candidate. Addresses are advisory; they never forfeit funds.
+			const storage2 = new SqliteStorage(':memory:');
+			storage2.open();
+			const node2 = recoveryNode(storage2);
+			const noAddresses = { ...good } as Record<string, unknown>;
+			delete noAddresses.peerAddresses;
+			try {
+				const result = await node2.recoverFromStaticChannelBackup([
+					{ ...good, peerAddresses: ['9735', 'host:0', ':9735'] },
+					{
+						...(noAddresses as unknown as IScbChannelEntry),
+						channelId: '55'.repeat(32)
+					}
+				]);
+				expect(result.recovering).to.deep.equal([
+					good.channelId,
+					'55'.repeat(32)
+				]);
+				expect(result.skipped).to.deep.equal([]);
+				expect(
+					storage2
+						.loadAllPeerAddresses()
+						.filter((a) => a.pubkey === good.peerNodeId)
+				).to.have.length(0);
+				expect(
+					storage2.loadAllChannels().some((c) => c.channelId === good.channelId)
+				).to.equal(true);
+			} finally {
+				node2.destroy();
+			}
+		});
+
+		it('rolls the recovered channel state back when the key index write fails', async function () {
+			const entries = backupEntries(7).map((e) => ({
+				...e,
+				// Port 9 is unreachable: the immediate dial fails, so what the
+				// storage holds afterwards is only what recovery wrote.
+				peerAddresses: ['127.0.0.1:9']
+			}));
+			expect(entries[0].channelKeyIndex).to.equal(7);
+			const channelId = Buffer.from(entries[0].channelId, 'hex');
+
+			// The SECOND mutation of the recovery commit fails. Both ride one
+			// SafetyCritical transaction, so the channel state written just
+			// before it must roll back with it: a channel on disk without its
+			// key index could never derive the keys its sweep needs.
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const originalSaveKeyIndex = storage.saveChannelKeyIndex.bind(storage);
+			(
+				storage as unknown as {
+					saveChannelKeyIndex: typeof storage.saveChannelKeyIndex;
+				}
+			).saveChannelKeyIndex = (): void => {
+				throw new Error('injected key index failure');
+			};
+			const node = recoveryNode(storage);
+			let persistenceErrors = 0;
+			node.on('node:error', (e: { code?: string }) => {
+				if (e.code === 'PERSISTENCE_ERROR') persistenceErrors++;
+			});
+			try {
+				const failed = await node.recoverFromStaticChannelBackup(entries);
+				expect(failed.recovering).to.deep.equal([]);
+				expect(failed.skipped).to.have.length(1);
+				expect(failed.skipped[0].reason).to.contain(
+					'failed to persist recovered channel'
+				);
+				expect(persistenceErrors).to.equal(1);
+				expect(node.getChannelManager().getChannel(channelId)).to.equal(
+					undefined
+				);
+				expect(
+					storage
+						.loadAllChannels()
+						.some((c) => c.channelId === entries[0].channelId)
+				).to.equal(false);
+				expect(storage.loadChannelKeyIndex(entries[0].channelId)).to.equal(
+					null
+				);
+				// Only the harmless orphan address survived.
+				expect(
+					storage
+						.loadAllPeerAddresses()
+						.some((a) => a.pubkey === entries[0].peerNodeId)
+				).to.equal(true);
+
+				// Storage recovers: the same node retries the same backup.
+				(
+					storage as unknown as {
+						saveChannelKeyIndex: typeof storage.saveChannelKeyIndex;
+					}
+				).saveChannelKeyIndex = originalSaveKeyIndex;
+				const retried = await node.recoverFromStaticChannelBackup(entries);
+				expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+				expect(storage.loadChannelKeyIndex(entries[0].channelId)).to.equal(7);
+				expect(node.getChannelManager().getChannel(channelId)).to.exist;
+			} finally {
+				node.destroy();
 			}
 		});
 	});

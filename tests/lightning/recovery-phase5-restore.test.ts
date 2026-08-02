@@ -450,6 +450,8 @@ describe('Recovery phase 5: restore driver', () => {
 		// no recency proof and the takeover must be refused (5.7 step 5).
 		await served[1].server.close();
 		await served[2].server.close();
+		const beforeRefusal = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
 		const target = openStorage();
 		try {
 			await driverFor(target, bind(served)).restore();
@@ -459,6 +461,21 @@ describe('Recovery phase 5: restore driver', () => {
 			expect((error as RestoreRefusedError).reason).to.equal('no-quorum');
 		}
 		expect(loadWriterLease(target).state).to.equal('missing');
+		// Refused BEFORE the CAS, not after: the reachable guardian still
+		// holds the old writer's epoch, and no takeover certificate exists.
+		const afterRefusal = await served[0].client.getHead(ROOT.recoveryId);
+		const afterState = afterRefusal.state as GuardianState;
+		expect(afterState.lease.epoch).to.equal(beforeRefusal.lease.epoch);
+		expect(
+			afterState.lease.writerPublicKey.equals(
+				beforeRefusal.lease.writerPublicKey
+			)
+		).to.equal(true);
+		expect(
+			(afterRefusal.certificates ?? []).some(
+				(cert) => cert.newEpoch > beforeRefusal.lease.epoch
+			)
+		).to.equal(false);
 		await shutdown(served);
 
 		// A namespace nobody serves has nothing to restore.
@@ -562,6 +579,112 @@ describe('Recovery phase 5: restore driver', () => {
 		).to.equal(null);
 		await shutdown(served);
 		live.storage.close();
+		target.close();
+	});
+
+	it('repairs a guardian that missed the takeover and discards its superseded tail', async () => {
+		// Phase 5 acceptance (docs/RECOVERY-PROTOCOL.md 9): a lagging guardian
+		// adopts the certified takeover head through SYNC_EPOCH and discards
+		// the uncommitted superseded-epoch tail sitting above it. The tail is
+		// the dangerous half: one guardian holding a record no quorum ever
+		// acknowledged must never pull a restore above the certified head.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(2);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+		await rep.replicatePending(lease);
+		const certifiedHead = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		// The dying writer lands ONE more transition on G3 alone: a
+		// sub-threshold tail under the epoch that is about to be superseded.
+		const tailHash = Buffer.alloc(32, 77).toString('hex');
+		expect(
+			live.manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: tailHash,
+						preimage: Buffer.alloc(32, 77)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const frames = live.storage.loadRecoveryFrames();
+		const tailFrame = frames[frames.length - 1];
+		const tailRecord = rep.signRecord(tailFrame, lease);
+		expect((await served[2].client.putState(tailRecord)).status).to.equal(
+			GuardianStatus.OK
+		);
+
+		// G3 goes dark, so the takeover reaches G1 and G2 only.
+		await served[2].server.close();
+		const firstTarget = openStorage();
+		const first = await driverFor(firstTarget, bind(served)).restore();
+		expect(first.certifiedState.logHead.sequence).to.equal(
+			certifiedHead.logHead.sequence
+		);
+
+		// G3 comes back at the superseded epoch, still holding its tail.
+		const revived = new GuardianHttpServer({ guardian: served[2].guardian });
+		const revivedPort = await revived.listen(0);
+		const revivedClient = new GuardianClient({
+			url: `http://127.0.0.1:${revivedPort}`,
+			guardianSetId: SET_ID
+		});
+		const before = (await revivedClient.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(before.lease.epoch).to.equal(certifiedHead.lease.epoch);
+		expect(before.logHead.sequence).to.equal(
+			certifiedHead.logHead.sequence + 1n
+		);
+
+		// The next restore reads all three heads. G3 is AHEAD by sequence and
+		// BEHIND by epoch: SYNC_EPOCH must fix its head at the certified one.
+		const events: IRestoreEvent[] = [];
+		const target = openStorage();
+		const result = await driverFor(
+			target,
+			[
+				...bind(served.slice(0, 2)),
+				{ client: revivedClient, expectedGuardianId: served[2].id }
+			],
+			events
+		).restore();
+
+		expect(result.certifiedState.logHead.sequence).to.equal(
+			certifiedHead.logHead.sequence
+		);
+		expect(result.guardiansRepaired).to.be.at.least(1);
+		const after = (await revivedClient.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+		expect(after.logHead.sequence).to.equal(certifiedHead.logHead.sequence);
+		expect(after.lease.epoch).to.equal(result.lease.epoch);
+
+		// The tail was archived, not served, and never reached the restore.
+		const orphans = served[2].guardian.listOrphanedRecords(ROOT.recoveryId);
+		expect(orphans.length).to.equal(1);
+		expect(orphans[0].reason).to.equal('sync-epoch-truncation');
+		expect(orphans[0].frameHash.equals(tailRecord.frameHash)).to.equal(true);
+		const servedAbove = await revivedClient.getState(
+			ROOT.recoveryId,
+			certifiedHead.logHead.sequence
+		);
+		expect(servedAbove.records ?? []).to.have.length(0);
+		expect(
+			live.storage.loadAllPreimages().some((p) => p.paymentHash === tailHash)
+		).to.equal(true);
+		expect(
+			target.loadAllPreimages().some((p) => p.paymentHash === tailHash)
+		).to.equal(false);
+
+		await revived.close();
+		await shutdown(served);
+		live.storage.close();
+		firstTarget.close();
 		target.close();
 	});
 

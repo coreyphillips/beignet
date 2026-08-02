@@ -58,6 +58,7 @@ import {
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import { ChannelRecoveryStatus } from '../../src/lightning/recovery';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -5014,6 +5015,156 @@ describe('Splice', function () {
 				acceptorManager.sendSpliceLocked(channelId);
 				expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
 				expect(acceptorChannel.getState()).to.equal(ChannelState.NORMAL);
+			});
+
+			it('a restart replays the OUTBOX batch VERBATIM and reports ReplayRequired', function () {
+				// Recovery phase 5 acceptance (docs/RECOVERY-PROTOCOL.md 9): the
+				// ReplayRequired branch of the status machine, served from the
+				// recovery outbox. The sibling test above rebuilds the batch by
+				// re-signing, which a taproot channel must never do (a fresh
+				// MuSig2 secret nonce would sign material the peer may already
+				// hold). The outbox exists so the restart replays the STORED
+				// bytes instead, and this pins both halves: the bytes are
+				// byte-identical to what was sent before the crash, and while
+				// they are being served the channel reports ReplayRequired.
+				const pair = pendingLockPair();
+				const {
+					openerManager,
+					acceptorManager,
+					channelId,
+					openerChannel,
+					acceptorChannel,
+					openerPubkey,
+					acceptorPubkey
+				} = pair;
+
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				const fromOpener: Array<{ type: number; payload: Buffer }> = [];
+				const fromAcceptor: Array<{ type: number; payload: Buffer }> = [];
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === acceptorPubkey) fromOpener.push({ type, payload });
+				});
+				acceptorManager.on('message:outbound', (pk, type, payload) => {
+					if (pk === openerPubkey) fromAcceptor.push({ type, payload });
+				});
+
+				const preimage = crypto.randomBytes(32);
+				openerManager.addHtlc(
+					channelId,
+					15_000_000n,
+					crypto.createHash('sha256').update(preimage).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				);
+				// [update_add_htlc, start_batch, commitment_signed, commitment_signed]
+				expect(fromOpener.length).to.equal(4);
+				// Exactly what the recovery outbox retains for this transition.
+				const storedBatch = {
+					startBatch: Buffer.from(fromOpener[1].payload),
+					commitments: [
+						Buffer.from(fromOpener[2].payload),
+						Buffer.from(fromOpener[3].payload)
+					]
+				};
+				expect(fromOpener[1].type).to.equal(MessageType.START_BATCH);
+				expect(fromOpener[2].type).to.equal(MessageType.COMMITMENT_SIGNED);
+				expect(fromOpener[3].type).to.equal(MessageType.COMMITMENT_SIGNED);
+
+				// Only the add reaches the acceptor; the batch is lost.
+				acceptorManager.handleMessage(
+					openerPubkey,
+					fromOpener[0].type,
+					fromOpener[0].payload
+				);
+				openerManager.handlePeerDisconnected(acceptorPubkey);
+				acceptorManager.handlePeerDisconnected(openerPubkey);
+
+				// The restart: the in-memory cache dies, and boot repopulates it
+				// from the outbox rows, exactly as
+				// LightningNode.restoreOutboxRetransmission does.
+				(
+					openerChannel as unknown as { _lastSentBatch: unknown }
+				)._lastSentBatch = null;
+				openerChannel.restoreLastSentBatch(
+					storedBatch.startBatch,
+					storedBatch.commitments
+				);
+				expect(openerChannel.getRecoveryStatus()).to.equal(
+					ChannelRecoveryStatus.Quarantined
+				);
+
+				fromOpener.length = 0;
+				fromAcceptor.length = 0;
+				openerManager.handlePeerReconnected(acceptorPubkey);
+				acceptorManager.handlePeerReconnected(openerPubkey);
+				const openerReest = fromOpener.splice(0);
+				const acceptorReest = fromAcceptor.splice(0);
+				openerManager.removeAllListeners('message:outbound');
+				acceptorManager.removeAllListeners('message:outbound');
+				// Record what the opener puts on the wire in answer to the
+				// peer's reestablish, then let it through to the acceptor. The
+				// status is sampled as the FIRST replayed byte leaves: the
+				// loopback is synchronous, so the round has already converged
+				// by the time the last one has.
+				const replayed: Array<{ type: number; payload: Buffer }> = [];
+				let statusWhileServing: ChannelRecoveryStatus | null = null;
+				openerManager.on('message:outbound', (pk, type, payload) => {
+					if (pk !== acceptorPubkey) return;
+					if (statusWhileServing === null) {
+						statusWhileServing = openerChannel.getRecoveryStatus();
+					}
+					replayed.push({ type, payload });
+				});
+				connectManagers(
+					openerManager,
+					openerPubkey,
+					acceptorManager,
+					acceptorPubkey
+				);
+				for (const m of openerReest) {
+					acceptorManager.handleMessage(openerPubkey, m.type, m.payload);
+				}
+				for (const m of acceptorReest) {
+					openerManager.handleMessage(acceptorPubkey, m.type, m.payload);
+				}
+
+				// The stored bytes went back out unchanged: nothing was re-signed.
+				const replayedBatch = replayed.filter(
+					(m) =>
+						m.type === MessageType.START_BATCH ||
+						m.type === MessageType.COMMITMENT_SIGNED
+				);
+				expect(replayedBatch).to.have.length(3);
+				expect(
+					replayedBatch[0].payload.equals(storedBatch.startBatch)
+				).to.equal(true);
+				expect(
+					replayedBatch[1].payload.equals(storedBatch.commitments[0])
+				).to.equal(true);
+				expect(
+					replayedBatch[2].payload.equals(storedBatch.commitments[1])
+				).to.equal(true);
+
+				// The round converged off those exact bytes, and the status
+				// machine followed it: ReplayRequired while the retransmission
+				// was being served, then on with the channel's life.
+				expect(statusWhileServing).to.equal(
+					ChannelRecoveryStatus.ReplayRequired
+				);
+				const oEntry = [...openerChannel.getFullState().htlcs.values()][0];
+				const aEntry = [...acceptorChannel.getFullState().htlcs.values()][0];
+				expect(oEntry?.state).to.equal(HtlcState.COMMITTED);
+				expect(aEntry?.state).to.equal(HtlcState.COMMITTED);
+				expect(openerChannel.getState()).to.equal(ChannelState.SPLICING);
+
+				acceptorManager.fulfillHtlc(channelId, 0n, preimage);
+				openerManager.sendSpliceLocked(channelId);
+				acceptorManager.sendSpliceLocked(channelId);
+				expect(openerChannel.getState()).to.equal(ChannelState.NORMAL);
+				expect(openerChannel.getRecoveryStatus()).to.equal(
+					ChannelRecoveryStatus.Active
+				);
 			});
 
 			it('the add itself is lost', function () {

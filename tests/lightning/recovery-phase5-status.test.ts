@@ -11,6 +11,12 @@
  * compatible channel_reestablish proves nothing about exactness (a peer can
  * under-report counters while holding a newer state), so the flag never
  * clears on the wire; only recovery-storage provenance can leave it off.
+ *
+ * ReplayRequired appears here served from persisted channel state. The other
+ * half of that branch, retransmission served from the recovery OUTBOX, needs
+ * a splice pending-lock batch (the case that cannot be rebuilt by re-signing)
+ * and lives beside that harness: see 'a restart replays the OUTBOX batch
+ * VERBATIM and reports ReplayRequired' in splice.test.ts.
  */
 
 import { expect } from 'chai';
