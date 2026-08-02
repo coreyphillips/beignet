@@ -3634,24 +3634,37 @@ export class LightningNode extends EventEmitter {
 			// The disposition is useless without an address to dial after a
 			// restart, and the backup's addresses were known-good persisted
 			// peer addresses when the SCB was written, so restore the first
-			// valid one to the same store. BEFORE the channel: an orphan
-			// address is harmless if channel persistence fails below, while
-			// the reverse ordering can strand the durable close request on a
-			// crash between the two writes. contactRecoveryPeer below is only
-			// the best-effort immediate attempt and persists nothing itself.
+			// valid one to the same store. BEFORE the channel, as a HARD
+			// prerequisite: an orphan address is harmless if channel
+			// persistence fails below, but a recovery-close channel installed
+			// without its dial candidate strands the close request after a
+			// restart, so a failed address write SKIPS this channel entirely
+			// (recovery is re-runnable; retry the SCB once storage recovers).
+			// contactRecoveryPeer below is only the best-effort immediate
+			// attempt and persists nothing itself.
 			const dialCandidate = this.firstDialableRecoveryAddress(
 				entry.peerAddresses
 			);
 			if (dialCandidate && this.storage) {
-				this.safeStorage(
-					() =>
-						this.storage!.savePeerAddress(
-							entry.peerNodeId,
-							dialCandidate.host,
-							dialCandidate.port
-						),
-					'savePeerAddress'
-				);
+				try {
+					this.storage.savePeerAddress(
+						entry.peerNodeId,
+						dialCandidate.host,
+						dialCandidate.port
+					);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					skipped.push({
+						channelId: entry.channelId,
+						reason: `failed to persist recovery peer address: ${message}`
+					});
+					this.emit('node:error', {
+						code: 'PERSISTENCE_ERROR',
+						message: `saveRecoveryPeerAddress: ${message}`,
+						timestamp: Date.now()
+					} as ILightningError);
+					continue;
+				}
 			}
 
 			const channel = new Channel(state);
@@ -3704,21 +3717,29 @@ export class LightningNode extends EventEmitter {
 
 	/** Try each known address for a recovery peer until one connects. */
 	/**
-	 * First backup address entry that parses to a dialable (host, port).
-	 * 'host:port' with a possibly-bracketed IPv6 host: split on the LAST
-	 * colon. Shared by the SCB address persistence and the dial loop so the
-	 * two can never disagree about validity.
+	 * Parse one backup address entry: 'host:port' with a possibly-bracketed
+	 * IPv6 host, split on the LAST colon. The ONE parser shared by SCB
+	 * address persistence and the immediate dial loop, so the two can never
+	 * drift on what counts as valid.
 	 */
+	private parseRecoveryAddress(
+		address: string
+	): { host: string; port: number } | null {
+		const sep = address.lastIndexOf(':');
+		if (sep <= 0) return null;
+		const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
+		const port = parseInt(address.slice(sep + 1), 10);
+		if (!Number.isFinite(port) || port <= 0) return null;
+		return { host, port };
+	}
+
+	/** First backup address entry that parses to a dialable (host, port). */
 	private firstDialableRecoveryAddress(
 		addresses: string[]
 	): { host: string; port: number } | null {
 		for (const address of addresses) {
-			const sep = address.lastIndexOf(':');
-			if (sep <= 0) continue;
-			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
-			const port = parseInt(address.slice(sep + 1), 10);
-			if (!Number.isFinite(port) || port <= 0) continue;
-			return { host, port };
+			const parsed = this.parseRecoveryAddress(address);
+			if (parsed) return parsed;
 		}
 		return null;
 	}
@@ -3728,13 +3749,10 @@ export class LightningNode extends EventEmitter {
 		addresses: string[]
 	): Promise<void> {
 		for (const address of addresses) {
-			const sep = address.lastIndexOf(':');
-			if (sep <= 0) continue;
-			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
-			const port = parseInt(address.slice(sep + 1), 10);
-			if (!Number.isFinite(port) || port <= 0) continue;
+			const parsed = this.parseRecoveryAddress(address);
+			if (!parsed) continue;
 			try {
-				await this.connectPeer(peerNodeId, host, port);
+				await this.connectPeer(peerNodeId, parsed.host, parsed.port);
 				return;
 			} catch {
 				// Try the next address; unreachable peers are expected here.

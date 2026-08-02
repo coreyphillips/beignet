@@ -427,6 +427,61 @@ describe('SCB restore', function () {
 					restarted.destroy();
 				}
 
+				// Failure path: the prerequisite address write must be able to
+				// FAIL the restoration of that channel. If savePeerAddress
+				// alone throws while channel persistence stays healthy, a
+				// swallowed error would install a recovery-close channel with
+				// no dial candidate, recreating the stranded disposition.
+				const storage2 = new SqliteStorage(':memory:');
+				storage2.open();
+				const originalSave = storage2.savePeerAddress.bind(storage2);
+				(
+					storage2 as unknown as {
+						savePeerAddress: (p: string, h: string, po: number) => void;
+					}
+				).savePeerAddress = (): void => {
+					throw new Error('injected savePeerAddress failure');
+				};
+				const faulted = new LightningNode({
+					...makeNodeConfig(1),
+					storage: storage2
+				});
+				faulted.on('node:error', () => {});
+				try {
+					const failedResult =
+						await faulted.recoverFromStaticChannelBackup(entries);
+					expect(failedResult.recovering).to.not.include(entries[0].channelId);
+					expect(failedResult.skipped).to.have.length(1);
+					expect(failedResult.skipped[0].reason).to.contain('peer address');
+					// Nothing installed, in memory or on disk.
+					expect(faulted.getChannelManager().getChannel(channelId)).to.equal(
+						undefined
+					);
+					expect(
+						storage2
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(false);
+
+					// The failure is recoverable: clear the fault and retry the
+					// SAME backup on the SAME node and storage.
+					(
+						storage2 as unknown as {
+							savePeerAddress: (p: string, h: string, po: number) => void;
+						}
+					).savePeerAddress = originalSave;
+					const retried = await faulted.recoverFromStaticChannelBackup(entries);
+					expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+					expect(
+						storage2
+							.loadAllPeerAddresses()
+							.some((a) => a.pubkey === entries[0].peerNodeId)
+					).to.equal(true);
+					expect(faulted.getChannelManager().getChannel(channelId)).to.exist;
+				} finally {
+					faulted.destroy();
+				}
+
 				// Funding outpoint watched: the script was fetched from the chain
 				// and its scripthash subscribed.
 				expect(backend.getTransactionCalls).to.include(fundingDisplayTxid);
