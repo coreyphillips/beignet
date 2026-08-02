@@ -461,6 +461,22 @@ export class PeerManager extends EventEmitter {
 	private pendingPeers = new Set<Peer>();
 
 	/**
+	 * Listeners whose bind has not completed. this.server / this.wsServer are
+	 * only assigned after the asynchronous bind, so a freeze landing mid-bind
+	 * would otherwise miss the listener and leave a fenced node bound.
+	 */
+	private pendingTcpServers = new Set<net.Server>();
+	private pendingWsServers = new Set<WebSocketServer>();
+
+	/**
+	 * Rejects listen()/listenWebSocket() calls whose bind is in flight when
+	 * a teardown lands. Closing a net.Server mid-bind silently CANCELS the
+	 * pending bind (no 'listening', no 'error'), so without this hook the
+	 * awaiting caller would hang forever.
+	 */
+	private pendingListenAborts = new Set<(err: Error) => void>();
+
+	/**
 	 * Permanently stop ALL connection activity: close listeners, clear every
 	 * reconnect and stability timer (they can exist for peers that are
 	 * currently disconnected, which no listPeers() sweep reaches), abort
@@ -472,7 +488,38 @@ export class PeerManager extends EventEmitter {
 	freezeConnections(): void {
 		if (this.permanentlyFrozen) return;
 		this.permanentlyFrozen = true;
+		this.teardownConnections();
+	}
+
+	/**
+	 * Shared teardown for freezeConnections() and destroy(), kept in one
+	 * place so the two shutdown paths cannot drift apart: listeners bound
+	 * AND still binding, every reconnect and stability timer, establishments
+	 * still in flight, and every registered peer.
+	 */
+	private teardownConnections(): void {
 		this.stopListening();
+		for (const server of this.pendingTcpServers) {
+			try {
+				server.close();
+			} catch {
+				// The bind may not have completed; listen()'s own recheck
+				// closes such a server the moment its bind resolves.
+			}
+		}
+		this.pendingTcpServers.clear();
+		for (const server of this.pendingWsServers) {
+			try {
+				server.close();
+			} catch {
+				// Same as above for the WebSocket bind.
+			}
+		}
+		this.pendingWsServers.clear();
+		for (const abort of [...this.pendingListenAborts]) {
+			abort(new Error('Listener aborted: connections were torn down'));
+		}
+		this.pendingListenAborts.clear();
 		for (const timer of this.reconnectTimers.values()) {
 			clearTimeout(timer);
 		}
@@ -633,27 +680,50 @@ export class PeerManager extends EventEmitter {
 			throw new Error('Already listening');
 		}
 
-		return new Promise((resolve, reject) => {
-			const server = net.createServer((socket) => {
-				this.handleInboundConnection(socket);
-			});
-
-			server.on('error', (err) => {
-				this.emit('listen:error', err);
-			});
-
-			server.listen(port, host, () => {
-				this.server = server;
-				this.emit('listening', port, host);
-				resolve();
-			});
-
-			server.once('error', (err) => {
-				if (!this.server) {
-					reject(err);
-				}
-			});
+		const server = net.createServer((socket) => {
+			this.handleInboundConnection(socket);
 		});
+		server.on('error', (err) => {
+			this.emit('listen:error', err);
+		});
+		// Visible to freezeConnections() while the bind is in flight.
+		this.pendingTcpServers.add(server);
+		let abortBind: (err: Error) => void = () => undefined;
+		const abortPromise = new Promise<never>((_, reject) => {
+			abortBind = reject;
+		});
+		abortPromise.catch(() => {
+			// Consumed via the race when a teardown lands mid-bind.
+		});
+		this.pendingListenAborts.add(abortBind);
+		try {
+			await Promise.race([
+				new Promise<void>((resolve, reject) => {
+					server.once('error', (err) => {
+						if (!this.server) {
+							reject(err);
+						}
+					});
+					server.listen(port, host, () => {
+						resolve();
+					});
+				}),
+				abortPromise
+			]);
+			// Recheck AFTER the bind: a freeze that landed mid-bind must win
+			// over publication, or a fenced node stays externally bound.
+			if (this.permanentlyFrozen) {
+				server.close();
+				throw new Error(
+					'Listener invalidated while starting: connections are permanently frozen'
+				);
+			}
+			this.server = server;
+			this.emit('listening', port, host);
+		} finally {
+			this.pendingListenAborts.delete(abortBind);
+			this.pendingTcpServers.delete(server);
+		}
 	}
 
 	/**
@@ -674,11 +744,38 @@ export class PeerManager extends EventEmitter {
 		server.on('error', (err: Error) => {
 			this.emit('listen:error', err);
 		});
-		await server.listen(port, host);
-		this.wsServer = server;
-		const addr = server.address();
-		const boundPort = addr && typeof addr === 'object' ? addr.port : port;
-		this.emit('listening:ws', boundPort, host);
+		// Visible to freezeConnections() while the bind is in flight.
+		this.pendingWsServers.add(server);
+		let abortBind: (err: Error) => void = () => undefined;
+		const abortPromise = new Promise<never>((_, reject) => {
+			abortBind = reject;
+		});
+		abortPromise.catch(() => {
+			// Consumed via the race when a teardown lands mid-bind.
+		});
+		this.pendingListenAborts.add(abortBind);
+		try {
+			const bind = server.listen(port, host);
+			bind.catch(() => {
+				// Consumed via the race; an abort winning must not leave the
+				// losing bind's rejection unhandled.
+			});
+			await Promise.race([bind, abortPromise]);
+			// Recheck AFTER the bind, exactly as in listen().
+			if (this.permanentlyFrozen) {
+				server.close();
+				throw new Error(
+					'Listener invalidated while starting: connections are permanently frozen'
+				);
+			}
+			this.wsServer = server;
+			const addr = server.address();
+			const boundPort = addr && typeof addr === 'object' ? addr.port : port;
+			this.emit('listening:ws', boundPort, host);
+		} finally {
+			this.pendingListenAborts.delete(abortBind);
+			this.pendingWsServers.delete(server);
+		}
 	}
 
 	/**
@@ -726,20 +823,8 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect all peers and clean up.
 	 */
 	destroy(): void {
-		this.stopListening();
-		for (const [pubkey] of this.peers) {
-			this.disconnectPeer(pubkey);
-		}
-		for (const timer of this.reconnectTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.reconnectTimers.clear();
-		this.reconnectDelays.clear();
+		this.teardownConnections();
 		this.announcedAddresses.clear();
-		for (const timer of this.stabilityTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.stabilityTimers.clear();
 		this.messageHandlers.clear();
 	}
 

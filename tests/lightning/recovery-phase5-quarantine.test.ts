@@ -911,6 +911,49 @@ describe('Recovery phase 5: startup quarantine', () => {
 		expect(fake.writes).to.have.length(0);
 	});
 
+	it('freezeConnections closes a TCP listener that is still binding', async () => {
+		// this.server is only assigned after the asynchronous bind, so a
+		// freeze landing mid-bind saw no listener to close and left a fenced
+		// node externally bound. The freeze fires synchronously after
+		// listen() starts, which is deterministically inside the bind.
+		const pm = new PeerManager({ localPrivateKey: sha('freeze-bind-tcp') });
+		try {
+			const listening = pm.listen(0);
+			listening.catch(() => {});
+			pm.freezeConnections();
+			let err: unknown;
+			try {
+				await listening;
+			} catch (e) {
+				err = e;
+			}
+			expect(String(err)).to.match(/invalidated|frozen|aborted/i);
+			expect(pm.isListening()).to.equal(false);
+		} finally {
+			pm.destroy();
+		}
+	});
+
+	it('freezeConnections closes a WebSocket listener that is still binding', async () => {
+		// Same race as the TCP variant, across listenWebSocket's await.
+		const pm = new PeerManager({ localPrivateKey: sha('freeze-bind-ws') });
+		try {
+			const listening = pm.listenWebSocket(0);
+			listening.catch(() => {});
+			pm.freezeConnections();
+			let err: unknown;
+			try {
+				await listening;
+			} catch (e) {
+				err = e;
+			}
+			expect(String(err)).to.match(/invalidated|frozen|aborted/i);
+			expect(pm.isListening()).to.equal(false);
+		} finally {
+			pm.destroy();
+		}
+	});
+
 	it('freezeConnections clears reconnect timers for DISCONNECTED peers and disables rescheduling', async () => {
 		// disconnectPeer clears timers per pubkey, but reconnect timers also
 		// exist for peers that are currently disconnected, which no
