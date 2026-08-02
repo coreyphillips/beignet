@@ -223,9 +223,9 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
-		if (this.permanentlyFrozen) {
+		if (this.connectionsDisabled()) {
 			throw new Error(
-				`Connections are permanently frozen; refusing dial to peer ${pubkey}`
+				`Connections are ${this.connectionsDisabledReason()}; refusing dial to peer ${pubkey}`
 			);
 		}
 		if (this.connectionGate && !this.connectionGate()) {
@@ -302,10 +302,10 @@ export class PeerManager extends EventEmitter {
 		} finally {
 			this.pendingPeers.delete(peer);
 		}
-		// Recheck AFTER the async establishment: a freeze or gate closure
-		// that landed mid-handshake must win over registration.
+		// Recheck AFTER the async establishment: a freeze, destroy or gate
+		// closure that landed mid-handshake must win over registration.
 		if (
-			this.permanentlyFrozen ||
+			this.connectionsDisabled() ||
 			(this.connectionGate && !this.connectionGate())
 		) {
 			peer.removeAllListeners();
@@ -452,6 +452,23 @@ export class PeerManager extends EventEmitter {
 
 	/** freezeConnections() ran; no connection may ever be established again. */
 	private permanentlyFrozen = false;
+
+	/** destroy() ran; ordinary shutdown must not arm new reconnect work. */
+	private destroyed = false;
+
+	/**
+	 * Both irreversible end states. Consulted wherever a connection could be
+	 * established or scheduled: destroy() aborting an in-flight connectPeer
+	 * lands in its catch path, which would otherwise schedule a fresh
+	 * reconnect on a manager that just shut down.
+	 */
+	private connectionsDisabled(): boolean {
+		return this.destroyed || this.permanentlyFrozen;
+	}
+
+	private connectionsDisabledReason(): string {
+		return this.permanentlyFrozen ? 'permanently frozen' : 'destroyed';
+	}
 
 	/**
 	 * Peers whose connect/accept is still in flight. They are invisible to
@@ -673,8 +690,10 @@ export class PeerManager extends EventEmitter {
 	 * Start listening for inbound peer connections.
 	 */
 	async listen(port: number, host = '0.0.0.0'): Promise<void> {
-		if (this.permanentlyFrozen) {
-			throw new Error('Connections are permanently frozen; refusing to listen');
+		if (this.connectionsDisabled()) {
+			throw new Error(
+				`Connections are ${this.connectionsDisabledReason()}; refusing to listen`
+			);
 		}
 		if (this.server) {
 			throw new Error('Already listening');
@@ -712,10 +731,10 @@ export class PeerManager extends EventEmitter {
 			]);
 			// Recheck AFTER the bind: a freeze that landed mid-bind must win
 			// over publication, or a fenced node stays externally bound.
-			if (this.permanentlyFrozen) {
+			if (this.connectionsDisabled()) {
 				server.close();
 				throw new Error(
-					'Listener invalidated while starting: connections are permanently frozen'
+					`Listener invalidated while starting: connections are ${this.connectionsDisabledReason()}`
 				);
 			}
 			this.server = server;
@@ -731,8 +750,10 @@ export class PeerManager extends EventEmitter {
 	 * additive: coexists with (does not replace) the TCP listener.
 	 */
 	async listenWebSocket(port: number, host = '0.0.0.0'): Promise<void> {
-		if (this.permanentlyFrozen) {
-			throw new Error('Connections are permanently frozen; refusing to listen');
+		if (this.connectionsDisabled()) {
+			throw new Error(
+				`Connections are ${this.connectionsDisabledReason()}; refusing to listen`
+			);
 		}
 		if (this.wsServer) {
 			throw new Error('Already listening for WebSocket peers');
@@ -762,10 +783,10 @@ export class PeerManager extends EventEmitter {
 			});
 			await Promise.race([bind, abortPromise]);
 			// Recheck AFTER the bind, exactly as in listen().
-			if (this.permanentlyFrozen) {
+			if (this.connectionsDisabled()) {
 				server.close();
 				throw new Error(
-					'Listener invalidated while starting: connections are permanently frozen'
+					`Listener invalidated while starting: connections are ${this.connectionsDisabledReason()}`
 				);
 			}
 			this.wsServer = server;
@@ -823,6 +844,10 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect all peers and clean up.
 	 */
 	destroy(): void {
+		if (this.destroyed) return;
+		// Set BEFORE the teardown: aborting an in-flight connectPeer lands in
+		// its catch path, which consults this flag before rescheduling.
+		this.destroyed = true;
 		this.teardownConnections();
 		this.announcedAddresses.clear();
 		this.messageHandlers.clear();
@@ -833,7 +858,7 @@ export class PeerManager extends EventEmitter {
 		// BEFORE the BOLT 8 handshake, so a node that cannot prove writer
 		// ownership never authenticates or exchanges init with anyone.
 		if (
-			this.permanentlyFrozen ||
+			this.connectionsDisabled() ||
 			(this.connectionGate && !this.connectionGate())
 		) {
 			socket.destroy();
@@ -865,7 +890,7 @@ export class PeerManager extends EventEmitter {
 				// Recheck AFTER the handshake: a freeze or gate closure that
 				// landed mid-establishment must win over registration.
 				if (
-					this.permanentlyFrozen ||
+					this.connectionsDisabled() ||
 					(this.connectionGate && !this.connectionGate())
 				) {
 					peer.disconnect();
@@ -998,7 +1023,7 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private scheduleReconnect(pubkey: string): void {
-		if (this.permanentlyFrozen) return; // frozen nodes never redial
+		if (this.connectionsDisabled()) return; // frozen or destroyed: never redial
 		if (this.reconnectTimers.has(pubkey)) return; // already scheduled
 		if (this.reconnectCandidates(pubkey).length === 0) return;
 

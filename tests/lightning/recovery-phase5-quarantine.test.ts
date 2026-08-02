@@ -992,6 +992,51 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
+	it('destroy() during a stalled establishment arms no reconnect timer', async function () {
+		// Ordinary shutdown, not fencing: destroy() aborts the in-flight
+		// connectPeer, whose catch path would schedule a reconnect because
+		// autoReconnect is on. The destroyed flag must refuse it, or a
+		// destroyed manager wakes up and redials.
+		this.timeout(20_000);
+		const pm = new PeerManager({
+			localPrivateKey: sha('destroy-stall-local'),
+			autoReconnect: true
+		});
+		const peerPub = getPublicKey(sha('destroy-stall-remote')).toString('hex');
+		const accepted: net.Socket[] = [];
+		const silent = net.createServer((sock) => {
+			accepted.push(sock);
+			// A paused socket never reads the client's FIN, so 'end' never
+			// fires and server.close() in the cleanup would wait forever.
+			sock.resume();
+		});
+		await new Promise<void>((resolve) => silent.listen(0, resolve));
+		const port = (silent.address() as net.AddressInfo).port;
+		try {
+			const dial = pm.connectPeer(peerPub, '127.0.0.1', port);
+			dial.catch(() => {});
+			await waitFor(() => accepted.length === 1);
+
+			pm.destroy();
+
+			let err: unknown;
+			try {
+				await dial;
+			} catch (e) {
+				err = e;
+			}
+			expect(err).to.not.equal(undefined);
+			expect((pm as any).reconnectTimers.size).to.equal(0);
+			// And rescheduling stays refused after destroy, permanently.
+			(pm as any).scheduleReconnect(peerPub);
+			expect((pm as any).reconnectTimers.size).to.equal(0);
+		} finally {
+			pm.destroy();
+			await new Promise<void>((resolve) => silent.close(() => resolve()));
+			for (const sock of accepted) sock.destroy();
+		}
+	});
+
 	it('a fence landing during an in-flight confirmation is never overwritten', async () => {
 		// The race: confirmation A reads a healthy quorum, then stalls in
 		// flight; a takeover is proven and the gate fences; A's stale answer
