@@ -195,6 +195,7 @@ import {
 	RecoveryManager,
 	RecoveryCriticality,
 	RecoveryMutation,
+	GuardianStartupGate,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
@@ -589,6 +590,13 @@ export class LightningNode extends EventEmitter {
 	/** Recovery Capsule (spec 5.4): journal configured, capsule refresh armed. */
 	private recoveryCapsuleActive = false;
 	private recoveryJournal: RecoveryJournal | undefined;
+	/**
+	 * Startup quarantine (recovery 5.6). When a gate is attached, NOTHING
+	 * reaches a channel peer until a guardian quorum confirms this device
+	 * still owns its writer lease. A stale device therefore discovers it was
+	 * superseded before it can touch the Lightning protocol.
+	 */
+	private recoveryGate: GuardianStartupGate | undefined;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private capsuleLastRefreshAt = 0;
 	/** A journaled commit landed after the last compose (see connect path). */
@@ -2033,6 +2041,15 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {
+				// The transport boundary itself is gated, not just the
+				// high-level state: a quarantined or fenced device must emit
+				// ZERO Lightning wire messages, including reestablish.
+				if (!this.recoveryPermitsPeerTraffic()) {
+					this.recoveryGate?.reportBlocked(
+						`suppressed outbound message type ${type} to ${peerPubkey}`
+					);
+					return;
+				}
 				this.emit('message:outbound', peerPubkey, type, payload);
 			}
 		);
@@ -2806,9 +2823,41 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Attach the startup gate. Until it reports confirmed, outbound messages
+	 * are suppressed and peer connections do not progress to reestablish.
+	 */
+	attachRecoveryGate(gate: GuardianStartupGate): void {
+		this.recoveryGate = gate;
+	}
+
+	/** The gate's view, for operators and tests. */
+	getRecoveryGateState(): string {
+		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
+	}
+
+	/**
+	 * The single question every transport chokepoint asks. With no gate
+	 * attached the node runs ungated, which is the guardian-disabled mode
+	 * the spec allows; with one attached, only a confirmed lease passes.
+	 */
+	private recoveryPermitsPeerTraffic(): boolean {
+		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
+	}
+
 	private wirePeerManagerEvents(): void {
 		if (!this.peerManager) return;
 		this.peerManager.on('peer:connect', (pubkey: string) => {
+			// Quarantine holds channels BEFORE reestablish (recovery 5.6): a
+			// device that cannot prove it owns its lease must not exchange
+			// channel state with anyone, so the connection is left inert.
+			if (!this.recoveryPermitsPeerTraffic()) {
+				this.recoveryGate?.reportBlocked(
+					`refused to bring up channels with ${pubkey} while quarantined`
+				);
+				this.emit('peer:connect', pubkey);
+				return;
+			}
 			// BOLT 1 peer storage first: return the peer's stored blob and push our
 			// own, before reestablish/gossip traffic (spec: ideally right after init).
 			this.sendPeerStorageOnConnect(pubkey);
