@@ -75,10 +75,22 @@ export class GuardianStartupGate {
 	private readonly clock: () => bigint;
 	private state: StartupGateState = 'quarantined';
 	private supersededBy?: GuardianState;
+	private openListeners: Array<() => void> = [];
 
 	constructor(config: IStartupGateConfig) {
 		this.config = config;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
+	}
+
+	/**
+	 * Run `listener` when the gate opens. Peers that connected during
+	 * quarantine sat on deliberately inert connections; whoever holds those
+	 * connections needs to know the moment traffic becomes permitted, or
+	 * they stay inert until the peer gives up and redials.
+	 */
+	onOpen(listener: () => void): void {
+		this.openListeners.push(listener);
+		if (this.state === 'confirmed') listener();
 	}
 
 	private emit(event: IStartupGateEvent): void {
@@ -135,6 +147,15 @@ export class GuardianStartupGate {
 			superseded = answer.superseded;
 			states = answer.states;
 		} catch (error) {
+			if ((this.state as StartupGateState) === 'fenced') {
+				// Fenced concurrently while this attempt was failing; the
+				// failure must not downgrade a permanent state.
+				return {
+					state: 'fenced',
+					confirming: 0,
+					supersededBy: this.supersededBy
+				};
+			}
 			const message = error instanceof Error ? error.message : String(error);
 			this.state = 'quarantined';
 			this.emit({
@@ -142,6 +163,17 @@ export class GuardianStartupGate {
 				detail: `ownership could not be confirmed (${message}); channels stay quarantined`
 			});
 			return { state: 'quarantined', confirming: 0 };
+		}
+
+		if ((this.state as StartupGateState) === 'fenced') {
+			// A concurrent confirmation proved a newer epoch while this one
+			// was in flight. Fencing is permanent, so a slower answer that
+			// still names this lease current must not reopen the gate.
+			return {
+				state: 'fenced',
+				confirming: 0,
+				supersededBy: this.supersededBy
+			};
 		}
 
 		if (superseded) {
@@ -184,6 +216,7 @@ export class GuardianStartupGate {
 			{ epoch: lease.epoch, writerPublicKey: lease.writerPublicKey },
 			this.clock()
 		);
+		const opened = (this.state as StartupGateState) !== 'confirmed';
 		this.state = 'confirmed';
 		this.emit({
 			type: 'gate:confirmed',
@@ -191,6 +224,11 @@ export class GuardianStartupGate {
 				publicLease(lease).epoch
 			}; peer traffic is permitted`
 		});
+		// Fire only on the closed-to-open TRANSITION: a re-confirmation of an
+		// already-open gate must not re-run reestablish on live connections.
+		if (opened) {
+			for (const listener of this.openListeners) listener();
+		}
 		return { state: 'confirmed', confirming };
 	}
 }

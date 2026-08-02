@@ -851,6 +851,17 @@ export class LightningNode extends EventEmitter {
 				webSocketImpl: config.webSocketImpl
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
+			// The socket boundary answers to the startup quarantine gate
+			// (recovery 5.6). ChannelManager sends via sendToPeer DIRECTLY
+			// when a PeerManager is attached, so gating only the node-level
+			// message:outbound relay would leave the production path open.
+			this.peerManager.setOutboundGate((pubkey, type) => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`suppressed outbound message type ${type} to ${pubkey}`
+				);
+				return false;
+			});
 			this.registerGossipHandlers();
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
@@ -2041,16 +2052,7 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {
-				// The transport boundary itself is gated, not just the
-				// high-level state: a quarantined or fenced device must emit
-				// ZERO Lightning wire messages, including reestablish.
-				if (!this.recoveryPermitsPeerTraffic()) {
-					this.recoveryGate?.reportBlocked(
-						`suppressed outbound message type ${type} to ${peerPubkey}`
-					);
-					return;
-				}
-				this.emit('message:outbound', peerPubkey, type, payload);
+				this.emitOutbound(peerPubkey, type, payload);
 			}
 		);
 
@@ -2826,9 +2828,28 @@ export class LightningNode extends EventEmitter {
 	/**
 	 * Attach the startup gate. Until it reports confirmed, outbound messages
 	 * are suppressed and peer connections do not progress to reestablish.
+	 * When the gate later opens, peers that connected during quarantine are
+	 * brought up as if they had just connected; without that, an inert
+	 * connection stays inert until the peer gives up and redials.
 	 */
 	attachRecoveryGate(gate: GuardianStartupGate): void {
 		this.recoveryGate = gate;
+		gate.onOpen(() => {
+			if (!this.peerManager) return;
+			for (const peer of this.peerManager.listPeers()) {
+				try {
+					this.bringUpChannelPeer(peer.pubkey);
+				} catch (err) {
+					// One peer failing to come up (it may have vanished mid
+					// bring-up) must not reject the confirmation that opened
+					// the gate, nor starve the remaining peers.
+					this.emitStructuredLog('peer', 'quarantine_release_failed', {
+						pubkey: peer.pubkey,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				}
+			}
+		});
 	}
 
 	/** The gate's view, for operators and tests. */
@@ -2845,6 +2866,48 @@ export class LightningNode extends EventEmitter {
 		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
 	}
 
+	/**
+	 * The transport boundary for the event-based transport: EVERY node-level
+	 * emit of 'message:outbound' must come through here. With no PeerManager
+	 * attached this event IS the wire (loopback tests, embedded integrators),
+	 * so it is gated exactly like the socket path in PeerManager.sendToPeer:
+	 * a quarantined or fenced device emits ZERO Lightning wire messages.
+	 */
+	private emitOutbound(pubkey: string, type: number, payload: Buffer): void {
+		if (!this.recoveryPermitsPeerTraffic()) {
+			this.recoveryGate?.reportBlocked(
+				`suppressed outbound message type ${type} to ${pubkey}`
+			);
+			return;
+		}
+		this.emit('message:outbound', pubkey, type, payload);
+	}
+
+	/**
+	 * Everything a fresh connection gets once traffic is permitted. Runs from
+	 * peer:connect on an ungated node, and from the gate's open hook for
+	 * connections that sat inert through quarantine.
+	 */
+	private bringUpChannelPeer(pubkey: string): void {
+		// BOLT 1 peer storage first: return the peer's stored blob and push our
+		// own, before reestablish/gossip traffic (spec: ideally right after init).
+		this.sendPeerStorageOnConnect(pubkey);
+		this.channelManager.handlePeerReconnected(pubkey);
+		// Push our own gossip to the new peer so it propagates onward — a one-shot
+		// broadcast at announcement time rarely reaches the whole network.
+		this.sendOwnGossipTo(pubkey);
+		// Persist peer address for auto-reconnect after crash recovery (Fix 2.1)
+		if (this.peerManager) {
+			const addr = this.peerManager.getPeerAddress(pubkey);
+			if (addr) {
+				this.safeStorage(
+					() => this.storage!.savePeerAddress(pubkey, addr.host, addr.port),
+					'savePeerAddress'
+				);
+			}
+		}
+	}
+
 	private wirePeerManagerEvents(): void {
 		if (!this.peerManager) return;
 		this.peerManager.on('peer:connect', (pubkey: string) => {
@@ -2858,23 +2921,7 @@ export class LightningNode extends EventEmitter {
 				this.emit('peer:connect', pubkey);
 				return;
 			}
-			// BOLT 1 peer storage first: return the peer's stored blob and push our
-			// own, before reestablish/gossip traffic (spec: ideally right after init).
-			this.sendPeerStorageOnConnect(pubkey);
-			this.channelManager.handlePeerReconnected(pubkey);
-			// Push our own gossip to the new peer so it propagates onward — a one-shot
-			// broadcast at announcement time rarely reaches the whole network.
-			this.sendOwnGossipTo(pubkey);
-			// Persist peer address for auto-reconnect after crash recovery (Fix 2.1)
-			if (this.peerManager) {
-				const addr = this.peerManager.getPeerAddress(pubkey);
-				if (addr) {
-					this.safeStorage(
-						() => this.storage!.savePeerAddress(pubkey, addr.host, addr.port),
-						'savePeerAddress'
-					);
-				}
-			}
+			this.bringUpChannelPeer(pubkey);
 			this.emit('peer:connect', pubkey);
 		});
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
@@ -5693,7 +5740,7 @@ export class LightningNode extends EventEmitter {
 				// Peer not connected; it will learn the policy from route hints.
 			}
 		} else {
-			this.emit('message:outbound', peer, MessageType.CHANNEL_UPDATE, payload);
+			this.emitOutbound(peer, MessageType.CHANNEL_UPDATE, payload);
 		}
 	}
 
@@ -7371,7 +7418,7 @@ export class LightningNode extends EventEmitter {
 					const msg = decodeReplyChannelRangeMessage(payload);
 					const responses = syncMgr.handleReplyChannelRange(msg);
 					for (const resp of responses) {
-						this.emit('message:outbound', pubkey, resp.type, resp.payload);
+						this.emitOutbound(pubkey, resp.type, resp.payload);
 					}
 				}
 				break;
@@ -7382,7 +7429,7 @@ export class LightningNode extends EventEmitter {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
 					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
 					for (const resp of responses) {
-						this.emit('message:outbound', pubkey, resp.type, resp.payload);
+						this.emitOutbound(pubkey, resp.type, resp.payload);
 					}
 				}
 				break;
@@ -7392,7 +7439,7 @@ export class LightningNode extends EventEmitter {
 				const msg = decodeQueryChannelRangeMessage(payload);
 				const responses = syncMgr.handleQueryChannelRange(msg);
 				for (const resp of responses) {
-					this.emit('message:outbound', pubkey, resp.type, resp.payload);
+					this.emitOutbound(pubkey, resp.type, resp.payload);
 				}
 				break;
 			}
@@ -7401,7 +7448,7 @@ export class LightningNode extends EventEmitter {
 				const msg = decodeQueryShortChannelIdsMessage(payload);
 				const responses = syncMgr.handleQueryShortChannelIds(msg);
 				for (const resp of responses) {
-					this.emit('message:outbound', pubkey, resp.type, resp.payload);
+					this.emitOutbound(pubkey, resp.type, resp.payload);
 				}
 				break;
 			}
@@ -7432,7 +7479,7 @@ export class LightningNode extends EventEmitter {
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync();
 		for (const msg of messages) {
-			this.emit('message:outbound', pubkey, msg.type, msg.payload);
+			this.emitOutbound(pubkey, msg.type, msg.payload);
 		}
 	}
 

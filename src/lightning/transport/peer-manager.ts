@@ -390,12 +390,36 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Install a gate consulted before every outbound wire message. This is
+	 * the socket boundary itself: ChannelManager, gossip, peer storage and
+	 * onion messages all converge here, so a closed gate holds them ALL,
+	 * including any future caller that does not know the gate exists.
+	 * Refused sends throw, the same contract as an unconnected peer, which
+	 * every caller already treats as best-effort. Connection-level ping/pong
+	 * lives inside Peer and is deliberately not gated: an inert connection
+	 * stays alive.
+	 */
+	setOutboundGate(
+		gate: ((pubkey: string, type: number) => boolean) | null
+	): void {
+		this.outboundGate = gate;
+	}
+
+	private outboundGate: ((pubkey: string, type: number) => boolean) | null =
+		null;
+
+	/**
 	 * Send a message to a specific peer.
 	 */
 	sendToPeer(pubkey: string, type: number, payload: Buffer): void {
 		const peer = this.peers.get(pubkey);
 		if (!peer) {
 			throw new Error(`Not connected to peer ${pubkey}`);
+		}
+		if (this.outboundGate && !this.outboundGate(pubkey, type)) {
+			throw new Error(
+				`Outbound gate refused message type ${type} to peer ${pubkey}`
+			);
 		}
 		captureWireMessage('out', pubkey, type, payload);
 		peer.sendMessage(type, payload);
