@@ -8,8 +8,11 @@
  * superseded BEFORE it can touch the Lightning protocol.
  *
  * These tests instrument the TRANSPORT BOUNDARY rather than a status flag:
- * the assertion that matters is that a quarantined or fenced node emits
- * zero wire messages, so nothing escapes before the gate opens.
+ * a quarantined or fenced node establishes no connections in either
+ * direction, emits zero wire messages, and dispatches zero inbound
+ * messages to its handlers, so nothing escapes OR enters before the gate
+ * opens. The gate arrives via config.recovery.startupGate at construction;
+ * there is deliberately no post-construction attach.
  */
 
 import { expect } from 'chai';
@@ -39,6 +42,7 @@ import {
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { PeerManager } from '../../src/lightning/transport/peer-manager';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -366,19 +370,21 @@ describe('Recovery phase 5: startup quarantine', () => {
 			});
 		}
 
-		// Device A restarts, attaches the gate, and instruments its own
-		// transport boundary: every outbound message and peer event is
-		// counted, so nothing can slip out unnoticed.
-		const nodeA = new LightningNode(makeNodeConfig(4, storageA));
+		// Device A restarts with the gate in its CONSTRUCTION config (the
+		// only way to install one) and instruments its own transport
+		// boundary: every outbound message and peer event is counted, so
+		// nothing can slip out unnoticed.
+		const gateEvents: IStartupGateEvent[] = [];
+		const gate = gateFor(storageA, rep, gateEvents);
+		const configA = makeNodeConfig(4, storageA);
+		configA.recovery = { enabled: true, startupGate: gate };
+		const nodeA = new LightningNode(configA);
 		nodeA.on('error', () => {});
 		nodeA.on('node:error', () => {});
 		const wireMessages: Array<{ peer: string; type: number }> = [];
 		nodeA.on('message:outbound', (peer: string, type: number) => {
 			wireMessages.push({ peer, type });
 		});
-		const gateEvents: IStartupGateEvent[] = [];
-		const gate = gateFor(storageA, rep, gateEvents);
-		nodeA.attachRecoveryGate(gate);
 		expect(nodeA.getRecoveryGateState()).to.equal('quarantined');
 
 		// Even before confirmation, a peer that connects must not draw a
@@ -408,7 +414,7 @@ describe('Recovery phase 5: startup quarantine', () => {
 		await shutdown(served);
 	});
 
-	it('runs ungated when no gate is attached', async () => {
+	it('runs ungated when no gate is configured', async () => {
 		// The spec allows running without guardians; that mode must not be
 		// silently quarantined.
 		const storage = openStorage();
@@ -419,28 +425,30 @@ describe('Recovery phase 5: startup quarantine', () => {
 		node.destroy();
 	});
 
-	it('gates the SOCKET path: nothing crosses TCP while quarantined, and inert peers come alive on confirmation', async function () {
-		// With a PeerManager attached, ChannelManager sends via sendToPeer
-		// DIRECTLY and only falls back to the node's message:outbound event
-		// when that throws. Gating only the event relay therefore leaves the
-		// production path wide open, which is exactly how a networked node
-		// sends channel_reestablish. This test runs two real nodes over TCP
-		// and instruments the RECEIVER, so no internal claim is trusted.
+	it('gates the CONNECTION lifecycle over TCP: no peer contact while quarantined, networking on confirmation, hard-freeze on fence', async function () {
+		// The spec rule is "may not even connect", not "connect but stay
+		// quiet": while quarantined the node refuses to listen and to dial,
+		// and the constructor's dial pass is deferred behind the gate.
+		// Confirmation starts real networking; a proven newer epoch then
+		// drops every connection and closes the listener. Two real nodes
+		// over TCP, with the RECEIVER instrumented, so no internal claim is
+		// trusted.
 		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storageA = openStorage();
 		const secret = nodeSecretOf(6);
+		const root = deriveRecoveryRoot(secret);
 		const rep = replicatorFor(storageA, served, secret);
 		const decision = await rep.ensureNamespace();
 		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
 
+		const gateEvents: IStartupGateEvent[] = [];
+		const gate = gateFor(storageA, rep, gateEvents);
 		const configA = { ...makeNodeConfig(6, storageA), enableNetworking: true };
+		configA.recovery = { enabled: true, startupGate: gate };
 		const a = new LightningNode(configA);
 		a.on('error', () => {});
 		a.on('node:error', () => {});
-		const gateEvents: IStartupGateEvent[] = [];
-		const gate = gateFor(storageA, rep, gateEvents);
-		a.attachRecoveryGate(gate);
 
 		const storageB = openStorage();
 		const configB = { ...makeNodeConfig(7, storageB), enableNetworking: true };
@@ -449,14 +457,39 @@ describe('Recovery phase 5: startup quarantine', () => {
 		b.on('node:error', () => {});
 
 		try {
-			await a.listen(0);
-			const port = (a as any).peerManager.server.address().port as number;
 			const aPub = getPublicKey(configA.nodePrivateKey).toString('hex');
 			const bPub = getPublicKey(configB.nodePrivateKey).toString('hex');
 
+			// QUARANTINED: no listener, no dial, no deferred dial timers.
+			let listenErr: unknown;
+			try {
+				await a.listen(0);
+			} catch (err) {
+				listenErr = err;
+			}
+			expect(String(listenErr)).to.match(/quarantine/i);
+			let dialErr: unknown;
+			try {
+				await a.connectPeer(bPub, '127.0.0.1', 1);
+			} catch (err) {
+				dialErr = err;
+			}
+			expect(String(dialErr)).to.match(/quarantine/i);
+			expect((a as any).peerManager.isListening()).to.equal(false);
+			expect((a as any)._reconnectTimers.size).to.equal(0);
+			expect(
+				gateEvents.filter((e) => e.type === 'gate:blocked').length
+			).to.be.greaterThan(0);
+
+			// CONFIRMED: networking is permitted and actually works.
+			const outcome = await gate.confirm(lease);
+			expect(outcome.state).to.equal('confirmed');
+			expect(a.getRecoveryGateState()).to.equal('confirmed');
+			await a.listen(0);
+			const port = (a as any).peerManager.server.address().port as number;
+
 			// Count every Lightning message B receives from A at B's own
-			// transport, excluding connection-level liveness (init/ping/pong,
-			// which deliberately keep an inert connection alive).
+			// transport, excluding connection-level liveness (init/ping/pong).
 			const received: number[] = [];
 			(b as any).peerManager.on('message', (pubkey: string, type: number) => {
 				if (pubkey !== aPub) return;
@@ -472,47 +505,57 @@ describe('Recovery phase 5: startup quarantine', () => {
 
 			await b.connectPeer(aPub, '127.0.0.1', port);
 			await waitFor(() => (a as any).peerManager.listPeers().length === 1);
-
-			// The exact production path for reestablish: ChannelManager sends
-			// through peerManager.sendToPeer. The socket gate must refuse it.
-			const reestablish = Buffer.concat([
-				Buffer.alloc(32),
-				Buffer.alloc(8),
-				Buffer.alloc(8),
-				Buffer.alloc(32),
-				getPublicKey(makeSeed(42))
-			]);
-			(a as any).channelManager.sendMessage(
-				bPub,
-				MessageType.CHANNEL_REESTABLISH,
-				reestablish
-			);
-			// Peer storage distribution also goes straight to the socket.
-			expect(a.distributePeerStorage(Buffer.from('capsule-bytes'))).to.equal(0);
-			await new Promise((r) => setTimeout(r, 300));
-			expect(received).to.have.length(0);
-			expect(gateEvents.some((e) => e.type === 'gate:blocked')).to.equal(true);
-			// Inert is not dead: the connection survives the refusals.
-			expect((b as any).peerManager.listPeers()).to.have.length(1);
-
-			// Confirmation opens the gate AND brings up the peers that sat
-			// inert through quarantine; nobody waits for a redial.
-			const reconnected: string[] = [];
-			const cm = a.getChannelManager() as any;
-			const original = cm.handlePeerReconnected.bind(cm);
-			cm.handlePeerReconnected = (pk: string): void => {
-				reconnected.push(pk);
-				original(pk);
-			};
-			const outcome = await gate.confirm(lease);
-			expect(outcome.state).to.equal('confirmed');
-			expect(a.getRecoveryGateState()).to.equal('confirmed');
-			expect(reconnected).to.include(bPub);
-			// And the socket now passes traffic, observed at the receiver.
+			// The socket path passes traffic, observed at the receiver.
 			expect(a.distributePeerStorage(Buffer.from('capsule-bytes'))).to.equal(1);
 			await waitFor(() =>
 				received.some((type) => type === MessageType.PEER_STORAGE)
 			);
+
+			// FENCED: another device takes the epoch; the moment a later
+			// confirmation proves it, the node hard-freezes: every
+			// connection drops, the listener closes, dials refuse.
+			const head = (await served[0].client.getHead(root.recoveryId))
+				.state as GuardianState;
+			const writerB = generateWriterKey();
+			for (const entry of served) {
+				await entry.client.acquireEpoch({
+					protocolVersion: 1,
+					guardianSetId: SET_ID,
+					expectedState: head,
+					newEpoch: head.lease.epoch + 1n,
+					newWriterPublicKey: writerB.publicKey,
+					...signAcquisition(
+						SET_ID,
+						head,
+						head.lease.epoch + 1n,
+						writerB,
+						root.rootSecret
+					)
+				});
+			}
+			const fenced = await gate.confirm(lease);
+			expect(fenced.state).to.equal('fenced');
+			expect((a as any).peerManager.isListening()).to.equal(false);
+			await waitFor(() => (a as any).peerManager.listPeers().length === 0);
+			await waitFor(() => (b as any).peerManager.listPeers().length === 0);
+			const receivedBeforeFreeze = received.length;
+			expect(a.distributePeerStorage(Buffer.from('capsule-bytes'))).to.equal(0);
+			let fencedDial: unknown;
+			try {
+				await a.connectPeer(bPub, '127.0.0.1', port);
+			} catch (err) {
+				fencedDial = err;
+			}
+			expect(String(fencedDial)).to.match(/quarantine/i);
+			let fencedListen: unknown;
+			try {
+				await a.listen(0);
+			} catch (err) {
+				fencedListen = err;
+			}
+			expect(String(fencedListen)).to.match(/quarantine/i);
+			await new Promise((r) => setTimeout(r, 200));
+			expect(received.length).to.equal(receivedBeforeFreeze);
 		} finally {
 			a.destroy();
 			b.destroy();
@@ -522,32 +565,189 @@ describe('Recovery phase 5: startup quarantine', () => {
 
 	it('suppresses gossip sync messages while quarantined', async () => {
 		// Gossip sync and query responses emit at the NODE level, not through
-		// the ChannelManager relay; they must answer to the same gate.
+		// the ChannelManager relay; they must answer to the same gate. An
+		// ungated twin proves the probe would have spoken.
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const peerKey = getPublicKey(makeSeed(98)).toString('hex');
+
+		const plain = new LightningNode(makeNodeConfig(88, openStorage()));
+		plain.on('error', () => {});
+		plain.on('node:error', () => {});
+		let plainEmitted = 0;
+		plain.on('message:outbound', () => {
+			plainEmitted++;
+		});
+		plain.initiateGossipSync(peerKey);
+		expect(plainEmitted).to.be.greaterThan(0);
+		plain.destroy();
+
 		const storage = openStorage();
 		const secret = nodeSecretOf(8);
 		const rep = replicatorFor(storage, served, secret);
-		const node = new LightningNode(makeNodeConfig(8, storage));
-		node.on('error', () => {});
-		node.on('node:error', () => {});
+		const events: IStartupGateEvent[] = [];
+		const config = makeNodeConfig(8, storage);
+		config.recovery = {
+			enabled: true,
+			startupGate: gateFor(storage, rep, events)
+		};
+		const gated = new LightningNode(config);
+		gated.on('error', () => {});
+		gated.on('node:error', () => {});
 		let emitted = 0;
-		node.on('message:outbound', () => {
+		gated.on('message:outbound', () => {
 			emitted++;
 		});
-		const peerKey = getPublicKey(makeSeed(98)).toString('hex');
-
-		// Ungated, gossip sync speaks: the contrast that proves the probe.
-		node.initiateGossipSync(peerKey);
-		expect(emitted).to.be.greaterThan(0);
-
-		const before = emitted;
-		const events: IStartupGateEvent[] = [];
-		node.attachRecoveryGate(gateFor(storage, rep, events));
-		node.initiateGossipSync(peerKey);
-		expect(emitted).to.equal(before);
+		gated.initiateGossipSync(peerKey);
+		expect(emitted).to.equal(0);
 		expect(events.some((e) => e.type === 'gate:blocked')).to.equal(true);
+		gated.destroy();
+		await shutdown(served);
+	});
+
+	it('drops inbound messages while quarantined, before any handler', async () => {
+		// The event-transport inbound boundary: an inbound error message
+		// must not reach the channel manager on an unconfirmed device, where
+		// it could force-close and broadcast state the device may not own.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const peerKey = getPublicKey(makeSeed(97)).toString('hex');
+		// 32-byte channel id plus a zero-length error payload.
+		const errorPayload = Buffer.alloc(34);
+
+		const plain = new LightningNode(makeNodeConfig(89, openStorage()));
+		plain.on('error', () => {});
+		plain.on('node:error', () => {});
+		let plainHandled = 0;
+		const plainCm = plain.getChannelManager() as any;
+		const plainOriginal = plainCm.handleMessage.bind(plainCm);
+		plainCm.handleMessage = (pk: string, t: number, p: Buffer): void => {
+			plainHandled++;
+			plainOriginal(pk, t, p);
+		};
+		plain.handlePeerMessage(peerKey, MessageType.ERROR, errorPayload);
+		expect(plainHandled).to.equal(1);
+		plain.destroy();
+
+		const storage = openStorage();
+		const secret = nodeSecretOf(10);
+		const rep = replicatorFor(storage, served, secret);
+		const events: IStartupGateEvent[] = [];
+		const config = makeNodeConfig(10, storage);
+		config.recovery = {
+			enabled: true,
+			startupGate: gateFor(storage, rep, events)
+		};
+		const gated = new LightningNode(config);
+		gated.on('error', () => {});
+		gated.on('node:error', () => {});
+		let handled = 0;
+		const cm = gated.getChannelManager() as any;
+		const original = cm.handleMessage.bind(cm);
+		cm.handleMessage = (pk: string, t: number, p: Buffer): void => {
+			handled++;
+			original(pk, t, p);
+		};
+		gated.handlePeerMessage(peerKey, MessageType.ERROR, errorPayload);
+		expect(handled).to.equal(0);
+		expect(events.some((e) => e.type === 'gate:blocked')).to.equal(true);
+		gated.destroy();
+		await shutdown(served);
+	});
+
+	it('defers the startup dial pass until ownership confirmation', async () => {
+		// The constructor schedules auto-reconnect dials; with a gate in the
+		// config they are withheld entirely (no timers armed) and run only
+		// from the gate's open hook.
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const secret = nodeSecretOf(11);
+		const rep = replicatorFor(storage, served, secret);
+		const decision = await rep.ensureNamespace();
+		const lease = (decision as { lease: IWriterLeaseKeys }).lease;
+
+		const gate = gateFor(storage, rep);
+		const config = { ...makeNodeConfig(11, storage), enableNetworking: true };
+		config.recovery = { enabled: true, startupGate: gate };
+		const node = new LightningNode(config);
+		node.on('error', () => {});
+		node.on('node:error', () => {});
+		expect((node as any)._autoReconnectDeferred).to.equal(true);
+		expect((node as any)._reconnectTimers.size).to.equal(0);
+
+		const outcome = await gate.confirm(lease);
+		expect(outcome.state).to.equal('confirmed');
+		// The deferred pass ran on the open transition.
+		expect((node as any)._autoReconnectDeferred).to.equal(false);
 		node.destroy();
 		await shutdown(served);
+	});
+
+	it('PeerManager gates hold at the transport itself', async function () {
+		// Unit-level proof for each of the three transport gates, so the
+		// node-level tests do not carry the whole burden: connections refuse
+		// in BOTH directions pre-handshake, a gated send throws, and a gated
+		// inbound message never reaches a registered handler.
+		this.timeout(20_000);
+		const keyA = sha('pm-gate-a');
+		const keyB = sha('pm-gate-b');
+		const pmA = new PeerManager({ localPrivateKey: keyA });
+		const pmB = new PeerManager({ localPrivateKey: keyB });
+		const aPub = getPublicKey(keyA).toString('hex');
+		const bPub = getPublicKey(keyB).toString('hex');
+		let open = false;
+		pmA.setConnectionGate(() => open);
+		try {
+			await pmA.listen(0);
+			const port = (pmA as any).server.address().port as number;
+
+			// Outbound dial refused at dialPeer, the one chokepoint.
+			let dialErr: unknown;
+			try {
+				await pmA.connectPeer(bPub, '127.0.0.1', 1);
+			} catch (err) {
+				dialErr = err;
+			}
+			expect(String(dialErr)).to.match(/Connection gate refused/);
+
+			// Inbound socket destroyed BEFORE the BOLT 8 handshake: the
+			// dialer fails and neither side registers a peer.
+			let inboundErr: unknown;
+			try {
+				await pmB.connectPeer(aPub, '127.0.0.1', port);
+			} catch (err) {
+				inboundErr = err;
+			}
+			expect(inboundErr).to.not.equal(undefined);
+			expect(pmA.listPeers()).to.have.length(0);
+			expect(pmB.listPeers()).to.have.length(0);
+
+			// Open the gate: the same dial completes.
+			open = true;
+			await pmB.connectPeer(aPub, '127.0.0.1', port);
+			await waitFor(() => pmA.listPeers().length === 1);
+
+			// Outbound send gate throws like an unconnected peer.
+			pmA.setOutboundGate(() => false);
+			expect(() =>
+				pmA.sendToPeer(bPub, MessageType.PING, Buffer.alloc(4))
+			).to.throw(/Outbound gate refused/);
+			pmA.setOutboundGate(null);
+
+			// Inbound dispatch gate: a registered handler never fires.
+			let handled = 0;
+			pmA.onMessage(MessageType.CHANNEL_REESTABLISH, () => {
+				handled++;
+			});
+			pmA.setInboundGate(() => false);
+			pmB.sendToPeer(aPub, MessageType.CHANNEL_REESTABLISH, Buffer.alloc(80));
+			await new Promise((r) => setTimeout(r, 200));
+			expect(handled).to.equal(0);
+			pmA.setInboundGate(null);
+			pmB.sendToPeer(aPub, MessageType.CHANNEL_REESTABLISH, Buffer.alloc(80));
+			await waitFor(() => handled === 1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+		}
 	});
 
 	it('a fence landing during an in-flight confirmation is never overwritten', async () => {

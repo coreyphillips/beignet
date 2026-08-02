@@ -591,12 +591,15 @@ export class LightningNode extends EventEmitter {
 	private recoveryCapsuleActive = false;
 	private recoveryJournal: RecoveryJournal | undefined;
 	/**
-	 * Startup quarantine (recovery 5.6). When a gate is attached, NOTHING
-	 * reaches a channel peer until a guardian quorum confirms this device
-	 * still owns its writer lease. A stale device therefore discovers it was
-	 * superseded before it can touch the Lightning protocol.
+	 * Startup quarantine (recovery 5.6). Installed at CONSTRUCTION from
+	 * config.recovery.startupGate. While present and unconfirmed, the node
+	 * makes NO peer contact at all, inbound or outbound, connection
+	 * establishment included: a stale device discovers it was superseded
+	 * before it can touch the Lightning protocol.
 	 */
 	private recoveryGate: GuardianStartupGate | undefined;
+	/** The constructor's dial pass was withheld pending gate confirmation. */
+	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private capsuleLastRefreshAt = 0;
 	/** A journaled commit landed after the last compose (see connect path). */
@@ -840,6 +843,14 @@ export class LightningNode extends EventEmitter {
 		this.autoReconnect =
 			config.autoReconnect ?? config.enableNetworking ?? false;
 
+		// Startup ownership quarantine (recovery 5.6) arrives at CONSTRUCTION,
+		// before any networking exists, so no dial, listener or inbound
+		// handshake can race the gate's installation. A gate attached after
+		// construction would lose that race: autoReconnectPeers() below
+		// schedules real dials on zero-delay timers.
+		this.recoveryGate = config.recovery?.startupGate;
+		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
+
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
 				localPrivateKey: config.nodePrivateKey,
@@ -859,6 +870,28 @@ export class LightningNode extends EventEmitter {
 				if (this.recoveryPermitsPeerTraffic()) return true;
 				this.recoveryGate?.reportBlocked(
 					`suppressed outbound message type ${type} to ${pubkey}`
+				);
+				return false;
+			});
+			// Connections themselves answer to the gate too: the spec's rule
+			// is "may not even connect", not "connect but stay quiet". Dials
+			// throw at dialPeer (the one chokepoint every dial path uses) and
+			// inbound sockets die before the BOLT 8 handshake.
+			this.peerManager.setConnectionGate(() => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`refused peer connection while ${this.getRecoveryGateState()}`
+				);
+				return false;
+			});
+			// Defense in depth behind the connection gate: a message arriving
+			// on a connection that predates a fence is dropped at the
+			// transport, before the channel manager can act on it (an inbound
+			// error would otherwise force-close and BROADCAST).
+			this.peerManager.setInboundGate((pubkey, type) => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`dropped inbound message type ${type} from ${pubkey}`
 				);
 				return false;
 			});
@@ -2826,27 +2859,50 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Attach the startup gate. Until it reports confirmed, outbound messages
-	 * are suppressed and peer connections do not progress to reestablish.
-	 * When the gate later opens, peers that connected during quarantine are
-	 * brought up as if they had just connected; without that, an inert
-	 * connection stays inert until the peer gives up and redials.
+	 * Constructor-only wiring of the startup gate (it arrives via
+	 * config.recovery.startupGate; there is deliberately NO post-construction
+	 * attach, because the constructor schedules dials that would race one).
+	 * While the gate is closed the node makes no peer contact at all; when it
+	 * opens, deferred startup networking runs; if it fences, every connection
+	 * drops and the listeners stop, the spec 5.6 hard-freeze.
 	 */
-	attachRecoveryGate(gate: GuardianStartupGate): void {
-		this.recoveryGate = gate;
+	private wireRecoveryGate(gate: GuardianStartupGate): void {
 		gate.onOpen(() => {
+			if (this._destroyed) return;
+			if (this.peerManager) {
+				for (const peer of this.peerManager.listPeers()) {
+					try {
+						this.bringUpChannelPeer(peer.pubkey);
+					} catch (err) {
+						// One peer failing to come up (it may have vanished mid
+						// bring-up) must not reject the confirmation that opened
+						// the gate, nor starve the remaining peers.
+						this.emitStructuredLog('peer', 'quarantine_release_failed', {
+							pubkey: peer.pubkey,
+							error: err instanceof Error ? err.message : String(err)
+						});
+					}
+				}
+			}
+			// The dial pass the constructor deferred (see autoReconnectPeers):
+			// stored channel peers are contacted only now, ownership proven.
+			if (this._autoReconnectDeferred) {
+				this._autoReconnectDeferred = false;
+				this.autoReconnectPeers();
+			}
+		});
+		gate.onFenced(() => {
+			// Hard-freeze (spec 5.6): a superseded writer must not exchange
+			// another wire message with anyone. Message-level gates already
+			// refuse traffic; dropping connections and listeners removes the
+			// surface entirely rather than trusting per-message suppression.
 			if (!this.peerManager) return;
+			this.peerManager.stopListening();
 			for (const peer of this.peerManager.listPeers()) {
 				try {
-					this.bringUpChannelPeer(peer.pubkey);
-				} catch (err) {
-					// One peer failing to come up (it may have vanished mid
-					// bring-up) must not reject the confirmation that opened
-					// the gate, nor starve the remaining peers.
-					this.emitStructuredLog('peer', 'quarantine_release_failed', {
-						pubkey: peer.pubkey,
-						error: err instanceof Error ? err.message : String(err)
-					});
+					this.peerManager.disconnectPeer(peer.pubkey);
+				} catch {
+					// Already gone; the goal is zero live connections.
 				}
 			}
 		});
@@ -2859,11 +2915,26 @@ export class LightningNode extends EventEmitter {
 
 	/**
 	 * The single question every transport chokepoint asks. With no gate
-	 * attached the node runs ungated, which is the guardian-disabled mode
-	 * the spec allows; with one attached, only a confirmed lease passes.
+	 * configured the node runs ungated, which is the guardian-disabled mode
+	 * the spec allows; with one configured, only a confirmed lease passes.
 	 */
 	private recoveryPermitsPeerTraffic(): boolean {
 		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
+	}
+
+	/**
+	 * Public networking entry points refuse loudly while the gate is closed,
+	 * rather than parking: a fenced gate never opens, and a parked promise
+	 * on a fenced node would hang its caller forever.
+	 */
+	private assertPeerContactPermitted(operation: string): void {
+		if (this.recoveryPermitsPeerTraffic()) return;
+		this.recoveryGate?.reportBlocked(
+			`refused ${operation} while ${this.getRecoveryGateState()}`
+		);
+		throw new Error(
+			`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+		);
 	}
 
 	/**
@@ -2945,6 +3016,19 @@ export class LightningNode extends EventEmitter {
 		// every start. The ready lifecycle is this method's to complete on
 		// every exit, so the disabled branch still emits it.
 		if (!this.autoReconnect || !this.storage || !this.peerManager) {
+			this.emitReady();
+			return;
+		}
+
+		// Startup ownership quarantine: the node may not even connect to
+		// channel peers before the quorum confirms the lease. Defer the whole
+		// dial pass to the gate's open hook; a fenced gate never opens, so a
+		// superseded device never dials at all. Ready still fires: a
+		// quarantined node is constructed and operable, just silent.
+		if (this.recoveryGate && !this.recoveryGate.permitsPeerTraffic()) {
+			if (this.recoveryGate.getState() === 'quarantined') {
+				this._autoReconnectDeferred = true;
+			}
 			this.emitReady();
 			return;
 		}
@@ -3893,6 +3977,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('connectPeer');
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
 		if (transport?.type === 'ws' && transport.url !== undefined) {
@@ -4033,6 +4118,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('listen');
 		await this.peerManager.listen(port, host);
 	}
 
@@ -4044,6 +4130,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('listenWebSocket');
 		await this.peerManager.listenWebSocket(port, host);
 	}
 
@@ -4641,6 +4728,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('connectToSeeds');
 		const peers = await this.bootstrapPeers(config);
 		const connected: string[] = [];
 		for (const peer of peers.slice(0, maxPeers)) {
@@ -11494,6 +11582,17 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Message Handling (testing support) ───────────────
 
 	handlePeerMessage(pubkey: string, type: number, payload: Buffer): void {
+		// Startup quarantine: the event-transport inbound boundary (the
+		// networked path is gated inside PeerManager). Nothing may reach the
+		// channel manager before ownership is confirmed; an inbound error
+		// message would otherwise force-close and BROADCAST on a device that
+		// may no longer own the channel state it stores.
+		if (!this.recoveryPermitsPeerTraffic()) {
+			this.recoveryGate?.reportBlocked(
+				`dropped inbound message type ${type} from ${pubkey}`
+			);
+			return;
+		}
 		if (Buffer.isBuffer(payload) && payload.length > MAX_MESSAGE_SIZE) {
 			this.emit('node:error', {
 				code: 'MESSAGE_TOO_LARGE',

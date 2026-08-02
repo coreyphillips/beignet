@@ -76,6 +76,7 @@ export class GuardianStartupGate {
 	private state: StartupGateState = 'quarantined';
 	private supersededBy?: GuardianState;
 	private openListeners: Array<() => void> = [];
+	private fencedListeners: Array<() => void> = [];
 
 	constructor(config: IStartupGateConfig) {
 		this.config = config;
@@ -83,14 +84,24 @@ export class GuardianStartupGate {
 	}
 
 	/**
-	 * Run `listener` when the gate opens. Peers that connected during
-	 * quarantine sat on deliberately inert connections; whoever holds those
-	 * connections needs to know the moment traffic becomes permitted, or
-	 * they stay inert until the peer gives up and redials.
+	 * Run `listener` when the gate opens. The node defers its startup
+	 * networking (auto-reconnect dialing, held connections) behind this, so
+	 * peer contact begins the moment ownership is proven and not before.
 	 */
 	onOpen(listener: () => void): void {
 		this.openListeners.push(listener);
 		if (this.state === 'confirmed') listener();
+	}
+
+	/**
+	 * Run `listener` when the gate fences. Fencing is the spec 5.6
+	 * hard-freeze: a superseded writer must not exchange another wire
+	 * message, so the node uses this to drop every live connection and stop
+	 * its listeners rather than trusting per-message suppression alone.
+	 */
+	onFenced(listener: () => void): void {
+		this.fencedListeners.push(listener);
+		if (this.state === 'fenced') listener();
 	}
 
 	private emit(event: IStartupGateEvent): void {
@@ -193,6 +204,8 @@ export class GuardianStartupGate {
 					'; channels are frozen and no peer traffic is permitted',
 				currentState: this.supersededBy
 			});
+			// Always a transition: every fenced-before path returned above.
+			for (const listener of this.fencedListeners) listener();
 			return {
 				state: 'fenced',
 				confirming,

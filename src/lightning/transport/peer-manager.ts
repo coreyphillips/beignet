@@ -223,6 +223,11 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		if (this.connectionGate && !this.connectionGate()) {
+			throw new Error(
+				`Connection gate refused dial to peer ${pubkey}: writer ownership is not confirmed`
+			);
+		}
 		// Keep stored address objects shaped exactly as before for TCP peers
 		// (no `transport` key unless a non-default transport was requested).
 		const addressEntry = transport ? { host, port, transport } : { host, port };
@@ -406,6 +411,38 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private outboundGate: ((pubkey: string, type: number) => boolean) | null =
+		null;
+
+	/**
+	 * Install a gate consulted before any connection is ESTABLISHED, in both
+	 * directions. Startup ownership quarantine (recovery 5.6) says the node
+	 * may not even connect to channel peers until the writer lease is
+	 * confirmed, so while the gate is closed every dial throws (dialPeer is
+	 * the one chokepoint both connectPeer and the reconnect rounds use) and
+	 * an inbound socket is destroyed BEFORE the BOLT 8 handshake begins:
+	 * a quarantined node never authenticates, sends init, or reveals itself.
+	 */
+	setConnectionGate(gate: (() => boolean) | null): void {
+		this.connectionGate = gate;
+	}
+
+	private connectionGate: (() => boolean) | null = null;
+
+	/**
+	 * Install a gate consulted before an inbound message is dispatched to
+	 * any registered handler or the generic 'message' event. Defense in
+	 * depth behind the connection gate: if a connection survives from before
+	 * a fence (or a race), a refused message is dropped at the transport, so
+	 * nothing reaches the channel manager, gossip, onion or peer storage
+	 * handlers. Ping/pong live inside Peer and are unaffected.
+	 */
+	setInboundGate(
+		gate: ((pubkey: string, type: number) => boolean) | null
+	): void {
+		this.inboundGate = gate;
+	}
+
+	private inboundGate: ((pubkey: string, type: number) => boolean) | null =
 		null;
 
 	/**
@@ -638,6 +675,13 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private handleInboundConnection(socket: IDuplexTransport): void {
+		// Quarantined or fenced (recovery 5.6): destroy the socket BEFORE the
+		// BOLT 8 handshake, so a node that cannot prove writer ownership
+		// never authenticates or exchanges init with anyone.
+		if (this.connectionGate && !this.connectionGate()) {
+			socket.destroy();
+			return;
+		}
 		// Reject if at inbound peer limit
 		if (this.inboundPeerCount >= this.maxInboundPeers) {
 			socket.destroy();
@@ -715,6 +759,12 @@ export class PeerManager extends EventEmitter {
 	private setupPeerListeners(pubkey: string, peer: Peer): void {
 		peer.on('message', (type: number, payload: Buffer) => {
 			captureWireMessage('in', pubkey, type, payload);
+
+			// Inbound dispatch gate: a refused message is dropped here, before
+			// any handler (channel, gossip, onion, peer storage) can act on it.
+			if (this.inboundGate && !this.inboundGate(pubkey, type)) {
+				return;
+			}
 
 			// Route to type-specific handlers
 			const handlers = this.messageHandlers.get(type);
