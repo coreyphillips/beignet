@@ -18,6 +18,8 @@ import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { MessageType } from '../../src/lightning/message/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -360,12 +362,56 @@ describe('SCB restore', function () {
 				expect(state.localCommitmentNumber).to.equal(0n);
 				expect(state.remoteCommitmentNumber).to.equal(0n);
 
+				// The durable peer-close disposition rides the SCB reconstruction
+				// (recovery 5.6): a failed first connection attempt or a restart
+				// must not strand the close request.
+				expect(state.recoveryCloseReason).to.equal('local-data-loss');
+
 				// Persisted (survives a restart).
 				const persisted = storage
 					.loadAllChannels()
 					.find((c) => c.channelId === entries[0].channelId);
 				expect(persisted).to.exist;
 				expect(persisted!.peerPubkey).to.equal(entries[0].peerNodeId);
+
+				// Restart liveness: the initial connection attempt failed (no
+				// networking here at all), the process restarts from storage
+				// alone, and the recovered channel's peer is selected for
+				// startup dialing; on reconnect the deterministic close
+				// request is regenerated.
+				storage.savePeerAddress(entries[0].peerNodeId, '127.0.0.1', 9);
+				const restarted = new LightningNode({
+					...makeNodeConfig(1),
+					storage,
+					enableNetworking: true,
+					autoReconnect: true
+				});
+				restarted.on('node:error', () => {});
+				try {
+					expect(
+						(restarted as unknown as { _reconnectTimers: Set<unknown> })
+							._reconnectTimers.size
+					).to.equal(1);
+					const sent: Array<{ type: number; payload: Buffer }> = [];
+					restarted
+						.getChannelManager()
+						.on(
+							'message:outbound',
+							(_p: string, type: number, payload: Buffer) => {
+								sent.push({ type, payload });
+							}
+						);
+					restarted
+						.getChannelManager()
+						.handlePeerReconnected(entries[0].peerNodeId);
+					const errSent = sent.find((m) => m.type === MessageType.ERROR);
+					expect(errSent).to.exist;
+					expect(
+						decodeErrorMessage(errSent!.payload).data.toString('ascii')
+					).to.contain('stale');
+				} finally {
+					restarted.destroy();
+				}
 
 				// Funding outpoint watched: the script was fetched from the chain
 				// and its scripthash subscribed.

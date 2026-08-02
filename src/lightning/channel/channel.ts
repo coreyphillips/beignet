@@ -82,7 +82,8 @@ import {
 	ISpliceInFlight,
 	createOpenerState,
 	createAcceptorState,
-	mustNotBroadcastCommitment
+	mustNotBroadcastCommitment,
+	RecoveryCloseReason
 } from './channel-state';
 import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
@@ -3818,6 +3819,45 @@ export class Channel {
 	}
 
 	/**
+	 * The recovery-close disposition as an INVARIANT, not a field lookup:
+	 * restart liveness must not depend on every ERRORED transition having
+	 * remembered to assign a redundant field. The explicit reason wins when
+	 * present; otherwise it derives from the durable safety flags, which
+	 * covers states created by SCB recovery, by early reestablish validation
+	 * failures, and by databases written before the field existed.
+	 */
+	getRecoveryCloseReason(): RecoveryCloseReason | undefined {
+		if (this._state.recoveryCloseReason) {
+			return this._state.recoveryCloseReason;
+		}
+		if (this._state.dataLossDetected) return 'local-data-loss';
+		if (this._state.stateUncertain) return 'state-uncertain';
+		return undefined;
+	}
+
+	/** ERRORED and waiting for the PEER's close: reconnect must chase it. */
+	hasRecoveryCloseDisposition(): boolean {
+		return (
+			this._state.state === ChannelState.ERRORED &&
+			this.getRecoveryCloseReason() !== undefined
+		);
+	}
+
+	/**
+	 * Stamp the explicit disposition from the safety flags before an ERRORED
+	 * transition persists, so the stored row is self-describing even where
+	 * the derived fallback would already cover it.
+	 */
+	private _ensureRecoveryCloseDisposition(): void {
+		if (this._state.recoveryCloseReason) return;
+		if (this._state.dataLossDetected) {
+			this._state.recoveryCloseReason = 'local-data-loss';
+		} else if (this._state.stateUncertain) {
+			this._state.recoveryCloseReason = 'state-uncertain';
+		}
+	}
+
+	/**
 	 * The durable peer-close request (recovery 5.6). The original wire error
 	 * can be lost to a crash between the ERRORED persist and the socket
 	 * (ERROR is deliberately not in the retransmission outbox), so the
@@ -3825,7 +3865,7 @@ export class Channel {
 	 * reconnect until the peer's close resolves the channel on chain.
 	 */
 	buildRecoveryCloseActions(): ChannelAction[] {
-		const reason = this._state.recoveryCloseReason;
+		const reason = this.getRecoveryCloseReason();
 		if (!reason || !this._state.channelId) return [];
 		const data =
 			reason === 'local-data-loss'
@@ -5352,6 +5392,12 @@ export class Channel {
 	 * misuse must keep returning plain ERROR actions.
 	 */
 	private _failChannelWithWireError(message: string): ChannelAction[] {
+		// A hostile or malformed message can fail a channel whose safety
+		// flags already forbid broadcasting (a restored uncertain channel
+		// sent garbage counters, say). The peer-close disposition must ride
+		// THIS persist too, or a crash before the error send strands the
+		// channel with no reconnect chasing the peer.
+		this._ensureRecoveryCloseDisposition();
 		this._state.state = ChannelState.ERRORED;
 		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
 		return [

@@ -677,6 +677,99 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		node.destroy();
 	});
 
+	it('a malformed reestablish on an uncertain channel still stamps the disposition', function () {
+		// The early validation exits (_failChannelWithWireError) run BEFORE
+		// the StateUncertain branch; without the invariant a crash after the
+		// ERRORED persist stranded the channel with no disposition and no
+		// reconnect chasing the peer. Case 1: next_commitment_number of 0.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		opener.getFullState().stateUncertain = true;
+		opener.markForReestablish();
+		opener.handleReestablish({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber: 0n,
+			nextRevocationNumber: 0n,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('mal')).digest()
+			)
+		});
+		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(opener.getFullState().recoveryCloseReason).to.equal(
+			'state-uncertain'
+		);
+
+		// Crash before the error send; restart from storage alone.
+		const restored = new Channel(
+			deserializeChannelState(serializeChannelState(opener.getFullState()))
+		);
+		expect(restored.hasRecoveryCloseDisposition()).to.equal(true);
+		const actions = restored.buildRecoveryCloseActions();
+		expect(actions).to.have.length(1);
+		expect(
+			decodeErrorMessage(
+				(actions[0] as unknown as { payload: Buffer }).payload
+			).data.toString('ascii')
+		).to.contain('proven current');
+		expect(
+			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
+		).to.equal(false);
+	});
+
+	it('an invalid reestablish secret on an uncertain channel still stamps the disposition', function () {
+		// Case 2: a nonzero but WRONG yourLastPerCommitmentSecret fails the
+		// channel before the StateUncertain branch; the disposition must
+		// ride that persist too.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		opener.getFullState().stateUncertain = true;
+		const pre = opener.getFullState();
+		opener.markForReestablish();
+		opener.handleReestablish({
+			channelId: opener.getChannelId()!,
+			nextCommitmentNumber: pre.remoteCommitmentNumber + 1n,
+			nextRevocationNumber: pre.localCommitmentNumber,
+			yourLastPerCommitmentSecret: Buffer.alloc(32, 0x5a),
+			myCurrentPerCommitmentPoint: perCommitmentPointFromSecret(
+				crypto.createHash('sha256').update(Buffer.from('bad-sec')).digest()
+			)
+		});
+		expect(opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(opener.getFullState().recoveryCloseReason).to.equal(
+			'state-uncertain'
+		);
+		const restored = new Channel(
+			deserializeChannelState(serializeChannelState(opener.getFullState()))
+		);
+		expect(restored.hasRecoveryCloseDisposition()).to.equal(true);
+		expect(restored.buildRecoveryCloseActions()).to.have.length(1);
+	});
+
+	it('a legacy ERRORED data-loss state without the field still gets durable close behavior', function () {
+		// Migration: databases written before recoveryCloseReason existed
+		// hold ERRORED + dataLossDetected only. The invariant DERIVES the
+		// disposition from the durable safety flags.
+		const { opener, acceptor } = setupNormalChannels();
+		exchangeCommitments(opener, acceptor);
+		const state = opener.getFullState();
+		state.dataLossDetected = true;
+		state.state = ChannelState.ERRORED;
+		const serialized = serializeChannelState(state);
+		delete (serialized as { recoveryCloseReason?: string }).recoveryCloseReason;
+		const legacy = new Channel(deserializeChannelState(serialized));
+		expect(legacy.getFullState().recoveryCloseReason).to.equal(undefined);
+		expect(legacy.getRecoveryCloseReason()).to.equal('local-data-loss');
+		expect(legacy.hasRecoveryCloseDisposition()).to.equal(true);
+		const actions = legacy.buildRecoveryCloseActions();
+		expect(actions).to.have.length(1);
+		expect(
+			decodeErrorMessage(
+				(actions[0] as unknown as { payload: Buffer }).payload
+			).data.toString('ascii')
+		).to.contain('stale');
+	});
+
 	it('ForceClosing after a real force close', function () {
 		const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
 		exchangeCommitments(opener, acceptor);

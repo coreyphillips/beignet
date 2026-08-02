@@ -3072,8 +3072,7 @@ export class LightningNode extends EventEmitter {
 			if (
 				state === ChannelState.AWAITING_REESTABLISH ||
 				state === ChannelState.AWAITING_CHANNEL_READY ||
-				(state === ChannelState.ERRORED &&
-					channel.getFullState().recoveryCloseReason !== undefined)
+				channel.hasRecoveryCloseDisposition()
 			) {
 				const channelId = channel.getChannelId();
 				if (channelId) {
@@ -3626,6 +3625,11 @@ export class LightningNode extends EventEmitter {
 			// the peer's force-close on-chain.
 			state.state = ChannelState.ERRORED;
 			state.dataLossDetected = true;
+			// The durable peer-close disposition (recovery 5.6): if the
+			// immediate connection attempt below fails or the process
+			// restarts, startup dialing selects this channel and reconnect
+			// regenerates the close request.
+			state.recoveryCloseReason = 'local-data-loss';
 
 			const channel = new Channel(state);
 			channel.channelKeyIndex = entry.channelKeyIndex;
