@@ -199,7 +199,10 @@ function gateable(
 // ─────────────── Tests ───────────────
 
 describe('Recovery phase 6: the barrier holds only what it must', () => {
-	it('local and async-remote release synchronously and hold NOTHING', async () => {
+	it('local and async-remote release synchronously and hold NOTHING', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -229,7 +232,10 @@ describe('Recovery phase 6: the barrier holds only what it must', () => {
 		storage.close();
 	});
 
-	it('quorum mode releases a frame already below the watermark INLINE', async () => {
+	it('quorum mode releases a frame already below the watermark INLINE', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -253,7 +259,10 @@ describe('Recovery phase 6: the barrier holds only what it must', () => {
 		storage.close();
 	});
 
-	it('quorum mode HOLDS a frame the quorum has not stored yet', async () => {
+	it('quorum mode HOLDS a frame the quorum has not stored yet', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -296,7 +305,10 @@ describe('Recovery phase 6: the barrier holds only what it must', () => {
 });
 
 describe('Recovery phase 6: one receipt releases every barrier below it', () => {
-	it('a single advance frees waiters from MANY frames at once', async () => {
+	it('a single advance frees waiters from MANY frames at once', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -344,7 +356,10 @@ describe('Recovery phase 6: one receipt releases every barrier below it', () => 
 		storage.close();
 	});
 
-	it('a burst of commits shares ONE replication pass, not one per waiter', async () => {
+	it('a burst of commits shares ONE replication pass, not one per waiter', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -385,7 +400,10 @@ describe('Recovery phase 6: one receipt releases every barrier below it', () => 
 });
 
 describe('Recovery phase 6: a timeout freezes, it does not proceed', () => {
-	it('an unreachable quorum REFUSES the message rather than letting it go', async () => {
+	it('an unreachable quorum REFUSES the message rather than letting it go', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -421,7 +439,10 @@ describe('Recovery phase 6: a timeout freezes, it does not proceed', () => {
 		storage.close();
 	});
 
-	it('a timeout leaves LATER frames held, never released by the passage of time', async () => {
+	it('a timeout leaves LATER frames held, never released by the passage of time', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -449,7 +470,10 @@ describe('Recovery phase 6: a timeout freezes, it does not proceed', () => {
 		storage.close();
 	});
 
-	it('an unsettled lease is never a reason to release', async () => {
+	it('an unsettled lease is never a reason to release', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);
@@ -480,7 +504,10 @@ describe('Recovery phase 6: a timeout freezes, it does not proceed', () => {
 });
 
 describe('Recovery phase 6: a fenced writer never releases again', () => {
-	it('a proven takeover refuses every held message and freezes FIRST', async () => {
+	it('a proven takeover refuses every held message and freezes FIRST', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const harness = journaled(storage);

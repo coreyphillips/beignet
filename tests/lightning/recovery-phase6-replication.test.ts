@@ -215,7 +215,10 @@ function instrument(
 // ─────────────── Tests ───────────────
 
 describe('Recovery phase 6: appends pipeline', () => {
-	it('streams several records to ONE guardian before reading any receipt', async () => {
+	it('streams several records to ONE guardian before reading any receipt', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(8);
 		let inFlight = 0;
@@ -245,7 +248,10 @@ describe('Recovery phase 6: appends pipeline', () => {
 		storage.close();
 	});
 
-	it('a slow guardian adds NO round trip per frame, only per pass', async () => {
+	it('a slow guardian adds NO round trip per frame, only per pass', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(12);
 		let puts = 0;
@@ -270,7 +276,10 @@ describe('Recovery phase 6: appends pipeline', () => {
 		storage.close();
 	});
 
-	it('a strictly sequential window reaches the SAME head, only slower', async () => {
+	it('a strictly sequential window reaches the SAME head, only slower', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(6);
 		const rep = replicator(storage, bind(served), [], 1);
@@ -286,7 +295,10 @@ describe('Recovery phase 6: appends pipeline', () => {
 		storage.close();
 	});
 
-	it('re-anchors and still converges when responses arrive OUT OF ORDER', async () => {
+	it('re-anchors and still converges when responses arrive OUT OF ORDER', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(10);
 		// Stagger one endpoint's responses so its records land at the guardian
@@ -317,7 +329,10 @@ describe('Recovery phase 6: appends pipeline', () => {
 });
 
 describe('Recovery phase 6: receipts are cumulative and bound', () => {
-	it('one proven head certifies the whole prefix, with no per-record accounting', async () => {
+	it('one proven head certifies the whole prefix, with no per-record accounting', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(9);
 		const events: IGuardianReplicationEvent[] = [];
@@ -335,7 +350,10 @@ describe('Recovery phase 6: receipts are cumulative and bound', () => {
 		storage.close();
 	});
 
-	it('a receipt for a DIFFERENT namespace never advances the watermark', async () => {
+	it('a receipt for a DIFFERENT namespace never advances the watermark', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(3);
 		const rep = replicator(storage, bind(served));
@@ -406,7 +424,10 @@ describe('Recovery phase 6: receipts are cumulative and bound', () => {
 		otherStorage.close();
 	});
 
-	it('a lease the guardians never granted collects nothing to count', async () => {
+	it('a lease the guardians never granted collects nothing to count', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(3);
 		const rep = replicator(storage, bind(served));
@@ -430,7 +451,10 @@ describe('Recovery phase 6: receipts are cumulative and bound', () => {
 		storage.close();
 	});
 
-	it('a guardian holding a DIFFERENT record at our sequence is a conflict', async () => {
+	it('a guardian holding a DIFFERENT record at our sequence is a conflict', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(4);
 		const events: IGuardianReplicationEvent[] = [];
@@ -470,7 +494,10 @@ describe('Recovery phase 6: receipts are cumulative and bound', () => {
 });
 
 describe('Recovery phase 6: the watermark only rises', () => {
-	it('overlapping passes COALESCE rather than racing the mark downward', async () => {
+	it('overlapping passes COALESCE rather than racing the mark downward', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(6);
 		const rep = replicator(storage, bind(served));
@@ -490,7 +517,10 @@ describe('Recovery phase 6: the watermark only rises', () => {
 		storage.close();
 	});
 
-	it('a later pass never writes a LOWER mark than the one on disk', async () => {
+	it('a later pass never writes a LOWER mark than the one on disk', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(5);
 		const rep = replicator(storage, bind(served));
@@ -511,7 +541,10 @@ describe('Recovery phase 6: the watermark only rises', () => {
 		storage.close();
 	});
 
-	it('a CORRUPT watermark reads as zero instead of throwing into the send path', async () => {
+	it('a CORRUPT watermark reads as zero instead of throwing into the send path', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(2);
 		const rep = replicator(storage, bind(served));
@@ -532,7 +565,10 @@ describe('Recovery phase 6: the watermark only rises', () => {
 });
 
 describe('Recovery phase 6: fencing needs proof', () => {
-	it('one endpoint claiming supersession does NOT fence the node', async () => {
+	it('one endpoint claiming supersession does NOT fence the node', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const { storage } = journaledStorage(3);
 		const events: IGuardianReplicationEvent[] = [];

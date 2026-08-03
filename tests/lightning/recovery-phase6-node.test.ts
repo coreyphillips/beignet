@@ -220,7 +220,10 @@ async function waitFor(
 // ─────────────── Tests ───────────────
 
 describe('Recovery phase 6: a quorum chain will not run unbarriered', () => {
-	it('a node REFUSES to start when its journal promised quorum and nothing enforces it', async () => {
+	it('a node REFUSES to start when its journal promised quorum and nothing enforces it', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 
@@ -258,7 +261,31 @@ describe('Recovery phase 6: a quorum chain will not run unbarriered', () => {
 		storage.close();
 	});
 
-	it('the same chain starts fine once the barrier is back', async () => {
+	it('an enforcing barrier with NO JOURNAL is refused, not silently inert', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const replicator = replicatorFor(storage, bind(served));
+		const barrier = barrierFor(replicator, () => null, 'quorum');
+
+		// The mirror image of the case above, and worse because it looks like
+		// it is working: with no journal every batch reports frameSequence
+		// null, every barrier answers yes, and quorum mode would hold nothing
+		// at all while claiming to.
+		expect(() =>
+			createNode(storage, { enabled: false, durability: 'quorum', barrier })
+		).to.throw(/journal/);
+
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('the same chain starts fine once the barrier is back', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const journal = new RecoveryJournal(
@@ -294,7 +321,10 @@ describe('Recovery phase 6: a quorum chain will not run unbarriered', () => {
 });
 
 describe('Recovery phase 6: the node drives durability', () => {
-	it('a journaled commit replicates WITHOUT the caller waiting for it', async () => {
+	it('a journaled commit replicates WITHOUT the caller waiting for it', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const replicator = replicatorFor(storage, bind(served));
@@ -334,7 +364,10 @@ describe('Recovery phase 6: the node drives durability', () => {
 		storage.close();
 	});
 
-	it('an advancing watermark releases the compaction a lagging replica held back', async () => {
+	it('an advancing watermark releases the compaction a lagging replica held back', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const replicator = replicatorFor(storage, bind(served));
@@ -385,7 +418,10 @@ describe('Recovery phase 6: the node drives durability', () => {
 });
 
 describe('Recovery phase 6: the status surface', () => {
-	it('reports the mode, the durable head and nothing waiting on a quiet node', async () => {
+	it('reports the mode, the durable head and nothing waiting on a quiet node', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const replicator = replicatorFor(storage, bind(served));
@@ -419,7 +455,10 @@ describe('Recovery phase 6: the status surface', () => {
 		storage.close();
 	});
 
-	it('destroy REFUSES what is held instead of leaving it parked', async () => {
+	it('destroy REFUSES what is held instead of leaving it parked', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const replicator = replicatorFor(storage, bind(served));

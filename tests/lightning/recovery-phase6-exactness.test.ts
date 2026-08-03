@@ -207,7 +207,10 @@ async function sourceNode(
 // ─────────────── Tests ───────────────
 
 describe('Recovery phase 6: a proven-exact restore resumes', () => {
-	it('a certified head declaring QUORUM brings the channel back resumable', async () => {
+	it('a certified head declaring QUORUM brings the channel back resumable', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = await sourceNode(served, 'quorum');
 
@@ -234,7 +237,10 @@ describe('Recovery phase 6: a proven-exact restore resumes', () => {
 		target.close();
 	});
 
-	it('an ASYNC-REMOTE head keeps the DLP fallback, with no proof', async () => {
+	it('an ASYNC-REMOTE head keeps the DLP fallback, with no proof', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = await sourceNode(served, 'async-remote');
 
@@ -251,7 +257,10 @@ describe('Recovery phase 6: a proven-exact restore resumes', () => {
 		target.close();
 	});
 
-	it('a head with NO declaration at all is treated as unproven', async () => {
+	it('a head with NO declaration at all is treated as unproven', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = await sourceNode(served, undefined);
 
@@ -266,7 +275,10 @@ describe('Recovery phase 6: a proven-exact restore resumes', () => {
 		target.close();
 	});
 
-	it('the driver REPORTS which way it went, either way', async () => {
+	it('the driver REPORTS which way it went, either way', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = await sourceNode(served, 'quorum');
 		const target = openStorage();

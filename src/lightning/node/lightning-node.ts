@@ -689,6 +689,18 @@ export class LightningNode extends EventEmitter {
 					'restore the guardian set, or start a new recovery namespace'
 			);
 		}
+		// And the mirror image, which would be worse because it looks like it
+		// is working: an enforcing barrier with no journal has no frame to wait
+		// on, so every batch reports frameSequence null, every barrier answers
+		// yes, and quorum mode holds nothing at all while claiming to. Journal
+		// support is not optional for the mode that depends on it.
+		if (barrier?.enforcing && !journal) {
+			throw new Error(
+				'recovery: quorum durability needs the recovery journal, which is off ' +
+					'or unsupported by this storage backend; without frames there is ' +
+					'nothing for a barrier to wait on and nothing would be held'
+			);
+		}
 		this.recoveryBarrier = barrier;
 		// Phase 3 (docs/RECOVERY-PROTOCOL.md 5.4): with the journal on, every
 		// journaled commit schedules a (once-per-minute throttled) refresh of
