@@ -90,18 +90,6 @@ export interface IDurabilityBarrierConfig {
 	/** Gap between retry passes while waiters are outstanding. Default 1s. */
 	retryDelayMs?: number;
 	onEvent?: (event: IDurabilityBarrierEvent) => void;
-	/**
-	 * A proven supersession. Called at most once, before the waiters are
-	 * refused, so the node can hard freeze (spec 5.6) rather than rely on
-	 * per-message suppression.
-	 */
-	onFenced?: (superseding?: GuardianState) => void;
-	/**
-	 * The watermark advanced. The journal hangs its deferred compaction off
-	 * this: frames held back for a lagging replica become prunable exactly
-	 * when that replica catches up.
-	 */
-	onDurableAdvance?: (through: bigint) => void;
 }
 
 interface IWaiter {
@@ -125,13 +113,37 @@ export class DurabilityBarrier {
 	private pumping = false;
 	private kicked = false;
 	private fenced = false;
+	private supersededBy: GuardianState | undefined;
 	private stopped = false;
 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	private fenceListeners: Array<(superseding?: GuardianState) => void> = [];
+	private durableListeners: Array<(through: bigint) => void> = [];
 
 	constructor(config: IDurabilityBarrierConfig) {
 		this.config = config;
 		this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+	}
+
+	/**
+	 * Run `listener` when a proven supersession fences this writer. Fires
+	 * BEFORE the held messages are refused, so the node's hard freeze (spec
+	 * 5.6) has torn the transport down before anything could be released into
+	 * it. Register during construction of whatever owns the barrier; a
+	 * listener added after the fence still runs, immediately.
+	 */
+	onFenced(listener: (superseding?: GuardianState) => void): void {
+		this.fenceListeners.push(listener);
+		if (this.fenced) listener(this.supersededBy);
+	}
+
+	/**
+	 * Run `listener` when the watermark advances. The journal hangs its
+	 * deferred compaction off this: frames held back for a lagging replica
+	 * become prunable exactly when that replica catches up.
+	 */
+	onDurableAdvance(listener: (through: bigint) => void): void {
+		this.durableListeners.push(listener);
 	}
 
 	/** True when this mode holds messages at all. */
@@ -300,16 +312,19 @@ export class DurabilityBarrier {
 			sequence: through,
 			waiting: held.length
 		});
-		try {
-			this.config.onDurableAdvance?.(through);
-		} catch {
-			// Observer only: a compaction retry must never fail a release.
+		for (const listener of this.durableListeners) {
+			try {
+				listener(through);
+			} catch {
+				// Observer only: a compaction retry must never fail a release.
+			}
 		}
 	}
 
 	private fence(superseding?: GuardianState): void {
 		if (this.fenced) return;
 		this.fenced = true;
+		this.supersededBy = superseding;
 		if (this.retryTimer) {
 			clearTimeout(this.retryTimer);
 			this.retryTimer = null;
@@ -324,10 +339,12 @@ export class DurabilityBarrier {
 		});
 		// The node hard freezes BEFORE the waiters are told, so nothing can be
 		// released into a transport that is still open.
-		try {
-			this.config.onFenced?.(superseding);
-		} catch {
-			// Observer only.
+		for (const listener of this.fenceListeners) {
+			try {
+				listener(superseding);
+			} catch {
+				// Observer only.
+			}
 		}
 		this.settleAll({ released: false, reason: 'fenced' });
 	}

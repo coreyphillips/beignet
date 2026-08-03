@@ -4950,6 +4950,11 @@ export class ChannelManager extends EventEmitter {
 		if (held.outboxIds.length) this.emit('outbox:sent', held.outboxIds);
 	}
 
+	/** Channel ids currently holding messages behind the barrier. */
+	channelsAwaitingDurability(): Set<string> {
+		return new Set(this.barrierQueues.keys());
+	}
+
 	/**
 	 * Drop everything held for a channel. Called on disconnect, where
 	 * markForReestablish rolls uncommitted updates back, deletes uncommitted

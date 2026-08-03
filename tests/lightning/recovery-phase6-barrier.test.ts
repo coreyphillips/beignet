@@ -518,10 +518,10 @@ describe('Recovery phase 6: a fenced writer never releases again', () => {
 			replicator: rep,
 			lease: (): IWriterLeaseKeys => lease,
 			timeoutMs: 8_000,
-			retryDelayMs: 50,
-			onFenced: (): void => {
-				order.push('freeze');
-			}
+			retryDelayMs: 50
+		});
+		barrier.onFenced((): void => {
+			order.push('freeze');
 		});
 		const outcome = await barrier.whenReleased(stranded);
 		order.push('refused');

@@ -196,6 +196,8 @@ import {
 	RecoveryCriticality,
 	RecoveryMutation,
 	GuardianStartupGate,
+	DurabilityBarrier,
+	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
@@ -605,6 +607,11 @@ export class LightningNode extends EventEmitter {
 	 * before it can touch the Lightning protocol.
 	 */
 	private recoveryGate: GuardianStartupGate | undefined;
+	/**
+	 * Quorum durability barrier (recovery 5.8). Also the node's only driver
+	 * of guardian replication, in every durability mode.
+	 */
+	private recoveryBarrier: DurabilityBarrier | undefined;
 	/** The constructor's dial pass was withheld pending gate confirmation. */
 	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -629,6 +636,16 @@ export class LightningNode extends EventEmitter {
 		// Opt-in and additive; when off, nothing changes. The journal appends
 		// inside RecoveryManager.commit's transaction, so enabling it makes the
 		// frame part of every safety transition's atomicity.
+		// Phase 6 (5.8): the durability mode every frame declares, and the
+		// barrier that holds wire messages until their frame is replicated.
+		// async-remote is the default because it is exactly the node's
+		// pre-Phase-6 conduct.
+		const barrier = config.recovery?.barrier;
+		// The journal is built before the logger field is assigned, and its
+		// sticky-durability check reports through onDurabilityRefused during
+		// construction, so the message is captured and logged below rather
+		// than reaching for a logger that does not exist yet.
+		let durabilityRefusal: string | null = null;
 		const journal =
 			this.storage &&
 			config.recovery?.enabled === true &&
@@ -641,11 +658,38 @@ export class LightningNode extends EventEmitter {
 						// (wire spec 1.1, 3.2); never the public node id.
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
+							durability: config.recovery.durability ?? 'async-remote',
+							// Compaction must never prune a frame a guardian has not
+							// received: the chain origin is immutable and guardians
+							// accept only logHead.sequence + 1, so a pruned-early
+							// frame wedges that guardian for good.
+							retainFrom: barrier
+								? (): bigint => barrier.watermark() + 1n
+								: undefined,
+							onDurabilityRefused: (detail): void => {
+								durabilityRefusal = detail;
+							},
+							onCompactionForced: (detail): void => {
+								this.logger?.warn(`recovery compaction: ${detail}`);
+							},
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
 							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
 						}
 				  )
 				: undefined;
+		// Fail closed on a chain that promised quorum and a node that can no
+		// longer deliver it. Continuing would put revoke_and_ack on the wire
+		// unbarriered beneath a certified head that still reads 'quorum', and
+		// a later restore of that chain would claim an exactness it does not
+		// have. The remedy is to restore the guardian configuration.
+		if (journal?.getDurability() === 'quorum' && !barrier?.enforcing) {
+			throw new Error(
+				'recovery: this journal is in quorum mode but no enforcing durability ' +
+					'barrier was configured, so safety-critical messages could not be held; ' +
+					'restore the guardian set, or start a new recovery namespace'
+			);
+		}
+		this.recoveryBarrier = barrier;
 		// Phase 3 (docs/RECOVERY-PROTOCOL.md 5.4): with the journal on, every
 		// journaled commit schedules a (once-per-minute throttled) refresh of
 		// the peer_storage Recovery Capsule.
@@ -655,7 +699,15 @@ export class LightningNode extends EventEmitter {
 			? new RecoveryManager(this.storage, {
 					journal,
 					onCommitted: journal
-						? (): void => this.scheduleRecoveryCapsuleRefresh()
+						? (): void => {
+								this.scheduleRecoveryCapsuleRefresh();
+								// Start replicating without waiting for it. This is
+								// "appends are pipelined" from the commit side: the
+								// frame is handed to the pump and the transition
+								// returns, so later frames keep landing while an
+								// earlier receipt is still outstanding.
+								this.recoveryBarrier?.noteCommitted();
+						  }
 						: undefined,
 					onError: (err: Error, context): void => {
 						// persistChannel reports its own failures with the channel id
@@ -703,6 +755,9 @@ export class LightningNode extends EventEmitter {
 		this.socks5Proxy = config.socks5Proxy ?? null;
 		this.initWatchtowerClient(config.watchtowers ?? []);
 		this.logger = config.logger ?? noopLogger;
+		if (durabilityRefusal) {
+			this.logger.warn(`recovery durability: ${durabilityRefusal}`);
+		}
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
 		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
@@ -777,6 +832,11 @@ export class LightningNode extends EventEmitter {
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
 			signerFactory: config.signerFactory,
+			// Recovery 5.8: in quorum mode this holds a batch's remaining
+			// actions until the frame behind them is replicated. In every
+			// other mode it answers yes synchronously and dispatch is
+			// unchanged.
+			durabilityBarrier: this.recoveryBarrier,
 			largeChannels: this.largeChannels,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
@@ -857,6 +917,9 @@ export class LightningNode extends EventEmitter {
 		// schedules real dials on zero-delay timers.
 		this.recoveryGate = config.recovery?.startupGate;
 		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
+		if (this.recoveryBarrier) {
+			this.wireRecoveryBarrier(this.recoveryBarrier, journal);
+		}
 
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
@@ -3015,39 +3078,106 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
+	/**
+	 * Wire the quorum durability barrier into the node (recovery 5.8).
+	 *
+	 * Two node-owned consequences hang off it. A proven supersession is the
+	 * SAME hard freeze the startup gate performs, because the two differ only
+	 * in when they notice: the gate catches a device that restarts stale, the
+	 * barrier catches one that was already running when it was superseded.
+	 * And an advancing watermark releases the compaction the journal held back
+	 * for a lagging replica.
+	 */
+	private wireRecoveryBarrier(
+		barrier: DurabilityBarrier,
+		journal: RecoveryJournal | undefined
+	): void {
+		barrier.onFenced((superseding) => {
+			this.emitStructuredLog('channel', 'recovery_fenced', {
+				epoch: superseding ? String(superseding.lease.epoch) : null
+			});
+			this.emit('recovery:fenced', superseding);
+			this.peerManager?.freezeConnections();
+		});
+		if (journal) {
+			barrier.onDurableAdvance((through) => {
+				this.emit('recovery:durable', through);
+				try {
+					journal.compact();
+				} catch (error) {
+					// Compaction is housekeeping; a failure costs disk, never
+					// correctness, and must not disturb a release.
+					this.emitStructuredLog('channel', 'recovery_compaction_failed', {
+						error: error instanceof Error ? error.message : String(error)
+					});
+				}
+			});
+		}
+	}
+
 	/** The gate's view, for operators and tests. */
 	getRecoveryGateState(): string {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
 	}
 
 	/**
-	 * The recovery picture in one call (spec 5.6): the startup gate plus
+	 * The recovery picture in one call (spec 5.6 and 5.8): the startup gate,
+	 * the durability mode and how far replication has provably got, plus
 	 * every open channel's ChannelRecoveryStatus. While the gate is closed
 	 * the node-level rule overrides the per-channel view: channels may not
 	 * leave quarantine before ownership confirmation, whatever their own
 	 * reestablish bookkeeping says.
+	 *
+	 * `awaitingDurability` sits BESIDE the status rather than inside it. The
+	 * seven ChannelRecoveryStatus values are the spec's 5.7 machine and
+	 * describe what is known about a channel's STATE; waiting on a receipt
+	 * says nothing about the state, only that a message it authorized has not
+	 * been allowed out yet.
 	 */
 	getRecoveryStatus(): {
 		gate: string;
-		channels: Array<{ channelId: string; status: ChannelRecoveryStatus }>;
+		durability: RecoveryDurability;
+		/** Highest journal frame a guardian quorum provably holds. */
+		lastDurableSequence: string;
+		/** Batches held behind the barrier right now, node wide. */
+		awaitingDurabilityCount: number;
+		fenced: boolean;
+		channels: Array<{
+			channelId: string;
+			status: ChannelRecoveryStatus;
+			awaitingDurability: boolean;
+		}>;
 	} {
 		const gated = !this.recoveryPermitsPeerTraffic();
+		const barrier = this.recoveryBarrier?.snapshot();
+		const holding = this.channelManager.channelsAwaitingDurability();
 		const channels: Array<{
 			channelId: string;
 			status: ChannelRecoveryStatus;
+			awaitingDurability: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.state === ChannelState.CLOSED) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
+			const idHex = id.toString('hex');
 			channels.push({
-				channelId: id.toString('hex'),
+				channelId: idHex,
 				status: gated
 					? ChannelRecoveryStatus.Quarantined
-					: channel.getRecoveryStatus()
+					: channel.getRecoveryStatus(),
+				awaitingDurability: holding.has(idHex)
 			});
 		}
-		return { gate: this.getRecoveryGateState(), channels };
+		return {
+			gate: this.getRecoveryGateState(),
+			durability:
+				this.recoveryJournal?.getDurability() ?? barrier?.durability ?? 'local',
+			lastDurableSequence: (barrier?.durableThrough ?? 0n).toString(),
+			awaitingDurabilityCount: barrier?.waiting ?? 0,
+			fenced: barrier?.fenced ?? false,
+			channels
+		};
 	}
 
 	/**
@@ -5067,6 +5197,10 @@ export class LightningNode extends EventEmitter {
 		this._destroyed = true;
 		// Retires any chain startup sequence still working through its awaits.
 		++this.chainStartupGeneration;
+		// Anything held behind the barrier is refused rather than left parked.
+		// A shutdown is not permission either, and the barrier's retry timer
+		// must not keep the process alive.
+		this.recoveryBarrier?.stop();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);

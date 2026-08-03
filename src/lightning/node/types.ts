@@ -19,6 +19,8 @@ import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
 import { GuardianStartupGate } from '../recovery/startup-gate';
+import { DurabilityBarrier } from '../recovery/durability-barrier';
+import { RecoveryDurability } from '../recovery/types';
 
 export type { IInvoiceInfo };
 
@@ -216,6 +218,36 @@ export interface INodeConfig {
 	 */
 	recovery?: {
 		enabled?: boolean;
+		/**
+		 * How durable a safety transition must be before the wire messages it
+		 * authorizes may reach the peer (5.8, Phase 6). Defaults to
+		 * `async-remote`, which is the node's pre-Phase-6 conduct: fsync,
+		 * continue, replicate in the background.
+		 *
+		 * `quorum` is the only value that changes behaviour. It holds
+		 * revoke_and_ack, update_fulfill_htlc, commitment_signed, the
+		 * irreversible splice messages and the data-loss error until the
+		 * journal frame behind them has reached a guardian quorum, and it
+		 * REQUIRES `barrier`. What it buys is the Tier 3 guarantee: once a
+		 * peer has seen new channel state from us, sufficient remote
+		 * information already exists to restore that state, so a restored
+		 * device resumes the channel instead of falling back to DLP.
+		 *
+		 * Quorum is sticky. Once this journal has written quorum frames the
+		 * writer stays in quorum mode whatever this says, because a certified
+		 * head reading 'quorum' must never be followed by an unbarriered
+		 * frame. Leaving the mode means starting a new namespace, not editing
+		 * a config value.
+		 */
+		durability?: RecoveryDurability;
+		/**
+		 * The barrier itself (5.8, Phase 6). Built outside the node with its
+		 * guardian set, exactly as `startupGate` is, and required whenever
+		 * `durability` resolves to `quorum`. It also drives replication in
+		 * every mode, so an `async-remote` node passes one too if it wants its
+		 * journal replicated at all.
+		 */
+		barrier?: DurabilityBarrier;
 		/** Delta frames between full-state snapshots (default 256). */
 		snapshotIntervalFrames?: number;
 		/**
