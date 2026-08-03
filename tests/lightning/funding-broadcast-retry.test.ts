@@ -22,7 +22,10 @@ import {
 	ILightningError
 } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
-import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
+import {
+	ChannelState,
+	DEFAULT_CHANNEL_CONFIG
+} from '../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChainBackend } from '../../src/lightning/chain/chain-watcher';
@@ -441,6 +444,166 @@ describe('Funding broadcast retry', function () {
 			pendingMap(alice).has(fundingTxidHex),
 			'the retained tx is retired with the channel'
 		).to.equal(false);
+
+		alice.destroy();
+		bob.destroy();
+	});
+});
+
+describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
+	/**
+	 * Bridge the two nodes but WITHHOLD one message type from B to A, so the
+	 * funder can be parked mid-handshake the way a real peer parks it.
+	 */
+	function connectWithheld(
+		nodeA: LightningNode,
+		nodeB: LightningNode,
+		withheldType: number
+	): { deliver: () => void } {
+		const held: Array<{ type: number; payload: Buffer }> = [];
+		nodeA.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey === nodeB.getNodeId()) {
+					nodeB.handlePeerMessage(nodeA.getNodeId(), type, payload);
+				}
+			}
+		);
+		nodeB.on(
+			'message:outbound',
+			(pubkey: string, type: number, payload: Buffer) => {
+				if (pubkey !== nodeA.getNodeId()) return;
+				if (type === withheldType) {
+					held.push({ type, payload });
+					return;
+				}
+				nodeA.handlePeerMessage(nodeB.getNodeId(), type, payload);
+			}
+		);
+		return {
+			deliver: (): void => {
+				for (const m of held.splice(0)) {
+					nodeA.handlePeerMessage(nodeB.getNodeId(), m.type, m.payload);
+				}
+			}
+		};
+	}
+
+	const FUNDING_SIGNED = 35;
+
+	it('a new block does NOT broadcast while funding_signed is outstanding', async function () {
+		const broadcasts: string[] = [];
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) =>
+				buildMockFundingTx(address, Number(amountSats)),
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(41, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(42));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+
+		// Signed and retained, but NOT owed: without the acceptor's signature
+		// over our commitment #0 the 2-of-2 has no unilateral exit for us.
+		const channel = alice.getChannelManager().listChannels()[0];
+		expect(channel.getFullState().state).to.equal(
+			ChannelState.SENT_FUNDING_CREATED
+		);
+		expect(!!channel.getFullState().remoteCommitmentSignature).to.equal(false);
+		expect(pendingMap(alice).size).to.equal(1);
+		expect(broadcasts).to.have.length(0);
+
+		// The block feed is the embedder's documented contract, and this is
+		// where the obligation used to be assumed rather than checked.
+		alice.handleNewBlock(500);
+		await tick();
+		expect(broadcasts).to.have.length(0);
+		// And the retained transaction is NOT retired either: the open is still
+		// live, so the obligation may still begin.
+		expect(pendingMap(alice).size).to.equal(1);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a peer that never answers cannot be timed into a broadcast', async function () {
+		const broadcasts: string[] = [];
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) =>
+				buildMockFundingTx(address, Number(amountSats)),
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(43, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(44));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+
+		// The window is not the round trip. Nothing in the node bounds a peer
+		// that stays connected and simply never replies, so the timing is the
+		// peer's to choose; every block must answer the same way.
+		for (let height = 500; height < 510; height++) {
+			alice.handleNewBlock(height);
+		}
+		await tick();
+		expect(broadcasts).to.have.length(0);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('the obligation begins the moment funding_signed lands', async function () {
+		const broadcasts: string[] = [];
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) =>
+				buildMockFundingTx(address, Number(amountSats)),
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(45, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(46));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		const bridge = connectWithheld(alice, bob, FUNDING_SIGNED);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		alice.handleNewBlock(500);
+		await tick();
+		expect(broadcasts).to.have.length(0);
+
+		// Release the held funding_signed: the obligation starts here, and the
+		// guard must not have turned a delay into a permanent refusal.
+		bridge.deliver();
+		await tick();
+		expect(broadcasts).to.have.length(1);
+
+		// And it stays an obligation until the funding confirms.
+		alice.handleNewBlock(501);
+		await tick();
+		expect(broadcasts).to.have.length(2);
+		expect(broadcasts[1]).to.equal(broadcasts[0]);
 
 		alice.destroy();
 		bob.destroy();

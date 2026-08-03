@@ -3692,6 +3692,44 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * May this retained funding transaction go onto the network yet?
+	 *
+	 * BOLT 2 starts the broadcast obligation at funding_signed, never at
+	 * funding_created: without the acceptor's signature over our commitment #0
+	 * the funding output has no unilateral exit for us, so a broadcast in that
+	 * window puts the whole channel balance behind a peer who may simply never
+	 * answer. The transaction is retained from the moment it is signed, so a
+	 * crash in the signing window cannot lose it, but retaining it is not the
+	 * same as owing it.
+	 *
+	 * The answer is DERIVED from the channel rather than recorded beside the
+	 * transaction. The routes that ask fire on chain events, a new block and a
+	 * mempool eviction, which know nothing about how far the handshake got,
+	 * and a flag stored next to the transaction would be a copy of a fact the
+	 * channel already holds and the only one of the two that can go stale. It
+	 * also needs no migration: an entry written by an older build is answered
+	 * by the same channel state, and a crash between funding_signed and the
+	 * broadcast still resumes, which is what the startup sweep exists for.
+	 *
+	 * Both conditions are checked although either alone answers today.
+	 * createFundingCreated is the sole writer of SENT_FUNDING_CREATED and
+	 * handleFundingSigned, which stores the verified peer signature on the
+	 * ECDSA and the taproot branch alike, is its sole exit. A state added
+	 * between them later cannot silently authorize a broadcast.
+	 */
+	private canBroadcastFunding(txidHex: string): boolean {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			return (
+				state.state !== ChannelState.SENT_FUNDING_CREATED &&
+				!!state.remoteCommitmentSignature
+			);
+		}
+		return false;
+	}
+
+	/**
 	 * Broadcast the pending funding tx with this txid (internal byte order
 	 * hex). The entry is NOT removed on success: it lives until the funding
 	 * confirms, so a later mempool eviction can be answered by rebroadcast
@@ -3702,6 +3740,9 @@ export class LightningNode extends EventEmitter {
 	private broadcastPendingFundingTx(txidHex: string): void {
 		const txHex = this.pendingFundingTxs.get(txidHex);
 		if (!txHex || !this.fundingProvider) return;
+		// Covers all three routes that reach here: the watch:funding emit, the
+		// per-block sweep and the startup sweep.
+		if (!this.canBroadcastFunding(txidHex)) return;
 		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
 			const message = (err as Error)?.message ?? String(err);
 			// A tx that is already mined cannot be re-sent; that is success,
@@ -4771,7 +4812,19 @@ export class LightningNode extends EventEmitter {
 				// a confirmed tx) is the channel truly fiction.
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
 				const pendingHex = this.pendingFundingTxs.get(internalHex);
-				if (pendingHex && this.fundingProvider) {
+				// This route bypasses broadcastPendingFundingTx, so it needs the
+				// same authorization. It is genuinely reachable before
+				// funding_signed: restoreChainWatches arms a funding watch on a
+				// SENT_FUNDING_CREATED channel, and a transaction that was never
+				// broadcast is absent from mempool and chain by construction,
+				// which is exactly what funding:missing reports. Falling through
+				// to the void below is then the right disposition: a channel
+				// whose funding was never authorized and never sent is fiction.
+				if (
+					pendingHex &&
+					this.fundingProvider &&
+					this.canBroadcastFunding(internalHex)
+				) {
 					this.fundingProvider
 						.broadcastTransaction(pendingHex)
 						.then(() => {
