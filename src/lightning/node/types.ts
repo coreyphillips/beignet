@@ -18,6 +18,7 @@ import { ILogger } from '../../logger';
 import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
+import { GuardianStartupGate } from '../recovery/startup-gate';
 
 export type { IInvoiceInfo };
 
@@ -222,6 +223,18 @@ export interface INodeConfig {
 		 * limits trips first (default 4 MiB).
 		 */
 		snapshotIntervalBytes?: number;
+		/**
+		 * Startup ownership quarantine (5.6, Phase 5). A guardian-backed
+		 * node MUST pass its gate HERE, at construction, never afterward:
+		 * the constructor schedules auto-reconnect dials, so a gate
+		 * installed later races them and can lose. With a gate present the
+		 * node starts quarantined and refuses ALL peer contact, inbound and
+		 * outbound, including connection establishment itself, until a
+		 * guardian quorum confirms the writer lease via gate.confirm(); a
+		 * proven newer epoch fences the node permanently instead. Omit only
+		 * for a node genuinely running without guardians.
+		 */
+		startupGate?: GuardianStartupGate;
 	};
 	/** Chain backend for blockchain monitoring (Electrum, Esplora, etc.) */
 	chainBackend?: IChainBackend;
@@ -315,7 +328,13 @@ export interface INodeConfig {
 	maxTotalInFlightHtlcs?: number;
 	/** Starting channel key index (for per-channel HD derivation) */
 	nextChannelIndex?: number;
-	/** Per-channel key derivation callback — produces unique keys per channel index */
+	/**
+	 * Per-channel key derivation callback, producing unique keys per channel
+	 * index. MUST be pure and deterministic: the same index has to answer
+	 * with the same key material for the life of the wallet, since a
+	 * channel's basepoints are committed to on chain while its signing
+	 * secrets are re-derived on every restart and every recovery.
+	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
 	/** Per-peer rate limit config */
 	rateLimitConfig?: {

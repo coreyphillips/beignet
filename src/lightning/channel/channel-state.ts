@@ -86,6 +86,9 @@ export interface IRemoteForwardingPolicy {
 	timestamp: number;
 }
 
+/** Why a channel is durably waiting for the PEER's force close (5.6). */
+export type RecoveryCloseReason = 'local-data-loss' | 'state-uncertain';
+
 export interface IChannelState {
 	/** Identity */
 	channelId: Buffer | null;
@@ -473,6 +476,30 @@ export interface IChannelState {
 	 */
 	dataLossDetected?: boolean;
 	/**
+	 * Recovery 5.6 StateUncertain: this state was restored from replicas that
+	 * cannot be proven current (guardian replication is best effort until the
+	 * Phase 6 barriers), so the stored local commitment may be revoked in the
+	 * peer's view and must never be broadcast. A compatible
+	 * channel_reestablish does NOT clear it - the peer can under-report its
+	 * counters while holding a newer state, so compatibility proves nothing
+	 * about exactness; only recovery-storage provenance (a wire-safe
+	 * boundary from the Phase 6 barrier) lets the restore driver leave the
+	 * flag off. While set, reestablish routes the channel to the DLP path
+	 * (error out, the peer closes with its commitment); a peer positively
+	 * proving us stale upgrades to dataLossDetected.
+	 */
+	stateUncertain?: boolean;
+	/**
+	 * Recovery 5.6 liveness: the channel was routed to the DLP path and the
+	 * peer must force-close it. The wire error asking for that close can be
+	 * lost to a crash between the ERRORED persist and the socket, so the
+	 * DISPOSITION persists here and the request is regenerated
+	 * deterministically on every reconnect (buildRecoveryCloseActions) until
+	 * the peer's close resolves the channel on chain. Never cleared by the
+	 * wire, and never a broadcast authorization.
+	 */
+	recoveryCloseReason?: RecoveryCloseReason;
+	/**
 	 * Data loss protection: the peer's my_current_per_commitment_point from the
 	 * reestablish that proved data loss. Stored for completeness/legacy
 	 * commitments; static_remotekey/anchor/taproot to_remote sweeps derive from
@@ -716,4 +743,19 @@ export function createAcceptorState(params: {
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0
 	};
+}
+
+/**
+ * The recovery never-broadcast invariant (docs/RECOVERY-PROTOCOL.md 5.6):
+ * a channel whose state is proven stale (dataLossDetected) or cannot be
+ * proven current (stateUncertain) must never broadcast its stored local
+ * commitment, even if the peer stays unreachable indefinitely. Every
+ * force-close, rebroadcast and fee-bump decision consults this ONE
+ * predicate so the two flags can never drift apart.
+ */
+export function mustNotBroadcastCommitment(state: {
+	dataLossDetected?: boolean;
+	stateUncertain?: boolean;
+}): boolean {
+	return state.dataLossDetected === true || state.stateUncertain === true;
 }

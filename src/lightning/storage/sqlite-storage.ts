@@ -44,6 +44,7 @@ import {
 
 export class SqliteStorage implements IStorageBackend {
 	private db: Database.Database;
+	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
 	private encryptionKey?: Buffer;
 
@@ -64,8 +65,20 @@ export class SqliteStorage implements IStorageBackend {
 		opts?: { encryptionKey?: Buffer }
 	) {
 		this.db = new Database(dbPath);
+		this.dbPath = dbPath;
 		this.onCorruptRow = onCorruptRow;
 		this.encryptionKey = opts?.encryptionKey;
+	}
+
+	/**
+	 * True when a secret written here cannot be read out of the stored
+	 * artifact: either an encryption key is configured, or the database is
+	 * purely in memory and has no file to steal. Consulted by the writer
+	 * lease (recovery 5.6), which refuses to persist its signing key into a
+	 * file-backed database with no key configured.
+	 */
+	secretsEncryptedAtRest(): boolean {
+		return this.encryptionKey !== undefined || this.dbPath === ':memory:';
 	}
 
 	private reportCorruptRow(error: unknown): void {
@@ -206,7 +219,12 @@ export class SqliteStorage implements IStorageBackend {
 			table: 'invoice_path_ids',
 			pk: 'payment_hash_hex',
 			columns: ['path_id']
-		}
+		},
+		// Recovery journal metadata, which from Phase 5 on holds the WRITER
+		// LEASE: the private half of the ephemeral writer key that signs
+		// guardian records. That is signing material and must never sit in
+		// plaintext in a stolen database file.
+		{ table: 'recovery_meta', pk: 'key', columns: ['value'] }
 	];
 
 	/**
@@ -1728,11 +1746,13 @@ export class SqliteStorage implements IStorageBackend {
 			.run(sequence);
 	}
 
+	// value is encrypted at rest (see ENCRYPTED_COLUMNS): from Phase 5 the
+	// writer lease keeps its signing secret here.
 	getRecoveryMeta(key: string): string | null {
 		const row = this.db
 			.prepare('SELECT value FROM recovery_meta WHERE key = ?')
 			.get(key) as { value: string } | undefined;
-		return row ? row.value : null;
+		return row ? this._dec(row.value) : null;
 	}
 
 	setRecoveryMeta(key: string, value: string): void {
@@ -1740,7 +1760,11 @@ export class SqliteStorage implements IStorageBackend {
 			.prepare(
 				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
 			)
-			.run(key, value);
+			.run(key, this._enc(value));
+	}
+
+	deleteRecoveryMeta(key: string): void {
+		this.db.prepare('DELETE FROM recovery_meta WHERE key = ?').run(key);
 	}
 
 	// ─── Watchtower (LND altruist client) ───

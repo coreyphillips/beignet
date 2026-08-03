@@ -21,7 +21,7 @@ import {
 	IBlindedHopData,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { ChannelManager } from '../channel/channel-manager';
+import { ChannelManager, IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelResult } from '../channel/types';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -195,6 +195,8 @@ import {
 	RecoveryManager,
 	RecoveryCriticality,
 	RecoveryMutation,
+	GuardianStartupGate,
+	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
@@ -238,9 +240,15 @@ import {
 import {
 	createOpenerState,
 	createAcceptorState,
-	IChannelState
+	IChannelState,
+	mustNotBroadcastCommitment
 } from '../channel/channel-state';
-import { IScbChannelEntry, encodeScb } from '../backup/scb';
+import {
+	IScbChannelEntry,
+	encodeScb,
+	parseScbAddress,
+	validateScbEntry
+} from '../backup/scb';
 import { signRemoteCommitment } from '../channel/commitment-builder';
 import { ChannelSigner, SignerFactory } from '../keys/signer';
 import { bootstrapPeers, IPeerAddress, IBootstrapConfig } from '../bootstrap';
@@ -589,6 +597,16 @@ export class LightningNode extends EventEmitter {
 	/** Recovery Capsule (spec 5.4): journal configured, capsule refresh armed. */
 	private recoveryCapsuleActive = false;
 	private recoveryJournal: RecoveryJournal | undefined;
+	/**
+	 * Startup quarantine (recovery 5.6). Installed at CONSTRUCTION from
+	 * config.recovery.startupGate. While present and unconfirmed, the node
+	 * makes NO peer contact at all, inbound or outbound, connection
+	 * establishment included: a stale device discovers it was superseded
+	 * before it can touch the Lightning protocol.
+	 */
+	private recoveryGate: GuardianStartupGate | undefined;
+	/** The constructor's dial pass was withheld pending gate confirmation. */
+	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 	private capsuleLastRefreshAt = 0;
 	/** A journaled commit landed after the last compose (see connect path). */
@@ -832,6 +850,14 @@ export class LightningNode extends EventEmitter {
 		this.autoReconnect =
 			config.autoReconnect ?? config.enableNetworking ?? false;
 
+		// Startup ownership quarantine (recovery 5.6) arrives at CONSTRUCTION,
+		// before any networking exists, so no dial, listener or inbound
+		// handshake can race the gate's installation. A gate attached after
+		// construction would lose that race: autoReconnectPeers() below
+		// schedules real dials on zero-delay timers.
+		this.recoveryGate = config.recovery?.startupGate;
+		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
+
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
 				localPrivateKey: config.nodePrivateKey,
@@ -843,6 +869,39 @@ export class LightningNode extends EventEmitter {
 				webSocketImpl: config.webSocketImpl
 			});
 			this.channelManager.attachToPeerManager(this.peerManager);
+			// The socket boundary answers to the startup quarantine gate
+			// (recovery 5.6). ChannelManager sends via sendToPeer DIRECTLY
+			// when a PeerManager is attached, so gating only the node-level
+			// message:outbound relay would leave the production path open.
+			this.peerManager.setOutboundGate((pubkey, type) => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`suppressed outbound message type ${type} to ${pubkey}`
+				);
+				return false;
+			});
+			// Connections themselves answer to the gate too: the spec's rule
+			// is "may not even connect", not "connect but stay quiet". Dials
+			// throw at dialPeer (the one chokepoint every dial path uses) and
+			// inbound sockets die before the BOLT 8 handshake.
+			this.peerManager.setConnectionGate(() => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`refused peer connection while ${this.getRecoveryGateState()}`
+				);
+				return false;
+			});
+			// Defense in depth behind the connection gate: a message arriving
+			// on a connection that predates a fence is dropped at the
+			// transport, before the channel manager can act on it (an inbound
+			// error would otherwise force-close and BROADCAST).
+			this.peerManager.setInboundGate((pubkey, type) => {
+				if (this.recoveryPermitsPeerTraffic()) return true;
+				this.recoveryGate?.reportBlocked(
+					`dropped inbound message type ${type} from ${pubkey}`
+				);
+				return false;
+			});
 			this.registerGossipHandlers();
 			this.registerOnionMessageHandler();
 			this.registerPeerStorageHandlers();
@@ -1389,6 +1448,55 @@ export class LightningNode extends EventEmitter {
 	 * which withholds those sends: a message whose justifying state is not on
 	 * disk must never reach the peer.
 	 */
+	/**
+	 * Commit a freshly reconstructed recovery channel BEFORE it is exposed
+	 * through the ChannelManager. persistChannel cannot serve here: it
+	 * resolves the channel from the manager (not yet registered) and
+	 * reports failure only through an event, while this install must gate
+	 * on durability. Returns whether the commit landed; one
+	 * PERSISTENCE_ERROR is emitted on failure.
+	 */
+	private persistRecoveredChannel(
+		channel: Channel,
+		peerPubkey: string,
+		keyIndex: number | null | undefined
+	): boolean {
+		if (!this.storage || !this.recovery) return false;
+		const channelId = channel.getChannelId();
+		if (!channelId) return false;
+		const channelIdHex = channelId.toString('hex');
+		const mutations: RecoveryMutation[] = [
+			{
+				type: 'channel_state',
+				channelId: channelIdHex,
+				state: channel.getFullState(),
+				peerPubkey
+			}
+		];
+		if (keyIndex != null) {
+			mutations.push({
+				type: 'channel_key_index',
+				channelId: channelIdHex,
+				channelIndex: keyIndex
+			});
+		}
+		const result = this.recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations,
+			outboundMessages: [],
+			reportedByCaller: true
+		});
+		if (!result.committed) {
+			this.emit('node:error', {
+				code: 'PERSISTENCE_ERROR',
+				channelId,
+				message: `Failed to persist recovered channel: ${result.error?.message}`,
+				timestamp: Date.now()
+			} as ILightningError);
+		}
+		return result.committed;
+	}
+
 	private persistChannel(
 		channelId: Buffer,
 		request?: IChannelPersistRequest
@@ -2033,7 +2141,7 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {
-				this.emit('message:outbound', peerPubkey, type, payload);
+				this.emitOutbound(peerPubkey, type, payload);
 			}
 		);
 
@@ -2806,26 +2914,165 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
+	/**
+	 * Constructor-only wiring of the startup gate (it arrives via
+	 * config.recovery.startupGate; there is deliberately NO post-construction
+	 * attach, because the constructor schedules dials that would race one).
+	 * While the gate is closed the node makes no peer contact at all; when it
+	 * opens, deferred startup networking runs; if it fences, every connection
+	 * drops and the listeners stop, the spec 5.6 hard-freeze.
+	 */
+	private wireRecoveryGate(gate: GuardianStartupGate): void {
+		gate.onOpen(() => {
+			if (this._destroyed) return;
+			if (this.peerManager) {
+				for (const peer of this.peerManager.listPeers()) {
+					try {
+						this.bringUpChannelPeer(peer.pubkey);
+					} catch (err) {
+						// One peer failing to come up (it may have vanished mid
+						// bring-up) must not reject the confirmation that opened
+						// the gate, nor starve the remaining peers.
+						this.emitStructuredLog('peer', 'quarantine_release_failed', {
+							pubkey: peer.pubkey,
+							error: err instanceof Error ? err.message : String(err)
+						});
+					}
+				}
+			}
+			// The dial pass the constructor deferred (see autoReconnectPeers):
+			// stored channel peers are contacted only now, ownership proven.
+			if (this._autoReconnectDeferred) {
+				this._autoReconnectDeferred = false;
+				this.autoReconnectPeers();
+			}
+		});
+		gate.onFenced(() => {
+			// Hard-freeze (spec 5.6): a superseded writer must not exchange
+			// another wire message with anyone. freezeConnections is the
+			// PeerManager's own irreversible teardown: listeners, ALL
+			// reconnect timers (including ones for currently-disconnected
+			// peers), connections still mid-handshake (invisible to
+			// listPeers), and every registered peer.
+			this.peerManager?.freezeConnections();
+		});
+	}
+
+	/** The gate's view, for operators and tests. */
+	getRecoveryGateState(): string {
+		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
+	}
+
+	/**
+	 * The recovery picture in one call (spec 5.6): the startup gate plus
+	 * every open channel's ChannelRecoveryStatus. While the gate is closed
+	 * the node-level rule overrides the per-channel view: channels may not
+	 * leave quarantine before ownership confirmation, whatever their own
+	 * reestablish bookkeeping says.
+	 */
+	getRecoveryStatus(): {
+		gate: string;
+		channels: Array<{ channelId: string; status: ChannelRecoveryStatus }>;
+	} {
+		const gated = !this.recoveryPermitsPeerTraffic();
+		const channels: Array<{
+			channelId: string;
+			status: ChannelRecoveryStatus;
+		}> = [];
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.state === ChannelState.CLOSED) continue;
+			const id = state.channelId ?? state.temporaryChannelId;
+			channels.push({
+				channelId: id.toString('hex'),
+				status: gated
+					? ChannelRecoveryStatus.Quarantined
+					: channel.getRecoveryStatus()
+			});
+		}
+		return { gate: this.getRecoveryGateState(), channels };
+	}
+
+	/**
+	 * The single question every transport chokepoint asks. With no gate
+	 * configured the node runs ungated, which is the guardian-disabled mode
+	 * the spec allows; with one configured, only a confirmed lease passes.
+	 */
+	private recoveryPermitsPeerTraffic(): boolean {
+		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
+	}
+
+	/**
+	 * Public networking entry points refuse loudly while the gate is closed,
+	 * rather than parking: a fenced gate never opens, and a parked promise
+	 * on a fenced node would hang its caller forever.
+	 */
+	private assertPeerContactPermitted(operation: string): void {
+		if (this.recoveryPermitsPeerTraffic()) return;
+		this.recoveryGate?.reportBlocked(
+			`refused ${operation} while ${this.getRecoveryGateState()}`
+		);
+		throw new Error(
+			`Startup quarantine: ${operation} is refused until writer ownership is confirmed (gate is ${this.getRecoveryGateState()})`
+		);
+	}
+
+	/**
+	 * The transport boundary for the event-based transport: EVERY node-level
+	 * emit of 'message:outbound' must come through here. With no PeerManager
+	 * attached this event IS the wire (loopback tests, embedded integrators),
+	 * so it is gated exactly like the socket path in PeerManager.sendToPeer:
+	 * a quarantined or fenced device emits ZERO Lightning wire messages.
+	 */
+	private emitOutbound(pubkey: string, type: number, payload: Buffer): void {
+		if (!this.recoveryPermitsPeerTraffic()) {
+			this.recoveryGate?.reportBlocked(
+				`suppressed outbound message type ${type} to ${pubkey}`
+			);
+			return;
+		}
+		this.emit('message:outbound', pubkey, type, payload);
+	}
+
+	/**
+	 * Everything a fresh connection gets once traffic is permitted. Runs from
+	 * peer:connect on an ungated node, and from the gate's open hook for
+	 * connections that sat inert through quarantine.
+	 */
+	private bringUpChannelPeer(pubkey: string): void {
+		// BOLT 1 peer storage first: return the peer's stored blob and push our
+		// own, before reestablish/gossip traffic (spec: ideally right after init).
+		this.sendPeerStorageOnConnect(pubkey);
+		this.channelManager.handlePeerReconnected(pubkey);
+		// Push our own gossip to the new peer so it propagates onward — a one-shot
+		// broadcast at announcement time rarely reaches the whole network.
+		this.sendOwnGossipTo(pubkey);
+		// Persist peer address for auto-reconnect after crash recovery (Fix 2.1)
+		if (this.peerManager) {
+			const addr = this.peerManager.getPeerAddress(pubkey);
+			if (addr) {
+				this.safeStorage(
+					() => this.storage!.savePeerAddress(pubkey, addr.host, addr.port),
+					'savePeerAddress'
+				);
+			}
+		}
+	}
+
 	private wirePeerManagerEvents(): void {
 		if (!this.peerManager) return;
 		this.peerManager.on('peer:connect', (pubkey: string) => {
-			// BOLT 1 peer storage first: return the peer's stored blob and push our
-			// own, before reestablish/gossip traffic (spec: ideally right after init).
-			this.sendPeerStorageOnConnect(pubkey);
-			this.channelManager.handlePeerReconnected(pubkey);
-			// Push our own gossip to the new peer so it propagates onward — a one-shot
-			// broadcast at announcement time rarely reaches the whole network.
-			this.sendOwnGossipTo(pubkey);
-			// Persist peer address for auto-reconnect after crash recovery (Fix 2.1)
-			if (this.peerManager) {
-				const addr = this.peerManager.getPeerAddress(pubkey);
-				if (addr) {
-					this.safeStorage(
-						() => this.storage!.savePeerAddress(pubkey, addr.host, addr.port),
-						'savePeerAddress'
-					);
-				}
+			// Quarantine holds channels BEFORE reestablish (recovery 5.6): a
+			// device that cannot prove it owns its lease must not exchange
+			// channel state with anyone, so the connection is left inert.
+			if (!this.recoveryPermitsPeerTraffic()) {
+				this.recoveryGate?.reportBlocked(
+					`refused to bring up channels with ${pubkey} while quarantined`
+				);
+				this.emit('peer:connect', pubkey);
+				return;
 			}
+			this.bringUpChannelPeer(pubkey);
 			this.emit('peer:connect', pubkey);
 		});
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
@@ -2853,15 +3100,33 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 
+		// Startup ownership quarantine: the node may not even connect to
+		// channel peers before the quorum confirms the lease. Defer the whole
+		// dial pass to the gate's open hook; a fenced gate never opens, so a
+		// superseded device never dials at all. Ready still fires: a
+		// quarantined node is constructed and operable, just silent.
+		if (this.recoveryGate && !this.recoveryGate.permitsPeerTraffic()) {
+			if (this.recoveryGate.getState() === 'quarantined') {
+				this._autoReconnectDeferred = true;
+			}
+			this.emitReady();
+			return;
+		}
+
 		const peerAddresses = this.storage.loadAllPeerAddresses();
 		const channelPeers = new Set<string>();
 
-		// Only reconnect peers that have channels needing reestablishment
+		// Only reconnect peers that have channels needing reestablishment, or
+		// carrying a durable recovery-close disposition (5.6): those must
+		// proactively reach the peer to deliver the force-close request, or a
+		// crash between the ERRORED persist and the error send would leave
+		// the channel waiting forever on a peer that never dials us.
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getState();
 			if (
 				state === ChannelState.AWAITING_REESTABLISH ||
-				state === ChannelState.AWAITING_CHANNEL_READY
+				state === ChannelState.AWAITING_CHANNEL_READY ||
+				channel.hasRecoveryCloseDisposition()
 			) {
 				const channelId = channel.getChannelId();
 				if (channelId) {
@@ -3345,17 +3610,22 @@ export class LightningNode extends EventEmitter {
 		const skipped: Array<{ channelId: string; reason: string }> = [];
 
 		for (const entry of entries) {
-			const channelId = Buffer.from(entry.channelId, 'hex');
-			if (
-				channelId.length !== 32 ||
-				channelId.toString('hex') !== entry.channelId.toLowerCase()
-			) {
+			// Every field this reconstruction relies on is validated HERE, at
+			// the boundary: an entry that reaches the reconstruction malformed
+			// either installs an unsweepable channel or throws out of this
+			// loop, taking the entries behind it with it.
+			const invalid = validateScbEntry(entry);
+			if (invalid) {
 				skipped.push({
-					channelId: entry.channelId,
-					reason: 'invalid channelId (expected 32-byte hex)'
+					channelId:
+						typeof (entry as { channelId?: unknown })?.channelId === 'string'
+							? entry.channelId
+							: '',
+					reason: invalid
 				});
 				continue;
 			}
+			const channelId = Buffer.from(entry.channelId, 'hex');
 			if (this.channelManager.getChannel(channelId)) {
 				skipped.push({
 					channelId: entry.channelId,
@@ -3364,65 +3634,105 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 
-			// Local key material: per-channel keys for the recorded index, or the
-			// node-level basepoints for legacy (null-index) channels. Using the
-			// SAME derivation as the original open is what makes the peer's DLP
-			// proof verifiable and the to_remote output ours to claim.
-			const material = this.channelManager.getRecoveryChannelMaterial(
-				entry.channelKeyIndex
-			);
-			const stateParams = {
-				temporaryChannelId: Buffer.from(channelId),
-				fundingSatoshis: BigInt(entry.fundingSatoshis),
-				pushMsat: 0n,
-				localConfig: material.localConfig,
-				localBasepoints: material.basepoints,
-				localPerCommitmentSeed: material.perCommitmentSeed
-			};
-			const state =
-				entry.role === 'ACCEPTOR'
-					? createAcceptorState({
-							...stateParams,
-							// Placeholder only - nulled right below. The peer's basepoints
-							// are not in the backup; classification and to_remote resolution
-							// intentionally work without them (see classifyCommitmentTx).
-							remoteBasepoints: material.basepoints,
-							remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
-					  })
-					: createOpenerState(stateParams);
-			state.remoteBasepoints = null;
-			state.channelId = channelId;
-			state.fundingTxid = Buffer.from(entry.fundingTxid, 'hex');
-			state.fundingOutputIndex = entry.fundingOutputIndex;
-			state.channelType = entry.channelType
-				? Buffer.from(entry.channelType, 'hex')
-				: null;
-			// Liquidity ads: restore the lease fields so the DLP classifier builds
-			// the lease-locked to_remote variant and the sweep sets its nLockTime.
-			state.leaseExpiry = entry.leaseExpiry;
-			state.isLessor = entry.isLessor;
-			state.leaseCommitBlockheight = entry.leaseCommitBlockheight;
-			state.localCommitmentNumber = 0n;
-			state.remoteCommitmentNumber = 0n;
-			// Balances are unknown after data loss; the sweep takes its amount from
-			// the on-chain to_remote output, so never report a fabricated balance.
-			state.localBalanceMsat = 0n;
-			state.remoteBalanceMsat = 0n;
-			state.announceChannel = false;
-			// We KNOW we have no usable commitment state: refuse every local
-			// broadcast (forceClose refuses, scanStuckChannels skips) and wait for
-			// the peer's force-close on-chain.
-			state.state = ChannelState.ERRORED;
-			state.dataLossDetected = true;
+			// Key derivation and channel construction happen behind a per-entry
+			// boundary. Structural validation cannot promise that a configured
+			// channelKeyDeriver (the caller's own callback) will not throw, and
+			// a throw here must cost THIS channel only, never the entries
+			// queued behind it.
+			let state: IChannelState;
+			let channel: Channel;
+			let perChannelKeys: IPerChannelKeys | null;
+			try {
+				const built = this.buildRecoveryChannelState(entry, channelId);
+				state = built.state;
+				perChannelKeys = built.perChannelKeys;
+				channel = new Channel(state);
+				channel.channelKeyIndex = entry.channelKeyIndex;
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				skipped.push({
+					channelId: entry.channelId,
+					reason: `failed to derive recovery channel keys: ${message}`
+				});
+				continue;
+			}
 
-			const channel = new Channel(state);
-			channel.channelKeyIndex = entry.channelKeyIndex;
-			this.channelManager.restoreChannel(
-				channel,
-				entry.peerNodeId,
-				entry.channelKeyIndex
-			);
-			this.persistChannel(channelId);
+			// The disposition is useless without an address to dial after a
+			// restart, and the backup's addresses were known-good persisted
+			// peer addresses when the SCB was written, so restore the first
+			// valid one to the same store. BEFORE the channel, as a HARD
+			// prerequisite: an orphan address is harmless if channel
+			// persistence fails below, but a recovery-close channel installed
+			// without its dial candidate strands the close request after a
+			// restart, so a failed address write SKIPS this channel entirely
+			// (recovery is re-runnable; retry the SCB once storage recovers).
+			// contactRecoveryPeer below is only the best-effort immediate
+			// attempt and persists nothing itself.
+			const peerAddresses = Array.isArray(entry.peerAddresses)
+				? entry.peerAddresses
+				: [];
+			const dialCandidate = this.firstDialableRecoveryAddress(peerAddresses);
+			if (dialCandidate && this.storage) {
+				try {
+					this.storage.savePeerAddress(
+						entry.peerNodeId,
+						dialCandidate.host,
+						dialCandidate.port
+					);
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					skipped.push({
+						channelId: entry.channelId,
+						reason: `failed to persist recovery peer address: ${message}`
+					});
+					this.emit('node:error', {
+						code: 'PERSISTENCE_ERROR',
+						message: `saveRecoveryPeerAddress: ${message}`,
+						timestamp: Date.now()
+					} as ILightningError);
+					continue;
+				}
+			}
+
+			// Durability BEFORE visibility: committing the recovered state
+			// first means a failed commit installs nothing (the address above
+			// is the only, harmless, orphan) instead of an undurable
+			// in-memory channel reported as recovering, which a retry would
+			// then skip as already existing until a restart cleared it.
+			if (
+				!this.persistRecoveredChannel(
+					channel,
+					entry.peerNodeId,
+					entry.channelKeyIndex
+				)
+			) {
+				skipped.push({
+					channelId: entry.channelId,
+					reason: 'failed to persist recovered channel'
+				});
+				continue;
+			}
+			try {
+				// The SAME derivation that produced the state's basepoints
+				// also arms the signer: one evaluation of the caller's
+				// deriver per recovered channel, never two that could differ.
+				this.channelManager.restoreChannel(
+					channel,
+					entry.peerNodeId,
+					entry.channelKeyIndex,
+					perChannelKeys
+				);
+			} catch (err) {
+				// The state is already durable, so a restart or a retry picks
+				// this channel up; what must not happen is the registration
+				// failure taking the remaining entries down with it.
+				const message = err instanceof Error ? err.message : String(err);
+				skipped.push({
+					channelId: entry.channelId,
+					reason: `failed to register recovered channel: ${message}`
+				});
+				continue;
+			}
 			recovering.push(entry.channelId);
 
 			this.emitStructuredLog('channel', 'recovery_started', {
@@ -3455,12 +3765,97 @@ export class LightningNode extends EventEmitter {
 			// hit our provably-stale state, prompting it to error and force-close.
 			// Failures are non-fatal - recovery only needs the funding spend to
 			// appear on chain eventually.
-			if (this.peerManager && entry.peerAddresses.length > 0) {
-				void this.contactRecoveryPeer(entry.peerNodeId, entry.peerAddresses);
+			if (this.peerManager && peerAddresses.length > 0) {
+				void this.contactRecoveryPeer(entry.peerNodeId, peerAddresses);
 			}
 		}
 
 		return { recovering, skipped };
+	}
+
+	/**
+	 * Rebuild one backup entry's channel state: local key material for the
+	 * recorded index (or the node-level basepoints for a legacy null-index
+	 * channel), the funding outpoint, the channel type that decides which
+	 * to_remote variant the sweep looks for, and the broadcast-banned
+	 * recovery disposition.
+	 *
+	 * Using the SAME derivation as the original open is what makes the peer's
+	 * DLP proof verifiable and the to_remote output ours to claim. Throws are
+	 * the caller's to isolate: they belong to this entry alone. The derived
+	 * key material is returned alongside the state so registration can reuse
+	 * it instead of asking the deriver a second time.
+	 */
+	private buildRecoveryChannelState(
+		entry: IScbChannelEntry,
+		channelId: Buffer
+	): { state: IChannelState; perChannelKeys: IPerChannelKeys | null } {
+		const material = this.channelManager.getRecoveryChannelMaterial(
+			entry.channelKeyIndex
+		);
+		const stateParams = {
+			temporaryChannelId: Buffer.from(channelId),
+			fundingSatoshis: BigInt(entry.fundingSatoshis),
+			pushMsat: 0n,
+			localConfig: material.localConfig,
+			localBasepoints: material.basepoints,
+			localPerCommitmentSeed: material.perCommitmentSeed
+		};
+		const state =
+			entry.role === 'ACCEPTOR'
+				? createAcceptorState({
+						...stateParams,
+						// Placeholder only - nulled right below. The peer's basepoints
+						// are not in the backup; classification and to_remote resolution
+						// intentionally work without them (see classifyCommitmentTx).
+						remoteBasepoints: material.basepoints,
+						remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+				  })
+				: createOpenerState(stateParams);
+		state.remoteBasepoints = null;
+		state.channelId = channelId;
+		state.fundingTxid = Buffer.from(entry.fundingTxid, 'hex');
+		state.fundingOutputIndex = entry.fundingOutputIndex;
+		state.channelType = entry.channelType
+			? Buffer.from(entry.channelType, 'hex')
+			: null;
+		// Liquidity ads: restore the lease fields so the DLP classifier builds
+		// the lease-locked to_remote variant and the sweep sets its nLockTime.
+		state.leaseExpiry = entry.leaseExpiry;
+		state.isLessor = entry.isLessor;
+		state.leaseCommitBlockheight = entry.leaseCommitBlockheight;
+		state.localCommitmentNumber = 0n;
+		state.remoteCommitmentNumber = 0n;
+		// Balances are unknown after data loss; the sweep takes its amount from
+		// the on-chain to_remote output, so never report a fabricated balance.
+		state.localBalanceMsat = 0n;
+		state.remoteBalanceMsat = 0n;
+		state.announceChannel = false;
+		// We KNOW we have no usable commitment state: refuse every local
+		// broadcast (forceClose refuses, scanStuckChannels skips) and wait for
+		// the peer's force-close on-chain.
+		state.state = ChannelState.ERRORED;
+		state.dataLossDetected = true;
+		// The durable peer-close disposition (recovery 5.6): if the immediate
+		// connection attempt fails or the process restarts, startup dialing
+		// selects this channel and reconnect regenerates the close request.
+		state.recoveryCloseReason = 'local-data-loss';
+		return { state, perChannelKeys: material.perChannelKeys };
+	}
+
+	/**
+	 * First backup address entry that parses to a dialable (host, port).
+	 * `parseScbAddress` is THE parser for the format, shared with entry
+	 * validation and the dial loop below so none of them can drift.
+	 */
+	private firstDialableRecoveryAddress(
+		addresses: string[]
+	): { host: string; port: number } | null {
+		for (const address of addresses) {
+			const parsed = parseScbAddress(address);
+			if (parsed) return parsed;
+		}
+		return null;
 	}
 
 	/** Try each known address for a recovery peer until one connects. */
@@ -3469,14 +3864,10 @@ export class LightningNode extends EventEmitter {
 		addresses: string[]
 	): Promise<void> {
 		for (const address of addresses) {
-			// 'host:port' with a possibly-bracketed IPv6 host: split on the LAST colon.
-			const sep = address.lastIndexOf(':');
-			if (sep <= 0) continue;
-			const host = address.slice(0, sep).replace(/^\[|\]$/g, '');
-			const port = parseInt(address.slice(sep + 1), 10);
-			if (!Number.isFinite(port) || port <= 0) continue;
+			const parsed = parseScbAddress(address);
+			if (!parsed) continue;
 			try {
-				await this.connectPeer(peerNodeId, host, port);
+				await this.connectPeer(peerNodeId, parsed.host, parsed.port);
 				return;
 			} catch {
 				// Try the next address; unreachable peers are expected here.
@@ -3797,6 +4188,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('connectPeer');
 		const pubkeyErr = validateHexPubkey(pubkey, 'pubkey');
 		if (pubkeyErr) throw new Error(pubkeyErr);
 		if (transport?.type === 'ws' && transport.url !== undefined) {
@@ -3937,6 +4329,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('listen');
 		await this.peerManager.listen(port, host);
 	}
 
@@ -3948,6 +4341,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('listenWebSocket');
 		await this.peerManager.listenWebSocket(port, host);
 	}
 
@@ -4545,6 +4939,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.peerManager) {
 			throw new Error('Networking is not enabled');
 		}
+		this.assertPeerContactPermitted('connectToSeeds');
 		const peers = await this.bootstrapPeers(config);
 		const connected: string[] = [];
 		for (const peer of peers.slice(0, maxPeers)) {
@@ -5644,7 +6039,7 @@ export class LightningNode extends EventEmitter {
 				// Peer not connected; it will learn the policy from route hints.
 			}
 		} else {
-			this.emit('message:outbound', peer, MessageType.CHANNEL_UPDATE, payload);
+			this.emitOutbound(peer, MessageType.CHANNEL_UPDATE, payload);
 		}
 	}
 
@@ -7322,7 +7717,7 @@ export class LightningNode extends EventEmitter {
 					const msg = decodeReplyChannelRangeMessage(payload);
 					const responses = syncMgr.handleReplyChannelRange(msg);
 					for (const resp of responses) {
-						this.emit('message:outbound', pubkey, resp.type, resp.payload);
+						this.emitOutbound(pubkey, resp.type, resp.payload);
 					}
 				}
 				break;
@@ -7333,7 +7728,7 @@ export class LightningNode extends EventEmitter {
 					const msg = decodeReplyShortChannelIdsEndMessage(payload);
 					const responses = syncMgr.handleReplyShortChannelIdsEnd(msg);
 					for (const resp of responses) {
-						this.emit('message:outbound', pubkey, resp.type, resp.payload);
+						this.emitOutbound(pubkey, resp.type, resp.payload);
 					}
 				}
 				break;
@@ -7343,7 +7738,7 @@ export class LightningNode extends EventEmitter {
 				const msg = decodeQueryChannelRangeMessage(payload);
 				const responses = syncMgr.handleQueryChannelRange(msg);
 				for (const resp of responses) {
-					this.emit('message:outbound', pubkey, resp.type, resp.payload);
+					this.emitOutbound(pubkey, resp.type, resp.payload);
 				}
 				break;
 			}
@@ -7352,7 +7747,7 @@ export class LightningNode extends EventEmitter {
 				const msg = decodeQueryShortChannelIdsMessage(payload);
 				const responses = syncMgr.handleQueryShortChannelIds(msg);
 				for (const resp of responses) {
-					this.emit('message:outbound', pubkey, resp.type, resp.payload);
+					this.emitOutbound(pubkey, resp.type, resp.payload);
 				}
 				break;
 			}
@@ -7383,7 +7778,7 @@ export class LightningNode extends EventEmitter {
 		const mgr = this.getOrCreateSyncManager(pubkey);
 		const messages = mgr.initiateSync();
 		for (const msg of messages) {
-			this.emit('message:outbound', pubkey, msg.type, msg.payload);
+			this.emitOutbound(pubkey, msg.type, msg.payload);
 		}
 	}
 
@@ -11398,6 +11793,17 @@ export class LightningNode extends EventEmitter {
 	// ─────────────── Message Handling (testing support) ───────────────
 
 	handlePeerMessage(pubkey: string, type: number, payload: Buffer): void {
+		// Startup quarantine: the event-transport inbound boundary (the
+		// networked path is gated inside PeerManager). Nothing may reach the
+		// channel manager before ownership is confirmed; an inbound error
+		// message would otherwise force-close and BROADCAST on a device that
+		// may no longer own the channel state it stores.
+		if (!this.recoveryPermitsPeerTraffic()) {
+			this.recoveryGate?.reportBlocked(
+				`dropped inbound message type ${type} from ${pubkey}`
+			);
+			return;
+		}
 		if (Buffer.isBuffer(payload) && payload.length > MAX_MESSAGE_SIZE) {
 			this.emit('node:error', {
 				code: 'MESSAGE_TOO_LARGE',
@@ -11550,7 +11956,9 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
-		if (state.dataLossDetected) {
+		if (mustNotBroadcastCommitment(state)) {
+			// Proven stale or unprovable (recovery 5.6): broadcasting our
+			// commitment is forbidden; the peer's close resolves the channel.
 			this.emitStructuredLog('channel', 'errored_awaiting_peer_close', {
 				channelId: channelId.toString('hex'),
 				reason
@@ -11637,7 +12045,8 @@ export class LightningNode extends EventEmitter {
 			// commitment is provably stale and broadcasting it forfeits the whole
 			// balance to the justice path.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 
 			for (const [key, htlc] of state.htlcs) {
@@ -11740,7 +12149,8 @@ export class LightningNode extends EventEmitter {
 			// resolve a forwarded HTLC stuck on it. dataLossDetected must never
 			// broadcast; the peer's commitment resolves those channels.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (state.state !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
@@ -12574,7 +12984,8 @@ export class LightningNode extends EventEmitter {
 			// downstream can claim it with the preimage whether or not the channel
 			// is operational. dataLossDetected must never broadcast.
 			const errored =
-				state.state === ChannelState.ERRORED && !state.dataLossDetected;
+				state.state === ChannelState.ERRORED &&
+				!mustNotBroadcastCommitment(state);
 			if (effectiveState !== ChannelState.NORMAL && !errored) continue;
 			const channelId = state.channelId || state.temporaryChannelId;
 
@@ -13070,12 +13481,14 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			const channelId = state.channelId || state.temporaryChannelId;
 
-			// Data loss protection: the peer proved our state is stale. Auto
-			// force-closing here would broadcast our revoked-in-their-view
-			// commitment and lose the whole balance to the justice path. The
-			// peer's force close resolves the channel; never time it out.
+			// The never-broadcast invariant (recovery 5.6): proven stale or
+			// unprovable, auto force-closing here would broadcast a possibly
+			// revoked commitment and lose the whole balance to the justice
+			// path. StateUncertain is permanent absent independently verified
+			// storage provenance; only the peer's force close resolves the
+			// channel. Never time it out.
 			// (Channel.forceClose refuses too - this skip avoids even trying.)
-			if (state.dataLossDetected) {
+			if (mustNotBroadcastCommitment(state)) {
 				continue;
 			}
 

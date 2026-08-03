@@ -81,8 +81,11 @@ import {
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	mustNotBroadcastCommitment,
+	RecoveryCloseReason
 } from './channel-state';
+import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
 	deriveChannelId,
 	deriveV2ChannelId,
@@ -415,6 +418,12 @@ export class Channel {
 		startBatch: Buffer;
 		commitments: Buffer[];
 	} | null = null;
+	// Outcome of the last processed channel_reestablish this SESSION (recovery
+	// 5.6 status machine): 'replay' when we served retransmissions, 'clean'
+	// when the counters simply agreed. In-memory only - after a restart the
+	// channel is back in AWAITING_REESTABLISH and the status derives from
+	// that. Cleared again once fresh signed traffic proves the exchange over.
+	private _lastReestablishOutcome: 'replay' | 'clean' | null = null;
 	// Watchtower: the remote commitment transactions we have signed, keyed by the
 	// per-commitment point they use, so that when the peer later reveals that
 	// point's secret (revoke_and_ack) we can ship the exact revoked tx to a tower.
@@ -2841,6 +2850,8 @@ export class Channel {
 	 * Returns revoke_and_ack.
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
+		// Fresh signed traffic ends the reestablish exchange (status machine).
+		this._lastReestablishOutcome = null;
 		// start_batch collection: buffer the announced batch, then process all
 		// of its commitment_signed messages as one logical update.
 		if (this._pendingBatch) {
@@ -3124,6 +3135,8 @@ export class Channel {
 	 * Handle revoke_and_ack from remote.
 	 */
 	handleRevokeAndAck(msg: IRevokeAndAckMessage): ChannelAction[] {
+		// Fresh signed traffic ends the reestablish exchange (status machine).
+		this._lastReestablishOutcome = null;
 		if (
 			this._state.state !== ChannelState.NORMAL &&
 			this._state.state !== ChannelState.SHUTTING_DOWN &&
@@ -3767,16 +3780,123 @@ export class Channel {
 	 * Force close the channel by broadcasting the latest local commitment.
 	 * Returns the commitment transaction to broadcast and a CHANNEL_CLOSED action.
 	 */
-	forceClose(signer: ISigner): ChannelAction[] {
-		// Data loss protection: the peer proved our state is stale. Our latest
-		// local commitment is revoked in the peer's view - broadcasting it hands
-		// our entire balance to the justice path. Recovery is passive: the peer
-		// force-closes with its newer commitment and we sweep our to_remote.
+	/**
+	 * Per-channel recovery status (docs/RECOVERY-PROTOCOL.md 5.6). Derived,
+	 * not stored: the two stale-side states come from their persisted flags,
+	 * the exchange states from where reestablish stands this session.
+	 * Precedence: proven stale beats everything (the never-broadcast
+	 * invariant rides that flag through any lifecycle state), then
+	 * unprovable, then the terminal close, then the exchange.
+	 */
+	getRecoveryStatus(): ChannelRecoveryStatus {
+		const s = this._state;
+		if (s.dataLossDetected) return ChannelRecoveryStatus.LocalDataLoss;
+		if (s.stateUncertain) return ChannelRecoveryStatus.StateUncertain;
+		if (
+			s.state === ChannelState.FORCE_CLOSED ||
+			s.state === ChannelState.ERRORED
+		) {
+			// ERRORED without a stale flag is recovered by broadcasting our
+			// latest commitment (the BOLT 1 prescription for a received
+			// error), so it is on the force-close path.
+			return ChannelRecoveryStatus.ForceClosing;
+		}
+		if (s.state === ChannelState.AWAITING_REESTABLISH) {
+			return ChannelRecoveryStatus.Quarantined;
+		}
+		if (this._lastReestablishOutcome === 'replay') {
+			return ChannelRecoveryStatus.ReplayRequired;
+		}
+		if (
+			this._lastReestablishOutcome === 'clean' &&
+			s.state !== ChannelState.NORMAL
+		) {
+			// Counters agreed but the channel resumed into a non-quiescent
+			// state (a splice mid-flight, a pending shutdown): still resuming.
+			return ChannelRecoveryStatus.Reestablishing;
+		}
+		return ChannelRecoveryStatus.Active;
+	}
+
+	/**
+	 * The recovery-close disposition as an INVARIANT, not a field lookup:
+	 * restart liveness must not depend on every ERRORED transition having
+	 * remembered to assign a redundant field. The explicit reason wins when
+	 * present; otherwise it derives from the durable safety flags, which
+	 * covers states created by SCB recovery, by early reestablish validation
+	 * failures, and by databases written before the field existed.
+	 */
+	getRecoveryCloseReason(): RecoveryCloseReason | undefined {
+		if (this._state.recoveryCloseReason) {
+			return this._state.recoveryCloseReason;
+		}
+		if (this._state.dataLossDetected) return 'local-data-loss';
+		if (this._state.stateUncertain) return 'state-uncertain';
+		return undefined;
+	}
+
+	/** ERRORED and waiting for the PEER's close: reconnect must chase it. */
+	hasRecoveryCloseDisposition(): boolean {
+		return (
+			this._state.state === ChannelState.ERRORED &&
+			this.getRecoveryCloseReason() !== undefined
+		);
+	}
+
+	/**
+	 * Stamp the explicit disposition from the safety flags before an ERRORED
+	 * transition persists, so the stored row is self-describing even where
+	 * the derived fallback would already cover it.
+	 */
+	private _ensureRecoveryCloseDisposition(): void {
+		if (this._state.recoveryCloseReason) return;
 		if (this._state.dataLossDetected) {
+			this._state.recoveryCloseReason = 'local-data-loss';
+		} else if (this._state.stateUncertain) {
+			this._state.recoveryCloseReason = 'state-uncertain';
+		}
+	}
+
+	/**
+	 * The durable peer-close request (recovery 5.6). The original wire error
+	 * can be lost to a crash between the ERRORED persist and the socket
+	 * (ERROR is deliberately not in the retransmission outbox), so the
+	 * persisted DISPOSITION regenerates it deterministically on every
+	 * reconnect until the peer's close resolves the channel on chain.
+	 */
+	buildRecoveryCloseActions(): ChannelAction[] {
+		const reason = this.getRecoveryCloseReason();
+		if (!reason || !this._state.channelId) return [];
+		const data =
+			reason === 'local-data-loss'
+				? 'peer proved our channel state is stale (data loss); awaiting your force close'
+				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
+		return [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: this._state.channelId,
+					data: Buffer.from(data, 'ascii')
+				})
+			)
+		];
+	}
+
+	forceClose(signer: ISigner): ChannelAction[] {
+		// The recovery never-broadcast invariant (5.6): proven stale
+		// (dataLossDetected) or unprovable (stateUncertain), our latest local
+		// commitment may be revoked in the peer's view - broadcasting it hands
+		// our entire balance to the justice path. Recovery is passive:
+		// StateUncertain is permanent absent independently verified storage
+		// provenance, so the only exit is the peer force-closing with ITS
+		// commitment; we sweep our to_remote from that.
+		if (mustNotBroadcastCommitment(this._state)) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: 'Refusing to broadcast stale commitment after data loss'
+					message: this._state.dataLossDetected
+						? 'Refusing to broadcast stale commitment after data loss'
+						: 'Refusing to broadcast: restored state is not proven current'
 				}
 			];
 		}
@@ -5272,6 +5392,12 @@ export class Channel {
 	 * misuse must keep returning plain ERROR actions.
 	 */
 	private _failChannelWithWireError(message: string): ChannelAction[] {
+		// A hostile or malformed message can fail a channel whose safety
+		// flags already forbid broadcasting (a restored uncertain channel
+		// sent garbage counters, say). The peer-close disposition must ride
+		// THIS persist too, or a crash before the error send strands the
+		// channel with no reconnect chasing the peer.
+		this._ensureRecoveryCloseDisposition();
 		this._state.state = ChannelState.ERRORED;
 		const channelId = this._state.channelId ?? this._state.temporaryChannelId;
 		return [
@@ -5665,6 +5791,8 @@ export class Channel {
 	 */
 	handleReestablish(msg: IChannelReestablishMessage): ChannelAction[] {
 		const actions: ChannelAction[] = [];
+		// A fresh exchange begins; the previous session's outcome is stale.
+		this._lastReestablishOutcome = null;
 
 		// BOLT 2: next_commitment_number MUST NOT be 0 — the initial commitment
 		// (number 0) is delivered inside funding_created/funding_signed, so the
@@ -5717,6 +5845,7 @@ export class Channel {
 		) {
 			this._state.dataLossDetected = true;
 			this._state.dlpRemotePerCommitmentPoint = msg.myCurrentPerCommitmentPoint;
+			this._state.recoveryCloseReason = 'local-data-loss';
 			this._state.state = ChannelState.ERRORED;
 			return [
 				// Persist FIRST: a crash between the error send and the peer's
@@ -5736,6 +5865,45 @@ export class Channel {
 					type: ChannelActionType.ERROR,
 					message:
 						'Channel fell behind: peer proved our state is stale (data loss); refusing to broadcast, awaiting peer force close'
+				}
+			];
+		}
+
+		// ── StateUncertain (recovery 5.6): unprovable restored state ──
+		// A compatible reestablish is NOT proof of currency. BOLT 2's
+		// stale-state proof only works in one direction: a valid FUTURE
+		// secret proves we fell behind (the branch above), but nothing in
+		// channel_reestablish attests the peer's HIGHEST state - a malicious
+		// peer can under-report counters compatible with our restored state
+		// while holding a newer one (it always holds our previously released
+		// secrets), wait for us to broadcast, and take everything through the
+		// justice path. Exactness must come from recovery-storage provenance
+		// (the Phase 6 wire barrier); the restore driver leaves this flag off
+		// only when it holds that proof. Without it the sole safe resolution
+		// is the DLP path: never resume, never retransmit from an unprovable
+		// state, never broadcast; ask the peer to close with ITS commitment
+		// and sweep our to_remote from that.
+		if (this._state.stateUncertain) {
+			this._state.recoveryCloseReason = 'state-uncertain';
+			this._state.state = ChannelState.ERRORED;
+			return [
+				// Persist FIRST: a crash between the error send and the peer's
+				// force-close must not forget that broadcasting is forbidden.
+				{ type: ChannelActionType.PERSIST_STATE },
+				sendMsg(
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: this._state.channelId!,
+						data: Buffer.from(
+							'restored channel state cannot be proven current (recovery); awaiting your force close',
+							'ascii'
+						)
+					})
+				),
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Restored state is unprovable (StateUncertain): refusing to resume or broadcast, awaiting peer force close'
 				}
 			];
 		}
@@ -6017,6 +6185,12 @@ export class Channel {
 				)
 			);
 		}
+
+		this._lastReestablishOutcome = actions.some(
+			(a) => a.type === ChannelActionType.SEND_MESSAGE && a.replay === true
+		)
+			? 'replay'
+			: 'clean';
 
 		// Persist before ANY of the above reaches the peer
 		// (docs/RECOVERY-PROTOCOL.md 5.1). Reestablish both mutates state (the

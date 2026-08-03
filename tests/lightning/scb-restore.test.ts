@@ -18,6 +18,8 @@ import * as bip39 from 'bip39';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { MessageType } from '../../src/lightning/message/types';
+import { decodeErrorMessage } from '../../src/lightning/message/error';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -41,6 +43,7 @@ import {
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	encodeScb,
+	IScbChannelEntry,
 	IStaticChannelBackup
 } from '../../src/lightning/backup/scb';
 import { BeignetNode } from '../../src/cli/beignet-node';
@@ -296,6 +299,11 @@ describe('SCB restore', function () {
 				// ORIGINAL state - the recovered node never has the material for it.
 				entries = alice.buildStaticChannelBackupData().channels;
 				expect(entries).to.have.length(1);
+				// The backup carries the private peer's address, exactly as a
+				// production SCB does (sourced from persisted peer addresses).
+				// Port 9 is unreachable: the immediate dial attempt fails, so
+				// only what the RESTORE PATH persisted can enable the redial.
+				entries[0].peerAddresses = ['127.0.0.1:9'];
 				commitmentTx = buildRemoteCommitment(
 					originalState,
 					makeForeignPoint('recovery-monitor-point'),
@@ -360,12 +368,188 @@ describe('SCB restore', function () {
 				expect(state.localCommitmentNumber).to.equal(0n);
 				expect(state.remoteCommitmentNumber).to.equal(0n);
 
+				// The durable peer-close disposition rides the SCB reconstruction
+				// (recovery 5.6): a failed first connection attempt or a restart
+				// must not strand the close request.
+				expect(state.recoveryCloseReason).to.equal('local-data-loss');
+
 				// Persisted (survives a restart).
 				const persisted = storage
 					.loadAllChannels()
 					.find((c) => c.channelId === entries[0].channelId);
 				expect(persisted).to.exist;
 				expect(persisted!.peerPubkey).to.equal(entries[0].peerNodeId);
+
+				// Restart liveness FROM THE PRODUCTION PATH ALONE: the backup's
+				// dial candidate must have been persisted by the recovery
+				// itself (nothing here calls savePeerAddress), the initial
+				// dial attempt failed, the process restarts from the resulting
+				// database only, the peer is selected for startup dialing, and
+				// reconnect regenerates the deterministic close request.
+				const savedAddresses = storage.loadAllPeerAddresses();
+				expect(
+					savedAddresses.some(
+						(a) =>
+							a.pubkey === entries[0].peerNodeId &&
+							a.host === '127.0.0.1' &&
+							a.port === 9
+					)
+				).to.equal(true);
+				const restarted = new LightningNode({
+					...makeNodeConfig(1),
+					storage,
+					enableNetworking: true,
+					autoReconnect: true
+				});
+				restarted.on('node:error', () => {});
+				try {
+					expect(
+						(restarted as unknown as { _reconnectTimers: Set<unknown> })
+							._reconnectTimers.size
+					).to.equal(1);
+					const sent: Array<{ type: number; payload: Buffer }> = [];
+					restarted
+						.getChannelManager()
+						.on(
+							'message:outbound',
+							(_p: string, type: number, payload: Buffer) => {
+								sent.push({ type, payload });
+							}
+						);
+					restarted
+						.getChannelManager()
+						.handlePeerReconnected(entries[0].peerNodeId);
+					const errSent = sent.find((m) => m.type === MessageType.ERROR);
+					expect(errSent).to.exist;
+					expect(
+						decodeErrorMessage(errSent!.payload).data.toString('ascii')
+					).to.contain('stale');
+				} finally {
+					restarted.destroy();
+				}
+
+				// Failure path: the prerequisite address write must be able to
+				// FAIL the restoration of that channel. If savePeerAddress
+				// alone throws while channel persistence stays healthy, a
+				// swallowed error would install a recovery-close channel with
+				// no dial candidate, recreating the stranded disposition.
+				const storage2 = new SqliteStorage(':memory:');
+				storage2.open();
+				const originalSave = storage2.savePeerAddress.bind(storage2);
+				(
+					storage2 as unknown as {
+						savePeerAddress: (p: string, h: string, po: number) => void;
+					}
+				).savePeerAddress = (): void => {
+					throw new Error('injected savePeerAddress failure');
+				};
+				const faulted = new LightningNode({
+					...makeNodeConfig(1),
+					storage: storage2
+				});
+				faulted.on('node:error', () => {});
+				try {
+					const failedResult =
+						await faulted.recoverFromStaticChannelBackup(entries);
+					expect(failedResult.recovering).to.not.include(entries[0].channelId);
+					expect(failedResult.skipped).to.have.length(1);
+					expect(failedResult.skipped[0].reason).to.contain('peer address');
+					// Nothing installed, in memory or on disk.
+					expect(faulted.getChannelManager().getChannel(channelId)).to.equal(
+						undefined
+					);
+					expect(
+						storage2
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(false);
+
+					// The failure is recoverable: clear the fault and retry the
+					// SAME backup on the SAME node and storage.
+					(
+						storage2 as unknown as {
+							savePeerAddress: (p: string, h: string, po: number) => void;
+						}
+					).savePeerAddress = originalSave;
+					const retried = await faulted.recoverFromStaticChannelBackup(entries);
+					expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+					expect(
+						storage2
+							.loadAllPeerAddresses()
+							.some((a) => a.pubkey === entries[0].peerNodeId)
+					).to.equal(true);
+					expect(faulted.getChannelManager().getChannel(channelId)).to.exist;
+				} finally {
+					faulted.destroy();
+				}
+
+				// Symmetric failure path: address persistence succeeds but the
+				// CHANNEL commit fails. Durability gates visibility: nothing
+				// may be installed in the manager, recovering must not claim
+				// success, and the same node stays retryable without a
+				// restart (an undurable in-memory channel would be skipped as
+				// already existing forever).
+				const storage3 = new SqliteStorage(':memory:');
+				storage3.open();
+				const originalSaveChannel = storage3.saveChannel.bind(storage3);
+				(
+					storage3 as unknown as {
+						saveChannel: typeof storage3.saveChannel;
+					}
+				).saveChannel = (): void => {
+					throw new Error('injected channel persistence failure');
+				};
+				const chanFaulted = new LightningNode({
+					...makeNodeConfig(1),
+					storage: storage3
+				});
+				let persistenceErrors = 0;
+				chanFaulted.on('node:error', (e: { code?: string }) => {
+					if (e.code === 'PERSISTENCE_ERROR') persistenceErrors++;
+				});
+				try {
+					const failed =
+						await chanFaulted.recoverFromStaticChannelBackup(entries);
+					expect(failed.recovering).to.not.include(entries[0].channelId);
+					expect(failed.skipped).to.have.length(1);
+					expect(failed.skipped[0].reason).to.contain(
+						'failed to persist recovered channel'
+					);
+					expect(persistenceErrors).to.equal(1);
+					// Address-first ordering: only the harmless orphan address.
+					expect(
+						storage3
+							.loadAllPeerAddresses()
+							.some((a) => a.pubkey === entries[0].peerNodeId)
+					).to.equal(true);
+					expect(
+						chanFaulted.getChannelManager().getChannel(channelId)
+					).to.equal(undefined);
+					expect(
+						storage3
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(false);
+
+					// Same node, same SCB, storage recovered: retry succeeds.
+					(
+						storage3 as unknown as {
+							saveChannel: typeof storage3.saveChannel;
+						}
+					).saveChannel = originalSaveChannel;
+					const retried =
+						await chanFaulted.recoverFromStaticChannelBackup(entries);
+					expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+					expect(chanFaulted.getChannelManager().getChannel(channelId)).to
+						.exist;
+					expect(
+						storage3
+							.loadAllChannels()
+							.some((c) => c.channelId === entries[0].channelId)
+					).to.equal(true);
+				} finally {
+					chanFaulted.destroy();
+				}
 
 				// Funding outpoint watched: the script was fetched from the chain
 				// and its scripthash subscribed.
@@ -413,6 +597,375 @@ describe('SCB restore', function () {
 			} finally {
 				restored.destroy();
 				storage.close();
+			}
+		});
+
+		/** One real channel's backup entry, with a per-channel key index. */
+		function backupEntries(keyIndex: number | null = 7): IScbChannelEntry[] {
+			const alice = new LightningNode(makeNodeConfig(1));
+			const bob = new LightningNode(makeNodeConfig(2));
+			alice.on('node:error', () => {});
+			bob.on('node:error', () => {});
+			connectNodes(alice, bob);
+			try {
+				const { channelId } = openReadyChannel(alice, bob);
+				alice.getChannelManager().getChannel(channelId)!.channelKeyIndex =
+					keyIndex;
+				const entries = alice.buildStaticChannelBackupData().channels;
+				expect(entries).to.have.length(1);
+				return entries;
+			} finally {
+				alice.destroy();
+				bob.destroy();
+			}
+		}
+
+		function recoveryNode(storage: SqliteStorage): LightningNode {
+			const node = new LightningNode({ ...makeNodeConfig(1), storage });
+			node.on('node:error', () => {});
+			return node;
+		}
+
+		it('skips malformed entries with a reason and still recovers the valid ones', async function () {
+			const good = backupEntries()[0];
+			// Validation happens at the boundary, so a malformed entry can
+			// neither install a channel nor take the entries behind it down
+			// with it. The satoshi string goes FIRST for exactly that reason:
+			// reaching the reconstruction, it threw out of the whole loop.
+			const entries: IScbChannelEntry[] = [
+				{
+					...good,
+					channelId: '11'.repeat(32),
+					fundingSatoshis: 'not-a-number'
+				},
+				{ ...good, channelId: '22'.repeat(32), fundingTxid: 'zz'.repeat(32) },
+				{
+					...good,
+					channelId: '33'.repeat(32),
+					peerNodeId: '02' + 'bb'.repeat(32)
+				},
+				{ ...good, channelId: 'nothex' },
+				{
+					...good,
+					channelId: '44'.repeat(32),
+					role: 'INITIATOR'
+				} as unknown as IScbChannelEntry,
+				good
+			];
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = recoveryNode(storage);
+			try {
+				const result = await node.recoverFromStaticChannelBackup(entries);
+
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped.map((s) => s.channelId)).to.deep.equal([
+					'11'.repeat(32),
+					'22'.repeat(32),
+					'33'.repeat(32),
+					'nothex',
+					'44'.repeat(32)
+				]);
+				expect(result.skipped[0].reason).to.contain('fundingSatoshis');
+				expect(result.skipped[1].reason).to.contain('fundingTxid');
+				expect(result.skipped[2].reason).to.contain('valid public key');
+				expect(result.skipped[3].reason).to.contain('channelId');
+				expect(result.skipped[4].reason).to.contain('role');
+
+				// Only the valid entry exists, in memory and on disk.
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+				expect(
+					node
+						.getChannelManager()
+						.getChannel(Buffer.from(good.channelId, 'hex'))
+				).to.exist;
+				for (const id of ['11', '22', '33', '44']) {
+					expect(
+						node
+							.getChannelManager()
+							.getChannel(Buffer.from(id.repeat(32), 'hex'))
+					).to.equal(undefined);
+				}
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('persists only a strictly parseable dial candidate', async function () {
+			const good = backupEntries()[0];
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = recoveryNode(storage);
+			try {
+				// A permissive parseInt reads '9735junk' as 9735 and '0' as a
+				// port: both would persist a dial candidate nobody ever wrote,
+				// hiding the one address that can actually be reached.
+				const result = await node.recoverFromStaticChannelBackup([
+					{
+						...good,
+						peerAddresses: [
+							'127.0.0.1:9735junk',
+							'[fe80::1',
+							'198.51.100.9:0',
+							'198.51.100.9:65536',
+							'127.0.0.1:9'
+						]
+					}
+				]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				const saved = storage
+					.loadAllPeerAddresses()
+					.filter((a) => a.pubkey === good.peerNodeId);
+				expect(saved).to.have.length(1);
+				expect(saved[0].host).to.equal('127.0.0.1');
+				expect(saved[0].port).to.equal(9);
+			} finally {
+				node.destroy();
+			}
+
+			// Addresses that ALL fail to parse, or a list that is not there at
+			// all, are the empty-address case: the channel still recovers (the
+			// peer may dial us), and nothing unusable is written as a dial
+			// candidate. Addresses are advisory; they never forfeit funds.
+			const storage2 = new SqliteStorage(':memory:');
+			storage2.open();
+			const node2 = recoveryNode(storage2);
+			const noAddresses = { ...good } as Record<string, unknown>;
+			delete noAddresses.peerAddresses;
+			try {
+				const result = await node2.recoverFromStaticChannelBackup([
+					{ ...good, peerAddresses: ['9735', 'host:0', ':9735'] },
+					{
+						...(noAddresses as unknown as IScbChannelEntry),
+						channelId: '55'.repeat(32)
+					}
+				]);
+				expect(result.recovering).to.deep.equal([
+					good.channelId,
+					'55'.repeat(32)
+				]);
+				expect(result.skipped).to.deep.equal([]);
+				expect(
+					storage2
+						.loadAllPeerAddresses()
+						.filter((a) => a.pubkey === good.peerNodeId)
+				).to.have.length(0);
+				expect(
+					storage2.loadAllChannels().some((c) => c.channelId === good.channelId)
+				).to.equal(true);
+			} finally {
+				node2.destroy();
+			}
+		});
+
+		it('rolls the recovered channel state back when the key index write fails', async function () {
+			const entries = backupEntries(7).map((e) => ({
+				...e,
+				// Port 9 is unreachable: the immediate dial fails, so what the
+				// storage holds afterwards is only what recovery wrote.
+				peerAddresses: ['127.0.0.1:9']
+			}));
+			expect(entries[0].channelKeyIndex).to.equal(7);
+			const channelId = Buffer.from(entries[0].channelId, 'hex');
+
+			// The SECOND mutation of the recovery commit fails. Both ride one
+			// SafetyCritical transaction, so the channel state written just
+			// before it must roll back with it: a channel on disk without its
+			// key index could never derive the keys its sweep needs.
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const originalSaveKeyIndex = storage.saveChannelKeyIndex.bind(storage);
+			(
+				storage as unknown as {
+					saveChannelKeyIndex: typeof storage.saveChannelKeyIndex;
+				}
+			).saveChannelKeyIndex = (): void => {
+				throw new Error('injected key index failure');
+			};
+			const node = recoveryNode(storage);
+			let persistenceErrors = 0;
+			node.on('node:error', (e: { code?: string }) => {
+				if (e.code === 'PERSISTENCE_ERROR') persistenceErrors++;
+			});
+			try {
+				const failed = await node.recoverFromStaticChannelBackup(entries);
+				expect(failed.recovering).to.deep.equal([]);
+				expect(failed.skipped).to.have.length(1);
+				expect(failed.skipped[0].reason).to.contain(
+					'failed to persist recovered channel'
+				);
+				expect(persistenceErrors).to.equal(1);
+				expect(node.getChannelManager().getChannel(channelId)).to.equal(
+					undefined
+				);
+				expect(
+					storage
+						.loadAllChannels()
+						.some((c) => c.channelId === entries[0].channelId)
+				).to.equal(false);
+				expect(storage.loadChannelKeyIndex(entries[0].channelId)).to.equal(
+					null
+				);
+				// Only the harmless orphan address survived.
+				expect(
+					storage
+						.loadAllPeerAddresses()
+						.some((a) => a.pubkey === entries[0].peerNodeId)
+				).to.equal(true);
+
+				// Storage recovers: the same node retries the same backup.
+				(
+					storage as unknown as {
+						saveChannelKeyIndex: typeof storage.saveChannelKeyIndex;
+					}
+				).saveChannelKeyIndex = originalSaveKeyIndex;
+				const retried = await node.recoverFromStaticChannelBackup(entries);
+				expect(retried.recovering).to.deep.equal([entries[0].channelId]);
+				expect(storage.loadChannelKeyIndex(entries[0].channelId)).to.equal(7);
+				expect(node.getChannelManager().getChannel(channelId)).to.exist;
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('isolates an underivable channel key index from later entries', async function () {
+			// channelKeyIndex is a HARDENED BIP32 component
+			// (m/1017'/coinType'/channelIndex'), so 0x80000000 is not a
+			// derivable index: on a real mnemonic node it throws inside the
+			// deriver. Reaching the deriver at all would abort the whole
+			// recovery, taking every valid channel behind it.
+			const good = backupEntries()[0];
+			const bad = {
+				...good,
+				channelId: '11'.repeat(32),
+				channelKeyIndex: 0x80000000
+			};
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = LightningNode.fromMnemonic(
+				'abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about',
+				{ network: Network.REGTEST, storage }
+			);
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([bad, good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped).to.deep.equal([
+					{ channelId: bad.channelId, reason: 'invalid channelKeyIndex' }
+				]);
+				expect(
+					node
+						.getChannelManager()
+						.getChannel(Buffer.from(good.channelId, 'hex'))
+				).to.exist;
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('isolates a THROWING key deriver from later entries', async function () {
+			// Defense in depth for the same class: channelKeyDeriver is the
+			// caller's own callback, so structural validation cannot promise
+			// it will not throw for an index it dislikes. The failure must
+			// cost that channel alone.
+			const good = backupEntries(3)[0];
+			const bad = { ...good, channelId: '22'.repeat(32), channelKeyIndex: 5 };
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const base = makeNodeConfig(1);
+			const node = new LightningNode({
+				...base,
+				storage,
+				channelKeyDeriver: (index: number) => {
+					if (index === 5) throw new Error('deriver refused index 5');
+					const privkeys = makePrivkeys(makeSeed(index + 50));
+					return {
+						fundingPrivkey: privkeys[0],
+						basepoints: makeBasepoints(privkeys),
+						perCommitmentSeed: makeSeed(index + 60),
+						htlcBasepointSecret: privkeys[4],
+						revocationBasepointSecret: privkeys[1],
+						paymentBasepointSecret: privkeys[2],
+						delayedPaymentBasepointSecret: privkeys[3]
+					};
+				}
+			});
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([bad, good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(result.skipped).to.have.length(1);
+				expect(result.skipped[0].channelId).to.equal(bad.channelId);
+				expect(result.skipped[0].reason).to.contain(
+					'failed to derive recovery channel keys'
+				);
+				expect(result.skipped[0].reason).to.contain('refused index 5');
+				expect(storage.loadAllChannels().map((c) => c.channelId)).to.deep.equal(
+					[good.channelId]
+				);
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('asks the key deriver exactly ONCE per recovered channel', async function () {
+			// The deriver is a caller-supplied callback. Reconstruction takes
+			// the basepoints and registration takes the signing secrets, so
+			// two evaluations of a callback that answered differently would
+			// arm a signer with keys the reconstructed state never committed
+			// to. One evaluation makes that unrepresentable.
+			const good = backupEntries(4)[0];
+			const calls: number[] = [];
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = new LightningNode({
+				...makeNodeConfig(1),
+				storage,
+				channelKeyDeriver: (index: number) => {
+					calls.push(index);
+					const privkeys = makePrivkeys(makeSeed(index + 70));
+					return {
+						fundingPrivkey: privkeys[0],
+						basepoints: makeBasepoints(privkeys),
+						perCommitmentSeed: makeSeed(index + 80),
+						htlcBasepointSecret: privkeys[4],
+						revocationBasepointSecret: privkeys[1],
+						paymentBasepointSecret: privkeys[2],
+						delayedPaymentBasepointSecret: privkeys[3]
+					};
+				}
+			});
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(calls).to.deep.equal([4]);
+
+				// And the signer really was armed from that one answer: the
+				// restored channel's funding key is the derived one.
+				const channel = node
+					.getChannelManager()
+					.getChannel(Buffer.from(good.channelId, 'hex'))!;
+				const derived = makePrivkeys(makeSeed(4 + 70));
+				expect(
+					channel
+						.getFullState()
+						.localBasepoints.fundingPubkey.equals(
+							makeBasepoints(derived).fundingPubkey
+						)
+				).to.equal(true);
+				expect(channel.channelKeyIndex).to.equal(4);
+			} finally {
+				node.destroy();
 			}
 		});
 	});

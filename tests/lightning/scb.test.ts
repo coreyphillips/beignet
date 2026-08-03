@@ -2,8 +2,9 @@
  * Static channel backup (SCB) export tests.
  *
  * Covers the encode/decode envelope (AES-256-GCM under an HKDF key from the
- * wallet seed), LightningNode.buildStaticChannelBackupData channel selection
- * and field mapping, and BeignetNode.exportStaticChannelBackup file output.
+ * wallet seed), per-entry and address validation at the decode boundary,
+ * LightningNode.buildStaticChannelBackupData channel selection and field
+ * mapping, and BeignetNode.exportStaticChannelBackup file output.
  */
 
 import { expect } from 'chai';
@@ -15,6 +16,9 @@ import * as bip39 from 'bip39';
 import {
 	encodeScb,
 	decodeScb,
+	parseScbAddress,
+	validateScbEntry,
+	validateScbEntries,
 	SCB_PREFIX,
 	IStaticChannelBackup,
 	IScbChannelEntry
@@ -117,6 +121,23 @@ function openReadyChannel(
 	alice.handleFundingConfirmed(channelId);
 	bob.handleFundingConfirmed(channelId);
 	return { channelId, fundingTxid };
+}
+
+/** An entry with every field exactly as the exporter writes it. */
+function makeValidScbEntry(): IScbChannelEntry {
+	return {
+		channelId: 'aa'.repeat(32),
+		peerNodeId: getPublicKey(makeSeed(9)).toString('hex'),
+		peerAddresses: ['203.0.113.7:9735'],
+		fundingTxid: 'cc'.repeat(32),
+		fundingOutputIndex: 1,
+		fundingSatoshis: '5000000',
+		channelKeyIndex: 3,
+		channelType: '',
+		role: 'OPENER',
+		isTaproot: false,
+		isAnchor: false
+	};
 }
 
 function makeFabricatedBackup(): IStaticChannelBackup {
@@ -225,6 +246,236 @@ describe('Static Channel Backup (SCB)', function () {
 			} as unknown as IStaticChannelBackup;
 			const encoded = encodeScb(bad, seed);
 			expect(() => decodeScb(encoded, seed)).to.throw(/channels/);
+		});
+
+		it('throws on an envelope with no network or no timestamp', function () {
+			const noNetwork = {
+				...makeFabricatedBackup(),
+				network: ''
+			} as unknown as IStaticChannelBackup;
+			expect(() => decodeScb(encodeScb(noNetwork, seed), seed)).to.throw(
+				/network/
+			);
+			const noTimestamp = {
+				...makeFabricatedBackup(),
+				createdAt: 'yesterday'
+			} as unknown as IStaticChannelBackup;
+			expect(() => decodeScb(encodeScb(noTimestamp, seed), seed)).to.throw(
+				/createdAt/
+			);
+			const notAnObject = [1, 2, 3] as unknown as IStaticChannelBackup;
+			expect(() => decodeScb(encodeScb(notAnObject, seed), seed)).to.throw(
+				/backup object/
+			);
+		});
+
+		it('keeps a backup usable when only SOME entries are malformed', function () {
+			// The blob is AEAD-authenticated, so a bad entry inside a
+			// decryptable backup is a producer bug, not corruption. Refusing
+			// the whole backup would forfeit the funds behind every good
+			// entry, so decode reports per entry instead of throwing.
+			const good = makeValidScbEntry();
+			const bad = {
+				...makeValidScbEntry(),
+				channelId: 'bb'.repeat(32),
+				fundingTxid: 'nothex'
+			};
+			const backup: IStaticChannelBackup = {
+				version: 1,
+				network: 'bcrt',
+				createdAt: 1750000000000,
+				channels: [good, bad]
+			};
+			const decoded = decodeScb(encodeScb(backup, seed), seed);
+			expect(decoded.channels).to.have.length(2);
+			const problems = validateScbEntries(decoded);
+			expect(problems).to.have.length(1);
+			expect(problems[0].index).to.equal(1);
+			expect(problems[0].channelId).to.equal(bad.channelId);
+			expect(problems[0].reason).to.contain('fundingTxid');
+		});
+	});
+
+	describe('parseScbAddress', function () {
+		it('accepts the forms a backup actually carries', function () {
+			expect(parseScbAddress('127.0.0.1:9735')).to.deep.equal({
+				host: '127.0.0.1',
+				port: 9735
+			});
+			expect(parseScbAddress('[fe80::1]:9735')).to.deep.equal({
+				host: 'fe80::1',
+				port: 9735
+			});
+			// Unbracketed IPv6, split on the LAST colon, as written by peers
+			// that stored the address that way.
+			expect(parseScbAddress('fe80::1:9735')).to.deep.equal({
+				host: 'fe80::1',
+				port: 9735
+			});
+			expect(
+				parseScbAddress(
+					'abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:9735'
+				)
+			).to.deep.equal({
+				host: 'abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion',
+				port: 9735
+			});
+			expect(parseScbAddress('host:1')).to.deep.equal({
+				host: 'host',
+				port: 1
+			});
+			expect(parseScbAddress('host:65535')).to.deep.equal({
+				host: 'host',
+				port: 65535
+			});
+		});
+
+		it('refuses everything a permissive parseInt would have accepted', function () {
+			// parseInt('9735junk') is 9735: a persisted dial candidate built
+			// from a port nobody wrote is worse than having none.
+			expect(parseScbAddress('127.0.0.1:9735junk')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:0x26')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1: 9735')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:+9735')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:97.35')).to.equal(null);
+			// Out of range at both ends.
+			expect(parseScbAddress('127.0.0.1:0')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:65536')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:99999')).to.equal(null);
+			// No host, no port, no separator.
+			expect(parseScbAddress(':9735')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1:')).to.equal(null);
+			expect(parseScbAddress('127.0.0.1')).to.equal(null);
+			expect(parseScbAddress('[]:9735')).to.equal(null);
+			// A stray bracket is malformed, never something to strip.
+			expect(parseScbAddress('[fe80::1:9735')).to.equal(null);
+			expect(parseScbAddress('fe80::1]:9735')).to.equal(null);
+			// Whitespace and non-strings.
+			expect(parseScbAddress('local host:9735')).to.equal(null);
+			expect(parseScbAddress('')).to.equal(null);
+			expect(parseScbAddress(undefined)).to.equal(null);
+			expect(parseScbAddress(9735)).to.equal(null);
+		});
+	});
+
+	describe('validateScbEntry', function () {
+		const validEntry = makeValidScbEntry;
+
+		it('accepts a well-formed entry, with and without the lease fields', function () {
+			expect(validateScbEntry(validEntry())).to.equal(null);
+			expect(
+				validateScbEntry({
+					...validEntry(),
+					channelKeyIndex: null,
+					channelType: '10100000',
+					role: 'ACCEPTOR',
+					isTaproot: true,
+					isAnchor: true,
+					leaseExpiry: 900_000,
+					isLessor: true,
+					leaseCommitBlockheight: 800_000
+				})
+			).to.equal(null);
+		});
+
+		it('tolerates advisory absence and the LEGACY shape, never absent recovery material', function () {
+			// Advisory: recovery is passive without addresses, and it reads the
+			// channel type rather than the taproot/anchor booleans, so their
+			// absence must not forfeit a channel's funds.
+			const advisory = { ...makeValidScbEntry() } as Record<string, unknown>;
+			delete advisory.peerAddresses;
+			delete advisory.isTaproot;
+			delete advisory.isAnchor;
+			expect(validateScbEntry(advisory)).to.equal(null);
+
+			// LEGACY, not advisory: a missing channelKeyIndex means the
+			// node-level basepoints and a missing channelType means the
+			// untyped static_remotekey channel. Both are accepted because
+			// backups predating per-channel keys and channel types are still
+			// recoverable, not because the fields do not matter.
+			const legacy = { ...makeValidScbEntry() } as Record<string, unknown>;
+			delete legacy.channelKeyIndex;
+			delete legacy.channelType;
+			expect(validateScbEntry(legacy)).to.equal(null);
+
+			// A modern entry cannot claim the legacy shape AND a modern
+			// commitment format: reconstructing it would look for a
+			// static_remotekey P2WPKH its commitment never pays.
+			for (const claim of [{ isAnchor: true }, { isTaproot: true }]) {
+				expect(
+					validateScbEntry({ ...legacy, ...claim }),
+					JSON.stringify(claim)
+				).to.match(/channelType is required/);
+				expect(
+					validateScbEntry({
+						...makeValidScbEntry(),
+						...claim,
+						channelType: ''
+					})
+				).to.match(/channelType is required/);
+			}
+
+			// A hardened BIP32 path component stops at 2^31 - 1; a larger
+			// index is not a legacy channel, it is an underivable one.
+			expect(
+				validateScbEntry({
+					...makeValidScbEntry(),
+					channelKeyIndex: 0x80000000
+				})
+			).to.equal('invalid channelKeyIndex');
+			expect(
+				validateScbEntry({
+					...makeValidScbEntry(),
+					channelKeyIndex: 0x7fffffff
+				})
+			).to.equal(null);
+
+			for (const field of [
+				'channelId',
+				'peerNodeId',
+				'fundingTxid',
+				'fundingOutputIndex',
+				'fundingSatoshis',
+				'role'
+			]) {
+				const missing = { ...makeValidScbEntry() } as Record<string, unknown>;
+				delete missing[field];
+				expect(validateScbEntry(missing), field).to.not.equal(null);
+			}
+		});
+
+		it('names the field that makes an entry unusable', function () {
+			const cases: Array<[Partial<Record<string, unknown>>, RegExp]> = [
+				[{ channelId: 'aa'.repeat(31) }, /channelId/],
+				[{ channelId: 'zz'.repeat(32) }, /channelId/],
+				[{ peerNodeId: '02' + 'bb'.repeat(31) }, /peerNodeId/],
+				// Well-shaped 33-byte hex that is not a point on the curve:
+				// recovery would persist it as a peer and dial it forever.
+				[{ peerNodeId: '02' + 'bb'.repeat(32) }, /valid public key/],
+				[{ peerAddresses: '203.0.113.7:9735' }, /peerAddresses/],
+				[{ peerAddresses: [9735] }, /peerAddresses/],
+				[{ fundingTxid: 'nothex' }, /fundingTxid/],
+				[{ fundingOutputIndex: -1 }, /fundingOutputIndex/],
+				[{ fundingOutputIndex: 1.5 }, /fundingOutputIndex/],
+				[{ fundingSatoshis: 5_000_000 }, /fundingSatoshis/],
+				[{ fundingSatoshis: '5_000_000' }, /fundingSatoshis/],
+				[{ fundingSatoshis: '0' }, /range/],
+				[{ fundingSatoshis: '2100000100000000' }, /range/],
+				[{ channelKeyIndex: -3 }, /channelKeyIndex/],
+				[{ channelType: 'abc' }, /channelType/],
+				[{ role: 'INITIATOR' }, /role/],
+				[{ isTaproot: 'yes' }, /booleans/],
+				[{ isAnchor: null }, /booleans/],
+				[{ leaseExpiry: -1 }, /leaseExpiry/],
+				[{ leaseCommitBlockheight: 'soon' }, /leaseCommitBlockheight/],
+				[{ isLessor: 1 }, /isLessor/]
+			];
+			for (const [patch, expected] of cases) {
+				const reason = validateScbEntry({ ...validEntry(), ...patch });
+				expect(reason, JSON.stringify(patch)).to.match(expected);
+			}
+			expect(validateScbEntry(null)).to.match(/not an object/);
+			expect(validateScbEntry('channel')).to.match(/not an object/);
 		});
 	});
 

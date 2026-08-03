@@ -223,6 +223,16 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		if (this.connectionsDisabled()) {
+			throw new Error(
+				`Connections are ${this.connectionsDisabledReason()}; refusing dial to peer ${pubkey}`
+			);
+		}
+		if (this.connectionGate && !this.connectionGate()) {
+			throw new Error(
+				`Connection gate refused dial to peer ${pubkey}: writer ownership is not confirmed`
+			);
+		}
 		// Keep stored address objects shaped exactly as before for TCP peers
 		// (no `transport` key unless a non-default transport was requested).
 		const addressEntry = transport ? { host, port, transport } : { host, port };
@@ -276,6 +286,9 @@ export class PeerManager extends EventEmitter {
 		});
 
 		this.setupPeerListeners(pubkey, peer);
+		// Visible to freezeConnections() while establishing: a freeze aborts
+		// the handshake instead of letting it complete and register later.
+		this.pendingPeers.add(peer);
 
 		try {
 			await peer.connect();
@@ -286,6 +299,20 @@ export class PeerManager extends EventEmitter {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
 			throw err;
+		} finally {
+			this.pendingPeers.delete(peer);
+		}
+		// Recheck AFTER the async establishment: a freeze, destroy or gate
+		// closure that landed mid-handshake must win over registration.
+		if (
+			this.connectionsDisabled() ||
+			(this.connectionGate && !this.connectionGate())
+		) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			throw new Error(
+				`Connection to peer ${pubkey} was invalidated while establishing`
+			);
 		}
 		// The peer may have dialed US while our handshake was in flight. Apply
 		// the deterministic tie-break (see preferOutboundTo): if the registered
@@ -390,12 +417,173 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Install a gate consulted before every outbound wire message. This is
+	 * the socket boundary itself: ChannelManager, gossip, peer storage and
+	 * onion messages all converge here, so a closed gate holds them ALL,
+	 * including any future caller that does not know the gate exists.
+	 * Refused sends throw, the same contract as an unconnected peer, which
+	 * every caller already treats as best-effort. Connection-level ping/pong
+	 * lives inside Peer and is deliberately not gated: an inert connection
+	 * stays alive.
+	 */
+	setOutboundGate(
+		gate: ((pubkey: string, type: number) => boolean) | null
+	): void {
+		this.outboundGate = gate;
+	}
+
+	private outboundGate: ((pubkey: string, type: number) => boolean) | null =
+		null;
+
+	/**
+	 * Install a gate consulted before any connection is ESTABLISHED, in both
+	 * directions. Startup ownership quarantine (recovery 5.6) says the node
+	 * may not even connect to channel peers until the writer lease is
+	 * confirmed, so while the gate is closed every dial throws (dialPeer is
+	 * the one chokepoint both connectPeer and the reconnect rounds use) and
+	 * an inbound socket is destroyed BEFORE the BOLT 8 handshake begins:
+	 * a quarantined node never authenticates, sends init, or reveals itself.
+	 */
+	setConnectionGate(gate: (() => boolean) | null): void {
+		this.connectionGate = gate;
+	}
+
+	private connectionGate: (() => boolean) | null = null;
+
+	/** freezeConnections() ran; no connection may ever be established again. */
+	private permanentlyFrozen = false;
+
+	/** destroy() ran; ordinary shutdown must not arm new reconnect work. */
+	private destroyed = false;
+
+	/**
+	 * Both irreversible end states. Consulted wherever a connection could be
+	 * established or scheduled: destroy() aborting an in-flight connectPeer
+	 * lands in its catch path, which would otherwise schedule a fresh
+	 * reconnect on a manager that just shut down.
+	 */
+	private connectionsDisabled(): boolean {
+		return this.destroyed || this.permanentlyFrozen;
+	}
+
+	private connectionsDisabledReason(): string {
+		return this.permanentlyFrozen ? 'permanently frozen' : 'destroyed';
+	}
+
+	/**
+	 * Peers whose connect/accept is still in flight. They are invisible to
+	 * listPeers() until registration, so a freeze must sweep this set or an
+	 * in-flight handshake survives it and registers afterwards.
+	 */
+	private pendingPeers = new Set<Peer>();
+
+	/**
+	 * Listeners whose bind has not completed. this.server / this.wsServer are
+	 * only assigned after the asynchronous bind, so a freeze landing mid-bind
+	 * would otherwise miss the listener and leave a fenced node bound.
+	 */
+	private pendingTcpServers = new Set<net.Server>();
+	private pendingWsServers = new Set<WebSocketServer>();
+
+	/**
+	 * Rejects listen()/listenWebSocket() calls whose bind is in flight when
+	 * a teardown lands. Closing a net.Server mid-bind silently CANCELS the
+	 * pending bind (no 'listening', no 'error'), so without this hook the
+	 * awaiting caller would hang forever.
+	 */
+	private pendingListenAborts = new Set<(err: Error) => void>();
+
+	/**
+	 * Permanently stop ALL connection activity: close listeners, clear every
+	 * reconnect and stability timer (they can exist for peers that are
+	 * currently disconnected, which no listPeers() sweep reaches), abort
+	 * every connection still ESTABLISHING, and drop every registered peer.
+	 * Used by the recovery startup gate when a newer writer epoch is proven
+	 * (spec 5.6 hard-freeze): after this, not one more byte leaves the node
+	 * toward a Lightning peer, handshake bytes included. Irreversible.
+	 */
+	freezeConnections(): void {
+		if (this.permanentlyFrozen) return;
+		this.permanentlyFrozen = true;
+		this.teardownConnections();
+	}
+
+	/**
+	 * Shared teardown for freezeConnections() and destroy(), kept in one
+	 * place so the two shutdown paths cannot drift apart: listeners bound
+	 * AND still binding, every reconnect and stability timer, establishments
+	 * still in flight, and every registered peer.
+	 */
+	private teardownConnections(): void {
+		this.stopListening();
+		for (const server of this.pendingTcpServers) {
+			try {
+				server.close();
+			} catch {
+				// The bind may not have completed; listen()'s own recheck
+				// closes such a server the moment its bind resolves.
+			}
+		}
+		this.pendingTcpServers.clear();
+		for (const server of this.pendingWsServers) {
+			try {
+				server.close();
+			} catch {
+				// Same as above for the WebSocket bind.
+			}
+		}
+		this.pendingWsServers.clear();
+		for (const abort of [...this.pendingListenAborts]) {
+			abort(new Error('Listener aborted: connections were torn down'));
+		}
+		this.pendingListenAborts.clear();
+		for (const timer of this.reconnectTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.reconnectTimers.clear();
+		this.reconnectDelays.clear();
+		for (const timer of this.stabilityTimers.values()) {
+			clearTimeout(timer);
+		}
+		this.stabilityTimers.clear();
+		for (const peer of [...this.pendingPeers]) {
+			peer.disconnect();
+		}
+		this.pendingPeers.clear();
+		for (const pubkey of [...this.peers.keys()]) {
+			this.disconnectPeer(pubkey);
+		}
+	}
+
+	/**
+	 * Install a gate consulted before an inbound message is dispatched to
+	 * any registered handler or the generic 'message' event. Defense in
+	 * depth behind the connection gate: if a connection survives from before
+	 * a fence (or a race), a refused message is dropped at the transport, so
+	 * nothing reaches the channel manager, gossip, onion or peer storage
+	 * handlers. Ping/pong live inside Peer and are unaffected.
+	 */
+	setInboundGate(
+		gate: ((pubkey: string, type: number) => boolean) | null
+	): void {
+		this.inboundGate = gate;
+	}
+
+	private inboundGate: ((pubkey: string, type: number) => boolean) | null =
+		null;
+
+	/**
 	 * Send a message to a specific peer.
 	 */
 	sendToPeer(pubkey: string, type: number, payload: Buffer): void {
 		const peer = this.peers.get(pubkey);
 		if (!peer) {
 			throw new Error(`Not connected to peer ${pubkey}`);
+		}
+		if (this.outboundGate && !this.outboundGate(pubkey, type)) {
+			throw new Error(
+				`Outbound gate refused message type ${type} to peer ${pubkey}`
+			);
 		}
 		captureWireMessage('out', pubkey, type, payload);
 		peer.sendMessage(type, payload);
@@ -502,31 +690,59 @@ export class PeerManager extends EventEmitter {
 	 * Start listening for inbound peer connections.
 	 */
 	async listen(port: number, host = '0.0.0.0'): Promise<void> {
+		if (this.connectionsDisabled()) {
+			throw new Error(
+				`Connections are ${this.connectionsDisabledReason()}; refusing to listen`
+			);
+		}
 		if (this.server) {
 			throw new Error('Already listening');
 		}
 
-		return new Promise((resolve, reject) => {
-			const server = net.createServer((socket) => {
-				this.handleInboundConnection(socket);
-			});
-
-			server.on('error', (err) => {
-				this.emit('listen:error', err);
-			});
-
-			server.listen(port, host, () => {
-				this.server = server;
-				this.emit('listening', port, host);
-				resolve();
-			});
-
-			server.once('error', (err) => {
-				if (!this.server) {
-					reject(err);
-				}
-			});
+		const server = net.createServer((socket) => {
+			this.handleInboundConnection(socket);
 		});
+		server.on('error', (err) => {
+			this.emit('listen:error', err);
+		});
+		// Visible to freezeConnections() while the bind is in flight.
+		this.pendingTcpServers.add(server);
+		let abortBind: (err: Error) => void = () => undefined;
+		const abortPromise = new Promise<never>((_, reject) => {
+			abortBind = reject;
+		});
+		abortPromise.catch(() => {
+			// Consumed via the race when a teardown lands mid-bind.
+		});
+		this.pendingListenAborts.add(abortBind);
+		try {
+			await Promise.race([
+				new Promise<void>((resolve, reject) => {
+					server.once('error', (err) => {
+						if (!this.server) {
+							reject(err);
+						}
+					});
+					server.listen(port, host, () => {
+						resolve();
+					});
+				}),
+				abortPromise
+			]);
+			// Recheck AFTER the bind: a freeze that landed mid-bind must win
+			// over publication, or a fenced node stays externally bound.
+			if (this.connectionsDisabled()) {
+				server.close();
+				throw new Error(
+					`Listener invalidated while starting: connections are ${this.connectionsDisabledReason()}`
+				);
+			}
+			this.server = server;
+			this.emit('listening', port, host);
+		} finally {
+			this.pendingListenAborts.delete(abortBind);
+			this.pendingTcpServers.delete(server);
+		}
 	}
 
 	/**
@@ -534,6 +750,11 @@ export class PeerManager extends EventEmitter {
 	 * additive: coexists with (does not replace) the TCP listener.
 	 */
 	async listenWebSocket(port: number, host = '0.0.0.0'): Promise<void> {
+		if (this.connectionsDisabled()) {
+			throw new Error(
+				`Connections are ${this.connectionsDisabledReason()}; refusing to listen`
+			);
+		}
 		if (this.wsServer) {
 			throw new Error('Already listening for WebSocket peers');
 		}
@@ -544,11 +765,38 @@ export class PeerManager extends EventEmitter {
 		server.on('error', (err: Error) => {
 			this.emit('listen:error', err);
 		});
-		await server.listen(port, host);
-		this.wsServer = server;
-		const addr = server.address();
-		const boundPort = addr && typeof addr === 'object' ? addr.port : port;
-		this.emit('listening:ws', boundPort, host);
+		// Visible to freezeConnections() while the bind is in flight.
+		this.pendingWsServers.add(server);
+		let abortBind: (err: Error) => void = () => undefined;
+		const abortPromise = new Promise<never>((_, reject) => {
+			abortBind = reject;
+		});
+		abortPromise.catch(() => {
+			// Consumed via the race when a teardown lands mid-bind.
+		});
+		this.pendingListenAborts.add(abortBind);
+		try {
+			const bind = server.listen(port, host);
+			bind.catch(() => {
+				// Consumed via the race; an abort winning must not leave the
+				// losing bind's rejection unhandled.
+			});
+			await Promise.race([bind, abortPromise]);
+			// Recheck AFTER the bind, exactly as in listen().
+			if (this.connectionsDisabled()) {
+				server.close();
+				throw new Error(
+					`Listener invalidated while starting: connections are ${this.connectionsDisabledReason()}`
+				);
+			}
+			this.wsServer = server;
+			const addr = server.address();
+			const boundPort = addr && typeof addr === 'object' ? addr.port : port;
+			this.emit('listening:ws', boundPort, host);
+		} finally {
+			this.pendingListenAborts.delete(abortBind);
+			this.pendingWsServers.delete(server);
+		}
 	}
 
 	/**
@@ -596,24 +844,26 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect all peers and clean up.
 	 */
 	destroy(): void {
-		this.stopListening();
-		for (const [pubkey] of this.peers) {
-			this.disconnectPeer(pubkey);
-		}
-		for (const timer of this.reconnectTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.reconnectTimers.clear();
-		this.reconnectDelays.clear();
+		if (this.destroyed) return;
+		// Set BEFORE the teardown: aborting an in-flight connectPeer lands in
+		// its catch path, which consults this flag before rescheduling.
+		this.destroyed = true;
+		this.teardownConnections();
 		this.announcedAddresses.clear();
-		for (const timer of this.stabilityTimers.values()) {
-			clearTimeout(timer);
-		}
-		this.stabilityTimers.clear();
 		this.messageHandlers.clear();
 	}
 
 	private handleInboundConnection(socket: IDuplexTransport): void {
+		// Quarantined, fenced or frozen (recovery 5.6): destroy the socket
+		// BEFORE the BOLT 8 handshake, so a node that cannot prove writer
+		// ownership never authenticates or exchanges init with anyone.
+		if (
+			this.connectionsDisabled() ||
+			(this.connectionGate && !this.connectionGate())
+		) {
+			socket.destroy();
+			return;
+		}
 		// Reject if at inbound peer limit
 		if (this.inboundPeerCount >= this.maxInboundPeers) {
 			socket.destroy();
@@ -630,9 +880,22 @@ export class PeerManager extends EventEmitter {
 			networks: this.networks
 		});
 
+		// Visible to freezeConnections() while the handshake is in flight.
+		this.pendingPeers.add(peer);
+
 		peer
 			.acceptInbound(socket)
 			.then(() => {
+				this.pendingPeers.delete(peer);
+				// Recheck AFTER the handshake: a freeze or gate closure that
+				// landed mid-establishment must win over registration.
+				if (
+					this.connectionsDisabled() ||
+					(this.connectionGate && !this.connectionGate())
+				) {
+					peer.disconnect();
+					return;
+				}
 				const pubkey = peer.remotePublicKey.toString('hex');
 
 				const existing = this.peers.get(pubkey);
@@ -685,12 +948,19 @@ export class PeerManager extends EventEmitter {
 			})
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
+				this.pendingPeers.delete(peer);
 			});
 	}
 
 	private setupPeerListeners(pubkey: string, peer: Peer): void {
 		peer.on('message', (type: number, payload: Buffer) => {
 			captureWireMessage('in', pubkey, type, payload);
+
+			// Inbound dispatch gate: a refused message is dropped here, before
+			// any handler (channel, gossip, onion, peer storage) can act on it.
+			if (this.inboundGate && !this.inboundGate(pubkey, type)) {
+				return;
+			}
 
 			// Route to type-specific handlers
 			const handlers = this.messageHandlers.get(type);
@@ -753,6 +1023,7 @@ export class PeerManager extends EventEmitter {
 	}
 
 	private scheduleReconnect(pubkey: string): void {
+		if (this.connectionsDisabled()) return; // frozen or destroyed: never redial
 		if (this.reconnectTimers.has(pubkey)) return; // already scheduled
 		if (this.reconnectCandidates(pubkey).length === 0) return;
 

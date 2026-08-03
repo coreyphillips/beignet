@@ -181,7 +181,12 @@ export interface IChannelManagerConfig {
 	chainHash?: Buffer;
 	/** Node identity private key (for announcements) */
 	nodePrivateKey?: Buffer;
-	/** Per-channel key derivation callback. If provided, each new channel gets unique keys. */
+	/**
+	 * Per-channel key derivation callback. If provided, each new channel gets
+	 * unique keys. MUST be pure and deterministic: an index has to answer
+	 * with the same material every time, since basepoints are committed to on
+	 * chain while signing secrets are re-derived at restart and recovery.
+	 */
 	channelKeyDeriver?: (channelIndex: number) => IPerChannelKeys;
 	/**
 	 * Custom {@link ISigner} factory (e.g. a remote/external signer). When
@@ -1232,6 +1237,15 @@ export class ChannelManager extends EventEmitter {
 			if (channel.getState() === ChannelState.AWAITING_REESTABLISH) {
 				const actions = channel.createReestablish();
 				this.processActions(peerPubkey, channel, actions);
+			} else if (channel.getState() === ChannelState.ERRORED) {
+				// Recovery 5.6 liveness: the peer-close request survives
+				// crashes as a persisted disposition, not as a wire message.
+				// Repeat it on every reconnect until the peer's force close
+				// resolves the channel on chain; empty for ordinary errors.
+				const actions = channel.buildRecoveryCloseActions();
+				if (actions.length > 0) {
+					this.processActions(peerPubkey, channel, actions);
+				}
 			}
 		}
 	}
@@ -1243,11 +1257,17 @@ export class ChannelManager extends EventEmitter {
 	 *
 	 * @param keyIndex - If provided and channelKeyDeriver exists, re-derives
 	 *   per-channel keys instead of using shared global keys.
+	 * @param perChannelKeys - Key material ALREADY derived for `keyIndex` (see
+	 *   getRecoveryChannelMaterial). Passing it keeps the deriver, a caller
+	 *   supplied callback, to a single evaluation per channel, so the state's
+	 *   basepoints and the signer's secrets cannot come from two different
+	 *   answers. Omit it and the deriver is called here, as before.
 	 */
 	restoreChannel(
 		channel: Channel,
 		peerPubkey: string,
-		keyIndex?: number | null
+		keyIndex?: number | null,
+		perChannelKeys?: IPerChannelKeys | null
 	): void {
 		if (this.config.chainHash) {
 			channel.announcementChainHash = this.config.chainHash;
@@ -1258,20 +1278,27 @@ export class ChannelManager extends EventEmitter {
 			let fundingPrivkey = this.config.localFundingPrivkey;
 			let htlcBasepointSecret = this.config.htlcBasepointSecret;
 
-			if (this.config.channelKeyDeriver && keyIndex != null) {
-				const perChannelKeys = this.config.channelKeyDeriver(keyIndex);
-				fundingPrivkey = perChannelKeys.fundingPrivkey;
-				htlcBasepointSecret = perChannelKeys.htlcBasepointSecret;
+			// 0 is the node-level shared-key signer; a per-channel restore
+			// replaces it with the channel's own index below.
+			let signerKeyIndex = 0;
+			if (
+				keyIndex != null &&
+				(perChannelKeys || this.config.channelKeyDeriver)
+			) {
+				const keys = perChannelKeys ?? this.config.channelKeyDeriver!(keyIndex);
+				fundingPrivkey = keys.fundingPrivkey;
+				htlcBasepointSecret = keys.htlcBasepointSecret;
 				// Preserve key index on channel for future persists
 				channel.channelKeyIndex = keyIndex;
 				// Advance _nextChannelIndex past any restored index
 				if (keyIndex >= this._nextChannelIndex) {
 					this._nextChannelIndex = keyIndex + 1;
 				}
+				signerKeyIndex = keyIndex;
 			}
 
 			const signer = this.makeSigner(
-				this.config.channelKeyDeriver && keyIndex != null ? keyIndex : 0,
+				signerKeyIndex,
 				fundingPrivkey,
 				htlcBasepointSecret
 			);
@@ -1405,24 +1432,33 @@ export class ChannelManager extends EventEmitter {
 	 * channelKeyIndex, or the node-level basepoints for legacy channels. Also
 	 * returns the local channel config the manager would use for a new channel.
 	 * Never advances the next-channel index (restoreChannel handles that).
+	 *
+	 * `perChannelKeys` is the deriver's WHOLE answer, returned so the caller
+	 * can hand it back to restoreChannel: the reconstructed state's
+	 * basepoints and the signer's secrets then provably come from ONE
+	 * evaluation of the callback, rather than two that a non-deterministic
+	 * implementation could answer differently.
 	 */
 	getRecoveryChannelMaterial(channelKeyIndex: number | null): {
 		basepoints: IChannelBasepoints;
 		perCommitmentSeed: Buffer;
 		localConfig: IChannelConfig;
+		perChannelKeys: IPerChannelKeys | null;
 	} {
 		if (this.config.channelKeyDeriver && channelKeyIndex != null) {
 			const keys = this.config.channelKeyDeriver(channelKeyIndex);
 			return {
 				basepoints: keys.basepoints,
 				perCommitmentSeed: keys.perCommitmentSeed,
-				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG
+				localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+				perChannelKeys: keys
 			};
 		}
 		return {
 			basepoints: this.config.localBasepoints,
 			perCommitmentSeed: this.config.localPerCommitmentSeed,
-			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG
+			localConfig: this.config.localConfig || DEFAULT_CHANNEL_CONFIG,
+			perChannelKeys: null
 		};
 	}
 
