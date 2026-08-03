@@ -49,7 +49,7 @@ import {
 	verifyGuardianBindings,
 	verifyGuardianReceipt
 } from './guardian-client';
-import { JOURNAL_META_KEYS } from './journal';
+import { JOURNAL_META_KEYS, storedTipSequence } from './journal';
 import {
 	IWriterLeaseKeys,
 	generateWriterKey,
@@ -625,6 +625,44 @@ export class GuardianReplicator {
 		} catch {
 			return 0n;
 		}
+	}
+
+	/**
+	 * Why the persisted watermark cannot be trusted, or null when it can.
+	 *
+	 * The watermark survives in recovery_meta while the frames underneath it
+	 * can be rolled back, restored in part or repaired, and a mark above the
+	 * local tip is then a claim about records this device cannot even show.
+	 * provenHead already refuses a RECEIPT whose head is above our tip, for
+	 * exactly this reason, but that check is structurally unreachable here: a
+	 * pass whose watermark already exceeds the tip loads no frames at all, so
+	 * no receipt is ever examined and the mark stands unchallenged forever.
+	 *
+	 * Asked ONCE, at barrier construction, never per evaluation.
+	 *
+	 * A ZERO watermark is never refused. It releases nothing, so there is
+	 * nothing to refuse, and refusing it would freeze a node whose journal is
+	 * merely damaged, which is the same trade resolveDurability makes for an
+	 * unreadable tip.
+	 */
+	watermarkExceedingJournal(): string | null {
+		const watermark = this.replicatedThrough();
+		if (watermark === 0n) return null;
+		const tip = storedTipSequence(this.config.storage);
+		if (tip == null) {
+			return (
+				`the replication watermark is ${watermark} but this journal's ` +
+				`recorded tip does not match the frames on disk`
+			);
+		}
+		if (watermark > tip) {
+			return (
+				`the replication watermark is ${watermark} but the journal only ` +
+				`holds frames through ${tip}, so the log was rolled back or ` +
+				`restored underneath a mark that survived it`
+			);
+		}
+		return null;
 	}
 
 	/**

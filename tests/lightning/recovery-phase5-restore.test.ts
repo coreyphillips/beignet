@@ -907,6 +907,11 @@ describe('Recovery phase 5: restore driver', () => {
 			}
 		});
 		expect(resumed.replicatedThrough()).to.equal(certifiedSequence);
+		// And the mark is a statement about frames this database can SHOW. The
+		// install writes the watermark and the journal tip to the same
+		// certified head in one transaction, so a quorum barrier built over a
+		// restored database must not read it as a rolled-back log.
+		expect(resumed.watermarkExceedingJournal()).to.equal(null);
 
 		// Nothing new: no requests, no rejections, no re-sent history.
 		const idle = await resumed.replicatePending(restored.lease);

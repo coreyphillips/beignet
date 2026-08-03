@@ -349,6 +349,39 @@ export function chainPromisedQuorum(
 	return tip.tip === 'present' && tip.durability === 'quorum';
 }
 
+/**
+ * The highest frame sequence this database can SHOW, or null when the
+ * journal's own bookkeeping and the frames on disk disagree.
+ *
+ * A replication watermark is only ever a statement about frames this device
+ * can produce, so this is the ceiling one has to be checked against. The
+ * recorded tip and the newest stored ROW must agree on sequence AND frame
+ * hash: rows are AEAD bound to (nodeId, epoch, sequence, previousFrameHash),
+ * so anyone without the frame key can DELETE frames but never forge a higher
+ * one, and deletion is exactly the rollback this is looking for.
+ *
+ * Callable without a journal object and without the frame key, because the
+ * caller that needs it holds neither, and cheap enough for startup: one meta
+ * read and one row, no decryption and no chain walk.
+ */
+export function storedTipSequence(storage: IStorageBackend): bigint | null {
+	const tip = storage.getRecoveryMeta?.(META_TIP_SEQUENCE);
+	const tipHash = storage.getRecoveryMeta?.(META_TIP_HASH);
+	const empty = (storage.loadRecoveryFrames?.(0) ?? []).length === 0;
+	if (tip == null || tipHash == null || !/^\d+$/.test(tip)) {
+		// A virgin database is the only honest reading of "no tip", so a frame
+		// underneath one means the bookkeeping does not describe the frames.
+		return empty ? 0n : null;
+	}
+	const sequence = BigInt(tip);
+	if (sequence === 0n) return empty ? 0n : null;
+	// Only the tip row: sequence > tip-1 is exactly the newest frame.
+	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
+	const row = rows[rows.length - 1];
+	if (!row || BigInt(row.sequence) !== sequence) return null;
+	return row.frameHash.equals(Buffer.from(tipHash, 'hex')) ? sequence : null;
+}
+
 export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly storage: IStorageBackend;
 	private readonly masterKey: Buffer;

@@ -28,6 +28,7 @@ import {
 	IBoundGuardianClient,
 	IDurabilityBarrierEvent,
 	IWriterLeaseKeys,
+	REPLICATION_META_KEYS,
 	RecoveryCriticality,
 	RecoveryJournal,
 	RecoveryManager,
@@ -566,5 +567,138 @@ describe('Recovery phase 6: a fenced writer never releases again', () => {
 		barrier.stop();
 		await shutdown(served);
 		storage.close();
+	});
+});
+
+describe('Recovery phase 6: a watermark speaks only for frames we hold', () => {
+	it('a quorum barrier REFUSES to build over a watermark above the tip', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		const sequence = commit(harness, 41);
+		await rep.replicatePending(lease);
+		expect(rep.replicatedThrough()).to.equal(sequence);
+
+		// The frames can be rolled back, restored in part or repaired while
+		// the mark in recovery_meta survives. Nothing in a replication pass
+		// notices: a pass whose watermark already exceeds the tip loads no
+		// frames, examines no receipt, and reports success.
+		storage.setRecoveryMeta(
+			REPLICATION_META_KEYS.replicatedThrough,
+			String(sequence + 1000n)
+		);
+		expect(
+			() =>
+				new DurabilityBarrier({
+					durability: 'quorum',
+					replicator: rep,
+					lease: (): IWriterLeaseKeys => lease
+				})
+		).to.throw(/rolled back or restored underneath/);
+
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('a truncated frame table is refused even with the mark below the tip', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		const sequence = commit(harness, 42);
+		await rep.replicatePending(lease);
+
+		// The tip row itself is gone while the bookkeeping still names it. The
+		// mark is not above the recorded tip, so only cross-checking the tip
+		// against the ROW catches this.
+		storage.deleteRecoveryFramesBelow(Number(sequence) + 1);
+		expect(
+			() =>
+				new DurabilityBarrier({
+					durability: 'quorum',
+					replicator: rep,
+					lease: (): IWriterLeaseKeys => lease
+				})
+		).to.throw(/does not match the frames on disk/);
+
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('a weaker mode REPORTS the same inconsistency and keeps running', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		const sequence = commit(harness, 43);
+		await rep.replicatePending(lease);
+		storage.setRecoveryMeta(
+			REPLICATION_META_KEYS.replicatedThrough,
+			String(sequence + 500n)
+		);
+
+		const events: IDurabilityBarrierEvent[] = [];
+		const barrier = new DurabilityBarrier({
+			durability: 'async-remote',
+			replicator: rep,
+			lease: (): IWriterLeaseKeys => lease,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+		expect(barrier.enforcing).to.equal(false);
+		expect(events.map((e) => e.type)).to.deep.equal(['barrier:unreachable']);
+		// Never written DOWN. raiseWatermark is monotone by design, and
+		// lowering it would repair nothing: a guardian genuinely holding
+		// records above our tip refuses a re-offer with a sequence gap anyway.
+		expect(
+			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough)
+		).to.equal(String(sequence + 500n));
+
+		barrier.stop();
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('a fresh database and a mid-journal enablement both build', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const fresh = openStorage();
+		const freshRep = replicatorFor(fresh, bind(served));
+		const empty = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: freshRep,
+			lease: (): IWriterLeaseKeys | null => null
+		});
+		expect(empty.isReleased(1n)).to.equal(false);
+		empty.stop();
+		fresh.close();
+
+		// Frames already journaled, guardians only being enabled now: there is
+		// no watermark at all, which releases nothing and refuses nothing.
+		const midJournal = openStorage();
+		const harness = journaled(midJournal);
+		commit(harness, 44);
+		commit(harness, 45);
+		const midRep = replicatorFor(midJournal, bind(served));
+		const barrier = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: midRep,
+			lease: (): IWriterLeaseKeys | null => null
+		});
+		expect(barrier.watermark()).to.equal(0n);
+		barrier.stop();
+		midJournal.close();
+		await shutdown(served);
 	});
 });

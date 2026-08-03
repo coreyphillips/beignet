@@ -127,6 +127,25 @@ export class DurabilityBarrier {
 		this.config = config;
 		this.timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 		this.retryDelayMs = config.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS;
+		// The watermark is read from disk and RELEASED on, so it has to be a
+		// statement about frames this device can still produce. In quorum mode
+		// a mark above the local tip is fatal and must NOT be clamped down:
+		// clamping would release every frame under it as durable while
+		// discarding the one piece of evidence that this device is behind what
+		// its peers already saw, which is the data-loss case, not a repair.
+		// Other modes only stand to lose replication progress, so they report
+		// it and keep running.
+		const stale = config.replicator.watermarkExceedingJournal();
+		if (stale) {
+			if (config.durability === 'quorum') {
+				throw new Error(
+					`recovery: ${stale}; a quorum writer cannot prove durability ` +
+						'against a chain it does not hold, so restore this device from ' +
+						'the guardian set or start a new recovery namespace'
+				);
+			}
+			config.onEvent?.({ type: 'barrier:unreachable', detail: stale });
+		}
 	}
 
 	/**
