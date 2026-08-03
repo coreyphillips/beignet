@@ -666,10 +666,18 @@ export class GuardianReplicator {
 	private provenHead(
 		receipt: IGuardianReceipt | undefined,
 		lease: IWriterLeaseKeys,
-		framesBySequence: Map<bigint, IStoredRecoveryFrame>
+		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
+		expectedGuardianId: Buffer,
+		tip: bigint
 	): { head: bigint; conflictAt: bigint | null } | null {
 		if (!receipt) return null;
 		if (!verifyGuardianReceipt(receipt, this.config.context)) return null;
+		// The quorum is over DISTINCT guardians and this pass collects one head
+		// per ENDPOINT, so the receipt has to be signed by the guardian this
+		// endpoint proved it is through INFO. Without the check one endpoint
+		// satisfies a 2-of-3 on its own by replaying another guardian's
+		// genuine receipt beside its own.
+		if (!receipt.guardianId.equals(expectedGuardianId)) return null;
 		const state = receipt.state;
 		if (!state.recoveryId.equals(this.config.recoveryRoot.recoveryId)) {
 			return null;
@@ -677,6 +685,13 @@ export class GuardianReplicator {
 		if (state.lease.epoch !== lease.epoch) return null;
 		if (!state.lease.writerPublicKey.equals(lease.writerPublicKey)) return null;
 		const head = state.logHead.sequence;
+		// A guardian cannot hold a record we never wrote, so a head above our
+		// tip is not evidence about our chain at all. REFUSE it rather than
+		// clamp it down to the tip: clamping turns a guardian that is ahead of
+		// a locally rolled-back journal into proof of frames this device
+		// cannot even show, and the frame-hash check below cannot help,
+		// because a head we do not hold is not in the map to compare against.
+		if (head > tip) return null;
 		const ours = framesBySequence.get(head);
 		if (ours && !state.logHead.frameHash.equals(ours.frameHash)) {
 			return { head: 0n, conflictAt: head };
@@ -701,7 +716,8 @@ export class GuardianReplicator {
 		entry: IBoundGuardianClient,
 		frames: IStoredRecoveryFrame[],
 		lease: IWriterLeaseKeys,
-		framesBySequence: Map<bigint, IStoredRecoveryFrame>
+		framesBySequence: Map<bigint, IStoredRecoveryFrame>,
+		tip: bigint
 	): Promise<IGuardianStreamResult> {
 		const result: IGuardianStreamResult = {
 			provenThrough: null,
@@ -738,7 +754,9 @@ export class GuardianReplicator {
 				const proven = this.provenHead(
 					response.receipt,
 					lease,
-					framesBySequence
+					framesBySequence,
+					entry.expectedGuardianId,
+					tip
 				);
 				if (proven?.conflictAt != null) {
 					result.conflictAt = proven.conflictAt;
@@ -837,7 +855,7 @@ export class GuardianReplicator {
 
 		const streams = await Promise.all(
 			this.config.guardians.map((entry) =>
-				this.streamToGuardian(entry, frames, lease, framesBySequence)
+				this.streamToGuardian(entry, frames, lease, framesBySequence, tip)
 			)
 		);
 
@@ -870,8 +888,9 @@ export class GuardianReplicator {
 			heads.length >= this.config.required
 				? heads[this.config.required - 1]
 				: from;
-		// A guardian cannot prove more than we wrote. Clamping keeps a buggy or
-		// hostile answer from advancing the mark past our own chain.
+		// provenHead already refuses a head above our tip, so this cannot lift
+		// the mark; it is a belt on the braces. It must never clamp UPWARD,
+		// which would turn an over-reporting guardian into proof of our tip.
 		if (quorumHead > tip) quorumHead = tip;
 		if (quorumHead < from) quorumHead = from;
 

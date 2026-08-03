@@ -197,6 +197,7 @@ import {
 	RecoveryMutation,
 	GuardianStartupGate,
 	DurabilityBarrier,
+	chainPromisedQuorum,
 	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
@@ -682,9 +683,22 @@ export class LightningNode extends EventEmitter {
 		// unbarriered beneath a certified head that still reads 'quorum', and
 		// a later restore of that chain would claim an exactness it does not
 		// have. The remedy is to restore the guardian configuration.
-		if (journal?.getDurability() === 'quorum' && !barrier?.enforcing) {
+		// The check is on the DATABASE, not on the journal object, because the
+		// dangerous configuration is the one where no journal exists at all:
+		// the sticky rule lives inside RecoveryJournal, so a run with recovery
+		// switched off would append nothing while its channels kept advancing
+		// past a certified head that still reads 'quorum'.
+		if (
+			this.storage &&
+			!barrier?.enforcing &&
+			chainPromisedQuorum(
+				this.storage,
+				deriveRecoveryMasterKey(config.nodePrivateKey),
+				getPublicKey(config.nodePrivateKey)
+			)
+		) {
 			throw new Error(
-				'recovery: this journal is in quorum mode but no enforcing durability ' +
+				'recovery: this database is in quorum mode but no enforcing durability ' +
 					'barrier was configured, so safety-critical messages could not be held; ' +
 					'restore the guardian set, or start a new recovery namespace'
 			);
@@ -3151,7 +3165,12 @@ export class LightningNode extends EventEmitter {
 		durability: RecoveryDurability;
 		/** Highest journal frame a guardian quorum provably holds. */
 		lastDurableSequence: string;
-		/** Batches held behind the barrier right now, node wide. */
+		/**
+		 * CHANNELS holding messages behind the barrier right now, not batches.
+		 * A channel releases its held batches strictly in order through a
+		 * single outstanding wait, so one channel is one waiter however many
+		 * batches are parked behind it.
+		 */
 		awaitingDurabilityCount: number;
 		fenced: boolean;
 		channels: Array<{
@@ -3186,7 +3205,10 @@ export class LightningNode extends EventEmitter {
 			durability:
 				this.recoveryJournal?.getDurability() ?? barrier?.durability ?? 'local',
 			lastDurableSequence: (barrier?.durableThrough ?? 0n).toString(),
-			awaitingDurabilityCount: barrier?.waiting ?? 0,
+			// Taken from the channel manager rather than the barrier's waiter
+			// count: they agree today, and deriving it from the thing the
+			// field is named after keeps them agreeing.
+			awaitingDurabilityCount: holding.size,
 			fenced: barrier?.fenced ?? false,
 			channels
 		};

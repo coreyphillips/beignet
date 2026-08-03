@@ -373,8 +373,10 @@ describe('Recovery phase 6: one channel waiting does not stall another', () => {
 		]);
 		expect(harness.sent).to.have.length(0);
 
-		// The other channel's frame is already durable, so it is not affected
-		// by the first channel's outstanding receipt.
+		// The other channel carries a BARRIER-CLASS message, so the barrier is
+		// genuinely consulted for it; its frame is simply already durable. An
+		// ungated message type here would prove nothing, because
+		// _shouldHoldBatch would return before ever asking.
 		harness.barrier.advance(0n);
 		harness.nextFrame = 0n;
 		dispatch(
@@ -382,13 +384,75 @@ describe('Recovery phase 6: one channel waiting does not stall another', () => {
 			other,
 			[
 				{ type: ChannelActionType.PERSIST_STATE },
-				send(MessageType.UPDATE_ADD_HTLC)
+				send(MessageType.REVOKE_AND_ACK)
 			],
 			OTHER_PEER
 		);
 
 		expect(harness.sent.map((e) => e.peer)).to.deep.equal([OTHER_PEER]);
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.REVOKE_AND_ACK
+		]);
 		expect(harness.barrier.waiting).to.equal(1);
+	});
+});
+
+describe('Recovery phase 6: nothing overtakes a held channel', () => {
+	it('a batch with NO PERSIST_STATE queues behind held messages', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.REVOKE_AND_ACK)
+		]);
+		// initiateShutdown, the closing_signed rounds, stfu and
+		// createReestablish all dispatch persist-less arrays. The barrier is
+		// consulted at the PERSIST_STATE action, so without a separate check
+		// these walk straight past a parked revoke_and_ack.
+		dispatch(harness.manager, channel, [send(MessageType.SHUTDOWN)]);
+		expect(harness.sent).to.have.length(0);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.REVOKE_AND_ACK,
+			MessageType.SHUTDOWN
+		]);
+	});
+});
+
+describe('Recovery phase 6: a refusal drops the wire half only', () => {
+	it('the internal effects of a refused batch still run', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+		const forwarded: bigint[] = [];
+		harness.manager.on('htlc:forwarded', (_id: Buffer, htlcId: bigint) => {
+			forwarded.push(htlcId);
+		});
+
+		// handleRevokeAndAck sets htlc.forwardEmitted = true while BUILDING
+		// its actions, and the batch's own persist commits that flag. Dropping
+		// the HTLC_FORWARDED would mean no later commitment round ever emits
+		// it again, and the inbound HTLC sits unforwarded until its CLTV.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.REVOKE_AND_ACK),
+			{
+				type: ChannelActionType.HTLC_FORWARDED,
+				htlcId: 7n,
+				amountMsat: 1_000n,
+				paymentHash: crypto.randomBytes(32)
+			} as ChannelAction
+		]);
+		expect(forwarded).to.deep.equal([]);
+
+		harness.barrier.refuse('timeout');
+		await settle();
+
+		// The wire half is gone, the forward is not.
+		expect(harness.sent).to.have.length(0);
+		expect(forwarded).to.deep.equal([7n]);
 	});
 });
 

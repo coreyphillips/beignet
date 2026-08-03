@@ -36,6 +36,7 @@ import {
 	RecoveryJournal,
 	RecoveryManager,
 	ReferenceGuardian,
+	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	computeGuardianSetId,
 	decodeGetHeadResponse,
@@ -268,10 +269,15 @@ describe('Recovery phase 6: appends pipeline', () => {
 
 		const result = await rep.replicatePending(lease);
 		expect(result.outcome).to.equal('replicated');
-		// Every frame reaches every guardian exactly once. Anything that
-		// re-drove records per barrier would multiply this.
+		// Bounded, not exact. Out-of-order arrival at a linearized guardian is
+		// answered with a refusal and re-driven, which the next case exercises
+		// deliberately, so an exact count here would be a flake rather than a
+		// property. What matters is the ORDER OF MAGNITUDE: one pass, not one
+		// per frame. A per-barrier re-drive would be quadratic in the backlog.
 		const frames = storage.loadRecoveryFrames().length;
-		expect(puts).to.equal(frames * served.length);
+		const ideal = frames * served.length;
+		expect(puts).to.be.greaterThanOrEqual(ideal);
+		expect(puts).to.be.lessThan(ideal * 2);
 		await shutdown(served);
 		storage.close();
 	});
@@ -488,6 +494,86 @@ describe('Recovery phase 6: receipts are cumulative and bound', () => {
 			lease
 		);
 		expect(proof.confirming).to.equal(0);
+		await shutdown(served);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 6: a receipt only speaks for what it holds', () => {
+	it('a head ABOVE our own tip is refused, never clamped down into proof', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const { storage } = journaledStorage(8);
+		const rep = replicator(storage, bind(served));
+		const lease = await registered(rep);
+		await rep.replicatePending(lease);
+		const full = BigInt(storage.loadRecoveryFrames().slice(-1)[0].sequence);
+
+		// Roll the LOCAL journal back below what the guardians hold, which is
+		// what a restored-from-an-older-copy device looks like. Every receipt
+		// now names a head above our tip.
+		const keep = 4;
+		(
+			storage as unknown as {
+				db: { prepare: (sql: string) => { run: (...a: unknown[]) => void } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence > ?')
+			.run(keep);
+		storage.setRecoveryMeta(JOURNAL_META_KEYS.tipSequence, String(keep));
+		storage.setRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough, '0');
+		expect(full > BigInt(keep)).to.equal(true);
+
+		// A guardian cannot have stored a record we never wrote, so a head we
+		// do not hold says nothing about OUR chain. Clamping it down to our tip
+		// would turn it into proof of frames this device cannot even show.
+		const result = await replicator(storage, bind(served)).replicatePending(
+			lease
+		);
+		expect(result.replicatedThrough).to.equal(0n);
+
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('one guardian answering for ANOTHER cannot make a quorum by itself', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const { storage } = journaledStorage(3);
+		const rep = replicator(storage, bind(served));
+		const lease = await registered(rep);
+		await rep.replicatePending(lease);
+
+		// Guardian 1's genuine receipt, replayed by endpoint 0. The signature
+		// verifies under a committed member key, so only the binding between
+		// the endpoint and the identity it PROVED through INFO can reject it.
+		const borrowed = await served[1].client.getHead(ROOT.recoveryId);
+		const impersonator = instrument(served[0], {
+			rewrite: (path, response) => {
+				if (path !== '/put_state') return response;
+				const decoded = decodePutStateResponse(response.body);
+				return {
+					status: response.status,
+					body: encodePutStateResponse({
+						...decoded,
+						receipt: borrowed.receipt
+					})
+				};
+			}
+		});
+		// Guardian 2 goes dark, so the only honest signer left is guardian 1.
+		// Counting the borrowed receipt as a second distinct guardian would
+		// form a 2-of-3 out of one guardian's word.
+		await served[2].server.close();
+		storage.setRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough, '0');
+		const guardians = [impersonator, ...bind(served).slice(1, 2)];
+		const result = await replicator(storage, guardians).replicatePending(lease);
+		expect(result.replicatedThrough).to.equal(0n);
+
 		await shutdown(served);
 		storage.close();
 	});

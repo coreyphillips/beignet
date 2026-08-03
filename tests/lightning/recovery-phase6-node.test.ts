@@ -261,6 +261,46 @@ describe('Recovery phase 6: a quorum chain will not run unbarriered', () => {
 		storage.close();
 	});
 
+	it('removing the recovery block ENTIRELY is refused too', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{ durability: 'quorum' }
+		);
+		new RecoveryManager(storage, { journal }).commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: sha('whole-block').toString('hex'),
+					preimage: sha('whole-block-preimage')
+				}
+			],
+			outboundMessages: []
+		});
+
+		// The quadrant a guard keyed on the JOURNAL OBJECT cannot see, and the
+		// most natural way an operator turns recovery off: dropping the block
+		// removes the journal and the barrier together, so a check on either
+		// one alone short-circuits. The node would then advance its channels
+		// while appending nothing, leaving the certified head reading 'quorum'
+		// but describing state the peers have long since moved past, and a
+		// later restore would resume on a commitment the peer can punish.
+		// The check is therefore on the DATABASE.
+		expect(() => createNode(storage, undefined)).to.throw(/quorum/);
+		expect(() => createNode(storage, { enabled: false })).to.throw(/quorum/);
+
+		await shutdown(served);
+		storage.close();
+	});
+
 	it('an enforcing barrier with NO JOURNAL is refused, not silently inert', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.

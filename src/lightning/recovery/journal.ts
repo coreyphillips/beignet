@@ -83,7 +83,7 @@ const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
 /** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */
 const DEFAULT_SNAPSHOT_INTERVAL_BYTES = 4 * 1024 * 1024;
 /** Frames compaction will hold back for a lagging replica before forcing. */
-const DEFAULT_MAX_RETAINED_FRAMES = 1024;
+const DEFAULT_MAX_RETAINED_FRAME_GAP = 1024;
 
 export interface IRecoveryJournalOptions {
 	/**
@@ -115,13 +115,18 @@ export interface IRecoveryJournalOptions {
 	 */
 	retainFrom?: () => bigint;
 	/**
-	 * Ceiling on how many frames compaction will hold back waiting for a
+	 * Ceiling on the SEQUENCE GAP compaction will hold back waiting for a
 	 * replica, after which it prunes anyway. Without it a permanently dead
-	 * guardian would grow the journal without bound. Default 1024. Crossing it
-	 * is reported through onCompactionForced, and it means the lagging replica
-	 * can no longer be backfilled and has to be re-provisioned.
+	 * guardian would grow the journal without bound. Default 1024.
+	 *
+	 * A gap rather than a frame count, and the distinction is deliberate: past
+	 * compactions mean the retained rows are at most the gap, never more, so
+	 * measuring the gap trips the ceiling no later than counting rows would.
+	 * Crossing it orphans every guardian behind the watermark, not one lagging
+	 * replica, and the namespace then has to be re-provisioned; that is why
+	 * the default is high and the event that reports it says so.
 	 */
-	maxRetainedFrames?: number;
+	maxRetainedFrameGap?: number;
 	/** Compaction pruned frames a replica had not yet received. */
 	onCompactionForced?: (detail: string) => void;
 	/** Append a snapshot frame after this many delta frames. Default 256. */
@@ -318,6 +323,32 @@ function resolveDurability(
 	return 'quorum';
 }
 
+/**
+ * Has this database ever promised quorum durability?
+ *
+ * Callable WITHOUT constructing a journal, which is the point: the sticky
+ * rule is enforced inside RecoveryJournal, so a run that builds no journal at
+ * all (recovery disabled, or a backend without frame support) escapes it
+ * entirely. Such a node keeps operating its channels while appending nothing,
+ * so its state advances past a certified head that still reads 'quorum', and
+ * a later restore of that chain would claim an exactness it does not have.
+ * The node asks this at construction so it can refuse instead.
+ *
+ * The frame check is skipped when the backend cannot serve frames, which is
+ * also the only case where the meta floor is the sole evidence available.
+ */
+export function chainPromisedQuorum(
+	storage: IStorageBackend,
+	masterKey: Buffer,
+	nodeId: Buffer
+): boolean {
+	if (storage.getRecoveryMeta?.(META_DURABILITY_FLOOR) === 'quorum')
+		return true;
+	if (typeof storage.loadRecoveryFrames !== 'function') return false;
+	const tip = readTipDurability(storage, masterKey, nodeId);
+	return tip.tip === 'present' && tip.durability === 'quorum';
+}
+
 export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly storage: IStorageBackend;
 	private readonly masterKey: Buffer;
@@ -328,7 +359,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** The mode every frame this journal writes declares (spec 5.8). */
 	private readonly durability: RecoveryDurability | undefined;
 	private readonly retainFrom: (() => bigint) | undefined;
-	private readonly maxRetainedFrames: number;
+	private readonly maxRetainedFrameGap: number;
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
@@ -370,8 +401,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.onDurabilityRefused
 		);
 		this.retainFrom = options.retainFrom;
-		this.maxRetainedFrames =
-			options.maxRetainedFrames ?? DEFAULT_MAX_RETAINED_FRAMES;
+		this.maxRetainedFrameGap =
+			options.maxRetainedFrameGap ?? DEFAULT_MAX_RETAINED_FRAME_GAP;
 		this.onCompactionForced = options.onCompactionForced;
 	}
 
@@ -645,14 +676,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const floor = this.retainFrom?.();
 		if (floor !== undefined && floor < snapshotSequence) {
 			const held = snapshotSequence - floor;
-			if (held <= BigInt(this.maxRetainedFrames)) return;
-			// A replica this far behind is not coming back on its own. Pruning
-			// costs us its backfill; not pruning costs us the disk, forever.
+			if (held <= BigInt(this.maxRetainedFrameGap)) return;
+			// Nothing behind this point is coming back on its own. Be exact
+			// about the cost: the floor is the QUORUM watermark, so crossing
+			// the ceiling orphans every guardian that has not caught up, not
+			// one lagging replica, and the namespace has to be re-provisioned
+			// from a fresh registration. The alternative is a journal that
+			// grows without bound behind a guardian set that is simply gone,
+			// so the ceiling is deliberately high rather than absent.
 			this.onCompactionForced?.(
-				`compaction pruned to frame ${snapshotSequence} while a replica still ` +
-					`needed frame ${floor}: ${held} frames exceeded the ${this.maxRetainedFrames} ` +
-					`frame retention ceiling, so that replica can no longer be backfilled ` +
-					`and has to be re-provisioned`
+				`compaction pruned to frame ${snapshotSequence} while the quorum had ` +
+					`only reached frame ${
+						floor - 1n
+					}: the ${held} frame gap exceeded the ` +
+					`${this.maxRetainedFrameGap} frame retention ceiling, so every guardian ` +
+					`behind that point can no longer be backfilled and this namespace has ` +
+					`to be re-provisioned`
 			);
 		}
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));

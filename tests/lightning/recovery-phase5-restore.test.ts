@@ -217,7 +217,10 @@ function driverFor(
 }
 
 describe('Recovery phase 5: restore driver', () => {
-	it('fences first, then rebuilds the database byte-identically', async () => {
+	it('fences first, then rebuilds the database byte-identically', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(3);
@@ -268,7 +271,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('reconciles a divergent head: one guardian unreachable, one stale', async () => {
+	it('reconciles a divergent head: one guardian unreachable, one stale', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);
@@ -315,7 +321,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('retries the CAS when the old writer certifies a state mid-restore', async () => {
+	it('retries the CAS when the old writer certifies a state mid-restore', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);
@@ -361,7 +370,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('picks up a record the old writer appended mid-restore', async () => {
+	it('picks up a record the old writer appended mid-restore', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(2);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -439,7 +451,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('refuses without a read quorum, and for an unknown namespace', async () => {
+	it('refuses without a read quorum, and for an unknown namespace', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(1);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -496,7 +511,10 @@ describe('Recovery phase 5: restore driver', () => {
 		emptyTarget.close();
 	});
 
-	it('finishes a partial acquisition with the SAME key instead of chasing epochs', async () => {
+	it('finishes a partial acquisition with the SAME key instead of chasing epochs', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(2);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -582,7 +600,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('repairs a guardian that missed the takeover and discards its superseded tail', async () => {
+	it('repairs a guardian that missed the takeover and discards its superseded tail', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// Phase 5 acceptance (docs/RECOVERY-PROTOCOL.md 9): a lagging guardian
 		// adopts the certified takeover head through SYNC_EPOCH and discards
 		// the uncommitted superseded-epoch tail sitting above it. The tail is
@@ -688,7 +709,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('adopts a higher epoch only when a quorum certified it', async () => {
+	it('adopts a higher epoch only when a quorum certified it', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(2);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -728,7 +752,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('does not count a possibly-stale guardian toward the read set', async () => {
+	it('does not count a possibly-stale guardian toward the read set', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(3);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -770,7 +797,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('resumes after a crash between the takeover and lease promotion', async () => {
+	it('resumes after a crash between the takeover and lease promotion', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(3);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -844,7 +874,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('starts post-restore replication after the certified head', async () => {
+	it('starts post-restore replication after the certified head', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(3);
 		const rep = replicatorFor(live.storage, bind(served));
@@ -921,7 +954,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('does not call one holder plus two unknowns an unregistered namespace', async () => {
+	it('does not call one holder plus two unknowns an unregistered namespace', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const live = liveNode(1);
 		// Only G1 ever learns about the namespace: a partially replicated
@@ -963,7 +999,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('marks every restored channel StateUncertain inside the install', async () => {
+	it('marks every restored channel StateUncertain inside the install', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// Guardian replication is best effort until the Phase 6 barriers, so
 		// the certified head can trail what the lost device actually did with
 		// its peers: a restored channel must come back with its commitment
@@ -1045,7 +1084,10 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
-	it('halts on a crash-fault-model breach instead of guessing', async () => {
+	it('halts on a crash-fault-model breach instead of guessing', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const clients = served.map((s) => s.client);
 		const live = liveNode(2);

@@ -4563,6 +4563,28 @@ export class ChannelManager extends EventEmitter {
 		const channelIdHex = batchChannelId?.toString('hex') ?? null;
 		let heldFrom = -1;
 
+		// A channel that is ALREADY holding messages holds this batch too, and
+		// the check has to happen here rather than at the PERSIST_STATE action,
+		// because a batch with no persist never reaches that case. Those exist
+		// and are not exotic: initiateShutdown, the closing_signed rounds, stfu
+		// and createReestablish all dispatch persist-less arrays. Without this
+		// they would overtake a parked revoke_and_ack and reorder the channel's
+		// wire stream. A batch WITH a persist still runs up to and including it
+		// (that state must reach disk) and is held from the action after.
+		if (
+			channelIdHex &&
+			persistIndex < 0 &&
+			this.barrierQueues.has(channelIdHex)
+		) {
+			this._holdBatch(channelIdHex, peerPubkey, channel, {
+				actions,
+				from: 0,
+				frameSequence: null,
+				outboxIds: []
+			});
+			return;
+		}
+
 		this.emit('transition:begin', channelIdHex);
 		try {
 			heldFrom = this._dispatchActions(
@@ -4856,7 +4878,21 @@ export class ChannelManager extends EventEmitter {
 		};
 		this.barrierQueues.set(channelIdHex, queue);
 		this.emit('transition:held', peerPubkey, channelIdHex, held.frameSequence);
-		void this._awaitRelease(channelIdHex, queue);
+		void this._awaitRelease(channelIdHex, queue).catch((error) => {
+			// The loop is deliberately not awaited by anything. An escaping
+			// rejection would be an unhandled promise AND a channel wedged with
+			// its queue still installed, so it is caught and the queue cleared.
+			if (this.barrierQueues.get(channelIdHex) === queue) {
+				this.barrierQueues.delete(channelIdHex);
+			}
+			this.emit(
+				'error',
+				channel.getChannelId(),
+				`durability barrier release failed: ${
+					error instanceof Error ? error.message : String(error)
+				}`
+			);
+		});
 	}
 
 	/**
@@ -4886,7 +4922,20 @@ export class ChannelManager extends EventEmitter {
 				return;
 			}
 			queue.batches.shift();
-			this._dispatchHeld(queue, next);
+			try {
+				this._dispatchHeld(queue, next);
+			} catch (error) {
+				// A released batch runs re-entrant handlers, any of which can
+				// throw. Without this the loop exits with the queue still
+				// installed, and the channel never sends again.
+				this.emit(
+					'error',
+					queue.channel.getChannelId(),
+					`released batch failed: ${
+						error instanceof Error ? error.message : String(error)
+					}`
+				);
+			}
 		}
 	}
 
@@ -4909,15 +4958,60 @@ export class ChannelManager extends EventEmitter {
 		reason: string
 	): void {
 		this.barrierQueues.delete(channelIdHex);
-		const dropped = queue.batches.length;
+		const dropped = queue.batches;
 		queue.batches = [];
+		// The WIRE half is dropped. The rest of the batch is not, and that
+		// distinction is fund-critical: a held suffix also carries the
+		// EDGE-TRIGGERED internal effects of the state its persist already
+		// committed. handleRevokeAndAck sets htlc.forwardEmitted = true while
+		// BUILDING its actions, and that flag is on disk by the time the
+		// barrier is asked, so an HTLC_FORWARDED dropped here is never emitted
+		// again by any later commitment round: the inbound HTLC would sit
+		// unforwarded and unsettled until its CLTV. Running the suffix with
+		// sends suppressed is exactly the disposition a failed persist already
+		// has, and it costs nothing, since nothing reaches the peer either way.
+		for (const batch of dropped) {
+			this.runHeldSuffixWithoutSending(queue, batch);
+		}
 		this.emit(
 			'transition:frozen',
 			queue.peerPubkey,
 			channelIdHex,
 			reason,
-			dropped
+			dropped.length
 		);
+	}
+
+	/**
+	 * Run a held suffix for its internal effects only, with every SEND_MESSAGE,
+	 * BROADCAST_TX and FORCE_CLOSE suppressed.
+	 *
+	 * This reuses the failed-persist suppression already built into
+	 * _dispatchActions rather than inventing a second notion of "do everything
+	 * except talk to the peer".
+	 */
+	private runHeldSuffixWithoutSending(
+		queue: IBarrierQueue,
+		held: IHeldBatch
+	): void {
+		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
+		this.emit('transition:begin', channelIdHex);
+		try {
+			this._dispatchActions(
+				queue.peerPubkey,
+				queue.channel,
+				held.actions,
+				null,
+				() => true,
+				() => undefined,
+				held.from,
+				true
+			);
+		} catch {
+			// One batch's internal effects failing must not strand the rest.
+		} finally {
+			this.emit('transition:end', channelIdHex);
+		}
 	}
 
 	/** Run a released suffix through the ordinary dispatch path. */
@@ -4966,7 +5060,15 @@ export class ChannelManager extends EventEmitter {
 		const queue = this.barrierQueues.get(channelIdHex);
 		if (!queue) return;
 		this.barrierQueues.delete(channelIdHex);
+		const dropped = queue.batches;
 		queue.batches = [];
+		// Same rule as a refusal: the wire half goes, the internal effects do
+		// not. Called BEFORE markForReestablish, so a committed received HTLC
+		// still forwards; the rollback only discards UNcommitted updates, which
+		// were never going to forward anyway.
+		for (const batch of dropped) {
+			this.runHeldSuffixWithoutSending(queue, batch);
+		}
 	}
 
 	private processChainActions(channelId: Buffer, actions: ChainAction[]): void {

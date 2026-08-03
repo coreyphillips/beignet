@@ -72,7 +72,7 @@ function makeJournal(
 		storage?: SqliteStorage;
 		durability?: RecoveryDurability;
 		retainFrom?: () => bigint;
-		maxRetainedFrames?: number;
+		maxRetainedFrameGap?: number;
 		snapshotIntervalFrames?: number;
 	} = {}
 ): IJournalFixture {
@@ -87,7 +87,7 @@ function makeJournal(
 		{
 			durability: options.durability,
 			retainFrom: options.retainFrom,
-			maxRetainedFrames: options.maxRetainedFrames,
+			maxRetainedFrameGap: options.maxRetainedFrameGap,
 			snapshotIntervalFrames: options.snapshotIntervalFrames,
 			onDurabilityRefused: (detail): void => {
 				refusals.push(detail);
@@ -432,7 +432,7 @@ describe('Recovery phase 6: compaction never outruns a replica', () => {
 		const fixture = makeJournal({
 			durability: 'quorum',
 			snapshotIntervalFrames: 2,
-			maxRetainedFrames: 3,
+			maxRetainedFrameGap: 3,
 			retainFrom: (): bigint => 1n
 		});
 		for (let i = 0; i < 10; i++) commitOne(fixture.manager, i);

@@ -116,6 +116,8 @@ export class DurabilityBarrier {
 	private supersededBy: GuardianState | undefined;
 	private stopped = false;
 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
+	/** Resolves the pump's in-flight delay, so a stop does not strand it. */
+	private wakeRetry: (() => void) | null = null;
 	private fenceListeners: Array<(superseding?: GuardianState) => void> = [];
 	private durableListeners: Array<(through: bigint) => void> = [];
 
@@ -249,10 +251,7 @@ export class DurabilityBarrier {
 	stop(): void {
 		if (this.stopped) return;
 		this.stopped = true;
-		if (this.retryTimer) {
-			clearTimeout(this.retryTimer);
-			this.retryTimer = null;
-		}
+		this.cancelRetry();
 		this.settleAll({ released: false, reason: 'stopped' });
 	}
 
@@ -272,6 +271,17 @@ export class DurabilityBarrier {
 	}
 
 	// ─────────────── internals ───────────────
+
+	/** Clear a pending retry AND release the frame awaiting it. */
+	private cancelRetry(): void {
+		if (this.retryTimer) {
+			clearTimeout(this.retryTimer);
+			this.retryTimer = null;
+		}
+		const wake = this.wakeRetry;
+		this.wakeRetry = null;
+		if (wake) wake();
+	}
 
 	private emit(event: IDurabilityBarrierEvent): void {
 		this.config.onEvent?.(event);
@@ -325,10 +335,7 @@ export class DurabilityBarrier {
 		if (this.fenced) return;
 		this.fenced = true;
 		this.supersededBy = superseding;
-		if (this.retryTimer) {
-			clearTimeout(this.retryTimer);
-			this.retryTimer = null;
-		}
+		this.cancelRetry();
 		this.emit({
 			type: 'barrier:fenced',
 			detail:
@@ -360,11 +367,20 @@ export class DurabilityBarrier {
 
 	private async delay(ms: number): Promise<void> {
 		await new Promise<void>((resolve) => {
+			if (this.stopped) {
+				resolve();
+				return;
+			}
 			this.retryTimer = setTimeout(() => {
 				this.retryTimer = null;
+				this.wakeRetry = null;
 				resolve();
 			}, ms);
 			this.retryTimer.unref?.();
+			// stop() resolves through this rather than only clearing the timer:
+			// clearTimeout alone leaves the awaiting async frame suspended
+			// forever, retaining the whole barrier object graph.
+			this.wakeRetry = resolve;
 		});
 	}
 
@@ -382,17 +398,22 @@ export class DurabilityBarrier {
 				this.kicked = false;
 				const lease = this.config.lease();
 				if (!lease) {
-					// Ownership is unsettled. Waiters keep waiting until their own
-					// timeout: an unowned namespace cannot certify anything, and
-					// releasing here would be exactly the unproven send the barrier
-					// exists to prevent.
+					// Ownership is unsettled. Releasing here would be exactly the
+					// unproven send the barrier exists to prevent, so waiters keep
+					// waiting. But they must keep waiting on a RETRY rather than
+					// on their own timeout: ownership settles asynchronously at
+					// startup, often milliseconds later, and nothing else kicks
+					// the pump when it does. Returning outright would freeze a
+					// channel for the full timeout over a race with startup.
 					this.emit({
 						type: 'barrier:unreachable',
 						detail:
 							'no writer lease is held yet, so nothing can be proven durable',
 						waiting: this.waiters.length
 					});
-					return;
+					if (this.waiters.length === 0 && !this.kicked) return;
+					await this.delay(this.retryDelayMs);
+					continue;
 				}
 				try {
 					const result = await this.config.replicator.replicatePending(lease);

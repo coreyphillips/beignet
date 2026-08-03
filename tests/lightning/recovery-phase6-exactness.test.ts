@@ -382,6 +382,27 @@ describe('Recovery phase 6: the proof is evidence, not configuration', () => {
 				{ certified, recoveryId: ROOT.recoveryId, head }
 			)
 		).to.equal(false);
+		// And the certified state has to agree, not just the proof's own copy
+		// of it: mutating one side alone would only be testing an equality.
+		const elsewhere: GuardianState = {
+			...certified,
+			logHead: { ...certified.logHead, frameHash: sha('different-chain') }
+		};
+		expect(
+			verifyWireSafetyProof(derived(), {
+				certified: elsewhere,
+				recoveryId: ROOT.recoveryId,
+				head
+			})
+		).to.equal(false);
+		// The frame the proof describes has to be the frame at that position.
+		expect(
+			verifyWireSafetyProof(derived(), {
+				certified,
+				recoveryId: ROOT.recoveryId,
+				head: { ...head, sequence: 11n }
+			})
+		).to.equal(false);
 	});
 
 	it('a proof over a head that does not declare quorum does not verify', () => {

@@ -976,6 +976,17 @@ export class RestoreDriver {
 				JOURNAL_META_KEYS.lastSnapshot,
 				String(rows[0]?.sequence ?? 0)
 			);
+			// Carry the quorum promise across the restore. The floor is the
+			// second, independent source the sticky rule leans on; without it
+			// a restored device would enforce the rule on the tip frame alone,
+			// which is exactly the single point of evidence the floor exists
+			// to back up.
+			if (wireSafe) {
+				targetStorage.setRecoveryMeta!(
+					JOURNAL_META_KEYS.durabilityFloor,
+					'quorum'
+				);
+			}
 			reconstructFromFrames(targetStorage, frames);
 			// StateUncertain (5.6), unless the restore can PROVE it is exact.
 			//
