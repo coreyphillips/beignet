@@ -30,6 +30,10 @@ import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChainBackend } from '../../src/lightning/chain/chain-watcher';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import {
+	deserializeChannelState,
+	serializeChannelState
+} from '../../src/lightning/storage/serialization';
 
 bitcoin.initEccLib(ecc);
 
@@ -696,5 +700,95 @@ describe('Funding authorization survives a restart', function () {
 		expect(order).to.contain('authorized');
 
 		alice2.destroy();
+	});
+});
+
+describe('Funding payload and retry survive what the process does not', function () {
+	it('the exact transaction rides the CHANNEL state, not just node metadata', async function () {
+		// A guardian restore rebuilds channels from frames and has none of the
+		// node's generic metadata. The frame that records funding_signed proves
+		// the broadcast is owed; without the bytes beside it there is nothing to
+		// broadcast, and the transaction cannot be rebuilt from the txid.
+		let fundingTxidHex = '';
+		let builtHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				builtHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId()
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(61, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(62));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+
+		const state = alice.getChannelManager().listChannels()[0].getFullState();
+		expect(state.fundingTxid?.toString('hex')).to.equal(fundingTxidHex);
+		expect(state.pendingFundingTxHex).to.equal(builtHex);
+
+		// And it survives the serialization the journal frame carries.
+		const round = deserializeChannelState(serializeChannelState(state));
+		expect(round.pendingFundingTxHex).to.equal(builtHex);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a transport failure does NOT void the channel; a conflict does', async function () {
+		for (const [message, shouldVoid] of [
+			['connection reset by peer', false],
+			['bad-txns-inputs-missingorspent', true]
+		] as Array<[string, boolean]>) {
+			let fundingTxidHex = '';
+			const provider: IFundingProvider = {
+				buildFundingTransaction: async (address, amountSats) => {
+					const built = buildMockFundingTx(address, Number(amountSats));
+					fundingTxidHex = built.txid.toString('hex');
+					return built;
+				},
+				broadcastTransaction: async () => {
+					throw new Error(message);
+				}
+			};
+			const alice = new LightningNode(
+				makeNodeConfig(63, {
+					fundingProvider: provider,
+					chainBackend: new ControlledBackend()
+				})
+			);
+			const bob = new LightningNode(makeNodeConfig(64));
+			alice.on('node:error', () => {});
+			bob.on('node:error', () => {});
+			connectNodes(alice, bob);
+			const channel = alice.openChannel(bob.getNodeId(), 500_000n);
+			await tick();
+			const channelId = channel.getChannelId()!;
+			const displayTxid = Buffer.from(fundingTxidHex, 'hex')
+				.reverse()
+				.toString('hex');
+
+			alice.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+			await tick(80);
+
+			// A dropped socket says nothing about validity and the per-block
+			// retry answers it. Only a conflict means the output can never
+			// exist, and only that may destroy the channel.
+			expect(
+				alice.getChannelManager().getChannel(channelId) === undefined,
+				`voided for "${message}"`
+			).to.equal(shouldVoid);
+
+			alice.destroy();
+			bob.destroy();
+		}
 	});
 });

@@ -1086,3 +1086,59 @@ describe('Recovery phase 6: a restart asks the barrier, it does not assume', () 
 		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
 	});
 });
+
+describe('Recovery phase 6: a refused terminal close leaves the queue alone', () => {
+	it('a force close that REFUSES does not consume the batch it would replace', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const idHex = channelId.toString('hex');
+		// A channel that must not broadcast: restored, unprovable state. Its
+		// forceClose refuses rather than putting a possibly stale commitment on
+		// chain, and that refusal must not cost it the recovery declaration it
+		// is already holding.
+		const channel = {
+			setLocalNodeIdLower: (): void => undefined,
+			getChannelId: (): Buffer => channelId,
+			getTemporaryChannelId: (): Buffer | null => null,
+			getState: (): ChannelState => ChannelState.NORMAL,
+			markForReestablish: (): void => undefined,
+			getSigner: (): unknown => ({}),
+			channelKeyIndex: 0,
+			forceClose: (): ChannelAction[] => [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Refusing to broadcast: restored state is not proven current'
+				} as ChannelAction
+			],
+			getFullState: (): unknown => ({ channelId })
+		} as unknown as Channel;
+		(
+			harness.manager as unknown as {
+				channels: Map<string, Channel>;
+				channelPeers: Map<string, string>;
+			}
+		).channels.set(idHex, channel);
+		(
+			harness.manager as unknown as { channelPeers: Map<string, string> }
+		).channelPeers.set(idHex, PEER);
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			declare(MessageType.ERROR)
+		]);
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(1);
+
+		const result = harness.manager.forceClose(channelId, Buffer.alloc(22), 10);
+		expect(result.ok).to.equal(false);
+
+		// The held declaration is still held, and still releases on its own
+		// frame. A failed terminal operation must not consume the operation it
+		// was meant to replace.
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(1);
+		expect(harness.broadcasts).to.equal(0);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([MessageType.ERROR]);
+	});
+});

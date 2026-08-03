@@ -375,6 +375,21 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 ]);
 
 /**
+ * Does this broadcast rejection prove the funding output can never exist?
+ *
+ * Voiding a channel destroys it, so it needs evidence that the NETWORK refused
+ * the transaction: an input already spent, or a conflict with something
+ * confirmed. Everything else a backend can answer with, a timeout, a dropped
+ * socket, a rate limit, or an already-known acknowledgement, says nothing
+ * about validity and is answered by the per-block retry instead.
+ */
+function isFundingConflictRejection(message: string): boolean {
+	return /txn-mempool-conflict|bad-txns-inputs-missingorspent|conflict|already spent|missing inputs|txn-already-in-mempool-conflict/i.test(
+		message
+	);
+}
+
+/**
  * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
  * the network.
  *
@@ -524,8 +539,20 @@ export class LightningNode extends EventEmitter {
 	 * is persisted so a restart resumes the obligation.
 	 */
 	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
-	/** Funding txids with a re-authorization request already in flight. */
-	private pendingFundingReauth: Set<string> = new Set();
+	/**
+	 * When a re-authorization was last asked for, keyed by funding txid or, for
+	 * a splice, by channel id.
+	 *
+	 * Two jobs, and the second is why this is a timestamp rather than a flag. A
+	 * request still parked behind the barrier must not be duplicated, which the
+	 * awaiting-durability check answers. A request that ENDED without being
+	 * granted, because the barrier timed out or refused, has to be asked again,
+	 * or a transient guardian outage would strand the obligation until the next
+	 * process restart. Asking again on every block would mint a no-op frame per
+	 * block while the quorum is down, so the retry is spaced.
+	 */
+	private reauthAttempts: Map<string, number> = new Map();
+	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
@@ -2457,7 +2484,7 @@ export class LightningNode extends EventEmitter {
 			const txidHex = fundingTxid.toString('hex');
 			const entry = this.pendingFundingTxs.get(txidHex);
 			if (entry) entry.phase = 'authorized';
-			this.pendingFundingReauth.delete(txidHex);
+			this.reauthAttempts.delete(txidHex);
 			this.broadcastPendingFundingTx(txidHex);
 		});
 
@@ -3654,6 +3681,11 @@ export class LightningNode extends EventEmitter {
 				// claimed the funding_created to watch:funding chain completed
 				// synchronously, which held only in loopback and is exactly what
 				// let a block broadcast it mid-handshake.
+				// The payload rides the CHANNEL state, so the frame that records
+				// funding_signed carries the bytes beside the obligation and a
+				// guardian restore can actually discharge what it restores. The
+				// node's own map stays as the runtime index.
+				state.pendingFundingTxHex = txHex;
 				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
 				// Send funding_created. The broadcast now waits for the
@@ -3736,6 +3768,18 @@ export class LightningNode extends EventEmitter {
 
 	/** Drop a broadcast obligation (confirmed, or its channel is gone). */
 	private deletePendingFundingTx(txidHex: string): void {
+		this.reauthAttempts.delete(txidHex);
+		// Drop the payload from channel state with the obligation it served, so
+		// a confirmed channel does not carry the transaction through every
+		// future snapshot. The write rides whatever transition retires the
+		// obligation; losing it costs nothing, since by then the funding is
+		// confirmed or the channel is gone.
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			delete state.pendingFundingTxHex;
+			break;
+		}
 		if (this.pendingFundingTxs.delete(txidHex)) {
 			this.persistPendingFundingTxs();
 		}
@@ -3790,18 +3834,86 @@ export class LightningNode extends EventEmitter {
 	 * cleared when the authorization is granted, and on a refusal the next
 	 * sweep asks again, which is the retry this obligation is supposed to have.
 	 */
+	/**
+	 * Is this retained transaction owed but not yet allowed out?
+	 *
+	 * True exactly while the obligation exists and the authorization does not:
+	 * a candidate whose funding_signed has arrived but whose authorization is
+	 * still parked, or a restored entry that has not been re-asked yet. It
+	 * separates "we are deliberately not broadcasting this" from "this channel
+	 * is fiction", which is a distinction the absence of a transaction on chain
+	 * cannot make on its own.
+	 */
+	private awaitingFundingAuthorization(txidHex: string): boolean {
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry || entry.phase === 'authorized') return false;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			// The same two conditions the live path establishes at
+			// funding_signed. Without them this is an open that never got that
+			// far, which genuinely has nothing to broadcast.
+			return (
+				state.state !== ChannelState.SENT_FUNDING_CREATED &&
+				!!state.remoteCommitmentSignature
+			);
+		}
+		return false;
+	}
+
 	private requestFundingReauthorization(txidHex: string): void {
-		if (this.pendingFundingReauth.has(txidHex)) return;
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) return;
-			this.pendingFundingReauth.add(txidHex);
+			if (!this.mayAskForReauthorization(txidHex, id.toString('hex'))) return;
+			this.reauthAttempts.set(txidHex, Date.now());
 			if (!this.channelManager.reauthorizeFundingBroadcast(id)) {
-				this.pendingFundingReauth.delete(txidHex);
+				this.reauthAttempts.delete(txidHex);
 			}
 			return;
+		}
+	}
+
+	/**
+	 * Is a fresh re-authorization request due for this key?
+	 *
+	 * No while the channel is still holding messages, because the request that
+	 * is parked IS the outstanding one. Yes once it is not, subject to the
+	 * spacing: the previous request ended, and if it had been granted the
+	 * obligation would no longer be asking.
+	 */
+	private mayAskForReauthorization(key: string, channelIdHex: string): boolean {
+		if (this.channelManager.channelsAwaitingDurability().has(channelIdHex)) {
+			return false;
+		}
+		const last = this.reauthAttempts.get(key);
+		if (last === undefined) return true;
+		return Date.now() - last >= LightningNode.REAUTH_RETRY_MS;
+	}
+
+	/**
+	 * Re-ask for every fully signed splice that has not confirmed.
+	 *
+	 * Startup asks once, and a refusal there would otherwise strand the splice
+	 * until the next restart. A splice creates a funding output, so its
+	 * rebroadcast is an obligation on exactly the same footing as a v1
+	 * funding one and gets the same block-driven retry.
+	 */
+	private retryPendingSpliceBroadcasts(): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const inflight = state.spliceInFlight;
+			if (!inflight?.fullySigned) continue;
+			const id = state.channelId ?? state.temporaryChannelId;
+			if (!id) continue;
+			const idHex = id.toString('hex');
+			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
+			this.reauthAttempts.set(idHex, Date.now());
+			if (!this.channelManager.reauthorizeSpliceBroadcast(id)) {
+				this.reauthAttempts.delete(idHex);
+			}
 		}
 	}
 
@@ -3874,6 +3986,28 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			this.broadcastPendingFundingTx(txidHex);
+		}
+	}
+
+	/**
+	 * Rebuild the runtime index from RESTORED CHANNEL STATE.
+	 *
+	 * This is the half that survives a guardian restore. The node's generic
+	 * metadata is local and best effort, and a device restored from frames
+	 * alone has none of it; the channel row does carry the transaction, because
+	 * it rides the same frame as the obligation. Entries land as 'restored', so
+	 * they still have to ask for a fresh authorization before anything is sent.
+	 */
+	private restorePendingFundingFromChannels(): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid || !state.pendingFundingTxHex) continue;
+			const txidHex = state.fundingTxid.toString('hex');
+			if (this.pendingFundingTxs.has(txidHex)) continue;
+			this.pendingFundingTxs.set(txidHex, {
+				txHex: state.pendingFundingTxHex,
+				phase: 'restored'
+			});
 		}
 	}
 
@@ -4899,14 +5033,27 @@ export class LightningNode extends EventEmitter {
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
 				const pending = this.pendingFundingTxs.get(internalHex);
 				const pendingHex = pending?.txHex;
+				// ABSENT IS NOT THE SAME AS FICTION, and the difference is the
+				// whole disposition here. This alarm fires after three checks
+				// find nothing, and it does not require that the transaction was
+				// ever seen, so a transaction we are deliberately NOT
+				// broadcasting looks exactly like an evicted one. A channel
+				// whose authorization is merely waiting on the quorum must not
+				// be voided for that: it would delete the channel, its watch,
+				// its state and the one signed transaction that discharges the
+				// obligation, over a transient guardian outage. Only a channel
+				// with no retained transaction at all, or one that never reached
+				// funding_signed, is genuinely fiction.
+				if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
+					this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
+						channelId: channelId.toString('hex'),
+						txid
+					});
+					this.requestFundingReauthorization(internalHex);
+					return;
+				}
 				// This route bypasses broadcastPendingFundingTx, so it needs the
-				// same authorization. It is genuinely reachable before
-				// funding_signed: restoreChainWatches arms a funding watch on a
-				// SENT_FUNDING_CREATED channel, and a transaction that was never
-				// broadcast is absent from mempool and chain by construction,
-				// which is exactly what funding:missing reports. Falling through
-				// to the void below is then the right disposition: a channel
-				// whose funding was never authorized and never sent is fiction.
+				// same authorization.
 				if (
 					pendingHex &&
 					this.fundingProvider &&
@@ -4924,11 +5071,21 @@ export class LightningNode extends EventEmitter {
 							});
 						})
 						.catch((err) => {
+							const message = (err as Error)?.message ?? String(err);
 							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
 								channelId: channelId.toString('hex'),
 								txid,
-								error: (err as Error).message
+								error: message
 							});
+							// Voiding destroys a channel whose funding may be
+							// perfectly valid, so it needs evidence that the
+							// NETWORK rejected the transaction, not merely that
+							// the call failed. A timeout, a dropped connection or
+							// an already-known answer say nothing about validity,
+							// and the per-block retry is the right answer to all
+							// three. Only a conflict or an invalid-input verdict
+							// means the funding output can never exist.
+							if (!isFundingConflictRejection(message)) return;
 							this.voidMissingFundingChannel(channelId, txid);
 						});
 					return;
@@ -4986,7 +5143,11 @@ export class LightningNode extends EventEmitter {
 			// Resume the broadcast obligation for signed funding txs that never
 			// confirmed (crash between funding_signed and broadcast, or an
 			// eviction while we were down). Retries again on every new block.
+			// Channels are restored by now, so the payload that rode their
+			// frames can seed the runtime index before the sweep asks about it.
+			this.restorePendingFundingFromChannels();
 			this.retryPendingFundingBroadcasts();
+			this.retryPendingSpliceBroadcasts();
 			// Start reconnect monitor on ElectrumBackend to resume subscriptions after drops
 			if (
 				this._chainBackend &&
@@ -12302,6 +12463,7 @@ export class LightningNode extends EventEmitter {
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
 		this.retryPendingFundingBroadcasts();
+		this.retryPendingSpliceBroadcasts();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
