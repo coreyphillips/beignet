@@ -40,6 +40,7 @@ import {
 	readTipDurability,
 	reconstructFromFrames
 } from '../../src/lightning/recovery';
+import { WIRE_SAFETY_POLICY_VERSION } from '../../src/lightning/channel/channel-actions';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
 // ─────────────── Fixtures ───────────────
@@ -208,6 +209,66 @@ describe('Recovery phase 6: the durability a frame declares', () => {
 					.equals(rows[i].frameHash)
 			).to.equal(true);
 		}
+		fixture.storage.close();
+	});
+
+	it('a quorum frame stamps the policy its writer enforced, hash included', () => {
+		const fixture = makeJournal({ durability: 'quorum' });
+		commitOne(fixture.manager, 1);
+		commitOne(fixture.manager, 2);
+		const rows = fixture.storage.loadRecoveryFrames();
+		const frames = loadFrames(fixture.storage);
+
+		for (let i = 0; i < frames.length; i++) {
+			// A bare 'quorum' is a claim about WHICH messages waited, and that
+			// claim is only as strong as the policy in force when it was made.
+			expect(frames[i].durabilityPolicy).to.equal(WIRE_SAFETY_POLICY_VERSION);
+			const reEncoded = encodeFrame(frames[i]);
+			expect(
+				crypto
+					.createHash('sha256')
+					.update(reEncoded)
+					.digest()
+					.equals(rows[i].frameHash)
+			).to.equal(true);
+		}
+		fixture.storage.close();
+	});
+
+	it('a quorum declaration with NO policy version is corruption', () => {
+		const fixture = makeJournal({ durability: 'quorum' });
+		commitOne(fixture.manager, 1);
+		const frames = loadFrames(fixture.storage);
+		const encoded = JSON.parse(encodeFrame(frames[0]).toString('utf8'));
+		delete encoded.durabilityPolicy;
+
+		// No released build has ever written a quorum frame, so nothing
+		// legitimate can produce this shape. Decoding it cleanly would be the
+		// laundering path the stamp exists to close.
+		expect(() =>
+			decodeFrame(Buffer.from(JSON.stringify(encoded), 'utf8'))
+		).to.throw(/policy version/);
+		fixture.storage.close();
+	});
+
+	it('a weaker mode carries no stamp, so its bytes did not move', () => {
+		const fixture = makeJournal({ durability: 'local' });
+		commitOne(fixture.manager, 1);
+		const rows = fixture.storage.loadRecoveryFrames();
+		const frames = loadFrames(fixture.storage);
+
+		expect(frames[0].durabilityPolicy).to.equal(undefined);
+		const reEncoded = encodeFrame(frames[0]);
+		expect(JSON.parse(reEncoded.toString('utf8')).durabilityPolicy).to.equal(
+			undefined
+		);
+		expect(
+			crypto
+				.createHash('sha256')
+				.update(reEncoded)
+				.digest()
+				.equals(rows[0].frameHash)
+		).to.equal(true);
 		fixture.storage.close();
 	});
 

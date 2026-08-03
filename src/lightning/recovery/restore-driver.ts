@@ -63,7 +63,6 @@ import {
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import { RecoveryFrame } from './types';
 import {
 	IWireSafetyProof,
 	deriveWireSafetyProof,
@@ -905,7 +904,7 @@ export class RestoreDriver {
 		}));
 		// The chain is verified against the CERTIFIED head, not against
 		// whatever the download happened to contain.
-		const frames: RecoveryFrame[] = verifyFrameChain(
+		const frames = verifyFrameChain(
 			rows,
 			{
 				tipSequence: certified.logHead.sequence.toString(),

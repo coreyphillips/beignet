@@ -38,6 +38,7 @@ import {
 	RecoveryManager,
 	ReferenceGuardian,
 	RestoreDriver,
+	VerifiedRecoveryChain,
 	computeGuardianSetId,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
@@ -45,6 +46,11 @@ import {
 	verifyWireSafetyProof,
 	xOnlyFromSecret
 } from '../../src/lightning/recovery';
+import {
+	QUORUM_BARRIER_MESSAGE_TYPES,
+	WIRE_SAFETY_POLICY_VERSION
+} from '../../src/lightning/channel/channel-actions';
+import { MessageType } from '../../src/lightning/message/types';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -316,7 +322,8 @@ describe('Recovery phase 6: the proof is evidence, not configuration', () => {
 		timestamp: 0,
 		mutations: [],
 		outboundMessages: [],
-		durability: 'quorum'
+		durability: 'quorum',
+		durabilityPolicy: WIRE_SAFETY_POLICY_VERSION
 	};
 	const certified: GuardianState = {
 		recoveryId: ROOT.recoveryId,
@@ -330,8 +337,20 @@ describe('Recovery phase 6: the proof is evidence, not configuration', () => {
 		}
 	};
 
+	/**
+	 * These cases exercise the acceptance PREDICATE, not chain authenticity,
+	 * which verifyFrameChain owns and its own tests cover. The brand makes
+	 * that escape explicit and greppable rather than eliminating it.
+	 */
+	const asChain = (frames: RecoveryFrame[]): VerifiedRecoveryChain =>
+		frames as VerifiedRecoveryChain;
+
 	function derived(): IWireSafetyProof {
-		const result = deriveWireSafetyProof(certified, [head], ROOT.recoveryId);
+		const result = deriveWireSafetyProof(
+			certified,
+			asChain([head]),
+			ROOT.recoveryId
+		);
 		expect(result.proven).to.equal(true);
 		return (result as { proof: IWireSafetyProof }).proof;
 	}
@@ -418,14 +437,115 @@ describe('Recovery phase 6: the proof is evidence, not configuration', () => {
 
 	it('derivation refuses a chain that does not END at the certified head', () => {
 		const short: RecoveryFrame = { ...head, sequence: 11n };
-		const result = deriveWireSafetyProof(certified, [short], ROOT.recoveryId);
+		const result = deriveWireSafetyProof(
+			certified,
+			asChain([short]),
+			ROOT.recoveryId
+		);
 		expect(result.proven).to.equal(false);
 		expect((result as { reason: string }).reason).to.equal('head-mismatch');
 	});
 
 	it('derivation refuses an empty restore rather than calling it exact', () => {
-		const result = deriveWireSafetyProof(certified, [], ROOT.recoveryId);
+		const result = deriveWireSafetyProof(
+			certified,
+			asChain([]),
+			ROOT.recoveryId
+		);
 		expect(result.proven).to.equal(false);
 		expect((result as { reason: string }).reason).to.equal('no-frames');
+	});
+});
+
+describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
+	const certified: GuardianState = {
+		recoveryId: ROOT.recoveryId,
+		lease: { epoch: 3n, writerPublicKey: Buffer.alloc(32, 7) },
+		origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+		logHead: {
+			sequence: 12n,
+			frameHash: sha('policy-head'),
+			ciphertextHash: sha('policy-ciphertext'),
+			recordEpoch: 1n
+		}
+	};
+	const head: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 12n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [],
+		outboundMessages: [],
+		durability: 'quorum',
+		durabilityPolicy: WIRE_SAFETY_POLICY_VERSION
+	};
+	const asChain = (frames: RecoveryFrame[]): VerifiedRecoveryChain =>
+		frames as VerifiedRecoveryChain;
+
+	it('a head written under an UNKNOWN policy proves nothing', () => {
+		// The threat is cross build: a device on policy 1 writes 'quorum', and
+		// a later release that widened the gated set reads that bare word as a
+		// promise about messages the writer never held back.
+		const future: RecoveryFrame = {
+			...head,
+			durabilityPolicy: WIRE_SAFETY_POLICY_VERSION + 1
+		};
+		const result = deriveWireSafetyProof(
+			certified,
+			asChain([future]),
+			ROOT.recoveryId
+		);
+		expect(result.proven).to.equal(false);
+		expect((result as { reason: string }).reason).to.equal('policy-mismatch');
+	});
+
+	it('a proof cannot claim a policy its head frame does not carry', () => {
+		const derivation = deriveWireSafetyProof(
+			certified,
+			asChain([head]),
+			ROOT.recoveryId
+		);
+		expect(derivation.proven).to.equal(true);
+		const proof = (derivation as { proof: IWireSafetyProof }).proof;
+		expect(proof.policyVersion).to.equal(WIRE_SAFETY_POLICY_VERSION);
+
+		// Overclaiming on the proof itself.
+		expect(
+			verifyWireSafetyProof(
+				{ ...proof, policyVersion: WIRE_SAFETY_POLICY_VERSION + 1 },
+				{ certified, recoveryId: ROOT.recoveryId, head }
+			)
+		).to.equal(false);
+
+		// And the load-bearing direction: a correct-looking proof over a head
+		// whose stamp disagrees. This is what makes the field evidence about
+		// the WRITER rather than a self-report by the restorer.
+		expect(
+			verifyWireSafetyProof(proof, {
+				certified,
+				recoveryId: ROOT.recoveryId,
+				head: { ...head, durabilityPolicy: WIRE_SAFETY_POLICY_VERSION + 1 }
+			})
+		).to.equal(false);
+	});
+
+	it('the gated set cannot change without bumping the policy version', () => {
+		// A frame's 'quorum' claim is only as strong as this set, so widening
+		// it without a bump would let old frames be read as promises their
+		// writers never made. Change the set, change this pin, bump the
+		// version, all in one commit.
+		expect(WIRE_SAFETY_POLICY_VERSION).to.equal(1);
+		expect(
+			[...QUORUM_BARRIER_MESSAGE_TYPES].sort((a, b) => a - b)
+		).to.deep.equal(
+			[
+				MessageType.COMMITMENT_SIGNED,
+				MessageType.REVOKE_AND_ACK,
+				MessageType.UPDATE_FULFILL_HTLC,
+				MessageType.TX_SIGNATURES,
+				MessageType.SPLICE_LOCKED
+			].sort((a, b) => a - b)
+		);
 	});
 });

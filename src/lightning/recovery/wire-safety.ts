@@ -16,10 +16,25 @@
  * evidence, and it is derived from the restore itself rather than supplied to
  * it. The argument it encodes:
  *
- *   In quorum mode no wire message leaves before the journal frame that
- *   authorized it has reached a guardian quorum. So for every message a peer
- *   ever saw, the frame behind it is at or below the certified head. A
- *   restore installed AT that head therefore holds every state the peer could
+ *   In quorum mode no IRREVERSIBLE wire message leaves before the journal
+ *   frame that authorized it has reached a guardian quorum. Irreversible
+ *   means the gated set: revoke_and_ack, commitment_signed,
+ *   update_fulfill_htlc, tx_signatures, splice_locked, and the recovery
+ *   declarations that establish the never-broadcast invariant.
+ *
+ *   The premise is narrower than "no wire message" on purpose, and the gap is
+ *   what carries the argument rather than weakening it. Everything ungated is
+ *   an UNCOMMITTED update (update_add_htlc, update_fail_htlc, update_fee), a
+ *   negotiation step that simply restarts (shutdown, closing_signed, the
+ *   interactive-tx and splice preamble) or a message the reestablish rules
+ *   regenerate (channel_ready, channel_reestablish). BOLT 2 requires the peer
+ *   to discard every one of them across a reconnect that did not commit them,
+ *   so none can leave the peer holding a commitment we do not, or a
+ *   revocation for a commitment the restored chain still believes is current.
+ *
+ *   So for every message that irrevocably advanced or discarded commitment
+ *   state, the frame behind it is at or below the certified head. A restore
+ *   installed AT that head therefore holds every such state the peer could
  *   possibly know about, and in particular can hold no commitment the peer
  *   has already seen us revoke. That is exactly the condition for resuming.
  *
@@ -33,8 +48,9 @@
  * restore cannot see.
  */
 
+import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { GuardianState } from './guardian-wire';
-import { RecoveryFrame } from './types';
+import { RecoveryFrame, VerifiedRecoveryChain } from './types';
 
 /**
  * Evidence that a restore at this head is exact. Every field is part of the
@@ -51,6 +67,13 @@ export interface IWireSafetyProof {
 	headFrameHash: Buffer;
 	/** Always `quorum`; anything else is not a proof and is never built. */
 	durability: 'quorum';
+	/**
+	 * The barrier policy the WRITER enforced, copied from the head frame's own
+	 * authenticated plaintext. Not the restorer's own constant: that would be
+	 * a self-report, and this field exists precisely so a build cannot read an
+	 * older writer's `quorum` as a promise about a set it never held.
+	 */
+	policyVersion: number;
 }
 
 /** Why a restore could not be shown to be exact. */
@@ -58,6 +81,7 @@ export type WireSafetyRefusal =
 	| 'no-frames'
 	| 'head-mismatch'
 	| 'not-quorum'
+	| 'policy-mismatch'
 	| 'namespace-mismatch';
 
 export type WireSafetyDerivation =
@@ -73,7 +97,7 @@ export type WireSafetyDerivation =
  */
 export function deriveWireSafetyProof(
 	certified: GuardianState,
-	frames: RecoveryFrame[],
+	frames: VerifiedRecoveryChain,
 	recoveryId: Buffer
 ): WireSafetyDerivation {
 	if (!certified.recoveryId.equals(recoveryId)) {
@@ -111,6 +135,26 @@ export function deriveWireSafetyProof(
 				'reached a peer before this state reached the guardians'
 		};
 	}
+	// The head declares quorum, but quorum under WHOSE policy? The stamp names
+	// the message set the writer actually held back. A version this build does
+	// not know is not corruption, it is a chain this build cannot reason
+	// about, so it refuses and the DLP fallback stays in place.
+	//
+	// Exact match rather than a range: a lower version guarantees a weaker set
+	// than the argument above assumes, and a higher one is a set this build has
+	// never seen. A future release that establishes "v2 implies v1" can add an
+	// explicit table; accepting silently is the laundering this field exists
+	// to prevent.
+	if (head.durabilityPolicy !== WIRE_SAFETY_POLICY_VERSION) {
+		return {
+			proven: false,
+			reason: 'policy-mismatch',
+			detail:
+				`the certified head was written under wire-safety policy ` +
+				`'${String(head.durabilityPolicy ?? 'none')}', and this build can ` +
+				`only reason about policy ${WIRE_SAFETY_POLICY_VERSION}`
+		};
+	}
 	return {
 		proven: true,
 		proof: {
@@ -118,7 +162,8 @@ export function deriveWireSafetyProof(
 			supersededEpoch: certified.lease.epoch,
 			headSequence: certified.logHead.sequence,
 			headFrameHash: Buffer.from(certified.logHead.frameHash),
-			durability: 'quorum'
+			durability: 'quorum',
+			policyVersion: head.durabilityPolicy
 		}
 	};
 }
@@ -138,6 +183,11 @@ export function verifyWireSafetyProof(
 ): boolean {
 	return (
 		proof.durability === 'quorum' &&
+		proof.policyVersion === WIRE_SAFETY_POLICY_VERSION &&
+		// The load-bearing one: it binds the proof's version to the FRAME's
+		// own stamp, so the field is evidence about the writer rather than a
+		// self-report by whoever built the proof.
+		against.head.durabilityPolicy === proof.policyVersion &&
 		proof.recoveryId.equals(against.recoveryId) &&
 		against.certified.recoveryId.equals(against.recoveryId) &&
 		proof.supersededEpoch === against.certified.lease.epoch &&

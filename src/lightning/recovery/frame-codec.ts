@@ -135,6 +135,7 @@ interface IEncodedFrame {
 	mutations: IEncodedMutation[];
 	outboundMessages: IEncodedOutboundMessage[];
 	durability?: RecoveryDurability;
+	durabilityPolicy?: number;
 	snapshot?: IEncodedSnapshot;
 }
 
@@ -491,6 +492,13 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 	// journals verifiable and their hashes stable.
 	if (frame.durability) {
 		encoded.durability = frame.durability;
+		// The stamp sits immediately after the declaration it qualifies, and is
+		// a pure passthrough with no default: re-encoding a decoded frame has
+		// to reproduce its stored hash byte for byte, so the codec must never
+		// invent a value the writer did not put there.
+		if (frame.durabilityPolicy !== undefined) {
+			encoded.durabilityPolicy = frame.durabilityPolicy;
+		}
 	}
 	if (frame.snapshot) {
 		encoded.snapshot = encodeSnapshot(frame.snapshot);
@@ -524,6 +532,30 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 			);
 		}
 		frame.durability = encoded.durability;
+	}
+	if (encoded.durabilityPolicy !== undefined) {
+		if (
+			!Number.isInteger(encoded.durabilityPolicy) ||
+			encoded.durabilityPolicy < 1
+		) {
+			throw new Error(
+				`Unsupported recovery frame durability policy: ${String(
+					encoded.durabilityPolicy
+				)}`
+			);
+		}
+		frame.durabilityPolicy = encoded.durabilityPolicy;
+	} else if (frame.durability === 'quorum') {
+		// A quorum declaration with no stamp is CORRUPTION, not an old writer:
+		// no released build has ever written a quorum frame, so nothing
+		// legitimate can produce this. Structural validity throws here.
+		// Whether a well formed version is one this build understands is a
+		// different question, answered by a refusal in deriveWireSafetyProof,
+		// so a newer writer's journal still restores down the DLP path rather
+		// than failing to restore at all.
+		throw new Error(
+			`Recovery journal frame ${frame.sequence} declares quorum durability with no policy version`
+		);
 	}
 	if (encoded.snapshot) {
 		frame.snapshot = decodeSnapshot(encoded.snapshot);

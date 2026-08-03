@@ -141,4 +141,16 @@ make those tests meaningful.
   are never held, and outside quorum mode nothing is: the barrier answers
   synchronously and dispatch is unchanged. The gated set is
   `QUORUM_BARRIER_MESSAGE_TYPES` in `src/lightning/channel/channel-actions.ts`,
-  one entry per row of spec 5.8.)
+  one entry per row of spec 5.8, EXCEPT the data-loss `error`. That row is
+  carried by the per-action `durabilityCritical` mark instead, because `error`
+  is also BOLT 1's ordinary protocol-violation message and the two are
+  different in kind: an ordinary error advances no commitment state, is not
+  retransmittable, and drives the local force close from the same send, so
+  holding it would cost a channel its on-chain close for no safety gain.
+  Losing the record that broadcasting is FORBIDDEN, by contrast, re-enables
+  broadcasting a commitment the peer has provably revoked. A gated message
+  with no `PERSIST_STATE` ahead of it names no frame and is refused outright.
+  The set plus the mark are versioned together by
+  `WIRE_SAFETY_POLICY_VERSION`, stamped into every quorum frame, so a later
+  release cannot read an older frame's `quorum` as a promise about messages
+  its writer never gated.)

@@ -25,6 +25,7 @@
  */
 
 import { createCipheriv, createDecipheriv } from 'crypto';
+import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
@@ -37,7 +38,8 @@ import {
 	RecoveryFrame,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
-	RecoverySnapshot
+	RecoverySnapshot,
+	VerifiedRecoveryChain
 } from './types';
 
 const IV_LENGTH = 12;
@@ -594,7 +596,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * and a truncated tail (chain ends below the recorded tip). Throws on the
 	 * first violation; returns the decoded frames on success.
 	 */
-	loadVerifiedFrames(): RecoveryFrame[] {
+	loadVerifiedFrames(): VerifiedRecoveryChain {
 		return verifyFrameChain(
 			this.storage.loadRecoveryFrames!(),
 			{
@@ -654,7 +656,15 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
 		// all carry the same declaration; a snapshot that omitted it would be a
 		// certified head that says nothing about what its writer promised.
-		if (this.durability) frame.durability = this.durability;
+		if (this.durability) {
+			frame.durability = this.durability;
+			// Only quorum frames carry a policy stamp, because only they make a
+			// claim about which messages waited. Local and async-remote frames
+			// keep exactly the bytes they had before.
+			if (this.durability === 'quorum') {
+				frame.durabilityPolicy = WIRE_SAFETY_POLICY_VERSION;
+			}
+		}
 		const plaintext = encodeFrame(frame);
 		const frameHash = hashFrame(plaintext);
 		const key = deriveFrameKey(this.masterKey, this.nodeId, frame.writerEpoch);
@@ -879,7 +889,7 @@ export function verifyFrameChain(
 	meta: IFrameChainMeta,
 	masterKey: Buffer,
 	nodeId: Buffer
-): RecoveryFrame[] {
+): VerifiedRecoveryChain {
 	const frames: RecoveryFrame[] = [];
 	let previousHash: Buffer | null = null;
 	let previousSequence: bigint | null = null;
@@ -978,7 +988,7 @@ export function verifyFrameChain(
 		}
 	}
 
-	return frames;
+	return frames as VerifiedRecoveryChain;
 }
 
 /**

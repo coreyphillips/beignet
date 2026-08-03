@@ -230,8 +230,40 @@ export interface RecoveryFrame {
 	 * a certified head that still reads `quorum`.
 	 */
 	durability?: RecoveryDurability;
+	/**
+	 * The barrier-policy version the writer enforced, present exactly when
+	 * `durability` is `quorum` (Phase 6, spec 5.8).
+	 *
+	 * A bare `quorum` is a claim about WHICH messages its writer held back,
+	 * and that claim is only as strong as the policy in force when the frame
+	 * was written. Without this, a later release that widened the gated set
+	 * would read an old frame's `quorum` as a promise about messages that
+	 * frame's writer never gated, and resume a channel on evidence nobody
+	 * produced.
+	 *
+	 * It has to live HERE, in the AEAD-authenticated plaintext covered by the
+	 * frame hash the guardians certified, rather than on the proof object. The
+	 * proof is built by the RESTORER from its own constant, so a version there
+	 * would be checked against itself and would describe the wrong device.
+	 */
+	durabilityPolicy?: number;
 	snapshot?: RecoverySnapshot;
 }
+
+declare const verifiedRecoveryChain: unique symbol;
+
+/**
+ * A frame array verifyFrameChain has ACCEPTED.
+ *
+ * deriveWireSafetyProof reasons about authenticity it does not itself check,
+ * and a doc comment asking callers to pass verified frames is not enforcement.
+ * Only verifyFrameChain mints this type, so a future restore path cannot hand
+ * the proof a chain nobody authenticated. An intersection rather than a
+ * wrapper, so every existing consumer keeps its signature.
+ */
+export type VerifiedRecoveryChain = RecoveryFrame[] & {
+	readonly [verifiedRecoveryChain]: true;
+};
 
 /**
  * A frame as stored: AEAD ciphertext plus the chain fields kept in the clear
