@@ -133,4 +133,12 @@ make those tests meaningful.
 - No capsule, guardian, epoch or quorum barrier (Phases 3 to 6).
 - No change to SCB behavior; it remains the Tier 1 fallback.
 - `RecoveryCriticality` is recorded but not yet acted on: there is no durability
-  barrier to gate until Phase 6.
+  barrier to gate until Phase 6. (Since delivered by Phase 6: in quorum mode a
+  `SafetyCritical` batch carrying `revoke_and_ack`, `update_fulfill_htlc`,
+  `commitment_signed`, `tx_signatures`, `splice_locked` or the data-loss
+  `error` holds the REST of its action list until the journal frame behind it
+  has reached a guardian quorum. `Important` and `Reconstructable` transitions
+  are never held, and outside quorum mode nothing is: the barrier answers
+  synchronously and dispatch is unchanged. The gated set is
+  `QUORUM_BARRIER_MESSAGE_TYPES` in `src/lightning/channel/channel-actions.ts`,
+  one entry per row of spec 5.8.)

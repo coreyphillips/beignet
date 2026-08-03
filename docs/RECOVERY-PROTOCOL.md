@@ -2,10 +2,11 @@
 
 Replicated, cryptographically versioned state continuity for Lightning channels, with channel-preserving restore and split-brain fencing.
 
-Status: Phases 1 to 4 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279; guardian protocol with the reference guardian, transports and quorum client, PRs #282 and #283); Phase 5 (writer epochs, split-brain fencing, startup quarantine, per-channel recovery status) in PR #284; Phases 6 and 7 not started
+Status: Phases 1 to 5 implemented (safety transition layer + durable outbox, PR #273; hash-chained journal with snapshots, compaction and deterministic reconstruction, PR #278; Recovery Capsule over peer_storage with validated multi-candidate restore, PR #279; guardian protocol with the reference guardian, transports and quorum client, PRs #282 and #283; writer epochs, split-brain fencing, startup quarantine and the per-channel recovery status machine, PR #284); Phase 6 (quorum durability barriers, pipelined appends, and the wire-safety proof that lets a quorum restore resume) in PR #287; Phase 7 not started
 Revision 2 (2026-07-23): epoch acquisition is now a compare-and-swap takeover and restoration fences before reconstructing; reestablish is described as a consistency gate, not a proof of exact recovery; uncertain recovery states may never broadcast the stored local commitment
 Revision 3 (2026-07-27): applied an external design review of revision 2. Guardians gain explicit durability obligations and the backfill verbs SYNC_RECORD and SYNC_EPOCH; restoration gains a head reconciliation algorithm over a read quorum with stale-guardian repair (5.7); the node-wide journal ordering question is decided with pipelined appends and cumulative receipts (5.3); ephemeral signing sessions get a nonce-reuse invariant and a four-way disposition classification (5.10); Phase 4 gains an exact wire specification deliverable and a written comparison against LDK's Versioned Storage Service; a prior art and standardization path section was added (12)
 Revision 4 (2026-08-01): the Phase 4 gating deliverables. The guardian transport is decided and recorded (12.1): HTTP/protobuf over v3 onion services and HTTPS/protobuf over clearnet are both first-class normative transports, and BOLT 8 custom messages are not the v1 transport; the exact wire specification exists as docs/RECOVERY-GUARDIAN-WIRE.md; the written VSS comparison is completed (12.2) and concludes the guardian protocol ships as a VSS-compatible sibling with four semantic extensions VSS cannot express today; open questions 11.1, 11.2 and 11.7 are closed. Applied four external design review rounds of the wire draft: an explicit REGISTER_NODE genesis operation under a dedicated seed-derived recovery root (which is also the guardian namespace, keeping the Lightning node id out of the protocol, including out of the IV derivation), the writer lease separated from the log head so the post-takeover state is fully defined, an IMMUTABLE root-committed ChainOrigin inside the registration so an existing node enables guardians mid-journal without renumbering while a truncated store can never pass a surviving record off as its origin, a deterministic AES-GCM nonce construction keyed by recovery_id, an exact SYNC_EPOCH validation algorithm, per-verb protobuf responses with 32-byte x-only keys throughout, mandatory transport authentication for non-local deployments with credentials recoverable from the encrypted capsule, guardian-set replacement made a LITERAL v1 non-feature (one set per namespace ever; loss degrades to SCB/DLP; ROTATE_SET reserved), uncertain-store repair defined as rollback-then-replay anchored at the origin proof with re-entry to writability ONLY on quorum evidence (writer possession never proves recency), receipts certifying origin-through-head across epochs, and the obsolete 5.5 sketches replaced rather than annotated
+Revision 5 (2026-08-02): Phase 6 as built. Durability becomes a property a FRAME DECLARES rather than a runtime setting, which is what turns exact restore from an assertion into evidence: 5.8 gains the sticky-quorum rule (a chain containing a quorum frame can never be followed by an unbarriered one, so a certified head reading 'quorum' also rules out the unbarriered frames a restore cannot see), and 5.6's StateUncertain marking gains its one and only exit, the wire-safety proof, derived from the restore and re-verified rather than configured. Compaction gains a retain floor: guardians hold an immutable chain from a root-committed origin and accept only logHead.sequence + 1, so a frame pruned before it replicated wedges that guardian permanently and, under a barrier, blocks every channel on the node. Replication gains what a barrier needs to stand on: receipts bound to the namespace, epoch and frame hash before they can release anything, a single-flight monotone watermark, a fence that requires a signed higher epoch rather than one endpoint's unsigned rejection, and genuinely pipelined appends per 5.3.
 Scope: beignet library (this repo), plus a companion integration issue in beignet-umbrel
 Audience: an implementing agent or engineer. Every code reference below was verified against the codebase as of beignet 0.7.0 (2026-07-22). Re-verify line numbers before editing; file and symbol names are the stable anchors.
 
@@ -633,7 +634,25 @@ Reconstructable (not journaled):
 
 Never put gossip or graph writes behind WAN latency.
 
-Implementation note: rather than sprinkling barrier calls through `channel.ts`, extend the action model. Add an action-level marker (for example `PERSIST_STATE` carrying a criticality) and let `processActions` in `channel-manager.ts` route persistence through `RecoveryManager.commit` and hold subsequent `SEND_MESSAGE` actions of the same batch until the barrier resolves. That makes persist-before-send structural instead of conventional, fixing 3.3 as a side effect. `processActions` becomes async-aware for barrier waits; audit every caller for ordering assumptions.
+Implementation note: rather than sprinkling barrier calls through `channel.ts`, extend the action model. `processActions` in `channel-manager.ts` already routes persistence through `RecoveryManager.commit`; the barrier hangs off the same `PERSIST_STATE` marker and holds the rest of that batch until the frame behind it is durable.
+
+As built (Phase 6), three details differ from the sketch above and each is deliberate.
+
+The batch's whole REMAINDER is held, not only its `SEND_MESSAGE` actions. The dispatch loop interleaves sends with `BROADCAST_TX`, `FORCE_CLOSE` and the re-entrant HTLC emits in one ordered pass, and a splice puts `tx_signatures` and the broadcast of the transaction it signs in the same array; deferring the send alone would put that transaction on the network before the peer saw the message authorizing it.
+
+`processActions` did NOT become async, and 72 call sites were not audited. The barrier answers a SYNCHRONOUS question first (`isReleased`), which is a constant true outside quorum mode and true again for any frame already below the watermark, so the ordinary path keeps dispatching inline with no promise and no reordering risk. Only a batch that genuinely has to wait leaves the synchronous path, and it resumes through the same dispatch function so every action keeps one implementation of its meaning.
+
+Wire order is preserved by a per-channel queue rather than by the wait itself: a channel already holding messages holds everything after them, barrier-class or not. Per channel and not node wide, because one channel waiting on its frame must not stop an unrelated channel from sending.
+
+The barrier holds MESSAGES, never commits. Frames keep landing and keep streaming to the guardians while an earlier receipt is outstanding, and the receipt covering the newest of them releases all of them at once. A refusal DROPS the held bytes rather than flushing them late: a timeout is not a postponement of permission, and a disconnect purges them outright, because `markForReestablish` rolls the channel backward underneath anything parked. What is retransmittable returns through the outbox and the reestablish rules.
+
+Durability is a property each frame DECLARES, recorded in its AEAD-authenticated plaintext, and not merely a runtime setting. That declaration is what 5.6 consumes to decide whether a restored channel may resume (see the wire-safety proof below), and it is only sound under one additional rule.
+
+QUORUM IS STICKY. Once a chain contains a quorum frame, every later frame in that chain is quorum too; a configured downgrade is refused and reported rather than obeyed. Without the rule, an unbarriered frame written ABOVE a certified head could put state on the wire that the head does not contain, and a restore at that head would claim an exactness it does not have. Restoring the mode means starting a new namespace, not editing a config value. A node whose journal is in quorum mode and whose barrier has been removed refuses to start.
+
+COMPACTION MUST NOT OUTRUN REPLICATION. Guardians hold an immutable chain from a root-committed origin and accept only `logHead.sequence + 1`, so a frame pruned before it replicated can never be delivered: that guardian sits one behind forever, every later record is refused with a sequence gap, and in quorum mode every barrier on the node blocks permanently while looking exactly like guardian failure. The journal therefore holds the prune behind a retain floor at the replication watermark, with a ceiling past which it prunes anyway and reports that the lagging replica must be re-provisioned. The verified base only advances when the prune actually runs, so a snapshot left unpruned mid-chain costs nothing: reconstruction already replays from the newest snapshot it finds.
+
+The wire-safety proof (the exit from 5.6's StateUncertain marking). In quorum mode no wire message leaves before the frame that authorized it reached a quorum, so for every message a peer ever saw the frame behind it is at or below the certified head. A restore installed AT that head therefore holds every state the peer could know about, and in particular holds no commitment the peer has already seen revoked. The restore driver derives an `IWireSafetyProof` bound to the recovery namespace, the superseded epoch, and the certified head's sequence AND frame hash, accepts it only when the head frame itself declares `quorum`, and re-verifies it through the same predicate before acting on it. It is evidence, never configuration: there is no way to pass one in, which is the lesson of the removed `wireSafeThroughSequence` scalar. Every other restore keeps the DLP fallback, which stays the ordinary outcome.
 
 ### 5.9 The safety transition matrix (the implementation spec)
 
@@ -708,13 +727,20 @@ Library (all additive, default off):
 interface RecoveryConfig {
   enabled: boolean;                    // default false
   durability: RecoveryDurability;      // default 'async-remote' when enabled
+  barrier?: DurabilityBarrier;         // required when durability is 'quorum'
+  startupGate?: GuardianStartupGate;   // required for a guardian-backed node
   guardians?: GuardianDescriptor[];    // absent = peer_storage checkpoints only
   profile?: 'crash-v1';                // the only accepted value in v1 (12.1)
   snapshotIntervalFrames?: number;
 }
 
 // LightningNode additions
-node.getRecoveryStatus(): RecoveryStatus;    // tier, lastDurableSequence, guardian health, per-channel ChannelRecoveryStatus
+node.getRecoveryStatus(): RecoveryStatus;    // durability, lastDurableSequence, per-channel ChannelRecoveryStatus + awaitingDurability
+// awaitingDurability sits BESIDE the status rather than becoming an eighth
+// ChannelRecoveryStatus member: the seven values are the 5.7 machine and
+// describe what is known about a channel's STATE, while waiting on a receipt
+// says nothing about the state, only that a message it authorized has not been
+// let out yet.
 node.restoreFromRecoveryReplicas(opts): Promise<RestoreReport>;
 events: 'recovery:durable', 'recovery:guardian_unreachable', 'recovery:fenced', 'recovery:restored'
 ```
