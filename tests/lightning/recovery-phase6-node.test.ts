@@ -34,6 +34,7 @@ import {
 	GuardianClient,
 	GuardianHttpServer,
 	GuardianReplicator,
+	GuardianStartupGate,
 	IBoundGuardianClient,
 	IWriterLeaseKeys,
 	JOURNAL_META_KEYS,
@@ -515,6 +516,67 @@ describe('Recovery phase 6: the status surface', () => {
 		expect(outcome.released).to.equal(false);
 		expect((outcome as { reason: string }).reason).to.equal('stopped');
 
+		await shutdown(served);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 6: ownership settling starts replication', () => {
+	it('a frame committed before the lease replicates when the gate opens', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const replicator = replicatorFor(storage, bind(served));
+		let lease: IWriterLeaseKeys | null = null;
+		const barrier = barrierFor(replicator, () => lease, 'async-remote');
+		const gate = new GuardianStartupGate({
+			storage,
+			replicator,
+			required: CRASH_V1_PROFILE.required,
+			clock
+		});
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'async-remote',
+			barrier,
+			startupGate: gate
+		});
+
+		// Committed while ownership is still unsettled. The pump runs, finds no
+		// lease and nobody waiting, and gives up: that is deliberate, since
+		// spinning a timer on an absent lease would never end.
+		const commit = (
+			node as unknown as { recovery: RecoveryManager }
+		).recovery.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: sha('pre-lease').toString('hex'),
+					preimage: sha('pre-lease-secret')
+				}
+			],
+			outboundMessages: []
+		});
+		expect(commit.committed).to.equal(true);
+		await new Promise((resolve) => setTimeout(resolve, 200));
+		expect(replicator.replicatedThrough()).to.equal(0n);
+
+		// The lease is installed BEFORE confirm, because the gate runs its open
+		// listeners synchronously inside it.
+		lease = (
+			(await replicator.ensureNamespace()) as {
+				lease: IWriterLeaseKeys;
+			}
+		).lease;
+		expect((await gate.confirm(lease)).state).to.equal('confirmed');
+
+		// No further commit. Without the wakeup this frame would sit
+		// unreplicated for as long as the node stayed quiet.
+		await waitFor(() => replicator.replicatedThrough() >= 1n);
+		expect(node.getRecoveryStatus().lastDurableSequence).to.not.equal('0');
+
+		node.destroy();
 		await shutdown(served);
 		storage.close();
 	});

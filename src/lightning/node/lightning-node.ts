@@ -942,10 +942,13 @@ export class LightningNode extends EventEmitter {
 		// construction would lose that race: autoReconnectPeers() below
 		// schedules real dials on zero-delay timers.
 		this.recoveryGate = config.recovery?.startupGate;
-		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
+		// The barrier is wired FIRST so its own gate hook is registered before
+		// the gate's peer bring-up runs: replication is then already in flight
+		// when the first batch arrives to be held.
 		if (this.recoveryBarrier) {
 			this.wireRecoveryBarrier(this.recoveryBarrier, journal);
 		}
+		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
 
 		if (config.enableNetworking) {
 			this.peerManager = new PeerManager({
@@ -3163,6 +3166,17 @@ export class LightningNode extends EventEmitter {
 			});
 			this.emit('recovery:fenced', superseding);
 			this.peerManager?.freezeConnections();
+		});
+		// Ownership settles asynchronously after construction, and a pump that
+		// finds no lease with nobody waiting gives up rather than spinning a
+		// timer forever. Frames committed during startup would then sit
+		// unreplicated until the next commit, which on a quiet node is never,
+		// and the journal's retain floor holds compaction at that stalled
+		// watermark for exactly as long. The gate opening is the moment
+		// ownership is confirmed, so it is the moment to kick.
+		this.recoveryGate?.onOpen(() => {
+			if (this._destroyed) return;
+			barrier.kickReplication();
 		});
 		if (journal) {
 			barrier.onDurableAdvance((through) => {

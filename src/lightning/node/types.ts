@@ -246,6 +246,14 @@ export interface INodeConfig {
 		 * `durability` resolves to `quorum`. It also drives replication in
 		 * every mode, so an `async-remote` node passes one too if it wants its
 		 * journal replicated at all.
+		 *
+		 * Its pump is kicked by three things: a commit, a barrier waiter, and
+		 * ownership settling. The node performs the third when a `startupGate`
+		 * is configured alongside it. WITHOUT a gate it is the integrator's
+		 * job: call `barrier.kickReplication()` as soon as the barrier's
+		 * `lease` closure starts returning the new lease, or a frame committed
+		 * before ownership settled stays unreplicated until the next commit,
+		 * which on a quiet node is never.
 		 */
 		barrier?: DurabilityBarrier;
 		/** Delta frames between full-state snapshots (default 256). */

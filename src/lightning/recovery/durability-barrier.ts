@@ -81,6 +81,12 @@ export interface IDurabilityBarrierConfig {
 	 * barrier may be constructed before the lease exists. Returning null means
 	 * ownership is unsettled, which is never a reason to release: a node that
 	 * cannot prove it owns the namespace cannot prove anything is durable.
+	 *
+	 * ORDERING MATTERS when a GuardianStartupGate drives the wakeup. The gate
+	 * invokes its open listeners SYNCHRONOUSLY inside `confirm`, before that
+	 * promise resolves, so this closure has to be answering with the new lease
+	 * BEFORE confirm is called. Install first, then confirm; the reverse order
+	 * kicks a pump that still sees null and puts the gap straight back.
 	 */
 	lease: () => IWriterLeaseKeys | null;
 	/**
