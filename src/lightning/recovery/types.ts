@@ -27,7 +27,8 @@ import {
  * How much a transition matters to fund safety, and therefore whether it is
  * journaled (Phase 2) and whether it is subject to a durability barrier
  * (Phase 6). Phase 1 records the classification and uses it only for
- * diagnostics; no barrier exists yet.
+ * diagnostics; from Phase 6 a SafetyCritical transition in quorum mode also
+ * holds the wire messages it authorizes until its frame is quorum durable.
  */
 export enum RecoveryCriticality {
 	/** Gossip, mission control: never journaled, always rebuildable. */
@@ -37,6 +38,28 @@ export enum RecoveryCriticality {
 	/** Journaled and, from Phase 6, subject to the durability barrier. */
 	SafetyCritical = 'safety_critical'
 }
+
+/**
+ * How durable a safety transition must be before the wire messages it
+ * authorizes may reach the peer (docs/RECOVERY-PROTOCOL.md 5.8, Phase 6).
+ *
+ * - `local`: fsync and continue, replicate opportunistically. Safety equals a
+ *   normally persisted node. No fencing guarantee, and nothing promises a
+ *   remote copy exists before a peer sees new state.
+ * - `async-remote`: fsync, continue, replicate in the background. On
+ *   catastrophic device loss the latest replica resumes; a slightly stale
+ *   replica means DLP-closing only the channels that advanced past the last
+ *   replicated frame. The recommended default for consumer wallets.
+ * - `quorum`: fsync, replicate, WAIT for the required receipts, and only then
+ *   release the dependent wire message. The guarantee this buys is the point
+ *   of the mode: once a peer has seen new channel state from us, sufficient
+ *   remote information already exists to restore that state, so a restored
+ *   device resumes the channel instead of falling back to DLP.
+ *
+ * Only `quorum` changes behaviour. `local` and `async-remote` are exactly the
+ * node's pre-Phase-6 conduct, which is why the default stays `async-remote`.
+ */
+export type RecoveryDurability = 'local' | 'async-remote' | 'quorum';
 
 /**
  * One storage mutation inside a transition.
@@ -149,6 +172,15 @@ export interface IRecoveryCommitResult {
 	released: Array<{ id: number | null; message: RecoveryOutboundMessage }>;
 	/** Set when the transaction threw; mutations and rows all rolled back. */
 	error?: Error;
+	/**
+	 * The journal frame that carries this transition, or null when the commit
+	 * was not journaled (no journal configured, or a Reconstructable
+	 * transition). This is the sequence a Phase 6 quorum barrier waits on: the
+	 * replication watermark is a CONTIGUOUS quorum-receipted prefix, so
+	 * "watermark >= this sequence" proves every frame up to and including this
+	 * transition reached the quorum.
+	 */
+	frameSequence: bigint | null;
 }
 
 // ─────────────── Phase 2: the recovery journal (spec 5.3) ───────────────
@@ -178,6 +210,26 @@ export interface RecoveryFrame {
 	timestamp: number;
 	mutations: RecoveryMutation[];
 	outboundMessages: RecoveryOutboundMessage[];
+	/**
+	 * The durability mode the writer was operating under when it committed
+	 * this frame (Phase 6, spec 5.8). Absent on frames written before Phase 6
+	 * and on frames from a writer that never configured a mode, which is
+	 * indistinguishable from `local` for safety purposes and is treated as
+	 * such.
+	 *
+	 * This is what makes exact restore PROVABLE rather than asserted. A frame
+	 * declaring `quorum` is a statement, inside AEAD-authenticated plaintext
+	 * bound by the chain hash to the certified head, that every wire message
+	 * this frame authorized waited for its receipts. A restore whose certified
+	 * head declares `quorum` therefore holds every state a peer could have
+	 * seen, which is exactly the condition for resuming instead of falling
+	 * back to DLP. See deriveWireSafetyProof in restore-driver.ts.
+	 *
+	 * A mode DOWNGRADE (quorum to anything weaker) is itself committed under
+	 * the barrier it is leaving, so no unbarriered frame can ever hide behind
+	 * a certified head that still reads `quorum`.
+	 */
+	durability?: RecoveryDurability;
 	snapshot?: RecoverySnapshot;
 }
 

@@ -33,6 +33,7 @@ import { RecoveryManager } from './recovery-manager';
 import {
 	IRecoveryJournalSink,
 	RecoveryCriticality,
+	RecoveryDurability,
 	RecoveryFrame,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
@@ -50,6 +51,18 @@ const META_TIP_HASH = 'journal_tip_hash';
 const META_WRITER_EPOCH = 'journal_writer_epoch';
 const META_LAST_SNAPSHOT = 'journal_last_snapshot_sequence';
 const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
+/**
+ * The newest snapshot frame WRITTEN, which is not always the newest snapshot
+ * pruned to. Snapshot cadence is measured against this; the verified base
+ * (META_LAST_SNAPSHOT) only moves when compaction actually runs.
+ */
+const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
+/**
+ * Monotonic record that this journal has written at least one `quorum` frame
+ * (Phase 6, spec 5.8). Only ever set, never cleared: it is the writer's own
+ * memory of a promise it made to every future restore of this chain.
+ */
+const META_DURABILITY_FLOOR = 'journal_durability_floor';
 
 /**
  * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
@@ -60,15 +73,57 @@ export const JOURNAL_META_KEYS = {
 	tipSequence: META_TIP_SEQUENCE,
 	tipHash: META_TIP_HASH,
 	writerEpoch: META_WRITER_EPOCH,
-	lastSnapshot: META_LAST_SNAPSHOT
+	lastSnapshot: META_LAST_SNAPSHOT,
+	lastSnapshotWritten: META_LAST_SNAPSHOT_WRITTEN,
+	durabilityFloor: META_DURABILITY_FLOOR
 } as const;
 
 /** Deltas between full-state snapshot frames. */
 const DEFAULT_SNAPSHOT_INTERVAL_FRAMES = 256;
 /** Delta plaintext bytes between snapshots (spec 5.3: N frames OR M bytes). */
 const DEFAULT_SNAPSHOT_INTERVAL_BYTES = 4 * 1024 * 1024;
+/** Frames compaction will hold back for a lagging replica before forcing. */
+const DEFAULT_MAX_RETAINED_FRAMES = 1024;
 
 export interface IRecoveryJournalOptions {
+	/**
+	 * The durability mode the writer is operating under (spec 5.8, Phase 6).
+	 * Stamped onto every frame this journal writes, which is what lets a
+	 * restore PROVE that the state it recovered covers everything a peer could
+	 * have seen. Omit for a journal-only node that configured no mode; its
+	 * frames carry no declaration, which reads exactly like `local`.
+	 */
+	durability?: RecoveryDurability;
+	/**
+	 * Called when a configured downgrade away from `quorum` is refused because
+	 * the journal already contains quorum frames (see stickyQuorum below).
+	 * Purely for operator visibility; the refusal is not optional.
+	 */
+	onDurabilityRefused?: (detail: string) => void;
+	/**
+	 * The lowest frame sequence that must SURVIVE compaction, because a
+	 * replica still needs it (Phase 6). Guardians hold an immutable chain from
+	 * a root-committed origin and accept only `logHead.sequence + 1`
+	 * (docs/RECOVERY-GUARDIAN-WIRE.md, ORIGIN is "IMMUTABLE... never changing
+	 * for the life of the namespace"), so a frame pruned before it replicated
+	 * can never be delivered: that guardian sits one behind forever, every
+	 * later record is refused with a sequence gap, and in quorum mode every
+	 * barrier on the node blocks permanently.
+	 *
+	 * Return `replicatedThrough() + 1`. Omit for a journal with no replicas,
+	 * which compacts exactly as it did before Phase 6.
+	 */
+	retainFrom?: () => bigint;
+	/**
+	 * Ceiling on how many frames compaction will hold back waiting for a
+	 * replica, after which it prunes anyway. Without it a permanently dead
+	 * guardian would grow the journal without bound. Default 1024. Crossing it
+	 * is reported through onCompactionForced, and it means the lagging replica
+	 * can no longer be backfilled and has to be re-provisioned.
+	 */
+	maxRetainedFrames?: number;
+	/** Compaction pruned frames a replica had not yet received. */
+	onCompactionForced?: (detail: string) => void;
 	/** Append a snapshot frame after this many delta frames. Default 256. */
 	snapshotIntervalFrames?: number;
 	/**
@@ -173,6 +228,96 @@ export function journalSupported(storage: IStorageBackend): boolean {
 	);
 }
 
+/**
+ * What the journal's newest frame declares about the mode it was written
+ * under. `unreadable` is kept distinct from `absent` because they justify
+ * different conclusions: nothing was ever written, versus something was and we
+ * cannot see what.
+ */
+export type TipDurability =
+	| { tip: 'absent' }
+	| { tip: 'present'; durability: RecoveryDurability | undefined }
+	| { tip: 'unreadable'; reason: string };
+
+/** Read the durability declaration off the newest stored frame. */
+export function readTipDurability(
+	storage: IStorageBackend,
+	masterKey: Buffer,
+	nodeId: Buffer
+): TipDurability {
+	const tipSequence = storage.getRecoveryMeta?.(META_TIP_SEQUENCE);
+	if (tipSequence == null) return { tip: 'absent' };
+	// Only the tip row: sequence > tip-1 is exactly the newest frame.
+	const rows = storage.loadRecoveryFrames?.(Number(BigInt(tipSequence) - 1n));
+	const row = rows?.[rows.length - 1];
+	if (!row) {
+		return { tip: 'unreadable', reason: `no stored frame at ${tipSequence}` };
+	}
+	try {
+		const writerEpoch = BigInt(row.writerEpoch);
+		const plaintext = decryptFrame(
+			deriveFrameKey(masterKey, nodeId, writerEpoch),
+			row.ciphertext,
+			frameAad(nodeId, writerEpoch, BigInt(row.sequence), row.previousFrameHash)
+		);
+		return { tip: 'present', durability: decodeFrame(plaintext).durability };
+	} catch (error) {
+		return {
+			tip: 'unreadable',
+			reason: error instanceof Error ? error.message : String(error)
+		};
+	}
+}
+
+/**
+ * Decide the mode this journal will actually stamp, enforcing the ONE rule
+ * that keeps the wire-safety proof honest: quorum is STICKY.
+ *
+ * A restore concludes "this state is exact, resume the channels" from a
+ * certified head frame that declares `quorum`. That conclusion is only valid
+ * if every frame ABOVE the head was barriered too, because an unbarriered
+ * frame could have put state on the wire that the head does not contain. The
+ * cheapest way to guarantee that is to forbid the transition entirely: once a
+ * chain contains a quorum frame, every later frame in that chain is quorum as
+ * well. Upgrades are free and need no rule, since they only add barriers.
+ *
+ * Evidence comes from two independent places, and either one is enough:
+ * the newest frame's own declaration, and a monotonic recovery_meta floor
+ * written in the same transaction as the first quorum frame. Two sources
+ * because each covers the other's blind spot: a locally corrupted tip frame
+ * may still be intact at the guardians (so the tip alone can be lost), and a
+ * meta row is not part of the authenticated chain (so meta alone is weaker
+ * evidence). An unreadable tip with no floor is deliberately NOT treated as
+ * quorum: freezing a node whose journal is merely damaged would time out live
+ * HTLCs, and that node's chain cannot be verified by a restorer anyway.
+ *
+ * The practical consequence to document for operators: to leave quorum mode
+ * you start a new namespace, you do not flip a config value.
+ */
+function resolveDurability(
+	storage: IStorageBackend,
+	masterKey: Buffer,
+	nodeId: Buffer,
+	configured: RecoveryDurability | undefined,
+	onRefused?: (detail: string) => void
+): RecoveryDurability | undefined {
+	if (configured === 'quorum') return 'quorum';
+	const floor = storage.getRecoveryMeta?.(META_DURABILITY_FLOOR);
+	const tip = readTipDurability(storage, masterKey, nodeId);
+	const sticky =
+		floor === 'quorum' ||
+		(tip.tip === 'present' && tip.durability === 'quorum');
+	if (!sticky) return configured;
+	onRefused?.(
+		`this journal already contains quorum frames, so the configured durability ` +
+			`'${String(
+				configured ?? 'none'
+			)}' is refused and the writer stays in quorum mode; ` +
+			`a certified head that reads 'quorum' must never be followed by an unbarriered frame`
+	);
+	return 'quorum';
+}
+
 export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly storage: IStorageBackend;
 	private readonly masterKey: Buffer;
@@ -180,6 +325,11 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly recoveryId: Buffer;
 	private readonly snapshotInterval: number;
 	private readonly snapshotIntervalBytes: number;
+	/** The mode every frame this journal writes declares (spec 5.8). */
+	private readonly durability: RecoveryDurability | undefined;
+	private readonly retainFrom: (() => bigint) | undefined;
+	private readonly maxRetainedFrames: number;
+	private readonly onCompactionForced: ((detail: string) => void) | undefined;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
 
@@ -212,6 +362,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.snapshotIntervalFrames ?? DEFAULT_SNAPSHOT_INTERVAL_FRAMES;
 		this.snapshotIntervalBytes =
 			options.snapshotIntervalBytes ?? DEFAULT_SNAPSHOT_INTERVAL_BYTES;
+		this.durability = resolveDurability(
+			storage,
+			masterKey,
+			nodeId,
+			options.durability,
+			options.onDurabilityRefused
+		);
+		this.retainFrom = options.retainFrom;
+		this.maxRetainedFrames =
+			options.maxRetainedFrames ?? DEFAULT_MAX_RETAINED_FRAMES;
+		this.onCompactionForced = options.onCompactionForced;
+	}
+
+	/** The mode this journal stamps on its frames, after the sticky rule. */
+	getDurability(): RecoveryDurability | undefined {
+		return this.durability;
 	}
 
 	/**
@@ -282,8 +448,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 
 		// Snapshot on whichever bound trips first (spec 5.3): N delta frames
 		// or M bytes of delta plaintext since the last snapshot.
+		// Cadence follows snapshots WRITTEN, not the verified base: a base held
+		// back for a lagging replica would otherwise read as "no snapshot for
+		// ages" and fire one on every single append.
 		const lastSnapshot = BigInt(
-			this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ?? '0'
+			this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT_WRITTEN) ??
+				this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ??
+				'0'
 		);
 		const deltaBytes =
 			Number(this.storage.getRecoveryMeta!(META_DELTA_BYTES) ?? '0') +
@@ -377,6 +548,11 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		frameHash: Buffer;
 		plaintextBytes: number;
 	} {
+		// Stamped here rather than at each construction site so that deltas,
+		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
+		// all carry the same declaration; a snapshot that omitted it would be a
+		// certified head that says nothing about what its writer promised.
+		if (this.durability) frame.durability = this.durability;
 		const plaintext = encodeFrame(frame);
 		const frameHash = hashFrame(plaintext);
 		const key = deriveFrameKey(this.masterKey, this.nodeId, frame.writerEpoch);
@@ -405,6 +581,15 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		});
 		this.storage.setRecoveryMeta!(META_TIP_SEQUENCE, frame.sequence.toString());
 		this.storage.setRecoveryMeta!(META_TIP_HASH, frameHash.toString('hex'));
+		// The floor rides the SAME transaction as the frame that raises it, so
+		// a chain can never contain a durable quorum frame without the record
+		// that forbids a later downgrade.
+		if (
+			this.durability === 'quorum' &&
+			this.storage.getRecoveryMeta!(META_DURABILITY_FLOOR) !== 'quorum'
+		) {
+			this.storage.setRecoveryMeta!(META_DURABILITY_FLOOR, 'quorum');
+		}
 		if (this.storage.getRecoveryMeta!(META_WRITER_EPOCH) == null) {
 			this.storage.setRecoveryMeta!(
 				META_WRITER_EPOCH,
@@ -434,9 +619,62 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			outboundMessages: [],
 			snapshot: this.captureSnapshot()
 		});
-		this.storage.setRecoveryMeta!(META_LAST_SNAPSHOT, sequence.toString());
+		// Cadence is measured against snapshots WRITTEN. The verified base only
+		// moves when the deltas below it are actually pruned, which a lagging
+		// replica can postpone (see compactTo).
+		this.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT_WRITTEN,
+			sequence.toString()
+		);
 		this.storage.setRecoveryMeta!(META_DELTA_BYTES, '0');
-		this.storage.deleteRecoveryFramesBelow!(Number(sequence));
+		this.compactTo(sequence);
+	}
+
+	/**
+	 * Prune below a snapshot, unless a replica still needs frames down there.
+	 *
+	 * The base the chain verifies against (META_LAST_SNAPSHOT) advances only
+	 * when the prune runs, so verifyFrameChain's "first retained frame IS the
+	 * recorded base snapshot" invariant holds either way: either we pruned to
+	 * this snapshot and it is now the base, or we kept everything and the
+	 * previous base is still the first retained frame. A snapshot left
+	 * unpruned mid-chain costs nothing at restore time, since
+	 * reconstructFromFrames replays from the NEWEST snapshot it finds.
+	 */
+	private compactTo(snapshotSequence: bigint): void {
+		const floor = this.retainFrom?.();
+		if (floor !== undefined && floor < snapshotSequence) {
+			const held = snapshotSequence - floor;
+			if (held <= BigInt(this.maxRetainedFrames)) return;
+			// A replica this far behind is not coming back on its own. Pruning
+			// costs us its backfill; not pruning costs us the disk, forever.
+			this.onCompactionForced?.(
+				`compaction pruned to frame ${snapshotSequence} while a replica still ` +
+					`needed frame ${floor}: ${held} frames exceeded the ${this.maxRetainedFrames} ` +
+					`frame retention ceiling, so that replica can no longer be backfilled ` +
+					`and has to be re-provisioned`
+			);
+		}
+		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
+		this.storage.setRecoveryMeta!(
+			META_LAST_SNAPSHOT,
+			snapshotSequence.toString()
+		);
+	}
+
+	/**
+	 * Retry a compaction that a lagging replica held back. Called after the
+	 * replication watermark advances; a no-op when nothing is outstanding.
+	 */
+	compact(): void {
+		const written = this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT_WRITTEN);
+		if (written == null) return;
+		const base = BigInt(
+			this.storage.getRecoveryMeta!(META_LAST_SNAPSHOT) ?? '0'
+		);
+		const target = BigInt(written);
+		if (target <= base) return;
+		this.storage.transaction(() => this.compactTo(target));
 	}
 
 	/** Serialize every safety-critical table (see RecoverySnapshot). */
