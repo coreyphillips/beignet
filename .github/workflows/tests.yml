@@ -23,14 +23,20 @@ jobs:
           sudo apt install wait-for-it
           wait-for-it -h 127.0.0.1 -p 43782 -t 60
 
-      - name: Wait for electrum server
-        run: wait-for-it -h 127.0.0.1 -p 60001 -t 60
-
       - name: Set up Node.js
         uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: 'npm'
+
+      # NOT a port check: Docker publishes 60001 the moment the container
+      # starts, so `wait-for-it` returned "available after 0 seconds" while
+      # electrs was still starting, and the wallet suite opened its first
+      # real connection into a server that was not answering yet. This probe
+      # requires a server.version answer and a tip that has caught up with
+      # bitcoind, which is what the wallet tests actually depend on.
+      - name: Wait for electrum server
+        run: node scripts/wait-for-electrum.js 127.0.0.1 60001 180
 
       - name: Install Node.js dependencies
         run: npm install || npm install

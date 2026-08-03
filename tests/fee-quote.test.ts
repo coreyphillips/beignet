@@ -26,6 +26,7 @@ import {
 	Wallet
 } from '../';
 import { createOpReturnScript, getByteCount } from '../src/utils/transaction';
+import { sleep } from '../src/utils/helpers';
 import { getDefaultSendTransaction } from '../src/shapes/wallet';
 import { ISendTransaction } from '../src/types/wallet';
 import {
@@ -147,6 +148,22 @@ describe('On-chain fee quoting', function () {
 			await rpc.generateToAddress(1, address);
 			await waitForElectrum();
 			await wallet.refreshWallet({});
+
+			// Matching tips is not the same as a queryable address index: on CI
+			// the wallet has come back from this refresh with nothing, and the
+			// funding then went missing INSIDE the test as a confusing "No
+			// inputs specified in setupTransaction". Wait for the coins to
+			// actually appear, and fail here, where the cause is legible, if
+			// they never do.
+			for (let i = 0; wallet.data.utxos.length < 4 && i < 20; i++) {
+				await sleep(250);
+				await waitForElectrum();
+				await wallet.refreshWallet({});
+			}
+			expect(
+				wallet.data.utxos.length,
+				'the funding UTXOs are visible to the wallet'
+			).to.equal(4);
 		});
 
 		afterEach(async () => {
