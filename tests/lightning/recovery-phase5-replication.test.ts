@@ -421,9 +421,13 @@ describe('Recovery phase 5: record replication', () => {
 		expect(first.attempted).to.be.greaterThan(0);
 		expect(first.durable).to.equal(first.attempted);
 		expect(rep.replicatedThrough()).to.equal(first.replicatedThrough);
-		expect(
-			events.filter((e) => e.type === 'record:replicated').length
-		).to.equal(first.durable);
+		// Phase 6: receipts are cumulative, so a pass reports the HEAD it made
+		// durable ONCE rather than one event per frame. A per-frame event would
+		// imply a per-frame round trip, which is exactly what pipelined appends
+		// exist to avoid (spec 5.3).
+		const durableEvents = events.filter((e) => e.type === 'record:replicated');
+		expect(durableEvents.length).to.equal(1);
+		expect(durableEvents[0].sequence).to.equal(first.replicatedThrough);
 
 		// The guardians hold exactly the journal, and their head matches the
 		// journal tip.

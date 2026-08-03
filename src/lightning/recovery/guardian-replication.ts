@@ -38,6 +38,7 @@ import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	GuardianStatus,
 	IGuardianRecord,
+	IGuardianReceipt,
 	IGuardianRegisterNodeRequest
 } from './guardian';
 import {
@@ -146,6 +147,13 @@ export interface IGuardianReplicationConfig {
 	onEvent?: (event: IGuardianReplicationEvent) => void;
 	/** Persisting the lease into unencrypted storage, opted into explicitly. */
 	allowUnencryptedSecrets?: boolean;
+	/**
+	 * How many records may be in flight to ONE guardian at a time (Phase 6).
+	 * Spec 5.3: "Appends are pipelined. The writer streams frames to each
+	 * guardian in sequence order without waiting for the previous receipt."
+	 * Default 8; 1 makes the stream strictly sequential.
+	 */
+	pipelineWindow?: number;
 }
 
 export interface IGuardianReplicationEvent {
@@ -157,7 +165,9 @@ export interface IGuardianReplicationEvent {
 		| 'record:replicated'
 		| 'record:under-replicated'
 		| 'record:rejected'
-		| 'writer:fenced';
+		| 'record:conflict'
+		| 'writer:fenced'
+		| 'writer:supersession-unproven';
 	detail: string;
 	sequence?: bigint;
 	/** Distinct verified receipts a record collected. */
@@ -185,11 +195,40 @@ export interface IReplicationResult {
 	localEpoch?: bigint;
 }
 
+/** Frames one guardian may hold in flight at once (spec 5.3, pipelining). */
+const DEFAULT_PIPELINE_WINDOW = 8;
+
+/**
+ * What one guardian's stream achieved: the highest sequence it PROVED it
+ * holds, and the highest it merely reported. Only the proven one counts
+ * toward a quorum; the reported one exists to re-anchor the stream after an
+ * out-of-order arrival, because a gap rejection is unsigned (wire 4.2 returns
+ * `current` without a receipt) and can therefore steer but never certify.
+ */
+interface IGuardianStreamResult {
+	/** Verified receipt head, or null when nothing was proven. */
+	provenThrough: bigint | null;
+	/** Any epoch rejection seen, which triggers the supersession check. */
+	sawSupersession: boolean;
+	/** A guardian holding a DIFFERENT record at one of our sequences. */
+	conflictAt: bigint | null;
+	requests: number;
+}
+
 export class GuardianReplicator {
 	private readonly config: IGuardianReplicationConfig;
 	private readonly clock: () => bigint;
+	private readonly pipelineWindow: number;
 
 	private verifiedBindings: Set<string> | null = null;
+	/**
+	 * Single-flight over replicatePending. Two overlapping passes would fan
+	 * the same records out twice and, worse, race the watermark: each computes
+	 * its own contiguous prefix from the value it read at entry, so the slower
+	 * one can write a LOWER mark over the faster one's. Under Phase 6 that is
+	 * a released barrier being forgotten across a restart.
+	 */
+	private inFlight: Promise<IReplicationResult> | null = null;
 
 	constructor(config: IGuardianReplicationConfig) {
 		if (config.guardians.length === 0) {
@@ -200,6 +239,10 @@ export class GuardianReplicator {
 		}
 		this.config = config;
 		this.clock = config.clock ?? ((): bigint => BigInt(Date.now()));
+		this.pipelineWindow = Math.max(
+			1,
+			config.pipelineWindow ?? DEFAULT_PIPELINE_WINDOW
+		);
 	}
 
 	/**
@@ -564,129 +607,363 @@ export class GuardianReplicator {
 		};
 	}
 
-	/** The highest sequence provably replicated to a quorum, or 0. */
+	/**
+	 * The highest sequence provably replicated to a quorum, or 0.
+	 *
+	 * A corrupt value reads as 0 rather than throwing. This is called on every
+	 * barrier evaluation and inside the send path; a SyntaxError escaping here
+	 * would take down a channel transition over a bookkeeping row. Reading 0
+	 * is the safe direction: it re-offers records the guardians already hold,
+	 * which they answer idempotently with OK_DUPLICATE.
+	 */
 	replicatedThrough(): bigint {
 		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
-		return raw == null ? 0n : BigInt(raw);
+		if (raw == null) return 0n;
+		if (!/^\d+$/.test(raw)) return 0n;
+		try {
+			return BigInt(raw);
+		} catch {
+			return 0n;
+		}
+	}
+
+	/**
+	 * Advance the watermark, never retreat it.
+	 *
+	 * The read and the write share one transaction so a concurrent pass cannot
+	 * interleave between them, and the value written is the MAX: a pass that
+	 * started earlier and finished later must not overwrite a higher mark with
+	 * the lower one it computed from a stale entry snapshot.
+	 */
+	private raiseWatermark(value: bigint): bigint {
+		const storage = this.config.storage;
+		let stored = value;
+		storage.transaction(() => {
+			const current = this.replicatedThrough();
+			if (value <= current) {
+				stored = current;
+				return;
+			}
+			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
+		});
+		return stored;
+	}
+
+	/**
+	 * The head this receipt PROVES a guardian holds, or null.
+	 *
+	 * Everything about the binding here is load-bearing, because this number
+	 * is what a Phase 6 barrier releases wire messages on. A receipt is only
+	 * evidence about OUR chain when it verifies under a committed member key,
+	 * names THIS recovery namespace, and was issued while the guardian agreed
+	 * we are the current writer. And where the head lands on a frame we hold,
+	 * the frame hashes must agree: a guardian holding a different record at
+	 * that position has not stored ours, however valid its signature is.
+	 *
+	 * Without these checks a validly signed receipt over a different
+	 * namespace at a higher sequence would release the barrier.
+	 */
+	private provenHead(
+		receipt: IGuardianReceipt | undefined,
+		lease: IWriterLeaseKeys,
+		framesBySequence: Map<bigint, IStoredRecoveryFrame>
+	): { head: bigint; conflictAt: bigint | null } | null {
+		if (!receipt) return null;
+		if (!verifyGuardianReceipt(receipt, this.config.context)) return null;
+		const state = receipt.state;
+		if (!state.recoveryId.equals(this.config.recoveryRoot.recoveryId)) {
+			return null;
+		}
+		if (state.lease.epoch !== lease.epoch) return null;
+		if (!state.lease.writerPublicKey.equals(lease.writerPublicKey)) return null;
+		const head = state.logHead.sequence;
+		const ours = framesBySequence.get(head);
+		if (ours && !state.logHead.frameHash.equals(ours.frameHash)) {
+			return { head: 0n, conflictAt: head };
+		}
+		return { head, conflictAt: null };
+	}
+
+	/**
+	 * Stream this pass's records to ONE guardian, in sequence order, without
+	 * waiting for each receipt (spec 5.3: "Appends are pipelined").
+	 *
+	 * The guardian is linearized and order sensitive: it accepts only
+	 * `logHead.sequence + 1` and refuses anything else with an unsigned gap
+	 * error carrying its current position. Independent HTTP requests can
+	 * therefore land out of order, so the window re-anchors on whatever
+	 * position the guardian reports and, if a round makes no forward progress,
+	 * narrows to strictly sequential. Nothing is lost either way, because a
+	 * refused record changes no state and receipts are cumulative: only the
+	 * furthest response of a burst has to be believed.
+	 */
+	private async streamToGuardian(
+		entry: IBoundGuardianClient,
+		frames: IStoredRecoveryFrame[],
+		lease: IWriterLeaseKeys,
+		framesBySequence: Map<bigint, IStoredRecoveryFrame>
+	): Promise<IGuardianStreamResult> {
+		const result: IGuardianStreamResult = {
+			provenThrough: null,
+			sawSupersession: false,
+			conflictAt: null,
+			requests: 0
+		};
+		let window = this.pipelineWindow;
+		let cursor = 0;
+		let lastReported: bigint | null = null;
+		// Strictly bounded: every round either advances the cursor or narrows
+		// the window, and a round that does neither twice stops the stream.
+		const maxRounds = frames.length + this.pipelineWindow + 1;
+
+		for (let round = 0; round < maxRounds && cursor < frames.length; round++) {
+			const batch = frames.slice(cursor, cursor + window);
+			result.requests += batch.length;
+			const responses = await Promise.all(
+				batch.map(async (frame) => {
+					try {
+						return await entry.client.putState(this.signRecord(frame, lease));
+					} catch {
+						return undefined;
+					}
+				})
+			);
+
+			let reported: bigint | null = null;
+			for (const response of responses) {
+				if (!response) continue;
+				if (response.status === GuardianStatus.ERR_EPOCH_SUPERSEDED) {
+					result.sawSupersession = true;
+				}
+				const proven = this.provenHead(
+					response.receipt,
+					lease,
+					framesBySequence
+				);
+				if (proven?.conflictAt != null) {
+					result.conflictAt = proven.conflictAt;
+					continue;
+				}
+				if (proven) {
+					if (
+						result.provenThrough == null ||
+						proven.head > result.provenThrough
+					) {
+						result.provenThrough = proven.head;
+					}
+					if (reported == null || proven.head > reported)
+						reported = proven.head;
+					continue;
+				}
+				// Unsigned steering only. A gap or previous-hash rejection tells
+				// us where the guardian actually is; it certifies nothing.
+				const current = response.current;
+				if (
+					current &&
+					current.recoveryId.equals(this.config.recoveryRoot.recoveryId)
+				) {
+					const at = current.logHead.sequence;
+					if (reported == null || at > reported) reported = at;
+				}
+			}
+
+			if (result.sawSupersession) return result;
+			if (reported == null) return result;
+			const next = frames.findIndex(
+				(frame) => BigInt(frame.sequence) > (reported as bigint)
+			);
+			if (next < 0) {
+				cursor = frames.length;
+				break;
+			}
+			if (next <= cursor) {
+				if (window === 1 && lastReported === reported) return result;
+				window = 1;
+			}
+			lastReported = reported;
+			cursor = next;
+		}
+		return result;
 	}
 
 	/**
 	 * Replicate every journal frame above the replication high-water mark.
-	 * Best effort: a frame that fails to reach the quorum stops the mark
-	 * from advancing (durability is only claimed for a CONTIGUOUS prefix,
-	 * since a receipt is cumulative over the chain it certifies), but never
-	 * throws into the caller's path. Phase 6 turns this into a barrier.
+	 *
+	 * The pass is single flight, streams to each guardian in parallel and each
+	 * guardian's records in pipelined sequence order, and derives the new
+	 * watermark from CUMULATIVE receipts: a receipt for head S certifies every
+	 * record from the origin through S (wire spec, "receipts are cumulative"),
+	 * so the quorum head is simply the `required`-th highest proven head.
+	 * There is no per-record round trip and no per-record accounting.
+	 *
+	 * Never throws into the caller's path: a failure to reach the quorum
+	 * degrades durability, and in quorum mode the barrier is what turns that
+	 * into a hold. Replication itself never blocks a channel.
 	 */
 	async replicatePending(lease: IWriterLeaseKeys): Promise<IReplicationResult> {
+		if (this.inFlight) return this.inFlight;
+		const pass = this.runReplicationPass(lease).finally(() => {
+			this.inFlight = null;
+		});
+		this.inFlight = pass;
+		return pass;
+	}
+
+	private async runReplicationPass(
+		lease: IWriterLeaseKeys
+	): Promise<IReplicationResult> {
 		const storage = this.config.storage;
 		const from = this.replicatedThrough();
 		const frames = (storage.loadRecoveryFrames?.(Number(from)) ?? []).filter(
 			(frame) => BigInt(frame.sequence) > from
 		);
-		let durable = 0;
-		let contiguousThrough = from;
-		let contiguous = true;
+		if (frames.length === 0) {
+			return {
+				outcome: 'replicated',
+				attempted: 0,
+				durable: 0,
+				replicatedThrough: from
+			};
+		}
+		// An endpoint that has not proved which guardian it is cannot be
+		// counted toward a quorum, and must not be able to fence us either.
+		await this.ensureBindings();
 
+		const framesBySequence = new Map<bigint, IStoredRecoveryFrame>();
 		for (const frame of frames) {
-			const sequence = BigInt(frame.sequence);
-			const record = this.signRecord(frame, lease);
-			const results = await boundFanOut(this.config.guardians, (client) =>
-				client.putState(record)
-			);
-			// A definitive epoch rejection is TERMINAL, not noise: another
-			// device holds the lease, so this writer must stop before it does
-			// anything else (spec 5.6 async-mode hard freeze). The newer state
-			// is then proven through a signed GET_HEAD rather than taken from
-			// the rejection itself.
-			if (
-				results.some(
-					(entry) =>
-						entry.result?.status === GuardianStatus.ERR_EPOCH_SUPERSEDED
-				)
-			) {
-				const proof = await this.confirmOwnership(lease);
-				const newer = proof.states.find(
-					(state) => state.lease.epoch > lease.epoch
-				);
+			framesBySequence.set(BigInt(frame.sequence), frame);
+		}
+		const tip = BigInt(frames[frames.length - 1].sequence);
+
+		const streams = await Promise.all(
+			this.config.guardians.map((entry) =>
+				this.streamToGuardian(entry, frames, lease, framesBySequence)
+			)
+		);
+
+		for (const stream of streams) {
+			if (stream.conflictAt != null) {
 				this.emit({
-					type: 'writer:fenced',
+					type: 'record:conflict',
 					detail:
-						`epoch ${lease.epoch} was superseded` +
-						(newer ? ` by epoch ${newer.lease.epoch}` : '') +
-						'; replication stopped and the writer must freeze',
-					sequence
-				});
-				if (contiguousThrough > from) {
-					storage.setRecoveryMeta?.(
-						META_REPLICATED_THROUGH,
-						contiguousThrough.toString()
-					);
-				}
-				return {
-					outcome: 'fenced',
-					attempted: frames.indexOf(frame) + 1,
-					durable,
-					replicatedThrough: contiguousThrough,
-					verifiedCurrentState: newer,
-					localEpoch: lease.epoch
-				};
-			}
-			const rejected = results.filter(
-				(entry) =>
-					entry.result !== undefined &&
-					entry.result.status !== GuardianStatus.OK &&
-					entry.result.status !== GuardianStatus.OK_DUPLICATE
-			);
-			for (const entry of rejected) {
-				this.emit({
-					type: 'record:rejected',
-					detail: `guardian rejected record with status ${entry.result?.status}`,
-					sequence
-				});
-			}
-			const receipts = countReceiptQuorum(
-				results.map((entry) => ({
-					client: entry.client,
-					result: entry.result,
-					error: entry.error
-				})),
-				this.config.context,
-				(state) => state.logHead.sequence >= sequence
-			);
-			if (receipts >= this.config.required) {
-				durable += 1;
-				if (contiguous) contiguousThrough = sequence;
-				this.emit({
-					type: 'record:replicated',
-					detail: `record ${sequence} durable at ${receipts} guardians`,
-					sequence,
-					receipts
-				});
-			} else {
-				contiguous = false;
-				this.emit({
-					type: 'record:under-replicated',
-					detail: `record ${sequence} reached only ${receipts} of ${this.config.required} guardians`,
-					sequence,
-					receipts
+						`a guardian holds a DIFFERENT record at sequence ${stream.conflictAt}; ` +
+						`its receipts are not evidence for this chain`,
+					sequence: stream.conflictAt
 				});
 			}
 		}
 
-		if (contiguousThrough > from) {
-			storage.setRecoveryMeta?.(
-				META_REPLICATED_THROUGH,
-				contiguousThrough.toString()
-			);
+		if (streams.some((stream) => stream.sawSupersession)) {
+			const fenced = await this.resolveSupersession(lease, tip);
+			if (fenced) return fenced;
 		}
+
+		// Cumulative receipts collapse the whole pass to one order statistic:
+		// the highest sequence that `required` distinct guardians have proven
+		// they hold. Guardians are distinct by construction here, since
+		// verifyGuardianBindings refuses duplicate members.
+		const heads = streams
+			.map((stream) => stream.provenThrough)
+			.filter((head): head is bigint => head != null)
+			.sort((a, b) => (a === b ? 0 : a > b ? -1 : 1));
+		let quorumHead =
+			heads.length >= this.config.required
+				? heads[this.config.required - 1]
+				: from;
+		// A guardian cannot prove more than we wrote. Clamping keeps a buggy or
+		// hostile answer from advancing the mark past our own chain.
+		if (quorumHead > tip) quorumHead = tip;
+		if (quorumHead < from) quorumHead = from;
+
+		const replicatedThrough = this.raiseWatermark(quorumHead);
+		const durable = Number(
+			replicatedThrough > from ? replicatedThrough - from : 0n
+		);
+
+		if (replicatedThrough >= tip) {
+			this.emit({
+				type: 'record:replicated',
+				detail: `records through ${replicatedThrough} are durable at ${this.config.required} guardians`,
+				sequence: replicatedThrough,
+				receipts: heads.length
+			});
+			return {
+				outcome: 'replicated',
+				attempted: frames.length,
+				durable,
+				replicatedThrough
+			};
+		}
+		this.emit({
+			type: 'record:under-replicated',
+			detail:
+				`records are durable only through ${replicatedThrough} of ${tip}; ` +
+				`${heads.length} of ${this.config.guardians.length} guardians answered with proof`,
+			sequence: tip,
+			receipts: heads.length
+		});
 		return {
-			outcome:
-				contiguous && durable === frames.length
-					? 'replicated'
-					: 'under-replicated',
+			outcome: 'under-replicated',
 			attempted: frames.length,
 			durable,
-			replicatedThrough: contiguousThrough
+			replicatedThrough
+		};
+	}
+
+	/**
+	 * A guardian said our epoch is superseded. Decide whether that is true.
+	 *
+	 * ERR_EPOCH_SUPERSEDED is an UNSIGNED status, so on its own it is a claim
+	 * by one endpoint. Fencing is permanent and, under Phase 6, node wide: it
+	 * stops revoke_and_ack, fulfill and splice on every channel. So the fence
+	 * requires the same evidence the startup gate requires, a signed state
+	 * naming a HIGHER epoch. Without it the pass reports the disagreement and
+	 * continues, which is the difference between one misbehaving endpoint
+	 * costing us a log line and costing us the node.
+	 */
+	private async resolveSupersession(
+		lease: IWriterLeaseKeys,
+		sequence: bigint
+	): Promise<IReplicationResult | null> {
+		let proof: { states: GuardianState[] };
+		try {
+			proof = await this.confirmOwnership(lease);
+		} catch (error) {
+			this.emit({
+				type: 'writer:supersession-unproven',
+				detail:
+					`a guardian rejected our epoch but ownership could not be checked ` +
+					`(${error instanceof Error ? error.message : String(error)}); ` +
+					`not fencing on an unsigned claim`,
+				sequence
+			});
+			return null;
+		}
+		const newer = proof.states.find((state) => state.lease.epoch > lease.epoch);
+		if (!newer) {
+			this.emit({
+				type: 'writer:supersession-unproven',
+				detail:
+					`a guardian rejected our epoch but no signed state names a higher one; ` +
+					`not fencing on an unsigned claim`,
+				sequence
+			});
+			return null;
+		}
+		this.emit({
+			type: 'writer:fenced',
+			detail:
+				`epoch ${lease.epoch} was superseded by epoch ${newer.lease.epoch}; ` +
+				'replication stopped and the writer must freeze',
+			sequence
+		});
+		return {
+			outcome: 'fenced',
+			attempted: 0,
+			durable: 0,
+			replicatedThrough: this.replicatedThrough(),
+			verifiedCurrentState: newer,
+			localEpoch: lease.epoch
 		};
 	}
 
