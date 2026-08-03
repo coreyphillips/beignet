@@ -581,3 +581,66 @@ describe('Recovery phase 6: ownership settling starts replication', () => {
 		storage.close();
 	});
 });
+
+describe('Recovery phase 6: a finished namespace is reported, not guessed', () => {
+	it('survives the restart that discovered it and refuses a new channel', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+
+		// A previous run pruned past a configured ceiling. The fact is in the
+		// journal metadata, so this run inherits it: without that, a dead
+		// namespace and an unreachable guardian set look identical, and only
+		// one of them is ever coming back.
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{ durability: 'quorum' }
+		);
+		new RecoveryManager(storage, { journal }).commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: sha('finished').toString('hex'),
+					preimage: sha('finished-preimage')
+				}
+			],
+			outboundMessages: []
+		});
+		storage.setRecoveryMeta(
+			JOURNAL_META_KEYS.backfillLost,
+			'a previous run pruned frames the quorum never received'
+		);
+
+		const replicator = replicatorFor(storage, bind(served));
+		const barrier = barrierFor(replicator, () => null, 'quorum');
+		// It still STARTS. An operator whose namespace is finished still has to
+		// be able to close the channels it already has, so refusing to boot
+		// would take away the only exit.
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'quorum',
+			barrier
+		});
+
+		const status = node.getRecoveryStatus();
+		expect(status.backfillLost).to.equal(true);
+		expect(status.fenced).to.equal(false);
+		expect(status.durability).to.equal('quorum');
+
+		// Opening is the one irreversible step the barrier does not otherwise
+		// gate: funding_created, funding_signed and channel_ready are not
+		// barrier-class, so an open would run to completion into a namespace
+		// that can never record it.
+		expect(() => node.openChannel('02'.repeat(33), 100_000n)).to.throw(
+			/lost its guardian backfill/
+		);
+
+		node.destroy();
+		await shutdown(served);
+		storage.close();
+	});
+});

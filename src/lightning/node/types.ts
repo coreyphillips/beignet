@@ -256,6 +256,18 @@ export interface INodeConfig {
 		 * which on a quiet node is never.
 		 */
 		barrier?: DurabilityBarrier;
+		/**
+		 * Frames compaction will hold back for a guardian that has not caught
+		 * up, before pruning anyway.
+		 *
+		 * Defaults to 1024 in `local` and `async-remote`, where a dead replica
+		 * costs durability alone and unbounded disk is the worse failure. In
+		 * `quorum` there is NO default: crossing the ceiling deletes frames
+		 * fewer than `required` guardians ever accepted, so those frames exist
+		 * nowhere and the namespace is finished. Setting this in quorum mode is
+		 * opting in to that outcome.
+		 */
+		maxRetainedFrameGap?: number;
 		/** Delta frames between full-state snapshots (default 256). */
 		snapshotIntervalFrames?: number;
 		/**

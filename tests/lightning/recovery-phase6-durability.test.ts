@@ -438,10 +438,67 @@ describe('Recovery phase 6: compaction never outruns a replica', () => {
 		for (let i = 0; i < 10; i++) commitOne(fixture.manager, i);
 
 		expect(fixture.forced.length).to.be.greaterThan(0);
-		expect(fixture.forced[0]).to.contain('re-provisioned');
+		expect(fixture.forced[0]).to.contain('exist nowhere');
 		const rows = fixture.storage.loadRecoveryFrames();
 		expect(rows[0].sequence).to.be.greaterThan(1);
 		expect(loadFrames(fixture.storage).length).to.equal(rows.length);
+
+		// And it is RECORDED, not merely reported. A log line dies with the
+		// process, and the next start could not then tell a namespace that is
+		// finished from a guardian set that is merely unreachable: one waits,
+		// the other never will.
+		const recorded = fixture.storage.getRecoveryMeta(
+			JOURNAL_META_KEYS.backfillLost
+		);
+		expect(recorded).to.be.a('string');
+		expect(recorded).to.contain('exist nowhere');
+
+		// Set once. The first loss is the one that killed the namespace, and a
+		// later prune must not overwrite the gap that explains it.
+		for (let i = 10; i < 20; i++) commitOne(fixture.manager, i);
+		expect(
+			fixture.storage.getRecoveryMeta(JOURNAL_META_KEYS.backfillLost)
+		).to.equal(recorded);
+		fixture.storage.close();
+	});
+
+	it('quorum mode NEVER forces the prune unless a ceiling is configured', () => {
+		// The ceiling deletes frames fewer than `required` guardians ever
+		// accepted, so they exist nowhere and no guardian can repair another
+		// from records none of them hold. Unbounded disk is recoverable; a dead
+		// namespace is not. Quorum mode also throttles itself while the quorum
+		// is behind, which is the pressure the ceiling relieves elsewhere.
+		const fixture = makeJournal({
+			durability: 'quorum',
+			snapshotIntervalFrames: 2,
+			retainFrom: (): bigint => 1n
+		});
+		for (let i = 0; i < 40; i++) commitOne(fixture.manager, i);
+
+		expect(fixture.forced).to.have.length(0);
+		expect(fixture.storage.loadRecoveryFrames()[0].sequence).to.equal(1);
+		expect(
+			fixture.storage.getRecoveryMeta(JOURNAL_META_KEYS.backfillLost)
+		).to.equal(null);
+		fixture.storage.close();
+	});
+
+	it('a weaker mode still forces at its configured ceiling', () => {
+		// Pins the asymmetry, so a later refactor cannot quietly extend the
+		// no-forcing rule to the modes that genuinely need the bound: there a
+		// dead replica costs durability alone and nothing throttles the writer.
+		const fixture = makeJournal({
+			durability: 'async-remote',
+			snapshotIntervalFrames: 2,
+			maxRetainedFrameGap: 3,
+			retainFrom: (): bigint => 1n
+		});
+		for (let i = 0; i < 10; i++) commitOne(fixture.manager, i);
+
+		expect(fixture.forced.length).to.be.greaterThan(0);
+		expect(fixture.storage.loadRecoveryFrames()[0].sequence).to.be.greaterThan(
+			1
+		);
 		fixture.storage.close();
 	});
 

@@ -52,9 +52,15 @@ export type BarrierOutcome =
 			 * the message must never go out at all. `stopped`: the node is
 			 * shutting down. `missing-frame`: nothing named the frame that
 			 * authorized this message, so there is no receipt that could ever
-			 * release it.
+			 * release it. `backfill-lost`: compaction pruned frames the quorum
+			 * never received, so the namespace can never advance again.
 			 */
-			reason: 'timeout' | 'fenced' | 'stopped' | 'missing-frame';
+			reason:
+				| 'timeout'
+				| 'fenced'
+				| 'stopped'
+				| 'missing-frame'
+				| 'backfill-lost';
 	  };
 
 export interface IDurabilityBarrierEvent {
@@ -63,6 +69,7 @@ export interface IDurabilityBarrierEvent {
 		| 'barrier:waiting'
 		| 'barrier:timeout'
 		| 'barrier:fenced'
+		| 'barrier:backfill-lost'
 		| 'barrier:unreachable';
 	detail: string;
 	/** The frame sequence the event is about, where there is one. */
@@ -97,6 +104,23 @@ export interface IDurabilityBarrierConfig {
 	timeoutMs?: number;
 	/** Gap between retry passes while waiters are outstanding. Default 1s. */
 	retryDelayMs?: number;
+	/**
+	 * Has this namespace lost the ability to backfill its guardians?
+	 *
+	 * Defaults to the replicator's own reading of the journal metadata, so
+	 * nothing has to be wired for it. Override only to test the refusal.
+	 *
+	 * A PREDICATE over the database rather than a push from the journal, and
+	 * deliberately so: the database stays the single source of truth, a
+	 * compaction that rolls back cannot brick a live barrier, a restart cannot
+	 * forget one that committed, and nothing has to call into the barrier from
+	 * inside an open storage transaction.
+	 *
+	 * What it buys is a NAMED refusal. Without it a dead namespace is
+	 * indistinguishable from an unreachable quorum: every batch waits out the
+	 * full timeout and reports one, forever.
+	 */
+	backfillLost?: () => boolean;
 	onEvent?: (event: IDurabilityBarrierEvent) => void;
 }
 
@@ -122,6 +146,8 @@ export class DurabilityBarrier {
 	private kicked = false;
 	private fenced = false;
 	private supersededBy: GuardianState | undefined;
+	/** Monotone, like the fact it mirrors: once lost, never regained. */
+	private backfillLost = false;
 	private stopped = false;
 	private retryTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Resolves the pump's in-flight delay, so a stop does not strand it. */
@@ -180,6 +206,40 @@ export class DurabilityBarrier {
 		return this.config.durability === 'quorum';
 	}
 
+	/**
+	 * This namespace can never advance again: compaction pruned frames the
+	 * quorum never received, so every guardian behind that point refuses every
+	 * later record with a sequence gap and no guardian can repair another from
+	 * records none of them hold.
+	 *
+	 * Read through to storage until it turns true, then cached, because the
+	 * fact it mirrors is itself set once and never cleared. The dispatch
+	 * boundary reads this to refuse a NEW channel: opening one is the single
+	 * irreversible step the barrier does not otherwise gate, since
+	 * funding_created, funding_signed and channel_ready are not barrier-class.
+	 * Closing is deliberately left working, in both forms: it is the only exit
+	 * an operator has.
+	 */
+	get namespaceLost(): boolean {
+		if (this.backfillLost) return true;
+		const lost =
+			this.config.backfillLost?.() ??
+			this.config.replicator.namespaceLostBackfill() !== null;
+		if (lost) {
+			this.backfillLost = true;
+			this.emit({
+				type: 'barrier:backfill-lost',
+				detail:
+					'this recovery namespace lost its guardian backfill, so no further ' +
+					'transition can ever be proven durable',
+				waiting: this.waiters.length
+			});
+			this.cancelRetry();
+			this.settleAll({ released: false, reason: 'backfill-lost' });
+		}
+		return this.backfillLost;
+	}
+
 	get durability(): RecoveryDurability {
 		return this.config.durability;
 	}
@@ -228,6 +288,13 @@ export class DurabilityBarrier {
 		}
 		if (this.fenced) {
 			return Promise.resolve({ released: false, reason: 'fenced' });
+		}
+		// Asked here rather than in isReleased, which is the per-batch hot path
+		// and is already correct without it: the watermark simply can never
+		// reach the sequence. This turns the resulting 30s stall into an
+		// immediate, named refusal.
+		if (this.namespaceLost) {
+			return Promise.resolve({ released: false, reason: 'backfill-lost' });
 		}
 		if (this.stopped) {
 			return Promise.resolve({ released: false, reason: 'stopped' });
@@ -315,12 +382,17 @@ export class DurabilityBarrier {
 		durableThrough: bigint;
 		waiting: number;
 		fenced: boolean;
+		backfillLost: boolean;
 	} {
 		return {
 			durability: this.config.durability,
 			durableThrough: this.watermark(),
 			waiting: this.waiters.length,
-			fenced: this.fenced
+			fenced: this.fenced,
+			// Beside `fenced`, never folded into it. They are different facts
+			// with different remedies: a fence means another device owns this
+			// namespace, and this means nobody can advance it again.
+			backfillLost: this.namespaceLost
 		};
 	}
 
@@ -450,6 +522,10 @@ export class DurabilityBarrier {
 		try {
 			do {
 				this.kicked = false;
+				// Checked once per pass so a waiter parked when compaction
+				// killed the namespace is settled now, rather than sitting out
+				// its full timeout and reporting the wrong reason.
+				if (this.namespaceLost) return;
 				const lease = this.config.lease();
 				if (!lease) {
 					// Ownership is unsettled. Releasing here would be exactly the

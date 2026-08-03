@@ -63,6 +63,13 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
  * memory of a promise it made to every future restore of this chain.
  */
 const META_DURABILITY_FLOOR = 'journal_durability_floor';
+/**
+ * Compaction pruned frames the quorum had not received, so those frames exist
+ * nowhere: not locally, and not at any guardian that could have served a
+ * repair. Set once, never cleared, because it records something irreversible
+ * about the NAMESPACE rather than a condition that can improve.
+ */
+const META_BACKFILL_LOST = 'journal_backfill_lost';
 
 /**
  * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
@@ -75,7 +82,8 @@ export const JOURNAL_META_KEYS = {
 	writerEpoch: META_WRITER_EPOCH,
 	lastSnapshot: META_LAST_SNAPSHOT,
 	lastSnapshotWritten: META_LAST_SNAPSHOT_WRITTEN,
-	durabilityFloor: META_DURABILITY_FLOOR
+	durabilityFloor: META_DURABILITY_FLOOR,
+	backfillLost: META_BACKFILL_LOST
 } as const;
 
 /** Deltas between full-state snapshot frames. */
@@ -117,14 +125,24 @@ export interface IRecoveryJournalOptions {
 	/**
 	 * Ceiling on the SEQUENCE GAP compaction will hold back waiting for a
 	 * replica, after which it prunes anyway. Without it a permanently dead
-	 * guardian would grow the journal without bound. Default 1024.
+	 * guardian would grow the journal without bound. Default 1024 outside
+	 * quorum mode, and NO ceiling at all in quorum mode.
 	 *
 	 * A gap rather than a frame count, and the distinction is deliberate: past
 	 * compactions mean the retained rows are at most the gap, never more, so
 	 * measuring the gap trips the ceiling no later than counting rows would.
-	 * Crossing it orphans every guardian behind the watermark, not one lagging
-	 * replica, and the namespace then has to be re-provisioned; that is why
-	 * the default is high and the event that reports it says so.
+	 *
+	 * The asymmetry between the modes is the important part. Crossing the
+	 * ceiling deletes frames that, by definition, `required` guardians never
+	 * accepted, so they exist nowhere: no guardian can repair another from
+	 * records none of them hold. The namespace is then finished, because the
+	 * origin is immutable and every guardian behind that point refuses every
+	 * later record with a sequence gap. Under a quorum barrier that is not a
+	 * degraded node, it is a permanently frozen one. Unbounded disk is
+	 * recoverable; a dead namespace is not. Quorum mode also throttles itself
+	 * while the quorum is behind, which is exactly the pressure the ceiling
+	 * exists to relieve in the other modes, so setting one here is opting in
+	 * to destroying the namespace and must be explicit.
 	 */
 	maxRetainedFrameGap?: number;
 	/** Compaction pruned frames a replica had not yet received. */
@@ -350,6 +368,22 @@ export function chainPromisedQuorum(
 }
 
 /**
+ * Has compaction ever pruned frames the quorum never received? Returns the
+ * recorded detail, or null.
+ *
+ * Journal free, like chainPromisedQuorum and for the same reason: the fact
+ * outlives the object that recorded it and has to be readable by a barrier and
+ * an operator surface that hold no journal. It is also the reason the fact is
+ * PERSISTED at all. Before this, a forced prune was a log line, and the next
+ * process start could not tell a permanently dead namespace from a guardian
+ * set that was merely unreachable, which is precisely the pair a node must
+ * distinguish: one waits, and the other never will.
+ */
+export function chainLostBackfill(storage: IStorageBackend): string | null {
+	return storage.getRecoveryMeta?.(META_BACKFILL_LOST) ?? null;
+}
+
+/**
  * The highest frame sequence this database can SHOW, or null when the
  * journal's own bookkeeping and the frames on disk disagree.
  *
@@ -392,7 +426,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** The mode every frame this journal writes declares (spec 5.8). */
 	private readonly durability: RecoveryDurability | undefined;
 	private readonly retainFrom: (() => bigint) | undefined;
-	private readonly maxRetainedFrameGap: number;
+	/** null means no ceiling: the prune is never forced. */
+	private readonly maxRetainedFrameGap: number | null;
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
@@ -434,8 +469,11 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.onDurabilityRefused
 		);
 		this.retainFrom = options.retainFrom;
+		// `this.durability` is already resolved above, sticky rule included, so
+		// a chain that was forced into quorum mode also loses the ceiling.
 		this.maxRetainedFrameGap =
-			options.maxRetainedFrameGap ?? DEFAULT_MAX_RETAINED_FRAME_GAP;
+			options.maxRetainedFrameGap ??
+			(this.durability === 'quorum' ? null : DEFAULT_MAX_RETAINED_FRAME_GAP);
 		this.onCompactionForced = options.onCompactionForced;
 	}
 
@@ -708,24 +746,34 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private compactTo(snapshotSequence: bigint): void {
 		const floor = this.retainFrom?.();
 		if (floor !== undefined && floor < snapshotSequence) {
+			const ceiling = this.maxRetainedFrameGap;
 			const held = snapshotSequence - floor;
-			if (held <= BigInt(this.maxRetainedFrameGap)) return;
-			// Nothing behind this point is coming back on its own. Be exact
-			// about the cost: the floor is the QUORUM watermark, so crossing
-			// the ceiling orphans every guardian that has not caught up, not
-			// one lagging replica, and the namespace has to be re-provisioned
-			// from a fresh registration. The alternative is a journal that
-			// grows without bound behind a guardian set that is simply gone,
-			// so the ceiling is deliberately high rather than absent.
-			this.onCompactionForced?.(
+			if (ceiling === null || held <= BigInt(ceiling)) return;
+			// Nothing behind this point is coming back, from anywhere. The
+			// floor is the QUORUM watermark, so the frames about to go were
+			// accepted by fewer than `required` guardians and no guardian can
+			// repair another from records none of them hold. The origin is
+			// immutable and every guardian behind this point refuses every
+			// later record with a sequence gap, so the namespace is finished:
+			// a new one needs a new node identity or operator deletion at every
+			// guardian, which is not something the writer can do for itself.
+			const detail =
 				`compaction pruned to frame ${snapshotSequence} while the quorum had ` +
-					`only reached frame ${
-						floor - 1n
-					}: the ${held} frame gap exceeded the ` +
-					`${this.maxRetainedFrameGap} frame retention ceiling, so every guardian ` +
-					`behind that point can no longer be backfilled and this namespace has ` +
-					`to be re-provisioned`
-			);
+				`only reached frame ${
+					floor - 1n
+				}: the ${held} frame gap exceeded the ` +
+				`${ceiling} frame retention ceiling, so those frames now exist nowhere ` +
+				`and no guardian behind that point can ever be backfilled. This ` +
+				`recovery namespace is finished; a new one needs a new node identity ` +
+				`or operator deletion at every guardian`;
+			// Recorded BEFORE the delete and inside the caller's transaction, so
+			// a compaction that rolls back cannot leave a node believing it lost
+			// a backfill it still has. Set once: the first loss is the one that
+			// killed the namespace.
+			if (this.storage.getRecoveryMeta!(META_BACKFILL_LOST) == null) {
+				this.storage.setRecoveryMeta!(META_BACKFILL_LOST, detail);
+			}
+			this.onCompactionForced?.(detail);
 		}
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
 		this.storage.setRecoveryMeta!(

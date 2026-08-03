@@ -49,7 +49,11 @@ import {
 	verifyGuardianBindings,
 	verifyGuardianReceipt
 } from './guardian-client';
-import { JOURNAL_META_KEYS, storedTipSequence } from './journal';
+import {
+	JOURNAL_META_KEYS,
+	chainLostBackfill,
+	storedTipSequence
+} from './journal';
 import {
 	IWriterLeaseKeys,
 	generateWriterKey,
@@ -625,6 +629,18 @@ export class GuardianReplicator {
 		} catch {
 			return 0n;
 		}
+	}
+
+	/**
+	 * Why this namespace can never advance again, or null.
+	 *
+	 * Read from the journal's own metadata rather than tracked in memory,
+	 * because the fact is irreversible and has to survive the process that
+	 * discovered it. Exposed here so a barrier, which already holds the
+	 * replicator, needs nothing else wired to it.
+	 */
+	namespaceLostBackfill(): string | null {
+		return chainLostBackfill(this.config.storage);
 	}
 
 	/**

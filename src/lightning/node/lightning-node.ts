@@ -197,6 +197,7 @@ import {
 	RecoveryMutation,
 	GuardianStartupGate,
 	DurabilityBarrier,
+	chainLostBackfill,
 	chainPromisedQuorum,
 	RecoveryDurability,
 	ChannelRecoveryStatus,
@@ -670,8 +671,18 @@ export class LightningNode extends EventEmitter {
 							onDurabilityRefused: (detail): void => {
 								durabilityRefusal = detail;
 							},
+							maxRetainedFrameGap: config.recovery.maxRetainedFrameGap,
 							onCompactionForced: (detail): void => {
 								this.logger?.warn(`recovery compaction: ${detail}`);
+								// Deferred out of the commit's open transaction: this
+								// fires from inside RecoveryManager.commit, and a
+								// listener that touches storage must not run there.
+								setImmediate(() => {
+									this.emitStructuredLog('channel', 'recovery_backfill_lost', {
+										detail
+									});
+									this.emit('recovery:backfill-lost', detail);
+								});
 							},
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
 							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
@@ -3226,6 +3237,13 @@ export class LightningNode extends EventEmitter {
 		 */
 		awaitingDurabilityCount: number;
 		fenced: boolean;
+		/**
+		 * Compaction pruned frames the quorum never received, so this
+		 * namespace can never advance again. Beside `fenced` and never folded
+		 * into it: a fence means another device owns the namespace and this
+		 * means nobody can advance it, and the remedies differ.
+		 */
+		backfillLost: boolean;
 		channels: Array<{
 			channelId: string;
 			status: ChannelRecoveryStatus;
@@ -3263,6 +3281,12 @@ export class LightningNode extends EventEmitter {
 			// field is named after keeps them agreeing.
 			awaitingDurabilityCount: holding.size,
 			fenced: barrier?.fenced ?? false,
+			// Falls back to the database, so a node whose barrier was removed
+			// (or which never had one) still reports the fact rather than a
+			// reassuring false.
+			backfillLost:
+				barrier?.backfillLost ??
+				(this.storage ? chainLostBackfill(this.storage) !== null : false),
 			channels
 		};
 	}

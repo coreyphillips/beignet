@@ -28,6 +28,7 @@ import {
 	IBoundGuardianClient,
 	IDurabilityBarrierEvent,
 	IWriterLeaseKeys,
+	JOURNAL_META_KEYS,
 	REPLICATION_META_KEYS,
 	RecoveryCriticality,
 	RecoveryJournal,
@@ -700,5 +701,110 @@ describe('Recovery phase 6: a watermark speaks only for frames we hold', () => {
 		barrier.stop();
 		midJournal.close();
 		await shutdown(served);
+	});
+});
+
+describe('Recovery phase 6: a namespace that can never advance says so', () => {
+	it('refuses IMMEDIATELY with its own reason, not on the timeout', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		const sequence = commit(harness, 51);
+
+		const events: IDurabilityBarrierEvent[] = [];
+		const barrier = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: rep,
+			lease: (): IWriterLeaseKeys => lease,
+			// Long enough that a timeout would be obvious in the elapsed time.
+			timeoutMs: 60_000,
+			retryDelayMs: 50,
+			backfillLost: (): boolean => true,
+			onEvent: (event): void => {
+				events.push(event);
+			}
+		});
+
+		const started = Date.now();
+		const outcome = await barrier.whenReleased(sequence);
+		expect(outcome.released).to.equal(false);
+		expect((outcome as { reason: string }).reason).to.equal('backfill-lost');
+		expect(Date.now() - started).to.be.lessThan(2_000);
+		expect(events.map((e) => e.type)).to.contain('barrier:backfill-lost');
+		expect(barrier.snapshot().backfillLost).to.equal(true);
+		// A different fact from a fence, with a different remedy, so the two
+		// must never be folded into one another.
+		expect(barrier.snapshot().fenced).to.equal(false);
+
+		barrier.stop();
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('settles a waiter already parked when the loss is discovered', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		await rep.ensureNamespace();
+		const sequence = commit(harness, 52);
+
+		let lost = false;
+		const barrier = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: rep,
+			// No lease yet, so nothing can release and the waiter genuinely parks.
+			lease: (): IWriterLeaseKeys | null => null,
+			timeoutMs: 60_000,
+			retryDelayMs: 25,
+			backfillLost: (): boolean => lost
+		});
+
+		const waiting = barrier.whenReleased(sequence + 100n);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		lost = true;
+
+		// Ended by the pump noticing, not by its own timer 60s later.
+		const outcome = await waiting;
+		expect(outcome.released).to.equal(false);
+		expect((outcome as { reason: string }).reason).to.equal('backfill-lost');
+
+		barrier.stop();
+		await shutdown(served);
+		storage.close();
+	});
+
+	it('reads the loss straight out of the journal with nothing wired', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		commit(harness, 53);
+		storage.setRecoveryMeta(
+			JOURNAL_META_KEYS.backfillLost,
+			'a previous run pruned past the ceiling'
+		);
+
+		// No backfillLost predicate supplied: the fact is irreversible and
+		// lives in the journal, so it must survive the process that found it.
+		const barrier = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: rep,
+			lease: (): IWriterLeaseKeys => lease,
+			timeoutMs: 1_000
+		});
+		expect(barrier.namespaceLost).to.equal(true);
+
+		barrier.stop();
+		await shutdown(served);
+		storage.close();
 	});
 });

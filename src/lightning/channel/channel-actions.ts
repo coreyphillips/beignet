@@ -252,6 +252,19 @@ export interface IChannelPersistRequest {
 export interface IWireDurabilityBarrier {
 	/** False in local and async-remote, where nothing is ever held. */
 	readonly enforcing: boolean;
+	/**
+	 * This namespace can never be proven durable again (compaction outran
+	 * replication). Optional so a test double or a non-guardian barrier needs
+	 * no opinion on it.
+	 *
+	 * The channel layer consults it for ONE thing: refusing a new channel.
+	 * Every other irreversible step is already gated by the barrier itself,
+	 * and would now refuse immediately rather than after a timeout, but
+	 * funding_created, funding_signed and channel_ready are not barrier-class,
+	 * so opening is the one irreversible commitment that would otherwise
+	 * proceed into a namespace that can never record it.
+	 */
+	readonly namespaceLost?: boolean;
 	/** The synchronous question: is this frame already quorum durable? */
 	isReleased(sequence: bigint | null): boolean;
 	/** Park until it is, or until the wait is refused. */

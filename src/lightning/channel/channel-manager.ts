@@ -179,6 +179,12 @@ interface IHeldBatch {
 	outboxIds: Array<number | null>;
 }
 
+/** Why a new channel is refused once the recovery namespace is finished. */
+const NAMESPACE_LOST_REFUSAL =
+	'recovery: this namespace lost its guardian backfill, so a new channel ' +
+	'could never be proven durable; close the existing channels and provision ' +
+	'a new namespace';
+
 /** One channel's held batches, released strictly in order. */
 interface IBarrierQueue {
 	peerPubkey: string;
@@ -608,6 +614,7 @@ export class ChannelManager extends EventEmitter {
 		if (this.peerManager && !this.peerManager.getPeer(peerPubkey)) {
 			throw new Error(`Not connected to peer ${peerPubkey}`);
 		}
+		this._assertNamespaceCanRecordANewChannel();
 		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
 			throw new Error(
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
@@ -2076,6 +2083,10 @@ export class ChannelManager extends EventEmitter {
 				msg.temporaryChannelId,
 				`open_channel for unknown chain ${msg.chainHash.toString('hex')}`
 			);
+			return;
+		}
+		if (this._namespaceCannotRecordANewChannel()) {
+			this.emit('error', msg.temporaryChannelId, NAMESPACE_LOST_REFUSAL);
 			return;
 		}
 
@@ -3866,6 +3877,10 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
+		if (this._namespaceCannotRecordANewChannel()) {
+			this.emit('error', msg.channelId, NAMESPACE_LOST_REFUSAL);
+			return;
+		}
 
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createAcceptorState({
@@ -4886,6 +4901,28 @@ export class ChannelManager extends EventEmitter {
 		if (this.barrierQueues.has(channelIdHex)) return true;
 		if (!this._carriesBarrierMessage(actions, persistIndex + 1)) return false;
 		return !barrier.isReleased(persistRequest?.frameSequence ?? null);
+	}
+
+	/**
+	 * A namespace that can never advance again must not take on a new
+	 * commitment it can never record.
+	 *
+	 * Only opening is refused. Every other irreversible step is barrier-class
+	 * and now refuses immediately with its own reason; funding_created,
+	 * funding_signed and channel_ready are not, so an open would otherwise run
+	 * to completion into a namespace with no future. Closing keeps working in
+	 * both forms, cooperative and forced, because it is the only exit an
+	 * operator has left.
+	 */
+	private _namespaceCannotRecordANewChannel(): boolean {
+		const barrier = this.config.durabilityBarrier;
+		return barrier?.enforcing === true && barrier.namespaceLost === true;
+	}
+
+	private _assertNamespaceCanRecordANewChannel(): void {
+		if (this._namespaceCannotRecordANewChannel()) {
+			throw new Error(NAMESPACE_LOST_REFUSAL);
+		}
 	}
 
 	/**
