@@ -216,9 +216,9 @@ export class DurabilityBarrier {
 	 * fact it mirrors is itself set once and never cleared. The dispatch
 	 * boundary reads this to refuse a NEW channel: opening one is the single
 	 * irreversible step the barrier does not otherwise gate, since
-	 * funding_created, funding_signed and channel_ready are not barrier-class.
-	 * Closing is deliberately left working, in both forms: it is the only exit
-	 * an operator has.
+	 * funding_created and channel_ready are not barrier-class. Closing is
+	 * deliberately left working, in both forms: it is the only exit an operator
+	 * has.
 	 */
 	get namespaceLost(): boolean {
 		if (!this.backfillLost) {

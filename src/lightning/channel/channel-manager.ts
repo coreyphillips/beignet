@@ -1577,6 +1577,16 @@ export class ChannelManager extends EventEmitter {
 			return { ok: false, actions: [], error };
 		}
 
+		// Terminal override, BEFORE the channel is mutated. A force close is the
+		// operator's exit and must not queue behind a barrier that may never
+		// release: its batch carries no persist, so the wire-order rule would
+		// park it behind whatever this channel is already holding, and a
+		// refusal there would suppress the commitment broadcast while the
+		// CHANNEL_CLOSED beside it still ran and this method still answered ok.
+		// Ending the off-chain protocol is exactly the point of the call, so
+		// preserving off-chain order behind an unreachable quorum buys nothing.
+		this._abandonQueueForTerminalClose(idHex);
+
 		const signer = this.signerFor(channel, true);
 		const actions = channel.forceClose(signer);
 		const failure = actions.find(
@@ -5305,6 +5315,71 @@ export class ChannelManager extends EventEmitter {
 	/** Channel ids currently holding messages behind the barrier. */
 	channelsAwaitingDurability(): Set<string> {
 		return new Set(this.barrierQueues.keys());
+	}
+
+	/**
+	 * Ask again for an authorization a restart lost, for one channel.
+	 *
+	 * Returns whether a request was dispatched. Callers use that to keep one
+	 * outstanding request per transaction rather than minting a fresh frame on
+	 * every block while the first one is still waiting on the quorum.
+	 */
+	reauthorizeFundingBroadcast(channelId: Buffer): boolean {
+		return this._dispatchReauthorization(channelId, (channel) =>
+			channel.buildFundingReauthorizationActions()
+		);
+	}
+
+	/** The splice equivalent, for a fully signed splice resumed at startup. */
+	reauthorizeSpliceBroadcast(channelId: Buffer): boolean {
+		return this._dispatchReauthorization(channelId, (channel) =>
+			channel.buildSpliceRebroadcastActions()
+		);
+	}
+
+	private _dispatchReauthorization(
+		channelId: Buffer,
+		build: (channel: Channel) => ChannelAction[]
+	): boolean {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		if (!channel) return false;
+		const peerPubkey = this.channelPeers.get(idHex);
+		if (!peerPubkey) return false;
+		const actions = build(channel);
+		if (actions.length === 0) return false;
+		this.processActions(peerPubkey, channel, actions);
+		return true;
+	}
+
+	/**
+	 * Tear a channel's barrier queue down because it is force closing.
+	 *
+	 * Everything parked runs for its committed edge-triggered effects only and
+	 * its wire half is abandoned permanently: once the commitment is on chain
+	 * the off-chain stream is over, and releasing an older message after it
+	 * would describe a channel that no longer exists. Removing the queue also
+	 * retires the release loop, whose own guard stops it from dispatching into
+	 * a queue this method has replaced.
+	 *
+	 * Its OWN event, because this is neither a durability refusal nor a
+	 * dispatch failure: nothing went wrong, an operator asked for the exit.
+	 */
+	private _abandonQueueForTerminalClose(channelIdHex: string): void {
+		const queue = this.barrierQueues.get(channelIdHex);
+		if (!queue) return;
+		this.barrierQueues.delete(channelIdHex);
+		const abandoned = queue.batches;
+		queue.batches = [];
+		for (const batch of abandoned) {
+			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, batch);
+		}
+		this.emit(
+			'transition:terminal-override',
+			queue.peerPubkey,
+			channelIdHex,
+			abandoned.length
+		);
 	}
 
 	/**

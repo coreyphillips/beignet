@@ -291,9 +291,9 @@ export interface IWireDurabilityBarrier {
 	 * The channel layer consults it for ONE thing: refusing a new channel.
 	 * Every other irreversible step is already gated by the barrier itself,
 	 * and would now refuse immediately rather than after a timeout, but
-	 * funding_created, funding_signed and channel_ready are not barrier-class,
-	 * so opening is the one irreversible commitment that would otherwise
-	 * proceed into a namespace that can never record it.
+	 * funding_created and channel_ready are not barrier-class, so opening is
+	 * the one irreversible commitment that would otherwise proceed into a
+	 * namespace that can never record it.
 	 */
 	readonly namespaceLost?: boolean;
 	/** The synchronous question: is this frame already quorum durable? */

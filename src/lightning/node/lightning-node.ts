@@ -524,6 +524,8 @@ export class LightningNode extends EventEmitter {
 	 * is persisted so a restart resumes the obligation.
 	 */
 	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
+	/** Funding txids with a re-authorization request already in flight. */
+	private pendingFundingReauth: Set<string> = new Set();
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
@@ -2455,6 +2457,7 @@ export class LightningNode extends EventEmitter {
 			const txidHex = fundingTxid.toString('hex');
 			const entry = this.pendingFundingTxs.get(txidHex);
 			if (entry) entry.phase = 'authorized';
+			this.pendingFundingReauth.delete(txidHex);
 			this.broadcastPendingFundingTx(txidHex);
 		});
 
@@ -3644,11 +3647,17 @@ export class LightningNode extends EventEmitter {
 					state.remoteCurrentPerCommitmentPoint!
 				);
 
-				// Store pending tx BEFORE createFunding — the synchronous message chain
-				// (funding_created → funding_signed → watch:funding) completes during the call
+				// Retained BEFORE createFunding so a crash in the signing window
+				// cannot lose the transaction. It is a CANDIDATE, not an
+				// obligation: BOLT 2 starts that at funding_signed, and nothing
+				// here may put it on the network. The comment this replaces
+				// claimed the funding_created to watch:funding chain completed
+				// synchronously, which held only in loopback and is exactly what
+				// let a block broadcast it mid-handshake.
 				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
-				// Send funding_created — triggers synchronous chain that broadcasts via watch:funding
+				// Send funding_created. The broadcast now waits for the
+				// authorization action handleFundingSigned emits.
 				this.channelManager.createFunding(
 					channel,
 					txid,
@@ -3751,37 +3760,49 @@ export class LightningNode extends EventEmitter {
 	 * the hold. Only the authorization ACTION knows it cleared both the persist
 	 * gate and the barrier.
 	 *
-	 * A restored entry is the one case the action cannot speak for, since
-	 * nothing re-runs handleFundingSigned across a restart, so there it does
-	 * fall back to the channel. That is safe for the reason the barrier exists:
-	 * the hazard is the wire having seen what a restore does not have, and a
-	 * restore that HAS the channel row has the frame that recorded it.
+	 * A RESTORED entry is not resolved from the channel either, and that is the
+	 * subtle half. The obligation survives a restart, because the peer's
+	 * signature over our commitment #0 is on disk; the AUTHORIZATION does not,
+	 * and the two are not the same thing. A channel row proves only that THIS
+	 * device wrote the frame, never that the guardians accepted it, so under a
+	 * barrier the original authorization may have been held when the process
+	 * died and reading the row back would walk straight around the hold.
+	 * Restored channel state may determine that an authorization is NEEDED. It
+	 * must never BE the authorization, so the restart asks again through a
+	 * fresh persist whose frame the barrier can actually wait on.
 	 */
 	private owesFundingBroadcast(txidHex: string): boolean {
 		const entry = this.pendingFundingTxs.get(txidHex);
 		if (!entry) return false;
 		if (entry.phase === 'authorized') return true;
-		// A candidate is refused outright: its authorization has not been
-		// dispatched, so there is nothing yet to resolve against.
-		if (entry.phase === 'candidate') return false;
+		// A candidate has no authorization dispatched yet; a restored entry
+		// lost the one it had. Neither may broadcast on its own account.
+		if (entry.phase === 'restored') this.requestFundingReauthorization(txidHex);
+		return false;
+	}
+
+	/**
+	 * Mint a fresh authorizing frame for a restored funding obligation, at most
+	 * one at a time per transaction.
+	 *
+	 * Without the outstanding-request guard every block would append another
+	 * no-op frame while the first was still waiting on the quorum. The flag is
+	 * cleared when the authorization is granted, and on a refusal the next
+	 * sweep asks again, which is the retry this obligation is supposed to have.
+	 */
+	private requestFundingReauthorization(txidHex: string): void {
+		if (this.pendingFundingReauth.has(txidHex)) return;
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
-			// Both conditions although either alone answers today.
-			// createFundingCreated is the sole writer of SENT_FUNDING_CREATED
-			// and handleFundingSigned, which stores the verified peer signature
-			// on the ECDSA and the taproot branch alike, is its sole exit. A
-			// state added between them later cannot silently authorize.
-			if (
-				state.state === ChannelState.SENT_FUNDING_CREATED ||
-				!state.remoteCommitmentSignature
-			) {
-				return false;
+			const id = state.channelId ?? state.temporaryChannelId;
+			if (!id) return;
+			this.pendingFundingReauth.add(txidHex);
+			if (!this.channelManager.reauthorizeFundingBroadcast(id)) {
+				this.pendingFundingReauth.delete(txidHex);
 			}
-			entry.phase = 'authorized';
-			return true;
+			return;
 		}
-		return false;
 	}
 
 	/**
@@ -5186,17 +5207,18 @@ export class LightningNode extends EventEmitter {
 					fundingScript,
 					spliceTxidHex
 				);
-				if (
-					inflight.fullySigned &&
-					this._chainBackend &&
-					this.isCurrentChainStartup(generation)
-				) {
-					try {
-						await this._chainBackend.broadcastTransaction(inflight.spliceTxHex);
-					} catch {
-						// Already in mempool/confirmed (or backend hiccup) — the watch
-						// above still reports confirmation either way.
-					}
+				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
+					// Through the ACTION path, never straight at the backend. A
+					// splice creates a funding output exactly as an open does, so
+					// it answers to the same rule, and a direct call here has no
+					// frame, no persist gate and no barrier: a restart could put
+					// on chain the very transaction the barrier was holding when
+					// the process died. The rebroadcast is idempotent and the
+					// watch armed above reports the confirmation either way, so
+					// nothing is lost by making it wait its turn.
+					this.channelManager.reauthorizeSpliceBroadcast(
+						state.channelId || state.temporaryChannelId
+					);
 				}
 				continue;
 			}

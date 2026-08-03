@@ -910,3 +910,59 @@ describe('Recovery phase 6: funding does not outrun its own frame', () => {
 		expect(harness.broadcasts).to.equal(2);
 	});
 });
+
+describe('Recovery phase 6: force close is the exit, never a queue entry', () => {
+	it('a force close on a HELD channel broadcasts, and the queue never flushes', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = stubChannel(channelId);
+		const idHex = channelId.toString('hex');
+		const manager = harness.manager as unknown as {
+			channels: Map<string, Channel>;
+			channelPeers: Map<string, string>;
+			_abandonQueueForTerminalClose(id: string): void;
+		};
+		manager.channels.set(idHex, channel);
+		manager.channelPeers.set(idHex, PEER);
+		const overrides: Array<{ channelId: string; dropped: number }> = [];
+		harness.manager.on(
+			'transition:terminal-override',
+			(_peer: string, id: string, dropped: number) => {
+				overrides.push({ channelId: id, dropped });
+			}
+		);
+
+		// Something irreversible is already parked on this channel.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.REVOKE_AND_ACK)
+		]);
+		expect(harness.sent).to.have.length(0);
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(1);
+
+		// The operator's exit. Its batch carries no persist, so the wire-order
+		// rule would park it behind the held revoke; a refusal there would then
+		// suppress the commitment broadcast while the CHANNEL_CLOSED beside it
+		// still ran, and the caller would already have been told ok.
+		manager._abandonQueueForTerminalClose(idHex);
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([7]) },
+			{ type: ChannelActionType.CHANNEL_CLOSED, channelId } as ChannelAction
+		]);
+
+		expect(harness.broadcasts).to.equal(1);
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
+		expect(overrides).to.deep.equal([{ channelId: idHex, dropped: 1 }]);
+
+		// And the abandoned revoke never reaches the peer, before or after the
+		// barrier resolves either way. Once the commitment is on chain, an
+		// older message would describe a channel that no longer exists.
+		harness.barrier.advance(10n);
+		await settle();
+		expect(harness.sent).to.have.length(0);
+
+		harness.barrier.refuse('timeout');
+		await settle();
+		expect(harness.sent).to.have.length(0);
+	});
+});

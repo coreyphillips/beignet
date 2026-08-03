@@ -609,3 +609,92 @@ describe('Funding broadcast authorization (BOLT 2 ordering)', function () {
 		bob.destroy();
 	});
 });
+
+describe('Funding authorization survives a restart', function () {
+	it('a restart RE-ASKS for authorization instead of inferring it', async function () {
+		// The obligation survives a restart, because the peer's signature over
+		// our commitment #0 is on disk. The AUTHORIZATION does not. A channel
+		// row proves only that THIS device wrote the frame, never that the
+		// guardians accepted it, so a restart that read the row back would walk
+		// straight around a barrier that was holding the broadcast when the
+		// process died. It has to ask again, through a persist whose frame the
+		// barrier can wait on.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'beignet-reauth-')),
+			'node.db'
+		);
+		let fundingTxidHex = '';
+		const failing: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async () => {
+				throw new Error('offline');
+			}
+		};
+
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const alice1 = new LightningNode(
+			makeNodeConfig(51, { fundingProvider: failing, storage: storage1 })
+		);
+		const bob = new LightningNode(makeNodeConfig(52));
+		alice1.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice1, bob);
+		alice1.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice1).has(fundingTxidHex)).to.equal(true);
+		alice1.destroy();
+		bob.destroy();
+
+		const broadcasts: string[] = [];
+		const working: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) =>
+				buildMockFundingTx(address, Number(amountSats)),
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const alice2 = new LightningNode(
+			makeNodeConfig(51, {
+				fundingProvider: working,
+				storage: storage2,
+				chainBackend: new ControlledBackend()
+			})
+		);
+		alice2.on('node:error', () => {});
+
+		// The restart's broadcast must be preceded by a PERSIST for the same
+		// channel: that persist is the frame the authorization rides, and it is
+		// the whole difference between asking again and inferring.
+		const order: string[] = [];
+		(
+			alice2 as unknown as {
+				channelManager: {
+					on(e: string, l: (...a: unknown[]) => void): void;
+				};
+			}
+		).channelManager.on('channel:persist', () => order.push('persist'));
+		(
+			alice2 as unknown as {
+				channelManager: {
+					on(e: string, l: (...a: unknown[]) => void): void;
+				};
+			}
+		).channelManager.on('funding:authorized', () => order.push('authorized'));
+
+		await tick(120);
+
+		expect(broadcasts.length, 'the obligation still resumes').to.equal(1);
+		expect(order[0], 'a fresh frame is minted first').to.equal('persist');
+		expect(order).to.contain('authorized');
+
+		alice2.destroy();
+	});
+});

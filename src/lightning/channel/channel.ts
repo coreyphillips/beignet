@@ -3925,6 +3925,58 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Re-mint the authorization a RESTART lost, for a v1 funding transaction
+	 * this node is already obliged to broadcast.
+	 *
+	 * The obligation itself survives a restart, because the peer's signature
+	 * over our commitment #0 is on disk. The AUTHORIZATION does not, and the
+	 * two are not the same thing. Under a quorum barrier the original
+	 * authorization may have been held when the process died, and a local
+	 * frame is not a quorum-durable one: restoring a channel row proves this
+	 * device wrote the frame, never that the guardians accepted it. So the
+	 * restart asks again, through a fresh persist whose frame the barrier can
+	 * actually wait on, exactly as the recovery-close declaration does.
+	 *
+	 * Restored channel state may determine that an authorization is NEEDED. It
+	 * must never be the authorization.
+	 */
+	buildFundingReauthorizationActions(): ChannelAction[] {
+		const fundingTxid = this._state.fundingTxid;
+		if (!fundingTxid) return [];
+		// The same two conditions the live path establishes at funding_signed.
+		if (this._state.state === ChannelState.SENT_FUNDING_CREATED) return [];
+		if (!this._state.remoteCommitmentSignature) return [];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+				fundingTxid
+			}
+		];
+	}
+
+	/**
+	 * The same re-authorization for a fully signed splice resumed at startup.
+	 *
+	 * Startup used to hand the retained hex straight to the chain backend,
+	 * which is outside the action model entirely: no frame, no persist gate and
+	 * no barrier. A splice creates a funding output exactly as an open does, so
+	 * it answers to the same rule.
+	 */
+	buildSpliceRebroadcastActions(): ChannelAction[] {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight?.fullySigned || !inflight.spliceTxHex) return [];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.from(inflight.spliceTxHex, 'hex'),
+				fundingCritical: true
+			}
+		];
+	}
+
 	forceClose(signer: ISigner): ChannelAction[] {
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected) or unprovable (stateUncertain), our latest local
