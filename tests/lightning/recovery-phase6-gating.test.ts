@@ -62,14 +62,20 @@ class ScriptedBarrier implements IWireDurabilityBarrier {
 		resolve: (outcome: { released: boolean; reason: string }) => void;
 	}> = [];
 
+	// Mirrors the production barrier, including its fail-closed answer to a
+	// missing frame: no frame is not permission, because an unattributed
+	// transition names nothing a guardian could ever have receipted.
 	isReleased(sequence: bigint | null): boolean {
-		if (sequence == null) return true;
+		if (sequence == null) return false;
 		return sequence <= this.watermark;
 	}
 
 	whenReleased(
 		sequence: bigint | null
 	): Promise<{ released: boolean; reason: string }> {
+		if (sequence == null) {
+			return Promise.resolve({ released: false, reason: 'missing-frame' });
+		}
 		if (this.isReleased(sequence)) {
 			return Promise.resolve({ released: true, reason: 'durable' });
 		}
@@ -106,6 +112,12 @@ interface IHarness {
 	sent: Array<{ peer: string; type: number }>;
 	broadcasts: number;
 	frozen: Array<{ channelId: string; reason: string; dropped: number }>;
+	dispatchFailed: Array<{
+		channelId: string;
+		reason: string;
+		dropped: number;
+	}>;
+	errors: string[];
 	held: string[];
 	outboxSent: Array<Array<number | null>>;
 	/** Next frame sequence the persist listener will report. */
@@ -125,10 +137,17 @@ function makeHarness(enforcing = true): IHarness {
 		sent: [],
 		broadcasts: 0,
 		frozen: [],
+		dispatchFailed: [],
+		errors: [],
 		held: [],
 		outboxSent: [],
 		nextFrame: 1n
 	};
+	// ChannelManager is a bare EventEmitter, so an unhandled 'error' emit
+	// throws out of the call that produced it.
+	manager.on('error', (_id: Buffer | null, message: string) => {
+		harness.errors.push(message);
+	});
 	manager.on(
 		'channel:persist',
 		(_id: Buffer, request?: IChannelPersistRequest) => {
@@ -161,6 +180,17 @@ function makeHarness(enforcing = true): IHarness {
 			harness.frozen.push({ channelId, reason, dropped });
 		}
 	);
+	manager.on(
+		'transition:dispatch-failed',
+		(
+			_peer: string,
+			channelId: string,
+			reason: string,
+			dropped: number
+		): void => {
+			harness.dispatchFailed.push({ channelId, reason, dropped });
+		}
+	);
 	return harness;
 }
 
@@ -186,6 +216,25 @@ function send(messageType: number, payload = 1): ChannelAction {
 		type: ChannelActionType.SEND_MESSAGE,
 		messageType,
 		payload: Buffer.from([payload])
+	} as ChannelAction;
+}
+
+/** A recovery declaration: gated by its MARK, not by its message type. */
+function declare(messageType: number, payload = 1): ChannelAction {
+	return {
+		type: ChannelActionType.SEND_MESSAGE,
+		messageType,
+		payload: Buffer.from([payload]),
+		durabilityCritical: true
+	} as ChannelAction;
+}
+
+function forwardAction(htlcId: bigint): ChannelAction {
+	return {
+		type: ChannelActionType.HTLC_FORWARDED,
+		htlcId,
+		amountMsat: 1_000n,
+		paymentHash: crypto.randomBytes(32)
 	} as ChannelAction;
 }
 
@@ -508,5 +557,157 @@ describe('Recovery phase 6: a refusal drops, it never flushes late', () => {
 		await settle();
 
 		expect(harness.sent).to.have.length(0);
+	});
+});
+
+describe('Recovery phase 6: nothing goes out on a frame nobody named', () => {
+	it('a barrier-class message with NO persist ahead of it is refused, never sent', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = stubChannel(channelId);
+
+		// The barrier is consulted at the PERSIST_STATE action and nowhere
+		// else, so a batch without one used to walk straight past it. There is
+		// no receipt that could ever cover this message: refusing is the only
+		// honest answer.
+		dispatch(harness.manager, channel, [send(MessageType.REVOKE_AND_ACK)]);
+		await settle();
+
+		expect(harness.sent).to.have.length(0);
+		expect(harness.frozen).to.have.length(1);
+		expect(harness.frozen[0].reason).to.equal('missing-frame');
+		expect(harness.frozen[0].channelId).to.equal(channelId.toString('hex'));
+		expect(harness.errors.join(' ')).to.contain('PERSIST_STATE');
+		// And it must RETURN rather than throw: processActions runs inside the
+		// socket data callback, with no try/catch anywhere above it.
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
+	});
+
+	it('a recovery declaration is refused too, so the regenerated close waits', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		// buildRecoveryCloseActions regenerates the data-loss error on every
+		// reconnect. Without its own persist it names no frame, and a peer
+		// acting on it while the disposition is still only local is exactly
+		// how a restore comes back believing it may broadcast again.
+		dispatch(harness.manager, channel, [declare(MessageType.ERROR)]);
+		await settle();
+
+		expect(harness.sent).to.have.length(0);
+		expect(harness.frozen.map((f) => f.reason)).to.deep.equal([
+			'missing-frame'
+		]);
+	});
+
+	it('the declaration DOES go out once its own frame is durable', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			declare(MessageType.ERROR)
+		]);
+		expect(harness.sent).to.have.length(0);
+		expect(harness.held).to.have.length(1);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([MessageType.ERROR]);
+	});
+
+	it('an ORDINARY protocol error is not held at all', () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		// error is BOLT 1's single overloaded failure channel. Holding a
+		// protocol-violation error would buy nothing (it advances no
+		// commitment state) and cost a great deal: it is not retransmittable,
+		// so a refused one is lost for good, and the local force close it
+		// drives rides the same send.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.ERROR)
+		]);
+
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([MessageType.ERROR]);
+		expect(harness.held).to.have.length(0);
+	});
+});
+
+describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
+	it('a batch that throws partway stops every batch queued behind it', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = stubChannel(channelId);
+
+		// One inbound commitment_signed reliably parks revoke_and_ack ahead of
+		// the commitment_signed that answers it. If the first dies partway and
+		// the second still drains, the peer gets a commitment with no
+		// preceding revocation, which is a BOLT 2 violation it answers by
+		// failing the channel with HTLCs in flight.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.REVOKE_AND_ACK),
+			forwardAction(1n)
+		]);
+		harness.nextFrame = 2n;
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.COMMITMENT_SIGNED)
+		]);
+		expect(harness.sent).to.have.length(0);
+
+		harness.manager.on('htlc:forwarded', () => {
+			throw new Error('observer exploded');
+		});
+		harness.barrier.advance(2n);
+		await settle();
+
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.REVOKE_AND_ACK
+		]);
+		expect(harness.dispatchFailed).to.have.length(1);
+		expect(harness.dispatchFailed[0].reason).to.contain('observer exploded');
+		expect(harness.dispatchFailed[0].dropped).to.equal(2);
+		expect(harness.dispatchFailed[0].channelId).to.equal(
+			channelId.toString('hex')
+		);
+		// Nothing is marked sent, so reestablish offers the rows again.
+		expect(harness.outboxSent).to.have.length(0);
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
+
+		// A later advance must not resurrect the abandoned queue either.
+		harness.barrier.advance(10n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.REVOKE_AND_ACK
+		]);
+	});
+
+	it('the failed batch keeps the committed effects of its own tail', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+		const seen: bigint[] = [];
+		harness.manager.on('htlc:forwarded', (_id: Buffer, htlcId: bigint) => {
+			seen.push(htlcId);
+			if (htlcId === 1n) throw new Error('first observer exploded');
+		});
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.REVOKE_AND_ACK),
+			forwardAction(1n),
+			forwardAction(2n)
+		]);
+		harness.barrier.advance(1n);
+		await settle();
+
+		// forwardEmitted was set while the batch was BUILT and is already on
+		// disk, so a forward skipped here is never emitted by any later
+		// commitment round and the HTLC sits unforwarded until its CLTV.
+		expect(seen).to.deep.equal([1n, 2n]);
+		expect(harness.dispatchFailed).to.have.length(1);
+		expect(harness.dispatchFailed[0].dropped).to.equal(1);
 	});
 });

@@ -2284,6 +2284,45 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// A released batch threw partway through dispatch, so an unknown prefix
+		// of its wire bytes is on the socket and its tail never went. There is
+		// no safe continuation on this connection: only reestablish after a
+		// reconnect replays the channel's stream from durable state. The
+		// disconnect is unconditional here, unlike the frozen handler's fenced
+		// exemption, because nothing else is tearing this transport down.
+		this.channelManager.on(
+			'transition:dispatch-failed',
+			(
+				peerPubkey: string,
+				channelIdHex: string,
+				reason: string,
+				dropped: number
+			) => {
+				this.emitStructuredLog('channel', 'transition_dispatch_failed', {
+					peerPubkey,
+					channelId: channelIdHex,
+					reason,
+					dropped
+				});
+				this.emit('node:error', {
+					code: 'BARRIER_DISPATCH_FAILED',
+					channelId: Buffer.from(channelIdHex, 'hex'),
+					message:
+						`a released batch failed partway through dispatch (${reason}); ` +
+						'the connection is dropped so reestablish can replay from durable state',
+					timestamp: Date.now()
+				} as ILightningError);
+				if (!this.peerManager) return;
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
+			}
+		);
+
 		this.channelManager.on(
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {

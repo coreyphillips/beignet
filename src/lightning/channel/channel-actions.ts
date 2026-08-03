@@ -43,6 +43,20 @@ export interface ISendMessageAction {
 	 * would churn the table for nothing.
 	 */
 	replay?: boolean;
+	/**
+	 * A recovery declaration, held by the quorum barrier until the state that
+	 * authorizes it is durable (docs/RECOVERY-PROTOCOL.md 5.8).
+	 *
+	 * Marked per ACTION rather than inferred from the message type, because
+	 * `error` is also BOLT 1's ordinary protocol-violation message. Holding
+	 * those would buy nothing and cost a great deal: an ordinary error is not
+	 * retransmittable, so a refused one is lost for good, and the local
+	 * force-close it drives (the `channel:errored` emit rides the send) would
+	 * be lost with it. The declarations are different in kind. Losing the
+	 * record that broadcasting is FORBIDDEN re-enables broadcasting a
+	 * commitment the peer has provably revoked, which is the whole balance.
+	 */
+	durabilityCritical?: boolean;
 }
 
 export interface IBroadcastTxAction {
@@ -262,8 +276,11 @@ export interface IWireDurabilityBarrier {
  *   therefore held with it.
  * - `tx_signatures` and `splice_locked` are the irreversible splice steps.
  *   Splice negotiation up to them is abortable and deliberately not held.
- * - `error` carries the data-loss declaration. The phase 5 disposition
- *   regenerates it on every reconnect, so holding it costs liveness only.
+ *
+ * The data-loss `error` of spec 5.8's last row is NOT here, and its absence is
+ * deliberate: it is gated by the per-action `durabilityCritical` mark instead,
+ * because `error` is one wire type serving two unrelated purposes and only one
+ * of them is a recovery declaration. See ISendMessageAction.durabilityCritical.
  */
 export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
 	new Set<number>([
@@ -271,9 +288,22 @@ export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
 		MessageType.UPDATE_FULFILL_HTLC,
 		MessageType.COMMITMENT_SIGNED,
 		MessageType.TX_SIGNATURES,
-		MessageType.SPLICE_LOCKED,
-		MessageType.ERROR
+		MessageType.SPLICE_LOCKED
 	]);
+
+/**
+ * The version of the gated set above, plus the `durabilityCritical` mark.
+ *
+ * A frame declaring `quorum` is a claim about WHICH messages its writer held
+ * back, and that claim is only as strong as the policy in force when the frame
+ * was written. Without a version a later release could widen this set and then
+ * read an old frame's bare `quorum` as a promise about messages that frame's
+ * writer never gated, which is a restore resuming a channel on evidence nobody
+ * produced. Bump this in the SAME commit as any change to what is gated; the
+ * pinned-set test in tests/lightning/recovery-phase6-exactness.test.ts fails
+ * otherwise.
+ */
+export const WIRE_SAFETY_POLICY_VERSION = 1;
 
 export type ChannelAction =
 	| ISendMessageAction

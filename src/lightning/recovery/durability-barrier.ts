@@ -50,9 +50,11 @@ export type BarrierOutcome =
 			 * `timeout`: the quorum did not answer in time, so the message is
 			 * withheld. `fenced`: another device provably owns this namespace, so
 			 * the message must never go out at all. `stopped`: the node is
-			 * shutting down.
+			 * shutting down. `missing-frame`: nothing named the frame that
+			 * authorized this message, so there is no receipt that could ever
+			 * release it.
 			 */
-			reason: 'timeout' | 'fenced' | 'stopped';
+			reason: 'timeout' | 'fenced' | 'stopped' | 'missing-frame';
 	  };
 
 export interface IDurabilityBarrierEvent {
@@ -175,11 +177,14 @@ export class DurabilityBarrier {
 	 */
 	isReleased(sequence: bigint | null): boolean {
 		if (!this.enforcing) return true;
-		if (this.fenced) return false;
-		// A transition with no frame was not journaled, so there is nothing to
-		// replicate and nothing to wait for. That happens only when the journal
-		// is off, which quorum mode cannot be configured without.
-		if (sequence == null) return true;
+		if (this.fenced || this.stopped) return false;
+		// NO FRAME IS NOT PERMISSION. An unattributed transition names nothing
+		// the guardians could have receipted, so no receipt can ever release
+		// it and answering yes here would be a message going out on no
+		// evidence at all. Quorum mode cannot even be configured without a
+		// journal, so in production this is a caller that asked about a batch
+		// with no PERSIST_STATE, which the dispatch boundary refuses outright.
+		if (sequence == null) return false;
 		return sequence <= this.watermark();
 	}
 
@@ -202,7 +207,13 @@ export class DurabilityBarrier {
 		if (this.stopped) {
 			return Promise.resolve({ released: false, reason: 'stopped' });
 		}
-		if (sequence == null || sequence <= this.watermark()) {
+		// Same rule as isReleased, and it has to be repeated here rather than
+		// delegated: this is the path a caller reaches when it decided to wait,
+		// and a wait on nothing must end in a refusal, never in a release.
+		if (sequence == null) {
+			return Promise.resolve({ released: false, reason: 'missing-frame' });
+		}
+		if (sequence <= this.watermark()) {
 			return Promise.resolve({ released: true, reason: 'durable' });
 		}
 		return new Promise<BarrierOutcome>((resolve) => {
@@ -243,6 +254,24 @@ export class DurabilityBarrier {
 	 * are still outstanding.
 	 */
 	noteCommitted(): void {
+		if (this.fenced || this.stopped) return;
+		this.kick();
+	}
+
+	/**
+	 * Ownership settled: start replicating whatever is already committed.
+	 *
+	 * The pump gives up when it finds no lease AND no waiter, because with
+	 * nobody held there is nothing for a retry loop to rescue and spinning on
+	 * an absent lease would burn a timer forever. That leaves one real gap: a
+	 * frame committed BEFORE the lease existed, with no barrier waiter behind
+	 * it (every async-remote commit, and any non-critical quorum commit made
+	 * during startup), sits unreplicated until some later commit happens to
+	 * kick the pump. Whoever installs the lease closes that gap by calling
+	 * this; without it a quiet node can hold an unreplicated frame for as long
+	 * as it stays quiet, which is exactly the window replication exists for.
+	 */
+	kickReplication(): void {
 		if (this.fenced || this.stopped) return;
 		this.kick();
 	}

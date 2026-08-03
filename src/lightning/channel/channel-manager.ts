@@ -164,6 +164,17 @@ interface IHeldBatch {
 	from: number;
 	/** The journal frame the batch's persist landed in. */
 	frameSequence: bigint | null;
+	/**
+	 * The held suffix carries a message the barrier gates, so it may not be
+	 * dispatched until `frameSequence` is quorum durable.
+	 *
+	 * False for a batch queued purely to preserve wire ORDER behind one that
+	 * does. Those carry no frame of their own, and putting them to the barrier
+	 * anyway would refuse a shutdown, a closing_signed round or an stfu for
+	 * doing nothing that needs durability. They wait for their turn, not for a
+	 * receipt.
+	 */
+	requiresDurability: boolean;
 	/** Outbox rows to mark sent once the bytes actually leave. */
 	outboxIds: Array<number | null>;
 }
@@ -4563,6 +4574,23 @@ export class ChannelManager extends EventEmitter {
 		const channelIdHex = batchChannelId?.toString('hex') ?? null;
 		let heldFrom = -1;
 
+		// ── The barrier's structural invariant (Recovery 5.8) ──
+		// A barrier-class message is only ever released against the frame that
+		// authorized it, and the ONLY thing that names that frame is this
+		// batch's own PERSIST_STATE. A batch that puts such a message on the
+		// wire with no persist ahead of it is therefore unreleasable by
+		// construction: no receipt exists that could cover it, so the honest
+		// answer is to send nothing. Enforced HERE, before a single action
+		// runs, because the release path is asked about frames rather than
+		// about batches and would have to answer "no frame, nothing to wait
+		// for", which reads as permission. Every producer in this codebase
+		// leads with its persist, so a violation is a producer bug, and the
+		// safe response to a producer bug on a fund-critical path is silence.
+		if (channelIdHex && this._lacksFrameAttribution(actions, persistIndex)) {
+			this._refuseUnattributed(channelIdHex, peerPubkey, channel, actions);
+			return;
+		}
+
 		// A channel that is ALREADY holding messages holds this batch too, and
 		// the check has to happen here rather than at the PERSIST_STATE action,
 		// because a batch with no persist never reaches that case. Those exist
@@ -4580,6 +4608,7 @@ export class ChannelManager extends EventEmitter {
 				actions,
 				from: 0,
 				frameSequence: null,
+				requiresDurability: this._carriesBarrierMessage(actions, 0),
 				outboxIds: []
 			});
 			return;
@@ -4622,6 +4651,7 @@ export class ChannelManager extends EventEmitter {
 				actions,
 				from: heldFrom,
 				frameSequence: persistRequest?.frameSequence ?? null,
+				requiresDurability: this._carriesBarrierMessage(actions, heldFrom),
 				outboxIds: persistRequest ? [...persistRequest.outboxIds] : []
 			});
 		}
@@ -4662,10 +4692,16 @@ export class ChannelManager extends EventEmitter {
 		setSendsBlocked: (blocked: boolean) => void,
 		startIndex = 0,
 		persistAlreadySeen = false,
-		shouldHold?: () => boolean
+		shouldHold?: () => boolean,
+		progress?: { index: number }
 	): number {
 		let persistSeen = persistAlreadySeen;
 		for (let index = startIndex; index < actions.length; index++) {
+			// How far the run got. A re-entrant handler can throw out of this
+			// loop, and the actions AFTER the thrower are then untouched: their
+			// committed edge-triggered effects are still owed, so the caller
+			// needs to know where to resume them from.
+			if (progress) progress.index = index;
 			const action = actions[index];
 			switch (action.type) {
 				case ChannelActionType.SEND_MESSAGE:
@@ -4848,15 +4884,94 @@ export class ChannelManager extends EventEmitter {
 		const barrier = this.config.durabilityBarrier;
 		if (!barrier || !barrier.enforcing || !channelIdHex) return false;
 		if (this.barrierQueues.has(channelIdHex)) return true;
-		const carriesBarrierMessage = actions
-			.slice(persistIndex + 1)
-			.some(
-				(action) =>
-					action.type === ChannelActionType.SEND_MESSAGE &&
-					QUORUM_BARRIER_MESSAGE_TYPES.has(action.messageType)
-			);
-		if (!carriesBarrierMessage) return false;
+		if (!this._carriesBarrierMessage(actions, persistIndex + 1)) return false;
 		return !barrier.isReleased(persistRequest?.frameSequence ?? null);
+	}
+
+	/**
+	 * Is this action a send the quorum barrier gates?
+	 *
+	 * Two sources, because the gated set is two things. Most of spec 5.8's rows
+	 * are whole message TYPES that are irreversible wherever they appear. The
+	 * data-loss declaration is not: `error` is also BOLT 1's ordinary
+	 * protocol-violation message, so that row is carried by a mark the producer
+	 * sets on the action it means.
+	 */
+	private _isBarrierClass(action: ChannelAction): boolean {
+		if (action.type !== ChannelActionType.SEND_MESSAGE) return false;
+		return (
+			action.durabilityCritical === true ||
+			QUORUM_BARRIER_MESSAGE_TYPES.has(action.messageType)
+		);
+	}
+
+	/** Does the suffix from `from` put a message the barrier gates on the wire? */
+	private _carriesBarrierMessage(
+		actions: ChannelAction[],
+		from: number
+	): boolean {
+		for (let index = Math.max(from, 0); index < actions.length; index++) {
+			if (this._isBarrierClass(actions[index])) return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Does this batch send a barrier-class message that no persist authorizes?
+	 *
+	 * Only ever true in quorum mode, and only for a batch whose first
+	 * barrier-class send has no PERSIST_STATE before it. `persistIndex > first`
+	 * counts as well: a persist AFTER the send did not authorize that send.
+	 */
+	private _lacksFrameAttribution(
+		actions: ChannelAction[],
+		persistIndex: number
+	): boolean {
+		const barrier = this.config.durabilityBarrier;
+		if (!barrier || !barrier.enforcing) return false;
+		const first = actions.findIndex((action) => this._isBarrierClass(action));
+		if (first < 0) return false;
+		return persistIndex < 0 || persistIndex > first;
+	}
+
+	/**
+	 * Refuse a batch whose barrier-class message no frame authorizes.
+	 *
+	 * Same disposition a timed-out barrier already has, for the same reason:
+	 * the WIRE half is dropped, and the rest of the batch still runs, because a
+	 * suffix also carries the edge-triggered internal effects of state that is
+	 * already on disk (handleRevokeAndAck sets forwardEmitted while BUILDING
+	 * its actions, so an HTLC_FORWARDED dropped outright would leave that HTLC
+	 * unforwarded until its CLTV). `transition:frozen` then has the node
+	 * disconnect, so the channel reconciles through channel_reestablish rather
+	 * than leaving the peer waiting on a message that will never come.
+	 */
+	private _refuseUnattributed(
+		channelIdHex: string,
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[]
+	): void {
+		this.runHeldSuffixWithoutSending(peerPubkey, channel, {
+			actions,
+			from: 0,
+			frameSequence: null,
+			requiresDurability: true,
+			outboxIds: []
+		});
+		this.emit(
+			'transition:frozen',
+			peerPubkey,
+			channelIdHex,
+			'missing-frame',
+			1
+		);
+		this.emit(
+			'error',
+			channel.getChannelId(),
+			'durability barrier: a batch carrying a quorum-gated message has no ' +
+				'PERSIST_STATE naming the frame that authorized it, so nothing was sent'
+		);
 	}
 
 	/** Park a held suffix and arm its release. */
@@ -4912,31 +5027,72 @@ export class ChannelManager extends EventEmitter {
 				this.barrierQueues.delete(channelIdHex);
 				return;
 			}
-			const outcome = await barrier.whenReleased(next.frameSequence);
-			// The queue may have been discarded while we waited: a disconnect
-			// rolls channel state backward under it, so what is parked here no
-			// longer describes the channel.
-			if (this.barrierQueues.get(channelIdHex) !== queue) return;
-			if (!outcome.released) {
-				this._discardHeld(channelIdHex, queue, outcome.reason);
-				return;
+			if (next.requiresDurability) {
+				const outcome = await barrier.whenReleased(next.frameSequence);
+				// The queue may have been discarded while we waited: a disconnect
+				// rolls channel state backward under it, so what is parked here no
+				// longer describes the channel.
+				if (this.barrierQueues.get(channelIdHex) !== queue) return;
+				if (!outcome.released) {
+					this._discardHeld(channelIdHex, queue, outcome.reason);
+					return;
+				}
 			}
 			queue.batches.shift();
 			try {
 				this._dispatchHeld(queue, next);
 			} catch (error) {
-				// A released batch runs re-entrant handlers, any of which can
-				// throw. Without this the loop exits with the queue still
-				// installed, and the channel never sends again.
-				this.emit(
-					'error',
-					queue.channel.getChannelId(),
-					`released batch failed: ${
-						error instanceof Error ? error.message : String(error)
-					}`
-				);
+				// The batch was PARTIALLY dispatched. Draining on would let a
+				// later batch reach the peer with its predecessor missing, so
+				// the whole queue stops here.
+				this._abandonAfterPartialDispatch(channelIdHex, queue, error);
+				return;
 			}
 		}
+	}
+
+	/**
+	 * A released batch threw partway through dispatch.
+	 *
+	 * `_dispatchActions` runs sends, broadcasts and the re-entrant emits in one
+	 * sequential pass, and any of the listeners on those emits can throw back
+	 * into it. When one does, an unknown prefix of the batch is already on the
+	 * socket and the rest never will be, so this channel's wire stream is
+	 * truncated at a point nobody can name. Everything still queued behind it
+	 * MUST NOT go out: a later batch describes a transition whose predecessor
+	 * the peer never saw, which is exactly the inversion the whole-suffix queue
+	 * exists to prevent. So the queue is torn down and the stranded batches run
+	 * for their internal effects only. Reestablish is the only reliable
+	 * boundary after an uncertain partial send, and it is also why the partial
+	 * batch is NOT retried on the live connection: some of its bytes may
+	 * already have arrived.
+	 *
+	 * Its OWN event, not `transition:frozen`. A freeze means durability was
+	 * refused and the node exempts a fenced writer from the disconnect, because
+	 * a fence is already tearing the transport down. Here nothing else tears
+	 * anything down and the remedy is unconditional, so conflating the two
+	 * would leave a truncated stream on a live connection.
+	 */
+	private _abandonAfterPartialDispatch(
+		channelIdHex: string,
+		queue: IBarrierQueue,
+		error: unknown
+	): void {
+		if (this.barrierQueues.get(channelIdHex) === queue) {
+			this.barrierQueues.delete(channelIdHex);
+		}
+		const stranded = queue.batches;
+		queue.batches = [];
+		for (const batch of stranded) {
+			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, batch);
+		}
+		this.emit(
+			'transition:dispatch-failed',
+			queue.peerPubkey,
+			channelIdHex,
+			error instanceof Error ? error.message : String(error),
+			stranded.length + 1
+		);
 	}
 
 	/**
@@ -4971,7 +5127,7 @@ export class ChannelManager extends EventEmitter {
 		// sends suppressed is exactly the disposition a failed persist already
 		// has, and it costs nothing, since nothing reaches the peer either way.
 		for (const batch of dropped) {
-			this.runHeldSuffixWithoutSending(queue, batch);
+			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, batch);
 		}
 		this.emit(
 			'transition:frozen',
@@ -4991,15 +5147,16 @@ export class ChannelManager extends EventEmitter {
 	 * except talk to the peer".
 	 */
 	private runHeldSuffixWithoutSending(
-		queue: IBarrierQueue,
+		peerPubkey: string,
+		channel: Channel,
 		held: IHeldBatch
 	): void {
-		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
+		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
 		this.emit('transition:begin', channelIdHex);
 		try {
 			this._dispatchActions(
-				queue.peerPubkey,
-				queue.channel,
+				peerPubkey,
+				channel,
 				held.actions,
 				null,
 				() => true,
@@ -5018,6 +5175,7 @@ export class ChannelManager extends EventEmitter {
 	private _dispatchHeld(queue: IBarrierQueue, held: IHeldBatch): void {
 		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
+		const progress = { index: held.from };
 		// Same bracket a live batch runs in, so a monitor change caused by the
 		// released actions still rides its channel's transition instead of
 		// committing as a frame of its own.
@@ -5033,8 +5191,23 @@ export class ChannelManager extends EventEmitter {
 					blocked = value;
 				},
 				held.from,
-				true
+				true,
+				undefined,
+				progress
 			);
+		} catch (error) {
+			// The action at progress.index threw and everything after it is
+			// untouched. Those actions still owe their committed edge-triggered
+			// effects, the same reason a refusal runs what it drops: an
+			// HTLC_FORWARDED skipped here is never emitted again, because
+			// forwardEmitted was set while the batch was BUILT and is already on
+			// disk. So the tail runs with sends suppressed before the error goes
+			// up to abandon the queue.
+			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, {
+				...held,
+				from: progress.index + 1
+			});
+			throw error;
 		} finally {
 			this.emit('transition:end', channelIdHex);
 		}
@@ -5067,7 +5240,7 @@ export class ChannelManager extends EventEmitter {
 		// still forwards; the rollback only discards UNcommitted updates, which
 		// were never going to forward anyway.
 		for (const batch of dropped) {
-			this.runHeldSuffixWithoutSending(queue, batch);
+			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, batch);
 		}
 	}
 

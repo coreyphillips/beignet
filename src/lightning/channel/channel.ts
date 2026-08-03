@@ -224,6 +224,28 @@ function replayMsg(
 }
 
 /**
+ * A recovery declaration (spec 5.6 and 5.8): the wire half of "our state is
+ * stale, or unprovable, so close with YOUR commitment".
+ *
+ * Marked so the quorum barrier holds it until the disposition that authorizes
+ * it is durable. What that protects is the never-broadcast invariant itself:
+ * if the peer acts on this while the frame carrying `dataLossDetected` or
+ * `recoveryCloseReason` is still only local, a restore below that frame comes
+ * back believing it may broadcast a commitment the peer has already revoked.
+ */
+function declMsg(
+	messageType: MessageType,
+	payload: Buffer
+): ISendMessageAction {
+	return {
+		type: ChannelActionType.SEND_MESSAGE,
+		messageType,
+		payload,
+		durabilityCritical: true
+	};
+}
+
+/**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
  * capped at BOLT 2 max of funding / 5 (20%).
@@ -3872,7 +3894,17 @@ export class Channel {
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
-			sendMsg(
+			// The persist leads, exactly as it does at the two sites that first
+			// declare this disposition, and for a second reason here: under a
+			// quorum barrier (5.8) a data-loss error may not reach the peer
+			// before the frame authorizing it has guardian receipts, and the
+			// batch's own PERSIST_STATE is the only thing that names that
+			// frame. Regenerating the error alone would hand the wire a
+			// declaration no receipt covers. The state written is the same
+			// state that was already committed, so the cost is one no-op frame
+			// per reconnect of a channel that is only waiting to be closed.
+			{ type: ChannelActionType.PERSIST_STATE },
+			declMsg(
 				MessageType.ERROR,
 				encodeErrorMessage({
 					channelId: this._state.channelId,
@@ -5851,7 +5883,7 @@ export class Channel {
 				// Persist FIRST: a crash between the error send and the peer's
 				// force-close must not forget that broadcasting is forbidden.
 				{ type: ChannelActionType.PERSIST_STATE },
-				sendMsg(
+				declMsg(
 					MessageType.ERROR,
 					encodeErrorMessage({
 						channelId: this._state.channelId!,
@@ -5890,7 +5922,7 @@ export class Channel {
 				// Persist FIRST: a crash between the error send and the peer's
 				// force-close must not forget that broadcasting is forbidden.
 				{ type: ChannelActionType.PERSIST_STATE },
-				sendMsg(
+				declMsg(
 					MessageType.ERROR,
 					encodeErrorMessage({
 						channelId: this._state.channelId!,
