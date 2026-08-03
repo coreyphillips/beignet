@@ -445,7 +445,7 @@ describe('Recovery phase 6: the node drives durability', () => {
 		lease = (
 			(await replicator.ensureNamespace()) as { lease: IWriterLeaseKeys }
 		).lease;
-		barrier.noteCommitted();
+		barrier.kickReplication();
 		await waitFor(() => storage.loadRecoveryFrames().length < heldBack);
 		// The chain still verifies from its new base.
 		expect(storage.loadRecoveryFrames()[0].sequence).to.equal(

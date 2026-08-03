@@ -3762,6 +3762,9 @@ export class ChannelManager extends EventEmitter {
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
 			);
 		}
+		// openChannelV2 arrives here rather than through openChannel, so the
+		// guard has to be on both, or half the opens escape it.
+		this._assertNamespaceCanRecordANewChannel();
 		const chKeys = this.deriveKeysForNewChannel();
 		const state = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
