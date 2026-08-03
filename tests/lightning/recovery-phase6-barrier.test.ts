@@ -808,3 +808,49 @@ describe('Recovery phase 6: a namespace that can never advance says so', () => {
 		storage.close();
 	});
 });
+
+describe('Recovery phase 6: no frame is not permission', () => {
+	it('an unattributed transition is refused, synchronously and on the wait', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const harness = journaled(storage);
+		const rep = replicatorFor(storage, bind(served));
+		const lease = ((await rep.ensureNamespace()) as { lease: IWriterLeaseKeys })
+			.lease;
+		const sequence = commit(harness, 61);
+		await rep.replicatePending(lease);
+
+		const barrier = new DurabilityBarrier({
+			durability: 'quorum',
+			replicator: rep,
+			lease: (): IWriterLeaseKeys => lease,
+			timeoutMs: 1_000,
+			retryDelayMs: 50
+		});
+		// The frame that IS named releases, so the refusal below is about
+		// attribution and not about the watermark.
+		expect(barrier.isReleased(sequence)).to.equal(true);
+
+		// A null sequence names nothing the guardians could have receipted, so
+		// no receipt can ever release it and answering yes would be a message
+		// going out on no evidence at all.
+		expect(barrier.isReleased(null)).to.equal(false);
+		const outcome = await barrier.whenReleased(null);
+		expect(outcome.released).to.equal(false);
+		expect((outcome as { reason: string }).reason).to.equal('missing-frame');
+
+		// And the weaker modes are untouched: they hold nothing, ever.
+		const relaxed = new DurabilityBarrier({
+			durability: 'async-remote',
+			replicator: rep,
+			lease: (): IWriterLeaseKeys => lease
+		});
+		expect(relaxed.isReleased(null)).to.equal(true);
+		relaxed.stop();
+
+		barrier.stop();
+		await shutdown(served);
+		storage.close();
+	});
+});

@@ -644,3 +644,50 @@ describe('Recovery phase 6: a finished namespace is reported, not guessed', () =
 		storage.close();
 	});
 });
+
+describe('Recovery phase 6: a truncated wire stream drops the connection', () => {
+	it('reports its own code rather than reusing the barrier timeout', async function (): Promise<void> {
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const storage = openStorage();
+		const replicator = replicatorFor(storage, bind(served));
+		const barrier = barrierFor(replicator, () => null, 'quorum');
+		const node = createNode(storage, {
+			enabled: true,
+			durability: 'quorum',
+			barrier
+		});
+
+		const errors: Array<{ code: string; message: string }> = [];
+		node.on('node:error', (error: { code: string; message: string }) => {
+			errors.push(error);
+		});
+
+		const channelId = crypto.randomBytes(32);
+		(
+			node as unknown as { channelManager: { emit: (...a: unknown[]) => void } }
+		).channelManager.emit(
+			'transition:dispatch-failed',
+			'02'.repeat(33),
+			channelId.toString('hex'),
+			'observer exploded',
+			2
+		);
+
+		// A distinct code from DURABILITY_BARRIER_TIMEOUT, because the remedy
+		// differs: a freeze exempts a fenced writer from the disconnect, and
+		// here nothing else is tearing the transport down.
+		const failure = errors.find((e) => e.code === 'BARRIER_DISPATCH_FAILED');
+		expect(failure, 'a dispatch failure must be reported').to.not.equal(
+			undefined
+		);
+		expect(failure!.message).to.contain('observer exploded');
+		expect(
+			errors.some((e) => e.code === 'DURABILITY_BARRIER_TIMEOUT')
+		).to.equal(false);
+
+		node.destroy();
+		await shutdown(served);
+		storage.close();
+	});
+});

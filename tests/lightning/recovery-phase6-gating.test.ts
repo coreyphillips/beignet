@@ -711,3 +711,57 @@ describe('Recovery phase 6: a partial dispatch takes its queue with it', () => {
 		expect(harness.dispatchFailed[0].dropped).to.equal(1);
 	});
 });
+
+describe('Recovery phase 6: the peer-close request survives a refusal', () => {
+	/** An ERRORED channel whose disposition regenerates the close request. */
+	function erroredRecoveryChannel(channelId: Buffer): Channel {
+		return {
+			setLocalNodeIdLower: (): void => undefined,
+			getChannelId: (): Buffer => channelId,
+			getTemporaryChannelId: (): Buffer | null => null,
+			getState: (): ChannelState => ChannelState.ERRORED,
+			markForReestablish: (): void => undefined,
+			buildRecoveryCloseActions: (): ChannelAction[] => [
+				{ type: ChannelActionType.PERSIST_STATE },
+				declare(MessageType.ERROR)
+			]
+		} as unknown as Channel;
+	}
+
+	it('times out, reconnects, and STILL sends nothing while the quorum is behind', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = erroredRecoveryChannel(channelId);
+		(
+			harness.manager as unknown as {
+				channels: Map<string, Channel>;
+				channelPeers: Map<string, string>;
+			}
+		).channels.set(channelId.toString('hex'), channel);
+		(
+			harness.manager as unknown as { channelPeers: Map<string, string> }
+		).channelPeers.set(channelId.toString('hex'), PEER);
+
+		// The original declaration is held and then refused.
+		dispatch(harness.manager, channel, channel.buildRecoveryCloseActions());
+		expect(harness.sent).to.have.length(0);
+		harness.barrier.refuse('timeout');
+		await settle();
+		expect(harness.sent).to.have.length(0);
+		expect(harness.frozen.map((f) => f.reason)).to.deep.equal(['timeout']);
+
+		// The peer reconnects while the quorum is STILL unreachable. The
+		// disposition regenerates the request, and it must not walk out on the
+		// strength of having been regenerated rather than replicated.
+		harness.nextFrame = 2n;
+		harness.manager.handlePeerReconnected(PEER);
+		await settle();
+		expect(harness.sent).to.have.length(0);
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(1);
+
+		// Quorum returns, covering the frame the RECONNECT persist minted.
+		harness.barrier.advance(2n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([MessageType.ERROR]);
+	});
+});
