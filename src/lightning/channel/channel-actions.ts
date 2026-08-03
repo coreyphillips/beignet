@@ -12,6 +12,7 @@ import { IRecoveryOutboxMessage } from '../storage/types';
 export enum ChannelActionType {
 	SEND_MESSAGE = 'SEND_MESSAGE',
 	BROADCAST_TX = 'BROADCAST_TX',
+	AUTHORIZE_FUNDING_BROADCAST = 'AUTHORIZE_FUNDING_BROADCAST',
 	WATCH_FUNDING = 'WATCH_FUNDING',
 	CHANNEL_READY = 'CHANNEL_READY',
 	CHANNEL_CLOSED = 'CHANNEL_CLOSED',
@@ -62,6 +63,36 @@ export interface ISendMessageAction {
 export interface IBroadcastTxAction {
 	type: ChannelActionType.BROADCAST_TX;
 	tx: Buffer;
+	/**
+	 * This broadcast creates a funding output naming us, so it is held until
+	 * the frame recording the channel is quorum durable (5.8): a restore below
+	 * that frame comes back with no channel at all while a 2-of-2 we are a
+	 * party to exists on the network.
+	 *
+	 * A MARK rather than gating BROADCAST_TX wholesale, because the type is
+	 * overloaded and one of its other users must never be refusable: a force
+	 * close returns [BROADCAST_TX, CHANNEL_CLOSED] with no PERSIST_STATE at
+	 * all, so gating the type would send it through the unattributed-batch
+	 * refusal and take away the only exit an operator has left.
+	 */
+	fundingCritical?: true;
+}
+
+/**
+ * BOLT 2's point of no return for a v1 funder.
+ *
+ * The obligation begins at funding_signed and never at funding_created:
+ * without the acceptor's signature over our commitment #0 the funding output
+ * has no unilateral exit for us. It is an ACTION rather than a side effect of
+ * the funding watch because everything this dispatch path gates is an action:
+ * as a bare emit it could be withheld by neither a failed persist nor a quorum
+ * barrier. It carries no transaction, because the signed v1 funding tx lives
+ * in the node's pending map and never in the channel.
+ */
+export interface IAuthorizeFundingBroadcastAction {
+	type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST;
+	/** Internal byte order, the key the node's pending map uses. */
+	fundingTxid: Buffer;
 }
 
 export interface IWatchFundingAction {
@@ -301,7 +332,15 @@ export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
 		MessageType.UPDATE_FULFILL_HTLC,
 		MessageType.COMMITMENT_SIGNED,
 		MessageType.TX_SIGNATURES,
-		MessageType.SPLICE_LOCKED
+		MessageType.SPLICE_LOCKED,
+		// The acceptor's authorization for the opener to put the funding output
+		// on chain. A restore below the frame that FIRST records this channel
+		// comes back with no channel at all, while a 2-of-2 naming us exists on
+		// the network and the peer's reestablish gets an unknown-channel error.
+		// The v2 counterpart, tx_signatures, has been gated since phase 6
+		// landed, so leaving this out would give the identical role different
+		// exactness guarantees depending on which open the peer chose.
+		MessageType.FUNDING_SIGNED
 	]);
 
 /**
@@ -316,11 +355,12 @@ export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
  * pinned-set test in tests/lightning/recovery-phase6-exactness.test.ts fails
  * otherwise.
  */
-export const WIRE_SAFETY_POLICY_VERSION = 1;
+export const WIRE_SAFETY_POLICY_VERSION = 2;
 
 export type ChannelAction =
 	| ISendMessageAction
 	| IBroadcastTxAction
+	| IAuthorizeFundingBroadcastAction
 	| IWatchFundingAction
 	| IChannelReadyAction
 	| IChannelClosedAction

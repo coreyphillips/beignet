@@ -765,3 +765,148 @@ describe('Recovery phase 6: the peer-close request survives a refusal', () => {
 		expect(harness.sent.map((e) => e.type)).to.deep.equal([MessageType.ERROR]);
 	});
 });
+
+describe('Recovery phase 6: funding does not outrun its own frame', () => {
+	const authorize = (): ChannelAction =>
+		({
+			type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+			fundingTxid: crypto.randomBytes(32)
+		}) as ChannelAction;
+
+	const watchFunding = (): ChannelAction =>
+		({
+			type: ChannelActionType.WATCH_FUNDING,
+			fundingTxid: crypto.randomBytes(32),
+			fundingOutputIndex: 0,
+			minimumDepth: 1
+		}) as ChannelAction;
+
+	it("the fundee's funding_signed waits for the frame that first records the channel", async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+		const watched: number[] = [];
+		harness.manager.on('watch:funding', () => watched.push(1));
+
+		// The real acceptor batch. A restore below this frame comes back with
+		// no channel at all, while a 2-of-2 naming us is on the network.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			send(MessageType.FUNDING_SIGNED),
+			watchFunding()
+		]);
+		expect(harness.sent).to.have.length(0);
+		expect(watched).to.have.length(0);
+		expect(harness.held).to.have.length(1);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.FUNDING_SIGNED
+		]);
+		expect(watched).to.have.length(1);
+	});
+
+	it("the funder's authorization is held, and the watch still arms on a refusal", async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+		const authorized: number[] = [];
+		const watched: number[] = [];
+		harness.manager.on('funding:authorized', () => authorized.push(1));
+		harness.manager.on('watch:funding', () => watched.push(1));
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			watchFunding(),
+			authorize()
+		]);
+		expect(authorized).to.have.length(0);
+
+		// A refusal runs the suffix for its internal effects with the
+		// irreversible ones suppressed, which is exactly the right disposition
+		// here: the outpoint is watched, the transaction is not created.
+		harness.barrier.refuse('timeout');
+		await settle();
+		expect(watched).to.have.length(1);
+		expect(authorized).to.have.length(0);
+		expect(harness.frozen.map((f) => f.reason)).to.deep.equal(['timeout']);
+	});
+
+	it('a released funder batch authorizes exactly once, after its frame', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+		const authorized: number[] = [];
+		harness.manager.on('funding:authorized', () => authorized.push(1));
+
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			watchFunding(),
+			authorize(),
+			// The zero-conf tail rides the same batch and must not overtake the
+			// authorization.
+			send(MessageType.CHANNEL_READY)
+		]);
+		expect(authorized).to.have.length(0);
+		expect(harness.sent).to.have.length(0);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(authorized).to.have.length(1);
+		expect(harness.sent.map((e) => e.type)).to.deep.equal([
+			MessageType.CHANNEL_READY
+		]);
+	});
+
+	it('a failed persist withholds the authorization', () => {
+		const harness = makeHarness(false);
+		const channel = stubChannel(crypto.randomBytes(32));
+		const authorized: number[] = [];
+		harness.manager.on('funding:authorized', () => authorized.push(1));
+		harness.manager.removeAllListeners('channel:persist');
+		harness.manager.on(
+			'channel:persist',
+			(_id: Buffer, request?: IChannelPersistRequest) => {
+				if (request) request.committed = false;
+			}
+		);
+
+		// Independent of quorum mode: a funding transaction whose channel state
+		// never reached disk is a 2-of-2 no restored node can enumerate. As a
+		// bare emit off watch:funding this could not be withheld at all.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			watchFunding(),
+			authorize()
+		]);
+		expect(authorized).to.have.length(0);
+	});
+
+	it('a funding-critical broadcast is held, and a force close never is', async () => {
+		const harness = makeHarness();
+		const channel = stubChannel(crypto.randomBytes(32));
+
+		// The splice and v2 paths build a BROADCAST_TX of their own. When WE
+		// signed first there is no tx_signatures left in the batch, so without
+		// the mark nothing in it would be barrier-class.
+		dispatch(harness.manager, channel, [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.from([1]),
+				fundingCritical: true
+			} as ChannelAction
+		]);
+		expect(harness.broadcasts).to.equal(0);
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.broadcasts).to.equal(1);
+
+		// A force close carries no persist at all. Gating BROADCAST_TX by type
+		// would route it through the unattributed refusal and take away the
+		// only exit an operator has left.
+		const closing = stubChannel(crypto.randomBytes(32));
+		dispatch(harness.manager, closing, [
+			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([2]) }
+		]);
+		expect(harness.broadcasts).to.equal(2);
+	});
+});

@@ -1268,6 +1268,17 @@ export class Channel {
 				fundingOutputIndex: this._state.fundingOutputIndex,
 				minimumDepth: this._state.minimumDepth
 			});
+			// AFTER the watch and never before: the outpoint has to be under
+			// observation before the transaction that creates it can confirm.
+			// This is the only signal that authorizes the broadcast, and it is
+			// an action so that a failed persist can withhold it and a quorum
+			// barrier can hold it. The peer's signature over our commitment #0
+			// has just been verified above, which is precisely when BOLT 2
+			// starts the obligation.
+			actions.push({
+				type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+				fundingTxid: this._state.fundingTxid
+			});
 		}
 
 		// Zero-conf: immediately send channel_ready without waiting for confirmation
@@ -10856,7 +10867,15 @@ export class Channel {
 				spliceTxHex: tx.toHex()
 			});
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
-			actions.push({ type: ChannelActionType.BROADCAST_TX, tx: tx.toBuffer() });
+			// Marked: this creates a funding output naming us. When WE signed
+			// first the batch carries no tx_signatures of our own, so without
+			// the mark nothing in it is barrier-class and the transaction would
+			// reach the network ahead of the frame recording the splice.
+			actions.push({
+				type: ChannelActionType.BROADCAST_TX,
+				tx: tx.toBuffer(),
+				fundingCritical: true
+			});
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
@@ -10932,9 +10951,13 @@ export class Channel {
 			if (this._dualFundingContribution) {
 				const assembled = this._assembleV2FundingTx();
 				if (assembled) {
+					// Same reason as the splice above: once our own
+					// tx_signatures have been released this batch has nothing
+					// barrier-class left to hold it.
 					actions.push({
 						type: ChannelActionType.BROADCAST_TX,
-						tx: assembled
+						tx: assembled,
+						fundingCritical: true
 					});
 				}
 			}

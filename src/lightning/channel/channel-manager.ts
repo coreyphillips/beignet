@@ -4831,6 +4831,15 @@ export class ChannelManager extends EventEmitter {
 						);
 					}
 					break;
+				case ChannelActionType.AUTHORIZE_FUNDING_BROADCAST:
+					// Same guard and the same reason as BROADCAST_TX below: a
+					// funding transaction whose channel state never reached
+					// disk is a 2-of-2 no restored node can enumerate.
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
+					this.emit('funding:authorized', action.fundingTxid);
+					break;
 				case ChannelActionType.BROADCAST_TX:
 					// A transaction the failed persist authorized must not reach
 					// the network either: a splice or funding tx broadcast whose
@@ -4959,6 +4968,21 @@ export class ChannelManager extends EventEmitter {
 	 * sets on the action it means.
 	 */
 	private _isBarrierClass(action: ChannelAction): boolean {
+		// Gated without being a send. Putting a funding output on chain is
+		// irreversible in exactly the sense the barrier is about: the network
+		// cannot be asked to forget a transaction, and a restore below the
+		// frame that FIRST records the channel comes back not knowing it
+		// exists. The v1 funder has no transaction inside the channel to mark,
+		// so its authorization is its own action; the splice and v2 paths
+		// already build a BROADCAST_TX and carry a mark on it instead. The mark
+		// is opt-in because a force close is a BROADCAST_TX too and must never
+		// be refusable.
+		if (action.type === ChannelActionType.AUTHORIZE_FUNDING_BROADCAST) {
+			return true;
+		}
+		if (action.type === ChannelActionType.BROADCAST_TX) {
+			return action.fundingCritical === true;
+		}
 		if (action.type !== ChannelActionType.SEND_MESSAGE) return false;
 		return (
 			action.durabilityCritical === true ||

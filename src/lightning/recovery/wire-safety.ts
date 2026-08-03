@@ -19,8 +19,17 @@
  *   In quorum mode no IRREVERSIBLE wire message leaves before the journal
  *   frame that authorized it has reached a guardian quorum. Irreversible
  *   means the gated set: revoke_and_ack, commitment_signed,
- *   update_fulfill_htlc, tx_signatures, splice_locked, and the recovery
- *   declarations that establish the never-broadcast invariant.
+ *   update_fulfill_htlc, tx_signatures, splice_locked, funding_signed, the
+ *   recovery declarations that establish the never-broadcast invariant, and
+ *   the two ACTION forms that put a funding output on chain. The gated set is
+ *   therefore message types PLUS action forms, and WIRE_SAFETY_POLICY_VERSION
+ *   covers both halves.
+ *
+ *   Funding is in the set for a reason worth stating separately, because it is
+ *   the one case where the loss is not about revocation at all. A restore
+ *   below the frame that FIRST records a channel comes back not knowing the
+ *   channel exists, while a 2-of-2 naming us sits on chain and the peer's
+ *   reestablish gets an unknown-channel error.
  *
  *   The premise is narrower than "no wire message" on purpose, and the gap is
  *   what carries the argument rather than weakening it. Everything ungated is

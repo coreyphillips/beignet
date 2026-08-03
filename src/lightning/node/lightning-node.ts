@@ -374,6 +374,29 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 	Feature.ROUTE_BLINDING
 ]);
 
+/**
+ * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
+ * the network.
+ *
+ * 'candidate' is built and signed but FORBIDDEN: funding_signed has not been
+ * accepted, so the 2-of-2 has no unilateral exit for us. It is retained anyway
+ * so a crash in the signing window cannot lose the transaction. 'authorized'
+ * is the obligation, granted only by the AUTHORIZE_FUNDING_BROADCAST action,
+ * which is the one signal that has cleared both the persist gate and the
+ * quorum barrier. 'restored' came off disk this startup with its authorization
+ * unknown, and resolves on first read against the channel it belongs to.
+ *
+ * Deliberately NOT persisted: the on-disk shape stays {txid, txHex}, so an
+ * entry written by any older build restores through the same path as one
+ * written by this build and there is no migration to get wrong. A flag on disk
+ * would be a copy of a fact the channel already holds, and the only one of the
+ * two that can go stale.
+ */
+interface IPendingFundingTx {
+	txHex: string;
+	phase: 'candidate' | 'authorized' | 'restored';
+}
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -500,7 +523,7 @@ export class LightningNode extends EventEmitter {
 	 * or a later mempool eviction is retried on every new block, and the map
 	 * is persisted so a restart resumes the obligation.
 	 */
-	private pendingFundingTxs: Map<string, string> = new Map();
+	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
@@ -2423,9 +2446,24 @@ export class LightningNode extends EventEmitter {
 
 		// Auto-funding: broadcast funding tx after funding_signed
 		// pendingFundingTxs is keyed by funding txid hex
+		// The funder's BOLT 2 point of no return, dispatched as an action so a
+		// failed persist can withhold it and a quorum barrier can hold it. The
+		// broadcast used to ride the watch:funding emit below, which is not an
+		// action and therefore sat outside every gate the dispatch path
+		// applies.
+		this.channelManager.on('funding:authorized', (fundingTxid: Buffer) => {
+			const txidHex = fundingTxid.toString('hex');
+			const entry = this.pendingFundingTxs.get(txidHex);
+			if (entry) entry.phase = 'authorized';
+			this.broadcastPendingFundingTx(txidHex);
+		});
+
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
-			this.broadcastPendingFundingTx(txidHex);
+			// Arming the watch is deliberately NOT gated. It emits no bytes,
+			// touches no chain and is idempotent, restoreChainWatches rebuilds
+			// it at startup, and on a barrier refusal the right disposition is
+			// the outpoint watched and the transaction not created.
 			// Register the funding output with the chain watcher NOW, not only
 			// on restart: live confirmation detection, announcement depth,
 			// breach detection and the funding-missing watchdog (critical for
@@ -3668,9 +3706,9 @@ export class LightningNode extends EventEmitter {
 				this.storage!.saveMetadata(
 					LightningNode.PENDING_FUNDING_TXS_KEY,
 					JSON.stringify(
-						[...this.pendingFundingTxs].map(([txid, txHex]) => ({
+						[...this.pendingFundingTxs].map(([txid, entry]) => ({
 							txid,
-							txHex
+							txHex: entry.txHex
 						}))
 					)
 				),
@@ -3680,7 +3718,10 @@ export class LightningNode extends EventEmitter {
 
 	/** Record a signed funding tx we are obligated to broadcast. */
 	private setPendingFundingTx(txidHex: string, txHex: string): void {
-		this.pendingFundingTxs.set(txidHex, txHex);
+		// 'candidate': retained so a crash in the signing window cannot lose the
+		// transaction, but NOT yet owed. Only the authorization action promotes
+		// it, and that action has cleared the persist gate and the barrier.
+		this.pendingFundingTxs.set(txidHex, { txHex, phase: 'candidate' });
 		this.persistPendingFundingTxs();
 	}
 
@@ -3697,34 +3738,48 @@ export class LightningNode extends EventEmitter {
 	 * BOLT 2 starts the broadcast obligation at funding_signed, never at
 	 * funding_created: without the acceptor's signature over our commitment #0
 	 * the funding output has no unilateral exit for us, so a broadcast in that
-	 * window puts the whole channel balance behind a peer who may simply never
-	 * answer. The transaction is retained from the moment it is signed, so a
-	 * crash in the signing window cannot lose it, but retaining it is not the
-	 * same as owing it.
+	 * window puts the whole capacity behind a peer who may simply never answer.
+	 * Retaining the transaction from the moment it is signed is right, so a
+	 * crash in the signing window cannot lose it. Owing it is what has to wait.
 	 *
-	 * The answer is DERIVED from the channel rather than recorded beside the
-	 * transaction. The routes that ask fire on chain events, a new block and a
-	 * mempool eviction, which know nothing about how far the handshake got,
-	 * and a flag stored next to the transaction would be a copy of a fact the
-	 * channel already holds and the only one of the two that can go stale. It
-	 * also needs no migration: an entry written by an older build is answered
-	 * by the same channel state, and a crash between funding_signed and the
-	 * broadcast still resumes, which is what the startup sweep exists for.
+	 * The answer cannot be derived from channel state alone, and that is the
+	 * subtle part. handleFundingSigned mutates the channel to
+	 * AWAITING_FUNDING_CONFIRMED and stores remoteCommitmentSignature while
+	 * BUILDING its action array, before anything is dispatched, so a predicate
+	 * reading the channel is already true the instant a quorum barrier starts
+	 * holding that batch, and the next block would broadcast straight through
+	 * the hold. Only the authorization ACTION knows it cleared both the persist
+	 * gate and the barrier.
 	 *
-	 * Both conditions are checked although either alone answers today.
-	 * createFundingCreated is the sole writer of SENT_FUNDING_CREATED and
-	 * handleFundingSigned, which stores the verified peer signature on the
-	 * ECDSA and the taproot branch alike, is its sole exit. A state added
-	 * between them later cannot silently authorize a broadcast.
+	 * A restored entry is the one case the action cannot speak for, since
+	 * nothing re-runs handleFundingSigned across a restart, so there it does
+	 * fall back to the channel. That is safe for the reason the barrier exists:
+	 * the hazard is the wire having seen what a restore does not have, and a
+	 * restore that HAS the channel row has the frame that recorded it.
 	 */
-	private canBroadcastFunding(txidHex: string): boolean {
+	private owesFundingBroadcast(txidHex: string): boolean {
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry) return false;
+		if (entry.phase === 'authorized') return true;
+		// A candidate is refused outright: its authorization has not been
+		// dispatched, so there is nothing yet to resolve against.
+		if (entry.phase === 'candidate') return false;
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
-			return (
-				state.state !== ChannelState.SENT_FUNDING_CREATED &&
-				!!state.remoteCommitmentSignature
-			);
+			// Both conditions although either alone answers today.
+			// createFundingCreated is the sole writer of SENT_FUNDING_CREATED
+			// and handleFundingSigned, which stores the verified peer signature
+			// on the ECDSA and the taproot branch alike, is its sole exit. A
+			// state added between them later cannot silently authorize.
+			if (
+				state.state === ChannelState.SENT_FUNDING_CREATED ||
+				!state.remoteCommitmentSignature
+			) {
+				return false;
+			}
+			entry.phase = 'authorized';
+			return true;
 		}
 		return false;
 	}
@@ -3738,11 +3793,15 @@ export class LightningNode extends EventEmitter {
 	 * surfaced but the obligation stands.
 	 */
 	private broadcastPendingFundingTx(txidHex: string): void {
-		const txHex = this.pendingFundingTxs.get(txidHex);
-		if (!txHex || !this.fundingProvider) return;
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry || !this.fundingProvider) return;
+		// Covers all three routes that reach here: the funding:authorized emit,
+		// the per-block sweep and the startup sweep.
+		if (!this.owesFundingBroadcast(txidHex)) return;
+		const txHex = entry.txHex;
 		// Covers all three routes that reach here: the watch:funding emit, the
 		// per-block sweep and the startup sweep.
-		if (!this.canBroadcastFunding(txidHex)) return;
+		if (!this.owesFundingBroadcast(txidHex)) return;
 		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
 			const message = (err as Error)?.message ?? String(err);
 			// A tx that is already mined cannot be re-sent; that is success,
@@ -3811,7 +3870,13 @@ export class LightningNode extends EventEmitter {
 			}>;
 			for (const entry of entries) {
 				if (entry?.txid && entry?.txHex) {
-					this.pendingFundingTxs.set(entry.txid, entry.txHex);
+					// 'restored': the authorization is unknown until it is
+					// resolved against the channel, because nothing re-runs
+					// handleFundingSigned across a restart.
+					this.pendingFundingTxs.set(entry.txid, {
+						txHex: entry.txHex,
+						phase: 'restored'
+					});
 				}
 			}
 		} catch {
@@ -4811,7 +4876,8 @@ export class LightningNode extends EventEmitter {
 				// REJECTS it (an input was double-spent, or it conflicts with
 				// a confirmed tx) is the channel truly fiction.
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
-				const pendingHex = this.pendingFundingTxs.get(internalHex);
+				const pending = this.pendingFundingTxs.get(internalHex);
+				const pendingHex = pending?.txHex;
 				// This route bypasses broadcastPendingFundingTx, so it needs the
 				// same authorization. It is genuinely reachable before
 				// funding_signed: restoreChainWatches arms a funding watch on a
@@ -4823,7 +4889,7 @@ export class LightningNode extends EventEmitter {
 				if (
 					pendingHex &&
 					this.fundingProvider &&
-					this.canBroadcastFunding(internalHex)
+					this.owesFundingBroadcast(internalHex)
 				) {
 					this.fundingProvider
 						.broadcastTransaction(pendingHex)

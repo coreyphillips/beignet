@@ -51,6 +51,11 @@ import {
 	WIRE_SAFETY_POLICY_VERSION
 } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
+import {
+	ChannelAction,
+	ChannelActionType
+} from '../../src/lightning/channel/channel-actions';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { IStorageBackend } from '../../src/lightning/storage/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -535,7 +540,7 @@ describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
 		// it without a bump would let old frames be read as promises their
 		// writers never made. Change the set, change this pin, bump the
 		// version, all in one commit.
-		expect(WIRE_SAFETY_POLICY_VERSION).to.equal(1);
+		expect(WIRE_SAFETY_POLICY_VERSION).to.equal(2);
 		expect(
 			[...QUORUM_BARRIER_MESSAGE_TYPES].sort((a, b) => a - b)
 		).to.deep.equal(
@@ -544,8 +549,65 @@ describe('Recovery phase 6: a quorum claim names the policy behind it', () => {
 				MessageType.REVOKE_AND_ACK,
 				MessageType.UPDATE_FULFILL_HTLC,
 				MessageType.TX_SIGNATURES,
-				MessageType.SPLICE_LOCKED
+				MessageType.SPLICE_LOCKED,
+				MessageType.FUNDING_SIGNED
 			].sort((a, b) => a - b)
 		);
+	});
+
+	it('the gated ACTION forms are pinned too, not just the message set', () => {
+		// The message-type pin above structurally cannot see the other half of
+		// the policy: two action forms are gated without being sends. Without
+		// this, widening or narrowing THOSE slips past the guard that exists
+		// precisely to force a version bump.
+		const barrierClass = (action: ChannelAction): boolean =>
+			(
+				new ChannelManager({
+					durabilityBarrier: { enforcing: true }
+				} as unknown as ConstructorParameters<
+					typeof ChannelManager
+				>[0]) as unknown as { _isBarrierClass(a: ChannelAction): boolean }
+			)._isBarrierClass(action);
+
+		const txid = Buffer.alloc(32, 9);
+		expect(
+			barrierClass({
+				type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+				fundingTxid: txid
+			})
+		).to.equal(true);
+		expect(
+			barrierClass({
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.alloc(1),
+				fundingCritical: true
+			})
+		).to.equal(true);
+
+		// And the ones that must stay ungated. A force close is a BROADCAST_TX
+		// with no PERSIST_STATE in its batch, so gating the type would send it
+		// through the unattributed refusal and take away the only exit an
+		// operator has.
+		expect(
+			barrierClass({
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.alloc(1)
+			})
+		).to.equal(false);
+		expect(
+			barrierClass({
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: txid,
+				fundingOutputIndex: 0,
+				minimumDepth: 1
+			})
+		).to.equal(false);
+		expect(
+			barrierClass({
+				type: ChannelActionType.FORCE_CLOSE,
+				commitmentTx: Buffer.alloc(1),
+				channelId: txid
+			})
+		).to.equal(false);
 	});
 });
