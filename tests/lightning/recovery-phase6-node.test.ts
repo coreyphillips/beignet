@@ -22,6 +22,7 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { DEFAULT_CHANNEL_CONFIG } from '../../src/lightning/channel/types';
@@ -638,6 +639,44 @@ describe('Recovery phase 6: a finished namespace is reported, not guessed', () =
 		expect(() => node.openChannel('02'.repeat(33), 100_000n)).to.throw(
 			/lost its guardian backfill/
 		);
+
+		// EVERY entry point, not only the one the node wrapper happens to use.
+		// ChannelManager is published, and its low-level primitives are
+		// reachable by an embedder driving the negotiation itself.
+		const manager = (node as unknown as { channelManager: ChannelManager })
+			.channelManager;
+		const peer = '02'.repeat(33);
+		const errors: string[] = [];
+		manager.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		const indexBeforeRefusals = manager.nextChannelIndex;
+
+		expect(() => manager.openChannel(peer, 100_000n)).to.throw(
+			/lost its guardian backfill/
+		);
+		expect(() =>
+			manager.createDualFundedChannel(peer, {
+				fundingSatoshis: 100_000n,
+				fundingFeeratePerkw: 500
+			} as unknown as Parameters<typeof manager.createDualFundedChannel>[1])
+		).to.throw(/lost its guardian backfill/);
+
+		// The zero-conf primitive refuses with a null, matching its own
+		// disposition. Trust the peer FIRST, or the untrusted-peer branch above
+		// the guard satisfies this on its own and the assertion would pass with
+		// the guard reverted.
+		manager.addTrustedPeer(peer);
+		expect(manager.openZeroConfChannel(peer, 100_000n)).to.equal(null);
+		expect(errors.join(' ')).to.contain('lost its guardian backfill');
+
+		// And nothing was allocated on the way to any refusal: a refused open
+		// must not burn a per-channel key index. This is the assertion that
+		// pins the guard AHEAD of deriveKeysForNewChannel rather than behind
+		// it, so it has to be a before/after comparison on a manager whose
+		// deriver actually advances the index.
+		expect(manager.listChannels()).to.have.length(0);
+		expect(manager.nextChannelIndex).to.equal(indexBeforeRefusals);
 
 		node.destroy();
 		await shutdown(served);

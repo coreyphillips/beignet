@@ -386,6 +386,16 @@ export class ChannelManager extends EventEmitter {
 		htlcBasepointSecret?: Buffer;
 		channelIndex: number;
 	} {
+		// The one place every brand-new channel passes through, and the one that
+		// consumes a key index, so a refusal here cannot burn one. Every caller
+		// already refuses ahead of this with a message scoped to its own
+		// channel id, which is the better error; this is the backstop that
+		// keeps a SIXTH entry point, written later, from silently opening a
+		// channel into a namespace that can never record it. Restore does not
+		// come through here (it derives from a recorded index via
+		// getRecoveryChannelMaterial), so recovering an old channel is never
+		// refused.
+		this._assertNamespaceCanRecordANewChannel();
 		if (this.config.channelKeyDeriver) {
 			const idx = this._nextChannelIndex++;
 			const keys = this.config.channelKeyDeriver(idx);
@@ -550,6 +560,17 @@ export class ChannelManager extends EventEmitter {
 	): Channel | null {
 		if (!this.zeroConfManager.isTrustedPeer(peerPubkey)) {
 			this.emit('error', null, 'Peer is not trusted for zero-conf channels');
+			return null;
+		}
+		// A finished namespace refuses a new channel through EVERY entry point,
+		// and this one is a v1 primitive an embedder can still reach directly.
+		// It matters most here: a zero-conf open sets minimumDepth 0 and
+		// delivers push_msat in the INITIAL commitment, so nothing later in the
+		// handshake is barrier-class and the whole capacity plus the push
+		// reaches the chain on frames the guardians will never hold. Null
+		// rather than a throw, matching this method's own disposition above.
+		if (this._namespaceCannotRecordANewChannel()) {
+			this.emit('error', null, NAMESPACE_LOST_REFUSAL);
 			return null;
 		}
 
