@@ -218,7 +218,62 @@ export interface IChannelPersistRequest {
 	 * pre-revoke state whose retransmission bytes are already gone.
 	 */
 	supersede?: { messageTypes: number[] };
+	/**
+	 * The recovery journal frame this transition landed in, or null when the
+	 * journal is off. Set by the listener alongside `committed`. This is the
+	 * sequence a Phase 6 quorum barrier waits on before the batch's messages
+	 * are allowed onto the wire (docs/RECOVERY-PROTOCOL.md 5.8).
+	 */
+	frameSequence?: bigint | null;
 }
+
+/**
+ * The Phase 6 durability barrier, as the dispatch path sees it
+ * (docs/RECOVERY-PROTOCOL.md 5.8).
+ *
+ * Structural rather than an import so the channel layer keeps knowing nothing
+ * about guardians, replication or recovery storage. DurabilityBarrier in
+ * src/lightning/recovery satisfies it.
+ */
+export interface IWireDurabilityBarrier {
+	/** False in local and async-remote, where nothing is ever held. */
+	readonly enforcing: boolean;
+	/** The synchronous question: is this frame already quorum durable? */
+	isReleased(sequence: bigint | null): boolean;
+	/** Park until it is, or until the wait is refused. */
+	whenReleased(
+		sequence: bigint | null
+	): Promise<{ released: boolean; reason: string }>;
+}
+
+/**
+ * The messages a quorum barrier holds, one per row of spec 5.8.
+ *
+ * - `revoke_and_ack` follows the new commitment being persisted. Releasing it
+ *   before the quorum holds that state is exactly what makes a restored
+ *   device broadcastable: the peer would hold our revocation for a commitment
+ *   our replicas never learned we had moved past.
+ * - `update_fulfill_htlc` follows the preimage and its HTLC linkage. A
+ *   forgotten preimage, after the peer has already seen the fulfill, is a
+ *   paid HTLC we can no longer claim.
+ * - `commitment_signed` is where an outgoing forwarded HTLC becomes
+ *   irrevocable, which is the spec's "forward linkage" row expressed in this
+ *   codebase's message set. `start_batch` rides in the same batch and is
+ *   therefore held with it.
+ * - `tx_signatures` and `splice_locked` are the irreversible splice steps.
+ *   Splice negotiation up to them is abortable and deliberately not held.
+ * - `error` carries the data-loss declaration. The phase 5 disposition
+ *   regenerates it on every reconnect, so holding it costs liveness only.
+ */
+export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
+	new Set<number>([
+		MessageType.REVOKE_AND_ACK,
+		MessageType.UPDATE_FULFILL_HTLC,
+		MessageType.COMMITMENT_SIGNED,
+		MessageType.TX_SIGNATURES,
+		MessageType.SPLICE_LOCKED,
+		MessageType.ERROR
+	]);
 
 export type ChannelAction =
 	| ISendMessageAction

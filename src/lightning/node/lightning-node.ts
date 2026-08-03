@@ -1555,6 +1555,9 @@ export class LightningNode extends EventEmitter {
 		if (request) {
 			request.committed = result.committed;
 			request.outboxIds = result.released.map((r) => r.id);
+			// The frame this transition landed in, which is what a Phase 6
+			// quorum barrier waits on before the batch's messages may go out.
+			request.frameSequence = result.frameSequence;
 		}
 		if (!result.committed) {
 			// Everything rolled back together: re-arm the monitor delta and put
@@ -2128,6 +2131,60 @@ export class LightningNode extends EventEmitter {
 				// Deferred: the blocked batch may still be unwinding through
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
+			}
+		);
+
+		// A quorum barrier is holding a batch's messages (Recovery 5.8). Purely
+		// informational: the channel is waiting, not broken, and the release
+		// happens on its own once the guardians answer.
+		this.channelManager.on(
+			'transition:held',
+			(peerPubkey: string, channelIdHex: string, frame: bigint | null) => {
+				this.emitStructuredLog('channel', 'transition_held', {
+					peerPubkey,
+					channelId: channelIdHex,
+					frameSequence: frame == null ? null : frame.toString()
+				});
+			}
+		);
+
+		// The barrier REFUSED. This is not the failed-persist path: the state
+		// did commit, so none of that path's rollback bookkeeping applies, and
+		// the reason is durability rather than storage. What they share is the
+		// remedy, because a peer waiting on a revoke or commitment we will
+		// never send on this connection rides every in-flight HTLC to its
+		// CLTV. A fenced writer is the exception: its transport is already
+		// being torn down node wide by the gate's hard freeze.
+		this.channelManager.on(
+			'transition:frozen',
+			(
+				peerPubkey: string,
+				channelIdHex: string,
+				reason: string,
+				dropped: number
+			) => {
+				this.emitStructuredLog('channel', 'transition_frozen', {
+					peerPubkey,
+					channelId: channelIdHex,
+					reason,
+					dropped
+				});
+				this.emit('node:error', {
+					code: 'DURABILITY_BARRIER_TIMEOUT',
+					channelId: Buffer.from(channelIdHex, 'hex'),
+					message:
+						`held messages were refused by the durability barrier (${reason}); ` +
+						'the channel resumes through reestablish once the quorum is reachable',
+					timestamp: Date.now()
+				} as ILightningError);
+				if (reason === 'fenced' || !this.peerManager) return;
 				setImmediate(() => {
 					try {
 						this.peerManager?.disconnectPeer(peerPubkey);
