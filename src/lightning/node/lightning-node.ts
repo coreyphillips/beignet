@@ -21,7 +21,7 @@ import {
 	IBlindedHopData,
 	IBlindedPaymentPath
 } from '../onion/blinded-path';
-import { ChannelManager } from '../channel/channel-manager';
+import { ChannelManager, IPerChannelKeys } from '../channel/channel-manager';
 import { ChannelResult } from '../channel/types';
 import { Channel } from '../channel/channel';
 import { isValidShutdownScript } from '../channel/validation';
@@ -3641,8 +3641,11 @@ export class LightningNode extends EventEmitter {
 			// queued behind it.
 			let state: IChannelState;
 			let channel: Channel;
+			let perChannelKeys: IPerChannelKeys | null;
 			try {
-				state = this.buildRecoveryChannelState(entry, channelId);
+				const built = this.buildRecoveryChannelState(entry, channelId);
+				state = built.state;
+				perChannelKeys = built.perChannelKeys;
 				channel = new Channel(state);
 				channel.channelKeyIndex = entry.channelKeyIndex;
 			} catch (err) {
@@ -3710,10 +3713,14 @@ export class LightningNode extends EventEmitter {
 				continue;
 			}
 			try {
+				// The SAME derivation that produced the state's basepoints
+				// also arms the signer: one evaluation of the caller's
+				// deriver per recovered channel, never two that could differ.
 				this.channelManager.restoreChannel(
 					channel,
 					entry.peerNodeId,
-					entry.channelKeyIndex
+					entry.channelKeyIndex,
+					perChannelKeys
 				);
 			} catch (err) {
 				// The state is already durable, so a restart or a retry picks
@@ -3775,12 +3782,14 @@ export class LightningNode extends EventEmitter {
 	 *
 	 * Using the SAME derivation as the original open is what makes the peer's
 	 * DLP proof verifiable and the to_remote output ours to claim. Throws are
-	 * the caller's to isolate: they belong to this entry alone.
+	 * the caller's to isolate: they belong to this entry alone. The derived
+	 * key material is returned alongside the state so registration can reuse
+	 * it instead of asking the deriver a second time.
 	 */
 	private buildRecoveryChannelState(
 		entry: IScbChannelEntry,
 		channelId: Buffer
-	): IChannelState {
+	): { state: IChannelState; perChannelKeys: IPerChannelKeys | null } {
 		const material = this.channelManager.getRecoveryChannelMaterial(
 			entry.channelKeyIndex
 		);
@@ -3831,7 +3840,7 @@ export class LightningNode extends EventEmitter {
 		// connection attempt fails or the process restarts, startup dialing
 		// selects this channel and reconnect regenerates the close request.
 		state.recoveryCloseReason = 'local-data-loss';
-		return state;
+		return { state, perChannelKeys: material.perChannelKeys };
 	}
 
 	/**

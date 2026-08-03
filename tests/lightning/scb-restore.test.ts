@@ -915,6 +915,59 @@ describe('SCB restore', function () {
 				node.destroy();
 			}
 		});
+
+		it('asks the key deriver exactly ONCE per recovered channel', async function () {
+			// The deriver is a caller-supplied callback. Reconstruction takes
+			// the basepoints and registration takes the signing secrets, so
+			// two evaluations of a callback that answered differently would
+			// arm a signer with keys the reconstructed state never committed
+			// to. One evaluation makes that unrepresentable.
+			const good = backupEntries(4)[0];
+			const calls: number[] = [];
+
+			const storage = new SqliteStorage(':memory:');
+			storage.open();
+			const node = new LightningNode({
+				...makeNodeConfig(1),
+				storage,
+				channelKeyDeriver: (index: number) => {
+					calls.push(index);
+					const privkeys = makePrivkeys(makeSeed(index + 70));
+					return {
+						fundingPrivkey: privkeys[0],
+						basepoints: makeBasepoints(privkeys),
+						perCommitmentSeed: makeSeed(index + 80),
+						htlcBasepointSecret: privkeys[4],
+						revocationBasepointSecret: privkeys[1],
+						paymentBasepointSecret: privkeys[2],
+						delayedPaymentBasepointSecret: privkeys[3]
+					};
+				}
+			});
+			node.on('node:error', () => {});
+			try {
+				const result = await node.recoverFromStaticChannelBackup([good]);
+				expect(result.recovering).to.deep.equal([good.channelId]);
+				expect(calls).to.deep.equal([4]);
+
+				// And the signer really was armed from that one answer: the
+				// restored channel's funding key is the derived one.
+				const channel = node
+					.getChannelManager()
+					.getChannel(Buffer.from(good.channelId, 'hex'))!;
+				const derived = makePrivkeys(makeSeed(4 + 70));
+				expect(
+					channel
+						.getFullState()
+						.localBasepoints.fundingPubkey.equals(
+							makeBasepoints(derived).fundingPubkey
+						)
+				).to.equal(true);
+				expect(channel.channelKeyIndex).to.equal(4);
+			} finally {
+				node.destroy();
+			}
+		});
 	});
 
 	// ───────── BeignetNode.restoreFromScb guards ─────────
