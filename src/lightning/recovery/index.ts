@@ -27,3 +27,4 @@ export * from './restore-driver';
 export * from './startup-gate';
 export * from './channel-status';
 export * from './durability-barrier';
+export * from './wire-safety';
