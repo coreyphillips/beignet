@@ -966,3 +966,123 @@ describe('Recovery phase 6: force close is the exit, never a queue entry', () =>
 		expect(harness.sent).to.have.length(0);
 	});
 });
+
+describe('Recovery phase 6: a restart asks the barrier, it does not assume', () => {
+	/** A restored channel that still owes its funding broadcast. */
+	function restoredFunder(channelId: Buffer, txid: Buffer): Channel {
+		return {
+			setLocalNodeIdLower: (): void => undefined,
+			getChannelId: (): Buffer => channelId,
+			getTemporaryChannelId: (): Buffer | null => null,
+			getState: (): ChannelState => ChannelState.AWAITING_FUNDING_CONFIRMED,
+			markForReestablish: (): void => undefined,
+			buildFundingReauthorizationActions: (): ChannelAction[] => [
+				{ type: ChannelActionType.PERSIST_STATE },
+				{
+					type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+					fundingTxid: txid
+				} as ChannelAction
+			],
+			buildSpliceRebroadcastActions: (): ChannelAction[] => [
+				{ type: ChannelActionType.PERSIST_STATE },
+				{
+					type: ChannelActionType.BROADCAST_TX,
+					tx: Buffer.from([3]),
+					fundingCritical: true
+				} as ChannelAction
+			]
+		} as unknown as Channel;
+	}
+
+	it('a re-asked funding authorization is HELD until its new frame is durable', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const txid = crypto.randomBytes(32);
+		const channel = restoredFunder(channelId, txid);
+		const idHex = channelId.toString('hex');
+		(
+			harness.manager as unknown as {
+				channels: Map<string, Channel>;
+				channelPeers: Map<string, string>;
+			}
+		).channels.set(idHex, channel);
+		(
+			harness.manager as unknown as { channelPeers: Map<string, string> }
+		).channelPeers.set(idHex, PEER);
+		const authorized: Buffer[] = [];
+		harness.manager.on('funding:authorized', (id: Buffer) =>
+			authorized.push(id)
+		);
+
+		// This is the restart path. Its frame is brand new, so the barrier can
+		// wait on it; the channel row that proves the obligation cannot.
+		expect(harness.manager.reauthorizeFundingBroadcast(channelId)).to.equal(
+			true
+		);
+		expect(authorized).to.have.length(0);
+		expect(harness.held).to.deep.equal([idHex]);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(authorized).to.have.length(1);
+		expect(authorized[0].equals(txid)).to.equal(true);
+	});
+
+	it('a re-asked splice rebroadcast is held the same way', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = restoredFunder(channelId, crypto.randomBytes(32));
+		const idHex = channelId.toString('hex');
+		(
+			harness.manager as unknown as {
+				channels: Map<string, Channel>;
+				channelPeers: Map<string, string>;
+			}
+		).channels.set(idHex, channel);
+		(
+			harness.manager as unknown as { channelPeers: Map<string, string> }
+		).channelPeers.set(idHex, PEER);
+
+		expect(harness.manager.reauthorizeSpliceBroadcast(channelId)).to.equal(
+			true
+		);
+		expect(harness.broadcasts).to.equal(0);
+
+		harness.barrier.advance(1n);
+		await settle();
+		expect(harness.broadcasts).to.equal(1);
+	});
+
+	it('a refused re-ask broadcasts NOTHING, and leaves the obligation to ask again', async () => {
+		const harness = makeHarness();
+		const channelId = crypto.randomBytes(32);
+		const channel = restoredFunder(channelId, crypto.randomBytes(32));
+		const idHex = channelId.toString('hex');
+		(
+			harness.manager as unknown as {
+				channels: Map<string, Channel>;
+				channelPeers: Map<string, string>;
+			}
+		).channels.set(idHex, channel);
+		(
+			harness.manager as unknown as { channelPeers: Map<string, string> }
+		).channelPeers.set(idHex, PEER);
+		const authorized: Buffer[] = [];
+		harness.manager.on('funding:authorized', (id: Buffer) =>
+			authorized.push(id)
+		);
+
+		harness.manager.reauthorizeFundingBroadcast(channelId);
+		harness.barrier.refuse('backfill-lost');
+		await settle();
+
+		expect(authorized).to.have.length(0);
+		expect(harness.broadcasts).to.equal(0);
+		expect(harness.frozen.map((f) => f.reason)).to.deep.equal([
+			'backfill-lost'
+		]);
+		// The queue is gone, so the next sweep can ask again rather than piling
+		// a second request behind a dead one.
+		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
+	});
+});
