@@ -221,21 +221,10 @@ export class DurabilityBarrier {
 	 * an operator has.
 	 */
 	get namespaceLost(): boolean {
-		if (this.backfillLost) return true;
-		const lost =
-			this.config.backfillLost?.() ??
-			this.config.replicator.namespaceLostBackfill() !== null;
-		if (lost) {
-			this.backfillLost = true;
-			this.emit({
-				type: 'barrier:backfill-lost',
-				detail:
-					'this recovery namespace lost its guardian backfill, so no further ' +
-					'transition can ever be proven durable',
-				waiting: this.waiters.length
-			});
-			this.cancelRetry();
-			this.settleAll({ released: false, reason: 'backfill-lost' });
+		if (!this.backfillLost) {
+			this.backfillLost =
+				this.config.backfillLost?.() ??
+				this.config.replicator.namespaceLostBackfill() !== null;
 		}
 		return this.backfillLost;
 	}
@@ -293,7 +282,7 @@ export class DurabilityBarrier {
 		// and is already correct without it: the watermark simply can never
 		// reach the sequence. This turns the resulting 30s stall into an
 		// immediate, named refusal.
-		if (this.namespaceLost) {
+		if (this.noticeNamespaceLost()) {
 			return Promise.resolve({ released: false, reason: 'backfill-lost' });
 		}
 		if (this.stopped) {
@@ -457,6 +446,31 @@ export class DurabilityBarrier {
 		}
 	}
 
+	/**
+	 * Notice the loss and act on it: report it once, and refuse everything
+	 * parked rather than leaving each waiter to run out its own timeout and
+	 * report the wrong reason.
+	 *
+	 * Separate from the `namespaceLost` getter, which stays a plain
+	 * observation, so that reading the operator status surface cannot settle a
+	 * channel's held messages as a side effect of being asked a question.
+	 */
+	private noticeNamespaceLost(): boolean {
+		const alreadyKnown = this.backfillLost;
+		if (!this.namespaceLost) return false;
+		if (alreadyKnown) return true;
+		this.emit({
+			type: 'barrier:backfill-lost',
+			detail:
+				'this recovery namespace lost its guardian backfill, so no further ' +
+				'transition can ever be proven durable',
+			waiting: this.waiters.length
+		});
+		this.cancelRetry();
+		this.settleAll({ released: false, reason: 'backfill-lost' });
+		return true;
+	}
+
 	private fence(superseding?: GuardianState): void {
 		if (this.fenced) return;
 		this.fenced = true;
@@ -525,7 +539,7 @@ export class DurabilityBarrier {
 				// Checked once per pass so a waiter parked when compaction
 				// killed the namespace is settled now, rather than sitting out
 				// its full timeout and reporting the wrong reason.
-				if (this.namespaceLost) return;
+				if (this.noticeNamespaceLost()) return;
 				const lease = this.config.lease();
 				if (!lease) {
 					// Ownership is unsettled. Releasing here would be exactly the
