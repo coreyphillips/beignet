@@ -4303,6 +4303,11 @@ export class Channel {
 	 * prepareForceClose, against the same candidate view this applies, so the
 	 * caller is free to have made its own irreversible arrangements (a barrier
 	 * queue abandoned, say) between the two calls.
+	 *
+	 * Apply in the same turn the plan was made. It is a decision about the
+	 * state that existed when it was planned, not a standing permission: a
+	 * plan held across further channel activity would commit a commitment
+	 * built from a view the channel has since left.
 	 */
 	applyForceClosePlan(plan: IForceClosePlanReady): ChannelAction[] {
 		if (plan.spliceAdoption) {
