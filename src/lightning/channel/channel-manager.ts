@@ -1586,31 +1586,39 @@ export class ChannelManager extends EventEmitter {
 		}
 
 		const signer = this.signerFor(channel, true);
-		const actions = channel.forceClose(signer);
-		const failure = actions.find(
-			(a): a is { type: ChannelActionType.ERROR; message: string } =>
-				a.type === ChannelActionType.ERROR
-		);
-		if (failure) {
-			this.emit('error', channelId, failure.message);
-			return { ok: false, actions, error: failure.message };
-		}
-
-		// Terminal override, and ONLY once the close is known to be possible.
+		// PLAN, then abandon, then APPLY. The order is the whole point.
+		//
 		// A force close is the operator's exit and must not queue behind a
 		// barrier that may never release: its batch carries no persist, so the
 		// wire-order rule would park it behind whatever this channel is already
 		// holding, and a refusal there would suppress the commitment broadcast
 		// while the CHANNEL_CLOSED beside it still ran and this method still
-		// answered ok. But abandoning the queue is irreversible, and forceClose
+		// answered ok. But abandoning the queue is irreversible, and a close
 		// legitimately refuses for several reasons (an uncertain or stale
 		// restored state, a missing remote signature or taproot nonce, a splice
-		// it cannot adopt). Doing it first would let a REFUSED close consume
-		// the very batch it was meant to replace, including a held recovery
-		// declaration. Ending the off-chain protocol is the point of the call,
-		// so once it is going ahead, preserving off-chain order behind an
-		// unreachable quorum buys nothing.
+		// it cannot adopt), so it cannot be done first either: a REFUSED close
+		// would consume the very batch it was meant to replace, including a
+		// held recovery declaration.
+		//
+		// Planning separates the two. Everything that can refuse happens before
+		// the queue is touched and before the channel moves; once the plan is
+		// ready nothing is left that can decline, so ending the off-chain
+		// protocol and preserving off-chain order behind an unreachable quorum
+		// are no longer in tension.
+		const plan = channel.prepareForceClose(signer);
+		if (!plan.ok) {
+			this.emit('error', channelId, plan.error);
+			return {
+				ok: false,
+				actions: [
+					{ type: ChannelActionType.ERROR, message: plan.error }
+				] as ChannelAction[],
+				error: plan.error
+			};
+		}
+
 		this._abandonQueueForTerminalClose(idHex);
+		const actions = channel.applyForceClosePlan(plan);
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
 		if (peerPubkey) {
 			this.processActions(peerPubkey, channel, actions);

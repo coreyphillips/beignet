@@ -5229,6 +5229,143 @@ describe('Splice', function () {
 			).to.equal(true);
 		});
 
+		/**
+		 * A force close that REFUSES must leave the channel exactly as it
+		 * found it.
+		 *
+		 * The close used to adopt a confirmed splice (swapping the funding
+		 * outpoint, capacity, both balances and the signature material, and
+		 * resetting the splice runtime) BEFORE checks that can still refuse.
+		 * Under Phase 6 that is not merely untidy: a barrier can be holding a
+		 * batch built against the state the channel just moved away from, and
+		 * that batch releases later against a channel that no longer matches
+		 * it. Being in memory and unpersisted is what makes it dangerous, not
+		 * what makes it safe.
+		 */
+		function heldQueueBarrier(): unknown {
+			return {
+				enforcing: true,
+				// Nothing is ever durable here, so the first barrier-class batch
+				// parks and stays parked.
+				isReleased: (): boolean => false,
+				whenReleased: (): Promise<never> => new Promise(() => undefined)
+			};
+		}
+
+		function parkABatch(
+			pair: ReturnType<typeof createNormalChannelPair>
+		): void {
+			// Quorum mode from here on, with nothing ever released: the
+			// commitment round this HTLC drives parks behind the barrier and
+			// stays parked.
+			(
+				pair.openerManager as unknown as {
+					config: { durabilityBarrier: unknown };
+				}
+			).config.durabilityBarrier = heldQueueBarrier();
+			pair.openerManager.addHtlc(
+				pair.channelId,
+				15_000_000n,
+				crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			expect(
+				pair.openerManager
+					.channelsAwaitingDurability()
+					.has(pair.channelId.toString('hex')),
+				'a batch is held against this channel'
+			).to.equal(true);
+		}
+
+		it('a refused force close moves neither the channel nor the batch held against it', function () {
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			parkABatch(pair);
+
+			// The splice confirmed, so the close must exit on the NEW funding.
+			// But the peer's signature over the post-splice commitment is gone
+			// from both the cache and the persisted record, so adopting would
+			// leave the PRE-splice signature in place: non-null, and useless.
+			openerChannel.markSpliceConfirmed();
+			const inflight = openerChannel.getFullState().spliceInFlight!;
+			(
+				inflight as unknown as { remoteCommitmentSig: Buffer | null }
+			).remoteCommitmentSig = null;
+			(
+				openerChannel as unknown as { _spliceRemoteCommitmentSig: null }
+			)._spliceRemoteCommitmentSig = null;
+
+			const before = JSON.stringify(
+				serializeChannelState(openerChannel.getFullState())
+			);
+			const sessionBefore = openerChannel.getSpliceSession();
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, 'the close refuses').to.equal(false);
+			expect(res.error).to.contain('remote commitment signature');
+
+			expect(
+				JSON.stringify(serializeChannelState(openerChannel.getFullState())),
+				'serialized state is byte-for-byte what it was'
+			).to.equal(before);
+			expect(
+				openerChannel.getSpliceSession(),
+				'and the splice runtime was not reset either'
+			).to.equal(sessionBefore);
+			expect(
+				openerChannel.getState(),
+				'no transition toward FORCE_CLOSED'
+			).to.not.equal(ChannelState.FORCE_CLOSED);
+			expect(
+				openerManager
+					.channelsAwaitingDurability()
+					.has(channelId.toString('hex')),
+				'the held batch is still held: a refused terminal close must not consume the batch it would have replaced'
+			).to.equal(true);
+		});
+
+		it('a force close that goes ahead abandons the held batch and broadcasts once', function () {
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			parkABatch(pair);
+
+			openerChannel.markSpliceConfirmed();
+			const spliceTxid = Buffer.from(
+				openerChannel.getFullState().spliceInFlight!.spliceTxid
+			);
+			const dest = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+
+			const res = openerManager.forceClose(channelId, dest);
+			expect(res.ok, res.error).to.equal(true);
+			const broadcasts = res.actions.filter(
+				(a) => a.type === ChannelActionType.BROADCAST_TX
+			);
+			expect(broadcasts.length, 'exactly one commitment').to.equal(1);
+			const tx = bitcoin.Transaction.fromBuffer(
+				(broadcasts[0] as { type: ChannelActionType.BROADCAST_TX; tx: Buffer })
+					.tx
+			);
+			expect(
+				Buffer.from(tx.ins[0].hash).equals(spliceTxid),
+				'spends the NEW funding, planned against the adopted view'
+			).to.equal(true);
+			expect(
+				openerManager
+					.channelsAwaitingDurability()
+					.has(channelId.toString('hex')),
+				'the queue the close replaced is gone, so nothing can release into a closed channel'
+			).to.equal(false);
+			expect(openerChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
+		});
+
 		it('force-close after the splice tx CONFIRMED exits on the NEW funding (no splice_locked ever)', function () {
 			// The peer vanished after tx_signatures; the splice tx confirmed on
 			// chain. The old funding is spent — the live-state commitment could

@@ -1093,6 +1093,13 @@ describe('Recovery phase 6: a refused terminal close leaves the queue alone', ()
 		// forceClose refuses rather than putting a possibly stale commitment on
 		// chain, and that refusal must not cost it the recovery declaration it
 		// is already holding.
+		//
+		// This case is about the QUEUE, so the channel is a stub. What a
+		// refusal must not do to the CHANNEL is pinned on real channels
+		// instead: splice.test.ts (a confirmed splice with no post-splice
+		// signature, alongside a held batch) and taproot-force-close.test.ts
+		// (a missing peer nonce), where there is real state to compare byte
+		// for byte.
 		const channel = {
 			setLocalNodeIdLower: (): void => undefined,
 			getChannelId: (): Buffer => channelId,
@@ -1101,12 +1108,10 @@ describe('Recovery phase 6: a refused terminal close leaves the queue alone', ()
 			markForReestablish: (): void => undefined,
 			getSigner: (): unknown => ({}),
 			channelKeyIndex: 0,
-			forceClose: (): ChannelAction[] => [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Refusing to broadcast: restored state is not proven current'
-				} as ChannelAction
-			],
+			prepareForceClose: (): { ok: false; error: string } => ({
+				ok: false,
+				error: 'Refusing to broadcast: restored state is not proven current'
+			}),
 			getFullState: (): unknown => ({ channelId })
 		} as unknown as Channel;
 		(
