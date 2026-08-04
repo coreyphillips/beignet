@@ -5211,8 +5211,9 @@ export class LightningNode extends EventEmitter {
 							// unconfirmed parent this backend has not seen, a
 							// mempool conflict need not be confirmed, and a
 							// timeout says nothing at all. Retain, retry, and
-							// let the block clock above be the only thing that
-							// ever forgets a channel.
+							// leave forgetting to the block clock below, which
+							// this side never even starts: a funder that owes
+							// the broadcast answers by sending.
 							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
 								channelId: channelId.toString('hex'),
 								txid,
