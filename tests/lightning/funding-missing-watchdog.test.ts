@@ -238,6 +238,19 @@ describe('Channel voiding on funding:missing', function () {
 		);
 
 		expect(alice.listChannels().length).to.equal(1);
+		// BOLT 2 forgets an unconfirmed funding only after 2016 blocks, and
+		// this node holds no signed transaction of its own, so the first
+		// absence starts a clock rather than reaching a verdict. Forgetting
+		// sooner would force a funder whose broadcast is merely late to close
+		// and reopen a channel that was never in trouble.
+		alice.handleNewBlock(700_000);
+		alice
+			.getChainWatcher()!
+			.emit('funding:missing', channelId, '33'.repeat(32));
+		expect(voided.length, 'not voided on the first absence').to.equal(0);
+		expect(alice.listChannels().length).to.equal(1);
+
+		alice.handleNewBlock(700_000 + 2016);
 		alice
 			.getChainWatcher()!
 			.emit('funding:missing', channelId, '33'.repeat(32));

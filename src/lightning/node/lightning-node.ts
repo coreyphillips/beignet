@@ -374,20 +374,8 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 	Feature.ROUTE_BLINDING
 ]);
 
-/**
- * Does this broadcast rejection prove the funding output can never exist?
- *
- * Voiding a channel destroys it, so it needs evidence that the NETWORK refused
- * the transaction: an input already spent, or a conflict with something
- * confirmed. Everything else a backend can answer with, a timeout, a dropped
- * socket, a rate limit, or an already-known acknowledgement, says nothing
- * about validity and is answered by the per-block retry instead.
- */
-function isFundingConflictRejection(message: string): boolean {
-	return /txn-mempool-conflict|bad-txns-inputs-missingorspent|conflict|already spent|missing inputs|txn-already-in-mempool-conflict/i.test(
-		message
-	);
-}
+/** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
+const FUNDING_FORGET_BLOCKS = 2016;
 
 /**
  * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
@@ -552,6 +540,18 @@ export class LightningNode extends EventEmitter {
 	 * block while the quorum is down, so the retry is spaced.
 	 */
 	private reauthAttempts: Map<string, number> = new Map();
+	/**
+	 * Channels whose fully signed splice rebroadcast has already been
+	 * authorized IN THIS PROCESS.
+	 *
+	 * A splice has no equivalent of the funding map's 'authorized' phase, so
+	 * without this every retry window would mint another no-op frame and
+	 * another barrier wait for a rebroadcast that is already permitted.
+	 * Rebroadcasting is cheap and idempotent; re-authorizing is not. Process
+	 * local by the same rule as the funding phase: a restart must ask again,
+	 * because a local frame is not a quorum-durable one.
+	 */
+	private authorizedSpliceBroadcasts: Set<string> = new Set();
 	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
@@ -2488,6 +2488,15 @@ export class LightningNode extends EventEmitter {
 			this.broadcastPendingFundingTx(txidHex);
 		});
 
+		this.channelManager.on(
+			'funding:broadcast-authorized',
+			(channelId: Buffer | null) => {
+				if (channelId) {
+					this.authorizedSpliceBroadcasts.add(channelId.toString('hex'));
+				}
+			}
+		);
+
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
 			// Arming the watch is deliberately NOT gated. It emits no bytes,
@@ -3877,6 +3886,25 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Re-send a splice the barrier has already released in this process.
+	 *
+	 * Straight at the backend deliberately: the authorization this rebroadcast
+	 * rides was granted through the action path and is what made these bytes
+	 * sendable. Repeating the transaction is idempotent, and the alternative,
+	 * a fresh frame per retry window, buys nothing.
+	 */
+	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
+		if (!this._chainBackend) return;
+		this._chainBackend.broadcastTransaction(txHex).catch(() => {
+			// Already in mempool or confirmed, or a backend hiccup. The watch
+			// on the new funding output reports the confirmation either way.
+			this.emitStructuredLog('chain', 'splice_rebroadcast_failed', {
+				channelId: idHex
+			});
+		});
+	}
+
+	/**
 	 * Is a fresh re-authorization request due for this key?
 	 *
 	 * No while the channel is still holding messages, because the request that
@@ -3909,6 +3937,12 @@ export class LightningNode extends EventEmitter {
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) continue;
 			const idHex = id.toString('hex');
+			// Already authorized in this process: rebroadcast without minting
+			// another frame. The barrier has answered for this splice.
+			if (this.authorizedSpliceBroadcasts.has(idHex)) {
+				this.rebroadcastAuthorizedSplice(idHex, inflight.spliceTxHex);
+				continue;
+			}
 			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
 			this.reauthAttempts.set(idHex, Date.now());
 			if (!this.channelManager.reauthorizeSpliceBroadcast(id)) {
@@ -4003,7 +4037,33 @@ export class LightningNode extends EventEmitter {
 			const state = channel.getFullState();
 			if (!state.fundingTxid || !state.pendingFundingTxHex) continue;
 			const txidHex = state.fundingTxid.toString('hex');
-			if (this.pendingFundingTxs.has(txidHex)) continue;
+			// The journal copy WINS, unconditionally. It rode the same frame as
+			// the obligation and is authenticated; the metadata map is local and
+			// best effort, so letting a stale or corrupt entry sit in front of
+			// it would hand a fresh authorization to unrelated bytes.
+			let parsed: bitcoin.Transaction;
+			try {
+				parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex);
+			} catch {
+				this.emitStructuredLog('chain', 'pending_funding_unparseable', {
+					channelId: state.channelId?.toString('hex') ?? null,
+					txid: txidHex
+				});
+				continue;
+			}
+			// And it has to BE the transaction this channel names. A payload
+			// that hashes to something else is corruption, not an obligation:
+			// broadcasting it would put an unrelated transaction on the network
+			// under a channel's authorization.
+			if (parsed.getHash().toString('hex') !== txidHex) {
+				this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
+					channelId: state.channelId?.toString('hex') ?? null,
+					expected: txidHex,
+					actual: parsed.getHash().toString('hex')
+				});
+				this.pendingFundingTxs.delete(txidHex);
+				continue;
+			}
 			this.pendingFundingTxs.set(txidHex, {
 				txHex: state.pendingFundingTxHex,
 				phase: 'restored'
@@ -5020,40 +5080,35 @@ export class LightningNode extends EventEmitter {
 
 				const channel = this.channelManager.getChannel(channelId);
 				if (!channel) return;
+				const state = channel.getFullState();
 				// A vanished SPLICE tx is different: the pre-splice channel is
 				// real and confirmed, and voiding it would destroy a live
 				// channel. Alarm only; splice rollback is a separate path.
-				if (channel.getFullState().spliceInFlight) return;
+				if (state.spliceInFlight) return;
 
-				// Rebroadcast before voiding: BOLT 2 obliges the funder to get
-				// the funding tx confirmed, and a mempool-evicted tx is still
-				// valid. Only when we hold the signed tx and the network
-				// REJECTS it (an input was double-spent, or it conflicts with
-				// a confirmed tx) is the channel truly fiction.
+				// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
+				// three checks find nothing and does not require that the
+				// transaction was ever seen, so it cannot on its own tell an
+				// evicted funding from one we are deliberately withholding, one
+				// whose funder has not broadcast yet, or a backend with an
+				// incomplete view. BOLT 2 gives the answer: a node forgets an
+				// unconfirmed funding only after 2016 blocks. Until then the
+				// channel is retained, whichever side we are, because
+				// forgetting early forces a funder to close and reopen a
+				// channel that was never in trouble.
+				if (state.fundingMissingSinceHeight === undefined) {
+					state.fundingMissingSinceHeight = this.currentBlockHeight;
+				}
+				const waited =
+					this.currentBlockHeight - state.fundingMissingSinceHeight;
+
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
 				const pending = this.pendingFundingTxs.get(internalHex);
 				const pendingHex = pending?.txHex;
-				// ABSENT IS NOT THE SAME AS FICTION, and the difference is the
-				// whole disposition here. This alarm fires after three checks
-				// find nothing, and it does not require that the transaction was
-				// ever seen, so a transaction we are deliberately NOT
-				// broadcasting looks exactly like an evicted one. A channel
-				// whose authorization is merely waiting on the quorum must not
-				// be voided for that: it would delete the channel, its watch,
-				// its state and the one signed transaction that discharges the
-				// obligation, over a transient guardian outage. Only a channel
-				// with no retained transaction at all, or one that never reached
-				// funding_signed, is genuinely fiction.
-				if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
-					this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
-						channelId: channelId.toString('hex'),
-						txid
-					});
-					this.requestFundingReauthorization(internalHex);
-					return;
-				}
-				// This route bypasses broadcastPendingFundingTx, so it needs the
-				// same authorization.
+
+				// The funder's own obligation comes first: if we hold the
+				// transaction and are allowed to send it, absence is answered
+				// by sending it rather than by waiting out a clock.
 				if (
 					pendingHex &&
 					this.fundingProvider &&
@@ -5062,32 +5117,46 @@ export class LightningNode extends EventEmitter {
 					this.fundingProvider
 						.broadcastTransaction(pendingHex)
 						.then(() => {
-							// Back in the mempool: the watcher sees it on its
-							// next check, resets the absence counter and
-							// re-arms the alarm. The channel stays.
 							this.emitStructuredLog('chain', 'funding_rebroadcast', {
 								channelId: channelId.toString('hex'),
 								txid
 							});
 						})
 						.catch((err) => {
-							const message = (err as Error)?.message ?? String(err);
+							// A rejection is NOT evidence that the channel is
+							// fiction. bad-txns-inputs-missingorspent covers an
+							// unconfirmed parent this backend has not seen, a
+							// mempool conflict need not be confirmed, and a
+							// timeout says nothing at all. Retain, retry, and
+							// let the block clock above be the only thing that
+							// ever forgets a channel.
 							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
 								channelId: channelId.toString('hex'),
 								txid,
-								error: message
+								error: (err as Error)?.message ?? String(err)
 							});
-							// Voiding destroys a channel whose funding may be
-							// perfectly valid, so it needs evidence that the
-							// NETWORK rejected the transaction, not merely that
-							// the call failed. A timeout, a dropped connection or
-							// an already-known answer say nothing about validity,
-							// and the per-block retry is the right answer to all
-							// three. Only a conflict or an invalid-input verdict
-							// means the funding output can never exist.
-							if (!isFundingConflictRejection(message)) return;
-							this.voidMissingFundingChannel(channelId, txid);
 						});
+					return;
+				}
+
+				// We hold the transaction but may not send it yet: ask again.
+				if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
+					this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
+						channelId: channelId.toString('hex'),
+						txid
+					});
+					this.requestFundingReauthorization(internalHex);
+					return;
+				}
+
+				// Otherwise this is the fundee, or a funder whose payload is
+				// gone. Nothing to send, so the only question is the clock.
+				if (waited < FUNDING_FORGET_BLOCKS) {
+					this.emitStructuredLog('chain', 'funding_missing_waiting', {
+						channelId: channelId.toString('hex'),
+						txid,
+						waitedBlocks: waited
+					});
 					return;
 				}
 				this.voidMissingFundingChannel(channelId, txid);
@@ -5101,6 +5170,7 @@ export class LightningNode extends EventEmitter {
 			// The funding is mined: the BOLT 2 broadcast obligation is met and
 			// the retained signed tx (kept for eviction rebroadcasts) retires.
 			if (state.fundingTxid) {
+				delete state.fundingMissingSinceHeight;
 				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
 			}
 			if (!state.spliceFundingTxid || !channel.getSpliceSession()) return;

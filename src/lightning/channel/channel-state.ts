@@ -117,6 +117,16 @@ export interface IChannelState {
 	 * restored process still mints a fresh quorum authorization (5.8).
 	 */
 	pendingFundingTxHex?: string;
+	/**
+	 * Block height at which the funding transaction was FIRST observed absent
+	 * from mempool and chain, or unset while it is present.
+	 *
+	 * BOLT 2 lets a non-funding node forget a channel only after 2016 blocks,
+	 * because forgetting sooner forces the funder to close and reopen one that
+	 * was perfectly good. Journaled so the clock survives a restart and a
+	 * guardian restore rather than starting again from zero each time.
+	 */
+	fundingMissingSinceHeight?: number;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 

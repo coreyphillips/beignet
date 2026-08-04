@@ -396,7 +396,7 @@ describe('Funding broadcast retry', function () {
 		bob.destroy();
 	});
 
-	it('funding:missing voids the channel when the rebroadcast is rejected', async function () {
+	it('funding:missing does NOT void on a rejected rebroadcast', async function () {
 		let fundingTxidHex = '';
 		let acceptBroadcast = true;
 		const provider: IFundingProvider = {
@@ -431,8 +431,12 @@ describe('Funding broadcast retry', function () {
 			voided.push(d.channelId)
 		);
 
-		// An input was double-spent: the network rejects the rebroadcast, so
-		// the channel is fiction and must be voided.
+		// The rebroadcast is rejected. That is NOT evidence the channel is
+		// fiction: bad-txns-inputs-missingorspent covers an unconfirmed parent
+		// this backend has not seen, a mempool conflict need not be confirmed,
+		// and a timeout says nothing at all. BOLT 2 forgets an unconfirmed
+		// funding only after 2016 blocks, so the channel and its retained
+		// transaction are both kept.
 		acceptBroadcast = false;
 		const displayTxid = Buffer.from(fundingTxidHex, 'hex')
 			.reverse()
@@ -442,12 +446,12 @@ describe('Funding broadcast retry', function () {
 			.emit('funding:missing', channel.getChannelId()!, displayTxid);
 		await tick();
 
-		expect(voided.length, 'rejected rebroadcast voids the channel').to.equal(1);
-		expect(alice.listChannels().length).to.equal(0);
+		expect(voided.length, 'a rejection is not a verdict').to.equal(0);
+		expect(alice.listChannels().length).to.equal(1);
 		expect(
 			pendingMap(alice).has(fundingTxidHex),
-			'the retained tx is retired with the channel'
-		).to.equal(false);
+			'the retained tx survives a rejected rebroadcast'
+		).to.equal(true);
 
 		alice.destroy();
 		bob.destroy();
@@ -743,11 +747,11 @@ describe('Funding payload and retry survive what the process does not', function
 		bob.destroy();
 	});
 
-	it('a transport failure does NOT void the channel; a conflict does', async function () {
-		for (const [message, shouldVoid] of [
-			['connection reset by peer', false],
-			['bad-txns-inputs-missingorspent', true]
-		] as Array<[string, boolean]>) {
+	it('no rejection message ever voids a funder that still owes the broadcast', async function () {
+		for (const message of [
+			'connection reset by peer',
+			'bad-txns-inputs-missingorspent'
+		]) {
 			let fundingTxidHex = '';
 			const provider: IFundingProvider = {
 				buildFundingTransaction: async (address, amountSats) => {
@@ -776,19 +780,89 @@ describe('Funding payload and retry survive what the process does not', function
 				.reverse()
 				.toString('hex');
 
-			alice.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
-			await tick(80);
-
-			// A dropped socket says nothing about validity and the per-block
-			// retry answers it. Only a conflict means the output can never
-			// exist, and only that may destroy the channel.
-			expect(
-				alice.getChannelManager().getChannel(channelId) === undefined,
-				`voided for "${message}"`
-			).to.equal(shouldVoid);
+			// No message a backend can return proves the funding output can
+			// never exist: a missing input can be an unconfirmed parent this
+			// backend has not seen, a mempool conflict need not be confirmed,
+			// and a timeout says nothing at all. The funder is OBLIGED to get
+			// this confirmed, so it retries rather than ever forgetting.
+			for (const height of [1_000, 1_000 + 2016, 1_000 + 5_000]) {
+				alice.handleNewBlock(height);
+				alice
+					.getChainWatcher()!
+					.emit('funding:missing', channelId, displayTxid);
+				await tick(60);
+				expect(
+					alice.getChannelManager().getChannel(channelId),
+					`voided for "${message}" at height ${height}`
+				).to.not.equal(undefined);
+			}
+			expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
 
 			alice.destroy();
 			bob.destroy();
 		}
+	});
+
+	it('a node with no payload waits out the BOLT 2 timeout before forgetting', async function () {
+		// The fundee never owns the funding transaction, so absence tells it
+		// nothing it can act on. Forgetting after a handful of missing checks
+		// would force a funder whose own quorum was merely slow to close and
+		// reopen a channel that was never in trouble.
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId()
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(65, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(
+			makeNodeConfig(66, { chainBackend: new ControlledBackend() })
+		);
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+
+		const bobChannel = bob.getChannelManager().listChannels()[0];
+		const bobChannelId = bobChannel.getChannelId()!;
+		expect(pendingMap(bob).size, 'the fundee owns no payload').to.equal(0);
+		const displayTxid = Buffer.from(fundingTxidHex, 'hex')
+			.reverse()
+			.toString('hex');
+
+		bob.handleNewBlock(1_000);
+		bob.getChainWatcher()!.emit('funding:missing', bobChannelId, displayTxid);
+		await tick(60);
+		expect(
+			bob.getChannelManager().getChannel(bobChannelId),
+			'retained on the first absence'
+		).to.not.equal(undefined);
+		expect(bobChannel.getFullState().fundingMissingSinceHeight).to.equal(1_000);
+
+		bob.handleNewBlock(1_000 + 2015);
+		bob.getChainWatcher()!.emit('funding:missing', bobChannelId, displayTxid);
+		await tick(60);
+		expect(
+			bob.getChannelManager().getChannel(bobChannelId),
+			'2015 blocks is not 2016'
+		).to.not.equal(undefined);
+
+		bob.handleNewBlock(1_000 + 2016);
+		bob.getChainWatcher()!.emit('funding:missing', bobChannelId, displayTxid);
+		await tick(60);
+		expect(
+			bob.getChannelManager().getChannel(bobChannelId),
+			'forgotten at the BOLT 2 timeout'
+		).to.equal(undefined);
+
+		alice.destroy();
+		bob.destroy();
 	});
 });
