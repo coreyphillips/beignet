@@ -3957,6 +3957,46 @@ export class Channel {
 	}
 
 	/**
+	 * Start the BOLT 2 forget clock for a funding neither mempool nor chain can
+	 * find. Returns true when THIS call started it, which is the caller's
+	 * signal that the new height owes a persist: the clock counts down to
+	 * destroying a channel, so it must be read back after a restart rather
+	 * than restarted from whatever height the node happens to be at then.
+	 * Idempotent afterwards, so every later absence keeps the original height.
+	 */
+	beginFundingMissingClock(height: number): boolean {
+		if (this._state.fundingMissingSinceHeight !== undefined) return false;
+		this._state.fundingMissingSinceHeight = height;
+		return true;
+	}
+
+	/** The height absence was first observed at, or undefined if never. */
+	fundingMissingSince(): number | undefined {
+		return this._state.fundingMissingSinceHeight;
+	}
+
+	/**
+	 * Stop the clock: the funding was found, so nothing is counting down any
+	 * more. Returns true when this call cleared a running clock, so the caller
+	 * knows the removal is a state change that owes a persist of its own.
+	 */
+	clearFundingMissingClock(): boolean {
+		if (this._state.fundingMissingSinceHeight === undefined) return false;
+		delete this._state.fundingMissingSinceHeight;
+		return true;
+	}
+
+	/**
+	 * Retire the retained funding payload, which lives with the broadcast
+	 * obligation it serves. Returns true when this call dropped one.
+	 */
+	clearRetainedFundingPayload(): boolean {
+		if (this._state.pendingFundingTxHex === undefined) return false;
+		delete this._state.pendingFundingTxHex;
+		return true;
+	}
+
+	/**
 	 * The same re-authorization for a fully signed splice resumed at startup.
 	 *
 	 * Startup used to hand the retained hex straight to the chain backend,

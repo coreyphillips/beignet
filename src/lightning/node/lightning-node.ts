@@ -1652,6 +1652,33 @@ export class LightningNode extends EventEmitter {
 		return result.committed;
 	}
 
+	/**
+	 * persistChannel, with the outcome reported back to the caller.
+	 *
+	 * For the transitions a caller must not act on until they are on disk. The
+	 * funding forget clock is one: an unrecorded start is a countdown that
+	 * begins again at every restart, so the caller rolls it back rather than
+	 * counting down from a height nothing can read back.
+	 *
+	 * A node configured without storage answers true. Nothing it holds
+	 * survives a restart in any case, so refusing the transition would deny it
+	 * a behavior it can never earn, rather than protecting anything. Every
+	 * other path that does not reach the commit — an unresolvable channel, a
+	 * rolled-back transaction — answers false.
+	 */
+	private persistChannelCommitted(channelId: Buffer): boolean {
+		if (!this.storage || !this.recovery) return true;
+		const request: IChannelPersistRequest = {
+			outbound: [],
+			// Answered by the commit itself. Anything that returns before it
+			// leaves this false, which is the fail-closed direction.
+			committed: false,
+			outboxIds: []
+		};
+		this.persistChannel(channelId, request);
+		return request.committed;
+	}
+
 	private persistChannel(
 		channelId: Buffer,
 		request?: IChannelPersistRequest
@@ -5086,22 +5113,6 @@ export class LightningNode extends EventEmitter {
 				// channel. Alarm only; splice rollback is a separate path.
 				if (state.spliceInFlight) return;
 
-				// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
-				// three checks find nothing and does not require that the
-				// transaction was ever seen, so it cannot on its own tell an
-				// evicted funding from one we are deliberately withholding, one
-				// whose funder has not broadcast yet, or a backend with an
-				// incomplete view. BOLT 2 gives the answer: a node forgets an
-				// unconfirmed funding only after 2016 blocks. Until then the
-				// channel is retained, whichever side we are, because
-				// forgetting early forces a funder to close and reopen a
-				// channel that was never in trouble.
-				if (state.fundingMissingSinceHeight === undefined) {
-					state.fundingMissingSinceHeight = this.currentBlockHeight;
-				}
-				const waited =
-					this.currentBlockHeight - state.fundingMissingSinceHeight;
-
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
 				const pending = this.pendingFundingTxs.get(internalHex);
 				const pendingHex = pending?.txHex;
@@ -5151,6 +5162,39 @@ export class LightningNode extends EventEmitter {
 
 				// Otherwise this is the fundee, or a funder whose payload is
 				// gone. Nothing to send, so the only question is the clock.
+				//
+				// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
+				// three checks find nothing and does not require that the
+				// transaction was ever seen, so it cannot on its own tell an
+				// evicted funding from one we are deliberately withholding, one
+				// whose funder has not broadcast yet, or a backend with an
+				// incomplete view. BOLT 2 gives the answer: a node forgets an
+				// unconfirmed funding only after 2016 blocks. Until then the
+				// channel is retained, whichever side we are, because
+				// forgetting early forces a funder to close and reopen a
+				// channel that was never in trouble.
+				//
+				// The START of that countdown has to reach disk before it
+				// counts for anything. Held only in memory it is lost on the
+				// next restart, the following absence starts it again at
+				// whatever height the node is at by then, and a node that
+				// restarts often enough never reaches the disposition at all.
+				// A start that cannot be recorded therefore does not begin:
+				// failing closed here means RETAINING the channel and asking
+				// again on the next absence, never counting down from a height
+				// no restart can read back.
+				if (channel.beginFundingMissingClock(this.currentBlockHeight)) {
+					if (!this.persistChannelCommitted(channelId)) {
+						channel.clearFundingMissingClock();
+						this.emitStructuredLog('chain', 'funding_missing_clock_unwritten', {
+							channelId: channelId.toString('hex'),
+							txid
+						});
+						return;
+					}
+				}
+				const waited = this.currentBlockHeight - channel.fundingMissingSince()!;
+
 				if (waited < FUNDING_FORGET_BLOCKS) {
 					this.emitStructuredLog('chain', 'funding_missing_waiting', {
 						channelId: channelId.toString('hex'),
@@ -5167,13 +5211,22 @@ export class LightningNode extends EventEmitter {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
 			const state = channel.getFullState();
-			// The funding is mined: the BOLT 2 broadcast obligation is met and
-			// the retained signed tx (kept for eviction rebroadcasts) retires.
+			// The funding is mined: the BOLT 2 broadcast obligation is met, so
+			// the retained signed tx (kept for eviction rebroadcasts) retires
+			// and the forget clock stops. Both are channel state and both are
+			// persisted here rather than left for some later transition to
+			// carry: a clock left on disk after its funding CONFIRMED keeps
+			// counting across the next restart, toward voiding a channel that
+			// is on the chain.
+			let retired = channel.clearFundingMissingClock();
 			if (state.fundingTxid) {
-				delete state.fundingMissingSinceHeight;
+				retired = channel.clearRetainedFundingPayload() || retired;
 				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
 			}
-			if (!state.spliceFundingTxid || !channel.getSpliceSession()) return;
+			if (!state.spliceFundingTxid || !channel.getSpliceSession()) {
+				if (retired) this.persistChannel(channelId);
+				return;
+			}
 			// sendSpliceLocked self-validates the splice state; ignore if not ready.
 			const result = this.channelManager.sendSpliceLocked(channelId);
 			if (!result.ok) {

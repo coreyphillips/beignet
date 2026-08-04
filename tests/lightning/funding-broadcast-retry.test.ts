@@ -34,6 +34,19 @@ import {
 	deserializeChannelState,
 	serializeChannelState
 } from '../../src/lightning/storage/serialization';
+import {
+	CRASH_V1_PROFILE,
+	GuardianClient,
+	GuardianHttpServer,
+	GuardianReplicator,
+	IBoundGuardianClient,
+	IWriterLeaseKeys,
+	ReferenceGuardian,
+	RestoreDriver,
+	computeGuardianSetId,
+	deriveRecoveryRoot,
+	xOnlyFromSecret
+} from '../../src/lightning/recovery';
 
 bitcoin.initEccLib(ecc);
 
@@ -97,6 +110,7 @@ function makeNodeConfig(
 		fundingProvider?: IFundingProvider;
 		chainBackend?: IChainBackend;
 		storage?: SqliteStorage;
+		recovery?: INodeConfig['recovery'];
 	} = {}
 ): INodeConfig {
 	const seed = makeSeed(seedId);
@@ -116,6 +130,15 @@ function makeNodeConfig(
 		htlcBasepointSecret: htlcSecret,
 		...opts
 	};
+}
+
+/** The node identity makeNodeConfig derives, as the recovery root needs it. */
+function nodeSecretFor(seedId: number): Buffer {
+	return crypto
+		.createHash('sha256')
+		.update(makeSeed(seedId))
+		.update(Buffer.from('node-identity'))
+		.digest();
 }
 
 function connectNodes(nodeA: LightningNode, nodeB: LightningNode): void {
@@ -864,5 +887,375 @@ describe('Funding payload and retry survive what the process does not', function
 
 		alice.destroy();
 		bob.destroy();
+	});
+});
+
+/**
+ * The clock counts down to DESTROYING a channel, so where it started has to
+ * survive everything the channel survives. A start held only in memory is
+ * lost on the next restart, the following absence starts it again at whatever
+ * height the node is at by then, and a node that restarts often enough never
+ * reaches the disposition at all. Adding the field to IChannelState makes it
+ * persistABLE; only a commit makes a particular start persistED.
+ */
+describe('The funding forget clock outlives the process that starts it', function () {
+	/** A fundee (owns no payload) with its own database, plus its funder. */
+	async function fundeeWithStorage(
+		seedId: number,
+		storage: SqliteStorage
+	): Promise<{
+		funder: LightningNode;
+		fundee: LightningNode;
+		channelId: Buffer;
+		displayTxid: string;
+	}> {
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId()
+		};
+		const funder = new LightningNode(
+			makeNodeConfig(seedId, { fundingProvider: provider })
+		);
+		const fundee = new LightningNode(
+			makeNodeConfig(seedId + 1, {
+				storage,
+				chainBackend: new ControlledBackend(),
+				recovery: { enabled: true }
+			})
+		);
+		funder.on('node:error', () => {});
+		fundee.on('node:error', () => {});
+		connectNodes(funder, fundee);
+		funder.openChannel(fundee.getNodeId(), 500_000n);
+		await tick();
+		const channel = fundee.getChannelManager().listChannels()[0];
+		return {
+			funder,
+			fundee,
+			channelId: channel.getChannelId()!,
+			displayTxid: Buffer.from(fundingTxidHex, 'hex').reverse().toString('hex')
+		};
+	}
+
+	function reopen(seedId: number, storage: SqliteStorage): LightningNode {
+		const node = new LightningNode(
+			makeNodeConfig(seedId, {
+				storage,
+				chainBackend: new ControlledBackend(),
+				recovery: { enabled: true }
+			})
+		);
+		node.on('node:error', () => {});
+		return node;
+	}
+
+	function tempDb(prefix: string): string {
+		return path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), `beignet-${prefix}-`)),
+			'node.db'
+		);
+	}
+
+	it('a restart reads the clock back instead of restarting it', async function () {
+		this.timeout(20_000);
+		const dbPath = tempDb('forget-clock');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const first = await fundeeWithStorage(70, storage1);
+
+		first.fundee.handleNewBlock(700_000);
+		first.fundee
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			first.fundee
+				.getChannelManager()
+				.getChannel(first.channelId)!
+				.fundingMissingSince(),
+			'the clock started'
+		).to.equal(700_000);
+
+		first.funder.destroy();
+		first.fundee.destroy();
+
+		// A crash before any later transition: nothing else wrote this channel
+		// between the start and the restart, so the start is durable or it is
+		// nowhere.
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const restarted = reopen(71, storage2);
+		await tick(150);
+
+		const restored = restarted.getChannelManager().getChannel(first.channelId);
+		expect(restored, 'channel restored').to.not.equal(undefined);
+		expect(
+			restored!.fundingMissingSince(),
+			'the height the FIRST process observed, not this one'
+		).to.equal(700_000);
+
+		// 2015 blocks after the original start is still not 2016, however many
+		// processes the wait was spread across.
+		restarted.handleNewBlock(700_000 + 2015);
+		restarted
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			restarted.getChannelManager().getChannel(first.channelId),
+			'retained at 2015'
+		).to.not.equal(undefined);
+
+		restarted.handleNewBlock(700_000 + 2016);
+		restarted
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			restarted.getChannelManager().getChannel(first.channelId),
+			'forgotten at the boundary the FIRST process set'
+		).to.equal(undefined);
+
+		restarted.destroy();
+	});
+
+	it('a start that cannot be recorded does not begin', async function () {
+		this.timeout(20_000);
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const { funder, fundee, channelId, displayTxid } = await fundeeWithStorage(
+			72,
+			storage
+		);
+
+		// The disk refuses. A countdown toward destroying a channel must not
+		// start from a height no restart can read back, so the fail-closed
+		// direction is RETENTION: no clock, and ask again next time.
+		const recovery = (
+			fundee as unknown as {
+				recovery: { commit: (...a: unknown[]) => unknown };
+			}
+		).recovery;
+		const realCommit = recovery.commit.bind(recovery);
+		recovery.commit = (): unknown => ({
+			committed: false,
+			released: [],
+			frameSequence: null,
+			error: new Error('disk full')
+		});
+
+		fundee.handleNewBlock(700_000);
+		fundee.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+		await tick(60);
+		const channel = fundee.getChannelManager().getChannel(channelId)!;
+		expect(channel, 'retained').to.not.equal(undefined);
+		expect(
+			channel.fundingMissingSince(),
+			'no clock was started from an unrecorded height'
+		).to.equal(undefined);
+
+		// The disk comes back and the next absence starts the clock for real,
+		// at the height it is actually observed.
+		recovery.commit = realCommit;
+		fundee.handleNewBlock(700_050);
+		fundee.getChainWatcher()!.emit('funding:missing', channelId, displayTxid);
+		await tick(60);
+		expect(channel.fundingMissingSince()).to.equal(700_050);
+
+		funder.destroy();
+		fundee.destroy();
+	});
+
+	it('a confirmed funding retires the clock durably', async function () {
+		this.timeout(20_000);
+		const dbPath = tempDb('forget-clock-confirmed');
+		const storage1 = new SqliteStorage(dbPath);
+		storage1.open();
+		const first = await fundeeWithStorage(74, storage1);
+
+		first.fundee.handleNewBlock(700_000);
+		first.fundee
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			first.fundee
+				.getChannelManager()
+				.getChannel(first.channelId)!
+				.fundingMissingSince()
+		).to.equal(700_000);
+
+		// Found after all. The clock stops, and stopping it is itself a state
+		// change that has to reach disk: left there it keeps counting toward
+		// voiding a channel whose funding is on the chain.
+		first.fundee.getChainWatcher()!.emit('funding:confirmed', first.channelId);
+		await tick(60);
+		first.funder.destroy();
+		first.fundee.destroy();
+
+		const storage2 = new SqliteStorage(dbPath);
+		storage2.open();
+		const restarted = reopen(75, storage2);
+		await tick(150);
+		const restored = restarted.getChannelManager().getChannel(first.channelId);
+		expect(
+			restored!.fundingMissingSince(),
+			'cleared clock stays cleared'
+		).to.equal(undefined);
+
+		// So an absence long after the original start begins a fresh clock
+		// rather than landing past a boundary that was never running.
+		restarted.handleNewBlock(700_000 + 2016);
+		restarted
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			restarted.getChannelManager().getChannel(first.channelId),
+			'not voided by a clock that had been retired'
+		).to.not.equal(undefined);
+		expect(restored!.fundingMissingSince()).to.equal(700_000 + 2016);
+
+		restarted.destroy();
+	});
+
+	it('a guardian-only restore brings the clock back where it started', async function () {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(30_000);
+		const secrets = [1, 2, 3].map((i) =>
+			crypto.createHash('sha256').update(`forget-clock-guardian-${i}`).digest()
+		);
+		const ids = secrets.map((s) => xOnlyFromSecret(s));
+		const setId = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: ids
+		});
+		const context = { guardianSetId: setId, members: ids };
+		let now = 2_000_000_000_000n;
+		const clock = (): bigint => ++now;
+		const served = await Promise.all(
+			secrets.map(async (secret, index) => {
+				const guardian = new ReferenceGuardian({
+					path: ':memory:',
+					guardianSecret: secret,
+					members: ids,
+					clock
+				});
+				const server = new GuardianHttpServer({ guardian });
+				const port = await server.listen(0);
+				return {
+					guardian,
+					server,
+					bound: {
+						client: new GuardianClient({
+							url: `http://127.0.0.1:${port}`,
+							guardianSetId: setId
+						}),
+						expectedGuardianId: ids[index]
+					} as IBoundGuardianClient
+				};
+			})
+		);
+		const bound = served.map((s) => s.bound);
+		const nodeSecret = nodeSecretFor(77);
+		const recoveryRoot = deriveRecoveryRoot(nodeSecret);
+
+		const storage1 = new SqliteStorage(':memory:');
+		storage1.open();
+		const first = await fundeeWithStorage(76, storage1);
+		first.fundee.handleNewBlock(700_000);
+		first.fundee
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+
+		// Everything this device journaled, including the frame the clock
+		// started in, reaches the guardians.
+		const replicator = new GuardianReplicator({
+			storage: storage1,
+			guardians: bound,
+			context,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot,
+			clock
+		});
+		const decision = await replicator.ensureNamespace();
+		await replicator.replicatePending(
+			(decision as { lease: IWriterLeaseKeys }).lease
+		);
+
+		// The device is destroyed: process, database and all. Only the
+		// guardians hold anything now.
+		first.funder.destroy();
+		first.fundee.destroy();
+		storage1.close();
+
+		const target = new SqliteStorage(':memory:');
+		target.open();
+		await new RestoreDriver({
+			target,
+			guardians: bound,
+			context,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot,
+			nodeSecret,
+			nodeId: getPublicKey(nodeSecret),
+			clock
+		}).restore();
+
+		const revived = new LightningNode(
+			makeNodeConfig(77, {
+				storage: target,
+				chainBackend: new ControlledBackend(),
+				recovery: { enabled: true }
+			})
+		);
+		revived.on('node:error', () => {});
+		await tick(150);
+
+		const restored = revived.getChannelManager().getChannel(first.channelId);
+		expect(restored, 'the channel came back from the guardians').to.not.equal(
+			undefined
+		);
+		expect(
+			restored!.fundingMissingSince(),
+			'and so did the height its clock started at'
+		).to.equal(700_000);
+
+		// The BOLT 2 boundary is the one the destroyed device set, not one
+		// measured from the restore.
+		revived.handleNewBlock(700_000 + 2015);
+		revived
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			revived.getChannelManager().getChannel(first.channelId),
+			'retained at 2015'
+		).to.not.equal(undefined);
+
+		revived.handleNewBlock(700_000 + 2016);
+		revived
+			.getChainWatcher()!
+			.emit('funding:missing', first.channelId, first.displayTxid);
+		await tick(60);
+		expect(
+			revived.getChannelManager().getChannel(first.channelId),
+			'forgotten at the boundary the LOST device set'
+		).to.equal(undefined);
+
+		revived.destroy();
+		target.close();
+		for (const entry of served) {
+			await entry.server.close();
+			entry.guardian.close();
+		}
 	});
 });
