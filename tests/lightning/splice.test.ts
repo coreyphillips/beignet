@@ -5366,6 +5366,109 @@ describe('Splice', function () {
 			expect(openerChannel.getState()).to.equal(ChannelState.FORCE_CLOSED);
 		});
 
+		/**
+		 * The gap between planning a close and applying it must contain no
+		 * callbacks at all.
+		 *
+		 * Tearing the held queue down used to dispatch the abandoned batches'
+		 * internal effects and emit three events, all BEFORE the plan was
+		 * applied. Node emits synchronously, so a listener that throws leaves
+		 * the queue deleted and the close never applied, and a listener that
+		 * re-enters the manager moves the channel out from under a commitment
+		 * already built against it. Neither is a race; both are ordinary
+		 * control flow.
+		 */
+		function closeOn(
+			pair: ReturnType<typeof createNormalChannelPair>
+		): ReturnType<
+			ReturnType<typeof createNormalChannelPair>['openerManager']['forceClose']
+		> {
+			pair.openerChannel.markSpliceConfirmed();
+			return pair.openerManager.forceClose(
+				pair.channelId,
+				Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)])
+			);
+		}
+
+		it('an observer that throws cannot cost the operator the exit', function () {
+			for (const event of [
+				'transition:terminal-override',
+				'transition:begin',
+				'transition:end'
+			]) {
+				const pair = pendingLockPair();
+				parkABatch(pair);
+				const broadcasts: Buffer[] = [];
+				pair.openerManager.on('broadcast:tx', (tx: Buffer) =>
+					broadcasts.push(tx)
+				);
+				pair.openerManager.on(event, () => {
+					throw new Error(`observer failure from ${event}`);
+				});
+
+				const res = closeOn(pair);
+
+				expect(res.ok, `${event}: the close still happened`).to.equal(true);
+				expect(
+					broadcasts.length,
+					`${event}: the commitment was broadcast exactly once`
+				).to.equal(1);
+				expect(
+					pair.openerManager
+						.channelsAwaitingDurability()
+						.has(pair.channelId.toString('hex')),
+					`${event}: and the queue it replaced is gone`
+				).to.equal(false);
+				expect(pair.openerChannel.getState()).to.equal(
+					ChannelState.FORCE_CLOSED
+				);
+			}
+		});
+
+		it('nothing from the abandoned queue runs before the close is applied', function () {
+			const pair = pendingLockPair();
+			const { openerManager, channelId, openerChannel } = pair;
+			parkABatch(pair);
+
+			const broadcasts: Buffer[] = [];
+			openerManager.on('broadcast:tx', (tx: Buffer) => broadcasts.push(tx));
+
+			// The settlement's own event, which is the first callback the
+			// teardown makes. By the time it runs the close must already be a
+			// fact, so a listener re-entering this channel meets a closed one
+			// rather than editing the state the plan was built from.
+			let stateAtCallback: ChannelState | null = null;
+			let broadcastsAtCallback = -1;
+			let reentrantAddOk: boolean | null = null;
+			openerManager.on('transition:terminal-override', () => {
+				stateAtCallback = openerChannel.getState();
+				broadcastsAtCallback = broadcasts.length;
+				reentrantAddOk = openerManager.addHtlc(
+					channelId,
+					1_000_000n,
+					crypto.createHash('sha256').update(crypto.randomBytes(32)).digest(),
+					500000,
+					crypto.randomBytes(1366)
+				).ok;
+			});
+
+			const res = closeOn(pair);
+			expect(res.ok, res.error).to.equal(true);
+
+			expect(stateAtCallback, 'the channel was already closed').to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(
+				broadcastsAtCallback,
+				'and the commitment was already on its way'
+			).to.equal(1);
+			expect(
+				reentrantAddOk,
+				'so a re-entrant update is declined by the closed channel, not applied behind the plan'
+			).to.equal(false);
+			expect(broadcasts.length, 'still exactly one commitment').to.equal(1);
+		});
+
 		it('force-close after the splice tx CONFIRMED exits on the NEW funding (no splice_locked ever)', function () {
 			// The peer vanished after tx_signatures; the splice tx confirmed on
 			// chain. The old funding is spent — the live-state commitment could

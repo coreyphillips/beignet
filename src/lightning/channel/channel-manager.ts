@@ -1617,12 +1617,22 @@ export class ChannelManager extends EventEmitter {
 			};
 		}
 
-		this._abandonQueueForTerminalClose(idHex);
+		// Detach, apply, dispatch, THEN settle. Nothing between the plan and
+		// its application may run a listener: an observer that throws would
+		// leave the queue gone and the close never applied, and one that
+		// synchronously re-enters this manager would move the channel out from
+		// under a commitment already built against it. So the teardown is
+		// split, and only its callback-free half runs in that gap.
+		const detached = this._detachQueueForTerminalClose(idHex);
 		const actions = channel.applyForceClosePlan(plan);
 		const peerPubkey = this.channelPeers.get(channelId.toString('hex'));
 		if (peerPubkey) {
-			this.processActions(peerPubkey, channel, actions);
+			this._dispatchTerminalForceClose(peerPubkey, channel, actions);
 		}
+		// What the detached batches still owed, with their wire half suppressed
+		// and every observer failure contained. After the dispatch above, so a
+		// listener re-entering this channel meets a FORCE_CLOSED one.
+		this._settleDetachedQueueAfterTerminalClose(idHex, detached);
 		this.emit('channel:force-closing', channelId, 'local');
 
 		// Create a ChainMonitor for this channel, signing with the channel's own
@@ -5327,7 +5337,10 @@ export class ChannelManager extends EventEmitter {
 		held: IHeldBatch
 	): void {
 		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
-		this.emit('transition:begin', channelIdHex);
+		// Contained on both edges so the pair is always balanced: a listener
+		// that throws out of `begin` would otherwise leave every listener that
+		// already ran holding an open transition that never closes.
+		this.emitContained('transition:begin', channelIdHex);
 		try {
 			this._dispatchActions(
 				peerPubkey,
@@ -5342,7 +5355,7 @@ export class ChannelManager extends EventEmitter {
 		} catch {
 			// One batch's internal effects failing must not strand the rest.
 		} finally {
-			this.emit('transition:end', channelIdHex);
+			this.emitContained('transition:end', channelIdHex);
 		}
 	}
 
@@ -5433,33 +5446,138 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Tear a channel's barrier queue down because it is force closing.
+	 * Unhook a channel's barrier queue because it is force closing, and hand
+	 * the caller what was parked. PURE, in the only sense that matters here:
+	 * it dispatches nothing and emits nothing.
+	 *
+	 * That is the whole point of the split. This runs between a force-close
+	 * plan being made and being applied, and a plan is a decision about the
+	 * state that existed when it was planned. Anything with a callback in it
+	 * (a dispatched action, an emitted event) opens a window in that gap:
+	 * a listener that throws leaves the queue deleted and the close never
+	 * applied, and one that synchronously re-enters this manager moves the
+	 * channel out from under a commitment already built against it. Node
+	 * emits synchronously, so both are ordinary control flow, not races.
+	 *
+	 * Removing the queue also retires the release loop, whose own guard stops
+	 * it from dispatching into a queue this has replaced.
+	 */
+	private _detachQueueForTerminalClose(channelIdHex: string): {
+		peerPubkey: string;
+		channel: Channel;
+		batches: IHeldBatch[];
+	} | null {
+		const queue = this.barrierQueues.get(channelIdHex);
+		if (!queue) return null;
+		this.barrierQueues.delete(channelIdHex);
+		const batches = queue.batches;
+		queue.batches = [];
+		return { peerPubkey: queue.peerPubkey, channel: queue.channel, batches };
+	}
+
+	/**
+	 * Settle what the detached queue still owed, AFTER the close is on its way.
 	 *
 	 * Everything parked runs for its committed edge-triggered effects only and
 	 * its wire half is abandoned permanently: once the commitment is on chain
 	 * the off-chain stream is over, and releasing an older message after it
-	 * would describe a channel that no longer exists. Removing the queue also
-	 * retires the release loop, whose own guard stops it from dispatching into
-	 * a queue this method has replaced.
+	 * would describe a channel that no longer exists.
+	 *
+	 * Every observer failure is contained. By the time this runs the
+	 * commitment has been authorized and dispatched, so an exception escaping
+	 * a diagnostic listener could only undo bookkeeping for a close that has
+	 * already happened. Re-entrancy is answered the same way, by ordering: a
+	 * listener that comes back into this channel now meets a FORCE_CLOSED one
+	 * and is declined on its own merits, rather than editing the state a plan
+	 * was built from.
 	 *
 	 * Its OWN event, because this is neither a durability refusal nor a
 	 * dispatch failure: nothing went wrong, an operator asked for the exit.
 	 */
-	private _abandonQueueForTerminalClose(channelIdHex: string): void {
-		const queue = this.barrierQueues.get(channelIdHex);
-		if (!queue) return;
-		this.barrierQueues.delete(channelIdHex);
-		const abandoned = queue.batches;
-		queue.batches = [];
-		for (const batch of abandoned) {
-			this.runHeldSuffixWithoutSending(queue.peerPubkey, queue.channel, batch);
+	private _settleDetachedQueueAfterTerminalClose(
+		channelIdHex: string,
+		detached: {
+			peerPubkey: string;
+			channel: Channel;
+			batches: IHeldBatch[];
+		} | null
+	): void {
+		if (!detached) return;
+		for (const batch of detached.batches) {
+			try {
+				this.runHeldSuffixWithoutSending(
+					detached.peerPubkey,
+					detached.channel,
+					batch
+				);
+			} catch {
+				// One batch's observers must not strand the rest, and none of
+				// them may reach back out past a close that is already done.
+			}
 		}
-		this.emit(
+		this.emitContained(
 			'transition:terminal-override',
-			queue.peerPubkey,
+			detached.peerPubkey,
 			channelIdHex,
-			abandoned.length
+			detached.batches.length
 		);
+	}
+
+	/**
+	 * emit, for the terminal teardown paths, where a throwing listener must
+	 * not propagate. Everything these announce has already happened.
+	 */
+	private emitContained(event: string, ...args: unknown[]): void {
+		try {
+			this.emit(event, ...args);
+		} catch {
+			// Contained deliberately: see the callers.
+		}
+	}
+
+	/**
+	 * Dispatch the terminal force-close batch.
+	 *
+	 * Deliberately not processActions. Everything that path adds is for cases
+	 * this batch does not have: it carries no persist, nothing in it is
+	 * barrier-class, and its queue has just been detached, so there is nothing
+	 * to attribute, hold or park. What processActions WOULD add is an
+	 * uncontained observer boundary in front of the commitment broadcast, and
+	 * a listener must not be able to suppress the last exit a channel has.
+	 * The transition pair is emitted for the same listeners, contained on both
+	 * edges so it stays balanced whatever an observer does.
+	 */
+	private _dispatchTerminalForceClose(
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[]
+	): void {
+		if (this.config.nodePrivateKey) {
+			if (!this.localNodeIdCache) {
+				this.localNodeIdCache = getPublicKey(this.config.nodePrivateKey);
+			}
+			channel.setLocalNodeIdLower(
+				Buffer.compare(this.localNodeIdCache, Buffer.from(peerPubkey, 'hex')) <
+					0
+			);
+		}
+		// Staged for a batch that is not happening now: a supersede belongs to
+		// the transition that staged it, and this one deletes nothing.
+		this._pendingOutboxSupersede = null;
+		const channelIdHex = channel.getChannelId()?.toString('hex') ?? null;
+		this.emitContained('transition:begin', channelIdHex);
+		try {
+			this._dispatchActions(
+				peerPubkey,
+				channel,
+				actions,
+				null,
+				() => false,
+				() => undefined
+			);
+		} finally {
+			this.emitContained('transition:end', channelIdHex);
+		}
 	}
 
 	/**

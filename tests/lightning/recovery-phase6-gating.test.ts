@@ -917,7 +917,11 @@ describe('Recovery phase 6: force close is the exit, never a queue entry', () =>
 		const manager = harness.manager as unknown as {
 			channels: Map<string, Channel>;
 			channelPeers: Map<string, string>;
-			_abandonQueueForTerminalClose(id: string): void;
+			_detachQueueForTerminalClose(id: string): unknown;
+			_settleDetachedQueueAfterTerminalClose(
+				id: string,
+				detached: unknown
+			): void;
 		};
 		manager.channels.set(idHex, channel);
 		manager.channelPeers.set(idHex, PEER);
@@ -941,11 +945,16 @@ describe('Recovery phase 6: force close is the exit, never a queue entry', () =>
 		// rule would park it behind the held revoke; a refusal there would then
 		// suppress the commitment broadcast while the CHANNEL_CLOSED beside it
 		// still ran, and the caller would already have been told ok.
-		manager._abandonQueueForTerminalClose(idHex);
+		// In the manager's order: detach (which runs no callbacks at all, so
+		// nothing can move the channel or throw between the plan and its
+		// application), dispatch the terminal batch, then settle what the
+		// detached queue still owed.
+		const detached = manager._detachQueueForTerminalClose(idHex);
 		dispatch(harness.manager, channel, [
 			{ type: ChannelActionType.BROADCAST_TX, tx: Buffer.from([7]) },
 			{ type: ChannelActionType.CHANNEL_CLOSED, channelId } as ChannelAction
 		]);
+		manager._settleDetachedQueueAfterTerminalClose(idHex, detached);
 
 		expect(harness.broadcasts).to.equal(1);
 		expect(harness.manager.channelsAwaitingDurability().size).to.equal(0);
