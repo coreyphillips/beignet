@@ -19,6 +19,8 @@ import { IPerChannelKeys } from '../channel/channel-manager';
 import { SignerFactory } from '../keys/signer';
 import { WebSocketConstructor } from '../transport/websocket';
 import { GuardianStartupGate } from '../recovery/startup-gate';
+import { DurabilityBarrier } from '../recovery/durability-barrier';
+import { RecoveryDurability } from '../recovery/types';
 
 export type { IInvoiceInfo };
 
@@ -216,6 +218,56 @@ export interface INodeConfig {
 	 */
 	recovery?: {
 		enabled?: boolean;
+		/**
+		 * How durable a safety transition must be before the wire messages it
+		 * authorizes may reach the peer (5.8, Phase 6). Defaults to
+		 * `async-remote`, which is the node's pre-Phase-6 conduct: fsync,
+		 * continue, replicate in the background.
+		 *
+		 * `quorum` is the only value that changes behaviour. It holds
+		 * revoke_and_ack, update_fulfill_htlc, commitment_signed, the
+		 * irreversible splice messages and the data-loss error until the
+		 * journal frame behind them has reached a guardian quorum, and it
+		 * REQUIRES `barrier`. What it buys is the Tier 3 guarantee: once a
+		 * peer has seen new channel state from us, sufficient remote
+		 * information already exists to restore that state, so a restored
+		 * device resumes the channel instead of falling back to DLP.
+		 *
+		 * Quorum is sticky. Once this journal has written quorum frames the
+		 * writer stays in quorum mode whatever this says, because a certified
+		 * head reading 'quorum' must never be followed by an unbarriered
+		 * frame. Leaving the mode means starting a new namespace, not editing
+		 * a config value.
+		 */
+		durability?: RecoveryDurability;
+		/**
+		 * The barrier itself (5.8, Phase 6). Built outside the node with its
+		 * guardian set, exactly as `startupGate` is, and required whenever
+		 * `durability` resolves to `quorum`. It also drives replication in
+		 * every mode, so an `async-remote` node passes one too if it wants its
+		 * journal replicated at all.
+		 *
+		 * Its pump is kicked by three things: a commit, a barrier waiter, and
+		 * ownership settling. The node performs the third when a `startupGate`
+		 * is configured alongside it. WITHOUT a gate it is the integrator's
+		 * job: call `barrier.kickReplication()` as soon as the barrier's
+		 * `lease` closure starts returning the new lease, or a frame committed
+		 * before ownership settled stays unreplicated until the next commit,
+		 * which on a quiet node is never.
+		 */
+		barrier?: DurabilityBarrier;
+		/**
+		 * Frames compaction will hold back for a guardian that has not caught
+		 * up, before pruning anyway.
+		 *
+		 * Defaults to 1024 in `local` and `async-remote`, where a dead replica
+		 * costs durability alone and unbounded disk is the worse failure. In
+		 * `quorum` there is NO default: crossing the ceiling deletes frames
+		 * fewer than `required` guardians ever accepted, so those frames exist
+		 * nowhere and the namespace is finished. Setting this in quorum mode is
+		 * opting in to that outcome.
+		 */
+		maxRetainedFrameGap?: number;
 		/** Delta frames between full-state snapshots (default 256). */
 		snapshotIntervalFrames?: number;
 		/**

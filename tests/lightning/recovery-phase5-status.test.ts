@@ -99,12 +99,36 @@ function makeBasepoints(seed: Buffer): {
 function findSendAction(
 	actions: Array<{ type: ChannelActionType }>,
 	msgType: MessageType
-): { payload: Buffer } | undefined {
+): { payload: Buffer; durabilityCritical?: boolean } | undefined {
 	return actions.find(
 		(a) =>
 			a.type === ChannelActionType.SEND_MESSAGE &&
 			(a as unknown as { messageType: MessageType }).messageType === msgType
-	) as { payload: Buffer } | undefined;
+	) as { payload: Buffer; durabilityCritical?: boolean } | undefined;
+}
+
+/**
+ * The shape every recovery-close batch must have: the persist that names the
+ * frame, then the declaration that waits on it. Asserted by predicate rather
+ * than by index so a future leading action does not silently move the send out
+ * from under the assertion.
+ */
+function expectRecoveryCloseShape(
+	actions: Array<{ type: ChannelActionType }>
+): {
+	payload: Buffer;
+	durabilityCritical?: boolean;
+} {
+	expect(actions.map((a) => a.type)).to.deep.equal([
+		ChannelActionType.PERSIST_STATE,
+		ChannelActionType.SEND_MESSAGE
+	]);
+	const wire = findSendAction(actions, MessageType.ERROR);
+	expect(wire, 'the batch must carry the wire error').to.not.equal(undefined);
+	// Marked, not merely typed: an ordinary protocol ERROR is not held by the
+	// barrier, so only the mark distinguishes the declaration from it.
+	expect(wire!.durabilityCritical).to.equal(true);
+	return wire!;
 }
 
 function setupNormalChannels(): {
@@ -712,12 +736,10 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		);
 		expect(restored.hasRecoveryCloseDisposition()).to.equal(true);
 		const actions = restored.buildRecoveryCloseActions();
-		expect(actions).to.have.length(1);
-		expect(
-			decodeErrorMessage(
-				(actions[0] as unknown as { payload: Buffer }).payload
-			).data.toString('ascii')
-		).to.contain('proven current');
+		const wire = expectRecoveryCloseShape(actions);
+		expect(decodeErrorMessage(wire.payload).data.toString('ascii')).to.contain(
+			'proven current'
+		);
 		expect(
 			actions.some((a) => a.type === ChannelActionType.BROADCAST_TX)
 		).to.equal(false);
@@ -749,7 +771,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 			deserializeChannelState(serializeChannelState(opener.getFullState()))
 		);
 		expect(restored.hasRecoveryCloseDisposition()).to.equal(true);
-		expect(restored.buildRecoveryCloseActions()).to.have.length(1);
+		expectRecoveryCloseShape(restored.buildRecoveryCloseActions());
 	});
 
 	it('a legacy ERRORED data-loss state without the field still gets durable close behavior', function () {
@@ -767,13 +789,10 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 		expect(legacy.getFullState().recoveryCloseReason).to.equal(undefined);
 		expect(legacy.getRecoveryCloseReason()).to.equal('local-data-loss');
 		expect(legacy.hasRecoveryCloseDisposition()).to.equal(true);
-		const actions = legacy.buildRecoveryCloseActions();
-		expect(actions).to.have.length(1);
-		expect(
-			decodeErrorMessage(
-				(actions[0] as unknown as { payload: Buffer }).payload
-			).data.toString('ascii')
-		).to.contain('stale');
+		const wire = expectRecoveryCloseShape(legacy.buildRecoveryCloseActions());
+		expect(decodeErrorMessage(wire.payload).data.toString('ascii')).to.contain(
+			'stale'
+		);
 	});
 
 	it('ForceClosing after a real force close', function () {

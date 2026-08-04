@@ -196,6 +196,10 @@ import {
 	RecoveryCriticality,
 	RecoveryMutation,
 	GuardianStartupGate,
+	DurabilityBarrier,
+	chainLostBackfill,
+	chainPromisedQuorum,
+	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
@@ -203,7 +207,10 @@ import {
 	journalSupported,
 	composeRecoveryCapsule
 } from '../recovery';
-import { IChannelPersistRequest } from '../channel/channel-actions';
+import {
+	IChannelPersistEvent,
+	IChannelPersistRequest
+} from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
 import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
@@ -370,6 +377,32 @@ const PAYER_UNDERSTOOD_INVOICE_FEATURES: ReadonlySet<number> = new Set([
 	Feature.ROUTE_BLINDING
 ]);
 
+/** BOLT 2: a node forgets an unconfirmed funding only after 2016 blocks. */
+const FUNDING_FORGET_BLOCKS = 2016;
+
+/**
+ * A signed funding transaction and whether BOLT 2 yet obliges us to put it on
+ * the network.
+ *
+ * 'candidate' is built and signed but FORBIDDEN: funding_signed has not been
+ * accepted, so the 2-of-2 has no unilateral exit for us. It is retained anyway
+ * so a crash in the signing window cannot lose the transaction. 'authorized'
+ * is the obligation, granted only by the AUTHORIZE_FUNDING_BROADCAST action,
+ * which is the one signal that has cleared both the persist gate and the
+ * quorum barrier. 'restored' came off disk this startup with its authorization
+ * unknown, and resolves on first read against the channel it belongs to.
+ *
+ * Deliberately NOT persisted: the on-disk shape stays {txid, txHex}, so an
+ * entry written by any older build restores through the same path as one
+ * written by this build and there is no migration to get wrong. A flag on disk
+ * would be a copy of a fact the channel already holds, and the only one of the
+ * two that can go stale.
+ */
+interface IPendingFundingTx {
+	txHex: string;
+	phase: 'candidate' | 'authorized' | 'restored';
+}
+
 export class LightningNode extends EventEmitter {
 	private nodePrivkey: Buffer;
 	/** Genesis hashes of chains we operate on (for gossip chain-scoping). */
@@ -496,7 +529,33 @@ export class LightningNode extends EventEmitter {
 	 * or a later mempool eviction is retried on every new block, and the map
 	 * is persisted so a restart resumes the obligation.
 	 */
-	private pendingFundingTxs: Map<string, string> = new Map();
+	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
+	/**
+	 * When a re-authorization was last asked for, keyed by funding txid or, for
+	 * a splice, by channel id.
+	 *
+	 * Two jobs, and the second is why this is a timestamp rather than a flag. A
+	 * request still parked behind the barrier must not be duplicated, which the
+	 * awaiting-durability check answers. A request that ENDED without being
+	 * granted, because the barrier timed out or refused, has to be asked again,
+	 * or a transient guardian outage would strand the obligation until the next
+	 * process restart. Asking again on every block would mint a no-op frame per
+	 * block while the quorum is down, so the retry is spaced.
+	 */
+	private reauthAttempts: Map<string, number> = new Map();
+	/**
+	 * Channels whose fully signed splice rebroadcast has already been
+	 * authorized IN THIS PROCESS.
+	 *
+	 * A splice has no equivalent of the funding map's 'authorized' phase, so
+	 * without this every retry window would mint another no-op frame and
+	 * another barrier wait for a rebroadcast that is already permitted.
+	 * Rebroadcasting is cheap and idempotent; re-authorizing is not. Process
+	 * local by the same rule as the funding phase: a restart must ask again,
+	 * because a local frame is not a quorum-durable one.
+	 */
+	private authorizedSpliceBroadcasts: Set<string> = new Set();
+	private static readonly REAUTH_RETRY_MS = 10 * 60_000;
 	private paymentRetryContexts: Map<string, IPaymentRetryContext> = new Map();
 	private mppCleanupTimer: ReturnType<typeof setInterval> | null = null;
 	// Per-HTLC shared secrets for creating encrypted failure messages (keyed by "channelIdHex:htlcId")
@@ -605,6 +664,11 @@ export class LightningNode extends EventEmitter {
 	 * before it can touch the Lightning protocol.
 	 */
 	private recoveryGate: GuardianStartupGate | undefined;
+	/**
+	 * Quorum durability barrier (recovery 5.8). Also the node's only driver
+	 * of guardian replication, in every durability mode.
+	 */
+	private recoveryBarrier: DurabilityBarrier | undefined;
 	/** The constructor's dial pass was withheld pending gate confirmation. */
 	private _autoReconnectDeferred = false;
 	private capsuleRefreshTimer: ReturnType<typeof setTimeout> | null = null;
@@ -629,6 +693,16 @@ export class LightningNode extends EventEmitter {
 		// Opt-in and additive; when off, nothing changes. The journal appends
 		// inside RecoveryManager.commit's transaction, so enabling it makes the
 		// frame part of every safety transition's atomicity.
+		// Phase 6 (5.8): the durability mode every frame declares, and the
+		// barrier that holds wire messages until their frame is replicated.
+		// async-remote is the default because it is exactly the node's
+		// pre-Phase-6 conduct.
+		const barrier = config.recovery?.barrier;
+		// The journal is built before the logger field is assigned, and its
+		// sticky-durability check reports through onDurabilityRefused during
+		// construction, so the message is captured and logged below rather
+		// than reaching for a logger that does not exist yet.
+		let durabilityRefusal: string | null = null;
 		const journal =
 			this.storage &&
 			config.recovery?.enabled === true &&
@@ -641,11 +715,73 @@ export class LightningNode extends EventEmitter {
 						// (wire spec 1.1, 3.2); never the public node id.
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
+							durability: config.recovery.durability ?? 'async-remote',
+							// Compaction must never prune a frame a guardian has not
+							// received: the chain origin is immutable and guardians
+							// accept only logHead.sequence + 1, so a pruned-early
+							// frame wedges that guardian for good.
+							retainFrom: barrier
+								? (): bigint => barrier.watermark() + 1n
+								: undefined,
+							onDurabilityRefused: (detail): void => {
+								durabilityRefusal = detail;
+							},
+							maxRetainedFrameGap: config.recovery.maxRetainedFrameGap,
+							onCompactionForced: (detail): void => {
+								this.logger?.warn(`recovery compaction: ${detail}`);
+								// Deferred out of the commit's open transaction: this
+								// fires from inside RecoveryManager.commit, and a
+								// listener that touches storage must not run there.
+								setImmediate(() => {
+									this.emitStructuredLog('channel', 'recovery_backfill_lost', {
+										detail
+									});
+									this.emit('recovery:backfill-lost', detail);
+								});
+							},
 							snapshotIntervalFrames: config.recovery.snapshotIntervalFrames,
 							snapshotIntervalBytes: config.recovery.snapshotIntervalBytes
 						}
 				  )
 				: undefined;
+		// Fail closed on a chain that promised quorum and a node that can no
+		// longer deliver it. Continuing would put revoke_and_ack on the wire
+		// unbarriered beneath a certified head that still reads 'quorum', and
+		// a later restore of that chain would claim an exactness it does not
+		// have. The remedy is to restore the guardian configuration.
+		// The check is on the DATABASE, not on the journal object, because the
+		// dangerous configuration is the one where no journal exists at all:
+		// the sticky rule lives inside RecoveryJournal, so a run with recovery
+		// switched off would append nothing while its channels kept advancing
+		// past a certified head that still reads 'quorum'.
+		if (
+			this.storage &&
+			!barrier?.enforcing &&
+			chainPromisedQuorum(
+				this.storage,
+				deriveRecoveryMasterKey(config.nodePrivateKey),
+				getPublicKey(config.nodePrivateKey)
+			)
+		) {
+			throw new Error(
+				'recovery: this database is in quorum mode but no enforcing durability ' +
+					'barrier was configured, so safety-critical messages could not be held; ' +
+					'restore the guardian set, or start a new recovery namespace'
+			);
+		}
+		// And the mirror image, which would be worse because it looks like it
+		// is working: an enforcing barrier with no journal has no frame to wait
+		// on, so every batch reports frameSequence null, every barrier answers
+		// yes, and quorum mode holds nothing at all while claiming to. Journal
+		// support is not optional for the mode that depends on it.
+		if (barrier?.enforcing && !journal) {
+			throw new Error(
+				'recovery: quorum durability needs the recovery journal, which is off ' +
+					'or unsupported by this storage backend; without frames there is ' +
+					'nothing for a barrier to wait on and nothing would be held'
+			);
+		}
+		this.recoveryBarrier = barrier;
 		// Phase 3 (docs/RECOVERY-PROTOCOL.md 5.4): with the journal on, every
 		// journaled commit schedules a (once-per-minute throttled) refresh of
 		// the peer_storage Recovery Capsule.
@@ -655,7 +791,15 @@ export class LightningNode extends EventEmitter {
 			? new RecoveryManager(this.storage, {
 					journal,
 					onCommitted: journal
-						? (): void => this.scheduleRecoveryCapsuleRefresh()
+						? (): void => {
+								this.scheduleRecoveryCapsuleRefresh();
+								// Start replicating without waiting for it. This is
+								// "appends are pipelined" from the commit side: the
+								// frame is handed to the pump and the transition
+								// returns, so later frames keep landing while an
+								// earlier receipt is still outstanding.
+								this.recoveryBarrier?.noteCommitted();
+						  }
 						: undefined,
 					onError: (err: Error, context): void => {
 						// persistChannel reports its own failures with the channel id
@@ -703,6 +847,9 @@ export class LightningNode extends EventEmitter {
 		this.socks5Proxy = config.socks5Proxy ?? null;
 		this.initWatchtowerClient(config.watchtowers ?? []);
 		this.logger = config.logger ?? noopLogger;
+		if (durabilityRefusal) {
+			this.logger.warn(`recovery durability: ${durabilityRefusal}`);
+		}
 		this.missionControl = new MissionControl();
 		this.maxPaymentRetries = config.maxPaymentRetries ?? 3;
 		this.maxTotalInFlightHtlcs = config.maxTotalInFlightHtlcs ?? 1000;
@@ -753,6 +900,18 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
+		// option_dual_fund: quorum durability refuses to START a v2 open (see
+		// ChannelManager, QUORUM_NO_DUAL_FUND_REFUSAL), so it must not invite
+		// one either. A peer that reads the bit and opens accordingly would be
+		// answered with a refusal it could have been spared, and our own
+		// openChannel routes by this same bit, so clearing it is also what
+		// makes the generic API choose v1 rather than a v2 its own manager
+		// will reject. Advertising is only half of it: negotiation is advisory
+		// and the handler guards refuse for themselves regardless.
+		if (barrier?.enforcing === true) {
+			localFeatures.clearBit(Feature.DUAL_FUND);
+			localFeatures.clearBit(Feature.DUAL_FUND + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -777,6 +936,11 @@ export class LightningNode extends EventEmitter {
 			nodePrivateKey: config.nodePrivateKey,
 			channelKeyDeriver: config.channelKeyDeriver,
 			signerFactory: config.signerFactory,
+			// Recovery 5.8: in quorum mode this holds a batch's remaining
+			// actions until the frame behind them is replicated. In every
+			// other mode it answers yes synchronously and dispatch is
+			// unchanged.
+			durabilityBarrier: this.recoveryBarrier,
 			largeChannels: this.largeChannels,
 			// Liquidity ads seller policy (bLIP-0051): sign will_fund for inbound
 			// request_funds and fund the contribution via the fundingProvider.
@@ -856,6 +1020,12 @@ export class LightningNode extends EventEmitter {
 		// construction would lose that race: autoReconnectPeers() below
 		// schedules real dials on zero-delay timers.
 		this.recoveryGate = config.recovery?.startupGate;
+		// The barrier is wired FIRST so its own gate hook is registered before
+		// the gate's peer bring-up runs: replication is then already in flight
+		// when the first batch arrives to be held.
+		if (this.recoveryBarrier) {
+			this.wireRecoveryBarrier(this.recoveryBarrier, journal);
+		}
 		if (this.recoveryGate) this.wireRecoveryGate(this.recoveryGate);
 
 		if (config.enableNetworking) {
@@ -931,6 +1101,35 @@ export class LightningNode extends EventEmitter {
 		// Restore from storage if available
 		if (this.storage) {
 			this.restoreFromStorage();
+			// Turning quorum ON is the one moment a v2 opening session and
+			// quorum durability can meet: the mode refuses to START a v2 open,
+			// but a session begun under async-remote can be sitting in the
+			// restored state when the operator switches. Refuse to come up
+			// rather than carry it: that session may already have crossed
+			// commitment_signed, so silently abandoning it would discard a
+			// funding round the peer may be able to complete, and continuing
+			// would claim an exactness this node cannot deliver for it.
+			// Finish or abandon it under async-remote first.
+			if (barrier?.enforcing === true) {
+				for (const channel of this.channelManager.listChannels()) {
+					const st = channel.getState();
+					if (
+						st !== ChannelState.DUAL_FUNDING_V2 &&
+						st !== ChannelState.AWAITING_TX_SIGNATURES
+					) {
+						continue;
+					}
+					const id = (
+						channel.getChannelId() ?? channel.getTemporaryChannelId()
+					).toString('hex');
+					throw new Error(
+						`recovery: cannot enable quorum durability while a dual-funded ` +
+							`open is in progress (channel ${id} is ${st}); its interactive ` +
+							`funding session is not restartable, so finish or abandon it ` +
+							`under async-remote durability first`
+					);
+				}
+			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
@@ -1497,6 +1696,41 @@ export class LightningNode extends EventEmitter {
 		return result.committed;
 	}
 
+	/**
+	 * persistChannel, with the outcome reported back to the caller.
+	 *
+	 * For the transitions a caller must not act on until they are on disk. The
+	 * funding forget clock is one: an unrecorded start is a countdown that
+	 * begins again at every restart, so the caller rolls it back rather than
+	 * counting down from a height nothing can read back.
+	 *
+	 * A node configured without storage answers true. Nothing it holds
+	 * survives a restart in any case, so refusing the transition would deny it
+	 * a behavior it can never earn, rather than protecting anything. Every
+	 * other path that does not reach the commit — an unresolvable channel, a
+	 * rolled-back transaction — answers false.
+	 */
+	private persistChannelCommitted(channelId: Buffer): boolean {
+		if (!this.storage || !this.recovery) return true;
+		const request: IChannelPersistRequest = {
+			outbound: [],
+			// Answered by the commit itself. Anything that returns before it
+			// leaves this false, which is the fail-closed direction.
+			committed: false,
+			outboxIds: []
+		};
+		this.persistChannel(channelId, request);
+		return request.committed;
+	}
+
+	/**
+	 * The id-addressed entry point, for the node's own call sites: they hold a
+	 * channel id and the channel is in the manager under it.
+	 *
+	 * The dispatch path does NOT come through here. It hands over the channel
+	 * it already resolved, because during a v2 open the id a channel answers
+	 * to and the id it will be keyed by are briefly different things.
+	 */
 	private persistChannel(
 		channelId: Buffer,
 		request?: IChannelPersistRequest
@@ -1506,7 +1740,16 @@ export class LightningNode extends EventEmitter {
 		if (!channel) return;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return;
+		this.persistChannelState(channel, peer, channelId, request);
+	}
 
+	private persistChannelState(
+		channel: Channel,
+		peer: string,
+		channelId: Buffer,
+		request?: IChannelPersistRequest
+	): void {
+		if (!this.storage || !this.recovery) return;
 		const channelIdHex = channelId.toString('hex');
 		const keyIndex = channel.channelKeyIndex;
 		// Channel state persisted without its key index restores a channel that
@@ -1555,6 +1798,9 @@ export class LightningNode extends EventEmitter {
 		if (request) {
 			request.committed = result.committed;
 			request.outboxIds = result.released.map((r) => r.id);
+			// The frame this transition landed in, which is what a Phase 6
+			// quorum barrier waits on before the batch's messages may go out.
+			request.frameSequence = result.frameSequence;
 		}
 		if (!result.committed) {
 			// Everything rolled back together: re-arm the monitor delta and put
@@ -2074,12 +2320,23 @@ export class LightningNode extends EventEmitter {
 		// Persist-before-send: channel state, its key index, any monitor delta
 		// this same action produced, and the wire bytes it authorizes all commit
 		// in one transaction; the sends are released only if it commits.
-		this.channelManager.on(
-			'channel:persist',
-			(channelId: Buffer, request?: IChannelPersistRequest) => {
-				this.persistChannel(channelId, request);
+		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
+			// A node that HAS persistence answers for itself. The request
+			// arrives committed:true, which is the right default only for a
+			// node that persists nothing at all; leaving it true here would
+			// let a listener that returned early, or an id that resolved to
+			// nothing, read as a successful commit and release the batch's
+			// sends. Only reaching recovery.commit may say committed.
+			if (event.request && this.storage && this.recovery) {
+				event.request.committed = false;
 			}
-		);
+			this.persistChannelState(
+				event.channel,
+				event.peerPubkey,
+				event.channelId,
+				event.request
+			);
+		});
 
 		// A processActions batch is open: monitor changes it causes belong in
 		// that channel's transition rather than in a second, separate write.
@@ -2128,6 +2385,99 @@ export class LightningNode extends EventEmitter {
 				// Deferred: the blocked batch may still be unwinding through
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
+			}
+		);
+
+		// A quorum barrier is holding a batch's messages (Recovery 5.8). Purely
+		// informational: the channel is waiting, not broken, and the release
+		// happens on its own once the guardians answer.
+		this.channelManager.on(
+			'transition:held',
+			(peerPubkey: string, channelIdHex: string, frame: bigint | null) => {
+				this.emitStructuredLog('channel', 'transition_held', {
+					peerPubkey,
+					channelId: channelIdHex,
+					frameSequence: frame == null ? null : frame.toString()
+				});
+			}
+		);
+
+		// The barrier REFUSED. This is not the failed-persist path: the state
+		// did commit, so none of that path's rollback bookkeeping applies, and
+		// the reason is durability rather than storage. What they share is the
+		// remedy, because a peer waiting on a revoke or commitment we will
+		// never send on this connection rides every in-flight HTLC to its
+		// CLTV. A fenced writer is the exception: its transport is already
+		// being torn down node wide by the gate's hard freeze.
+		this.channelManager.on(
+			'transition:frozen',
+			(
+				peerPubkey: string,
+				channelIdHex: string,
+				reason: string,
+				dropped: number
+			) => {
+				this.emitStructuredLog('channel', 'transition_frozen', {
+					peerPubkey,
+					channelId: channelIdHex,
+					reason,
+					dropped
+				});
+				this.emit('node:error', {
+					code: 'DURABILITY_BARRIER_TIMEOUT',
+					channelId: Buffer.from(channelIdHex, 'hex'),
+					message:
+						`held messages were refused by the durability barrier (${reason}); ` +
+						'the channel resumes through reestablish once the quorum is reachable',
+					timestamp: Date.now()
+				} as ILightningError);
+				if (reason === 'fenced' || !this.peerManager) return;
+				setImmediate(() => {
+					try {
+						this.peerManager?.disconnectPeer(peerPubkey);
+					} catch {
+						// Already disconnected, or transport-level teardown raced.
+					}
+				});
+			}
+		);
+
+		// A released batch threw partway through dispatch, so an unknown prefix
+		// of its wire bytes is on the socket and its tail never went. There is
+		// no safe continuation on this connection: only reestablish after a
+		// reconnect replays the channel's stream from durable state. The
+		// disconnect is unconditional here, unlike the frozen handler's fenced
+		// exemption, because nothing else is tearing this transport down.
+		this.channelManager.on(
+			'transition:dispatch-failed',
+			(
+				peerPubkey: string,
+				channelIdHex: string,
+				reason: string,
+				dropped: number
+			) => {
+				this.emitStructuredLog('channel', 'transition_dispatch_failed', {
+					peerPubkey,
+					channelId: channelIdHex,
+					reason,
+					dropped
+				});
+				this.emit('node:error', {
+					code: 'BARRIER_DISPATCH_FAILED',
+					channelId: Buffer.from(channelIdHex, 'hex'),
+					message:
+						`a released batch failed partway through dispatch (${reason}); ` +
+						'the connection is dropped so reestablish can replay from durable state',
+					timestamp: Date.now()
+				} as ILightningError);
+				if (!this.peerManager) return;
 				setImmediate(() => {
 					try {
 						this.peerManager?.disconnectPeer(peerPubkey);
@@ -2224,9 +2574,34 @@ export class LightningNode extends EventEmitter {
 
 		// Auto-funding: broadcast funding tx after funding_signed
 		// pendingFundingTxs is keyed by funding txid hex
+		// The funder's BOLT 2 point of no return, dispatched as an action so a
+		// failed persist can withhold it and a quorum barrier can hold it. The
+		// broadcast used to ride the watch:funding emit below, which is not an
+		// action and therefore sat outside every gate the dispatch path
+		// applies.
+		this.channelManager.on('funding:authorized', (fundingTxid: Buffer) => {
+			const txidHex = fundingTxid.toString('hex');
+			const entry = this.pendingFundingTxs.get(txidHex);
+			if (entry) entry.phase = 'authorized';
+			this.reauthAttempts.delete(txidHex);
+			this.broadcastPendingFundingTx(txidHex);
+		});
+
+		this.channelManager.on(
+			'funding:broadcast-authorized',
+			(channelId: Buffer | null) => {
+				if (channelId) {
+					this.authorizedSpliceBroadcasts.add(channelId.toString('hex'));
+				}
+			}
+		);
+
 		this.channelManager.on('watch:funding', (fundingTxid: Buffer) => {
 			const txidHex = fundingTxid.toString('hex');
-			this.broadcastPendingFundingTx(txidHex);
+			// Arming the watch is deliberately NOT gated. It emits no bytes,
+			// touches no chain and is idempotent, restoreChainWatches rebuilds
+			// it at startup, and on a barrier refusal the right disposition is
+			// the outpoint watched and the transaction not created.
 			// Register the funding output with the chain watcher NOW, not only
 			// on restart: live confirmation detection, announcement depth,
 			// breach detection and the funding-missing watchdog (critical for
@@ -2958,39 +3333,138 @@ export class LightningNode extends EventEmitter {
 		});
 	}
 
+	/**
+	 * Wire the quorum durability barrier into the node (recovery 5.8).
+	 *
+	 * Two node-owned consequences hang off it. A proven supersession is the
+	 * SAME hard freeze the startup gate performs, because the two differ only
+	 * in when they notice: the gate catches a device that restarts stale, the
+	 * barrier catches one that was already running when it was superseded.
+	 * And an advancing watermark releases the compaction the journal held back
+	 * for a lagging replica.
+	 */
+	private wireRecoveryBarrier(
+		barrier: DurabilityBarrier,
+		journal: RecoveryJournal | undefined
+	): void {
+		barrier.onFenced((superseding) => {
+			this.emitStructuredLog('channel', 'recovery_fenced', {
+				epoch: superseding ? String(superseding.lease.epoch) : null
+			});
+			this.emit('recovery:fenced', superseding);
+			this.peerManager?.freezeConnections();
+		});
+		// Ownership settles asynchronously after construction, and a pump that
+		// finds no lease with nobody waiting gives up rather than spinning a
+		// timer forever. Frames committed during startup would then sit
+		// unreplicated until the next commit, which on a quiet node is never,
+		// and the journal's retain floor holds compaction at that stalled
+		// watermark for exactly as long. The gate opening is the moment
+		// ownership is confirmed, so it is the moment to kick.
+		this.recoveryGate?.onOpen(() => {
+			if (this._destroyed) return;
+			barrier.kickReplication();
+		});
+		if (journal) {
+			barrier.onDurableAdvance((through) => {
+				this.emit('recovery:durable', through);
+				try {
+					journal.compact();
+				} catch (error) {
+					// Compaction is housekeeping; a failure costs disk, never
+					// correctness, and must not disturb a release.
+					this.emitStructuredLog('channel', 'recovery_compaction_failed', {
+						error: error instanceof Error ? error.message : String(error)
+					});
+				}
+			});
+		}
+	}
+
 	/** The gate's view, for operators and tests. */
 	getRecoveryGateState(): string {
 		return this.recoveryGate ? this.recoveryGate.getState() : 'disabled';
 	}
 
 	/**
-	 * The recovery picture in one call (spec 5.6): the startup gate plus
+	 * The recovery picture in one call (spec 5.6 and 5.8): the startup gate,
+	 * the durability mode and how far replication has provably got, plus
 	 * every open channel's ChannelRecoveryStatus. While the gate is closed
 	 * the node-level rule overrides the per-channel view: channels may not
 	 * leave quarantine before ownership confirmation, whatever their own
 	 * reestablish bookkeeping says.
+	 *
+	 * `awaitingDurability` sits BESIDE the status rather than inside it. The
+	 * seven ChannelRecoveryStatus values are the spec's 5.7 machine and
+	 * describe what is known about a channel's STATE; waiting on a receipt
+	 * says nothing about the state, only that a message it authorized has not
+	 * been allowed out yet.
 	 */
 	getRecoveryStatus(): {
 		gate: string;
-		channels: Array<{ channelId: string; status: ChannelRecoveryStatus }>;
+		durability: RecoveryDurability;
+		/** Highest journal frame a guardian quorum provably holds. */
+		lastDurableSequence: string;
+		/**
+		 * CHANNELS holding messages behind the barrier right now, not batches.
+		 * A channel releases its held batches strictly in order through a
+		 * single outstanding wait, so one channel is one waiter however many
+		 * batches are parked behind it.
+		 */
+		awaitingDurabilityCount: number;
+		fenced: boolean;
+		/**
+		 * Compaction pruned frames the quorum never received, so this
+		 * namespace can never advance again. Beside `fenced` and never folded
+		 * into it: a fence means another device owns the namespace and this
+		 * means nobody can advance it, and the remedies differ.
+		 */
+		backfillLost: boolean;
+		channels: Array<{
+			channelId: string;
+			status: ChannelRecoveryStatus;
+			awaitingDurability: boolean;
+		}>;
 	} {
 		const gated = !this.recoveryPermitsPeerTraffic();
+		const barrier = this.recoveryBarrier?.snapshot();
+		const holding = this.channelManager.channelsAwaitingDurability();
 		const channels: Array<{
 			channelId: string;
 			status: ChannelRecoveryStatus;
+			awaitingDurability: boolean;
 		}> = [];
 		for (const channel of this.channelManager.listChannels()) {
 			const state = channel.getFullState();
 			if (state.state === ChannelState.CLOSED) continue;
 			const id = state.channelId ?? state.temporaryChannelId;
+			const idHex = id.toString('hex');
 			channels.push({
-				channelId: id.toString('hex'),
+				channelId: idHex,
 				status: gated
 					? ChannelRecoveryStatus.Quarantined
-					: channel.getRecoveryStatus()
+					: channel.getRecoveryStatus(),
+				awaitingDurability: holding.has(idHex)
 			});
 		}
-		return { gate: this.getRecoveryGateState(), channels };
+		return {
+			gate: this.getRecoveryGateState(),
+			durability:
+				this.recoveryJournal?.getDurability() ?? barrier?.durability ?? 'local',
+			lastDurableSequence: (barrier?.durableThrough ?? 0n).toString(),
+			// Taken from the channel manager rather than the barrier's waiter
+			// count: they agree today, and deriving it from the thing the
+			// field is named after keeps them agreeing.
+			awaitingDurabilityCount: holding.size,
+			fenced: barrier?.fenced ?? false,
+			// Falls back to the database, so a node whose barrier was removed
+			// (or which never had one) still reports the fact rather than a
+			// reassuring false.
+			backfillLost:
+				barrier?.backfillLost ??
+				(this.storage ? chainLostBackfill(this.storage) !== null : false),
+			channels
+		};
 	}
 
 	/**
@@ -3308,11 +3782,22 @@ export class LightningNode extends EventEmitter {
 					state.remoteCurrentPerCommitmentPoint!
 				);
 
-				// Store pending tx BEFORE createFunding — the synchronous message chain
-				// (funding_created → funding_signed → watch:funding) completes during the call
+				// Retained BEFORE createFunding so a crash in the signing window
+				// cannot lose the transaction. It is a CANDIDATE, not an
+				// obligation: BOLT 2 starts that at funding_signed, and nothing
+				// here may put it on the network. The comment this replaces
+				// claimed the funding_created to watch:funding chain completed
+				// synchronously, which held only in loopback and is exactly what
+				// let a block broadcast it mid-handshake.
+				// The payload rides the CHANNEL state, so the frame that records
+				// funding_signed carries the bytes beside the obligation and a
+				// guardian restore can actually discharge what it restores. The
+				// node's own map stays as the runtime index.
+				state.pendingFundingTxHex = txHex;
 				this.setPendingFundingTx(txid.toString('hex'), txHex);
 
-				// Send funding_created — triggers synchronous chain that broadcasts via watch:funding
+				// Send funding_created. The broadcast now waits for the
+				// authorization action handleFundingSigned emits.
 				this.channelManager.createFunding(
 					channel,
 					txid,
@@ -3370,9 +3855,9 @@ export class LightningNode extends EventEmitter {
 				this.storage!.saveMetadata(
 					LightningNode.PENDING_FUNDING_TXS_KEY,
 					JSON.stringify(
-						[...this.pendingFundingTxs].map(([txid, txHex]) => ({
+						[...this.pendingFundingTxs].map(([txid, entry]) => ({
 							txid,
-							txHex
+							txHex: entry.txHex
 						}))
 					)
 				),
@@ -3382,14 +3867,186 @@ export class LightningNode extends EventEmitter {
 
 	/** Record a signed funding tx we are obligated to broadcast. */
 	private setPendingFundingTx(txidHex: string, txHex: string): void {
-		this.pendingFundingTxs.set(txidHex, txHex);
+		// 'candidate': retained so a crash in the signing window cannot lose the
+		// transaction, but NOT yet owed. Only the authorization action promotes
+		// it, and that action has cleared the persist gate and the barrier.
+		this.pendingFundingTxs.set(txidHex, { txHex, phase: 'candidate' });
 		this.persistPendingFundingTxs();
 	}
 
 	/** Drop a broadcast obligation (confirmed, or its channel is gone). */
 	private deletePendingFundingTx(txidHex: string): void {
+		this.reauthAttempts.delete(txidHex);
+		// Drop the payload from channel state with the obligation it served, so
+		// a confirmed channel does not carry the transaction through every
+		// future snapshot. The write rides whatever transition retires the
+		// obligation; losing it costs nothing, since by then the funding is
+		// confirmed or the channel is gone.
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			delete state.pendingFundingTxHex;
+			break;
+		}
 		if (this.pendingFundingTxs.delete(txidHex)) {
 			this.persistPendingFundingTxs();
+		}
+	}
+
+	/**
+	 * May this retained funding transaction go onto the network yet?
+	 *
+	 * BOLT 2 starts the broadcast obligation at funding_signed, never at
+	 * funding_created: without the acceptor's signature over our commitment #0
+	 * the funding output has no unilateral exit for us, so a broadcast in that
+	 * window puts the whole capacity behind a peer who may simply never answer.
+	 * Retaining the transaction from the moment it is signed is right, so a
+	 * crash in the signing window cannot lose it. Owing it is what has to wait.
+	 *
+	 * The answer cannot be derived from channel state alone, and that is the
+	 * subtle part. handleFundingSigned mutates the channel to
+	 * AWAITING_FUNDING_CONFIRMED and stores remoteCommitmentSignature while
+	 * BUILDING its action array, before anything is dispatched, so a predicate
+	 * reading the channel is already true the instant a quorum barrier starts
+	 * holding that batch, and the next block would broadcast straight through
+	 * the hold. Only the authorization ACTION knows it cleared both the persist
+	 * gate and the barrier.
+	 *
+	 * A RESTORED entry is not resolved from the channel either, and that is the
+	 * subtle half. The obligation survives a restart, because the peer's
+	 * signature over our commitment #0 is on disk; the AUTHORIZATION does not,
+	 * and the two are not the same thing. A channel row proves only that THIS
+	 * device wrote the frame, never that the guardians accepted it, so under a
+	 * barrier the original authorization may have been held when the process
+	 * died and reading the row back would walk straight around the hold.
+	 * Restored channel state may determine that an authorization is NEEDED. It
+	 * must never BE the authorization, so the restart asks again through a
+	 * fresh persist whose frame the barrier can actually wait on.
+	 */
+	private owesFundingBroadcast(txidHex: string): boolean {
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry) return false;
+		if (entry.phase === 'authorized') return true;
+		// A candidate has no authorization dispatched yet; a restored entry
+		// lost the one it had. Neither may broadcast on its own account.
+		if (entry.phase === 'restored') this.requestFundingReauthorization(txidHex);
+		return false;
+	}
+
+	/**
+	 * Mint a fresh authorizing frame for a restored funding obligation, at most
+	 * one at a time per transaction.
+	 *
+	 * Without the outstanding-request guard every block would append another
+	 * no-op frame while the first was still waiting on the quorum. The flag is
+	 * cleared when the authorization is granted, and on a refusal the next
+	 * sweep asks again, which is the retry this obligation is supposed to have.
+	 */
+	/**
+	 * Is this retained transaction owed but not yet allowed out?
+	 *
+	 * True exactly while the obligation exists and the authorization does not:
+	 * a candidate whose funding_signed has arrived but whose authorization is
+	 * still parked, or a restored entry that has not been re-asked yet. It
+	 * separates "we are deliberately not broadcasting this" from "this channel
+	 * is fiction", which is a distinction the absence of a transaction on chain
+	 * cannot make on its own.
+	 */
+	private awaitingFundingAuthorization(txidHex: string): boolean {
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry || entry.phase === 'authorized') return false;
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			// The same two conditions the live path establishes at
+			// funding_signed. Without them this is an open that never got that
+			// far, which genuinely has nothing to broadcast.
+			return (
+				state.state !== ChannelState.SENT_FUNDING_CREATED &&
+				!!state.remoteCommitmentSignature
+			);
+		}
+		return false;
+	}
+
+	private requestFundingReauthorization(txidHex: string): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (state.fundingTxid?.toString('hex') !== txidHex) continue;
+			const id = state.channelId ?? state.temporaryChannelId;
+			if (!id) return;
+			if (!this.mayAskForReauthorization(txidHex, id.toString('hex'))) return;
+			this.reauthAttempts.set(txidHex, Date.now());
+			if (!this.channelManager.reauthorizeFundingBroadcast(id)) {
+				this.reauthAttempts.delete(txidHex);
+			}
+			return;
+		}
+	}
+
+	/**
+	 * Re-send a splice the barrier has already released in this process.
+	 *
+	 * Straight at the backend deliberately: the authorization this rebroadcast
+	 * rides was granted through the action path and is what made these bytes
+	 * sendable. Repeating the transaction is idempotent, and the alternative,
+	 * a fresh frame per retry window, buys nothing.
+	 */
+	private rebroadcastAuthorizedSplice(idHex: string, txHex: string): void {
+		if (!this._chainBackend) return;
+		this._chainBackend.broadcastTransaction(txHex).catch(() => {
+			// Already in mempool or confirmed, or a backend hiccup. The watch
+			// on the new funding output reports the confirmation either way.
+			this.emitStructuredLog('chain', 'splice_rebroadcast_failed', {
+				channelId: idHex
+			});
+		});
+	}
+
+	/**
+	 * Is a fresh re-authorization request due for this key?
+	 *
+	 * No while the channel is still holding messages, because the request that
+	 * is parked IS the outstanding one. Yes once it is not, subject to the
+	 * spacing: the previous request ended, and if it had been granted the
+	 * obligation would no longer be asking.
+	 */
+	private mayAskForReauthorization(key: string, channelIdHex: string): boolean {
+		if (this.channelManager.channelsAwaitingDurability().has(channelIdHex)) {
+			return false;
+		}
+		const last = this.reauthAttempts.get(key);
+		if (last === undefined) return true;
+		return Date.now() - last >= LightningNode.REAUTH_RETRY_MS;
+	}
+
+	/**
+	 * Re-ask for every fully signed splice that has not confirmed.
+	 *
+	 * Startup asks once, and a refusal there would otherwise strand the splice
+	 * until the next restart. A splice creates a funding output, so its
+	 * rebroadcast is an obligation on exactly the same footing as a v1
+	 * funding one and gets the same block-driven retry.
+	 */
+	private retryPendingSpliceBroadcasts(): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			const inflight = state.spliceInFlight;
+			if (!inflight?.fullySigned) continue;
+			const id = state.channelId ?? state.temporaryChannelId;
+			if (!id) continue;
+			const idHex = id.toString('hex');
+			// Already authorized in this process: rebroadcast without minting
+			// another frame. The barrier has answered for this splice.
+			if (this.authorizedSpliceBroadcasts.has(idHex)) {
+				this.rebroadcastAuthorizedSplice(idHex, inflight.spliceTxHex);
+				continue;
+			}
+			if (!this.mayAskForReauthorization(idHex, idHex)) continue;
+			this.reauthAttempts.set(idHex, Date.now());
+			if (!this.channelManager.reauthorizeSpliceBroadcast(id)) {
+				this.reauthAttempts.delete(idHex);
+			}
 		}
 	}
 
@@ -3402,8 +4059,15 @@ export class LightningNode extends EventEmitter {
 	 * surfaced but the obligation stands.
 	 */
 	private broadcastPendingFundingTx(txidHex: string): void {
-		const txHex = this.pendingFundingTxs.get(txidHex);
-		if (!txHex || !this.fundingProvider) return;
+		const entry = this.pendingFundingTxs.get(txidHex);
+		if (!entry || !this.fundingProvider) return;
+		// Covers all three routes that reach here: the funding:authorized emit,
+		// the per-block sweep and the startup sweep.
+		if (!this.owesFundingBroadcast(txidHex)) return;
+		const txHex = entry.txHex;
+		// Covers all three routes that reach here: the watch:funding emit, the
+		// per-block sweep and the startup sweep.
+		if (!this.owesFundingBroadcast(txidHex)) return;
 		this.fundingProvider.broadcastTransaction(txHex).catch((err) => {
 			const message = (err as Error)?.message ?? String(err);
 			// A tx that is already mined cannot be re-sent; that is success,
@@ -3458,6 +4122,54 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Rebuild the runtime index from RESTORED CHANNEL STATE.
+	 *
+	 * This is the half that survives a guardian restore. The node's generic
+	 * metadata is local and best effort, and a device restored from frames
+	 * alone has none of it; the channel row does carry the transaction, because
+	 * it rides the same frame as the obligation. Entries land as 'restored', so
+	 * they still have to ask for a fresh authorization before anything is sent.
+	 */
+	private restorePendingFundingFromChannels(): void {
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid || !state.pendingFundingTxHex) continue;
+			const txidHex = state.fundingTxid.toString('hex');
+			// The journal copy WINS, unconditionally. It rode the same frame as
+			// the obligation and is authenticated; the metadata map is local and
+			// best effort, so letting a stale or corrupt entry sit in front of
+			// it would hand a fresh authorization to unrelated bytes.
+			let parsed: bitcoin.Transaction;
+			try {
+				parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex);
+			} catch {
+				this.emitStructuredLog('chain', 'pending_funding_unparseable', {
+					channelId: state.channelId?.toString('hex') ?? null,
+					txid: txidHex
+				});
+				continue;
+			}
+			// And it has to BE the transaction this channel names. A payload
+			// that hashes to something else is corruption, not an obligation:
+			// broadcasting it would put an unrelated transaction on the network
+			// under a channel's authorization.
+			if (parsed.getHash().toString('hex') !== txidHex) {
+				this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
+					channelId: state.channelId?.toString('hex') ?? null,
+					expected: txidHex,
+					actual: parsed.getHash().toString('hex')
+				});
+				this.pendingFundingTxs.delete(txidHex);
+				continue;
+			}
+			this.pendingFundingTxs.set(txidHex, {
+				txHex: state.pendingFundingTxHex,
+				phase: 'restored'
+			});
+		}
+	}
+
 	/** Restore the persisted pending funding tx map (called at startup). */
 	private restorePendingFundingTxs(): void {
 		if (!this.storage) return;
@@ -3472,7 +4184,13 @@ export class LightningNode extends EventEmitter {
 			}>;
 			for (const entry of entries) {
 				if (entry?.txid && entry?.txHex) {
-					this.pendingFundingTxs.set(entry.txid, entry.txHex);
+					// 'restored': the authorization is unknown until it is
+					// resolved against the channel, because nothing re-runs
+					// handleFundingSigned across a restart.
+					this.pendingFundingTxs.set(entry.txid, {
+						txHex: entry.txHex,
+						phase: 'restored'
+					});
 				}
 			}
 		} catch {
@@ -4461,38 +5179,101 @@ export class LightningNode extends EventEmitter {
 
 				const channel = this.channelManager.getChannel(channelId);
 				if (!channel) return;
+				const state = channel.getFullState();
 				// A vanished SPLICE tx is different: the pre-splice channel is
 				// real and confirmed, and voiding it would destroy a live
 				// channel. Alarm only; splice rollback is a separate path.
-				if (channel.getFullState().spliceInFlight) return;
+				if (state.spliceInFlight) return;
 
-				// Rebroadcast before voiding: BOLT 2 obliges the funder to get
-				// the funding tx confirmed, and a mempool-evicted tx is still
-				// valid. Only when we hold the signed tx and the network
-				// REJECTS it (an input was double-spent, or it conflicts with
-				// a confirmed tx) is the channel truly fiction.
 				const internalHex = Buffer.from(txid, 'hex').reverse().toString('hex');
-				const pendingHex = this.pendingFundingTxs.get(internalHex);
-				if (pendingHex && this.fundingProvider) {
+				const pending = this.pendingFundingTxs.get(internalHex);
+				const pendingHex = pending?.txHex;
+
+				// The funder's own obligation comes first: if we hold the
+				// transaction and are allowed to send it, absence is answered
+				// by sending it rather than by waiting out a clock.
+				if (
+					pendingHex &&
+					this.fundingProvider &&
+					this.owesFundingBroadcast(internalHex)
+				) {
 					this.fundingProvider
 						.broadcastTransaction(pendingHex)
 						.then(() => {
-							// Back in the mempool: the watcher sees it on its
-							// next check, resets the absence counter and
-							// re-arms the alarm. The channel stays.
 							this.emitStructuredLog('chain', 'funding_rebroadcast', {
 								channelId: channelId.toString('hex'),
 								txid
 							});
 						})
 						.catch((err) => {
+							// A rejection is NOT evidence that the channel is
+							// fiction. bad-txns-inputs-missingorspent covers an
+							// unconfirmed parent this backend has not seen, a
+							// mempool conflict need not be confirmed, and a
+							// timeout says nothing at all. Retain, retry, and
+							// leave forgetting to the block clock below, which
+							// this side never even starts: a funder that owes
+							// the broadcast answers by sending.
 							this.emitStructuredLog('chain', 'funding_rebroadcast_rejected', {
 								channelId: channelId.toString('hex'),
 								txid,
-								error: (err as Error).message
+								error: (err as Error)?.message ?? String(err)
 							});
-							this.voidMissingFundingChannel(channelId, txid);
 						});
+					return;
+				}
+
+				// We hold the transaction but may not send it yet: ask again.
+				if (pendingHex && this.awaitingFundingAuthorization(internalHex)) {
+					this.emitStructuredLog('chain', 'funding_missing_unauthorized', {
+						channelId: channelId.toString('hex'),
+						txid
+					});
+					this.requestFundingReauthorization(internalHex);
+					return;
+				}
+
+				// Otherwise this is the fundee, or a funder whose payload is
+				// gone. Nothing to send, so the only question is the clock.
+				//
+				// ABSENCE IS A CLOCK, NOT A VERDICT. This alarm fires after
+				// three checks find nothing and does not require that the
+				// transaction was ever seen, so it cannot on its own tell an
+				// evicted funding from one we are deliberately withholding, one
+				// whose funder has not broadcast yet, or a backend with an
+				// incomplete view. BOLT 2 gives the answer: a node forgets an
+				// unconfirmed funding only after 2016 blocks. Until then the
+				// channel is retained, whichever side we are, because
+				// forgetting early forces a funder to close and reopen a
+				// channel that was never in trouble.
+				//
+				// The START of that countdown has to reach disk before it
+				// counts for anything. Held only in memory it is lost on the
+				// next restart, the following absence starts it again at
+				// whatever height the node is at by then, and a node that
+				// restarts often enough never reaches the disposition at all.
+				// A start that cannot be recorded therefore does not begin:
+				// failing closed here means RETAINING the channel and asking
+				// again on the next absence, never counting down from a height
+				// no restart can read back.
+				if (channel.beginFundingMissingClock(this.currentBlockHeight)) {
+					if (!this.persistChannelCommitted(channelId)) {
+						channel.clearFundingMissingClock();
+						this.emitStructuredLog('chain', 'funding_missing_clock_unwritten', {
+							channelId: channelId.toString('hex'),
+							txid
+						});
+						return;
+					}
+				}
+				const waited = this.currentBlockHeight - channel.fundingMissingSince()!;
+
+				if (waited < FUNDING_FORGET_BLOCKS) {
+					this.emitStructuredLog('chain', 'funding_missing_waiting', {
+						channelId: channelId.toString('hex'),
+						txid,
+						waitedBlocks: waited
+					});
 					return;
 				}
 				this.voidMissingFundingChannel(channelId, txid);
@@ -4503,12 +5284,22 @@ export class LightningNode extends EventEmitter {
 			const channel = this.channelManager.getChannel(channelId);
 			if (!channel) return;
 			const state = channel.getFullState();
-			// The funding is mined: the BOLT 2 broadcast obligation is met and
-			// the retained signed tx (kept for eviction rebroadcasts) retires.
+			// The funding is mined: the BOLT 2 broadcast obligation is met, so
+			// the retained signed tx (kept for eviction rebroadcasts) retires
+			// and the forget clock stops. Both are channel state and both are
+			// persisted here rather than left for some later transition to
+			// carry: a clock left on disk after its funding CONFIRMED keeps
+			// counting across the next restart, toward voiding a channel that
+			// is on the chain.
+			let retired = channel.clearFundingMissingClock();
 			if (state.fundingTxid) {
+				retired = channel.clearRetainedFundingPayload() || retired;
 				this.deletePendingFundingTx(state.fundingTxid.toString('hex'));
 			}
-			if (!state.spliceFundingTxid || !channel.getSpliceSession()) return;
+			if (!state.spliceFundingTxid || !channel.getSpliceSession()) {
+				if (retired) this.persistChannel(channelId);
+				return;
+			}
 			// sendSpliceLocked self-validates the splice state; ignore if not ready.
 			const result = this.channelManager.sendSpliceLocked(channelId);
 			if (!result.ok) {
@@ -4548,7 +5339,11 @@ export class LightningNode extends EventEmitter {
 			// Resume the broadcast obligation for signed funding txs that never
 			// confirmed (crash between funding_signed and broadcast, or an
 			// eviction while we were down). Retries again on every new block.
+			// Channels are restored by now, so the payload that rode their
+			// frames can seed the runtime index before the sweep asks about it.
+			this.restorePendingFundingFromChannels();
 			this.retryPendingFundingBroadcasts();
+			this.retryPendingSpliceBroadcasts();
 			// Start reconnect monitor on ElectrumBackend to resume subscriptions after drops
 			if (
 				this._chainBackend &&
@@ -4769,17 +5564,18 @@ export class LightningNode extends EventEmitter {
 					fundingScript,
 					spliceTxidHex
 				);
-				if (
-					inflight.fullySigned &&
-					this._chainBackend &&
-					this.isCurrentChainStartup(generation)
-				) {
-					try {
-						await this._chainBackend.broadcastTransaction(inflight.spliceTxHex);
-					} catch {
-						// Already in mempool/confirmed (or backend hiccup) — the watch
-						// above still reports confirmation either way.
-					}
+				if (inflight.fullySigned && this.isCurrentChainStartup(generation)) {
+					// Through the ACTION path, never straight at the backend. A
+					// splice creates a funding output exactly as an open does, so
+					// it answers to the same rule, and a direct call here has no
+					// frame, no persist gate and no barrier: a restart could put
+					// on chain the very transaction the barrier was holding when
+					// the process died. The rebroadcast is idempotent and the
+					// watch armed above reports the confirmation either way, so
+					// nothing is lost by making it wait its turn.
+					this.channelManager.reauthorizeSpliceBroadcast(
+						state.channelId || state.temporaryChannelId
+					);
 				}
 				continue;
 			}
@@ -5010,6 +5806,10 @@ export class LightningNode extends EventEmitter {
 		this._destroyed = true;
 		// Retires any chain startup sequence still working through its awaits.
 		++this.chainStartupGeneration;
+		// Anything held behind the barrier is refused rather than left parked.
+		// A shutdown is not permission either, and the barrier's retry timer
+		// must not keep the process alive.
+		this.recoveryBarrier?.stop();
 		this.stopCleanupTimer();
 		if (this.mppCleanupTimer) {
 			clearInterval(this.mppCleanupTimer);
@@ -11859,6 +12659,7 @@ export class LightningNode extends EventEmitter {
 		// not confirmed yet: retry, so a transient failure at watch:funding
 		// or a mempool eviction never orphans a signed funding.
 		this.retryPendingFundingBroadcasts();
+		this.retryPendingSpliceBroadcasts();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(

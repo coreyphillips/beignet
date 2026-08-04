@@ -8,10 +8,12 @@
 
 import { MessageType } from '../message/types';
 import { IRecoveryOutboxMessage } from '../storage/types';
+import type { Channel } from './channel';
 
 export enum ChannelActionType {
 	SEND_MESSAGE = 'SEND_MESSAGE',
 	BROADCAST_TX = 'BROADCAST_TX',
+	AUTHORIZE_FUNDING_BROADCAST = 'AUTHORIZE_FUNDING_BROADCAST',
 	WATCH_FUNDING = 'WATCH_FUNDING',
 	CHANNEL_READY = 'CHANNEL_READY',
 	CHANNEL_CLOSED = 'CHANNEL_CLOSED',
@@ -43,11 +45,55 @@ export interface ISendMessageAction {
 	 * would churn the table for nothing.
 	 */
 	replay?: boolean;
+	/**
+	 * A recovery declaration, held by the quorum barrier until the state that
+	 * authorizes it is durable (docs/RECOVERY-PROTOCOL.md 5.8).
+	 *
+	 * Marked per ACTION rather than inferred from the message type, because
+	 * `error` is also BOLT 1's ordinary protocol-violation message. Holding
+	 * those would buy nothing and cost a great deal: an ordinary error is not
+	 * retransmittable, so a refused one is lost for good, and the local
+	 * force-close it drives (the `channel:errored` emit rides the send) would
+	 * be lost with it. The declarations are different in kind. Losing the
+	 * record that broadcasting is FORBIDDEN re-enables broadcasting a
+	 * commitment the peer has provably revoked, which is the whole balance.
+	 */
+	durabilityCritical?: boolean;
 }
 
 export interface IBroadcastTxAction {
 	type: ChannelActionType.BROADCAST_TX;
 	tx: Buffer;
+	/**
+	 * This broadcast creates a funding output naming us, so it is held until
+	 * the frame recording the channel is quorum durable (5.8): a restore below
+	 * that frame comes back with no channel at all while a 2-of-2 we are a
+	 * party to exists on the network.
+	 *
+	 * A MARK rather than gating BROADCAST_TX wholesale, because the type is
+	 * overloaded and one of its other users must never be refusable: a force
+	 * close returns [BROADCAST_TX, CHANNEL_CLOSED] with no PERSIST_STATE at
+	 * all, so gating the type would send it through the unattributed-batch
+	 * refusal and take away the only exit an operator has left.
+	 */
+	fundingCritical?: true;
+}
+
+/**
+ * BOLT 2's point of no return for a v1 funder.
+ *
+ * The obligation begins at funding_signed and never at funding_created:
+ * without the acceptor's signature over our commitment #0 the funding output
+ * has no unilateral exit for us. It is an ACTION rather than a side effect of
+ * the funding watch because everything this dispatch path gates is an action:
+ * as a bare emit it could be withheld by neither a failed persist nor a quorum
+ * barrier. It carries no transaction, because the signed v1 funding tx lives
+ * in the node's pending map and never in the channel.
+ */
+export interface IAuthorizeFundingBroadcastAction {
+	type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST;
+	/** Internal byte order, the key the node's pending map uses. */
+	fundingTxid: Buffer;
 }
 
 export interface IWatchFundingAction {
@@ -218,11 +264,130 @@ export interface IChannelPersistRequest {
 	 * pre-revoke state whose retransmission bytes are already gone.
 	 */
 	supersede?: { messageTypes: number[] };
+	/**
+	 * The recovery journal frame this transition landed in, or null when the
+	 * journal is off. Set by the listener alongside `committed`. This is the
+	 * sequence a Phase 6 quorum barrier waits on before the batch's messages
+	 * are allowed onto the wire (docs/RECOVERY-PROTOCOL.md 5.8).
+	 */
+	frameSequence?: bigint | null;
 }
+
+/**
+ * The `channel:persist` event itself.
+ *
+ * The channel and its peer are passed BY REFERENCE rather than by an id the
+ * listener has to resolve again, because the id a channel answers to is not
+ * stable across its own opening. A v2 channel derives its permanent
+ * channel_id during accept_channel2 but stays registered under its TEMPORARY
+ * id until the open leaves AWAITING_TX_SIGNATURES, so the first v2
+ * commitment_signed used to emit a permanent id that resolved to nothing:
+ * the listener returned without committing, the batch reported committed
+ * anyway, and the message left with no state on disk behind it.
+ *
+ * `channelId` is what the row is KEYED by (permanent once derived), which is
+ * a separate question from which map currently holds the object.
+ */
+export interface IChannelPersistEvent {
+	/** The channel to commit. Already resolved; never looked up again. */
+	channel: Channel;
+	/** The peer this channel belongs to, for the channel_state mutation. */
+	peerPubkey: string;
+	/** The id to key the persisted row by: permanent when one exists. */
+	channelId: Buffer;
+	/** Present when the batch has messages whose release depends on it. */
+	request?: IChannelPersistRequest;
+}
+
+/**
+ * The Phase 6 durability barrier, as the dispatch path sees it
+ * (docs/RECOVERY-PROTOCOL.md 5.8).
+ *
+ * Structural rather than an import so the channel layer keeps knowing nothing
+ * about guardians, replication or recovery storage. DurabilityBarrier in
+ * src/lightning/recovery satisfies it.
+ */
+export interface IWireDurabilityBarrier {
+	/** False in local and async-remote, where nothing is ever held. */
+	readonly enforcing: boolean;
+	/**
+	 * This namespace can never be proven durable again (compaction outran
+	 * replication). Optional so a test double or a non-guardian barrier needs
+	 * no opinion on it.
+	 *
+	 * The channel layer consults it for ONE thing: refusing a new channel.
+	 * Every other irreversible step is already gated by the barrier itself,
+	 * and would now refuse immediately rather than after a timeout, but
+	 * funding_created and channel_ready are not barrier-class, so opening is
+	 * the one irreversible commitment that would otherwise proceed into a
+	 * namespace that can never record it.
+	 */
+	readonly namespaceLost?: boolean;
+	/** The synchronous question: is this frame already quorum durable? */
+	isReleased(sequence: bigint | null): boolean;
+	/** Park until it is, or until the wait is refused. */
+	whenReleased(
+		sequence: bigint | null
+	): Promise<{ released: boolean; reason: string }>;
+}
+
+/**
+ * The messages a quorum barrier holds, one per row of spec 5.8.
+ *
+ * - `revoke_and_ack` follows the new commitment being persisted. Releasing it
+ *   before the quorum holds that state is exactly what makes a restored
+ *   device broadcastable: the peer would hold our revocation for a commitment
+ *   our replicas never learned we had moved past.
+ * - `update_fulfill_htlc` follows the preimage and its HTLC linkage. A
+ *   forgotten preimage, after the peer has already seen the fulfill, is a
+ *   paid HTLC we can no longer claim.
+ * - `commitment_signed` is where an outgoing forwarded HTLC becomes
+ *   irrevocable, which is the spec's "forward linkage" row expressed in this
+ *   codebase's message set. `start_batch` rides in the same batch and is
+ *   therefore held with it.
+ * - `tx_signatures` and `splice_locked` are the irreversible splice steps.
+ *   Splice negotiation up to them is abortable and deliberately not held.
+ *
+ * The data-loss `error` of spec 5.8's last row is NOT here, and its absence is
+ * deliberate: it is gated by the per-action `durabilityCritical` mark instead,
+ * because `error` is one wire type serving two unrelated purposes and only one
+ * of them is a recovery declaration. See ISendMessageAction.durabilityCritical.
+ */
+export const QUORUM_BARRIER_MESSAGE_TYPES: ReadonlySet<number> =
+	new Set<number>([
+		MessageType.REVOKE_AND_ACK,
+		MessageType.UPDATE_FULFILL_HTLC,
+		MessageType.COMMITMENT_SIGNED,
+		MessageType.TX_SIGNATURES,
+		MessageType.SPLICE_LOCKED,
+		// The acceptor's authorization for the opener to put the funding output
+		// on chain. A restore below the frame that FIRST records this channel
+		// comes back with no channel at all, while a 2-of-2 naming us exists on
+		// the network and the peer's reestablish gets an unknown-channel error.
+		// The v2 counterpart, tx_signatures, has been gated since phase 6
+		// landed, so leaving this out would give the identical role different
+		// exactness guarantees depending on which open the peer chose.
+		MessageType.FUNDING_SIGNED
+	]);
+
+/**
+ * The version of the gated set above, plus the `durabilityCritical` mark.
+ *
+ * A frame declaring `quorum` is a claim about WHICH messages its writer held
+ * back, and that claim is only as strong as the policy in force when the frame
+ * was written. Without a version a later release could widen this set and then
+ * read an old frame's bare `quorum` as a promise about messages that frame's
+ * writer never gated, which is a restore resuming a channel on evidence nobody
+ * produced. Bump this in the SAME commit as any change to what is gated; the
+ * pinned-set test in tests/lightning/recovery-phase6-exactness.test.ts fails
+ * otherwise.
+ */
+export const WIRE_SAFETY_POLICY_VERSION = 2;
 
 export type ChannelAction =
 	| ISendMessageAction
 	| IBroadcastTxAction
+	| IAuthorizeFundingBroadcastAction
 	| IWatchFundingAction
 	| IChannelReadyAction
 	| IChannelClosedAction

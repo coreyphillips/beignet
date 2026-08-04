@@ -63,7 +63,11 @@ import {
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import { RecoveryFrame } from './types';
+import {
+	IWireSafetyProof,
+	deriveWireSafetyProof,
+	verifyWireSafetyProof
+} from './wire-safety';
 import { REPLICATION_META_KEYS } from './guardian-replication';
 import {
 	IWriterLeaseKeys,
@@ -173,11 +177,19 @@ export interface IRestoreEvent {
 		| 'epoch:resumed'
 		| 'epoch:abandoned'
 		| 'frames:downloaded'
+		| 'restore:exactness'
 		| 'restore:complete';
 	detail: string;
 }
 
 export interface IRestoreResult {
+	/**
+	 * Present when the restore was PROVEN exact (5.8): the certified head
+	 * declared quorum durability, so every state a peer could have seen is in
+	 * the chain that was installed and the channels resume rather than
+	 * routing to DLP. Absent is the ordinary, safe outcome.
+	 */
+	wireSafetyProof?: IWireSafetyProof;
 	/** The lease this device now holds, already persisted. */
 	lease: IWriterLeaseKeys;
 	/** The superseded epoch's final head, fixed by the takeover. */
@@ -892,7 +904,7 @@ export class RestoreDriver {
 		}));
 		// The chain is verified against the CERTIFIED head, not against
 		// whatever the download happened to contain.
-		const frames: RecoveryFrame[] = verifyFrameChain(
+		const frames = verifyFrameChain(
 			rows,
 			{
 				tipSequence: certified.logHead.sequence.toString(),
@@ -901,6 +913,33 @@ export class RestoreDriver {
 			},
 			deriveRecoveryMasterKey(this.config.nodeSecret),
 			this.config.nodeId
+		);
+
+		// Can this restore be shown to be EXACT? Derived from the verified
+		// chain, then re-checked through the same predicate any other caller
+		// would face, and only then allowed to decide anything. A refusal is
+		// the ordinary outcome and simply leaves the DLP fallback in place.
+		const derivation = deriveWireSafetyProof(
+			certified,
+			frames,
+			this.config.recoveryRoot.recoveryId
+		);
+		const head = frames[frames.length - 1];
+		const wireSafe =
+			derivation.proven &&
+			head !== undefined &&
+			verifyWireSafetyProof(derivation.proof, {
+				certified,
+				recoveryId: this.config.recoveryRoot.recoveryId,
+				head
+			});
+		this.emit(
+			'restore:exactness',
+			wireSafe
+				? 'the certified head declares quorum durability, so restored channels resume'
+				: `restored channels stay StateUncertain: ${
+						derivation.proven ? 'the proof did not verify' : derivation.detail
+				  }`
 		);
 
 		const targetStorage = this.config.target;
@@ -936,25 +975,35 @@ export class RestoreDriver {
 				JOURNAL_META_KEYS.lastSnapshot,
 				String(rows[0]?.sequence ?? 0)
 			);
+			// Carry the quorum promise across the restore. The floor is the
+			// second, independent source the sticky rule leans on; without it
+			// a restored device would enforce the rule on the tip frame alone,
+			// which is exactly the single point of evidence the floor exists
+			// to back up.
+			if (wireSafe) {
+				targetStorage.setRecoveryMeta!(
+					JOURNAL_META_KEYS.durabilityFloor,
+					'quorum'
+				);
+			}
 			reconstructFromFrames(targetStorage, frames);
-			// StateUncertain (5.6): guardian replication is best effort until
-			// the Phase 6 barriers, so the certified head can trail what the
-			// old device actually did with its peers. EVERY restored channel
-			// therefore starts with its commitment broadcast FORBIDDEN,
-			// permanently: a compatible channel_reestablish is not proof of
-			// exactness, so nothing on the wire ever lifts the flag, and
-			// Phase 5 deliberately has NO way to skip this marking. A naked
-			// scalar cannot carry the security meaning; when Phase 6 lands
-			// its quorum barrier, exactness will arrive as an opaque proof
-			// VERIFIED by the barrier subsystem and bound to this restore:
-			// the recovery namespace, the superseded writer epoch, the
-			// certified head sequence AND frame hash, and a durability of
-			// 'quorum'. Until that verified object exists, the safe restore
-			// is the DLP fallback. Set inside the install transaction so a
-			// crash can never yield restored channels without the marking.
-			for (const row of targetStorage.loadAllChannels()) {
-				row.state.stateUncertain = true;
-				targetStorage.saveChannel(row.channelId, row.state, row.peerPubkey);
+			// StateUncertain (5.6), unless the restore can PROVE it is exact.
+			//
+			// Without a proof the certified head can trail what the old device
+			// actually did with its peers, so every restored channel starts
+			// with its commitment broadcast forbidden, permanently: a
+			// compatible channel_reestablish is not proof of exactness, and
+			// nothing on the wire ever lifts the flag. The only thing that
+			// lifts it is the Phase 6 wire-safety proof (5.8), which is
+			// derived from this restore rather than supplied to it and is
+			// re-verified here before it is acted on. Applied inside the
+			// install transaction so a crash can never leave a channel
+			// resumable that the proof did not cover.
+			if (!wireSafe) {
+				for (const row of targetStorage.loadAllChannels()) {
+					row.state.stateUncertain = true;
+					targetStorage.saveChannel(row.channelId, row.state, row.peerPubkey);
+				}
 			}
 			// The lease carries the granted epoch, so the journal stamps later
 			// frames under the epoch this device owns; the pending record
@@ -981,6 +1030,7 @@ export class RestoreDriver {
 			`restored ${frames.length} frames under epoch ${acquired.lease.epoch}`
 		);
 		return {
+			wireSafetyProof: wireSafe ? derivation.proof : undefined,
 			lease: acquired.lease,
 			certifiedState: certified,
 			certificates: acquired.certificates,

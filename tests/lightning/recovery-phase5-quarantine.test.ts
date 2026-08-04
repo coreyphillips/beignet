@@ -246,7 +246,10 @@ function gateFor(
 }
 
 describe('Recovery phase 5: startup quarantine', () => {
-	it('confirms a current lease and only then permits peer traffic', async () => {
+	it('confirms a current lease and only then permits peer traffic', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const secret = nodeSecretOf(1);
@@ -293,7 +296,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		storage.close();
 	});
 
-	it('stays quarantined without a confirming quorum', async () => {
+	it('stays quarantined without a confirming quorum', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const secret = nodeSecretOf(2);
@@ -316,7 +322,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		storage.close();
 	});
 
-	it('fences permanently once a newer epoch is proven', async () => {
+	it('fences permanently once a newer epoch is proven', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storage = openStorage();
 		const secret = nodeSecretOf(3);
@@ -373,7 +382,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		storage.close();
 	});
 
-	it('a superseded device emits ZERO wire messages after restart', async () => {
+	it('a superseded device emits ZERO wire messages after restart', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const served = await Promise.all([serve(0), serve(1), serve(2)]);
 		const storageA = openStorage();
 		const secret = nodeSecretOf(4);
@@ -447,7 +459,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		await shutdown(served);
 	});
 
-	it('runs ungated when no gate is configured', async () => {
+	it('runs ungated when no gate is configured', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// The spec allows running without guardians; that mode must not be
 		// silently quarantined.
 		const storage = openStorage();
@@ -596,7 +611,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('suppresses gossip sync messages while quarantined', async () => {
+	it('suppresses gossip sync messages while quarantined', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// Gossip sync and query responses emit at the NODE level, not through
 		// the ChannelManager relay; they must answer to the same gate. An
 		// ungated twin proves the probe would have spoken.
@@ -637,7 +655,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		await shutdown(served);
 	});
 
-	it('drops inbound messages while quarantined, before any handler', async () => {
+	it('drops inbound messages while quarantined, before any handler', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// The event-transport inbound boundary: an inbound error message
 		// must not reach the channel manager on an unconfirmed device, where
 		// it could force-close and broadcast state the device may not own.
@@ -686,7 +707,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		await shutdown(served);
 	});
 
-	it('defers the startup dial pass until ownership confirmation', async () => {
+	it('defers the startup dial pass until ownership confirmation', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// The constructor schedules auto-reconnect dials; with a gate in the
 		// config they are withheld entirely (no timers armed) and run only
 		// from the gate's open hook.
@@ -852,7 +876,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('freezeConnections aborts an INBOUND connection mid-handshake', async () => {
+	it('freezeConnections aborts an INBOUND connection mid-handshake', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// Inbound variant: the socket was accepted and the responder is
 		// waiting for act 1 when the freeze lands. The fake transport records
 		// every write and destroy, so the assertion is exact: destroyed, no
@@ -879,7 +906,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('a socket factory resolving after disconnect is destroyed before any byte', async () => {
+	it('a socket factory resolving after disconnect is destroyed before any byte', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// The sharpest late case (Tor/SOCKS/WebSocket): disconnect() lands
 		// while the factory is still pending, so there is no socket to
 		// destroy yet. The factory's socket must die the moment it exists,
@@ -911,7 +941,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		expect(fake.writes).to.have.length(0);
 	});
 
-	it('freezeConnections closes a TCP listener that is still binding', async () => {
+	it('freezeConnections closes a TCP listener that is still binding', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// this.server is only assigned after the asynchronous bind, so a
 		// freeze landing mid-bind saw no listener to close and left a fenced
 		// node externally bound. The freeze fires synchronously after
@@ -934,7 +967,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('freezeConnections closes a WebSocket listener that is still binding', async () => {
+	it('freezeConnections closes a WebSocket listener that is still binding', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// Same race as the TCP variant, across listenWebSocket's await.
 		const pm = new PeerManager({ localPrivateKey: sha('freeze-bind-ws') });
 		try {
@@ -954,7 +990,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('freezeConnections clears reconnect timers for DISCONNECTED peers and disables rescheduling', async () => {
+	it('freezeConnections clears reconnect timers for DISCONNECTED peers and disables rescheduling', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// disconnectPeer clears timers per pubkey, but reconnect timers also
 		// exist for peers that are currently disconnected, which no
 		// listPeers() sweep reaches; a fenced node must not wake and redial
@@ -1037,7 +1076,10 @@ describe('Recovery phase 5: startup quarantine', () => {
 		}
 	});
 
-	it('a fence landing during an in-flight confirmation is never overwritten', async () => {
+	it('a fence landing during an in-flight confirmation is never overwritten', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		// The race: confirmation A reads a healthy quorum, then stalls in
 		// flight; a takeover is proven and the gate fences; A's stale answer
 		// finally arrives still naming the old lease current. Fencing is

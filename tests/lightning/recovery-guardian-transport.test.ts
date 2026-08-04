@@ -365,14 +365,20 @@ describe('Guardian transport: HTTP server and client', () => {
 		guardian.close();
 	});
 
-	it('serves INFO and passes version gating', async () => {
+	it('serves INFO and passes version gating', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const info = await client.checkVersion();
 		expect(info.guardianId.equals(GUARDIAN_IDS[0])).to.equal(true);
 		expect(info.guardianSetIds[0].equals(SET_ID)).to.equal(true);
 		expect(info.maxRecordsPerGet).to.equal(256);
 	});
 
-	it('runs the whole verb matrix over the wire', async () => {
+	it('runs the whole verb matrix over the wire', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const registration = buildRegistration();
 		const registered = await client.register(registration);
 		expect(registered.status).to.equal(GuardianStatus.OK);
@@ -438,7 +444,10 @@ describe('Guardian transport: HTTP server and client', () => {
 		expect(stale.status).to.equal(GuardianStatus.ERR_CERT_MISMATCH);
 	});
 
-	it('answers 404 for unknown paths and methods', async () => {
+	it('answers 404 for unknown paths and methods', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const transport = nodeGuardianTransport();
 		const wrongVerb = await transport(
 			`${baseUrl}/beignet-guardian/v1/no_such_verb`,
@@ -463,7 +472,10 @@ describe('Guardian transport: HTTP server and client', () => {
 		expect(wrongMethod.status).to.equal(404);
 	});
 
-	it('rejects an undecodable body inside a 200 with ERR_MALFORMED', async () => {
+	it('rejects an undecodable body inside a 200 with ERR_MALFORMED', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const transport = nodeGuardianTransport();
 		const response = await transport(
 			`${baseUrl}/beignet-guardian/v1/put_state`,
@@ -480,7 +492,10 @@ describe('Guardian transport: HTTP server and client', () => {
 		expect(decoded.status).to.equal(GuardianStatus.ERR_MALFORMED);
 	});
 
-	it('enforces the body cap with 413', async () => {
+	it('enforces the body cap with 413', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const small = makeGuardian(1);
 		const smallServer = new GuardianHttpServer({
 			guardian: small,
@@ -503,7 +518,10 @@ describe('Guardian transport: HTTP server and client', () => {
 		small.close();
 	});
 
-	it('demands the transport credential when configured', async () => {
+	it('demands the transport credential when configured', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const secured = makeGuardian(2);
 		const securedServer = new GuardianHttpServer({
 			guardian: secured,
@@ -533,7 +551,10 @@ describe('Guardian transport: HTTP server and client', () => {
 		secured.close();
 	});
 
-	it('rejects a guardian outside the protocol version range', async () => {
+	it('rejects a guardian outside the protocol version range', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const stub: GuardianClient = new GuardianClient({
 			url: 'http://stub.invalid',
 			guardianSetId: SET_ID,
@@ -678,7 +699,10 @@ describe('Guardian transport: endpoint selection', () => {
 });
 
 describe('Guardian transport: client hardening', () => {
-	it('gates every verb on the advertised version range, once', async () => {
+	it('gates every verb on the advertised version range, once', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const calls: string[] = [];
 		const incompatible = new GuardianClient({
 			url: 'http://127.0.0.1:1',
@@ -794,7 +818,10 @@ describe('Guardian transport: client hardening', () => {
 });
 
 describe('Guardian transport: quorum fan-out', () => {
-	it('collects receipts across guardians and counts the durable quorum', async () => {
+	it('collects receipts across guardians and counts the durable quorum', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
 		const guardians = [0, 1, 2].map((i) => makeGuardian(i));
 		const servers = await Promise.all(
 			guardians.map(async (g) => {

@@ -224,6 +224,28 @@ function replayMsg(
 }
 
 /**
+ * A recovery declaration (spec 5.6 and 5.8): the wire half of "our state is
+ * stale, or unprovable, so close with YOUR commitment".
+ *
+ * Marked so the quorum barrier holds it until the disposition that authorizes
+ * it is durable. What that protects is the never-broadcast invariant itself:
+ * if the peer acts on this while the frame carrying `dataLossDetected` or
+ * `recoveryCloseReason` is still only local, a restore below that frame comes
+ * back believing it may broadcast a commitment the peer has already revoked.
+ */
+function declMsg(
+	messageType: MessageType,
+	payload: Buffer
+): ISendMessageAction {
+	return {
+		type: ChannelActionType.SEND_MESSAGE,
+		messageType,
+		payload,
+		durabilityCritical: true
+	};
+}
+
+/**
  * Compute channel reserve: 1% of funding (matching LND/CLN/Eclair),
  * floored at the greater of dust limit and 546 sats (LND's minimum),
  * capped at BOLT 2 max of funding / 5 (20%).
@@ -287,6 +309,40 @@ function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
 		return null;
 	}
 }
+
+/** A force close this channel cannot perform, and why. */
+export interface IForceClosePlanRefused {
+	ok: false;
+	error: string;
+}
+
+/**
+ * A force close that is going to work: everything fallible is already done,
+ * and the live channel has not been touched.
+ */
+export interface IForceClosePlanReady {
+	ok: true;
+	/** The fully witnessed commitment, built against the planned view. */
+	commitmentTx: Buffer;
+	/**
+	 * The state a CONFIRMED splice contributes to that view, or null when
+	 * there is no splice to adopt. Applied as one assignment, so the channel
+	 * either has the whole spliced view or none of it.
+	 */
+	spliceAdoption: Partial<IChannelState> | null;
+	/**
+	 * The taproot verification nonce the commitment was aggregated under.
+	 *
+	 * The EXACT object generateNonce returned, never a copy: the MuSig2
+	 * library finds the secret nonce by the public nonce it was registered
+	 * with, so a duplicated buffer signs nothing.
+	 */
+	localNonce: Uint8Array | null;
+	/** The id the CHANNEL_CLOSED action carries. */
+	channelId: Buffer;
+}
+
+export type ForceClosePlan = IForceClosePlanRefused | IForceClosePlanReady;
 
 /**
  * A wallet-owned input contributed to a splice-in. The wallet provides the full
@@ -1245,6 +1301,17 @@ export class Channel {
 				fundingTxid: this._state.fundingTxid,
 				fundingOutputIndex: this._state.fundingOutputIndex,
 				minimumDepth: this._state.minimumDepth
+			});
+			// AFTER the watch and never before: the outpoint has to be under
+			// observation before the transaction that creates it can confirm.
+			// This is the only signal that authorizes the broadcast, and it is
+			// an action so that a failed persist can withhold it and a quorum
+			// barrier can hold it. The peer's signature over our commitment #0
+			// has just been verified above, which is precisely when BOLT 2
+			// starts the obligation.
+			actions.push({
+				type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+				fundingTxid: this._state.fundingTxid
 			});
 		}
 
@@ -3872,7 +3939,17 @@ export class Channel {
 				? 'peer proved our channel state is stale (data loss); awaiting your force close'
 				: 'restored channel state cannot be proven current (recovery); awaiting your force close';
 		return [
-			sendMsg(
+			// The persist leads, exactly as it does at the two sites that first
+			// declare this disposition, and for a second reason here: under a
+			// quorum barrier (5.8) a data-loss error may not reach the peer
+			// before the frame authorizing it has guardian receipts, and the
+			// batch's own PERSIST_STATE is the only thing that names that
+			// frame. Regenerating the error alone would hand the wire a
+			// declaration no receipt covers. The state written is the same
+			// state that was already committed, so the cost is one no-op frame
+			// per reconnect of a channel that is only waiting to be closed.
+			{ type: ChannelActionType.PERSIST_STATE },
+			declMsg(
 				MessageType.ERROR,
 				encodeErrorMessage({
 					channelId: this._state.channelId,
@@ -3882,7 +3959,134 @@ export class Channel {
 		];
 	}
 
+	/**
+	 * Re-mint the authorization a RESTART lost, for a v1 funding transaction
+	 * this node is already obliged to broadcast.
+	 *
+	 * The obligation itself survives a restart, because the peer's signature
+	 * over our commitment #0 is on disk. The AUTHORIZATION does not, and the
+	 * two are not the same thing. Under a quorum barrier the original
+	 * authorization may have been held when the process died, and a local
+	 * frame is not a quorum-durable one: restoring a channel row proves this
+	 * device wrote the frame, never that the guardians accepted it. So the
+	 * restart asks again, through a fresh persist whose frame the barrier can
+	 * actually wait on, exactly as the recovery-close declaration does.
+	 *
+	 * Restored channel state may determine that an authorization is NEEDED. It
+	 * must never be the authorization.
+	 */
+	buildFundingReauthorizationActions(): ChannelAction[] {
+		const fundingTxid = this._state.fundingTxid;
+		if (!fundingTxid) return [];
+		// The same two conditions the live path establishes at funding_signed.
+		if (this._state.state === ChannelState.SENT_FUNDING_CREATED) return [];
+		if (!this._state.remoteCommitmentSignature) return [];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.AUTHORIZE_FUNDING_BROADCAST,
+				fundingTxid
+			}
+		];
+	}
+
+	/**
+	 * Start the BOLT 2 forget clock for a funding neither mempool nor chain can
+	 * find. Returns true when THIS call started it, which is the caller's
+	 * signal that the new height owes a persist: the clock counts down to
+	 * destroying a channel, so it must be read back after a restart rather
+	 * than restarted from whatever height the node happens to be at then.
+	 * Idempotent afterwards, so every later absence keeps the original height.
+	 */
+	beginFundingMissingClock(height: number): boolean {
+		if (this._state.fundingMissingSinceHeight !== undefined) return false;
+		this._state.fundingMissingSinceHeight = height;
+		return true;
+	}
+
+	/** The height absence was first observed at, or undefined if never. */
+	fundingMissingSince(): number | undefined {
+		return this._state.fundingMissingSinceHeight;
+	}
+
+	/**
+	 * Stop the clock: the funding was found, so nothing is counting down any
+	 * more. Returns true when this call cleared a running clock, so the caller
+	 * knows the removal is a state change that owes a persist of its own.
+	 */
+	clearFundingMissingClock(): boolean {
+		if (this._state.fundingMissingSinceHeight === undefined) return false;
+		delete this._state.fundingMissingSinceHeight;
+		return true;
+	}
+
+	/**
+	 * Retire the retained funding payload, which lives with the broadcast
+	 * obligation it serves. Returns true when this call dropped one.
+	 */
+	clearRetainedFundingPayload(): boolean {
+		if (this._state.pendingFundingTxHex === undefined) return false;
+		delete this._state.pendingFundingTxHex;
+		return true;
+	}
+
+	/**
+	 * The same re-authorization for a fully signed splice resumed at startup.
+	 *
+	 * Startup used to hand the retained hex straight to the chain backend,
+	 * which is outside the action model entirely: no frame, no persist gate and
+	 * no barrier. A splice creates a funding output exactly as an open does, so
+	 * it answers to the same rule.
+	 */
+	buildSpliceRebroadcastActions(): ChannelAction[] {
+		const inflight = this._state.spliceInFlight;
+		if (!inflight?.fullySigned || !inflight.spliceTxHex) return [];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			{
+				type: ChannelActionType.BROADCAST_TX,
+				tx: Buffer.from(inflight.spliceTxHex, 'hex'),
+				fundingCritical: true
+			}
+		];
+	}
+
+	/**
+	 * Force close, in one call: plan, then apply.
+	 *
+	 * Kept for callers with nothing to sequence between the two. The operator
+	 * path does NOT use it: abandoning a held barrier queue is irreversible,
+	 * so it has to happen after the plan is known to be possible and before
+	 * the live channel moves, which is the whole reason the two halves exist.
+	 */
 	forceClose(signer: ISigner): ChannelAction[] {
+		const plan = this.prepareForceClose(signer);
+		if (!plan.ok) {
+			return [{ type: ChannelActionType.ERROR, message: plan.error }];
+		}
+		return this.applyForceClosePlan(plan);
+	}
+
+	/**
+	 * Decide whether this channel can force close, and build the commitment it
+	 * would broadcast, WITHOUT touching the live channel.
+	 *
+	 * This used to be one method that mutated as it went: it adopted a
+	 * confirmed splice (swapping the funding outpoint, the capacity, both
+	 * balances and the signature material, and resetting the splice runtime)
+	 * and wrote the taproot verification nonce, and only then reached checks
+	 * that could still refuse. A refusal therefore left a channel that had
+	 * already moved, while a Phase 6 barrier could still be holding a batch
+	 * built against the state it moved from. That batch releases later against
+	 * a channel that no longer matches it. "In memory and unpersisted" is not
+	 * a mitigation: an unpersisted mutation underneath a persisted, queued
+	 * batch is exactly the divergence.
+	 *
+	 * So every refusal is decided here, against a CANDIDATE view, and the
+	 * commitment is built against that same view. Once this returns ok the
+	 * caller may burn its irreversible bridges before applying.
+	 */
+	prepareForceClose(signer: ISigner): ForceClosePlan {
 		// The recovery never-broadcast invariant (5.6): proven stale
 		// (dataLossDetected) or unprovable (stateUncertain), our latest local
 		// commitment may be revoked in the peer's view - broadcasting it hands
@@ -3891,14 +4095,12 @@ export class Channel {
 		// provenance, so the only exit is the peer force-closing with ITS
 		// commitment; we sweep our to_remote from that.
 		if (mustNotBroadcastCommitment(this._state)) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: this._state.dataLossDetected
-						? 'Refusing to broadcast stale commitment after data loss'
-						: 'Refusing to broadcast: restored state is not proven current'
-				}
-			];
+			return {
+				ok: false,
+				error: this._state.dataLossDetected
+					? 'Refusing to broadcast stale commitment after data loss'
+					: 'Refusing to broadcast: restored state is not proven current'
+			};
 		}
 
 		if (
@@ -3918,21 +4120,29 @@ export class Channel {
 			// network simply rejects the duplicate.
 			this._state.state !== ChannelState.FORCE_CLOSED
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Cannot force close: wrong state'
-				}
-			];
+			return { ok: false, error: 'Cannot force close: wrong state' };
+		}
+
+		// The taproot peer nonce is asked FIRST, before anything else is even
+		// computed, because nothing else affects it: a splice adoption does not
+		// touch remoteSigningNonce. It used to be asked after our own
+		// verification nonce had already been written to live state.
+		const taproot = isTaprootChannel(this._state.channelType);
+		if (taproot && !this._state.remoteSigningNonce) {
+			return {
+				ok: false,
+				error:
+					'Cannot force close taproot channel: missing peer signing nonce (remoteSigningNonce) for the current commitment'
+			};
 		}
 
 		// A splice tx that CONFIRMED makes the old funding output unspendable —
-		// the live-state commitment below would spend a spent outpoint and can
-		// never confirm, leaving no unilateral exit. The only valid exit is the
+		// a live-state commitment would spend a spent outpoint and can never
+		// confirm, leaving no unilateral exit. The only valid exit is the
 		// commitment on the NEW funding, whose peer signatures the
-		// point-of-no-return record carries; adopt the spliced view first
-		// (completeSplice swaps the outpoint, balances and signature material,
-		// exactly as a splice_locked exchange would — the peer's signatures are
+		// point-of-no-return record carries; so the close is planned against
+		// the spliced view (the same swap of outpoint, balances and signature
+		// material a splice_locked exchange makes — the peer's signatures are
 		// over commitment N regardless of whether splice_locked ever crossed).
 		//
 		// Judged by the CONFIRMED record alone, never by channel state: the
@@ -3942,66 +4152,69 @@ export class Channel {
 		// markErrored has already replaced SPLICING with ERRORED by the time the
 		// close is driven. A state-based gate would skip adoption in the latter
 		// and broadcast against the spent pre-splice funding.
-		const preAdoptionState = this._state.state;
-		if (this._state.spliceInFlight?.confirmed === true) {
-			// Capture the adoption target BEFORE completeSplice nulls the record.
-			const expectedTxid = Buffer.from(this._state.spliceInFlight.spliceTxid);
-			const expectedOutputIndex =
-				this._state.spliceInFlight.newFundingOutputIndex;
-			// After a restart the in-memory splice session may not be rebuilt
-			// yet; restore is a no-op when it already exists.
-			this.restoreSpliceInFlight();
-			this.completeSplice();
-			// Never knowingly broadcast a commitment against the spent
-			// pre-splice funding: if the session could not be rebuilt and the
-			// adoption no-oped, refuse rather than produce an unconfirmable
-			// exit and transition toward FORCE_CLOSED on the strength of it.
-			if (
-				!this._state.fundingTxid?.equals(expectedTxid) ||
-				this._state.fundingOutputIndex !== expectedOutputIndex
-			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Cannot force close: confirmed splice funding could not be adopted'
-					}
-				];
+		let spliceAdoption: Partial<IChannelState> | null = null;
+		const inflight = this._state.spliceInFlight;
+		if (inflight?.confirmed === true) {
+			// Without the peer's signature over the POST-splice commitment,
+			// adopting would leave remoteCommitmentSignature holding the
+			// PRE-splice one: non-null, so the check further down passes, and
+			// useless, because it signs an output this splice has spent. That
+			// produces a commitment the network rejects while this method
+			// reports a successful close.
+			if (!this.spliceAdoptedRemoteSignature()) {
+				return {
+					ok: false,
+					error:
+						'Cannot force close: confirmed splice has no remote commitment signature to adopt'
+				};
 			}
-			if (preAdoptionState === ChannelState.ERRORED) {
-				// completeSplice restores NORMAL exactly as a splice_locked
+			spliceAdoption = this._computeSpliceAdoption();
+			// Never knowingly broadcast a commitment against the spent
+			// pre-splice funding: if the adoption would not actually swap the
+			// outpoint, refuse rather than produce an unconfirmable exit.
+			const expectedTxid = Buffer.from(inflight.spliceTxid);
+			if (
+				!spliceAdoption?.fundingTxid?.equals(expectedTxid) ||
+				spliceAdoption.fundingOutputIndex !== inflight.newFundingOutputIndex
+			) {
+				return {
+					ok: false,
+					error:
+						'Cannot force close: confirmed splice funding could not be adopted'
+				};
+			}
+			if (this._state.state === ChannelState.ERRORED) {
+				// The adoption restores NORMAL exactly as a splice_locked
 				// exchange would; a channel failed by a BOLT 1 error stays failed.
-				this._state.state = ChannelState.ERRORED;
-				this._state.preReestablishState = null;
-			} else if (this._state.state === ChannelState.NORMAL) {
+				spliceAdoption.state = ChannelState.ERRORED;
+				spliceAdoption.preReestablishState = null;
+			} else if (spliceAdoption.state === ChannelState.NORMAL) {
 				// Adoption succeeded from inside the reestablish wrapper: the
 				// wrapper's return-to state no longer exists.
-				this._state.preReestablishState = null;
+				spliceAdoption.preReestablishState = null;
 			}
 		}
 
-		if (!this._state.fundingTxid || !this._state.remoteBasepoints) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Cannot force close: channel not funded'
-				}
-			];
+		// The view this close is planned against: the live state, plus the
+		// splice adoption if there is one. A copy either way, so that nothing
+		// below can reach the live channel by accident.
+		const closing = {
+			...this._state,
+			...(spliceAdoption ?? {})
+		} as IChannelState;
+
+		if (!closing.fundingTxid || !closing.remoteBasepoints) {
+			return { ok: false, error: 'Cannot force close: channel not funded' };
 		}
 
-		if (!this._state.remoteCommitmentSignature) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Cannot force close: no remote signature'
-				}
-			];
+		if (!closing.remoteCommitmentSignature) {
+			return { ok: false, error: 'Cannot force close: no remote signature' };
 		}
 
 		// Build our latest local commitment
 		const perCommitmentPoint = getPerCommitmentPoint(
-			this._state.localPerCommitmentSeed,
-			this._state.localCommitmentNumber
+			closing.localPerCommitmentSeed,
+			closing.localCommitmentNumber
 		);
 
 		const {
@@ -4012,9 +4225,10 @@ export class Channel {
 		// Rebuild at the exact feerate the stored remote signature covers
 		// (signedLocal=true) — mid-fee-round the in-flight rate can differ,
 		// which would change the sighash and make the witness invalid.
-		const built = buildLocal(this._state, perCommitmentPoint, undefined, true);
+		const built = buildLocal(closing, perCommitmentPoint, undefined, true);
 
-		if (isTaprootChannel(this._state.channelType)) {
+		let localNonce: Uint8Array | null = null;
+		if (taproot) {
 			// option_taproot: the funding output is a MuSig2 key-spend P2TR. The
 			// broadcast witness is the single 64-byte BIP340 Schnorr signature
 			// obtained by aggregating our partial with the peer's stored partial over
@@ -4030,38 +4244,28 @@ export class Channel {
 			// Safe — same height + same persisted peer nonce + same commitment ⇒ the
 			// identical signature, never a reused nonce over a different message. The
 			// peer's signing nonce is persisted (remoteSigningNonce); without it we
-			// cannot aggregate.
-			this._state.localNonce = this._deriveVerificationNonce(
-				this._state.localCommitmentNumber
-			);
-			if (!this._state.remoteSigningNonce) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'Cannot force close taproot channel: missing peer signing nonce (remoteSigningNonce) for the current commitment'
-					}
-				];
-			}
+			// cannot aggregate, which is why that is the very first thing asked.
+			localNonce = this._deriveVerificationNonce(closing.localCommitmentNumber);
+			closing.localNonce = localNonce;
 			const { aggregateLocalCommitmentSig } = require('./commitment-builder');
 			const {
 				buildTaprootKeySpendWitness
 			} = require('../script/funding-taproot');
 			const aggSig = aggregateLocalCommitmentSig(
-				this._state,
+				closing,
 				signer,
-				this._state.localNonce!,
-				this._state.remoteSigningNonce,
-				this._state.remoteCommitmentSignature,
+				localNonce,
+				closing.remoteSigningNonce!,
+				closing.remoteCommitmentSignature,
 				perCommitmentPoint,
-				this._state.localCommitmentNumber
+				closing.localCommitmentNumber
 			);
 			built.result.tx.setWitness(0, buildTaprootKeySpendWitness(aggSig));
 		} else {
 			// Create the funding witness using stored remote signature
 			const funding = createFundingScript(
-				this._state.localBasepoints.fundingPubkey,
-				this._state.remoteBasepoints.fundingPubkey
+				closing.localBasepoints.fundingPubkey,
+				closing.remoteBasepoints.fundingPubkey
 			);
 
 			// Sign our side
@@ -4074,27 +4278,55 @@ export class Channel {
 			// Build the 2-of-2 witness
 			const witness = ChannelSigner.buildFundingWitness(
 				localSig,
-				this._state.remoteCommitmentSignature,
-				this._state.localBasepoints.fundingPubkey,
-				this._state.remoteBasepoints.fundingPubkey,
+				closing.remoteCommitmentSignature,
+				closing.localBasepoints.fundingPubkey,
+				closing.remoteBasepoints.fundingPubkey,
 				funding.witnessScript
 			);
 
 			built.result.tx.setWitness(0, witness);
 		}
 
-		this._state.state = ChannelState.FORCE_CLOSED;
+		return {
+			ok: true,
+			commitmentTx: built.result.tx.toBuffer(),
+			spliceAdoption,
+			localNonce,
+			channelId: closing.channelId!
+		};
+	}
 
-		const commitmentTx = built.result.tx.toBuffer();
+	/**
+	 * Commit the planned close to the live channel.
+	 *
+	 * Nothing here can fail. Everything that could refuse was decided in
+	 * prepareForceClose, against the same candidate view this applies, so the
+	 * caller is free to have made its own irreversible arrangements (a barrier
+	 * queue abandoned, say) between the two calls.
+	 *
+	 * Apply in the same turn the plan was made. It is a decision about the
+	 * state that existed when it was planned, not a standing permission: a
+	 * plan held across further channel activity would commit a commitment
+	 * built from a view the channel has since left.
+	 */
+	applyForceClosePlan(plan: IForceClosePlanReady): ChannelAction[] {
+		if (plan.spliceAdoption) {
+			Object.assign(this._state, plan.spliceAdoption);
+			this._finishSpliceRuntime();
+		}
+		if (plan.localNonce) {
+			this._state.localNonce = plan.localNonce;
+		}
+		this._state.state = ChannelState.FORCE_CLOSED;
 
 		return [
 			{
 				type: ChannelActionType.BROADCAST_TX,
-				tx: commitmentTx
+				tx: plan.commitmentTx
 			},
 			{
 				type: ChannelActionType.CHANNEL_CLOSED,
-				channelId: this._state.channelId!
+				channelId: plan.channelId
 			}
 		];
 	}
@@ -5851,7 +6083,7 @@ export class Channel {
 				// Persist FIRST: a crash between the error send and the peer's
 				// force-close must not forget that broadcasting is forbidden.
 				{ type: ChannelActionType.PERSIST_STATE },
-				sendMsg(
+				declMsg(
 					MessageType.ERROR,
 					encodeErrorMessage({
 						channelId: this._state.channelId!,
@@ -5890,7 +6122,7 @@ export class Channel {
 				// Persist FIRST: a crash between the error send and the peer's
 				// force-close must not forget that broadcasting is forbidden.
 				{ type: ChannelActionType.PERSIST_STATE },
-				sendMsg(
+				declMsg(
 					MessageType.ERROR,
 					encodeErrorMessage({
 						channelId: this._state.channelId!,
@@ -8315,9 +8547,31 @@ export class Channel {
 	 * Complete the splice: update channel funding outpoint, balances, and exit quiescence.
 	 */
 	private completeSplice(): void {
-		const inflight = this._state.spliceInFlight;
-		if (!this._spliceSession && !inflight) return;
+		const adopted = this._computeSpliceAdoption();
+		if (!adopted) return;
+		Object.assign(this._state, adopted);
+		this._finishSpliceRuntime();
+	}
 
+	/**
+	 * The state a splice adoption produces, as a VALUE rather than a mutation.
+	 *
+	 * Separated out because force close has to know what adopting a CONFIRMED
+	 * splice would produce before it decides to adopt anything: it builds the
+	 * commitment against the adopted view, and a refusal after the live
+	 * channel had already moved leaves a channel that disagrees with the
+	 * batch a barrier is still holding against it. One computation, two
+	 * callers, so the arithmetic cannot drift between the ordinary
+	 * splice_locked path and the last-exit one.
+	 *
+	 * Null when there is nothing to adopt. Reads runtime and state; writes
+	 * neither.
+	 */
+	private _computeSpliceAdoption(): Partial<IChannelState> | null {
+		const inflight = this._state.spliceInFlight;
+		if (!this._spliceSession && !inflight) return null;
+
+		const fields: Partial<IChannelState> = {};
 		if (!this._spliceSession) {
 			// Session-free adoption from the persisted point-of-no-return record:
 			// the worst-case restart where the in-memory session could not be
@@ -8344,21 +8598,20 @@ export class Channel {
 			const theirNewMsat =
 				newCapacity * 1000n - myNewLocalMsat - htlcInFlightMsat;
 
-			this._state.spliceFundingTxid = Buffer.from(inflight!.spliceTxid);
-			this._state.spliceFundingOutputIndex = inflight!.newFundingOutputIndex;
-			this._state.fundingTxid = Buffer.from(inflight!.spliceTxid);
-			this._state.fundingOutputIndex = inflight!.newFundingOutputIndex;
-			this._state.fundingSatoshis = newCapacity;
-			this._state.localBalanceMsat = myNewLocalMsat;
-			this._state.remoteBalanceMsat = theirNewMsat;
+			fields.spliceFundingTxid = Buffer.from(inflight!.spliceTxid);
+			fields.spliceFundingOutputIndex = inflight!.newFundingOutputIndex;
+			fields.fundingTxid = Buffer.from(inflight!.spliceTxid);
+			fields.fundingOutputIndex = inflight!.newFundingOutputIndex;
+			fields.fundingSatoshis = newCapacity;
+			fields.localBalanceMsat = myNewLocalMsat;
+			fields.remoteBalanceMsat = theirNewMsat;
 			if (this._state.remoteBasepoints) {
-				this._state.remoteBasepoints = {
+				fields.remoteBasepoints = {
 					...this._state.remoteBasepoints,
 					fundingPubkey: Buffer.from(inflight!.remoteFundingPubkey)
 				};
 			}
-			this._finishCompleteSplice();
-			return;
+			return this._withSpliceAdoptionTail(fields);
 		}
 
 		// Capture the fee-adjusted new outpoint/capacity/balances from the actual
@@ -8368,31 +8621,35 @@ export class Channel {
 		const outputIndex = this._spliceSession.getSpliceFundingOutputIndex();
 
 		if (spliced) {
-			this._state.spliceFundingTxid = txid;
-			this._state.spliceFundingOutputIndex = spliced.fundingOutputIndex;
-			this._state.fundingTxid = spliced.fundingTxid;
-			this._state.fundingOutputIndex = spliced.fundingOutputIndex;
-			this._state.fundingSatoshis = spliced.fundingSatoshis;
-			this._state.localBalanceMsat = spliced.localBalanceMsat;
-			this._state.remoteBalanceMsat = spliced.remoteBalanceMsat;
+			fields.spliceFundingTxid = txid;
+			fields.spliceFundingOutputIndex = spliced.fundingOutputIndex;
+			fields.fundingTxid = spliced.fundingTxid;
+			fields.fundingOutputIndex = spliced.fundingOutputIndex;
+			fields.fundingSatoshis = spliced.fundingSatoshis;
+			fields.localBalanceMsat = spliced.localBalanceMsat;
+			fields.remoteBalanceMsat = spliced.remoteBalanceMsat;
 			// Adopt the splice-negotiated funding pubkeys: post-splice commitments
 			// spend the new funding 2-of-2 and must use these, not the originals.
-			this._state.localBasepoints = spliced.localBasepoints;
-			this._state.remoteBasepoints = spliced.remoteBasepoints;
+			fields.localBasepoints = spliced.localBasepoints;
+			fields.remoteBasepoints = spliced.remoteBasepoints;
 		} else if (txid) {
 			// Fallback: net-change accounting (does not subtract the on-chain fee).
-			this._state.spliceFundingTxid = txid;
-			this._state.spliceFundingOutputIndex = outputIndex;
-			this._state.fundingTxid = txid;
-			this._state.fundingOutputIndex = outputIndex;
-			this._state.fundingSatoshis += this._spliceSession.getNetCapacityChange();
-			this._state.localBalanceMsat +=
+			fields.spliceFundingTxid = txid;
+			fields.spliceFundingOutputIndex = outputIndex;
+			fields.fundingTxid = txid;
+			fields.fundingOutputIndex = outputIndex;
+			fields.fundingSatoshis =
+				this._state.fundingSatoshis +
+				this._spliceSession.getNetCapacityChange();
+			fields.localBalanceMsat =
+				this._state.localBalanceMsat +
 				this._spliceSession.getLocalRelativeSatoshis() * 1000n;
-			this._state.remoteBalanceMsat +=
+			fields.remoteBalanceMsat =
+				this._state.remoteBalanceMsat +
 				this._spliceSession.getRemoteRelativeSatoshis() * 1000n;
 		}
 
-		this._finishCompleteSplice();
+		return this._withSpliceAdoptionTail(fields);
 	}
 
 	/**
@@ -8402,7 +8659,12 @@ export class Channel {
 	 * bookkeeping. Shared by the session-driven and session-free (post-restart)
 	 * adoption paths.
 	 */
-	private _finishCompleteSplice(): void {
+	private _withSpliceAdoptionTail(
+		fields: Partial<IChannelState>
+	): Partial<IChannelState> {
+		// The reads below have to see the funding swap this same adoption
+		// makes, exactly as they did when this ran after the live mutation.
+		const adopted = { ...this._state, ...fields } as IChannelState;
 		// localConfig.maxHtlcValueInFlightMsat is deliberately NOT re-clamped to
 		// the post-splice capacity: it is the limit we NEGOTIATED at open, and
 		// the peer holds us to it across splices. Lowering it after a splice-out
@@ -8416,29 +8678,26 @@ export class Channel {
 		// spliced channel. After a restart the in-memory copy is gone but the
 		// point-of-no-return record still holds it. If no mid-splice commitment
 		// was ever exchanged, fall back to driving a post-splice round.
-		const adoptedSig =
-			this._spliceRemoteCommitmentSig ??
-			this._state.spliceInFlight?.remoteCommitmentSig ??
-			null;
+		const adoptedSig = this.spliceAdoptedRemoteSignature();
 		if (adoptedSig) {
-			this._state.remoteCommitmentSignature = Buffer.from(adoptedSig);
+			fields.remoteCommitmentSignature = Buffer.from(adoptedSig);
 			// Committed HTLCs that rode through the splice (S-2.M8) keep their
 			// outputs on the post-splice commitment; adopt the peer's verified
 			// second-level sigs over them (empty for an HTLC-free splice).
-			this._state.remoteHtlcSignatures =
+			fields.remoteHtlcSignatures =
 				this._spliceRemoteHtlcSigs ??
 				this._state.spliceInFlight?.remoteHtlcSignatures ??
 				[];
 			// Rebuild at the rate the adopted signature was actually made at, not
 			// a feerate that may have been staged (update_fee) but not yet signed.
-			this._state.lastSignedCommitFeeratePerKw =
+			fields.lastSignedCommitFeeratePerKw =
 				this._state.spliceInFlight?.remoteCommitmentSigFeeratePerKw ??
-				getLocalCommitmentFeeRate(this._state);
-			this._state.lastSignedCommitLeaseBlockheight =
+				getLocalCommitmentFeeRate(adopted);
+			fields.lastSignedCommitLeaseBlockheight =
 				this._state.spliceInFlight?.remoteCommitmentSigLeaseBlockheight ??
-				getLocalCommitmentLeaseBlockheight(this._state);
+				getLocalCommitmentLeaseBlockheight(adopted);
 		} else {
-			this._state.needsCommitment = true;
+			fields.needsCommitment = true;
 		}
 
 		// The pre-splice funding output is spent: its SCID and any exchanged
@@ -8450,14 +8709,14 @@ export class Channel {
 		// one is computed. Without this reset, the peer's post-splice
 		// announcement_signatures get combined with our stale SCID/signatures
 		// into an announcement the network rejects ("Bad node_signature_1").
-		this._state.announcementSigsSent = false;
-		this._state.announcementSigsReceived = false;
-		this._state.localAnnouncementNodeSig = null;
-		this._state.localAnnouncementBitcoinSig = null;
-		this._state.remoteAnnouncementNodeSig = null;
-		this._state.remoteAnnouncementBitcoinSig = null;
-		this._state.fundingConfirmationHeight = 0;
-		this._state.fundingTxIndex = 0;
+		fields.announcementSigsSent = false;
+		fields.announcementSigsReceived = false;
+		fields.localAnnouncementNodeSig = null;
+		fields.localAnnouncementBitcoinSig = null;
+		fields.remoteAnnouncementNodeSig = null;
+		fields.remoteAnnouncementBitcoinSig = null;
+		fields.fundingConfirmationHeight = 0;
+		fields.fundingTxIndex = 0;
 
 		// A batch round can be outstanding at the lock: our commitment_signed
 		// pair went out, the peer's revoke_and_ack has not arrived. The generic
@@ -8470,25 +8729,43 @@ export class Channel {
 				const spliceSigned = decodeCommitmentSignedMessage(
 					this._lastSentBatch.commitments[1]
 				);
-				this._state.lastSentCommitmentSigned = Buffer.from(
-					spliceSigned.signature
-				);
-				this._state.lastSentHtlcSignatures = spliceSigned.htlcSignatures.map(
-					(h) => Buffer.from(h)
+				fields.lastSentCommitmentSigned = Buffer.from(spliceSigned.signature);
+				fields.lastSentHtlcSignatures = spliceSigned.htlcSignatures.map((h) =>
+					Buffer.from(h)
 				);
 			} catch {
 				// Undecodable cache: keep the existing material rather than corrupt it.
 			}
 		}
 
-		// Exit quiescence and restore normal operation
-		this._quiescence.exitQuiescence();
-		this._state.quiescenceState = QuiescenceState.NORMAL;
-		this._state.quiescenceInitiator = false;
-		this._state.state = ChannelState.NORMAL;
-		this._state.preSpliceState = null;
-		this._state.spliceInFlight = null;
+		fields.quiescenceState = QuiescenceState.NORMAL;
+		fields.quiescenceInitiator = false;
+		fields.state = ChannelState.NORMAL;
+		fields.preSpliceState = null;
+		fields.spliceInFlight = null;
+		return fields;
+	}
 
+	/**
+	 * The peer's signature over our POST-splice commitment, from the cache or
+	 * from the persisted point-of-no-return record.
+	 *
+	 * Its absence is what tells force close that adopting a confirmed splice
+	 * would leave the channel holding a signature over the PRE-splice
+	 * commitment: non-null, so the "no remote signature" check passes, and
+	 * useless, because it signs a funding output the splice has spent.
+	 */
+	private spliceAdoptedRemoteSignature(): Buffer | null {
+		return (
+			this._spliceRemoteCommitmentSig ??
+			this._state.spliceInFlight?.remoteCommitmentSig ??
+			null
+		);
+	}
+
+	/** Exit quiescence and drop the splice driver: the runtime half. */
+	private _finishSpliceRuntime(): void {
+		this._quiescence.exitQuiescence();
 		this._spliceSession = null;
 		this._resetSpliceDriver();
 	}
@@ -10824,7 +11101,15 @@ export class Channel {
 				spliceTxHex: tx.toHex()
 			});
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
-			actions.push({ type: ChannelActionType.BROADCAST_TX, tx: tx.toBuffer() });
+			// Marked: this creates a funding output naming us. When WE signed
+			// first the batch carries no tx_signatures of our own, so without
+			// the mark nothing in it is barrier-class and the transaction would
+			// reach the network ahead of the frame recording the splice.
+			actions.push({
+				type: ChannelActionType.BROADCAST_TX,
+				tx: tx.toBuffer(),
+				fundingCritical: true
+			});
 			actions.push({
 				type: ChannelActionType.WATCH_FUNDING,
 				fundingTxid: spliceTxid,
@@ -10900,9 +11185,13 @@ export class Channel {
 			if (this._dualFundingContribution) {
 				const assembled = this._assembleV2FundingTx();
 				if (assembled) {
+					// Same reason as the splice above: once our own
+					// tx_signatures have been released this batch has nothing
+					// barrier-class left to hold it.
 					actions.push({
 						type: ChannelActionType.BROADCAST_TX,
-						tx: assembled
+						tx: assembled,
+						fundingCritical: true
 					});
 				}
 			}

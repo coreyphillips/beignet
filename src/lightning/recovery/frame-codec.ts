@@ -31,6 +31,7 @@ import {
 	IRecoveryOutboxMessage
 } from '../storage/types';
 import {
+	RecoveryDurability,
 	RecoveryFrame,
 	RecoveryMutation,
 	RecoveryOutboundMessage,
@@ -133,8 +134,17 @@ interface IEncodedFrame {
 	timestamp: number;
 	mutations: IEncodedMutation[];
 	outboundMessages: IEncodedOutboundMessage[];
+	durability?: RecoveryDurability;
+	durabilityPolicy?: number;
 	snapshot?: IEncodedSnapshot;
 }
+
+/** The only durability values a frame may declare (spec 5.8). */
+const DURABILITY_VALUES: readonly RecoveryDurability[] = [
+	'local',
+	'async-remote',
+	'quorum'
+];
 
 function encodeMutation(mutation: RecoveryMutation): IEncodedMutation {
 	switch (mutation.type) {
@@ -475,6 +485,21 @@ export function encodeFrame(frame: RecoveryFrame): Buffer {
 		mutations: frame.mutations.map(encodeMutation),
 		outboundMessages: frame.outboundMessages.map(encodeOutboundMessage)
 	};
+	// Key insertion order IS the byte layout the frame hash commits to, so
+	// durability is written here, between outboundMessages and snapshot, on
+	// every frame that declares one. A frame without a declaration encodes
+	// exactly as it did before Phase 6, which is what keeps pre-existing
+	// journals verifiable and their hashes stable.
+	if (frame.durability) {
+		encoded.durability = frame.durability;
+		// The stamp sits immediately after the declaration it qualifies, and is
+		// a pure passthrough with no default: re-encoding a decoded frame has
+		// to reproduce its stored hash byte for byte, so the codec must never
+		// invent a value the writer did not put there.
+		if (frame.durabilityPolicy !== undefined) {
+			encoded.durabilityPolicy = frame.durabilityPolicy;
+		}
+	}
 	if (frame.snapshot) {
 		encoded.snapshot = encodeSnapshot(frame.snapshot);
 	}
@@ -496,6 +521,42 @@ export function decodeFrame(plaintext: Buffer): RecoveryFrame {
 		mutations: encoded.mutations.map(decodeMutation),
 		outboundMessages: encoded.outboundMessages.map(decodeOutboundMessage)
 	};
+	if (encoded.durability !== undefined) {
+		// An unrecognised value is a CORRUPT frame, never a tolerated unknown.
+		// The restore path reads this field to decide whether a channel may
+		// resume, so silently dropping a value we cannot interpret would turn
+		// a garbled frame into a downgrade nobody noticed.
+		if (!DURABILITY_VALUES.includes(encoded.durability)) {
+			throw new Error(
+				`Unsupported recovery frame durability: ${String(encoded.durability)}`
+			);
+		}
+		frame.durability = encoded.durability;
+	}
+	if (encoded.durabilityPolicy !== undefined) {
+		if (
+			!Number.isInteger(encoded.durabilityPolicy) ||
+			encoded.durabilityPolicy < 1
+		) {
+			throw new Error(
+				`Unsupported recovery frame durability policy: ${String(
+					encoded.durabilityPolicy
+				)}`
+			);
+		}
+		frame.durabilityPolicy = encoded.durabilityPolicy;
+	} else if (frame.durability === 'quorum') {
+		// A quorum declaration with no stamp is CORRUPTION, not an old writer:
+		// no released build has ever written a quorum frame, so nothing
+		// legitimate can produce this. Structural validity throws here.
+		// Whether a well formed version is one this build understands is a
+		// different question, answered by a refusal in deriveWireSafetyProof,
+		// so a newer writer's journal still restores down the DLP path rather
+		// than failing to restore at all.
+		throw new Error(
+			`Recovery journal frame ${frame.sequence} declares quorum durability with no policy version`
+		);
+	}
 	if (encoded.snapshot) {
 		frame.snapshot = decodeSnapshot(encoded.snapshot);
 	}

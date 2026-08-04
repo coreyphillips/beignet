@@ -97,11 +97,12 @@ export class RecoveryManager {
 	commit(transition: SafetyTransition): IRecoveryCommitResult {
 		const { mutations, outboundMessages } = transition;
 		if (mutations.length === 0 && outboundMessages.length === 0) {
-			return { committed: true, released: [] };
+			return { committed: true, released: [], frameSequence: null };
 		}
 
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
+		let frameSequence: bigint | null = null;
 		try {
 			this.storage.transaction(() => {
 				for (const mutation of mutations) {
@@ -127,7 +128,15 @@ export class RecoveryManager {
 					if (ids.length && this.storage.setOutboxFrameSequence) {
 						this.storage.setOutboxFrameSequence(ids, Number(sequence));
 					}
-					this.options.journal.appendFrame(mutations, outboundMessages);
+					// appendFrame reports the sequence it actually used, which is
+					// what a Phase 6 barrier waits on. nextSequence agrees with it
+					// in all three append branches, but the barrier is a fund
+					// safety gate: it takes the value the frame was written under,
+					// not a prediction of it.
+					frameSequence = this.options.journal.appendFrame(
+						mutations,
+						outboundMessages
+					);
 					journaled = true;
 				}
 			});
@@ -152,7 +161,12 @@ export class RecoveryManager {
 					this.outboxCounts.delete(mutation.channelId);
 				}
 			}
-			return { committed: false, released: [], error: error as Error };
+			return {
+				committed: false,
+				released: [],
+				error: error as Error,
+				frameSequence: null
+			};
 		}
 
 		// channel_closed deleted the channel's outbox rows with it (the storage
@@ -179,7 +193,8 @@ export class RecoveryManager {
 			released: outboundMessages.map((message, index) => ({
 				id: outboxIds[index] ?? null,
 				message
-			}))
+			})),
+			frameSequence
 		};
 	}
 

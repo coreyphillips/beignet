@@ -268,6 +268,8 @@ export interface ISerializedChannelState {
 	fundingSatoshis: string;
 	pushMsat: string;
 	fundingTxid: string | null;
+	pendingFundingTxHex?: string;
+	fundingMissingSinceHeight?: number;
 	fundingOutputIndex: number;
 	minimumDepth: number;
 	localConfig: ISerializedChannelConfig;
@@ -535,6 +537,8 @@ export function serializeChannelState(
 		fundingSatoshis: bigintToStr(s.fundingSatoshis),
 		pushMsat: bigintToStr(s.pushMsat),
 		fundingTxid: bufToHex(s.fundingTxid),
+		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: serializeChannelConfig(s.localConfig),
@@ -704,6 +708,8 @@ export function deserializeChannelState(
 		fundingSatoshis: strToBigint(s.fundingSatoshis),
 		pushMsat: strToBigint(s.pushMsat),
 		fundingTxid: hexToBuf(s.fundingTxid),
+		pendingFundingTxHex: s.pendingFundingTxHex,
+		fundingMissingSinceHeight: s.fundingMissingSinceHeight,
 		fundingOutputIndex: s.fundingOutputIndex,
 		minimumDepth: s.minimumDepth,
 		localConfig: deserializeChannelConfig(s.localConfig),

@@ -346,13 +346,13 @@ describe('max_htlc_value_in_flight_msat policy', function () {
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			const ch = channel as any;
 			ch._state.fundingSatoshis = 600_000n;
-			ch._finishCompleteSplice();
+			Object.assign(ch._state, ch._withSpliceAdoptionTail({}));
 			expect(
 				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
 			).to.equal(1_000_000_000n);
 
 			ch._state.fundingSatoshis = 1_500_000n;
-			ch._finishCompleteSplice();
+			Object.assign(ch._state, ch._withSpliceAdoptionTail({}));
 			expect(
 				channel.getFullState().localConfig.maxHtlcValueInFlightMsat
 			).to.equal(1_000_000_000n);

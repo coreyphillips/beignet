@@ -44,7 +44,7 @@ import {
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import { RecoveryFrame } from './types';
+import { VerifiedRecoveryChain } from './types';
 
 const CAPSULE_HKDF_INFO = 'beignet-recovery-capsule-v1';
 const CAPSULE_MAGIC = 'bRC1';
@@ -458,7 +458,7 @@ function verifyInlineJournal(
 ): {
 	encoded: IEncodedInlineState;
 	rows: IStoredRecoveryFrame[];
-	frames: RecoveryFrame[];
+	frames: VerifiedRecoveryChain;
 } {
 	const { encoded, rows } = parseInlineState(capsule.inlineRecoveryState!);
 	const frames = verifyFrameChain(

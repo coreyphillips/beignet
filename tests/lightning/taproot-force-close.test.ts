@@ -17,6 +17,7 @@ import { createTaprootFundingScript } from '../../src/lightning/script/funding-t
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Channel } from '../../src/lightning/channel/channel';
+import { serializeChannelState } from '../../src/lightning/storage/serialization';
 
 function makeSeed(id: number): Buffer {
 	return crypto
@@ -182,5 +183,34 @@ describe('option_taproot force-close key-spend aggregation (Stage C)', function 
 		// Each side force-closes on its latest (post-round) commitment #1.
 		assertForceCloseWitnessValid(aliceChannel);
 		assertForceCloseWitnessValid(bobChannel);
+	});
+
+	it('a refusal for a missing peer nonce leaves the channel untouched', function () {
+		// Without the peer's signing nonce there is nothing to aggregate with,
+		// so the close refuses. It used to write OUR verification nonce to live
+		// state first and look for the peer's only afterwards, which under
+		// Phase 6 moves a channel a barrier may still be holding a batch
+		// against.
+		const { aliceChannel } = readyTaprootChannel(5, 6);
+		const state = aliceChannel.getFullState();
+		delete (state as { remoteSigningNonce?: Buffer }).remoteSigningNonce;
+		delete (state as { localNonce?: Uint8Array }).localNonce;
+
+		const before = JSON.stringify(serializeChannelState(state));
+		const plan = aliceChannel.prepareForceClose(aliceChannel.getSigner()!);
+
+		expect(plan.ok, 'the close refuses').to.equal(false);
+		expect((plan as { error: string }).error).to.contain(
+			'missing peer signing nonce'
+		);
+		expect(
+			aliceChannel.getFullState().localNonce,
+			'no verification nonce was written on the way to refusing'
+		).to.equal(undefined);
+		expect(
+			JSON.stringify(serializeChannelState(aliceChannel.getFullState())),
+			'serialized state is byte-for-byte what it was'
+		).to.equal(before);
+		expect(aliceChannel.getState()).to.equal(ChannelState.NORMAL);
 	});
 });
