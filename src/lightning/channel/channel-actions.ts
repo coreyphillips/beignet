@@ -8,6 +8,7 @@
 
 import { MessageType } from '../message/types';
 import { IRecoveryOutboxMessage } from '../storage/types';
+import type { Channel } from './channel';
 
 export enum ChannelActionType {
 	SEND_MESSAGE = 'SEND_MESSAGE',
@@ -270,6 +271,32 @@ export interface IChannelPersistRequest {
 	 * are allowed onto the wire (docs/RECOVERY-PROTOCOL.md 5.8).
 	 */
 	frameSequence?: bigint | null;
+}
+
+/**
+ * The `channel:persist` event itself.
+ *
+ * The channel and its peer are passed BY REFERENCE rather than by an id the
+ * listener has to resolve again, because the id a channel answers to is not
+ * stable across its own opening. A v2 channel derives its permanent
+ * channel_id during accept_channel2 but stays registered under its TEMPORARY
+ * id until the open leaves AWAITING_TX_SIGNATURES, so the first v2
+ * commitment_signed used to emit a permanent id that resolved to nothing:
+ * the listener returned without committing, the batch reported committed
+ * anyway, and the message left with no state on disk behind it.
+ *
+ * `channelId` is what the row is KEYED by (permanent once derived), which is
+ * a separate question from which map currently holds the object.
+ */
+export interface IChannelPersistEvent {
+	/** The channel to commit. Already resolved; never looked up again. */
+	channel: Channel;
+	/** The peer this channel belongs to, for the channel_state mutation. */
+	peerPubkey: string;
+	/** The id to key the persisted row by: permanent when one exists. */
+	channelId: Buffer;
+	/** Present when the batch has messages whose release depends on it. */
+	request?: IChannelPersistRequest;
 }
 
 /**

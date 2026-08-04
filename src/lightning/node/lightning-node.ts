@@ -207,7 +207,10 @@ import {
 	journalSupported,
 	composeRecoveryCapsule
 } from '../recovery';
-import { IChannelPersistRequest } from '../channel/channel-actions';
+import {
+	IChannelPersistEvent,
+	IChannelPersistRequest
+} from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
 import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
@@ -897,6 +900,18 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
+		// option_dual_fund: quorum durability refuses to START a v2 open (see
+		// ChannelManager, QUORUM_NO_DUAL_FUND_REFUSAL), so it must not invite
+		// one either. A peer that reads the bit and opens accordingly would be
+		// answered with a refusal it could have been spared, and our own
+		// openChannel routes by this same bit, so clearing it is also what
+		// makes the generic API choose v1 rather than a v2 its own manager
+		// will reject. Advertising is only half of it: negotiation is advisory
+		// and the handler guards refuse for themselves regardless.
+		if (barrier?.enforcing === true) {
+			localFeatures.clearBit(Feature.DUAL_FUND);
+			localFeatures.clearBit(Feature.DUAL_FUND + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1086,6 +1101,35 @@ export class LightningNode extends EventEmitter {
 		// Restore from storage if available
 		if (this.storage) {
 			this.restoreFromStorage();
+			// Turning quorum ON is the one moment a v2 opening session and
+			// quorum durability can meet: the mode refuses to START a v2 open,
+			// but a session begun under async-remote can be sitting in the
+			// restored state when the operator switches. Refuse to come up
+			// rather than carry it: that session may already have crossed
+			// commitment_signed, so silently abandoning it would discard a
+			// funding round the peer may be able to complete, and continuing
+			// would claim an exactness this node cannot deliver for it.
+			// Finish or abandon it under async-remote first.
+			if (barrier?.enforcing === true) {
+				for (const channel of this.channelManager.listChannels()) {
+					const st = channel.getState();
+					if (
+						st !== ChannelState.DUAL_FUNDING_V2 &&
+						st !== ChannelState.AWAITING_TX_SIGNATURES
+					) {
+						continue;
+					}
+					const id = (
+						channel.getChannelId() ?? channel.getTemporaryChannelId()
+					).toString('hex');
+					throw new Error(
+						`recovery: cannot enable quorum durability while a dual-funded ` +
+							`open is in progress (channel ${id} is ${st}); its interactive ` +
+							`funding session is not restartable, so finish or abandon it ` +
+							`under async-remote durability first`
+					);
+				}
+			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
@@ -1679,6 +1723,14 @@ export class LightningNode extends EventEmitter {
 		return request.committed;
 	}
 
+	/**
+	 * The id-addressed entry point, for the node's own call sites: they hold a
+	 * channel id and the channel is in the manager under it.
+	 *
+	 * The dispatch path does NOT come through here. It hands over the channel
+	 * it already resolved, because during a v2 open the id a channel answers
+	 * to and the id it will be keyed by are briefly different things.
+	 */
 	private persistChannel(
 		channelId: Buffer,
 		request?: IChannelPersistRequest
@@ -1688,7 +1740,16 @@ export class LightningNode extends EventEmitter {
 		if (!channel) return;
 		const peer = this.channelManager.getPeerForChannel(channelId);
 		if (!peer) return;
+		this.persistChannelState(channel, peer, channelId, request);
+	}
 
+	private persistChannelState(
+		channel: Channel,
+		peer: string,
+		channelId: Buffer,
+		request?: IChannelPersistRequest
+	): void {
+		if (!this.storage || !this.recovery) return;
 		const channelIdHex = channelId.toString('hex');
 		const keyIndex = channel.channelKeyIndex;
 		// Channel state persisted without its key index restores a channel that
@@ -2259,12 +2320,23 @@ export class LightningNode extends EventEmitter {
 		// Persist-before-send: channel state, its key index, any monitor delta
 		// this same action produced, and the wire bytes it authorizes all commit
 		// in one transaction; the sends are released only if it commits.
-		this.channelManager.on(
-			'channel:persist',
-			(channelId: Buffer, request?: IChannelPersistRequest) => {
-				this.persistChannel(channelId, request);
+		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
+			// A node that HAS persistence answers for itself. The request
+			// arrives committed:true, which is the right default only for a
+			// node that persists nothing at all; leaving it true here would
+			// let a listener that returned early, or an id that resolved to
+			// nothing, read as a successful commit and release the batch's
+			// sends. Only reaching recovery.commit may say committed.
+			if (event.request && this.storage && this.recovery) {
+				event.request.committed = false;
 			}
-		);
+			this.persistChannelState(
+				event.channel,
+				event.peerPubkey,
+				event.channelId,
+				event.request
+			);
+		});
 
 		// A processActions batch is open: monitor changes it causes belong in
 		// that channel's transition rather than in a second, separate write.

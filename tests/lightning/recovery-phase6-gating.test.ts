@@ -29,7 +29,7 @@ import { ChannelState } from '../../src/lightning/channel/types';
 import {
 	ChannelAction,
 	ChannelActionType,
-	IChannelPersistRequest,
+	IChannelPersistEvent,
 	IWireDurabilityBarrier
 } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
@@ -148,15 +148,12 @@ function makeHarness(enforcing = true): IHarness {
 	manager.on('error', (_id: Buffer | null, message: string) => {
 		harness.errors.push(message);
 	});
-	manager.on(
-		'channel:persist',
-		(_id: Buffer, request?: IChannelPersistRequest) => {
-			if (!request) return;
-			request.committed = true;
-			request.frameSequence = harness.nextFrame;
-			request.outboxIds = request.outbound.map((_m, index) => index + 1);
-		}
-	);
+	manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
+		if (!request) return;
+		request.committed = true;
+		request.frameSequence = harness.nextFrame;
+		request.outboxIds = request.outbound.map((_m, index) => index + 1);
+	});
 	manager.on('message:outbound', (peer: string, type: number) => {
 		harness.sent.push({ peer, type });
 	});
@@ -864,7 +861,7 @@ describe('Recovery phase 6: funding does not outrun its own frame', () => {
 		harness.manager.removeAllListeners('channel:persist');
 		harness.manager.on(
 			'channel:persist',
-			(_id: Buffer, request?: IChannelPersistRequest) => {
+			({ request }: IChannelPersistEvent) => {
 				if (request) request.committed = false;
 			}
 		);

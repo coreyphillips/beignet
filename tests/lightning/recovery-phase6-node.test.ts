@@ -655,12 +655,17 @@ describe('Recovery phase 6: a finished namespace is reported, not guessed', () =
 		expect(() => manager.openChannel(peer, 100_000n)).to.throw(
 			/lost its guardian backfill/
 		);
+		// The v2 entry point refuses for its own reason and never reaches the
+		// namespace check: quorum does not START a dual-funded open at all,
+		// and that guard sits at the pre-allocation boundary, ahead of
+		// everything. What this case is really about holds either way, that
+		// the entry point refuses and allocates nothing.
 		expect(() =>
 			manager.createDualFundedChannel(peer, {
 				fundingSatoshis: 100_000n,
 				fundingFeeratePerkw: 500
 			} as unknown as Parameters<typeof manager.createDualFundedChannel>[1])
-		).to.throw(/lost its guardian backfill/);
+		).to.throw(/dual-funded/);
 
 		// The zero-conf primitive refuses with a null, matching its own
 		// disposition. Trust the peer FIRST, or the untrusted-peer branch above

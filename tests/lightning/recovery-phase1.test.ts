@@ -52,6 +52,7 @@ import { MessageType } from '../../src/lightning/message/types';
 import {
 	ChannelAction,
 	ChannelActionType,
+	IChannelPersistEvent,
 	IChannelPersistRequest
 } from '../../src/lightning/channel/channel-actions';
 import {
@@ -994,12 +995,9 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 		const channel = stubChannel(crypto.randomBytes(32));
 
 		const persists: IChannelPersistRequest[] = [];
-		manager.on(
-			'channel:persist',
-			(_id: Buffer, request?: IChannelPersistRequest) => {
-				if (request) persists.push(request);
-			}
-		);
+		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
+			if (request) persists.push(request);
+		});
 		const sent: number[] = [];
 		manager.on('message:outbound', (_pk: string, type: number) => {
 			sent.push(type);
@@ -1041,12 +1039,9 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 		const manager = makeManager();
 		const channel = stubChannel(crypto.randomBytes(32));
 
-		manager.on(
-			'channel:persist',
-			(_id: Buffer, request?: IChannelPersistRequest) => {
-				if (request) request.committed = false;
-			}
-		);
+		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
+			if (request) request.committed = false;
+		});
 		const leaked: string[] = [];
 		manager.on('message:outbound', () => leaked.push('send'));
 		manager.on('broadcast:tx', () => leaked.push('broadcast'));
@@ -1080,12 +1075,9 @@ describe('Recovery phase 1: batch dispatch invariants', () => {
 	it('raises no blocked signal when the persist commits', () => {
 		const manager = makeManager();
 		const channel = stubChannel(crypto.randomBytes(32));
-		manager.on(
-			'channel:persist',
-			(_id: Buffer, request?: IChannelPersistRequest) => {
-				if (request) request.committed = true;
-			}
-		);
+		manager.on('channel:persist', ({ request }: IChannelPersistEvent) => {
+			if (request) request.committed = true;
+		});
 		let blockedCount = 0;
 		manager.on('transition:blocked', () => {
 			blockedCount++;
