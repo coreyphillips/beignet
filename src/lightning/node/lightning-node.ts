@@ -1591,8 +1591,11 @@ export class LightningNode extends EventEmitter {
 	 * Driven from channel:ready rather than from restoreFromStorage, because a
 	 * just-restored channel is in AWAITING_REESTABLISH and can send nothing: both
 	 * the onward add and the fail-back would be refused for wrong state. Every
-	 * channel passes through channel:ready once reestablish completes, and the
-	 * guards below make a repeat run a no-op.
+	 * channel passes through channel:ready once reestablish completes; the
+	 * CHANNEL_READY action supplies it only when channel_ready itself is
+	 * retransmitted (a channel on its first commitment round), so
+	 * handleChannelReestablish emits it at its tail for every channel that
+	 * returns to NORMAL. The guards below make a repeat run a no-op.
 	 */
 	private redispatchUnresolvedReceivedHtlcs(channelId: Buffer): void {
 		const channel = this.channelManager.getChannel(channelId);

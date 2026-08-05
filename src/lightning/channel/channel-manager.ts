@@ -3542,6 +3542,28 @@ export class ChannelManager extends EventEmitter {
 		// released when the peer's (retransmitted) revoke_and_ack arrives — our
 		// accurate next_revocation_number in channel_reestablish makes the peer
 		// retransmit it (see handleRevokeAndAck's autoSignAndSendCommitment).
+
+		// A channel back in NORMAL has completed reestablish and can carry
+		// updates again: pass it through 'channel:ready' so the node's
+		// restart-repair pass runs (redispatchUnresolvedReceivedHtlcs). The
+		// CHANNEL_READY action only reaches this event when channel_ready
+		// itself is retransmitted, which is true only for a channel that never
+		// completed a commitment round; without this emit, a received HTLC
+		// committed before a crash but resolved only in memory stays COMMITTED
+		// forever on any channel past its first round (its forwardEmitted
+		// marker is durable, so nothing re-emits it) until the CLTV backstop
+		// fails it late or, on a final hop whose preimage we hold, force
+		// closes the channel. Every listener tolerates repeats: the repair
+		// pass skips resolved, forwarded and held HTLCs, SCID registration is
+		// idempotent, and the public event already repeats whenever
+		// channel_ready is retransmitted. Emitted at the tail so no later
+		// step of this handler sits inside the listeners' callback window.
+		if (channel.getState() === ChannelState.NORMAL) {
+			this.emit(
+				'channel:ready',
+				channel.getChannelId() ?? channel.getTemporaryChannelId()
+			);
+		}
 	}
 
 	private handleStfu(peerPubkey: string, payload: Buffer): void {
