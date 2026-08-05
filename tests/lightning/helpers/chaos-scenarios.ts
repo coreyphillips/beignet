@@ -483,6 +483,41 @@ export function makeChaosSpliceWallet(amountSats: bigint): {
  * `_lastSentBatch` is the only thing a taproot channel may replay, since
  * re-signing would reuse a MuSig2 nonce.
  */
+/**
+ * S7: the victim opens a dual-funded (v2) channel and dies inside the
+ * open, around the temporary to permanent id promotion (matrix row 10).
+ * The interactive session is process-local by design; the disk must hold
+ * either nothing or exactly one row under the PERMANENT id, never a
+ * half-promoted orphan. Local mode only: quorum refuses v2 opens
+ * outright (see the phase 6 v2 decision), which the splice suite asserts
+ * separately.
+ */
+export function s7OpensV2(): IChaosScenario {
+	return {
+		name: 'S7 v2 open',
+		setup(env: IChaosEnv): void {
+			void env;
+		},
+		async run(env: IChaosEnv): Promise<void> {
+			const channel = env.victim.openChannelV2(env.peers[0].getNodeId(), {
+				fundingSatoshis: 150_000n,
+				fundingFeeratePerkw: 1000
+			});
+			env.scratch.tempId = channel.getTemporaryChannelId().toString('hex');
+			await chaosWait(
+				env,
+				() =>
+					channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+					env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
+			env.scratch.permanentId = channel.getChannelId()?.toString('hex');
+		},
+		probe(): void {
+			// Cell-dependent verdicts; the sweep supplies its own assertions.
+		}
+	};
+}
+
 export function s4SplicesIn(): IChaosScenario {
 	return {
 		name: 'S4 splice-in',

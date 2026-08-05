@@ -26,8 +26,13 @@
 
 import { expect } from 'chai';
 import { QUORUM_NO_DUAL_FUND_REFUSAL } from '../../src/lightning/channel/channel-manager';
+import crypto from 'crypto';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import * as bitcoin from 'bitcoinjs-lib';
 import { ChannelState } from '../../src/lightning/channel/types';
+import { IFundingProvider } from '../../src/lightning/node/types';
 import {
+	IChaosEnvOptions,
 	makeChaosEnv,
 	recordSchedule,
 	runKillPoint,
@@ -36,9 +41,35 @@ import {
 import { quorumOptions, withNamespace } from './helpers/chaos-quorum';
 import {
 	CHAOS_ENV,
+	makeChaosSpliceWallet,
 	s1aSenderPays,
-	s4SplicesIn
+	s4SplicesIn,
+	s7OpensV2
 } from './helpers/chaos-scenarios';
+
+bitcoin.initEccLib(ecc);
+
+/**
+ * A v2 opener funds through the provider's splice-input surface; the
+ * deterministic chaos wallet input serves, and v1 funding must never run.
+ */
+function v2FundingProvider(): IFundingProvider {
+	const wallet = makeChaosSpliceWallet(250_000n);
+	const changeScript = bitcoin.payments.p2wpkh({
+		hash: crypto.randomBytes(20)
+	}).output!;
+	return {
+		buildFundingTransaction: async () => {
+			throw new Error('v1 funding must not run for a v2 open');
+		},
+		broadcastTransaction: async (txHex: string) =>
+			bitcoin.Transaction.fromHex(txHex).getId(),
+		selectSpliceInputs: async () => ({
+			inputs: [wallet.walletInput],
+			changeScript
+		})
+	};
+}
 
 describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 	it('quorum mode refuses a new v2 open before any side effect, so the promotion row has no reachable kill points there', async function () {
@@ -174,5 +205,67 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		// stopped testing the row.
 		expect(abandoned, 'cells that abandoned').to.be.at.least(1);
 		expect(resumed, 'cells that resumed').to.be.at.least(1);
+	});
+
+	it('S7 v2 open: no boundary leaves an orphan temporary row (matrix row 10)', async function () {
+		this.timeout(300_000);
+		const V2_ENV: IChaosEnvOptions = {
+			...CHAOS_ENV,
+			victimExtrasFactory: () => ({ fundingProvider: v2FundingProvider() })
+		};
+		const { schedule } = await recordSchedule('local', s7OpensV2, V2_ENV);
+		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
+		let abandonedCells = 0;
+		let promotedCells = 0;
+		for (const label of schedule) {
+			const result = await runKillPoint('local', s7OpensV2, label, V2_ENV);
+			const at = `at ${label}`;
+			for (let i = 0; i < 10; i++) await settle();
+			const rows = result.restoredStorage.loadAllChannels();
+			const tempId = result.env.scratch.tempId as string;
+			expect(
+				rows.every((row) => row.channelId !== tempId),
+				`no orphan temporary row ${at}`
+			).to.equal(true);
+			expect(rows.length, `at most one channel row ${at}`).to.be.at.most(1);
+			if (rows.length === 0) {
+				// Nothing durable: the open is abandoned wholesale and the
+				// restart carries no debris.
+				abandonedCells++;
+				expect(
+					result.restored.getChannelManager().listChannels().length,
+					`clean restart after abandon ${at}`
+				).to.equal(0);
+			} else {
+				// The promotion committed: exactly one row, under the
+				// permanent id, and the restart loads it into one of the
+				// three legitimate shapes. Once our tx_signatures went out,
+				// the exchange resumes over reestablish next_funding and the
+				// open completes (AWAITING_FUNDING_CONFIRMED). Before that,
+				// the interactive session is process-local by design, so the
+				// restored row either waits (AWAITING_TX_SIGNATURES; making
+				// that window resumable is the already-filed #288/#289
+				// follow-up, and nothing is broadcastable from it) or was
+				// closed out as bookkeeping (FORCE_CLOSED, with no funding
+				// transaction in existence to have broadcast).
+				promotedCells++;
+				const restoredStates = result.restored
+					.getChannelManager()
+					.listChannels()
+					.map((c) => c.getState());
+				expect(restoredStates.length, `one restored channel ${at}`).to.equal(1);
+				expect(
+					[
+						ChannelState.AWAITING_TX_SIGNATURES,
+						ChannelState.AWAITING_FUNDING_CONFIRMED,
+						ChannelState.FORCE_CLOSED
+					],
+					`restored shape is one of the three legitimate ones ${at}`
+				).to.include(restoredStates[0]);
+			}
+			result.destroyAll();
+		}
+		expect(abandonedCells, 'cells that abandoned').to.be.at.least(1);
+		expect(promotedCells, 'cells that promoted').to.be.at.least(1);
 	});
 });
