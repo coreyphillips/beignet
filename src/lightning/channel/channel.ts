@@ -80,6 +80,7 @@ import {
 	IChannelState,
 	IRemoteForwardingPolicy,
 	ISpliceInFlight,
+	IV2InFlight,
 	createOpenerState,
 	createAcceptorState,
 	mustNotBroadcastCommitment,
@@ -427,9 +428,11 @@ export class Channel {
 	private _spliceReceivedCommitment = false;
 	// BOLT 2 v2 establishment: after both tx_completes the peers exchange
 	// commitment_signed for commitment #0 of the new funding output, and only
-	// then tx_signatures (lower-total-input-sats side first). In-memory only:
-	// a disconnect mid-open aborts the v2 open entirely (the manager errors
-	// v2 channels on peer disconnect), so nothing here must survive a restart.
+	// then tx_signatures (lower-total-input-sats side first). Process-local
+	// mirrors of the durable v2InFlight record: once our commitment_signed
+	// leaves, the open must survive disconnect AND restart (BOLT 2 requires
+	// the exchange to resume over channel_reestablish.next_funding), and
+	// restoreV2InFlight rebuilds these flags from the record.
 	private _v2SentCommitment = false;
 	private _v2ReceivedCommitment = false;
 	/**
@@ -1676,6 +1679,10 @@ export class Channel {
 
 		if (this._state.remoteChannelReady) {
 			this._state.state = ChannelState.NORMAL;
+			// The peer's channel_ready means it holds the complete funding tx,
+			// so the v2 opening record has nothing left to resume or retransmit
+			// (the funding tx itself stays in pendingFundingTxHex until depth).
+			this._state.v2InFlight = null;
 			return [
 				sendMsg(MessageType.CHANNEL_READY, encodeChannelReadyMessage(msg)),
 				{
@@ -1743,6 +1750,9 @@ export class Channel {
 
 		if (this._state.localChannelReady) {
 			this._state.state = ChannelState.NORMAL;
+			// Mirror of fundingConfirmed: the peer's channel_ready means the v2
+			// opening record has nothing left to resume or retransmit.
+			this._state.v2InFlight = null;
 			return [
 				{
 					type: ChannelActionType.CHANNEL_READY,
@@ -10778,6 +10788,113 @@ export class Channel {
 	}
 
 	/**
+	 * Compute the tx-input indices we own (BOLT 2: initiator uses even serial
+	 * ids, the acceptor odd) and, when the wallet contribution closures are
+	 * live, sign each of our inputs over the negotiated tx (BIP 341: P2TR
+	 * closures sign over ALL prevouts; P2WPKH closures ignore the extra
+	 * argument). Witnesses are applied to built.tx in place. With no
+	 * contribution registered the witness list is empty: either we own no
+	 * inputs (a complete answer) or the caller drives sendTxSignatures itself
+	 * (the witnesses are recorded when they are released). Returns null when a
+	 * prevout cannot be resolved or a contributed input has no closure —
+	 * nothing must be signed or recorded in that case.
+	 */
+	private _signV2ContributionWitnesses(built: {
+		tx: import('bitcoinjs-lib').Transaction;
+		outputIndex: number;
+	}): { witnesses: Buffer[][]; indices: number[] } | null {
+		const session = this._state.dualFundingSession;
+		const builder = session?.getTxBuilder();
+		if (!session || !builder) return null;
+		const sorted = [...builder.getInputs()].sort((a, b) =>
+			a.serialId < b.serialId ? -1 : 1
+		);
+		if (sorted.length !== built.tx.ins.length) return null;
+		const indices: number[] = [];
+		for (let i = 0; i < sorted.length; i++) {
+			if ((sorted[i].serialId % 2n === 0n) === session.isInitiator()) {
+				indices.push(i);
+			}
+		}
+		const c = this._dualFundingContribution;
+		if (!c) return { witnesses: [], indices };
+		const prevouts = this._collectPrevouts(built.tx, sorted);
+		if (!prevouts) return null;
+		const witnesses: Buffer[][] = [];
+		for (const i of indices) {
+			const prevTxid = Buffer.from(built.tx.ins[i].hash);
+			const vout = built.tx.ins[i].index;
+			const w = c.inputs.find(
+				(wi) =>
+					extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+					wi.prevOutputIndex === vout
+			);
+			if (!w) return null;
+			const witness = w.signWitness(built.tx, i, w.value, prevouts);
+			built.tx.setWitness(i, witness);
+			witnesses.push(witness);
+		}
+		return { witnesses, indices };
+	}
+
+	/**
+	 * Create or patch the durable v2 open record. Created at the point of no
+	 * return — our initial commitment_signed is about to leave — from the LIVE
+	 * session and interactive-tx builder: the negotiated tx, the tx_signatures
+	 * ordering and our wallet witnesses cannot be recomputed after a restart,
+	 * so everything resumption needs is captured here, and our inputs are
+	 * signed NOW while the wallet closures are live (they still only LEAVE
+	 * under the commitment-round and ordering gates of _maybeSendV2TxSigs).
+	 * Later calls patch the existing record; restored (builder-less) sessions
+	 * only ever patch.
+	 */
+	private _syncV2InFlight(changes: Partial<IV2InFlight>): void {
+		if (!this._state.v2InFlight) {
+			const session = this._state.dualFundingSession;
+			if (!session) return;
+			const built = this._v2NegotiatedTx();
+			if (!built) return;
+			const signed = this._signV2ContributionWitnesses(built);
+			if (!signed) return;
+			const params = session.getLocalParams();
+			this._state.v2InFlight = {
+				fundingTxid: Buffer.from(built.tx.getHash()),
+				fundingOutputIndex: built.outputIndex,
+				// The signing pass above applied our witnesses to built.tx.
+				fundingTxHex: built.tx.toHex(),
+				fullySigned: false,
+				isInitiator: session.isInitiator(),
+				localContributionSats: params?.fundingSatoshis ?? 0n,
+				remoteContributionSats: session.getRemoteFundingSatoshis(),
+				fundingFeeratePerkw:
+					params?.fundingFeeratePerkw ??
+					session.getOpenMsg()?.fundingFeeratePerkw ??
+					0,
+				weSignFirst: this._v2ShouldSignFirst(),
+				ourWitnesses: signed.witnesses,
+				ourWalletInputIndices: signed.indices,
+				remoteCommitmentSig: null,
+				sentTxSignatures: false,
+				receivedTxSignatures: false,
+				rbfAttempt: session.getRbfCount()
+			};
+		}
+		Object.assign(this._state.v2InFlight, changes);
+	}
+
+	/**
+	 * Reset the process-local v2 open driver: an accepted RBF renegotiation,
+	 * an abort, or the drop of an unresumable session starts the commitment
+	 * and tx_signatures round over (or ends it) with no stale releases.
+	 */
+	private _resetV2Driver(): void {
+		this._v2SentCommitment = false;
+		this._v2ReceivedCommitment = false;
+		this._v2PendingTxSigs = null;
+		this._v2TxSigsReleased = false;
+	}
+
+	/**
 	 * Send our commitment_signed for the peer's commitment #0 once both sides
 	 * have sent tx_complete (BOLT 2 v2 establishment: the commitment_signed
 	 * exchange precedes tx_signatures). Idempotent.
@@ -10828,6 +10945,11 @@ export class Channel {
 			0n
 		);
 		this._v2SentCommitment = true;
+		// Point of no return (BOLT 2): from here the peer holds our signature
+		// and the open must survive disconnect and restart, resuming over
+		// channel_reestablish.next_funding. Record everything resumption needs
+		// while the builder and wallet closures are live, before the persist.
+		this._syncV2InFlight({});
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature,
@@ -10889,6 +11011,7 @@ export class Channel {
 		this._state.lastSignedCommitLeaseBlockheight =
 			getLocalCommitmentLeaseBlockheight(this._state);
 		this._v2ReceivedCommitment = true;
+		this._syncV2InFlight({ remoteCommitmentSig: Buffer.from(msg.signature) });
 		actions.push({ type: ChannelActionType.PERSIST_STATE });
 		// Commitment round complete — release tx_signatures if ordering allows.
 		actions.push(...this._maybeSendV2TxSigs());
@@ -10947,38 +11070,36 @@ export class Channel {
 		const peerSigned = session.getRemoteWitnesses() !== null;
 		if (!peerSigned && !this._v2ShouldSignFirst()) return [];
 
-		if (!this._v2PendingTxSigs && this._dualFundingContribution) {
-			// We contributed wallet inputs (acceptor lease share): sign each via
-			// its wallet closure over the negotiated tx, exactly like splice-in
-			// (buildAndSignSpliceTx), and release them as our tx_signatures.
-			const built = this._v2NegotiatedTx();
-			if (!built) return [];
-			// BIP 341: P2TR wallet inputs sign over ALL prevouts; P2WPKH
-			// closures ignore the extra argument.
-			const prevouts = this._collectPrevouts(
-				built.tx,
-				session.getTxBuilder()?.getInputs() ?? []
-			);
-			if (!prevouts) return [];
-			const witnesses: Buffer[][] = [];
-			for (let i = 0; i < built.tx.ins.length; i++) {
-				const prevTxid = Buffer.from(built.tx.ins[i].hash);
-				const vout = built.tx.ins[i].index;
-				const w = this._dualFundingContribution.inputs.find(
-					(wi) =>
-						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
-						wi.prevOutputIndex === vout
-				);
-				if (!w) continue;
-				const witness = w.signWitness(built.tx, i, w.value, prevouts);
-				built.tx.setWitness(i, witness);
-				witnesses.push(witness);
+		if (!this._v2PendingTxSigs) {
+			const record = this._state.v2InFlight;
+			if (
+				record &&
+				record.ourWitnesses.length === record.ourWalletInputIndices.length
+			) {
+				// The record was created at the commitment point with our inputs
+				// already signed (or with none to sign): release those witnesses
+				// verbatim. Empty witnesses beside non-empty indices mean the
+				// caller-driven flow still owes them — fall through and wait.
+				this._v2PendingTxSigs = {
+					txid: Buffer.from(record.fundingTxid),
+					outputIndex: record.fundingOutputIndex,
+					witnesses: record.ourWitnesses.map((w) =>
+						w.map((b) => Buffer.from(b))
+					)
+				};
+			} else if (!record && this._dualFundingContribution) {
+				// No record yet (legacy path): sign our wallet inputs over the
+				// negotiated tx via their closures, exactly like splice-in.
+				const built = this._v2NegotiatedTx();
+				if (!built) return [];
+				const signed = this._signV2ContributionWitnesses(built);
+				if (!signed) return [];
+				this._v2PendingTxSigs = {
+					txid: Buffer.from(built.tx.getHash()),
+					outputIndex: built.outputIndex,
+					witnesses: signed.witnesses
+				};
 			}
-			this._v2PendingTxSigs = {
-				txid: Buffer.from(built.tx.getHash()),
-				outputIndex: built.outputIndex,
-				witnesses
-			};
 		}
 
 		// A side that contributed no inputs has nothing to sign: auto-fill an
@@ -11010,6 +11131,12 @@ export class Channel {
 		}
 		this._v2PendingTxSigs = null;
 		this._v2TxSigsReleased = true;
+		// Record the release, and the witnesses that actually left (the
+		// caller-driven flow only provides them now).
+		this._syncV2InFlight({
+			sentTxSignatures: true,
+			ourWitnesses: witnesses.map((w) => w.map((b) => Buffer.from(b)))
+		});
 
 		// Funding info was already set when the commitment round started; keep
 		// the assignment idempotent for callers that reached here another way.
@@ -11207,6 +11334,12 @@ export class Channel {
 			];
 		}
 
+		// Duplicate tx_signatures (retransmitted after a reconnect) when we are
+		// already fully signed: benign no-op, mirroring the splice branch.
+		if (this._state.v2InFlight?.receivedTxSignatures) {
+			return [];
+		}
+
 		// BOLT 2 v2: tx_signatures MUST NOT be exchanged before the
 		// commitment_signed round completes. Without this gate the old path
 		// reached AWAITING_FUNDING_CONFIRMED with no commitment signature at
@@ -11245,23 +11378,35 @@ export class Channel {
 
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			// Both witness sets are in hand: record the fully-signed funding tx
+			// for EVERY role — a restart (or a guardian restore) must be able to
+			// rebroadcast it, and the record answers a peer that still asks for
+			// our tx_signatures over reestablish. Persist BEFORE any broadcast.
+			const assembled = this._assembleV2FundingTx();
+			if (assembled) {
+				this._state.pendingFundingTxHex = assembled.toString('hex');
+				this._syncV2InFlight({
+					receivedTxSignatures: true,
+					fullySigned: true,
+					fundingTxHex: assembled.toString('hex')
+				});
+			} else {
+				this._syncV2InFlight({ receivedTxSignatures: true });
+			}
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 			// When WE contributed inputs (lease selling) both witness sets are
 			// now in hand: assemble and broadcast the funding tx ourselves
 			// (mirrors the splice path; the opener usually broadcasts too, and
 			// a duplicate broadcast is harmless).
-			if (this._dualFundingContribution) {
-				const assembled = this._assembleV2FundingTx();
-				if (assembled) {
-					// Same reason as the splice above: once our own
-					// tx_signatures have been released this batch has nothing
-					// barrier-class left to hold it.
-					actions.push({
-						type: ChannelActionType.BROADCAST_TX,
-						tx: assembled,
-						fundingCritical: true
-					});
-				}
+			if (assembled && this._dualFundingContribution) {
+				// Same reason as the splice above: once our own
+				// tx_signatures have been released this batch has nothing
+				// barrier-class left to hold it.
+				actions.push({
+					type: ChannelActionType.BROADCAST_TX,
+					tx: assembled,
+					fundingCritical: true
+				});
 			}
 			// Zero-conf v2: channel_ready right behind tx_signatures, mirroring
 			// the v1 fast-tracks on funding_signed.
@@ -11325,41 +11470,85 @@ export class Channel {
 	}
 
 	/**
-	 * Assemble the fully-signed v2 funding tx: our wallet witnesses (re-signed
-	 * via the wallet closures) on our inputs, the peer's tx_signatures
-	 * witnesses on theirs (both in ascending-serial input order).
+	 * Assemble the fully-signed v2 funding tx: our witnesses on our inputs
+	 * (signed via the live wallet closures, or replayed from the in-flight
+	 * record after a restart), the peer's tx_signatures witnesses on theirs
+	 * (both in ascending-serial input order). A side that contributed no
+	 * inputs assembles too — every role must be able to (re)broadcast.
 	 */
 	private _assembleV2FundingTx(): Buffer | null {
 		const session = this._state.dualFundingSession;
-		const c = this._dualFundingContribution;
-		if (!session || !c) return null;
+		if (!session) return null;
+		const remote = session.getRemoteWitnesses();
+		if (!remote) return null;
+		const record = this._state.v2InFlight;
+		const builder = session.getTxBuilder();
+		if (!builder) {
+			// Restored (builder-less) session: the negotiated tx and our
+			// witnesses come from the durable record; no wallet closures are
+			// needed or available. No re-signing — the stored witnesses were
+			// produced over this exact transaction.
+			if (!record) return null;
+			if (record.ourWitnesses.length !== record.ourWalletInputIndices.length) {
+				return null;
+			}
+			const bitcoin = require('bitcoinjs-lib');
+			let tx: import('bitcoinjs-lib').Transaction;
+			try {
+				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+			} catch {
+				return null;
+			}
+			let r = 0;
+			for (let i = 0; i < tx.ins.length; i++) {
+				const pos = record.ourWalletInputIndices.indexOf(i);
+				if (pos >= 0) {
+					tx.setWitness(i, record.ourWitnesses[pos]);
+				} else {
+					if (r >= remote.length) return null;
+					tx.setWitness(i, remote[r++]);
+				}
+			}
+			return tx.toBuffer();
+		}
 		const built = this._v2NegotiatedTx();
 		if (!built) return null;
-		const builder = session.getTxBuilder();
-		if (!builder) return null;
 		const sorted = [...builder.getInputs()].sort((a, b) =>
 			a.serialId < b.serialId ? -1 : 1
 		);
 		if (sorted.length !== built.tx.ins.length) return null;
+		const c = this._dualFundingContribution;
 		// BIP 341: P2TR wallet inputs sign over ALL prevouts.
-		const prevouts = this._collectPrevouts(built.tx, sorted);
-		if (!prevouts) return null;
-		const remote = session.getRemoteWitnesses() ?? [];
+		const prevouts = c ? this._collectPrevouts(built.tx, sorted) : null;
+		if (c && !prevouts) return null;
 		let r = 0;
 		for (let i = 0; i < built.tx.ins.length; i++) {
 			// BOLT 2: initiator uses even serial ids, the acceptor odd.
 			const ourInput =
 				(sorted[i].serialId % 2n === 0n) === session.isInitiator();
 			if (ourInput) {
-				const prevTxid = Buffer.from(built.tx.ins[i].hash);
-				const vout = built.tx.ins[i].index;
-				const w = c.inputs.find(
-					(wi) =>
-						extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
-						wi.prevOutputIndex === vout
-				);
-				if (!w) return null;
-				built.tx.setWitness(i, w.signWitness(built.tx, i, w.value, prevouts));
+				if (c) {
+					const prevTxid = Buffer.from(built.tx.ins[i].hash);
+					const vout = built.tx.ins[i].index;
+					const w = c.inputs.find(
+						(wi) =>
+							extractTxidFromPrevTx(wi.prevTx).equals(prevTxid) &&
+							wi.prevOutputIndex === vout
+					);
+					if (!w) return null;
+					built.tx.setWitness(
+						i,
+						w.signWitness(built.tx, i, w.value, prevouts!)
+					);
+				} else if (record) {
+					// Caller-driven flow: the witnesses that left as our
+					// tx_signatures were recorded at release.
+					const pos = record.ourWalletInputIndices.indexOf(i);
+					if (pos < 0 || !record.ourWitnesses[pos]) return null;
+					built.tx.setWitness(i, record.ourWitnesses[pos]);
+				} else {
+					return null;
+				}
 			} else {
 				if (r >= remote.length) return null;
 				built.tx.setWitness(i, remote[r++]);
@@ -11407,6 +11596,27 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
 			];
 		}
+		// Once our tx_signatures have been released the peer can complete and
+		// broadcast this attempt; only one attempt is tracked, so replacing it
+		// now would orphan a funding tx the peer may still broadcast.
+		if (this._state.v2InFlight?.sentTxSignatures) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot RBF a v2 open after tx_signatures were released'
+				}
+			];
+		}
+		// A restored (builder-less) session cannot renegotiate: the wallet
+		// contribution closures did not survive the restart.
+		if (!session.getTxBuilder()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot RBF a v2 open restored after a restart'
+				}
+			];
+		}
 
 		const result = session.initiateRbf(newFeeratePerkw, newLocktime);
 		if (!result.ok) {
@@ -11419,6 +11629,11 @@ export class Channel {
 		}
 
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
+		// The in-flight record is per-attempt: the renegotiation replaces the
+		// negotiated tx, and the new round records itself at its own
+		// commitment_signed. The commitment/tx_signatures driver resets with it.
+		this._state.v2InFlight = null;
+		this._resetV2Driver();
 
 		const msg: ITxInitRbfMessage = {
 			channelId: this._v2ChannelId(),
@@ -11426,7 +11641,10 @@ export class Channel {
 			feerate: newFeeratePerkw
 		};
 
-		return [sendMsg(MessageType.TX_INIT_RBF, encodeTxInitRbfMessage(msg))];
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			sendMsg(MessageType.TX_INIT_RBF, encodeTxInitRbfMessage(msg))
+		];
 	}
 
 	/**
@@ -11464,6 +11682,27 @@ export class Channel {
 				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
 			];
 		}
+		// BOLT 2: a node MUST NOT send tx_init_rbf once it has received our
+		// tx_signatures; only one attempt is tracked here, and the released
+		// witnesses let anyone who saw them broadcast attempt N.
+		if (this._state.v2InFlight?.sentTxSignatures) {
+			return [
+				this._txAbort(
+					this._v2ChannelId(),
+					'RBF after tx_signatures not supported'
+				)
+			];
+		}
+		// A restored (builder-less) session cannot renegotiate: the wallet
+		// contribution closures did not survive the restart.
+		if (!session.getTxBuilder()) {
+			return [
+				this._txAbort(
+					this._v2ChannelId(),
+					'cannot RBF a v2 open restored after a restart'
+				)
+			];
+		}
 
 		const result = session.handleRbf(msg.feerate, msg.locktime);
 		if (!result.ok) {
@@ -11482,9 +11721,15 @@ export class Channel {
 		}
 
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
+		// Per-attempt record: the accepted renegotiation replaces the
+		// negotiated tx; the new round records itself at its own
+		// commitment_signed. The commitment/tx_signatures driver resets with it.
+		this._state.v2InFlight = null;
+		this._resetV2Driver();
 
 		// Send tx_ack_rbf
 		return [
+			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(
 				MessageType.TX_ACK_RBF,
 				encodeTxAckRbfMessage({
@@ -11507,11 +11752,28 @@ export class Channel {
 				}
 			];
 		}
+		// BOLT 2: a node MUST NOT send tx_abort after transmitting
+		// tx_signatures — the peer can complete and broadcast the funding tx.
+		if (this._state.v2InFlight?.sentTxSignatures) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot abort a v2 open after tx_signatures were released'
+				}
+			];
+		}
 
 		session.abort();
+		const hadRecord = !!this._state.v2InFlight;
+		this._state.v2InFlight = null;
+		this._resetV2Driver();
 		this._state.state = ChannelState.ERRORED;
 
-		return [this._txAbort(this._v2ChannelId(), reason)];
+		const actions: ChannelAction[] = hadRecord
+			? [{ type: ChannelActionType.PERSIST_STATE }]
+			: [];
+		actions.push(this._txAbort(this._v2ChannelId(), reason));
+		return actions;
 	}
 
 	/**
@@ -11580,11 +11842,28 @@ export class Channel {
 			return [];
 		}
 
+		// BOLT 2: our tx_signatures already left, so the peer (or anyone who
+		// saw the witnesses) can still broadcast the funding transaction; a
+		// node MUST NOT forget the channel until its inputs are spent. Echo
+		// the abort as the ack, but keep the record, the state and the watch.
+		if (this._state.v2InFlight?.sentTxSignatures) {
+			return [this._txAbort(this._v2ChannelId())];
+		}
+
 		session.abort();
+		const hadRecord = !!this._state.v2InFlight;
+		this._state.v2InFlight = null;
+		this._resetV2Driver();
 		this._state.state = ChannelState.ERRORED;
 		// Echo the tx_abort (BOLT 2 ack) — we had an active session and had not
-		// sent tx_abort ourselves.
-		return [this._txAbort(this._v2ChannelId())];
+		// sent tx_abort ourselves. A record meant the open had already been
+		// persisted: persist the unwind too, or a restart would resume a round
+		// the peer has aborted.
+		const actions: ChannelAction[] = hadRecord
+			? [{ type: ChannelActionType.PERSIST_STATE }]
+			: [];
+		actions.push(this._txAbort(this._v2ChannelId()));
+		return actions;
 	}
 }
 

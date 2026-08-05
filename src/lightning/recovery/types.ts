@@ -75,7 +75,8 @@ export type RecoveryDurability = 'local' | 'async-remote' | 'quorum';
  * The spec's `splice_state` variant is deliberately absent: splice state
  * (`spliceInFlight`, `spliceHistory`) lives inside IChannelState and is
  * already covered by `channel_state`, so a separate variant could only
- * introduce a second, divergent copy.
+ * introduce a second, divergent copy. The same holds for the v2 opening
+ * record (`v2InFlight`).
  */
 export type RecoveryMutation =
 	| {
