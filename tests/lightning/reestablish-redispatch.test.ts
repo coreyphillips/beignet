@@ -17,6 +17,15 @@
  *
  * Found by the phase 7 chaos matrix (S1b post-commit:6 through
  * pre-commit:10, S3 likewise); these are the minimal standalone shapes.
+ *
+ * The repair fires on its OWN one-shot event, armed when a channel is
+ * restored from persistence, never on 'channel:ready' and never for a
+ * channel that stayed live. An ordinary TCP disconnect also puts a live
+ * channel into AWAITING_REESTABLISH, and the repair is not idempotent
+ * against node state that never went away: re-offering an already
+ * accumulated inbound MPP part would count its amount twice, so a payer
+ * could cycle the connection until the set reached its declared total
+ * having sent less. The last two tests here are that boundary.
  */
 
 import { expect } from 'chai';
@@ -131,20 +140,56 @@ function sealableStorage(
 	}) as IStorageBackend;
 }
 
-/** Event-relay wire with a dead switch: dead = the victim's process is gone. */
+interface IWireGate {
+	hold: boolean;
+	queue: Array<{ to: LightningNode; from: string; type: number; p: Buffer }>;
+}
+
+/**
+ * Event-relay wire with a dead switch (dead = the victim's process is gone)
+ * and an optional hold gate. A real connection delivers BOTH
+ * channel_reestablish messages before any response they trigger, so a
+ * reconnect holds the wire and drains it in order.
+ */
 function wire(
 	a: LightningNode,
 	b: LightningNode,
-	dead: { val: boolean }
+	dead: { val: boolean },
+	gate?: IWireGate
 ): void {
-	a.on('message:outbound', (pk: string, t: number, p: Buffer) => {
-		if (dead.val) return;
-		if (pk === b.getNodeId()) b.handlePeerMessage(a.getNodeId(), t, p);
-	});
-	b.on('message:outbound', (pk: string, t: number, p: Buffer) => {
-		if (dead.val) return;
-		if (pk === a.getNodeId()) a.handlePeerMessage(b.getNodeId(), t, p);
-	});
+	const route = (from: LightningNode, to: LightningNode): void => {
+		from.on('message:outbound', (pk: string, t: number, p: Buffer) => {
+			if (dead.val) return;
+			if (pk !== to.getNodeId()) return;
+			if (gate?.hold) {
+				gate.queue.push({ to, from: from.getNodeId(), type: t, p });
+				return;
+			}
+			to.handlePeerMessage(from.getNodeId(), t, p);
+		});
+	};
+	route(a, b);
+	route(b, a);
+}
+
+/** One full disconnect/reconnect cycle on two LIVE nodes. */
+async function cycleConnection(
+	a: LightningNode,
+	b: LightningNode,
+	gate: IWireGate
+): Promise<void> {
+	a.getChannelManager().handlePeerDisconnected(b.getNodeId());
+	b.getChannelManager().handlePeerDisconnected(a.getNodeId());
+	await settle();
+	gate.hold = true;
+	a.getChannelManager().handlePeerReconnected(b.getNodeId());
+	b.getChannelManager().handlePeerReconnected(a.getNodeId());
+	while (gate.queue.length > 0) {
+		const m = gate.queue.shift()!;
+		m.to.handlePeerMessage(m.from, m.type, m.p);
+	}
+	gate.hold = false;
+	await settle();
 }
 
 function openReadyChannel(
@@ -442,6 +487,151 @@ describe('Reestablish re-dispatches committed-but-unresolved received HTLCs', ()
 		).to.equal(0);
 
 		restarted.destroy();
+		alice.destroy();
+	});
+
+	it('a live reconnect does NOT re-run the repair (the restart-only boundary)', async function () {
+		this.timeout(20_000);
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		// Count the repair ITSELF, not the event that drives it, so this bites
+		// against any implementation that reaches it by another route.
+		let repairs = 0;
+		const holder = bob as unknown as {
+			redispatchUnresolvedReceivedHtlcs: (channelId: Buffer) => void;
+		};
+		const realRepair = holder.redispatchUnresolvedReceivedHtlcs.bind(bob);
+		holder.redispatchUnresolvedReceivedHtlcs = (channelId: Buffer): void => {
+			repairs++;
+			realRepair(channelId);
+		};
+
+		// Two full disconnect/reconnect cycles on nodes that never restarted.
+		for (let i = 0; i < 2; i++) await cycleConnection(alice, bob, gate);
+
+		expect(
+			repairs,
+			'a channel that never left this process is never repaired'
+		).to.equal(0);
+		expect(
+			bob.getChannelManager().listChannels()[0].getState(),
+			'the channel reestablished normally'
+		).to.equal(ChannelState.NORMAL);
+
+		bob.destroy();
+		alice.destroy();
+	});
+
+	it('an accumulated MPP part is never counted twice across a live reconnect', async function () {
+		this.timeout(20_000);
+		// The vulnerability this boundary exists for: one 60k part of a 100k
+		// invoice, then the payer cycles the connection. If the repair ran on
+		// a live reconnect, the same HTLC would be accumulated again, the set
+		// would sum to 120k, cross its declared total and reveal the preimage
+		// for 60k of real money.
+		const alice = createNode(ALICE_SEED);
+		const bob = createNode(BOB_SEED);
+		const dead = { val: false };
+		const gate: IWireGate = { hold: false, queue: [] };
+		wire(alice, bob, dead, gate);
+		const channelId = openReadyChannel(alice, bob);
+		buildDirectGraph(alice, ALICE_SEED, BOB_SEED);
+
+		const invoice = bob.createInvoice({
+			amountMsat: 100_000n,
+			description: 'mpp reconnect'
+		});
+		const scid = encodeShortChannelId({
+			block: 500,
+			txIndex: 1,
+			outputIndex: 0
+		});
+		const finalCltv = (
+			alice as unknown as { paddedFinalCltvExpiry: () => number }
+		).paddedFinalCltvExpiry();
+
+		// One part: 60k of a declared 100k total.
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: scid,
+						amountToForwardMsat: 60_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+
+		const hashHex = invoice.paymentHash.toString('hex');
+		const pendingMpp = (
+			bob as unknown as {
+				pendingMppPayments: Map<string, { receivedParts: unknown[] }>;
+			}
+		).pendingMppPayments;
+		expect(
+			pendingMpp.get(hashHex)?.receivedParts.length,
+			'exactly one part accumulated'
+		).to.equal(1);
+		const settledBefore = alice.getPayment(invoice.paymentHash)!.status;
+		expect(settledBefore, 'payer still pending').to.equal(
+			PaymentStatus.PENDING
+		);
+
+		// Cycle the connection twice.
+		for (let i = 0; i < 2; i++) await cycleConnection(alice, bob, gate);
+
+		expect(
+			pendingMpp.get(hashHex)?.receivedParts.length,
+			'the part was not accumulated again'
+		).to.equal(1);
+		expect(
+			alice.getPayment(invoice.paymentHash)!.status,
+			'no preimage was revealed for an underpaid set'
+		).to.equal(PaymentStatus.PENDING);
+		const htlcs = bob
+			.getChannelManager()
+			.getChannel(channelId)!
+			.getFullState().htlcs;
+		expect(htlcs.size, 'the single real HTLC is still unresolved').to.equal(1);
+
+		// The genuine remaining 40k completes the set exactly once.
+		let received = 0;
+		bob.on('payment:received', () => {
+			received++;
+		});
+		alice.sendPaymentToRoute(
+			{
+				hops: [
+					{
+						pubkey: Buffer.from(bob.getNodeId(), 'hex'),
+						shortChannelId: scid,
+						amountToForwardMsat: 40_000n,
+						outgoingCltvValue: finalCltv
+					}
+				]
+			},
+			invoice.paymentHash,
+			finalCltv,
+			invoice.paymentSecret,
+			100_000n
+		);
+		await settle();
+		expect(received, 'the set settled exactly once').to.equal(1);
+
+		bob.destroy();
 		alice.destroy();
 	});
 });

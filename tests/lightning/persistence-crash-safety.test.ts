@@ -1066,12 +1066,15 @@ describe('Crash-Safe State Persistence', function () {
 
 		// A restored channel comes back in AWAITING_REESTABLISH and can send
 		// nothing. Stand in for a completed reconnect: put it back in NORMAL and
-		// fire the channel:ready the reestablish would have produced.
+		// fire the one-shot restore event the reestablish would have produced
+		// for a channel loaded from persistence. Deliberately not
+		// 'channel:ready', which a LIVE channel also reaches: the repair must
+		// never run for a channel that never left the process.
 		function reconnect(node: LightningNode, channelId: Buffer): void {
 			const channel = node.getChannelManager().getChannel(channelId);
 			expect(channel, 'expected the channel to have been restored').to.exist;
 			channel!.getFullState().state = ChannelState.NORMAL;
-			node.getChannelManager().emit('channel:ready', channelId);
+			node.getChannelManager().emit('channel:restore-ready', channelId);
 		}
 
 		function receivedHtlcState(
@@ -1381,12 +1384,12 @@ describe('Crash-Safe State Persistence', function () {
 
 	describe('BOLT 12 receive authentication across restart', function () {
 		// Stand in for a completed reconnect on a restored channel: put it back
-		// in NORMAL and fire the channel:ready the reestablish would produce.
+		// in NORMAL and fire the restore event the reestablish would produce.
 		function reconnect(node: LightningNode, channelId: Buffer): void {
 			const channel = node.getChannelManager().getChannel(channelId);
 			expect(channel, 'expected the channel to have been restored').to.exist;
 			channel!.getFullState().state = ChannelState.NORMAL;
-			node.getChannelManager().emit('channel:ready', channelId);
+			node.getChannelManager().emit('channel:restore-ready', channelId);
 		}
 
 		it('restores the expected path_id and settles a post-restart payment over the invoice path', function () {

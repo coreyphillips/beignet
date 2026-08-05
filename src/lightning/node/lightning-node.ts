@@ -1588,14 +1588,22 @@ export class LightningNode extends EventEmitter {
 	 * Anything whose resolution IS durable is skipped, so this is a repair pass
 	 * rather than a second dispatch.
 	 *
-	 * Driven from channel:ready rather than from restoreFromStorage, because a
-	 * just-restored channel is in AWAITING_REESTABLISH and can send nothing: both
-	 * the onward add and the fail-back would be refused for wrong state. Every
-	 * channel passes through channel:ready once reestablish completes; the
-	 * CHANNEL_READY action supplies it only when channel_ready itself is
-	 * retransmitted (a channel on its first commitment round), so
-	 * handleChannelReestablish emits it at its tail for every channel that
-	 * returns to NORMAL. The guards below make a repeat run a no-op.
+	 * Driven from `channel:restore-ready` rather than from restoreFromStorage,
+	 * because a just-restored channel is in AWAITING_REESTABLISH and can send
+	 * nothing: both the onward add and the fail-back would be refused for wrong
+	 * state. The manager arms that event when it loads a channel from
+	 * persistence and fires it once, at the tail of the reestablishment that
+	 * returns the channel to NORMAL.
+	 *
+	 * It must NOT be driven by reestablishment alone. An ordinary TCP
+	 * disconnect also moves a live channel into AWAITING_REESTABLISH, and this
+	 * pass is only safe against node state that is genuinely gone: re-offering
+	 * an HTLC whose inbound MPP part is still accumulated would count that part
+	 * twice, so a payer could cycle the connection until the set reached its
+	 * declared total having sent less than it owed. The guards below make a
+	 * repeat run a no-op for everything they cover, but the MPP accumulator is
+	 * not among them (it dedupes by (channel, htlc) as its own defense, which
+	 * is a second line, not this one).
 	 */
 	private redispatchUnresolvedReceivedHtlcs(channelId: Buffer): void {
 		const channel = this.channelManager.getChannel(channelId);
@@ -2153,13 +2161,17 @@ export class LightningNode extends EventEmitter {
 				this.registerChannelScid(channelId, scid);
 			}
 		);
+		// A channel restored from persistence has finished reestablishing:
+		// rebuild the node-level handling its previous process took with it.
+		// Its own event, fired once per restored channel, because this repair
+		// must never run for a channel that stayed live (see
+		// redispatchUnresolvedReceivedHtlcs).
+		this.channelManager.on('channel:restore-ready', (channelId: Buffer) => {
+			this.redispatchUnresolvedReceivedHtlcs(channelId);
+		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
-			// The channel can carry updates again. Pick up any received HTLC that
-			// was dispatched before a restart but whose node-side handling did not
-			// survive it (see redispatchUnresolvedReceivedHtlcs).
-			this.redispatchUnresolvedReceivedHtlcs(channelId);
 			// Clear reestablish stuck tracker when channel reaches NORMAL
 			this._stuckChannelTracker.delete(
 				`reestablish:${channelId.toString('hex')}`
@@ -11092,6 +11104,24 @@ export class LightningNode extends EventEmitter {
 				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
 			this.cleanupHtlcSharedSecret(secretKey);
 			this.channelManager.failHtlc(channelId, htlcId, reason);
+			return;
+		}
+
+		// One HTLC is one part. Completion sums the array, so accumulating the
+		// same (channel, htlc) twice would credit money that was never sent:
+		// the set would reach its declared total, reveal the preimage and
+		// settle, while only the single real HTLC exists to settle. Nothing
+		// upstream should offer the same HTLC twice, and this is the check that
+		// means a path which does cannot turn it into value.
+		const alreadyCounted = pending.receivedParts.some(
+			(p) => p.htlcId === htlcId && p.channelId.equals(channelId)
+		);
+		if (alreadyCounted) {
+			this.emitStructuredLog('htlc', 'mpp_duplicate_part_ignored', {
+				paymentHash: hashHex,
+				channelId: channelId.toString('hex'),
+				htlcId: htlcId.toString()
+			});
 			return;
 		}
 
