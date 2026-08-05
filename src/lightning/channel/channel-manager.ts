@@ -1310,7 +1310,8 @@ export class ChannelManager extends EventEmitter {
 			channel.markForReestablish();
 		}
 
-		// Early-stage channels → abort (BOLT 2: no reestablish before funding_signed)
+		// Early-stage channels → abort (BOLT 2: no reestablish before
+		// funding_signed for v1; before the initial commitment_signed for v2)
 		const earlyStates = new Set([
 			ChannelState.NONE,
 			ChannelState.SENT_OPEN,
@@ -1324,6 +1325,21 @@ export class ChannelManager extends EventEmitter {
 			if (this.channelPeers.get(tempId) !== peerPubkey) continue;
 			const state = channel.getState();
 			if (!earlyStates.has(state)) continue;
+
+			// A v2 open past its point of no return (the durable record exists)
+			// is NOT abortable: BOLT 2 requires the signature exchange to
+			// resume over reestablish. The promotion normally happened with the
+			// batch that created the record; catch any channel the disconnect
+			// beat to it, then treat it like the established loop above.
+			if (channel.getFullState().v2InFlight != null) {
+				this._promoteV2ChannelIfReady(peerPubkey, channel);
+				const idHex = channel.getChannelId()?.toString('hex');
+				if (idHex && this.channels.has(idHex)) {
+					this.purgeBarrierQueue(idHex);
+					channel.markForReestablish();
+					continue;
+				}
+			}
 
 			channel.getFullState().state = ChannelState.ERRORED;
 			this.tempChannels.delete(tempId);
@@ -4429,13 +4445,16 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Promote a v2 (dual-funded) channel from tempChannels to the permanent map.
-	 * Deferred until the open reaches AWAITING_FUNDING_CONFIRMED: while the
-	 * channel is still in the commitment_signed / tx_signatures round (state
-	 * AWAITING_TX_SIGNATURES) it MUST stay in tempChannels so a mid-round peer
-	 * disconnect is aborted by handlePeerDisconnected (which only scans
-	 * tempChannels for early-state channels). Routing still works in the interim:
-	 * commitment_signed is found via findChannelByChannelIdInTemp (derived id) and
-	 * tx_signatures via findTempChannel (temporary id). Idempotent.
+	 * The boundary is the point of no return: the batch that creates the
+	 * durable v2InFlight record (our initial commitment_signed) also first
+	 * persists the row under the permanent id, and from then on the channel
+	 * must be resolvable by findChannelByChannelId / getChannelsByPeer so a
+	 * disconnect reestablishes instead of aborting (BOLT 2: the signature
+	 * exchange resumes over next_funding). Before the record exists the
+	 * channel stays in tempChannels, where handlePeerDisconnected's sweep
+	 * correctly aborts it. Routing works either way: commitment_signed is
+	 * found via findChannelByChannelIdInTemp (derived id) and tx_signatures
+	 * via findTempChannel (temporary id). Idempotent.
 	 */
 	private _promoteV2ChannelIfReady(peerPubkey: string, channel: Channel): void {
 		const cid = channel.getChannelId();
@@ -4447,7 +4466,11 @@ export class ChannelManager extends EventEmitter {
 		if (
 			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			st !== ChannelState.AWAITING_CHANNEL_READY &&
-			st !== ChannelState.NORMAL
+			st !== ChannelState.NORMAL &&
+			!(
+				st === ChannelState.AWAITING_TX_SIGNATURES &&
+				channel.getFullState().v2InFlight != null
+			)
 		) {
 			return;
 		}
