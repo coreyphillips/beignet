@@ -286,6 +286,9 @@ export interface IChannelManagerConfig {
  * - 'channel:opened' (channelId: Buffer)
  * - 'channel:opening' (channelId: Buffer, fundingTxid: Buffer)
  * - 'channel:ready' (channelId: Buffer)
+ * - 'channel:restore-ready' (channelId: Buffer) — a channel RESTORED FROM
+ *   PERSISTENCE this process has completed reestablishment; fires at most
+ *   once per channel and never for a channel that stayed live
  * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
  * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
@@ -307,6 +310,13 @@ export class ChannelManager extends EventEmitter {
 	private channels: Map<string, Channel> = new Map();
 	private tempChannels: Map<string, Channel> = new Map();
 	private channelPeers: Map<string, string> = new Map();
+	/**
+	 * Channels restored from persistence in THIS process whose node-level
+	 * repair pass has not run yet (see 'channel:restore-ready'). Emptied one
+	 * channel at a time as each completes reestablishment, so the repair can
+	 * never run for a channel that has been live all along.
+	 */
+	private channelsAwaitingRestoreRepair: Set<string> = new Set();
 	private peerManager: PeerManager | null = null;
 	private monitors: Map<string, ChainMonitor> = new Map();
 	// Latest block height seen (for stamping when a force-close CPFP was broadcast).
@@ -1418,6 +1428,11 @@ export class ChannelManager extends EventEmitter {
 			}
 			this.channels.set(channelId.toString('hex'), channel);
 			this.channelPeers.set(channelId.toString('hex'), peerPubkey);
+			// This channel came from persistence, so the node-level state that
+			// would resolve its committed inbound HTLCs (MPP part sets, held
+			// forwards, the forwarding machinery's view) died with the previous
+			// process. Arm the one-shot repair; reestablish fires it.
+			this.channelsAwaitingRestoreRepair.add(channelId.toString('hex'));
 		}
 	}
 
@@ -3542,6 +3557,54 @@ export class ChannelManager extends EventEmitter {
 		// released when the peer's (retransmitted) revoke_and_ack arrives — our
 		// accurate next_revocation_number in channel_reestablish makes the peer
 		// retransmit it (see handleRevokeAndAck's autoSignAndSendCommitment).
+
+		// A channel RESTORED FROM PERSISTENCE that is back in NORMAL has
+		// completed reestablish and can carry updates again, which is the
+		// first moment its node-level repair pass can act
+		// (redispatchUnresolvedReceivedHtlcs). Emitted at the tail so no later
+		// step of this handler sits inside the listeners' callback window.
+		//
+		// Deliberately NOT 'channel:ready', and deliberately NOT for every
+		// reestablishment. An ordinary TCP disconnect also puts a live channel
+		// into AWAITING_REESTABLISH, so firing on every reconnect would re-run
+		// the repair against node state that never went away, and that state
+		// is not all idempotent: an accumulated inbound MPP part would be
+		// counted a second time, letting a payer cycle the connection to reach
+		// the declared total with less money than it sent. The repair exists
+		// for exactly one situation, a process that lost its in-memory view,
+		// so it is armed at restore and fires once.
+		if (channel.getState() === ChannelState.NORMAL) {
+			this.emitRestoreRepairOnce(
+				channel.getChannelId() ?? channel.getTemporaryChannelId()
+			);
+		}
+	}
+
+	/**
+	 * Fire the restore repair for a channel that was loaded from persistence,
+	 * at most once per process.
+	 *
+	 * The marker is cleared only after the listeners returned, so a repair
+	 * that threw part way is retried on the next reestablishment rather than
+	 * being silently dropped: EventEmitter is synchronous, which is what makes
+	 * "the repair completed" observable here at all.
+	 */
+	private emitRestoreRepairOnce(channelId: Buffer): void {
+		const idHex = channelId.toString('hex');
+		if (!this.channelsAwaitingRestoreRepair.has(idHex)) return;
+		try {
+			this.emit('channel:restore-ready', channelId);
+		} catch (err) {
+			this.emit(
+				'error',
+				channelId,
+				`restore repair failed, will retry on the next reestablish: ${
+					(err as Error).message
+				}`
+			);
+			return;
+		}
+		this.channelsAwaitingRestoreRepair.delete(idHex);
 	}
 
 	private handleStfu(peerPubkey: string, payload: Buffer): void {
@@ -4484,6 +4547,7 @@ export class ChannelManager extends EventEmitter {
 		this.purgeBarrierQueue(idHex);
 		this.channels.delete(idHex);
 		this.channelPeers.delete(idHex);
+		this.channelsAwaitingRestoreRepair.delete(idHex);
 		return true;
 	}
 
