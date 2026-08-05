@@ -232,6 +232,17 @@ export interface ICapturedMessage {
  * everything else the victim tries to send afterwards, is dropped. That is
  * a SIGKILL between the socket write and the next read.
  */
+/**
+ * A wire that never stops is a product failure, not a test hang: the
+ * loopback relay is synchronous, so an unbounded exchange recurses until
+ * the heap dies and takes the whole mocha process with it, reporting
+ * nothing. The valve throws instead, carrying the repeating tail so the
+ * loop is diagnosable from the failure message alone.
+ */
+export const CHAOS_MAX_WIRE_MESSAGES = 3000;
+
+export class ChaosLoopError extends Error {}
+
 export class ChaosRelay {
 	readonly captured: ICapturedMessage[] = [];
 	readonly droppedAfterKill: Array<{ from: string; type: number }> = [];
@@ -241,6 +252,8 @@ export class ChaosRelay {
 		(pk: string, type: number, payload: Buffer) => void
 	>();
 	private readonly sendOrdinals = new Map<number, number>();
+	private delivered = 0;
+	private readonly recentTypes: number[] = [];
 	private victimId: string | null = null;
 	private armed: KillLabel | null = null;
 	private recording: KillLabel[] | null = null;
@@ -337,6 +350,17 @@ export class ChaosRelay {
 	): void {
 		const to = this.nodes.get(toId);
 		if (!to) return;
+		if (++this.delivered > CHAOS_MAX_WIRE_MESSAGES) {
+			const tail = this.recentTypes
+				.slice(-12)
+				.map((t) => MessageType[t] ?? t)
+				.join(' ');
+			throw new ChaosLoopError(
+				`the wire exceeded ${CHAOS_MAX_WIRE_MESSAGES} messages, which means it is looping; last types: ${tail}`
+			);
+		}
+		this.recentTypes.push(type);
+		if (this.recentTypes.length > 24) this.recentTypes.shift();
 		if (this.kill.killed) {
 			if (fromId === this.victimId || toId === this.victimId) {
 				this.droppedAfterKill.push({ from: fromId, type });

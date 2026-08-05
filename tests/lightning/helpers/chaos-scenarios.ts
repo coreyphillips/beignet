@@ -12,7 +12,11 @@
  */
 
 import { expect } from 'chai';
+import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import { PaymentStatus } from '../../../src/lightning/node/types';
+import type { ISpliceWalletInput } from '../../../src/lightning/channel/channel';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import {
 	BITCOIN_CHAIN_HASH,
@@ -415,6 +419,98 @@ export function s9ForceCloses(): IChaosScenario {
 		},
 		probe(): void {
 			// Cell-dependent verdicts; the sweep supplies its own assertOutcome.
+		}
+	};
+}
+
+/**
+ * A deterministic wallet input for a splice-in, byte-identical to the one
+ * splice.test.ts builds (the interactive-tx audit requires a real input
+ * with a working witness signer).
+ */
+export function makeChaosSpliceWallet(amountSats: bigint): {
+	walletInput: ISpliceWalletInput;
+	changeScript: Buffer;
+} {
+	bitcoin.initEccLib(ecc);
+	const walletPriv = crypto
+		.createHash('sha256')
+		.update('chaos-splice-in-wallet')
+		.digest();
+	const walletPub = Buffer.from(ecc.pointFromScalar(walletPriv, true)!);
+	const walletScript = bitcoin.payments.p2wpkh({ pubkey: walletPub }).output!;
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: walletPub }).output!;
+	const value = amountSats + 100_000n;
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addOutput(walletScript, Number(value));
+	return {
+		walletInput: {
+			prevTx: prevTx.toBuffer(),
+			prevOutputIndex: 0,
+			value,
+			sequence: 0xfffffffd,
+			signWitness: (
+				tx: bitcoin.Transaction,
+				inputIndex: number,
+				inputValue: bigint
+			): Buffer[] => {
+				const sighash = tx.hashForWitnessV0(
+					inputIndex,
+					scriptCode,
+					Number(inputValue),
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				const sig64 = Buffer.from(ecc.sign(sighash, walletPriv));
+				const der = bitcoin.script.signature.encode(
+					sig64,
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				return [der, walletPub];
+			}
+		},
+		changeScript: walletScript
+	};
+}
+
+/**
+ * S4: the victim initiates a splice-in and dies inside it. The
+ * interactive-tx session and the splice session are in-memory by design
+ * (matrix rows 6 and 7, D3 before anything is signed), while everything
+ * from tx_signatures onward is D2, retransmit-exact from the outbox: the
+ * pending-lock window is where commitments become start_batch batches and
+ * `_lastSentBatch` is the only thing a taproot channel may replay, since
+ * re-signing would reuse a MuSig2 nonce.
+ */
+export function s4SplicesIn(): IChaosScenario {
+	return {
+		name: 'S4 splice-in',
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.victim,
+				env.peers[0]
+			);
+			buildDirectGraph(env.victim, CHAOS_VICTIM_SEED, CHAOS_PEER_SEED);
+		},
+		async run(env: IChaosEnv): Promise<void> {
+			const manager = env.victim.getChannelManager();
+			manager.initiateQuiescence(env.channelId!);
+			const wallet = makeChaosSpliceWallet(100_000n);
+			manager
+				.getChannel(env.channelId!)!
+				.setSpliceInInputs([wallet.walletInput], wallet.changeScript);
+			manager.initiateSplice(env.channelId!, 100_000n, 253);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
+		},
+		probe(): void {
+			// Verdicts are cell-dependent (a kill inside the negotiation
+			// legitimately abandons it); the sweep supplies its own
+			// assertOutcome.
 		}
 	};
 }
