@@ -31,6 +31,7 @@ import { INodeConfig } from '../../../src/lightning/node/types';
 import { Network } from '../../../src/lightning/invoice/types';
 import {
 	BITCOIN_CHAIN_HASH,
+	ChannelState,
 	DEFAULT_CHANNEL_CONFIG
 } from '../../../src/lightning/channel/types';
 import { IChannelBasepoints } from '../../../src/lightning/keys/derivation';
@@ -457,6 +458,24 @@ export function tempDb(prefix: string): string {
 	);
 }
 
+/**
+ * One deterministic key for every chaos database: the writer signing key
+ * refuses plaintext storage at rest (phase 5's fail-closed rule), and the
+ * restart must open with the SAME key the dead process wrote with.
+ */
+export const CHAOS_DB_KEY = crypto
+	.createHash('sha256')
+	.update('beignet-chaos-db-encryption-key')
+	.digest();
+
+export function openChaosStorage(dbPath: string): SqliteStorage {
+	const storage = new SqliteStorage(dbPath, undefined, {
+		encryptionKey: CHAOS_DB_KEY
+	});
+	storage.open();
+	return storage;
+}
+
 export function openReadyChannel(
 	opener: LightningNode,
 	acceptor: LightningNode,
@@ -469,6 +488,38 @@ export function openReadyChannel(
 		0,
 		crypto.randomBytes(64)
 	)!;
+	opener.handleFundingConfirmed(channelId);
+	acceptor.handleFundingConfirmed(channelId);
+	return channelId;
+}
+
+/**
+ * Like openReadyChannel, but tolerant of a barrier in the opening path: a
+ * quorum-mode ACCEPTOR parks its funding_signed until the frame behind it
+ * is quorum durable, so the confirmation must wait for the opener to have
+ * processed it, or the funding events land on a channel still waiting for
+ * its signature. Identical to the synchronous helper in the modes where
+ * nothing parks.
+ */
+export async function openReadyChannelChaos(
+	env: IChaosEnv,
+	opener: LightningNode,
+	acceptor: LightningNode,
+	amountSat = 1_000_000n
+): Promise<Buffer> {
+	const channel = opener.openChannel(acceptor.getNodeId(), amountSat);
+	const channelId = opener.createFunding(
+		channel,
+		crypto.randomBytes(32),
+		0,
+		crypto.randomBytes(64)
+	)!;
+	await chaosWait(
+		env,
+		() =>
+			opener.getChannelManager().listChannels()[0]?.getState() !==
+			ChannelState.SENT_FUNDING_CREATED
+	);
 	opener.handleFundingConfirmed(channelId);
 	acceptor.handleFundingConfirmed(channelId);
 	return channelId;
@@ -527,6 +578,27 @@ export function buildDirectGraph(
 export async function settle(): Promise<void> {
 	await new Promise<void>((resolve) => setImmediate(resolve));
 	await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Wait for a condition OR the kill: a scenario step that completes
+ * asynchronously (a quorum-mode payment finishing round by round as
+ * receipts land) must wait kill-aware, because in a kill run the condition
+ * legitimately never comes true. A timeout with the victim still alive is
+ * a hard failure; a timeout after the kill is the kill doing its job.
+ */
+export async function chaosWait(
+	env: IChaosEnv,
+	condition: () => boolean,
+	timeoutMs = 15_000
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition() && !env.kill.killed) {
+		if (Date.now() > deadline) {
+			throw new Error('chaosWait timed out with the victim alive');
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -642,6 +714,28 @@ export interface IChaosEnvOptions {
 	victimRecovery?: Partial<NonNullable<INodeConfig['recovery']>>;
 	/** Peers get storage too when a scenario needs a journaled peer. */
 	peerFactory?: (seedId: number) => LightningNode;
+	/**
+	 * Per-run recovery config, built over THAT run's storage: quorum mode
+	 * needs a DurabilityBarrier wired at node construction, and the
+	 * restored node needs its own over the reopened storage (a quorum
+	 * journal refuses to start unbarriered). Wins over victimRecovery.
+	 */
+	victimRecoveryFactory?: (ctx: {
+		storage: IStorageBackend;
+		dbPath: string;
+		phase: 'initial' | 'restored';
+		kill: KillSwitch;
+	}) => Promise<INodeConfig['recovery']> | INodeConfig['recovery'];
+	/**
+	 * Runs right after the restored node is constructed, before the
+	 * reestablish: the place to kick replication on a gateless quorum node.
+	 */
+	afterRestart?: (
+		env: IChaosEnv,
+		restored: LightningNode
+	) => Promise<void> | void;
+	/** Per-run cleanup (guardian servers, etc.), errors swallowed. */
+	teardown?: (env: IChaosEnv) => Promise<void> | void;
 }
 
 export interface IChaosRunResult {
@@ -655,20 +749,27 @@ export interface IChaosRunResult {
 	destroyAll: () => void;
 }
 
-function buildEnv(
+export async function makeChaosEnv(
 	mode: RecoveryDurability,
 	options: IChaosEnvOptions
-): IChaosEnv {
+): Promise<IChaosEnv> {
 	const victimSeedId = options.victimSeedId ?? 1;
 	const peerSeedIds = options.peerSeedIds ?? [2];
 	const kill = new KillSwitch();
 	const dbPath = tempDb('chaos');
-	const raw = new SqliteStorage(dbPath);
-	raw.open();
+	const raw = openChaosStorage(dbPath);
 	const storage = sealableStorage(raw, kill);
+	const recovery = options.victimRecoveryFactory
+		? await options.victimRecoveryFactory({
+				storage,
+				dbPath,
+				phase: 'initial',
+				kill
+		  })
+		: { enabled: true, durability: mode, ...options.victimRecovery };
 	const victim = createChaosNode(victimSeedId, {
 		storage,
-		recovery: { enabled: true, durability: mode, ...options.victimRecovery }
+		recovery
 	});
 	const peers = peerSeedIds.map(
 		(id) => options.peerFactory?.(id) ?? createChaosNode(id)
@@ -717,15 +818,23 @@ export async function recordSchedule(
 	options: IChaosEnvOptions = {}
 ): Promise<{ schedule: KillLabel[]; captured: ICapturedMessage[] }> {
 	const scenario = scenarioFactory();
-	const env = buildEnv(mode, options);
+	const env = await makeChaosEnv(mode, options);
 	const schedule: KillLabel[] = [];
-	await scenario.setup(env);
-	env.commitTap.record(schedule);
-	env.relay.record(schedule);
-	await scenario.run(env);
-	await settle();
-	env.victim.destroy();
-	for (const peer of env.peers) peer.destroy();
+	try {
+		await scenario.setup(env);
+		env.commitTap.record(schedule);
+		env.relay.record(schedule);
+		await scenario.run(env);
+		await settle();
+	} finally {
+		env.victim.destroy();
+		for (const peer of env.peers) peer.destroy();
+		try {
+			await options.teardown?.(env);
+		} catch {
+			// Teardown is best-effort by contract.
+		}
+	}
 	return { schedule, captured: env.relay.captured };
 }
 
@@ -743,7 +852,7 @@ export async function runKillPoint(
 	options: IChaosEnvOptions = {}
 ): Promise<IChaosRunResult> {
 	const scenario = scenarioFactory();
-	const env = buildEnv(mode, options);
+	const env = await makeChaosEnv(mode, options);
 	const broadcasts: IChaosRunResult['broadcasts'] = [];
 	watchBroadcasts(env.victim, env.kill, broadcasts, false);
 	await scenario.setup(env);
@@ -761,6 +870,23 @@ export async function runKillPoint(
 		env.kill.killed,
 		`kill label ${label} never fired for ${scenario.name} in ${mode}`
 	).to.equal(true);
+	return restartVictim(env, options, broadcasts, label);
+}
+
+/**
+ * The death-and-restart half of a kill run, usable on its own for
+ * hand-driven cells (the quorum choreographies) whose kill is fired
+ * manually rather than by an armed label: destroy the dead victim, let the
+ * peer observe the disconnect, reopen the file the kill left behind, build
+ * a fresh node on it, reconnect over the held FIFO, and hand back the
+ * oracle's inputs.
+ */
+export async function restartVictim(
+	env: IChaosEnv,
+	options: IChaosEnvOptions = {},
+	broadcasts: IChaosRunResult['broadcasts'] = [],
+	label?: KillLabel
+): Promise<IChaosRunResult> {
 	// The label has done its work; disarm so the restored node's own
 	// traffic (reestablish, replays) can never re-match it.
 	env.commitTap.disarm();
@@ -775,18 +901,30 @@ export async function runKillPoint(
 	}
 
 	// Reopen the file the kill left behind and restart on it.
-	const restoredRaw = new SqliteStorage(env.dbPath);
-	restoredRaw.open();
+	const restoredRaw = openChaosStorage(env.dbPath);
 	const postKillDump = dumpTables(restoredRaw);
 	const restoredKill = new KillSwitch();
 	const restoredStorage = sealableStorage(restoredRaw, restoredKill);
+	const recovery = options.victimRecoveryFactory
+		? await options.victimRecoveryFactory({
+				storage: restoredStorage,
+				dbPath: env.dbPath,
+				phase: 'restored',
+				kill: restoredKill
+		  })
+		: {
+				enabled: true,
+				durability: env.mode,
+				...options.victimRecovery
+		  };
 	const restored = createChaosNode(env.victimSeedId, {
 		storage: restoredStorage,
-		recovery: { enabled: true, durability: mode, ...options.victimRecovery }
+		recovery
 	});
 	watchBroadcasts(restored, env.kill, broadcasts, true);
 	env.relay.replaceNode(env.victim, restored);
 	env.kill.killed = false;
+	await options.afterRestart?.(env, restored);
 
 	// A real connection delivers BOTH reestablish messages before any
 	// responses they trigger, so hold a FIFO until both sides sent theirs.
@@ -798,7 +936,7 @@ export async function runKillPoint(
 		restored,
 		restoredStorage,
 		postKillDump,
-		firedLabel: env.kill.firedLabel ?? label,
+		firedLabel: env.kill.firedLabel ?? label ?? 'manual',
 		broadcasts,
 		destroyAll: (): void => {
 			restored.destroy();
@@ -874,6 +1012,11 @@ export async function runKillMatrix(
 			);
 		} finally {
 			result.destroyAll();
+			try {
+				await options.teardown?.(result.env);
+			} catch {
+				// Teardown is best-effort by contract.
+			}
 		}
 		executed++;
 	}

@@ -19,13 +19,25 @@ import { IStorageBackend } from '../../../src/lightning/storage/types';
 import { IChaosRunResult, settle } from './chaos-harness';
 
 /**
- * A few extra settle rounds for cascades the reestablish kicked off (the
- * peer re-fulfilling an interrupted HTLC, replayed batches completing their
- * round). Bounded and deterministic: the loopback wire is synchronous, so
- * anything that is going to drain drains within a handful of macrotasks.
+ * Wait for the reestablish cascades to finish (the peer re-fulfilling an
+ * interrupted HTLC, replayed batches completing their round). In the
+ * synchronous modes this converges within a handful of macrotasks; in
+ * quorum mode every gated re-send parks behind its own fresh frame and
+ * waits on a real HTTP receipt, so the drain polls a condition up to a
+ * deadline instead of counting setImmediates. The assertions after it
+ * still run unconditionally: a drain that never converges fails on them
+ * with the precise state it left behind.
  */
-async function drain(rounds = 5): Promise<void> {
-	for (let i = 0; i < rounds; i++) await settle();
+async function drain(
+	converged?: () => boolean,
+	timeoutMs = 8_000
+): Promise<void> {
+	for (let i = 0; i < 5; i++) await settle();
+	if (!converged) return;
+	const deadline = Date.now() + timeoutMs;
+	while (!converged() && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
 }
 
 /**
@@ -37,8 +49,17 @@ async function drain(rounds = 5): Promise<void> {
 export async function assertExactResume(
 	result: IChaosRunResult
 ): Promise<void> {
-	await drain();
 	const { restored } = result;
+	await drain(() =>
+		restored
+			.getChannelManager()
+			.listChannels()
+			.every(
+				(c) =>
+					c.getState() === ChannelState.NORMAL &&
+					c.getFullState().htlcs.size === 0
+			)
+	);
 	const channels = restored.getChannelManager().listChannels();
 	expect(channels.length, 'restored node lost its channel').to.be.greaterThan(
 		0

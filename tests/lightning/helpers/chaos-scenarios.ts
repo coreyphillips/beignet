@@ -19,7 +19,8 @@ import {
 	IChaosEnvOptions,
 	IChaosScenario,
 	buildDirectGraph,
-	openReadyChannel
+	chaosWait,
+	openReadyChannelChaos
 } from './chaos-harness';
 
 export const CHAOS_VICTIM_SEED = 71;
@@ -34,26 +35,42 @@ export const CHAOS_ENV: IChaosEnvOptions = {
 export function s1aSenderPays(): IChaosScenario {
 	return {
 		name: 'S1a sender pays',
-		setup(env: IChaosEnv): void {
-			env.channelId = openReadyChannel(env.victim, env.peers[0]);
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.victim,
+				env.peers[0]
+			);
 			buildDirectGraph(env.victim, CHAOS_VICTIM_SEED, CHAOS_PEER_SEED);
 		},
-		run(env: IChaosEnv): void {
+		async run(env: IChaosEnv): Promise<void> {
 			const invoice = env.peers[0].createInvoice({
 				amountMsat: 50_000n,
 				description: 'chaos S1a'
 			});
 			// The kill may land anywhere inside this call; the harness owns
-			// the outcome, not the return value.
-			env.victim.sendPayment(invoice.bolt11);
+			// the outcome, not the return value. The wait is kill-aware and
+			// exists for quorum mode, where the rounds complete
+			// asynchronously as receipts land; in the synchronous modes the
+			// payment is already settled when sendPayment returns.
+			const payment = env.victim.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
+			// Drain the round's tail: the final gated revoke may still be
+			// waiting on its receipt in quorum mode, and the schedule must
+			// record it deterministically.
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
 		},
-		probe(env: IChaosEnv, restored: LightningNode): void {
+		async probe(env: IChaosEnv, restored: LightningNode): Promise<void> {
 			buildDirectGraph(restored, CHAOS_VICTIM_SEED, CHAOS_PEER_SEED);
 			const invoice = env.peers[0].createInvoice({
 				amountMsat: 40_000n,
 				description: 'chaos S1a probe'
 			});
 			const payment = restored.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
 			expect(payment.status, 'probe payment after resume').to.equal(
 				PaymentStatus.COMPLETED
 			);
@@ -69,23 +86,33 @@ export function s1aSenderPays(): IChaosScenario {
 export function s1bReceiverFulfills(): IChaosScenario {
 	return {
 		name: 'S1b receiver fulfills',
-		setup(env: IChaosEnv): void {
-			env.channelId = openReadyChannel(env.peers[0], env.victim);
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.peers[0],
+				env.victim
+			);
 			buildDirectGraph(env.peers[0], CHAOS_PEER_SEED, CHAOS_VICTIM_SEED);
 		},
-		run(env: IChaosEnv): void {
+		async run(env: IChaosEnv): Promise<void> {
 			const invoice = env.victim.createInvoice({
 				amountMsat: 50_000n,
 				description: 'chaos S1b'
 			});
-			env.peers[0].sendPayment(invoice.bolt11);
+			const payment = env.peers[0].sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
 		},
-		probe(env: IChaosEnv, restored: LightningNode): void {
+		async probe(env: IChaosEnv, restored: LightningNode): Promise<void> {
 			const invoice = restored.createInvoice({
 				amountMsat: 40_000n,
 				description: 'chaos S1b probe'
 			});
 			const payment = env.peers[0].sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
 			expect(payment.status, 'probe payment after resume').to.equal(
 				PaymentStatus.COMPLETED
 			);
@@ -103,11 +130,15 @@ export function s1bReceiverFulfills(): IChaosScenario {
 export function s3FailsHeldHtlc(): IChaosScenario {
 	return {
 		name: 'S3 fails a held HTLC',
-		setup(env: IChaosEnv): void {
-			env.channelId = openReadyChannel(env.peers[0], env.victim);
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.peers[0],
+				env.victim
+			);
 			buildDirectGraph(env.peers[0], CHAOS_PEER_SEED, CHAOS_VICTIM_SEED);
 		},
-		run(env: IChaosEnv): void {
+		async run(env: IChaosEnv): Promise<void> {
 			const invoice = env.victim.createInvoice({
 				amountMsat: 60_000n,
 				description: 'chaos S3',
@@ -115,11 +146,21 @@ export function s3FailsHeldHtlc(): IChaosScenario {
 			});
 			env.scratch.holdHash = invoice.paymentHash;
 			const payment = env.peers[0].sendPayment(invoice.bolt11);
-			// The HTLC parks at the victim; nothing has resolved yet.
+			// The HTLC parks at the victim; nothing has resolved yet. In
+			// quorum mode the add round completes asynchronously, so wait for
+			// the park itself (kill-aware) before cancelling, or the cancel
+			// races the round and the schedule loses its determinism.
 			expect(payment.status, 'held payment still pending').to.equal(
 				PaymentStatus.PENDING
 			);
+			await chaosWait(env, () =>
+				env.victim.listHoldInvoices().some((h) => h.state === 'ACCEPTED')
+			);
 			env.victim.cancelHoldInvoice(invoice.paymentHash);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
 		},
 		async probe(env: IChaosEnv, restored: LightningNode): Promise<void> {
 			// The kill may have landed before the cancel became durable, in
@@ -139,6 +180,7 @@ export function s3FailsHeldHtlc(): IChaosScenario {
 				description: 'chaos S3 probe'
 			});
 			const payment = env.peers[0].sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
 			expect(payment.status, 'probe payment after resume').to.equal(
 				PaymentStatus.COMPLETED
 			);
