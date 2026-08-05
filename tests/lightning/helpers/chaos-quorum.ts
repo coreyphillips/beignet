@@ -136,9 +136,22 @@ export function currentQuorumRun(): IQuorumRun {
 	return current;
 }
 
+/** The guardian-set context, for tests that drive a RestoreDriver. */
+export const QUORUM_CONTEXT = CONTEXT;
+export const QUORUM_REQUIRED = CRASH_V1_PROFILE.required;
+
+/** Bind the live trio's clients the way a RestoreDriver consumes them. */
+export function bindServed(served: IServed[]): IBoundGuardianClient[] {
+	return served.map((entry) => ({
+		client: entry.client,
+		expectedGuardianId: entry.id
+	}));
+}
+
 export function quorumOptions(
 	overrides: Partial<Pick<IQuorumRun, 'wrapBarrier' | 'barrierTimeoutMs'>> = {},
-	base: IChaosEnvOptions = CHAOS_ENV
+	base: IChaosEnvOptions = CHAOS_ENV,
+	durability: 'quorum' | 'async-remote' = 'quorum'
 ): IChaosEnvOptions {
 	return {
 		...base,
@@ -176,7 +189,7 @@ export function quorumOptions(
 					barrierTimeoutMs: overrides.barrierTimeoutMs ?? 20_000
 				};
 				run.barrier = new DurabilityBarrier({
-					durability: 'quorum',
+					durability,
 					replicator,
 					lease: (): IWriterLeaseKeys | null => run.lease,
 					timeoutMs: run.barrierTimeoutMs,
@@ -185,7 +198,7 @@ export function quorumOptions(
 				current = run;
 				const barrier = (run.wrapBarrier?.(run.barrier, kill) ??
 					run.barrier) as DurabilityBarrier;
-				return { enabled: true, durability: 'quorum', barrier };
+				return { enabled: true, durability, barrier };
 			}
 			// Restored: a new replicator and barrier over the reopened
 			// storage, against the SAME still-serving trio, with the lease
@@ -210,13 +223,13 @@ export function quorumOptions(
 			});
 			run.replicator = replicator;
 			run.barrier = new DurabilityBarrier({
-				durability: 'quorum',
+				durability,
 				replicator,
 				lease: (): IWriterLeaseKeys | null => run.lease,
 				timeoutMs: run.barrierTimeoutMs,
 				retryDelayMs: 40
 			});
-			return { enabled: true, durability: 'quorum', barrier: run.barrier };
+			return { enabled: true, durability, barrier: run.barrier };
 		},
 		afterRestart: async (): Promise<void> => {
 			// Gateless quorum node: kicking replication is the integrator's
