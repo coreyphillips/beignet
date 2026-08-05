@@ -3551,15 +3551,22 @@ export class ChannelManager extends EventEmitter {
 			}
 		}
 
-		// NOTE: no unconditional commitment_signed here. needsCommitment can be
-		// true for updates the peer has NOT yet committed to us (a received
-		// add/fulfill whose covering commitment_signed was lost with the
-		// connection) — signing those into the peer's commitment before it
-		// retransmits and we revoke violates the two-phase update flow. A
-		// commitment that was legitimately deferred by the alternation gate is
-		// released when the peer's (retransmitted) revoke_and_ack arrives — our
-		// accurate next_revocation_number in channel_reestablish makes the peer
-		// retransmit it (see handleRevokeAndAck's autoSignAndSendCommitment).
+		// A commitment_signed the durable state says we owe is released below
+		// once the channel is back to NORMAL (issue 301). needsCommitment is
+		// only ever persisted for legitimately owed signatures: our own
+		// updates, and peer updates whose covering commitment_signed we
+		// processed and revoked for (handleCommitmentSigned's two-phase
+		// flags) — a peer update still awaiting the peer's own signature
+		// never sets it. The dangerous interleavings stay covered by
+		// autoSignAndSendCommitment's own gates: a commitment_signed of ours
+		// the peer has not revoked defers on isAwaitingRemoteRevocation
+		// (derived from persisted counters; the peer's retransmitted
+		// revoke_and_ack releases it via handleRevokeAndAck), and with
+		// nothing owed the call is a no-op. Without this release, a crash
+		// after our revoke_and_ack reached the peer but before the counter
+		// commitment_signed was built leaves BOTH sides with nothing to
+		// retransmit per BOLT 2 — the peer simply waits for our signature,
+		// forever, and the in-flight HTLC stalls to its CLTV expiry.
 
 		// A channel RESTORED FROM PERSISTENCE that is back in NORMAL has
 		// completed reestablish and can carry updates again, which is the
@@ -3590,6 +3597,18 @@ export class ChannelManager extends EventEmitter {
 				'channel:reestablished',
 				channel.getChannelId() ?? channel.getTemporaryChannelId()
 			);
+			// Release a durably owed commitment_signed (see the note above the
+			// NORMAL check). Runs after the repair emissions so a fulfill/fail
+			// they staged rides the same release. Re-check the state: a
+			// listener may have force-closed the channel.
+			const reestablishedId = channel.getChannelId();
+			if (
+				reestablishedId &&
+				channel.getState() === ChannelState.NORMAL &&
+				!channel.isCollectingBatch()
+			) {
+				this.autoSignAndSendCommitment(reestablishedId);
+			}
 		}
 	}
 
