@@ -10,6 +10,8 @@
  *   taproot round only verifies if the restart re-derived the same
  *   verification nonces, and every resumed round re-signs with FRESH
  *   nonces over fresh material, which is what the 5.10 invariant permits.
+ *   The sweep found #293 here (the reestablish revoke rebuild omitted its
+ *   nonce, fixed in #298); every cell now runs.
  * - Taproot cooperative close session (D3, MUST NOT persist) and
  *   lastCooperativeCloseTxHex (D1): the S6 close sweep, with a
  *   non-persistence assertion on every cell's disk and a targeted
@@ -38,7 +40,6 @@ import { MessageType } from '../../src/lightning/message/types';
 import {
 	IChaosEnvOptions,
 	IChaosRunResult,
-	KillLabel,
 	postSendLabel,
 	runKillMatrix,
 	recordSchedule,
@@ -87,49 +88,7 @@ async function waitForCloseConvergence(
 }
 
 describe('Recovery phase 7: signing sessions I (taproot, close paths)', () => {
-	/**
-	 * The #293 window: killed between our commitment_signed reaching the
-	 * peer and the peer's revoke_and_ack becoming durable, a TAPROOT
-	 * channel never resumes the round (the identical cells pass on a plain
-	 * channel, which is what makes the defect taproot-specific). Two cells:
-	 * the send itself and the commit that would have processed the peer's
-	 * revoke.
-	 */
-	function taprootResumeDefectWindow(schedule: KillLabel[]): Set<KillLabel> {
-		const sendIdx = schedule.indexOf(
-			postSendLabel(MessageType.COMMITMENT_SIGNED, 1)
-		);
-		expect(
-			sendIdx,
-			'schedule holds the taproot commitment send'
-		).to.be.at.least(0);
-		return new Set(schedule.slice(sendIdx, sendIdx + 2));
-	}
-
-	it('taproot payment: every boundary outside the #293 window resumes exactly, so verification nonces re-derive and no round reuses a secret nonce', async function () {
-		this.timeout(180_000);
-		let window: Set<KillLabel> | null = null;
-		const { schedule, executed } = await runKillMatrix(
-			'local',
-			s1aSenderPays,
-			(label, fullSchedule) => {
-				window ??= taprootResumeDefectWindow(fullSchedule);
-				return window.has(label) ? 'skip' : 'exact-resume';
-			},
-			assertChaosOutcome,
-			TAPROOT_ENV
-		);
-		expect(executed, 'only the #293 window was skipped').to.equal(
-			schedule.length - window!.size
-		);
-		expect(
-			schedule.includes(postSendLabel(MessageType.COMMITMENT_SIGNED, 1)),
-			'the sweep crossed the taproot commitment boundary'
-		).to.equal(true);
-	});
-
-	// Flip on when the #293 fix lands.
-	it.skip('taproot payment: EVERY boundary resumes exactly (needs the #293 fix)', async function () {
+	it('taproot payment: every boundary resumes exactly, so verification nonces re-derive and no round reuses a secret nonce', async function () {
 		this.timeout(180_000);
 		const { schedule, executed } = await runKillMatrix(
 			'local',
@@ -139,6 +98,10 @@ describe('Recovery phase 7: signing sessions I (taproot, close paths)', () => {
 			TAPROOT_ENV
 		);
 		expect(executed).to.equal(schedule.length);
+		expect(
+			schedule.includes(postSendLabel(MessageType.COMMITMENT_SIGNED, 1)),
+			'the sweep crossed the taproot commitment boundary'
+		).to.equal(true);
 	});
 
 	it('cooperative close: killed anywhere inside the negotiation, the close converges and the session never persists', async function () {
