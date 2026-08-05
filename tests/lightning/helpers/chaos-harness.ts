@@ -769,6 +769,13 @@ export interface IChaosEnvOptions {
 	preferTaproot?: boolean;
 	/** Extra INodeConfig fields for the victim (and its restart). */
 	victimExtras?: Partial<INodeConfig>;
+	/**
+	 * Like victimExtras, but built per process life: a restarted process must
+	 * NOT inherit in-memory extras state from the killed one (a funding
+	 * provider's pledge map, for example), while the durable thing the extras
+	 * wrap (the wallet) is shared. Wins over victimExtras.
+	 */
+	victimExtrasFactory?: (phase: 'initial' | 'restored') => Partial<INodeConfig>;
 }
 
 export interface IChaosRunResult {
@@ -804,7 +811,7 @@ export async function makeChaosEnv(
 		storage,
 		recovery,
 		preferTaproot: options.preferTaproot,
-		extras: options.victimExtras
+		extras: options.victimExtrasFactory?.('initial') ?? options.victimExtras
 	});
 	const peers = peerSeedIds.map(
 		(id) =>
@@ -958,7 +965,7 @@ export async function restartVictim(
 		storage: restoredStorage,
 		recovery,
 		preferTaproot: options.preferTaproot,
-		extras: options.victimExtras
+		extras: options.victimExtrasFactory?.('restored') ?? options.victimExtras
 	});
 	watchBroadcasts(restored, env.kill, broadcasts, true);
 	env.relay.replaceNode(env.victim, restored);
