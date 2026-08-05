@@ -15,55 +15,17 @@
  */
 
 import { expect } from 'chai';
-import { PaymentStatus } from '../../src/lightning/node/types';
-import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { MessageType } from '../../src/lightning/message/types';
 import {
-	IChaosEnv,
-	IChaosScenario,
-	buildDirectGraph,
-	openReadyChannel,
 	postSendLabel,
 	recordSchedule,
 	runKillMatrix,
 	runKillPoint
 } from './helpers/chaos-harness';
 import { assertChaosOutcome } from './helpers/chaos-oracle';
+import { CHAOS_ENV, s1aSenderPays } from './helpers/chaos-scenarios';
 
-const VICTIM_SEED = 71;
-const PEER_SEED = 72;
-
-function s1aSenderPays(): IChaosScenario {
-	return {
-		name: 'S1a sender pays',
-		setup(env: IChaosEnv): void {
-			env.channelId = openReadyChannel(env.victim, env.peers[0]);
-			buildDirectGraph(env.victim, VICTIM_SEED, PEER_SEED);
-		},
-		run(env: IChaosEnv): void {
-			const invoice = env.peers[0].createInvoice({
-				amountMsat: 50_000n,
-				description: 'chaos S1a'
-			});
-			// The kill may land anywhere inside this call; the harness owns
-			// the outcome, not the return value.
-			env.victim.sendPayment(invoice.bolt11);
-		},
-		probe(env: IChaosEnv, restored: LightningNode): void {
-			buildDirectGraph(restored, VICTIM_SEED, PEER_SEED);
-			const invoice = env.peers[0].createInvoice({
-				amountMsat: 40_000n,
-				description: 'chaos S1a probe'
-			});
-			const payment = restored.sendPayment(invoice.bolt11);
-			expect(payment.status, 'probe payment after resume').to.equal(
-				PaymentStatus.COMPLETED
-			);
-		}
-	};
-}
-
-const ENV = { victimSeedId: VICTIM_SEED, peerSeedIds: [PEER_SEED] };
+const ENV = CHAOS_ENV;
 
 describe('Recovery phase 7: chaos harness (S1a, local mode)', () => {
 	it('rehearsal records a deterministic schedule with commit and send boundaries', async function () {

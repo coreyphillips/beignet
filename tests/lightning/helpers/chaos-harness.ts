@@ -616,6 +616,13 @@ export interface IChaosEnv {
 	dbPath: string;
 	mode: RecoveryDurability;
 	channelId: Buffer | null;
+	/**
+	 * Scenario-owned state that must survive the kill: the env object is the
+	 * one thing shared between the killed run() and the probe(), which runs
+	 * on a FRESH scenario instance (a payment hash the probe must resolve,
+	 * for example).
+	 */
+	scratch: Record<string, unknown>;
 }
 
 export interface IChaosScenario {
@@ -680,7 +687,8 @@ function buildEnv(
 		kill,
 		dbPath,
 		mode,
-		channelId: null
+		channelId: null,
+		scratch: {}
 	};
 }
 
@@ -828,7 +836,7 @@ export type ChaosVerdict = 'exact-resume' | 'safe-dlp' | 'skip';
 export async function runKillMatrix(
 	mode: RecoveryDurability,
 	scenarioFactory: () => IChaosScenario,
-	expected: (label: KillLabel) => ChaosVerdict,
+	expected: (label: KillLabel, schedule: KillLabel[]) => ChaosVerdict,
 	assertOutcome: (
 		result: IChaosRunResult,
 		verdict: Exclude<ChaosVerdict, 'skip'>
@@ -849,7 +857,7 @@ export async function runKillMatrix(
 	assertNoGatedSendBeforeCommit(schedule, captured);
 	let executed = 0;
 	for (const label of schedule) {
-		const verdict = expected(label);
+		const verdict = expected(label, schedule);
 		if (verdict === 'skip') continue;
 		const result = await runKillPoint(mode, scenarioFactory, label, options);
 		try {
