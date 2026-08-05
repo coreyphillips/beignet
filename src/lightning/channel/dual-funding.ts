@@ -176,6 +176,39 @@ export class DualFundingSession {
 		this._maxFundingSatoshis = maxFundingSatoshis;
 	}
 
+	/**
+	 * Rebuild a session for an in-flight v2 open past the interactive-tx
+	 * negotiation (the funding tx is known and our inputs are signed into the
+	 * durable record). Used after a restart to resume the commitment_signed /
+	 * tx_signatures exchange over channel_reestablish.next_funding — no tx
+	 * builder is needed post-negotiation, and none could be rebuilt (the
+	 * wallet contribution closures die with the process).
+	 */
+	static restore(params: {
+		channelId: Buffer;
+		isInitiator: boolean;
+		remoteContributionSats: bigint;
+		fundingTxid: Buffer;
+		fundingOutputIndex: number;
+		/** Witnesses our released tx_signatures carried; null until it left. */
+		ourWitnesses: Buffer[][] | null;
+		receivedTxSignatures: boolean;
+	}): DualFundingSession {
+		const session = new DualFundingSession(
+			params.isInitiator,
+			params.channelId
+		);
+		session._remoteFundingSatoshis = params.remoteContributionSats;
+		session._fundingTxid = Buffer.from(params.fundingTxid);
+		session._fundingOutputIndex = params.fundingOutputIndex;
+		session._localWitnesses = params.ourWitnesses;
+		session._state =
+			params.ourWitnesses && params.receivedTxSignatures
+				? DualFundingState.AWAITING_CHANNEL_READY
+				: DualFundingState.AWAITING_TX_SIGNATURES;
+		return session;
+	}
+
 	// ─────────────── Getters ───────────────
 
 	getState(): DualFundingState {

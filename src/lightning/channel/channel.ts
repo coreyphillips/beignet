@@ -5579,14 +5579,42 @@ export class Channel {
 			this._state.state !== ChannelState.NEGOTIATING_CLOSING &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY &&
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
-			this._state.state !== ChannelState.SPLICING
+			this._state.state !== ChannelState.SPLICING &&
+			this._state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
+			this._state.state !== ChannelState.DUAL_FUNDING_V2
 		) {
-			return; // Only mark operational or funded channels
+			return; // Only mark operational, funded or resumable-open channels
 		}
 
 		// A disconnect aborts any quiescence handshake, so a splice we were waiting
 		// to start can never fire. Drop it rather than leave it dangling.
 		this._pendingSplice = null;
+
+		if (
+			this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+			this._state.state === ChannelState.DUAL_FUNDING_V2
+		) {
+			// Phase-aware, mirroring the SPLICING block below: BOLT 2's boundary
+			// for a v2 open is the initial commitment_signed. Before it the open
+			// is not resumable (the interactive-tx negotiation dies with the
+			// connection) and in-memory channels never reach here — the
+			// manager's tempChannels sweep aborts them — so the drop branch only
+			// fires for rows persisted before the in-flight record existed.
+			// Past it the open MUST survive: keep the session and the record so
+			// handleReestablish resumes the exchange via next_funding. The peer
+			// of a dropped open learns from the reestablish answer (tx_abort for
+			// an unknown next_funding_txid); no proactive latch is needed
+			// because nothing broadcastable ever existed for a dropped round.
+			const keep = this._v2SentCommitment || !!this._state.v2InFlight;
+			if (!keep) {
+				this._state.dualFundingSession?.abort();
+				this._state.dualFundingSession = null;
+				this._resetV2Driver();
+				this._state.v2InFlight = null;
+				this._state.state = ChannelState.ERRORED;
+				return;
+			}
+		}
 
 		if (this._state.state === ChannelState.SPLICING) {
 			// Phase-aware: before the mid-splice commitment round the splice is not
@@ -5799,6 +5827,21 @@ export class Channel {
 			msg.nextFundingRetransmitFlags = haveTheirCommitment ? 0 : 1;
 		}
 
+		// v2 open resumption (BOLT 2): set next_funding_txid while our initial
+		// commitment_signed for the interactive open has left but the peer's
+		// tx_signatures have not arrived; the TLV MUST be omitted once they
+		// have. A channel is never mid-splice and mid-open at once, so the two
+		// branches are naturally exclusive. retransmit_flags bit 0 asks the
+		// peer to retransmit ITS commitment_signed (we never received it).
+		if (!msg.nextFundingTxid) {
+			const v2Txid = this._inFlightUnsignedV2Txid();
+			if (v2Txid) {
+				msg.nextFundingTxid = v2Txid;
+				msg.nextFundingRetransmitFlags =
+					this._state.v2InFlight?.remoteCommitmentSig != null ? 0 : 1;
+			}
+		}
+
 		const actions: ChannelAction[] = [];
 
 		// We dropped an unresumable splice; the peer may still hold it in-flight.
@@ -5884,6 +5927,20 @@ export class Channel {
 			if (built) return built.spliceTxid;
 		}
 		return null;
+	}
+
+	/**
+	 * The txid of an in-flight v2 open whose signature exchange is incomplete
+	 * (the condition for setting next_funding_txid on channel_reestablish), or
+	 * null. Unlike the splice regime above (announce until locked), BOLT 2
+	 * scopes the TLV for an OPEN to the tx_signatures exchange: include it
+	 * while our initial commitment_signed has left and the peer's
+	 * tx_signatures have not arrived, and MUST omit it once they have.
+	 */
+	private _inFlightUnsignedV2Txid(): Buffer | null {
+		const inflight = this._state.v2InFlight;
+		if (!inflight || inflight.receivedTxSignatures) return null;
+		return Buffer.from(inflight.fundingTxid);
 	}
 
 	/**
@@ -5980,6 +6037,139 @@ export class Channel {
 			} else if (inflight?.confirmed && inflight.receivedTxSignatures) {
 				// The splice tx confirmed while we were disconnected: lock it now.
 				actions.push(...this.sendSpliceLocked());
+			}
+		}
+
+		return actions;
+	}
+
+	/**
+	 * Re-send our v2 open tx_signatures verbatim from the in-flight record,
+	 * without re-signing (no shared input exists for an open, so the message
+	 * carries only the wallet witnesses). Only valid once they left the first
+	 * time — the release gates of _maybeSendV2TxSigs stay authoritative.
+	 */
+	private _retransmitV2TxSignatures(): ChannelAction[] {
+		const inflight = this._state.v2InFlight;
+		if (!inflight?.sentTxSignatures || !this._state.channelId) return [];
+		return [
+			sendMsg(
+				MessageType.TX_SIGNATURES,
+				encodeTxSignaturesMessage({
+					channelId: this._state.channelId,
+					txid: inflight.fundingTxid,
+					witnesses: inflight.ourWitnesses
+				})
+			)
+		];
+	}
+
+	/**
+	 * Whether reestablish handling should route next_funding through the v2
+	 * OPEN resumption rather than the splice one: a v2 channel still in its
+	 * opening signature exchange, with either the durable record or a live
+	 * session. NORMAL-track states never qualify (the record is cleared when
+	 * both channel_readys crossed, and a stale one must not re-enter here).
+	 */
+	private _v2OpenResuming(): boolean {
+		if (this._state.fundingVersion !== 2) return false;
+		if (this._spliceSession || this._state.spliceInFlight) return false;
+		if (
+			this._state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
+			this._state.state !== ChannelState.DUAL_FUNDING_V2
+		) {
+			return false;
+		}
+		return !!this._state.v2InFlight || !!this._state.dualFundingSession;
+	}
+
+	/**
+	 * v2 open resumption on channel_reestablish (BOLT 2 interactive-tx
+	 * establishment):
+	 * - peer's next_funding_txid matches our in-flight open → retransmit our
+	 *   commitment_signed when asked (retransmit_flags bit 0, a legacy peer
+	 *   with no flags byte, or a pre-#1289 peer's next_commitment_number 0),
+	 *   then tx_signatures per the ordering rules;
+	 * - the txids disagree while we hold an in-flight open → wire error and
+	 *   fail (BOLT 2: neither side can prove which negotiation the other's
+	 *   signatures cover), never tx_abort once our tx_signatures left;
+	 * - peer's txid with nothing in flight on our side → tx_abort so it can
+	 *   forget the round;
+	 * - peer omitted next_funding while nothing irreversible crossed → the
+	 *   peer forgot the open: unwind ours, tx_abort tells it we did too.
+	 */
+	private _handleReestablishV2(
+		msg: IChannelReestablishMessage
+	): ChannelAction[] {
+		const actions: ChannelAction[] = [];
+		const inflight = this._state.v2InFlight;
+
+		if (msg.nextFundingTxid) {
+			if (inflight && msg.nextFundingTxid.equals(inflight.fundingTxid)) {
+				if (!inflight.receivedTxSignatures) {
+					const peerWantsCommitment =
+						msg.nextFundingRetransmitFlags === undefined ||
+						(msg.nextFundingRetransmitFlags & 1) === 1 ||
+						msg.nextCommitmentNumber === 0n;
+					if (peerWantsCommitment) {
+						// Re-sign commitment #0 byte-identically (RFC 6979 over
+						// the same funding outpoint and per-commitment point;
+						// taproot cannot appear here). This is also the release
+						// of a commitment we OWED: a crash between the persist
+						// that recorded the peer's commitment_signed and our own
+						// send leaves the peer asking for a signature that never
+						// left, and BOLT 2 numbers alone would never resend it.
+						this._v2SentCommitment = false;
+						actions.push(...this._maybeSendV2Commitment());
+					}
+					if (this._v2ReceivedCommitment) {
+						if (inflight.sentTxSignatures) {
+							// Past the point of no return: replay the recorded
+							// witnesses, never re-sign.
+							actions.push(...this._retransmitV2TxSignatures());
+						} else {
+							this._v2TxSigsReleased = false;
+							actions.push(...this._maybeSendV2TxSigs());
+						}
+					}
+				} else {
+					// We are fully signed; the peer only needs our tx_signatures.
+					actions.push(...this._retransmitV2TxSignatures());
+				}
+			} else if (inflight) {
+				return this._failChannelWithWireError(
+					'channel_reestablish next_funding_txid does not match the in-flight v2 open'
+				);
+			} else if (this._state.channelId) {
+				// A live session that never reached its commitment round holds
+				// nothing the peer's txid could name — tell it to forget.
+				actions.push(
+					this._txAbort(this._state.channelId, 'unknown next_funding_txid')
+				);
+			}
+		} else if (
+			inflight &&
+			!inflight.sentTxSignatures &&
+			!inflight.receivedTxSignatures
+		) {
+			// The peer reestablished without next_funding while no tx_signatures
+			// crossed in either direction: it has forgotten the open (BOLT 2
+			// lets it, before its commitment_signed left). Unwind ours; the
+			// tx_abort converges a peer that merely lagged. With sentTxSignatures
+			// set, omission is instead EXPECTED (the peer received our
+			// signatures and MUST NOT set the TLV) and nothing happens.
+			this._state.dualFundingSession?.abort();
+			this._state.dualFundingSession = null;
+			this._resetV2Driver();
+			this._state.v2InFlight = null;
+			this._state.state = ChannelState.ERRORED;
+			if (this._state.channelId) {
+				actions.push(
+					this._txAbort(
+						this._state.channelId,
+						'peer reestablished without next_funding_txid'
+					)
+				);
 			}
 		}
 
@@ -6085,6 +6275,45 @@ export class Channel {
 	}
 
 	/**
+	 * Rebuild the in-memory v2 opening session/driver from the persisted
+	 * in-flight record (state.v2InFlight) after a restart. Call before
+	 * markForReestablish() so the open survives the reconnect handling. The
+	 * rebuilt session is builder-less: the negotiated funding tx and our
+	 * witnesses come from the record, never from re-signing.
+	 */
+	restoreV2InFlight(): void {
+		const inflight = this._state.v2InFlight;
+		if (!inflight || this._state.dualFundingSession) return;
+		if (!this._state.channelId || !this._state.remoteBasepoints) return;
+		// Taproot v2 opens fail closed before any signature, so a taproot
+		// record cannot exist; refuse to resume one rather than resume into a
+		// MuSig2 exchange that does not exist.
+		if (isTaprootChannel(this._state.channelType)) return;
+
+		this._state.dualFundingSession = DualFundingSession.restore({
+			channelId: this._state.channelId,
+			isInitiator: inflight.isInitiator,
+			remoteContributionSats: inflight.remoteContributionSats,
+			fundingTxid: inflight.fundingTxid,
+			fundingOutputIndex: inflight.fundingOutputIndex,
+			ourWitnesses: inflight.sentTxSignatures
+				? inflight.ourWitnesses.map((w) => w.map((b) => Buffer.from(b)))
+				: null,
+			receivedTxSignatures: inflight.receivedTxSignatures
+		});
+		// The record only exists once our initial commitment_signed left (or
+		// was owed against the persist that recorded the peer's).
+		this._v2SentCommitment = true;
+		this._v2ReceivedCommitment = inflight.remoteCommitmentSig !== null;
+		this._v2TxSigsReleased = inflight.sentTxSignatures;
+		// Defensive: the commitment round set these before the first persist.
+		if (!this._state.fundingTxid) {
+			this._state.fundingTxid = Buffer.from(inflight.fundingTxid);
+			this._state.fundingOutputIndex = inflight.fundingOutputIndex;
+		}
+	}
+
+	/**
 	 * Record that the splice tx reached confirmation depth while splice_locked
 	 * could not be sent (e.g. the channel was AWAITING_REESTABLISH). The lock is
 	 * flushed by handleReestablish on the next reconnect.
@@ -6114,11 +6343,23 @@ export class Channel {
 		// (number 0) is delivered inside funding_created/funding_signed, so the
 		// first commitment_signed a peer can expect is number 1. Zero means the
 		// peer's state is corrupt or hostile; fail the channel loudly rather
-		// than fall through the retransmission logic with it.
+		// than fall through the retransmission logic with it. One exception:
+		// pre-#1289 dual-funding peers (eclair 0.13.x) signal a missing initial
+		// commitment_signed for an interactive OPEN with next_commitment_number
+		// 0 beside next_funding, instead of the retransmit flag; the matching
+		// txid proves that context, and the v2 resumption below treats it as
+		// the retransmit request it is.
 		if (msg.nextCommitmentNumber === 0n) {
-			return this._failChannelWithWireError(
-				'channel_reestablish next_commitment_number is 0'
-			);
+			const v2Txid = this._inFlightUnsignedV2Txid();
+			if (
+				!v2Txid ||
+				!msg.nextFundingTxid ||
+				!msg.nextFundingTxid.equals(v2Txid)
+			) {
+				return this._failChannelWithWireError(
+					'channel_reestablish next_commitment_number is 0'
+				);
+			}
 		}
 
 		// ── Data loss protection: validate yourLastPerCommitmentSecret ──
@@ -6474,8 +6715,17 @@ export class Channel {
 			this._state.preReestablishState = null;
 		}
 
-		// ── Splice resumption (merged splice spec) ──
-		actions.push(...this._handleReestablishSplice(msg));
+		// ── Interactive-tx resumption ──
+		// A channel is never mid-splice and mid-open at once: while a v2 open
+		// is in flight, next_funding routes through the v2 handler (the splice
+		// handler would answer the open's txid with tx_abort). Everything else
+		// takes the splice handler, whose unknown-txid answer also serves a
+		// peer resuming a v2 open we dropped or never recorded.
+		if (this._v2OpenResuming()) {
+			actions.push(...this._handleReestablishV2(msg));
+		} else {
+			actions.push(...this._handleReestablishSplice(msg));
+		}
 
 		// ── Retransmit channel_ready if we sent it previously (BOLT 2 §5) ──
 		// Spec trigger: the peer's next_commitment_number == 1 proves it never
@@ -10779,6 +11029,15 @@ export class Channel {
 	}
 
 	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
+		// The record (created at the commitment point from the live builder) is
+		// authoritative once it exists, and the only source after a restart.
+		const record = this._state.v2InFlight;
+		if (record) {
+			return {
+				txid: Buffer.from(record.fundingTxid),
+				outputIndex: record.fundingOutputIndex
+			};
+		}
 		const built = this._v2NegotiatedTx();
 		if (!built) return null;
 		return {
@@ -11028,6 +11287,10 @@ export class Channel {
 	private _v2ShouldSignFirst(): boolean {
 		const session = this._state.dualFundingSession;
 		if (!session) return false;
+		// Captured from the live builder at record creation; the only source
+		// after a restart, and stable for the whole attempt either way.
+		const record = this._state.v2InFlight;
+		if (record) return record.weSignFirst;
 		const builder = session.getTxBuilder();
 		if (!builder) return !session.isInitiator();
 		let ours = 0n;

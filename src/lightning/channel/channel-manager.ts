@@ -1415,6 +1415,10 @@ export class ChannelManager extends EventEmitter {
 			// splice BEFORE markForReestablish, so the splice survives the
 			// reconnect handling (markForReestablish keeps it only when present).
 			channel.restoreSpliceInFlight();
+			// Same for a v2 open past its initial commitment_signed: rebuild the
+			// builder-less session from the durable record so the signature
+			// exchange resumes over channel_reestablish.next_funding.
+			channel.restoreV2InFlight();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish
@@ -1425,7 +1429,13 @@ export class ChannelManager extends EventEmitter {
 				st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 				st === ChannelState.AWAITING_CHANNEL_READY ||
 				st === ChannelState.SHUTTING_DOWN ||
-				st === ChannelState.SPLICING
+				st === ChannelState.SPLICING ||
+				// A v2 open is only reestablishable when the durable record made
+				// it resumable; a row persisted before the record existed keeps
+				// its legacy shape (an inert AWAITING_TX_SIGNATURES orphan, and
+				// the quorum startup guard still gets to see it).
+				(st === ChannelState.AWAITING_TX_SIGNATURES &&
+					channel.getFullState().v2InFlight != null)
 			) {
 				channel.markForReestablish();
 			}
