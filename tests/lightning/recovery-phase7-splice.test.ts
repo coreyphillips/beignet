@@ -5,11 +5,14 @@
  *
  * - Interactive transaction construction and `tx_signatures` (row 6: D3
  *   while unsigned, D2 once `tx_signatures` is out) and splice RBF (row
- *   7, D3): the S4 splice sweep. It is SKIPPED pending #294, an infinite
+ *   7, D3): the S4 splice sweep. The sweep found #294 here, an infinite
  *   `tx_abort` loop between two honest nodes after a restart during a
- *   splice, which the harness's wire valve turns into a diagnosable
- *   failure instead of a dead runner. Every splice kill point trips it,
- *   so there is no partial window to sweep the way #291 and #293 allow.
+ *   splice (fixed in #299; the harness's wire valve is what turned the
+ *   loop into a diagnosable failure instead of a dead runner). Verdicts
+ *   are derived from the disk the kill left behind: no in-flight record
+ *   means the restart must talk both sides out of the splice and leave a
+ *   working channel; a durable in-flight record means both sides must
+ *   still agree on the splice after reestablish.
  * - Temporary to permanent channel id promotion (row 10, D1 required):
  *   covered here through its quorum-mode scope limit. Phase 6 refuses NEW
  *   v2 opens whenever quorum enforcement is active
@@ -23,9 +26,19 @@
 
 import { expect } from 'chai';
 import { QUORUM_NO_DUAL_FUND_REFUSAL } from '../../src/lightning/channel/channel-manager';
-import { makeChaosEnv } from './helpers/chaos-harness';
+import { ChannelState } from '../../src/lightning/channel/types';
+import {
+	makeChaosEnv,
+	recordSchedule,
+	runKillPoint,
+	settle
+} from './helpers/chaos-harness';
 import { quorumOptions, withNamespace } from './helpers/chaos-quorum';
-import { s1aSenderPays, s4SplicesIn } from './helpers/chaos-scenarios';
+import {
+	CHAOS_ENV,
+	s1aSenderPays,
+	s4SplicesIn
+} from './helpers/chaos-scenarios';
 
 describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 	it('quorum mode refuses a new v2 open before any side effect, so the promotion row has no reachable kill points there', async function () {
@@ -89,11 +102,77 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		}
 	});
 
-	// Flip on when #294 is fixed: every splice kill point currently ends in
-	// an unbounded tx_abort exchange, so the sweep cannot distinguish a
-	// resumable cell from a broken one.
-	it.skip('S4 splice: every boundary abandons or replays exactly (needs the #294 fix)', async function () {
+	it('S4 splice: every boundary converges, abandoning or resuming per what the disk holds', async function () {
 		this.timeout(300_000);
-		void s4SplicesIn;
+		const { schedule } = await recordSchedule('local', s4SplicesIn, CHAOS_ENV);
+		expect(
+			schedule.length,
+			'the splice flow produced kill labels'
+		).to.be.at.least(4);
+		let abandoned = 0;
+		let resumed = 0;
+		for (const label of schedule) {
+			const result = await runKillPoint('local', s4SplicesIn, label, CHAOS_ENV);
+			const at = `at ${label}`;
+			for (let i = 0; i < 10; i++) await settle();
+
+			const diskInflight =
+				result.restoredStorage.loadAllChannels()[0]?.state.spliceInFlight ??
+				null;
+			const victimChannel = result.restored
+				.getChannelManager()
+				.listChannels()[0];
+			const peerChannel = result.env.peers[0]
+				.getChannelManager()
+				.listChannels()[0];
+			const victimState = victimChannel.getFullState();
+			const peerState = peerChannel.getFullState();
+
+			if (diskInflight === null) {
+				// Nothing irreversible was durable: the restart knows no
+				// splice, and the reestablish abort exchange must talk BOTH
+				// sides out of it, terminating (the valve rode the run) with
+				// the channel back in normal operation.
+				abandoned++;
+				expect(
+					victimChannel.getState(),
+					`victim back to NORMAL ${at}`
+				).to.equal(ChannelState.NORMAL);
+				expect(peerChannel.getState(), `peer back to NORMAL ${at}`).to.equal(
+					ChannelState.NORMAL
+				);
+				expect(
+					victimState.spliceInFlight,
+					`victim carries no splice ${at}`
+				).to.equal(null);
+				expect(
+					peerState.spliceInFlight,
+					`peer carries no splice ${at}`
+				).to.equal(null);
+			} else {
+				// The splice was durably in flight: the reestablish must keep
+				// both sides on it, agreeing on the same splice transaction.
+				resumed++;
+				expect(
+					victimState.spliceInFlight,
+					`victim still holds the splice ${at}`
+				).to.not.equal(null);
+				expect(
+					peerState.spliceInFlight,
+					`peer still holds the splice ${at}`
+				).to.not.equal(null);
+				expect(
+					Buffer.from(victimState.spliceInFlight!.spliceTxid).toString('hex'),
+					`both sides agree on the splice tx ${at}`
+				).to.equal(
+					Buffer.from(peerState.spliceInFlight!.spliceTxid).toString('hex')
+				);
+			}
+			result.destroyAll();
+		}
+		// A schedule change that stops reaching either regime has silently
+		// stopped testing the row.
+		expect(abandoned, 'cells that abandoned').to.be.at.least(1);
+		expect(resumed, 'cells that resumed').to.be.at.least(1);
 	});
 });
