@@ -20,11 +20,11 @@
  * The #291 redispatch window appeared here in its FORWARD form (killed
  * between the inbound add becoming durable and the forward linkage
  * becoming durable, the restart re-forwarded only through a repair pass
- * whose trigger was broken). Fixed in #292, so local and async-remote now
- * run every cell. Quorum mode skips one cell pending #295, a distinct
- * defect this widened sweep then found: killed once the onward HTLC is
- * irrevocable, the restart resolves the downstream leg and never fulfills
- * upstream.
+ * whose trigger was broken; fixed in #292). The widened sweep then found
+ * #295 in quorum mode: the pipeline persisted the processed downstream
+ * fulfill ahead of the preimage commit, and the restart swallowed the
+ * peer's replayed fulfill (fixed in #296). Every mode now runs every
+ * cell.
  */
 
 import { expect } from 'chai';
@@ -73,46 +73,16 @@ function assertForwardOutcome(
 	};
 }
 
-/**
- * The window #295 covers: from the commit that follows the onward round's
- * revoke_and_ack (the outgoing HTLC is now irrevocable) up to the commit
- * that authorizes the upstream fulfill. Derived from the schedule's shape
- * rather than pinned to ordinals, so it keeps naming the same boundaries
- * if the schedule moves.
- */
-function quorumForwardDefectWindow(schedule: KillLabel[]): Set<KillLabel> {
-	const revokeIdx = schedule.indexOf(
-		postSendLabel(MessageType.REVOKE_AND_ACK, 2)
-	);
-	const fulfillIdx = schedule.indexOf(
-		postSendLabel(MessageType.UPDATE_FULFILL_HTLC, 1)
-	);
-	if (revokeIdx < 0 || fulfillIdx < 0) return new Set();
-	return new Set(schedule.slice(revokeIdx + 1, fulfillIdx - 1));
-}
-
 describe('Recovery phase 7: forward kill sweep (payer -> victim -> payee)', () => {
 	for (const mode of ['local', 'async-remote', 'quorum'] as const) {
 		it(`S2 forwarder: every boundary resumes exactly in ${mode} mode`, async function () {
 			this.timeout(300_000);
 			let outcome: ReturnType<typeof assertForwardOutcome> | null = null;
-			let window: Set<KillLabel> | null = null;
-			let skipped = 0;
 			const { schedule, executed } = await runKillMatrix(
 				mode,
 				mode === 'quorum' ? withNamespace(s2ForwarderDies) : s2ForwarderDies,
-				(label, fullSchedule) => {
+				(_label, fullSchedule) => {
 					outcome ??= assertForwardOutcome(fullSchedule);
-					// #295: in quorum mode, killed anywhere between the onward
-					// HTLC becoming irrevocable and the upstream fulfill being
-					// authorized, the restart resolves the downstream leg and
-					// never fulfills upstream. Local and async-remote run every
-					// cell.
-					window ??= quorumForwardDefectWindow(fullSchedule);
-					if (mode === 'quorum' && window.has(label)) {
-						skipped++;
-						return 'skip';
-					}
 					return 'exact-resume';
 				},
 				async (result, verdict) => outcome!(result, verdict),
@@ -120,7 +90,7 @@ describe('Recovery phase 7: forward kill sweep (payer -> victim -> payee)', () =
 					? quorumOptions({}, CHAOS_FORWARD_ENV)
 					: CHAOS_FORWARD_ENV
 			);
-			expect(executed).to.equal(schedule.length - skipped);
+			expect(executed).to.equal(schedule.length);
 			expect(
 				schedule.includes(postSendLabel(MessageType.UPDATE_FULFILL_HTLC, 1)),
 				'the sweep crossed the upstream fulfill boundary'
