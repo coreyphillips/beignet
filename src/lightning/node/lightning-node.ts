@@ -2169,6 +2169,15 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('channel:restore-ready', (channelId: Buffer) => {
 			this.redispatchUnresolvedReceivedHtlcs(channelId);
 		});
+		// A forward whose downstream leg settled while this inbound channel
+		// could not carry the fulfill (killed process, or a live disconnect
+		// at the moment the fulfill arrived) is owed its settle the moment
+		// the channel can carry updates again. The pass gates on durable
+		// facts only, which is what makes it safe on this every-reconnect
+		// event where the restore repair above is not.
+		this.channelManager.on('channel:reestablished', (channelId: Buffer) => {
+			this.settleForwardsOwedUpstream(channelId);
+		});
 		this.channelManager.on('channel:ready', (channelId: Buffer) => {
 			this.registerChannelScids(channelId);
 			this.persistChannel(channelId);
@@ -11729,41 +11738,7 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
-			// Clean up shared secret for the incoming leg
-			this.cleanupHtlcSharedSecret(
-				`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
-			);
-			// Deliver the preimage to the chain monitors before settling the incoming
-			// leg. We learned this preimage from the downstream fulfill; if the incoming
-			// channel force-closes before our upstream fulfill confirms, the monitor must
-			// already hold the preimage to claim the inbound HTLC on-chain. Without this
-			// the forwarded value is lost via the counterparty's timeout path.
-			this.channelManager.recordPreimage(preimageHash, preimage);
-			// Both legs of the forward settle here: record the ledger entry now,
-			// while both HTLC entries still exist (they are dropped on revoke)
-			this.recordForwardingEvent(channelId, htlcId, forward);
-			// The preimage, the closed-out linkage and the upstream fulfill are
-			// ONE transition: this is the preimage that lets us claim the
-			// inbound leg for value we have already paid downstream, so it must
-			// never be on the wire without being on disk.
-			this.withStagedMutations(
-				[
-					{
-						type: 'payment_preimage',
-						paymentHash: preimageHash.toString('hex'),
-						preimage
-					},
-					{ type: 'delete_forwarded_htlc', outKey }
-				],
-				() => {
-					this.channelManager.fulfillHtlc(
-						forward.inChannelId,
-						forward.inHtlcId,
-						preimage
-					);
-				}
-			);
-			this.forwardedHtlcs.delete(outKey);
+			this.settleForwardUpstream(outKey, forward, preimage, preimageHash);
 			this.persistChannel(channelId);
 			return;
 		}
@@ -11820,17 +11795,123 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Persist a forwarding-ledger entry for a forward whose downstream fulfill
-	 * just arrived. Amounts come from the live HTLC entries on both legs; they
-	 * still exist at this point (removed only on the later revoke_and_ack). A
-	 * forward restored after a restart whose entries are already gone is
-	 * skipped: there is no accurate amount left to record.
+	 * Propagate a downstream fulfill to the inbound leg it pays for. Returns
+	 * whether the inbound channel accepted the fulfill.
+	 *
+	 * The preimage reaches the chain monitors unconditionally, but the
+	 * linkage delete and the forwarding ledger row are consumed ONLY when
+	 * the inbound channel can actually carry the fulfill: they ride the same
+	 * storage transaction as the fulfill's own state, so a crash cannot
+	 * separate them, and a refusal (inbound peer disconnected, or still
+	 * mid-reestablish when a restart's replayed fulfill arrives) leaves the
+	 * linkage in place for settleForwardsOwedUpstream to retry once the
+	 * channel returns to NORMAL. Consuming it around a refused fulfill
+	 * would strand the upstream leg and, worse, prime the restore-time
+	 * redispatch pass to forward the same inbound HTLC a second time.
+	 *
+	 * Repeat-tolerant by construction: the linkage row survives exactly
+	 * until the settle it admits becomes durable, so a replayed fulfill
+	 * that finds it is not a duplicate but the first effective run, and one
+	 * that does not finds nothing to redo.
 	 */
-	private recordForwardingEvent(
+	private settleForwardUpstream(
+		outKey: string,
+		forward: { inChannelId: Buffer; inHtlcId: bigint },
+		preimage: Buffer,
+		preimageHash: Buffer
+	): boolean {
+		// Deliver the preimage to the chain monitors before settling the
+		// incoming leg. We learned this preimage from the downstream fulfill;
+		// if the incoming channel force-closes before our upstream fulfill
+		// confirms, the monitor must already hold the preimage to claim the
+		// inbound HTLC on-chain. Without this the forwarded value is lost via
+		// the counterparty's timeout path.
+		this.channelManager.recordPreimage(preimageHash, preimage);
+
+		// The gate that keeps the staged consumption honest: everything
+		// staged below commits with the fulfill's transition or, if nothing
+		// commits inside the callback, on its own. A refusal must therefore
+		// be established BEFORE staging, not discovered after.
+		const inChannel = this.channelManager.getChannel(forward.inChannelId);
+		if (!inChannel || !inChannel.canFulfillHtlc(forward.inHtlcId)) {
+			return false;
+		}
+
+		// Both legs of the forward settle here: build the ledger entry now,
+		// while both HTLC entries still exist (they are dropped on revoke).
+		const outParts = outKey.split(':');
+		const outChannelId = Buffer.from(outParts[0], 'hex');
+		const outHtlcId = BigInt(outParts[1].replace('offered-', ''));
+		const ledger = this.buildForwardingEvent(outChannelId, outHtlcId, forward);
+
+		// The preimage, the closed-out linkage, the ledger row and the
+		// upstream fulfill are ONE transition: this is the preimage that lets
+		// us claim the inbound leg for value we have already paid downstream,
+		// so it must never be on the wire without being on disk.
+		const mutations: RecoveryMutation[] = [
+			{
+				type: 'payment_preimage',
+				paymentHash: preimageHash.toString('hex'),
+				preimage
+			},
+			{ type: 'delete_forwarded_htlc', outKey }
+		];
+		if (ledger?.mutation) mutations.push(ledger.mutation);
+		this.withStagedMutations(mutations, () => {
+			this.channelManager.fulfillHtlc(
+				forward.inChannelId,
+				forward.inHtlcId,
+				preimage
+			);
+		});
+		this.forwardedHtlcs.delete(outKey);
+		this.cleanupHtlcSharedSecret(
+			`${forward.inChannelId.toString('hex')}:${forward.inHtlcId}`
+		);
+		ledger?.emit();
+		return true;
+	}
+
+	/**
+	 * Settle upstream any forward on this inbound channel whose downstream
+	 * leg already revealed its preimage while the channel could not carry
+	 * the fulfill: the process was killed after the downstream settle
+	 * became durable, or the inbound peer was disconnected when it arrived.
+	 * Driven from every return to NORMAL (channel:ready).
+	 *
+	 * Gated on durable facts only: the linkage row survives exactly until
+	 * the upstream fulfill commits, the preimage exists only once the
+	 * downstream fulfill was processed, and a COMMITTED received HTLC is
+	 * the only shape owed a settle. All three hold or the pass skips, so
+	 * running it for a channel whose state never went away is a no-op.
+	 */
+	private settleForwardsOwedUpstream(inChannelId: Buffer): void {
+		const channel = this.channelManager.getChannel(inChannelId);
+		if (!channel) return;
+		const state = channel.getFullState();
+		for (const [outKey, forward] of [...this.forwardedHtlcs]) {
+			if (!forward.inChannelId.equals(inChannelId)) continue;
+			const entry = state.htlcs.get(`received-${forward.inHtlcId}`);
+			if (!entry || entry.state !== HtlcState.COMMITTED) continue;
+			const preimage = this.preimages.get(entry.paymentHash.toString('hex'));
+			if (!preimage) continue;
+			this.settleForwardUpstream(outKey, forward, preimage, entry.paymentHash);
+		}
+	}
+
+	/**
+	 * Build a forwarding-ledger entry for a forward whose downstream fulfill
+	 * arrived, as a stageable mutation plus the events to emit once the
+	 * settle actually happens. Amounts come from the live HTLC entries on
+	 * both legs; a forward whose entries are already gone (a replayed
+	 * fulfill settling after the removal rounds completed) yields null:
+	 * there is no accurate amount left to record.
+	 */
+	private buildForwardingEvent(
 		outChannelId: Buffer,
 		outHtlcId: bigint,
 		forward: { inChannelId: Buffer; inHtlcId: bigint }
-	): void {
+	): { mutation: RecoveryMutation | null; emit: () => void } | null {
 		const outState = this.channelManager
 			.getChannel(outChannelId)
 			?.getFullState();
@@ -11839,35 +11920,37 @@ export class LightningNode extends EventEmitter {
 			?.getFullState();
 		const outHtlc = outState?.htlcs.get(`offered-${outHtlcId}`);
 		const inHtlc = inState?.htlcs.get(`received-${forward.inHtlcId}`);
-		if (!outHtlc || !inHtlc) return;
+		if (!outHtlc || !inHtlc) return null;
 		const amountInMsat = inHtlc.amountMsat;
 		const amountOutMsat = outHtlc.amountMsat;
-		this.emit('htlc:forwarded', {
-			inChannelId: forward.inChannelId,
-			outChannelId,
-			amountInMsat,
-			amountOutMsat,
-			feeMsat: amountInMsat - amountOutMsat
-		});
-		// Resolution counterpart to the forward_attempt log, at the same level as
-		// a settled payment: a completed relay should leave a trace, not just an
-		// SSE event no log consumer sees.
-		this.emitStructuredLog('htlc', 'forwarded', {
-			paymentHash: inHtlc.paymentHash?.toString('hex'),
-			inChannelId: forward.inChannelId.toString('hex'),
-			outChannelId: outChannelId.toString('hex'),
-			amountInMsat: Number(amountInMsat),
-			amountOutMsat: Number(amountOutMsat),
-			feeMsat: Number(amountInMsat - amountOutMsat)
-		});
+		const emit = (): void => {
+			this.emit('htlc:forwarded', {
+				inChannelId: forward.inChannelId,
+				outChannelId,
+				amountInMsat,
+				amountOutMsat,
+				feeMsat: amountInMsat - amountOutMsat
+			});
+			// Resolution counterpart to the forward_attempt log, at the same
+			// level as a settled payment: a completed relay should leave a
+			// trace, not just an SSE event no log consumer sees.
+			this.emitStructuredLog('htlc', 'forwarded', {
+				paymentHash: inHtlc.paymentHash?.toString('hex'),
+				inChannelId: forward.inChannelId.toString('hex'),
+				outChannelId: outChannelId.toString('hex'),
+				amountInMsat: Number(amountInMsat),
+				amountOutMsat: Number(amountOutMsat),
+				feeMsat: Number(amountInMsat - amountOutMsat)
+			});
+		};
 		if (
 			!this.storage ||
 			typeof this.storage.saveForwardingEvent !== 'function'
 		) {
-			return;
+			return { mutation: null, emit };
 		}
-		this.commitMutations('saveForwardingEvent', [
-			{
+		return {
+			mutation: {
 				type: 'forwarding_event',
 				event: {
 					settledAt: Date.now(),
@@ -11879,8 +11962,9 @@ export class LightningNode extends EventEmitter {
 					amountOutMsat,
 					feeMsat: amountInMsat - amountOutMsat
 				}
-			}
-		]);
+			},
+			emit
+		};
 	}
 
 	/**
