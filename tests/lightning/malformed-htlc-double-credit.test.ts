@@ -17,6 +17,7 @@ import {
 	ChannelManager,
 	IChannelManagerConfig
 } from '../../src/lightning/channel/channel-manager';
+import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import {
 	ChannelState,
 	DEFAULT_CHANNEL_CONFIG,
@@ -121,7 +122,7 @@ describe('S-2.H1: update_fail_malformed_htlc two-phase removal', () => {
 		expect(entry.removalLocallyRevoked).to.equal(false);
 	});
 
-	it('is idempotent on a reestablish replay (second malformed fail is a no-op)', () => {
+	it('is idempotent on a reestablish replay, which re-emits without mutating', () => {
 		const { aChannel, channelId, offeredId } = setup('dedup');
 		const msg = {
 			channelId,
@@ -132,8 +133,20 @@ describe('S-2.H1: update_fail_malformed_htlc two-phase removal', () => {
 		aChannel.handleUpdateFailMalformedHtlc(msg);
 		const afterFirst = aChannel.getBalances().localMsat;
 
+		// A replay changes NO channel state (no double credit, no flag reset),
+		// but it is not silent either: HTLC_FAILED is re-emitted so the
+		// node-level refund it authorizes can be re-driven when the first
+		// emission's work was refused or lost (issue 297). The synthetic
+		// reason is rebuilt identically from the failure code.
 		const replay = aChannel.handleUpdateFailMalformedHtlc(msg);
-		expect(replay, 'replay is a no-op').to.deep.equal([]);
+		expect(replay.length, 'the replay re-emits exactly one action').to.equal(1);
+		expect(replay[0].type).to.equal(ChannelActionType.HTLC_FAILED);
 		expect(aChannel.getBalances().localMsat).to.equal(afterFirst);
+		const entry = [...aChannel.getFullState().htlcs.values()].find(
+			(h) => h.id === offeredId && h.direction === HtlcDirection.OFFERED
+		)!;
+		expect(entry.state, 'state untouched by the replay').to.equal(
+			HtlcState.FAILED
+		);
 	});
 });

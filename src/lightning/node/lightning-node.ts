@@ -11894,9 +11894,142 @@ export class LightningNode extends EventEmitter {
 			const entry = state.htlcs.get(`received-${forward.inHtlcId}`);
 			if (!entry || entry.state !== HtlcState.COMMITTED) continue;
 			const preimage = this.preimages.get(entry.paymentHash.toString('hex'));
-			if (!preimage) continue;
-			this.settleForwardUpstream(outKey, forward, preimage, entry.paymentHash);
+			if (preimage) {
+				this.settleForwardUpstream(
+					outKey,
+					forward,
+					preimage,
+					entry.paymentHash
+				);
+				continue;
+			}
+			// The fail side of the same debt (issue 297): the outgoing leg
+			// failed durably, but the fail owed upstream never became durable
+			// (killed process, or the inbound peer was disconnected when the
+			// downstream fail arrived). The downstream reason bytes died with
+			// the process, so the refund carries a synthesized
+			// temporary_channel_failure, which refunds the payer identically.
+			const outParts = outKey.split(':');
+			const outChannel = this.channelManager.getChannel(
+				Buffer.from(outParts[0], 'hex')
+			);
+			const outState = outChannel?.getFullState();
+			const outHtlc = outState?.htlcs.get(outParts[1]);
+			// An entry that is GONE from a live NORMAL outbound channel also
+			// means the leg failed: an off-chain fulfill makes its preimage
+			// durable BEFORE any removal round can complete, so the settle
+			// branch above would have taken it. A missing or closed outbound
+			// channel stays ambiguous (an on-chain claim can still reveal the
+			// preimage later) and is left to the chain machinery and the CLTV
+			// sweeper, exactly like scanForwardTimeouts.
+			const outgoingFailed =
+				outHtlc?.state === HtlcState.FAILED ||
+				(outHtlc === undefined &&
+					outState !== undefined &&
+					outState.state === ChannelState.NORMAL);
+			if (!outgoingFailed) continue;
+			const secretKey = `${forward.inChannelId.toString('hex')}:${
+				forward.inHtlcId
+			}`;
+			const sharedSecret = this.receivedHtlcSharedSecrets.get(secretKey);
+			const reason = sharedSecret
+				? createFailureMessage(sharedSecret, TEMPORARY_CHANNEL_FAILURE)
+				: Buffer.alloc(FAILURE_MESSAGE_LENGTH);
+			this.failForwardUpstream(
+				outKey,
+				forward,
+				Buffer.from(outParts[0], 'hex'),
+				forward.inHtlcId,
+				reason,
+				true
+			);
 		}
+	}
+
+	/**
+	 * Propagate a downstream failure to the inbound leg it refunds. Mirror
+	 * of settleForwardUpstream, with the same discipline (issue 297): the
+	 * forward linkage is consumed ONLY when the inbound channel actually
+	 * accepts the fail, riding the same storage transaction as the fail's
+	 * own state, and a refusal (inbound peer disconnected, or still
+	 * mid-reestablish when a restart's replayed fail arrives) leaves the
+	 * linkage for settleForwardsOwedUpstream to retry at the next
+	 * reestablish tail. `preWrapped` marks a reason that is already a
+	 * complete failure message (the owed-pass synthesis) rather than the
+	 * downstream's bytes to wrap.
+	 */
+	private failForwardUpstream(
+		outKey: string,
+		forward: { inChannelId: Buffer; inHtlcId: bigint },
+		outChannelId: Buffer,
+		outHtlcId: bigint,
+		reason: Buffer,
+		preWrapped = false
+	): boolean {
+		// Resolution counterpart to forward_attempt for the failure case, so
+		// every attempted forward pairs with a 'forwarded' or 'forward_failed'
+		// line rather than going silent when the downstream leg fails.
+		this.emitStructuredLog('htlc', 'forward_failed', {
+			inChannelId: forward.inChannelId.toString('hex'),
+			inHtlcId: Number(forward.inHtlcId),
+			outChannelId: outChannelId.toString('hex'),
+			outHtlcId: Number(outHtlcId)
+		});
+		this.emit('htlc:forward-failed', {
+			inChannelId: forward.inChannelId,
+			outChannelId
+		});
+
+		// The gate that keeps the staged consumption honest, exactly as in
+		// settleForwardUpstream: a refusal must be established BEFORE the
+		// linkage delete is staged, or the flush commits it standalone.
+		const inChannel = this.channelManager.getChannel(forward.inChannelId);
+		if (!inChannel || !inChannel.canFailHtlc(forward.inHtlcId)) {
+			return false;
+		}
+
+		const inHtlcSecretKey = `${forward.inChannelId.toString('hex')}:${
+			forward.inHtlcId
+		}`;
+		// BOLT 4 route blinding: a downstream failure of a blinded forward must
+		// NOT be relayed (it would leak the blinded portion); replace it with
+		// invalid_onion_blinding.
+		const blindedRole = this.blindedIncomingHtlcs.get(inHtlcSecretKey);
+		if (blindedRole) {
+			this.withStagedMutations(
+				[{ type: 'delete_forwarded_htlc', outKey }],
+				() => {
+					this.failBlindedIncomingHtlc(
+						forward.inChannelId,
+						forward.inHtlcId,
+						blindedRole
+					);
+				}
+			);
+			this.forwardedHtlcs.delete(outKey);
+			this.persistChannel(outChannelId);
+			return true;
+		}
+		const inSharedSecret = this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
+		const wrappedReason = preWrapped
+			? reason
+			: inSharedSecret
+			? wrapFailureMessage(inSharedSecret, reason)
+			: reason;
+		this.withStagedMutations(
+			[{ type: 'delete_forwarded_htlc', outKey }],
+			() => {
+				this.channelManager.failHtlc(
+					forward.inChannelId,
+					forward.inHtlcId,
+					wrappedReason
+				);
+			}
+		);
+		this.forwardedHtlcs.delete(outKey);
+		this.cleanupHtlcSharedSecret(inHtlcSecretKey);
+		this.persistChannel(outChannelId);
+		return true;
 	}
 
 	/**
@@ -12024,59 +12157,7 @@ export class LightningNode extends EventEmitter {
 		const outKey = `${channelId.toString('hex')}:offered-${htlcId}`;
 		const forward = this.forwardedHtlcs.get(outKey);
 		if (forward) {
-			// Resolution counterpart to forward_attempt for the failure case, so
-			// every attempted forward pairs with a 'forwarded' or 'forward_failed'
-			// line rather than going silent when the downstream leg fails.
-			this.emitStructuredLog('htlc', 'forward_failed', {
-				inChannelId: forward.inChannelId.toString('hex'),
-				inHtlcId: Number(forward.inHtlcId),
-				outChannelId: channelId.toString('hex'),
-				outHtlcId: Number(htlcId)
-			});
-			this.emit('htlc:forward-failed', {
-				inChannelId: forward.inChannelId,
-				outChannelId: channelId
-			});
-			const inHtlcSecretKey = `${forward.inChannelId.toString('hex')}:${
-				forward.inHtlcId
-			}`;
-			// BOLT 4 route blinding: a downstream failure of a blinded forward must
-			// NOT be relayed (it would leak the blinded portion); replace it with
-			// invalid_onion_blinding.
-			const blindedRole = this.blindedIncomingHtlcs.get(inHtlcSecretKey);
-			if (blindedRole) {
-				this.failBlindedIncomingHtlc(
-					forward.inChannelId,
-					forward.inHtlcId,
-					blindedRole
-				);
-				this.forwardedHtlcs.delete(outKey);
-				this.withStagedMutations(
-					[{ type: 'delete_forwarded_htlc', outKey }],
-					() => {
-						this.persistChannel(channelId);
-					}
-				);
-				return;
-			}
-			const inSharedSecret =
-				this.receivedHtlcSharedSecrets.get(inHtlcSecretKey);
-			const wrappedReason = inSharedSecret
-				? wrapFailureMessage(inSharedSecret, reason)
-				: reason;
-			this.cleanupHtlcSharedSecret(inHtlcSecretKey);
-			this.channelManager.failHtlc(
-				forward.inChannelId,
-				forward.inHtlcId,
-				wrappedReason
-			);
-			this.forwardedHtlcs.delete(outKey);
-			this.withStagedMutations(
-				[{ type: 'delete_forwarded_htlc', outKey }],
-				() => {
-					this.persistChannel(channelId);
-				}
-			);
+			this.failForwardUpstream(outKey, forward, channelId, htlcId, reason);
 			return;
 		}
 

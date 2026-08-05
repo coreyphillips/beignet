@@ -2193,6 +2193,16 @@ export class Channel {
 		);
 	}
 
+	/**
+	 * Whether failHtlc would currently accept this received HTLC. Same
+	 * contract and purpose as canFulfillHtlc above: callers that pair
+	 * irreversible bookkeeping with the fail check this first, because a
+	 * refused fail must not consume the bookkeeping a later retry needs.
+	 */
+	canFailHtlc(htlcId: bigint): boolean {
+		return this.canFulfillHtlc(htlcId);
+	}
+
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
@@ -2533,10 +2543,22 @@ export class Channel {
 			];
 		}
 
-		// Dedup check: a reestablish replay of a fail we already processed
-		// (BOLT 2 update retransmission) is a no-op.
+		// A reestablish replay of a fail we already processed (BOLT 2 update
+		// retransmission) changes no channel state, but it must still re-emit
+		// HTLC_FAILED: the channel state carrying FAILED can reach disk in a
+		// commit that precedes the node-level upstream fail (the quorum
+		// pipeline persists deferred snapshots, the same window as issue 295's
+		// fulfill side), and swallowing the replay leaves the inbound leg
+		// stalled until the CLTV sweeper. Every listener on the resulting
+		// event is repeat-tolerant (issue 297).
 		if (entry.state === HtlcState.FAILED) {
-			return [];
+			return [
+				{
+					type: ChannelActionType.HTLC_FAILED,
+					htlcId: msg.id,
+					reason: msg.reason
+				}
+			];
 		}
 
 		entry.state = HtlcState.FAILED;
@@ -2598,10 +2620,20 @@ export class Channel {
 			];
 		}
 
-		// Dedup check: a reestablish replay of a fail we already processed is a
-		// no-op.
+		// A replay of a malformed-fail we already processed re-emits the event
+		// for the same reason as handleUpdateFailHtlc above (issue 297); the
+		// synthetic reason is rebuilt identically from the failure code.
 		if (entry.state === HtlcState.FAILED) {
-			return [];
+			const replayReason = Buffer.alloc(4);
+			replayReason.writeUInt16BE(msg.failureCode, 0);
+			replayReason.writeUInt16BE(0, 2);
+			return [
+				{
+					type: ChannelActionType.HTLC_FAILED,
+					htlcId: msg.id,
+					reason: replayReason
+				}
+			];
 		}
 
 		// A malformed-HTLC removal follows the SAME two-phase settlement as a plain
