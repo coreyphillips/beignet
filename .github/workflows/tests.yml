@@ -63,6 +63,13 @@ jobs:
       - name: Run lightning unit tests
         run: npm run test:lightning
 
+      # The process-level chaos matrix SIGKILLs a real LightningNode child
+      # (built against dist) at every recorded boundary; its cost and any
+      # flakes stay visible in their own step instead of hiding inside the
+      # lightning suite.
+      - name: Run SIGKILL chaos matrix
+        run: npm run test:sigkill
+
       - name: Run CLI unit tests
         run: npm run test:cli
 
