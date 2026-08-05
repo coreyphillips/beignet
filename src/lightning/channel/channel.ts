@@ -505,6 +505,18 @@ export class Channel {
 	 */
 	announcementChainHash: Buffer = BITCOIN_CHAIN_HASH;
 	private _spliceAbortPending = false;
+	/**
+	 * We have sent a tx_abort on the current negotiation (proactively, as an
+	 * echo, or refusing a peer message). BOLT 2: a node that has itself sent
+	 * tx_abort MUST NOT send another in reply to the peer's, so while this is
+	 * set, handleTxAbort consumes incoming aborts silently. Without it, two
+	 * nodes that have both forgotten the transaction answer each other's
+	 * answers forever (issue 294): the ack-latch above is a boolean, so a
+	 * second outstanding abort of ours already overflowed it, and each echo
+	 * then met a side with no session and no memory of having answered.
+	 * Cleared on disconnect and when a fresh interactive negotiation starts.
+	 */
+	private _txAbortSent = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
 	// tx_abort) by retransmitting ours. Without the latch two nodes that both
@@ -5562,6 +5574,7 @@ export class Channel {
 		// Neither a tx_abort handshake nor the reestablish-retransmit latch
 		// survives a disconnect.
 		this._spliceAbortPending = false;
+		this._txAbortSent = false;
 		this._reestablishRetransmitted = false;
 
 		// A partially collected start_batch is connection-scoped: the peer
@@ -5758,12 +5771,9 @@ export class Channel {
 			this._forgottenSplice = false;
 			this._spliceAbortPending = true;
 			actions.push(
-				sendMsg(
-					MessageType.TX_ABORT,
-					encodeTxAbortMessage({
-						channelId: this._state.channelId,
-						data: Buffer.from('splice not resumable after disconnect', 'utf8')
-					})
+				this._txAbort(
+					this._state.channelId,
+					'splice not resumable after disconnect'
 				)
 			);
 		}
@@ -5890,13 +5900,7 @@ export class Channel {
 				// We never signed a splice with this txid — tell the peer to forget it.
 				this._spliceAbortPending = true;
 				actions.push(
-					sendMsg(
-						MessageType.TX_ABORT,
-						encodeTxAbortMessage({
-							channelId: this._state.channelId,
-							data: Buffer.from('unknown next_funding_txid', 'utf8')
-						})
-					)
+					this._txAbort(this._state.channelId, 'unknown next_funding_txid')
 				);
 			}
 		} else if (
@@ -6769,6 +6773,10 @@ export class Channel {
 			locktime
 		};
 
+		// A fresh negotiation opens a fresh tx_abort conversation: an abort of
+		// THIS session deserves its echo even if an earlier one on this
+		// connection was already answered.
+		this._txAbortSent = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.initiate();
 
@@ -6828,13 +6836,7 @@ export class Channel {
 			const abort: ChannelAction[] = [];
 			if (this._state.channelId) {
 				abort.push(
-					sendMsg(
-						MessageType.TX_ABORT,
-						encodeTxAbortMessage({
-							channelId: this._state.channelId,
-							data: Buffer.from('taproot splicing unsupported', 'utf8')
-						})
-					)
+					this._txAbort(this._state.channelId, 'taproot splicing unsupported')
 				);
 			}
 			abort.push({
@@ -6863,6 +6865,7 @@ export class Channel {
 			locktime: msg.locktime
 		};
 
+		this._txAbortSent = false;
 		this._spliceSession = new SpliceSession(params);
 		const result = this._spliceSession.handleSplice(msg);
 
@@ -6932,12 +6935,9 @@ export class Channel {
 			this._state.fundingSatoshis + this._spliceSession.getNetCapacityChange();
 		if (postSpliceCapacity > this._maxFundingSatoshis) {
 			const actions: ChannelAction[] = [
-				sendMsg(
-					MessageType.TX_ABORT,
-					encodeTxAbortMessage({
-						channelId: this._state.channelId!,
-						data: Buffer.from('post-splice capacity exceeds maximum', 'utf8')
-					})
+				this._txAbort(
+					this._state.channelId!,
+					'post-splice capacity exceeds maximum'
 				)
 			];
 			actions.push(
@@ -6960,12 +6960,9 @@ export class Channel {
 			this._spliceInInputs?.inputs.some((i) => i.confirmed === false)
 		) {
 			const actions: ChannelAction[] = [
-				sendMsg(
-					MessageType.TX_ABORT,
-					encodeTxAbortMessage({
-						channelId: this._state.channelId!,
-						data: Buffer.from('require_confirmed_inputs not satisfied', 'utf8')
-					})
+				this._txAbort(
+					this._state.channelId!,
+					'require_confirmed_inputs not satisfied'
 				)
 			];
 			actions.push(
@@ -9384,6 +9381,7 @@ export class Channel {
 		this._state.localConfig.maxHtlcValueInFlightMsat =
 			result.message.maxHtlcValueInFlightMsat;
 
+		this._txAbortSent = false;
 		this._state.dualFundingSession = session;
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
@@ -9480,6 +9478,7 @@ export class Channel {
 		this._state.localConfig.maxHtlcValueInFlightMsat =
 			result.message.maxHtlcValueInFlightMsat;
 
+		this._txAbortSent = false;
 		this._state.dualFundingSession = session;
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
 		this._state.remoteCurrentPerCommitmentPoint = msg.firstPerCommitmentPoint;
@@ -9910,15 +9909,9 @@ export class Channel {
 					msg.prevTxVout !== this._state.fundingOutputIndex
 				) {
 					return [
-						sendMsg(
-							MessageType.TX_ABORT,
-							encodeTxAbortMessage({
-								channelId: this._state.channelId!,
-								data: Buffer.from(
-									'splice shared input does not match the channel funding outpoint',
-									'utf8'
-								)
-							})
+						this._txAbort(
+							this._state.channelId!,
+							'splice shared input does not match the channel funding outpoint'
 						),
 						...this.abortSplice(
 							'peer splice shared input does not match the channel funding outpoint'
@@ -9951,13 +9944,7 @@ export class Channel {
 				// splice that means tx_abort + unwind; the channel keeps operating
 				// on the existing funding output.
 				return [
-					sendMsg(
-						MessageType.TX_ABORT,
-						encodeTxAbortMessage({
-							channelId: this._state.channelId!,
-							data: Buffer.from(err, 'utf8')
-						})
-					),
+					this._txAbort(this._state.channelId!, err),
 					...this.abortSplice(err),
 					{ type: ChannelActionType.ERROR, message: `splice aborted: ${err}` }
 				];
@@ -11432,12 +11419,9 @@ export class Channel {
 		// error the peer cannot interpret.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
 			return [
-				sendMsg(
-					MessageType.TX_ABORT,
-					encodeTxAbortMessage({
-						channelId: this._state.channelId ?? msg.channelId,
-						data: Buffer.from('splice RBF not supported', 'utf8')
-					})
+				this._txAbort(
+					this._state.channelId ?? msg.channelId,
+					'splice RBF not supported'
 				)
 			];
 		}
@@ -11454,12 +11438,9 @@ export class Channel {
 			// Spec-conformant refusal: tx_abort with the reason, plus the
 			// app-level error for observability.
 			return [
-				sendMsg(
-					MessageType.TX_ABORT,
-					encodeTxAbortMessage({
-						channelId: this._v2ChannelId(),
-						data: Buffer.from(result.error || 'Failed to handle RBF', 'utf8')
-					})
+				this._txAbort(
+					this._v2ChannelId(),
+					result.error || 'Failed to handle RBF'
 				),
 				{
 					type: ChannelActionType.ERROR,
@@ -11498,16 +11479,24 @@ export class Channel {
 		session.abort();
 		this._state.state = ChannelState.ERRORED;
 
-		const data = reason ? Buffer.from(reason, 'utf8') : Buffer.alloc(0);
-		return [
-			sendMsg(
-				MessageType.TX_ABORT,
-				encodeTxAbortMessage({
-					channelId: this._v2ChannelId(),
-					data
-				})
-			)
-		];
+		return [this._txAbort(this._v2ChannelId(), reason)];
+	}
+
+	/**
+	 * Compose a tx_abort send and remember that WE have sent one on this
+	 * negotiation. Every tx_abort this channel emits goes through here, so
+	 * handleTxAbort can enforce BOLT 2's "having sent one, never answer the
+	 * peer's with another" without each send site remembering to mark.
+	 */
+	private _txAbort(channelId: Buffer, reason?: string): ChannelAction {
+		this._txAbortSent = true;
+		return sendMsg(
+			MessageType.TX_ABORT,
+			encodeTxAbortMessage({
+				channelId,
+				data: reason ? Buffer.from(reason, 'utf8') : Buffer.alloc(0)
+			})
+		);
 	}
 
 	/**
@@ -11521,6 +11510,19 @@ export class Channel {
 			return [];
 		}
 
+		// We have already sent a tx_abort on this negotiation: this incoming
+		// one is the peer's own abort crossing ours, or an answer to an echo
+		// of ours the ack-latch above already consumed. BOLT 2: a node that
+		// has itself sent tx_abort MUST NOT send another in reply. Answering
+		// here is what wedged two honest nodes into an unbounded echo loop
+		// after a restart mid-splice (issue 294): the restarted side sends
+		// two aborts (the proactive forget and the answer to the peer's
+		// next_funding_txid), the one-shot latch absorbs only one ack, and
+		// from then on each side saw only "no session, so echo".
+		if (this._txAbortSent) {
+			return [];
+		}
+
 		// A splice tx_abort unwinds the splice and returns the channel to normal
 		// operation (the existing channel is unaffected), rather than erroring it.
 		// BOLT 2: a node receiving tx_abort that has not itself sent one MUST
@@ -11528,15 +11530,7 @@ export class Channel {
 		// sides have forgotten the transaction.
 		if (this._spliceSession && !this._spliceSession.isComplete()) {
 			const echo = this._state.channelId
-				? [
-						sendMsg(
-							MessageType.TX_ABORT,
-							encodeTxAbortMessage({
-								channelId: this._state.channelId,
-								data: Buffer.alloc(0)
-							})
-						)
-				  ]
+				? [this._txAbort(this._state.channelId)]
 				: [];
 			return [...echo, ...this.abortSplice('peer sent tx_abort')];
 		}
@@ -11546,17 +11540,10 @@ export class Channel {
 			// Unsolicited tx_abort with nothing in progress (e.g. the peer is
 			// discarding a splice we already forgot). BOLT 2: a node that has not
 			// itself sent tx_abort MUST echo it back as the ack; it is not a
-			// channel failure.
+			// channel failure. The mark set by the echo keeps a peer that
+			// answers the answer from starting the same loop remotely.
 			if (this._state.channelId) {
-				return [
-					sendMsg(
-						MessageType.TX_ABORT,
-						encodeTxAbortMessage({
-							channelId: this._state.channelId,
-							data: Buffer.alloc(0)
-						})
-					)
-				];
+				return [this._txAbort(this._state.channelId)];
 			}
 			return [];
 		}
@@ -11565,15 +11552,7 @@ export class Channel {
 		this._state.state = ChannelState.ERRORED;
 		// Echo the tx_abort (BOLT 2 ack) — we had an active session and had not
 		// sent tx_abort ourselves.
-		return [
-			sendMsg(
-				MessageType.TX_ABORT,
-				encodeTxAbortMessage({
-					channelId: this._v2ChannelId(),
-					data: Buffer.alloc(0)
-				})
-			)
-		];
+		return [this._txAbort(this._v2ChannelId())];
 	}
 }
 
