@@ -928,7 +928,10 @@ export async function restartVictim(
 
 	// A real connection delivers BOTH reestablish messages before any
 	// responses they trigger, so hold a FIFO until both sides sent theirs.
-	await reestablishFifo(env.relay, restored, env.peers[0]);
+	// Every peer reconnects: a forwarder victim has channels on both sides.
+	for (const peer of env.peers) {
+		await reestablishFifo(env.relay, restored, peer);
+	}
 	await settle();
 
 	return {

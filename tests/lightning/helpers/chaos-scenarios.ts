@@ -14,21 +14,32 @@
 import { expect } from 'chai';
 import { PaymentStatus } from '../../../src/lightning/node/types';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
+import { BITCOIN_CHAIN_HASH } from '../../../src/lightning/channel/types';
+import { encodeShortChannelId } from '../../../src/lightning/gossip/types';
+import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import {
 	IChaosEnv,
 	IChaosEnvOptions,
 	IChaosScenario,
 	buildDirectGraph,
 	chaosWait,
+	makeChaosNodeConfig,
 	openReadyChannelChaos
 } from './chaos-harness';
 
 export const CHAOS_VICTIM_SEED = 71;
 export const CHAOS_PEER_SEED = 72;
+export const CHAOS_THIRD_SEED = 73;
 
 export const CHAOS_ENV: IChaosEnvOptions = {
 	victimSeedId: CHAOS_VICTIM_SEED,
 	peerSeedIds: [CHAOS_PEER_SEED]
+};
+
+/** S2's world: payer, VICTIM FORWARDER, payee. */
+export const CHAOS_FORWARD_ENV: IChaosEnvOptions = {
+	victimSeedId: CHAOS_VICTIM_SEED,
+	peerSeedIds: [CHAOS_PEER_SEED, CHAOS_THIRD_SEED]
 };
 
 /** S1a: the victim pays its peer; kills land around the sender's rounds. */
@@ -114,6 +125,120 @@ export function s1bReceiverFulfills(): IChaosScenario {
 			const payment = env.peers[0].sendPayment(invoice.bolt11);
 			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
 			expect(payment.status, 'probe payment after resume').to.equal(
+				PaymentStatus.COMPLETED
+			);
+		}
+	};
+}
+
+function addGraphChannel(
+	node: LightningNode,
+	scid: Buffer,
+	pubA: Buffer,
+	pubB: Buffer
+): void {
+	const aIs1 = Buffer.compare(pubA, pubB) < 0;
+	node.getGraph().addChannelAnnouncement({
+		nodeSignature1: Buffer.alloc(64),
+		nodeSignature2: Buffer.alloc(64),
+		bitcoinSignature1: Buffer.alloc(64),
+		bitcoinSignature2: Buffer.alloc(64),
+		features: Buffer.alloc(0),
+		chainHash: BITCOIN_CHAIN_HASH,
+		shortChannelId: scid,
+		nodeId1: aIs1 ? pubA : pubB,
+		nodeId2: aIs1 ? pubB : pubA,
+		bitcoinKey1: Buffer.alloc(33, 2),
+		bitcoinKey2: Buffer.alloc(33, 3)
+	});
+	for (const dir of [0, 1]) {
+		node.getGraph().applyChannelUpdate({
+			signature: Buffer.alloc(64),
+			chainHash: BITCOIN_CHAIN_HASH,
+			shortChannelId: scid,
+			timestamp: Math.floor(Date.now() / 1000),
+			messageFlags: 1,
+			channelFlags: dir,
+			cltvExpiryDelta: 40,
+			htlcMinimumMsat: 1000n,
+			feeBaseMsat: 1000,
+			feeProportionalMillionths: 1,
+			htlcMaximumMsat: 1_000_000_000n
+		});
+	}
+}
+
+/**
+ * S2: payer -> VICTIM -> payee, the forwarder dies. The wiring mirrors the
+ * forwarding-history harness: the payer's graph knows only its own hop, the
+ * payee's invoice hints the second, and the victim resolves the onward
+ * channel through its persisted SCID registration. The victim's forward
+ * fee is pinned so the payer attaches exactly what the hint promises.
+ */
+export function s2ForwarderDies(): IChaosScenario {
+	return {
+		name: 'S2 forwarder dies',
+		async setup(env: IChaosEnv): Promise<void> {
+			const [payer, payee] = env.peers;
+			const inboundId = await openReadyChannelChaos(env, payer, env.victim);
+			const outboundId = await openReadyChannelChaos(env, env.victim, payee);
+			env.channelId = inboundId;
+			const scidIn = encodeShortChannelId({
+				block: 830,
+				txIndex: 1,
+				outputIndex: 0
+			});
+			const scidOut = encodeShortChannelId({
+				block: 830,
+				txIndex: 2,
+				outputIndex: 0
+			});
+			env.victim.registerChannelScid(inboundId, scidIn);
+			env.victim.registerChannelScid(outboundId, scidOut);
+			payer.registerChannelScid(inboundId, scidIn);
+			env.victim
+				.getChannelManager()
+				.getChannel(outboundId)!
+				.getFullState().remoteScidAlias = scidOut;
+			payee
+				.getChannelManager()
+				.getChannel(outboundId)!
+				.getFullState().remoteScidAlias = scidOut;
+			addGraphChannel(
+				payer,
+				scidIn,
+				getPublicKey(makeChaosNodeConfig(CHAOS_PEER_SEED).nodePrivateKey),
+				getPublicKey(makeChaosNodeConfig(CHAOS_VICTIM_SEED).nodePrivateKey)
+			);
+			env.victim.setChannelPolicy(outboundId, {
+				feeBaseMsat: 5000,
+				feeProportionalMillionths: 0
+			});
+		},
+		async run(env: IChaosEnv): Promise<void> {
+			const [payer, payee] = env.peers;
+			const invoice = payee.createInvoice({
+				amountMsat: 80_000n,
+				description: 'chaos S2'
+			});
+			env.scratch.forwardHash = invoice.paymentHash.toString('hex');
+			const payment = payer.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
+		},
+		async probe(env: IChaosEnv, restored: LightningNode): Promise<void> {
+			void restored;
+			const [payer, payee] = env.peers;
+			const invoice = payee.createInvoice({
+				amountMsat: 30_000n,
+				description: 'chaos S2 probe'
+			});
+			const payment = payer.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status !== PaymentStatus.PENDING);
+			expect(payment.status, 'probe forward after resume').to.equal(
 				PaymentStatus.COMPLETED
 			);
 		}
