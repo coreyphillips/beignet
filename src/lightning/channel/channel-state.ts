@@ -144,8 +144,10 @@ export interface IChannelState {
 	pushMsat: bigint;
 	fundingTxid: Buffer | null;
 	/**
-	 * The exact signed v1 funding transaction, retained while it is unconfirmed
-	 * and this node is the funder.
+	 * The exact signed funding transaction, retained while it is unconfirmed:
+	 * for a v1 open while this node is the funder, and for a completed v2
+	 * (dual-funded) open on every role, staged when both tx_signatures have
+	 * been applied (`_recordV2FullySigned`).
 	 *
 	 * It lives HERE, in journaled channel state, rather than only in the node's
 	 * generic metadata, because a guardian restore has to be able to discharge

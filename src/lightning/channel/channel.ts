@@ -11142,6 +11142,27 @@ export class Channel {
 	}
 
 	/**
+	 * The v2 signature exchange just completed: record the fully-signed
+	 * funding tx for EVERY role — a restart (or a guardian restore) must be
+	 * able to rebroadcast it, and the record answers a peer that still asks
+	 * for our tx_signatures over reestablish. The staged pendingFundingTxHex
+	 * rides the existing startup-rebroadcast and per-block retry machinery.
+	 */
+	private _recordV2FullySigned(): void {
+		const assembled = this._assembleV2FundingTx();
+		if (assembled) {
+			this._state.pendingFundingTxHex = assembled.toString('hex');
+			this._syncV2InFlight({
+				receivedTxSignatures: true,
+				fullySigned: true,
+				fundingTxHex: assembled.toString('hex')
+			});
+		} else {
+			this._syncV2InFlight({ receivedTxSignatures: true });
+		}
+	}
+
+	/**
 	 * Reset the process-local v2 open driver: an accepted RBF renegotiation,
 	 * an abort, or the drop of an unresumable session starts the commitment
 	 * and tx_signatures round over (or ends it) with no stale releases.
@@ -11409,7 +11430,11 @@ export class Channel {
 		this._state.fundingOutputIndex = outputIndex;
 
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
+			// The peer's witnesses arrived before ours went out (we sign
+			// second, or the caller drove the release): the exchange completes
+			// HERE, so the fully-signed record must be captured here too.
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			this._recordV2FullySigned();
 		}
 
 		const msg: ITxSignaturesMessage = {
@@ -11641,33 +11666,22 @@ export class Channel {
 
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
-			// Both witness sets are in hand: record the fully-signed funding tx
-			// for EVERY role — a restart (or a guardian restore) must be able to
-			// rebroadcast it, and the record answers a peer that still asks for
-			// our tx_signatures over reestablish. Persist BEFORE any broadcast.
-			const assembled = this._assembleV2FundingTx();
-			if (assembled) {
-				this._state.pendingFundingTxHex = assembled.toString('hex');
-				this._syncV2InFlight({
-					receivedTxSignatures: true,
-					fullySigned: true,
-					fundingTxHex: assembled.toString('hex')
-				});
-			} else {
-				this._syncV2InFlight({ receivedTxSignatures: true });
-			}
+			// Both witness sets are in hand (the flush above released ours, or
+			// they had already left). Record the fully-signed funding tx, then
+			// persist BEFORE any broadcast.
+			this._recordV2FullySigned();
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 			// When WE contributed inputs (lease selling) both witness sets are
 			// now in hand: assemble and broadcast the funding tx ourselves
 			// (mirrors the splice path; the opener usually broadcasts too, and
 			// a duplicate broadcast is harmless).
-			if (assembled && this._dualFundingContribution) {
+			if (this._dualFundingContribution && this._state.pendingFundingTxHex) {
 				// Same reason as the splice above: once our own
 				// tx_signatures have been released this batch has nothing
 				// barrier-class left to hold it.
 				actions.push({
 					type: ChannelActionType.BROADCAST_TX,
-					tx: assembled,
+					tx: Buffer.from(this._state.pendingFundingTxHex, 'hex'),
 					fundingCritical: true
 				});
 			}

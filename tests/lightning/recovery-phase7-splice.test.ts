@@ -238,17 +238,19 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 				).to.equal(0);
 			} else {
 				// The promotion committed: exactly one row, under the
-				// permanent id, and the restart loads it into one of the
-				// three legitimate shapes. Once our tx_signatures went out,
-				// the exchange resumes over reestablish next_funding and the
-				// open completes (AWAITING_FUNDING_CONFIRMED). Before that,
-				// the interactive session is process-local by design, so the
-				// restored row either waits (AWAITING_TX_SIGNATURES; making
-				// that window resumable is the already-filed #288/#289
-				// follow-up, and nothing is broadcastable from it) or was
-				// closed out as bookkeeping (FORCE_CLOSED, with no funding
-				// transaction in existence to have broadcast).
+				// permanent id, and it carries the durable v2 record (the
+				// same batch that creates the record writes the first row).
+				// The restart rebuilds the builder-less session from it and
+				// the reestablish that follows resumes the signature
+				// exchange over next_funding, so every promoted cell must
+				// COMPLETE the open. This is the kill-matrix acceptance for
+				// the formerly process-local window (issues 288/289).
 				promotedCells++;
+				expect(
+					rows[0].state.v2InFlight != null ||
+						rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
+					`an opening row carries the durable record ${at}`
+				).to.equal(true);
 				const restoredStates = result.restored
 					.getChannelManager()
 					.listChannels()
@@ -256,11 +258,11 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 				expect(restoredStates.length, `one restored channel ${at}`).to.equal(1);
 				expect(
 					[
-						ChannelState.AWAITING_TX_SIGNATURES,
 						ChannelState.AWAITING_FUNDING_CONFIRMED,
-						ChannelState.FORCE_CLOSED
+						ChannelState.AWAITING_CHANNEL_READY,
+						ChannelState.NORMAL
 					],
-					`restored shape is one of the three legitimate ones ${at}`
+					`the open resumed to completion ${at}`
 				).to.include(restoredStates[0]);
 			}
 			result.destroyAll();
