@@ -289,6 +289,9 @@ export interface IChannelManagerConfig {
  * - 'channel:restore-ready' (channelId: Buffer) — a channel RESTORED FROM
  *   PERSISTENCE this process has completed reestablishment; fires at most
  *   once per channel and never for a channel that stayed live
+ * - 'channel:reestablished' (channelId: Buffer) — a channel completed
+ *   reestablishment back to NORMAL; fires on EVERY reconnect, so listeners
+ *   must gate on durable facts, never on in-memory state having been lost
  * - 'channel:scid-assigned' (channelId: Buffer, shortChannelId: Buffer)
  * - 'channel:pending-close' (channelId: Buffer, initiator: 'local' | 'remote')
  * - 'channel:force-closing' (channelId: Buffer, initiator: 'local' | 'remote')
@@ -3575,6 +3578,16 @@ export class ChannelManager extends EventEmitter {
 		// so it is armed at restore and fires once.
 		if (channel.getState() === ChannelState.NORMAL) {
 			this.emitRestoreRepairOnce(
+				channel.getChannelId() ?? channel.getTemporaryChannelId()
+			);
+			// Unlike the restore repair above, this fires for EVERY completed
+			// reestablishment, live reconnects included. Its listeners must
+			// therefore be gated on durable facts alone (the node's
+			// owed-upstream settle pass is: a forward linkage still on disk, a
+			// known preimage, a committed inbound HTLC), never on the
+			// assumption that in-memory state was lost.
+			this.emit(
+				'channel:reestablished',
 				channel.getChannelId() ?? channel.getTemporaryChannelId()
 			);
 		}

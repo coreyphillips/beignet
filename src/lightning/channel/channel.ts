@@ -2158,6 +2158,29 @@ export class Channel {
 	/**
 	 * Fulfill a received HTLC with a preimage.
 	 */
+	/**
+	 * Whether fulfillHtlc would currently accept this received HTLC: the
+	 * channel can carry updates and the entry is live (not already settled).
+	 * Callers that must pair irreversible bookkeeping with the fulfill (the
+	 * forwarder's linkage delete) check this first, because a refused fulfill
+	 * must not consume the bookkeeping a later retry needs. Mirrors the
+	 * guards of fulfillHtlc below; keep the two in step.
+	 */
+	canFulfillHtlc(htlcId: bigint): boolean {
+		if (
+			this._state.state !== ChannelState.NORMAL &&
+			this._state.state !== ChannelState.SHUTTING_DOWN &&
+			!this.canUpdateHtlcsDuringSplice()
+		) {
+			return false;
+		}
+		const entry = this._state.htlcs.get(`received-${htlcId}`);
+		if (!entry) return false;
+		return (
+			entry.state !== HtlcState.FULFILLED && entry.state !== HtlcState.FAILED
+		);
+	}
+
 	fulfillHtlc(htlcId: bigint, paymentPreimage: Buffer): ChannelAction[] {
 		if (
 			this._state.state !== ChannelState.NORMAL &&
@@ -2255,18 +2278,13 @@ export class Channel {
 			];
 		}
 
-		// Dedup check: a reestablish replay of a fulfill we already processed
-		// (BOLT 2 update retransmission) is a no-op.
-		if (entry.state === HtlcState.FULFILLED) {
-			return [];
-		}
-
 		// Verify the revealed preimage actually hashes to this HTLC's
 		// payment_hash before crediting the counterparty. Without this a peer
 		// could fulfill with a bogus preimage and, on the next revoke_and_ack,
-		// move the HTLC value into their balance with no valid proof revealed —
+		// move the HTLC value into their balance with no valid proof revealed:
 		// direct theft of every HTLC we offer. Mirrors the receive-side check in
-		// fulfillHtlc().
+		// fulfillHtlc(). Checked before the repeat branch below so a replay
+		// carrying a bogus preimage is rejected, not silently tolerated.
 		const fulfillHash = crypto
 			.createHash('sha256')
 			.update(msg.paymentPreimage)
@@ -2276,6 +2294,26 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'Invalid preimage for offered HTLC'
+				}
+			];
+		}
+
+		// A reestablish replay of a fulfill we already processed (BOLT 2 update
+		// retransmission) changes no channel state, but it must still re-emit
+		// HTLC_FULFILLED. The channel state carrying FULFILLED can reach disk
+		// in a commit that precedes the node-level preimage and forward
+		// bookkeeping (the quorum pipeline persists deferred snapshots), and a
+		// process killed in that window restarts knowing the fulfill happened
+		// while holding no preimage at all. The peer's retransmission is then
+		// the only remaining source, so swallowing it here would strand the
+		// upstream leg of a forward forever (issue 295). Every listener on the
+		// resulting event is repeat-tolerant.
+		if (entry.state === HtlcState.FULFILLED) {
+			return [
+				{
+					type: ChannelActionType.HTLC_FULFILLED,
+					htlcId: msg.id,
+					paymentPreimage: msg.paymentPreimage
 				}
 			];
 		}
