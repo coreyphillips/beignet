@@ -6228,6 +6228,17 @@ export class Channel {
 					perCommitmentSecret: this._state.lastSentRevokeSecret,
 					nextPerCommitmentPoint: this._state.lastSentRevokeNextPoint
 				};
+				// option_taproot: the original revoke_and_ack advertised our
+				// next-commitment verification nonce, and handleRevokeAndAck
+				// requires it unconditionally, so a rebuild without it is
+				// rejected by the very peer that asked for the retransmission
+				// and the interrupted round never resumes (issue 293). The
+				// nonce is deterministic per commitment height and the height
+				// has not moved since the original send, so this re-advertises
+				// byte-identically what the original carried.
+				if (isTaprootChannel(this._state.channelType)) {
+					revokeMsg.nextLocalNonce = this._ensureLocalNextNonce();
+				}
 				revokeRetransmit.push(
 					replayMsg(
 						MessageType.REVOKE_AND_ACK,
