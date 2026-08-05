@@ -409,6 +409,9 @@ function makeBasepoints(seed: Buffer): IChannelBasepoints {
 export interface IChaosNodeOptions {
 	storage?: IStorageBackend;
 	recovery?: INodeConfig['recovery'];
+	preferTaproot?: boolean;
+	/** Extra INodeConfig fields merged last (chain backend stubs, etc.). */
+	extras?: Partial<INodeConfig>;
 }
 
 export function makeChaosNodeConfig(
@@ -437,7 +440,9 @@ export function makeChaosNodeConfig(
 			.update(Buffer.from([4]))
 			.digest(),
 		storage: options.storage,
-		recovery: options.recovery
+		recovery: options.recovery,
+		preferTaproot: options.preferTaproot,
+		...options.extras
 	};
 }
 
@@ -736,6 +741,10 @@ export interface IChaosEnvOptions {
 	) => Promise<void> | void;
 	/** Per-run cleanup (guardian servers, etc.), errors swallowed. */
 	teardown?: (env: IChaosEnv) => Promise<void> | void;
+	/** Open taproot channels: set on the victim and every default peer. */
+	preferTaproot?: boolean;
+	/** Extra INodeConfig fields for the victim (and its restart). */
+	victimExtras?: Partial<INodeConfig>;
 }
 
 export interface IChaosRunResult {
@@ -769,10 +778,14 @@ export async function makeChaosEnv(
 		: { enabled: true, durability: mode, ...options.victimRecovery };
 	const victim = createChaosNode(victimSeedId, {
 		storage,
-		recovery
+		recovery,
+		preferTaproot: options.preferTaproot,
+		extras: options.victimExtras
 	});
 	const peers = peerSeedIds.map(
-		(id) => options.peerFactory?.(id) ?? createChaosNode(id)
+		(id) =>
+			options.peerFactory?.(id) ??
+			createChaosNode(id, { preferTaproot: options.preferTaproot })
 	);
 	const commitTap = new ChaosCommitTap(victim, kill);
 	const relay = new ChaosRelay(kill);
@@ -919,7 +932,9 @@ export async function restartVictim(
 		  };
 	const restored = createChaosNode(env.victimSeedId, {
 		storage: restoredStorage,
-		recovery
+		recovery,
+		preferTaproot: options.preferTaproot,
+		extras: options.victimExtras
 	});
 	watchBroadcasts(restored, env.kill, broadcasts, true);
 	env.relay.replaceNode(env.victim, restored);

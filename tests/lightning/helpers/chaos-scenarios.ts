@@ -14,7 +14,10 @@
 import { expect } from 'chai';
 import { PaymentStatus } from '../../../src/lightning/node/types';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
-import { BITCOIN_CHAIN_HASH } from '../../../src/lightning/channel/types';
+import {
+	BITCOIN_CHAIN_HASH,
+	ChannelState
+} from '../../../src/lightning/channel/types';
 import { encodeShortChannelId } from '../../../src/lightning/gossip/types';
 import { getPublicKey } from '../../../src/lightning/crypto/ecdh';
 import {
@@ -309,6 +312,109 @@ export function s3FailsHeldHtlc(): IChaosScenario {
 			expect(payment.status, 'probe payment after resume').to.equal(
 				PaymentStatus.COMPLETED
 			);
+		}
+	};
+}
+
+/**
+ * S6: the victim initiates a cooperative close and dies somewhere inside
+ * the negotiation. On a taproot channel the closing session (nonces,
+ * signed-latch, cache) is in-memory BY DESIGN (transition matrix section
+ * 3: journaling it would be exactly the nonce reuse 5.10 forbids), so a
+ * restart renegotiates with a fresh session. The setup routes one payment
+ * first so the close carries real balances.
+ */
+export function s6CoopCloses(): IChaosScenario {
+	return {
+		name: 'S6 cooperative close',
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.victim,
+				env.peers[0]
+			);
+			buildDirectGraph(env.victim, CHAOS_VICTIM_SEED, CHAOS_PEER_SEED);
+			const invoice = env.peers[0].createInvoice({
+				amountMsat: 50_000n,
+				description: 'chaos S6 setup'
+			});
+			const payment = env.victim.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status === PaymentStatus.COMPLETED);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
+		},
+		async run(env: IChaosEnv): Promise<void> {
+			const destination = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				Buffer.alloc(20, 7)
+			]);
+			const result = env.victim.closeChannel(env.channelId!, destination);
+			expect(result.ok, 'close initiated').to.equal(true);
+			await chaosWait(env, () => {
+				const channel = env.victim
+					.getChannelManager()
+					.getChannel(env.channelId!);
+				return !channel || channel.getState() === ChannelState.CLOSED;
+			});
+		},
+		probe(): void {
+			// Verdicts are cell-dependent (a kill before the shutdown commit
+			// legitimately resumes NORMAL); the sweep supplies its own
+			// assertOutcome and leaves this unused.
+		}
+	};
+}
+
+/**
+ * S9: the victim force-closes and dies between planning and the chain.
+ * The terminal path deliberately bypasses the barrier queue (an operator's
+ * last exit must be unrefusable), so its cells are about the DECISION
+ * surviving: killed before the close commit, nothing moved and the channel
+ * resumes; killed after, the restart must hold FORCE_CLOSED with its chain
+ * monitor durable beside it (transition matrix row: chain monitor deltas
+ * ride their causal transition).
+ */
+export function s9ForceCloses(): IChaosScenario {
+	return {
+		name: 'S9 force close',
+		async setup(env: IChaosEnv): Promise<void> {
+			env.channelId = await openReadyChannelChaos(
+				env,
+				env.victim,
+				env.peers[0]
+			);
+			buildDirectGraph(env.victim, CHAOS_VICTIM_SEED, CHAOS_PEER_SEED);
+			const invoice = env.peers[0].createInvoice({
+				amountMsat: 50_000n,
+				description: 'chaos S9 setup'
+			});
+			const payment = env.victim.sendPayment(invoice.bolt11);
+			await chaosWait(env, () => payment.status === PaymentStatus.COMPLETED);
+			await chaosWait(
+				env,
+				() => env.victim.getRecoveryStatus().awaitingDurabilityCount === 0
+			);
+		},
+		async run(env: IChaosEnv): Promise<void> {
+			const destination = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				Buffer.alloc(20, 9)
+			]);
+			const result = env.victim
+				.getChannelManager()
+				.forceClose(env.channelId!, destination);
+			expect(result.ok, 'force close accepted').to.equal(true);
+			await chaosWait(env, () => {
+				const channel = env.victim
+					.getChannelManager()
+					.getChannel(env.channelId!);
+				return !channel || channel.getState() === ChannelState.FORCE_CLOSED;
+			});
+		},
+		probe(): void {
+			// Cell-dependent verdicts; the sweep supplies its own assertOutcome.
 		}
 	};
 }
