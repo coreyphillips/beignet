@@ -1065,6 +1065,42 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		]);
 	});
 
+	it('refuses RBF on a completed open: nothing reaches the wire after channel_ready', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+
+		// channel_ready both ways: the record clears, but the session object
+		// survives (at AWAITING_CHANNEL_READY), so every pre-round-6 guard
+		// passes and only the session-state check stands between a caller and
+		// a tx_init_rbf the peer would refuse with tx_abort.
+		const opReady = h.opener.fundingConfirmed();
+		const opReadyPayload = findPayload(opReady, MessageType.CHANNEL_READY)!;
+		const acReady = h.acceptor.fundingConfirmed();
+		const acReadyPayload = findPayload(acReady, MessageType.CHANNEL_READY)!;
+		expect(
+			findError(
+				h.opener.handleChannelReady(decodeChannelReadyMessage(acReadyPayload))
+			)
+		).to.equal(null);
+		expect(
+			findError(
+				h.acceptor.handleChannelReady(decodeChannelReadyMessage(opReadyPayload))
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
+		expect(h.opener.getFullState().dualFundingSession).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+
+		const actions = h.opener.initiateTxRbf(2000);
+		expect(findError(actions)).to.contain('not renegotiable');
+		expect(findPayload(actions, MessageType.TX_INIT_RBF)).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+	});
+
 	it('records the fully signed funding tx for rebroadcast and clears the record at NORMAL', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

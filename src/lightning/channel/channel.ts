@@ -10697,6 +10697,36 @@ export class Channel {
 	}
 
 	/**
+	 * Whether the registered wallet contribution can still cover itself at
+	 * the given feerate: the same arithmetic _computeDualFundingContributions
+	 * applies (inputs must cover contribution + our interactive-tx fee
+	 * share), evaluated without touching the session or the derived list.
+	 * Null when affordable, when no contribution is registered (legacy
+	 * caller-driven flow), or for a plain zero accept, which owes no fee.
+	 */
+	private _dualFundingAffordabilityError(feeratePerKw: number): string | null {
+		const session = this._state.dualFundingSession;
+		const c = this._dualFundingContribution;
+		if (!session || !c) return null;
+		const initiator = session.isInitiator();
+		if (!initiator && c.inputs.length === 0 && c.contributionSats === 0n) {
+			return null;
+		}
+		const feeSats = spliceFeeSats(
+			dualFundingContributionWeight(c.inputs.length, initiator),
+			feeratePerKw
+		);
+		let walletTotal = 0n;
+		for (const w of c.inputs) {
+			walletTotal += w.value;
+		}
+		if (walletTotal - c.contributionSats - feeSats < 0n) {
+			return `wallet contribution cannot cover feerate ${feeratePerKw}: inputs ${walletTotal} < contribution ${c.contributionSats} + fee ${feeSats}`;
+		}
+		return null;
+	}
+
+	/**
 	 * Interactive-tx drive for a v2 open with a registered contribution: on
 	 * each of our turns send the next wallet input / funding or change output,
 	 * then tx_complete (re-sent whenever the peer keeps adding, exactly like
@@ -12286,6 +12316,24 @@ export class Channel {
 				}
 			];
 		}
+		// Only a session still negotiating (or awaiting signatures) can be
+		// replaced. The session applies the same check when the ack arrives
+		// (initiateRbf), but by then tx_init_rbf has already gone out and the
+		// peer's refusal errors the channel; a completed open (channel_ready
+		// exchanged, session at AWAITING_CHANNEL_READY or beyond) must be
+		// refused here, before anything reaches the wire.
+		const sessionState = session.getState();
+		if (
+			sessionState !== DualFundingState.TX_NEGOTIATION &&
+			sessionState !== DualFundingState.AWAITING_TX_SIGNATURES
+		) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `cannot RBF: dual-funding session is not renegotiable in state ${sessionState}`
+				}
+			];
+		}
 		// BOLT 2: the RBF feerate MUST be at least 25/24 of the previous
 		// funding feerate. Validated here WITHOUT mutating anything: the
 		// renegotiation only begins when the peer acks.
@@ -12301,6 +12349,14 @@ export class Channel {
 					message: `RBF fee rate ${newFeeratePerkw} below the 25/24 floor ${floor}`
 				}
 			];
+		}
+		// The registered wallet inputs must still cover our share at the new
+		// feerate. Pure arithmetic over already-known values, so it belongs
+		// here: a request the renegotiation could never afford is refused
+		// locally instead of aborting the attempt after the peer acks.
+		const unaffordable = this._dualFundingAffordabilityError(newFeeratePerkw);
+		if (unaffordable) {
+			return [{ type: ChannelActionType.ERROR, message: unaffordable }];
 		}
 
 		// NOTHING is replaced until tx_ack_rbf arrives: the current attempt
