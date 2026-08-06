@@ -2411,21 +2411,53 @@ export class LightningNode extends EventEmitter {
 				// the PREVIOUS attempt as the durable truth, with tx_ack_rbf
 				// withheld behind the same failed commit, so the peer never
 				// adopted the renegotiation and the prior attempt is still
-				// resumable: re-restore it instead of deleting it.
-				const row = this.storage?.loadChannel?.(idHex) ?? null;
+				// resumable: re-restore it instead of deleting it. Every read
+				// is contained: this path already runs under a possibly
+				// failing store, and a thrown read must not escape the
+				// disconnect handling after the manager removed the channel.
+				let row: { state: IChannelState; peerPubkey: string } | null = null;
+				let rowKnown = true;
+				try {
+					row = this.storage?.loadChannel?.(idHex) ?? null;
+				} catch {
+					rowKnown = false;
+				}
+				if (!rowKnown) {
+					// The disk cannot answer: fail closed by touching nothing
+					// durable. A restart re-evaluates the row under the same
+					// rules with a healthy store.
+					this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+						channelId: idHex,
+						reason
+					});
+					return;
+				}
 				if (
 					row &&
 					row.state.state === ChannelState.AWAITING_TX_SIGNATURES &&
 					row.state.v2InFlight
 				) {
-					const channel = new Channel(row.state);
-					const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
-					this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
-					this.emitStructuredLog(
-						'channel',
-						'open_abandon_reverted_to_durable',
-						{ channelId: idHex, reason }
-					);
+					try {
+						const channel = new Channel(row.state);
+						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+						this.channelManager.restoreChannel(
+							channel,
+							row.peerPubkey,
+							keyIndex
+						);
+						this.emitStructuredLog(
+							'channel',
+							'open_abandon_reverted_to_durable',
+							{ channelId: idHex, reason }
+						);
+					} catch {
+						// Restoration failed mid-way: the row is untouched, so
+						// a restart restores it; nothing terminal is emitted.
+						this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+							channelId: idHex,
+							reason
+						});
+					}
 					return;
 				}
 				if (this.storage) {

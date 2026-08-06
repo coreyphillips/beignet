@@ -138,6 +138,7 @@ import {
 	decodeTxCompleteMessage,
 	decodeTxSignaturesMessage,
 	decodeTxInitRbfMessage,
+	decodeTxAckRbfMessage,
 	decodeTxAbortMessage,
 	encodeTxAbortMessage
 } from '../message/interactive-tx';
@@ -2170,6 +2171,9 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.TX_INIT_RBF:
 					this.handleTxInitRbfMsg(peerPubkey, payload);
+					break;
+				case MessageType.TX_ACK_RBF:
+					this.handleTxAckRbfMsg(peerPubkey, payload);
 					break;
 				case MessageType.TX_ABORT:
 					this.handleTxAbortMsg(peerPubkey, payload);
@@ -4515,6 +4519,18 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxInitRbf(msg);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	private handleTxAckRbfMsg(peerPubkey: string, payload: Buffer): void {
+		const msg = decodeTxAckRbfMessage(payload);
+		const channel =
+			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
+			this.findTempChannel(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleTxAckRbf();
 		this.processActions(peerPubkey, channel, actions);
 	}
 

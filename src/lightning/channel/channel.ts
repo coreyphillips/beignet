@@ -159,7 +159,8 @@ import {
 import {
 	DualFundingSession,
 	DualFundingState,
-	IDualFundingParams
+	IDualFundingParams,
+	rbfFeerateFloor
 } from './dual-funding';
 import { computeLeaseFeeSat, computeLeaseExpiry } from './liquidity-ads';
 import {
@@ -556,6 +557,10 @@ export class Channel {
 	// Set once our v2 tx_signatures witnesses have been provided to the
 	// session, so later flushes never re-provide.
 	private _v2TxSigsReleased = false;
+	// Our un-acked tx_init_rbf (feerate/locktime it proposed). Connection
+	// scoped: BOLT 2 starts the renegotiation only at tx_ack_rbf, so nothing
+	// is replaced while this is pending and a disconnect simply forgets it.
+	private _pendingRbfInit: { feerate: number; locktime: number } | null = null;
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -5657,10 +5662,13 @@ export class Channel {
 		}
 
 		// Neither a tx_abort handshake nor the reestablish-retransmit latch
-		// survives a disconnect.
+		// survives a disconnect, and an un-acked tx_init_rbf dies with the
+		// connection (the current attempt stayed live, so there is nothing
+		// to unwind).
 		this._spliceAbortPending = false;
 		this._txAbortSent = false;
 		this._reestablishRetransmitted = false;
+		this._pendingRbfInit = null;
 
 		// A partially collected start_batch is connection-scoped: the peer
 		// re-announces the batch (with fresh framing) when it retransmits after
@@ -10804,7 +10812,7 @@ export class Channel {
 			// Audit the negotiated tx before signing anything for it (S-2.M4).
 			const invalid = this._validateNegotiatedInteractiveTx('v2');
 			if (invalid) {
-				return [{ type: ChannelActionType.ERROR, message: invalid }];
+				return this._abortV2Negotiation(invalid);
 			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 		}
@@ -10875,7 +10883,7 @@ export class Channel {
 			// Audit the negotiated tx before signing anything for it (S-2.M4).
 			const invalid = this._validateNegotiatedInteractiveTx('v2');
 			if (invalid) {
-				return [{ type: ChannelActionType.ERROR, message: invalid }];
+				return this._abortV2Negotiation(invalid);
 			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 			return this._maybeSendV2Commitment();
@@ -12270,33 +12278,83 @@ export class Channel {
 			];
 		}
 
-		const result = session.initiateRbf(newFeeratePerkw, newLocktime);
-		if (!result.ok) {
+		if (!session.isInitiator()) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to initiate RBF'
+					message: 'Only initiator can initiate RBF'
+				}
+			];
+		}
+		// BOLT 2: the RBF feerate MUST be at least 25/24 of the previous
+		// funding feerate. Validated here WITHOUT mutating anything: the
+		// renegotiation only begins when the peer acks.
+		const currentFeerate =
+			this._state.v2InFlight?.fundingFeeratePerkw ??
+			session.getLocalParams()?.fundingFeeratePerkw ??
+			0;
+		const floor = rbfFeerateFloor(currentFeerate);
+		if (newFeeratePerkw < floor) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `RBF fee rate ${newFeeratePerkw} below the 25/24 floor ${floor}`
 				}
 			];
 		}
 
-		this._state.state = ChannelState.DUAL_FUNDING_V2;
-		// The in-flight record is per-attempt: the renegotiation replaces the
-		// negotiated tx, and the new round records itself at its own
-		// commitment_signed. The commitment/tx_signatures driver resets with it.
-		this._state.v2InFlight = null;
-		this._resetV2Driver();
+		// NOTHING is replaced until tx_ack_rbf arrives: the current attempt
+		// stays live and durable through the request window, so a disconnect
+		// here resumes it on BOTH sides (the receiver only commits its own
+		// replacement when it accepts, alongside the ack we never got).
+		// handleTxAckRbf performs the actual renegotiation reset.
+		const locktime = newLocktime ?? session.getLocalParams()?.locktime ?? 0;
+		this._pendingRbfInit = { feerate: newFeeratePerkw, locktime };
 
 		const msg: ITxInitRbfMessage = {
 			channelId: this._v2ChannelId(),
-			locktime: result.locktime ?? 0,
+			locktime,
 			feerate: newFeeratePerkw
 		};
 
-		return [
-			{ type: ChannelActionType.PERSIST_STATE },
-			sendMsg(MessageType.TX_INIT_RBF, encodeTxInitRbfMessage(msg))
-		];
+		return [sendMsg(MessageType.TX_INIT_RBF, encodeTxInitRbfMessage(msg))];
+	}
+
+	/**
+	 * The peer accepted our tx_init_rbf: the renegotiation begins HERE. The
+	 * previous attempt survived the request window (durably and in memory),
+	 * so a disconnect before this ack resumed it on both sides; from the ack
+	 * onward both sides have agreed to replace it, and the per-attempt record
+	 * clears durably on this side exactly as the receiver's cleared with its
+	 * accept.
+	 */
+	handleTxAckRbf(): ChannelAction[] {
+		const session = this._state.dualFundingSession;
+		const pending = this._pendingRbfInit;
+		this._pendingRbfInit = null;
+		if (!session || !pending) {
+			// An unsolicited ack, or one for a request this connection no
+			// longer remembers (the pending marker dies with the connection):
+			// it acknowledges nothing. The peer's view converges over
+			// reestablish.
+			return [];
+		}
+		const result = session.initiateRbf(pending.feerate, pending.locktime);
+		if (!result.ok) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: result.error || 'Failed to begin the RBF renegotiation'
+				}
+			];
+		}
+		this._state.state = ChannelState.DUAL_FUNDING_V2;
+		// Per-attempt record: both sides have now agreed to replace the
+		// negotiated tx; the new round records itself at its own
+		// commitment_signed. The commitment/tx_signatures driver resets too.
+		this._state.v2InFlight = null;
+		this._resetV2Driver();
+		return [{ type: ChannelActionType.PERSIST_STATE }];
 	}
 
 	/**
@@ -12426,6 +12484,23 @@ export class Channel {
 			: [];
 		actions.push(this._txAbort(this._v2ChannelId(), reason));
 		return actions;
+	}
+
+	/**
+	 * The negotiated v2 funding tx failed its audit: nothing has been signed,
+	 * so the open unwinds with a wire tx_abort the peer can act on. A bare
+	 * local ERROR here left the peer waiting forever for a commitment_signed
+	 * (or a tx_abort) that would never come.
+	 */
+	private _abortV2Negotiation(reason: string): ChannelAction[] {
+		this._state.dualFundingSession?.abort();
+		this._resetV2Driver();
+		this._state.v2InFlight = null;
+		this._state.state = ChannelState.ERRORED;
+		return [
+			this._txAbort(this._v2ChannelId(), reason),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
 	}
 
 	/**
