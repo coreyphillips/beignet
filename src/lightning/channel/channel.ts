@@ -12370,6 +12370,32 @@ export class Channel {
 				}
 			];
 		}
+		// One outstanding request at a time: a second tx_init_rbf would
+		// overwrite the pending parameters, and the eventual ack would apply
+		// the second request's feerate locally while the peer accepted the
+		// first, pricing the two sides of one renegotiation differently.
+		if (this._pendingRbfInit) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'an RBF request is already pending its ack'
+				}
+			];
+		}
+		// RBF replaces a COMPLETED attempt: the recorded one. Before the
+		// record exists the negotiation is still in flight (and on this side
+		// possibly still waiting for the wallet's asynchronous input
+		// selection, whose stale contribution must never register into a
+		// replacement builder); the record's existence proves the previous
+		// attempt, drive and funding callback all ran to completion.
+		if (!this._state.v2InFlight) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot RBF: no completed funding attempt is recorded'
+				}
+			];
+		}
 		// BOLT 2: the RBF feerate MUST be at least 25/24 of the previous
 		// funding feerate. Validated here WITHOUT mutating anything: the
 		// renegotiation only begins when the peer acks.
@@ -12546,6 +12572,18 @@ export class Channel {
 				this._txAbort(
 					this._v2ChannelId(),
 					'cannot RBF a v2 open restored after a restart'
+				)
+			];
+		}
+		// RBF replaces a COMPLETED attempt: the recorded one. A tx_init_rbf
+		// mid-negotiation is refused (BOLT 2 lets the receiver refuse any),
+		// which also guarantees our own asynchronous wallet selection for
+		// the attempt has resolved before a replacement can reprice it.
+		if (!this._state.v2InFlight) {
+			return [
+				this._txAbort(
+					this._v2ChannelId(),
+					'no completed funding attempt is recorded to replace'
 				)
 			];
 		}

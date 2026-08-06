@@ -1478,22 +1478,49 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			).to.be.true;
 		});
 
-		it('should handle RBF initiation', () => {
+		it('refuses RBF in both directions before the attempt is recorded', () => {
 			const { channel, params } = makeV2Channel();
 			channel.initiateOpenV2(params);
 
 			const channelId = channel.getTemporaryChannelId();
 			channel.handleAcceptChannel2(makeAcceptChannel2Msg({ channelId }));
 
+			// Mid-negotiation there is no recorded attempt to replace (and
+			// the wallet's asynchronous input selection may still be
+			// resolving): the request is refused locally, nothing reaches
+			// the wire, and the negotiation is untouched.
 			const actions = channel.initiateTxRbf(2000);
+			expect(
+				actions.some((a) => a.type === ChannelActionType.ERROR),
+				'refused locally'
+			).to.be.true;
 			expect(
 				actions.some(
 					(a) =>
 						a.type === ChannelActionType.SEND_MESSAGE &&
 						(a as { messageType: MessageType }).messageType ===
 							MessageType.TX_INIT_RBF
-				)
+				),
+				'nothing reaches the wire'
+			).to.be.false;
+
+			// A peer proposing the same mid-negotiation replacement is
+			// refused with tx_abort; the session survives to keep negotiating.
+			const refusal = channel.handleTxInitRbf({
+				channelId: channel.getChannelId() ?? channelId,
+				locktime: 0,
+				feerate: 2000
+			});
+			expect(
+				refusal.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType: MessageType }).messageType ===
+							MessageType.TX_ABORT
+				),
+				'refused on the wire'
 			).to.be.true;
+			expect(channel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
 		});
 
 		it('does NOT release tx_signatures before the commitment_signed round (fund-safety)', () => {

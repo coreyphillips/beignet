@@ -1064,6 +1064,27 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		completeExchange(h);
 	});
 
+	it('permits only one outstanding RBF request; the ack applies the first', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// The first request pends; a second is refused while it waits, so
+		// the eventual ack can only apply the parameters the peer saw.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const second = h.opener.initiateTxRbf(3000);
+		expect(findError(second)).to.contain('already pending');
+		expect(findPayload(second, MessageType.TX_INIT_RBF)).to.equal(null);
+
+		const ackActions = h.opener.handleTxAckRbf();
+		expect(findError(ackActions)).to.equal(null);
+		expect(
+			h.opener
+				.getFullState()
+				.dualFundingSession!.getLocalParams()!.fundingFeeratePerkw,
+			'the renegotiation prices at the FIRST request'
+		).to.equal(2000);
+	});
+
 	it('a refused tx_init_rbf preserves the current attempt on both sides', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
