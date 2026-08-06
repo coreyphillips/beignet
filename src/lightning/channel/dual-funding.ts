@@ -871,6 +871,16 @@ export class DualFundingSession {
 			this._remoteParams.fundingFeeratePerkw = feerate;
 			this._remoteParams.locktime = locktime;
 		}
+		// The funding feerate is the opener's and applies to the whole
+		// replacement. Our local params were seeded from open_channel2, so
+		// they must follow the accepted RBF too: the negotiated-tx audit and
+		// the next in-flight record both read the feerate from local params,
+		// and leaving the old value there prices both against the replaced
+		// attempt.
+		if (this._localParams) {
+			this._localParams.fundingFeeratePerkw = feerate;
+			this._localParams.locktime = locktime;
+		}
 
 		this._state = DualFundingState.TX_NEGOTIATION;
 

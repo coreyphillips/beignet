@@ -12410,7 +12410,31 @@ export class Channel {
 		// commitment_signed. The commitment/tx_signatures driver resets too.
 		this._state.v2InFlight = null;
 		this._resetV2Driver();
-		return [{ type: ChannelActionType.PERSIST_STATE }];
+		// The renegotiation restarts the interactive-tx exchange from
+		// nothing: reprice the registered contribution at the accepted
+		// feerate and drop the derived list so it re-derives against the
+		// fresh builder (its serial ids died with the old one). The first
+		// tx_add_* rides behind the persist below, so a failed commit
+		// withholds it and the ack boundary stays the durable one.
+		if (this._dualFundingContribution) {
+			this._dualFundingContribution.feeratePerKw = pending.feerate;
+			this._dualFundingContribs = null;
+			this._dualFundingContribIndex = 0;
+			const derived = this._computeDualFundingContributions();
+			if (derived) {
+				// Both sides already committed to the replacement; a bare
+				// local error would leave the peer waiting forever for a
+				// tx_add_* that never comes. Unwind the attempt on the wire.
+				return [
+					{ type: ChannelActionType.PERSIST_STATE },
+					...this._abortV2Negotiation(derived)
+				];
+			}
+		}
+		return [
+			{ type: ChannelActionType.PERSIST_STATE },
+			...this._driveDualFunding()
+		];
 	}
 
 	/**
@@ -12470,6 +12494,19 @@ export class Channel {
 			];
 		}
 
+		// Refuse a replacement our registered wallet inputs cannot cover at
+		// the offered feerate BEFORE the session mutates: the refusal keeps
+		// the current attempt intact on both sides (the peer unwinds on the
+		// tx_abort), where a post-accept failure would strand an attempt
+		// both sides had already agreed to.
+		const unaffordable = this._dualFundingAffordabilityError(msg.feerate);
+		if (unaffordable) {
+			return [
+				this._txAbort(this._v2ChannelId(), unaffordable),
+				{ type: ChannelActionType.ERROR, message: unaffordable }
+			];
+		}
+
 		const result = session.handleRbf(msg.feerate, msg.locktime);
 		if (!result.ok) {
 			// Spec-conformant refusal: tx_abort with the reason, plus the
@@ -12492,6 +12529,15 @@ export class Channel {
 		// commitment_signed. The commitment/tx_signatures driver resets with it.
 		this._state.v2InFlight = null;
 		this._resetV2Driver();
+		// Restart our side of the interactive-tx exchange: reprice the
+		// registered contribution at the accepted feerate and drop the
+		// derived list (stale serial ids from the discarded builder). It
+		// re-derives lazily on the opener's first post-ack tx_add_*.
+		if (this._dualFundingContribution) {
+			this._dualFundingContribution.feeratePerKw = msg.feerate;
+			this._dualFundingContribs = null;
+			this._dualFundingContribIndex = 0;
+		}
 
 		// Send tx_ack_rbf
 		return [

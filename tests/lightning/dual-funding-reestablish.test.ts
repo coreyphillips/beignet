@@ -2057,6 +2057,79 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	it('a successful RBF renegotiates to completion at the new feerate', async function () {
+		const opener = new LightningNode(
+			makeNodeConfig(61, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(62));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		// Strand the exchange inside the RBF window: the acceptor never sees
+		// our commitment_signed, so neither side releases tx_signatures.
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+
+		// The real production path: the opener requests, the peer acks, the
+		// ack restarts and reprices the interactive-tx exchange, and the
+		// replacement negotiates through to its own signatures.
+		wire.clearDrops();
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				acceptorChannel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		// The replacement is a NEW funding tx priced at the accepted feerate,
+		// recorded as attempt 1 on BOTH sides (the acceptor's record must not
+		// carry the stale open_channel2 feerate).
+		const openerRecord = channel.getFullState().v2InFlight!;
+		const acceptorRecord = acceptorChannel.getFullState().v2InFlight!;
+		expect(openerRecord.fundingTxid.equals(attempt0Txid)).to.be.false;
+		expect(
+			openerRecord.fundingTxid.equals(acceptorRecord.fundingTxid)
+		).to.be.true;
+		expect(openerRecord.fundingFeeratePerkw).to.equal(2000);
+		expect(acceptorRecord.fundingFeeratePerkw).to.equal(2000);
+		expect(openerRecord.rbfAttempt).to.equal(1);
+		expect(acceptorRecord.rbfAttempt).to.equal(1);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
 	it('removes an abandoned RBF renegotiation on a live disconnect, durably', async function () {
 		const acceptorStorage = new SqliteStorage(':memory:');
 		acceptorStorage.open();
