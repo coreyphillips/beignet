@@ -954,6 +954,239 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
 		expect(h.acceptor.getFullState().v2InFlight ?? null).to.equal(null);
 	});
+
+	/**
+	 * Drive to the mirrored-loss shape: the acceptor released its
+	 * tx_signatures and the opener completed (fully signed, state
+	 * AWAITING_FUNDING_CONFIRMED), but the opener's own tx_signatures never
+	 * reached the acceptor.
+	 */
+	function driveToFullySignedWithLostFinal(h: IHarness): Buffer {
+		deliverCommitments(h);
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			[[Buffer.alloc(72)]]
+		);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
+		expect(accTxSigs).to.not.equal(null);
+		expect(
+			findError(
+				h.opener.handleTxSignatures(decodeTxSignaturesMessage(accTxSigs))
+			)
+		).to.equal(null);
+		const openSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			[[Buffer.alloc(72)]]
+		);
+		const openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES)!;
+		expect(openTxSigs, 'the opener released its tx_signatures').to.not.equal(
+			null
+		);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getFullState().v2InFlight!.fullySigned).to.be.true;
+		return openTxSigs;
+	}
+
+	it('replays tx_signatures for a fully signed side whose final message was lost', () => {
+		const h = driveToCommitmentExchange();
+		const openTxSigs = driveToFullySignedWithLostFinal(h);
+
+		h.opener.markForReestablish();
+		h.acceptor.markForReestablish();
+
+		// The acceptor lacks our tx_signatures, so it still announces; the
+		// fully signed opener does not (BOLT 2: MUST omit once received).
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		expect(acMsg.nextFundingTxid).to.not.be.oneOf([null, undefined]);
+		const opMsg = reestablishOf(h.opener.createReestablish());
+		expect(opMsg.nextFundingTxid ?? undefined).to.equal(undefined);
+
+		// The opener answers with a byte-identical replay, never tx_abort:
+		// this is the regression the state-scoped routing used to hit (the
+		// splice handler answered the open's txid with tx_abort).
+		const opHandle = h.opener.handleReestablish(acMsg);
+		expect(findError(opHandle)).to.equal(null);
+		expect(
+			findPayload(opHandle, MessageType.TX_ABORT),
+			'no tx_abort for an open we are fully signed on'
+		).to.equal(null);
+		const replayed = findPayload(opHandle, MessageType.TX_SIGNATURES);
+		expect(replayed, 'the recorded witnesses replay').to.not.equal(null);
+		expect(replayed!.equals(openTxSigs)).to.be.true;
+
+		// The acceptor sees the opener's reestablish without next_funding:
+		// with its own tx_signatures already released, omission is expected
+		// and nothing unwinds.
+		const acHandle = h.acceptor.handleReestablish(opMsg);
+		expect(findPayload(acHandle, MessageType.TX_ABORT)).to.equal(null);
+		expect(h.acceptor.getState()).to.not.equal(ChannelState.ERRORED);
+
+		expect(
+			findError(
+				h.acceptor.handleTxSignatures(decodeTxSignaturesMessage(replayed!))
+			)
+		).to.equal(null);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('records a confirmation arriving while disconnected and flushes it on reestablish', () => {
+		const h = driveToCommitmentExchange();
+		driveToFullySignedWithLostFinal(h);
+		h.opener.markForReestablish();
+		h.acceptor.markForReestablish();
+
+		// The chain watcher fires while the channel is AWAITING_REESTABLISH:
+		// the one-shot confirmation must land on the durable record instead
+		// of evaporating against the state gate.
+		const confirmActions = h.opener.fundingConfirmed();
+		expect(findPayload(confirmActions, MessageType.CHANNEL_READY)).to.equal(
+			null
+		);
+		expect(
+			confirmActions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the recorded confirmation persists'
+		).to.be.true;
+		expect(h.opener.getFullState().v2InFlight!.confirmed).to.be.true;
+
+		// The next reestablish flushes channel_ready beside the replay.
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		const opHandle = h.opener.handleReestablish(acMsg);
+		expect(findError(opHandle)).to.equal(null);
+		expect(
+			findPayload(opHandle, MessageType.CHANNEL_READY),
+			'the parked confirmation flushes as channel_ready'
+		).to.not.equal(null);
+	});
+
+	it('flushes a confirmation that arrived mid-exchange when the exchange completes', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Confirmed while the signature exchange is still incomplete.
+		const confirmActions = h.opener.fundingConfirmed();
+		expect(findPayload(confirmActions, MessageType.CHANNEL_READY)).to.equal(
+			null
+		);
+		expect(h.opener.getFullState().v2InFlight!.confirmed).to.be.true;
+
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			[[Buffer.alloc(72)]]
+		);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
+		expect(
+			findError(
+				h.opener.handleTxSignatures(decodeTxSignaturesMessage(accTxSigs))
+			)
+		).to.equal(null);
+		const openSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			[[Buffer.alloc(72)]]
+		);
+		expect(
+			findPayload(openSig, MessageType.CHANNEL_READY),
+			'the exchange completion flushes the parked confirmation'
+		).to.not.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_CHANNEL_READY);
+	});
+
+	it('abandons a crashed RBF renegotiation deterministically on restore', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const rbfHandle = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(rbfHandle, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+
+		// The shape a crash right after the accepted RBF persists: a
+		// DUAL_FUNDING_V2 row with no record and no serializable session.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.acceptor.getFullState()))
+		);
+		const restored = deserializeChannelState(json);
+		expect(restored.v2InFlight ?? null).to.equal(null);
+		const revived = new Channel(restored, h.acceptorSigner);
+		revived.restoreV2InFlight();
+		// restoreChannel routes DUAL_FUNDING_V2 rows through markForReestablish,
+		// whose drop branch abandons them: nothing of the renegotiated attempt
+		// was signed, so the row must error out instead of restoring as a
+		// channel that sends nothing and cannot handle the next message.
+		revived.markForReestablish();
+		expect(revived.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('refuses invalid peer tx_signatures before they enter the session', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const cid = h.opener.getChannelId()!;
+		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+
+		// Wrong stack count (the peer owns exactly one input).
+		const derAll = Buffer.alloc(71);
+		derAll[0] = 0x30;
+		derAll[70] = 0x01;
+		let actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [
+				[derAll, Buffer.alloc(33)],
+				[derAll, Buffer.alloc(33)]
+			]
+		});
+		expect(findError(actions)).to.contain('witness stacks');
+
+		// An empty stack cannot spend a segwit input.
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[]]
+		});
+		expect(findError(actions)).to.contain('empty witness stack');
+
+		// A DER signature must commit with SIGHASH_ALL.
+		const derSingle = Buffer.alloc(71);
+		derSingle[0] = 0x30;
+		derSingle[70] = 0x83;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[derSingle, Buffer.alloc(33)]]
+		});
+		expect(findError(actions)).to.contain('SIGHASH_ALL');
+
+		// A 65-byte schnorr signature carries an explicit type byte.
+		const schnorrOdd = Buffer.alloc(65, 7);
+		schnorrOdd[64] = 0x02;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[schnorrOdd]]
+		});
+		expect(findError(actions)).to.contain('SIGHASH_ALL');
+
+		// None of the refusals recorded anything: the peer can retransmit.
+		expect(h.opener.getFullState().v2InFlight!.receivedTxSignatures).to.be
+			.false;
+
+		// A well-formed set is accepted.
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[derAll, Buffer.alloc(33)]]
+		});
+		expect(findError(actions)).to.equal(null);
+	});
 });
 
 // ─────────────── Node-level helpers ───────────────

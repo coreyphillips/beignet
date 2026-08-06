@@ -525,6 +525,7 @@ export interface ISerializedV2InFlight {
 	remoteCommitmentSig: string | null;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
+	confirmed?: boolean;
 	rbfAttempt: number;
 }
 
@@ -544,6 +545,7 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
+		confirmed: f.confirmed,
 		rbfAttempt: f.rbfAttempt
 	};
 }
@@ -566,6 +568,7 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
 		sentTxSignatures: s.sentTxSignatures,
 		receivedTxSignatures: s.receivedTxSignatures,
+		confirmed: s.confirmed ?? false,
 		rbfAttempt: s.rbfAttempt
 	};
 }

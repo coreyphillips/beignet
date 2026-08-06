@@ -110,6 +110,14 @@ export interface IV2InFlight {
 	remoteCommitmentSig: Buffer | null;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
+	/**
+	 * The funding tx reached depth while the channel could not consume the
+	 * confirmation (disconnected or mid-exchange). The chain watcher's depth
+	 * callback is one-shot, so this survives for the exchange completion or
+	 * the next reestablish to flush channel_ready (mirrors the splice
+	 * record's `confirmed`).
+	 */
+	confirmed: boolean;
 	/** RBF attempt ordinal this record belongs to (0 = original negotiation). */
 	rbfAttempt: number;
 }

@@ -1451,7 +1451,14 @@ export class ChannelManager extends EventEmitter {
 				// its legacy shape (an inert AWAITING_TX_SIGNATURES orphan, and
 				// the quorum startup guard still gets to see it).
 				(st === ChannelState.AWAITING_TX_SIGNATURES &&
-					channel.getFullState().v2InFlight != null)
+					channel.getFullState().v2InFlight != null) ||
+				// A DUAL_FUNDING_V2 row is RBF-renegotiation residue: the accept
+				// persisted the record clear, the session died with the process
+				// and nothing of the new attempt was signed. markForReestablish
+				// takes its drop branch, so the row abandons deterministically
+				// (ERRORED) instead of restoring as a channel that sends
+				// nothing and cannot handle the peer's next message.
+				st === ChannelState.DUAL_FUNDING_V2
 			) {
 				channel.markForReestablish();
 			}

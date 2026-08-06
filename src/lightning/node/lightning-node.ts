@@ -1112,7 +1112,16 @@ export class LightningNode extends EventEmitter {
 			// Finish or abandon it under async-remote first.
 			if (barrier?.enforcing === true) {
 				for (const channel of this.channelManager.listChannels()) {
-					const st = channel.getState();
+					const full = channel.getFullState();
+					// restoreChannel marks a resumable (recorded) open for
+					// reestablish before this guard runs: look through
+					// AWAITING_REESTABLISH to the state it will return to, so
+					// the guard keeps seeing the in-flight open either way.
+					const st =
+						full.state === ChannelState.AWAITING_REESTABLISH &&
+						full.preReestablishState
+							? full.preReestablishState
+							: full.state;
 					if (
 						st !== ChannelState.DUAL_FUNDING_V2 &&
 						st !== ChannelState.AWAITING_TX_SIGNATURES
@@ -1124,9 +1133,8 @@ export class LightningNode extends EventEmitter {
 					).toString('hex');
 					throw new Error(
 						`recovery: cannot enable quorum durability while a dual-funded ` +
-							`open is in progress (channel ${id} is ${st}); its interactive ` +
-							`funding session is not restartable, so finish or abandon it ` +
-							`under async-remote durability first`
+							`open is in progress (channel ${id} is ${st}); finish or ` +
+							`abandon it under async-remote durability first`
 					);
 				}
 			}

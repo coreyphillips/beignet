@@ -563,6 +563,76 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 		storage.close();
 	});
 
+	it('still refuses to come up over a RESUMABLE (recorded) v2 open', function () {
+		const storage = openStorage();
+		// A row carrying the durable v2InFlight record: restoreChannel marks
+		// it for reestablish before the guard runs, so the guard must look
+		// through AWAITING_REESTABLISH to keep seeing the in-flight open.
+		const inFlight = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(19).basepoints,
+			localPerCommitmentSeed: makeSeed(19)
+		});
+		inFlight.channelId = crypto.randomBytes(32);
+		inFlight.state = ChannelState.AWAITING_TX_SIGNATURES;
+		inFlight.fundingVersion = 2;
+		const fundingTx = new bitcoin.Transaction();
+		fundingTx.version = 2;
+		fundingTx.addInput(crypto.randomBytes(32), 0);
+		fundingTx.addOutput(
+			Buffer.concat([Buffer.from([0x00, 0x20]), crypto.randomBytes(32)]),
+			150_000
+		);
+		inFlight.v2InFlight = {
+			fundingTxid: Buffer.from(fundingTx.getHash()),
+			fundingOutputIndex: 0,
+			fundingTxHex: fundingTx.toHex(),
+			fullySigned: false,
+			isInitiator: true,
+			localContributionSats: 150_000n,
+			remoteContributionSats: 0n,
+			fundingFeeratePerkw: 1000,
+			weSignFirst: false,
+			ourWitnesses: [],
+			ourWalletInputIndices: [],
+			remoteCommitmentSig: null,
+			sentTxSignatures: false,
+			receivedTxSignatures: false,
+			confirmed: false,
+			rbfAttempt: 0
+		};
+		storage.saveChannel(
+			inFlight.channelId.toString('hex'),
+			inFlight,
+			'02'.repeat(33)
+		);
+
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(19, {
+						storage,
+						recovery: quorumRecovery()
+					})
+				)
+		).to.throw(/dual-funded open is in progress/);
+
+		// Async-remote resumes it instead of refusing: the record marks the
+		// row for reestablish on restore.
+		const asyncNode = new LightningNode(
+			makeNodeConfig(19, { storage, recovery: { enabled: true } })
+		);
+		asyncNode.on('node:error', () => {});
+		const restored = asyncNode.getChannelManager().listChannels();
+		expect(restored).to.have.length(1);
+		expect(restored[0].getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		asyncNode.destroy();
+		storage.close();
+	});
+
 	it('leaves an established v2 channel alone', function () {
 		const storage = openStorage();
 		// Originally opened with v2, long since an ordinary channel: quorum

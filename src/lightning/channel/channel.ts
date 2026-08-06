@@ -1650,6 +1650,21 @@ export class Channel {
 			this._state.state !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			this._state.state !== ChannelState.AWAITING_CHANNEL_READY
 		) {
+			// A v2 open that cannot consume the confirmation yet (disconnected,
+			// or its signature exchange still incomplete): the chain watcher's
+			// depth callback is one-shot, so record it durably and let the
+			// exchange completion or the next reestablish flush channel_ready
+			// (mirrors markSpliceConfirmed for a splice that confirmed while
+			// the channel could not send splice_locked).
+			if (
+				this._state.v2InFlight &&
+				!this._state.v2InFlight.confirmed &&
+				(this._state.state === ChannelState.AWAITING_REESTABLISH ||
+					this._state.state === ChannelState.AWAITING_TX_SIGNATURES)
+			) {
+				this._state.v2InFlight.confirmed = true;
+				return [{ type: ChannelActionType.PERSIST_STATE }];
+			}
 			return [];
 		}
 
@@ -6066,21 +6081,30 @@ export class Channel {
 
 	/**
 	 * Whether reestablish handling should route next_funding through the v2
-	 * OPEN resumption rather than the splice one: a v2 channel still in its
-	 * opening signature exchange, with either the durable record or a live
-	 * session. NORMAL-track states never qualify (the record is cleared when
-	 * both channel_readys crossed, and a stale one must not re-enter here).
+	 * OPEN resumption rather than the splice one: a v2 channel whose opening
+	 * exchange may still owe the peer something, with either the durable
+	 * record or a live session. A side that signed second advances to
+	 * AWAITING_FUNDING_CONFIRMED (zero-conf: AWAITING_CHANNEL_READY) the
+	 * moment it is fully signed, while the peer may still LACK our
+	 * tx_signatures; the record is retained until NORMAL exactly so the
+	 * peer's next_funding is answered with a verbatim replay here instead of
+	 * the splice handler's tx_abort. NORMAL never qualifies (the record is
+	 * cleared when both channel_readys crossed, and a stale one must not
+	 * re-enter here).
 	 */
 	private _v2OpenResuming(): boolean {
 		if (this._state.fundingVersion !== 2) return false;
 		if (this._spliceSession || this._state.spliceInFlight) return false;
-		if (
-			this._state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
-			this._state.state !== ChannelState.DUAL_FUNDING_V2
-		) {
-			return false;
+		switch (this._state.state) {
+			case ChannelState.AWAITING_TX_SIGNATURES:
+			case ChannelState.DUAL_FUNDING_V2:
+				return !!this._state.v2InFlight || !!this._state.dualFundingSession;
+			case ChannelState.AWAITING_FUNDING_CONFIRMED:
+			case ChannelState.AWAITING_CHANNEL_READY:
+				return !!this._state.v2InFlight;
+			default:
+				return false;
 		}
-		return !!this._state.v2InFlight || !!this._state.dualFundingSession;
 	}
 
 	/**
@@ -6135,6 +6159,12 @@ export class Channel {
 				} else {
 					// We are fully signed; the peer only needs our tx_signatures.
 					actions.push(...this._retransmitV2TxSignatures());
+					// Flush a confirmation that arrived while disconnected (the
+					// depth callback is one-shot; the restore-state block has
+					// already returned the channel to its funding-track state).
+					if (inflight.confirmed) {
+						actions.push(...this.fundingConfirmed());
+					}
 				}
 			} else if (inflight) {
 				return this._failChannelWithWireError(
@@ -11135,6 +11165,7 @@ export class Channel {
 				remoteCommitmentSig: null,
 				sentTxSignatures: false,
 				receivedTxSignatures: false,
+				confirmed: false,
 				rbfAttempt: session.getRbfCount()
 			};
 		}
@@ -11147,19 +11178,70 @@ export class Channel {
 	 * able to rebroadcast it, and the record answers a peer that still asks
 	 * for our tx_signatures over reestablish. The staged pendingFundingTxHex
 	 * rides the existing startup-rebroadcast and per-block retry machinery.
+	 * Returns false when the complete transaction cannot be assembled, in
+	 * which case NOTHING is recorded: marking the peer's witnesses received
+	 * without their bytes would lose the only copy of them on restart and
+	 * silence the next_funding announcement that lets the peer resend them.
 	 */
-	private _recordV2FullySigned(): void {
+	private _recordV2FullySigned(): boolean {
 		const assembled = this._assembleV2FundingTx();
-		if (assembled) {
-			this._state.pendingFundingTxHex = assembled.toString('hex');
-			this._syncV2InFlight({
-				receivedTxSignatures: true,
-				fullySigned: true,
-				fundingTxHex: assembled.toString('hex')
-			});
-		} else {
-			this._syncV2InFlight({ receivedTxSignatures: true });
+		if (!assembled) return false;
+		this._state.pendingFundingTxHex = assembled.toString('hex');
+		this._syncV2InFlight({
+			receivedTxSignatures: true,
+			fullySigned: true,
+			fundingTxHex: assembled.toString('hex')
+		});
+		return true;
+	}
+
+	/**
+	 * Sanity-check the peer's tx_signatures witnesses BEFORE they enter the
+	 * session: the exact per-input count (one stack per peer input), no empty
+	 * stacks (every negotiated input is segwit, so an empty witness cannot
+	 * spend it), bounded element sizes, and SIGHASH_ALL on signature-shaped
+	 * elements (DER signatures and 65-byte schnorr carry an explicit type
+	 * byte; 64-byte schnorr is implicit SIGHASH_DEFAULT, which commits to
+	 * everything). Returns the problem, or null when acceptable.
+	 */
+	private _validateV2PeerWitnesses(witnesses: Buffer[][]): string | null {
+		const session = this._state.dualFundingSession;
+		const record = this._state.v2InFlight;
+		let peerInputs: number | null = null;
+		const builder = session?.getTxBuilder();
+		if (builder && session) {
+			let count = 0;
+			for (const input of builder.getInputs()) {
+				if ((input.serialId % 2n === 0n) !== session.isInitiator()) count++;
+			}
+			peerInputs = count;
+		} else if (record) {
+			try {
+				const bitcoin = require('bitcoinjs-lib');
+				const tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+				peerInputs = tx.ins.length - record.ourWalletInputIndices.length;
+			} catch {
+				return 'recorded funding tx is unreadable';
+			}
 		}
+		if (peerInputs !== null && witnesses.length !== peerInputs) {
+			return `expected ${peerInputs} witness stacks, got ${witnesses.length}`;
+		}
+		for (const stack of witnesses) {
+			if (stack.length === 0) return 'empty witness stack';
+			for (const element of stack) {
+				if (element.length > 520) return 'witness element exceeds 520 bytes';
+			}
+			const first = stack[0];
+			if (first.length > 0 && first[0] === 0x30) {
+				if (first[first.length - 1] !== 0x01) {
+					return 'signature is not SIGHASH_ALL';
+				}
+			} else if (first.length === 65) {
+				if (first[64] !== 0x01) return 'signature is not SIGHASH_ALL';
+			}
+		}
+		return null;
 	}
 
 	/**
@@ -11432,9 +11514,21 @@ export class Channel {
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
 			// The peer's witnesses arrived before ours went out (we sign
 			// second, or the caller drove the release): the exchange completes
-			// HERE, so the fully-signed record must be captured here too.
+			// HERE. Never release witnesses into an exchange that cannot be
+			// recorded: on an assembly failure roll the release back (nothing
+			// has left the wire yet) and fail the negotiation.
+			if (!this._recordV2FullySigned()) {
+				this._v2TxSigsReleased = false;
+				this._syncV2InFlight({ sentTxSignatures: false });
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'v2 funding transaction could not be assembled from the exchanged signatures'
+					}
+				];
+			}
 			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
-			this._recordV2FullySigned();
 		}
 
 		const msg: ITxSignaturesMessage = {
@@ -11459,10 +11553,12 @@ export class Channel {
 		// Zero-conf v2: send channel_ready right behind tx_signatures instead of
 		// waiting for confirmation, mirroring the v1 fast-tracks on
 		// funding_signed. Only meaningful once the funding negotiation is done.
+		// Also flush a confirmation that arrived while the exchange was still
+		// incomplete (the depth callback is one-shot; see fundingConfirmed).
 		if (
 			this._state.state === ChannelState.AWAITING_FUNDING_CONFIRMED &&
-			this._state.zeroConfEnabled &&
-			this._state.trustedPeer
+			((this._state.zeroConfEnabled && this._state.trustedPeer) ||
+				this._state.v2InFlight?.confirmed === true)
 		) {
 			actions.push(...this.fundingConfirmed());
 		}
@@ -11641,6 +11737,21 @@ export class Channel {
 			];
 		}
 
+		// Validate the peer's witnesses BEFORE they enter the session: the
+		// count must match its inputs exactly, every stack must be able to
+		// spend a segwit input, and signature-shaped elements must commit with
+		// SIGHASH_ALL. Refusing here fails the negotiation cleanly instead of
+		// advancing into a funding tx that can never be broadcast.
+		const witnessProblem = this._validateV2PeerWitnesses(msg.witnesses || []);
+		if (witnessProblem) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `invalid v2 tx_signatures: ${witnessProblem}`
+				}
+			];
+		}
+
 		const result = session.handlePeerWitnesses(msg.txid, msg.witnesses);
 		if (!result.ok) {
 			return [
@@ -11665,11 +11776,22 @@ export class Channel {
 		actions.push(...this._maybeSendV2TxSigs());
 
 		if (session.getState() === DualFundingState.AWAITING_CHANNEL_READY) {
-			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
 			// Both witness sets are in hand (the flush above released ours, or
-			// they had already left). Record the fully-signed funding tx, then
-			// persist BEFORE any broadcast.
-			this._recordV2FullySigned();
+			// they had already left). The exchange only completes if the full
+			// funding tx assembles and records: advancing anyway would mark
+			// the peer's witnesses received while losing the only copy of
+			// them on restart, and silence the next_funding announcement that
+			// lets the peer resend them.
+			if (!this._recordV2FullySigned()) {
+				actions.push({
+					type: ChannelActionType.ERROR,
+					message:
+						'v2 funding transaction could not be assembled from the exchanged signatures'
+				});
+				return actions;
+			}
+			this._state.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+			// Persist BEFORE any broadcast.
 			actions.push({ type: ChannelActionType.PERSIST_STATE });
 			// When WE contributed inputs (lease selling) both witness sets are
 			// now in hand: assemble and broadcast the funding tx ourselves
@@ -11686,8 +11808,13 @@ export class Channel {
 				});
 			}
 			// Zero-conf v2: channel_ready right behind tx_signatures, mirroring
-			// the v1 fast-tracks on funding_signed.
-			if (this._state.zeroConfEnabled && this._state.trustedPeer) {
+			// the v1 fast-tracks on funding_signed. Also flush a confirmation
+			// that arrived while the exchange was still incomplete (the depth
+			// callback is one-shot; see fundingConfirmed).
+			if (
+				(this._state.zeroConfEnabled && this._state.trustedPeer) ||
+				this._state.v2InFlight?.confirmed === true
+			) {
 				actions.push(...this.fundingConfirmed());
 			}
 		}
