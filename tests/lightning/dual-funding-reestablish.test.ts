@@ -1443,22 +1443,41 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		residueNode.destroy();
 	});
 
-	it('isAbandonedV2Open covers only dead unfunded opens', () => {
-		// A pre-signature abort is dead and unfunded: nothing anyone can
-		// broadcast exists, so the channel is removable everywhere.
+	it('isAbandonedV2Open covers only dead unfunded opens; a recorded abort waits for its echo', () => {
+		// Aborting a RECORDED attempt tears nothing down until the peer's
+		// echo confirms it heard: the peer holds our commitment_signed, so a
+		// lost abort must leave the attempt resumable.
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
-		expect(findError(h.opener.abortDualFunding('operator cancelled'))).to.equal(
-			null
-		);
+		const abortActions = h.opener.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		expect(findPayload(abortActions, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.opener.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+		expect(h.opener.isAbandonedV2Open()).to.be.false;
+
+		// The echo lands: both sides agreed, the teardown runs durably and
+		// the channel becomes removable everywhere.
+		const echoActions = h.opener.handleTxAbort();
+		expect(
+			echoActions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the teardown persists'
+		).to.be.true;
 		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 		expect(h.opener.isAbandonedV2Open()).to.be.true;
 
 		// A fully signed open is NOT abandoned even when it errors: the
 		// funding tx is staged for (re)broadcast and the peer holds it too.
+		// It cannot be aborted either; the broadcast is owed.
 		const g = driveToCommitmentExchange();
 		deliverCommitments(g);
 		completeExchange(g);
+		expect(findError(g.opener.abortDualFunding('too late'))).to.contain(
+			'after tx_signatures'
+		);
 		g.opener.getFullState().state = ChannelState.ERRORED;
 		expect(g.opener.isAbandonedV2Open()).to.be.false;
 	});
@@ -2674,7 +2693,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
-	it('a dead unfunded v2 open is reaped on disconnect when the abort echo never arrives', async function () {
+	it('a lost abort echo keeps the aborter alive; the diverged terminal voids it on reconnect', async function () {
 		const openerStorage = new SqliteStorage(':memory:');
 		openerStorage.open();
 		const opener = new LightningNode(
@@ -2697,8 +2716,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		wire.clearDrops();
-		// The peer's echo dies on the wire: the aborting side stays ERRORED
-		// and registered, the shape the disconnect sweeps used to skip.
+		// The peer heard the abort and removed its side, but its echo dies:
+		// with no confirmation, the aborting side must NOT tear down (the
+		// echo is the only proof the peer agreed to forget).
 		wire.dropFrom(acceptor, MessageType.TX_ABORT);
 
 		const abortActions = channel.abortDualFunding('operator cancelled');
@@ -2711,17 +2731,117 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		await settle(() => wire.dropped(MessageType.TX_ABORT) > 0);
 		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
 		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
-		expect(channel.getState()).to.equal(ChannelState.ERRORED);
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(channel.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
 
+		// A disconnect keeps the recorded attempt AND its row: the un-echoed
+		// abort dies with the connection.
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+
+		// On reconnect the peer answers reestablish with unknown-channel;
+		// our signatures never left, so the diverged terminal VOIDS the
+		// channel rather than force-closing into a nonexistent funding tx.
 		const voided: Buffer[] = [];
 		opener.on('channel:voided', (e: { channelId: Buffer }) => {
 			voided.push(e.channelId);
 		});
-		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		wire.clearDrops();
+		wire.hold();
+		managerOf(opener).handlePeerReconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerReconnected(opener.getNodeId());
+		wire.drain();
+		await settle(() => voided.length > 0);
+		expect(voided).to.have.length(1);
 		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
 		expect(openerStorage.loadAllChannels()).to.have.length(0);
-		expect(voided).to.have.length(1);
-		expect(voided[0].equals(channelId)).to.be.true;
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a lost tx_abort keeps the recorded attempt on both sides; reconnect resumes it', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(73, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(74, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		wire.clearDrops();
+
+		// The abort itself is lost: the peer still holds our verified
+		// commitment_signed, so NOTHING may be discarded on our side.
+		wire.dropFrom(opener, MessageType.TX_ABORT);
+		const abortActions = channel.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, abortActions);
+		await settle(() => wire.dropped(MessageType.TX_ABORT) > 0);
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(managerOf(acceptor).getChannel(channelId)).to.not.equal(undefined);
+
+		// Disconnect: both sides keep the channel AND the row (this used to
+		// reap the aborting side while the peer still had everything).
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+
+		// Reconnect: the abort never happened; the attempt resumes and
+		// completes on both sides.
+		wire.clearDrops();
+		wire.hold();
+		managerOf(opener).handlePeerReconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerReconnected(opener.getNodeId());
+		wire.drain();
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				acceptorChannel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be
+			.true;
 
 		opener.destroy();
 		acceptor.destroy();

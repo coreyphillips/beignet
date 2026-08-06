@@ -561,6 +561,13 @@ export class Channel {
 	// scoped: BOLT 2 starts the renegotiation only at tx_ack_rbf, so nothing
 	// is replaced while this is pending and a disconnect simply forgets it.
 	private _pendingRbfInit: { feerate: number; locktime: number } | null = null;
+	// Our un-echoed tx_abort of a RECORDED v2 open. Connection scoped: the
+	// teardown happens only when the peer's echo confirms it heard the
+	// abort; until then the attempt (and its durable record) stays fully
+	// live, because a lost abort leaves the peer holding our verified
+	// commitment_signed and possibly a completable funding tx. A disconnect
+	// forgets the abort and the attempt resumes over reestablish.
+	private _v2AbortPending = false;
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -5688,6 +5695,10 @@ export class Channel {
 		this._txAbortSent = false;
 		this._reestablishRetransmitted = false;
 		this._pendingRbfInit = null;
+		// An un-echoed abort of a recorded attempt dies with the connection
+		// too: nothing was torn down, so the attempt resumes over
+		// reestablish exactly as if the abort was never sent.
+		this._v2AbortPending = false;
 
 		// A partially collected start_batch is connection-scoped: the peer
 		// re-announces the batch (with fresh framing) when it retransmits after
@@ -12624,18 +12635,34 @@ export class Channel {
 				}
 			];
 		}
+		// A fully signed funding tx is staged for (re)broadcast: the open
+		// owes the network a broadcast, not the peer an abort.
+		if (this._state.pendingFundingTxHex) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot abort a v2 open whose funding tx is fully signed'
+				}
+			];
+		}
 
+		// A RECORDED attempt tears down only when the peer's echo confirms
+		// it heard the abort: the peer holds our verified commitment_signed,
+		// and if we contributed no inputs it can even complete the funding
+		// tx without us. Discarding our state on a lost abort would forget a
+		// channel the peer can still act on. Nothing durable changes here;
+		// a disconnect forgets the abort and the attempt resumes.
+		if (this._state.v2InFlight) {
+			this._v2AbortPending = true;
+			return [this._txAbort(this._v2ChannelId(), reason)];
+		}
+
+		// Pre-commitment: nothing was signed and nothing durable exists, so
+		// the negotiation dies immediately, echo or not.
 		session.abort();
-		const hadRecord = !!this._state.v2InFlight;
-		this._state.v2InFlight = null;
 		this._resetV2Driver();
 		this._state.state = ChannelState.ERRORED;
-
-		const actions: ChannelAction[] = hadRecord
-			? [{ type: ChannelActionType.PERSIST_STATE }]
-			: [];
-		actions.push(this._txAbort(this._v2ChannelId(), reason));
-		return actions;
+		return [this._txAbort(this._v2ChannelId(), reason)];
 	}
 
 	/**
@@ -12701,6 +12728,20 @@ export class Channel {
 		if (this._spliceAbortPending) {
 			this._spliceAbortPending = false;
 			return [];
+		}
+
+		// The echo of our tx_abort of a RECORDED v2 open: the peer has now
+		// confirmed it heard the abort (or crossed us with its own), so both
+		// sides are agreed and the deferred teardown runs, durably. Until
+		// this moment the attempt stayed fully live, because a lost abort
+		// leaves the peer holding our verified commitment_signed.
+		if (this._txAbortSent && this._v2AbortPending) {
+			this._v2AbortPending = false;
+			this._state.dualFundingSession?.abort();
+			this._state.v2InFlight = null;
+			this._resetV2Driver();
+			this._state.state = ChannelState.ERRORED;
+			return [{ type: ChannelActionType.PERSIST_STATE }];
 		}
 
 		// We have already sent a tx_abort on this negotiation: this incoming
