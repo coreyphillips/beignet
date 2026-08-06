@@ -1064,6 +1064,48 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		completeExchange(h);
 	});
 
+	it('a refused tx_init_rbf preserves the current attempt on both sides', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const before = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+
+		// The receiver refuses (a feerate below its 25/24 floor, modelling a
+		// peer with a different fee view); the refusal mutates nothing there.
+		const refusal = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 1001
+		});
+		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_TX_SIGNATURES
+		);
+		expect(h.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+
+		// The initiator, holding a pending request, treats the tx_abort as
+		// the refusal it is: only the pending request dies. No teardown, no
+		// error, and the attempt is not abandoned.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const answer = h.opener.handleTxAbort();
+		expect(findError(answer)).to.equal(null);
+		expect(
+			findPayload(answer, MessageType.TX_ABORT),
+			'the abort is echoed as its ack'
+		).to.not.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.opener.getFullState().v2InFlight!.fundingTxid.equals(before)).to
+			.be.true;
+		expect(h.opener.isAbandonedV2Open()).to.be.false;
+
+		// The refusing receiver swallows the echo (it sent the abort itself),
+		// and the ORIGINAL attempt still completes.
+		expect(h.acceptor.handleTxAbort()).to.deep.equal([]);
+		completeExchange(h);
+	});
+
 	it('tx_ack_rbf begins the renegotiation: record cleared, persisted, state knocked back', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

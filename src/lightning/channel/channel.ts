@@ -12749,6 +12749,19 @@ export class Channel {
 			return [this._txAbort(this._v2ChannelId())];
 		}
 
+		// The abort answers our un-acked tx_init_rbf: the peer refused the
+		// replacement (BOLT 2 lets the receiver refuse any tx_init_rbf with
+		// tx_abort). NOTHING was replaced on either side (the renegotiation
+		// begins only at the ack, and the refusing receiver mutated nothing),
+		// so the current attempt stays fully live; only the pending request
+		// dies. Echo the abort as the ack it expects and carry on. A peer
+		// that was instead aborting the whole open converges later through
+		// its own reestablish answer, exactly like a dropped open.
+		if (this._pendingRbfInit) {
+			this._pendingRbfInit = null;
+			return [this._txAbort(this._v2ChannelId())];
+		}
+
 		session.abort();
 		const hadRecord = !!this._state.v2InFlight;
 		this._state.v2InFlight = null;
