@@ -11158,10 +11158,11 @@ export class Channel {
 			if (!built) return;
 			const signed = this._signV2ContributionWitnesses(built);
 			if (!signed) return;
-			// The peer's prevout scripts must survive the process: witness
-			// validation after a restart has nothing else to type them by.
-			const peerScripts = this._v2PeerPrevoutScripts();
-			if (!peerScripts) return;
+			// The complete prevout set must survive the process: witness
+			// validation after a restart has nothing else to bind and verify
+			// the peer's signatures against.
+			const prevouts = this._v2InputPrevouts();
+			if (!prevouts) return;
 			const params = session.getLocalParams();
 			this._state.v2InFlight = {
 				fundingTxid: Buffer.from(built.tx.getHash()),
@@ -11179,7 +11180,10 @@ export class Channel {
 				weSignFirst: this._v2ShouldSignFirst(),
 				ourWitnesses: signed.witnesses,
 				ourWalletInputIndices: signed.indices,
-				peerPrevoutScripts: peerScripts.map((s) => Buffer.from(s)),
+				inputPrevouts: prevouts.scripts.map((s, i) => ({
+					script: Buffer.from(s),
+					valueSats: prevouts.values[i]
+				})),
 				remoteCommitmentSig: null,
 				sentTxSignatures: false,
 				receivedTxSignatures: false,
@@ -11214,13 +11218,14 @@ export class Channel {
 	}
 
 	/**
-	 * ScriptPubkeys of the PEER's funding inputs, in tx-input order: from the
-	 * live builder's prevouts while it exists, from the durable record after
-	 * a restart (captured at record creation, when the prev_txs were last in
-	 * hand). Null when they cannot be resolved, in which case nothing about
-	 * the peer's witnesses can be judged and the exchange must not advance.
+	 * The complete prevout set of the negotiated funding tx (script and value
+	 * per input, in tx-input order): from the live builder's prev_txs while
+	 * it exists, from the durable record after a restart (captured at record
+	 * creation, when the prev_txs were last in hand). Null when unresolvable,
+	 * in which case nothing about the peer's witnesses can be judged and the
+	 * exchange must not advance.
 	 */
-	private _v2PeerPrevoutScripts(): Buffer[] | null {
+	private _v2InputPrevouts(): { scripts: Buffer[]; values: bigint[] } | null {
 		const session = this._state.dualFundingSession;
 		const builder = session?.getTxBuilder();
 		if (session && builder) {
@@ -11230,47 +11235,105 @@ export class Channel {
 				a.serialId < b.serialId ? -1 : 1
 			);
 			if (sorted.length !== built.tx.ins.length) return null;
-			const prevouts = this._collectPrevouts(built.tx, sorted);
-			if (!prevouts) return null;
-			const scripts: Buffer[] = [];
+			return this._collectPrevouts(built.tx, sorted);
+		}
+		const record = this._state.v2InFlight;
+		if (!record || record.inputPrevouts.length === 0) return null;
+		return {
+			scripts: record.inputPrevouts.map((p) => p.script),
+			values: record.inputPrevouts.map((p) => p.valueSats)
+		};
+	}
+
+	/** The tx-input indices of the PEER's funding inputs, ascending. */
+	private _v2PeerInputIndices(inputCount: number): number[] | null {
+		const session = this._state.dualFundingSession;
+		const builder = session?.getTxBuilder();
+		if (session && builder) {
+			const sorted = [...builder.getInputs()].sort((a, b) =>
+				a.serialId < b.serialId ? -1 : 1
+			);
+			if (sorted.length !== inputCount) return null;
+			const indices: number[] = [];
 			for (let i = 0; i < sorted.length; i++) {
 				if ((sorted[i].serialId % 2n === 0n) !== session.isInitiator()) {
-					scripts.push(prevouts.scripts[i]);
+					indices.push(i);
 				}
 			}
-			return scripts;
+			return indices;
 		}
-		return this._state.v2InFlight?.peerPrevoutScripts ?? null;
+		const record = this._state.v2InFlight;
+		if (!record) return null;
+		const ours = new Set(record.ourWalletInputIndices);
+		const indices: number[] = [];
+		for (let i = 0; i < inputCount; i++) {
+			if (!ours.has(i)) indices.push(i);
+		}
+		return indices;
 	}
 
 	/**
 	 * Validate the peer's tx_signatures witnesses BEFORE they enter the
-	 * session, each against its negotiated prevout: exactly one stack per
-	 * peer input, and per output type the shape a valid SIGHASH_ALL spend
-	 * must have (P2WPKH [DER-ALL sig, pubkey]; P2TR key-spend 64-byte
-	 * SIGHASH_DEFAULT, which commits to everything ALL does, or 65-byte with
-	 * an explicit ALL byte; P2WSH under standardness bounds with DER-shaped
-	 * items required to be ALL; taproot script-path judged structurally, its
-	 * leaf semantics cannot be typed generically). Returns the problem, or
-	 * null when acceptable.
+	 * session: exactly one stack per peer input, each bound to its negotiated
+	 * prevout and cryptographically verified where the output type allows.
+	 * P2WPKH: [DER SIGHASH_ALL signature, pubkey], the pubkey must hash to
+	 * the program and the signature must verify over the BIP 143 sighash.
+	 * P2TR key-spend: a 65-byte schnorr signature with an explicit ALL byte
+	 * (BOLT 2 requires SIGHASH_ALL on tx_signatures signatures), verified
+	 * over the BIP 341 sighash against the output key. P2WSH: the witness
+	 * script must hash to the program, items under standardness bounds, and
+	 * DER-shaped items must carry ALL (the script itself cannot be executed
+	 * generically); taproot script-path likewise is judged structurally.
+	 * Returns the problem, or null when acceptable.
 	 */
 	private _validateV2PeerWitnesses(witnesses: Buffer[][]): string | null {
-		const scripts = this._v2PeerPrevoutScripts();
-		if (!scripts) return 'peer funding inputs cannot be resolved';
-		if (witnesses.length !== scripts.length) {
-			return `expected ${scripts.length} witness stacks, got ${witnesses.length}`;
+		const prevouts = this._v2InputPrevouts();
+		if (!prevouts) return 'funding prevouts cannot be resolved';
+		const record = this._state.v2InFlight;
+		let tx: import('bitcoinjs-lib').Transaction;
+		const built = this._v2NegotiatedTx();
+		if (built) {
+			tx = built.tx;
+		} else if (record) {
+			const bitcoin = require('bitcoinjs-lib');
+			try {
+				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
+			} catch {
+				return 'negotiated funding tx cannot be resolved';
+			}
+		} else {
+			return 'negotiated funding tx cannot be resolved';
 		}
-		for (let i = 0; i < witnesses.length; i++) {
-			const problem = this._validateWitnessForPrevout(witnesses[i], scripts[i]);
+		if (prevouts.scripts.length !== tx.ins.length) {
+			return 'funding prevouts do not cover the negotiated tx';
+		}
+		const peerIndices = this._v2PeerInputIndices(tx.ins.length);
+		if (!peerIndices) return 'peer funding inputs cannot be resolved';
+		if (witnesses.length !== peerIndices.length) {
+			return `expected ${peerIndices.length} witness stacks, got ${witnesses.length}`;
+		}
+		for (let k = 0; k < peerIndices.length; k++) {
+			const problem = this._validateWitnessForInput(
+				tx,
+				peerIndices[k],
+				witnesses[k],
+				prevouts
+			);
 			if (problem) return problem;
 		}
 		return null;
 	}
 
-	private _validateWitnessForPrevout(
+	private _validateWitnessForInput(
+		tx: import('bitcoinjs-lib').Transaction,
+		index: number,
 		stack: Buffer[],
-		script: Buffer
+		prevouts: { scripts: Buffer[]; values: bigint[] }
 	): string | null {
+		const bitcoin = require('bitcoinjs-lib');
+		const ecc = require('@bitcoinerlab/secp256k1');
+		const script = prevouts.scripts[index];
+		const value = prevouts.values[index];
 		if (stack.length === 0) return 'empty witness stack';
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
@@ -11282,23 +11345,50 @@ export class Channel {
 			if (stack.length !== 2) {
 				return 'P2WPKH witness must be [signature, pubkey]';
 			}
-			if (!this._isDerSighashAll(stack[0])) {
-				return 'P2WPKH signature is not a DER SIGHASH_ALL signature';
-			}
-			if (
-				stack[1].length !== 33 ||
-				(stack[1][0] !== 0x02 && stack[1][0] !== 0x03)
-			) {
+			const decoded = this._decodeDerSighashAll(stack[0]);
+			if (typeof decoded === 'string') return `P2WPKH ${decoded}`;
+			const pubkey = stack[1];
+			if (pubkey.length !== 33 || (pubkey[0] !== 0x02 && pubkey[0] !== 0x03)) {
 				return 'P2WPKH witness pubkey is malformed';
+			}
+			if (!bitcoin.crypto.hash160(pubkey).equals(script.subarray(2))) {
+				return 'P2WPKH witness pubkey does not match the prevout program';
+			}
+			const scriptCode = bitcoin.payments.p2pkh({
+				hash: script.subarray(2)
+			}).output!;
+			const sighash = tx.hashForWitnessV0(
+				index,
+				scriptCode,
+				Number(value),
+				bitcoin.Transaction.SIGHASH_ALL
+			);
+			if (!ecc.verify(sighash, pubkey, decoded)) {
+				return 'P2WPKH signature does not verify against its prevout';
 			}
 			return null;
 		}
 		if (isP2tr) {
 			if (stack.length === 1) {
 				const sig = stack[0];
-				if (sig.length === 64) return null;
-				if (sig.length === 65 && sig[64] === 0x01) return null;
-				return 'P2TR key-spend signature is not SIGHASH_DEFAULT or SIGHASH_ALL';
+				// BOLT 2 requires SIGHASH_ALL on every tx_signatures
+				// signature: only the explicit 65-byte form qualifies (the
+				// 64-byte shorthand is SIGHASH_DEFAULT).
+				if (sig.length !== 65 || sig[64] !== 0x01) {
+					return 'P2TR key-spend signature must carry an explicit SIGHASH_ALL byte';
+				}
+				const sighash = tx.hashForWitnessV1(
+					index,
+					prevouts.scripts,
+					prevouts.values.map((v) => Number(v)),
+					bitcoin.Transaction.SIGHASH_ALL
+				);
+				if (
+					!ecc.verifySchnorr(sighash, script.subarray(2), sig.subarray(0, 64))
+				) {
+					return 'P2TR signature does not verify against its prevout';
+				}
+				return null;
 			}
 			const control = stack[stack.length - 1];
 			if (control.length < 33 || (control.length - 33) % 32 !== 0) {
@@ -11314,16 +11404,16 @@ export class Channel {
 			if (witnessScript.length === 0 || witnessScript.length > 3600) {
 				return 'P2WSH witness script oversized or empty';
 			}
+			if (!bitcoin.crypto.sha256(witnessScript).equals(script.subarray(2))) {
+				return 'P2WSH witness script does not match the prevout program';
+			}
 			for (let i = 0; i < stack.length - 1; i++) {
 				if (stack[i].length > 80) {
 					return 'P2WSH witness stack item exceeds standardness bounds';
 				}
-				if (
-					stack[i].length > 0 &&
-					stack[i][0] === 0x30 &&
-					!this._isDerSighashAll(stack[i])
-				) {
-					return 'P2WSH signature is not a DER SIGHASH_ALL signature';
+				if (stack[i].length > 0 && stack[i][0] === 0x30) {
+					const decoded = this._decodeDerSighashAll(stack[i]);
+					if (typeof decoded === 'string') return `P2WSH ${decoded}`;
 				}
 			}
 			return null;
@@ -11331,17 +11421,23 @@ export class Channel {
 		return 'peer funding input is not a supported segwit output';
 	}
 
-	/** Structural DER signature check with an explicit SIGHASH_ALL byte. */
-	private _isDerSighashAll(el: Buffer): boolean {
-		if (el.length < 9 || el.length > 73) return false;
-		if (el[0] !== 0x30 || el[1] !== el.length - 3) return false;
-		if (el[2] !== 0x02) return false;
-		const rLen = el[3];
-		if (rLen === 0 || 5 + rLen >= el.length) return false;
-		if (el[4 + rLen] !== 0x02) return false;
-		const sLen = el[5 + rLen];
-		if (sLen === 0 || 6 + rLen + sLen !== el.length - 1) return false;
-		return el[el.length - 1] === 0x01;
+	/**
+	 * Decode a DER-encoded signature-with-sighash element; returns the raw
+	 * 64-byte signature when it is structurally valid AND carries an explicit
+	 * SIGHASH_ALL byte, or the problem as a string.
+	 */
+	private _decodeDerSighashAll(el: Buffer): Buffer | string {
+		const bitcoin = require('bitcoinjs-lib');
+		let decoded: { signature: Buffer; hashType: number };
+		try {
+			decoded = bitcoin.script.signature.decode(el);
+		} catch {
+			return 'signature is not a valid DER signature';
+		}
+		if (decoded.hashType !== bitcoin.Transaction.SIGHASH_ALL) {
+			return 'signature is not SIGHASH_ALL';
+		}
+		return decoded.signature;
 	}
 
 	/**

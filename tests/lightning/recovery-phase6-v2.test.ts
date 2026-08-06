@@ -598,7 +598,7 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 			weSignFirst: false,
 			ourWitnesses: [],
 			ourWalletInputIndices: [],
-			peerPrevoutScripts: [],
+			inputPrevouts: [],
 			remoteCommitmentSig: null,
 			sentTxSignatures: false,
 			receivedTxSignatures: false,

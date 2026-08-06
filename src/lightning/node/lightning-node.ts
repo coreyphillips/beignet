@@ -1269,6 +1269,16 @@ export class LightningNode extends EventEmitter {
 	private restoreFromStorage(): void {
 		if (!this.storage) return;
 
+		// Seed the per-channel key index from storage FIRST: restoreChannel
+		// advances it from each restored row, but a row removed below never
+		// restores, and a stale index would hand the next channel a previous
+		// channel's funding keys and per-commitment seed. Guarded call: test
+		// doubles implement partial backends.
+		const nextChannelIndex = this.storage.loadNextChannelIndex?.() ?? 1;
+		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
+			this.channelManager.nextChannelIndex = nextChannelIndex;
+		}
+
 		// Restore channels — look up per-channel key index for each
 		for (const {
 			channelId,
@@ -2388,6 +2398,26 @@ export class LightningNode extends EventEmitter {
 				event.request
 			);
 		});
+
+		// The manager abandoned an unfunded open outright (a v2 RBF
+		// renegotiation dropped on disconnect): its row must go with it, or
+		// the next restart restores a channel the manager already removed.
+		this.channelManager.on(
+			'channel:abandoned',
+			(channelId: Buffer, reason: string) => {
+				const idHex = channelId.toString('hex');
+				if (this.storage) {
+					this.safeStorage(
+						() => this.storage!.deleteChannel(idHex),
+						'deleteChannel'
+					);
+				}
+				this.emitStructuredLog('channel', 'open_abandoned', {
+					channelId: idHex,
+					reason
+				});
+			}
+		);
 
 		// A processActions batch is open: monitor changes it causes belong in
 		// that channel's transition rather than in a second, separate write.

@@ -1307,7 +1307,28 @@ export class ChannelManager extends EventEmitter {
 			// rules; what is not was a negotiation that restarts.
 			const channelIdHex = channel.getChannelId()?.toString('hex');
 			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
+			const wasRbfRenegotiation =
+				channel.getState() === ChannelState.DUAL_FUNDING_V2;
 			channel.markForReestablish();
+			// The drop branch abandoned an RBF renegotiation nothing was signed
+			// for: remove the channel entirely, mirroring the restart path
+			// (which deletes the row). Leaving it ERRORED left a silent
+			// permanent channel that no reestablish, disposition or cleanup
+			// ever touches; a peer that still asks after removal gets the
+			// unknown-channel error and ends the attempt on its side.
+			if (
+				wasRbfRenegotiation &&
+				channel.getState() === ChannelState.ERRORED &&
+				channelIdHex
+			) {
+				this.channels.delete(channelIdHex);
+				this.channelPeers.delete(channelIdHex);
+				this.emit(
+					'channel:abandoned',
+					channel.getChannelId(),
+					'v2 open RBF renegotiation dropped on disconnect'
+				);
+			}
 		}
 
 		// Early-stage channels → abort (BOLT 2: no reestablish before

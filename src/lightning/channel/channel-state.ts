@@ -107,12 +107,13 @@ export interface IV2InFlight {
 	ourWitnesses: Buffer[][];
 	ourWalletInputIndices: number[];
 	/**
-	 * ScriptPubkeys of the PEER's funding inputs, in tx-input order. The
-	 * interactive-tx prev_txs die with the process, so the peer's witnesses
-	 * can only be validated against their prevouts after a restart if the
-	 * scripts were captured while the builder was live.
+	 * The complete prevout set of the negotiated funding tx (scriptPubkey and
+	 * value per input, in tx-input order). The interactive-tx prev_txs die
+	 * with the process, and witness validation needs the set after a restart:
+	 * BIP 143 sighashes commit to the spent input's value, BIP 341 sighashes
+	 * to every input's script and value.
 	 */
-	peerPrevoutScripts: Buffer[];
+	inputPrevouts: Array<{ script: Buffer; valueSats: bigint }>;
 	/** Peer's verified signature over OUR commitment #0; doubles as the received-commitment marker. */
 	remoteCommitmentSig: Buffer | null;
 	sentTxSignatures: boolean;

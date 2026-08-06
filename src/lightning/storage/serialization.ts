@@ -522,7 +522,7 @@ export interface ISerializedV2InFlight {
 	weSignFirst: boolean;
 	ourWitnesses: string[][];
 	ourWalletInputIndices: number[];
-	peerPrevoutScripts?: string[];
+	inputPrevouts?: Array<{ script: string; valueSats: string }>;
 	remoteCommitmentSig: string | null;
 	sentTxSignatures: boolean;
 	receivedTxSignatures: boolean;
@@ -543,7 +543,10 @@ export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
 		weSignFirst: f.weSignFirst,
 		ourWitnesses: f.ourWitnesses.map((w) => w.map((b) => b.toString('hex'))),
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
-		peerPrevoutScripts: f.peerPrevoutScripts.map((b) => b.toString('hex')),
+		inputPrevouts: f.inputPrevouts.map((p) => ({
+			script: p.script.toString('hex'),
+			valueSats: bigintToStr(p.valueSats)
+		})),
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
 		sentTxSignatures: f.sentTxSignatures,
 		receivedTxSignatures: f.receivedTxSignatures,
@@ -567,9 +570,10 @@ export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
 			w.map((h) => Buffer.from(h, 'hex'))
 		),
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
-		peerPrevoutScripts: (s.peerPrevoutScripts ?? []).map((h) =>
-			Buffer.from(h, 'hex')
-		),
+		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
+			script: Buffer.from(p.script, 'hex'),
+			valueSats: strToBigint(p.valueSats)
+		})),
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
 		sentTxSignatures: s.sentTxSignatures,
 		receivedTxSignatures: s.receivedTxSignatures,

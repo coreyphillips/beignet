@@ -77,7 +77,8 @@ import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
-	decodeTxAbortMessage
+	decodeTxAbortMessage,
+	encodeTxInitRbfMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
 import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
@@ -134,18 +135,6 @@ function makeBasepoints(fundingPub: Buffer, seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makePrevTx(valueSats: number, script?: Buffer): Buffer {
-	const tx = new bitcoin.Transaction();
-	tx.version = 2;
-	tx.addInput(crypto.randomBytes(32), 0);
-	tx.addOutput(
-		script ??
-			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
-		valueSats
-	);
-	return tx.toBuffer();
-}
-
 function makeInput(
 	serialId: bigint,
 	prevTx: Buffer,
@@ -162,20 +151,80 @@ function makeInput(
 }
 
 /**
- * A structurally valid P2WPKH witness: DER-shaped SIGHASH_ALL signature plus
- * a 33-byte compressed pubkey. The validation types witnesses against their
- * negotiated prevouts, so the caller-driven tests must release shapes a real
- * wallet would.
+ * A REAL spendable P2WPKH prevout with a signing closure: witness validation
+ * binds the pubkey to the program and verifies the signature over the BIP 143
+ * sighash, so the caller-driven tests must release genuine spends.
  */
-function fakeDerWitness(): Buffer[] {
-	const sig = Buffer.concat([
-		Buffer.from([0x30, 0x44, 0x02, 0x20]),
-		crypto.randomBytes(32),
-		Buffer.from([0x02, 0x20]),
-		crypto.randomBytes(32),
-		Buffer.from([0x01])
-	]);
-	return [sig, Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)])];
+interface IRealPrevOut {
+	prevTx: Buffer;
+	script: Buffer;
+	pub: Buffer;
+	sign: (
+		tx: bitcoin.Transaction,
+		index: number,
+		prevouts: { scripts: Buffer[]; values: bigint[] }
+	) => Buffer[];
+}
+
+function makeRealPrevOut(valueSats: number): IRealPrevOut {
+	const priv = crypto.randomBytes(32);
+	const pub = getPublicKey(priv);
+	const payment = bitcoin.payments.p2wpkh({ pubkey: pub });
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addOutput(payment.output!, valueSats);
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output!;
+	return {
+		prevTx: prevTx.toBuffer(),
+		script: payment.output!,
+		pub,
+		sign: (tx, index) => {
+			const sighash = tx.hashForWitnessV0(
+				index,
+				scriptCode,
+				valueSats,
+				bitcoin.Transaction.SIGHASH_ALL
+			);
+			return [
+				bitcoin.script.signature.encode(
+					Buffer.from(ecc.sign(sighash, priv)),
+					bitcoin.Transaction.SIGHASH_ALL
+				),
+				pub
+			];
+		}
+	};
+}
+
+/** A real P2TR key-path prevout (raw x-only key program, BIP 341 spend). */
+function makeRealP2trPrevOut(valueSats: number): IRealPrevOut {
+	const priv = crypto.randomBytes(32);
+	const xonly = Buffer.from(getPublicKey(priv).subarray(1));
+	const script = Buffer.concat([Buffer.from([0x51, 0x20]), xonly]);
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(crypto.randomBytes(32), 0);
+	prevTx.addOutput(script, valueSats);
+	return {
+		prevTx: prevTx.toBuffer(),
+		script,
+		pub: xonly,
+		sign: (tx, index, prevouts) => {
+			const sighash = tx.hashForWitnessV1(
+				index,
+				prevouts.scripts,
+				prevouts.values.map((v) => Number(v)),
+				bitcoin.Transaction.SIGHASH_ALL
+			);
+			return [
+				Buffer.concat([
+					Buffer.from(ecc.signSchnorr(sighash, priv)),
+					Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+				])
+			];
+		}
+	};
 }
 
 interface IHarness {
@@ -188,6 +237,11 @@ interface IHarness {
 	/** commitment_signed payloads captured but NOT yet delivered. */
 	openerCommit: Buffer;
 	acceptorCommit: Buffer;
+	openerPrev: IRealPrevOut;
+	acceptorPrev: IRealPrevOut;
+	/** Genuine witnesses for each side's funding input over the negotiated tx. */
+	openerWitness(): Buffer[][];
+	acceptorWitness(): Buffer[][];
 }
 
 const OPENER_FUNDING = 100_000n;
@@ -201,7 +255,7 @@ const TOTAL_FUNDING = OPENER_FUNDING + ACCEPTOR_FUNDING;
  * input; the acceptor (lower input sats) signs tx_signatures first.
  */
 function driveToCommitmentExchange(
-	opts: { acceptorPrevOutScript?: Buffer } = {}
+	opts: { acceptorPrev?: IRealPrevOut } = {}
 ): IHarness {
 	const sharedTempId = crypto.randomBytes(32);
 
@@ -280,11 +334,10 @@ function driveToCommitmentExchange(
 	);
 	expect(findError(opener.handleAcceptChannel2(acceptMsg))).to.equal(null);
 
-	const openerInput = makeInput(0n, makePrevTx(120_000));
-	const acceptorInput = makeInput(
-		1n,
-		makePrevTx(60_000, opts.acceptorPrevOutScript)
-	);
+	const openerPrev = makeRealPrevOut(120_000);
+	const acceptorPrev = opts.acceptorPrev ?? makeRealPrevOut(60_000);
+	const openerInput = makeInput(0n, openerPrev.prevTx);
+	const acceptorInput = makeInput(1n, acceptorPrev.prevTx);
 	const funding = createFundingScript(openerFundingPub, acceptorFundingPub);
 	const fundingOutput: IInteractiveTxOutput = {
 		serialId: 2n,
@@ -326,6 +379,21 @@ function driveToCommitmentExchange(
 	expect(opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 	expect(acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 
+	const witnessFor = (
+		channel: Channel,
+		prev: IRealPrevOut,
+		index: number
+	): Buffer[][] => {
+		const rec = channel.getFullState().v2InFlight!;
+		const tx = bitcoin.Transaction.fromHex(rec.fundingTxHex);
+		return [
+			prev.sign(tx, index, {
+				scripts: rec.inputPrevouts.map((p) => p.script),
+				values: rec.inputPrevouts.map((p) => p.valueSats)
+			})
+		];
+	};
+
 	return {
 		opener,
 		acceptor,
@@ -334,7 +402,11 @@ function driveToCommitmentExchange(
 		openerSeed,
 		acceptorSeed,
 		openerCommit,
-		acceptorCommit
+		acceptorCommit,
+		openerPrev,
+		acceptorPrev,
+		openerWitness: () => witnessFor(opener, openerPrev, 0),
+		acceptorWitness: () => witnessFor(acceptor, acceptorPrev, 1)
 	};
 }
 
@@ -369,9 +441,11 @@ function completeExchange(h: IHarness): void {
 	// The acceptor (lower input sats) signs first.
 	const accTxid = h.acceptor.getFullState().fundingTxid!;
 	const accOidx = h.acceptor.getFullState().fundingOutputIndex;
-	const accSig = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-		fakeDerWitness()
-	]);
+	const accSig = h.acceptor.sendTxSignatures(
+		accTxid,
+		accOidx,
+		h.acceptorWitness()
+	);
 	expect(findError(accSig)).to.equal(null);
 	const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES);
 	expect(accTxSigs, 'acceptor releases tx_signatures first').to.not.equal(null);
@@ -386,7 +460,7 @@ function completeExchange(h: IHarness): void {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		expect(findError(openSig)).to.equal(null);
 		openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES);
@@ -486,9 +560,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		// The acceptor releases its tx_signatures, but they never arrive.
 		const accTxid = h.acceptor.getFullState().fundingTxid!;
 		const accOidx = h.acceptor.getFullState().fundingOutputIndex;
-		const accSig = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-			fakeDerWitness()
-		]);
+		const accSig = h.acceptor.sendTxSignatures(
+			accTxid,
+			accOidx,
+			h.acceptorWitness()
+		);
 		const original = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(original).to.not.equal(null);
 		expect(h.acceptor.getFullState().v2InFlight!.sentTxSignatures).to.be.true;
@@ -521,7 +597,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		const openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES)!;
 		expect(openTxSigs).to.not.equal(null);
@@ -615,7 +691,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			accTxid,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.acceptorWitness()
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 
@@ -764,7 +840,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.acceptorWitness()
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		const revAfterPeer = revived.handleTxSignatures(
@@ -774,7 +850,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const revSig = revived.sendTxSignatures(
 			revived.getFullState().fundingTxid!,
 			revived.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		const revTxSigs = findPayload(revSig, MessageType.TX_SIGNATURES)!;
 		expect(revTxSigs).to.not.equal(null);
@@ -903,7 +979,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = g.acceptor.sendTxSignatures(
 			g.acceptor.getFullState().fundingTxid!,
 			g.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			g.acceptorWitness()
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 		expect(findError(g.acceptor.initiateTxRbf(2000))).to.contain(
@@ -989,7 +1065,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.acceptorWitness()
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(accTxSigs).to.not.equal(null);
@@ -1001,7 +1077,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		const openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES)!;
 		expect(openTxSigs, 'the opener released its tx_signatures').to.not.equal(
@@ -1101,7 +1177,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.acceptorWitness()
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(
@@ -1112,7 +1188,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		expect(
 			findPayload(openSig, MessageType.CHANNEL_READY),
@@ -1153,31 +1229,37 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		// zombie cannot repeat on the next restart because the row is gone.
 		const storage = new SqliteStorage(':memory:');
 		storage.open();
-		storage.saveChannel(
-			h.acceptor.getChannelId()!.toString('hex'),
-			deserializeChannelState(json),
-			'02'.repeat(33)
-		);
+		const idHex = h.acceptor.getChannelId()!.toString('hex');
+		storage.saveChannel(idHex, deserializeChannelState(json), '02'.repeat(33));
+		// The residue held per-channel key index 7. Removing the row must not
+		// forget the index, or the next channel would reuse funding keys and
+		// the per-commitment seed of a channel that once existed.
+		storage.saveChannelKeyIndex(idHex, 7);
 		const node = new LightningNode(
 			makeNodeConfig(26, { storage, recovery: { enabled: true } })
 		);
 		node.on('node:error', () => {});
 		expect(node.getChannelManager().listChannels()).to.have.length(0);
 		expect(storage.loadAllChannels()).to.have.length(0);
+		expect(
+			managerOf(node).nextChannelIndex,
+			'the key index advanced past the removed residue'
+		).to.be.at.least(8);
 		node.destroy();
 	});
 
-	it('validates peer tx_signatures against their negotiated prevouts', () => {
+	it('verifies peer tx_signatures against their negotiated prevouts', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 		const cid = h.opener.getChannelId()!;
 		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+		const genuine = h.acceptorWitness();
 
 		// Wrong stack count (the peer owns exactly one P2WPKH input).
 		let actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [fakeDerWitness(), fakeDerWitness()]
+			witnesses: [genuine[0], genuine[0]]
 		});
 		expect(findError(actions)).to.contain('witness stacks');
 
@@ -1198,65 +1280,97 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		});
 		expect(findError(actions)).to.contain('P2WPKH witness');
 
-		// A zero-filled 72-byte element beside a pubkey is not a DER
-		// signature either.
+		// A zero-filled element beside the right pubkey is not DER.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[Buffer.alloc(72), fakeDerWitness()[1]]]
+			witnesses: [[Buffer.alloc(72), genuine[0][1]]]
 		});
-		expect(findError(actions)).to.contain('DER SIGHASH_ALL');
+		expect(findError(actions)).to.contain('valid DER');
 
-		// A structurally valid DER signature with a non-ALL sighash byte.
-		const derSingle = fakeDerWitness()[0];
-		derSingle[derSingle.length - 1] = 0x83;
+		// A genuine signature re-encoded with a non-ALL sighash byte.
+		const decoded = bitcoin.script.signature.decode(genuine[0][0]);
+		const nonAll = bitcoin.script.signature.encode(decoded.signature, 0x83);
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[derSingle, fakeDerWitness()[1]]]
+			witnesses: [[nonAll, genuine[0][1]]]
 		});
-		expect(findError(actions)).to.contain('DER SIGHASH_ALL');
+		expect(findError(actions)).to.contain('not SIGHASH_ALL');
 
-		// A malformed pubkey.
+		// A pubkey that does not hash to the prevout program.
+		const alienPub = Buffer.concat([
+			Buffer.from([0x02]),
+			crypto.randomBytes(32)
+		]);
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[fakeDerWitness()[0], Buffer.alloc(33)]]
+			witnesses: [[genuine[0][0], alienPub]]
 		});
-		expect(findError(actions)).to.contain('pubkey');
+		expect(findError(actions)).to.contain('does not match the prevout program');
+
+		// A genuine-shaped signature that does not verify (one flipped byte in
+		// the r value): binding alone is not enough, the crypto must hold.
+		const corrupted = Buffer.from(genuine[0][0]);
+		corrupted[10] ^= 0x01;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[corrupted, genuine[0][1]]]
+		});
+		expect(findError(actions)).to.contain('does not verify');
 
 		// None of the refusals recorded anything: the peer can retransmit.
 		expect(h.opener.getFullState().v2InFlight!.receivedTxSignatures).to.be
 			.false;
 
-		// A well-formed spend of the negotiated prevout is accepted.
+		// The genuine spend of the negotiated prevout is accepted.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [fakeDerWitness()]
+			witnesses: genuine
 		});
 		expect(findError(actions)).to.equal(null);
 	});
 
-	it('types P2TR peer inputs: key-spend DEFAULT or explicit ALL only', () => {
-		const p2tr = Buffer.concat([
-			Buffer.from([0x51, 0x20]),
-			crypto.randomBytes(32)
-		]);
-		const h = driveToCommitmentExchange({ acceptorPrevOutScript: p2tr });
+	it('verifies P2TR peer inputs: explicit SIGHASH_ALL key-spend only', () => {
+		const h = driveToCommitmentExchange({
+			acceptorPrev: makeRealP2trPrevOut(60_000)
+		});
 		deliverCommitments(h);
 		const cid = h.opener.getChannelId()!;
 		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+		const genuine = h.acceptorWitness();
 
-		// 65-byte schnorr with a non-ALL type byte is refused.
-		const schnorrOdd = Buffer.alloc(65, 7);
-		schnorrOdd[64] = 0x02;
+		// The 64-byte SIGHASH_DEFAULT shorthand is refused: BOLT 2 names
+		// SIGHASH_ALL, which only the explicit 65-byte form carries.
 		let actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[schnorrOdd]]
+			witnesses: [[genuine[0][0].subarray(0, 64)]]
 		});
-		expect(findError(actions)).to.contain('SIGHASH_DEFAULT or SIGHASH_ALL');
+		expect(findError(actions)).to.contain('explicit SIGHASH_ALL');
+
+		// A 65-byte signature with a non-ALL type byte is refused.
+		const wrongType = Buffer.from(genuine[0][0]);
+		wrongType[64] = 0x02;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[wrongType]]
+		});
+		expect(findError(actions)).to.contain('explicit SIGHASH_ALL');
+
+		// A well-formed signature that does not verify against the output key.
+		const corrupted = Buffer.from(genuine[0][0]);
+		corrupted[10] ^= 0x01;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[corrupted]]
+		});
+		expect(findError(actions)).to.contain('does not verify');
 
 		// A script-path shape with a malformed control block is refused (a
 		// two-element stack is judged structurally as script plus control).
@@ -1267,12 +1381,11 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		});
 		expect(findError(actions)).to.contain('control block');
 
-		// 64-byte schnorr is SIGHASH_DEFAULT, which commits to everything
-		// SIGHASH_ALL does: accepted.
+		// The genuine explicit-ALL key-spend verifies and is accepted.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[Buffer.alloc(64, 7)]]
+			witnesses: genuine
 		});
 		expect(findError(actions)).to.equal(null);
 	});
@@ -1284,7 +1397,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.acceptorWitness()
 		);
 		const accTxSigs = decodeTxSignaturesMessage(
 			findPayload(accSig, MessageType.TX_SIGNATURES)!
@@ -1293,7 +1406,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[fakeDerWitness()]
+			h.openerWitness()
 		);
 		expect(
 			findError(
@@ -1652,6 +1765,70 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		).to.be.true;
 		// The acceptor sent tx_signatures twice: the dropped one, the resumed one.
 		expect(wire.sent(acceptor, MessageType.TX_SIGNATURES)).to.be.greaterThan(1);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('removes an abandoned RBF renegotiation on a live disconnect, durably', async function () {
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(27, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(28, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		// Drop the opener's commitment_signed: the acceptor crosses its own
+		// point of no return (record created) but releases no tx_signatures,
+		// which is the only window an RBF can still be accepted in.
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId);
+		expect(acceptorChannel, 'the acceptor promoted its side').to.not.equal(
+			undefined
+		);
+		expect(acceptorChannel!.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+
+		// The opener renegotiates; the acceptor accepts and knocks back into
+		// DUAL_FUNDING_V2 with the per-attempt record cleared.
+		managerOf(acceptor).handleMessage(
+			opener.getNodeId(),
+			MessageType.TX_INIT_RBF,
+			encodeTxInitRbfMessage({ channelId, locktime: 0, feerate: 2000 })
+		);
+		expect(acceptorChannel!.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+
+		// A live disconnect mid-renegotiation removes the channel AND its row:
+		// nothing of the new attempt was signed, and an ERRORED leftover would
+		// answer nothing forever while its row repeated on every restart.
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
 
 		opener.destroy();
 		acceptor.destroy();

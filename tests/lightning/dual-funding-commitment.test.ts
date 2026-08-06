@@ -112,18 +112,41 @@ function makeBasepoints(fundingPub: Buffer, seed: Buffer): IChannelBasepoints {
 	};
 }
 
-/** A tiny serialized prevtx with one output of the given value (the wallet UTXO). */
-function makePrevTx(valueSats: number): Buffer {
+/**
+ * A REAL spendable P2WPKH prevout with a signing closure: the peer verifies
+ * tx_signatures witnesses against their prevouts, so the caller-driven
+ * releases must be genuine spends.
+ */
+function makeRealPrevOut(valueSats: number): {
+	prevTx: Buffer;
+	sign: (tx: bitcoin.Transaction, index: number) => Buffer[];
+} {
+	const priv = crypto.randomBytes(32);
+	const pub = getPublicKey(priv);
+	const payment = bitcoin.payments.p2wpkh({ pubkey: pub });
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 	tx.addInput(crypto.randomBytes(32), 0);
-	// A native-segwit (P2WPKH-shaped) scriptPubkey: the receive side now
-	// enforces segwit-only spends (S-2.H3 anti-malleability).
-	tx.addOutput(
-		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
-		valueSats
-	);
-	return tx.toBuffer();
+	tx.addOutput(payment.output!, valueSats);
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output!;
+	return {
+		prevTx: tx.toBuffer(),
+		sign: (spend, index) => {
+			const sighash = spend.hashForWitnessV0(
+				index,
+				scriptCode,
+				valueSats,
+				bitcoin.Transaction.SIGHASH_ALL
+			);
+			return [
+				bitcoin.script.signature.encode(
+					Buffer.from(ecc.sign(sighash, priv)),
+					bitcoin.Transaction.SIGHASH_ALL
+				),
+				pub
+			];
+		}
+	};
 }
 
 function makeInput(
@@ -141,22 +164,6 @@ function makeInput(
 	};
 }
 
-/**
- * A structurally valid P2WPKH witness: DER-shaped SIGHASH_ALL signature plus
- * a 33-byte compressed pubkey. handleTxSignatures validates peer witnesses
- * against their negotiated prevouts, so released shapes must be spendable.
- */
-function fakeDerWitness(): Buffer[] {
-	const sig = Buffer.concat([
-		Buffer.from([0x30, 0x44, 0x02, 0x20]),
-		crypto.randomBytes(32),
-		Buffer.from([0x02, 0x20]),
-		crypto.randomBytes(32),
-		Buffer.from([0x01])
-	]);
-	return [sig, Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)])];
-}
-
 interface IHarness {
 	opener: Channel;
 	acceptor: Channel;
@@ -167,6 +174,9 @@ interface IHarness {
 	/** commitment_signed payloads captured but NOT yet delivered to the peer. */
 	openerCommit: Buffer;
 	acceptorCommit: Buffer;
+	/** Genuine witnesses for each side's funding input over the negotiated tx. */
+	openerWitness(): Buffer[][];
+	acceptorWitness(): Buffer[][];
 }
 
 const OPENER_FUNDING = 100_000n;
@@ -279,10 +289,10 @@ function driveToCommitmentExchange(
 	expect(findError(handleAcceptActions)).to.equal(null);
 
 	// ── interactive-tx: each side contributes one input; opener adds funding out ──
-	const openerPrevTx = makePrevTx(120_000); // opener's wallet UTXO (> its funding)
-	const acceptorPrevTx = makePrevTx(60_000); // acceptor's wallet UTXO
-	const openerInput = makeInput(0n, openerPrevTx); // even serial = initiator
-	const acceptorInput = makeInput(1n, acceptorPrevTx); // odd serial = acceptor
+	const openerPrev = makeRealPrevOut(120_000); // opener's wallet UTXO (> its funding)
+	const acceptorPrev = makeRealPrevOut(60_000); // acceptor's wallet UTXO
+	const openerInput = makeInput(0n, openerPrev.prevTx); // even serial = initiator
+	const acceptorInput = makeInput(1n, acceptorPrev.prevTx); // odd serial = acceptor
 
 	const funding = createFundingScript(openerFundingPub, acceptorFundingPub);
 	const fundingOutput: IInteractiveTxOutput = {
@@ -347,6 +357,12 @@ function driveToCommitmentExchange(
 	).to.not.equal(null);
 	expect(acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 
+	const witnessFor = (channel: Channel, index: number): Buffer[][] => {
+		const rec = channel.getFullState().v2InFlight!;
+		const tx = bitcoin.Transaction.fromHex(rec.fundingTxHex);
+		return [index === 0 ? openerPrev.sign(tx, 0) : acceptorPrev.sign(tx, 1)];
+	};
+
 	return {
 		opener,
 		acceptor,
@@ -355,7 +371,9 @@ function driveToCommitmentExchange(
 		openerSeed,
 		acceptorSeed,
 		openerCommit: openerCommit!,
-		acceptorCommit: acceptorCommit!
+		acceptorCommit: acceptorCommit!,
+		openerWitness: () => witnessFor(opener, 0),
+		acceptorWitness: () => witnessFor(acceptor, 1)
 	};
 }
 
@@ -476,9 +494,11 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 		//    first; the opener defers until the acceptor's witnesses arrive. ──
 		const accTxid = h.acceptor.getFullState().fundingTxid!;
 		const accOidx = h.acceptor.getFullState().fundingOutputIndex;
-		const accSigActions = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-			fakeDerWitness()
-		]);
+		const accSigActions = h.acceptor.sendTxSignatures(
+			accTxid,
+			accOidx,
+			h.acceptorWitness()
+		);
 		expect(findError(accSigActions)).to.equal(null);
 		const accTxSigs = findPayload(accSigActions, MessageType.TX_SIGNATURES);
 		expect(accTxSigs, 'acceptor releases tx_signatures first').to.not.equal(
@@ -487,9 +507,11 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 
 		const openTxid = h.opener.getFullState().fundingTxid!;
 		const openOidx = h.opener.getFullState().fundingOutputIndex;
-		const openSigDeferred = h.opener.sendTxSignatures(openTxid, openOidx, [
-			fakeDerWitness()
-		]);
+		const openSigDeferred = h.opener.sendTxSignatures(
+			openTxid,
+			openOidx,
+			h.openerWitness()
+		);
 		expect(findError(openSigDeferred)).to.equal(null);
 		expect(
 			findPayload(openSigDeferred, MessageType.TX_SIGNATURES),
