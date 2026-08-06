@@ -5625,6 +5625,25 @@ export class Channel {
 			// of a dropped open learns from the reestablish answer (tx_abort for
 			// an unknown next_funding_txid); no proactive latch is needed
 			// because nothing broadcastable ever existed for a dropped round.
+			if (
+				this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+				this._state.v2InFlight
+			) {
+				// An accepted replacement that no post-ack traffic ever
+				// confirmed: our ack may never have arrived, or the
+				// initiator may never have committed it, in which case the
+				// peer still holds the PREVIOUS attempt. The retained
+				// record is that attempt; roll back to it,
+				// restart-equivalent (the renegotiated builder is
+				// worthless, the record carries everything resumable), and
+				// reestablish resumes it against a peer on either side of
+				// the ack.
+				this._state.dualFundingSession?.abort();
+				this._state.dualFundingSession = null;
+				this._resetV2Driver();
+				this.restoreV2InFlight();
+				this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+			}
 			const keep = this._v2SentCommitment || !!this._state.v2InFlight;
 			if (!keep) {
 				this._state.dualFundingSession?.abort();
@@ -10334,7 +10353,10 @@ export class Channel {
 
 		// Our turn: contribute our own inputs/change when we accepted with a
 		// contribution (lease selling); no-op otherwise.
-		return this._driveDualFunding();
+		return [
+			...this._consumeRbfRollbackRecord(),
+			...this._driveDualFunding()
+		];
 	}
 
 	/**
@@ -10429,7 +10451,10 @@ export class Channel {
 		}
 
 		// Our turn (see handleTxAddInput).
-		return this._driveDualFunding();
+		return [
+			...this._consumeRbfRollbackRecord(),
+			...this._driveDualFunding()
+		];
 	}
 
 	/**
@@ -10906,6 +10931,12 @@ export class Channel {
 			];
 		}
 
+		// A retained rollback record must clear BEFORE the completion work
+		// below: _maybeSendV2Commitment records the NEW attempt through
+		// _syncV2InFlight, which would otherwise patch the previous
+		// attempt's record instead of creating a fresh one.
+		const rbfCommit = this._consumeRbfRollbackRecord();
+
 		// If both sides are now complete, move to AWAITING_TX_SIGNATURES and
 		// start the commitment_signed exchange (BOLT 2 v2: it precedes
 		// tx_signatures).
@@ -10913,16 +10944,16 @@ export class Channel {
 			// Audit the negotiated tx before signing anything for it (S-2.M4).
 			const invalid = this._validateNegotiatedInteractiveTx('v2');
 			if (invalid) {
-				return this._abortV2Negotiation(invalid);
+				return [...rbfCommit, ...this._abortV2Negotiation(invalid)];
 			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
-			return this._maybeSendV2Commitment();
+			return [...rbfCommit, ...this._maybeSendV2Commitment()];
 		}
 
 		// Peer completed but we have not: contribute our remaining
 		// inputs/change (or answer with our tx_complete) when a contribution
 		// is registered; legacy caller-driven flow otherwise.
-		return this._driveDualFunding();
+		return [...rbfCommit, ...this._driveDualFunding()];
 	}
 
 	/**
@@ -12377,6 +12408,26 @@ export class Channel {
 	}
 
 	/**
+	 * Consume the rollback record an accepted tx_init_rbf retained: the first
+	 * post-ack interactive message proves the initiator persisted the
+	 * replacement, so the previous attempt can never resume and its record
+	 * clears, durably (the caller prepends the returned persist to its
+	 * actions). Until this runs, a disconnect rolls the receiver back to the
+	 * previous attempt (markForReestablish), matching an initiator that never
+	 * saw the ack or never committed it.
+	 */
+	private _consumeRbfRollbackRecord(): ChannelAction[] {
+		if (
+			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+			this._state.v2InFlight
+		) {
+			this._state.v2InFlight = null;
+			return [{ type: ChannelActionType.PERSIST_STATE }];
+		}
+		return [];
+	}
+
+	/**
 	 * The peer accepted our tx_init_rbf: the renegotiation begins HERE. The
 	 * previous attempt survived the request window (durably and in memory),
 	 * so a disconnect before this ack resumed it on both sides; from the ack
@@ -12524,10 +12575,15 @@ export class Channel {
 		}
 
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
-		// Per-attempt record: the accepted renegotiation replaces the
-		// negotiated tx; the new round records itself at its own
-		// commitment_signed. The commitment/tx_signatures driver resets with it.
-		this._state.v2InFlight = null;
+		// The previous attempt's record is RETAINED as rollback state: our
+		// ack may never arrive (or the initiator may fail to persist it), in
+		// which case the peer still holds the previous attempt and the
+		// retained record is the only way back to it. It clears at the first
+		// post-ack interactive message, which proves the initiator committed
+		// to the replacement. Until then the durable shape DUAL_FUNDING_V2
+		// with a record means exactly "accepted, unconfirmed by traffic";
+		// the normal flow cannot produce it (records are created after the
+		// state moved to AWAITING_TX_SIGNATURES). Only the driver resets.
 		this._resetV2Driver();
 		// Restart our side of the interactive-tx exchange: reprice the
 		// registered contribution at the accepted feerate and drop the

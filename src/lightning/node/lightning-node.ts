@@ -1285,15 +1285,27 @@ export class LightningNode extends EventEmitter {
 			state,
 			peerPubkey
 		} of this.storage.loadAllChannels()) {
-			// A DUAL_FUNDING_V2 row is RBF-renegotiation residue: the accepted
-			// tx_init_rbf persisted the per-attempt record clear, and the
-			// renegotiated session died with the process before anything was
-			// signed. There is no channel in it: no funding tx, no signatures,
-			// nothing the peer can complete. Remove the row durably (the
-			// voidMissingFundingChannel pattern) instead of restoring a
-			// permanent channel that sends nothing, answers nothing, and
-			// repeats this on every restart; a peer that still asks gets the
-			// manager's unknown-channel error and gives the attempt up.
+			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
+			// RBF whose post-ack traffic never arrived: the record is the
+			// previous attempt, still resumable and possibly the only side
+			// the peer knows. Roll the row back to it and restore normally
+			// (restoreChannel marks it for reestablish); the rewrite is
+			// idempotent across crashes, so the row itself needs no update.
+			if (state.state === ChannelState.DUAL_FUNDING_V2 && state.v2InFlight) {
+				state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				this.emitStructuredLog('channel', 'v2_rbf_provisional_rolled_back', {
+					channelId
+				});
+			}
+			// A record-less DUAL_FUNDING_V2 row is RBF-renegotiation residue:
+			// the committed replacement's session died with the process
+			// before anything was signed. There is no channel in it: no
+			// funding tx, no signatures, nothing the peer can complete.
+			// Remove the row durably (the voidMissingFundingChannel pattern)
+			// instead of restoring a permanent channel that sends nothing,
+			// answers nothing, and repeats this on every restart; a peer that
+			// still asks gets the manager's unknown-channel error and gives
+			// the attempt up.
 			if (state.state === ChannelState.DUAL_FUNDING_V2) {
 				this.safeStorage(
 					() => this.storage!.deleteChannel(channelId),
@@ -2434,10 +2446,17 @@ export class LightningNode extends EventEmitter {
 				}
 				if (
 					row &&
-					row.state.state === ChannelState.AWAITING_TX_SIGNATURES &&
+					(row.state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+						row.state.state === ChannelState.DUAL_FUNDING_V2) &&
 					row.state.v2InFlight
 				) {
 					try {
+						// A DUAL_FUNDING_V2 row with a record is the
+						// receiver's provisionally accepted RBF whose
+						// commit-point persist failed: the retained record
+						// is the previous attempt. Roll it back exactly as a
+						// restart would.
+						row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
 						const channel = new Channel(row.state);
 						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
 						this.channelManager.restoreChannel(
@@ -13069,6 +13088,23 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
+		if (state.v2InFlight && !state.v2InFlight.sentTxSignatures) {
+			// A v2 open whose witnesses never left us: nobody can complete
+			// or broadcast this funding tx, so a commitment spending its
+			// outpoint can never confirm and "closing on chain" is a
+			// fiction. This is the diverged-RBF terminal (the peer answered
+			// reestablish with unknown-channel after dropping its side);
+			// void the channel instead of broadcasting into nothing.
+			this.emitStructuredLog('channel', 'errored_unsigned_v2_voided', {
+				channelId: channelId.toString('hex'),
+				reason
+			});
+			this.voidMissingFundingChannel(
+				channelId,
+				state.fundingTxid.toString('hex')
+			);
+			return;
+		}
 		if (mustNotBroadcastCommitment(state)) {
 			// Proven stale or unprovable (recovery 5.6): broadcasting our
 			// commitment is forbidden; the peer's close resolves the channel.
