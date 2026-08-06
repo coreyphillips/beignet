@@ -6393,7 +6393,8 @@ export class Channel {
 			ourWitnesses: inflight.sentTxSignatures
 				? inflight.ourWitnesses.map((w) => w.map((b) => Buffer.from(b)))
 				: null,
-			receivedTxSignatures: inflight.receivedTxSignatures
+			receivedTxSignatures: inflight.receivedTxSignatures,
+			rbfCount: inflight.rbfAttempt
 		});
 		// The record only exists once our initial commitment_signed left (or
 		// was owed against the persist that recorded the peer's).
@@ -11170,8 +11171,11 @@ export class Channel {
 	private _v2FundingOutpoint(): { txid: Buffer; outputIndex: number } | null {
 		// The record (created at the commitment point from the live builder) is
 		// authoritative once it exists, and the only source after a restart.
+		// A RETAINED rollback record describes the REPLACED attempt: fall
+		// through to the live builder so nothing of the new round ever binds
+		// to the old outpoint.
 		const record = this._state.v2InFlight;
-		if (record) {
+		if (record && !this._v2RecordIsStaleRollback()) {
 			return {
 				txid: Buffer.from(record.fundingTxid),
 				outputIndex: record.fundingOutputIndex
@@ -11255,55 +11259,78 @@ export class Channel {
 		// every rollback arm still finds the old record and returns both
 		// sides to it, so a failed persist cannot leave the two peers
 		// holding different attempts.
-		if (
+		if (!this._state.v2InFlight || this._v2RecordIsStaleRollback()) {
+			// Build the ENTIRE replacement first: every fallible step
+			// (negotiated-tx assembly, wallet witness signing, prevout
+			// capture) must succeed before anything is swapped, so a failure
+			// mid-construction can never leave memory recordless while the
+			// disk still holds the retained previous attempt.
+			const candidate = this._buildV2InFlightRecord();
+			if (!candidate) return;
+			this._state.v2InFlight = candidate;
+		}
+		Object.assign(this._state.v2InFlight, changes);
+	}
+
+	/**
+	 * Whether the current record is RETAINED rollback state from a replaced
+	 * attempt: an accepted RBF bumps the session's attempt counter
+	 * immediately, while the record keeps describing the previous attempt
+	 * until the new one replaces it at its commitment persist.
+	 */
+	private _v2RecordIsStaleRollback(): boolean {
+		return !!(
 			this._state.v2InFlight &&
 			this._state.dualFundingSession &&
 			this._state.v2InFlight.rbfAttempt !==
 				this._state.dualFundingSession.getRbfCount()
-		) {
-			this._state.v2InFlight = null;
-		}
-		if (!this._state.v2InFlight) {
-			const session = this._state.dualFundingSession;
-			if (!session) return;
-			const built = this._v2NegotiatedTx();
-			if (!built) return;
-			const signed = this._signV2ContributionWitnesses(built);
-			if (!signed) return;
-			// The complete prevout set must survive the process: witness
-			// validation after a restart has nothing else to bind and verify
-			// the peer's signatures against.
-			const prevouts = this._v2InputPrevouts();
-			if (!prevouts) return;
-			const params = session.getLocalParams();
-			this._state.v2InFlight = {
-				fundingTxid: Buffer.from(built.tx.getHash()),
-				fundingOutputIndex: built.outputIndex,
-				// The signing pass above applied our witnesses to built.tx.
-				fundingTxHex: built.tx.toHex(),
-				fullySigned: false,
-				isInitiator: session.isInitiator(),
-				localContributionSats: params?.fundingSatoshis ?? 0n,
-				remoteContributionSats: session.getRemoteFundingSatoshis(),
-				fundingFeeratePerkw:
-					params?.fundingFeeratePerkw ??
-					session.getOpenMsg()?.fundingFeeratePerkw ??
-					0,
-				weSignFirst: this._v2ShouldSignFirst(),
-				ourWitnesses: signed.witnesses,
-				ourWalletInputIndices: signed.indices,
-				inputPrevouts: prevouts.scripts.map((s, i) => ({
-					script: Buffer.from(s),
-					valueSats: prevouts.values[i]
-				})),
-				remoteCommitmentSig: null,
-				sentTxSignatures: false,
-				receivedTxSignatures: false,
-				confirmed: false,
-				rbfAttempt: session.getRbfCount()
-			};
-		}
-		Object.assign(this._state.v2InFlight, changes);
+		);
+	}
+
+	/**
+	 * Assemble the complete in-flight record for the CURRENT attempt from
+	 * the live session and builder, or null when any step fails. Pure
+	 * construction: nothing on the channel is mutated.
+	 */
+	private _buildV2InFlightRecord(): IV2InFlight | null {
+		const session = this._state.dualFundingSession;
+		if (!session) return null;
+		const built = this._v2NegotiatedTx();
+		if (!built) return null;
+		const signed = this._signV2ContributionWitnesses(built);
+		if (!signed) return null;
+		// The complete prevout set must survive the process: witness
+		// validation after a restart has nothing else to bind and verify
+		// the peer's signatures against.
+		const prevouts = this._v2InputPrevouts();
+		if (!prevouts) return null;
+		const params = session.getLocalParams();
+		return {
+			fundingTxid: Buffer.from(built.tx.getHash()),
+			fundingOutputIndex: built.outputIndex,
+			// The signing pass above applied our witnesses to built.tx.
+			fundingTxHex: built.tx.toHex(),
+			fullySigned: false,
+			isInitiator: session.isInitiator(),
+			localContributionSats: params?.fundingSatoshis ?? 0n,
+			remoteContributionSats: session.getRemoteFundingSatoshis(),
+			fundingFeeratePerkw:
+				params?.fundingFeeratePerkw ??
+				session.getOpenMsg()?.fundingFeeratePerkw ??
+				0,
+			weSignFirst: this._v2ShouldSignFirst(),
+			ourWitnesses: signed.witnesses,
+			ourWalletInputIndices: signed.indices,
+			inputPrevouts: prevouts.scripts.map((s, i) => ({
+				script: Buffer.from(s),
+				valueSats: prevouts.values[i]
+			})),
+			remoteCommitmentSig: null,
+			sentTxSignatures: false,
+			receivedTxSignatures: false,
+			confirmed: false,
+			rbfAttempt: session.getRbfCount()
+		};
 	}
 
 	/**
@@ -11629,22 +11656,25 @@ export class Channel {
 				}
 			];
 		}
-		const fo = this._v2FundingOutpoint();
-		if (!fo) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'v2 funding tx does not pay the negotiated funding output — refusing to sign'
-				}
-			];
+		// Install the CURRENT attempt's record BEFORE anything is signed: the
+		// commitment must spend the attempt being negotiated, never the
+		// retained rollback record's outpoint (during an RBF the record still
+		// describes the replaced attempt until this very step swaps it). The
+		// construction is all-or-nothing, so a failure leaves the rollback
+		// record untouched and the renegotiation unwinds to it on the wire.
+		this._syncV2InFlight({});
+		const record = this._state.v2InFlight;
+		if (!record || this._v2RecordIsStaleRollback()) {
+			return this._unwindV2NegotiationOrRollback(
+				'failed to assemble the replacement funding record — refusing to sign'
+			);
 		}
 		// signRemoteCommitment reads the funding outpoint from state; set it now,
 		// before either side has released any signature. The v2 channel_id is the
 		// basepoint-derived id set at accept_channel2 (NOT the funding outpoint) —
 		// do not overwrite it here.
-		this._state.fundingTxid = fo.txid;
-		this._state.fundingOutputIndex = fo.outputIndex;
+		this._state.fundingTxid = Buffer.from(record.fundingTxid);
+		this._state.fundingOutputIndex = record.fundingOutputIndex;
 
 		const { signature, htlcSignatures } = signRemoteCommitment(
 			this._state,
@@ -11653,11 +11683,6 @@ export class Channel {
 			0n
 		);
 		this._v2SentCommitment = true;
-		// Point of no return (BOLT 2): from here the peer holds our signature
-		// and the open must survive disconnect and restart, resuming over
-		// channel_reestablish.next_funding. Record everything resumption needs
-		// while the builder and wallet closures are live, before the persist.
-		this._syncV2InFlight({});
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
 			signature,
@@ -11665,10 +11690,23 @@ export class Channel {
 		};
 		// Persist BEFORE the message leaves: the peer holds our signature from
 		// this point on.
-		return [
+		const actions: ChannelAction[] = [
 			{ type: ChannelActionType.PERSIST_STATE },
 			sendMsg(MessageType.COMMITMENT_SIGNED, encodeCommitmentSignedMessage(msg))
 		];
+		// A zero-local-input attempt becomes broadcastable the moment this
+		// signature leaves (the peer needs no witness bytes from us), so the
+		// funding watch arms in the SAME persisted batch: a broadcastable
+		// attempt must never exist without a live watch on its outpoint.
+		if (this.isV2AttemptBroadcastable()) {
+			actions.push({
+				type: ChannelActionType.WATCH_FUNDING,
+				fundingTxid: Buffer.from(record.fundingTxid),
+				fundingOutputIndex: record.fundingOutputIndex,
+				minimumDepth: this._state.minimumDepth
+			});
+		}
+		return actions;
 	}
 
 	/**
@@ -11737,9 +11775,11 @@ export class Channel {
 		const session = this._state.dualFundingSession;
 		if (!session) return false;
 		// Captured from the live builder at record creation; the only source
-		// after a restart, and stable for the whole attempt either way.
+		// after a restart, and stable for the whole attempt either way. A
+		// RETAINED rollback record describes the REPLACED attempt: fall
+		// through to the live builder for the one being negotiated.
 		const record = this._state.v2InFlight;
-		if (record) return record.weSignFirst;
+		if (record && !this._v2RecordIsStaleRollback()) return record.weSignFirst;
 		const builder = session.getTxBuilder();
 		if (!builder) return !session.isInitiator();
 		let ours = 0n;
@@ -12528,10 +12568,7 @@ export class Channel {
 	 * (_abortV2Negotiation) applies.
 	 */
 	private _unwindV2NegotiationOrRollback(reason: string): ChannelAction[] {
-		if (
-			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
-			this._state.v2InFlight
-		) {
+		if (this._state.v2InFlight && this._v2RecordIsStaleRollback()) {
 			this._state.dualFundingSession?.abort();
 			this._state.dualFundingSession = null;
 			this._resetV2Driver();
@@ -12678,13 +12715,17 @@ export class Channel {
 				)
 			];
 		}
-		// Abort and RBF are mutually exclusive: with our own abort awaiting
-		// its echo, a replacement request is refused rather than accepted,
-		// so the peer can never hold an ack for an attempt we are unwinding.
+		// Abort and RBF crossed on the wire: our abort is already on its way
+		// and the requester's pending-RBF branch will consume it as exactly
+		// the refusal this request needs. A SECOND abort here would
+		// desynchronize the exchange (the requester answers the first, we
+		// tear down on what we take for an echo of the second). Cancel the
+		// pending teardown instead: the crossed exchange resolves as a
+		// refusal, both sides keep the current attempt, and the operator can
+		// re-abort once the wire is quiet.
 		if (this._v2AbortPending) {
-			return [
-				this._txAbort(this._v2ChannelId(), 'tx_abort pending; RBF refused')
-			];
+			this._v2AbortPending = false;
+			return [];
 		}
 		// A restored (builder-less) session cannot renegotiate: the wallet
 		// contribution closures did not survive the restart.
@@ -12957,6 +12998,18 @@ export class Channel {
 			this._v2AbortPending = false;
 			if (this.isV2AttemptBroadcastable()) {
 				return [];
+			}
+			// Mid-renegotiation the record is attempt 0 ROLLBACK state, and
+			// the peer answered our abort by rolling back to it: mirror that
+			// instead of tearing down, or the two sides part with different
+			// dispositions of the same attempt.
+			if (this._state.v2InFlight && this._v2RecordIsStaleRollback()) {
+				this._state.dualFundingSession?.abort();
+				this._state.dualFundingSession = null;
+				this._resetV2Driver();
+				this.restoreV2InFlight();
+				this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				return [{ type: ChannelActionType.PERSIST_STATE }];
 			}
 			this._state.dualFundingSession?.abort();
 			this._state.v2InFlight = null;

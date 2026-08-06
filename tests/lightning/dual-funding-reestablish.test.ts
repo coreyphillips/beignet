@@ -1346,18 +1346,28 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(findError(g.opener.abortDualFunding('too eager'))).to.contain(
 			'awaiting its answer'
 		);
-		// A peer proposing RBF while OUR abort is pending is refused, never
-		// acked, so no ack for an attempt being unwound can ever exist.
+		// A peer's RBF request crossing OUR abort: the abort already on the
+		// wire serves as its refusal, so nothing more leaves (no second
+		// abort, never an ack) and the pending teardown is CANCELLED; the
+		// crossed exchange resolves with both sides keeping the attempt.
 		const k = driveToCommitmentExchange();
 		deliverCommitments(k);
 		expect(findError(k.acceptor.abortDualFunding('going away'))).to.equal(null);
-		const refusal = k.acceptor.handleTxInitRbf({
+		const crossedInit = k.acceptor.handleTxInitRbf({
 			channelId: k.acceptor.getChannelId()!,
 			locktime: 0,
 			feerate: 2000
 		});
-		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
-		expect(findPayload(refusal, MessageType.TX_ACK_RBF)).to.equal(null);
+		expect(crossedInit).to.deep.equal([]);
+		expect(k.acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		// The requester's echo of our abort then completes a refusal
+		// exchange, never a teardown: the attempt survives on this side too.
+		expect(k.acceptor.handleTxAbort()).to.deep.equal([]);
+		expect(k.acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(k.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
 	});
 
 	it('keeps a zero-input attempt when the peer reestablishes without next_funding', async function () {
@@ -2554,8 +2564,21 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 
 		// The real production path: the opener requests, the peer acks, the
 		// ack restarts and reprices the interactive-tx exchange, and the
-		// replacement negotiates through to its own signatures.
+		// replacement negotiates through to its own signatures. Capture the
+		// funding txid each side's record holds at the instant its
+		// replacement commitment_signed leaves: the commitment MUST spend
+		// the replacement outpoint, never the retained attempt 0's.
 		wire.clearDrops();
+		const commitmentRecordTxids: Buffer[] = [];
+		const captureAt = (node: LightningNode, ch: () => Channel | undefined) =>
+			node.on('message:outbound', (_p: string, type: number) => {
+				if (type === MessageType.COMMITMENT_SIGNED) {
+					const rec = ch()?.getFullState().v2InFlight;
+					if (rec) commitmentRecordTxids.push(Buffer.from(rec.fundingTxid));
+				}
+			});
+		captureAt(opener, () => channel);
+		captureAt(acceptor, () => managerOf(acceptor).getChannel(channelId));
 		const rbfActions = channel.initiateTxRbf(2000);
 		expect(findError(rbfActions)).to.equal(null);
 		(
@@ -2588,6 +2611,33 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		expect(acceptorRecord.fundingFeeratePerkw).to.equal(2000);
 		expect(openerRecord.rbfAttempt).to.equal(1);
 		expect(acceptorRecord.rbfAttempt).to.equal(1);
+
+		// Every replacement commitment_signed left with the record already
+		// describing the replacement: no commitment ever signed attempt 0's
+		// outpoint during the renegotiation (both peers would otherwise lack
+		// a valid unilateral exit if attempt 1 confirms).
+		expect(commitmentRecordTxids.length).to.be.greaterThan(1);
+		for (const txid of commitmentRecordTxids) {
+			expect(
+				txid.equals(openerRecord.fundingTxid),
+				'commitment signed over the replacement outpoint'
+			).to.be.true;
+		}
+
+		// A restored attempt 1 keeps its record: the rebuilt session carries
+		// the record's attempt number, so the next sync must never mistake
+		// it for retained rollback state and erase it.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(channel.getFullState()))
+		);
+		const restored = deserializeChannelState(json);
+		const revived = new Channel(restored);
+		revived.restoreV2InFlight();
+		expect(
+			restored.dualFundingSession!.getRbfCount(),
+			'the restored session carries the attempt number'
+		).to.equal(1);
+		expect(revived.getFullState().v2InFlight!.rbfAttempt).to.equal(1);
 
 		opener.destroy();
 		acceptor.destroy();

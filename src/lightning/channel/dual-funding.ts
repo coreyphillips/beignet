@@ -193,6 +193,13 @@ export class DualFundingSession {
 		/** Witnesses our released tx_signatures carried; null until it left. */
 		ourWitnesses: Buffer[][] | null;
 		receivedTxSignatures: boolean;
+		/**
+		 * The record's RBF attempt number. The session counter MUST match
+		 * the restored record, or the record looks like retained rollback
+		 * state and the next sync would erase it, unrecreatable from a
+		 * builder-less session.
+		 */
+		rbfCount?: number;
 	}): DualFundingSession {
 		const session = new DualFundingSession(
 			params.isInitiator,
@@ -202,6 +209,7 @@ export class DualFundingSession {
 		session._fundingTxid = Buffer.from(params.fundingTxid);
 		session._fundingOutputIndex = params.fundingOutputIndex;
 		session._localWitnesses = params.ourWitnesses;
+		session._rbfCount = params.rbfCount ?? 0;
 		session._state =
 			params.ourWitnesses && params.receivedTxSignatures
 				? DualFundingState.AWAITING_CHANNEL_READY
