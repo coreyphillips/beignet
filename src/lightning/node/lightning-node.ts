@@ -2166,16 +2166,23 @@ export class LightningNode extends EventEmitter {
 	 * Wrap a storage operation in try/catch, emitting node:error on failure.
 	 * Prevents disk-full or locked-DB from crashing a long-running node.
 	 */
-	private safeStorage(fn: () => void, operation: string): void {
-		if (!this.storage) return;
+	/**
+	 * Run a storage operation, reporting (not throwing) a failure. Returns
+	 * whether the operation succeeded; with no storage configured nothing
+	 * durable can fail, so that counts as success.
+	 */
+	private safeStorage(fn: () => void, operation: string): boolean {
+		if (!this.storage) return true;
 		try {
 			fn();
+			return true;
 		} catch (err) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${(err as Error).message}`,
 				timestamp: Date.now()
 			} as ILightningError);
+			return false;
 		}
 	}
 
@@ -2479,11 +2486,20 @@ export class LightningNode extends EventEmitter {
 					}
 					return;
 				}
-				if (this.storage) {
-					this.safeStorage(
-						() => this.storage!.deleteChannel(idHex),
-						'deleteChannel'
-					);
+				const deleted = this.safeStorage(
+					() => this.storage!.deleteChannel(idHex),
+					'deleteChannel'
+				);
+				if (!deleted) {
+					// The row survived: the abandonment is not terminal yet.
+					// A restart restores the row and the disconnect sweep
+					// retries the removal against a healthy store; the
+					// terminal event fires only when the deletion lands.
+					this.emitStructuredLog('channel', 'open_abandon_deferred', {
+						channelId: idHex,
+						reason
+					});
+					return;
 				}
 				this.emitStructuredLog('channel', 'open_abandoned', {
 					channelId: idHex,
@@ -3989,10 +4005,24 @@ export class LightningNode extends EventEmitter {
 		if (!this.channelManager.voidChannel(channelId)) return;
 		const idHex = channelId.toString('hex');
 		this.chainWatcher?.removeWatchedFunding(channelId);
-		this.safeStorage(() => this.storage!.deleteChannel(idHex), 'deleteChannel');
+		const deleted = this.safeStorage(
+			() => this.storage!.deleteChannel(idHex),
+			'deleteChannel'
+		);
 		this.deletePendingFundingTx(
 			Buffer.from(txid, 'hex').reverse().toString('hex')
 		);
+		if (!deleted) {
+			// The row survived, so the channel is NOT terminally gone: a
+			// restart restores it and this removal is re-evaluated then.
+			// Emitting the terminal event now would claim a deletion that
+			// did not happen.
+			this.emitStructuredLog('channel', 'channel_void_deferred', {
+				channelId: idHex,
+				txid
+			});
+			return;
+		}
 		this.emitStructuredLog('channel', 'channel_voided', {
 			channelId: idHex,
 			txid

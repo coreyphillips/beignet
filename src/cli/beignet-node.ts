@@ -1035,7 +1035,7 @@ export class BeignetNode extends EventEmitter {
 			const channelId = data.channelId.toString('hex');
 			this.log(
 				'warn',
-				'Channel voided: funding tx vanished before confirming',
+				'Channel voided: removed with nothing to close on chain (funding tx vanished, or the open was aborted or abandoned before funding)',
 				{
 					channelId
 				}

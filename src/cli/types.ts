@@ -851,7 +851,7 @@ export interface BeignetNodeEvents {
 		initiator: 'local' | 'remote';
 	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
-	/** An unconfirmed channel's funding tx vanished from mempool and chain; the channel was dropped (nothing to close). */
+	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
 	'channel:voided': (data: { channelId: string }) => void;
 	'htlc:forwarded': (data: {
 		inChannelId: string;

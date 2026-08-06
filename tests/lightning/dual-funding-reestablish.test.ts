@@ -1078,9 +1078,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const ackActions = h.opener.handleTxAckRbf();
 		expect(findError(ackActions)).to.equal(null);
 		expect(
-			h.opener
-				.getFullState()
-				.dualFundingSession!.getLocalParams()!.fundingFeeratePerkw,
+			h.opener.getFullState().dualFundingSession!.getLocalParams()!
+				.fundingFeeratePerkw,
 			'the renegotiation prices at the FIRST request'
 		).to.equal(2000);
 	});
@@ -1098,9 +1097,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			feerate: 1001
 		});
 		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
-		expect(h.acceptor.getState()).to.equal(
-			ChannelState.AWAITING_TX_SIGNATURES
-		);
+		expect(h.acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 		expect(h.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
 			null,
 			undefined
@@ -1117,8 +1114,8 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the abort is echoed as its ack'
 		).to.not.equal(null);
 		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
-		expect(h.opener.getFullState().v2InFlight!.fundingTxid.equals(before)).to
-			.be.true;
+		expect(h.opener.getFullState().v2InFlight!.fundingTxid.equals(before)).to.be
+			.true;
 		expect(h.opener.isAbandonedV2Open()).to.be.false;
 
 		// The refusing receiver swallows the echo (it sent the abort itself),
@@ -2861,11 +2858,103 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		expect(acceptorChannel.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
-		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be
-			.true;
+		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be.true;
 
 		opener.destroy();
 		acceptor.destroy();
+	});
+
+	it('defers the terminal void when the row deletion fails; a restart completes it', async function () {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-void-'));
+		const dbPath = path.join(dir, 'acceptor.db');
+		const acceptorStorage = new SqliteStorage(dbPath);
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(75, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(76, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		wire.clearDrops();
+
+		// The acceptor's disk refuses deletions: the abort handshake removes
+		// its registration, but the row survives, so the terminal event must
+		// NOT fire; a voided claim here would be a lie a restart disproves.
+		const realDelete = acceptorStorage.deleteChannel.bind(acceptorStorage);
+		const refuseDelete = true;
+		(
+			acceptorStorage as unknown as { deleteChannel: (id: string) => void }
+		).deleteChannel = (id: string): void => {
+			if (refuseDelete) throw new Error('disk full');
+			realDelete(id);
+		};
+		const voided: Buffer[] = [];
+		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		const abortActions = channel.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, abortActions);
+		await settle(() => managerOf(acceptor).getChannel(channelId) === undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(
+			voided,
+			'no terminal event without a durable deletion'
+		).to.have.length(0);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+		acceptor.destroy();
+
+		// The restart restores the surviving row; the next disconnect sweep
+		// completes the removal against a healthy store, and only THEN does
+		// the terminal event fire.
+		const acceptorStorage2 = new SqliteStorage(dbPath);
+		acceptorStorage2.open();
+		const revived = new LightningNode(
+			makeNodeConfig(76, {
+				storage: acceptorStorage2,
+				recovery: { enabled: true }
+			})
+		);
+		revived.on('node:error', () => {});
+		const revivedVoided: Buffer[] = [];
+		revived.on('channel:voided', (e: { channelId: Buffer }) => {
+			revivedVoided.push(e.channelId);
+		});
+		expect(revived.getChannelManager().listChannels()).to.have.length(1);
+		managerOf(revived).handlePeerDisconnected(opener.getNodeId());
+		expect(managerOf(revived).getChannel(channelId)).to.equal(undefined);
+		expect(acceptorStorage2.loadAllChannels()).to.have.length(0);
+		expect(revivedVoided).to.have.length(1);
+		expect(revivedVoided[0].equals(channelId)).to.be.true;
+
+		opener.destroy();
+		revived.destroy();
 	});
 
 	it('a failed RBF persist keeps the previous durable attempt recoverable', async function () {
