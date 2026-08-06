@@ -557,10 +557,17 @@ export class Channel {
 	// Set once our v2 tx_signatures witnesses have been provided to the
 	// session, so later flushes never re-provide.
 	private _v2TxSigsReleased = false;
-	// Our un-acked tx_init_rbf (feerate/locktime it proposed). Connection
-	// scoped: BOLT 2 starts the renegotiation only at tx_ack_rbf, so nothing
-	// is replaced while this is pending and a disconnect simply forgets it.
-	private _pendingRbfInit: { feerate: number; locktime: number } | null = null;
+	// Our un-acked tx_init_rbf (feerate/locktime it proposed, and the
+	// recorded funding txid it was bound to; the ack revalidates the
+	// binding). Connection scoped: BOLT 2 starts the renegotiation only at
+	// tx_ack_rbf, so nothing is replaced while this is pending and a
+	// disconnect simply forgets it. While set, the recorded attempt's
+	// tx_signatures release is frozen (_maybeSendV2TxSigs).
+	private _pendingRbfInit: {
+		feerate: number;
+		locktime: number;
+		fundingTxid: Buffer;
+	} | null = null;
 	// Our un-echoed tx_abort of a RECORDED v2 open. Connection scoped: the
 	// teardown happens only when the peer's echo confirms it heard the
 	// abort; until then the attempt (and its durable record) stays fully
@@ -11734,6 +11741,13 @@ export class Channel {
 	private _maybeSendV2TxSigs(): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (!session) return [];
+		// An un-acked tx_init_rbf freezes this attempt's release: the peer
+		// may already have accepted the replacement, in which case witnesses
+		// released now belong to an attempt only WE would still track, and
+		// the ack would then clear our only record of it. The release
+		// resumes when the request is refused (the refusal branch re-drives
+		// this) or the request dies with the connection.
+		if (this._pendingRbfInit) return [];
 		if (
 			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES &&
 			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
@@ -12425,9 +12439,18 @@ export class Channel {
 		// stays live and durable through the request window, so a disconnect
 		// here resumes it on BOTH sides (the receiver only commits its own
 		// replacement when it accepts, alongside the ack we never got).
-		// handleTxAckRbf performs the actual renegotiation reset.
+		// handleTxAckRbf performs the actual renegotiation reset, and
+		// revalidates this binding to the recorded attempt.
 		const locktime = newLocktime ?? session.getLocalParams()?.locktime ?? 0;
-		this._pendingRbfInit = { feerate: newFeeratePerkw, locktime };
+		this._pendingRbfInit = {
+			feerate: newFeeratePerkw,
+			locktime,
+			fundingTxid: Buffer.from(this._state.v2InFlight!.fundingTxid)
+		};
+		// A fresh abort exchange may follow this request (the peer is free
+		// to refuse it); a latch left over from a previous completed
+		// exchange must not swallow that answer.
+		this._txAbortSent = false;
 
 		const msg: ITxInitRbfMessage = {
 			channelId: this._v2ChannelId(),
@@ -12439,13 +12462,15 @@ export class Channel {
 	}
 
 	/**
-	 * Consume the rollback record an accepted tx_init_rbf retained: the first
-	 * post-ack interactive message proves the initiator persisted the
-	 * replacement, so the previous attempt can never resume and its record
-	 * clears, durably (the caller prepends the returned persist to its
-	 * actions). Until this runs, a disconnect rolls the receiver back to the
-	 * previous attempt (markForReestablish), matching an initiator that never
-	 * saw the ack or never committed it.
+	 * Consume the rollback record an RBF retained, on EITHER role: the first
+	 * post-ack interactive message FROM the peer is the causal proof it
+	 * observed the replacement round (for the receiver, the initiator's
+	 * first contribution proves the ack was committed; for the initiator,
+	 * the receiver's first answer proves the new round was seen), so the
+	 * previous attempt can never resume and its record clears, durably (the
+	 * caller prepends the returned persist to its actions). Until this
+	 * runs, every rollback arm returns this side to the previous attempt,
+	 * matching a peer on either side of the ack.
 	 */
 	private _consumeRbfRollbackRecord(): ChannelAction[] {
 		if (
@@ -12477,6 +12502,27 @@ export class Channel {
 			// reestablish.
 			return [];
 		}
+		// Revalidate the binding: the renegotiation must replace exactly the
+		// attempt the request named. If the record is gone, tracks a
+		// different transaction, or released its witnesses while the request
+		// was in flight (the freeze should prevent that; this is the belt),
+		// beginning the renegotiation would strand or erase an attempt the
+		// peer can still act on. Unwind the accepted request on the wire
+		// instead; the peer retained its rollback record and returns to the
+		// shared attempt.
+		const bound = this._state.v2InFlight;
+		if (
+			!bound ||
+			!bound.fundingTxid.equals(pending.fundingTxid) ||
+			bound.sentTxSignatures
+		) {
+			return [
+				this._txAbort(
+					this._v2ChannelId(),
+					'RBF request no longer applies to the recorded attempt'
+				)
+			];
+		}
 		const result = session.initiateRbf(pending.feerate, pending.locktime);
 		if (!result.ok) {
 			return [
@@ -12487,10 +12533,13 @@ export class Channel {
 			];
 		}
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
-		// Per-attempt record: both sides have now agreed to replace the
-		// negotiated tx; the new round records itself at its own
-		// commitment_signed. The commitment/tx_signatures driver resets too.
-		this._state.v2InFlight = null;
+		// The previous attempt's record is RETAINED here too, symmetric with
+		// the receiver: the ack proves the peer accepted, but nothing proves
+		// the peer ever OBSERVES the new round (our first contribution can
+		// be lost). It clears at the first post-ack message FROM the peer,
+		// the causal proof the replacement round was seen; until then every
+		// rollback arm (disconnect, restart, failed persist) returns both
+		// sides to the shared previous attempt. Only the driver resets.
 		this._resetV2Driver();
 		// The renegotiation restarts the interactive-tx exchange from
 		// nothing: reprice the registered contribution at the accepted
@@ -12504,12 +12553,20 @@ export class Channel {
 			this._dualFundingContribIndex = 0;
 			const derived = this._computeDualFundingContributions();
 			if (derived) {
-				// Both sides already committed to the replacement; a bare
-				// local error would leave the peer waiting forever for a
-				// tx_add_* that never comes. Unwind the attempt on the wire.
+				// A bare local error would leave the peer waiting forever
+				// for a tx_add_* that never comes. Unwind the renegotiation
+				// on the wire and return to the shared previous attempt on
+				// BOTH sides: the peer's retained rollback record rolls it
+				// back when our abort arrives, and ours rolls back here.
+				this._state.dualFundingSession?.abort();
+				this._state.dualFundingSession = null;
+				this._resetV2Driver();
+				this.restoreV2InFlight();
+				this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
 				return [
 					{ type: ChannelActionType.PERSIST_STATE },
-					...this._abortV2Negotiation(derived)
+					this._txAbort(this._v2ChannelId(), derived),
+					{ type: ChannelActionType.ERROR, message: derived }
 				];
 			}
 		}
@@ -12750,10 +12807,33 @@ export class Channel {
 		return (
 			this._state.state === ChannelState.ERRORED &&
 			this._state.fundingVersion === 2 &&
-			(!this._state.v2InFlight || !this._state.v2InFlight.sentTxSignatures) &&
-			!this._state.pendingFundingTxHex &&
+			!this.isV2AttemptBroadcastable() &&
 			!this._state.localChannelReady &&
 			!this._state.remoteChannelReady
+		);
+	}
+
+	/**
+	 * Whether the PEER may be able to broadcast the recorded funding tx
+	 * without any further message from us. True once our witnesses left
+	 * (sentTxSignatures) or the fully signed tx exists (fullySigned, or
+	 * staged in pendingFundingTxHex), and ALSO for a zero-local-input
+	 * attempt: the record only exists once our commitment_signed left, and
+	 * a side that contributed no inputs owes no witness bytes, so the peer
+	 * can assemble and broadcast the funding tx entirely alone. A
+	 * caller-driven attempt whose witnesses are still owed (empty indices
+	 * AND empty witnesses) reports broadcastable too: the record cannot
+	 * prove otherwise, and every consumer of this answer must fail toward
+	 * keeping state.
+	 */
+	isV2AttemptBroadcastable(): boolean {
+		if (this._state.pendingFundingTxHex) return true;
+		const rec = this._state.v2InFlight;
+		if (!rec) return false;
+		return (
+			rec.sentTxSignatures ||
+			rec.fullySigned ||
+			(rec.ourWalletInputIndices.length === 0 && rec.ourWitnesses.length === 0)
 		);
 	}
 
@@ -12768,13 +12848,34 @@ export class Channel {
 			return [];
 		}
 
+		// An RBF request of ours is outstanding: under ordered delivery the
+		// FIRST incoming abort answers it (the peer processed tx_init_rbf
+		// before anything we sent later), so this is the refusal, even when
+		// an operator abort is also pending behind it. Only the request
+		// dies; the frozen tx_signatures release of the current attempt
+		// resumes. Echo as the ack the refusal expects unless an abort of
+		// ours is already on the wire (BOLT 2: never answer with a second).
+		if (this._pendingRbfInit) {
+			this._pendingRbfInit = null;
+			const echo = this._txAbortSent
+				? []
+				: [this._txAbort(this._v2ChannelId())];
+			return [...echo, ...this._maybeSendV2TxSigs()];
+		}
+
 		// The echo of our tx_abort of a RECORDED v2 open: the peer has now
 		// confirmed it heard the abort (or crossed us with its own), so both
 		// sides are agreed and the deferred teardown runs, durably. Until
 		// this moment the attempt stayed fully live, because a lost abort
-		// leaves the peer holding our verified commitment_signed.
+		// leaves the peer holding our verified commitment_signed. Recheck
+		// broadcastability first: witnesses that crossed with the abort can
+		// have completed the funding tx in the meantime, and a tx the peer
+		// can broadcast must stay tracked even though both sides said abort.
 		if (this._txAbortSent && this._v2AbortPending) {
 			this._v2AbortPending = false;
+			if (this.isV2AttemptBroadcastable()) {
+				return [];
+			}
 			this._state.dualFundingSession?.abort();
 			this._state.v2InFlight = null;
 			this._resetV2Driver();
@@ -12792,6 +12893,17 @@ export class Channel {
 		// next_funding_txid), the one-shot latch absorbs only one ack, and
 		// from then on each side saw only "no session, so echo".
 		if (this._txAbortSent) {
+			// Scope the latch to ONE exchange when a live dual-funding
+			// session exists and no abort of ours is still outstanding: this
+			// incoming abort is the answer that completes the exchange (e.g.
+			// the peer's ack of our refusal echo), and a sticky latch here
+			// would silently swallow the NEXT exchange's abort (a second
+			// refusal, or a later operator abort). The session-less shape
+			// stays sticky: that is the issue-294 restart dance, where more
+			// answers than one can arrive.
+			if (this._state.dualFundingSession && !this._v2AbortPending) {
+				this._txAbortSent = false;
+			}
 			return [];
 		}
 
@@ -12820,24 +12932,34 @@ export class Channel {
 			return [];
 		}
 
-		// BOLT 2: our tx_signatures already left, so the peer (or anyone who
-		// saw the witnesses) can still broadcast the funding transaction; a
-		// node MUST NOT forget the channel until its inputs are spent. Echo
-		// the abort as the ack, but keep the record, the state and the watch.
-		if (this._state.v2InFlight?.sentTxSignatures) {
-			return [this._txAbort(this._v2ChannelId())];
+		// A retained rollback record: the peer aborted the renegotiation
+		// while the accepted replacement was still unconfirmed by traffic.
+		// The previous attempt is the only thing both sides can share; roll
+		// back to it (builder-less, restart-equivalent) instead of tearing
+		// down, and echo the abort as its ack.
+		if (
+			this._state.state === ChannelState.DUAL_FUNDING_V2 &&
+			this._state.v2InFlight
+		) {
+			this._state.dualFundingSession?.abort();
+			this._state.dualFundingSession = null;
+			this._resetV2Driver();
+			this.restoreV2InFlight();
+			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+			return [
+				{ type: ChannelActionType.PERSIST_STATE },
+				this._txAbort(this._v2ChannelId())
+			];
 		}
 
-		// The abort answers our un-acked tx_init_rbf: the peer refused the
-		// replacement (BOLT 2 lets the receiver refuse any tx_init_rbf with
-		// tx_abort). NOTHING was replaced on either side (the renegotiation
-		// begins only at the ack, and the refusing receiver mutated nothing),
-		// so the current attempt stays fully live; only the pending request
-		// dies. Echo the abort as the ack it expects and carry on. A peer
-		// that was instead aborting the whole open converges later through
-		// its own reestablish answer, exactly like a dropped open.
-		if (this._pendingRbfInit) {
-			this._pendingRbfInit = null;
+		// The peer may be able to broadcast the recorded funding tx without
+		// us: our witnesses left, or the fully signed tx exists, or we
+		// contributed no inputs at all (it needs no bytes from us once our
+		// commitment_signed left). BOLT 2: a node MUST NOT forget the
+		// channel until the funding's inputs are provably unspendable. Echo
+		// the abort as the ack, but keep the record, the state and the
+		// watch.
+		if (this.isV2AttemptBroadcastable()) {
 			return [this._txAbort(this._v2ChannelId())];
 		}
 

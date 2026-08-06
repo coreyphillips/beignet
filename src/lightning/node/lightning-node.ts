@@ -1280,11 +1280,21 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Restore channels — look up per-channel key index for each
+		// Deletions owed from a previous run come first: a row whose removal
+		// was already decided must not resurrect as a channel because its
+		// delete once failed.
+		const owedDeletions = this.processDeletionTombstones();
 		for (const {
 			channelId,
 			state,
 			peerPubkey
 		} of this.storage.loadAllChannels()) {
+			if (owedDeletions.has(channelId)) {
+				this.emitStructuredLog('channel', 'channel_deletion_still_owed', {
+					channelId
+				});
+				continue;
+			}
 			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
 			// RBF whose post-ack traffic never arrived: the record is the
 			// previous attempt, still resumable and possibly the only side
@@ -2492,15 +2502,17 @@ export class LightningNode extends EventEmitter {
 				);
 				if (!deleted) {
 					// The row survived: the abandonment is not terminal yet.
-					// A restart restores the row and the disconnect sweep
-					// retries the removal against a healthy store; the
+					// A tombstone makes the deletion owed at the next start
+					// (and the disconnect sweep retries it too); the
 					// terminal event fires only when the deletion lands.
+					this.addDeletionTombstone(idHex);
 					this.emitStructuredLog('channel', 'open_abandon_deferred', {
 						channelId: idHex,
 						reason
 					});
 					return;
 				}
+				this.clearDeletionTombstone(idHex);
 				this.emitStructuredLog('channel', 'open_abandoned', {
 					channelId: idHex,
 					reason
@@ -4014,15 +4026,17 @@ export class LightningNode extends EventEmitter {
 		);
 		if (!deleted) {
 			// The row survived, so the channel is NOT terminally gone: a
-			// restart restores it and this removal is re-evaluated then.
-			// Emitting the terminal event now would claim a deletion that
-			// did not happen.
+			// tombstone makes the deletion owed at the next start, and the
+			// terminal event fires only when it lands. Emitting it now
+			// would claim a deletion that did not happen.
+			this.addDeletionTombstone(idHex);
 			this.emitStructuredLog('channel', 'channel_void_deferred', {
 				channelId: idHex,
 				txid
 			});
 			return;
 		}
+		this.clearDeletionTombstone(idHex);
 		this.emitStructuredLog('channel', 'channel_voided', {
 			channelId: idHex,
 			txid
@@ -4050,6 +4064,90 @@ export class LightningNode extends EventEmitter {
 				),
 			'savePendingFundingTxs'
 		);
+	}
+
+	/** Metadata key: channel rows whose durable deletion failed and is owed. */
+	private static readonly PENDING_CHANNEL_DELETIONS_KEY =
+		'pending_channel_deletions';
+
+	private loadDeletionTombstones(): Set<string> {
+		try {
+			const json = this.storage?.loadMetadata(
+				LightningNode.PENDING_CHANNEL_DELETIONS_KEY
+			);
+			if (!json) return new Set();
+			const parsed = JSON.parse(json);
+			return new Set(
+				Array.isArray(parsed)
+					? parsed.filter((v): v is string => typeof v === 'string')
+					: []
+			);
+		} catch {
+			return new Set();
+		}
+	}
+
+	private saveDeletionTombstones(ids: Set<string>): void {
+		this.safeStorage(
+			() =>
+				this.storage!.saveMetadata(
+					LightningNode.PENDING_CHANNEL_DELETIONS_KEY,
+					JSON.stringify([...ids])
+				),
+			'saveMetadata'
+		);
+	}
+
+	/** Record that this row's deletion failed and is owed at the next start. */
+	private addDeletionTombstone(idHex: string): void {
+		const ids = this.loadDeletionTombstones();
+		if (ids.has(idHex)) return;
+		ids.add(idHex);
+		this.saveDeletionTombstones(ids);
+	}
+
+	/**
+	 * Retire a tombstone once the deletion landed by another path (the
+	 * disconnect sweep can retry before the next start); without this the
+	 * startup retry would re-delete a missing row and fire the terminal
+	 * event twice.
+	 */
+	private clearDeletionTombstone(idHex: string): void {
+		const ids = this.loadDeletionTombstones();
+		if (!ids.delete(idHex)) return;
+		this.saveDeletionTombstones(ids);
+	}
+
+	/**
+	 * Retry deletions owed from a previous run BEFORE restoring channels: a
+	 * row whose removal was already decided must not resurrect as a channel
+	 * because the delete happened to fail once. Rows whose deletion fails
+	 * again keep their tombstone, and the restore loop skips them, so the
+	 * retry repeats on every start until it lands. The terminal
+	 * channel:voided fires only when the deletion succeeds, deferred a tick
+	 * so listeners attached right after construction still hear it.
+	 */
+	private processDeletionTombstones(): Set<string> {
+		const ids = this.loadDeletionTombstones();
+		if (ids.size === 0) return ids;
+		const remaining = new Set<string>();
+		for (const idHex of ids) {
+			const deleted = this.safeStorage(
+				() => this.storage!.deleteChannel(idHex),
+				'deleteChannel'
+			);
+			if (!deleted) {
+				remaining.add(idHex);
+				continue;
+			}
+			this.emitStructuredLog('channel', 'channel_deletion_retried', {
+				channelId: idHex
+			});
+			const channelId = Buffer.from(idHex, 'hex');
+			setImmediate(() => this.emit('channel:voided', { channelId }));
+		}
+		this.saveDeletionTombstones(remaining);
+		return remaining;
 	}
 
 	/** Record a signed funding tx we are obligated to broadcast. */
@@ -13118,13 +13216,17 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
-		if (state.v2InFlight && !state.v2InFlight.sentTxSignatures) {
-			// A v2 open whose witnesses never left us: nobody can complete
-			// or broadcast this funding tx, so a commitment spending its
-			// outpoint can never confirm and "closing on chain" is a
-			// fiction. This is the diverged-RBF terminal (the peer answered
-			// reestablish with unknown-channel after dropping its side);
-			// void the channel instead of broadcasting into nothing.
+		if (state.v2InFlight && !channel.isV2AttemptBroadcastable()) {
+			// A v2 open the peer provably cannot broadcast: our witnesses
+			// never left AND the funding tx still needs them, so a
+			// commitment spending its outpoint can never confirm and
+			// "closing on chain" is a fiction. This is the diverged-RBF
+			// terminal (the peer answered reestablish with unknown-channel
+			// after dropping its side); void the channel instead of
+			// broadcasting into nothing. A broadcastable attempt, including
+			// the zero-local-input case where the peer needs no witness
+			// bytes from us at all, keeps the watch and the force-close
+			// path below instead.
 			this.emitStructuredLog('channel', 'errored_unsigned_v2_voided', {
 				channelId: channelId.toString('hex'),
 				reason

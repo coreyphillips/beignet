@@ -1124,9 +1124,10 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		completeExchange(h);
 	});
 
-	it('tx_ack_rbf begins the renegotiation: record cleared, persisted, state knocked back', () => {
+	it('tx_ack_rbf begins the renegotiation and retains the rollback record until the peer answers', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
+		const preRecord = h.opener.getFullState().v2InFlight;
 		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
 		const ackActions = h.opener.handleTxAckRbf();
 		expect(findError(ackActions)).to.equal(null);
@@ -1135,6 +1136,22 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the agreed replacement persists'
 		).to.be.true;
 		expect(h.opener.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		// Symmetric with the receiver: the ack proves acceptance, not that
+		// the peer will ever SEE the new round (our first contribution can
+		// be lost), so the previous attempt's record is retained.
+		expect(
+			h.opener.getFullState().v2InFlight,
+			'the rollback record is retained through the ack'
+		).to.equal(preRecord);
+
+		// The peer's first post-ack answer is the causal proof it observed
+		// the replacement round: the rollback record clears, durably.
+		const commitActions = h.opener.handleTxComplete();
+		expect(findError(commitActions)).to.equal(null);
+		expect(
+			commitActions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the record clear persists at the commit point'
+		).to.be.true;
 		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
 
 		// An unsolicited ack acknowledges nothing.
@@ -1145,6 +1162,146 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			null,
 			undefined
 		]);
+	});
+
+	it('freezes the old attempt while an RBF request is pending; the ack revalidates the binding', () => {
+		// The acceptor contributes MORE, so the opener signs first: without
+		// the freeze, the crossed commitment_signed below would release
+		// attempt 0's tx_signatures while the peer may already have accepted
+		// the replacement.
+		const h = driveToCommitmentExchange({
+			acceptorPrev: makeRealPrevOut(300_000)
+		});
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+
+		const crossed = h.opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(h.acceptorCommit)
+		);
+		expect(findError(crossed)).to.equal(null);
+		expect(
+			findPayload(crossed, MessageType.TX_SIGNATURES),
+			'the release is frozen while the request is un-acked'
+		).to.equal(null);
+		expect(h.opener.getFullState().v2InFlight!.sentTxSignatures).to.be.false;
+
+		// A refusal thaws it: the request dies, the attempt is untouched,
+		// and the signature exchange completes normally from here (this
+		// caller-driven harness releases witnesses explicitly, so the thaw
+		// shows as the exchange succeeding rather than as an inline
+		// retransmit).
+		const answer = h.opener.handleTxAbort();
+		expect(findError(answer)).to.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(
+			findError(
+				h.acceptor.handleCommitmentSigned(
+					decodeCommitmentSignedMessage(h.openerCommit)
+				)
+			)
+		).to.equal(null);
+		// The opener contributes less here, so IT signs first (the inverse
+		// of completeExchange's usual ordering).
+		const opSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(opSig)).to.equal(null);
+		const opTxSigs = findPayload(opSig, MessageType.TX_SIGNATURES);
+		expect(opTxSigs, 'the thawed release goes out').to.not.equal(null);
+		const acAfter = h.acceptor.handleTxSignatures(
+			decodeTxSignaturesMessage(opTxSigs!)
+		);
+		expect(findError(acAfter)).to.equal(null);
+		let acTxSigs = findPayload(acAfter, MessageType.TX_SIGNATURES);
+		if (!acTxSigs) {
+			const acSig = h.acceptor.sendTxSignatures(
+				h.acceptor.getFullState().fundingTxid!,
+				h.acceptor.getFullState().fundingOutputIndex,
+				h.acceptorWitness()
+			);
+			expect(findError(acSig)).to.equal(null);
+			acTxSigs = findPayload(acSig, MessageType.TX_SIGNATURES);
+		}
+		expect(acTxSigs).to.not.equal(null);
+		expect(
+			findError(
+				h.opener.handleTxSignatures(decodeTxSignaturesMessage(acTxSigs!))
+			)
+		).to.equal(null);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		// The ack revalidates the binding: a record whose witnesses left (or
+		// that tracks another tx) refuses the renegotiation on the wire and
+		// keeps the attempt.
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		expect(findError(g.opener.initiateTxRbf(2000))).to.equal(null);
+		g.opener.getFullState().v2InFlight!.sentTxSignatures = true;
+		const stale = g.opener.handleTxAckRbf();
+		expect(
+			findPayload(stale, MessageType.TX_ABORT),
+			'the invalidated request unwinds on the wire'
+		).to.not.equal(null);
+		expect(g.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(g.opener.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+	});
+
+	it('survives consecutive refusals and a refusal followed by an operator abort', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Refusal 1: the exchange completes and leaves no stale latches.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const refusal1 = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 1001
+		});
+		expect(findPayload(refusal1, MessageType.TX_ABORT)).to.not.equal(null);
+		const echo1 = h.opener.handleTxAbort();
+		expect(findPayload(echo1, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.acceptor.handleTxAbort()).to.deep.equal([]);
+
+		// Refusal 2: a second request is neither blocked nor silently
+		// swallowed by the first exchange's latch, on either side.
+		expect(findError(h.opener.initiateTxRbf(2100))).to.equal(null);
+		const refusal2 = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 1001
+		});
+		expect(
+			findPayload(refusal2, MessageType.TX_ABORT),
+			'the second refusal reaches the wire'
+		).to.not.equal(null);
+		const echo2 = h.opener.handleTxAbort();
+		expect(findPayload(echo2, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.acceptor.handleTxAbort()).to.deep.equal([]);
+
+		// An operator abort after the refusals must not be swallowed either:
+		// the full handshake still runs and the aborter tears down at the
+		// echo.
+		const abortActions = h.opener.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		expect(findPayload(abortActions, MessageType.TX_ABORT)).to.not.equal(null);
+		const peerAnswer = h.acceptor.handleTxAbort();
+		expect(
+			findPayload(peerAnswer, MessageType.TX_ABORT),
+			'the peer answers the abort'
+		).to.not.equal(null);
+		const teardown = h.opener.handleTxAbort();
+		expect(
+			teardown.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the echo completes the teardown'
+		).to.be.true;
+		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 	});
 
 	it('refuses RBF on a completed open: nothing reaches the wire after channel_ready', () => {
@@ -2293,6 +2450,103 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	it('a lost first post-ack contribution rolls BOTH sides back to the previous attempt', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(77, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(78, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		wire.clearDrops();
+
+		// The RBF is accepted and acked, but the initiator's first
+		// contribution of the new round never arrives: NEITHER side has
+		// causal proof the other observed the replacement round, so both
+		// retained their rollback records.
+		wire.dropFrom(opener, MessageType.TX_ADD_INPUT);
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		await settle(() => wire.dropped(MessageType.TX_ADD_INPUT) > 0);
+		expect(channel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		expect(
+			channel.getFullState().v2InFlight,
+			'the initiator retained its rollback record through the ack'
+		).to.not.be.oneOf([null, undefined]);
+
+		// Disconnect: both sides roll back to the shared previous attempt,
+		// keeping their rows. This used to delete the initiator's row while
+		// the receiver rolled back.
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid))
+			.to.be.true;
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
+		expect(
+			acceptorChannel
+				.getFullState()
+				.v2InFlight!.fundingTxid.equals(attempt0Txid)
+		).to.be.true;
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+
+		// Reconnect: the shared previous attempt resumes and completes.
+		wire.clearDrops();
+		wire.hold();
+		managerOf(opener).handlePeerReconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerReconnected(opener.getNodeId());
+		wire.drain();
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				acceptorChannel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be.true;
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
 	it('a lost tx_ack_rbf converges: both sides resume the previous attempt', async function () {
 		const acceptorStorage = new SqliteStorage(':memory:');
 		acceptorStorage.open();
@@ -2684,10 +2938,13 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			acceptorVoided.push(e.channelId);
 		});
 
-		// The operator aborts the stranded open. The abort reaches the peer,
-		// which errors, echoes and removes itself; the echo completes the
-		// handshake on the aborting side and removes it there too. Rows go
-		// with the registrations on both sides.
+		// The operator aborts the stranded open. The opener contributed the
+		// only wallet input, so ITS attempt is not broadcastable by the peer
+		// and the echo completes its teardown and removal. The ACCEPTOR
+		// contributed nothing: the opener needs no witness bytes from it and
+		// could broadcast the funding tx alone, so the acceptor keeps its
+		// record, state and row despite the abort (zero-local-input
+		// broadcastability).
 		const abortActions = channel.abortDualFunding('operator cancelled');
 		expect(findError(abortActions)).to.equal(null);
 		(
@@ -2695,23 +2952,25 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				processActions: (p: string, c: Channel, a: unknown[]) => void;
 			}
 		).processActions(acceptor.getNodeId(), channel, abortActions);
-		await settle(
-			() =>
-				managerOf(opener).getChannel(channelId) === undefined &&
-				managerOf(acceptor).getChannel(channelId) === undefined
-		);
+		await settle(() => managerOf(opener).getChannel(channelId) === undefined);
 		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
-		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
 		expect(openerStorage.loadAllChannels()).to.have.length(0);
-		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
 		expect(openerVoided).to.have.length(1);
-		expect(acceptorVoided).to.have.length(1);
+
+		const kept = managerOf(acceptor).getChannel(channelId);
+		expect(kept, 'the zero-input acceptor keeps its side').to.not.equal(
+			undefined
+		);
+		expect(kept!.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(kept!.getFullState().v2InFlight).to.not.be.oneOf([null, undefined]);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+		expect(acceptorVoided).to.have.length(0);
 
 		opener.destroy();
 		acceptor.destroy();
 	});
 
-	it('a lost abort echo keeps the aborter alive; the diverged terminal voids it on reconnect', async function () {
+	it('a lost abort echo keeps BOTH sides alive; reconnect resumes the attempt', async function () {
 		const openerStorage = new SqliteStorage(':memory:');
 		openerStorage.open();
 		const opener = new LightningNode(
@@ -2733,9 +2992,13 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		});
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
 		wire.clearDrops();
-		// The peer heard the abort and removed its side, but its echo dies:
-		// with no confirmation, the aborting side must NOT tear down (the
+		// The zero-input acceptor hears the abort and keeps its side (the
+		// attempt is broadcastable by the opener alone); its echo dies on
+		// the wire, so the aborting opener must not tear down either (the
 		// echo is the only proof the peer agreed to forget).
 		wire.dropFrom(acceptor, MessageType.TX_ABORT);
 
@@ -2747,7 +3010,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			}
 		).processActions(acceptor.getNodeId(), channel, abortActions);
 		await settle(() => wire.dropped(MessageType.TX_ABORT) > 0);
-		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.not.equal(undefined);
 		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
 		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
 		expect(channel.getFullState().v2InFlight).to.not.be.oneOf([
@@ -2761,23 +3024,27 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
 		expect(openerStorage.loadAllChannels()).to.have.length(1);
 
-		// On reconnect the peer answers reestablish with unknown-channel;
-		// our signatures never left, so the diverged terminal VOIDS the
-		// channel rather than force-closing into a nonexistent funding tx.
-		const voided: Buffer[] = [];
-		opener.on('channel:voided', (e: { channelId: Buffer }) => {
-			voided.push(e.channelId);
-		});
+		// Reconnect: the abort never completed anywhere, so the shared
+		// attempt simply resumes and completes.
 		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
 		wire.clearDrops();
 		wire.hold();
 		managerOf(opener).handlePeerReconnected(acceptor.getNodeId());
 		managerOf(acceptor).handlePeerReconnected(opener.getNodeId());
 		wire.drain();
-		await settle(() => voided.length > 0);
-		expect(voided).to.have.length(1);
-		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
-		expect(openerStorage.loadAllChannels()).to.have.length(0);
+		await settle(
+			() =>
+				channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED &&
+				acceptorChannel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be.true;
 
 		opener.destroy();
 		acceptor.destroy();
@@ -2866,26 +3133,17 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 
 	it('defers the terminal void when the row deletion fails; a restart completes it', async function () {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-void-'));
-		const dbPath = path.join(dir, 'acceptor.db');
-		const acceptorStorage = new SqliteStorage(dbPath);
-		acceptorStorage.open();
+		const dbPath = path.join(dir, 'opener.db');
+		const openerStorage = new SqliteStorage(dbPath);
+		openerStorage.open();
 		const opener = new LightningNode(
 			makeNodeConfig(75, {
-				storage: (() => {
-					const s = new SqliteStorage(':memory:');
-					s.open();
-					return s;
-				})(),
+				storage: openerStorage,
 				recovery: { enabled: true },
 				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
 			})
 		);
-		const acceptor = new LightningNode(
-			makeNodeConfig(76, {
-				storage: acceptorStorage,
-				recovery: { enabled: true }
-			})
-		);
+		const acceptor = new LightningNode(makeNodeConfig(76));
 		opener.on('node:error', () => {});
 		acceptor.on('node:error', () => {});
 		const wire = wireNodes(opener, acceptor);
@@ -2899,19 +3157,20 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const channelId = channel.getChannelId()!;
 		wire.clearDrops();
 
-		// The acceptor's disk refuses deletions: the abort handshake removes
-		// its registration, but the row survives, so the terminal event must
-		// NOT fire; a voided claim here would be a lie a restart disproves.
-		const realDelete = acceptorStorage.deleteChannel.bind(acceptorStorage);
+		// The opener's disk refuses deletions: the abort handshake (its echo
+		// completes the teardown) removes its registration, but the row
+		// survives, so the terminal event must NOT fire; a voided claim here
+		// would be a lie a restart disproves.
+		const realDelete = openerStorage.deleteChannel.bind(openerStorage);
 		const refuseDelete = true;
 		(
-			acceptorStorage as unknown as { deleteChannel: (id: string) => void }
+			openerStorage as unknown as { deleteChannel: (id: string) => void }
 		).deleteChannel = (id: string): void => {
 			if (refuseDelete) throw new Error('disk full');
 			realDelete(id);
 		};
 		const voided: Buffer[] = [];
-		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+		opener.on('channel:voided', (e: { channelId: Buffer }) => {
 			voided.push(e.channelId);
 		});
 		const abortActions = channel.abortDualFunding('operator cancelled');
@@ -2921,39 +3180,39 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				processActions: (p: string, c: Channel, a: unknown[]) => void;
 			}
 		).processActions(acceptor.getNodeId(), channel, abortActions);
-		await settle(() => managerOf(acceptor).getChannel(channelId) === undefined);
-		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		await settle(() => managerOf(opener).getChannel(channelId) === undefined);
+		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
 		expect(
 			voided,
 			'no terminal event without a durable deletion'
 		).to.have.length(0);
-		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
-		acceptor.destroy();
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+		opener.destroy();
 
-		// The restart restores the surviving row; the next disconnect sweep
-		// completes the removal against a healthy store, and only THEN does
-		// the terminal event fire.
-		const acceptorStorage2 = new SqliteStorage(dbPath);
-		acceptorStorage2.open();
+		// The restart processes the persisted cleanup tombstone at startup:
+		// the row is deleted against the healthy store WITHOUT waiting for
+		// another peer disconnect, and only then does the terminal event
+		// fire.
+		const openerStorage2 = new SqliteStorage(dbPath);
+		openerStorage2.open();
+		const revivedVoided: Buffer[] = [];
 		const revived = new LightningNode(
-			makeNodeConfig(76, {
-				storage: acceptorStorage2,
+			makeNodeConfig(75, {
+				storage: openerStorage2,
 				recovery: { enabled: true }
 			})
 		);
 		revived.on('node:error', () => {});
-		const revivedVoided: Buffer[] = [];
 		revived.on('channel:voided', (e: { channelId: Buffer }) => {
 			revivedVoided.push(e.channelId);
 		});
-		expect(revived.getChannelManager().listChannels()).to.have.length(1);
-		managerOf(revived).handlePeerDisconnected(opener.getNodeId());
-		expect(managerOf(revived).getChannel(channelId)).to.equal(undefined);
-		expect(acceptorStorage2.loadAllChannels()).to.have.length(0);
+		expect(revived.getChannelManager().listChannels()).to.have.length(0);
+		expect(openerStorage2.loadAllChannels()).to.have.length(0);
+		await settle(() => revivedVoided.length > 0, 1000);
 		expect(revivedVoided).to.have.length(1);
 		expect(revivedVoided[0].equals(channelId)).to.be.true;
 
-		opener.destroy();
+		acceptor.destroy();
 		revived.destroy();
 	});
 
