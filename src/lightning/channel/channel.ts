@@ -10353,10 +10353,7 @@ export class Channel {
 
 		// Our turn: contribute our own inputs/change when we accepted with a
 		// contribution (lease selling); no-op otherwise.
-		return [
-			...this._consumeRbfRollbackRecord(),
-			...this._driveDualFunding()
-		];
+		return [...this._consumeRbfRollbackRecord(), ...this._driveDualFunding()];
 	}
 
 	/**
@@ -10451,10 +10448,7 @@ export class Channel {
 		}
 
 		// Our turn (see handleTxAddInput).
-		return [
-			...this._consumeRbfRollbackRecord(),
-			...this._driveDualFunding()
-		];
+		return [...this._consumeRbfRollbackRecord(), ...this._driveDualFunding()];
 	}
 
 	/**
@@ -12675,6 +12669,26 @@ export class Channel {
 				channelId,
 				data: reason ? Buffer.from(reason, 'utf8') : Buffer.alloc(0)
 			})
+		);
+	}
+
+	/**
+	 * Whether this channel is a dead unfunded v2 open: errored with no
+	 * funding transaction anyone could ever complete or broadcast. Such a
+	 * channel answers nothing forever and is safe to remove entirely (maps
+	 * and row); everything it checks is durable, so the answer survives a
+	 * restore. Never true once our tx_signatures left (the peer may hold a
+	 * broadcastable funding tx), once the fully signed tx was staged for
+	 * (re)broadcast, or once either channel_ready was exchanged.
+	 */
+	isAbandonedV2Open(): boolean {
+		return (
+			this._state.state === ChannelState.ERRORED &&
+			this._state.fundingVersion === 2 &&
+			(!this._state.v2InFlight || !this._state.v2InFlight.sentTxSignatures) &&
+			!this._state.pendingFundingTxHex &&
+			!this._state.localChannelReady &&
+			!this._state.remoteChannelReady
 		);
 	}
 

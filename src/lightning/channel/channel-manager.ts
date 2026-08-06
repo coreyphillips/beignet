@@ -1308,26 +1308,22 @@ export class ChannelManager extends EventEmitter {
 			// rules; what is not was a negotiation that restarts.
 			const channelIdHex = channel.getChannelId()?.toString('hex');
 			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
-			const wasRbfRenegotiation =
-				channel.getState() === ChannelState.DUAL_FUNDING_V2;
 			channel.markForReestablish();
-			// The drop branch abandoned an RBF renegotiation nothing was signed
-			// for: remove the channel entirely, mirroring the restart path
-			// (which deletes the row). Leaving it ERRORED left a silent
-			// permanent channel that no reestablish, disposition or cleanup
-			// ever touches; a peer that still asks after removal gets the
+			// A dead unfunded v2 open: either the drop branch just abandoned
+			// a committed RBF renegotiation nothing was signed for, or the
+			// channel was already ERRORED by an abort whose echo never
+			// arrived. Remove it entirely, mirroring the restart path (which
+			// deletes the row). Leaving it ERRORED left a silent permanent
+			// channel that no reestablish, disposition or cleanup ever
+			// touches; a peer that still asks after removal gets the
 			// unknown-channel error and ends the attempt on its side.
-			if (
-				wasRbfRenegotiation &&
-				channel.getState() === ChannelState.ERRORED &&
-				channelIdHex
-			) {
+			if (channel.isAbandonedV2Open() && channelIdHex) {
 				this.channels.delete(channelIdHex);
 				this.channelPeers.delete(channelIdHex);
 				this.emit(
 					'channel:abandoned',
 					channel.getChannelId(),
-					'v2 open RBF renegotiation dropped on disconnect'
+					'dead unfunded v2 open removed on disconnect'
 				);
 			}
 		}
@@ -1346,6 +1342,21 @@ export class ChannelManager extends EventEmitter {
 		for (const [tempId, channel] of this.tempChannels) {
 			if (this.channelPeers.get(tempId) !== peerPubkey) continue;
 			const state = channel.getState();
+			// A dead unfunded v2 open still in the temp map: it errored as
+			// the tx_abort responder and the aborting peer disconnected
+			// before this side ever heard back. ERRORED is not an early
+			// state, so the sweep below skipped it forever. Remove it and
+			// let the node delete any row via channel:abandoned.
+			if (channel.isAbandonedV2Open()) {
+				this.tempChannels.delete(tempId);
+				this.channelPeers.delete(tempId);
+				this.emit(
+					'channel:abandoned',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					'dead unfunded v2 open removed on disconnect'
+				);
+				continue;
+			}
 			if (!earlyStates.has(state)) continue;
 
 			// A v2 open past its point of no return (the durable record exists)
@@ -4544,6 +4555,32 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleTxAbort();
 		this.processActions(peerPubkey, channel, actions);
+
+		// The abort handshake is now complete for a dead unfunded v2 open on
+		// BOTH shapes of this call: the responder just errored itself above
+		// (and its echo went out with the actions), and the aborting side
+		// just consumed the peer's echo. Either way nothing more will ever
+		// arrive for this channel; leaving it registered made an inert
+		// ERRORED entry the disconnect sweeps skipped and the row repeated
+		// on every restart. Remove it entirely; the node deletes the row via
+		// channel:abandoned.
+		if (channel.isAbandonedV2Open()) {
+			const idHex = channel.getChannelId()?.toString('hex');
+			const tempHex = channel.getTemporaryChannelId()?.toString('hex');
+			if (idHex) {
+				this.channels.delete(idHex);
+				this.channelPeers.delete(idHex);
+			}
+			if (tempHex) {
+				this.tempChannels.delete(tempHex);
+				this.channelPeers.delete(tempHex);
+			}
+			this.emit(
+				'channel:abandoned',
+				channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				'v2 open aborted'
+			);
+		}
 	}
 
 	private handleAnnouncementSignaturesMsg(

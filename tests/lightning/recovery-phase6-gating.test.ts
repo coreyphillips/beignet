@@ -45,7 +45,8 @@ function stubChannel(channelId: Buffer): Channel {
 		getChannelId: (): Buffer => channelId,
 		getTemporaryChannelId: (): Buffer | null => null,
 		getState: (): ChannelState => ChannelState.NORMAL,
-		markForReestablish: (): void => undefined
+		markForReestablish: (): void => undefined,
+		isAbandonedV2Open: (): boolean => false
 	} as unknown as Channel;
 }
 

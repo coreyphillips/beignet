@@ -1386,7 +1386,10 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		// the per-commitment seed of a channel that once existed.
 		residueStorage.saveChannelKeyIndex(idHex, 7);
 		const residueNode = new LightningNode(
-			makeNodeConfig(26, { storage: residueStorage, recovery: { enabled: true } })
+			makeNodeConfig(26, {
+				storage: residueStorage,
+				recovery: { enabled: true }
+			})
 		);
 		residueNode.on('node:error', () => {});
 		expect(residueNode.getChannelManager().listChannels()).to.have.length(0);
@@ -1396,6 +1399,26 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the key index advanced past the removed residue'
 		).to.be.at.least(8);
 		residueNode.destroy();
+	});
+
+	it('isAbandonedV2Open covers only dead unfunded opens', () => {
+		// A pre-signature abort is dead and unfunded: nothing anyone can
+		// broadcast exists, so the channel is removable everywhere.
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		expect(findError(h.opener.abortDualFunding('operator cancelled'))).to.equal(
+			null
+		);
+		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(h.opener.isAbandonedV2Open()).to.be.true;
+
+		// A fully signed open is NOT abandoned even when it errors: the
+		// funding tx is staged for (re)broadcast and the peer holds it too.
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		completeExchange(g);
+		g.opener.getFullState().state = ChannelState.ERRORED;
+		expect(g.opener.isAbandonedV2Open()).to.be.false;
 	});
 
 	it('verifies peer tx_signatures against their negotiated prevouts', () => {
@@ -2180,9 +2203,8 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const openerRecord = channel.getFullState().v2InFlight!;
 		const acceptorRecord = acceptorChannel.getFullState().v2InFlight!;
 		expect(openerRecord.fundingTxid.equals(attempt0Txid)).to.be.false;
-		expect(
-			openerRecord.fundingTxid.equals(acceptorRecord.fundingTxid)
-		).to.be.true;
+		expect(openerRecord.fundingTxid.equals(acceptorRecord.fundingTxid)).to.be
+			.true;
 		expect(openerRecord.fundingFeeratePerkw).to.equal(2000);
 		expect(acceptorRecord.fundingFeeratePerkw).to.equal(2000);
 		expect(openerRecord.rbfAttempt).to.equal(1);
@@ -2255,9 +2277,8 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
 		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
 		expect(channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
-		expect(
-			channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid)
-		).to.be.true;
+		expect(channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid))
+			.to.be.true;
 		const kept = managerOf(acceptor).getChannel(channelId);
 		expect(kept, 'the acceptor kept its side').to.not.equal(undefined);
 		expect(kept!.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
@@ -2282,8 +2303,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 		expect(kept!.getState()).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
-		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be
-			.true;
+		expect(channel.getFullState().fundingTxid!.equals(attempt0Txid)).to.be.true;
 		expect(kept!.getFullState().fundingTxid!.equals(attempt0Txid)).to.be.true;
 
 		opener.destroy();
@@ -2381,9 +2401,8 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		).to.be.true;
 		const kept = managerOf(acceptor).getChannel(channelId)!;
 		expect(kept.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
-		expect(
-			kept.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid)
-		).to.be.true;
+		expect(kept.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid)).to
+			.be.true;
 
 		// Reconnect: the previous attempt completes on both sides.
 		wire.hold();
@@ -2400,9 +2419,8 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
 		expect(kept.getState()).to.equal(ChannelState.AWAITING_FUNDING_CONFIRMED);
-		expect(
-			openerRestored!.getFullState().fundingTxid!.equals(attempt0Txid)
-		).to.be.true;
+		expect(openerRestored!.getFullState().fundingTxid!.equals(attempt0Txid)).to
+			.be.true;
 
 		opener.destroy();
 		acceptor.destroy();
@@ -2531,9 +2549,7 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		});
 		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
 		const kept = managerOf(acceptor).getChannel(channelId);
-		expect(kept, 'the channel survives the disconnect').to.not.equal(
-			undefined
-		);
+		expect(kept, 'the channel survives the disconnect').to.not.equal(undefined);
 		expect(kept!.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
 		expect(
 			kept!.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid),
@@ -2541,6 +2557,129 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		).to.be.true;
 		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
 		expect(voided).to.have.length(0);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('the tx_abort handshake removes a dead unfunded v2 open from both sides, durably', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(69, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(70, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		expect(managerOf(acceptor).getChannel(channelId)).to.not.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(1);
+		wire.clearDrops();
+
+		const openerVoided: Buffer[] = [];
+		opener.on('channel:voided', (e: { channelId: Buffer }) => {
+			openerVoided.push(e.channelId);
+		});
+		const acceptorVoided: Buffer[] = [];
+		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+			acceptorVoided.push(e.channelId);
+		});
+
+		// The operator aborts the stranded open. The abort reaches the peer,
+		// which errors, echoes and removes itself; the echo completes the
+		// handshake on the aborting side and removes it there too. Rows go
+		// with the registrations on both sides.
+		const abortActions = channel.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, abortActions);
+		await settle(
+			() =>
+				managerOf(opener).getChannel(channelId) === undefined &&
+				managerOf(acceptor).getChannel(channelId) === undefined
+		);
+		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(0);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
+		expect(openerVoided).to.have.length(1);
+		expect(acceptorVoided).to.have.length(1);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a dead unfunded v2 open is reaped on disconnect when the abort echo never arrives', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(71, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(72));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		wire.clearDrops();
+		// The peer's echo dies on the wire: the aborting side stays ERRORED
+		// and registered, the shape the disconnect sweeps used to skip.
+		wire.dropFrom(acceptor, MessageType.TX_ABORT);
+
+		const abortActions = channel.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, abortActions);
+		await settle(() => wire.dropped(MessageType.TX_ABORT) > 0);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(managerOf(opener).getChannel(channelId)).to.not.equal(undefined);
+		expect(channel.getState()).to.equal(ChannelState.ERRORED);
+
+		const voided: Buffer[] = [];
+		opener.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(0);
+		expect(voided).to.have.length(1);
+		expect(voided[0].equals(channelId)).to.be.true;
 
 		opener.destroy();
 		acceptor.destroy();
