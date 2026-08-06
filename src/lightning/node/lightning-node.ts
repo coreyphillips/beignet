@@ -2496,16 +2496,44 @@ export class LightningNode extends EventEmitter {
 					}
 					return;
 				}
-				const deleted = this.safeStorage(
-					() => this.storage!.deleteChannel(idHex),
-					'deleteChannel'
-				);
+				const deleted = row
+					? this.deleteChannelDurably(idHex)
+					: this.safeStorage(
+							() => this.storage!.deleteChannel(idHex),
+							'deleteChannel'
+					  );
 				if (!deleted) {
 					// The row survived: the abandonment is not terminal yet.
 					// A tombstone makes the deletion owed at the next start
 					// (and the disconnect sweep retries it too); the
 					// terminal event fires only when the deletion lands.
-					this.addDeletionTombstone(idHex);
+					if (!this.addDeletionTombstone(idHex)) {
+						// Neither the deletion nor the durable intent
+						// landed: with no marker, a healthy restart would
+						// silently restore the row as a live channel. Keep
+						// it TRACKED instead, exactly like the recoverable
+						// failed-persist arm, so this removal re-runs
+						// against a store that answers.
+						try {
+							const channel = new Channel(row!.state);
+							const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+							this.channelManager.restoreChannel(
+								channel,
+								row!.peerPubkey,
+								keyIndex
+							);
+							this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+								channelId: idHex,
+								reason
+							});
+						} catch {
+							this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+								channelId: idHex,
+								reason
+							});
+						}
+						return;
+					}
 					this.emitStructuredLog('channel', 'open_abandon_deferred', {
 						channelId: idHex,
 						reason
@@ -2566,7 +2594,6 @@ export class LightningNode extends EventEmitter {
 					peerPubkey,
 					channelId: channelId?.toString('hex')
 				});
-				if (!this.peerManager) return;
 				// Deferred: the blocked batch may still be unwinding through
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
@@ -2576,6 +2603,12 @@ export class LightningNode extends EventEmitter {
 					} catch {
 						// Already disconnected, or transport-level teardown raced.
 					}
+					// A v2 opening whose blocked persist left memory ahead of
+					// disk (e.g. the replacement's commitment failed to
+					// commit) resyncs to the durable truth: the attempt on
+					// disk is the only one a restart would resume, so it is
+					// the only one this side may keep tracking.
+					this.resyncV2OpenFromDisk(channelId);
 				});
 			}
 		);
@@ -4017,10 +4050,7 @@ export class LightningNode extends EventEmitter {
 		if (!this.channelManager.voidChannel(channelId)) return;
 		const idHex = channelId.toString('hex');
 		this.chainWatcher?.removeWatchedFunding(channelId);
-		const deleted = this.safeStorage(
-			() => this.storage!.deleteChannel(idHex),
-			'deleteChannel'
-		);
+		const deleted = this.deleteChannelDurably(idHex);
 		this.deletePendingFundingTx(
 			Buffer.from(txid, 'hex').reverse().toString('hex')
 		);
@@ -4029,7 +4059,32 @@ export class LightningNode extends EventEmitter {
 			// tombstone makes the deletion owed at the next start, and the
 			// terminal event fires only when it lands. Emitting it now
 			// would claim a deletion that did not happen.
-			this.addDeletionTombstone(idHex);
+			if (!this.addDeletionTombstone(idHex)) {
+				// Neither the deletion nor the durable intent landed: keep
+				// the channel tracked (a restart would otherwise silently
+				// restore the row) so the removal re-runs against a store
+				// that answers.
+				try {
+					const row = this.storage?.loadChannel?.(idHex);
+					if (row) {
+						const channel = new Channel(row.state);
+						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+						this.channelManager.restoreChannel(
+							channel,
+							row.peerPubkey,
+							keyIndex
+						);
+					}
+				} catch {
+					// The store answers nothing at all; the row (if any)
+					// restores at the next start and is re-evaluated there.
+				}
+				this.emitStructuredLog('channel', 'channel_void_unresolved', {
+					channelId: idHex,
+					txid
+				});
+				return;
+			}
 			this.emitStructuredLog('channel', 'channel_void_deferred', {
 				channelId: idHex,
 				txid
@@ -4087,8 +4142,8 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
-	private saveDeletionTombstones(ids: Set<string>): void {
-		this.safeStorage(
+	private saveDeletionTombstones(ids: Set<string>): boolean {
+		return this.safeStorage(
 			() =>
 				this.storage!.saveMetadata(
 					LightningNode.PENDING_CHANNEL_DELETIONS_KEY,
@@ -4098,12 +4153,81 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	/** Record that this row's deletion failed and is owed at the next start. */
-	private addDeletionTombstone(idHex: string): void {
+	/**
+	 * A blocked persist on a v2 OPENING left its in-memory channel ahead of
+	 * the row (the failed write may have carried a replacement attempt the
+	 * disk never saw). Re-restore the row, restart-equivalent: the durable
+	 * attempt is the only one a crash would resume, so it is the only one
+	 * this side may keep tracking; a provisional DUAL_FUNDING_V2 row rolls
+	 * back to its retained previous attempt exactly as a restart would.
+	 * Scoped to v2 opening shapes; established channels re-converge through
+	 * the ordinary reestablish and outbox replay.
+	 */
+	private resyncV2OpenFromDisk(channelId: Buffer | null): void {
+		if (!channelId || !this.storage) return;
+		const idHex = channelId.toString('hex');
+		let row: { state: IChannelState; peerPubkey: string } | null = null;
+		try {
+			row = this.storage.loadChannel?.(idHex) ?? null;
+		} catch {
+			return;
+		}
+		if (!row || !row.state.v2InFlight) return;
+		if (
+			row.state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
+			row.state.state !== ChannelState.DUAL_FUNDING_V2
+		) {
+			return;
+		}
+		try {
+			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
+				row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
+			}
+			this.channelManager.voidChannel(channelId);
+			const channel = new Channel(row.state);
+			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
+			this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
+			this.emitStructuredLog('channel', 'v2_open_resynced_from_disk', {
+				channelId: idHex
+			});
+		} catch {
+			// The store answers nothing more; the row restores at the next
+			// start and is re-evaluated there.
+		}
+	}
+
+	/**
+	 * Terminal channel-row deletion, routed through the recovery journal
+	 * (the channel_closed mutation; the storage layer cascades the outbox
+	 * rows) so the deletion is a journaled transition rather than a bare
+	 * storage write; falls back to the direct delete when recovery is
+	 * disabled. Returns whether the deletion landed.
+	 */
+	private deleteChannelDurably(idHex: string): boolean {
+		if (this.recovery) {
+			return this.commitMutations(
+				'deleteChannel',
+				[{ type: 'channel_closed', channelId: idHex }],
+				RecoveryCriticality.Important
+			);
+		}
+		return this.safeStorage(
+			() => this.storage!.deleteChannel(idHex),
+			'deleteChannel'
+		);
+	}
+
+	/**
+	 * Record that this row's deletion failed and is owed at the next start.
+	 * Returns whether the intent is durable: a false answer means neither
+	 * the deletion nor the marker exists on disk, and the caller must keep
+	 * the channel tracked instead.
+	 */
+	private addDeletionTombstone(idHex: string): boolean {
 		const ids = this.loadDeletionTombstones();
-		if (ids.has(idHex)) return;
+		if (ids.has(idHex)) return true;
 		ids.add(idHex);
-		this.saveDeletionTombstones(ids);
+		return this.saveDeletionTombstones(ids);
 	}
 
 	/**
@@ -4132,10 +4256,7 @@ export class LightningNode extends EventEmitter {
 		if (ids.size === 0) return ids;
 		const remaining = new Set<string>();
 		for (const idHex of ids) {
-			const deleted = this.safeStorage(
-				() => this.storage!.deleteChannel(idHex),
-				'deleteChannel'
-			);
+			const deleted = this.deleteChannelDurably(idHex);
 			if (!deleted) {
 				remaining.add(idHex);
 				continue;

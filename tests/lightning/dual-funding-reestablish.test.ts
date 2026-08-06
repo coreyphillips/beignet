@@ -96,6 +96,7 @@ import { INodeConfig, IFundingProvider } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
+import { ILeaseRates } from '../../src/lightning/gossip/types';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -978,8 +979,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.equal(preRecord);
 		expect(h.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
 
-		// The first post-ack interactive message proves the initiator
-		// committed to the replacement: the rollback record clears, durably.
+		// Post-ack traffic does NOT clear the record: the rollback state is
+		// retained through the whole renegotiation and is only replaced,
+		// atomically, by the NEW attempt's record at its commitment persist.
 		const prev = makeRealPrevOut(120_000);
 		const commitActions = h.acceptor.handleTxAddInput({
 			channelId: h.acceptor.getChannelId()!,
@@ -990,10 +992,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		});
 		expect(findError(commitActions)).to.equal(null);
 		expect(
-			commitActions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
-			'the record clear persists at the commit point'
-		).to.be.true;
-		expect(h.acceptor.getFullState().v2InFlight ?? null).to.equal(null);
+			h.acceptor.getFullState().v2InFlight,
+			'the rollback record survives replacement-round traffic'
+		).to.equal(preRecord);
 
 		// After a release, RBF is refused in both directions.
 		const g = driveToCommitmentExchange();
@@ -1005,7 +1006,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 		expect(findError(g.acceptor.initiateTxRbf(2000))).to.contain(
-			'after tx_signatures'
+			'already broadcast'
 		);
 		const refused = g.acceptor.handleTxInitRbf({
 			channelId: g.acceptor.getChannelId()!,
@@ -1144,15 +1145,15 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			'the rollback record is retained through the ack'
 		).to.equal(preRecord);
 
-		// The peer's first post-ack answer is the causal proof it observed
-		// the replacement round: the rollback record clears, durably.
+		// Replacement-round traffic does NOT clear it either: the record is
+		// only replaced, atomically, by the NEW attempt's record at its
+		// commitment persist, so no separate clear-write can fail apart.
 		const commitActions = h.opener.handleTxComplete();
 		expect(findError(commitActions)).to.equal(null);
 		expect(
-			commitActions.some((a) => a.type === ChannelActionType.PERSIST_STATE),
-			'the record clear persists at the commit point'
-		).to.be.true;
-		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
+			h.opener.getFullState().v2InFlight,
+			'the rollback record survives replacement-round traffic'
+		).to.equal(preRecord);
 
 		// An unsolicited ack acknowledges nothing.
 		const g = driveToCommitmentExchange();
@@ -1304,6 +1305,114 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 	});
 
+	it('freezes commitment and signature release while an abort is pending, and serializes abort with RBF', () => {
+		// Opener signs first (smaller contribution) so a crossed
+		// commitment_signed would trigger its release.
+		const h = driveToCommitmentExchange({
+			acceptorPrev: makeRealPrevOut(300_000)
+		});
+		const abortActions = h.opener.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+
+		// Crossed commitment: no signature may leave behind our own abort.
+		const crossed = h.opener.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(h.acceptorCommit)
+		);
+		expect(findError(crossed)).to.equal(null);
+		expect(
+			findPayload(crossed, MessageType.TX_SIGNATURES),
+			'the release is frozen while the abort is un-echoed'
+		).to.equal(null);
+		expect(h.opener.getFullState().v2InFlight!.sentTxSignatures).to.be.false;
+
+		// The caller-driven release honors the same freeze.
+		expect(
+			findError(
+				h.opener.sendTxSignatures(
+					h.opener.getFullState().fundingTxid!,
+					h.opener.getFullState().fundingOutputIndex,
+					h.openerWitness()
+				)
+			)
+		).to.contain('frozen');
+
+		// Abort and RBF are mutually exclusive in both orders.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.contain(
+			'awaiting its echo'
+		);
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		expect(findError(g.opener.initiateTxRbf(2000))).to.equal(null);
+		expect(findError(g.opener.abortDualFunding('too eager'))).to.contain(
+			'awaiting its answer'
+		);
+		// A peer proposing RBF while OUR abort is pending is refused, never
+		// acked, so no ack for an attempt being unwound can ever exist.
+		const k = driveToCommitmentExchange();
+		deliverCommitments(k);
+		expect(findError(k.acceptor.abortDualFunding('going away'))).to.equal(null);
+		const refusal = k.acceptor.handleTxInitRbf({
+			channelId: k.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(findPayload(refusal, MessageType.TX_ACK_RBF)).to.equal(null);
+	});
+
+	it('keeps a zero-input attempt when the peer reestablishes without next_funding', async function () {
+		// Node-level: the acceptor contributed nothing, so the opener can
+		// broadcast the recorded funding tx without any witness bytes from
+		// the acceptor. A peer claiming (or appearing) to have forgotten the
+		// open must not make the acceptor discard what the opener can still
+		// publish.
+		const opener = new LightningNode(
+			makeNodeConfig(81, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(82));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		expect(
+			acceptorChannel.getFullState().v2InFlight!.ourWalletInputIndices
+		).to.have.length(0);
+
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		const msg = reestablishOf(channel.createReestablish());
+		delete msg.nextFundingTxid;
+		delete msg.nextFundingRetransmitFlags;
+		const answer = acceptorChannel.handleReestablish(msg);
+		expect(findError(answer)).to.equal(null);
+		expect(
+			acceptorChannel.getState(),
+			'the broadcastable attempt is not unwound'
+		).to.not.equal(ChannelState.ERRORED);
+		expect(acceptorChannel.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
 	it('refuses RBF on a completed open: nothing reaches the wire after channel_ready', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
@@ -1335,7 +1444,9 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		]);
 
 		const actions = h.opener.initiateTxRbf(2000);
-		expect(findError(actions)).to.contain('not renegotiable');
+		expect(findError(actions), 'the request is refused locally').to.not.equal(
+			null
+		);
 		expect(findPayload(actions, MessageType.TX_INIT_RBF)).to.equal(null);
 		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
 	});
@@ -2142,12 +2253,39 @@ function makeNodeBasepoints(seedId: number): {
 	};
 }
 
+// Lease-seller rates for tests whose ACCEPTOR must contribute inputs: a
+// zero-input acceptor's attempt is broadcastable by the opener alone, so it
+// refuses RBF; the lease is the node-level path to a contributing acceptor.
+const LEASE_RATES: ILeaseRates = {
+	fundingWeightWitness: 1000,
+	leaseFeeBasis: 100,
+	leaseFeeBaseSat: 500,
+	channelFeeMaxBaseMsat: 1_000,
+	channelFeeMaxProportionalThousandths: 10
+};
+
+/** openChannelV2 params buying a lease so the acceptor contributes. */
+function leaseOpenParams(): {
+	fundingSatoshis: bigint;
+	fundingFeeratePerkw: number;
+	requestFunds: { requestedSats: bigint; blockheight: number };
+	maxLeaseRates: ILeaseRates;
+} {
+	return {
+		fundingSatoshis: 150_000n,
+		fundingFeeratePerkw: 1000,
+		requestFunds: { requestedSats: 50_000n, blockheight: 800_000 },
+		maxLeaseRates: LEASE_RATES
+	};
+}
+
 function makeNodeConfig(
 	seedId: number,
 	opts: {
 		storage?: SqliteStorage;
 		recovery?: INodeConfig['recovery'];
 		fundingProvider?: IFundingProvider;
+		leaseRates?: ILeaseRates;
 	} = {}
 ): INodeConfig {
 	const seed = makeSeed(seedId);
@@ -2390,7 +2528,12 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
 			})
 		);
-		const acceptor = new LightningNode(makeNodeConfig(62));
+		const acceptor = new LightningNode(
+			makeNodeConfig(62, {
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
 		opener.on('node:error', () => {});
 		acceptor.on('node:error', () => {});
 		const wire = wireNodes(opener, acceptor);
@@ -2398,10 +2541,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		// our commitment_signed, so neither side releases tx_signatures.
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
@@ -2450,6 +2593,249 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	it('a zero-input acceptor refuses RBF; both sides keep the broadcastable attempt', async function () {
+		const opener = new LightningNode(
+			makeNodeConfig(83, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(84));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		wire.clearDrops();
+
+		// The acceptor contributed no inputs: the opener can broadcast
+		// attempt 0 without it, so accepting a replacement would let a
+		// tx it cannot stop confirm while it tracks a different one.
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		await settle(() => wire.sent(acceptor, MessageType.TX_ABORT) > 0);
+		expect(wire.sent(acceptor, MessageType.TX_ACK_RBF)).to.equal(0);
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_TX_SIGNATURES
+		);
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid))
+			.to.be.true;
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a failed persist at the replacement commitment rolls both sides back to the previous attempt', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(85, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(86, {
+				storage: acceptorStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		wire.clearDrops();
+
+		// The opener's disk accepts exactly ONE more commit (the ack that
+		// makes the replacement provisional) and then refuses: the failure
+		// lands on the commitment persist that would have replaced the
+		// rollback record. With no separate clear-write, BOTH sides still
+		// hold attempt 0 and roll back to it.
+		const recovery = (
+			opener as unknown as {
+				recovery: { commit: (...a: unknown[]) => unknown };
+			}
+		).recovery;
+		const realCommit = recovery.commit.bind(recovery);
+		let allowed = 1;
+		let refusing = false;
+		recovery.commit = (...args: unknown[]): unknown => {
+			if (!refusing) return realCommit(...args);
+			if (allowed > 0) {
+				allowed--;
+				return realCommit(...args);
+			}
+			return {
+				committed: false,
+				released: [],
+				frameSequence: null,
+				error: new Error('disk full')
+			};
+		};
+
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		refusing = true;
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		await settle(() => wire.sent(acceptor, MessageType.TX_ACK_RBF) > 0);
+		refusing = false;
+		// Let the deferred blocked-transition resync land: the opener
+		// re-restores the durable attempt from its row.
+		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setImmediate(resolve));
+
+		// The replacement never became durable on the opener (its row still
+		// carries attempt 0, and the blocked-transition resync restored it),
+		// while the acceptor's own commitment persist DID land (attempt 1).
+		// The sides now hold different attempts; because an accepted RBF
+		// requires both to have contributed inputs and neither released
+		// witnesses, NEITHER attempt is broadcastable by anyone.
+		managerOf(opener).handlePeerDisconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+		const openerRestored = managerOf(opener).getChannel(channelId);
+		expect(openerRestored).to.not.equal(undefined);
+		expect(
+			openerRestored!
+				.getFullState()
+				.v2InFlight!.fundingTxid.equals(attempt0Txid),
+			'the opener holds the durable attempt 0'
+		).to.be.true;
+		const kept = managerOf(acceptor).getChannel(channelId)!;
+		expect(
+			kept.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid),
+			'the acceptor durably committed the replacement'
+		).to.be.false;
+
+		// Reconnect: the divergent next_funding advertisements hard-fail the
+		// open on both sides, and with nothing broadcastable the terminal is
+		// a clean mutual void, never a broadcast into nothing.
+		const openerVoided: Buffer[] = [];
+		opener.on('channel:voided', (e: { channelId: Buffer }) => {
+			openerVoided.push(e.channelId);
+		});
+		const acceptorVoided: Buffer[] = [];
+		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+			acceptorVoided.push(e.channelId);
+		});
+		wire.hold();
+		managerOf(opener).handlePeerReconnected(acceptor.getNodeId());
+		managerOf(acceptor).handlePeerReconnected(opener.getNodeId());
+		wire.drain();
+		await settle(() => openerVoided.length > 0 && acceptorVoided.length > 0);
+		expect(openerVoided).to.have.length(1);
+		expect(acceptorVoided).to.have.length(1);
+		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(0);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('retains the channel when neither deletion nor cleanup intent can be persisted', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(87, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(makeNodeConfig(88));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		wire.clearDrops();
+
+		// Both the row deletion AND the tombstone write refuse: with no
+		// durable trace of the removal decision, a restart would silently
+		// restore the row as a live channel. The node must keep it TRACKED
+		// instead of orphaning it.
+		(
+			openerStorage as unknown as { deleteChannel: (id: string) => void }
+		).deleteChannel = (): void => {
+			throw new Error('disk full');
+		};
+		(
+			openerStorage as unknown as {
+				saveMetadata: (k: string, v: string) => void;
+			}
+		).saveMetadata = (): void => {
+			throw new Error('disk full');
+		};
+		const voided: Buffer[] = [];
+		opener.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		const abortActions = channel.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, abortActions);
+		await settle(
+			() => managerOf(opener).getChannel(channelId) !== undefined,
+			4000
+		);
+		expect(
+			managerOf(opener).getChannel(channelId),
+			'the channel stays tracked without a durable removal'
+		).to.not.equal(undefined);
+		expect(voided).to.have.length(0);
+		expect(openerStorage.loadAllChannels()).to.have.length(1);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
 	it('a lost first post-ack contribution rolls BOTH sides back to the previous attempt', async function () {
 		const openerStorage = new SqliteStorage(':memory:');
 		openerStorage.open();
@@ -2465,7 +2851,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(78, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -2473,10 +2861,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const wire = wireNodes(opener, acceptor);
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
@@ -2564,7 +2952,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(64, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -2572,10 +2962,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const wire = wireNodes(opener, acceptor);
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
@@ -2658,7 +3048,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(66, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -2666,10 +3058,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const wire = wireNodes(opener, acceptor);
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const attempt0Txid = Buffer.from(
@@ -2828,7 +3220,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(28, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -2839,10 +3233,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		// which is the only window an RBF can still be accepted in.
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const acceptorChannel = managerOf(acceptor).getChannel(channelId);
@@ -3233,7 +3627,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(30, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -3241,10 +3637,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const wire = wireNodes(opener, acceptor);
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
@@ -3325,7 +3721,9 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(32, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
@@ -3334,10 +3732,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		// Strand the exchange mid-round so the RBF stays acceptable.
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
 
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		const attemptTxid = Buffer.from(
@@ -3436,17 +3834,19 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const acceptor = new LightningNode(
 			makeNodeConfig(34, {
 				storage: acceptorStorage,
-				recovery: { enabled: true }
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
 			})
 		);
 		opener.on('node:error', () => {});
 		acceptor.on('node:error', () => {});
 		const wire = wireNodes(opener, acceptor);
 		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
-		const channel = opener.openChannelV2(acceptor.getNodeId(), {
-			fundingSatoshis: 150_000n,
-			fundingFeeratePerkw: 1000
-		});
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
 		managerOf(acceptor).handleMessage(
