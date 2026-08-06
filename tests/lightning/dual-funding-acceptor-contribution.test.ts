@@ -102,6 +102,22 @@ const TOTAL_FUNDING = OPENER_FUNDING + ACCEPTOR_FUNDING;
 const WALLET_UTXO_SATS = 60_000;
 const FUNDING_FEERATE = 1000;
 
+/**
+ * A structurally valid P2WPKH witness: DER-shaped SIGHASH_ALL signature plus
+ * a 33-byte compressed pubkey. handleTxSignatures validates peer witnesses
+ * against their negotiated prevouts, so released shapes must be spendable.
+ */
+function fakeDerWitness(): Buffer[] {
+	const sig = Buffer.concat([
+		Buffer.from([0x30, 0x44, 0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x01])
+	]);
+	return [sig, Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)])];
+}
+
 describe('Dual funding acceptor contribution (auto-driven, real keys)', function () {
 	it('contributes, signs and broadcasts the acceptor share end to end', function () {
 		const sharedTempId = crypto.randomBytes(32);
@@ -345,7 +361,7 @@ describe('Dual funding acceptor contribution (auto-driven, real keys)', function
 		const oSigsDeferred = opener.sendTxSignatures(
 			opener.getFullState().fundingTxid!,
 			opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		expect(findError(oSigsDeferred)).to.equal(null);
 		const oSigsPayload =

@@ -141,6 +141,22 @@ function makeInput(
 	};
 }
 
+/**
+ * A structurally valid P2WPKH witness: DER-shaped SIGHASH_ALL signature plus
+ * a 33-byte compressed pubkey. handleTxSignatures validates peer witnesses
+ * against their negotiated prevouts, so released shapes must be spendable.
+ */
+function fakeDerWitness(): Buffer[] {
+	const sig = Buffer.concat([
+		Buffer.from([0x30, 0x44, 0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x01])
+	]);
+	return [sig, Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)])];
+}
+
 interface IHarness {
 	opener: Channel;
 	acceptor: Channel;
@@ -461,7 +477,7 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 		const accTxid = h.acceptor.getFullState().fundingTxid!;
 		const accOidx = h.acceptor.getFullState().fundingOutputIndex;
 		const accSigActions = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-			[Buffer.alloc(72)]
+			fakeDerWitness()
 		]);
 		expect(findError(accSigActions)).to.equal(null);
 		const accTxSigs = findPayload(accSigActions, MessageType.TX_SIGNATURES);
@@ -472,7 +488,7 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 		const openTxid = h.opener.getFullState().fundingTxid!;
 		const openOidx = h.opener.getFullState().fundingOutputIndex;
 		const openSigDeferred = h.opener.sendTxSignatures(openTxid, openOidx, [
-			[Buffer.alloc(72)]
+			fakeDerWitness()
 		]);
 		expect(findError(openSigDeferred)).to.equal(null);
 		expect(

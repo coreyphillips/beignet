@@ -106,6 +106,13 @@ export interface IV2InFlight {
 	/** Our wallet-input witnesses, parallel to ourWalletInputIndices (empty for a zero-contribution side). */
 	ourWitnesses: Buffer[][];
 	ourWalletInputIndices: number[];
+	/**
+	 * ScriptPubkeys of the PEER's funding inputs, in tx-input order. The
+	 * interactive-tx prev_txs die with the process, so the peer's witnesses
+	 * can only be validated against their prevouts after a restart if the
+	 * scripts were captured while the builder was live.
+	 */
+	peerPrevoutScripts: Buffer[];
 	/** Peer's verified signature over OUR commitment #0; doubles as the received-commitment marker. */
 	remoteCommitmentSig: Buffer | null;
 	sentTxSignatures: boolean;

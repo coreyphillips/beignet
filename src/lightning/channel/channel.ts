@@ -6159,20 +6159,22 @@ export class Channel {
 				} else {
 					// We are fully signed; the peer only needs our tx_signatures.
 					actions.push(...this._retransmitV2TxSignatures());
-					// Flush a confirmation that arrived while disconnected (the
-					// depth callback is one-shot; the restore-state block has
-					// already returned the channel to its funding-track state).
-					if (inflight.confirmed) {
-						actions.push(...this.fundingConfirmed());
-					}
 				}
-			} else if (inflight) {
+			} else if (inflight && this._inFlightUnsignedV2Txid()) {
+				// BOTH sides advertised next_funding and the values disagree
+				// (e.g. divergent RBF attempts): BOLT 2 reserves the hard
+				// failure for exactly this case, since neither side can prove
+				// which negotiation the other's signatures cover.
 				return this._failChannelWithWireError(
 					'channel_reestablish next_funding_txid does not match the in-flight v2 open'
 				);
 			} else if (this._state.channelId) {
-				// A live session that never reached its commitment round holds
-				// nothing the peer's txid could name — tell it to forget.
+				// We did not advertise: we are fully signed (our reestablish
+				// correctly omits the TLV once the peer's tx_signatures were
+				// received), or a live session never reached its commitment
+				// round. Either way BOLT 2 answers the peer's unknown
+				// next_funding_txid with tx_abort so it can forget THAT
+				// negotiation; nothing of ours unwinds.
 				actions.push(
 					this._txAbort(this._state.channelId, 'unknown next_funding_txid')
 				);
@@ -6201,6 +6203,17 @@ export class Channel {
 					)
 				);
 			}
+		}
+
+		// A confirmation parked while the channel could not consume it (the
+		// depth callback is one-shot) flushes on ANY reestablish once the
+		// exchange is complete: after both sides hold tx_signatures, BOTH
+		// reestablish messages correctly omit next_funding, so none of the
+		// arms above runs for it. Re-read the record, since the omission arm
+		// may have unwound it.
+		const record = this._state.v2InFlight;
+		if (record?.confirmed && record.receivedTxSignatures) {
+			actions.push(...this.fundingConfirmed());
 		}
 
 		return actions;
@@ -11145,6 +11158,10 @@ export class Channel {
 			if (!built) return;
 			const signed = this._signV2ContributionWitnesses(built);
 			if (!signed) return;
+			// The peer's prevout scripts must survive the process: witness
+			// validation after a restart has nothing else to type them by.
+			const peerScripts = this._v2PeerPrevoutScripts();
+			if (!peerScripts) return;
 			const params = session.getLocalParams();
 			this._state.v2InFlight = {
 				fundingTxid: Buffer.from(built.tx.getHash()),
@@ -11162,6 +11179,7 @@ export class Channel {
 				weSignFirst: this._v2ShouldSignFirst(),
 				ourWitnesses: signed.witnesses,
 				ourWalletInputIndices: signed.indices,
+				peerPrevoutScripts: peerScripts.map((s) => Buffer.from(s)),
 				remoteCommitmentSig: null,
 				sentTxSignatures: false,
 				receivedTxSignatures: false,
@@ -11196,52 +11214,134 @@ export class Channel {
 	}
 
 	/**
-	 * Sanity-check the peer's tx_signatures witnesses BEFORE they enter the
-	 * session: the exact per-input count (one stack per peer input), no empty
-	 * stacks (every negotiated input is segwit, so an empty witness cannot
-	 * spend it), bounded element sizes, and SIGHASH_ALL on signature-shaped
-	 * elements (DER signatures and 65-byte schnorr carry an explicit type
-	 * byte; 64-byte schnorr is implicit SIGHASH_DEFAULT, which commits to
-	 * everything). Returns the problem, or null when acceptable.
+	 * ScriptPubkeys of the PEER's funding inputs, in tx-input order: from the
+	 * live builder's prevouts while it exists, from the durable record after
+	 * a restart (captured at record creation, when the prev_txs were last in
+	 * hand). Null when they cannot be resolved, in which case nothing about
+	 * the peer's witnesses can be judged and the exchange must not advance.
+	 */
+	private _v2PeerPrevoutScripts(): Buffer[] | null {
+		const session = this._state.dualFundingSession;
+		const builder = session?.getTxBuilder();
+		if (session && builder) {
+			const built = this._v2NegotiatedTx();
+			if (!built) return null;
+			const sorted = [...builder.getInputs()].sort((a, b) =>
+				a.serialId < b.serialId ? -1 : 1
+			);
+			if (sorted.length !== built.tx.ins.length) return null;
+			const prevouts = this._collectPrevouts(built.tx, sorted);
+			if (!prevouts) return null;
+			const scripts: Buffer[] = [];
+			for (let i = 0; i < sorted.length; i++) {
+				if ((sorted[i].serialId % 2n === 0n) !== session.isInitiator()) {
+					scripts.push(prevouts.scripts[i]);
+				}
+			}
+			return scripts;
+		}
+		return this._state.v2InFlight?.peerPrevoutScripts ?? null;
+	}
+
+	/**
+	 * Validate the peer's tx_signatures witnesses BEFORE they enter the
+	 * session, each against its negotiated prevout: exactly one stack per
+	 * peer input, and per output type the shape a valid SIGHASH_ALL spend
+	 * must have (P2WPKH [DER-ALL sig, pubkey]; P2TR key-spend 64-byte
+	 * SIGHASH_DEFAULT, which commits to everything ALL does, or 65-byte with
+	 * an explicit ALL byte; P2WSH under standardness bounds with DER-shaped
+	 * items required to be ALL; taproot script-path judged structurally, its
+	 * leaf semantics cannot be typed generically). Returns the problem, or
+	 * null when acceptable.
 	 */
 	private _validateV2PeerWitnesses(witnesses: Buffer[][]): string | null {
-		const session = this._state.dualFundingSession;
-		const record = this._state.v2InFlight;
-		let peerInputs: number | null = null;
-		const builder = session?.getTxBuilder();
-		if (builder && session) {
-			let count = 0;
-			for (const input of builder.getInputs()) {
-				if ((input.serialId % 2n === 0n) !== session.isInitiator()) count++;
-			}
-			peerInputs = count;
-		} else if (record) {
-			try {
-				const bitcoin = require('bitcoinjs-lib');
-				const tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
-				peerInputs = tx.ins.length - record.ourWalletInputIndices.length;
-			} catch {
-				return 'recorded funding tx is unreadable';
-			}
+		const scripts = this._v2PeerPrevoutScripts();
+		if (!scripts) return 'peer funding inputs cannot be resolved';
+		if (witnesses.length !== scripts.length) {
+			return `expected ${scripts.length} witness stacks, got ${witnesses.length}`;
 		}
-		if (peerInputs !== null && witnesses.length !== peerInputs) {
-			return `expected ${peerInputs} witness stacks, got ${witnesses.length}`;
-		}
-		for (const stack of witnesses) {
-			if (stack.length === 0) return 'empty witness stack';
-			for (const element of stack) {
-				if (element.length > 520) return 'witness element exceeds 520 bytes';
-			}
-			const first = stack[0];
-			if (first.length > 0 && first[0] === 0x30) {
-				if (first[first.length - 1] !== 0x01) {
-					return 'signature is not SIGHASH_ALL';
-				}
-			} else if (first.length === 65) {
-				if (first[64] !== 0x01) return 'signature is not SIGHASH_ALL';
-			}
+		for (let i = 0; i < witnesses.length; i++) {
+			const problem = this._validateWitnessForPrevout(witnesses[i], scripts[i]);
+			if (problem) return problem;
 		}
 		return null;
+	}
+
+	private _validateWitnessForPrevout(
+		stack: Buffer[],
+		script: Buffer
+	): string | null {
+		if (stack.length === 0) return 'empty witness stack';
+		const isP2wpkh =
+			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+		const isP2wsh =
+			script.length === 34 && script[0] === 0x00 && script[1] === 0x20;
+		const isP2tr =
+			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
+		if (isP2wpkh) {
+			if (stack.length !== 2) {
+				return 'P2WPKH witness must be [signature, pubkey]';
+			}
+			if (!this._isDerSighashAll(stack[0])) {
+				return 'P2WPKH signature is not a DER SIGHASH_ALL signature';
+			}
+			if (
+				stack[1].length !== 33 ||
+				(stack[1][0] !== 0x02 && stack[1][0] !== 0x03)
+			) {
+				return 'P2WPKH witness pubkey is malformed';
+			}
+			return null;
+		}
+		if (isP2tr) {
+			if (stack.length === 1) {
+				const sig = stack[0];
+				if (sig.length === 64) return null;
+				if (sig.length === 65 && sig[64] === 0x01) return null;
+				return 'P2TR key-spend signature is not SIGHASH_DEFAULT or SIGHASH_ALL';
+			}
+			const control = stack[stack.length - 1];
+			if (control.length < 33 || (control.length - 33) % 32 !== 0) {
+				return 'P2TR control block is malformed';
+			}
+			for (const element of stack) {
+				if (element.length > 3600) return 'P2TR witness element oversized';
+			}
+			return null;
+		}
+		if (isP2wsh) {
+			const witnessScript = stack[stack.length - 1];
+			if (witnessScript.length === 0 || witnessScript.length > 3600) {
+				return 'P2WSH witness script oversized or empty';
+			}
+			for (let i = 0; i < stack.length - 1; i++) {
+				if (stack[i].length > 80) {
+					return 'P2WSH witness stack item exceeds standardness bounds';
+				}
+				if (
+					stack[i].length > 0 &&
+					stack[i][0] === 0x30 &&
+					!this._isDerSighashAll(stack[i])
+				) {
+					return 'P2WSH signature is not a DER SIGHASH_ALL signature';
+				}
+			}
+			return null;
+		}
+		return 'peer funding input is not a supported segwit output';
+	}
+
+	/** Structural DER signature check with an explicit SIGHASH_ALL byte. */
+	private _isDerSighashAll(el: Buffer): boolean {
+		if (el.length < 9 || el.length > 73) return false;
+		if (el[0] !== 0x30 || el[1] !== el.length - 3) return false;
+		if (el[2] !== 0x02) return false;
+		const rLen = el[3];
+		if (rLen === 0 || 5 + rLen >= el.length) return false;
+		if (el[4 + rLen] !== 0x02) return false;
+		const sLen = el[5 + rLen];
+		if (sLen === 0 || 6 + rLen + sLen !== el.length - 1) return false;
+		return el[el.length - 1] === 0x01;
 	}
 
 	/**
@@ -11709,6 +11809,17 @@ export class Channel {
 				actions.push(...this.sendSpliceLocked());
 			}
 			return actions;
+		}
+
+		// BOLT 2: tx_signatures MUST be ignored once either side has sent or
+		// received channel_ready; the opening exchange is over. Checked before
+		// the session requirement, and before anything with an effect: the
+		// record is cleared at NORMAL while the live session object remains,
+		// so without this gate a replay of the original (valid) message would
+		// recreate the record, re-persist, rebroadcast, and pull the channel
+		// from NORMAL back to AWAITING_FUNDING_CONFIRMED.
+		if (this._state.localChannelReady || this._state.remoteChannelReady) {
+			return [];
 		}
 
 		const session = this._state.dualFundingSession;

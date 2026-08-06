@@ -134,12 +134,13 @@ function makeBasepoints(fundingPub: Buffer, seed: Buffer): IChannelBasepoints {
 	};
 }
 
-function makePrevTx(valueSats: number): Buffer {
+function makePrevTx(valueSats: number, script?: Buffer): Buffer {
 	const tx = new bitcoin.Transaction();
 	tx.version = 2;
 	tx.addInput(crypto.randomBytes(32), 0);
 	tx.addOutput(
-		Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+		script ??
+			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
 		valueSats
 	);
 	return tx.toBuffer();
@@ -158,6 +159,23 @@ function makeInput(
 		prevTx,
 		prevTxVout: 0
 	};
+}
+
+/**
+ * A structurally valid P2WPKH witness: DER-shaped SIGHASH_ALL signature plus
+ * a 33-byte compressed pubkey. The validation types witnesses against their
+ * negotiated prevouts, so the caller-driven tests must release shapes a real
+ * wallet would.
+ */
+function fakeDerWitness(): Buffer[] {
+	const sig = Buffer.concat([
+		Buffer.from([0x30, 0x44, 0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x02, 0x20]),
+		crypto.randomBytes(32),
+		Buffer.from([0x01])
+	]);
+	return [sig, Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)])];
 }
 
 interface IHarness {
@@ -182,7 +200,9 @@ const TOTAL_FUNDING = OPENER_FUNDING + ACCEPTOR_FUNDING;
  * Same wiring as dual-funding-commitment.test.ts: both sides contribute one
  * input; the acceptor (lower input sats) signs tx_signatures first.
  */
-function driveToCommitmentExchange(): IHarness {
+function driveToCommitmentExchange(
+	opts: { acceptorPrevOutScript?: Buffer } = {}
+): IHarness {
 	const sharedTempId = crypto.randomBytes(32);
 
 	const openerFundingPriv = crypto.randomBytes(32);
@@ -261,7 +281,10 @@ function driveToCommitmentExchange(): IHarness {
 	expect(findError(opener.handleAcceptChannel2(acceptMsg))).to.equal(null);
 
 	const openerInput = makeInput(0n, makePrevTx(120_000));
-	const acceptorInput = makeInput(1n, makePrevTx(60_000));
+	const acceptorInput = makeInput(
+		1n,
+		makePrevTx(60_000, opts.acceptorPrevOutScript)
+	);
 	const funding = createFundingScript(openerFundingPub, acceptorFundingPub);
 	const fundingOutput: IInteractiveTxOutput = {
 		serialId: 2n,
@@ -347,7 +370,7 @@ function completeExchange(h: IHarness): void {
 	const accTxid = h.acceptor.getFullState().fundingTxid!;
 	const accOidx = h.acceptor.getFullState().fundingOutputIndex;
 	const accSig = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-		[Buffer.alloc(72)]
+		fakeDerWitness()
 	]);
 	expect(findError(accSig)).to.equal(null);
 	const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES);
@@ -363,7 +386,7 @@ function completeExchange(h: IHarness): void {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		expect(findError(openSig)).to.equal(null);
 		openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES);
@@ -464,7 +487,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accTxid = h.acceptor.getFullState().fundingTxid!;
 		const accOidx = h.acceptor.getFullState().fundingOutputIndex;
 		const accSig = h.acceptor.sendTxSignatures(accTxid, accOidx, [
-			[Buffer.alloc(72)]
+			fakeDerWitness()
 		]);
 		const original = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(original).to.not.equal(null);
@@ -498,7 +521,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES)!;
 		expect(openTxSigs).to.not.equal(null);
@@ -592,7 +615,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			accTxid,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 
@@ -741,7 +764,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		const revAfterPeer = revived.handleTxSignatures(
@@ -751,7 +774,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const revSig = revived.sendTxSignatures(
 			revived.getFullState().fundingTxid!,
 			revived.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const revTxSigs = findPayload(revSig, MessageType.TX_SIGNATURES)!;
 		expect(revTxSigs).to.not.equal(null);
@@ -880,7 +903,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = g.acceptor.sendTxSignatures(
 			g.acceptor.getFullState().fundingTxid!,
 			g.acceptor.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		expect(findPayload(accSig, MessageType.TX_SIGNATURES)).to.not.equal(null);
 		expect(findError(g.acceptor.initiateTxRbf(2000))).to.contain(
@@ -966,7 +989,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(accTxSigs).to.not.equal(null);
@@ -978,7 +1001,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const openTxSigs = findPayload(openSig, MessageType.TX_SIGNATURES)!;
 		expect(openTxSigs, 'the opener released its tx_signatures').to.not.equal(
@@ -1078,7 +1101,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const accSig = h.acceptor.sendTxSignatures(
 			h.acceptor.getFullState().fundingTxid!,
 			h.acceptor.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
 		expect(
@@ -1089,7 +1112,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const openSig = h.opener.sendTxSignatures(
 			h.opener.getFullState().fundingTxid!,
 			h.opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[fakeDerWitness()]
 		);
 		expect(
 			findPayload(openSig, MessageType.CHANNEL_READY),
@@ -1116,33 +1139,45 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 		const restored = deserializeChannelState(json);
 		expect(restored.v2InFlight ?? null).to.equal(null);
+
+		// The live-disconnect half of the same boundary: the drop branch
+		// errors the in-memory channel (nothing of the renegotiated attempt
+		// was signed).
 		const revived = new Channel(restored, h.acceptorSigner);
 		revived.restoreV2InFlight();
-		// restoreChannel routes DUAL_FUNDING_V2 rows through markForReestablish,
-		// whose drop branch abandons them: nothing of the renegotiated attempt
-		// was signed, so the row must error out instead of restoring as a
-		// channel that sends nothing and cannot handle the next message.
 		revived.markForReestablish();
 		expect(revived.getState()).to.equal(ChannelState.ERRORED);
+
+		// The restart half: the node removes the row DURABLY and restores no
+		// channel from it. Nothing exists for either side to resume, and the
+		// zombie cannot repeat on the next restart because the row is gone.
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		storage.saveChannel(
+			h.acceptor.getChannelId()!.toString('hex'),
+			deserializeChannelState(json),
+			'02'.repeat(33)
+		);
+		const node = new LightningNode(
+			makeNodeConfig(26, { storage, recovery: { enabled: true } })
+		);
+		node.on('node:error', () => {});
+		expect(node.getChannelManager().listChannels()).to.have.length(0);
+		expect(storage.loadAllChannels()).to.have.length(0);
+		node.destroy();
 	});
 
-	it('refuses invalid peer tx_signatures before they enter the session', () => {
+	it('validates peer tx_signatures against their negotiated prevouts', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 		const cid = h.opener.getChannelId()!;
 		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
 
-		// Wrong stack count (the peer owns exactly one input).
-		const derAll = Buffer.alloc(71);
-		derAll[0] = 0x30;
-		derAll[70] = 0x01;
+		// Wrong stack count (the peer owns exactly one P2WPKH input).
 		let actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [
-				[derAll, Buffer.alloc(33)],
-				[derAll, Buffer.alloc(33)]
-			]
+			witnesses: [fakeDerWitness(), fakeDerWitness()]
 		});
 		expect(findError(actions)).to.contain('witness stacks');
 
@@ -1154,38 +1189,197 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		});
 		expect(findError(actions)).to.contain('empty witness stack');
 
-		// A DER signature must commit with SIGHASH_ALL.
-		const derSingle = Buffer.alloc(71);
-		derSingle[0] = 0x30;
-		derSingle[70] = 0x83;
+		// The zero-filled placeholder the old shape check let through is not
+		// a P2WPKH spend at all.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[derSingle, Buffer.alloc(33)]]
+			witnesses: [[Buffer.alloc(72)]]
 		});
-		expect(findError(actions)).to.contain('SIGHASH_ALL');
+		expect(findError(actions)).to.contain('P2WPKH witness');
 
-		// A 65-byte schnorr signature carries an explicit type byte.
-		const schnorrOdd = Buffer.alloc(65, 7);
-		schnorrOdd[64] = 0x02;
+		// A zero-filled 72-byte element beside a pubkey is not a DER
+		// signature either.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[schnorrOdd]]
+			witnesses: [[Buffer.alloc(72), fakeDerWitness()[1]]]
 		});
-		expect(findError(actions)).to.contain('SIGHASH_ALL');
+		expect(findError(actions)).to.contain('DER SIGHASH_ALL');
+
+		// A structurally valid DER signature with a non-ALL sighash byte.
+		const derSingle = fakeDerWitness()[0];
+		derSingle[derSingle.length - 1] = 0x83;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[derSingle, fakeDerWitness()[1]]]
+		});
+		expect(findError(actions)).to.contain('DER SIGHASH_ALL');
+
+		// A malformed pubkey.
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[fakeDerWitness()[0], Buffer.alloc(33)]]
+		});
+		expect(findError(actions)).to.contain('pubkey');
 
 		// None of the refusals recorded anything: the peer can retransmit.
 		expect(h.opener.getFullState().v2InFlight!.receivedTxSignatures).to.be
 			.false;
 
-		// A well-formed set is accepted.
+		// A well-formed spend of the negotiated prevout is accepted.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[derAll, Buffer.alloc(33)]]
+			witnesses: [fakeDerWitness()]
 		});
 		expect(findError(actions)).to.equal(null);
+	});
+
+	it('types P2TR peer inputs: key-spend DEFAULT or explicit ALL only', () => {
+		const p2tr = Buffer.concat([
+			Buffer.from([0x51, 0x20]),
+			crypto.randomBytes(32)
+		]);
+		const h = driveToCommitmentExchange({ acceptorPrevOutScript: p2tr });
+		deliverCommitments(h);
+		const cid = h.opener.getChannelId()!;
+		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+
+		// 65-byte schnorr with a non-ALL type byte is refused.
+		const schnorrOdd = Buffer.alloc(65, 7);
+		schnorrOdd[64] = 0x02;
+		let actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[schnorrOdd]]
+		});
+		expect(findError(actions)).to.contain('SIGHASH_DEFAULT or SIGHASH_ALL');
+
+		// A script-path shape with a malformed control block is refused (a
+		// two-element stack is judged structurally as script plus control).
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[Buffer.alloc(70), crypto.randomBytes(32)]]
+		});
+		expect(findError(actions)).to.contain('control block');
+
+		// 64-byte schnorr is SIGHASH_DEFAULT, which commits to everything
+		// SIGHASH_ALL does: accepted.
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[Buffer.alloc(64, 7)]]
+		});
+		expect(findError(actions)).to.equal(null);
+	});
+
+	it('ignores tx_signatures once either side sent channel_ready', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		// Capture the acceptor's valid tx_signatures for the later replay.
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			[fakeDerWitness()]
+		);
+		const accTxSigs = decodeTxSignaturesMessage(
+			findPayload(accSig, MessageType.TX_SIGNATURES)!
+		);
+		expect(findError(h.opener.handleTxSignatures(accTxSigs))).to.equal(null);
+		const openSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			[fakeDerWitness()]
+		);
+		expect(
+			findError(
+				h.acceptor.handleTxSignatures(
+					decodeTxSignaturesMessage(
+						findPayload(openSig, MessageType.TX_SIGNATURES)!
+					)
+				)
+			)
+		).to.equal(null);
+
+		// channel_ready both ways: NORMAL, record cleared, session lives on.
+		const opReady = decodeChannelReadyMessage(
+			findPayload(h.opener.fundingConfirmed(), MessageType.CHANNEL_READY)!
+		);
+		const acReady = decodeChannelReadyMessage(
+			findPayload(h.acceptor.fundingConfirmed(), MessageType.CHANNEL_READY)!
+		);
+		h.opener.handleChannelReady(acReady);
+		h.acceptor.handleChannelReady(opReady);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
+		expect(h.opener.getFullState().dualFundingSession).to.not.equal(null);
+
+		// Replaying the original valid tx_signatures must be ignored: BOLT 2
+		// ends the opening exchange at channel_ready, and without the gate
+		// the replay recreated the record and pulled the channel back to
+		// AWAITING_FUNDING_CONFIRMED.
+		const replay = h.opener.handleTxSignatures(accTxSigs);
+		expect(replay).to.deep.equal([]);
+		expect(h.opener.getState()).to.equal(ChannelState.NORMAL);
+		expect(h.opener.getFullState().v2InFlight ?? null).to.equal(null);
+	});
+
+	it('answers an alien next_funding_txid from a fully signed side with tx_abort, not failure', () => {
+		const h = driveToCommitmentExchange();
+		driveToFullySignedWithLostFinal(h);
+		h.opener.markForReestablish();
+
+		// The fully signed opener did not advertise next_funding, so BOLT 2
+		// reserves the hard failure for the both-advertised mismatch; an
+		// unknown peer txid gets tx_abort naming THAT negotiation, and
+		// nothing of the completed open unwinds.
+		const alien: IChannelReestablishMessage = {
+			channelId: h.opener.getChannelId()!,
+			nextCommitmentNumber: 1n,
+			nextRevocationNumber: 0n,
+			yourLastPerCommitmentSecret: Buffer.alloc(32),
+			myCurrentPerCommitmentPoint: getPerCommitmentPoint(h.acceptorSeed, 0n),
+			nextFundingTxid: crypto.randomBytes(32),
+			nextFundingRetransmitFlags: 0
+		};
+		const actions = h.opener.handleReestablish(alien);
+		expect(findPayload(actions, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.opener.getState()).to.not.equal(ChannelState.ERRORED);
+		expect(h.opener.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+	});
+
+	it('flushes a parked confirmation when both reestablish messages omit next_funding', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		completeExchange(h);
+		h.opener.markForReestablish();
+		h.acceptor.markForReestablish();
+
+		// Confirmed while disconnected, after a COMPLETE exchange: both sides
+		// hold tx_signatures, so both reestablish messages correctly omit
+		// next_funding and no retransmission arm will run.
+		expect(
+			h.opener
+				.fundingConfirmed()
+				.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+		).to.be.true;
+		expect(h.opener.getFullState().v2InFlight!.confirmed).to.be.true;
+
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		expect(acMsg.nextFundingTxid ?? undefined).to.equal(undefined);
+		const opHandle = h.opener.handleReestablish(acMsg);
+		expect(findError(opHandle)).to.equal(null);
+		expect(
+			findPayload(opHandle, MessageType.CHANNEL_READY),
+			'the parked confirmation flushes with no next_funding in sight'
+		).to.not.equal(null);
 	});
 });
 

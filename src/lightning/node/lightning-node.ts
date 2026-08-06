@@ -1275,6 +1275,25 @@ export class LightningNode extends EventEmitter {
 			state,
 			peerPubkey
 		} of this.storage.loadAllChannels()) {
+			// A DUAL_FUNDING_V2 row is RBF-renegotiation residue: the accepted
+			// tx_init_rbf persisted the per-attempt record clear, and the
+			// renegotiated session died with the process before anything was
+			// signed. There is no channel in it: no funding tx, no signatures,
+			// nothing the peer can complete. Remove the row durably (the
+			// voidMissingFundingChannel pattern) instead of restoring a
+			// permanent channel that sends nothing, answers nothing, and
+			// repeats this on every restart; a peer that still asks gets the
+			// manager's unknown-channel error and gives the attempt up.
+			if (state.state === ChannelState.DUAL_FUNDING_V2) {
+				this.safeStorage(
+					() => this.storage!.deleteChannel(channelId),
+					'deleteChannel'
+				);
+				this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
+					channelId
+				});
+				continue;
+			}
 			const channel = new Channel(state);
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
