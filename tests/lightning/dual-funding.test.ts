@@ -1406,11 +1406,27 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const channelId = channel.getTemporaryChannelId();
 			channel.handleAcceptChannel2(makeAcceptChannel2Msg({ channelId }));
 
-			// Add input and output
+			// Add input and output. The input carries its previous transaction,
+			// as the wire message always does: the negotiated-tx audit refuses
+			// inputs whose prevouts cannot be verified.
+			const prevTx = makePeerPrevTx(200_000);
 			channel.addTxInput({
 				serialId: 0n,
-				prevTxid: crypto.randomBytes(32),
+				prevTxid: Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash()),
 				prevOutputIndex: 0,
+				sequence: 0xfffffffd,
+				prevTx,
+				prevTxVout: 0
+			});
+			// The peer's input backs the 50k contribution accept_channel2
+			// pledged: with real prevouts the audit checks each side's
+			// solvency, which the old prevtx-less fixture skipped.
+			const peerPrevTx = makePeerPrevTx(60_000);
+			channel.handleTxAddInput({
+				channelId,
+				serialId: 1n,
+				prevTx: peerPrevTx,
+				prevTxVout: 0,
 				sequence: 0xfffffffd
 			});
 			channel.addTxOutput({

@@ -1334,6 +1334,88 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(findError(actions)).to.equal(null);
 	});
 
+	it('refuses high-S signatures and contains malformed program points', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const cid = h.opener.getChannelId()!;
+		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+		const genuine = h.acceptorWitness();
+
+		// The genuine signature with s replaced by n - s: identical validity
+		// under lax rules, refused under strict (BIP 62 low-S) verification.
+		const N = BigInt(
+			'0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141'
+		);
+		const decoded = bitcoin.script.signature.decode(genuine[0][0]);
+		const r = decoded.signature.subarray(0, 32);
+		const sVal = BigInt('0x' + decoded.signature.subarray(32).toString('hex'));
+		const highS = Buffer.from((N - sVal).toString(16).padStart(64, '0'), 'hex');
+		const highSig = bitcoin.script.signature.encode(
+			Buffer.concat([r, highS]),
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		let actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[highSig, genuine[0][1]]]
+		});
+		expect(findError(actions)).to.contain('does not verify');
+
+		// A prevout program built from an off-curve point: the verifier throw
+		// is contained and the negotiation fails, instead of the exception
+		// escaping the validator.
+		let badPub: Buffer;
+		do {
+			badPub = Buffer.concat([Buffer.from([0x02]), crypto.randomBytes(32)]);
+		} while (ecc.isPoint(badPub));
+		const badScript = bitcoin.payments.p2wpkh({
+			hash: bitcoin.crypto.hash160(badPub)
+		}).output!;
+		const badPrevTx = new bitcoin.Transaction();
+		badPrevTx.version = 2;
+		badPrevTx.addInput(crypto.randomBytes(32), 0);
+		badPrevTx.addOutput(badScript, 60_000);
+		const badPrev: IRealPrevOut = {
+			prevTx: badPrevTx.toBuffer(),
+			script: badScript,
+			pub: badPub,
+			sign: () => []
+		};
+		const g = driveToCommitmentExchange({ acceptorPrev: badPrev });
+		deliverCommitments(g);
+		actions = g.opener.handleTxSignatures({
+			channelId: g.opener.getChannelId()!,
+			txid: Buffer.from(g.opener.getFullState().v2InFlight!.fundingTxid),
+			witnesses: [[genuine[0][0], badPub]]
+		});
+		expect(findError(actions)).to.contain('does not verify');
+		expect(g.opener.getFullState().v2InFlight!.receivedTxSignatures).to.be
+			.false;
+	});
+
+	it('refuses P2WSH funding inputs at negotiation, before anything signs', () => {
+		const script = Buffer.concat([
+			Buffer.from([0x00, 0x20]),
+			crypto.randomBytes(32)
+		]);
+		const prevTx = new bitcoin.Transaction();
+		prevTx.version = 2;
+		prevTx.addInput(crypto.randomBytes(32), 0);
+		prevTx.addOutput(script, 60_000);
+		const p2wsh: IRealPrevOut = {
+			prevTx: prevTx.toBuffer(),
+			script,
+			pub: Buffer.alloc(33),
+			sign: () => []
+		};
+		// The negotiated-tx audit at tx_complete refuses the input type, so
+		// the open never reaches the commitment round (the harness trips on
+		// the audit error while completing).
+		expect(() => driveToCommitmentExchange({ acceptorPrev: p2wsh })).to.throw(
+			/unsupported output type/
+		);
+	});
+
 	it('verifies P2TR peer inputs: explicit SIGHASH_ALL key-spend only', () => {
 		const h = driveToCommitmentExchange({
 			acceptorPrev: makeRealP2trPrevOut(60_000)
@@ -1372,14 +1454,16 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		});
 		expect(findError(actions)).to.contain('does not verify');
 
-		// A script-path shape with a malformed control block is refused (a
-		// two-element stack is judged structurally as script plus control).
+		// Script-path spends fail closed: the leaf semantics cannot be
+		// verified generically, so no multi-element stack is accepted.
 		actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
-			witnesses: [[Buffer.alloc(70), crypto.randomBytes(32)]]
+			witnesses: [[Buffer.alloc(70), crypto.randomBytes(33)]]
 		});
-		expect(findError(actions)).to.contain('control block');
+		expect(findError(actions)).to.contain(
+			'script-path spends are not supported'
+		);
 
 		// The genuine explicit-ALL key-spend verifies and is accepted.
 		actions = h.opener.handleTxSignatures({
@@ -1825,10 +1909,111 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 
 		// A live disconnect mid-renegotiation removes the channel AND its row:
 		// nothing of the new attempt was signed, and an ERRORED leftover would
-		// answer nothing forever while its row repeated on every restart.
+		// answer nothing forever while its row repeated on every restart. The
+		// removal surfaces as the documented terminal lifecycle event.
+		const voided: Buffer[] = [];
+		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
 		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
 		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
 		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
+		expect(voided).to.have.length(1);
+		expect(voided[0].equals(channelId)).to.be.true;
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a failed RBF persist keeps the previous durable attempt recoverable', async function () {
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(29, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(30, {
+				storage: acceptorStorage,
+				recovery: { enabled: true }
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		expect(acceptorChannel.getFullState().v2InFlight).to.not.be.oneOf([
+			null,
+			undefined
+		]);
+
+		// The disk refuses from here: the RBF clear never commits, so
+		// tx_ack_rbf is withheld with it and the durable truth stays the
+		// previous attempt.
+		const recovery = (
+			acceptor as unknown as {
+				recovery: { commit: (...a: unknown[]) => unknown };
+			}
+		).recovery;
+		const realCommit = recovery.commit.bind(recovery);
+		let refuse = true;
+		recovery.commit = (...args: unknown[]): unknown =>
+			refuse
+				? {
+						committed: false,
+						released: [],
+						frameSequence: null,
+						error: new Error('disk full')
+				  }
+				: realCommit(...args);
+
+		managerOf(acceptor).handleMessage(
+			opener.getNodeId(),
+			MessageType.TX_INIT_RBF,
+			encodeTxInitRbfMessage({ channelId, locktime: 0, feerate: 2000 })
+		);
+		expect(acceptorChannel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		expect(
+			wire.sent(acceptor, MessageType.TX_ACK_RBF),
+			'tx_ack_rbf is withheld behind the failed persist'
+		).to.equal(0);
+		refuse = false;
+
+		const voided: Buffer[] = [];
+		acceptor.on('channel:voided', (e: { channelId: Buffer }) => {
+			voided.push(e.channelId);
+		});
+		managerOf(acceptor).handlePeerDisconnected(opener.getNodeId());
+
+		// The peer never adopted the renegotiation: the previous attempt is
+		// still the durable truth, and it is re-restored rather than deleted.
+		const rows = acceptorStorage.loadAllChannels();
+		expect(rows).to.have.length(1);
+		expect(rows[0].state.state).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(rows[0].state.v2InFlight).to.not.be.oneOf([null, undefined]);
+		const restored = managerOf(acceptor).getChannel(channelId);
+		expect(restored, 'the durable attempt restored in place').to.not.equal(
+			undefined
+		);
+		expect(restored!.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		expect(voided, 'no terminal event for a recoverable open').to.have.length(
+			0
+		);
 
 		opener.destroy();
 		acceptor.destroy();

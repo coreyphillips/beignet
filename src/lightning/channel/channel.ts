@@ -10982,6 +10982,15 @@ export class Channel {
 			const remoteOwned = (input.serialId % 2n === 0n) !== weAreInitiator;
 			const isShared =
 				kind === 'splice' && (!input.prevTx || input.prevTx.length === 0);
+			if (kind === 'v2' && !isShared) {
+				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
+				// prevouts; every other type would have to be accepted on
+				// shape alone. Refuse the negotiation HERE, before the
+				// commitment round signs anything for this transaction, rather
+				// than at tx_signatures when signatures may already be out.
+				const unsupported = this._v2CheckInputSpendable(input);
+				if (unsupported) return unsupported;
+			}
 			weight += isShared ? SHARED_FUNDING_INPUT_WEIGHT : P2WPKH_INPUT_WEIGHT;
 			if (isShared) {
 				// Pre-splice capacity rolls over; it is nobody's new contribution.
@@ -11324,6 +11333,35 @@ export class Channel {
 		return null;
 	}
 
+	/**
+	 * v2 funding inputs must pay P2WPKH or P2TR: those are the only prevout
+	 * types whose tx_signatures witnesses can be cryptographically verified,
+	 * and an unverifiable input must never make it into the negotiated tx.
+	 */
+	private _v2CheckInputSpendable(input: IInteractiveTxInput): string | null {
+		if (!input.prevTx || input.prevTx.length < 32) {
+			return 'v2 funding input carries no previous transaction';
+		}
+		const bitcoin = require('bitcoinjs-lib');
+		let script: Buffer;
+		try {
+			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
+			const out = prev.outs[input.prevTxVout ?? input.prevOutputIndex];
+			if (!out) return 'v2 funding input names a missing prevout';
+			script = Buffer.from(out.script);
+		} catch {
+			return 'v2 funding input previous transaction is unreadable';
+		}
+		const isP2wpkh =
+			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
+		const isP2tr =
+			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
+		if (!isP2wpkh && !isP2tr) {
+			return 'v2 funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
+		}
+		return null;
+	}
+
 	private _validateWitnessForInput(
 		tx: import('bitcoinjs-lib').Transaction,
 		index: number,
@@ -11363,7 +11401,16 @@ export class Channel {
 				Number(value),
 				bitcoin.Transaction.SIGHASH_ALL
 			);
-			if (!ecc.verify(sighash, pubkey, decoded)) {
+			let valid = false;
+			try {
+				// strict: high-S signatures are refused (BIP 62 standardness).
+				valid = ecc.verify(sighash, pubkey, decoded, true);
+			} catch {
+				// A malformed peer-controlled point must fail the negotiation,
+				// not escape the validator as an exception.
+				valid = false;
+			}
+			if (!valid) {
 				return 'P2WPKH signature does not verify against its prevout';
 			}
 			return null;
@@ -11383,40 +11430,34 @@ export class Channel {
 					prevouts.values.map((v) => Number(v)),
 					bitcoin.Transaction.SIGHASH_ALL
 				);
-				if (
-					!ecc.verifySchnorr(sighash, script.subarray(2), sig.subarray(0, 64))
-				) {
+				let valid = false;
+				try {
+					valid = ecc.verifySchnorr(
+						sighash,
+						script.subarray(2),
+						sig.subarray(0, 64)
+					);
+				} catch {
+					valid = false;
+				}
+				if (!valid) {
 					return 'P2TR signature does not verify against its prevout';
 				}
 				return null;
 			}
-			const control = stack[stack.length - 1];
-			if (control.length < 33 || (control.length - 33) % 32 !== 0) {
-				return 'P2TR control block is malformed';
-			}
-			for (const element of stack) {
-				if (element.length > 3600) return 'P2TR witness element oversized';
-			}
-			return null;
+			// Script-path spends cannot be verified generically (the leaf
+			// semantics are the script's own): fail closed rather than accept
+			// a witness this validator cannot judge. The negotiation-time
+			// check keeps P2TR prevouts acceptable, because a KEY-spend of
+			// them is fully verifiable; only the path choice is refused here.
+			return 'P2TR script-path spends are not supported for funding inputs';
 		}
 		if (isP2wsh) {
-			const witnessScript = stack[stack.length - 1];
-			if (witnessScript.length === 0 || witnessScript.length > 3600) {
-				return 'P2WSH witness script oversized or empty';
-			}
-			if (!bitcoin.crypto.sha256(witnessScript).equals(script.subarray(2))) {
-				return 'P2WSH witness script does not match the prevout program';
-			}
-			for (let i = 0; i < stack.length - 1; i++) {
-				if (stack[i].length > 80) {
-					return 'P2WSH witness stack item exceeds standardness bounds';
-				}
-				if (stack[i].length > 0 && stack[i][0] === 0x30) {
-					const decoded = this._decodeDerSighashAll(stack[i]);
-					if (typeof decoded === 'string') return `P2WSH ${decoded}`;
-				}
-			}
-			return null;
+			// A P2WSH witness cannot be verified without executing the script
+			// (a hash-matched OP_FALSE spend would pass any structural check):
+			// fail closed. The negotiation-time check refuses P2WSH funding
+			// inputs before anything signs, so this is defense in depth.
+			return 'P2WSH peer funding inputs are not supported (the witness cannot be verified)';
 		}
 		return 'peer funding input is not a supported segwit output';
 	}

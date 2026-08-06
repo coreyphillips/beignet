@@ -2406,6 +2406,28 @@ export class LightningNode extends EventEmitter {
 			'channel:abandoned',
 			(channelId: Buffer, reason: string) => {
 				const idHex = channelId.toString('hex');
+				// The manager judged the attempt from MEMORY; the disk answers
+				// for what was actually committed. A FAILED RBF persist leaves
+				// the PREVIOUS attempt as the durable truth, with tx_ack_rbf
+				// withheld behind the same failed commit, so the peer never
+				// adopted the renegotiation and the prior attempt is still
+				// resumable: re-restore it instead of deleting it.
+				const row = this.storage?.loadChannel?.(idHex) ?? null;
+				if (
+					row &&
+					row.state.state === ChannelState.AWAITING_TX_SIGNATURES &&
+					row.state.v2InFlight
+				) {
+					const channel = new Channel(row.state);
+					const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+					this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
+					this.emitStructuredLog(
+						'channel',
+						'open_abandon_reverted_to_durable',
+						{ channelId: idHex, reason }
+					);
+					return;
+				}
 				if (this.storage) {
 					this.safeStorage(
 						() => this.storage!.deleteChannel(idHex),
@@ -2416,6 +2438,9 @@ export class LightningNode extends EventEmitter {
 					channelId: idHex,
 					reason
 				});
+				// The documented terminal lifecycle event for a removed
+				// unfunded channel, same as voidMissingFundingChannel.
+				this.emit('channel:voided', { channelId });
 			}
 		);
 
