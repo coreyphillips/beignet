@@ -4200,6 +4200,24 @@ export class LightningNode extends EventEmitter {
 			// No row: there is nothing a restart could resurrect.
 			if (!row) return true;
 			row.state.condemned = true;
+			// Journaled like every other durable channel transition: a
+			// verified-frame reconstruction must rebuild the row CONDEMNED,
+			// or recovery would resurrect a channel whose deletion was
+			// already decided.
+			if (this.recovery) {
+				return this.commitMutations(
+					'condemnChannel',
+					[
+						{
+							type: 'channel_state',
+							channelId: idHex,
+							state: row.state,
+							peerPubkey: row.peerPubkey
+						}
+					],
+					RecoveryCriticality.Important
+				);
+			}
 			return this.safeStorage(
 				() => this.storage!.saveChannel(idHex, row.state, row.peerPubkey),
 				'saveChannel'

@@ -98,6 +98,7 @@ import { Network } from '../../src/lightning/invoice/types';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
+import { reconstructFromFrames } from '../../src/lightning/recovery';
 
 // ─────────────── Channel-level helpers ───────────────
 
@@ -2644,6 +2645,92 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	it('a signer failure at the replacement commitment rolls both sides back to the previous attempt', async function () {
+		const opener = new LightningNode(
+			makeNodeConfig(89, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(90, {
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const attempt0Txid = Buffer.from(
+			channel.getFullState().v2InFlight!.fundingTxid
+		);
+		wire.clearDrops();
+
+		// The opener's signer refuses exactly once: at the REPLACEMENT
+		// commitment (attempt 0's commitments were signed during the open).
+		// The record swap must be undone before anything observes attempt 1,
+		// and the unwind returns both sides to the shared previous attempt.
+		const signer = (
+			channel as unknown as {
+				_signer: { signCommitmentTx: (...a: unknown[]) => unknown };
+			}
+		)._signer;
+		const realSign = signer.signCommitmentTx.bind(signer);
+		let failOnce = true;
+		signer.signCommitmentTx = (...args: unknown[]): unknown => {
+			if (failOnce) {
+				failOnce = false;
+				throw new Error('signer unavailable');
+			}
+			return realSign(...args);
+		};
+
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		await settle(
+			() => channel.getState() === ChannelState.AWAITING_TX_SIGNATURES
+		);
+
+		// The throwing side undid the record swap and rolled back to the
+		// shared previous attempt: it must never keep an attempt 1 the peer
+		// could diverge from.
+		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(
+			channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid),
+			'the opener rolled back to attempt 0'
+		).to.be.true;
+		expect(channel.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+
+		// The acceptor had already durably committed the replacement (its
+		// own commitment persist landed before the abort arrived), so its
+		// rollback record was legitimately gone: the abort tears it down and
+		// the handshake cleanup removes it. Neither attempt is broadcastable
+		// (both sides funded, no witnesses left), so the divergence terminal
+		// is a clean removal, never a broadcast.
+		await settle(() => managerOf(acceptor).getChannel(channelId) === undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
 	it('a zero-input acceptor refuses RBF; both sides keep the broadcastable attempt', async function () {
 		const opener = new LightningNode(
 			makeNodeConfig(83, {
@@ -3636,6 +3723,38 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 			'no terminal event without a durable deletion'
 		).to.have.length(0);
 		expect(openerStorage.loadAllChannels()).to.have.length(1);
+		expect(openerStorage.loadAllChannels()[0].state.condemned).to.be.true;
+
+		// The condemnation is JOURNALED: a verified-frame reconstruction
+		// must rebuild the row condemned too, or recovery would resurrect a
+		// channel whose deletion was already decided.
+		const journal = (
+			opener as unknown as {
+				recovery: {
+					options: {
+						journal?: { loadVerifiedFrames: () => unknown };
+					};
+				};
+			}
+		).recovery.options.journal;
+		expect(journal, 'the node journals recovery frames').to.not.equal(
+			undefined
+		);
+		const rebuilt = new SqliteStorage(':memory:');
+		rebuilt.open();
+		reconstructFromFrames(
+			rebuilt,
+			journal!.loadVerifiedFrames() as Parameters<
+				typeof reconstructFromFrames
+			>[1]
+		);
+		const rebuiltRows = rebuilt.loadAllChannels();
+		expect(rebuiltRows).to.have.length(1);
+		expect(
+			rebuiltRows[0].state.condemned,
+			'reconstruction preserves the condemnation'
+		).to.be.true;
+		rebuilt.close();
 		opener.destroy();
 
 		// A restart whose deletions STILL fail must not restore the

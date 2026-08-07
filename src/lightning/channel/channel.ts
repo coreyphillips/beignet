@@ -11662,6 +11662,9 @@ export class Channel {
 		// describes the replaced attempt until this very step swaps it). The
 		// construction is all-or-nothing, so a failure leaves the rollback
 		// record untouched and the renegotiation unwinds to it on the wire.
+		const prior = this._state.v2InFlight;
+		const priorFundingTxid = this._state.fundingTxid;
+		const priorFundingOutputIndex = this._state.fundingOutputIndex;
 		this._syncV2InFlight({});
 		const record = this._state.v2InFlight;
 		if (!record || this._v2RecordIsStaleRollback()) {
@@ -11676,12 +11679,29 @@ export class Channel {
 		this._state.fundingTxid = Buffer.from(record.fundingTxid);
 		this._state.fundingOutputIndex = record.fundingOutputIndex;
 
-		const { signature, htlcSignatures } = signRemoteCommitment(
-			this._state,
-			this._signer,
-			this._state.remoteCurrentPerCommitmentPoint,
-			0n
-		);
+		let signature: Buffer;
+		let htlcSignatures: Buffer[];
+		try {
+			({ signature, htlcSignatures } = signRemoteCommitment(
+				this._state,
+				this._signer,
+				this._state.remoteCurrentPerCommitmentPoint,
+				0n
+			));
+		} catch {
+			// The signer failed AFTER the record swap: undo it before
+			// anything else observes attempt N+1, or this side would keep
+			// the replacement while the peer keeps the previous attempt and
+			// reestablish splits on different funding txids. With the prior
+			// record restored, the unwind below rolls back to it on the
+			// wire (or aborts a fresh open where there is nothing to keep).
+			this._state.v2InFlight = prior;
+			this._state.fundingTxid = priorFundingTxid;
+			this._state.fundingOutputIndex = priorFundingOutputIndex;
+			return this._unwindV2NegotiationOrRollback(
+				'failed to sign the v2 commitment'
+			);
+		}
 		this._v2SentCommitment = true;
 		const msg: ICommitmentSignedMessage = {
 			channelId: this._state.channelId!,
