@@ -2741,6 +2741,177 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
+	it('the mirrored acceptor signer failure converges both sides to removal', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(91, {
+				storage: openerStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(92, {
+				storage: acceptorStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		wire.clearDrops();
+
+		// The ACCEPTOR's signer refuses once, at its replacement commitment.
+		// The acceptor is the side RECEIVING the completing tx_complete, and
+		// its sender's commitment is queued right behind that message: the
+		// failure must be terminal, because the peer has already durably
+		// committed the replacement.
+		const signer = (
+			acceptorChannel as unknown as {
+				_signer: { signCommitmentTx: (...a: unknown[]) => unknown };
+			}
+		)._signer;
+		const realSign = signer.signCommitmentTx.bind(signer);
+		let failOnce = true;
+		signer.signCommitmentTx = (...args: unknown[]): unknown => {
+			if (failOnce) {
+				failOnce = false;
+				throw new Error('signer unavailable');
+			}
+			return realSign(...args);
+		};
+
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+
+		// BOTH managers and BOTH durable rows converge to nothing over the
+		// abort handshake, on the live connection: the opener committed the
+		// replacement and is torn down by the abort; the acceptor's terminal
+		// failure removes it at the echo. Neither attempt is broadcastable.
+		await settle(
+			() =>
+				managerOf(opener).getChannel(channelId) === undefined &&
+				managerOf(acceptor).getChannel(channelId) === undefined
+		);
+		expect(managerOf(opener).getChannel(channelId)).to.equal(undefined);
+		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(openerStorage.loadAllChannels()).to.have.length(0);
+		expect(acceptorStorage.loadAllChannels()).to.have.length(0);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a crash between the terminal persist and the abort echo cannot resurrect the channel', async function () {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'v2-term-'));
+		const dbPath = path.join(dir, 'acceptor.db');
+		const acceptorStorage = new SqliteStorage(dbPath);
+		acceptorStorage.open();
+		const opener = new LightningNode(
+			makeNodeConfig(93, {
+				storage: (() => {
+					const s = new SqliteStorage(':memory:');
+					s.open();
+					return s;
+				})(),
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			})
+		);
+		const acceptor = new LightningNode(
+			makeNodeConfig(94, {
+				storage: acceptorStorage,
+				recovery: { enabled: true },
+				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
+				leaseRates: LEASE_RATES
+			})
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		const wire = wireNodes(opener, acceptor);
+		wire.dropFrom(opener, MessageType.COMMITMENT_SIGNED);
+		const channel = opener.openChannelV2(
+			acceptor.getNodeId(),
+			leaseOpenParams()
+		);
+		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
+		const channelId = channel.getChannelId()!;
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
+		wire.clearDrops();
+		// The abort's ECHO from the opener never arrives: the acceptor's
+		// handshake cleanup cannot run, modelling a crash right after the
+		// terminal persist and abort send.
+		wire.dropFrom(opener, MessageType.TX_ABORT);
+
+		const signer = (
+			acceptorChannel as unknown as {
+				_signer: { signCommitmentTx: (...a: unknown[]) => unknown };
+			}
+		)._signer;
+		signer.signCommitmentTx = (): unknown => {
+			throw new Error('signer unavailable');
+		};
+		const rbfActions = channel.initiateTxRbf(2000);
+		expect(findError(rbfActions)).to.equal(null);
+		(
+			managerOf(opener) as unknown as {
+				processActions: (p: string, c: Channel, a: unknown[]) => void;
+			}
+		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		await settle(() => wire.dropped(MessageType.TX_ABORT) > 0);
+		expect(acceptorChannel.getState()).to.equal(ChannelState.ERRORED);
+		const rows = acceptorStorage.loadAllChannels();
+		expect(rows).to.have.length(1);
+		expect(rows[0].state.condemned, 'the terminal row is condemned').to.be.true;
+		acceptor.destroy();
+
+		// The restart deletes the condemned row instead of restoring a
+		// permanently tracked inert channel, and fires the terminal event
+		// exactly once.
+		const acceptorStorage2 = new SqliteStorage(dbPath);
+		acceptorStorage2.open();
+		const revivedVoided: Buffer[] = [];
+		const revived = new LightningNode(
+			makeNodeConfig(94, {
+				storage: acceptorStorage2,
+				recovery: { enabled: true }
+			})
+		);
+		revived.on('node:error', () => {});
+		revived.on('channel:voided', (e: { channelId: Buffer }) => {
+			revivedVoided.push(e.channelId);
+		});
+		expect(
+			revived.getChannelManager().listChannels(),
+			'the condemned terminal row never restores'
+		).to.have.length(0);
+		expect(acceptorStorage2.loadAllChannels()).to.have.length(0);
+		await settle(() => revivedVoided.length > 0, 1000);
+		expect(revivedVoided).to.have.length(1);
+		expect(revivedVoided[0].equals(channelId)).to.be.true;
+
+		opener.destroy();
+		revived.destroy();
+	});
+
 	it('a zero-input acceptor refuses RBF; both sides keep the broadcastable attempt', async function () {
 		const opener = new LightningNode(
 			makeNodeConfig(83, {

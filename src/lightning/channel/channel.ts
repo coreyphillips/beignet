@@ -10968,12 +10968,20 @@ export class Channel {
 		// instead rolls the renegotiation back to it.
 		if (session.getState() === DualFundingState.AWAITING_TX_SIGNATURES) {
 			// Audit the negotiated tx before signing anything for it (S-2.M4).
+			// A shared-deterministic audit failure is safe to roll back: the
+			// peer runs the same audit over the same tx before ITS
+			// commitment, so it cannot have committed a tx we refuse.
 			const invalid = this._validateNegotiatedInteractiveTx('v2');
 			if (invalid) {
 				return this._unwindV2NegotiationOrRollback(invalid);
 			}
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
-			return this._maybeSendV2Commitment();
+			// The completing tx_complete was RECEIVED: its sender completes
+			// and commits in one batch, so its replacement commitment may
+			// already be queued behind this very message. A local signer
+			// failure here must therefore be terminal, never a rollback to
+			// an attempt the peer may have durably left.
+			return this._maybeSendV2Commitment(true);
 		}
 
 		// Peer completed but we have not: contribute our remaining
@@ -11715,6 +11723,12 @@ export class Channel {
 				this._state.dualFundingSession = null;
 				this._resetV2Driver();
 				this._state.state = ChannelState.ERRORED;
+				// Condemned IN the terminal persist: the removal is decided
+				// here, and a crash before the abort echo (whose handshake
+				// cleanup deletes the row) must not restore this as a
+				// permanently tracked inert channel. Startup deletes
+				// condemned rows instead of restoring them.
+				this._state.condemned = true;
 				return [
 					{ type: ChannelActionType.PERSIST_STATE },
 					this._txAbort(
@@ -13075,6 +13089,10 @@ export class Channel {
 			this._state.v2InFlight = null;
 			this._resetV2Driver();
 			this._state.state = ChannelState.ERRORED;
+			// Condemned in the same persist: the teardown is decided, and a
+			// crash before the manager's handshake cleanup deletes the row
+			// must not restore it as a tracked inert channel.
+			this._state.condemned = true;
 			return [{ type: ChannelActionType.PERSIST_STATE }];
 		}
 
@@ -13163,6 +13181,10 @@ export class Channel {
 		this._state.v2InFlight = null;
 		this._resetV2Driver();
 		this._state.state = ChannelState.ERRORED;
+		// Condemned in the same persist: the teardown is decided, and a
+		// crash between this write and the manager's handshake cleanup
+		// deleting the row must not restore it as a tracked inert channel.
+		this._state.condemned = true;
 		// Echo the tx_abort (BOLT 2 ack) — we had an active session and had not
 		// sent tx_abort ourselves. A record meant the open had already been
 		// persisted: persist the unwind too, or a restart would resume a round

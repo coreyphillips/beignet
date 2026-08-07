@@ -2420,6 +2420,24 @@ export class LightningNode extends EventEmitter {
 		// this same action produced, and the wire bytes it authorizes all commit
 		// in one transaction; the sends are released only if it commits.
 		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
+			// The synchronous dispatch nests: an action earlier in this batch
+			// can have triggered a whole cascade that REMOVED this channel
+			// and deleted its row (a terminal abort handshake completing
+			// inside a send). Persisting now would resurrect a row nobody
+			// tracks. Report success so the batch finishes; any remaining
+			// sends address a negotiation the peer has already left, and its
+			// manager drops them against the missing channel.
+			if (
+				event.channelId &&
+				!this.channelManager.getChannel(event.channelId) &&
+				!(
+					this.channelManager as unknown as {
+						findChannelByChannelIdInTemp(id: Buffer): unknown;
+					}
+				).findChannelByChannelIdInTemp(event.channelId)
+			) {
+				return;
+			}
 			// A node that HAS persistence answers for itself. The request
 			// arrives committed:true, which is the right default only for a
 			// node that persists nothing at all; leaving it true here would
