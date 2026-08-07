@@ -5,7 +5,11 @@
  * to/from JSON-safe representations for SQLite storage.
  */
 
-import { IChannelState, ISpliceInFlight } from '../channel/channel-state';
+import {
+	IChannelState,
+	ISpliceInFlight,
+	IV2InFlight
+} from '../channel/channel-state';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
 import {
@@ -336,6 +340,7 @@ export interface ISerializedChannelState {
 	channelType: string | null;
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
+	condemned?: boolean;
 	localShutdownScript: string | null;
 	remoteShutdownScript: string | null;
 	lastSentCommitmentSigned: string | null;
@@ -395,6 +400,7 @@ export interface ISerializedChannelState {
 	fundingVersion?: number;
 	commitmentFeeratePerkw?: number;
 	fundingLocktime?: number;
+	v2InFlight?: ISerializedV2InFlight | null;
 	// Liquidity ads (bLIP-0051): if we are the lessor, our to_local (and its
 	// exact on-chain script) is CLTV-locked until leaseExpiry. These MUST persist —
 	// otherwise a restart rebuilds the commitment without the lock, the peer's cached
@@ -505,6 +511,78 @@ export function deserializeSpliceInFlight(
 	};
 }
 
+export interface ISerializedV2InFlight {
+	fundingTxid: string;
+	fundingOutputIndex: number;
+	fundingTxHex: string;
+	fullySigned: boolean;
+	isInitiator: boolean;
+	localContributionSats: string;
+	remoteContributionSats: string;
+	fundingFeeratePerkw: number;
+	weSignFirst: boolean;
+	ourWitnesses: string[][];
+	ourWalletInputIndices: number[];
+	inputPrevouts?: Array<{ script: string; valueSats: string }>;
+	remoteCommitmentSig: string | null;
+	sentTxSignatures: boolean;
+	receivedTxSignatures: boolean;
+	confirmed?: boolean;
+	rbfAttempt: number;
+}
+
+export function serializeV2InFlight(f: IV2InFlight): ISerializedV2InFlight {
+	return {
+		fundingTxid: f.fundingTxid.toString('hex'),
+		fundingOutputIndex: f.fundingOutputIndex,
+		fundingTxHex: f.fundingTxHex,
+		fullySigned: f.fullySigned,
+		isInitiator: f.isInitiator,
+		localContributionSats: bigintToStr(f.localContributionSats),
+		remoteContributionSats: bigintToStr(f.remoteContributionSats),
+		fundingFeeratePerkw: f.fundingFeeratePerkw,
+		weSignFirst: f.weSignFirst,
+		ourWitnesses: f.ourWitnesses.map((w) => w.map((b) => b.toString('hex'))),
+		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		inputPrevouts: f.inputPrevouts.map((p) => ({
+			script: p.script.toString('hex'),
+			valueSats: bigintToStr(p.valueSats)
+		})),
+		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
+		sentTxSignatures: f.sentTxSignatures,
+		receivedTxSignatures: f.receivedTxSignatures,
+		confirmed: f.confirmed,
+		rbfAttempt: f.rbfAttempt
+	};
+}
+
+export function deserializeV2InFlight(s: ISerializedV2InFlight): IV2InFlight {
+	return {
+		fundingTxid: Buffer.from(s.fundingTxid, 'hex'),
+		fundingOutputIndex: s.fundingOutputIndex,
+		fundingTxHex: s.fundingTxHex,
+		fullySigned: s.fullySigned,
+		isInitiator: s.isInitiator,
+		localContributionSats: strToBigint(s.localContributionSats),
+		remoteContributionSats: strToBigint(s.remoteContributionSats),
+		fundingFeeratePerkw: s.fundingFeeratePerkw,
+		weSignFirst: s.weSignFirst,
+		ourWitnesses: s.ourWitnesses.map((w) =>
+			w.map((h) => Buffer.from(h, 'hex'))
+		),
+		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
+			script: Buffer.from(p.script, 'hex'),
+			valueSats: strToBigint(p.valueSats)
+		})),
+		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
+		sentTxSignatures: s.sentTxSignatures,
+		receivedTxSignatures: s.receivedTxSignatures,
+		confirmed: s.confirmed ?? false,
+		rbfAttempt: s.rbfAttempt
+	};
+}
+
 export function serializeChannelState(
 	s: IChannelState
 ): ISerializedChannelState {
@@ -580,6 +658,7 @@ export function serializeChannelState(
 		channelType: bufToHex(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
 		localShutdownScript: bufToHex(s.localShutdownScript),
 		remoteShutdownScript: bufToHex(s.remoteShutdownScript),
 		lastSentCommitmentSigned: bufToHex(s.lastSentCommitmentSigned),
@@ -664,6 +743,7 @@ export function serializeChannelState(
 		fundingVersion: s.fundingVersion,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw,
 		fundingLocktime: s.fundingLocktime,
+		v2InFlight: s.v2InFlight ? serializeV2InFlight(s.v2InFlight) : null,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,
@@ -755,6 +835,7 @@ export function deserializeChannelState(
 		channelType: hexToBuf(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
 		localShutdownScript: hexToBuf(s.localShutdownScript),
 		remoteShutdownScript: hexToBuf(s.remoteShutdownScript),
 		lastSentCommitmentSigned: hexToBuf(s.lastSentCommitmentSigned),
@@ -844,6 +925,7 @@ export function deserializeChannelState(
 		dualFundingSession: null,
 		commitmentFeeratePerkw: s.commitmentFeeratePerkw ?? 0,
 		fundingLocktime: s.fundingLocktime ?? 0,
+		v2InFlight: s.v2InFlight ? deserializeV2InFlight(s.v2InFlight) : null,
 		isLessor: s.isLessor,
 		leaseExpiry: s.leaseExpiry,
 		leaseCommitBlockheight: s.leaseCommitBlockheight,

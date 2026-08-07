@@ -72,6 +72,65 @@ export interface ISpliceInFlight {
 }
 
 /**
+ * A v2 (dual-funded) open past its point of no return: our initial
+ * commitment_signed has left (or is owed against the peer's persisted one), so
+ * BOLT 2 obliges us to remember the funding transaction and resume the
+ * signature exchange on reconnect via channel_reestablish.next_funding.
+ * Everything needed to resume after a disconnect or a restart without the
+ * live interactive-tx builder or the wallet's signWitness closures. Taproot
+ * never appears here: taproot v2 opens fail closed before any signature.
+ */
+export interface IV2InFlight {
+	/** Funding txid in tx.getHash() internal byte order. */
+	fundingTxid: Buffer;
+	fundingOutputIndex: number;
+	/**
+	 * The negotiated funding tx: our wallet witnesses applied from creation
+	 * (signed at record time, while the closures are live), the peer's added
+	 * when its tx_signatures verify; broadcastable when fullySigned.
+	 */
+	fundingTxHex: string;
+	/** Both tx_signatures applied → safe to (re)broadcast. */
+	fullySigned: boolean;
+	isInitiator: boolean;
+	/** Contribution split; the RBF 25/24 feerate floor derives from the rate. */
+	localContributionSats: bigint;
+	remoteContributionSats: bigint;
+	fundingFeeratePerkw: number;
+	/**
+	 * BOLT 2 tx_signatures ordering (lower total input value first, node-id
+	 * tie-break), captured from the LIVE builder at record creation — the
+	 * restored session has no builder to recompute it from.
+	 */
+	weSignFirst: boolean;
+	/** Our wallet-input witnesses, parallel to ourWalletInputIndices (empty for a zero-contribution side). */
+	ourWitnesses: Buffer[][];
+	ourWalletInputIndices: number[];
+	/**
+	 * The complete prevout set of the negotiated funding tx (scriptPubkey and
+	 * value per input, in tx-input order). The interactive-tx prev_txs die
+	 * with the process, and witness validation needs the set after a restart:
+	 * BIP 143 sighashes commit to the spent input's value, BIP 341 sighashes
+	 * to every input's script and value.
+	 */
+	inputPrevouts: Array<{ script: Buffer; valueSats: bigint }>;
+	/** Peer's verified signature over OUR commitment #0; doubles as the received-commitment marker. */
+	remoteCommitmentSig: Buffer | null;
+	sentTxSignatures: boolean;
+	receivedTxSignatures: boolean;
+	/**
+	 * The funding tx reached depth while the channel could not consume the
+	 * confirmation (disconnected or mid-exchange). The chain watcher's depth
+	 * callback is one-shot, so this survives for the exchange completion or
+	 * the next reestablish to flush channel_ready (mirrors the splice
+	 * record's `confirmed`).
+	 */
+	confirmed: boolean;
+	/** RBF attempt ordinal this record belongs to (0 = original negotiation). */
+	rbfAttempt: number;
+}
+
+/**
  * The peer's forwarding policy for the peer-to-us direction of a channel,
  * from a signature-verified channel_update the peer sent us directly.
  * Primarily for PRIVATE channels, whose updates never enter the public graph.
@@ -101,8 +160,10 @@ export interface IChannelState {
 	pushMsat: bigint;
 	fundingTxid: Buffer | null;
 	/**
-	 * The exact signed v1 funding transaction, retained while it is unconfirmed
-	 * and this node is the funder.
+	 * The exact signed funding transaction, retained while it is unconfirmed:
+	 * for a v1 open while this node is the funder, and for a completed v2
+	 * (dual-funded) open on every role, staged when both tx_signatures have
+	 * been applied (`_recordV2FullySigned`).
 	 *
 	 * It lives HERE, in journaled channel state, rather than only in the node's
 	 * generic metadata, because a guardian restore has to be able to discharge
@@ -248,6 +309,12 @@ export interface IChannelState {
 	/** Flags */
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
+	/**
+	 * The row is CONDEMNED: its durable deletion was decided but failed, so
+	 * the intent rides the row itself (no separate store whose read can
+	 * fail). Startup deletes a condemned row instead of restoring it.
+	 */
+	condemned?: boolean;
 	localShutdownScript: Buffer | null;
 	remoteShutdownScript: Buffer | null;
 
@@ -396,6 +463,14 @@ export interface IChannelState {
 	fundingVersion: 1 | 2;
 	/** Dual-funding: session state (only set for v2 channels) */
 	dualFundingSession: import('./dual-funding').DualFundingSession | null;
+	/**
+	 * Dual-funding: v2 open past the point of no return (our initial
+	 * commitment_signed left). Must survive disconnect AND restart — the peer
+	 * holds our signature and BOLT 2 requires the exchange to resume over
+	 * channel_reestablish.next_funding. Optional for backward compatibility
+	 * with states created before this field existed (treated as null).
+	 */
+	v2InFlight?: IV2InFlight | null;
 	/** Dual-funding: commitment feerate in sat/kw (v2 only) */
 	commitmentFeeratePerkw: number;
 	/** Dual-funding: funding tx locktime (v2 only) */
@@ -657,6 +732,7 @@ export function createOpenerState(params: {
 
 		fundingVersion: 1,
 		dualFundingSession: null,
+		v2InFlight: null,
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0
 	};
@@ -767,6 +843,7 @@ export function createAcceptorState(params: {
 
 		fundingVersion: 1,
 		dualFundingSession: null,
+		v2InFlight: null,
 		commitmentFeeratePerkw: 0,
 		fundingLocktime: 0
 	};

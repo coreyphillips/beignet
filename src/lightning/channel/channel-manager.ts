@@ -138,6 +138,7 @@ import {
 	decodeTxCompleteMessage,
 	decodeTxSignaturesMessage,
 	decodeTxInitRbfMessage,
+	decodeTxAckRbfMessage,
 	decodeTxAbortMessage,
 	encodeTxAbortMessage
 } from '../message/interactive-tx';
@@ -1308,9 +1309,27 @@ export class ChannelManager extends EventEmitter {
 			const channelIdHex = channel.getChannelId()?.toString('hex');
 			if (channelIdHex) this.purgeBarrierQueue(channelIdHex);
 			channel.markForReestablish();
+			// A dead unfunded v2 open: either the drop branch just abandoned
+			// a committed RBF renegotiation nothing was signed for, or the
+			// channel was already ERRORED by an abort whose echo never
+			// arrived. Remove it entirely, mirroring the restart path (which
+			// deletes the row). Leaving it ERRORED left a silent permanent
+			// channel that no reestablish, disposition or cleanup ever
+			// touches; a peer that still asks after removal gets the
+			// unknown-channel error and ends the attempt on its side.
+			if (channel.isAbandonedV2Open() && channelIdHex) {
+				this.channels.delete(channelIdHex);
+				this.channelPeers.delete(channelIdHex);
+				this.emit(
+					'channel:abandoned',
+					channel.getChannelId(),
+					'dead unfunded v2 open removed on disconnect'
+				);
+			}
 		}
 
-		// Early-stage channels → abort (BOLT 2: no reestablish before funding_signed)
+		// Early-stage channels → abort (BOLT 2: no reestablish before
+		// funding_signed for v1; before the initial commitment_signed for v2)
 		const earlyStates = new Set([
 			ChannelState.NONE,
 			ChannelState.SENT_OPEN,
@@ -1323,7 +1342,37 @@ export class ChannelManager extends EventEmitter {
 		for (const [tempId, channel] of this.tempChannels) {
 			if (this.channelPeers.get(tempId) !== peerPubkey) continue;
 			const state = channel.getState();
+			// A dead unfunded v2 open still in the temp map: it errored as
+			// the tx_abort responder and the aborting peer disconnected
+			// before this side ever heard back. ERRORED is not an early
+			// state, so the sweep below skipped it forever. Remove it and
+			// let the node delete any row via channel:abandoned.
+			if (channel.isAbandonedV2Open()) {
+				this.tempChannels.delete(tempId);
+				this.channelPeers.delete(tempId);
+				this.emit(
+					'channel:abandoned',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					'dead unfunded v2 open removed on disconnect'
+				);
+				continue;
+			}
 			if (!earlyStates.has(state)) continue;
+
+			// A v2 open past its point of no return (the durable record exists)
+			// is NOT abortable: BOLT 2 requires the signature exchange to
+			// resume over reestablish. The promotion normally happened with the
+			// batch that created the record; catch any channel the disconnect
+			// beat to it, then treat it like the established loop above.
+			if (channel.getFullState().v2InFlight != null) {
+				this._promoteV2ChannelIfReady(peerPubkey, channel);
+				const idHex = channel.getChannelId()?.toString('hex');
+				if (idHex && this.channels.has(idHex)) {
+					this.purgeBarrierQueue(idHex);
+					channel.markForReestablish();
+					continue;
+				}
+			}
 
 			channel.getFullState().state = ChannelState.ERRORED;
 			this.tempChannels.delete(tempId);
@@ -1415,6 +1464,10 @@ export class ChannelManager extends EventEmitter {
 			// splice BEFORE markForReestablish, so the splice survives the
 			// reconnect handling (markForReestablish keeps it only when present).
 			channel.restoreSpliceInFlight();
+			// Same for a v2 open past its initial commitment_signed: rebuild the
+			// builder-less session from the durable record so the signature
+			// exchange resumes over channel_reestablish.next_funding.
+			channel.restoreV2InFlight();
 
 			// Mark channels for reestablishment — after a restart the peer
 			// connection is lost, so we must complete channel_reestablish
@@ -1425,7 +1478,15 @@ export class ChannelManager extends EventEmitter {
 				st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 				st === ChannelState.AWAITING_CHANNEL_READY ||
 				st === ChannelState.SHUTTING_DOWN ||
-				st === ChannelState.SPLICING
+				st === ChannelState.SPLICING ||
+				// A v2 open is only reestablishable when the durable record made
+				// it resumable; a row persisted before the record existed keeps
+				// its legacy shape (an inert AWAITING_TX_SIGNATURES orphan, and
+				// the quorum startup guard still gets to see it). DUAL_FUNDING_V2
+				// rows never reach here: they are RBF-renegotiation residue and
+				// the node removes them durably before restoring channels.
+				(st === ChannelState.AWAITING_TX_SIGNATURES &&
+					channel.getFullState().v2InFlight != null)
 			) {
 				channel.markForReestablish();
 			}
@@ -2121,6 +2182,9 @@ export class ChannelManager extends EventEmitter {
 					break;
 				case MessageType.TX_INIT_RBF:
 					this.handleTxInitRbfMsg(peerPubkey, payload);
+					break;
+				case MessageType.TX_ACK_RBF:
+					this.handleTxAckRbfMsg(peerPubkey, payload);
 					break;
 				case MessageType.TX_ABORT:
 					this.handleTxAbortMsg(peerPubkey, payload);
@@ -4419,13 +4483,16 @@ export class ChannelManager extends EventEmitter {
 
 	/**
 	 * Promote a v2 (dual-funded) channel from tempChannels to the permanent map.
-	 * Deferred until the open reaches AWAITING_FUNDING_CONFIRMED: while the
-	 * channel is still in the commitment_signed / tx_signatures round (state
-	 * AWAITING_TX_SIGNATURES) it MUST stay in tempChannels so a mid-round peer
-	 * disconnect is aborted by handlePeerDisconnected (which only scans
-	 * tempChannels for early-state channels). Routing still works in the interim:
-	 * commitment_signed is found via findChannelByChannelIdInTemp (derived id) and
-	 * tx_signatures via findTempChannel (temporary id). Idempotent.
+	 * The boundary is the point of no return: the batch that creates the
+	 * durable v2InFlight record (our initial commitment_signed) also first
+	 * persists the row under the permanent id, and from then on the channel
+	 * must be resolvable by findChannelByChannelId / getChannelsByPeer so a
+	 * disconnect reestablishes instead of aborting (BOLT 2: the signature
+	 * exchange resumes over next_funding). Before the record exists the
+	 * channel stays in tempChannels, where handlePeerDisconnected's sweep
+	 * correctly aborts it. Routing works either way: commitment_signed is
+	 * found via findChannelByChannelIdInTemp (derived id) and tx_signatures
+	 * via findTempChannel (temporary id). Idempotent.
 	 */
 	private _promoteV2ChannelIfReady(peerPubkey: string, channel: Channel): void {
 		const cid = channel.getChannelId();
@@ -4437,7 +4504,11 @@ export class ChannelManager extends EventEmitter {
 		if (
 			st !== ChannelState.AWAITING_FUNDING_CONFIRMED &&
 			st !== ChannelState.AWAITING_CHANNEL_READY &&
-			st !== ChannelState.NORMAL
+			st !== ChannelState.NORMAL &&
+			!(
+				st === ChannelState.AWAITING_TX_SIGNATURES &&
+				channel.getFullState().v2InFlight != null
+			)
 		) {
 			return;
 		}
@@ -4462,6 +4533,18 @@ export class ChannelManager extends EventEmitter {
 		this.processActions(peerPubkey, channel, actions);
 	}
 
+	private handleTxAckRbfMsg(peerPubkey: string, payload: Buffer): void {
+		const msg = decodeTxAckRbfMessage(payload);
+		const channel =
+			this.findChannelByChannelId(msg.channelId) ||
+			this.findChannelByChannelIdInTemp(msg.channelId) ||
+			this.findTempChannel(msg.channelId);
+		if (!channel) return;
+
+		const actions = channel.handleTxAckRbf();
+		this.processActions(peerPubkey, channel, actions);
+	}
+
 	private handleTxAbortMsg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeTxAbortMessage(payload);
 		const channel =
@@ -4472,6 +4555,32 @@ export class ChannelManager extends EventEmitter {
 
 		const actions = channel.handleTxAbort();
 		this.processActions(peerPubkey, channel, actions);
+
+		// The abort handshake is now complete for a dead unfunded v2 open on
+		// BOTH shapes of this call: the responder just errored itself above
+		// (and its echo went out with the actions), and the aborting side
+		// just consumed the peer's echo. Either way nothing more will ever
+		// arrive for this channel; leaving it registered made an inert
+		// ERRORED entry the disconnect sweeps skipped and the row repeated
+		// on every restart. Remove it entirely; the node deletes the row via
+		// channel:abandoned.
+		if (channel.isAbandonedV2Open()) {
+			const idHex = channel.getChannelId()?.toString('hex');
+			const tempHex = channel.getTemporaryChannelId()?.toString('hex');
+			if (idHex) {
+				this.channels.delete(idHex);
+				this.channelPeers.delete(idHex);
+			}
+			if (tempHex) {
+				this.tempChannels.delete(tempHex);
+				this.channelPeers.delete(tempHex);
+			}
+			this.emit(
+				'channel:abandoned',
+				channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				'v2 open aborted'
+			);
+		}
 	}
 
 	private handleAnnouncementSignaturesMsg(

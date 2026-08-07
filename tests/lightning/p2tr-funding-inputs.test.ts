@@ -142,20 +142,24 @@ describe('P2TR funding inputs', function () {
 			spend.setWitness(i, witness);
 		}
 
-		// The taproot input carries exactly one 64-byte Schnorr signature that
-		// verifies against the output key of the funded address.
+		// The taproot input carries exactly one 65-byte Schnorr signature with
+		// an explicit SIGHASH_ALL byte (BOLT 2 requires ALL on tx_signatures
+		// signatures) that verifies against the funded address's output key.
 		const trIndex = prevoutScripts.findIndex((s) => scriptKind(s) === 'p2tr');
 		const trWitness = spend.ins[trIndex].witness;
 		expect(trWitness.length).to.equal(1);
-		expect(trWitness[0].length).to.equal(64);
+		expect(trWitness[0].length).to.equal(65);
+		expect(trWitness[0][64]).to.equal(bitcoin.Transaction.SIGHASH_ALL);
 		const sighash = spend.hashForWitnessV1(
 			trIndex,
 			prevoutScripts,
 			prevoutValues.map((v) => Number(v)),
-			bitcoin.Transaction.SIGHASH_DEFAULT
+			bitcoin.Transaction.SIGHASH_ALL
 		);
 		const outputKey = prevoutScripts[trIndex].subarray(2);
-		expect(ecc.verifySchnorr(sighash, outputKey, trWitness[0])).to.equal(true);
+		expect(
+			ecc.verifySchnorr(sighash, outputKey, trWitness[0].subarray(0, 64))
+		).to.equal(true);
 
 		// The P2WPKH witness keeps its [der, pubkey] shape.
 		const wpkhIndex = trIndex === 0 ? 1 : 0;

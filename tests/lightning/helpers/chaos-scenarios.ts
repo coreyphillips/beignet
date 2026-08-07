@@ -486,10 +486,13 @@ export function makeChaosSpliceWallet(amountSats: bigint): {
 /**
  * S7: the victim opens a dual-funded (v2) channel and dies inside the
  * open, around the temporary to permanent id promotion (matrix row 10).
- * The interactive session is process-local by design; the disk must hold
- * either nothing or exactly one row under the PERMANENT id, never a
- * half-promoted orphan. Local mode only: quorum refuses v2 opens
- * outright (see the phase 6 v2 decision), which the splice suite asserts
+ * Before the initial commitment_signed the session dies with the process
+ * and the disk holds nothing; from it onward the durable v2InFlight
+ * record (issues 288/289) makes every boundary resumable over
+ * reestablish next_funding, and the disk must hold exactly one row under
+ * the PERMANENT id, never a half-promoted orphan. Local mode only in
+ * this suite: quorum mode still refuses v2 opens (the phase 6 guards
+ * lift with their own follow-up), which the splice suite asserts
  * separately.
  */
 export function s7OpensV2(): IChaosScenario {

@@ -227,11 +227,13 @@ describe('Dual funding acceptor contribution (auto-driven, real keys)', function
 
 		// ── interactive-tx. The opener contributes manually; every acceptor
 		//    turn is AUTO-DRIVEN by the registered contribution. ──
+		const openerPriv = crypto.randomBytes(32);
+		const openerPub = getPublicKey(openerPriv);
 		const openerPrevTx = new bitcoin.Transaction();
 		openerPrevTx.version = 2;
 		openerPrevTx.addInput(crypto.randomBytes(32), 0);
 		openerPrevTx.addOutput(
-			Buffer.concat([Buffer.from([0x00, 0x14]), crypto.randomBytes(20)]),
+			bitcoin.payments.p2wpkh({ pubkey: openerPub }).output!,
 			120_000
 		);
 		const openerInput: IInteractiveTxInput = {
@@ -342,10 +344,30 @@ describe('Dual funding acceptor contribution (auto-driven, real keys)', function
 		// Opener releases its own after the peer's arrive (manual, as before).
 		const oAfterPeerSigs = opener.handleTxSignatures(aSigs);
 		expect(findError(oAfterPeerSigs)).to.equal(null);
+		// The acceptor verifies the opener's witness against its prevout, so
+		// the caller-driven release must be a genuine spend.
+		const openerRecord = opener.getFullState().v2InFlight!;
+		const negotiated = bitcoin.Transaction.fromHex(openerRecord.fundingTxHex);
+		const openerScriptCode = bitcoin.payments.p2pkh({
+			pubkey: openerPub
+		}).output!;
+		const openerSighash = negotiated.hashForWitnessV0(
+			0,
+			openerScriptCode,
+			120_000,
+			bitcoin.Transaction.SIGHASH_ALL
+		);
+		const openerWitness = [
+			bitcoin.script.signature.encode(
+				Buffer.from(ecc.sign(openerSighash, openerPriv)),
+				bitcoin.Transaction.SIGHASH_ALL
+			),
+			openerPub
+		];
 		const oSigsDeferred = opener.sendTxSignatures(
 			opener.getFullState().fundingTxid!,
 			opener.getFullState().fundingOutputIndex,
-			[[Buffer.alloc(72)]]
+			[openerWitness]
 		);
 		expect(findError(oSigsDeferred)).to.equal(null);
 		const oSigsPayload =

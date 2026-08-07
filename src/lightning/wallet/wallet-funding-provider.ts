@@ -668,6 +668,10 @@ export class WalletFundingProvider implements IFundingProvider {
 			if (kind === 'p2tr') {
 				// BIP 86 key-path spend: sign with the taproot-tweaked key over
 				// the BIP 341 sighash, which commits to every input's prevout.
+				// BOLT 2 requires SIGHASH_ALL on every tx_signatures signature,
+				// so the explicit 65-byte form is emitted rather than the
+				// 64-byte SIGHASH_DEFAULT shorthand (identical coverage, but
+				// the interactive-tx rule names ALL and peers may enforce it).
 				const tweakedPriv = taprootTweakPrivateKey(privKey, pubkey);
 				return {
 					...base,
@@ -686,9 +690,14 @@ export class WalletFundingProvider implements IFundingProvider {
 							inputIndex,
 							prevouts.scripts,
 							prevouts.values.map((v) => Number(v)),
-							bitcoin.Transaction.SIGHASH_DEFAULT
+							bitcoin.Transaction.SIGHASH_ALL
 						);
-						return [Buffer.from(ecc.signSchnorr(sighash, tweakedPriv))];
+						return [
+							Buffer.concat([
+								Buffer.from(ecc.signSchnorr(sighash, tweakedPriv)),
+								Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+							])
+						];
 					}
 				};
 			}

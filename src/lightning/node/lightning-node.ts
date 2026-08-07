@@ -1112,7 +1112,16 @@ export class LightningNode extends EventEmitter {
 			// Finish or abandon it under async-remote first.
 			if (barrier?.enforcing === true) {
 				for (const channel of this.channelManager.listChannels()) {
-					const st = channel.getState();
+					const full = channel.getFullState();
+					// restoreChannel marks a resumable (recorded) open for
+					// reestablish before this guard runs: look through
+					// AWAITING_REESTABLISH to the state it will return to, so
+					// the guard keeps seeing the in-flight open either way.
+					const st =
+						full.state === ChannelState.AWAITING_REESTABLISH &&
+						full.preReestablishState
+							? full.preReestablishState
+							: full.state;
 					if (
 						st !== ChannelState.DUAL_FUNDING_V2 &&
 						st !== ChannelState.AWAITING_TX_SIGNATURES
@@ -1124,9 +1133,8 @@ export class LightningNode extends EventEmitter {
 					).toString('hex');
 					throw new Error(
 						`recovery: cannot enable quorum durability while a dual-funded ` +
-							`open is in progress (channel ${id} is ${st}); its interactive ` +
-							`funding session is not restartable, so finish or abandon it ` +
-							`under async-remote durability first`
+							`open is in progress (channel ${id} is ${st}); finish or ` +
+							`abandon it under async-remote durability first`
 					);
 				}
 			}
@@ -1261,12 +1269,72 @@ export class LightningNode extends EventEmitter {
 	private restoreFromStorage(): void {
 		if (!this.storage) return;
 
+		// Seed the per-channel key index from storage FIRST: restoreChannel
+		// advances it from each restored row, but a row removed below never
+		// restores, and a stale index would hand the next channel a previous
+		// channel's funding keys and per-commitment seed. Guarded call: test
+		// doubles implement partial backends.
+		const nextChannelIndex = this.storage.loadNextChannelIndex?.() ?? 1;
+		if (nextChannelIndex > this.channelManager.nextChannelIndex) {
+			this.channelManager.nextChannelIndex = nextChannelIndex;
+		}
+
 		// Restore channels — look up per-channel key index for each
 		for (const {
 			channelId,
 			state,
 			peerPubkey
 		} of this.storage.loadAllChannels()) {
+			// A CONDEMNED row's removal was already decided; the intent rides
+			// the row itself, so there is no separate store whose read can
+			// fail and silently resurrect it. Retry the deletion now; a row
+			// whose deletion fails again stays condemned on disk, is NOT
+			// restored, and retries at every start. The terminal event fires
+			// exactly once, when the deletion lands.
+			if (state.condemned) {
+				if (this.deleteChannelDurably(channelId)) {
+					this.emitStructuredLog('channel', 'condemned_row_removed', {
+						channelId
+					});
+					const condemnedId = Buffer.from(channelId, 'hex');
+					setImmediate(() =>
+						this.emit('channel:voided', { channelId: condemnedId })
+					);
+				} else {
+					this.emitStructuredLog('channel', 'channel_deletion_still_owed', {
+						channelId
+					});
+				}
+				continue;
+			}
+			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
+			// RBF whose post-ack traffic never arrived: the record is the
+			// previous attempt, still resumable and possibly the only side
+			// the peer knows. Roll the row back to it and restore normally
+			// (restoreChannel marks it for reestablish); the rewrite is
+			// idempotent across crashes, so the row itself needs no update.
+			if (state.state === ChannelState.DUAL_FUNDING_V2 && state.v2InFlight) {
+				state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				this.emitStructuredLog('channel', 'v2_rbf_provisional_rolled_back', {
+					channelId
+				});
+			}
+			// A record-less DUAL_FUNDING_V2 row is RBF-renegotiation residue:
+			// the committed replacement's session died with the process
+			// before anything was signed. There is no channel in it: no
+			// funding tx, no signatures, nothing the peer can complete.
+			// Remove the row durably (the voidMissingFundingChannel pattern)
+			// instead of restoring a permanent channel that sends nothing,
+			// answers nothing, and repeats this on every restart; a peer that
+			// still asks gets the manager's unknown-channel error and gives
+			// the attempt up.
+			if (state.state === ChannelState.DUAL_FUNDING_V2) {
+				this.deleteChannelDurably(channelId);
+				this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
+					channelId
+				});
+				continue;
+			}
 			const channel = new Channel(state);
 			const keyIndex = this.storage!.loadChannelKeyIndex(channelId);
 			this.channelManager.restoreChannel(channel, peerPubkey, keyIndex);
@@ -2117,16 +2185,23 @@ export class LightningNode extends EventEmitter {
 	 * Wrap a storage operation in try/catch, emitting node:error on failure.
 	 * Prevents disk-full or locked-DB from crashing a long-running node.
 	 */
-	private safeStorage(fn: () => void, operation: string): void {
-		if (!this.storage) return;
+	/**
+	 * Run a storage operation, reporting (not throwing) a failure. Returns
+	 * whether the operation succeeded; with no storage configured nothing
+	 * durable can fail, so that counts as success.
+	 */
+	private safeStorage(fn: () => void, operation: string): boolean {
+		if (!this.storage) return true;
 		try {
 			fn();
+			return true;
 		} catch (err) {
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				message: `${operation}: ${(err as Error).message}`,
 				timestamp: Date.now()
 			} as ILightningError);
+			return false;
 		}
 	}
 
@@ -2345,6 +2420,24 @@ export class LightningNode extends EventEmitter {
 		// this same action produced, and the wire bytes it authorizes all commit
 		// in one transaction; the sends are released only if it commits.
 		this.channelManager.on('channel:persist', (event: IChannelPersistEvent) => {
+			// The synchronous dispatch nests: an action earlier in this batch
+			// can have triggered a whole cascade that REMOVED this channel
+			// and deleted its row (a terminal abort handshake completing
+			// inside a send). Persisting now would resurrect a row nobody
+			// tracks. Report success so the batch finishes; any remaining
+			// sends address a negotiation the peer has already left, and its
+			// manager drops them against the missing channel.
+			if (
+				event.channelId &&
+				!this.channelManager.getChannel(event.channelId) &&
+				!(
+					this.channelManager as unknown as {
+						findChannelByChannelIdInTemp(id: Buffer): unknown;
+					}
+				).findChannelByChannelIdInTemp(event.channelId)
+			) {
+				return;
+			}
 			// A node that HAS persistence answers for itself. The request
 			// arrives committed:true, which is the right default only for a
 			// node that persists nothing at all; leaving it true here would
@@ -2361,6 +2454,129 @@ export class LightningNode extends EventEmitter {
 				event.request
 			);
 		});
+
+		// The manager abandoned an unfunded open outright (a v2 RBF
+		// renegotiation dropped on disconnect): its row must go with it, or
+		// the next restart restores a channel the manager already removed.
+		this.channelManager.on(
+			'channel:abandoned',
+			(channelId: Buffer, reason: string) => {
+				const idHex = channelId.toString('hex');
+				// The manager judged the attempt from MEMORY; the disk answers
+				// for what was actually committed. A FAILED RBF persist leaves
+				// the PREVIOUS attempt as the durable truth, with tx_ack_rbf
+				// withheld behind the same failed commit, so the peer never
+				// adopted the renegotiation and the prior attempt is still
+				// resumable: re-restore it instead of deleting it. Every read
+				// is contained: this path already runs under a possibly
+				// failing store, and a thrown read must not escape the
+				// disconnect handling after the manager removed the channel.
+				let row: { state: IChannelState; peerPubkey: string } | null = null;
+				let rowKnown = true;
+				try {
+					row = this.storage?.loadChannel?.(idHex) ?? null;
+				} catch {
+					rowKnown = false;
+				}
+				if (!rowKnown) {
+					// The disk cannot answer: fail closed by touching nothing
+					// durable. A restart re-evaluates the row under the same
+					// rules with a healthy store.
+					this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+						channelId: idHex,
+						reason
+					});
+					return;
+				}
+				if (
+					row &&
+					(row.state.state === ChannelState.AWAITING_TX_SIGNATURES ||
+						row.state.state === ChannelState.DUAL_FUNDING_V2) &&
+					row.state.v2InFlight
+				) {
+					try {
+						// A DUAL_FUNDING_V2 row with a record is the
+						// receiver's provisionally accepted RBF whose
+						// commit-point persist failed: the retained record
+						// is the previous attempt. Roll it back exactly as a
+						// restart would.
+						row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
+						const channel = new Channel(row.state);
+						const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+						this.channelManager.restoreChannel(
+							channel,
+							row.peerPubkey,
+							keyIndex
+						);
+						this.emitStructuredLog(
+							'channel',
+							'open_abandon_reverted_to_durable',
+							{ channelId: idHex, reason }
+						);
+					} catch {
+						// Restoration failed mid-way: the row is untouched, so
+						// a restart restores it; nothing terminal is emitted.
+						this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+							channelId: idHex,
+							reason
+						});
+					}
+					return;
+				}
+				const deleted = row
+					? this.deleteChannelDurably(idHex)
+					: this.safeStorage(
+							() => this.storage!.deleteChannel(idHex),
+							'deleteChannel'
+					  );
+				if (!deleted) {
+					// The row survived: the abandonment is not terminal yet.
+					// Condemning the row itself makes the deletion owed at
+					// the next start (the intent rides the row, so no
+					// separate read can lose it); the terminal event fires
+					// only when the deletion lands.
+					if (!this.condemnChannelRow(idHex)) {
+						// Neither the deletion nor the durable intent
+						// landed: with no marker, a healthy restart would
+						// silently restore the row as a live channel. Keep
+						// it TRACKED instead, exactly like the recoverable
+						// failed-persist arm, so this removal re-runs
+						// against a store that answers.
+						try {
+							const channel = new Channel(row!.state);
+							const keyIndex = this.storage!.loadChannelKeyIndex(idHex);
+							this.channelManager.restoreChannel(
+								channel,
+								row!.peerPubkey,
+								keyIndex
+							);
+							this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+								channelId: idHex,
+								reason
+							});
+						} catch {
+							this.emitStructuredLog('channel', 'open_abandon_unresolved', {
+								channelId: idHex,
+								reason
+							});
+						}
+						return;
+					}
+					this.emitStructuredLog('channel', 'open_abandon_deferred', {
+						channelId: idHex,
+						reason
+					});
+					return;
+				}
+				this.emitStructuredLog('channel', 'open_abandoned', {
+					channelId: idHex,
+					reason
+				});
+				// The documented terminal lifecycle event for a removed
+				// unfunded channel, same as voidMissingFundingChannel.
+				this.emit('channel:voided', { channelId });
+			}
+		);
 
 		// A processActions batch is open: monitor changes it causes belong in
 		// that channel's transition rather than in a second, separate write.
@@ -2405,7 +2621,6 @@ export class LightningNode extends EventEmitter {
 					peerPubkey,
 					channelId: channelId?.toString('hex')
 				});
-				if (!this.peerManager) return;
 				// Deferred: the blocked batch may still be unwinding through
 				// nested dispatches; tearing the peer down mid-turn would pull
 				// state out from under them.
@@ -2415,6 +2630,12 @@ export class LightningNode extends EventEmitter {
 					} catch {
 						// Already disconnected, or transport-level teardown raced.
 					}
+					// A v2 opening whose blocked persist left memory ahead of
+					// disk (e.g. the replacement's commitment failed to
+					// commit) resyncs to the durable truth: the attempt on
+					// disk is the only one a restart would resume, so it is
+					// the only one this side may keep tracking.
+					this.resyncV2OpenFromDisk(channelId);
 				});
 			}
 		);
@@ -3853,13 +4074,37 @@ export class LightningNode extends EventEmitter {
 	 * embedder via channel:voided.
 	 */
 	private voidMissingFundingChannel(channelId: Buffer, txid: string): void {
-		if (!this.channelManager.voidChannel(channelId)) return;
 		const idHex = channelId.toString('hex');
+		// Durable FIRST: the live channel and its funding watch are only
+		// removed once the deletion, or at least the durable intent to
+		// delete, exists on disk. Removing them first and failing both
+		// writes would leave a storage-wide outage with neither a tracked
+		// channel nor a watch while the row silently restores at the next
+		// start.
+		const deleted = this.deleteChannelDurably(idHex);
+		if (!deleted && !this.condemnChannelRow(idHex)) {
+			this.emitStructuredLog('channel', 'channel_void_unresolved', {
+				channelId: idHex,
+				txid
+			});
+			return;
+		}
+		if (!this.channelManager.voidChannel(channelId)) return;
 		this.chainWatcher?.removeWatchedFunding(channelId);
-		this.safeStorage(() => this.storage!.deleteChannel(idHex), 'deleteChannel');
 		this.deletePendingFundingTx(
 			Buffer.from(txid, 'hex').reverse().toString('hex')
 		);
+		if (!deleted) {
+			// The row survived but is durably condemned: the removal
+			// proceeds and the terminal event fires when the deletion lands
+			// at the next start. Emitting it now would claim a deletion
+			// that did not happen.
+			this.emitStructuredLog('channel', 'channel_void_deferred', {
+				channelId: idHex,
+				txid
+			});
+			return;
+		}
 		this.emitStructuredLog('channel', 'channel_voided', {
 			channelId: idHex,
 			txid
@@ -3887,6 +4132,117 @@ export class LightningNode extends EventEmitter {
 				),
 			'savePendingFundingTxs'
 		);
+	}
+
+	/**
+	 * A blocked persist on a v2 OPENING left its in-memory channel ahead of
+	 * the row (the failed write may have carried a replacement attempt the
+	 * disk never saw). Re-restore the row, restart-equivalent: the durable
+	 * attempt is the only one a crash would resume, so it is the only one
+	 * this side may keep tracking; a provisional DUAL_FUNDING_V2 row rolls
+	 * back to its retained previous attempt exactly as a restart would.
+	 * The live registration is never removed here: restoreChannel registers
+	 * via a map overwrite, and every fallible step it runs (signer
+	 * construction, session restores, reestablish marking) happens BEFORE
+	 * that overwrite, so a throw anywhere leaves the previous object
+	 * tracked and success replaces it in one step. Scoped to v2 opening
+	 * shapes; established channels re-converge through the ordinary
+	 * reestablish and outbox replay.
+	 */
+	private resyncV2OpenFromDisk(channelId: Buffer | null): void {
+		if (!channelId || !this.storage) return;
+		const idHex = channelId.toString('hex');
+		let row: { state: IChannelState; peerPubkey: string } | null = null;
+		try {
+			row = this.storage.loadChannel?.(idHex) ?? null;
+		} catch {
+			return;
+		}
+		if (!row || !row.state.v2InFlight || row.state.condemned) return;
+		if (
+			row.state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
+			row.state.state !== ChannelState.DUAL_FUNDING_V2
+		) {
+			return;
+		}
+		try {
+			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
+				row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
+			}
+			const channel = new Channel(row.state);
+			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
+			this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
+			this.emitStructuredLog('channel', 'v2_open_resynced_from_disk', {
+				channelId: idHex
+			});
+		} catch {
+			// Nothing was removed: the stale in-memory channel stays tracked
+			// and the row is re-evaluated at the next start.
+		}
+	}
+
+	/**
+	 * Terminal channel-row deletion, routed through the recovery journal
+	 * (the channel_closed mutation; the storage layer cascades the outbox
+	 * rows) so the deletion is a journaled transition rather than a bare
+	 * storage write; falls back to the direct delete when recovery is
+	 * disabled. Returns whether the deletion landed.
+	 */
+	private deleteChannelDurably(idHex: string): boolean {
+		if (this.recovery) {
+			return this.commitMutations(
+				'deleteChannel',
+				[{ type: 'channel_closed', channelId: idHex }],
+				RecoveryCriticality.Important
+			);
+		}
+		return this.safeStorage(
+			() => this.storage!.deleteChannel(idHex),
+			'deleteChannel'
+		);
+	}
+
+	/**
+	 * Condemn the row itself: its durable deletion was decided but the
+	 * delete failed, so the intent is written INTO the row, atomic with the
+	 * state a restart reads. There is no separate tombstone store whose
+	 * read can fail and silently resurrect the channel: startup either
+	 * reads the condemned row (and deletes instead of restoring) or cannot
+	 * read the row at all, in which case nothing restores either. Returns
+	 * whether the intent is durable; a false answer means the caller must
+	 * keep the channel tracked.
+	 */
+	private condemnChannelRow(idHex: string): boolean {
+		try {
+			const row = this.storage?.loadChannel?.(idHex);
+			// No row: there is nothing a restart could resurrect.
+			if (!row) return true;
+			row.state.condemned = true;
+			// Journaled like every other durable channel transition: a
+			// verified-frame reconstruction must rebuild the row CONDEMNED,
+			// or recovery would resurrect a channel whose deletion was
+			// already decided.
+			if (this.recovery) {
+				return this.commitMutations(
+					'condemnChannel',
+					[
+						{
+							type: 'channel_state',
+							channelId: idHex,
+							state: row.state,
+							peerPubkey: row.peerPubkey
+						}
+					],
+					RecoveryCriticality.Important
+				);
+			}
+			return this.safeStorage(
+				() => this.storage!.saveChannel(idHex, row.state, row.peerPubkey),
+				'saveChannel'
+			);
+		} catch {
+			return false;
+		}
 	}
 
 	/** Record a signed funding tx we are obligated to broadcast. */
@@ -12955,6 +13311,27 @@ export class LightningNode extends EventEmitter {
 		const state = channel.getFullState();
 		if (state.state !== ChannelState.ERRORED) return;
 		if (!state.fundingTxid) return;
+		if (state.v2InFlight && !channel.isV2AttemptBroadcastable()) {
+			// A v2 open the peer provably cannot broadcast: our witnesses
+			// never left AND the funding tx still needs them, so a
+			// commitment spending its outpoint can never confirm and
+			// "closing on chain" is a fiction. This is the diverged-RBF
+			// terminal (the peer answered reestablish with unknown-channel
+			// after dropping its side); void the channel instead of
+			// broadcasting into nothing. A broadcastable attempt, including
+			// the zero-local-input case where the peer needs no witness
+			// bytes from us at all, keeps the watch and the force-close
+			// path below instead.
+			this.emitStructuredLog('channel', 'errored_unsigned_v2_voided', {
+				channelId: channelId.toString('hex'),
+				reason
+			});
+			this.voidMissingFundingChannel(
+				channelId,
+				state.fundingTxid.toString('hex')
+			);
+			return;
+		}
 		if (mustNotBroadcastCommitment(state)) {
 			// Proven stale or unprovable (recovery 5.6): broadcasting our
 			// commitment is forbidden; the peer's close resolves the channel.

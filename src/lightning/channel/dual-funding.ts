@@ -176,6 +176,47 @@ export class DualFundingSession {
 		this._maxFundingSatoshis = maxFundingSatoshis;
 	}
 
+	/**
+	 * Rebuild a session for an in-flight v2 open past the interactive-tx
+	 * negotiation (the funding tx is known and our inputs are signed into the
+	 * durable record). Used after a restart to resume the commitment_signed /
+	 * tx_signatures exchange over channel_reestablish.next_funding — no tx
+	 * builder is needed post-negotiation, and none could be rebuilt (the
+	 * wallet contribution closures die with the process).
+	 */
+	static restore(params: {
+		channelId: Buffer;
+		isInitiator: boolean;
+		remoteContributionSats: bigint;
+		fundingTxid: Buffer;
+		fundingOutputIndex: number;
+		/** Witnesses our released tx_signatures carried; null until it left. */
+		ourWitnesses: Buffer[][] | null;
+		receivedTxSignatures: boolean;
+		/**
+		 * The record's RBF attempt number. The session counter MUST match
+		 * the restored record, or the record looks like retained rollback
+		 * state and the next sync would erase it, unrecreatable from a
+		 * builder-less session.
+		 */
+		rbfCount?: number;
+	}): DualFundingSession {
+		const session = new DualFundingSession(
+			params.isInitiator,
+			params.channelId
+		);
+		session._remoteFundingSatoshis = params.remoteContributionSats;
+		session._fundingTxid = Buffer.from(params.fundingTxid);
+		session._fundingOutputIndex = params.fundingOutputIndex;
+		session._localWitnesses = params.ourWitnesses;
+		session._rbfCount = params.rbfCount ?? 0;
+		session._state =
+			params.ourWitnesses && params.receivedTxSignatures
+				? DualFundingState.AWAITING_CHANNEL_READY
+				: DualFundingState.AWAITING_TX_SIGNATURES;
+		return session;
+	}
+
 	// ─────────────── Getters ───────────────
 
 	getState(): DualFundingState {
@@ -837,6 +878,16 @@ export class DualFundingSession {
 		if (this._remoteParams) {
 			this._remoteParams.fundingFeeratePerkw = feerate;
 			this._remoteParams.locktime = locktime;
+		}
+		// The funding feerate is the opener's and applies to the whole
+		// replacement. Our local params were seeded from open_channel2, so
+		// they must follow the accepted RBF too: the negotiated-tx audit and
+		// the next in-flight record both read the feerate from local params,
+		// and leaving the old value there prices both against the replaced
+		// attempt.
+		if (this._localParams) {
+			this._localParams.fundingFeeratePerkw = feerate;
+			this._localParams.locktime = locktime;
 		}
 
 		this._state = DualFundingState.TX_NEGOTIATION;
