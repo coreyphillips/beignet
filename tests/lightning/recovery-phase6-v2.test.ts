@@ -935,6 +935,143 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			s3.loadAllChannels(),
 			'the residue row was removed durably'
 		).to.have.length(0);
+		// A DELETION-ONLY carry still gates: the deletion frame and the
+		// snapshot that carries the burned index are unreceipted, so the
+		// node must quarantine on the journal tip even though no repair
+		// mutations were committed.
+		expect(
+			(node2 as unknown as { startupRepairPending: boolean })
+				.startupRepairPending,
+			'deletion-only dispositions still await their receipt'
+		).to.equal(true);
+		node2.destroy();
+	});
+
+	it('a carried row whose deletion disposition fails refuses startup', function () {
+		// Sticky quorum + a wrapped-DUAL residue whose durable deletion
+		// cannot land: the disposition is not durable, so the node must not
+		// come up over it.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-delfail-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(37, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(68).toString('hex'),
+					preimage: makeSeed(69)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		const residue = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(38).basepoints,
+			localPerCommitmentSeed: makeSeed(38)
+		});
+		residue.channelId = crypto.randomBytes(32);
+		residue.state = ChannelState.AWAITING_REESTABLISH;
+		residue.preReestablishState = ChannelState.DUAL_FUNDING_V2;
+		const residueId = residue.channelId.toString('hex');
+		s2.saveChannel(residueId, residue, '02'.repeat(33));
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const realDelete = s3.deleteChannel.bind(s3);
+		s3.deleteChannel = (id: string): void => {
+			if (id === residueId) throw new Error('disk says no');
+			realDelete(id);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(37, { storage: s3, recovery: quorumRecovery() })
+				)
+		).to.throw(/could not be dispositioned durably/);
+		s3.close();
+	});
+
+	it('an upgraded journal writes the schema-repair snapshot and reconstruction keeps burned indices', function () {
+		// A head compacted by an older release omitted deleted channels'
+		// key-index rows. On the first boot of a release that knows better,
+		// the journal must append a fresh full snapshot even if the node is
+		// otherwise quiet, and reconstruction must then preserve the burned
+		// high-water mark.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-schema-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(39, { storage: s1, recovery: { enabled: true } })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(70).toString('hex'),
+					preimage: makeSeed(71)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		// The upgrade shape: a burned index whose channel is long gone, and
+		// a journal whose snapshot-schema marker predates the fix.
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.saveChannelKeyIndex('feed'.repeat(16), 7);
+		s2.setRecoveryMeta!('journal_snapshot_schema', '1');
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const node2 = new LightningNode(
+			makeNodeConfig(39, { storage: s3, recovery: { enabled: true } })
+		);
+		node2.on('node:error', () => {});
+		const journal = (
+			node2 as unknown as {
+				recovery: {
+					options: { journal?: { loadVerifiedFrames: () => unknown } };
+				};
+			}
+		).recovery.options.journal;
+		const rebuilt = new SqliteStorage(':memory:');
+		rebuilt.open();
+		reconstructFromFrames(
+			rebuilt,
+			journal!.loadVerifiedFrames() as Parameters<
+				typeof reconstructFromFrames
+			>[1]
+		);
+		expect(
+			rebuilt.loadNextChannelIndex(),
+			'the burned index survives reconstruction of the repaired head'
+		).to.be.at.least(8);
+		rebuilt.close();
 		node2.destroy();
 	});
 
@@ -1109,6 +1246,20 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			makeNodeConfig(nodeSeed, { storage: s3, recovery: q2.recovery })
 		);
 		node2.on('node:error', () => {});
+		// The deferred bring-up must end deterministically even when the
+		// reconnect pass explodes: contained as a node error, ready still
+		// reported, quarantine still lifted.
+		const nodeErrors: Array<{ code?: string }> = [];
+		node2.on('node:error', (e: { code?: string }) => nodeErrors.push(e));
+		let readyFired = false;
+		node2.on('node:ready', () => {
+			readyFired = true;
+		});
+		(
+			node2 as unknown as { autoReconnectPeers: () => void }
+		).autoReconnectPeers = () => {
+			throw new Error('reconnect exploded');
+		};
 		const pendingOf = (n: LightningNode): boolean =>
 			(n as unknown as { startupRepairPending: boolean }).startupRepairPending;
 		expect(
@@ -1131,6 +1282,12 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			node2.getChannelManager().getChannel(residue.channelId),
 			'the residue was deleted, not restored'
 		).to.equal(undefined);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(
+			nodeErrors.some((e) => e.code === 'STARTUP_RECONNECT_FAILED'),
+			'the throwing reconnect surfaced as a node error'
+		).to.equal(true);
+		expect(readyFired, 'the node still reported ready').to.equal(true);
 		node2.destroy();
 
 		// Guardian-only restore: the device burns; the trio must give back

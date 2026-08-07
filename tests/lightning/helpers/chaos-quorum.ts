@@ -231,10 +231,24 @@ export function quorumOptions(
 			});
 			return { enabled: true, durability, barrier: run.barrier };
 		},
-		afterRestart: async (): Promise<void> => {
+		afterRestart: async (_env, restored): Promise<void> => {
 			// Gateless quorum node: kicking replication is the integrator's
 			// job, and the restart IS the integrator here.
 			current!.barrier.kickReplication();
+			// The restarted (or restored) database may owe a startup repair
+			// receipt: carried v2 rows, or the one-time snapshot-schema
+			// repair a reconstructed database always takes (its meta does
+			// not ride the frames). The node quarantines its own traffic
+			// until the quorum receipts that repair, so the harness must
+			// wait it out before driving reestablish into closed gates,
+			// exactly as a real integrator's reconnect loop would retry.
+			if (restored) {
+				await waitFor(
+					() =>
+						!(restored as unknown as { startupRepairPending?: boolean })
+							.startupRepairPending
+				);
+			}
 		},
 		teardown: async (): Promise<void> => {
 			if (!current) return;

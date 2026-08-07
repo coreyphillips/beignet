@@ -199,6 +199,7 @@ import {
 	DurabilityBarrier,
 	chainLostBackfill,
 	chainPromisedQuorum,
+	storedTipSequence,
 	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
@@ -532,6 +533,8 @@ export class LightningNode extends EventEmitter {
 	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
 	/** True while a startup repair frame awaits its quorum receipt. */
 	private startupRepairPending = false;
+	/** Channel ids whose restore-time deletion disposition FAILED. */
+	private restoreDeletionFailures: string[] = [];
 	/**
 	 * When a re-authorization was last asked for, keyed by funding txid or, for
 	 * a splice, by channel id.
@@ -1119,22 +1122,46 @@ export class LightningNode extends EventEmitter {
 				);
 			}
 			this.restoreFromStorage();
+			// One-time snapshot-content repair: heads compacted by an older
+			// release omitted deleted channels' key-index rows, and a quiet
+			// upgraded node might never write a replacement frame. Forcing a
+			// fresh full snapshot here (once, versioned) restores the burned
+			// high-water marks to whatever the guardians hold next.
+			const schemaRepairSeq =
+				this.recoveryJournal?.snapshotSchemaRepair() ?? null;
+			if (schemaRepairSeq !== null) {
+				this.emitStructuredLog('channel', 'snapshot_schema_repaired', {
+					frameSequence: String(schemaRepairSeq)
+				});
+			}
 			// A carried row entered this database OUTSIDE the journal (it
 			// predates the record, or was written by a release without the
 			// preflight), so guardian reconstruction would omit a channel
 			// whose funding the peer may be able to broadcast. Repair that
 			// BEFORE any networking, fail-closed: one frame carries every
-			// carried row (with the key-index high-water mark riding the
-			// snapshot machinery), a failed append refuses startup outright,
-			// and the node stays quarantined behind its own traffic gates
-			// until the repair frame is quorum-RECEIPTED, so nothing this
-			// node ever says can outrun what the guardians can restore.
+			// still-tracked carried row, a carried row whose deletion
+			// disposition FAILED refuses startup outright, and the node stays
+			// quarantined behind its own traffic gates until the JOURNAL TIP
+			// (which covers the repair frame, every deletion frame written
+			// during restore, and the schema-repair snapshot) is
+			// quorum-RECEIPTED, so nothing this node ever says can outrun
+			// what the guardians can restore.
+			const failedCarried = carriedV2Rows.filter((idHex) =>
+				this.restoreDeletionFailures.includes(idHex)
+			);
+			if (failedCarried.length > 0) {
+				throw new Error(
+					`recovery: the carried v2 open(s) ${failedCarried.join(', ')} ` +
+						`could not be dispositioned durably (deletion failed); ` +
+						`refusing to start over an unrepaired quorum database`
+				);
+			}
 			const repairMutations: RecoveryMutation[] = [];
 			for (const idHex of carriedV2Rows) {
 				const channel = this.channelManager.getChannel(
 					Buffer.from(idHex, 'hex')
 				);
-				if (!channel) continue; // took a deletion disposition instead
+				if (!channel) continue; // took a (durable) deletion disposition
 				const peer = this.channelManager.getPeerForChannel(
 					Buffer.from(idHex, 'hex')
 				);
@@ -1159,14 +1186,27 @@ export class LightningNode extends EventEmitter {
 							`to start over an unrepaired quorum database`
 					);
 				}
-				if (barrier && repair.frameSequence !== null) {
-					this.startupRepairPending = true;
-					this.emitStructuredLog('channel', 'startup_repair_pending', {
-						frameSequence: String(repair.frameSequence),
-						channels: carriedV2Rows
-					});
-					barrier.kickReplication?.();
-					void barrier.whenReleased(repair.frameSequence).then((outcome) => {
+			}
+			// Receipt gating keys on the TIP, not one frame: deletion-only
+			// dispositions and the schema repair write frames this boot too,
+			// and receipts are cumulative, so the tip covers them all.
+			const repairTail =
+				barrier &&
+				(carriedV2Rows.length > 0 || schemaRepairSeq !== null) &&
+				this.storage
+					? storedTipSequence(this.storage)
+					: null;
+			if (barrier && repairTail !== null) {
+				this.startupRepairPending = true;
+				this.emitStructuredLog('channel', 'startup_repair_pending', {
+					frameSequence: String(repairTail),
+					channels: carriedV2Rows
+				});
+				barrier.kickReplication?.();
+				void barrier
+					.whenReleased(repairTail)
+					.then((outcome) => {
+						if (this._destroyed) return;
 						if (!outcome.released) {
 							// Quarantine holds: the operator sees why, and the
 							// gates keep refusing until a restart with a
@@ -1177,20 +1217,38 @@ export class LightningNode extends EventEmitter {
 							this.emit('node:error', {
 								code: 'STARTUP_REPAIR_UNRECEIPTED',
 								message:
-									`the carried v2 open's repair frame was not ` +
-									`accepted by a guardian quorum (${outcome.reason}); ` +
-									`the node stays quarantined`,
+									`the startup repair frames were not accepted by ` +
+									`a guardian quorum (${outcome.reason}); the node ` +
+									`stays quarantined`,
 								timestamp: Date.now()
 							} as ILightningError);
 							return;
 						}
 						this.startupRepairPending = false;
 						this.emitStructuredLog('channel', 'startup_repair_receipted', {
-							frameSequence: String(repair.frameSequence)
+							frameSequence: String(repairTail)
 						});
-						this.autoReconnectPeers();
+						// The deferred bring-up must end in a deterministic
+						// outcome: a throwing reconnect pass surfaces as a node
+						// error and the node still reports ready, rather than
+						// leaving traffic permitted with startup half-done.
+						try {
+							this.autoReconnectPeers();
+						} catch (err) {
+							this.emit('node:error', {
+								code: 'STARTUP_RECONNECT_FAILED',
+								message: `post-repair reconnect failed: ${
+									err instanceof Error ? err.message : String(err)
+								}`,
+								timestamp: Date.now()
+							} as ILightningError);
+							this.emitReady();
+						}
+					})
+					.catch(() => {
+						// whenReleased never rejects by contract; belt and
+						// braces so a broken barrier cannot strand the promise.
 					});
-				}
 			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1); deferred
 			// to the receipt callback while the repair quarantine holds.
@@ -1470,10 +1528,20 @@ export class LightningNode extends EventEmitter {
 			// still asks gets the manager's unknown-channel error and gives
 			// the attempt up.
 			if (state.state === ChannelState.DUAL_FUNDING_V2) {
-				this.deleteChannelDurably(channelId);
-				this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
-					channelId
-				});
+				if (this.deleteChannelDurably(channelId)) {
+					this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
+						channelId
+					});
+				} else {
+					// Fail closed: the row stays on disk (retried next start),
+					// the channel is NOT restored, and a quorum startup that
+					// was carrying this row refuses to come up over the
+					// undispositioned residue.
+					this.restoreDeletionFailures.push(channelId);
+					this.emitStructuredLog('channel', 'v2_rbf_residue_removal_failed', {
+						channelId
+					});
+				}
 				continue;
 			}
 			const channel = new Channel(state);

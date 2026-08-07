@@ -353,10 +353,23 @@ export class PeerManager extends EventEmitter {
 		if (typeof stabilityTimer.unref === 'function') stabilityTimer.unref();
 		this.stabilityTimers.set(pubkey, stabilityTimer);
 		captureWireEvent('connect', pubkey, 'outbound');
-		this.emit('peer:connect', pubkey);
+		// A throwing peer:connect listener must not wedge the connection:
+		// the peer is already registered and ready, so skipping the release
+		// would leave held traffic accumulating forever, and letting the
+		// throw unwind would reject a connect that in fact succeeded.
+		try {
+			this.emit('peer:connect', pubkey);
+		} catch (err) {
+			this.emit(
+				'peer:error',
+				pubkey,
+				err instanceof Error ? err : new Error(String(err))
+			);
+		}
 		// Bring-up is complete: registration, bookkeeping and the connect
-		// handlers all ran, so the held post-handshake traffic (if any)
-		// now delivers in order against a fully wired connection.
+		// handlers all ran (or failed contained), so the held post-handshake
+		// traffic (if any) now delivers in order against a fully wired
+		// connection.
 		peer.releaseHeldMessages();
 	}
 
@@ -959,9 +972,17 @@ export class PeerManager extends EventEmitter {
 				// Do NOT store inbound peer address — peer.port is the TCP source (ephemeral) port,
 				// not the node's listening port. Reconnect attempts to ephemeral ports always fail.
 				captureWireEvent('connect', pubkey, 'inbound');
-				this.emit('peer:connect', pubkey);
-				// Bring-up is complete (see the outbound twin): deliver the
-				// held post-handshake traffic in order.
+				// Contained like the outbound twin: a throwing connect hook
+				// must neither wedge the held queue nor unwind bookkeeping.
+				try {
+					this.emit('peer:connect', pubkey);
+				} catch (err) {
+					this.emit(
+						'peer:error',
+						pubkey,
+						err instanceof Error ? err : new Error(String(err))
+					);
+				}
 				peer.releaseHeldMessages();
 			})
 			.catch(() => {

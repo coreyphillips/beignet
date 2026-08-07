@@ -122,7 +122,7 @@ describe('Peer held post-handshake delivery', function () {
 		expect(seen).to.have.length(3);
 	});
 
-	it('contains a throwing listener as a peer error and stops delivery', function () {
+	it('a throwing listener surfaces as a peer error and CLOSES the connection', function () {
 		const peer = bareHeldPeer();
 		const seen: number[] = [];
 		const errors: Error[] = [];
@@ -136,12 +136,94 @@ describe('Peer held post-handshake delivery', function () {
 		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
 		peer.releaseHeldMessages();
 
-		// The first delivery threw: surfaced as a peer error, and the rest
-		// of the queue is dropped rather than dispatched into a session
-		// whose bring-up bookkeeping just unwound.
+		// The first delivery threw: surfaced as a peer error, the rest of
+		// the queue dropped, and the connection CLOSED, exactly like the
+		// live loop's undecodable-frame path. Later frames must not run
+		// after a missing predecessor.
 		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
 		expect(errors).to.have.length(1);
 		expect(errors[0].message).to.contain('handler exploded');
+		expect(
+			(peer as unknown as { state: string }).state,
+			'the peer is no longer ready'
+		).to.not.equal('ready');
+	});
+
+	it('reentrant arrivals queue BEHIND the remaining held frames', function () {
+		const peer = bareHeldPeer();
+		const seen: number[] = [];
+		peer.on('message', (type: number) => {
+			seen.push(type);
+			// A synchronous transport delivers a NEW frame while older held
+			// frames are still draining: it must not overtake them.
+			if (seen.length === 1) {
+				feed(peer, MessageType.TX_COMPLETE, Buffer.from([9]));
+			}
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
+		peer.releaseHeldMessages();
+		expect(seen).to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_ADD_INPUT,
+			MessageType.TX_COMPLETE
+		]);
+	});
+
+	it('a throwing peer:connect hook neither wedges the release nor fails the connect', async function () {
+		const events: string[] = [];
+		const realRelease = Peer.prototype.releaseHeldMessages;
+		Peer.prototype.releaseHeldMessages = function (
+			this: Peer,
+			...args: []
+		): void {
+			events.push('release');
+			return realRelease.apply(this, args);
+		};
+		const a = new LightningNode(makeNodeConfig(13));
+		const b = new LightningNode(makeNodeConfig(14));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmOf = (n: LightningNode): NodeJS.EventEmitter =>
+				(n as unknown as { peerManager: NodeJS.EventEmitter }).peerManager;
+			// Hostile hooks on BOTH sides.
+			pmOf(a).on('peer:connect', () => {
+				throw new Error('outbound hook exploded');
+			});
+			pmOf(b).on('peer:connect', () => {
+				throw new Error('inbound hook exploded');
+			});
+			pmOf(a).on('peer:error', () => {});
+			pmOf(b).on('peer:error', () => {});
+
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// The connect must RESOLVE despite the throwing hook.
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 500));
+
+			expect(
+				events.filter((e) => e === 'release'),
+				'both sides still released their held traffic'
+			).to.have.length(2);
+			const peersOf = (n: LightningNode): Map<string, unknown> =>
+				(
+					n as unknown as {
+						peerManager: { peers: Map<string, unknown> };
+					}
+				).peerManager.peers;
+			expect(peersOf(a).size, 'outbound stays registered').to.equal(1);
+			expect(peersOf(b).size, 'inbound stays registered').to.equal(1);
+		} finally {
+			Peer.prototype.releaseHeldMessages = realRelease;
+			a.destroy();
+			b.destroy();
+		}
 	});
 
 	it('stops delivering the moment the connection leaves ready', function () {

@@ -60,6 +60,16 @@ const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
  */
 const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 /**
+ * Snapshot content versioning. '2' = snapshots carry the WHOLE
+ * channel_key_indices table, including entries whose channel was deleted
+ * (the high-water mark that prevents key reuse). Snapshots written before
+ * this omitted them, so a guardian head compacted by an older release can
+ * restore a reset key index; snapshotSchemaRepair() closes that on the
+ * first startup of a release that knows better.
+ */
+const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
+const SNAPSHOT_SCHEMA_VERSION = '2';
+/**
  * Monotonic record that this journal has written at least one `quorum` frame
  * (Phase 6, spec 5.8). Only ever set, never cleared: it is the writer's own
  * memory of a promise it made to every future restore of this chain.
@@ -249,7 +259,12 @@ export function journalSupported(storage: IStorageBackend): boolean {
 		typeof storage.loadRecoveryFrames === 'function' &&
 		typeof storage.deleteRecoveryFramesBelow === 'function' &&
 		typeof storage.getRecoveryMeta === 'function' &&
-		typeof storage.setRecoveryMeta === 'function'
+		typeof storage.setRecoveryMeta === 'function' &&
+		// Snapshots must be able to carry EVERY key-index row, deleted
+		// channels included: a backend that can only enumerate live
+		// channels would hand reconstruction a reset next-index and reopen
+		// key reuse, so it does not get a journal at all.
+		typeof storage.loadAllChannelKeyIndices === 'function'
 	);
 }
 
@@ -717,6 +732,40 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * transaction: the tables it reads already include the current
 	 * transition's writes, so the snapshot is exact as of this sequence.
 	 */
+	/**
+	 * One-time snapshot-content repair (see META_SNAPSHOT_SCHEMA). A head
+	 * compacted by an older release omitted deleted channels' key-index
+	 * rows; append a fresh full snapshot so the guardian head regains the
+	 * burned indices, and record coverage so this runs once. Returns the
+	 * snapshot's sequence for receipt gating, or null when already covered
+	 * or when nothing was ever journaled (the first real snapshot will
+	 * carry the full table by construction).
+	 */
+	snapshotSchemaRepair(): bigint | null {
+		if (
+			this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA) ===
+			SNAPSHOT_SCHEMA_VERSION
+		) {
+			return null;
+		}
+		const tip = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
+		if (tip == null || tipHash == null) {
+			this.storage.setRecoveryMeta!(
+				META_SNAPSHOT_SCHEMA,
+				SNAPSHOT_SCHEMA_VERSION
+			);
+			return null;
+		}
+		const sequence = BigInt(tip) + 1n;
+		this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+		this.storage.setRecoveryMeta!(
+			META_SNAPSHOT_SCHEMA,
+			SNAPSHOT_SCHEMA_VERSION
+		);
+		return sequence;
+	}
+
 	private appendSnapshotFrame(
 		sequence: bigint,
 		previousFrameHash: Buffer
@@ -821,17 +870,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			// deleted channel's index row is the high-water mark that keeps
 			// the next open from reusing its keys, and a snapshot composed
 			// after the deletion is the only carrier a reconstruction has.
-			keyIndices:
-				storage.loadAllChannelKeyIndices?.() ??
-				channels
-					.map((c) => ({
-						channelId: c.channelId,
-						channelIndex: storage.loadChannelKeyIndex(c.channelId)
-					}))
-					.filter(
-						(k): k is { channelId: string; channelIndex: number } =>
-							k.channelIndex != null
-					),
+			// journalSupported() made the enumeration mandatory.
+			keyIndices: storage.loadAllChannelKeyIndices!(),
 			chainMonitors: storage.loadAllChainMonitors(),
 			preimages: storage.loadAllPreimages(),
 			payments: storage.loadAllPayments(),

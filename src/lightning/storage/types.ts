@@ -145,8 +145,11 @@ export interface IStorageBackend {
 	/**
 	 * Every stored key-index row, INCLUDING entries whose channel was
 	 * deleted (deletion keeps them: they are the high-water mark that
-	 * prevents key reuse). Optional so partial test backends keep working;
-	 * snapshots fall back to live-channel derivation without it.
+	 * prevents key reuse). Optional in the TYPE so partial test backends
+	 * keep compiling, but MANDATORY for journal-capable storage:
+	 * journalSupported() refuses a backend without it, because a snapshot
+	 * that can only enumerate live channels hands reconstruction a reset
+	 * next-index and reopens key reuse.
 	 */
 	loadAllChannelKeyIndices?(): Array<{
 		channelId: string;

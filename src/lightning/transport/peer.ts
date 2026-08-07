@@ -693,17 +693,33 @@ export class Peer extends EventEmitter {
 	 */
 	releaseHeldMessages(): void {
 		const held = this.heldMessages;
-		this.heldMessages = null;
 		if (!held) return;
-		for (const { type, payload } of held) {
-			if (this.state !== 'ready') return;
+		// Drain IN PLACE: a synchronous transport or reentrant callback can
+		// deliver new frames while older ones are still draining, and those
+		// must queue BEHIND the remaining held frames, not overtake them
+		// (handleMessage keeps appending while heldMessages is non-null).
+		while (held.length > 0) {
+			if (this.state !== 'ready') {
+				// Torn down mid-release: the undelivered tail dies with the
+				// connection, exactly as unread socket bytes would.
+				this.heldMessages = null;
+				return;
+			}
+			const next = held.shift()!;
 			try {
-				this.emit('message', type, payload);
+				this.emit('message', next.type, next.payload);
 			} catch (err) {
+				// A failed handler mid-stream: delivering LATER frames after
+				// a missing predecessor would hand the state machines a gap,
+				// so surface the error and close, exactly as the live
+				// message loop does for an undecodable frame.
+				this.heldMessages = null;
 				this.emit('error', err instanceof Error ? err : new Error(String(err)));
+				this.disconnect();
 				return;
 			}
 		}
+		this.heldMessages = null;
 	}
 
 	// ─── Ping/Pong ─────────────────────────────────────────────
