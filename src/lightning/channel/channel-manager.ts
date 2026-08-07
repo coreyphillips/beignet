@@ -4081,6 +4081,25 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
 
+		// A node that does not advertise option_dual_fund never negotiated
+		// v2 opens, so an inbound open_channel2 is out of contract however
+		// it arrived (features are advisory on the wire: cached, raced, or
+		// ignored). Refuse ahead of everything with an effect: no keys
+		// derived, no temp channel, no row. This is what makes a masked
+		// feature vector (quorum + preferTaproot masks the bit because
+		// taproot v2 signing does not exist) hold on the INBOUND side too.
+		// A manager built without a feature vector negotiates for itself
+		// and is left alone.
+		const localFeatures = this.config.localFeatures;
+		if (localFeatures && !localFeatures.hasFeature(Feature.DUAL_FUND)) {
+			this.emit(
+				'error',
+				msg.channelId,
+				'open_channel2 refused: this node does not advertise option_dual_fund'
+			);
+			return;
+		}
+
 		// Reject opens for a chain we do not operate on (the v1 open path
 		// applies the same guard).
 		if (

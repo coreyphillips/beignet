@@ -604,6 +604,174 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		storage.close();
 	});
 
+	it('refuses a record-less DUAL_FUNDING_V2 row BEFORE restore deletes it', function () {
+		const storage = openStorage();
+		// Restoration removes record-less DUAL_FUNDING_V2 rows durably (RBF
+		// residue) and can journal frames while doing it. The preflight has
+		// to run first: it throws with the DATABASE UNTOUCHED, so the
+		// operator's async-remote retry still finds the row and takes the
+		// ordinary residue path.
+		const inFlight = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(23).basepoints,
+			localPerCommitmentSeed: makeSeed(23)
+		});
+		inFlight.channelId = crypto.randomBytes(32);
+		inFlight.state = ChannelState.DUAL_FUNDING_V2;
+		const idHex = inFlight.channelId.toString('hex');
+		storage.saveChannel(idHex, inFlight, '02'.repeat(33));
+
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(23, {
+						storage,
+						recovery: quorumRecovery()
+					})
+				)
+		).to.throw(/no durable in-flight record is in progress/);
+		// The refusal fired BEFORE restoration: the row is still there.
+		expect(
+			storage.loadAllChannels().map((row) => row.channelId),
+			'the preflight left the database untouched'
+		).to.deep.equal([idHex]);
+
+		// Async-remote takes the ordinary residue path: the row is removed
+		// durably at restore, nothing is tracked.
+		const asyncNode = new LightningNode(
+			makeNodeConfig(23, { storage, recovery: { enabled: true } })
+		);
+		asyncNode.on('node:error', () => {});
+		expect(asyncNode.getChannelManager().listChannels()).to.have.length(0);
+		expect(storage.loadAllChannels()).to.have.length(0);
+		asyncNode.destroy();
+	});
+
+	it('refuses a record-less v2 row even past tx_signatures states', function () {
+		const storage = openStorage();
+		// AWAITING_FUNDING_CONFIRMED with fundingVersion 2 and no record:
+		// a healthy post-#304 open carries the record until NORMAL, so this
+		// shape is a legacy row, and it cannot answer a peer's next_funding
+		// (the splice handler replies tx_abort). Quorum refuses it too.
+		const inFlight = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(24).basepoints,
+			localPerCommitmentSeed: makeSeed(24)
+		});
+		inFlight.channelId = crypto.randomBytes(32);
+		inFlight.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		inFlight.fundingVersion = 2;
+		storage.saveChannel(
+			inFlight.channelId.toString('hex'),
+			inFlight,
+			'02'.repeat(33)
+		);
+
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(24, {
+						storage,
+						recovery: quorumRecovery()
+					})
+				)
+		).to.throw(/no durable in-flight record is in progress/);
+
+		// Async-remote comes up over it for the operator to finish.
+		const asyncNode = new LightningNode(
+			makeNodeConfig(24, { storage, recovery: { enabled: true } })
+		);
+		asyncNode.on('node:error', () => {});
+		expect(asyncNode.getChannelManager().listChannels()).to.have.length(1);
+		asyncNode.destroy();
+	});
+
+	it('leaves a v1 AWAITING_FUNDING_CONFIRMED row alone', function () {
+		const storage = openStorage();
+		// The later-state clauses are scoped to fundingVersion 2: an
+		// ordinary v1 open awaiting depth resumes fine and must not trip
+		// the preflight.
+		const v1 = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(25).basepoints,
+			localPerCommitmentSeed: makeSeed(25)
+		});
+		v1.channelId = crypto.randomBytes(32);
+		v1.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		storage.saveChannel(v1.channelId.toString('hex'), v1, '02'.repeat(33));
+
+		const node = quorumNode(25, storage);
+		expect(node.getChannelManager().listChannels()).to.have.length(1);
+		node.destroy();
+	});
+
+	it('a masked node refuses an inbound open_channel2 before it allocates anything', async function () {
+		const storage = openStorage();
+		// quorum + preferTaproot masks option_dual_fund; features are
+		// advisory on the wire, so the handler must hold the line itself:
+		// no keys derived, no temp channel, no row.
+		const node = new LightningNode({
+			...makeNodeConfig(26, {
+				storage,
+				recovery: quorumRecovery(),
+				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
+			}),
+			preferTaproot: true
+		});
+		node.on('node:error', () => {});
+		node.on('error', () => {});
+		const manager = managerOf(node);
+		const errors: string[] = [];
+		manager.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		const sent: number[] = [];
+		node.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+
+		const peerSide = makeBasepoints(27);
+		const openMsg = encodeOpenChannel2Message({
+			chainHash: REGTEST_CHAIN_HASH,
+			channelId: crypto.randomBytes(32),
+			fundingFeeratePerkw: 1000,
+			commitmentFeeratePerkw: 253,
+			fundingSatoshis: 150_000n,
+			dustLimitSatoshis: 546n,
+			maxHtlcValueInFlightMsat: 500_000_000n,
+			htlcMinimumMsat: 1n,
+			toSelfDelay: 144,
+			maxAcceptedHtlcs: 483,
+			locktime: 0,
+			fundingPubkey: peerSide.basepoints.fundingPubkey,
+			revocationBasepoint: peerSide.basepoints.revocationBasepoint,
+			paymentBasepoint: peerSide.basepoints.paymentBasepoint,
+			delayedPaymentBasepoint: peerSide.basepoints.delayedPaymentBasepoint,
+			htlcBasepoint: peerSide.basepoints.htlcBasepoint,
+			firstPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			secondPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			channelFlags: 1
+		});
+		manager.handleMessage('02'.repeat(33), MessageType.OPEN_CHANNEL2, openMsg);
+		await settle(() => errors.length > 0, 1500);
+
+		expect(errors.join(' ')).to.contain('does not advertise option_dual_fund');
+		expect(sent).to.not.include(MessageType.ACCEPT_CHANNEL2);
+		expect(manager.listChannels()).to.have.length(0);
+		expect(storage.loadAllChannels()).to.have.length(0);
+
+		node.destroy();
+	});
+
 	it('comes up RESUMABLE over a recorded v2 open', function () {
 		const storage = openStorage();
 		// A row carrying the durable v2InFlight record: restoreChannel marks

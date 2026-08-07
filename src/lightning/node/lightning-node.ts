@@ -1100,45 +1100,16 @@ export class LightningNode extends EventEmitter {
 
 		// Restore from storage if available
 		if (this.storage) {
-			this.restoreFromStorage();
-			// A RECORDED in-flight v2 open (v2InFlight) restores resumable and
-			// quorum carries it: the record is exactly what makes the round
-			// provable again. A record-less legacy row is different in kind:
-			// it restores without a session, cannot answer a retransmitted
-			// tx_signatures, ignores funding confirmation, and may already
-			// have crossed commitment_signed, so carrying it under quorum
-			// would snapshot state the mode cannot actually resume. Refuse to
-			// come up over it; finish or abandon it under async-remote first.
+			// The quorum eligibility preflight runs BEFORE restoration touches
+			// anything: restore deletes record-less DUAL_FUNDING_V2 rows
+			// durably (RBF residue) and can journal the first quorum frame
+			// while doing it, so a post-restore scan would both miss rows and
+			// leave a half-mutated database behind its own refusal, making
+			// the suggested async-remote retry impossible.
 			if (barrier?.enforcing === true) {
-				for (const channel of this.channelManager.listChannels()) {
-					const full = channel.getFullState();
-					// restoreChannel marks a resumable open for reestablish
-					// before this guard runs: look through AWAITING_REESTABLISH
-					// to the state it will return to.
-					const st =
-						full.state === ChannelState.AWAITING_REESTABLISH &&
-						full.preReestablishState
-							? full.preReestablishState
-							: full.state;
-					if (
-						st !== ChannelState.DUAL_FUNDING_V2 &&
-						st !== ChannelState.AWAITING_TX_SIGNATURES
-					) {
-						continue;
-					}
-					if (full.v2InFlight) continue;
-					const id = (
-						channel.getChannelId() ?? channel.getTemporaryChannelId()
-					).toString('hex');
-					throw new Error(
-						`recovery: cannot enable quorum durability while a ` +
-							`dual-funded open with no durable in-flight record is in ` +
-							`progress (channel ${id} is ${st}); it cannot resume over ` +
-							`reestablish, so finish or abandon it under async-remote ` +
-							`durability first`
-					);
-				}
+				this.assertQuorumCanCarryStoredV2Opens();
 			}
+			this.restoreFromStorage();
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
@@ -1266,6 +1237,53 @@ export class LightningNode extends EventEmitter {
 	}
 
 	// ─────────────── Storage Restore ───────────────
+
+	/**
+	 * Quorum eligibility preflight over the STORED rows, read-only, before
+	 * restoration mutates or journals anything.
+	 *
+	 * A RECORDED in-flight v2 open (v2InFlight) is resumable and quorum
+	 * carries it: the record is exactly what makes the round provable
+	 * again. A record-less v2 row is different in kind: it restores
+	 * without a session, cannot answer a retransmitted tx_signatures or a
+	 * peer's next_funding (the splice handler answers with tx_abort),
+	 * and ignores funding confirmation, so carrying it would snapshot
+	 * state the mode cannot actually resume. That covers every pre-NORMAL
+	 * v2 state: DUAL_FUNDING_V2 and AWAITING_TX_SIGNATURES always, and
+	 * AWAITING_FUNDING_CONFIRMED / AWAITING_CHANNEL_READY when the row is
+	 * fundingVersion 2 (a v1 row in those states resumes fine and is left
+	 * alone). Refuse to come up; finish or abandon it under async-remote
+	 * first, which this preflight keeps possible by throwing before a
+	 * single row is deleted or a single frame is written.
+	 */
+	private assertQuorumCanCarryStoredV2Opens(): void {
+		for (const row of this.storage!.loadAllChannels()) {
+			const state = row.state;
+			if (state.v2InFlight) continue;
+			// A row persisted mid-reestablish carries the state it will
+			// return to; judge that one.
+			const st =
+				state.state === ChannelState.AWAITING_REESTABLISH &&
+				state.preReestablishState
+					? state.preReestablishState
+					: state.state;
+			const alwaysV2 =
+				st === ChannelState.DUAL_FUNDING_V2 ||
+				st === ChannelState.AWAITING_TX_SIGNATURES;
+			const v2Later =
+				state.fundingVersion === 2 &&
+				(st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+					st === ChannelState.AWAITING_CHANNEL_READY);
+			if (!alwaysV2 && !v2Later) continue;
+			throw new Error(
+				`recovery: cannot enable quorum durability while a ` +
+					`dual-funded open with no durable in-flight record is in ` +
+					`progress (channel ${row.channelId} is ${st}); it cannot ` +
+					`resume over reestablish, so finish or abandon it under ` +
+					`async-remote durability first`
+			);
+		}
+	}
 
 	private restoreFromStorage(): void {
 		if (!this.storage) return;
