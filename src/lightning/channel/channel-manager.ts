@@ -187,13 +187,6 @@ const NAMESPACE_LOST_REFUSAL =
 	'could never be proven durable; close the existing channels and provision ' +
 	'a new namespace';
 
-/** Why a dual-funded open is refused while quorum durability is enforced. */
-export const QUORUM_NO_DUAL_FUND_REFUSAL =
-	'recovery: quorum durability does not open dual-funded (v2) channels, ' +
-	'because the interactive-funding session is not durable and BOLT 2 ' +
-	'resumption of the signature exchange is not implemented; open a v1 ' +
-	'channel, or run this node in async-remote durability';
-
 /** One channel's held batches, released strictly in order. */
 interface IBarrierQueue {
 	peerPubkey: string;
@@ -3979,17 +3972,6 @@ export class ChannelManager extends EventEmitter {
 		params: IDualFundingParams,
 		opts?: { trusted?: boolean }
 	): Channel {
-		// FIRST, ahead of every other check: this is the pre-allocation
-		// boundary. Nothing below it may run, because everything below it has
-		// an effect worth undoing (a derivation index, a signer, a temp
-		// channel, wallet inputs the caller reserved for the open). The
-		// refusal is a throw rather than a v1 fallback: this API is
-		// explicitly dual-funded and the caller may be contributing its own
-		// inputs, so quietly opening something else would be answering a
-		// different question than the one asked.
-		if (this._quorumRefusesDualFunding()) {
-			throw new Error(QUORUM_NO_DUAL_FUND_REFUSAL);
-		}
 		if (opts?.trusted && !this.zeroConfManager.isTrustedPeer(peerPubkey)) {
 			throw new Error(
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
@@ -4098,17 +4080,6 @@ export class ChannelManager extends EventEmitter {
 
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
-
-		// Quorum mode masks option_dual_fund, so a compliant peer never sends
-		// this. Feature negotiation is advisory though: it can be cached,
-		// raced against a mode change, or simply ignored, so the handler
-		// refuses for itself, ahead of everything with an effect. It is the
-		// unsupported-open path and nothing else: no keys derived, no index
-		// advanced, no temp channel, no row.
-		if (this._quorumRefusesDualFunding()) {
-			this.emit('error', msg.channelId, QUORUM_NO_DUAL_FUND_REFUSAL);
-			return;
-		}
 
 		// Reject opens for a chain we do not operate on (the v1 open path
 		// applies the same guard).
@@ -5237,30 +5208,6 @@ export class ChannelManager extends EventEmitter {
 		if (this._namespaceCannotRecordANewChannel()) {
 			throw new Error(NAMESPACE_LOST_REFUSAL);
 		}
-	}
-
-	/**
-	 * Quorum mode does not START dual-funded (v2) opens.
-	 *
-	 * What quorum promises is that once a peer has seen new channel state from
-	 * us, enough remote information exists to restore that state and resume
-	 * the channel. The v2 opening round cannot keep that promise past its
-	 * first commitment_signed: BOLT 2 requires the opener to remember the
-	 * funding transaction and resume the signature exchange through
-	 * channel_reestablish.next_funding, while this implementation holds the
-	 * interactive-funding session in memory alone and discards it on
-	 * disconnect. Barrier-gating commitment_signed and tx_signatures keeps
-	 * those messages behind quorum durability; it does NOT make the state
-	 * needed to resume them durable, and the two are not the same thing.
-	 *
-	 * So the mode refuses the one thing it cannot honour, rather than
-	 * documenting an exception to the invariant the whole phase advertises.
-	 * This is about STARTING a v2 open: an established channel that was
-	 * originally opened with v2 is an ordinary channel and is untouched, as
-	 * are splices, which are interactive-tx but not opens.
-	 */
-	private _quorumRefusesDualFunding(): boolean {
-		return this.config.durabilityBarrier?.enforcing === true;
 	}
 
 	/**

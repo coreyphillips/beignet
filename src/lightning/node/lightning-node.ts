@@ -900,18 +900,6 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
-		// option_dual_fund: quorum durability refuses to START a v2 open (see
-		// ChannelManager, QUORUM_NO_DUAL_FUND_REFUSAL), so it must not invite
-		// one either. A peer that reads the bit and opens accordingly would be
-		// answered with a refusal it could have been spared, and our own
-		// openChannel routes by this same bit, so clearing it is also what
-		// makes the generic API choose v1 rather than a v2 its own manager
-		// will reject. Advertising is only half of it: negotiation is advisory
-		// and the handler guards refuse for themselves regardless.
-		if (barrier?.enforcing === true) {
-			localFeatures.clearBit(Feature.DUAL_FUND);
-			localFeatures.clearBit(Feature.DUAL_FUND + 1);
-		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1101,43 +1089,6 @@ export class LightningNode extends EventEmitter {
 		// Restore from storage if available
 		if (this.storage) {
 			this.restoreFromStorage();
-			// Turning quorum ON is the one moment a v2 opening session and
-			// quorum durability can meet: the mode refuses to START a v2 open,
-			// but a session begun under async-remote can be sitting in the
-			// restored state when the operator switches. Refuse to come up
-			// rather than carry it: that session may already have crossed
-			// commitment_signed, so silently abandoning it would discard a
-			// funding round the peer may be able to complete, and continuing
-			// would claim an exactness this node cannot deliver for it.
-			// Finish or abandon it under async-remote first.
-			if (barrier?.enforcing === true) {
-				for (const channel of this.channelManager.listChannels()) {
-					const full = channel.getFullState();
-					// restoreChannel marks a resumable (recorded) open for
-					// reestablish before this guard runs: look through
-					// AWAITING_REESTABLISH to the state it will return to, so
-					// the guard keeps seeing the in-flight open either way.
-					const st =
-						full.state === ChannelState.AWAITING_REESTABLISH &&
-						full.preReestablishState
-							? full.preReestablishState
-							: full.state;
-					if (
-						st !== ChannelState.DUAL_FUNDING_V2 &&
-						st !== ChannelState.AWAITING_TX_SIGNATURES
-					) {
-						continue;
-					}
-					const id = (
-						channel.getChannelId() ?? channel.getTemporaryChannelId()
-					).toString('hex');
-					throw new Error(
-						`recovery: cannot enable quorum durability while a dual-funded ` +
-							`open is in progress (channel ${id} is ${st}); finish or ` +
-							`abandon it under async-remote durability first`
-					);
-				}
-			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}

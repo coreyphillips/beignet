@@ -14,18 +14,14 @@
  *   working channel; a durable in-flight record means both sides must
  *   still agree on the splice after reestablish.
  * - Temporary to permanent channel id promotion (row 10, D1 required):
- *   covered here through its quorum-mode scope limit. Phase 6 refuses NEW
- *   v2 opens whenever quorum enforcement is active
- *   (`QUORUM_NO_DUAL_FUND_REFUSAL`), and the handoff is explicit that the
- *   matrix must assert that refusal rather than route around it. The
- *   refusal is what makes the row's kill points unreachable in quorum
- *   mode, and it must hold BEFORE any side effect: no key derivation, no
- *   channel index increment, no temporary channel registered, no wire
- *   message.
+ *   the S7 sweeps drive every boundary of the promotion window and require
+ *   each recorded (promoted) cell to complete the open after the restart.
+ *   Quorum no longer scopes this row: the durable v2InFlight record lifted
+ *   the phase 6 refusal, so quorum-mode coverage runs the SAME kill points
+ *   with the irreversible sends behind the barrier.
  */
 
 import { expect } from 'chai';
-import { QUORUM_NO_DUAL_FUND_REFUSAL } from '../../src/lightning/channel/channel-manager';
 import crypto from 'crypto';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
@@ -33,16 +29,13 @@ import { ChannelState } from '../../src/lightning/channel/types';
 import { IFundingProvider } from '../../src/lightning/node/types';
 import {
 	IChaosEnvOptions,
-	makeChaosEnv,
 	recordSchedule,
 	runKillPoint,
 	settle
 } from './helpers/chaos-harness';
-import { quorumOptions, withNamespace } from './helpers/chaos-quorum';
 import {
 	CHAOS_ENV,
 	makeChaosSpliceWallet,
-	s1aSenderPays,
 	s4SplicesIn,
 	s7OpensV2
 } from './helpers/chaos-scenarios';
@@ -72,67 +65,6 @@ function v2FundingProvider(): IFundingProvider {
 }
 
 describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
-	it('quorum mode refuses a new v2 open before any side effect, so the promotion row has no reachable kill points there', async function () {
-		this.timeout(60_000);
-		const options = quorumOptions();
-		const scenario = withNamespace(s1aSenderPays)();
-		const env = await makeChaosEnv('quorum', options);
-		try {
-			await scenario.setup(env);
-			const manager = env.victim.getChannelManager();
-			const indexBefore = (manager as unknown as { nextChannelIndex: number })
-				.nextChannelIndex;
-			const channelsBefore = manager.listChannels().length;
-			const sentBefore = env.relay.captured.length;
-
-			let refusal: Error | null = null;
-			try {
-				manager.createDualFundedChannel(env.peers[0].getNodeId(), {
-					fundingSatoshis: 200_000n,
-					fundingFeeratePerkw: 253,
-					commitmentFeeratePerkw: 253,
-					dustLimitSatoshis: 546n,
-					maxHtlcValueInFlightMsat: 100_000_000n,
-					htlcMinimumMsat: 1n,
-					toSelfDelay: 144,
-					maxAcceptedHtlcs: 30,
-					locktime: 0,
-					localBasepoints: (
-						manager as unknown as { config: { localBasepoints: unknown } }
-					).config.localBasepoints as never,
-					localPerCommitmentSeed: Buffer.alloc(32, 3),
-					secondPerCommitmentPoint: Buffer.alloc(33, 2)
-				} as never);
-			} catch (err) {
-				refusal = err as Error;
-			}
-
-			expect(refusal, 'the v2 open was refused').to.not.equal(null);
-			expect(refusal!.message, 'refused for the quorum reason').to.equal(
-				QUORUM_NO_DUAL_FUND_REFUSAL
-			);
-			// Refused BEFORE every side effect: this is the assertion the phase 6
-			// decision record pins, and the reason the promotion row cannot be
-			// swept in quorum mode.
-			expect(
-				(manager as unknown as { nextChannelIndex: number }).nextChannelIndex,
-				'no channel index was consumed'
-			).to.equal(indexBefore);
-			expect(
-				manager.listChannels().length,
-				'no channel was registered'
-			).to.equal(channelsBefore);
-			expect(
-				env.relay.captured.length,
-				'no wire message left the node'
-			).to.equal(sentBefore);
-		} finally {
-			env.victim.destroy();
-			for (const peer of env.peers) peer.destroy();
-			await options.teardown!(env);
-		}
-	});
-
 	it('S4 splice: every boundary converges, abandoning or resuming per what the disk holds', async function () {
 		this.timeout(300_000);
 		const { schedule } = await recordSchedule('local', s4SplicesIn, CHAOS_ENV);

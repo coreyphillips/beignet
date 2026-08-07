@@ -14,15 +14,15 @@
  *    left with no state on disk behind it, and under a quorum barrier the
  *    frame it should have waited on never existed.
  *
- * 2. QUORUM DOES NOT OPEN V2 CHANNELS AT ALL. Barrier-gating the messages
- *    does not make the state behind them durable: the interactive-funding
- *    session is process-local and is discarded on disconnect, while BOLT 2
- *    requires retaining the funding transaction and resuming the signature
- *    exchange through channel_reestablish.next_funding. Quorum's promise is
- *    that a peer which has seen new channel state can be resumed to, so
- *    rather than weaken the promise for one channel type, the mode refuses
- *    to START v2 opens. Established channels, including ones originally
- *    opened with v2, are untouched.
+ * 2. QUORUM OPENS V2 CHANNELS BEHIND THE BARRIER. The interactive-funding
+ *    round is durable now: the v2InFlight record rides channel_state
+ *    mutations into the journal and guardian frames, and BOLT 2 resumption
+ *    over channel_reestablish.next_funding works across restarts and
+ *    guardian-only restores. So the phase 6 refusal that once covered the
+ *    gap is gone. What quorum still adds is the wire gate: the first
+ *    commitment_signed and tx_signatures are barrier-class messages, so
+ *    they wait on replication like every other irreversible send, and a
+ *    restored in-flight open comes up resumable instead of being refused.
  */
 
 import { expect } from 'chai';
@@ -385,18 +385,19 @@ describe('Recovery phase 6: the v2 opening round persists what it sends', functi
 const managerOf = (node: LightningNode): ChannelManager =>
 	(node as unknown as { channelManager: ChannelManager }).channelManager;
 
-describe('Recovery phase 6: quorum does not start dual-funded opens', function () {
+describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier', function () {
 	this.timeout(20_000);
 
-	/** An enforcing barrier. Nothing here ever has to be RELEASED: every
-	 *  assertion is about a refusal that happens before a message exists. */
+	/** An enforcing barrier. Nothing here is ever RELEASED: the stub never
+	 *  confirms replication, so the barrier HOLDS what it gates, and every
+	 *  assertion is about a hold or a startup disposition. */
 	function quorumRecovery(): INodeConfig['recovery'] {
-		// A replication stub, deliberately. Every assertion below is about a
-		// refusal that happens before any message exists, so nothing here is
-		// ever released, replicated or waited on; standing up real guardians
-		// would only make the tests slower without making them stricter. The
-		// three reads the barrier actually performs are answered honestly:
-		// nothing replicated, no lost backfill, no stale watermark.
+		// A replication stub, deliberately. The assertions below are about
+		// the open STARTING and its irreversible sends being held, never
+		// about a release, so standing up real guardians would only make the
+		// tests slower without making them stricter. The three reads the
+		// barrier actually performs are answered honestly: nothing
+		// replicated, no lost backfill, no stale watermark.
 		const replicator = {
 			replicatedThrough: (): bigint => 0n,
 			namespaceLostBackfill: (): string | null => null,
@@ -429,62 +430,75 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 		return node;
 	}
 
-	it('masks option_dual_fund so a compliant peer never proposes one', function () {
+	it('advertises option_dual_fund like every other mode', function () {
 		const storage = openStorage();
 		const node = quorumNode(10, storage);
+		// The durable v2InFlight record made the round resumable, so quorum
+		// no longer masks the bit: a compliant peer may propose a v2 open,
+		// and the generic openChannel routes by this same bit, so it picks
+		// v2 against a capable peer just as it would in async-remote.
 		expect(
 			localFeaturesOf(node).hasFeature(Feature.DUAL_FUND),
 			'the bit we advertise'
-		).to.equal(false);
-		// Which is also what the generic openChannel routes by, so it picks v1
-		// rather than a v2 this node would then refuse itself.
-		expect(node.peerFundingInfo('02'.repeat(33)).dualFund).to.equal(false);
+		).to.equal(true);
 		node.destroy();
 		storage.close();
 	});
 
-	it('refuses an outbound v2 open before it allocates anything', function () {
+	it('starts an outbound v2 open and holds its commitment_signed behind the barrier', async function () {
 		const storage = openStorage();
 		const node = quorumNode(12, storage);
-		const manager = managerOf(node);
-		const indexBefore = manager.nextChannelIndex;
-		const peer = '02'.repeat(33);
+		const acceptor = new LightningNode(makeNodeConfig(13));
+		acceptor.on('node:error', () => {});
+		connectNodes(node, acceptor);
 
-		expect(() =>
-			node.openChannelV2(peer, {
-				fundingSatoshis: 150_000n,
-				fundingFeeratePerkw: 1000
-			})
-		).to.throw(/dual-funded/);
+		const sent: number[] = [];
+		node.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
 
-		// The manager primitive is published, so an embedder driving the
-		// negotiation itself answers to the same rule.
-		expect(() =>
-			manager.createDualFundedChannel(peer, {
-				fundingSatoshis: 150_000n,
-				fundingFeeratePerkw: 1000
-			} as unknown as Parameters<typeof manager.createDualFundedChannel>[1])
-		).to.throw(/dual-funded/);
+		// No refusal: the round is durable, so quorum starts the open and
+		// lets the barrier gate the irreversible sends instead.
+		const channel = node.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		// The commitment round persists BEFORE it sends, so the durable row
+		// is the sign the negotiation reached the commitment boundary.
+		await settle(() => storage.loadAllChannels().length > 0, 2000);
 
-		// Before ANY side effect: no channel, no temp channel, and no burnt
-		// per-channel key index. The index is the assertion that pins the
-		// guard ahead of deriveKeysForNewChannel rather than behind it.
-		expect(manager.listChannels()).to.have.length(0);
-		expect(manager.nextChannelIndex).to.equal(indexBefore);
-		expect(storage.loadAllChannels()).to.have.length(0);
+		expect(sent, 'the open went out').to.include(MessageType.OPEN_CHANNEL2);
+		expect(sent, 'negotiation ran to the commitment boundary').to.include(
+			MessageType.TX_COMPLETE
+		);
+		expect(
+			storage.loadAllChannels().length,
+			'the commitment persist landed'
+		).to.be.greaterThan(0);
+		// The stub replicator never confirms replication, so the barrier is
+		// what stands between the negotiated round and the wire now: the
+		// commitment_signed is HELD, not refused up front.
+		expect(sent).to.not.include(MessageType.COMMITMENT_SIGNED);
+		expect(channel.getState()).to.not.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
 
 		node.destroy();
+		acceptor.destroy();
 		storage.close();
 	});
 
-	it('refuses an inbound open_channel2 and leaves no debris', function () {
+	it('accepts an inbound open_channel2 and negotiates', async function () {
 		const storage = openStorage();
 		const node = quorumNode(14, storage);
 		const manager = managerOf(node);
-		const indexBefore = manager.nextChannelIndex;
 		const errors: string[] = [];
 		manager.on('error', (_id: Buffer | null, message: string) => {
 			errors.push(message);
+		});
+		const sent: number[] = [];
+		node.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
 		});
 
 		const peerSide = makeBasepoints(15);
@@ -510,22 +524,24 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 			channelFlags: 1
 		});
 		manager.handleMessage('02'.repeat(33), MessageType.OPEN_CHANNEL2, openMsg);
+		await settle(() => sent.includes(MessageType.ACCEPT_CHANNEL2), 1500);
 
-		expect(errors.join(' ')).to.contain('dual-funded');
-		expect(manager.listChannels()).to.have.length(0);
-		expect(manager.nextChannelIndex).to.equal(indexBefore);
-		expect(storage.loadAllChannels()).to.have.length(0);
+		// Answered, not refused.
+		expect(errors.join(' ')).to.not.contain('dual-funded');
+		expect(sent, 'the open was answered').to.include(
+			MessageType.ACCEPT_CHANNEL2
+		);
 
 		node.destroy();
 		storage.close();
 	});
 
-	it('refuses to come up over a v2 open that is already in progress', function () {
+	it('comes up over a legacy record-less v2 open, the same inert orphan async-remote keeps', function () {
 		const storage = openStorage();
-		// A session begun under async-remote, sitting in the state the
-		// operator is about to switch quorum on over. It may already have
-		// crossed commitment_signed, so it is neither resumable nor safe to
-		// discard on our own account.
+		// A row WITHOUT the durable v2InFlight record: nothing to resume
+		// from, but nothing to refuse over either. Quorum now restores it
+		// exactly as async-remote does, an inert orphan for the operator to
+		// finish or abandon.
 		const inFlight = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
 			fundingSatoshis: 150_000n,
@@ -536,38 +552,46 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 		});
 		inFlight.channelId = crypto.randomBytes(32);
 		inFlight.state = ChannelState.AWAITING_TX_SIGNATURES;
-		storage.saveChannel(
-			inFlight.channelId.toString('hex'),
-			inFlight,
-			'02'.repeat(33)
+		// Two identically seeded databases: destroy() closes the storage it
+		// was handed, and an in-memory database does not survive that.
+		const quorumStorage = storage;
+		const asyncStorage = openStorage();
+		for (const s of [quorumStorage, asyncStorage]) {
+			s.saveChannel(
+				inFlight.channelId.toString('hex'),
+				inFlight,
+				'02'.repeat(33)
+			);
+		}
+
+		const quorumRestored = new LightningNode(
+			makeNodeConfig(17, {
+				storage: quorumStorage,
+				recovery: quorumRecovery()
+			})
 		);
+		quorumRestored.on('node:error', () => {});
+		const restored = quorumRestored.getChannelManager().listChannels();
+		expect(restored).to.have.length(1);
+		expect(restored[0].getState()).to.equal(
+			ChannelState.AWAITING_TX_SIGNATURES
+		);
+		quorumRestored.destroy();
 
-		expect(
-			() =>
-				new LightningNode(
-					makeNodeConfig(17, {
-						storage,
-						recovery: quorumRecovery()
-					})
-				)
-		).to.throw(/dual-funded open is in progress/);
-
-		// And the same database comes up fine in async-remote, which is where
-		// the operator finishes or abandons it.
+		// And the same database shape comes up the same way in async-remote.
 		const asyncNode = new LightningNode(
-			makeNodeConfig(17, { storage, recovery: { enabled: true } })
+			makeNodeConfig(17, { storage: asyncStorage, recovery: { enabled: true } })
 		);
 		asyncNode.on('node:error', () => {});
 		expect(asyncNode.getChannelManager().listChannels()).to.have.length(1);
 		asyncNode.destroy();
-		storage.close();
 	});
 
-	it('still refuses to come up over a RESUMABLE (recorded) v2 open', function () {
+	it('comes up RESUMABLE over a recorded v2 open', function () {
 		const storage = openStorage();
 		// A row carrying the durable v2InFlight record: restoreChannel marks
-		// it for reestablish before the guard runs, so the guard must look
-		// through AWAITING_REESTABLISH to keep seeing the in-flight open.
+		// it for reestablish, and quorum lets it come up that way, because
+		// the record is exactly what makes the round provable again.
 		const inFlight = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
 			fundingSatoshis: 150_000n,
@@ -605,39 +629,48 @@ describe('Recovery phase 6: quorum does not start dual-funded opens', function (
 			confirmed: false,
 			rbfAttempt: 0
 		};
-		storage.saveChannel(
-			inFlight.channelId.toString('hex'),
-			inFlight,
-			'02'.repeat(33)
-		);
+		// Two identically seeded databases: destroy() closes the storage it
+		// was handed, and an in-memory database does not survive that.
+		const quorumStorage = storage;
+		const asyncStorage = openStorage();
+		for (const s of [quorumStorage, asyncStorage]) {
+			s.saveChannel(
+				inFlight.channelId.toString('hex'),
+				inFlight,
+				'02'.repeat(33)
+			);
+		}
 
-		expect(
-			() =>
-				new LightningNode(
-					makeNodeConfig(19, {
-						storage,
-						recovery: quorumRecovery()
-					})
-				)
-		).to.throw(/dual-funded open is in progress/);
-
-		// Async-remote resumes it instead of refusing: the record marks the
-		// row for reestablish on restore.
-		const asyncNode = new LightningNode(
-			makeNodeConfig(19, { storage, recovery: { enabled: true } })
+		const quorumRestored = new LightningNode(
+			makeNodeConfig(19, {
+				storage: quorumStorage,
+				recovery: quorumRecovery()
+			})
 		);
-		asyncNode.on('node:error', () => {});
-		const restored = asyncNode.getChannelManager().listChannels();
+		quorumRestored.on('node:error', () => {});
+		const restored = quorumRestored.getChannelManager().listChannels();
 		expect(restored).to.have.length(1);
 		expect(restored[0].getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		quorumRestored.destroy();
+
+		// Async-remote resumes it the same way: the record marks the row for
+		// reestablish on restore in either mode.
+		const asyncNode = new LightningNode(
+			makeNodeConfig(19, { storage: asyncStorage, recovery: { enabled: true } })
+		);
+		asyncNode.on('node:error', () => {});
+		const restoredAsync = asyncNode.getChannelManager().listChannels();
+		expect(restoredAsync).to.have.length(1);
+		expect(restoredAsync[0].getState()).to.equal(
+			ChannelState.AWAITING_REESTABLISH
+		);
 		asyncNode.destroy();
-		storage.close();
 	});
 
 	it('leaves an established v2 channel alone', function () {
 		const storage = openStorage();
-		// Originally opened with v2, long since an ordinary channel: quorum
-		// restricts STARTING interactive opens, not operating what they built.
+		// Originally opened with v2, long since an ordinary channel: under
+		// quorum it restores and operates like any other channel.
 		const established = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
 			fundingSatoshis: 150_000n,

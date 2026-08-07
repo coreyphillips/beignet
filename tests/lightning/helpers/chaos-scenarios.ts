@@ -490,10 +490,9 @@ export function makeChaosSpliceWallet(amountSats: bigint): {
  * and the disk holds nothing; from it onward the durable v2InFlight
  * record (issues 288/289) makes every boundary resumable over
  * reestablish next_funding, and the disk must hold exactly one row under
- * the PERMANENT id, never a half-promoted orphan. Local mode only in
- * this suite: quorum mode still refuses v2 opens (the phase 6 guards
- * lift with their own follow-up), which the splice suite asserts
- * separately.
+ * the PERMANENT id, never a half-promoted orphan. Runs in local mode and,
+ * with the phase 6 guards lifted, in quorum mode too, where the same kill
+ * points sit behind the durability barrier.
  */
 export function s7OpensV2(): IChaosScenario {
 	return {
