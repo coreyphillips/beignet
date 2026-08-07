@@ -33,6 +33,8 @@
  *   CHAOS_ARM      optional kill label: pre-commit:N | post-commit:N |
  *                  post-send:TYPE:K
  *   CHAOS_TAPROOT  1 to prefer taproot channels
+ *   CHAOS_DUAL_FUND 1 to advertise option_dual_fund and carry a funding
+ *                  provider, so `openv2` can drive a durable v2 open
  *
  * Line protocol on stdout:
  *   ready:<nodeIdHex>:<port>        the node is listening
@@ -89,6 +91,7 @@ const SEED_ID = Number(env.CHAOS_SEED || '71');
 const MODE = env.CHAOS_MODE || 'local';
 const ARM = env.CHAOS_ARM || null;
 const TAPROOT = env.CHAOS_TAPROOT === '1';
+const DUAL_FUND = env.CHAOS_DUAL_FUND === '1';
 
 /** Same key the in-process harness encrypts its chaos databases with. */
 const DB_KEY = crypto
@@ -213,6 +216,68 @@ async function buildRecovery(storage) {
 	return { enabled: true, durability: MODE, barrier };
 }
 
+/**
+ * A deterministic v2 funding provider: same key, same prevout, same change
+ * script every life, so the recorded schedule replays byte-identically.
+ * The opener funds through the splice-input surface exactly like the
+ * in-process chaos wallet; v1 funding must never run for a v2 open.
+ */
+function makeV2FundingProvider() {
+	const bitcoin = require('bitcoinjs-lib');
+	const ecc = require('@bitcoinerlab/secp256k1');
+	bitcoin.initEccLib(ecc);
+	const tag = (label) =>
+		crypto
+			.createHash('sha256')
+			.update(seed)
+			.update(Buffer.from(label))
+			.digest();
+	const priv = tag('v2-wallet-key');
+	const pub = getPublicKey(priv);
+	const payment = bitcoin.payments.p2wpkh({ pubkey: pub });
+	const prevTx = new bitcoin.Transaction();
+	prevTx.version = 2;
+	prevTx.addInput(tag('v2-wallet-prev'), 0);
+	prevTx.addOutput(payment.output, 1_000_000);
+	const scriptCode = bitcoin.payments.p2pkh({ pubkey: pub }).output;
+	const walletInput = {
+		prevTx: prevTx.toBuffer(),
+		prevOutputIndex: 0,
+		value: 1_000_000n,
+		sequence: 0xfffffffd,
+		confirmed: true,
+		signWitness: (tx, inputIndex, value) => {
+			const sighash = tx.hashForWitnessV0(
+				inputIndex,
+				scriptCode,
+				Number(value),
+				bitcoin.Transaction.SIGHASH_ALL
+			);
+			return [
+				bitcoin.script.signature.encode(
+					Buffer.from(ecc.sign(sighash, priv)),
+					bitcoin.Transaction.SIGHASH_ALL
+				),
+				pub
+			];
+		}
+	};
+	const changeScript = bitcoin.payments.p2wpkh({
+		hash: tag('v2-wallet-change').subarray(0, 20)
+	}).output;
+	return {
+		buildFundingTransaction: async () => {
+			throw new Error('v1 funding must not run for a v2 open');
+		},
+		broadcastTransaction: async (txHex) =>
+			bitcoin.Transaction.fromHex(txHex).getId(),
+		selectSpliceInputs: async () => ({
+			inputs: [walletInput],
+			changeScript
+		})
+	};
+}
+
 async function main() {
 	const storage = new SqliteStorage(DB_PATH, undefined, {
 		encryptionKey: DB_KEY
@@ -220,13 +285,15 @@ async function main() {
 	storage.open();
 	const recovery = await buildRecovery(storage);
 	// Over real TCP both stacks negotiate option_dual_fund and a v1 open
-	// would be routed to the v2 flow (which quorum mode refuses by design).
-	// The matrix drives the v1 flow, so the victim does not advertise
-	// dual-fund.
+	// would be routed to the v2 flow. The v1 matrix drives the v1 flow, so
+	// by default the victim does not advertise dual-fund; the v2 sweep sets
+	// CHAOS_DUAL_FUND=1 and drives the v2 flow through `openv2` instead.
 	const localFeatures = LightningNode.defaultFeatures();
-	// hasFeature checks the mandatory AND optional bits; clear both.
-	localFeatures.clearBit(Feature.DUAL_FUND);
-	localFeatures.clearBit(Feature.DUAL_FUND + 1);
+	if (!DUAL_FUND) {
+		// hasFeature checks the mandatory AND optional bits; clear both.
+		localFeatures.clearBit(Feature.DUAL_FUND);
+		localFeatures.clearBit(Feature.DUAL_FUND + 1);
+	}
 	const node = new LightningNode({
 		nodePrivateKey,
 		localFeatures,
@@ -247,7 +314,8 @@ async function main() {
 		storage,
 		recovery,
 		preferTaproot: TAPROOT,
-		enableNetworking: true
+		enableNetworking: true,
+		...(DUAL_FUND ? { fundingProvider: makeV2FundingProvider() } : {})
 	});
 	node.on('error', () => undefined);
 	node.on('node:error', (e) => out(`err:node:${(e && e.message) || e}`));
@@ -288,6 +356,13 @@ async function main() {
 		const k = (sendCounts.get(name) || 0) + 1;
 		sendCounts.set(name, k);
 		out(`evt:send:${name}:${k}`);
+		if (env.CHAOS_DEBUG === '1' && name === 'ERROR') {
+			out(
+				`dbg:error-payload:${payload
+					.toString('latin1')
+					.replace(/[^ -~]/g, '.')}`
+			);
+		}
 		if (ARM === `post-send:${name}:${k}`) freeze(ARM);
 	};
 
@@ -338,6 +413,24 @@ async function main() {
 				await new Promise((resolve) => setTimeout(resolve, 10));
 			}
 			node.handleFundingConfirmed(channelId);
+			out(`opened:${channelId.toString('hex')}`);
+		} else if (cmd === 'openv2') {
+			const sats = BigInt(args[0]);
+			const peer = args[1];
+			const channel = node.openChannelV2(peer, {
+				fundingSatoshis: sats,
+				fundingFeeratePerkw: 1000
+			});
+			// The interactive round, both commitment_signeds and both
+			// tx_signatures all ride the wire asynchronously; completion is
+			// the state leaving the signature exchange.
+			const deadline = Date.now() + 30_000;
+			while (channel.getState() !== 'AWAITING_FUNDING_CONFIRMED') {
+				if (Date.now() > deadline) throw new Error('v2 open never completed');
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			const channelId = channel.getChannelId();
+			pendingChannels.set(channelId.toString('hex'), channel);
 			out(`opened:${channelId.toString('hex')}`);
 		} else if (cmd === 'confirm') {
 			node.handleFundingConfirmed(Buffer.from(args[0], 'hex'));
