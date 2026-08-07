@@ -758,11 +758,18 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			return null;
 		}
 		const sequence = BigInt(tip) + 1n;
-		this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
-		this.storage.setRecoveryMeta!(
-			META_SNAPSHOT_SCHEMA,
-			SNAPSHOT_SCHEMA_VERSION
-		);
+		// ATOMIC: the snapshot frame, its tip advance, the compaction
+		// metadata and the schema marker land together or roll back
+		// together. A partial write (frame stored, tip metadata stale)
+		// would leave the whole journal unverifiable, which is strictly
+		// worse than the gap this repair closes.
+		this.storage.transaction(() => {
+			this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+			this.storage.setRecoveryMeta!(
+				META_SNAPSHOT_SCHEMA,
+				SNAPSHOT_SCHEMA_VERSION
+			);
+		});
 		return sequence;
 	}
 

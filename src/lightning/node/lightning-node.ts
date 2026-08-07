@@ -1189,14 +1189,34 @@ export class LightningNode extends EventEmitter {
 			}
 			// Receipt gating keys on the TIP, not one frame: deletion-only
 			// dispositions and the schema repair write frames this boot too,
-			// and receipts are cumulative, so the tip covers them all.
-			const repairTail =
-				barrier &&
-				(carriedV2Rows.length > 0 || schemaRepairSeq !== null) &&
-				this.storage
-					? storedTipSequence(this.storage)
-					: null;
-			if (barrier && repairTail !== null) {
+			// and receipts are cumulative, so the tip covers them all. The
+			// TARGET IS PERSISTED until the receipt lands: a receipt timeout
+			// followed by a restart finds neither the consumed schema marker
+			// nor the carried rows, so without the stored tail the reboot
+			// would open with the guardians still at watermark zero.
+			const REPAIR_TAIL_KEY = 'startup_repair_tail';
+			const persistedTail = this.storage.getRecoveryMeta?.(REPAIR_TAIL_KEY);
+			const owesRepair =
+				carriedV2Rows.length > 0 ||
+				schemaRepairSeq !== null ||
+				(persistedTail != null && persistedTail !== '');
+			if (barrier && owesRepair) {
+				const tip = storedTipSequence(this.storage);
+				if (tip === null) {
+					// Fail closed: a repair is owed but the local tip cannot
+					// be verified, so there is nothing sound to wait on.
+					throw new Error(
+						`recovery: a startup repair is owed but the journal tip ` +
+							`cannot be verified; refusing to start`
+					);
+				}
+				const repairTail =
+					persistedTail != null &&
+					persistedTail !== '' &&
+					BigInt(persistedTail) > tip
+						? BigInt(persistedTail)
+						: tip;
+				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, repairTail.toString());
 				this.startupRepairPending = true;
 				this.emitStructuredLog('channel', 'startup_repair_pending', {
 					frameSequence: String(repairTail),
@@ -1208,9 +1228,10 @@ export class LightningNode extends EventEmitter {
 					.then((outcome) => {
 						if (this._destroyed) return;
 						if (!outcome.released) {
-							// Quarantine holds: the operator sees why, and the
-							// gates keep refusing until a restart with a
-							// reachable quorum succeeds.
+							// Quarantine holds: the operator sees why, the
+							// stored tail survives the restart, and the gates
+							// keep refusing until a boot with a reachable
+							// quorum receipts it.
 							this.emitStructuredLog('channel', 'startup_repair_unreceipted', {
 								reason: outcome.reason
 							});
@@ -1224,14 +1245,30 @@ export class LightningNode extends EventEmitter {
 							} as ILightningError);
 							return;
 						}
-						this.startupRepairPending = false;
-						this.emitStructuredLog('channel', 'startup_repair_receipted', {
-							frameSequence: String(repairTail)
-						});
-						// The deferred bring-up must end in a deterministic
-						// outcome: a throwing reconnect pass surfaces as a node
-						// error and the node still reports ready, rather than
-						// leaving traffic permitted with startup half-done.
+						// The completion must be deterministic: every step is
+						// contained so a throwing observer can neither strand
+						// startup half-done nor leave quarantine ambiguous.
+						try {
+							this.storage?.setRecoveryMeta?.(REPAIR_TAIL_KEY, '');
+							this.startupRepairPending = false;
+							this.emitStructuredLog('channel', 'startup_repair_receipted', {
+								frameSequence: String(repairTail)
+							});
+						} catch (err) {
+							// The receipt landed but local completion failed
+							// (a throwing meta write or log observer): stay
+							// quarantined and say so; the stored tail makes
+							// the next boot retry cleanly.
+							this.startupRepairPending = true;
+							this.emit('node:error', {
+								code: 'STARTUP_REPAIR_COMPLETION_FAILED',
+								message: `finishing the startup repair failed: ${
+									err instanceof Error ? err.message : String(err)
+								}; the node stays quarantined`,
+								timestamp: Date.now()
+							} as ILightningError);
+							return;
+						}
 						try {
 							this.autoReconnectPeers();
 						} catch (err) {
@@ -1245,9 +1282,20 @@ export class LightningNode extends EventEmitter {
 							this.emitReady();
 						}
 					})
-					.catch(() => {
-						// whenReleased never rejects by contract; belt and
-						// braces so a broken barrier cannot strand the promise.
+					.catch((err) => {
+						// whenReleased never rejects by contract, and the
+						// success path contains its own failures; if a
+						// rejection still lands here, REPORT it and keep the
+						// deterministic quarantined state (the stored tail
+						// retries next boot) instead of pending silently.
+						if (this._destroyed) return;
+						this.emit('node:error', {
+							code: 'STARTUP_REPAIR_UNRECEIPTED',
+							message: `the startup repair wait failed: ${
+								err instanceof Error ? err.message : String(err)
+							}; the node stays quarantined`,
+							timestamp: Date.now()
+						} as ILightningError);
 					});
 			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1); deferred

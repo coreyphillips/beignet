@@ -126,7 +126,14 @@ describe('Peer held post-handshake delivery', function () {
 		const peer = bareHeldPeer();
 		const seen: number[] = [];
 		const errors: Error[] = [];
-		peer.on('error', (err: Error) => errors.push(err));
+		peer.on('error', (err: Error) => {
+			errors.push(err);
+			// HOSTILE error observer: it re-pokes the peer with a fresh
+			// frame AND throws. The teardown already happened (terminal
+			// first), so neither may have any effect.
+			feed(peer, MessageType.TX_COMPLETE, Buffer.from([9]));
+			throw new Error('error observer exploded too');
+		});
 		peer.on('message', (type: number) => {
 			seen.push(type);
 			throw new Error('handler exploded');
@@ -136,10 +143,9 @@ describe('Peer held post-handshake delivery', function () {
 		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
 		peer.releaseHeldMessages();
 
-		// The first delivery threw: surfaced as a peer error, the rest of
-		// the queue dropped, and the connection CLOSED, exactly like the
-		// live loop's undecodable-frame path. Later frames must not run
-		// after a missing predecessor.
+		// The first delivery threw: torn down BEFORE the error observer ran,
+		// so the reentrant feed dispatched nothing, the throwing observer
+		// bypassed nothing, and later frames cannot run after the gap.
 		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
 		expect(errors).to.have.length(1);
 		expect(errors[0].message).to.contain('handler exploded');
@@ -147,6 +153,27 @@ describe('Peer held post-handshake delivery', function () {
 			(peer as unknown as { state: string }).state,
 			'the peer is no longer ready'
 		).to.not.equal('ready');
+	});
+
+	it('a recursive release cannot interleave the drain', function () {
+		const peer = bareHeldPeer();
+		const seen: number[] = [];
+		peer.on('message', (type: number) => {
+			seen.push(type);
+			// A hostile observer calls release again mid-drain: the
+			// reentrancy guard must make it a no-op instead of starting a
+			// second cursor over the same queue.
+			peer.releaseHeldMessages();
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
+		feed(peer, MessageType.TX_COMPLETE, Buffer.from([3]));
+		peer.releaseHeldMessages();
+		expect(seen).to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_ADD_INPUT,
+			MessageType.TX_COMPLETE
+		]);
 	});
 
 	it('reentrant arrivals queue BEHIND the remaining held frames', function () {
@@ -170,7 +197,11 @@ describe('Peer held post-handshake delivery', function () {
 		]);
 	});
 
-	it('a throwing peer:connect hook neither wedges the release nor fails the connect', async function () {
+	it('a failed bring-up TEARS DOWN instead of releasing held traffic', async function () {
+		// The connect hook is the required bring-up (our channel_reestablish
+		// rides it): if it fails, releasing the peer's held reestablish
+		// would reopen the ordering hazard the hold exists to prevent, so
+		// the connection dies and the dial fails visibly instead.
 		const events: string[] = [];
 		const realRelease = Peer.prototype.releaseHeldMessages;
 		Peer.prototype.releaseHeldMessages = function (
@@ -187,7 +218,8 @@ describe('Peer held post-handshake delivery', function () {
 		try {
 			const pmOf = (n: LightningNode): NodeJS.EventEmitter =>
 				(n as unknown as { peerManager: NodeJS.EventEmitter }).peerManager;
-			// Hostile hooks on BOTH sides.
+			// Hostile hooks on BOTH sides; ours registered LAST so the
+			// node's own bring-up runs first and the failure follows it.
 			pmOf(a).on('peer:connect', () => {
 				throw new Error('outbound hook exploded');
 			});
@@ -203,22 +235,27 @@ describe('Peer held post-handshake delivery', function () {
 					peerManager: { server: { address(): { port: number } } };
 				}
 			).peerManager.server.address().port;
-			// The connect must RESOLVE despite the throwing hook.
-			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			let rejected = false;
+			try {
+				await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			} catch {
+				rejected = true;
+			}
 			await new Promise((resolve) => setTimeout(resolve, 500));
 
+			expect(rejected, 'the dial failed visibly').to.equal(true);
 			expect(
 				events.filter((e) => e === 'release'),
-				'both sides still released their held traffic'
-			).to.have.length(2);
+				'no held traffic was released after a failed bring-up'
+			).to.have.length(0);
 			const peersOf = (n: LightningNode): Map<string, unknown> =>
 				(
 					n as unknown as {
 						peerManager: { peers: Map<string, unknown> };
 					}
 				).peerManager.peers;
-			expect(peersOf(a).size, 'outbound stays registered').to.equal(1);
-			expect(peersOf(b).size, 'inbound stays registered').to.equal(1);
+			expect(peersOf(a).size, 'outbound unregistered').to.equal(0);
+			expect(peersOf(b).size, 'inbound unregistered').to.equal(0);
 		} finally {
 			Peer.prototype.releaseHeldMessages = realRelease;
 			a.destroy();

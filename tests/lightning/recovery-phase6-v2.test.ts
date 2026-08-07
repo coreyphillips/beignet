@@ -945,6 +945,141 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			'deletion-only dispositions still await their receipt'
 		).to.equal(true);
 		node2.destroy();
+
+		// THE RECEIPT NEVER LANDED (the stub replicator never confirms).
+		// The next boot finds no carried rows and a consumed schema marker,
+		// so only the PERSISTED repair tail can remember that the guardians
+		// still owe a receipt; without it this reboot would open clean.
+		const s4 = new SqliteStorage(dbPath);
+		s4.open();
+		const node3 = new LightningNode(
+			makeNodeConfig(35, { storage: s4, recovery: quorumRecovery() })
+		);
+		node3.on('node:error', () => {});
+		expect(
+			(node3 as unknown as { startupRepairPending: boolean })
+				.startupRepairPending,
+			'the persisted tail survives the restart and re-quarantines'
+		).to.equal(true);
+		node3.destroy();
+	});
+
+	it('an unverifiable journal tip refuses startup while a repair is owed', function () {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-badtip-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(45, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(72).toString('hex'),
+					preimage: makeSeed(73)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		// A repair is owed (persisted tail) but the tip no longer verifies
+		// (its recorded hash does not match the stored frame): there is
+		// nothing sound to wait on, so startup must refuse, not proceed.
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('startup_repair_tail', '1');
+		s2.setRecoveryMeta!('journal_tip_hash', 'ff'.repeat(32));
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(45, { storage: s3, recovery: quorumRecovery() })
+				)
+		).to.throw(/journal tip cannot be verified/);
+		s3.close();
+	});
+
+	it('a failed schema migration rolls back atomically and retries', function () {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-atomic-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(46, { storage: s1, recovery: { enabled: true } })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(74).toString('hex'),
+					preimage: makeSeed(75)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('journal_snapshot_schema', '1');
+		const frameCountBefore = s2.loadRecoveryFrames!(0).length;
+		s2.close();
+
+		// The marker write explodes mid-migration: the WHOLE transaction
+		// must roll back, leaving the journal exactly as it was.
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const realSetMeta = s3.setRecoveryMeta!.bind(s3);
+		s3.setRecoveryMeta = (key: string, value: string): void => {
+			if (key === 'journal_snapshot_schema' && value === '2') {
+				throw new Error('disk says no');
+			}
+			realSetMeta(key, value);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(46, { storage: s3, recovery: { enabled: true } })
+				)
+		).to.throw(/disk says no/);
+		s3.close();
+
+		// Nothing partial: same frame count, old marker, tip verifiable.
+		const s4 = new SqliteStorage(dbPath);
+		s4.open();
+		expect(s4.loadRecoveryFrames!(0).length, 'no stranded frame').to.equal(
+			frameCountBefore
+		);
+		expect(s4.getRecoveryMeta!('journal_snapshot_schema')).to.equal('1');
+		// And the unpatched retry completes the migration.
+		const node2 = new LightningNode(
+			makeNodeConfig(46, { storage: s4, recovery: { enabled: true } })
+		);
+		node2.on('node:error', () => {});
+		expect(s4.getRecoveryMeta!('journal_snapshot_schema')).to.equal('2');
+		// The repair snapshot compacts the deltas below it, so the count
+		// SHRINKS; what matters is that the journal stayed verifiable and
+		// the newest retained frame is the fresh snapshot.
+		expect(
+			s4.loadRecoveryFrames!(0).length,
+			'the repaired journal retains a verifiable chain'
+		).to.be.at.least(1);
+		node2.destroy();
 	});
 
 	it('a carried row whose deletion disposition fails refuses startup', function () {
@@ -1288,6 +1423,10 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			'the throwing reconnect surfaced as a node error'
 		).to.equal(true);
 		expect(readyFired, 'the node still reported ready').to.equal(true);
+		expect(
+			s3.getRecoveryMeta!('startup_repair_tail') || '',
+			'the persisted repair tail was cleared by the receipt'
+		).to.equal('');
 		node2.destroy();
 
 		// Guardian-only restore: the device burns; the trio must give back

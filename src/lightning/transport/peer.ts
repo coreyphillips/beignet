@@ -111,6 +111,8 @@ export class Peer extends EventEmitter {
 	private state: PeerState = 'disconnected';
 	/** Non-null while messages are held (see holdMessagesUntilRelease). */
 	private heldMessages: Array<{ type: number; payload: Buffer }> | null = null;
+	/** True while releaseHeldMessages() is mid-drain (reentrancy guard). */
+	private drainingHeld = false;
 	private socket: IDuplexTransport | null = null;
 	private transport: TransportCipher | null = null;
 	private remoteInit: IInitMessage | null = null;
@@ -652,6 +654,10 @@ export class Peer extends EventEmitter {
 	}
 
 	private handleMessage(type: number, payload: Buffer): void {
+		// A terminal connection dispatches nothing: a real closed socket
+		// emits no data, and a reentrant observer poking a torn-down peer
+		// must not slip a message past the state machines either.
+		if (this.state === 'closing' || this.state === 'disconnected') return;
 		// Handle ping/pong internally
 		if (type === MessageType.PING) {
 			const ping = decodePingMessage(payload);
@@ -693,33 +699,53 @@ export class Peer extends EventEmitter {
 	 */
 	releaseHeldMessages(): void {
 		const held = this.heldMessages;
-		if (!held) return;
-		// Drain IN PLACE: a synchronous transport or reentrant callback can
-		// deliver new frames while older ones are still draining, and those
-		// must queue BEHIND the remaining held frames, not overtake them
-		// (handleMessage keeps appending while heldMessages is non-null).
-		while (held.length > 0) {
-			if (this.state !== 'ready') {
-				// Torn down mid-release: the undelivered tail dies with the
-				// connection, exactly as unread socket bytes would.
-				this.heldMessages = null;
-				return;
+		if (!held || this.drainingHeld) return;
+		// Reentrancy guard: a recursive release (an observer calling back
+		// into the manager) must not start a second cursor and interleave.
+		this.drainingHeld = true;
+		try {
+			// Drain with an INDEX CURSOR over the live array: reentrant
+			// synchronous arrivals append behind the remaining held frames
+			// (handleMessage keeps queueing while heldMessages is non-null),
+			// and no per-message shift() compaction makes a hostile
+			// coalesced burst quadratic.
+			let cursor = 0;
+			while (cursor < held.length) {
+				if (this.state !== 'ready') {
+					// Torn down mid-release: the undelivered tail dies with
+					// the connection, exactly as unread socket bytes would.
+					return;
+				}
+				const next = held[cursor++];
+				try {
+					this.emit('message', next.type, next.payload);
+				} catch (err) {
+					// TERMINAL FIRST: tear the connection down before any
+					// observer runs, so a reentrant or throwing error
+					// listener can neither deliver past the gap nor bypass
+					// the teardown. Delivering later frames after a missing
+					// predecessor would hand the state machines a hole.
+					this.heldMessages = null;
+					try {
+						this.disconnect();
+					} finally {
+						try {
+							this.emit(
+								'error',
+								err instanceof Error ? err : new Error(String(err))
+							);
+						} catch {
+							// The error observer threw; the connection is
+							// already down, which is the outcome that matters.
+						}
+					}
+					return;
+				}
 			}
-			const next = held.shift()!;
-			try {
-				this.emit('message', next.type, next.payload);
-			} catch (err) {
-				// A failed handler mid-stream: delivering LATER frames after
-				// a missing predecessor would hand the state machines a gap,
-				// so surface the error and close, exactly as the live
-				// message loop does for an undecodable frame.
-				this.heldMessages = null;
-				this.emit('error', err instanceof Error ? err : new Error(String(err)));
-				this.disconnect();
-				return;
-			}
+		} finally {
+			this.drainingHeld = false;
+			this.heldMessages = null;
 		}
-		this.heldMessages = null;
 	}
 
 	// ─── Ping/Pong ─────────────────────────────────────────────

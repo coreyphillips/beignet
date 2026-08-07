@@ -353,24 +353,25 @@ export class PeerManager extends EventEmitter {
 		if (typeof stabilityTimer.unref === 'function') stabilityTimer.unref();
 		this.stabilityTimers.set(pubkey, stabilityTimer);
 		captureWireEvent('connect', pubkey, 'outbound');
-		// A throwing peer:connect listener must not wedge the connection:
-		// the peer is already registered and ready, so skipping the release
-		// would leave held traffic accumulating forever, and letting the
-		// throw unwind would reject a connect that in fact succeeded.
+		// The connect hook IS the required bring-up: the node marks its
+		// channels for reestablish and sends OUR channel_reestablish in it.
+		// If that work fails, releasing the held traffic (the peer's own
+		// reestablish among it) would reopen the exact ordering hazard the
+		// hold exists to prevent, so the connection is torn down instead
+		// and the dial fails visibly. Only a completed bring-up releases.
 		try {
 			this.emit('peer:connect', pubkey);
 		} catch (err) {
-			this.emit(
-				'peer:error',
-				pubkey,
-				err instanceof Error ? err : new Error(String(err))
-			);
+			this.removeRegisteredPeer(pubkey, peer);
+			throw err instanceof Error ? err : new Error(String(err));
 		}
-		// Bring-up is complete: registration, bookkeeping and the connect
-		// handlers all ran (or failed contained), so the held post-handshake
-		// traffic (if any) now delivers in order against a fully wired
-		// connection.
 		peer.releaseHeldMessages();
+		// The release itself can legitimately end in teardown (a failed
+		// held handler disconnects); make the registry agree even when no
+		// socket close event backs it (both cleanups are idempotent).
+		if (peer.getState() !== 'ready') {
+			this.removeRegisteredPeer(pubkey, peer);
+		}
 	}
 
 	private clearStabilityTimer(pubkey: string): void {
@@ -972,18 +973,29 @@ export class PeerManager extends EventEmitter {
 				// Do NOT store inbound peer address — peer.port is the TCP source (ephemeral) port,
 				// not the node's listening port. Reconnect attempts to ephemeral ports always fail.
 				captureWireEvent('connect', pubkey, 'inbound');
-				// Contained like the outbound twin: a throwing connect hook
-				// must neither wedge the held queue nor unwind bookkeeping.
+				// The outbound twin's rule: only a completed bring-up
+				// releases; a failed one tears the connection down (the
+				// remote will redial and BOTH sides retry the bring-up).
 				try {
 					this.emit('peer:connect', pubkey);
 				} catch (err) {
-					this.emit(
-						'peer:error',
-						pubkey,
-						err instanceof Error ? err : new Error(String(err))
-					);
+					this.removeRegisteredPeer(pubkey, peer);
+					try {
+						this.emit(
+							'peer:error',
+							pubkey,
+							err instanceof Error ? err : new Error(String(err))
+						);
+					} catch {
+						// The error observer threw too; the teardown already
+						// happened, which is the outcome that matters.
+					}
+					return;
 				}
 				peer.releaseHeldMessages();
+				if (peer.getState() !== 'ready') {
+					this.removeRegisteredPeer(pubkey, peer);
+				}
 			})
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
