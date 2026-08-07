@@ -15,7 +15,10 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { PaymentStatus } from '../../../src/lightning/node/types';
+import {
+	IFundingProvider,
+	PaymentStatus
+} from '../../../src/lightning/node/types';
 import type { ISpliceWalletInput } from '../../../src/lightning/channel/channel';
 import { LightningNode } from '../../../src/lightning/node/lightning-node';
 import {
@@ -494,6 +497,31 @@ export function makeChaosSpliceWallet(amountSats: bigint): {
  * with the phase 6 guards lifted, in quorum mode too, where the same kill
  * points sit behind the durability barrier.
  */
+/**
+ * A v2 opener funds through the provider's splice-input surface; the
+ * deterministic chaos wallet input serves, and v1 funding must never run.
+ * Shared by every S7 executor (local sweep, quorum sweep, device loss).
+ */
+export function v2ChaosFundingProvider(): IFundingProvider {
+	const wallet = makeChaosSpliceWallet(250_000n);
+	const changeScript = bitcoin.payments.p2wpkh({
+		hash: crypto.randomBytes(20)
+	}).output!;
+	return {
+		buildFundingTransaction: async (): Promise<never> => {
+			throw new Error('v1 funding must not run for a v2 open');
+		},
+		broadcastTransaction: async (txHex: string): Promise<string> =>
+			bitcoin.Transaction.fromHex(txHex).getId(),
+		selectSpliceInputs: async (): ReturnType<
+			NonNullable<IFundingProvider['selectSpliceInputs']>
+		> => ({
+			inputs: [wallet.walletInput],
+			changeScript
+		})
+	};
+}
+
 export function s7OpensV2(): IChaosScenario {
 	return {
 		name: 'S7 v2 open',

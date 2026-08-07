@@ -22,47 +22,31 @@
  */
 
 import { expect } from 'chai';
-import crypto from 'crypto';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChannelState } from '../../src/lightning/channel/types';
-import { IFundingProvider } from '../../src/lightning/node/types';
 import {
+	IChaosEnv,
 	IChaosEnvOptions,
+	IChaosScenario,
+	assertNoGatedSendBeforeCommit,
 	recordSchedule,
 	runKillPoint,
 	settle
 } from './helpers/chaos-harness';
 import {
+	quorumOptions,
+	registerQuorumNamespace,
+	waitFor
+} from './helpers/chaos-quorum';
+import {
 	CHAOS_ENV,
-	makeChaosSpliceWallet,
 	s4SplicesIn,
-	s7OpensV2
+	s7OpensV2,
+	v2ChaosFundingProvider
 } from './helpers/chaos-scenarios';
 
 bitcoin.initEccLib(ecc);
-
-/**
- * A v2 opener funds through the provider's splice-input surface; the
- * deterministic chaos wallet input serves, and v1 funding must never run.
- */
-function v2FundingProvider(): IFundingProvider {
-	const wallet = makeChaosSpliceWallet(250_000n);
-	const changeScript = bitcoin.payments.p2wpkh({
-		hash: crypto.randomBytes(20)
-	}).output!;
-	return {
-		buildFundingTransaction: async () => {
-			throw new Error('v1 funding must not run for a v2 open');
-		},
-		broadcastTransaction: async (txHex: string) =>
-			bitcoin.Transaction.fromHex(txHex).getId(),
-		selectSpliceInputs: async () => ({
-			inputs: [wallet.walletInput],
-			changeScript
-		})
-	};
-}
 
 describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 	it('S4 splice: every boundary converges, abandoning or resuming per what the disk holds', async function () {
@@ -143,7 +127,7 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		this.timeout(300_000);
 		const V2_ENV: IChaosEnvOptions = {
 			...CHAOS_ENV,
-			victimExtrasFactory: () => ({ fundingProvider: v2FundingProvider() })
+			victimExtrasFactory: () => ({ fundingProvider: v2ChaosFundingProvider() })
 		};
 		const { schedule } = await recordSchedule('local', s7OpensV2, V2_ENV);
 		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
@@ -201,5 +185,100 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		}
 		expect(abandonedCells, 'cells that abandoned').to.be.at.least(1);
 		expect(promotedCells, 'cells that promoted').to.be.at.least(1);
+	});
+	it('S7 v2 open under quorum: the same boundaries, gated sends behind the barrier (matrix row 10)', async function () {
+		this.timeout(300_000);
+		const options = quorumOptions(
+			{},
+			{
+				...CHAOS_ENV,
+				victimExtrasFactory: () => ({
+					fundingProvider: v2ChaosFundingProvider()
+				})
+			}
+		);
+		// s7's setup opens nothing (the RUN is the open), so it registers the
+		// namespace itself rather than through withNamespace, whose post-setup
+		// wait needs opening traffic to have moved the watermark already.
+		const quorumS7 = (): IChaosScenario => {
+			const inner = s7OpensV2();
+			return {
+				...inner,
+				async setup(env: IChaosEnv): Promise<void> {
+					await registerQuorumNamespace();
+					await inner.setup(env);
+				}
+			};
+		};
+		const { schedule, captured } = await recordSchedule(
+			'quorum',
+			quorumS7,
+			options
+		);
+		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
+		// The barrier property itself, from the rehearsal for free: no gated
+		// send may precede the commit of the frame that authorizes it.
+		assertNoGatedSendBeforeCommit(schedule, captured);
+		let abandonedCells = 0;
+		let promotedCells = 0;
+		for (const label of schedule) {
+			const result = await runKillPoint('quorum', quorumS7, label, options);
+			try {
+				const at = `at ${label} (quorum)`;
+				for (let i = 0; i < 10; i++) await settle();
+				const rows = result.restoredStorage.loadAllChannels();
+				const tempId = result.env.scratch.tempId as string;
+				expect(
+					rows.every((row) => row.channelId !== tempId),
+					`no orphan temporary row ${at}`
+				).to.equal(true);
+				expect(rows.length, `at most one channel row ${at}`).to.be.at.most(1);
+				if (rows.length === 0) {
+					abandonedCells++;
+					expect(
+						result.restored.getChannelManager().listChannels().length,
+						`clean restart after abandon ${at}`
+					).to.equal(0);
+				} else {
+					// Same acceptance as the local sweep: a promoted cell holds
+					// the durable record and COMPLETES the open after restart.
+					// Quorum adds nothing to the verdict, only to the wire: the
+					// commitment_signed and tx_signatures that led here each
+					// waited on guardian replication before they left.
+					promotedCells++;
+					expect(
+						rows[0].state.v2InFlight != null ||
+							rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
+						`an opening row carries the durable record ${at}`
+					).to.equal(true);
+					// Unlike the local sweep, completion is not synchronous
+					// here: the resumed exchange's own gated sends wait on
+					// real guardian acks over HTTP, so poll in real time.
+					await waitFor(() => {
+						const states = result.restored
+							.getChannelManager()
+							.listChannels()
+							.map((c) => c.getState());
+						return (
+							states.length === 1 &&
+							[
+								ChannelState.AWAITING_FUNDING_CONFIRMED,
+								ChannelState.AWAITING_CHANNEL_READY,
+								ChannelState.NORMAL
+							].includes(states[0])
+						);
+					});
+				}
+			} finally {
+				result.destroyAll();
+				try {
+					await options.teardown?.(result.env);
+				} catch {
+					// Teardown is best-effort by contract.
+				}
+			}
+		}
+		expect(abandonedCells, 'cells that abandoned (quorum)').to.be.at.least(1);
+		expect(promotedCells, 'cells that promoted (quorum)').to.be.at.least(1);
 	});
 });
