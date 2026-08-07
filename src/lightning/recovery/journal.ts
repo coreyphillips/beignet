@@ -817,15 +817,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				state: c.state,
 				peerPubkey: c.peerPubkey
 			})),
-			keyIndices: channels
-				.map((c) => ({
-					channelId: c.channelId,
-					channelIndex: storage.loadChannelKeyIndex(c.channelId)
-				}))
-				.filter(
-					(k): k is { channelId: string; channelIndex: number } =>
-						k.channelIndex != null
-				),
+			// The WHOLE index table, not just live channels' entries: a
+			// deleted channel's index row is the high-water mark that keeps
+			// the next open from reusing its keys, and a snapshot composed
+			// after the deletion is the only carrier a reconstruction has.
+			keyIndices:
+				storage.loadAllChannelKeyIndices?.() ??
+				channels
+					.map((c) => ({
+						channelId: c.channelId,
+						channelIndex: storage.loadChannelKeyIndex(c.channelId)
+					}))
+					.filter(
+						(k): k is { channelId: string; channelIndex: number } =>
+							k.channelIndex != null
+					),
 			chainMonitors: storage.loadAllChainMonitors(),
 			preimages: storage.loadAllPreimages(),
 			payments: storage.loadAllPayments(),

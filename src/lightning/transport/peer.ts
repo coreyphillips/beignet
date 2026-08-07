@@ -58,6 +58,16 @@ export interface IPeerOptions {
 	port: number;
 	/** Local feature flags to advertise */
 	localFeatures?: FeatureFlags;
+	/**
+	 * Hold post-init inbound messages until releaseHeldMessages() is
+	 * called. The post-handshake drain can surface coalesced traffic (an
+	 * init and an open_channel2 in one TCP segment) before the consumer
+	 * has finished its bring-up (registration, peer:connect handlers);
+	 * holding at the source keeps ONE ordered stream instead of racing
+	 * early frames against that bring-up. Managed connections set this;
+	 * a raw Peer keeps the historical emit-immediately behavior.
+	 */
+	holdMessagesUntilRelease?: boolean;
 	/** Chain hashes to advertise */
 	networks?: Buffer[];
 	/** Ping interval in ms (default 30s) */
@@ -99,6 +109,8 @@ export class Peer extends EventEmitter {
 	private localFeatures: FeatureFlags;
 	private networks?: Buffer[];
 	private state: PeerState = 'disconnected';
+	/** Non-null while messages are held (see holdMessagesUntilRelease). */
+	private heldMessages: Array<{ type: number; payload: Buffer }> | null = null;
 	private socket: IDuplexTransport | null = null;
 	private transport: TransportCipher | null = null;
 	private remoteInit: IInitMessage | null = null;
@@ -145,6 +157,7 @@ export class Peer extends EventEmitter {
 		this.createSocketFn = options.createSocket;
 		this.connectTimeoutMs = options.connectTimeout ?? 15_000;
 		this.handshakeTimeoutMs = options.handshakeTimeout ?? 30_000;
+		this.heldMessages = options.holdMessagesUntilRelease ? [] : null;
 	}
 
 	getState(): PeerState {
@@ -662,8 +675,35 @@ export class Peer extends EventEmitter {
 			return;
 		}
 
-		// Emit known messages and unknown odd messages to listeners
+		// Emit known messages and unknown odd messages to listeners; while
+		// held, queue in arrival order instead (ping/pong above stay live).
+		if (this.heldMessages) {
+			this.heldMessages.push({ type, payload });
+			return;
+		}
 		this.emit('message', type, payload);
+	}
+
+	/**
+	 * Deliver everything held and go live. Delivery preserves arrival
+	 * order, stops the moment the connection leaves 'ready' (a delivered
+	 * message may legitimately tear the connection down), and contains a
+	 * throwing listener as a peer error rather than letting it unwind the
+	 * caller's bring-up bookkeeping.
+	 */
+	releaseHeldMessages(): void {
+		const held = this.heldMessages;
+		this.heldMessages = null;
+		if (!held) return;
+		for (const { type, payload } of held) {
+			if (this.state !== 'ready') return;
+			try {
+				this.emit('message', type, payload);
+			} catch (err) {
+				this.emit('error', err instanceof Error ? err : new Error(String(err)));
+				return;
+			}
+		}
 	}
 
 	// ─── Ping/Pong ─────────────────────────────────────────────

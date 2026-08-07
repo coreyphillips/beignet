@@ -30,6 +30,9 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 
@@ -54,9 +57,22 @@ import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
+	CRASH_V1_PROFILE,
 	DurabilityBarrier,
+	GuardianClient,
+	GuardianHttpServer,
 	GuardianReplicator,
-	RecoveryManager
+	IBoundGuardianClient,
+	IWriterLeaseKeys,
+	RecoveryCriticality,
+	RecoveryManager,
+	ReferenceGuardian,
+	RestoreDriver,
+	computeGuardianSetId,
+	deriveRecoveryRoot,
+	loadWriterLease,
+	reconstructFromFrames,
+	xOnlyFromSecret
 } from '../../src/lightning/recovery';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
 import { encodeOpenChannel2Message } from '../../src/lightning/message/dual-funding';
@@ -651,22 +667,69 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 	});
 
 	it('refuses a record-less v2 row even past tx_signatures states', function () {
+		// AWAITING_FUNDING_CONFIRMED and AWAITING_CHANNEL_READY with
+		// fundingVersion 2 and no record: a healthy post-record open
+		// carries v2InFlight until NORMAL, so these shapes are legacy rows,
+		// and they cannot answer a peer's next_funding (the splice handler
+		// replies tx_abort). Quorum refuses both.
+		for (const laterState of [
+			ChannelState.AWAITING_FUNDING_CONFIRMED,
+			ChannelState.AWAITING_CHANNEL_READY
+		]) {
+			const storage = openStorage();
+			const inFlight = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 150_000n,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(24).basepoints,
+				localPerCommitmentSeed: makeSeed(24)
+			});
+			inFlight.channelId = crypto.randomBytes(32);
+			inFlight.state = laterState;
+			inFlight.fundingVersion = 2;
+			storage.saveChannel(
+				inFlight.channelId.toString('hex'),
+				inFlight,
+				'02'.repeat(33)
+			);
+
+			expect(
+				() =>
+					new LightningNode(
+						makeNodeConfig(24, {
+							storage,
+							recovery: quorumRecovery()
+						})
+					),
+				`refuses ${laterState}`
+			).to.throw(/no durable in-flight record is in progress/);
+
+			// Async-remote comes up over it for the operator to finish.
+			const asyncNode = new LightningNode(
+				makeNodeConfig(24, { storage, recovery: { enabled: true } })
+			);
+			asyncNode.on('node:error', () => {});
+			expect(asyncNode.getChannelManager().listChannels()).to.have.length(1);
+			asyncNode.destroy();
+		}
+	});
+
+	it('unwraps a row stored mid-reestablish to the state it returns to', function () {
 		const storage = openStorage();
-		// AWAITING_FUNDING_CONFIRMED with fundingVersion 2 and no record:
-		// a healthy post-#304 open carries the record until NORMAL, so this
-		// shape is a legacy row, and it cannot answer a peer's next_funding
-		// (the splice handler replies tx_abort). Quorum refuses it too.
+		// A crash while AWAITING_REESTABLISH persists that state with the
+		// original underneath; the preflight must judge the underlying one.
 		const inFlight = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
 			fundingSatoshis: 150_000n,
 			pushMsat: 0n,
 			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-			localBasepoints: makeBasepoints(24).basepoints,
-			localPerCommitmentSeed: makeSeed(24)
+			localBasepoints: makeBasepoints(33).basepoints,
+			localPerCommitmentSeed: makeSeed(33)
 		});
 		inFlight.channelId = crypto.randomBytes(32);
-		inFlight.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
-		inFlight.fundingVersion = 2;
+		inFlight.state = ChannelState.AWAITING_REESTABLISH;
+		inFlight.preReestablishState = ChannelState.AWAITING_TX_SIGNATURES;
 		storage.saveChannel(
 			inFlight.channelId.toString('hex'),
 			inFlight,
@@ -676,20 +739,490 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		expect(
 			() =>
 				new LightningNode(
-					makeNodeConfig(24, {
+					makeNodeConfig(33, {
 						storage,
 						recovery: quorumRecovery()
 					})
 				)
 		).to.throw(/no durable in-flight record is in progress/);
+		storage.close();
+	});
 
-		// Async-remote comes up over it for the operator to finish.
+	it('a database already sticky in quorum still boots over a legacy record-less v2 row', function () {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-sticky-')),
+			'node.db'
+		);
+		// Life 1: an ordinary quorum run writes a REAL quorum frame, which
+		// is what makes the chain sticky.
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(28, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(60).toString('hex'),
+					preimage: makeSeed(61)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed, 'a real quorum frame landed').to.equal(true);
+		node1.destroy();
+
+		// The upgrade shape: a pre-record v2 row sits in a database whose
+		// chain already promised quorum (it passed the pre-preflight guard
+		// of an earlier release and frames were written since).
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		const legacy = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(29).basepoints,
+			localPerCommitmentSeed: makeSeed(29)
+		});
+		legacy.channelId = crypto.randomBytes(32);
+		legacy.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		legacy.fundingVersion = 2;
+		s2.saveChannel(legacy.channelId.toString('hex'), legacy, '02'.repeat(33));
+		s2.close();
+
+		// Async-remote is NOT an exit here: the sticky rule refuses to run
+		// this chain unbarriered. This is exactly why the preflight must
+		// not refuse quorum startup for this database.
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(28, { storage: s3, recovery: { enabled: true } })
+				)
+		).to.throw(/quorum mode but no enforcing/);
+		s3.close();
+
+		// Quorum still boots: the preflight carries the row loudly instead
+		// of leaving the database with no startup path, and the row takes
+		// its ordinary disposition.
+		const s4 = new SqliteStorage(dbPath);
+		s4.open();
+		const node2 = new LightningNode(
+			makeNodeConfig(28, { storage: s4, recovery: quorumRecovery() })
+		);
+		node2.on('node:error', () => {});
+		expect(node2.getChannelManager().listChannels()).to.have.length(1);
+
+		// And the carried row is QUORUM-DURABLE, not merely restored: the
+		// peer may hold a fully signed funding tx for it, so a guardian
+		// reconstruction that omitted the channel would forget state the
+		// peer can put on chain. The startup carriage appends it to the
+		// journal, so frames alone rebuild it.
+		const journal = (
+			node2 as unknown as {
+				recovery: {
+					options: { journal?: { loadVerifiedFrames: () => unknown } };
+				};
+			}
+		).recovery.options.journal;
+		expect(journal, 'the node journals recovery frames').to.not.equal(
+			undefined
+		);
+		const rebuilt = new SqliteStorage(':memory:');
+		rebuilt.open();
+		reconstructFromFrames(
+			rebuilt,
+			journal!.loadVerifiedFrames() as Parameters<
+				typeof reconstructFromFrames
+			>[1]
+		);
+		expect(
+			rebuilt.loadAllChannels().map((row) => row.channelId),
+			'guardian reconstruction includes the carried channel'
+		).to.include(legacy.channelId.toString('hex'));
+		rebuilt.close();
+		node2.destroy();
+	});
+
+	it('a wrapped record-less DUAL row takes the residue deletion, not a phantom restore', function () {
+		// Stored mid-reestablish, the row names DUAL_FUNDING_V2 underneath;
+		// restoration must judge THAT state and remove the residue, in
+		// async-remote and in a sticky-quorum carry alike.
+		const buildRow = (seedId: number): ReturnType<typeof createOpenerState> => {
+			const row = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 150_000n,
+				pushMsat: 0n,
+				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+				localBasepoints: makeBasepoints(seedId).basepoints,
+				localPerCommitmentSeed: makeSeed(seedId)
+			});
+			row.channelId = crypto.randomBytes(32);
+			row.state = ChannelState.AWAITING_REESTABLISH;
+			row.preReestablishState = ChannelState.DUAL_FUNDING_V2;
+			return row;
+		};
+
+		// Async-remote: deleted at restore, never tracked, never stored.
+		const asyncStorage = openStorage();
+		const asyncRow = buildRow(34);
+		asyncStorage.saveChannel(
+			asyncRow.channelId!.toString('hex'),
+			asyncRow,
+			'02'.repeat(33)
+		);
 		const asyncNode = new LightningNode(
-			makeNodeConfig(24, { storage, recovery: { enabled: true } })
+			makeNodeConfig(34, { storage: asyncStorage, recovery: { enabled: true } })
 		);
 		asyncNode.on('node:error', () => {});
-		expect(asyncNode.getChannelManager().listChannels()).to.have.length(1);
+		expect(asyncNode.getChannelManager().listChannels()).to.have.length(0);
+		expect(asyncStorage.loadAllChannels()).to.have.length(0);
 		asyncNode.destroy();
+
+		// Sticky quorum: the preflight carries it (unwrapping to judge it),
+		// and restoration still deletes the residue instead of restoring a
+		// phantom that answers nothing.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-wrapdual-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(35, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(62).toString('hex'),
+					preimage: makeSeed(63)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		const stickyRow = buildRow(36);
+		s2.saveChannel(
+			stickyRow.channelId!.toString('hex'),
+			stickyRow,
+			'02'.repeat(33)
+		);
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const node2 = new LightningNode(
+			makeNodeConfig(35, { storage: s3, recovery: quorumRecovery() })
+		);
+		node2.on('node:error', () => {});
+		expect(
+			node2.getChannelManager().listChannels(),
+			'no phantom channel is tracked'
+		).to.have.length(0);
+		expect(
+			s3.loadAllChannels(),
+			'the residue row was removed durably'
+		).to.have.length(0);
+		node2.destroy();
+	});
+
+	it('the carried row is guardian-durable BEFORE the node talks to anyone, and burned key indices survive', async function () {
+		this.timeout(30_000);
+		// The full upgrade arc against REAL guardians: a sticky-quorum
+		// database gains (a) a record-less AFC row the peer may be able to
+		// fund and (b) a wrapped-DUAL residue row whose key index 7 is
+		// burned. The boot must journal the carried row, stay quarantined
+		// until the repair frame is quorum-RECEIPTED, and a guardian-only
+		// RestoreDriver must then rebuild BOTH the carried channel and the
+		// key-index high-water mark.
+		const secrets = [1, 2, 3].map((i) =>
+			crypto.createHash('sha256').update(`p6v2-guardian-${i}`).digest()
+		);
+		const ids = secrets.map((secret) => xOnlyFromSecret(secret));
+		const setId = computeGuardianSetId({
+			...CRASH_V1_PROFILE,
+			guardianIds: ids
+		});
+		const context = { guardianSetId: setId, members: ids };
+		let now = 2_600_000_000_000n;
+		const clock = (): bigint => ++now;
+		const served = await Promise.all(
+			secrets.map(async (secret, index) => {
+				const guardian = new ReferenceGuardian({
+					path: ':memory:',
+					guardianSecret: secret,
+					members: ids,
+					clock
+				});
+				const server = new GuardianHttpServer({ guardian });
+				const port = await server.listen(0);
+				return {
+					guardian,
+					server,
+					bound: {
+						client: new GuardianClient({
+							url: `http://127.0.0.1:${port}`,
+							guardianSetId: setId
+						}),
+						expectedGuardianId: ids[index]
+					} as IBoundGuardianClient
+				};
+			})
+		);
+		const bound = served.map((entry) => entry.bound);
+		const nodeSeed = 40;
+		const nodePriv = crypto
+			.createHash('sha256')
+			.update(makeSeed(nodeSeed))
+			.update(Buffer.from('node-identity'))
+			.digest();
+		const recoveryRoot = deriveRecoveryRoot(nodePriv);
+
+		const realQuorum = (
+			storage: SqliteStorage,
+			lease: { value: IWriterLeaseKeys | null }
+		): {
+			recovery: INodeConfig['recovery'];
+			replicator: GuardianReplicator;
+		} => {
+			const replicator = new GuardianReplicator({
+				storage,
+				guardians: bound,
+				context,
+				required: CRASH_V1_PROFILE.required,
+				recoveryRoot,
+				clock
+			});
+			const barrier = new DurabilityBarrier({
+				durability: 'quorum',
+				replicator,
+				lease: () => lease.value,
+				timeoutMs: 10_000,
+				retryDelayMs: 50
+			});
+			return {
+				recovery: {
+					enabled: true,
+					durability: 'quorum',
+					barrier,
+					snapshotIntervalFrames: 1
+				},
+				replicator
+			};
+		};
+
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-guardians-')),
+			'node.db'
+		);
+		// The writer lease refuses unencrypted storage.
+		const dbKey = crypto
+			.createHash('sha256')
+			.update('p6v2-guardian-db-key')
+			.digest();
+		const openDb = (): SqliteStorage => {
+			const db = new SqliteStorage(dbPath, undefined, {
+				encryptionKey: dbKey
+			});
+			db.open();
+			return db;
+		};
+		// Life 1: quorum runs for real; the namespace registers, a frame
+		// lands, replication catches up.
+		const s1 = openDb();
+		const lease1: { value: IWriterLeaseKeys | null } = { value: null };
+		const q1 = realQuorum(s1, lease1);
+		const decision = await q1.replicator.ensureNamespace();
+		expect(decision.outcome, 'namespace registered').to.equal('registered');
+		lease1.value = (decision as { lease: IWriterLeaseKeys }).lease;
+		const node1 = new LightningNode(
+			makeNodeConfig(nodeSeed, { storage: s1, recovery: q1.recovery })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(64).toString('hex'),
+					preimage: makeSeed(65)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		await q1.replicator.replicatePending(lease1.value!);
+		node1.destroy();
+
+		// The upgrade shape: a carried AFC row plus a wrapped-DUAL residue
+		// row with key index 7 burned, both written OUTSIDE the journal.
+		const s2 = openDb();
+		const carried = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(41).basepoints,
+			localPerCommitmentSeed: makeSeed(41)
+		});
+		carried.channelId = crypto.randomBytes(32);
+		carried.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		carried.fundingVersion = 2;
+		s2.saveChannel(carried.channelId.toString('hex'), carried, '02'.repeat(33));
+		const residue = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(42).basepoints,
+			localPerCommitmentSeed: makeSeed(42)
+		});
+		residue.channelId = crypto.randomBytes(32);
+		residue.state = ChannelState.AWAITING_REESTABLISH;
+		residue.preReestablishState = ChannelState.DUAL_FUNDING_V2;
+		const residueId = residue.channelId.toString('hex');
+		s2.saveChannel(residueId, residue, '02'.repeat(33));
+		s2.saveChannelKeyIndex(residueId, 7);
+		s2.close();
+
+		// Life 2: the boot journals the carried row and stays quarantined
+		// until the repair frame is receipted by the quorum.
+		const s3 = openDb();
+		const lease2: { value: IWriterLeaseKeys | null } = { value: null };
+		const loaded = loadWriterLease(s3);
+		expect(loaded.state, 'the lease survived').to.equal('present');
+		lease2.value = (loaded as { lease: IWriterLeaseKeys }).lease;
+		const q2 = realQuorum(s3, lease2);
+		const node2 = new LightningNode(
+			makeNodeConfig(nodeSeed, { storage: s3, recovery: q2.recovery })
+		);
+		node2.on('node:error', () => {});
+		const pendingOf = (n: LightningNode): boolean =>
+			(n as unknown as { startupRepairPending: boolean }).startupRepairPending;
+		expect(
+			pendingOf(node2),
+			'the node quarantines itself behind the repair frame'
+		).to.equal(true);
+		const deadline = Date.now() + 15_000;
+		while (pendingOf(node2) && Date.now() < deadline) {
+			await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		expect(
+			pendingOf(node2),
+			'the repair frame was receipted and the quarantine lifted'
+		).to.equal(false);
+		expect(
+			node2.getChannelManager().getChannel(carried.channelId),
+			'the carried channel is tracked'
+		).to.not.equal(undefined);
+		expect(
+			node2.getChannelManager().getChannel(residue.channelId),
+			'the residue was deleted, not restored'
+		).to.equal(undefined);
+		node2.destroy();
+
+		// Guardian-only restore: the device burns; the trio must give back
+		// the carried channel AND the key-index high-water mark.
+		const target = new SqliteStorage(':memory:');
+		target.open();
+		await new RestoreDriver({
+			target,
+			guardians: bound,
+			context,
+			required: CRASH_V1_PROFILE.required,
+			recoveryRoot,
+			nodeSecret: nodePriv,
+			nodeId: getPublicKey(nodePriv),
+			clock
+		}).restore();
+		expect(
+			target.loadAllChannels().map((row) => row.channelId),
+			'guardian-held frames rebuild the carried channel'
+		).to.include(carried.channelId.toString('hex'));
+		expect(
+			target.loadNextChannelIndex(),
+			'the burned key index survives reconstruction'
+		).to.be.at.least(8);
+		target.close();
+		s3.close();
+		for (const entry of served) {
+			await entry.server.close();
+			entry.guardian.close();
+		}
+	});
+
+	it('a failed repair append refuses startup outright', function () {
+		// Fail-closed: if the carried row cannot be journaled, the node must
+		// not come up and start talking as if the repair had happened.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-failrepair-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(43, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(66).toString('hex'),
+					preimage: makeSeed(67)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		const carried = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(44).basepoints,
+			localPerCommitmentSeed: makeSeed(44)
+		});
+		carried.channelId = crypto.randomBytes(32);
+		carried.state = ChannelState.AWAITING_FUNDING_CONFIRMED;
+		carried.fundingVersion = 2;
+		s2.saveChannel(carried.channelId.toString('hex'), carried, '02'.repeat(33));
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		// The journal append fails exactly when the repair frame would be
+		// written: the carried row's channel_state save inside the commit.
+		const realSave = s3.saveChannel.bind(s3);
+		const carriedId = carried.channelId.toString('hex');
+		s3.saveChannel = (id: string, state: unknown, peer: string): void => {
+			if (id === carriedId) throw new Error('disk says no');
+			realSave(id, state as never, peer);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(43, { storage: s3, recovery: quorumRecovery() })
+				)
+		).to.throw(/could not journal the carried v2 open/);
+		s3.close();
 	});
 
 	it('leaves a v1 AWAITING_FUNDING_CONFIRMED row alone', function () {
@@ -718,14 +1251,26 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		const storage = openStorage();
 		// quorum + preferTaproot masks option_dual_fund; features are
 		// advisory on the wire, so the handler must hold the line itself:
-		// no keys derived, no temp channel, no row.
+		// no keys derived, no temp channel, no row, and a WIRE error so the
+		// opener is not left parked in DUAL_FUNDING_V2.
+		let derived = 0;
 		const node = new LightningNode({
 			...makeNodeConfig(26, {
 				storage,
 				recovery: quorumRecovery(),
 				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
 			}),
-			preferTaproot: true
+			preferTaproot: true,
+			channelKeyDeriver: (index: number) => {
+				derived++;
+				const bp = makeBasepoints(70 + index);
+				return {
+					basepoints: bp.basepoints,
+					perCommitmentSeed: makeSeed(170 + index),
+					fundingPrivkey: bp.fundingPrivkey,
+					htlcBasepointSecret: bp.htlcSecret
+				};
+			}
 		});
 		node.on('node:error', () => {});
 		node.on('error', () => {});
@@ -765,11 +1310,73 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		await settle(() => errors.length > 0, 1500);
 
 		expect(errors.join(' ')).to.contain('does not advertise option_dual_fund');
+		// The refusal is peer-visible, and nothing was allocated for it:
+		// no accept, no key index burnt, no channel, no row.
+		expect(sent, 'a wire error went out').to.include(MessageType.ERROR);
+		expect(sent).to.not.include(MessageType.ACCEPT_CHANNEL2);
+		expect(derived, 'no channel keys were derived').to.equal(0);
+		expect(manager.listChannels()).to.have.length(0);
+		expect(storage.loadAllChannels()).to.have.length(0);
+
+		node.destroy();
+	});
+
+	it('refuses an inbound open_channel2 from a peer whose init lacked the bit', async function () {
+		const storage = openStorage();
+		// We advertise option_dual_fund, the PEER did not: v2 establishment
+		// is conditioned on the NEGOTIATED feature, so the proposal is out
+		// of contract however it arrived, and the refusal goes on the wire.
+		const node = quorumNode(30, storage);
+		const manager = managerOf(node);
+		const errors: string[] = [];
+		manager.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		const sent: number[] = [];
+		(manager as unknown as { peerManager: unknown }).peerManager = {
+			getPeer: () => ({
+				getRemoteInit: () => ({ features: FeatureFlags.empty() })
+			}),
+			sendToPeer: (_pk: string, type: number) => {
+				sent.push(type);
+			}
+		};
+
+		const peerSide = makeBasepoints(31);
+		const openMsg = encodeOpenChannel2Message({
+			chainHash: REGTEST_CHAIN_HASH,
+			channelId: crypto.randomBytes(32),
+			fundingFeeratePerkw: 1000,
+			commitmentFeeratePerkw: 253,
+			fundingSatoshis: 150_000n,
+			dustLimitSatoshis: 546n,
+			maxHtlcValueInFlightMsat: 500_000_000n,
+			htlcMinimumMsat: 1n,
+			toSelfDelay: 144,
+			maxAcceptedHtlcs: 483,
+			locktime: 0,
+			fundingPubkey: peerSide.basepoints.fundingPubkey,
+			revocationBasepoint: peerSide.basepoints.revocationBasepoint,
+			paymentBasepoint: peerSide.basepoints.paymentBasepoint,
+			delayedPaymentBasepoint: peerSide.basepoints.delayedPaymentBasepoint,
+			htlcBasepoint: peerSide.basepoints.htlcBasepoint,
+			firstPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			secondPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
+			channelFlags: 1
+		});
+		manager.handleMessage('02'.repeat(33), MessageType.OPEN_CHANNEL2, openMsg);
+		await settle(() => errors.length > 0, 1500);
+
+		expect(errors.join(' ')).to.contain(
+			'the peer did not advertise option_dual_fund'
+		);
+		expect(sent, 'a wire error went out').to.include(MessageType.ERROR);
 		expect(sent).to.not.include(MessageType.ACCEPT_CHANNEL2);
 		expect(manager.listChannels()).to.have.length(0);
 		expect(storage.loadAllChannels()).to.have.length(0);
 
 		node.destroy();
+		storage.close();
 	});
 
 	it('comes up RESUMABLE over a recorded v2 open', function () {

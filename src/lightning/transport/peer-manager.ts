@@ -282,7 +282,12 @@ export class PeerManager extends EventEmitter {
 			port,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
-			createSocket
+			createSocket,
+			// Held until bring-up completes: the post-handshake drain must
+			// not race registration or the peer:connect handlers (a queued
+			// channel_reestablish processed before our own reconnect hook
+			// would suppress the reestablish WE owe).
+			holdMessagesUntilRelease: true
 		});
 
 		this.setupPeerListeners(pubkey, peer);
@@ -349,6 +354,10 @@ export class PeerManager extends EventEmitter {
 		this.stabilityTimers.set(pubkey, stabilityTimer);
 		captureWireEvent('connect', pubkey, 'outbound');
 		this.emit('peer:connect', pubkey);
+		// Bring-up is complete: registration, bookkeeping and the connect
+		// handlers all ran, so the held post-handshake traffic (if any)
+		// now delivers in order against a fully wired connection.
+		peer.releaseHeldMessages();
 	}
 
 	private clearStabilityTimer(pubkey: string): void {
@@ -877,7 +886,13 @@ export class PeerManager extends EventEmitter {
 			host: socket.remoteAddress || 'unknown',
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
-			networks: this.networks
+			networks: this.networks,
+			// Held until bring-up completes; see the outbound twin. For
+			// inbound this also closes the harder gap: the drain runs
+			// before acceptInbound() resolves, when no listener is even
+			// attached yet, so unheld coalesced frames would be LOST, not
+			// merely early.
+			holdMessagesUntilRelease: true
 		});
 
 		// Visible to freezeConnections() while the handshake is in flight.
@@ -945,6 +960,9 @@ export class PeerManager extends EventEmitter {
 				// not the node's listening port. Reconnect attempts to ephemeral ports always fail.
 				captureWireEvent('connect', pubkey, 'inbound');
 				this.emit('peer:connect', pubkey);
+				// Bring-up is complete (see the outbound twin): deliver the
+				// held post-handshake traffic in order.
+				peer.releaseHeldMessages();
 			})
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
@@ -952,26 +970,33 @@ export class PeerManager extends EventEmitter {
 			});
 	}
 
+	private dispatchPeerMessage(
+		pubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		// Inbound dispatch gate: a refused message is dropped here, before
+		// any handler (channel, gossip, onion, peer storage) can act on it.
+		if (this.inboundGate && !this.inboundGate(pubkey, type)) {
+			return;
+		}
+
+		// Route to type-specific handlers
+		const handlers = this.messageHandlers.get(type);
+		if (handlers) {
+			for (const handler of handlers) {
+				handler(pubkey, type, payload);
+			}
+		}
+
+		// Also emit as generic event
+		this.emit('message', pubkey, type, payload);
+	}
+
 	private setupPeerListeners(pubkey: string, peer: Peer): void {
 		peer.on('message', (type: number, payload: Buffer) => {
 			captureWireMessage('in', pubkey, type, payload);
-
-			// Inbound dispatch gate: a refused message is dropped here, before
-			// any handler (channel, gossip, onion, peer storage) can act on it.
-			if (this.inboundGate && !this.inboundGate(pubkey, type)) {
-				return;
-			}
-
-			// Route to type-specific handlers
-			const handlers = this.messageHandlers.get(type);
-			if (handlers) {
-				for (const handler of handlers) {
-					handler(pubkey, type, payload);
-				}
-			}
-
-			// Also emit as generic event
-			this.emit('message', pubkey, type, payload);
+			this.dispatchPeerMessage(pubkey, type, payload);
 		});
 
 		peer.on('error', (err: Error) => {

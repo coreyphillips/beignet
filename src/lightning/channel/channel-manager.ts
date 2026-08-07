@@ -4081,22 +4081,38 @@ export class ChannelManager extends EventEmitter {
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeOpenChannel2Message(payload);
 
-		// A node that does not advertise option_dual_fund never negotiated
-		// v2 opens, so an inbound open_channel2 is out of contract however
-		// it arrived (features are advisory on the wire: cached, raced, or
-		// ignored). Refuse ahead of everything with an effect: no keys
-		// derived, no temp channel, no row. This is what makes a masked
-		// feature vector (quorum + preferTaproot masks the bit because
-		// taproot v2 signing does not exist) hold on the INBOUND side too.
-		// A manager built without a feature vector negotiates for itself
-		// and is left alone.
+		// V2 establishment is conditioned on NEGOTIATED option_dual_fund:
+		// BOTH our advertised vector and the peer's init must carry it, so
+		// an open_channel2 outside that contract is refused ahead of
+		// everything with an effect: no keys derived, no temp channel, no
+		// row. This is what makes a masked feature vector (quorum +
+		// preferTaproot masks the bit because taproot v2 signing does not
+		// exist) hold on the INBOUND side too. The refusal is PEER-VISIBLE:
+		// a local event alone would leave the opener parked in
+		// DUAL_FUNDING_V2 forever, so a wire error scoped to the temporary
+		// channel id cancels the open on its side. A manager built without
+		// a feature vector, or driven without a peer manager (unit
+		// harnesses), negotiates for itself and is left alone.
 		const localFeatures = this.config.localFeatures;
-		if (localFeatures && !localFeatures.hasFeature(Feature.DUAL_FUND)) {
-			this.emit(
-				'error',
-				msg.channelId,
-				'open_channel2 refused: this node does not advertise option_dual_fund'
+		const localLacks =
+			localFeatures !== undefined &&
+			!localFeatures.hasFeature(Feature.DUAL_FUND);
+		const remoteInit = this.peerManager?.getPeer(peerPubkey)?.getRemoteInit();
+		const remoteLacks =
+			!!remoteInit && !remoteInit.features.hasFeature(Feature.DUAL_FUND);
+		if (localLacks || remoteLacks) {
+			const reason = localLacks
+				? 'open_channel2 refused: this node does not advertise option_dual_fund'
+				: 'open_channel2 refused: the peer did not advertise option_dual_fund';
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
 			);
+			this.emit('error', msg.channelId, reason);
 			return;
 		}
 

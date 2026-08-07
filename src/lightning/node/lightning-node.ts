@@ -530,6 +530,8 @@ export class LightningNode extends EventEmitter {
 	 * is persisted so a restart resumes the obligation.
 	 */
 	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
+	/** True while a startup repair frame awaits its quorum receipt. */
+	private startupRepairPending = false;
 	/**
 	 * When a re-authorization was last asked for, keyed by funding txid or, for
 	 * a splice, by channel id.
@@ -1106,12 +1108,95 @@ export class LightningNode extends EventEmitter {
 			// while doing it, so a post-restore scan would both miss rows and
 			// leave a half-mutated database behind its own refusal, making
 			// the suggested async-remote retry impossible.
+			let carriedV2Rows: string[] = [];
 			if (barrier?.enforcing === true) {
-				this.assertQuorumCanCarryStoredV2Opens();
+				carriedV2Rows = this.assertQuorumCanCarryStoredV2Opens(
+					chainPromisedQuorum(
+						this.storage,
+						deriveRecoveryMasterKey(config.nodePrivateKey),
+						getPublicKey(config.nodePrivateKey)
+					)
+				);
 			}
 			this.restoreFromStorage();
-			// Auto-reconnect peers after crash recovery (Fix 2.1)
-			this.autoReconnectPeers();
+			// A carried row entered this database OUTSIDE the journal (it
+			// predates the record, or was written by a release without the
+			// preflight), so guardian reconstruction would omit a channel
+			// whose funding the peer may be able to broadcast. Repair that
+			// BEFORE any networking, fail-closed: one frame carries every
+			// carried row (with the key-index high-water mark riding the
+			// snapshot machinery), a failed append refuses startup outright,
+			// and the node stays quarantined behind its own traffic gates
+			// until the repair frame is quorum-RECEIPTED, so nothing this
+			// node ever says can outrun what the guardians can restore.
+			const repairMutations: RecoveryMutation[] = [];
+			for (const idHex of carriedV2Rows) {
+				const channel = this.channelManager.getChannel(
+					Buffer.from(idHex, 'hex')
+				);
+				if (!channel) continue; // took a deletion disposition instead
+				const peer = this.channelManager.getPeerForChannel(
+					Buffer.from(idHex, 'hex')
+				);
+				repairMutations.push({
+					type: 'channel_state',
+					channelId: idHex,
+					state: channel.getFullState(),
+					peerPubkey: peer ?? ''
+				});
+			}
+			if (repairMutations.length > 0 && this.recovery) {
+				const repair = this.recovery.commit({
+					criticality: RecoveryCriticality.Important,
+					mutations: repairMutations,
+					outboundMessages: [],
+					reportedByCaller: true
+				});
+				if (!repair.committed) {
+					throw new Error(
+						`recovery: could not journal the carried v2 open(s) ` +
+							`(${repair.error?.message ?? 'commit refused'}); refusing ` +
+							`to start over an unrepaired quorum database`
+					);
+				}
+				if (barrier && repair.frameSequence !== null) {
+					this.startupRepairPending = true;
+					this.emitStructuredLog('channel', 'startup_repair_pending', {
+						frameSequence: String(repair.frameSequence),
+						channels: carriedV2Rows
+					});
+					barrier.kickReplication?.();
+					void barrier.whenReleased(repair.frameSequence).then((outcome) => {
+						if (!outcome.released) {
+							// Quarantine holds: the operator sees why, and the
+							// gates keep refusing until a restart with a
+							// reachable quorum succeeds.
+							this.emitStructuredLog('channel', 'startup_repair_unreceipted', {
+								reason: outcome.reason
+							});
+							this.emit('node:error', {
+								code: 'STARTUP_REPAIR_UNRECEIPTED',
+								message:
+									`the carried v2 open's repair frame was not ` +
+									`accepted by a guardian quorum (${outcome.reason}); ` +
+									`the node stays quarantined`,
+								timestamp: Date.now()
+							} as ILightningError);
+							return;
+						}
+						this.startupRepairPending = false;
+						this.emitStructuredLog('channel', 'startup_repair_receipted', {
+							frameSequence: String(repair.frameSequence)
+						});
+						this.autoReconnectPeers();
+					});
+				}
+			}
+			// Auto-reconnect peers after crash recovery (Fix 2.1); deferred
+			// to the receipt callback while the repair quarantine holds.
+			if (!this.startupRepairPending) {
+				this.autoReconnectPeers();
+			}
 		}
 
 		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
@@ -1255,8 +1340,21 @@ export class LightningNode extends EventEmitter {
 	 * alone). Refuse to come up; finish or abandon it under async-remote
 	 * first, which this preflight keeps possible by throwing before a
 	 * single row is deleted or a single frame is written.
+	 *
+	 * EXCEPT when the journal is already sticky quorum. A pre-record v2
+	 * row can have entered quorum legitimately (opened under an earlier
+	 * release, quorum enabled while the guard did not exist, frames
+	 * written since), and once the chain promised quorum the async-remote
+	 * retry this refusal recommends is itself refused, so throwing here
+	 * would leave the database with NO startup path. Such a row is
+	 * carried instead, loudly: it takes its deterministic disposition
+	 * (residue deletion, inert orphan, or a tx_abort answer to the peer's
+	 * reestablish followed by an operator close), none of which claims
+	 * the resumability this preflight polices, and none of which is
+	 * broadcastable, so wire safety is untouched.
 	 */
-	private assertQuorumCanCarryStoredV2Opens(): void {
+	private assertQuorumCanCarryStoredV2Opens(alreadyQuorum: boolean): string[] {
+		const carried: string[] = [];
 		for (const row of this.storage!.loadAllChannels()) {
 			const state = row.state;
 			if (state.v2InFlight) continue;
@@ -1275,6 +1373,18 @@ export class LightningNode extends EventEmitter {
 				(st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
 					st === ChannelState.AWAITING_CHANNEL_READY);
 			if (!alwaysV2 && !v2Later) continue;
+			if (alreadyQuorum) {
+				this.emitStructuredLog(
+					'channel',
+					'quorum_carries_unresumable_v2_open',
+					{
+						channelId: row.channelId,
+						state: st
+					}
+				);
+				carried.push(row.channelId);
+				continue;
+			}
 			throw new Error(
 				`recovery: cannot enable quorum durability while a ` +
 					`dual-funded open with no durable in-flight record is in ` +
@@ -1283,6 +1393,7 @@ export class LightningNode extends EventEmitter {
 					`async-remote durability first`
 			);
 		}
+		return carried;
 	}
 
 	private restoreFromStorage(): void {
@@ -1325,6 +1436,17 @@ export class LightningNode extends EventEmitter {
 					});
 				}
 				continue;
+			}
+			// A row persisted mid-reestablish names the state it returns to,
+			// and the DUAL_FUNDING_V2 dispositions below must judge THAT one:
+			// a wrapped record-less row would otherwise skip the residue
+			// deletion and restore as a phantom that answers nothing.
+			if (
+				state.state === ChannelState.AWAITING_REESTABLISH &&
+				state.preReestablishState === ChannelState.DUAL_FUNDING_V2
+			) {
+				state.state = ChannelState.DUAL_FUNDING_V2;
+				state.preReestablishState = null;
 			}
 			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
 			// RBF whose post-ack traffic never arrived: the record is the
@@ -3737,6 +3859,10 @@ export class LightningNode extends EventEmitter {
 	 * the spec allows; with one configured, only a confirmed lease passes.
 	 */
 	private recoveryPermitsPeerTraffic(): boolean {
+		// Startup repair quarantine: a carried v2 row's repair frame must be
+		// quorum-receipted before this node talks to anyone (connections,
+		// outbound messages and inbound dispatch all consult this).
+		if (this.startupRepairPending) return false;
 		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
 	}
 

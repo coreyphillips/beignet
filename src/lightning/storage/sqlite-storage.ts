@@ -1113,6 +1113,19 @@ export class SqliteStorage implements IStorageBackend {
 		return row ? this._decodeChannelIndex(row.channel_index) : null;
 	}
 
+	loadAllChannelKeyIndices(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}> {
+		const rows = this.db
+			.prepare('SELECT channel_id, channel_index FROM channel_key_indices')
+			.all() as Array<{ channel_id: string; channel_index: number | string }>;
+		return rows.map((row) => ({
+			channelId: row.channel_id,
+			channelIndex: this._decodeChannelIndex(row.channel_index)
+		}));
+	}
+
 	loadNextChannelIndex(): number {
 		// Encrypted cells are TEXT, so SQL MAX() would compare ciphertext;
 		// decode in JS instead (one small row per channel)

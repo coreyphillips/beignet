@@ -142,6 +142,16 @@ export interface IStorageBackend {
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void;
 	loadChannelKeyIndex(channelId: string): number | null;
 	loadNextChannelIndex(): number;
+	/**
+	 * Every stored key-index row, INCLUDING entries whose channel was
+	 * deleted (deletion keeps them: they are the high-water mark that
+	 * prevents key reuse). Optional so partial test backends keep working;
+	 * snapshots fall back to live-channel derivation without it.
+	 */
+	loadAllChannelKeyIndices?(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}>;
 
 	// ─── Metadata (key/value) ───
 	saveMetadata(key: string, value: string): void;
