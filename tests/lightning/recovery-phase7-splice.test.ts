@@ -131,9 +131,23 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		};
 		const { schedule } = await recordSchedule('local', s7OpensV2, V2_ENV);
 		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
-		let abandonedCells = 0;
-		let promotedCells = 0;
-		for (const label of schedule) {
+		// The rehearsal names the durable boundary: the first commitment
+		// persist is post-commit:1, and the same batch creates the v2InFlight
+		// record and writes the first (permanent-id) row. Every label from it
+		// onward must leave EXACTLY ONE resumable row; every label before it
+		// must leave nothing. Deriving the expectation from the label rather
+		// than from whatever survived means a regression that LOSES the
+		// durable row reads as the failure it is, not as a valid abandonment.
+		const boundary = schedule.indexOf('post-commit:1');
+		expect(
+			boundary,
+			'the rehearsal crossed the durable boundary'
+		).to.be.greaterThan(0);
+		expect(boundary, 'labels exist beyond the boundary').to.be.lessThan(
+			schedule.length - 1
+		);
+		for (const [index, label] of schedule.entries()) {
+			const mustResume = index >= boundary;
 			const result = await runKillPoint('local', s7OpensV2, label, V2_ENV);
 			const at = `at ${label}`;
 			for (let i = 0; i < 10; i++) await settle();
@@ -143,25 +157,23 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 				rows.every((row) => row.channelId !== tempId),
 				`no orphan temporary row ${at}`
 			).to.equal(true);
-			expect(rows.length, `at most one channel row ${at}`).to.be.at.most(1);
-			if (rows.length === 0) {
-				// Nothing durable: the open is abandoned wholesale and the
-				// restart carries no debris.
-				abandonedCells++;
+			if (!mustResume) {
+				// Nothing durable exists before the boundary: the open is
+				// abandoned wholesale and the restart carries no debris.
+				expect(rows.length, `nothing durable ${at}`).to.equal(0);
 				expect(
 					result.restored.getChannelManager().listChannels().length,
 					`clean restart after abandon ${at}`
 				).to.equal(0);
 			} else {
 				// The promotion committed: exactly one row, under the
-				// permanent id, and it carries the durable v2 record (the
-				// same batch that creates the record writes the first row).
-				// The restart rebuilds the builder-less session from it and
-				// the reestablish that follows resumes the signature
-				// exchange over next_funding, so every promoted cell must
-				// COMPLETE the open. This is the kill-matrix acceptance for
-				// the formerly process-local window (issues 288/289).
-				promotedCells++;
+				// permanent id, carrying the durable v2 record. The restart
+				// rebuilds the builder-less session from it and the
+				// reestablish that follows resumes the signature exchange
+				// over next_funding, so every promoted cell must COMPLETE
+				// the open. This is the kill-matrix acceptance for the
+				// formerly process-local window (issues 288/289).
+				expect(rows.length, `exactly one durable row ${at}`).to.equal(1);
 				expect(
 					rows[0].state.v2InFlight != null ||
 						rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
@@ -183,8 +195,6 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 			}
 			result.destroyAll();
 		}
-		expect(abandonedCells, 'cells that abandoned').to.be.at.least(1);
-		expect(promotedCells, 'cells that promoted').to.be.at.least(1);
 	});
 	it('S7 v2 open under quorum: the same boundaries, gated sends behind the barrier (matrix row 10)', async function () {
 		this.timeout(300_000);
@@ -219,9 +229,20 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		// The barrier property itself, from the rehearsal for free: no gated
 		// send may precede the commit of the frame that authorizes it.
 		assertNoGatedSendBeforeCommit(schedule, captured);
-		let abandonedCells = 0;
-		let promotedCells = 0;
-		for (const label of schedule) {
+		// Same boundary classification as the local sweep: expectations come
+		// from the rehearsal's label order, not from what survived, so a
+		// lost durable row fails its cell instead of counting as abandoned.
+		const boundary = schedule.indexOf('post-commit:1');
+		expect(
+			boundary,
+			'the rehearsal crossed the durable boundary (quorum)'
+		).to.be.greaterThan(0);
+		expect(
+			boundary,
+			'labels exist beyond the boundary (quorum)'
+		).to.be.lessThan(schedule.length - 1);
+		for (const [index, label] of schedule.entries()) {
+			const mustResume = index >= boundary;
 			const result = await runKillPoint('quorum', quorumS7, label, options);
 			try {
 				const at = `at ${label} (quorum)`;
@@ -232,9 +253,8 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 					rows.every((row) => row.channelId !== tempId),
 					`no orphan temporary row ${at}`
 				).to.equal(true);
-				expect(rows.length, `at most one channel row ${at}`).to.be.at.most(1);
-				if (rows.length === 0) {
-					abandonedCells++;
+				if (!mustResume) {
+					expect(rows.length, `nothing durable ${at}`).to.equal(0);
 					expect(
 						result.restored.getChannelManager().listChannels().length,
 						`clean restart after abandon ${at}`
@@ -245,7 +265,7 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 					// Quorum adds nothing to the verdict, only to the wire: the
 					// commitment_signed and tx_signatures that led here each
 					// waited on guardian replication before they left.
-					promotedCells++;
+					expect(rows.length, `exactly one durable row ${at}`).to.equal(1);
 					expect(
 						rows[0].state.v2InFlight != null ||
 							rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
@@ -278,7 +298,5 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 				}
 			}
 		}
-		expect(abandonedCells, 'cells that abandoned (quorum)').to.be.at.least(1);
-		expect(promotedCells, 'cells that promoted (quorum)').to.be.at.least(1);
 	});
 });

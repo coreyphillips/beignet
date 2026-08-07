@@ -106,8 +106,16 @@ function spawnChild(envExtra: Record<string, string>): IChildHandle {
 		},
 		kill: (): Promise<string | null> =>
 			new Promise((resolve) => {
+				// The child may already be gone (a cell that failed after its
+				// kill, or a watchdog-reaped freeze): 'exit' will not re-fire,
+				// and kill() on a dead pid returns false. Resolve from the
+				// recorded signal instead of waiting forever.
+				if (proc.exitCode !== null || proc.signalCode !== null) {
+					resolve(proc.signalCode);
+					return;
+				}
 				proc.once('exit', (_code, signal) => resolve(signal));
-				proc.kill('SIGKILL');
+				if (!proc.kill('SIGKILL')) resolve(proc.signalCode);
 			})
 	};
 }
@@ -361,6 +369,20 @@ async function runKillCell(world: IWorld, label: string): Promise<void> {
 	await settle();
 
 	const revived = await bootChild(world, null);
+	try {
+		await runS1aCellBody(world, revived, label);
+	} catch (err) {
+		if (revived.proc.exitCode === null) await revived.kill();
+		throw err;
+	}
+}
+
+/** The revived half of an S1a kill cell; failures kill the child upstream. */
+async function runS1aCellBody(
+	world: IWorld,
+	revived: IChildHandle,
+	label: string
+): Promise<void> {
 	// Reestablish rides the reconnect. Re-deliver the funding confirmation
 	// the chain would repeat, both sides, when the open got that far.
 	if (world.channelId) {
@@ -503,7 +525,11 @@ async function pollDump(child: IChildHandle): Promise<IChildDump> {
  * completes. Either way the cell ends with a NORMAL channel and a settled
  * probe payment.
  */
-async function runV2KillCell(world: IWorld, label: string): Promise<boolean> {
+async function runV2KillCell(
+	world: IWorld,
+	label: string,
+	mustResume: boolean
+): Promise<void> {
 	const child = await bootChild(world, label);
 	const reached = child.waitLine(`reached:${label}`, 30_000);
 	await Promise.race([
@@ -517,7 +543,7 @@ async function runV2KillCell(world: IWorld, label: string): Promise<boolean> {
 
 	const revived = await bootChild(world, null);
 	try {
-		return await runV2CellBody(world, revived, label);
+		await runV2CellBody(world, revived, label, mustResume);
 	} catch (err) {
 		if (revived.proc.exitCode === null) await revived.kill();
 		throw err;
@@ -526,29 +552,58 @@ async function runV2KillCell(world: IWorld, label: string): Promise<boolean> {
 
 /**
  * The revived half of a v2 kill cell; failures kill the child upstream.
- * Returns true when the cell RESUMED a promoted open, false when it
- * abandoned cleanly.
+ * The expected disposition COMES IN from the schedule's durable boundary
+ * rather than being inferred from what survived, so a lost durable row
+ * fails its cell instead of reading as a valid abandonment.
  */
 async function runV2CellBody(
 	world: IWorld,
 	revived: IChildHandle,
-	label: string
-): Promise<boolean> {
-	// The reestablish rides the reconnect; poll the child's own view until
-	// the resumed open leaves the signature exchange, or conclude abandon
-	// when the restart carries no channel at all.
+	label: string,
+	mustResume: boolean
+): Promise<void> {
+	if (!mustResume) {
+		// Nothing durable exists before the boundary: the restart must
+		// carry no channel at all, and the child correctly answers the
+		// peer's reestablish with an error. That is the matrix's abandoned
+		// disposition, the same acceptance the in-process S7 sweep holds.
+		// No fresh v2 open rides this branch: the child's fixed basepoints
+		// would derive the SAME channel id as the dead attempt, which the
+		// peer deliberately retains (a zero-input acceptor's attempt is
+		// conservatively broadcastable, so no sweep reaps it), and that
+		// collision exists only in this harness, never in production
+		// where openers derive fresh basepoints per channel.
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		const dump = await pollDump(revived);
+		expect(
+			dump.channels.length,
+			`no debris after abandon at ${label}`
+		).to.equal(0);
+		const bye = await revived.kill();
+		expect(bye).to.equal('SIGKILL');
+		return;
+	}
+
+	// The durable row survived by construction (the kill landed at or
+	// after post-commit:1); the reestablish rides the reconnect, so poll
+	// the child's own view until the resumed open leaves the signature
+	// exchange. An empty channel list here is the exact regression this
+	// classification exists to catch.
 	let resumedId: string | null = null;
-	const deadline = Date.now() + 15_000;
+	const deadline = Date.now() + 20_000;
 	for (;;) {
 		const dump = await pollDump(revived);
 		const resumed = dump.channels.find(
 			(c) => c.id !== null && V2_COMPLETION.has(c.state)
 		);
-		if (resumed) {
+		if (resumed?.id) {
 			resumedId = resumed.id;
 			break;
 		}
-		if (dump.channels.length === 0) break;
+		expect(
+			dump.channels.length,
+			`the durable row survived the kill at ${label}`
+		).to.be.greaterThan(0);
 		if (Date.now() > deadline) {
 			throw new Error(
 				`resumed open stuck after ${label}: ${JSON.stringify(dump.channels)}`
@@ -557,29 +612,13 @@ async function runV2CellBody(
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 
-	if (resumedId === null) {
-		// Nothing durable survived the kill: the open is abandoned
-		// wholesale, the restart carries no debris (asserted by the empty
-		// dump above), and the child correctly answers the peer's
-		// reestablish with an error. That is the matrix's abandoned
-		// disposition, the same acceptance the in-process S7 sweep holds.
-		// No fresh v2 open rides this branch: the child's fixed basepoints
-		// would derive the SAME channel id as the dead attempt, which the
-		// peer deliberately retains (a zero-input acceptor's attempt is
-		// conservatively broadcastable, so no sweep reaps it), and that
-		// collision exists only in this harness, never in production
-		// where openers derive fresh basepoints per channel.
-		const bye = await revived.kill();
-		expect(bye).to.equal('SIGKILL');
-		return false;
-	}
-
 	// A promoted cell must COMPLETE: confirm both sides; channel_ready
 	// finishes the open, and a probe payment proves the channel works.
-	revived.send(`confirm ${resumedId}`);
+	const activeId: string = resumedId!;
+	revived.send(`confirm ${activeId}`);
 	await revived.waitLine('ok:confirm').catch(() => undefined);
 	try {
-		world.peer.handleFundingConfirmed(Buffer.from(resumedId, 'hex'));
+		world.peer.handleFundingConfirmed(Buffer.from(activeId, 'hex'));
 	} catch {
 		// Already confirmed during the dying life.
 	}
@@ -605,7 +644,6 @@ async function runV2CellBody(
 
 	const bye = await revived.kill();
 	expect(bye).to.equal('SIGKILL');
-	return true;
 }
 
 describe('Recovery phase 7: SIGKILL matrix (dedicated child, real assembly)', function () {
@@ -662,22 +700,27 @@ describe('Recovery phase 7: SIGKILL matrix (dedicated child, real assembly)', fu
 				'the schedule crossed the signature exchange'
 			).to.equal(true);
 
-			let abandonedCells = 0;
-			let resumedCells = 0;
-			for (const label of schedule) {
+			// Same boundary classification as the in-process sweeps: from
+			// post-commit:1 onward the durable row exists and the cell must
+			// resume; before it, the restart must be clean. Deriving this
+			// from the rehearsal keeps a lost-row regression from passing
+			// as an abandonment.
+			const boundary = schedule.indexOf('post-commit:1');
+			expect(
+				boundary,
+				'the rehearsal crossed the durable boundary'
+			).to.be.greaterThan(0);
+			expect(boundary, 'labels exist beyond the boundary').to.be.lessThan(
+				schedule.length - 1
+			);
+			for (const [index, label] of schedule.entries()) {
 				const world = await makeWorld(mode, true);
 				try {
-					const resumed = await runV2KillCell(world, label);
-					if (resumed) resumedCells++;
-					else abandonedCells++;
+					await runV2KillCell(world, label, index >= boundary);
 				} finally {
 					await destroyWorld(world);
 				}
 			}
-			// A schedule change that stops reaching either regime has
-			// silently stopped testing the row.
-			expect(abandonedCells, 'cells that abandoned').to.be.at.least(1);
-			expect(resumedCells, 'cells that resumed').to.be.at.least(1);
 		});
 	}
 

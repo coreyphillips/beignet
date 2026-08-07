@@ -21,8 +21,11 @@
  *    guardian-only restores. So the phase 6 refusal that once covered the
  *    gap is gone. What quorum still adds is the wire gate: the first
  *    commitment_signed and tx_signatures are barrier-class messages, so
- *    they wait on replication like every other irreversible send, and a
- *    restored in-flight open comes up resumable instead of being refused.
+ *    they wait on replication like every other irreversible send. A
+ *    RECORDED in-flight open comes up resumable instead of being refused;
+ *    a legacy record-less row, which cannot actually resume, still
+ *    refuses startup, and quorum + preferTaproot still masks the bit
+ *    because taproot v2 signing does not exist.
  */
 
 import { expect } from 'chai';
@@ -445,6 +448,26 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		storage.close();
 	});
 
+	it('quorum with preferTaproot keeps the bit masked: taproot v2 signing does not exist', function () {
+		const storage = openStorage();
+		// The generic openChannel routes by this bit; advertising it under
+		// preferTaproot would steer every open into a taproot v2
+		// negotiation that fails closed at the commitment stage. Masking
+		// preserves what this configuration had before the lift: generic
+		// opens ride the working v1 taproot path.
+		const node = new LightningNode({
+			...makeNodeConfig(21, { storage, recovery: quorumRecovery() }),
+			preferTaproot: true
+		});
+		node.on('node:error', () => {});
+		expect(
+			localFeaturesOf(node).hasFeature(Feature.DUAL_FUND),
+			'the bit stays masked for quorum + preferTaproot'
+		).to.equal(false);
+		node.destroy();
+		storage.close();
+	});
+
 	it('starts an outbound v2 open and holds its commitment_signed behind the barrier', async function () {
 		const storage = openStorage();
 		const node = quorumNode(12, storage);
@@ -536,12 +559,14 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		storage.close();
 	});
 
-	it('comes up over a legacy record-less v2 open, the same inert orphan async-remote keeps', function () {
+	it('still refuses to come up over a legacy RECORD-LESS v2 open', function () {
 		const storage = openStorage();
-		// A row WITHOUT the durable v2InFlight record: nothing to resume
-		// from, but nothing to refuse over either. Quorum now restores it
-		// exactly as async-remote does, an inert orphan for the operator to
-		// finish or abandon.
+		// A row WITHOUT the durable v2InFlight record cannot actually
+		// resume: it restores without a session, rejects a retransmitted
+		// tx_signatures, and ignores funding confirmation, and it may
+		// already have crossed commitment_signed. Quorum must not carry it
+		// (a snapshot would claim an exactness the row cannot deliver);
+		// the RECORDED row two tests down is the one that comes up.
 		const inFlight = createOpenerState({
 			temporaryChannelId: crypto.randomBytes(32),
 			fundingSatoshis: 150_000n,
@@ -552,39 +577,31 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		});
 		inFlight.channelId = crypto.randomBytes(32);
 		inFlight.state = ChannelState.AWAITING_TX_SIGNATURES;
-		// Two identically seeded databases: destroy() closes the storage it
-		// was handed, and an in-memory database does not survive that.
-		const quorumStorage = storage;
-		const asyncStorage = openStorage();
-		for (const s of [quorumStorage, asyncStorage]) {
-			s.saveChannel(
-				inFlight.channelId.toString('hex'),
-				inFlight,
-				'02'.repeat(33)
-			);
-		}
-
-		const quorumRestored = new LightningNode(
-			makeNodeConfig(17, {
-				storage: quorumStorage,
-				recovery: quorumRecovery()
-			})
+		storage.saveChannel(
+			inFlight.channelId.toString('hex'),
+			inFlight,
+			'02'.repeat(33)
 		);
-		quorumRestored.on('node:error', () => {});
-		const restored = quorumRestored.getChannelManager().listChannels();
-		expect(restored).to.have.length(1);
-		expect(restored[0].getState()).to.equal(
-			ChannelState.AWAITING_TX_SIGNATURES
-		);
-		quorumRestored.destroy();
 
-		// And the same database shape comes up the same way in async-remote.
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(17, {
+						storage,
+						recovery: quorumRecovery()
+					})
+				)
+		).to.throw(/no durable in-flight record is in progress/);
+
+		// And the same database comes up fine in async-remote, which is
+		// where the operator finishes or abandons it.
 		const asyncNode = new LightningNode(
-			makeNodeConfig(17, { storage: asyncStorage, recovery: { enabled: true } })
+			makeNodeConfig(17, { storage, recovery: { enabled: true } })
 		);
 		asyncNode.on('node:error', () => {});
 		expect(asyncNode.getChannelManager().listChannels()).to.have.length(1);
 		asyncNode.destroy();
+		storage.close();
 	});
 
 	it('comes up RESUMABLE over a recorded v2 open', function () {

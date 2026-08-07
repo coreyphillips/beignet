@@ -230,7 +230,9 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 	const mkNode = (
 		s: IStorageBackend,
 		passphrase: string,
-		fundingProvider?: IFundingProvider
+		fundingProvider?: IFundingProvider,
+		kill?: KillSwitch,
+		onRelay?: () => void
 	): LightningNode => {
 		const n = LightningNode.fromMnemonic(TEST_MNEMONIC, {
 			passphrase,
@@ -252,7 +254,15 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 		// No chain watcher in this harness: relay broadcast:tx to bitcoind
 		// ourselves (the daemon's Electrum chain watcher does this in
 		// production). Duplicate submissions are fine; CLN may broadcast too.
+		// FAIL-STOP: once the kill fired, nothing may reach the network.
+		// The armed send tap drops the message and returns, but the
+		// synchronous dispatcher continues its batch, and for the
+		// tx_signatures kill that batch ends in BROADCAST_TX; relaying it
+		// would put the funding on chain from the DYING life and life 2's
+		// chain-presence assertions would prove nothing.
 		n.on('broadcast:tx', (tx: Buffer) => {
+			if (kill?.killed) return;
+			onRelay?.();
 			bitcoinRpc('sendrawtransaction', [tx.toString('hex')]).catch(() => {
 				/* already known / already broadcast */
 			});
@@ -280,10 +290,13 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 		storage = new SqliteStorage(dbPath);
 		storage.open();
 		const kill = new KillSwitch();
+		let life1Broadcasts = 0;
 		node = mkNode(
 			sealableStorage(storage, kill),
 			passphrase,
-			await mkProvider()
+			await mkProvider(),
+			kill,
+			() => life1Broadcasts++
 		);
 		const nodeId = node.getNodeId();
 
@@ -299,11 +312,13 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 			}
 		).peerManager;
 		const realSend = pm.sendToPeer.bind(pm);
+		let droppedPayload: Buffer | null = null;
 		pm.sendToPeer = (pk, type, payload) => {
 			// Fail-stop: everything up to the armed send is durable, the armed
 			// message never reaches the wire, nothing after does either.
 			if (kill.killed) return;
 			if (type === killOn) {
+				droppedPayload = Buffer.from(payload);
 				kill.fire(killLabel);
 				setImmediate(() => {
 					try {
@@ -326,6 +341,11 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 
 		await waitFor(() => kill.killed, 'chaos kill to fire', 60_000);
 		await sleep(1500);
+		expect(droppedPayload, 'the armed message was captured').to.not.equal(null);
+		expect(
+			life1Broadcasts,
+			'the dying life relayed nothing to bitcoind'
+		).to.equal(0);
 
 		// ── Life 2: fresh process simulation on the same DB file ──
 		storage = new SqliteStorage(dbPath);
@@ -336,12 +356,50 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 			rows[0].state.v2InFlight,
 			'the row carries the v2InFlight record'
 		).to.not.equal(null);
+		// The funding tx must NOT be on the network yet: chain presence
+		// after the resume has to be attributable to the RESTORED node (or
+		// to CLN completing with what the restored node retransmits), never
+		// to the dying life.
+		const rowTxidHex = Buffer.from(rows[0].state.fundingTxid!)
+			.reverse()
+			.toString('hex');
+		let preSeen = false;
+		try {
+			await bitcoinRpc('getrawtransaction', [rowTxidHex]);
+			preSeen = true;
+		} catch {
+			/* expected: not broadcast */
+		}
+		expect(
+			preSeen,
+			'the funding tx is not on chain before the restored node acts'
+		).to.equal(false);
 
 		node = mkNode(storage, passphrase);
 		expect(node.getNodeId()).to.equal(nodeId);
 		const restored = node.getChannelManager().listChannels();
 		expect(restored.length, 'the channel restored').to.equal(1);
 		const channelId = restored[0].getChannelId()!;
+
+		// Capture the restored node's first send of the armed type: the
+		// resume must re-emit the very bytes the dead process dropped
+		// (verbatim witnesses for tx_signatures, an RFC 6979 re-sign for
+		// commitment_signed).
+		const pm2 = (
+			node as unknown as {
+				peerManager: {
+					sendToPeer(pk: string, type: number, payload: Buffer): void;
+				};
+			}
+		).peerManager;
+		const realSend2 = pm2.sendToPeer.bind(pm2);
+		let retransmitted: Buffer | null = null;
+		pm2.sendToPeer = (pk, type, payload) => {
+			if (type === killOn && retransmitted === null) {
+				retransmitted = Buffer.from(payload);
+			}
+			realSend2(pk, type, payload);
+		};
 
 		await node.connectPeer(clnPubkey, CLN_P2P_HOST, CLN_P2P_PORT);
 
@@ -391,6 +449,17 @@ describe('Interop chaos: CLN v2 open crash-resume (regtest)', function () {
 			30_000,
 			500
 		);
+
+		// The boundary was genuinely replayed: the restored node re-sent the
+		// dropped message BYTE-IDENTICALLY.
+		expect(
+			retransmitted,
+			'the restored node re-sent the dropped message'
+		).to.not.equal(null);
+		expect(
+			(retransmitted as unknown as Buffer).equals(droppedPayload!),
+			'the retransmission is byte-identical to the dropped send'
+		).to.equal(true);
 
 		// CLN agrees on the SAME funding tx: the resumed exchange finished
 		// the open the dead process started, rather than a fresh one.

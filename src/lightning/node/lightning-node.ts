@@ -900,6 +900,18 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
+		// option_dual_fund + preferTaproot: taproot v2 opens are not
+		// implemented (the commitment stage fails closed), so the generic
+		// openChannel, which routes by this bit, would negotiate a
+		// combination that always aborts. Under quorum, masking the bit
+		// preserves what the phase 6 mask used to give this configuration:
+		// generic opens route through the working v1 taproot path. Outside
+		// quorum the bit was always advertised for preferTaproot nodes and
+		// stays so; widening the mask is a separate decision.
+		if (barrier?.enforcing === true && config.preferTaproot) {
+			localFeatures.clearBit(Feature.DUAL_FUND);
+			localFeatures.clearBit(Feature.DUAL_FUND + 1);
+		}
 		this.localFeatures = localFeatures;
 
 		this.channelManager = new ChannelManager({
@@ -1089,6 +1101,44 @@ export class LightningNode extends EventEmitter {
 		// Restore from storage if available
 		if (this.storage) {
 			this.restoreFromStorage();
+			// A RECORDED in-flight v2 open (v2InFlight) restores resumable and
+			// quorum carries it: the record is exactly what makes the round
+			// provable again. A record-less legacy row is different in kind:
+			// it restores without a session, cannot answer a retransmitted
+			// tx_signatures, ignores funding confirmation, and may already
+			// have crossed commitment_signed, so carrying it under quorum
+			// would snapshot state the mode cannot actually resume. Refuse to
+			// come up over it; finish or abandon it under async-remote first.
+			if (barrier?.enforcing === true) {
+				for (const channel of this.channelManager.listChannels()) {
+					const full = channel.getFullState();
+					// restoreChannel marks a resumable open for reestablish
+					// before this guard runs: look through AWAITING_REESTABLISH
+					// to the state it will return to.
+					const st =
+						full.state === ChannelState.AWAITING_REESTABLISH &&
+						full.preReestablishState
+							? full.preReestablishState
+							: full.state;
+					if (
+						st !== ChannelState.DUAL_FUNDING_V2 &&
+						st !== ChannelState.AWAITING_TX_SIGNATURES
+					) {
+						continue;
+					}
+					if (full.v2InFlight) continue;
+					const id = (
+						channel.getChannelId() ?? channel.getTemporaryChannelId()
+					).toString('hex');
+					throw new Error(
+						`recovery: cannot enable quorum durability while a ` +
+							`dual-funded open with no durable in-flight record is in ` +
+							`progress (channel ${id} is ${st}); it cannot resume over ` +
+							`reestablish, so finish or abandon it under async-remote ` +
+							`durability first`
+					);
+				}
+			}
 			// Auto-reconnect peers after crash recovery (Fix 2.1)
 			this.autoReconnectPeers();
 		}
@@ -4426,6 +4476,27 @@ export class LightningNode extends EventEmitter {
 	 * block and once at startup after channels are restored.
 	 */
 	private retryPendingFundingBroadcasts(): void {
+		// Self-heal the runtime index first. A disconnect purges a channel's
+		// barrier-held batch, and for a v2 open that suffix can be the
+		// TX_SIGNATURES release plus the funding broadcast: the fully signed
+		// transaction is already durable on the row (staged at
+		// tx_signatures), but the action that would have registered the
+		// runtime obligation never ran, so without this pass the per-block
+		// retry has nothing to retry until a restart rebuilds the index.
+		// Adopted entries land as 'restored', so they re-ask for a fresh
+		// authorization exactly as a restart would; under a quorum barrier
+		// nothing goes out that the barrier has not released.
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid || !state.pendingFundingTxHex) continue;
+			const txidHex = state.fundingTxid.toString('hex');
+			if (this.pendingFundingTxs.has(txidHex)) continue;
+			this.emitStructuredLog('chain', 'pending_funding_readopted', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				txid: txidHex
+			});
+			this.adoptPendingFundingFromChannel(state, txidHex);
+		}
 		if (this.pendingFundingTxs.size === 0) return;
 		const deadStates = new Set([
 			ChannelState.CLOSED,
@@ -4471,34 +4542,45 @@ export class LightningNode extends EventEmitter {
 			// the obligation and is authenticated; the metadata map is local and
 			// best effort, so letting a stale or corrupt entry sit in front of
 			// it would hand a fresh authorization to unrelated bytes.
-			let parsed: bitcoin.Transaction;
-			try {
-				parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex);
-			} catch {
-				this.emitStructuredLog('chain', 'pending_funding_unparseable', {
-					channelId: state.channelId?.toString('hex') ?? null,
-					txid: txidHex
-				});
-				continue;
-			}
-			// And it has to BE the transaction this channel names. A payload
-			// that hashes to something else is corruption, not an obligation:
-			// broadcasting it would put an unrelated transaction on the network
-			// under a channel's authorization.
-			if (parsed.getHash().toString('hex') !== txidHex) {
-				this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
-					channelId: state.channelId?.toString('hex') ?? null,
-					expected: txidHex,
-					actual: parsed.getHash().toString('hex')
-				});
-				this.pendingFundingTxs.delete(txidHex);
-				continue;
-			}
-			this.pendingFundingTxs.set(txidHex, {
-				txHex: state.pendingFundingTxHex,
-				phase: 'restored'
-			});
+			this.adoptPendingFundingFromChannel(state, txidHex);
 		}
+	}
+
+	/**
+	 * Validate a row's staged funding payload and adopt it into the runtime
+	 * index as 'restored' (authorization unknown, re-asked before any send).
+	 */
+	private adoptPendingFundingFromChannel(
+		state: IChannelState,
+		txidHex: string
+	): void {
+		let parsed: bitcoin.Transaction;
+		try {
+			parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex!);
+		} catch {
+			this.emitStructuredLog('chain', 'pending_funding_unparseable', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				txid: txidHex
+			});
+			return;
+		}
+		// And it has to BE the transaction this channel names. A payload
+		// that hashes to something else is corruption, not an obligation:
+		// broadcasting it would put an unrelated transaction on the network
+		// under a channel's authorization.
+		if (parsed.getHash().toString('hex') !== txidHex) {
+			this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				expected: txidHex,
+				actual: parsed.getHash().toString('hex')
+			});
+			this.pendingFundingTxs.delete(txidHex);
+			return;
+		}
+		this.pendingFundingTxs.set(txidHex, {
+			txHex: state.pendingFundingTxHex!,
+			phase: 'restored'
+		});
 	}
 
 	/** Restore the persisted pending funding tx map (called at startup). */
