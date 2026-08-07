@@ -10896,7 +10896,14 @@ export class Channel {
 
 		// BOLT 2 v2: once both sides have completed, the commitment_signed
 		// exchange starts (before any tx_signatures). Ours goes out right after
-		// our tx_complete on the wire.
+		// our tx_complete on the wire. A commitment FAILURE must replace the
+		// batch entirely: sending the tx_complete anyway would push the peer
+		// over its own commitment point for a round we are about to unwind,
+		// leaving it durably on the replacement while we roll back.
+		const commitment = this._maybeSendV2Commitment();
+		if (commitment.some((a) => a.type === ChannelActionType.ERROR)) {
+			return commitment;
+		}
 		return [
 			sendMsg(
 				MessageType.TX_COMPLETE,
@@ -10904,7 +10911,7 @@ export class Channel {
 					channelId: this._v2ChannelId()
 				})
 			),
-			...this._maybeSendV2Commitment()
+			...commitment
 		];
 	}
 
@@ -11628,7 +11635,7 @@ export class Channel {
 	 * have sent tx_complete (BOLT 2 v2 establishment: the commitment_signed
 	 * exchange precedes tx_signatures). Idempotent.
 	 */
-	private _maybeSendV2Commitment(): ChannelAction[] {
+	private _maybeSendV2Commitment(peerCommitted = false): ChannelAction[] {
 		const session = this._state.dualFundingSession;
 		if (
 			!session ||
@@ -11692,9 +11699,38 @@ export class Channel {
 			// The signer failed AFTER the record swap: undo it before
 			// anything else observes attempt N+1, or this side would keep
 			// the replacement while the peer keeps the previous attempt and
-			// reestablish splits on different funding txids. With the prior
-			// record restored, the unwind below rolls back to it on the
-			// wire (or aborts a fresh open where there is nothing to keep).
+			// reestablish splits on different funding txids.
+			if (prior && peerCommitted) {
+				// The signing attempt was triggered by the PEER's commitment
+				// for the replacement, which only leaves behind its persist:
+				// the peer has durably replaced its rollback record and can
+				// NEVER return to the previous attempt. Restoring it here
+				// would strand this side on an attempt the peer already
+				// abandoned, split until some disconnect. Terminal instead:
+				// the abort tears the peer's replacement down, the echo's
+				// handshake cleanup removes this side, and both managers and
+				// rows converge on the live connection.
+				this._state.v2InFlight = null;
+				this._state.dualFundingSession?.abort();
+				this._state.dualFundingSession = null;
+				this._resetV2Driver();
+				this._state.state = ChannelState.ERRORED;
+				return [
+					{ type: ChannelActionType.PERSIST_STATE },
+					this._txAbort(
+						this._v2ChannelId(),
+						'failed to sign the v2 commitment'
+					),
+					{
+						type: ChannelActionType.ERROR,
+						message: 'failed to sign the v2 commitment'
+					}
+				];
+			}
+			// With the prior record restored, the unwind below rolls back to
+			// it on the wire (or aborts a fresh open where there is nothing
+			// to keep): the peer has not committed the replacement yet, so
+			// the previous attempt is still the shared truth.
 			this._state.v2InFlight = prior;
 			this._state.fundingTxid = priorFundingTxid;
 			this._state.fundingOutputIndex = priorFundingOutputIndex;
@@ -11740,7 +11776,11 @@ export class Channel {
 		msg: ICommitmentSignedMessage
 	): ChannelAction[] {
 		const actions: ChannelAction[] = [];
-		actions.push(...this._maybeSendV2Commitment());
+		// The incoming commitment proves the peer COMMITTED its side (the
+		// message only leaves behind the peer's persist); the flag makes a
+		// signer failure here terminal rather than a rollback to an attempt
+		// the peer can no longer return to.
+		actions.push(...this._maybeSendV2Commitment(true));
 		if (actions.some((a) => a.type === ChannelActionType.ERROR)) {
 			return actions;
 		}

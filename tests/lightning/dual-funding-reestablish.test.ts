@@ -2645,20 +2645,22 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		acceptor.destroy();
 	});
 
-	it('a signer failure at the replacement commitment rolls both sides back to the previous attempt', async function () {
+	it('a signer failure at the replacement commitment converges both sides', async function () {
+		const openerStorage = new SqliteStorage(':memory:');
+		openerStorage.open();
+		const acceptorStorage = new SqliteStorage(':memory:');
+		acceptorStorage.open();
 		const opener = new LightningNode(
 			makeNodeConfig(89, {
-				storage: (() => {
-					const s = new SqliteStorage(':memory:');
-					s.open();
-					return s;
-				})(),
+				storage: openerStorage,
 				recovery: { enabled: true },
 				fundingProvider: fundingProviderWith(makeWalletInput(200_000))
 			})
 		);
 		const acceptor = new LightningNode(
 			makeNodeConfig(90, {
+				storage: acceptorStorage,
+				recovery: { enabled: true },
 				fundingProvider: fundingProviderWith(makeWalletInput(150_000)),
 				leaseRates: LEASE_RATES
 			})
@@ -2673,15 +2675,10 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		);
 		await settle(() => wire.dropped(MessageType.COMMITMENT_SIGNED) > 0);
 		const channelId = channel.getChannelId()!;
-		const attempt0Txid = Buffer.from(
-			channel.getFullState().v2InFlight!.fundingTxid
-		);
 		wire.clearDrops();
 
 		// The opener's signer refuses exactly once: at the REPLACEMENT
 		// commitment (attempt 0's commitments were signed during the open).
-		// The record swap must be undone before anything observes attempt 1,
-		// and the unwind returns both sides to the shared previous attempt.
 		const signer = (
 			channel as unknown as {
 				_signer: { signCommitmentTx: (...a: unknown[]) => unknown };
@@ -2704,28 +2701,41 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 				processActions: (p: string, c: Channel, a: unknown[]) => void;
 			}
 		).processActions(acceptor.getNodeId(), channel, rbfActions);
+		// The failing batch REPLACED the tx_complete that would have pushed
+		// the peer over its commitment point, so the peer never committed
+		// the replacement: BOTH sides roll back to the shared attempt 0 and
+		// stay live, and BOTH managers and durable rows agree, with no
+		// disconnect needed.
+		const acceptorChannel = managerOf(acceptor).getChannel(channelId)!;
 		await settle(
-			() => channel.getState() === ChannelState.AWAITING_TX_SIGNATURES
+			() =>
+				channel.getState() === ChannelState.AWAITING_TX_SIGNATURES &&
+				acceptorChannel.getState() === ChannelState.AWAITING_TX_SIGNATURES
 		);
-
-		// The throwing side undid the record swap and rolled back to the
-		// shared previous attempt: it must never keep an attempt 1 the peer
-		// could diverge from.
 		expect(channel.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
-		expect(
-			channel.getFullState().v2InFlight!.fundingTxid.equals(attempt0Txid),
-			'the opener rolled back to attempt 0'
-		).to.be.true;
+		expect(acceptorChannel.getState()).to.equal(
+			ChannelState.AWAITING_TX_SIGNATURES
+		);
 		expect(channel.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
-
-		// The acceptor had already durably committed the replacement (its
-		// own commitment persist landed before the abort arrived), so its
-		// rollback record was legitimately gone: the abort tears it down and
-		// the handshake cleanup removes it. Neither attempt is broadcastable
-		// (both sides funded, no witnesses left), so the divergence terminal
-		// is a clean removal, never a broadcast.
-		await settle(() => managerOf(acceptor).getChannel(channelId) === undefined);
-		expect(managerOf(acceptor).getChannel(channelId)).to.equal(undefined);
+		expect(acceptorChannel.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+		expect(
+			channel
+				.getFullState()
+				.v2InFlight!.fundingTxid.equals(
+					acceptorChannel.getFullState().v2InFlight!.fundingTxid
+				),
+			'both sides track the same attempt'
+		).to.be.true;
+		const openerRows = openerStorage.loadAllChannels();
+		const acceptorRows = acceptorStorage.loadAllChannels();
+		expect(openerRows).to.have.length(1);
+		expect(acceptorRows).to.have.length(1);
+		expect(
+			openerRows[0].state.v2InFlight!.fundingTxid.equals(
+				acceptorRows[0].state.v2InFlight!.fundingTxid
+			),
+			'both durable rows agree'
+		).to.be.true;
 
 		opener.destroy();
 		acceptor.destroy();
