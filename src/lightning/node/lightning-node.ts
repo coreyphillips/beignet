@@ -1280,19 +1280,31 @@ export class LightningNode extends EventEmitter {
 		}
 
 		// Restore channels — look up per-channel key index for each
-		// Deletions owed from a previous run come first: a row whose removal
-		// was already decided must not resurrect as a channel because its
-		// delete once failed.
-		const owedDeletions = this.processDeletionTombstones();
 		for (const {
 			channelId,
 			state,
 			peerPubkey
 		} of this.storage.loadAllChannels()) {
-			if (owedDeletions.has(channelId)) {
-				this.emitStructuredLog('channel', 'channel_deletion_still_owed', {
-					channelId
-				});
+			// A CONDEMNED row's removal was already decided; the intent rides
+			// the row itself, so there is no separate store whose read can
+			// fail and silently resurrect it. Retry the deletion now; a row
+			// whose deletion fails again stays condemned on disk, is NOT
+			// restored, and retries at every start. The terminal event fires
+			// exactly once, when the deletion lands.
+			if (state.condemned) {
+				if (this.deleteChannelDurably(channelId)) {
+					this.emitStructuredLog('channel', 'condemned_row_removed', {
+						channelId
+					});
+					const condemnedId = Buffer.from(channelId, 'hex');
+					setImmediate(() =>
+						this.emit('channel:voided', { channelId: condemnedId })
+					);
+				} else {
+					this.emitStructuredLog('channel', 'channel_deletion_still_owed', {
+						channelId
+					});
+				}
 				continue;
 			}
 			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
@@ -2501,10 +2513,11 @@ export class LightningNode extends EventEmitter {
 					  );
 				if (!deleted) {
 					// The row survived: the abandonment is not terminal yet.
-					// A tombstone makes the deletion owed at the next start
-					// (and the disconnect sweep retries it too); the
-					// terminal event fires only when the deletion lands.
-					if (!this.addDeletionTombstone(idHex)) {
+					// Condemning the row itself makes the deletion owed at
+					// the next start (the intent rides the row, so no
+					// separate read can lose it); the terminal event fires
+					// only when the deletion lands.
+					if (!this.condemnChannelRow(idHex)) {
 						// Neither the deletion nor the durable intent
 						// landed: with no marker, a healthy restart would
 						// silently restore the row as a live channel. Keep
@@ -2537,7 +2550,6 @@ export class LightningNode extends EventEmitter {
 					});
 					return;
 				}
-				this.clearDeletionTombstone(idHex);
 				this.emitStructuredLog('channel', 'open_abandoned', {
 					channelId: idHex,
 					reason
@@ -4052,7 +4064,7 @@ export class LightningNode extends EventEmitter {
 		// channel nor a watch while the row silently restores at the next
 		// start.
 		const deleted = this.deleteChannelDurably(idHex);
-		if (!deleted && !this.addDeletionTombstone(idHex)) {
+		if (!deleted && !this.condemnChannelRow(idHex)) {
 			this.emitStructuredLog('channel', 'channel_void_unresolved', {
 				channelId: idHex,
 				txid
@@ -4065,7 +4077,7 @@ export class LightningNode extends EventEmitter {
 			Buffer.from(txid, 'hex').reverse().toString('hex')
 		);
 		if (!deleted) {
-			// The row survived but the tombstone is durable: the removal
+			// The row survived but is durably condemned: the removal
 			// proceeds and the terminal event fires when the deletion lands
 			// at the next start. Emitting it now would claim a deletion
 			// that did not happen.
@@ -4075,7 +4087,6 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
-		this.clearDeletionTombstone(idHex);
 		this.emitStructuredLog('channel', 'channel_voided', {
 			channelId: idHex,
 			txid
@@ -4105,44 +4116,6 @@ export class LightningNode extends EventEmitter {
 		);
 	}
 
-	/** Metadata key: channel rows whose durable deletion failed and is owed. */
-	private static readonly PENDING_CHANNEL_DELETIONS_KEY =
-		'pending_channel_deletions';
-
-	/**
-	 * The persisted deletion-tombstone set, or NULL when the store cannot
-	 * answer. Null is not the empty set: an unreadable list may hide owed
-	 * deletions, so callers must fail closed (refuse to claim durable
-	 * intent, refuse to retire) rather than treat it as none.
-	 */
-	private loadDeletionTombstones(): Set<string> | null {
-		try {
-			const json = this.storage?.loadMetadata(
-				LightningNode.PENDING_CHANNEL_DELETIONS_KEY
-			);
-			if (!json) return new Set();
-			const parsed = JSON.parse(json);
-			return new Set(
-				Array.isArray(parsed)
-					? parsed.filter((v): v is string => typeof v === 'string')
-					: []
-			);
-		} catch {
-			return null;
-		}
-	}
-
-	private saveDeletionTombstones(ids: Set<string>): boolean {
-		return this.safeStorage(
-			() =>
-				this.storage!.saveMetadata(
-					LightningNode.PENDING_CHANNEL_DELETIONS_KEY,
-					JSON.stringify([...ids])
-				),
-			'saveMetadata'
-		);
-	}
-
 	/**
 	 * A blocked persist on a v2 OPENING left its in-memory channel ahead of
 	 * the row (the failed write may have carried a replacement attempt the
@@ -4150,8 +4123,13 @@ export class LightningNode extends EventEmitter {
 	 * attempt is the only one a crash would resume, so it is the only one
 	 * this side may keep tracking; a provisional DUAL_FUNDING_V2 row rolls
 	 * back to its retained previous attempt exactly as a restart would.
-	 * Scoped to v2 opening shapes; established channels re-converge through
-	 * the ordinary reestablish and outbox replay.
+	 * The live registration is never removed here: restoreChannel registers
+	 * via a map overwrite, and every fallible step it runs (signer
+	 * construction, session restores, reestablish marking) happens BEFORE
+	 * that overwrite, so a throw anywhere leaves the previous object
+	 * tracked and success replaces it in one step. Scoped to v2 opening
+	 * shapes; established channels re-converge through the ordinary
+	 * reestablish and outbox replay.
 	 */
 	private resyncV2OpenFromDisk(channelId: Buffer | null): void {
 		if (!channelId || !this.storage) return;
@@ -4162,7 +4140,7 @@ export class LightningNode extends EventEmitter {
 		} catch {
 			return;
 		}
-		if (!row || !row.state.v2InFlight) return;
+		if (!row || !row.state.v2InFlight || row.state.condemned) return;
 		if (
 			row.state.state !== ChannelState.AWAITING_TX_SIGNATURES &&
 			row.state.state !== ChannelState.DUAL_FUNDING_V2
@@ -4170,16 +4148,11 @@ export class LightningNode extends EventEmitter {
 			return;
 		}
 		try {
-			// Prepare the replacement COMPLETELY before touching the live
-			// registration: a throw in construction or the key-index read
-			// must leave the running node still tracking the old object
-			// rather than tracking nothing while the row survives.
 			if (row.state.state === ChannelState.DUAL_FUNDING_V2) {
 				row.state.state = ChannelState.AWAITING_TX_SIGNATURES;
 			}
 			const channel = new Channel(row.state);
 			const keyIndex = this.storage.loadChannelKeyIndex(idHex);
-			this.channelManager.voidChannel(channelId);
 			this.channelManager.restoreChannel(channel, row.peerPubkey, keyIndex);
 			this.emitStructuredLog('channel', 'v2_open_resynced_from_disk', {
 				channelId: idHex
@@ -4212,87 +4185,28 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * Record that this row's deletion failed and is owed at the next start.
-	 * Returns whether the intent is durable: a false answer means neither
-	 * the deletion nor the marker exists on disk, and the caller must keep
-	 * the channel tracked instead.
+	 * Condemn the row itself: its durable deletion was decided but the
+	 * delete failed, so the intent is written INTO the row, atomic with the
+	 * state a restart reads. There is no separate tombstone store whose
+	 * read can fail and silently resurrect the channel: startup either
+	 * reads the condemned row (and deletes instead of restoring) or cannot
+	 * read the row at all, in which case nothing restores either. Returns
+	 * whether the intent is durable; a false answer means the caller must
+	 * keep the channel tracked.
 	 */
-	private addDeletionTombstone(idHex: string): boolean {
-		const ids = this.loadDeletionTombstones();
-		// An unreadable list cannot prove the intent became durable: fail
-		// closed and let the caller keep the channel tracked.
-		if (ids === null) return false;
-		if (ids.has(idHex)) return true;
-		ids.add(idHex);
-		return this.saveDeletionTombstones(ids);
-	}
-
-	/**
-	 * Retire a tombstone once the deletion landed by another path (the
-	 * disconnect sweep can retry before the next start); without this the
-	 * startup retry would re-delete a missing row and fire the terminal
-	 * event twice.
-	 */
-	private clearDeletionTombstone(idHex: string): void {
-		const ids = this.loadDeletionTombstones();
-		if (ids === null || !ids.delete(idHex)) return;
-		this.saveDeletionTombstones(ids);
-	}
-
-	/**
-	 * Retry deletions owed from a previous run BEFORE restoring channels: a
-	 * row whose removal was already decided must not resurrect as a channel
-	 * because the delete happened to fail once. Rows whose deletion fails
-	 * again keep their tombstone, and the restore loop skips them, so the
-	 * retry repeats on every start until it lands. The terminal
-	 * channel:voided fires only when the deletion succeeds, deferred a tick
-	 * so listeners attached right after construction still hear it.
-	 */
-	private processDeletionTombstones(): Set<string> {
-		const ids = this.loadDeletionTombstones();
-		if (ids === null) {
-			// The list is unreadable: owed deletions may be hiding in it, so
-			// say so loudly and process nothing this start. Rows restore and
-			// stay inert; a start with a readable list converges them. The
-			// empty answer here must never be mistaken for "no tombstones".
-			this.emitStructuredLog('channel', 'deletion_tombstones_unreadable', {});
-			this.emit('node:error', {
-				code: 'PERSISTENCE_ERROR',
-				message: 'deletion tombstones unreadable; startup cleanup skipped',
-				timestamp: Date.now()
-			} as ILightningError);
-			return new Set();
+	private condemnChannelRow(idHex: string): boolean {
+		try {
+			const row = this.storage?.loadChannel?.(idHex);
+			// No row: there is nothing a restart could resurrect.
+			if (!row) return true;
+			row.state.condemned = true;
+			return this.safeStorage(
+				() => this.storage!.saveChannel(idHex, row.state, row.peerPubkey),
+				'saveChannel'
+			);
+		} catch {
+			return false;
 		}
-		if (ids.size === 0) return ids;
-		const remaining = new Set<string>();
-		const finished: Buffer[] = [];
-		for (const idHex of ids) {
-			// The terminal event fires at most once per channel: only a
-			// deletion that removed an EXISTING row emits. A re-run after a
-			// failed tombstone retirement finds the row already gone and
-			// retires silently.
-			let existed: boolean;
-			try {
-				existed = !!this.storage?.loadChannel?.(idHex);
-			} catch {
-				remaining.add(idHex);
-				continue;
-			}
-			const deleted = this.deleteChannelDurably(idHex);
-			if (!deleted) {
-				remaining.add(idHex);
-				continue;
-			}
-			this.emitStructuredLog('channel', 'channel_deletion_retried', {
-				channelId: idHex
-			});
-			if (existed) finished.push(Buffer.from(idHex, 'hex'));
-		}
-		this.saveDeletionTombstones(remaining);
-		for (const channelId of finished) {
-			setImmediate(() => this.emit('channel:voided', { channelId }));
-		}
-		return remaining;
 	}
 
 	/** Record a signed funding tx we are obligated to broadcast. */

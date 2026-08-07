@@ -340,6 +340,7 @@ export interface ISerializedChannelState {
 	channelType: string | null;
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
+	condemned?: boolean;
 	localShutdownScript: string | null;
 	remoteShutdownScript: string | null;
 	lastSentCommitmentSigned: string | null;
@@ -657,6 +658,7 @@ export function serializeChannelState(
 		channelType: bufToHex(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
 		localShutdownScript: bufToHex(s.localShutdownScript),
 		remoteShutdownScript: bufToHex(s.remoteShutdownScript),
 		lastSentCommitmentSigned: bufToHex(s.lastSentCommitmentSigned),
@@ -833,6 +835,7 @@ export function deserializeChannelState(
 		channelType: hexToBuf(s.channelType),
 		localChannelReady: s.localChannelReady,
 		remoteChannelReady: s.remoteChannelReady,
+		condemned: s.condemned === true ? true : undefined,
 		localShutdownScript: hexToBuf(s.localShutdownScript),
 		remoteShutdownScript: hexToBuf(s.remoteShutdownScript),
 		lastSentCommitmentSigned: hexToBuf(s.lastSentCommitmentSigned),

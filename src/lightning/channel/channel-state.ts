@@ -309,6 +309,12 @@ export interface IChannelState {
 	/** Flags */
 	localChannelReady: boolean;
 	remoteChannelReady: boolean;
+	/**
+	 * The row is CONDEMNED: its durable deletion was decided but failed, so
+	 * the intent rides the row itself (no separate store whose read can
+	 * fail). Startup deletes a condemned row instead of restoring it.
+	 */
+	condemned?: boolean;
 	localShutdownScript: Buffer | null;
 	remoteShutdownScript: Buffer | null;
 

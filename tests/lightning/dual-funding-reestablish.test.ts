@@ -48,7 +48,8 @@ import {
 } from '../../src/lightning/channel/channel';
 import {
 	createOpenerState,
-	createAcceptorState
+	createAcceptorState,
+	IChannelState
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
@@ -2844,21 +2845,25 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		const channelId = channel.getChannelId()!;
 		wire.clearDrops();
 
-		// Both the row deletion AND the tombstone write refuse: with no
+		// Both the row deletion AND the condemnation write refuse: with no
 		// durable trace of the removal decision, a restart would silently
 		// restore the row as a live channel. The node must keep it TRACKED
-		// instead of orphaning it.
+		// instead of orphaning it. (Only the CONDEMNED save is refused, so
+		// the abort's own state persist still lands and the cleanup path is
+		// genuinely reached.)
 		(
 			openerStorage as unknown as { deleteChannel: (id: string) => void }
 		).deleteChannel = (): void => {
 			throw new Error('disk full');
 		};
+		const realSave = openerStorage.saveChannel.bind(openerStorage);
 		(
 			openerStorage as unknown as {
-				saveMetadata: (k: string, v: string) => void;
+				saveChannel: (id: string, state: IChannelState, peer: string) => void;
 			}
-		).saveMetadata = (): void => {
-			throw new Error('disk full');
+		).saveChannel = (id: string, state: IChannelState, peer: string): void => {
+			if (state.condemned) throw new Error('disk full');
+			realSave(id, state, peer);
 		};
 		const voided: Buffer[] = [];
 		opener.on('channel:voided', (e: { channelId: Buffer }) => {
@@ -3633,10 +3638,42 @@ describe('Dual funding v2 reestablish, node level (issues 288/289)', function ()
 		expect(openerStorage.loadAllChannels()).to.have.length(1);
 		opener.destroy();
 
-		// The restart processes the persisted cleanup tombstone at startup:
-		// the row is deleted against the healthy store WITHOUT waiting for
-		// another peer disconnect, and only then does the terminal event
-		// fire.
+		// A restart whose deletions STILL fail must not restore the
+		// condemned row as a live channel (the intent rides the row itself,
+		// so no unreadable side-store can lose it), and must not fire the
+		// terminal event either.
+		const openerStorageStillFailing = new SqliteStorage(dbPath);
+		openerStorageStillFailing.open();
+		(
+			openerStorageStillFailing as unknown as {
+				deleteChannel: (id: string) => void;
+			}
+		).deleteChannel = (): void => {
+			throw new Error('disk full');
+		};
+		const stillFailingVoided: Buffer[] = [];
+		const stillFailing = new LightningNode(
+			makeNodeConfig(75, {
+				storage: openerStorageStillFailing,
+				recovery: { enabled: false }
+			})
+		);
+		stillFailing.on('node:error', () => {});
+		stillFailing.on('channel:voided', (e: { channelId: Buffer }) => {
+			stillFailingVoided.push(e.channelId);
+		});
+		expect(
+			stillFailing.getChannelManager().listChannels(),
+			'a condemned row never restores as a live channel'
+		).to.have.length(0);
+		await settle(() => stillFailingVoided.length > 0, 300);
+		expect(stillFailingVoided).to.have.length(0);
+		expect(openerStorageStillFailing.loadAllChannels()).to.have.length(1);
+		stillFailing.destroy();
+
+		// The healthy restart completes the owed deletion WITHOUT waiting
+		// for another peer disconnect, and only then does the terminal
+		// event fire, exactly once.
 		const openerStorage2 = new SqliteStorage(dbPath);
 		openerStorage2.open();
 		const revivedVoided: Buffer[] = [];
