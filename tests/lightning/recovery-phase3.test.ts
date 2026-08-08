@@ -215,6 +215,13 @@ function buildDirectGraph(alice: LightningNode): void {
 
 const NODE_SECRET = makeNodeConfig(1).nodePrivateKey;
 
+/** The capsule dry-run scratch: a fresh in-memory backend per candidate. */
+const scratchStorage = (): SqliteStorage => {
+	const scratch = new SqliteStorage(':memory:');
+	scratch.open();
+	return scratch;
+};
+
 function openStorage(): SqliteStorage {
 	const storage = new SqliteStorage(':memory:');
 	storage.open();
@@ -1232,11 +1239,13 @@ describe('Recovery phase 3: capsule replay failures roll back', () => {
 		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
 		const target1 = openStorage();
 		expect(() =>
-			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET)
-		).to.throw();
+			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/failed to replay/);
 		expect(
 			target1.loadRecoveryFrames!(0),
-			'the install transaction rolled back the frames'
+			'the dry-run refused before any target write'
 		).to.have.length(0);
 		expect(
 			target1.getRecoveryMeta!('journal_tip_sequence') ?? null,
@@ -1246,7 +1255,9 @@ describe('Recovery phase 3: capsule replay failures roll back', () => {
 
 		// Selection: a candidate defect, so the Tier 1 SCB still restores.
 		const target2 = openStorage();
-		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET);
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET, {
+			scratchStorage
+		});
 		expect(best.tier, 'Tier 1 fallback survives').to.equal(1);
 		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
 		target2.close();
@@ -1287,10 +1298,10 @@ describe('Recovery phase 3: restore target and backend contracts', () => {
 		metaDirty.setRecoveryMeta!('journal_tip_sequence', '7');
 		expect(() =>
 			restoreBestRecoveryCapsule([blob], metaDirty, NODE_SECRET)
-		).to.throw(/journal metadata/);
+		).to.throw(/recovery metadata/);
 		expect(() =>
 			restoreFromRecoveryCapsule(capsule, metaDirty, NODE_SECRET)
-		).to.throw(/journal metadata/);
+		).to.throw(/recovery metadata/);
 		expect(
 			metaDirty.getRecoveryMeta!('journal_tip_sequence'),
 			'the residue was not overwritten'
@@ -1367,6 +1378,75 @@ describe('Recovery phase 3: restore target and backend contracts', () => {
 			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET)
 		).to.throw(/disk write failed/);
 		broken.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-13 boundary hardening', () => {
+	it('propagates a replay-time target failure instead of Tier 1', () => {
+		// A VALID capsule over a target whose preimage table fails during
+		// the replay: with the dry-run proving the content on a scratch,
+		// the install-time failure is a TARGET problem and must propagate,
+		// never degrade to Tier 1.
+		const { storage } = journaledStorage(2);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const broken = openStorage();
+		broken.savePreimage = (): void => {
+			throw new Error('preimage disk write failed');
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/preimage disk write failed/);
+		// The shared install transaction rolled everything back.
+		expect(broken.loadRecoveryFrames!()).to.have.length(0);
+		expect(broken.getRecoveryMeta!('journal_tip_sequence') ?? null).to.equal(
+			null
+		);
+		broken.close();
+		storage.close();
+	});
+
+	it('refuses residue the old empty-target check missed', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const row = storage.loadRecoveryFrames!(0)[0];
+
+		// (a) A sequence-0 frame: loadRecoveryFrames(0) reads strictly
+		// above, so the old check missed it; the restored journal would be
+		// immediately unverifiable.
+		const seqZero = openStorage();
+		seqZero.saveRecoveryFrame!({ ...row, sequence: 0 });
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], seqZero, NODE_SECRET)
+		).to.throw(/recovery frames/);
+		seqZero.close();
+
+		// (b) Recovery-control metadata beyond the journal's own keys.
+		const leased = openStorage();
+		leased.setRecoveryMeta!('writer_lease_v1', 'aa'.repeat(16));
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], leased, NODE_SECRET)
+		).to.throw(/recovery metadata/);
+		leased.close();
+
+		// (c) An orphaned key-index row: it would shift the next
+		// derivation index of the restored node.
+		const indexed = openStorage();
+		indexed.saveChannelKeyIndex('cc'.repeat(32), 7);
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], indexed, NODE_SECRET)
+		).to.throw(/EMPTY target/);
+		indexed.close();
 		storage.close();
 	});
 });

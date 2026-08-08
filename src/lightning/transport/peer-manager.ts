@@ -399,6 +399,14 @@ export class PeerManager extends EventEmitter {
 			// the inbound replacement path: channels mark AWAITING_REESTABLISH
 			// first, then the connect handler re-drives channel_reestablish.
 			this.removeRegisteredPeer(pubkey, raceWinner);
+			// The removal emitted peer:disconnect SYNCHRONOUSLY: an observer
+			// may have called disconnectPeer() to cancel the peer for good,
+			// and registering the replacement anyway would reverse that.
+			if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+				peer.removeAllListeners();
+				peer.disconnect();
+				throw new PeerDialCancelledError(pubkey);
+			}
 		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
@@ -495,6 +503,17 @@ export class PeerManager extends EventEmitter {
 		}
 		captureWireEvent('close', pubkey);
 		this.emit('peer:disconnect', pubkey);
+	}
+
+	/**
+	 * Opaque token for a peer's current cancellation generation. Callers
+	 * running multi-step operations around dials (address resolution, DNS
+	 * bootstrap) capture it up front and compare before every step:
+	 * a change means disconnectPeer() cancelled the peer meanwhile, even
+	 * if no dial existed at that moment to reject with the typed error.
+	 */
+	cancellationToken(pubkey: string): number {
+		return this.cancelGenerations.get(pubkey) ?? 0;
 	}
 
 	/**
@@ -1055,7 +1074,17 @@ export class PeerManager extends EventEmitter {
 					// replacement's peer:connect so channels are marked
 					// AWAITING_REESTABLISH first and the connect handler then
 					// re-drives channel_reestablish over the new connection.
+					const replaceGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 					this.removeRegisteredPeer(pubkey, existing);
+					// The removal emitted peer:disconnect SYNCHRONOUSLY: an
+					// observer may have called disconnectPeer() to cancel the
+					// peer for good, and registering the fresh inbound anyway
+					// would reverse that. The remote may redial; that dial
+					// will be judged under the new generation.
+					if ((this.cancelGenerations.get(pubkey) ?? 0) !== replaceGeneration) {
+						peer.disconnect();
+						return;
+					}
 				}
 
 				this.setupPeerListeners(pubkey, peer);

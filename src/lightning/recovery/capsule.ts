@@ -51,12 +51,14 @@ import { withStorageTransaction } from '../storage/transaction';
 import { VerifiedRecoveryChain } from './types';
 
 /**
- * A capsule whose CONTENT could not replay into the target (the chain
- * verified, but a table write it implies is invalid, e.g. a constraint
- * violation). The install transaction has rolled the target back, so the
- * candidate may be skipped and a lower tier tried. Deliberately distinct
- * from raw storage failures (a disk error while writing the frames or
- * metadata), which mean the TARGET is broken and must propagate.
+ * A capsule whose CONTENT could not replay (the chain verified, but a
+ * table write it implies is invalid, e.g. a constraint violation). Raised
+ * during PREVALIDATION, by replaying the candidate into a caller-supplied
+ * scratch backend BEFORE anything touches the real target: replaying on
+ * the target itself could never tell a content defect apart from a broken
+ * target disk, since both surface as the same storage exception. With the
+ * defect proven on the scratch, every error the real install raises is a
+ * TARGET problem and propagates.
  */
 export class CapsuleReplayError extends Error {
 	readonly cause: unknown;
@@ -68,6 +70,35 @@ export class CapsuleReplayError extends Error {
 		);
 		this.name = 'CapsuleReplayError';
 		this.cause = cause;
+	}
+}
+
+export interface ICapsuleRestoreOptions {
+	/**
+	 * Factory for a FRESH, empty storage backend used to dry-run the
+	 * candidate's reconstruction before the real target is written (see
+	 * CapsuleReplayError). Supply an in-memory backend (e.g.
+	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
+	 * the recovery core stays free of a concrete backend dependency;
+	 * WITHOUT it no dry-run runs, and a content-defective capsule then
+	 * fails the install loudly (rolled back, error propagated) instead of
+	 * degrading to a lower tier.
+	 */
+	scratchStorage?: () => IStorageBackend;
+}
+
+/** Dry-run the candidate's replay on a scratch backend (see options). */
+function assertReplaysOnScratch(
+	frames: VerifiedRecoveryChain,
+	scratchStorage: () => IStorageBackend
+): void {
+	const scratch = scratchStorage();
+	try {
+		reconstructFromFrames(scratch, frames);
+	} catch (err) {
+		throw new CapsuleReplayError(err);
+	} finally {
+		(scratch as { close?: () => void }).close?.();
 	}
 }
 
@@ -536,7 +567,8 @@ function verifyInlineJournal(
 export function restoreFromRecoveryCapsule(
 	capsule: RecoveryCapsule,
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): ICapsuleRestoreResult {
 	// Authenticates the Tier 1 material up front: wrong-key or tampered SCBs
 	// fail here before anything touches the target.
@@ -547,19 +579,25 @@ export function restoreFromRecoveryCapsule(
 	}
 
 	// Validate the candidate COMPLETELY before the first write to the
-	// target, and refuse a target already carrying journal state: the
-	// metadata writes below would silently overwrite another journal.
+	// target: chain and schema, then (when a scratch backend is supplied)
+	// a full dry-run replay, so a content defect surfaces as the typed
+	// CapsuleReplayError while the target is still untouched. Refuse a
+	// target already carrying journal state: the metadata writes below
+	// would silently overwrite another journal.
 	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
+	if (options.scratchStorage) {
+		assertReplaysOnScratch(frames, options.scratchStorage);
+	}
 	assertNoJournalResidue(target);
 
 	// ONE shared transaction for the frames, the metadata AND the replay:
 	// the inner reconstruction units (applySnapshot, the per-frame
 	// RecoveryManager commits) JOIN it through withStorageTransaction
-	// instead of nesting, which IStorageBackend does not promise. A replay
-	// defect therefore rolls the whole install back and surfaces as a
-	// typed CapsuleReplayError; a raw storage failure (frames or metadata
-	// refusing to write) propagates untyped, because that means the TARGET
-	// is broken, not the capsule.
+	// instead of nesting, which IStorageBackend does not promise. Any
+	// throw rolls the whole install back and PROPAGATES: the candidate's
+	// content was already proven (or, without a scratch, is at least never
+	// silently degraded), so a failure here means the TARGET is broken,
+	// not the capsule.
 	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
@@ -577,11 +615,7 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
-		try {
-			reconstructFromFrames(target, frames);
-		} catch (err) {
-			throw new CapsuleReplayError(err);
-		}
+		reconstructFromFrames(target, frames);
 	});
 	return { tier: 2, scb, framesApplied: frames.length };
 }
@@ -615,7 +649,8 @@ export interface IBestCapsuleRestore extends ICapsuleRestoreResult {
 export function restoreBestRecoveryCapsule(
 	blobs: Buffer[],
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): IBestCapsuleRestore {
 	const candidates = blobs
 		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
@@ -687,17 +722,21 @@ export function restoreBestRecoveryCapsule(
 				} catch {
 					continue;
 				}
-				// A REPLAY failure past validation is a CANDIDATE defect:
-				// chain verification cannot prove the content replays, and
-				// the install transaction rolls the target back to untouched
-				// on any throw, so trying the next replica (or falling
-				// through to Tier 1) is safe. ONLY the typed replay error is
-				// swallowed; a raw storage failure means the TARGET is
-				// broken, and degrading it to a Tier 1 answer would mask
-				// that, so it propagates.
+				// The typed replay error is a CANDIDATE defect, raised by the
+				// dry-run BEFORE the target was written, so trying the next
+				// replica (or falling through to Tier 1) is safe. Everything
+				// else the restore throws is a TARGET problem (the install
+				// transaction has rolled it back, but the database is
+				// broken or dirty) and degrading it to a Tier 1 answer
+				// would mask that, so it propagates.
 				let result: ICapsuleRestoreResult;
 				try {
-					result = restoreFromRecoveryCapsule(candidate, target, nodeSecret);
+					result = restoreFromRecoveryCapsule(
+						candidate,
+						target,
+						nodeSecret,
+						options
+					);
 				} catch (err) {
 					if (!(err instanceof CapsuleReplayError)) throw err;
 					continue;

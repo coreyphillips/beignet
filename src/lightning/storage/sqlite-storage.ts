@@ -1776,6 +1776,14 @@ export class SqliteStorage implements IStorageBackend {
 			.run(key, this._enc(value));
 	}
 
+	listRecoveryMetaKeys(): string[] {
+		return (
+			this.db.prepare('SELECT key FROM recovery_meta').all() as Array<{
+				key: string;
+			}>
+		).map((row) => row.key);
+	}
+
 	deleteRecoveryMeta(key: string): void {
 		this.db.prepare('DELETE FROM recovery_meta WHERE key = ?').run(key);
 	}

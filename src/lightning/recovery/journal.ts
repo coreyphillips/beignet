@@ -105,6 +105,31 @@ const META_DURABILITY_FLOOR = 'journal_durability_floor';
 const META_BACKFILL_LOST = 'journal_backfill_lost';
 
 /**
+ * Every recovery_meta key that only ever exists because FRAMES existed. A
+ * store with ZERO frames must carry none of them: any survivor means the
+ * frames were destroyed around it, and rewriting from "fresh" would fork
+ * the chain from every replica still holding the erased history. The
+ * writer epoch is deliberately NOT here: lease acquisition legitimately
+ * records it before the first frame is ever written.
+ */
+const FRAME_DERIVED_META_KEYS = [
+	META_TIP_SEQUENCE,
+	META_TIP_HASH,
+	META_LAST_SNAPSHOT,
+	META_DELTA_BYTES,
+	META_LAST_SNAPSHOT_WRITTEN,
+	META_SNAPSHOT_SCHEMA,
+	META_DURABILITY_FLOOR,
+	META_BACKFILL_LOST
+] as const;
+
+/** Every journal-owned key, for restore-target emptiness checks. */
+const JOURNAL_META_RESIDUE_KEYS = [
+	...FRAME_DERIVED_META_KEYS,
+	META_WRITER_EPOCH
+] as const;
+
+/**
  * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
  * which snapshots them alongside the stored frames so a restore can install
  * a verifiable journal into an empty database.
@@ -728,6 +753,23 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				}); refusing to rewrite it`
 			);
 		}
+		if (frames.length === 0) {
+			// Fresh means COMPLETELY fresh: chain verification already
+			// refused partial tip metadata, but any other frame-derived key
+			// surviving an emptied store (a snapshot cadence record, a
+			// durability floor) is the same tampering with a different key
+			// deleted. The writer epoch alone is legitimate: lease
+			// acquisition records it before the first frame.
+			for (const key of FRAME_DERIVED_META_KEYS) {
+				const value = this.storage.getRecoveryMeta!(key);
+				if (value != null && value !== '') {
+					throw new Error(
+						`recovery: the frame store is empty but journal metadata ` +
+							`('${key}') survives; refusing to rewrite the journal`
+					);
+				}
+			}
+		}
 		let sawSnapshot = frames.length === 0;
 		for (let i = frames.length - 1; i >= 0 && !sawSnapshot; i--) {
 			if (!frames[i].snapshot) continue;
@@ -1127,6 +1169,17 @@ export function verifyFrameChain(
 		previousSequence = sequence;
 	}
 
+	// The tip fields are written together, so they must survive together: a
+	// journal carrying one without the other is not a fresh journal, it is
+	// one whose metadata was partially destroyed, and treating it as
+	// tip-less would let the next rewrite re-base from genesis and fork
+	// from every replica still holding the erased history.
+	if ((meta.tipSequence != null) !== (meta.tipHash != null)) {
+		throw new Error(
+			'Recovery journal metadata is partial: tip sequence and tip hash ' +
+				'must both be present or both be absent'
+		);
+	}
 	const tip =
 		meta.tipSequence != null && meta.tipHash != null
 			? {
@@ -1134,6 +1187,14 @@ export function verifyFrameChain(
 					frameHash: Buffer.from(meta.tipHash, 'hex')
 			  }
 			: null;
+	if (!tip && frames.length === 0 && meta.lastSnapshotSequence != null) {
+		// Same reasoning for the base record: it only ever exists because
+		// frames did.
+		throw new Error(
+			'Recovery journal truncated: a base snapshot is recorded but no ' +
+				'frames exist'
+		);
+	}
 	if (tip) {
 		if (frames.length === 0) {
 			throw new Error(
@@ -1321,27 +1382,42 @@ export function reconstructFromFrames(
  * journal's metadata (and a failed attempt could leave its frames behind).
  */
 export function assertNoJournalResidue(target: IStorageBackend): void {
-	if ((target.loadRecoveryFrames?.(0) ?? []).length > 0) {
+	// ALL stored rows, with no lower bound: loadRecoveryFrames(0) reads
+	// strictly-greater-than and would miss a sequence-0 residue row, which
+	// then survives the install and leaves the restored journal
+	// unverifiable.
+	if ((target.loadRecoveryFrames?.() ?? []).length > 0) {
 		throw new Error(
 			'Recovery restore requires a target with no stored recovery frames'
 		);
 	}
-	const residueKeys = [
-		META_TIP_SEQUENCE,
-		META_TIP_HASH,
-		META_WRITER_EPOCH,
-		META_LAST_SNAPSHOT,
-		META_DELTA_BYTES,
-		META_LAST_SNAPSHOT_WRITTEN,
-		META_SNAPSHOT_SCHEMA,
-		META_DURABILITY_FLOOR,
-		META_BACKFILL_LOST
+	// ALL recovery metadata, not just the journal's own keys: a restore
+	// target must be a fresh database, and any surviving control record (a
+	// writer lease, a startup repair marker) belongs to a previous life the
+	// restore would otherwise resurrect alongside the new one. Backends
+	// that can enumerate the table are checked exhaustively; the rest fall
+	// back to every key this codebase writes.
+	const listedKeys = target.listRecoveryMetaKeys?.();
+	if (listedKeys !== undefined) {
+		if (listedKeys.length > 0) {
+			throw new Error(
+				`Recovery restore requires a target with no recovery metadata ` +
+					`('${listedKeys[0]}' is set)`
+			);
+		}
+		return;
+	}
+	const residueKeys: readonly string[] = [
+		...JOURNAL_META_RESIDUE_KEYS,
+		'writer_lease_v1',
+		'restore_pending_acquisition_v1',
+		'startup_repair_tail'
 	];
 	for (const key of residueKeys) {
 		const value = target.getRecoveryMeta?.(key);
 		if (value != null && value !== '') {
 			throw new Error(
-				`Recovery restore requires a target with no journal metadata ` +
+				`Recovery restore requires a target with no recovery metadata ` +
 					`('${key}' is set)`
 			);
 		}
@@ -1352,6 +1428,9 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 export function assertEmptyTarget(target: IStorageBackend): void {
 	const dirty =
 		target.loadAllChannels().length > 0 ||
+		// Key indices are safety-critical residue too: an orphaned row
+		// surviving a restore shifts the next channel's derivation index.
+		(target.loadAllChannelKeyIndices?.() ?? []).length > 0 ||
 		target.loadAllChainMonitors().length > 0 ||
 		target.loadAllPreimages().length > 0 ||
 		target.loadAllPayments().length > 0 ||

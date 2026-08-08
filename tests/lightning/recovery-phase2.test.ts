@@ -1491,6 +1491,59 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		s3.close();
 	});
 
+	it('refuses an emptied store that kept partial journal metadata', () => {
+		// Deleting frame 1 plus ONLY the tip hash (keeping the sequence and
+		// base records) used to read as a fresh journal; the next commit
+		// then created frame 2 with the genesis predecessor, a local chain
+		// that verifies but forks from every guardian retaining frame 1.
+		const sql = (
+			storage: SqliteStorage
+		): { prepare(q: string): { run(...args: unknown[]): unknown } } =>
+			(
+				storage as unknown as {
+					db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+				}
+			).db;
+
+		// (a) Tip hash deleted, sequence and base retained.
+		const s1 = openStorage();
+		expect(
+			commitPreimage(makeJournaledManager(s1).manager, 20).committed
+		).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames').run();
+		s1.deleteRecoveryMeta!('journal_tip_hash');
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 21);
+		expect(r1.committed, 'partial tip metadata refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/fails verification/);
+		expect(
+			s1.loadRecoveryFrames!(0),
+			'no genesis-predecessor frame was created'
+		).to.have.length(0);
+		s1.close();
+
+		// (b) Tip AND base records deleted, but other frame-derived
+		// metadata (the writer epoch) survives: still not a fresh journal.
+		const s2 = openStorage();
+		expect(
+			commitPreimage(makeJournaledManager(s2).manager, 22).committed
+		).to.equal(true);
+		sql(s2).prepare('DELETE FROM recovery_frames').run();
+		for (const key of [
+			'journal_tip_hash',
+			'journal_tip_sequence',
+			'journal_last_snapshot_sequence',
+			'journal_last_snapshot_written'
+		]) {
+			s2.deleteRecoveryMeta!(key);
+		}
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 23);
+		expect(r2.committed, 'surviving frame-derived metadata refused').to.equal(
+			false
+		);
+		expect(String(r2.error?.message)).to.match(/metadata \('.*'\) survives/);
+		s2.close();
+	});
+
 	it('refuses a present-but-null or empty schema declaration outright', () => {
 		// Only a truly ABSENT property means pre-versioning: an explicit
 		// null or empty declaration is an evasive shape that could smuggle

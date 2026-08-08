@@ -5717,6 +5717,18 @@ export class LightningNode extends EventEmitter {
 	 */
 	private async connectPeerById(pubkey: string): Promise<void> {
 		const attempts: string[] = [];
+		// ONE cancellation token for the whole node-id operation: a dial
+		// rejects typed on its own, but disconnectPeer() can also land in
+		// the gaps BETWEEN dials (most importantly while the async DNS
+		// bootstrap is pending, when no dial exists to reject), and the
+		// next candidate would otherwise start fresh under the bumped
+		// generation and reverse the explicit disconnect.
+		const cancellationToken = this.peerManager!.cancellationToken(pubkey);
+		const assertNotCancelled = (): void => {
+			if (this.peerManager!.cancellationToken(pubkey) !== cancellationToken) {
+				throw new PeerDialCancelledError(pubkey);
+			}
+		};
 		const isTor = (a: INodeAddress): boolean =>
 			a.type === ADDRESS_TYPE_TORV2 || a.type === ADDRESS_TYPE_TORV3;
 
@@ -5735,6 +5747,7 @@ export class LightningNode extends EventEmitter {
 			if (dialable) candidates.push(dialable);
 		}
 		for (const { host, port } of candidates) {
+			assertNotCancelled();
 			try {
 				await this.peerManager!.connectPeer(pubkey, host, port);
 				return;
@@ -5775,6 +5788,10 @@ export class LightningNode extends EventEmitter {
 				attempts.push('DNS bootstrap returned no address for this node id');
 			}
 			for (const peer of matches) {
+				// The DNS bootstrap awaited above is exactly the window where
+				// a cancellation has no dial to reject: check the token
+				// before the FIRST dns dial too.
+				assertNotCancelled();
 				try {
 					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
 					return;

@@ -672,6 +672,207 @@ describe('Peer held post-handshake delivery', function () {
 		}
 	});
 
+	it('a cancellation during DNS resolution stops the node-id operation', async function () {
+		// While bootstrapPeers() is pending no dial exists to reject with
+		// the typed error: the operation token captured up front must stop
+		// the FIRST dns dial from ever starting.
+		const a = new LightningNode(makeNodeConfig(35));
+		a.on('node:error', () => {});
+		try {
+			const pubkey = getPublicKey(makeSeed(995)).toString('hex');
+			(
+				a as unknown as {
+					graph: { getNode(id: Buffer): undefined };
+				}
+			).graph = { getNode: () => undefined };
+			(
+				a as unknown as {
+					bootstrapPeers(): Promise<
+						Array<{ pubkey: Buffer; host: string; port: number }>
+					>;
+				}
+			).bootstrapPeers = async () => {
+				// The explicit cancellation lands MID-resolution.
+				a.disconnectPeer(pubkey);
+				return [
+					{
+						pubkey: Buffer.from(pubkey, 'hex'),
+						host: '127.0.0.1',
+						port: 9
+					}
+				];
+			};
+			let dials = 0;
+			(
+				a as unknown as {
+					peerManager: { connectPeer(): Promise<void> };
+				}
+			).peerManager.connectPeer = async (): Promise<void> => {
+				dials++;
+			};
+			let rejection: Error | null = null;
+			await a.connectPeer(pubkey).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(rejection, 'the operation rejected').to.be.instanceOf(Error);
+			expect((rejection as unknown as Error).name).to.equal(
+				'PeerDialCancelledError'
+			);
+			expect(dials, 'the resolved DNS address was never dialed').to.equal(0);
+		} finally {
+			a.destroy();
+		}
+	});
+
+	it('an inbound replacement is discarded when a peer:disconnect observer cancels', async function () {
+		// Newest-wins replacement emits peer:disconnect for the old
+		// connection; a synchronous observer cancelling the peer must not
+		// be reversed by registering the fresh inbound anyway.
+		const a = new LightningNode(makeNodeConfig(36));
+		const b = new LightningNode(makeNodeConfig(37));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await a.listen(0, '127.0.0.1');
+			const port = (
+				a as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// First inbound registers normally.
+			await b.connectPeer(a.getNodeId(), '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(pmA.peers.size, 'the first inbound registered').to.equal(1);
+			// The observer decides the peer is gone for good the moment the
+			// replacement tears the old connection down.
+			a.on('peer:disconnect', (pubkey: string) => {
+				a.disconnectPeer(pubkey);
+			});
+			// A SECOND inbound from the same identity (a raw Peer dialing
+			// a's listener) triggers newest-wins replacement.
+			const raw = new Peer({
+				localPrivateKey: crypto
+					.createHash('sha256')
+					.update(makeSeed(37))
+					.update(Buffer.from('node-identity'))
+					.digest(),
+				remotePublicKey: Buffer.from(a.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port
+			});
+			raw.on('error', () => {});
+			await raw.connect().catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(
+				pmA.peers.size,
+				'the replacement was discarded, not registered'
+			).to.equal(0);
+			expect(pmA.reconnectTimers.size).to.equal(0);
+			raw.disconnect();
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('an outbound collision replacement is discarded when the observer cancels', async function () {
+		// The outbound twin of the inbound test: an inbound registers WHILE
+		// our outbound handshake is in flight, our outbound wins the
+		// cross-direction tie-break and tears the inbound down, and a
+		// synchronous observer cancellation during that teardown must
+		// discard OUR fresh connection too, rejecting the dial typed.
+		const x = new LightningNode(makeNodeConfig(38));
+		const y = new LightningNode(makeNodeConfig(39));
+		x.on('node:error', () => {});
+		y.on('node:error', () => {});
+		const realConnect = Peer.prototype.connect;
+		try {
+			// The SMALLER pubkey side prefers its outbound in the tie-break.
+			const [small, big] = x.getNodeId() < y.getNodeId() ? [x, y] : [y, x];
+			const pmSmall = (
+				small as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await small.listen(0, '127.0.0.1');
+			await big.listen(0, '127.0.0.1');
+			const smallPort = (
+				small as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			const bigPort = (
+				big as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			small.on('peer:disconnect', (pubkey: string) => {
+				small.disconnectPeer(pubkey);
+			});
+			// After small's outbound handshake completes but BEFORE the
+			// manager registers it, an inbound bearing BIG'S identity (a raw
+			// Peer: big's manager would refuse the dial as already-connected)
+			// occupies the registration: the exact cross-dial window.
+			const nodeKeyOf = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from('node-identity'))
+					.digest();
+			const bigKey = [38, 39]
+				.map(nodeKeyOf)
+				.find((k) => getPublicKey(k).toString('hex') === big.getNodeId())!;
+			const raw = new Peer({
+				localPrivateKey: bigKey,
+				remotePublicKey: Buffer.from(small.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port: smallPort
+			});
+			raw.on('error', () => {});
+			let armed = true;
+			Peer.prototype.connect = async function (this: Peer): Promise<void> {
+				await realConnect.apply(this);
+				if (armed && this.remotePublicKey.toString('hex') === big.getNodeId()) {
+					armed = false;
+					await realConnect.apply(raw);
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+			};
+			let rejection: Error | null = null;
+			await small
+				.connectPeer(big.getNodeId(), '127.0.0.1', bigPort)
+				.catch((err) => {
+					rejection = err instanceof Error ? err : new Error(String(err));
+				});
+			expect(rejection, 'the dial rejected').to.be.instanceOf(Error);
+			expect((rejection as unknown as Error).name).to.equal(
+				'PeerDialCancelledError'
+			);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(
+				pmSmall.peers.size,
+				'neither the loser nor the replacement survived'
+			).to.equal(0);
+			expect(pmSmall.reconnectTimers.size).to.equal(0);
+			raw.disconnect();
+		} finally {
+			Peer.prototype.connect = realConnect;
+			x.destroy();
+			y.destroy();
+		}
+	});
+
 	it('a reconnect round cancelled mid-round neither redials nor reschedules', async function () {
 		// disconnectPeer clears the PENDING timer, but a round already past
 		// that point keeps running: it must check the cancellation before
