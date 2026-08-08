@@ -29,7 +29,10 @@ import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
-import { withStorageTransaction } from '../storage/transaction';
+import {
+	isStorageTransactionActive,
+	withStorageTransaction
+} from '../storage/transaction';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
 import { RecoveryManager } from './recovery-manager';
 import {
@@ -103,6 +106,12 @@ const META_DURABILITY_FLOOR = 'journal_durability_floor';
  * about the NAMESPACE rather than a condition that can improve.
  */
 const META_BACKFILL_LOST = 'journal_backfill_lost';
+/**
+ * The frame hash the replication watermark was receipted AT (written by
+ * GuardianReplicator beside guardian_replicated_through). Binds the
+ * watermark to a specific history instead of a bare height.
+ */
+export const META_REPLICATED_THROUGH_HASH = 'guardian_replicated_through_hash';
 
 /**
  * Every recovery_meta key that only ever exists because FRAMES existed. A
@@ -141,17 +150,25 @@ const JOURNAL_META_RESIDUE_KEYS = [
  * The scan refuses BY PRESENCE: an explicitly stored empty string is
  * presence, not absence.
  */
+const isJsonObject = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return parsed !== null && typeof parsed === 'object';
+	} catch {
+		return false;
+	}
+};
 const EMPTY_STORE_ALLOWED_META: ReadonlyMap<
 	string,
 	(value: string) => boolean
 > = new Map([
 	[META_WRITER_EPOCH, (value: string): boolean => /^[1-9]\d*$/.test(value)],
-	['writer_lease_v1', (value: string): boolean => value !== ''],
-	['restore_pending_acquisition_v1', (value: string): boolean => value !== ''],
-	[
-		'guardian_pending_registration_v1',
-		(value: string): boolean => value !== ''
-	],
+	// The lease and the pending records are JSON artifacts; a value their
+	// loaders could never parse is residue or corruption, not a
+	// legitimate pre-frame state.
+	['writer_lease_v1', isJsonObject],
+	['restore_pending_acquisition_v1', isJsonObject],
+	['guardian_pending_registration_v1', isJsonObject],
 	['startup_repair_tail', (value: string): boolean => value === 'owed']
 ]);
 
@@ -346,7 +363,12 @@ export function journalSupported(storage: IStorageBackend): boolean {
 		// channels included: a backend that can only enumerate live
 		// channels would hand reconstruction a reset next-index and reopen
 		// key reuse, so it does not get a journal at all.
-		typeof storage.loadAllChannelKeyIndices === 'function'
+		typeof storage.loadAllChannelKeyIndices === 'function' &&
+		// The write gate's empty-store scan must be able to see EVERY
+		// metadata key: a backend that cannot enumerate cannot reveal
+		// unknown residue of destroyed history, so it does not get a
+		// journal either.
+		typeof storage.listRecoveryMetaKeys === 'function'
 	);
 }
 
@@ -549,6 +571,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 */
 	private lastWrittenTip: { sequence: bigint; hashHex: string } | null = null;
 	/**
+	 * The first retained sequence this run VERIFIED (one-shot) or produced
+	 * (compaction). Together with the tip and the primary key's uniqueness,
+	 * an exact count against this minimum proves the retained chain lost
+	 * nothing: not its tail, not an interior frame, and not its prefix.
+	 */
+	private expectedRetainedMin: bigint | null = null;
+	/**
 	 * The highest writer epoch this run has observed or written. The epoch
 	 * defaulting to 1 when its record is missing is only safe on a journal
 	 * that never had one: after that, a vanished or regressed epoch means
@@ -625,15 +654,31 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		lastWrittenTip: { sequence: bigint; hashHex: string } | null;
 		tipFloor: bigint;
 		epochFloor: bigint;
+		expectedRetainedMin: bigint | null;
 		rebasedThisRun: boolean;
 		writeSchemaChecked: boolean;
 	} | null = null;
 
 	private beginWriteAttempt(): void {
+		// The floors captured here are RAISED to what durable storage holds
+		// at this instant, BEFORE the attempt writes anything: an
+		// observation of pre-transaction state is a fact about disk, and a
+		// later rollback of the attempt must not un-know it (that is
+		// exactly how a failed write let a lost journal restart at frame 1).
+		let durableTip = 0n;
+		const tipSeq = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		if (tipSeq != null && /^\d+$/.test(tipSeq)) durableTip = BigInt(tipSeq);
+		let durableEpoch = 1n;
+		const epochRaw = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
+		if (epochRaw != null && /^[1-9]\d*$/.test(epochRaw)) {
+			durableEpoch = BigInt(epochRaw);
+		}
+		const maxBig = (a: bigint, b: bigint): bigint => (a > b ? a : b);
 		this.writeAttemptCheckpoint = {
 			lastWrittenTip: this.lastWrittenTip,
-			tipFloor: this.tipFloor,
-			epochFloor: this.epochFloor,
+			tipFloor: maxBig(this.tipFloor, durableTip),
+			epochFloor: maxBig(this.epochFloor, durableEpoch),
+			expectedRetainedMin: this.expectedRetainedMin,
 			rebasedThisRun: this.rebasedThisRun,
 			writeSchemaChecked: this.writeSchemaChecked
 		};
@@ -646,6 +691,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.lastWrittenTip = checkpoint.lastWrittenTip;
 		this.tipFloor = checkpoint.tipFloor;
 		this.epochFloor = checkpoint.epochFloor;
+		this.expectedRetainedMin = checkpoint.expectedRetainedMin;
 		this.rebasedThisRun = checkpoint.rebasedThisRun;
 		this.writeSchemaChecked = checkpoint.writeSchemaChecked;
 	}
@@ -810,6 +856,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 */
 	prepareForReplication(): void {
 		if (this.rebasedThisRun) return;
+		this.assertOwnsTransaction('prepareForReplication');
 		// This path OWNS its transaction, so it owns the attempt lifecycle
 		// too: a rollback restores every in-memory field (a failed re-base
 		// must not leave rebasedThisRun true or a phantom written tip).
@@ -920,6 +967,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					err instanceof Error ? err.message : String(err)
 				}); refusing to rewrite it`
 			);
+		}
+		// The VERIFIED chain is the authority for what this run may build
+		// on: the retained span it proves is what every later write must
+		// still find, and the highest epoch it contains is a floor no
+		// metadata deletion can lower (a rebase under a lower epoch would
+		// compact real history into a chain a receipted restore cannot
+		// decrypt).
+		if (frames.length > 0) {
+			this.expectedRetainedMin = frames[0].sequence;
+			for (const frame of frames) {
+				if (frame.writerEpoch > this.epochFloor) {
+					this.epochFloor = frame.writerEpoch;
+				}
+			}
+		} else {
+			this.expectedRetainedMin = null;
 		}
 		let sawSnapshot = frames.length === 0;
 		for (let i = frames.length - 1; i >= 0 && !sawSnapshot; i--) {
@@ -1066,35 +1129,91 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			);
 		}
 		// The recorded tip must be BACKED by its stored rows, exactly and
-		// CONTIGUOUSLY: the primary key makes sequences unique, so matching
-		// endpoints plus an exact count prove the retained chain has no
-		// interior gap. A deleted tail, a swapped tip hash, or a deleted
-		// middle frame all fail here on the very next write instead of
-		// after the next restart.
+		// CONTIGUOUSLY, against the span the VERIFIED chain established:
+		// the primary key makes sequences unique, so a matching minimum,
+		// maximum and exact count prove the retained chain lost nothing (a
+		// deleted tail, a deleted PREFIX, or a deleted middle frame all
+		// fail here on the very next write instead of after a restart).
 		const stats = this.recoveryFrameSpan();
+		const expectedMin = this.expectedRetainedMin;
 		if (
 			stats == null ||
+			expectedMin == null ||
+			BigInt(stats.minSequence) !== expectedMin ||
 			BigInt(stats.maxSequence) !== sequence ||
-			stats.minSequence < 1 ||
-			BigInt(stats.count) !== sequence - BigInt(stats.minSequence) + 1n
+			BigInt(stats.count) !== sequence - expectedMin + 1n
 		) {
 			throw new Error(
 				`recovery: the stored frames do not match the recorded tip ` +
 					`${sequence}; refusing to write`
 			);
 		}
-		const tipRow = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		const tipRow = this.loadFrameRow(sequence);
 		if (
-			tipRow.length !== 1 ||
-			BigInt(tipRow[0].sequence) !== sequence ||
-			!tipRow[0].frameHash.equals(Buffer.from(tipHash!, 'hex'))
+			tipRow == null ||
+			!tipRow.frameHash.equals(Buffer.from(tipHash!, 'hex'))
 		) {
 			throw new Error(
 				`recovery: the stored frames do not match the recorded tip ` +
 					`${sequence}; refusing to write`
 			);
+		}
+		// AUTHENTICATE the tip row's content, not just its bookkeeping: a
+		// frame-hash column is only a claim until the ciphertext behind it
+		// decrypts and hashes to it (the storage layer additionally refuses
+		// UPDATEs on frame rows outright).
+		let tipPlaintext: Buffer;
+		try {
+			const tipEpoch = BigInt(tipRow.writerEpoch);
+			tipPlaintext = decryptFrame(
+				deriveFrameKey(this.masterKey, this.nodeId, tipEpoch),
+				tipRow.ciphertext,
+				frameAad(this.nodeId, tipEpoch, sequence, tipRow.previousFrameHash)
+			);
+		} catch {
+			throw new Error(
+				`recovery: the tip frame ${sequence} fails authentication; ` +
+					`refusing to write`
+			);
+		}
+		if (!hashFrame(tipPlaintext).equals(tipRow.frameHash)) {
+			throw new Error(
+				`recovery: the tip frame ${sequence} does not match its ` +
+					`recorded hash; refusing to write`
+			);
+		}
+		// The watermark is a receipt for THIS history, not for a height: a
+		// recorded receipted-frame hash must still name the stored frame at
+		// that sequence, or the receipts belong to a chain this store no
+		// longer holds.
+		if (watermark != null) {
+			const receipted = BigInt(watermark);
+			const receiptedHash = this.storage.getRecoveryMeta!(
+				META_REPLICATED_THROUGH_HASH
+			);
+			if (receiptedHash != null && receipted >= expectedMin) {
+				const receiptedRow = this.loadFrameRow(receipted);
+				if (
+					receiptedRow == null ||
+					receiptedRow.frameHash.toString('hex') !== receiptedHash
+				) {
+					throw new Error(
+						`recovery: the stored frame at the replication watermark ` +
+							`${receipted} is not the receipted frame; refusing to write`
+					);
+				}
+			}
 		}
 		this.tipFloor = sequence;
+	}
+
+	/** One stored frame row by exact sequence, null when absent. */
+	private loadFrameRow(sequence: bigint): IStoredRecoveryFrame | null {
+		const rows = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		if (rows.length === 0 || BigInt(rows[0].sequence) !== sequence) {
+			return null;
+		}
+		return rows[0];
 	}
 
 	/** Row count of the frame store (stats API when available). */
@@ -1126,8 +1245,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		frameHash: Buffer;
 		plaintextBytes: number;
 	} {
-		this.assertWriteInvariants();
+		// One-shot verification first: it establishes the verified span and
+		// epoch floor the per-write invariants then hold every write to.
 		this.assertSchemaCompatibleForWrite();
+		this.assertWriteInvariants();
+		// The frame's epoch was computed BEFORE the verified chain could
+		// raise the floor (callers evaluate writerEpoch() while building
+		// the frame), so it is re-validated here: writing below the chain's
+		// own epoch would compact real history into frames a receipted
+		// restore cannot decrypt.
+		if (frame.writerEpoch < this.epochFloor) {
+			throw new Error(
+				`recovery: frame epoch ${frame.writerEpoch} is below the ` +
+					`verified chain's epoch ${this.epochFloor}; refusing to write`
+			);
+		}
 		// Stamped here rather than at each construction site so that deltas,
 		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
 		// all carry the same declaration; a snapshot that omitted it would be a
@@ -1173,6 +1305,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			sequence: frame.sequence,
 			hashHex: frameHash.toString('hex')
 		};
+		// A bootstrap (or first-ever) write establishes the retained span.
+		if (this.expectedRetainedMin == null) {
+			this.expectedRetainedMin = frame.sequence;
+		}
 		// The floor rides the SAME transaction as the frame that raises it, so
 		// a chain can never contain a durable quorum frame without the record
 		// that forbids a later downgrade.
@@ -1224,6 +1360,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// would leave the whole journal unverifiable, which is strictly
 		// worse than the gap this repair closes. The attempt lifecycle is
 		// owned here too: a rollback restores every in-memory field.
+		this.assertOwnsTransaction('snapshotSchemaRepair');
 		this.beginWriteAttempt();
 		try {
 			this.storage.transaction(() => {
@@ -1358,6 +1495,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			META_LAST_SNAPSHOT,
 			snapshotSequence.toString()
 		);
+		// The prune moved the retained minimum; the per-write span check
+		// holds every later write to exactly this.
+		this.expectedRetainedMin = snapshotSequence;
 	}
 
 	/**
@@ -1372,7 +1512,30 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		);
 		const target = BigInt(written);
 		if (target <= base) return;
-		this.storage.transaction(() => this.compactTo(target));
+		this.assertOwnsTransaction('compact');
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => this.compactTo(target));
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
+	}
+
+	/**
+	 * Journal writes settle durability (and, through the barrier, wire
+	 * releases) at their OWN commit boundary. Joining an outer transaction
+	 * would settle before the real commit: an outer rollback then leaves
+	 * no frame while everything downstream already believed there was one.
+	 */
+	private assertOwnsTransaction(operation: string): void {
+		if (isStorageTransactionActive(this.storage)) {
+			throw new Error(
+				`recovery: ${operation} cannot run inside an outer storage ` +
+					`transaction; journal durability settles at its own commit`
+			);
+		}
 	}
 
 	/** Serialize every safety-critical table (see RecoverySnapshot). */

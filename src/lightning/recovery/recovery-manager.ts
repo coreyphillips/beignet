@@ -12,7 +12,10 @@
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
-import { withStorageTransaction } from '../storage/transaction';
+import {
+	isStorageTransactionActive,
+	withStorageTransaction
+} from '../storage/transaction';
 import {
 	IRecoveryCommitResult,
 	IRecoveryJournalSink,
@@ -99,6 +102,26 @@ export class RecoveryManager {
 		const { mutations, outboundMessages } = transition;
 		if (mutations.length === 0 && outboundMessages.length === 0) {
 			return { committed: true, released: [], frameSequence: null };
+		}
+
+		// A JOURNALED commit settles durability and releases wire messages
+		// when it returns; joining an outer transaction would settle before
+		// the real commit (an outer rollback then leaves no frame while the
+		// messages were already released, and the journal's own integrity
+		// guards would refuse every retry). Refuse instead of joining.
+		if (
+			this.options.journal &&
+			transition.criticality !== RecoveryCriticality.Reconstructable &&
+			isStorageTransactionActive(this.storage)
+		) {
+			const error = new Error(
+				'a journaled commit cannot join an outer storage transaction'
+			);
+			this.options.onError?.(error, {
+				criticality: transition.criticality,
+				reportedByCaller: transition.reportedByCaller === true
+			});
+			return { committed: false, released: [], error, frameSequence: null };
 		}
 
 		const outboxIds: Array<number | null> = [];

@@ -930,15 +930,32 @@ describe('Recovery phase 3: review regressions', () => {
 	it('never inlines a journal that fails verification at compose time', () => {
 		const { storage } = journaledStorage(3);
 		// Corrupt one stored frame on disk.
-		(
+		const db = (
 			storage as unknown as {
-				db: { prepare: (sql: string) => { run: () => unknown } };
+				db: {
+					prepare: (sql: string) => {
+						run: (...args: unknown[]) => unknown;
+						get: (...args: unknown[]) => unknown;
+					};
+				};
 			}
-		).db
-			.prepare(
-				'UPDATE recovery_frames SET ciphertext = zeroblob(64) WHERE sequence = 2'
-			)
-			.run();
+		).db;
+		// The storage layer refuses UPDATEs on frame rows (append-only
+		// trigger), so simulated corruption replaces the row wholesale.
+		const full = db
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = 2')
+			.get() as Record<string, unknown>;
+		db.prepare('DELETE FROM recovery_frames WHERE sequence = 2').run();
+		db.prepare(
+			'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+		).run(
+			full.sequence,
+			full.writer_epoch,
+			full.frame_hash,
+			full.previous_hash,
+			Buffer.alloc(64),
+			full.created_at
+		);
 		const { capsule, inline, inlineError } = composeRecoveryCapsule({
 			storage,
 			encryptedScb: makeScb(),
@@ -1549,44 +1566,35 @@ describe('Recovery phase 3: round-14 validator and residue hardening', () => {
 		storage.close();
 	});
 
-	it('a non-enumerating backend still refuses guardian and corrupt residue', () => {
+	it('a non-enumerating backend is refused Tier 2 outright', () => {
+		// A backend that cannot enumerate its recovery metadata cannot
+		// prove a restore target clean of unknown residue, so it does not
+		// get a journal (journalSupported) and a capsule restore degrades
+		// to Tier 1 BY CONTRACT instead of installing over unseen state.
 		const { storage } = journaledStorage(1);
 		const { blob } = composeRecoveryCapsule({
 			storage,
 			encryptedScb: makeScb(),
 			nodeSecret: NODE_SECRET
 		});
-		// Hide the enumeration so the fallback list is what protects.
-		const nonEnumerating = (base: SqliteStorage): IStorageBackend => {
-			const proxied = new Proxy(base, {
-				get(target, prop, receiver): unknown {
-					if (prop === 'listRecoveryMetaKeys') return undefined;
-					const value = Reflect.get(target, prop, receiver);
-					return typeof value === 'function' ? value.bind(target) : value;
-				}
-			});
-			return proxied as unknown as IStorageBackend;
-		};
-
-		// (a) A stale replication watermark.
-		const w = openStorage();
-		w.setRecoveryMeta!('guardian_replicated_through', '5');
-		expect(() =>
-			restoreBestRecoveryCapsule([blob], nonEnumerating(w), NODE_SECRET, {
-				scratchStorage
-			})
-		).to.throw(/guardian_replicated_through/);
-		w.close();
-
-		// (b) An EMPTY corrupt writer lease is presence, not absence.
-		const l = openStorage();
-		l.setRecoveryMeta!('writer_lease_v1', '');
-		expect(() =>
-			restoreBestRecoveryCapsule([blob], nonEnumerating(l), NODE_SECRET, {
-				scratchStorage
-			})
-		).to.throw(/writer_lease_v1/);
-		l.close();
+		const base = openStorage();
+		base.setRecoveryMeta!('guardian_replicated_through', '5');
+		const nonEnumerating = new Proxy(base, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'listRecoveryMetaKeys') return undefined;
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+		const result = restoreBestRecoveryCapsule(
+			[blob],
+			nonEnumerating,
+			NODE_SECRET,
+			{ scratchStorage }
+		);
+		expect(result.tier, 'Tier 1 only').to.equal(1);
+		expect(base.loadRecoveryFrames!(), 'no frames installed').to.have.length(0);
+		base.close();
 		storage.close();
 	});
 });
@@ -1622,6 +1630,53 @@ describe('Recovery phase 3: validator failures are never capsule defects', () =>
 			target.loadRecoveryFrames!(),
 			'the target was never touched'
 		).to.have.length(0);
+		target.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-16 validator provenance', () => {
+	it('a backend failing a table the probe covers propagates raw', () => {
+		// savePaymentSecret failures were previously laundered into capsule
+		// defects; the known-good probe now writes that table on the SAME
+		// instance whose candidate failure is being classified, so a broken
+		// validator propagates instead of discarding valid Tier-2 state.
+		const { storage, manager } = journaledStorage(1);
+		// The candidate itself carries a payment secret, so its replay hits
+		// the broken table.
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_secret',
+						paymentHash: 'ee'.repeat(32),
+						secret: Buffer.alloc(32, 9)
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const broken = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			scratch.savePaymentSecret = (): void => {
+				throw new Error('scratch payment_secrets broken');
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+				scratchStorage: broken
+			})
+		).to.throw(/scratch payment_secrets broken/);
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
 		target.close();
 		storage.close();
 	});

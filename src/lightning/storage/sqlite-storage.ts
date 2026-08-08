@@ -384,6 +384,16 @@ export class SqliteStorage implements IStorageBackend {
 				ciphertext BLOB NOT NULL,
 				created_at INTEGER NOT NULL
 			);
+			-- Frames are APPEND-ONLY at the storage layer: nothing in the
+			-- protocol ever rewrites a stored frame (compaction deletes below
+			-- the base, appends insert), so an UPDATE is always tampering or
+			-- corruption and is refused where it happens instead of surfacing
+			-- as an unverifiable chain later.
+			CREATE TRIGGER IF NOT EXISTS recovery_frames_append_only
+				BEFORE UPDATE ON recovery_frames
+			BEGIN
+				SELECT RAISE(ABORT, 'recovery_frames is append-only');
+			END;
 
 			CREATE TABLE IF NOT EXISTS recovery_meta (
 				key TEXT PRIMARY KEY,

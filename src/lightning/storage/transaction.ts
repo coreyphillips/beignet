@@ -22,6 +22,17 @@ import { IStorageBackend } from './types';
 
 const activeTransactions = new WeakSet<IStorageBackend>();
 
+/**
+ * True while a transaction opened through withStorageTransaction is active
+ * on this backend. Lets operations whose durability semantics CANNOT be
+ * deferred to an outer owner (a journaled commit that reports durable and
+ * releases wire messages when it returns) refuse to join instead of
+ * settling before the real commit.
+ */
+export function isStorageTransactionActive(storage: IStorageBackend): boolean {
+	return activeTransactions.has(storage);
+}
+
 export function withStorageTransaction<T>(
 	storage: IStorageBackend,
 	fn: () => T

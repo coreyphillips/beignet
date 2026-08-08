@@ -52,7 +52,8 @@ import {
 import {
 	JOURNAL_META_KEYS,
 	chainLostBackfill,
-	storedTipSequence
+	storedTipSequence,
+	META_REPLICATED_THROUGH_HASH
 } from './journal';
 import {
 	IWriterLeaseKeys,
@@ -621,14 +622,32 @@ export class GuardianReplicator {
 	 * which they answer idempotently with OK_DUPLICATE.
 	 */
 	replicatedThrough(): bigint {
-		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		const storage = this.config.storage;
+		const raw = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
 		if (raw == null) return 0n;
 		if (!/^\d+$/.test(raw)) return 0n;
+		let value: bigint;
 		try {
-			return BigInt(raw);
+			value = BigInt(raw);
 		} catch {
 			return 0n;
 		}
+		// The recorded receipted-frame hash must still name the stored
+		// frame at the watermark: a replaced chain at the same height has
+		// NOT been receipted, and answering with the inherited watermark
+		// would release its messages without one. Reading 0 is the safe
+		// direction (re-offering is idempotent; a divergent chain is then
+		// refused by the guardians at its occupied sequences).
+		const boundHash = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH_HASH);
+		if (boundHash != null && value >= 1n) {
+			const rows = storage.loadRecoveryFrames?.(Number(value) - 1) ?? [];
+			const row =
+				rows.length > 0 && BigInt(rows[0].sequence) === value ? rows[0] : null;
+			if (row != null && row.frameHash.toString('hex') !== boundHash) {
+				return 0n;
+			}
+		}
+		return value;
 	}
 
 	/**
@@ -699,6 +718,18 @@ export class GuardianReplicator {
 				return;
 			}
 			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
+			// Bind the watermark to the HISTORY it receipts, not just a
+			// height: the receipt verification above proved the guardian
+			// head names our stored frame, so record which frame that was.
+			// A later chain replacement at the same height then fails the
+			// binding instead of inheriting the receipts.
+			const rows = storage.loadRecoveryFrames?.(Number(value) - 1) ?? [];
+			if (rows.length > 0 && BigInt(rows[0].sequence) === value) {
+				storage.setRecoveryMeta?.(
+					META_REPLICATED_THROUGH_HASH,
+					rows[0].frameHash.toString('hex')
+				);
+			}
 		});
 		return stored;
 	}

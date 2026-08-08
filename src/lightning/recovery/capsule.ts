@@ -114,12 +114,22 @@ function knownGoodProbeFrames(): VerifiedRecoveryChain {
 				{ paymentHash: 'bb'.repeat(32), preimage: Buffer.alloc(32, 1) }
 			],
 			payments: [],
-			paymentSecrets: [],
-			htlcPaymentMappings: [],
-			forwardedHtlcs: [],
-			htlcSharedSecrets: [],
+			paymentSecrets: [
+				{ paymentHash: 'bb'.repeat(32), secret: Buffer.alloc(32, 3) }
+			],
+			htlcPaymentMappings: [{ key: 'probe:0', paymentHash: 'bb'.repeat(32) }],
+			forwardedHtlcs: [
+				{
+					outKey: 'probe:offered-0',
+					inChannelId: Buffer.alloc(32, 4),
+					inHtlcId: 0n
+				}
+			],
+			htlcSharedSecrets: [{ key: 'probe:0', secret: Buffer.alloc(32, 5) }],
 			invoices: [],
-			invoicePathIds: [],
+			invoicePathIds: [
+				{ paymentHash: 'bb'.repeat(32), pathId: Buffer.alloc(32, 6) }
+			],
 			forwardingEvents: [],
 			outbox: []
 		}
@@ -159,18 +169,32 @@ function assertReplaysOnScratch(
 	frames: VerifiedRecoveryChain,
 	scratchStorage: () => IStorageBackend
 ): void {
-	const probe = scratchStorage();
-	try {
-		reconstructFromFrames(probe, knownGoodProbeFrames());
-	} finally {
-		(probe as { close?: () => void }).close?.();
-	}
-	// A FRESH scratch for the candidate (the probe populated the first).
 	const scratch = scratchStorage();
 	try {
-		reconstructFromFrames(scratch, frames);
-	} catch (err) {
-		throw new CapsuleReplayError(err);
+		try {
+			// The candidate replay runs TRANSACTIONALLY, so a failure rolls
+			// the scratch back to empty and the health probe below runs on
+			// the very same instance whose failure is being classified.
+			withStorageTransaction(scratch, () => {
+				reconstructFromFrames(scratch, frames);
+			});
+			return;
+		} catch (candidateErr) {
+			// Prove THIS instance against known-good content exercising the
+			// same reads, table writes and transaction completion. If the
+			// backend cannot replay that either, the validator is broken:
+			// the RAW candidate error propagates (never a capsule defect).
+			try {
+				withStorageTransaction(scratch, () => {
+					reconstructFromFrames(scratch, knownGoodProbeFrames());
+				});
+			} catch {
+				throw candidateErr;
+			}
+			// The backend just proved healthy on the identical operation
+			// set: the candidate's failure is its CONTENT.
+			throw new CapsuleReplayError(candidateErr);
+		}
 	} finally {
 		(scratch as { close?: () => void }).close?.();
 	}

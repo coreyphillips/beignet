@@ -43,6 +43,7 @@ import {
 	hashFrame
 } from '../../src/lightning/recovery';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { withStorageTransaction } from '../../src/lightning/storage/transaction';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -956,9 +957,26 @@ describe('Recovery phase 2: corruption detection', () => {
 			.get() as { ciphertext: Buffer };
 		const tampered = Buffer.from(row.ciphertext);
 		tampered[tampered.length - 1] ^= 0x01;
+		// The storage layer refuses UPDATEs on frame rows (append-only
+		// trigger), so simulated tampering replaces the row wholesale.
+		const full = rawDb(storage)
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = 2')
+			.get() as Record<string, unknown>;
 		rawDb(storage)
-			.prepare('UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 2')
-			.run(tampered);
+			.prepare('DELETE FROM recovery_frames WHERE sequence = 2')
+			.run();
+		rawDb(storage)
+			.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			)
+			.run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				tampered,
+				full.created_at
+			);
 		expect(() => journal.loadVerifiedFrames()).to.throw(
 			/failed authentication/
 		);
@@ -976,12 +994,26 @@ describe('Recovery phase 2: corruption detection', () => {
 		const three = db
 			.prepare('SELECT ciphertext FROM recovery_frames WHERE sequence = 3')
 			.get() as { ciphertext: Buffer };
-		db.prepare(
-			'UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 2'
-		).run(three.ciphertext);
-		db.prepare(
-			'UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 3'
-		).run(two.ciphertext);
+		const swap = (sequence: number, ciphertext: Buffer): void => {
+			const full = db
+				.prepare('SELECT * FROM recovery_frames WHERE sequence = ?')
+				.get(sequence) as Record<string, unknown>;
+			db.prepare('DELETE FROM recovery_frames WHERE sequence = ?').run(
+				sequence
+			);
+			db.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			).run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				ciphertext,
+				full.created_at
+			);
+		};
+		swap(2, three.ciphertext);
+		swap(3, two.ciphertext);
 		expect(() => journal.loadVerifiedFrames()).to.throw(
 			/failed authentication/
 		);
@@ -1611,7 +1643,7 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		const r2 = commitPreimage(makeJournaledManager(s2).manager, 33);
 		expect(r2.committed, 'explicit empty value refused').to.equal(false);
 		expect(String(r2.error?.message)).to.match(
-			/journal_last_snapshot_sequence/
+			/journal_last_snapshot_sequence|fails verification/
 		);
 		s2.close();
 	});
@@ -1855,5 +1887,212 @@ describe('Recovery phase 2: attempt-owned commit and rollback', () => {
 			'the owed sentinel is allowed'
 		).to.equal(true);
 		ok.close();
+	});
+});
+
+describe('Recovery phase 2: round-16 complete invariants', () => {
+	const sql = (
+		storage: SqliteStorage
+	): {
+		prepare(q: string): {
+			run(...args: unknown[]): unknown;
+			get(...args: unknown[]): unknown;
+		};
+	} =>
+		(
+			storage as unknown as {
+				db: {
+					prepare(q: string): {
+						run(...args: unknown[]): unknown;
+						get(...args: unknown[]): unknown;
+					};
+				};
+			}
+		).db;
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	it('a rollback never un-observes durable state', () => {
+		// The failed attempt OBSERVED durable tip 1 before writing; rolling
+		// its floors back must not forget that, or deleting the journal
+		// afterwards would let the retry restart at frame 1.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 70).committed).to.equal(true);
+		const realSave = storage.saveRecoveryFrame!.bind(storage);
+		let failNext = true;
+		storage.saveRecoveryFrame = (frame): void => {
+			if (failNext) {
+				failNext = false;
+				throw new Error('disk hiccup');
+			}
+			realSave(frame);
+		};
+		expect(commitPreimage(manager, 71).committed).to.equal(false);
+		sql(storage).prepare('DELETE FROM recovery_frames').run();
+		for (const key of storage.listRecoveryMetaKeys!()) {
+			storage.deleteRecoveryMeta!(key);
+		}
+		const retry = commitPreimage(manager, 72);
+		expect(retry.committed, 'the emptied store is refused').to.equal(false);
+		expect(String(retry.error?.message)).to.match(
+			/disappeared|changed outside this writer/
+		);
+		expect(storage.loadRecoveryFrames!()).to.have.length(0);
+		storage.close();
+	});
+
+	it('journaled writes refuse to join an outer storage transaction', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 73).committed).to.equal(true);
+		let inner: ReturnType<RecoveryManager['commit']> | null = null;
+		withStorageTransaction(storage, () => {
+			inner = commitPreimage(manager, 74);
+		});
+		expect(inner!.committed, 'the joined commit is refused').to.equal(false);
+		expect(String(inner!.error?.message)).to.match(/cannot join an outer/);
+		expect(
+			storage.loadRecoveryFrames!(),
+			'nothing was written under the outer transaction'
+		).to.have.length(1);
+		// The journal-owned paths refuse too.
+		const fresh = makeJournaledManager(storage).journal;
+		expect(() =>
+			withStorageTransaction(storage, () => fresh.prepareForReplication())
+		).to.throw(/cannot run inside an outer storage transaction/);
+		// And a normal commit afterwards still works.
+		expect(commitPreimage(manager, 75).committed).to.equal(true);
+		storage.close();
+	});
+
+	it('detects a deleted retained prefix and a corrupted tip on the next write', () => {
+		// Prefix deletion: [1,2,3] -> [2,3] passes bare count-vs-span
+		// arithmetic but not the VERIFIED minimum.
+		const s1 = openStorage();
+		const m1 = makeJournaledManager(s1);
+		expect(commitPreimage(m1.manager, 76).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 77).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 78).committed).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames WHERE sequence = 1').run();
+		const r1 = commitPreimage(m1.manager, 79);
+		expect(r1.committed, 'deleted prefix refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/do not match the recorded tip/);
+		s1.close();
+
+		// Corrupted tip ciphertext (replaced wholesale; UPDATEs are blocked
+		// at the storage layer): refused by per-write authentication.
+		const s2 = openStorage();
+		const m2 = makeJournaledManager(s2);
+		expect(commitPreimage(m2.manager, 80).committed).to.equal(true);
+		const full = sql(s2)
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = 1')
+			.get() as Record<string, unknown>;
+		sql(s2).prepare('DELETE FROM recovery_frames WHERE sequence = 1').run();
+		sql(s2)
+			.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			)
+			.run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				Buffer.alloc(64),
+				full.created_at
+			);
+		const r2 = commitPreimage(m2.manager, 81);
+		expect(r2.committed, 'corrupt tip refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(/fails authentication/);
+		s2.close();
+
+		// And in-place mutation is refused AT the storage layer.
+		const s3 = openStorage();
+		const m3 = makeJournaledManager(s3);
+		expect(commitPreimage(m3.manager, 82).committed).to.equal(true);
+		expect(() =>
+			sql(s3)
+				.prepare(
+					'UPDATE recovery_frames SET ciphertext = zeroblob(8) WHERE sequence = 1'
+				)
+				.run()
+		).to.throw(/append-only/);
+		s3.close();
+	});
+
+	it('derives the epoch floor from the verified chain itself', () => {
+		// Frames written under epoch 2; then BOTH the epoch record and any
+		// lease disappear. A fresh journal must refuse to default to epoch
+		// 1 and compact the epoch-2 history away.
+		const storage = openStorage();
+		storage.setRecoveryMeta!('journal_writer_epoch', '2');
+		const first = makeJournaledManager(storage);
+		expect(commitPreimage(first.manager, 83).committed).to.equal(true);
+		storage.deleteRecoveryMeta!('journal_writer_epoch');
+		const fresh = makeJournaledManager(storage);
+		const result = commitPreimage(fresh.manager, 84);
+		expect(result.committed, 'the epoch-less rebase refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/epoch record is missing|below the verified chain/
+		);
+		const rows = storage.loadRecoveryFrames!();
+		expect(
+			rows.every((row) => row.writerEpoch === 2),
+			'the epoch-2 history survives untouched'
+		).to.equal(true);
+		storage.close();
+	});
+
+	it('binds the replication watermark to the receipted history', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 85).committed).to.equal(true);
+		expect(commitPreimage(manager, 86).committed).to.equal(true);
+		const frame2 = storage.loadRecoveryFrames!(1)[0];
+		storage.setRecoveryMeta!('guardian_replicated_through', '2');
+		storage.setRecoveryMeta!(
+			'guardian_replicated_through_hash',
+			frame2.frameHash.toString('hex')
+		);
+		expect(
+			commitPreimage(manager, 87).committed,
+			'a correctly bound watermark passes'
+		).to.equal(true);
+		// The recorded receipt now names a frame this store does not hold:
+		// the receipts belong to a different history.
+		storage.setRecoveryMeta!(
+			'guardian_replicated_through_hash',
+			'cd'.repeat(32)
+		);
+		const result = commitPreimage(manager, 88);
+		expect(result.committed, 'the divergent history refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('validates pre-frame artifacts with their real shapes', () => {
+		const storage = openStorage();
+		storage.setRecoveryMeta!('writer_lease_v1', 'not json at all');
+		const result = commitPreimage(makeJournaledManager(storage).manager, 89);
+		expect(result.committed, 'a non-JSON lease refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(/illegitimate value/);
+		storage.close();
 	});
 });
