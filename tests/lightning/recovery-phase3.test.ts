@@ -664,7 +664,8 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 		const result = restoreBestRecoveryCapsule(
 			[crypto.randomBytes(300), blob!],
 			restoredStorage,
-			makeNodeConfig(1).nodePrivateKey
+			makeNodeConfig(1).nodePrivateKey,
+			{ scratchStorage }
 		);
 		expect(result.tier).to.equal(2);
 		expect(
@@ -862,7 +863,8 @@ describe('Recovery phase 3: review regressions', () => {
 		const result = restoreBestRecoveryCapsule(
 			[tamperedNewer, older.blob],
 			target,
-			NODE_SECRET
+			NODE_SECRET,
+			{ scratchStorage }
 		);
 		// The raw-highest candidate is invalid; the validated lower one wins.
 		expect(result.tier).to.equal(2);
@@ -895,7 +897,9 @@ describe('Recovery phase 3: review regressions', () => {
 		}).blob;
 		const target = openStorage();
 		expect(() =>
-			restoreBestRecoveryCapsule([blobA, blobB], target, NODE_SECRET)
+			restoreBestRecoveryCapsule([blobA, blobB], target, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/conflicting/);
 		a.storage.close();
 		b.storage.close();
@@ -911,7 +915,9 @@ describe('Recovery phase 3: review regressions', () => {
 		});
 		const tampered = tamperInline(composed.capsule, NODE_SECRET);
 		const target = openStorage();
-		const result = restoreBestRecoveryCapsule([tampered], target, NODE_SECRET);
+		const result = restoreBestRecoveryCapsule([tampered], target, NODE_SECRET, {
+			scratchStorage
+		});
 		expect(result.tier).to.equal(1);
 		expect(result.scb.version).to.equal(1);
 		// Nothing touched the target on the failed Tier 2 attempt.
@@ -1083,7 +1089,8 @@ describe('Recovery phase 3: review regressions', () => {
 		const result = restoreBestRecoveryCapsule(
 			[badInline, badScb, good.blob],
 			target,
-			NODE_SECRET
+			NODE_SECRET,
+			{ scratchStorage }
 		);
 		expect(result.tier).to.equal(2);
 		expect(result.capsule.latestSequence).to.equal(good.capsule.latestSequence);
@@ -1164,7 +1171,9 @@ describe('Recovery phase 3: capsule schema prevalidation', () => {
 		// so the valid Tier 1 SCB is still returned and the target stays
 		// clean, instead of an exception over a half-written database.
 		const target2 = openStorage();
-		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET);
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET, {
+			scratchStorage
+		});
 		expect(best.tier, 'the SCB tier survives').to.equal(1);
 		expect(best.framesApplied).to.equal(0);
 		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
@@ -1274,7 +1283,9 @@ describe('Recovery phase 3: capsule replay failures roll back', () => {
 		const dirty = openStorage();
 		dirty.savePreimage('bb'.repeat(32), Buffer.alloc(32, 7));
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], dirty, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], dirty, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/EMPTY target/);
 		dirty.close();
 		storage.close();
@@ -1297,7 +1308,9 @@ describe('Recovery phase 3: restore target and backend contracts', () => {
 		const metaDirty = openStorage();
 		metaDirty.setRecoveryMeta!('journal_tip_sequence', '7');
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], metaDirty, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], metaDirty, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/recovery metadata/);
 		expect(() =>
 			restoreFromRecoveryCapsule(capsule, metaDirty, NODE_SECRET)
@@ -1314,7 +1327,9 @@ describe('Recovery phase 3: restore target and backend contracts', () => {
 		frameDirty.saveRecoveryFrame!(row);
 		frameDirty.deleteRecoveryMeta?.('journal_tip_sequence');
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], frameDirty, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], frameDirty, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/recovery frames/);
 		frameDirty.close();
 		storage.close();
@@ -1375,7 +1390,9 @@ describe('Recovery phase 3: restore target and backend contracts', () => {
 			throw new Error('disk write failed');
 		};
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/disk write failed/);
 		broken.close();
 		storage.close();
@@ -1427,7 +1444,9 @@ describe('Recovery phase 3: round-13 boundary hardening', () => {
 		const seqZero = openStorage();
 		seqZero.saveRecoveryFrame!({ ...row, sequence: 0 });
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], seqZero, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], seqZero, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/recovery frames/);
 		seqZero.close();
 
@@ -1435,7 +1454,9 @@ describe('Recovery phase 3: round-13 boundary hardening', () => {
 		const leased = openStorage();
 		leased.setRecoveryMeta!('writer_lease_v1', 'aa'.repeat(16));
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], leased, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], leased, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/recovery metadata/);
 		leased.close();
 
@@ -1444,9 +1465,128 @@ describe('Recovery phase 3: round-13 boundary hardening', () => {
 		const indexed = openStorage();
 		indexed.saveChannelKeyIndex('cc'.repeat(32), 7);
 		expect(() =>
-			restoreBestRecoveryCapsule([blob], indexed, NODE_SECRET)
+			restoreBestRecoveryCapsule([blob], indexed, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/EMPTY target/);
 		indexed.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-14 validator and residue hardening', () => {
+	it('selection REQUIRES the scratch and a broken validator propagates', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// (a) Mandatory: without a scratch the candidate/Tier-1 contract
+		// cannot be honored, so selection refuses to run at all.
+		const t1 = openStorage();
+		expect(() => restoreBestRecoveryCapsule([blob], t1, NODE_SECRET)).to.throw(
+			/requires options\.scratchStorage/
+		);
+		t1.close();
+
+		// (b) A validator whose own storage cannot pass the probe is
+		// INFRASTRUCTURE failure: it must propagate raw, never downgrade a
+		// valid capsule to another candidate or Tier 1.
+		const t2 = openStorage();
+		const brokenScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			scratch.transaction = (): never => {
+				throw new Error('scratch backend exploded');
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], t2, NODE_SECRET, {
+				scratchStorage: brokenScratch
+			})
+		).to.throw(/scratch backend exploded/);
+		expect(t2.loadRecoveryFrames!()).to.have.length(0);
+		t2.close();
+		storage.close();
+	});
+
+	it('a scratch that mutates its inputs cannot alter the target replay', () => {
+		// The dry-run hands decoded frames to FOREIGN code; a hostile or
+		// buggy adapter mutating a Buffer argument must not change what the
+		// target reconstructs, because the install re-decodes from the
+		// authenticated rows.
+		const { storage } = journaledStorage(1);
+		const original = storage.loadAllPreimages()[0].preimage.toString('hex');
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const mutatingScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			const realSave = scratch.savePreimage.bind(scratch);
+			scratch.savePreimage = (hash: string, preimage: Buffer): void => {
+				realSave(hash, preimage);
+				preimage.fill(0); // hostile: mutate the shared buffer
+			};
+			return scratch;
+		};
+		const target = openStorage();
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const result = restoreFromRecoveryCapsule(capsule, target, NODE_SECRET, {
+			scratchStorage: mutatingScratch
+		});
+		expect(result.tier).to.equal(2);
+		expect(
+			target.loadAllPreimages()[0].preimage.toString('hex'),
+			'the target replay used a fresh decode, not the mutated buffers'
+		).to.equal(original);
+		target.close();
+		storage.close();
+	});
+
+	it('a non-enumerating backend still refuses guardian and corrupt residue', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		// Hide the enumeration so the fallback list is what protects.
+		const nonEnumerating = (base: SqliteStorage): IStorageBackend => {
+			const proxied = new Proxy(base, {
+				get(target, prop, receiver): unknown {
+					if (prop === 'listRecoveryMetaKeys') return undefined;
+					const value = Reflect.get(target, prop, receiver);
+					return typeof value === 'function' ? value.bind(target) : value;
+				}
+			});
+			return proxied as unknown as IStorageBackend;
+		};
+
+		// (a) A stale replication watermark.
+		const w = openStorage();
+		w.setRecoveryMeta!('guardian_replicated_through', '5');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], nonEnumerating(w), NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/guardian_replicated_through/);
+		w.close();
+
+		// (b) An EMPTY corrupt writer lease is presence, not absence.
+		const l = openStorage();
+		l.setRecoveryMeta!('writer_lease_v1', '');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], nonEnumerating(l), NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/writer_lease_v1/);
+		l.close();
 		storage.close();
 	});
 });

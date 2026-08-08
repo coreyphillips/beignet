@@ -1467,7 +1467,9 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		sql(s1).prepare('DELETE FROM recovery_frames WHERE sequence = 2').run();
 		const r1 = commitPreimage(makeJournaledManager(s1).manager, 12);
 		expect(r1.committed, 'deleted tail refused').to.equal(false);
-		expect(String(r1.error?.message)).to.match(/fails verification/);
+		expect(String(r1.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
 		s1.close();
 
 		// (b) Every frame deleted, tip metadata retained.
@@ -1477,7 +1479,9 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		sql(s2).prepare('DELETE FROM recovery_frames').run();
 		const r2 = commitPreimage(makeJournaledManager(s2).manager, 14);
 		expect(r2.committed, 'emptied store refused').to.equal(false);
-		expect(String(r2.error?.message)).to.match(/fails verification/);
+		expect(String(r2.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
 		s2.close();
 
 		// (c) Tip hash swapped for a plausible but wrong value.
@@ -1487,7 +1491,9 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		s3.setRecoveryMeta!('journal_tip_hash', 'ab'.repeat(32));
 		const r3 = commitPreimage(makeJournaledManager(s3).manager, 16);
 		expect(r3.committed, 'swapped tip hash refused').to.equal(false);
-		expect(String(r3.error?.message)).to.match(/fails verification/);
+		expect(String(r3.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
 		s3.close();
 	});
 
@@ -1514,7 +1520,9 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		s1.deleteRecoveryMeta!('journal_tip_hash');
 		const r1 = commitPreimage(makeJournaledManager(s1).manager, 21);
 		expect(r1.committed, 'partial tip metadata refused').to.equal(false);
-		expect(String(r1.error?.message)).to.match(/fails verification/);
+		expect(String(r1.error?.message)).to.match(
+			/tip metadata is partial|fails verification/
+		);
 		expect(
 			s1.loadRecoveryFrames!(0),
 			'no genesis-predecessor frame was created'
@@ -1541,6 +1549,70 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 			false
 		);
 		expect(String(r2.error?.message)).to.match(/metadata \('.*'\) survives/);
+		s2.close();
+	});
+
+	it('refuses a store rewritten UNDER a live writer, not just at startup', () => {
+		// The expensive chain verification is one-shot per run, but the
+		// cheap invariants are not: deleting the frames and tip metadata
+		// while the SAME journal instance keeps writing must refuse the
+		// next commit instead of silently creating a new frame 1 that
+		// forks from every replica holding the original history.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 30).committed).to.equal(true);
+		(
+			storage as unknown as {
+				db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames')
+			.run();
+		for (const key of [
+			'journal_tip_hash',
+			'journal_tip_sequence',
+			'journal_last_snapshot_sequence',
+			'journal_last_snapshot_written',
+			'journal_delta_bytes_since_snapshot',
+			'journal_snapshot_schema'
+		]) {
+			storage.deleteRecoveryMeta!(key);
+		}
+		// SAME manager instance: the one-shot verification already ran.
+		const result = commitPreimage(manager, 31);
+		expect(result.committed, 'the mid-process rewrite is refused').to.equal(
+			false
+		);
+		expect(String(result.error?.message)).to.match(
+			/tip changed outside this writer/
+		);
+		expect(
+			storage.loadRecoveryFrames!(),
+			'no forked frame 1 was created'
+		).to.have.length(0);
+		storage.close();
+	});
+
+	it('refuses empty stores carrying a replication watermark or explicit empty values', () => {
+		// (a) A dangling guardian watermark over an empty store: writing
+		// frame 1 under it would leave replication believing everything at
+		// or below the watermark was already sent.
+		const s1 = openStorage();
+		s1.setRecoveryMeta!('guardian_replicated_through', '1');
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 32);
+		expect(r1.committed, 'watermark residue refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/guardian_replicated_through/);
+		s1.close();
+
+		// (b) PRESENCE is residue: an explicitly stored empty value is not
+		// absence.
+		const s2 = openStorage();
+		s2.setRecoveryMeta!('journal_last_snapshot_sequence', '');
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 33);
+		expect(r2.committed, 'explicit empty value refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(
+			/journal_last_snapshot_sequence/
+		);
 		s2.close();
 	});
 

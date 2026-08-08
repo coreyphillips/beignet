@@ -130,6 +130,22 @@ const JOURNAL_META_RESIDUE_KEYS = [
 ] as const;
 
 /**
+ * The recovery_meta keys that may legitimately exist BEFORE a journal's
+ * first frame: lease acquisition and namespace registration run ahead of
+ * the first commit, and the node's startup repair marker is written before
+ * restore. Everything else present over an EMPTY frame store is residue of
+ * destroyed history, and the empty-store scan refuses it BY PRESENCE (an
+ * explicitly stored empty string is presence, not absence).
+ */
+const EMPTY_STORE_ALLOWED_META_KEYS = new Set<string>([
+	META_WRITER_EPOCH,
+	'writer_lease_v1',
+	'restore_pending_acquisition_v1',
+	'guardian_pending_registration_v1',
+	'startup_repair_tail'
+]);
+
+/**
  * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
  * which snapshots them alongside the stored frames so a restore can install
  * a verifiable journal into an empty database.
@@ -496,6 +512,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private rebasedThisRun = false;
 	/** One-shot: the write boundary validated the stored schema marker. */
 	private writeSchemaChecked = false;
+	/**
+	 * The highest tip sequence this run has OBSERVED in storage. Only ever
+	 * raised at check time (never on our own writes, so a rolled-back
+	 * transaction cannot wedge it): a stored tip below it, or a vanished
+	 * tip after it moved past zero, means the store was rewritten under
+	 * this writer's feet.
+	 */
+	private tipFloor = 0n;
+	/**
+	 * The exact tip this run last WROTE successfully, cleared by
+	 * onCommitRollback when the surrounding transaction failed: the next
+	 * write requires the stored tip to still BE this tip, so frames or
+	 * metadata destroyed under a live writer refuse the next commit
+	 * instead of silently re-basing.
+	 */
+	private lastWrittenTip: { sequence: bigint; hashHex: string } | null = null;
 
 	/**
 	 * @param recoveryId The guardian namespace (wire spec 1.1): the x-only
@@ -545,6 +577,16 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** The mode this journal stamps on its frames, after the sticky rule. */
 	getDurability(): RecoveryDurability | undefined {
 		return this.durability;
+	}
+
+	/**
+	 * The surrounding commit ROLLED BACK after a frame write: the write no
+	 * longer exists on disk, so the exact-tip invariant must fall back to
+	 * the observation-based checks for the next commit (see
+	 * assertWriteInvariants) instead of refusing a legitimate retry.
+	 */
+	onCommitRollback(): void {
+		this.lastWrittenTip = null;
 	}
 
 	/**
@@ -753,23 +795,6 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				}); refusing to rewrite it`
 			);
 		}
-		if (frames.length === 0) {
-			// Fresh means COMPLETELY fresh: chain verification already
-			// refused partial tip metadata, but any other frame-derived key
-			// surviving an emptied store (a snapshot cadence record, a
-			// durability floor) is the same tampering with a different key
-			// deleted. The writer epoch alone is legitimate: lease
-			// acquisition records it before the first frame.
-			for (const key of FRAME_DERIVED_META_KEYS) {
-				const value = this.storage.getRecoveryMeta!(key);
-				if (value != null && value !== '') {
-					throw new Error(
-						`recovery: the frame store is empty but journal metadata ` +
-							`('${key}') survives; refusing to rewrite the journal`
-					);
-				}
-			}
-		}
 		let sawSnapshot = frames.length === 0;
 		for (let i = frames.length - 1; i >= 0 && !sawSnapshot; i--) {
 			if (!frames[i].snapshot) continue;
@@ -795,11 +820,108 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.writeSchemaChecked = true;
 	}
 
+	/**
+	 * Cheap invariants revalidated at EVERY write, unlike the one-shot
+	 * chain verification: a store rewritten DURING this process (frames or
+	 * tip metadata deleted, tip hash swapped, watermark left dangling)
+	 * must refuse the next commit, not silently re-base and fork from the
+	 * replicas holding the erased history.
+	 */
+	private assertWriteInvariants(): void {
+		const tipSeq = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
+		if ((tipSeq != null) !== (tipHash != null)) {
+			throw new Error(
+				'recovery: journal tip metadata is partial; refusing to write'
+			);
+		}
+		// The strongest invariant first: whatever this run last wrote must
+		// still be EXACTLY the stored tip (a rolled-back commit clears the
+		// record via onCommitRollback, so a legitimate retry is not
+		// refused).
+		if (
+			this.lastWrittenTip !== null &&
+			(tipSeq == null ||
+				BigInt(tipSeq) !== this.lastWrittenTip.sequence ||
+				tipHash !== this.lastWrittenTip.hashHex)
+		) {
+			throw new Error(
+				`recovery: the journal tip changed outside this writer (wrote ` +
+					`${this.lastWrittenTip.sequence}, found ${tipSeq ?? 'nothing'}); ` +
+					`refusing to write`
+			);
+		}
+		if (tipSeq == null) {
+			if (this.tipFloor > 0n) {
+				throw new Error(
+					`recovery: the journal tip (last observed at ${this.tipFloor}) ` +
+						`disappeared; refusing to write`
+				);
+			}
+			// A genuinely fresh journal: no frames, and no metadata beyond
+			// what legitimately precedes the first frame (lease, epoch,
+			// registration, startup repair marker). PRESENCE is what is
+			// checked: an explicitly stored empty value is still residue.
+			const listed = this.storage.listRecoveryMetaKeys?.();
+			if (listed !== undefined) {
+				for (const key of listed) {
+					if (!EMPTY_STORE_ALLOWED_META_KEYS.has(key)) {
+						throw new Error(
+							`recovery: the frame store is empty but recovery ` +
+								`metadata ('${key}') survives; refusing to write`
+						);
+					}
+				}
+			} else {
+				for (const key of [
+					...FRAME_DERIVED_META_KEYS,
+					'guardian_replicated_through'
+				]) {
+					if (this.storage.getRecoveryMeta!(key) != null) {
+						throw new Error(
+							`recovery: the frame store is empty but recovery ` +
+								`metadata ('${key}') survives; refusing to write`
+						);
+					}
+				}
+			}
+			if (this.storage.loadRecoveryFrames!().length > 0) {
+				throw new Error(
+					'recovery: frames exist without a recorded tip; refusing to write'
+				);
+			}
+			return;
+		}
+		const sequence = BigInt(tipSeq);
+		if (sequence < this.tipFloor) {
+			throw new Error(
+				`recovery: the journal tip moved backwards (${sequence} after ` +
+					`${this.tipFloor}); refusing to write`
+			);
+		}
+		// The recorded tip must be BACKED by its stored row, exactly: a
+		// deleted tail or a swapped tip hash fails here on the very next
+		// write instead of after the next restart.
+		const above = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		if (
+			above.length !== 1 ||
+			BigInt(above[0].sequence) !== sequence ||
+			!above[0].frameHash.equals(Buffer.from(tipHash!, 'hex'))
+		) {
+			throw new Error(
+				`recovery: the stored frames do not match the recorded tip ` +
+					`${sequence}; refusing to write`
+			);
+		}
+		this.tipFloor = sequence;
+	}
+
 	/** Encode, hash, encrypt and store one frame; advance the tip. */
 	private writeFrame(frame: RecoveryFrame): {
 		frameHash: Buffer;
 		plaintextBytes: number;
 	} {
+		this.assertWriteInvariants();
 		this.assertSchemaCompatibleForWrite();
 		// Stamped here rather than at each construction site so that deltas,
 		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
@@ -842,6 +964,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		});
 		this.storage.setRecoveryMeta!(META_TIP_SEQUENCE, frame.sequence.toString());
 		this.storage.setRecoveryMeta!(META_TIP_HASH, frameHash.toString('hex'));
+		this.lastWrittenTip = {
+			sequence: frame.sequence,
+			hashHex: frameHash.toString('hex')
+		};
 		// The floor rides the SAME transaction as the frame that raises it, so
 		// a chain can never contain a durable quorum frame without the record
 		// that forbids a later downgrade.
@@ -1411,11 +1537,15 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 		...JOURNAL_META_RESIDUE_KEYS,
 		'writer_lease_v1',
 		'restore_pending_acquisition_v1',
+		'guardian_replicated_through',
+		'guardian_pending_registration_v1',
 		'startup_repair_tail'
 	];
 	for (const key of residueKeys) {
-		const value = target.getRecoveryMeta?.(key);
-		if (value != null && value !== '') {
+		// PRESENCE is residue: an explicitly stored empty value (a corrupt
+		// or cleared-but-not-deleted record) still belongs to the previous
+		// life and must not survive into the restored one.
+		if (target.getRecoveryMeta?.(key) != null) {
 			throw new Error(
 				`Recovery restore requires a target with no recovery metadata ` +
 					`('${key}' is set)`

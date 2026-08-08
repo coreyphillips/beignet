@@ -145,6 +145,7 @@ export class RecoveryManager {
 				}
 			});
 		} catch (error) {
+			this.options.journal?.onCommitRollback?.();
 			this.options.onError?.(error as Error, {
 				criticality: transition.criticality,
 				reportedByCaller: transition.reportedByCaller === true

@@ -79,24 +79,45 @@ export interface ICapsuleRestoreOptions {
 	 * candidate's reconstruction before the real target is written (see
 	 * CapsuleReplayError). Supply an in-memory backend (e.g.
 	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
-	 * the recovery core stays free of a concrete backend dependency;
-	 * WITHOUT it no dry-run runs, and a content-defective capsule then
-	 * fails the install loudly (rolled back, error propagated) instead of
-	 * degrading to a lower tier.
+	 * the recovery core stays free of a concrete backend dependency.
+	 * OPTIONAL for the single-capsule restore (a throw is a throw there);
+	 * REQUIRED by restoreBestRecoveryCapsule whenever the target supports
+	 * Tier 2, because its candidate/Tier-1 fallback contract depends on
+	 * classifying content defects, and without a dry-run a replay failure
+	 * on the real target cannot be told apart from a broken database.
 	 */
 	scratchStorage?: () => IStorageBackend;
 }
 
-/** Dry-run the candidate's replay on a scratch backend (see options). */
+/**
+ * Dry-run the candidate's replay on a scratch backend (see options).
+ *
+ * The scratch is PROBED first with a trivial transaction and metadata
+ * round-trip: a generic backend exception cannot prove whether the capsule
+ * content or the validator's own storage failed, so a scratch that cannot
+ * even pass the probe propagates its failure RAW (validator infrastructure
+ * broken) instead of laundering it into a candidate defect. Only a
+ * failure of the candidate replay on a probed-healthy scratch is typed as
+ * CapsuleReplayError.
+ */
 function assertReplaysOnScratch(
 	frames: VerifiedRecoveryChain,
 	scratchStorage: () => IStorageBackend
 ): void {
 	const scratch = scratchStorage();
 	try {
-		reconstructFromFrames(scratch, frames);
-	} catch (err) {
-		throw new CapsuleReplayError(err);
+		scratch.transaction(() => {
+			scratch.setRecoveryMeta!('capsule_scratch_probe', '1');
+		});
+		if (scratch.getRecoveryMeta!('capsule_scratch_probe') !== '1') {
+			throw new Error('capsule scratch backend failed its probe round-trip');
+		}
+		scratch.deleteRecoveryMeta?.('capsule_scratch_probe');
+		try {
+			reconstructFromFrames(scratch, frames);
+		} catch (err) {
+			throw new CapsuleReplayError(err);
+		}
 	} finally {
 		(scratch as { close?: () => void }).close?.();
 	}
@@ -584,10 +605,17 @@ export function restoreFromRecoveryCapsule(
 	// CapsuleReplayError while the target is still untouched. Refuse a
 	// target already carrying journal state: the metadata writes below
 	// would silently overwrite another journal.
-	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
+	const validated = verifyInlineJournal(capsule, nodeSecret);
 	if (options.scratchStorage) {
-		assertReplaysOnScratch(frames, options.scratchStorage);
+		assertReplaysOnScratch(validated.frames, options.scratchStorage);
 	}
+	// The dry-run handed the decoded frames to FOREIGN code (the scratch
+	// backend); a hostile or buggy adapter mutating a Buffer argument must
+	// not alter what the target replays, so the install re-decodes a fresh
+	// frame graph from the authenticated rows.
+	const { encoded, rows, frames } = options.scratchStorage
+		? verifyInlineJournal(capsule, nodeSecret)
+		: validated;
 	assertNoJournalResidue(target);
 
 	// ONE shared transaction for the frames, the metadata AND the replay:
@@ -683,6 +711,17 @@ export function restoreBestRecoveryCapsule(
 	// recovery journal residue (stored frames, journal metadata): the
 	// install writes both.
 	if (journalSupported(target)) {
+		// The candidate/Tier-1 fallback CONTRACT depends on classifying
+		// content defects, and only the dry-run can do that: without a
+		// scratch, a replay failure on the real target is indistinguishable
+		// from a broken database, so selection refuses to run rather than
+		// choose between aborting on bad content and masking bad disks.
+		if (!options.scratchStorage) {
+			throw new Error(
+				'restoreBestRecoveryCapsule requires options.scratchStorage ' +
+					'when the target supports Tier 2 restoration'
+			);
+		}
 		assertEmptyTarget(target);
 		assertNoJournalResidue(target);
 	}

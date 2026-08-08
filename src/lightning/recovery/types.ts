@@ -357,4 +357,11 @@ export interface IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint;
+	/**
+	 * Called when the commit's transaction ROLLED BACK after appendFrame
+	 * ran: any in-memory record of "the tip this run last wrote" must be
+	 * dropped, because that write no longer exists on disk and the next
+	 * commit would otherwise be refused as tampering.
+	 */
+	onCommitRollback?(): void;
 }
