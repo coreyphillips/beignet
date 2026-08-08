@@ -113,6 +113,14 @@ export class Peer extends EventEmitter {
 	private heldMessages: Array<{ type: number; payload: Buffer }> | null = null;
 	/** True while releaseHeldMessages() is mid-drain (reentrancy guard). */
 	private drainingHeld = false;
+	/**
+	 * The lifecycle's terminal release outcome, STICKY until the next
+	 * establishment re-arms: releaseHeldMessages() is public, so an
+	 * observer may drain (and fail) before the manager's own call, and the
+	 * manager must still see the causal result rather than a fresh
+	 * 'released' from an already-cleared queue.
+	 */
+	private heldReleaseOutcome: 'released' | 'aborted' | 'failed' | null = null;
 	/** The configured hold behavior, re-armed on every establishment. */
 	private readonly holdOnEstablish: boolean = false;
 	private socket: IDuplexTransport | null = null;
@@ -180,6 +188,7 @@ export class Peer extends EventEmitter {
 	private rearmHeldMessages(): void {
 		this.heldMessages = this.holdOnEstablish ? [] : null;
 		this.drainingHeld = false;
+		this.heldReleaseOutcome = null;
 	}
 
 	async connect(): Promise<void> {
@@ -721,14 +730,26 @@ export class Peer extends EventEmitter {
 	 * The returned outcome is the CAUSAL record the caller cannot infer
 	 * from state alone: 'released' means every held frame was delivered
 	 * (or none were held), 'aborted' means a delivered frame's handler
-	 * ended the connection without an error, and 'failed' means a handler
-	 * threw and the connection was torn down over it. Registry identity
-	 * cannot stand in for this: an error observer's cleanup disconnect
-	 * looks exactly like a deliberate cancellation from the outside.
+	 * ended the connection without an error, 'failed' means a handler
+	 * threw and the connection was torn down over it, and 'pending' means
+	 * the call was reentrant while the owning drain was still deciding.
+	 * Registry identity cannot stand in for any of this: an error
+	 * observer's cleanup disconnect looks exactly like a deliberate
+	 * cancellation from the outside.
 	 */
-	releaseHeldMessages(): 'released' | 'aborted' | 'failed' {
+	releaseHeldMessages(): 'released' | 'aborted' | 'failed' | 'pending' {
+		// A reentrant call during an active drain: the owning drain has no
+		// terminal outcome yet (unless one was already recorded, e.g. the
+		// failure written before its teardown observers run), and inventing
+		// 'released' here would be a false terminal answer for a drain that
+		// may still fail.
+		if (this.drainingHeld) return this.heldReleaseOutcome ?? 'pending';
 		const held = this.heldMessages;
-		if (!held || this.drainingHeld) return 'released';
+		// An already-cleared queue answers with the lifecycle's STICKY
+		// outcome: an earlier caller may have drained and failed, and that
+		// result must not be laundered into a fresh 'released' for whoever
+		// asks next.
+		if (!held) return this.heldReleaseOutcome ?? 'released';
 		// Reentrancy guard: a recursive release (an observer calling back
 		// into the manager) must not start a second cursor and interleave.
 		this.drainingHeld = true;
@@ -743,6 +764,7 @@ export class Peer extends EventEmitter {
 				if (this.state !== 'ready') {
 					// Torn down mid-release: the undelivered tail dies with
 					// the connection, exactly as unread socket bytes would.
+					this.heldReleaseOutcome = 'aborted';
 					return 'aborted';
 				}
 				const next = held[cursor++];
@@ -753,7 +775,10 @@ export class Peer extends EventEmitter {
 					// observer runs, so a reentrant or throwing error
 					// listener can neither deliver past the gap nor bypass
 					// the teardown. Delivering later frames after a missing
-					// predecessor would hand the state machines a hole.
+					// predecessor would hand the state machines a hole. The
+					// outcome is recorded FIRST so even a reentrant query
+					// from inside the teardown observers sees the failure.
+					this.heldReleaseOutcome = 'failed';
 					this.heldMessages = null;
 					try {
 						this.disconnect();
@@ -771,6 +796,7 @@ export class Peer extends EventEmitter {
 					return 'failed';
 				}
 			}
+			this.heldReleaseOutcome = 'released';
 			return 'released';
 		} finally {
 			this.drainingHeld = false;

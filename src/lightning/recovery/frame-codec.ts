@@ -434,6 +434,18 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 }
 
 function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
+	// Only a truly ABSENT property means pre-versioning. A declaration that
+	// is present but null, non-string or empty is not a legacy shape, it is
+	// malformed or evasive (a way to smuggle an unknown snapshot shape past
+	// the schema gate); refuse the frame outright.
+	if (
+		'schemaVersion' in encoded &&
+		(typeof encoded.schemaVersion !== 'string' || encoded.schemaVersion === '')
+	) {
+		throw new Error(
+			'Recovery snapshot schemaVersion, when present, must be a nonempty string'
+		);
+	}
 	return {
 		...(encoded.schemaVersion !== undefined
 			? { schemaVersion: encoded.schemaVersion }

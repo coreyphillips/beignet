@@ -213,7 +213,7 @@ export function deriveFrameKey(
 }
 
 /** AAD binding a frame to its node, epoch, position and predecessor. */
-function frameAad(
+export function frameAad(
 	nodeId: Buffer,
 	writerEpoch: bigint,
 	sequence: bigint,
@@ -549,18 +549,6 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint {
-		// The WRITE BOUNDARY enforces schema compatibility, not just the
-		// node's optional startup probe: RecoveryJournal is public API, and
-		// a direct commit over an unmigratable marker would advance the
-		// journal and let a cadence snapshot rewrite the marker. Checked
-		// once per run; only this journal's own snapshots move the marker
-		// after that, and they write the current version.
-		if (!this.writeSchemaChecked) {
-			this.assertSnapshotSchemaMigratable(
-				this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA)
-			);
-			this.writeSchemaChecked = true;
-		}
 		const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		if (tipSequence == null) {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
@@ -696,11 +684,86 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		return epoch == null ? 1n : BigInt(epoch);
 	}
 
+	/**
+	 * ONE-SHOT compatibility gate at the TRUE write boundary: every delta,
+	 * bootstrap snapshot, per-run re-base, interval snapshot, schema-repair
+	 * snapshot and replication re-base funnels through writeFrame, so this
+	 * is the one place a rewrite of the journal can be refused before it
+	 * begins. Two independent sources must both agree:
+	 *
+	 * 1. The LOCAL marker (fast, but unauthenticated recovery_meta: with it
+	 *    removed, a future journal would read as migratable legacy).
+	 * 2. The AUTHENTICATED retained base: the newest decodable snapshot
+	 *    among the stored frames declares, under the frame AEAD, which
+	 *    schema actually wrote this journal. Re-basing over a future base
+	 *    and compacting it away would destroy state this release cannot
+	 *    even read completely.
+	 *
+	 * Frames this run writes afterwards are current-schema by construction,
+	 * so one check per run suffices.
+	 */
+	private assertSchemaCompatibleForWrite(): void {
+		if (this.writeSchemaChecked) return;
+		this.assertSnapshotSchemaMigratable(
+			this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA)
+		);
+		const rows = this.storage.loadRecoveryFrames!(0);
+		let sawSnapshot = rows.length === 0;
+		for (let i = rows.length - 1; i >= 0 && !sawSnapshot; i--) {
+			const row = rows[i];
+			let frame: RecoveryFrame;
+			try {
+				const writerEpoch = BigInt(row.writerEpoch);
+				const key = deriveFrameKey(this.masterKey, this.nodeId, writerEpoch);
+				const aad = frameAad(
+					this.nodeId,
+					writerEpoch,
+					BigInt(row.sequence),
+					row.previousFrameHash
+				);
+				frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+			} catch {
+				// FAIL CLOSED on any stored row this release cannot read: an
+				// AEAD-valid frame whose shape decodeFrame rejects is
+				// exactly what a future release's tail looks like, and
+				// skipping it in favor of an older readable snapshot would
+				// let the next re-base compact the future frames away. A
+				// frame that fails the AEAD is corruption, which is no
+				// sounder a base for a rewrite.
+				throw new Error(
+					`recovery: stored frame ${row.sequence} cannot be read by ` +
+						`this release; refusing to rewrite the journal`
+				);
+			}
+			if (!frame.snapshot) continue;
+			sawSnapshot = true;
+			const declared = frame.snapshot.schemaVersion;
+			if (!snapshotSchemaKnown(declared)) {
+				throw new Error(
+					`recovery: the journal's retained base snapshot declares ` +
+						`schema '${declared}', which is not one this release can ` +
+						`migrate; refusing to rewrite the journal`
+				);
+			}
+		}
+		if (!sawSnapshot) {
+			// Frames exist but none of them is a snapshot: the base
+			// invariant (first retained frame IS the base snapshot) is
+			// broken, so nothing sound can be built on top.
+			throw new Error(
+				'recovery: no base snapshot among the stored frames; ' +
+					'refusing to rewrite the journal'
+			);
+		}
+		this.writeSchemaChecked = true;
+	}
+
 	/** Encode, hash, encrypt and store one frame; advance the tip. */
 	private writeFrame(frame: RecoveryFrame): {
 		frameHash: Buffer;
 		plaintextBytes: number;
 	} {
+		this.assertSchemaCompatibleForWrite();
 		// Stamped here rather than at each construction site so that deltas,
 		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
 		// all carry the same declaration; a snapshot that omitted it would be a
@@ -1122,6 +1185,60 @@ export function verifyFrameChain(
 }
 
 /**
+ * Assert that a decoded frame set's base snapshot (the NEWEST snapshot, the
+ * one a reconstruction builds from) may be restored by THIS release. Unlike
+ * the write boundary's migration rule, restoration is STRICT: only the
+ * exact current schema passes.
+ *
+ * - A FUTURE schema would deserialize with this release's shape and
+ *   silently drop whatever that shape added.
+ * - A LEGACY snapshot (absent or pre-2 declaration) is refused too, and
+ *   deliberately so, even though a LOCAL journal of the same vintage is
+ *   migratable: local migration is safe because the original
+ *   channel_key_indices TABLE still holds deleted channels' burned
+ *   high-water marks and the repair re-snapshots them. A remote snapshot
+ *   from that era has already OMITTED those rows; rebuilding from it and
+ *   then stamping the result current would launder the gap into a schema-2
+ *   journal and permit key-index reuse. There is nothing to migrate FROM,
+ *   so the only safe disposition is refusal (the SCB tier remains the
+ *   fallback).
+ *
+ * Shared by reconstructFromFrames and the capsule's candidate
+ * prevalidation, so an incompatible capsule is rejected BEFORE anything
+ * touches the restore target.
+ */
+export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
+	let snapshot: RecoveryFrame['snapshot'];
+	for (let i = frames.length - 1; i >= 0; i--) {
+		if (frames[i].snapshot) {
+			snapshot = frames[i].snapshot;
+			break;
+		}
+	}
+	// No snapshot at all: reconstructFromFrames has its own refusal for
+	// that shape, and a capsule chain without one fails the base binding.
+	if (!snapshot) return;
+	const declared = snapshot.schemaVersion;
+	if (declared === SNAPSHOT_SCHEMA_VERSION) return;
+	if (
+		declared == null ||
+		declared === '' ||
+		MIGRATABLE_SNAPSHOT_SCHEMAS.has(declared)
+	) {
+		throw new Error(
+			`recovery: the base snapshot predates schema ` +
+				`${SNAPSHOT_SCHEMA_VERSION}: snapshots from that era omit deleted ` +
+				`channels' burned key indices, and rebuilding from one could ` +
+				`reuse a deleted channel's keys; refusing to reconstruct`
+		);
+	}
+	throw new Error(
+		`recovery: the base snapshot declares schema '${declared}', ` +
+			`which this release cannot restore; refusing to reconstruct`
+	);
+}
+
+/**
  * Rebuild every safety-critical table from a verified frame sequence
  * (spec 5.3, deterministic reconstruction).
  *
@@ -1155,18 +1272,11 @@ export function reconstructFromFrames(
 			'Recovery reconstruction requires an authenticated base snapshot'
 		);
 	}
-	// The snapshot's AUTHENTICATED schema declaration gates the restore:
-	// applySnapshot deserializes with THIS release's shape, so replaying a
-	// future release's snapshot would silently drop whatever that shape
-	// added. The local marker cannot stand in for this check because it
-	// does not survive the loss of the device.
+	// The snapshot's AUTHENTICATED schema declaration gates the restore;
+	// the local marker cannot stand in for it because it does not survive
+	// the loss of the device.
+	assertFramesReconstructable(frames);
 	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
-	if (!snapshotSchemaKnown(snapshotSchema)) {
-		throw new Error(
-			`recovery: the base snapshot declares schema '${snapshotSchema}', ` +
-				`which this release cannot restore; refusing to reconstruct`
-		);
-	}
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.
@@ -1209,7 +1319,7 @@ export function reconstructFromFrames(
 }
 
 /** Throw when the reconstruction target already holds journaled state. */
-function assertEmptyTarget(target: IStorageBackend): void {
+export function assertEmptyTarget(target: IStorageBackend): void {
 	const dirty =
 		target.loadAllChannels().length > 0 ||
 		target.loadAllChainMonitors().length > 0 ||

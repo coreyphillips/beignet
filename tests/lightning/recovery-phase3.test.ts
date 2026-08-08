@@ -39,7 +39,15 @@ import {
 	restoreBestRecoveryCapsule,
 	selectRecoveryCapsule,
 	deriveRecoveryMasterKey,
-	deriveRecoveryRoot
+	deriveRecoveryRoot,
+	deriveFrameIv,
+	deriveFrameKey,
+	decodeFrame,
+	decryptFrame,
+	encodeFrame,
+	encryptFrame,
+	frameAad,
+	hashFrame
 } from '../../src/lightning/recovery';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodePeerStorageMessage } from '../../src/lightning/message/peer-storage';
@@ -1075,5 +1083,189 @@ describe('Recovery phase 3: review regressions', () => {
 		expect(dumpTables(target)).to.equal(dumpTables(storage));
 		storage.close();
 		target.close();
+	});
+});
+
+describe('Recovery phase 3: capsule schema prevalidation', () => {
+	it('rejects a future-schema capsule BEFORE writing the target and falls back to Tier 1', () => {
+		// A single-frame journal whose base snapshot is rewritten, with a
+		// valid AEAD seal and matching tip hash, to declare schema '3':
+		// what a capsule composed by a future release looks like.
+		const { storage } = journaledStorage(1);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const masterKey = deriveRecoveryMasterKey(NODE_SECRET);
+		const nodeId = getPublicKey(NODE_SECRET);
+		const key = deriveFrameKey(masterKey, nodeId, epoch);
+		const aad = frameAad(
+			nodeId,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.schemaVersion = '3';
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// Direct restore: the schema refusal lands during candidate
+		// validation, BEFORE the first write to the target.
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const target1 = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET)
+		).to.throw(/cannot restore/);
+		expect(
+			target1.loadRecoveryFrames!(0),
+			'no frames written to the target'
+		).to.have.length(0);
+		expect(
+			target1.getRecoveryMeta!('journal_tip_sequence') ?? null,
+			'no journal metadata written either'
+		).to.equal(null);
+		target1.close();
+
+		// Selection: the incompatible inline journal is a CANDIDATE defect,
+		// so the valid Tier 1 SCB is still returned and the target stays
+		// clean, instead of an exception over a half-written database.
+		const target2 = openStorage();
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET);
+		expect(best.tier, 'the SCB tier survives').to.equal(1);
+		expect(best.framesApplied).to.equal(0);
+		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
+		target2.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: capsule replay failures roll back', () => {
+	it('a replay-invalid capsule leaves the target untouched and falls back to Tier 1', () => {
+		// An AUTHENTICATED, current-schema capsule whose snapshot content
+		// cannot actually replay (an outbox row with a null peerId hits the
+		// NOT NULL constraint): chain verification cannot see this, so the
+		// install transaction must roll the frames and metadata back and
+		// selection must degrade to the valid Tier 1 SCB.
+		const { storage } = journaledStorage(1);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const masterKey = deriveRecoveryMasterKey(NODE_SECRET);
+		const nodeId = getPublicKey(NODE_SECRET);
+		const key = deriveFrameKey(masterKey, nodeId, epoch);
+		const aad = frameAad(
+			nodeId,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.outbox = [
+			{
+				peerId: null as unknown as string,
+				channelId: undefined,
+				messageType: 1,
+				wireMessage: Buffer.alloc(2),
+				disposition: 'pending_send',
+				frameSequence: null
+			}
+		];
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// Direct restore: the throw leaves the target EXACTLY as it was,
+		// because frames, metadata and replay share one transaction.
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const target1 = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET)
+		).to.throw();
+		expect(
+			target1.loadRecoveryFrames!(0),
+			'the install transaction rolled back the frames'
+		).to.have.length(0);
+		expect(
+			target1.getRecoveryMeta!('journal_tip_sequence') ?? null,
+			'and the metadata'
+		).to.equal(null);
+		target1.close();
+
+		// Selection: a candidate defect, so the Tier 1 SCB still restores.
+		const target2 = openStorage();
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET);
+		expect(best.tier, 'Tier 1 fallback survives').to.equal(1);
+		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
+		target2.close();
+		storage.close();
+	});
+
+	it('a dirty target is refused loudly before any candidate is tried', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const dirty = openStorage();
+		dirty.savePreimage('bb'.repeat(32), Buffer.alloc(32, 7));
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], dirty, NODE_SECRET)
+		).to.throw(/EMPTY target/);
+		dirty.close();
+		storage.close();
 	});
 });

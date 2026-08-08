@@ -35,6 +35,7 @@ import {
 	deriveFrameKey,
 	encryptFrame,
 	decryptFrame,
+	frameAad,
 	journalSupported,
 	reconstructFromFrames,
 	encodeFrame,
@@ -1286,6 +1287,192 @@ describe('Recovery phase 2: wiring and defaults', () => {
 			outboundMessages: []
 		});
 		expect(journal.getTip()).to.equal(null);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: authenticated snapshot schema at the write boundary', () => {
+	/**
+	 * Rewrite the single bootstrap frame's snapshot schema IN PLACE with a
+	 * valid AEAD seal and a matching tip hash: exactly what a journal
+	 * written by a future release looks like on disk.
+	 */
+	function tamperBaseSchema(storage: SqliteStorage, schema: string): void {
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, epoch);
+		const aad = frameAad(
+			NODE_ID,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.schemaVersion = schema;
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			RECOVERY_ID,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+	}
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	it('refuses to rewrite a journal whose AUTHENTICATED base is future-schema, even with the local marker gone', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		tamperBaseSchema(storage, '3');
+		// The unauthenticated local marker is REMOVED: metadata alone now
+		// reads as migratable legacy. The frames say otherwise.
+		storage.setRecoveryMeta!('journal_snapshot_schema', '');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { manager: fresh } = makeJournaledManager(storage);
+		const result = commitPreimage(fresh, 2);
+		expect(result.committed, 'the rewrite is refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/retained base snapshot declares schema '3'/
+		);
+		// Nothing was re-based or compacted: the future base survives.
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		const base = storage.loadRecoveryFrames!(0)[0];
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, BigInt(base.writerEpoch));
+		const aad = frameAad(
+			NODE_ID,
+			BigInt(base.writerEpoch),
+			BigInt(base.sequence),
+			base.previousFrameHash
+		);
+		const decoded = decodeFrame(decryptFrame(key, base.ciphertext, aad));
+		expect(decoded.snapshot!.schemaVersion).to.equal('3');
+		storage.close();
+	});
+
+	it('refuses to rewrite over an AEAD-valid frame this release cannot decode', () => {
+		// A future release's tail frame decrypts (same keys) but its shape
+		// is unknown to this decoder. Skipping it in favor of an older
+		// readable snapshot would let the next re-base compact the future
+		// frames away; the write boundary must fail closed instead.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 5).committed).to.equal(true);
+		const base = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(base.writerEpoch);
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, epoch);
+		// An AEAD-valid frame at sequence 2 whose plaintext this release's
+		// decodeFrame refuses (unsupported frame version).
+		const plaintext = Buffer.from(
+			JSON.stringify({ version: 2, shape: 'from the future' }),
+			'utf8'
+		);
+		const frameHash = hashFrame(plaintext);
+		const aad = frameAad(NODE_ID, epoch, 2n, base.frameHash);
+		const iv = deriveFrameIv(RECOVERY_ID, epoch, 2n, frameHash);
+		storage.saveRecoveryFrame!({
+			sequence: 2,
+			writerEpoch: base.writerEpoch,
+			frameHash,
+			previousFrameHash: base.frameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: base.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_sequence', '2');
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+		storage.setRecoveryMeta!('journal_snapshot_schema', '');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { manager: fresh } = makeJournaledManager(storage);
+		const result = commitPreimage(fresh, 6);
+		expect(result.committed, 'the rewrite is refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/frame 2 cannot be read by this release/
+		);
+		// The future frame survives untouched.
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		const kept = storage.loadRecoveryFrames!(0).find((r) => r.sequence === 2);
+		expect(kept, 'the undecodable frame is still stored').to.not.equal(
+			undefined
+		);
+		expect(kept!.frameHash.equals(frameHash)).to.equal(true);
+		storage.close();
+	});
+
+	it('prepareForReplication hits the same wall as any other write', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 3).committed).to.equal(true);
+		storage.setRecoveryMeta!('journal_snapshot_schema', '3');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { journal: fresh } = makeJournaledManager(storage);
+		expect(() => fresh.prepareForReplication()).to.throw(
+			/not one this release can migrate/
+		);
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		storage.close();
+	});
+
+	it('refuses a present-but-null or empty schema declaration outright', () => {
+		// Only a truly ABSENT property means pre-versioning: an explicit
+		// null or empty declaration is an evasive shape that could smuggle
+		// unknown snapshot content past the schema gate.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 4).committed).to.equal(true);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, BigInt(row.writerEpoch));
+		const aad = frameAad(
+			NODE_ID,
+			BigInt(row.writerEpoch),
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const plaintext = decryptFrame(key, row.ciphertext, aad);
+		for (const bad of [null, '']) {
+			const parsed = JSON.parse(plaintext.toString('utf8')) as {
+				snapshot: { schemaVersion?: unknown };
+			};
+			parsed.snapshot.schemaVersion = bad;
+			expect(
+				() => decodeFrame(Buffer.from(JSON.stringify(parsed), 'utf8')),
+				`declaration ${JSON.stringify(bad)}`
+			).to.throw(/nonempty string/);
+		}
 		storage.close();
 	});
 });

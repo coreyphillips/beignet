@@ -247,6 +247,90 @@ describe('Peer held post-handshake delivery', function () {
 			expect(rejection, 'the dial rejected').to.be.instanceOf(Error);
 			expect(String(rejection)).to.contain('held-message delivery');
 			expect(pmA.peers.size, 'rejected dial leaves no peer').to.equal(0);
+			expect(
+				(pmA as unknown as { reconnectTimers: Map<string, unknown> })
+					.reconnectTimers.size,
+				'a genuine failure still schedules the auto-reconnect retry'
+			).to.equal(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('the release outcome is STICKY for the lifecycle', function () {
+		// releaseHeldMessages() is public: an observer may drain (and fail)
+		// before the manager's own call, and the manager must still see the
+		// causal result instead of a fresh 'released' from a cleared queue.
+		const peer = bareHeldPeer();
+		peer.on('error', () => {});
+		peer.on('message', () => {
+			throw new Error('handler exploded');
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		expect(peer.releaseHeldMessages()).to.equal('failed');
+		expect(
+			peer.releaseHeldMessages(),
+			'a later caller sees the same failure'
+		).to.equal('failed');
+	});
+
+	it('an observer draining (and failing) before the manager still fails the dial', async function () {
+		// A peer:connect observer calls the PUBLIC releaseHeldMessages
+		// itself; the drain fails and the peer:error cleanup unregisters
+		// the peer. The manager's own release call must see the sticky
+		// failure: without it, the dial resolves with zero peers.
+		const a = new LightningNode(makeNodeConfig(25));
+		const b = new LightningNode(makeNodeConfig(26));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		a.on('peer:error', (pubkey: string) => {
+			a.disconnectPeer(pubkey);
+		});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						on(e: string, l: (...args: unknown[]) => void): void;
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+						getPeer(pk: string): Peer | undefined;
+					};
+				}
+			).peerManager;
+			pmA.on('peer:connect', (pubkey: unknown) => {
+				const peer = pmA.getPeer(pubkey as string);
+				(
+					peer as unknown as {
+						heldMessages: Array<{ type: number; payload: Buffer }>;
+					}
+				).heldMessages.push({
+					type: 50_001,
+					payload: Buffer.alloc(1)
+				});
+				// The observer's own early drain: it fails right here.
+				peer?.releaseHeldMessages();
+			});
+			pmA.on('message', () => {
+				throw new Error('held handler exploded');
+			});
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			let rejection: Error | null = null;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(rejection, 'the dial still rejected').to.be.instanceOf(Error);
+			expect(String(rejection)).to.contain('held-message delivery');
+			expect(pmA.peers.size, 'no phantom registration').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the explicit cleanup disconnect was not resurrected'
+			).to.equal(0);
 		} finally {
 			a.destroy();
 			b.destroy();
@@ -273,6 +357,7 @@ describe('Peer held post-handshake delivery', function () {
 					peerManager: {
 						on(e: string, l: (...args: unknown[]) => void): void;
 						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
 						getPeer(pk: string): Peer | undefined;
 					};
 				}
@@ -307,6 +392,10 @@ describe('Peer held post-handshake delivery', function () {
 			).to.be.instanceOf(Error);
 			expect(String(rejection)).to.contain('held-message delivery');
 			expect(pmA.peers.size, 'no phantom registration').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the failure did not resurrect the explicitly cancelled peer'
+			).to.equal(0);
 		} finally {
 			a.destroy();
 			b.destroy();
@@ -354,6 +443,118 @@ describe('Peer held post-handshake delivery', function () {
 		} finally {
 			a.destroy();
 			b.destroy();
+		}
+	});
+
+	it('a reentrant release reports pending, never a false terminal outcome', function () {
+		// A recursive call during an active drain has no terminal outcome
+		// to report yet: answering 'released' while the outer drain later
+		// fails would hand the reentrant caller a false success.
+		const peer = bareHeldPeer();
+		peer.on('error', () => {});
+		const reentrant: string[] = [];
+		let first = true;
+		peer.on('message', () => {
+			if (first) {
+				first = false;
+				reentrant.push(peer.releaseHeldMessages());
+				return;
+			}
+			throw new Error('second handler exploded');
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
+		expect(peer.releaseHeldMessages()).to.equal('failed');
+		expect(reentrant, 'the reentrant call saw pending').to.deep.equal([
+			'pending'
+		]);
+		expect(peer.releaseHeldMessages(), 'sticky afterwards').to.equal('failed');
+	});
+
+	it('an explicit disconnectPeer DURING a pending dial wins over registration', async function () {
+		// The cancellation lands after the handshake completed but before
+		// the manager registers the connection: the dial must not
+		// resurrect the peer the caller just removed, and must reject
+		// without scheduling the auto-reconnect that was just cancelled.
+		const a = new LightningNode(makeNodeConfig(27));
+		const b = new LightningNode(makeNodeConfig(28));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		const realConnect = Peer.prototype.connect;
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			Peer.prototype.connect = async function (this: Peer): Promise<void> {
+				await realConnect.apply(this);
+				a.disconnectPeer(b.getNodeId());
+			};
+			let rejection: Error | null = null;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(rejection, 'the dial rejected').to.be.instanceOf(Error);
+			expect(String(rejection)).to.contain('cancelled while establishing');
+			expect(pmA.peers.size, 'nothing was registered').to.equal(0);
+			expect(pmA.reconnectTimers.size, 'and nothing was rescheduled').to.equal(
+				0
+			);
+		} finally {
+			Peer.prototype.connect = realConnect;
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a reconnect round cancelled mid-round neither redials nor reschedules', async function () {
+		// disconnectPeer clears the PENDING timer, but a round already past
+		// that point keeps running: it must check the cancellation before
+		// trying another address and before rescheduling itself.
+		const a = new LightningNode(makeNodeConfig(29));
+		a.on('node:error', () => {});
+		try {
+			const pubkey = getPublicKey(makeSeed(999)).toString('hex');
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peerAddresses: Map<string, { host: string; port: number }>;
+						reconnectDelays: Map<string, number>;
+						reconnectTimers: Map<string, unknown>;
+						dialPeer: (...args: unknown[]) => Promise<void>;
+						scheduleReconnect(pk: string): void;
+					};
+				}
+			).peerManager;
+			pmA.peerAddresses.set(pubkey, { host: '127.0.0.1', port: 1 });
+			pmA.reconnectDelays.set(pubkey, 80);
+			let dialCount = 0;
+			pmA.dialPeer = async (): Promise<void> => {
+				dialCount++;
+				// The explicit cancellation lands while the round is mid-dial.
+				a.disconnectPeer(pubkey);
+				throw new Error('dial failed');
+			};
+			pmA.scheduleReconnect(pubkey);
+			expect(pmA.reconnectTimers.size).to.equal(1);
+			await new Promise((resolve) => setTimeout(resolve, 500));
+			expect(dialCount, 'exactly one dial ran').to.equal(1);
+			expect(
+				pmA.reconnectTimers.size,
+				'the cancelled round did not reschedule itself'
+			).to.equal(0);
+		} finally {
+			a.destroy();
 		}
 	});
 

@@ -1545,6 +1545,31 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		).to.throw(/cannot restore/);
 		expect(rebuilt2.loadAllChannels()).to.have.length(0);
 		rebuilt2.close();
+
+		// And a LEGACY snapshot (no declaration) refuses too: snapshots
+		// from that era omitted deleted channels' burned key indices, so
+		// rebuilding from one and then stamping it current would launder
+		// the gap into a schema-2 journal and permit key-index reuse.
+		// Local journals of the same vintage stay migratable because their
+		// TABLE still holds the rows; a remote snapshot has already lost
+		// them, so there is nothing to migrate from.
+		const legacy = (
+			frames as Array<{ snapshot?: { schemaVersion?: string } }>
+		).map((f) => {
+			if (!f.snapshot) return f;
+			const { schemaVersion: _dropped, ...rest } = f.snapshot;
+			return { ...f, snapshot: rest };
+		});
+		const rebuilt3 = new SqliteStorage(':memory:');
+		rebuilt3.open();
+		expect(() =>
+			reconstructFromFrames(
+				rebuilt3,
+				legacy as Parameters<typeof reconstructFromFrames>[1]
+			)
+		).to.throw(/burned key indices/);
+		expect(rebuilt3.loadAllChannels()).to.have.length(0);
+		rebuilt3.close();
 		s1.close();
 	});
 

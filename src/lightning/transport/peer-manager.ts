@@ -157,6 +157,15 @@ export class PeerManager extends EventEmitter {
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
 	private reconnectDelays: Map<string, number> = new Map();
+	/**
+	 * Bumped by every explicit disconnectPeer(). A dial snapshots it before
+	 * starting; a failure only schedules auto-reconnect when the generation
+	 * is unchanged, so a deliberate cancellation issued DURING the dial
+	 * (e.g. by a synchronous peer:error observer cleaning up after a failed
+	 * held delivery) is never resurrected by the dial's own error handling,
+	 * while the dial itself still rejects honestly.
+	 */
+	private cancelGenerations: Map<string, number> = new Map();
 	// Per-peer timers that reset the backoff once a connection has stayed up for
 	// STABLE_CONNECTION_MS. Cleared if the peer disconnects before then.
 	private stabilityTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -202,10 +211,18 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		try {
 			await this.dialPeer(pubkey, host, port, transport);
 		} catch (err) {
-			if (this.autoReconnect) {
+			// An explicit disconnectPeer() during the dial (a peer:error
+			// observer's cleanup, an operator decision) already cancelled
+			// this peer's reconnect state; re-arming it here would reverse
+			// that. The rejection itself still propagates.
+			if (
+				this.autoReconnect &&
+				(this.cancelGenerations.get(pubkey) ?? 0) === cancelGeneration
+			) {
 				this.scheduleReconnect(pubkey);
 			}
 			throw err;
@@ -223,6 +240,7 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		if (this.connectionsDisabled()) {
 			throw new Error(
 				`Connections are ${this.connectionsDisabledReason()}; refusing dial to peer ${pubkey}`
@@ -317,6 +335,17 @@ export class PeerManager extends EventEmitter {
 			peer.disconnect();
 			throw new Error(
 				`Connection to peer ${pubkey} was invalidated while establishing`
+			);
+		}
+		// An explicit disconnectPeer() issued while the handshake was in
+		// flight wins over registration too: cancellation covers the WHOLE
+		// dial lifecycle, not just the failure path, or a pending dial
+		// would resurrect the very peer the caller just removed.
+		if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			throw new Error(
+				`Connection to peer ${pubkey} was cancelled while establishing`
 			);
 		}
 		// The peer may have dialed US while our handshake was in flight. Apply
@@ -441,6 +470,10 @@ export class PeerManager extends EventEmitter {
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
+		this.cancelGenerations.set(
+			pubkey,
+			(this.cancelGenerations.get(pubkey) ?? 0) + 1
+		);
 		const timer = this.reconnectTimers.get(pubkey);
 		if (timer) {
 			clearTimeout(timer);
@@ -1113,9 +1146,18 @@ export class PeerManager extends EventEmitter {
 			this.reconnectTimers.delete(pubkey);
 			// The peer may have re-dialed us while we waited (common over Tor).
 			if (this.peers.has(pubkey)) return;
+			// An explicit disconnectPeer() clears the PENDING timer, but this
+			// round may already be past that point mid-dial when the
+			// cancellation lands: check the generation before every further
+			// step so the round neither tries another address nor
+			// reschedules itself against a deliberate cancellation.
+			const roundGeneration = this.cancelGenerations.get(pubkey) ?? 0;
+			const cancelled = (): boolean =>
+				(this.cancelGenerations.get(pubkey) ?? 0) !== roundGeneration;
 			// Candidates are re-read at fire time so addresses learned while
 			// waiting (e.g. a fresh node_announcement) are included.
 			for (const addr of this.reconnectCandidates(pubkey)) {
+				if (cancelled()) return;
 				try {
 					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
 					return;
@@ -1123,6 +1165,7 @@ export class PeerManager extends EventEmitter {
 					// try the next candidate
 				}
 			}
+			if (cancelled()) return;
 			// Every candidate failed: next round with a larger backoff.
 			this.scheduleReconnect(pubkey);
 		}, actualDelay);

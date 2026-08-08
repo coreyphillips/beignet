@@ -39,6 +39,8 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
+	assertEmptyTarget,
+	assertFramesReconstructable,
 	deriveRecoveryMasterKey,
 	journalSupported,
 	reconstructFromFrames,
@@ -482,6 +484,13 @@ function verifyInlineJournal(
 			'recovery capsule head does not match its inline journal (stale or spliced payload)'
 		);
 	}
+	// Schema compatibility is part of CANDIDATE validation, not something
+	// discovered after the target was written: a structurally valid capsule
+	// whose base snapshot this release cannot restore must be rejected
+	// here, so restoreBestRecoveryCapsule treats it as a candidate defect
+	// (falling back to other replicas or the Tier 1 SCB) and
+	// restoreFromRecoveryCapsule throws before its first target write.
+	assertFramesReconstructable(frames);
 	return { encoded, rows, frames };
 }
 
@@ -491,10 +500,12 @@ function verifyInlineJournal(
  * Tier 2 path (inline journal present and the target supports frames): the
  * inline journal is verified COMPLETELY before anything touches the target
  * (verifyInlineJournal: the exact Phase 2 chain checks plus the capsule head
- * binding). Only then are the stored frame rows and journal metadata
- * installed and the deltas replayed through reconstructFromFrames. On ANY
- * tier 2 throw the target must be discarded; partial installs are not
- * cleaned up.
+ * binding and schema compatibility). The frame rows, the journal metadata
+ * AND the reconstruction replay then run inside ONE transaction: chain
+ * verification cannot prove the content REPLAYS (a constraint violation
+ * only surfaces when the tables are written), so a replay failure must
+ * roll the whole install back and leave the target exactly as it was,
+ * never half-populated.
  *
  * Tier 1 path (no inline state): the decoded SCB is returned for
  * recoverFromStaticChannelBackup, exactly like a plain SCB restore.
@@ -532,8 +543,10 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
+		// Inside the SAME transaction (nested transactions are savepoints):
+		// a replay defect rolls back the frames and metadata above too.
+		reconstructFromFrames(target, frames);
 	});
-	reconstructFromFrames(target, frames);
 	return { tier: 2, scb, framesApplied: frames.length };
 }
 
@@ -591,6 +604,15 @@ export function restoreBestRecoveryCapsule(
 		latestSequence: sorted[0].latestSequence
 	};
 
+	// A dirty target is refused ONCE, loudly, before any candidate is
+	// tried: with the install rolled back on failure, a per-candidate
+	// throw now reads as a candidate defect, and a pre-populated database
+	// must not be silently degraded through every candidate into a Tier 1
+	// answer.
+	if (journalSupported(target)) {
+		assertEmptyTarget(target);
+	}
+
 	for (let i = 0; i < sorted.length; ) {
 		// One group of candidates claiming the same (epoch, sequence).
 		let j = i;
@@ -626,15 +648,18 @@ export function restoreBestRecoveryCapsule(
 				} catch {
 					continue;
 				}
-				// Throws from here PROPAGATE: after a candidate validated,
-				// failures are target integrity problems (dirty database,
-				// write errors), not candidate defects, and trying another
-				// blob against a half-written target would be wrong.
-				const result = restoreFromRecoveryCapsule(
-					candidate,
-					target,
-					nodeSecret
-				);
+				// A restore failure past validation is a CANDIDATE defect
+				// too: chain verification cannot prove the content REPLAYS,
+				// and the install transaction rolls the target back to
+				// untouched on any throw, so trying the next replica (or
+				// falling through to Tier 1) is safe. A dirty target was
+				// already refused loudly before the selection loop.
+				let result: ICapsuleRestoreResult;
+				try {
+					result = restoreFromRecoveryCapsule(candidate, target, nodeSecret);
+				} catch {
+					continue;
+				}
 				return {
 					...result,
 					capsule: candidate,
