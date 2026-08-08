@@ -253,6 +253,110 @@ describe('Peer held post-handshake delivery', function () {
 		}
 	});
 
+	it('a peer:error cleanup disconnect does not turn delivery failure into success', async function () {
+		// Same deterministic held-frame failure as above, but the app's
+		// peer:error observer "cleans up" with an explicit disconnectPeer,
+		// removing the registration before the dial's ownership check. The
+		// dial must STILL reject: the causal outcome is a delivery failure,
+		// and registry identity alone cannot distinguish this cleanup from
+		// a deliberate cancellation.
+		const a = new LightningNode(makeNodeConfig(21));
+		const b = new LightningNode(makeNodeConfig(22));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		a.on('peer:error', (pubkey: string) => {
+			a.disconnectPeer(pubkey);
+		});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						on(e: string, l: (...args: unknown[]) => void): void;
+						peers: Map<string, unknown>;
+						getPeer(pk: string): Peer | undefined;
+					};
+				}
+			).peerManager;
+			pmA.on('peer:connect', (pubkey: unknown) => {
+				const peer = pmA.getPeer(pubkey as string);
+				(
+					peer as unknown as {
+						heldMessages: Array<{ type: number; payload: Buffer }>;
+					}
+				).heldMessages.push({
+					type: 50_001,
+					payload: Buffer.alloc(1)
+				});
+			});
+			pmA.on('message', () => {
+				throw new Error('held handler exploded');
+			});
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			let rejection: Error | null = null;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(
+				rejection,
+				'the dial rejected despite the cleanup'
+			).to.be.instanceOf(Error);
+			expect(String(rejection)).to.contain('held-message delivery');
+			expect(pmA.peers.size, 'no phantom registration').to.equal(0);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a throwing peer:connect observer costs neither the connection nor the dial', async function () {
+		// The public notification is not part of the required bring-up: an
+		// application observer that explodes, and even a log observer that
+		// explodes while that failure is being reported, must both be
+		// contained instead of reading as a failed bring-up and tearing
+		// down a healthy connection.
+		const a = new LightningNode(makeNodeConfig(23));
+		const b = new LightningNode(makeNodeConfig(24));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		a.on('peer:connect', () => {
+			throw new Error('app observer exploded');
+		});
+		a.on('log', (entry: { action?: string }) => {
+			if (entry?.action === 'connect_observer_failed') {
+				throw new Error('log observer exploded too');
+			}
+		});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						getPeer(pk: string): Peer | undefined;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size, 'the connection survived').to.equal(1);
+			expect(pmA.getPeer(b.getNodeId())?.getState(), 'and it is live').to.equal(
+				'ready'
+			);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
 	it('an explicit disconnectPeer from a peer:connect observer is respected', async function () {
 		// The observer deliberately drops the fresh connection. The dial
 		// must NOT read the resulting non-ready peer as a held-delivery
@@ -307,7 +411,7 @@ describe('Peer held post-handshake delivery', function () {
 		Peer.prototype.releaseHeldMessages = function (
 			this: Peer,
 			...args: []
-		): void {
+		): ReturnType<Peer['releaseHeldMessages']> {
 			events.push('release');
 			return realRelease.apply(this, args);
 		};
@@ -403,14 +507,11 @@ describe('Peer held post-handshake delivery', function () {
 			port: 1,
 			holdMessagesUntilRelease: true
 		});
-		const rearm = (): void =>
-			(peer as unknown as { rearmHeldMessages(): void }).rearmHeldMessages();
-
-		// Life 1: hold, receive, release.
-		rearm();
+		// Life 1: hold (armed by the constructor), receive, release.
 		(peer as unknown as { state: string }).state = 'ready';
 		const seen: number[] = [];
 		peer.on('message', (type: number) => seen.push(type));
+		peer.on('error', () => {});
 		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
 		peer.releaseHeldMessages();
 		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
@@ -419,9 +520,11 @@ describe('Peer held post-handshake delivery', function () {
 		peer.disconnect();
 		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
 
-		// Life 2: a fresh hold, NOT the nulled post-release state, and no
-		// replay of life 1's frame.
-		rearm();
+		// Life 2 re-arms through the REAL call site: connect() itself (the
+		// dial fails, port 1, but the fresh hold must already be armed).
+		// A fresh hold, NOT the nulled post-release state, and no replay
+		// of life 1's frame.
+		await peer.connect().catch(() => undefined);
 		(peer as unknown as { state: string }).state = 'ready';
 		feed(peer, MessageType.TX_COMPLETE, Buffer.from([3]));
 		expect(seen, 'life-2 frame held until release').to.deep.equal([
@@ -508,7 +611,7 @@ describe('Peer held post-handshake delivery', function () {
 		Peer.prototype.releaseHeldMessages = function (
 			this: Peer,
 			...args: []
-		): void {
+		): ReturnType<Peer['releaseHeldMessages']> {
 			events.push(
 				`release:${this.remotePublicKey.toString('hex').slice(0, 8)}`
 			);

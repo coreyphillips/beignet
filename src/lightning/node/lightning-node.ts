@@ -1152,7 +1152,12 @@ export class LightningNode extends EventEmitter {
 				barrier !== undefined &&
 				barrier !== null &&
 				(carriedV2Rows.length > 0 || needsSchemaRepair || tailOwed);
-			if (owesRepair) {
+			// Write the bare sentinel ONLY when no trigger is stored yet: an
+			// existing numeric tail is already durable AND may sit above the
+			// local tip, so replacing it with 'owed' would let a crash right
+			// here lower the next boot's receipt target to its own tip and
+			// lift quarantine before the original target was receipted.
+			if (owesRepair && !tailOwed) {
 				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
 			}
 			this.restoreFromStorage();

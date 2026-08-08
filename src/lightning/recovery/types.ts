@@ -298,6 +298,15 @@ export interface EncryptedRecoveryFrame {
  * peers treat replays idempotently.
  */
 export interface RecoverySnapshot {
+	/**
+	 * The snapshot content schema this frame was written under (see
+	 * META_SNAPSHOT_SCHEMA in journal.ts). Carried INSIDE the authenticated
+	 * frame because the local metadata marker does not survive guardian or
+	 * capsule restoration: without it, a future release's journal would
+	 * restore marker-less and read as migratable legacy. Absent on frames
+	 * written before the field existed.
+	 */
+	schemaVersion?: string;
 	channels: Array<{
 		channelId: string;
 		state: import('../channel/channel-state').IChannelState;

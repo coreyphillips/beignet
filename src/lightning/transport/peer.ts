@@ -717,10 +717,18 @@ export class Peer extends EventEmitter {
 	 * message may legitimately tear the connection down), and contains a
 	 * throwing listener as a peer error rather than letting it unwind the
 	 * caller's bring-up bookkeeping.
+	 *
+	 * The returned outcome is the CAUSAL record the caller cannot infer
+	 * from state alone: 'released' means every held frame was delivered
+	 * (or none were held), 'aborted' means a delivered frame's handler
+	 * ended the connection without an error, and 'failed' means a handler
+	 * threw and the connection was torn down over it. Registry identity
+	 * cannot stand in for this: an error observer's cleanup disconnect
+	 * looks exactly like a deliberate cancellation from the outside.
 	 */
-	releaseHeldMessages(): void {
+	releaseHeldMessages(): 'released' | 'aborted' | 'failed' {
 		const held = this.heldMessages;
-		if (!held || this.drainingHeld) return;
+		if (!held || this.drainingHeld) return 'released';
 		// Reentrancy guard: a recursive release (an observer calling back
 		// into the manager) must not start a second cursor and interleave.
 		this.drainingHeld = true;
@@ -735,7 +743,7 @@ export class Peer extends EventEmitter {
 				if (this.state !== 'ready') {
 					// Torn down mid-release: the undelivered tail dies with
 					// the connection, exactly as unread socket bytes would.
-					return;
+					return 'aborted';
 				}
 				const next = held[cursor++];
 				try {
@@ -760,9 +768,10 @@ export class Peer extends EventEmitter {
 							// already down, which is the outcome that matters.
 						}
 					}
-					return;
+					return 'failed';
 				}
 			}
+			return 'released';
 		} finally {
 			this.drainingHeld = false;
 			// Only THIS drain's queue dies here: a delivered message's

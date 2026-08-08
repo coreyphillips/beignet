@@ -53,6 +53,10 @@ interface IEncodedOutboundMessage {
 }
 
 interface IEncodedSnapshot {
+	/** Snapshot content schema, authenticated by the frame hash. Written
+	 *  first so its bytes sit at a stable position; conditional so frames
+	 *  captured before the field existed re-encode byte-identically. */
+	schemaVersion?: string;
 	channels: Array<{
 		channelId: string;
 		state: ISerializedChannelState;
@@ -376,6 +380,11 @@ function decodeOutboundMessage(
 
 function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 	return {
+		// Pure passthrough, no default: a decoded pre-field frame must
+		// re-encode to its stored hash byte for byte.
+		...(snapshot.schemaVersion !== undefined
+			? { schemaVersion: snapshot.schemaVersion }
+			: {}),
 		channels: snapshot.channels.map((c) => ({
 			channelId: c.channelId,
 			state: serializeChannelState(c.state),
@@ -426,6 +435,9 @@ function encodeSnapshot(snapshot: RecoverySnapshot): IEncodedSnapshot {
 
 function decodeSnapshot(encoded: IEncodedSnapshot): RecoverySnapshot {
 	return {
+		...(encoded.schemaVersion !== undefined
+			? { schemaVersion: encoded.schemaVersion }
+			: {}),
 		channels: encoded.channels.map((c) => ({
 			channelId: c.channelId,
 			state: deserializeChannelState(c.state),

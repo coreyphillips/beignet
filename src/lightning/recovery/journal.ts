@@ -77,6 +77,18 @@ const SNAPSHOT_SCHEMA_VERSION = '2';
  * corruption; both are unknowable and must refuse, never migrate.
  */
 const MIGRATABLE_SNAPSHOT_SCHEMAS = new Set(['1']);
+
+/**
+ * The one compatibility predicate, shared by the journal's local-marker
+ * checks and by reconstruction's authenticated-snapshot check: absent or
+ * empty (pre-versioning legacy), the current version, or an exact known
+ * older version. Everything else is a future release or corruption.
+ */
+function snapshotSchemaKnown(marker: string | null | undefined): boolean {
+	if (marker == null || marker === '') return true;
+	if (marker === SNAPSHOT_SCHEMA_VERSION) return true;
+	return MIGRATABLE_SNAPSHOT_SCHEMAS.has(marker);
+}
 /**
  * Monotonic record that this journal has written at least one `quorum` frame
  * (Phase 6, spec 5.8). Only ever set, never cleared: it is the writer's own
@@ -456,6 +468,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
+	/** One-shot: the write boundary validated the stored schema marker. */
+	private writeSchemaChecked = false;
 
 	/**
 	 * @param recoveryId The guardian namespace (wire spec 1.1): the x-only
@@ -535,6 +549,18 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint {
+		// The WRITE BOUNDARY enforces schema compatibility, not just the
+		// node's optional startup probe: RecoveryJournal is public API, and
+		// a direct commit over an unmigratable marker would advance the
+		// journal and let a cadence snapshot rewrite the marker. Checked
+		// once per run; only this journal's own snapshots move the marker
+		// after that, and they write the current version.
+		if (!this.writeSchemaChecked) {
+			this.assertSnapshotSchemaMigratable(
+				this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA)
+			);
+			this.writeSchemaChecked = true;
+		}
 		const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		if (tipSequence == null) {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
@@ -806,9 +832,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private assertSnapshotSchemaMigratable(
 		marker: string | null | undefined
 	): void {
-		if (marker == null || marker === '') return;
-		if (marker === SNAPSHOT_SCHEMA_VERSION) return;
-		if (MIGRATABLE_SNAPSHOT_SCHEMAS.has(marker)) return;
+		if (snapshotSchemaKnown(marker)) return;
 		throw new Error(
 			`recovery: journal snapshot schema '${marker}' is not one ` +
 				`this release can migrate; refusing to rewrite the journal`
@@ -917,6 +941,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const storage = this.storage;
 		const channels = storage.loadAllChannels();
 		return {
+			// Authenticated by the frame: restoration re-derives the local
+			// schema marker from here, since recovery_meta does not ride
+			// frames and would otherwise be lost with the device.
+			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
 			channels: channels.map((c) => ({
 				channelId: c.channelId,
 				state: c.state,
@@ -1127,6 +1155,18 @@ export function reconstructFromFrames(
 			'Recovery reconstruction requires an authenticated base snapshot'
 		);
 	}
+	// The snapshot's AUTHENTICATED schema declaration gates the restore:
+	// applySnapshot deserializes with THIS release's shape, so replaying a
+	// future release's snapshot would silently drop whatever that shape
+	// added. The local marker cannot stand in for this check because it
+	// does not survive the loss of the device.
+	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
+	if (!snapshotSchemaKnown(snapshotSchema)) {
+		throw new Error(
+			`recovery: the base snapshot declares schema '${snapshotSchema}', ` +
+				`which this release cannot restore; refusing to reconstruct`
+		);
+	}
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.
@@ -1157,6 +1197,14 @@ export function reconstructFromFrames(
 		if (ids.length && target.setOutboxFrameSequence) {
 			target.setOutboxFrameSequence(ids, Number(frame.sequence));
 		}
+	}
+	// Reinstall the schema marker FROM the authenticated snapshot: local
+	// metadata died with the lost device, and leaving the restored journal
+	// marker-less would read as pre-versioning legacy, letting this or a
+	// future boot migrate content it never validated. A pre-field snapshot
+	// installs nothing, which is exactly the legacy shape it is.
+	if (snapshotSchema != null && snapshotSchema !== '') {
+		target.setRecoveryMeta?.(META_SNAPSHOT_SCHEMA, snapshotSchema);
 	}
 }
 

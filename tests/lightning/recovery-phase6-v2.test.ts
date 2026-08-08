@@ -65,6 +65,7 @@ import {
 	IBoundGuardianClient,
 	IWriterLeaseKeys,
 	RecoveryCriticality,
+	RecoveryJournal,
 	RecoveryManager,
 	ReferenceGuardian,
 	RestoreDriver,
@@ -1357,6 +1358,253 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			'the marker is preserved for inspection'
 		).to.equal('garbage');
 		s1.close();
+	});
+
+	it('consumes no trigger before the intent marker is durable', function () {
+		// The bare sentinel write precedes BOTH trigger consumptions (the
+		// schema migration and restore). A boot that cannot persist the
+		// sentinel must refuse before consuming anything, or a crash there
+		// leaves the guardians owed a receipt with no trigger left to
+		// re-arm it.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-intentorder-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(54, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(90).toString('hex'),
+					preimage: makeSeed(91)
+				}
+			],
+			outboundMessages: []
+		});
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('journal_snapshot_schema', '1');
+		const realSet = s2.setRecoveryMeta!.bind(s2);
+		s2.setRecoveryMeta = (key: string, value: string): void => {
+			if (key === 'startup_repair_tail' && value === 'owed') {
+				throw new Error('disk says no');
+			}
+			realSet(key, value);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(54, { storage: s2, recovery: quorumRecovery() })
+				)
+		).to.throw(/disk says no/);
+		// Neither trigger was consumed: the old-schema marker is intact, so
+		// a later boot still sees the whole repair owed.
+		expect(
+			s2.getRecoveryMeta!('journal_snapshot_schema'),
+			'the schema trigger was not consumed before the intent write'
+		).to.equal('1');
+		s2.close();
+	});
+
+	it('never downgrades a stored numeric repair target to the bare sentinel', function () {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-numtail-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(53, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(92).toString('hex'),
+					preimage: makeSeed(93)
+				}
+			],
+			outboundMessages: []
+		});
+		node1.destroy();
+
+		// The stored target sits ABOVE the local tip (a prior boot computed
+		// it from a higher intent). Crash the boot before the concrete tail
+		// write lands: whatever happens, the stored target must never have
+		// shrunk in the meantime, or a restart in that window would gate on
+		// the lower tip and lift quarantine before the real target was
+		// receipted.
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('startup_repair_tail', '999999');
+		const realSet = s2.setRecoveryMeta!.bind(s2);
+		s2.setRecoveryMeta = (key: string, value: string): void => {
+			if (key === 'startup_repair_tail' && /^[0-9]+$/.test(value)) {
+				throw new Error('disk says no');
+			}
+			realSet(key, value);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(53, { storage: s2, recovery: quorumRecovery() })
+				)
+		).to.throw();
+		expect(
+			s2.getRecoveryMeta!('startup_repair_tail'),
+			'the numeric target survived the crashed boot un-shrunk'
+		).to.equal('999999');
+		s2.close();
+
+		// A healthy boot gates on the HIGHER of tip and stored target, and
+		// keeps the concrete number durable.
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const node2 = new LightningNode(
+			makeNodeConfig(53, { storage: s3, recovery: quorumRecovery() })
+		);
+		node2.on('node:error', () => {});
+		expect(
+			(node2 as unknown as { startupRepairPending: boolean })
+				.startupRepairPending,
+			'quarantined behind the stored target'
+		).to.equal(true);
+		expect(s3.getRecoveryMeta!('startup_repair_tail')).to.equal('999999');
+		node2.destroy();
+		s3.close();
+	});
+
+	it('restoration carries the snapshot schema and refuses an unknown one', function () {
+		// The local marker is metadata and dies with the device; what
+		// survives is the schema declaration INSIDE the authenticated
+		// snapshot frame.
+		const s1 = openStorage();
+		const node1 = new LightningNode(
+			makeNodeConfig(52, { storage: s1, recovery: { enabled: true } })
+		);
+		node1.on('node:error', () => {});
+		recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(94).toString('hex'),
+					preimage: makeSeed(95)
+				}
+			],
+			outboundMessages: []
+		});
+		const journal = (
+			node1 as unknown as {
+				recovery: {
+					options: { journal?: { loadVerifiedFrames: () => unknown } };
+				};
+			}
+		).recovery.options.journal;
+		const frames = journal!.loadVerifiedFrames() as Parameters<
+			typeof reconstructFromFrames
+		>[1];
+		node1.destroy();
+
+		// A device rebuilt from frames alone knows its schema again: the
+		// restored journal is NOT mistaken for pre-versioning legacy.
+		const rebuilt = new SqliteStorage(':memory:');
+		rebuilt.open();
+		reconstructFromFrames(rebuilt, frames);
+		expect(
+			rebuilt.getRecoveryMeta!('journal_snapshot_schema'),
+			'the authenticated snapshot reinstalled the marker'
+		).to.equal('2');
+		rebuilt.close();
+
+		// A FUTURE release's snapshot refuses reconstruction outright:
+		// replaying it with this build's shape would silently drop whatever
+		// that shape added.
+		const tampered = (
+			frames as Array<{ snapshot?: { schemaVersion?: string } }>
+		).map((f) =>
+			f.snapshot ? { ...f, snapshot: { ...f.snapshot, schemaVersion: '3' } } : f
+		);
+		const rebuilt2 = new SqliteStorage(':memory:');
+		rebuilt2.open();
+		expect(() =>
+			reconstructFromFrames(
+				rebuilt2,
+				tampered as Parameters<typeof reconstructFromFrames>[1]
+			)
+		).to.throw(/cannot restore/);
+		expect(rebuilt2.loadAllChannels()).to.have.length(0);
+		rebuilt2.close();
+		s1.close();
+	});
+
+	it('a direct journal write refuses an unmigratable schema marker', function () {
+		// The node's startup probe is optional API; a direct
+		// RecoveryManager over the same storage must hit the same wall at
+		// the journal's own write boundary.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-directwrite-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(51, { storage: s1, recovery: { enabled: true } })
+		);
+		node1.on('node:error', () => {});
+		recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(96).toString('hex'),
+					preimage: makeSeed(97)
+				}
+			],
+			outboundMessages: []
+		});
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('journal_snapshot_schema', '3');
+		const framesBefore = s2.loadRecoveryFrames!(0).length;
+		const journal = new RecoveryJournal(
+			s2,
+			makeSeed(98),
+			getPublicKey(makeSeed(99)),
+			makeSeed(100)
+		);
+		const manager = new RecoveryManager(s2, { journal });
+		const result = manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(101).toString('hex'),
+					preimage: makeSeed(102)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(result.committed, 'the direct commit is refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/not one this release can migrate/
+		);
+		// Untouched: same marker, same frame count.
+		expect(s2.getRecoveryMeta!('journal_snapshot_schema')).to.equal('3');
+		expect(s2.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		s2.close();
 	});
 
 	it('waitForReady fast paths never outrun the startup repair quarantine', async function () {

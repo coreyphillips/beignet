@@ -365,20 +365,25 @@ export class PeerManager extends EventEmitter {
 			this.removeRegisteredPeer(pubkey, peer);
 			throw err instanceof Error ? err : new Error(String(err));
 		}
-		peer.releaseHeldMessages();
+		const release = peer.releaseHeldMessages();
 		// The release itself can legitimately end in teardown (a failed
 		// held handler disconnects); make the registry agree even when no
 		// socket close event backs it (both cleanups are idempotent), and
-		// FAIL THE DIAL: resolving here would hand the caller a success
-		// with an empty registry and no reconnect scheduled. But only when
-		// this dial still OWNS the registration: a registration that moved
-		// on mid-release records deliberate intent (a peer:connect observer
-		// explicitly called disconnectPeer, or a fresh connection replaced
-		// this one), and rethrowing would read as a dial failure and
-		// schedule the very auto-reconnect that disconnect just cancelled.
-		if (peer.getState() !== 'ready') {
-			if (this.peers.get(pubkey) !== peer) return;
-			this.removeRegisteredPeer(pubkey, peer);
+		// decide the dial CAUSALLY. A delivery FAILURE fails the dial no
+		// matter who reconciled the registry meanwhile: a peer:error
+		// observer's cleanup disconnect must not convert the failure into
+		// a silent success with zero peers. Only a teardown that happened
+		// WITHOUT a delivery failure and whose registration deliberately
+		// moved on (a peer:connect observer called disconnectPeer, or a
+		// fresh connection replaced this one) resolves quietly; rethrowing
+		// there would read as a dial failure and schedule the very
+		// auto-reconnect that disconnect just cancelled.
+		if (release === 'failed' || peer.getState() !== 'ready') {
+			const owned = this.peers.get(pubkey) === peer;
+			if (owned) {
+				this.removeRegisteredPeer(pubkey, peer);
+			}
+			if (release !== 'failed' && !owned) return;
 			throw new Error(
 				`Connection to peer ${pubkey} failed during held-message delivery`
 			);
