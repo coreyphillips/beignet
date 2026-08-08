@@ -70,6 +70,14 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
 const SNAPSHOT_SCHEMA_VERSION = '2';
 /**
+ * The EXACT marker strings this release knows how to migrate from. An
+ * absent or empty marker (a journal written before versioning existed)
+ * is also migratable. Anything else, including malformed numerics such
+ * as '-1', '1e0', '0x1' or '01', is either a future release's marker or
+ * corruption; both are unknowable and must refuse, never migrate.
+ */
+const MIGRATABLE_SNAPSHOT_SCHEMAS = new Set(['1']);
+/**
  * Monotonic record that this journal has written at least one `quorum` frame
  * (Phase 6, spec 5.8). Only ever set, never cleared: it is the writer's own
  * memory of a promise it made to every future restore of this chain.
@@ -742,19 +750,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * carry the full table by construction).
 	 */
 	snapshotSchemaRepair(): bigint | null {
-		if (
-			this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA) ===
-			SNAPSHOT_SCHEMA_VERSION
-		) {
-			return null;
-		}
+		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
+		if (marker === SNAPSHOT_SCHEMA_VERSION) return null;
+		this.assertSnapshotSchemaMigratable(marker);
 		const tip = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
 		if (tip == null || tipHash == null) {
-			this.storage.setRecoveryMeta!(
-				META_SNAPSHOT_SCHEMA,
-				SNAPSHOT_SCHEMA_VERSION
-			);
+			// Nothing written yet: the first real snapshot stamps the
+			// current schema itself, so there is nothing to repair.
 			return null;
 		}
 		const sequence = BigInt(tip) + 1n;
@@ -771,6 +774,45 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			);
 		});
 		return sequence;
+	}
+
+	/**
+	 * Read-only probe: would snapshotSchemaRepair() act on this journal?
+	 * Lets the caller persist its repair intent BEFORE the marker or any
+	 * other trigger is consumed. This is ALSO the fail-closed compatibility
+	 * gate, and it must run before any restore mutation: restoration can
+	 * journal deletions, and a journal write that triggers a snapshot
+	 * would stamp the current schema over a marker this release never
+	 * validated, silently downgrading a future release's journal.
+	 */
+	needsSnapshotSchemaRepair(): boolean {
+		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
+		this.assertSnapshotSchemaMigratable(marker);
+		if (this.storage.getRecoveryMeta!(META_TIP_SEQUENCE) == null) {
+			// No frames yet: the bootstrap snapshot will be current-schema.
+			return false;
+		}
+		return marker !== SNAPSHOT_SCHEMA_VERSION;
+	}
+
+	/**
+	 * Only the current marker, an EXACT known-older marker, or no marker at
+	 * all may proceed. A higher or unrecognized marker was written by a
+	 * newer release whose snapshot shape this build cannot reproduce;
+	 * compacting with our shape and rewriting the marker would
+	 * destructively downgrade the journal. Malformed markers are just as
+	 * unknowable. Fail closed, journal untouched.
+	 */
+	private assertSnapshotSchemaMigratable(
+		marker: string | null | undefined
+	): void {
+		if (marker == null || marker === '') return;
+		if (marker === SNAPSHOT_SCHEMA_VERSION) return;
+		if (MIGRATABLE_SNAPSHOT_SCHEMAS.has(marker)) return;
+		throw new Error(
+			`recovery: journal snapshot schema '${marker}' is not one ` +
+				`this release can migrate; refusing to rewrite the journal`
+		);
 	}
 
 	private appendSnapshotFrame(
@@ -795,6 +837,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			sequence.toString()
 		);
 		this.storage.setRecoveryMeta!(META_DELTA_BYTES, '0');
+		// Every snapshot this release writes carries the whole key-index
+		// table, so it IS current-schema by construction; stamping here
+		// means a fresh journal is never seen as needing the repair.
+		this.storage.setRecoveryMeta!(
+			META_SNAPSHOT_SCHEMA,
+			SNAPSHOT_SCHEMA_VERSION
+		);
 		this.compactTo(sequence);
 	}
 

@@ -113,6 +113,8 @@ export class Peer extends EventEmitter {
 	private heldMessages: Array<{ type: number; payload: Buffer }> | null = null;
 	/** True while releaseHeldMessages() is mid-drain (reentrancy guard). */
 	private drainingHeld = false;
+	/** The configured hold behavior, re-armed on every establishment. */
+	private readonly holdOnEstablish: boolean = false;
 	private socket: IDuplexTransport | null = null;
 	private transport: TransportCipher | null = null;
 	private remoteInit: IInitMessage | null = null;
@@ -159,7 +161,8 @@ export class Peer extends EventEmitter {
 		this.createSocketFn = options.createSocket;
 		this.connectTimeoutMs = options.connectTimeout ?? 15_000;
 		this.handshakeTimeoutMs = options.handshakeTimeout ?? 30_000;
-		this.heldMessages = options.holdMessagesUntilRelease ? [] : null;
+		this.holdOnEstablish = options.holdMessagesUntilRelease === true;
+		this.heldMessages = this.holdOnEstablish ? [] : null;
 	}
 
 	getState(): PeerState {
@@ -173,10 +176,23 @@ export class Peer extends EventEmitter {
 	/**
 	 * Initiate an outbound connection to the peer.
 	 */
+	/** Arm a fresh hold for a new connection lifecycle (see options). */
+	private rearmHeldMessages(): void {
+		this.heldMessages = this.holdOnEstablish ? [] : null;
+		this.drainingHeld = false;
+	}
+
 	async connect(): Promise<void> {
+		// Validate the lifecycle transition BEFORE mutating anything: a
+		// rejected connect() on a live peer must not touch that
+		// connection's queue (re-arming it would hold its traffic forever).
 		if (this.state !== 'disconnected') {
 			throw new Error(`Cannot connect: peer is ${this.state}`);
 		}
+		// A reused Peer must neither replay the previous connection's held
+		// frames nor skip holding because the first release nulled the
+		// queue: every establishment starts a fresh hold lifecycle.
+		this.rearmHeldMessages();
 
 		this.state = 'connecting';
 		this.aborted = false;
@@ -305,6 +321,8 @@ export class Peer extends EventEmitter {
 		if (this.state !== 'disconnected') {
 			throw new Error(`Cannot accept: peer is ${this.state}`);
 		}
+		// See connect(): state validated first, then a fresh hold lifecycle.
+		this.rearmHeldMessages();
 
 		this.socket = socket;
 		this.state = 'handshaking';
@@ -401,6 +419,9 @@ export class Peer extends EventEmitter {
 		this.establishmentAbort?.(new Error('Peer aborted'));
 		this.establishmentAbort = null;
 		this.state = 'closing';
+		// The previous connection's undelivered frames die with it: a later
+		// re-establishment re-arms a FRESH hold (rearmHeldMessages).
+		this.heldMessages = null;
 		this.stopPingTimer();
 		this.destroySocket();
 		this.state = 'disconnected';
@@ -744,7 +765,13 @@ export class Peer extends EventEmitter {
 			}
 		} finally {
 			this.drainingHeld = false;
-			this.heldMessages = null;
+			// Only THIS drain's queue dies here: a delivered message's
+			// observer can tear the connection down and begin a new
+			// establishment mid-drain, arming a fresh queue that belongs to
+			// the newer lifecycle and must survive to its own release.
+			if (this.heldMessages === held) {
+				this.heldMessages = null;
+			}
 		}
 	}
 

@@ -197,6 +197,106 @@ describe('Peer held post-handshake delivery', function () {
 		]);
 	});
 
+	it('a held handler that fails mid-release FAILS the dial (no false success)', async function () {
+		// A held frame is injected DETERMINISTICALLY during bring-up (after
+		// registration, before release) and its handler explodes: the Peer
+		// tears down mid-release, and connectPeer must REJECT instead of
+		// resolving with an empty registry.
+		const a = new LightningNode(makeNodeConfig(15));
+		const b = new LightningNode(makeNodeConfig(16));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		a.on('peer:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						on(e: string, l: (...args: unknown[]) => void): void;
+						peers: Map<string, unknown>;
+						getPeer(pk: string): Peer | undefined;
+					};
+				}
+			).peerManager;
+			// This listener runs during dialPeer's peer:connect emit, i.e.
+			// after registration and strictly before releaseHeldMessages:
+			// the injected frame is guaranteed to drain through the release.
+			pmA.on('peer:connect', (pubkey: unknown) => {
+				const peer = pmA.getPeer(pubkey as string);
+				(
+					peer as unknown as {
+						heldMessages: Array<{ type: number; payload: Buffer }>;
+					}
+				).heldMessages.push({
+					type: 50_001, // odd, unknown: dispatched, no builtin handler
+					payload: Buffer.alloc(1)
+				});
+			});
+			pmA.on('message', () => {
+				throw new Error('held handler exploded');
+			});
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			let rejection: Error | null = null;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(rejection, 'the dial rejected').to.be.instanceOf(Error);
+			expect(String(rejection)).to.contain('held-message delivery');
+			expect(pmA.peers.size, 'rejected dial leaves no peer').to.equal(0);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('an explicit disconnectPeer from a peer:connect observer is respected', async function () {
+		// The observer deliberately drops the fresh connection. The dial
+		// must NOT read the resulting non-ready peer as a held-delivery
+		// failure: rejecting would schedule the auto-reconnect the
+		// disconnect just cancelled, undoing an explicit operator decision.
+		const a = new LightningNode(makeNodeConfig(17));
+		const b = new LightningNode(makeNodeConfig(18));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		a.on('peer:connect', (pubkey: string) => {
+			a.disconnectPeer(pubkey);
+		});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// Resolves: the connection was established, then explicitly
+			// closed by the observer. That is not a dial failure.
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size, 'the disconnect stands').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'no auto-reconnect was scheduled against the explicit disconnect'
+			).to.equal(0);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(pmA.peers.size, 'no resurrection later either').to.equal(0);
+			expect(pmA.reconnectTimers.size).to.equal(0);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
 	it('a failed bring-up TEARS DOWN instead of releasing held traffic', async function () {
 		// The connect hook is the required bring-up (our channel_reestablish
 		// rides it): if it fails, releasing the peer's held reestablish
@@ -291,6 +391,114 @@ describe('Peer held post-handshake delivery', function () {
 		peer.on('message', (type: number) => seen.push(type));
 		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
 		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
+	});
+
+	it('re-arms a fresh hold on each establishment (no stale replay, no bypass)', async function () {
+		// A reused Peer must not replay the prior connection's held frames,
+		// nor skip holding because the first release nulled the queue.
+		const peer = new Peer({
+			localPrivateKey: makeSeed(5),
+			remotePublicKey: getPublicKey(makeSeed(6)),
+			host: '127.0.0.1',
+			port: 1,
+			holdMessagesUntilRelease: true
+		});
+		const rearm = (): void =>
+			(peer as unknown as { rearmHeldMessages(): void }).rearmHeldMessages();
+
+		// Life 1: hold, receive, release.
+		rearm();
+		(peer as unknown as { state: string }).state = 'ready';
+		const seen: number[] = [];
+		peer.on('message', (type: number) => seen.push(type));
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		peer.releaseHeldMessages();
+		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
+
+		// Teardown drops the (empty) queue; a stray late frame is ignored.
+		peer.disconnect();
+		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
+
+		// Life 2: a fresh hold, NOT the nulled post-release state, and no
+		// replay of life 1's frame.
+		rearm();
+		(peer as unknown as { state: string }).state = 'ready';
+		feed(peer, MessageType.TX_COMPLETE, Buffer.from([3]));
+		expect(seen, 'life-2 frame held until release').to.deep.equal([
+			MessageType.OPEN_CHANNEL2
+		]);
+		peer.releaseHeldMessages();
+		expect(seen, 'only life-2 frame delivered, no replay').to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_COMPLETE
+		]);
+	});
+
+	it('a rejected connect() on a live peer leaves its delivery state untouched', async function () {
+		// connect() must validate the lifecycle transition BEFORE arming a
+		// fresh hold: re-arming a live connection's queue would silently
+		// hold its subsequent traffic forever.
+		const peer = bareHeldPeer();
+		const seen: number[] = [];
+		peer.on('message', (type: number) => seen.push(type));
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+
+		let firstRejected = false;
+		await peer.connect().catch(() => {
+			firstRejected = true;
+		});
+		expect(firstRejected, 'connect() on a ready peer rejects').to.equal(true);
+		// The held frame survived the rejected call and still delivers.
+		peer.releaseHeldMessages();
+		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
+
+		// Live now. A second rejected connect() must not re-arm the hold:
+		// traffic keeps flowing immediately.
+		let secondRejected = false;
+		await peer.connect().catch(() => {
+			secondRejected = true;
+		});
+		expect(secondRejected).to.equal(true);
+		feed(peer, MessageType.TX_COMPLETE, Buffer.from([2]));
+		expect(seen, 'the live connection was not put back on hold').to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_COMPLETE
+		]);
+	});
+
+	it("an old drain never clears a newer lifecycle's fresh queue", function () {
+		// A delivered message's observer tears the connection down and a
+		// reconnect re-arms mid-drain: the old drain's cleanup must only
+		// retire ITS OWN queue, or the new lifecycle silently loses its
+		// hold and traffic bypasses the release ordering.
+		const peer = bareHeldPeer();
+		const rearm = (): void =>
+			(peer as unknown as { rearmHeldMessages(): void }).rearmHeldMessages();
+		const seen: number[] = [];
+		peer.on('message', (type: number) => {
+			seen.push(type);
+			// Mid-drain teardown plus the start of a new establishment.
+			peer.disconnect();
+			rearm();
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		feed(peer, MessageType.TX_ADD_INPUT, Buffer.from([2]));
+		peer.releaseHeldMessages();
+		// First frame delivered; the teardown killed the old queue's tail.
+		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
+
+		// The NEW lifecycle's queue survived the old drain's cleanup: its
+		// traffic is held until its own release, not delivered live.
+		(peer as unknown as { state: string }).state = 'ready';
+		feed(peer, MessageType.TX_COMPLETE, Buffer.from([3]));
+		expect(seen, 'the new lifecycle still holds').to.deep.equal([
+			MessageType.OPEN_CHANNEL2
+		]);
+		peer.releaseHeldMessages();
+		expect(seen).to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_COMPLETE
+		]);
 	});
 
 	it('over a real connection, release happens exactly once per side, AFTER peer:connect', async function () {

@@ -368,9 +368,20 @@ export class PeerManager extends EventEmitter {
 		peer.releaseHeldMessages();
 		// The release itself can legitimately end in teardown (a failed
 		// held handler disconnects); make the registry agree even when no
-		// socket close event backs it (both cleanups are idempotent).
+		// socket close event backs it (both cleanups are idempotent), and
+		// FAIL THE DIAL: resolving here would hand the caller a success
+		// with an empty registry and no reconnect scheduled. But only when
+		// this dial still OWNS the registration: a registration that moved
+		// on mid-release records deliberate intent (a peer:connect observer
+		// explicitly called disconnectPeer, or a fresh connection replaced
+		// this one), and rethrowing would read as a dial failure and
+		// schedule the very auto-reconnect that disconnect just cancelled.
 		if (peer.getState() !== 'ready') {
+			if (this.peers.get(pubkey) !== peer) return;
 			this.removeRegisteredPeer(pubkey, peer);
+			throw new Error(
+				`Connection to peer ${pubkey} failed during held-message delivery`
+			);
 		}
 	}
 

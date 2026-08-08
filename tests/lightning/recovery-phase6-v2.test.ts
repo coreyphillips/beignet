@@ -1009,6 +1009,79 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		s3.close();
 	});
 
+	it('persists repair intent BEFORE consuming triggers, so a crash still re-quarantines', function () {
+		// The schema migration consumes its marker and restore consumes the
+		// carried rows; if the concrete tail write is lost after that, the
+		// intent marker written FIRST must still make the next boot gate.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-intent-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(47, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(76).toString('hex'),
+					preimage: makeSeed(77)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		// An old-schema journal (owes the schema repair) and no carried row.
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('journal_snapshot_schema', '1');
+		s2.close();
+
+		// Fail the CONCRETE tail write (the numeric one), letting the
+		// intent marker ('owed') and the migration land first.
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		const realSet = s3.setRecoveryMeta!.bind(s3);
+		s3.setRecoveryMeta = (key: string, value: string): void => {
+			if (key === 'startup_repair_tail' && /^[0-9]+$/.test(value)) {
+				throw new Error('disk says no');
+			}
+			realSet(key, value);
+		};
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(47, { storage: s3, recovery: quorumRecovery() })
+				)
+		).to.throw();
+		s3.close();
+
+		// The intent marker survived: the next (healthy) boot still gates
+		// even though the schema marker is now consumed and no row carried.
+		const s4 = new SqliteStorage(dbPath);
+		s4.open();
+		expect(
+			s4.getRecoveryMeta!('startup_repair_tail'),
+			'the owed intent marker persisted'
+		).to.equal('owed');
+		const node2 = new LightningNode(
+			makeNodeConfig(47, { storage: s4, recovery: quorumRecovery() })
+		);
+		node2.on('node:error', () => {});
+		expect(
+			(node2 as unknown as { startupRepairPending: boolean })
+				.startupRepairPending,
+			'the persisted intent re-quarantines the reboot'
+		).to.equal(true);
+		node2.destroy();
+	});
+
 	it('a failed schema migration rolls back atomically and retries', function () {
 		const dbPath = path.join(
 			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-atomic-')),
@@ -1141,6 +1214,233 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 				)
 		).to.throw(/could not be dispositioned durably/);
 		s3.close();
+	});
+
+	it('refuses to downgrade a FUTURE recovery schema version', function () {
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-future-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(48, { storage: s1, recovery: { enabled: true } })
+		);
+		node1.on('node:error', () => {});
+		recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(78).toString('hex'),
+					preimage: makeSeed(79)
+				}
+			],
+			outboundMessages: []
+		});
+		node1.destroy();
+
+		// A newer release wrote schema '3'; this build must NOT compact with
+		// its version-2 shape and rewrite the marker down to 2. Seed a
+		// record-less DUAL_FUNDING_V2 row too: restoration deletes those
+		// durably and can journal (and even snapshot) while doing it, so the
+		// refusal must land BEFORE restore runs, or the restore-triggered
+		// snapshot stamps the current schema over the marker this build
+		// never validated and the startup sails through.
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		const residue = createOpenerState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 150_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(48).basepoints,
+			localPerCommitmentSeed: makeSeed(48)
+		});
+		residue.channelId = crypto.randomBytes(32);
+		residue.state = ChannelState.DUAL_FUNDING_V2;
+		const residueIdHex = residue.channelId.toString('hex');
+		s2.saveChannel(residueIdHex, residue, '02'.repeat(33));
+		s2.setRecoveryMeta!('journal_snapshot_schema', '3');
+		const framesBefore = s2.loadRecoveryFrames!(0).length;
+		s2.close();
+
+		const s3 = new SqliteStorage(dbPath);
+		s3.open();
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(48, { storage: s3, recovery: { enabled: true } })
+				)
+		).to.throw(/not one this release can migrate/);
+		// Untouched: same marker, same frame count, the residue row intact.
+		expect(s3.getRecoveryMeta!('journal_snapshot_schema')).to.equal('3');
+		expect(s3.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		expect(
+			s3.loadAllChannels().map((row) => row.channelId),
+			'the refusal fired before restore touched the database'
+		).to.deep.equal([residueIdHex]);
+		s3.close();
+	});
+
+	it('refuses malformed schema markers instead of coercing them', function () {
+		// Number-coercion would accept '-1', '1e0', '0x1' or '01' and then
+		// destructively migrate a journal whose real version is unknowable.
+		// Only the exact known representations may proceed.
+		for (const bad of ['-1', '1e0', '0x1', '01', 'garbage']) {
+			const dbPath = path.join(
+				fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-malformed-')),
+				'node.db'
+			);
+			const s1 = new SqliteStorage(dbPath);
+			s1.open();
+			const node1 = new LightningNode(
+				makeNodeConfig(48, { storage: s1, recovery: { enabled: true } })
+			);
+			node1.on('node:error', () => {});
+			recoveryOf(node1).commit({
+				criticality: RecoveryCriticality.Important,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: makeSeed(80).toString('hex'),
+						preimage: makeSeed(81)
+					}
+				],
+				outboundMessages: []
+			});
+			node1.destroy();
+
+			const s2 = new SqliteStorage(dbPath);
+			s2.open();
+			s2.setRecoveryMeta!('journal_snapshot_schema', bad);
+			const framesBefore = s2.loadRecoveryFrames!(0).length;
+			s2.close();
+
+			const s3 = new SqliteStorage(dbPath);
+			s3.open();
+			expect(
+				() =>
+					new LightningNode(
+						makeNodeConfig(48, { storage: s3, recovery: { enabled: true } })
+					),
+				`marker '${bad}' must refuse`
+			).to.throw(/not one this release can migrate/);
+			expect(
+				s3.getRecoveryMeta!('journal_snapshot_schema'),
+				`marker '${bad}' left untouched`
+			).to.equal(bad);
+			expect(s3.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+			s3.close();
+		}
+	});
+
+	it('refuses an unrecognized startup repair marker instead of guessing', function () {
+		// The stored tail is either the bare 'owed' sentinel or a decimal
+		// frame sequence. Treating arbitrary corruption as the sentinel
+		// would invent a guardian obligation out of garbage; fail closed.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-badtail-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		s1.setRecoveryMeta!('startup_repair_tail', 'garbage');
+		expect(
+			() =>
+				new LightningNode(
+					makeNodeConfig(49, { storage: s1, recovery: quorumRecovery() })
+				)
+		).to.throw(/startup repair marker/);
+		expect(
+			s1.getRecoveryMeta!('startup_repair_tail'),
+			'the marker is preserved for inspection'
+		).to.equal('garbage');
+		s1.close();
+	});
+
+	it('waitForReady fast paths never outrun the startup repair quarantine', async function () {
+		// Boot a REAL quarantined node (owed marker, unreleasable stub
+		// barrier) with zero channels: exactly the shape the no-channel
+		// fast path would wave through without the guard.
+		const dbPath = path.join(
+			fs.mkdtempSync(path.join(os.tmpdir(), 'p6v2-ready-')),
+			'node.db'
+		);
+		const s1 = new SqliteStorage(dbPath);
+		s1.open();
+		const node1 = new LightningNode(
+			makeNodeConfig(50, { storage: s1, recovery: quorumRecovery() })
+		);
+		node1.on('node:error', () => {});
+		const committed = recoveryOf(node1).commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: makeSeed(82).toString('hex'),
+					preimage: makeSeed(83)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(committed.committed).to.equal(true);
+		node1.destroy();
+
+		const s2 = new SqliteStorage(dbPath);
+		s2.open();
+		s2.setRecoveryMeta!('startup_repair_tail', 'owed');
+		const node2 = new LightningNode(
+			makeNodeConfig(50, { storage: s2, recovery: quorumRecovery() })
+		);
+		node2.on('node:error', () => {});
+		try {
+			const pending = (node2 as unknown as { startupRepairPending: boolean })
+				.startupRepairPending;
+			expect(pending, 'the node came up quarantined').to.equal(true);
+			let readyFired = false;
+			node2.on('node:ready', () => {
+				readyFired = true;
+			});
+
+			// No channels at all, and still NOT ready.
+			expect(node2.getChannelManager().listChannels()).to.have.length(0);
+			let timedOut = false;
+			await node2.waitForReady(150).catch(() => {
+				timedOut = true;
+			});
+			expect(timedOut, 'no-channel fast path refused').to.equal(true);
+			expect(readyFired).to.equal(false);
+
+			// A NORMAL channel, and still NOT ready either.
+			(
+				node2.getChannelManager() as unknown as {
+					listChannels(): unknown[];
+				}
+			).listChannels = () => [
+				{ getState: (): ChannelState => ChannelState.NORMAL }
+			];
+			timedOut = false;
+			await node2.waitForReady(150).catch(() => {
+				timedOut = true;
+			});
+			expect(timedOut, 'NORMAL-channel fast path refused').to.equal(true);
+			expect(readyFired).to.equal(false);
+
+			// Quarantine lifted (the receipt path does this): the very same
+			// fast path is ready immediately and the event fires.
+			(
+				node2 as unknown as { startupRepairPending: boolean }
+			).startupRepairPending = false;
+			await node2.waitForReady(2000);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+			expect(readyFired, 'ready fires once the quarantine lifts').to.equal(
+				true
+			);
+		} finally {
+			node2.destroy();
+			s2.close();
+		}
 	});
 
 	it('an upgraded journal writes the schema-repair snapshot and reconstruction keeps burned indices', function () {
@@ -1401,6 +1701,22 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			pendingOf(node2),
 			'the node quarantines itself behind the repair frame'
 		).to.equal(true);
+		// Readiness must not outrun the quarantine, even on the no-channel
+		// and NORMAL-channel fast paths, and the status surface reports it.
+		expect(
+			node2.getRecoveryStatus().startupRepairPending,
+			'getRecoveryStatus reports the quarantine'
+		).to.equal(true);
+		let readyWhileQuarantined = false;
+		node2.on('node:ready', () => {
+			if (pendingOf(node2)) readyWhileQuarantined = true;
+		});
+		void node2.waitForReady(200).catch(() => undefined);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(
+			readyWhileQuarantined,
+			'ready never fired while quarantined'
+		).to.equal(false);
 		const deadline = Date.now() + 15_000;
 		while (pendingOf(node2) && Date.now() < deadline) {
 			await new Promise((resolve) => setTimeout(resolve, 50));
