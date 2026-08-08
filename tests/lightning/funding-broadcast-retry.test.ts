@@ -237,6 +237,58 @@ describe('Funding broadcast retry', function () {
 		bob.destroy();
 	});
 
+	it('a stranded obligation is re-adopted from the channel row on the next block', async function () {
+		// A disconnect purges a channel's barrier-held batch, and for a v2
+		// open that suffix can be the tx_signatures release plus the funding
+		// broadcast: the fully signed tx is already durable on the row, but
+		// the action that registers the runtime obligation never ran. The
+		// per-block retry must adopt the row's payload (as 'restored', so it
+		// re-asks authorization) instead of idling until a restart.
+		const broadcasts: string[] = [];
+		let fundingTxidHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				return built;
+			},
+			broadcastTransaction: async (txHex) => {
+				broadcasts.push(txHex);
+				return bitcoin.Transaction.fromHex(txHex).getId();
+			}
+		};
+
+		const alice = new LightningNode(
+			makeNodeConfig(31, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(32));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(broadcasts.length).to.equal(1);
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+
+		// Strand it: the runtime entry vanishes the way a purged held batch
+		// leaves things, while the channel row still owes the broadcast.
+		pendingMap(alice).clear();
+		expect(pendingMap(alice).size).to.equal(0);
+
+		alice.handleNewBlock(501);
+		await tick();
+		expect(
+			pendingMap(alice).has(fundingTxidHex),
+			're-adopted from the channel row'
+		).to.equal(true);
+		expect(broadcasts.length, 'the obligation was re-broadcast').to.equal(2);
+		expect(broadcasts[1]).to.equal(broadcasts[0]);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
 	it('funding:confirmed retires the obligation', async function () {
 		let fundingTxidHex = '';
 		const provider: IFundingProvider = {

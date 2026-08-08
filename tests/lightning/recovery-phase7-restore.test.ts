@@ -24,7 +24,7 @@
 
 import { expect } from 'chai';
 import { MessageType } from '../../src/lightning/message/types';
-import { HtlcState } from '../../src/lightning/channel/types';
+import { ChannelState, HtlcState } from '../../src/lightning/channel/types';
 import {
 	RestoreDriver,
 	deriveRecoveryRoot
@@ -49,12 +49,16 @@ import {
 	bindServed,
 	currentQuorumRun,
 	quorumOptions,
+	registerQuorumNamespace,
+	waitFor,
 	withNamespace
 } from './helpers/chaos-quorum';
 import {
 	CHAOS_ENV,
 	CHAOS_VICTIM_SEED,
-	s1aSenderPays
+	s1aSenderPays,
+	s7OpensV2,
+	v2ChaosFundingProvider
 } from './helpers/chaos-scenarios';
 
 let clockNow = 2_400_000_000_000n;
@@ -219,6 +223,97 @@ describe('Recovery phase 7: device-loss verdicts (S10)', () => {
 			const result = await restartVictim(env, options);
 			await assertChaosOutcome(result, 'safe-dlp');
 			result.destroyAll();
+		} finally {
+			env.victim.destroy();
+			for (const peer of env.peers) peer.destroy();
+			await options.teardown?.(env);
+		}
+	});
+	it('quorum: a device lost inside a v2 open restores the record from the guardians and completes the open', async function () {
+		this.timeout(120_000);
+		const options = quorumOptions(
+			{},
+			{
+				...CHAOS_ENV,
+				victimExtrasFactory: () => ({
+					fundingProvider: v2ChaosFundingProvider()
+				})
+			}
+		);
+		// s7's setup opens nothing (the RUN is the open), so the namespace is
+		// registered directly; withNamespace's post-setup wait would starve.
+		const inner = s7OpensV2();
+		const scenario: IChaosScenario = {
+			...inner,
+			async setup(env: IChaosEnv): Promise<void> {
+				await registerQuorumNamespace();
+				await inner.setup(env);
+			}
+		};
+		const env = await makeChaosEnv('quorum', options);
+		try {
+			await scenario.setup(env);
+			// Past the point of no return: the commitment_signed that left had
+			// its frame quorum-replicated first (it is barrier-class), so the
+			// guardians hold the v2InFlight record the resume needs.
+			await killAt(
+				env,
+				scenario,
+				postSendLabel(MessageType.COMMITMENT_SIGNED, 1)
+			);
+
+			const { wireSafetyProof } = await restoreFromGuardians(env);
+			expect(
+				wireSafetyProof,
+				'the quorum head yielded a wire-safety proof'
+			).to.not.equal(undefined);
+			const restoredDisk = openChaosStorage(env.dbPath);
+			const row = restoredDisk.loadAllChannels()[0];
+			expect(row, 'the opening channel came back').to.not.equal(undefined);
+			expect(
+				row.state.v2InFlight,
+				'the durable v2 record survived device loss'
+			).to.not.equal(null);
+			expect(
+				row.state.stateUncertain,
+				'the restored channel is NOT stateUncertain'
+			).to.equal(undefined);
+			restoredDisk.close();
+
+			const result = await restartVictim(env, options);
+			try {
+				// The reestablish resumes the signature exchange over
+				// next_funding; the open must COMPLETE, exactly as a same-disk
+				// restart would, because the guardian head is the same state.
+				await waitFor(() => {
+					const states = result.restored
+						.getChannelManager()
+						.listChannels()
+						.map((c) => c.getState());
+					return (
+						states.length === 1 &&
+						[
+							ChannelState.AWAITING_FUNDING_CONFIRMED,
+							ChannelState.AWAITING_CHANNEL_READY,
+							ChannelState.NORMAL
+						].includes(states[0])
+					);
+				});
+				const restoredFull = result.restored
+					.getChannelManager()
+					.listChannels()[0]
+					.getFullState();
+				const peerFull = env.peers[0]
+					.getChannelManager()
+					.listChannels()[0]
+					.getFullState();
+				expect(
+					restoredFull.fundingTxid?.toString('hex'),
+					'both sides agree on the funding tx the restore resumed'
+				).to.equal(peerFull.fundingTxid?.toString('hex'));
+			} finally {
+				result.destroyAll();
+			}
 		} finally {
 			env.victim.destroy();
 			for (const peer of env.peers) peer.destroy();

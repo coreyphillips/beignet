@@ -142,6 +142,19 @@ export interface IStorageBackend {
 	saveChannelKeyIndex(channelId: string, channelIndex: number): void;
 	loadChannelKeyIndex(channelId: string): number | null;
 	loadNextChannelIndex(): number;
+	/**
+	 * Every stored key-index row, INCLUDING entries whose channel was
+	 * deleted (deletion keeps them: they are the high-water mark that
+	 * prevents key reuse). Optional in the TYPE so partial test backends
+	 * keep compiling, but MANDATORY for journal-capable storage:
+	 * journalSupported() refuses a backend without it, because a snapshot
+	 * that can only enumerate live channels hands reconstruction a reset
+	 * next-index and reopens key reuse.
+	 */
+	loadAllChannelKeyIndices?(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}>;
 
 	// ─── Metadata (key/value) ───
 	saveMetadata(key: string, value: string): void;
@@ -302,6 +315,22 @@ export interface IStorageBackend {
 	setRecoveryMeta?(key: string, value: string): void;
 	/** Remove one journal metadata value. */
 	deleteRecoveryMeta?(key: string): void;
+	/**
+	 * Enumerate every stored recovery metadata key. Restore-target
+	 * emptiness checks prefer this over a known-key list, so residue under
+	 * ANY key (a writer lease, a repair marker) refuses the restore.
+	 */
+	listRecoveryMetaKeys?(): string[];
+	/**
+	 * Row-count and sequence span of the stored recovery frames (null when
+	 * none). Lets per-write chain invariants prove retained-chain
+	 * contiguity without loading every ciphertext.
+	 */
+	recoveryFrameStats?(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null;
 	/**
 	 * Whether secrets written through this backend are protected at rest.
 	 * The writer lease (recovery 5.6) keeps a signing key, so it refuses to

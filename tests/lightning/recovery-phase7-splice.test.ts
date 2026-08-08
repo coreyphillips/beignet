@@ -14,125 +14,41 @@
  *   working channel; a durable in-flight record means both sides must
  *   still agree on the splice after reestablish.
  * - Temporary to permanent channel id promotion (row 10, D1 required):
- *   covered here through its quorum-mode scope limit. Phase 6 refuses NEW
- *   v2 opens whenever quorum enforcement is active
- *   (`QUORUM_NO_DUAL_FUND_REFUSAL`), and the handoff is explicit that the
- *   matrix must assert that refusal rather than route around it. The
- *   refusal is what makes the row's kill points unreachable in quorum
- *   mode, and it must hold BEFORE any side effect: no key derivation, no
- *   channel index increment, no temporary channel registered, no wire
- *   message.
+ *   the S7 sweeps drive every boundary of the promotion window and require
+ *   each recorded (promoted) cell to complete the open after the restart.
+ *   Quorum no longer scopes this row: the durable v2InFlight record lifted
+ *   the phase 6 refusal, so quorum-mode coverage runs the SAME kill points
+ *   with the irreversible sends behind the barrier.
  */
 
 import { expect } from 'chai';
-import { QUORUM_NO_DUAL_FUND_REFUSAL } from '../../src/lightning/channel/channel-manager';
-import crypto from 'crypto';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
 import { ChannelState } from '../../src/lightning/channel/types';
-import { IFundingProvider } from '../../src/lightning/node/types';
 import {
+	IChaosEnv,
 	IChaosEnvOptions,
-	makeChaosEnv,
+	IChaosScenario,
+	assertNoGatedSendBeforeCommit,
 	recordSchedule,
 	runKillPoint,
 	settle
 } from './helpers/chaos-harness';
-import { quorumOptions, withNamespace } from './helpers/chaos-quorum';
+import {
+	quorumOptions,
+	registerQuorumNamespace,
+	waitFor
+} from './helpers/chaos-quorum';
 import {
 	CHAOS_ENV,
-	makeChaosSpliceWallet,
-	s1aSenderPays,
 	s4SplicesIn,
-	s7OpensV2
+	s7OpensV2,
+	v2ChaosFundingProvider
 } from './helpers/chaos-scenarios';
 
 bitcoin.initEccLib(ecc);
 
-/**
- * A v2 opener funds through the provider's splice-input surface; the
- * deterministic chaos wallet input serves, and v1 funding must never run.
- */
-function v2FundingProvider(): IFundingProvider {
-	const wallet = makeChaosSpliceWallet(250_000n);
-	const changeScript = bitcoin.payments.p2wpkh({
-		hash: crypto.randomBytes(20)
-	}).output!;
-	return {
-		buildFundingTransaction: async () => {
-			throw new Error('v1 funding must not run for a v2 open');
-		},
-		broadcastTransaction: async (txHex: string) =>
-			bitcoin.Transaction.fromHex(txHex).getId(),
-		selectSpliceInputs: async () => ({
-			inputs: [wallet.walletInput],
-			changeScript
-		})
-	};
-}
-
 describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
-	it('quorum mode refuses a new v2 open before any side effect, so the promotion row has no reachable kill points there', async function () {
-		this.timeout(60_000);
-		const options = quorumOptions();
-		const scenario = withNamespace(s1aSenderPays)();
-		const env = await makeChaosEnv('quorum', options);
-		try {
-			await scenario.setup(env);
-			const manager = env.victim.getChannelManager();
-			const indexBefore = (manager as unknown as { nextChannelIndex: number })
-				.nextChannelIndex;
-			const channelsBefore = manager.listChannels().length;
-			const sentBefore = env.relay.captured.length;
-
-			let refusal: Error | null = null;
-			try {
-				manager.createDualFundedChannel(env.peers[0].getNodeId(), {
-					fundingSatoshis: 200_000n,
-					fundingFeeratePerkw: 253,
-					commitmentFeeratePerkw: 253,
-					dustLimitSatoshis: 546n,
-					maxHtlcValueInFlightMsat: 100_000_000n,
-					htlcMinimumMsat: 1n,
-					toSelfDelay: 144,
-					maxAcceptedHtlcs: 30,
-					locktime: 0,
-					localBasepoints: (
-						manager as unknown as { config: { localBasepoints: unknown } }
-					).config.localBasepoints as never,
-					localPerCommitmentSeed: Buffer.alloc(32, 3),
-					secondPerCommitmentPoint: Buffer.alloc(33, 2)
-				} as never);
-			} catch (err) {
-				refusal = err as Error;
-			}
-
-			expect(refusal, 'the v2 open was refused').to.not.equal(null);
-			expect(refusal!.message, 'refused for the quorum reason').to.equal(
-				QUORUM_NO_DUAL_FUND_REFUSAL
-			);
-			// Refused BEFORE every side effect: this is the assertion the phase 6
-			// decision record pins, and the reason the promotion row cannot be
-			// swept in quorum mode.
-			expect(
-				(manager as unknown as { nextChannelIndex: number }).nextChannelIndex,
-				'no channel index was consumed'
-			).to.equal(indexBefore);
-			expect(
-				manager.listChannels().length,
-				'no channel was registered'
-			).to.equal(channelsBefore);
-			expect(
-				env.relay.captured.length,
-				'no wire message left the node'
-			).to.equal(sentBefore);
-		} finally {
-			env.victim.destroy();
-			for (const peer of env.peers) peer.destroy();
-			await options.teardown!(env);
-		}
-	});
-
 	it('S4 splice: every boundary converges, abandoning or resuming per what the disk holds', async function () {
 		this.timeout(300_000);
 		const { schedule } = await recordSchedule('local', s4SplicesIn, CHAOS_ENV);
@@ -211,13 +127,27 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 		this.timeout(300_000);
 		const V2_ENV: IChaosEnvOptions = {
 			...CHAOS_ENV,
-			victimExtrasFactory: () => ({ fundingProvider: v2FundingProvider() })
+			victimExtrasFactory: () => ({ fundingProvider: v2ChaosFundingProvider() })
 		};
 		const { schedule } = await recordSchedule('local', s7OpensV2, V2_ENV);
 		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
-		let abandonedCells = 0;
-		let promotedCells = 0;
-		for (const label of schedule) {
+		// The rehearsal names the durable boundary: the first commitment
+		// persist is post-commit:1, and the same batch creates the v2InFlight
+		// record and writes the first (permanent-id) row. Every label from it
+		// onward must leave EXACTLY ONE resumable row; every label before it
+		// must leave nothing. Deriving the expectation from the label rather
+		// than from whatever survived means a regression that LOSES the
+		// durable row reads as the failure it is, not as a valid abandonment.
+		const boundary = schedule.indexOf('post-commit:1');
+		expect(
+			boundary,
+			'the rehearsal crossed the durable boundary'
+		).to.be.greaterThan(0);
+		expect(boundary, 'labels exist beyond the boundary').to.be.lessThan(
+			schedule.length - 1
+		);
+		for (const [index, label] of schedule.entries()) {
+			const mustResume = index >= boundary;
 			const result = await runKillPoint('local', s7OpensV2, label, V2_ENV);
 			const at = `at ${label}`;
 			for (let i = 0; i < 10; i++) await settle();
@@ -227,25 +157,23 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 				rows.every((row) => row.channelId !== tempId),
 				`no orphan temporary row ${at}`
 			).to.equal(true);
-			expect(rows.length, `at most one channel row ${at}`).to.be.at.most(1);
-			if (rows.length === 0) {
-				// Nothing durable: the open is abandoned wholesale and the
-				// restart carries no debris.
-				abandonedCells++;
+			if (!mustResume) {
+				// Nothing durable exists before the boundary: the open is
+				// abandoned wholesale and the restart carries no debris.
+				expect(rows.length, `nothing durable ${at}`).to.equal(0);
 				expect(
 					result.restored.getChannelManager().listChannels().length,
 					`clean restart after abandon ${at}`
 				).to.equal(0);
 			} else {
 				// The promotion committed: exactly one row, under the
-				// permanent id, and it carries the durable v2 record (the
-				// same batch that creates the record writes the first row).
-				// The restart rebuilds the builder-less session from it and
-				// the reestablish that follows resumes the signature
-				// exchange over next_funding, so every promoted cell must
-				// COMPLETE the open. This is the kill-matrix acceptance for
-				// the formerly process-local window (issues 288/289).
-				promotedCells++;
+				// permanent id, carrying the durable v2 record. The restart
+				// rebuilds the builder-less session from it and the
+				// reestablish that follows resumes the signature exchange
+				// over next_funding, so every promoted cell must COMPLETE
+				// the open. This is the kill-matrix acceptance for the
+				// formerly process-local window (issues 288/289).
+				expect(rows.length, `exactly one durable row ${at}`).to.equal(1);
 				expect(
 					rows[0].state.v2InFlight != null ||
 						rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
@@ -267,7 +195,108 @@ describe('Recovery phase 7: signing sessions II (splice, v2 promotion)', () => {
 			}
 			result.destroyAll();
 		}
-		expect(abandonedCells, 'cells that abandoned').to.be.at.least(1);
-		expect(promotedCells, 'cells that promoted').to.be.at.least(1);
+	});
+	it('S7 v2 open under quorum: the same boundaries, gated sends behind the barrier (matrix row 10)', async function () {
+		this.timeout(300_000);
+		const options = quorumOptions(
+			{},
+			{
+				...CHAOS_ENV,
+				victimExtrasFactory: () => ({
+					fundingProvider: v2ChaosFundingProvider()
+				})
+			}
+		);
+		// s7's setup opens nothing (the RUN is the open), so it registers the
+		// namespace itself rather than through withNamespace, whose post-setup
+		// wait needs opening traffic to have moved the watermark already.
+		const quorumS7 = (): IChaosScenario => {
+			const inner = s7OpensV2();
+			return {
+				...inner,
+				async setup(env: IChaosEnv): Promise<void> {
+					await registerQuorumNamespace();
+					await inner.setup(env);
+				}
+			};
+		};
+		const { schedule, captured } = await recordSchedule(
+			'quorum',
+			quorumS7,
+			options
+		);
+		expect(schedule.length, 'the open produced kill labels').to.be.at.least(4);
+		// The barrier property itself, from the rehearsal for free: no gated
+		// send may precede the commit of the frame that authorizes it.
+		assertNoGatedSendBeforeCommit(schedule, captured);
+		// Same boundary classification as the local sweep: expectations come
+		// from the rehearsal's label order, not from what survived, so a
+		// lost durable row fails its cell instead of counting as abandoned.
+		const boundary = schedule.indexOf('post-commit:1');
+		expect(
+			boundary,
+			'the rehearsal crossed the durable boundary (quorum)'
+		).to.be.greaterThan(0);
+		expect(
+			boundary,
+			'labels exist beyond the boundary (quorum)'
+		).to.be.lessThan(schedule.length - 1);
+		for (const [index, label] of schedule.entries()) {
+			const mustResume = index >= boundary;
+			const result = await runKillPoint('quorum', quorumS7, label, options);
+			try {
+				const at = `at ${label} (quorum)`;
+				for (let i = 0; i < 10; i++) await settle();
+				const rows = result.restoredStorage.loadAllChannels();
+				const tempId = result.env.scratch.tempId as string;
+				expect(
+					rows.every((row) => row.channelId !== tempId),
+					`no orphan temporary row ${at}`
+				).to.equal(true);
+				if (!mustResume) {
+					expect(rows.length, `nothing durable ${at}`).to.equal(0);
+					expect(
+						result.restored.getChannelManager().listChannels().length,
+						`clean restart after abandon ${at}`
+					).to.equal(0);
+				} else {
+					// Same acceptance as the local sweep: a promoted cell holds
+					// the durable record and COMPLETES the open after restart.
+					// Quorum adds nothing to the verdict, only to the wire: the
+					// commitment_signed and tx_signatures that led here each
+					// waited on guardian replication before they left.
+					expect(rows.length, `exactly one durable row ${at}`).to.equal(1);
+					expect(
+						rows[0].state.v2InFlight != null ||
+							rows[0].state.state !== ChannelState.AWAITING_TX_SIGNATURES,
+						`an opening row carries the durable record ${at}`
+					).to.equal(true);
+					// Unlike the local sweep, completion is not synchronous
+					// here: the resumed exchange's own gated sends wait on
+					// real guardian acks over HTTP, so poll in real time.
+					await waitFor(() => {
+						const states = result.restored
+							.getChannelManager()
+							.listChannels()
+							.map((c) => c.getState());
+						return (
+							states.length === 1 &&
+							[
+								ChannelState.AWAITING_FUNDING_CONFIRMED,
+								ChannelState.AWAITING_CHANNEL_READY,
+								ChannelState.NORMAL
+							].includes(states[0])
+						);
+					});
+				}
+			} finally {
+				result.destroyAll();
+				try {
+					await options.teardown?.(result.env);
+				} catch {
+					// Teardown is best-effort by contract.
+				}
+			}
+		}
 	});
 });

@@ -7,6 +7,19 @@
  */
 
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import { createFundingScript } from '../script/funding';
+import {
+	buildTaprootKeySpendWitness,
+	createTaprootFundingScript
+} from '../script/funding-taproot';
+import { encodeShortChannelId } from '../gossip/types';
+import {
+	encodeAnnouncementSignaturesMessage,
+	encodeChannelAnnouncementMessage,
+	encodeChannelUpdateMessage
+} from '../gossip/messages';
 import { MessageType } from '../message/types';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import {
@@ -74,7 +87,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
-	MAX_FUNDING_SATOSHIS
+	MAX_FUNDING_SATOSHIS,
+	DEFAULT_CHANNEL_CONFIG
 } from './types';
 import {
 	IChannelState,
@@ -102,6 +116,8 @@ import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { ChannelSigner, ISigner } from '../keys/signer';
 import {
+	buildLocalCommitment,
+	aggregateLocalCommitmentSig,
 	buildRemoteCommitment,
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
@@ -290,7 +306,6 @@ function computeChannelReserve(
  * interactive-tx input that arrived with the full prevtx.
  */
 function extractTxidFromPrevTx(prevTx: Buffer): Buffer {
-	const bitcoin = require('bitcoinjs-lib');
 	return Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash());
 }
 
@@ -302,7 +317,6 @@ function extractTxidFromPrevTx(prevTx: Buffer): Buffer {
 function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
 	if (!input.prevTx || input.prevTx.length === 0) return null;
 	try {
-		const bitcoin = require('bitcoinjs-lib');
 		const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
 		const vout = input.prevTxVout ?? input.prevOutputIndex;
 		if (vout < 0 || vout >= prev.outs.length) return null;
@@ -4343,15 +4357,15 @@ export class Channel {
 			closing.localCommitmentNumber
 		);
 
-		const {
-			buildLocalCommitment: buildLocal
-		} = require('./commitment-builder');
-		const { createFundingScript } = require('../script/funding');
-
 		// Rebuild at the exact feerate the stored remote signature covers
 		// (signedLocal=true) — mid-fee-round the in-flight rate can differ,
 		// which would change the sighash and make the witness invalid.
-		const built = buildLocal(closing, perCommitmentPoint, undefined, true);
+		const built = buildLocalCommitment(
+			closing,
+			perCommitmentPoint,
+			undefined,
+			true
+		);
 
 		let localNonce: Uint8Array | null = null;
 		if (taproot) {
@@ -4373,10 +4387,6 @@ export class Channel {
 			// cannot aggregate, which is why that is the very first thing asked.
 			localNonce = this._deriveVerificationNonce(closing.localCommitmentNumber);
 			closing.localNonce = localNonce;
-			const { aggregateLocalCommitmentSig } = require('./commitment-builder');
-			const {
-				buildTaprootKeySpendWitness
-			} = require('../script/funding-taproot');
 			const aggSig = aggregateLocalCommitmentSig(
 				closing,
 				signer,
@@ -6320,11 +6330,7 @@ export class Channel {
 			!this._state.fundingTxid
 		)
 			return;
-
-		const bitcoinLib = require('bitcoinjs-lib');
-		const tx = bitcoinLib.Transaction.fromHex(inflight.spliceTxHex);
-
-		const { createFundingScript } = require('../script/funding');
+		const tx = bitcoin.Transaction.fromHex(inflight.spliceTxHex);
 		const oldFunding = createFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
@@ -7416,8 +7422,6 @@ export class Channel {
 
 		const session = this._spliceSession;
 		if (!session || !this._state.fundingTxid) return;
-
-		const { createFundingScript } = require('../script/funding');
 		const localFundingPubkey = this._state.localBasepoints.fundingPubkey;
 		const remoteFundingPubkey =
 			session.getRemoteFundingPubkey() ||
@@ -7677,7 +7681,6 @@ export class Channel {
 
 		// The shared input spends our current funding output (a 2-of-2 of the
 		// current funding pubkeys).
-		const { createFundingScript } = require('../script/funding');
 		const oldFunding = createFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
@@ -7724,7 +7727,7 @@ export class Channel {
 		const ourWalletWitnesses: Buffer[][] = [];
 		const ourWalletInputIndices: number[] = [];
 		if (this._spliceInInputs) {
-			const p2wshScript = require('bitcoinjs-lib').payments.p2wsh({
+			const p2wshScript = bitcoin.payments.p2wsh({
 				redeem: { output: oldFunding.witnessScript }
 			}).output as Buffer;
 			const prevouts = this._collectPrevouts(
@@ -9368,7 +9371,6 @@ export class Channel {
 		}
 
 		// Compute real SCID for ALL channels (needed for routing hints on private channels)
-		const { encodeShortChannelId } = require('../gossip/types');
 		const scid = encodeShortChannelId({
 			block: blockHeight,
 			txIndex,
@@ -9393,9 +9395,6 @@ export class Channel {
 		const sigs = signAnnouncement(announcementData);
 
 		// Encode announcement_signatures message
-		const {
-			encodeAnnouncementSignaturesMessage
-		} = require('../gossip/messages');
 		const payload = encodeAnnouncementSignaturesMessage({
 			channelId: this._state.channelId!,
 			shortChannelId: scid,
@@ -9520,7 +9519,6 @@ export class Channel {
 			.createHash('sha256')
 			.update(crypto.createHash('sha256').update(data).digest())
 			.digest();
-		const ecc = require('@bitcoinerlab/secp256k1');
 		try {
 			if (
 				ecc.verify(hash, this._state.localBasepoints.fundingPubkey, storedSig)
@@ -9619,7 +9617,6 @@ export class Channel {
 		const remoteBp = this._state.remoteBasepoints!;
 
 		// Construct the full channel_announcement message
-		const { encodeChannelAnnouncementMessage } = require('../gossip/messages');
 		const announcement = encodeChannelAnnouncementMessage({
 			nodeSignature1: isNode1
 				? localNodeSig
@@ -9643,7 +9640,6 @@ export class Channel {
 		});
 
 		// Build initial channel_update (direction = our direction bit)
-		const { encodeChannelUpdateMessage } = require('../gossip/messages');
 		const directionBit = isNode1 ? 0 : 1;
 		// BOLT 7: htlc_maximum_msat MUST be <= channel capacity
 		const capacityMsat = this._state.fundingSatoshis * 1000n;
@@ -10701,15 +10697,11 @@ export class Channel {
 			const taproot = isTaprootChannel(session.getOpenChannelType() ?? null);
 			let fundingSpk: Buffer;
 			if (taproot) {
-				const {
-					createTaprootFundingScript
-				} = require('../script/funding-taproot');
 				fundingSpk = createTaprootFundingScript(
 					this._state.localBasepoints.fundingPubkey,
 					this._state.remoteBasepoints.fundingPubkey
 				).p2trOutput;
 			} else {
-				const { createFundingScript } = require('../script/funding');
 				fundingSpk = createFundingScript(
 					this._state.localBasepoints.fundingPubkey,
 					this._state.remoteBasepoints.fundingPubkey
@@ -11059,7 +11051,6 @@ export class Channel {
 		let fundingScript: Buffer | null = null;
 		if (this._state.remoteBasepoints) {
 			try {
-				const { createFundingScript } = require('../script/funding');
 				const localPub =
 					kind === 'splice'
 						? this._spliceSession!.getLocalFundingPubkey()
@@ -11142,16 +11133,11 @@ export class Channel {
 		if (!session || !this._state.remoteBasepoints) return null;
 		const built = session.buildTransaction();
 		if (!built) return null;
-		const {
-			buildSpliceTx: buildV2Tx,
-			findOutputIndex: findFundingIndex
-		} = require('./splice-tx');
-		const { createFundingScript } = require('../script/funding');
 		let tx;
 		try {
 			// The interactive-tx final ordering (ascending serial_id) is exactly
 			// what buildSpliceTx produces; both sides derive the identical txid.
-			tx = buildV2Tx(
+			tx = buildSpliceTx(
 				built.inputs.map((i: IInteractiveTxInput) => ({
 					serialId: i.serialId,
 					prevTxid:
@@ -11175,7 +11161,7 @@ export class Channel {
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
 		);
-		const outputIndex = findFundingIndex(tx, funding.p2wshOutput);
+		const outputIndex = findOutputIndex(tx, funding.p2wshOutput);
 		if (outputIndex < 0) return null;
 		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
 			return null;
@@ -11449,7 +11435,6 @@ export class Channel {
 		if (built) {
 			tx = built.tx;
 		} else if (record) {
-			const bitcoin = require('bitcoinjs-lib');
 			try {
 				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
 			} catch {
@@ -11487,7 +11472,6 @@ export class Channel {
 		if (!input.prevTx || input.prevTx.length < 32) {
 			return 'v2 funding input carries no previous transaction';
 		}
-		const bitcoin = require('bitcoinjs-lib');
 		let script: Buffer;
 		try {
 			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
@@ -11513,11 +11497,16 @@ export class Channel {
 		stack: Buffer[],
 		prevouts: { scripts: Buffer[]; values: bigint[] }
 	): string | null {
-		const bitcoin = require('bitcoinjs-lib');
-		const ecc = require('@bitcoinerlab/secp256k1');
 		const script = prevouts.scripts[index];
 		const value = prevouts.values[index];
 		if (stack.length === 0) return 'empty witness stack';
+		// bitcoinjs sighash APIs take number values; above 2^53 the
+		// narrowing would silently compute a wrong sighash and fail the
+		// verify for the wrong reason. No real prevout gets there (21M BTC
+		// in sats fits), so refuse loudly instead of narrowing quietly.
+		if (prevouts.values.some((v) => v > BigInt(Number.MAX_SAFE_INTEGER))) {
+			return 'prevout value exceeds the safe integer range';
+		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
 		const isP2wsh =
@@ -11613,7 +11602,6 @@ export class Channel {
 	 * SIGHASH_ALL byte, or the problem as a string.
 	 */
 	private _decodeDerSighashAll(el: Buffer): Buffer | string {
-		const bitcoin = require('bitcoinjs-lib');
 		let decoded: { signature: Buffer; hashType: number };
 		try {
 			decoded = bitcoin.script.signature.decode(el);
@@ -12335,7 +12323,6 @@ export class Channel {
 		}>,
 		sharedOverride?: { index: number; script: Buffer; value: bigint }
 	): { scripts: Buffer[]; values: bigint[] } | null {
-		const bitcoin = require('bitcoinjs-lib');
 		const scripts: Buffer[] = [];
 		const values: bigint[] = [];
 		for (let i = 0; i < tx.ins.length; i++) {
@@ -12390,7 +12377,6 @@ export class Channel {
 			if (record.ourWitnesses.length !== record.ourWalletInputIndices.length) {
 				return null;
 			}
-			const bitcoin = require('bitcoinjs-lib');
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
@@ -13207,7 +13193,6 @@ export function createOpenerChannel(params: {
 	localBasepoints: IChannelBasepoints;
 	localPerCommitmentSeed: Buffer;
 }): Channel {
-	const { DEFAULT_CHANNEL_CONFIG } = require('./types');
 	const state = createOpenerState({
 		temporaryChannelId: crypto.randomBytes(32),
 		fundingSatoshis: params.fundingSatoshis,
@@ -13228,7 +13213,6 @@ export function createAcceptorChannel(params: {
 	localBasepoints: IChannelBasepoints;
 	localPerCommitmentSeed: Buffer;
 }): Channel {
-	const { DEFAULT_CHANNEL_CONFIG } = require('./types');
 	const state = createAcceptorState({
 		temporaryChannelId: params.temporaryChannelId,
 		fundingSatoshis: 0n,

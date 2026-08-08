@@ -231,10 +231,24 @@ export function quorumOptions(
 			});
 			return { enabled: true, durability, barrier: run.barrier };
 		},
-		afterRestart: async (): Promise<void> => {
+		afterRestart: async (_env, restored): Promise<void> => {
 			// Gateless quorum node: kicking replication is the integrator's
 			// job, and the restart IS the integrator here.
 			current!.barrier.kickReplication();
+			// The restarted (or restored) database may owe a startup repair
+			// receipt: carried v2 rows, or the one-time snapshot-schema
+			// repair a reconstructed database always takes (its meta does
+			// not ride the frames). The node quarantines its own traffic
+			// until the quorum receipts that repair, so the harness must
+			// wait it out before driving reestablish into closed gates,
+			// exactly as a real integrator's reconnect loop would retry.
+			if (restored) {
+				await waitFor(
+					() =>
+						!(restored as unknown as { startupRepairPending?: boolean })
+							.startupRepairPending
+				);
+			}
 		},
 		teardown: async (): Promise<void> => {
 			if (!current) return;
@@ -245,9 +259,22 @@ export function quorumOptions(
 }
 
 /**
+ * Register the run's recovery namespace and hand the barrier its lease.
+ * Quorum scenarios must do this before the channel opens: nothing is
+ * provable until the namespace exists.
+ */
+export async function registerQuorumNamespace(): Promise<void> {
+	const decision = await current!.replicator.ensureNamespace();
+	expect(decision.outcome, 'namespace registered').to.equal('registered');
+	current!.lease = (decision as { lease: IWriterLeaseKeys }).lease;
+}
+
+/**
  * Quorum scenarios must register the namespace before the channel opens:
  * nothing is provable until it exists, and the lease is what the barrier's
- * closure serves from then on.
+ * closure serves from then on. The post-setup wait needs a channel to have
+ * opened during setup; a scenario whose RUN does the opening (S7) calls
+ * registerQuorumNamespace itself instead.
  */
 export function withNamespace(
 	factory: () => IChaosScenario
@@ -257,9 +284,7 @@ export function withNamespace(
 		return {
 			...inner,
 			async setup(env: IChaosEnv): Promise<void> {
-				const decision = await current!.replicator.ensureNamespace();
-				expect(decision.outcome, 'namespace registered').to.equal('registered');
-				current!.lease = (decision as { lease: IWriterLeaseKeys }).lease;
+				await registerQuorumNamespace();
 				await inner.setup(env);
 				// The opening traffic itself crosses the barrier (the
 				// acceptor's funding_signed and the opener's broadcast

@@ -39,7 +39,15 @@ import {
 	restoreBestRecoveryCapsule,
 	selectRecoveryCapsule,
 	deriveRecoveryMasterKey,
-	deriveRecoveryRoot
+	deriveRecoveryRoot,
+	deriveFrameIv,
+	deriveFrameKey,
+	decodeFrame,
+	decryptFrame,
+	encodeFrame,
+	encryptFrame,
+	frameAad,
+	hashFrame
 } from '../../src/lightning/recovery';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodePeerStorageMessage } from '../../src/lightning/message/peer-storage';
@@ -206,6 +214,13 @@ function buildDirectGraph(alice: LightningNode): void {
 }
 
 const NODE_SECRET = makeNodeConfig(1).nodePrivateKey;
+
+/** The capsule dry-run scratch: a fresh in-memory backend per candidate. */
+const scratchStorage = (): SqliteStorage => {
+	const scratch = new SqliteStorage(':memory:');
+	scratch.open();
+	return scratch;
+};
 
 function openStorage(): SqliteStorage {
 	const storage = new SqliteStorage(':memory:');
@@ -649,7 +664,8 @@ describe('Recovery phase 3: end to end restore from the capsule alone', () => {
 		const result = restoreBestRecoveryCapsule(
 			[crypto.randomBytes(300), blob!],
 			restoredStorage,
-			makeNodeConfig(1).nodePrivateKey
+			makeNodeConfig(1).nodePrivateKey,
+			{ scratchStorage }
 		);
 		expect(result.tier).to.equal(2);
 		expect(
@@ -847,7 +863,8 @@ describe('Recovery phase 3: review regressions', () => {
 		const result = restoreBestRecoveryCapsule(
 			[tamperedNewer, older.blob],
 			target,
-			NODE_SECRET
+			NODE_SECRET,
+			{ scratchStorage }
 		);
 		// The raw-highest candidate is invalid; the validated lower one wins.
 		expect(result.tier).to.equal(2);
@@ -880,7 +897,9 @@ describe('Recovery phase 3: review regressions', () => {
 		}).blob;
 		const target = openStorage();
 		expect(() =>
-			restoreBestRecoveryCapsule([blobA, blobB], target, NODE_SECRET)
+			restoreBestRecoveryCapsule([blobA, blobB], target, NODE_SECRET, {
+				scratchStorage
+			})
 		).to.throw(/conflicting/);
 		a.storage.close();
 		b.storage.close();
@@ -896,7 +915,9 @@ describe('Recovery phase 3: review regressions', () => {
 		});
 		const tampered = tamperInline(composed.capsule, NODE_SECRET);
 		const target = openStorage();
-		const result = restoreBestRecoveryCapsule([tampered], target, NODE_SECRET);
+		const result = restoreBestRecoveryCapsule([tampered], target, NODE_SECRET, {
+			scratchStorage
+		});
 		expect(result.tier).to.equal(1);
 		expect(result.scb.version).to.equal(1);
 		// Nothing touched the target on the failed Tier 2 attempt.
@@ -1068,12 +1089,540 @@ describe('Recovery phase 3: review regressions', () => {
 		const result = restoreBestRecoveryCapsule(
 			[badInline, badScb, good.blob],
 			target,
-			NODE_SECRET
+			NODE_SECRET,
+			{ scratchStorage }
 		);
 		expect(result.tier).to.equal(2);
 		expect(result.capsule.latestSequence).to.equal(good.capsule.latestSequence);
 		expect(dumpTables(target)).to.equal(dumpTables(storage));
 		storage.close();
 		target.close();
+	});
+});
+
+describe('Recovery phase 3: capsule schema prevalidation', () => {
+	it('rejects a future-schema capsule BEFORE writing the target and falls back to Tier 1', () => {
+		// A single-frame journal whose base snapshot is rewritten, with a
+		// valid AEAD seal and matching tip hash, to declare schema '3':
+		// what a capsule composed by a future release looks like.
+		const { storage } = journaledStorage(1);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const masterKey = deriveRecoveryMasterKey(NODE_SECRET);
+		const nodeId = getPublicKey(NODE_SECRET);
+		const key = deriveFrameKey(masterKey, nodeId, epoch);
+		const aad = frameAad(
+			nodeId,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.schemaVersion = '3';
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// Direct restore: the schema refusal lands during candidate
+		// validation, BEFORE the first write to the target.
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const target1 = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET)
+		).to.throw(/cannot restore/);
+		expect(
+			target1.loadRecoveryFrames!(0),
+			'no frames written to the target'
+		).to.have.length(0);
+		expect(
+			target1.getRecoveryMeta!('journal_tip_sequence') ?? null,
+			'no journal metadata written either'
+		).to.equal(null);
+		target1.close();
+
+		// Selection: the incompatible inline journal is a CANDIDATE defect,
+		// so the valid Tier 1 SCB is still returned and the target stays
+		// clean, instead of an exception over a half-written database.
+		const target2 = openStorage();
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET, {
+			scratchStorage
+		});
+		expect(best.tier, 'the SCB tier survives').to.equal(1);
+		expect(best.framesApplied).to.equal(0);
+		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
+		target2.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: capsule replay failures roll back', () => {
+	it('a replay-invalid capsule leaves the target untouched and falls back to Tier 1', () => {
+		// An AUTHENTICATED, current-schema capsule whose snapshot content
+		// cannot actually replay (an outbox row with a null peerId hits the
+		// NOT NULL constraint): chain verification cannot see this, so the
+		// install transaction must roll the frames and metadata back and
+		// selection must degrade to the valid Tier 1 SCB.
+		const { storage } = journaledStorage(1);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const masterKey = deriveRecoveryMasterKey(NODE_SECRET);
+		const nodeId = getPublicKey(NODE_SECRET);
+		const key = deriveFrameKey(masterKey, nodeId, epoch);
+		const aad = frameAad(
+			nodeId,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.outbox = [
+			{
+				peerId: null as unknown as string,
+				channelId: undefined,
+				messageType: 1,
+				wireMessage: Buffer.alloc(2),
+				disposition: 'pending_send',
+				frameSequence: null
+			}
+		];
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			deriveRecoveryRoot(NODE_SECRET).recoveryId,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// Direct restore: the throw leaves the target EXACTLY as it was,
+		// because frames, metadata and replay share one transaction.
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const target1 = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target1, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/failed to replay/);
+		expect(
+			target1.loadRecoveryFrames!(0),
+			'the dry-run refused before any target write'
+		).to.have.length(0);
+		expect(
+			target1.getRecoveryMeta!('journal_tip_sequence') ?? null,
+			'and the metadata'
+		).to.equal(null);
+		target1.close();
+
+		// Selection: a candidate defect, so the Tier 1 SCB still restores.
+		const target2 = openStorage();
+		const best = restoreBestRecoveryCapsule([blob], target2, NODE_SECRET, {
+			scratchStorage
+		});
+		expect(best.tier, 'Tier 1 fallback survives').to.equal(1);
+		expect(target2.loadRecoveryFrames!(0)).to.have.length(0);
+		target2.close();
+		storage.close();
+	});
+
+	it('a dirty target is refused loudly before any candidate is tried', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const dirty = openStorage();
+		dirty.savePreimage('bb'.repeat(32), Buffer.alloc(32, 7));
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], dirty, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/EMPTY target/);
+		dirty.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: restore target and backend contracts', () => {
+	it('refuses a target carrying recovery metadata or frames, not just tables', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+
+		// Metadata-only residue: application tables empty, but journal
+		// metadata present. Overwriting it would silently orphan another
+		// journal's identity.
+		const metaDirty = openStorage();
+		metaDirty.setRecoveryMeta!('journal_tip_sequence', '7');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], metaDirty, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/recovery metadata/);
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, metaDirty, NODE_SECRET)
+		).to.throw(/recovery metadata/);
+		expect(
+			metaDirty.getRecoveryMeta!('journal_tip_sequence'),
+			'the residue was not overwritten'
+		).to.equal('7');
+		metaDirty.close();
+
+		// Frame residue: a stray stored frame with no tip metadata.
+		const frameDirty = openStorage();
+		const row = storage.loadRecoveryFrames!(0)[0];
+		frameDirty.saveRecoveryFrame!(row);
+		frameDirty.deleteRecoveryMeta?.('journal_tip_sequence');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], frameDirty, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/recovery frames/);
+		frameDirty.close();
+		storage.close();
+	});
+
+	it('restores Tier 2 through a backend that refuses nested transactions', () => {
+		// IStorageBackend does not promise reentrant transactions. Emulate
+		// a strictly non-reentrant backend: the whole install (frames,
+		// metadata, replay) must share ONE transaction instead of nesting.
+		const { storage } = journaledStorage(2);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const real = openStorage();
+		let inTransaction = false;
+		const strict = new Proxy(real, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'transaction') {
+					return <T>(fn: () => T): T => {
+						if (inTransaction) {
+							throw new Error('nested transaction refused');
+						}
+						inTransaction = true;
+						try {
+							return target.transaction(fn);
+						} finally {
+							inTransaction = false;
+						}
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+
+		const result = restoreFromRecoveryCapsule(capsule, strict, NODE_SECRET);
+		expect(result.tier, 'the valid capsule restores Tier 2').to.equal(2);
+		expect(real.loadRecoveryFrames!(0).length).to.be.greaterThan(0);
+		expect(real.loadAllPreimages().length).to.be.greaterThan(0);
+		real.close();
+		storage.close();
+	});
+
+	it('propagates a broken target instead of degrading it to Tier 1', () => {
+		// A valid capsule over a target whose frame store fails is a TARGET
+		// problem: returning Tier 1 would mask the broken database.
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const broken = openStorage();
+		broken.saveRecoveryFrame = (): void => {
+			throw new Error('disk write failed');
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/disk write failed/);
+		broken.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-13 boundary hardening', () => {
+	it('propagates a replay-time target failure instead of Tier 1', () => {
+		// A VALID capsule over a target whose preimage table fails during
+		// the replay: with the dry-run proving the content on a scratch,
+		// the install-time failure is a TARGET problem and must propagate,
+		// never degrade to Tier 1.
+		const { storage } = journaledStorage(2);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const broken = openStorage();
+		broken.savePreimage = (): void => {
+			throw new Error('preimage disk write failed');
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/preimage disk write failed/);
+		// The shared install transaction rolled everything back.
+		expect(broken.loadRecoveryFrames!()).to.have.length(0);
+		expect(broken.getRecoveryMeta!('journal_tip_sequence') ?? null).to.equal(
+			null
+		);
+		broken.close();
+		storage.close();
+	});
+
+	it('refuses residue the old empty-target check missed', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const row = storage.loadRecoveryFrames!(0)[0];
+
+		// (a) A sequence-0 frame: loadRecoveryFrames(0) reads strictly
+		// above, so the old check missed it; the restored journal would be
+		// immediately unverifiable.
+		const seqZero = openStorage();
+		seqZero.saveRecoveryFrame!({ ...row, sequence: 0 });
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], seqZero, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/recovery frames/);
+		seqZero.close();
+
+		// (b) Recovery-control metadata beyond the journal's own keys.
+		const leased = openStorage();
+		leased.setRecoveryMeta!('writer_lease_v1', 'aa'.repeat(16));
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], leased, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/recovery metadata/);
+		leased.close();
+
+		// (c) An orphaned key-index row: it would shift the next
+		// derivation index of the restored node.
+		const indexed = openStorage();
+		indexed.saveChannelKeyIndex('cc'.repeat(32), 7);
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], indexed, NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/EMPTY target/);
+		indexed.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-14 validator and residue hardening', () => {
+	it('selection REQUIRES the scratch and a broken validator propagates', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+
+		// (a) Mandatory: without a scratch the candidate/Tier-1 contract
+		// cannot be honored, so selection refuses to run at all.
+		const t1 = openStorage();
+		expect(() => restoreBestRecoveryCapsule([blob], t1, NODE_SECRET)).to.throw(
+			/requires options\.scratchStorage/
+		);
+		t1.close();
+
+		// (b) A validator whose own storage cannot pass the probe is
+		// INFRASTRUCTURE failure: it must propagate raw, never downgrade a
+		// valid capsule to another candidate or Tier 1.
+		const t2 = openStorage();
+		const brokenScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			scratch.transaction = (): never => {
+				throw new Error('scratch backend exploded');
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], t2, NODE_SECRET, {
+				scratchStorage: brokenScratch
+			})
+		).to.throw(/scratch backend exploded/);
+		expect(t2.loadRecoveryFrames!()).to.have.length(0);
+		t2.close();
+		storage.close();
+	});
+
+	it('a scratch that mutates its inputs cannot alter the target replay', () => {
+		// The dry-run hands decoded frames to FOREIGN code; a hostile or
+		// buggy adapter mutating a Buffer argument must not change what the
+		// target reconstructs, because the install re-decodes from the
+		// authenticated rows.
+		const { storage } = journaledStorage(1);
+		const original = storage.loadAllPreimages()[0].preimage.toString('hex');
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const mutatingScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			const realSave = scratch.savePreimage.bind(scratch);
+			scratch.savePreimage = (hash: string, preimage: Buffer): void => {
+				realSave(hash, preimage);
+				preimage.fill(0); // hostile: mutate the shared buffer
+			};
+			return scratch;
+		};
+		const target = openStorage();
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const result = restoreFromRecoveryCapsule(capsule, target, NODE_SECRET, {
+			scratchStorage: mutatingScratch
+		});
+		expect(result.tier).to.equal(2);
+		expect(
+			target.loadAllPreimages()[0].preimage.toString('hex'),
+			'the target replay used a fresh decode, not the mutated buffers'
+		).to.equal(original);
+		target.close();
+		storage.close();
+	});
+
+	it('a non-enumerating backend still refuses guardian and corrupt residue', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		// Hide the enumeration so the fallback list is what protects.
+		const nonEnumerating = (base: SqliteStorage): IStorageBackend => {
+			const proxied = new Proxy(base, {
+				get(target, prop, receiver): unknown {
+					if (prop === 'listRecoveryMetaKeys') return undefined;
+					const value = Reflect.get(target, prop, receiver);
+					return typeof value === 'function' ? value.bind(target) : value;
+				}
+			});
+			return proxied as unknown as IStorageBackend;
+		};
+
+		// (a) A stale replication watermark.
+		const w = openStorage();
+		w.setRecoveryMeta!('guardian_replicated_through', '5');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], nonEnumerating(w), NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/guardian_replicated_through/);
+		w.close();
+
+		// (b) An EMPTY corrupt writer lease is presence, not absence.
+		const l = openStorage();
+		l.setRecoveryMeta!('writer_lease_v1', '');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], nonEnumerating(l), NODE_SECRET, {
+				scratchStorage
+			})
+		).to.throw(/writer_lease_v1/);
+		l.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: validator failures are never capsule defects', () => {
+	it('a validator that cannot replay KNOWN-GOOD content propagates raw', () => {
+		// The probe replays a synthetic known-good frame set exercising the
+		// same reads, table writes and transaction completion a real replay
+		// needs. A scratch backend failing THAT is broken infrastructure:
+		// it must propagate raw, never silently discard a valid Tier-2
+		// candidate into Tier 1.
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const failingReplayScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			scratch.savePreimage = (): void => {
+				throw new Error('scratch preimage table broken');
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+				scratchStorage: failingReplayScratch
+			})
+		).to.throw(/scratch preimage table broken/);
+		expect(
+			target.loadRecoveryFrames!(),
+			'the target was never touched'
+		).to.have.length(0);
+		target.close();
+		storage.close();
 	});
 });

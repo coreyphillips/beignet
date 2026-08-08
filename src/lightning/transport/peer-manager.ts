@@ -134,6 +134,20 @@ export interface IPeerInfo {
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
+/**
+ * A dial that was overtaken by an explicit disconnectPeer() for the same
+ * peer. TYPED so multi-address retry loops (connectPeerById's graph and
+ * DNS fallbacks) can stop instead of treating the cancellation as one
+ * more failed address and dialing the next one under the new generation,
+ * which would reverse the explicit disconnect.
+ */
+export class PeerDialCancelledError extends Error {
+	constructor(pubkey: string) {
+		super(`Connection to peer ${pubkey} was cancelled while establishing`);
+		this.name = 'PeerDialCancelledError';
+	}
+}
+
 export class PeerManager extends EventEmitter {
 	private localPrivateKey: Buffer;
 	private localPubkeyHex: string;
@@ -157,6 +171,15 @@ export class PeerManager extends EventEmitter {
 	private reconnectTimers: Map<string, ReturnType<typeof setTimeout>> =
 		new Map();
 	private reconnectDelays: Map<string, number> = new Map();
+	/**
+	 * Bumped by every explicit disconnectPeer(). A dial snapshots it before
+	 * starting; a failure only schedules auto-reconnect when the generation
+	 * is unchanged, so a deliberate cancellation issued DURING the dial
+	 * (e.g. by a synchronous peer:error observer cleaning up after a failed
+	 * held delivery) is never resurrected by the dial's own error handling,
+	 * while the dial itself still rejects honestly.
+	 */
+	private cancelGenerations: Map<string, number> = new Map();
 	// Per-peer timers that reset the backoff once a connection has stayed up for
 	// STABLE_CONNECTION_MS. Cleared if the peer disconnects before then.
 	private stabilityTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -202,10 +225,18 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		const cancelGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		try {
 			await this.dialPeer(pubkey, host, port, transport);
 		} catch (err) {
-			if (this.autoReconnect) {
+			// An explicit disconnectPeer() during the dial (a peer:error
+			// observer's cleanup, an operator decision) already cancelled
+			// this peer's reconnect state; re-arming it here would reverse
+			// that. The rejection itself still propagates.
+			if (
+				this.autoReconnect &&
+				(this.cancelGenerations.get(pubkey) ?? 0) === cancelGeneration
+			) {
 				this.scheduleReconnect(pubkey);
 			}
 			throw err;
@@ -223,6 +254,7 @@ export class PeerManager extends EventEmitter {
 		port: number,
 		transport?: IPeerTransportOptions
 	): Promise<void> {
+		const dialGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 		if (this.connectionsDisabled()) {
 			throw new Error(
 				`Connections are ${this.connectionsDisabledReason()}; refusing dial to peer ${pubkey}`
@@ -282,13 +314,27 @@ export class PeerManager extends EventEmitter {
 			port,
 			localFeatures: this.localFeatures,
 			networks: this.networks,
-			createSocket
+			createSocket,
+			// Held until bring-up completes: the post-handshake drain must
+			// not race registration or the peer:connect handlers (a queued
+			// channel_reestablish processed before our own reconnect hook
+			// would suppress the reestablish WE owe).
+			holdMessagesUntilRelease: true
 		});
 
 		this.setupPeerListeners(pubkey, peer);
 		// Visible to freezeConnections() while establishing: a freeze aborts
 		// the handshake instead of letting it complete and register later.
 		this.pendingPeers.add(peer);
+		// Visible to disconnectPeer() while establishing: an explicit
+		// cancellation aborts the handshake NOW instead of leaving the
+		// socket live until it completes or times out.
+		let pendingDials = this.pendingDialsByPubkey.get(pubkey);
+		if (!pendingDials) {
+			pendingDials = new Set();
+			this.pendingDialsByPubkey.set(pubkey, pendingDials);
+		}
+		pendingDials.add(peer);
 
 		try {
 			await peer.connect();
@@ -298,9 +344,19 @@ export class PeerManager extends EventEmitter {
 			if (previousAddress) {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
+			// A dial aborted BY the cancellation is reported as the typed
+			// cancellation, not as an address failure a retry loop would
+			// route around.
+			if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+				throw new PeerDialCancelledError(pubkey);
+			}
 			throw err;
 		} finally {
 			this.pendingPeers.delete(peer);
+			pendingDials.delete(peer);
+			if (pendingDials.size === 0) {
+				this.pendingDialsByPubkey.delete(pubkey);
+			}
 		}
 		// Recheck AFTER the async establishment: a freeze, destroy or gate
 		// closure that landed mid-handshake must win over registration.
@@ -313,6 +369,15 @@ export class PeerManager extends EventEmitter {
 			throw new Error(
 				`Connection to peer ${pubkey} was invalidated while establishing`
 			);
+		}
+		// An explicit disconnectPeer() issued while the handshake was in
+		// flight wins over registration too: cancellation covers the WHOLE
+		// dial lifecycle, not just the failure path, or a pending dial
+		// would resurrect the very peer the caller just removed.
+		if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+			peer.removeAllListeners();
+			peer.disconnect();
+			throw new PeerDialCancelledError(pubkey);
 		}
 		// The peer may have dialed US while our handshake was in flight. Apply
 		// the deterministic tie-break (see preferOutboundTo): if the registered
@@ -334,6 +399,14 @@ export class PeerManager extends EventEmitter {
 			// the inbound replacement path: channels mark AWAITING_REESTABLISH
 			// first, then the connect handler re-drives channel_reestablish.
 			this.removeRegisteredPeer(pubkey, raceWinner);
+			// The removal emitted peer:disconnect SYNCHRONOUSLY: an observer
+			// may have called disconnectPeer() to cancel the peer for good,
+			// and registering the replacement anyway would reverse that.
+			if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+				peer.removeAllListeners();
+				peer.disconnect();
+				throw new PeerDialCancelledError(pubkey);
+			}
 		}
 		this.peers.set(pubkey, peer);
 		// Reset the backoff only AFTER the connection proves stable, not
@@ -348,7 +421,41 @@ export class PeerManager extends EventEmitter {
 		if (typeof stabilityTimer.unref === 'function') stabilityTimer.unref();
 		this.stabilityTimers.set(pubkey, stabilityTimer);
 		captureWireEvent('connect', pubkey, 'outbound');
-		this.emit('peer:connect', pubkey);
+		// The connect hook IS the required bring-up: the node marks its
+		// channels for reestablish and sends OUR channel_reestablish in it.
+		// If that work fails, releasing the held traffic (the peer's own
+		// reestablish among it) would reopen the exact ordering hazard the
+		// hold exists to prevent, so the connection is torn down instead
+		// and the dial fails visibly. Only a completed bring-up releases.
+		try {
+			this.emit('peer:connect', pubkey);
+		} catch (err) {
+			this.removeRegisteredPeer(pubkey, peer);
+			throw err instanceof Error ? err : new Error(String(err));
+		}
+		const release = peer.releaseHeldMessages();
+		// The release itself can legitimately end in teardown (a failed
+		// held handler disconnects); make the registry agree even when no
+		// socket close event backs it (both cleanups are idempotent), and
+		// decide the dial CAUSALLY. A delivery FAILURE fails the dial no
+		// matter who reconciled the registry meanwhile: a peer:error
+		// observer's cleanup disconnect must not convert the failure into
+		// a silent success with zero peers. Only a teardown that happened
+		// WITHOUT a delivery failure and whose registration deliberately
+		// moved on (a peer:connect observer called disconnectPeer, or a
+		// fresh connection replaced this one) resolves quietly; rethrowing
+		// there would read as a dial failure and schedule the very
+		// auto-reconnect that disconnect just cancelled.
+		if (release === 'failed' || peer.getState() !== 'ready') {
+			const owned = this.peers.get(pubkey) === peer;
+			if (owned) {
+				this.removeRegisteredPeer(pubkey, peer);
+			}
+			if (release !== 'failed' && !owned) return;
+			throw new Error(
+				`Connection to peer ${pubkey} failed during held-message delivery`
+			);
+		}
 	}
 
 	private clearStabilityTimer(pubkey: string): void {
@@ -399,9 +506,31 @@ export class PeerManager extends EventEmitter {
 	}
 
 	/**
+	 * Opaque token for a peer's current cancellation generation. Callers
+	 * running multi-step operations around dials (address resolution, DNS
+	 * bootstrap) capture it up front and compare before every step:
+	 * a change means disconnectPeer() cancelled the peer meanwhile, even
+	 * if no dial existed at that moment to reject with the typed error.
+	 */
+	cancellationToken(pubkey: string): number {
+		return this.cancelGenerations.get(pubkey) ?? 0;
+	}
+
+	/**
 	 * Disconnect from a peer.
 	 */
 	disconnectPeer(pubkey: string): void {
+		this.cancelGenerations.set(
+			pubkey,
+			(this.cancelGenerations.get(pubkey) ?? 0) + 1
+		);
+		// Abort in-flight outbound dials NOW: a stalled handshake must not
+		// keep its socket live (and later reject or register) after the
+		// caller explicitly cancelled the peer. The abort makes the dial
+		// reject as a typed cancellation.
+		for (const pending of this.pendingDialsByPubkey.get(pubkey) ?? []) {
+			pending.disconnect();
+		}
 		const timer = this.reconnectTimers.get(pubkey);
 		if (timer) {
 			clearTimeout(timer);
@@ -476,6 +605,12 @@ export class PeerManager extends EventEmitter {
 	 * in-flight handshake survives it and registers afterwards.
 	 */
 	private pendingPeers = new Set<Peer>();
+	/**
+	 * In-flight OUTBOUND dials indexed by pubkey, so an explicit
+	 * disconnectPeer() can abort a stalled handshake immediately instead
+	 * of leaving its socket live until it finishes or times out.
+	 */
+	private pendingDialsByPubkey = new Map<string, Set<Peer>>();
 
 	/**
 	 * Listeners whose bind has not completed. this.server / this.wsServer are
@@ -877,7 +1012,13 @@ export class PeerManager extends EventEmitter {
 			host: socket.remoteAddress || 'unknown',
 			port: socket.remotePort || 0,
 			localFeatures: this.localFeatures,
-			networks: this.networks
+			networks: this.networks,
+			// Held until bring-up completes; see the outbound twin. For
+			// inbound this also closes the harder gap: the drain runs
+			// before acceptInbound() resolves, when no listener is even
+			// attached yet, so unheld coalesced frames would be LOST, not
+			// merely early.
+			holdMessagesUntilRelease: true
 		});
 
 		// Visible to freezeConnections() while the handshake is in flight.
@@ -933,7 +1074,17 @@ export class PeerManager extends EventEmitter {
 					// replacement's peer:connect so channels are marked
 					// AWAITING_REESTABLISH first and the connect handler then
 					// re-drives channel_reestablish over the new connection.
+					const replaceGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 					this.removeRegisteredPeer(pubkey, existing);
+					// The removal emitted peer:disconnect SYNCHRONOUSLY: an
+					// observer may have called disconnectPeer() to cancel the
+					// peer for good, and registering the fresh inbound anyway
+					// would reverse that. The remote may redial; that dial
+					// will be judged under the new generation.
+					if ((this.cancelGenerations.get(pubkey) ?? 0) !== replaceGeneration) {
+						peer.disconnect();
+						return;
+					}
 				}
 
 				this.setupPeerListeners(pubkey, peer);
@@ -944,7 +1095,29 @@ export class PeerManager extends EventEmitter {
 				// Do NOT store inbound peer address — peer.port is the TCP source (ephemeral) port,
 				// not the node's listening port. Reconnect attempts to ephemeral ports always fail.
 				captureWireEvent('connect', pubkey, 'inbound');
-				this.emit('peer:connect', pubkey);
+				// The outbound twin's rule: only a completed bring-up
+				// releases; a failed one tears the connection down (the
+				// remote will redial and BOTH sides retry the bring-up).
+				try {
+					this.emit('peer:connect', pubkey);
+				} catch (err) {
+					this.removeRegisteredPeer(pubkey, peer);
+					try {
+						this.emit(
+							'peer:error',
+							pubkey,
+							err instanceof Error ? err : new Error(String(err))
+						);
+					} catch {
+						// The error observer threw too; the teardown already
+						// happened, which is the outcome that matters.
+					}
+					return;
+				}
+				peer.releaseHeldMessages();
+				if (peer.getState() !== 'ready') {
+					this.removeRegisteredPeer(pubkey, peer);
+				}
 			})
 			.catch(() => {
 				// Handshake/init failed — socket already cleaned up by Peer
@@ -952,26 +1125,33 @@ export class PeerManager extends EventEmitter {
 			});
 	}
 
+	private dispatchPeerMessage(
+		pubkey: string,
+		type: number,
+		payload: Buffer
+	): void {
+		// Inbound dispatch gate: a refused message is dropped here, before
+		// any handler (channel, gossip, onion, peer storage) can act on it.
+		if (this.inboundGate && !this.inboundGate(pubkey, type)) {
+			return;
+		}
+
+		// Route to type-specific handlers
+		const handlers = this.messageHandlers.get(type);
+		if (handlers) {
+			for (const handler of handlers) {
+				handler(pubkey, type, payload);
+			}
+		}
+
+		// Also emit as generic event
+		this.emit('message', pubkey, type, payload);
+	}
+
 	private setupPeerListeners(pubkey: string, peer: Peer): void {
 		peer.on('message', (type: number, payload: Buffer) => {
 			captureWireMessage('in', pubkey, type, payload);
-
-			// Inbound dispatch gate: a refused message is dropped here, before
-			// any handler (channel, gossip, onion, peer storage) can act on it.
-			if (this.inboundGate && !this.inboundGate(pubkey, type)) {
-				return;
-			}
-
-			// Route to type-specific handlers
-			const handlers = this.messageHandlers.get(type);
-			if (handlers) {
-				for (const handler of handlers) {
-					handler(pubkey, type, payload);
-				}
-			}
-
-			// Also emit as generic event
-			this.emit('message', pubkey, type, payload);
+			this.dispatchPeerMessage(pubkey, type, payload);
 		});
 
 		peer.on('error', (err: Error) => {
@@ -995,9 +1175,18 @@ export class PeerManager extends EventEmitter {
 				this.inboundPeerCount--;
 				this.inboundPeerSet.delete(pubkey);
 			}
+			// Snapshot BEFORE the emit: a synchronous peer:disconnect
+			// observer may call disconnectPeer() to cancel this peer for
+			// good, and a timer scheduled after that would adopt the
+			// post-cancellation generation and dial anyway.
+			const closeGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 			this.emit('peer:disconnect', pubkey);
 
-			if (this.autoReconnect && this.reconnectCandidates(pubkey).length > 0) {
+			if (
+				this.autoReconnect &&
+				(this.cancelGenerations.get(pubkey) ?? 0) === closeGeneration &&
+				this.reconnectCandidates(pubkey).length > 0
+			) {
 				this.scheduleReconnect(pubkey);
 			}
 		});
@@ -1039,9 +1228,18 @@ export class PeerManager extends EventEmitter {
 			this.reconnectTimers.delete(pubkey);
 			// The peer may have re-dialed us while we waited (common over Tor).
 			if (this.peers.has(pubkey)) return;
+			// An explicit disconnectPeer() clears the PENDING timer, but this
+			// round may already be past that point mid-dial when the
+			// cancellation lands: check the generation before every further
+			// step so the round neither tries another address nor
+			// reschedules itself against a deliberate cancellation.
+			const roundGeneration = this.cancelGenerations.get(pubkey) ?? 0;
+			const cancelled = (): boolean =>
+				(this.cancelGenerations.get(pubkey) ?? 0) !== roundGeneration;
 			// Candidates are re-read at fire time so addresses learned while
 			// waiting (e.g. a fresh node_announcement) are included.
 			for (const addr of this.reconnectCandidates(pubkey)) {
+				if (cancelled()) return;
 				try {
 					await this.dialPeer(pubkey, addr.host, addr.port, addr.transport);
 					return;
@@ -1049,6 +1247,7 @@ export class PeerManager extends EventEmitter {
 					// try the next candidate
 				}
 			}
+			if (cancelled()) return;
 			// Every candidate failed: next round with a larger backoff.
 			this.scheduleReconnect(pubkey);
 		}, actualDelay);

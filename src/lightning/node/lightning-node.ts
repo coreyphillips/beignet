@@ -39,7 +39,11 @@ import {
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH
 } from '../channel/types';
-import { PeerManager, IPeerInfo } from '../transport/peer-manager';
+import {
+	PeerManager,
+	IPeerInfo,
+	PeerDialCancelledError
+} from '../transport/peer-manager';
 import { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
@@ -199,12 +203,14 @@ import {
 	DurabilityBarrier,
 	chainLostBackfill,
 	chainPromisedQuorum,
+	storedTipSequence,
 	RecoveryDurability,
 	ChannelRecoveryStatus,
 	RecoveryJournal,
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	journalSupported,
+	loadWriterLease,
 	composeRecoveryCapsule
 } from '../recovery';
 import {
@@ -530,6 +536,10 @@ export class LightningNode extends EventEmitter {
 	 * is persisted so a restart resumes the obligation.
 	 */
 	private pendingFundingTxs: Map<string, IPendingFundingTx> = new Map();
+	/** True while a startup repair frame awaits its quorum receipt. */
+	private startupRepairPending = false;
+	/** Channel ids whose restore-time deletion disposition FAILED. */
+	private restoreDeletionFailures: string[] = [];
 	/**
 	 * When a re-authorization was last asked for, keyed by funding txid or, for
 	 * a splice, by channel id.
@@ -716,6 +726,16 @@ export class LightningNode extends EventEmitter {
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
 							durability: config.recovery.durability ?? 'async-remote',
+							// Binds every frame's epoch to the ACTIVE lease
+							// (import-cycle-free injection): a mismatched or
+							// vanished epoch record refuses the write instead
+							// of encrypting frames a receipted restore could
+							// never decrypt. A corrupt lease throws, which
+							// refuses the write too.
+							activeLeaseEpoch: (): bigint | null => {
+								const loaded = loadWriterLease(this.storage!);
+								return loaded.state === 'present' ? loaded.lease.epoch : null;
+							},
 							// Compaction must never prune a frame a guardian has not
 							// received: the chain origin is immutable and guardians
 							// accept only logHead.sequence + 1, so a pruned-early
@@ -900,15 +920,15 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE);
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
-		// option_dual_fund: quorum durability refuses to START a v2 open (see
-		// ChannelManager, QUORUM_NO_DUAL_FUND_REFUSAL), so it must not invite
-		// one either. A peer that reads the bit and opens accordingly would be
-		// answered with a refusal it could have been spared, and our own
-		// openChannel routes by this same bit, so clearing it is also what
-		// makes the generic API choose v1 rather than a v2 its own manager
-		// will reject. Advertising is only half of it: negotiation is advisory
-		// and the handler guards refuse for themselves regardless.
-		if (barrier?.enforcing === true) {
+		// option_dual_fund + preferTaproot: taproot v2 opens are not
+		// implemented (the commitment stage fails closed), so the generic
+		// openChannel, which routes by this bit, would negotiate a
+		// combination that always aborts. Under quorum, masking the bit
+		// preserves what the phase 6 mask used to give this configuration:
+		// generic opens route through the working v1 taproot path. Outside
+		// quorum the bit was always advertised for preferTaproot nodes and
+		// stays so; widening the mask is a separate decision.
+		if (barrier?.enforcing === true && config.preferTaproot) {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}
@@ -1100,46 +1120,260 @@ export class LightningNode extends EventEmitter {
 
 		// Restore from storage if available
 		if (this.storage) {
-			this.restoreFromStorage();
-			// Turning quorum ON is the one moment a v2 opening session and
-			// quorum durability can meet: the mode refuses to START a v2 open,
-			// but a session begun under async-remote can be sitting in the
-			// restored state when the operator switches. Refuse to come up
-			// rather than carry it: that session may already have crossed
-			// commitment_signed, so silently abandoning it would discard a
-			// funding round the peer may be able to complete, and continuing
-			// would claim an exactness this node cannot deliver for it.
-			// Finish or abandon it under async-remote first.
+			// The quorum eligibility preflight runs BEFORE restoration touches
+			// anything: restore deletes record-less DUAL_FUNDING_V2 rows
+			// durably (RBF residue) and can journal the first quorum frame
+			// while doing it, so a post-restore scan would both miss rows and
+			// leave a half-mutated database behind its own refusal, making
+			// the suggested async-remote retry impossible.
+			let carriedV2Rows: string[] = [];
 			if (barrier?.enforcing === true) {
-				for (const channel of this.channelManager.listChannels()) {
-					const full = channel.getFullState();
-					// restoreChannel marks a resumable (recorded) open for
-					// reestablish before this guard runs: look through
-					// AWAITING_REESTABLISH to the state it will return to, so
-					// the guard keeps seeing the in-flight open either way.
-					const st =
-						full.state === ChannelState.AWAITING_REESTABLISH &&
-						full.preReestablishState
-							? full.preReestablishState
-							: full.state;
-					if (
-						st !== ChannelState.DUAL_FUNDING_V2 &&
-						st !== ChannelState.AWAITING_TX_SIGNATURES
-					) {
-						continue;
-					}
-					const id = (
-						channel.getChannelId() ?? channel.getTemporaryChannelId()
-					).toString('hex');
+				carriedV2Rows = this.assertQuorumCanCarryStoredV2Opens(
+					chainPromisedQuorum(
+						this.storage,
+						deriveRecoveryMasterKey(config.nodePrivateKey),
+						getPublicKey(config.nodePrivateKey)
+					)
+				);
+			}
+			// REPAIR INTENT FIRST: the schema migration consumes its marker
+			// and restore consumes the carried rows, so a crash after either
+			// but before the receipt target is stored would leave the next
+			// boot with no trigger at all while the guardians still owe the
+			// receipt. Persist the owed marker BEFORE any trigger is
+			// consumed; the concrete tail overwrites it below, and a boot
+			// that finds the bare marker gates on its own verified tip.
+			const REPAIR_TAIL_KEY = 'startup_repair_tail';
+			const priorTail = this.storage.getRecoveryMeta?.(REPAIR_TAIL_KEY);
+			const tailOwed = priorTail != null && priorTail !== '';
+			// The stored tail is either the bare intent sentinel or a decimal
+			// frame sequence, nothing else. An unrecognized value means the
+			// metadata is corrupt, and guessing between 'owed' and a sequence
+			// would rewrite a guardian obligation from garbage: refuse.
+			if (
+				barrier != null &&
+				tailOwed &&
+				priorTail !== 'owed' &&
+				!/^\d+$/.test(priorTail!)
+			) {
+				throw new Error(
+					`recovery: the stored startup repair marker '${priorTail}' ` +
+						`is not recognized; refusing to start`
+				);
+			}
+			const needsSchemaRepair =
+				this.recoveryJournal?.needsSnapshotSchemaRepair() ?? false;
+			const owesRepair =
+				barrier !== undefined &&
+				barrier !== null &&
+				(carriedV2Rows.length > 0 || needsSchemaRepair || tailOwed);
+			// Write the bare sentinel ONLY when no trigger is stored yet: an
+			// existing numeric tail is already durable AND may sit above the
+			// local tip, so replacing it with 'owed' would let a crash right
+			// here lower the next boot's receipt target to its own tip and
+			// lift quarantine before the original target was receipted.
+			if (owesRepair && !tailOwed) {
+				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, 'owed');
+			}
+			this.restoreFromStorage();
+			// One-time snapshot-content repair: heads compacted by an older
+			// release omitted deleted channels' key-index rows, and a quiet
+			// upgraded node might never write a replacement frame. Forcing a
+			// fresh full snapshot here (once, versioned) restores the burned
+			// high-water marks to whatever the guardians hold next.
+			const schemaRepairSeq =
+				this.recoveryJournal?.snapshotSchemaRepair() ?? null;
+			if (schemaRepairSeq !== null) {
+				this.emitStructuredLog('channel', 'snapshot_schema_repaired', {
+					frameSequence: String(schemaRepairSeq)
+				});
+			}
+			// A carried row entered this database OUTSIDE the journal (it
+			// predates the record, or was written by a release without the
+			// preflight), so guardian reconstruction would omit a channel
+			// whose funding the peer may be able to broadcast. Repair that
+			// BEFORE any networking, fail-closed: one frame carries every
+			// still-tracked carried row, a carried row whose deletion
+			// disposition FAILED refuses startup outright, and the node stays
+			// quarantined behind its own traffic gates until the JOURNAL TIP
+			// (which covers the repair frame, every deletion frame written
+			// during restore, and the schema-repair snapshot) is
+			// quorum-RECEIPTED, so nothing this node ever says can outrun
+			// what the guardians can restore.
+			const failedCarried = carriedV2Rows.filter((idHex) =>
+				this.restoreDeletionFailures.includes(idHex)
+			);
+			if (failedCarried.length > 0) {
+				throw new Error(
+					`recovery: the carried v2 open(s) ${failedCarried.join(', ')} ` +
+						`could not be dispositioned durably (deletion failed); ` +
+						`refusing to start over an unrepaired quorum database`
+				);
+			}
+			const repairMutations: RecoveryMutation[] = [];
+			for (const idHex of carriedV2Rows) {
+				const channel = this.channelManager.getChannel(
+					Buffer.from(idHex, 'hex')
+				);
+				if (!channel) continue; // took a (durable) deletion disposition
+				const peer = this.channelManager.getPeerForChannel(
+					Buffer.from(idHex, 'hex')
+				);
+				repairMutations.push({
+					type: 'channel_state',
+					channelId: idHex,
+					state: channel.getFullState(),
+					peerPubkey: peer ?? ''
+				});
+			}
+			if (repairMutations.length > 0 && this.recovery) {
+				const repair = this.recovery.commit({
+					criticality: RecoveryCriticality.Important,
+					mutations: repairMutations,
+					outboundMessages: [],
+					reportedByCaller: true
+				});
+				if (!repair.committed) {
 					throw new Error(
-						`recovery: cannot enable quorum durability while a dual-funded ` +
-							`open is in progress (channel ${id} is ${st}); finish or ` +
-							`abandon it under async-remote durability first`
+						`recovery: could not journal the carried v2 open(s) ` +
+							`(${repair.error?.message ?? 'commit refused'}); refusing ` +
+							`to start over an unrepaired quorum database`
 					);
 				}
 			}
-			// Auto-reconnect peers after crash recovery (Fix 2.1)
-			this.autoReconnectPeers();
+			// Receipt gating keys on the TIP, not one frame: deletion-only
+			// dispositions and the schema repair write frames this boot too,
+			// and receipts are cumulative, so the tip covers them all. The
+			// intent marker written above survives any crash between trigger
+			// consumption and here; the concrete tail replaces it now.
+			if (owesRepair) {
+				const tip = storedTipSequence(this.storage);
+				if (tip === null) {
+					// Fail closed: a repair is owed but the local tip cannot
+					// be verified, so there is nothing sound to wait on.
+					throw new Error(
+						`recovery: a startup repair is owed but the journal tip ` +
+							`cannot be verified; refusing to start`
+					);
+				}
+				const numericPrior =
+					tailOwed && /^\d+$/.test(priorTail!) ? BigInt(priorTail!) : null;
+				const repairTail =
+					numericPrior !== null && numericPrior > tip ? numericPrior : tip;
+				this.storage.setRecoveryMeta?.(REPAIR_TAIL_KEY, repairTail.toString());
+				this.startupRepairPending = true;
+				this.emitStructuredLog('channel', 'startup_repair_pending', {
+					frameSequence: String(repairTail),
+					channels: carriedV2Rows
+				});
+				barrier!.kickReplication?.();
+				void barrier!
+					.whenReleased(repairTail)
+					.then((outcome) => {
+						if (this._destroyed) return;
+						if (!outcome.released) {
+							// Quarantine holds: the operator sees why, the
+							// stored tail survives the restart, and the gates
+							// keep refusing until a boot with a reachable
+							// quorum receipts it.
+							try {
+								this.emitStructuredLog(
+									'channel',
+									'startup_repair_unreceipted',
+									{ reason: outcome.reason }
+								);
+							} catch {
+								// Reporting is best effort; the state holds.
+							}
+							try {
+								this.emit('node:error', {
+									code: 'STARTUP_REPAIR_UNRECEIPTED',
+									message:
+										`the startup repair frames were not accepted ` +
+										`by a guardian quorum (${outcome.reason}); the ` +
+										`node stays quarantined`,
+									timestamp: Date.now()
+								} as ILightningError);
+							} catch {
+								// Observer threw; quarantine already holds.
+							}
+							return;
+						}
+						// Observers first, CONTAINED: reporting must never be
+						// able to corrupt the receipt transition itself.
+						try {
+							this.emitStructuredLog('channel', 'startup_repair_receipted', {
+								frameSequence: String(repairTail)
+							});
+						} catch {
+							// Best effort.
+						}
+						// The transition proper: tail cleared and quarantine
+						// lifted TOGETHER, or neither (the stored tail is the
+						// retry marker, so it must never be lost while the
+						// node still reports pending).
+						try {
+							this.storage?.setRecoveryMeta?.(REPAIR_TAIL_KEY, '');
+							this.startupRepairPending = false;
+						} catch (err) {
+							this.startupRepairPending = true;
+							try {
+								this.emit('node:error', {
+									code: 'STARTUP_REPAIR_COMPLETION_FAILED',
+									message: `finishing the startup repair failed: ${
+										err instanceof Error ? err.message : String(err)
+									}; the node stays quarantined`,
+									timestamp: Date.now()
+								} as ILightningError);
+							} catch {
+								// Observer threw; quarantine already holds.
+							}
+							return;
+						}
+						try {
+							this.autoReconnectPeers();
+						} catch (err) {
+							// Readiness is guaranteed even when the reconnect
+							// pass or an error observer explodes: the repair
+							// IS receipted, and reporting must not undo that.
+							try {
+								this.emit('node:error', {
+									code: 'STARTUP_RECONNECT_FAILED',
+									message: `post-repair reconnect failed: ${
+										err instanceof Error ? err.message : String(err)
+									}`,
+									timestamp: Date.now()
+								} as ILightningError);
+							} catch {
+								// Observer threw; ready still fires below.
+							}
+							this.emitReady();
+						}
+					})
+					.catch((err) => {
+						// With the success path fully contained above, only a
+						// genuine whenReleased rejection can land here: REPORT
+						// it and keep the deterministic quarantined state (the
+						// stored tail retries next boot).
+						if (this._destroyed) return;
+						try {
+							this.emit('node:error', {
+								code: 'STARTUP_REPAIR_UNRECEIPTED',
+								message: `the startup repair wait failed: ${
+									err instanceof Error ? err.message : String(err)
+								}; the node stays quarantined`,
+								timestamp: Date.now()
+							} as ILightningError);
+						} catch {
+							// Observer threw; quarantine already holds.
+						}
+					});
+			}
+			// Auto-reconnect peers after crash recovery (Fix 2.1); deferred
+			// to the receipt callback while the repair quarantine holds.
+			if (!this.startupRepairPending) {
+				this.autoReconnectPeers();
+			}
 		}
 
 		// Compose the initial Recovery Capsule (spec 5.4) so peers connecting
@@ -1266,6 +1500,79 @@ export class LightningNode extends EventEmitter {
 
 	// ─────────────── Storage Restore ───────────────
 
+	/**
+	 * Quorum eligibility preflight over the STORED rows, read-only, before
+	 * restoration mutates or journals anything.
+	 *
+	 * A RECORDED in-flight v2 open (v2InFlight) is resumable and quorum
+	 * carries it: the record is exactly what makes the round provable
+	 * again. A record-less v2 row is different in kind: it restores
+	 * without a session, cannot answer a retransmitted tx_signatures or a
+	 * peer's next_funding (the splice handler answers with tx_abort),
+	 * and ignores funding confirmation, so carrying it would snapshot
+	 * state the mode cannot actually resume. That covers every pre-NORMAL
+	 * v2 state: DUAL_FUNDING_V2 and AWAITING_TX_SIGNATURES always, and
+	 * AWAITING_FUNDING_CONFIRMED / AWAITING_CHANNEL_READY when the row is
+	 * fundingVersion 2 (a v1 row in those states resumes fine and is left
+	 * alone). Refuse to come up; finish or abandon it under async-remote
+	 * first, which this preflight keeps possible by throwing before a
+	 * single row is deleted or a single frame is written.
+	 *
+	 * EXCEPT when the journal is already sticky quorum. A pre-record v2
+	 * row can have entered quorum legitimately (opened under an earlier
+	 * release, quorum enabled while the guard did not exist, frames
+	 * written since), and once the chain promised quorum the async-remote
+	 * retry this refusal recommends is itself refused, so throwing here
+	 * would leave the database with NO startup path. Such a row is
+	 * carried instead, loudly: it takes its deterministic disposition
+	 * (residue deletion, inert orphan, or a tx_abort answer to the peer's
+	 * reestablish followed by an operator close), none of which claims
+	 * the resumability this preflight polices, and none of which is
+	 * broadcastable, so wire safety is untouched.
+	 */
+	private assertQuorumCanCarryStoredV2Opens(alreadyQuorum: boolean): string[] {
+		const carried: string[] = [];
+		for (const row of this.storage!.loadAllChannels()) {
+			const state = row.state;
+			if (state.v2InFlight) continue;
+			// A row persisted mid-reestablish carries the state it will
+			// return to; judge that one.
+			const st =
+				state.state === ChannelState.AWAITING_REESTABLISH &&
+				state.preReestablishState
+					? state.preReestablishState
+					: state.state;
+			const alwaysV2 =
+				st === ChannelState.DUAL_FUNDING_V2 ||
+				st === ChannelState.AWAITING_TX_SIGNATURES;
+			const v2Later =
+				state.fundingVersion === 2 &&
+				(st === ChannelState.AWAITING_FUNDING_CONFIRMED ||
+					st === ChannelState.AWAITING_CHANNEL_READY);
+			if (!alwaysV2 && !v2Later) continue;
+			if (alreadyQuorum) {
+				this.emitStructuredLog(
+					'channel',
+					'quorum_carries_unresumable_v2_open',
+					{
+						channelId: row.channelId,
+						state: st
+					}
+				);
+				carried.push(row.channelId);
+				continue;
+			}
+			throw new Error(
+				`recovery: cannot enable quorum durability while a ` +
+					`dual-funded open with no durable in-flight record is in ` +
+					`progress (channel ${row.channelId} is ${st}); it cannot ` +
+					`resume over reestablish, so finish or abandon it under ` +
+					`async-remote durability first`
+			);
+		}
+		return carried;
+	}
+
 	private restoreFromStorage(): void {
 		if (!this.storage) return;
 
@@ -1307,6 +1614,17 @@ export class LightningNode extends EventEmitter {
 				}
 				continue;
 			}
+			// A row persisted mid-reestablish names the state it returns to,
+			// and the DUAL_FUNDING_V2 dispositions below must judge THAT one:
+			// a wrapped record-less row would otherwise skip the residue
+			// deletion and restore as a phantom that answers nothing.
+			if (
+				state.state === ChannelState.AWAITING_REESTABLISH &&
+				state.preReestablishState === ChannelState.DUAL_FUNDING_V2
+			) {
+				state.state = ChannelState.DUAL_FUNDING_V2;
+				state.preReestablishState = null;
+			}
 			// A DUAL_FUNDING_V2 row WITH a record is a provisionally accepted
 			// RBF whose post-ack traffic never arrived: the record is the
 			// previous attempt, still resumable and possibly the only side
@@ -1329,10 +1647,20 @@ export class LightningNode extends EventEmitter {
 			// still asks gets the manager's unknown-channel error and gives
 			// the attempt up.
 			if (state.state === ChannelState.DUAL_FUNDING_V2) {
-				this.deleteChannelDurably(channelId);
-				this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
-					channelId
-				});
+				if (this.deleteChannelDurably(channelId)) {
+					this.emitStructuredLog('channel', 'v2_rbf_residue_removed', {
+						channelId
+					});
+				} else {
+					// Fail closed: the row stays on disk (retried next start),
+					// the channel is NOT restored, and a quorum startup that
+					// was carrying this row refuses to come up over the
+					// undispositioned residue.
+					this.restoreDeletionFailures.push(channelId);
+					this.emitStructuredLog('channel', 'v2_rbf_residue_removal_failed', {
+						channelId
+					});
+				}
 				continue;
 			}
 			const channel = new Channel(state);
@@ -3648,6 +3976,8 @@ export class LightningNode extends EventEmitter {
 	getRecoveryStatus(): {
 		gate: string;
 		durability: RecoveryDurability;
+		/** True while a startup repair frame awaits its quorum receipt. */
+		startupRepairPending: boolean;
 		/** Highest journal frame a guardian quorum provably holds. */
 		lastDurableSequence: string;
 		/**
@@ -3694,6 +4024,7 @@ export class LightningNode extends EventEmitter {
 		}
 		return {
 			gate: this.getRecoveryGateState(),
+			startupRepairPending: this.startupRepairPending,
 			durability:
 				this.recoveryJournal?.getDurability() ?? barrier?.durability ?? 'local',
 			lastDurableSequence: (barrier?.durableThrough ?? 0n).toString(),
@@ -3718,6 +4049,10 @@ export class LightningNode extends EventEmitter {
 	 * the spec allows; with one configured, only a confirmed lease passes.
 	 */
 	private recoveryPermitsPeerTraffic(): boolean {
+		// Startup repair quarantine: a carried v2 row's repair frame must be
+		// quorum-receipted before this node talks to anyone (connections,
+		// outbound messages and inbound dispatch all consult this).
+		if (this.startupRepairPending) return false;
 		return this.recoveryGate ? this.recoveryGate.permitsPeerTraffic() : true;
 	}
 
@@ -3788,11 +4123,14 @@ export class LightningNode extends EventEmitter {
 				this.recoveryGate?.reportBlocked(
 					`refused to bring up channels with ${pubkey} while quarantined`
 				);
-				this.emit('peer:connect', pubkey);
+				this.notifyPeerConnectObservers(pubkey);
 				return;
 			}
 			this.bringUpChannelPeer(pubkey);
-			this.emit('peer:connect', pubkey);
+			// The PUBLIC notification is isolated from the required bring-up
+			// above: an application observer that throws must not read as a
+			// failed bring-up and cost a healthy connection its teardown.
+			this.notifyPeerConnectObservers(pubkey);
 		});
 		this.peerManager.on('peer:disconnect', (pubkey: string) => {
 			this.channelManager.handlePeerDisconnected(pubkey);
@@ -3803,6 +4141,29 @@ export class LightningNode extends EventEmitter {
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
 		});
+	}
+
+	/**
+	 * Emit the public peer:connect notification, FULLY contained: neither a
+	 * throwing application observer nor a throwing diagnostic path (the
+	 * structured-log event and the injectable logger are both public too)
+	 * may unwind into the PeerManager's bring-up, where the throw would
+	 * read as a failed bring-up and tear a healthy connection down.
+	 */
+	private notifyPeerConnectObservers(pubkey: string): void {
+		try {
+			this.emit('peer:connect', pubkey);
+		} catch (err) {
+			try {
+				this.emitStructuredLog('peer', 'connect_observer_failed', {
+					pubkey,
+					error: err instanceof Error ? err.message : String(err)
+				});
+			} catch {
+				// The log observer threw too; reporting is best effort and
+				// the connection stays up, which is the outcome that matters.
+			}
+		}
 	}
 
 	/**
@@ -3945,6 +4306,9 @@ export class LightningNode extends EventEmitter {
 
 	private emitReady(): void {
 		if (this._readyEmitted || this._destroyed) return;
+		// Readiness never outruns the startup repair quarantine; the
+		// receipt path re-drives this after the quarantine lifts.
+		if (this.startupRepairPending) return;
 		this._readyEmitted = true;
 		process.nextTick(() => {
 			this.emit('node:ready');
@@ -4475,6 +4839,27 @@ export class LightningNode extends EventEmitter {
 	 * block and once at startup after channels are restored.
 	 */
 	private retryPendingFundingBroadcasts(): void {
+		// Self-heal the runtime index first. A disconnect purges a channel's
+		// barrier-held batch, and for a v2 open that suffix can be the
+		// TX_SIGNATURES release plus the funding broadcast: the fully signed
+		// transaction is already durable on the row (staged at
+		// tx_signatures), but the action that would have registered the
+		// runtime obligation never ran, so without this pass the per-block
+		// retry has nothing to retry until a restart rebuilds the index.
+		// Adopted entries land as 'restored', so they re-ask for a fresh
+		// authorization exactly as a restart would; under a quorum barrier
+		// nothing goes out that the barrier has not released.
+		for (const channel of this.channelManager.listChannels()) {
+			const state = channel.getFullState();
+			if (!state.fundingTxid || !state.pendingFundingTxHex) continue;
+			const txidHex = state.fundingTxid.toString('hex');
+			if (this.pendingFundingTxs.has(txidHex)) continue;
+			this.emitStructuredLog('chain', 'pending_funding_readopted', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				txid: txidHex
+			});
+			this.adoptPendingFundingFromChannel(state, txidHex);
+		}
 		if (this.pendingFundingTxs.size === 0) return;
 		const deadStates = new Set([
 			ChannelState.CLOSED,
@@ -4520,34 +4905,45 @@ export class LightningNode extends EventEmitter {
 			// the obligation and is authenticated; the metadata map is local and
 			// best effort, so letting a stale or corrupt entry sit in front of
 			// it would hand a fresh authorization to unrelated bytes.
-			let parsed: bitcoin.Transaction;
-			try {
-				parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex);
-			} catch {
-				this.emitStructuredLog('chain', 'pending_funding_unparseable', {
-					channelId: state.channelId?.toString('hex') ?? null,
-					txid: txidHex
-				});
-				continue;
-			}
-			// And it has to BE the transaction this channel names. A payload
-			// that hashes to something else is corruption, not an obligation:
-			// broadcasting it would put an unrelated transaction on the network
-			// under a channel's authorization.
-			if (parsed.getHash().toString('hex') !== txidHex) {
-				this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
-					channelId: state.channelId?.toString('hex') ?? null,
-					expected: txidHex,
-					actual: parsed.getHash().toString('hex')
-				});
-				this.pendingFundingTxs.delete(txidHex);
-				continue;
-			}
-			this.pendingFundingTxs.set(txidHex, {
-				txHex: state.pendingFundingTxHex,
-				phase: 'restored'
-			});
+			this.adoptPendingFundingFromChannel(state, txidHex);
 		}
+	}
+
+	/**
+	 * Validate a row's staged funding payload and adopt it into the runtime
+	 * index as 'restored' (authorization unknown, re-asked before any send).
+	 */
+	private adoptPendingFundingFromChannel(
+		state: IChannelState,
+		txidHex: string
+	): void {
+		let parsed: bitcoin.Transaction;
+		try {
+			parsed = bitcoin.Transaction.fromHex(state.pendingFundingTxHex!);
+		} catch {
+			this.emitStructuredLog('chain', 'pending_funding_unparseable', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				txid: txidHex
+			});
+			return;
+		}
+		// And it has to BE the transaction this channel names. A payload
+		// that hashes to something else is corruption, not an obligation:
+		// broadcasting it would put an unrelated transaction on the network
+		// under a channel's authorization.
+		if (parsed.getHash().toString('hex') !== txidHex) {
+			this.emitStructuredLog('chain', 'pending_funding_txid_mismatch', {
+				channelId: state.channelId?.toString('hex') ?? null,
+				expected: txidHex,
+				actual: parsed.getHash().toString('hex')
+			});
+			this.pendingFundingTxs.delete(txidHex);
+			return;
+		}
+		this.pendingFundingTxs.set(txidHex, {
+			txHex: state.pendingFundingTxHex!,
+			phase: 'restored'
+		});
 	}
 
 	/** Restore the persisted pending funding tx map (called at startup). */
@@ -5332,6 +5728,18 @@ export class LightningNode extends EventEmitter {
 	 */
 	private async connectPeerById(pubkey: string): Promise<void> {
 		const attempts: string[] = [];
+		// ONE cancellation token for the whole node-id operation: a dial
+		// rejects typed on its own, but disconnectPeer() can also land in
+		// the gaps BETWEEN dials (most importantly while the async DNS
+		// bootstrap is pending, when no dial exists to reject), and the
+		// next candidate would otherwise start fresh under the bumped
+		// generation and reverse the explicit disconnect.
+		const cancellationToken = this.peerManager!.cancellationToken(pubkey);
+		const assertNotCancelled = (): void => {
+			if (this.peerManager!.cancellationToken(pubkey) !== cancellationToken) {
+				throw new PeerDialCancelledError(pubkey);
+			}
+		};
 		const isTor = (a: INodeAddress): boolean =>
 			a.type === ADDRESS_TYPE_TORV2 || a.type === ADDRESS_TYPE_TORV3;
 
@@ -5350,10 +5758,15 @@ export class LightningNode extends EventEmitter {
 			if (dialable) candidates.push(dialable);
 		}
 		for (const { host, port } of candidates) {
+			assertNotCancelled();
 			try {
 				await this.peerManager!.connectPeer(pubkey, host, port);
 				return;
 			} catch (err) {
+				// An explicit disconnectPeer() cancelled the whole node-id
+				// operation, not one address: retrying the next candidate
+				// would reconnect the very peer the caller just removed.
+				if (err instanceof PeerDialCancelledError) throw err;
 				attempts.push(
 					`graph ${host}:${port} (${
 						err instanceof Error ? err.message : String(err)
@@ -5386,10 +5799,16 @@ export class LightningNode extends EventEmitter {
 				attempts.push('DNS bootstrap returned no address for this node id');
 			}
 			for (const peer of matches) {
+				// The DNS bootstrap awaited above is exactly the window where
+				// a cancellation has no dial to reject: check the token
+				// before the FIRST dns dial too.
+				assertNotCancelled();
 				try {
 					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
 					return;
 				} catch (err) {
+					// See the graph loop: cancellation stops the operation.
+					if (err instanceof PeerDialCancelledError) throw err;
 					attempts.push(
 						`dns ${peer.host}:${peer.port} (${
 							err instanceof Error ? err.message : String(err)
@@ -14542,19 +14961,24 @@ export class LightningNode extends EventEmitter {
 		if (this._destroyed) return Promise.reject(new Error('Node destroyed'));
 		if (this._readyEmitted) return Promise.resolve();
 
-		// No channels at all → consider ready
-		if (this.channelManager.listChannels().length === 0) {
-			this.emitReady();
-			return Promise.resolve();
-		}
+		// The startup repair quarantine outranks the fast paths: every
+		// gate refuses traffic until the repair receipt lands, so a node in
+		// that state is NOT ready no matter what its channel list says.
+		if (!this.startupRepairPending) {
+			// No channels at all → consider ready
+			if (this.channelManager.listChannels().length === 0) {
+				this.emitReady();
+				return Promise.resolve();
+			}
 
-		// Already has NORMAL channels → consider ready
-		const hasNormal = this.channelManager
-			.listChannels()
-			.some((ch) => ch.getState() === ChannelState.NORMAL);
-		if (hasNormal) {
-			this.emitReady();
-			return Promise.resolve();
+			// Already has NORMAL channels → consider ready
+			const hasNormal = this.channelManager
+				.listChannels()
+				.some((ch) => ch.getState() === ChannelState.NORMAL);
+			if (hasNormal) {
+				this.emitReady();
+				return Promise.resolve();
+			}
 		}
 
 		return new Promise<void>((resolve, reject) => {

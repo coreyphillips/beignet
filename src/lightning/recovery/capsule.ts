@@ -39,12 +39,142 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
+	assertEmptyTarget,
+	assertFramesReconstructable,
+	assertNoJournalResidue,
 	deriveRecoveryMasterKey,
 	journalSupported,
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import { VerifiedRecoveryChain } from './types';
+import { withStorageTransaction } from '../storage/transaction';
+import { RecoveryFrame, VerifiedRecoveryChain } from './types';
+
+/**
+ * A capsule whose CONTENT could not replay (the chain verified, but a
+ * table write it implies is invalid, e.g. a constraint violation). Raised
+ * during PREVALIDATION, by replaying the candidate into a caller-supplied
+ * scratch backend BEFORE anything touches the real target: replaying on
+ * the target itself could never tell a content defect apart from a broken
+ * target disk, since both surface as the same storage exception. With the
+ * defect proven on the scratch, every error the real install raises is a
+ * TARGET problem and propagates.
+ */
+export class CapsuleReplayError extends Error {
+	readonly cause: unknown;
+	constructor(cause: unknown) {
+		super(
+			`recovery capsule content failed to replay: ${
+				cause instanceof Error ? cause.message : String(cause)
+			}`
+		);
+		this.name = 'CapsuleReplayError';
+		this.cause = cause;
+	}
+}
+
+export interface ICapsuleRestoreOptions {
+	/**
+	 * Factory for a FRESH, empty storage backend used to dry-run the
+	 * candidate's reconstruction before the real target is written (see
+	 * CapsuleReplayError). Supply an in-memory backend (e.g.
+	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
+	 * the recovery core stays free of a concrete backend dependency.
+	 * OPTIONAL for the single-capsule restore (a throw is a throw there);
+	 * REQUIRED by restoreBestRecoveryCapsule whenever the target supports
+	 * Tier 2, because its candidate/Tier-1 fallback contract depends on
+	 * classifying content defects, and without a dry-run a replay failure
+	 * on the real target cannot be told apart from a broken database.
+	 */
+	scratchStorage?: () => IStorageBackend;
+}
+
+/**
+ * A synthetic, KNOWN-GOOD frame set exercising the same operations a real
+ * replay performs: a current-schema snapshot writing the main safety
+ * tables, plus one delta replayed through RecoveryManager.commit. If the
+ * validator backend cannot replay THIS, the validator is broken, not the
+ * capsule.
+ */
+function knownGoodProbeFrames(): VerifiedRecoveryChain {
+	const snapshot: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 1n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [],
+		outboundMessages: [],
+		snapshot: {
+			schemaVersion: '2',
+			channels: [],
+			keyIndices: [{ channelId: 'aa'.repeat(32), channelIndex: 1 }],
+			chainMonitors: [],
+			preimages: [
+				{ paymentHash: 'bb'.repeat(32), preimage: Buffer.alloc(32, 1) }
+			],
+			payments: [],
+			paymentSecrets: [],
+			htlcPaymentMappings: [],
+			forwardedHtlcs: [],
+			htlcSharedSecrets: [],
+			invoices: [],
+			invoicePathIds: [],
+			forwardingEvents: [],
+			outbox: []
+		}
+	};
+	const delta: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 2n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [
+			{
+				type: 'payment_preimage',
+				paymentHash: 'cc'.repeat(32),
+				preimage: Buffer.alloc(32, 2)
+			}
+		],
+		outboundMessages: []
+	};
+	return [snapshot, delta] as VerifiedRecoveryChain;
+}
+
+/**
+ * Dry-run the candidate's replay on a scratch backend (see options).
+ *
+ * The validator is PROBED first by replaying a synthetic KNOWN-GOOD frame
+ * set on its own fresh scratch instance, exercising the reads, table
+ * writes and transaction completion a real replay needs: a generic
+ * backend exception cannot prove whether the capsule content or the
+ * validator's own storage failed, so a validator that cannot replay
+ * known-good content propagates its failure RAW (infrastructure broken)
+ * instead of laundering it into a candidate defect. Only a CANDIDATE
+ * replay failing on a validator that just proved itself against the same
+ * operations is typed as CapsuleReplayError.
+ */
+function assertReplaysOnScratch(
+	frames: VerifiedRecoveryChain,
+	scratchStorage: () => IStorageBackend
+): void {
+	const probe = scratchStorage();
+	try {
+		reconstructFromFrames(probe, knownGoodProbeFrames());
+	} finally {
+		(probe as { close?: () => void }).close?.();
+	}
+	// A FRESH scratch for the candidate (the probe populated the first).
+	const scratch = scratchStorage();
+	try {
+		reconstructFromFrames(scratch, frames);
+	} catch (err) {
+		throw new CapsuleReplayError(err);
+	} finally {
+		(scratch as { close?: () => void }).close?.();
+	}
+}
 
 const CAPSULE_HKDF_INFO = 'beignet-recovery-capsule-v1';
 const CAPSULE_MAGIC = 'bRC1';
@@ -482,6 +612,13 @@ function verifyInlineJournal(
 			'recovery capsule head does not match its inline journal (stale or spliced payload)'
 		);
 	}
+	// Schema compatibility is part of CANDIDATE validation, not something
+	// discovered after the target was written: a structurally valid capsule
+	// whose base snapshot this release cannot restore must be rejected
+	// here, so restoreBestRecoveryCapsule treats it as a candidate defect
+	// (falling back to other replicas or the Tier 1 SCB) and
+	// restoreFromRecoveryCapsule throws before its first target write.
+	assertFramesReconstructable(frames);
 	return { encoded, rows, frames };
 }
 
@@ -491,10 +628,12 @@ function verifyInlineJournal(
  * Tier 2 path (inline journal present and the target supports frames): the
  * inline journal is verified COMPLETELY before anything touches the target
  * (verifyInlineJournal: the exact Phase 2 chain checks plus the capsule head
- * binding). Only then are the stored frame rows and journal metadata
- * installed and the deltas replayed through reconstructFromFrames. On ANY
- * tier 2 throw the target must be discarded; partial installs are not
- * cleaned up.
+ * binding and schema compatibility). The frame rows, the journal metadata
+ * AND the reconstruction replay then run inside ONE transaction: chain
+ * verification cannot prove the content REPLAYS (a constraint violation
+ * only surfaces when the tables are written), so a replay failure must
+ * roll the whole install back and leave the target exactly as it was,
+ * never half-populated.
  *
  * Tier 1 path (no inline state): the decoded SCB is returned for
  * recoverFromStaticChannelBackup, exactly like a plain SCB restore.
@@ -502,7 +641,8 @@ function verifyInlineJournal(
 export function restoreFromRecoveryCapsule(
 	capsule: RecoveryCapsule,
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): ICapsuleRestoreResult {
 	// Authenticates the Tier 1 material up front: wrong-key or tampered SCBs
 	// fail here before anything touches the target.
@@ -512,10 +652,34 @@ export function restoreFromRecoveryCapsule(
 		return { tier: 1, scb, framesApplied: 0 };
 	}
 
-	// Validate the candidate COMPLETELY before the first write to the target.
-	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
+	// Validate the candidate COMPLETELY before the first write to the
+	// target: chain and schema, then (when a scratch backend is supplied)
+	// a full dry-run replay, so a content defect surfaces as the typed
+	// CapsuleReplayError while the target is still untouched. Refuse a
+	// target already carrying journal state: the metadata writes below
+	// would silently overwrite another journal.
+	const validated = verifyInlineJournal(capsule, nodeSecret);
+	if (options.scratchStorage) {
+		assertReplaysOnScratch(validated.frames, options.scratchStorage);
+	}
+	// The dry-run handed the decoded frames to FOREIGN code (the scratch
+	// backend); a hostile or buggy adapter mutating a Buffer argument must
+	// not alter what the target replays, so the install re-decodes a fresh
+	// frame graph from the authenticated rows.
+	const { encoded, rows, frames } = options.scratchStorage
+		? verifyInlineJournal(capsule, nodeSecret)
+		: validated;
+	assertNoJournalResidue(target);
 
-	target.transaction(() => {
+	// ONE shared transaction for the frames, the metadata AND the replay:
+	// the inner reconstruction units (applySnapshot, the per-frame
+	// RecoveryManager commits) JOIN it through withStorageTransaction
+	// instead of nesting, which IStorageBackend does not promise. Any
+	// throw rolls the whole install back and PROPAGATES: the candidate's
+	// content was already proven (or, without a scratch, is at least never
+	// silently degraded), so a failure here means the TARGET is broken,
+	// not the capsule.
+	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
 		}
@@ -532,8 +696,8 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
+		reconstructFromFrames(target, frames);
 	});
-	reconstructFromFrames(target, frames);
 	return { tier: 2, scb, framesApplied: frames.length };
 }
 
@@ -566,7 +730,8 @@ export interface IBestCapsuleRestore extends ICapsuleRestoreResult {
 export function restoreBestRecoveryCapsule(
 	blobs: Buffer[],
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): IBestCapsuleRestore {
 	const candidates = blobs
 		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
@@ -590,6 +755,29 @@ export function restoreBestRecoveryCapsule(
 		writerEpoch: sorted[0].writerEpoch,
 		latestSequence: sorted[0].latestSequence
 	};
+
+	// A dirty target is refused ONCE, loudly, before any candidate is
+	// tried: with the install rolled back on failure, a per-candidate
+	// throw now reads as a candidate defect, and a pre-populated database
+	// must not be silently degraded through every candidate into a Tier 1
+	// answer. Dirty means EITHER reconstructed application tables OR any
+	// recovery journal residue (stored frames, journal metadata): the
+	// install writes both.
+	if (journalSupported(target)) {
+		// The candidate/Tier-1 fallback CONTRACT depends on classifying
+		// content defects, and only the dry-run can do that: without a
+		// scratch, a replay failure on the real target is indistinguishable
+		// from a broken database, so selection refuses to run rather than
+		// choose between aborting on bad content and masking bad disks.
+		if (!options.scratchStorage) {
+			throw new Error(
+				'restoreBestRecoveryCapsule requires options.scratchStorage ' +
+					'when the target supports Tier 2 restoration'
+			);
+		}
+		assertEmptyTarget(target);
+		assertNoJournalResidue(target);
+	}
 
 	for (let i = 0; i < sorted.length; ) {
 		// One group of candidates claiming the same (epoch, sequence).
@@ -626,15 +814,25 @@ export function restoreBestRecoveryCapsule(
 				} catch {
 					continue;
 				}
-				// Throws from here PROPAGATE: after a candidate validated,
-				// failures are target integrity problems (dirty database,
-				// write errors), not candidate defects, and trying another
-				// blob against a half-written target would be wrong.
-				const result = restoreFromRecoveryCapsule(
-					candidate,
-					target,
-					nodeSecret
-				);
+				// The typed replay error is a CANDIDATE defect, raised by the
+				// dry-run BEFORE the target was written, so trying the next
+				// replica (or falling through to Tier 1) is safe. Everything
+				// else the restore throws is a TARGET problem (the install
+				// transaction has rolled it back, but the database is
+				// broken or dirty) and degrading it to a Tier 1 answer
+				// would mask that, so it propagates.
+				let result: ICapsuleRestoreResult;
+				try {
+					result = restoreFromRecoveryCapsule(
+						candidate,
+						target,
+						nodeSecret,
+						options
+					);
+				} catch (err) {
+					if (!(err instanceof CapsuleReplayError)) throw err;
+					continue;
+				}
 				return {
 					...result,
 					capsule: candidate,

@@ -1113,6 +1113,19 @@ export class SqliteStorage implements IStorageBackend {
 		return row ? this._decodeChannelIndex(row.channel_index) : null;
 	}
 
+	loadAllChannelKeyIndices(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}> {
+		const rows = this.db
+			.prepare('SELECT channel_id, channel_index FROM channel_key_indices')
+			.all() as Array<{ channel_id: string; channel_index: number | string }>;
+		return rows.map((row) => ({
+			channelId: row.channel_id,
+			channelIndex: this._decodeChannelIndex(row.channel_index)
+		}));
+	}
+
 	loadNextChannelIndex(): number {
 		// Encrypted cells are TEXT, so SQL MAX() would compare ciphertext;
 		// decode in JS instead (one small row per channel)
@@ -1761,6 +1774,32 @@ export class SqliteStorage implements IStorageBackend {
 				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
 			)
 			.run(key, this._enc(value));
+	}
+
+	recoveryFrameStats(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null {
+		const row = this.db
+			.prepare(
+				'SELECT COUNT(*) AS count, MIN(sequence) AS min, MAX(sequence) AS max FROM recovery_frames'
+			)
+			.get() as { count: number; min: number | null; max: number | null };
+		if (!row.count) return null;
+		return {
+			count: row.count,
+			minSequence: row.min!,
+			maxSequence: row.max!
+		};
+	}
+
+	listRecoveryMetaKeys(): string[] {
+		return (
+			this.db.prepare('SELECT key FROM recovery_meta').all() as Array<{
+				key: string;
+			}>
+		).map((row) => row.key);
 	}
 
 	deleteRecoveryMeta(key: string): void {
