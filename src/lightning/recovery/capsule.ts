@@ -48,7 +48,7 @@ import {
 	verifyFrameChain
 } from './journal';
 import { withStorageTransaction } from '../storage/transaction';
-import { VerifiedRecoveryChain } from './types';
+import { RecoveryFrame, VerifiedRecoveryChain } from './types';
 
 /**
  * A capsule whose CONTENT could not replay (the chain verified, but a
@@ -90,34 +90,87 @@ export interface ICapsuleRestoreOptions {
 }
 
 /**
+ * A synthetic, KNOWN-GOOD frame set exercising the same operations a real
+ * replay performs: a current-schema snapshot writing the main safety
+ * tables, plus one delta replayed through RecoveryManager.commit. If the
+ * validator backend cannot replay THIS, the validator is broken, not the
+ * capsule.
+ */
+function knownGoodProbeFrames(): VerifiedRecoveryChain {
+	const snapshot: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 1n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [],
+		outboundMessages: [],
+		snapshot: {
+			schemaVersion: '2',
+			channels: [],
+			keyIndices: [{ channelId: 'aa'.repeat(32), channelIndex: 1 }],
+			chainMonitors: [],
+			preimages: [
+				{ paymentHash: 'bb'.repeat(32), preimage: Buffer.alloc(32, 1) }
+			],
+			payments: [],
+			paymentSecrets: [],
+			htlcPaymentMappings: [],
+			forwardedHtlcs: [],
+			htlcSharedSecrets: [],
+			invoices: [],
+			invoicePathIds: [],
+			forwardingEvents: [],
+			outbox: []
+		}
+	};
+	const delta: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 2n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [
+			{
+				type: 'payment_preimage',
+				paymentHash: 'cc'.repeat(32),
+				preimage: Buffer.alloc(32, 2)
+			}
+		],
+		outboundMessages: []
+	};
+	return [snapshot, delta] as VerifiedRecoveryChain;
+}
+
+/**
  * Dry-run the candidate's replay on a scratch backend (see options).
  *
- * The scratch is PROBED first with a trivial transaction and metadata
- * round-trip: a generic backend exception cannot prove whether the capsule
- * content or the validator's own storage failed, so a scratch that cannot
- * even pass the probe propagates its failure RAW (validator infrastructure
- * broken) instead of laundering it into a candidate defect. Only a
- * failure of the candidate replay on a probed-healthy scratch is typed as
- * CapsuleReplayError.
+ * The validator is PROBED first by replaying a synthetic KNOWN-GOOD frame
+ * set on its own fresh scratch instance, exercising the reads, table
+ * writes and transaction completion a real replay needs: a generic
+ * backend exception cannot prove whether the capsule content or the
+ * validator's own storage failed, so a validator that cannot replay
+ * known-good content propagates its failure RAW (infrastructure broken)
+ * instead of laundering it into a candidate defect. Only a CANDIDATE
+ * replay failing on a validator that just proved itself against the same
+ * operations is typed as CapsuleReplayError.
  */
 function assertReplaysOnScratch(
 	frames: VerifiedRecoveryChain,
 	scratchStorage: () => IStorageBackend
 ): void {
+	const probe = scratchStorage();
+	try {
+		reconstructFromFrames(probe, knownGoodProbeFrames());
+	} finally {
+		(probe as { close?: () => void }).close?.();
+	}
+	// A FRESH scratch for the candidate (the probe populated the first).
 	const scratch = scratchStorage();
 	try {
-		scratch.transaction(() => {
-			scratch.setRecoveryMeta!('capsule_scratch_probe', '1');
-		});
-		if (scratch.getRecoveryMeta!('capsule_scratch_probe') !== '1') {
-			throw new Error('capsule scratch backend failed its probe round-trip');
-		}
-		scratch.deleteRecoveryMeta?.('capsule_scratch_probe');
-		try {
-			reconstructFromFrames(scratch, frames);
-		} catch (err) {
-			throw new CapsuleReplayError(err);
-		}
+		reconstructFromFrames(scratch, frames);
+	} catch (err) {
+		throw new CapsuleReplayError(err);
 	} finally {
 		(scratch as { close?: () => void }).close?.();
 	}

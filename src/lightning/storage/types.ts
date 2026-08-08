@@ -322,6 +322,16 @@ export interface IStorageBackend {
 	 */
 	listRecoveryMetaKeys?(): string[];
 	/**
+	 * Row-count and sequence span of the stored recovery frames (null when
+	 * none). Lets per-write chain invariants prove retained-chain
+	 * contiguity without loading every ciphertext.
+	 */
+	recoveryFrameStats?(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null;
+	/**
 	 * Whether secrets written through this backend are protected at rest.
 	 * The writer lease (recovery 5.6) keeps a signing key, so it refuses to
 	 * persist into a backend that cannot answer true. A backend that does

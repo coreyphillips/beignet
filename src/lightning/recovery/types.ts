@@ -358,10 +358,16 @@ export interface IRecoveryJournalSink {
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint;
 	/**
-	 * Called when the commit's transaction ROLLED BACK after appendFrame
-	 * ran: any in-memory record of "the tip this run last wrote" must be
-	 * dropped, because that write no longer exists on disk and the next
-	 * commit would otherwise be refused as tampering.
+	 * Called when the commit's transaction ROLLED BACK: the journal
+	 * restores every in-memory field to its pre-attempt checkpoint (a
+	 * no-op when the failure happened before appendFrame began an
+	 * attempt), so a refusal never erases evidence and a rollback never
+	 * leaves phantom expectations.
 	 */
 	onCommitRollback?(): void;
+	/**
+	 * Called after the commit's transaction COMMITTED with a frame: the
+	 * journal discards its attempt checkpoint.
+	 */
+	onCommitCommitted?(): void;
 }

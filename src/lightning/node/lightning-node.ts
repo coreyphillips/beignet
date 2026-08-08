@@ -210,6 +210,7 @@ import {
 	deriveRecoveryMasterKey,
 	deriveRecoveryRoot,
 	journalSupported,
+	loadWriterLease,
 	composeRecoveryCapsule
 } from '../recovery';
 import {
@@ -725,6 +726,16 @@ export class LightningNode extends EventEmitter {
 						deriveRecoveryRoot(config.nodePrivateKey).recoveryId,
 						{
 							durability: config.recovery.durability ?? 'async-remote',
+							// Binds every frame's epoch to the ACTIVE lease
+							// (import-cycle-free injection): a mismatched or
+							// vanished epoch record refuses the write instead
+							// of encrypting frames a receipted restore could
+							// never decrypt. A corrupt lease throws, which
+							// refuses the write too.
+							activeLeaseEpoch: (): bigint | null => {
+								const loaded = loadWriterLease(this.storage!);
+								return loaded.state === 'present' ? loaded.lease.epoch : null;
+							},
 							// Compaction must never prune a frame a guardian has not
 							// received: the chain origin is immutable and guardians
 							// accept only logHead.sequence + 1, so a pruned-early

@@ -174,6 +174,12 @@ export class RecoveryManager {
 			};
 		}
 
+		// The transaction committed: let the journal discard its attempt
+		// checkpoint (its in-memory expectations are now durable facts).
+		if (journaled) {
+			this.options.journal?.onCommitCommitted?.();
+		}
+
 		// channel_closed deleted the channel's outbox rows with it (the storage
 		// layer cascades); a stale cached count would survive the row deletion.
 		for (const mutation of mutations) {

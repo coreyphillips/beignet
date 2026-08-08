@@ -131,18 +131,28 @@ const JOURNAL_META_RESIDUE_KEYS = [
 
 /**
  * The recovery_meta keys that may legitimately exist BEFORE a journal's
- * first frame: lease acquisition and namespace registration run ahead of
- * the first commit, and the node's startup repair marker is written before
- * restore. Everything else present over an EMPTY frame store is residue of
- * destroyed history, and the empty-store scan refuses it BY PRESENCE (an
- * explicitly stored empty string is presence, not absence).
+ * first frame, WITH the exact value shapes they may legitimately hold:
+ * lease acquisition and namespace registration run ahead of the first
+ * commit, and the node's startup repair marker is written before restore,
+ * but only as the bare 'owed' sentinel (a numeric receipt target implies
+ * frames existed, so it can never precede frame 1). Everything else
+ * present over an EMPTY frame store, and every allowed key holding a
+ * value outside its legitimate shape, is residue of destroyed history.
+ * The scan refuses BY PRESENCE: an explicitly stored empty string is
+ * presence, not absence.
  */
-const EMPTY_STORE_ALLOWED_META_KEYS = new Set<string>([
-	META_WRITER_EPOCH,
-	'writer_lease_v1',
-	'restore_pending_acquisition_v1',
-	'guardian_pending_registration_v1',
-	'startup_repair_tail'
+const EMPTY_STORE_ALLOWED_META: ReadonlyMap<
+	string,
+	(value: string) => boolean
+> = new Map([
+	[META_WRITER_EPOCH, (value: string): boolean => /^[1-9]\d*$/.test(value)],
+	['writer_lease_v1', (value: string): boolean => value !== ''],
+	['restore_pending_acquisition_v1', (value: string): boolean => value !== ''],
+	[
+		'guardian_pending_registration_v1',
+		(value: string): boolean => value !== ''
+	],
+	['startup_repair_tail', (value: string): boolean => value === 'owed']
 ]);
 
 /**
@@ -221,6 +231,16 @@ export interface IRecoveryJournalOptions {
 	maxRetainedFrameGap?: number;
 	/** Compaction pruned frames a replica had not yet received. */
 	onCompactionForced?: (detail: string) => void;
+	/**
+	 * Reader for the ACTIVE writer-lease epoch, injected by the owner
+	 * (import-cycle-free: the lease module imports from this one). When
+	 * present, every frame's epoch must EQUAL the lease epoch; a mismatch
+	 * means guardians would receipt ciphertext under an epoch a restore
+	 * later reconstructs differently, making the receipted frame
+	 * undecryptable. Return null when no lease exists; throw on a corrupt
+	 * lease to refuse the write.
+	 */
+	activeLeaseEpoch?: () => bigint | null;
 	/** Append a snapshot frame after this many delta frames. Default 256. */
 	snapshotIntervalFrames?: number;
 	/**
@@ -528,6 +548,17 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * instead of silently re-basing.
 	 */
 	private lastWrittenTip: { sequence: bigint; hashHex: string } | null = null;
+	/**
+	 * The highest writer epoch this run has observed or written. The epoch
+	 * defaulting to 1 when its record is missing is only safe on a journal
+	 * that never had one: after that, a vanished or regressed epoch means
+	 * the next frame would encrypt under the wrong key while guardians
+	 * receipt it under the active lease epoch, leaving a receipted frame a
+	 * restore cannot decrypt.
+	 */
+	private epochFloor = 1n;
+	/** Injected reader for the active writer-lease epoch (cycle-free). */
+	private readonly activeLeaseEpoch?: () => bigint | null;
 
 	/**
 	 * @param recoveryId The guardian namespace (wire spec 1.1): the x-only
@@ -572,6 +603,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.maxRetainedFrameGap ??
 			(this.durability === 'quorum' ? null : DEFAULT_MAX_RETAINED_FRAME_GAP);
 		this.onCompactionForced = options.onCompactionForced;
+		this.activeLeaseEpoch = options.activeLeaseEpoch;
 	}
 
 	/** The mode this journal stamps on its frames, after the sticky rule. */
@@ -580,13 +612,61 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	}
 
 	/**
-	 * The surrounding commit ROLLED BACK after a frame write: the write no
-	 * longer exists on disk, so the exact-tip invariant must fall back to
-	 * the observation-based checks for the next commit (see
-	 * assertWriteInvariants) instead of refusing a legitimate retry.
+	 * Snapshot of every mutable in-memory field, taken when a write attempt
+	 * BEGINS. The journal owns its own attempt lifecycle: the checkpoint is
+	 * discarded when the surrounding transaction commits and fully restored
+	 * when it rolls back OR when the attempt's own guards refuse, so a
+	 * failure can neither erase evidence (a refusal must not clear the
+	 * expected tip) nor leave phantoms (a rolled-back re-base must not stay
+	 * marked as re-based, a rolled-back interval snapshot must not keep a
+	 * raised floor).
+	 */
+	private writeAttemptCheckpoint: {
+		lastWrittenTip: { sequence: bigint; hashHex: string } | null;
+		tipFloor: bigint;
+		epochFloor: bigint;
+		rebasedThisRun: boolean;
+		writeSchemaChecked: boolean;
+	} | null = null;
+
+	private beginWriteAttempt(): void {
+		this.writeAttemptCheckpoint = {
+			lastWrittenTip: this.lastWrittenTip,
+			tipFloor: this.tipFloor,
+			epochFloor: this.epochFloor,
+			rebasedThisRun: this.rebasedThisRun,
+			writeSchemaChecked: this.writeSchemaChecked
+		};
+	}
+
+	private settleWriteAttempt(committed: boolean): void {
+		const checkpoint = this.writeAttemptCheckpoint;
+		this.writeAttemptCheckpoint = null;
+		if (committed || !checkpoint) return;
+		this.lastWrittenTip = checkpoint.lastWrittenTip;
+		this.tipFloor = checkpoint.tipFloor;
+		this.epochFloor = checkpoint.epochFloor;
+		this.rebasedThisRun = checkpoint.rebasedThisRun;
+		this.writeSchemaChecked = checkpoint.writeSchemaChecked;
+	}
+
+	/**
+	 * The surrounding commit COMMITTED: the attempt's state is now durable,
+	 * so the checkpoint is discarded.
+	 */
+	onCommitCommitted(): void {
+		this.settleWriteAttempt(true);
+	}
+
+	/**
+	 * The surrounding commit ROLLED BACK (or failed before reaching the
+	 * journal at all, in which case no checkpoint exists and this is a
+	 * no-op): restore every in-memory field to its pre-attempt value. This
+	 * is deliberately a full restore, never a clear: clearing evidence on
+	 * a refusal is exactly how a forked frame 1 slipped past a retry.
 	 */
 	onCommitRollback(): void {
-		this.lastWrittenTip = null;
+		this.settleWriteAttempt(false);
 	}
 
 	/**
@@ -617,6 +697,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint {
+		// The attempt lifecycle is the journal's own: checkpoint everything
+		// mutable NOW; the manager signals commit or rollback afterwards.
+		this.beginWriteAttempt();
 		const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		if (tipSequence == null) {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
@@ -727,29 +810,72 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 */
 	prepareForReplication(): void {
 		if (this.rebasedThisRun) return;
-		this.storage.transaction(() => {
-			const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
-			if (tipSequence == null) {
-				this.appendSnapshotFrame(1n, GENESIS_HASH);
-			} else {
-				this.appendSnapshotFrame(
-					BigInt(tipSequence) + 1n,
-					Buffer.from(
-						this.storage.getRecoveryMeta!(META_TIP_HASH) ??
-							GENESIS_HASH.toString('hex'),
-						'hex'
-					)
-				);
-			}
-		});
+		// This path OWNS its transaction, so it owns the attempt lifecycle
+		// too: a rollback restores every in-memory field (a failed re-base
+		// must not leave rebasedThisRun true or a phantom written tip).
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => {
+				const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+				if (tipSequence == null) {
+					this.appendSnapshotFrame(1n, GENESIS_HASH);
+				} else {
+					this.appendSnapshotFrame(
+						BigInt(tipSequence) + 1n,
+						Buffer.from(
+							this.storage.getRecoveryMeta!(META_TIP_HASH) ??
+								GENESIS_HASH.toString('hex'),
+							'hex'
+						)
+					);
+				}
+			});
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
 		this.rebasedThisRun = true;
 	}
 
 	// ─────────────── internals ───────────────
 
 	private writerEpoch(): bigint {
-		const epoch = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
-		return epoch == null ? 1n : BigInt(epoch);
+		const stored = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
+		const lease = this.activeLeaseEpoch?.() ?? null;
+		if (stored == null) {
+			// Defaulting to 1 is only safe on a journal that never HAD an
+			// epoch: with a lease active, or after a higher epoch was
+			// observed, a missing record means it was destroyed.
+			if (lease != null || this.epochFloor > 1n) {
+				throw new Error(
+					'recovery: the journal writer epoch record is missing; ' +
+						'refusing to write'
+				);
+			}
+			return 1n;
+		}
+		if (!/^[1-9]\d*$/.test(stored)) {
+			throw new Error(
+				`recovery: the journal writer epoch record ('${stored}') is ` +
+					`malformed; refusing to write`
+			);
+		}
+		const epoch = BigInt(stored);
+		if (epoch < this.epochFloor) {
+			throw new Error(
+				`recovery: the journal writer epoch regressed (${epoch} after ` +
+					`${this.epochFloor}); refusing to write`
+			);
+		}
+		if (lease != null && epoch !== lease) {
+			throw new Error(
+				`recovery: the journal writer epoch (${epoch}) does not match ` +
+					`the active lease epoch (${lease}); refusing to write`
+			);
+		}
+		this.epochFloor = epoch;
+		return epoch;
 	}
 
 	/**
@@ -859,20 +985,35 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				);
 			}
 			// A genuinely fresh journal: no frames, and no metadata beyond
-			// what legitimately precedes the first frame (lease, epoch,
-			// registration, startup repair marker). PRESENCE is what is
+			// what legitimately precedes the first frame, each holding a
+			// value inside its legitimate shape. PRESENCE is what is
 			// checked: an explicitly stored empty value is still residue.
+			const validateAllowed = (key: string): void => {
+				const validate = EMPTY_STORE_ALLOWED_META.get(key);
+				if (!validate) {
+					throw new Error(
+						`recovery: the frame store is empty but recovery ` +
+							`metadata ('${key}') survives; refusing to write`
+					);
+				}
+				const value = this.storage.getRecoveryMeta!(key);
+				if (value == null || !validate(value)) {
+					throw new Error(
+						`recovery: pre-frame recovery metadata ('${key}') holds ` +
+							`an illegitimate value; refusing to write`
+					);
+				}
+			};
 			const listed = this.storage.listRecoveryMetaKeys?.();
 			if (listed !== undefined) {
 				for (const key of listed) {
-					if (!EMPTY_STORE_ALLOWED_META_KEYS.has(key)) {
-						throw new Error(
-							`recovery: the frame store is empty but recovery ` +
-								`metadata ('${key}') survives; refusing to write`
-						);
-					}
+					validateAllowed(key);
 				}
 			} else {
+				// A non-enumerating backend cannot reveal unknown residue,
+				// but every key this codebase writes is still checked: the
+				// disallowed ones for absence, the allowed ones for their
+				// exact legitimate value shape.
 				for (const key of [
 					...FRAME_DERIVED_META_KEYS,
 					'guardian_replicated_through'
@@ -884,8 +1025,17 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 						);
 					}
 				}
+				for (const [key, validate] of EMPTY_STORE_ALLOWED_META) {
+					const value = this.storage.getRecoveryMeta!(key);
+					if (value != null && !validate(value)) {
+						throw new Error(
+							`recovery: pre-frame recovery metadata ('${key}') ` +
+								`holds an illegitimate value; refusing to write`
+						);
+					}
+				}
 			}
-			if (this.storage.loadRecoveryFrames!().length > 0) {
+			if (this.recoveryFrameCount() > 0) {
 				throw new Error(
 					'recovery: frames exist without a recorded tip; refusing to write'
 				);
@@ -899,14 +1049,45 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 					`${this.tipFloor}); refusing to write`
 			);
 		}
-		// The recorded tip must be BACKED by its stored row, exactly: a
-		// deleted tail or a swapped tip hash fails here on the very next
-		// write instead of after the next restart.
-		const above = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		// The replication watermark is a PROMISE about frames guardians
+		// hold; it can never legitimately exceed the local tip, and letting
+		// a raised one stand would release the next frames without any
+		// receipt behind them.
+		const watermark = this.storage.getRecoveryMeta!(
+			'guardian_replicated_through'
+		);
 		if (
-			above.length !== 1 ||
-			BigInt(above[0].sequence) !== sequence ||
-			!above[0].frameHash.equals(Buffer.from(tipHash!, 'hex'))
+			watermark != null &&
+			(!/^\d+$/.test(watermark) || BigInt(watermark) > sequence)
+		) {
+			throw new Error(
+				`recovery: the replication watermark ('${watermark}') exceeds ` +
+					`the journal tip ${sequence}; refusing to write`
+			);
+		}
+		// The recorded tip must be BACKED by its stored rows, exactly and
+		// CONTIGUOUSLY: the primary key makes sequences unique, so matching
+		// endpoints plus an exact count prove the retained chain has no
+		// interior gap. A deleted tail, a swapped tip hash, or a deleted
+		// middle frame all fail here on the very next write instead of
+		// after the next restart.
+		const stats = this.recoveryFrameSpan();
+		if (
+			stats == null ||
+			BigInt(stats.maxSequence) !== sequence ||
+			stats.minSequence < 1 ||
+			BigInt(stats.count) !== sequence - BigInt(stats.minSequence) + 1n
+		) {
+			throw new Error(
+				`recovery: the stored frames do not match the recorded tip ` +
+					`${sequence}; refusing to write`
+			);
+		}
+		const tipRow = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		if (
+			tipRow.length !== 1 ||
+			BigInt(tipRow[0].sequence) !== sequence ||
+			!tipRow[0].frameHash.equals(Buffer.from(tipHash!, 'hex'))
 		) {
 			throw new Error(
 				`recovery: the stored frames do not match the recorded tip ` +
@@ -914,6 +1095,30 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			);
 		}
 		this.tipFloor = sequence;
+	}
+
+	/** Row count of the frame store (stats API when available). */
+	private recoveryFrameCount(): number {
+		const stats = this.storage.recoveryFrameStats?.();
+		if (stats !== undefined) return stats?.count ?? 0;
+		return this.storage.loadRecoveryFrames!().length;
+	}
+
+	/** Span statistics of the frame store, null when empty. */
+	private recoveryFrameSpan(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null {
+		const stats = this.storage.recoveryFrameStats?.();
+		if (stats !== undefined) return stats;
+		const rows = this.storage.loadRecoveryFrames!();
+		if (rows.length === 0) return null;
+		return {
+			count: rows.length,
+			minSequence: rows[0].sequence,
+			maxSequence: rows[rows.length - 1].sequence
+		};
 	}
 
 	/** Encode, hash, encrypt and store one frame; advance the tip. */
@@ -1017,14 +1222,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// metadata and the schema marker land together or roll back
 		// together. A partial write (frame stored, tip metadata stale)
 		// would leave the whole journal unverifiable, which is strictly
-		// worse than the gap this repair closes.
-		this.storage.transaction(() => {
-			this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
-			this.storage.setRecoveryMeta!(
-				META_SNAPSHOT_SCHEMA,
-				SNAPSHOT_SCHEMA_VERSION
-			);
-		});
+		// worse than the gap this repair closes. The attempt lifecycle is
+		// owned here too: a rollback restores every in-memory field.
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => {
+				this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+				this.storage.setRecoveryMeta!(
+					META_SNAPSHOT_SCHEMA,
+					SNAPSHOT_SCHEMA_VERSION
+				);
+			});
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
 		return sequence;
 	}
 

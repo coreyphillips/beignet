@@ -1590,3 +1590,39 @@ describe('Recovery phase 3: round-14 validator and residue hardening', () => {
 		storage.close();
 	});
 });
+
+describe('Recovery phase 3: validator failures are never capsule defects', () => {
+	it('a validator that cannot replay KNOWN-GOOD content propagates raw', () => {
+		// The probe replays a synthetic known-good frame set exercising the
+		// same reads, table writes and transaction completion a real replay
+		// needs. A scratch backend failing THAT is broken infrastructure:
+		// it must propagate raw, never silently discard a valid Tier-2
+		// candidate into Tier 1.
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const failingReplayScratch = (): SqliteStorage => {
+			const scratch = new SqliteStorage(':memory:');
+			scratch.open();
+			scratch.savePreimage = (): void => {
+				throw new Error('scratch preimage table broken');
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+				scratchStorage: failingReplayScratch
+			})
+		).to.throw(/scratch preimage table broken/);
+		expect(
+			target.loadRecoveryFrames!(),
+			'the target was never touched'
+		).to.have.length(0);
+		target.close();
+		storage.close();
+	});
+});

@@ -1776,6 +1776,24 @@ export class SqliteStorage implements IStorageBackend {
 			.run(key, this._enc(value));
 	}
 
+	recoveryFrameStats(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null {
+		const row = this.db
+			.prepare(
+				'SELECT COUNT(*) AS count, MIN(sequence) AS min, MAX(sequence) AS max FROM recovery_frames'
+			)
+			.get() as { count: number; min: number | null; max: number | null };
+		if (!row.count) return null;
+		return {
+			count: row.count,
+			minSequence: row.min!,
+			maxSequence: row.max!
+		};
+	}
+
 	listRecoveryMetaKeys(): string[] {
 		return (
 			this.db.prepare('SELECT key FROM recovery_meta').all() as Array<{
