@@ -1419,9 +1419,7 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		const { manager: fresh } = makeJournaledManager(storage);
 		const result = commitPreimage(fresh, 6);
 		expect(result.committed, 'the rewrite is refused').to.equal(false);
-		expect(String(result.error?.message)).to.match(
-			/frame 2 cannot be read by this release/
-		);
+		expect(String(result.error?.message)).to.match(/fails verification/);
 		// The future frame survives untouched.
 		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
 		const kept = storage.loadRecoveryFrames!(0).find((r) => r.sequence === 2);
@@ -1445,6 +1443,52 @@ describe('Recovery phase 2: authenticated snapshot schema at the write boundary'
 		);
 		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
 		storage.close();
+	});
+
+	it('refuses to rewrite a journal whose chain does not verify against its tip', () => {
+		// Deleting the tail, emptying the frame store while keeping the tip
+		// metadata, or swapping the tip hash must all refuse the rewrite:
+		// the compaction it triggers would destroy the evidence and leave a
+		// journal that verifies.
+		const sql = (
+			storage: SqliteStorage
+		): { prepare(q: string): { run(...args: unknown[]): unknown } } =>
+			(
+				storage as unknown as {
+					db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+				}
+			).db;
+
+		// (a) Deleted tail: tip says 2, rows end at 1.
+		const s1 = openStorage();
+		const m1 = makeJournaledManager(s1);
+		expect(commitPreimage(m1.manager, 10).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 11).committed).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames WHERE sequence = 2').run();
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 12);
+		expect(r1.committed, 'deleted tail refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/fails verification/);
+		s1.close();
+
+		// (b) Every frame deleted, tip metadata retained.
+		const s2 = openStorage();
+		const m2 = makeJournaledManager(s2);
+		expect(commitPreimage(m2.manager, 13).committed).to.equal(true);
+		sql(s2).prepare('DELETE FROM recovery_frames').run();
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 14);
+		expect(r2.committed, 'emptied store refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(/fails verification/);
+		s2.close();
+
+		// (c) Tip hash swapped for a plausible but wrong value.
+		const s3 = openStorage();
+		const m3 = makeJournaledManager(s3);
+		expect(commitPreimage(m3.manager, 15).committed).to.equal(true);
+		s3.setRecoveryMeta!('journal_tip_hash', 'ab'.repeat(32));
+		const r3 = commitPreimage(makeJournaledManager(s3).manager, 16);
+		expect(r3.committed, 'swapped tip hash refused').to.equal(false);
+		expect(String(r3.error?.message)).to.match(/fails verification/);
+		s3.close();
 	});
 
 	it('refuses a present-but-null or empty schema declaration outright', () => {

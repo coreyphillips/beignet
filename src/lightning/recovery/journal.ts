@@ -29,6 +29,7 @@ import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import { withStorageTransaction } from '../storage/transaction';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
 import { RecoveryManager } from './recovery-manager';
 import {
@@ -707,37 +708,31 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.assertSnapshotSchemaMigratable(
 			this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA)
 		);
-		const rows = this.storage.loadRecoveryFrames!(0);
-		let sawSnapshot = rows.length === 0;
-		for (let i = rows.length - 1; i >= 0 && !sawSnapshot; i--) {
-			const row = rows[i];
-			let frame: RecoveryFrame;
-			try {
-				const writerEpoch = BigInt(row.writerEpoch);
-				const key = deriveFrameKey(this.masterKey, this.nodeId, writerEpoch);
-				const aad = frameAad(
-					this.nodeId,
-					writerEpoch,
-					BigInt(row.sequence),
-					row.previousFrameHash
-				);
-				frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
-			} catch {
-				// FAIL CLOSED on any stored row this release cannot read: an
-				// AEAD-valid frame whose shape decodeFrame rejects is
-				// exactly what a future release's tail looks like, and
-				// skipping it in favor of an older readable snapshot would
-				// let the next re-base compact the future frames away. A
-				// frame that fails the AEAD is corruption, which is no
-				// sounder a base for a rewrite.
-				throw new Error(
-					`recovery: stored frame ${row.sequence} cannot be read by ` +
-						`this release; refusing to rewrite the journal`
-				);
-			}
-			if (!frame.snapshot) continue;
+		// FULL chain verification, not just decryption: the rewrite this
+		// gate protects will COMPACT whatever it re-bases over, so the
+		// stored chain must prove sequence continuity, hash linkage, AEAD
+		// integrity and binding to the recorded tip in BOTH directions (a
+		// recorded tip without frames, and frames without a recorded tip,
+		// are both an emptied or truncated journal, not a fresh one). Any
+		// row this release cannot decrypt OR decode fails verification,
+		// which is exactly right: an AEAD-valid future frame must not be
+		// skipped in favor of an older readable snapshot and compacted
+		// away. A truly fresh journal (no frames AND no metadata) passes.
+		let frames: VerifiedRecoveryChain;
+		try {
+			frames = this.loadVerifiedFrames();
+		} catch (err) {
+			throw new Error(
+				`recovery: the stored journal fails verification (${
+					err instanceof Error ? err.message : String(err)
+				}); refusing to rewrite it`
+			);
+		}
+		let sawSnapshot = frames.length === 0;
+		for (let i = frames.length - 1; i >= 0 && !sawSnapshot; i--) {
+			if (!frames[i].snapshot) continue;
 			sawSnapshot = true;
-			const declared = frame.snapshot.schemaVersion;
+			const declared = frames[i].snapshot!.schemaVersion;
 			if (!snapshotSchemaKnown(declared)) {
 				throw new Error(
 					`recovery: the journal's retained base snapshot declares ` +
@@ -1318,6 +1313,41 @@ export function reconstructFromFrames(
 	}
 }
 
+/**
+ * Throw when the target holds ANY recovery journal state: stored frames, or
+ * any of the journal's recovery_meta keys. assertEmptyTarget covers the
+ * reconstructed application tables; a restore destination must ALSO be
+ * clean of journal residue, or an install would silently overwrite another
+ * journal's metadata (and a failed attempt could leave its frames behind).
+ */
+export function assertNoJournalResidue(target: IStorageBackend): void {
+	if ((target.loadRecoveryFrames?.(0) ?? []).length > 0) {
+		throw new Error(
+			'Recovery restore requires a target with no stored recovery frames'
+		);
+	}
+	const residueKeys = [
+		META_TIP_SEQUENCE,
+		META_TIP_HASH,
+		META_WRITER_EPOCH,
+		META_LAST_SNAPSHOT,
+		META_DELTA_BYTES,
+		META_LAST_SNAPSHOT_WRITTEN,
+		META_SNAPSHOT_SCHEMA,
+		META_DURABILITY_FLOOR,
+		META_BACKFILL_LOST
+	];
+	for (const key of residueKeys) {
+		const value = target.getRecoveryMeta?.(key);
+		if (value != null && value !== '') {
+			throw new Error(
+				`Recovery restore requires a target with no journal metadata ` +
+					`('${key}' is set)`
+			);
+		}
+	}
+}
+
 /** Throw when the reconstruction target already holds journaled state. */
 export function assertEmptyTarget(target: IStorageBackend): void {
 	const dirty =
@@ -1344,7 +1374,9 @@ function applySnapshot(
 	target: IStorageBackend,
 	snapshot: RecoverySnapshot
 ): void {
-	target.transaction(() => {
+	// Joins the caller's transaction when one is active (a capsule install
+	// wraps the whole restore in one); opens its own otherwise.
+	withStorageTransaction(target, () => {
 		for (const c of snapshot.channels) {
 			target.saveChannel(c.channelId, c.state, c.peerPubkey);
 		}

@@ -41,12 +41,35 @@ import {
 	JOURNAL_META_KEYS,
 	assertEmptyTarget,
 	assertFramesReconstructable,
+	assertNoJournalResidue,
 	deriveRecoveryMasterKey,
 	journalSupported,
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
+import { withStorageTransaction } from '../storage/transaction';
 import { VerifiedRecoveryChain } from './types';
+
+/**
+ * A capsule whose CONTENT could not replay into the target (the chain
+ * verified, but a table write it implies is invalid, e.g. a constraint
+ * violation). The install transaction has rolled the target back, so the
+ * candidate may be skipped and a lower tier tried. Deliberately distinct
+ * from raw storage failures (a disk error while writing the frames or
+ * metadata), which mean the TARGET is broken and must propagate.
+ */
+export class CapsuleReplayError extends Error {
+	readonly cause: unknown;
+	constructor(cause: unknown) {
+		super(
+			`recovery capsule content failed to replay: ${
+				cause instanceof Error ? cause.message : String(cause)
+			}`
+		);
+		this.name = 'CapsuleReplayError';
+		this.cause = cause;
+	}
+}
 
 const CAPSULE_HKDF_INFO = 'beignet-recovery-capsule-v1';
 const CAPSULE_MAGIC = 'bRC1';
@@ -523,10 +546,21 @@ export function restoreFromRecoveryCapsule(
 		return { tier: 1, scb, framesApplied: 0 };
 	}
 
-	// Validate the candidate COMPLETELY before the first write to the target.
+	// Validate the candidate COMPLETELY before the first write to the
+	// target, and refuse a target already carrying journal state: the
+	// metadata writes below would silently overwrite another journal.
 	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
+	assertNoJournalResidue(target);
 
-	target.transaction(() => {
+	// ONE shared transaction for the frames, the metadata AND the replay:
+	// the inner reconstruction units (applySnapshot, the per-frame
+	// RecoveryManager commits) JOIN it through withStorageTransaction
+	// instead of nesting, which IStorageBackend does not promise. A replay
+	// defect therefore rolls the whole install back and surfaces as a
+	// typed CapsuleReplayError; a raw storage failure (frames or metadata
+	// refusing to write) propagates untyped, because that means the TARGET
+	// is broken, not the capsule.
+	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
 		}
@@ -543,9 +577,11 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
-		// Inside the SAME transaction (nested transactions are savepoints):
-		// a replay defect rolls back the frames and metadata above too.
-		reconstructFromFrames(target, frames);
+		try {
+			reconstructFromFrames(target, frames);
+		} catch (err) {
+			throw new CapsuleReplayError(err);
+		}
 	});
 	return { tier: 2, scb, framesApplied: frames.length };
 }
@@ -608,9 +644,12 @@ export function restoreBestRecoveryCapsule(
 	// tried: with the install rolled back on failure, a per-candidate
 	// throw now reads as a candidate defect, and a pre-populated database
 	// must not be silently degraded through every candidate into a Tier 1
-	// answer.
+	// answer. Dirty means EITHER reconstructed application tables OR any
+	// recovery journal residue (stored frames, journal metadata): the
+	// install writes both.
 	if (journalSupported(target)) {
 		assertEmptyTarget(target);
+		assertNoJournalResidue(target);
 	}
 
 	for (let i = 0; i < sorted.length; ) {
@@ -648,16 +687,19 @@ export function restoreBestRecoveryCapsule(
 				} catch {
 					continue;
 				}
-				// A restore failure past validation is a CANDIDATE defect
-				// too: chain verification cannot prove the content REPLAYS,
-				// and the install transaction rolls the target back to
-				// untouched on any throw, so trying the next replica (or
-				// falling through to Tier 1) is safe. A dirty target was
-				// already refused loudly before the selection loop.
+				// A REPLAY failure past validation is a CANDIDATE defect:
+				// chain verification cannot prove the content replays, and
+				// the install transaction rolls the target back to untouched
+				// on any throw, so trying the next replica (or falling
+				// through to Tier 1) is safe. ONLY the typed replay error is
+				// swallowed; a raw storage failure means the TARGET is
+				// broken, and degrading it to a Tier 1 answer would mask
+				// that, so it propagates.
 				let result: ICapsuleRestoreResult;
 				try {
 					result = restoreFromRecoveryCapsule(candidate, target, nodeSecret);
-				} catch {
+				} catch (err) {
+					if (!(err instanceof CapsuleReplayError)) throw err;
 					continue;
 				}
 				return {

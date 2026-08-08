@@ -134,6 +134,20 @@ export interface IPeerInfo {
 
 type MessageHandler = (pubkey: string, type: number, payload: Buffer) => void;
 
+/**
+ * A dial that was overtaken by an explicit disconnectPeer() for the same
+ * peer. TYPED so multi-address retry loops (connectPeerById's graph and
+ * DNS fallbacks) can stop instead of treating the cancellation as one
+ * more failed address and dialing the next one under the new generation,
+ * which would reverse the explicit disconnect.
+ */
+export class PeerDialCancelledError extends Error {
+	constructor(pubkey: string) {
+		super(`Connection to peer ${pubkey} was cancelled while establishing`);
+		this.name = 'PeerDialCancelledError';
+	}
+}
+
 export class PeerManager extends EventEmitter {
 	private localPrivateKey: Buffer;
 	private localPubkeyHex: string;
@@ -312,6 +326,15 @@ export class PeerManager extends EventEmitter {
 		// Visible to freezeConnections() while establishing: a freeze aborts
 		// the handshake instead of letting it complete and register later.
 		this.pendingPeers.add(peer);
+		// Visible to disconnectPeer() while establishing: an explicit
+		// cancellation aborts the handshake NOW instead of leaving the
+		// socket live until it completes or times out.
+		let pendingDials = this.pendingDialsByPubkey.get(pubkey);
+		if (!pendingDials) {
+			pendingDials = new Set();
+			this.pendingDialsByPubkey.set(pubkey, pendingDials);
+		}
+		pendingDials.add(peer);
 
 		try {
 			await peer.connect();
@@ -321,9 +344,19 @@ export class PeerManager extends EventEmitter {
 			if (previousAddress) {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
+			// A dial aborted BY the cancellation is reported as the typed
+			// cancellation, not as an address failure a retry loop would
+			// route around.
+			if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
+				throw new PeerDialCancelledError(pubkey);
+			}
 			throw err;
 		} finally {
 			this.pendingPeers.delete(peer);
+			pendingDials.delete(peer);
+			if (pendingDials.size === 0) {
+				this.pendingDialsByPubkey.delete(pubkey);
+			}
 		}
 		// Recheck AFTER the async establishment: a freeze, destroy or gate
 		// closure that landed mid-handshake must win over registration.
@@ -344,9 +377,7 @@ export class PeerManager extends EventEmitter {
 		if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
 			peer.removeAllListeners();
 			peer.disconnect();
-			throw new Error(
-				`Connection to peer ${pubkey} was cancelled while establishing`
-			);
+			throw new PeerDialCancelledError(pubkey);
 		}
 		// The peer may have dialed US while our handshake was in flight. Apply
 		// the deterministic tie-break (see preferOutboundTo): if the registered
@@ -474,6 +505,13 @@ export class PeerManager extends EventEmitter {
 			pubkey,
 			(this.cancelGenerations.get(pubkey) ?? 0) + 1
 		);
+		// Abort in-flight outbound dials NOW: a stalled handshake must not
+		// keep its socket live (and later reject or register) after the
+		// caller explicitly cancelled the peer. The abort makes the dial
+		// reject as a typed cancellation.
+		for (const pending of this.pendingDialsByPubkey.get(pubkey) ?? []) {
+			pending.disconnect();
+		}
 		const timer = this.reconnectTimers.get(pubkey);
 		if (timer) {
 			clearTimeout(timer);
@@ -548,6 +586,12 @@ export class PeerManager extends EventEmitter {
 	 * in-flight handshake survives it and registers afterwards.
 	 */
 	private pendingPeers = new Set<Peer>();
+	/**
+	 * In-flight OUTBOUND dials indexed by pubkey, so an explicit
+	 * disconnectPeer() can abort a stalled handshake immediately instead
+	 * of leaving its socket live until it finishes or times out.
+	 */
+	private pendingDialsByPubkey = new Map<string, Set<Peer>>();
 
 	/**
 	 * Listeners whose bind has not completed. this.server / this.wsServer are
@@ -1102,9 +1146,18 @@ export class PeerManager extends EventEmitter {
 				this.inboundPeerCount--;
 				this.inboundPeerSet.delete(pubkey);
 			}
+			// Snapshot BEFORE the emit: a synchronous peer:disconnect
+			// observer may call disconnectPeer() to cancel this peer for
+			// good, and a timer scheduled after that would adopt the
+			// post-cancellation generation and dial anyway.
+			const closeGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 			this.emit('peer:disconnect', pubkey);
 
-			if (this.autoReconnect && this.reconnectCandidates(pubkey).length > 0) {
+			if (
+				this.autoReconnect &&
+				(this.cancelGenerations.get(pubkey) ?? 0) === closeGeneration &&
+				this.reconnectCandidates(pubkey).length > 0
+			) {
 				this.scheduleReconnect(pubkey);
 			}
 		});

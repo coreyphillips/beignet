@@ -12,6 +12,7 @@
 
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
+import { withStorageTransaction } from '../storage/transaction';
 import {
 	IRecoveryCommitResult,
 	IRecoveryJournalSink,
@@ -104,7 +105,10 @@ export class RecoveryManager {
 		let journaled = false;
 		let frameSequence: bigint | null = null;
 		try {
-			this.storage.transaction(() => {
+			// Joins an outer transaction when one is active (reconstruction
+			// replays commits inside a single install transaction); opens
+			// its own otherwise. See withStorageTransaction.
+			withStorageTransaction(this.storage, () => {
 				for (const mutation of mutations) {
 					this.applyMutation(mutation);
 				}

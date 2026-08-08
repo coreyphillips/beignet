@@ -39,7 +39,11 @@ import {
 	REGTEST_CHAIN_HASH,
 	SIGNET_CHAIN_HASH
 } from '../channel/types';
-import { PeerManager, IPeerInfo } from '../transport/peer-manager';
+import {
+	PeerManager,
+	IPeerInfo,
+	PeerDialCancelledError
+} from '../transport/peer-manager';
 import { IPeerTransportOptions } from '../transport/duplex-transport';
 import { parseWebSocketUrl } from '../transport/websocket';
 import { NetworkGraph } from '../gossip/network-graph';
@@ -5735,6 +5739,10 @@ export class LightningNode extends EventEmitter {
 				await this.peerManager!.connectPeer(pubkey, host, port);
 				return;
 			} catch (err) {
+				// An explicit disconnectPeer() cancelled the whole node-id
+				// operation, not one address: retrying the next candidate
+				// would reconnect the very peer the caller just removed.
+				if (err instanceof PeerDialCancelledError) throw err;
 				attempts.push(
 					`graph ${host}:${port} (${
 						err instanceof Error ? err.message : String(err)
@@ -5771,6 +5779,8 @@ export class LightningNode extends EventEmitter {
 					await this.peerManager!.connectPeer(pubkey, peer.host, peer.port);
 					return;
 				} catch (err) {
+					// See the graph loop: cancellation stops the operation.
+					if (err instanceof PeerDialCancelledError) throw err;
 					attempts.push(
 						`dns ${peer.host}:${peer.port} (${
 							err instanceof Error ? err.message : String(err)

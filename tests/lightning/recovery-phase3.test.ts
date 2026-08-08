@@ -1269,3 +1269,104 @@ describe('Recovery phase 3: capsule replay failures roll back', () => {
 		storage.close();
 	});
 });
+
+describe('Recovery phase 3: restore target and backend contracts', () => {
+	it('refuses a target carrying recovery metadata or frames, not just tables', () => {
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+
+		// Metadata-only residue: application tables empty, but journal
+		// metadata present. Overwriting it would silently orphan another
+		// journal's identity.
+		const metaDirty = openStorage();
+		metaDirty.setRecoveryMeta!('journal_tip_sequence', '7');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], metaDirty, NODE_SECRET)
+		).to.throw(/journal metadata/);
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, metaDirty, NODE_SECRET)
+		).to.throw(/journal metadata/);
+		expect(
+			metaDirty.getRecoveryMeta!('journal_tip_sequence'),
+			'the residue was not overwritten'
+		).to.equal('7');
+		metaDirty.close();
+
+		// Frame residue: a stray stored frame with no tip metadata.
+		const frameDirty = openStorage();
+		const row = storage.loadRecoveryFrames!(0)[0];
+		frameDirty.saveRecoveryFrame!(row);
+		frameDirty.deleteRecoveryMeta?.('journal_tip_sequence');
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], frameDirty, NODE_SECRET)
+		).to.throw(/recovery frames/);
+		frameDirty.close();
+		storage.close();
+	});
+
+	it('restores Tier 2 through a backend that refuses nested transactions', () => {
+		// IStorageBackend does not promise reentrant transactions. Emulate
+		// a strictly non-reentrant backend: the whole install (frames,
+		// metadata, replay) must share ONE transaction instead of nesting.
+		const { storage } = journaledStorage(2);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const capsule = decodeRecoveryCapsuleBlob(blob, NODE_SECRET)!;
+		const real = openStorage();
+		let inTransaction = false;
+		const strict = new Proxy(real, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'transaction') {
+					return <T>(fn: () => T): T => {
+						if (inTransaction) {
+							throw new Error('nested transaction refused');
+						}
+						inTransaction = true;
+						try {
+							return target.transaction(fn);
+						} finally {
+							inTransaction = false;
+						}
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+
+		const result = restoreFromRecoveryCapsule(capsule, strict, NODE_SECRET);
+		expect(result.tier, 'the valid capsule restores Tier 2').to.equal(2);
+		expect(real.loadRecoveryFrames!(0).length).to.be.greaterThan(0);
+		expect(real.loadAllPreimages().length).to.be.greaterThan(0);
+		real.close();
+		storage.close();
+	});
+
+	it('propagates a broken target instead of degrading it to Tier 1', () => {
+		// A valid capsule over a target whose frame store fails is a TARGET
+		// problem: returning Tier 1 would mask the broken database.
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const broken = openStorage();
+		broken.saveRecoveryFrame = (): void => {
+			throw new Error('disk write failed');
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], broken, NODE_SECRET)
+		).to.throw(/disk write failed/);
+		broken.close();
+		storage.close();
+	});
+});

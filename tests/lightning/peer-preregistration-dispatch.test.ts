@@ -20,6 +20,7 @@
 
 import { expect } from 'chai';
 import crypto from 'crypto';
+import net from 'net';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { INodeConfig } from '../../src/lightning/node/types';
 import { Network } from '../../src/lightning/invoice/types';
@@ -506,12 +507,166 @@ describe('Peer held post-handshake delivery', function () {
 			});
 			expect(rejection, 'the dial rejected').to.be.instanceOf(Error);
 			expect(String(rejection)).to.contain('cancelled while establishing');
+			expect(
+				(rejection as unknown as Error).name,
+				'and the rejection is TYPED so retry loops can stop'
+			).to.equal('PeerDialCancelledError');
 			expect(pmA.peers.size, 'nothing was registered').to.equal(0);
 			expect(pmA.reconnectTimers.size, 'and nothing was rescheduled').to.equal(
 				0
 			);
 		} finally {
 			Peer.prototype.connect = realConnect;
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('disconnectPeer aborts a stalled in-flight dial immediately', async function () {
+		// A TCP server that accepts and never answers: the noise handshake
+		// stalls. Explicit cancellation must abort the pending dial NOW
+		// (typed rejection, no socket left live until the 30s timeout).
+		const blackhole = net.createServer(() => undefined);
+		await new Promise<void>((resolve) =>
+			blackhole.listen(0, '127.0.0.1', resolve)
+		);
+		const port = (blackhole.address() as { port: number }).port;
+		const a = new LightningNode(makeNodeConfig(31));
+		a.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+						pendingDialsByPubkey: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			const target = getPublicKey(makeSeed(997)).toString('hex');
+			let rejection: Error | null = null;
+			const dial = a.connectPeer(target, '127.0.0.1', port).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			await new Promise((resolve) => setTimeout(resolve, 150));
+			expect(
+				pmA.pendingDialsByPubkey.size,
+				'the stalled dial is indexed'
+			).to.equal(1);
+			a.disconnectPeer(target);
+			await dial;
+			expect(rejection, 'the dial settled promptly').to.be.instanceOf(Error);
+			expect((rejection as unknown as Error).name).to.equal(
+				'PeerDialCancelledError'
+			);
+			expect(pmA.pendingDialsByPubkey.size, 'nothing pending').to.equal(0);
+			expect(pmA.peers.size).to.equal(0);
+			expect(pmA.reconnectTimers.size, 'nothing rescheduled').to.equal(0);
+		} finally {
+			a.destroy();
+			blackhole.close();
+		}
+	});
+
+	it('connectPeerById stops on cancellation instead of trying the next address', async function () {
+		// The cancellation covers the whole node-id operation: treating it
+		// as one more failed address and dialing the next graph candidate
+		// would reconnect the very peer the caller just removed.
+		const a = new LightningNode(makeNodeConfig(32));
+		a.on('node:error', () => {});
+		try {
+			const pubkey = getPublicKey(makeSeed(996)).toString('hex');
+			(
+				a as unknown as {
+					graph: {
+						getNode(id: Buffer): {
+							announcement: {
+								addresses: Array<{
+									type: number;
+									host: string;
+									port: number;
+								}>;
+							};
+						};
+					};
+				}
+			).graph = {
+				getNode: () => ({
+					announcement: {
+						addresses: [
+							{ type: 1, host: '127.0.0.1', port: 1 },
+							{ type: 1, host: '127.0.0.1', port: 2 }
+						]
+					}
+				})
+			};
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						connectPeer(pk: string, host: string, port: number): Promise<void>;
+					};
+				}
+			).peerManager;
+			const { PeerDialCancelledError } = await import(
+				'../../src/lightning/transport/peer-manager'
+			);
+			let dials = 0;
+			pmA.connectPeer = async (pk: string): Promise<void> => {
+				dials++;
+				throw new PeerDialCancelledError(pk);
+			};
+			let rejection: Error | null = null;
+			await a.connectPeer(pubkey).catch((err) => {
+				rejection = err instanceof Error ? err : new Error(String(err));
+			});
+			expect(rejection, 'the operation rejected').to.be.instanceOf(Error);
+			expect((rejection as unknown as Error).name).to.equal(
+				'PeerDialCancelledError'
+			);
+			expect(dials, 'the second address was never tried').to.equal(1);
+		} finally {
+			a.destroy();
+		}
+	});
+
+	it('a peer:disconnect observer cancelling on natural close is respected', async function () {
+		// The remote side drops the connection; a synchronous
+		// peer:disconnect observer decides the peer is gone for good. The
+		// close handler must not schedule a reconnect that adopts the
+		// post-cancellation generation.
+		const a = new LightningNode(makeNodeConfig(33));
+		const b = new LightningNode(makeNodeConfig(34));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size).to.equal(1);
+			a.on('peer:disconnect', (pubkey: string) => {
+				a.disconnectPeer(pubkey);
+			});
+			// Natural close from the REMOTE side.
+			b.disconnectPeer(a.getNodeId());
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(pmA.peers.size, 'the peer stayed gone').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the close handler honored the cancellation'
+			).to.equal(0);
+		} finally {
 			a.destroy();
 			b.destroy();
 		}
