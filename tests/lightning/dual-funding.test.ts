@@ -1261,10 +1261,18 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			});
 
 			const actions = channel.handleOpenChannel2(openMsg, localParams);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			if (actions[0].type === ChannelActionType.ERROR) {
-				expect(actions[0].message).to.match(
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(
 					/option_taproot is not supported for dual-funded/i
 				);
 			}
@@ -2070,10 +2078,18 @@ describe('Round 17: v2 channel_type admission', () => {
 				}),
 				makeDualFundingParams()
 			);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			if (actions[0].type === ChannelActionType.ERROR) {
-				expect(actions[0].message).to.match(
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(
 					/option_taproot is not supported for dual-funded/
 				);
 			}
@@ -2092,8 +2108,16 @@ describe('Round 17: v2 channel_type admission', () => {
 				}),
 				makeDualFundingParams()
 			);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
 			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
 		});
 
@@ -2140,10 +2164,18 @@ describe('Round 17: v2 channel_type admission', () => {
 				}),
 				makeDualFundingParams()
 			);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			if (actions[0].type === ChannelActionType.ERROR) {
-				expect(actions[0].message).to.match(/requires a channel_type/);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(/requires a channel_type/);
 			}
 			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
 		});
@@ -2161,10 +2193,18 @@ describe('Round 17: v2 channel_type admission', () => {
 				}),
 				makeDualFundingParams()
 			);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			if (actions[0].type === ChannelActionType.ERROR) {
-				expect(actions[0].message).to.match(/cannot be announced/);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(/cannot be announced/);
 			}
 			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
 		});
@@ -2233,6 +2273,65 @@ describe('Round 17: v2 channel_type admission', () => {
 				actions.some((a) => a.type === ChannelActionType.ERROR),
 				'and surfaced locally'
 			).to.equal(true);
+		});
+	});
+
+	describe('round-19 wire-visible inbound refusals', () => {
+		it('an untrusted zero-conf open_channel2 is refused ON THE WIRE and the temp channel removed', () => {
+			// The reviewer's reproduction: the zero-conf trust gate fired
+			// AFTER the manager retained the temp channel, and its local-only
+			// error deleted our half silently, leaving the opener awaiting
+			// accept_channel2 forever. Every rejected inbound open now sends
+			// a scoped ERROR before cleanup (BOLT 2 negotiation
+			// cancellation).
+			const config = makeChannelManagerConfig();
+			const mgr = new ChannelManager(config);
+			const errors: string[] = [];
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			const openMsg = makeOpenChannel2Msg({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				// Alias types are never announceable; keep the flags legal so
+				// the refusal under test is the TRUST gate.
+				channelFlags: 0x00
+			});
+			mgr.handleMessage(
+				'02' + 'ab'.repeat(32),
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+
+			const wireErrors = sent.filter((m) => m.type === MessageType.ERROR);
+			expect(
+				wireErrors.length,
+				'a scoped wire ERROR reached the opener'
+			).to.equal(1);
+			expect(
+				wireErrors[0].payload.toString('utf8'),
+				'carrying the refusal reason'
+			).to.contain('requires a trusted peer');
+			expect(errors.join(' ')).to.contain('requires a trusted peer');
+			expect(
+				(mgr as unknown as { tempChannels: Map<string, unknown> }).tempChannels
+					.size,
+				'the temporary channel was removed'
+			).to.equal(0);
+			expect(
+				sent.some((m) => m.type === MessageType.ACCEPT_CHANNEL2),
+				'and no accept_channel2 went out'
+			).to.equal(false);
 		});
 	});
 

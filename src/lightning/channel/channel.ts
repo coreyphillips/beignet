@@ -9822,17 +9822,37 @@ export class Channel {
 		localParams: IDualFundingParams
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
+			// Deliberately LOCAL-only: this guard can only fire on a channel
+			// that already has a life (a replayed or misrouted open), and a
+			// wire error scoped to that id would cancel whatever the peer
+			// still considers live. Every refusal of a FRESH open below is
+			// wire-visible instead.
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected open_channel2' }
 			];
 		}
+
+		// Every rejected inbound open_channel2 must reach the OPENER too
+		// (BOLT 2 negotiation cancellation): a local error alone deletes our
+		// half while the opener sits awaiting accept_channel2 forever. The
+		// error is scoped to the id the opener used.
+		const refuse = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'ascii')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
 
 		const acceptV2MaxHtlcErr = validateU64(
 			localParams.maxHtlcValueInFlightMsat,
 			'max_htlc_value_in_flight_msat'
 		);
 		if (acceptV2MaxHtlcErr) {
-			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
+			return refuse(acceptV2MaxHtlcErr);
 		}
 
 		// Admission validation of the PROPOSED type before any state
@@ -9844,12 +9864,7 @@ export class Channel {
 		// the presence, structural and taproot rules still hold here.
 		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
 		if (v2TypeErr) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `open_channel2 refused: ${v2TypeErr}`
-				}
-			];
+			return refuse(`open_channel2 refused: ${v2TypeErr}`);
 		}
 		// BOLT 2: an opener proposing scid_alias with the announce flag set
 		// is asking for a pairing the spec forbids; refuse rather than
@@ -9859,12 +9874,7 @@ export class Channel {
 			(msg.channelFlags & 0x01) !== 0
 		);
 		if (aliasAnnounceErr) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `open_channel2 refused: ${aliasAnnounceErr}`
-				}
-			];
+			return refuse(`open_channel2 refused: ${aliasAnnounceErr}`);
 		}
 
 		this._state.fundingVersion = 2;
@@ -9880,12 +9890,9 @@ export class Channel {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
 			if (proposedFlags.hasFeature(Feature.ZERO_CONF)) {
 				if (!this._state.trustedPeer) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Proposed zero_conf channel type requires a trusted peer'
-						}
-					];
+					return refuse(
+						'Proposed zero_conf channel type requires a trusted peer'
+					);
 				}
 				this._state.zeroConfEnabled = true;
 				this._state.minimumDepth = 0;
@@ -9913,12 +9920,7 @@ export class Channel {
 		);
 		const result = session.handleOpenChannel2(msg, localParams);
 		if (!result.ok || !result.message) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to handle open_channel2'
-				}
-			];
+			return refuse(result.error || 'Failed to handle open_channel2');
 		}
 
 		// max_htlc_value_in_flight_msat is advertised as configured, not
@@ -9992,12 +9994,9 @@ export class Channel {
 			localParams.willFund &&
 			msg.requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Script-enforced lease is not supported on taproot channels'
-				}
-			];
+			return refuse(
+				'Script-enforced lease is not supported on taproot channels'
+			);
 		}
 
 		// Likewise anchors-only: the plain P2WPKH to_remote of a non-anchor
@@ -10008,13 +10007,9 @@ export class Channel {
 			localParams.willFund &&
 			msg.requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
-				}
-			];
+			return refuse(
+				'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
+			);
 		}
 
 		// Liquidity ads (bLIP-0051): if we (the seller) committed will_fund, the
@@ -10034,12 +10029,9 @@ export class Channel {
 					(bh < this._currentBlockHeight - LEASE_BLOCKHEIGHT_PAST_TOLERANCE ||
 						bh > this._currentBlockHeight + LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE))
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Buyer lease blockheight ${bh} is out of the acceptable range`
-					}
-				];
+				return refuse(
+					`Buyer lease blockheight ${bh} is out of the acceptable range`
+				);
 			}
 			// Charge the proportional fee on what the lease actually funds:
 			// min(our funding_satoshis, requested_sats). If we (the seller) fund
