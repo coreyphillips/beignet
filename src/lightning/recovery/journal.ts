@@ -72,7 +72,7 @@ const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
  * first startup of a release that knows better.
  */
 const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
-const SNAPSHOT_SCHEMA_VERSION = '2';
+export const SNAPSHOT_SCHEMA_VERSION = '2';
 /**
  * The EXACT marker strings this release knows how to migrate from. An
  * absent or empty marker (a journal written before versioning existed)
@@ -107,11 +107,48 @@ const META_DURABILITY_FLOOR = 'journal_durability_floor';
  */
 const META_BACKFILL_LOST = 'journal_backfill_lost';
 /**
+ * How far replication has provably got (written by GuardianReplicator; owned
+ * here so the journal's own checks and the replicator share one constant).
+ */
+export const META_REPLICATED_THROUGH = 'guardian_replicated_through';
+/**
  * The frame hash the replication watermark was receipted AT (written by
  * GuardianReplicator beside guardian_replicated_through). Binds the
- * watermark to a specific history instead of a bare height.
+ * watermark to a specific history instead of a bare height: a positive
+ * watermark is only ever trusted when this hash exists and resolves against
+ * the retained frame store (see resolveWatermarkAnchor).
  */
 export const META_REPLICATED_THROUGH_HASH = 'guardian_replicated_through_hash';
+
+/**
+ * The frame hash a watermark at `sequence` must have been receipted at, from
+ * the retained store alone, or null when the store cannot prove one.
+ *
+ * Two rows can prove it: the stored frame at `sequence` itself, or, when
+ * compaction legitimately pruned that frame, the retained BASE snapshot at
+ * `sequence + 1` whose cleartext previousFrameHash names exactly the frame
+ * that was pruned. The successor row only counts when it IS the recorded
+ * base (META_LAST_SNAPSHOT): a gap that is not the recorded base is a
+ * damaged store, not a compacted one. previousFrameHash is trustworthy
+ * without decryption because it is bound into the frame's AEAD associated
+ * data and verified by every full chain verification.
+ */
+export function resolveWatermarkAnchor(
+	storage: IStorageBackend,
+	sequence: bigint
+): Buffer | null {
+	if (sequence < 1n) return null;
+	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
+	if (rows.length === 0) return null;
+	const first = rows[0];
+	const firstSequence = BigInt(first.sequence);
+	if (firstSequence === sequence) return first.frameHash;
+	if (firstSequence !== sequence + 1n) return null;
+	const base = storage.getRecoveryMeta?.(META_LAST_SNAPSHOT);
+	if (base == null || !/^[1-9]\d*$/.test(base)) return null;
+	if (BigInt(base) !== firstSequence) return null;
+	return first.previousFrameHash;
+}
 
 /**
  * Every recovery_meta key that only ever exists because FRAMES existed. A
@@ -368,7 +405,12 @@ export function journalSupported(storage: IStorageBackend): boolean {
 		// metadata key: a backend that cannot enumerate cannot reveal
 		// unknown residue of destroyed history, so it does not get a
 		// journal either.
-		typeof storage.listRecoveryMetaKeys === 'function'
+		typeof storage.listRecoveryMetaKeys === 'function' &&
+		// Compaction that destroys the replication watermark's anchor must
+		// be able to RESET the watermark keys atomically; a backend that
+		// cannot delete metadata would leave a positive mark behind that
+		// resolves against nothing, permanently refusing every later write.
+		typeof storage.deleteRecoveryMeta === 'function'
 	);
 }
 
@@ -1079,7 +1121,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				// exact legitimate value shape.
 				for (const key of [
 					...FRAME_DERIVED_META_KEYS,
-					'guardian_replicated_through'
+					META_REPLICATED_THROUGH,
+					META_REPLICATED_THROUGH_HASH
 				]) {
 					if (this.storage.getRecoveryMeta!(key) != null) {
 						throw new Error(
@@ -1116,9 +1159,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		// hold; it can never legitimately exceed the local tip, and letting
 		// a raised one stand would release the next frames without any
 		// receipt behind them.
-		const watermark = this.storage.getRecoveryMeta!(
-			'guardian_replicated_through'
-		);
+		const watermark = this.storage.getRecoveryMeta!(META_REPLICATED_THROUGH);
 		if (
 			watermark != null &&
 			(!/^\d+$/.test(watermark) || BigInt(watermark) > sequence)
@@ -1183,20 +1224,22 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			);
 		}
 		// The watermark is a receipt for THIS history, not for a height: a
-		// recorded receipted-frame hash must still name the stored frame at
-		// that sequence, or the receipts belong to a chain this store no
-		// longer holds.
+		// recorded receipted-frame hash must resolve against the retained
+		// store, either at the stored frame itself or, when compaction
+		// legitimately pruned it, at the retained base snapshot's
+		// previousFrameHash. A hash that resolves nowhere, or to a different
+		// frame, means the receipts belong to a chain this store no longer
+		// holds. A watermark WITHOUT a hash is not validated here: it is
+		// already untrusted (replicatedThrough reads it as 0), and refusing
+		// it would brick journals written before the binding existed.
 		if (watermark != null) {
 			const receipted = BigInt(watermark);
 			const receiptedHash = this.storage.getRecoveryMeta!(
 				META_REPLICATED_THROUGH_HASH
 			);
-			if (receiptedHash != null && receipted >= expectedMin) {
-				const receiptedRow = this.loadFrameRow(receipted);
-				if (
-					receiptedRow == null ||
-					receiptedRow.frameHash.toString('hex') !== receiptedHash
-				) {
+			if (receiptedHash != null && receipted >= 1n) {
+				const anchor = resolveWatermarkAnchor(this.storage, receipted);
+				if (anchor == null || anchor.toString('hex') !== receiptedHash) {
 					throw new Error(
 						`recovery: the stored frame at the replication watermark ` +
 							`${receipted} is not the receipted frame; refusing to write`
@@ -1489,6 +1532,35 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				this.storage.setRecoveryMeta!(META_BACKFILL_LOST, detail);
 			}
 			this.onCompactionForced?.(detail);
+		}
+		// A prune that reaches past watermark + 1 destroys the watermark's
+		// anchor: neither the receipted frame nor a base snapshot naming it
+		// survives, so the binding can never be evaluated again. Reset BOTH
+		// keys atomically (a bare positive height would otherwise linger,
+		// resolvable by nothing) and record the loss: the pruned frames were
+		// never receipted by the quorum, so no guardian behind that point can
+		// ever be backfilled. This branch is reachable only through forced
+		// compaction (which recorded the loss above) or a writer with no
+		// retention floor at all; the normal floor holds the prune at
+		// watermark + 1, where the base snapshot still anchors the mark.
+		const watermarkRaw = this.storage.getRecoveryMeta!(META_REPLICATED_THROUGH);
+		if (
+			watermarkRaw != null &&
+			/^\d+$/.test(watermarkRaw) &&
+			BigInt(watermarkRaw) > 0n &&
+			BigInt(watermarkRaw) < snapshotSequence - 1n
+		) {
+			if (this.storage.getRecoveryMeta!(META_BACKFILL_LOST) == null) {
+				this.storage.setRecoveryMeta!(
+					META_BACKFILL_LOST,
+					`compaction pruned to frame ${snapshotSequence} past the ` +
+						`replication watermark ${watermarkRaw}: frames the guardians ` +
+						`never received now exist nowhere, so no guardian behind ` +
+						`that point can ever be backfilled`
+				);
+			}
+			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH);
+			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH_HASH);
 		}
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
 		this.storage.setRecoveryMeta!(
@@ -1913,7 +1985,8 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 		...JOURNAL_META_RESIDUE_KEYS,
 		'writer_lease_v1',
 		'restore_pending_acquisition_v1',
-		'guardian_replicated_through',
+		META_REPLICATED_THROUGH,
+		META_REPLICATED_THROUGH_HASH,
 		'guardian_pending_registration_v1',
 		'startup_repair_tail'
 	];

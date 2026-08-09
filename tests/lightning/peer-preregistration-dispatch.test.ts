@@ -1161,6 +1161,145 @@ describe('Peer held post-handshake delivery', function () {
 		]);
 	});
 
+	it('teardown by the FINAL held frame reports aborted, not released', function () {
+		// The drain loop only observes state at the top of an iteration, so
+		// a disconnect from the last (or sole) handler used to fall out of
+		// the loop into the success return. The outcome is the CAUSAL
+		// record; 'released' for a torn-down connection is a false answer.
+		const peer = bareHeldPeer();
+		const seen: number[] = [];
+		peer.on('message', (type: number) => {
+			seen.push(type);
+			(peer as unknown as { state: string }).state = 'closing';
+		});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		expect(peer.releaseHeldMessages()).to.equal('aborted');
+		expect(seen).to.deep.equal([MessageType.OPEN_CHANNEL2]);
+		// Sticky for the lifecycle, like every other terminal outcome.
+		expect(peer.releaseHeldMessages()).to.equal('aborted');
+	});
+
+	it('a handler that disconnects and THEN throws still records failed', function () {
+		// disconnect() nulls the queue without starting a new lifecycle, so
+		// a guard keyed on array identity would skip the sticky write here.
+		// The lifecycle ID does not move until a re-establishment re-arms:
+		// this is still the failing lifecycle and must answer 'failed'.
+		const peer = bareHeldPeer();
+		peer.on('message', () => {
+			peer.disconnect();
+			throw new Error('handler failed after its own teardown');
+		});
+		peer.on('error', () => {});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		expect(peer.releaseHeldMessages()).to.equal('failed');
+		expect(peer.releaseHeldMessages(), 'sticky across queries').to.equal(
+			'failed'
+		);
+	});
+
+	it('a throwing handler that re-armed a fresh lifecycle cannot destroy it', function () {
+		// The old drain's failure path used to clear this.heldMessages and
+		// disconnect unconditionally: a handler that tore down, re-armed a
+		// new establishment and THEN threw had the fresh queue erased and
+		// its reset outcome clobbered by the stale drain. With the
+		// lifecycle ID, the old drain reports its failure and touches
+		// nothing that now belongs to the new lifecycle.
+		const peer = bareHeldPeer();
+		const rearm = (): void =>
+			(peer as unknown as { rearmHeldMessages(): void }).rearmHeldMessages();
+		const seen: number[] = [];
+		let threw = false;
+		peer.on('message', (type: number) => {
+			seen.push(type);
+			if (!threw) {
+				threw = true;
+				peer.disconnect();
+				rearm();
+				throw new Error('old lifecycle handler failed');
+			}
+		});
+		peer.on('error', () => {});
+		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
+		expect(
+			peer.releaseHeldMessages(),
+			'the old drain still reports its failure'
+		).to.equal('failed');
+
+		// The FRESH lifecycle is intact: its queue still holds (traffic is
+		// not delivered live), and its outcome was not poisoned to 'failed'.
+		(peer as unknown as { state: string }).state = 'ready';
+		feed(peer, MessageType.TX_COMPLETE, Buffer.from([3]));
+		expect(seen, 'the new lifecycle still holds').to.deep.equal([
+			MessageType.OPEN_CHANNEL2
+		]);
+		expect(peer.releaseHeldMessages()).to.equal('released');
+		expect(seen).to.deep.equal([
+			MessageType.OPEN_CHANNEL2,
+			MessageType.TX_COMPLETE
+		]);
+	});
+
+	it('disconnectPeer during a first inbound handshake wins over registration', async function () {
+		// Inbound peers are anonymous until Noise completes, so an explicit
+		// disconnectPeer(pubkey) issued mid-handshake has nothing
+		// pubkey-addressable to abort; the cancellation era must be
+		// re-checked the moment identity is learned, or the peer registers
+		// 'ready' right through the cancellation.
+		const a = new LightningNode(makeNodeConfig(72));
+		a.on('node:error', () => {});
+		const dialerKey = crypto
+			.createHash('sha256')
+			.update(makeSeed(73))
+			.update(Buffer.from('node-identity'))
+			.digest();
+		const dialerPubkey = getPublicKey(dialerKey).toString('hex');
+		const originalAccept = Peer.prototype.acceptInbound;
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await a.listen(0, '127.0.0.1');
+			const port = (
+				a as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// Cancel WHILE the Noise handshake is in flight: the wrap runs
+			// after the manager snapshotted its era for this socket and
+			// before the handshake learns who is dialing.
+			Peer.prototype.acceptInbound = async function (
+				this: Peer,
+				...args: Parameters<typeof originalAccept>
+			): Promise<void> {
+				a.disconnectPeer(dialerPubkey);
+				return originalAccept.apply(this, args);
+			};
+			const raw = new Peer({
+				localPrivateKey: dialerKey,
+				remotePublicKey: Buffer.from(a.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port
+			});
+			raw.on('error', () => {});
+			await raw.connect().catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(
+				pmA.peers.size,
+				'the cancelled handshake never registered'
+			).to.equal(0);
+			expect(pmA.reconnectTimers.size).to.equal(0);
+			raw.disconnect();
+		} finally {
+			Peer.prototype.acceptInbound = originalAccept;
+			a.destroy();
+		}
+	});
+
 	it('over a real connection, release happens exactly once per side, AFTER peer:connect', async function () {
 		// Instrument the release so the real bring-up order is observable.
 		const events: string[] = [];

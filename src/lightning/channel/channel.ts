@@ -131,7 +131,11 @@ import {
 	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
-import { isAnchorChannel, isTaprootChannel } from './types';
+import {
+	isAnchorChannel,
+	isTaprootChannel,
+	validateV2ChannelType
+} from './types';
 import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -9700,6 +9704,22 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
 		}
 
+		// Admission validation of the type this open would propose, BEFORE
+		// any state mutation: taproot v2 signing does not exist, so a
+		// taproot (or otherwise unrecognized) type must never leave this
+		// method as an OPEN_CHANNEL2. The manager additionally validates
+		// against both init vectors; a raw Channel has none, so the
+		// structural rules and the taproot refusal still hold here.
+		const v2TypeErr = validateV2ChannelType(params.channelType ?? null);
+		if (v2TypeErr) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot initiate v2 open: ${v2TypeErr}`
+				}
+			];
+		}
+
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = params.commitmentFeeratePerkw;
 		this._state.fundingLocktime = params.locktime;
@@ -9798,6 +9818,22 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
 		}
 
+		// Admission validation of the PROPOSED type before any state
+		// mutation, echo or key adoption: a taproot or unrecognized type
+		// would otherwise be echoed in ACCEPT_CHANNEL2 and die at the
+		// commitment stage. The manager validates against both init
+		// vectors; a raw Channel has none, so the structural rules and the
+		// taproot refusal still hold here.
+		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
+		if (v2TypeErr) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `open_channel2 refused: ${v2TypeErr}`
+				}
+			];
+		}
+
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = msg.commitmentFeeratePerkw;
 		this._state.fundingLocktime = msg.locktime;
@@ -9874,8 +9910,8 @@ export class Channel {
 			this._state.remoteBasepoints!.revocationBasepoint,
 			this._state.localBasepoints.revocationBasepoint
 		);
-		// Record the negotiated channel type (session validated any mismatch) so
-		// commitment #0 is built with the same anchor/taproot dispatch on both
+		// Record the negotiated channel type (validated at admission above)
+		// so commitment #0 is built with the same anchor dispatch on both
 		// sides. Default per BOLT 2: static_remotekey.
 		if (msg.channelType) {
 			this._state.channelType = Buffer.from(msg.channelType);

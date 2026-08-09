@@ -46,7 +46,8 @@ import {
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	validateV2ChannelType
 } from '../../src/lightning/channel/types';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
@@ -1208,11 +1209,12 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 		});
 
 		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {
-			// Script-enforced lease and simple taproot are distinct commitment types
-			// with no interoperable "leased taproot" script. Even if the manager-level
-			// guard were bypassed and a will_fund reached the state machine on a taproot
-			// open, handleOpenChannel2 must refuse rather than enter an unenforceable
-			// lessor state.
+			// Round 17 moved the taproot-v2 refusal to ADMISSION: the raw
+			// Channel refuses the proposed type before the lease branch (or
+			// any state mutation) sees it, so a will_fund on a taproot open
+			// dies at the door with the channel-type error rather than deep
+			// in the lease logic. The lessor assertions still pin what
+			// matters: nothing was recorded.
 			const state = createAcceptorState({
 				temporaryChannelId: crypto.randomBytes(32),
 				fundingSatoshis: 0n,
@@ -1253,7 +1255,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
 			if (actions[0].type === ChannelActionType.ERROR) {
 				expect(actions[0].message).to.match(
-					/lease is not supported on taproot/i
+					/option_taproot is not supported for dual-funded/i
 				);
 			}
 			// No lessor state was recorded.
@@ -1285,6 +1287,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 100_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1316,6 +1319,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1348,6 +1352,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: {
 						signature: Buffer.alloc(64, 0x01),
@@ -1382,6 +1387,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1890,6 +1896,247 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				sequence: 0xfffffffd
 			});
 			expect(opener.getTxBuilder()!.getInputs().length).to.equal(1);
+		});
+	});
+});
+
+describe('Round 17: v2 channel_type admission', () => {
+	function taprootType(): Buffer {
+		const flags = FeatureFlags.empty();
+		flags.setCompulsory(Feature.OPTION_TAPROOT);
+		return flags.toBuffer();
+	}
+
+	function typeOf(...features: Feature[]): Buffer {
+		const flags = FeatureFlags.empty();
+		for (const feature of features) flags.setCompulsory(feature);
+		return flags.toBuffer();
+	}
+
+	function vector(...features: Feature[]): FeatureFlags {
+		const flags = FeatureFlags.empty();
+		for (const feature of features) flags.setOptional(feature);
+		return flags;
+	}
+
+	function makeAcceptorChannel(): Channel {
+		const state = createAcceptorState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 0n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: makeBasepoints(),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			remoteBasepoints: makeBasepoints(),
+			remoteConfig: DEFAULT_CHANNEL_CONFIG
+		});
+		return new Channel(state);
+	}
+
+	describe('validateV2ChannelType', () => {
+		it('accepts the recognized combinations and an absent type', () => {
+			expect(validateV2ChannelType(null)).to.equal(null);
+			expect(validateV2ChannelType(Buffer.alloc(0))).to.equal(null);
+			expect(validateV2ChannelType(typeOf(Feature.STATIC_REMOTE_KEY))).to.equal(
+				null
+			);
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.ANCHOR_ZERO_FEE_HTLC)
+				)
+			).to.equal(null);
+			// The trusted zero-conf shape: scid_alias + zero_conf ride along.
+			expect(
+				validateV2ChannelType(
+					typeOf(
+						Feature.STATIC_REMOTE_KEY,
+						Feature.ANCHOR_ZERO_FEE_HTLC,
+						Feature.SCID_ALIAS,
+						Feature.ZERO_CONF
+					)
+				)
+			).to.equal(null);
+		});
+
+		it('refuses taproot, unknown bits, and structural violations', () => {
+			expect(validateV2ChannelType(taprootType())).to.match(
+				/option_taproot is not supported/
+			);
+			// An unknown feature bit inside the type.
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.LARGE_CHANNELS)
+				)
+			).to.match(/not a recognized/);
+			// An ODD bit is never a channel type.
+			const odd = FeatureFlags.empty();
+			odd.setOptional(Feature.STATIC_REMOTE_KEY);
+			expect(validateV2ChannelType(odd.toBuffer())).to.match(
+				/not a recognized/
+			);
+			expect(
+				validateV2ChannelType(typeOf(Feature.ANCHOR_ZERO_FEE_HTLC))
+			).to.match(/must include static_remotekey/);
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.ZERO_CONF)
+				)
+			).to.match(/zero_conf requires option_scid_alias/);
+		});
+
+		it('holds commitment-format bits to BOTH feature vectors when supplied', () => {
+			const anchorsType = typeOf(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.ANCHOR_ZERO_FEE_HTLC
+			);
+			const full = vector(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.ANCHOR_ZERO_FEE_HTLC
+			);
+			const noAnchors = vector(Feature.STATIC_REMOTE_KEY);
+			expect(validateV2ChannelType(anchorsType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(anchorsType, noAnchors, full)).to.match(
+				/this node does not advertise/
+			);
+			expect(validateV2ChannelType(anchorsType, full, noAnchors)).to.match(
+				/the peer does not advertise/
+			);
+			// A vector the caller does not have skips only its own half.
+			expect(validateV2ChannelType(anchorsType, undefined, full)).to.equal(
+				null
+			);
+		});
+	});
+
+	describe('raw Channel admission', () => {
+		it('refuses an inbound taproot channel_type before any state exists', () => {
+			// No lease involved: the type alone is refused at the door, so
+			// nothing is derived, adopted or echoed for a negotiation that
+			// would die at the commitment stage (taproot v2 signing does
+			// not exist).
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: taprootType()
+				}),
+				makeDualFundingParams()
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(
+					/option_taproot is not supported for dual-funded/
+				);
+			}
+			const state = channel.getFullState();
+			expect(state.state, 'no state transition').to.equal(ChannelState.NONE);
+			expect(state.dualFundingSession == null, 'no session').to.equal(true);
+			expect(state.channelType, 'no adopted type').to.equal(null);
+		});
+
+		it('refuses an inbound channel_type carrying unknown bits', () => {
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.LARGE_CHANNELS)
+				}),
+				makeDualFundingParams()
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('refuses to INITIATE a v2 open with a taproot channel_type', () => {
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const actions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed,
+					channelType: taprootType()
+				})
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(
+					/option_taproot is not supported for dual-funded/
+				);
+			}
+			expect(
+				channel.getFullState().fundingVersion,
+				'no state mutated before the refusal'
+			).to.not.equal(2);
+		});
+	});
+
+	describe('accept_channel2 echo (BOLT 2)', () => {
+		const OFFERED = Buffer.from('401000', 'hex');
+
+		function openerSession(withType: boolean): DualFundingSession {
+			const channelId = crypto.randomBytes(32);
+			const session = new DualFundingSession(true, channelId);
+			const params = makeDualFundingParams(
+				withType ? { channelType: OFFERED } : {}
+			);
+			const result = session.initiateOpen(params);
+			expect(result.ok).to.equal(true);
+			return session;
+		}
+
+		it('a MISSING echo is refused before tx negotiation', () => {
+			const session = openerSession(true);
+			const result = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({ channelId: session.getChannelId() })
+			);
+			expect(result.ok).to.equal(false);
+			expect(result.error).to.match(/omitted the channel_type/);
+			expect(session.getState(), 'no tx negotiation started').to.equal(
+				DualFundingState.AWAITING_ACCEPT
+			);
+		});
+
+		it('a MISMATCHED echo is refused, an exact echo accepted', () => {
+			const session = openerSession(true);
+			const mismatched = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from('1000', 'hex')
+				})
+			);
+			expect(mismatched.ok).to.equal(false);
+			expect(mismatched.error).to.match(/Channel type mismatch/);
+
+			const exact = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from(OFFERED)
+				})
+			);
+			expect(exact.ok).to.equal(true);
+			expect(session.getState()).to.equal(DualFundingState.TX_NEGOTIATION);
+		});
+
+		it('a volunteered type the open never proposed is refused', () => {
+			const session = openerSession(false);
+			const result = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from('1000', 'hex')
+				})
+			);
+			expect(result.ok).to.equal(false);
+			expect(result.error).to.match(/did not propose/);
 		});
 	});
 });

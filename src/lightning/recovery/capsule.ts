@@ -39,6 +39,7 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
+	SNAPSHOT_SCHEMA_VERSION,
 	assertEmptyTarget,
 	assertFramesReconstructable,
 	assertNoJournalResidue,
@@ -48,7 +49,16 @@ import {
 	verifyFrameChain
 } from './journal';
 import { withStorageTransaction } from '../storage/transaction';
-import { RecoveryFrame, VerifiedRecoveryChain } from './types';
+import {
+	RecoveryFrame,
+	RecoveryMutation,
+	RecoverySnapshot,
+	VerifiedRecoveryChain
+} from './types';
+import { createOpenerState, IChannelState } from '../channel/channel-state';
+import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import { MonitorState } from '../chain/types';
+import { PaymentDirection, PaymentStatus } from '../node/types';
 
 /**
  * A capsule whose CONTENT could not replay (the chain verified, but a
@@ -90,13 +100,113 @@ export interface ICapsuleRestoreOptions {
 }
 
 /**
- * A synthetic, KNOWN-GOOD frame set exercising the same operations a real
- * replay performs: a current-schema snapshot writing the main safety
- * tables, plus one delta replayed through RecoveryManager.commit. If the
- * validator backend cannot replay THIS, the validator is broken, not the
- * capsule.
+ * Every mutation discriminant the probe's delta frames carry, and every
+ * snapshot table its base frame populates. These are Records over the REAL
+ * union types, so adding a mutation variant or a snapshot field breaks this
+ * file's compilation until the probe is extended to exercise it: the probe
+ * classifies validator health, and an operation it silently skips is an
+ * operation whose backend failure gets laundered into a capsule defect.
+ * A test additionally asserts the probe frames really carry each entry.
  */
-function knownGoodProbeFrames(): VerifiedRecoveryChain {
+export const PROBE_MUTATION_COVERAGE: Record<RecoveryMutation['type'], true> = {
+	channel_state: true,
+	channel_key_index: true,
+	chain_monitor: true,
+	payment_preimage: true,
+	htlc_payment_mapping: true,
+	delete_htlc_payment_mapping: true,
+	htlc_shared_secret: true,
+	delete_htlc_shared_secret: true,
+	forwarded_htlc: true,
+	delete_forwarded_htlc: true,
+	payment_state: true,
+	payment_secret: true,
+	delete_payment_secret: true,
+	delete_payment: true,
+	delete_preimage: true,
+	invoice_state: true,
+	delete_invoice: true,
+	invoice_path_id: true,
+	delete_invoice_path_id: true,
+	forwarding_event: true,
+	channel_closed: true,
+	outbox_supersede: true
+};
+export const PROBE_SNAPSHOT_COVERAGE: Record<
+	Exclude<keyof RecoverySnapshot, 'schemaVersion'>,
+	true
+> = {
+	channels: true,
+	keyIndices: true,
+	chainMonitors: true,
+	preimages: true,
+	payments: true,
+	paymentSecrets: true,
+	htlcPaymentMappings: true,
+	forwardedHtlcs: true,
+	htlcSharedSecrets: true,
+	invoices: true,
+	invoicePathIds: true,
+	forwardingEvents: true,
+	outbox: true
+};
+
+const PROBE_CHANNEL_ID = 'dd'.repeat(32);
+const PROBE_HASH = 'bb'.repeat(32);
+
+/**
+ * A serializable channel state built by the production constructor, so the
+ * probe's channel row can never rot against the serializer's field set the
+ * way a handcrafted literal would.
+ */
+function probeChannelState(): IChannelState {
+	const point = getPublicKey(Buffer.alloc(32, 7));
+	const state = createOpenerState({
+		temporaryChannelId: Buffer.alloc(32, 8),
+		fundingSatoshis: 1_000n,
+		pushMsat: 0n,
+		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+		localBasepoints: {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		},
+		localPerCommitmentSeed: Buffer.alloc(32, 9)
+	});
+	state.channelId = Buffer.from(PROBE_CHANNEL_ID, 'hex');
+	return state;
+}
+
+function probeOutboxMessage(): {
+	peerId: string;
+	channelId: string;
+	messageType: number;
+	wireMessage: Buffer;
+	disposition: 'pending_send';
+} {
+	return {
+		peerId: getPublicKey(Buffer.alloc(32, 7)).toString('hex'),
+		channelId: PROBE_CHANNEL_ID,
+		messageType: 136,
+		wireMessage: Buffer.from([0]),
+		disposition: 'pending_send'
+	};
+}
+
+/**
+ * A synthetic, KNOWN-GOOD frame set exercising EVERY operation a real
+ * replay can invoke: a current-schema snapshot populating all thirteen
+ * tables, one delta carrying every save-side mutation variant plus an
+ * outbox insert, and one delta carrying every delete-side variant against
+ * rows the earlier frames wrote. If the validator backend cannot replay
+ * THIS, the validator is broken, not the capsule; an operation missing
+ * here would let that backend's failure on it masquerade as a capsule
+ * content defect (see PROBE_MUTATION_COVERAGE / PROBE_SNAPSHOT_COVERAGE).
+ */
+export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 	const snapshot: RecoveryFrame = {
 		version: 1,
 		writerEpoch: 1n,
@@ -106,18 +216,43 @@ function knownGoodProbeFrames(): VerifiedRecoveryChain {
 		mutations: [],
 		outboundMessages: [],
 		snapshot: {
-			schemaVersion: '2',
-			channels: [],
+			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+			channels: [
+				{
+					channelId: PROBE_CHANNEL_ID,
+					state: probeChannelState(),
+					peerPubkey: getPublicKey(Buffer.alloc(32, 7)).toString('hex')
+				}
+			],
 			keyIndices: [{ channelId: 'aa'.repeat(32), channelIndex: 1 }],
-			chainMonitors: [],
-			preimages: [
-				{ paymentHash: 'bb'.repeat(32), preimage: Buffer.alloc(32, 1) }
+			chainMonitors: [
+				{
+					channelId: PROBE_CHANNEL_ID,
+					state: {
+						monitorState: MonitorState.WATCHING,
+						commitmentBroadcast: null,
+						trackedOutputs: [],
+						currentBlockHeight: 0
+					}
+				}
 			],
-			payments: [],
+			preimages: [{ paymentHash: PROBE_HASH, preimage: Buffer.alloc(32, 1) }],
+			payments: [
+				{
+					paymentHash: PROBE_HASH,
+					payment: {
+						paymentHash: Buffer.from(PROBE_HASH, 'hex'),
+						amountMsat: 1n,
+						status: PaymentStatus.COMPLETED,
+						direction: PaymentDirection.OUTGOING,
+						createdAt: 0
+					}
+				}
+			],
 			paymentSecrets: [
-				{ paymentHash: 'bb'.repeat(32), secret: Buffer.alloc(32, 3) }
+				{ paymentHash: PROBE_HASH, secret: Buffer.alloc(32, 3) }
 			],
-			htlcPaymentMappings: [{ key: 'probe:0', paymentHash: 'bb'.repeat(32) }],
+			htlcPaymentMappings: [{ key: 'probe:0', paymentHash: PROBE_HASH }],
 			forwardedHtlcs: [
 				{
 					outKey: 'probe:offered-0',
@@ -126,15 +261,36 @@ function knownGoodProbeFrames(): VerifiedRecoveryChain {
 				}
 			],
 			htlcSharedSecrets: [{ key: 'probe:0', secret: Buffer.alloc(32, 5) }],
-			invoices: [],
-			invoicePathIds: [
-				{ paymentHash: 'bb'.repeat(32), pathId: Buffer.alloc(32, 6) }
+			invoices: [
+				{
+					paymentHash: PROBE_HASH,
+					invoice: {
+						paymentHash: PROBE_HASH,
+						bolt11: 'lnbcrt1probe',
+						expiry: 3600,
+						createdAt: 0
+					}
+				}
 			],
-			forwardingEvents: [],
-			outbox: []
+			invoicePathIds: [
+				{ paymentHash: PROBE_HASH, pathId: Buffer.alloc(32, 6) }
+			],
+			forwardingEvents: [
+				{
+					settledAt: 1,
+					inChannelId: PROBE_CHANNEL_ID,
+					outChannelId: PROBE_CHANNEL_ID,
+					amountInMsat: 2n,
+					amountOutMsat: 1n,
+					feeMsat: 1n
+				}
+			],
+			outbox: [{ ...probeOutboxMessage(), frameSequence: 1 }]
 		}
 	};
-	const delta: RecoveryFrame = {
+	// Every save-side variant, plus the outbox insert path (which also
+	// drives the reconstruct loop's frame stamping on the released row).
+	const saves: RecoveryFrame = {
 		version: 1,
 		writerEpoch: 1n,
 		sequence: 2n,
@@ -142,61 +298,180 @@ function knownGoodProbeFrames(): VerifiedRecoveryChain {
 		timestamp: 0,
 		mutations: [
 			{
+				type: 'channel_state',
+				channelId: PROBE_CHANNEL_ID,
+				state: probeChannelState(),
+				peerPubkey: getPublicKey(Buffer.alloc(32, 7)).toString('hex')
+			},
+			{
+				type: 'channel_key_index',
+				channelId: 'aa'.repeat(32),
+				channelIndex: 2
+			},
+			{
+				type: 'chain_monitor',
+				channelId: PROBE_CHANNEL_ID,
+				state: {
+					monitorState: MonitorState.WATCHING,
+					commitmentBroadcast: null,
+					trackedOutputs: [],
+					currentBlockHeight: 1
+				}
+			},
+			{
 				type: 'payment_preimage',
 				paymentHash: 'cc'.repeat(32),
 				preimage: Buffer.alloc(32, 2)
+			},
+			{
+				type: 'htlc_payment_mapping',
+				htlcKey: 'probe:1',
+				paymentHash: PROBE_HASH
+			},
+			{
+				type: 'htlc_shared_secret',
+				key: 'probe:1',
+				secret: Buffer.alloc(32, 10)
+			},
+			{
+				type: 'forwarded_htlc',
+				outKey: 'probe:offered-1',
+				inChannelId: Buffer.alloc(32, 4),
+				inHtlcId: 1n
+			},
+			{
+				type: 'payment_state',
+				paymentHash: PROBE_HASH,
+				payment: {
+					paymentHash: Buffer.from(PROBE_HASH, 'hex'),
+					amountMsat: 1n,
+					status: PaymentStatus.COMPLETED,
+					direction: PaymentDirection.OUTGOING,
+					createdAt: 0
+				}
+			},
+			{
+				type: 'payment_secret',
+				paymentHash: PROBE_HASH,
+				secret: Buffer.alloc(32, 3)
+			},
+			{
+				type: 'invoice_state',
+				paymentHash: PROBE_HASH,
+				invoice: {
+					paymentHash: PROBE_HASH,
+					bolt11: 'lnbcrt1probe',
+					expiry: 3600,
+					createdAt: 0
+				}
+			},
+			{
+				type: 'invoice_path_id',
+				paymentHash: PROBE_HASH,
+				pathId: Buffer.alloc(32, 6)
+			},
+			{
+				type: 'forwarding_event',
+				event: {
+					settledAt: 2,
+					inChannelId: PROBE_CHANNEL_ID,
+					outChannelId: PROBE_CHANNEL_ID,
+					amountInMsat: 2n,
+					amountOutMsat: 1n,
+					feeMsat: 1n
+				}
 			}
+		],
+		outboundMessages: [probeOutboxMessage()]
+	};
+	// Every delete-side variant, each against a row frames 1 or 2 wrote, so
+	// the deletes genuinely execute instead of no-oping on absent rows.
+	const deletes: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 3n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [
+			{ type: 'delete_htlc_payment_mapping', htlcKey: 'probe:1' },
+			{ type: 'delete_htlc_shared_secret', key: 'probe:1' },
+			{ type: 'delete_forwarded_htlc', outKey: 'probe:offered-1' },
+			{ type: 'delete_payment_secret', paymentHash: PROBE_HASH },
+			{ type: 'delete_payment', paymentHash: PROBE_HASH },
+			{ type: 'delete_preimage', paymentHash: 'cc'.repeat(32) },
+			{ type: 'delete_invoice', paymentHash: PROBE_HASH },
+			{ type: 'delete_invoice_path_id', paymentHash: PROBE_HASH },
+			{ type: 'outbox_supersede', channelId: PROBE_CHANNEL_ID },
+			{ type: 'channel_closed', channelId: PROBE_CHANNEL_ID }
 		],
 		outboundMessages: []
 	};
-	return [snapshot, delta] as VerifiedRecoveryChain;
+	return [snapshot, saves, deletes] as VerifiedRecoveryChain;
 }
+
+/** Forces a deliberate rollback of a probe that SUCCEEDED (never surfaced). */
+class ProbeRollback extends Error {}
 
 /**
  * Dry-run the candidate's replay on a scratch backend (see options).
  *
- * The validator is PROBED first by replaying a synthetic KNOWN-GOOD frame
- * set on its own fresh scratch instance, exercising the reads, table
- * writes and transaction completion a real replay needs: a generic
- * backend exception cannot prove whether the capsule content or the
- * validator's own storage failed, so a validator that cannot replay
- * known-good content propagates its failure RAW (infrastructure broken)
- * instead of laundering it into a candidate defect. Only a CANDIDATE
- * replay failing on a validator that just proved itself against the same
- * operations is typed as CapsuleReplayError.
+ * A candidate failure alone proves nothing: a generic backend exception
+ * cannot say whether the capsule content or the validator's own storage
+ * failed, and a TRANSIENT storage hiccup must not be laundered into a
+ * permanent content verdict. So a first-attempt failure is retried on an
+ * INDEPENDENTLY FRESH instance, which is first PROVED against a synthetic
+ * known-good frame set exercising every operation a real replay can invoke
+ * (the probe is deliberately rolled back so the instance stays empty), and
+ * then handed the candidate again. Content is only what fails on the very
+ * instance that just proved itself: probe failure means the validator is
+ * broken (the RAW candidate error propagates), and a candidate that
+ * REPLAYS CLEANLY on the proven instance was a transient first failure
+ * (the dry-run's question is answered: the content is fine, proceed).
  */
 function assertReplaysOnScratch(
 	frames: VerifiedRecoveryChain,
 	scratchStorage: () => IStorageBackend
 ): void {
 	const scratch = scratchStorage();
+	let candidateErr: unknown;
 	try {
-		try {
-			// The candidate replay runs TRANSACTIONALLY, so a failure rolls
-			// the scratch back to empty and the health probe below runs on
-			// the very same instance whose failure is being classified.
-			withStorageTransaction(scratch, () => {
-				reconstructFromFrames(scratch, frames);
-			});
-			return;
-		} catch (candidateErr) {
-			// Prove THIS instance against known-good content exercising the
-			// same reads, table writes and transaction completion. If the
-			// backend cannot replay that either, the validator is broken:
-			// the RAW candidate error propagates (never a capsule defect).
-			try {
-				withStorageTransaction(scratch, () => {
-					reconstructFromFrames(scratch, knownGoodProbeFrames());
-				});
-			} catch {
-				throw candidateErr;
-			}
-			// The backend just proved healthy on the identical operation
-			// set: the candidate's failure is its CONTENT.
-			throw new CapsuleReplayError(candidateErr);
-		}
+		withStorageTransaction(scratch, () => {
+			reconstructFromFrames(scratch, frames);
+		});
+		return;
+	} catch (err) {
+		candidateErr = err;
 	} finally {
 		(scratch as { close?: () => void }).close?.();
+	}
+	const fresh = scratchStorage();
+	try {
+		try {
+			withStorageTransaction(fresh, () => {
+				reconstructFromFrames(fresh, knownGoodProbeFrames());
+				// Roll the successful probe back so the candidate replay
+				// below runs on the SAME, still-empty, just-proven instance.
+				throw new ProbeRollback();
+			});
+		} catch (probeErr) {
+			if (!(probeErr instanceof ProbeRollback)) {
+				throw candidateErr;
+			}
+		}
+		try {
+			withStorageTransaction(fresh, () => {
+				reconstructFromFrames(fresh, frames);
+			});
+		} catch (repeatedErr) {
+			// Reproduced on an instance that just proved healthy on the
+			// full operation set: the failure is the candidate's CONTENT.
+			throw new CapsuleReplayError(repeatedErr);
+		}
+		// The first failure did not reproduce: transient validator
+		// infrastructure, and the content is proven replayable.
+		return;
+	} finally {
+		(fresh as { close?: () => void }).close?.();
 	}
 }
 

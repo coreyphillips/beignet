@@ -40,7 +40,11 @@ import {
 	reconstructFromFrames,
 	encodeFrame,
 	decodeFrame,
-	hashFrame
+	hashFrame,
+	resolveWatermarkAnchor,
+	JOURNAL_META_KEYS,
+	META_REPLICATED_THROUGH,
+	META_REPLICATED_THROUGH_HASH
 } from '../../src/lightning/recovery';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { withStorageTransaction } from '../../src/lightning/storage/transaction';
@@ -2093,6 +2097,182 @@ describe('Recovery phase 2: round-16 complete invariants', () => {
 		const result = commitPreimage(makeJournaledManager(storage).manager, 89);
 		expect(result.committed, 'a non-JSON lease refused').to.equal(false);
 		expect(String(result.error?.message)).to.match(/illegitimate value/);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: round-17 watermark anchoring', () => {
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	/**
+	 * A journal whose compaction floor tracks a test-controlled watermark,
+	 * with a short snapshot cadence so pruning is reachable in a few commits.
+	 */
+	function compactableJournal(watermark: () => bigint): {
+		storage: SqliteStorage;
+		journal: RecoveryJournal;
+		manager: RecoveryManager;
+	} {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				snapshotIntervalFrames: 2,
+				retainFrom: (): bigint => watermark() + 1n
+			}
+		);
+		return {
+			storage,
+			journal,
+			manager: new RecoveryManager(storage, { journal })
+		};
+	}
+
+	/** Commit frames, then bind and prune at watermark = base - 1. */
+	function compactedFixture(hash?: string): {
+		storage: SqliteStorage;
+		manager: RecoveryManager;
+		base: bigint;
+		receiptedHash: string;
+	} {
+		let watermark = 0n;
+		const fixture = compactableJournal(() => watermark);
+		for (let i = 0; i < 6; i++) {
+			expect(commitPreimage(fixture.manager, 100 + i).committed).to.equal(true);
+		}
+		const base = BigInt(
+			fixture.storage.getRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshotWritten)!
+		);
+		expect(base > 2n, 'a snapshot above frame 2 exists').to.equal(true);
+		watermark = base - 1n;
+		const receipted = fixture.storage.loadRecoveryFrames!(
+			Number(watermark) - 1
+		)[0];
+		expect(BigInt(receipted.sequence)).to.equal(watermark);
+		const receiptedHash = receipted.frameHash.toString('hex');
+		fixture.storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH,
+			watermark.toString()
+		);
+		fixture.storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH_HASH,
+			hash ?? receiptedHash
+		);
+		fixture.journal.compact();
+		const retained = fixture.storage.loadRecoveryFrames!();
+		expect(
+			BigInt(retained[0].sequence),
+			'the receipted frame was pruned beneath the base snapshot'
+		).to.equal(base);
+		return {
+			storage: fixture.storage,
+			manager: fixture.manager,
+			base,
+			receiptedHash
+		};
+	}
+
+	it('a compacted watermark stays bound through the retained base snapshot', () => {
+		const { storage, manager, base, receiptedHash } = compactedFixture();
+		// The anchor resolves through the base snapshot's previousFrameHash,
+		// which names exactly the pruned frame.
+		const anchor = resolveWatermarkAnchor(storage, base - 1n);
+		expect(anchor?.toString('hex')).to.equal(receiptedHash);
+		expect(
+			commitPreimage(manager, 110).committed,
+			'a correctly bound compacted watermark passes the write gate'
+		).to.equal(true);
+		storage.close();
+	});
+
+	it('a compacted watermark bound to a foreign history is refused', () => {
+		// A receipt for a DIFFERENT chain at the same height: once the frame
+		// is compacted, only the base snapshot can expose the divergence.
+		const { storage, manager } = compactedFixture('cd'.repeat(32));
+		const result = commitPreimage(manager, 111);
+		expect(result.committed, 'the divergent history refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('a watermark below the retained base minus one resolves nowhere and is refused', () => {
+		const { storage, manager } = compactedFixture();
+		// Neither the frame at 1 nor a base snapshot at 2 survives, so no
+		// anchor exists and the binding must fail closed.
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH, '1');
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH_HASH, 'ab'.repeat(32));
+		const result = commitPreimage(manager, 112);
+		expect(result.committed, 'the unanchorable watermark refused').to.equal(
+			false
+		);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('a forced prune past the watermark RESETS the mark and records the loss', () => {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				snapshotIntervalFrames: 2,
+				maxRetainedFrameGap: 3,
+				retainFrom: (): bigint => 2n
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		expect(commitPreimage(manager, 120).committed).to.equal(true);
+		const frame1 = storage.loadRecoveryFrames!()[0];
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH, '1');
+		storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH_HASH,
+			frame1.frameHash.toString('hex')
+		);
+		for (let i = 1; i < 10; i++) {
+			expect(commitPreimage(manager, 120 + i).committed).to.equal(true);
+		}
+		// The prune destroyed the anchor: the mark was reset WITH its hash
+		// (a bare positive height resolvable by nothing must not linger),
+		// and the loss is recorded durably.
+		expect(
+			storage.loadRecoveryFrames!()[0].sequence,
+			'frames below the forced snapshot are gone'
+		).to.be.greaterThan(2);
+		expect(storage.getRecoveryMeta!(META_REPLICATED_THROUGH)).to.equal(null);
+		expect(storage.getRecoveryMeta!(META_REPLICATED_THROUGH_HASH)).to.equal(
+			null
+		);
+		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.backfillLost)).to.be.a(
+			'string'
+		);
+		expect(
+			commitPreimage(manager, 130).committed,
+			'the journal keeps writing after the reset'
+		).to.equal(true);
 		storage.close();
 	});
 });

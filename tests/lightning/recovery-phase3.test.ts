@@ -31,10 +31,16 @@ import {
 	RecoveryManager,
 	RecoveryJournal,
 	RecoveryCapsule,
+	RecoveryMutation,
+	RecoveryOutboundMessage,
 	CAPSULE_MAX_BYTES,
+	PROBE_MUTATION_COVERAGE,
+	PROBE_SNAPSHOT_COVERAGE,
 	composeRecoveryCapsule,
 	decodeRecoveryCapsuleBlob,
 	encryptRecoveryCapsule,
+	knownGoodProbeFrames,
+	reconstructFromFrames,
 	restoreFromRecoveryCapsule,
 	restoreBestRecoveryCapsule,
 	selectRecoveryCapsule,
@@ -49,6 +55,10 @@ import {
 	frameAad,
 	hashFrame
 } from '../../src/lightning/recovery';
+import { withStorageTransaction } from '../../src/lightning/storage/transaction';
+import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import { MonitorState } from '../../src/lightning/chain/types';
+import { PaymentDirection } from '../../src/lightning/node/types';
 import { MessageType } from '../../src/lightning/message/types';
 import { decodePeerStorageMessage } from '../../src/lightning/message/peer-storage';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
@@ -1677,6 +1687,328 @@ describe('Recovery phase 3: round-16 validator provenance', () => {
 			})
 		).to.throw(/scratch payment_secrets broken/);
 		expect(target.loadRecoveryFrames!()).to.have.length(0);
+		target.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-17 probe coverage and transient discrimination', () => {
+	function probeChannelMutation(): RecoveryMutation {
+		const point = getPublicKey(Buffer.alloc(32, 21));
+		const state = createOpenerState({
+			temporaryChannelId: Buffer.alloc(32, 22),
+			fundingSatoshis: 1_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: {
+				fundingPubkey: point,
+				revocationBasepoint: point,
+				paymentBasepoint: point,
+				delayedPaymentBasepoint: point,
+				htlcBasepoint: point,
+				firstPerCommitmentPoint: point
+			},
+			localPerCommitmentSeed: Buffer.alloc(32, 23)
+		});
+		state.channelId = Buffer.alloc(32, 0xdc);
+		return {
+			type: 'channel_state',
+			channelId: 'dc'.repeat(32),
+			state,
+			peerPubkey: point.toString('hex')
+		};
+	}
+
+	/** Every storage method a candidate replay can reach on the scratch. */
+	const REPLAY_SURFACE = [
+		'saveChannel',
+		'saveChannelKeyIndex',
+		'saveChainMonitor',
+		'savePreimage',
+		'savePayment',
+		'savePaymentSecret',
+		'saveHtlcPaymentMapping',
+		'saveForwardedHtlc',
+		'saveHtlcSharedSecret',
+		'saveInvoice',
+		'saveInvoicePathId',
+		'saveForwardingEvent',
+		'saveOutboxMessage',
+		'setOutboxFrameSequence',
+		'deleteHtlcPaymentMapping',
+		'deleteHtlcSharedSecret',
+		'deleteForwardedHtlc',
+		'deletePaymentSecret',
+		'deletePayment',
+		'deletePreimage',
+		'deleteInvoice',
+		'deleteInvoicePathId',
+		'deleteOutboxMessages',
+		'deleteChannel'
+	] as const;
+
+	it('the probe replays cleanly and invokes EVERY replay-surface operation', () => {
+		const scratch = scratchStorage();
+		const called = new Set<string>();
+		const spy = new Proxy(scratch, {
+			get(target, prop, receiver): unknown {
+				const value = Reflect.get(target, prop, receiver);
+				if (typeof value !== 'function') return value;
+				return (...args: unknown[]): unknown => {
+					called.add(String(prop));
+					return (value as (...a: unknown[]) => unknown).apply(target, args);
+				};
+			}
+		}) as unknown as IStorageBackend;
+		withStorageTransaction(spy, () => {
+			reconstructFromFrames(spy, knownGoodProbeFrames());
+		});
+		for (const method of REPLAY_SURFACE) {
+			expect(called.has(method), `probe exercises ${method}`).to.equal(true);
+		}
+		scratch.close();
+	});
+
+	it('the probe frames carry every mutation variant and populate every snapshot table', () => {
+		const frames = knownGoodProbeFrames();
+		const carried = new Set<string>();
+		for (const frame of frames) {
+			for (const mutation of frame.mutations) carried.add(mutation.type);
+		}
+		expect([...carried].sort()).to.deep.equal(
+			Object.keys(PROBE_MUTATION_COVERAGE).sort()
+		);
+		const snapshot = frames.find((f) => f.snapshot)!.snapshot!;
+		for (const field of Object.keys(PROBE_SNAPSHOT_COVERAGE)) {
+			const rows = snapshot[field as keyof typeof snapshot] as unknown[];
+			expect(Array.isArray(rows), `${field} is an array`).to.equal(true);
+			expect(rows.length, `${field} is populated`).to.be.greaterThan(0);
+		}
+		expect(
+			frames.some((f) => f.outboundMessages.length > 0),
+			'the outbox insert path is exercised by a delta'
+		).to.equal(true);
+	});
+
+	// One broken scratch method per case, with a candidate whose replay
+	// genuinely touches it: every failure must propagate RAW (validator
+	// infrastructure), never launder into a Tier-1 downgrade of valid
+	// Tier-2 content. Before round 17 the probe left these tables
+	// unexercised, so a backend broken on them misclassified the capsule.
+	const faultMatrix: Array<{
+		method: string;
+		mutations: RecoveryMutation[];
+		outbound?: RecoveryOutboundMessage[];
+	}> = [
+		{ method: 'saveChannel', mutations: [probeChannelMutation()] },
+		{
+			method: 'saveChainMonitor',
+			mutations: [
+				{
+					type: 'chain_monitor',
+					channelId: 'dc'.repeat(32),
+					state: {
+						monitorState: MonitorState.WATCHING,
+						commitmentBroadcast: null,
+						trackedOutputs: [],
+						currentBlockHeight: 0
+					}
+				}
+			]
+		},
+		{
+			method: 'savePayment',
+			mutations: [
+				{
+					type: 'payment_state',
+					paymentHash: 'ee'.repeat(32),
+					payment: {
+						paymentHash: Buffer.alloc(32, 0xee),
+						amountMsat: 1n,
+						status: PaymentStatus.COMPLETED,
+						direction: PaymentDirection.OUTGOING,
+						createdAt: 0
+					}
+				}
+			]
+		},
+		{
+			method: 'saveInvoice',
+			mutations: [
+				{
+					type: 'invoice_state',
+					paymentHash: 'ee'.repeat(32),
+					invoice: {
+						paymentHash: 'ee'.repeat(32),
+						bolt11: 'lnbcrt1round17',
+						expiry: 3600,
+						createdAt: 0
+					}
+				}
+			]
+		},
+		{
+			method: 'saveForwardingEvent',
+			mutations: [
+				{
+					type: 'forwarding_event',
+					event: {
+						settledAt: 3,
+						inChannelId: 'dc'.repeat(32),
+						outChannelId: 'dc'.repeat(32),
+						amountInMsat: 2n,
+						amountOutMsat: 1n,
+						feeMsat: 1n
+					}
+				}
+			]
+		},
+		{
+			method: 'saveOutboxMessage',
+			mutations: [],
+			outbound: [
+				{
+					peerId: getPublicKey(Buffer.alloc(32, 21)).toString('hex'),
+					channelId: 'dc'.repeat(32),
+					messageType: 136,
+					wireMessage: Buffer.from([0]),
+					disposition: 'pending_send'
+				}
+			]
+		},
+		{
+			method: 'deleteChannel',
+			mutations: [
+				probeChannelMutation(),
+				{ type: 'channel_closed', channelId: 'dc'.repeat(32) }
+			]
+		}
+	];
+
+	for (const entry of faultMatrix) {
+		it(`a backend broken on ${entry.method} propagates raw`, () => {
+			const { storage, manager } = journaledStorage(1, 40);
+			expect(
+				manager.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					mutations: entry.mutations,
+					outboundMessages: entry.outbound ?? []
+				}).committed
+			).to.equal(true);
+			const { blob } = composeRecoveryCapsule({
+				storage,
+				encryptedScb: makeScb(),
+				nodeSecret: NODE_SECRET
+			});
+			const target = openStorage();
+			const broken = (): SqliteStorage => {
+				const scratch = scratchStorage();
+				(scratch as unknown as Record<string, unknown>)[entry.method] =
+					(): void => {
+						throw new Error(`scratch ${entry.method} broken`);
+					};
+				return scratch;
+			};
+			expect(() =>
+				restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+					scratchStorage: broken
+				})
+			).to.throw(new RegExp(`scratch ${entry.method} broken`));
+			expect(
+				target.loadRecoveryFrames!(),
+				'the target was never touched'
+			).to.have.length(0);
+			target.close();
+			storage.close();
+		});
+	}
+
+	it('a transient scratch failure is retried, not misread as a content defect', () => {
+		// The FIRST scratch instance fails a table write; every later one is
+		// healthy. The candidate must reproduce its failure on a fresh,
+		// probe-proven instance before it may be classified as content, so a
+		// one-shot hiccup restores Tier 2 instead of silently degrading.
+		const { storage, manager } = journaledStorage(1, 50);
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [probeChannelMutation()],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		let scratchInstances = 0;
+		const flaky = (): SqliteStorage => {
+			const scratch = scratchStorage();
+			scratchInstances++;
+			if (scratchInstances === 1) {
+				scratch.saveChannel = (): void => {
+					throw new Error('transient scratch hiccup');
+				};
+			}
+			return scratch;
+		};
+		const result = restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+			scratchStorage: flaky
+		});
+		expect(result.tier, 'restored at Tier 2 despite the hiccup').to.equal(2);
+		expect(scratchInstances, 'a fresh instance decided').to.be.greaterThan(1);
+		expect(
+			target.loadAllChannels().map((c) => c.channelId),
+			'the candidate channel restored'
+		).to.include('dc'.repeat(32));
+		target.close();
+		storage.close();
+	});
+
+	it('a capsule carrying forwarding and outbox rows restores them at Tier 2', () => {
+		const { storage, manager } = journaledStorage(1, 60);
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'forwarding_event',
+						event: {
+							settledAt: 4,
+							inChannelId: 'dc'.repeat(32),
+							outChannelId: 'dc'.repeat(32),
+							amountInMsat: 5n,
+							amountOutMsat: 4n,
+							feeMsat: 1n
+						}
+					}
+				],
+				outboundMessages: [
+					{
+						peerId: getPublicKey(Buffer.alloc(32, 21)).toString('hex'),
+						channelId: 'dc'.repeat(32),
+						messageType: 136,
+						wireMessage: Buffer.from([0]),
+						disposition: 'pending_send'
+					}
+				]
+			}).committed
+		).to.equal(true);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const result = restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+			scratchStorage
+		});
+		expect(result.tier).to.equal(2);
+		expect(
+			(target.listForwardingEvents?.() ?? []).length,
+			'the forwarding ledger survived the round trip'
+		).to.be.greaterThan(0);
 		target.close();
 		storage.close();
 	});

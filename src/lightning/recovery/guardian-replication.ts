@@ -53,6 +53,8 @@ import {
 	JOURNAL_META_KEYS,
 	chainLostBackfill,
 	storedTipSequence,
+	resolveWatermarkAnchor,
+	META_REPLICATED_THROUGH,
 	META_REPLICATED_THROUGH_HASH
 } from './journal';
 import {
@@ -63,13 +65,12 @@ import {
 	requireEncryptedSecretStorage
 } from './writer-lease';
 
-/** How far replication has provably got, for catch-up after a restart. */
-const META_REPLICATED_THROUGH = 'guardian_replicated_through';
 /** A registration already sent to at least one guardian (see below). */
 const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
 
 export const REPLICATION_META_KEYS = {
 	replicatedThrough: META_REPLICATED_THROUGH,
+	replicatedThroughHash: META_REPLICATED_THROUGH_HASH,
 	pendingRegistration: META_PENDING_REGISTRATION
 } as const;
 
@@ -632,18 +633,23 @@ export class GuardianReplicator {
 		} catch {
 			return 0n;
 		}
-		// The recorded receipted-frame hash must still name the stored
-		// frame at the watermark: a replaced chain at the same height has
-		// NOT been receipted, and answering with the inherited watermark
-		// would release its messages without one. Reading 0 is the safe
-		// direction (re-offering is idempotent; a divergent chain is then
-		// refused by the guardians at its occupied sequences).
-		const boundHash = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH_HASH);
-		if (boundHash != null && value >= 1n) {
-			const rows = storage.loadRecoveryFrames?.(Number(value) - 1) ?? [];
-			const row =
-				rows.length > 0 && BigInt(rows[0].sequence) === value ? rows[0] : null;
-			if (row != null && row.frameHash.toString('hex') !== boundHash) {
+		// A positive watermark is only ever trusted when its recorded
+		// receipted-frame hash exists AND resolves against the retained
+		// store (the stored frame itself, or the retained base snapshot's
+		// previousFrameHash when compaction pruned exactly that frame): a
+		// replaced chain at the same height has NOT been receipted, and
+		// answering with the inherited watermark would release its messages
+		// without one. A missing hash is equally untrusted; every writer of
+		// the watermark binds it, so absence means the mark predates the
+		// binding or survived something that destroyed it. Reading 0 is the
+		// safe direction (re-offering is idempotent; a divergent chain is
+		// then refused by the guardians at its occupied sequences), and it
+		// self-heals: the next successful pass re-raises and re-binds.
+		if (value >= 1n) {
+			const boundHash = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH_HASH);
+			if (boundHash == null) return 0n;
+			const anchor = resolveWatermarkAnchor(storage, value);
+			if (anchor == null || anchor.toString('hex') !== boundHash) {
 				return 0n;
 			}
 		}
@@ -675,13 +681,20 @@ export class GuardianReplicator {
 	 *
 	 * Asked ONCE, at barrier construction, never per evaluation.
 	 *
-	 * A ZERO watermark is never refused. It releases nothing, so there is
-	 * nothing to refuse, and refusing it would freeze a node whose journal is
-	 * merely damaged, which is the same trade resolveDurability makes for an
-	 * unreadable tip.
+	 * Reads the RAW stored mark, not replicatedThrough(): the trusted read
+	 * already degrades an unresolvable mark to zero for release purposes,
+	 * and going through it here would silently wave through exactly the
+	 * rolled-back stores this check exists to refuse LOUDLY at startup.
+	 *
+	 * A ZERO (or unparseable, which reads as zero) watermark is never
+	 * refused. It releases nothing, so there is nothing to refuse, and
+	 * refusing it would freeze a node whose journal is merely damaged, which
+	 * is the same trade resolveDurability makes for an unreadable tip.
 	 */
 	watermarkExceedingJournal(): string | null {
-		const watermark = this.replicatedThrough();
+		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		if (raw == null || !/^\d+$/.test(raw)) return null;
+		const watermark = BigInt(raw);
 		if (watermark === 0n) return null;
 		const tip = storedTipSequence(this.config.storage);
 		if (tip == null) {
@@ -717,19 +730,24 @@ export class GuardianReplicator {
 				stored = current;
 				return;
 			}
-			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
 			// Bind the watermark to the HISTORY it receipts, not just a
 			// height: the receipt verification above proved the guardian
 			// head names our stored frame, so record which frame that was.
 			// A later chain replacement at the same height then fails the
-			// binding instead of inheriting the receipts.
-			const rows = storage.loadRecoveryFrames?.(Number(value) - 1) ?? [];
-			if (rows.length > 0 && BigInt(rows[0].sequence) === value) {
-				storage.setRecoveryMeta?.(
-					META_REPLICATED_THROUGH_HASH,
-					rows[0].frameHash.toString('hex')
-				);
+			// binding instead of inheriting the receipts. Height and hash
+			// are ONE atomic pair; a raise whose target has no resolvable
+			// anchor is REFUSED outright, because an unbound positive mark
+			// is exactly the fail-open the binding exists to close.
+			const anchor = resolveWatermarkAnchor(storage, value);
+			if (anchor == null) {
+				stored = current;
+				return;
 			}
+			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
+			storage.setRecoveryMeta?.(
+				META_REPLICATED_THROUGH_HASH,
+				anchor.toString('hex')
+			);
 		});
 		return stored;
 	}

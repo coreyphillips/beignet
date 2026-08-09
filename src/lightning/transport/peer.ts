@@ -121,6 +121,17 @@ export class Peer extends EventEmitter {
 	 * 'released' from an already-cleared queue.
 	 */
 	private heldReleaseOutcome: 'released' | 'aborted' | 'failed' | null = null;
+	/**
+	 * Monotonic id of the held-message lifecycle, bumped ONLY by
+	 * rearmHeldMessages(). Array identity cannot scope a drain to its
+	 * lifecycle: disconnect() nulls the queue without beginning a new
+	 * lifecycle, so `heldMessages === held` reads false for the very
+	 * lifecycle the drain still owns. A drain captures this id at entry
+	 * and writes sticky outcomes or performs teardown only while it still
+	 * matches; a handler that re-armed a fresh lifecycle mid-drain leaves
+	 * the old drain with a stale id and no authority over the new state.
+	 */
+	private heldLifecycleId = 0;
 	/** The configured hold behavior, re-armed on every establishment. */
 	private readonly holdOnEstablish: boolean = false;
 	private socket: IDuplexTransport | null = null;
@@ -186,6 +197,7 @@ export class Peer extends EventEmitter {
 	 */
 	/** Arm a fresh hold for a new connection lifecycle (see options). */
 	private rearmHeldMessages(): void {
+		this.heldLifecycleId++;
 		this.heldMessages = this.holdOnEstablish ? [] : null;
 		this.drainingHeld = false;
 		this.heldReleaseOutcome = null;
@@ -753,6 +765,10 @@ export class Peer extends EventEmitter {
 		// Reentrancy guard: a recursive release (an observer calling back
 		// into the manager) must not start a second cursor and interleave.
 		this.drainingHeld = true;
+		// The drain acts for THIS lifecycle only: a delivered handler may
+		// disconnect and re-establish, arming a fresh lifecycle whose
+		// sticky outcome and queue this (now stale) drain must not touch.
+		const lifecycle = this.heldLifecycleId;
 		try {
 			// Drain with an INDEX CURSOR over the live array: reentrant
 			// synchronous arrivals append behind the remaining held frames
@@ -764,13 +780,24 @@ export class Peer extends EventEmitter {
 				if (this.state !== 'ready') {
 					// Torn down mid-release: the undelivered tail dies with
 					// the connection, exactly as unread socket bytes would.
-					this.heldReleaseOutcome = 'aborted';
+					if (this.heldLifecycleId === lifecycle) {
+						this.heldReleaseOutcome = 'aborted';
+					}
 					return 'aborted';
 				}
 				const next = held[cursor++];
 				try {
 					this.emit('message', next.type, next.payload);
 				} catch (err) {
+					if (this.heldLifecycleId !== lifecycle) {
+						// The throwing handler already moved the peer into a
+						// FRESH lifecycle before failing: this drain has no
+						// authority left. Tearing down, clearing the queue or
+						// recording 'failed' now would destroy the new
+						// lifecycle over the old one's error; report the
+						// failure to the caller and touch nothing.
+						return 'failed';
+					}
 					// TERMINAL FIRST: tear the connection down before any
 					// observer runs, so a reentrant or throwing error
 					// listener can neither deliver past the gap nor bypass
@@ -796,7 +823,19 @@ export class Peer extends EventEmitter {
 					return 'failed';
 				}
 			}
-			this.heldReleaseOutcome = 'released';
+			// The loop only observes state at the TOP of an iteration, so a
+			// teardown by the FINAL frame's handler has no next iteration to
+			// notice it: check once more before declaring success, or that
+			// teardown would be reported as 'released'.
+			if (this.state !== 'ready') {
+				if (this.heldLifecycleId === lifecycle) {
+					this.heldReleaseOutcome = 'aborted';
+				}
+				return 'aborted';
+			}
+			if (this.heldLifecycleId === lifecycle) {
+				this.heldReleaseOutcome = 'released';
+			}
 			return 'released';
 		} finally {
 			this.drainingHeld = false;

@@ -180,6 +180,19 @@ export class PeerManager extends EventEmitter {
 	 * while the dial itself still rejects honestly.
 	 */
 	private cancelGenerations: Map<string, number> = new Map();
+	/**
+	 * A GLOBAL monotonic era stamped onto every explicit disconnectPeer(),
+	 * with the last stamped era recorded per pubkey. Inbound handshakes
+	 * cannot use the per-pubkey generation map: the peer's identity is
+	 * unknown until Noise completes, so nothing pubkey-addressable exists
+	 * to snapshot when the socket is accepted. The era closes that window:
+	 * the accept snapshots the global counter, and once identity is
+	 * learned, a cancellation for THAT pubkey stamped after the snapshot
+	 * proves disconnectPeer() ran mid-handshake and the registration must
+	 * not happen.
+	 */
+	private cancelEra = 0;
+	private lastCancelEraByPubkey: Map<string, number> = new Map();
 	// Per-peer timers that reset the backoff once a connection has stayed up for
 	// STABLE_CONNECTION_MS. Cleared if the peer disconnects before then.
 	private stabilityTimers: Map<string, ReturnType<typeof setTimeout>> =
@@ -524,6 +537,10 @@ export class PeerManager extends EventEmitter {
 			pubkey,
 			(this.cancelGenerations.get(pubkey) ?? 0) + 1
 		);
+		// Stamp the global cancellation era so an inbound handshake that is
+		// still anonymous right now (and therefore unabortable by pubkey)
+		// discovers this cancellation the moment its identity is learned.
+		this.lastCancelEraByPubkey.set(pubkey, ++this.cancelEra);
 		// Abort in-flight outbound dials NOW: a stalled handshake must not
 		// keep its socket live (and later reject or register) after the
 		// caller explicitly cancelled the peer. The abort makes the dial
@@ -1024,6 +1041,12 @@ export class PeerManager extends EventEmitter {
 		// Visible to freezeConnections() while the handshake is in flight.
 		this.pendingPeers.add(peer);
 
+		// Identity is unknown until Noise completes, so a disconnectPeer()
+		// during the handshake has nothing pubkey-addressable to abort.
+		// Snapshot the cancellation era now; the moment the pubkey is
+		// learned, any cancellation for it stamped after this point wins.
+		const acceptEra = this.cancelEra;
+
 		peer
 			.acceptInbound(socket)
 			.then(() => {
@@ -1038,6 +1061,10 @@ export class PeerManager extends EventEmitter {
 					return;
 				}
 				const pubkey = peer.remotePublicKey.toString('hex');
+				if ((this.lastCancelEraByPubkey.get(pubkey) ?? 0) > acceptEra) {
+					peer.disconnect();
+					return;
+				}
 
 				const existing = this.peers.get(pubkey);
 

@@ -113,6 +113,7 @@ import {
 	HtlcDirection,
 	isAnchorChannel,
 	isTaprootChannel,
+	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS
 } from './types';
@@ -3977,6 +3978,81 @@ export class ChannelManager extends EventEmitter {
 				`Peer ${peerPubkey} is not in the trusted set; add it with addTrustedPeer before a trusted open`
 			);
 		}
+		// V2 establishment is conditioned on NEGOTIATED option_dual_fund on
+		// the explicit API too: the generic openChannel routes by these
+		// bits, but openChannelV2 arrives here directly, and without the
+		// same enforcement a masked vector (preferTaproot masks dual_fund
+		// because taproot v2 signing does not exist) or an unsupporting
+		// peer would still get an OPEN_CHANNEL2, a burned key index and a
+		// retained temp channel for a negotiation that cannot complete.
+		// With a real peer manager the peer must be connected, init-complete
+		// and advertising the bit; a manager driven without one (unit
+		// harnesses) negotiates for itself and is left alone.
+		if (
+			this.config.localFeatures !== undefined &&
+			!this.config.localFeatures.hasFeature(Feature.DUAL_FUND)
+		) {
+			throw new Error(
+				'Cannot open a dual-funded (v2) channel: this node does not advertise option_dual_fund'
+			);
+		}
+		if (this.peerManager) {
+			const peer = this.peerManager.getPeer(peerPubkey);
+			if (!peer) {
+				throw new Error(`Not connected to peer ${peerPubkey}`);
+			}
+			const remoteInit = peer.getRemoteInit();
+			if (!remoteInit) {
+				throw new Error(
+					`Peer ${peerPubkey} has not completed init; cannot verify option_dual_fund`
+				);
+			}
+			if (!remoteInit.features.hasFeature(Feature.DUAL_FUND)) {
+				throw new Error(
+					`Peer ${peerPubkey} did not advertise option_dual_fund`
+				);
+			}
+		}
+		// Resolve and validate the channel_type BEFORE any state exists for
+		// it: a refused type must burn no key index and retain no channel.
+		// CLN requires the channel_type TLV on open_channel2 (tx_abort:
+		// "open_channel2 missing channel_type"). Default it to
+		// static_remotekey plus anchors when preferred; the legacy open's
+		// taproot default is deliberately NOT mirrored here, because taproot
+		// v2 signing does not exist and validateV2ChannelType refuses the
+		// bit outright (a preferTaproot node cannot reach this path through
+		// the node API anyway: the global dual_fund mask throws above).
+		let channelType = params.channelType;
+		if (!channelType) {
+			const typeFlags = FeatureFlags.empty();
+			typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			if (this.config.preferAnchors) {
+				typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+			}
+			channelType = typeFlags.toBuffer();
+		}
+		// Trusted zero-conf: the intent must ride in channel_type (BOLT 2
+		// feature 50) or the acceptor treats this as an ordinary open and
+		// answers with a real confirmation depth. BOLT 9 makes option_zeroconf
+		// depend on option_scid_alias (a vector MUST include its transitive
+		// dependencies), and BOLT 2 forbids announcing a channel whose type
+		// carries option_scid_alias, so the open goes out private.
+		let channelFlags = params.channelFlags;
+		if (opts?.trusted) {
+			const typeFlags = FeatureFlags.fromBuffer(channelType);
+			typeFlags.setCompulsory(Feature.SCID_ALIAS);
+			typeFlags.setCompulsory(Feature.ZERO_CONF);
+			channelType = typeFlags.toBuffer();
+			channelFlags = (channelFlags ?? 0x01) & ~0x01;
+		}
+		const typeRefusal = validateV2ChannelType(
+			channelType,
+			this.config.localFeatures,
+			this.peerManager?.getPeer(peerPubkey)?.getRemoteInit()?.features
+		);
+		if (typeRefusal) {
+			throw new Error(`Cannot open a dual-funded (v2) channel: ${typeRefusal}`);
+		}
 		// openChannelV2 arrives here rather than through openChannel, so the
 		// guard has to be on both, or half the opens escape it.
 		this._assertNamespaceCanRecordANewChannel();
@@ -4013,41 +4089,7 @@ export class ChannelManager extends EventEmitter {
 		// Override the caller's key material with the channel's own (mirrors the
 		// acceptor path in handleOpenChannel2). In the common case (no per-channel
 		// key deriver) these are already equal.
-		// CLN requires the channel_type TLV on open_channel2 (tx_abort: "open_channel2
-		// missing channel_type"). Default it exactly like the legacy open
-		// (Channel.initiateOpen): a taproot channel_type is the single
-		// OPTION_TAPROOT bit — the taproot bit implies anchor-style commitments
-		// and static_remotekey, and any extra bit makes peers reject the type —
-		// otherwise static_remotekey plus anchors when preferred. Without the
-		// taproot branch, an openChannel routed here by the peer's dual-fund
-		// feature would silently open a different channel type than the same
-		// call against a v1 peer.
-		let channelType = params.channelType;
-		if (!channelType) {
-			const typeFlags = FeatureFlags.empty();
-			if (this.config.preferTaproot) {
-				typeFlags.setCompulsory(Feature.OPTION_TAPROOT);
-			} else {
-				typeFlags.setCompulsory(Feature.STATIC_REMOTE_KEY);
-				if (this.config.preferAnchors) {
-					typeFlags.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
-				}
-			}
-			channelType = typeFlags.toBuffer();
-		}
-		// Trusted zero-conf: the intent must ride in channel_type (BOLT 2
-		// feature 50) or the acceptor treats this as an ordinary open and
-		// answers with a real confirmation depth. BOLT 9 makes option_zeroconf
-		// depend on option_scid_alias (a vector MUST include its transitive
-		// dependencies), and BOLT 2 forbids announcing a channel whose type
-		// carries option_scid_alias, so the open goes out private.
-		let channelFlags = params.channelFlags;
 		if (opts?.trusted) {
-			const typeFlags = FeatureFlags.fromBuffer(channelType);
-			typeFlags.setCompulsory(Feature.SCID_ALIAS);
-			typeFlags.setCompulsory(Feature.ZERO_CONF);
-			channelType = typeFlags.toBuffer();
-			channelFlags = (channelFlags ?? 0x01) & ~0x01;
 			state.announceChannel = false;
 		}
 
@@ -4104,6 +4146,33 @@ export class ChannelManager extends EventEmitter {
 			const reason = localLacks
 				? 'open_channel2 refused: this node does not advertise option_dual_fund'
 				: 'open_channel2 refused: the peer did not advertise option_dual_fund';
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			);
+			this.emit('error', msg.channelId, reason);
+			return;
+		}
+
+		// The PROPOSED channel_type is validated with the same timing and
+		// visibility as the feature guard above: before keys are derived or
+		// a temp channel is retained, with a wire error so the opener is
+		// not parked in DUAL_FUNDING_V2 forever. Advertising dual_fund says
+		// nothing about the commitment format the type asks for; a taproot
+		// or otherwise unsupported type accepted here would echo through
+		// ACCEPT_CHANNEL2 and then die at the commitment stage with a burnt
+		// key index and a stuck retained channel.
+		const typeRefusal = validateV2ChannelType(
+			msg.channelType ?? null,
+			localFeatures,
+			remoteInit?.features
+		);
+		if (typeRefusal) {
+			const reason = `open_channel2 refused: ${typeRefusal}`;
 			this.sendMessage(
 				peerPubkey,
 				MessageType.ERROR,

@@ -648,6 +648,93 @@ describe('Recovery phase 6: the watermark only rises', () => {
 		await shutdown(served);
 		storage.close();
 	});
+
+	// A replicator whose guardians are never contacted: replicatedThrough and
+	// raiseWatermark are pure storage paths, but the constructor refuses a
+	// guardian set smaller than the required quorum.
+	function offlineReplicator(storage: SqliteStorage): GuardianReplicator {
+		return replicator(
+			storage,
+			[2, 3, 4].map((fill) => ({
+				client: {} as unknown as GuardianClient,
+				expectedGuardianId: Buffer.alloc(32, fill)
+			}))
+		);
+	}
+
+	it('a positive watermark is only trusted when its binding hash resolves', () => {
+		const { storage } = journaledStorage(3);
+		const rep = offlineReplicator(storage);
+
+		// A bare height with NO hash is untrusted: a mark that predates the
+		// binding, or survived whatever destroyed it, must not release
+		// messages it cannot prove were receipted.
+		storage.setRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough, '2');
+		expect(rep.replicatedThrough(), 'missing hash reads zero').to.equal(0n);
+
+		// Bound to the stored frame it names, the mark reads back.
+		const frame2 = storage.loadRecoveryFrames(1)[0];
+		storage.setRecoveryMeta(
+			REPLICATION_META_KEYS.replicatedThroughHash,
+			frame2.frameHash.toString('hex')
+		);
+		expect(rep.replicatedThrough(), 'a bound mark reads back').to.equal(2n);
+
+		// Bound to a frame this store does not hold, it reads zero: the
+		// receipts belong to a different history.
+		storage.setRecoveryMeta(
+			REPLICATION_META_KEYS.replicatedThroughHash,
+			'cd'.repeat(32)
+		);
+		expect(rep.replicatedThrough(), 'a foreign receipt reads zero').to.equal(
+			0n
+		);
+		storage.close();
+	});
+
+	it('the watermark raise is ATOMIC: a failed hash write rolls back the height', () => {
+		const { storage } = journaledStorage(2);
+		const rep = offlineReplicator(storage);
+		const realSet = storage.setRecoveryMeta.bind(storage);
+		storage.setRecoveryMeta = (key, value): void => {
+			if (key === REPLICATION_META_KEYS.replicatedThroughHash) {
+				throw new Error('disk hiccup');
+			}
+			realSet(key, value);
+		};
+		expect(() =>
+			(
+				rep as unknown as { raiseWatermark(value: bigint): bigint }
+			).raiseWatermark(2n)
+		).to.throw(/disk hiccup/);
+		storage.setRecoveryMeta = realSet;
+		// Height and hash are one pair; neither key survived the rollback.
+		expect(
+			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough)
+		).to.equal(null);
+		expect(
+			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThroughHash)
+		).to.equal(null);
+		expect(rep.replicatedThrough()).to.equal(0n);
+		storage.close();
+	});
+
+	it('a raise whose target has no anchor is refused, leaving the mark unchanged', () => {
+		const { storage } = journaledStorage(2);
+		const rep = offlineReplicator(storage);
+		const refused = (
+			rep as unknown as { raiseWatermark(value: bigint): bigint }
+		).raiseWatermark(99n);
+		expect(refused, 'the raise reports the standing mark').to.equal(0n);
+		expect(
+			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThrough),
+			'an unbindable height was never recorded'
+		).to.equal(null);
+		expect(
+			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThroughHash)
+		).to.equal(null);
+		storage.close();
+	});
 });
 
 describe('Recovery phase 6: fencing needs proof', () => {

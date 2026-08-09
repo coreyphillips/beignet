@@ -921,14 +921,16 @@ export class LightningNode extends EventEmitter {
 			localFeatures.clearBit(Feature.PROVIDE_STORAGE + 1);
 		}
 		// option_dual_fund + preferTaproot: taproot v2 opens are not
-		// implemented (the commitment stage fails closed), so the generic
-		// openChannel, which routes by this bit, would negotiate a
-		// combination that always aborts. Under quorum, masking the bit
-		// preserves what the phase 6 mask used to give this configuration:
-		// generic opens route through the working v1 taproot path. Outside
-		// quorum the bit was always advertised for preferTaproot nodes and
-		// stays so; widening the mask is a separate decision.
-		if (barrier?.enforcing === true && config.preferTaproot) {
+		// implemented (the commitment stage fails closed), so a v2
+		// negotiation under this preference is guaranteed to die after keys
+		// are derived and state is retained. The mask is GLOBAL, not
+		// quorum-scoped: a preferTaproot node never advertises dual_fund,
+		// generic opens route through the working v1 taproot path (the
+		// configured preference is honored, never silently downgraded to a
+		// non-taproot v2 type), inbound open_channel2 is refused by the
+		// negotiated-feature guard, and the explicit openChannelV2 API is
+		// refused by the same mask at the manager.
+		if (config.preferTaproot) {
 			localFeatures.clearBit(Feature.DUAL_FUND);
 			localFeatures.clearBit(Feature.DUAL_FUND + 1);
 		}

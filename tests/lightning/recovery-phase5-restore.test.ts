@@ -32,6 +32,7 @@ import {
 	RecoveryJournal,
 	RecoveryManager,
 	ReferenceGuardian,
+	REPLICATION_META_KEYS,
 	RESTORE_META_KEYS,
 	RestoreDriver,
 	RestoreRefusedError,
@@ -907,6 +908,13 @@ describe('Recovery phase 5: restore driver', () => {
 			}
 		});
 		expect(resumed.replicatedThrough()).to.equal(certifiedSequence);
+		// The mark is only trusted when BOUND to the history it receipts, so
+		// the install must write the certified head's frame hash beside it;
+		// without the binding the strict read above would report zero and
+		// every pass would re-offer the whole restored journal.
+		expect(
+			target.getRecoveryMeta!(REPLICATION_META_KEYS.replicatedThroughHash)
+		).to.equal(restored.certifiedState.logHead.frameHash.toString('hex'));
 		// And the mark is a statement about frames this database can SHOW. The
 		// install writes the watermark and the journal tip to the same
 		// certified head in one transaction, so a quorum barrier built over a
