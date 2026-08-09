@@ -111,6 +111,9 @@ function makeOpenChannel2Msg(
 		firstPerCommitmentPoint: bp.firstPerCommitmentPoint,
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 		channelFlags: 0x01,
+		// BOLT 2 makes channel_type REQUIRED on open_channel2; the default
+		// mirrors the opener's resolved default (static_remotekey).
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
 }
@@ -135,6 +138,9 @@ function makeAcceptChannel2Msg(
 		htlcBasepoint: bp.htlcBasepoint,
 		firstPerCommitmentPoint: bp.firstPerCommitmentPoint,
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
+		// The accepter echoes the offered channel_type (BOLT 2); the default
+		// matches makeOpenChannel2Msg's.
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
 }
@@ -155,6 +161,10 @@ function makeDualFundingParams(
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
+		// BOLT 2 makes channel_type REQUIRED on open_channel2; sessions do
+		// not inject a default (the Channel layer does), so the fixture
+		// carries one that matches the message fixtures above.
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
 }
@@ -1934,9 +1944,17 @@ describe('Round 17: v2 channel_type admission', () => {
 	}
 
 	describe('validateV2ChannelType', () => {
-		it('accepts the recognized combinations and an absent type', () => {
-			expect(validateV2ChannelType(null)).to.equal(null);
-			expect(validateV2ChannelType(Buffer.alloc(0))).to.equal(null);
+		it('accepts the recognized combinations, requiring presence and minimality', () => {
+			// BOLT 2 makes channel_type REQUIRED on open_channel2.
+			expect(validateV2ChannelType(null)).to.match(/requires a channel_type/);
+			expect(validateV2ChannelType(Buffer.alloc(0))).to.match(
+				/requires a channel_type/
+			);
+			// A padded encoding is two byte strings for one type: the echo
+			// check would pass on bytes the dispatch reads differently.
+			expect(validateV2ChannelType(Buffer.from('001000', 'hex'))).to.match(
+				/minimal encoding/
+			);
 			expect(validateV2ChannelType(typeOf(Feature.STATIC_REMOTE_KEY))).to.equal(
 				null
 			);
@@ -2004,6 +2022,36 @@ describe('Round 17: v2 channel_type admission', () => {
 			// A vector the caller does not have skips only its own half.
 			expect(validateV2ChannelType(anchorsType, undefined, full)).to.equal(
 				null
+			);
+		});
+
+		it('holds scid_alias and zero_conf to BOTH feature vectors too', () => {
+			const aliasType = typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS);
+			const zeroConfType = typeOf(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.SCID_ALIAS,
+				Feature.ZERO_CONF
+			);
+			const full = vector(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.SCID_ALIAS,
+				Feature.ZERO_CONF
+			);
+			const noAlias = vector(Feature.STATIC_REMOTE_KEY);
+			const noZeroConf = vector(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS);
+			expect(validateV2ChannelType(aliasType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(zeroConfType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(aliasType, noAlias, full)).to.match(
+				/scid_alias was not negotiated: this node/
+			);
+			expect(validateV2ChannelType(aliasType, full, noAlias)).to.match(
+				/scid_alias was not negotiated: the peer/
+			);
+			expect(validateV2ChannelType(zeroConfType, noZeroConf, full)).to.match(
+				/zero_conf was not negotiated: this node/
+			);
+			expect(validateV2ChannelType(zeroConfType, full, noZeroConf)).to.match(
+				/zero_conf was not negotiated: the peer/
 			);
 		});
 	});
@@ -2080,6 +2128,114 @@ describe('Round 17: v2 channel_type admission', () => {
 		});
 	});
 
+	describe('round-18 admission hardening', () => {
+		it('an inbound open_channel2 WITHOUT a channel_type is refused', () => {
+			// BOLT 2 makes the field required; adopting a default here would
+			// negotiate a commitment format the opener never named.
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: undefined
+				}),
+				makeDualFundingParams()
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(/requires a channel_type/);
+			}
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('an inbound scid_alias type with the announce flag is refused', () => {
+			// BOLT 2: a channel whose type carries option_scid_alias must not
+			// be announced; an opener pairing them is refused, not silently
+			// flipped private on one side only.
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS),
+					channelFlags: 0x01
+				}),
+				makeDualFundingParams()
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(/cannot be announced/);
+			}
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('an outbound scid_alias type is forced PRIVATE', () => {
+			// The caller handed an alias type with the default (announce)
+			// flags: the open must go out private, exactly like a trusted
+			// open, because the alias type forbids announcement.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const actions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed,
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS)
+				})
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.SEND_MESSAGE);
+			if (actions[0].type === ChannelActionType.SEND_MESSAGE) {
+				const sent = decodeOpenChannel2Message(actions[0].payload);
+				expect(sent.channelFlags & 0x01, 'announce bit cleared').to.equal(0);
+			}
+			expect(channel.getFullState().announceChannel).to.equal(false);
+		});
+
+		it('a rejected accept_channel2 echo fails WIRE-VISIBLY', () => {
+			// A local error alone deletes our half while the accepter waits
+			// for tx_add_input forever: the refusal must reach the peer.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const openActions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed
+				})
+			);
+			expect(openActions[0].type).to.equal(ChannelActionType.SEND_MESSAGE);
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: Buffer.from('401000', 'hex')
+				})
+			);
+			const wire = actions.find(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					(a as { messageType?: number }).messageType === MessageType.ERROR
+			);
+			expect(wire, 'the refusal went out on the wire').to.exist;
+			expect(
+				actions.some((a) => a.type === ChannelActionType.ERROR),
+				'and surfaced locally'
+			).to.equal(true);
+		});
+	});
+
 	describe('accept_channel2 echo (BOLT 2)', () => {
 		const OFFERED = Buffer.from('401000', 'hex');
 
@@ -2087,7 +2243,12 @@ describe('Round 17: v2 channel_type admission', () => {
 			const channelId = crypto.randomBytes(32);
 			const session = new DualFundingSession(true, channelId);
 			const params = makeDualFundingParams(
-				withType ? { channelType: OFFERED } : {}
+				withType
+					? { channelType: OFFERED }
+					: // A session-level open with NO type at all (the Channel
+					  // layer normally injects one): pins the volunteered-echo
+					  // refusal below.
+					  { channelType: undefined }
 			);
 			const result = session.initiateOpen(params);
 			expect(result.ok).to.equal(true);
@@ -2097,7 +2258,10 @@ describe('Round 17: v2 channel_type admission', () => {
 		it('a MISSING echo is refused before tx negotiation', () => {
 			const session = openerSession(true);
 			const result = session.handleAcceptChannel2(
-				makeAcceptChannel2Msg({ channelId: session.getChannelId() })
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: undefined
+				})
 			);
 			expect(result.ok).to.equal(false);
 			expect(result.error).to.match(/omitted the channel_type/);

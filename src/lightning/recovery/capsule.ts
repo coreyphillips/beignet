@@ -382,7 +382,12 @@ export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 				}
 			}
 		],
-		outboundMessages: [probeOutboxMessage()]
+		outboundMessages: [
+			probeOutboxMessage(),
+			// A second row under a DIFFERENT message type, the target of the
+			// deletes frame's FILTERED outbox_supersede.
+			{ ...probeOutboxMessage(), messageType: 133 }
+		]
 	};
 	// Every delete-side variant, each against a row frames 1 or 2 wrote, so
 	// the deletes genuinely execute instead of no-oping on absent rows.
@@ -401,6 +406,15 @@ export function knownGoodProbeFrames(): VerifiedRecoveryChain {
 			{ type: 'delete_preimage', paymentHash: 'cc'.repeat(32) },
 			{ type: 'delete_invoice', paymentHash: PROBE_HASH },
 			{ type: 'delete_invoice_path_id', paymentHash: PROBE_HASH },
+			// The FILTERED outbox deletion is a distinct storage path (the
+			// message-type list reaches a different SQL shape), so it is
+			// exercised separately from the unfiltered sweep below, against
+			// the type-133 row frame 2 inserted for exactly this purpose.
+			{
+				type: 'outbox_supersede',
+				channelId: PROBE_CHANNEL_ID,
+				messageTypes: [133]
+			},
 			{ type: 'outbox_supersede', channelId: PROBE_CHANNEL_ID },
 			{ type: 'channel_closed', channelId: PROBE_CHANNEL_ID }
 		],
@@ -421,22 +435,31 @@ class ProbeRollback extends Error {}
  * permanent content verdict. So a first-attempt failure is retried on an
  * INDEPENDENTLY FRESH instance, which is first PROVED against a synthetic
  * known-good frame set exercising every operation a real replay can invoke
- * (the probe is deliberately rolled back so the instance stays empty), and
- * then handed the candidate again. Content is only what fails on the very
- * instance that just proved itself: probe failure means the validator is
- * broken (the RAW candidate error propagates), and a candidate that
- * REPLAYS CLEANLY on the proven instance was a transient first failure
- * (the dry-run's question is answered: the content is fine, proceed).
+ * (that probe is deliberately rolled back so the instance stays empty),
+ * and then handed the candidate again. When the candidate REPRODUCES its
+ * failure there, one more probe runs TO COMMIT on the same instance: the
+ * rolled-back probe never exercised successful transaction completion, and
+ * a backend whose commit path is broken fails candidates for reasons that
+ * are its own. Only a candidate failing on an instance that proved BOTH
+ * the operation surface and the commit is typed as content; every other
+ * combination propagates the RAW candidate error (validator broken), and
+ * a candidate that replays cleanly on the proven instance was a transient
+ * first failure (the dry-run's question is answered: proceed).
+ *
+ * Every attempt decodes a FRESH authenticated frame graph via the injected
+ * factory: the frames are handed to FOREIGN adapter code (the scratch
+ * backend), and a hostile or buggy adapter mutating a Buffer during the
+ * first attempt must not poison the retry into a false content verdict.
  */
 function assertReplaysOnScratch(
-	frames: VerifiedRecoveryChain,
+	decodeFrames: () => VerifiedRecoveryChain,
 	scratchStorage: () => IStorageBackend
 ): void {
 	const scratch = scratchStorage();
 	let candidateErr: unknown;
 	try {
 		withStorageTransaction(scratch, () => {
-			reconstructFromFrames(scratch, frames);
+			reconstructFromFrames(scratch, decodeFrames());
 		});
 		return;
 	} catch (err) {
@@ -460,11 +483,22 @@ function assertReplaysOnScratch(
 		}
 		try {
 			withStorageTransaction(fresh, () => {
-				reconstructFromFrames(fresh, frames);
+				reconstructFromFrames(fresh, decodeFrames());
 			});
 		} catch (repeatedErr) {
-			// Reproduced on an instance that just proved healthy on the
-			// full operation set: the failure is the candidate's CONTENT.
+			// Reproduced on the proven instance. Before this is called
+			// content, the backend must also COMPLETE a commit: the
+			// instance is empty again (the candidate rolled back), so the
+			// probe re-runs without the deliberate rollback. A commit that
+			// fails here is broken validator infrastructure; the raw
+			// candidate error propagates instead of a content verdict.
+			try {
+				withStorageTransaction(fresh, () => {
+					reconstructFromFrames(fresh, knownGoodProbeFrames());
+				});
+			} catch {
+				throw candidateErr;
+			}
 			throw new CapsuleReplayError(repeatedErr);
 		}
 		// The first failure did not reproduce: transient validator
@@ -959,7 +993,13 @@ export function restoreFromRecoveryCapsule(
 	// would silently overwrite another journal.
 	const validated = verifyInlineJournal(capsule, nodeSecret);
 	if (options.scratchStorage) {
-		assertReplaysOnScratch(validated.frames, options.scratchStorage);
+		// Every dry-run attempt decodes its OWN authenticated frame graph:
+		// the frames reach foreign adapter code, and a mutation during one
+		// attempt must not leak into the next.
+		assertReplaysOnScratch(
+			() => verifyInlineJournal(capsule, nodeSecret).frames,
+			options.scratchStorage
+		);
 	}
 	// The dry-run handed the decoded frames to FOREIGN code (the scratch
 	// backend); a hostile or buggy adapter mutating a Buffer argument must

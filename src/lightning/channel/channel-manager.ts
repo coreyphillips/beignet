@@ -111,8 +111,10 @@ import {
 	ChannelState,
 	ChannelRole,
 	HtlcDirection,
+	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	scidAliasAnnounceRefusal,
 	validateV2ChannelType,
 	MAX_FUNDING_SATOSHIS,
 	MAX_WUMBO_FUNDING_SATOSHIS
@@ -4043,6 +4045,12 @@ export class ChannelManager extends EventEmitter {
 			typeFlags.setCompulsory(Feature.SCID_ALIAS);
 			typeFlags.setCompulsory(Feature.ZERO_CONF);
 			channelType = typeFlags.toBuffer();
+		}
+		// BOLT 2: a channel whose type carries option_scid_alias MUST NOT
+		// be announced. Enforced on the RESOLVED type, so an explicit alias
+		// type from a caller is forced private exactly like a trusted open,
+		// instead of going out with the default announce flag.
+		if (hasScidAliasChannelType(channelType)) {
 			channelFlags = (channelFlags ?? 0x01) & ~0x01;
 		}
 		const typeRefusal = validateV2ChannelType(
@@ -4089,7 +4097,7 @@ export class ChannelManager extends EventEmitter {
 		// Override the caller's key material with the channel's own (mirrors the
 		// acceptor path in handleOpenChannel2). In the common case (no per-channel
 		// key deriver) these are already equal.
-		if (opts?.trusted) {
+		if (hasScidAliasChannelType(channelType)) {
 			state.announceChannel = false;
 		}
 
@@ -4173,6 +4181,26 @@ export class ChannelManager extends EventEmitter {
 		);
 		if (typeRefusal) {
 			const reason = `open_channel2 refused: ${typeRefusal}`;
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			);
+			this.emit('error', msg.channelId, reason);
+			return;
+		}
+		// BOLT 2: scid_alias types are never announceable; an opener
+		// pairing the alias type with the announce flag is refused with the
+		// same wire visibility.
+		const aliasAnnounce = scidAliasAnnounceRefusal(
+			msg.channelType ?? null,
+			(msg.channelFlags & 0x01) !== 0
+		);
+		if (aliasAnnounce) {
+			const reason = `open_channel2 refused: ${aliasAnnounce}`;
 			this.sendMessage(
 				peerPubkey,
 				MessageType.ERROR,

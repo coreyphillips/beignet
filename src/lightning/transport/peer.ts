@@ -794,8 +794,20 @@ export class Peer extends EventEmitter {
 						// FRESH lifecycle before failing: this drain has no
 						// authority left. Tearing down, clearing the queue or
 						// recording 'failed' now would destroy the new
-						// lifecycle over the old one's error; report the
-						// failure to the caller and touch nothing.
+						// lifecycle over the old one's error. The failure is
+						// still SURFACED as the contract promises (a 'failed'
+						// outcome with no error event is invisible to every
+						// observer that only listens): the error is emitted
+						// and contained, but nothing belonging to the new
+						// lifecycle is touched.
+						try {
+							this.emit(
+								'error',
+								err instanceof Error ? err : new Error(String(err))
+							);
+						} catch {
+							// A throwing error observer changes nothing here.
+						}
 						return 'failed';
 					}
 					// TERMINAL FIRST: tear the connection down before any

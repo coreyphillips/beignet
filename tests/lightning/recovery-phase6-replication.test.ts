@@ -46,7 +46,11 @@ import {
 	encodeGetHeadResponse,
 	encodePutStateResponse,
 	nodeGuardianTransport,
-	xOnlyFromSecret
+	receiptTranscriptHash,
+	signTranscript,
+	xOnlyFromSecret,
+	GUARDIAN_PROTOCOL_VERSION,
+	IGuardianReceipt
 } from '../../src/lightning/recovery';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
@@ -716,6 +720,127 @@ describe('Recovery phase 6: the watermark only rises', () => {
 			storage.getRecoveryMeta(REPLICATION_META_KEYS.replicatedThroughHash)
 		).to.equal(null);
 		expect(rep.replicatedThrough()).to.equal(0n);
+		storage.close();
+	});
+
+	it('a receipt for a FOREIGN history at a compacted head is never proof', () => {
+		// Guardians sign whatever state they hold; a receipt whose head
+		// lands on a frame we no longer retain used to skip the frame-hash
+		// binding entirely (the loaded map only holds frames above the
+		// watermark), so a validly signed receipt for a DIFFERENT history
+		// counted toward the quorum and raiseWatermark then laundered it by
+		// re-binding the height to OUR local hash. Every positive head must
+		// resolve against our own anchor before it counts.
+		let watermark = 0n;
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			deriveRecoveryMasterKey(NODE_SECRET),
+			NODE_ID,
+			ROOT.recoveryId,
+			{ snapshotIntervalFrames: 2, retainFrom: (): bigint => watermark + 1n }
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		for (let i = 0; i < 6; i++) {
+			expect(
+				manager.commit({
+					criticality: RecoveryCriticality.SafetyCritical,
+					mutations: [
+						{
+							type: 'payment_preimage',
+							paymentHash: Buffer.alloc(32, 40 + i).toString('hex'),
+							preimage: Buffer.alloc(32, 40 + i)
+						}
+					],
+					outboundMessages: []
+				}).committed
+			).to.equal(true);
+		}
+		const base = BigInt(
+			storage.getRecoveryMeta(JOURNAL_META_KEYS.lastSnapshotWritten)!
+		);
+		expect(base > 2n).to.equal(true);
+		const prunedHash = Buffer.from(
+			storage.loadRecoveryFrames(Number(base) - 2)[0].frameHash
+		);
+		watermark = base - 1n;
+		journal.compact();
+		expect(
+			BigInt(storage.loadRecoveryFrames()[0].sequence),
+			'the receipted frame was pruned beneath the base snapshot'
+		).to.equal(base);
+
+		const rep = offlineReplicator(storage);
+		const lease = {
+			epoch: 1n,
+			writerPublicKey: Buffer.alloc(32, 9),
+			writerSecret: Buffer.alloc(32, 10)
+		} as IWriterLeaseKeys;
+		const frames = storage.loadRecoveryFrames();
+		const map = new Map(frames.map((f) => [BigInt(f.sequence), f]));
+		const tip = BigInt(frames[frames.length - 1].sequence);
+		const makeReceipt = (
+			sequence: bigint,
+			frameHash: Buffer
+		): IGuardianReceipt => {
+			const state: GuardianState = {
+				recoveryId: Buffer.from(ROOT.recoveryId),
+				lease: { epoch: 1n, writerPublicKey: lease.writerPublicKey },
+				origin: { firstSequence: 1n, previousHash: Buffer.alloc(32) },
+				logHead: {
+					sequence,
+					frameHash,
+					ciphertextHash: Buffer.alloc(32),
+					recordEpoch: 1n
+				}
+			};
+			const issuedAt = 1n;
+			return {
+				protocolVersion: GUARDIAN_PROTOCOL_VERSION,
+				guardianSetId: Buffer.from(SET_ID),
+				guardianId: GUARDIAN_IDS[0],
+				state,
+				issuedAt,
+				signature: signTranscript(
+					receiptTranscriptHash(SET_ID, GUARDIAN_IDS[0], state, issuedAt),
+					GUARDIAN_SECRETS[0]
+				)
+			};
+		};
+		const proven = (
+			receipt: IGuardianReceipt
+		): { head: bigint; conflictAt: bigint | null } | null =>
+			(
+				rep as unknown as {
+					provenHead(
+						receipt: IGuardianReceipt,
+						lease: IWriterLeaseKeys,
+						map: Map<bigint, unknown>,
+						id: Buffer,
+						tip: bigint
+					): { head: bigint; conflictAt: bigint | null } | null;
+				}
+			).provenHead(receipt, lease, map, GUARDIAN_IDS[0], tip);
+
+		// A validly SIGNED receipt naming a foreign hash at the compacted
+		// head is not proof of our chain (fails on pre-round-18 code, which
+		// returned it as proven).
+		const foreign = proven(makeReceipt(base - 1n, Buffer.alloc(32, 0xcd)));
+		expect(
+			foreign == null || foreign.conflictAt != null,
+			'a foreign receipt never counts toward the quorum'
+		).to.equal(true);
+
+		// The SAME position with the hash of the frame we actually pruned
+		// resolves through the base snapshot anchor and IS proof.
+		const genuine = proven(makeReceipt(base - 1n, prunedHash));
+		expect(genuine?.head).to.equal(base - 1n);
+		expect(genuine?.conflictAt).to.equal(null);
+
+		// A head below the anchorable window resolves to nothing: not
+		// evidence, in either direction.
+		expect(proven(makeReceipt(1n, Buffer.alloc(32, 0xab)))).to.equal(null);
+		expect(proven(makeReceipt(1n, prunedHash))).to.equal(null);
 		storage.close();
 	});
 

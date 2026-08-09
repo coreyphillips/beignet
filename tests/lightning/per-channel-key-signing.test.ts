@@ -267,7 +267,9 @@ describe('Per-Channel Key Signing', () => {
 				secondPerCommitmentPoint: perCommitmentPointFromSecret(
 					generateFromSeed(makeSeed(150), MAX_INDEX - 1n)
 				),
-				channelFlags: 0x01
+				channelFlags: 0x01,
+				// BOLT 2 makes channel_type REQUIRED on open_channel2.
+				channelType: Buffer.from('1000', 'hex')
 			};
 
 			const prevIdx = mgr.nextChannelIndex;

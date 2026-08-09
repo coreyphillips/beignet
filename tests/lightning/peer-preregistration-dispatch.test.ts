@@ -1218,12 +1218,20 @@ describe('Peer held post-handshake delivery', function () {
 				throw new Error('old lifecycle handler failed');
 			}
 		});
-		peer.on('error', () => {});
+		const errors: Error[] = [];
+		peer.on('error', (err: Error) => errors.push(err));
 		feed(peer, MessageType.OPEN_CHANNEL2, Buffer.from([1]));
 		expect(
 			peer.releaseHeldMessages(),
 			'the old drain still reports its failure'
 		).to.equal('failed');
+		// The failure is SURFACED even though the stale drain touches
+		// nothing: a 'failed' outcome with zero error events is invisible
+		// to every observer that only listens.
+		expect(errors.length, 'the peer error was emitted').to.equal(1);
+		expect(String(errors[0].message)).to.contain(
+			'old lifecycle handler failed'
+		);
 
 		// The FRESH lifecycle is intact: its queue still holds (traffic is
 		// not delivered live), and its outcome was not poisoned to 'failed'.

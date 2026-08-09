@@ -1750,12 +1750,16 @@ describe('Recovery phase 3: round-17 probe coverage and transient discrimination
 	it('the probe replays cleanly and invokes EVERY replay-surface operation', () => {
 		const scratch = scratchStorage();
 		const called = new Set<string>();
+		const outboxDeletions: Array<number[] | undefined> = [];
 		const spy = new Proxy(scratch, {
 			get(target, prop, receiver): unknown {
 				const value = Reflect.get(target, prop, receiver);
 				if (typeof value !== 'function') return value;
 				return (...args: unknown[]): unknown => {
 					called.add(String(prop));
+					if (String(prop) === 'deleteOutboxMessages') {
+						outboxDeletions.push(args[1] as number[] | undefined);
+					}
 					return (value as (...a: unknown[]) => unknown).apply(target, args);
 				};
 			}
@@ -1766,6 +1770,16 @@ describe('Recovery phase 3: round-17 probe coverage and transient discrimination
 		for (const method of REPLAY_SURFACE) {
 			expect(called.has(method), `probe exercises ${method}`).to.equal(true);
 		}
+		// BOTH outbox deletion shapes ran: the filtered path (a message-type
+		// list) is a distinct storage path from the unfiltered sweep.
+		expect(
+			outboxDeletions.some((types) => Array.isArray(types)),
+			'the FILTERED outbox deletion ran'
+		).to.equal(true);
+		expect(
+			outboxDeletions.some((types) => types == null),
+			'the unfiltered outbox deletion ran'
+		).to.equal(true);
 		scratch.close();
 	});
 
@@ -2009,6 +2023,154 @@ describe('Recovery phase 3: round-17 probe coverage and transient discrimination
 			(target.listForwardingEvents?.() ?? []).length,
 			'the forwarding ledger survived the round trip'
 		).to.be.greaterThan(0);
+		target.close();
+		storage.close();
+	});
+});
+
+describe('Recovery phase 3: round-18 validator hardening', () => {
+	it('a scratch that MUTATES the frames and fails cannot poison the retry', () => {
+		// The first scratch instance corrupts a decoded object (foreign
+		// adapter code holds real references) and then fails. The retry
+		// must decode a FRESH authenticated frame graph: reusing the
+		// mutated one made the reproduction fail for the scratch's own
+		// reasons and downgraded a valid capsule to Tier 1.
+		const { storage, manager } = journaledStorage(1, 70);
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'invoice_state',
+						paymentHash: 'ef'.repeat(32),
+						invoice: {
+							paymentHash: 'ef'.repeat(32),
+							bolt11: 'lnbcrt1round18',
+							expiry: 3600,
+							createdAt: 0
+						}
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		let scratchInstances = 0;
+		const mutating = (): SqliteStorage => {
+			const scratch = scratchStorage();
+			scratchInstances++;
+			if (scratchInstances === 1) {
+				scratch.saveInvoice = (_hash, invoice): void => {
+					// Corrupt the DECODED object the replay handed us, then
+					// fail: a reused graph would now violate NOT NULL on the
+					// retry and read as a content defect.
+					(invoice as { paymentHash?: string }).paymentHash = undefined;
+					throw new Error('transient mutating hiccup');
+				};
+			}
+			return scratch;
+		};
+		const result = restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+			scratchStorage: mutating
+		});
+		expect(result.tier, 'restored at Tier 2 despite the mutation').to.equal(2);
+		expect(
+			target.loadAllInvoices().map((row) => row.paymentHashHex),
+			'the invoice restored from an UNMUTATED decode'
+		).to.include('ef'.repeat(32));
+		target.close();
+		storage.close();
+	});
+
+	it('a backend whose transaction COMMIT is broken propagates raw', () => {
+		// The rolled-back health probe never exercises successful commit
+		// completion, so a backend failing exactly at commit used to fail
+		// the candidate twice and read as a content defect. The deciding
+		// instance must also COMPLETE a probe commit before a reproduced
+		// candidate failure may be typed as content.
+		const { storage } = journaledStorage(2, 80);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const commitBroken = (): SqliteStorage => {
+			const scratch = scratchStorage();
+			const real = scratch.transaction.bind(scratch);
+			(scratch as unknown as Record<string, unknown>).transaction = (
+				fn: () => unknown
+			): unknown => {
+				const value = real(fn);
+				// The work succeeded; the COMMIT boundary is what fails.
+				throw new Error('scratch commit broken');
+				return value;
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+				scratchStorage: commitBroken
+			})
+		).to.throw(/scratch commit broken/);
+		expect(
+			target.loadRecoveryFrames!(),
+			'the target was never touched'
+		).to.have.length(0);
+		target.close();
+		storage.close();
+	});
+
+	it('a backend broken on FILTERED outbox deletion propagates raw', () => {
+		// deleteOutboxMessages with a message-type list reaches a different
+		// storage path than the unfiltered sweep; the probe must exercise
+		// both, or a backend broken on the filtered shape misclassifies a
+		// capsule whose deltas carry a filtered supersede.
+		const { storage, manager } = journaledStorage(1, 90);
+		expect(
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'outbox_supersede',
+						channelId: 'dc'.repeat(32),
+						messageTypes: [133]
+					}
+				],
+				outboundMessages: []
+			}).committed
+		).to.equal(true);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const broken = (): SqliteStorage => {
+			const scratch = scratchStorage();
+			const real = scratch.deleteOutboxMessages!.bind(scratch);
+			scratch.deleteOutboxMessages = (
+				channelId: string,
+				messageTypes?: number[]
+			): void => {
+				if (messageTypes != null) {
+					throw new Error('scratch filtered outbox deletion broken');
+				}
+				real(channelId, messageTypes);
+			};
+			return scratch;
+		};
+		expect(() =>
+			restoreBestRecoveryCapsule([blob], target, NODE_SECRET, {
+				scratchStorage: broken
+			})
+		).to.throw(/scratch filtered outbox deletion broken/);
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
 		target.close();
 		storage.close();
 	});

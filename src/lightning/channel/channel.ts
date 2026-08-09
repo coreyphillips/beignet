@@ -132,8 +132,10 @@ import {
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
 import {
+	hasScidAliasChannelType,
 	isAnchorChannel,
 	isTaprootChannel,
+	scidAliasAnnounceRefusal,
 	validateV2ChannelType
 } from './types';
 import { generateNonce } from '../crypto/musig';
@@ -9704,13 +9706,21 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
 		}
 
+		// BOLT 2 requires channel_type on open_channel2, so the default is
+		// resolved INTO the params before anything else: the wire message
+		// must carry it (CLN aborts a type-less open_channel2 outright).
+		if (!params.channelType) {
+			const defaultType = FeatureFlags.empty();
+			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			params = { ...params, channelType: defaultType.toBuffer() };
+		}
 		// Admission validation of the type this open would propose, BEFORE
 		// any state mutation: taproot v2 signing does not exist, so a
 		// taproot (or otherwise unrecognized) type must never leave this
 		// method as an OPEN_CHANNEL2. The manager additionally validates
 		// against both init vectors; a raw Channel has none, so the
-		// structural rules and the taproot refusal still hold here.
-		const v2TypeErr = validateV2ChannelType(params.channelType ?? null);
+		// presence, structural and taproot rules still hold here.
+		const v2TypeErr = validateV2ChannelType(params.channelType);
 		if (v2TypeErr) {
 			return [
 				{
@@ -9718,6 +9728,17 @@ export class Channel {
 					message: `Cannot initiate v2 open: ${v2TypeErr}`
 				}
 			];
+		}
+		// BOLT 2: a scid_alias type must never go out announceable. The
+		// trusted path upstream already forces this; enforcing it HERE
+		// covers every caller that hands an explicit alias type with the
+		// default (announce) channel flags.
+		if (hasScidAliasChannelType(params.channelType ?? null)) {
+			params = {
+				...params,
+				channelFlags: (params.channelFlags ?? 0x01) & ~0x01
+			};
+			this._state.announceChannel = false;
 		}
 
 		this._state.fundingVersion = 2;
@@ -9743,13 +9764,9 @@ export class Channel {
 				)
 			}
 		};
-		if (params.channelType) {
-			this._state.channelType = Buffer.from(params.channelType);
-		} else {
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
-		}
+		// The type was resolved and validated at admission above; it is
+		// always present here.
+		this._state.channelType = Buffer.from(params.channelType!);
 
 		// BOLT 2 v2: temporary_channel_id is derived from our revocation basepoint
 		// (peer's zeroed), not random — so a spec-compliant peer routes our
@@ -9821,15 +9838,31 @@ export class Channel {
 		// Admission validation of the PROPOSED type before any state
 		// mutation, echo or key adoption: a taproot or unrecognized type
 		// would otherwise be echoed in ACCEPT_CHANNEL2 and die at the
-		// commitment stage. The manager validates against both init
-		// vectors; a raw Channel has none, so the structural rules and the
-		// taproot refusal still hold here.
+		// commitment stage, and BOLT 2 makes the field REQUIRED on
+		// open_channel2, so an absent type is refused too. The manager
+		// validates against both init vectors; a raw Channel has none, so
+		// the presence, structural and taproot rules still hold here.
 		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
 		if (v2TypeErr) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
 					message: `open_channel2 refused: ${v2TypeErr}`
+				}
+			];
+		}
+		// BOLT 2: an opener proposing scid_alias with the announce flag set
+		// is asking for a pairing the spec forbids; refuse rather than
+		// silently flip its intent.
+		const aliasAnnounceErr = scidAliasAnnounceRefusal(
+			msg.channelType ?? null,
+			(msg.channelFlags & 0x01) !== 0
+		);
+		if (aliasAnnounceErr) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `open_channel2 refused: ${aliasAnnounceErr}`
 				}
 			];
 		}
@@ -9910,16 +9943,10 @@ export class Channel {
 			this._state.remoteBasepoints!.revocationBasepoint,
 			this._state.localBasepoints.revocationBasepoint
 		);
-		// Record the negotiated channel type (validated at admission above)
-		// so commitment #0 is built with the same anchor dispatch on both
-		// sides. Default per BOLT 2: static_remotekey.
-		if (msg.channelType) {
-			this._state.channelType = Buffer.from(msg.channelType);
-		} else {
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
-		}
+		// Record the negotiated channel type (validated at admission above,
+		// which also made its PRESENCE mandatory per BOLT 2) so commitment
+		// #0 is built with the same anchor dispatch on both sides.
+		this._state.channelType = Buffer.from(msg.channelType!);
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
 		// Dual funding v2: reconcile per-side balances from BOTH contributions.
@@ -10078,16 +10105,27 @@ export class Channel {
 
 		const result = session.handleAcceptChannel2(msg);
 		if (!result.ok) {
+			// The refusal must be WIRE-VISIBLE: a local error alone deletes
+			// our half while the accepter sits waiting for tx_add_input
+			// forever. The error is scoped to the id the peer used, so its
+			// side cancels the open too.
+			const reason = result.error || 'Failed to handle accept_channel2';
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to handle accept_channel2'
-				}
+				sendMsg(
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: msg.channelId,
+						data: Buffer.from(reason, 'ascii')
+					})
+				),
+				{ type: ChannelActionType.ERROR, message: reason }
 			];
 		}
 
 		// BOLT 2: when the channel type is option_zeroconf the accepter MUST set
-		// minimum_depth to zero. Surface a disagreement instead of ignoring it.
+		// minimum_depth to zero. Surface the disagreement to BOTH sides: this
+		// refusal ends the open, and a silent local exit would leave the
+		// accepter waiting on a channel we no longer track.
 		if (
 			this._state.channelType &&
 			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
@@ -10095,11 +10133,16 @@ export class Channel {
 			) &&
 			msg.minimumDepth !== 0
 		) {
+			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`
-				}
+				sendMsg(
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: msg.channelId,
+						data: Buffer.from(reason, 'ascii')
+					})
+				),
+				{ type: ChannelActionType.ERROR, message: reason }
 			];
 		}
 

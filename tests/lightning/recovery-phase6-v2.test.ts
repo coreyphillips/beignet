@@ -561,7 +561,9 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 			htlcBasepoint: peerSide.basepoints.htlcBasepoint,
 			firstPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
 			secondPerCommitmentPoint: peerSide.basepoints.firstPerCommitmentPoint,
-			channelFlags: 1
+			channelFlags: 1,
+			// BOLT 2 makes channel_type REQUIRED on open_channel2.
+			channelType: Buffer.from('1000', 'hex')
 		});
 		manager.handleMessage('02'.repeat(33), MessageType.OPEN_CHANNEL2, openMsg);
 		await settle(() => sent.includes(MessageType.ACCEPT_CHANNEL2), 1500);

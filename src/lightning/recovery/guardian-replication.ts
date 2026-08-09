@@ -795,8 +795,24 @@ export class GuardianReplicator {
 		// cannot even show, and the frame-hash check below cannot help,
 		// because a head we do not hold is not in the map to compare against.
 		if (head > tip) return null;
+		// A genesis head certifies nothing and binds to nothing.
+		if (head === 0n) return { head, conflictAt: null };
+		// EVERY positive head must bind to OUR history before it counts
+		// toward a quorum: the receipt's signed hash is compared against the
+		// frame this pass loaded, or, when the head sits below the loaded
+		// window or was legitimately compacted, against the same anchor the
+		// watermark trusts (the stored row, or the retained base snapshot's
+		// previousFrameHash). A head that resolves to NOTHING is not
+		// evidence; a head that resolves to a DIFFERENT hash is a receipt
+		// for a foreign history and must never raise our watermark, however
+		// valid its signature is. Without this, a compacted position let a
+		// foreign receipt through unchecked, and raiseWatermark would then
+		// launder it by re-binding the height to OUR local hash.
 		const ours = framesBySequence.get(head);
-		if (ours && !state.logHead.frameHash.equals(ours.frameHash)) {
+		const expected =
+			ours?.frameHash ?? resolveWatermarkAnchor(this.config.storage, head);
+		if (expected == null) return null;
+		if (!state.logHead.frameHash.equals(expected)) {
 			return { head: 0n, conflictAt: head };
 		}
 		return { head, conflictAt: null };
