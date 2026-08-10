@@ -2386,8 +2386,8 @@ export class LightningNode extends EventEmitter {
 	 * Persist a chain monitor on its own, for updates with no causally linked
 	 * channel action (block arrival, funding spend detection).
 	 */
-	private persistMonitorAlone(channelIdHex: string): boolean {
-		if (!this.recovery) return true;
+	private persistMonitorAlone(channelIdHex: string): void {
+		if (!this.recovery) return;
 		// Held back by a failed channel transition: retry as a COMBINED
 		// channel+monitor commit instead of refusing outright. On a closing
 		// channel this monitor update (the next block) may be the only event
@@ -2401,13 +2401,11 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.getChannel(channelId) &&
 				this.channelManager.getPeerForChannel(channelId)
 			) {
-				const request: IChannelPersistRequest = {
-					outbound: [],
-					committed: false,
-					outboxIds: []
-				};
-				this.persistChannel(channelId, request);
-				return request.committed;
+				// persistChannelState re-arms the monitor delta itself when that
+				// combined commit rolls back, so this branch needs no retry of
+				// its own.
+				this.persistChannel(channelId);
+				return;
 			}
 			// The channel is gone from the manager, so there is no channel
 			// state left to pair with; release the hold and let the monitor
@@ -2415,18 +2413,18 @@ export class LightningNode extends EventEmitter {
 			this.monitorsAwaitingChannel.delete(channelIdHex);
 		}
 		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
-		if (!mutation) return true;
+		if (!mutation) return;
 		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
 			mutations: [mutation],
 			outboundMessages: []
 		});
 		if (!result.committed) {
-			// The state never reached storage. Keep the monitor dirty so the next
-			// block, fee sample, or channel transition retries the exact mutation.
+			// The state never reached storage, and takeDirtyMonitorMutation already
+			// cleared the flag. Mark it dirty again so the next block, fee sample or
+			// channel transition writes this monitor instead of dropping the delta.
 			this.dirtyMonitors.add(channelIdHex);
 		}
-		return result.committed;
 	}
 
 	/**

@@ -1315,14 +1315,18 @@ export class ChainMonitor {
 		// watch before it disappears. Deduplicate a shared raw sweep if present.
 		const rawRebroadcasts = new Map<string, ITrackedOutput>();
 		for (const reorgedOutput of reorgedOutputs) {
+			// handleOutputSpent overwrote confirmationHeight with the SPEND's height.
+			// Now that the spend is gone, put the commitment's own height back: every
+			// timelock on this output (its CSV base, its contest height, the maturity
+			// of a claim rebuilt below) counts from the transaction that CREATED it.
+			if (
+				this._commitmentBroadcast?.txid === reorgedOutput.txid &&
+				this._commitmentBroadcast.blockHeight > 0
+			) {
+				reorgedOutput.confirmationHeight =
+					this._commitmentBroadcast.blockHeight;
+			}
 			if (reorgedOutput.sweepTxHex) {
-				if (
-					this._commitmentBroadcast?.txid === reorgedOutput.txid &&
-					this._commitmentBroadcast.blockHeight > 0
-				) {
-					reorgedOutput.confirmationHeight =
-						this._commitmentBroadcast.blockHeight;
-				}
 				let maturityHeight = reorgedOutput.maturityHeight;
 				if (maturityHeight === undefined) {
 					try {
