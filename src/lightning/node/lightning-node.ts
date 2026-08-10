@@ -223,8 +223,10 @@ import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
+	CommitmentType,
 	OutputStatus,
-	OutputType
+	OutputType,
+	ISweepUneconomicChainAction
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
 import { ElectrumBackend } from '../chain/electrum-backend';
@@ -317,6 +319,7 @@ bitcoin.initEccLib(ecc);
  * - 'peer:disconnect' (pubkey: string)
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
+ * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
  */
 
 /**
@@ -1882,11 +1885,29 @@ export class LightningNode extends EventEmitter {
 				);
 				this.channelManager.restoreMonitor(channelId, monitor);
 
-				// Reconcile: if the monitor already finished resolving every output
-				// of this close (possibly in a prior session where the resolved
-				// transition was never persisted), move the channel to CLOSED now so
-				// it doesn't report a stale pending-close balance forever.
+				// Older monitor state could mark a revoked close fully resolved
+				// before a snapshot-only penalty output was adopted. If that state
+				// also closed the channel, reopen the force-close lifecycle together
+				// with the repaired monitor. Cooperative closes are intentionally
+				// excluded because CLOSED is valid while their monitor reaches depth.
+				const restoredCommitment = monitor.getFullState().commitmentBroadcast;
 				if (
+					channelState.state === ChannelState.CLOSED &&
+					!monitor.isFullyResolved() &&
+					restoredCommitment?.commitmentType ===
+						CommitmentType.THEIR_REVOKED_COMMITMENT
+				) {
+					channelState.state = ChannelState.FORCE_CLOSED;
+					this.dirtyMonitors.add(channelId);
+					this.persistChannel(Buffer.from(channelId, 'hex'));
+					this.emitStructuredLog('channel', 'resolution_reopened', {
+						channelId
+					});
+					// Reconcile: if the monitor already finished resolving every output
+					// of this close (possibly in a prior session where the resolved
+					// transition was never persisted), move the channel to CLOSED now so
+					// it doesn't report a stale pending-close balance forever.
+				} else if (
 					monitor.isFullyResolved() &&
 					this.channelManager.markChannelResolved(Buffer.from(channelId, 'hex'))
 				) {
@@ -1922,14 +1943,12 @@ export class LightningNode extends EventEmitter {
 								satPerVbyteToSatPerKw(satPerVbyte),
 								MIN_FEERATE_PER_KW
 							);
-							for (const { channelId: monitorChannelId } of monitors) {
-								const m = this.channelManager.getMonitor(
-									Buffer.from(monitorChannelId, 'hex')
-								);
-								if (m && typeof m.updateFeeRate === 'function') {
-									m.updateFeeRate(feeratePerKw);
-								}
-							}
+							this.channelManager.updateMonitorFeeRates(
+								feeratePerKw,
+								monitors.map(
+									({ channelId: monitorChannelId }) => monitorChannelId
+								)
+							);
 						}
 						// Re-arm even on a <=0 sample.
 						rearmAllCommitmentCpfp();
@@ -3331,6 +3350,26 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
 			this.emit('broadcast:tx', tx);
 		});
+
+		// A claim declined because it cannot pay its own fee. Surfaced as a log and
+		// an event so an operator can see that funds were left on the table, and
+		// (at 'contested') that a competing spend path has opened while it stayed
+		// unclaimed. Retries continue in both cases.
+		this.channelManager.on(
+			'sweep:uneconomic',
+			(channelId: Buffer, action: ISweepUneconomicChainAction) => {
+				this.emitStructuredLog('chain', `sweep_${action.reason}`, {
+					channelId: channelId.toString('hex'),
+					txid: action.txid,
+					outputIndex: action.outputIndex,
+					outputType: action.outputType,
+					amountSats: action.amount.toString(),
+					feeRatePerVbyte: action.feeRatePerVbyte,
+					contestHeight: action.contestHeight
+				});
+				this.emit('sweep:uneconomic', channelId, action);
+			}
+		);
 	}
 
 	/**
@@ -13697,9 +13736,7 @@ export class LightningNode extends EventEmitter {
 				if (satPerVbyte > 0) {
 					this.feeAdvisor.recordSample(satPerVbyte);
 					// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
-					for (const monitor of this.channelManager.getMonitors().values()) {
-						monitor.updateFeeRate(satPerVbyte * 250);
-					}
+					this.channelManager.updateMonitorFeeRates(satPerVbyte * 250);
 				}
 			})
 			.catch(() => {

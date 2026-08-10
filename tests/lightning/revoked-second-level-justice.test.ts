@@ -34,6 +34,7 @@ import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import {
 	MonitorState,
 	ChainActionType,
+	CommitmentType,
 	OutputStatus,
 	OutputType
 } from '../../src/lightning/chain/types';
@@ -51,6 +52,12 @@ import {
 	calculateObscuredCommitmentNumber
 } from '../../src/lightning/script/commitment';
 import { buildReceivedHtlcScript } from '../../src/lightning/script/htlc';
+import { buildTaprootSecondLevelOutput } from '../../src/lightning/script/commitment-taproot';
+import {
+	NETWORK,
+	privAt,
+	revokedTaprootSetup
+} from './helpers/taproot-revoked-fixture';
 
 bitcoin.initEccLib(ecc);
 
@@ -343,6 +350,87 @@ describe('Revoked second-level HTLC justice (#8)', function () {
 			);
 			expect(resolved).to.have.length(0);
 		});
+
+		it('signals RBF and pays the incremental fee for taproot justice', function () {
+			const { state, aliceSeed, destScript } = revokedTaprootSetup();
+			const commitmentNumber = 1n;
+			const secret = state.shaChainStore.getSecret(
+				MAX_INDEX - commitmentNumber
+			)!;
+			const point = perCommitmentPointFromSecret(secret);
+			const secondLevelOutput = buildTaprootSecondLevelOutput(
+				deriveRevocationPubkey(
+					state.localBasepoints.revocationBasepoint,
+					point
+				),
+				derivePublicKey(state.remoteBasepoints!.delayedPaymentBasepoint, point),
+				state.localConfig.toSelfDelay,
+				NETWORK
+			);
+			const secondLevelTx = new bitcoin.Transaction();
+			secondLevelTx.version = 2;
+			secondLevelTx.addInput(crypto.randomBytes(32), 0);
+			secondLevelTx.addOutput(secondLevelOutput.output, 90_000);
+
+			const resolved = resolveRevokedSecondLevelOutput(
+				state,
+				secondLevelTx,
+				150,
+				commitmentNumber,
+				destScript,
+				1,
+				privAt(aliceSeed, 1),
+				NETWORK
+			);
+			expect(resolved).to.have.length(1);
+			const initial = resolved[0];
+			expect(initial.spendTx).to.exist;
+			expect(initial.spendTx!.ins[0].sequence).to.equal(0xfffffffd);
+
+			const tracked = {
+				...initial.trackedOutput,
+				status: OutputStatus.SPEND_BROADCAST as OutputStatus.SPEND_BROADCAST,
+				broadcastHeight: 150,
+				originalFeeRate: 1,
+				currentFeeRate: 1,
+				sweepTxHex: initial.spendTx!.toHex(),
+				secondLevelTxHex: secondLevelTx.toHex()
+			};
+			const monitor = ChainMonitor.restore(
+				{
+					monitorState: MonitorState.RESOLVING,
+					commitmentBroadcast: {
+						commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+						txid: crypto.randomBytes(32).toString('hex'),
+						blockHeight: 150,
+						commitmentNumber,
+						trackedOutputs: [tracked]
+					},
+					trackedOutputs: [tracked],
+					currentBlockHeight: 150
+				},
+				state,
+				destScript,
+				1,
+				privAt(aliceSeed, 1),
+				privAt(aliceSeed, 2),
+				NETWORK
+			);
+			const rebuilt = monitor.rebuildSweep(tracked, 1.5);
+			expect(rebuilt).to.not.be.null;
+			const oldFee =
+				90_000 -
+				initial.spendTx!.outs.reduce((sum, output) => sum + output.value, 0);
+			const replacementFee =
+				90_000 - rebuilt!.outs.reduce((sum, output) => sum + output.value, 0);
+			expect(replacementFee).to.be.at.least(oldFee + rebuilt!.virtualSize());
+			expect(tracked.currentFeeRate).to.be.greaterThan(1.5);
+			expect(rebuilt!.ins[0].sequence).to.equal(0xfffffffd);
+			expect(
+				Buffer.from(rebuilt!.ins[0].hash).reverse().toString('hex')
+			).to.equal(secondLevelTx.getId());
+			expect(rebuilt!.ins[0].index).to.equal(0);
+		});
 	});
 
 	describe('ChainMonitor.handleOutputSpent', function () {
@@ -492,6 +580,7 @@ describe('Revoked second-level HTLC justice (#8)', function () {
 				Buffer.from(claimTx.ins[0].hash).reverse().toString('hex')
 			).to.equal(secondLevelTx.getId());
 			expect(claimTx.ins[0].index).to.equal(0);
+			expect(claimTx.ins[0].sequence).to.equal(0xfffffffd);
 			// Revocation-branch witness: [sig, OP_TRUE flag, witnessScript].
 			expect(claimTx.ins[0].witness).to.have.length(3);
 			expect(claimTx.ins[0].witness[1].equals(Buffer.from([0x01]))).to.be.true;
@@ -510,6 +599,100 @@ describe('Revoked second-level HTLC justice (#8)', function () {
 			expect(tracked).to.exist;
 			expect(tracked!.status).to.equal(OutputStatus.SPEND_BROADCAST);
 			expect(tracked!.sweepTxHex).to.exist;
+
+			const rebuilt = monitor.rebuildSweep(tracked!, 25);
+			expect(rebuilt).to.not.be.null;
+			expect(rebuilt!.ins[0].sequence).to.equal(0xfffffffd);
+			expect(
+				Buffer.from(rebuilt!.ins[0].hash).reverse().toString('hex')
+			).to.equal(secondLevelTx.getId());
+			expect(rebuilt!.ins[0].index).to.equal(0);
+		});
+
+		it('keeps second-level reorg indices out of commitment claims', function () {
+			const { monitor, revokedTx, htlcIndex, secondLevelScript, preimage } =
+				setupRevokedBreach();
+			const secondLevelTx = new bitcoin.Transaction();
+			secondLevelTx.version = 2;
+			secondLevelTx.addInput(
+				Buffer.from(revokedTx.getId(), 'hex').reverse(),
+				htlcIndex,
+				0
+			);
+			secondLevelTx.ins[0].witness = [
+				Buffer.alloc(0),
+				crypto.randomBytes(72),
+				crypto.randomBytes(72),
+				preimage,
+				crypto.randomBytes(80)
+			];
+			secondLevelTx.addOutput(
+				bitcoin.payments.p2wsh({ redeem: { output: secondLevelScript } })
+					.output!,
+				95_000
+			);
+			monitor.handleOutputSpent(
+				revokedTx.getId(),
+				htlcIndex,
+				secondLevelTx,
+				105
+			);
+			const justiceOutput = monitor
+				.getTrackedOutputs()
+				.find((output) => output.txid === secondLevelTx.getId())!;
+			const justiceTx = bitcoin.Transaction.fromHex(justiceOutput.sweepTxHex!);
+			monitor.handleOutputSpent(
+				secondLevelTx.getId(),
+				justiceOutput.outputIndex,
+				justiceTx,
+				106
+			);
+
+			// Leave revoked commitment output 0 unclaimed so the second-level output's
+			// colliding index would suppress a real penalty if namespaces were mixed.
+			const commitmentOutput = monitor
+				.getTrackedOutputs()
+				.find(
+					(output) =>
+						output.txid === revokedTx.getId() && output.outputIndex === 0
+				)!;
+			commitmentOutput.status = OutputStatus.CONFIRMED;
+			commitmentOutput.sweepTxHex = undefined;
+			commitmentOutput.broadcastHeight = undefined;
+			commitmentOutput.originalFeeRate = undefined;
+			commitmentOutput.currentFeeRate = undefined;
+			commitmentOutput.resolutionTxid = undefined;
+			const fullState = monitor.getFullState();
+			fullState.commitmentBroadcast!.claimedOutputIndices = [htlcIndex];
+
+			const recovery = monitor.handleSpendUnconfirmed(
+				secondLevelTx.getId(),
+				justiceOutput.outputIndex
+			);
+			expect(
+				recovery.some((action) => action.type === ChainActionType.BROADCAST_TX)
+			).to.equal(true);
+			expect(
+				monitor.getFullState().commitmentBroadcast?.claimedOutputIndices
+			).to.deep.equal([htlcIndex]);
+
+			const retried = monitor.updateFeeRate(250);
+			const penalty = retried
+				.filter((action) => action.type === ChainActionType.BROADCAST_TX)
+				.map((action) =>
+					action.type === ChainActionType.BROADCAST_TX
+						? bitcoin.Transaction.fromBuffer(action.tx)
+						: null
+				)
+				.find(
+					(tx) =>
+						tx?.ins.some(
+							(input) =>
+								Buffer.from(input.hash).reverse().toString('hex') ===
+									revokedTx.getId() && input.index === 0
+						)
+				);
+			expect(penalty, 'commitment output 0 remains retryable').to.exist;
 		});
 
 		it('does not build a claim when our own penalty spends the HTLC output', function () {

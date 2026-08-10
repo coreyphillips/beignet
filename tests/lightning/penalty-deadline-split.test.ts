@@ -15,41 +15,9 @@ import { expect } from 'chai';
 import crypto from 'crypto';
 import * as bitcoin from 'bitcoinjs-lib';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { getPublicKey } from '../../src/lightning/crypto/ecdh';
-import {
-	createOpenerState,
-	createAcceptorState
-} from '../../src/lightning/channel/channel-state';
-import {
-	ChannelState,
-	DEFAULT_CHANNEL_CONFIG,
-	ChannelRole,
-	HtlcDirection
-} from '../../src/lightning/channel/types';
-import { Channel } from '../../src/lightning/channel/channel';
-import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
-import { MessageType } from '../../src/lightning/message/types';
-import {
-	decodeOpenChannelMessage,
-	decodeAcceptChannelMessage
-} from '../../src/lightning/message/channel-open';
-import {
-	decodeFundingCreatedMessage,
-	decodeFundingSignedMessage,
-	decodeChannelReadyMessage
-} from '../../src/lightning/message/channel-funding';
-import {
-	decodeCommitmentSignedMessage,
-	decodeRevokeAndAckMessage
-} from '../../src/lightning/message/channel-commitment';
+import { HtlcDirection } from '../../src/lightning/channel/types';
 import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
-import {
-	ChainActionType,
-	OutputStatus,
-	OutputType,
-	ITrackedOutput
-} from '../../src/lightning/chain/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import { ChainActionType, OutputType } from '../../src/lightning/chain/types';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
 	perCommitmentPointFromSecret,
@@ -57,309 +25,15 @@ import {
 	derivePublicKey
 } from '../../src/lightning/keys/derivation';
 import {
-	buildToLocalScript,
-	calculateObscuredCommitmentNumber
-} from '../../src/lightning/script/commitment';
-import { buildReceivedHtlcScript } from '../../src/lightning/script/htlc';
-import {
-	resolveRevokedCommitmentOutputs,
-	PENALTY_SPLIT_DEADLINE_BLOCKS
-} from '../../src/lightning/chain/output-resolver';
+	buildOfferedHtlcScript,
+	buildReceivedHtlcScript
+} from '../../src/lightning/script/htlc';
+import { resolveRevokedCommitmentOutputs } from '../../src/lightning/chain/output-resolver';
+import { setupRevokedWithHtlcs } from './helpers/revoked-commitment-fixture';
 
 bitcoin.initEccLib(ecc);
 
 const network = bitcoin.networks.regtest;
-
-function makeBasepoints(seed: Buffer): {
-	basepoints: IChannelBasepoints;
-	privkeys: Buffer[];
-} {
-	const privkeys: Buffer[] = [];
-	for (let i = 0; i < 5; i++) {
-		const privkey = crypto
-			.createHash('sha256')
-			.update(seed)
-			.update(Buffer.from([i]))
-			.digest();
-		privkeys.push(privkey);
-	}
-	return {
-		basepoints: {
-			fundingPubkey: getPublicKey(privkeys[0]),
-			revocationBasepoint: getPublicKey(privkeys[1]),
-			paymentBasepoint: getPublicKey(privkeys[2]),
-			delayedPaymentBasepoint: getPublicKey(privkeys[3]),
-			htlcBasepoint: getPublicKey(privkeys[4]),
-			firstPerCommitmentPoint: Buffer.alloc(33)
-		},
-		privkeys
-	};
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function findSendAction(actions: any[], msgType: MessageType): any {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	return actions.find(
-		(a: any) =>
-			a.type === ChannelActionType.SEND_MESSAGE && a.messageType === msgType
-	);
-}
-
-function setupNormalChannels(): {
-	opener: Channel;
-	acceptor: Channel;
-	openerPrivkeys: Buffer[];
-} {
-	const openerSeed = Buffer.alloc(32, 0x51);
-	const acceptorSeed = Buffer.alloc(32, 0x52);
-	const openerCommitmentSeed = crypto
-		.createHash('sha256')
-		.update(Buffer.from('penalty-split-opener'))
-		.digest();
-	const acceptorCommitmentSeed = crypto
-		.createHash('sha256')
-		.update(Buffer.from('penalty-split-acceptor'))
-		.digest();
-
-	const { basepoints: openerBasepoints, privkeys: openerPrivkeys } =
-		makeBasepoints(openerSeed);
-	const { basepoints: acceptorBasepoints } = makeBasepoints(acceptorSeed);
-
-	const openerState = createOpenerState({
-		temporaryChannelId: Buffer.alloc(32, 0xdd),
-		fundingSatoshis: 1_000_000n,
-		pushMsat: 200_000_000n,
-		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-		localBasepoints: openerBasepoints,
-		localPerCommitmentSeed: openerCommitmentSeed
-	});
-	const opener = new Channel(openerState);
-
-	const acceptorState = createAcceptorState({
-		temporaryChannelId: Buffer.alloc(32, 0xdd),
-		fundingSatoshis: 0n,
-		pushMsat: 0n,
-		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-		localBasepoints: acceptorBasepoints,
-		localPerCommitmentSeed: acceptorCommitmentSeed,
-		remoteBasepoints: openerBasepoints,
-		remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
-	});
-	const acceptor = new Channel(acceptorState);
-
-	const openActions = opener.initiateOpen();
-	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
-	const acceptActions = acceptor.handleOpenChannel(
-		decodeOpenChannelMessage(openMsg.payload)
-	);
-	const acceptMsg = findSendAction(acceptActions, MessageType.ACCEPT_CHANNEL);
-	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
-
-	const fundingTxid = crypto.randomBytes(32);
-	const fcActions = opener.createFundingCreated(
-		fundingTxid,
-		0,
-		crypto.randomBytes(64)
-	);
-	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
-	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
-	);
-	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
-	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
-
-	const openerReadyActions = opener.fundingConfirmed();
-	const openerReadyMsg = findSendAction(
-		openerReadyActions,
-		MessageType.CHANNEL_READY
-	);
-	acceptor.handleChannelReady(
-		decodeChannelReadyMessage(openerReadyMsg.payload)
-	);
-	const acceptorReadyActions = acceptor.fundingConfirmed();
-	const acceptorReadyMsg = findSendAction(
-		acceptorReadyActions,
-		MessageType.CHANNEL_READY
-	);
-	opener.handleChannelReady(
-		decodeChannelReadyMessage(acceptorReadyMsg.payload)
-	);
-
-	expect(opener.getState()).to.equal(ChannelState.NORMAL);
-	expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
-
-	return { opener, acceptor, openerPrivkeys };
-}
-
-function exchangeCommitments(opener: Channel, acceptor: Channel): void {
-	const commitActions1 = opener.signCommitment(crypto.randomBytes(64), []);
-	const commitMsg1 = findSendAction(
-		commitActions1,
-		MessageType.COMMITMENT_SIGNED
-	);
-	const raaActions1 = acceptor.handleCommitmentSigned(
-		decodeCommitmentSignedMessage(commitMsg1.payload)
-	);
-	const raaMsg1 = findSendAction(raaActions1, MessageType.REVOKE_AND_ACK);
-	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg1.payload));
-
-	const commitActions2 = acceptor.signCommitment(crypto.randomBytes(64), []);
-	const commitMsg2 = findSendAction(
-		commitActions2,
-		MessageType.COMMITMENT_SIGNED
-	);
-	const raaActions2 = opener.handleCommitmentSigned(
-		decodeCommitmentSignedMessage(commitMsg2.payload)
-	);
-	const raaMsg2 = findSendAction(raaActions2, MessageType.REVOKE_AND_ACK);
-	acceptor.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg2.payload));
-}
-
-interface IRevokedSetup {
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
-	state: any;
-	revokedTx: bitcoin.Transaction;
-	trackedOutputs: ITrackedOutput[];
-	openerPrivkeys: Buffer[];
-	destScript: Buffer;
-	nearCltv: number;
-	farCltv: number;
-}
-
-/**
- * Revoked commitment #0 with three penalty outputs:
- *   0: to_local
- *   1: HTLC with a NEAR cltv_expiry (within the split margin of `height`)
- *   2: HTLC with a FAR cltv_expiry
- */
-function setupRevokedWithHtlcs(height: number): IRevokedSetup {
-	const { opener, acceptor, openerPrivkeys } = setupNormalChannels();
-	exchangeCommitments(opener, acceptor);
-	const state = opener.getFullState();
-
-	const secret = state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
-	const revokedPoint = perCommitmentPointFromSecret(secret);
-	const revocationPubkey = deriveRevocationPubkey(
-		state.localBasepoints.revocationBasepoint,
-		revokedPoint
-	);
-	const theirDelayedPubkey = derivePublicKey(
-		state.remoteBasepoints!.delayedPaymentBasepoint,
-		revokedPoint
-	);
-	const theirHtlc = derivePublicKey(
-		state.remoteBasepoints!.htlcBasepoint,
-		revokedPoint
-	);
-	const ourHtlc = derivePublicKey(
-		state.localBasepoints.htlcBasepoint,
-		revokedPoint
-	);
-
-	const isOpener = state.role === ChannelRole.OPENER;
-	const openPBP = isOpener
-		? state.localBasepoints.paymentBasepoint
-		: state.remoteBasepoints!.paymentBasepoint;
-	const acceptPBP = isOpener
-		? state.remoteBasepoints!.paymentBasepoint
-		: state.localBasepoints.paymentBasepoint;
-	const obscured = calculateObscuredCommitmentNumber(openPBP, acceptPBP, 0n);
-
-	const revokedTx = new bitcoin.Transaction();
-	revokedTx.version = 2;
-	revokedTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
-	const seq = (0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0;
-	revokedTx.addInput(
-		Buffer.from(state.fundingTxid!.toString('hex'), 'hex').reverse(),
-		state.fundingOutputIndex,
-		seq
-	);
-
-	const toLocalScript = buildToLocalScript(
-		revocationPubkey,
-		theirDelayedPubkey,
-		state.localConfig.toSelfDelay
-	);
-	revokedTx.addOutput(
-		bitcoin.payments.p2wsh({ redeem: { output: toLocalScript } }).output!,
-		600_000
-	);
-
-	// One HTLC just inside the split margin, one far outside it.
-	const nearCltv = height + PENALTY_SPLIT_DEADLINE_BLOCKS - 2;
-	const farCltv = height + PENALTY_SPLIT_DEADLINE_BLOCKS + 500;
-	const nearScript = buildReceivedHtlcScript(
-		revocationPubkey,
-		theirHtlc,
-		ourHtlc,
-		crypto.randomBytes(32),
-		nearCltv,
-		false
-	);
-	const farScript = buildReceivedHtlcScript(
-		revocationPubkey,
-		theirHtlc,
-		ourHtlc,
-		crypto.randomBytes(32),
-		farCltv,
-		false
-	);
-	revokedTx.addOutput(
-		bitcoin.payments.p2wsh({ redeem: { output: nearScript } }).output!,
-		120_000
-	);
-	revokedTx.addOutput(
-		bitcoin.payments.p2wsh({ redeem: { output: farScript } }).output!,
-		130_000
-	);
-
-	const base = {
-		txid: revokedTx.getId(),
-		status: OutputStatus.CONFIRMED as OutputStatus.CONFIRMED,
-		confirmationHeight: height
-	};
-	const trackedOutputs: ITrackedOutput[] = [
-		{
-			...base,
-			outputIndex: 0,
-			amount: 600_000n,
-			outputType: OutputType.TO_LOCAL,
-			witnessScript: toLocalScript
-		},
-		{
-			...base,
-			outputIndex: 1,
-			amount: 120_000n,
-			outputType: OutputType.RECEIVED_HTLC,
-			witnessScript: nearScript,
-			cltvExpiry: nearCltv
-		},
-		{
-			...base,
-			outputIndex: 2,
-			amount: 130_000n,
-			outputType: OutputType.RECEIVED_HTLC,
-			witnessScript: farScript,
-			cltvExpiry: farCltv
-		}
-	];
-
-	const destScript = Buffer.concat([
-		Buffer.from([0x00, 0x14]),
-		crypto.randomBytes(20)
-	]);
-
-	return {
-		state,
-		revokedTx,
-		trackedOutputs,
-		openerPrivkeys,
-		destScript,
-		nearCltv,
-		farCltv
-	};
-}
 
 describe('Per-output penalty fallback near expiry', function () {
 	const HEIGHT = 750_000;
@@ -454,8 +128,8 @@ describe('Per-output penalty fallback near expiry', function () {
 		const s = setupRevokedWithHtlcs(HEIGHT);
 
 		// Move the near HTLC out of live tracking and into the revoked snapshot
-		// (settled since the revoked commitment; direction OFFERED from our
-		// perspective maps to the received-HTLC script on their commitment).
+		// (settled since the revoked commitment; direction RECEIVED from our
+		// perspective maps to the offered-HTLC script on their commitment).
 		const remaining = [s.trackedOutputs[0], s.trackedOutputs[2]];
 		s.state.revokedHtlcSnapshots = new Map([
 			[
@@ -465,7 +139,7 @@ describe('Per-output penalty fallback near expiry', function () {
 						paymentHash: crypto.randomBytes(32),
 						amountMsat: 120_000_000n,
 						cltvExpiry: s.nearCltv,
-						direction: HtlcDirection.OFFERED
+						direction: HtlcDirection.RECEIVED
 					}
 				]
 			]
@@ -474,7 +148,7 @@ describe('Per-output penalty fallback near expiry', function () {
 		const secret = s.state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
 		const revokedPoint = perCommitmentPointFromSecret(secret);
 		const snapshotEntry = s.state.revokedHtlcSnapshots.get('0')![0];
-		const script = buildReceivedHtlcScript(
+		const script = buildOfferedHtlcScript(
 			deriveRevocationPubkey(
 				s.state.localBasepoints.revocationBasepoint,
 				revokedPoint
@@ -482,7 +156,6 @@ describe('Per-output penalty fallback near expiry', function () {
 			derivePublicKey(s.state.remoteBasepoints!.htlcBasepoint, revokedPoint),
 			derivePublicKey(s.state.localBasepoints.htlcBasepoint, revokedPoint),
 			snapshotEntry.paymentHash,
-			s.nearCltv,
 			false
 		);
 		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
@@ -511,6 +184,66 @@ describe('Per-output penalty fallback near expiry', function () {
 		const others = resolved.filter((r) => r.trackedOutput.outputIndex !== 1);
 		expect(others[0].spendTx).to.equal(others[1].spendTx);
 		expect(others[0].spendTx!.getId()).to.not.equal(near.spendTx!.getId());
+	});
+
+	it('does not assign a CLTV deadline to an HTLC we offered', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const paymentHash = crypto.randomBytes(32);
+		const secret = s.state.shaChainStore.getSecret(MAX_INDEX)!;
+		const revokedPoint = perCommitmentPointFromSecret(secret);
+		const script = buildReceivedHtlcScript(
+			deriveRevocationPubkey(
+				s.state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			),
+			derivePublicKey(s.state.remoteBasepoints!.htlcBasepoint, revokedPoint),
+			derivePublicKey(s.state.localBasepoints.htlcBasepoint, revokedPoint),
+			paymentHash,
+			HEIGHT + 1,
+			false
+		);
+		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
+			redeem: { output: script }
+		}).output!;
+		s.revokedTx.outs[1].value = 500;
+		s.trackedOutputs[0].txid = s.revokedTx.getId();
+		s.state.revokedHtlcSnapshots = new Map([
+			[
+				'0',
+				[
+					{
+						paymentHash,
+						amountMsat: 500_000n,
+						cltvExpiry: HEIGHT + 1,
+						direction: HtlcDirection.OFFERED
+					}
+				]
+			]
+		]);
+
+		const resolved = resolveRevokedCommitmentOutputs(
+			s.state,
+			[s.trackedOutputs[0]],
+			0n,
+			s.revokedTx,
+			s.destScript,
+			50,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network,
+			HEIGHT + 100
+		);
+		const toLocal = resolved.find(
+			(entry) => entry.trackedOutput.outputIndex === 0
+		)!;
+		const offered = resolved.find(
+			(entry) => entry.trackedOutput.outputIndex === 1
+		)!;
+		expect(offered.trackedOutput.outputType).to.equal(OutputType.OFFERED_HTLC);
+		expect(offered.spendTx).to.equal(toLocal.spendTx);
+		expect(
+			offered.spendTx!.ins.map((input) => input.index).sort((a, b) => a - b)
+		).to.deep.equal([0, 1]);
 	});
 
 	it('monitor broadcasts each distinct penalty tx exactly once (dedupe + split)', function () {
@@ -543,37 +276,35 @@ describe('Per-output penalty fallback near expiry', function () {
 						paymentHash: nearHash,
 						amountMsat: 120_000_000n,
 						cltvExpiry: s.nearCltv,
-						direction: HtlcDirection.OFFERED
+						direction: HtlcDirection.RECEIVED
 					},
 					{
 						paymentHash: farHash,
 						amountMsat: 130_000_000n,
 						cltvExpiry: s.farCltv,
-						direction: HtlcDirection.OFFERED
+						direction: HtlcDirection.RECEIVED
 					}
 				]
 			]
 		]);
 		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
 			redeem: {
-				output: buildReceivedHtlcScript(
+				output: buildOfferedHtlcScript(
 					revocationPubkey,
 					theirHtlc,
 					ourHtlc,
 					nearHash,
-					s.nearCltv,
 					false
 				)
 			}
 		}).output!;
 		s.revokedTx.outs[2].script = bitcoin.payments.p2wsh({
 			redeem: {
-				output: buildReceivedHtlcScript(
+				output: buildOfferedHtlcScript(
 					revocationPubkey,
 					theirHtlc,
 					ourHtlc,
 					farHash,
-					s.farCltv,
 					false
 				)
 			}
@@ -646,8 +377,10 @@ describe('Penalty batch affordability (witness-v0)', function () {
 		).to.exist;
 		expect(byIndex.get(0)!.spendTx, 'and carries a real spend').to.exist;
 		expect(byIndex.get(2), 'the far HTLC is still batched with it').to.exist;
+		// Reported as declined (tracked, no spend) rather than dropped silently, so
+		// the caller can retry it once fees fall.
 		expect(
-			byIndex.get(1),
+			byIndex.get(1)?.spendTx,
 			'the starved HTLC produced no penalty of its own'
 		).to.equal(undefined);
 	});

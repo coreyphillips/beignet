@@ -43,8 +43,11 @@ import { buildClosingTx } from '../../src/lightning/chain/closing';
 import {
 	MonitorState,
 	ChainActionType,
-	OutputType
+	OutputStatus,
+	OutputType,
+	ITrackedOutput
 } from '../../src/lightning/chain/types';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
 	perCommitmentPointFromSecret,
@@ -377,6 +380,230 @@ describe('Chain Integration (Phase 4D)', function () {
 			const result = manager.forceClose(channelId, destScript, 10, network);
 			expect(result.ok).to.be.true;
 			expect(persisted).to.include(channelId.toString('hex'));
+		});
+
+		it('persists a CSV-held sweep created by a fee update', function () {
+			const { opener, openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
+				setupNormalChannels();
+			const config: IChannelManagerConfig = {
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			const channelIdHex = opener.getChannelId()!.toString('hex');
+			const output: ITrackedOutput = {
+				txid: '11'.repeat(32),
+				outputIndex: 0,
+				amount: 2_000n,
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				updateFeeRate: (): [] => {
+					// A real CSV-held retry stores these fields but emits no action until
+					// the maturity block.
+					output.sweepTxHex = '00';
+					output.maturityHeight = 101;
+					return [];
+				}
+			} as unknown as ChainMonitor;
+			manager.restoreMonitor(channelIdHex, monitor);
+
+			const persisted: string[] = [];
+			manager.on('monitor:updated', (id: string) => persisted.push(id));
+			manager.updateMonitorFeeRates(250, [channelIdHex]);
+
+			expect(persisted).to.deep.equal([channelIdHex]);
+		});
+	});
+
+	describe('Chain monitor persistence ordering', function () {
+		function managerWithMonitor(
+			channelIdHex: string,
+			monitor: ChainMonitor
+		): ChannelManager {
+			const { openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
+				setupNormalChannels();
+			const manager = new ChannelManager({
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			});
+			manager.restoreMonitor(channelIdHex, monitor);
+			return manager;
+		}
+
+		it('persists an output-spent transition before routing its actions', function () {
+			const channelIdHex = '31'.repeat(32);
+			const output: ITrackedOutput = {
+				txid: '41'.repeat(32),
+				outputIndex: 0,
+				amount: 10_000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.SPEND_BROADCAST,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				handleOutputSpent: () => {
+					output.status = OutputStatus.SPEND_CONFIRMED;
+					return [
+						{
+							type: ChainActionType.BROADCAST_TX,
+							tx: Buffer.from([1]),
+							description: 'replacement sweep'
+						}
+					];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const order: string[] = [];
+			manager.on('monitor:updated', (id: string) => {
+				order.push(`persist:${id}:${output.status}`);
+			});
+			manager.on('broadcast:tx', () => order.push('broadcast'));
+
+			manager.handleOutputSpent(
+				output.txid,
+				output.outputIndex,
+				new bitcoin.Transaction(),
+				101
+			);
+
+			const persisted = `persist:${channelIdHex}:${OutputStatus.SPEND_CONFIRMED}`;
+			expect(order).to.include(persisted);
+			expect(order.indexOf(persisted)).to.be.lessThan(
+				order.indexOf('broadcast')
+			);
+		});
+
+		it('persists an actionless output-spent transition', function () {
+			const channelIdHex = '32'.repeat(32);
+			const output: ITrackedOutput = {
+				txid: '42'.repeat(32),
+				outputIndex: 0,
+				amount: 10_000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.SPEND_BROADCAST,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				handleOutputSpent: () => {
+					output.status = OutputStatus.SPEND_CONFIRMED;
+					return [];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const persisted: OutputStatus[] = [];
+			manager.on('monitor:updated', () => persisted.push(output.status));
+
+			manager.handleOutputSpent(
+				output.txid,
+				output.outputIndex,
+				new bitcoin.Transaction(),
+				101
+			);
+
+			expect(persisted).to.include(OutputStatus.SPEND_CONFIRMED);
+		});
+
+		it('persists an output-unspent transition before routing its actions', function () {
+			const channelIdHex = '33'.repeat(32);
+			const output: ITrackedOutput = {
+				txid: '43'.repeat(32),
+				outputIndex: 0,
+				amount: 10_000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.SPEND_CONFIRMED,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				handleSpendUnconfirmed: () => {
+					output.status = OutputStatus.SPEND_BROADCAST;
+					return [
+						{
+							type: ChainActionType.BROADCAST_TX,
+							tx: Buffer.from([2]),
+							description: 'reorg recovery sweep'
+						}
+					];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const order: string[] = [];
+			manager.on('monitor:updated', (id: string) => {
+				order.push(`persist:${id}:${output.status}`);
+			});
+			manager.on('broadcast:tx', () => order.push('broadcast'));
+
+			manager.handleOutputUnspent(output.txid, output.outputIndex);
+
+			const persisted = `persist:${channelIdHex}:${OutputStatus.SPEND_BROADCAST}`;
+			expect(order).to.include(persisted);
+			expect(order.indexOf(persisted)).to.be.lessThan(
+				order.indexOf('broadcast')
+			);
+		});
+
+		it('persists an actionless output-unspent transition', function () {
+			const channelIdHex = '34'.repeat(32);
+			const output: ITrackedOutput = {
+				txid: '44'.repeat(32),
+				outputIndex: 0,
+				amount: 10_000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.SPEND_CONFIRMED,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				handleSpendUnconfirmed: () => {
+					output.status = OutputStatus.CONFIRMED;
+					return [];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const persisted: OutputStatus[] = [];
+			manager.on('monitor:updated', () => persisted.push(output.status));
+
+			manager.handleOutputUnspent(output.txid, output.outputIndex);
+
+			expect(persisted).to.include(OutputStatus.CONFIRMED);
+		});
+
+		it('persists a terminal block transition before channel resolution', function () {
+			const channelIdHex = '35'.repeat(32);
+			const channelId = Buffer.from(channelIdHex, 'hex');
+			let state = MonitorState.RESOLVING;
+			const monitor = {
+				isFullyResolved: (): boolean => state === MonitorState.FULLY_RESOLVED,
+				handleNewBlock: () => {
+					state = MonitorState.FULLY_RESOLVED;
+					return [
+						{
+							type: ChainActionType.CHANNEL_FULLY_RESOLVED,
+							channelId
+						}
+					];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const order: string[] = [];
+			manager.on('monitor:updated', () => order.push(`persist:${state}`));
+			manager.on('channel:resolved', () => order.push('resolved'));
+
+			manager.handleNewBlock(200);
+
+			const persisted = `persist:${MonitorState.FULLY_RESOLVED}`;
+			expect(order).to.include(persisted);
+			expect(order.indexOf(persisted)).to.be.lessThan(
+				order.indexOf('resolved')
+			);
 		});
 	});
 

@@ -134,6 +134,30 @@ describe('FS-3: REBUILD_SWEEP broadcast path', () => {
 		).to.equal(rebuilt.toHex());
 	});
 
+	it('broadcasts every transaction from a split sweep rebuild', async () => {
+		const channelId = crypto.randomBytes(32);
+		const rebuilt = [makeSweepTx(), makeSweepTx()];
+		(cm as unknown as { monitors: Map<string, unknown> }).monitors.set(
+			channelId.toString('hex'),
+			{ rebuildSweeps: () => rebuilt }
+		);
+
+		(
+			cm as unknown as {
+				processChainActions: (id: Buffer, actions: unknown[]) => void;
+			}
+		).processChainActions(channelId, [
+			{
+				type: ChainActionType.REBUILD_SWEEP,
+				output: { txid: 'cd'.repeat(32), outputIndex: 1 },
+				feeRatePerVbyte: 30
+			}
+		]);
+		await new Promise((resolve) => setTimeout(resolve, 30));
+
+		expect(backend.broadcasts).to.deep.equal(rebuilt.map((tx) => tx.toHex()));
+	});
+
 	it('drops a non-Buffer broadcast:tx payload without crashing', async () => {
 		let failure: Error | null = null;
 		watcher.on('broadcast:failure', (err: Error) => (failure = err));

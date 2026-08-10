@@ -25,11 +25,11 @@ import {
 	resolveOurCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs,
 	resolveRevokedCommitmentOutputs,
+	matchRevokedHtlcSnapshotOutputs,
 	resolveSecondLevelHtlcOutput,
 	resolveRevokedSecondLevelOutput
 } from './output-resolver';
-import { estimateSweepVbytes } from './sweep';
-import { leaseCsvFromToRemoteScript } from '../script/anchor';
+import { csvFromToLocalScript } from '../script/commitment';
 import { IChannelState } from '../channel/channel-state';
 import { isAnchorChannel } from '../channel/types';
 
@@ -230,7 +230,126 @@ export class ChainMonitor {
 		monitor._state = saved.monitorState;
 		monitor._commitmentBroadcast = saved.commitmentBroadcast;
 		monitor._trackedOutputs = saved.trackedOutputs;
+		if (monitor._commitmentBroadcast) {
+			// Serialized state contains this list in two places. Rejoin the references
+			// so restored adoption and metadata repair persist consistently.
+			monitor._commitmentBroadcast.trackedOutputs = monitor._trackedOutputs;
+		}
 		monitor._currentBlockHeight = saved.currentBlockHeight;
+		if (
+			monitor._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			monitor._commitmentBroadcast.revokedTxHex
+		) {
+			try {
+				const revokedTx = bitcoin.Transaction.fromHex(
+					monitor._commitmentBroadcast.revokedTxHex
+				);
+				const snapshotOutputs = matchRevokedHtlcSnapshotOutputs(
+					channelState,
+					monitor._commitmentBroadcast.commitmentNumber,
+					revokedTx,
+					network
+				);
+				for (const [outputIndex, metadata] of snapshotOutputs) {
+					const existing = monitor._trackedOutputs.find(
+						(output) =>
+							output.txid === monitor._commitmentBroadcast?.txid &&
+							output.outputIndex === outputIndex
+					);
+					if (existing) {
+						existing.outputType = metadata.outputType;
+						existing.paymentHash = metadata.paymentHash;
+						existing.cltvExpiry = metadata.cltvExpiry;
+						existing.witnessScript = metadata.witnessScript;
+						continue;
+					}
+
+					const claimCandidates = monitor._trackedOutputs.flatMap((output) => {
+						if (!output.sweepTxHex) return [];
+						try {
+							const sweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
+							const spendsOutput = sweep.ins.some(
+								(input) =>
+									Buffer.from(input.hash).reverse().toString('hex') ===
+										revokedTx.getId() && input.index === outputIndex
+							);
+							return spendsOutput ? [{ output, sweep }] : [];
+						} catch {
+							return [];
+						}
+					});
+					// A sibling's stored batch proves this output is managed only while
+					// the batch is live, held, or known to be the transaction that
+					// confirmed. A competing spend can leave the old batch hex behind;
+					// copying that sibling's terminal state would falsely resolve an
+					// output the competitor never spent.
+					const claimSource =
+						claimCandidates.find(
+							({ output, sweep }) =>
+								(output.status === OutputStatus.SPEND_CONFIRMED ||
+									output.status === OutputStatus.IRREVOCABLY_RESOLVED) &&
+								output.resolutionTxid === sweep.getId()
+						) ??
+						claimCandidates.find(
+							({ output }) =>
+								output.status === OutputStatus.SPEND_BROADCAST &&
+								output.resolutionTxid === undefined
+						) ??
+						claimCandidates.find(
+							({ output }) =>
+								output.status === OutputStatus.CONFIRMED &&
+								output.maturityHeight !== undefined
+						);
+					const sourceOutput = claimSource?.output;
+					const restoredStatus =
+						sourceOutput?.status === OutputStatus.SPEND_CONFIRMED ||
+						sourceOutput?.status === OutputStatus.IRREVOCABLY_RESOLVED
+							? OutputStatus.SPEND_CONFIRMED
+							: sourceOutput?.status ?? OutputStatus.CONFIRMED;
+					const restoredOutput: ITrackedOutput = {
+						txid: revokedTx.getId(),
+						outputIndex,
+						amount: BigInt(revokedTx.outs[outputIndex].value),
+						outputType: metadata.outputType,
+						// A newly inferred terminal member has never emitted its own
+						// OUTPUT_RESOLVED action. Route it through SPEND_CONFIRMED so
+						// block processing performs that per-output transition.
+						status: restoredStatus,
+						confirmationHeight:
+							sourceOutput?.confirmationHeight ??
+							monitor._commitmentBroadcast.blockHeight,
+						witnessScript: metadata.witnessScript,
+						paymentHash: metadata.paymentHash,
+						cltvExpiry: metadata.cltvExpiry,
+						sweepTxHex: sourceOutput?.sweepTxHex,
+						broadcastHeight: sourceOutput?.broadcastHeight,
+						originalFeeRate: sourceOutput?.originalFeeRate,
+						currentFeeRate: sourceOutput?.currentFeeRate,
+						resolutionTxid: sourceOutput?.resolutionTxid,
+						maturityHeight: sourceOutput?.maturityHeight
+					};
+					monitor._trackedOutputs.push(restoredOutput);
+					if (!sourceOutput) {
+						// No stored transaction can manage this old claim. Allow the retry
+						// pass to rebuild this output while preserving every other claim.
+						monitor._commitmentBroadcast.claimedOutputIndices = (
+							monitor._commitmentBroadcast.claimedOutputIndices ?? []
+						).filter((claimedIndex) => claimedIndex !== outputIndex);
+					}
+				}
+			} catch {
+				// A malformed legacy transaction must not prevent monitor restore.
+			}
+		}
+		if (
+			monitor._state === MonitorState.FULLY_RESOLVED &&
+			monitor._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			!monitor._allTrackedOutputsResolved()
+		) {
+			monitor._state = MonitorState.RESOLVING;
+		}
 		// Restore known preimages if present
 		if (saved.knownPreimages) {
 			for (const [hash, preimage] of Object.entries(saved.knownPreimages)) {
@@ -270,13 +389,37 @@ export class ChainMonitor {
 		);
 	}
 
+	private _allTrackedOutputsResolved(): boolean {
+		return (
+			this._trackedOutputs.length > 0 &&
+			this._trackedOutputs.every(
+				(output) =>
+					output.status === OutputStatus.IRREVOCABLY_RESOLVED ||
+					(this._commitmentBroadcast?.commitmentType ===
+						CommitmentType.OUR_COMMITMENT &&
+						output.outputType === OutputType.TO_REMOTE &&
+						output.status === OutputStatus.CONFIRMED)
+			)
+		);
+	}
+
 	/**
 	 * Update the fee rate used for sweep transactions.
+	 *
+	 * Returns any actions the new rate makes possible: a claim declined as
+	 * uneconomic is retried as soon as the estimate that priced it out falls,
+	 * rather than waiting for the next block. Callers that only want to set the
+	 * rate can ignore the return value.
+	 *
 	 * @param feeRatePerKw Fee rate in sat/kw — converted to sat/vbyte internally.
 	 */
-	updateFeeRate(feeRatePerKw: number): void {
+	updateFeeRate(feeRatePerKw: number): ChainAction[] {
 		// Convert sat/kw to sat/vbyte: 1 kw = 4 kvb, so sat/vbyte = sat/kw * 4 / 1000
 		this._feeRatePerVbyte = Math.max(1, Math.round((feeRatePerKw * 4) / 1000));
+		const actions: ChainAction[] = [];
+		this._retryUnsweptRevokedSweeps(actions);
+		this._retryUnsweptRemoteBalance(actions);
+		return actions;
 	}
 
 	getFullState(): IChainMonitorState {
@@ -434,7 +577,6 @@ export class ChainMonitor {
 		const actions: ChainAction[] = [];
 
 		// Check each tracked output for maturation
-		let allResolved = true;
 		for (const output of this._trackedOutputs) {
 			if (output.status === OutputStatus.IRREVOCABLY_RESOLVED) {
 				continue;
@@ -474,8 +616,6 @@ export class ChainMonitor {
 					continue;
 				}
 			}
-
-			allResolved = false;
 		}
 
 		// Release held (timelocked) sweeps whose CSV/CLTV has now matured.
@@ -499,6 +639,7 @@ export class ChainMonitor {
 		}
 
 		// Re-broadcast unconfirmed sweeps stuck in SPEND_BROADCAST
+		const handledSharedSweeps = new Set<string>();
 		for (const output of this._trackedOutputs) {
 			// HTLC output handling splits by WHOSE commitment confirmed:
 			//
@@ -588,6 +729,21 @@ export class ChainMonitor {
 				output.status === OutputStatus.SPEND_BROADCAST &&
 				output.broadcastHeight !== undefined
 			) {
+				let rebuildOutputs = [output];
+				const sharedPenaltyHex =
+					this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.THEIR_REVOKED_COMMITMENT
+						? output.sweepTxHex
+						: undefined;
+				if (sharedPenaltyHex) {
+					if (handledSharedSweeps.has(sharedPenaltyHex)) continue;
+					handledSharedSweeps.add(sharedPenaltyHex);
+					rebuildOutputs = this._trackedOutputs.filter(
+						(candidate) =>
+							candidate.status === OutputStatus.SPEND_BROADCAST &&
+							candidate.sweepTxHex === sharedPenaltyHex
+					);
+				}
 				const blocksSinceBroadcast = blockHeight - output.broadcastHeight;
 				if (blocksSinceBroadcast >= REBROADCAST_INTERVAL) {
 					// Bump the fee rate, but never below the current network estimate
@@ -596,8 +752,16 @@ export class ChainMonitor {
 					// Anti-runaway cap: 10x the build-time rate OR the live rate,
 					// whichever is larger — a sweep built at a stale low rate (e.g.
 					// the 10 sat/vB restore default) must still reach the live rate.
-					const originalRate = output.originalFeeRate || this._feeRatePerVbyte;
-					const currentRate = output.currentFeeRate || originalRate;
+					const originalRate = Math.max(
+						...rebuildOutputs.map(
+							(candidate) => candidate.originalFeeRate || this._feeRatePerVbyte
+						)
+					);
+					const currentRate = Math.max(
+						...rebuildOutputs.map(
+							(candidate) => candidate.currentFeeRate || originalRate
+						)
+					);
 					const bumpedRate = Math.min(
 						Math.max(currentRate * FEE_BUMP_FACTOR, this._feeRatePerVbyte),
 						Math.max(
@@ -605,33 +769,30 @@ export class ChainMonitor {
 							this._feeRatePerVbyte
 						)
 					);
-					const vbytes = estimateSweepVbytes(
-						output.outputType,
-						// Lease-locked to_remote (liquidity ads): multi-byte CSV adds ~1 vb.
-						output.outputType === OutputType.TO_REMOTE &&
-							!!output.witnessScript &&
-							leaseCsvFromToRemoteScript(output.witnessScript) !== undefined
-					);
-					const feeSatoshis = BigInt(Math.ceil(bumpedRate * vbytes));
-
-					if (output.amount > feeSatoshis) {
-						// Track per-output fee rate — do NOT mutate global _feeRatePerVbyte
-						output.currentFeeRate = bumpedRate;
-						output.broadcastHeight = blockHeight;
-
-						// Emit REBUILD_SWEEP so the caller can re-resolve with new fee
-						actions.push({
-							type: ChainActionType.REBUILD_SWEEP,
-							output,
-							feeRatePerVbyte: bumpedRate
-						});
-					}
+					// Rebuild and fallback decisions use the actual resolver result. A
+					// size estimate can disagree at the dust boundary, and a shared batch
+					// can split as one of its HTLCs becomes urgent.
+					actions.push({
+						type: ChainActionType.REBUILD_SWEEP,
+						output,
+						feeRatePerVbyte: bumpedRate
+					});
 				}
 			}
 		}
 
+		// Retry claims that were declined as uneconomic. The loops above only ever
+		// rebuild a sweep that already reached SPEND_BROADCAST, so without this a
+		// claim skipped during a fee spike is never revisited even after the spike
+		// passes.
+		this._retryUnsweptRevokedSweeps(actions);
+		this._retryUnsweptRemoteBalance(actions);
+
+		// A retry can adopt a snapshot-reconstructed output after the scan above.
+		// Recompute from the current tracked set so a new in-flight claim cannot be
+		// followed by CHANNEL_FULLY_RESOLVED in the same block.
 		// Check if all outputs are irrevocably resolved
-		if (allResolved && this._trackedOutputs.length > 0) {
+		if (this._allTrackedOutputsResolved()) {
 			this._state = MonitorState.FULLY_RESOLVED;
 			if (this._channelState.channelId) {
 				actions.push({
@@ -677,6 +838,16 @@ export class ChainMonitor {
 		output.status = OutputStatus.SPEND_CONFIRMED;
 		output.resolutionTxid = spendingTx.getId();
 		output.confirmationHeight = blockHeight;
+		const spentIndices = new Set<number>();
+		for (const input of spendingTx.ins) {
+			if (Buffer.from(input.hash).reverse().toString('hex') === txid) {
+				spentIndices.add(input.index);
+			}
+		}
+		const spentTrackedOutputs = this._trackedOutputs.filter(
+			(candidate) =>
+				candidate.txid === txid && spentIndices.has(candidate.outputIndex)
+		);
 
 		// Scan the whole spending tx for any preimages it reveals — not just the
 		// one matched output. A single counterparty tx can claim several HTLC
@@ -776,23 +947,33 @@ export class ChainMonitor {
 		// revocation private key); without this claim the HTLC value is lost once
 		// the cheater's to_self_delay matures.
 		if (
-			(output.outputType === OutputType.OFFERED_HTLC ||
-				output.outputType === OutputType.RECEIVED_HTLC) &&
+			spentTrackedOutputs.some(
+				(candidate) =>
+					candidate.outputType === OutputType.OFFERED_HTLC ||
+					candidate.outputType === OutputType.RECEIVED_HTLC
+			) &&
 			this._commitmentBroadcast?.commitmentType ===
 				CommitmentType.THEIR_REVOKED_COMMITMENT
 		) {
 			// Our own penalty confirming resolves the HTLC output — nothing to claim.
-			let ourPenaltyTxid: string | null = null;
-			if (output.sweepTxHex) {
+			let isOurPenalty = false;
+			for (const spentTrackedOutput of spentTrackedOutputs) {
+				if (!spentTrackedOutput.sweepTxHex) continue;
 				try {
-					ourPenaltyTxid = bitcoin.Transaction.fromHex(
-						output.sweepTxHex
-					).getId();
+					if (
+						bitcoin.Transaction.fromHex(
+							spentTrackedOutput.sweepTxHex
+						).getId() === spendingTx.getId()
+					) {
+						isOurPenalty = true;
+						break;
+					}
 				} catch {
-					ourPenaltyTxid = null;
+					// Ignore malformed retained sweep metadata and let the
+					// second-level resolver inspect the external spend.
 				}
 			}
-			if (ourPenaltyTxid !== spendingTx.getId()) {
+			if (!isOurPenalty) {
 				const resolved = resolveRevokedSecondLevelOutput(
 					this._channelState,
 					spendingTx,
@@ -840,7 +1021,99 @@ export class ChainMonitor {
 			}
 		}
 
+		// The transaction proves every matching watched input spent atomically.
+		// Apply that shared fact only after the whole-transaction HTLC follow-up
+		// paths above have run, so later per-output callbacks can be idempotent
+		// without suppressing second-level handling.
+		for (const spentTrackedOutput of spentTrackedOutputs) {
+			spentTrackedOutput.status = OutputStatus.SPEND_CONFIRMED;
+			spentTrackedOutput.resolutionTxid = spendingTx.getId();
+			spentTrackedOutput.confirmationHeight = blockHeight;
+		}
+
+		this._repairRevokedSharedSweepAfterConflict(spendingTx, actions);
 		return actions;
+	}
+
+	/**
+	 * A competing spend of one shared penalty input invalidates the whole stored
+	 * batch. Rebuild the surviving members immediately instead of waiting six
+	 * blocks to discover that the old transaction can no longer confirm.
+	 */
+	private _repairRevokedSharedSweepAfterConflict(
+		spendingTx: bitcoin.Transaction,
+		actions: ChainAction[]
+	): void {
+		const broadcast = this._commitmentBroadcast;
+		if (broadcast?.commitmentType !== CommitmentType.THEIR_REVOKED_COMMITMENT) {
+			return;
+		}
+		const spentIndices = new Set<number>();
+		for (const input of spendingTx.ins) {
+			if (
+				Buffer.from(input.hash).reverse().toString('hex') === broadcast.txid
+			) {
+				spentIndices.add(input.index);
+			}
+		}
+		const affectedSweepHexes = new Set<string>();
+		// A single competing transaction can invalidate more than one stored
+		// shared cohort. Collect every affected sweep independently of which
+		// output's watch delivered this callback first.
+		for (const candidate of this._trackedOutputs) {
+			if (
+				candidate.txid === broadcast.txid &&
+				spentIndices.has(candidate.outputIndex)
+			) {
+				if (candidate.sweepTxHex) {
+					affectedSweepHexes.add(candidate.sweepTxHex);
+				}
+			}
+		}
+		const claimed = new Set(broadcast.claimedOutputIndices ?? []);
+		let hasSurvivors = false;
+		for (const sweepHex of affectedSweepHexes) {
+			let oldSweep: bitcoin.Transaction;
+			try {
+				oldSweep = bitcoin.Transaction.fromHex(sweepHex);
+			} catch {
+				continue;
+			}
+			if (oldSweep.getId() === spendingTx.getId()) continue;
+			const oldIndices = new Set<number>();
+			for (const input of oldSweep.ins) {
+				if (
+					Buffer.from(input.hash).reverse().toString('hex') === broadcast.txid
+				) {
+					oldIndices.add(input.index);
+				}
+			}
+			if (oldIndices.size <= 1) continue;
+			const survivors = this._trackedOutputs.filter(
+				(candidate) =>
+					candidate.txid === broadcast.txid &&
+					oldIndices.has(candidate.outputIndex) &&
+					!spentIndices.has(candidate.outputIndex) &&
+					candidate.status === OutputStatus.SPEND_BROADCAST &&
+					candidate.sweepTxHex === sweepHex
+			);
+			if (survivors.length === 0) continue;
+			hasSurvivors = true;
+			for (const outputIndex of oldIndices) claimed.delete(outputIndex);
+			for (const survivor of survivors) {
+				survivor.status = OutputStatus.CONFIRMED;
+				survivor.sweepTxHex = undefined;
+				survivor.broadcastHeight = undefined;
+				survivor.originalFeeRate = undefined;
+				survivor.currentFeeRate = undefined;
+				survivor.maturityHeight = undefined;
+				survivor.resolutionTxid = undefined;
+			}
+		}
+		if (hasSurvivors) {
+			broadcast.claimedOutputIndices = [...claimed];
+			this._retryUnsweptRevokedSweeps(actions);
+		}
 	}
 
 	/**
@@ -908,6 +1181,7 @@ export class ChainMonitor {
 			(o) => o.txid === txid && o.outputIndex === outputIndex
 		);
 		if (!output) return [];
+		const actions: ChainAction[] = [];
 		if (
 			output.status !== OutputStatus.SPEND_CONFIRMED &&
 			output.status !== OutputStatus.IRREVOCABLY_RESOLVED &&
@@ -916,29 +1190,147 @@ export class ChainMonitor {
 			return [];
 		}
 
-		// The recorded spend is gone; forget it.
-		output.resolutionTxid = undefined;
+		// A multi-input spend can be recorded atomically after only one watched
+		// outpoint reports it. Reopen every output tied to that same transaction
+		// when any one watch later reports the reorg.
+		const previousResolutionTxid = output.resolutionTxid;
+		const reorgedOutputs = previousResolutionTxid
+			? this._trackedOutputs.filter(
+					(candidate) =>
+						candidate.txid === txid &&
+						candidate.resolutionTxid === previousResolutionTxid
+			  )
+			: [output];
+		for (const candidate of reorgedOutputs) {
+			candidate.resolutionTxid = undefined;
+		}
 		// If the monitor had declared the channel fully resolved on the strength of
 		// this spend, resume resolving so handleNewBlock keeps working the output.
 		if (this._state === MonitorState.FULLY_RESOLVED) {
 			this._state = MonitorState.RESOLVING;
 		}
 
-		// Re-broadcast our own sweep if we have one; otherwise just re-arm the watch
-		// (a counterparty spend was reorged out and we had no competing sweep).
-		if (output.sweepTxHex) {
-			output.status = OutputStatus.SPEND_BROADCAST;
-			output.broadcastHeight = this._currentBlockHeight;
-			return [
-				this._broadcastSweepAction(
-					output,
-					Buffer.from(output.sweepTxHex, 'hex'),
-					`${output.outputType.toLowerCase()} re-broadcast (reorg recovery)`
-				)
-			];
+		const revokedBroadcast =
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			this._commitmentBroadcast.txid === txid
+				? this._commitmentBroadcast
+				: undefined;
+		if (revokedBroadcast) {
+			const rawRebroadcasts = new Map<
+				string,
+				{ output: ITrackedOutput; tx: bitcoin.Transaction }
+			>();
+			const claimed = new Set(revokedBroadcast.claimedOutputIndices ?? []);
+			for (const reorgedOutput of reorgedOutputs) {
+				let retainedSweep: bitcoin.Transaction | undefined;
+				let retainedHex = reorgedOutput.sweepTxHex;
+				try {
+					if (retainedHex) {
+						retainedSweep = bitcoin.Transaction.fromHex(retainedHex);
+					}
+				} catch {
+					retainedSweep = undefined;
+					retainedHex = undefined;
+				}
+
+				const oldIndices = new Set<number>();
+				if (retainedSweep) {
+					for (const input of retainedSweep.ins) {
+						if (Buffer.from(input.hash).reverse().toString('hex') === txid) {
+							oldIndices.add(input.index);
+						}
+					}
+				}
+				const oldSweepTxid = retainedSweep?.getId();
+				const staleSharedSweep =
+					retainedSweep !== undefined &&
+					oldIndices.size > 1 &&
+					previousResolutionTxid !== oldSweepTxid &&
+					this._trackedOutputs.some(
+						(candidate) =>
+							candidate.txid === txid &&
+							oldIndices.has(candidate.outputIndex) &&
+							!reorgedOutputs.includes(candidate) &&
+							(((candidate.status === OutputStatus.SPEND_CONFIRMED ||
+								candidate.status === OutputStatus.IRREVOCABLY_RESOLVED) &&
+								candidate.resolutionTxid !== oldSweepTxid) ||
+								(candidate.status === OutputStatus.SPEND_BROADCAST &&
+									candidate.sweepTxHex !== retainedHex))
+					);
+
+				if (!retainedSweep || staleSharedSweep) {
+					reorgedOutput.status = OutputStatus.CONFIRMED;
+					reorgedOutput.confirmationHeight = revokedBroadcast.blockHeight;
+					reorgedOutput.sweepTxHex = undefined;
+					reorgedOutput.broadcastHeight = undefined;
+					reorgedOutput.originalFeeRate = undefined;
+					reorgedOutput.currentFeeRate = undefined;
+					reorgedOutput.maturityHeight = undefined;
+					claimed.delete(reorgedOutput.outputIndex);
+					continue;
+				}
+
+				for (const candidate of this._trackedOutputs) {
+					if (
+						candidate.txid === txid &&
+						oldIndices.has(candidate.outputIndex) &&
+						(candidate.resolutionTxid === undefined ||
+							candidate.resolutionTxid === oldSweepTxid)
+					) {
+						candidate.status = OutputStatus.SPEND_BROADCAST;
+						candidate.resolutionTxid = undefined;
+						candidate.confirmationHeight = revokedBroadcast.blockHeight;
+						candidate.sweepTxHex = retainedHex;
+						candidate.originalFeeRate = reorgedOutput.originalFeeRate;
+						candidate.currentFeeRate = reorgedOutput.currentFeeRate;
+						candidate.maturityHeight = undefined;
+						candidate.broadcastHeight = this._currentBlockHeight;
+					}
+				}
+				for (const oldIndex of oldIndices) claimed.add(oldIndex);
+				rawRebroadcasts.set(retainedSweep.getId(), {
+					output: reorgedOutput,
+					tx: retainedSweep
+				});
+			}
+			revokedBroadcast.claimedOutputIndices = [...claimed];
+			for (const { output: representative, tx } of rawRebroadcasts.values()) {
+				actions.push(
+					this._broadcastSweepAction(
+						representative,
+						tx.toBuffer(),
+						`${representative.outputType.toLowerCase()} re-broadcast (reorg recovery)`
+					)
+				);
+			}
+			this._retryUnsweptRevokedSweeps(actions);
+			return actions;
 		}
-		output.status = OutputStatus.CONFIRMED;
-		return [];
+
+		// Re-arm every output tied to the evicted transaction. This is normally
+		// one output, but a backend can report a multi-input spend through only one
+		// watch before it disappears. Deduplicate a shared raw sweep if present.
+		const rawRebroadcasts = new Map<string, ITrackedOutput>();
+		for (const reorgedOutput of reorgedOutputs) {
+			if (reorgedOutput.sweepTxHex) {
+				reorgedOutput.status = OutputStatus.SPEND_BROADCAST;
+				reorgedOutput.broadcastHeight = this._currentBlockHeight;
+				rawRebroadcasts.set(reorgedOutput.sweepTxHex, reorgedOutput);
+			} else {
+				reorgedOutput.status = OutputStatus.CONFIRMED;
+			}
+		}
+		for (const [sweepHex, representative] of rawRebroadcasts) {
+			actions.push(
+				this._broadcastSweepAction(
+					representative,
+					Buffer.from(sweepHex, 'hex'),
+					`${representative.outputType.toLowerCase()} re-broadcast (reorg recovery)`
+				)
+			);
+		}
+		return actions;
 	}
 
 	/**
@@ -1300,6 +1692,15 @@ export class ChainMonitor {
 			}
 		}
 
+		// Only to_remote: it is the one output here whose absence of a spend means
+		// the affordability guard declined it. Their to_local is not ours to spend,
+		// and an unclaimed HTLC is usually waiting on a preimage or its cltv, not
+		// on the feerate.
+		this._reportDeclinedClaims(
+			actions,
+			this._trackedOutputs.filter((o) => o.outputType === OutputType.TO_REMOTE)
+		);
+
 		return actions;
 	}
 
@@ -1341,6 +1742,11 @@ export class ChainMonitor {
 			}
 		}
 
+		// Same reason as the current-commitment handler: an unaffordable to_remote
+		// is declined here, and reporting only from a later retry loses the decline
+		// whenever the next fee sample recovers the claim.
+		this._reportDeclinedClaims(actions, toRemoteOutputs);
+
 		return actions;
 	}
 
@@ -1355,7 +1761,85 @@ export class ChainMonitor {
 		output: ITrackedOutput,
 		feeRatePerVbyte: number
 	): bitcoin.Transaction | null {
+		const rebuilt =
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			output.sweepTxHex &&
+			!output.secondLevelTxHex
+				? this._rebuildRevokedPenaltySweeps(output, feeRatePerVbyte, false)
+				: [this._rebuildSingleSweep(output, feeRatePerVbyte)].filter(
+						(tx): tx is bitcoin.Transaction => !!tx
+				  );
+		return (
+			rebuilt.find((tx) =>
+				tx.ins.some(
+					(input) =>
+						Buffer.from(input.hash).reverse().toString('hex') === output.txid &&
+						input.index === output.outputIndex
+				)
+			) ??
+			rebuilt[0] ??
+			null
+		);
+	}
+
+	/**
+	 * Return the complete replacement set. A shared revoked penalty can split
+	 * into several transactions when one of its HTLCs becomes urgent.
+	 */
+	rebuildSweeps(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number
+	): bitcoin.Transaction[] {
+		if (
+			this._commitmentBroadcast?.commitmentType ===
+				CommitmentType.THEIR_REVOKED_COMMITMENT &&
+			output.sweepTxHex &&
+			!output.secondLevelTxHex
+		) {
+			return this._rebuildRevokedPenaltySweeps(output, feeRatePerVbyte, true);
+		}
+		const rebuilt = this._rebuildSingleSweep(output, feeRatePerVbyte);
+		return rebuilt ? [rebuilt] : [];
+	}
+
+	private _rebuildSingleSweep(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number,
+		replacementAttempt = 0
+	): bitcoin.Transaction | null {
 		if (!this._commitmentBroadcast) return null;
+		let previousSweep: bitcoin.Transaction | undefined;
+		if (output.sweepTxHex) {
+			try {
+				const parsedSweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				const expectedInput =
+					parsedSweep.ins.length === 1 && parsedSweep.ins[0];
+				if (
+					expectedInput &&
+					Buffer.from(expectedInput.hash).reverse().toString('hex') ===
+						output.txid &&
+					expectedInput.index === output.outputIndex
+				) {
+					previousSweep = parsedSweep;
+				}
+				// A parseable transaction for another outpoint is stale metadata, not
+				// a replacement baseline. Rebuild the intended claim from retained
+				// commitment context instead of rebroadcasting the unrelated tx.
+				if (!previousSweep)
+					throw new Error('stored sweep spends another outpoint');
+				if (!previousSweep.ins.some((input) => input.sequence < 0xfffffffe)) {
+					// A legacy final-sequence claim cannot be replaced under
+					// opt-in RBF. Keep rebroadcasting the transaction the backend
+					// may already have instead of recording an unrelayable rebuild.
+					output.broadcastHeight = this._currentBlockHeight;
+					return previousSweep;
+				}
+			} catch {
+				// Rebuild undecodable or mismatched metadata from retained context.
+				previousSweep = undefined;
+			}
+		}
 		let resolved: ReturnType<typeof resolveOurCommitmentOutputs> = [];
 		try {
 			switch (this._commitmentBroadcast.commitmentType) {
@@ -1430,9 +1914,14 @@ export class ChainMonitor {
 					// commitment cannot be rebuilt from it — signing would target the
 					// wrong outpoint.
 					if (output.txid !== revokedTx.getId()) return null;
+					const rebuildOutputs = [output];
+					const claimedOutsideBatch = new Set<number>();
+					for (let i = 0; i < revokedTx.outs.length; i++) {
+						if (i !== output.outputIndex) claimedOutsideBatch.add(i);
+					}
 					resolved = resolveRevokedCommitmentOutputs(
 						this._channelState,
-						[output],
+						rebuildOutputs,
 						this._commitmentBroadcast.commitmentNumber,
 						revokedTx,
 						this._destinationScript,
@@ -1440,7 +1929,8 @@ export class ChainMonitor {
 						this._revocationBasepointSecret,
 						this._paymentPrivkey,
 						this._network,
-						this._currentBlockHeight
+						this._currentBlockHeight,
+						claimedOutsideBatch
 					);
 					break;
 				}
@@ -1448,6 +1938,10 @@ export class ChainMonitor {
 					return null;
 			}
 		} catch {
+			if (previousSweep) {
+				output.broadcastHeight = this._currentBlockHeight;
+				return previousSweep;
+			}
 			return null;
 		}
 
@@ -1468,9 +1962,361 @@ export class ChainMonitor {
 			// Penalty txs come back with witnesses already set; others carry a
 			// separate witness to attach.
 			if (match.witness) match.spendTx.setWitness(0, match.witness);
+			if (previousSweep) {
+				const feeForSingleInput = (
+					tx: bitcoin.Transaction
+				): number | undefined => {
+					if (tx.ins.length !== 1) return undefined;
+					const input = tx.ins[0];
+					if (
+						Buffer.from(input.hash).reverse().toString('hex') !== output.txid ||
+						input.index !== output.outputIndex
+					) {
+						return undefined;
+					}
+					return (
+						Number(output.amount) -
+						tx.outs.reduce((sum, txOutput) => sum + txOutput.value, 0)
+					);
+				};
+				const oldFee = feeForSingleInput(previousSweep);
+				const replacementFee = feeForSingleInput(match.spendTx);
+				const requiredFee =
+					oldFee === undefined
+						? undefined
+						: oldFee + match.spendTx.virtualSize();
+				if (
+					oldFee === undefined ||
+					replacementFee === undefined ||
+					requiredFee === undefined ||
+					replacementFee < requiredFee
+				) {
+					const maxRebuildRate = Math.max(
+						(output.originalFeeRate ?? feeRatePerVbyte) *
+							MAX_FEE_BUMP_MULTIPLIER,
+						this._feeRatePerVbyte
+					);
+					const shortfall =
+						replacementFee !== undefined && requiredFee !== undefined
+							? requiredFee - replacementFee
+							: 0;
+					const nextRate = Math.min(
+						maxRebuildRate,
+						feeRatePerVbyte +
+							Math.max(1, Math.ceil(shortfall / match.spendTx.virtualSize()))
+					);
+					if (
+						replacementAttempt < 3 &&
+						nextRate > feeRatePerVbyte &&
+						oldFee !== undefined &&
+						replacementFee !== undefined
+					) {
+						return this._rebuildSingleSweep(
+							output,
+							nextRate,
+							replacementAttempt + 1
+						);
+					}
+					output.broadcastHeight = this._currentBlockHeight;
+					return previousSweep;
+				}
+			}
+			const rebuiltHex = match.spendTx.toHex();
+			const spentOutpoints = new Set(
+				match.spendTx.ins.map(
+					(input) =>
+						`${Buffer.from(input.hash).reverse().toString('hex')}:${
+							input.index
+						}`
+				)
+			);
+			for (const candidate of this._trackedOutputs) {
+				if (spentOutpoints.has(`${candidate.txid}:${candidate.outputIndex}`)) {
+					candidate.status = OutputStatus.SPEND_BROADCAST;
+					candidate.sweepTxHex = rebuiltHex;
+					candidate.currentFeeRate = feeRatePerVbyte;
+					candidate.broadcastHeight = this._currentBlockHeight;
+				}
+			}
 			return match.spendTx;
 		}
+		if (previousSweep) {
+			output.broadcastHeight = this._currentBlockHeight;
+			return previousSweep;
+		}
 		return null;
+	}
+
+	private _rebuildRevokedPenaltySweeps(
+		output: ITrackedOutput,
+		feeRatePerVbyte: number,
+		allowDeadlineSplit: boolean
+	): bitcoin.Transaction[] {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.commitmentType !== CommitmentType.THEIR_REVOKED_COMMITMENT ||
+			!broadcast.revokedTxHex ||
+			!output.sweepTxHex
+		) {
+			return [];
+		}
+
+		let revokedTx: bitcoin.Transaction;
+		let oldSweep: bitcoin.Transaction;
+		try {
+			revokedTx = bitcoin.Transaction.fromHex(broadcast.revokedTxHex);
+			oldSweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
+		} catch {
+			return [];
+		}
+		if (output.txid !== revokedTx.getId()) return [];
+
+		const liveGroup = this._trackedOutputs.filter(
+			(candidate) =>
+				candidate.txid === revokedTx.getId() &&
+				candidate.status === OutputStatus.SPEND_BROADCAST &&
+				candidate.sweepTxHex === output.sweepTxHex
+		);
+		if (liveGroup.length === 0) return [];
+
+		const commitmentInputIndices = (tx: bitcoin.Transaction): Set<number> => {
+			const indices = new Set<number>();
+			for (const input of tx.ins) {
+				if (
+					Buffer.from(input.hash).reverse().toString('hex') ===
+					revokedTx.getId()
+				) {
+					indices.add(input.index);
+				}
+			}
+			return indices;
+		};
+		const oldIndices = commitmentInputIndices(oldSweep);
+		const liveIndices = new Set(
+			liveGroup.map((candidate) => candidate.outputIndex)
+		);
+
+		// If the old transaction itself confirmed, all of its inputs were spent
+		// atomically even when only one output watch has fired so far.
+		const confirmedOldSweep = this._trackedOutputs.find(
+			(candidate) =>
+				oldIndices.has(candidate.outputIndex) &&
+				(candidate.status === OutputStatus.SPEND_CONFIRMED ||
+					candidate.status === OutputStatus.IRREVOCABLY_RESOLVED) &&
+				candidate.resolutionTxid === oldSweep.getId()
+		);
+		if (confirmedOldSweep) {
+			for (const candidate of liveGroup) {
+				// Even when the watched sibling already reached final depth, route
+				// inferred members through SPEND_CONFIRMED so each one emits its own
+				// OUTPUT_RESOLVED action on the next block.
+				candidate.status = OutputStatus.SPEND_CONFIRMED;
+				candidate.resolutionTxid = confirmedOldSweep.resolutionTxid;
+				candidate.confirmationHeight = confirmedOldSweep.confirmationHeight;
+			}
+			return [];
+		}
+		const oldStillValid =
+			oldIndices.size === liveIndices.size &&
+			[...oldIndices].every((outputIndex) => liveIndices.has(outputIndex));
+		if (
+			oldStillValid &&
+			!oldSweep.ins.some((input) => input.sequence < 0xfffffffe)
+		) {
+			// A legacy final-sequence transaction cannot be replaced under
+			// opt-in RBF policy. Keep the only relayable claim under management.
+			for (const candidate of liveGroup) {
+				candidate.broadcastHeight = this._currentBlockHeight;
+			}
+			return [oldSweep];
+		}
+
+		// Exclude every output outside the old live cohort. The revoked resolver
+		// also scans snapshot HTLCs, and an unrestricted rebuild could steal an
+		// independently urgent output into this replacement.
+		const claimedOutside = new Set<number>();
+		for (let i = 0; i < revokedTx.outs.length; i++) {
+			if (!liveIndices.has(i)) claimedOutside.add(i);
+		}
+		const resolveGroup = (
+			currentHeight: number | undefined,
+			targetFeeRate: number
+		): ReturnType<typeof resolveRevokedCommitmentOutputs> => {
+			try {
+				return resolveRevokedCommitmentOutputs(
+					this._channelState,
+					liveGroup,
+					broadcast.commitmentNumber,
+					revokedTx,
+					this._destinationScript,
+					targetFeeRate,
+					this._revocationBasepointSecret,
+					this._paymentPrivkey,
+					this._network,
+					currentHeight,
+					claimedOutside
+				);
+			} catch {
+				return [];
+			}
+		};
+		const collectTransactions = (
+			resolved: ReturnType<typeof resolveRevokedCommitmentOutputs>
+		): bitcoin.Transaction[] => {
+			const unique = new Map<string, bitcoin.Transaction>();
+			for (const entry of resolved) {
+				if (!entry.spendTx) continue;
+				if (entry.witness && entry.spendTx.ins[0]?.witness.length === 0) {
+					entry.spendTx.setWitness(0, entry.witness);
+				}
+				const spent = commitmentInputIndices(entry.spendTx);
+				if (
+					spent.size === 0 ||
+					[...spent].some((outputIndex) => !liveIndices.has(outputIndex))
+				) {
+					continue;
+				}
+				unique.set(entry.spendTx.getId(), entry.spendTx);
+			}
+			return [...unique.values()];
+		};
+		const transactionFee = (tx: bitcoin.Transaction): number | undefined => {
+			let totalIn = 0;
+			for (const input of tx.ins) {
+				if (
+					Buffer.from(input.hash).reverse().toString('hex') !==
+					revokedTx.getId()
+				) {
+					return undefined;
+				}
+				const previousOutput = revokedTx.outs[input.index];
+				if (!previousOutput) return undefined;
+				totalIn += previousOutput.value;
+			}
+			return (
+				totalIn - tx.outs.reduce((sum, txOutput) => sum + txOutput.value, 0)
+			);
+		};
+
+		const oldFee = transactionFee(oldSweep);
+		const orderByFee = (transactions: bitcoin.Transaction[]): void => {
+			transactions.sort(
+				(a, b) =>
+					(transactionFee(b) ?? Number.MIN_SAFE_INTEGER) -
+					(transactionFee(a) ?? Number.MIN_SAFE_INTEGER)
+			);
+		};
+		const paysForEviction = (transactions: bitcoin.Transaction[]): boolean => {
+			if (transactions.length === 0 || oldFee === undefined) return false;
+			orderByFee(transactions);
+			const firstFee = transactionFee(transactions[0]);
+			return (
+				firstFee !== undefined &&
+				firstFee >= oldFee + transactions[0].virtualSize()
+			);
+		};
+		const maxRebuildRate = Math.max(
+			...liveGroup.map(
+				(candidate) =>
+					(candidate.originalFeeRate ?? feeRatePerVbyte) *
+					MAX_FEE_BUMP_MULTIPLIER
+			),
+			this._feeRatePerVbyte
+		);
+		const buildPayingReplacement = (
+			currentHeight: number | undefined
+		): { transactions: bitcoin.Transaction[]; feeRate: number } => {
+			let targetFeeRate = feeRatePerVbyte;
+			for (let attempt = 0; attempt < 3; attempt++) {
+				const transactions = collectTransactions(
+					resolveGroup(currentHeight, targetFeeRate)
+				);
+				if (transactions.length === 0) {
+					return { transactions: [], feeRate: targetFeeRate };
+				}
+				if (!oldStillValid || paysForEviction(transactions)) {
+					return { transactions, feeRate: targetFeeRate };
+				}
+				orderByFee(transactions);
+				const firstFee = transactionFee(transactions[0]);
+				if (firstFee === undefined || oldFee === undefined) {
+					return { transactions: [], feeRate: targetFeeRate };
+				}
+				const shortfall = oldFee + transactions[0].virtualSize() - firstFee;
+				const nextRate = Math.min(
+					maxRebuildRate,
+					targetFeeRate +
+						Math.max(1, Math.ceil(shortfall / transactions[0].virtualSize()))
+				);
+				if (nextRate <= targetFeeRate) {
+					return { transactions: [], feeRate: targetFeeRate };
+				}
+				targetFeeRate = nextRate;
+			}
+			return { transactions: [], feeRate: targetFeeRate };
+		};
+
+		let replacementResult = buildPayingReplacement(
+			allowDeadlineSplit ? this._currentBlockHeight : undefined
+		);
+		if (
+			allowDeadlineSplit &&
+			replacementResult.transactions.length === 0 &&
+			oldStillValid
+		) {
+			// A deadline split may be unable to evict the larger old batch even
+			// though a full-group replacement remains economical.
+			replacementResult = buildPayingReplacement(undefined);
+		}
+		const replacements = replacementResult.transactions;
+		const appliedFeeRate = replacementResult.feeRate;
+
+		if (replacements.length === 0) {
+			if (oldStillValid) {
+				for (const candidate of liveGroup) {
+					candidate.broadcastHeight = this._currentBlockHeight;
+				}
+				return [oldSweep];
+			}
+		}
+
+		// Replace the old cohort atomically. Claimed indices describe only current
+		// managed claims, not stale inputs from an invalidated batch.
+		const claimed = new Set(broadcast.claimedOutputIndices ?? []);
+		for (const outputIndex of oldIndices) claimed.delete(outputIndex);
+		const replacementByIndex = new Map<number, bitcoin.Transaction>();
+		for (const replacement of replacements) {
+			for (const outputIndex of commitmentInputIndices(replacement)) {
+				claimed.add(outputIndex);
+				replacementByIndex.set(outputIndex, replacement);
+			}
+		}
+		broadcast.claimedOutputIndices = [...claimed];
+
+		for (const candidate of liveGroup) {
+			const replacement = replacementByIndex.get(candidate.outputIndex);
+			if (replacement) {
+				candidate.status = OutputStatus.SPEND_BROADCAST;
+				candidate.sweepTxHex = replacement.toHex();
+				candidate.originalFeeRate ??= appliedFeeRate;
+				candidate.currentFeeRate = appliedFeeRate;
+				candidate.broadcastHeight = this._currentBlockHeight;
+				candidate.resolutionTxid = undefined;
+				continue;
+			}
+			// The old batch no longer manages this member. Return it to the retry
+			// set instead of retaining a transaction that can no longer confirm.
+			candidate.status = OutputStatus.CONFIRMED;
+			candidate.sweepTxHex = undefined;
+			candidate.broadcastHeight = undefined;
+			candidate.originalFeeRate = undefined;
+			candidate.currentFeeRate = undefined;
+			candidate.maturityHeight = undefined;
+			candidate.resolutionTxid = undefined;
+		}
+
+		return replacements;
 	}
 
 	private _handleRevokedCommitment(
@@ -1503,28 +2349,447 @@ export class ChainMonitor {
 			this._currentBlockHeight
 		);
 
-		// A batched penalty produces one resolved entry PER INPUT sharing the
-		// same tx; broadcast each distinct tx once (the deadline split can also
-		// yield several distinct txs here).
-		const broadcastTxids = new Set<string>();
-		for (const r of resolved) {
-			if (r.spendTx) {
-				const txBuf = r.spendTx.toBuffer();
-				if (!broadcastTxids.has(r.spendTx.getId())) {
-					broadcastTxids.add(r.spendTx.getId());
-					actions.push({
-						type: ChainActionType.BROADCAST_TX,
-						tx: txBuf,
-						description: 'penalty sweep (revoked commitment)'
-					});
-				}
-				r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
-				r.trackedOutput.broadcastHeight = this._currentBlockHeight;
-				r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
-				r.trackedOutput.sweepTxHex = txBuf.toString('hex');
-			}
+		this._recordPenaltyBroadcasts(
+			actions,
+			resolved,
+			'penalty sweep (revoked commitment)'
+		);
+		// Report anything this first pass declined. Waiting for the first retry to
+		// report would lose the decline entirely whenever the very next fee
+		// estimate recovers the claim.
+		if (this._commitmentBroadcast) {
+			this._reportDeclinedClaims(
+				actions,
+				this._revokedCommitmentOutputs(this._commitmentBroadcast)
+			);
 		}
 
 		return actions;
+	}
+
+	/**
+	 * Broadcast the spends a revoked-commitment resolution produced and record
+	 * each against its output. A batched penalty produces one resolved entry PER
+	 * INPUT sharing the same tx, and the deadline split can yield several distinct
+	 * txs, so each distinct tx is broadcast exactly once.
+	 */
+	private _recordPenaltyBroadcasts(
+		actions: ChainAction[],
+		resolved: ReturnType<typeof resolveRevokedCommitmentOutputs>,
+		description: string
+	): void {
+		const broadcastTxids = new Set<string>();
+		for (const entry of resolved) {
+			// Adopt before anything else: a settled-HTLC output rebuilt from the
+			// snapshot is not in the tracked set, and writing this pass's bookkeeping
+			// to a value that is then discarded is what left those claims unwatched,
+			// never rebroadcast, and outside full-resolution accounting.
+			const r = {
+				...entry,
+				trackedOutput: this._adoptPenaltyOutput(actions, entry.trackedOutput)
+			};
+			if (
+				r.trackedOutput.status === OutputStatus.SPEND_CONFIRMED ||
+				r.trackedOutput.status === OutputStatus.IRREVOCABLY_RESOLVED
+			) {
+				continue;
+			}
+			if (!r.spendTx) continue;
+			// Penalty txs come back with every input's witness already attached; a
+			// to_remote claim (our own balance on their revoked commitment) comes
+			// back with its witness alongside the tx instead, and broadcasting it
+			// unsigned strands the balance. Attach it ONLY while input 0 is still
+			// unsigned, so a batched penalty, one entry per input, each carrying
+			// its own witness, never has input 0 overwritten.
+			if (r.witness && r.spendTx.ins[0]?.witness.length === 0) {
+				r.spendTx.setWitness(0, r.witness);
+			}
+			const txBuf = r.spendTx.toBuffer();
+			if (!broadcastTxids.has(r.spendTx.getId())) {
+				broadcastTxids.add(r.spendTx.getId());
+				this._recordClaimedOutpoints(r.spendTx);
+				actions.push({
+					type: ChainActionType.BROADCAST_TX,
+					tx: txBuf,
+					description
+				});
+			}
+			r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
+			r.trackedOutput.broadcastHeight = this._currentBlockHeight;
+			r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
+			r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+		}
+	}
+
+	/**
+	 * Height at which a COMPETING spend path opens for a revoked-commitment
+	 * output, when one is bounded and known.
+	 *
+	 * This is urgency, never a stopping condition. None of these heights
+	 * invalidates our revocation spend: it stays valid for as long as the outpoint
+	 * is unspent, so a claim skipped as uneconomic is still worth building after
+	 * the height passes. Only an actual spend ends the claim.
+	 *
+	 * - their to_local: their delayed branch opens at the CSV in the ON-CHAIN
+	 *   script, which on a leased channel is the lease lock rather than the
+	 *   to_self_delay we configured (update_blockheight moves it over the
+	 *   channel's life, so current state can disagree with what they signed).
+	 * - an HTLC WE receive: their pre-signed HTLC-timeout opens at cltv_expiry.
+	 * - an HTLC WE offered: theirs to claim with the preimage at any moment, so
+	 *   there is no height to name.
+	 * - our to_remote: our own balance, which no one else can spend.
+	 */
+	private _contestHeight(output: ITrackedOutput): number | undefined {
+		switch (output.outputType) {
+			case OutputType.TO_LOCAL: {
+				// A relative delay needs the height it counts from. A mempool-first
+				// sighting has none yet, and treating that as 0 would name a height
+				// already behind the tip and report a race that has not started.
+				// _adoptLateConfirmation fills the height in once the commitment
+				// confirms, and the real transition is reported from there.
+				if (output.confirmationHeight <= 0) return undefined;
+				const scriptCsv = output.witnessScript
+					? csvFromToLocalScript(output.witnessScript)
+					: undefined;
+				return (
+					output.confirmationHeight +
+					(scriptCsv ?? this._channelState.localConfig.toSelfDelay)
+				);
+			}
+			case OutputType.RECEIVED_HTLC:
+				return output.cltvExpiry;
+			default:
+				return undefined;
+		}
+	}
+
+	/**
+	 * Return the tracked output a resolution entry refers to, adopting it into the
+	 * tracked set first if it is not there yet.
+	 *
+	 * The revoked resolver rebuilds settled-HTLC outputs from revokedHtlcSnapshots
+	 * (an HTLC that left state.htlcs, whose output the live classification never
+	 * matched). Those arrive as stand-ins that belong to no tracked output, so
+	 * without adoption nothing watches the outpoint, nothing rebroadcasts or
+	 * fee-bumps the claim if it stalls, the second-level justice path can never
+	 * fire for it, and full resolution is declared over a claim still in flight.
+	 */
+	private _adoptPenaltyOutput(
+		actions: ChainAction[],
+		candidate: ITrackedOutput
+	): ITrackedOutput {
+		const existing = this._trackedOutputs.find(
+			(o) =>
+				o.txid === candidate.txid && o.outputIndex === candidate.outputIndex
+		);
+		if (existing) return existing;
+		// A fee update can discover a snapshot output on a monitor restored from
+		// older state that already said it was fully resolved. The adopted output is
+		// unresolved, so block processing must resume immediately.
+		if (this._state === MonitorState.FULLY_RESOLVED) {
+			this._state = MonitorState.RESOLVING;
+		}
+		if (candidate.confirmationHeight <= 0) {
+			// A mempool-first breach has no height yet; _adoptLateConfirmation fills
+			// it in for every tracked output once the commitment confirms.
+			candidate.confirmationHeight =
+				this._commitmentBroadcast?.blockHeight ?? 0;
+		}
+		this._trackedOutputs.push(candidate);
+		actions.push({
+			type: ChainActionType.WATCH_OUTPUT,
+			txid: candidate.txid,
+			outputIndex: candidate.outputIndex
+		});
+		return candidate;
+	}
+
+	/**
+	 * Record which of the commitment's outputs a claim we are broadcasting spends,
+	 * reading the transaction's own inputs. A batched penalty can also spend
+	 * settled-HTLC outputs reconstructed from revokedHtlcSnapshots, which never
+	 * become tracked outputs, so the tracked set alone cannot answer the question
+	 * this set exists to answer.
+	 */
+	private _recordClaimedOutpoints(spendTx: bitcoin.Transaction): void {
+		const broadcast = this._commitmentBroadcast;
+		if (!broadcast) return;
+		const claimed = new Set<number>(broadcast.claimedOutputIndices ?? []);
+		for (const input of spendTx.ins) {
+			// Transaction inputs hold the txid in internal byte order.
+			const spentTxid = Buffer.from(input.hash).reverse().toString('hex');
+			if (spentTxid === broadcast.txid) claimed.add(input.index);
+		}
+		broadcast.claimedOutputIndices = [...claimed];
+	}
+
+	/**
+	 * Output indices of the revoked commitment that one of our claims already
+	 * spends: what _recordClaimedOutpoints has seen, plus the inputs of every
+	 * sweep still stored against a tracked output. The second half covers monitors
+	 * restored from state persisted before the recorded set existed.
+	 */
+	private _claimedRevokedOutputIndices(commitmentTxid: string): Set<number> {
+		const claimed = new Set<number>(
+			this._commitmentBroadcast?.claimedOutputIndices ?? []
+		);
+		for (const output of this._trackedOutputs) {
+			if (
+				output.txid === commitmentTxid &&
+				(output.status === OutputStatus.SPEND_CONFIRMED ||
+					output.status === OutputStatus.IRREVOCABLY_RESOLVED)
+			) {
+				claimed.add(output.outputIndex);
+			}
+			if (!output.sweepTxHex) continue;
+			try {
+				const sweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				const managesLiveClaim =
+					(output.status === OutputStatus.SPEND_BROADCAST &&
+						output.resolutionTxid === undefined) ||
+					(output.status === OutputStatus.CONFIRMED &&
+						output.maturityHeight !== undefined) ||
+					((output.status === OutputStatus.SPEND_CONFIRMED ||
+						output.status === OutputStatus.IRREVOCABLY_RESOLVED) &&
+						output.resolutionTxid === sweep.getId());
+				if (!managesLiveClaim) continue;
+				for (const input of sweep.ins) {
+					const spentTxid = Buffer.from(input.hash).reverse().toString('hex');
+					if (spentTxid === commitmentTxid) claimed.add(input.index);
+				}
+			} catch {
+				// An undecodable sweep cannot say which outpoints it spends; fall
+				// back to the one it is recorded against.
+				claimed.add(output.outputIndex);
+			}
+		}
+		return claimed;
+	}
+
+	private _uneconomicAction(
+		output: ITrackedOutput,
+		reason: 'skipped' | 'contested'
+	): ChainAction {
+		return {
+			type: ChainActionType.SWEEP_UNECONOMIC,
+			reason,
+			txid: output.txid,
+			outputIndex: output.outputIndex,
+			outputType: output.outputType,
+			amount: output.amount,
+			feeRatePerVbyte: this._feeRatePerVbyte,
+			contestHeight: this._contestHeight(output)
+		};
+	}
+
+	/**
+	 * Report every output left without a spend by a resolution pass, once each.
+	 *
+	 * Reported from the FIRST resolution as well as from retries: a claim declined
+	 * at breach time and recovered by the very next fee estimate would otherwise
+	 * be recorded and recovered without the decline ever being visible.
+	 *
+	 * A second report follows if a competing spend path opens while the claim is
+	 * still unbuilt. That is urgency, not a stopping condition, and the retry
+	 * carries on.
+	 */
+	private _reportDeclinedClaims(
+		actions: ChainAction[],
+		outputs: ITrackedOutput[]
+	): void {
+		const height = this._currentBlockHeight;
+		for (const output of outputs) {
+			if (output.sweepTxHex !== undefined) continue;
+			if (output.uneconomicSinceHeight === undefined) {
+				output.uneconomicSinceHeight = height;
+				actions.push(this._uneconomicAction(output, 'skipped'));
+			}
+			const contestHeight = this._contestHeight(output);
+			if (
+				contestHeight !== undefined &&
+				height >= contestHeight &&
+				output.uneconomicContestedHeight === undefined
+			) {
+				output.uneconomicContestedHeight = height;
+				actions.push(this._uneconomicAction(output, 'contested'));
+			}
+		}
+	}
+
+	/**
+	 * Re-resolve revoked-commitment outputs that produced no spend, at the CURRENT
+	 * feerate.
+	 *
+	 * A claim that cannot pay its own fee is skipped rather than built (#241), and
+	 * nothing else revisits it: the rebroadcast/RBF loops only rebuild sweeps that
+	 * already reached SPEND_BROADCAST, and an output with no sweepTxHex is not in
+	 * that set. Fee spikes are transient and a breach remedy is not, so a skipped
+	 * claim is retried for as long as its outpoint is unspent. A competing spend
+	 * path opening (their CSV maturing, an HTLC expiring) does NOT stop the retry:
+	 * it does not invalidate our revocation spend, it only starts a race, and a
+	 * later fee drop can still win it. Only an actual spend, which moves the
+	 * output off CONFIRMED through handleOutputSpent, ends the attempt.
+	 *
+	 * Runs on every new block and whenever a fresh fee estimate arrives.
+	 */
+	private _retryUnsweptRevokedSweeps(actions: ChainAction[]): void {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.commitmentType !== CommitmentType.THEIR_REVOKED_COMMITMENT ||
+			!broadcast.revokedTxHex
+		) {
+			return;
+		}
+
+		let revokedTx: bitcoin.Transaction;
+		try {
+			revokedTx = bitcoin.Transaction.fromHex(broadcast.revokedTxHex);
+		} catch {
+			return;
+		}
+
+		const retryable = this._trackedOutputs.filter(
+			(output) =>
+				output.status === OutputStatus.CONFIRMED &&
+				output.sweepTxHex === undefined &&
+				!output.isSecondLevelHtlc &&
+				// Second-level justice claims spend the cheater's HTLC tx rather than
+				// this commitment, and are re-resolved through rebuildSweep.
+				output.txid === broadcast.txid
+		);
+		const claimed = this._claimedRevokedOutputIndices(broadcast.txid);
+		if (
+			retryable.length === 0 &&
+			!this._hasUnclaimedSnapshotOutputs(broadcast, revokedTx, claimed)
+		) {
+			return;
+		}
+
+		let resolved: ReturnType<typeof resolveRevokedCommitmentOutputs> = [];
+		try {
+			resolved = resolveRevokedCommitmentOutputs(
+				this._channelState,
+				retryable,
+				broadcast.commitmentNumber,
+				revokedTx,
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._revocationBasepointSecret,
+				this._paymentPrivkey,
+				this._network,
+				this._currentBlockHeight,
+				// Never re-batch an outpoint one of our live sweeps already spends:
+				// the replacement would conflict with our own penalty.
+				claimed
+			);
+		} catch {
+			// A retry must never break block processing; the next one tries again.
+			return;
+		}
+
+		this._recordPenaltyBroadcasts(
+			actions,
+			resolved,
+			'penalty sweep (revoked commitment, retried after skip)'
+		);
+		// Over the tracked set rather than over `retryable`: the pass above adopts
+		// snapshot-reconstructed outputs, and a claim declined for one of those is
+		// otherwise the one decline nothing can report.
+		this._reportDeclinedClaims(
+			actions,
+			this._revokedCommitmentOutputs(broadcast)
+		);
+	}
+
+	/** Tracked outputs belonging to a given commitment broadcast. */
+	private _revokedCommitmentOutputs(
+		broadcast: ICommitmentBroadcast
+	): ITrackedOutput[] {
+		return this._trackedOutputs.filter((o) => o.txid === broadcast.txid);
+	}
+
+	/**
+	 * Whether the revoked commitment still carries an output that no claim of ours
+	 * spends and no tracked output covers, while a settled-HTLC snapshot exists
+	 * that could reconstruct one.
+	 *
+	 * The retry set is otherwise seeded from _trackedOutputs alone, and outputs
+	 * rebuilt from revokedHtlcSnapshots never become tracked outputs (#322). A
+	 * skipped snapshot HTLC would then be the one thing the retry could never come
+	 * back for, which is precisely the case it exists to cover. This is a coarse
+	 * trigger on purpose: the resolver does the exact script matching and returns
+	 * nothing when there is nothing to claim.
+	 */
+	private _hasUnclaimedSnapshotOutputs(
+		broadcast: ICommitmentBroadcast,
+		revokedTx: bitcoin.Transaction,
+		claimed: ReadonlySet<number>
+	): boolean {
+		const snapshot = this._channelState.revokedHtlcSnapshots?.get(
+			broadcast.commitmentNumber.toString()
+		);
+		if (!snapshot || snapshot.length === 0) return false;
+		for (let i = 0; i < revokedTx.outs.length; i++) {
+			if (claimed.has(i)) continue;
+			if (
+				this._trackedOutputs.some(
+					(o) => o.txid === broadcast.txid && o.outputIndex === i
+				)
+			) {
+				continue;
+			}
+			return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Re-claim OUR to_remote balance on a non-revoked peer commitment when it was
+	 * declined as uneconomic.
+	 *
+	 * The affordability guard that keeps an unaffordable to_remote from throwing
+	 * out of the resolver leaves the output tracked without a spend, and the
+	 * penalty retry above only covers revoked commitments. Without this the guard
+	 * would trade one failure (the throw that abandoned the whole resolution) for
+	 * another (a balance nobody ever comes back for). to_remote is ours outright,
+	 * so there is no race and no deadline; it is retried until it is claimed.
+	 *
+	 * Other output types on these commitments keep their existing paths: their
+	 * to_local is not ours to spend, and HTLC claims are driven by preimage and
+	 * cltv scheduling rather than by feerate.
+	 */
+	private _retryUnsweptRemoteBalance(actions: ChainAction[]): void {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			(broadcast.commitmentType !== CommitmentType.THEIR_CURRENT_COMMITMENT &&
+				broadcast.commitmentType !== CommitmentType.THEIR_FUTURE_COMMITMENT)
+		) {
+			return;
+		}
+
+		const retryable = this._trackedOutputs.filter(
+			(output) =>
+				output.outputType === OutputType.TO_REMOTE &&
+				output.status === OutputStatus.CONFIRMED &&
+				output.sweepTxHex === undefined &&
+				output.txid === broadcast.txid
+		);
+		if (retryable.length === 0) return;
+
+		for (const output of retryable) {
+			// rebuildSweep re-resolves a single output at a given rate across every
+			// commitment type, and _scheduleSweep holds one whose timelock (an
+			// anchor to_remote carries a 1-block CSV) has not matured yet.
+			const rebuilt = this.rebuildSweep(output, this._feeRatePerVbyte);
+			if (!rebuilt) continue;
+			this._scheduleSweep(
+				actions,
+				{ trackedOutput: output, spendTx: rebuilt },
+				'to_remote claim (retried after skip)'
+			);
+		}
+		this._reportDeclinedClaims(actions, retryable);
 	}
 }
