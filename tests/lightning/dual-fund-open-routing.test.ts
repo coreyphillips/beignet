@@ -325,11 +325,12 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 		expect(v2Calls.length).to.equal(1);
 	});
 
-	it('a v2 open honors preferTaproot in its default channel_type', function () {
-		// Same call, same node config, must mean the same channel type whether
-		// the peer routed us to v1 or v2. initiateOpen (v1) sends the single
-		// OPTION_TAPROOT bit when preferTaproot is set; the v2 default must
-		// match rather than silently opening a static_remotekey channel.
+	it('preferTaproot masks dual_fund globally: v2 refused, generic opens use v1 taproot', function () {
+		// Taproot v2 signing does not exist, so a preferTaproot node must
+		// never negotiate a v2 open: the configured preference is honored
+		// through the working v1 taproot path, never silently downgraded to
+		// a non-taproot v2 type. The explicit API refuses outright, and the
+		// generic open routes v1 even against a dual-fund-advertising peer.
 		const taprootNode = new LightningNode({
 			nodePrivateKey: crypto.randomBytes(32),
 			perCommitmentSeed: crypto.randomBytes(32),
@@ -339,21 +340,59 @@ describe('Issue #158: openChannel routes v1 vs v2 by peer features', function ()
 			preferTaproot: true
 		});
 		taprootNode.on('error', () => {});
-		const channel = taprootNode.openChannelV2(peerPubkey, {
+		expect(() =>
+			taprootNode.openChannelV2(peerPubkey, { fundingSatoshis: 100_000n })
+		).to.throw(/does not advertise option_dual_fund/);
+
+		const saved = node;
+		node = taprootNode; // reuse wirePeer/afterEach against this node
+		wirePeer(true);
+		node.openChannel(peerPubkey, 100_000n);
+		expect(v1Calls.length, 'v1 used: taproot preference preserved').to.equal(1);
+		expect(v2Calls.length).to.equal(0);
+		saved.destroy();
+	});
+
+	it('openChannelV2 with a real peer manager requires a connected, dual-fund peer', function () {
+		// The explicit v2 API enforces the SAME negotiated-feature contract
+		// as the generic router: with a peer manager attached, a missing
+		// peer, an incomplete init, or a peer without the bit all refuse
+		// BEFORE a key index is burned or a temp channel is retained.
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const cm = (node as any).channelManager;
+		cm.peerManager = { getPeer: () => undefined };
+		expect(() =>
+			node.openChannelV2(peerPubkey, { fundingSatoshis: 100_000n })
+		).to.throw(/Not connected to peer/);
+
+		cm.peerManager = {
+			getPeer: () => ({ getRemoteInit: () => undefined })
+		};
+		expect(() =>
+			node.openChannelV2(peerPubkey, { fundingSatoshis: 100_000n })
+		).to.throw(/has not completed init/);
+
+		cm.peerManager = {
+			getPeer: () => ({
+				getRemoteInit: () => ({ features: peerFeatures(false) })
+			})
+		};
+		expect(() =>
+			node.openChannelV2(peerPubkey, { fundingSatoshis: 100_000n })
+		).to.throw(/did not advertise option_dual_fund/);
+		expect(node.listChannels(), 'nothing was retained').to.have.length(0);
+
+		// A connected peer advertising the bit (and the commitment-format
+		// features the default type needs) passes the guard.
+		const rich = peerFeatures(true);
+		rich.setOptional(Feature.ANCHOR_ZERO_FEE_HTLC);
+		cm.peerManager = {
+			getPeer: () => ({ getRemoteInit: () => ({ features: rich }) })
+		};
+		const channel = node.openChannelV2(peerPubkey, {
 			fundingSatoshis: 100_000n
 		});
-		const channelType = channel.getDualFundingSession()!.getOpenChannelType();
-		expect(channelType, 'channel_type present').to.exist;
-		const flags = new FeatureFlags(channelType!);
-		expect(
-			flags.hasFeature(Feature.OPTION_TAPROOT),
-			'taproot bit set'
-		).to.equal(true);
-		expect(
-			flags.hasFeature(Feature.STATIC_REMOTE_KEY),
-			'no extra bits beside the taproot bit'
-		).to.equal(false);
-		taprootNode.destroy();
+		expect(channel.getTemporaryChannelId()).to.exist;
 	});
 
 	it('does not use v2 when our own features omit option_dual_fund', function () {

@@ -52,7 +52,10 @@ import {
 import {
 	JOURNAL_META_KEYS,
 	chainLostBackfill,
-	storedTipSequence
+	storedTipSequence,
+	resolveWatermarkAnchor,
+	META_REPLICATED_THROUGH,
+	META_REPLICATED_THROUGH_HASH
 } from './journal';
 import {
 	IWriterLeaseKeys,
@@ -62,13 +65,12 @@ import {
 	requireEncryptedSecretStorage
 } from './writer-lease';
 
-/** How far replication has provably got, for catch-up after a restart. */
-const META_REPLICATED_THROUGH = 'guardian_replicated_through';
 /** A registration already sent to at least one guardian (see below). */
 const META_PENDING_REGISTRATION = 'guardian_pending_registration_v1';
 
 export const REPLICATION_META_KEYS = {
 	replicatedThrough: META_REPLICATED_THROUGH,
+	replicatedThroughHash: META_REPLICATED_THROUGH_HASH,
 	pendingRegistration: META_PENDING_REGISTRATION
 } as const;
 
@@ -621,14 +623,37 @@ export class GuardianReplicator {
 	 * which they answer idempotently with OK_DUPLICATE.
 	 */
 	replicatedThrough(): bigint {
-		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		const storage = this.config.storage;
+		const raw = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
 		if (raw == null) return 0n;
 		if (!/^\d+$/.test(raw)) return 0n;
+		let value: bigint;
 		try {
-			return BigInt(raw);
+			value = BigInt(raw);
 		} catch {
 			return 0n;
 		}
+		// A positive watermark is only ever trusted when its recorded
+		// receipted-frame hash exists AND resolves against the retained
+		// store (the stored frame itself, or the retained base snapshot's
+		// previousFrameHash when compaction pruned exactly that frame): a
+		// replaced chain at the same height has NOT been receipted, and
+		// answering with the inherited watermark would release its messages
+		// without one. A missing hash is equally untrusted; every writer of
+		// the watermark binds it, so absence means the mark predates the
+		// binding or survived something that destroyed it. Reading 0 is the
+		// safe direction (re-offering is idempotent; a divergent chain is
+		// then refused by the guardians at its occupied sequences), and it
+		// self-heals: the next successful pass re-raises and re-binds.
+		if (value >= 1n) {
+			const boundHash = storage.getRecoveryMeta?.(META_REPLICATED_THROUGH_HASH);
+			if (boundHash == null) return 0n;
+			const anchor = resolveWatermarkAnchor(storage, value);
+			if (anchor == null || anchor.toString('hex') !== boundHash) {
+				return 0n;
+			}
+		}
+		return value;
 	}
 
 	/**
@@ -656,13 +681,20 @@ export class GuardianReplicator {
 	 *
 	 * Asked ONCE, at barrier construction, never per evaluation.
 	 *
-	 * A ZERO watermark is never refused. It releases nothing, so there is
-	 * nothing to refuse, and refusing it would freeze a node whose journal is
-	 * merely damaged, which is the same trade resolveDurability makes for an
-	 * unreadable tip.
+	 * Reads the RAW stored mark, not replicatedThrough(): the trusted read
+	 * already degrades an unresolvable mark to zero for release purposes,
+	 * and going through it here would silently wave through exactly the
+	 * rolled-back stores this check exists to refuse LOUDLY at startup.
+	 *
+	 * A ZERO (or unparseable, which reads as zero) watermark is never
+	 * refused. It releases nothing, so there is nothing to refuse, and
+	 * refusing it would freeze a node whose journal is merely damaged, which
+	 * is the same trade resolveDurability makes for an unreadable tip.
 	 */
 	watermarkExceedingJournal(): string | null {
-		const watermark = this.replicatedThrough();
+		const raw = this.config.storage.getRecoveryMeta?.(META_REPLICATED_THROUGH);
+		if (raw == null || !/^\d+$/.test(raw)) return null;
+		const watermark = BigInt(raw);
 		if (watermark === 0n) return null;
 		const tip = storedTipSequence(this.config.storage);
 		if (tip == null) {
@@ -698,7 +730,24 @@ export class GuardianReplicator {
 				stored = current;
 				return;
 			}
+			// Bind the watermark to the HISTORY it receipts, not just a
+			// height: the receipt verification above proved the guardian
+			// head names our stored frame, so record which frame that was.
+			// A later chain replacement at the same height then fails the
+			// binding instead of inheriting the receipts. Height and hash
+			// are ONE atomic pair; a raise whose target has no resolvable
+			// anchor is REFUSED outright, because an unbound positive mark
+			// is exactly the fail-open the binding exists to close.
+			const anchor = resolveWatermarkAnchor(storage, value);
+			if (anchor == null) {
+				stored = current;
+				return;
+			}
 			storage.setRecoveryMeta?.(META_REPLICATED_THROUGH, value.toString());
+			storage.setRecoveryMeta?.(
+				META_REPLICATED_THROUGH_HASH,
+				anchor.toString('hex')
+			);
 		});
 		return stored;
 	}
@@ -746,8 +795,24 @@ export class GuardianReplicator {
 		// cannot even show, and the frame-hash check below cannot help,
 		// because a head we do not hold is not in the map to compare against.
 		if (head > tip) return null;
+		// A genesis head certifies nothing and binds to nothing.
+		if (head === 0n) return { head, conflictAt: null };
+		// EVERY positive head must bind to OUR history before it counts
+		// toward a quorum: the receipt's signed hash is compared against the
+		// frame this pass loaded, or, when the head sits below the loaded
+		// window or was legitimately compacted, against the same anchor the
+		// watermark trusts (the stored row, or the retained base snapshot's
+		// previousFrameHash). A head that resolves to NOTHING is not
+		// evidence; a head that resolves to a DIFFERENT hash is a receipt
+		// for a foreign history and must never raise our watermark, however
+		// valid its signature is. Without this, a compacted position let a
+		// foreign receipt through unchecked, and raiseWatermark would then
+		// launder it by re-binding the height to OUR local hash.
 		const ours = framesBySequence.get(head);
-		if (ours && !state.logHead.frameHash.equals(ours.frameHash)) {
+		const expected =
+			ours?.frameHash ?? resolveWatermarkAnchor(this.config.storage, head);
+		if (expected == null) return null;
+		if (!state.logHead.frameHash.equals(expected)) {
 			return { head: 0n, conflictAt: head };
 		}
 		return { head, conflictAt: null };

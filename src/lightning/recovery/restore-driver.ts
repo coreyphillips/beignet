@@ -1023,6 +1023,14 @@ export class RestoreDriver {
 				REPLICATION_META_KEYS.replicatedThrough,
 				certified.logHead.sequence.toString()
 			);
+			// The watermark is only trusted when bound to the history it
+			// receipts; the certified head IS that history's tip, and its
+			// frame row was installed above, so the binding resolves
+			// immediately.
+			targetStorage.setRecoveryMeta!(
+				REPLICATION_META_KEYS.replicatedThroughHash,
+				certified.logHead.frameHash.toString('hex')
+			);
 			this.clearPending();
 		});
 		this.emit(

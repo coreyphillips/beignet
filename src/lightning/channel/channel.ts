@@ -7,6 +7,19 @@
  */
 
 import crypto from 'crypto';
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
+import { createFundingScript } from '../script/funding';
+import {
+	buildTaprootKeySpendWitness,
+	createTaprootFundingScript
+} from '../script/funding-taproot';
+import { encodeShortChannelId } from '../gossip/types';
+import {
+	encodeAnnouncementSignaturesMessage,
+	encodeChannelAnnouncementMessage,
+	encodeChannelUpdateMessage
+} from '../gossip/messages';
 import { MessageType } from '../message/types';
 import { ANCHOR_TOTAL_COST } from '../script/anchor';
 import {
@@ -74,7 +87,8 @@ import {
 	HtlcDirection,
 	HtlcState,
 	BITCOIN_CHAIN_HASH,
-	MAX_FUNDING_SATOSHIS
+	MAX_FUNDING_SATOSHIS,
+	DEFAULT_CHANNEL_CONFIG
 } from './types';
 import {
 	IChannelState,
@@ -102,6 +116,8 @@ import { generateFromSeed, MAX_INDEX } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { ChannelSigner, ISigner } from '../keys/signer';
 import {
+	buildLocalCommitment,
+	aggregateLocalCommitmentSig,
 	buildRemoteCommitment,
 	signRemoteCommitment,
 	verifyRemoteCommitmentSig,
@@ -115,7 +131,13 @@ import {
 	getLocalCommitmentLeaseBlockheight,
 	HTLC_SUCCESS_WEIGHT
 } from './commitment-builder';
-import { isAnchorChannel, isTaprootChannel } from './types';
+import {
+	hasScidAliasChannelType,
+	isAnchorChannel,
+	isTaprootChannel,
+	scidAliasAnnounceRefusal,
+	validateV2ChannelType
+} from './types';
 import { generateNonce } from '../crypto/musig';
 import { IStfuMessage, encodeStfuMessage } from '../message/stfu';
 import { QuiescenceManager, QuiescenceState } from './quiescence';
@@ -290,7 +312,6 @@ function computeChannelReserve(
  * interactive-tx input that arrived with the full prevtx.
  */
 function extractTxidFromPrevTx(prevTx: Buffer): Buffer {
-	const bitcoin = require('bitcoinjs-lib');
 	return Buffer.from(bitcoin.Transaction.fromBuffer(prevTx).getHash());
 }
 
@@ -302,7 +323,6 @@ function extractTxidFromPrevTx(prevTx: Buffer): Buffer {
 function interactiveInputValueSats(input: IInteractiveTxInput): bigint | null {
 	if (!input.prevTx || input.prevTx.length === 0) return null;
 	try {
-		const bitcoin = require('bitcoinjs-lib');
 		const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
 		const vout = input.prevTxVout ?? input.prevOutputIndex;
 		if (vout < 0 || vout >= prev.outs.length) return null;
@@ -4343,15 +4363,15 @@ export class Channel {
 			closing.localCommitmentNumber
 		);
 
-		const {
-			buildLocalCommitment: buildLocal
-		} = require('./commitment-builder');
-		const { createFundingScript } = require('../script/funding');
-
 		// Rebuild at the exact feerate the stored remote signature covers
 		// (signedLocal=true) — mid-fee-round the in-flight rate can differ,
 		// which would change the sighash and make the witness invalid.
-		const built = buildLocal(closing, perCommitmentPoint, undefined, true);
+		const built = buildLocalCommitment(
+			closing,
+			perCommitmentPoint,
+			undefined,
+			true
+		);
 
 		let localNonce: Uint8Array | null = null;
 		if (taproot) {
@@ -4373,10 +4393,6 @@ export class Channel {
 			// cannot aggregate, which is why that is the very first thing asked.
 			localNonce = this._deriveVerificationNonce(closing.localCommitmentNumber);
 			closing.localNonce = localNonce;
-			const { aggregateLocalCommitmentSig } = require('./commitment-builder');
-			const {
-				buildTaprootKeySpendWitness
-			} = require('../script/funding-taproot');
 			const aggSig = aggregateLocalCommitmentSig(
 				closing,
 				signer,
@@ -6320,11 +6336,7 @@ export class Channel {
 			!this._state.fundingTxid
 		)
 			return;
-
-		const bitcoinLib = require('bitcoinjs-lib');
-		const tx = bitcoinLib.Transaction.fromHex(inflight.spliceTxHex);
-
-		const { createFundingScript } = require('../script/funding');
+		const tx = bitcoin.Transaction.fromHex(inflight.spliceTxHex);
 		const oldFunding = createFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
@@ -7416,8 +7428,6 @@ export class Channel {
 
 		const session = this._spliceSession;
 		if (!session || !this._state.fundingTxid) return;
-
-		const { createFundingScript } = require('../script/funding');
 		const localFundingPubkey = this._state.localBasepoints.fundingPubkey;
 		const remoteFundingPubkey =
 			session.getRemoteFundingPubkey() ||
@@ -7677,7 +7687,6 @@ export class Channel {
 
 		// The shared input spends our current funding output (a 2-of-2 of the
 		// current funding pubkeys).
-		const { createFundingScript } = require('../script/funding');
 		const oldFunding = createFundingScript(
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
@@ -7724,7 +7733,7 @@ export class Channel {
 		const ourWalletWitnesses: Buffer[][] = [];
 		const ourWalletInputIndices: number[] = [];
 		if (this._spliceInInputs) {
-			const p2wshScript = require('bitcoinjs-lib').payments.p2wsh({
+			const p2wshScript = bitcoin.payments.p2wsh({
 				redeem: { output: oldFunding.witnessScript }
 			}).output as Buffer;
 			const prevouts = this._collectPrevouts(
@@ -9368,7 +9377,6 @@ export class Channel {
 		}
 
 		// Compute real SCID for ALL channels (needed for routing hints on private channels)
-		const { encodeShortChannelId } = require('../gossip/types');
 		const scid = encodeShortChannelId({
 			block: blockHeight,
 			txIndex,
@@ -9393,9 +9401,6 @@ export class Channel {
 		const sigs = signAnnouncement(announcementData);
 
 		// Encode announcement_signatures message
-		const {
-			encodeAnnouncementSignaturesMessage
-		} = require('../gossip/messages');
 		const payload = encodeAnnouncementSignaturesMessage({
 			channelId: this._state.channelId!,
 			shortChannelId: scid,
@@ -9520,7 +9525,6 @@ export class Channel {
 			.createHash('sha256')
 			.update(crypto.createHash('sha256').update(data).digest())
 			.digest();
-		const ecc = require('@bitcoinerlab/secp256k1');
 		try {
 			if (
 				ecc.verify(hash, this._state.localBasepoints.fundingPubkey, storedSig)
@@ -9619,7 +9623,6 @@ export class Channel {
 		const remoteBp = this._state.remoteBasepoints!;
 
 		// Construct the full channel_announcement message
-		const { encodeChannelAnnouncementMessage } = require('../gossip/messages');
 		const announcement = encodeChannelAnnouncementMessage({
 			nodeSignature1: isNode1
 				? localNodeSig
@@ -9643,7 +9646,6 @@ export class Channel {
 		});
 
 		// Build initial channel_update (direction = our direction bit)
-		const { encodeChannelUpdateMessage } = require('../gossip/messages');
 		const directionBit = isNode1 ? 0 : 1;
 		// BOLT 7: htlc_maximum_msat MUST be <= channel capacity
 		const capacityMsat = this._state.fundingSatoshis * 1000n;
@@ -9704,6 +9706,41 @@ export class Channel {
 			return [{ type: ChannelActionType.ERROR, message: v2MaxHtlcErr }];
 		}
 
+		// BOLT 2 requires channel_type on open_channel2, so the default is
+		// resolved INTO the params before anything else: the wire message
+		// must carry it (CLN aborts a type-less open_channel2 outright).
+		if (!params.channelType) {
+			const defaultType = FeatureFlags.empty();
+			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
+			params = { ...params, channelType: defaultType.toBuffer() };
+		}
+		// Admission validation of the type this open would propose, BEFORE
+		// any state mutation: taproot v2 signing does not exist, so a
+		// taproot (or otherwise unrecognized) type must never leave this
+		// method as an OPEN_CHANNEL2. The manager additionally validates
+		// against both init vectors; a raw Channel has none, so the
+		// presence, structural and taproot rules still hold here.
+		const v2TypeErr = validateV2ChannelType(params.channelType);
+		if (v2TypeErr) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: `Cannot initiate v2 open: ${v2TypeErr}`
+				}
+			];
+		}
+		// BOLT 2: a scid_alias type must never go out announceable. The
+		// trusted path upstream already forces this; enforcing it HERE
+		// covers every caller that hands an explicit alias type with the
+		// default (announce) channel flags.
+		if (hasScidAliasChannelType(params.channelType ?? null)) {
+			params = {
+				...params,
+				channelFlags: (params.channelFlags ?? 0x01) & ~0x01
+			};
+			this._state.announceChannel = false;
+		}
+
 		this._state.fundingVersion = 2;
 		this._state.commitmentFeeratePerkw = params.commitmentFeeratePerkw;
 		this._state.fundingLocktime = params.locktime;
@@ -9727,13 +9764,9 @@ export class Channel {
 				)
 			}
 		};
-		if (params.channelType) {
-			this._state.channelType = Buffer.from(params.channelType);
-		} else {
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
-		}
+		// The type was resolved and validated at admission above; it is
+		// always present here.
+		this._state.channelType = Buffer.from(params.channelType!);
 
 		// BOLT 2 v2: temporary_channel_id is derived from our revocation basepoint
 		// (peer's zeroed), not random — so a spec-compliant peer routes our
@@ -9789,17 +9822,59 @@ export class Channel {
 		localParams: IDualFundingParams
 	): ChannelAction[] {
 		if (this._state.state !== ChannelState.NONE) {
+			// Deliberately LOCAL-only: this guard can only fire on a channel
+			// that already has a life (a replayed or misrouted open), and a
+			// wire error scoped to that id would cancel whatever the peer
+			// still considers live. Every refusal of a FRESH open below is
+			// wire-visible instead.
 			return [
 				{ type: ChannelActionType.ERROR, message: 'Unexpected open_channel2' }
 			];
 		}
+
+		// Every rejected inbound open_channel2 must reach the OPENER too
+		// (BOLT 2 negotiation cancellation): a local error alone deletes our
+		// half while the opener sits awaiting accept_channel2 forever. The
+		// error is scoped to the id the opener used.
+		const refuse = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'ascii')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
 
 		const acceptV2MaxHtlcErr = validateU64(
 			localParams.maxHtlcValueInFlightMsat,
 			'max_htlc_value_in_flight_msat'
 		);
 		if (acceptV2MaxHtlcErr) {
-			return [{ type: ChannelActionType.ERROR, message: acceptV2MaxHtlcErr }];
+			return refuse(acceptV2MaxHtlcErr);
+		}
+
+		// Admission validation of the PROPOSED type before any state
+		// mutation, echo or key adoption: a taproot or unrecognized type
+		// would otherwise be echoed in ACCEPT_CHANNEL2 and die at the
+		// commitment stage, and BOLT 2 makes the field REQUIRED on
+		// open_channel2, so an absent type is refused too. The manager
+		// validates against both init vectors; a raw Channel has none, so
+		// the presence, structural and taproot rules still hold here.
+		const v2TypeErr = validateV2ChannelType(msg.channelType ?? null);
+		if (v2TypeErr) {
+			return refuse(`open_channel2 refused: ${v2TypeErr}`);
+		}
+		// BOLT 2: an opener proposing scid_alias with the announce flag set
+		// is asking for a pairing the spec forbids; refuse rather than
+		// silently flip its intent.
+		const aliasAnnounceErr = scidAliasAnnounceRefusal(
+			msg.channelType ?? null,
+			(msg.channelFlags & 0x01) !== 0
+		);
+		if (aliasAnnounceErr) {
+			return refuse(`open_channel2 refused: ${aliasAnnounceErr}`);
 		}
 
 		this._state.fundingVersion = 2;
@@ -9815,12 +9890,9 @@ export class Channel {
 			const proposedFlags = FeatureFlags.fromBuffer(msg.channelType);
 			if (proposedFlags.hasFeature(Feature.ZERO_CONF)) {
 				if (!this._state.trustedPeer) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Proposed zero_conf channel type requires a trusted peer'
-						}
-					];
+					return refuse(
+						'Proposed zero_conf channel type requires a trusted peer'
+					);
 				}
 				this._state.zeroConfEnabled = true;
 				this._state.minimumDepth = 0;
@@ -9848,12 +9920,7 @@ export class Channel {
 		);
 		const result = session.handleOpenChannel2(msg, localParams);
 		if (!result.ok || !result.message) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to handle open_channel2'
-				}
-			];
+			return refuse(result.error || 'Failed to handle open_channel2');
 		}
 
 		// max_htlc_value_in_flight_msat is advertised as configured, not
@@ -9878,16 +9945,10 @@ export class Channel {
 			this._state.remoteBasepoints!.revocationBasepoint,
 			this._state.localBasepoints.revocationBasepoint
 		);
-		// Record the negotiated channel type (session validated any mismatch) so
-		// commitment #0 is built with the same anchor/taproot dispatch on both
-		// sides. Default per BOLT 2: static_remotekey.
-		if (msg.channelType) {
-			this._state.channelType = Buffer.from(msg.channelType);
-		} else {
-			const defaultType = FeatureFlags.empty();
-			defaultType.setCompulsory(Feature.STATIC_REMOTE_KEY);
-			this._state.channelType = defaultType.toBuffer();
-		}
+		// Record the negotiated channel type (validated at admission above,
+		// which also made its PRESENCE mandatory per BOLT 2) so commitment
+		// #0 is built with the same anchor dispatch on both sides.
+		this._state.channelType = Buffer.from(msg.channelType!);
 		this._state.state = ChannelState.DUAL_FUNDING_V2;
 
 		// Dual funding v2: reconcile per-side balances from BOTH contributions.
@@ -9933,12 +9994,9 @@ export class Channel {
 			localParams.willFund &&
 			msg.requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Script-enforced lease is not supported on taproot channels'
-				}
-			];
+			return refuse(
+				'Script-enforced lease is not supported on taproot channels'
+			);
 		}
 
 		// Likewise anchors-only: the plain P2WPKH to_remote of a non-anchor
@@ -9949,13 +10007,9 @@ export class Channel {
 			localParams.willFund &&
 			msg.requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
-				}
-			];
+			return refuse(
+				'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
+			);
 		}
 
 		// Liquidity ads (bLIP-0051): if we (the seller) committed will_fund, the
@@ -9975,12 +10029,9 @@ export class Channel {
 					(bh < this._currentBlockHeight - LEASE_BLOCKHEIGHT_PAST_TOLERANCE ||
 						bh > this._currentBlockHeight + LEASE_BLOCKHEIGHT_FUTURE_TOLERANCE))
 			) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: `Buyer lease blockheight ${bh} is out of the acceptable range`
-					}
-				];
+				return refuse(
+					`Buyer lease blockheight ${bh} is out of the acceptable range`
+				);
 			}
 			// Charge the proportional fee on what the lease actually funds:
 			// min(our funding_satoshis, requested_sats). If we (the seller) fund
@@ -10031,31 +10082,39 @@ export class Channel {
 	 * Handle accept_channel2 from remote (opener side).
 	 */
 	handleAcceptChannel2(msg: IAcceptChannel2Message): ChannelAction[] {
+		const refuse = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
 		if (this._state.state !== ChannelState.DUAL_FUNDING_V2) {
-			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected accept_channel2' }
-			];
+			return refuse('Unexpected accept_channel2');
 		}
 
 		const session = this._state.dualFundingSession;
 		if (!session) {
-			return [
-				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
-			];
+			return refuse('No dual-funding session');
 		}
 
 		const result = session.handleAcceptChannel2(msg);
 		if (!result.ok) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to handle accept_channel2'
-				}
-			];
+			// The refusal must be WIRE-VISIBLE: a local error alone deletes
+			// our half while the accepter sits waiting for tx_add_input
+			// forever. The error is scoped to the id the peer used, so its
+			// side cancels the open too.
+			const reason = result.error || 'Failed to handle accept_channel2';
+			return refuse(reason);
 		}
 
 		// BOLT 2: when the channel type is option_zeroconf the accepter MUST set
-		// minimum_depth to zero. Surface a disagreement instead of ignoring it.
+		// minimum_depth to zero. Surface the disagreement to BOTH sides: this
+		// refusal ends the open, and a silent local exit would leave the
+		// accepter waiting on a channel we no longer track.
 		if (
 			this._state.channelType &&
 			FeatureFlags.fromBuffer(this._state.channelType).hasFeature(
@@ -10063,12 +10122,8 @@ export class Channel {
 			) &&
 			msg.minimumDepth !== 0
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`
-				}
-			];
+			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
+			return refuse(reason);
 		}
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
@@ -10123,12 +10178,9 @@ export class Channel {
 			msg.willFund &&
 			requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Script-enforced lease is not supported on taproot channels'
-				}
-			];
+			return refuse(
+				'Script-enforced lease is not supported on taproot channels'
+			);
 		}
 		// Anchors-only for the same reason as handleOpenChannel2: a non-anchor
 		// P2WPKH to_remote cannot carry the lessor's lease CLTV.
@@ -10137,13 +10189,9 @@ export class Channel {
 			msg.willFund &&
 			requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
-				}
-			];
+			return refuse(
+				'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
+			);
 		}
 		if (msg.willFund && requestFunds) {
 			// M2 fund-safety: the seller must actually contribute at least the inbound
@@ -10152,12 +10200,7 @@ export class Channel {
 			// this check an adversarial seller could return fundingSatoshis=0, pocket
 			// the lease fee, and deliver no liquidity — an unconditional loss to us.
 			if (msg.fundingSatoshis < requestFunds.requestedSats) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Seller funded less than the requested lease amount'
-					}
-				];
+				return refuse('Seller funded less than the requested lease amount');
 			}
 			const fundingFeeratePerkw =
 				session.getLocalParams()?.fundingFeeratePerkw ?? 0;
@@ -10186,13 +10229,9 @@ export class Channel {
 			// an unverified lease fee when no ceiling was set.
 			const maxLeaseRates = session.getLocalParams()?.maxLeaseRates;
 			if (!maxLeaseRates) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'No maximum lease rates configured; refusing to pay an unverified lease fee'
-					}
-				];
+				return refuse(
+					'No maximum lease rates configured; refusing to pay an unverified lease fee'
+				);
 			}
 			const maxLeaseFeeSat = computeLeaseFeeSat(
 				maxLeaseRates,
@@ -10200,12 +10239,7 @@ export class Channel {
 				fundingFeeratePerkw
 			);
 			if (leaseFeeSat > maxLeaseFeeSat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Seller lease fee exceeds our accepted maximum'
-					}
-				];
+				return refuse('Seller lease fee exceeds our accepted maximum');
 			}
 			// CLN's lease accounting (validated live): the buyer pays the fee
 			// through the FUNDING TRANSACTION — the funding output must total
@@ -10701,15 +10735,11 @@ export class Channel {
 			const taproot = isTaprootChannel(session.getOpenChannelType() ?? null);
 			let fundingSpk: Buffer;
 			if (taproot) {
-				const {
-					createTaprootFundingScript
-				} = require('../script/funding-taproot');
 				fundingSpk = createTaprootFundingScript(
 					this._state.localBasepoints.fundingPubkey,
 					this._state.remoteBasepoints.fundingPubkey
 				).p2trOutput;
 			} else {
-				const { createFundingScript } = require('../script/funding');
 				fundingSpk = createFundingScript(
 					this._state.localBasepoints.fundingPubkey,
 					this._state.remoteBasepoints.fundingPubkey
@@ -10794,7 +10824,7 @@ export class Channel {
 
 		if (!this._dualFundingContribs) {
 			const err = this._computeDualFundingContributions();
-			if (err) return [{ type: ChannelActionType.ERROR, message: err }];
+			if (err) return this._abortV2Negotiation(err);
 		}
 
 		if (this._dualFundingContribIndex < this._dualFundingContribs!.length) {
@@ -10802,12 +10832,9 @@ export class Channel {
 			if (c.kind === 'input') {
 				const result = session.addInput(c.input);
 				if (!result.ok) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: result.error || 'Failed to add contribution input'
-						}
-					];
+					return this._abortV2Negotiation(
+						result.error || 'Failed to add contribution input'
+					);
 				}
 				const msg: ITxAddInputMessage = {
 					channelId: this._v2ChannelId(),
@@ -10822,12 +10849,9 @@ export class Channel {
 			}
 			const result = session.addOutput(c.output);
 			if (!result.ok) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: result.error || 'Failed to add contribution output'
-					}
-				];
+				return this._abortV2Negotiation(
+					result.error || 'Failed to add contribution output'
+				);
 			}
 			const outMsg: ITxAddOutputMessage = {
 				channelId: this._v2ChannelId(),
@@ -11059,7 +11083,6 @@ export class Channel {
 		let fundingScript: Buffer | null = null;
 		if (this._state.remoteBasepoints) {
 			try {
-				const { createFundingScript } = require('../script/funding');
 				const localPub =
 					kind === 'splice'
 						? this._spliceSession!.getLocalFundingPubkey()
@@ -11142,16 +11165,11 @@ export class Channel {
 		if (!session || !this._state.remoteBasepoints) return null;
 		const built = session.buildTransaction();
 		if (!built) return null;
-		const {
-			buildSpliceTx: buildV2Tx,
-			findOutputIndex: findFundingIndex
-		} = require('./splice-tx');
-		const { createFundingScript } = require('../script/funding');
 		let tx;
 		try {
 			// The interactive-tx final ordering (ascending serial_id) is exactly
 			// what buildSpliceTx produces; both sides derive the identical txid.
-			tx = buildV2Tx(
+			tx = buildSpliceTx(
 				built.inputs.map((i: IInteractiveTxInput) => ({
 					serialId: i.serialId,
 					prevTxid:
@@ -11175,7 +11193,7 @@ export class Channel {
 			this._state.localBasepoints.fundingPubkey,
 			this._state.remoteBasepoints.fundingPubkey
 		);
-		const outputIndex = findFundingIndex(tx, funding.p2wshOutput);
+		const outputIndex = findOutputIndex(tx, funding.p2wshOutput);
 		if (outputIndex < 0) return null;
 		if (BigInt(tx.outs[outputIndex].value) !== this._state.fundingSatoshis) {
 			return null;
@@ -11449,7 +11467,6 @@ export class Channel {
 		if (built) {
 			tx = built.tx;
 		} else if (record) {
-			const bitcoin = require('bitcoinjs-lib');
 			try {
 				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
 			} catch {
@@ -11487,7 +11504,6 @@ export class Channel {
 		if (!input.prevTx || input.prevTx.length < 32) {
 			return 'v2 funding input carries no previous transaction';
 		}
-		const bitcoin = require('bitcoinjs-lib');
 		let script: Buffer;
 		try {
 			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
@@ -11513,11 +11529,16 @@ export class Channel {
 		stack: Buffer[],
 		prevouts: { scripts: Buffer[]; values: bigint[] }
 	): string | null {
-		const bitcoin = require('bitcoinjs-lib');
-		const ecc = require('@bitcoinerlab/secp256k1');
 		const script = prevouts.scripts[index];
 		const value = prevouts.values[index];
 		if (stack.length === 0) return 'empty witness stack';
+		// bitcoinjs sighash APIs take number values; above 2^53 the
+		// narrowing would silently compute a wrong sighash and fail the
+		// verify for the wrong reason. No real prevout gets there (21M BTC
+		// in sats fits), so refuse loudly instead of narrowing quietly.
+		if (prevouts.values.some((v) => v > BigInt(Number.MAX_SAFE_INTEGER))) {
+			return 'prevout value exceeds the safe integer range';
+		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
 		const isP2wsh =
@@ -11613,7 +11634,6 @@ export class Channel {
 	 * SIGHASH_ALL byte, or the problem as a string.
 	 */
 	private _decodeDerSighashAll(el: Buffer): Buffer | string {
-		const bitcoin = require('bitcoinjs-lib');
 		let decoded: { signature: Buffer; hashType: number };
 		try {
 			decoded = bitcoin.script.signature.decode(el);
@@ -12335,7 +12355,6 @@ export class Channel {
 		}>,
 		sharedOverride?: { index: number; script: Buffer; value: bigint }
 	): { scripts: Buffer[]; values: bigint[] } | null {
-		const bitcoin = require('bitcoinjs-lib');
 		const scripts: Buffer[] = [];
 		const values: bigint[] = [];
 		for (let i = 0; i < tx.ins.length; i++) {
@@ -12390,7 +12409,6 @@ export class Channel {
 			if (record.ourWitnesses.length !== record.ourWalletInputIndices.length) {
 				return null;
 			}
-			const bitcoin = require('bitcoinjs-lib');
 			let tx: import('bitcoinjs-lib').Transaction;
 			try {
 				tx = bitcoin.Transaction.fromHex(record.fundingTxHex);
@@ -13207,7 +13225,6 @@ export function createOpenerChannel(params: {
 	localBasepoints: IChannelBasepoints;
 	localPerCommitmentSeed: Buffer;
 }): Channel {
-	const { DEFAULT_CHANNEL_CONFIG } = require('./types');
 	const state = createOpenerState({
 		temporaryChannelId: crypto.randomBytes(32),
 		fundingSatoshis: params.fundingSatoshis,
@@ -13228,7 +13245,6 @@ export function createAcceptorChannel(params: {
 	localBasepoints: IChannelBasepoints;
 	localPerCommitmentSeed: Buffer;
 }): Channel {
-	const { DEFAULT_CHANNEL_CONFIG } = require('./types');
 	const state = createAcceptorState({
 		temporaryChannelId: params.temporaryChannelId,
 		fundingSatoshis: 0n,

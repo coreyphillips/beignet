@@ -16,7 +16,6 @@ import { IDualFundingParams } from '../../src/lightning/channel/dual-funding';
 import { ILeaseRates } from '../../src/lightning/gossip/types';
 import { computeLeaseFeeSat } from '../../src/lightning/channel/liquidity-ads';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
-import { isTaprootChannel } from '../../src/lightning/channel/types';
 
 /** channel_type advertising option_taproot (simple taproot channels). */
 function taprootChannelType(): Buffer {
@@ -242,10 +241,11 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 
 	it('does not lease a taproot channel (mutually-exclusive commitment types)', function () {
 		// Script-enforced lease and simple taproot are distinct, mutually-exclusive
-		// commitment types (LND has no taproot lease script). A liquidity seller must
-		// therefore NOT answer a request_funds with a will_fund on a taproot channel;
-		// it opens as a normal (unleased) taproot channel instead of an unenforceable
-		// leased one.
+		// commitment types (LND has no taproot lease script). Round 17 moved the
+		// refusal to ADMISSION: taproot v2 signing does not exist, so a taproot
+		// v2 open (leased or not) is refused before an OPEN_CHANNEL2 ever goes
+		// out. A taproot lease can no longer even be proposed; nothing reaches
+		// the seller and no lease state can arise on either side.
 		const { buyer, seller, sellerId } = setup(true);
 
 		let lease: any = null;
@@ -253,31 +253,20 @@ describe('Liquidity ads negotiation (M3.2)', function () {
 			lease = l;
 		});
 
-		const buyerChannel = buyer.createDualFundedChannel(
-			sellerId,
-			makeParams({
-				channelType: taprootChannelType(),
-				requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
-			})
-		);
+		expect(() =>
+			buyer.createDualFundedChannel(
+				sellerId,
+				makeParams({
+					channelType: taprootChannelType(),
+					requestFunds: { requestedSats: 500_000n, blockheight: 800000 }
+				})
+			)
+		).to.throw(/option_taproot is not supported for dual-funded/);
 
-		// The buyer requested a taproot channel_type in open_channel2 (the value the
-		// seller's will_fund guard keys off), so the seller must decline the lease
-		// despite selling liquidity — no lease shift.
-		expect(
-			isTaprootChannel(
-				buyerChannel.getDualFundingSession()?.getOpenChannelType() ?? null
-			),
-			'buyer proposed a taproot channel_type'
-		).to.be.true;
 		expect(lease, 'no lease negotiated on a taproot channel').to.be.null;
-
-		// The seller mirror never entered the lessor state (no unenforceable lease).
-		const tempId = buyerChannel.getTemporaryChannelId().toString('hex');
-		const sellerChannel = (seller as any).tempChannels.get(tempId);
-		expect(sellerChannel, 'seller has the channel').to.exist;
-		const sState = sellerChannel.getFullState();
-		expect(sState.isLessor, 'seller is not a lessor').to.not.equal(true);
-		expect(sState.leaseExpiry, 'no lease expiry recorded').to.be.undefined;
+		expect(
+			(seller as any).tempChannels.size,
+			'nothing reached the seller'
+		).to.equal(0);
 	});
 });

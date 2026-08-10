@@ -353,6 +353,30 @@ export class DualFundingSession {
 			return { ok: false, error: validErr };
 		}
 
+		// BOLT 2: the accepter echoes the channel_type it is accepting, so
+		// an open that proposed one must see EXACTLY it come back. A
+		// missing or different echo means the two sides would build
+		// different commitment formats over one funding output; refuse
+		// before any interactive-tx state exists. An accepter volunteering
+		// a type the open never proposed is refused for the same reason.
+		const offeredType = this._openMsg?.channelType;
+		if (offeredType) {
+			if (!msg.channelType) {
+				return {
+					ok: false,
+					error: 'accept_channel2 omitted the channel_type this open proposed'
+				};
+			}
+			if (!msg.channelType.equals(offeredType)) {
+				return { ok: false, error: 'Channel type mismatch' };
+			}
+		} else if (msg.channelType) {
+			return {
+				ok: false,
+				error: 'accept_channel2 set a channel_type this open did not propose'
+			};
+		}
+
 		this._remoteFundingSatoshis = msg.fundingSatoshis;
 		this._remoteBasepoints = {
 			fundingPubkey: msg.fundingPubkey,

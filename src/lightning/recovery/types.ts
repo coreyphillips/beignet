@@ -298,6 +298,15 @@ export interface EncryptedRecoveryFrame {
  * peers treat replays idempotently.
  */
 export interface RecoverySnapshot {
+	/**
+	 * The snapshot content schema this frame was written under (see
+	 * META_SNAPSHOT_SCHEMA in journal.ts). Carried INSIDE the authenticated
+	 * frame because the local metadata marker does not survive guardian or
+	 * capsule restoration: without it, a future release's journal would
+	 * restore marker-less and read as migratable legacy. Absent on frames
+	 * written before the field existed.
+	 */
+	schemaVersion?: string;
 	channels: Array<{
 		channelId: string;
 		state: import('../channel/channel-state').IChannelState;
@@ -348,4 +357,17 @@ export interface IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint;
+	/**
+	 * Called when the commit's transaction ROLLED BACK: the journal
+	 * restores every in-memory field to its pre-attempt checkpoint (a
+	 * no-op when the failure happened before appendFrame began an
+	 * attempt), so a refusal never erases evidence and a rollback never
+	 * leaves phantom expectations.
+	 */
+	onCommitRollback?(): void;
+	/**
+	 * Called after the commit's transaction COMMITTED with a frame: the
+	 * journal discards its attempt checkpoint.
+	 */
+	onCommitCommitted?(): void;
 }

@@ -39,12 +39,475 @@ import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
 import {
 	JOURNAL_META_KEYS,
+	SNAPSHOT_SCHEMA_VERSION,
+	assertEmptyTarget,
+	assertFramesReconstructable,
+	assertNoJournalResidue,
 	deriveRecoveryMasterKey,
 	journalSupported,
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
-import { VerifiedRecoveryChain } from './types';
+import { withStorageTransaction } from '../storage/transaction';
+import {
+	RecoveryFrame,
+	RecoveryMutation,
+	RecoverySnapshot,
+	VerifiedRecoveryChain
+} from './types';
+import { createOpenerState, IChannelState } from '../channel/channel-state';
+import { DEFAULT_CHANNEL_CONFIG } from '../channel/types';
+import { MonitorState } from '../chain/types';
+import { PaymentDirection, PaymentStatus } from '../node/types';
+
+/**
+ * A capsule whose CONTENT could not replay (the chain verified, but a
+ * table write it implies is invalid, e.g. a constraint violation). Raised
+ * during PREVALIDATION, by replaying the candidate into a caller-supplied
+ * scratch backend BEFORE anything touches the real target: replaying on
+ * the target itself could never tell a content defect apart from a broken
+ * target disk, since both surface as the same storage exception. With the
+ * defect proven on the scratch, every error the real install raises is a
+ * TARGET problem and propagates.
+ */
+export class CapsuleReplayError extends Error {
+	readonly cause: unknown;
+	constructor(cause: unknown) {
+		super(
+			`recovery capsule content failed to replay: ${
+				cause instanceof Error ? cause.message : String(cause)
+			}`
+		);
+		this.name = 'CapsuleReplayError';
+		this.cause = cause;
+	}
+}
+
+export interface ICapsuleRestoreOptions {
+	/**
+	 * Factory for a FRESH, empty storage backend used to dry-run the
+	 * candidate's reconstruction before the real target is written (see
+	 * CapsuleReplayError). Supply an in-memory backend (e.g.
+	 * `() => new SqliteStorage(':memory:')`, opened). Kept injectable so
+	 * the recovery core stays free of a concrete backend dependency.
+	 * OPTIONAL for the single-capsule restore (a throw is a throw there);
+	 * REQUIRED by restoreBestRecoveryCapsule whenever the target supports
+	 * Tier 2, because its candidate/Tier-1 fallback contract depends on
+	 * classifying content defects, and without a dry-run a replay failure
+	 * on the real target cannot be told apart from a broken database.
+	 */
+	scratchStorage?: () => IStorageBackend;
+}
+
+/**
+ * Every mutation discriminant the probe's delta frames carry, and every
+ * snapshot table its base frame populates. These are Records over the REAL
+ * union types, so adding a mutation variant or a snapshot field breaks this
+ * file's compilation until the probe is extended to exercise it: the probe
+ * classifies validator health, and an operation it silently skips is an
+ * operation whose backend failure gets laundered into a capsule defect.
+ * A test additionally asserts the probe frames really carry each entry.
+ */
+export const PROBE_MUTATION_COVERAGE: Record<RecoveryMutation['type'], true> = {
+	channel_state: true,
+	channel_key_index: true,
+	chain_monitor: true,
+	payment_preimage: true,
+	htlc_payment_mapping: true,
+	delete_htlc_payment_mapping: true,
+	htlc_shared_secret: true,
+	delete_htlc_shared_secret: true,
+	forwarded_htlc: true,
+	delete_forwarded_htlc: true,
+	payment_state: true,
+	payment_secret: true,
+	delete_payment_secret: true,
+	delete_payment: true,
+	delete_preimage: true,
+	invoice_state: true,
+	delete_invoice: true,
+	invoice_path_id: true,
+	delete_invoice_path_id: true,
+	forwarding_event: true,
+	channel_closed: true,
+	outbox_supersede: true
+};
+export const PROBE_SNAPSHOT_COVERAGE: Record<
+	Exclude<keyof RecoverySnapshot, 'schemaVersion'>,
+	true
+> = {
+	channels: true,
+	keyIndices: true,
+	chainMonitors: true,
+	preimages: true,
+	payments: true,
+	paymentSecrets: true,
+	htlcPaymentMappings: true,
+	forwardedHtlcs: true,
+	htlcSharedSecrets: true,
+	invoices: true,
+	invoicePathIds: true,
+	forwardingEvents: true,
+	outbox: true
+};
+
+const PROBE_CHANNEL_ID = 'dd'.repeat(32);
+const PROBE_HASH = 'bb'.repeat(32);
+
+/**
+ * A serializable channel state built by the production constructor, so the
+ * probe's channel row can never rot against the serializer's field set the
+ * way a handcrafted literal would.
+ */
+function probeChannelState(): IChannelState {
+	const point = getPublicKey(Buffer.alloc(32, 7));
+	const state = createOpenerState({
+		temporaryChannelId: Buffer.alloc(32, 8),
+		fundingSatoshis: 1_000n,
+		pushMsat: 0n,
+		localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+		localBasepoints: {
+			fundingPubkey: point,
+			revocationBasepoint: point,
+			paymentBasepoint: point,
+			delayedPaymentBasepoint: point,
+			htlcBasepoint: point,
+			firstPerCommitmentPoint: point
+		},
+		localPerCommitmentSeed: Buffer.alloc(32, 9)
+	});
+	state.channelId = Buffer.from(PROBE_CHANNEL_ID, 'hex');
+	return state;
+}
+
+function probeOutboxMessage(): {
+	peerId: string;
+	channelId: string;
+	messageType: number;
+	wireMessage: Buffer;
+	disposition: 'pending_send';
+} {
+	return {
+		peerId: getPublicKey(Buffer.alloc(32, 7)).toString('hex'),
+		channelId: PROBE_CHANNEL_ID,
+		messageType: 136,
+		wireMessage: Buffer.from([0]),
+		disposition: 'pending_send'
+	};
+}
+
+/**
+ * A synthetic, KNOWN-GOOD frame set exercising EVERY operation a real
+ * replay can invoke: a current-schema snapshot populating all thirteen
+ * tables, one delta carrying every save-side mutation variant plus an
+ * outbox insert, and one delta carrying every delete-side variant against
+ * rows the earlier frames wrote. If the validator backend cannot replay
+ * THIS, the validator is broken, not the capsule; an operation missing
+ * here would let that backend's failure on it masquerade as a capsule
+ * content defect (see PROBE_MUTATION_COVERAGE / PROBE_SNAPSHOT_COVERAGE).
+ */
+export function knownGoodProbeFrames(): VerifiedRecoveryChain {
+	const snapshot: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 1n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [],
+		outboundMessages: [],
+		snapshot: {
+			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+			channels: [
+				{
+					channelId: PROBE_CHANNEL_ID,
+					state: probeChannelState(),
+					peerPubkey: getPublicKey(Buffer.alloc(32, 7)).toString('hex')
+				}
+			],
+			keyIndices: [{ channelId: 'aa'.repeat(32), channelIndex: 1 }],
+			chainMonitors: [
+				{
+					channelId: PROBE_CHANNEL_ID,
+					state: {
+						monitorState: MonitorState.WATCHING,
+						commitmentBroadcast: null,
+						trackedOutputs: [],
+						currentBlockHeight: 0
+					}
+				}
+			],
+			preimages: [{ paymentHash: PROBE_HASH, preimage: Buffer.alloc(32, 1) }],
+			payments: [
+				{
+					paymentHash: PROBE_HASH,
+					payment: {
+						paymentHash: Buffer.from(PROBE_HASH, 'hex'),
+						amountMsat: 1n,
+						status: PaymentStatus.COMPLETED,
+						direction: PaymentDirection.OUTGOING,
+						createdAt: 0
+					}
+				}
+			],
+			paymentSecrets: [
+				{ paymentHash: PROBE_HASH, secret: Buffer.alloc(32, 3) }
+			],
+			htlcPaymentMappings: [{ key: 'probe:0', paymentHash: PROBE_HASH }],
+			forwardedHtlcs: [
+				{
+					outKey: 'probe:offered-0',
+					inChannelId: Buffer.alloc(32, 4),
+					inHtlcId: 0n
+				}
+			],
+			htlcSharedSecrets: [{ key: 'probe:0', secret: Buffer.alloc(32, 5) }],
+			invoices: [
+				{
+					paymentHash: PROBE_HASH,
+					invoice: {
+						paymentHash: PROBE_HASH,
+						bolt11: 'lnbcrt1probe',
+						expiry: 3600,
+						createdAt: 0
+					}
+				}
+			],
+			invoicePathIds: [
+				{ paymentHash: PROBE_HASH, pathId: Buffer.alloc(32, 6) }
+			],
+			forwardingEvents: [
+				{
+					settledAt: 1,
+					inChannelId: PROBE_CHANNEL_ID,
+					outChannelId: PROBE_CHANNEL_ID,
+					amountInMsat: 2n,
+					amountOutMsat: 1n,
+					feeMsat: 1n
+				}
+			],
+			outbox: [{ ...probeOutboxMessage(), frameSequence: 1 }]
+		}
+	};
+	// Every save-side variant, plus the outbox insert path (which also
+	// drives the reconstruct loop's frame stamping on the released row).
+	const saves: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 2n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [
+			{
+				type: 'channel_state',
+				channelId: PROBE_CHANNEL_ID,
+				state: probeChannelState(),
+				peerPubkey: getPublicKey(Buffer.alloc(32, 7)).toString('hex')
+			},
+			{
+				type: 'channel_key_index',
+				channelId: 'aa'.repeat(32),
+				channelIndex: 2
+			},
+			{
+				type: 'chain_monitor',
+				channelId: PROBE_CHANNEL_ID,
+				state: {
+					monitorState: MonitorState.WATCHING,
+					commitmentBroadcast: null,
+					trackedOutputs: [],
+					currentBlockHeight: 1
+				}
+			},
+			{
+				type: 'payment_preimage',
+				paymentHash: 'cc'.repeat(32),
+				preimage: Buffer.alloc(32, 2)
+			},
+			{
+				type: 'htlc_payment_mapping',
+				htlcKey: 'probe:1',
+				paymentHash: PROBE_HASH
+			},
+			{
+				type: 'htlc_shared_secret',
+				key: 'probe:1',
+				secret: Buffer.alloc(32, 10)
+			},
+			{
+				type: 'forwarded_htlc',
+				outKey: 'probe:offered-1',
+				inChannelId: Buffer.alloc(32, 4),
+				inHtlcId: 1n
+			},
+			{
+				type: 'payment_state',
+				paymentHash: PROBE_HASH,
+				payment: {
+					paymentHash: Buffer.from(PROBE_HASH, 'hex'),
+					amountMsat: 1n,
+					status: PaymentStatus.COMPLETED,
+					direction: PaymentDirection.OUTGOING,
+					createdAt: 0
+				}
+			},
+			{
+				type: 'payment_secret',
+				paymentHash: PROBE_HASH,
+				secret: Buffer.alloc(32, 3)
+			},
+			{
+				type: 'invoice_state',
+				paymentHash: PROBE_HASH,
+				invoice: {
+					paymentHash: PROBE_HASH,
+					bolt11: 'lnbcrt1probe',
+					expiry: 3600,
+					createdAt: 0
+				}
+			},
+			{
+				type: 'invoice_path_id',
+				paymentHash: PROBE_HASH,
+				pathId: Buffer.alloc(32, 6)
+			},
+			{
+				type: 'forwarding_event',
+				event: {
+					settledAt: 2,
+					inChannelId: PROBE_CHANNEL_ID,
+					outChannelId: PROBE_CHANNEL_ID,
+					amountInMsat: 2n,
+					amountOutMsat: 1n,
+					feeMsat: 1n
+				}
+			}
+		],
+		outboundMessages: [
+			probeOutboxMessage(),
+			// A second row under a DIFFERENT message type, the target of the
+			// deletes frame's FILTERED outbox_supersede.
+			{ ...probeOutboxMessage(), messageType: 133 }
+		]
+	};
+	// Every delete-side variant, each against a row frames 1 or 2 wrote, so
+	// the deletes genuinely execute instead of no-oping on absent rows.
+	const deletes: RecoveryFrame = {
+		version: 1,
+		writerEpoch: 1n,
+		sequence: 3n,
+		previousFrameHash: Buffer.alloc(32),
+		timestamp: 0,
+		mutations: [
+			{ type: 'delete_htlc_payment_mapping', htlcKey: 'probe:1' },
+			{ type: 'delete_htlc_shared_secret', key: 'probe:1' },
+			{ type: 'delete_forwarded_htlc', outKey: 'probe:offered-1' },
+			{ type: 'delete_payment_secret', paymentHash: PROBE_HASH },
+			{ type: 'delete_payment', paymentHash: PROBE_HASH },
+			{ type: 'delete_preimage', paymentHash: 'cc'.repeat(32) },
+			{ type: 'delete_invoice', paymentHash: PROBE_HASH },
+			{ type: 'delete_invoice_path_id', paymentHash: PROBE_HASH },
+			// The FILTERED outbox deletion is a distinct storage path (the
+			// message-type list reaches a different SQL shape), so it is
+			// exercised separately from the unfiltered sweep below, against
+			// the type-133 row frame 2 inserted for exactly this purpose.
+			{
+				type: 'outbox_supersede',
+				channelId: PROBE_CHANNEL_ID,
+				messageTypes: [133]
+			},
+			{ type: 'outbox_supersede', channelId: PROBE_CHANNEL_ID },
+			{ type: 'channel_closed', channelId: PROBE_CHANNEL_ID }
+		],
+		outboundMessages: []
+	};
+	return [snapshot, saves, deletes] as VerifiedRecoveryChain;
+}
+
+/** Forces a deliberate rollback of a probe that SUCCEEDED (never surfaced). */
+class ProbeRollback extends Error {}
+
+/**
+ * Dry-run the candidate's replay on a scratch backend (see options).
+ *
+ * A candidate failure alone proves nothing: a generic backend exception
+ * cannot say whether the capsule content or the validator's own storage
+ * failed, and a TRANSIENT storage hiccup must not be laundered into a
+ * permanent content verdict. So a first-attempt failure is retried on an
+ * INDEPENDENTLY FRESH instance, which is first PROVED against a synthetic
+ * known-good frame set exercising every operation a real replay can invoke
+ * (that probe is deliberately rolled back so the instance stays empty),
+ * and then handed the candidate again. When the candidate REPRODUCES its
+ * failure there, one more probe runs TO COMMIT on the same instance: the
+ * rolled-back probe never exercised successful transaction completion, and
+ * a backend whose commit path is broken fails candidates for reasons that
+ * are its own. Only a candidate failing on an instance that proved BOTH
+ * the operation surface and the commit is typed as content; every other
+ * combination propagates the RAW candidate error (validator broken), and
+ * a candidate that replays cleanly on the proven instance was a transient
+ * first failure (the dry-run's question is answered: proceed).
+ *
+ * Every attempt decodes a FRESH authenticated frame graph via the injected
+ * factory: the frames are handed to FOREIGN adapter code (the scratch
+ * backend), and a hostile or buggy adapter mutating a Buffer during the
+ * first attempt must not poison the retry into a false content verdict.
+ */
+function assertReplaysOnScratch(
+	decodeFrames: () => VerifiedRecoveryChain,
+	scratchStorage: () => IStorageBackend
+): void {
+	const scratch = scratchStorage();
+	let candidateErr: unknown;
+	try {
+		withStorageTransaction(scratch, () => {
+			reconstructFromFrames(scratch, decodeFrames());
+		});
+		return;
+	} catch (err) {
+		candidateErr = err;
+	} finally {
+		(scratch as { close?: () => void }).close?.();
+	}
+	const fresh = scratchStorage();
+	try {
+		try {
+			withStorageTransaction(fresh, () => {
+				reconstructFromFrames(fresh, knownGoodProbeFrames());
+				// Roll the successful probe back so the candidate replay
+				// below runs on the SAME, still-empty, just-proven instance.
+				throw new ProbeRollback();
+			});
+		} catch (probeErr) {
+			if (!(probeErr instanceof ProbeRollback)) {
+				throw candidateErr;
+			}
+		}
+		try {
+			withStorageTransaction(fresh, () => {
+				reconstructFromFrames(fresh, decodeFrames());
+			});
+		} catch (repeatedErr) {
+			// Reproduced on the proven instance. Before this is called
+			// content, the backend must also COMPLETE a commit: the
+			// instance is empty again (the candidate rolled back), so the
+			// probe re-runs without the deliberate rollback. A commit that
+			// fails here is broken validator infrastructure; the raw
+			// candidate error propagates instead of a content verdict.
+			try {
+				withStorageTransaction(fresh, () => {
+					reconstructFromFrames(fresh, knownGoodProbeFrames());
+				});
+			} catch {
+				throw candidateErr;
+			}
+			throw new CapsuleReplayError(repeatedErr);
+		}
+		// The first failure did not reproduce: transient validator
+		// infrastructure, and the content is proven replayable.
+		return;
+	} finally {
+		(fresh as { close?: () => void }).close?.();
+	}
+}
 
 const CAPSULE_HKDF_INFO = 'beignet-recovery-capsule-v1';
 const CAPSULE_MAGIC = 'bRC1';
@@ -482,6 +945,13 @@ function verifyInlineJournal(
 			'recovery capsule head does not match its inline journal (stale or spliced payload)'
 		);
 	}
+	// Schema compatibility is part of CANDIDATE validation, not something
+	// discovered after the target was written: a structurally valid capsule
+	// whose base snapshot this release cannot restore must be rejected
+	// here, so restoreBestRecoveryCapsule treats it as a candidate defect
+	// (falling back to other replicas or the Tier 1 SCB) and
+	// restoreFromRecoveryCapsule throws before its first target write.
+	assertFramesReconstructable(frames);
 	return { encoded, rows, frames };
 }
 
@@ -491,10 +961,12 @@ function verifyInlineJournal(
  * Tier 2 path (inline journal present and the target supports frames): the
  * inline journal is verified COMPLETELY before anything touches the target
  * (verifyInlineJournal: the exact Phase 2 chain checks plus the capsule head
- * binding). Only then are the stored frame rows and journal metadata
- * installed and the deltas replayed through reconstructFromFrames. On ANY
- * tier 2 throw the target must be discarded; partial installs are not
- * cleaned up.
+ * binding and schema compatibility). The frame rows, the journal metadata
+ * AND the reconstruction replay then run inside ONE transaction: chain
+ * verification cannot prove the content REPLAYS (a constraint violation
+ * only surfaces when the tables are written), so a replay failure must
+ * roll the whole install back and leave the target exactly as it was,
+ * never half-populated.
  *
  * Tier 1 path (no inline state): the decoded SCB is returned for
  * recoverFromStaticChannelBackup, exactly like a plain SCB restore.
@@ -502,7 +974,8 @@ function verifyInlineJournal(
 export function restoreFromRecoveryCapsule(
 	capsule: RecoveryCapsule,
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): ICapsuleRestoreResult {
 	// Authenticates the Tier 1 material up front: wrong-key or tampered SCBs
 	// fail here before anything touches the target.
@@ -512,10 +985,40 @@ export function restoreFromRecoveryCapsule(
 		return { tier: 1, scb, framesApplied: 0 };
 	}
 
-	// Validate the candidate COMPLETELY before the first write to the target.
-	const { encoded, rows, frames } = verifyInlineJournal(capsule, nodeSecret);
+	// Validate the candidate COMPLETELY before the first write to the
+	// target: chain and schema, then (when a scratch backend is supplied)
+	// a full dry-run replay, so a content defect surfaces as the typed
+	// CapsuleReplayError while the target is still untouched. Refuse a
+	// target already carrying journal state: the metadata writes below
+	// would silently overwrite another journal.
+	const validated = verifyInlineJournal(capsule, nodeSecret);
+	if (options.scratchStorage) {
+		// Every dry-run attempt decodes its OWN authenticated frame graph:
+		// the frames reach foreign adapter code, and a mutation during one
+		// attempt must not leak into the next.
+		assertReplaysOnScratch(
+			() => verifyInlineJournal(capsule, nodeSecret).frames,
+			options.scratchStorage
+		);
+	}
+	// The dry-run handed the decoded frames to FOREIGN code (the scratch
+	// backend); a hostile or buggy adapter mutating a Buffer argument must
+	// not alter what the target replays, so the install re-decodes a fresh
+	// frame graph from the authenticated rows.
+	const { encoded, rows, frames } = options.scratchStorage
+		? verifyInlineJournal(capsule, nodeSecret)
+		: validated;
+	assertNoJournalResidue(target);
 
-	target.transaction(() => {
+	// ONE shared transaction for the frames, the metadata AND the replay:
+	// the inner reconstruction units (applySnapshot, the per-frame
+	// RecoveryManager commits) JOIN it through withStorageTransaction
+	// instead of nesting, which IStorageBackend does not promise. Any
+	// throw rolls the whole install back and PROPAGATES: the candidate's
+	// content was already proven (or, without a scratch, is at least never
+	// silently degraded), so a failure here means the TARGET is broken,
+	// not the capsule.
+	withStorageTransaction(target, () => {
 		for (const row of rows) {
 			target.saveRecoveryFrame!(row);
 		}
@@ -532,8 +1035,8 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
+		reconstructFromFrames(target, frames);
 	});
-	reconstructFromFrames(target, frames);
 	return { tier: 2, scb, framesApplied: frames.length };
 }
 
@@ -566,7 +1069,8 @@ export interface IBestCapsuleRestore extends ICapsuleRestoreResult {
 export function restoreBestRecoveryCapsule(
 	blobs: Buffer[],
 	target: IStorageBackend,
-	nodeSecret: Buffer
+	nodeSecret: Buffer,
+	options: ICapsuleRestoreOptions = {}
 ): IBestCapsuleRestore {
 	const candidates = blobs
 		.map((blob) => decodeRecoveryCapsuleBlob(blob, nodeSecret))
@@ -590,6 +1094,29 @@ export function restoreBestRecoveryCapsule(
 		writerEpoch: sorted[0].writerEpoch,
 		latestSequence: sorted[0].latestSequence
 	};
+
+	// A dirty target is refused ONCE, loudly, before any candidate is
+	// tried: with the install rolled back on failure, a per-candidate
+	// throw now reads as a candidate defect, and a pre-populated database
+	// must not be silently degraded through every candidate into a Tier 1
+	// answer. Dirty means EITHER reconstructed application tables OR any
+	// recovery journal residue (stored frames, journal metadata): the
+	// install writes both.
+	if (journalSupported(target)) {
+		// The candidate/Tier-1 fallback CONTRACT depends on classifying
+		// content defects, and only the dry-run can do that: without a
+		// scratch, a replay failure on the real target is indistinguishable
+		// from a broken database, so selection refuses to run rather than
+		// choose between aborting on bad content and masking bad disks.
+		if (!options.scratchStorage) {
+			throw new Error(
+				'restoreBestRecoveryCapsule requires options.scratchStorage ' +
+					'when the target supports Tier 2 restoration'
+			);
+		}
+		assertEmptyTarget(target);
+		assertNoJournalResidue(target);
+	}
 
 	for (let i = 0; i < sorted.length; ) {
 		// One group of candidates claiming the same (epoch, sequence).
@@ -626,15 +1153,25 @@ export function restoreBestRecoveryCapsule(
 				} catch {
 					continue;
 				}
-				// Throws from here PROPAGATE: after a candidate validated,
-				// failures are target integrity problems (dirty database,
-				// write errors), not candidate defects, and trying another
-				// blob against a half-written target would be wrong.
-				const result = restoreFromRecoveryCapsule(
-					candidate,
-					target,
-					nodeSecret
-				);
+				// The typed replay error is a CANDIDATE defect, raised by the
+				// dry-run BEFORE the target was written, so trying the next
+				// replica (or falling through to Tier 1) is safe. Everything
+				// else the restore throws is a TARGET problem (the install
+				// transaction has rolled it back, but the database is
+				// broken or dirty) and degrading it to a Tier 1 answer
+				// would mask that, so it propagates.
+				let result: ICapsuleRestoreResult;
+				try {
+					result = restoreFromRecoveryCapsule(
+						candidate,
+						target,
+						nodeSecret,
+						options
+					);
+				} catch (err) {
+					if (!(err instanceof CapsuleReplayError)) throw err;
+					continue;
+				}
 				return {
 					...result,
 					capsule: candidate,

@@ -13,6 +13,10 @@
 import { SUPERSEDES_OWN_KIND_MESSAGE_TYPES } from '../channel/channel-actions';
 import { IStorageBackend } from '../storage/types';
 import {
+	isStorageTransactionActive,
+	withStorageTransaction
+} from '../storage/transaction';
+import {
 	IRecoveryCommitResult,
 	IRecoveryJournalSink,
 	IRecoveryOutboxRow,
@@ -100,11 +104,34 @@ export class RecoveryManager {
 			return { committed: true, released: [], frameSequence: null };
 		}
 
+		// A JOURNALED commit settles durability and releases wire messages
+		// when it returns; joining an outer transaction would settle before
+		// the real commit (an outer rollback then leaves no frame while the
+		// messages were already released, and the journal's own integrity
+		// guards would refuse every retry). Refuse instead of joining.
+		if (
+			this.options.journal &&
+			transition.criticality !== RecoveryCriticality.Reconstructable &&
+			isStorageTransactionActive(this.storage)
+		) {
+			const error = new Error(
+				'a journaled commit cannot join an outer storage transaction'
+			);
+			this.options.onError?.(error, {
+				criticality: transition.criticality,
+				reportedByCaller: transition.reportedByCaller === true
+			});
+			return { committed: false, released: [], error, frameSequence: null };
+		}
+
 		const outboxIds: Array<number | null> = [];
 		let journaled = false;
 		let frameSequence: bigint | null = null;
 		try {
-			this.storage.transaction(() => {
+			// Joins an outer transaction when one is active (reconstruction
+			// replays commits inside a single install transaction); opens
+			// its own otherwise. See withStorageTransaction.
+			withStorageTransaction(this.storage, () => {
 				for (const mutation of mutations) {
 					this.applyMutation(mutation);
 				}
@@ -141,6 +168,7 @@ export class RecoveryManager {
 				}
 			});
 		} catch (error) {
+			this.options.journal?.onCommitRollback?.();
 			this.options.onError?.(error as Error, {
 				criticality: transition.criticality,
 				reportedByCaller: transition.reportedByCaller === true
@@ -167,6 +195,12 @@ export class RecoveryManager {
 				error: error as Error,
 				frameSequence: null
 			};
+		}
+
+		// The transaction committed: let the journal discard its attempt
+		// checkpoint (its in-memory expectations are now durable facts).
+		if (journaled) {
+			this.options.journal?.onCommitCommitted?.();
 		}
 
 		// channel_closed deleted the channel's outbox rows with it (the storage

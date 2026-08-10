@@ -29,6 +29,10 @@ import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import {
+	isStorageTransactionActive,
+	withStorageTransaction
+} from '../storage/transaction';
 import { decodeFrame, encodeFrame, hashFrame } from './frame-codec';
 import { RecoveryManager } from './recovery-manager';
 import {
@@ -60,6 +64,36 @@ const META_DELTA_BYTES = 'journal_delta_bytes_since_snapshot';
  */
 const META_LAST_SNAPSHOT_WRITTEN = 'journal_last_snapshot_written';
 /**
+ * Snapshot content versioning. '2' = snapshots carry the WHOLE
+ * channel_key_indices table, including entries whose channel was deleted
+ * (the high-water mark that prevents key reuse). Snapshots written before
+ * this omitted them, so a guardian head compacted by an older release can
+ * restore a reset key index; snapshotSchemaRepair() closes that on the
+ * first startup of a release that knows better.
+ */
+const META_SNAPSHOT_SCHEMA = 'journal_snapshot_schema';
+export const SNAPSHOT_SCHEMA_VERSION = '2';
+/**
+ * The EXACT marker strings this release knows how to migrate from. An
+ * absent or empty marker (a journal written before versioning existed)
+ * is also migratable. Anything else, including malformed numerics such
+ * as '-1', '1e0', '0x1' or '01', is either a future release's marker or
+ * corruption; both are unknowable and must refuse, never migrate.
+ */
+const MIGRATABLE_SNAPSHOT_SCHEMAS = new Set(['1']);
+
+/**
+ * The one compatibility predicate, shared by the journal's local-marker
+ * checks and by reconstruction's authenticated-snapshot check: absent or
+ * empty (pre-versioning legacy), the current version, or an exact known
+ * older version. Everything else is a future release or corruption.
+ */
+function snapshotSchemaKnown(marker: string | null | undefined): boolean {
+	if (marker == null || marker === '') return true;
+	if (marker === SNAPSHOT_SCHEMA_VERSION) return true;
+	return MIGRATABLE_SNAPSHOT_SCHEMAS.has(marker);
+}
+/**
  * Monotonic record that this journal has written at least one `quorum` frame
  * (Phase 6, spec 5.8). Only ever set, never cleared: it is the writer's own
  * memory of a promise it made to every future restore of this chain.
@@ -72,6 +106,108 @@ const META_DURABILITY_FLOOR = 'journal_durability_floor';
  * about the NAMESPACE rather than a condition that can improve.
  */
 const META_BACKFILL_LOST = 'journal_backfill_lost';
+/**
+ * How far replication has provably got (written by GuardianReplicator; owned
+ * here so the journal's own checks and the replicator share one constant).
+ */
+export const META_REPLICATED_THROUGH = 'guardian_replicated_through';
+/**
+ * The frame hash the replication watermark was receipted AT (written by
+ * GuardianReplicator beside guardian_replicated_through). Binds the
+ * watermark to a specific history instead of a bare height: a positive
+ * watermark is only ever trusted when this hash exists and resolves against
+ * the retained frame store (see resolveWatermarkAnchor).
+ */
+export const META_REPLICATED_THROUGH_HASH = 'guardian_replicated_through_hash';
+
+/**
+ * The frame hash a watermark at `sequence` must have been receipted at, from
+ * the retained store alone, or null when the store cannot prove one.
+ *
+ * Two rows can prove it: the stored frame at `sequence` itself, or, when
+ * compaction legitimately pruned that frame, the retained BASE snapshot at
+ * `sequence + 1` whose cleartext previousFrameHash names exactly the frame
+ * that was pruned. The successor row only counts when it IS the recorded
+ * base (META_LAST_SNAPSHOT): a gap that is not the recorded base is a
+ * damaged store, not a compacted one. previousFrameHash is trustworthy
+ * without decryption because it is bound into the frame's AEAD associated
+ * data and verified by every full chain verification.
+ */
+export function resolveWatermarkAnchor(
+	storage: IStorageBackend,
+	sequence: bigint
+): Buffer | null {
+	if (sequence < 1n) return null;
+	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
+	if (rows.length === 0) return null;
+	const first = rows[0];
+	const firstSequence = BigInt(first.sequence);
+	if (firstSequence === sequence) return first.frameHash;
+	if (firstSequence !== sequence + 1n) return null;
+	const base = storage.getRecoveryMeta?.(META_LAST_SNAPSHOT);
+	if (base == null || !/^[1-9]\d*$/.test(base)) return null;
+	if (BigInt(base) !== firstSequence) return null;
+	return first.previousFrameHash;
+}
+
+/**
+ * Every recovery_meta key that only ever exists because FRAMES existed. A
+ * store with ZERO frames must carry none of them: any survivor means the
+ * frames were destroyed around it, and rewriting from "fresh" would fork
+ * the chain from every replica still holding the erased history. The
+ * writer epoch is deliberately NOT here: lease acquisition legitimately
+ * records it before the first frame is ever written.
+ */
+const FRAME_DERIVED_META_KEYS = [
+	META_TIP_SEQUENCE,
+	META_TIP_HASH,
+	META_LAST_SNAPSHOT,
+	META_DELTA_BYTES,
+	META_LAST_SNAPSHOT_WRITTEN,
+	META_SNAPSHOT_SCHEMA,
+	META_DURABILITY_FLOOR,
+	META_BACKFILL_LOST
+] as const;
+
+/** Every journal-owned key, for restore-target emptiness checks. */
+const JOURNAL_META_RESIDUE_KEYS = [
+	...FRAME_DERIVED_META_KEYS,
+	META_WRITER_EPOCH
+] as const;
+
+/**
+ * The recovery_meta keys that may legitimately exist BEFORE a journal's
+ * first frame, WITH the exact value shapes they may legitimately hold:
+ * lease acquisition and namespace registration run ahead of the first
+ * commit, and the node's startup repair marker is written before restore,
+ * but only as the bare 'owed' sentinel (a numeric receipt target implies
+ * frames existed, so it can never precede frame 1). Everything else
+ * present over an EMPTY frame store, and every allowed key holding a
+ * value outside its legitimate shape, is residue of destroyed history.
+ * The scan refuses BY PRESENCE: an explicitly stored empty string is
+ * presence, not absence.
+ */
+const isJsonObject = (value: string): boolean => {
+	try {
+		const parsed: unknown = JSON.parse(value);
+		return parsed !== null && typeof parsed === 'object';
+	} catch {
+		return false;
+	}
+};
+const EMPTY_STORE_ALLOWED_META: ReadonlyMap<
+	string,
+	(value: string) => boolean
+> = new Map([
+	[META_WRITER_EPOCH, (value: string): boolean => /^[1-9]\d*$/.test(value)],
+	// The lease and the pending records are JSON artifacts; a value their
+	// loaders could never parse is residue or corruption, not a
+	// legitimate pre-frame state.
+	['writer_lease_v1', isJsonObject],
+	['restore_pending_acquisition_v1', isJsonObject],
+	['guardian_pending_registration_v1', isJsonObject],
+	['startup_repair_tail', (value: string): boolean => value === 'owed']
+]);
 
 /**
  * The journal's recovery_meta keys, exported for the capsule (spec 5.4),
@@ -149,6 +285,16 @@ export interface IRecoveryJournalOptions {
 	maxRetainedFrameGap?: number;
 	/** Compaction pruned frames a replica had not yet received. */
 	onCompactionForced?: (detail: string) => void;
+	/**
+	 * Reader for the ACTIVE writer-lease epoch, injected by the owner
+	 * (import-cycle-free: the lease module imports from this one). When
+	 * present, every frame's epoch must EQUAL the lease epoch; a mismatch
+	 * means guardians would receipt ciphertext under an epoch a restore
+	 * later reconstructs differently, making the receipted frame
+	 * undecryptable. Return null when no lease exists; throw on a corrupt
+	 * lease to refuse the write.
+	 */
+	activeLeaseEpoch?: () => bigint | null;
 	/** Append a snapshot frame after this many delta frames. Default 256. */
 	snapshotIntervalFrames?: number;
 	/**
@@ -183,7 +329,7 @@ export function deriveFrameKey(
 }
 
 /** AAD binding a frame to its node, epoch, position and predecessor. */
-function frameAad(
+export function frameAad(
 	nodeId: Buffer,
 	writerEpoch: bigint,
 	sequence: bigint,
@@ -249,7 +395,22 @@ export function journalSupported(storage: IStorageBackend): boolean {
 		typeof storage.loadRecoveryFrames === 'function' &&
 		typeof storage.deleteRecoveryFramesBelow === 'function' &&
 		typeof storage.getRecoveryMeta === 'function' &&
-		typeof storage.setRecoveryMeta === 'function'
+		typeof storage.setRecoveryMeta === 'function' &&
+		// Snapshots must be able to carry EVERY key-index row, deleted
+		// channels included: a backend that can only enumerate live
+		// channels would hand reconstruction a reset next-index and reopen
+		// key reuse, so it does not get a journal at all.
+		typeof storage.loadAllChannelKeyIndices === 'function' &&
+		// The write gate's empty-store scan must be able to see EVERY
+		// metadata key: a backend that cannot enumerate cannot reveal
+		// unknown residue of destroyed history, so it does not get a
+		// journal either.
+		typeof storage.listRecoveryMetaKeys === 'function' &&
+		// Compaction that destroys the replication watermark's anchor must
+		// be able to RESET the watermark keys atomically; a backend that
+		// cannot delete metadata would leave a positive mark behind that
+		// resolves against nothing, permanently refusing every later write.
+		typeof storage.deleteRecoveryMeta === 'function'
 	);
 }
 
@@ -433,6 +594,42 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	private readonly onCompactionForced: ((detail: string) => void) | undefined;
 	/** Set once this run's first append has re-based the chain (see appendFrame). */
 	private rebasedThisRun = false;
+	/** One-shot: the write boundary validated the stored schema marker. */
+	private writeSchemaChecked = false;
+	/**
+	 * The highest tip sequence this run has OBSERVED in storage. Only ever
+	 * raised at check time (never on our own writes, so a rolled-back
+	 * transaction cannot wedge it): a stored tip below it, or a vanished
+	 * tip after it moved past zero, means the store was rewritten under
+	 * this writer's feet.
+	 */
+	private tipFloor = 0n;
+	/**
+	 * The exact tip this run last WROTE successfully, cleared by
+	 * onCommitRollback when the surrounding transaction failed: the next
+	 * write requires the stored tip to still BE this tip, so frames or
+	 * metadata destroyed under a live writer refuse the next commit
+	 * instead of silently re-basing.
+	 */
+	private lastWrittenTip: { sequence: bigint; hashHex: string } | null = null;
+	/**
+	 * The first retained sequence this run VERIFIED (one-shot) or produced
+	 * (compaction). Together with the tip and the primary key's uniqueness,
+	 * an exact count against this minimum proves the retained chain lost
+	 * nothing: not its tail, not an interior frame, and not its prefix.
+	 */
+	private expectedRetainedMin: bigint | null = null;
+	/**
+	 * The highest writer epoch this run has observed or written. The epoch
+	 * defaulting to 1 when its record is missing is only safe on a journal
+	 * that never had one: after that, a vanished or regressed epoch means
+	 * the next frame would encrypt under the wrong key while guardians
+	 * receipt it under the active lease epoch, leaving a receipted frame a
+	 * restore cannot decrypt.
+	 */
+	private epochFloor = 1n;
+	/** Injected reader for the active writer-lease epoch (cycle-free). */
+	private readonly activeLeaseEpoch?: () => bigint | null;
 
 	/**
 	 * @param recoveryId The guardian namespace (wire spec 1.1): the x-only
@@ -477,11 +674,87 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			options.maxRetainedFrameGap ??
 			(this.durability === 'quorum' ? null : DEFAULT_MAX_RETAINED_FRAME_GAP);
 		this.onCompactionForced = options.onCompactionForced;
+		this.activeLeaseEpoch = options.activeLeaseEpoch;
 	}
 
 	/** The mode this journal stamps on its frames, after the sticky rule. */
 	getDurability(): RecoveryDurability | undefined {
 		return this.durability;
+	}
+
+	/**
+	 * Snapshot of every mutable in-memory field, taken when a write attempt
+	 * BEGINS. The journal owns its own attempt lifecycle: the checkpoint is
+	 * discarded when the surrounding transaction commits and fully restored
+	 * when it rolls back OR when the attempt's own guards refuse, so a
+	 * failure can neither erase evidence (a refusal must not clear the
+	 * expected tip) nor leave phantoms (a rolled-back re-base must not stay
+	 * marked as re-based, a rolled-back interval snapshot must not keep a
+	 * raised floor).
+	 */
+	private writeAttemptCheckpoint: {
+		lastWrittenTip: { sequence: bigint; hashHex: string } | null;
+		tipFloor: bigint;
+		epochFloor: bigint;
+		expectedRetainedMin: bigint | null;
+		rebasedThisRun: boolean;
+		writeSchemaChecked: boolean;
+	} | null = null;
+
+	private beginWriteAttempt(): void {
+		// The floors captured here are RAISED to what durable storage holds
+		// at this instant, BEFORE the attempt writes anything: an
+		// observation of pre-transaction state is a fact about disk, and a
+		// later rollback of the attempt must not un-know it (that is
+		// exactly how a failed write let a lost journal restart at frame 1).
+		let durableTip = 0n;
+		const tipSeq = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		if (tipSeq != null && /^\d+$/.test(tipSeq)) durableTip = BigInt(tipSeq);
+		let durableEpoch = 1n;
+		const epochRaw = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
+		if (epochRaw != null && /^[1-9]\d*$/.test(epochRaw)) {
+			durableEpoch = BigInt(epochRaw);
+		}
+		const maxBig = (a: bigint, b: bigint): bigint => (a > b ? a : b);
+		this.writeAttemptCheckpoint = {
+			lastWrittenTip: this.lastWrittenTip,
+			tipFloor: maxBig(this.tipFloor, durableTip),
+			epochFloor: maxBig(this.epochFloor, durableEpoch),
+			expectedRetainedMin: this.expectedRetainedMin,
+			rebasedThisRun: this.rebasedThisRun,
+			writeSchemaChecked: this.writeSchemaChecked
+		};
+	}
+
+	private settleWriteAttempt(committed: boolean): void {
+		const checkpoint = this.writeAttemptCheckpoint;
+		this.writeAttemptCheckpoint = null;
+		if (committed || !checkpoint) return;
+		this.lastWrittenTip = checkpoint.lastWrittenTip;
+		this.tipFloor = checkpoint.tipFloor;
+		this.epochFloor = checkpoint.epochFloor;
+		this.expectedRetainedMin = checkpoint.expectedRetainedMin;
+		this.rebasedThisRun = checkpoint.rebasedThisRun;
+		this.writeSchemaChecked = checkpoint.writeSchemaChecked;
+	}
+
+	/**
+	 * The surrounding commit COMMITTED: the attempt's state is now durable,
+	 * so the checkpoint is discarded.
+	 */
+	onCommitCommitted(): void {
+		this.settleWriteAttempt(true);
+	}
+
+	/**
+	 * The surrounding commit ROLLED BACK (or failed before reaching the
+	 * journal at all, in which case no checkpoint exists and this is a
+	 * no-op): restore every in-memory field to its pre-attempt value. This
+	 * is deliberately a full restore, never a clear: clearing evidence on
+	 * a refusal is exactly how a forked frame 1 slipped past a retry.
+	 */
+	onCommitRollback(): void {
+		this.settleWriteAttempt(false);
 	}
 
 	/**
@@ -512,6 +785,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		mutations: RecoveryMutation[],
 		outboundMessages: RecoveryOutboundMessage[]
 	): bigint {
+		// The attempt lifecycle is the journal's own: checkpoint everything
+		// mutable NOW; the manager signals commit or rollback afterwards.
+		this.beginWriteAttempt();
 		const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		if (tipSequence == null) {
 			// The bootstrap snapshot CONTAINS this transition's effects, so the
@@ -622,29 +898,389 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 */
 	prepareForReplication(): void {
 		if (this.rebasedThisRun) return;
-		this.storage.transaction(() => {
-			const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
-			if (tipSequence == null) {
-				this.appendSnapshotFrame(1n, GENESIS_HASH);
-			} else {
-				this.appendSnapshotFrame(
-					BigInt(tipSequence) + 1n,
-					Buffer.from(
-						this.storage.getRecoveryMeta!(META_TIP_HASH) ??
-							GENESIS_HASH.toString('hex'),
-						'hex'
-					)
-				);
-			}
-		});
+		this.assertOwnsTransaction('prepareForReplication');
+		// This path OWNS its transaction, so it owns the attempt lifecycle
+		// too: a rollback restores every in-memory field (a failed re-base
+		// must not leave rebasedThisRun true or a phantom written tip).
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => {
+				const tipSequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+				if (tipSequence == null) {
+					this.appendSnapshotFrame(1n, GENESIS_HASH);
+				} else {
+					this.appendSnapshotFrame(
+						BigInt(tipSequence) + 1n,
+						Buffer.from(
+							this.storage.getRecoveryMeta!(META_TIP_HASH) ??
+								GENESIS_HASH.toString('hex'),
+							'hex'
+						)
+					);
+				}
+			});
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
 		this.rebasedThisRun = true;
 	}
 
 	// ─────────────── internals ───────────────
 
 	private writerEpoch(): bigint {
-		const epoch = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
-		return epoch == null ? 1n : BigInt(epoch);
+		const stored = this.storage.getRecoveryMeta!(META_WRITER_EPOCH);
+		const lease = this.activeLeaseEpoch?.() ?? null;
+		if (stored == null) {
+			// Defaulting to 1 is only safe on a journal that never HAD an
+			// epoch: with a lease active, or after a higher epoch was
+			// observed, a missing record means it was destroyed.
+			if (lease != null || this.epochFloor > 1n) {
+				throw new Error(
+					'recovery: the journal writer epoch record is missing; ' +
+						'refusing to write'
+				);
+			}
+			return 1n;
+		}
+		if (!/^[1-9]\d*$/.test(stored)) {
+			throw new Error(
+				`recovery: the journal writer epoch record ('${stored}') is ` +
+					`malformed; refusing to write`
+			);
+		}
+		const epoch = BigInt(stored);
+		if (epoch < this.epochFloor) {
+			throw new Error(
+				`recovery: the journal writer epoch regressed (${epoch} after ` +
+					`${this.epochFloor}); refusing to write`
+			);
+		}
+		if (lease != null && epoch !== lease) {
+			throw new Error(
+				`recovery: the journal writer epoch (${epoch}) does not match ` +
+					`the active lease epoch (${lease}); refusing to write`
+			);
+		}
+		this.epochFloor = epoch;
+		return epoch;
+	}
+
+	/**
+	 * ONE-SHOT compatibility gate at the TRUE write boundary: every delta,
+	 * bootstrap snapshot, per-run re-base, interval snapshot, schema-repair
+	 * snapshot and replication re-base funnels through writeFrame, so this
+	 * is the one place a rewrite of the journal can be refused before it
+	 * begins. Two independent sources must both agree:
+	 *
+	 * 1. The LOCAL marker (fast, but unauthenticated recovery_meta: with it
+	 *    removed, a future journal would read as migratable legacy).
+	 * 2. The AUTHENTICATED retained base: the newest decodable snapshot
+	 *    among the stored frames declares, under the frame AEAD, which
+	 *    schema actually wrote this journal. Re-basing over a future base
+	 *    and compacting it away would destroy state this release cannot
+	 *    even read completely.
+	 *
+	 * Frames this run writes afterwards are current-schema by construction,
+	 * so one check per run suffices.
+	 */
+	private assertSchemaCompatibleForWrite(): void {
+		if (this.writeSchemaChecked) return;
+		this.assertSnapshotSchemaMigratable(
+			this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA)
+		);
+		// FULL chain verification, not just decryption: the rewrite this
+		// gate protects will COMPACT whatever it re-bases over, so the
+		// stored chain must prove sequence continuity, hash linkage, AEAD
+		// integrity and binding to the recorded tip in BOTH directions (a
+		// recorded tip without frames, and frames without a recorded tip,
+		// are both an emptied or truncated journal, not a fresh one). Any
+		// row this release cannot decrypt OR decode fails verification,
+		// which is exactly right: an AEAD-valid future frame must not be
+		// skipped in favor of an older readable snapshot and compacted
+		// away. A truly fresh journal (no frames AND no metadata) passes.
+		let frames: VerifiedRecoveryChain;
+		try {
+			frames = this.loadVerifiedFrames();
+		} catch (err) {
+			throw new Error(
+				`recovery: the stored journal fails verification (${
+					err instanceof Error ? err.message : String(err)
+				}); refusing to rewrite it`
+			);
+		}
+		// The VERIFIED chain is the authority for what this run may build
+		// on: the retained span it proves is what every later write must
+		// still find, and the highest epoch it contains is a floor no
+		// metadata deletion can lower (a rebase under a lower epoch would
+		// compact real history into a chain a receipted restore cannot
+		// decrypt).
+		if (frames.length > 0) {
+			this.expectedRetainedMin = frames[0].sequence;
+			for (const frame of frames) {
+				if (frame.writerEpoch > this.epochFloor) {
+					this.epochFloor = frame.writerEpoch;
+				}
+			}
+		} else {
+			this.expectedRetainedMin = null;
+		}
+		let sawSnapshot = frames.length === 0;
+		for (let i = frames.length - 1; i >= 0 && !sawSnapshot; i--) {
+			if (!frames[i].snapshot) continue;
+			sawSnapshot = true;
+			const declared = frames[i].snapshot!.schemaVersion;
+			if (!snapshotSchemaKnown(declared)) {
+				throw new Error(
+					`recovery: the journal's retained base snapshot declares ` +
+						`schema '${declared}', which is not one this release can ` +
+						`migrate; refusing to rewrite the journal`
+				);
+			}
+		}
+		if (!sawSnapshot) {
+			// Frames exist but none of them is a snapshot: the base
+			// invariant (first retained frame IS the base snapshot) is
+			// broken, so nothing sound can be built on top.
+			throw new Error(
+				'recovery: no base snapshot among the stored frames; ' +
+					'refusing to rewrite the journal'
+			);
+		}
+		this.writeSchemaChecked = true;
+	}
+
+	/**
+	 * Cheap invariants revalidated at EVERY write, unlike the one-shot
+	 * chain verification: a store rewritten DURING this process (frames or
+	 * tip metadata deleted, tip hash swapped, watermark left dangling)
+	 * must refuse the next commit, not silently re-base and fork from the
+	 * replicas holding the erased history.
+	 */
+	private assertWriteInvariants(): void {
+		const tipSeq = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
+		if ((tipSeq != null) !== (tipHash != null)) {
+			throw new Error(
+				'recovery: journal tip metadata is partial; refusing to write'
+			);
+		}
+		// The strongest invariant first: whatever this run last wrote must
+		// still be EXACTLY the stored tip (a rolled-back commit clears the
+		// record via onCommitRollback, so a legitimate retry is not
+		// refused).
+		if (
+			this.lastWrittenTip !== null &&
+			(tipSeq == null ||
+				BigInt(tipSeq) !== this.lastWrittenTip.sequence ||
+				tipHash !== this.lastWrittenTip.hashHex)
+		) {
+			throw new Error(
+				`recovery: the journal tip changed outside this writer (wrote ` +
+					`${this.lastWrittenTip.sequence}, found ${tipSeq ?? 'nothing'}); ` +
+					`refusing to write`
+			);
+		}
+		if (tipSeq == null) {
+			if (this.tipFloor > 0n) {
+				throw new Error(
+					`recovery: the journal tip (last observed at ${this.tipFloor}) ` +
+						`disappeared; refusing to write`
+				);
+			}
+			// A genuinely fresh journal: no frames, and no metadata beyond
+			// what legitimately precedes the first frame, each holding a
+			// value inside its legitimate shape. PRESENCE is what is
+			// checked: an explicitly stored empty value is still residue.
+			const validateAllowed = (key: string): void => {
+				const validate = EMPTY_STORE_ALLOWED_META.get(key);
+				if (!validate) {
+					throw new Error(
+						`recovery: the frame store is empty but recovery ` +
+							`metadata ('${key}') survives; refusing to write`
+					);
+				}
+				const value = this.storage.getRecoveryMeta!(key);
+				if (value == null || !validate(value)) {
+					throw new Error(
+						`recovery: pre-frame recovery metadata ('${key}') holds ` +
+							`an illegitimate value; refusing to write`
+					);
+				}
+			};
+			const listed = this.storage.listRecoveryMetaKeys?.();
+			if (listed !== undefined) {
+				for (const key of listed) {
+					validateAllowed(key);
+				}
+			} else {
+				// A non-enumerating backend cannot reveal unknown residue,
+				// but every key this codebase writes is still checked: the
+				// disallowed ones for absence, the allowed ones for their
+				// exact legitimate value shape.
+				for (const key of [
+					...FRAME_DERIVED_META_KEYS,
+					META_REPLICATED_THROUGH,
+					META_REPLICATED_THROUGH_HASH
+				]) {
+					if (this.storage.getRecoveryMeta!(key) != null) {
+						throw new Error(
+							`recovery: the frame store is empty but recovery ` +
+								`metadata ('${key}') survives; refusing to write`
+						);
+					}
+				}
+				for (const [key, validate] of EMPTY_STORE_ALLOWED_META) {
+					const value = this.storage.getRecoveryMeta!(key);
+					if (value != null && !validate(value)) {
+						throw new Error(
+							`recovery: pre-frame recovery metadata ('${key}') ` +
+								`holds an illegitimate value; refusing to write`
+						);
+					}
+				}
+			}
+			if (this.recoveryFrameCount() > 0) {
+				throw new Error(
+					'recovery: frames exist without a recorded tip; refusing to write'
+				);
+			}
+			return;
+		}
+		const sequence = BigInt(tipSeq);
+		if (sequence < this.tipFloor) {
+			throw new Error(
+				`recovery: the journal tip moved backwards (${sequence} after ` +
+					`${this.tipFloor}); refusing to write`
+			);
+		}
+		// The replication watermark is a PROMISE about frames guardians
+		// hold; it can never legitimately exceed the local tip, and letting
+		// a raised one stand would release the next frames without any
+		// receipt behind them.
+		const watermark = this.storage.getRecoveryMeta!(META_REPLICATED_THROUGH);
+		if (
+			watermark != null &&
+			(!/^\d+$/.test(watermark) || BigInt(watermark) > sequence)
+		) {
+			throw new Error(
+				`recovery: the replication watermark ('${watermark}') exceeds ` +
+					`the journal tip ${sequence}; refusing to write`
+			);
+		}
+		// The recorded tip must be BACKED by its stored rows, exactly and
+		// CONTIGUOUSLY, against the span the VERIFIED chain established:
+		// the primary key makes sequences unique, so a matching minimum,
+		// maximum and exact count prove the retained chain lost nothing (a
+		// deleted tail, a deleted PREFIX, or a deleted middle frame all
+		// fail here on the very next write instead of after a restart).
+		const stats = this.recoveryFrameSpan();
+		const expectedMin = this.expectedRetainedMin;
+		if (
+			stats == null ||
+			expectedMin == null ||
+			BigInt(stats.minSequence) !== expectedMin ||
+			BigInt(stats.maxSequence) !== sequence ||
+			BigInt(stats.count) !== sequence - expectedMin + 1n
+		) {
+			throw new Error(
+				`recovery: the stored frames do not match the recorded tip ` +
+					`${sequence}; refusing to write`
+			);
+		}
+		const tipRow = this.loadFrameRow(sequence);
+		if (
+			tipRow == null ||
+			!tipRow.frameHash.equals(Buffer.from(tipHash!, 'hex'))
+		) {
+			throw new Error(
+				`recovery: the stored frames do not match the recorded tip ` +
+					`${sequence}; refusing to write`
+			);
+		}
+		// AUTHENTICATE the tip row's content, not just its bookkeeping: a
+		// frame-hash column is only a claim until the ciphertext behind it
+		// decrypts and hashes to it (the storage layer additionally refuses
+		// UPDATEs on frame rows outright).
+		let tipPlaintext: Buffer;
+		try {
+			const tipEpoch = BigInt(tipRow.writerEpoch);
+			tipPlaintext = decryptFrame(
+				deriveFrameKey(this.masterKey, this.nodeId, tipEpoch),
+				tipRow.ciphertext,
+				frameAad(this.nodeId, tipEpoch, sequence, tipRow.previousFrameHash)
+			);
+		} catch {
+			throw new Error(
+				`recovery: the tip frame ${sequence} fails authentication; ` +
+					`refusing to write`
+			);
+		}
+		if (!hashFrame(tipPlaintext).equals(tipRow.frameHash)) {
+			throw new Error(
+				`recovery: the tip frame ${sequence} does not match its ` +
+					`recorded hash; refusing to write`
+			);
+		}
+		// The watermark is a receipt for THIS history, not for a height: a
+		// recorded receipted-frame hash must resolve against the retained
+		// store, either at the stored frame itself or, when compaction
+		// legitimately pruned it, at the retained base snapshot's
+		// previousFrameHash. A hash that resolves nowhere, or to a different
+		// frame, means the receipts belong to a chain this store no longer
+		// holds. A watermark WITHOUT a hash is not validated here: it is
+		// already untrusted (replicatedThrough reads it as 0), and refusing
+		// it would brick journals written before the binding existed.
+		if (watermark != null) {
+			const receipted = BigInt(watermark);
+			const receiptedHash = this.storage.getRecoveryMeta!(
+				META_REPLICATED_THROUGH_HASH
+			);
+			if (receiptedHash != null && receipted >= 1n) {
+				const anchor = resolveWatermarkAnchor(this.storage, receipted);
+				if (anchor == null || anchor.toString('hex') !== receiptedHash) {
+					throw new Error(
+						`recovery: the stored frame at the replication watermark ` +
+							`${receipted} is not the receipted frame; refusing to write`
+					);
+				}
+			}
+		}
+		this.tipFloor = sequence;
+	}
+
+	/** One stored frame row by exact sequence, null when absent. */
+	private loadFrameRow(sequence: bigint): IStoredRecoveryFrame | null {
+		const rows = this.storage.loadRecoveryFrames!(Number(sequence) - 1);
+		if (rows.length === 0 || BigInt(rows[0].sequence) !== sequence) {
+			return null;
+		}
+		return rows[0];
+	}
+
+	/** Row count of the frame store (stats API when available). */
+	private recoveryFrameCount(): number {
+		const stats = this.storage.recoveryFrameStats?.();
+		if (stats !== undefined) return stats?.count ?? 0;
+		return this.storage.loadRecoveryFrames!().length;
+	}
+
+	/** Span statistics of the frame store, null when empty. */
+	private recoveryFrameSpan(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null {
+		const stats = this.storage.recoveryFrameStats?.();
+		if (stats !== undefined) return stats;
+		const rows = this.storage.loadRecoveryFrames!();
+		if (rows.length === 0) return null;
+		return {
+			count: rows.length,
+			minSequence: rows[0].sequence,
+			maxSequence: rows[rows.length - 1].sequence
+		};
 	}
 
 	/** Encode, hash, encrypt and store one frame; advance the tip. */
@@ -652,6 +1288,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		frameHash: Buffer;
 		plaintextBytes: number;
 	} {
+		// One-shot verification first: it establishes the verified span and
+		// epoch floor the per-write invariants then hold every write to.
+		this.assertSchemaCompatibleForWrite();
+		this.assertWriteInvariants();
+		// The frame's epoch was computed BEFORE the verified chain could
+		// raise the floor (callers evaluate writerEpoch() while building
+		// the frame), so it is re-validated here: writing below the chain's
+		// own epoch would compact real history into frames a receipted
+		// restore cannot decrypt.
+		if (frame.writerEpoch < this.epochFloor) {
+			throw new Error(
+				`recovery: frame epoch ${frame.writerEpoch} is below the ` +
+					`verified chain's epoch ${this.epochFloor}; refusing to write`
+			);
+		}
 		// Stamped here rather than at each construction site so that deltas,
 		// bootstrap snapshots, per-run re-base snapshots and interval snapshots
 		// all carry the same declaration; a snapshot that omitted it would be a
@@ -693,6 +1344,14 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		});
 		this.storage.setRecoveryMeta!(META_TIP_SEQUENCE, frame.sequence.toString());
 		this.storage.setRecoveryMeta!(META_TIP_HASH, frameHash.toString('hex'));
+		this.lastWrittenTip = {
+			sequence: frame.sequence,
+			hashHex: frameHash.toString('hex')
+		};
+		// A bootstrap (or first-ever) write establishes the retained span.
+		if (this.expectedRetainedMin == null) {
+			this.expectedRetainedMin = frame.sequence;
+		}
 		// The floor rides the SAME transaction as the frame that raises it, so
 		// a chain can never contain a durable quorum frame without the record
 		// that forbids a later downgrade.
@@ -717,6 +1376,88 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	 * transaction: the tables it reads already include the current
 	 * transition's writes, so the snapshot is exact as of this sequence.
 	 */
+	/**
+	 * One-time snapshot-content repair (see META_SNAPSHOT_SCHEMA). A head
+	 * compacted by an older release omitted deleted channels' key-index
+	 * rows; append a fresh full snapshot so the guardian head regains the
+	 * burned indices, and record coverage so this runs once. Returns the
+	 * snapshot's sequence for receipt gating, or null when already covered
+	 * or when nothing was ever journaled (the first real snapshot will
+	 * carry the full table by construction).
+	 */
+	snapshotSchemaRepair(): bigint | null {
+		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
+		if (marker === SNAPSHOT_SCHEMA_VERSION) return null;
+		this.assertSnapshotSchemaMigratable(marker);
+		const tip = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
+		const tipHash = this.storage.getRecoveryMeta!(META_TIP_HASH);
+		if (tip == null || tipHash == null) {
+			// Nothing written yet: the first real snapshot stamps the
+			// current schema itself, so there is nothing to repair.
+			return null;
+		}
+		const sequence = BigInt(tip) + 1n;
+		// ATOMIC: the snapshot frame, its tip advance, the compaction
+		// metadata and the schema marker land together or roll back
+		// together. A partial write (frame stored, tip metadata stale)
+		// would leave the whole journal unverifiable, which is strictly
+		// worse than the gap this repair closes. The attempt lifecycle is
+		// owned here too: a rollback restores every in-memory field.
+		this.assertOwnsTransaction('snapshotSchemaRepair');
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => {
+				this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+				this.storage.setRecoveryMeta!(
+					META_SNAPSHOT_SCHEMA,
+					SNAPSHOT_SCHEMA_VERSION
+				);
+			});
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
+		return sequence;
+	}
+
+	/**
+	 * Read-only probe: would snapshotSchemaRepair() act on this journal?
+	 * Lets the caller persist its repair intent BEFORE the marker or any
+	 * other trigger is consumed. This is ALSO the fail-closed compatibility
+	 * gate, and it must run before any restore mutation: restoration can
+	 * journal deletions, and a journal write that triggers a snapshot
+	 * would stamp the current schema over a marker this release never
+	 * validated, silently downgrading a future release's journal.
+	 */
+	needsSnapshotSchemaRepair(): boolean {
+		const marker = this.storage.getRecoveryMeta!(META_SNAPSHOT_SCHEMA);
+		this.assertSnapshotSchemaMigratable(marker);
+		if (this.storage.getRecoveryMeta!(META_TIP_SEQUENCE) == null) {
+			// No frames yet: the bootstrap snapshot will be current-schema.
+			return false;
+		}
+		return marker !== SNAPSHOT_SCHEMA_VERSION;
+	}
+
+	/**
+	 * Only the current marker, an EXACT known-older marker, or no marker at
+	 * all may proceed. A higher or unrecognized marker was written by a
+	 * newer release whose snapshot shape this build cannot reproduce;
+	 * compacting with our shape and rewriting the marker would
+	 * destructively downgrade the journal. Malformed markers are just as
+	 * unknowable. Fail closed, journal untouched.
+	 */
+	private assertSnapshotSchemaMigratable(
+		marker: string | null | undefined
+	): void {
+		if (snapshotSchemaKnown(marker)) return;
+		throw new Error(
+			`recovery: journal snapshot schema '${marker}' is not one ` +
+				`this release can migrate; refusing to rewrite the journal`
+		);
+	}
+
 	private appendSnapshotFrame(
 		sequence: bigint,
 		previousFrameHash: Buffer
@@ -739,6 +1480,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			sequence.toString()
 		);
 		this.storage.setRecoveryMeta!(META_DELTA_BYTES, '0');
+		// Every snapshot this release writes carries the whole key-index
+		// table, so it IS current-schema by construction; stamping here
+		// means a fresh journal is never seen as needing the repair.
+		this.storage.setRecoveryMeta!(
+			META_SNAPSHOT_SCHEMA,
+			SNAPSHOT_SCHEMA_VERSION
+		);
 		this.compactTo(sequence);
 	}
 
@@ -785,11 +1533,43 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			}
 			this.onCompactionForced?.(detail);
 		}
+		// A prune that reaches past watermark + 1 destroys the watermark's
+		// anchor: neither the receipted frame nor a base snapshot naming it
+		// survives, so the binding can never be evaluated again. Reset BOTH
+		// keys atomically (a bare positive height would otherwise linger,
+		// resolvable by nothing) and record the loss: the pruned frames were
+		// never receipted by the quorum, so no guardian behind that point can
+		// ever be backfilled. This branch is reachable only through forced
+		// compaction (which recorded the loss above) or a writer with no
+		// retention floor at all; the normal floor holds the prune at
+		// watermark + 1, where the base snapshot still anchors the mark.
+		const watermarkRaw = this.storage.getRecoveryMeta!(META_REPLICATED_THROUGH);
+		if (
+			watermarkRaw != null &&
+			/^\d+$/.test(watermarkRaw) &&
+			BigInt(watermarkRaw) > 0n &&
+			BigInt(watermarkRaw) < snapshotSequence - 1n
+		) {
+			if (this.storage.getRecoveryMeta!(META_BACKFILL_LOST) == null) {
+				this.storage.setRecoveryMeta!(
+					META_BACKFILL_LOST,
+					`compaction pruned to frame ${snapshotSequence} past the ` +
+						`replication watermark ${watermarkRaw}: frames the guardians ` +
+						`never received now exist nowhere, so no guardian behind ` +
+						`that point can ever be backfilled`
+				);
+			}
+			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH);
+			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH_HASH);
+		}
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
 		this.storage.setRecoveryMeta!(
 			META_LAST_SNAPSHOT,
 			snapshotSequence.toString()
 		);
+		// The prune moved the retained minimum; the per-write span check
+		// holds every later write to exactly this.
+		this.expectedRetainedMin = snapshotSequence;
 	}
 
 	/**
@@ -804,7 +1584,30 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		);
 		const target = BigInt(written);
 		if (target <= base) return;
-		this.storage.transaction(() => this.compactTo(target));
+		this.assertOwnsTransaction('compact');
+		this.beginWriteAttempt();
+		try {
+			this.storage.transaction(() => this.compactTo(target));
+		} catch (err) {
+			this.settleWriteAttempt(false);
+			throw err;
+		}
+		this.settleWriteAttempt(true);
+	}
+
+	/**
+	 * Journal writes settle durability (and, through the barrier, wire
+	 * releases) at their OWN commit boundary. Joining an outer transaction
+	 * would settle before the real commit: an outer rollback then leaves
+	 * no frame while everything downstream already believed there was one.
+	 */
+	private assertOwnsTransaction(operation: string): void {
+		if (isStorageTransactionActive(this.storage)) {
+			throw new Error(
+				`recovery: ${operation} cannot run inside an outer storage ` +
+					`transaction; journal durability settles at its own commit`
+			);
+		}
 	}
 
 	/** Serialize every safety-critical table (see RecoverySnapshot). */
@@ -812,20 +1615,21 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const storage = this.storage;
 		const channels = storage.loadAllChannels();
 		return {
+			// Authenticated by the frame: restoration re-derives the local
+			// schema marker from here, since recovery_meta does not ride
+			// frames and would otherwise be lost with the device.
+			schemaVersion: SNAPSHOT_SCHEMA_VERSION,
 			channels: channels.map((c) => ({
 				channelId: c.channelId,
 				state: c.state,
 				peerPubkey: c.peerPubkey
 			})),
-			keyIndices: channels
-				.map((c) => ({
-					channelId: c.channelId,
-					channelIndex: storage.loadChannelKeyIndex(c.channelId)
-				}))
-				.filter(
-					(k): k is { channelId: string; channelIndex: number } =>
-						k.channelIndex != null
-				),
+			// The WHOLE index table, not just live channels' entries: a
+			// deleted channel's index row is the high-water mark that keeps
+			// the next open from reusing its keys, and a snapshot composed
+			// after the deletion is the only carrier a reconstruction has.
+			// journalSupported() made the enumeration mandatory.
+			keyIndices: storage.loadAllChannelKeyIndices!(),
 			chainMonitors: storage.loadAllChainMonitors(),
 			preimages: storage.loadAllPreimages(),
 			payments: storage.loadAllPayments(),
@@ -939,6 +1743,17 @@ export function verifyFrameChain(
 		previousSequence = sequence;
 	}
 
+	// The tip fields are written together, so they must survive together: a
+	// journal carrying one without the other is not a fresh journal, it is
+	// one whose metadata was partially destroyed, and treating it as
+	// tip-less would let the next rewrite re-base from genesis and fork
+	// from every replica still holding the erased history.
+	if ((meta.tipSequence != null) !== (meta.tipHash != null)) {
+		throw new Error(
+			'Recovery journal metadata is partial: tip sequence and tip hash ' +
+				'must both be present or both be absent'
+		);
+	}
 	const tip =
 		meta.tipSequence != null && meta.tipHash != null
 			? {
@@ -946,6 +1761,14 @@ export function verifyFrameChain(
 					frameHash: Buffer.from(meta.tipHash, 'hex')
 			  }
 			: null;
+	if (!tip && frames.length === 0 && meta.lastSnapshotSequence != null) {
+		// Same reasoning for the base record: it only ever exists because
+		// frames did.
+		throw new Error(
+			'Recovery journal truncated: a base snapshot is recorded but no ' +
+				'frames exist'
+		);
+	}
 	if (tip) {
 		if (frames.length === 0) {
 			throw new Error(
@@ -992,6 +1815,60 @@ export function verifyFrameChain(
 }
 
 /**
+ * Assert that a decoded frame set's base snapshot (the NEWEST snapshot, the
+ * one a reconstruction builds from) may be restored by THIS release. Unlike
+ * the write boundary's migration rule, restoration is STRICT: only the
+ * exact current schema passes.
+ *
+ * - A FUTURE schema would deserialize with this release's shape and
+ *   silently drop whatever that shape added.
+ * - A LEGACY snapshot (absent or pre-2 declaration) is refused too, and
+ *   deliberately so, even though a LOCAL journal of the same vintage is
+ *   migratable: local migration is safe because the original
+ *   channel_key_indices TABLE still holds deleted channels' burned
+ *   high-water marks and the repair re-snapshots them. A remote snapshot
+ *   from that era has already OMITTED those rows; rebuilding from it and
+ *   then stamping the result current would launder the gap into a schema-2
+ *   journal and permit key-index reuse. There is nothing to migrate FROM,
+ *   so the only safe disposition is refusal (the SCB tier remains the
+ *   fallback).
+ *
+ * Shared by reconstructFromFrames and the capsule's candidate
+ * prevalidation, so an incompatible capsule is rejected BEFORE anything
+ * touches the restore target.
+ */
+export function assertFramesReconstructable(frames: RecoveryFrame[]): void {
+	let snapshot: RecoveryFrame['snapshot'];
+	for (let i = frames.length - 1; i >= 0; i--) {
+		if (frames[i].snapshot) {
+			snapshot = frames[i].snapshot;
+			break;
+		}
+	}
+	// No snapshot at all: reconstructFromFrames has its own refusal for
+	// that shape, and a capsule chain without one fails the base binding.
+	if (!snapshot) return;
+	const declared = snapshot.schemaVersion;
+	if (declared === SNAPSHOT_SCHEMA_VERSION) return;
+	if (
+		declared == null ||
+		declared === '' ||
+		MIGRATABLE_SNAPSHOT_SCHEMAS.has(declared)
+	) {
+		throw new Error(
+			`recovery: the base snapshot predates schema ` +
+				`${SNAPSHOT_SCHEMA_VERSION}: snapshots from that era omit deleted ` +
+				`channels' burned key indices, and rebuilding from one could ` +
+				`reuse a deleted channel's keys; refusing to reconstruct`
+		);
+	}
+	throw new Error(
+		`recovery: the base snapshot declares schema '${declared}', ` +
+			`which this release cannot restore; refusing to reconstruct`
+	);
+}
+
+/**
  * Rebuild every safety-critical table from a verified frame sequence
  * (spec 5.3, deterministic reconstruction).
  *
@@ -1025,6 +1902,11 @@ export function reconstructFromFrames(
 			'Recovery reconstruction requires an authenticated base snapshot'
 		);
 	}
+	// The snapshot's AUTHENTICATED schema declaration gates the restore;
+	// the local marker cannot stand in for it because it does not survive
+	// the loss of the device.
+	assertFramesReconstructable(frames);
+	const snapshotSchema = frames[snapshotIndex].snapshot!.schemaVersion;
 	// The target must be empty: applySnapshot and replay only insert and
 	// replace, so rows already present that the journal never mentions would
 	// silently survive into the "reconstructed" state.
@@ -1056,12 +1938,78 @@ export function reconstructFromFrames(
 			target.setOutboxFrameSequence(ids, Number(frame.sequence));
 		}
 	}
+	// Reinstall the schema marker FROM the authenticated snapshot: local
+	// metadata died with the lost device, and leaving the restored journal
+	// marker-less would read as pre-versioning legacy, letting this or a
+	// future boot migrate content it never validated. A pre-field snapshot
+	// installs nothing, which is exactly the legacy shape it is.
+	if (snapshotSchema != null && snapshotSchema !== '') {
+		target.setRecoveryMeta?.(META_SNAPSHOT_SCHEMA, snapshotSchema);
+	}
+}
+
+/**
+ * Throw when the target holds ANY recovery journal state: stored frames, or
+ * any of the journal's recovery_meta keys. assertEmptyTarget covers the
+ * reconstructed application tables; a restore destination must ALSO be
+ * clean of journal residue, or an install would silently overwrite another
+ * journal's metadata (and a failed attempt could leave its frames behind).
+ */
+export function assertNoJournalResidue(target: IStorageBackend): void {
+	// ALL stored rows, with no lower bound: loadRecoveryFrames(0) reads
+	// strictly-greater-than and would miss a sequence-0 residue row, which
+	// then survives the install and leaves the restored journal
+	// unverifiable.
+	if ((target.loadRecoveryFrames?.() ?? []).length > 0) {
+		throw new Error(
+			'Recovery restore requires a target with no stored recovery frames'
+		);
+	}
+	// ALL recovery metadata, not just the journal's own keys: a restore
+	// target must be a fresh database, and any surviving control record (a
+	// writer lease, a startup repair marker) belongs to a previous life the
+	// restore would otherwise resurrect alongside the new one. Backends
+	// that can enumerate the table are checked exhaustively; the rest fall
+	// back to every key this codebase writes.
+	const listedKeys = target.listRecoveryMetaKeys?.();
+	if (listedKeys !== undefined) {
+		if (listedKeys.length > 0) {
+			throw new Error(
+				`Recovery restore requires a target with no recovery metadata ` +
+					`('${listedKeys[0]}' is set)`
+			);
+		}
+		return;
+	}
+	const residueKeys: readonly string[] = [
+		...JOURNAL_META_RESIDUE_KEYS,
+		'writer_lease_v1',
+		'restore_pending_acquisition_v1',
+		META_REPLICATED_THROUGH,
+		META_REPLICATED_THROUGH_HASH,
+		'guardian_pending_registration_v1',
+		'startup_repair_tail'
+	];
+	for (const key of residueKeys) {
+		// PRESENCE is residue: an explicitly stored empty value (a corrupt
+		// or cleared-but-not-deleted record) still belongs to the previous
+		// life and must not survive into the restored one.
+		if (target.getRecoveryMeta?.(key) != null) {
+			throw new Error(
+				`Recovery restore requires a target with no recovery metadata ` +
+					`('${key}' is set)`
+			);
+		}
+	}
 }
 
 /** Throw when the reconstruction target already holds journaled state. */
-function assertEmptyTarget(target: IStorageBackend): void {
+export function assertEmptyTarget(target: IStorageBackend): void {
 	const dirty =
 		target.loadAllChannels().length > 0 ||
+		// Key indices are safety-critical residue too: an orphaned row
+		// surviving a restore shifts the next channel's derivation index.
+		(target.loadAllChannelKeyIndices?.() ?? []).length > 0 ||
 		target.loadAllChainMonitors().length > 0 ||
 		target.loadAllPreimages().length > 0 ||
 		target.loadAllPayments().length > 0 ||
@@ -1084,7 +2032,9 @@ function applySnapshot(
 	target: IStorageBackend,
 	snapshot: RecoverySnapshot
 ): void {
-	target.transaction(() => {
+	// Joins the caller's transaction when one is active (a capsule install
+	// wraps the whole restore in one); opens its own otherwise.
+	withStorageTransaction(target, () => {
 		for (const c of snapshot.channels) {
 			target.saveChannel(c.channelId, c.state, c.peerPubkey);
 		}

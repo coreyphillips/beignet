@@ -35,13 +35,19 @@ import {
 	deriveFrameKey,
 	encryptFrame,
 	decryptFrame,
+	frameAad,
 	journalSupported,
 	reconstructFromFrames,
 	encodeFrame,
 	decodeFrame,
-	hashFrame
+	hashFrame,
+	resolveWatermarkAnchor,
+	JOURNAL_META_KEYS,
+	META_REPLICATED_THROUGH,
+	META_REPLICATED_THROUGH_HASH
 } from '../../src/lightning/recovery';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { withStorageTransaction } from '../../src/lightning/storage/transaction';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import {
 	DEFAULT_CHANNEL_CONFIG,
@@ -955,9 +961,26 @@ describe('Recovery phase 2: corruption detection', () => {
 			.get() as { ciphertext: Buffer };
 		const tampered = Buffer.from(row.ciphertext);
 		tampered[tampered.length - 1] ^= 0x01;
+		// The storage layer refuses UPDATEs on frame rows (append-only
+		// trigger), so simulated tampering replaces the row wholesale.
+		const full = rawDb(storage)
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = 2')
+			.get() as Record<string, unknown>;
 		rawDb(storage)
-			.prepare('UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 2')
-			.run(tampered);
+			.prepare('DELETE FROM recovery_frames WHERE sequence = 2')
+			.run();
+		rawDb(storage)
+			.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			)
+			.run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				tampered,
+				full.created_at
+			);
 		expect(() => journal.loadVerifiedFrames()).to.throw(
 			/failed authentication/
 		);
@@ -975,12 +998,26 @@ describe('Recovery phase 2: corruption detection', () => {
 		const three = db
 			.prepare('SELECT ciphertext FROM recovery_frames WHERE sequence = 3')
 			.get() as { ciphertext: Buffer };
-		db.prepare(
-			'UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 2'
-		).run(three.ciphertext);
-		db.prepare(
-			'UPDATE recovery_frames SET ciphertext = ? WHERE sequence = 3'
-		).run(two.ciphertext);
+		const swap = (sequence: number, ciphertext: Buffer): void => {
+			const full = db
+				.prepare('SELECT * FROM recovery_frames WHERE sequence = ?')
+				.get(sequence) as Record<string, unknown>;
+			db.prepare('DELETE FROM recovery_frames WHERE sequence = ?').run(
+				sequence
+			);
+			db.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			).run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				ciphertext,
+				full.created_at
+			);
+		};
+		swap(2, three.ciphertext);
+		swap(3, two.ciphertext);
 		expect(() => journal.loadVerifiedFrames()).to.throw(
 			/failed authentication/
 		);
@@ -1286,6 +1323,956 @@ describe('Recovery phase 2: wiring and defaults', () => {
 			outboundMessages: []
 		});
 		expect(journal.getTip()).to.equal(null);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: authenticated snapshot schema at the write boundary', () => {
+	/**
+	 * Rewrite the single bootstrap frame's snapshot schema IN PLACE with a
+	 * valid AEAD seal and a matching tip hash: exactly what a journal
+	 * written by a future release looks like on disk.
+	 */
+	function tamperBaseSchema(storage: SqliteStorage, schema: string): void {
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(row.writerEpoch);
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, epoch);
+		const aad = frameAad(
+			NODE_ID,
+			epoch,
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const frame = decodeFrame(decryptFrame(key, row.ciphertext, aad));
+		frame.snapshot!.schemaVersion = schema;
+		const plaintext = encodeFrame(frame);
+		const frameHash = hashFrame(plaintext);
+		const iv = deriveFrameIv(
+			RECOVERY_ID,
+			epoch,
+			BigInt(row.sequence),
+			frameHash
+		);
+		(
+			storage as unknown as {
+				db: { prepare(sql: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames WHERE sequence = ?')
+			.run(row.sequence);
+		storage.saveRecoveryFrame!({
+			sequence: row.sequence,
+			writerEpoch: row.writerEpoch,
+			frameHash,
+			previousFrameHash: row.previousFrameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: row.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+	}
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	it('refuses to rewrite a journal whose AUTHENTICATED base is future-schema, even with the local marker gone', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 1).committed).to.equal(true);
+		tamperBaseSchema(storage, '3');
+		// The unauthenticated local marker is REMOVED: metadata alone now
+		// reads as migratable legacy. The frames say otherwise.
+		storage.setRecoveryMeta!('journal_snapshot_schema', '');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { manager: fresh } = makeJournaledManager(storage);
+		const result = commitPreimage(fresh, 2);
+		expect(result.committed, 'the rewrite is refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/retained base snapshot declares schema '3'/
+		);
+		// Nothing was re-based or compacted: the future base survives.
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		const base = storage.loadRecoveryFrames!(0)[0];
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, BigInt(base.writerEpoch));
+		const aad = frameAad(
+			NODE_ID,
+			BigInt(base.writerEpoch),
+			BigInt(base.sequence),
+			base.previousFrameHash
+		);
+		const decoded = decodeFrame(decryptFrame(key, base.ciphertext, aad));
+		expect(decoded.snapshot!.schemaVersion).to.equal('3');
+		storage.close();
+	});
+
+	it('refuses to rewrite over an AEAD-valid frame this release cannot decode', () => {
+		// A future release's tail frame decrypts (same keys) but its shape
+		// is unknown to this decoder. Skipping it in favor of an older
+		// readable snapshot would let the next re-base compact the future
+		// frames away; the write boundary must fail closed instead.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 5).committed).to.equal(true);
+		const base = storage.loadRecoveryFrames!(0)[0];
+		const epoch = BigInt(base.writerEpoch);
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, epoch);
+		// An AEAD-valid frame at sequence 2 whose plaintext this release's
+		// decodeFrame refuses (unsupported frame version).
+		const plaintext = Buffer.from(
+			JSON.stringify({ version: 2, shape: 'from the future' }),
+			'utf8'
+		);
+		const frameHash = hashFrame(plaintext);
+		const aad = frameAad(NODE_ID, epoch, 2n, base.frameHash);
+		const iv = deriveFrameIv(RECOVERY_ID, epoch, 2n, frameHash);
+		storage.saveRecoveryFrame!({
+			sequence: 2,
+			writerEpoch: base.writerEpoch,
+			frameHash,
+			previousFrameHash: base.frameHash,
+			ciphertext: encryptFrame(key, plaintext, aad, iv),
+			createdAt: base.createdAt
+		});
+		storage.setRecoveryMeta!('journal_tip_sequence', '2');
+		storage.setRecoveryMeta!('journal_tip_hash', frameHash.toString('hex'));
+		storage.setRecoveryMeta!('journal_snapshot_schema', '');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { manager: fresh } = makeJournaledManager(storage);
+		const result = commitPreimage(fresh, 6);
+		expect(result.committed, 'the rewrite is refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(/fails verification/);
+		// The future frame survives untouched.
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		const kept = storage.loadRecoveryFrames!(0).find((r) => r.sequence === 2);
+		expect(kept, 'the undecodable frame is still stored').to.not.equal(
+			undefined
+		);
+		expect(kept!.frameHash.equals(frameHash)).to.equal(true);
+		storage.close();
+	});
+
+	it('prepareForReplication hits the same wall as any other write', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 3).committed).to.equal(true);
+		storage.setRecoveryMeta!('journal_snapshot_schema', '3');
+		const framesBefore = storage.loadRecoveryFrames!(0).length;
+
+		const { journal: fresh } = makeJournaledManager(storage);
+		expect(() => fresh.prepareForReplication()).to.throw(
+			/not one this release can migrate/
+		);
+		expect(storage.loadRecoveryFrames!(0).length).to.equal(framesBefore);
+		storage.close();
+	});
+
+	it('refuses to rewrite a journal whose chain does not verify against its tip', () => {
+		// Deleting the tail, emptying the frame store while keeping the tip
+		// metadata, or swapping the tip hash must all refuse the rewrite:
+		// the compaction it triggers would destroy the evidence and leave a
+		// journal that verifies.
+		const sql = (
+			storage: SqliteStorage
+		): { prepare(q: string): { run(...args: unknown[]): unknown } } =>
+			(
+				storage as unknown as {
+					db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+				}
+			).db;
+
+		// (a) Deleted tail: tip says 2, rows end at 1.
+		const s1 = openStorage();
+		const m1 = makeJournaledManager(s1);
+		expect(commitPreimage(m1.manager, 10).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 11).committed).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames WHERE sequence = 2').run();
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 12);
+		expect(r1.committed, 'deleted tail refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
+		s1.close();
+
+		// (b) Every frame deleted, tip metadata retained.
+		const s2 = openStorage();
+		const m2 = makeJournaledManager(s2);
+		expect(commitPreimage(m2.manager, 13).committed).to.equal(true);
+		sql(s2).prepare('DELETE FROM recovery_frames').run();
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 14);
+		expect(r2.committed, 'emptied store refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
+		s2.close();
+
+		// (c) Tip hash swapped for a plausible but wrong value.
+		const s3 = openStorage();
+		const m3 = makeJournaledManager(s3);
+		expect(commitPreimage(m3.manager, 15).committed).to.equal(true);
+		s3.setRecoveryMeta!('journal_tip_hash', 'ab'.repeat(32));
+		const r3 = commitPreimage(makeJournaledManager(s3).manager, 16);
+		expect(r3.committed, 'swapped tip hash refused').to.equal(false);
+		expect(String(r3.error?.message)).to.match(
+			/do not match the recorded tip|fails verification/
+		);
+		s3.close();
+	});
+
+	it('refuses an emptied store that kept partial journal metadata', () => {
+		// Deleting frame 1 plus ONLY the tip hash (keeping the sequence and
+		// base records) used to read as a fresh journal; the next commit
+		// then created frame 2 with the genesis predecessor, a local chain
+		// that verifies but forks from every guardian retaining frame 1.
+		const sql = (
+			storage: SqliteStorage
+		): { prepare(q: string): { run(...args: unknown[]): unknown } } =>
+			(
+				storage as unknown as {
+					db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+				}
+			).db;
+
+		// (a) Tip hash deleted, sequence and base retained.
+		const s1 = openStorage();
+		expect(
+			commitPreimage(makeJournaledManager(s1).manager, 20).committed
+		).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames').run();
+		s1.deleteRecoveryMeta!('journal_tip_hash');
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 21);
+		expect(r1.committed, 'partial tip metadata refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(
+			/tip metadata is partial|fails verification/
+		);
+		expect(
+			s1.loadRecoveryFrames!(0),
+			'no genesis-predecessor frame was created'
+		).to.have.length(0);
+		s1.close();
+
+		// (b) Tip AND base records deleted, but other frame-derived
+		// metadata (the writer epoch) survives: still not a fresh journal.
+		const s2 = openStorage();
+		expect(
+			commitPreimage(makeJournaledManager(s2).manager, 22).committed
+		).to.equal(true);
+		sql(s2).prepare('DELETE FROM recovery_frames').run();
+		for (const key of [
+			'journal_tip_hash',
+			'journal_tip_sequence',
+			'journal_last_snapshot_sequence',
+			'journal_last_snapshot_written'
+		]) {
+			s2.deleteRecoveryMeta!(key);
+		}
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 23);
+		expect(r2.committed, 'surviving frame-derived metadata refused').to.equal(
+			false
+		);
+		expect(String(r2.error?.message)).to.match(/metadata \('.*'\) survives/);
+		s2.close();
+	});
+
+	it('refuses a store rewritten UNDER a live writer, not just at startup', () => {
+		// The expensive chain verification is one-shot per run, but the
+		// cheap invariants are not: deleting the frames and tip metadata
+		// while the SAME journal instance keeps writing must refuse the
+		// next commit instead of silently creating a new frame 1 that
+		// forks from every replica holding the original history.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 30).committed).to.equal(true);
+		(
+			storage as unknown as {
+				db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+			}
+		).db
+			.prepare('DELETE FROM recovery_frames')
+			.run();
+		for (const key of [
+			'journal_tip_hash',
+			'journal_tip_sequence',
+			'journal_last_snapshot_sequence',
+			'journal_last_snapshot_written',
+			'journal_delta_bytes_since_snapshot',
+			'journal_snapshot_schema'
+		]) {
+			storage.deleteRecoveryMeta!(key);
+		}
+		// SAME manager instance: the one-shot verification already ran.
+		const result = commitPreimage(manager, 31);
+		expect(result.committed, 'the mid-process rewrite is refused').to.equal(
+			false
+		);
+		expect(String(result.error?.message)).to.match(
+			/tip changed outside this writer/
+		);
+		expect(
+			storage.loadRecoveryFrames!(),
+			'no forked frame 1 was created'
+		).to.have.length(0);
+		storage.close();
+	});
+
+	it('refuses empty stores carrying a replication watermark or explicit empty values', () => {
+		// (a) A dangling guardian watermark over an empty store: writing
+		// frame 1 under it would leave replication believing everything at
+		// or below the watermark was already sent.
+		const s1 = openStorage();
+		s1.setRecoveryMeta!('guardian_replicated_through', '1');
+		const r1 = commitPreimage(makeJournaledManager(s1).manager, 32);
+		expect(r1.committed, 'watermark residue refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/guardian_replicated_through/);
+		s1.close();
+
+		// (b) PRESENCE is residue: an explicitly stored empty value is not
+		// absence.
+		const s2 = openStorage();
+		s2.setRecoveryMeta!('journal_last_snapshot_sequence', '');
+		const r2 = commitPreimage(makeJournaledManager(s2).manager, 33);
+		expect(r2.committed, 'explicit empty value refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(
+			/journal_last_snapshot_sequence|fails verification/
+		);
+		s2.close();
+	});
+
+	it('refuses a present-but-null or empty schema declaration outright', () => {
+		// Only a truly ABSENT property means pre-versioning: an explicit
+		// null or empty declaration is an evasive shape that could smuggle
+		// unknown snapshot content past the schema gate.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 4).committed).to.equal(true);
+		const row = storage.loadRecoveryFrames!(0)[0];
+		const key = deriveFrameKey(MASTER_KEY, NODE_ID, BigInt(row.writerEpoch));
+		const aad = frameAad(
+			NODE_ID,
+			BigInt(row.writerEpoch),
+			BigInt(row.sequence),
+			row.previousFrameHash
+		);
+		const plaintext = decryptFrame(key, row.ciphertext, aad);
+		for (const bad of [null, '']) {
+			const parsed = JSON.parse(plaintext.toString('utf8')) as {
+				snapshot: { schemaVersion?: unknown };
+			};
+			parsed.snapshot.schemaVersion = bad;
+			expect(
+				() => decodeFrame(Buffer.from(JSON.stringify(parsed), 'utf8')),
+				`declaration ${JSON.stringify(bad)}`
+			).to.throw(/nonempty string/);
+		}
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: attempt-owned commit and rollback', () => {
+	const sql = (
+		storage: SqliteStorage
+	): { prepare(q: string): { run(...args: unknown[]): unknown } } =>
+		(
+			storage as unknown as {
+				db: { prepare(q: string): { run(...args: unknown[]): unknown } };
+			}
+		).db;
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	it('a refusal never erases the evidence it refused on', () => {
+		// The guard's own refusal must NOT count as a rollback of journal
+		// expectations: after tampering, EVERY retry keeps refusing instead
+		// of the second one writing a forked frame 1.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 40).committed).to.equal(true);
+		sql(storage).prepare('DELETE FROM recovery_frames').run();
+		for (const key of [
+			'journal_tip_hash',
+			'journal_tip_sequence',
+			'journal_last_snapshot_sequence',
+			'journal_last_snapshot_written',
+			'journal_delta_bytes_since_snapshot',
+			'journal_snapshot_schema'
+		]) {
+			storage.deleteRecoveryMeta!(key);
+		}
+		const first = commitPreimage(manager, 41);
+		expect(first.committed, 'first retry refused').to.equal(false);
+		const second = commitPreimage(manager, 42);
+		expect(second.committed, 'second retry STILL refused').to.equal(false);
+		expect(String(second.error?.message)).to.match(
+			/tip changed outside this writer/
+		);
+		expect(
+			storage.loadRecoveryFrames!(),
+			'no forked frame 1 was ever created'
+		).to.have.length(0);
+		storage.close();
+	});
+
+	it('a genuine rollback restores EVERY journal field and the retry works', () => {
+		// (a) A bootstrap that rolls back must not leave rebasedThisRun
+		// true or a phantom written tip: the retry re-bootstraps cleanly.
+		const s1 = openStorage();
+		const h1 = makeJournaledManager(s1);
+		const realSave = s1.saveRecoveryFrame!.bind(s1);
+		let failNext = true;
+		s1.saveRecoveryFrame = (frame): void => {
+			if (failNext) {
+				failNext = false;
+				throw new Error('disk hiccup');
+			}
+			realSave(frame);
+		};
+		const failed = commitPreimage(h1.manager, 43);
+		expect(failed.committed).to.equal(false);
+		const retried = commitPreimage(h1.manager, 44);
+		expect(retried.committed, 'the retry commits cleanly').to.equal(true);
+		const frames = h1.journal.loadVerifiedFrames();
+		expect(frames[0].snapshot, 'the retry re-bootstrapped').to.not.equal(
+			undefined
+		);
+		expect(commitPreimage(h1.manager, 45).committed).to.equal(true);
+		s1.close();
+
+		// (b) A failed prepareForReplication must not leave the run marked
+		// as re-based: the next append still re-bases with a snapshot.
+		const s2 = openStorage();
+		const h2 = makeJournaledManager(s2);
+		expect(commitPreimage(h2.manager, 46).committed).to.equal(true);
+		const h3 = makeJournaledManager(s2);
+		const realSave2 = s2.saveRecoveryFrame!.bind(s2);
+		let failOnce = true;
+		s2.saveRecoveryFrame = (frame): void => {
+			if (failOnce) {
+				failOnce = false;
+				throw new Error('replication rebase failed');
+			}
+			realSave2(frame);
+		};
+		expect(() => h3.journal.prepareForReplication()).to.throw(
+			/replication rebase failed/
+		);
+		const after = commitPreimage(h3.manager, 47);
+		expect(after.committed, 'the next append commits').to.equal(true);
+		const chain = h3.journal.loadVerifiedFrames();
+		expect(
+			chain[chain.length - 1].snapshot,
+			'and it re-based with a snapshot, not a drift-blind delta'
+		).to.not.equal(undefined);
+		s2.close();
+	});
+
+	it('binds the frame epoch: missing and regressed records refuse', () => {
+		// Missing after epoch 2 was observed.
+		const s1 = openStorage();
+		s1.setRecoveryMeta!('journal_writer_epoch', '2');
+		const h1 = makeJournaledManager(s1);
+		expect(commitPreimage(h1.manager, 50).committed).to.equal(true);
+		s1.deleteRecoveryMeta!('journal_writer_epoch');
+		const missing = commitPreimage(h1.manager, 51);
+		expect(missing.committed, 'missing epoch refused').to.equal(false);
+		expect(String(missing.error?.message)).to.match(/epoch record is missing/);
+		s1.close();
+
+		// Regressed below the observed floor.
+		const s2 = openStorage();
+		s2.setRecoveryMeta!('journal_writer_epoch', '2');
+		const h2 = makeJournaledManager(s2);
+		expect(commitPreimage(h2.manager, 52).committed).to.equal(true);
+		s2.setRecoveryMeta!('journal_writer_epoch', '1');
+		const regressed = commitPreimage(h2.manager, 53);
+		expect(regressed.committed, 'regressed epoch refused').to.equal(false);
+		expect(String(regressed.error?.message)).to.match(/epoch regressed/);
+		s2.close();
+	});
+
+	it('binds the frame epoch to the ACTIVE lease when one is injected', () => {
+		const storage = openStorage();
+		storage.setRecoveryMeta!('journal_writer_epoch', '1');
+		let leaseEpoch: bigint | null = 1n;
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{ activeLeaseEpoch: (): bigint | null => leaseEpoch }
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		expect(commitPreimage(manager, 54).committed).to.equal(true);
+		// The lease advances (a takeover granted epoch 2) but the journal
+		// record was not updated: the mismatch refuses the write.
+		leaseEpoch = 2n;
+		const mismatch = commitPreimage(manager, 55);
+		expect(mismatch.committed, 'lease mismatch refused').to.equal(false);
+		expect(String(mismatch.error?.message)).to.match(
+			/does not match the active lease epoch/
+		);
+		storage.close();
+	});
+
+	it('refuses a replication watermark raised above the journal tip', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 56).committed).to.equal(true);
+		storage.setRecoveryMeta!('guardian_replicated_through', '999');
+		const result = commitPreimage(manager, 57);
+		expect(result.committed, 'the raised watermark refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/watermark.*exceeds the journal tip/
+		);
+		storage.close();
+	});
+
+	it('detects interior frame deletion, not just a damaged tip', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 58).committed).to.equal(true);
+		expect(commitPreimage(manager, 59).committed).to.equal(true);
+		expect(commitPreimage(manager, 60).committed).to.equal(true);
+		sql(storage)
+			.prepare('DELETE FROM recovery_frames WHERE sequence = 2')
+			.run();
+		const result = commitPreimage(manager, 61);
+		expect(result.committed, 'the interior gap refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/do not match the recorded tip/
+		);
+		storage.close();
+	});
+
+	it('validates pre-frame metadata VALUES, not only keys', () => {
+		for (const bad of ['', '9', 'garbage']) {
+			const storage = openStorage();
+			storage.setRecoveryMeta!('startup_repair_tail', bad);
+			const result = commitPreimage(makeJournaledManager(storage).manager, 62);
+			expect(result.committed, `tail ${JSON.stringify(bad)} refused`).to.equal(
+				false
+			);
+			expect(String(result.error?.message)).to.match(/illegitimate value/);
+			storage.close();
+		}
+		// The bare sentinel is the ONE legitimate pre-frame shape.
+		const ok = openStorage();
+		ok.setRecoveryMeta!('startup_repair_tail', 'owed');
+		expect(
+			commitPreimage(makeJournaledManager(ok).manager, 63).committed,
+			'the owed sentinel is allowed'
+		).to.equal(true);
+		ok.close();
+	});
+});
+
+describe('Recovery phase 2: round-16 complete invariants', () => {
+	const sql = (
+		storage: SqliteStorage
+	): {
+		prepare(q: string): {
+			run(...args: unknown[]): unknown;
+			get(...args: unknown[]): unknown;
+		};
+	} =>
+		(
+			storage as unknown as {
+				db: {
+					prepare(q: string): {
+						run(...args: unknown[]): unknown;
+						get(...args: unknown[]): unknown;
+					};
+				};
+			}
+		).db;
+
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	it('a rollback never un-observes durable state', () => {
+		// The failed attempt OBSERVED durable tip 1 before writing; rolling
+		// its floors back must not forget that, or deleting the journal
+		// afterwards would let the retry restart at frame 1.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 70).committed).to.equal(true);
+		const realSave = storage.saveRecoveryFrame!.bind(storage);
+		let failNext = true;
+		storage.saveRecoveryFrame = (frame): void => {
+			if (failNext) {
+				failNext = false;
+				throw new Error('disk hiccup');
+			}
+			realSave(frame);
+		};
+		expect(commitPreimage(manager, 71).committed).to.equal(false);
+		sql(storage).prepare('DELETE FROM recovery_frames').run();
+		for (const key of storage.listRecoveryMetaKeys!()) {
+			storage.deleteRecoveryMeta!(key);
+		}
+		const retry = commitPreimage(manager, 72);
+		expect(retry.committed, 'the emptied store is refused').to.equal(false);
+		expect(String(retry.error?.message)).to.match(
+			/disappeared|changed outside this writer/
+		);
+		expect(storage.loadRecoveryFrames!()).to.have.length(0);
+		storage.close();
+	});
+
+	it('journaled writes refuse to join an outer storage transaction', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 73).committed).to.equal(true);
+		let inner: ReturnType<RecoveryManager['commit']> | null = null;
+		withStorageTransaction(storage, () => {
+			inner = commitPreimage(manager, 74);
+		});
+		expect(inner!.committed, 'the joined commit is refused').to.equal(false);
+		expect(String(inner!.error?.message)).to.match(/cannot join an outer/);
+		expect(
+			storage.loadRecoveryFrames!(),
+			'nothing was written under the outer transaction'
+		).to.have.length(1);
+		// The journal-owned paths refuse too.
+		const fresh = makeJournaledManager(storage).journal;
+		expect(() =>
+			withStorageTransaction(storage, () => fresh.prepareForReplication())
+		).to.throw(/cannot run inside an outer storage transaction/);
+		// And a normal commit afterwards still works.
+		expect(commitPreimage(manager, 75).committed).to.equal(true);
+		storage.close();
+	});
+
+	it('detects a deleted retained prefix and a corrupted tip on the next write', () => {
+		// Prefix deletion: [1,2,3] -> [2,3] passes bare count-vs-span
+		// arithmetic but not the VERIFIED minimum.
+		const s1 = openStorage();
+		const m1 = makeJournaledManager(s1);
+		expect(commitPreimage(m1.manager, 76).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 77).committed).to.equal(true);
+		expect(commitPreimage(m1.manager, 78).committed).to.equal(true);
+		sql(s1).prepare('DELETE FROM recovery_frames WHERE sequence = 1').run();
+		const r1 = commitPreimage(m1.manager, 79);
+		expect(r1.committed, 'deleted prefix refused').to.equal(false);
+		expect(String(r1.error?.message)).to.match(/do not match the recorded tip/);
+		s1.close();
+
+		// Corrupted tip ciphertext (replaced wholesale; UPDATEs are blocked
+		// at the storage layer): refused by per-write authentication.
+		const s2 = openStorage();
+		const m2 = makeJournaledManager(s2);
+		expect(commitPreimage(m2.manager, 80).committed).to.equal(true);
+		const full = sql(s2)
+			.prepare('SELECT * FROM recovery_frames WHERE sequence = 1')
+			.get() as Record<string, unknown>;
+		sql(s2).prepare('DELETE FROM recovery_frames WHERE sequence = 1').run();
+		sql(s2)
+			.prepare(
+				'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+			)
+			.run(
+				full.sequence,
+				full.writer_epoch,
+				full.frame_hash,
+				full.previous_hash,
+				Buffer.alloc(64),
+				full.created_at
+			);
+		const r2 = commitPreimage(m2.manager, 81);
+		expect(r2.committed, 'corrupt tip refused').to.equal(false);
+		expect(String(r2.error?.message)).to.match(/fails authentication/);
+		s2.close();
+
+		// And in-place mutation is refused AT the storage layer.
+		const s3 = openStorage();
+		const m3 = makeJournaledManager(s3);
+		expect(commitPreimage(m3.manager, 82).committed).to.equal(true);
+		expect(() =>
+			sql(s3)
+				.prepare(
+					'UPDATE recovery_frames SET ciphertext = zeroblob(8) WHERE sequence = 1'
+				)
+				.run()
+		).to.throw(/append-only/);
+		s3.close();
+	});
+
+	it('derives the epoch floor from the verified chain itself', () => {
+		// Frames written under epoch 2; then BOTH the epoch record and any
+		// lease disappear. A fresh journal must refuse to default to epoch
+		// 1 and compact the epoch-2 history away.
+		const storage = openStorage();
+		storage.setRecoveryMeta!('journal_writer_epoch', '2');
+		const first = makeJournaledManager(storage);
+		expect(commitPreimage(first.manager, 83).committed).to.equal(true);
+		storage.deleteRecoveryMeta!('journal_writer_epoch');
+		const fresh = makeJournaledManager(storage);
+		const result = commitPreimage(fresh.manager, 84);
+		expect(result.committed, 'the epoch-less rebase refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/epoch record is missing|below the verified chain/
+		);
+		const rows = storage.loadRecoveryFrames!();
+		expect(
+			rows.every((row) => row.writerEpoch === 2),
+			'the epoch-2 history survives untouched'
+		).to.equal(true);
+		storage.close();
+	});
+
+	it('binds the replication watermark to the receipted history', () => {
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage);
+		expect(commitPreimage(manager, 85).committed).to.equal(true);
+		expect(commitPreimage(manager, 86).committed).to.equal(true);
+		const frame2 = storage.loadRecoveryFrames!(1)[0];
+		storage.setRecoveryMeta!('guardian_replicated_through', '2');
+		storage.setRecoveryMeta!(
+			'guardian_replicated_through_hash',
+			frame2.frameHash.toString('hex')
+		);
+		expect(
+			commitPreimage(manager, 87).committed,
+			'a correctly bound watermark passes'
+		).to.equal(true);
+		// The recorded receipt now names a frame this store does not hold:
+		// the receipts belong to a different history.
+		storage.setRecoveryMeta!(
+			'guardian_replicated_through_hash',
+			'cd'.repeat(32)
+		);
+		const result = commitPreimage(manager, 88);
+		expect(result.committed, 'the divergent history refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('validates pre-frame artifacts with their real shapes', () => {
+		const storage = openStorage();
+		storage.setRecoveryMeta!('writer_lease_v1', 'not json at all');
+		const result = commitPreimage(makeJournaledManager(storage).manager, 89);
+		expect(result.committed, 'a non-JSON lease refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(/illegitimate value/);
+		storage.close();
+	});
+});
+
+describe('Recovery phase 2: round-17 watermark anchoring', () => {
+	function commitPreimage(
+		manager: RecoveryManager,
+		fill: number
+	): ReturnType<RecoveryManager['commit']> {
+		return manager.commit({
+			criticality: RecoveryCriticality.Important,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: Buffer.alloc(32, fill).toString('hex'),
+					preimage: Buffer.alloc(32, fill)
+				}
+			],
+			outboundMessages: []
+		});
+	}
+
+	/**
+	 * A journal whose compaction floor tracks a test-controlled watermark,
+	 * with a short snapshot cadence so pruning is reachable in a few commits.
+	 */
+	function compactableJournal(watermark: () => bigint): {
+		storage: SqliteStorage;
+		journal: RecoveryJournal;
+		manager: RecoveryManager;
+	} {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				snapshotIntervalFrames: 2,
+				retainFrom: (): bigint => watermark() + 1n
+			}
+		);
+		return {
+			storage,
+			journal,
+			manager: new RecoveryManager(storage, { journal })
+		};
+	}
+
+	/** Commit frames, then bind and prune at watermark = base - 1. */
+	function compactedFixture(hash?: string): {
+		storage: SqliteStorage;
+		manager: RecoveryManager;
+		base: bigint;
+		receiptedHash: string;
+	} {
+		let watermark = 0n;
+		const fixture = compactableJournal(() => watermark);
+		for (let i = 0; i < 6; i++) {
+			expect(commitPreimage(fixture.manager, 100 + i).committed).to.equal(true);
+		}
+		const base = BigInt(
+			fixture.storage.getRecoveryMeta!(JOURNAL_META_KEYS.lastSnapshotWritten)!
+		);
+		expect(base > 2n, 'a snapshot above frame 2 exists').to.equal(true);
+		watermark = base - 1n;
+		const receipted = fixture.storage.loadRecoveryFrames!(
+			Number(watermark) - 1
+		)[0];
+		expect(BigInt(receipted.sequence)).to.equal(watermark);
+		const receiptedHash = receipted.frameHash.toString('hex');
+		fixture.storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH,
+			watermark.toString()
+		);
+		fixture.storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH_HASH,
+			hash ?? receiptedHash
+		);
+		fixture.journal.compact();
+		const retained = fixture.storage.loadRecoveryFrames!();
+		expect(
+			BigInt(retained[0].sequence),
+			'the receipted frame was pruned beneath the base snapshot'
+		).to.equal(base);
+		return {
+			storage: fixture.storage,
+			manager: fixture.manager,
+			base,
+			receiptedHash
+		};
+	}
+
+	it('a compacted watermark stays bound through the retained base snapshot', () => {
+		const { storage, manager, base, receiptedHash } = compactedFixture();
+		// The anchor resolves through the base snapshot's previousFrameHash,
+		// which names exactly the pruned frame.
+		const anchor = resolveWatermarkAnchor(storage, base - 1n);
+		expect(anchor?.toString('hex')).to.equal(receiptedHash);
+		expect(
+			commitPreimage(manager, 110).committed,
+			'a correctly bound compacted watermark passes the write gate'
+		).to.equal(true);
+		storage.close();
+	});
+
+	it('a compacted watermark bound to a foreign history is refused', () => {
+		// A receipt for a DIFFERENT chain at the same height: once the frame
+		// is compacted, only the base snapshot can expose the divergence.
+		const { storage, manager } = compactedFixture('cd'.repeat(32));
+		const result = commitPreimage(manager, 111);
+		expect(result.committed, 'the divergent history refused').to.equal(false);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('a watermark below the retained base minus one resolves nowhere and is refused', () => {
+		const { storage, manager } = compactedFixture();
+		// Neither the frame at 1 nor a base snapshot at 2 survives, so no
+		// anchor exists and the binding must fail closed.
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH, '1');
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH_HASH, 'ab'.repeat(32));
+		const result = commitPreimage(manager, 112);
+		expect(result.committed, 'the unanchorable watermark refused').to.equal(
+			false
+		);
+		expect(String(result.error?.message)).to.match(
+			/is not the receipted frame/
+		);
+		storage.close();
+	});
+
+	it('a forced prune past the watermark RESETS the mark and records the loss', () => {
+		const storage = openStorage();
+		const journal = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID,
+			{
+				snapshotIntervalFrames: 2,
+				maxRetainedFrameGap: 3,
+				retainFrom: (): bigint => 2n
+			}
+		);
+		const manager = new RecoveryManager(storage, { journal });
+		expect(commitPreimage(manager, 120).committed).to.equal(true);
+		const frame1 = storage.loadRecoveryFrames!()[0];
+		storage.setRecoveryMeta!(META_REPLICATED_THROUGH, '1');
+		storage.setRecoveryMeta!(
+			META_REPLICATED_THROUGH_HASH,
+			frame1.frameHash.toString('hex')
+		);
+		for (let i = 1; i < 10; i++) {
+			expect(commitPreimage(manager, 120 + i).committed).to.equal(true);
+		}
+		// The prune destroyed the anchor: the mark was reset WITH its hash
+		// (a bare positive height resolvable by nothing must not linger),
+		// and the loss is recorded durably.
+		expect(
+			storage.loadRecoveryFrames!()[0].sequence,
+			'frames below the forced snapshot are gone'
+		).to.be.greaterThan(2);
+		expect(storage.getRecoveryMeta!(META_REPLICATED_THROUGH)).to.equal(null);
+		expect(storage.getRecoveryMeta!(META_REPLICATED_THROUGH_HASH)).to.equal(
+			null
+		);
+		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.backfillLost)).to.be.a(
+			'string'
+		);
+		expect(
+			commitPreimage(manager, 130).committed,
+			'the journal keeps writing after the reset'
+		).to.equal(true);
 		storage.close();
 	});
 });

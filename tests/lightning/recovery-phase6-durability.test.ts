@@ -108,21 +108,33 @@ function makeJournal(
 }
 
 /**
- * Flip a byte of the newest frame's ciphertext in place. saveRecoveryFrame
- * only ever inserts, so damage has to go straight at the row.
+ * Flip a byte of the newest frame's ciphertext. The storage layer refuses
+ * UPDATEs on frame rows outright (append-only trigger), so simulated
+ * damage replaces the row wholesale.
  */
 function damageTipFrame(storage: SqliteStorage): void {
 	const rows = storage.loadRecoveryFrames();
 	const tip = rows[rows.length - 1];
 	const damaged = Buffer.from(tip.ciphertext);
 	damaged[damaged.length - 1] ^= 0xff;
-	(
+	const db = (
 		storage as unknown as {
 			db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
 		}
-	).db
-		.prepare('UPDATE recovery_frames SET ciphertext = ? WHERE sequence = ?')
-		.run(damaged, tip.sequence);
+	).db;
+	db.prepare('DELETE FROM recovery_frames WHERE sequence = ?').run(
+		tip.sequence
+	);
+	db.prepare(
+		'INSERT INTO recovery_frames (sequence, writer_epoch, frame_hash, previous_hash, ciphertext, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+	).run(
+		tip.sequence,
+		tip.writerEpoch,
+		tip.frameHash,
+		tip.previousFrameHash,
+		damaged,
+		tip.createdAt
+	);
 }
 
 /** One journaled transition; returns the frame sequence it landed in. */

@@ -384,6 +384,16 @@ export class SqliteStorage implements IStorageBackend {
 				ciphertext BLOB NOT NULL,
 				created_at INTEGER NOT NULL
 			);
+			-- Frames are APPEND-ONLY at the storage layer: nothing in the
+			-- protocol ever rewrites a stored frame (compaction deletes below
+			-- the base, appends insert), so an UPDATE is always tampering or
+			-- corruption and is refused where it happens instead of surfacing
+			-- as an unverifiable chain later.
+			CREATE TRIGGER IF NOT EXISTS recovery_frames_append_only
+				BEFORE UPDATE ON recovery_frames
+			BEGIN
+				SELECT RAISE(ABORT, 'recovery_frames is append-only');
+			END;
 
 			CREATE TABLE IF NOT EXISTS recovery_meta (
 				key TEXT PRIMARY KEY,
@@ -1113,6 +1123,19 @@ export class SqliteStorage implements IStorageBackend {
 		return row ? this._decodeChannelIndex(row.channel_index) : null;
 	}
 
+	loadAllChannelKeyIndices(): Array<{
+		channelId: string;
+		channelIndex: number;
+	}> {
+		const rows = this.db
+			.prepare('SELECT channel_id, channel_index FROM channel_key_indices')
+			.all() as Array<{ channel_id: string; channel_index: number | string }>;
+		return rows.map((row) => ({
+			channelId: row.channel_id,
+			channelIndex: this._decodeChannelIndex(row.channel_index)
+		}));
+	}
+
 	loadNextChannelIndex(): number {
 		// Encrypted cells are TEXT, so SQL MAX() would compare ciphertext;
 		// decode in JS instead (one small row per channel)
@@ -1761,6 +1784,32 @@ export class SqliteStorage implements IStorageBackend {
 				'INSERT OR REPLACE INTO recovery_meta (key, value) VALUES (?, ?)'
 			)
 			.run(key, this._enc(value));
+	}
+
+	recoveryFrameStats(): {
+		count: number;
+		minSequence: number;
+		maxSequence: number;
+	} | null {
+		const row = this.db
+			.prepare(
+				'SELECT COUNT(*) AS count, MIN(sequence) AS min, MAX(sequence) AS max FROM recovery_frames'
+			)
+			.get() as { count: number; min: number | null; max: number | null };
+		if (!row.count) return null;
+		return {
+			count: row.count,
+			minSequence: row.min!,
+			maxSequence: row.max!
+		};
+	}
+
+	listRecoveryMetaKeys(): string[] {
+		return (
+			this.db.prepare('SELECT key FROM recovery_meta').all() as Array<{
+				key: string;
+			}>
+		).map((row) => row.key);
 	}
 
 	deleteRecoveryMeta(key: string): void {

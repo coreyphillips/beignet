@@ -30,6 +30,14 @@ import {
 	IOpenChannel2Message,
 	IAcceptChannel2Message
 } from '../../src/lightning/message/dual-funding';
+import {
+	encodeAcceptChannelMessage,
+	encodeOpenChannelMessage
+} from '../../src/lightning/message/channel-open';
+import {
+	encodeFundingCreatedMessage,
+	encodeFundingSignedMessage
+} from '../../src/lightning/message/channel-funding';
 
 import {
 	DualFundingSession,
@@ -39,22 +47,41 @@ import {
 
 // InteractiveTxState used indirectly via DualFundingSession
 
-import { Channel } from '../../src/lightning/channel/channel';
+import {
+	Channel,
+	ISpliceWalletInput
+} from '../../src/lightning/channel/channel';
 import {
 	createOpenerState,
 	createAcceptorState
 } from '../../src/lightning/channel/channel-state';
 import {
 	ChannelState,
-	DEFAULT_CHANNEL_CONFIG
+	DEFAULT_CHANNEL_CONFIG,
+	validateV2ChannelType
 } from '../../src/lightning/channel/types';
-import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
+import {
+	ChannelAction,
+	ChannelActionType,
+	IChannelPersistEvent
+} from '../../src/lightning/channel/channel-actions';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { MessageType } from '../../src/lightning/message/types';
+import {
+	decodeErrorMessage,
+	encodeErrorMessage
+} from '../../src/lightning/message/error';
+import {
+	encodeTxAbortMessage,
+	encodeTxAddOutputMessage
+} from '../../src/lightning/message/interactive-tx';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
+import { IFundingProvider } from '../../src/lightning/node/types';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { Feature, FeatureFlags } from '../../src/lightning/features/flags';
+import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
+import { signWillFund } from '../../src/lightning/channel/liquidity-ads';
 
 // ─────────────── Helpers ───────────────
 
@@ -91,8 +118,8 @@ function makeOpenChannel2Msg(
 	overrides?: Partial<IOpenChannel2Message>
 ): IOpenChannel2Message {
 	const bp = makeBasepoints();
-	return {
-		channelId: crypto.randomBytes(32),
+	const message: IOpenChannel2Message = {
+		channelId: deriveV2TemporaryChannelId(bp.revocationBasepoint),
 		fundingFeeratePerkw: 1000,
 		commitmentFeeratePerkw: 253,
 		fundingSatoshis: 100000n,
@@ -110,8 +137,15 @@ function makeOpenChannel2Msg(
 		firstPerCommitmentPoint: bp.firstPerCommitmentPoint,
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
 		channelFlags: 0x01,
+		// BOLT 2 makes channel_type REQUIRED on open_channel2; the default
+		// mirrors the opener's resolved default (static_remotekey).
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
+	if (overrides?.channelId === undefined) {
+		message.channelId = deriveV2TemporaryChannelId(message.revocationBasepoint);
+	}
+	return message;
 }
 
 function makeAcceptChannel2Msg(
@@ -134,6 +168,9 @@ function makeAcceptChannel2Msg(
 		htlcBasepoint: bp.htlcBasepoint,
 		firstPerCommitmentPoint: bp.firstPerCommitmentPoint,
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
+		// The accepter echoes the offered channel_type (BOLT 2); the default
+		// matches makeOpenChannel2Msg's.
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
 }
@@ -154,6 +191,10 @@ function makeDualFundingParams(
 		localBasepoints: makeBasepoints(),
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		secondPerCommitmentPoint: getPublicKey(crypto.randomBytes(32)),
+		// BOLT 2 makes channel_type REQUIRED on open_channel2; sessions do
+		// not inject a default (the Channel layer does), so the fixture
+		// carries one that matches the message fixtures above.
+		channelType: Buffer.from('1000', 'hex'),
 		...overrides
 	};
 }
@@ -1208,11 +1249,12 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 		});
 
 		it('rejects a will_fund lease on a taproot channel (mutually-exclusive types)', () => {
-			// Script-enforced lease and simple taproot are distinct commitment types
-			// with no interoperable "leased taproot" script. Even if the manager-level
-			// guard were bypassed and a will_fund reached the state machine on a taproot
-			// open, handleOpenChannel2 must refuse rather than enter an unenforceable
-			// lessor state.
+			// Round 17 moved the taproot-v2 refusal to ADMISSION: the raw
+			// Channel refuses the proposed type before the lease branch (or
+			// any state mutation) sees it, so a will_fund on a taproot open
+			// dies at the door with the channel-type error rather than deep
+			// in the lease logic. The lessor assertions still pin what
+			// matters: nothing was recorded.
 			const state = createAcceptorState({
 				temporaryChannelId: crypto.randomBytes(32),
 				fundingSatoshis: 0n,
@@ -1249,11 +1291,19 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			});
 
 			const actions = channel.handleOpenChannel2(openMsg, localParams);
-			expect(actions.length).to.equal(1);
-			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
-			if (actions[0].type === ChannelActionType.ERROR) {
-				expect(actions[0].message).to.match(
-					/lease is not supported on taproot/i
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(
+					/option_taproot is not supported for dual-funded/i
 				);
 			}
 			// No lessor state was recorded.
@@ -1285,6 +1335,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 100_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1316,6 +1367,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1348,6 +1400,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: {
 						signature: Buffer.alloc(64, 0x01),
@@ -1382,6 +1435,7 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 			const actions = channel.handleAcceptChannel2(
 				makeAcceptChannel2Msg({
 					channelId,
+					channelType: LEASE_CHANNEL_TYPE,
 					fundingSatoshis: 500_000n,
 					willFund: { signature: Buffer.alloc(64, 0x01), leaseRates: M2_RATES }
 				})
@@ -1890,6 +1944,2559 @@ describe('Dual Funding (BOLT 2 v2)', () => {
 				sequence: 0xfffffffd
 			});
 			expect(opener.getTxBuilder()!.getInputs().length).to.equal(1);
+		});
+	});
+});
+
+describe('Round 17: v2 channel_type admission', () => {
+	function taprootType(): Buffer {
+		const flags = FeatureFlags.empty();
+		flags.setCompulsory(Feature.OPTION_TAPROOT);
+		return flags.toBuffer();
+	}
+
+	function typeOf(...features: Feature[]): Buffer {
+		const flags = FeatureFlags.empty();
+		for (const feature of features) flags.setCompulsory(feature);
+		return flags.toBuffer();
+	}
+
+	function vector(...features: Feature[]): FeatureFlags {
+		const flags = FeatureFlags.empty();
+		for (const feature of features) flags.setOptional(feature);
+		return flags;
+	}
+
+	function makeAcceptorChannel(): Channel {
+		const state = createAcceptorState({
+			temporaryChannelId: crypto.randomBytes(32),
+			fundingSatoshis: 0n,
+			pushMsat: 0n,
+			localConfig: DEFAULT_CHANNEL_CONFIG,
+			localBasepoints: makeBasepoints(),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			remoteBasepoints: makeBasepoints(),
+			remoteConfig: DEFAULT_CHANNEL_CONFIG
+		});
+		return new Channel(state);
+	}
+
+	describe('validateV2ChannelType', () => {
+		it('accepts the recognized combinations, requiring presence and minimality', () => {
+			// BOLT 2 makes channel_type REQUIRED on open_channel2.
+			expect(validateV2ChannelType(null)).to.match(/requires a channel_type/);
+			expect(validateV2ChannelType(Buffer.alloc(0))).to.match(
+				/requires a channel_type/
+			);
+			// A padded encoding is two byte strings for one type: the echo
+			// check would pass on bytes the dispatch reads differently.
+			expect(validateV2ChannelType(Buffer.from('001000', 'hex'))).to.match(
+				/minimal encoding/
+			);
+			expect(validateV2ChannelType(typeOf(Feature.STATIC_REMOTE_KEY))).to.equal(
+				null
+			);
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.ANCHOR_ZERO_FEE_HTLC)
+				)
+			).to.equal(null);
+			// The trusted zero-conf shape: scid_alias + zero_conf ride along.
+			expect(
+				validateV2ChannelType(
+					typeOf(
+						Feature.STATIC_REMOTE_KEY,
+						Feature.ANCHOR_ZERO_FEE_HTLC,
+						Feature.SCID_ALIAS,
+						Feature.ZERO_CONF
+					)
+				)
+			).to.equal(null);
+		});
+
+		it('refuses taproot, unknown bits, and structural violations', () => {
+			expect(validateV2ChannelType(taprootType())).to.match(
+				/option_taproot is not supported/
+			);
+			// An unknown feature bit inside the type.
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.LARGE_CHANNELS)
+				)
+			).to.match(/not a recognized/);
+			// An ODD bit is never a channel type.
+			const odd = FeatureFlags.empty();
+			odd.setOptional(Feature.STATIC_REMOTE_KEY);
+			expect(validateV2ChannelType(odd.toBuffer())).to.match(
+				/not a recognized/
+			);
+			expect(
+				validateV2ChannelType(typeOf(Feature.ANCHOR_ZERO_FEE_HTLC))
+			).to.match(/must include static_remotekey/);
+			expect(
+				validateV2ChannelType(
+					typeOf(Feature.STATIC_REMOTE_KEY, Feature.ZERO_CONF)
+				)
+			).to.match(/zero_conf requires option_scid_alias/);
+		});
+
+		it('holds commitment-format bits to BOTH feature vectors when supplied', () => {
+			const anchorsType = typeOf(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.ANCHOR_ZERO_FEE_HTLC
+			);
+			const full = vector(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.ANCHOR_ZERO_FEE_HTLC
+			);
+			const noAnchors = vector(Feature.STATIC_REMOTE_KEY);
+			expect(validateV2ChannelType(anchorsType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(anchorsType, noAnchors, full)).to.match(
+				/this node does not advertise/
+			);
+			expect(validateV2ChannelType(anchorsType, full, noAnchors)).to.match(
+				/the peer does not advertise/
+			);
+			// A vector the caller does not have skips only its own half.
+			expect(validateV2ChannelType(anchorsType, undefined, full)).to.equal(
+				null
+			);
+		});
+
+		it('holds scid_alias and zero_conf to BOTH feature vectors too', () => {
+			const aliasType = typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS);
+			const zeroConfType = typeOf(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.SCID_ALIAS,
+				Feature.ZERO_CONF
+			);
+			const full = vector(
+				Feature.STATIC_REMOTE_KEY,
+				Feature.SCID_ALIAS,
+				Feature.ZERO_CONF
+			);
+			const noAlias = vector(Feature.STATIC_REMOTE_KEY);
+			const noZeroConf = vector(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS);
+			expect(validateV2ChannelType(aliasType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(zeroConfType, full, full)).to.equal(null);
+			expect(validateV2ChannelType(aliasType, noAlias, full)).to.match(
+				/scid_alias was not negotiated: this node/
+			);
+			expect(validateV2ChannelType(aliasType, full, noAlias)).to.match(
+				/scid_alias was not negotiated: the peer/
+			);
+			expect(validateV2ChannelType(zeroConfType, noZeroConf, full)).to.match(
+				/zero_conf was not negotiated: this node/
+			);
+			expect(validateV2ChannelType(zeroConfType, full, noZeroConf)).to.match(
+				/zero_conf was not negotiated: the peer/
+			);
+		});
+	});
+
+	describe('raw Channel admission', () => {
+		it('refuses an inbound taproot channel_type before any state exists', () => {
+			// No lease involved: the type alone is refused at the door, so
+			// nothing is derived, adopted or echoed for a negotiation that
+			// would die at the commitment stage (taproot v2 signing does
+			// not exist).
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: taprootType()
+				}),
+				makeDualFundingParams()
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(
+					/option_taproot is not supported for dual-funded/
+				);
+			}
+			const state = channel.getFullState();
+			expect(state.state, 'no state transition').to.equal(ChannelState.NONE);
+			expect(state.dualFundingSession == null, 'no session').to.equal(true);
+			expect(state.channelType, 'no adopted type').to.equal(null);
+		});
+
+		it('refuses an inbound channel_type carrying unknown bits', () => {
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.LARGE_CHANNELS)
+				}),
+				makeDualFundingParams()
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('refuses to INITIATE a v2 open with a taproot channel_type', () => {
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const actions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed,
+					channelType: taprootType()
+				})
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.ERROR);
+			if (actions[0].type === ChannelActionType.ERROR) {
+				expect(actions[0].message).to.match(
+					/option_taproot is not supported for dual-funded/
+				);
+			}
+			expect(
+				channel.getFullState().fundingVersion,
+				'no state mutated before the refusal'
+			).to.not.equal(2);
+		});
+	});
+
+	describe('round-18 admission hardening', () => {
+		it('an inbound open_channel2 WITHOUT a channel_type is refused', () => {
+			// BOLT 2 makes the field required; adopting a default here would
+			// negotiate a commitment format the opener never named.
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: undefined
+				}),
+				makeDualFundingParams()
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(/requires a channel_type/);
+			}
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('an inbound scid_alias type with the announce flag is refused', () => {
+			// BOLT 2: a channel whose type carries option_scid_alias must not
+			// be announced; an opener pairing them is refused, not silently
+			// flipped private on one side only.
+			const channel = makeAcceptorChannel();
+			const actions = channel.handleOpenChannel2(
+				makeOpenChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS),
+					channelFlags: 0x01
+				}),
+				makeDualFundingParams()
+			);
+			expect(
+				actions.some(
+					(a) =>
+						a.type === ChannelActionType.SEND_MESSAGE &&
+						(a as { messageType?: number }).messageType === MessageType.ERROR
+				),
+				'the refusal went out on the wire'
+			).to.equal(true);
+			const local = actions.find((a) => a.type === ChannelActionType.ERROR);
+			expect(local, 'and surfaced locally').to.exist;
+			if (local && local.type === ChannelActionType.ERROR) {
+				expect(local.message).to.match(/cannot be announced/);
+			}
+			expect(channel.getFullState().state).to.equal(ChannelState.NONE);
+		});
+
+		it('an outbound scid_alias type is forced PRIVATE', () => {
+			// The caller handed an alias type with the default (announce)
+			// flags: the open must go out private, exactly like a trusted
+			// open, because the alias type forbids announcement.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const actions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed,
+					channelType: typeOf(Feature.STATIC_REMOTE_KEY, Feature.SCID_ALIAS)
+				})
+			);
+			expect(actions.length).to.equal(1);
+			expect(actions[0].type).to.equal(ChannelActionType.SEND_MESSAGE);
+			if (actions[0].type === ChannelActionType.SEND_MESSAGE) {
+				const sent = decodeOpenChannel2Message(actions[0].payload);
+				expect(sent.channelFlags & 0x01, 'announce bit cleared').to.equal(0);
+			}
+			expect(channel.getFullState().announceChannel).to.equal(false);
+		});
+
+		it('a rejected accept_channel2 echo fails WIRE-VISIBLY', () => {
+			// A local error alone deletes our half while the accepter waits
+			// for tx_add_input forever: the refusal must reach the peer.
+			const state = createOpenerState({
+				temporaryChannelId: crypto.randomBytes(32),
+				fundingSatoshis: 100000n,
+				pushMsat: 0n,
+				localConfig: DEFAULT_CHANNEL_CONFIG,
+				localBasepoints: makeBasepoints(),
+				localPerCommitmentSeed: crypto.randomBytes(32)
+			});
+			const channel = new Channel(state);
+			const openActions = channel.initiateOpenV2(
+				makeDualFundingParams({
+					localBasepoints: state.localBasepoints,
+					localPerCommitmentSeed: state.localPerCommitmentSeed
+				})
+			);
+			expect(openActions[0].type).to.equal(ChannelActionType.SEND_MESSAGE);
+			const actions = channel.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: channel.getTemporaryChannelId(),
+					channelType: Buffer.from('401000', 'hex')
+				})
+			);
+			const wire = actions.find(
+				(a) =>
+					a.type === ChannelActionType.SEND_MESSAGE &&
+					(a as { messageType?: number }).messageType === MessageType.ERROR
+			);
+			expect(wire, 'the refusal went out on the wire').to.exist;
+			expect(
+				actions.some((a) => a.type === ChannelActionType.ERROR),
+				'and surfaced locally'
+			).to.equal(true);
+		});
+	});
+
+	describe('round-19 wire-visible inbound refusals', () => {
+		const peerPubkey = '02' + 'ab'.repeat(32);
+		const leaseRates = {
+			fundingWeightWitness: 1000,
+			leaseFeeBasis: 100,
+			leaseFeeBaseSat: 500,
+			channelFeeMaxBaseMsat: 5000,
+			channelFeeMaxProportionalThousandths: 10
+		};
+		type ManagerMaps = {
+			channels: Map<string, Channel>;
+			tempChannels: Map<string, Channel>;
+			channelPeers: Map<string, string>;
+		};
+
+		function mapsOf(mgr: ChannelManager): ManagerMaps {
+			return mgr as unknown as ManagerMaps;
+		}
+
+		function makeDetachedChannel(temporaryChannelId: Buffer): Channel {
+			return new Channel(
+				createOpenerState({
+					temporaryChannelId,
+					fundingSatoshis: 100_000n,
+					pushMsat: 0n,
+					localConfig: DEFAULT_CHANNEL_CONFIG,
+					localBasepoints: makeBasepoints(),
+					localPerCommitmentSeed: crypto.randomBytes(32)
+				})
+			);
+		}
+
+		function installPermanentVictim(
+			mgr: ChannelManager,
+			channelId: Buffer,
+			owner: string
+		): Channel {
+			const victim = makeDetachedChannel(crypto.randomBytes(32));
+			victim.getFullState().state = ChannelState.NORMAL;
+			victim.getFullState().channelId = channelId;
+			const maps = mapsOf(mgr);
+			maps.channels.set(channelId.toString('hex'), victim);
+			maps.channelPeers.set(channelId.toString('hex'), owner);
+			return victim;
+		}
+
+		function encodeV1Open(temporaryChannelId: Buffer): Buffer {
+			const points = makeBasepoints();
+			return encodeOpenChannelMessage({
+				chainHash: Buffer.alloc(32),
+				temporaryChannelId,
+				fundingSatoshis: 100_000n,
+				pushMsat: 0n,
+				dustLimitSatoshis: 546n,
+				maxHtlcValueInFlightMsat: 500_000_000n,
+				channelReserveSatoshis: 1_000n,
+				htlcMinimumMsat: 1_000n,
+				feeratePerKw: 253,
+				toSelfDelay: 144,
+				maxAcceptedHtlcs: 483,
+				fundingPubkey: points.fundingPubkey,
+				revocationBasepoint: points.revocationBasepoint,
+				paymentBasepoint: points.paymentBasepoint,
+				delayedPaymentBasepoint: points.delayedPaymentBasepoint,
+				htlcBasepoint: points.htlcBasepoint,
+				firstPerCommitmentPoint: points.firstPerCommitmentPoint,
+				channelFlags: 0
+			});
+		}
+
+		function encodeV1Accept(channel: Channel): Buffer {
+			const points = makeBasepoints();
+			return encodeAcceptChannelMessage({
+				temporaryChannelId: channel.getTemporaryChannelId(),
+				dustLimitSatoshis: 546n,
+				maxHtlcValueInFlightMsat: 500_000_000n,
+				channelReserveSatoshis: 1_000n,
+				htlcMinimumMsat: 1_000n,
+				minimumDepth: 3,
+				toSelfDelay: 144,
+				maxAcceptedHtlcs: 483,
+				fundingPubkey: points.fundingPubkey,
+				revocationBasepoint: points.revocationBasepoint,
+				paymentBasepoint: points.paymentBasepoint,
+				delayedPaymentBasepoint: points.delayedPaymentBasepoint,
+				htlcBasepoint: points.htlcBasepoint,
+				firstPerCommitmentPoint: points.firstPerCommitmentPoint,
+				channelType: channel.getFullState().channelType ?? undefined
+			});
+		}
+
+		function untrustedZeroConfOpen(
+			overrides: Partial<IOpenChannel2Message> = {}
+		): IOpenChannel2Message {
+			return makeOpenChannel2Msg({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				channelFlags: 0x00,
+				...overrides
+			});
+		}
+
+		function installThrowingTransport(
+			mgr: ChannelManager,
+			openMsg: IOpenChannel2Message
+		): {
+			sent: Array<{ type: number; payload: Buffer }>;
+			errors: string[];
+			tempPresentAtDelivery: () => boolean;
+		} {
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			const errors: string[] = [];
+			let presentAtDelivery = false;
+			let throwOnce = true;
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+					if (type === MessageType.ERROR && throwOnce) {
+						throwOnce = false;
+						presentAtDelivery = mgr.getTempChannel(openMsg.channelId) != null;
+						throw new Error('transport threw after delivery');
+					}
+				}
+			);
+			return {
+				sent,
+				errors,
+				tempPresentAtDelivery: (): boolean => presentAtDelivery
+			};
+		}
+
+		function assertRefusal(
+			mgr: ChannelManager,
+			openMsg: IOpenChannel2Message,
+			probe: ReturnType<typeof installThrowingTransport>
+		): void {
+			const wireErrors = probe.sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors, 'one refusal reached the opener').to.have.length(1);
+			const decoded = decodeErrorMessage(wireErrors[0].payload);
+			expect(
+				decoded.channelId.equals(openMsg.channelId),
+				'exact temporary id'
+			).to.equal(true);
+			expect(decoded.data.toString('ascii')).to.contain(
+				'requires a trusted peer'
+			);
+			expect(
+				probe.errors.filter((message) =>
+					message.includes('requires a trusted peer')
+				),
+				'one local refusal'
+			).to.have.length(1);
+			expect(
+				probe.tempPresentAtDelivery(),
+				'wire attempt preceded cleanup'
+			).to.equal(true);
+			expect(
+				mgr.getTempChannel(openMsg.channelId),
+				'temporary channel cleaned'
+			).to.equal(undefined);
+			expect(
+				(
+					mgr as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.has(openMsg.channelId.toString('hex')),
+				'temporary peer binding cleaned'
+			).to.equal(false);
+			expect(
+				probe.sent.some(
+					(message) => message.type === MessageType.ACCEPT_CHANNEL2
+				),
+				'no accept_channel2 went out'
+			).to.equal(false);
+		}
+
+		async function settlePromises(): Promise<void> {
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			await new Promise<void>((resolve) => setImmediate(resolve));
+		}
+
+		function makeLeaseManager(
+			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>
+		): ChannelManager {
+			const mgr = new ChannelManager({
+				...makeChannelManagerConfig(),
+				nodePrivateKey: crypto.randomBytes(32),
+				leaseRates
+			});
+			mgr.setFundingProvider({
+				buildFundingTransaction: async () => {
+					throw new Error('not used by this test');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('not used by this test');
+				},
+				selectSpliceInputs
+			});
+			return mgr;
+		}
+
+		function makeAutofundInput(valueSats: number): ISpliceWalletInput {
+			const prevTx = new bitcoin.Transaction();
+			prevTx.version = 2;
+			prevTx.addInput(crypto.randomBytes(32), 0);
+			prevTx.addOutput(
+				bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!,
+				valueSats
+			);
+			return {
+				prevTx: prevTx.toBuffer(),
+				prevOutputIndex: 0,
+				value: BigInt(valueSats),
+				sequence: 0xfffffffd,
+				confirmed: true,
+				signWitness: (): Buffer[] => []
+			};
+		}
+
+		function makeAutofundManager(
+			selectSpliceInputs: NonNullable<IFundingProvider['selectSpliceInputs']>
+		): ChannelManager {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			mgr.setFundingProvider({
+				buildFundingTransaction: async () => {
+					throw new Error('not used by this test');
+				},
+				broadcastTransaction: async () => {
+					throw new Error('not used by this test');
+				},
+				selectSpliceInputs
+			});
+			return mgr;
+		}
+
+		it('cleans a synchronous refusal when transport throws after delivery', () => {
+			// The reviewer's reproduction: the zero-conf trust gate fired
+			// after the manager retained the temp channel, and its local-only
+			// error deleted our half silently, leaving the opener awaiting
+			// accept_channel2 forever. The refusal and cleanup must also survive
+			// a synchronous transport failure after delivery.
+			const config = makeChannelManagerConfig();
+			const mgr = new ChannelManager(config);
+			const openMsg = untrustedZeroConfOpen();
+			const probe = installThrowingTransport(mgr, openMsg);
+			mgr.handleMessage(
+				peerPubkey,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+			assertRefusal(mgr, openMsg, probe);
+		});
+
+		it('cleans a refusal when the local error observer throws', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const openMsg = untrustedZeroConfOpen();
+			const sent: number[] = [];
+			let localCalls = 0;
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('error', () => {
+				localCalls++;
+				throw new Error('local observer failed');
+			});
+			try {
+				mgr.handleMessage(
+					peerPubkey,
+					MessageType.OPEN_CHANNEL2,
+					encodeOpenChannel2Message(openMsg)
+				);
+			} catch {
+				// The observer may propagate, but it cannot prevent cleanup.
+			}
+			expect(sent.filter((type) => type === MessageType.ERROR)).to.have.length(
+				1
+			);
+			expect(localCalls).to.be.greaterThan(0);
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(undefined);
+		});
+
+		it('contains a transition observer and completes the scoped refusal', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const openMsg = untrustedZeroConfOpen();
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			let transitionCalls = 0;
+			mgr.on('error', () => {});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			mgr.on('transition:begin', () => {
+				transitionCalls++;
+				throw new Error('transition setup failed');
+			});
+
+			expect(() =>
+				mgr.handleMessage(
+					peerPubkey,
+					MessageType.OPEN_CHANNEL2,
+					encodeOpenChannel2Message(openMsg)
+				)
+			).to.not.throw();
+
+			expect(transitionCalls).to.equal(1);
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(
+					openMsg.channelId
+				)
+			).to.equal(true);
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(undefined);
+			expect(
+				mapsOf(mgr).channelPeers.has(openMsg.channelId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('refuses an outbound v2 temporary id collision without replacement', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const firstOwner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const secondOwner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const sent: number[] = [];
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const first = mgr.createDualFundedChannel(
+				firstOwner,
+				makeDualFundingParams()
+			);
+			const tempId = first.getTemporaryChannelId();
+
+			expect(() =>
+				mgr.createDualFundedChannel(secondOwner, makeDualFundingParams())
+			).to.throw('temporary channel_id is already in use');
+			expect(mgr.getTempChannel(tempId)).to.equal(first);
+			expect(mapsOf(mgr).channelPeers.get(tempId.toString('hex'))).to.equal(
+				firstOwner
+			);
+			expect(
+				sent.filter((type) => type === MessageType.OPEN_CHANNEL2)
+			).to.have.length(1);
+		});
+
+		it('refuses a mismatched v2 temporary id without replacing its owner', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const attacker = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.on('error', () => {});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			const existing = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = existing.getTemporaryChannelId();
+			sent.length = 0;
+			const malicious = makeOpenChannel2Msg({ channelId: tempId });
+
+			mgr.handleMessage(
+				attacker,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(malicious)
+			);
+
+			expect(mgr.getTempChannel(tempId)).to.equal(existing);
+			expect(
+				(
+					mgr as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.get(tempId.toString('hex'))
+			).to.equal(owner);
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(tempId)
+			).to.equal(true);
+		});
+
+		it('sends scoped refusals for wrong-chain and lost-namespace opens', () => {
+			const cases = [
+				{
+					manager: new ChannelManager({
+						...makeChannelManagerConfig(),
+						chainHash: Buffer.alloc(32, 0x01)
+					}),
+					message: makeOpenChannel2Msg({
+						chainHash: Buffer.alloc(32, 0x02)
+					})
+				},
+				{
+					manager: new ChannelManager({
+						...makeChannelManagerConfig(),
+						durabilityBarrier: {
+							enforcing: true,
+							namespaceLost: true,
+							isReleased: (): boolean => false,
+							whenReleased: async (): Promise<{
+								released: boolean;
+								reason: string;
+							}> => ({
+								released: false,
+								reason: 'namespace-lost'
+							})
+						}
+					}),
+					message: makeOpenChannel2Msg()
+				}
+			];
+
+			for (const { manager, message } of cases) {
+				const sent: Array<{ type: number; payload: Buffer }> = [];
+				manager.on('error', () => {});
+				manager.on(
+					'message:outbound',
+					(_peer: string, type: number, payload: Buffer) => {
+						sent.push({ type, payload });
+					}
+				);
+				manager.handleMessage(
+					peerPubkey,
+					MessageType.OPEN_CHANNEL2,
+					encodeOpenChannel2Message(message)
+				);
+				const wireErrors = sent.filter(
+					(item) => item.type === MessageType.ERROR
+				);
+				expect(wireErrors).to.have.length(1);
+				expect(
+					decodeErrorMessage(wireErrors[0].payload).channelId.equals(
+						message.channelId
+					)
+				).to.equal(true);
+				expect(manager.getTempChannel(message.channelId)).to.equal(undefined);
+			}
+		});
+
+		it('does not retry an async refusal after wallet selection succeeds', async () => {
+			let selections = 0;
+			const mgr = makeLeaseManager(async () => {
+				selections++;
+				return { inputs: [], changeScript: Buffer.alloc(0) };
+			});
+			const openMsg = untrustedZeroConfOpen({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+			const probe = installThrowingTransport(mgr, openMsg);
+			mgr.handleMessage(
+				peerPubkey,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+			await settlePromises();
+			expect(selections).to.equal(1);
+			assertRefusal(mgr, openMsg, probe);
+		});
+
+		it('contains an async fallback refusal after wallet selection fails', async () => {
+			let selections = 0;
+			const mgr = makeLeaseManager(async () => {
+				selections++;
+				throw new Error('selector failed');
+			});
+			const openMsg = untrustedZeroConfOpen({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+			const probe = installThrowingTransport(mgr, openMsg);
+			mgr.handleMessage(
+				peerPubkey,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+			await settlePromises();
+			expect(selections).to.equal(1);
+			assertRefusal(mgr, openMsg, probe);
+		});
+
+		it('routes a synchronous wallet throw through the fallback refusal', async () => {
+			let selections = 0;
+			const throwingSelector = (() => {
+				selections++;
+				throw new Error('synchronous selector failure');
+			}) as NonNullable<IFundingProvider['selectSpliceInputs']>;
+			const mgr = makeLeaseManager(throwingSelector);
+			const openMsg = untrustedZeroConfOpen({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+			const probe = installThrowingTransport(mgr, openMsg);
+			mgr.handleMessage(
+				peerPubkey,
+				MessageType.OPEN_CHANNEL2,
+				encodeOpenChannel2Message(openMsg)
+			);
+			await settlePromises();
+			expect(selections).to.equal(1);
+			assertRefusal(mgr, openMsg, probe);
+		});
+
+		it('rechecks ownership after a reentrant wallet-failure observer', async () => {
+			type Selection = Awaited<
+				ReturnType<NonNullable<IFundingProvider['selectSpliceInputs']>>
+			>;
+			const attempts: Array<{
+				resolve: (selection: Selection) => void;
+				reject: (error: Error) => void;
+			}> = [];
+			const mgr = makeLeaseManager(
+				() =>
+					new Promise<Selection>((resolve, reject) => {
+						attempts.push({ resolve, reject });
+					})
+			);
+			const openMsg = untrustedZeroConfOpen({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC,
+					Feature.SCID_ALIAS,
+					Feature.ZERO_CONF
+				),
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+			const payload = encodeOpenChannel2Message(openMsg);
+			const sent: number[] = [];
+			let reentered = false;
+			let replacement: Channel | undefined;
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				if (!reentered && message.includes('Lease contribution not funded')) {
+					reentered = true;
+					mgr.handleMessage(
+						peerPubkey,
+						MessageType.ERROR,
+						encodeErrorMessage({
+							channelId: openMsg.channelId,
+							data: Buffer.from('cancel old open', 'ascii')
+						})
+					);
+					mgr.handleMessage(peerPubkey, MessageType.OPEN_CHANNEL2, payload);
+					replacement = mgr.getTempChannel(openMsg.channelId);
+				}
+			});
+
+			mgr.handleMessage(peerPubkey, MessageType.OPEN_CHANNEL2, payload);
+			const first = mgr.getTempChannel(openMsg.channelId);
+			attempts[0].reject(new Error('old selector failed'));
+			await settlePromises();
+			expect(reentered).to.equal(true);
+			expect(replacement).to.exist;
+			expect(replacement).to.not.equal(first);
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(replacement);
+			expect(sent, 'the stale callback dispatched nothing').to.have.length(0);
+
+			attempts[1].reject(new Error('replacement selector failed'));
+			await settlePromises();
+			expect(sent.filter((type) => type === MessageType.ERROR)).to.have.length(
+				1
+			);
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(undefined);
+		});
+
+		it('ignores stale wallet selection after a same-id retry', async () => {
+			type Selection = Awaited<
+				ReturnType<NonNullable<IFundingProvider['selectSpliceInputs']>>
+			>;
+			const resolvers: Array<(selection: Selection) => void> = [];
+			const mgr = makeLeaseManager(
+				() =>
+					new Promise<Selection>((resolve) => {
+						resolvers.push(resolve);
+					})
+			);
+			const openMsg = makeOpenChannel2Msg({
+				channelType: typeOf(
+					Feature.STATIC_REMOTE_KEY,
+					Feature.ANCHOR_ZERO_FEE_HTLC
+				),
+				channelFlags: 0x00,
+				requestFunds: { requestedSats: 500_000n, blockheight: 800_000 }
+			});
+			const payload = encodeOpenChannel2Message(openMsg);
+			const sent: number[] = [];
+			const errors: string[] = [];
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+
+			mgr.handleMessage(peerPubkey, MessageType.OPEN_CHANNEL2, payload);
+			const first = mgr.getTempChannel(openMsg.channelId);
+			mgr.handlePeerDisconnected(peerPubkey);
+			mgr.handleMessage(peerPubkey, MessageType.OPEN_CHANNEL2, payload);
+			const replacement = mgr.getTempChannel(openMsg.channelId);
+			expect(first).to.exist;
+			expect(replacement).to.exist;
+			expect(replacement).to.not.equal(first);
+
+			resolvers[0]({ inputs: [], changeScript: Buffer.alloc(0) });
+			await settlePromises();
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(replacement);
+			expect(
+				sent.filter((type) => type === MessageType.ACCEPT_CHANNEL2)
+			).to.have.length(0);
+			expect(errors.join(' ')).to.not.contain('Unexpected open_channel2');
+
+			resolvers[1]({ inputs: [], changeScript: Buffer.alloc(0) });
+			await settlePromises();
+			expect(mgr.getTempChannel(openMsg.channelId)).to.equal(replacement);
+			expect(
+				sent.filter((type) => type === MessageType.ACCEPT_CHANNEL2)
+			).to.have.length(1);
+		});
+
+		it('does not abort opener funding after a delivered action throws', async () => {
+			const owner = '02' + 'cd'.repeat(32);
+			const changeScript = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const mgr = makeAutofundManager(async () => ({
+				inputs: [makeAutofundInput(200_000)],
+				changeScript
+			}));
+			const sent: number[] = [];
+			const errors: string[] = [];
+			let throwOnce = true;
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+				if (type === MessageType.TX_ADD_INPUT && throwOnce) {
+					throwOnce = false;
+					throw new Error('transport threw after tx_add_input delivery');
+				}
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			await settlePromises();
+
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(1);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(0);
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			expect(errors.join(' ')).to.contain('v2 open dispatch failed');
+		});
+
+		it('aborts opener funding once when wallet selection throws', async () => {
+			const owner = '02' + 'cd'.repeat(32);
+			let selections = 0;
+			const throwingSelector = (() => {
+				selections++;
+				throw new Error('synchronous opener selector failure');
+			}) as NonNullable<IFundingProvider['selectSpliceInputs']>;
+			const mgr = makeAutofundManager(throwingSelector);
+			const sent: number[] = [];
+			const errors: string[] = [];
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			await settlePromises();
+
+			expect(selections).to.equal(1);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(0);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(1);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(errors.join(' ')).to.contain('v2 open not funded');
+		});
+
+		it('starts opener funding before informational observers run', () => {
+			const owner = '02' + 'cd'.repeat(32);
+			let selections = 0;
+			const mgr = makeAutofundManager(() => {
+				selections++;
+				return new Promise(() => {});
+			});
+			mgr.on('error', () => {});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			let transitionBegins = 0;
+			let acceptedEvents = 0;
+			mgr.on('transition:begin', () => {
+				transitionBegins++;
+				throw new Error('empty action transition must not run');
+			});
+			mgr.on('channel:accepted', () => {
+				acceptedEvents++;
+				throw new Error('informational observer failed');
+			});
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+
+			expect(selections).to.equal(1);
+			expect(acceptedEvents).to.equal(1);
+			expect(transitionBegins).to.equal(0);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+		});
+
+		it('auto-funds normally when a transition observer throws', async () => {
+			const owner = '02' + 'cd'.repeat(32);
+			const changeScript = bitcoin.payments.p2wpkh({
+				hash: crypto.randomBytes(20)
+			}).output!;
+			const mgr = makeAutofundManager(async () => ({
+				inputs: [makeAutofundInput(200_000)],
+				changeScript
+			}));
+			const sent: number[] = [];
+			let transitionCalls = 0;
+			mgr.on('error', () => {});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('transition:begin', () => {
+				transitionCalls++;
+				throw new Error('transition observer failed');
+			});
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			await settlePromises();
+
+			expect(transitionCalls).to.be.greaterThan(0);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(1);
+			expect(channel.getState()).to.not.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+		});
+
+		it('cancels a deferred opener selection through its derived id', async () => {
+			type Selection = Awaited<
+				ReturnType<NonNullable<IFundingProvider['selectSpliceInputs']>>
+			>;
+			const owner = '02' + 'cd'.repeat(32);
+			const foreignPeer = '03' + 'ef'.repeat(32);
+			let resolveSelection: ((selection: Selection) => void) | undefined;
+			const mgr = makeAutofundManager(
+				() =>
+					new Promise<Selection>((resolve) => {
+						resolveSelection = resolve;
+					})
+			);
+			const sent: number[] = [];
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			const derivedId = channel.getChannelId();
+			expect(derivedId).to.not.equal(null);
+
+			const cancel = encodeErrorMessage({
+				channelId: derivedId!,
+				data: Buffer.from('cancel open', 'ascii')
+			});
+			mgr.handleMessage(foreignPeer, MessageType.ERROR, cancel);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			mgr.handleMessage(owner, MessageType.ERROR, cancel);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+
+			resolveSelection?.({
+				inputs: [makeAutofundInput(200_000)],
+				changeScript: bitcoin.payments.p2wpkh({
+					hash: crypto.randomBytes(20)
+				}).output!
+			});
+			await settlePromises();
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(0);
+		});
+
+		it('ignores accept_channel2 from a peer that does not own the open', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = '02' + 'cd'.repeat(32);
+			const foreignPeer = '03' + 'ef'.repeat(32);
+			const sent: number[] = [];
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			const session = channel.getDualFundingSession();
+			expect(session).to.not.equal(null);
+			expect(session?.getState()).to.equal(DualFundingState.AWAITING_ACCEPT);
+			expect(channel.getChannelId()).to.equal(null);
+			sent.length = 0;
+
+			mgr.handleMessage(
+				foreignPeer,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({
+						channelId: tempId
+					})
+				)
+			);
+
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			expect(session?.getState()).to.equal(DualFundingState.AWAITING_ACCEPT);
+			expect(channel.getChannelId()).to.equal(null);
+			expect(
+				(
+					mgr as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.get(tempId.toString('hex'))
+			).to.equal(owner);
+			expect(sent, 'foreign accept caused no protocol response').to.have.length(
+				0
+			);
+		});
+
+		it('advances a valid lease before a throwing lease observer', async () => {
+			const sellerPrivateKey = crypto.randomBytes(32);
+			const seller = getPublicKey(sellerPrivateKey).toString('hex');
+			let selections = 0;
+			const mgr = makeAutofundManager(async () => {
+				selections++;
+				return {
+					inputs: [makeAutofundInput(800_000)],
+					changeScript: bitcoin.payments.p2wpkh({
+						hash: crypto.randomBytes(20)
+					}).output!
+				};
+			});
+			const channelType = Buffer.from('401000', 'hex');
+			const channel = mgr.createDualFundedChannel(
+				seller,
+				makeDualFundingParams({
+					channelType,
+					requestFunds: {
+						requestedSats: 500_000n,
+						blockheight: 800_000
+					},
+					maxLeaseRates: leaseRates
+				})
+			);
+			const tempId = channel.getTemporaryChannelId();
+			const accept = makeAcceptChannel2Msg({
+				channelId: tempId,
+				channelType,
+				fundingSatoshis: 500_000n
+			});
+			accept.willFund = {
+				signature: signWillFund(
+					accept.fundingPubkey,
+					800_000,
+					leaseRates,
+					sellerPrivateKey
+				),
+				leaseRates
+			};
+			const sent: number[] = [];
+			let leaseEvents = 0;
+			let selectionsAtLease = -1;
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('channel:lease', () => {
+				leaseEvents++;
+				selectionsAtLease = selections;
+				throw new Error('lease observer failed');
+			});
+
+			mgr.handleMessage(
+				seller,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(accept)
+			);
+			await settlePromises();
+
+			expect(leaseEvents).to.equal(1);
+			expect(selectionsAtLease).to.equal(1);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(1);
+			expect(channel.getFullState().leaseExpiry).to.equal(804_032);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+		});
+
+		it('suppresses channel:accepted when the lease observer cancels the open', () => {
+			const sellerPrivateKey = crypto.randomBytes(32);
+			const seller = getPublicKey(sellerPrivateKey).toString('hex');
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const channelType = Buffer.from('401000', 'hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.createDualFundedChannel(
+				seller,
+				makeDualFundingParams({
+					channelType,
+					requestFunds: {
+						requestedSats: 500_000n,
+						blockheight: 800_000
+					},
+					maxLeaseRates: leaseRates
+				})
+			);
+			const tempId = channel.getTemporaryChannelId();
+			const accept = makeAcceptChannel2Msg({
+				channelId: tempId,
+				channelType,
+				fundingSatoshis: 500_000n
+			});
+			accept.willFund = {
+				signature: signWillFund(
+					accept.fundingPubkey,
+					800_000,
+					leaseRates,
+					sellerPrivateKey
+				),
+				leaseRates
+			};
+			let leaseEvents = 0;
+			let acceptedEvents = 0;
+			mgr.on('channel:lease', () => {
+				leaseEvents++;
+				mgr.handleMessage(
+					seller,
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: tempId,
+						data: Buffer.from('cancel accepted lease', 'ascii')
+					})
+				);
+			});
+			mgr.on('channel:accepted', () => {
+				acceptedEvents++;
+			});
+
+			mgr.handleMessage(
+				seller,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(accept)
+			);
+
+			expect(leaseEvents).to.equal(1);
+			expect(acceptedEvents).to.equal(0);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+		});
+
+		it('suppresses lease events when the synchronous selector cancels the open', async () => {
+			const sellerPrivateKey = crypto.randomBytes(32);
+			const seller = getPublicKey(sellerPrivateKey).toString('hex');
+			const control: {
+				manager?: ChannelManager;
+				tempId?: Buffer;
+			} = {};
+			let selections = 0;
+			const mgr = makeAutofundManager(() => {
+				selections++;
+				control.manager!.handleMessage(
+					seller,
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: control.tempId!,
+						data: Buffer.from('selector cancelled open', 'ascii')
+					})
+				);
+				return Promise.resolve({
+					inputs: [makeAutofundInput(800_000)],
+					changeScript: bitcoin.payments.p2wpkh({
+						hash: crypto.randomBytes(20)
+					}).output!
+				});
+			});
+			control.manager = mgr;
+			const channelType = Buffer.from('401000', 'hex');
+			const sent: number[] = [];
+			let leaseEvents = 0;
+			let acceptedEvents = 0;
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('channel:lease', () => {
+				leaseEvents++;
+			});
+			mgr.on('channel:accepted', () => {
+				acceptedEvents++;
+			});
+			const channel = mgr.createDualFundedChannel(
+				seller,
+				makeDualFundingParams({
+					channelType,
+					requestFunds: {
+						requestedSats: 500_000n,
+						blockheight: 800_000
+					},
+					maxLeaseRates: leaseRates
+				})
+			);
+			const tempId = channel.getTemporaryChannelId();
+			control.tempId = tempId;
+			sent.length = 0;
+			const accept = makeAcceptChannel2Msg({
+				channelId: tempId,
+				channelType,
+				fundingSatoshis: 500_000n
+			});
+			accept.willFund = {
+				signature: signWillFund(
+					accept.fundingPubkey,
+					800_000,
+					leaseRates,
+					sellerPrivateKey
+				),
+				leaseRates
+			};
+
+			mgr.handleMessage(
+				seller,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(accept)
+			);
+			await settlePromises();
+
+			expect(selections).to.equal(1);
+			expect(leaseEvents).to.equal(0);
+			expect(acceptedEvents).to.equal(0);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ADD_INPUT)
+			).to.have.length(0);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+		});
+
+		it('refuses a late underfunded lease on the wire and cleans up', () => {
+			const sellerPrivateKey = crypto.randomBytes(32);
+			const seller = getPublicKey(sellerPrivateKey).toString('hex');
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const channelType = Buffer.from('401000', 'hex');
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			const errors: string[] = [];
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			const channel = mgr.createDualFundedChannel(
+				seller,
+				makeDualFundingParams({
+					channelType,
+					requestFunds: {
+						requestedSats: 500_000n,
+						blockheight: 800_000
+					},
+					maxLeaseRates: leaseRates
+				})
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+			const accept = makeAcceptChannel2Msg({
+				channelId: tempId,
+				channelType,
+				fundingSatoshis: 499_999n
+			});
+			accept.willFund = {
+				signature: signWillFund(
+					accept.fundingPubkey,
+					800_000,
+					leaseRates,
+					sellerPrivateKey
+				),
+				leaseRates
+			};
+
+			mgr.handleMessage(
+				seller,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(accept)
+			);
+
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(tempId)
+			).to.equal(true);
+			expect(errors.join(' ')).to.contain(
+				'Seller funded less than the requested lease amount'
+			);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+		});
+
+		it('refuses an invalid will_fund signature on the wire and cleans up', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			const errors: string[] = [];
+			mgr.on('error', (_id: Buffer | null, message: string) => {
+				errors.push(message);
+			});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			const channelType = Buffer.from('401000', 'hex');
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams({
+					channelType,
+					requestFunds: {
+						requestedSats: 500_000n,
+						blockheight: 800_000
+					},
+					maxLeaseRates: leaseRates
+				})
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({
+						channelId: tempId,
+						channelType,
+						fundingSatoshis: 500_000n,
+						willFund: {
+							signature: Buffer.alloc(64, 0x01),
+							leaseRates
+						}
+					})
+				)
+			);
+
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(tempId)
+			).to.equal(true);
+			expect(errors.join(' ')).to.contain('Invalid will_fund signature');
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(channel.getDualFundingSession()?.getState()).to.equal(
+				DualFundingState.AWAITING_ACCEPT
+			);
+		});
+
+		it('ignores interactive tx messages for a derived id owned by another peer', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = '02' + 'cd'.repeat(32);
+			const foreignPeer = '03' + 'ef'.repeat(32);
+			const sent: number[] = [];
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+			const derivedId = channel.getChannelId();
+			const session = channel.getDualFundingSession();
+			const builder = session?.getTxBuilder();
+			expect(derivedId).to.not.equal(null);
+			expect(builder).to.not.equal(null);
+			expect(builder?.getOutputs()).to.have.length(0);
+			sent.length = 0;
+			const output = encodeTxAddOutputMessage({
+				channelId: derivedId!,
+				serialId: 1n,
+				amountSats: 1_000n,
+				scriptPubkey: bitcoin.payments.p2wpkh({
+					hash: crypto.randomBytes(20)
+				}).output!
+			});
+
+			mgr.handleMessage(foreignPeer, MessageType.TX_ADD_OUTPUT, output);
+			expect(
+				builder?.getOutputs(),
+				'foreign message caused no mutation'
+			).to.have.length(0);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			expect(
+				sent,
+				'foreign message caused no protocol response'
+			).to.have.length(0);
+
+			mgr.handleMessage(owner, MessageType.TX_ADD_OUTPUT, output);
+			expect(
+				builder?.getOutputs(),
+				'owner message still routed'
+			).to.have.length(1);
+		});
+
+		it('ignores tx_abort for a temporary id owned by another peer', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = '02' + 'cd'.repeat(32);
+			const foreignPeer = '03' + 'ef'.repeat(32);
+			const sent: number[] = [];
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			const session = channel.getDualFundingSession();
+			expect(session?.getState()).to.equal(DualFundingState.AWAITING_ACCEPT);
+			sent.length = 0;
+			const abort = encodeTxAbortMessage({
+				channelId: tempId,
+				data: Buffer.from('cancel', 'ascii')
+			});
+
+			mgr.handleMessage(foreignPeer, MessageType.TX_ABORT, abort);
+			expect(session?.getState()).to.equal(DualFundingState.AWAITING_ACCEPT);
+			expect(channel.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			expect(sent, 'foreign abort caused no protocol response').to.have.length(
+				0
+			);
+
+			mgr.handleMessage(owner, MessageType.TX_ABORT, abort);
+			expect(session?.getState()).to.equal(DualFundingState.ABORTED);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(
+				sent.filter((type) => type === MessageType.TX_ABORT),
+				'owner abort was routed'
+			).to.have.length(1);
+		});
+
+		it('cleans an aborted open when transport throws after the echo', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const sent: number[] = [];
+			let abandoned = 0;
+			let throwOnce = true;
+			mgr.on('error', () => {});
+			mgr.on('channel:abandoned', () => {
+				abandoned++;
+			});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+				if (type === MessageType.TX_ABORT && throwOnce) {
+					throwOnce = false;
+					throw new Error('transport threw after tx_abort delivery');
+				}
+			});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			sent.length = 0;
+
+			mgr.handleMessage(
+				owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: tempId,
+					data: Buffer.from('cancel', 'ascii')
+				})
+			);
+
+			expect(
+				sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(1);
+			expect(abandoned).to.equal(1);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(
+				(
+					mgr as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.has(tempId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('retains an abandoned v2 open when its teardown persist fails', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			const permanentId = crypto.randomBytes(32);
+			channel.getFullState().channelId = permanentId;
+			channel.getFullState().state = ChannelState.ERRORED;
+			const lifecycle = channel as unknown as {
+				handleTxAbort: () => ChannelAction[];
+				isAbandonedV2Open: () => boolean;
+			};
+			lifecycle.handleTxAbort = (): ChannelAction[] => [
+				{ type: ChannelActionType.PERSIST_STATE },
+				{
+					type: ChannelActionType.SEND_MESSAGE,
+					messageType: MessageType.TX_ABORT,
+					payload: encodeTxAbortMessage({
+						channelId: permanentId,
+						data: Buffer.from('teardown', 'ascii')
+					})
+				}
+			];
+			lifecycle.isAbandonedV2Open = (): boolean => true;
+			const sent: number[] = [];
+			let blocked = 0;
+			let abandoned = 0;
+			mgr.on('channel:persist', ({ request }: IChannelPersistEvent) => {
+				if (request) request.committed = false;
+			});
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				sent.push(type);
+			});
+			mgr.on('transition:blocked', () => {
+				blocked++;
+			});
+			mgr.on('channel:abandoned', () => {
+				abandoned++;
+			});
+
+			mgr.handleMessage(
+				owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: permanentId,
+					data: Buffer.from('echo', 'ascii')
+				})
+			);
+
+			expect(
+				sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(0);
+			expect(blocked).to.equal(1);
+			expect(abandoned).to.equal(0);
+			expect(mgr.getTempChannel(tempId)).to.equal(channel);
+			expect(mapsOf(mgr).tempChannels.get(tempId.toString('hex'))).to.equal(
+				channel
+			);
+			expect(mapsOf(mgr).channels.has(permanentId.toString('hex'))).to.equal(
+				false
+			);
+			expect(mapsOf(mgr).channelPeers.get(tempId.toString('hex'))).to.equal(
+				owner
+			);
+		});
+
+		it('does not delete a same-id replacement during abort cleanup', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			const oldChannel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = oldChannel.getTemporaryChannelId();
+			const replacementOpen = makeOpenChannel2Msg({
+				revocationBasepoint:
+					oldChannel.getFullState().localBasepoints.revocationBasepoint
+			});
+			expect(replacementOpen.channelId.equals(tempId)).to.equal(true);
+			let replacement: Channel | undefined;
+			let reentered = false;
+			mgr.on('message:outbound', (_peer: string, type: number) => {
+				if (type !== MessageType.TX_ABORT || reentered) return;
+				reentered = true;
+				mgr.handleMessage(
+					owner,
+					MessageType.ERROR,
+					encodeErrorMessage({
+						channelId: tempId,
+						data: Buffer.from('forget old open', 'ascii')
+					})
+				);
+				mgr.handleMessage(
+					owner,
+					MessageType.OPEN_CHANNEL2,
+					encodeOpenChannel2Message(replacementOpen)
+				);
+				replacement = mgr.getTempChannel(tempId);
+			});
+
+			mgr.handleMessage(
+				owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: tempId,
+					data: Buffer.from('cancel', 'ascii')
+				})
+			);
+
+			expect(reentered).to.equal(true);
+			expect(replacement).to.exist;
+			expect(replacement).to.not.equal(oldChannel);
+			expect(mgr.getTempChannel(tempId)).to.equal(replacement);
+			expect(
+				(
+					mgr as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.get(tempId.toString('hex'))
+			).to.equal(owner);
+		});
+
+		it('refuses a v1 temporary id that collides with a permanent channel', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const attacker = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const collisionId = crypto.randomBytes(32);
+			const victim = installPermanentVictim(mgr, collisionId, owner);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.on('error', () => {});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+
+			mgr.handleMessage(
+				attacker,
+				MessageType.OPEN_CHANNEL,
+				encodeV1Open(collisionId)
+			);
+
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(collisionId)
+			).to.equal(true);
+			expect(mapsOf(mgr).channels.get(collisionId.toString('hex'))).to.equal(
+				victim
+			);
+			expect(
+				mapsOf(mgr).channelPeers.get(collisionId.toString('hex'))
+			).to.equal(owner);
+			expect(mgr.getTempChannel(collisionId)).to.equal(undefined);
+			expect(
+				sent.filter((message) => message.type === MessageType.ACCEPT_CHANNEL)
+			).to.have.length(0);
+		});
+
+		it('refuses a funding_created permanent id collision without harming its victim', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const attacker = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const collisionId = crypto.randomBytes(32);
+			const victim = installPermanentVictim(mgr, collisionId, owner);
+			const attackerTempId = crypto.randomBytes(32);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.on('error', () => {});
+			mgr.on(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+				}
+			);
+			mgr.handleMessage(
+				attacker,
+				MessageType.OPEN_CHANNEL,
+				encodeV1Open(attackerTempId)
+			);
+			const attackerChannel = mgr.getTempChannel(attackerTempId);
+			expect(attackerChannel).to.exist;
+			sent.length = 0;
+
+			mgr.handleMessage(
+				attacker,
+				MessageType.FUNDING_CREATED,
+				encodeFundingCreatedMessage({
+					temporaryChannelId: attackerTempId,
+					fundingTxid: collisionId,
+					fundingOutputIndex: 0,
+					signature: Buffer.alloc(64)
+				})
+			);
+
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(
+					attackerTempId
+				)
+			).to.equal(true);
+			expect(mapsOf(mgr).channels.get(collisionId.toString('hex'))).to.equal(
+				victim
+			);
+			expect(
+				mapsOf(mgr).channelPeers.get(collisionId.toString('hex'))
+			).to.equal(owner);
+			expect(mgr.getTempChannel(attackerTempId)).to.equal(undefined);
+			expect(
+				mapsOf(mgr).channelPeers.has(attackerTempId.toString('hex'))
+			).to.equal(false);
+			expect(attackerChannel?.getFullState().fundingTxid).to.not.exist;
+		});
+
+		it('cleans abortPendingOpen after an outbound observer throws', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const tempId = channel.getTemporaryChannelId();
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			let aborted = 0;
+			mgr.on('channel:aborted', () => {
+				aborted++;
+			});
+			mgr.prependListener(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					if (type !== MessageType.ERROR) return;
+					sent.push({ type, payload });
+					throw new Error('abort transport observer failed');
+				}
+			);
+
+			expect(() => mgr.abortPendingOpen(channel, 'wallet failed')).to.throw(
+				'abort transport observer failed'
+			);
+			expect(sent).to.have.length(1);
+			expect(
+				decodeErrorMessage(sent[0].payload).channelId.equals(tempId)
+			).to.equal(true);
+			expect(channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+			expect(aborted).to.equal(1);
+		});
+
+		it('preserves a reentrant same-id replacement during abortPendingOpen cleanup', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const oldChannel = mgr.openChannel(owner, 100_000n);
+			const tempId = oldChannel.getTemporaryChannelId();
+			let replacement: Channel | undefined;
+			let abandoned = 0;
+			mgr.on('channel:aborted', () => {
+				abandoned++;
+			});
+			mgr.prependListener('message:outbound', (_peer: string, type: number) => {
+				if (type !== MessageType.ERROR) return;
+				replacement = makeDetachedChannel(tempId);
+				mapsOf(mgr).tempChannels.set(tempId.toString('hex'), replacement);
+				mapsOf(mgr).channelPeers.set(tempId.toString('hex'), owner);
+			});
+
+			mgr.abortPendingOpen(oldChannel, 'wallet failed');
+			expect(replacement).to.exist;
+			expect(mgr.getTempChannel(tempId)).to.equal(replacement);
+			expect(mapsOf(mgr).channelPeers.get(tempId.toString('hex'))).to.equal(
+				owner
+			);
+			expect(oldChannel.getState()).to.equal(ChannelState.ERRORED);
+			expect(abandoned).to.equal(0);
+		});
+
+		it('preserves a reentrant same-id replacement and refuses outer promotion', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const oldChannel = mgr.openChannel(owner, 100_000n);
+			const tempId = oldChannel.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(oldChannel)
+			);
+			expect(oldChannel.getState()).to.equal(ChannelState.SENT_ACCEPT);
+			let replacement: Channel | undefined;
+			mgr.prependListener('message:outbound', (_peer: string, type: number) => {
+				if (type !== MessageType.FUNDING_CREATED) return;
+				replacement = makeDetachedChannel(tempId);
+				mapsOf(mgr).tempChannels.set(tempId.toString('hex'), replacement);
+				mapsOf(mgr).channelPeers.set(tempId.toString('hex'), owner);
+			});
+
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			const result = mgr.createFunding(
+				oldChannel,
+				fundingTxid,
+				0,
+				Buffer.alloc(64)
+			);
+
+			expect(result).to.equal(null);
+			expect(replacement).to.exist;
+			expect(mgr.getTempChannel(tempId)).to.equal(replacement);
+			expect(mapsOf(mgr).channelPeers.get(tempId.toString('hex'))).to.equal(
+				owner
+			);
+			expect(mgr.getChannel(permanentId)).to.equal(undefined);
+			expect(
+				mapsOf(mgr).channelPeers.has(permanentId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('does not promote after outbound funding_created disconnects the owner', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const tempId = channel.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(channel)
+			);
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			let disconnected = false;
+			mgr.prependListener('message:outbound', (_peer: string, type: number) => {
+				if (type !== MessageType.FUNDING_CREATED || disconnected) return;
+				disconnected = true;
+				mgr.handlePeerDisconnected(owner);
+			});
+
+			const result = mgr.createFunding(
+				channel,
+				fundingTxid,
+				0,
+				Buffer.alloc(64)
+			);
+
+			expect(disconnected).to.equal(true);
+			expect(result).to.equal(null);
+			expect(mgr.getChannel(permanentId)).to.equal(undefined);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+			expect(
+				mapsOf(mgr).channelPeers.has(permanentId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('does not promote after reentrant invalid funding_signed cleanup', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const tempId = channel.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(channel)
+			);
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			let reentered = false;
+			mgr.prependListener('message:outbound', (_peer: string, type: number) => {
+				if (type !== MessageType.FUNDING_CREATED || reentered) return;
+				reentered = true;
+				mgr.handleMessage(
+					owner,
+					MessageType.FUNDING_SIGNED,
+					encodeFundingSignedMessage({
+						channelId: permanentId,
+						signature: Buffer.alloc(64)
+					})
+				);
+			});
+
+			const result = mgr.createFunding(
+				channel,
+				fundingTxid,
+				0,
+				Buffer.alloc(64)
+			);
+
+			expect(reentered).to.equal(true);
+			expect(result).to.equal(null);
+			expect(mgr.getChannel(permanentId)).to.equal(undefined);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+			expect(
+				mapsOf(mgr).channelPeers.has(permanentId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('reserves the permanent id across createFunding outbound reentrancy', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const attacker = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const original = mgr.openChannel(owner, 100_000n);
+			const originalTempId = original.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(original)
+			);
+			expect(original.getState()).to.equal(ChannelState.SENT_ACCEPT);
+
+			const attackerTempId = crypto.randomBytes(32);
+			mgr.handleMessage(
+				attacker,
+				MessageType.OPEN_CHANNEL,
+				encodeV1Open(attackerTempId)
+			);
+			expect(mgr.getTempChannel(attackerTempId)).to.exist;
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			let reentered = false;
+			mgr.prependListener(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+					if (type !== MessageType.FUNDING_CREATED || reentered) return;
+					reentered = true;
+					mgr.handleMessage(
+						attacker,
+						MessageType.FUNDING_CREATED,
+						encodeFundingCreatedMessage({
+							temporaryChannelId: attackerTempId,
+							fundingTxid,
+							fundingOutputIndex: 0,
+							signature: Buffer.alloc(64)
+						})
+					);
+				}
+			);
+
+			const promotedId = mgr.createFunding(
+				original,
+				fundingTxid,
+				0,
+				Buffer.alloc(64)
+			);
+
+			expect(reentered).to.equal(true);
+			expect(promotedId?.equals(permanentId)).to.equal(true);
+			expect(mgr.getChannel(permanentId)).to.equal(original);
+			expect(
+				mapsOf(mgr).channelPeers.get(permanentId.toString('hex'))
+			).to.equal(owner);
+			expect(mgr.getTempChannel(originalTempId)).to.equal(undefined);
+			expect(mgr.getTempChannel(attackerTempId)).to.equal(undefined);
+			expect(
+				mapsOf(mgr).channelPeers.has(attackerTempId.toString('hex'))
+			).to.equal(false);
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(
+					attackerTempId
+				)
+			).to.equal(true);
+		});
+
+		it('blocks a second createFunding while the first owns the derived id in temp', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const firstOwner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const secondOwner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const first = mgr.openChannel(firstOwner, 100_000n);
+			const second = mgr.openChannel(secondOwner, 100_000n);
+			const firstTempId = first.getTemporaryChannelId();
+			const secondTempId = second.getTemporaryChannelId();
+			mgr.handleMessage(
+				firstOwner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(first)
+			);
+			mgr.handleMessage(
+				secondOwner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(second)
+			);
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			let throwOnce = true;
+			mgr.prependListener('message:outbound', (_peer: string, type: number) => {
+				if (type === MessageType.FUNDING_CREATED && throwOnce) {
+					throwOnce = false;
+					throw new Error('first funding_created observer failed');
+				}
+			});
+
+			expect(() =>
+				mgr.createFunding(first, fundingTxid, 0, Buffer.alloc(64))
+			).to.throw('first funding_created observer failed');
+			expect(first.getChannelId()?.equals(permanentId)).to.equal(true);
+			expect(mgr.getTempChannel(firstTempId)).to.equal(first);
+
+			const secondResult = mgr.createFunding(
+				second,
+				fundingTxid,
+				0,
+				Buffer.alloc(64)
+			);
+
+			expect(secondResult).to.equal(null);
+			expect(mgr.getChannel(permanentId)).to.equal(undefined);
+			expect(mgr.getTempChannel(firstTempId)).to.equal(first);
+			expect(mgr.getTempChannel(secondTempId)).to.equal(undefined);
+			expect(
+				mapsOf(mgr).channelPeers.get(firstTempId.toString('hex'))
+			).to.equal(firstOwner);
+			expect(
+				mapsOf(mgr).channelPeers.has(permanentId.toString('hex'))
+			).to.equal(false);
+		});
+
+		it('refuses inbound v1 temporary ids owned as a pending derived id', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const attacker = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const first = mgr.openChannel(owner, 100_000n);
+			const firstTempId = first.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL,
+				encodeV1Accept(first)
+			);
+			const fundingTxid = crypto.randomBytes(32);
+			const permanentId = Buffer.from(fundingTxid);
+			let throwOnce = true;
+			const sent: Array<{ type: number; payload: Buffer }> = [];
+			mgr.prependListener(
+				'message:outbound',
+				(_peer: string, type: number, payload: Buffer) => {
+					sent.push({ type, payload });
+					if (type === MessageType.FUNDING_CREATED && throwOnce) {
+						throwOnce = false;
+						throw new Error('pending derived owner');
+					}
+				}
+			);
+			expect(() =>
+				mgr.createFunding(first, fundingTxid, 0, Buffer.alloc(64))
+			).to.throw('pending derived owner');
+			sent.length = 0;
+
+			mgr.handleMessage(
+				attacker,
+				MessageType.OPEN_CHANNEL,
+				encodeV1Open(permanentId)
+			);
+
+			const wireErrors = sent.filter(
+				(message) => message.type === MessageType.ERROR
+			);
+			expect(wireErrors).to.have.length(1);
+			expect(
+				decodeErrorMessage(wireErrors[0].payload).channelId.equals(permanentId)
+			).to.equal(true);
+			expect(mgr.getTempChannel(permanentId)).to.equal(undefined);
+			expect(mgr.getTempChannel(firstTempId)).to.equal(first);
+			expect(first.getChannelId()?.equals(permanentId)).to.equal(true);
+			expect(
+				mapsOf(mgr).channelPeers.get(firstTempId.toString('hex'))
+			).to.equal(owner);
+		});
+
+		it('removes the exact old temp entry during funding_signed fallback promotion', () => {
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.openChannel(owner, 100_000n);
+			const tempId = channel.getTemporaryChannelId();
+			const permanentId = crypto.randomBytes(32);
+			channel.getFullState().channelId = permanentId;
+			(
+				channel as unknown as {
+					handleFundingSigned: () => ChannelAction[];
+				}
+			).handleFundingSigned = (): ChannelAction[] => [];
+
+			mgr.handleMessage(
+				owner,
+				MessageType.FUNDING_SIGNED,
+				encodeFundingSignedMessage({
+					channelId: permanentId,
+					signature: Buffer.alloc(64)
+				})
+			);
+
+			expect(mgr.getChannel(permanentId)).to.equal(channel);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+			expect(mapsOf(mgr).channelPeers.has(tempId.toString('hex'))).to.equal(
+				false
+			);
+			expect(
+				mapsOf(mgr).channelPeers.get(permanentId.toString('hex'))
+			).to.equal(owner);
+		});
+
+		it('guards v1 temporary negotiation messages by peer ownership', () => {
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const foreignPeer = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const opener = new ChannelManager(makeChannelManagerConfig());
+			opener.on('error', () => {});
+			opener.on('message:outbound', () => {});
+			const outbound = opener.openChannel(owner, 100_000n);
+			const outboundTempId = outbound.getTemporaryChannelId();
+			const acceptPoints = makeBasepoints();
+			const accept = encodeAcceptChannelMessage({
+				temporaryChannelId: outboundTempId,
+				dustLimitSatoshis: 546n,
+				maxHtlcValueInFlightMsat: 500_000_000n,
+				channelReserveSatoshis: 1_000n,
+				htlcMinimumMsat: 1_000n,
+				minimumDepth: 3,
+				toSelfDelay: 144,
+				maxAcceptedHtlcs: 483,
+				fundingPubkey: acceptPoints.fundingPubkey,
+				revocationBasepoint: acceptPoints.revocationBasepoint,
+				paymentBasepoint: acceptPoints.paymentBasepoint,
+				delayedPaymentBasepoint: acceptPoints.delayedPaymentBasepoint,
+				htlcBasepoint: acceptPoints.htlcBasepoint,
+				firstPerCommitmentPoint: acceptPoints.firstPerCommitmentPoint,
+				channelType: outbound.getFullState().channelType ?? undefined
+			});
+
+			opener.handleMessage(foreignPeer, MessageType.ACCEPT_CHANNEL, accept);
+			expect(outbound.getState()).to.equal(ChannelState.SENT_OPEN);
+			expect(opener.getTempChannel(outboundTempId)).to.equal(outbound);
+			opener.handleMessage(owner, MessageType.ACCEPT_CHANNEL, accept);
+			expect(outbound.getState()).to.equal(ChannelState.SENT_ACCEPT);
+
+			const acceptor = new ChannelManager(makeChannelManagerConfig());
+			acceptor.on('error', () => {});
+			acceptor.on('message:outbound', () => {});
+			const inboundTempId = crypto.randomBytes(32);
+			const openPoints = makeBasepoints();
+			acceptor.handleMessage(
+				owner,
+				MessageType.OPEN_CHANNEL,
+				encodeOpenChannelMessage({
+					chainHash: Buffer.alloc(32),
+					temporaryChannelId: inboundTempId,
+					fundingSatoshis: 100_000n,
+					pushMsat: 0n,
+					dustLimitSatoshis: 546n,
+					maxHtlcValueInFlightMsat: 500_000_000n,
+					channelReserveSatoshis: 1_000n,
+					htlcMinimumMsat: 1_000n,
+					feeratePerKw: 253,
+					toSelfDelay: 144,
+					maxAcceptedHtlcs: 483,
+					fundingPubkey: openPoints.fundingPubkey,
+					revocationBasepoint: openPoints.revocationBasepoint,
+					paymentBasepoint: openPoints.paymentBasepoint,
+					delayedPaymentBasepoint: openPoints.delayedPaymentBasepoint,
+					htlcBasepoint: openPoints.htlcBasepoint,
+					firstPerCommitmentPoint: openPoints.firstPerCommitmentPoint,
+					channelFlags: 0
+				})
+			);
+			const inbound = acceptor.getTempChannel(inboundTempId);
+			expect(inbound).to.exist;
+			expect(inbound?.getState()).to.equal(ChannelState.SENT_ACCEPT);
+
+			acceptor.handleMessage(
+				foreignPeer,
+				MessageType.FUNDING_CREATED,
+				encodeFundingCreatedMessage({
+					temporaryChannelId: inboundTempId,
+					fundingTxid: crypto.randomBytes(32),
+					fundingOutputIndex: 0,
+					signature: Buffer.alloc(64)
+				})
+			);
+			expect(acceptor.getTempChannel(inboundTempId)).to.equal(inbound);
+			expect(inbound?.getState()).to.equal(ChannelState.SENT_ACCEPT);
+			expect(inbound?.getFullState().fundingTxid).to.not.exist;
+			expect(
+				(
+					acceptor as unknown as { channelPeers: Map<string, string> }
+				).channelPeers.get(inboundTempId.toString('hex'))
+			).to.equal(owner);
+		});
+	});
+
+	describe('accept_channel2 echo (BOLT 2)', () => {
+		const OFFERED = Buffer.from('401000', 'hex');
+
+		function openerSession(withType: boolean): DualFundingSession {
+			const channelId = crypto.randomBytes(32);
+			const session = new DualFundingSession(true, channelId);
+			const params = makeDualFundingParams(
+				withType
+					? { channelType: OFFERED }
+					: // A session-level open with NO type at all (the Channel
+					  // layer normally injects one): pins the volunteered-echo
+					  // refusal below.
+					  { channelType: undefined }
+			);
+			const result = session.initiateOpen(params);
+			expect(result.ok).to.equal(true);
+			return session;
+		}
+
+		it('a MISSING echo is refused before tx negotiation', () => {
+			const session = openerSession(true);
+			const result = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: undefined
+				})
+			);
+			expect(result.ok).to.equal(false);
+			expect(result.error).to.match(/omitted the channel_type/);
+			expect(session.getState(), 'no tx negotiation started').to.equal(
+				DualFundingState.AWAITING_ACCEPT
+			);
+		});
+
+		it('a MISMATCHED echo is refused, an exact echo accepted', () => {
+			const session = openerSession(true);
+			const mismatched = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from('1000', 'hex')
+				})
+			);
+			expect(mismatched.ok).to.equal(false);
+			expect(mismatched.error).to.match(/Channel type mismatch/);
+
+			const exact = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from(OFFERED)
+				})
+			);
+			expect(exact.ok).to.equal(true);
+			expect(session.getState()).to.equal(DualFundingState.TX_NEGOTIATION);
+		});
+
+		it('a volunteered type the open never proposed is refused', () => {
+			const session = openerSession(false);
+			const result = session.handleAcceptChannel2(
+				makeAcceptChannel2Msg({
+					channelId: session.getChannelId(),
+					channelType: Buffer.from('1000', 'hex')
+				})
+			);
+			expect(result.ok).to.equal(false);
+			expect(result.error).to.match(/did not propose/);
 		});
 	});
 });

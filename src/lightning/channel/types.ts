@@ -45,6 +45,143 @@ export function hasScidAliasChannelType(channelType: Buffer | null): boolean {
 	return FeatureFlags.fromBuffer(channelType).hasFeature(Feature.SCID_ALIAS);
 }
 
+/**
+ * Refuse a proposed dual-funded (v2) channel_type before ANY state exists
+ * for it, or return null when it is acceptable.
+ *
+ * BOLT 2 defines channel types as explicit even-bit combinations, so this
+ * is an allow-list, not a bit filter: static_remotekey, optionally with
+ * anchors_zero_fee_htlc_tx, optionally with scid_alias (+zero_conf, which
+ * BOLT 9 makes dependent on scid_alias). Everything else is refused,
+ * including option_taproot: taproot v2 signing is unimplemented (the
+ * commitment stage fails closed), and a negotiation that is guaranteed to
+ * die later must be refused at admission, before keys are derived, state
+ * is retained or an ACCEPT_CHANNEL2 is sent.
+ *
+ * BOLT 2 makes channel_type REQUIRED on open_channel2 (unlike the legacy
+ * open, where it is optional), so an absent or empty value is refused
+ * outright, as is a non-minimal encoding (leading zero bytes): two
+ * different byte strings for one type would let the echo check be
+ * satisfied by a value the commitment dispatch reads differently.
+ *
+ * Every bit is additionally held to BOTH feature vectors when the caller
+ * supplies them, per BOLT 2's rule that a channel_type must not carry
+ * un-negotiated features (the default vector advertises scid_alias and
+ * zero_conf, so this costs nothing between our own nodes; zero-conf
+ * ACCEPTANCE stays separately gated on the trusted set where the type is
+ * adopted). A vector the caller does not have (raw Channel harnesses,
+ * manager-less drivers) skips only its own half of that check.
+ */
+export function validateV2ChannelType(
+	channelType: Buffer | null | undefined,
+	localFeatures?: FeatureFlags | null,
+	remoteFeatures?: FeatureFlags | null
+): string | null {
+	if (!channelType || channelType.length === 0) {
+		return 'open_channel2 requires a channel_type';
+	}
+	if (channelType[0] === 0) {
+		return 'channel_type must use a minimal encoding';
+	}
+	const flags = FeatureFlags.fromBuffer(channelType);
+	if (flags.hasFeature(Feature.OPTION_TAPROOT)) {
+		return 'channel_type option_taproot is not supported for dual-funded (v2) channels';
+	}
+	// Only the even (compulsory) bits of the known combinations may appear;
+	// any other bit, odd bits included, is an unknown type.
+	const allowed = FeatureFlags.empty();
+	allowed.setCompulsory(Feature.STATIC_REMOTE_KEY);
+	allowed.setCompulsory(Feature.ANCHOR_ZERO_FEE_HTLC);
+	allowed.setCompulsory(Feature.SCID_ALIAS);
+	allowed.setCompulsory(Feature.ZERO_CONF);
+	const mask = allowed.toBuffer();
+	for (let i = 0; i < channelType.length; i++) {
+		const bits = channelType[channelType.length - 1 - i];
+		const permitted = i < mask.length ? mask[mask.length - 1 - i] : 0;
+		if ((bits & ~permitted) !== 0) {
+			return 'channel_type is not a recognized dual-funded (v2) combination';
+		}
+	}
+	if (!flags.hasFeature(Feature.STATIC_REMOTE_KEY)) {
+		return 'channel_type must include static_remotekey';
+	}
+	if (
+		flags.hasFeature(Feature.ZERO_CONF) &&
+		!flags.hasFeature(Feature.SCID_ALIAS)
+	) {
+		return 'channel_type zero_conf requires option_scid_alias';
+	}
+	if (flags.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)) {
+		if (
+			localFeatures != null &&
+			!localFeatures.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)
+		) {
+			return 'channel_type anchors_zero_fee_htlc_tx was not negotiated: this node does not advertise it';
+		}
+		if (
+			remoteFeatures != null &&
+			!remoteFeatures.hasFeature(Feature.ANCHOR_ZERO_FEE_HTLC)
+		) {
+			return 'channel_type anchors_zero_fee_htlc_tx was not negotiated: the peer does not advertise it';
+		}
+	}
+	if (
+		localFeatures != null &&
+		!localFeatures.hasFeature(Feature.STATIC_REMOTE_KEY)
+	) {
+		return 'channel_type static_remotekey was not negotiated: this node does not advertise it';
+	}
+	if (
+		remoteFeatures != null &&
+		!remoteFeatures.hasFeature(Feature.STATIC_REMOTE_KEY)
+	) {
+		return 'channel_type static_remotekey was not negotiated: the peer does not advertise it';
+	}
+	if (flags.hasFeature(Feature.SCID_ALIAS)) {
+		if (
+			localFeatures != null &&
+			!localFeatures.hasFeature(Feature.SCID_ALIAS)
+		) {
+			return 'channel_type scid_alias was not negotiated: this node does not advertise it';
+		}
+		if (
+			remoteFeatures != null &&
+			!remoteFeatures.hasFeature(Feature.SCID_ALIAS)
+		) {
+			return 'channel_type scid_alias was not negotiated: the peer does not advertise it';
+		}
+	}
+	if (flags.hasFeature(Feature.ZERO_CONF)) {
+		if (localFeatures != null && !localFeatures.hasFeature(Feature.ZERO_CONF)) {
+			return 'channel_type zero_conf was not negotiated: this node does not advertise it';
+		}
+		if (
+			remoteFeatures != null &&
+			!remoteFeatures.hasFeature(Feature.ZERO_CONF)
+		) {
+			return 'channel_type zero_conf was not negotiated: the peer does not advertise it';
+		}
+	}
+	return null;
+}
+
+/**
+ * BOLT 2: a channel whose type carries option_scid_alias MUST NOT be
+ * announced. Returns the refusal, or null when the pairing is legal.
+ * Callers with a channel_flags byte pass its announce bit (0x01).
+ */
+export function scidAliasAnnounceRefusal(
+	channelType: Buffer | null | undefined,
+	announceChannel: boolean
+): string | null {
+	if (!announceChannel) return null;
+	if (!channelType || channelType.length === 0) return null;
+	if (!FeatureFlags.fromBuffer(channelType).hasFeature(Feature.SCID_ALIAS)) {
+		return null;
+	}
+	return 'a channel_type carrying option_scid_alias cannot be announced';
+}
+
 export enum ChannelState {
 	NONE = 'NONE',
 	SENT_OPEN = 'SENT_OPEN',

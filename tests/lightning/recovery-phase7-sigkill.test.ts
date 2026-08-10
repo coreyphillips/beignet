@@ -67,6 +67,7 @@ function spawnChild(envExtra: Record<string, string>): IChildHandle {
 	}> = [];
 	const rl = readline.createInterface({ input: proc.stdout! });
 	rl.on('line', (line) => {
+		if (process.env.CHAOS_DEBUG === '1') console.log('[child]', line);
 		lines.push(line);
 		for (let i = waiters.length - 1; i >= 0; i--) {
 			if (line.startsWith(waiters[i].prefix)) {
@@ -105,8 +106,16 @@ function spawnChild(envExtra: Record<string, string>): IChildHandle {
 		},
 		kill: (): Promise<string | null> =>
 			new Promise((resolve) => {
+				// The child may already be gone (a cell that failed after its
+				// kill, or a watchdog-reaped freeze): 'exit' will not re-fire,
+				// and kill() on a dead pid returns false. Resolve from the
+				// recorded signal instead of waiting forever.
+				if (proc.exitCode !== null || proc.signalCode !== null) {
+					resolve(proc.signalCode);
+					return;
+				}
 				proc.once('exit', (_code, signal) => resolve(signal));
-				proc.kill('SIGKILL');
+				if (!proc.kill('SIGKILL')) resolve(proc.signalCode);
 			})
 	};
 }
@@ -144,6 +153,7 @@ interface IWorld {
 	served: Array<{ guardian: ReferenceGuardian; server: GuardianHttpServer }>;
 	channelId: string;
 	firstLife: boolean;
+	dualFund: boolean;
 }
 
 const GUARDIAN_SECRETS = [1, 2, 3].map((i) =>
@@ -175,10 +185,24 @@ async function serveTrio(): Promise<{
 	return { served, urls: urls.join(',') };
 }
 
-async function makeWorld(mode: IWorld['mode']): Promise<IWorld> {
+async function makeWorld(
+	mode: IWorld['mode'],
+	dualFund = false
+): Promise<IWorld> {
 	const peer = createChaosNode(PEER_SEED, {
 		extras: { enableNetworking: true }
 	});
+	if (process.env.CHAOS_DEBUG === '1') {
+		peer.on('node:error', (e) => console.log('[peer node:error]', e));
+		peer
+			.getChannelManager()
+			.on('error', (_id: Buffer | null, m: string) =>
+				console.log('[peer mgr error]', m)
+			);
+		peer.on('message:outbound', (_pk: string, t: number) =>
+			console.log('[peer ->]', t)
+		);
+	}
 	await peer.listen(0, '127.0.0.1');
 	let guardians = '';
 	let served: IWorld['served'] = [];
@@ -194,7 +218,8 @@ async function makeWorld(mode: IWorld['mode']): Promise<IWorld> {
 		guardians,
 		served,
 		channelId: '',
-		firstLife: true
+		firstLife: true,
+		dualFund
 	};
 }
 
@@ -221,6 +246,7 @@ async function bootChild(
 		CHAOS_MODE: world.mode,
 		CHAOS_GUARDIANS: world.guardians,
 		CHAOS_REGISTER: world.firstLife ? '1' : '0',
+		...(world.dualFund ? { CHAOS_DUAL_FUND: '1' } : {}),
 		...(arm ? { CHAOS_ARM: arm } : {})
 	});
 	world.firstLife = false;
@@ -276,10 +302,24 @@ async function driveS1a(
 	}
 }
 
+type Drive = (
+	world: IWorld,
+	child: IChildHandle,
+	expectKill: boolean
+) => Promise<void>;
+
 /** The rehearsal life: record the label schedule the scenario produces. */
-async function recordSchedule(world: IWorld): Promise<string[]> {
+async function recordSchedule(
+	world: IWorld,
+	drive: Drive = driveS1a
+): Promise<string[]> {
 	const child = await bootChild(world, null);
-	await driveS1a(world, child, false);
+	try {
+		await drive(world, child, false);
+	} catch (err) {
+		await child.kill();
+		throw err;
+	}
 	// Drain the tail: the last gated sends may land just after paid:, and
 	// the schedule must record them deterministically.
 	for (let i = 0; i < 100; i++) {
@@ -329,6 +369,20 @@ async function runKillCell(world: IWorld, label: string): Promise<void> {
 	await settle();
 
 	const revived = await bootChild(world, null);
+	try {
+		await runS1aCellBody(world, revived, label);
+	} catch (err) {
+		if (revived.proc.exitCode === null) await revived.kill();
+		throw err;
+	}
+}
+
+/** The revived half of an S1a kill cell; failures kill the child upstream. */
+async function runS1aCellBody(
+	world: IWorld,
+	revived: IChildHandle,
+	label: string
+): Promise<void> {
 	// Reestablish rides the reconnect. Re-deliver the funding confirmation
 	// the chain would repeat, both sides, when the open got that far.
 	if (world.channelId) {
@@ -407,6 +461,191 @@ async function runKillCell(world: IWorld, label: string): Promise<void> {
 	expect(bye).to.equal('SIGKILL');
 }
 
+/**
+ * S7 at process level: the child opens a DUAL-FUNDED channel to the parent
+ * peer; the kill labels land inside the interactive round, the commitment
+ * exchange and the signature exchange the durable v2InFlight record makes
+ * resumable. No payment rides the rehearsal: the sweep is about the open.
+ */
+async function driveS7v2(
+	world: IWorld,
+	child: IChildHandle,
+	expectKill: boolean
+): Promise<void> {
+	// Let the init exchange finish before opening (the in-process harness
+	// has no transport latency; real TCP does).
+	await new Promise((resolve) => setTimeout(resolve, 1500));
+	child.send(`openv2 400000 ${world.peer.getNodeId()}`);
+	const opened = await child.waitLine('opened:', 30_000).catch((err) => {
+		if (expectKill) return null;
+		throw err;
+	});
+	if (opened === null) return;
+	world.channelId = opened.slice('opened:'.length);
+	child.send(`confirm ${world.channelId}`);
+	await child.waitLine('ok:confirm').catch(() => undefined);
+	try {
+		world.peer.handleFundingConfirmed(Buffer.from(world.channelId, 'hex'));
+	} catch {
+		// The kill may land before the peer's half exists.
+	}
+	await waitFor(
+		() =>
+			world.peer
+				.getChannelManager()
+				.listChannels()
+				.some((c) => c.getState() === ChannelState.NORMAL),
+		'the v2 channel to reach NORMAL'
+	);
+}
+
+const V2_COMPLETION = new Set([
+	'AWAITING_FUNDING_CONFIRMED',
+	'AWAITING_CHANNEL_READY',
+	'NORMAL'
+]);
+
+interface IChildDump {
+	channels: Array<{ id: string | null; state: string }>;
+}
+
+/** One child dump, with the consumed line removed for the next poll. */
+async function pollDump(child: IChildHandle): Promise<IChildDump> {
+	child.send('dump');
+	const dumpLine = await child.waitLine('dump:');
+	child.lines.splice(child.lines.indexOf(dumpLine), 1);
+	return JSON.parse(dumpLine.slice('dump:'.length)) as IChildDump;
+}
+
+/**
+ * One v2 kill run: die at the armed label, respawn on the same file, and
+ * judge by what the disk holds, exactly like the in-process S7 sweep: a
+ * cell killed before the promotion persist restarts clean and a fresh v2
+ * open works; a promoted cell RESUMES over reestablish next_funding and
+ * completes. Either way the cell ends with a NORMAL channel and a settled
+ * probe payment.
+ */
+async function runV2KillCell(
+	world: IWorld,
+	label: string,
+	mustResume: boolean
+): Promise<void> {
+	const child = await bootChild(world, label);
+	const reached = child.waitLine(`reached:${label}`, 30_000);
+	await Promise.race([
+		driveS7v2(world, child, true).catch(() => undefined),
+		reached
+	]);
+	await reached;
+	const signal = await child.kill();
+	expect(signal, `the child died by SIGKILL at ${label}`).to.equal('SIGKILL');
+	await settle();
+
+	const revived = await bootChild(world, null);
+	try {
+		await runV2CellBody(world, revived, label, mustResume);
+	} catch (err) {
+		if (revived.proc.exitCode === null) await revived.kill();
+		throw err;
+	}
+}
+
+/**
+ * The revived half of a v2 kill cell; failures kill the child upstream.
+ * The expected disposition COMES IN from the schedule's durable boundary
+ * rather than being inferred from what survived, so a lost durable row
+ * fails its cell instead of reading as a valid abandonment.
+ */
+async function runV2CellBody(
+	world: IWorld,
+	revived: IChildHandle,
+	label: string,
+	mustResume: boolean
+): Promise<void> {
+	if (!mustResume) {
+		// Nothing durable exists before the boundary: the restart must
+		// carry no channel at all, and the child correctly answers the
+		// peer's reestablish with an error. That is the matrix's abandoned
+		// disposition, the same acceptance the in-process S7 sweep holds.
+		// No fresh v2 open rides this branch: the child's fixed basepoints
+		// would derive the SAME channel id as the dead attempt, which the
+		// peer deliberately retains (a zero-input acceptor's attempt is
+		// conservatively broadcastable, so no sweep reaps it), and that
+		// collision exists only in this harness, never in production
+		// where openers derive fresh basepoints per channel.
+		await new Promise((resolve) => setTimeout(resolve, 2000));
+		const dump = await pollDump(revived);
+		expect(
+			dump.channels.length,
+			`no debris after abandon at ${label}`
+		).to.equal(0);
+		const bye = await revived.kill();
+		expect(bye).to.equal('SIGKILL');
+		return;
+	}
+
+	// The durable row survived by construction (the kill landed at or
+	// after post-commit:1); the reestablish rides the reconnect, so poll
+	// the child's own view until the resumed open leaves the signature
+	// exchange. An empty channel list here is the exact regression this
+	// classification exists to catch.
+	let resumedId: string | null = null;
+	const deadline = Date.now() + 20_000;
+	for (;;) {
+		const dump = await pollDump(revived);
+		const resumed = dump.channels.find(
+			(c) => c.id !== null && V2_COMPLETION.has(c.state)
+		);
+		if (resumed?.id) {
+			resumedId = resumed.id;
+			break;
+		}
+		expect(
+			dump.channels.length,
+			`the durable row survived the kill at ${label}`
+		).to.be.greaterThan(0);
+		if (Date.now() > deadline) {
+			throw new Error(
+				`resumed open stuck after ${label}: ${JSON.stringify(dump.channels)}`
+			);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+
+	// A promoted cell must COMPLETE: confirm both sides; channel_ready
+	// finishes the open, and a probe payment proves the channel works.
+	const activeId: string = resumedId!;
+	revived.send(`confirm ${activeId}`);
+	await revived.waitLine('ok:confirm').catch(() => undefined);
+	try {
+		world.peer.handleFundingConfirmed(Buffer.from(activeId, 'hex'));
+	} catch {
+		// Already confirmed during the dying life.
+	}
+	await waitFor(
+		() =>
+			world.peer
+				.getChannelManager()
+				.listChannels()
+				.some((c) => c.getState() === ChannelState.NORMAL),
+		`the v2 channel NORMAL after ${label}`
+	);
+	const invoice = world.peer.createInvoice({
+		amountMsat: 30_000n,
+		description: `sigkill v2 probe ${label}`
+	});
+	revived.send(`graph ${world.peer.getNodeId()} 830`);
+	await revived.waitLine('ok:graph');
+	revived.send(`pay ${invoice.bolt11}`);
+	const paid = await revived.waitLine('paid:', 25_000);
+	expect(paid, `probe payment settled after ${label}`).to.equal(
+		'paid:COMPLETED'
+	);
+
+	const bye = await revived.kill();
+	expect(bye).to.equal('SIGKILL');
+}
+
 describe('Recovery phase 7: SIGKILL matrix (dedicated child, real assembly)', function () {
 	for (const mode of ['local', 'quorum'] as const) {
 		it(`S1a payer: every boundary survives a real SIGKILL and resumes (${mode})`, async function () {
@@ -431,6 +670,53 @@ describe('Recovery phase 7: SIGKILL matrix (dedicated child, real assembly)', fu
 				const world = await makeWorld(mode);
 				try {
 					await runKillCell(world, label);
+				} finally {
+					await destroyWorld(world);
+				}
+			}
+		});
+	}
+
+	for (const mode of ['local', 'quorum'] as const) {
+		it(`S7 v2 opener: every boundary of the durable open survives a real SIGKILL (${mode})`, async function () {
+			this.timeout(600_000);
+			const rehearsalWorld = await makeWorld(mode, true);
+			let schedule: string[];
+			try {
+				schedule = await recordSchedule(rehearsalWorld, driveS7v2);
+			} finally {
+				await destroyWorld(rehearsalWorld);
+			}
+			expect(
+				schedule.length,
+				'the rehearsal recorded a schedule'
+			).to.be.at.least(6);
+			expect(
+				schedule.some((l) => l.startsWith('post-send:COMMITMENT_SIGNED')),
+				'the schedule crossed the commitment boundary'
+			).to.equal(true);
+			expect(
+				schedule.some((l) => l.startsWith('post-send:TX_SIGNATURES')),
+				'the schedule crossed the signature exchange'
+			).to.equal(true);
+
+			// Same boundary classification as the in-process sweeps: from
+			// post-commit:1 onward the durable row exists and the cell must
+			// resume; before it, the restart must be clean. Deriving this
+			// from the rehearsal keeps a lost-row regression from passing
+			// as an abandonment.
+			const boundary = schedule.indexOf('post-commit:1');
+			expect(
+				boundary,
+				'the rehearsal crossed the durable boundary'
+			).to.be.greaterThan(0);
+			expect(boundary, 'labels exist beyond the boundary').to.be.lessThan(
+				schedule.length - 1
+			);
+			for (const [index, label] of schedule.entries()) {
+				const world = await makeWorld(mode, true);
+				try {
+					await runV2KillCell(world, label, index >= boundary);
 				} finally {
 					await destroyWorld(world);
 				}
