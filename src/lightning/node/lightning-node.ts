@@ -2401,6 +2401,9 @@ export class LightningNode extends EventEmitter {
 				this.channelManager.getChannel(channelId) &&
 				this.channelManager.getPeerForChannel(channelId)
 			) {
+				// persistChannelState re-arms the monitor delta itself when that
+				// combined commit rolls back, so this branch needs no retry of
+				// its own.
 				this.persistChannel(channelId);
 				return;
 			}
@@ -2411,11 +2414,17 @@ export class LightningNode extends EventEmitter {
 		}
 		const mutation = this.takeDirtyMonitorMutation(channelIdHex);
 		if (!mutation) return;
-		this.recovery.commit({
+		const result = this.recovery.commit({
 			criticality: RecoveryCriticality.SafetyCritical,
 			mutations: [mutation],
 			outboundMessages: []
 		});
+		if (!result.committed) {
+			// The state never reached storage, and takeDirtyMonitorMutation already
+			// cleared the flag. Mark it dirty again so the next block, fee sample or
+			// channel transition writes this monitor instead of dropping the delta.
+			this.dirtyMonitors.add(channelIdHex);
+		}
 	}
 
 	/**

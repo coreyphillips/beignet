@@ -152,7 +152,9 @@ export class ChainMonitor {
 						this._destinationScript,
 						this._feeRatePerVbyte,
 						this._knownPreimages,
-						this._paymentPrivkey
+						this._paymentPrivkey,
+						this._htlcBasepointSecret,
+						this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
 					);
 					break;
 				case CommitmentType.THEIR_FUTURE_COMMITMENT:
@@ -418,7 +420,7 @@ export class ChainMonitor {
 		this._feeRatePerVbyte = Math.max(1, Math.round((feeRatePerKw * 4) / 1000));
 		const actions: ChainAction[] = [];
 		this._retryUnsweptRevokedSweeps(actions);
-		this._retryUnsweptRemoteBalance(actions);
+		this._retryUnsweptPeerCommitmentClaims(actions, true);
 		return actions;
 	}
 
@@ -786,7 +788,7 @@ export class ChainMonitor {
 		// claim skipped during a fee spike is never revisited even after the spike
 		// passes.
 		this._retryUnsweptRevokedSweeps(actions);
-		this._retryUnsweptRemoteBalance(actions);
+		this._retryUnsweptPeerCommitmentClaims(actions);
 
 		// A retry can adopt a snapshot-reconstructed output after the scan above.
 		// Recompute from the current tracked set so a new in-flight claim cannot be
@@ -1313,7 +1315,38 @@ export class ChainMonitor {
 		// watch before it disappears. Deduplicate a shared raw sweep if present.
 		const rawRebroadcasts = new Map<string, ITrackedOutput>();
 		for (const reorgedOutput of reorgedOutputs) {
+			// handleOutputSpent overwrote confirmationHeight with the SPEND's height.
+			// Now that the spend is gone, put the commitment's own height back: every
+			// timelock on this output (its CSV base, its contest height, the maturity
+			// of a claim rebuilt below) counts from the transaction that CREATED it.
+			if (
+				this._commitmentBroadcast?.txid === reorgedOutput.txid &&
+				this._commitmentBroadcast.blockHeight > 0
+			) {
+				reorgedOutput.confirmationHeight =
+					this._commitmentBroadcast.blockHeight;
+			}
 			if (reorgedOutput.sweepTxHex) {
+				let maturityHeight = reorgedOutput.maturityHeight;
+				if (maturityHeight === undefined) {
+					try {
+						maturityHeight = this._computeMaturityHeight(
+							bitcoin.Transaction.fromHex(reorgedOutput.sweepTxHex),
+							reorgedOutput.confirmationHeight
+						);
+						reorgedOutput.maturityHeight = maturityHeight;
+					} catch {
+						maturityHeight = this._currentBlockHeight;
+					}
+				}
+				if (this._currentBlockHeight < maturityHeight) {
+					// A competing spend can disappear before our retained timeout or
+					// CSV claim matures. Keep it held instead of broadcasting a
+					// transaction the network must reject as non-final.
+					reorgedOutput.status = OutputStatus.CONFIRMED;
+					reorgedOutput.broadcastHeight = undefined;
+					continue;
+				}
 				reorgedOutput.status = OutputStatus.SPEND_BROADCAST;
 				reorgedOutput.broadcastHeight = this._currentBlockHeight;
 				rawRebroadcasts.set(reorgedOutput.sweepTxHex, reorgedOutput);
@@ -1330,6 +1363,7 @@ export class ChainMonitor {
 				)
 			);
 		}
+		this._retryUnsweptPeerCommitmentClaims(actions);
 		return actions;
 	}
 
@@ -1426,6 +1460,12 @@ export class ChainMonitor {
 					this._scheduleSweep(actions, r, 'HTLC claim (preimage learned)');
 				}
 			}
+			this._reportDeclinedClaims(
+				actions,
+				resolved
+					.filter((r) => r.declinedAsUneconomic)
+					.map((r) => r.trackedOutput)
+			);
 		}
 		// THEIR_REVOKED_COMMITMENT needs no preimage — a received HTLC on a revoked
 		// commitment is swept via the revocation key at broadcast time, not by preimage.
@@ -1692,13 +1732,9 @@ export class ChainMonitor {
 			}
 		}
 
-		// Only to_remote: it is the one output here whose absence of a spend means
-		// the affordability guard declined it. Their to_local is not ours to spend,
-		// and an unclaimed HTLC is usually waiting on a preimage or its cltv, not
-		// on the feerate.
 		this._reportDeclinedClaims(
 			actions,
-			this._trackedOutputs.filter((o) => o.outputType === OutputType.TO_REMOTE)
+			resolved.filter((r) => r.declinedAsUneconomic).map((r) => r.trackedOutput)
 		);
 
 		return actions;
@@ -1742,10 +1778,12 @@ export class ChainMonitor {
 			}
 		}
 
-		// Same reason as the current-commitment handler: an unaffordable to_remote
-		// is declined here, and reporting only from a later retry loses the decline
-		// whenever the next fee sample recovers the claim.
-		this._reportDeclinedClaims(actions, toRemoteOutputs);
+		// Reporting from the first pass keeps a decline visible even when the next
+		// fee sample immediately recovers it.
+		this._reportDeclinedClaims(
+			actions,
+			resolved.filter((r) => r.declinedAsUneconomic).map((r) => r.trackedOutput)
+		);
 
 		return actions;
 	}
@@ -2422,8 +2460,8 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * Height at which a COMPETING spend path opens for a revoked-commitment
-	 * output, when one is bounded and known.
+	 * Height at which a COMPETING spend path opens for a peer-commitment output,
+	 * when one is bounded and known.
 	 *
 	 * This is urgency, never a stopping condition. None of these heights
 	 * invalidates our revocation spend: it stays valid for as long as the outpoint
@@ -2434,7 +2472,8 @@ export class ChainMonitor {
 	 *   script, which on a leased channel is the lease lock rather than the
 	 *   to_self_delay we configured (update_blockheight moves it over the
 	 *   channel's life, so current state can disagree with what they signed).
-	 * - an HTLC WE receive: their pre-signed HTLC-timeout opens at cltv_expiry.
+	 * - an HTLC WE receive: their pre-signed HTLC-timeout opens at cltv_expiry;
+	 *   anchor-style claims also require one confirmation-relative block.
 	 * - an HTLC WE offered: theirs to claim with the preimage at any moment, so
 	 *   there is no height to name.
 	 * - our to_remote: our own balance, which no one else can spend.
@@ -2457,7 +2496,15 @@ export class ChainMonitor {
 				);
 			}
 			case OutputType.RECEIVED_HTLC:
-				return output.cltvExpiry;
+				if (output.cltvExpiry === undefined) return undefined;
+				if (!isAnchorChannel(this._channelState.channelType)) {
+					return output.cltvExpiry;
+				}
+				// Anchor and Taproot HTLC-timeout inputs carry CSV-1. While the
+				// commitment is only in the mempool there is no relative-lock base,
+				// and after confirmation both the absolute and relative locks apply.
+				if (output.confirmationHeight <= 0) return undefined;
+				return Math.max(output.cltvExpiry, output.confirmationHeight + 1);
 			default:
 				return undefined;
 		}
@@ -2745,21 +2792,22 @@ export class ChainMonitor {
 	}
 
 	/**
-	 * Re-claim OUR to_remote balance on a non-revoked peer commitment when it was
-	 * declined as uneconomic.
+	 * Retry economically declined claims on a non-revoked peer commitment.
 	 *
-	 * The affordability guard that keeps an unaffordable to_remote from throwing
-	 * out of the resolver leaves the output tracked without a spend, and the
-	 * penalty retry above only covers revoked commitments. Without this the guard
-	 * would trade one failure (the throw that abandoned the whole resolution) for
-	 * another (a balance nobody ever comes back for). to_remote is ours outright,
-	 * so there is no race and no deadline; it is retried until it is claimed.
-	 *
-	 * Other output types on these commitments keep their existing paths: their
-	 * to_local is not ours to spend, and HTLC claims are driven by preimage and
-	 * cltv scheduling rather than by feerate.
+	 * A current commitment can carry our to_remote balance, an offered HTLC we
+	 * reclaim after CLTV, and a received HTLC we claim once its preimage is known.
+	 * The resolver marks only claims that were fully constructible but priced out,
+	 * so outputs waiting for a preimage or signing material are not reported as fee
+	 * declines. A future commitment remains restricted to to_remote because its
+	 * HTLC scripts and per-commitment point are unknown after data loss. A fresh
+	 * fee estimate also refreshes a held CLTV or CSV claim before maturity, so it
+	 * does not enter its spend race at a stale rate and wait another rebroadcast
+	 * interval for its first bump.
 	 */
-	private _retryUnsweptRemoteBalance(actions: ChainAction[]): void {
+	private _retryUnsweptPeerCommitmentClaims(
+		actions: ChainAction[],
+		refreshHeld = false
+	): void {
 		const broadcast = this._commitmentBroadcast;
 		if (
 			!broadcast ||
@@ -2769,27 +2817,57 @@ export class ChainMonitor {
 			return;
 		}
 
+		const currentCommitment =
+			broadcast.commitmentType === CommitmentType.THEIR_CURRENT_COMMITMENT;
 		const retryable = this._trackedOutputs.filter(
 			(output) =>
-				output.outputType === OutputType.TO_REMOTE &&
 				output.status === OutputStatus.CONFIRMED &&
-				output.sweepTxHex === undefined &&
-				output.txid === broadcast.txid
+				(output.sweepTxHex === undefined ||
+					(refreshHeld && output.maturityHeight !== undefined)) &&
+				output.txid === broadcast.txid &&
+				(output.outputType === OutputType.TO_REMOTE ||
+					(currentCommitment &&
+						(output.outputType === OutputType.OFFERED_HTLC ||
+							output.outputType === OutputType.RECEIVED_HTLC)))
 		);
 		if (retryable.length === 0) return;
 
-		for (const output of retryable) {
-			// rebuildSweep re-resolves a single output at a given rate across every
-			// commitment type, and _scheduleSweep holds one whose timelock (an
-			// anchor to_remote carries a 1-block CSV) has not matured yet.
-			const rebuilt = this.rebuildSweep(output, this._feeRatePerVbyte);
-			if (!rebuilt) continue;
-			this._scheduleSweep(
-				actions,
-				{ trackedOutput: output, spendTx: rebuilt },
-				'to_remote claim (retried after skip)'
+		let resolved: ReturnType<typeof resolveTheirCurrentCommitmentOutputs>;
+		try {
+			resolved = resolveTheirCurrentCommitmentOutputs(
+				this._channelState,
+				retryable,
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._knownPreimages,
+				this._paymentPrivkey,
+				this._htlcBasepointSecret,
+				currentCommitment
+					? this._channelState.remoteCurrentPerCommitmentPoint ?? undefined
+					: this._channelState.dlpRemotePerCommitmentPoint ??
+							this._channelState.remoteCurrentPerCommitmentPoint ??
+							undefined
 			);
+		} catch {
+			// A malformed retained claim must not abort block or fee processing.
+			return;
 		}
-		this._reportDeclinedClaims(actions, retryable);
+
+		for (const entry of resolved) {
+			if (!entry.spendTx) continue;
+			const description =
+				entry.trackedOutput.outputType === OutputType.TO_REMOTE
+					? 'to_remote claim (retried after skip)'
+					: entry.trackedOutput.outputType === OutputType.OFFERED_HTLC
+					? 'HTLC-timeout claim (retried after skip)'
+					: 'HTLC preimage claim (retried after skip)';
+			this._scheduleSweep(actions, entry, description);
+		}
+		this._reportDeclinedClaims(
+			actions,
+			resolved
+				.filter((entry) => entry.declinedAsUneconomic)
+				.map((entry) => entry.trackedOutput)
+		);
 	}
 }

@@ -127,6 +127,8 @@ export interface IResolvedOutput {
 	trackedOutput: ITrackedOutput;
 	spendTx?: bitcoin.Transaction;
 	witness?: Buffer[];
+	/** The spend was fully constructible but could not cover its fee and dust. */
+	declinedAsUneconomic?: boolean;
 	/** CSV delay before this output can be spent */
 	csvDelay?: number;
 	/** CLTV expiry before this output can be spent */
@@ -1969,7 +1971,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				1 // 1-block CSV
 			);
 			if (!tx) {
-				resolved.push({ trackedOutput: output });
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
 				continue;
 			}
 			resolved.push({
@@ -1983,6 +1988,8 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			resolved.push({ trackedOutput: output });
 		} else if (
 			output.outputType === OutputType.OFFERED_HTLC &&
+			output.paymentHash &&
+			output.cltvExpiry !== undefined &&
 			htlcPrivkey &&
 			keys
 		) {
@@ -2006,7 +2013,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				1 // received-timeout leaf now has OP_1 CSV (+ CLTV via nLockTime)
 			);
 			if (!tx) {
-				resolved.push({ trackedOutput: output });
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
 				continue;
 			}
 			resolved.push({
@@ -2017,6 +2027,7 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 			});
 		} else if (
 			output.outputType === OutputType.RECEIVED_HTLC &&
+			output.paymentHash &&
 			htlcPrivkey &&
 			keys
 		) {
@@ -2045,7 +2056,10 @@ function resolveTheirCurrentTaprootCommitmentOutputs(
 				1 // offered-success leaf now has OP_1 CSV
 			);
 			if (!tx) {
-				resolved.push({ trackedOutput: output });
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
 				continue;
 			}
 			resolved.push({
@@ -2127,7 +2141,10 @@ export function resolveTheirCurrentCommitmentOutputs(
 			if (
 				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
 			) {
-				resolved.push({ trackedOutput: output });
+				resolved.push({
+					trackedOutput: output,
+					declinedAsUneconomic: true
+				});
 				continue;
 			}
 
@@ -2189,7 +2206,8 @@ export function resolveTheirCurrentCommitmentOutputs(
 			resolved.push({ trackedOutput: output });
 		} else if (
 			output.outputType === OutputType.OFFERED_HTLC &&
-			output.paymentHash
+			output.paymentHash &&
+			output.cltvExpiry !== undefined
 		) {
 			// Output types are labelled from OUR perspective (see classifyOutputs /
 			// matchHtlcOutput). An OFFERED_HTLC is one WE offered (outbound) — on
@@ -2204,6 +2222,17 @@ export function resolveTheirCurrentCommitmentOutputs(
 				htlcBasepointSecret &&
 				remotePerCommitmentPoint
 			) {
+				if (
+					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
+					null
+				) {
+					resolved.push({
+						trackedOutput: output,
+						declinedAsUneconomic: true,
+						cltvExpiry: output.cltvExpiry
+					});
+					continue;
+				}
 				const claimTx = buildRemoteHtlcTimeoutClaimTx({
 					commitmentTxid: output.txid,
 					outputIndex: output.outputIndex,
@@ -2262,6 +2291,16 @@ export function resolveTheirCurrentCommitmentOutputs(
 				htlcBasepointSecret &&
 				remotePerCommitmentPoint
 			) {
+				if (
+					sweepOutputValue(output.amount, feeSatoshis, destinationScript) ===
+					null
+				) {
+					resolved.push({
+						trackedOutput: output,
+						declinedAsUneconomic: true
+					});
+					continue;
+				}
 				// Build and sign the preimage claim transaction. Anchor channels add
 				// a 1-block CSV to the HTLC output's claim path, so the input must use
 				// sequence 1 (the immediate-path RBF sequence would fail OP_CSV).

@@ -35,6 +35,7 @@ import {
 } from '../../src/lightning/recovery';
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelManager } from '../../src/lightning/channel/channel-manager';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { Network } from '../../src/lightning/invoice/types';
@@ -1240,6 +1241,56 @@ describe('Recovery phase 1: revoke supersede is transactional', () => {
 // ─────────────── 13-15. Failure recovery paths ───────────────
 
 describe('Recovery phase 1: failure recovery paths', () => {
+	it('retries the latest standalone monitor state after a failed commit', () => {
+		const storage = new SqliteStorage(':memory:');
+		storage.open();
+		const node = createNode(1, storage);
+		const channelId = crypto.randomBytes(32);
+		const idHex = channelId.toString('hex');
+		const state = makeChannelState(channelId);
+		const monitor = new ChainMonitor(
+			state,
+			Buffer.concat([Buffer.from([0x00, 0x14]), Buffer.alloc(20, 1)]),
+			1,
+			makeSeed(20),
+			makeSeed(21)
+		);
+		node.getChannelManager().restoreMonitor(idHex, monitor);
+
+		const internals = node as unknown as {
+			dirtyMonitors: Set<string>;
+			persistMonitorAlone(idHex: string): void;
+		};
+		const originalSave = storage.saveChainMonitor.bind(storage);
+		let saveAttempts = 0;
+		storage.saveChainMonitor = (id, monitorState): void => {
+			saveAttempts++;
+			if (saveAttempts === 1) throw new Error('disk on fire');
+			originalSave(id, monitorState);
+		};
+
+		monitor.handleNewBlock(101);
+		internals.dirtyMonitors.add(idHex);
+		internals.persistMonitorAlone(idHex);
+
+		expect(saveAttempts).to.equal(1);
+		expect(storage.loadChainMonitor(idHex)).to.equal(null);
+		expect(
+			internals.dirtyMonitors.has(idHex),
+			'a failed standalone commit remains queued'
+		).to.equal(true);
+
+		monitor.handleNewBlock(102);
+		internals.persistMonitorAlone(idHex);
+
+		expect(saveAttempts).to.equal(2);
+		expect(storage.loadChainMonitor(idHex)?.currentBlockHeight).to.equal(102);
+		expect(internals.dirtyMonitors.has(idHex)).to.equal(false);
+
+		node.destroy();
+		storage.close();
+	});
+
 	it('a held-back monitor delta retries as a combined channel commit', () => {
 		const storage = new SqliteStorage(':memory:');
 		storage.open();
