@@ -647,6 +647,7 @@ const result = await node.recoverFromStaticChannelBackup(scb.channels);
 | `htlc:fulfilled` | `({ channelId, htlcId })` | Forwarded HTLC fulfilled |
 | `htlc:failed` | `({ channelId, htlcId })` | Forwarded HTLC failed |
 | `htlc:held` | `({ paymentHash, amountMsat })` | HTLC parked by a hold invoice |
+| `sweep:uneconomic` | `(channelId: Buffer, action: ISweepUneconomicChainAction)` | An on-chain claim was declined because it cannot pay its own fee (`reason: 'skipped'`), or its deadline passed while it stayed unaffordable (`reason: 'abandoned'`) |
 | `peer:connect` | `(pubkey: string)` | Peer connected (networking mode) |
 | `peer:disconnect` | `(pubkey: string)` | Peer disconnected (networking mode) |
 | `peer:error` | `(pubkey: string, error: Error)` | Peer error (networking mode) |

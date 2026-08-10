@@ -224,7 +224,8 @@ import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
 	OutputStatus,
-	OutputType
+	OutputType,
+	ISweepUneconomicChainAction
 } from '../chain/types';
 import { ChainMonitor } from '../chain/chain-monitor';
 import { ElectrumBackend } from '../chain/electrum-backend';
@@ -317,6 +318,7 @@ bitcoin.initEccLib(ecc);
  * - 'peer:disconnect' (pubkey: string)
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
+ * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction) — an on-chain claim was declined because it cannot pay its own fee
  */
 
 /**
@@ -1922,14 +1924,12 @@ export class LightningNode extends EventEmitter {
 								satPerVbyteToSatPerKw(satPerVbyte),
 								MIN_FEERATE_PER_KW
 							);
-							for (const { channelId: monitorChannelId } of monitors) {
-								const m = this.channelManager.getMonitor(
-									Buffer.from(monitorChannelId, 'hex')
-								);
-								if (m && typeof m.updateFeeRate === 'function') {
-									m.updateFeeRate(feeratePerKw);
-								}
-							}
+							this.channelManager.updateMonitorFeeRates(
+								feeratePerKw,
+								monitors.map(
+									({ channelId: monitorChannelId }) => monitorChannelId
+								)
+							);
 						}
 						// Re-arm even on a <=0 sample.
 						rearmAllCommitmentCpfp();
@@ -3331,6 +3331,25 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on('broadcast:tx', (tx: Buffer) => {
 			this.emit('broadcast:tx', tx);
 		});
+
+		// A claim declined because it cannot pay its own fee. Surfaced as a log and
+		// an event so an operator can see that funds were left on the table, and
+		// (at 'abandoned') that the deadline bounding the claim has passed.
+		this.channelManager.on(
+			'sweep:uneconomic',
+			(channelId: Buffer, action: ISweepUneconomicChainAction) => {
+				this.emitStructuredLog('chain', `sweep_${action.reason}`, {
+					channelId: channelId.toString('hex'),
+					txid: action.txid,
+					outputIndex: action.outputIndex,
+					outputType: action.outputType,
+					amountSats: action.amount.toString(),
+					feeRatePerVbyte: action.feeRatePerVbyte,
+					deadlineHeight: action.deadlineHeight
+				});
+				this.emit('sweep:uneconomic', channelId, action);
+			}
+		);
 	}
 
 	/**
@@ -13697,9 +13716,7 @@ export class LightningNode extends EventEmitter {
 				if (satPerVbyte > 0) {
 					this.feeAdvisor.recordSample(satPerVbyte);
 					// updateFeeRate expects sat/kw: 1 sat/vB = 250 sat/kw.
-					for (const monitor of this.channelManager.getMonitors().values()) {
-						monitor.updateFeeRate(satPerVbyte * 250);
-					}
+					this.channelManager.updateMonitorFeeRates(satPerVbyte * 250);
 				}
 			})
 			.catch(() => {

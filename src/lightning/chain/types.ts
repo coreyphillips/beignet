@@ -74,6 +74,20 @@ export interface ITrackedOutput {
 	 */
 	maturityHeight?: number;
 	/**
+	 * Height at which this output was FIRST observed to be unclaimable at the
+	 * prevailing feerate (its sweep would not cover its own fee, or would leave
+	 * only dust). Retained so the skip is visible to an operator and so the
+	 * "declined" notification fires once rather than on every retry.
+	 */
+	uneconomicSinceHeight?: number;
+	/**
+	 * Height at which retries for this output stopped: the deadline that bounds
+	 * the claim (the cheater's to_self_delay, or an HTLC's cltv_expiry) passed
+	 * while it was still unaffordable. Set once, and only for outputs that never
+	 * produced a sweep.
+	 */
+	uneconomicAbandonedHeight?: number;
+	/**
 	 * True when this TO_LOCAL output is the CSV-delayed output of OUR own
 	 * second-level HTLC-success/timeout tx (tracked by resolveSecondLevelHtlcOutput),
 	 * NOT a commitment to_local. On a taproot channel the two use DIFFERENT script
@@ -98,6 +112,15 @@ export interface ICommitmentBroadcast {
 	 * full tx to read output values). Only set for revoked-commitment broadcasts.
 	 */
 	revokedTxHex?: string;
+	/**
+	 * Output indices of this commitment that one of our broadcast claims already
+	 * spends. A penalty batch can also spend settled-HTLC outputs reconstructed
+	 * from revokedHtlcSnapshots, which never become tracked outputs, so the
+	 * tracked set alone cannot answer "is this outpoint already claimed". Read
+	 * when retrying a skipped claim, to keep the retry from building a
+	 * transaction that conflicts with a live claim of our own.
+	 */
+	claimedOutputIndices?: number[];
 }
 
 /** Chain action types returned by ChainMonitor */
@@ -110,6 +133,7 @@ export enum ChainActionType {
 	CHANNEL_FULLY_RESOLVED = 'CHAIN_CHANNEL_FULLY_RESOLVED',
 	PREIMAGE_LEARNED = 'CHAIN_PREIMAGE_LEARNED',
 	REBUILD_SWEEP = 'CHAIN_REBUILD_SWEEP',
+	SWEEP_UNECONOMIC = 'CHAIN_SWEEP_UNECONOMIC',
 	ERROR = 'CHAIN_ERROR'
 }
 
@@ -203,6 +227,29 @@ export interface IRebuildSweepChainAction {
 	feeRatePerVbyte: number;
 }
 
+/**
+ * A claim we declined to build because it cannot pay its own fee. Without this
+ * the skip is silent, and an operator has no way to know a claim was declined
+ * (or, at `abandoned`, that it will not be attempted again).
+ *
+ * - `skipped`: the first block at which the output was found unaffordable. It
+ *   stays under retry while its outpoint is unspent and its deadline is ahead.
+ * - `abandoned`: the deadline passed with the output still unswept, so retries
+ *   for it have stopped.
+ */
+export interface ISweepUneconomicChainAction {
+	type: ChainActionType.SWEEP_UNECONOMIC;
+	reason: 'skipped' | 'abandoned';
+	txid: string;
+	outputIndex: number;
+	outputType: OutputType;
+	amount: bigint;
+	/** Feerate (sat/vByte) at which the claim was last declined. */
+	feeRatePerVbyte: number;
+	/** Last height at which the claim can still be attempted, if bounded. */
+	deadlineHeight?: number;
+}
+
 export interface IChainErrorAction {
 	type: ChainActionType.ERROR;
 	message: string;
@@ -217,6 +264,7 @@ export type ChainAction =
 	| IChannelFullyResolvedChainAction
 	| IPreimageLearnedChainAction
 	| IRebuildSweepChainAction
+	| ISweepUneconomicChainAction
 	| IChainErrorAction;
 
 /** Monitor lifecycle state */

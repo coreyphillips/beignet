@@ -2036,6 +2036,32 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Feed a fresh fee estimate to chain monitors and act on what it unblocks.
+	 *
+	 * updateFeeRate is not purely a setter: a breach claim declined as uneconomic
+	 * at a spiked feerate becomes affordable when the spike passes, and it is
+	 * retried right here rather than waiting for the next block. Looping monitors
+	 * without routing the returned actions would build those sweeps and never
+	 * broadcast them.
+	 *
+	 * @param feeRatePerKw Fee rate in sat/kw.
+	 * @param channelIds Channel id hexes to update; every monitor when omitted.
+	 */
+	updateMonitorFeeRates(feeRatePerKw: number, channelIds?: string[]): void {
+		const targets = channelIds ?? [...this.monitors.keys()];
+		for (const channelIdHex of targets) {
+			const monitor = this.monitors.get(channelIdHex);
+			// Restored/injected monitors are not guaranteed to implement it.
+			if (!monitor || typeof monitor.updateFeeRate !== 'function') continue;
+			const actions = monitor.updateFeeRate(feeRatePerKw) ?? [];
+			if (actions.length === 0) continue;
+			this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+			// A retry that produced a sweep changed persisted monitor state.
+			this.emit('monitor:updated', channelIdHex, monitor);
+		}
+	}
+
+	/**
 	 * Mark a closing channel as fully resolved on-chain (all tracked outputs of
 	 * the close irrevocably swept/claimed) by transitioning it to CLOSED.
 	 *
@@ -6361,6 +6387,12 @@ export class ChannelManager extends EventEmitter {
 					}
 					break;
 				}
+				case ChainActionType.SWEEP_UNECONOMIC:
+					// A claim we declined because it cannot pay its own fee. Surfaced
+					// so an operator can see the decline (and, at 'abandoned', that it
+					// will not be retried again) instead of it passing silently.
+					this.emit('sweep:uneconomic', channelId, action);
+					break;
 				case ChainActionType.ERROR:
 					this.emit('error', channelId, action.message);
 					break;

@@ -272,11 +272,20 @@ export class ChainMonitor {
 
 	/**
 	 * Update the fee rate used for sweep transactions.
+	 *
+	 * Returns any actions the new rate makes possible: a claim declined as
+	 * uneconomic is retried as soon as the estimate that priced it out falls,
+	 * rather than waiting for the next block. Callers that only want to set the
+	 * rate can ignore the return value.
+	 *
 	 * @param feeRatePerKw Fee rate in sat/kw — converted to sat/vbyte internally.
 	 */
-	updateFeeRate(feeRatePerKw: number): void {
+	updateFeeRate(feeRatePerKw: number): ChainAction[] {
 		// Convert sat/kw to sat/vbyte: 1 kw = 4 kvb, so sat/vbyte = sat/kw * 4 / 1000
 		this._feeRatePerVbyte = Math.max(1, Math.round((feeRatePerKw * 4) / 1000));
+		const actions: ChainAction[] = [];
+		this._retryUnsweptRevokedSweeps(actions);
+		return actions;
 	}
 
 	getFullState(): IChainMonitorState {
@@ -629,6 +638,12 @@ export class ChainMonitor {
 				}
 			}
 		}
+
+		// Retry revoked-commitment claims that were declined as uneconomic. The
+		// loops above only ever rebuild a sweep that already reached
+		// SPEND_BROADCAST, so without this a claim skipped during a fee spike is
+		// never revisited even after the spike passes.
+		this._retryUnsweptRevokedSweeps(actions);
 
 		// Check if all outputs are irrevocably resolved
 		if (allResolved && this._trackedOutputs.length > 0) {
@@ -1503,28 +1518,232 @@ export class ChainMonitor {
 			this._currentBlockHeight
 		);
 
-		// A batched penalty produces one resolved entry PER INPUT sharing the
-		// same tx; broadcast each distinct tx once (the deadline split can also
-		// yield several distinct txs here).
-		const broadcastTxids = new Set<string>();
-		for (const r of resolved) {
-			if (r.spendTx) {
-				const txBuf = r.spendTx.toBuffer();
-				if (!broadcastTxids.has(r.spendTx.getId())) {
-					broadcastTxids.add(r.spendTx.getId());
-					actions.push({
-						type: ChainActionType.BROADCAST_TX,
-						tx: txBuf,
-						description: 'penalty sweep (revoked commitment)'
-					});
-				}
-				r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
-				r.trackedOutput.broadcastHeight = this._currentBlockHeight;
-				r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
-				r.trackedOutput.sweepTxHex = txBuf.toString('hex');
-			}
-		}
+		this._recordPenaltyBroadcasts(
+			actions,
+			resolved,
+			'penalty sweep (revoked commitment)'
+		);
 
 		return actions;
+	}
+
+	/**
+	 * Broadcast the spends a revoked-commitment resolution produced and record
+	 * each against its output. A batched penalty produces one resolved entry PER
+	 * INPUT sharing the same tx, and the deadline split can yield several distinct
+	 * txs, so each distinct tx is broadcast exactly once.
+	 */
+	private _recordPenaltyBroadcasts(
+		actions: ChainAction[],
+		resolved: ReturnType<typeof resolveRevokedCommitmentOutputs>,
+		description: string
+	): void {
+		const broadcastTxids = new Set<string>();
+		for (const r of resolved) {
+			if (!r.spendTx) continue;
+			// Penalty txs come back with every input's witness already attached; a
+			// to_remote claim (our own balance on their revoked commitment) comes
+			// back with its witness alongside the tx instead, and broadcasting it
+			// unsigned strands the balance. Attach it ONLY while input 0 is still
+			// unsigned, so a batched penalty — one entry per input, each carrying
+			// ITS OWN witness — never has input 0 overwritten.
+			if (r.witness && r.spendTx.ins[0]?.witness.length === 0) {
+				r.spendTx.setWitness(0, r.witness);
+			}
+			const txBuf = r.spendTx.toBuffer();
+			if (!broadcastTxids.has(r.spendTx.getId())) {
+				broadcastTxids.add(r.spendTx.getId());
+				this._recordClaimedOutpoints(r.spendTx);
+				actions.push({
+					type: ChainActionType.BROADCAST_TX,
+					tx: txBuf,
+					description
+				});
+			}
+			r.trackedOutput.status = OutputStatus.SPEND_BROADCAST;
+			r.trackedOutput.broadcastHeight = this._currentBlockHeight;
+			r.trackedOutput.originalFeeRate = this._feeRatePerVbyte;
+			r.trackedOutput.sweepTxHex = txBuf.toString('hex');
+		}
+	}
+
+	/**
+	 * Last height at which a revoked-commitment claim is still worth attempting:
+	 *
+	 * - their to_local — the cheater cannot touch it until the to_self_delay WE
+	 *   demanded of them matures, counted from the commitment's confirmation.
+	 * - an HTLC output — contested by the cheater's pre-signed HTLC-timeout at
+	 *   cltv_expiry. An HTLC they can instead claim with a preimage carries no
+	 *   such bound, but that spend ends the retry through handleOutputSpent.
+	 * - our to_remote — our own balance, which nobody else can spend, so there is
+	 *   no deadline at which giving up would make sense.
+	 */
+	private _revokedClaimDeadline(output: ITrackedOutput): number | undefined {
+		const toSelfDelay = this._channelState.localConfig.toSelfDelay;
+		switch (output.outputType) {
+			case OutputType.TO_REMOTE:
+				return undefined;
+			case OutputType.TO_LOCAL:
+				return output.confirmationHeight + toSelfDelay;
+			default:
+				return output.cltvExpiry ?? output.confirmationHeight + toSelfDelay;
+		}
+	}
+
+	/**
+	 * Record which of the commitment's outputs a claim we are broadcasting spends,
+	 * reading the transaction's own inputs. A batched penalty can also spend
+	 * settled-HTLC outputs reconstructed from revokedHtlcSnapshots, which never
+	 * become tracked outputs, so the tracked set alone cannot answer the question
+	 * this set exists to answer.
+	 */
+	private _recordClaimedOutpoints(spendTx: bitcoin.Transaction): void {
+		const broadcast = this._commitmentBroadcast;
+		if (!broadcast) return;
+		const claimed = new Set<number>(broadcast.claimedOutputIndices ?? []);
+		for (const input of spendTx.ins) {
+			// Transaction inputs hold the txid in internal byte order.
+			const spentTxid = Buffer.from(input.hash).reverse().toString('hex');
+			if (spentTxid === broadcast.txid) claimed.add(input.index);
+		}
+		broadcast.claimedOutputIndices = [...claimed];
+	}
+
+	/**
+	 * Output indices of the revoked commitment that one of our claims already
+	 * spends: what _recordClaimedOutpoints has seen, plus the inputs of every
+	 * sweep still stored against a tracked output. The second half covers monitors
+	 * restored from state persisted before the recorded set existed.
+	 */
+	private _claimedRevokedOutputIndices(commitmentTxid: string): Set<number> {
+		const claimed = new Set<number>(
+			this._commitmentBroadcast?.claimedOutputIndices ?? []
+		);
+		for (const output of this._trackedOutputs) {
+			if (!output.sweepTxHex) continue;
+			try {
+				const sweep = bitcoin.Transaction.fromHex(output.sweepTxHex);
+				for (const input of sweep.ins) {
+					const spentTxid = Buffer.from(input.hash).reverse().toString('hex');
+					if (spentTxid === commitmentTxid) claimed.add(input.index);
+				}
+			} catch {
+				// An undecodable sweep cannot say which outpoints it spends; fall
+				// back to the one it is recorded against.
+				claimed.add(output.outputIndex);
+			}
+		}
+		return claimed;
+	}
+
+	private _uneconomicAction(
+		output: ITrackedOutput,
+		reason: 'skipped' | 'abandoned',
+		deadlineHeight: number | undefined
+	): ChainAction {
+		return {
+			type: ChainActionType.SWEEP_UNECONOMIC,
+			reason,
+			txid: output.txid,
+			outputIndex: output.outputIndex,
+			outputType: output.outputType,
+			amount: output.amount,
+			feeRatePerVbyte: this._feeRatePerVbyte,
+			deadlineHeight
+		};
+	}
+
+	/**
+	 * Re-resolve revoked-commitment outputs that produced no spend, at the CURRENT
+	 * feerate.
+	 *
+	 * A claim that cannot pay its own fee is skipped rather than built (#241), and
+	 * nothing else revisits it: the rebroadcast/RBF loops only rebuild sweeps that
+	 * already reached SPEND_BROADCAST, and an output with no sweepTxHex is not in
+	 * that set. Fee spikes are transient and a breach remedy is not, so a skipped
+	 * claim is retried while its outpoint is unspent and its deadline is ahead,
+	 * then abandoned rather than retried forever.
+	 *
+	 * Runs on every new block and whenever a fresh fee estimate arrives.
+	 */
+	private _retryUnsweptRevokedSweeps(actions: ChainAction[]): void {
+		const broadcast = this._commitmentBroadcast;
+		if (
+			!broadcast ||
+			broadcast.commitmentType !== CommitmentType.THEIR_REVOKED_COMMITMENT ||
+			!broadcast.revokedTxHex
+		) {
+			return;
+		}
+
+		const height = this._currentBlockHeight;
+		const retryable: ITrackedOutput[] = [];
+		for (const output of this._trackedOutputs) {
+			// A spend by either side moves the output off CONFIRMED
+			// (handleOutputSpent), so "outpoint still unspent" needs no separate
+			// bookkeeping. Second-level justice claims spend the cheater's HTLC tx
+			// rather than this commitment and are re-resolved through rebuildSweep.
+			if (
+				output.status !== OutputStatus.CONFIRMED ||
+				output.sweepTxHex !== undefined ||
+				output.isSecondLevelHtlc ||
+				output.txid !== broadcast.txid
+			) {
+				continue;
+			}
+			const deadline = this._revokedClaimDeadline(output);
+			if (deadline !== undefined && height > deadline) {
+				if (output.uneconomicAbandonedHeight === undefined) {
+					output.uneconomicAbandonedHeight = height;
+					actions.push(this._uneconomicAction(output, 'abandoned', deadline));
+				}
+				continue;
+			}
+			retryable.push(output);
+		}
+		if (retryable.length === 0) return;
+
+		let resolved: ReturnType<typeof resolveRevokedCommitmentOutputs> = [];
+		try {
+			resolved = resolveRevokedCommitmentOutputs(
+				this._channelState,
+				retryable,
+				broadcast.commitmentNumber,
+				bitcoin.Transaction.fromHex(broadcast.revokedTxHex),
+				this._destinationScript,
+				this._feeRatePerVbyte,
+				this._revocationBasepointSecret,
+				this._paymentPrivkey,
+				this._network,
+				height,
+				// Never re-batch an outpoint one of our live sweeps already spends:
+				// the replacement would conflict with our own penalty.
+				this._claimedRevokedOutputIndices(broadcast.txid)
+			);
+		} catch {
+			// A retry must never break block processing; the next one tries again.
+			return;
+		}
+
+		this._recordPenaltyBroadcasts(
+			actions,
+			resolved,
+			'penalty sweep (revoked commitment, retried after skip)'
+		);
+
+		// Whatever still has no sweep is uneconomic at this feerate. Report it
+		// once, not on every retry — the skip is otherwise entirely silent.
+		for (const output of retryable) {
+			if (output.sweepTxHex !== undefined) continue;
+			if (output.uneconomicSinceHeight !== undefined) continue;
+			output.uneconomicSinceHeight = height;
+			actions.push(
+				this._uneconomicAction(
+					output,
+					'skipped',
+					this._revokedClaimDeadline(output)
+				)
+			);
+		}
 	}
 }

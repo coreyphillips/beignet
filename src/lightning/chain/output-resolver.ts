@@ -2118,6 +2118,19 @@ export function resolveTheirCurrentCommitmentOutputs(
 			// This is our balance on their commitment — claim it with our payment key.
 			const paymentPubkey = state.localBasepoints.paymentBasepoint;
 
+			// Both builders below throw when the fee exceeds the output (the guards
+			// inside buildToLocalSweepTx / buildToRemoteClaimTx), and this loop runs
+			// over every output of one commitment — so an uneconomic to_remote used
+			// to abandon the HTLC claims that follow it. Decide affordability here
+			// instead, the way #241 did for the penalty batch, and track the output
+			// without a spend so the retry can claim it once fees fall.
+			if (
+				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
+			) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
+
 			if (output.witnessScript) {
 				// Anchor channel: to_remote is a P2WSH with a 1-block CSV. Spend via
 				// the script path with nSequence=1 instead of the legacy P2WPKH path.
@@ -2314,6 +2327,16 @@ export function resolveTheirCurrentCommitmentOutputs(
  */
 export const PENALTY_SPLIT_DEADLINE_BLOCKS = 18;
 
+/**
+ * Output indices of the revoked commitment that already have a live claim of
+ * ours. A retry resolves only the outputs left unclaimed, so without this the
+ * settled-HTLC rescan below (which reads the snapshot, not the tracked set)
+ * would pull an already-claimed outpoint back into the new batch and build a
+ * transaction conflicting with our own live penalty — one that, paying a higher
+ * absolute fee, would REPLACE the batch holding their to_local.
+ */
+export type ClaimedOutputIndices = ReadonlySet<number>;
+
 export function resolveRevokedCommitmentOutputs(
 	state: IChannelState,
 	trackedOutputs: ITrackedOutput[],
@@ -2324,7 +2347,8 @@ export function resolveRevokedCommitmentOutputs(
 	revocationBasepointSecret: Buffer,
 	paymentPrivkey: Buffer,
 	network: bitcoin.Network = bitcoin.networks.bitcoin,
-	currentHeight?: number
+	currentHeight?: number,
+	claimedOutputIndices?: ClaimedOutputIndices
 ): IResolvedOutput[] {
 	if (!state.remoteBasepoints) return [];
 
@@ -2339,9 +2363,12 @@ export function resolveRevokedCommitmentOutputs(
 			revocationBasepointSecret,
 			paymentPrivkey,
 			network,
-			currentHeight
+			currentHeight,
+			claimedOutputIndices
 		);
 	}
+
+	const alreadyClaimed = claimedOutputIndices ?? new Set<number>();
 
 	// Get the per-commitment secret for the revoked commitment
 	const secretIndex = MAX_INDEX - commitmentNumber;
@@ -2368,6 +2395,7 @@ export function resolveRevokedCommitmentOutputs(
 	const htlcDeadlines = new Map<number, number>();
 
 	for (const output of trackedOutputs) {
+		if (alreadyClaimed.has(output.outputIndex)) continue;
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
 			claimableIndices.push(output.outputIndex);
 			witnessScripts.set(output.outputIndex, output.witnessScript);
@@ -2402,6 +2430,18 @@ export function resolveRevokedCommitmentOutputs(
 						)
 				)
 			);
+			// Both builders below throw when the fee exceeds the output, and this
+			// runs BEFORE the penalty batch is built — so an uneconomic to_remote
+			// (dust-sized balance against a spiked feerate) used to abandon the
+			// whole breach remedy, their to_local included. Same guard and same
+			// reasoning as #241, which fixed it for the batch itself. The taproot
+			// revoked path already skips here; this brings witness-v0 in line.
+			if (
+				sweepOutputValue(output.amount, feeSatoshis, destinationScript) === null
+			) {
+				resolved.push({ trackedOutput: output });
+				continue;
+			}
 			if (output.witnessScript) {
 				// Anchor channel: P2WSH with a 1-block CSV — spend via script path.
 				const claimTx = buildToLocalSweepTx({
@@ -2499,6 +2539,7 @@ export function resolveRevokedCommitmentOutputs(
 			for (let i = 0; i < revokedTx.outs.length; i++) {
 				if (
 					!claimableIndices.includes(i) &&
+					!alreadyClaimed.has(i) &&
 					revokedTx.outs[i].script.equals(p2wsh.output)
 				) {
 					claimableIndices.push(i);
@@ -2640,9 +2681,11 @@ function resolveRevokedTaprootCommitmentOutputs(
 	revocationBasepointSecret: Buffer,
 	paymentPrivkey: Buffer,
 	network: bitcoin.Network,
-	currentHeight?: number
+	currentHeight?: number,
+	claimedOutputIndices?: ClaimedOutputIndices
 ): IResolvedOutput[] {
 	if (!state.remoteBasepoints) return [];
+	const alreadyClaimed = claimedOutputIndices ?? new Set<number>();
 	const perCommitmentSecret = state.shaChainStore.getSecret(
 		MAX_INDEX - commitmentNumber
 	);
@@ -2668,6 +2711,7 @@ function resolveRevokedTaprootCommitmentOutputs(
 	const penaltyIns: IPenaltyIn[] = [];
 
 	for (const o of trackedOutputs) {
+		if (alreadyClaimed.has(o.outputIndex)) continue;
 		if (o.outputType === OutputType.TO_LOCAL) {
 			const tl = buildTaprootToLocalOutput(
 				keys.revocationPubkey,
@@ -2759,7 +2803,10 @@ function resolveRevokedTaprootCommitmentOutputs(
 	// revocation-key-path (merkleRoot) breach spend.
 	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
 	if (snapshot && snapshot.length > 0) {
-		const handled = new Set<number>(trackedOutputs.map((o) => o.outputIndex));
+		const handled = new Set<number>([
+			...trackedOutputs.map((o) => o.outputIndex),
+			...alreadyClaimed
+		]);
 		for (const entry of snapshot) {
 			// outputType/direction reflect OUR perspective; on THEIR commitment our
 			// received HTLC is their offered output and vice-versa (the same swap the
