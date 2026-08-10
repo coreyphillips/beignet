@@ -103,7 +103,11 @@ import {
 	createAcceptorState,
 	IChannelState
 } from './channel-state';
-import { isValidShutdownScript } from './validation';
+import {
+	deriveChannelId,
+	deriveV2TemporaryChannelId,
+	isValidShutdownScript
+} from './validation';
 import {
 	IChannelConfig,
 	DEFAULT_CHANNEL_CONFIG,
@@ -182,6 +186,18 @@ interface IHeldBatch {
 	requiresDurability: boolean;
 	/** Outbox rows to mark sent once the bytes actually leave. */
 	outboxIds: Array<number | null>;
+}
+
+/** Observable progress through one synchronous action dispatch. */
+interface IActionDispatchProgress {
+	/** Action currently being attempted, or -1 before dispatch starts. */
+	index: number;
+	/** Last action that returned normally, or -1 when none completed. */
+	completedIndex: number;
+	/** Wire message types whose transport call was attempted. */
+	attemptedMessageTypes: Set<number>;
+	/** A failed persist withheld one or more wire effects. */
+	sendsWithheld: boolean;
 }
 
 /** Why a new channel is refused once the recovery namespace is finished. */
@@ -310,6 +326,8 @@ export class ChannelManager extends EventEmitter {
 	private channels: Map<string, Channel> = new Map();
 	private tempChannels: Map<string, Channel> = new Map();
 	private channelPeers: Map<string, string> = new Map();
+	/** Synchronous funding promotions reserved across reentrant observers. */
+	private channelIdReservations: Map<string, Channel> = new Map();
 	/**
 	 * Channels restored from persistence in THIS process whose node-level
 	 * repair pass has not run yet (see 'channel:restore-ready'). Emptied one
@@ -743,7 +761,17 @@ export class ChannelManager extends EventEmitter {
 		if (channel.getChannelId()) return;
 		const peerPubkey = this.channelPeers.get(tempId);
 		channel.markErrored();
-		if (peerPubkey) {
+		if (!peerPubkey) {
+			if (
+				this.tempChannels.get(tempId) === channel &&
+				!this.channelPeers.has(tempId)
+			) {
+				this.tempChannels.delete(tempId);
+				this.emitContained('channel:aborted', tempIdBuf, reason);
+			}
+			return;
+		}
+		try {
 			this.sendMessage(
 				peerPubkey,
 				MessageType.ERROR,
@@ -752,10 +780,11 @@ export class ChannelManager extends EventEmitter {
 					data: Buffer.from(reason, 'utf8')
 				})
 			);
+		} finally {
+			if (this.removeCurrentTempChannel(peerPubkey, channel)) {
+				this.emitContained('channel:aborted', tempIdBuf, reason);
+			}
 		}
-		this.tempChannels.delete(tempId);
-		this.channelPeers.delete(tempId);
-		this.emit('channel:aborted', tempIdBuf, reason);
 	}
 
 	/**
@@ -770,6 +799,20 @@ export class ChannelManager extends EventEmitter {
 	): Buffer | null {
 		const peerPubkey = this.findPeerForChannel(channel);
 		if (!peerPubkey) return null;
+		const proposedChannelId = deriveChannelId(fundingTxid, fundingOutputIndex);
+		if (
+			!this.channelIdAvailableForLifecycle(
+				proposedChannelId.toString('hex'),
+				peerPubkey,
+				channel
+			)
+		) {
+			this.abortPendingOpen(
+				channel,
+				'Cannot create funding: channel_id is already in use'
+			);
+			return null;
+		}
 
 		// Sign the acceptor's initial commitment ourselves rather than trusting a
 		// caller-supplied signature. The acceptor now verifies this signature in
@@ -808,20 +851,37 @@ export class ChannelManager extends EventEmitter {
 			initialSignature,
 			partialSignatureWithNonce
 		);
-		this.processActions(peerPubkey, channel, actions);
-
-		// Move from temp to permanent map
 		const channelId = channel.getChannelId();
-		if (channelId) {
-			const permId = channelId.toString('hex');
-			this.channels.set(permId, channel);
-			this.channelPeers.set(permId, peerPubkey);
-			// Clean up temp entry
-			const tempId = channel.getTemporaryChannelId().toString('hex');
-			this.tempChannels.delete(tempId);
-		}
+		const hasError = actions.some(
+			(action) => action.type === ChannelActionType.ERROR
+		);
+		const reservedId =
+			channelId && !hasError ? channelId.toString('hex') : null;
+		if (reservedId) this.channelIdReservations.set(reservedId, channel);
+		try {
+			this.processActions(peerPubkey, channel, actions);
+			if (
+				channelId &&
+				!hasError &&
+				!this.promoteChannelLifecycle(peerPubkey, channel)
+			) {
+				this.emitContained(
+					'error',
+					channelId,
+					'Cannot promote funding: channel_id is already in use'
+				);
+				return null;
+			}
 
-		return channelId;
+			return channelId;
+		} finally {
+			if (
+				reservedId &&
+				this.channelIdReservations.get(reservedId) === channel
+			) {
+				this.channelIdReservations.delete(reservedId);
+			}
+		}
 	}
 
 	/**
@@ -1989,28 +2049,26 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
-	 * Established-channel messages that lead with a 32-byte channel_id and are
-	 * only ever valid from the peer that owns that channel. Dispatching one from
+	 * Channel-scoped messages that lead with a 32-byte channel_id and are only
+	 * ever valid from the peer that owns that lifecycle. Dispatching one from
 	 * any other peer must be refused BEFORE it reaches the channel state machine:
 	 * several of these can drive the machine to emit a BOLT 1 error (a bad
 	 * commitment signature, a reestablish with next_commitment_number 0), which
 	 * now force-closes the channel. Resolving the channel globally by id would
 	 * let peer X close peer Y's channel with a single forged message.
 	 *
-	 * The interactive-tx family is included because beignet reuses it for
-	 * SPLICING on existing permanent channels: their handlers search the
-	 * permanent `channels` map first, so a foreign tx_abort could cancel, and a
-	 * foreign tx_add_input could mutate, another peer's live splice. The guard
-	 * only refuses ids that resolve to a permanent channel owned by someone
-	 * else, so a v2 open still negotiating in `tempChannels` is untouched (its
-	 * id is not in `channels`) and reaches its existing handler unchanged.
+	 * The resolver covers permanent channels, direct temporary ids and derived
+	 * v2 ids that still live in tempChannels. This protects both interactive v2
+	 * opens and the same message family when it is reused for a live splice.
 	 *
 	 * ERROR/WARNING are excluded, since handleErrorMsg has its own BOLT 1
-	 * ownership and all-channels handling. OPEN_CHANNEL(2) and ACCEPT_CHANNEL
-	 * do not lead with a permanent channel_id, so they are omitted.
+	 * ownership and all-channels handling. OPEN_CHANNEL and OPEN_CHANNEL2 create
+	 * new lifecycles, while ACCEPT_CHANNEL2 has its own exact owner check.
 	 */
 	private static readonly OWNED_CHANNEL_MESSAGES: ReadonlySet<number> =
 		new Set<number>([
+			MessageType.ACCEPT_CHANNEL,
+			MessageType.FUNDING_CREATED,
 			MessageType.FUNDING_SIGNED,
 			MessageType.CHANNEL_READY,
 			MessageType.UPDATE_ADD_HTLC,
@@ -2032,8 +2090,8 @@ export class ChannelManager extends EventEmitter {
 			MessageType.SPLICE_LOCKED,
 			MessageType.START_BATCH,
 			MessageType.ANNOUNCEMENT_SIGNATURES,
-			// Interactive-tx: dual-use for v2 opens (temp channels, not matched
-			// here) and splices (permanent channels, matched and guarded).
+			// Interactive-tx is shared by temporary v2 opens and permanent
+			// splices. The resolver below guards every supported id shape.
 			MessageType.TX_ADD_INPUT,
 			MessageType.TX_ADD_OUTPUT,
 			MessageType.TX_REMOVE_INPUT,
@@ -2046,11 +2104,11 @@ export class ChannelManager extends EventEmitter {
 		]);
 
 	/**
-	 * Refuse an established-channel message that names a channel the sending
-	 * peer does not own. Only fires when the channel_id resolves to a permanent
-	 * channel bound to a DIFFERENT peer; unknown ids (temp/interactive opens,
-	 * post-splice ids not yet promoted) fall through to the handler, which does
-	 * its own resolution. Returns true when the message should be dropped.
+	 * Refuse a channel message that names a channel the sending peer does not
+	 * own. Resolve the same permanent, derived and temporary id shapes used by
+	 * the handlers so an interactive open is protected before promotion too.
+	 * Unknown ids fall through to the handler. Returns true when the message
+	 * should be dropped.
 	 */
 	private isForeignChannelMessage(
 		peerPubkey: string,
@@ -2059,9 +2117,13 @@ export class ChannelManager extends EventEmitter {
 	): boolean {
 		if (!ChannelManager.OWNED_CHANNEL_MESSAGES.has(type)) return false;
 		if (payload.length < 32) return false;
-		const idHex = payload.subarray(0, 32).toString('hex');
-		if (!this.channels.has(idHex)) return false;
-		const owner = this.channelPeers.get(idHex);
+		const channelId = payload.subarray(0, 32);
+		const channel =
+			this.findChannelByChannelId(channelId) ||
+			this.findChannelByChannelIdInTemp(channelId) ||
+			this.findTempChannel(channelId);
+		if (!channel) return false;
+		const owner = this.findPeerForChannel(channel);
 		return owner !== undefined && owner !== peerPubkey;
 	}
 
@@ -2219,15 +2281,28 @@ export class ChannelManager extends EventEmitter {
 			msg.chainHash &&
 			!msg.chainHash.equals(this.config.chainHash)
 		) {
-			this.emit(
-				'error',
+			this.refuseInboundOpen(
+				peerPubkey,
 				msg.temporaryChannelId,
 				`open_channel for unknown chain ${msg.chainHash.toString('hex')}`
 			);
 			return;
 		}
 		if (this._namespaceCannotRecordANewChannel()) {
-			this.emit('error', msg.temporaryChannelId, NAMESPACE_LOST_REFUSAL);
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.temporaryChannelId,
+				NAMESPACE_LOST_REFUSAL
+			);
+			return;
+		}
+		const tempId = msg.temporaryChannelId.toString('hex');
+		if (this.channelIdInUse(tempId)) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.temporaryChannelId,
+				'open_channel refused: temporary_channel_id is already in use'
+			);
 			return;
 		}
 
@@ -2269,7 +2344,6 @@ export class ChannelManager extends EventEmitter {
 		}
 		channel.channelKeyIndex = chKeys.channelIndex;
 		channel.setMaxFundingSatoshis(this.maxFundingForPeer(peerPubkey));
-		const tempId = msg.temporaryChannelId.toString('hex');
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
 
@@ -2322,6 +2396,31 @@ export class ChannelManager extends EventEmitter {
 			);
 			return;
 		}
+		const permanentId = deriveChannelId(
+			msg.fundingTxid,
+			msg.fundingOutputIndex
+		);
+		if (
+			!this.channelIdAvailableForLifecycle(
+				permanentId.toString('hex'),
+				peerPubkey,
+				channel
+			)
+		) {
+			const reason = 'funding_created refused: channel_id is already in use';
+			this.processActions(peerPubkey, channel, [
+				{
+					type: ChannelActionType.SEND_MESSAGE,
+					messageType: MessageType.ERROR,
+					payload: encodeErrorMessage({
+						channelId: msg.temporaryChannelId,
+						data: Buffer.from(reason, 'utf8')
+					})
+				},
+				{ type: ChannelActionType.ERROR, message: reason }
+			]);
+			return;
+		}
 
 		// Set funding outpoint on state before signing (handleFundingCreated also sets these)
 		const channelState = channel.getFullState();
@@ -2355,13 +2454,25 @@ export class ChannelManager extends EventEmitter {
 			partialSignatureWithNonce
 		);
 
-		// Move to permanent channel ID map BEFORE processActions so that
-		// PERSIST_STATE (which uses the permanent channelId) can find the channel
-		if (channel.getChannelId()) {
-			const permId = channel.getChannelId()!.toString('hex');
-			this.channels.set(permId, channel);
-			this.channelPeers.set(permId, peerPubkey);
-			this.tempChannels.delete(msg.temporaryChannelId.toString('hex'));
+		const hasError = actions.some(
+			(action) => action.type === ChannelActionType.ERROR
+		);
+		// Successful funding_created state is persisted under its permanent id.
+		// Reserve that id before dispatch, but never promote a rejected open.
+		if (!hasError && !this.promoteChannelLifecycle(peerPubkey, channel)) {
+			const reason = 'funding_created refused: channel_id is already in use';
+			this.processActions(peerPubkey, channel, [
+				{
+					type: ChannelActionType.SEND_MESSAGE,
+					messageType: MessageType.ERROR,
+					payload: encodeErrorMessage({
+						channelId: msg.temporaryChannelId,
+						data: Buffer.from(reason, 'utf8')
+					})
+				},
+				{ type: ChannelActionType.ERROR, message: reason }
+			]);
+			return;
 		}
 
 		this.processActions(peerPubkey, channel, actions);
@@ -2382,12 +2493,24 @@ export class ChannelManager extends EventEmitter {
 				return;
 			}
 			const actions = ch.handleFundingSigned(msg);
-
-			// Move to permanent map BEFORE processActions so that
-			// PERSIST_STATE can find the channel by its permanent ID
-			const permId = msg.channelId.toString('hex');
-			this.channels.set(permId, ch);
-			this.channelPeers.set(permId, peerPubkey);
+			const hasError = actions.some(
+				(action) => action.type === ChannelActionType.ERROR
+			);
+			if (!hasError && !this.promoteChannelLifecycle(peerPubkey, ch)) {
+				const reason = 'funding_signed refused: channel_id is already in use';
+				this.processActions(peerPubkey, ch, [
+					{
+						type: ChannelActionType.SEND_MESSAGE,
+						messageType: MessageType.ERROR,
+						payload: encodeErrorMessage({
+							channelId: msg.channelId,
+							data: Buffer.from(reason, 'utf8')
+						})
+					},
+					{ type: ChannelActionType.ERROR, message: reason }
+				]);
+				return;
+			}
 
 			this.processActions(peerPubkey, ch, actions);
 
@@ -4120,12 +4243,40 @@ export class ChannelManager extends EventEmitter {
 		// would not route back to this channel.
 		const actions = channel.initiateOpenV2(alignedParams);
 		const tempId = channel.getTemporaryChannelId().toString('hex');
+		if (this.channelIdInUse(tempId)) {
+			throw new Error(
+				'Cannot open a dual-funded (v2) channel: temporary channel_id is already in use'
+			);
+		}
 		this.tempChannels.set(tempId, channel);
 		this.channelPeers.set(tempId, peerPubkey);
 		this.processActions(peerPubkey, channel, actions);
 
 		this.emit('channel:opened', channel.getTemporaryChannelId());
 		return channel;
+	}
+
+	/** Refuse an inbound open before any channel state is retained. */
+	private refuseInboundOpen(
+		peerPubkey: string,
+		channelId: Buffer,
+		reason: string
+	): void {
+		try {
+			this.sendMessage(
+				peerPubkey,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			);
+		} catch {
+			// The wire attempt already happened. Keep the local refusal diagnostic
+			// singular even when a synchronous outbound observer throws.
+		} finally {
+			this.emitContained('error', channelId, reason);
+		}
 	}
 
 	private handleOpenChannel2(peerPubkey: string, payload: Buffer): void {
@@ -4154,15 +4305,30 @@ export class ChannelManager extends EventEmitter {
 			const reason = localLacks
 				? 'open_channel2 refused: this node does not advertise option_dual_fund'
 				: 'open_channel2 refused: the peer did not advertise option_dual_fund';
-			this.sendMessage(
+			this.refuseInboundOpen(peerPubkey, msg.channelId, reason);
+			return;
+		}
+
+		const expectedTempId = deriveV2TemporaryChannelId(msg.revocationBasepoint);
+		if (!msg.channelId.equals(expectedTempId)) {
+			this.refuseInboundOpen(
 				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(reason, 'utf8')
-				})
+				msg.channelId,
+				'open_channel2 refused: channel_id does not match the opener revocation basepoint'
 			);
-			this.emit('error', msg.channelId, reason);
+			return;
+		}
+		const proposedTempId = msg.channelId.toString('hex');
+		if (
+			this.tempChannels.has(proposedTempId) ||
+			this.channels.has(proposedTempId) ||
+			this.channelPeers.has(proposedTempId)
+		) {
+			this.refuseInboundOpen(
+				peerPubkey,
+				msg.channelId,
+				'open_channel2 refused: channel_id is already in use'
+			);
 			return;
 		}
 
@@ -4181,15 +4347,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		if (typeRefusal) {
 			const reason = `open_channel2 refused: ${typeRefusal}`;
-			this.sendMessage(
-				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(reason, 'utf8')
-				})
-			);
-			this.emit('error', msg.channelId, reason);
+			this.refuseInboundOpen(peerPubkey, msg.channelId, reason);
 			return;
 		}
 		// BOLT 2: scid_alias types are never announceable; an opener
@@ -4201,15 +4359,7 @@ export class ChannelManager extends EventEmitter {
 		);
 		if (aliasAnnounce) {
 			const reason = `open_channel2 refused: ${aliasAnnounce}`;
-			this.sendMessage(
-				peerPubkey,
-				MessageType.ERROR,
-				encodeErrorMessage({
-					channelId: msg.channelId,
-					data: Buffer.from(reason, 'utf8')
-				})
-			);
-			this.emit('error', msg.channelId, reason);
+			this.refuseInboundOpen(peerPubkey, msg.channelId, reason);
 			return;
 		}
 
@@ -4220,15 +4370,15 @@ export class ChannelManager extends EventEmitter {
 			msg.chainHash &&
 			!msg.chainHash.equals(this.config.chainHash)
 		) {
-			this.emit(
-				'error',
+			this.refuseInboundOpen(
+				peerPubkey,
 				msg.channelId,
 				`open_channel2 for unknown chain ${msg.chainHash.toString('hex')}`
 			);
 			return;
 		}
 		if (this._namespaceCannotRecordANewChannel()) {
-			this.emit('error', msg.channelId, NAMESPACE_LOST_REFUSAL);
+			this.refuseInboundOpen(peerPubkey, msg.channelId, NAMESPACE_LOST_REFUSAL);
 			return;
 		}
 
@@ -4343,38 +4493,67 @@ export class ChannelManager extends EventEmitter {
 			const requested = msg.requestFunds.requestedSats;
 			const fp = this.fundingProvider;
 			if (fp?.selectSpliceInputs) {
-				fp.selectSpliceInputs(requested, msg.fundingFeeratePerkw)
-					.then(({ inputs, changeScript }) => {
-						channel.setDualFundingContribution(
-							inputs,
-							changeScript,
-							requested,
-							msg.fundingFeeratePerkw
-						);
-						const actions = channel.handleOpenChannel2(msg, localParams);
-						this.processActions(peerPubkey, channel, actions);
-					})
+				const isCurrentOpen = (): boolean =>
+					this.tempChannels.get(tempId) === channel &&
+					this.channelPeers.get(tempId) === peerPubkey;
+				let selection: ReturnType<
+					NonNullable<IFundingProvider['selectSpliceInputs']>
+				>;
+				try {
+					selection = fp.selectSpliceInputs(requested, msg.fundingFeeratePerkw);
+				} catch (err) {
+					selection = Promise.reject(err);
+				}
+				void selection
+					.then(
+						({ inputs, changeScript }) => {
+							// Wallet selection can outlive a disconnect and same-id retry.
+							// A stale completion must not mutate or dispatch for its old channel.
+							if (!isCurrentOpen()) return;
+							channel.setDualFundingContribution(
+								inputs,
+								changeScript,
+								requested,
+								msg.fundingFeeratePerkw
+							);
+							const actions = channel.handleOpenChannel2(msg, localParams);
+							this.processActions(peerPubkey, channel, actions);
+						},
+						(err) => {
+							if (!isCurrentOpen()) return;
+							this.emitContained(
+								'error',
+								msg.channelId,
+								`Lease contribution not funded (${
+									(err as Error)?.message ?? err
+								}); accepting without will_fund`
+							);
+							// The diagnostic observer can synchronously disconnect and replace
+							// this open, so ownership must be checked again after it returns.
+							if (!isCurrentOpen()) return;
+							delete localParams.willFund;
+							localParams.fundingSatoshis = 0n;
+							// Withdrawn lease → plain zero-contribution accept; register
+							// the empty contribution so the drive still answers the
+							// opener's turns (see below).
+							channel.setDualFundingContribution(
+								[],
+								Buffer.alloc(0),
+								0n,
+								msg.fundingFeeratePerkw
+							);
+							const actions = channel.handleOpenChannel2(msg, localParams);
+							this.processActions(peerPubkey, channel, actions);
+						}
+					)
 					.catch((err) => {
-						this.emit(
+						// Dispatch failures are not wallet-selection failures and must not
+						// run the fallback a second time.
+						this.emitContained(
 							'error',
 							msg.channelId,
-							`Lease contribution not funded (${
-								(err as Error)?.message ?? err
-							}); accepting without will_fund`
+							`Lease open dispatch failed: ${(err as Error)?.message ?? err}`
 						);
-						delete localParams.willFund;
-						localParams.fundingSatoshis = 0n;
-						// Withdrawn lease → plain zero-contribution accept; register
-						// the empty contribution so the drive still answers the
-						// opener's turns (see below).
-						channel.setDualFundingContribution(
-							[],
-							Buffer.alloc(0),
-							0n,
-							msg.fundingFeeratePerkw
-						);
-						const actions = channel.handleOpenChannel2(msg, localParams);
-						this.processActions(peerPubkey, channel, actions);
 					});
 				return;
 			}
@@ -4403,9 +4582,18 @@ export class ChannelManager extends EventEmitter {
 
 	private handleAcceptChannel2Msg(peerPubkey: string, payload: Buffer): void {
 		const msg = decodeAcceptChannel2Message(payload);
-		const channel = this.tempChannels.get(msg.channelId.toString('hex'));
+		const tempId = msg.channelId.toString('hex');
+		const channel = this.tempChannels.get(tempId);
 		if (!channel) {
 			this.emit('error', null, 'Unknown channel_id in accept_channel2');
+			return;
+		}
+		if (this.channelPeers.get(tempId) !== peerPubkey) {
+			this.emit(
+				'error',
+				msg.channelId,
+				'Ignoring accept_channel2 from a peer that does not own the open'
+			);
 			return;
 		}
 
@@ -4414,6 +4602,14 @@ export class ChannelManager extends EventEmitter {
 		// trusting the lease. A bad signature fails the open.
 		const session = channel.getDualFundingSession();
 		const requestFunds = session?.getRequestFunds();
+		let leaseEvent:
+			| {
+					channelId: Buffer;
+					requestedSats: bigint;
+					leaseRates: ILeaseRates;
+					sellerFundingSatoshis: bigint;
+			  }
+			| undefined;
 		if (msg.willFund && requestFunds) {
 			const ok = verifyWillFund(
 				msg.willFund.signature,
@@ -4423,25 +4619,49 @@ export class ChannelManager extends EventEmitter {
 				requestFunds.blockheight
 			);
 			if (!ok) {
-				this.emit('error', msg.channelId, 'Invalid will_fund signature');
+				const reason = 'Invalid will_fund signature';
+				this.processActions(peerPubkey, channel, [
+					{
+						type: ChannelActionType.SEND_MESSAGE,
+						messageType: MessageType.ERROR,
+						payload: encodeErrorMessage({
+							channelId: msg.channelId,
+							data: Buffer.from(reason, 'utf8')
+						})
+					},
+					{ type: ChannelActionType.ERROR, message: reason }
+				]);
 				return;
 			}
-			this.emit('channel:lease', {
+			leaseEvent = {
 				channelId: msg.channelId,
 				requestedSats: requestFunds.requestedSats,
 				leaseRates: msg.willFund.leaseRates,
 				sellerFundingSatoshis: msg.fundingSatoshis
-			});
+			};
 		}
 
 		const actions = channel.handleAcceptChannel2(msg);
-		this.processActions(peerPubkey, channel, actions);
-
-		// Only emit channel:accepted if accept was successful (no errors)
 		const hasError = actions.some((a) => a.type === ChannelActionType.ERROR);
+		if (actions.length > 0) {
+			this.processActions(peerPubkey, channel, actions);
+		}
+
+		// Start the driver before the informational event. A throwing observer
+		// must not prevent the wallet selection the peer is waiting on.
 		if (!hasError) {
-			this.emit('channel:accepted', channel, peerPubkey);
+			const isCurrentOpen = (): boolean =>
+				this.tempChannels.get(tempId) === channel &&
+				this.channelPeers.get(tempId) === peerPubkey;
 			this.autoFundDualFundedOpen(channel, peerPubkey);
+			if (!isCurrentOpen()) return;
+			if (leaseEvent) {
+				this.emitContained('channel:lease', leaseEvent);
+				if (!isCurrentOpen()) return;
+			}
+			if (isCurrentOpen()) {
+				this.emitContained('channel:accepted', channel, peerPubkey);
+			}
 		}
 	}
 
@@ -4475,35 +4695,61 @@ export class ChannelManager extends EventEmitter {
 		const state = channel.getFullState();
 		const contributionSats = local.fundingSatoshis + (state.leaseFeeSats ?? 0n);
 		const feeratePerKw = local.fundingFeeratePerkw;
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		const isCurrentOpen = (): boolean =>
+			this.tempChannels.get(tempId) === channel &&
+			this.channelPeers.get(tempId) === peerPubkey;
+		let selection: ReturnType<
+			NonNullable<IFundingProvider['selectSpliceInputs']>
+		>;
+		try {
+			selection = fundMax
+				? fp!.selectMaxDualFundingInputs!()
+				: fp!.selectSpliceInputs!(contributionSats, feeratePerKw);
+		} catch (err) {
+			selection = Promise.reject(err);
+		}
 
-		(fundMax
-			? fp!.selectMaxDualFundingInputs!()
-			: fp!.selectSpliceInputs!(contributionSats, feeratePerKw)
-		)
-			.then(({ inputs, changeScript }) => {
-				channel.setDualFundingContribution(
-					inputs,
-					changeScript,
-					contributionSats,
-					feeratePerKw
-				);
-				const driveActions = channel.beginDualFundingContribution();
-				this.processActions(peerPubkey, channel, driveActions);
-			})
+		void selection
+			.then(
+				({ inputs, changeScript }) => {
+					if (!isCurrentOpen()) return;
+					channel.setDualFundingContribution(
+						inputs,
+						changeScript,
+						contributionSats,
+						feeratePerKw
+					);
+					const driveActions = channel.beginDualFundingContribution();
+					this.processActions(peerPubkey, channel, driveActions);
+				},
+				(err) => {
+					if (!isCurrentOpen()) return;
+					const reason = (err as Error)?.message ?? err;
+					// The opener cannot downgrade to a zero contribution. Report the
+					// wallet failure, then abort so the peer does not wait indefinitely.
+					this.emitContained(
+						'error',
+						channel.getChannelId() ?? channel.getTemporaryChannelId(),
+						`v2 open not funded: ${reason}`
+					);
+					// The diagnostic observer can synchronously remove or replace the
+					// open, so check ownership again before changing channel state.
+					if (!isCurrentOpen()) return;
+					const abortActions = channel.abortDualFunding(
+						`opener funding unavailable: ${reason}`
+					);
+					this.processActions(peerPubkey, channel, abortActions);
+				}
+			)
 			.catch((err) => {
-				// Unlike the lease seller, the opener cannot downgrade to a
-				// zero contribution: the channel cannot exist without our
-				// funding. Surface the reason and abort the negotiation so the
-				// peer forgets the channel instead of waiting on us.
-				this.emit(
+				// Dispatch failures are not wallet-selection failures and must not
+				// abort a contribution whose wire actions may already be delivered.
+				this.emitContained(
 					'error',
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
-					`v2 open not funded: ${(err as Error)?.message ?? err}`
+					`v2 open dispatch failed: ${(err as Error)?.message ?? err}`
 				);
-				const abortActions = channel.abortDualFunding(
-					`opener funding unavailable: ${(err as Error)?.message ?? err}`
-				);
-				this.processActions(peerPubkey, channel, abortActions);
 			});
 	}
 
@@ -4615,13 +4861,7 @@ export class ChannelManager extends EventEmitter {
 		) {
 			return;
 		}
-		const permId = cid.toString('hex');
-		if (this.channels.has(permId)) return;
-		const tempId = channel.getTemporaryChannelId()?.toString('hex');
-		if (!tempId || !this.tempChannels.has(tempId)) return;
-		this.channels.set(permId, channel);
-		this.channelPeers.set(permId, peerPubkey);
-		this.tempChannels.delete(tempId);
+		this.promoteChannelLifecycle(peerPubkey, channel);
 	}
 
 	private handleTxInitRbfMsg(peerPubkey: string, payload: Buffer): void {
@@ -4657,32 +4897,38 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxAbort();
-		this.processActions(peerPubkey, channel, actions);
-
-		// The abort handshake is now complete for a dead unfunded v2 open on
-		// BOTH shapes of this call: the responder just errored itself above
-		// (and its echo went out with the actions), and the aborting side
-		// just consumed the peer's echo. Either way nothing more will ever
-		// arrive for this channel; leaving it registered made an inert
-		// ERRORED entry the disconnect sweeps skipped and the row repeated
-		// on every restart. Remove it entirely; the node deletes the row via
-		// channel:abandoned.
-		if (channel.isAbandonedV2Open()) {
-			const idHex = channel.getChannelId()?.toString('hex');
-			const tempHex = channel.getTemporaryChannelId()?.toString('hex');
-			if (idHex) {
-				this.channels.delete(idHex);
-				this.channelPeers.delete(idHex);
-			}
-			if (tempHex) {
-				this.tempChannels.delete(tempHex);
-				this.channelPeers.delete(tempHex);
-			}
-			this.emit(
-				'channel:abandoned',
-				channel.getChannelId() ?? channel.getTemporaryChannelId(),
-				'v2 open aborted'
+		const progress: IActionDispatchProgress = {
+			index: -1,
+			completedIndex: -1,
+			attemptedMessageTypes: new Set<number>(),
+			sendsWithheld: false
+		};
+		let dispatchCompleted = false;
+		try {
+			this.processActions(peerPubkey, channel, actions, progress);
+			dispatchCompleted = true;
+		} finally {
+			// Forget a dead open only after its full teardown batch completed, or
+			// after the tx_abort transport call was attempted. A persist or
+			// transition failure before that point must retain the recoverable row.
+			const allActionsCompleted =
+				actions.length > 0 && progress.completedIndex >= actions.length - 1;
+			const cancellationAttempted = progress.attemptedMessageTypes.has(
+				MessageType.TX_ABORT
 			);
+			if (
+				channel.isAbandonedV2Open() &&
+				((!progress.sendsWithheld &&
+					(dispatchCompleted || allActionsCompleted)) ||
+					cancellationAttempted) &&
+				this.removeCurrentChannelLifecycle(peerPubkey, channel)
+			) {
+				this.emitContained(
+					'channel:abandoned',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					'v2 open aborted'
+				);
+			}
 		}
 	}
 
@@ -4821,13 +5067,17 @@ export class ChannelManager extends EventEmitter {
 			return;
 		}
 
-		// Clean up a temp channel if this error references one the sender owns
-		if (
-			this.tempChannels.has(channelIdHex) &&
-			this.channelPeers.get(channelIdHex) === peerPubkey
-		) {
-			this.tempChannels.delete(channelIdHex);
-			this.channelPeers.delete(channelIdHex);
+		// A v2 open begins under its temporary id, then learns a derived channel
+		// id while it is still retained in tempChannels. Either id can scope the
+		// peer's cancellation, but only the owning peer may remove the lifecycle.
+		const exactTemp = this.tempChannels.get(channelIdHex);
+		if (exactTemp) {
+			this.removeCurrentTempChannel(peerPubkey, exactTemp);
+		} else {
+			const derivedTemp = this.findChannelByChannelIdInTemp(msg.channelId);
+			if (derivedTemp) {
+				this.removeCurrentTempChannel(peerPubkey, derivedTemp);
+			}
 		}
 
 		// BOLT 1: an error referencing a specific channel means fail that
@@ -4891,11 +5141,15 @@ export class ChannelManager extends EventEmitter {
 		// Check permanent map first
 		const channelId = channel.getChannelId();
 		if (channelId) {
-			const peer = this.channelPeers.get(channelId.toString('hex'));
-			if (peer) return peer;
+			const idHex = channelId.toString('hex');
+			if (this.channels.get(idHex) === channel) {
+				const peer = this.channelPeers.get(idHex);
+				if (peer) return peer;
+			}
 		}
 		// Check temp map
 		const tempId = channel.getTemporaryChannelId().toString('hex');
+		if (this.tempChannels.get(tempId) !== channel) return undefined;
 		return this.channelPeers.get(tempId);
 	}
 
@@ -4913,10 +5167,175 @@ export class ChannelManager extends EventEmitter {
 		return undefined;
 	}
 
+	/** Whether any channel lifecycle or owner binding already uses this id. */
+	private channelIdInUse(idHex: string): boolean {
+		return (
+			this.channels.has(idHex) ||
+			this.tempChannels.has(idHex) ||
+			this.findChannelByChannelIdInTemp(Buffer.from(idHex, 'hex')) !==
+				undefined ||
+			this.channelPeers.has(idHex) ||
+			this.channelIdReservations.has(idHex)
+		);
+	}
+
+	/** Whether this exact lifecycle may claim an id without replacing another. */
+	private channelIdAvailableForLifecycle(
+		idHex: string,
+		peerPubkey: string,
+		channel: Channel
+	): boolean {
+		const permanent = this.channels.get(idHex);
+		const temporary = this.tempChannels.get(idHex);
+		const derivedTemporary = this.findChannelByChannelIdInTemp(
+			Buffer.from(idHex, 'hex')
+		);
+		const reservation = this.channelIdReservations.get(idHex);
+		if (permanent && permanent !== channel) return false;
+		if (temporary && temporary !== channel) return false;
+		if (derivedTemporary && derivedTemporary !== channel) return false;
+		if (reservation && reservation !== channel) return false;
+		const owner = this.channelPeers.get(idHex);
+		if (owner === undefined) return true;
+		if (owner !== peerPubkey) return false;
+		return permanent === channel || temporary === channel;
+	}
+
+	/** Promote a channel while preserving any reentrant replacement lifecycle. */
+	private promoteChannelLifecycle(
+		peerPubkey: string,
+		channel: Channel
+	): boolean {
+		const channelId = channel.getChannelId();
+		if (!channelId) return false;
+		const permanentId = channelId.toString('hex');
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		const ownsPermanent =
+			this.channels.get(permanentId) === channel &&
+			this.channelPeers.get(permanentId) === peerPubkey;
+		const ownsTemporary =
+			this.tempChannels.get(tempId) === channel &&
+			this.channelPeers.get(tempId) === peerPubkey;
+		if (!ownsPermanent && !ownsTemporary) return false;
+		if (
+			!this.channelIdAvailableForLifecycle(permanentId, peerPubkey, channel)
+		) {
+			return false;
+		}
+
+		this.channels.set(permanentId, channel);
+		this.channelPeers.set(permanentId, peerPubkey);
+		if (
+			this.tempChannels.get(tempId) === channel &&
+			this.channelPeers.get(tempId) === peerPubkey
+		) {
+			this.tempChannels.delete(tempId);
+			if (tempId !== permanentId) this.channelPeers.delete(tempId);
+		}
+		return true;
+	}
+
+	/** Remove a temporary channel only when this exact lifecycle still owns it. */
+	private removeCurrentTempChannel(
+		peerPubkey: string,
+		channel: Channel
+	): boolean {
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		if (
+			this.tempChannels.get(tempId) !== channel ||
+			this.channelPeers.get(tempId) !== peerPubkey
+		) {
+			return false;
+		}
+		this.tempChannels.delete(tempId);
+		this.channelPeers.delete(tempId);
+		return true;
+	}
+
+	/** Remove this exact peer and channel lifecycle from every active map. */
+	private removeCurrentChannelLifecycle(
+		peerPubkey: string,
+		channel: Channel
+	): boolean {
+		let removed = false;
+		const channelId = channel.getChannelId()?.toString('hex');
+		if (
+			channelId &&
+			this.channels.get(channelId) === channel &&
+			this.channelPeers.get(channelId) === peerPubkey
+		) {
+			this.channels.delete(channelId);
+			this.channelPeers.delete(channelId);
+			removed = true;
+		}
+		const tempId = channel.getTemporaryChannelId().toString('hex');
+		if (
+			this.tempChannels.get(tempId) === channel &&
+			this.channelPeers.get(tempId) === peerPubkey
+		) {
+			this.tempChannels.delete(tempId);
+			this.channelPeers.delete(tempId);
+			removed = true;
+		} else if (
+			removed &&
+			!this.tempChannels.has(tempId) &&
+			this.channelPeers.get(tempId) === peerPubkey
+		) {
+			// Promotion can leave the temporary owner binding behind after the
+			// channel itself moved to the permanent map.
+			this.channelPeers.delete(tempId);
+		}
+		return removed;
+	}
+
 	private processActions(
 		peerPubkey: string,
 		channel: Channel,
-		actions: ChannelAction[]
+		actions: ChannelAction[],
+		progress?: IActionDispatchProgress
+	): void {
+		if (actions.length === 0) return;
+		const dispatchProgress = progress ?? {
+			index: -1,
+			completedIndex: -1,
+			attemptedMessageTypes: new Set<number>(),
+			sendsWithheld: false
+		};
+		const errorIndex = actions.findIndex(
+			(action) => action.type === ChannelActionType.ERROR
+		);
+		const errorAction = errorIndex >= 0 ? actions[errorIndex] : undefined;
+		try {
+			this.processActionsUnchecked(
+				peerPubkey,
+				channel,
+				actions,
+				dispatchProgress
+			);
+		} finally {
+			// Cleanup is allowed once the local error ran, or once its cancellation
+			// reached the transport boundary.
+			if (
+				errorAction?.type === ChannelActionType.ERROR &&
+				(dispatchProgress.completedIndex >= errorIndex ||
+					dispatchProgress.attemptedMessageTypes.has(MessageType.ERROR) ||
+					dispatchProgress.attemptedMessageTypes.has(MessageType.TX_ABORT)) &&
+				this.removeCurrentTempChannel(peerPubkey, channel)
+			) {
+				this.emitContained(
+					'error',
+					channel.getChannelId() ?? channel.getTemporaryChannelId(),
+					errorAction.message
+				);
+			}
+		}
+	}
+
+	private processActionsUnchecked(
+		peerPubkey: string,
+		channel: Channel,
+		actions: ChannelAction[],
+		progress: IActionDispatchProgress
 	): void {
 		// Keep the channel's node-id ordering current (BOLT 2 interactive-tx
 		// tx_signatures tie-break): the channel itself never learns node ids.
@@ -5035,7 +5454,7 @@ export class ChannelManager extends EventEmitter {
 			return;
 		}
 
-		this.emit('transition:begin', channelIdHex);
+		this.emitContained('transition:begin', channelIdHex);
 		try {
 			heldFrom = this._dispatchActions(
 				peerPubkey,
@@ -5045,6 +5464,7 @@ export class ChannelManager extends EventEmitter {
 				() => sendsBlocked,
 				(blocked: boolean) => {
 					sendsBlocked = blocked;
+					if (blocked) progress.sendsWithheld = true;
 				},
 				0,
 				false,
@@ -5054,7 +5474,8 @@ export class ChannelManager extends EventEmitter {
 						actions,
 						persistIndex,
 						persistRequest
-					)
+					),
+				progress
 			);
 			if (
 				heldFrom < 0 &&
@@ -5065,7 +5486,7 @@ export class ChannelManager extends EventEmitter {
 				this.emit('outbox:sent', persistRequest.outboxIds);
 			}
 		} finally {
-			this.emit('transition:end', channelIdHex);
+			this.emitContained('transition:end', channelIdHex);
 		}
 		if (heldFrom >= 0 && channelIdHex) {
 			this._holdBatch(channelIdHex, peerPubkey, channel, {
@@ -5083,6 +5504,7 @@ export class ChannelManager extends EventEmitter {
 		// disconnect instead of deadlocking a live connection on a peer
 		// timeout we do not control.
 		if (sendsBlocked) {
+			progress.sendsWithheld = true;
 			this.emit('transition:blocked', peerPubkey, batchChannelId);
 		}
 	}
@@ -5114,7 +5536,7 @@ export class ChannelManager extends EventEmitter {
 		startIndex = 0,
 		persistAlreadySeen = false,
 		shouldHold?: () => boolean,
-		progress?: { index: number }
+		progress?: IActionDispatchProgress
 	): number {
 		let persistSeen = persistAlreadySeen;
 		for (let index = startIndex; index < actions.length; index++) {
@@ -5129,8 +5551,10 @@ export class ChannelManager extends EventEmitter {
 					// A message the failed persist authorized must not reach the
 					// peer: the state that justifies it is not on disk.
 					if (persistSeen && sendsBlocked()) {
+						if (progress) progress.sendsWithheld = true;
 						break;
 					}
+					progress?.attemptedMessageTypes.add(action.messageType);
 					this.sendMessage(peerPubkey, action.messageType, action.payload);
 					// BOLT 1: the SENDER of an error must fail the channel too. A
 					// channel that just emitted a wire error and sits ERRORED (peer
@@ -5158,17 +5582,12 @@ export class ChannelManager extends EventEmitter {
 					// A channel that failed before funding has no permanent id yet, so
 					// fall back to the temporary one: without it the error carries a
 					// null channelId and cannot be tied back to the open it belongs to.
+					this.removeCurrentTempChannel(peerPubkey, channel);
 					this.emit(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
 						action.message
 					);
-					// Clean up temp channel on error
-					const tempId = channel.getTemporaryChannelId()?.toString('hex');
-					if (tempId && this.tempChannels.has(tempId)) {
-						this.tempChannels.delete(tempId);
-						this.channelPeers.delete(tempId);
-					}
 					break;
 				}
 				case ChannelActionType.HTLC_FORWARDED:
@@ -5285,6 +5704,7 @@ export class ChannelManager extends EventEmitter {
 					// failed persist takes precedence: there is nothing durable
 					// to wait for.
 					if (shouldHold?.()) {
+						if (progress) progress.completedIndex = index;
 						return index + 1;
 					}
 					break;
@@ -5292,6 +5712,7 @@ export class ChannelManager extends EventEmitter {
 					this.emit('splice:complete', channel.getChannelId());
 					break;
 			}
+			if (progress) progress.completedIndex = index;
 		}
 		return -1;
 	}
@@ -5647,11 +6068,16 @@ export class ChannelManager extends EventEmitter {
 	private _dispatchHeld(queue: IBarrierQueue, held: IHeldBatch): void {
 		let blocked = false;
 		const channelIdHex = queue.channel.getChannelId()?.toString('hex') ?? null;
-		const progress = { index: held.from };
+		const progress: IActionDispatchProgress = {
+			index: held.from,
+			completedIndex: held.from - 1,
+			attemptedMessageTypes: new Set<number>(),
+			sendsWithheld: false
+		};
 		// Same bracket a live batch runs in, so a monitor change caused by the
 		// released actions still rides its channel's transition instead of
 		// committing as a frame of its own.
-		this.emit('transition:begin', channelIdHex);
+		this.emitContained('transition:begin', channelIdHex);
 		try {
 			this._dispatchActions(
 				queue.peerPubkey,
@@ -5681,7 +6107,7 @@ export class ChannelManager extends EventEmitter {
 			});
 			throw error;
 		} finally {
-			this.emit('transition:end', channelIdHex);
+			this.emitContained('transition:end', channelIdHex);
 		}
 		// Marked sent only now that the bytes are actually on the socket. A
 		// row reading sent_unacked while its message is still parked would make
@@ -5825,11 +6251,10 @@ export class ChannelManager extends EventEmitter {
 	 * Deliberately not processActions. Everything that path adds is for cases
 	 * this batch does not have: it carries no persist, nothing in it is
 	 * barrier-class, and its queue has just been detached, so there is nothing
-	 * to attribute, hold or park. What processActions WOULD add is an
-	 * uncontained observer boundary in front of the commitment broadcast, and
-	 * a listener must not be able to suppress the last exit a channel has.
-	 * The transition pair is emitted for the same listeners, contained on both
-	 * edges so it stays balanced whatever an observer does.
+	 * to attribute, hold or park. The direct path also keeps the terminal send
+	 * independent from ordinary batch bookkeeping. The transition pair is
+	 * emitted for the same listeners, contained on both edges so it stays
+	 * balanced whatever an observer does.
 	 */
 	private _dispatchTerminalForceClose(
 		peerPubkey: string,

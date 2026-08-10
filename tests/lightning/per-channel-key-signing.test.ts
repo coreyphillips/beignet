@@ -31,6 +31,7 @@ import {
 } from '../../src/lightning/message/dual-funding';
 import { MessageType } from '../../src/lightning/message/types';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
+import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
 
 // ─── Helpers ───
 
@@ -248,7 +249,7 @@ describe('Per-Channel Key Signing', () => {
 			);
 
 			const msg: IOpenChannel2Message = {
-				channelId: crypto.randomBytes(32),
+				channelId: deriveV2TemporaryChannelId(remoteBp.revocationBasepoint),
 				fundingFeeratePerkw: 1000,
 				commitmentFeeratePerkw: 500,
 				fundingSatoshis: 100_000n,

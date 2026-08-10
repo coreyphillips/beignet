@@ -10082,17 +10082,23 @@ export class Channel {
 	 * Handle accept_channel2 from remote (opener side).
 	 */
 	handleAcceptChannel2(msg: IAcceptChannel2Message): ChannelAction[] {
+		const refuse = (reason: string): ChannelAction[] => [
+			sendMsg(
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: msg.channelId,
+					data: Buffer.from(reason, 'utf8')
+				})
+			),
+			{ type: ChannelActionType.ERROR, message: reason }
+		];
 		if (this._state.state !== ChannelState.DUAL_FUNDING_V2) {
-			return [
-				{ type: ChannelActionType.ERROR, message: 'Unexpected accept_channel2' }
-			];
+			return refuse('Unexpected accept_channel2');
 		}
 
 		const session = this._state.dualFundingSession;
 		if (!session) {
-			return [
-				{ type: ChannelActionType.ERROR, message: 'No dual-funding session' }
-			];
+			return refuse('No dual-funding session');
 		}
 
 		const result = session.handleAcceptChannel2(msg);
@@ -10102,16 +10108,7 @@ export class Channel {
 			// forever. The error is scoped to the id the peer used, so its
 			// side cancels the open too.
 			const reason = result.error || 'Failed to handle accept_channel2';
-			return [
-				sendMsg(
-					MessageType.ERROR,
-					encodeErrorMessage({
-						channelId: msg.channelId,
-						data: Buffer.from(reason, 'ascii')
-					})
-				),
-				{ type: ChannelActionType.ERROR, message: reason }
-			];
+			return refuse(reason);
 		}
 
 		// BOLT 2: when the channel type is option_zeroconf the accepter MUST set
@@ -10126,16 +10123,7 @@ export class Channel {
 			msg.minimumDepth !== 0
 		) {
 			const reason = `zero_conf accept_channel2 must use minimum_depth 0, got ${msg.minimumDepth}`;
-			return [
-				sendMsg(
-					MessageType.ERROR,
-					encodeErrorMessage({
-						channelId: msg.channelId,
-						data: Buffer.from(reason, 'ascii')
-					})
-				),
-				{ type: ChannelActionType.ERROR, message: reason }
-			];
+			return refuse(reason);
 		}
 
 		this._state.remoteBasepoints = session.getRemoteBasepoints();
@@ -10190,12 +10178,9 @@ export class Channel {
 			msg.willFund &&
 			requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: 'Script-enforced lease is not supported on taproot channels'
-				}
-			];
+			return refuse(
+				'Script-enforced lease is not supported on taproot channels'
+			);
 		}
 		// Anchors-only for the same reason as handleOpenChannel2: a non-anchor
 		// P2WPKH to_remote cannot carry the lessor's lease CLTV.
@@ -10204,13 +10189,9 @@ export class Channel {
 			msg.willFund &&
 			requestFunds
 		) {
-			return [
-				{
-					type: ChannelActionType.ERROR,
-					message:
-						'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
-				}
-			];
+			return refuse(
+				'Script-enforced lease requires an anchor channel (option_anchors channel_type)'
+			);
 		}
 		if (msg.willFund && requestFunds) {
 			// M2 fund-safety: the seller must actually contribute at least the inbound
@@ -10219,12 +10200,7 @@ export class Channel {
 			// this check an adversarial seller could return fundingSatoshis=0, pocket
 			// the lease fee, and deliver no liquidity — an unconditional loss to us.
 			if (msg.fundingSatoshis < requestFunds.requestedSats) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Seller funded less than the requested lease amount'
-					}
-				];
+				return refuse('Seller funded less than the requested lease amount');
 			}
 			const fundingFeeratePerkw =
 				session.getLocalParams()?.fundingFeeratePerkw ?? 0;
@@ -10253,13 +10229,9 @@ export class Channel {
 			// an unverified lease fee when no ceiling was set.
 			const maxLeaseRates = session.getLocalParams()?.maxLeaseRates;
 			if (!maxLeaseRates) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message:
-							'No maximum lease rates configured; refusing to pay an unverified lease fee'
-					}
-				];
+				return refuse(
+					'No maximum lease rates configured; refusing to pay an unverified lease fee'
+				);
 			}
 			const maxLeaseFeeSat = computeLeaseFeeSat(
 				maxLeaseRates,
@@ -10267,12 +10239,7 @@ export class Channel {
 				fundingFeeratePerkw
 			);
 			if (leaseFeeSat > maxLeaseFeeSat) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Seller lease fee exceeds our accepted maximum'
-					}
-				];
+				return refuse('Seller lease fee exceeds our accepted maximum');
 			}
 			// CLN's lease accounting (validated live): the buyer pays the fee
 			// through the FUNDING TRANSACTION — the funding output must total
@@ -10857,7 +10824,7 @@ export class Channel {
 
 		if (!this._dualFundingContribs) {
 			const err = this._computeDualFundingContributions();
-			if (err) return [{ type: ChannelActionType.ERROR, message: err }];
+			if (err) return this._abortV2Negotiation(err);
 		}
 
 		if (this._dualFundingContribIndex < this._dualFundingContribs!.length) {
@@ -10865,12 +10832,9 @@ export class Channel {
 			if (c.kind === 'input') {
 				const result = session.addInput(c.input);
 				if (!result.ok) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: result.error || 'Failed to add contribution input'
-						}
-					];
+					return this._abortV2Negotiation(
+						result.error || 'Failed to add contribution input'
+					);
 				}
 				const msg: ITxAddInputMessage = {
 					channelId: this._v2ChannelId(),
@@ -10885,12 +10849,9 @@ export class Channel {
 			}
 			const result = session.addOutput(c.output);
 			if (!result.ok) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: result.error || 'Failed to add contribution output'
-					}
-				];
+				return this._abortV2Negotiation(
+					result.error || 'Failed to add contribution output'
+				);
 			}
 			const outMsg: ITxAddOutputMessage = {
 				channelId: this._v2ChannelId(),

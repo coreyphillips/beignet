@@ -48,6 +48,7 @@ import {
 	REGTEST_CHAIN_HASH
 } from '../../src/lightning/channel/types';
 import { ISpliceWalletInput } from '../../src/lightning/channel/channel';
+import { deriveV2TemporaryChannelId } from '../../src/lightning/channel/validation';
 import { MessageType } from '../../src/lightning/message/types';
 import {
 	IChannelBasepoints,
@@ -544,7 +545,9 @@ describe('Recovery phase 6: quorum opens dual-funded channels behind the barrier
 		const peerSide = makeBasepoints(15);
 		const openMsg = encodeOpenChannel2Message({
 			chainHash: REGTEST_CHAIN_HASH,
-			channelId: crypto.randomBytes(32),
+			channelId: deriveV2TemporaryChannelId(
+				peerSide.basepoints.revocationBasepoint
+			),
 			fundingFeeratePerkw: 1000,
 			commitmentFeeratePerkw: 253,
 			fundingSatoshis: 150_000n,

@@ -44,6 +44,7 @@ import {
 	dualFundingContributionWeight
 } from '../../src/lightning/channel/splice-weight';
 import { IFundingProvider } from '../../src/lightning/node/types';
+import { MessageType } from '../../src/lightning/message/types';
 
 // ─────────────── Helpers ───────────────
 
@@ -283,6 +284,14 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 
 	it('an underfunded max contribution aborts cleanly instead of stalling', async function () {
 		const h = makeHarness(makeWalletInput(WALLET_UTXO_SATS));
+		const sentA: number[] = [];
+		const sentB: number[] = [];
+		h.mgrA.on('message:outbound', (_peer: string, type: number) => {
+			sentA.push(type);
+		});
+		h.mgrB.on('message:outbound', (_peer: string, type: number) => {
+			sentB.push(type);
+		});
 		// Committed amount above what the wallet inputs can fund alongside the
 		// fee (the balance shrank between quote and funding).
 		const chA = h.mgrA.createDualFundedChannel(
@@ -302,6 +311,17 @@ describe('beignet-to-beignet v2 open (plain acceptor, auto-funded opener)', func
 		expect(chA.getState()).to.not.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
+		expect(
+			sentA.filter((type) => type === MessageType.TX_ABORT),
+			'opener cancelled the negotiation on the wire'
+		).to.have.length(1);
+		expect(
+			sentB.filter((type) => type === MessageType.TX_ABORT),
+			'acceptor acknowledged the abort'
+		).to.have.length(1);
+		const tempId = chA.getTemporaryChannelId();
+		expect(h.mgrA.getTempChannel(tempId)).to.equal(undefined);
+		expect(h.mgrB.getTempChannel(tempId)).to.equal(undefined);
 	});
 });
 
