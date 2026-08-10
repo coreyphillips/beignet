@@ -317,8 +317,10 @@ describe('Penalty batch affordability (witness-v0)', function () {
 		).to.exist;
 		expect(byIndex.get(0)!.spendTx, 'and carries a real spend').to.exist;
 		expect(byIndex.get(2), 'the far HTLC is still batched with it').to.exist;
+		// Reported as declined (tracked, no spend) rather than dropped silently, so
+		// the caller can retry it once fees fall.
 		expect(
-			byIndex.get(1),
+			byIndex.get(1)?.spendTx,
 			'the starved HTLC produced no penalty of its own'
 		).to.equal(undefined);
 	});

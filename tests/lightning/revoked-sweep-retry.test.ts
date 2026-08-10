@@ -32,7 +32,7 @@ import {
 	resolveRevokedCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs
 } from '../../src/lightning/chain/output-resolver';
-import { HtlcDirection } from '../../src/lightning/channel/types';
+import { HtlcDirection, ChannelRole } from '../../src/lightning/channel/types';
 import { MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
 	perCommitmentPointFromSecret,
@@ -40,7 +40,10 @@ import {
 	derivePublicKey
 } from '../../src/lightning/keys/derivation';
 import { buildReceivedHtlcScript } from '../../src/lightning/script/htlc';
-import { buildToLocalScript } from '../../src/lightning/script/commitment';
+import {
+	buildToLocalScript,
+	calculateObscuredCommitmentNumber
+} from '../../src/lightning/script/commitment';
 import {
 	setupRevokedWithHtlcs,
 	IRevokedSetup
@@ -263,6 +266,39 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		expect(reported[0].contestHeight).to.equal(HEIGHT + leaseCsv);
 	});
 
+	it('names no competing height until the breach confirms', function () {
+		// A relative delay counts from confirmation. A mempool-first sighting has
+		// no height yet, and treating that as 0 would name a height already behind
+		// the tip: a race reported before it starts, and then suppressed when it
+		// really does.
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		s.revokedTx.outs[0].value = STARVED_SATS;
+		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		monitor.handleFundingSpent(s.revokedTx, 0);
+		expect(trackedAt(monitor, 0)!.confirmationHeight).to.equal(0);
+
+		expect(
+			uneconomicActions(monitor.handleNewBlock(HEIGHT)),
+			'no height is named while the commitment is unconfirmed'
+		).to.have.length(0);
+
+		// It confirms; the CSV counts from here.
+		monitor.handleFundingSpent(s.revokedTx, HEIGHT);
+		expect(
+			uneconomicActions(monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY - 1)),
+			'and the race has still not started'
+		).to.have.length(0);
+
+		const reported = uneconomicActions(
+			monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY)
+		);
+		expect(
+			reported.map((r) => r.reason),
+			'the real transition is reported once it does'
+		).to.deep.equal(['contested']);
+		expect(reported[0].contestHeight).to.equal(HEIGHT + TO_SELF_DELAY);
+	});
+
 	it('names no competing height for an HTLC only a preimage can take', function () {
 		const s = setupRevokedWithHtlcs(HEIGHT);
 		s.revokedTx.outs[0].value = STARVED_SATS;
@@ -437,11 +473,12 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		).to.be.greaterThan(0);
 	});
 
-	it('retries a snapshot-reconstructed HTLC nothing else tracks', function () {
+	it('adopts, reports and keeps managing a snapshot-reconstructed HTLC', function () {
 		// The tracked to_local is affordable and claimed at the opening; the only
 		// skipped claim is a settled HTLC rebuilt from revokedHtlcSnapshots, which
-		// never becomes a tracked output. Seeding retries from _trackedOutputs
-		// alone would never come back for it.
+		// the live classification never matched. Left unadopted it would be outside
+		// the retry set, unwatched, never rebroadcast, and outside full-resolution
+		// accounting, so "retry until spent" would not hold for it.
 		const s = setupRevokedWithHtlcs(HEIGHT);
 		const secret = s.state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
 		const revokedPoint = perCommitmentPointFromSecret(secret);
@@ -487,11 +524,9 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		s.revokedTx.outs[1].value = STARVED_SATS;
 
 		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
-		const opening = broadcastTxs(
-			monitor.handleFundingSpent(s.revokedTx, HEIGHT)
-		);
+		const openingActions = monitor.handleFundingSpent(s.revokedTx, HEIGHT);
 		const claimedAtOpening = new Set<number>();
-		for (const tx of opening) {
+		for (const tx of broadcastTxs(openingActions)) {
 			for (const index of spentIndices(tx)) claimedAtOpening.add(index);
 		}
 		expect(
@@ -503,13 +538,37 @@ describe('Retrying uneconomic revoked sweeps', function () {
 			'the starved snapshot HTLC is not'
 		).to.equal(false);
 		expect(
-			monitor.getTrackedOutputs().some((o) => o.outputIndex === 1),
-			'and it is not a tracked output either'
-		).to.equal(false);
+			trackedAt(monitor, 1),
+			'but it is adopted, so something owns it from here on'
+		).to.not.equal(undefined);
+		expect(
+			openingActions.some(
+				(a) =>
+					a.type === ChainActionType.WATCH_OUTPUT &&
+					a.txid === s.revokedTx.getId() &&
+					a.outputIndex === 1
+			),
+			'and its outpoint is watched, so a spend can end the claim'
+		).to.equal(true);
+		expect(
+			uneconomicActions(openingActions).map((d) => d.outputIndex),
+			'the decline of a snapshot claim is reported too'
+		).to.deep.equal([1]);
 
 		const retried = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
-		expect(retried, 'the retry still reaches it').to.have.length(1);
+		expect(retried, 'the retry reaches it').to.have.length(1);
 		expect(spentIndices(retried[0])).to.deep.equal([1]);
+
+		// Recovered, and still under management: it holds its sweep, so the
+		// rebroadcast and RBF loops cover it, and full resolution waits for it.
+		const adopted = trackedAt(monitor, 1)!;
+		expect(adopted.status).to.equal(OutputStatus.SPEND_BROADCAST);
+		expect(adopted.sweepTxHex).to.not.equal(undefined);
+		monitor.handleNewBlock(HEIGHT + 1);
+		expect(
+			monitor.getState(),
+			'a claim still in flight is not full resolution'
+		).to.not.equal(MonitorState.FULLY_RESOLVED);
 	});
 
 	it('retries a skipped taproot penalty', function () {
@@ -667,6 +726,57 @@ describe('Uneconomic to_remote no longer aborts the resolution', function () {
 				OutputStatus.SPEND_BROADCAST
 			);
 		}
+	});
+
+	it('reports the declined to_remote on a future peer commitment', function () {
+		// The peer advanced past us (data loss on our side), so our to_remote is the
+		// only thing we can claim from their commitment. Reporting the decline only
+		// from a later retry loses it whenever the next fee sample recovers it.
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const isOpener = s.state.role === ChannelRole.OPENER;
+		const openPBP = isOpener
+			? s.state.localBasepoints.paymentBasepoint
+			: s.state.remoteBasepoints!.paymentBasepoint;
+		const acceptPBP = isOpener
+			? s.state.remoteBasepoints!.paymentBasepoint
+			: s.state.localBasepoints.paymentBasepoint;
+		const obscured = calculateObscuredCommitmentNumber(
+			openPBP,
+			acceptPBP,
+			s.state.remoteCommitmentNumber + 50n
+		);
+
+		const futureTx = new bitcoin.Transaction();
+		futureTx.version = 2;
+		futureTx.locktime = 0x20000000 | Number(obscured & 0xffffffn);
+		futureTx.addInput(
+			Buffer.from(s.state.fundingTxid!.toString('hex'), 'hex').reverse(),
+			s.state.fundingOutputIndex,
+			(0x80000000 | Number((obscured >> 24n) & 0xffffffn)) >>> 0
+		);
+		futureTx.addOutput(
+			bitcoin.payments.p2wpkh({
+				pubkey: s.state.localBasepoints.paymentBasepoint
+			}).output!,
+			STARVED_SATS
+		);
+
+		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		const actions = monitor.handleFundingSpent(futureTx, HEIGHT);
+
+		expect(
+			broadcastTxs(actions),
+			'unaffordable at the spike rate, so nothing is built'
+		).to.have.length(0);
+		expect(
+			uneconomicActions(actions).map((d) => d.reason),
+			'and the decline is reported where it happens'
+		).to.deep.equal(['skipped']);
+
+		expect(
+			broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW)),
+			'the next fee sample still recovers it'
+		).to.have.length(1);
 	});
 
 	it('keeps their-current-commitment claims when to_remote is unaffordable', function () {

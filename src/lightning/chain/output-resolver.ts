@@ -2566,6 +2566,22 @@ export function resolveRevokedCommitmentOutputs(
 		perCommitmentPoint
 	);
 
+	// The tracked output for a penalty input, or a stand-in for one the live
+	// classification never saw (an HTLC that settled and left state.htlcs, rebuilt
+	// from the snapshot below). Callers adopt the stand-in so the output is
+	// watched and its claim rebroadcast like any other.
+	const penaltyTrackedOutput = (outputIdx: number): ITrackedOutput =>
+		trackedOutputs.find((o) => o.outputIndex === outputIdx) ?? {
+			txid: revokedTx.getId(),
+			outputIndex: outputIdx,
+			amount: BigInt(revokedTx.outs[outputIdx].value),
+			outputType: OutputType.OFFERED_HTLC,
+			status: OutputStatus.CONFIRMED,
+			confirmationHeight: 0,
+			witnessScript: witnessScripts.get(outputIdx),
+			cltvExpiry: htlcDeadlines.get(outputIdx)
+		};
+
 	// Build ONE penalty tx over the given indices, sign every input, and push
 	// a resolved entry per input (all sharing that tx).
 	const buildAndSignPenalty = (outputIndices: number[]): void => {
@@ -2586,7 +2602,15 @@ export function resolveRevokedCommitmentOutputs(
 				destinationScript
 			)
 		);
-		if (sweepOutputValue(totalIn, fee, destinationScript) === null) return;
+		if (sweepOutputValue(totalIn, fee, destinationScript) === null) {
+			// Report the declined inputs rather than returning silently: the caller
+			// cannot otherwise tell a batch it never heard about from one it chose
+			// not to build, and a snapshot-reconstructed input appears nowhere else.
+			for (const idx of outputIndices) {
+				resolved.push({ trackedOutput: penaltyTrackedOutput(idx) });
+			}
+			return;
+		}
 
 		const penaltyTx = buildPenaltyTx({
 			revokedTx,
@@ -2602,14 +2626,14 @@ export function resolveRevokedCommitmentOutputs(
 			const outputIdx = outputIndices[i];
 			const ws = witnessScripts.get(outputIdx)!;
 			const value = revokedTx.outs[outputIdx].value;
-			// May be undefined for an HTLC output reconstructed from the snapshot
-			// (it was not in the live classification because the HTLC had settled).
-			const output = trackedOutputs.find((o) => o.outputIndex === outputIdx);
+			// Synthesized for an HTLC output reconstructed from the snapshot (it was
+			// not in the live classification because the HTLC had settled).
+			const output = penaltyTrackedOutput(outputIdx);
 
 			const sig = signPenaltyInput(penaltyTx, i, ws, value, revocationPrivkey);
 
 			let witness: Buffer[];
-			if (output?.outputType === OutputType.TO_LOCAL) {
+			if (output.outputType === OutputType.TO_LOCAL) {
 				witness = buildToLocalPenaltyWitness(sig, ws);
 			} else {
 				// Both tracked HTLC outputs and snapshot-reconstructed ones use the
@@ -2620,16 +2644,7 @@ export function resolveRevokedCommitmentOutputs(
 			penaltyTx.setWitness(i, witness);
 
 			resolved.push({
-				trackedOutput: output ?? {
-					txid: revokedTx.getId(),
-					outputIndex: outputIdx,
-					amount: BigInt(value),
-					outputType: OutputType.OFFERED_HTLC,
-					status: OutputStatus.CONFIRMED,
-					confirmationHeight: 0,
-					witnessScript: ws,
-					cltvExpiry: htlcDeadlines.get(outputIdx)
-				},
+				trackedOutput: output,
 				spendTx: penaltyTx,
 				witness
 			});
@@ -2882,6 +2897,9 @@ function resolveRevokedTaprootCommitmentOutputs(
 			// addOutput a negative value: the caller splits urgent inputs into
 			// their own batch, and a throw here would abandon the remaining
 			// batches (including the one holding their to_local) along with it.
+			// Report the declined inputs so the caller can tell a batch it never
+			// heard about from one we chose not to build.
+			for (const pin of ins) resolved.push({ trackedOutput: pin.output });
 			return;
 		}
 		penaltyTx.addOutput(destinationScript, penaltyValue);

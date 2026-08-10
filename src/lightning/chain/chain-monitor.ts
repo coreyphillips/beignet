@@ -1368,6 +1368,11 @@ export class ChainMonitor {
 			}
 		}
 
+		// Same reason as the current-commitment handler: an unaffordable to_remote
+		// is declined here, and reporting only from a later retry loses the decline
+		// whenever the next fee sample recovers the claim.
+		this._reportDeclinedClaims(actions, toRemoteOutputs);
+
 		return actions;
 	}
 
@@ -1538,12 +1543,12 @@ export class ChainMonitor {
 		// Report anything this first pass declined. Waiting for the first retry to
 		// report would lose the decline entirely whenever the very next fee
 		// estimate recovers the claim.
-		this._reportDeclinedClaims(
-			actions,
-			this._trackedOutputs.filter(
-				(o) => o.txid === this._commitmentBroadcast?.txid
-			)
-		);
+		if (this._commitmentBroadcast) {
+			this._reportDeclinedClaims(
+				actions,
+				this._revokedCommitmentOutputs(this._commitmentBroadcast)
+			);
+		}
 
 		return actions;
 	}
@@ -1560,7 +1565,15 @@ export class ChainMonitor {
 		description: string
 	): void {
 		const broadcastTxids = new Set<string>();
-		for (const r of resolved) {
+		for (const entry of resolved) {
+			// Adopt before anything else: a settled-HTLC output rebuilt from the
+			// snapshot is not in the tracked set, and writing this pass's bookkeeping
+			// to a value that is then discarded is what left those claims unwatched,
+			// never rebroadcast, and outside full-resolution accounting.
+			const r = {
+				...entry,
+				trackedOutput: this._adoptPenaltyOutput(actions, entry.trackedOutput)
+			};
 			if (!r.spendTx) continue;
 			// Penalty txs come back with every input's witness already attached; a
 			// to_remote claim (our own balance on their revoked commitment) comes
@@ -1609,6 +1622,12 @@ export class ChainMonitor {
 	private _contestHeight(output: ITrackedOutput): number | undefined {
 		switch (output.outputType) {
 			case OutputType.TO_LOCAL: {
+				// A relative delay needs the height it counts from. A mempool-first
+				// sighting has none yet, and treating that as 0 would name a height
+				// already behind the tip and report a race that has not started.
+				// _adoptLateConfirmation fills the height in once the commitment
+				// confirms, and the real transition is reported from there.
+				if (output.confirmationHeight <= 0) return undefined;
 				const scriptCsv = output.witnessScript
 					? csvFromToLocalScript(output.witnessScript)
 					: undefined;
@@ -1622,6 +1641,41 @@ export class ChainMonitor {
 			default:
 				return undefined;
 		}
+	}
+
+	/**
+	 * Return the tracked output a resolution entry refers to, adopting it into the
+	 * tracked set first if it is not there yet.
+	 *
+	 * The revoked resolver rebuilds settled-HTLC outputs from revokedHtlcSnapshots
+	 * (an HTLC that left state.htlcs, whose output the live classification never
+	 * matched). Those arrive as stand-ins that belong to no tracked output, so
+	 * without adoption nothing watches the outpoint, nothing rebroadcasts or
+	 * fee-bumps the claim if it stalls, the second-level justice path can never
+	 * fire for it, and full resolution is declared over a claim still in flight.
+	 */
+	private _adoptPenaltyOutput(
+		actions: ChainAction[],
+		candidate: ITrackedOutput
+	): ITrackedOutput {
+		const existing = this._trackedOutputs.find(
+			(o) =>
+				o.txid === candidate.txid && o.outputIndex === candidate.outputIndex
+		);
+		if (existing) return existing;
+		if (candidate.confirmationHeight <= 0) {
+			// A mempool-first breach has no height yet; _adoptLateConfirmation fills
+			// it in for every tracked output once the commitment confirms.
+			candidate.confirmationHeight =
+				this._commitmentBroadcast?.blockHeight ?? 0;
+		}
+		this._trackedOutputs.push(candidate);
+		actions.push({
+			type: ChainActionType.WATCH_OUTPUT,
+			txid: candidate.txid,
+			outputIndex: candidate.outputIndex
+		});
+		return candidate;
 	}
 
 	/**
@@ -1797,7 +1851,20 @@ export class ChainMonitor {
 			resolved,
 			'penalty sweep (revoked commitment, retried after skip)'
 		);
-		this._reportDeclinedClaims(actions, retryable);
+		// Over the tracked set rather than over `retryable`: the pass above adopts
+		// snapshot-reconstructed outputs, and a claim declined for one of those is
+		// otherwise the one decline nothing can report.
+		this._reportDeclinedClaims(
+			actions,
+			this._revokedCommitmentOutputs(broadcast)
+		);
+	}
+
+	/** Tracked outputs belonging to a given commitment broadcast. */
+	private _revokedCommitmentOutputs(
+		broadcast: ICommitmentBroadcast
+	): ITrackedOutput[] {
+		return this._trackedOutputs.filter((o) => o.txid === broadcast.txid);
 	}
 
 	/**

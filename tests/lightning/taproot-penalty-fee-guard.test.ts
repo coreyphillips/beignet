@@ -112,7 +112,9 @@ describe('taproot penalty fee guard', function () {
 		const htlc = resolved.find(
 			(r) => r.trackedOutput.outputType === OutputType.OFFERED_HTLC
 		);
-		expect(htlc, 'the unaffordable HTLC produced no penalty').to.equal(
+		// Reported as declined (tracked, no spend) rather than dropped silently, so
+		// the caller can retry it once fees fall.
+		expect(htlc?.spendTx, 'the unaffordable HTLC produced no penalty').to.equal(
 			undefined
 		);
 	});
@@ -129,7 +131,12 @@ describe('taproot penalty fee guard', function () {
 			50
 		);
 
-		expect(resolved, 'nothing unbroadcastable was produced').to.have.length(0);
+		// Both inputs come back reported as declined, and neither carries a spend:
+		// nothing unbroadcastable is produced, and the caller can still retry them.
+		expect(resolved, 'both inputs are reported').to.have.length(2);
+		for (const r of resolved) {
+			expect(r.spendTx, 'with no spend built').to.equal(undefined);
+		}
 	});
 
 	it('accumulates every input of a batched penalty into one output', function () {
