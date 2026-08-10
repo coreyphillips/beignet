@@ -1,4 +1,6 @@
 import { expect } from 'chai';
+import * as bitcoin from 'bitcoinjs-lib';
+import * as ecc from '@bitcoinerlab/secp256k1';
 import {
 	OutputStatus,
 	OutputType,
@@ -17,6 +19,11 @@ import {
 	DEFAULT_CHANNEL_CONFIG
 } from '../../src/lightning/channel/types';
 import { ShaChainStore } from '../../src/lightning/keys/shachain';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
+import { setupNormalChannels } from './helpers/revoked-commitment-fixture';
+
+bitcoin.initEccLib(ecc);
 
 function makeMinimalChannelState(): IChannelState {
 	const seed = crypto.randomBytes(32);
@@ -309,6 +316,52 @@ describe('Sweep Re-broadcast', () => {
 		expect(rebuilds.length).to.equal(0);
 	});
 
+	it('rebuilds a claim when stored sweep metadata names another outpoint', () => {
+		const { opener, openerPrivkeys } = setupNormalChannels();
+		const channelState = opener.getFullState();
+		const destinationScript = bitcoin.payments.p2wpkh({
+			pubkey: getPublicKey(openerPrivkeys[0]),
+			network: bitcoin.networks.regtest
+		}).output!;
+		const remoteCommitment = buildRemoteCommitment(
+			channelState,
+			channelState.remoteCurrentPerCommitmentPoint!
+		);
+		const monitor = new ChainMonitor(
+			channelState,
+			destinationScript,
+			1,
+			openerPrivkeys[1],
+			openerPrivkeys[2],
+			bitcoin.networks.regtest
+		);
+		monitor.handleFundingSpent(remoteCommitment.result.tx, 100);
+		const output = monitor
+			.getTrackedOutputs()
+			.find((candidate) => candidate.outputType === OutputType.TO_REMOTE)!;
+		expect(output.sweepTxHex).to.exist;
+
+		const unrelated = new bitcoin.Transaction();
+		unrelated.version = 2;
+		unrelated.addInput(crypto.randomBytes(32), 7, 0xfffffffd);
+		unrelated.addOutput(destinationScript, 1_000);
+		output.sweepTxHex = unrelated.toHex();
+		output.originalFeeRate = 1;
+		output.currentFeeRate = 1;
+
+		const rebuilt = monitor.rebuildSweep(output, 2);
+		expect(rebuilt).to.not.equal(null);
+		expect(rebuilt!.getId()).to.not.equal(unrelated.getId());
+		expect(
+			rebuilt!.ins.some(
+				(input) =>
+					Buffer.from(input.hash).reverse().toString('hex') === output.txid &&
+					input.index === output.outputIndex
+			)
+		).to.equal(true);
+		expect(output.sweepTxHex).to.equal(rebuilt!.toHex());
+	});
+
 	it('re-broadcast stops once spend is confirmed', () => {
 		const state: IChainMonitorState = {
 			monitorState: MonitorState.RESOLVING,
@@ -344,9 +397,10 @@ describe('Sweep Re-broadcast', () => {
 			actions.filter((a) => a.type === ChainActionType.REBUILD_SWEEP).length
 		).to.be.greaterThan(0);
 
-		// Get tracked outputs and verify broadcastHeight was updated
+		// Scheduling alone does not advance bookkeeping. The rebuild path updates
+		// broadcastHeight only after it has a replacement or a raw fallback to send.
 		const outputs = m.getTrackedOutputs();
-		expect(outputs[0].broadcastHeight).to.equal(106);
+		expect(outputs[0].broadcastHeight).to.equal(100);
 
 		// Simulate the sweep being confirmed by calling handleOutputSpent
 		// This transitions the output to SPEND_CONFIRMED

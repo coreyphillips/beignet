@@ -453,7 +453,7 @@ describe('Chain Closing & Sweep (Phase 4A)', function () {
 			});
 
 			expect(tx.version).to.equal(2);
-			expect(tx.ins[0].sequence).to.equal(0xffffffff); // no delay
+			expect(tx.ins[0].sequence).to.equal(0xfffffffd); // no relative delay, opts into RBF
 			expect(tx.outs[0].value).to.equal(399_700);
 		});
 

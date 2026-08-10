@@ -223,6 +223,7 @@ import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
+	CommitmentType,
 	OutputStatus,
 	OutputType,
 	ISweepUneconomicChainAction
@@ -318,7 +319,7 @@ bitcoin.initEccLib(ecc);
  * - 'peer:disconnect' (pubkey: string)
  * - 'peer:error' (pubkey: string, error: Error)
  * - 'peer_storage:retrieved' (peerPubkey: string, blob: Buffer)
- * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction) — an on-chain claim was declined because it cannot pay its own fee
+ * - 'sweep:uneconomic' (channelId: Buffer, action: ISweepUneconomicChainAction): an on-chain claim was declined because it cannot pay its own fee
  */
 
 /**
@@ -1884,11 +1885,29 @@ export class LightningNode extends EventEmitter {
 				);
 				this.channelManager.restoreMonitor(channelId, monitor);
 
-				// Reconcile: if the monitor already finished resolving every output
-				// of this close (possibly in a prior session where the resolved
-				// transition was never persisted), move the channel to CLOSED now so
-				// it doesn't report a stale pending-close balance forever.
+				// Older monitor state could mark a revoked close fully resolved
+				// before a snapshot-only penalty output was adopted. If that state
+				// also closed the channel, reopen the force-close lifecycle together
+				// with the repaired monitor. Cooperative closes are intentionally
+				// excluded because CLOSED is valid while their monitor reaches depth.
+				const restoredCommitment = monitor.getFullState().commitmentBroadcast;
 				if (
+					channelState.state === ChannelState.CLOSED &&
+					!monitor.isFullyResolved() &&
+					restoredCommitment?.commitmentType ===
+						CommitmentType.THEIR_REVOKED_COMMITMENT
+				) {
+					channelState.state = ChannelState.FORCE_CLOSED;
+					this.dirtyMonitors.add(channelId);
+					this.persistChannel(Buffer.from(channelId, 'hex'));
+					this.emitStructuredLog('channel', 'resolution_reopened', {
+						channelId
+					});
+					// Reconcile: if the monitor already finished resolving every output
+					// of this close (possibly in a prior session where the resolved
+					// transition was never persisted), move the channel to CLOSED now so
+					// it doesn't report a stale pending-close balance forever.
+				} else if (
 					monitor.isFullyResolved() &&
 					this.channelManager.markChannelResolved(Buffer.from(channelId, 'hex'))
 				) {

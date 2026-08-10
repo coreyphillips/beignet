@@ -1029,7 +1029,7 @@ describe('Output Resolver (Phase 4B)', function () {
 					[
 						{
 							paymentHash,
-							amountMsat: 1_000_000n,
+							amountMsat: 100_000_000n,
 							cltvExpiry,
 							direction: HtlcDirection.OFFERED
 						}

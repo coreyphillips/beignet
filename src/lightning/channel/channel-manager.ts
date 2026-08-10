@@ -1901,13 +1901,18 @@ export class ChannelManager extends EventEmitter {
 			if (monitor.isFullyResolved()) continue;
 
 			const actions = monitor.handleNewBlock(blockHeight);
+			// Persist the block transition before routing terminal or broadcast
+			// actions. A channel:resolved listener can close the channel immediately,
+			// so the monitor must already be marked dirty at that boundary.
+			this.emit('monitor:updated', channelIdHex, monitor);
 			if (actions.length > 0) {
 				const channelId = Buffer.from(channelIdHex, 'hex');
 				this.processChainActions(channelId, actions);
 				allActions.push(...actions);
+				// REBUILD_SWEEP is applied while actions are processed and can replace
+				// tracked sweep metadata. Persist that post-action state as well.
+				this.emit('monitor:updated', channelIdHex, monitor);
 			}
-			// Emit monitor:updated so LightningNode can persist
-			this.emit('monitor:updated', channelIdHex, monitor);
 		}
 
 		return allActions;
@@ -1937,7 +1942,11 @@ export class ChannelManager extends EventEmitter {
 					blockHeight
 				);
 				const channelId = Buffer.from(channelIdHex, 'hex');
+				this.emit('monitor:updated', channelIdHex, monitor);
 				this.processChainActions(channelId, actions);
+				if (actions.length > 0) {
+					this.emit('monitor:updated', channelIdHex, monitor);
+				}
 				return actions;
 			}
 		}
@@ -1958,8 +1967,10 @@ export class ChannelManager extends EventEmitter {
 				tracked.some((o) => o.txid === txid && o.outputIndex === outputIndex)
 			) {
 				const actions = monitor.handleSpendUnconfirmed(txid, outputIndex);
+				this.emit('monitor:updated', channelIdHex, monitor);
 				if (actions.length > 0) {
 					this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+					this.emit('monitor:updated', channelIdHex, monitor);
 				}
 				return actions;
 			}
@@ -6396,15 +6407,18 @@ export class ChannelManager extends EventEmitter {
 					// the bumped feerate and rebroadcast (RBF). Critical for penalty
 					// txs that must confirm before the cheater's to_self_delay matures.
 					const mon = this.monitors.get(channelId.toString('hex'));
-					const rebuilt = mon?.rebuildSweep(
-						action.output,
-						action.feeRatePerVbyte
-					);
-					if (rebuilt) {
-						// rebuildSweep returns a bitcoin.Transaction; every broadcast:tx
-						// listener expects a raw Buffer. Emitting the Transaction serialized
-						// to "[object Object]" and the RBF re-bump never reached the network.
-						this.emit('broadcast:tx', rebuilt.toBuffer());
+					const rebuilt =
+						mon && typeof mon.rebuildSweeps === 'function'
+							? mon.rebuildSweeps(action.output, action.feeRatePerVbyte)
+							: [
+									mon?.rebuildSweep(action.output, action.feeRatePerVbyte)
+							  ].filter(
+									(tx): tx is import('bitcoinjs-lib').Transaction => !!tx
+							  );
+					for (const tx of rebuilt) {
+						// Sweep rebuilds return bitcoin.Transaction objects; every
+						// broadcast listener expects a raw Buffer.
+						this.emit('broadcast:tx', tx.toBuffer());
 					}
 					break;
 				}

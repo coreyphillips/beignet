@@ -29,6 +29,7 @@ import {
 	ITrackedOutput
 } from '../../src/lightning/chain/types';
 import {
+	matchRevokedHtlcSnapshotOutputs,
 	resolveRevokedCommitmentOutputs,
 	resolveTheirCurrentCommitmentOutputs
 } from '../../src/lightning/chain/output-resolver';
@@ -47,6 +48,10 @@ import {
 	buildToLocalScript,
 	calculateObscuredCommitmentNumber
 } from '../../src/lightning/script/commitment';
+import {
+	buildTaprootOfferedHtlcOutput,
+	buildTaprootReceivedHtlcOutput
+} from '../../src/lightning/script/commitment-taproot';
 import {
 	setupRevokedWithHtlcs,
 	IRevokedSetup
@@ -125,11 +130,17 @@ function trackedAt(
 	return monitor.getTrackedOutputs().find((o) => o.outputIndex === outputIndex);
 }
 
-function installSnapshotHtlc(
+interface ISnapshotHtlcSpec {
+	outputIndex: number;
+	direction: HtlcDirection;
+	amountSats: number;
+	cltvExpiry: number;
+}
+
+function installSnapshotHtlcs(
 	s: IRevokedSetup,
-	direction: HtlcDirection,
-	amountSats = STARVED_SATS
-): Buffer {
+	specs: ISnapshotHtlcSpec[]
+): Buffer[] {
 	const secret = s.state.shaChainStore.getSecret(MAX_INDEX)!;
 	const revokedPoint = perCommitmentPointFromSecret(secret);
 	const revocationPubkey = deriveRevocationPubkey(
@@ -144,42 +155,54 @@ function installSnapshotHtlc(
 		s.state.localBasepoints.htlcBasepoint,
 		revokedPoint
 	);
-	const paymentHash = crypto.randomBytes(32);
-	s.state.revokedHtlcSnapshots = new Map([
-		[
-			'0',
-			[
-				{
-					paymentHash,
-					amountMsat: BigInt(amountSats) * 1000n,
-					cltvExpiry: s.nearCltv,
-					direction
-				}
-			]
-		]
-	]);
-	const script =
-		direction === HtlcDirection.OFFERED
-			? buildReceivedHtlcScript(
-					revocationPubkey,
-					theirHtlc,
-					ourHtlc,
-					paymentHash,
-					s.nearCltv,
-					false
-			  )
-			: buildOfferedHtlcScript(
-					revocationPubkey,
-					theirHtlc,
-					ourHtlc,
-					paymentHash,
-					false
-			  );
-	s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
-		redeem: { output: script }
-	}).output!;
-	s.revokedTx.outs[1].value = amountSats;
-	return paymentHash;
+	const entries = specs.map((spec) => ({
+		paymentHash: crypto.randomBytes(32),
+		amountMsat: BigInt(spec.amountSats) * 1000n,
+		cltvExpiry: spec.cltvExpiry,
+		direction: spec.direction
+	}));
+	s.state.revokedHtlcSnapshots = new Map([['0', entries]]);
+	for (let i = 0; i < specs.length; i++) {
+		const spec = specs[i];
+		const entry = entries[i];
+		const script =
+			spec.direction === HtlcDirection.OFFERED
+				? buildReceivedHtlcScript(
+						revocationPubkey,
+						theirHtlc,
+						ourHtlc,
+						entry.paymentHash,
+						spec.cltvExpiry,
+						false
+				  )
+				: buildOfferedHtlcScript(
+						revocationPubkey,
+						theirHtlc,
+						ourHtlc,
+						entry.paymentHash,
+						false
+				  );
+		s.revokedTx.outs[spec.outputIndex].script = bitcoin.payments.p2wsh({
+			redeem: { output: script }
+		}).output!;
+		s.revokedTx.outs[spec.outputIndex].value = spec.amountSats;
+	}
+	return entries.map((entry) => entry.paymentHash);
+}
+
+function installSnapshotHtlc(
+	s: IRevokedSetup,
+	direction: HtlcDirection,
+	amountSats = STARVED_SATS
+): Buffer {
+	return installSnapshotHtlcs(s, [
+		{
+			outputIndex: 1,
+			direction,
+			amountSats,
+			cltvExpiry: s.nearCltv
+		}
+	])[0];
 }
 
 /**
@@ -540,7 +563,7 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		// the retry set, unwatched, never rebroadcast, and outside full-resolution
 		// accounting, so "retry until spent" would not hold for it.
 		const s = setupRevokedWithHtlcs(HEIGHT);
-		installSnapshotHtlc(s, HtlcDirection.OFFERED);
+		installSnapshotHtlc(s, HtlcDirection.RECEIVED);
 
 		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
 		const openingActions = monitor.handleFundingSpent(s.revokedTx, HEIGHT);
@@ -611,6 +634,169 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		}
 	});
 
+	it('repairs received snapshot metadata from a legacy monitor state', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const paymentHash = installSnapshotHtlc(s, HtlcDirection.RECEIVED);
+		const active = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		active.handleFundingSpent(s.revokedTx, HEIGHT);
+		const legacySnapshot: ITrackedOutput = {
+			...trackedAt(active, 1)!,
+			outputType: OutputType.OFFERED_HTLC,
+			paymentHash: undefined
+		};
+		const resolvedToLocal: ITrackedOutput = {
+			...trackedAt(active, 0)!,
+			status: OutputStatus.IRREVOCABLY_RESOLVED
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [resolvedToLocal, legacySnapshot],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [resolvedToLocal, legacySnapshot],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			SPIKE_SAT_PER_VBYTE,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const repaired = trackedAt(monitor, 1)!;
+		expect(repaired.outputType).to.equal(OutputType.RECEIVED_HTLC);
+		expect(repaired.paymentHash?.equals(paymentHash)).to.equal(true);
+		const persisted = monitor
+			.getFullState()
+			.trackedOutputs.find((output) => output.outputIndex === 1)!;
+		expect(persisted.outputType).to.equal(OutputType.RECEIVED_HTLC);
+		expect(persisted.paymentHash?.equals(paymentHash)).to.equal(true);
+		const contested = monitor.handleNewBlock(s.nearCltv);
+		expect(
+			uneconomicActions(contested).some(
+				(action) => action.outputIndex === 1 && action.reason === 'contested'
+			)
+		).to.equal(true);
+	});
+
+	it('ignores a trimmed same-script snapshot when matching metadata', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const secret = s.state.shaChainStore.getSecret(MAX_INDEX)!;
+		const revokedPoint = perCommitmentPointFromSecret(secret);
+		const paymentHash = crypto.randomBytes(32);
+		const trimmedCltv = HEIGHT + 150_000;
+		const liveCltv = HEIGHT + 10;
+		const liveAmount = 20_000;
+		const script = buildOfferedHtlcScript(
+			deriveRevocationPubkey(
+				s.state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			),
+			derivePublicKey(s.state.remoteBasepoints!.htlcBasepoint, revokedPoint),
+			derivePublicKey(s.state.localBasepoints.htlcBasepoint, revokedPoint),
+			paymentHash,
+			false
+		);
+		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
+			redeem: { output: script }
+		}).output!;
+		s.revokedTx.outs[1].value = liveAmount;
+		s.state.revokedHtlcSnapshots = new Map([
+			[
+				'0',
+				[
+					{
+						paymentHash,
+						amountMsat: 100_000n,
+						cltvExpiry: trimmedCltv,
+						direction: HtlcDirection.RECEIVED
+					},
+					{
+						paymentHash,
+						amountMsat: BigInt(liveAmount) * 1000n,
+						cltvExpiry: liveCltv,
+						direction: HtlcDirection.RECEIVED
+					}
+				]
+			]
+		]);
+
+		const matched = matchRevokedHtlcSnapshotOutputs(
+			s.state,
+			0n,
+			s.revokedTx,
+			network
+		);
+		expect(matched.size).to.equal(1);
+		expect(matched.get(1)?.cltvExpiry).to.equal(liveCltv);
+		expect(matched.get(1)?.outputType).to.equal(OutputType.RECEIVED_HTLC);
+	});
+
+	it('matches duplicate offered scripts in BOLT CLTV order', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const secret = s.state.shaChainStore.getSecret(MAX_INDEX)!;
+		const revokedPoint = perCommitmentPointFromSecret(secret);
+		const paymentHash = crypto.randomBytes(32);
+		const lowCltv = HEIGHT + 10;
+		const highCltv = HEIGHT + 100;
+		const amountSats = 20_000;
+		const script = buildOfferedHtlcScript(
+			deriveRevocationPubkey(
+				s.state.localBasepoints.revocationBasepoint,
+				revokedPoint
+			),
+			derivePublicKey(s.state.remoteBasepoints!.htlcBasepoint, revokedPoint),
+			derivePublicKey(s.state.localBasepoints.htlcBasepoint, revokedPoint),
+			paymentHash,
+			false
+		);
+		const scriptPubkey = bitcoin.payments.p2wsh({
+			redeem: { output: script }
+		}).output!;
+		for (const outputIndex of [1, 2]) {
+			s.revokedTx.outs[outputIndex].script = scriptPubkey;
+			s.revokedTx.outs[outputIndex].value = amountSats;
+		}
+		// Deliberately reverse snapshot insertion order. The commitment indices
+		// still follow the BOLT 3 CLTV tie-break.
+		s.state.revokedHtlcSnapshots = new Map([
+			[
+				'0',
+				[
+					{
+						paymentHash,
+						amountMsat: BigInt(amountSats) * 1000n,
+						cltvExpiry: highCltv,
+						direction: HtlcDirection.RECEIVED
+					},
+					{
+						paymentHash,
+						amountMsat: BigInt(amountSats) * 1000n,
+						cltvExpiry: lowCltv,
+						direction: HtlcDirection.RECEIVED
+					}
+				]
+			]
+		]);
+
+		const matched = matchRevokedHtlcSnapshotOutputs(
+			s.state,
+			0n,
+			s.revokedTx,
+			network
+		);
+		expect(matched.get(1)?.cltvExpiry).to.equal(lowCltv);
+		expect(matched.get(2)?.cltvExpiry).to.equal(highCltv);
+	});
+
 	it('does not resolve a monitor when a block retry adopts a claim', function () {
 		const s = setupRevokedWithHtlcs(HEIGHT);
 		installSnapshotHtlc(s, HtlcDirection.OFFERED);
@@ -654,7 +840,7 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		).to.equal(false);
 	});
 
-	it('reopens a fully resolved monitor when a fee retry adopts a claim', function () {
+	it('reopens a fully resolved monitor before a block retry adopts a claim', function () {
 		const s = setupRevokedWithHtlcs(HEIGHT);
 		installSnapshotHtlc(s, HtlcDirection.OFFERED);
 		const resolvedToLocal: ITrackedOutput = {
@@ -684,7 +870,8 @@ describe('Retrying uneconomic revoked sweeps', function () {
 			network
 		);
 
-		const actions = monitor.updateFeeRate(CALM_SAT_PER_KW);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		const actions = monitor.handleNewBlock(HEIGHT + 1);
 		expect(broadcastTxs(actions)).to.have.length(1);
 		expect(trackedAt(monitor, 1)?.status).to.equal(
 			OutputStatus.SPEND_BROADCAST
@@ -692,9 +879,1274 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
 	});
 
+	it('rebuilds a legacy claimed snapshot output with no stored sweep', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlc(s, HtlcDirection.OFFERED);
+		const resolvedToLocal: ITrackedOutput = {
+			...s.trackedOutputs[0],
+			status: OutputStatus.IRREVOCABLY_RESOLVED
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [resolvedToLocal],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0, 1]
+				},
+				trackedOutputs: [resolvedToLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		expect(trackedAt(monitor, 1)?.status).to.equal(OutputStatus.CONFIRMED);
+		expect(
+			monitor.getFullState().commitmentBroadcast?.claimedOutputIndices
+		).to.deep.equal([0]);
+		const actions = monitor.handleNewBlock(HEIGHT + 1);
+		expect(broadcastTxs(actions)).to.have.length(1);
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.SPEND_BROADCAST
+		);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+	});
+
+	it('restores a missing snapshot output from its shared penalty sweep', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const active = monitorFor(s, 1);
+		const opening = broadcastTxs(
+			active.handleFundingSpent(s.revokedTx, HEIGHT)
+		);
+		const shared = opening.find((tx) => {
+			const indices = spentIndices(tx);
+			return indices.length === 2 && indices[0] === 0 && indices[1] === 1;
+		})!;
+		expect(spentIndices(shared)).to.deep.equal([0, 1]);
+		const trackedToLocal = trackedAt(active, 0)!;
+		expect(trackedToLocal.sweepTxHex).to.equal(shared.toHex());
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [trackedToLocal],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0, 1]
+				},
+				trackedOutputs: [trackedToLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const restoredSnapshot = trackedAt(monitor, 1)!;
+		expect(restoredSnapshot.status).to.equal(OutputStatus.SPEND_BROADCAST);
+		expect(restoredSnapshot.sweepTxHex).to.equal(shared.toHex());
+		expect(
+			monitor.getFullState().commitmentBroadcast?.claimedOutputIndices
+		).to.deep.equal([0, 1]);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+	});
+
+	it('emits resolution for a hidden member of a confirmed shared penalty', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const active = monitorFor(s, 1);
+		const shared = broadcastTxs(
+			active.handleFundingSpent(s.revokedTx, HEIGHT)
+		).find((tx) => spentIndices(tx).join(',') === '0,1')!;
+		expect(shared).to.exist;
+		const terminalSource: ITrackedOutput = {
+			...trackedAt(active, 0)!,
+			status: OutputStatus.IRREVOCABLY_RESOLVED,
+			confirmationHeight: HEIGHT + 1,
+			resolutionTxid: shared.getId(),
+			sweepTxHex: shared.toHex()
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [terminalSource],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0, 1]
+				},
+				trackedOutputs: [terminalSource],
+				currentBlockHeight: HEIGHT + 100
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.SPEND_CONFIRMED
+		);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		const actions = monitor.handleNewBlock(HEIGHT + 101);
+		expect(
+			actions.some(
+				(action) =>
+					action.type === ChainActionType.OUTPUT_RESOLVED &&
+					action.outputIndex === 1
+			)
+		).to.equal(true);
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.IRREVOCABLY_RESOLVED
+		);
+	});
+
+	it('emits resolution for a late-inferred member of a buried penalty', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const monitor = monitorFor(s, 1);
+		const shared = broadcastTxs(
+			monitor.handleFundingSpent(s.revokedTx, HEIGHT)
+		).find((tx) => spentIndices(tx).join(',') === '0,1')!;
+		expect(shared).to.exist;
+		const source = trackedAt(monitor, 0)!;
+		const inferred = trackedAt(monitor, 1)!;
+		source.status = OutputStatus.IRREVOCABLY_RESOLVED;
+		source.resolutionTxid = shared.getId();
+		source.confirmationHeight = HEIGHT + 1;
+
+		const replacements = monitor.rebuildSweeps(inferred, 2);
+		expect(replacements).to.deep.equal([]);
+		expect(inferred.status).to.equal(OutputStatus.SPEND_CONFIRMED);
+		expect(inferred.resolutionTxid).to.equal(shared.getId());
+		const actions = monitor.handleNewBlock(HEIGHT + 101);
+		expect(
+			actions.some(
+				(action) =>
+					action.type === ChainActionType.OUTPUT_RESOLVED &&
+					action.outputIndex === 1
+			)
+		).to.equal(true);
+	});
+
+	it('rebuilds a hidden batch member after its sibling loses a spend race', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const active = monitorFor(s, 1);
+		const shared = broadcastTxs(
+			active.handleFundingSpent(s.revokedTx, HEIGHT)
+		).find((tx) => spentIndices(tx).join(',') === '0,1')!;
+		expect(shared).to.exist;
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 0);
+		competitor.addOutput(s.destScript, 500_000);
+		const staleSource: ITrackedOutput = {
+			...trackedAt(active, 0)!,
+			status: OutputStatus.IRREVOCABLY_RESOLVED,
+			confirmationHeight: HEIGHT + 1,
+			resolutionTxid: competitor.getId(),
+			sweepTxHex: shared.toHex()
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [staleSource],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0, 1]
+				},
+				trackedOutputs: [staleSource],
+				currentBlockHeight: HEIGHT + 100
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const hidden = trackedAt(monitor, 1)!;
+		expect(hidden.status).to.equal(OutputStatus.CONFIRMED);
+		expect(hidden.sweepTxHex).to.equal(undefined);
+		expect(hidden.resolutionTxid).to.equal(undefined);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		expect(
+			monitor.getFullState().commitmentBroadcast?.claimedOutputIndices
+		).to.deep.equal([0]);
+
+		const retried = broadcastTxs(monitor.handleNewBlock(HEIGHT + 101));
+		expect(retried).to.have.length(1);
+		expect(spentIndices(retried[0])).to.deep.equal([1]);
+	});
+
+	it('reopens a legacy fully resolved monitor with an in-flight claim', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlc(s, HtlcDirection.OFFERED);
+		const active = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		active.handleFundingSpent(s.revokedTx, HEIGHT);
+		active.updateFeeRate(CALM_SAT_PER_KW);
+		const inFlight = trackedAt(active, 1)!;
+		expect(inFlight.status).to.equal(OutputStatus.SPEND_BROADCAST);
+		const resolvedToLocal: ITrackedOutput = {
+			...trackedAt(active, 0)!,
+			status: OutputStatus.IRREVOCABLY_RESOLVED
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [resolvedToLocal, inFlight],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0, 1]
+				},
+				trackedOutputs: [resolvedToLocal, inFlight],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		const actions = monitor.handleNewBlock(HEIGHT + 6);
+		expect(
+			actions.some(
+				(action) =>
+					action.type === ChainActionType.REBUILD_SWEEP ||
+					action.type === ChainActionType.BROADCAST_TX
+			)
+		).to.equal(true);
+	});
+
+	it('fee-bumps a jointly economical snapshot penalty as one batch', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_100,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_100,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+		expect(
+			opening[0].ins.some((input) => input.sequence < 0xfffffffe)
+		).to.equal(true);
+		const originalHex = opening[0].toHex();
+		expect(trackedAt(monitor, 1)?.sweepTxHex).to.equal(originalHex);
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(originalHex);
+
+		const bumpActions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuilds = bumpActions.filter(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuilds).to.have.length(1);
+		const rebuild = rebuilds[0];
+		if (rebuild.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected one grouped sweep rebuild');
+		}
+		const replacements = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacements).to.have.length(1);
+		const replacement = replacements[0];
+		expect(spentIndices(replacement)).to.deep.equal([1, 2]);
+		expect(replacement.toHex()).to.not.equal(originalHex);
+		expect(
+			replacement.ins.some((input) => input.sequence < 0xfffffffe)
+		).to.equal(true);
+		expect(replacement.outs[0].value).to.equal(480);
+		const replacementHex = replacement.toHex();
+		for (const outputIndex of [1, 2]) {
+			const output = trackedAt(monitor, outputIndex)!;
+			expect(output.sweepTxHex).to.equal(replacementHex);
+			expect(output.currentFeeRate).to.equal(15);
+			expect(output.broadcastHeight).to.equal(HEIGHT + 7);
+		}
+
+		const restored = ChainMonitor.restore(
+			monitor.getFullState(),
+			s.state,
+			s.destScript,
+			15,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		expect(trackedAt(restored, 1)?.sweepTxHex).to.equal(replacementHex);
+		expect(trackedAt(restored, 2)?.sweepTxHex).to.equal(replacementHex);
+	});
+
+	it('raises a low-rate replacement enough to evict its old batch', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected low-rate group rebuild');
+		}
+		expect(rebuild.feeRatePerVbyte).to.equal(1.5);
+		const replacements = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacements).to.have.length(1);
+		expect(spentIndices(replacements[0])).to.deep.equal([1, 2]);
+		expect(replacements[0].toHex()).to.not.equal(opening[0].toHex());
+		expect(trackedAt(monitor, 1)?.currentFeeRate).to.be.greaterThan(1.5);
+		expect(trackedAt(monitor, 2)?.currentFeeRate).to.equal(
+			trackedAt(monitor, 1)?.currentFeeRate
+		);
+	});
+
+	it('rebroadcasts a shared penalty when its group bump is uneconomic', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 1_500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 1_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+		const rebroadcast = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuilds = rebroadcast.filter(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuilds).to.have.length(1);
+		const rebuild = rebuilds[0];
+		if (rebuild.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected one grouped sweep rebuild');
+		}
+		const rebroadcastTxs = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(rebroadcastTxs).to.have.length(1);
+		expect(rebroadcastTxs[0].toHex()).to.equal(opening[0].toHex());
+		expect(spentIndices(rebroadcastTxs[0])).to.deep.equal([1, 2]);
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.currentFeeRate).to.equal(
+				undefined
+			);
+			expect(trackedAt(monitor, outputIndex)?.broadcastHeight).to.equal(
+				HEIGHT + 7
+			);
+		}
+	});
+
+	it('retains a legacy shared penalty that did not signal replacement', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_100,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_100,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		const legacy = bitcoin.Transaction.fromHex(opening[0].toHex());
+		for (const input of legacy.ins) input.sequence = 0xffffffff;
+		const legacyHex = legacy.toHex();
+		for (const outputIndex of [1, 2]) {
+			const tracked = trackedAt(monitor, outputIndex)!;
+			tracked.sweepTxHex = legacyHex;
+			tracked.currentFeeRate = undefined;
+		}
+
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected legacy group rebuild');
+		}
+		const transactions = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(transactions).to.have.length(1);
+		expect(transactions[0].toHex()).to.equal(legacyHex);
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.sweepTxHex).to.equal(legacyHex);
+			expect(trackedAt(monitor, outputIndex)?.currentFeeRate).to.equal(
+				undefined
+			);
+			expect(trackedAt(monitor, outputIndex)?.broadcastHeight).to.equal(
+				HEIGHT + 7
+			);
+		}
+	});
+
+	it('rebuilds the surviving member after a shared penalty is conflicted', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addOutput(s.destScript, 400);
+		const conflictActions = monitor.handleOutputSpent(
+			s.revokedTx.getId(),
+			1,
+			competitor,
+			HEIGHT + 2
+		);
+		const replacements = broadcastTxs(conflictActions);
+		expect(replacements).to.have.length(1);
+		expect(spentIndices(replacements[0])).to.deep.equal([2]);
+		expect(replacements[0].toHex()).to.not.equal(opening[0].toHex());
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(replacements[0].toHex());
+		expect(
+			monitor
+				.getFullState()
+				.commitmentBroadcast?.claimedOutputIndices?.sort((a, b) => a - b)
+		).to.deep.equal([0, 2]);
+	});
+
+	it('excludes a spent member when a survivor becomes affordable later', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 1_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+		monitor.updateFeeRate(12_500);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addOutput(s.destScript, 400);
+		const conflictActions = monitor.handleOutputSpent(
+			s.revokedTx.getId(),
+			1,
+			competitor,
+			HEIGHT + 2
+		);
+		expect(broadcastTxs(conflictActions)).to.have.length(0);
+		expect(trackedAt(monitor, 2)?.status).to.equal(OutputStatus.CONFIRMED);
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(undefined);
+
+		const recovered = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
+		expect(recovered).to.have.length(1);
+		expect(spentIndices(recovered[0])).to.deep.equal([2]);
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.SPEND_CONFIRMED
+		);
+		expect(trackedAt(monitor, 1)?.resolutionTxid).to.equal(competitor.getId());
+	});
+
+	it('does not rebuild any member spent by one competing transaction', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		expect(broadcastTxs(monitor.handleNewBlock(HEIGHT + 1))).to.have.length(1);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 2);
+		competitor.addOutput(s.destScript, 4_000);
+		const actions = monitor.handleOutputSpent(
+			s.revokedTx.getId(),
+			1,
+			competitor,
+			HEIGHT + 2
+		);
+		expect(broadcastTxs(actions)).to.have.length(0);
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.status).to.equal(
+				OutputStatus.SPEND_CONFIRMED
+			);
+			expect(trackedAt(monitor, outputIndex)?.resolutionTxid).to.equal(
+				competitor.getId()
+			);
+		}
+		expect(
+			monitor.handleOutputSpent(s.revokedTx.getId(), 2, competitor, HEIGHT + 2)
+		).to.deep.equal([]);
+	});
+
+	it('repairs a shared cohort when the first callback names another claim', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.RECEIVED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 10
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const toLocal = {
+			...s.trackedOutputs[0],
+			txid: s.revokedTx.getId(),
+			confirmationHeight: HEIGHT
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [toLocal],
+					revokedTxHex: s.revokedTx.toHex()
+				},
+				trackedOutputs: [toLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening.map(spentIndices)).to.deep.include.members([[1], [0, 2]]);
+		const oldShared = opening.find(
+			(tx) => spentIndices(tx).join(',') === '0,2'
+		)!;
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 2);
+		competitor.addOutput(s.destScript, 90_000);
+		const repaired = broadcastTxs(
+			monitor.handleOutputSpent(s.revokedTx.getId(), 1, competitor, HEIGHT + 2)
+		);
+		expect(repaired).to.have.length(1);
+		expect(spentIndices(repaired[0])).to.deep.equal([0]);
+		expect(repaired[0].toHex()).to.not.equal(oldShared.toHex());
+		expect(trackedAt(monitor, 2)?.status).to.equal(
+			OutputStatus.SPEND_CONFIRMED
+		);
+	});
+
+	it('rearms every member when one watch reports a multi-input reorg', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 2);
+		competitor.addOutput(s.destScript, 4_000);
+		monitor.handleOutputSpent(s.revokedTx.getId(), 1, competitor, HEIGHT + 2);
+
+		const recovery = broadcastTxs(
+			monitor.handleSpendUnconfirmed(s.revokedTx.getId(), 1)
+		);
+		expect(recovery).to.have.length(1);
+		expect(recovery[0].toHex()).to.equal(opening[0].toHex());
+		expect(spentIndices(recovery[0])).to.deep.equal([1, 2]);
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.status).to.equal(
+				OutputStatus.SPEND_BROADCAST
+			);
+			expect(trackedAt(monitor, outputIndex)?.resolutionTxid).to.equal(
+				undefined
+			);
+		}
+	});
+
+	it('keeps a survivor claim when its competing sibling spend reorgs', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 2_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addOutput(s.destScript, 2_000);
+		const survivor = broadcastTxs(
+			monitor.handleOutputSpent(s.revokedTx.getId(), 1, competitor, HEIGHT + 2)
+		);
+		expect(survivor).to.have.length(1);
+		expect(spentIndices(survivor[0])).to.deep.equal([2]);
+		const survivorHex = survivor[0].toHex();
+
+		const recovery = broadcastTxs(
+			monitor.handleSpendUnconfirmed(s.revokedTx.getId(), 1)
+		);
+		expect(recovery).to.have.length(1);
+		expect(spentIndices(recovery[0])).to.deep.equal([1]);
+		expect(trackedAt(monitor, 1)?.sweepTxHex).to.equal(recovery[0].toHex());
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(survivorHex);
+	});
+
+	it('restores shared bookkeeping when an uneconomic conflict reorgs', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 500,
+				cltvExpiry: HEIGHT + 1_000
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 1_500,
+				cltvExpiry: HEIGHT + 1_100
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+		monitor.updateFeeRate(12_500);
+
+		const competitor = new bitcoin.Transaction();
+		competitor.version = 2;
+		competitor.addInput(Buffer.from(s.revokedTx.getId(), 'hex').reverse(), 1);
+		competitor.addOutput(s.destScript, 400);
+		expect(
+			broadcastTxs(
+				monitor.handleOutputSpent(
+					s.revokedTx.getId(),
+					1,
+					competitor,
+					HEIGHT + 2
+				)
+			)
+		).to.have.length(0);
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(undefined);
+
+		const recovery = broadcastTxs(
+			monitor.handleSpendUnconfirmed(s.revokedTx.getId(), 1)
+		);
+		expect(recovery).to.have.length(1);
+		expect(recovery[0].toHex()).to.equal(opening[0].toHex());
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.status).to.equal(
+				OutputStatus.SPEND_BROADCAST
+			);
+			expect(trackedAt(monitor, outputIndex)?.sweepTxHex).to.equal(
+				opening[0].toHex()
+			);
+		}
+		expect(
+			monitor
+				.getFullState()
+				.commitmentBroadcast?.claimedOutputIndices?.sort((a, b) => a - b)
+		).to.deep.equal([0, 1, 2]);
+	});
+
+	it('does not pull an unclaimed urgent snapshot into a safe group rebuild', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.RECEIVED,
+				amountSats: 1_200,
+				cltvExpiry: HEIGHT + 10
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const toLocal = {
+			...s.trackedOutputs[0],
+			txid: s.revokedTx.getId(),
+			confirmationHeight: HEIGHT
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [toLocal],
+					revokedTxHex: s.revokedTx.toHex()
+				},
+				trackedOutputs: [toLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([0, 2]);
+		expect(trackedAt(monitor, 1)?.sweepTxHex).to.equal(undefined);
+
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) =>
+				action.type === ChainActionType.REBUILD_SWEEP &&
+				action.output.sweepTxHex === opening[0].toHex()
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected safe group rebuild');
+		}
+		const replacements = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacements).to.have.length(1);
+		expect(spentIndices(replacements[0])).to.deep.equal([0, 2]);
+		expect(trackedAt(monitor, 1)?.status).to.equal(OutputStatus.CONFIRMED);
+		expect(trackedAt(monitor, 1)?.sweepTxHex).to.equal(undefined);
+	});
+
+	it('splits a newly urgent member and leaves the remainder retryable', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.RECEIVED,
+				amountSats: 4_000,
+				cltvExpiry: HEIGHT + 20
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 500,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+
+		monitor.updateFeeRate(5_000);
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected urgent group rebuild');
+		}
+		const replacements = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacements).to.have.length(1);
+		expect(spentIndices(replacements[0])).to.deep.equal([1]);
+		expect(trackedAt(monitor, 1)?.sweepTxHex).to.equal(replacements[0].toHex());
+		expect(trackedAt(monitor, 2)?.status).to.equal(OutputStatus.CONFIRMED);
+		expect(trackedAt(monitor, 2)?.sweepTxHex).to.equal(undefined);
+		expect(
+			monitor
+				.getFullState()
+				.commitmentBroadcast?.claimedOutputIndices?.sort((a, b) => a - b)
+		).to.deep.equal([0, 1]);
+
+		const retry = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
+		expect(retry).to.have.length(1);
+		expect(spentIndices(retry[0])).to.deep.equal([2]);
+	});
+
+	it('keeps the singular rebuild API on one complete replacement', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlcs(s, [
+			{
+				outputIndex: 1,
+				direction: HtlcDirection.RECEIVED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 20
+			},
+			{
+				outputIndex: 2,
+				direction: HtlcDirection.OFFERED,
+				amountSats: 50_000,
+				cltvExpiry: HEIGHT + 1_000
+			}
+		]);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			10,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+		const opening = broadcastTxs(monitor.handleNewBlock(HEIGHT + 1));
+		expect(opening).to.have.length(1);
+		expect(spentIndices(opening[0])).to.deep.equal([1, 2]);
+
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected singular compatibility rebuild');
+		}
+		const replacement = monitor.rebuildSweep(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacement).to.not.equal(null);
+		expect(spentIndices(replacement!)).to.deep.equal([1, 2]);
+		for (const outputIndex of [1, 2]) {
+			expect(trackedAt(monitor, outputIndex)?.sweepTxHex).to.equal(
+				replacement!.toHex()
+			);
+		}
+	});
+
 	it('retries a skipped taproot penalty', function () {
 		const { state, aliceSeed, destScript } = revokedTaprootSetup();
 		const revokedTx = emptyRevokedTx();
+		revokedTx.addOutput(Buffer.from([0x51]), 50_000);
+		revokedTx.addOutput(Buffer.from([0x51]), 20_000);
 		const txid = revokedTx.getId();
 		const tracked = trackedFor(50_000n, 20_000n, HEIGHT + 500).map((o) => ({
 			...o,
@@ -734,6 +2186,142 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		expect(spentIndices(txs[0]), 'claiming both penalty inputs').to.deep.equal([
 			0, 1
 		]);
+		expect(txs[0].ins.some((input) => input.sequence < 0xfffffffe)).to.equal(
+			true
+		);
+
+		const actions = monitor.handleNewBlock(HEIGHT + 7);
+		const rebuild = actions.find(
+			(action) => action.type === ChainActionType.REBUILD_SWEEP
+		);
+		expect(rebuild?.type).to.equal(ChainActionType.REBUILD_SWEEP);
+		if (rebuild?.type !== ChainActionType.REBUILD_SWEEP) {
+			throw new Error('expected taproot penalty rebuild');
+		}
+		const replacements = monitor.rebuildSweeps(
+			rebuild.output,
+			rebuild.feeRatePerVbyte
+		);
+		expect(replacements).to.have.length(1);
+		expect(replacements[0].toHex()).to.not.equal(txs[0].toHex());
+		expect(
+			replacements[0].ins.some((input) => input.sequence < 0xfffffffe)
+		).to.equal(true);
+	});
+
+	it('adopts an untracked claimed taproot snapshot during restore', function () {
+		const { state, aliceSeed, destScript } = revokedTaprootSetup();
+		const secret = state.shaChainStore.getSecret(MAX_INDEX - 1n)!;
+		const point = perCommitmentPointFromSecret(secret);
+		const paymentHash = crypto.randomBytes(32);
+		const cltvExpiry = HEIGHT + 1_000;
+		const amountSats = 50_000;
+		state.revokedHtlcSnapshots = new Map([
+			[
+				'1',
+				[
+					{
+						paymentHash,
+						amountMsat: BigInt(amountSats) * 1000n,
+						cltvExpiry,
+						direction: HtlcDirection.OFFERED
+					}
+				]
+			]
+		]);
+		const htlcOutput = buildTaprootReceivedHtlcOutput(
+			deriveRevocationPubkey(state.localBasepoints.revocationBasepoint, point),
+			derivePublicKey(state.remoteBasepoints!.htlcBasepoint, point),
+			derivePublicKey(state.localBasepoints.htlcBasepoint, point),
+			paymentHash,
+			cltvExpiry,
+			NETWORK
+		).output;
+		const revokedTx = emptyRevokedTx();
+		revokedTx.addOutput(htlcOutput, amountSats);
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 1n,
+					trackedOutputs: [],
+					revokedTxHex: revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [],
+				currentBlockHeight: HEIGHT
+			},
+			state,
+			destScript,
+			1,
+			privAt(aliceSeed, 1),
+			privAt(aliceSeed, 2),
+			NETWORK
+		);
+
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		const adopted = trackedAt(monitor, 0)!;
+		expect(adopted.outputType).to.equal(OutputType.OFFERED_HTLC);
+		expect(adopted.paymentHash?.equals(paymentHash)).to.equal(true);
+		expect(
+			monitor.getFullState().commitmentBroadcast?.claimedOutputIndices
+		).to.deep.equal([]);
+		const actions = monitor.handleNewBlock(HEIGHT + 1);
+		expect(broadcastTxs(actions)).to.have.length(1);
+		expect(trackedAt(monitor, 0)?.status).to.equal(
+			OutputStatus.SPEND_BROADCAST
+		);
+	});
+
+	it('matches duplicate taproot offered outputs in BOLT CLTV order', function () {
+		const { state } = revokedTaprootSetup();
+		const secret = state.shaChainStore.getSecret(MAX_INDEX - 1n)!;
+		const point = perCommitmentPointFromSecret(secret);
+		const paymentHash = crypto.randomBytes(32);
+		const amountSats = 50_000;
+		const lowCltv = HEIGHT + 10;
+		const highCltv = HEIGHT + 100;
+		state.revokedHtlcSnapshots = new Map([
+			[
+				'1',
+				[
+					{
+						paymentHash,
+						amountMsat: BigInt(amountSats) * 1000n,
+						cltvExpiry: highCltv,
+						direction: HtlcDirection.RECEIVED
+					},
+					{
+						paymentHash,
+						amountMsat: BigInt(amountSats) * 1000n,
+						cltvExpiry: lowCltv,
+						direction: HtlcDirection.RECEIVED
+					}
+				]
+			]
+		]);
+		const output = buildTaprootOfferedHtlcOutput(
+			deriveRevocationPubkey(state.localBasepoints.revocationBasepoint, point),
+			derivePublicKey(state.remoteBasepoints!.htlcBasepoint, point),
+			derivePublicKey(state.localBasepoints.htlcBasepoint, point),
+			paymentHash,
+			NETWORK
+		).output;
+		const revokedTx = emptyRevokedTx();
+		revokedTx.addOutput(output, amountSats);
+		revokedTx.addOutput(output, amountSats);
+
+		const matched = matchRevokedHtlcSnapshotOutputs(
+			state,
+			1n,
+			revokedTx,
+			NETWORK
+		);
+		expect(matched.get(0)?.cltvExpiry).to.equal(lowCltv);
+		expect(matched.get(1)?.cltvExpiry).to.equal(highCltv);
 	});
 });
 

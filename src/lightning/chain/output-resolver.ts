@@ -2120,7 +2120,7 @@ export function resolveTheirCurrentCommitmentOutputs(
 
 			// Both builders below throw when the fee exceeds the output (the guards
 			// inside buildToLocalSweepTx / buildToRemoteClaimTx), and this loop runs
-			// over every output of one commitment — so an uneconomic to_remote used
+			// over every output of one commitment, so an uneconomic to_remote used
 			// to abandon the HTLC claims that follow it. Decide affordability here
 			// instead, the way #241 did for the penalty batch, and track the output
 			// without a spend so the retry can claim it once fees fall.
@@ -2264,7 +2264,7 @@ export function resolveTheirCurrentCommitmentOutputs(
 			) {
 				// Build and sign the preimage claim transaction. Anchor channels add
 				// a 1-block CSV to the HTLC output's claim path, so the input must use
-				// sequence 1 (the default 0xffffffff disable bit would fail OP_CSV).
+				// sequence 1 (the immediate-path RBF sequence would fail OP_CSV).
 				const claimTx = buildRemoteHtlcPreimageClaimTx({
 					commitmentTxid: output.txid,
 					outputIndex: output.outputIndex,
@@ -2272,7 +2272,7 @@ export function resolveTheirCurrentCommitmentOutputs(
 					witnessScript: output.witnessScript,
 					destinationScript,
 					feeSatoshis,
-					inputSequence: isAnchorChannel(state.channelType) ? 1 : 0xffffffff
+					inputSequence: isAnchorChannel(state.channelType) ? 1 : 0xfffffffd
 				});
 
 				// Derive local HTLC private key for signing
@@ -2332,10 +2332,150 @@ export const PENALTY_SPLIT_DEADLINE_BLOCKS = 18;
  * ours. A retry resolves only the outputs left unclaimed, so without this the
  * settled-HTLC rescan below (which reads the snapshot, not the tracked set)
  * would pull an already-claimed outpoint back into the new batch and build a
- * transaction conflicting with our own live penalty — one that, paying a higher
+ * transaction conflicting with our own live penalty. One paying a higher
  * absolute fee, would REPLACE the batch holding their to_local.
  */
 export type ClaimedOutputIndices = ReadonlySet<number>;
+
+export interface IRevokedHtlcSnapshotOutput {
+	outputType: OutputType.OFFERED_HTLC | OutputType.RECEIVED_HTLC;
+	paymentHash: Buffer;
+	cltvExpiry: number;
+	witnessScript?: Buffer;
+}
+
+/**
+ * Match revoked-commitment outputs against the HTLC snapshot that was saved
+ * when the commitment was signed. This is also used during monitor restore to
+ * repair metadata persisted by older snapshot-adoption code.
+ */
+export function matchRevokedHtlcSnapshotOutputs(
+	state: IChannelState,
+	commitmentNumber: bigint,
+	revokedTx: bitcoin.Transaction,
+	network: bitcoin.Network = bitcoin.networks.bitcoin
+): Map<number, IRevokedHtlcSnapshotOutput> {
+	const matched = new Map<number, IRevokedHtlcSnapshotOutput>();
+	if (!state.remoteBasepoints) return matched;
+	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
+	if (!snapshot || snapshot.length === 0) return matched;
+	const perCommitmentSecret = state.shaChainStore.getSecret(
+		MAX_INDEX - commitmentNumber
+	);
+	if (!perCommitmentSecret) return matched;
+
+	const perCommitmentPoint = perCommitmentPointFromSecret(perCommitmentSecret);
+	const taproot = isTaprootChannel(state.channelType);
+	const taprootKeys = taproot
+		? deriveTaprootCommitKeys(state, perCommitmentPoint, false)
+		: undefined;
+	const revocationPubkey = taproot
+		? undefined
+		: deriveRevocationPubkey(
+				state.localBasepoints.revocationBasepoint,
+				perCommitmentPoint
+		  );
+	const theirHtlcPubkey = taproot
+		? undefined
+		: derivePublicKey(state.remoteBasepoints.htlcBasepoint, perCommitmentPoint);
+	const ourHtlcPubkey = taproot
+		? undefined
+		: derivePublicKey(state.localBasepoints.htlcBasepoint, perCommitmentPoint);
+	const useAnchors = isAnchorChannel(state.channelType);
+	interface ISnapshotMatchCandidate {
+		amountSats: number;
+		scriptPubkey: Buffer;
+		metadata: IRevokedHtlcSnapshotOutput;
+	}
+	const matchGroups = new Map<string, ISnapshotMatchCandidate[]>();
+
+	for (const entry of snapshot) {
+		// On their commitment our offered HTLC uses their received script, and
+		// our received HTLC uses their offered script.
+		let witnessScript: Buffer | undefined;
+		let scriptPubkey: Buffer | undefined;
+		if (taprootKeys) {
+			const asOffered = entry.direction === HtlcDirection.RECEIVED;
+			scriptPubkey = asOffered
+				? buildTaprootOfferedHtlcOutput(
+						taprootKeys.revocationPubkey,
+						taprootKeys.localHtlcPubkey,
+						taprootKeys.remoteHtlcPubkey,
+						entry.paymentHash,
+						network
+				  ).output
+				: buildTaprootReceivedHtlcOutput(
+						taprootKeys.revocationPubkey,
+						taprootKeys.localHtlcPubkey,
+						taprootKeys.remoteHtlcPubkey,
+						entry.paymentHash,
+						entry.cltvExpiry,
+						network
+				  ).output;
+		} else {
+			witnessScript =
+				entry.direction === HtlcDirection.OFFERED
+					? buildReceivedHtlcScript(
+							revocationPubkey!,
+							theirHtlcPubkey!,
+							ourHtlcPubkey!,
+							entry.paymentHash,
+							entry.cltvExpiry,
+							useAnchors
+					  )
+					: buildOfferedHtlcScript(
+							revocationPubkey!,
+							theirHtlcPubkey!,
+							ourHtlcPubkey!,
+							entry.paymentHash,
+							useAnchors
+					  );
+			scriptPubkey = bitcoin.payments.p2wsh({
+				redeem: { output: witnessScript }
+			}).output;
+		}
+		if (!scriptPubkey) continue;
+
+		const amountSats = Number(entry.amountMsat / 1000n);
+		const key = amountSats + ':' + scriptPubkey.toString('hex');
+		const candidates = matchGroups.get(key) ?? [];
+		candidates.push({
+			amountSats,
+			scriptPubkey,
+			metadata: {
+				outputType:
+					entry.direction === HtlcDirection.OFFERED
+						? OutputType.OFFERED_HTLC
+						: OutputType.RECEIVED_HTLC,
+				paymentHash: entry.paymentHash,
+				cltvExpiry: entry.cltvExpiry,
+				witnessScript
+			}
+		});
+		matchGroups.set(key, candidates);
+	}
+
+	for (const candidates of matchGroups.values()) {
+		// Equal-value offered HTLC outputs can have identical scripts because the
+		// script omits CLTV. BOLT 3 orders that tie by CLTV ascending, independent
+		// of snapshot insertion order, so restore must pair metadata the same way.
+		candidates.sort((a, b) => a.metadata.cltvExpiry - b.metadata.cltvExpiry);
+		const outputIndices: number[] = [];
+		for (let i = 0; i < revokedTx.outs.length; i++) {
+			if (
+				revokedTx.outs[i].value === candidates[0].amountSats &&
+				revokedTx.outs[i].script.equals(candidates[0].scriptPubkey)
+			) {
+				outputIndices.push(i);
+			}
+		}
+		for (let i = 0; i < candidates.length && i < outputIndices.length; i++) {
+			matched.set(outputIndices[i], candidates[i].metadata);
+		}
+	}
+
+	return matched;
+}
 
 export function resolveRevokedCommitmentOutputs(
 	state: IChannelState,
@@ -2393,15 +2533,21 @@ export function resolveRevokedCommitmentOutputs(
 	// HTLC cltv_expiry per output index: near this height the cheater's
 	// pre-signed HTLC-timeout competes for the outpoint (deadline-split below).
 	const htlcDeadlines = new Map<number, number>();
-	// Metadata for settled HTLCs reconstructed from the snapshot. A stand-in is
-	// adopted into persistent monitor state, so it must preserve the same
-	// direction and payment context as a normally classified output.
-	const snapshotHtlcMetadata = new Map<
-		number,
-		{ outputType: OutputType; paymentHash: Buffer }
-	>();
+	const snapshotHtlcMetadata = matchRevokedHtlcSnapshotOutputs(
+		state,
+		commitmentNumber,
+		revokedTx,
+		network
+	);
 
 	for (const output of trackedOutputs) {
+		const snapshotMetadata = snapshotHtlcMetadata.get(output.outputIndex);
+		if (snapshotMetadata && output.txid === revokedTx.getId()) {
+			output.outputType = snapshotMetadata.outputType;
+			output.paymentHash = snapshotMetadata.paymentHash;
+			output.cltvExpiry = snapshotMetadata.cltvExpiry;
+			output.witnessScript = snapshotMetadata.witnessScript;
+		}
 		if (alreadyClaimed.has(output.outputIndex)) continue;
 		if (output.outputType === OutputType.TO_LOCAL && output.witnessScript) {
 			claimableIndices.push(output.outputIndex);
@@ -2413,7 +2559,10 @@ export function resolveRevokedCommitmentOutputs(
 		) {
 			claimableIndices.push(output.outputIndex);
 			witnessScripts.set(output.outputIndex, output.witnessScript);
-			if (output.cltvExpiry !== undefined) {
+			if (
+				output.outputType === OutputType.RECEIVED_HTLC &&
+				output.cltvExpiry !== undefined
+			) {
 				htlcDeadlines.set(output.outputIndex, output.cltvExpiry);
 			}
 		} else if (output.outputType === OutputType.TO_REMOTE) {
@@ -2438,7 +2587,7 @@ export function resolveRevokedCommitmentOutputs(
 				)
 			);
 			// Both builders below throw when the fee exceeds the output, and this
-			// runs BEFORE the penalty batch is built — so an uneconomic to_remote
+			// runs BEFORE the penalty batch is built, so an uneconomic to_remote
 			// (dust-sized balance against a spiked feerate) used to abandon the
 			// whole breach remedy, their to_local included. Same guard and same
 			// reasoning as #241, which fixed it for the batch itself. The taproot
@@ -2506,62 +2655,18 @@ export function resolveRevokedCommitmentOutputs(
 	// HTLCs, so without the snapshot those outputs go unpenalized and the cheater
 	// reclaims them after their CLTV/CSV. Reconstruct each snapshot HTLC's script
 	// (using this commitment's keys) and add any matching, not-yet-claimed output.
-	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
-	if (snapshot && snapshot.length > 0) {
-		const useAnchors = isAnchorChannel(state.channelType);
-		const htlcRevocationPubkey = deriveRevocationPubkey(
-			state.localBasepoints.revocationBasepoint,
-			perCommitmentPoint
-		);
-		const theirHtlcPubkey = derivePublicKey(
-			state.remoteBasepoints.htlcBasepoint,
-			perCommitmentPoint
-		);
-		const ourHtlcPubkey = derivePublicKey(
-			state.localBasepoints.htlcBasepoint,
-			perCommitmentPoint
-		);
-		for (const entry of snapshot) {
-			// On their commitment: our offered HTLC uses the received-HTLC script,
-			// our received HTLC uses the offered-HTLC script (perspective swap).
-			const script =
-				entry.direction === HtlcDirection.OFFERED
-					? buildReceivedHtlcScript(
-							htlcRevocationPubkey,
-							theirHtlcPubkey,
-							ourHtlcPubkey,
-							entry.paymentHash,
-							entry.cltvExpiry,
-							useAnchors
-					  )
-					: buildOfferedHtlcScript(
-							htlcRevocationPubkey,
-							theirHtlcPubkey,
-							ourHtlcPubkey,
-							entry.paymentHash,
-							useAnchors
-					  );
-			const p2wsh = bitcoin.payments.p2wsh({ redeem: { output: script } });
-			if (!p2wsh.output) continue;
-			for (let i = 0; i < revokedTx.outs.length; i++) {
-				if (
-					!claimableIndices.includes(i) &&
-					!alreadyClaimed.has(i) &&
-					revokedTx.outs[i].script.equals(p2wsh.output)
-				) {
-					claimableIndices.push(i);
-					witnessScripts.set(i, script);
-					htlcDeadlines.set(i, entry.cltvExpiry);
-					snapshotHtlcMetadata.set(i, {
-						outputType:
-							entry.direction === HtlcDirection.OFFERED
-								? OutputType.OFFERED_HTLC
-								: OutputType.RECEIVED_HTLC,
-						paymentHash: entry.paymentHash
-					});
-					break;
-				}
-			}
+	for (const [outputIndex, metadata] of snapshotHtlcMetadata) {
+		if (
+			claimableIndices.includes(outputIndex) ||
+			alreadyClaimed.has(outputIndex)
+		) {
+			continue;
+		}
+		if (!metadata.witnessScript) continue;
+		claimableIndices.push(outputIndex);
+		witnessScripts.set(outputIndex, metadata.witnessScript);
+		if (metadata.outputType === OutputType.RECEIVED_HTLC) {
+			htlcDeadlines.set(outputIndex, metadata.cltvExpiry);
 		}
 	}
 
@@ -2595,8 +2700,9 @@ export function resolveRevokedCommitmentOutputs(
 			outputType: snapshotMetadata?.outputType ?? OutputType.OFFERED_HTLC,
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0,
-			witnessScript: witnessScripts.get(outputIdx),
-			cltvExpiry: htlcDeadlines.get(outputIdx),
+			witnessScript:
+				snapshotMetadata?.witnessScript ?? witnessScripts.get(outputIdx),
+			cltvExpiry: snapshotMetadata?.cltvExpiry ?? htlcDeadlines.get(outputIdx),
 			paymentHash: snapshotMetadata?.paymentHash
 		};
 	};
@@ -2835,57 +2941,55 @@ function resolveRevokedTaprootCommitmentOutputs(
 	// and the cheater reclaims them after their CLTV/CSV (mirrors the witness-v0
 	// snapshot fallback in resolveRevokedCommitmentOutputs). Each is a
 	// revocation-key-path (merkleRoot) breach spend.
-	const snapshot = state.revokedHtlcSnapshots?.get(commitmentNumber.toString());
-	if (snapshot && snapshot.length > 0) {
+	const snapshotOutputs = matchRevokedHtlcSnapshotOutputs(
+		state,
+		commitmentNumber,
+		revokedTx,
+		network
+	);
+	if (snapshotOutputs.size > 0) {
 		const handled = new Set<number>([
 			...trackedOutputs.map((o) => o.outputIndex),
 			...alreadyClaimed
 		]);
-		for (const entry of snapshot) {
+		for (const [outputIndex, metadata] of snapshotOutputs) {
+			if (handled.has(outputIndex)) continue;
 			// outputType/direction reflect OUR perspective; on THEIR commitment our
 			// received HTLC is their offered output and vice-versa (the same swap the
 			// tracked-output loop above and matchTaprootHtlcOutput use).
-			const asOffered = entry.direction === HtlcDirection.RECEIVED;
+			const asOffered = metadata.outputType === OutputType.RECEIVED_HTLC;
 			const h = asOffered
 				? buildTaprootOfferedHtlcOutput(
 						keys.revocationPubkey,
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
-						entry.paymentHash,
+						metadata.paymentHash,
 						network
 				  )
 				: buildTaprootReceivedHtlcOutput(
 						keys.revocationPubkey,
 						keys.localHtlcPubkey,
 						keys.remoteHtlcPubkey,
-						entry.paymentHash,
-						entry.cltvExpiry || 0,
+						metadata.paymentHash,
+						metadata.cltvExpiry,
 						network
 				  );
-			for (let i = 0; i < revokedTx.outs.length; i++) {
-				if (handled.has(i)) continue;
-				if (!revokedTx.outs[i].script.equals(h.output)) continue;
-				handled.add(i);
-				penaltyIns.push({
-					output: {
-						txid: revokedTx.getId(),
-						outputIndex: i,
-						amount: BigInt(revokedTx.outs[i].value),
-						outputType:
-							entry.direction === HtlcDirection.OFFERED
-								? OutputType.OFFERED_HTLC
-								: OutputType.RECEIVED_HTLC,
-						status: OutputStatus.CONFIRMED,
-						confirmationHeight: 0,
-						paymentHash: entry.paymentHash,
-						cltvExpiry: entry.cltvExpiry
-					},
-					spk: h.output,
-					value: revokedTx.outs[i].value,
-					merkleRoot: h.merkleRoot
-				});
-				break;
-			}
+			handled.add(outputIndex);
+			penaltyIns.push({
+				output: {
+					txid: revokedTx.getId(),
+					outputIndex,
+					amount: BigInt(revokedTx.outs[outputIndex].value),
+					outputType: metadata.outputType,
+					status: OutputStatus.CONFIRMED,
+					confirmationHeight: 0,
+					paymentHash: metadata.paymentHash,
+					cltvExpiry: metadata.cltvExpiry
+				},
+				spk: h.output,
+				value: revokedTx.outs[outputIndex].value,
+				merkleRoot: h.merkleRoot
+			});
 		}
 	}
 
@@ -2901,7 +3005,8 @@ function resolveRevokedTaprootCommitmentOutputs(
 		for (const pin of ins) {
 			penaltyTx.addInput(
 				Buffer.from(pin.output.txid, 'hex').reverse(),
-				pin.output.outputIndex
+				pin.output.outputIndex,
+				0xfffffffd
 			);
 			totalIn += BigInt(pin.value);
 		}
@@ -2974,6 +3079,7 @@ function resolveRevokedTaprootCommitmentOutputs(
 			currentHeight !== undefined && penaltyIns.length > 1
 				? penaltyIns.filter(
 						(pin) =>
+							pin.output.outputType === OutputType.RECEIVED_HTLC &&
 							pin.output.cltvExpiry !== undefined &&
 							pin.output.cltvExpiry - currentHeight <=
 								PENALTY_SPLIT_DEADLINE_BLOCKS
@@ -3060,7 +3166,11 @@ export function resolveRevokedSecondLevelOutput(
 			if (claimValue === null) continue;
 			const claimTx = new bitcoin.Transaction();
 			claimTx.version = 2;
-			claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
+			claimTx.addInput(
+				Buffer.from(spendingTxid, 'hex').reverse(),
+				i,
+				0xfffffffd
+			);
 			claimTx.addOutput(destinationScript, claimValue);
 			const sighash = claimTx.hashForWitnessV1(
 				0,
@@ -3117,11 +3227,11 @@ export function resolveRevokedSecondLevelOutput(
 		const amount = BigInt(out.value);
 		const claimValue = sweepOutputValue(amount, feeSatoshis, destinationScript);
 		if (claimValue === null) continue;
-		// Revocation branch: no CSV/CLTV — spend immediately (default sequence,
-		// locktime 0, matching buildPenaltyTx's convention).
+		// Revocation branch: no CSV/CLTV. Opt in to replacement so a stalled
+		// justice transaction can be rebuilt before the cheater's delay matures.
 		const claimTx = new bitcoin.Transaction();
 		claimTx.version = 2;
-		claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i);
+		claimTx.addInput(Buffer.from(spendingTxid, 'hex').reverse(), i, 0xfffffffd);
 		claimTx.addOutput(destinationScript, claimValue);
 		const sig = signPenaltyInput(
 			claimTx,

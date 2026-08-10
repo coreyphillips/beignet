@@ -162,7 +162,7 @@ export function trackedFor(
 			txid,
 			outputIndex: 1,
 			amount: htlcSats,
-			outputType: OutputType.OFFERED_HTLC,
+			outputType: OutputType.RECEIVED_HTLC,
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0,
 			paymentHash: crypto.randomBytes(32),

@@ -244,7 +244,7 @@ export function buildToRemoteClaimTx(
 	tx.locktime = 0;
 
 	const txidBuf = Buffer.from(commitmentTxid, 'hex').reverse();
-	tx.addInput(txidBuf, outputIndex, 0xffffffff);
+	tx.addInput(txidBuf, outputIndex, 0xfffffffd);
 
 	const outputAmount = amount - feeSatoshis;
 	if (outputAmount <= 0n) {

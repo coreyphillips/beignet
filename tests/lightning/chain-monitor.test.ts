@@ -1006,9 +1006,15 @@ describe('Chain Monitor (Phase 4C)', function () {
 				openerPrivkeys[4]
 			);
 			const txid = 'bb'.repeat(32);
+			const penalty = new bitcoin.Transaction();
+			penalty.version = 2;
+			penalty.addInput(Buffer.from(txid, 'hex').reverse(), 0, 0xfffffffd);
+			penalty.addOutput(destScript, 90_000);
 			(monitor as any)._state = MonitorState.RESOLVING;
 			(monitor as any)._commitmentBroadcast = {
 				commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+				txid,
+				blockHeight: 95,
 				commitmentNumber: 0n
 			};
 			(monitor as any)._currentBlockHeight = 105;
@@ -1019,9 +1025,9 @@ describe('Chain Monitor (Phase 4C)', function () {
 					amount: 100_000n,
 					outputType: OutputType.TO_LOCAL, // our penalty on a revoked to_local
 					status: OutputStatus.SPEND_CONFIRMED,
-					resolutionTxid: 'cc'.repeat(32),
+					resolutionTxid: penalty.getId(),
 					confirmationHeight: 100,
-					sweepTxHex: '0200000000010000000000' // our penalty tx (opaque)
+					sweepTxHex: penalty.toHex()
 				}
 			];
 			return { monitor, txid };
@@ -1059,6 +1065,80 @@ describe('Chain Monitor (Phase 4C)', function () {
 			// A retained watch re-fires the subscription; the same spend must be a no-op.
 			const second = monitor.handleOutputSpent(txid, 0, spendTx, 100);
 			expect(second.length, 'duplicate spend is not reprocessed').to.equal(0);
+		});
+
+		it('re-arms every non-revoked input after one reorg callback', function () {
+			const { opener, openerPrivkeys } = setupNormalChannels();
+			const state = opener.getFullState();
+			const destScript = makeP2wpkhScript(getPublicKey(openerPrivkeys[0]));
+			const monitor = new ChainMonitor(
+				state,
+				destScript,
+				5,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+			const txid = 'dd'.repeat(32);
+			const sweepHex = (outputIndex: number): string => {
+				const sweep = new bitcoin.Transaction();
+				sweep.version = 2;
+				sweep.addInput(
+					Buffer.from(txid, 'hex').reverse(),
+					outputIndex,
+					0xfffffffd
+				);
+				sweep.addOutput(destScript, 90_000);
+				return sweep.toHex();
+			};
+
+			(monitor as any)._state = MonitorState.RESOLVING;
+			(monitor as any)._commitmentBroadcast = {
+				commitmentType: CommitmentType.THEIR_CURRENT_COMMITMENT,
+				commitmentNumber: 0n
+			};
+			(monitor as any)._currentBlockHeight = 105;
+			(monitor as any)._trackedOutputs = [0, 1].map((outputIndex) => ({
+				txid,
+				outputIndex,
+				amount: 100_000n,
+				outputType: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.SPEND_BROADCAST,
+				confirmationHeight: 95,
+				broadcastHeight: 96,
+				originalFeeRate: 5,
+				currentFeeRate: 5,
+				sweepTxHex: sweepHex(outputIndex)
+			}));
+
+			const competingSpend = new bitcoin.Transaction();
+			competingSpend.version = 2;
+			competingSpend.addInput(Buffer.from(txid, 'hex').reverse(), 0);
+			competingSpend.addInput(Buffer.from(txid, 'hex').reverse(), 1);
+			competingSpend.addOutput(destScript, 180_000);
+			monitor.handleOutputSpent(txid, 0, competingSpend, 100);
+			for (const output of (monitor as any)._trackedOutputs) {
+				expect(output.status).to.equal(OutputStatus.SPEND_CONFIRMED);
+				expect(output.resolutionTxid).to.equal(competingSpend.getId());
+			}
+			(monitor as any)._currentBlockHeight = 105;
+
+			const actions = monitor.handleSpendUnconfirmed(txid, 0);
+			const rebroadcasts = actions.filter(
+				(action) => action.type === ChainActionType.BROADCAST_TX
+			);
+			expect(
+				rebroadcasts,
+				'both competing claims are re-broadcast'
+			).to.have.length(2);
+			for (const output of (monitor as any)._trackedOutputs) {
+				expect(output.status).to.equal(OutputStatus.SPEND_BROADCAST);
+				expect(output.resolutionTxid, 'stale spend record cleared').to.be
+					.undefined;
+				expect(output.broadcastHeight).to.equal(105);
+			}
 		});
 	});
 

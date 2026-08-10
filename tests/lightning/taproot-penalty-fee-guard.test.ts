@@ -110,7 +110,7 @@ describe('taproot penalty fee guard', function () {
 		expect(toLocal!.spendTx, 'and it carries a real spend').to.exist;
 
 		const htlc = resolved.find(
-			(r) => r.trackedOutput.outputType === OutputType.OFFERED_HTLC
+			(r) => r.trackedOutput.outputType === OutputType.RECEIVED_HTLC
 		);
 		// Reported as declined (tracked, no spend) rather than dropped silently, so
 		// the caller can retry it once fees fall.

@@ -47,6 +47,9 @@ import { buildClosingTx } from '../../src/lightning/chain/closing';
 import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import {
 	ChainActionType,
+	CommitmentType,
+	ITrackedOutput,
+	MonitorState,
 	OutputStatus,
 	OutputType
 } from '../../src/lightning/chain/types';
@@ -495,6 +498,77 @@ describe('Pending-close resolution', function () {
 			expect(restored!.getState()).to.equal(ChannelState.CLOSED);
 			expect(storage.channels.get(channelIdHex)!.state.state).to.equal(
 				ChannelState.CLOSED
+			);
+			node.destroy();
+		});
+
+		it('reopens a stale CLOSED channel with a repaired revoked monitor', function () {
+			const { opener } = setupNormalChannels();
+			const channelId = opener.getChannelId()!;
+			const channelIdHex = channelId.toString('hex');
+			const revokedTx = new bitcoin.Transaction();
+			revokedTx.version = 2;
+			revokedTx.addInput(crypto.randomBytes(32), 0);
+			revokedTx.addOutput(
+				Buffer.concat([Buffer.from([0x00, 0x14]), Buffer.alloc(20, 3)]),
+				50_000
+			);
+			const tracked: ITrackedOutput = {
+				txid: revokedTx.getId(),
+				outputIndex: 0,
+				amount: 50_000n,
+				outputType: OutputType.TO_LOCAL,
+				status: OutputStatus.SPEND_BROADCAST,
+				confirmationHeight: 100
+			};
+			const staleMonitor = {
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: revokedTx.getId(),
+					blockHeight: 100,
+					commitmentNumber: 0n,
+					trackedOutputs: [tracked],
+					revokedTxHex: revokedTx.toHex()
+				},
+				trackedOutputs: [tracked],
+				currentBlockHeight: 100
+			};
+
+			opener.markClosedOnChain(true);
+			opener.markResolved();
+			expect(opener.getState()).to.equal(ChannelState.CLOSED);
+			const storage = new MockStorage();
+			storage.saveChannel(
+				channelIdHex,
+				opener.getFullState(),
+				'deadbeef'.repeat(8)
+			);
+			storage.saveChainMonitor(channelIdHex, staleMonitor);
+
+			const keys = makeNodeKeys('node-reopen-resolution');
+			const node = new LightningNode({
+				nodePrivateKey: keys.nodePrivateKey,
+				channelBasepoints: keys.basepoints,
+				perCommitmentSeed: keys.perCommitmentSeed,
+				fundingPrivkey: keys.fundingPrivkey,
+				network: Network.REGTEST,
+				storage
+			});
+			node.on('error', () => {});
+			node.on('node:error', () => {});
+
+			expect(
+				node.getChannelManager().getMonitor(channelId)?.getState()
+			).to.equal(MonitorState.RESOLVING);
+			expect(
+				node.getChannelManager().getChannel(channelId)?.getState()
+			).to.equal(ChannelState.FORCE_CLOSED);
+			expect(storage.channels.get(channelIdHex)?.state.state).to.equal(
+				ChannelState.FORCE_CLOSED
+			);
+			expect(storage.chainMonitors.get(channelIdHex)?.monitorState).to.equal(
+				MonitorState.RESOLVING
 			);
 			node.destroy();
 		});

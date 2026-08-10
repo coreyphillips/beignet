@@ -140,7 +140,10 @@ export function buildPenaltyTx(params: IPenaltyTxParams): bitcoin.Transaction {
 		if (idx >= revokedTx.outs.length) {
 			throw new Error(`Output index ${idx} out of range`);
 		}
-		tx.addInput(txidBuf, idx, 0xffffffff);
+		// Justice sweeps are fully signed by us and may need to replace a stalled
+		// version. Opt in to BIP125 so replacement does not depend on full-RBF
+		// policy at the backend or across the relay path.
+		tx.addInput(txidBuf, idx, 0xfffffffd);
 		totalValue += revokedTx.outs[idx].value;
 	}
 
