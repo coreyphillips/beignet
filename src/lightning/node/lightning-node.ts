@@ -3066,7 +3066,7 @@ export class LightningNode extends EventEmitter {
 		this.channelManager.on(
 			'message:outbound',
 			(peerPubkey: string, type: number, payload: Buffer) => {
-				this.emitOutbound(peerPubkey, type, payload);
+				this.emitOutbound(peerPubkey, type, payload, true);
 			}
 		);
 
@@ -4074,17 +4074,29 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
-	 * The transport boundary for the event-based transport: EVERY node-level
-	 * emit of 'message:outbound' must come through here. With no PeerManager
-	 * attached this event IS the wire (loopback tests, embedded integrators),
-	 * so it is gated exactly like the socket path in PeerManager.sendToPeer:
-	 * a quarantined or fenced device emits ZERO Lightning wire messages.
+	 * The transport boundary for every node-level outbound message. Prefer the
+	 * built-in peer transport when a connected PeerManager is attached, then
+	 * fall back to the event transport used by embedded integrators and tests.
+	 * Both paths share the recovery gate, so a quarantined or fenced device
+	 * emits zero Lightning wire messages.
 	 */
-	private emitOutbound(pubkey: string, type: number, payload: Buffer): void {
+	private emitOutbound(
+		pubkey: string,
+		type: number,
+		payload: Buffer,
+		transportAttempted = false
+	): void {
 		if (!this.recoveryPermitsPeerTraffic()) {
 			this.recoveryGate?.reportBlocked(
 				`suppressed outbound message type ${type} to ${pubkey}`
 			);
+			return;
+		}
+		if (
+			!transportAttempted &&
+			this.peerManager?.getPeer(pubkey)?.getState() === 'ready'
+		) {
+			this.peerManager.sendToPeer(pubkey, type, payload);
 			return;
 		}
 		this.emit('message:outbound', pubkey, type, payload);

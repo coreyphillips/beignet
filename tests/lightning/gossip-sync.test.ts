@@ -40,6 +40,7 @@ import {
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { Feature } from '../../src/lightning/features/flags';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
+import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 
 // ── Helpers ────────────────────────────────────────────────────────
 
@@ -58,6 +59,19 @@ function makeScid(block: number, txIndex: number, outputIndex: number): Buffer {
 	return encodeShortChannelId({ block, txIndex, outputIndex });
 }
 
+async function waitFor(
+	condition: () => boolean,
+	timeoutMs = 5_000
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!condition()) {
+		if (Date.now() >= deadline) {
+			throw new Error('Timed out waiting for gossip sync state');
+		}
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+}
+
 /**
  * Create a mock channel announcement for two nodes with a given SCID.
  * Node IDs are ordered so nodeId1 < nodeId2 lexicographically.
@@ -65,7 +79,8 @@ function makeScid(block: number, txIndex: number, outputIndex: number): Buffer {
 function makeChannelAnnouncement(
 	scid: Buffer,
 	nodeId1: Buffer,
-	nodeId2: Buffer
+	nodeId2: Buffer,
+	chainHash = BITCOIN_CHAIN_HASH
 ): IChannelAnnouncementMessage {
 	// Ensure correct ordering
 	const [n1, n2] =
@@ -78,7 +93,7 @@ function makeChannelAnnouncement(
 		bitcoinSignature1: crypto.randomBytes(64),
 		bitcoinSignature2: crypto.randomBytes(64),
 		features: Buffer.alloc(0),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash,
 		shortChannelId: scid,
 		nodeId1: n1,
 		nodeId2: n2,
@@ -90,11 +105,12 @@ function makeChannelAnnouncement(
 function makeChannelUpdate(
 	scid: Buffer,
 	direction: number,
-	timestamp: number
+	timestamp: number,
+	chainHash = BITCOIN_CHAIN_HASH
 ): IChannelUpdateMessage {
 	return {
 		signature: crypto.randomBytes(64),
-		chainHash: BITCOIN_CHAIN_HASH,
+		chainHash,
 		shortChannelId: scid,
 		timestamp,
 		messageFlags: 0x01,
@@ -122,7 +138,11 @@ function makeNodeAnnouncement(
 	};
 }
 
-function populateGraph(graph: NetworkGraph, channelCount: number): Buffer[] {
+function populateGraph(
+	graph: NetworkGraph,
+	channelCount: number,
+	chainHash = BITCOIN_CHAIN_HASH
+): Buffer[] {
 	const scids: Buffer[] = [];
 	for (let i = 0; i < channelCount; i++) {
 		const scid = makeScid(100 + i, 1, 0);
@@ -132,9 +152,11 @@ function populateGraph(graph: NetworkGraph, channelCount: number): Buffer[] {
 		const node2 = Buffer.alloc(33, 0);
 		node2[0] = 0x02;
 		node2[32] = i * 2 + 2;
-		graph.addChannelAnnouncement(makeChannelAnnouncement(scid, node1, node2));
-		graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 1000 + i));
-		graph.applyChannelUpdate(makeChannelUpdate(scid, 1, 1000 + i));
+		graph.addChannelAnnouncement(
+			makeChannelAnnouncement(scid, node1, node2, chainHash)
+		);
+		graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 1000 + i, chainHash));
+		graph.applyChannelUpdate(makeChannelUpdate(scid, 1, 1000 + i, chainHash));
 		graph.applyNodeAnnouncement(makeNodeAnnouncement(node1, 1000 + i));
 		graph.applyNodeAnnouncement(makeNodeAnnouncement(node2, 1000 + i));
 		scids.push(scid);
@@ -754,14 +776,131 @@ describe('Gossip Sync (Phase 5)', function () {
 	});
 
 	describe('LightningNode Integration', function () {
-		function makeNode(): LightningNode {
+		function makeNode(
+			enableNetworking = false,
+			nodePrivateKey = crypto.randomBytes(32)
+		): LightningNode {
 			return new LightningNode({
-				nodePrivateKey: crypto.randomBytes(32),
+				nodePrivateKey,
 				perCommitmentSeed: crypto.randomBytes(32),
 				channelBasepoints: makeBasepoints(),
-				fundingPrivkey: crypto.randomBytes(32)
+				fundingPrivkey: crypto.randomBytes(32),
+				enableNetworking
 			});
 		}
+
+		it('completes gossip sync over the built-in TCP transport', async function () {
+			this.timeout(10_000);
+			const initiatorKey = crypto.randomBytes(32);
+			const responderKey = crypto.randomBytes(32);
+			const responderPubkey = getPublicKey(responderKey).toString('hex');
+			const initiator = makeNode(true, initiatorKey);
+			const responder = makeNode(true, responderKey);
+			populateGraph(responder.getGraph(), 1, REGTEST_CHAIN_HASH);
+			const initiatorTypes: number[] = [];
+			const responderTypes: number[] = [];
+			const initiatorPeerManager = initiator.getPeerManager()!;
+			const responderPeerManager = responder.getPeerManager()!;
+			const initiatorSend =
+				initiatorPeerManager.sendToPeer.bind(initiatorPeerManager);
+			const responderSend =
+				responderPeerManager.sendToPeer.bind(responderPeerManager);
+			initiatorPeerManager.sendToPeer = (pubkey, type, payload): void => {
+				initiatorTypes.push(type);
+				initiatorSend(pubkey, type, payload);
+			};
+			responderPeerManager.sendToPeer = (pubkey, type, payload): void => {
+				responderTypes.push(type);
+				responderSend(pubkey, type, payload);
+			};
+
+			try {
+				await responder.listen(0, '127.0.0.1');
+				const responderPort = (
+					responder.getPeerManager() as unknown as {
+						server: { address(): { port: number } };
+					}
+				).server.address().port;
+				await initiator.connectPeer(
+					responderPubkey,
+					'127.0.0.1',
+					responderPort
+				);
+
+				initiator.initiateGossipSync(responderPubkey);
+				await waitFor(
+					() =>
+						initiator.getGossipSyncState(responderPubkey) ===
+						GossipSyncState.SYNCED
+				);
+
+				expect(initiator.getGossipSyncState(responderPubkey)).to.equal(
+					GossipSyncState.SYNCED
+				);
+				expect(initiatorTypes).to.include.members([
+					MessageType.GOSSIP_TIMESTAMP_FILTER,
+					MessageType.QUERY_CHANNEL_RANGE,
+					MessageType.QUERY_SHORT_CHANNEL_IDS
+				]);
+				expect(responderTypes).to.include.members([
+					MessageType.REPLY_CHANNEL_RANGE,
+					MessageType.CHANNEL_ANNOUNCEMENT,
+					MessageType.CHANNEL_UPDATE,
+					MessageType.NODE_ANNOUNCEMENT,
+					MessageType.REPLY_SHORT_CHANNEL_IDS_END
+				]);
+			} finally {
+				initiator.destroy();
+				responder.destroy();
+			}
+		});
+
+		it('falls back to message:outbound when the peer is disconnected', function () {
+			const node = makeNode(true);
+			const peerPubkey = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const outbound: number[] = [];
+			node.on('message:outbound', (_pubkey: string, type: number) => {
+				outbound.push(type);
+			});
+
+			try {
+				node.initiateGossipSync(peerPubkey);
+				expect(outbound).to.deep.equal([
+					MessageType.GOSSIP_TIMESTAMP_FILTER,
+					MessageType.QUERY_CHANNEL_RANGE
+				]);
+			} finally {
+				node.destroy();
+			}
+		});
+
+		it('falls back when a registered peer is no longer ready', function () {
+			const node = makeNode(true);
+			const peerPubkey = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const peerManager = node.getPeerManager()!;
+			const originalGetPeer = peerManager.getPeer;
+			const outbound: number[] = [];
+			peerManager.getPeer = (): NonNullable<
+				ReturnType<typeof originalGetPeer>
+			> =>
+				({
+					getState: (): 'disconnected' => 'disconnected'
+				}) as NonNullable<ReturnType<typeof originalGetPeer>>;
+			node.on('message:outbound', (_pubkey: string, type: number) => {
+				outbound.push(type);
+			});
+
+			try {
+				node.initiateGossipSync(peerPubkey);
+				expect(outbound).to.deep.equal([
+					MessageType.GOSSIP_TIMESTAMP_FILTER,
+					MessageType.QUERY_CHANNEL_RANGE
+				]);
+			} finally {
+				peerManager.getPeer = originalGetPeer;
+				node.destroy();
+			}
+		});
 
 		it('should have GOSSIP_QUERIES in default features', function () {
 			const features = LightningNode.defaultFeatures();
