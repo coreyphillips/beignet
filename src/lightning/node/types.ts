@@ -87,6 +87,25 @@ export interface IFundingProvider {
 	broadcastTransaction(txHex: string): Promise<string>;
 
 	/**
+	 * Renew the input pledges of a transaction we are still obligated to
+	 * broadcast (optional).
+	 *
+	 * A funding (or splice) transaction is retained and retried until it
+	 * CONFIRMS, which can outlast the pledge that reserved its inputs: the
+	 * provider frees a pledge on a timeout, and again when the wallet stops
+	 * listing the coin, so a mempool eviction hands the inputs back unspent AND
+	 * unfrozen. Either way a later funding or an ordinary wallet send can
+	 * double-spend the transaction we still owe the network. The node calls this
+	 * once per block and once at startup for every retained transaction, so a
+	 * pledge lives exactly as long as the obligation it protects; when the
+	 * obligation retires the calls stop and the pledge ages out as usual.
+	 *
+	 * Implementations must be idempotent and must not throw for coins the wallet
+	 * no longer holds (the transaction's own confirmed or in-mempool spend).
+	 */
+	pledgeTransactionInputs?(txHex: string): Promise<void>;
+
+	/**
 	 * Splice-in only (optional): select wallet UTXOs covering `amountSats` plus
 	 * fees and return them as splice inputs (each with its prevTx, value and a
 	 * witness-signing closure) along with a change script. Required for

@@ -214,6 +214,139 @@ describe('Funding input pledges', function () {
 		expect(outpoints(inputs)).to.include(`${utxos[0].tx_hash}:0`);
 	});
 
+	it('a renewed pledge outlives the TTL while the broadcast is still owed', async function () {
+		const { wallet, utxos, frozen, unfrozenLog, payment } = makeWallet([
+			100_000, 100_000
+		]);
+		// The pledge for coin 0 is 11 minutes old (TTL is 10) because the funding
+		// tx that spends it has not confirmed yet: an electrum outage, a fee
+		// spike, or a restart in the middle of either.
+		frozen.set(`${utxos[0].tx_hash}:0`, {
+			tx_hash: utxos[0].tx_hash,
+			tx_pos: 0,
+			freezeTag: 'funding-pledge',
+			frozenAt: Date.now() - 11 * 60_000
+		});
+		const retained = new bitcoin.Transaction();
+		retained.version = 2;
+		retained.addInput(
+			Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+			utxos[0].tx_pos
+		);
+		retained.addOutput(payment.output!, 90_000);
+
+		const provider = new WalletFundingProvider(wallet as never);
+		await provider.pledgeTransactionInputs(retained.toHex());
+		// Renewals arrive with the blocks, and this gap is already longer than
+		// the session TTL: the renewed reservation has to outlast it or the
+		// coin is unfrozen for most of every long interval.
+		(provider as unknown as { pledged: Map<string, number> }).pledged.set(
+			`${utxos[0].tx_hash}:0`,
+			Date.now() - 11 * 60_000
+		);
+
+		// The next selection still cannot draw on the coin the retained
+		// transaction spends.
+		const { inputs } = await provider.selectSpliceInputs!(80_000n, 1000);
+		expect(unfrozenLog).to.deep.equal([]);
+		expect(outpoints(inputs)).to.not.include(`${utxos[0].tx_hash}:0`);
+		expect(outpoints(inputs)).to.deep.equal([`${utxos[1].tx_hash}:0`]);
+	});
+
+	it('a renewed pledge still ages out once nothing renews it', async function () {
+		const { wallet, utxos, unfrozenLog, payment } = makeWallet([
+			100_000, 100_000
+		]);
+		const retained = new bitcoin.Transaction();
+		retained.version = 2;
+		retained.addInput(
+			Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+			utxos[0].tx_pos
+		);
+		retained.addOutput(payment.output!, 90_000);
+
+		const provider = new WalletFundingProvider(wallet as never);
+		await provider.pledgeTransactionInputs(retained.toHex());
+
+		// The obligation retired (channel voided) and the renewals stopped an
+		// hour ago. A reservation nothing stands behind must release the coin.
+		const pledged = (provider as unknown as { pledged: Map<string, number> })
+			.pledged;
+		pledged.set(`${utxos[0].tx_hash}:0`, Date.now() - 61 * 60_000);
+
+		const { inputs } = await provider.selectSpliceInputs!(150_000n, 1000);
+		expect(unfrozenLog).to.include(`${utxos[0].tx_hash}:0`);
+		expect(outpoints(inputs)).to.include(`${utxos[0].tx_hash}:0`);
+	});
+
+	it('re-freezes an input a mempool eviction handed back', async function () {
+		const { wallet, utxos, frozen, payment } = makeWallet([100_000, 100_000]);
+		const key = `${utxos[0].tx_hash}:0`;
+		const spend = new bitcoin.Transaction();
+		spend.version = 2;
+		spend.addInput(
+			Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+			utxos[0].tx_pos
+		);
+		spend.addOutput(payment.output!, 90_000);
+		wallet.send = async () => ok(spend.toHex());
+
+		const provider = new WalletFundingProvider(wallet as never);
+		await provider.buildFundingTransaction(payment.address!, 90_000n);
+		expect(frozen.has(key), 'the built tx pledged its input').to.equal(true);
+
+		// The broadcast landed: the wallet stops listing the coin and the next
+		// selection prunes the pledge as spent.
+		const evicted = utxos.splice(0, 1)[0];
+		await provider.selectSpliceInputs!(50_000n, 1000);
+		expect(frozen.has(key)).to.equal(false);
+
+		// The funding tx is evicted from the mempool: the coin comes back
+		// unspent AND unfrozen, with the broadcast still owed.
+		utxos.unshift(evicted);
+		await provider.pledgeTransactionInputs(spend.toHex());
+		expect(
+			frozen.has(key),
+			'the renewal re-froze the resurrected coin'
+		).to.equal(true);
+
+		let error = '';
+		try {
+			await provider.selectSpliceInputs!(80_000n, 1000);
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		expect(error, 'nothing can double-spend the retained tx').to.contain(
+			'insufficient wallet funds'
+		);
+	});
+
+	it('a renewal never re-freezes a coin the transaction already spent', async function () {
+		const { wallet, utxos, frozen, payment } = makeWallet([100_000, 100_000]);
+		const key = `${utxos[0].tx_hash}:0`;
+		const spend = new bitcoin.Transaction();
+		spend.version = 2;
+		spend.addInput(
+			Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+			utxos[0].tx_pos
+		);
+		spend.addOutput(payment.output!, 90_000);
+
+		const provider = new WalletFundingProvider(wallet as never);
+		// The spend is in the mempool: the wallet no longer lists the coin, and
+		// re-freezing an outpoint the wallet does not hold is rejected anyway.
+		utxos.splice(0, 1);
+		await provider.pledgeTransactionInputs(spend.toHex());
+		expect(frozen.has(key)).to.equal(false);
+	});
+
+	it('an unreadable transaction renews nothing instead of throwing', async function () {
+		const { wallet, frozen } = makeWallet([100_000]);
+		const provider = new WalletFundingProvider(wallet as never);
+		await provider.pledgeTransactionInputs('not-a-transaction');
+		expect(frozen.size).to.equal(0);
+	});
+
 	it('never adopts or unfreezes a user freeze (no tag)', async function () {
 		const { wallet, utxos, unfrozenLog } = makeWallet([100_000, 100_000]);
 		// User froze coin 0 with no tag.

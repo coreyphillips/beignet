@@ -326,6 +326,84 @@ describe('Funding broadcast retry', function () {
 		bob.destroy();
 	});
 
+	it('a retained obligation renews its input pledges on every block', async function () {
+		// The pledge that reserved the funding inputs is released on a timeout,
+		// and again once the wallet stops listing the coin, while the obligation
+		// runs until the funding CONFIRMS. Without a renewal on the retry cadence
+		// the inputs return to the candidate set (or to an ordinary wallet send)
+		// while the transaction we still owe the network is retrying.
+		const renewed: string[] = [];
+		let fundingTxidHex = '';
+		let fundingTxHex = '';
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) => {
+				const built = buildMockFundingTx(address, Number(amountSats));
+				fundingTxidHex = built.txid.toString('hex');
+				fundingTxHex = built.txHex;
+				return built;
+			},
+			broadcastTransaction: async (txHex) =>
+				bitcoin.Transaction.fromHex(txHex).getId(),
+			pledgeTransactionInputs: async (txHex) => {
+				renewed.push(txHex);
+			}
+		};
+
+		const alice = new LightningNode(
+			makeNodeConfig(41, { fundingProvider: provider })
+		);
+		const bob = new LightningNode(makeNodeConfig(42));
+		alice.on('node:error', () => {});
+		bob.on('node:error', () => {});
+		connectNodes(alice, bob);
+
+		alice.openChannel(bob.getNodeId(), 500_000n);
+		await tick();
+		expect(pendingMap(alice).has(fundingTxidHex)).to.equal(true);
+
+		alice.handleNewBlock(600);
+		await tick();
+		expect(renewed, 'the retained tx renewed its pledges').to.deep.equal([
+			fundingTxHex
+		]);
+
+		// Still unconfirmed one block later: the reservation is renewed again
+		// rather than left to time out under the obligation.
+		alice.handleNewBlock(601);
+		await tick();
+		expect(renewed).to.deep.equal([fundingTxHex, fundingTxHex]);
+
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('a retired obligation stops renewing its pledges', async function () {
+		const renewed: string[] = [];
+		const provider: IFundingProvider = {
+			buildFundingTransaction: async (address, amountSats) =>
+				buildMockFundingTx(address, Number(amountSats)),
+			broadcastTransaction: async () => 'txid',
+			pledgeTransactionInputs: async (txHex) => {
+				renewed.push(txHex);
+			}
+		};
+		const alice = new LightningNode(
+			makeNodeConfig(43, { fundingProvider: provider })
+		);
+		alice.on('node:error', () => {});
+
+		// No channel references this funding txid, so the entry is retired. Its
+		// coins are nobody's obligation now and must age out normally.
+		pendingMap(alice).set('ab'.repeat(32), 'deadbeef');
+		alice.handleNewBlock(600);
+		await tick();
+
+		expect(renewed).to.deep.equal([]);
+		expect(pendingMap(alice).size).to.equal(0);
+
+		alice.destroy();
+	});
+
 	it('an entry whose channel is gone is retired without broadcasting', async function () {
 		const broadcasts: string[] = [];
 		const provider: IFundingProvider = {

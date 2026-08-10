@@ -169,8 +169,23 @@ export class WalletFundingProvider implements IFundingProvider {
 	 * TTL and spent pruning instead of locking coins forever after a crash.
 	 */
 	private pledged = new Map<string, number>();
+	/**
+	 * Pledges last renewed by pledgeTransactionInputs, i.e. held for a
+	 * transaction the node is still obligated to broadcast rather than for a
+	 * funding session that may simply have been abandoned.
+	 */
+	private renewedPledges = new Set<string>();
 	private adoptedStale = false;
 	private static readonly PLEDGE_TTL_MS = 10 * 60_000;
+	/**
+	 * Expiry for a renewed pledge. Renewals arrive once per block, and a block
+	 * interval exceeds ten minutes better than a third of the time, so reusing
+	 * PLEDGE_TTL_MS would leave the coin unfrozen for most of a long gap: the
+	 * very window the renewal exists to close. Six intervals of slack keeps the
+	 * pledge alive between blocks while still releasing the coin, on its own,
+	 * for an obligation that stopped renewing.
+	 */
+	private static readonly RENEWED_PLEDGE_TTL_MS = 60 * 60_000;
 	private static readonly PLEDGE_TAG = 'funding-pledge';
 
 	/**
@@ -196,12 +211,53 @@ export class WalletFundingProvider implements IFundingProvider {
 	}
 
 	/** Freeze the outpoint and remember when we pledged it. */
-	private async pledge(txid: string, vout: number): Promise<void> {
-		this.pledged.set(`${txid}:${vout}`, Date.now());
+	private async pledge(
+		txid: string,
+		vout: number,
+		renewed = false
+	): Promise<void> {
+		const key = `${txid}:${vout}`;
+		this.pledged.set(key, Date.now());
+		if (renewed) this.renewedPledges.add(key);
 		await this.wallet.freezeUtxo?.({
 			txid,
 			index: vout,
 			tag: WalletFundingProvider.PLEDGE_TAG
+		});
+	}
+
+	/**
+	 * Re-pledge the inputs of a transaction whose broadcast obligation is still
+	 * open (IFundingProvider.pledgeTransactionInputs).
+	 *
+	 * Runs under the selection lock, so it can never interleave with the prune
+	 * a selection performs, and only touches coins the wallet still lists as
+	 * unspent: the inputs this transaction already spent need no reservation,
+	 * and freezing an outpoint the wallet does not hold is rejected anyway. An
+	 * input the transaction spent and a later eviction gave back IS listed
+	 * again, and that is precisely the coin this has to re-freeze.
+	 */
+	async pledgeTransactionInputs(txHex: string): Promise<void> {
+		let tx: bitcoin.Transaction;
+		try {
+			tx = bitcoin.Transaction.fromHex(txHex);
+		} catch {
+			// Not a transaction we can read inputs from; nothing to reserve.
+			return;
+		}
+		return this.runSelection(async () => {
+			const utxos = this.wallet.listUtxos?.();
+			// Same reading as prunePledges: no list, or an empty one, is a wallet
+			// that has not loaded rather than a wallet whose coins are gone. Neither
+			// expires a pledge, so neither needs a renewal.
+			if (!utxos || utxos.length === 0) return;
+			const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
+			for (const input of tx.ins) {
+				// Transaction inputs hold the txid in internal byte order.
+				const txid = Buffer.from(input.hash).reverse().toString('hex');
+				if (!live.has(`${txid}:${input.index}`)) continue;
+				await this.pledge(txid, input.index, true);
+			}
 		});
 	}
 
@@ -236,11 +292,20 @@ export class WalletFundingProvider implements IFundingProvider {
 		if (utxos.length === 0) return;
 		const live = new Set(utxos.map((u) => `${u.tx_hash}:${u.tx_pos}`));
 		const now = Date.now();
-		for (const [key, ts] of [...this.pledged]) {
+		for (const key of [...this.pledged.keys()]) {
+			// Read the timestamp live: a renewal can land between this snapshot
+			// and the unfreeze below, and expiring it on the stale one would drop
+			// the reservation the renewal just made.
+			const ts = this.pledged.get(key);
+			if (ts === undefined) continue;
+			const ttl = this.renewedPledges.has(key)
+				? WalletFundingProvider.RENEWED_PLEDGE_TTL_MS
+				: WalletFundingProvider.PLEDGE_TTL_MS;
 			const spent = !live.has(key);
-			const expired = now - ts > WalletFundingProvider.PLEDGE_TTL_MS;
+			const expired = now - ts > ttl;
 			if (spent || expired) {
 				this.pledged.delete(key);
+				this.renewedPledges.delete(key);
 				const sep = key.lastIndexOf(':');
 				await this.wallet.unfreezeUtxo?.({
 					txid: key.slice(0, sep),
