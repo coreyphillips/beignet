@@ -3334,7 +3334,8 @@ export class LightningNode extends EventEmitter {
 
 		// A claim declined because it cannot pay its own fee. Surfaced as a log and
 		// an event so an operator can see that funds were left on the table, and
-		// (at 'abandoned') that the deadline bounding the claim has passed.
+		// (at 'contested') that a competing spend path has opened while it stayed
+		// unclaimed. Retries continue in both cases.
 		this.channelManager.on(
 			'sweep:uneconomic',
 			(channelId: Buffer, action: ISweepUneconomicChainAction) => {
@@ -3345,7 +3346,7 @@ export class LightningNode extends EventEmitter {
 					outputType: action.outputType,
 					amountSats: action.amount.toString(),
 					feeRatePerVbyte: action.feeRatePerVbyte,
-					deadlineHeight: action.deadlineHeight
+					contestHeight: action.contestHeight
 				});
 				this.emit('sweep:uneconomic', channelId, action);
 			}

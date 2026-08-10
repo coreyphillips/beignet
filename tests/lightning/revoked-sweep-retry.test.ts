@@ -8,9 +8,10 @@
  * and once the spike passed nothing went back for it, even though the funds
  * stay claimable until their to_self_delay matures.
  *
- * The retry runs on every new block and on every fresh fee estimate, over the
- * outputs of a revoked commitment that still have no spend, while the outpoint
- * is unspent and the deadline that bounds the claim is still ahead.
+ * The retry runs on every new block and on every fresh fee estimate, over every
+ * output that still has no spend, for as long as its outpoint is unspent. A
+ * competing spend path opening (their CSV maturing, an HTLC expiring) is
+ * reported but does not stop it: it does not invalidate our own spend path.
  */
 
 import { expect } from 'chai';
@@ -39,6 +40,7 @@ import {
 	derivePublicKey
 } from '../../src/lightning/keys/derivation';
 import { buildReceivedHtlcScript } from '../../src/lightning/script/htlc';
+import { buildToLocalScript } from '../../src/lightning/script/commitment';
 import {
 	setupRevokedWithHtlcs,
 	IRevokedSetup
@@ -88,18 +90,18 @@ function broadcastTxs(actions: ChainAction[]): bitcoin.Transaction[] {
 
 function uneconomicActions(
 	actions: ChainAction[]
-): Array<{ reason: string; outputIndex: number; deadlineHeight?: number }> {
+): Array<{ reason: string; outputIndex: number; contestHeight?: number }> {
 	const found: Array<{
 		reason: string;
 		outputIndex: number;
-		deadlineHeight?: number;
+		contestHeight?: number;
 	}> = [];
 	for (const action of actions) {
 		if (action.type === ChainActionType.SWEEP_UNECONOMIC) {
 			found.push({
 				reason: action.reason,
 				outputIndex: action.outputIndex,
-				deadlineHeight: action.deadlineHeight
+				contestHeight: action.contestHeight
 			});
 		}
 	}
@@ -139,6 +141,12 @@ function breachWithStarvedToLocal(): {
 		broadcastTxs(actions),
 		'the starved to_local penalty is declined, not built'
 	).to.have.length(0);
+	const declined = uneconomicActions(actions);
+	expect(
+		declined.map((d) => d.reason),
+		'and the very first decline is reported, not only later retries'
+	).to.deep.equal(['skipped']);
+	expect(declined[0].outputIndex).to.equal(0);
 	const toLocal = trackedAt(monitor, 0)!;
 	expect(toLocal.outputType).to.equal(OutputType.TO_LOCAL);
 	expect(toLocal.status).to.equal(OutputStatus.CONFIRMED);
@@ -192,38 +200,92 @@ describe('Retrying uneconomic revoked sweeps', function () {
 	it('reports the decline once, not on every retry', function () {
 		const { monitor } = breachWithStarvedToLocal();
 
-		const first = uneconomicActions(monitor.handleNewBlock(HEIGHT + 1));
-		expect(first, 'the skip is surfaced').to.have.length(1);
-		expect(first[0].reason).to.equal('skipped');
-		expect(first[0].outputIndex).to.equal(0);
 		expect(
-			first[0].deadlineHeight,
-			'bounded by the to_self_delay we demanded of them'
-		).to.equal(HEIGHT + TO_SELF_DELAY);
-
+			uneconomicActions(monitor.handleNewBlock(HEIGHT + 1)),
+			'the decline was already reported at breach time'
+		).to.have.length(0);
 		expect(
 			uneconomicActions(monitor.handleNewBlock(HEIGHT + 2)),
-			'a still-unaffordable retry does not report again'
+			'and a still-unaffordable retry does not report again'
 		).to.have.length(0);
 	});
 
-	it('gives up once the deadline that bounds the claim has passed', function () {
+	it('keeps retrying after a competing spend path opens', function () {
 		const { monitor } = breachWithStarvedToLocal();
 
-		const past = monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY + 1);
-		const reported = uneconomicActions(past);
-		expect(reported, 'the abandonment is surfaced').to.have.length(1);
-		expect(reported[0].reason).to.equal('abandoned');
-		expect(broadcastTxs(past), 'and nothing is broadcast').to.have.length(0);
+		// Their delayed branch matures here. It does not invalidate our revocation
+		// spend, so the claim is now a race rather than a lost cause.
+		const contested = monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY + 1);
+		const reported = uneconomicActions(contested);
+		expect(reported, 'the race is surfaced').to.have.length(1);
+		expect(reported[0].reason).to.equal('contested');
+		expect(
+			reported[0].contestHeight,
+			'at the CSV their to_local script actually carries'
+		).to.equal(HEIGHT + TO_SELF_DELAY);
+
+		const txs = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
+		expect(
+			txs,
+			'and a later fee drop still recovers the outpoint, which is unspent'
+		).to.have.length(1);
+		expect(spentIndices(txs[0])).to.deep.equal([0]);
 
 		expect(
-			broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW)),
-			'a later fee drop does not revive an abandoned claim'
-		).to.have.length(0);
-		expect(
 			uneconomicActions(monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY + 2)),
-			'and the abandonment is reported only once'
+			'the race is reported only once'
 		).to.have.length(0);
+	});
+
+	it('uses the on-chain lease CSV, not the configured to_self_delay', function () {
+		const { monitor } = breachWithStarvedToLocal();
+		const toLocal = trackedAt(monitor, 0)!;
+		// A leased to_local carries the lease lock in its script (CLN model: a pure
+		// CSV), far beyond the 144 we configured.
+		const leaseCsv = 4032;
+		toLocal.witnessScript = buildToLocalScript(
+			crypto.randomBytes(33),
+			crypto.randomBytes(33),
+			TO_SELF_DELAY,
+			leaseCsv
+		);
+
+		expect(
+			uneconomicActions(monitor.handleNewBlock(HEIGHT + TO_SELF_DELAY + 1)),
+			'the configured delay is not the height their branch opens at'
+		).to.have.length(0);
+
+		const reported = uneconomicActions(
+			monitor.handleNewBlock(HEIGHT + leaseCsv)
+		);
+		expect(reported, 'the lease CSV is').to.have.length(1);
+		expect(reported[0].reason).to.equal('contested');
+		expect(reported[0].contestHeight).to.equal(HEIGHT + leaseCsv);
+	});
+
+	it('names no competing height for an HTLC only a preimage can take', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		s.revokedTx.outs[0].value = STARVED_SATS;
+		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		monitor.handleFundingSpent(s.revokedTx, HEIGHT);
+
+		// An HTLC WE offered is theirs to claim with the preimage at any moment, so
+		// no height bounds it. One we receive is bounded by their HTLC-timeout.
+		const toLocal = trackedAt(monitor, 0)!;
+		toLocal.outputType = OutputType.OFFERED_HTLC;
+		toLocal.cltvExpiry = HEIGHT + 10;
+		expect(
+			uneconomicActions(monitor.handleNewBlock(HEIGHT + 500)),
+			'an offered HTLC has no cltv boundary of ours to report'
+		).to.have.length(0);
+
+		toLocal.outputType = OutputType.RECEIVED_HTLC;
+		const reported = uneconomicActions(monitor.handleNewBlock(HEIGHT + 501));
+		expect(
+			reported,
+			'a received HTLC is bounded by its cltv_expiry'
+		).to.have.length(1);
+		expect(reported[0].contestHeight).to.equal(HEIGHT + 10);
 	});
 
 	it('stops retrying an outpoint the cheater has spent', function () {
@@ -375,6 +437,81 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		).to.be.greaterThan(0);
 	});
 
+	it('retries a snapshot-reconstructed HTLC nothing else tracks', function () {
+		// The tracked to_local is affordable and claimed at the opening; the only
+		// skipped claim is a settled HTLC rebuilt from revokedHtlcSnapshots, which
+		// never becomes a tracked output. Seeding retries from _trackedOutputs
+		// alone would never come back for it.
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const secret = s.state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
+		const revokedPoint = perCommitmentPointFromSecret(secret);
+		const revocationPubkey = deriveRevocationPubkey(
+			s.state.localBasepoints.revocationBasepoint,
+			revokedPoint
+		);
+		const theirHtlc = derivePublicKey(
+			s.state.remoteBasepoints!.htlcBasepoint,
+			revokedPoint
+		);
+		const ourHtlc = derivePublicKey(
+			s.state.localBasepoints.htlcBasepoint,
+			revokedPoint
+		);
+		const nearHash = crypto.randomBytes(32);
+		s.state.revokedHtlcSnapshots = new Map([
+			[
+				'0',
+				[
+					{
+						paymentHash: nearHash,
+						amountMsat: BigInt(STARVED_SATS) * 1000n,
+						cltvExpiry: s.nearCltv,
+						direction: HtlcDirection.OFFERED
+					}
+				]
+			]
+		]);
+		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
+			redeem: {
+				output: buildReceivedHtlcScript(
+					revocationPubkey,
+					theirHtlc,
+					ourHtlc,
+					nearHash,
+					s.nearCltv,
+					false
+				)
+			}
+		}).output!;
+		// Near its expiry the split isolates it, and alone it cannot pay its way.
+		s.revokedTx.outs[1].value = STARVED_SATS;
+
+		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		const opening = broadcastTxs(
+			monitor.handleFundingSpent(s.revokedTx, HEIGHT)
+		);
+		const claimedAtOpening = new Set<number>();
+		for (const tx of opening) {
+			for (const index of spentIndices(tx)) claimedAtOpening.add(index);
+		}
+		expect(
+			claimedAtOpening.has(0),
+			'their to_local is affordable and claimed'
+		).to.equal(true);
+		expect(
+			claimedAtOpening.has(1),
+			'the starved snapshot HTLC is not'
+		).to.equal(false);
+		expect(
+			monitor.getTrackedOutputs().some((o) => o.outputIndex === 1),
+			'and it is not a tracked output either'
+		).to.equal(false);
+
+		const retried = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
+		expect(retried, 'the retry still reaches it').to.have.length(1);
+		expect(spentIndices(retried[0])).to.deep.equal([1]);
+	});
+
 	it('retries a skipped taproot penalty', function () {
 		const { state, aliceSeed, destScript } = revokedTaprootSetup();
 		const revokedTx = emptyRevokedTx();
@@ -472,6 +609,64 @@ describe('Uneconomic to_remote no longer aborts the resolution', function () {
 		);
 		expect(claim?.spendTx, 'the guard does not decline an affordable claim').to
 			.exist;
+	});
+
+	it('retries the skipped to_remote on a current peer commitment', function () {
+		// The guard above leaves the balance tracked without a spend. The penalty
+		// retry only covers revoked commitments, so without a path of its own this
+		// output would trade a throw for a balance nobody comes back for.
+		for (const commitmentType of [
+			CommitmentType.THEIR_CURRENT_COMMITMENT,
+			CommitmentType.THEIR_FUTURE_COMMITMENT
+		]) {
+			const s = setupRevokedWithHtlcs(HEIGHT);
+			const txid = crypto.randomBytes(32).toString('hex');
+			const toRemote: ITrackedOutput = {
+				txid,
+				outputIndex: 0,
+				amount: BigInt(STARVED_SATS),
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: HEIGHT
+			};
+
+			const monitor = ChainMonitor.restore(
+				{
+					monitorState: MonitorState.RESOLVING,
+					commitmentBroadcast: {
+						commitmentType,
+						txid,
+						blockHeight: HEIGHT,
+						commitmentNumber: 0n,
+						trackedOutputs: [toRemote]
+					},
+					trackedOutputs: [toRemote],
+					currentBlockHeight: HEIGHT
+				},
+				s.state,
+				s.destScript,
+				SPIKE_SAT_PER_VBYTE,
+				s.openerPrivkeys[1],
+				s.openerPrivkeys[2],
+				network
+			);
+
+			expect(
+				broadcastTxs(monitor.handleNewBlock(HEIGHT + 1)),
+				`${commitmentType}: unaffordable at the spike rate`
+			).to.have.length(0);
+
+			const txs = broadcastTxs(monitor.updateFeeRate(CALM_SAT_PER_KW));
+			expect(
+				txs,
+				`${commitmentType}: claimed once the spike passes`
+			).to.have.length(1);
+			expect(spentIndices(txs[0])).to.deep.equal([0]);
+			expect(txs[0].ins[0].witness.length, 'signed').to.be.greaterThan(0);
+			expect(trackedAt(monitor, 0)!.status).to.equal(
+				OutputStatus.SPEND_BROADCAST
+			);
+		}
 	});
 
 	it('keeps their-current-commitment claims when to_remote is unaffordable', function () {

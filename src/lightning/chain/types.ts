@@ -81,12 +81,12 @@ export interface ITrackedOutput {
 	 */
 	uneconomicSinceHeight?: number;
 	/**
-	 * Height at which retries for this output stopped: the deadline that bounds
-	 * the claim (the cheater's to_self_delay, or an HTLC's cltv_expiry) passed
-	 * while it was still unaffordable. Set once, and only for outputs that never
-	 * produced a sweep.
+	 * Height at which a competing spend path opened while this output was still
+	 * unclaimed: the counterparty's CSV matured, or an HTLC reached its
+	 * cltv_expiry. It does NOT stop the retry, because it does not invalidate our
+	 * own spend path; it marks the point where the claim became a race. Set once.
 	 */
-	uneconomicAbandonedHeight?: number;
+	uneconomicContestedHeight?: number;
 	/**
 	 * True when this TO_LOCAL output is the CSV-delayed output of OUR own
 	 * second-level HTLC-success/timeout tx (tracked by resolveSecondLevelHtlcOutput),
@@ -229,25 +229,29 @@ export interface IRebuildSweepChainAction {
 
 /**
  * A claim we declined to build because it cannot pay its own fee. Without this
- * the skip is silent, and an operator has no way to know a claim was declined
- * (or, at `abandoned`, that it will not be attempted again).
+ * the skip is silent, and an operator has no way to know a claim was declined.
  *
- * - `skipped`: the first block at which the output was found unaffordable. It
- *   stays under retry while its outpoint is unspent and its deadline is ahead.
- * - `abandoned`: the deadline passed with the output still unswept, so retries
- *   for it have stopped.
+ * - `skipped`: the first time the output was found unaffordable. It stays under
+ *   retry for as long as its outpoint is unspent.
+ * - `contested`: a competing spend path has opened (the counterparty's CSV
+ *   matured, or an HTLC reached its cltv_expiry) while the claim is still
+ *   unbuilt. Retries CONTINUE: a competing path does not invalidate ours, it
+ *   only means we are now racing for the outpoint.
  */
 export interface ISweepUneconomicChainAction {
 	type: ChainActionType.SWEEP_UNECONOMIC;
-	reason: 'skipped' | 'abandoned';
+	reason: 'skipped' | 'contested';
 	txid: string;
 	outputIndex: number;
 	outputType: OutputType;
 	amount: bigint;
 	/** Feerate (sat/vByte) at which the claim was last declined. */
 	feeRatePerVbyte: number;
-	/** Last height at which the claim can still be attempted, if bounded. */
-	deadlineHeight?: number;
+	/**
+	 * Height at which a competing spend path opens (or opened), when one is
+	 * bounded and known. Urgency, never a stopping condition.
+	 */
+	contestHeight?: number;
 }
 
 export interface IChainErrorAction {
