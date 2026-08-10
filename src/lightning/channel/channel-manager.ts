@@ -2002,8 +2002,13 @@ export class ChannelManager extends EventEmitter {
 		this._knownPreimages.set(paymentHash.toString('hex'), preimage);
 		for (const [channelIdHex, monitor] of this.monitors) {
 			const actions = monitor.addPreimage(paymentHash, preimage);
+			// Request persistence of the preimage and any newly built sweep before
+			// exposing a broadcast side effect. This also covers an uneconomic claim
+			// that emits no transaction but must be retried after a fee change.
+			this.emit('monitor:updated', channelIdHex, monitor);
 			if (actions.length > 0) {
 				this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+				this.emit('monitor:updated', channelIdHex, monitor);
 			}
 		}
 	}
@@ -2014,23 +2019,22 @@ export class ChannelManager extends EventEmitter {
 		monitor: ChainMonitor
 	): void {
 		const channelId = Buffer.from(channelIdHex, 'hex');
-		let produced = false;
+		const pendingActions: ChainAction[] = [];
+		let seeded = false;
 		for (const [hashHex, preimage] of this._knownPreimages) {
 			const actions = monitor.addPreimage(
 				Buffer.from(hashHex, 'hex'),
 				preimage
 			);
-			// addPreimage mutates the matched HTLC output to SPEND_BROADCAST and
-			// returns its broadcast/persist actions. Those MUST be processed (mirrors
-			// recordPreimage) or, on a restored monitor whose HTLC-success was seeded
-			// here, the output is marked broadcast but the tx never reaches the network
-			// (and the non-anchor OUR-commitment rebroadcast path used to skip it too).
-			if (actions.length > 0) {
-				this.processChainActions(channelId, actions);
-				produced = true;
-			}
+			seeded = true;
+			pendingActions.push(...actions);
 		}
-		if (produced) {
+		if (!seeded) return;
+
+		// Request a save of every seeded preimage and built claim before routing.
+		this.emit('monitor:updated', channelIdHex, monitor);
+		if (pendingActions.length > 0) {
+			this.processChainActions(channelId, pendingActions);
 			this.emit('monitor:updated', channelIdHex, monitor);
 		}
 	}
@@ -2076,9 +2080,6 @@ export class ChannelManager extends EventEmitter {
 					)
 			);
 			const actions = monitor.updateFeeRate(feeRatePerKw) ?? [];
-			if (actions.length > 0) {
-				this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
-			}
 			// A CSV-held sweep stores its template and maturity without emitting an
 			// action until it matures. Persist that actionless mutation too.
 			const storedSweep = monitor
@@ -2089,7 +2090,13 @@ export class ChannelManager extends EventEmitter {
 						output.sweepTxHex
 				);
 			if (actions.length === 0 && !storedSweep) continue;
+			// Request a save of newly built sweeps and decline metadata before any
+			// broadcast or operator event is routed.
 			this.emit('monitor:updated', channelIdHex, monitor);
+			if (actions.length > 0) {
+				this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+				this.emit('monitor:updated', channelIdHex, monitor);
+			}
 		}
 	}
 

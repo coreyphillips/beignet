@@ -418,6 +418,74 @@ describe('Chain Integration (Phase 4D)', function () {
 
 			expect(persisted).to.deep.equal([channelIdHex]);
 		});
+
+		it('persists a pre-CLTV peer HTLC timeout sweep before broadcast', function () {
+			const { opener, openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
+				setupNormalChannels();
+			const cltvExpiry = 120;
+			const preimage = crypto.randomBytes(32);
+			const paymentHash = crypto.createHash('sha256').update(preimage).digest();
+			opener.addHtlc(2_000_000n, paymentHash, cltvExpiry, Buffer.alloc(1366));
+
+			const state = opener.getFullState();
+			const commitment = buildRemoteCommitment(
+				state,
+				state.remoteCurrentPerCommitmentPoint!
+			).result.tx;
+			const destinationScript = makeP2wpkhScript(
+				getPublicKey(openerPrivkeys[0])
+			);
+			const monitor = new ChainMonitor(
+				state,
+				destinationScript,
+				50,
+				openerPrivkeys[1],
+				openerPrivkeys[2],
+				network,
+				openerPrivkeys[3],
+				openerPrivkeys[4]
+			);
+			monitor.handleFundingSpent(commitment, 100);
+			const offered = monitor
+				.getTrackedOutputs()
+				.find((output) => output.outputType === OutputType.OFFERED_HTLC);
+			expect(offered, 'offered HTLC tracked after the fee spike').to.exist;
+			expect(offered!.sweepTxHex).to.equal(undefined);
+
+			const manager = new ChannelManager({
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0],
+				htlcBasepointSecret: openerPrivkeys[4]
+			});
+			const channelIdHex = opener.getChannelId()!.toString('hex');
+			manager.restoreMonitor(channelIdHex, monitor);
+
+			const order: string[] = [];
+			manager.on(
+				'monitor:updated',
+				(id: string, persistedMonitor: ChainMonitor) => {
+					const persistedOutput = persistedMonitor
+						.getTrackedOutputs()
+						.find((output) => output.outputType === OutputType.OFFERED_HTLC);
+					order.push(
+						`persist:${id}:${Boolean(
+							persistedOutput?.sweepTxHex
+						)}:${persistedOutput?.maturityHeight}`
+					);
+				}
+			);
+			manager.on('broadcast:tx', () => order.push('broadcast'));
+
+			manager.updateMonitorFeeRates(250, [channelIdHex]);
+
+			expect(order).to.deep.equal([
+				`persist:${channelIdHex}:true:${cltvExpiry}`
+			]);
+			expect(offered!.status).to.equal(OutputStatus.CONFIRMED);
+			expect(offered!.sweepTxHex).to.be.a('string');
+			expect(offered!.maturityHeight).to.equal(cltvExpiry);
+		});
 	});
 
 	describe('Chain monitor persistence ordering', function () {
@@ -478,6 +546,89 @@ describe('Chain Integration (Phase 4D)', function () {
 			expect(order.indexOf(persisted)).to.be.lessThan(
 				order.indexOf('broadcast')
 			);
+		});
+
+		it('persists a learned preimage before routing its broadcast', function () {
+			const channelIdHex = '36'.repeat(32);
+			const paymentHash = Buffer.alloc(32, 0x46);
+			const preimage = Buffer.alloc(32, 0x56);
+			let learned = false;
+			const monitor = {
+				addPreimage: (hash: Buffer, value: Buffer) => {
+					expect(hash.equals(paymentHash)).to.equal(true);
+					expect(value.equals(preimage)).to.equal(true);
+					learned = true;
+					return [
+						{
+							type: ChainActionType.BROADCAST_TX,
+							tx: Buffer.from([3]),
+							description: 'HTLC preimage claim'
+						}
+					];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const order: string[] = [];
+			manager.on('monitor:updated', () => order.push(`persist:${learned}`));
+			manager.on('broadcast:tx', () => order.push(`broadcast:${learned}`));
+
+			manager.recordPreimage(paymentHash, preimage);
+
+			expect(order).to.deep.equal([
+				'persist:true',
+				'broadcast:true',
+				'persist:true'
+			]);
+		});
+
+		it('persists an uneconomic known-preimage state without broadcasting', function () {
+			const channelIdHex = '37'.repeat(32);
+			const paymentHash = Buffer.alloc(32, 0x47);
+			const preimage = Buffer.alloc(32, 0x57);
+			const output: ITrackedOutput = {
+				txid: '48'.repeat(32),
+				outputIndex: 0,
+				amount: 2_000n,
+				outputType: OutputType.RECEIVED_HTLC,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 100,
+				paymentHash
+			};
+			let learned = false;
+			const monitor = {
+				addPreimage: () => {
+					learned = true;
+					output.uneconomicSinceHeight = 100;
+					return [
+						{
+							type: ChainActionType.SWEEP_UNECONOMIC,
+							reason: 'skipped',
+							txid: output.txid,
+							outputIndex: output.outputIndex,
+							outputType: output.outputType,
+							amount: output.amount,
+							feeRatePerVbyte: 50
+						}
+					];
+				}
+			} as unknown as ChainMonitor;
+			const manager = managerWithMonitor(channelIdHex, monitor);
+			const order: string[] = [];
+			manager.on('monitor:updated', () =>
+				order.push(
+					`persist:${learned}:${output.uneconomicSinceHeight ?? 'missing'}`
+				)
+			);
+			manager.on('sweep:uneconomic', () => order.push('uneconomic'));
+			manager.on('broadcast:tx', () => order.push('broadcast'));
+
+			manager.recordPreimage(paymentHash, preimage);
+
+			expect(order).to.deep.equal([
+				'persist:true:100',
+				'uneconomic',
+				'persist:true:100'
+			]);
 		});
 
 		it('persists an actionless output-spent transition', function () {
