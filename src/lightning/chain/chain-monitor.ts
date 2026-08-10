@@ -648,6 +648,18 @@ export class ChainMonitor {
 		this._retryUnsweptRevokedSweeps(actions);
 		this._retryUnsweptRemoteBalance(actions);
 
+		// A retry can adopt a snapshot-reconstructed output after the scan above.
+		// Recompute from the current tracked set so a new in-flight claim cannot be
+		// followed by CHANNEL_FULLY_RESOLVED in the same block.
+		allResolved = this._trackedOutputs.every(
+			(output) =>
+				output.status === OutputStatus.IRREVOCABLY_RESOLVED ||
+				(this._commitmentBroadcast?.commitmentType ===
+					CommitmentType.OUR_COMMITMENT &&
+					output.outputType === OutputType.TO_REMOTE &&
+					output.status === OutputStatus.CONFIRMED)
+		);
+
 		// Check if all outputs are irrevocably resolved
 		if (allResolved && this._trackedOutputs.length > 0) {
 			this._state = MonitorState.FULLY_RESOLVED;
@@ -1663,6 +1675,12 @@ export class ChainMonitor {
 				o.txid === candidate.txid && o.outputIndex === candidate.outputIndex
 		);
 		if (existing) return existing;
+		// A fee update can discover a snapshot output on a monitor restored from
+		// older state that already said it was fully resolved. The adopted output is
+		// unresolved, so block processing must resume immediately.
+		if (this._state === MonitorState.FULLY_RESOLVED) {
+			this._state = MonitorState.RESOLVING;
+		}
 		if (candidate.confirmationHeight <= 0) {
 			// A mempool-first breach has no height yet; _adoptLateConfirmation fills
 			// it in for every tracked output once the commitment confirms.

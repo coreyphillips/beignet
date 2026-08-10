@@ -2053,10 +2053,31 @@ export class ChannelManager extends EventEmitter {
 			const monitor = this.monitors.get(channelIdHex);
 			// Restored/injected monitors are not guaranteed to implement it.
 			if (!monitor || typeof monitor.updateFeeRate !== 'function') continue;
+			const sweepHexBefore = new Map(
+				monitor
+					.getTrackedOutputs()
+					.map(
+						(output) =>
+							[
+								`${output.txid}:${output.outputIndex}`,
+								output.sweepTxHex
+							] as const
+					)
+			);
 			const actions = monitor.updateFeeRate(feeRatePerKw) ?? [];
-			if (actions.length === 0) continue;
-			this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
-			// A retry that produced a sweep changed persisted monitor state.
+			if (actions.length > 0) {
+				this.processChainActions(Buffer.from(channelIdHex, 'hex'), actions);
+			}
+			// A CSV-held sweep stores its template and maturity without emitting an
+			// action until it matures. Persist that actionless mutation too.
+			const storedSweep = monitor
+				.getTrackedOutputs()
+				.some(
+					(output) =>
+						sweepHexBefore.get(`${output.txid}:${output.outputIndex}`) !==
+						output.sweepTxHex
+				);
+			if (actions.length === 0 && !storedSweep) continue;
 			this.emit('monitor:updated', channelIdHex, monitor);
 		}
 	}

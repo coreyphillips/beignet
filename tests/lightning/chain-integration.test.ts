@@ -43,8 +43,11 @@ import { buildClosingTx } from '../../src/lightning/chain/closing';
 import {
 	MonitorState,
 	ChainActionType,
-	OutputType
+	OutputStatus,
+	OutputType,
+	ITrackedOutput
 } from '../../src/lightning/chain/types';
+import { ChainMonitor } from '../../src/lightning/chain/chain-monitor';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import {
 	perCommitmentPointFromSecret,
@@ -377,6 +380,43 @@ describe('Chain Integration (Phase 4D)', function () {
 			const result = manager.forceClose(channelId, destScript, 10, network);
 			expect(result.ok).to.be.true;
 			expect(persisted).to.include(channelId.toString('hex'));
+		});
+
+		it('persists a CSV-held sweep created by a fee update', function () {
+			const { opener, openerPrivkeys, openerBasepoints, openerCommitmentSeed } =
+				setupNormalChannels();
+			const config: IChannelManagerConfig = {
+				localBasepoints: openerBasepoints,
+				localPerCommitmentSeed: openerCommitmentSeed,
+				localFundingPrivkey: openerPrivkeys[0]
+			};
+			const manager = new ChannelManager(config);
+			const channelIdHex = opener.getChannelId()!.toString('hex');
+			const output: ITrackedOutput = {
+				txid: '11'.repeat(32),
+				outputIndex: 0,
+				amount: 2_000n,
+				outputType: OutputType.TO_REMOTE,
+				status: OutputStatus.CONFIRMED,
+				confirmationHeight: 100
+			};
+			const monitor = {
+				getTrackedOutputs: (): ITrackedOutput[] => [output],
+				updateFeeRate: (): [] => {
+					// A real CSV-held retry stores these fields but emits no action until
+					// the maturity block.
+					output.sweepTxHex = '00';
+					output.maturityHeight = 101;
+					return [];
+				}
+			} as unknown as ChainMonitor;
+			manager.restoreMonitor(channelIdHex, monitor);
+
+			const persisted: string[] = [];
+			manager.on('monitor:updated', (id: string) => persisted.push(id));
+			manager.updateMonitorFeeRates(250, [channelIdHex]);
+
+			expect(persisted).to.deep.equal([channelIdHex]);
 		});
 	});
 

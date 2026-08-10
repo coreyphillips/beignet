@@ -2393,6 +2393,13 @@ export function resolveRevokedCommitmentOutputs(
 	// HTLC cltv_expiry per output index: near this height the cheater's
 	// pre-signed HTLC-timeout competes for the outpoint (deadline-split below).
 	const htlcDeadlines = new Map<number, number>();
+	// Metadata for settled HTLCs reconstructed from the snapshot. A stand-in is
+	// adopted into persistent monitor state, so it must preserve the same
+	// direction and payment context as a normally classified output.
+	const snapshotHtlcMetadata = new Map<
+		number,
+		{ outputType: OutputType; paymentHash: Buffer }
+	>();
 
 	for (const output of trackedOutputs) {
 		if (alreadyClaimed.has(output.outputIndex)) continue;
@@ -2545,6 +2552,13 @@ export function resolveRevokedCommitmentOutputs(
 					claimableIndices.push(i);
 					witnessScripts.set(i, script);
 					htlcDeadlines.set(i, entry.cltvExpiry);
+					snapshotHtlcMetadata.set(i, {
+						outputType:
+							entry.direction === HtlcDirection.OFFERED
+								? OutputType.OFFERED_HTLC
+								: OutputType.RECEIVED_HTLC,
+						paymentHash: entry.paymentHash
+					});
 					break;
 				}
 			}
@@ -2570,17 +2584,22 @@ export function resolveRevokedCommitmentOutputs(
 	// classification never saw (an HTLC that settled and left state.htlcs, rebuilt
 	// from the snapshot below). Callers adopt the stand-in so the output is
 	// watched and its claim rebroadcast like any other.
-	const penaltyTrackedOutput = (outputIdx: number): ITrackedOutput =>
-		trackedOutputs.find((o) => o.outputIndex === outputIdx) ?? {
+	const penaltyTrackedOutput = (outputIdx: number): ITrackedOutput => {
+		const tracked = trackedOutputs.find((o) => o.outputIndex === outputIdx);
+		if (tracked) return tracked;
+		const snapshotMetadata = snapshotHtlcMetadata.get(outputIdx);
+		return {
 			txid: revokedTx.getId(),
 			outputIndex: outputIdx,
 			amount: BigInt(revokedTx.outs[outputIdx].value),
-			outputType: OutputType.OFFERED_HTLC,
+			outputType: snapshotMetadata?.outputType ?? OutputType.OFFERED_HTLC,
 			status: OutputStatus.CONFIRMED,
 			confirmationHeight: 0,
 			witnessScript: witnessScripts.get(outputIdx),
-			cltvExpiry: htlcDeadlines.get(outputIdx)
+			cltvExpiry: htlcDeadlines.get(outputIdx),
+			paymentHash: snapshotMetadata?.paymentHash
 		};
+	};
 
 	// Build ONE penalty tx over the given indices, sign every input, and push
 	// a resolved entry per input (all sharing that tx).

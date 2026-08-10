@@ -39,7 +39,10 @@ import {
 	deriveRevocationPubkey,
 	derivePublicKey
 } from '../../src/lightning/keys/derivation';
-import { buildReceivedHtlcScript } from '../../src/lightning/script/htlc';
+import {
+	buildOfferedHtlcScript,
+	buildReceivedHtlcScript
+} from '../../src/lightning/script/htlc';
 import {
 	buildToLocalScript,
 	calculateObscuredCommitmentNumber
@@ -120,6 +123,63 @@ function trackedAt(
 	outputIndex: number
 ): ITrackedOutput | undefined {
 	return monitor.getTrackedOutputs().find((o) => o.outputIndex === outputIndex);
+}
+
+function installSnapshotHtlc(
+	s: IRevokedSetup,
+	direction: HtlcDirection,
+	amountSats = STARVED_SATS
+): Buffer {
+	const secret = s.state.shaChainStore.getSecret(MAX_INDEX)!;
+	const revokedPoint = perCommitmentPointFromSecret(secret);
+	const revocationPubkey = deriveRevocationPubkey(
+		s.state.localBasepoints.revocationBasepoint,
+		revokedPoint
+	);
+	const theirHtlc = derivePublicKey(
+		s.state.remoteBasepoints!.htlcBasepoint,
+		revokedPoint
+	);
+	const ourHtlc = derivePublicKey(
+		s.state.localBasepoints.htlcBasepoint,
+		revokedPoint
+	);
+	const paymentHash = crypto.randomBytes(32);
+	s.state.revokedHtlcSnapshots = new Map([
+		[
+			'0',
+			[
+				{
+					paymentHash,
+					amountMsat: BigInt(amountSats) * 1000n,
+					cltvExpiry: s.nearCltv,
+					direction
+				}
+			]
+		]
+	]);
+	const script =
+		direction === HtlcDirection.OFFERED
+			? buildReceivedHtlcScript(
+					revocationPubkey,
+					theirHtlc,
+					ourHtlc,
+					paymentHash,
+					s.nearCltv,
+					false
+			  )
+			: buildOfferedHtlcScript(
+					revocationPubkey,
+					theirHtlc,
+					ourHtlc,
+					paymentHash,
+					false
+			  );
+	s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
+		redeem: { output: script }
+	}).output!;
+	s.revokedTx.outs[1].value = amountSats;
+	return paymentHash;
 }
 
 /**
@@ -480,48 +540,7 @@ describe('Retrying uneconomic revoked sweeps', function () {
 		// the retry set, unwatched, never rebroadcast, and outside full-resolution
 		// accounting, so "retry until spent" would not hold for it.
 		const s = setupRevokedWithHtlcs(HEIGHT);
-		const secret = s.state.shaChainStore.getSecret(MAX_INDEX - 0n)!;
-		const revokedPoint = perCommitmentPointFromSecret(secret);
-		const revocationPubkey = deriveRevocationPubkey(
-			s.state.localBasepoints.revocationBasepoint,
-			revokedPoint
-		);
-		const theirHtlc = derivePublicKey(
-			s.state.remoteBasepoints!.htlcBasepoint,
-			revokedPoint
-		);
-		const ourHtlc = derivePublicKey(
-			s.state.localBasepoints.htlcBasepoint,
-			revokedPoint
-		);
-		const nearHash = crypto.randomBytes(32);
-		s.state.revokedHtlcSnapshots = new Map([
-			[
-				'0',
-				[
-					{
-						paymentHash: nearHash,
-						amountMsat: BigInt(STARVED_SATS) * 1000n,
-						cltvExpiry: s.nearCltv,
-						direction: HtlcDirection.OFFERED
-					}
-				]
-			]
-		]);
-		s.revokedTx.outs[1].script = bitcoin.payments.p2wsh({
-			redeem: {
-				output: buildReceivedHtlcScript(
-					revocationPubkey,
-					theirHtlc,
-					ourHtlc,
-					nearHash,
-					s.nearCltv,
-					false
-				)
-			}
-		}).output!;
-		// Near its expiry the split isolates it, and alone it cannot pay its way.
-		s.revokedTx.outs[1].value = STARVED_SATS;
+		installSnapshotHtlc(s, HtlcDirection.OFFERED);
 
 		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
 		const openingActions = monitor.handleFundingSpent(s.revokedTx, HEIGHT);
@@ -569,6 +588,108 @@ describe('Retrying uneconomic revoked sweeps', function () {
 			monitor.getState(),
 			'a claim still in flight is not full resolution'
 		).to.not.equal(MonitorState.FULLY_RESOLVED);
+	});
+
+	it('preserves metadata for a received snapshot HTLC', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		const paymentHash = installSnapshotHtlc(s, HtlcDirection.RECEIVED);
+		const monitor = monitorFor(s, SPIKE_SAT_PER_VBYTE);
+		const actions = monitor.handleFundingSpent(s.revokedTx, HEIGHT);
+
+		const adopted = trackedAt(monitor, 1)!;
+		expect(adopted.outputType).to.equal(OutputType.RECEIVED_HTLC);
+		expect(adopted.paymentHash?.equals(paymentHash)).to.equal(true);
+		const report = actions.find(
+			(action) =>
+				action.type === ChainActionType.SWEEP_UNECONOMIC &&
+				action.outputIndex === 1
+		);
+		expect(report?.type).to.equal(ChainActionType.SWEEP_UNECONOMIC);
+		if (report?.type === ChainActionType.SWEEP_UNECONOMIC) {
+			expect(report.outputType).to.equal(OutputType.RECEIVED_HTLC);
+			expect(report.contestHeight).to.equal(s.nearCltv);
+		}
+	});
+
+	it('does not resolve a monitor when a block retry adopts a claim', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlc(s, HtlcDirection.OFFERED);
+		const resolvedToLocal: ITrackedOutput = {
+			...s.trackedOutputs[0],
+			status: OutputStatus.IRREVOCABLY_RESOLVED
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.RESOLVING,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [resolvedToLocal],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [resolvedToLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const actions = monitor.handleNewBlock(HEIGHT + 1);
+		expect(broadcastTxs(actions)).to.have.length(1);
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.SPEND_BROADCAST
+		);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
+		expect(
+			actions.some(
+				(action) => action.type === ChainActionType.CHANNEL_FULLY_RESOLVED
+			)
+		).to.equal(false);
+	});
+
+	it('reopens a fully resolved monitor when a fee retry adopts a claim', function () {
+		const s = setupRevokedWithHtlcs(HEIGHT);
+		installSnapshotHtlc(s, HtlcDirection.OFFERED);
+		const resolvedToLocal: ITrackedOutput = {
+			...s.trackedOutputs[0],
+			status: OutputStatus.IRREVOCABLY_RESOLVED
+		};
+		const monitor = ChainMonitor.restore(
+			{
+				monitorState: MonitorState.FULLY_RESOLVED,
+				commitmentBroadcast: {
+					commitmentType: CommitmentType.THEIR_REVOKED_COMMITMENT,
+					txid: s.revokedTx.getId(),
+					blockHeight: HEIGHT,
+					commitmentNumber: 0n,
+					trackedOutputs: [resolvedToLocal],
+					revokedTxHex: s.revokedTx.toHex(),
+					claimedOutputIndices: [0]
+				},
+				trackedOutputs: [resolvedToLocal],
+				currentBlockHeight: HEIGHT
+			},
+			s.state,
+			s.destScript,
+			1,
+			s.openerPrivkeys[1],
+			s.openerPrivkeys[2],
+			network
+		);
+
+		const actions = monitor.updateFeeRate(CALM_SAT_PER_KW);
+		expect(broadcastTxs(actions)).to.have.length(1);
+		expect(trackedAt(monitor, 1)?.status).to.equal(
+			OutputStatus.SPEND_BROADCAST
+		);
+		expect(monitor.getState()).to.equal(MonitorState.RESOLVING);
 	});
 
 	it('retries a skipped taproot penalty', function () {
