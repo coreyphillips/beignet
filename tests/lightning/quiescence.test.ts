@@ -37,6 +37,10 @@ import {
 	decodeChannelReadyMessage
 } from '../../src/lightning/message/channel-funding';
 import { decodeUpdateAddHtlcMessage } from '../../src/lightning/message/channel-update';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -163,6 +167,8 @@ describe('Quiescence (STFU)', function () {
 		});
 
 		const acceptor = new Channel(acceptorState);
+		opener.setSigner(signerFromSeed(openerSeed));
+		acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 		return { opener, acceptor };
 	}
@@ -182,12 +188,17 @@ describe('Quiescence (STFU)', function () {
 		const fcActions = opener.createFundingCreated(
 			fundingTxid,
 			0,
-			crypto.randomBytes(64)
+			realInitialCommitmentSig(opener, fundingTxid, 0)
 		);
 		const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+		const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 		const fsActions = acceptor.handleFundingCreated(
-			decodeFundingCreatedMessage(fcMsg.payload),
-			crypto.randomBytes(64)
+			decodedFc,
+			realInitialCommitmentSig(
+				acceptor,
+				decodedFc.fundingTxid,
+				decodedFc.fundingOutputIndex
+			)
 		);
 		const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 		opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));

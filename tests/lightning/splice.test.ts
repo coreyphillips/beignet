@@ -71,6 +71,10 @@ import {
 	decodeFundingSignedMessage,
 	decodeChannelReadyMessage
 } from '../../src/lightning/message/channel-funding';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -1677,6 +1681,8 @@ describe('Splice', function () {
 				remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 			});
 			const acceptor = new Channel(acceptorState);
+			opener.setSigner(signerFromSeed(openerSeed));
+			acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 			// Full open_channel / accept_channel flow with message decode
 			const openActions = opener.initiateOpen();
@@ -1695,12 +1701,17 @@ describe('Splice', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -1882,6 +1893,30 @@ describe('Splice', function () {
 				scriptPubkey: Buffer.alloc(34, 0x00)
 			});
 			expect(findAction(outAction, ChannelActionType.ERROR)).to.not.exist;
+
+			// The initiator also supplies the shared input and an honest new
+			// funding output, so the co-sign audit accepts the completed tx.
+			acceptor.handleTxAddInput({
+				channelId,
+				serialId: 4n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd,
+				sharedInputTxid: acceptor.getFullState().fundingTxid!
+			});
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+			const newFunding = createFundingScript(
+				acceptor.getFullState().localBasepoints.fundingPubkey,
+				Buffer.alloc(33, 0x02)
+			);
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 6n,
+				amountSats: 600_000n,
+				scriptPubkey: newFunding.p2wshOutput
+			});
 
 			// Peer signals tx_complete; the session accepts it without error.
 			const completeAction = acceptor.handleTxComplete();

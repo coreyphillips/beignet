@@ -30,6 +30,10 @@ import {
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import * as ecc from '@bitcoinerlab/secp256k1';
 import * as bitcoin from 'bitcoinjs-lib';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -366,6 +370,8 @@ describe('Zero-Conf Channels', function () {
 			}
 
 			const acceptor = new Channel(acceptorState);
+			opener.setSigner(signerFromSeed(openerSeed));
+			acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 			return { opener, acceptor };
 		}
@@ -390,13 +396,12 @@ describe('Zero-Conf Channels', function () {
 
 		function driveFunding(opener: Channel, acceptor: Channel): void {
 			const fundingTxid = crypto.randomBytes(32);
-			const fakeSig = crypto.randomBytes(64);
 
 			// Step 4: Opener creates funding
 			const fundingCreatedActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				fakeSig
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(
 				fundingCreatedActions,
@@ -405,10 +410,13 @@ describe('Zero-Conf Channels', function () {
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
 			// Step 5: Acceptor responds with funding_signed
-			const fakeSig2 = crypto.randomBytes(64);
 			const fundingSignedActions = acceptor.handleFundingCreated(
 				decodedFc,
-				fakeSig2
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(
 				fundingSignedActions,
@@ -428,13 +436,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -456,13 +470,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -483,13 +503,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -534,13 +560,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -606,13 +638,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -661,13 +699,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -713,13 +757,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -769,13 +819,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 
@@ -793,13 +849,19 @@ describe('Zero-Conf Channels', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
 			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 
-			const fakeSig2 = crypto.randomBytes(64);
-			const fsActions = acceptor.handleFundingCreated(decodedFc, fakeSig2);
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			const decodedFs = decodeFundingSignedMessage(fsMsg.payload);
 

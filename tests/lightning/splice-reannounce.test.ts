@@ -53,6 +53,10 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { IChainBackend } from '../../src/lightning/chain/chain-watcher';
 import { Network } from '../../src/lightning/invoice/types';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 // ─────────────── Helpers ───────────────
 
@@ -111,10 +115,12 @@ function setupNormalChannels(): {
 		.createHash('sha256')
 		.update('reann-acceptor')
 		.digest();
+	const openerSeed = Buffer.alloc(32, 0x61);
+	const acceptorSeed = Buffer.alloc(32, 0x62);
 	const { basepoints: openerBasepoints, privkeys: openerPrivkeys } =
-		makeBasepoints(Buffer.alloc(32, 0x61));
+		makeBasepoints(openerSeed);
 	const { basepoints: acceptorBasepoints, privkeys: acceptorPrivkeys } =
-		makeBasepoints(Buffer.alloc(32, 0x62));
+		makeBasepoints(acceptorSeed);
 
 	const opener = new Channel(
 		createOpenerState({
@@ -139,6 +145,9 @@ function setupNormalChannels(): {
 		})
 	);
 
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
+
 	const openActions = opener.initiateOpen();
 	const acceptActions = acceptor.handleOpenChannel(
 		decodeOpenChannelMessage(
@@ -150,16 +159,22 @@ function setupNormalChannels(): {
 			findSendAction(acceptActions, MessageType.ACCEPT_CHANNEL).payload
 		)
 	);
+	const fundingTxid = crypto.randomBytes(32);
 	const fcActions = opener.createFundingCreated(
-		crypto.randomBytes(32),
+		fundingTxid,
 		0,
-		crypto.randomBytes(64)
+		realInitialCommitmentSig(opener, fundingTxid, 0)
+	);
+	const decodedFc = decodeFundingCreatedMessage(
+		findSendAction(fcActions, MessageType.FUNDING_CREATED).payload
 	);
 	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(
-			findSendAction(fcActions, MessageType.FUNDING_CREATED).payload
-		),
-		crypto.randomBytes(64)
+		decodedFc,
+		realInitialCommitmentSig(
+			acceptor,
+			decodedFc.fundingTxid,
+			decodedFc.fundingOutputIndex
+		)
 	);
 	opener.handleFundingSigned(
 		decodeFundingSignedMessage(

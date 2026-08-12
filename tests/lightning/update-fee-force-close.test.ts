@@ -35,6 +35,7 @@ import {
 	serializeChannelState,
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
+import { signerFromSeed } from './helpers/real-signing';
 
 function getPerCommitmentPoint(seed: Buffer, commitmentNumber: bigint): Buffer {
 	return perCommitmentPointFromSecret(
@@ -91,7 +92,25 @@ function makeNormalAcceptorChannel(): Channel {
 	state.fundingTxid = crypto.randomBytes(32);
 	state.localBalanceMsat = 400_000_000n;
 	state.remoteBalanceMsat = 600_000_000n;
-	return new Channel(state);
+	const channel = new Channel(state);
+	channel.setSigner(signerFromSeed(localSeed));
+	return channel;
+}
+
+/** The remote's (opener's) real signature over our NEXT local commitment. */
+function remoteCommitmentSig(channel: Channel): Buffer {
+	const state = channel.getFullState();
+	const n = state.localCommitmentNumber + 1n;
+	const built = buildLocalCommitment(
+		state,
+		getPerCommitmentPoint(localSeed, n),
+		n
+	);
+	return signerFromSeed(remoteSeed).signCommitmentTx(
+		built.result.tx,
+		built.fundingWitnessScript,
+		built.fundingAmount
+	);
 }
 
 describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', function () {
@@ -107,11 +126,11 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		expect(state.pendingFeeratePerKw).to.equal(NEW_RATE);
 
 		// Their commitment_signed covers our local commitment at the staged
-		// rate (no signer in this test, so sig verification is skipped — the
-		// bookkeeping under test is identical).
+		// rate, signed for real with the remote funding key so the channel's
+		// signature verification passes.
 		channel.handleCommitmentSigned({
 			channelId: state.channelId!,
-			signature: crypto.randomBytes(64),
+			signature: remoteCommitmentSig(channel),
 			htlcSignatures: []
 		});
 
@@ -148,7 +167,7 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		});
 		channel.handleCommitmentSigned({
 			channelId: state.channelId!,
-			signature: crypto.randomBytes(64),
+			signature: remoteCommitmentSig(channel),
 			htlcSignatures: []
 		});
 
@@ -238,7 +257,7 @@ describe('update_fee force-close safety (lastSignedCommitFeeratePerKw)', functio
 		});
 		channel.handleCommitmentSigned({
 			channelId: state.channelId!,
-			signature: crypto.randomBytes(64),
+			signature: remoteCommitmentSig(channel),
 			htlcSignatures: []
 		});
 

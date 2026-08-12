@@ -19,21 +19,31 @@ import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
+import { decodeChannelReadyMessage } from '../../src/lightning/message/channel-funding';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import {
 	INCORRECT_CLTV_EXPIRY,
 	FEE_INSUFFICIENT
 } from '../../src/lightning/onion/types';
+import {
+	seedKey,
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
-function makeBasepoints(): IChannelBasepoints {
+function makeBasepoints(seed?: Buffer): IChannelBasepoints {
+	// With a seed, keys follow the makeBasepoints convention (funding at
+	// index 0, HTLC at index 4) so signerFromSeed(seed) matches them.
+	const key = (i: number): Buffer =>
+		seed ? seedKey(seed, i) : crypto.randomBytes(32);
 	return {
 		// Real curve points: open/accept validation now rejects off-curve
 		// basepoints (BOLT 2 LOW hardening).
-		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
-		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
-		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		fundingPubkey: getPublicKey(key(0)),
+		revocationBasepoint: getPublicKey(key(1)),
+		paymentBasepoint: getPublicKey(key(2)),
+		delayedPaymentBasepoint: getPublicKey(key(3)),
+		htlcBasepoint: getPublicKey(key(4)),
 		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
@@ -69,8 +79,10 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 	acceptor: Channel;
 	htlcId: bigint;
 } {
-	const openerBp = makeBasepoints();
-	const acceptorBp = makeBasepoints();
+	const openerBpSeed = crypto.randomBytes(32);
+	const acceptorBpSeed = crypto.randomBytes(32);
+	const openerBp = makeBasepoints(openerBpSeed);
+	const acceptorBp = makeBasepoints(acceptorBpSeed);
 	const openerSeed = crypto.randomBytes(32);
 	const acceptorSeed = crypto.randomBytes(32);
 
@@ -79,6 +91,7 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 		localBasepoints: openerBp,
 		localPerCommitmentSeed: openerSeed
 	});
+	opener.setSigner(signerFromSeed(openerBpSeed));
 
 	const openActions = opener.initiateOpen();
 	const openPayload = findSendAction(openActions, MessageType.OPEN_CHANNEL)!;
@@ -114,6 +127,7 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 	});
 
 	const acceptor = new Channel(acceptorState);
+	acceptor.setSigner(signerFromSeed(acceptorBpSeed));
 	const {
 		decodeAcceptChannelMessage
 	} = require('../../src/lightning/message/channel-open');
@@ -126,10 +140,11 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 	opener.handleAcceptChannel(acceptMsg);
 
 	const fundingTxid = crypto.randomBytes(32);
-	const sig = crypto.randomBytes(64);
+	const sig = realInitialCommitmentSig(opener, fundingTxid, 0);
 	opener.createFundingCreated(fundingTxid, 0, sig);
 	const channelId = opener.getChannelId()!;
 
+	const acceptorSig = realInitialCommitmentSig(acceptor, fundingTxid, 0);
 	acceptor.handleFundingCreated(
 		{
 			temporaryChannelId: opener.getTemporaryChannelId(),
@@ -137,20 +152,22 @@ function setupChannelWithHtlc(cltvExpiry: number): {
 			fundingOutputIndex: 0,
 			signature: sig
 		},
-		crypto.randomBytes(64)
+		acceptorSig
 	);
-	opener.handleFundingSigned({ channelId, signature: crypto.randomBytes(64) });
+	opener.handleFundingSigned({ channelId, signature: acceptorSig });
 
-	opener.fundingConfirmed();
-	acceptor.fundingConfirmed();
-	opener.handleChannelReady({
-		channelId,
-		secondPerCommitmentPoint: crypto.randomBytes(33)
-	});
-	acceptor.handleChannelReady({
-		channelId: acceptor.getChannelId()!,
-		secondPerCommitmentPoint: crypto.randomBytes(33)
-	});
+	const openerReady = opener.fundingConfirmed();
+	const acceptorReady = acceptor.fundingConfirmed();
+	opener.handleChannelReady(
+		decodeChannelReadyMessage(
+			findSendAction(acceptorReady, MessageType.CHANNEL_READY)!
+		)
+	);
+	acceptor.handleChannelReady(
+		decodeChannelReadyMessage(
+			findSendAction(openerReady, MessageType.CHANNEL_READY)!
+		)
+	);
 
 	expect(opener.getState()).to.equal(ChannelState.NORMAL);
 

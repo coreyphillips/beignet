@@ -49,6 +49,11 @@ import {
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
 import { serializeHtlcEntry } from '../../src/lightning/storage/serialization';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 const FUNDING_SATOSHIS = 1_000_000n;
 const PUSH_MSAT = 0n;
@@ -130,6 +135,9 @@ describe('Stuck forward re-drive loop', function () {
 			})
 		);
 
+		opener.setSigner(signerFromSeed(openerSeed));
+		acceptor.setSigner(signerFromSeed(acceptorSeed));
+
 		const openMsg = findSendAction(
 			opener.initiateOpen(),
 			MessageType.OPEN_CHANNEL
@@ -140,18 +148,24 @@ describe('Stuck forward re-drive loop', function () {
 		);
 		opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
+		const fundingTxid = crypto.randomBytes(32);
 		const fcMsg = findSendAction(
 			opener.createFundingCreated(
-				crypto.randomBytes(32),
+				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			),
 			MessageType.FUNDING_CREATED
 		);
+		const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 		const fsMsg = findSendAction(
 			acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			),
 			MessageType.FUNDING_SIGNED
 		);
@@ -177,9 +191,14 @@ describe('Stuck forward re-drive loop', function () {
 	// `b` produced from its closing handleRevokeAndAck, which is where
 	// HTLC_FORWARDED is dispatched.
 	/* eslint-disable @typescript-eslint/no-explicit-any */
+	function signRealCommitment(channel: ChannelClass): any[] {
+		const sigs = realCommitmentSigs(channel);
+		return channel.signCommitment(sigs.signature, sigs.htlcSignatures);
+	}
+
 	function commitmentRoundTrip(a: ChannelClass, b: ChannelClass): any[] {
 		const s1 = findSendAction(
-			a.signCommitment(crypto.randomBytes(64), []),
+			signRealCommitment(a),
 			MessageType.COMMITMENT_SIGNED
 		);
 		const r1 = findSendAction(
@@ -188,7 +207,7 @@ describe('Stuck forward re-drive loop', function () {
 		);
 		a.handleRevokeAndAck(decodeRevokeAndAckMessage(r1.payload));
 		const s2 = findSendAction(
-			b.signCommitment(crypto.randomBytes(64), []),
+			signRealCommitment(b),
 			MessageType.COMMITMENT_SIGNED
 		);
 		const r2 = findSendAction(

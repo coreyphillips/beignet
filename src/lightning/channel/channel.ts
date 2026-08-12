@@ -1310,26 +1310,36 @@ export class Channel {
 				return [{ type: ChannelActionType.ERROR, message: err }];
 			}
 		} else {
-			if (this._signer && this._state.remoteBasepoints) {
-				const firstPerCommitmentPoint = getPerCommitmentPoint(
-					this._state.localPerCommitmentSeed,
-					0n
-				);
-				const valid = verifyRemoteCommitmentSig(
-					this._state,
-					this._signer,
-					firstPerCommitmentPoint,
-					msg.signature,
-					0n
-				);
-				if (!valid) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Invalid commitment signature in funding_signed'
-						}
-					];
-				}
+			// Cannot verify -> must not adopt: an unverified funding_signed
+			// gives the channel no unilateral exit, and the funding broadcast
+			// that follows would lock funds behind it.
+			if (!this._signer || !this._state.remoteBasepoints) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot verify commitment signature in funding_signed: no signer or remote basepoints'
+					}
+				];
+			}
+			const firstPerCommitmentPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				0n
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				firstPerCommitmentPoint,
+				msg.signature,
+				0n
+			);
+			if (!valid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid commitment signature in funding_signed'
+					}
+				];
 			}
 
 			// Store remote's commitment signature
@@ -1608,26 +1618,36 @@ export class Channel {
 				];
 			}
 		} else {
-			if (this._signer && this._state.remoteBasepoints) {
-				const firstPerCommitmentPoint = getPerCommitmentPoint(
-					this._state.localPerCommitmentSeed,
-					0n
-				);
-				const valid = verifyRemoteCommitmentSig(
-					this._state,
-					this._signer,
-					firstPerCommitmentPoint,
-					msg.signature,
-					0n
-				);
-				if (!valid) {
-					return [
-						{
-							type: ChannelActionType.ERROR,
-							message: 'Invalid commitment signature in funding_created'
-						}
-					];
-				}
+			// Cannot verify -> must not adopt: the funding_signed we return
+			// commits us to the opener's funding tx, so an unverified opener
+			// signature would leave this side with no unilateral exit.
+			if (!this._signer || !this._state.remoteBasepoints) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot verify commitment signature in funding_created: no signer or remote basepoints'
+					}
+				];
+			}
+			const firstPerCommitmentPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				0n
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				firstPerCommitmentPoint,
+				msg.signature,
+				0n
+			);
+			if (!valid) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: 'Invalid commitment signature in funding_created'
+					}
+				];
 			}
 
 			// Store remote's commitment signature
@@ -3164,48 +3184,55 @@ export class Channel {
 			}
 			this._state.remoteHtlcSignatures = msg.htlcSignatures;
 		} else {
+			// Cannot verify -> must not adopt: the revoke_and_ack this handler
+			// returns reveals the previous revocation secret, so an unverified
+			// commitment must never make it that far. A plain ERROR, not a wire
+			// error: the missing pieces are a LOCAL invariant failure, not a
+			// peer violation, so the channel must not be condemned at the peer.
+			if (!this._signer || !this._state.remoteBasepoints) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message:
+							'Cannot verify commitment signature: no signer or remote basepoints'
+					}
+				];
+			}
+
 			// Verify the remote's commitment signature BEFORE revoking old state (Fix 1.1)
-			if (this._signer && this._state.remoteBasepoints) {
-				const nextCommitmentNumber = this._state.localCommitmentNumber + 1n;
-				const nextPerCommitmentPoint = getPerCommitmentPoint(
-					this._state.localPerCommitmentSeed,
-					nextCommitmentNumber
+			const nextCommitmentNumber = this._state.localCommitmentNumber + 1n;
+			const nextPerCommitmentPoint = getPerCommitmentPoint(
+				this._state.localPerCommitmentSeed,
+				nextCommitmentNumber
+			);
+			const valid = verifyRemoteCommitmentSig(
+				this._state,
+				this._signer,
+				nextPerCommitmentPoint,
+				msg.signature,
+				nextCommitmentNumber
+			);
+			if (!valid) {
+				const cid = (
+					this._state.channelId || this._state.temporaryChannelId
+				).toString('hex');
+				// BOLT 2: MUST fail the channel — send the wire error so the
+				// peer force-closes; continuing would wedge on desynced state.
+				return this._failChannelWithWireError(
+					`Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
 				);
-				const valid = verifyRemoteCommitmentSig(
-					this._state,
-					this._signer,
-					nextPerCommitmentPoint,
-					msg.signature,
-					nextCommitmentNumber
-				);
-				if (!valid) {
-					const cid = (
-						this._state.channelId || this._state.temporaryChannelId
-					).toString('hex');
-					// BOLT 2: MUST fail the channel — send the wire error so the
-					// peer force-closes; continuing would wedge on desynced state.
-					return this._failChannelWithWireError(
-						`Invalid commitment signature on channel ${cid} (commitNum=${this._state.localCommitmentNumber}, htlcs=${this._state.htlcs.size}, state=${this._state.state})`
-					);
-				}
 			}
 
 			// Verify HTLC second-level transaction signatures before revoking old state
-			if (this._signer && this._state.remoteBasepoints) {
-				const htlcPerCommitmentPoint = getPerCommitmentPoint(
-					this._state.localPerCommitmentSeed,
-					this._state.localCommitmentNumber + 1n
-				);
-				const htlcSigsValid = verifyRemoteHtlcSignatures(
-					this._state,
-					this._signer,
-					htlcPerCommitmentPoint,
-					msg.htlcSignatures
-				);
-				if (!htlcSigsValid) {
-					// BOLT 2: MUST fail the channel (see above).
-					return this._failChannelWithWireError('Invalid HTLC signature');
-				}
+			const htlcSigsValid = verifyRemoteHtlcSignatures(
+				this._state,
+				this._signer,
+				nextPerCommitmentPoint,
+				msg.htlcSignatures
+			);
+			if (!htlcSigsValid) {
+				// BOLT 2: MUST fail the channel (see above).
+				return this._failChannelWithWireError('Invalid HTLC signature');
 			}
 
 			// Store remote's signature

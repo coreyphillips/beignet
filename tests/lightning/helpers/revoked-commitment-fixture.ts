@@ -55,6 +55,11 @@ import {
 } from '../../../src/lightning/script/commitment';
 import { buildReceivedHtlcScript } from '../../../src/lightning/script/htlc';
 import { PENALTY_SPLIT_DEADLINE_BLOCKS } from '../../../src/lightning/chain/output-resolver';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './real-signing';
 
 export function makeBasepoints(seed: Buffer): {
 	basepoints: IChannelBasepoints;
@@ -132,6 +137,8 @@ export function setupNormalChannels(): {
 		remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 	});
 	const acceptor = new Channel(acceptorState);
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 	const openActions = opener.initiateOpen();
 	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
@@ -145,12 +152,17 @@ export function setupNormalChannels(): {
 	const fcActions = opener.createFundingCreated(
 		fundingTxid,
 		0,
-		crypto.randomBytes(64)
+		realInitialCommitmentSig(opener, fundingTxid, 0)
 	);
 	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+	const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
+		decodedFc,
+		realInitialCommitmentSig(
+			acceptor,
+			decodedFc.fundingTxid,
+			decodedFc.fundingOutputIndex
+		)
 	);
 	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -179,7 +191,11 @@ export function setupNormalChannels(): {
 }
 
 export function exchangeCommitments(opener: Channel, acceptor: Channel): void {
-	const commitActions1 = opener.signCommitment(crypto.randomBytes(64), []);
+	const openerSigs = realCommitmentSigs(opener);
+	const commitActions1 = opener.signCommitment(
+		openerSigs.signature,
+		openerSigs.htlcSignatures
+	);
 	const commitMsg1 = findSendAction(
 		commitActions1,
 		MessageType.COMMITMENT_SIGNED
@@ -190,7 +206,11 @@ export function exchangeCommitments(opener: Channel, acceptor: Channel): void {
 	const raaMsg1 = findSendAction(raaActions1, MessageType.REVOKE_AND_ACK);
 	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg1.payload));
 
-	const commitActions2 = acceptor.signCommitment(crypto.randomBytes(64), []);
+	const acceptorSigs = realCommitmentSigs(acceptor);
+	const commitActions2 = acceptor.signCommitment(
+		acceptorSigs.signature,
+		acceptorSigs.htlcSignatures
+	);
 	const commitMsg2 = findSendAction(
 		commitActions2,
 		MessageType.COMMITMENT_SIGNED

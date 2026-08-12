@@ -64,6 +64,11 @@ import { ChannelManager } from '../../src/lightning/channel/channel-manager';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { Network } from '../../src/lightning/invoice/types';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -175,6 +180,8 @@ function setupNormalChannels(): {
 			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 		})
 	);
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 	const openActions = opener.initiateOpen();
 	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL)!;
@@ -188,12 +195,13 @@ function setupNormalChannels(): {
 	const fcActions = opener.createFundingCreated(
 		fundingTxid,
 		0,
-		crypto.randomBytes(64)
+		realInitialCommitmentSig(opener, fundingTxid, 0)
 	);
 	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED)!;
+	const fc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
+		fc,
+		realInitialCommitmentSig(acceptor, fc.fundingTxid, fc.fundingOutputIndex)
 	);
 	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED)!;
 	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -220,10 +228,18 @@ function setupNormalChannels(): {
 	};
 }
 
+/** Sign the peer's next commitment for real and send commitment_signed. */
+function signRealCommitment(
+	channel: Channel
+): Array<{ type: ChannelActionType }> {
+	const sigs = realCommitmentSigs(channel);
+	return channel.signCommitment(sigs.signature, sigs.htlcSignatures);
+}
+
 /** One full commitment round in each direction (advances both numbers to 1). */
 function exchangeCommitments(opener: Channel, acceptor: Channel): void {
 	const commitMsg1 = findSendAction(
-		opener.signCommitment(crypto.randomBytes(64), []),
+		signRealCommitment(opener),
 		MessageType.COMMITMENT_SIGNED
 	)!;
 	const raaMsg1 = findSendAction(
@@ -235,7 +251,7 @@ function exchangeCommitments(opener: Channel, acceptor: Channel): void {
 	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg1.payload));
 
 	const commitMsg2 = findSendAction(
-		acceptor.signCommitment(crypto.randomBytes(64), []),
+		signRealCommitment(acceptor),
 		MessageType.COMMITMENT_SIGNED
 	)!;
 	const raaMsg2 = findSendAction(
@@ -365,7 +381,7 @@ describe('Recovery phase 5: ChannelRecoveryStatus machine', function () {
 
 		// Fresh signed traffic ends the exchange: the status machine moves on.
 		const commitMsg = findSendAction(
-			opener.signCommitment(crypto.randomBytes(64), []),
+			signRealCommitment(opener),
 			MessageType.COMMITMENT_SIGNED
 		)!;
 		acceptor.handleCommitmentSigned(

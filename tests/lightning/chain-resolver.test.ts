@@ -56,6 +56,11 @@ import {
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { generateFromSeed, MAX_INDEX } from '../../src/lightning/keys/shachain';
 import { perCommitmentPointFromSecret } from '../../src/lightning/keys/derivation';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -145,6 +150,9 @@ function setupNormalChannels(): {
 
 	const acceptor = new Channel(acceptorState);
 
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
+
 	// Opening handshake
 	const openActions = opener.initiateOpen();
 	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
@@ -155,12 +163,20 @@ function setupNormalChannels(): {
 	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
 	const fundingTxid = crypto.randomBytes(32);
-	const fakeSig = crypto.randomBytes(64);
-	const fcActions = opener.createFundingCreated(fundingTxid, 0, fakeSig);
+	const fcActions = opener.createFundingCreated(
+		fundingTxid,
+		0,
+		realInitialCommitmentSig(opener, fundingTxid, 0)
+	);
 	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+	const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
+		decodedFc,
+		realInitialCommitmentSig(
+			acceptor,
+			decodedFc.fundingTxid,
+			decodedFc.fundingOutputIndex
+		)
 	);
 	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -201,8 +217,11 @@ function setupNormalChannels(): {
  * Exchange commitment signatures between two channels.
  */
 function exchangeCommitments(opener: Channel, acceptor: Channel): void {
-	const sig1 = crypto.randomBytes(64);
-	const commitActions1 = opener.signCommitment(sig1, []);
+	const sigs1 = realCommitmentSigs(opener);
+	const commitActions1 = opener.signCommitment(
+		sigs1.signature,
+		sigs1.htlcSignatures
+	);
 	const commitMsg1 = findSendAction(
 		commitActions1,
 		MessageType.COMMITMENT_SIGNED
@@ -212,8 +231,11 @@ function exchangeCommitments(opener: Channel, acceptor: Channel): void {
 	const raaMsg1 = findSendAction(raaActions1, MessageType.REVOKE_AND_ACK);
 	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg1.payload));
 
-	const sig2 = crypto.randomBytes(64);
-	const commitActions2 = acceptor.signCommitment(sig2, []);
+	const sigs2 = realCommitmentSigs(acceptor);
+	const commitActions2 = acceptor.signCommitment(
+		sigs2.signature,
+		sigs2.htlcSignatures
+	);
 	const commitMsg2 = findSendAction(
 		commitActions2,
 		MessageType.COMMITMENT_SIGNED
@@ -407,8 +429,11 @@ describe('Output Resolver (Phase 4B)', function () {
 			// Half a commitment round: opener signs (remoteCommitmentNumber 0→1) and
 			// consumes the peer's revoke_and_ack (stores secret #0), but never receives
 			// the peer's commitment_signed, so localCommitmentNumber stays 0.
-			const sig = crypto.randomBytes(64);
-			const commitActions = opener.signCommitment(sig, []);
+			const sigs = realCommitmentSigs(opener);
+			const commitActions = opener.signCommitment(
+				sigs.signature,
+				sigs.htlcSignatures
+			);
 			const commitMsg = findSendAction(
 				commitActions,
 				MessageType.COMMITMENT_SIGNED
@@ -659,7 +684,14 @@ describe('Output Resolver (Phase 4B)', function () {
 			const peerRevokedTx = buildRemoteCommitment(preState, peerPoint0, 0n)
 				.result.tx;
 
+			// The real signature exchange is over the lease-free commitments both
+			// sides agreed at open; clear the lease fields for the round and
+			// restore them for classification below.
+			preState.leaseExpiry = undefined;
+			preState.leaseCommitBlockheight = undefined;
 			exchangeCommitments(opener, acceptor);
+			preState.leaseExpiry = LEASE_EXPIRY;
+			preState.leaseCommitBlockheight = LEASE_COMMIT_BH;
 			const state = opener.getFullState();
 			expect(state.shaChainStore.getSecret(MAX_INDEX - 0n)).to.not.be.null;
 
