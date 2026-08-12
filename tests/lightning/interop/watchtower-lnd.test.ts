@@ -57,6 +57,11 @@ import { IJusticeContext } from '../../../src/lightning/watchtower/justice';
 import { WatchtowerClient } from '../../../src/lightning/watchtower/watchtower-client';
 import { chainHashForNetwork } from '../../../src/lightning/watchtower';
 import { BlobType } from '../../../src/lightning/watchtower/blob';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from '../helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -117,7 +122,8 @@ function findSendAction(actions: any[], msgType: MessageType): any {
 
 /** One commitment round; the acceptor reveals a revocation secret. */
 function exchangeOnce(opener: Channel, acceptor: Channel): void {
-	const csActions = opener.signCommitment(crypto.randomBytes(64), []);
+	const sigs = realCommitmentSigs(opener);
+	const csActions = opener.signCommitment(sigs.signature, sigs.htlcSignatures);
 	const csMsg = findSendAction(csActions, MessageType.COMMITMENT_SIGNED);
 	const raaActions = acceptor.handleCommitmentSigned(
 		decodeCommitmentSignedMessage(csMsg.payload)
@@ -152,10 +158,11 @@ function buildRevokedContexts(
 	rounds: number,
 	kind: ChannelKind = 'legacy'
 ): IJusticeContext[] {
-	const { basepoints: openerBp, privkeys: openerPrivkeys } = makeBasepoints(
-		crypto.randomBytes(32)
-	);
-	const { basepoints: acceptorBp } = makeBasepoints(crypto.randomBytes(32));
+	const openerSeed = crypto.randomBytes(32);
+	const acceptorSeed = crypto.randomBytes(32);
+	const { basepoints: openerBp, privkeys: openerPrivkeys } =
+		makeBasepoints(openerSeed);
+	const { basepoints: acceptorBp } = makeBasepoints(acceptorSeed);
 	const temporaryChannelId = crypto.randomBytes(32);
 	const opener = new Channel(
 		createOpenerState({
@@ -179,6 +186,8 @@ function buildRevokedContexts(
 			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 		})
 	);
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 	const openMsg = findSendAction(
 		opener.initiateOpen(),
 		MessageType.OPEN_CHANNEL
@@ -188,18 +197,24 @@ function buildRevokedContexts(
 		MessageType.ACCEPT_CHANNEL
 	);
 	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
+	const fundingTxid = crypto.randomBytes(32);
 	const fcMsg = findSendAction(
 		opener.createFundingCreated(
-			crypto.randomBytes(32),
+			fundingTxid,
 			0,
-			crypto.randomBytes(64)
+			realInitialCommitmentSig(opener, fundingTxid, 0)
 		),
 		MessageType.FUNDING_CREATED
 	);
+	const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsMsg = findSendAction(
 		acceptor.handleFundingCreated(
-			decodeFundingCreatedMessage(fcMsg.payload),
-			crypto.randomBytes(64)
+			decodedFc,
+			realInitialCommitmentSig(
+				acceptor,
+				decodedFc.fundingTxid,
+				decodedFc.fundingOutputIndex
+			)
 		),
 		MessageType.FUNDING_SIGNED
 	);

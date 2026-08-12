@@ -31,7 +31,25 @@ import {
 import { Channel } from '../../src/lightning/channel/channel';
 import { ChannelActionType } from '../../src/lightning/channel/channel-actions';
 import { ChannelSigner } from '../../src/lightning/keys/signer';
-import { createOpenerState } from '../../src/lightning/channel/channel-state';
+import {
+	createOpenerState,
+	createAcceptorState
+} from '../../src/lightning/channel/channel-state';
+import {
+	decodeOpenChannelMessage,
+	decodeAcceptChannelMessage
+} from '../../src/lightning/message/channel-open';
+import {
+	decodeFundingCreatedMessage,
+	decodeFundingSignedMessage,
+	decodeChannelReadyMessage
+} from '../../src/lightning/message/channel-funding';
+import { decodeCommitmentSignedMessage } from '../../src/lightning/message/channel-commitment';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 import {
 	deriveChannelKeys,
 	LnCoinType
@@ -173,10 +191,12 @@ function makeCMConfig(seed: Buffer): IChannelManagerConfig {
 		.update(seed)
 		.update(Buffer.from([0]))
 		.digest();
+	// Matches makeBasepoints keys[4]; without it commitment_signed fails
+	// 'Invalid HTLC signature' once an HTLC exists.
 	const htlcSecret = crypto
 		.createHash('sha256')
 		.update(seed)
-		.update(Buffer.from([5]))
+		.update(Buffer.from([4]))
 		.digest();
 	return {
 		localBasepoints: makeBasepoints(seed),
@@ -188,6 +208,82 @@ function makeCMConfig(seed: Buffer): IChannelManagerConfig {
 		localFundingPrivkey: fundingPrivkey,
 		htlcBasepointSecret: htlcSecret
 	};
+}
+
+// A real opener/acceptor pair driven to NORMAL with genuinely verified
+// signatures, for tests that need a successful commitment round.
+function getToNormalPair(): { opener: Channel; acceptor: Channel } {
+	const openerSeed = makeSeed(90);
+	const acceptorSeed = makeSeed(91);
+	const opener = new Channel(
+		createOpenerState({
+			temporaryChannelId: Buffer.alloc(32, 0xab),
+			fundingSatoshis: 1_000_000n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(openerSeed),
+			localPerCommitmentSeed: makeSeed(190)
+		})
+	);
+	const acceptor = new Channel(
+		createAcceptorState({
+			temporaryChannelId: Buffer.alloc(32, 0xab),
+			fundingSatoshis: 0n,
+			pushMsat: 0n,
+			localConfig: { ...DEFAULT_CHANNEL_CONFIG },
+			localBasepoints: makeBasepoints(acceptorSeed),
+			localPerCommitmentSeed: makeSeed(191),
+			remoteBasepoints: makeBasepoints(openerSeed),
+			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
+		})
+	);
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
+
+	const openMsg = findSendAction(
+		opener.initiateOpen(),
+		MessageType.OPEN_CHANNEL
+	);
+	const acceptMsg = findSendAction(
+		acceptor.handleOpenChannel(decodeOpenChannelMessage(openMsg.payload)),
+		MessageType.ACCEPT_CHANNEL
+	);
+	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
+
+	const fundingTxid = crypto.randomBytes(32);
+	const fcMsg = findSendAction(
+		opener.createFundingCreated(
+			fundingTxid,
+			0,
+			realInitialCommitmentSig(opener, fundingTxid, 0)
+		),
+		MessageType.FUNDING_CREATED
+	);
+	const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
+	const fsMsg = findSendAction(
+		acceptor.handleFundingCreated(
+			decodedFc,
+			realInitialCommitmentSig(
+				acceptor,
+				decodedFc.fundingTxid,
+				decodedFc.fundingOutputIndex
+			)
+		),
+		MessageType.FUNDING_SIGNED
+	);
+	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
+
+	const orMsg = findSendAction(
+		opener.fundingConfirmed(),
+		MessageType.CHANNEL_READY
+	);
+	const arMsg = findSendAction(
+		acceptor.fundingConfirmed(),
+		MessageType.CHANNEL_READY
+	);
+	opener.handleChannelReady(decodeChannelReadyMessage(arMsg.payload));
+	acceptor.handleChannelReady(decodeChannelReadyMessage(orMsg.payload));
+	return { opener, acceptor };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -254,7 +350,7 @@ describe('Production Hardening 3: Fund Safety', function () {
 			expect(state.localCommitmentNumber).to.equal(0n);
 		});
 
-		it('should not verify if no signer is set (backward compatible)', () => {
+		it('should fail closed if no signer is set', () => {
 			const seed = makeSeed(12);
 			const bp = makeBasepoints(seed);
 
@@ -270,7 +366,8 @@ describe('Production Hardening 3: Fund Safety', function () {
 			state.state = ChannelState.NORMAL;
 			state.channelId = crypto.randomBytes(32);
 
-			// No signer — backward compatible
+			// No signer: the channel cannot verify, so it must refuse to adopt
+			// the commitment rather than store-and-revoke unverified.
 			const channel = new Channel(state);
 
 			const actions = channel.handleCommitmentSigned({
@@ -279,13 +376,16 @@ describe('Production Hardening 3: Fund Safety', function () {
 				htlcSignatures: []
 			});
 
-			// Should succeed — no verification, just store and revoke
-			const persistAction = actions.find(
-				(a) => a.type === ChannelActionType.PERSIST_STATE
+			const errorAction = actions.find(
+				(a) => a.type === ChannelActionType.ERROR
 			);
-			const sendAction = findSendAction(actions, MessageType.REVOKE_AND_ACK);
-			expect(persistAction).to.exist;
-			expect(sendAction).to.exist;
+			expect(errorAction).to.exist;
+			expect((errorAction as any).message).to.include(
+				'Cannot verify commitment signature'
+			);
+			expect(findSendAction(actions, MessageType.REVOKE_AND_ACK)).to.be
+				.undefined;
+			expect(state.localCommitmentNumber).to.equal(0n);
 		});
 
 		it('should wire signer on open, accept, and restore in ChannelManager', () => {
@@ -621,28 +721,16 @@ describe('Production Hardening 3: Crash Recovery', function () {
 
 	describe('Fix 2.2: Persist-Before-Send Ordering', () => {
 		it('handleCommitmentSigned returns PERSIST_STATE before SEND_MESSAGE', () => {
-			const seed = makeSeed(60);
-			const bp = makeBasepoints(seed);
+			const { opener, acceptor } = getToNormalPair();
 
-			const state = createOpenerState({
-				temporaryChannelId: Buffer.alloc(32, 0xdd),
-				fundingSatoshis: 1_000_000n,
-				pushMsat: 0n,
-				localConfig: { ...DEFAULT_CHANNEL_CONFIG },
-				localBasepoints: bp,
-				localPerCommitmentSeed: makeSeed(160)
-			});
-
-			state.state = ChannelState.NORMAL;
-			state.channelId = crypto.randomBytes(32);
-
-			const channel = new Channel(state); // No signer — skips verification
-
-			const actions = channel.handleCommitmentSigned({
-				channelId: state.channelId!,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
-			});
+			const sigs = realCommitmentSigs(opener);
+			const csMsg = findSendAction(
+				opener.signCommitment(sigs.signature, sigs.htlcSignatures),
+				MessageType.COMMITMENT_SIGNED
+			);
+			const actions = acceptor.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(csMsg.payload)
+			);
 
 			expect(actions.length).to.equal(2);
 			expect(actions[0].type).to.equal(ChannelActionType.PERSIST_STATE);
@@ -676,32 +764,56 @@ describe('Production Hardening 3: Crash Recovery', function () {
 		});
 
 		it('channel:persist event emitted in ChannelManager processActions', () => {
-			const config = makeCMConfig(makeSeed(62));
-			const manager = new ChannelManager(config);
-			manager.on('error', () => {});
-
-			// Create a channel and get it to NORMAL
-			const remotePubkey = getPublicKey(crypto.randomBytes(32)).toString('hex');
-			const channel = manager.openChannel(remotePubkey, 1_000_000n);
-
-			// Manually advance to NORMAL so we can test commitment flow
-			const channelState = channel.getFullState();
-			channelState.state = ChannelState.NORMAL;
-			channelState.channelId = crypto.randomBytes(32);
-
-			// Simulate sending commitment_signed to trigger handleCommitmentSigned
-			// (which returns PERSIST_STATE)
-			const msg = {
-				channelId: channelState.channelId,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
-			};
-			const actions = channel.handleCommitmentSigned(msg);
-			// PERSIST_STATE should be in actions
-			const hasPersist = actions.some(
-				(a) => a.type === ChannelActionType.PERSIST_STATE
+			const aliceConfig = makeCMConfig(makeSeed(62));
+			const bobConfig = makeCMConfig(makeSeed(63));
+			const alicePubkey =
+				aliceConfig.localBasepoints.fundingPubkey.toString('hex');
+			const bobPubkey = bobConfig.localBasepoints.fundingPubkey.toString('hex');
+			const alice = new ChannelManager(aliceConfig);
+			const bob = new ChannelManager(bobConfig);
+			alice.on('error', () => {});
+			bob.on('error', () => {});
+			alice.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === bobPubkey) bob.handleMessage(alicePubkey, type, payload);
+				}
 			);
-			expect(hasPersist).to.be.true;
+			bob.on(
+				'message:outbound',
+				(peer: string, type: number, payload: Buffer) => {
+					if (peer === alicePubkey)
+						alice.handleMessage(bobPubkey, type, payload);
+				}
+			);
+
+			const channel = alice.openChannel(bobPubkey, 1_000_000n);
+			const channelId = alice.createFunding(
+				channel,
+				crypto.randomBytes(32),
+				0,
+				crypto.randomBytes(64)
+			)!;
+			alice.handleFundingConfirmed(channelId);
+			bob.handleFundingConfirmed(channelId);
+
+			let persistEmitted = false;
+			alice.on('channel:persist', () => {
+				persistEmitted = true;
+			});
+
+			// A real commitment round (add + auto-sign, driven by the loopback)
+			// produces PERSIST_STATE actions, which processActions surfaces as
+			// channel:persist.
+			const res = alice.addHtlc(
+				channelId,
+				10_000_000n,
+				crypto.randomBytes(32),
+				500000,
+				crypto.randomBytes(1366)
+			);
+			expect(res.ok).to.be.true;
+			expect(persistEmitted).to.be.true;
 		});
 	});
 

@@ -71,6 +71,10 @@ import {
 	decodeFundingSignedMessage,
 	decodeChannelReadyMessage
 } from '../../src/lightning/message/channel-funding';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	const keys: Buffer[] = [];
@@ -1677,6 +1681,8 @@ describe('Splice', function () {
 				remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 			});
 			const acceptor = new Channel(acceptorState);
+			opener.setSigner(signerFromSeed(openerSeed));
+			acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 			// Full open_channel / accept_channel flow with message decode
 			const openActions = opener.initiateOpen();
@@ -1695,12 +1701,17 @@ describe('Splice', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -1882,6 +1893,30 @@ describe('Splice', function () {
 				scriptPubkey: Buffer.alloc(34, 0x00)
 			});
 			expect(findAction(outAction, ChannelActionType.ERROR)).to.not.exist;
+
+			// The initiator also supplies the shared input and an honest new
+			// funding output, so the co-sign audit accepts the completed tx.
+			acceptor.handleTxAddInput({
+				channelId,
+				serialId: 4n,
+				prevTx: Buffer.alloc(0),
+				prevTxVout: 0,
+				sequence: 0xfffffffd,
+				sharedInputTxid: acceptor.getFullState().fundingTxid!
+			});
+			const {
+				createFundingScript
+			} = require('../../src/lightning/script/funding');
+			const newFunding = createFundingScript(
+				acceptor.getFullState().localBasepoints.fundingPubkey,
+				Buffer.alloc(33, 0x02)
+			);
+			acceptor.handleTxAddOutput({
+				channelId,
+				serialId: 6n,
+				amountSats: 600_000n,
+				scriptPubkey: newFunding.p2wshOutput
+			});
 
 			// Peer signals tx_complete; the session accepts it without error.
 			const completeAction = acceptor.handleTxComplete();
@@ -2149,6 +2184,49 @@ describe('Splice', function () {
 					opener.getFullState().remoteBasepoints!.revocationBasepoint
 				)
 			).to.be.true;
+		});
+
+		it('fails closed on a splice commitment_signed when the signer is missing', function () {
+			// Issue #329: "cannot verify" must never become "cache and mark
+			// received" on the splice commitment path either.
+			const { opener } = makeNormalChannel();
+			quiesce(opener);
+			const channelId = opener.getChannelId()!;
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const withdraw = 50_000n;
+			opener.setSpliceOutDestination(destScript, withdraw);
+			opener.initiateSplice(-withdraw, 253);
+			opener.handleSpliceAck({
+				channelId,
+				fundingPubkey: makeBasepoints(acceptorSeed).fundingPubkey,
+				relativeSatoshis: 0n
+			});
+			opener.handleTxComplete();
+			opener.handleTxComplete();
+			opener.handleTxComplete();
+			expect(opener.buildAndSignSpliceTx(), 'splice tx built').to.not.be.null;
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(opener as any)._signer = null;
+			const actions = opener.handleCommitmentSigned({
+				channelId,
+				signature: crypto.randomBytes(64),
+				htlcSignatures: []
+			});
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain(
+				'Cannot verify splice commitment signature'
+			);
+			// Nothing cached, round not marked received.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((opener as any)._spliceRemoteCommitmentSig).to.equal(null);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((opener as any)._spliceReceivedCommitment).to.equal(false);
 		});
 
 		it('should unwind the splice on peer tx_abort (channel returns to NORMAL)', function () {

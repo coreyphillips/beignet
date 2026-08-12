@@ -86,6 +86,11 @@ import {
 	IWatchtowerUpdate
 } from '../../src/lightning/watchtower/types';
 import { chainHashForNetwork } from '../../src/lightning/watchtower';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -127,7 +132,8 @@ function findSendAction(actions: any[], msgType: MessageType): any {
 
 /** One commitment round; returns the secret the acceptor revealed to the opener. */
 function exchangeOnce(opener: Channel, acceptor: Channel): Buffer {
-	const csActions = opener.signCommitment(crypto.randomBytes(64), []);
+	const sigs = realCommitmentSigs(opener);
+	const csActions = opener.signCommitment(sigs.signature, sigs.htlcSignatures);
 	const csMsg = findSendAction(csActions, MessageType.COMMITMENT_SIGNED);
 	const raaActions = acceptor.handleCommitmentSigned(
 		decodeCommitmentSignedMessage(csMsg.payload)
@@ -241,6 +247,8 @@ function freshPair(): {
 			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 		})
 	);
+	opener.setSigner(signerFromSeed(Buffer.alloc(32, 0x11)));
+	acceptor.setSigner(signerFromSeed(Buffer.alloc(32, 0x22)));
 	const openMsg = findSendAction(
 		opener.initiateOpen(),
 		MessageType.OPEN_CHANNEL
@@ -250,18 +258,20 @@ function freshPair(): {
 		MessageType.ACCEPT_CHANNEL
 	);
 	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
+	const fundingTxid = crypto.randomBytes(32);
 	const fcMsg = findSendAction(
 		opener.createFundingCreated(
-			crypto.randomBytes(32),
+			fundingTxid,
 			0,
-			crypto.randomBytes(64)
+			realInitialCommitmentSig(opener, fundingTxid, 0)
 		),
 		MessageType.FUNDING_CREATED
 	);
+	const fc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsMsg = findSendAction(
 		acceptor.handleFundingCreated(
-			decodeFundingCreatedMessage(fcMsg.payload),
-			crypto.randomBytes(64)
+			fc,
+			realInitialCommitmentSig(acceptor, fc.fundingTxid, fc.fundingOutputIndex)
 		),
 		MessageType.FUNDING_SIGNED
 	);

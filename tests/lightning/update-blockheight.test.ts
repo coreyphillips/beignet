@@ -56,6 +56,11 @@ import {
 import { classifyOutputs } from '../../src/lightning/chain/output-resolver';
 import { CommitmentType, OutputType } from '../../src/lightning/chain/types';
 import { FeatureFlags, Feature } from '../../src/lightning/features/flags';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -108,9 +113,8 @@ function makeAnchorChannelType(): Buffer {
 
 /**
  * Loopback buyer(opener)/seller(acceptor) pair driven to NORMAL, then dressed
- * as a leased anchor channel (seller = lessor). Signatures are fake (the
- * Channel state machine does not verify the funding sig itself), which is
- * enough to drive the two-phase blockheight rounds.
+ * as a leased anchor channel (seller = lessor). Both sides carry real signers
+ * and exchange real signatures, which the channel now verifies.
  */
 function setupLeasedPair(): {
 	buyer: Channel;
@@ -139,6 +143,7 @@ function setupLeasedPair(): {
 		localPerCommitmentSeed: buyerCommitSeed
 	});
 	const buyer = new Channel(buyerState);
+	buyer.setSigner(signerFromSeed(buyerSeed));
 
 	const sellerState = createAcceptorState({
 		temporaryChannelId: Buffer.alloc(32, 0xee),
@@ -151,6 +156,7 @@ function setupLeasedPair(): {
 		remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 	});
 	const seller = new Channel(sellerState);
+	seller.setSigner(signerFromSeed(sellerSeed));
 
 	const openActions = buyer.initiateOpen();
 	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
@@ -164,12 +170,17 @@ function setupLeasedPair(): {
 	const fcActions = buyer.createFundingCreated(
 		fundingTxid,
 		0,
-		crypto.randomBytes(64)
+		realInitialCommitmentSig(buyer, fundingTxid, 0)
 	);
 	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+	const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsActions = seller.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
+		decodedFc,
+		realInitialCommitmentSig(
+			seller,
+			decodedFc.fundingTxid,
+			decodedFc.fundingOutputIndex
+		)
 	);
 	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 	buyer.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -204,7 +215,11 @@ function setupLeasedPair(): {
 }
 
 function exchangeCommitments(opener: Channel, acceptor: Channel): void {
-	const commitActions1 = opener.signCommitment(crypto.randomBytes(64), []);
+	const openerSigs = realCommitmentSigs(opener);
+	const commitActions1 = opener.signCommitment(
+		openerSigs.signature,
+		openerSigs.htlcSignatures
+	);
 	const commitMsg1 = findSendAction(
 		commitActions1,
 		MessageType.COMMITMENT_SIGNED
@@ -215,7 +230,11 @@ function exchangeCommitments(opener: Channel, acceptor: Channel): void {
 	const raaMsg1 = findSendAction(raaActions1, MessageType.REVOKE_AND_ACK);
 	opener.handleRevokeAndAck(decodeRevokeAndAckMessage(raaMsg1.payload));
 
-	const commitActions2 = acceptor.signCommitment(crypto.randomBytes(64), []);
+	const acceptorSigs = realCommitmentSigs(acceptor);
+	const commitActions2 = acceptor.signCommitment(
+		acceptorSigs.signature,
+		acceptorSigs.htlcSignatures
+	);
 	const commitMsg2 = findSendAction(
 		commitActions2,
 		MessageType.COMMITMENT_SIGNED

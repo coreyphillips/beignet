@@ -48,7 +48,11 @@ import {
 	decodeCommitmentSignedMessage,
 	decodeRevokeAndAckMessage
 } from '../../src/lightning/message/channel-commitment';
-import { buildRemoteCommitment } from '../../src/lightning/channel/commitment-builder';
+import {
+	buildRemoteCommitment,
+	signRemoteCommitmentPartial
+} from '../../src/lightning/channel/commitment-builder';
+import { generateNonce } from '../../src/lightning/crypto/musig';
 import { buildToLocalScript } from '../../src/lightning/script/commitment';
 import { buildToRemoteAnchorScript } from '../../src/lightning/script/anchor';
 import {
@@ -105,6 +109,11 @@ import {
 	ITowerTransport
 } from '../../src/lightning/watchtower/types';
 import { chainHashForNetwork } from '../../src/lightning/watchtower';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -163,11 +172,37 @@ function exchangeOnce(
 	acceptor: Channel,
 	taprootPartial = false
 ): Buffer {
-	const csActions = opener.signCommitment(
-		crypto.randomBytes(64),
-		[],
-		taprootPartial ? crypto.randomBytes(98) : undefined
-	);
+	let csActions;
+	if (taprootPartial) {
+		// A real MuSig2 partial over the acceptor's next commitment against
+		// the acceptor's advertised verification nonce (the manager's
+		// signCommitmentPartial recipe). The 64-byte signature field is dead
+		// weight on a taproot commitment_signed (zeroed on the wire).
+		const os = opener.getFullState();
+		const as = acceptor.getFullState();
+		const signingNonce = generateNonce({
+			publicKey: os.localBasepoints.fundingPubkey,
+			sessionId: crypto.randomBytes(32)
+		});
+		const point =
+			os.remoteNextPerCommitmentPoint || os.remoteCurrentPerCommitmentPoint;
+		const partial = signRemoteCommitmentPartial(
+			os,
+			opener.getSigner()!,
+			signingNonce,
+			Buffer.from(as.localNextNonce!),
+			point!,
+			os.remoteCommitmentNumber + 1n
+		);
+		csActions = opener.signCommitment(
+			Buffer.alloc(64),
+			[],
+			Buffer.concat([partial, Buffer.from(signingNonce)])
+		);
+	} else {
+		const sigs = realCommitmentSigs(opener);
+		csActions = opener.signCommitment(sigs.signature, sigs.htlcSignatures);
+	}
 	const csMsg = findSendAction(csActions, MessageType.COMMITMENT_SIGNED);
 	const raaActions = acceptor.handleCommitmentSigned(
 		decodeCommitmentSignedMessage(csMsg.payload)
@@ -209,6 +244,8 @@ function freshPair(seedTag: string): {
 			remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 		})
 	);
+	opener.setSigner(signerFromSeed(det(`${seedTag}-opener`)));
+	acceptor.setSigner(signerFromSeed(det(`${seedTag}-acceptor`)));
 	const openMsg = findSendAction(
 		opener.initiateOpen(),
 		MessageType.OPEN_CHANNEL
@@ -218,18 +255,20 @@ function freshPair(seedTag: string): {
 		MessageType.ACCEPT_CHANNEL
 	);
 	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
+	const fundingTxid = det(`${seedTag}-funding`);
 	const fcMsg = findSendAction(
 		opener.createFundingCreated(
-			det(`${seedTag}-funding`),
+			fundingTxid,
 			0,
-			crypto.randomBytes(64)
+			realInitialCommitmentSig(opener, fundingTxid, 0)
 		),
 		MessageType.FUNDING_CREATED
 	);
+	const fc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsMsg = findSendAction(
 		acceptor.handleFundingCreated(
-			decodeFundingCreatedMessage(fcMsg.payload),
-			crypto.randomBytes(64)
+			fc,
+			realInitialCommitmentSig(acceptor, fc.fundingTxid, fc.fundingOutputIndex)
 		),
 		MessageType.FUNDING_SIGNED
 	);
@@ -704,8 +743,18 @@ describe('watchtower v1 kit against a REAL revoked taproot commitment', function
 		// Round 1 in legacy form so the funding-state secret is consumed.
 		exchangeOnce(pair.opener, pair.acceptor);
 		// Flip to taproot: from here signCommitment caches TAPROOT commitments.
+		// Both sides flip (the acceptor now really verifies what it receives),
+		// and the acceptor needs a verification nonce for the opener to co-sign
+		// against, as channel_ready would have advertised on a negotiated
+		// taproot channel.
 		const state = pair.opener.getFullState();
 		state.channelType = channelTypeOf(Feature.OPTION_TAPROOT);
+		const acceptorState = pair.acceptor.getFullState();
+		acceptorState.channelType = state.channelType;
+		acceptorState.localNextNonce = generateNonce({
+			publicKey: acceptorState.localBasepoints.fundingPubkey,
+			sessionId: crypto.randomBytes(32)
+		});
 		// Round 2 signs + caches the taproot commitment; round 3's revoke_and_ack
 		// reveals its secret (a revocation always reveals the PREVIOUS state).
 		exchangeOnce(pair.opener, pair.acceptor, true);

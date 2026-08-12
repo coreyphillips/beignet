@@ -33,16 +33,33 @@ import {
 	deserializeChannelState
 } from '../../src/lightning/storage/serialization';
 import { createOpenerChannel } from '../../src/lightning/channel/channel';
+import { decodeFundingSignedMessage } from '../../src/lightning/message/channel-funding';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
 
-function makeBasepoints(): IChannelBasepoints {
+function makeBasepoints(seed: Buffer): IChannelBasepoints {
+	// Real curve points: open/accept validation now rejects off-curve
+	// basepoints (BOLT 2 LOW hardening). Derived as sha256(seed || [i]) so
+	// signerFromSeed(seed) holds the matching funding/HTLC privkeys.
+	const keys: Buffer[] = [];
+	for (let i = 0; i < 5; i++) {
+		keys.push(
+			crypto
+				.createHash('sha256')
+				.update(seed)
+				.update(Buffer.from([i]))
+				.digest()
+		);
+	}
 	return {
-		// Real curve points: open/accept validation now rejects off-curve
-		// basepoints (BOLT 2 LOW hardening).
-		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
-		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
-		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		fundingPubkey: getPublicKey(keys[0]),
+		revocationBasepoint: getPublicKey(keys[1]),
+		paymentBasepoint: getPublicKey(keys[2]),
+		delayedPaymentBasepoint: getPublicKey(keys[3]),
+		htlcBasepoint: getPublicKey(keys[4]),
 		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
@@ -95,14 +112,17 @@ function setupNormalChannels(): {
 } {
 	const openerSeed = crypto.randomBytes(32);
 	const acceptorSeed = crypto.randomBytes(32);
-	const openerBp = makeBasepoints();
-	const acceptorBp = makeBasepoints();
+	const openerBpSeed = crypto.randomBytes(32);
+	const acceptorBpSeed = crypto.randomBytes(32);
+	const openerBp = makeBasepoints(openerBpSeed);
+	const acceptorBp = makeBasepoints(acceptorBpSeed);
 
 	const opener = createOpenerChannel({
 		fundingSatoshis: 1_000_000n,
 		localBasepoints: openerBp,
 		localPerCommitmentSeed: openerSeed
 	});
+	opener.setSigner(signerFromSeed(openerBpSeed));
 
 	// Opener initiates
 	const openActions = opener.initiateOpen();
@@ -141,6 +161,7 @@ function setupNormalChannels(): {
 	});
 
 	const acceptor = new Channel(acceptorState);
+	acceptor.setSigner(signerFromSeed(acceptorBpSeed));
 	const acceptActions = acceptor.handleOpenChannel(openMsg);
 	const acceptPayload = findSendAction(
 		acceptActions,
@@ -156,24 +177,28 @@ function setupNormalChannels(): {
 
 	// Funding
 	const fundingTxid = crypto.randomBytes(32);
-	const sig = crypto.randomBytes(64);
+	const sig = realInitialCommitmentSig(opener, fundingTxid, 0);
 	opener.createFundingCreated(fundingTxid, 0, sig);
 
 	const channelId = opener.getChannelId()!;
 
 	// Acceptor handles funding_created
-	acceptor.handleFundingCreated(
+	const fsActions = acceptor.handleFundingCreated(
 		{
 			temporaryChannelId: opener.getTemporaryChannelId(),
 			fundingTxid,
 			fundingOutputIndex: 0,
 			signature: sig
 		},
-		crypto.randomBytes(64)
+		realInitialCommitmentSig(acceptor, fundingTxid, 0)
 	);
 
 	// Opener handles funding_signed
-	opener.handleFundingSigned({ channelId, signature: crypto.randomBytes(64) });
+	opener.handleFundingSigned(
+		decodeFundingSignedMessage(
+			findSendAction(fsActions, MessageType.FUNDING_SIGNED)!
+		)
+	);
 
 	// Both confirm funding
 	opener.fundingConfirmed();
@@ -251,7 +276,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		it('should not modify non-operational channels', function () {
 			const opener = createOpenerChannel({
 				fundingSatoshis: 1_000_000n,
-				localBasepoints: makeBasepoints(),
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32)
 			});
 			opener.markForReestablish();
@@ -380,10 +405,11 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		it('should retransmit revoke_and_ack if peer missed it', function () {
 			const { opener, acceptor } = setupNormalChannels();
 
+			const openerSigs = realCommitmentSigs(opener);
 			const revokeActions = acceptor.handleCommitmentSigned({
 				channelId: acceptor.getChannelId()!,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
 			});
 
 			const revokeSent = findSendAction(
@@ -428,11 +454,12 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		it('should accept valid per-commitment secret', function () {
 			const { opener, acceptor, acceptorSeed } = setupNormalChannels();
 
-			opener.signCommitment(crypto.randomBytes(64), []);
+			const openerSigs = realCommitmentSigs(opener);
+			opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures);
 			acceptor.handleCommitmentSigned({
 				channelId: acceptor.getChannelId()!,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
 			});
 			opener.handleRevokeAndAck({
 				channelId: opener.getChannelId()!,
@@ -573,11 +600,12 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		});
 
 		it('should cache revoke_and_ack on handleCommitmentSigned', function () {
-			const { acceptor, acceptorSeed } = setupNormalChannels();
+			const { opener, acceptor, acceptorSeed } = setupNormalChannels();
+			const openerSigs = realCommitmentSigs(opener);
 			acceptor.handleCommitmentSigned({
 				channelId: acceptor.getChannelId()!,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
 			});
 
 			expect(acceptor.getFullState().lastSentRevokeSecret).to.not.be.null;
@@ -633,7 +661,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 
 	describe('ChannelManager integration', function () {
 		it('should mark channels AWAITING_REESTABLISH on peer disconnect', function () {
-			const basepoints = makeBasepoints();
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
 			const seed = crypto.randomBytes(32);
 			const manager = new ChannelManager({
 				localBasepoints: basepoints,
@@ -662,7 +690,7 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		});
 
 		it('should send channel_reestablish on peer reconnect', function () {
-			const basepoints = makeBasepoints();
+			const basepoints = makeBasepoints(crypto.randomBytes(32));
 			const seed = crypto.randomBytes(32);
 			const manager = new ChannelManager({
 				localBasepoints: basepoints,
@@ -748,12 +776,13 @@ describe('Channel Reestablish (BOLT 2 §5)', function () {
 		it('should recover from disconnect after commitment exchange', function () {
 			const { opener, acceptor, acceptorSeed } = setupNormalChannels();
 
-			opener.signCommitment(crypto.randomBytes(64), []);
+			const openerSigs = realCommitmentSigs(opener);
+			opener.signCommitment(openerSigs.signature, openerSigs.htlcSignatures);
 
 			acceptor.handleCommitmentSigned({
 				channelId: acceptor.getChannelId()!,
-				signature: crypto.randomBytes(64),
-				htlcSignatures: []
+				signature: openerSigs.signature,
+				htlcSignatures: openerSigs.htlcSignatures
 			});
 
 			opener.handleRevokeAndAck({

@@ -37,6 +37,17 @@ import {
 	decodeClosingSignedMessage
 } from '../../src/lightning/message/channel-close';
 import { deriveChannelId } from '../../src/lightning/channel/validation';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig,
+	realCommitmentSigs
+} from './helpers/real-signing';
+
+/** Sign the peer's next commitment for real and send commitment_signed. */
+function signRealCommitment(channel: ChannelClass): any[] {
+	const sigs = realCommitmentSigs(channel);
+	return channel.signCommitment(sigs.signature, sigs.htlcSignatures);
+}
 
 function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	// Derive deterministic keys from seed
@@ -116,6 +127,8 @@ describe('Channel State Machine', function () {
 		});
 
 		const acceptor = new ChannelClass(acceptorState);
+		opener.setSigner(signerFromSeed(openerSeed));
+		acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 		return { opener, acceptor };
 	}
@@ -172,12 +185,11 @@ describe('Channel State Machine', function () {
 			// Step 4: Opener creates funding transaction and sends funding_created
 			const fundingTxid = crypto.randomBytes(32);
 			const fundingOutputIndex = 0;
-			const fakeSig = crypto.randomBytes(64);
 
 			const fundingCreatedActions = opener.createFundingCreated(
 				fundingTxid,
 				fundingOutputIndex,
-				fakeSig
+				realInitialCommitmentSig(opener, fundingTxid, fundingOutputIndex)
 			);
 			expect(opener.getState()).to.equal(ChannelState.SENT_FUNDING_CREATED);
 			const fundingCreatedMsg = findSendAction(
@@ -190,10 +202,13 @@ describe('Channel State Machine', function () {
 			const decodedFundingCreated = decodeFundingCreatedMessage(
 				fundingCreatedMsg.payload
 			);
-			const fakeSig2 = crypto.randomBytes(64);
 			const fundingSignedActions = acceptor.handleFundingCreated(
 				decodedFundingCreated,
-				fakeSig2
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFundingCreated.fundingTxid,
+					decodedFundingCreated.fundingOutputIndex
+				)
 			);
 			expect(acceptor.getState()).to.equal(
 				ChannelState.AWAITING_FUNDING_CONFIRMED
@@ -256,19 +271,23 @@ describe('Channel State Machine', function () {
 			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
 			const fundingTxid = crypto.randomBytes(32);
-			const fakeSig = crypto.randomBytes(64);
 			const fundingCreatedActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				fakeSig
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(
 				fundingCreatedActions,
 				MessageType.FUNDING_CREATED
 			);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -405,12 +424,17 @@ describe('Channel State Machine', function () {
 			const fcActions = opener.createFundingCreated(
 				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -433,12 +457,11 @@ describe('Channel State Machine', function () {
 
 		// Drive one full BOLT 2 commitment round-trip initiated by `a`:
 		// a signs b's new commitment, b revokes + signs back, a revokes. This is
-		// what irrevocably commits pending updates and settles balances. These
-		// channels have no signer, so handleCommitmentSigned skips signature
-		// verification and placeholder signatures are fine.
+		// what irrevocably commits pending updates and settles balances. The
+		// channels carry real signers, so every signature is genuinely verified.
 		function commitmentRoundTrip(a: ChannelClass, b: ChannelClass): void {
 			const s1 = findSendAction(
-				a.signCommitment(crypto.randomBytes(64), []),
+				signRealCommitment(a),
 				MessageType.COMMITMENT_SIGNED
 			);
 			const r1 = findSendAction(
@@ -447,7 +470,7 @@ describe('Channel State Machine', function () {
 			);
 			a.handleRevokeAndAck(decodeRevokeAndAckMessage(r1.payload));
 			const s2 = findSendAction(
-				b.signCommitment(crypto.randomBytes(64), []),
+				signRealCommitment(b),
 				MessageType.COMMITMENT_SIGNED
 			);
 			const r2 = findSendAction(
@@ -718,15 +741,21 @@ describe('Channel State Machine', function () {
 			);
 			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
+			const fundingTxid = crypto.randomBytes(32);
 			const fcActions = opener.createFundingCreated(
-				crypto.randomBytes(32),
+				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -751,7 +780,7 @@ describe('Channel State Machine', function () {
 			const { opener, acceptor } = getToNormal();
 
 			// Opener signs commitment
-			const sigActions = opener.signCommitment(crypto.randomBytes(64), []);
+			const sigActions = signRealCommitment(opener);
 			const sigMsg = findSendAction(sigActions, MessageType.COMMITMENT_SIGNED);
 			expect(sigMsg).to.exist;
 
@@ -796,7 +825,7 @@ describe('Channel State Machine', function () {
 			acceptor.handleUpdateAddHtlc(decodeUpdateAddHtlcMessage(addMsg.payload));
 
 			// 2. Opener signs commitment (including HTLC)
-			const sigActions1 = opener.signCommitment(crypto.randomBytes(64), []);
+			const sigActions1 = signRealCommitment(opener);
 			const sigMsg1 = findSendAction(
 				sigActions1,
 				MessageType.COMMITMENT_SIGNED
@@ -811,7 +840,7 @@ describe('Channel State Machine', function () {
 			opener.handleRevokeAndAck(decodeRevokeAndAckMessage(revokeMsg1.payload));
 
 			// 3. Acceptor signs commitment (acknowledging HTLC)
-			const sigActions2 = acceptor.signCommitment(crypto.randomBytes(64), []);
+			const sigActions2 = signRealCommitment(acceptor);
 			const sigMsg2 = findSendAction(
 				sigActions2,
 				MessageType.COMMITMENT_SIGNED
@@ -838,7 +867,7 @@ describe('Channel State Machine', function () {
 			);
 
 			// 5. Acceptor signs commitment (with fulfilled HTLC)
-			const sigActions3 = acceptor.signCommitment(crypto.randomBytes(64), []);
+			const sigActions3 = signRealCommitment(acceptor);
 			const sigMsg3 = findSendAction(
 				sigActions3,
 				MessageType.COMMITMENT_SIGNED
@@ -855,7 +884,7 @@ describe('Channel State Machine', function () {
 			);
 
 			// 6. Opener signs commitment
-			const sigActions4 = opener.signCommitment(crypto.randomBytes(64), []);
+			const sigActions4 = signRealCommitment(opener);
 			const sigMsg4 = findSendAction(
 				sigActions4,
 				MessageType.COMMITMENT_SIGNED
@@ -899,15 +928,21 @@ describe('Channel State Machine', function () {
 			);
 			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
+			const fundingTxid = crypto.randomBytes(32);
 			const fcActions = opener.createFundingCreated(
-				crypto.randomBytes(32),
+				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -990,15 +1025,21 @@ describe('Channel State Machine', function () {
 			);
 			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
+			const fundingTxid = crypto.randomBytes(32);
 			const fcActions = opener.createFundingCreated(
-				crypto.randomBytes(32),
+				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -1104,15 +1145,21 @@ describe('Channel State Machine', function () {
 			);
 			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
+			const fundingTxid = crypto.randomBytes(32);
 			const fcActions = opener.createFundingCreated(
-				crypto.randomBytes(32),
+				fundingTxid,
 				0,
-				crypto.randomBytes(64)
+				realInitialCommitmentSig(opener, fundingTxid, 0)
 			);
 			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			const decodedFc = decodeFundingCreatedMessage(fcMsg.payload);
 			const fsActions = acceptor.handleFundingCreated(
-				decodeFundingCreatedMessage(fcMsg.payload),
-				crypto.randomBytes(64)
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
 			);
 			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
@@ -1156,6 +1203,152 @@ describe('Channel State Machine', function () {
 		it('should return null channel ID before funding', function () {
 			const { opener } = createTestChannels();
 			expect(opener.getChannelId()).to.be.null;
+		});
+	});
+
+	// Issue #329: "cannot verify" must never become "adopt". Each signature
+	// handler fails closed when the signer or remote basepoints are missing,
+	// with a plain ERROR (local invariant failure, not a peer violation).
+	describe('Fail closed on unverifiable signatures', function () {
+		function driveToFundingCreated(): {
+			opener: ChannelClass;
+			acceptor: ChannelClass;
+			decodedFc: ReturnType<typeof decodeFundingCreatedMessage>;
+		} {
+			const { opener, acceptor } = createTestChannels();
+			const openActions = opener.initiateOpen();
+			const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
+			const acceptActions = acceptor.handleOpenChannel(
+				decodeOpenChannelMessage(openMsg.payload)
+			);
+			const acceptMsg = findSendAction(
+				acceptActions,
+				MessageType.ACCEPT_CHANNEL
+			);
+			opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
+
+			const fundingTxid = crypto.randomBytes(32);
+			const fcActions = opener.createFundingCreated(
+				fundingTxid,
+				0,
+				realInitialCommitmentSig(opener, fundingTxid, 0)
+			);
+			const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+			return {
+				opener,
+				acceptor,
+				decodedFc: decodeFundingCreatedMessage(fcMsg.payload)
+			};
+		}
+
+		it('funding_created on a signer-less acceptor fails the open', function () {
+			const { acceptor, decodedFc } = driveToFundingCreated();
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(acceptor as any)._signer = null;
+			const actions = acceptor.handleFundingCreated(
+				decodedFc,
+				crypto.randomBytes(64)
+			);
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain(
+				'Cannot verify commitment signature in funding_created'
+			);
+			expect(acceptor.getFullState().remoteCommitmentSignature).to.equal(null);
+			expect(findSendAction(actions, MessageType.FUNDING_SIGNED)).to.not.exist;
+		});
+
+		it('funding_signed on a signer-less opener fails the open', function () {
+			const { opener, acceptor, decodedFc } = driveToFundingCreated();
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
+			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(opener as any)._signer = null;
+			const actions = opener.handleFundingSigned(
+				decodeFundingSignedMessage(fsMsg.payload)
+			);
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain(
+				'Cannot verify commitment signature in funding_signed'
+			);
+			expect(opener.getFullState().remoteCommitmentSignature).to.equal(null);
+			// The funding tx must not be watched (nothing may be broadcast on an
+			// unverified exit).
+			expect(findAction(actions, ChannelActionType.WATCH_FUNDING)).to.not.exist;
+		});
+
+		function driveToNormal(): { opener: ChannelClass; acceptor: ChannelClass } {
+			const { opener, acceptor, decodedFc } = driveToFundingCreated();
+			const fsActions = acceptor.handleFundingCreated(
+				decodedFc,
+				realInitialCommitmentSig(
+					acceptor,
+					decodedFc.fundingTxid,
+					decodedFc.fundingOutputIndex
+				)
+			);
+			const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
+			opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));
+			const or = opener.fundingConfirmed();
+			const ar = acceptor.fundingConfirmed();
+			opener.handleChannelReady(
+				decodeChannelReadyMessage(
+					findSendAction(ar, MessageType.CHANNEL_READY).payload
+				)
+			);
+			acceptor.handleChannelReady(
+				decodeChannelReadyMessage(
+					findSendAction(or, MessageType.CHANNEL_READY).payload
+				)
+			);
+			return { opener, acceptor };
+		}
+
+		it('commitment_signed on a signer-less live channel is refused without a wire error', function () {
+			const { opener, acceptor } = driveToNormal();
+			const sigMsg = findSendAction(
+				signRealCommitment(opener),
+				MessageType.COMMITMENT_SIGNED
+			);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(acceptor as any)._signer = null;
+			const actions = acceptor.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(sigMsg.payload)
+			);
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain('Cannot verify commitment signature');
+			// A LOCAL invariant failure: no revocation, no wire error, channel
+			// not condemned at the peer.
+			expect(findSendAction(actions, MessageType.REVOKE_AND_ACK)).to.not.exist;
+			expect(findSendAction(actions, MessageType.ERROR)).to.not.exist;
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
+		});
+
+		it('commitment_signed with missing remote basepoints is refused without a wire error', function () {
+			const { opener, acceptor } = driveToNormal();
+			const sigMsg = findSendAction(
+				signRealCommitment(opener),
+				MessageType.COMMITMENT_SIGNED
+			);
+			acceptor.getFullState().remoteBasepoints = null;
+			const actions = acceptor.handleCommitmentSigned(
+				decodeCommitmentSignedMessage(sigMsg.payload)
+			);
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain('Cannot verify commitment signature');
+			expect(findSendAction(actions, MessageType.REVOKE_AND_ACK)).to.not.exist;
+			expect(findSendAction(actions, MessageType.ERROR)).to.not.exist;
+			expect(acceptor.getState()).to.equal(ChannelState.NORMAL);
 		});
 	});
 });

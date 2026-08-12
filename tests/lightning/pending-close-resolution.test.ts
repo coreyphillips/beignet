@@ -68,6 +68,10 @@ import {
 	computeScriptHash
 } from '../../src/lightning/chain/chain-watcher';
 import { Network } from '../../src/lightning/invoice/types';
+import {
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
 bitcoin.initEccLib(ecc);
 
@@ -150,6 +154,8 @@ function setupNormalChannels(): {
 		remoteConfig: { ...DEFAULT_CHANNEL_CONFIG }
 	});
 	const acceptor = new Channel(acceptorState);
+	opener.setSigner(signerFromSeed(openerSeed));
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 
 	const openActions = opener.initiateOpen();
 	const openMsg = findSendAction(openActions, MessageType.OPEN_CHANNEL);
@@ -160,12 +166,16 @@ function setupNormalChannels(): {
 	opener.handleAcceptChannel(decodeAcceptChannelMessage(acceptMsg.payload));
 
 	const fundingTxid = crypto.randomBytes(32);
-	const fakeSig = crypto.randomBytes(64);
-	const fcActions = opener.createFundingCreated(fundingTxid, 0, fakeSig);
+	const fcActions = opener.createFundingCreated(
+		fundingTxid,
+		0,
+		realInitialCommitmentSig(opener, fundingTxid, 0)
+	);
 	const fcMsg = findSendAction(fcActions, MessageType.FUNDING_CREATED);
+	const fc = decodeFundingCreatedMessage(fcMsg.payload);
 	const fsActions = acceptor.handleFundingCreated(
-		decodeFundingCreatedMessage(fcMsg.payload),
-		crypto.randomBytes(64)
+		fc,
+		realInitialCommitmentSig(acceptor, fc.fundingTxid, fc.fundingOutputIndex)
 	);
 	const fsMsg = findSendAction(fsActions, MessageType.FUNDING_SIGNED);
 	opener.handleFundingSigned(decodeFundingSignedMessage(fsMsg.payload));

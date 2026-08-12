@@ -18,16 +18,22 @@ import { MessageType } from '../../src/lightning/message/types';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { createAcceptorState } from '../../src/lightning/channel/channel-state';
 import { decodeClosingSignedMessage } from '../../src/lightning/message/channel-close';
+import {
+	seedKey,
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
-function makeBasepoints(): IChannelBasepoints {
+function makeBasepoints(seed: Buffer): IChannelBasepoints {
 	return {
 		// Real curve points: open/accept validation now rejects off-curve
-		// basepoints (BOLT 2 LOW hardening).
-		fundingPubkey: getPublicKey(crypto.randomBytes(32)),
-		revocationBasepoint: getPublicKey(crypto.randomBytes(32)),
-		paymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		delayedPaymentBasepoint: getPublicKey(crypto.randomBytes(32)),
-		htlcBasepoint: getPublicKey(crypto.randomBytes(32)),
+		// basepoints (BOLT 2 LOW hardening). Derived with the seedKey
+		// convention so signerFromSeed(seed) matches them.
+		fundingPubkey: getPublicKey(seedKey(seed, 0)),
+		revocationBasepoint: getPublicKey(seedKey(seed, 1)),
+		paymentBasepoint: getPublicKey(seedKey(seed, 2)),
+		delayedPaymentBasepoint: getPublicKey(seedKey(seed, 3)),
+		htlcBasepoint: getPublicKey(seedKey(seed, 4)),
 		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
@@ -71,14 +77,17 @@ function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
 	opener: Channel;
 	acceptor: Channel;
 } {
-	const openerBp = makeBasepoints();
-	const acceptorBp = makeBasepoints();
+	const openerSeed = crypto.randomBytes(32);
+	const acceptorSeed = crypto.randomBytes(32);
+	const openerBp = makeBasepoints(openerSeed);
+	const acceptorBp = makeBasepoints(acceptorSeed);
 
 	const opener = createOpenerChannel({
 		fundingSatoshis: 1_000_000n,
 		localBasepoints: openerBp,
 		localPerCommitmentSeed: crypto.randomBytes(32)
 	});
+	opener.setSigner(signerFromSeed(openerSeed));
 
 	const openActions = opener.initiateOpen();
 	const openPayload = findSendAction(openActions, MessageType.OPEN_CHANNEL)!;
@@ -114,6 +123,7 @@ function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
 	});
 
 	const acceptor = new Channel(acceptorState);
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 	const {
 		decodeAcceptChannelMessage
 	} = require('../../src/lightning/message/channel-open');
@@ -126,10 +136,11 @@ function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
 	opener.handleAcceptChannel(acceptMsg);
 
 	const fundingTxid = crypto.randomBytes(32);
-	const sig = crypto.randomBytes(64);
+	const sig = realInitialCommitmentSig(opener, fundingTxid, 0);
 	opener.createFundingCreated(fundingTxid, 0, sig);
 	const channelId = opener.getChannelId()!;
 
+	const acceptorSig = realInitialCommitmentSig(acceptor, fundingTxid, 0);
 	acceptor.handleFundingCreated(
 		{
 			temporaryChannelId: opener.getTemporaryChannelId(),
@@ -137,9 +148,9 @@ function setupNegotiatingChannels(opts?: { withPendingHtlc?: boolean }): {
 			fundingOutputIndex: 0,
 			signature: sig
 		},
-		crypto.randomBytes(64)
+		acceptorSig
 	);
-	opener.handleFundingSigned({ channelId, signature: crypto.randomBytes(64) });
+	opener.handleFundingSigned({ channelId, signature: acceptorSig });
 
 	opener.fundingConfirmed();
 	acceptor.fundingConfirmed();
@@ -206,7 +217,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 		it('should reject proposal in wrong state', function () {
 			const opener = createOpenerChannel({
 				fundingSatoshis: 1_000_000n,
-				localBasepoints: makeBasepoints(),
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32)
 			});
 			const actions = opener.proposeClosingFee(crypto.randomBytes(64));
@@ -618,7 +629,7 @@ describe('Cooperative Close Fee Negotiation (Phase 4)', function () {
 		it('should reject closing_signed in NORMAL state', function () {
 			const opener = createOpenerChannel({
 				fundingSatoshis: 1_000_000n,
-				localBasepoints: makeBasepoints(),
+				localBasepoints: makeBasepoints(crypto.randomBytes(32)),
 				localPerCommitmentSeed: crypto.randomBytes(32)
 			});
 			const actions = opener.handleClosingSigned(

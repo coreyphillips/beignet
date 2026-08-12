@@ -43,16 +43,23 @@ import { getPublicKey } from '../../src/lightning/crypto/ecdh';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
 import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
+import {
+	seedKey,
+	signerFromSeed,
+	realInitialCommitmentSig
+} from './helpers/real-signing';
 
-function realBasepoints(): IChannelBasepoints {
-	const p = (): Buffer => getPublicKey(crypto.randomBytes(32));
+function realBasepoints(seed?: Buffer): IChannelBasepoints {
+	// With a seed, derive with the seedKey convention so signerFromSeed(seed)
+	// matches the basepoints; without one the keys are throwaway randoms.
+	const s = seed ?? crypto.randomBytes(32);
 	return {
-		fundingPubkey: p(),
-		revocationBasepoint: p(),
-		paymentBasepoint: p(),
-		delayedPaymentBasepoint: p(),
-		htlcBasepoint: p(),
-		firstPerCommitmentPoint: p()
+		fundingPubkey: getPublicKey(seedKey(s, 0)),
+		revocationBasepoint: getPublicKey(seedKey(s, 1)),
+		paymentBasepoint: getPublicKey(seedKey(s, 2)),
+		delayedPaymentBasepoint: getPublicKey(seedKey(s, 3)),
+		htlcBasepoint: getPublicKey(seedKey(s, 4)),
+		firstPerCommitmentPoint: getPublicKey(crypto.randomBytes(32))
 	};
 }
 
@@ -115,11 +122,14 @@ function openerAndAccept(
 	acceptActions: ReturnType<Channel['handleOpenChannel']>;
 	accept: IAcceptChannelMessage | null;
 } {
+	const openerSeed = crypto.randomBytes(32);
+	const acceptorSeed = crypto.randomBytes(32);
 	const opener = createOpenerChannel({
 		fundingSatoshis: 1_000_000n,
-		localBasepoints: realBasepoints(),
+		localBasepoints: realBasepoints(openerSeed),
 		localPerCommitmentSeed: crypto.randomBytes(32)
 	});
+	opener.setSigner(signerFromSeed(openerSeed));
 	const openActions = opener.initiateOpen();
 	const openMsg = decodeOpenChannelMessage(
 		findSend(openActions, MessageType.OPEN_CHANNEL)!
@@ -136,7 +146,7 @@ function openerAndAccept(
 				? { dustLimitSatoshis: acceptorDustLimit }
 				: {})
 		},
-		localBasepoints: realBasepoints(),
+		localBasepoints: realBasepoints(acceptorSeed),
 		localPerCommitmentSeed: crypto.randomBytes(32),
 		remoteBasepoints: {
 			fundingPubkey: openMsg.fundingPubkey,
@@ -157,20 +167,22 @@ function openerAndAccept(
 		}
 	});
 	const acceptor = new Channel(acceptorState);
+	acceptor.setSigner(signerFromSeed(acceptorSeed));
 	const acceptActions = acceptor.handleOpenChannel(openMsg);
 	const payload = findSend(acceptActions, MessageType.ACCEPT_CHANNEL);
 	const accept = payload ? decodeAcceptChannelMessage(payload) : null;
 	return { opener, acceptor, openMsg, acceptActions, accept };
 }
 
-/** Drive a pair all the way to NORMAL (random sigs; no commitment exchange). */
+/** Drive a pair all the way to NORMAL (real sigs; no commitment exchange). */
 function normalPair(): { opener: Channel; acceptor: Channel } {
 	const { opener, acceptor, accept } = openerAndAccept();
 	opener.handleAcceptChannel(accept!);
 	const fundingTxid = crypto.randomBytes(32);
-	const sig = crypto.randomBytes(64);
+	const sig = realInitialCommitmentSig(opener, fundingTxid, 0);
 	opener.createFundingCreated(fundingTxid, 0, sig);
 	const channelId = opener.getChannelId()!;
+	const acceptorSig = realInitialCommitmentSig(acceptor, fundingTxid, 0);
 	acceptor.handleFundingCreated(
 		{
 			temporaryChannelId: opener.getTemporaryChannelId(),
@@ -178,9 +190,9 @@ function normalPair(): { opener: Channel; acceptor: Channel } {
 			fundingOutputIndex: 0,
 			signature: sig
 		},
-		crypto.randomBytes(64)
+		acceptorSig
 	);
-	opener.handleFundingSigned({ channelId, signature: crypto.randomBytes(64) });
+	opener.handleFundingSigned({ channelId, signature: acceptorSig });
 	opener.fundingConfirmed();
 	acceptor.fundingConfirmed();
 	opener.handleChannelReady({
