@@ -16,6 +16,7 @@ import {
 	IRecoveryOutboxMessage,
 	IRecoveryOutboxStoredMessage,
 	IStoredRecoveryFrame,
+	CorruptRecoveryRowError,
 	RecoveryOutboxDisposition
 } from './types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
@@ -47,6 +48,7 @@ export class SqliteStorage implements IStorageBackend {
 	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
 	private encryptionKey?: Buffer;
+	private corruptRowsSeen = 0;
 
 	/**
 	 * @param dbPath Path to the SQLite database file (or ':memory:').
@@ -87,9 +89,30 @@ export class SqliteStorage implements IStorageBackend {
 		if (error instanceof StorageEncryptedError) {
 			throw error;
 		}
+		this.corruptRowsSeen++;
 		if (this.onCorruptRow) {
 			this.onCorruptRow(error);
 		}
+	}
+
+	/** Rows skipped by the forgiving loaders since open (issue #317). */
+	corruptRowCount(): number {
+		return this.corruptRowsSeen;
+	}
+
+	/**
+	 * Decode a hex payload column EXACTLY or throw. Buffer.from(s, 'hex')
+	 * silently truncates at the first malformed byte, so a corrupt column
+	 * would otherwise be coerced into a short (or empty) buffer instead of
+	 * being counted as corrupt (issue #317). Callers sit inside the per-row
+	 * try/catch, so at runtime the row is still skipped and counted;
+	 * recovery-critical readers refuse via corruptRowCount.
+	 */
+	private _hexColumn(value: string, label: string): Buffer {
+		if (value.length === 0 || !/^([0-9a-f]{2})*$/i.test(value)) {
+			throw new CorruptRecoveryRowError(`${label} is not valid hex`);
+		}
+		return Buffer.from(value, 'hex');
 	}
 
 	/** Encrypt a sensitive payload value when an encryption key is configured. */
@@ -645,7 +668,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
-					preimage: Buffer.from(this._dec(row.preimage), 'hex')
+					preimage: this._hexColumn(
+						this._dec(row.preimage),
+						`preimage row ${row.payment_hash}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -680,7 +706,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					scidHex: row.scid_hex,
-					channelId: Buffer.from(row.channel_id, 'hex')
+					channelId: this._hexColumn(
+						row.channel_id,
+						`scid mapping row ${row.scid_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -762,7 +791,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					outKey: row.out_key,
-					inChannelId: Buffer.from(this._dec(row.in_channel_id), 'hex'),
+					inChannelId: this._hexColumn(
+						this._dec(row.in_channel_id),
+						`forwarded htlc row ${row.out_key}`
+					),
 					inHtlcId: BigInt(this._dec(row.in_htlc_id))
 				});
 			} catch (err) {
@@ -897,7 +929,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					secret: Buffer.from(this._dec(row.secret), 'hex')
+					secret: this._hexColumn(
+						this._dec(row.secret),
+						`payment secret row ${row.payment_hash_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -936,7 +971,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					pathId: Buffer.from(this._dec(row.path_id), 'hex')
+					pathId: this._hexColumn(
+						this._dec(row.path_id),
+						`invoice path id row ${row.payment_hash_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -1111,7 +1149,17 @@ export class SqliteStorage implements IStorageBackend {
 
 	/** Decode a channel_index cell: plaintext INTEGER or encrypted TEXT. */
 	private _decodeChannelIndex(value: number | string): number {
-		return typeof value === 'number' ? value : Number(this._dec(value));
+		const decoded =
+			typeof value === 'number' ? value : Number(this._dec(value));
+		// Strict: Number() turns a corrupt cell into NaN, which would ride a
+		// snapshot as null and silently lose the derivation high-water mark
+		// (issue #317). Key indices are safety-critical; fail loudly.
+		if (!Number.isSafeInteger(decoded) || decoded < 0) {
+			throw new CorruptRecoveryRowError(
+				'channel key index is not a non-negative integer'
+			);
+		}
+		return decoded;
 	}
 
 	loadChannelKeyIndex(channelId: string): number | null {
@@ -1173,7 +1221,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					key: row.key,
-					secret: Buffer.from(this._dec(row.secret), 'hex')
+					secret: this._hexColumn(
+						this._dec(row.secret),
+						`htlc shared secret row ${row.key}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -1572,7 +1623,10 @@ export class SqliteStorage implements IStorageBackend {
 					offerIdHex: row.offer_id,
 					encoded: this._dec(row.encoded),
 					pathId: row.path_id
-						? Buffer.from(this._dec(row.path_id), 'hex')
+						? this._hexColumn(
+								this._dec(row.path_id),
+								`offer row ${row.offer_id}`
+						  )
 						: null,
 					createdAt: row.created_at,
 					asyncHold: !!row.async_hold
@@ -1636,12 +1690,22 @@ export class SqliteStorage implements IStorageBackend {
 		const results: IRecoveryOutboxStoredMessage[] = [];
 		for (const row of rows) {
 			try {
+				// Strict hex: Buffer.from(s, 'hex') silently truncates at the
+				// first bad byte, so a corrupt wire_message would otherwise be
+				// coerced into a short retransmission instead of being counted
+				// as corrupt (issue #317).
+				const wireHex = this._dec(row.wire_message);
+				if (!/^([0-9a-f]{2})*$/i.test(wireHex)) {
+					throw new CorruptRecoveryRowError(
+						`outbox row ${row.id}: wire_message is not valid hex`
+					);
+				}
 				results.push({
 					id: row.id,
 					peerId: row.peer_pubkey,
 					channelId: row.channel_id ?? undefined,
 					messageType: row.message_type,
-					wireMessage: Buffer.from(this._dec(row.wire_message), 'hex'),
+					wireMessage: Buffer.from(wireHex, 'hex'),
 					disposition: row.disposition as RecoveryOutboxDisposition,
 					frameSequence: row.frame_sequence,
 					createdAt: row.created_at
@@ -1735,21 +1799,55 @@ export class SqliteStorage implements IStorageBackend {
 						.prepare('SELECT * FROM recovery_frames ORDER BY sequence ASC')
 						.all()
 		) as Array<{
-			sequence: number;
-			writer_epoch: number;
-			frame_hash: Buffer;
-			previous_hash: Buffer;
-			ciphertext: Buffer;
-			created_at: number;
+			sequence: unknown;
+			writer_epoch: unknown;
+			frame_hash: unknown;
+			previous_hash: unknown;
+			ciphertext: unknown;
+			created_at: unknown;
 		}>;
-		return rows.map((row) => ({
-			sequence: row.sequence,
-			writerEpoch: row.writer_epoch,
-			frameHash: Buffer.from(row.frame_hash),
-			previousFrameHash: Buffer.from(row.previous_hash),
-			ciphertext: Buffer.from(row.ciphertext),
-			createdAt: row.created_at
-		}));
+		// Decode EXACTLY or throw: SQLite column affinity does not enforce
+		// types, so a physically corrupt row (TEXT in a BLOB column, a float
+		// or string sequence) would otherwise be coerced into plausible bytes
+		// that chain verification then runs over (issue #317). Frame
+		// corruption always propagates; it is never routed through
+		// reportCorruptRow's skip path.
+		return rows.map((row) => {
+			const label = `recovery frame row ${String(row.sequence)}`;
+			const frameInt = (value: unknown, field: string, min: number): number => {
+				if (
+					typeof value !== 'number' ||
+					!Number.isSafeInteger(value) ||
+					value < min
+				) {
+					throw new CorruptRecoveryRowError(
+						`${label}: ${field} is not an integer >= ${min}`
+					);
+				}
+				return value;
+			};
+			const frameHash = (value: unknown, field: string): Buffer => {
+				if (!Buffer.isBuffer(value) || value.length !== 32) {
+					throw new CorruptRecoveryRowError(
+						`${label}: ${field} is not a 32-byte buffer`
+					);
+				}
+				return Buffer.from(value);
+			};
+			if (!Buffer.isBuffer(row.ciphertext) || row.ciphertext.length === 0) {
+				throw new CorruptRecoveryRowError(
+					`${label}: ciphertext is not a non-empty buffer`
+				);
+			}
+			return {
+				sequence: frameInt(row.sequence, 'sequence', 1),
+				writerEpoch: frameInt(row.writer_epoch, 'writer_epoch', 1),
+				frameHash: frameHash(row.frame_hash, 'frame_hash'),
+				previousFrameHash: frameHash(row.previous_hash, 'previous_hash'),
+				ciphertext: Buffer.from(row.ciphertext),
+				createdAt: frameInt(row.created_at, 'created_at', 0)
+			};
+		});
 	}
 
 	setOutboxFrameSequence(ids: number[], frameSequence: number): void {

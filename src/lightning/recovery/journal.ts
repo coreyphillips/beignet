@@ -28,7 +28,11 @@ import { createCipheriv, createDecipheriv } from 'crypto';
 import { WIRE_SAFETY_POLICY_VERSION } from '../channel/channel-actions';
 import { deriveFrameIv } from './guardian-wire';
 import { hkdfKey } from '../storage/encryption';
-import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import {
+	CorruptRecoveryRowError,
+	IStorageBackend,
+	IStoredRecoveryFrame
+} from '../storage/types';
 import {
 	isStorageTransactionActive,
 	withStorageTransaction
@@ -50,6 +54,19 @@ const IV_LENGTH = 12;
 const TAG_LENGTH = 16;
 /** 32 zero bytes: previousFrameHash of the first frame in a chain. */
 const GENESIS_HASH = Buffer.alloc(32);
+
+/**
+ * Decode a stored hash EXACTLY 32 hex bytes or throw. Buffer.from(s, 'hex')
+ * silently truncates at the first malformed byte, so a corrupt stored hash
+ * would otherwise be coerced into a short buffer and surface as a misleading
+ * chain-verification failure instead of the corruption it is (issue #317).
+ */
+export function decodeStoredHashHex(value: string, field: string): Buffer {
+	if (!/^[0-9a-f]{64}$/i.test(value)) {
+		throw new CorruptRecoveryRowError(`${field} is not 32 hex bytes`);
+	}
+	return Buffer.from(value, 'hex');
+}
 
 /** recovery_meta keys owned by the journal. */
 const META_TIP_SEQUENCE = 'journal_tip_sequence';
@@ -576,7 +593,17 @@ export function storedTipSequence(storage: IStorageBackend): bigint | null {
 	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
 	const row = rows[rows.length - 1];
 	if (!row || BigInt(row.sequence) !== sequence) return null;
-	return row.frameHash.equals(Buffer.from(tipHash, 'hex')) ? sequence : null;
+	let recorded: Buffer;
+	try {
+		// Strict: bare Buffer.from would decode a valid prefix of a malformed
+		// record and prove the tip with it (issue #317). Malformed bookkeeping
+		// is UNPROVABLE, not a throw: both callers fail closed on null with
+		// their own refusal messages.
+		recorded = decodeStoredHashHex(tipHash, 'journal tip hash');
+	} catch {
+		return null;
+	}
+	return row.frameHash.equals(recorded) ? sequence : null;
 }
 
 export class RecoveryJournal implements IRecoveryJournalSink {
@@ -798,24 +825,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		}
 		if (!this.rebasedThisRun) {
 			const rebaseSequence = BigInt(tipSequence) + 1n;
-			this.appendSnapshotFrame(
-				rebaseSequence,
-				Buffer.from(
-					this.storage.getRecoveryMeta!(META_TIP_HASH) ??
-						GENESIS_HASH.toString('hex'),
-					'hex'
-				)
-			);
+			this.appendSnapshotFrame(rebaseSequence, this.storedTipHash());
 			this.rebasedThisRun = true;
 			return rebaseSequence;
 		}
 
 		const sequence = BigInt(tipSequence) + 1n;
-		const previousFrameHash = Buffer.from(
-			this.storage.getRecoveryMeta!(META_TIP_HASH) ??
-				GENESIS_HASH.toString('hex'),
-			'hex'
-		);
+		const previousFrameHash = this.storedTipHash();
 		const { frameHash, plaintextBytes } = this.writeFrame({
 			version: 1,
 			writerEpoch: this.writerEpoch(),
@@ -860,7 +876,17 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const sequence = this.storage.getRecoveryMeta!(META_TIP_SEQUENCE);
 		const hash = this.storage.getRecoveryMeta!(META_TIP_HASH);
 		if (sequence == null || hash == null) return null;
-		return { sequence: BigInt(sequence), frameHash: Buffer.from(hash, 'hex') };
+		return {
+			sequence: BigInt(sequence),
+			frameHash: decodeStoredHashHex(hash, 'journal tip hash')
+		};
+	}
+
+	/** The stored tip hash, strictly decoded; GENESIS_HASH before any frame. */
+	private storedTipHash(): Buffer {
+		const hash = this.storage.getRecoveryMeta!(META_TIP_HASH);
+		if (hash == null) return GENESIS_HASH;
+		return decodeStoredHashHex(hash, 'journal tip hash');
 	}
 
 	/**
@@ -911,11 +937,7 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				} else {
 					this.appendSnapshotFrame(
 						BigInt(tipSequence) + 1n,
-						Buffer.from(
-							this.storage.getRecoveryMeta!(META_TIP_HASH) ??
-								GENESIS_HASH.toString('hex'),
-							'hex'
-						)
+						this.storedTipHash()
 					);
 				}
 			});
@@ -1192,7 +1214,9 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		const tipRow = this.loadFrameRow(sequence);
 		if (
 			tipRow == null ||
-			!tipRow.frameHash.equals(Buffer.from(tipHash!, 'hex'))
+			!tipRow.frameHash.equals(
+				decodeStoredHashHex(tipHash!, 'journal tip hash')
+			)
 		) {
 			throw new Error(
 				`recovery: the stored frames do not match the recorded tip ` +
@@ -1407,7 +1431,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.beginWriteAttempt();
 		try {
 			this.storage.transaction(() => {
-				this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+				this.appendSnapshotFrame(
+					sequence,
+					decodeStoredHashHex(tipHash, 'journal tip hash')
+				);
 				this.storage.setRecoveryMeta!(
 					META_SNAPSHOT_SCHEMA,
 					SNAPSHOT_SCHEMA_VERSION
@@ -1562,6 +1589,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH);
 			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH_HASH);
 		}
+		// Compaction destroys history, so it must not run over rows it never
+		// decoded: the per-write invariants prove only counts, spans and the
+		// tip row, and a physically corrupt OLDER frame would otherwise be
+		// pruned away into a fresh chain that verifies (issue #317). The
+		// strict loader throws on any such row, aborting this append inside
+		// its own transaction with the corrupt history left intact.
+		this.storage.loadRecoveryFrames!();
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
 		this.storage.setRecoveryMeta!(
 			META_LAST_SNAPSHOT,
@@ -1613,8 +1647,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 	/** Serialize every safety-critical table (see RecoverySnapshot). */
 	private captureSnapshot(): RecoverySnapshot {
 		const storage = this.storage;
+		// A row the forgiving loaders skip would silently vanish from the
+		// snapshot, and the resulting frame would verify cleanly over state
+		// that does not match disk (issue #317). Sample the corrupt-row
+		// counter around the loads and refuse the snapshot if it moved.
+		const corruptBefore = storage.corruptRowCount?.();
 		const channels = storage.loadAllChannels();
-		return {
+		const snapshot: RecoverySnapshot = {
 			// Authenticated by the frame: restoration re-derives the local
 			// schema marker from here, since recovery_meta does not ride
 			// frames and would otherwise be lost with the device.
@@ -1666,6 +1705,19 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				frameSequence: row.frameSequence
 			}))
 		};
+		const corruptAfter = storage.corruptRowCount?.();
+		if (
+			corruptBefore != null &&
+			corruptAfter != null &&
+			corruptAfter !== corruptBefore
+		) {
+			throw new CorruptRecoveryRowError(
+				`recovery snapshot aborted: ${corruptAfter - corruptBefore} stored ` +
+					`row(s) do not decode and were skipped; the snapshot would not ` +
+					`faithfully represent stored state`
+			);
+		}
+		return snapshot;
 	}
 }
 
@@ -1758,7 +1810,7 @@ export function verifyFrameChain(
 		meta.tipSequence != null && meta.tipHash != null
 			? {
 					sequence: BigInt(meta.tipSequence),
-					frameHash: Buffer.from(meta.tipHash, 'hex')
+					frameHash: decodeStoredHashHex(meta.tipHash, 'journal tip hash')
 			  }
 			: null;
 	if (!tip && frames.length === 0 && meta.lastSnapshotSequence != null) {
@@ -2005,6 +2057,10 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 
 /** Throw when the reconstruction target already holds journaled state. */
 export function assertEmptyTarget(target: IStorageBackend): void {
+	// A corrupt row is skipped by the forgiving loaders, so without the
+	// counter check a target holding undecodable rows would read as empty
+	// and the restore would proceed over them (issue #317).
+	const corruptBefore = target.corruptRowCount?.();
 	const dirty =
 		target.loadAllChannels().length > 0 ||
 		// Key indices are safety-critical residue too: an orphaned row
@@ -2021,6 +2077,17 @@ export function assertEmptyTarget(target: IStorageBackend): void {
 		(target.loadAllInvoicePathIds?.() ?? []).length > 0 ||
 		(target.listForwardingEvents?.() ?? []).length > 0 ||
 		(target.loadOutboxMessages?.() ?? []).length > 0;
+	const corruptAfter = target.corruptRowCount?.();
+	if (
+		corruptBefore != null &&
+		corruptAfter != null &&
+		corruptAfter !== corruptBefore
+	) {
+		throw new CorruptRecoveryRowError(
+			'restore target has stored rows that do not decode; refusing to ' +
+				'treat it as empty'
+		);
+	}
 	if (dirty) {
 		throw new Error(
 			'Recovery reconstruction requires an EMPTY target database'

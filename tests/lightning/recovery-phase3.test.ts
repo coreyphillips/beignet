@@ -620,6 +620,95 @@ describe('Recovery phase 3: capsule restore', () => {
 		target.close();
 	});
 
+	it('rejects inline frames that do not decode exactly', () => {
+		// Physically malformed inline fields must be refused as corruption,
+		// not silently coerced by Buffer.from and left for the chain checks
+		// to misattribute (issue #317).
+		const { storage, capsule } = composedCapsule();
+		const withInline = (
+			mutate: (frames: Array<Record<string, unknown>>) => void
+		): RecoveryCapsule => {
+			const inline = JSON.parse(
+				capsule.inlineRecoveryState!.toString('utf8')
+			) as { frames: Array<Record<string, unknown>> };
+			mutate(inline.frames);
+			return {
+				...capsule,
+				inlineRecoveryState: Buffer.from(JSON.stringify(inline), 'utf8')
+			};
+		};
+		const target = openStorage();
+		// Truncated base64: Buffer.from would decode the surviving bytes.
+		expect(() =>
+			restoreFromRecoveryCapsule(
+				withInline((frames) => {
+					frames[0].ciphertext = (frames[0].ciphertext as string).slice(0, -2);
+				}),
+				target,
+				NODE_SECRET
+			)
+		).to.throw(/base64/);
+		// Invalid characters: Buffer.from would silently drop them.
+		expect(() =>
+			restoreFromRecoveryCapsule(
+				withInline((frames) => {
+					frames[0].ciphertext = `!!${(frames[0].ciphertext as string).slice(
+						2
+					)}`;
+				}),
+				target,
+				NODE_SECRET
+			)
+		).to.throw(/base64/);
+		// A stringly-typed sequence would flow into BigInt conversions.
+		expect(() =>
+			restoreFromRecoveryCapsule(
+				withInline((frames) => {
+					frames[0].sequence = String(frames[0].sequence);
+				}),
+				target,
+				NODE_SECRET
+			)
+		).to.throw(/sequence is not an integer/);
+		// A truncated frame hash would coerce to a short buffer.
+		expect(() =>
+			restoreFromRecoveryCapsule(
+				withInline((frames) => {
+					frames[0].frameHash = (frames[0].frameHash as string).slice(0, 63);
+				}),
+				target,
+				NODE_SECRET
+			)
+		).to.throw(/32 hex bytes/);
+		// Every refusal fired before anything touched the target.
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
+		expect(target.loadAllPreimages()).to.have.length(0);
+		storage.close();
+		target.close();
+	});
+
+	it('rejects inline writer-epoch metadata the chain does not carry', () => {
+		// meta.writerEpoch is INSTALLED into the target's recovery_meta but
+		// the chain and head checks never read it: only a syntax check stood
+		// between a tampered epoch and every frame the restored journal
+		// writes carrying it.
+		const { storage, capsule } = composedCapsule();
+		const inline = JSON.parse(
+			capsule.inlineRecoveryState!.toString('utf8')
+		) as {
+			meta: { writerEpoch: string };
+		};
+		inline.meta.writerEpoch = '999';
+		capsule.inlineRecoveryState = Buffer.from(JSON.stringify(inline), 'utf8');
+		const target = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target, NODE_SECRET)
+		).to.throw(/writer epoch/);
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
+		storage.close();
+		target.close();
+	});
+
 	it('rejects an inline journal that does not end at the capsule head', () => {
 		const { storage, capsule } = composedCapsule();
 		// A lying head: the capsule claims a NEWER sequence than the payload.
@@ -1467,14 +1556,16 @@ describe('Recovery phase 3: round-13 boundary hardening', () => {
 
 		// (a) A sequence-0 frame: loadRecoveryFrames(0) reads strictly
 		// above, so the old check missed it; the restored journal would be
-		// immediately unverifiable.
+		// immediately unverifiable. The strict loader now refuses the row
+		// as corrupt before the residue count even runs; either way the
+		// restore is refused.
 		const seqZero = openStorage();
 		seqZero.saveRecoveryFrame!({ ...row, sequence: 0 });
 		expect(() =>
 			restoreBestRecoveryCapsule([blob], seqZero, NODE_SECRET, {
 				scratchStorage
 			})
-		).to.throw(/recovery frames/);
+		).to.throw(/recovery row is corrupt/);
 		seqZero.close();
 
 		// (b) Recovery-control metadata beyond the journal's own keys.
