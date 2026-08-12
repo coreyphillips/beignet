@@ -35,6 +35,7 @@
  */
 
 import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import { withStorageTransaction } from '../storage/transaction';
 import {
 	GuardianState,
 	parseStateBytes,
@@ -954,8 +955,11 @@ export class RestoreDriver {
 		// anywhere rolls the whole installation back and the restore is
 		// simply re-runnable: no duplicate frames, no half-reconstructed
 		// tables, and the writer key still on disk in the pending record
-		// until the lease that replaces it is durable.
-		targetStorage.transaction(() => {
+		// until the lease that replaces it is durable. Opened through
+		// withStorageTransaction so the inner reconstruction units
+		// (applySnapshot, the per-frame RecoveryManager commits) JOIN it
+		// instead of nesting, which IStorageBackend does not promise.
+		withStorageTransaction(targetStorage, () => {
 			// A previous interrupted attempt may have left frames behind; the
 			// install is idempotent over them because nothing is authoritative
 			// until this transaction commits.
