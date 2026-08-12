@@ -599,6 +599,14 @@ interface IEncodedInlineState {
 		tipHash: string;
 		writerEpoch: string;
 		lastSnapshot: string;
+		/**
+		 * The set-once namespace-loss marker (journal META_BACKFILL_LOST).
+		 * Travels in the capsule because no frame can reconstruct it: it is
+		 * the only journal meta row with no frame-borne fallback, so a
+		 * restore that drops it would report a dead namespace as healthy
+		 * (issue #314). Absent when the namespace never lost backfill.
+		 */
+		backfillLost?: string;
 	};
 	frames: Array<{
 		sequence: number;
@@ -798,6 +806,9 @@ export function composeRecoveryCapsule(
 	const lastSnapshot = storage?.getRecoveryMeta?.(
 		JOURNAL_META_KEYS.lastSnapshot
 	);
+	const backfillLost = storage?.getRecoveryMeta?.(
+		JOURNAL_META_KEYS.backfillLost
+	);
 
 	const capsule: RecoveryCapsule = {
 		version: 1,
@@ -869,6 +880,9 @@ export function composeRecoveryCapsule(
 				createdAt: row.createdAt
 			}))
 		};
+		if (backfillLost != null) {
+			inlineState.meta.backfillLost = backfillLost;
+		}
 		const withInline: RecoveryCapsule = {
 			...capsule,
 			inlineRecoveryState: Buffer.from(JSON.stringify(inlineState), 'utf8')
@@ -926,6 +940,14 @@ function inlineInt(value: unknown, field: string, min: number): number {
 	return value;
 }
 
+/**
+ * Ceiling on the inline backfill-lost detail string. The two detail strings
+ * compactTo writes are a few hundred characters; the bound is defense in
+ * depth against a corrupt row, not a security boundary (the capsule is
+ * AEAD-sealed under the node secret).
+ */
+const INLINE_BACKFILL_LOST_MAX_LENGTH = 4096;
+
 /** Assert a meta field is a positive decimal string, or throw. */
 function inlineMetaNumeric(value: unknown, field: string): string {
 	if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
@@ -965,6 +987,21 @@ function parseInlineState(inline: Buffer): {
 		throw new CorruptRecoveryRowError('inline tip hash is not a string');
 	}
 	decodeStoredHashHex(meta.tipHash, 'inline tip hash');
+	// Present-but-malformed is corruption, absent is a healthy namespace (or
+	// an older capsule). The marker is not frame-derived, so unlike the
+	// writer epoch it cannot be bound to the verified chain; the AEAD seal
+	// over the whole capsule is its integrity boundary.
+	if (meta.backfillLost !== undefined) {
+		if (
+			typeof meta.backfillLost !== 'string' ||
+			meta.backfillLost.length === 0 ||
+			meta.backfillLost.length > INLINE_BACKFILL_LOST_MAX_LENGTH
+		) {
+			throw new CorruptRecoveryRowError(
+				'inline backfill-lost marker is not a non-empty string'
+			);
+		}
+	}
 	const encoded: IEncodedInlineState = {
 		meta: {
 			tipSequence: inlineMetaNumeric(meta.tipSequence, 'inline tip sequence'),
@@ -973,7 +1010,10 @@ function parseInlineState(inline: Buffer): {
 			lastSnapshot: inlineMetaNumeric(
 				meta.lastSnapshot,
 				'inline snapshot sequence'
-			)
+			),
+			...(meta.backfillLost !== undefined
+				? { backfillLost: meta.backfillLost }
+				: {})
 		},
 		frames: candidate.frames
 	};
@@ -1143,6 +1183,18 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
+		// The backfill-lost marker is irreversible namespace state with no
+		// frame-borne fallback; dropping it here would let the restored node
+		// open channels into a namespace that can never durably record them
+		// and settle durability waits with the wrong reason (issue #314).
+		// Install-if-present only: assertNoJournalResidue proved the target
+		// empty, so this is exactly the marker's set-once contract.
+		if (encoded.meta.backfillLost !== undefined) {
+			target.setRecoveryMeta!(
+				JOURNAL_META_KEYS.backfillLost,
+				encoded.meta.backfillLost
+			);
+		}
 		reconstructFromFrames(target, frames);
 	});
 	return { tier: 2, scb, framesApplied: frames.length };
