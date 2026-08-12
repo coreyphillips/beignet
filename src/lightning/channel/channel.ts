@@ -11822,26 +11822,35 @@ export class Channel {
 			// Duplicate (retransmit): the first one was verified and adopted.
 			return actions;
 		}
-		if (this._signer && this._state.remoteBasepoints) {
-			const point0 = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				0n
-			);
-			const valid = verifyRemoteCommitmentSig(
-				this._state,
-				this._signer,
-				point0,
-				msg.signature,
-				0n
-			);
-			if (!valid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid commitment signature in v2 open'
-					}
-				];
-			}
+		// Cannot verify -> must not adopt: an adopted-but-unverified peer
+		// commitment would satisfy the tx_signatures release gate below.
+		if (!this._signer || !this._state.remoteBasepoints) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot verify commitment signature in v2 open: no signer or remote basepoints'
+				}
+			];
+		}
+		const point0 = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			0n
+		);
+		const valid = verifyRemoteCommitmentSig(
+			this._state,
+			this._signer,
+			point0,
+			msg.signature,
+			0n
+		);
+		if (!valid) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Invalid commitment signature in v2 open'
+				}
+			];
 		}
 		this._state.remoteCommitmentSignature = Buffer.from(msg.signature);
 		this._state.remoteHtlcSignatures = [];
