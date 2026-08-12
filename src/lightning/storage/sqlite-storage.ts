@@ -100,6 +100,21 @@ export class SqliteStorage implements IStorageBackend {
 		return this.corruptRowsSeen;
 	}
 
+	/**
+	 * Decode a hex payload column EXACTLY or throw. Buffer.from(s, 'hex')
+	 * silently truncates at the first malformed byte, so a corrupt column
+	 * would otherwise be coerced into a short (or empty) buffer instead of
+	 * being counted as corrupt (issue #317). Callers sit inside the per-row
+	 * try/catch, so at runtime the row is still skipped and counted;
+	 * recovery-critical readers refuse via corruptRowCount.
+	 */
+	private _hexColumn(value: string, label: string): Buffer {
+		if (value.length === 0 || !/^([0-9a-f]{2})*$/i.test(value)) {
+			throw new CorruptRecoveryRowError(`${label} is not valid hex`);
+		}
+		return Buffer.from(value, 'hex');
+	}
+
 	/** Encrypt a sensitive payload value when an encryption key is configured. */
 	private _enc(value: string): string {
 		return this.encryptionKey ? encryptValue(this.encryptionKey, value) : value;
@@ -653,7 +668,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHash: row.payment_hash,
-					preimage: Buffer.from(this._dec(row.preimage), 'hex')
+					preimage: this._hexColumn(
+						this._dec(row.preimage),
+						`preimage row ${row.payment_hash}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -688,7 +706,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					scidHex: row.scid_hex,
-					channelId: Buffer.from(row.channel_id, 'hex')
+					channelId: this._hexColumn(
+						row.channel_id,
+						`scid mapping row ${row.scid_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -770,7 +791,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					outKey: row.out_key,
-					inChannelId: Buffer.from(this._dec(row.in_channel_id), 'hex'),
+					inChannelId: this._hexColumn(
+						this._dec(row.in_channel_id),
+						`forwarded htlc row ${row.out_key}`
+					),
 					inHtlcId: BigInt(this._dec(row.in_htlc_id))
 				});
 			} catch (err) {
@@ -905,7 +929,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					secret: Buffer.from(this._dec(row.secret), 'hex')
+					secret: this._hexColumn(
+						this._dec(row.secret),
+						`payment secret row ${row.payment_hash_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -944,7 +971,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					paymentHashHex: row.payment_hash_hex,
-					pathId: Buffer.from(this._dec(row.path_id), 'hex')
+					pathId: this._hexColumn(
+						this._dec(row.path_id),
+						`invoice path id row ${row.payment_hash_hex}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -1119,7 +1149,17 @@ export class SqliteStorage implements IStorageBackend {
 
 	/** Decode a channel_index cell: plaintext INTEGER or encrypted TEXT. */
 	private _decodeChannelIndex(value: number | string): number {
-		return typeof value === 'number' ? value : Number(this._dec(value));
+		const decoded =
+			typeof value === 'number' ? value : Number(this._dec(value));
+		// Strict: Number() turns a corrupt cell into NaN, which would ride a
+		// snapshot as null and silently lose the derivation high-water mark
+		// (issue #317). Key indices are safety-critical; fail loudly.
+		if (!Number.isSafeInteger(decoded) || decoded < 0) {
+			throw new CorruptRecoveryRowError(
+				'channel key index is not a non-negative integer'
+			);
+		}
+		return decoded;
 	}
 
 	loadChannelKeyIndex(channelId: string): number | null {
@@ -1181,7 +1221,10 @@ export class SqliteStorage implements IStorageBackend {
 			try {
 				results.push({
 					key: row.key,
-					secret: Buffer.from(this._dec(row.secret), 'hex')
+					secret: this._hexColumn(
+						this._dec(row.secret),
+						`htlc shared secret row ${row.key}`
+					)
 				});
 			} catch (err) {
 				// Skip corrupted row
@@ -1580,7 +1623,10 @@ export class SqliteStorage implements IStorageBackend {
 					offerIdHex: row.offer_id,
 					encoded: this._dec(row.encoded),
 					pathId: row.path_id
-						? Buffer.from(this._dec(row.path_id), 'hex')
+						? this._hexColumn(
+								this._dec(row.path_id),
+								`offer row ${row.offer_id}`
+						  )
 						: null,
 					createdAt: row.created_at,
 					asyncHold: !!row.async_hold

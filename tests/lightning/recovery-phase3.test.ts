@@ -687,6 +687,28 @@ describe('Recovery phase 3: capsule restore', () => {
 		target.close();
 	});
 
+	it('rejects inline writer-epoch metadata the chain does not carry', () => {
+		// meta.writerEpoch is INSTALLED into the target's recovery_meta but
+		// the chain and head checks never read it: only a syntax check stood
+		// between a tampered epoch and every frame the restored journal
+		// writes carrying it.
+		const { storage, capsule } = composedCapsule();
+		const inline = JSON.parse(
+			capsule.inlineRecoveryState!.toString('utf8')
+		) as {
+			meta: { writerEpoch: string };
+		};
+		inline.meta.writerEpoch = '999';
+		capsule.inlineRecoveryState = Buffer.from(JSON.stringify(inline), 'utf8');
+		const target = openStorage();
+		expect(() =>
+			restoreFromRecoveryCapsule(capsule, target, NODE_SECRET)
+		).to.throw(/writer epoch/);
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
+		storage.close();
+		target.close();
+	});
+
 	it('rejects an inline journal that does not end at the capsule head', () => {
 		const { storage, capsule } = composedCapsule();
 		// A lying head: the capsule claims a NEWER sequence than the payload.

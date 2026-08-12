@@ -46,6 +46,7 @@ import {
 	decodeFrame,
 	hashFrame,
 	resolveWatermarkAnchor,
+	storedTipSequence,
 	JOURNAL_META_KEYS,
 	META_REPLICATED_THROUGH,
 	META_REPLICATED_THROUGH_HASH
@@ -1119,6 +1120,28 @@ describe('Recovery phase 2: corruption detection', () => {
 		storage.close();
 	});
 
+	it('refuses to snapshot over a corrupt channel key index', () => {
+		// Number('zz-not-a-number') is NaN, not a throw: the derivation
+		// high-water mark would ride the snapshot as null.
+		const { storage } = journalWithFrames();
+		rawDb(storage)
+			.prepare(
+				"INSERT INTO channel_key_indices (channel_id, channel_index) VALUES ('ee', 'zz-not-a-number')"
+			)
+			.run();
+		const fresh = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID
+		);
+		expect(() => fresh.prepareForReplication()).to.throw(
+			CorruptRecoveryRowError,
+			/channel key index/
+		);
+		storage.close();
+	});
+
 	it('refuses to snapshot over an outbox row that does not decode', () => {
 		const { storage } = journalWithFrames();
 		rawDb(storage)
@@ -1143,6 +1166,100 @@ describe('Recovery phase 2: corruption detection', () => {
 		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.tipSequence)).to.equal(
 			tipBefore
 		);
+		storage.close();
+	});
+
+	it('refuses to snapshot over a preimage row that silently coerces', () => {
+		// Buffer.from('zz-not-hex', 'hex') is an EMPTY buffer, not a throw:
+		// without strict hex in the loader the counter never moves, and the
+		// snapshot authenticates an empty preimage while compaction prunes
+		// the last good snapshot that held the real one.
+		const { storage } = journalWithFrames();
+		rawDb(storage)
+			.prepare(
+				"INSERT INTO preimages (payment_hash, preimage) VALUES ('ff', 'zz-not-hex')"
+			)
+			.run();
+		const frameCount = (): unknown =>
+			(
+				rawDb(storage)
+					.prepare('SELECT COUNT(*) AS n FROM recovery_frames')
+					.get() as { n: number }
+			).n;
+		const framesBefore = frameCount();
+		const fresh = new RecoveryJournal(
+			storage,
+			MASTER_KEY,
+			NODE_ID,
+			RECOVERY_ID
+		);
+		expect(() => fresh.prepareForReplication()).to.throw(
+			CorruptRecoveryRowError,
+			/do not decode/
+		);
+		// The refused snapshot compacted nothing: the prior chain survives.
+		expect(frameCount()).to.equal(framesBefore);
+		storage.close();
+	});
+
+	it('refuses to compact away a physically corrupt retained frame', () => {
+		// The per-write invariants prove counts, spans and the tip row only,
+		// so an OLDER row whose column changed physical type after the LIVE
+		// writer's one-shot verification would be pruned into a fresh chain
+		// that verifies. The compaction path must decode the retained history
+		// strictly before destroying it.
+		const storage = openStorage();
+		const { manager } = makeJournaledManager(storage, 4);
+		const rand = mulberry32(7);
+		const channelIds = [prngBytes(rand, 32)];
+		const commitOne = (): { committed: boolean; error?: Error } =>
+			manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				...randomTransition(rand, channelIds)
+			});
+		// Frames 1..4 (snapshot base at 1), verified by this live writer.
+		for (let i = 0; i < 4; i++) {
+			expect(commitOne().committed).to.equal(true);
+		}
+		// The column changes physical type AFTER verification.
+		const full = rawDb(storage)
+			.prepare('SELECT frame_hash FROM recovery_frames WHERE sequence = 2')
+			.get() as { frame_hash: Buffer };
+		replaceFrameColumn(
+			storage,
+			2,
+			'frame_hash',
+			full.frame_hash.toString('hex')
+		);
+		const rowCount = (): unknown =>
+			(
+				rawDb(storage)
+					.prepare('SELECT COUNT(*) AS n FROM recovery_frames')
+					.get() as { n: number }
+			).n;
+		const framesBefore = rowCount();
+		const tipBefore = storage.getRecoveryMeta!(JOURNAL_META_KEYS.tipSequence);
+		// The next commit crosses the snapshot cadence: it would append a
+		// snapshot at sequence 6 and prune frames 1-5, corrupt row included.
+		const result = commitOne();
+		expect(result.committed).to.equal(false);
+		expect(String(result.error?.message)).to.match(/frame_hash/);
+		// Nothing was pruned and the tip did not advance.
+		expect(rowCount()).to.equal(framesBefore);
+		expect(storage.getRecoveryMeta!(JOURNAL_META_KEYS.tipSequence)).to.equal(
+			tipBefore
+		);
+		storage.close();
+	});
+
+	it('storedTipSequence refuses a tip hash with trailing garbage', () => {
+		// Buffer.from stops at the first malformed byte, so a valid hash
+		// followed by 'zz' used to PROVE the tip here while getTip refused it.
+		const { storage } = journalWithFrames();
+		expect(storedTipSequence(storage)).to.not.equal(null);
+		const hash = storage.getRecoveryMeta!(JOURNAL_META_KEYS.tipHash);
+		storage.setRecoveryMeta!(JOURNAL_META_KEYS.tipHash, `${hash}zz`);
+		expect(storedTipSequence(storage)).to.equal(null);
 		storage.close();
 	});
 

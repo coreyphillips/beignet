@@ -593,7 +593,17 @@ export function storedTipSequence(storage: IStorageBackend): bigint | null {
 	const rows = storage.loadRecoveryFrames?.(Number(sequence) - 1) ?? [];
 	const row = rows[rows.length - 1];
 	if (!row || BigInt(row.sequence) !== sequence) return null;
-	return row.frameHash.equals(Buffer.from(tipHash, 'hex')) ? sequence : null;
+	let recorded: Buffer;
+	try {
+		// Strict: bare Buffer.from would decode a valid prefix of a malformed
+		// record and prove the tip with it (issue #317). Malformed bookkeeping
+		// is UNPROVABLE, not a throw: both callers fail closed on null with
+		// their own refusal messages.
+		recorded = decodeStoredHashHex(tipHash, 'journal tip hash');
+	} catch {
+		return null;
+	}
+	return row.frameHash.equals(recorded) ? sequence : null;
 }
 
 export class RecoveryJournal implements IRecoveryJournalSink {
@@ -1421,7 +1431,10 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 		this.beginWriteAttempt();
 		try {
 			this.storage.transaction(() => {
-				this.appendSnapshotFrame(sequence, Buffer.from(tipHash, 'hex'));
+				this.appendSnapshotFrame(
+					sequence,
+					decodeStoredHashHex(tipHash, 'journal tip hash')
+				);
 				this.storage.setRecoveryMeta!(
 					META_SNAPSHOT_SCHEMA,
 					SNAPSHOT_SCHEMA_VERSION
@@ -1576,6 +1589,13 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH);
 			this.storage.deleteRecoveryMeta!(META_REPLICATED_THROUGH_HASH);
 		}
+		// Compaction destroys history, so it must not run over rows it never
+		// decoded: the per-write invariants prove only counts, spans and the
+		// tip row, and a physically corrupt OLDER frame would otherwise be
+		// pruned away into a fresh chain that verifies (issue #317). The
+		// strict loader throws on any such row, aborting this append inside
+		// its own transaction with the corrupt history left intact.
+		this.storage.loadRecoveryFrames!();
 		this.storage.deleteRecoveryFramesBelow!(Number(snapshotSequence));
 		this.storage.setRecoveryMeta!(
 			META_LAST_SNAPSHOT,

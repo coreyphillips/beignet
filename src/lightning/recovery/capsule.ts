@@ -1042,6 +1042,17 @@ function verifyInlineJournal(
 			'recovery capsule head does not match its inline journal (stale or spliced payload)'
 		);
 	}
+	// The inline metadata epoch is INSTALLED into the target's recovery_meta,
+	// so it must be the verified chain's epoch, not a free-floating value
+	// parseInlineState only syntax-checked (issue #317). The chain and head
+	// checks above never read it; without this bind a tampered epoch would
+	// restore at Tier 2 and every frame the restored journal writes would
+	// carry it.
+	if (BigInt(encoded.meta.writerEpoch) !== last.writerEpoch) {
+		throw new Error(
+			'recovery capsule inline metadata does not match its verified chain (writer epoch)'
+		);
+	}
 	// Schema compatibility is part of CANDIDATE validation, not something
 	// discovered after the target was written: a structurally valid capsule
 	// whose base snapshot this release cannot restore must be rejected
