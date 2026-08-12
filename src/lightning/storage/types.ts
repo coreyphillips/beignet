@@ -339,6 +339,14 @@ export interface IStorageBackend {
 	 * lease fails closed rather than assuming.
 	 */
 	secretsEncryptedAtRest?(): boolean;
+	/**
+	 * Total rows skipped by the forgiving loaders since this backend was
+	 * opened. Recovery-critical readers (snapshot capture, restore-target
+	 * emptiness checks) sample this before and after loading so a skipped
+	 * row fails the operation closed instead of silently vanishing from the
+	 * state they act on.
+	 */
+	corruptRowCount?(): number;
 
 	// ─── BOLT 12 Offers (optional) ───
 	/**
@@ -377,6 +385,19 @@ export type RecoveryOutboxDisposition =
 	| 'pending_send'
 	| 'sent_unacked'
 	| 'superseded';
+
+/**
+ * A stored recovery row does not decode EXACTLY: wrong column type, wrong
+ * hash length, malformed hex or base64, out-of-range integer. Thrown instead
+ * of coercing or skipping, so chain verification and restore checks always
+ * see the true physical state of the row (issue #317).
+ */
+export class CorruptRecoveryRowError extends Error {
+	constructor(message: string) {
+		super(`recovery row is corrupt: ${message}`);
+		this.name = 'CorruptRecoveryRowError';
+	}
+}
 
 /**
  * An outbound wire message whose durability is tied to the state that makes it

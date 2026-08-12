@@ -33,7 +33,11 @@
 
 import { createCipheriv, createDecipheriv, randomBytes } from 'crypto';
 import { hkdfKey } from '../storage/encryption';
-import { IStorageBackend, IStoredRecoveryFrame } from '../storage/types';
+import {
+	CorruptRecoveryRowError,
+	IStorageBackend,
+	IStoredRecoveryFrame
+} from '../storage/types';
 import { IStaticChannelBackup, decodeScb } from '../backup/scb';
 import { PEER_STORAGE_MAX_BYTES } from '../message/peer-storage';
 import { getPublicKey } from '../crypto/ecdh';
@@ -43,6 +47,7 @@ import {
 	assertEmptyTarget,
 	assertFramesReconstructable,
 	assertNoJournalResidue,
+	decodeStoredHashHex,
 	deriveRecoveryMasterKey,
 	journalSupported,
 	reconstructFromFrames,
@@ -799,11 +804,17 @@ export function composeRecoveryCapsule(
 		encryptedScb: options.encryptedScb,
 		writerEpoch: writerEpoch != null ? BigInt(writerEpoch) : 0n,
 		latestSequence: tipSequence != null ? BigInt(tipSequence) : 0n,
-		frameHash: tipHash != null ? Buffer.from(tipHash, 'hex') : ZERO_HASH,
+		// Strict decode: a corrupt stored tip hash must not be replicated to
+		// guardians as the anti-rollback locator (issue #317).
+		frameHash:
+			tipHash != null
+				? decodeStoredHashHex(tipHash, 'journal tip hash')
+				: ZERO_HASH,
 		snapshotHash: ZERO_HASH,
 		guardians: options.guardians ?? []
 	};
 
+	let inlineError: string | undefined;
 	let frames: IStoredRecoveryFrame[] = [];
 	if (
 		options.allowInline !== false &&
@@ -811,12 +822,18 @@ export function composeRecoveryCapsule(
 		tipSequence != null &&
 		lastSnapshot != null
 	) {
-		frames = storage.loadRecoveryFrames?.() ?? [];
-		const base = frames.find((row) => String(row.sequence) === lastSnapshot);
-		if (base) capsule.snapshotHash = base.frameHash;
+		// A frame row that does not decode makes loadRecoveryFrames throw;
+		// degrade to SCB plus locator, matching the contract that a journal
+		// which fails verification is never inlined.
+		try {
+			frames = storage.loadRecoveryFrames?.() ?? [];
+			const base = frames.find((row) => String(row.sequence) === lastSnapshot);
+			if (base) capsule.snapshotHash = base.frameHash;
+		} catch (err) {
+			inlineError = err instanceof Error ? err.message : String(err);
+			frames = [];
+		}
 	}
-
-	let inlineError: string | undefined;
 	if (frames.length > 0) {
 		try {
 			verifyFrameChain(
@@ -880,30 +897,110 @@ export interface ICapsuleRestoreResult {
 	framesApplied: number;
 }
 
-/** Parse an inline Tier 2 payload back into stored rows plus chain metadata. */
+/**
+ * Decode canonical padded base64 or throw. Buffer.from(s, 'base64') silently
+ * drops invalid characters and tolerates truncation; the composer always
+ * writes toString('base64'), so a round-trip compare accepts exactly what was
+ * written and nothing else (issue #317).
+ */
+function decodeStrictBase64(value: unknown, field: string): Buffer {
+	if (typeof value !== 'string' || value.length === 0) {
+		throw new CorruptRecoveryRowError(`${field} is not a base64 string`);
+	}
+	const decoded = Buffer.from(value, 'base64');
+	if (decoded.length === 0 || decoded.toString('base64') !== value) {
+		throw new CorruptRecoveryRowError(`${field} is not canonical base64`);
+	}
+	return decoded;
+}
+
+/** Assert a frame field is an integer within range, or throw. */
+function inlineInt(value: unknown, field: string, min: number): number {
+	if (
+		typeof value !== 'number' ||
+		!Number.isSafeInteger(value) ||
+		value < min
+	) {
+		throw new CorruptRecoveryRowError(`${field} is not an integer >= ${min}`);
+	}
+	return value;
+}
+
+/** Assert a meta field is a positive decimal string, or throw. */
+function inlineMetaNumeric(value: unknown, field: string): string {
+	if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
+		throw new CorruptRecoveryRowError(`${field} is not a positive integer`);
+	}
+	return value;
+}
+
+/**
+ * Parse an inline Tier 2 payload back into stored rows plus chain metadata.
+ *
+ * Every field is decoded EXACTLY or refused: the rows this returns are what
+ * chain verification runs over and what a restore writes into the target, so
+ * a coerced field (truncated hex, non-canonical base64, a stringly-typed
+ * sequence) must surface as corruption here rather than flow onward
+ * (issue #317).
+ */
 function parseInlineState(inline: Buffer): {
 	encoded: IEncodedInlineState;
 	rows: IStoredRecoveryFrame[];
 } {
-	let encoded: IEncodedInlineState;
+	let parsed: unknown;
 	try {
-		encoded = JSON.parse(inline.toString('utf8')) as IEncodedInlineState;
+		parsed = JSON.parse(inline.toString('utf8'));
 	} catch {
 		throw new Error('recovery capsule inline state is not valid JSON');
 	}
-	if (!Array.isArray(encoded.frames) || encoded.frames.length === 0) {
+	const candidate = parsed as IEncodedInlineState;
+	if (!Array.isArray(candidate.frames) || candidate.frames.length === 0) {
 		throw new Error('recovery capsule inline state carries no frames');
 	}
+	const meta = candidate.meta;
+	if (typeof meta !== 'object' || meta == null) {
+		throw new CorruptRecoveryRowError('inline state meta is missing');
+	}
+	if (typeof meta.tipHash !== 'string') {
+		throw new CorruptRecoveryRowError('inline tip hash is not a string');
+	}
+	decodeStoredHashHex(meta.tipHash, 'inline tip hash');
+	const encoded: IEncodedInlineState = {
+		meta: {
+			tipSequence: inlineMetaNumeric(meta.tipSequence, 'inline tip sequence'),
+			tipHash: meta.tipHash,
+			writerEpoch: inlineMetaNumeric(meta.writerEpoch, 'inline writer epoch'),
+			lastSnapshot: inlineMetaNumeric(
+				meta.lastSnapshot,
+				'inline snapshot sequence'
+			)
+		},
+		frames: candidate.frames
+	};
 	return {
 		encoded,
-		rows: encoded.frames.map((row) => ({
-			sequence: row.sequence,
-			writerEpoch: row.writerEpoch,
-			frameHash: Buffer.from(row.frameHash, 'hex'),
-			previousFrameHash: Buffer.from(row.previousFrameHash, 'hex'),
-			ciphertext: Buffer.from(row.ciphertext, 'base64'),
-			createdAt: row.createdAt
-		}))
+		rows: encoded.frames.map((row, index) => {
+			const label = `inline frame ${index}`;
+			if (
+				typeof row.frameHash !== 'string' ||
+				typeof row.previousFrameHash !== 'string'
+			) {
+				throw new CorruptRecoveryRowError(
+					`${label}: frame hash is not a string`
+				);
+			}
+			return {
+				sequence: inlineInt(row.sequence, `${label}: sequence`, 1),
+				writerEpoch: inlineInt(row.writerEpoch, `${label}: writerEpoch`, 1),
+				frameHash: decodeStoredHashHex(row.frameHash, `${label}: frameHash`),
+				previousFrameHash: decodeStoredHashHex(
+					row.previousFrameHash,
+					`${label}: previousFrameHash`
+				),
+				ciphertext: decodeStrictBase64(row.ciphertext, `${label}: ciphertext`),
+				createdAt: inlineInt(row.createdAt, `${label}: createdAt`, 0)
+			};
+		})
 	};
 }
 

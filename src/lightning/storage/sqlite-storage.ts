@@ -16,6 +16,7 @@ import {
 	IRecoveryOutboxMessage,
 	IRecoveryOutboxStoredMessage,
 	IStoredRecoveryFrame,
+	CorruptRecoveryRowError,
 	RecoveryOutboxDisposition
 } from './types';
 import { IWatchtowerSession, IWatchtowerUpdate } from '../watchtower/types';
@@ -47,6 +48,7 @@ export class SqliteStorage implements IStorageBackend {
 	private readonly dbPath: string;
 	private onCorruptRow?: (error: unknown) => void;
 	private encryptionKey?: Buffer;
+	private corruptRowsSeen = 0;
 
 	/**
 	 * @param dbPath Path to the SQLite database file (or ':memory:').
@@ -87,9 +89,15 @@ export class SqliteStorage implements IStorageBackend {
 		if (error instanceof StorageEncryptedError) {
 			throw error;
 		}
+		this.corruptRowsSeen++;
 		if (this.onCorruptRow) {
 			this.onCorruptRow(error);
 		}
+	}
+
+	/** Rows skipped by the forgiving loaders since open (issue #317). */
+	corruptRowCount(): number {
+		return this.corruptRowsSeen;
 	}
 
 	/** Encrypt a sensitive payload value when an encryption key is configured. */
@@ -1636,12 +1644,22 @@ export class SqliteStorage implements IStorageBackend {
 		const results: IRecoveryOutboxStoredMessage[] = [];
 		for (const row of rows) {
 			try {
+				// Strict hex: Buffer.from(s, 'hex') silently truncates at the
+				// first bad byte, so a corrupt wire_message would otherwise be
+				// coerced into a short retransmission instead of being counted
+				// as corrupt (issue #317).
+				const wireHex = this._dec(row.wire_message);
+				if (!/^([0-9a-f]{2})*$/i.test(wireHex)) {
+					throw new CorruptRecoveryRowError(
+						`outbox row ${row.id}: wire_message is not valid hex`
+					);
+				}
 				results.push({
 					id: row.id,
 					peerId: row.peer_pubkey,
 					channelId: row.channel_id ?? undefined,
 					messageType: row.message_type,
-					wireMessage: Buffer.from(this._dec(row.wire_message), 'hex'),
+					wireMessage: Buffer.from(wireHex, 'hex'),
 					disposition: row.disposition as RecoveryOutboxDisposition,
 					frameSequence: row.frame_sequence,
 					createdAt: row.created_at
@@ -1735,21 +1753,55 @@ export class SqliteStorage implements IStorageBackend {
 						.prepare('SELECT * FROM recovery_frames ORDER BY sequence ASC')
 						.all()
 		) as Array<{
-			sequence: number;
-			writer_epoch: number;
-			frame_hash: Buffer;
-			previous_hash: Buffer;
-			ciphertext: Buffer;
-			created_at: number;
+			sequence: unknown;
+			writer_epoch: unknown;
+			frame_hash: unknown;
+			previous_hash: unknown;
+			ciphertext: unknown;
+			created_at: unknown;
 		}>;
-		return rows.map((row) => ({
-			sequence: row.sequence,
-			writerEpoch: row.writer_epoch,
-			frameHash: Buffer.from(row.frame_hash),
-			previousFrameHash: Buffer.from(row.previous_hash),
-			ciphertext: Buffer.from(row.ciphertext),
-			createdAt: row.created_at
-		}));
+		// Decode EXACTLY or throw: SQLite column affinity does not enforce
+		// types, so a physically corrupt row (TEXT in a BLOB column, a float
+		// or string sequence) would otherwise be coerced into plausible bytes
+		// that chain verification then runs over (issue #317). Frame
+		// corruption always propagates; it is never routed through
+		// reportCorruptRow's skip path.
+		return rows.map((row) => {
+			const label = `recovery frame row ${String(row.sequence)}`;
+			const frameInt = (value: unknown, field: string, min: number): number => {
+				if (
+					typeof value !== 'number' ||
+					!Number.isSafeInteger(value) ||
+					value < min
+				) {
+					throw new CorruptRecoveryRowError(
+						`${label}: ${field} is not an integer >= ${min}`
+					);
+				}
+				return value;
+			};
+			const frameHash = (value: unknown, field: string): Buffer => {
+				if (!Buffer.isBuffer(value) || value.length !== 32) {
+					throw new CorruptRecoveryRowError(
+						`${label}: ${field} is not a 32-byte buffer`
+					);
+				}
+				return Buffer.from(value);
+			};
+			if (!Buffer.isBuffer(row.ciphertext) || row.ciphertext.length === 0) {
+				throw new CorruptRecoveryRowError(
+					`${label}: ciphertext is not a non-empty buffer`
+				);
+			}
+			return {
+				sequence: frameInt(row.sequence, 'sequence', 1),
+				writerEpoch: frameInt(row.writer_epoch, 'writer_epoch', 1),
+				frameHash: frameHash(row.frame_hash, 'frame_hash'),
+				previousFrameHash: frameHash(row.previous_hash, 'previous_hash'),
+				ciphertext: Buffer.from(row.ciphertext),
+				createdAt: frameInt(row.created_at, 'created_at', 0)
+			};
+		});
 	}
 
 	setOutboxFrameSequence(ids: number[], frameSequence: number): void {
