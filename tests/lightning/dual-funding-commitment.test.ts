@@ -614,4 +614,53 @@ describe('Dual Funding v2 commitment_signed exchange (e2e, real keys)', () => {
 			'no commitment is broadcast without a verified peer signature'
 		).to.be.false;
 	});
+
+	// Issue #310: "cannot verify" must never become "adopt". A channel missing
+	// the signer or the remote basepoints cannot verify the peer's commitment
+	// signature, and adopting it unverified would satisfy the tx_signatures
+	// release gate on exactly the construction where verification is impossible.
+	it('fails a commitment_signed arriving on a signer-less channel', () => {
+		const h = driveToCommitmentExchange();
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		(h.acceptor as any)._signer = null;
+		const actions = h.acceptor.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(h.openerCommit)
+		);
+
+		const err = findError(actions);
+		expect(err, 'a signer-less channel rejects commitment_signed').to.not.equal(
+			null
+		);
+		expect(err!.toLowerCase()).to.contain('cannot verify');
+
+		// No signature adopted, and no tx_signatures released.
+		expect(h.acceptor.getFullState().remoteCommitmentSignature).to.equal(null);
+		expect(
+			findPayload(actions, MessageType.TX_SIGNATURES),
+			'tx_signatures must not leave on an unverifiable commitment sig'
+		).to.equal(null);
+	});
+
+	it('fails a commitment_signed when remote basepoints are missing', () => {
+		const h = driveToCommitmentExchange();
+
+		h.acceptor.getFullState().remoteBasepoints = null;
+		const actions = h.acceptor.handleCommitmentSigned(
+			decodeCommitmentSignedMessage(h.openerCommit)
+		);
+
+		const err = findError(actions);
+		expect(
+			err,
+			'missing remote basepoints reject commitment_signed'
+		).to.not.equal(null);
+		expect(err!.toLowerCase()).to.contain('cannot verify');
+
+		expect(h.acceptor.getFullState().remoteCommitmentSignature).to.equal(null);
+		expect(
+			findPayload(actions, MessageType.TX_SIGNATURES),
+			'tx_signatures must not leave on an unverifiable commitment sig'
+		).to.equal(null);
+	});
 });
