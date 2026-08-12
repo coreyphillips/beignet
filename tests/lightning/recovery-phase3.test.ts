@@ -589,6 +589,23 @@ describe('Recovery phase 3: capsule composition', () => {
 		storage.close();
 	});
 
+	it('refuses to compose from a corrupt stored backfill-lost marker', () => {
+		// A stored row the decoder would refuse must fail loudly here, not
+		// compose an inline capsule that cannot restore at Tier 2.
+		const { storage } = journaledStorage();
+		for (const bad of ['', 'x'.repeat(4097)]) {
+			storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, bad);
+			expect(() =>
+				composeRecoveryCapsule({
+					storage,
+					encryptedScb: makeScb(),
+					nodeSecret: NODE_SECRET
+				})
+			).to.throw(/backfill-lost/);
+		}
+		storage.close();
+	});
+
 	it('omits the marker from a healthy namespace inline state', () => {
 		const { storage } = journaledStorage();
 		const { capsule, inline } = composeRecoveryCapsule({
@@ -1109,6 +1126,39 @@ describe('Recovery phase 3: review regressions', () => {
 		a.storage.close();
 		b.storage.close();
 		target.close();
+	});
+
+	it('prefers a marker-bearing replica over a marker-less same-head twin', () => {
+		// An older composer at the same head produces a valid capsule without
+		// the backfill-lost marker. Selection takes the first valid replica of
+		// a nonconflicting head, so without an ordering preference the arrival
+		// order would decide whether the irreversible marker survives the
+		// restore (issue #314).
+		const { storage } = journaledStorage();
+		const markerless = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, LOST_DETAIL);
+		const marked = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		for (const blobs of [
+			[markerless, marked],
+			[marked, markerless]
+		]) {
+			const target = openStorage();
+			const result = restoreBestRecoveryCapsule(blobs, target, NODE_SECRET, {
+				scratchStorage
+			});
+			expect(result.tier).to.equal(2);
+			expect(chainLostBackfill(target)).to.equal(LOST_DETAIL);
+			target.close();
+		}
+		storage.close();
 	});
 
 	it('falls back to Tier 1 when no inline journal validates', () => {
