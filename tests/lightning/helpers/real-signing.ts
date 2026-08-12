@@ -32,17 +32,20 @@ export function signerFromSeed(seed: Buffer): ChannelSigner {
 /**
  * Our real signature over the PEER's initial commitment (#0), for
  * createFundingCreated (opener side) or the handleFundingCreated reply
- * (acceptor side). Signing needs the funding outpoint in state, so it is
- * installed here; the handler that follows sets the same values again.
+ * (acceptor side). Signing needs the funding outpoint, so it is applied to
+ * a shallow COPY of the state: the live channel stays untouched, and the
+ * production handler remains responsible for storing the outpoint.
  */
 export function realInitialCommitmentSig(
 	channel: Channel,
 	fundingTxid: Buffer,
 	fundingOutputIndex: number
 ): Buffer {
-	const state = channel.getFullState();
-	state.fundingTxid = fundingTxid;
-	state.fundingOutputIndex = fundingOutputIndex;
+	const state = {
+		...channel.getFullState(),
+		fundingTxid,
+		fundingOutputIndex
+	};
 	return signRemoteCommitment(
 		state,
 		channel.getSigner()!,

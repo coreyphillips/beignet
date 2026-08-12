@@ -2186,6 +2186,49 @@ describe('Splice', function () {
 			).to.be.true;
 		});
 
+		it('fails closed on a splice commitment_signed when the signer is missing', function () {
+			// Issue #329: "cannot verify" must never become "cache and mark
+			// received" on the splice commitment path either.
+			const { opener } = makeNormalChannel();
+			quiesce(opener);
+			const channelId = opener.getChannelId()!;
+
+			const destScript = Buffer.concat([
+				Buffer.from([0x00, 0x14]),
+				crypto.randomBytes(20)
+			]);
+			const withdraw = 50_000n;
+			opener.setSpliceOutDestination(destScript, withdraw);
+			opener.initiateSplice(-withdraw, 253);
+			opener.handleSpliceAck({
+				channelId,
+				fundingPubkey: makeBasepoints(acceptorSeed).fundingPubkey,
+				relativeSatoshis: 0n
+			});
+			opener.handleTxComplete();
+			opener.handleTxComplete();
+			opener.handleTxComplete();
+			expect(opener.buildAndSignSpliceTx(), 'splice tx built').to.not.be.null;
+
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(opener as any)._signer = null;
+			const actions = opener.handleCommitmentSigned({
+				channelId,
+				signature: crypto.randomBytes(64),
+				htlcSignatures: []
+			});
+			const error = findAction(actions, ChannelActionType.ERROR);
+			expect(error).to.exist;
+			expect(error.message).to.contain(
+				'Cannot verify splice commitment signature'
+			);
+			// Nothing cached, round not marked received.
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((opener as any)._spliceRemoteCommitmentSig).to.equal(null);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			expect((opener as any)._spliceReceivedCommitment).to.equal(false);
+		});
+
 		it('should unwind the splice on peer tx_abort (channel returns to NORMAL)', function () {
 			const { acceptor } = makeNormalChannel();
 			quiesce(acceptor);

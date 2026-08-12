@@ -8831,52 +8831,63 @@ export class Channel {
 			];
 		}
 
-		if (this._signer && this._state.remoteBasepoints) {
-			const ourPoint = getPerCommitmentPoint(
-				this._state.localPerCommitmentSeed,
-				this._state.localCommitmentNumber
-			);
-			const valid = verifyRemoteCommitmentSig(
-				spliced,
-				this._signer,
-				ourPoint,
-				msg.signature,
-				this._state.localCommitmentNumber
-			);
-			if (!valid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid splice commitment signature'
-					}
-				];
-			}
-			// Committed HTLCs riding through the splice (S-2.M8) put HTLC
-			// outputs on the spliced commitment; verify the peer's second-level
-			// sigs over them before caching anything (they are the force-close
-			// witness material for the new funding).
-			const htlcSigsValid = isTaprootChannel(this._state.channelType)
-				? verifyRemoteHtlcSignaturesTaproot(
-						spliced,
-						ourPoint,
-						msg.htlcSignatures,
-						this._state.localCommitmentNumber
-				  )
-				: verifyRemoteHtlcSignatures(
-						spliced,
-						this._signer,
-						ourPoint,
-						msg.htlcSignatures,
-						this._state.localCommitmentNumber
-				  );
-			if (!htlcSigsValid) {
-				return [
-					{
-						type: ChannelActionType.ERROR,
-						message: 'Invalid splice commitment HTLC signature'
-					}
-				];
-			}
+		// Cannot verify -> must not cache: the signature stored below is the
+		// force-close witness material for the new funding, and the received
+		// flag it sets gates the rest of the splice round. A plain ERROR, not
+		// a wire error: the missing pieces are a LOCAL invariant failure.
+		if (!this._signer || !this._state.remoteBasepoints) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'Cannot verify splice commitment signature: no signer or remote basepoints'
+				}
+			];
+		}
+		const ourPoint = getPerCommitmentPoint(
+			this._state.localPerCommitmentSeed,
+			this._state.localCommitmentNumber
+		);
+		const valid = verifyRemoteCommitmentSig(
+			spliced,
+			this._signer,
+			ourPoint,
+			msg.signature,
+			this._state.localCommitmentNumber
+		);
+		if (!valid) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Invalid splice commitment signature'
+				}
+			];
+		}
+		// Committed HTLCs riding through the splice (S-2.M8) put HTLC
+		// outputs on the spliced commitment; verify the peer's second-level
+		// sigs over them before caching anything (they are the force-close
+		// witness material for the new funding).
+		const htlcSigsValid = isTaprootChannel(this._state.channelType)
+			? verifyRemoteHtlcSignaturesTaproot(
+					spliced,
+					ourPoint,
+					msg.htlcSignatures,
+					this._state.localCommitmentNumber
+			  )
+			: verifyRemoteHtlcSignatures(
+					spliced,
+					this._signer,
+					ourPoint,
+					msg.htlcSignatures,
+					this._state.localCommitmentNumber
+			  );
+		if (!htlcSigsValid) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'Invalid splice commitment HTLC signature'
+				}
+			];
 		}
 		this._spliceRemoteCommitmentSig = Buffer.from(msg.signature);
 		this._spliceRemoteHtlcSigs = msg.htlcSignatures.map((s) => Buffer.from(s));
