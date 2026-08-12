@@ -272,6 +272,55 @@ describe('Recovery phase 5: restore driver', () => {
 		target.close();
 	});
 
+	it('restores through a backend that refuses nested transactions', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(3);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+		const expectedDump = dumpTables(live.storage);
+
+		// IStorageBackend does not promise reentrant transactions. Emulate
+		// a strictly non-reentrant backend: the whole install (frames,
+		// metadata, replay, lease) must share ONE transaction instead of
+		// opening a BEGIN per reconstruction unit inside the outer one.
+		const real = openStorage();
+		let inTransaction = false;
+		const strict = new Proxy(real, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'transaction') {
+					return <T>(fn: () => T): T => {
+						if (inTransaction) {
+							throw new Error('nested transaction refused');
+						}
+						inTransaction = true;
+						try {
+							return target.transaction(fn);
+						} finally {
+							inTransaction = false;
+						}
+					};
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+
+		const driver = driverFor(strict, bind(served));
+		const result = await driver.restore();
+
+		expect(result.framesApplied).to.be.greaterThan(0);
+		expect(dumpTables(real)).to.equal(expectedDump);
+		const restoredLease = loadWriterLease(real);
+		expect(restoredLease.state).to.equal('present');
+		await shutdown(served);
+		live.storage.close();
+		real.close();
+	});
+
 	it('reconciles a divergent head: one guardian unreachable, one stale', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.
