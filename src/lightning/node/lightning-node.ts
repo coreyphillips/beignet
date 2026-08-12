@@ -4842,6 +4842,10 @@ export class LightningNode extends EventEmitter {
 			const id = state.channelId ?? state.temporaryChannelId;
 			if (!id) continue;
 			const idHex = id.toString('hex');
+			// Splice inputs are pledged by the same wallet bookkeeping and the
+			// splice tx is retained on the same terms, so its reservation needs
+			// the same renewal as a funding one.
+			this.renewTransactionPledges(inflight.spliceTxHex);
 			// Already authorized in this process: rebroadcast without minting
 			// another frame. The barrier has answered for this splice.
 			if (this.authorizedSpliceBroadcasts.has(idHex)) {
@@ -4894,6 +4898,35 @@ export class LightningNode extends EventEmitter {
 	}
 
 	/**
+	 * Keep the wallet coins a retained transaction spends reserved for it.
+	 *
+	 * The pledge taken when the inputs were selected is released on a timeout,
+	 * and again the moment the wallet stops listing the coin, while the
+	 * obligation to broadcast runs until the transaction CONFIRMS. A broadcast
+	 * still failing after the pledge times out, or an eviction that hands the
+	 * inputs back unspent and unfrozen, puts them back in front of the next
+	 * coin selection (or an ordinary wallet send, which only respects the
+	 * freeze list). Whichever spends them first, the transaction we still owe
+	 * the network can never confirm again and the channel is voided: the
+	 * orphaned-channel outcome pledges exist to prevent, reached through the
+	 * seam between the two lifetimes.
+	 *
+	 * Renewed on the same cadence as the broadcast retry, so the reservation
+	 * lasts exactly as long as the obligation. Best effort and never awaited:
+	 * a provider failure must not break block processing, and the next block
+	 * renews again.
+	 */
+	private renewTransactionPledges(txHex: string): void {
+		const provider = this.fundingProvider;
+		if (!provider?.pledgeTransactionInputs) return;
+		provider.pledgeTransactionInputs(txHex).catch((err) => {
+			this.emitStructuredLog('chain', 'input_pledge_renewal_failed', {
+				error: (err as Error)?.message ?? String(err)
+			});
+		});
+	}
+
+	/**
 	 * Retry every pending funding broadcast whose channel is still alive and
 	 * unconfirmed, and retire entries whose channel is gone (aborted, closed
 	 * or voided before confirmation): broadcasting a funding tx for a dead
@@ -4935,7 +4968,7 @@ export class LightningNode extends EventEmitter {
 				liveByTxid.set(state.fundingTxid.toString('hex'), state.state);
 			}
 		}
-		for (const [txidHex] of [...this.pendingFundingTxs]) {
+		for (const [txidHex, entry] of [...this.pendingFundingTxs]) {
 			const channelState = liveByTxid.get(txidHex);
 			if (channelState === undefined || deadStates.has(channelState)) {
 				this.emitStructuredLog('chain', 'pending_funding_retired', {
@@ -4945,6 +4978,10 @@ export class LightningNode extends EventEmitter {
 				this.deletePendingFundingTx(txidHex);
 				continue;
 			}
+			// Whatever the authorization says: the coins are committed to this
+			// transaction from the moment it was built, and an entry still waiting
+			// on a fresh authorization is one whose broadcast has not happened yet.
+			this.renewTransactionPledges(entry.txHex);
 			this.broadcastPendingFundingTx(txidHex);
 		}
 	}
