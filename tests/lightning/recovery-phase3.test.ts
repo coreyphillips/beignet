@@ -36,6 +36,8 @@ import {
 	CAPSULE_MAX_BYTES,
 	PROBE_MUTATION_COVERAGE,
 	PROBE_SNAPSHOT_COVERAGE,
+	JOURNAL_META_KEYS,
+	chainLostBackfill,
 	composeRecoveryCapsule,
 	decodeRecoveryCapsuleBlob,
 	encryptRecoveryCapsule,
@@ -224,6 +226,10 @@ function buildDirectGraph(alice: LightningNode): void {
 }
 
 const NODE_SECRET = makeNodeConfig(1).nodePrivateKey;
+
+/** Fixture detail for the set-once backfill-lost marker (issue #314). */
+const LOST_DETAIL =
+	'compaction pruned to frame 9 while the quorum had only reached frame 3';
 
 /** The capsule dry-run scratch: a fresh in-memory backend per candidate. */
 const scratchStorage = (): SqliteStorage => {
@@ -559,6 +565,59 @@ describe('Recovery phase 3: capsule composition', () => {
 		).to.throw(/oversized/);
 		storage.close();
 	});
+
+	it('carries the backfill-lost marker in the inline state', () => {
+		// The marker is the only journal meta row with no frame-borne
+		// fallback: a capsule that omits it makes a restored device forget
+		// the namespace lost backfill (issue #314).
+		const { storage } = journaledStorage();
+		storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, LOST_DETAIL);
+		const { blob, capsule, inline } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		expect(inline).to.equal(true);
+		const state = JSON.parse(capsule.inlineRecoveryState!.toString('utf8'));
+		expect(state.meta.backfillLost).to.equal(LOST_DETAIL);
+		// The marker survives the encrypt/decrypt round trip guardians see.
+		const decoded = decodeRecoveryCapsuleBlob(blob, NODE_SECRET);
+		const decodedState = JSON.parse(
+			decoded!.inlineRecoveryState!.toString('utf8')
+		);
+		expect(decodedState.meta.backfillLost).to.equal(LOST_DETAIL);
+		storage.close();
+	});
+
+	it('refuses to compose from a corrupt stored backfill-lost marker', () => {
+		// A stored row the decoder would refuse must fail loudly here, not
+		// compose an inline capsule that cannot restore at Tier 2.
+		const { storage } = journaledStorage();
+		for (const bad of ['', 'x'.repeat(4097)]) {
+			storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, bad);
+			expect(() =>
+				composeRecoveryCapsule({
+					storage,
+					encryptedScb: makeScb(),
+					nodeSecret: NODE_SECRET
+				})
+			).to.throw(/backfill-lost/);
+		}
+		storage.close();
+	});
+
+	it('omits the marker from a healthy namespace inline state', () => {
+		const { storage } = journaledStorage();
+		const { capsule, inline } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		expect(inline).to.equal(true);
+		const state = JSON.parse(capsule.inlineRecoveryState!.toString('utf8'));
+		expect('backfillLost' in state.meta).to.equal(false);
+		storage.close();
+	});
 });
 
 // ─────────────── 4. Restore fails closed ───────────────
@@ -729,6 +788,70 @@ describe('Recovery phase 3: capsule restore', () => {
 		expect(() =>
 			restoreFromRecoveryCapsule(capsule, target, NODE_SECRET)
 		).to.throw(/EMPTY target/);
+		storage.close();
+		target.close();
+	});
+
+	it('reinstalls the backfill-lost marker (tier 2)', () => {
+		// A device restored from a capsule composed after the loss must not
+		// surface the backfill guarantee as intact: the marker gates the
+		// durability barrier settle reason and the refusal of new channel
+		// opens (issue #314).
+		const { storage } = journaledStorage();
+		storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, LOST_DETAIL);
+		const { capsule } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const target = openStorage();
+		const result = restoreFromRecoveryCapsule(capsule, target, NODE_SECRET);
+		expect(result.tier).to.equal(2);
+		expect(target.getRecoveryMeta(JOURNAL_META_KEYS.backfillLost)).to.equal(
+			LOST_DETAIL
+		);
+		// The consumer surface every gate reads reports the loss again.
+		expect(chainLostBackfill(target)).to.equal(LOST_DETAIL);
+		storage.close();
+		target.close();
+	});
+
+	it('leaves the marker absent when the capsule does not carry it', () => {
+		const { storage, capsule } = composedCapsule();
+		const target = openStorage();
+		restoreFromRecoveryCapsule(capsule, target, NODE_SECRET);
+		expect(target.getRecoveryMeta(JOURNAL_META_KEYS.backfillLost)).to.equal(
+			null
+		);
+		expect(chainLostBackfill(target)).to.equal(null);
+		storage.close();
+		target.close();
+	});
+
+	it('rejects a corrupt backfill-lost marker shape', () => {
+		// Present-but-malformed is corruption, not a value to coerce: the
+		// marker is installed into the target's recovery_meta (issue #317
+		// fail-closed decode style).
+		const { storage, capsule } = composedCapsule();
+		const withMarker = (value: unknown): RecoveryCapsule => {
+			const inline = JSON.parse(
+				capsule.inlineRecoveryState!.toString('utf8')
+			) as { meta: Record<string, unknown> };
+			inline.meta.backfillLost = value;
+			return {
+				...capsule,
+				inlineRecoveryState: Buffer.from(JSON.stringify(inline), 'utf8')
+			};
+		};
+		const target = openStorage();
+		for (const bad of [42, '', null, 'x'.repeat(4097)]) {
+			expect(() =>
+				restoreFromRecoveryCapsule(withMarker(bad), target, NODE_SECRET)
+			).to.throw(/backfill-lost/);
+		}
+		// Every refusal fired before anything touched the target.
+		expect(target.loadRecoveryFrames!()).to.have.length(0);
+		expect(target.loadAllPreimages()).to.have.length(0);
 		storage.close();
 		target.close();
 	});
@@ -1003,6 +1126,39 @@ describe('Recovery phase 3: review regressions', () => {
 		a.storage.close();
 		b.storage.close();
 		target.close();
+	});
+
+	it('prefers a marker-bearing replica over a marker-less same-head twin', () => {
+		// An older composer at the same head produces a valid capsule without
+		// the backfill-lost marker. Selection takes the first valid replica of
+		// a nonconflicting head, so without an ordering preference the arrival
+		// order would decide whether the irreversible marker survives the
+		// restore (issue #314).
+		const { storage } = journaledStorage();
+		const markerless = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		storage.setRecoveryMeta(JOURNAL_META_KEYS.backfillLost, LOST_DETAIL);
+		const marked = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		}).blob;
+		for (const blobs of [
+			[markerless, marked],
+			[marked, markerless]
+		]) {
+			const target = openStorage();
+			const result = restoreBestRecoveryCapsule(blobs, target, NODE_SECRET, {
+				scratchStorage
+			});
+			expect(result.tier).to.equal(2);
+			expect(chainLostBackfill(target)).to.equal(LOST_DETAIL);
+			target.close();
+		}
+		storage.close();
 	});
 
 	it('falls back to Tier 1 when no inline journal validates', () => {

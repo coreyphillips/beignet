@@ -599,6 +599,14 @@ interface IEncodedInlineState {
 		tipHash: string;
 		writerEpoch: string;
 		lastSnapshot: string;
+		/**
+		 * The set-once namespace-loss marker (journal META_BACKFILL_LOST).
+		 * Travels in the capsule because no frame can reconstruct it: it is
+		 * the only journal meta row with no frame-borne fallback, so a
+		 * restore that drops it would report a dead namespace as healthy
+		 * (issue #314). Absent when the namespace never lost backfill.
+		 */
+		backfillLost?: string;
 	};
 	frames: Array<{
 		sequence: number;
@@ -798,6 +806,15 @@ export function composeRecoveryCapsule(
 	const lastSnapshot = storage?.getRecoveryMeta?.(
 		JOURNAL_META_KEYS.lastSnapshot
 	);
+	const backfillLost = storage?.getRecoveryMeta?.(
+		JOURNAL_META_KEYS.backfillLost
+	);
+	// Strict decode: a corrupt stored marker row must not compose an inline
+	// capsule this module's own decoder refuses (issue #317 rule, matching
+	// the tip-hash check below).
+	if (backfillLost != null) {
+		assertBackfillLostShape(backfillLost, 'stored');
+	}
 
 	const capsule: RecoveryCapsule = {
 		version: 1,
@@ -869,6 +886,9 @@ export function composeRecoveryCapsule(
 				createdAt: row.createdAt
 			}))
 		};
+		if (backfillLost != null) {
+			inlineState.meta.backfillLost = backfillLost;
+		}
 		const withInline: RecoveryCapsule = {
 			...capsule,
 			inlineRecoveryState: Buffer.from(JSON.stringify(inlineState), 'utf8')
@@ -926,6 +946,31 @@ function inlineInt(value: unknown, field: string, min: number): number {
 	return value;
 }
 
+/**
+ * Ceiling on the inline backfill-lost detail string. The two detail strings
+ * compactTo writes are a few hundred characters; the bound is defense in
+ * depth against a corrupt row, not a security boundary (the capsule is
+ * AEAD-sealed under the node secret).
+ */
+const INLINE_BACKFILL_LOST_MAX_LENGTH = 4096;
+
+/**
+ * Assert a backfill-lost marker is a non-empty bounded string, or throw.
+ * Shared by compose and decode so the two sides cannot drift: a stored row
+ * the decoder would refuse must never compose into an inline capsule.
+ */
+function assertBackfillLostShape(value: unknown, context: string): void {
+	if (
+		typeof value !== 'string' ||
+		value.length === 0 ||
+		value.length > INLINE_BACKFILL_LOST_MAX_LENGTH
+	) {
+		throw new CorruptRecoveryRowError(
+			`${context} backfill-lost marker is not a non-empty string`
+		);
+	}
+}
+
 /** Assert a meta field is a positive decimal string, or throw. */
 function inlineMetaNumeric(value: unknown, field: string): string {
 	if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) {
@@ -965,6 +1010,13 @@ function parseInlineState(inline: Buffer): {
 		throw new CorruptRecoveryRowError('inline tip hash is not a string');
 	}
 	decodeStoredHashHex(meta.tipHash, 'inline tip hash');
+	// Present-but-malformed is corruption, absent is a healthy namespace (or
+	// an older capsule). The marker is not frame-derived, so unlike the
+	// writer epoch it cannot be bound to the verified chain; the AEAD seal
+	// over the whole capsule is its integrity boundary.
+	if (meta.backfillLost !== undefined) {
+		assertBackfillLostShape(meta.backfillLost, 'inline');
+	}
 	const encoded: IEncodedInlineState = {
 		meta: {
 			tipSequence: inlineMetaNumeric(meta.tipSequence, 'inline tip sequence'),
@@ -973,7 +1025,10 @@ function parseInlineState(inline: Buffer): {
 			lastSnapshot: inlineMetaNumeric(
 				meta.lastSnapshot,
 				'inline snapshot sequence'
-			)
+			),
+			...(meta.backfillLost !== undefined
+				? { backfillLost: meta.backfillLost }
+				: {})
 		},
 		frames: candidate.frames
 	};
@@ -1143,6 +1198,18 @@ export function restoreFromRecoveryCapsule(
 			JOURNAL_META_KEYS.lastSnapshot,
 			encoded.meta.lastSnapshot
 		);
+		// The backfill-lost marker is irreversible namespace state with no
+		// frame-borne fallback; dropping it here would let the restored node
+		// open channels into a namespace that can never durably record them
+		// and settle durability waits with the wrong reason (issue #314).
+		// Install-if-present only: assertNoJournalResidue proved the target
+		// empty, so this is exactly the marker's set-once contract.
+		if (encoded.meta.backfillLost !== undefined) {
+			target.setRecoveryMeta!(
+				JOURNAL_META_KEYS.backfillLost,
+				encoded.meta.backfillLost
+			);
+		}
 		reconstructFromFrames(target, frames);
 	});
 	return { tier: 2, scb, framesApplied: frames.length };
@@ -1157,6 +1224,28 @@ export interface IBestCapsuleRestore extends ICapsuleRestoreResult {
 	newestSeenHead: { writerEpoch: bigint; latestSequence: bigint };
 	/** Decrypted candidates that were not used (invalid or superseded). */
 	rejectedCandidates: number;
+}
+
+/**
+ * Peek whether an authenticated candidate's inline state carries the
+ * backfill-lost marker. Selection-only ordering hint: within a
+ * nonconflicting same-head group a marker-bearing replica must be tried
+ * before a marker-less twin (an older composer at the same head), or
+ * arrival order would decide whether the restored namespace remembers it
+ * lost backfill (issue #314). Full validation still happens in
+ * verifyInlineJournal; a candidate this misjudges just sorts differently
+ * and is verified or refused exactly as before.
+ */
+function inlineCarriesBackfillLost(capsule: RecoveryCapsule): boolean {
+	if (!capsule.inlineRecoveryState) return false;
+	try {
+		const parsed = JSON.parse(
+			capsule.inlineRecoveryState.toString('utf8')
+		) as IEncodedInlineState;
+		return typeof parsed?.meta?.backfillLost === 'string';
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -1253,7 +1342,15 @@ export function restoreBestRecoveryCapsule(
 		// exhausted does the next-lower head get its turn (spec 5.4: highest
 		// WHOSE HASH CHAIN VALIDATES).
 		if (journalSupported(target)) {
-			for (const candidate of group) {
+			// A replica carrying the irreversible backfill-lost marker gets
+			// its turn before a marker-less twin at the same head, so which
+			// peer's blob happened to arrive first cannot decide whether the
+			// marker survives the restore (issue #314).
+			const ordered = [
+				...group.filter((c) => inlineCarriesBackfillLost(c)),
+				...group.filter((c) => !inlineCarriesBackfillLost(c))
+			];
+			for (const candidate of ordered) {
 				if (!candidate.inlineRecoveryState) continue;
 				try {
 					verifyInlineJournal(candidate, nodeSecret);
