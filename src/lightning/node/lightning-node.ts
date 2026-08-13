@@ -4224,7 +4224,7 @@ export class LightningNode extends EventEmitter {
 			this.channelManager.handlePeerDisconnected(pubkey);
 			this.gossipSyncManagers.delete(pubkey);
 			this.rateLimiter.removePeer(pubkey);
-			this.emit('peer:disconnect', pubkey);
+			this.notifyPeerDisconnectObservers(pubkey);
 		});
 		this.peerManager.on('peer:error', (pubkey: string, err: Error) => {
 			this.emit('peer:error', pubkey, err);
@@ -4250,6 +4250,34 @@ export class LightningNode extends EventEmitter {
 			} catch {
 				// The log observer threw too; reporting is best effort and
 				// the connection stays up, which is the outcome that matters.
+			}
+		}
+	}
+
+	/**
+	 * Emit the public peer:disconnect notification with each observer FULLY
+	 * contained, the disconnect twin of notifyPeerConnectObservers: the emit
+	 * runs inside the PeerManager's teardown and replacement bookkeeping, so
+	 * a throwing observer unwinding from here would leak the replacement
+	 * connection or skip the auto-reconnect. Observers are dispatched
+	 * individually, not via emit(): emit stops at the first throw, so a
+	 * later observer whose job is cancellation (disconnectPeer) would
+	 * silently depend on listener order.
+	 */
+	private notifyPeerDisconnectObservers(pubkey: string): void {
+		for (const listener of this.rawListeners('peer:disconnect')) {
+			try {
+				(listener as (pubkey: string) => void)(pubkey);
+			} catch (err) {
+				try {
+					this.emitStructuredLog('peer', 'disconnect_observer_failed', {
+						pubkey,
+						error: err instanceof Error ? err.message : String(err)
+					});
+				} catch {
+					// The log observer threw too; reporting is best effort
+					// and the teardown bookkeeping continues regardless.
+				}
 			}
 		}
 	}
