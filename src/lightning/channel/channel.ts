@@ -13218,10 +13218,18 @@ export class Channel {
 		// ours is already on the wire (BOLT 2: never answer with a second).
 		if (this._pendingRbfInit) {
 			this._pendingRbfInit = null;
-			const echo = this._txAbortSent
-				? []
-				: [this._txAbort(this._v2ChannelId())];
-			return [...echo, ...this._maybeSendV2TxSigs()];
+			if (this._txAbortSent) {
+				return this._maybeSendV2TxSigs();
+			}
+			const actions = [
+				this._txAbort(this._v2ChannelId()),
+				...this._maybeSendV2TxSigs()
+			];
+			// The echo terminates this exchange and the channel lives on:
+			// reset the latch the compose just set, or the swallow below
+			// would eat the peer's NEXT independent abort (issue 337).
+			this._txAbortSent = false;
+			return actions;
 		}
 
 		// The echo of our tx_abort of a RECORDED v2 open: the peer has now
@@ -13235,6 +13243,11 @@ export class Channel {
 		if (this._txAbortSent && this._v2AbortPending) {
 			this._v2AbortPending = false;
 			if (this.isV2AttemptBroadcastable()) {
+				// The exchange is complete both ways (sent and received) and
+				// the channel lives on tracking the kept attempt: reset the
+				// latch so the peer's next independent abort is answered,
+				// not swallowed.
+				this._txAbortSent = false;
 				return [];
 			}
 			// Mid-renegotiation the record is attempt 0 ROLLBACK state, and
@@ -13355,7 +13368,13 @@ export class Channel {
 		// the abort as the ack, but keep the record, the state and the
 		// watch.
 		if (this.isV2AttemptBroadcastable()) {
-			return [this._txAbort(this._v2ChannelId())];
+			const actions = [this._txAbort(this._v2ChannelId())];
+			// The echo terminates this exchange and the channel lives on
+			// tracking the kept attempt: reset the latch the compose just
+			// set, or the swallow above would eat the peer's NEXT
+			// independent abort (an operator retry) instead of answering it.
+			this._txAbortSent = false;
+			return actions;
 		}
 
 		session.abort();
