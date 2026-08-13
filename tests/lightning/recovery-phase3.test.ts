@@ -1854,6 +1854,34 @@ describe('Recovery phase 3: round-14 validator and residue hardening', () => {
 		base.close();
 		storage.close();
 	});
+
+	it('a backend that cannot persist invoice path_ids is refused Tier 2 outright', () => {
+		// Tier 2 would restore claimable preimages whose invoices can never
+		// be authenticated if path_id rows were dropped, so a backend
+		// without the path_id pair does not get a journal (#316) and the
+		// restore degrades to Tier 1 BY CONTRACT.
+		const { storage } = journaledStorage(1);
+		const { blob } = composeRecoveryCapsule({
+			storage,
+			encryptedScb: makeScb(),
+			nodeSecret: NODE_SECRET
+		});
+		const base = openStorage();
+		const noPathIds = new Proxy(base, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'saveInvoicePathId') return undefined;
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+		const result = restoreBestRecoveryCapsule([blob], noPathIds, NODE_SECRET, {
+			scratchStorage
+		});
+		expect(result.tier, 'Tier 1 only').to.equal(1);
+		expect(base.loadRecoveryFrames!(), 'no frames installed').to.have.length(0);
+		base.close();
+		storage.close();
+	});
 });
 
 describe('Recovery phase 3: validator failures are never capsule defects', () => {

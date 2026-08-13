@@ -561,6 +561,58 @@ describe('Recovery phase 5: restore driver', () => {
 		emptyTarget.close();
 	});
 
+	it('refuses a target without journal support BEFORE fencing the writer', async function (): Promise<void> {
+		// Real guardians over real TCP: the default 2s is not enough under
+		// full-suite load, and a load-sensitive timeout is a flaky test.
+		this.timeout(20_000);
+		const served = await Promise.all([serve(0), serve(1), serve(2)]);
+		const live = liveNode(1);
+		const rep = replicatorFor(live.storage, bind(served));
+		const decision = await rep.ensureNamespace();
+		await rep.replicatePending((decision as { lease: IWriterLeaseKeys }).lease);
+		const before = (await served[0].client.getHead(ROOT.recoveryId))
+			.state as GuardianState;
+
+		// A target missing the path_id pair cannot continue the journal
+		// (#316): acquiring the epoch for it would fence the working device
+		// in exchange for an uninstallable database.
+		const base = openStorage();
+		const stripped = new Proxy(base, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'saveInvoicePathId' || prop === 'loadAllInvoicePathIds') {
+					return undefined;
+				}
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as unknown as IStorageBackend;
+		try {
+			await driverFor(stripped, bind(served)).restore();
+			expect.fail('an unsupported target must be refused');
+		} catch (error) {
+			expect(error).to.be.instanceOf(RestoreRefusedError);
+			expect((error as RestoreRefusedError).reason).to.equal(
+				'target-unsupported'
+			);
+		}
+		// Refused before ANY takeover traffic: the old writer's epoch stands
+		// and no certificate for a successor exists.
+		const after = await served[0].client.getHead(ROOT.recoveryId);
+		const afterState = after.state as GuardianState;
+		expect(afterState.lease.epoch).to.equal(before.lease.epoch);
+		expect(
+			afterState.lease.writerPublicKey.equals(before.lease.writerPublicKey)
+		).to.equal(true);
+		expect(
+			(after.certificates ?? []).some(
+				(cert) => cert.newEpoch > before.lease.epoch
+			)
+		).to.equal(false);
+		await shutdown(served);
+		live.storage.close();
+		base.close();
+	});
+
 	it('finishes a partial acquisition with the SAME key instead of chasing epochs', async function (): Promise<void> {
 		// Real guardians over real TCP: the default 2s is not enough under
 		// full-suite load, and a load-sensitive timeout is a flaky test.

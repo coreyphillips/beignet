@@ -404,7 +404,23 @@ export class RecoveryManager {
 				this.storage.deleteInvoice(mutation.paymentHash);
 				break;
 			case 'invoice_path_id':
-				this.storage.saveInvoicePathId?.(mutation.paymentHash, mutation.pathId);
+				// Silently dropping the row would commit a claimable invoice
+				// that can never be authenticated (issue #316); throwing here
+				// rolls the whole mutation set back instead. The loader is
+				// required alongside the saver: a row that persists but is
+				// invisible to the node's startup rehydration leaves the
+				// invoice just as unpayable after a restart.
+				if (
+					typeof this.storage.saveInvoicePathId !== 'function' ||
+					typeof this.storage.loadAllInvoicePathIds !== 'function'
+				) {
+					throw new Error(
+						'recovery: storage cannot persist and rehydrate a BOLT 12 ' +
+							'invoice path_id; refusing to commit a claimable invoice ' +
+							'without its authentication path_id'
+					);
+				}
+				this.storage.saveInvoicePathId(mutation.paymentHash, mutation.pathId);
 				break;
 			case 'delete_invoice_path_id':
 				this.storage.deleteInvoicePathId(mutation.paymentHash);
