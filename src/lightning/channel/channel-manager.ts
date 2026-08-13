@@ -1347,6 +1347,55 @@ export class ChannelManager extends EventEmitter {
 	}
 
 	/**
+	 * Provide the caller-owed tx_signatures witnesses for a v2 open: the
+	 * public answer to channel:txsigs-needed (issue 307). During the live
+	 * exchange the channel still lives in the temporary map (promotion
+	 * happens once the open leaves AWAITING_TX_SIGNATURES) while the event
+	 * carries the PERMANENT id, so the lookup covers both maps; getChannel
+	 * alone cannot resolve it inside the notification callback. Dispatches
+	 * the resulting actions (persist, wire send, funding watch) through the
+	 * normal action path and promotes a completed exchange, mirroring the
+	 * inbound tx_signatures handler.
+	 */
+	provideTxSignatures(
+		channelId: Buffer,
+		txid: Buffer,
+		outputIndex: number,
+		witnesses: Buffer[][]
+	): ChannelResult {
+		const idHex = channelId.toString('hex');
+		const channel =
+			this.channels.get(idHex) ?? this.findChannelByChannelIdInTemp(channelId);
+		if (!channel) {
+			const error = `Channel not found: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+		// A temp-resident channel's peer binding is keyed by its temporary id.
+		const peerPubkey =
+			this.channelPeers.get(idHex) ??
+			this.channelPeers.get(channel.getTemporaryChannelId().toString('hex'));
+		if (!peerPubkey) {
+			const error = `Peer not found for channel: ${idHex}`;
+			this.emit('error', channelId, error);
+			return { ok: false, actions: [], error };
+		}
+
+		const actions = channel.sendTxSignatures(txid, outputIndex, witnesses);
+		this.processActions(peerPubkey, channel, actions);
+		this._promoteV2ChannelIfReady(peerPubkey, channel);
+		const errorAction = actions.find((a) => a.type === ChannelActionType.ERROR);
+		if (errorAction) {
+			return {
+				ok: false,
+				actions,
+				error: (errorAction as { message: string }).message
+			};
+		}
+		return { ok: true, actions };
+	}
+
+	/**
 	 * Handle peer disconnection: mark all channels with this peer as AWAITING_REESTABLISH.
 	 */
 	handlePeerDisconnected(peerPubkey: string): void {
@@ -5733,9 +5782,17 @@ export class ChannelManager extends EventEmitter {
 					this.emit('channel:resolved', action.channelId);
 					break;
 				case ChannelActionType.TX_SIGNATURES_NEEDED:
-					// Advisory (no wire send, no broadcast), so never gated on a
-					// failed persist: the embedder must learn it owes witnesses
-					// via sendTxSignatures regardless (issue 307).
+					// A failed persist withholds this batch's earlier sends (our
+					// own commitment_signed can be among them). A listener
+					// answering this notification dispatches tx_signatures in a
+					// FRESH batch no failed-persist marker withholds, putting
+					// witnesses on the wire before a commitment the peer never
+					// received, which the peer rejects. Suppress instead; the
+					// reconnect that follows re-arms the reminder
+					// (markForReestablish).
+					if (persistSeen && sendsBlocked()) {
+						break;
+					}
 					this.emit(
 						'channel:txsigs-needed',
 						action.channelId,
