@@ -461,37 +461,48 @@ describe('Recovery phase 1: safety transition atomicity', () => {
 	});
 
 	it('rolls back the whole set when storage cannot persist a path_id', () => {
-		// A backend without saveInvoicePathId must not silently drop the
-		// row: the invoice would commit claimable but never authenticable
-		// (#316). The whole mutation set rolls back instead.
-		const stripped = new Proxy(storage, {
-			get(target, prop, receiver): unknown {
-				if (prop === 'saveInvoicePathId') return undefined;
-				const value = Reflect.get(target, prop, receiver);
-				return typeof value === 'function' ? value.bind(target) : value;
-			}
-		}) as IStorageBackend;
-		const manager = new RecoveryManager(stripped);
-		const hashHex = '66'.repeat(32);
-		const result = manager.commit({
-			criticality: RecoveryCriticality.SafetyCritical,
-			mutations: [
-				{
-					type: 'payment_preimage',
-					paymentHash: hashHex,
-					preimage: Buffer.alloc(32, 6)
-				},
-				{
-					type: 'invoice_path_id',
-					paymentHash: hashHex,
-					pathId: Buffer.alloc(32, 7)
+		// A backend missing either path-ID method must not commit the row:
+		// without the saver it is silently dropped, and without the loader
+		// it persists invisibly to the node's startup rehydration; either
+		// way the invoice commits claimable but never authenticable (#316).
+		// The whole mutation set rolls back instead.
+		for (const missing of [
+			'saveInvoicePathId',
+			'loadAllInvoicePathIds'
+		] as const) {
+			const stripped = new Proxy(storage, {
+				get(target, prop, receiver): unknown {
+					if (prop === missing) return undefined;
+					const value = Reflect.get(target, prop, receiver);
+					return typeof value === 'function' ? value.bind(target) : value;
 				}
-			],
-			outboundMessages: []
-		});
-		expect(result.committed).to.equal(false);
-		expect(result.error?.message).to.match(/path_id/);
-		expect(storage.loadPreimage(hashHex), 'rolled back').to.equal(null);
+			}) as IStorageBackend;
+			const manager = new RecoveryManager(stripped);
+			const hashHex = '66'.repeat(32);
+			const result = manager.commit({
+				criticality: RecoveryCriticality.SafetyCritical,
+				mutations: [
+					{
+						type: 'payment_preimage',
+						paymentHash: hashHex,
+						preimage: Buffer.alloc(32, 6)
+					},
+					{
+						type: 'invoice_path_id',
+						paymentHash: hashHex,
+						pathId: Buffer.alloc(32, 7)
+					}
+				],
+				outboundMessages: []
+			});
+			expect(result.committed, `missing ${missing}`).to.equal(false);
+			expect(result.error?.message).to.match(/path_id/);
+			expect(storage.loadPreimage(hashHex), 'rolled back').to.equal(null);
+			expect(
+				storage.loadAllInvoicePathIds(),
+				'no path_id row leaked'
+			).to.have.length(0);
+		}
 	});
 
 	it('reports the failure through onError without throwing', () => {

@@ -924,7 +924,44 @@ describe('Recovery phase 2: journal append', () => {
 		const target = openStorage();
 		expect(() =>
 			reconstructFromFrames(stripMethod(target, 'saveInvoicePathId'), frames)
-		).to.throw(/Reconstruction failed replaying frame .*path_id/);
+		).to.throw(/cannot persist and rehydrate/);
+		// The preflight fired before the snapshot committed: a mid-replay
+		// refusal would leave the target dirty and unretryable.
+		expect(target.loadAllChannels()).to.have.length(0);
+		expect(target.loadAllPreimages()).to.have.length(0);
+		live.close();
+		target.close();
+	});
+
+	it('refuses a snapshot whose claimable BOLT 12 invoice has no path_id', () => {
+		// The shape a pre-fix writer could capture through the optional
+		// loader: the authenticated snapshot carries the invoice and its
+		// preimage but silently omits the path_id row. The rows of one hash
+		// live and die together on the live path, so this is unfaithful
+		// capture, and restoring it would leave the invoice permanently
+		// unpayable with no indication of loss.
+		const live = openStorage();
+		const hashHex = 'ef'.repeat(32);
+		live.saveInvoice(hashHex, {
+			paymentHash: hashHex,
+			bolt11: 'lnbcrt1inconsistent',
+			expiry: 3600,
+			createdAt: 1_700_000_000_000,
+			bolt12: true
+		});
+		live.savePreimage(hashHex, Buffer.alloc(32, 8));
+		const { manager, journal } = makeJournaledManager(live);
+		const rand = mulberry32(320);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, [prngBytes(rand, 32)])
+		});
+		const frames = journal.loadVerifiedFrames();
+		const target = openStorage();
+		expect(() => reconstructFromFrames(target, frames)).to.throw(
+			/not a faithful capture/
+		);
+		expect(target.loadAllPreimages()).to.have.length(0);
 		live.close();
 		target.close();
 	});

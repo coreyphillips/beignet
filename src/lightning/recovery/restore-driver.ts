@@ -61,6 +61,7 @@ import {
 import {
 	JOURNAL_META_KEYS,
 	deriveRecoveryMasterKey,
+	journalSupported,
 	reconstructFromFrames,
 	verifyFrameChain
 } from './journal';
@@ -138,7 +139,8 @@ export class RestoreRefusedError extends Error {
 		| 'unknown-namespace'
 		| 'conflict'
 		| 'cas-exhausted'
-		| 'head-unverifiable';
+		| 'head-unverifiable'
+		| 'target-unsupported';
 
 	constructor(reason: RestoreRefusedError['reason'], message: string) {
 		super(message);
@@ -857,6 +859,18 @@ export class RestoreDriver {
 	 * up on this database is the fenced current writer.
 	 */
 	async restore(): Promise<IRestoreResult> {
+		// Preflight the target BEFORE any takeover traffic: acquireEpoch
+		// fences the current writer, and fencing it for a database that
+		// cannot persist the journal (or its path_id rows) trades a working
+		// device for an uninstallable one.
+		if (!journalSupported(this.config.target)) {
+			throw new RestoreRefusedError(
+				'target-unsupported',
+				'the restore target does not satisfy journalSupported(); ' +
+					'refusing to fence the current writer for a database that ' +
+					'cannot continue the journal'
+			);
+		}
 		const { readings, stale } = await this.readHeads();
 		this.assertNoConflict(readings);
 		const target = this.selectHead(readings);
