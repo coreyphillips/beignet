@@ -235,6 +235,8 @@ interface IHarness {
 	acceptor: Channel;
 	openerSigner: ChannelSigner;
 	acceptorSigner: ChannelSigner;
+	/** The acceptor's raw funding key, for manager-level signer rebuilds. */
+	acceptorFundingPriv: Buffer;
 	openerSeed: Buffer;
 	acceptorSeed: Buffer;
 	/** commitment_signed payloads captured but NOT yet delivered. */
@@ -402,6 +404,7 @@ function driveToCommitmentExchange(
 		acceptor,
 		openerSigner,
 		acceptorSigner,
+		acceptorFundingPriv,
 		openerSeed,
 		acceptorSeed,
 		openerCommit,
@@ -868,6 +871,422 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.acceptor.getState()).to.equal(
 			ChannelState.AWAITING_FUNDING_CONFIRMED
 		);
+	});
+
+	it('surfaces the owed caller-driven release after a restart and completes once re-driven (307)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Restart the ACCEPTOR: it signs first, so its release is due the
+		// moment reestablish completes, while its witnesses (caller-driven,
+		// held only in memory) died with the process.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.acceptor.getFullState()))
+		);
+		const revived = new Channel(
+			deserializeChannelState(json),
+			h.acceptorSigner
+		);
+		revived.restoreV2InFlight();
+		revived.markForReestablish();
+		h.opener.markForReestablish();
+
+		const revMsg = reestablishOf(revived.createReestablish());
+		const opMsg = reestablishOf(h.opener.createReestablish());
+		const opReestActions = h.opener.handleReestablish(revMsg);
+		expect(findError(opReestActions)).to.equal(null);
+		// The opener signs second and the peer's signatures are not in yet:
+		// nothing is owed from its caller at this point.
+		expect(
+			opReestActions.some(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			)
+		).to.equal(false);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const revActions: any[] = revived.handleReestablish(opMsg);
+		expect(findError(revActions)).to.equal(null);
+		const record = revived.getFullState().v2InFlight!;
+		const needed = revActions.filter(
+			(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+		);
+		expect(needed.length, 'the resume surfaces the owed release').to.equal(1);
+		expect(needed[0].channelId.equals(revived.getChannelId()!)).to.equal(true);
+		expect(needed[0].fundingTxid.equals(record.fundingTxid)).to.equal(true);
+		expect(needed[0].fundingOutputIndex).to.equal(record.fundingOutputIndex);
+		expect(needed[0].inputIndices).to.deep.equal([1]);
+
+		// One-shot per connection cycle: a second flush does not re-signal...
+		expect(
+			revived
+				.handleReestablish(opMsg)
+				.some((a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED)
+		).to.equal(false);
+		// ...but the NEXT reconnect re-arms the reminder while still owed.
+		revived.markForReestablish();
+		expect(
+			revived
+				.handleReestablish(opMsg)
+				.filter((a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED).length
+		).to.equal(1);
+
+		// The embedder re-drives with witnesses over the recorded funding tx
+		// and the exchange completes.
+		const accSig = revived.sendTxSignatures(
+			revived.getFullState().fundingTxid!,
+			revived.getFullState().fundingOutputIndex,
+			h.acceptorWitness()
+		);
+		expect(findError(accSig)).to.equal(null);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES);
+		expect(accTxSigs, 'the re-driven release leaves').to.not.equal(null);
+
+		// The LIVE opener now owes its own caller-driven witnesses: the same
+		// signal fires the moment the ordering gate opens.
+		const opAfterPeer = h.opener.handleTxSignatures(
+			decodeTxSignaturesMessage(accTxSigs!)
+		);
+		expect(findError(opAfterPeer)).to.equal(null);
+		expect(
+			opAfterPeer.filter(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			).length
+		).to.equal(1);
+		const opSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(opSig)).to.equal(null);
+		const opTxSigs = findPayload(opSig, MessageType.TX_SIGNATURES)!;
+		expect(
+			findError(revived.handleTxSignatures(decodeTxSignaturesMessage(opTxSigs)))
+		).to.equal(null);
+		expect(revived.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('a restarted second-signer surfaces the owed release when the peer signatures arrive (307)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Restart the OPENER: it signs second, so nothing is owed at
+		// reestablish; the obligation surfaces when the peer's tx_signatures
+		// arrive and the ordering gate opens.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		const revived = new Channel(deserializeChannelState(json), h.openerSigner);
+		revived.restoreV2InFlight();
+		revived.markForReestablish();
+		h.acceptor.markForReestablish();
+
+		const revMsg = reestablishOf(revived.createReestablish());
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		const revReestActions = revived.handleReestablish(acMsg);
+		expect(findError(revReestActions)).to.equal(null);
+		expect(
+			revReestActions.some(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			)
+		).to.equal(false);
+		expect(findError(h.acceptor.handleReestablish(revMsg))).to.equal(null);
+
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			h.acceptorWitness()
+		);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const revAfterPeer: any[] = revived.handleTxSignatures(
+			decodeTxSignaturesMessage(accTxSigs)
+		);
+		expect(findError(revAfterPeer)).to.equal(null);
+		const needed = revAfterPeer.filter(
+			(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+		);
+		expect(needed.length, 'the owed release surfaces').to.equal(1);
+		expect(needed[0].inputIndices).to.deep.equal([0]);
+
+		const revSig = revived.sendTxSignatures(
+			revived.getFullState().fundingTxid!,
+			revived.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(revSig)).to.equal(null);
+		const revTxSigs = findPayload(revSig, MessageType.TX_SIGNATURES)!;
+		expect(
+			findError(
+				h.acceptor.handleTxSignatures(decodeTxSignaturesMessage(revTxSigs))
+			)
+		).to.equal(null);
+		expect(revived.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('the manager relays channel:txsigs-needed after restore and provideTxSignatures completes the exchange (307)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Restart the acceptor INTO a ChannelManager, through the real restore
+		// path (signer rebuilt from the manager config, restoreV2InFlight and
+		// markForReestablish inside restoreChannel).
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.acceptor.getFullState()))
+		);
+		const revived = new Channel(deserializeChannelState(json));
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(
+				getPublicKey(crypto.randomBytes(32)),
+				crypto.randomBytes(32)
+			),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: h.acceptorFundingPriv
+		});
+		mgr.on('error', () => {});
+		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		mgr.restoreChannel(revived, peerHex);
+		expect(revived.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+
+		const outbound: Array<{ type: number; payload: Buffer }> = [];
+		mgr.on('message:outbound', (_p: string, type: number, payload: Buffer) => {
+			outbound.push({ type, payload });
+		});
+		const events: Array<{
+			channelId: Buffer;
+			fundingTxid: Buffer;
+			fundingOutputIndex: number;
+			inputIndices: number[];
+		}> = [];
+		let cbResult: { ok: boolean; error?: string } | null = null;
+		let cbResolved: boolean | null = null;
+		mgr.on(
+			'channel:txsigs-needed',
+			(
+				channelId: Buffer,
+				fundingTxid: Buffer,
+				fundingOutputIndex: number,
+				inputIndices: number[]
+			) => {
+				events.push({
+					channelId,
+					fundingTxid,
+					fundingOutputIndex,
+					inputIndices
+				});
+				// Restored channels live in the permanent map: resolvable.
+				cbResolved = mgr.getChannel(channelId) !== undefined;
+				// Answer synchronously inside the callback, through the public
+				// path an embedder uses.
+				cbResult = mgr.provideTxSignatures(
+					channelId,
+					fundingTxid,
+					fundingOutputIndex,
+					h.acceptorWitness()
+				);
+			}
+		);
+
+		h.opener.markForReestablish();
+		const opReest = findPayload(
+			h.opener.createReestablish(),
+			MessageType.CHANNEL_REESTABLISH
+		)!;
+		mgr.handleMessage(peerHex, MessageType.CHANNEL_REESTABLISH, opReest);
+
+		const record = revived.getFullState().v2InFlight!;
+		expect(events.length, 'the manager relayed the reminder').to.equal(1);
+		expect(events[0].channelId.equals(revived.getChannelId()!)).to.equal(true);
+		expect(events[0].fundingTxid.equals(record.fundingTxid)).to.equal(true);
+		expect(events[0].fundingOutputIndex).to.equal(record.fundingOutputIndex);
+		expect(events[0].inputIndices).to.deep.equal([1]);
+		expect(cbResolved, 'getChannel resolves a restored channel').to.equal(true);
+		expect(cbResult!.ok, cbResult!.error ?? '').to.equal(true);
+		const sigsOut = outbound.find((m) => m.type === MessageType.TX_SIGNATURES);
+		expect(
+			sigsOut,
+			'the re-driven tx_signatures left the manager'
+		).to.not.be.oneOf([null, undefined]);
+
+		// The live opener completes the exchange.
+		expect(
+			findError(
+				h.opener.handleTxSignatures(decodeTxSignaturesMessage(sigsOut!.payload))
+			)
+		).to.equal(null);
+		const opSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(opSig)).to.equal(null);
+		const opTxSigs = findPayload(opSig, MessageType.TX_SIGNATURES)!;
+		mgr.handleMessage(peerHex, MessageType.TX_SIGNATURES, opTxSigs);
+		expect(revived.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('provideTxSignatures resolves a temp-resident channel inside the pre-promotion callback (307)', () => {
+		const h = driveToCommitmentExchange();
+		// Both commitments crossed on the opener side only; the acceptor's
+		// arrives THROUGH the manager below, with the acceptor still living in
+		// the temporary map exactly as in the live open.
+		expect(
+			findError(
+				h.opener.handleCommitmentSigned(
+					decodeCommitmentSignedMessage(h.acceptorCommit)
+				)
+			)
+		).to.equal(null);
+
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(
+				getPublicKey(crypto.randomBytes(32)),
+				crypto.randomBytes(32)
+			),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		mgr.on('error', () => {});
+		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const tempIdHex = h.acceptor.getTemporaryChannelId().toString('hex');
+		(mgr as unknown as { tempChannels: Map<string, Channel> }).tempChannels.set(
+			tempIdHex,
+			h.acceptor
+		);
+		(mgr as unknown as { channelPeers: Map<string, string> }).channelPeers.set(
+			tempIdHex,
+			peerHex
+		);
+
+		const outbound: Array<{ type: number; payload: Buffer }> = [];
+		mgr.on('message:outbound', (_p: string, type: number, payload: Buffer) => {
+			outbound.push({ type, payload });
+		});
+		let cbResult: { ok: boolean; error?: string } | null = null;
+		let cbResolved: boolean | null = null;
+		mgr.on('channel:txsigs-needed', (channelId: Buffer) => {
+			// The live exchange emits BEFORE promotion, so the permanent id is
+			// not yet resolvable through getChannel...
+			cbResolved = mgr.getChannel(channelId) !== undefined;
+			// ...but the public response path must still work right here.
+			const record = h.acceptor.getFullState().v2InFlight!;
+			cbResult = mgr.provideTxSignatures(
+				channelId,
+				Buffer.from(record.fundingTxid),
+				record.fundingOutputIndex,
+				h.acceptorWitness()
+			);
+		});
+
+		mgr.handleMessage(peerHex, MessageType.COMMITMENT_SIGNED, h.openerCommit);
+
+		expect(cbResolved, 'the event fired before promotion').to.equal(false);
+		expect(cbResult, 'the reminder fired').to.not.equal(null);
+		expect(cbResult!.ok, cbResult!.error ?? '').to.equal(true);
+		const sigsOut = outbound.find((m) => m.type === MessageType.TX_SIGNATURES);
+		expect(sigsOut, 'the release left through the manager').to.not.be.oneOf([
+			null,
+			undefined
+		]);
+		expect(
+			mgr.getChannel(h.acceptor.getChannelId()!),
+			'the channel was promoted by the time the handler returned'
+		).to.not.equal(undefined);
+
+		// The live opener completes the exchange.
+		expect(
+			findError(
+				h.opener.handleTxSignatures(decodeTxSignaturesMessage(sigsOut!.payload))
+			)
+		).to.equal(null);
+		const opSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(opSig)).to.equal(null);
+		const opTxSigs = findPayload(opSig, MessageType.TX_SIGNATURES)!;
+		mgr.handleMessage(peerHex, MessageType.TX_SIGNATURES, opTxSigs);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('a failed persist suppresses channel:txsigs-needed; the reconnect re-arms it (307)', () => {
+		const h = driveToCommitmentExchange();
+		expect(
+			findError(
+				h.opener.handleCommitmentSigned(
+					decodeCommitmentSignedMessage(h.acceptorCommit)
+				)
+			)
+		).to.equal(null);
+
+		const mgr = new ChannelManager({
+			localBasepoints: makeBasepoints(
+				getPublicKey(crypto.randomBytes(32)),
+				crypto.randomBytes(32)
+			),
+			localPerCommitmentSeed: crypto.randomBytes(32),
+			localFundingPrivkey: crypto.randomBytes(32)
+		});
+		mgr.on('error', () => {});
+		const peerHex = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const tempIdHex = h.acceptor.getTemporaryChannelId().toString('hex');
+		(mgr as unknown as { tempChannels: Map<string, Channel> }).tempChannels.set(
+			tempIdHex,
+			h.acceptor
+		);
+		(mgr as unknown as { channelPeers: Map<string, string> }).channelPeers.set(
+			tempIdHex,
+			peerHex
+		);
+
+		let refusePersist = true;
+		mgr.on('channel:persist', (ev: { request?: { committed: boolean } }) => {
+			if (refusePersist && ev.request) {
+				ev.request.committed = false;
+			}
+		});
+		let events = 0;
+		mgr.on('channel:txsigs-needed', () => {
+			events++;
+		});
+
+		// The batch whose persist failed may have withheld our own
+		// commitment_signed; a listener answering the reminder would put
+		// tx_signatures on the wire ahead of it, so the reminder is withheld
+		// with the sends.
+		mgr.handleMessage(peerHex, MessageType.COMMITMENT_SIGNED, h.openerCommit);
+		expect(events, 'a failed persist suppresses the reminder').to.equal(0);
+
+		// Persistence recovers and the peer reconnects: the reminder fires.
+		refusePersist = false;
+		mgr.handlePeerDisconnected(peerHex);
+		h.opener.markForReestablish();
+		const opReest = findPayload(
+			h.opener.createReestablish(),
+			MessageType.CHANNEL_REESTABLISH
+		)!;
+		mgr.handleMessage(peerHex, MessageType.CHANNEL_REESTABLISH, opReest);
+		expect(events, 'the reconnect re-armed the reminder').to.equal(1);
 	});
 
 	it('deserializes a legacy state without a record to null and drops it deterministically', () => {

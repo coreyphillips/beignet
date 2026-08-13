@@ -29,7 +29,8 @@ export enum ChannelActionType {
 	PROPOSE_CLOSING_FEE = 'PROPOSE_CLOSING_FEE',
 	/** Persist channel state before sending messages (Fix 2.2) */
 	PERSIST_STATE = 'PERSIST_STATE',
-	SPLICE_COMPLETE = 'SPLICE_COMPLETE'
+	SPLICE_COMPLETE = 'SPLICE_COMPLETE',
+	TX_SIGNATURES_NEEDED = 'TX_SIGNATURES_NEEDED'
 }
 
 export interface ISendMessageAction {
@@ -180,6 +181,26 @@ export interface IPersistStateAction {
  *  a NEW funding outpoint and must be re-announced with its new SCID. */
 export interface ISpliceCompleteAction {
 	type: ChannelActionType.SPLICE_COMPLETE;
+}
+
+/**
+ * A caller-driven v2 open owes its tx_signatures and the release is due NOW:
+ * the commitment round is complete and the interactive-tx ordering allows the
+ * send, but the witnesses only ever arrive via sendTxSignatures and none are
+ * pending. In particular, after a restart the pending witnesses died with the
+ * process while the durable record only carries our input indices, so without
+ * this signal the open stalls until the embedder re-drives on its own
+ * (issue 307). Emitted once per connection cycle. The caller answers by
+ * calling sendTxSignatures with witnesses over the recorded funding tx;
+ * state.v2InFlight carries fundingTxHex and inputPrevouts to re-sign against.
+ */
+export interface ITxSignaturesNeededAction {
+	type: ChannelActionType.TX_SIGNATURES_NEEDED;
+	channelId: Buffer;
+	fundingTxid: Buffer;
+	fundingOutputIndex: number;
+	/** The negotiated tx input indices our witnesses must cover. */
+	inputIndices: number[];
 }
 
 /**
@@ -402,4 +423,5 @@ export type ChannelAction =
 	| IAnnouncementReadyAction
 	| IProposeClosingFeeAction
 	| IPersistStateAction
-	| ISpliceCompleteAction;
+	| ISpliceCompleteAction
+	| ITxSignaturesNeededAction;

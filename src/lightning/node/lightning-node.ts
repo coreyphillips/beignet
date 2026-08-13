@@ -2647,6 +2647,32 @@ export class LightningNode extends EventEmitter {
 			}
 		);
 
+		// A caller-driven v2 open owes its tx_signatures and only the embedder
+		// holds the witnesses (issue 307): relay the reminder so it can answer
+		// with sendTxSignatures.
+		this.channelManager.on(
+			'channel:txsigs-needed',
+			(
+				channelId: Buffer,
+				fundingTxid: Buffer,
+				fundingOutputIndex: number,
+				inputIndices: number[]
+			) => {
+				this.emit('channel:txsigs-needed', {
+					channelId,
+					fundingTxid,
+					fundingOutputIndex,
+					inputIndices
+				});
+				this.emitStructuredLog('channel', 'txsigs_needed', {
+					channelId: channelId.toString('hex'),
+					fundingTxid: fundingTxid.toString('hex'),
+					fundingOutputIndex,
+					inputIndices
+				});
+			}
+		);
+
 		this.channelManager.on(
 			'channel:pending-close',
 			(channelId: Buffer, initiator: 'local' | 'remote') => {
@@ -7418,6 +7444,58 @@ export class LightningNode extends EventEmitter {
 		if (!result.ok) {
 			this.emit('node:error', {
 				code: 'CLOSE_CHANNEL_FAILED',
+				channelId,
+				message: result.error!,
+				timestamp: Date.now()
+			} as ILightningError);
+			return { ok: false, error: result.error };
+		}
+		return { ok: true };
+	}
+
+	/**
+	 * Provide the caller-owed tx_signatures witnesses for a v2 open: the
+	 * public answer to the channel:txsigs-needed event (issue 307). The
+	 * witnesses cover the input indices the event carried, signed over the
+	 * recorded funding tx (the channel's v2InFlight record holds
+	 * fundingTxHex and inputPrevouts to re-sign against after a restart).
+	 * @param channelId - 32-byte channel ID from the event
+	 * @param txid - funding txid from the event (internal byte order)
+	 * @param outputIndex - funding output index from the event
+	 * @param witnesses - one witness stack per owed input, in index order
+	 */
+	sendTxSignatures(
+		channelId: Buffer,
+		txid: Buffer,
+		outputIndex: number,
+		witnesses: Buffer[][]
+	): { ok: boolean; error?: string } {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) throw new Error(cidErr);
+		const txidErr = validateBuffer(txid, 32, 'txid');
+		if (txidErr) throw new Error(txidErr);
+		if (!Number.isInteger(outputIndex) || outputIndex < 0) {
+			throw new Error(
+				`outputIndex must be a non-negative integer, got ${outputIndex}`
+			);
+		}
+		if (
+			!Array.isArray(witnesses) ||
+			witnesses.some(
+				(w) => !Array.isArray(w) || w.some((b) => !Buffer.isBuffer(b))
+			)
+		) {
+			throw new Error('witnesses must be an array of Buffer arrays');
+		}
+		const result = this.channelManager.provideTxSignatures(
+			channelId,
+			txid,
+			outputIndex,
+			witnesses
+		);
+		if (!result.ok) {
+			this.emit('node:error', {
+				code: 'SEND_TX_SIGNATURES_FAILED',
 				channelId,
 				message: result.error!,
 				timestamp: Date.now()

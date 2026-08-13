@@ -577,6 +577,12 @@ export class Channel {
 	// Set once our v2 tx_signatures witnesses have been provided to the
 	// session, so later flushes never re-provide.
 	private _v2TxSigsReleased = false;
+	// One-shot latch for TX_SIGNATURES_NEEDED: the caller-owed release is
+	// signaled once per connection cycle (markForReestablish re-arms it), not
+	// on every flush. In-memory only; a restart re-arms it, which is the
+	// point (issue 307): the pending witnesses died with the process and the
+	// embedder must be told to re-drive sendTxSignatures.
+	private _v2CallerTxSigsSignaled = false;
 	// Our un-acked tx_init_rbf (feerate/locktime it proposed, and the
 	// recorded funding txid it was bound to; the ack revalidates the
 	// binding). Connection scoped: BOLT 2 starts the renegotiation only at
@@ -5671,6 +5677,10 @@ export class Channel {
 			this._state.state === ChannelState.AWAITING_TX_SIGNATURES ||
 			this._state.state === ChannelState.DUAL_FUNDING_V2
 		) {
+			// A new connection cycle: re-arm the caller-owed release signal so
+			// the next reestablish reminds the embedder while witnesses are
+			// still owed (issue 307).
+			this._v2CallerTxSigsSignaled = false;
 			// Phase-aware, mirroring the SPLICING block below: BOLT 2's boundary
 			// for a v2 open is the initial commitment_signed. Before it the open
 			// is not resumable (the interactive-tx negotiation dies with the
@@ -11694,6 +11704,7 @@ export class Channel {
 		this._v2ReceivedCommitment = false;
 		this._v2PendingTxSigs = null;
 		this._v2TxSigsReleased = false;
+		this._v2CallerTxSigsSignaled = false;
 	}
 
 	/**
@@ -11981,8 +11992,7 @@ export class Channel {
 			) {
 				// The record was created at the commitment point with our inputs
 				// already signed (or with none to sign): release those witnesses
-				// verbatim. Empty witnesses beside non-empty indices mean the
-				// caller-driven flow still owes them — fall through and wait.
+				// verbatim.
 				this._v2PendingTxSigs = {
 					txid: Buffer.from(record.fundingTxid),
 					outputIndex: record.fundingOutputIndex,
@@ -11990,7 +12000,26 @@ export class Channel {
 						w.map((b) => Buffer.from(b))
 					)
 				};
-			} else if (!record && this._dualFundingContribution) {
+			} else if (record) {
+				// Empty witnesses beside non-empty indices: the caller-driven
+				// flow still owes them via sendTxSignatures. Every other release
+				// gate has passed, so the send is due NOW and only the caller
+				// can supply the bytes. Surface the obligation once per
+				// connection cycle instead of waiting silently: after a restart
+				// the pending witnesses died with the process and nothing else
+				// tells the embedder to re-drive (issue 307).
+				if (this._v2CallerTxSigsSignaled) return [];
+				this._v2CallerTxSigsSignaled = true;
+				return [
+					{
+						type: ChannelActionType.TX_SIGNATURES_NEEDED,
+						channelId: this._v2ChannelId(),
+						fundingTxid: Buffer.from(record.fundingTxid),
+						fundingOutputIndex: record.fundingOutputIndex,
+						inputIndices: [...record.ourWalletInputIndices]
+					}
+				];
+			} else if (this._dualFundingContribution) {
 				// No record yet (legacy path): sign our wallet inputs over the
 				// negotiated tx via their closures, exactly like splice-in.
 				const built = this._v2NegotiatedTx();
