@@ -354,7 +354,11 @@ export class PeerManager extends EventEmitter {
 		} catch (err) {
 			// Restore the last-known-good address (keep the attempted one only
 			// when there was no previous address, so initial connects still retry).
-			if (previousAddress) {
+			// This dial owns the rollback only while its own entry is still the
+			// stored one: a concurrent newer dial may have stored a fresh address,
+			// and restoring over it would poison every future reconnect with the
+			// stale snapshot.
+			if (previousAddress && this.peerAddresses.get(pubkey) === addressEntry) {
 				this.peerAddresses.set(pubkey, previousAddress);
 			}
 			// A dial aborted BY the cancellation is reported as the typed
