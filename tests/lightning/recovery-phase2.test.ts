@@ -180,6 +180,20 @@ function makeJournaledManager(
 	return { manager, journal };
 }
 
+/** Proxy hiding one method, so the backend reads as not implementing it. */
+function stripMethod(
+	storage: SqliteStorage,
+	method: keyof IStorageBackend
+): IStorageBackend {
+	return new Proxy(storage, {
+		get(target, prop, receiver): unknown {
+			if (prop === method) return undefined;
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === 'function' ? value.bind(target) : value;
+		}
+	}) as IStorageBackend;
+}
+
 /**
  * Generate one randomized safety transition. Covers every mutation variant
  * over a few recurring keys (so deletes hit rows that exist) and outbox rows
@@ -846,6 +860,138 @@ describe('Recovery phase 2: journal append', () => {
 		expect(journalSupported(noCompact)).to.equal(false);
 		expect(journalSupported(storage)).to.equal(true);
 		storage.close();
+	});
+
+	it('journalSupported requires the invoice path_id pair', () => {
+		const storage = openStorage();
+		// A backend that cannot persist or enumerate BOLT 12 path_ids would
+		// snapshot or restore claimable preimages whose invoices can never
+		// be authenticated, so it must not qualify for journaling (#316).
+		expect(
+			journalSupported(stripMethod(storage, 'saveInvoicePathId'))
+		).to.equal(false);
+		expect(
+			journalSupported(stripMethod(storage, 'loadAllInvoicePathIds'))
+		).to.equal(false);
+		storage.close();
+	});
+
+	it('refuses snapshot-carried path_ids on a target that cannot persist them', () => {
+		const live = openStorage();
+		// Present before the first commit, so the bootstrap snapshot
+		// carries the row.
+		live.saveInvoicePathId('ab'.repeat(32), Buffer.alloc(32, 5));
+		const { manager, journal } = makeJournaledManager(live);
+		const rand = mulberry32(316);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, [prngBytes(rand, 32)])
+		});
+		const frames = journal.loadVerifiedFrames();
+		expect(frames[0].snapshot!.invoicePathIds).to.have.length(1);
+		const target = openStorage();
+		expect(() =>
+			reconstructFromFrames(stripMethod(target, 'saveInvoicePathId'), frames)
+		).to.throw(/path_id/);
+		// The refusal fired before the first write.
+		expect(target.loadAllChannels()).to.have.length(0);
+		expect(target.loadAllPreimages()).to.have.length(0);
+		live.close();
+		target.close();
+	});
+
+	it('refuses a post-snapshot path_id delta on a target that cannot persist it', () => {
+		const live = openStorage();
+		const { manager, journal } = makeJournaledManager(live);
+		const rand = mulberry32(317);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, [prngBytes(rand, 32)])
+		});
+		const delta = manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'invoice_path_id',
+					paymentHash: 'cd'.repeat(32),
+					pathId: Buffer.alloc(32, 7)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(delta.committed).to.equal(true);
+		const frames = journal.loadVerifiedFrames();
+		const target = openStorage();
+		expect(() =>
+			reconstructFromFrames(stripMethod(target, 'saveInvoicePathId'), frames)
+		).to.throw(/Reconstruction failed replaying frame .*path_id/);
+		live.close();
+		target.close();
+	});
+
+	it('refuses a target that can write path_ids but cannot enumerate them', () => {
+		const live = openStorage();
+		const { manager, journal } = makeJournaledManager(live);
+		const rand = mulberry32(318);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, [prngBytes(rand, 32)])
+		});
+		const frames = journal.loadVerifiedFrames();
+		const target = openStorage();
+		// Rows such a target holds are invisible to the emptiness scan, so
+		// it must not be vouched for as empty.
+		expect(() =>
+			reconstructFromFrames(
+				stripMethod(target, 'loadAllInvoicePathIds'),
+				frames
+			)
+		).to.throw(/cannot enumerate/);
+		live.close();
+		target.close();
+	});
+
+	it('reconstruction restores path_id rows byte for byte', () => {
+		const live = openStorage();
+		const snapshotRow = {
+			hash: 'ab'.repeat(32),
+			pathId: crypto.createHash('sha256').update('path-a').digest()
+		};
+		const deltaRow = {
+			hash: 'cd'.repeat(32),
+			pathId: crypto.createHash('sha256').update('path-b').digest()
+		};
+		live.saveInvoicePathId(snapshotRow.hash, snapshotRow.pathId);
+		const { manager, journal } = makeJournaledManager(live);
+		const rand = mulberry32(319);
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			...randomTransition(rand, [prngBytes(rand, 32)])
+		});
+		manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'invoice_path_id',
+					paymentHash: deltaRow.hash,
+					pathId: deltaRow.pathId
+				}
+			],
+			outboundMessages: []
+		});
+		const rebuilt = openStorage();
+		reconstructFromFrames(rebuilt, journal.loadVerifiedFrames());
+		// Asserted directly, not via dumpTables: its own optional-chained
+		// loader would compare empty against empty and mask a drop.
+		const rows = rebuilt.loadAllInvoicePathIds();
+		const byHash = new Map(rows.map((r) => [r.paymentHashHex, r.pathId]));
+		expect(rows).to.have.length(2);
+		expect(byHash.get(snapshotRow.hash)!.equals(snapshotRow.pathId)).to.equal(
+			true
+		);
+		expect(byHash.get(deltaRow.hash)!.equals(deltaRow.pathId)).to.equal(true);
+		live.close();
+		rebuilt.close();
 	});
 });
 

@@ -418,6 +418,13 @@ export function journalSupported(storage: IStorageBackend): boolean {
 		// channels would hand reconstruction a reset next-index and reopen
 		// key reuse, so it does not get a journal at all.
 		typeof storage.loadAllChannelKeyIndices === 'function' &&
+		// Snapshots must carry EVERY BOLT 12 invoice path_id row and a
+		// restore must be able to write them back: a backend that cannot
+		// persist or enumerate path_ids would restore claimable preimages
+		// whose invoices can never be authenticated (every incoming HTLC
+		// fails payment_path_id_mismatch), so it does not get a journal.
+		typeof storage.saveInvoicePathId === 'function' &&
+		typeof storage.loadAllInvoicePathIds === 'function' &&
 		// The write gate's empty-store scan must be able to see EVERY
 		// metadata key: a backend that cannot enumerate cannot reveal
 		// unknown residue of destroyed history, so it does not get a
@@ -1686,7 +1693,8 @@ export class RecoveryJournal implements IRecoveryJournalSink {
 				paymentHash: i.paymentHashHex,
 				invoice: i.invoice
 			})),
-			invoicePathIds: (storage.loadAllInvoicePathIds?.() ?? []).map((i) => ({
+			// journalSupported() made the enumeration mandatory.
+			invoicePathIds: storage.loadAllInvoicePathIds!().map((i) => ({
 				paymentHash: i.paymentHashHex,
 				pathId: i.pathId
 			})),
@@ -2057,6 +2065,19 @@ export function assertNoJournalResidue(target: IStorageBackend): void {
 
 /** Throw when the reconstruction target already holds journaled state. */
 export function assertEmptyTarget(target: IStorageBackend): void {
+	// A target that can write path_id rows but cannot enumerate them could
+	// hold rows this scan cannot see; refuse to vouch for its emptiness. A
+	// target lacking BOTH methods genuinely cannot hold rows, so the ?? []
+	// below stays sound for that shape (issue #316).
+	if (
+		typeof target.saveInvoicePathId === 'function' &&
+		typeof target.loadAllInvoicePathIds !== 'function'
+	) {
+		throw new Error(
+			'restore target can write invoice path_id rows but cannot ' +
+				'enumerate them; refusing to treat its path_id table as empty'
+		);
+	}
 	// A corrupt row is skipped by the forgiving loaders, so without the
 	// counter check a target holding undecodable rows would read as empty
 	// and the restore would proceed over them (issue #317).
@@ -2099,6 +2120,21 @@ function applySnapshot(
 	target: IStorageBackend,
 	snapshot: RecoverySnapshot
 ): void {
+	// Fail before the first write: silently dropping these rows would
+	// restore claimable preimages whose invoices can never be authenticated
+	// (issue #316). Belt to journalSupported()'s braces, for callers that
+	// reach reconstruction without the structural gate.
+	if (
+		snapshot.invoicePathIds.length > 0 &&
+		typeof target.saveInvoicePathId !== 'function'
+	) {
+		throw new Error(
+			`recovery reconstruction: the snapshot carries ` +
+				`${snapshot.invoicePathIds.length} BOLT 12 invoice path_id row(s) ` +
+				`the target cannot persist; restoring would leave claimable ` +
+				`invoices without their authentication path_id`
+		);
+	}
 	// Joins the caller's transaction when one is active (a capsule install
 	// wraps the whole restore in one); opens its own otherwise.
 	withStorageTransaction(target, () => {
@@ -2133,7 +2169,7 @@ function applySnapshot(
 			target.saveInvoice(i.paymentHash, i.invoice);
 		}
 		for (const i of snapshot.invoicePathIds) {
-			target.saveInvoicePathId?.(i.paymentHash, i.pathId);
+			target.saveInvoicePathId!(i.paymentHash, i.pathId);
 		}
 		for (const event of snapshot.forwardingEvents) {
 			target.saveForwardingEvent?.(event);

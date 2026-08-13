@@ -94,6 +94,12 @@ export interface IStorageBackend {
 	 * the receive-side authentication analogue of a BOLT 11 payment secret.
 	 * Written in the same transaction as the invoice's preimage so
 	 * authentication state can never be lost while the payment stays claimable.
+	 *
+	 * save/loadAll are optional in the TYPE so partial test backends keep
+	 * compiling, but MANDATORY for journal-capable storage: journalSupported()
+	 * refuses a backend without them, because a snapshot or restore that drops
+	 * path_ids leaves claimable BOLT 12 invoices permanently unpayable (every
+	 * incoming HTLC fails payment_path_id_mismatch), silently (issue #316).
 	 */
 	saveInvoicePathId?(paymentHashHex: string, pathId: Buffer): void;
 	loadAllInvoicePathIds?(): Array<{ paymentHashHex: string; pathId: Buffer }>;

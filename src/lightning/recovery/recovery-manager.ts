@@ -404,7 +404,17 @@ export class RecoveryManager {
 				this.storage.deleteInvoice(mutation.paymentHash);
 				break;
 			case 'invoice_path_id':
-				this.storage.saveInvoicePathId?.(mutation.paymentHash, mutation.pathId);
+				// Silently dropping the row would commit a claimable invoice
+				// that can never be authenticated (issue #316); throwing here
+				// rolls the whole mutation set back instead.
+				if (typeof this.storage.saveInvoicePathId !== 'function') {
+					throw new Error(
+						'recovery: storage cannot persist a BOLT 12 invoice ' +
+							'path_id; refusing to commit a claimable invoice ' +
+							'without its authentication path_id'
+					);
+				}
+				this.storage.saveInvoicePathId(mutation.paymentHash, mutation.pathId);
 				break;
 			case 'delete_invoice_path_id':
 				this.storage.deleteInvoicePathId(mutation.paymentHash);

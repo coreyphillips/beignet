@@ -460,6 +460,40 @@ describe('Recovery phase 1: safety transition atomicity', () => {
 		expect(result.released).to.have.length(0);
 	});
 
+	it('rolls back the whole set when storage cannot persist a path_id', () => {
+		// A backend without saveInvoicePathId must not silently drop the
+		// row: the invoice would commit claimable but never authenticable
+		// (#316). The whole mutation set rolls back instead.
+		const stripped = new Proxy(storage, {
+			get(target, prop, receiver): unknown {
+				if (prop === 'saveInvoicePathId') return undefined;
+				const value = Reflect.get(target, prop, receiver);
+				return typeof value === 'function' ? value.bind(target) : value;
+			}
+		}) as IStorageBackend;
+		const manager = new RecoveryManager(stripped);
+		const hashHex = '66'.repeat(32);
+		const result = manager.commit({
+			criticality: RecoveryCriticality.SafetyCritical,
+			mutations: [
+				{
+					type: 'payment_preimage',
+					paymentHash: hashHex,
+					preimage: Buffer.alloc(32, 6)
+				},
+				{
+					type: 'invoice_path_id',
+					paymentHash: hashHex,
+					pathId: Buffer.alloc(32, 7)
+				}
+			],
+			outboundMessages: []
+		});
+		expect(result.committed).to.equal(false);
+		expect(result.error?.message).to.match(/path_id/);
+		expect(storage.loadPreimage(hashHex), 'rolled back').to.equal(null);
+	});
+
 	it('reports the failure through onError without throwing', () => {
 		const seen: Error[] = [];
 		const manager = new RecoveryManager(
