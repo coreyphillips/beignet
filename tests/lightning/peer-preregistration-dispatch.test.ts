@@ -873,6 +873,198 @@ describe('Peer held post-handshake delivery', function () {
 		}
 	});
 
+	it('a throwing peer:disconnect observer does not leak the inbound replacement', async function () {
+		// Newest-wins replacement emits peer:disconnect for the old
+		// connection synchronously. An observer that THROWS (rather than
+		// cancels) must not unwind into the replacement path: the fresh
+		// inbound would end up neither registered nor disconnected, with no
+		// listeners attached, leaking until its ping timeout (issue #319).
+		const a = new LightningNode(makeNodeConfig(93));
+		const b = new LightningNode(makeNodeConfig(94));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await a.listen(0, '127.0.0.1');
+			const port = (
+				a as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// First inbound registers normally.
+			await b.connectPeer(a.getNodeId(), '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(pmA.peers.size, 'the first inbound registered').to.equal(1);
+			const observerErrors: string[] = [];
+			a.on('peer:error', (_pubkey: string, err: Error) => {
+				observerErrors.push(err.message);
+			});
+			a.on('peer:disconnect', () => {
+				throw new Error('disconnect observer exploded');
+			});
+			// A SECOND inbound from the same identity triggers newest-wins.
+			const raw = new Peer({
+				localPrivateKey: crypto
+					.createHash('sha256')
+					.update(makeSeed(94))
+					.update(Buffer.from('node-identity'))
+					.digest(),
+				remotePublicKey: Buffer.from(a.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port
+			});
+			raw.on('error', () => {});
+			await raw.connect().catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(
+				pmA.peers.size,
+				'the replacement was registered despite the throwing observer'
+			).to.equal(1);
+			expect(
+				observerErrors,
+				'the observer failure surfaced as peer:error'
+			).to.include('disconnect observer exploded');
+			raw.disconnect();
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a throwing peer:disconnect observer does not leak the outbound race winner', async function () {
+		// The outbound twin: an inbound registers WHILE our outbound
+		// handshake is in flight, our outbound wins the cross-direction
+		// tie-break and tears the inbound down. An observer throwing during
+		// that teardown must not unwind before the registration at the end
+		// of dialPeer: the dial would reject with the observer's error and
+		// the fresh socket would leak un-registered (issue #319).
+		const x = new LightningNode(makeNodeConfig(95));
+		const y = new LightningNode(makeNodeConfig(96));
+		x.on('node:error', () => {});
+		y.on('node:error', () => {});
+		const realConnect = Peer.prototype.connect;
+		try {
+			// The SMALLER pubkey side prefers its outbound in the tie-break.
+			const [small, big] = x.getNodeId() < y.getNodeId() ? [x, y] : [y, x];
+			const pmSmall = (
+				small as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await small.listen(0, '127.0.0.1');
+			await big.listen(0, '127.0.0.1');
+			const smallPort = (
+				small as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			const bigPort = (
+				big as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			small.on('peer:disconnect', () => {
+				throw new Error('disconnect observer exploded');
+			});
+			// After small's outbound handshake completes but BEFORE the
+			// manager registers it, an inbound bearing BIG'S identity
+			// occupies the registration: the exact cross-dial window.
+			const nodeKeyOf = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from('node-identity'))
+					.digest();
+			const bigKey = [95, 96]
+				.map(nodeKeyOf)
+				.find((k) => getPublicKey(k).toString('hex') === big.getNodeId())!;
+			const raw = new Peer({
+				localPrivateKey: bigKey,
+				remotePublicKey: Buffer.from(small.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port: smallPort
+			});
+			raw.on('error', () => {});
+			let armed = true;
+			Peer.prototype.connect = async function (this: Peer): Promise<void> {
+				await realConnect.apply(this);
+				if (armed && this.remotePublicKey.toString('hex') === big.getNodeId()) {
+					armed = false;
+					await realConnect.apply(raw);
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+			};
+			let rejection: Error | null = null;
+			await small
+				.connectPeer(big.getNodeId(), '127.0.0.1', bigPort)
+				.catch((err) => {
+					rejection = err instanceof Error ? err : new Error(String(err));
+				});
+			expect(rejection, 'the dial resolved despite the throwing observer').to.be
+				.null;
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(pmSmall.peers.size, 'the race winner was registered').to.equal(1);
+			raw.disconnect();
+		} finally {
+			Peer.prototype.connect = realConnect;
+			x.destroy();
+			y.destroy();
+		}
+	});
+
+	it('a throwing peer:disconnect observer does not cancel the reconnect on natural close', async function () {
+		// The close handler schedules the auto-reconnect AFTER the
+		// peer:disconnect emit. A throwing observer must not unwind past
+		// that scheduling (silently cancelling the reconnect) or escape
+		// uncaught into the socket event loop.
+		const a = new LightningNode(makeNodeConfig(91));
+		const b = new LightningNode(makeNodeConfig(92));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size).to.equal(1);
+			a.on('peer:disconnect', () => {
+				throw new Error('disconnect observer exploded');
+			});
+			// Natural close from the REMOTE side. The reconnect delay floor
+			// (1s base, minus 25% jitter) keeps the timer pending well past
+			// the assertion below.
+			b.disconnectPeer(a.getNodeId());
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(pmA.peers.size, 'the close bookkeeping completed').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the reconnect was still scheduled'
+			).to.equal(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
 	it('a reconnect round cancelled mid-round neither redials nor reschedules', async function () {
 		// disconnectPeer clears the PENDING timer, but a round already past
 		// that point keeps running: it must check the cancellation before

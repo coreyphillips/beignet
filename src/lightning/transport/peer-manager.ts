@@ -536,7 +536,32 @@ export class PeerManager extends EventEmitter {
 			this.inboundPeerCount--;
 		}
 		captureWireEvent('close', pubkey);
-		this.emit('peer:disconnect', pubkey);
+		this.emitPeerDisconnect(pubkey);
+	}
+
+	/**
+	 * Emit peer:disconnect FULLY contained. The emit happens mid-teardown
+	 * (collision replacement, disconnectPeer, the close handler): a throwing
+	 * observer must not unwind into that bookkeeping, where it would leave
+	 * the replacement socket neither registered nor disconnected, or skip
+	 * the reconnect scheduling. Observer failures surface as peer:error,
+	 * itself best-effort.
+	 */
+	private emitPeerDisconnect(pubkey: string): void {
+		try {
+			this.emit('peer:disconnect', pubkey);
+		} catch (err) {
+			try {
+				this.emit(
+					'peer:error',
+					pubkey,
+					err instanceof Error ? err : new Error(String(err))
+				);
+			} catch {
+				// The error observer threw too; the teardown already
+				// completed, which is the outcome that matters.
+			}
+		}
 	}
 
 	/**
@@ -1245,7 +1270,7 @@ export class PeerManager extends EventEmitter {
 			// good, and a timer scheduled after that would adopt the
 			// post-cancellation generation and dial anyway.
 			const closeGeneration = this.cancelGenerations.get(pubkey) ?? 0;
-			this.emit('peer:disconnect', pubkey);
+			this.emitPeerDisconnect(pubkey);
 
 			if (
 				this.autoReconnect &&
