@@ -12,8 +12,12 @@
 import { expect } from 'chai';
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
+import net from 'net';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
-import { PeerManager } from '../../src/lightning/transport/peer-manager';
+import {
+	PeerManager,
+	PeerDialCancelledError
+} from '../../src/lightning/transport/peer-manager';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import {
 	encodeNodeAnnouncementMessage,
@@ -451,6 +455,34 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 		peers: Map<string, unknown>;
 		inboundPeerSet: Set<string>;
 		inboundPeerCount: number;
+		peerAddresses: Map<string, { host: string; port: number }>;
+	}
+
+	/**
+	 * A TCP endpoint that accepts connections but never responds, so a noise
+	 * handshake dialed at it stalls until aborted or the socket is destroyed.
+	 */
+	async function hangingServer(): Promise<{
+		port: number;
+		close(): void;
+	}> {
+		const sockets: net.Socket[] = [];
+		const server = net.createServer((socket) => {
+			sockets.push(socket);
+		});
+		await new Promise<void>((resolve) => {
+			server.listen(0, '127.0.0.1', resolve);
+		});
+		let closed = false;
+		return {
+			port: (server.address() as net.AddressInfo).port,
+			close: (): void => {
+				if (closed) return;
+				closed = true;
+				for (const socket of sockets) socket.destroy();
+				server.close();
+			}
+		};
 	}
 
 	it('larger-pubkey side: an outbound dial losing the race to an inbound connection is discarded', async function () {
@@ -758,6 +790,209 @@ describe('PeerManager: simultaneous cross-dial handling', function () {
 			pmA.destroy();
 			pmB.destroy();
 			pmB2.destroy();
+		}
+	});
+
+	it('a cancelled dial must not roll back the address a newer dial stored', async function () {
+		this.timeout(20_000);
+		// Regression for #318: dialPeer restores its previousAddress snapshot
+		// on failure. An older dial cancelled while a newer dial is in flight
+		// must not restore its stale snapshot over the newer dial's address,
+		// or every future reconnect dials the stale address.
+		const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+		const hangOld = await hangingServer();
+		const hangNew = await hangingServer();
+		const remotePub = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const internal = pm as unknown as IPmInternal;
+		try {
+			// Last-known-good address from an earlier successful connect.
+			internal.peerAddresses.set(remotePub, {
+				host: '203.0.113.1',
+				port: 9735
+			});
+
+			// Dial 1 stalls in its handshake, then is cancelled; its rejection
+			// lands on a later tick.
+			const dial1 = internal.dialPeer(remotePub, '127.0.0.1', hangOld.port);
+			const settled1 = dial1.then(
+				() => undefined,
+				(err: unknown) => err
+			);
+			pm.disconnectPeer(remotePub);
+
+			// Dial 2 starts before dial 1's rejection lands and stores the
+			// fresh address synchronously. Its own outcome is irrelevant.
+			void internal
+				.dialPeer(remotePub, '127.0.0.1', hangNew.port)
+				.catch(() => {});
+
+			expect(await settled1).to.be.instanceOf(PeerDialCancelledError);
+
+			// The cancelled dial's rollback must not clobber dial 2's address.
+			expect(pm.getPeerAddress(remotePub)).to.deep.equal({
+				host: '127.0.0.1',
+				port: hangNew.port
+			});
+		} finally {
+			pm.destroy();
+			hangOld.close();
+			hangNew.close();
+		}
+	});
+
+	it('an older dial failing late must not clobber the newer connected address', async function () {
+		this.timeout(20_000);
+		// Regression for #318, organic-failure flavor: an older slow dial that
+		// fails after a newer dial already connected must not overwrite the
+		// live peer's address with its stale previousAddress snapshot.
+		const { lowKey, lowPub, highKey } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: highKey });
+		const pmB = new PeerManager({ localPrivateKey: lowKey });
+		const hang = await hangingServer();
+		try {
+			await pmB.listen(0);
+			const bPort = pmPort(pmB);
+			const internal = pmA as unknown as IPmInternal;
+			// Last-known-good address from an earlier successful connect.
+			internal.peerAddresses.set(lowPub, {
+				host: '203.0.113.1',
+				port: 9735
+			});
+
+			// Dial 1 stalls against a mute endpoint while dial 2 to the peer's
+			// current address completes and registers.
+			const dial1 = internal.dialPeer(lowPub, '127.0.0.1', hang.port);
+			const settled1 = dial1.then(
+				() => 'resolved',
+				() => 'rejected'
+			);
+			await internal.dialPeer(lowPub, '127.0.0.1', bPort);
+			expect(pmA.listPeers().length).to.equal(1);
+
+			// The stalled dial now fails organically (endpoint drops it).
+			hang.close();
+			expect(await settled1).to.equal('rejected');
+
+			// The connected peer's address survives the older dial's failure.
+			expect(pmA.getPeerAddress(lowPub)).to.deep.equal({
+				host: '127.0.0.1',
+				port: bPort
+			});
+			expect(pmA.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			hang.close();
+		}
+	});
+
+	it('rollbacks compose across three overlapping dials', async function () {
+		this.timeout(20_000);
+		// Regression for the #318 review finding: with known-good A0 and
+		// three overlapping dials storing A1, A2, A3 that fail in D2, D3,
+		// D1 order, per-dial snapshots would let D3 restore the already-
+		// failed A2 (D2 and D1 skip: they no longer own the stored entry).
+		// Every all-fail ordering must end back at A0.
+		const pm = new PeerManager({ localPrivateKey: crypto.randomBytes(32) });
+		const hangs = [
+			await hangingServer(),
+			await hangingServer(),
+			await hangingServer()
+		];
+		const remotePub = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const internal = pm as unknown as IPmInternal;
+		try {
+			// Last-known-good address from an earlier successful connect.
+			internal.peerAddresses.set(remotePub, {
+				host: '203.0.113.1',
+				port: 9735
+			});
+
+			// The dials store their attempts in D1, D2, D3 order.
+			const settled = hangs.map((h) =>
+				internal.dialPeer(remotePub, '127.0.0.1', h.port).then(
+					() => 'resolved',
+					() => 'rejected'
+				)
+			);
+
+			// Fail D2, then D3, then D1, awaiting each settlement so the
+			// rollback interleaving is deterministic.
+			for (const i of [1, 2, 0]) {
+				hangs[i].close();
+				expect(await settled[i]).to.equal('rejected');
+			}
+
+			expect(pm.getPeerAddress(remotePub)).to.deep.equal({
+				host: '203.0.113.1',
+				port: 9735
+			});
+		} finally {
+			pm.destroy();
+			for (const h of hangs) h.close();
+		}
+	});
+
+	it('a mid-burst success is what later overlapping failures fall back to', async function () {
+		this.timeout(20_000);
+		// A dial that connects while other dials are still in flight proves
+		// its address: the map must report it immediately (listPeers and the
+		// peer:connect persistence read it), and later overlapping failures
+		// must not roll back past it to the pre-burst address.
+		const { lowKey, lowPub, highKey } = orderedKeyPair();
+		const pmA = new PeerManager({ localPrivateKey: highKey });
+		const pmB = new PeerManager({ localPrivateKey: lowKey });
+		const hangBefore = await hangingServer();
+		const hangAfter = await hangingServer();
+		try {
+			await pmB.listen(0);
+			const bPort = pmPort(pmB);
+			const internal = pmA as unknown as IPmInternal;
+			// Last-known-good address from an earlier successful connect.
+			internal.peerAddresses.set(lowPub, {
+				host: '203.0.113.1',
+				port: 9735
+			});
+
+			// D1 stalls, D2 dials the peer's live address, D3 stalls; all
+			// three overlap, so D3's attempt is the stored entry when D2
+			// completes and registers.
+			const settled1 = internal
+				.dialPeer(lowPub, '127.0.0.1', hangBefore.port)
+				.then(
+					() => 'resolved',
+					() => 'rejected'
+				);
+			const dial2 = internal.dialPeer(lowPub, '127.0.0.1', bPort);
+			const settled3 = internal
+				.dialPeer(lowPub, '127.0.0.1', hangAfter.port)
+				.then(
+					() => 'resolved',
+					() => 'rejected'
+				);
+			await dial2;
+
+			// Registration re-asserts the proven address over D3's attempt.
+			expect(pmA.getPeerAddress(lowPub)).to.deep.equal({
+				host: '127.0.0.1',
+				port: bPort
+			});
+
+			// The stragglers fail in either order; neither may clobber it.
+			hangAfter.close();
+			expect(await settled3).to.equal('rejected');
+			hangBefore.close();
+			expect(await settled1).to.equal('rejected');
+			expect(pmA.getPeerAddress(lowPub)).to.deep.equal({
+				host: '127.0.0.1',
+				port: bPort
+			});
+			expect(pmA.listPeers().length).to.equal(1);
+		} finally {
+			pmA.destroy();
+			pmB.destroy();
+			hangBefore.close();
+			hangAfter.close();
 		}
 	});
 });
