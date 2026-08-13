@@ -601,6 +601,16 @@ export class Channel {
 	// commitment_signed and possibly a completable funding tx. A disconnect
 	// forgets the abort and the attempt resumes over reestablish.
 	private _v2AbortPending = false;
+	// Our un-echoed tx_abort that unwound an ACCEPTED RBF request while the
+	// recorded attempt stays fully live (handleTxAckRbf's failure arms). The
+	// peer rolls back to the shared previous attempt and echoes; until that
+	// echo a new RBF or operator abort would overlap the exchange, and the
+	// delayed echo would then be taken for the newer abort's answer (tearing
+	// down an attempt the peer rolled back to keep). While set, the
+	// tx_signatures release is frozen like the other exchange latches; the
+	// echo clears it and re-drives the release. Connection scoped: a
+	// disconnect forgets it and both sides converge over reestablish.
+	private _v2RollbackAbortPending = false;
 	// The splice transaction once built and partially/fully signed: the tx, the
 	// index of the shared 2-of-2 funding input, the new funding output index, the
 	// old funding witness script, and our signature on the shared input.
@@ -5757,8 +5767,11 @@ export class Channel {
 		this._pendingRbfInit = null;
 		// An un-echoed abort of a recorded attempt dies with the connection
 		// too: nothing was torn down, so the attempt resumes over
-		// reestablish exactly as if the abort was never sent.
+		// reestablish exactly as if the abort was never sent. The rollback
+		// abort's exchange dies the same way (the peer's side rolls back in
+		// its own markForReestablish if the abort never arrived).
 		this._v2AbortPending = false;
+		this._v2RollbackAbortPending = false;
 
 		// A partially collected start_batch is connection-scoped: the peer
 		// re-announces the batch (with fresh framing) when it retransmits after
@@ -11729,7 +11742,8 @@ export class Channel {
 		// extends what it can enforce against an attempt we may then drop at
 		// the echo. The freeze thaws with the abort (echo teardown keeps
 		// broadcastable attempts; disconnect forgets the abort entirely).
-		if (this._v2AbortPending) return [];
+		// The rollback abort freezes it the same way until its echo.
+		if (this._v2AbortPending || this._v2RollbackAbortPending) return [];
 		// v2 + simple taproot would need a MuSig2 funding co-sign round that
 		// does not exist yet — fail closed rather than open without an exit.
 		if (isTaprootChannel(this._state.channelType)) {
@@ -11970,7 +11984,13 @@ export class Channel {
 		// freezes it the same way: witnesses crossing our own abort would
 		// hand the peer a broadcastable tx for an attempt we are asking it
 		// to forget.
-		if (this._pendingRbfInit || this._v2AbortPending) return [];
+		if (
+			this._pendingRbfInit ||
+			this._v2AbortPending ||
+			this._v2RollbackAbortPending
+		) {
+			return [];
+		}
 		if (
 			session.getState() !== DualFundingState.AWAITING_TX_SIGNATURES &&
 			session.getState() !== DualFundingState.AWAITING_CHANNEL_READY
@@ -12150,10 +12170,14 @@ export class Channel {
 			];
 		}
 		// The caller-driven release honors the same freezes as the automatic
-		// one: witnesses crossing our own un-echoed abort, or an un-acked
-		// tx_init_rbf, hand the peer a broadcastable tx for an attempt we
-		// are asking it to drop.
-		if (this._v2AbortPending || this._pendingRbfInit) {
+		// one: witnesses crossing our own un-echoed abort (operator or
+		// rollback), or an un-acked tx_init_rbf, hand the peer a
+		// broadcastable tx for an attempt we are asking it to drop.
+		if (
+			this._v2AbortPending ||
+			this._pendingRbfInit ||
+			this._v2RollbackAbortPending
+		) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -12602,9 +12626,10 @@ export class Channel {
 			];
 		}
 		// Abort and RBF are mutually exclusive, never inferred from arrival
-		// order: an abort of ours is outstanding, so no replacement of the
-		// attempt it is unwinding may be requested.
-		if (this._v2AbortPending) {
+		// order: an abort of ours is outstanding (an operator abort, or the
+		// rollback abort that unwound a failed ack), so no replacement of
+		// the attempt it concerns may be requested before its echo.
+		if (this._v2AbortPending || this._v2RollbackAbortPending) {
 			return [
 				{
 					type: ChannelActionType.ERROR,
@@ -12799,6 +12824,10 @@ export class Channel {
 			!bound.fundingTxid.equals(pending.fundingTxid) ||
 			bound.sentTxSignatures
 		) {
+			// The abort expects the peer's echo; serialize the exchange so a
+			// new RBF or operator abort cannot overlap it (the delayed echo
+			// would be taken for the newer abort's answer).
+			this._v2RollbackAbortPending = true;
 			return [
 				this._txAbort(
 					this._v2ChannelId(),
@@ -12815,8 +12844,11 @@ export class Channel {
 			// previous attempt, and its echo lands in the sent-latch swallow.
 			// initiateRbf fails before mutating anything, so the current
 			// attempt stays fully live here: no rollback, no persist, and no
-			// _v2AbortPending (nothing is being torn down at the echo). The
+			// _v2AbortPending (nothing is torn down at the echo). The
+			// rollback latch serializes the exchange instead: no new RBF or
+			// operator abort may overlap this abort before its echo. The
 			// stale-record guard in initiateTxRbf keeps this arm a belt.
+			this._v2RollbackAbortPending = true;
 			const reason = result.error || 'Failed to begin the RBF renegotiation';
 			return [
 				this._txAbort(this._v2ChannelId(), reason),
@@ -12913,8 +12945,10 @@ export class Channel {
 		// tear down on what we take for an echo of the second). Cancel the
 		// pending teardown instead: the crossed exchange resolves as a
 		// refusal, both sides keep the current attempt, and the operator can
-		// re-abort once the wire is quiet.
-		if (this._v2AbortPending) {
+		// re-abort once the wire is quiet. An un-echoed rollback abort of
+		// ours refuses the crossed request the same way (its own echo still
+		// resolves it; there is no teardown to cancel).
+		if (this._v2AbortPending || this._v2RollbackAbortPending) {
 			this._v2AbortPending = false;
 			return [];
 		}
@@ -13049,6 +13083,19 @@ export class Channel {
 				{
 					type: ChannelActionType.ERROR,
 					message: 'cannot abort while an RBF request is awaiting its answer'
+				}
+			];
+		}
+		// A rollback abort of ours (an accepted RBF that failed at ack time)
+		// is still awaiting its echo: a second abort behind it would take
+		// the delayed echo for its own answer and tear down an attempt the
+		// peer rolled back to keep. Let the exchange complete (echo or
+		// disconnect) first.
+		if (this._v2RollbackAbortPending) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message: 'cannot abort while a rollback tx_abort is awaiting its echo'
 				}
 			];
 		}
@@ -13200,6 +13247,10 @@ export class Channel {
 				this._resetV2Driver();
 				this.restoreV2InFlight();
 				this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
+				// The exchange is complete both ways (sent and received) and
+				// the channel lives on: reset the latch so the peer's next
+				// independent abort is answered, not swallowed.
+				this._txAbortSent = false;
 				return [{ type: ChannelActionType.PERSIST_STATE }];
 			}
 			this._state.dualFundingSession?.abort();
@@ -13233,6 +13284,14 @@ export class Channel {
 			// answers than one can arrive.
 			if (this._state.dualFundingSession && !this._v2AbortPending) {
 				this._txAbortSent = false;
+				// The answer to our rollback abort: the peer is back on the
+				// shared previous attempt (or crossed us with its own abort,
+				// which its retained record resolves the same way), so the
+				// frozen tx_signatures release of that attempt resumes.
+				if (this._v2RollbackAbortPending) {
+					this._v2RollbackAbortPending = false;
+					return this._maybeSendV2TxSigs();
+				}
 			}
 			return [];
 		}
@@ -13276,10 +13335,16 @@ export class Channel {
 			this._resetV2Driver();
 			this.restoreV2InFlight();
 			this._state.state = ChannelState.AWAITING_TX_SIGNATURES;
-			return [
+			const actions: ChannelAction[] = [
 				{ type: ChannelActionType.PERSIST_STATE },
 				this._txAbort(this._v2ChannelId())
 			];
+			// The echo terminates this exchange: nothing further is owed or
+			// expected on it, and the latch the compose just set would make
+			// the swallow above eat the peer's NEXT independent abort (a
+			// later operator abort) instead of answering it.
+			this._txAbortSent = false;
+			return actions;
 		}
 
 		// The peer may be able to broadcast the recorded funding tx without

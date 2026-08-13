@@ -1758,6 +1758,162 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 	});
 
+	/**
+	 * Drive the opener into the rollback-abort state: request accepted by
+	 * the peer (which is now mid-replacement), then the ack-time session
+	 * failure induced white-box so handleTxAckRbf sends the unwind abort.
+	 */
+	function induceRollbackAbort(h: IHarness): void {
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const ackAnswer = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(ackAnswer, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		const session = h.opener.getFullState().dualFundingSession!;
+		session.initiateRbf = (): { ok: boolean; error?: string } => ({
+			ok: false,
+			error: 'induced ack-time failure'
+		});
+		const ack = h.opener.handleTxAckRbf();
+		expect(findPayload(ack, MessageType.TX_ABORT)).to.not.equal(null);
+	}
+
+	it('serializes RBF and operator aborts behind an un-echoed rollback abort; the echo thaws the release and reopens them', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		induceRollbackAbort(h);
+
+		// While the rollback abort is un-echoed, everything that would
+		// overlap the exchange is refused: a delayed echo must never be
+		// taken for a newer abort's answer, and no witnesses may cross the
+		// peer's rollback.
+		expect(findError(h.opener.initiateTxRbf(2083))).to.contain(
+			'awaiting its echo'
+		);
+		expect(findError(h.opener.abortDualFunding('too eager'))).to.contain(
+			'awaiting its echo'
+		);
+		expect(
+			findError(
+				h.opener.sendTxSignatures(
+					h.opener.getFullState().fundingTxid!,
+					h.opener.getFullState().fundingOutputIndex,
+					h.openerWitness()
+				)
+			)
+		).to.contain('frozen');
+
+		// The peer rolls back and echoes; the echo completes the exchange.
+		expect(
+			findPayload(h.acceptor.handleTxAbort(), MessageType.TX_ABORT)
+		).to.not.equal(null);
+		expect(h.opener.handleTxAbort()).to.deep.equal([]);
+
+		// A subsequent operator abort now runs the FULL handshake: the
+		// peer's latch was reset by its rollback echo, so the abort is
+		// answered (not silently swallowed) and the teardown completes on
+		// both sides at the echo.
+		const abortActions = h.opener.abortDualFunding('operator cancelled');
+		expect(findError(abortActions)).to.equal(null);
+		expect(findPayload(abortActions, MessageType.TX_ABORT)).to.not.equal(null);
+		const peerAnswer = h.acceptor.handleTxAbort();
+		expect(
+			findPayload(peerAnswer, MessageType.TX_ABORT),
+			'the peer answers the abort instead of swallowing it'
+		).to.not.equal(null);
+		const teardown = h.opener.handleTxAbort();
+		expect(teardown.some((a) => a.type === ChannelActionType.PERSIST_STATE)).to
+			.be.true;
+		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
+		expect(h.acceptor.getState()).to.equal(ChannelState.ERRORED);
+	});
+
+	it('a lost rollback abort or lost echo converges over reestablish to the shared attempt', () => {
+		// Echo lost: the peer rolled back durably, our latches die with the
+		// connection, and both sides resume attempt 0.
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		induceRollbackAbort(h);
+		expect(
+			findPayload(h.acceptor.handleTxAbort(), MessageType.TX_ABORT)
+		).to.not.equal(null);
+		// The echo is never delivered.
+		h.opener.markForReestablish();
+		h.acceptor.markForReestablish();
+		const opMsg = reestablishOf(h.opener.createReestablish());
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		expect(findError(h.opener.handleReestablish(acMsg))).to.equal(null);
+		expect(findError(h.acceptor.handleReestablish(opMsg))).to.equal(null);
+		completeExchange(h);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		// Abort lost: the peer is still mid-replacement when the connection
+		// dies; its own markForReestablish rolls it back to the retained
+		// attempt and both sides resume it.
+		const g = driveToCommitmentExchange();
+		deliverCommitments(g);
+		induceRollbackAbort(g);
+		expect(g.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		g.opener.markForReestablish();
+		g.acceptor.markForReestablish();
+		// The disconnect armed the rollback: the retained attempt-0 record
+		// is restored behind the reestablish gate.
+		expect(g.acceptor.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+		expect(
+			g.acceptor.getFullState().dualFundingSession!.getRbfCount()
+		).to.equal(0);
+		const gOpMsg = reestablishOf(g.opener.createReestablish());
+		const gAcMsg = reestablishOf(g.acceptor.createReestablish());
+		expect(findError(g.opener.handleReestablish(gAcMsg))).to.equal(null);
+		expect(findError(g.acceptor.handleReestablish(gOpMsg))).to.equal(null);
+		completeExchange(g);
+		expect(g.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('a peer operator abort crossing the rollback abort resolves both sides to the shared attempt', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		induceRollbackAbort(h);
+
+		// Before our rollback abort arrives, the peer (mid-replacement)
+		// operator-aborts: the two aborts cross on the wire.
+		const peerAbort = h.acceptor.abortDualFunding('going away');
+		expect(findError(peerAbort)).to.equal(null);
+		expect(findPayload(peerAbort, MessageType.TX_ABORT)).to.not.equal(null);
+
+		// Our abort reaches the peer as the answer to its own: mid-
+		// renegotiation its retained record is rollback state, so it rolls
+		// back to attempt 0 instead of tearing down, with no second abort.
+		const peerResolution = h.acceptor.handleTxAbort();
+		expect(
+			peerResolution.some((a) => a.type === ChannelActionType.PERSIST_STATE)
+		).to.be.true;
+		expect(findPayload(peerResolution, MessageType.TX_ABORT)).to.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.acceptor.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+
+		// The peer's abort reaches us as the answer that completes our
+		// exchange: swallowed, latches cleared, attempt untouched.
+		expect(h.opener.handleTxAbort()).to.deep.equal([]);
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.opener.getFullState().v2InFlight!.rbfAttempt).to.equal(0);
+
+		// Both sides sit on the shared attempt and it still completes.
+		completeExchange(h);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
 	it('freezes the old attempt while an RBF request is pending; the ack revalidates the binding', () => {
 		// The acceptor contributes MORE, so the opener signs first: without
 		// the freeze, the crossed commitment_signed below would release
