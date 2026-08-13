@@ -429,9 +429,24 @@ export class PeerManager extends EventEmitter {
 			// the inbound replacement path: channels mark AWAITING_REESTABLISH
 			// first, then the connect handler re-drives channel_reestablish.
 			this.removeRegisteredPeer(pubkey, raceWinner);
-			// The removal emitted peer:disconnect SYNCHRONOUSLY: an observer
-			// may have called disconnectPeer() to cancel the peer for good,
-			// and registering the replacement anyway would reverse that.
+			// The removal emitted peer:disconnect SYNCHRONOUSLY. An observer
+			// may have destroyed or frozen the manager: the candidate is no
+			// longer pending and not yet registered, so that teardown cannot
+			// reach it, and registering it anyway would put a live connection
+			// on a manager that just shut down.
+			if (
+				this.connectionsDisabled() ||
+				(this.connectionGate && !this.connectionGate())
+			) {
+				peer.removeAllListeners();
+				peer.disconnect();
+				throw new Error(
+					`Connection to peer ${pubkey} was invalidated while establishing`
+				);
+			}
+			// An observer may also have called disconnectPeer() to cancel the
+			// peer for good, and registering the replacement anyway would
+			// reverse that.
 			if ((this.cancelGenerations.get(pubkey) ?? 0) !== dialGeneration) {
 				peer.removeAllListeners();
 				peer.disconnect();
@@ -536,7 +551,34 @@ export class PeerManager extends EventEmitter {
 			this.inboundPeerCount--;
 		}
 		captureWireEvent('close', pubkey);
-		this.emit('peer:disconnect', pubkey);
+		this.emitPeerDisconnect(pubkey);
+	}
+
+	/**
+	 * Notify peer:disconnect listeners, each FULLY contained. The emit
+	 * happens mid-teardown (collision replacement, disconnectPeer, the
+	 * close handler): a throwing listener must not unwind into that
+	 * bookkeeping, where it would leave the replacement socket neither
+	 * registered nor disconnected, or skip the reconnect scheduling. The
+	 * listeners are dispatched individually, not via emit(): emit stops at
+	 * the first throw, so a later listener whose job is cancellation
+	 * (disconnectPeer) would silently depend on listener order. Failures
+	 * surface as a wire-capture diagnostic, NOT as peer:error: peer:error
+	 * cleanup handlers legitimately call disconnectPeer(), which would
+	 * cancel the very replacement or reconnect this containment protects.
+	 */
+	private emitPeerDisconnect(pubkey: string): void {
+		for (const listener of this.rawListeners('peer:disconnect')) {
+			try {
+				(listener as (pubkey: string) => void)(pubkey);
+			} catch (err) {
+				captureWireEvent(
+					'disconnect_observer_failed',
+					pubkey,
+					err instanceof Error ? err.message : String(err)
+				);
+			}
+		}
 	}
 
 	/**
@@ -1141,11 +1183,22 @@ export class PeerManager extends EventEmitter {
 					// re-drives channel_reestablish over the new connection.
 					const replaceGeneration = this.cancelGenerations.get(pubkey) ?? 0;
 					this.removeRegisteredPeer(pubkey, existing);
-					// The removal emitted peer:disconnect SYNCHRONOUSLY: an
-					// observer may have called disconnectPeer() to cancel the
-					// peer for good, and registering the fresh inbound anyway
-					// would reverse that. The remote may redial; that dial
-					// will be judged under the new generation.
+					// The removal emitted peer:disconnect SYNCHRONOUSLY. An
+					// observer may have destroyed or frozen the manager: the
+					// fresh inbound is no longer pending and not yet
+					// registered, so that teardown cannot reach it.
+					if (
+						this.connectionsDisabled() ||
+						(this.connectionGate && !this.connectionGate())
+					) {
+						peer.disconnect();
+						return;
+					}
+					// An observer may also have called disconnectPeer() to
+					// cancel the peer for good, and registering the fresh
+					// inbound anyway would reverse that. The remote may
+					// redial; that dial will be judged under the new
+					// generation.
 					if ((this.cancelGenerations.get(pubkey) ?? 0) !== replaceGeneration) {
 						peer.disconnect();
 						return;
@@ -1245,7 +1298,7 @@ export class PeerManager extends EventEmitter {
 			// good, and a timer scheduled after that would adopt the
 			// post-cancellation generation and dial anyway.
 			const closeGeneration = this.cancelGenerations.get(pubkey) ?? 0;
-			this.emit('peer:disconnect', pubkey);
+			this.emitPeerDisconnect(pubkey);
 
 			if (
 				this.autoReconnect &&

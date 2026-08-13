@@ -873,6 +873,474 @@ describe('Peer held post-handshake delivery', function () {
 		}
 	});
 
+	it('a throwing peer:disconnect observer does not leak the inbound replacement', async function () {
+		// Newest-wins replacement emits peer:disconnect for the old
+		// connection synchronously. An observer that THROWS (rather than
+		// cancels) must not unwind into the replacement path: the fresh
+		// inbound would end up neither registered nor disconnected, with no
+		// listeners attached, leaking until its ping timeout (issue #319).
+		const a = new LightningNode(makeNodeConfig(93));
+		const b = new LightningNode(makeNodeConfig(94));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await a.listen(0, '127.0.0.1');
+			const port = (
+				a as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			// First inbound registers normally.
+			await b.connectPeer(a.getNodeId(), '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(pmA.peers.size, 'the first inbound registered').to.equal(1);
+			const firstPeer = pmA.peers.get(b.getNodeId());
+			let observerRan = false;
+			a.on('peer:disconnect', () => {
+				observerRan = true;
+				throw new Error('disconnect observer exploded');
+			});
+			// A SECOND inbound from the same identity triggers newest-wins.
+			const raw = new Peer({
+				localPrivateKey: crypto
+					.createHash('sha256')
+					.update(makeSeed(94))
+					.update(Buffer.from('node-identity'))
+					.digest(),
+				remotePublicKey: Buffer.from(a.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port
+			});
+			raw.on('error', () => {});
+			await raw.connect().catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(observerRan, 'the replacement ran the observer').to.equal(true);
+			expect(
+				pmA.peers.size,
+				'the replacement was registered despite the throwing observer'
+			).to.equal(1);
+			expect(
+				pmA.peers.get(b.getNodeId()),
+				'the registered connection is the fresh inbound, not the old one'
+			).to.not.equal(firstPeer);
+			raw.disconnect();
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a throwing peer:disconnect observer does not leak the outbound race winner', async function () {
+		// The outbound twin: an inbound registers WHILE our outbound
+		// handshake is in flight, our outbound wins the cross-direction
+		// tie-break and tears the inbound down. An observer throwing during
+		// that teardown must not unwind before the registration at the end
+		// of dialPeer: the dial would reject with the observer's error and
+		// the fresh socket would leak un-registered (issue #319).
+		const x = new LightningNode(makeNodeConfig(95));
+		const y = new LightningNode(makeNodeConfig(96));
+		x.on('node:error', () => {});
+		y.on('node:error', () => {});
+		const realConnect = Peer.prototype.connect;
+		try {
+			// The SMALLER pubkey side prefers its outbound in the tie-break.
+			const [small, big] = x.getNodeId() < y.getNodeId() ? [x, y] : [y, x];
+			const pmSmall = (
+				small as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						inboundPeerSet: Set<string>;
+					};
+				}
+			).peerManager;
+			await small.listen(0, '127.0.0.1');
+			await big.listen(0, '127.0.0.1');
+			const smallPort = (
+				small as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			const bigPort = (
+				big as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			let observerRan = false;
+			small.on('peer:disconnect', () => {
+				observerRan = true;
+				throw new Error('disconnect observer exploded');
+			});
+			// After small's outbound handshake completes but BEFORE the
+			// manager registers it, an inbound bearing BIG'S identity
+			// occupies the registration: the exact cross-dial window.
+			const nodeKeyOf = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from('node-identity'))
+					.digest();
+			const bigKey = [95, 96]
+				.map(nodeKeyOf)
+				.find((k) => getPublicKey(k).toString('hex') === big.getNodeId())!;
+			const raw = new Peer({
+				localPrivateKey: bigKey,
+				remotePublicKey: Buffer.from(small.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port: smallPort
+			});
+			raw.on('error', () => {});
+			let armed = true;
+			let injectedRegistered = false;
+			Peer.prototype.connect = async function (this: Peer): Promise<void> {
+				await realConnect.apply(this);
+				if (armed && this.remotePublicKey.toString('hex') === big.getNodeId()) {
+					armed = false;
+					await realConnect.apply(raw);
+					await new Promise((resolve) => setTimeout(resolve, 100));
+					// The collision is real only if the injected inbound holds
+					// the registration when the outbound resumes.
+					injectedRegistered =
+						pmSmall.peers.size === 1 &&
+						pmSmall.inboundPeerSet.has(big.getNodeId());
+				}
+			};
+			let rejection: Error | null = null;
+			await small
+				.connectPeer(big.getNodeId(), '127.0.0.1', bigPort)
+				.catch((err) => {
+					rejection = err instanceof Error ? err : new Error(String(err));
+				});
+			expect(injectedRegistered, 'the injected inbound registered').to.equal(
+				true
+			);
+			expect(observerRan, 'the replacement ran the observer').to.equal(true);
+			expect(rejection, 'the dial resolved despite the throwing observer').to.be
+				.null;
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(pmSmall.peers.size, 'the race winner was registered').to.equal(1);
+			expect(
+				pmSmall.inboundPeerSet.has(big.getNodeId()),
+				'the survivor is the OUTBOUND race winner, not the inbound'
+			).to.equal(false);
+			raw.disconnect();
+		} finally {
+			Peer.prototype.connect = realConnect;
+			x.destroy();
+			y.destroy();
+		}
+	});
+
+	it('a throwing peer:disconnect observer does not cancel the reconnect on natural close', async function () {
+		// The close handler schedules the auto-reconnect AFTER the
+		// peer:disconnect emit. A throwing observer must not unwind past
+		// that scheduling (silently cancelling the reconnect) or escape
+		// uncaught into the socket event loop.
+		const a = new LightningNode(makeNodeConfig(91));
+		const b = new LightningNode(makeNodeConfig(92));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size).to.equal(1);
+			let observerRan = false;
+			a.on('peer:disconnect', () => {
+				observerRan = true;
+				throw new Error('disconnect observer exploded');
+			});
+			// Natural close from the REMOTE side. The reconnect delay floor
+			// (1s base, minus 25% jitter) keeps the timer pending well past
+			// the assertion below.
+			b.disconnectPeer(a.getNodeId());
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(observerRan, 'the close ran the observer').to.equal(true);
+			expect(pmA.peers.size, 'the close bookkeeping completed').to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the reconnect was still scheduled'
+			).to.equal(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a disconnect observer destroying the manager blocks the inbound replacement', async function () {
+		// The contained observer callback may call destroy() (or throw
+		// AFTER destroying). The fresh inbound is no longer pending and not
+		// yet registered at that moment, so the destroy sweep cannot reach
+		// it: the replacement path itself must recheck and discard, or a
+		// ready connection ends up registered on a destroyed manager.
+		const a = new LightningNode(makeNodeConfig(85));
+		const b = new LightningNode(makeNodeConfig(86));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await a.listen(0, '127.0.0.1');
+			const port = (
+				a as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await b.connectPeer(a.getNodeId(), '127.0.0.1', port);
+			await new Promise((resolve) => setTimeout(resolve, 100));
+			expect(pmA.peers.size, 'the first inbound registered').to.equal(1);
+			let observerRan = false;
+			a.on('peer:disconnect', () => {
+				observerRan = true;
+				a.destroy();
+				throw new Error('observer destroyed the node');
+			});
+			const raw = new Peer({
+				localPrivateKey: crypto
+					.createHash('sha256')
+					.update(makeSeed(86))
+					.update(Buffer.from('node-identity'))
+					.digest(),
+				remotePublicKey: Buffer.from(a.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port
+			});
+			raw.on('error', () => {});
+			await raw.connect().catch(() => undefined);
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(observerRan, 'the replacement ran the observer').to.equal(true);
+			expect(
+				pmA.peers.size,
+				'nothing registered on the destroyed manager'
+			).to.equal(0);
+			raw.disconnect();
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('a disconnect observer destroying the manager blocks the outbound race winner', async function () {
+		// The outbound twin: destroy() from the observer during the
+		// collision teardown must invalidate the dial instead of letting
+		// the fresh outbound register on the destroyed manager.
+		const x = new LightningNode(makeNodeConfig(87));
+		const y = new LightningNode(makeNodeConfig(88));
+		x.on('node:error', () => {});
+		y.on('node:error', () => {});
+		const realConnect = Peer.prototype.connect;
+		try {
+			const [small, big] = x.getNodeId() < y.getNodeId() ? [x, y] : [y, x];
+			const pmSmall = (
+				small as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						inboundPeerSet: Set<string>;
+					};
+				}
+			).peerManager;
+			await small.listen(0, '127.0.0.1');
+			await big.listen(0, '127.0.0.1');
+			const smallPort = (
+				small as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			const bigPort = (
+				big as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			let observerRan = false;
+			small.on('peer:disconnect', () => {
+				observerRan = true;
+				small.destroy();
+				throw new Error('observer destroyed the node');
+			});
+			const nodeKeyOf = (seedId: number): Buffer =>
+				crypto
+					.createHash('sha256')
+					.update(makeSeed(seedId))
+					.update(Buffer.from('node-identity'))
+					.digest();
+			const bigKey = [87, 88]
+				.map(nodeKeyOf)
+				.find((k) => getPublicKey(k).toString('hex') === big.getNodeId())!;
+			const raw = new Peer({
+				localPrivateKey: bigKey,
+				remotePublicKey: Buffer.from(small.getNodeId(), 'hex'),
+				host: '127.0.0.1',
+				port: smallPort
+			});
+			raw.on('error', () => {});
+			let armed = true;
+			let injectedRegistered = false;
+			Peer.prototype.connect = async function (this: Peer): Promise<void> {
+				await realConnect.apply(this);
+				if (armed && this.remotePublicKey.toString('hex') === big.getNodeId()) {
+					armed = false;
+					await realConnect.apply(raw);
+					await new Promise((resolve) => setTimeout(resolve, 100));
+					injectedRegistered =
+						pmSmall.peers.size === 1 &&
+						pmSmall.inboundPeerSet.has(big.getNodeId());
+				}
+			};
+			let rejection: Error | null = null;
+			await small
+				.connectPeer(big.getNodeId(), '127.0.0.1', bigPort)
+				.catch((err) => {
+					rejection = err instanceof Error ? err : new Error(String(err));
+				});
+			expect(injectedRegistered, 'the injected inbound registered').to.equal(
+				true
+			);
+			expect(observerRan, 'the replacement ran the observer').to.equal(true);
+			expect(rejection, 'the dial was invalidated').to.be.instanceOf(Error);
+			expect((rejection as unknown as Error).message).to.match(/invalidated/);
+			await new Promise((resolve) => setTimeout(resolve, 200));
+			expect(
+				pmSmall.peers.size,
+				'nothing registered on the destroyed manager'
+			).to.equal(0);
+			raw.disconnect();
+		} finally {
+			Peer.prototype.connect = realConnect;
+			x.destroy();
+			y.destroy();
+		}
+	});
+
+	it('a throwing disconnect observer does not suppress a later cancelling one', async function () {
+		// Observers are dispatched individually: emit() stops at the first
+		// throw, which would make a later disconnectPeer() cancellation
+		// listener-order dependent and schedule the very reconnect the
+		// cancellation forbids.
+		const a = new LightningNode(makeNodeConfig(89));
+		const b = new LightningNode(makeNodeConfig(90));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size).to.equal(1);
+			a.on('peer:disconnect', () => {
+				throw new Error('first observer exploded');
+			});
+			let cancellationRan = false;
+			a.on('peer:disconnect', (pubkey: string) => {
+				cancellationRan = true;
+				a.disconnectPeer(pubkey);
+			});
+			b.disconnectPeer(a.getNodeId());
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(cancellationRan, 'the later observer still ran').to.equal(true);
+			expect(pmA.peers.size).to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the cancellation was honored despite the earlier throw'
+			).to.equal(0);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
+	it('an observer failure surfaces as a diagnostic, not as peer:error', async function () {
+		// peer:error cleanup handlers legitimately call disconnectPeer().
+		// Routing a disconnect observer failure through peer:error would
+		// hand it to such a handler, whose cancellation defeats the
+		// reconnect the containment just preserved.
+		const a = new LightningNode(makeNodeConfig(97));
+		const b = new LightningNode(makeNodeConfig(98));
+		a.on('node:error', () => {});
+		b.on('node:error', () => {});
+		try {
+			const pmA = (
+				a as unknown as {
+					peerManager: {
+						peers: Map<string, unknown>;
+						reconnectTimers: Map<string, unknown>;
+					};
+				}
+			).peerManager;
+			await b.listen(0, '127.0.0.1');
+			const port = (
+				b as unknown as {
+					peerManager: { server: { address(): { port: number } } };
+				}
+			).peerManager.server.address().port;
+			await a.connectPeer(b.getNodeId(), '127.0.0.1', port);
+			expect(pmA.peers.size).to.equal(1);
+			const peerErrors: string[] = [];
+			a.on('peer:error', (pubkey: string, err: Error) => {
+				peerErrors.push(err.message);
+				a.disconnectPeer(pubkey);
+			});
+			const observerLogs: string[] = [];
+			a.on('log', (log: { action: string }) => {
+				if (log.action === 'disconnect_observer_failed') {
+					observerLogs.push(log.action);
+				}
+			});
+			a.on('peer:disconnect', () => {
+				throw new Error('disconnect observer exploded');
+			});
+			b.disconnectPeer(a.getNodeId());
+			await new Promise((resolve) => setTimeout(resolve, 300));
+			expect(
+				peerErrors,
+				'the observer failure did not surface as peer:error'
+			).to.deep.equal([]);
+			expect(observerLogs, 'the observer failure surfaced as a structured log')
+				.to.not.be.empty;
+			expect(pmA.peers.size).to.equal(0);
+			expect(
+				pmA.reconnectTimers.size,
+				'the reconnect survived the cleanup handler'
+			).to.equal(1);
+		} finally {
+			a.destroy();
+			b.destroy();
+		}
+	});
+
 	it('a reconnect round cancelled mid-round neither redials nor reschedules', async function () {
 		// disconnectPeer clears the PENDING timer, but a round already past
 		// that point keeps running: it must check the cancellation before
