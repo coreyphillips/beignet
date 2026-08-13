@@ -870,6 +870,166 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		);
 	});
 
+	it('surfaces the owed caller-driven release after a restart and completes once re-driven (307)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Restart the ACCEPTOR: it signs first, so its release is due the
+		// moment reestablish completes, while its witnesses (caller-driven,
+		// held only in memory) died with the process.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.acceptor.getFullState()))
+		);
+		const revived = new Channel(
+			deserializeChannelState(json),
+			h.acceptorSigner
+		);
+		revived.restoreV2InFlight();
+		revived.markForReestablish();
+		h.opener.markForReestablish();
+
+		const revMsg = reestablishOf(revived.createReestablish());
+		const opMsg = reestablishOf(h.opener.createReestablish());
+		const opReestActions = h.opener.handleReestablish(revMsg);
+		expect(findError(opReestActions)).to.equal(null);
+		// The opener signs second and the peer's signatures are not in yet:
+		// nothing is owed from its caller at this point.
+		expect(
+			opReestActions.some(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			)
+		).to.equal(false);
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const revActions: any[] = revived.handleReestablish(opMsg);
+		expect(findError(revActions)).to.equal(null);
+		const record = revived.getFullState().v2InFlight!;
+		const needed = revActions.filter(
+			(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+		);
+		expect(needed.length, 'the resume surfaces the owed release').to.equal(1);
+		expect(needed[0].channelId.equals(revived.getChannelId()!)).to.equal(true);
+		expect(needed[0].fundingTxid.equals(record.fundingTxid)).to.equal(true);
+		expect(needed[0].fundingOutputIndex).to.equal(record.fundingOutputIndex);
+		expect(needed[0].inputIndices).to.deep.equal([1]);
+
+		// One-shot per connection cycle: a second flush does not re-signal...
+		expect(
+			revived
+				.handleReestablish(opMsg)
+				.some((a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED)
+		).to.equal(false);
+		// ...but the NEXT reconnect re-arms the reminder while still owed.
+		revived.markForReestablish();
+		expect(
+			revived
+				.handleReestablish(opMsg)
+				.filter((a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED).length
+		).to.equal(1);
+
+		// The embedder re-drives with witnesses over the recorded funding tx
+		// and the exchange completes.
+		const accSig = revived.sendTxSignatures(
+			revived.getFullState().fundingTxid!,
+			revived.getFullState().fundingOutputIndex,
+			h.acceptorWitness()
+		);
+		expect(findError(accSig)).to.equal(null);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES);
+		expect(accTxSigs, 'the re-driven release leaves').to.not.equal(null);
+
+		// The LIVE opener now owes its own caller-driven witnesses: the same
+		// signal fires the moment the ordering gate opens.
+		const opAfterPeer = h.opener.handleTxSignatures(
+			decodeTxSignaturesMessage(accTxSigs!)
+		);
+		expect(findError(opAfterPeer)).to.equal(null);
+		expect(
+			opAfterPeer.filter(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			).length
+		).to.equal(1);
+		const opSig = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(opSig)).to.equal(null);
+		const opTxSigs = findPayload(opSig, MessageType.TX_SIGNATURES)!;
+		expect(
+			findError(revived.handleTxSignatures(decodeTxSignaturesMessage(opTxSigs)))
+		).to.equal(null);
+		expect(revived.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
+	it('a restarted second-signer surfaces the owed release when the peer signatures arrive (307)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// Restart the OPENER: it signs second, so nothing is owed at
+		// reestablish; the obligation surfaces when the peer's tx_signatures
+		// arrive and the ordering gate opens.
+		const json = JSON.parse(
+			JSON.stringify(serializeChannelState(h.opener.getFullState()))
+		);
+		const revived = new Channel(deserializeChannelState(json), h.openerSigner);
+		revived.restoreV2InFlight();
+		revived.markForReestablish();
+		h.acceptor.markForReestablish();
+
+		const revMsg = reestablishOf(revived.createReestablish());
+		const acMsg = reestablishOf(h.acceptor.createReestablish());
+		const revReestActions = revived.handleReestablish(acMsg);
+		expect(findError(revReestActions)).to.equal(null);
+		expect(
+			revReestActions.some(
+				(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+			)
+		).to.equal(false);
+		expect(findError(h.acceptor.handleReestablish(revMsg))).to.equal(null);
+
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			h.acceptorWitness()
+		);
+		const accTxSigs = findPayload(accSig, MessageType.TX_SIGNATURES)!;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const revAfterPeer: any[] = revived.handleTxSignatures(
+			decodeTxSignaturesMessage(accTxSigs)
+		);
+		expect(findError(revAfterPeer)).to.equal(null);
+		const needed = revAfterPeer.filter(
+			(a) => a.type === ChannelActionType.TX_SIGNATURES_NEEDED
+		);
+		expect(needed.length, 'the owed release surfaces').to.equal(1);
+		expect(needed[0].inputIndices).to.deep.equal([0]);
+
+		const revSig = revived.sendTxSignatures(
+			revived.getFullState().fundingTxid!,
+			revived.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(revSig)).to.equal(null);
+		const revTxSigs = findPayload(revSig, MessageType.TX_SIGNATURES)!;
+		expect(
+			findError(
+				h.acceptor.handleTxSignatures(decodeTxSignaturesMessage(revTxSigs))
+			)
+		).to.equal(null);
+		expect(revived.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
 	it('deserializes a legacy state without a record to null and drops it deterministically', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);

@@ -5732,6 +5732,18 @@ export class ChannelManager extends EventEmitter {
 				case ChannelActionType.CHANNEL_FULLY_RESOLVED:
 					this.emit('channel:resolved', action.channelId);
 					break;
+				case ChannelActionType.TX_SIGNATURES_NEEDED:
+					// Advisory (no wire send, no broadcast), so never gated on a
+					// failed persist: the embedder must learn it owes witnesses
+					// via sendTxSignatures regardless (issue 307).
+					this.emit(
+						'channel:txsigs-needed',
+						action.channelId,
+						action.fundingTxid,
+						action.fundingOutputIndex,
+						action.inputIndices
+					);
+					break;
 				case ChannelActionType.ANNOUNCEMENT_READY:
 					this.emit(
 						'announcement:ready',
