@@ -12661,6 +12661,21 @@ export class Channel {
 				}
 			];
 		}
+		// The previous request's ack already began a replacement round: until
+		// the replacement records itself at its commitment persist, the
+		// retained record still describes the REPLACED attempt, so a request
+		// here would price its 25/24 floor against the wrong attempt and fail
+		// at ack time with the peer already committed. One renegotiation at a
+		// time; the guard reopens when the replacement's record lands.
+		if (this._state.v2InFlight && this._v2RecordIsStaleRollback()) {
+			return [
+				{
+					type: ChannelActionType.ERROR,
+					message:
+						'an accepted RBF is still renegotiating; wait for the replacement attempt to be recorded'
+				}
+			];
+		}
 		// RBF replaces a COMPLETED attempt: the recorded one. Before the
 		// record exists the negotiation is still in flight (and on this side
 		// possibly still waiting for the wallet's asynchronous input
@@ -12793,11 +12808,19 @@ export class Channel {
 		}
 		const result = session.initiateRbf(pending.feerate, pending.locktime);
 		if (!result.ok) {
+			// The peer accepted and is waiting for the renegotiation's first
+			// tx_add_*; a bare local error would strand it. Unwind on the
+			// wire (mirroring handleTxInitRbf's session-failure arm): the
+			// peer's retained rollback record returns it to the shared
+			// previous attempt, and its echo lands in the sent-latch swallow.
+			// initiateRbf fails before mutating anything, so the current
+			// attempt stays fully live here: no rollback, no persist, and no
+			// _v2AbortPending (nothing is being torn down at the echo). The
+			// stale-record guard in initiateTxRbf keeps this arm a belt.
+			const reason = result.error || 'Failed to begin the RBF renegotiation';
 			return [
-				{
-					type: ChannelActionType.ERROR,
-					message: result.error || 'Failed to begin the RBF renegotiation'
-				}
+				this._txAbort(this._v2ChannelId(), reason),
+				{ type: ChannelActionType.ERROR, message: reason }
 			];
 		}
 		this._state.state = ChannelState.DUAL_FUNDING_V2;

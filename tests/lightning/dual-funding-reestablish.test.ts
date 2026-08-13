@@ -1586,6 +1586,178 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		]);
 	});
 
+	it('refuses a second RBF while the accepted replacement is unrecorded; the guard reopens at the replacement commitment', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const preRecord = h.opener.getFullState().v2InFlight!;
+		expect(preRecord.rbfAttempt).to.equal(0);
+
+		// Request 1 is accepted: the renegotiation begins at the ack.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const ackAnswer = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(ackAnswer, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		expect(findError(h.opener.handleTxAckRbf())).to.equal(null);
+
+		// The race window is provably open: the retained record still
+		// describes the replaced attempt while the session already counts
+		// the accepted replacement round.
+		const session = h.opener.getFullState().dualFundingSession!;
+		expect(h.opener.getFullState().v2InFlight).to.equal(preRecord);
+		expect(session.getRbfCount()).to.equal(1);
+		expect(preRecord.rbfAttempt).to.equal(0);
+
+		// A second request priced against the retained record (1100 clears
+		// attempt 0's floor of 1041 but not the replacement's floor of 2083)
+		// would pass the local pre-check and fail at ack time with the peer
+		// already committed; it is refused locally with nothing on the wire.
+		const second = h.opener.initiateTxRbf(1100);
+		expect(findError(second)).to.contain('still renegotiating');
+		expect(findPayload(second, MessageType.TX_INIT_RBF)).to.equal(null);
+		expect(second.some((a) => a.type === ChannelActionType.PERSIST_STATE)).to.be
+			.false;
+		expect(h.opener.getFullState().v2InFlight).to.equal(preRecord);
+		expect(session.getLocalParams()!.fundingFeeratePerkw).to.equal(2000);
+		expect(session.getRbfCount()).to.equal(1);
+
+		// The replacement round completes caller-driven (same contributions,
+		// repriced): its commitment persist swaps the record in atomically.
+		const fundingScript = bitcoin.Transaction.fromHex(preRecord.fundingTxHex)
+			.outs[preRecord.fundingOutputIndex].script;
+		const oInAct = h.opener.addTxInput(makeInput(0n, h.openerPrev.prevTx));
+		expect(findError(oInAct)).to.equal(null);
+		h.acceptor.handleTxAddInput(
+			decodeTxAddInputMessage(findPayload(oInAct, MessageType.TX_ADD_INPUT)!)
+		);
+		const aInAct = h.acceptor.addTxInput(makeInput(1n, h.acceptorPrev.prevTx));
+		expect(findError(aInAct)).to.equal(null);
+		h.opener.handleTxAddInput(
+			decodeTxAddInputMessage(findPayload(aInAct, MessageType.TX_ADD_INPUT)!)
+		);
+		const oOutAct = h.opener.addTxOutput({
+			serialId: 2n,
+			amountSats: TOTAL_FUNDING,
+			scriptPubkey: fundingScript
+		});
+		expect(findError(oOutAct)).to.equal(null);
+		h.acceptor.handleTxAddOutput(
+			decodeTxAddOutputMessage(findPayload(oOutAct, MessageType.TX_ADD_OUTPUT)!)
+		);
+		expect(findError(h.acceptor.sendTxComplete())).to.equal(null);
+		h.opener.handleTxComplete();
+		const opComplete = h.opener.sendTxComplete();
+		expect(findError(opComplete)).to.equal(null);
+		const openerCommit = findPayload(opComplete, MessageType.COMMITMENT_SIGNED);
+		expect(openerCommit).to.not.equal(null);
+		const acComplete = h.acceptor.handleTxComplete();
+		const acceptorCommit = findPayload(
+			acComplete,
+			MessageType.COMMITMENT_SIGNED
+		);
+		expect(acceptorCommit).to.not.equal(null);
+		expect(
+			findError(
+				h.acceptor.handleCommitmentSigned(
+					decodeCommitmentSignedMessage(openerCommit!)
+				)
+			)
+		).to.equal(null);
+		expect(
+			findError(
+				h.opener.handleCommitmentSigned(
+					decodeCommitmentSignedMessage(acceptorCommit!)
+				)
+			)
+		).to.equal(null);
+		const swapped = h.opener.getFullState().v2InFlight!;
+		expect(swapped).to.not.equal(preRecord);
+		expect(swapped.rbfAttempt).to.equal(1);
+		expect(swapped.fundingFeeratePerkw).to.equal(2000);
+
+		// With the replacement recorded the guard reopens: a further RBF at
+		// the recorded attempt's floor goes out normally.
+		const third = h.opener.initiateTxRbf(2083);
+		expect(findError(third)).to.equal(null);
+		expect(findPayload(third, MessageType.TX_INIT_RBF)).to.not.equal(null);
+	});
+
+	it('an ack-time initiateRbf failure unwinds on the wire: tx_abort out, the peer rolls back, the echo is swallowed', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+		const preRecord = h.opener.getFullState().v2InFlight!;
+		const attempt0Txid = Buffer.from(preRecord.fundingTxid);
+
+		// The peer accepts the request: it is now mid-replacement, holding
+		// its own retained rollback record.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const ackAnswer = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(ackAnswer, MessageType.TX_ACK_RBF)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.DUAL_FUNDING_V2);
+		expect(
+			h.acceptor.getFullState().dualFundingSession!.getRbfCount()
+		).to.equal(1);
+
+		// The stale-record guard makes this arm unreachable through the
+		// public API, so induce the session failure directly: the channel
+		// must still unwind ON THE WIRE, never with a bare local error that
+		// leaves the committed peer waiting for tx_add_* forever.
+		const session = h.opener.getFullState().dualFundingSession!;
+		session.initiateRbf = (): { ok: boolean; error?: string } => ({
+			ok: false,
+			error: 'induced ack-time failure'
+		});
+		const ack = h.opener.handleTxAckRbf();
+		const abortPayload = findPayload(ack, MessageType.TX_ABORT);
+		expect(abortPayload, 'the failed ack unwinds on the wire').to.not.equal(
+			null
+		);
+		expect(
+			decodeTxAbortMessage(abortPayload!).data.toString('utf8')
+		).to.contain('induced ack-time failure');
+		expect(findError(ack)).to.contain('induced ack-time failure');
+		// The failure fired before the session mutated anything: the current
+		// attempt stays fully live, nothing to roll back or persist.
+		expect(ack.some((a) => a.type === ChannelActionType.PERSIST_STATE)).to.be
+			.false;
+		expect(h.opener.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		expect(h.opener.getFullState().v2InFlight).to.equal(preRecord);
+		expect(preRecord.rbfAttempt).to.equal(0);
+
+		// The peer's retained rollback record returns it to the shared
+		// previous attempt, durably, and it answers with the echo.
+		const peerAnswer = h.acceptor.handleTxAbort();
+		expect(
+			peerAnswer.some((a) => a.type === ChannelActionType.PERSIST_STATE),
+			'the rollback persists'
+		).to.be.true;
+		expect(findPayload(peerAnswer, MessageType.TX_ABORT)).to.not.equal(null);
+		expect(h.acceptor.getState()).to.equal(ChannelState.AWAITING_TX_SIGNATURES);
+		const peerRecord = h.acceptor.getFullState().v2InFlight!;
+		expect(peerRecord.fundingTxid.equals(attempt0Txid)).to.be.true;
+		expect(peerRecord.rbfAttempt).to.equal(0);
+		expect(
+			h.acceptor.getFullState().dualFundingSession!.getRbfCount()
+		).to.equal(0);
+
+		// The echo lands in the sent-latch swallow (no _v2AbortPending
+		// teardown), and the original attempt still completes on both sides.
+		expect(h.opener.handleTxAbort()).to.deep.equal([]);
+		completeExchange(h);
+		expect(h.opener.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(h.acceptor.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+	});
+
 	it('freezes the old attempt while an RBF request is pending; the ack revalidates the binding', () => {
 		// The acceptor contributes MORE, so the opener signs first: without
 		// the freeze, the crossed commitment_signed below would release
