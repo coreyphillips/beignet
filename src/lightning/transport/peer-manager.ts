@@ -348,18 +348,27 @@ export class PeerManager extends EventEmitter {
 			this.pendingDialsByPubkey.set(pubkey, pendingDials);
 		}
 		pendingDials.add(peer);
+		// Join (or open) the burst of overlapping dials for this pubkey. All
+		// their failures roll back to the SAME target; a per-dial snapshot
+		// would capture another overlapping dial's attempt and restore it
+		// after that attempt already failed.
+		let burst = this.dialBurstPrevious.get(pubkey);
+		if (!burst) {
+			burst = { previous: previousAddress };
+			this.dialBurstPrevious.set(pubkey, burst);
+		}
 
 		try {
 			await peer.connect();
 		} catch (err) {
-			// Restore the last-known-good address (keep the attempted one only
-			// when there was no previous address, so initial connects still retry).
-			// This dial owns the rollback only while its own entry is still the
-			// stored one: a concurrent newer dial may have stored a fresh address,
-			// and restoring over it would poison every future reconnect with the
-			// stale snapshot.
-			if (previousAddress && this.peerAddresses.get(pubkey) === addressEntry) {
-				this.peerAddresses.set(pubkey, previousAddress);
+			// Roll back to the burst's last proven address (keep the attempted
+			// one only when there is none, so initial connects still retry).
+			// Only the dial whose own entry is still the stored one may roll
+			// back: a concurrent newer dial may have stored a fresh address,
+			// and restoring over it would poison every future reconnect with
+			// a stale snapshot.
+			if (burst.previous && this.peerAddresses.get(pubkey) === addressEntry) {
+				this.peerAddresses.set(pubkey, burst.previous);
 			}
 			// A dial aborted BY the cancellation is reported as the typed
 			// cancellation, not as an address failure a retry loop would
@@ -373,8 +382,12 @@ export class PeerManager extends EventEmitter {
 			pendingDials.delete(peer);
 			if (pendingDials.size === 0) {
 				this.pendingDialsByPubkey.delete(pubkey);
+				this.dialBurstPrevious.delete(pubkey);
 			}
 		}
+		// The completed handshake proves this address dials the peer: later
+		// overlapping failures roll back to it, never past it.
+		burst.previous = addressEntry;
 		// Recheck AFTER the async establishment: a freeze, destroy or gate
 		// closure that landed mid-handshake must win over registration.
 		if (
@@ -426,6 +439,10 @@ export class PeerManager extends EventEmitter {
 			}
 		}
 		this.peers.set(pubkey, peer);
+		// A newer overlapping dial may have stored its own attempt meanwhile;
+		// the registered connection's address is the one listPeers() reports
+		// and the peer:connect handlers persist, so re-assert it.
+		this.peerAddresses.set(pubkey, addressEntry);
 		// Reset the backoff only AFTER the connection proves stable, not
 		// immediately — otherwise a peer that drops right after connecting keeps
 		// reconnecting at the minimum delay. The disconnect handler clears this
@@ -632,6 +649,23 @@ export class PeerManager extends EventEmitter {
 	 * of leaving its socket live until it finishes or times out.
 	 */
 	private pendingDialsByPubkey = new Map<string, Set<Peer>>();
+	/**
+	 * While dials for a pubkey overlap, the shared rollback target their
+	 * failures restore: the last address proven by a completed handshake,
+	 * seeded with the address that stood before the burst's first attempt
+	 * was stored. Per-dial snapshots cannot compose here: with three or
+	 * more overlapping dials, whichever failure still owns the stored
+	 * entry would restore another dial's already-failed attempt. Lives
+	 * exactly as long as pendingDialsByPubkey has entries for the pubkey.
+	 */
+	private dialBurstPrevious = new Map<
+		string,
+		{
+			previous:
+				| { host: string; port: number; transport?: IPeerTransportOptions }
+				| undefined;
+		}
+	>();
 
 	/**
 	 * Listeners whose bind has not completed. this.server / this.wsServer are
