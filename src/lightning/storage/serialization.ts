@@ -1100,7 +1100,15 @@ export function serializeGraphChannel(ch: IGraphChannel): string {
 }
 
 export function deserializeGraphChannel(json: string): IGraphChannel {
-	return JSON.parse(json, genericReviver) as IGraphChannel;
+	const ch = JSON.parse(json, genericReviver) as IGraphChannel;
+	// Rows persisted before provenance tracking (#340) could only come from
+	// the signature-verified receive path, so an absent flag means verified.
+	// Explicit false (e.g. a verified update on an RGS-primed channel)
+	// round-trips untouched.
+	ch.announcementVerified ??= true;
+	if (ch.update1) ch.update1Verified ??= true;
+	if (ch.update2) ch.update2Verified ??= true;
+	return ch;
 }
 
 export function serializeGraphNode(node: IGraphNode): string {
@@ -1113,13 +1121,19 @@ export function serializeGraphNode(node: IGraphNode): string {
 			node.announcement as unknown as Record<string, unknown>
 		);
 	}
+	if (node.announcementVerified !== undefined) {
+		obj.announcementVerified = node.announcementVerified;
+	}
 	return JSON.stringify(obj);
 }
 
 export function deserializeGraphNode(json: string): IGraphNode {
 	const parsed = JSON.parse(json, genericReviver);
-	return {
+	const node = {
 		...parsed,
 		channels: new Set(parsed.channels as string[])
 	} as IGraphNode;
+	// Legacy rows (pre-#340) only ever held verified announcements.
+	if (node.announcement) node.announcementVerified ??= true;
+	return node;
 }

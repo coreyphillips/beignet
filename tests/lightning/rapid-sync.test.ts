@@ -167,6 +167,27 @@ describe('Rapid Gossip Sync (v1 snapshot parsing)', () => {
 		expect(graph.getChannelCount()).to.equal(1);
 	});
 
+	it('keeps snapshot entries unverified so gossip queries never serve them (issue #340)', () => {
+		// RGS strips signatures, so serving these would get us disconnected by
+		// strict peers (BOLT 7: MUST NOT relay unvalidated announcements).
+		const graph = new NetworkGraph();
+		applyRapidGossipSnapshot(
+			graph,
+			baseSnapshot([
+				{ scid, flags: 0x00 },
+				{ scid, flags: 0x01 }
+			])
+		);
+		const scidBuf = encodeShortChannelId(
+			decodeShortChannelId(Buffer.from(u64(scid)))
+		);
+		expect(graph.getChannel(scidBuf)!.announcementVerified).to.not.be.true;
+		expect(graph.getChannelsByBlockRange(800000, 1).length).to.equal(0);
+		const served = graph.getGossipMessagesForChannels([scidBuf]);
+		expect(served.announcements.length).to.equal(0);
+		expect(served.updates.length).to.equal(0);
+	});
+
 	it('applies all explicitly-present update fields', () => {
 		const graph = new NetworkGraph();
 		// flags: dir0 + all five field bits (0x40|0x20|0x10|0x08|0x04) = 0x7C

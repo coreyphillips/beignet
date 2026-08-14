@@ -43,7 +43,9 @@ import { MonitorState } from '../../src/lightning/chain/types';
 import {
 	IGraphChannel,
 	IGraphNode,
-	IChannelAnnouncementMessage
+	IChannelAnnouncementMessage,
+	IChannelUpdateMessage,
+	INodeAnnouncementMessage
 } from '../../src/lightning/gossip/types';
 import { BITCOIN_CHAIN_HASH } from '../../src/lightning/channel/types';
 
@@ -278,6 +280,114 @@ describe('Storage Layer', function () {
 			expect(deserialized.nodeId.equals(nodeId)).to.be.true;
 			expect(deserialized.channels.has('abc123')).to.be.true;
 			expect(deserialized.channels.has('def456')).to.be.true;
+		});
+
+		function makeGraphChannelFixture(): IGraphChannel {
+			const nodeId1 = getPublicKey(makeSeed(1));
+			const nodeId2 = getPublicKey(makeSeed(2));
+			const [n1, n2] =
+				Buffer.compare(nodeId1, nodeId2) < 0
+					? [nodeId1, nodeId2]
+					: [nodeId2, nodeId1];
+			const ann: IChannelAnnouncementMessage = {
+				nodeSignature1: crypto.randomBytes(64),
+				nodeSignature2: crypto.randomBytes(64),
+				bitcoinSignature1: crypto.randomBytes(64),
+				bitcoinSignature2: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: Buffer.from('0000010000020003', 'hex'),
+				nodeId1: n1,
+				nodeId2: n2,
+				bitcoinKey1: getPublicKey(makeSeed(3)),
+				bitcoinKey2: getPublicKey(makeSeed(4))
+			};
+			const update: IChannelUpdateMessage = {
+				signature: crypto.randomBytes(64),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: ann.shortChannelId,
+				timestamp: 1000,
+				messageFlags: 0x01,
+				channelFlags: 0,
+				cltvExpiryDelta: 40,
+				htlcMinimumMsat: 1000n,
+				feeBaseMsat: 1000,
+				feeProportionalMillionths: 1,
+				htlcMaximumMsat: 1_000_000_000n
+			};
+			return {
+				shortChannelId: ann.shortChannelId,
+				nodeId1: n1,
+				nodeId2: n2,
+				features: Buffer.alloc(0),
+				announcement: ann,
+				update1: update
+			};
+		}
+
+		it('treats legacy persisted graph rows without provenance flags as verified', function () {
+			// Rows written before #340 could only come from the
+			// signature-verified receive path.
+			const channel = makeGraphChannelFixture();
+			const restored = deserializeGraphChannel(serializeGraphChannel(channel));
+			expect(restored.announcementVerified).to.be.true;
+			expect(restored.update1Verified).to.be.true;
+			// No update2 in the row: no flag is invented for it.
+			expect(restored.update2Verified).to.be.undefined;
+
+			const nodeAnn: INodeAnnouncementMessage = {
+				signature: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				timestamp: 1000,
+				nodeId: getPublicKey(makeSeed(1)),
+				rgbColor: Buffer.from([255, 0, 0]),
+				alias: Buffer.alloc(32),
+				addresses: []
+			};
+			const node: IGraphNode = {
+				nodeId: nodeAnn.nodeId,
+				announcement: nodeAnn,
+				channels: new Set(['abc123'])
+			};
+			const restoredNode = deserializeGraphNode(serializeGraphNode(node));
+			expect(restoredNode.announcementVerified).to.be.true;
+
+			// A node row without an announcement gets no flag either.
+			const bare: IGraphNode = {
+				nodeId: getPublicKey(makeSeed(2)),
+				channels: new Set()
+			};
+			const restoredBare = deserializeGraphNode(serializeGraphNode(bare));
+			expect(restoredBare.announcementVerified).to.be.undefined;
+		});
+
+		it('round-trips explicit provenance flags', function () {
+			// Mixed provenance happens in production: a verified update applied
+			// to an RGS-primed (unverified) channel is persisted whole.
+			const channel = makeGraphChannelFixture();
+			channel.announcementVerified = false;
+			channel.update1Verified = true;
+			const restored = deserializeGraphChannel(serializeGraphChannel(channel));
+			expect(restored.announcementVerified).to.be.false;
+			expect(restored.update1Verified).to.be.true;
+
+			const nodeAnn: INodeAnnouncementMessage = {
+				signature: crypto.randomBytes(64),
+				features: Buffer.alloc(0),
+				timestamp: 1000,
+				nodeId: getPublicKey(makeSeed(1)),
+				rgbColor: Buffer.from([255, 0, 0]),
+				alias: Buffer.alloc(32),
+				addresses: []
+			};
+			const node: IGraphNode = {
+				nodeId: nodeAnn.nodeId,
+				announcement: nodeAnn,
+				channels: new Set(['abc123']),
+				announcementVerified: false
+			};
+			const restoredNode = deserializeGraphNode(serializeGraphNode(node));
+			expect(restoredNode.announcementVerified).to.be.false;
 		});
 	});
 

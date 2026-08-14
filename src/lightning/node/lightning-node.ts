@@ -3294,12 +3294,12 @@ export class LightningNode extends EventEmitter {
 					}
 				}
 
-				// Add to our own network graph
+				// Add to our own network graph (self-signed: safe to serve)
 				try {
 					const annMsg = decodeChannelAnnouncementMessage(channelAnnouncement);
-					this.graph.addChannelAnnouncement(annMsg);
+					this.graph.addChannelAnnouncement(annMsg, { verified: true });
 					const updateMsg = decodeChannelUpdateMessage(signedChannelUpdate);
-					this.graph.applyChannelUpdate(updateMsg);
+					this.graph.applyChannelUpdate(updateMsg, { verified: true });
 				} catch {
 					// Ignore decode errors for self-generated announcements
 				}
@@ -7824,7 +7824,9 @@ export class LightningNode extends EventEmitter {
 				update: refreshed
 			});
 			try {
-				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed));
+				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed), {
+					verified: true
+				});
 			} catch {
 				// Own-update decode failure only affects our local graph view.
 			}
@@ -9604,7 +9606,7 @@ export class LightningNode extends EventEmitter {
 		if (!verifyChannelAnnouncement(msg, payload)) {
 			return;
 		}
-		if (this.graph.addChannelAnnouncement(msg)) {
+		if (this.graph.addChannelAnnouncement(msg, { verified: true })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(
@@ -9635,7 +9637,7 @@ export class LightningNode extends EventEmitter {
 		// private channels never enters the graph, yet its channels still need
 		// a reconnect path or they sit in AWAITING_REESTABLISH forever.
 		this.captureChannelPeerAddresses(msg);
-		if (this.graph.applyNodeAnnouncement(msg)) {
+		if (this.graph.applyNodeAnnouncement(msg, { verified: true })) {
 			const node = this.graph.getNode(msg.nodeId);
 			if (node)
 				this.safeStorage(
@@ -9715,7 +9717,7 @@ export class LightningNode extends EventEmitter {
 		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
 			return;
 		}
-		if (this.graph.applyChannelUpdate(msg)) {
+		if (this.graph.applyChannelUpdate(msg, { verified: true })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(
