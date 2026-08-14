@@ -13227,8 +13227,13 @@ export class Channel {
 			];
 			// The echo terminates this exchange and the channel lives on:
 			// reset the latch the compose just set, or the swallow below
-			// would eat the peer's NEXT independent abort (issue 337).
-			this._txAbortSent = false;
+			// would eat the peer's NEXT independent abort (issue 337). NOT
+			// when the resumed release above just sent our tx_signatures:
+			// BOLT 2 forbids tx_abort after transmitting tx_signatures, and
+			// the sticky latch is what enforces that from here on.
+			if (!this._v2TxSigsReleased) {
+				this._txAbortSent = false;
+			}
 			return actions;
 		}
 
@@ -13243,11 +13248,13 @@ export class Channel {
 		if (this._txAbortSent && this._v2AbortPending) {
 			this._v2AbortPending = false;
 			if (this.isV2AttemptBroadcastable()) {
-				// The exchange is complete both ways (sent and received) and
-				// the channel lives on tracking the kept attempt: reset the
-				// latch so the peer's next independent abort is answered,
-				// not swallowed.
-				this._txAbortSent = false;
+				// The latch stays SET for the retained attempt: tx_abort has
+				// no exchange identifier, so a cleared latch could not tell
+				// the peer's next independent abort from a duplicate or an
+				// answer to our answer, and answering those would reopen the
+				// issue-294 echo loop between two sides that both kept the
+				// attempt. The swallow below absorbs further aborts; a
+				// disconnect resets the exchange.
 				return [];
 			}
 			// Mid-renegotiation the record is attempt 0 ROLLBACK state, and
@@ -13368,13 +13375,14 @@ export class Channel {
 		// the abort as the ack, but keep the record, the state and the
 		// watch.
 		if (this.isV2AttemptBroadcastable()) {
-			const actions = [this._txAbort(this._v2ChannelId())];
-			// The echo terminates this exchange and the channel lives on
-			// tracking the kept attempt: reset the latch the compose just
-			// set, or the swallow above would eat the peer's NEXT
-			// independent abort (an operator retry) instead of answering it.
-			this._txAbortSent = false;
-			return actions;
+			// The compose latches _txAbortSent, and for the RETAINED attempt
+			// it stays latched: tx_abort has no exchange identifier, so a
+			// second inbound abort is indistinguishable from a duplicate or
+			// an answer to this echo, and answering it would reopen the
+			// issue-294 echo loop between two sides that both kept the
+			// attempt. The swallow above absorbs it; a disconnect resets the
+			// exchange.
+			return [this._txAbort(this._v2ChannelId())];
 		}
 
 		session.abort();

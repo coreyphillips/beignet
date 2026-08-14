@@ -2101,7 +2101,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.acceptor.getState()).to.equal(ChannelState.ERRORED);
 	});
 
-	it('answers an operator abort retry after a broadcastable-keep echo (issue 337)', () => {
+	it('a broadcastable-keep echo stays latched: an abort retry is consumed, not answered (issue 337)', () => {
 		const h = driveToCommitmentExchange();
 		deliverCommitments(h);
 
@@ -2141,15 +2141,19 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 
 		// The operator retries before that echo is processed (legal: a
 		// pending abort only bars RBF and rollback exchanges, not a
-		// re-send). The keep-echo's latch must not swallow the retry.
+		// re-send). tx_abort has no exchange identifier, so the retained
+		// side cannot tell the retry from a duplicate or an answer to its
+		// own echo: the keep-echo's latch stays sticky and the retry is
+		// consumed, never answered with a second echo (which could feed the
+		// issue-294 loop). The retry is redundant anyway: the first echo,
+		// already in flight, completes the aborter's exchange.
 		const abort2 = h.opener.abortDualFunding('operator retry');
 		expect(findError(abort2)).to.equal(null);
 		expect(findPayload(abort2, MessageType.TX_ABORT)).to.not.equal(null);
-		const echo2 = h.acceptor.handleTxAbort();
 		expect(
-			findPayload(echo2, MessageType.TX_ABORT),
-			'the retry is answered, not swallowed'
-		).to.not.equal(null);
+			h.acceptor.handleTxAbort(),
+			'the retry is consumed, not answered'
+		).to.deep.equal([]);
 		expect(h.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
 			null,
 			undefined
@@ -2164,7 +2168,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 	});
 
-	it('a kept zero-input attempt answers every subsequent abort (issue 337)', () => {
+	it('a kept zero-input attempt consumes further aborts without answering (issue 337)', () => {
 		const h = driveToCommitmentExchange({ acceptorNoInput: true });
 		deliverCommitments(h);
 
@@ -2192,21 +2196,22 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			.be.true;
 		expect(h.opener.getState()).to.equal(ChannelState.ERRORED);
 
-		// A further abort from the peer (its side forgot the attempt and a
-		// later retransmit or operator action re-sends) must be echoed
-		// again, not swallowed by the latch of the keep-echo.
-		const echo2 = h.acceptor.handleTxAbort();
+		// A further abort at the retained side is indistinguishable from a
+		// duplicate or an answer to the keep-echo (tx_abort has no exchange
+		// identifier), so the sticky latch consumes it without a second
+		// echo, and the attempt stays kept.
 		expect(
-			findPayload(echo2, MessageType.TX_ABORT),
-			'the next abort is answered, not swallowed'
-		).to.not.equal(null);
+			h.acceptor.handleTxAbort(),
+			'the next abort is consumed, not answered'
+		).to.deep.equal([]);
+		expect(h.acceptor.getState()).to.not.equal(ChannelState.ERRORED);
 		expect(h.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
 			null,
 			undefined
 		]);
 	});
 
-	it('a zero-input aborter keeps the attempt at the echo and answers later aborts (issue 337)', () => {
+	it('a zero-input aborter keeps the attempt at the echo and consumes later aborts (issue 337)', () => {
 		// Before the commitment exchange completes, a zero-input acceptor
 		// has not yet auto-released its empty tx_signatures, so an operator
 		// abort of the recorded open is still legal, and its own side of
@@ -2237,17 +2242,81 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			undefined
 		]);
 
-		// A further abort from the peer must be echoed, not swallowed by a
-		// latch left over from the completed exchange.
-		const echo2 = h.acceptor.handleTxAbort();
+		// A further abort at the retained side is indistinguishable from a
+		// duplicate or an answer to our answer (tx_abort has no exchange
+		// identifier), so the sticky latch consumes it without a second
+		// echo, and the attempt stays kept.
 		expect(
-			findPayload(echo2, MessageType.TX_ABORT),
-			'the next abort is answered, not swallowed'
-		).to.not.equal(null);
+			h.acceptor.handleTxAbort(),
+			'the next abort is consumed, not answered'
+		).to.deep.equal([]);
+		expect(h.acceptor.getState()).to.not.equal(ChannelState.ERRORED);
 		expect(h.acceptor.getFullState().v2InFlight).to.not.be.oneOf([
 			null,
 			undefined
 		]);
+	});
+
+	it('keeps the refusal-echo latch when the resumed release sent tx_signatures (issue 337)', () => {
+		const h = driveToCommitmentExchange();
+		deliverCommitments(h);
+
+		// The opener stages its witnesses; it signs second (larger
+		// contribution), so nothing leaves yet.
+		const staged = h.opener.sendTxSignatures(
+			h.opener.getFullState().fundingTxid!,
+			h.opener.getFullState().fundingOutputIndex,
+			h.openerWitness()
+		);
+		expect(findError(staged)).to.equal(null);
+		expect(findPayload(staged, MessageType.TX_SIGNATURES)).to.equal(null);
+
+		// The opener requests an RBF; the acceptor's tx_signatures (it
+		// signs first) cross the request on the wire. The frozen release
+		// holds while the request is unanswered.
+		expect(findError(h.opener.initiateTxRbf(2000))).to.equal(null);
+		const accSig = h.acceptor.sendTxSignatures(
+			h.acceptor.getFullState().fundingTxid!,
+			h.acceptor.getFullState().fundingOutputIndex,
+			h.acceptorWitness()
+		);
+		expect(findError(accSig)).to.equal(null);
+		const crossed = h.opener.handleTxSignatures(
+			decodeTxSignaturesMessage(findPayload(accSig, MessageType.TX_SIGNATURES)!)
+		);
+		expect(findError(crossed)).to.equal(null);
+		expect(
+			findPayload(crossed, MessageType.TX_SIGNATURES),
+			'the release stays frozen behind the pending request'
+		).to.equal(null);
+
+		// The acceptor refuses the crossed request (its attempt is already
+		// broadcastable). The refusal completes the exchange at the opener:
+		// echo out, and the thawed release sends the staged witnesses in
+		// the same batch.
+		const refusal = h.acceptor.handleTxInitRbf({
+			channelId: h.acceptor.getChannelId()!,
+			locktime: 0,
+			feerate: 2000
+		});
+		expect(findPayload(refusal, MessageType.TX_ABORT)).to.not.equal(null);
+		const answer = h.opener.handleTxAbort();
+		expect(
+			findPayload(answer, MessageType.TX_ABORT),
+			'the refusal is echoed'
+		).to.not.equal(null);
+		expect(
+			findPayload(answer, MessageType.TX_SIGNATURES),
+			'the resumed release sends the staged witnesses'
+		).to.not.equal(null);
+
+		// Our witnesses have left: BOLT 2 forbids sending tx_abort after
+		// transmitting tx_signatures, so the latch stays sticky and any
+		// later inbound abort is consumed, never answered with an echo.
+		expect(
+			h.opener.handleTxAbort(),
+			'no tx_abort leaves after tx_signatures'
+		).to.deep.equal([]);
 	});
 
 	it('freezes commitment and signature release while an abort is pending, and serializes abort with RBF', () => {
