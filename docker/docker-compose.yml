@@ -1,7 +1,9 @@
 services:
   bitcoind:
     container_name: bitcoin
-    image: btcpayserver/bitcoin:29.1
+    # 31.0: eclair 0.14.1 (needed for the post-#1289 channel_reestablish wire
+    # form, issue #305) asserts Bitcoin Core 31 or higher at startup.
+    image: btcpayserver/bitcoin:31.0
     restart: unless-stopped
     expose:
       - '43782'
@@ -36,7 +38,7 @@ services:
       start_period: 10s
 
   bitcoinsetup:
-    image: btcpayserver/bitcoin:29.1
+    image: btcpayserver/bitcoin:31.0
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -133,13 +135,14 @@ services:
 
   eclair:
     container_name: eclair
-    # Pinned: acinq/eclair:latest moved to a build that asserts "Eclair
-    # requires Bitcoin Core 30 or higher" against our bitcoind 29.1, then
-    # crash-loops under restart:unless-stopped and starves the CI runner
-    # (electrs loses its connection mid-suite and every tests job fails).
-    # polarlightning/eclair:0.13.1 is the same eclair version the interop
-    # suites are validated against locally.
-    image: polarlightning/eclair:0.13.1
+    # Built locally from the official 0.14.1 release zip (see eclair/Dockerfile):
+    # 0.14.x implements the post-#1289 channel_reestablish next_funding form
+    # needed to resume a v2 open (issue #305), and no upstream 0.14.x image
+    # runs natively on arm64 (polarlightning stops at 0.13.1; the amd64
+    # acinq/eclair build SIGSEGVs under Rosetta). Requires the bitcoind 31.x
+    # image pinned above; a lower Core version makes eclair crash-loop under
+    # restart:unless-stopped and starve the CI runner.
+    build: ./eclair
     depends_on:
       bitcoind:
         condition: service_healthy
@@ -164,11 +167,14 @@ services:
         -Declair.bitcoind.rpcport=43782
         -Declair.bitcoind.rpcuser=polaruser
         -Declair.bitcoind.rpcpassword=polarpass
-        -Declair.bitcoind.wallet=
+        -Declair.bitcoind.wallet=default
         -Declair.bitcoind.zmqblock=tcp://bitcoind:28334
         -Declair.bitcoind.zmqtx=tcp://bitcoind:28335
         -Declair.channel.min-public-funding-satoshis=20000
         -Declair.channel.min-private-funding-satoshis=20000
+        -Declair.channel.max-restart-watch-delay=1s
+        -Declair.channel.max-block-processing-delay=1s
+        -Declair.features.option_dual_fund=optional
         -Declair.printToConsole
 
   electrs:

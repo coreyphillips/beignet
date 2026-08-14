@@ -606,9 +606,6 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				const channelId = channels[0].getChannelId();
 				if (channelId) {
 					node.handleFundingConfirmed(channelId);
-
-					// Setup routing for beignet → Eclair
-					setupRoutingForChannel(node, eclairPubkey);
 				}
 			}
 			await sleep(1000);
@@ -618,6 +615,13 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 			await sleep(3000);
 
 			await waitForEclairChannels(eclair, 1, 30_000);
+
+			// Setup routing for beignet -> Eclair AFTER the final reconnect:
+			// the synthetic graph entry has zeroed signatures, and if it exists
+			// when Eclair runs its on-connect gossip sync, beignet serves it in
+			// reply to query_short_channel_ids and Eclair 0.14+ closes the
+			// connection on the malformed announcement (0.13.x only warned).
+			setupRoutingForChannel(node, eclairPubkey);
 
 			// Create Eclair invoice
 			const eclairInvoice = await eclair.createInvoice(

@@ -11,9 +11,11 @@ import {
 
 // Wallet-scoped RPC URL: the shared bitcoind container can have wallets
 // loaded by other projects, and wallet RPCs sent to the root path then fail
-// with code -19 ("Multiple wallets are loaded"). /wallet/ targets the
-// historical default wallet (empty name); node-level RPCs work there too.
-export const bitcoinURL = 'http://polaruser:polarpass@127.0.0.1:43782/wallet/';
+// with code -19 ("Multiple wallets are loaded"). /wallet/default targets the
+// wallet the btcpayserver/bitcoin 31.x image creates (the pre-31 images used
+// the empty name); node-level RPCs work there too.
+export const bitcoinURL =
+	'http://polaruser:polarpass@127.0.0.1:43782/wallet/default';
 export const electrumHost = '127.0.0.1';
 export const electrumPort = 60001;
 

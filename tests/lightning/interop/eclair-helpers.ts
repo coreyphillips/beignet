@@ -178,7 +178,18 @@ export async function restartEclairAndSync(
 				lastLog = elapsed;
 			}
 
-			if (info.blockHeight >= targetHeight) return;
+			if (info.blockHeight >= targetHeight) {
+				// The restart re-arms Eclair's channel watches, but a re-armed
+				// watch only re-checks confirmations when a NEW block event
+				// arrives; without a trigger block, funding confirmed BEFORE
+				// the restart goes unnoticed until unrelated mining happens.
+				try {
+					await mineBlocks(1);
+				} catch {
+					/* best effort */
+				}
+				return;
+			}
 		} catch {
 			// Eclair still starting up
 		}

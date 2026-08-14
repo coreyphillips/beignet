@@ -31,8 +31,9 @@ const BITCOIN_RPC_PASS = 'polarpass';
 // The shared bitcoind container can have wallets loaded by OTHER projects;
 // wallet-scoped RPCs sent to the root path then fail with code -19
 // ("Multiple wallets are loaded"). Always target our wallet explicitly via
-// the /wallet/<name> URI (the historical default wallet has the empty name).
-const BITCOIN_RPC_WALLET = process.env.BITCOIN_RPC_WALLET ?? '';
+// the /wallet/<name> URI ('default' is the wallet the btcpayserver/bitcoin
+// 31.x image creates; the pre-31 images used the empty name).
+const BITCOIN_RPC_WALLET = process.env.BITCOIN_RPC_WALLET ?? 'default';
 
 /**
  * Deterministic test mnemonic for reproducible interop testing.
