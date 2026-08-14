@@ -639,6 +639,12 @@ export class LightningNode extends EventEmitter {
 	private _pendingCloseTxids: Map<string, string> = new Map(); // txidHex -> channelIdHex
 	private _lastCloseBroadcast: Map<string, { txid: string; ok: boolean }> =
 		new Map(); // channelIdHex -> last close-tx broadcast result
+	// Terminal-state (CLOSED/FORCE_CLOSED/ERRORED) channel persists that
+	// failed. A terminal channel may never see another transition or monitor
+	// update to ride, so without this per-block retry a one-shot storage
+	// failure leaves disk on the pre-close state (and without closeReason)
+	// forever.
+	private _failedTerminalPersists: Set<string> = new Set();
 	private reestablishTimeoutBlocks: number;
 	private readonly autoReconnect: boolean;
 	private walCheckpointTimer: ReturnType<typeof setInterval> | null = null;
@@ -2311,12 +2317,42 @@ export class LightningNode extends EventEmitter {
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
 			if (staged.length) this.stagedMutations.unshift(...staged);
+			// A failed persist of a TERMINAL state has no later transition to
+			// ride; arm the per-block retry so the close (and its closeReason)
+			// still reaches disk once storage recovers.
+			const failedState = channel.getFullState().state;
+			if (
+				failedState === ChannelState.CLOSED ||
+				failedState === ChannelState.FORCE_CLOSED ||
+				failedState === ChannelState.ERRORED
+			) {
+				this._failedTerminalPersists.add(channelIdHex);
+			}
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
 				message: `Failed to persist channel: ${result.error?.message}`,
 				timestamp: Date.now()
 			} as ILightningError);
+		} else {
+			this._failedTerminalPersists.delete(channelIdHex);
+		}
+	}
+
+	/**
+	 * Retry channel persists whose terminal state never reached disk (run
+	 * once per block). Success removes the entry inside persistChannelState;
+	 * another failure re-arms it there too.
+	 */
+	private retryFailedTerminalPersists(): void {
+		if (this._failedTerminalPersists.size === 0) return;
+		for (const idHex of [...this._failedTerminalPersists]) {
+			const channelId = Buffer.from(idHex, 'hex');
+			if (!this.channelManager.getChannel(channelId)) {
+				this._failedTerminalPersists.delete(idHex);
+				continue;
+			}
+			this.persistChannel(channelId);
 		}
 	}
 
@@ -7618,13 +7654,17 @@ export class LightningNode extends EventEmitter {
 		// times out into a force-close, that path relabels with the terminal
 		// reason.
 		const channel = this.channelManager.getChannel(channelId);
+		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason('user') ?? false;
 		const result = this.channelManager.initiateShutdown(
 			channelId,
 			scriptPubkey
 		);
 		if (!result.ok) {
-			if (stamped) channel!.clearCloseReason();
+			if (stamped) {
+				channel!.clearCloseReason();
+				if (prevReason !== undefined) channel!.recordCloseReason(prevReason);
+			}
 			this.emit('node:error', {
 				code: 'CLOSE_CHANNEL_FAILED',
 				channelId,
@@ -8084,6 +8124,7 @@ export class LightningNode extends EventEmitter {
 		reason: ChannelCloseReason
 	): ChannelResult {
 		const channel = this.channelManager.getChannel(channelId);
+		const prevReason = channel?.getFullState().closeReason;
 		const stamped = channel?.recordCloseReason(reason) ?? false;
 		const result = this.channelManager.forceClose(
 			channelId,
@@ -8091,7 +8132,14 @@ export class LightningNode extends EventEmitter {
 			feeRatePerVbyte
 		);
 		if (!result.ok) {
-			if (stamped) channel!.clearCloseReason();
+			// A refused close must not leave this attempt's label behind, but
+			// it must also not erase a reason an earlier close attempt validly
+			// recorded (e.g. 'user' from a coop close a failed automatic
+			// escalation tried to relabel).
+			if (stamped) {
+				channel!.clearCloseReason();
+				if (prevReason !== undefined) channel!.recordCloseReason(prevReason);
+			}
 			return result;
 		}
 		for (const action of result.actions) {
@@ -8178,10 +8226,14 @@ export class LightningNode extends EventEmitter {
 		}
 		const state = channel.getState();
 		const monitor = this.channelManager.getMonitor(channelId);
-		// A confirmed or fully swept close needs no rebroadcast: no-op success.
+		// A CONFIRMED close needs no rebroadcast: no-op success. The gate is
+		// isCommitmentConfirmed alone, deliberately not isFullyResolved: a
+		// cooperative close is marked fully resolved the moment it is
+		// classified, possibly from a mempool sighting (issue #338), and an
+		// unconfirmed mutual close is exactly what this route exists to
+		// re-send. A genuinely resolved force-close is always also confirmed.
 		const closeSettled =
-			monitor !== undefined &&
-			(monitor.isFullyResolved() || monitor.isCommitmentConfirmed());
+			monitor !== undefined && monitor.isCommitmentConfirmed();
 		if (
 			closeSettled &&
 			(state === ChannelState.FORCE_CLOSED || state === ChannelState.CLOSED)
@@ -8255,7 +8307,11 @@ export class LightningNode extends EventEmitter {
 			}
 		} catch (err) {
 			const msg = err instanceof Error ? err.message : String(err);
-			ok = /already|duplicate|in mempool|in block/i.test(msg);
+			// Only the KNOWN duplicate-transaction rejections count as success
+			// (same allowlist as broadcastPendingFundingTx). A broad match is
+			// dangerous: "Input already spent by conflicting transaction" also
+			// says "already" but means this tx can never be in the network.
+			ok = /already in block ?chain|already known|txn-already/i.test(msg);
 		}
 		this._lastCloseBroadcast.set(idHex, { txid, ok });
 		return ok;
@@ -9265,8 +9321,9 @@ export class LightningNode extends EventEmitter {
 			s === ChannelState.NEGOTIATING_CLOSING ||
 			s === ChannelState.CLOSED ||
 			s === ChannelState.FORCE_CLOSED ||
-			// A pre-funding error has nothing on chain to report.
-			(s === ChannelState.ERRORED && state.fundingTxid !== undefined);
+			// A pre-funding error has nothing on chain to report (the field is
+			// initialized to null, so a bare undefined check is not enough).
+			(s === ChannelState.ERRORED && state.fundingTxid != null);
 		if (!closing) return undefined;
 
 		const idHex = channelId.toString('hex');
@@ -9318,12 +9375,25 @@ export class LightningNode extends EventEmitter {
 				monitor === undefined
 					? 'pending'
 					: monitor.getState() === MonitorState.FULLY_RESOLVED
-					? 'resolved'
+					? // A cooperative close is marked fully resolved at
+					  // classification, possibly from a mempool sighting (issue
+					  // #338). An unconfirmed close is never 'resolved'; report it
+					  // as still pending so consumers do not read a terminal
+					  // guarantee that a reorg can void.
+					  monitor.isCommitmentConfirmed()
+						? 'resolved'
+						: 'pending'
 					: monitor.getState() === MonitorState.RESOLVING
 					? 'sweeping'
 					: 'pending'
 		};
-		if (state.closeReason) status.reason = state.closeReason;
+		// Our stamped reason describes OUR close. When the spend that actually
+		// resolved the channel was the peer's (simultaneous-close race, or a
+		// remote close after our coop attempt), the reason no longer describes
+		// what happened: peer closes report no reason, per the contract.
+		if (state.closeReason && (closer === 'local' || closer === 'cooperative')) {
+			status.reason = state.closeReason;
+		}
 
 		if (cb?.txid) {
 			status.closingTxid = cb.txid;
@@ -14284,6 +14354,7 @@ export class LightningNode extends EventEmitter {
 		// or a mempool eviction never orphans a signed funding.
 		this.retryPendingFundingBroadcasts();
 		this.retryPendingSpliceBroadcasts();
+		this.retryFailedTerminalPersists();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(

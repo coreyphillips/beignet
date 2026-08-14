@@ -273,6 +273,7 @@ describe('HTTP Route Fixes', () => {
 			expect((missing.body.error as { code: string }).code).to.equal(
 				'INVALID_PARAMS'
 			);
+			expect(missing.status).to.equal(400);
 
 			const unknown = await httpPost(addr.port, '/channel/rebroadcast-close', {
 				channelId: 'aa'.repeat(32)
@@ -281,6 +282,8 @@ describe('HTTP Route Fixes', () => {
 			expect((unknown.body.error as { code: string }).code).to.equal(
 				'REBROADCAST_FAILED'
 			);
+			// A caller problem (unknown channel, wrong state), never a 5xx.
+			expect(unknown.status).to.equal(400);
 		} finally {
 			await node.destroy();
 			server.close();

@@ -1049,6 +1049,20 @@ export class BeignetNode extends EventEmitter {
 		this.node.on('channel:resolved', (data: { channelId: Buffer }) => {
 			this.refreshStaticChannelBackup();
 			const channelId = data.channelId.toString('hex');
+			// Issue #338: the engine currently marks a cooperative close fully
+			// resolved the moment it is classified, possibly from a mempool
+			// sighting. An unconfirmed close is not a terminal guarantee (a
+			// reorg can void it), so do not relay it as one; once #338 gates
+			// the engine event on burial this guard never triggers.
+			const monitor = this.node.getChannelManager().getMonitor(data.channelId);
+			if (monitor && !monitor.isCommitmentConfirmed()) {
+				this.log(
+					'warn',
+					'Suppressing channel:resolved relay for unconfirmed close',
+					{ channelId }
+				);
+				return;
+			}
 			this.log('info', 'Channel resolved', { channelId });
 			this.emit('channel:resolved', { channelId });
 		});

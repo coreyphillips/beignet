@@ -185,7 +185,10 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// trouble, not a node fault: none of them may read as a retryable 500.
 	RESPONSE_TOO_LARGE: 413,
 	PRIVATE_NETWORK_REFUSED: 403,
-	L402_FETCH_FAILED: 502
+	L402_FETCH_FAILED: 502,
+	// Unknown channel / wrong state / nothing recorded to rebroadcast are all
+	// problems with the caller's request, not node faults: never a 5xx.
+	REBROADCAST_FAILED: 400
 };
 
 export function statusForErrorCode(code: string): number {

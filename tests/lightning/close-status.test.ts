@@ -429,6 +429,90 @@ describe('Issue #214: manual close rebroadcast', function () {
 		fx.destroy();
 	});
 
+	it('an unconfirmed cooperative close is not terminal: pending resolution, real rebroadcast', async () => {
+		const fx = setup(381);
+		const result = fx.alice.closeChannel(fx.channelId, destScript(fx.alice));
+		expect(result.ok).to.equal(true);
+		const channel = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const closeHex = channel.getFullState().lastCooperativeCloseTxHex;
+		expect(closeHex, 'loopback negotiation recorded a mutual close').to.be.a(
+			'string'
+		);
+		// Mempool sighting only: issue #338 marks the monitor fully resolved
+		// here, which must NOT surface as a terminal guarantee.
+		observeSpend(
+			fx.alice,
+			fx.channelId,
+			bitcoin.Transaction.fromHex(closeHex).toBuffer(),
+			0
+		);
+
+		const cs = closeStatusOf(fx.alice, fx.channelId);
+		expect(cs.resolution).to.equal('pending');
+		expect(cs.confirmationHeight).to.equal(0);
+
+		// And the rebroadcast route must actually re-send, not no-op success.
+		const sent: string[] = [];
+		(fx.alice as any)._chainBackend = {
+			broadcastTransaction: async (hex: string) => {
+				sent.push(hex);
+				return bitcoin.Transaction.fromHex(hex).getId();
+			}
+		};
+		const re = await fx.alice.rebroadcastClose(fx.channelId);
+		expect(re.ok).to.equal(true);
+		expect(re.broadcastOk).to.equal(true);
+		expect(sent).to.deep.equal([closeHex]);
+		fx.destroy();
+	});
+
+	it('a confirmed cooperative close is resolved and rebroadcast is a no-op', async () => {
+		const fx = setup(391);
+		fx.alice.closeChannel(fx.channelId, destScript(fx.alice));
+		const channel = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		const closeHex = channel.getFullState().lastCooperativeCloseTxHex;
+		observeSpend(
+			fx.alice,
+			fx.channelId,
+			bitcoin.Transaction.fromHex(closeHex).toBuffer(),
+			105
+		);
+
+		const cs = closeStatusOf(fx.alice, fx.channelId);
+		expect(cs.resolution).to.equal('resolved');
+		expect(cs.confirmationHeight).to.equal(105);
+
+		const sent: string[] = [];
+		(fx.alice as any)._chainBackend = {
+			broadcastTransaction: async (hex: string) => {
+				sent.push(hex);
+				return bitcoin.Transaction.fromHex(hex).getId();
+			}
+		};
+		const re = await fx.alice.rebroadcastClose(fx.channelId);
+		expect(re.ok).to.equal(true);
+		expect(re.broadcastOk).to.equal(true);
+		expect(sent).to.deep.equal([]);
+		fx.destroy();
+	});
+
+	it('does not mistake a conflicting-input rejection for success', async () => {
+		const fx = setup(401);
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		(fx.alice as any)._chainBackend = {
+			broadcastTransaction: async () => {
+				// Contains "already" but means the tx can NEVER be in the network.
+				throw new Error('Input already spent by conflicting transaction');
+			}
+		};
+
+		const result = await fx.alice.rebroadcastClose(fx.channelId);
+		expect(result.ok).to.equal(true);
+		expect(result.broadcastOk).to.equal(false);
+		expect(closeStatusOf(fx.alice, fx.channelId).broadcast).to.equal(false);
+		fx.destroy();
+	});
+
 	it('rebroadcasts a recorded cooperative close on a CLOSED channel', async () => {
 		const fx = setup(371);
 		const channel = (fx.alice as any).channelManager.getChannel(fx.channelId);
@@ -451,6 +535,116 @@ describe('Issue #214: manual close rebroadcast', function () {
 		expect(result.txid).to.equal(coopTx.getId());
 		expect(result.broadcastOk).to.equal(true);
 		expect(sent).to.deep.equal([coopTx.toHex()]);
+		fx.destroy();
+	});
+});
+
+describe('Issue #214: review fixes', function () {
+	this.timeout(10_000);
+
+	it('a stale local reason is not reported when the peer closed', () => {
+		// Simultaneous-close race: we stamped 'user' for our own coop attempt,
+		// but the spend that resolved the channel was the peer's commitment.
+		const alice = createNode(451);
+		const bob = createNode(452);
+		connectNodes(alice, bob);
+		const opened = alice.openChannel(bob.getNodeId(), 1_000_000n, 300_000_000n);
+		const channelId = alice.createFunding(
+			opened,
+			crypto.randomBytes(32),
+			0,
+			crypto.randomBytes(64)
+		)!;
+		alice.handleFundingConfirmed(channelId);
+		bob.handleFundingConfirmed(channelId);
+		const channel = (alice as any).channelManager.getChannel(channelId);
+		expect(channel.recordCloseReason('user')).to.equal(true);
+		const bobBroadcasts: Buffer[] = [];
+		(bob as any).channelManager.on('broadcast:tx', (tx: Buffer) =>
+			bobBroadcasts.push(tx)
+		);
+		bob.forceCloseChannel(channelId, destScript(bob));
+
+		observeSpend(alice, channelId, bobBroadcasts[0], 120);
+
+		const cs = closeStatusOf(alice, channelId);
+		expect(cs.closer).to.equal('remote');
+		expect(cs.reason).to.equal(undefined);
+		alice.destroy();
+		bob.destroy();
+	});
+
+	it('an unfunded ERRORED channel gets no closeStatus', () => {
+		const fx = setup(461);
+		const state = (fx.alice as any).channelManager
+			.getChannel(fx.channelId)
+			.getFullState();
+		state.state = ChannelState.ERRORED;
+		state.fundingTxid = null;
+
+		expect(closeStatusOf(fx.alice, fx.channelId)).to.equal(undefined);
+		fx.destroy();
+	});
+
+	it('a refused automatic escalation preserves the earlier reason', () => {
+		const fx = setup(471);
+		const channel = (fx.alice as any).channelManager.getChannel(fx.channelId);
+		expect(channel.recordCloseReason('user')).to.equal(true);
+		channel.getFullState().dataLossDetected = true;
+
+		const result = (fx.alice as any)._forceCloseWithReason(
+			fx.channelId,
+			destScript(fx.alice),
+			10,
+			'STUCK_CHANNEL_FORCE_CLOSED'
+		);
+
+		expect(result.ok).to.equal(false);
+		expect(channel.getFullState().closeReason).to.equal('user');
+		fx.destroy();
+	});
+
+	it('a failed terminal persist is retried per block until it lands', () => {
+		const fx = setup(481);
+		const idHex = fx.channelId.toString('hex');
+		const commits: any[] = [];
+		let failCommits = true;
+		(fx.alice as any).storage = {};
+		(fx.alice as any).recovery = {
+			commit: (args: any) => {
+				commits.push(args);
+				return failCommits
+					? {
+							committed: false,
+							released: [],
+							frameSequence: 0,
+							error: new Error('disk full')
+					  }
+					: { committed: true, released: [], frameSequence: 1 };
+			},
+			clearChannelOutbox: () => {}
+		};
+
+		fx.alice.forceCloseChannel(fx.channelId, destScript(fx.alice));
+		expect(
+			(fx.alice as any)._failedTerminalPersists.has(idHex),
+			'failed terminal persist armed for retry'
+		).to.equal(true);
+
+		failCommits = false;
+		(fx.alice as any).retryFailedTerminalPersists();
+
+		expect((fx.alice as any)._failedTerminalPersists.size).to.equal(0);
+		const last = commits[commits.length - 1];
+		const channelMutation = last.mutations.find(
+			(m: any) => m.type === 'channel_state' && m.channelId === idHex
+		);
+		expect(
+			channelMutation,
+			'retried commit carries the channel state'
+		).to.not.equal(undefined);
+		expect(channelMutation.state.state).to.equal(ChannelState.FORCE_CLOSED);
+		expect(channelMutation.state.closeReason).to.equal('user');
 		fx.destroy();
 	});
 });
