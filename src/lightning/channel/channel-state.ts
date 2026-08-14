@@ -148,6 +148,22 @@ export interface IRemoteForwardingPolicy {
 /** Why a channel is durably waiting for the PEER's force close (5.6). */
 export type RecoveryCloseReason = 'local-data-loss' | 'state-uncertain';
 
+/**
+ * Why WE closed (or are closing) the channel. 'user' means an API-initiated
+ * close or force-close; the code values are the automatic close triggers,
+ * matching the node:error codes they emit. Never set for a close initiated by
+ * the peer or observed only on chain.
+ */
+export type ChannelCloseReason =
+	| 'user'
+	| 'REESTABLISH_TIMEOUT_FORCE_CLOSED'
+	| 'ERRORED_TIMEOUT_FORCE_CLOSED'
+	| 'STUCK_CHANNEL_FORCE_CLOSED'
+	| 'CHANNEL_FAILED_FORCE_CLOSED'
+	| 'HTLC_CLAIM_FORCE_CLOSE'
+	| 'FORWARD_TIMEOUT_FORCE_CLOSE'
+	| 'HTLC_EXPIRY_FORCE_CLOSE';
+
 export interface IChannelState {
 	/** Identity */
 	channelId: Buffer | null;
@@ -601,6 +617,13 @@ export interface IChannelState {
 	 * wire, and never a broadcast authorization.
 	 */
 	recoveryCloseReason?: RecoveryCloseReason;
+	/**
+	 * Why WE closed this channel, persisted so a restart can still explain a
+	 * terminal FORCE_CLOSED/CLOSED row. Stamped by the automatic close paths
+	 * and by the close APIs; absent for remote closes and for cooperative
+	 * closes the peer initiated.
+	 */
+	closeReason?: ChannelCloseReason;
 	/**
 	 * Data loss protection: the peer's my_current_per_commitment_point from the
 	 * reestablish that proved data loss. Stored for completeness/legacy

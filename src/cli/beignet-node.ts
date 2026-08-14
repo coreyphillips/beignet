@@ -1044,9 +1044,27 @@ export class BeignetNode extends EventEmitter {
 			this.emit('channel:voided', { channelId });
 		});
 		// A resolved channel leaves the SCB channel set (state becomes CLOSED),
-		// so refresh here too even though the event is not re-emitted.
-		this.node.on('channel:resolved', () => {
+		// so refresh here. Also relay the event: it is the true terminal event
+		// of a close (every on-chain output irrevocably swept).
+		this.node.on('channel:resolved', (data: { channelId: Buffer }) => {
 			this.refreshStaticChannelBackup();
+			const channelId = data.channelId.toString('hex');
+			// Issue #338: the engine currently marks a cooperative close fully
+			// resolved the moment it is classified, possibly from a mempool
+			// sighting. An unconfirmed close is not a terminal guarantee (a
+			// reorg can void it), so do not relay it as one; once #338 gates
+			// the engine event on burial this guard never triggers.
+			const monitor = this.node.getChannelManager().getMonitor(data.channelId);
+			if (monitor && !monitor.isCommitmentConfirmed()) {
+				this.log(
+					'warn',
+					'Suppressing channel:resolved relay for unconfirmed close',
+					{ channelId }
+				);
+				return;
+			}
+			this.log('info', 'Channel resolved', { channelId });
+			this.emit('channel:resolved', { channelId });
 		});
 		// Refresh the SCB when a splice LOCKS, not when it is initiated: only now
 		// does fundingTxid hold the new post-splice outpoint, so the backup encodes
@@ -1387,6 +1405,7 @@ export class BeignetNode extends EventEmitter {
 			erroredBalanceSats: this.getErroredBalanceSats(),
 			splicingBalanceSats: this.getSplicingBalanceSats(),
 			channelCount: info.channelCount,
+			openChannelCount: info.openChannelCount,
 			peerCount: info.peerCount,
 			listening: this.node.isListening()
 		};
@@ -2775,6 +2794,21 @@ export class BeignetNode extends EventEmitter {
 		return this.node.forceCloseChannel(idBuf, destinationScript!);
 	}
 
+	/**
+	 * Rebroadcast the recorded close tx of a force-closed channel (or the
+	 * stored mutual close of a CLOSED one). Only a channelId: the engine
+	 * always rebuilds from the latest state, so no older commitment can be
+	 * selected.
+	 */
+	rebroadcastClose(channelId: string): Promise<{
+		ok: boolean;
+		error?: string;
+		txid?: string;
+		broadcastOk?: boolean;
+	}> {
+		return this.node.rebroadcastClose(Buffer.from(channelId, 'hex'));
+	}
+
 	listChannels(): ChannelInfo[] {
 		return this.node.listChannels().map((ch) => this.toChannelInfo(ch));
 	}
@@ -2902,6 +2936,7 @@ export class BeignetNode extends EventEmitter {
 		cltvExpiryDelta?: number;
 		htlcMinimumMsat?: bigint;
 		htlcMaximumMsat?: bigint;
+		closeStatus?: import('../lightning/node/types').ICloseStatus;
 	}): ChannelInfo {
 		// Import ChannelStateString to satisfy the narrowed type
 		type CS = import('./types').ChannelStateString;
@@ -2952,6 +2987,8 @@ export class BeignetNode extends EventEmitter {
 			info.htlcMinimumMsat = ch.htlcMinimumMsat.toString();
 		if (ch.htlcMaximumMsat !== undefined)
 			info.htlcMaximumMsat = ch.htlcMaximumMsat.toString();
+		// All fields are JSON-safe primitives; pass through untouched.
+		if (ch.closeStatus) info.closeStatus = ch.closeStatus;
 		return info;
 	}
 

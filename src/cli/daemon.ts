@@ -185,7 +185,10 @@ const STATUS_BY_ERROR_CODE: Record<string, number> = {
 	// trouble, not a node fault: none of them may read as a retryable 500.
 	RESPONSE_TOO_LARGE: 413,
 	PRIVATE_NETWORK_REFUSED: 403,
-	L402_FETCH_FAILED: 502
+	L402_FETCH_FAILED: 502,
+	// Unknown channel / wrong state / nothing recorded to rebroadcast are all
+	// problems with the caller's request, not node faults: never a 5xx.
+	REBROADCAST_FAILED: 400
 };
 
 export function statusForErrorCode(code: string): number {
@@ -249,6 +252,11 @@ export function getRelayedEvents(htlcEvents?: boolean): string[] {
 		'channel:pending-close',
 		'channel:force-closing',
 		'channel:closed',
+		// The true terminal event of a close: every on-chain output
+		// irrevocably swept, state becomes CLOSED. channel:closed only says a
+		// commitment spend was classified; consumers tracking close resolution
+		// need this one.
+		'channel:resolved',
 		'peer:connect',
 		'peer:disconnect',
 		// Every channel failure reason (peer rejection, funding build/broadcast
@@ -785,6 +793,21 @@ export async function startDaemon(
 				forceClosed: true,
 				commitmentTxid: result.commitmentTxid
 			});
+		},
+		// Re-drive the close broadcast of a FORCE_CLOSED channel (or a CLOSED
+		// one whose mutual close has not confirmed). Only a channelId is
+		// accepted: the engine rebuilds the latest commitment byte-identically,
+		// so an older (revoked) state can never be selected. Idempotent.
+		'POST /channel/rebroadcast-close': async (body) => {
+			const { channelId } = body as { channelId: string };
+			if (!channelId) return failure('INVALID_PARAMS', 'channelId required');
+			const result = await node.rebroadcastClose(channelId);
+			if (!result.ok)
+				return failure(
+					'REBROADCAST_FAILED',
+					result.error || 'Rebroadcast failed'
+				);
+			return success({ txid: result.txid, broadcastOk: result.broadcastOk });
 		},
 		// Sets the channel's COMMITMENT transaction feerate (BOLT 2 update_fee).
 		// This is not the routing fee policy (base fee / proportional millionths);

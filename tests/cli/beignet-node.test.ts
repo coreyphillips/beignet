@@ -124,6 +124,7 @@ describe('CLI types', () => {
 			erroredBalanceSats: 0,
 			splicingBalanceSats: 0,
 			channelCount: 1,
+			openChannelCount: 1,
 			peerCount: 2,
 			listening: true
 		};

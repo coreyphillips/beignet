@@ -8,7 +8,8 @@
 import {
 	IChannelState,
 	ISpliceInFlight,
-	IV2InFlight
+	IV2InFlight,
+	ChannelCloseReason
 } from '../channel/channel-state';
 import { ShaChainStore, IShaChainEntry } from '../keys/shachain';
 import { IChannelBasepoints } from '../keys/derivation';
@@ -422,6 +423,8 @@ export interface ISerializedChannelState {
 	// Recovery 5.6 liveness: the persisted peer-close disposition; the wire
 	// error is regenerated from this on every reconnect.
 	recoveryCloseReason?: 'local-data-loss' | 'state-uncertain';
+	// Why WE closed the channel ('user' or an automatic close code).
+	closeReason?: ChannelCloseReason;
 	dlpRemotePerCommitmentPoint?: string | null;
 }
 
@@ -751,6 +754,7 @@ export function serializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		stateUncertain: s.stateUncertain,
 		recoveryCloseReason: s.recoveryCloseReason,
+		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint: bufToHex(s.dlpRemotePerCommitmentPoint ?? null)
 	};
 }
@@ -933,6 +937,7 @@ export function deserializeChannelState(
 		dataLossDetected: s.dataLossDetected,
 		stateUncertain: s.stateUncertain,
 		recoveryCloseReason: s.recoveryCloseReason,
+		closeReason: s.closeReason,
 		dlpRemotePerCommitmentPoint:
 			hexToBuf(s.dlpRemotePerCommitmentPoint) ?? undefined
 	};

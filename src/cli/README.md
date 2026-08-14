@@ -443,6 +443,7 @@ node.on('channel:ready', ({ channelId }) => { ... });
 node.on('channel:pending-close', ({ channelId, initiator }) => { ... }); // coop close initiated ('local' | 'remote')
 node.on('channel:force-closing', ({ channelId, initiator }) => { ... }); // our force-close broadcast or peer unilateral detected
 node.on('channel:closed', ({ channelId }) => { ... });
+node.on('channel:resolved', ({ channelId }) => { ... }); // terminal: every on-chain output of the close irrevocably swept
 node.on('htlc:forwarded', ({ inChannelId, outChannelId, amountInMsat, amountOutMsat, feeMsat }) => { ... }); // a forward settled (msat values as strings)
 node.on('htlc:fulfilled', ({ channelId, htlcId }) => { ... }); // an HTLC we offered was fulfilled
 node.on('htlc:failed', ({ channelId, htlcId }) => { ... });
@@ -469,7 +470,8 @@ interface NodeInfo {
   blockHeight: number;
   onchainBalanceSats: number;
   lightningBalanceSats: number;
-  channelCount: number;
+  channelCount: number;      // every known channel row, incl. CLOSED/FORCE_CLOSED
+  openChannelCount: number;  // channels not in a terminal state
   peerCount: number;
   listening: boolean;
 }
@@ -500,6 +502,15 @@ interface ChannelInfo {
   shortChannelId?: string;  // e.g. "800000x1x0"
   feeratePerKw?: number;    // current commitment feerate
   htlcCount?: number;       // number of active HTLCs
+  closeStatus?: {           // present for closing/closed channels
+    closer: 'local' | 'remote' | 'cooperative' | 'unknown';
+    reason?: string;        // 'user' or an automatic close code; absent for peer closes
+    closingTxid?: string;
+    broadcast: boolean;     // close tx reached the network (broadcast ok or spend observed)
+    confirmationHeight: number;  // 0 while unconfirmed
+    resolution: 'pending' | 'sweeping' | 'resolved';
+    fundsAvailableHeight?: number;  // to_local CSV maturity, our force close only
+  };
 }
 
 interface InvoiceInfo {
@@ -782,6 +793,7 @@ interface BeignetNodeEvents {
   'channel:pending-close': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:force-closing': (data: { channelId: string; initiator: 'local' | 'remote' }) => void;
   'channel:closed': (data: { channelId: string }) => void;
+  'channel:resolved': (data: { channelId: string }) => void;
   'htlc:forwarded': (data: { inChannelId: string; outChannelId: string; amountInMsat: string; amountOutMsat: string; feeMsat: string }) => void;
   'htlc:fulfilled': (data: { channelId: string; htlcId: string }) => void;
   'htlc:failed': (data: { channelId: string; htlcId: string }) => void;
@@ -1125,6 +1137,7 @@ beignet channel open-and-wait <pubkey> <sats> [pushSats] [--timeout 60000]
 beignet channel connect-and-open <pubkey> <host> <port> <sats> [pushSats]
 beignet channel close <channelId>
 beignet channel forceclose <channelId>
+beignet channel rebroadcast-close <channelId>
 beignet channel splice-in <channelId> <sats> <feeratePerkw>
 beignet channel splice-out <channelId> <sats> <feeratePerkw>
 beignet channel ensure-minimum 3 500000
@@ -1518,6 +1531,7 @@ Key comparison is constant-time (SHA-256 digests compared with `crypto.timingSaf
 | POST | `/channel/open-and-wait` | `{ pubkey, amountSats, pushSats?, timeoutMs? }` | Open channel + wait for NORMAL state |
 | POST | `/channel/close` | `{ channelId }` | Coop close |
 | POST | `/channel/forceclose` | `{ channelId }` | Force close |
+| POST | `/channel/rebroadcast-close` | `{ channelId }` | Rebroadcast the recorded close tx of a force-closed channel (or an unconfirmed mutual close); idempotent, always rebuilds from the latest state |
 | POST | `/channel/splice-in` | `{ channelId, amountSats, feeratePerkw }` | Splice-in funds |
 | POST | `/channel/splice-out` | `{ channelId, amountSats, feeratePerkw }` | Splice-out funds |
 | POST | `/invoice/create` | `{ amountSats?, description? }` | Create invoice (omit amountSats for amount-less) |
@@ -1596,7 +1610,7 @@ event: channel:ready
 data: {"channelId":"cd34..."}
 ```
 
-Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `peer:connect`, `peer:disconnect`, `node:ready`.
+Events relayed to SSE clients and webhooks: `payment:received`, `payment:sent`, `payment:failed`, `invoice:settled`, `channel:opening`, `channel:ready`, `channel:pending-close`, `channel:force-closing`, `channel:closed`, `channel:resolved` (terminal: every on-chain output of the close irrevocably swept), `peer:connect`, `peer:disconnect`, `node:ready`.
 
 - `invoice:settled` fires when an invoice this node issued is paid. `payment:received` also covers spontaneous (keysend) receives, which have no invoice.
 - `channel:force-closing` fires both when this node broadcasts its own commitment (`initiator: "local"`) and when a peer's unilateral close is detected on-chain (`initiator: "remote"`).

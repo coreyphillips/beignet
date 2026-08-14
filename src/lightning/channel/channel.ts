@@ -98,7 +98,8 @@ import {
 	createOpenerState,
 	createAcceptorState,
 	mustNotBroadcastCommitment,
-	RecoveryCloseReason
+	RecoveryCloseReason,
+	ChannelCloseReason
 } from './channel-state';
 import { ChannelRecoveryStatus } from '../recovery/channel-status';
 import {
@@ -793,6 +794,30 @@ export class Channel {
 	 */
 	recordCooperativeCloseTx(txHex: string): void {
 		this._state.lastCooperativeCloseTxHex = txHex;
+	}
+
+	/**
+	 * Record why WE are closing this channel (persisted with channel state).
+	 * Write-once for terminal closes: once the channel is FORCE_CLOSED or
+	 * CLOSED the recorded reason describes the close that actually happened,
+	 * so a later rebroadcast or duplicate API call must not relabel it.
+	 * Returns whether the reason was written.
+	 */
+	recordCloseReason(reason: ChannelCloseReason): boolean {
+		if (
+			this._state.state === ChannelState.FORCE_CLOSED ||
+			this._state.state === ChannelState.CLOSED
+		) {
+			return false;
+		}
+		if (this._state.closeReason === reason) return false;
+		this._state.closeReason = reason;
+		return true;
+	}
+
+	/** Undo a recordCloseReason whose close was refused. */
+	clearCloseReason(): void {
+		delete this._state.closeReason;
 	}
 
 	// ─────────────── Opening (Opener) ───────────────

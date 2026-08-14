@@ -151,6 +151,7 @@ import {
 	ICreateInvoiceOptions,
 	ICreateInvoiceResult,
 	IChannelInfo,
+	ICloseStatus,
 	INodeInfo,
 	ILightningError,
 	ILightningBalance,
@@ -231,6 +232,7 @@ import {
 	satPerVbyteToSatPerKw,
 	MIN_FEERATE_PER_KW,
 	CommitmentType,
+	MonitorState,
 	OutputStatus,
 	OutputType,
 	ISweepUneconomicChainAction
@@ -253,6 +255,7 @@ import * as bip39 from 'bip39';
 import { generateFromSeed } from '../keys/shachain';
 import { perCommitmentPointFromSecret } from '../keys/derivation';
 import { createFundingScript } from '../script/funding';
+import { csvFromToLocalScript } from '../script/commitment';
 import { createTaprootFundingScript } from '../script/funding-taproot';
 import {
 	isTaprootChannel,
@@ -263,7 +266,8 @@ import {
 	createOpenerState,
 	createAcceptorState,
 	IChannelState,
-	mustNotBroadcastCommitment
+	mustNotBroadcastCommitment,
+	ChannelCloseReason
 } from '../channel/channel-state';
 import {
 	IScbChannelEntry,
@@ -628,6 +632,19 @@ export class LightningNode extends EventEmitter {
 	private graphPruneTimer: ReturnType<typeof setInterval> | null = null;
 	private _chainBackend: import('../chain/chain-watcher').IChainBackend | null =
 		null;
+	// Close-broadcast bookkeeping for closeStatus reporting. In-memory only:
+	// after a restart the spend observation (monitor commitmentBroadcast) or a
+	// manual rebroadcast re-establishes the truth, so `broadcast` honestly
+	// reads false in between.
+	private _pendingCloseTxids: Map<string, string> = new Map(); // txidHex -> channelIdHex
+	private _lastCloseBroadcast: Map<string, { txid: string; ok: boolean }> =
+		new Map(); // channelIdHex -> last close-tx broadcast result
+	// Terminal-state (CLOSED/FORCE_CLOSED/ERRORED) channel persists that
+	// failed. A terminal channel may never see another transition or monitor
+	// update to ride, so without this per-block retry a one-shot storage
+	// failure leaves disk on the pre-close state (and without closeReason)
+	// forever.
+	private _failedTerminalPersists: Set<string> = new Set();
 	private reestablishTimeoutBlocks: number;
 	private readonly autoReconnect: boolean;
 	private walCheckpointTimer: ReturnType<typeof setInterval> | null = null;
@@ -2300,12 +2317,42 @@ export class LightningNode extends EventEmitter {
 				this.monitorsAwaitingChannel.add(channelIdHex);
 			}
 			if (staged.length) this.stagedMutations.unshift(...staged);
+			// A failed persist of a TERMINAL state has no later transition to
+			// ride; arm the per-block retry so the close (and its closeReason)
+			// still reaches disk once storage recovers.
+			const failedState = channel.getFullState().state;
+			if (
+				failedState === ChannelState.CLOSED ||
+				failedState === ChannelState.FORCE_CLOSED ||
+				failedState === ChannelState.ERRORED
+			) {
+				this._failedTerminalPersists.add(channelIdHex);
+			}
 			this.emit('node:error', {
 				code: 'PERSISTENCE_ERROR',
 				channelId,
 				message: `Failed to persist channel: ${result.error?.message}`,
 				timestamp: Date.now()
 			} as ILightningError);
+		} else {
+			this._failedTerminalPersists.delete(channelIdHex);
+		}
+	}
+
+	/**
+	 * Retry channel persists whose terminal state never reached disk (run
+	 * once per block). Success removes the entry inside persistChannelState;
+	 * another failure re-arms it there too.
+	 */
+	private retryFailedTerminalPersists(): void {
+		if (this._failedTerminalPersists.size === 0) return;
+		for (const idHex of [...this._failedTerminalPersists]) {
+			const channelId = Buffer.from(idHex, 'hex');
+			if (!this.channelManager.getChannel(channelId)) {
+				this._failedTerminalPersists.delete(idHex);
+				continue;
+			}
+			this.persistChannel(channelId);
 		}
 	}
 
@@ -2748,6 +2795,21 @@ export class LightningNode extends EventEmitter {
 
 		this.channelManager.on('channel:closed', (channelId: Buffer) => {
 			this.persistChannel(channelId);
+			// A cooperative close records its signed tx just before the manager
+			// emits broadcast:tx; register the txid so the watcher's
+			// broadcast:success resolves into closeStatus.broadcast.
+			const closeHex = this.channelManager.getChannel(channelId)?.getFullState()
+				.lastCooperativeCloseTxHex;
+			if (closeHex) {
+				try {
+					this._registerCloseTxid(
+						channelId.toString('hex'),
+						bitcoin.Transaction.fromHex(closeHex).getId()
+					);
+				} catch {
+					// Unparseable hex: broadcast simply stays unreported.
+				}
+			}
 			// NOTE: the funding watch is deliberately NOT torn down here. 'closed'
 			// fires the moment a commitment spend is classified — possibly from a
 			// mempool sighting — and the spend can still be replaced (reorg, or a
@@ -2780,6 +2842,13 @@ export class LightningNode extends EventEmitter {
 			// monitor commits for this id forever.
 			this.dirtyMonitors.delete(channelId.toString('hex'));
 			this.monitorsAwaitingChannel.delete(channelId.toString('hex'));
+			// Close-broadcast bookkeeping is only meaningful while the close can
+			// still be rebroadcast; a resolved close retires it.
+			const resolvedIdHex = channelId.toString('hex');
+			this._lastCloseBroadcast.delete(resolvedIdHex);
+			for (const [txid, idHex] of this._pendingCloseTxids) {
+				if (idHex === resolvedIdHex) this._pendingCloseTxids.delete(txid);
+			}
 			// Every output of the close is irrevocably resolved — a commitment
 			// swap is no longer possible, so the funding watch can be retired
 			// (memory cleanup for long-lived nodes).
@@ -5255,10 +5324,19 @@ export class LightningNode extends EventEmitter {
 	}
 
 	getNodeInfo(): INodeInfo {
+		const channels = this.channelManager.listChannels();
 		return {
 			nodeId: this.nodeId,
 			network: this.network,
-			channelCount: this.channelManager.listChannels().length,
+			channelCount: channels.length,
+			openChannelCount: channels.filter((ch) => {
+				const s = ch.getState();
+				return (
+					s !== ChannelState.CLOSED &&
+					s !== ChannelState.FORCE_CLOSED &&
+					s !== ChannelState.ERRORED
+				);
+			}).length,
 			peerCount: this.peerManager ? this.peerManager.listPeers().length : 0,
 			networkingEnabled: this.peerManager !== null,
 			alias: this.alias
@@ -6153,6 +6231,16 @@ export class LightningNode extends EventEmitter {
 				timestamp: Date.now()
 			} as ILightningError);
 		});
+		// A close tx we registered reached the network: record it so
+		// closeStatus.broadcast can answer honestly before the spend is
+		// observed. broadcast:failure carries no txid, so failures simply
+		// never set ok; absence of success is the default.
+		this.chainWatcher.on('broadcast:success', (txid: string) => {
+			const idHex = this._pendingCloseTxids.get(txid);
+			if (idHex !== undefined) {
+				this._lastCloseBroadcast.set(idHex, { txid, ok: true });
+			}
+		});
 		// The watcher owns the broadcast; surface its failures under the code
 		// consumers already watch for. It re-queues and retries on the next
 		// block, so this is a warning rather than a terminal outcome.
@@ -6475,8 +6563,12 @@ export class LightningNode extends EventEmitter {
 					this.isCurrentChainStartup(generation)
 				) {
 					try {
-						await this._chainBackend.broadcastTransaction(
+						const txid = await this._chainBackend.broadcastTransaction(
 							state.lastCooperativeCloseTxHex
+						);
+						this._lastCloseBroadcast.set(
+							(state.channelId || state.temporaryChannelId).toString('hex'),
+							{ txid, ok: true }
 						);
 					} catch {
 						// Already in mempool/confirmed (or backend hiccup): the funding
@@ -7555,11 +7647,24 @@ export class LightningNode extends EventEmitter {
 			'scriptPubkey'
 		);
 		if (scriptErr) throw new Error(scriptErr);
+		// Durable 'user' marker for closeStatus, stamped BEFORE the shutdown
+		// dispatch: with a live peer the whole negotiation can complete
+		// synchronously inside initiateShutdown, and once the channel is
+		// CLOSED the stamp is write-once refused. If the coop close later
+		// times out into a force-close, that path relabels with the terminal
+		// reason.
+		const channel = this.channelManager.getChannel(channelId);
+		const prevReason = channel?.getFullState().closeReason;
+		const stamped = channel?.recordCloseReason('user') ?? false;
 		const result = this.channelManager.initiateShutdown(
 			channelId,
 			scriptPubkey
 		);
 		if (!result.ok) {
+			if (stamped) {
+				channel!.clearCloseReason();
+				if (prevReason !== undefined) channel!.recordCloseReason(prevReason);
+			}
 			this.emit('node:error', {
 				code: 'CLOSE_CHANNEL_FAILED',
 				channelId,
@@ -7568,6 +7673,9 @@ export class LightningNode extends EventEmitter {
 			} as ILightningError);
 			return { ok: false, error: result.error };
 		}
+		// initiateShutdown's own action batch carries no persist of the stamp,
+		// so commit it here.
+		if (stamped) this.persistChannel(channelId);
 		return { ok: true };
 	}
 
@@ -8002,14 +8110,75 @@ export class LightningNode extends EventEmitter {
 		}
 	}
 
+	/**
+	 * Force-close with a durable reason: stamps state.closeReason BEFORE the
+	 * close so it persists in the same channel:closed commit that records
+	 * FORCE_CLOSED, registers the commitment txid for broadcast-success
+	 * tracking, and clears the stamp again if the close was refused. Wraps
+	 * channelManager.forceClose and returns its result unchanged.
+	 */
+	private _forceCloseWithReason(
+		channelId: Buffer,
+		destinationScript: Buffer,
+		feeRatePerVbyte: number,
+		reason: ChannelCloseReason
+	): ChannelResult {
+		const channel = this.channelManager.getChannel(channelId);
+		const prevReason = channel?.getFullState().closeReason;
+		const stamped = channel?.recordCloseReason(reason) ?? false;
+		const result = this.channelManager.forceClose(
+			channelId,
+			destinationScript,
+			feeRatePerVbyte
+		);
+		if (!result.ok) {
+			// A refused close must not leave this attempt's label behind, but
+			// it must also not erase a reason an earlier close attempt validly
+			// recorded (e.g. 'user' from a coop close a failed automatic
+			// escalation tried to relabel).
+			if (stamped) {
+				channel!.clearCloseReason();
+				if (prevReason !== undefined) channel!.recordCloseReason(prevReason);
+			}
+			return result;
+		}
+		for (const action of result.actions) {
+			if (action.type === 'BROADCAST_TX' && 'tx' in action) {
+				this._registerCloseTxid(
+					channelId.toString('hex'),
+					bitcoin.Transaction.fromBuffer(action.tx).getId()
+				);
+				break;
+			}
+		}
+		return result;
+	}
+
+	/**
+	 * Record the close tx the engine is trying to get on chain. The entry
+	 * starts with ok false (attempted, not known to have reached the network)
+	 * so closeStatus can report the txid even while broadcast keeps failing,
+	 * which is exactly the window a manual rebroadcast exists for;
+	 * broadcast:success flips it to true. Never downgrades an existing
+	 * success for the same txid.
+	 */
+	private _registerCloseTxid(idHex: string, txid: string): void {
+		this._pendingCloseTxids.set(txid, idHex);
+		const prev = this._lastCloseBroadcast.get(idHex);
+		if (!prev || prev.txid !== txid) {
+			this._lastCloseBroadcast.set(idHex, { txid, ok: false });
+		}
+	}
+
 	forceCloseChannel(
 		channelId: Buffer,
 		destinationScript: Buffer
 	): { ok: boolean; error?: string; commitmentTxid?: string } {
-		const result = this.channelManager.forceClose(
+		const result = this._forceCloseWithReason(
 			channelId,
 			destinationScript,
-			this.resolveForceCloseFeeRatePerVbyte()
+			this.resolveForceCloseFeeRatePerVbyte(),
+			'user'
 		);
 		if (!result.ok) {
 			this.emit('node:error', {
@@ -8030,6 +8199,122 @@ export class LightningNode extends EventEmitter {
 			}
 		}
 		return { ok: true, commitmentTxid };
+	}
+
+	/**
+	 * Manually rebroadcast the recorded close transaction of a channel whose
+	 * close may not have reached the network: the latest commitment of a
+	 * FORCE_CLOSED channel (rebuilt byte-identically from current state), or
+	 * the stored mutual close of a CLOSED channel that has not confirmed.
+	 * Takes only a channelId by design: there is no way to select an older
+	 * (revoked) state, the rebuild always derives from what the engine would
+	 * broadcast itself. Idempotent: a duplicate is rejected harmlessly by the
+	 * network and reported as success, and a confirmed close is a no-op.
+	 */
+	async rebroadcastClose(channelId: Buffer): Promise<{
+		ok: boolean;
+		error?: string;
+		txid?: string;
+		broadcastOk?: boolean;
+	}> {
+		const cidErr = validateBuffer(channelId, 32, 'channelId');
+		if (cidErr) return { ok: false, error: cidErr };
+		const idHex = channelId.toString('hex');
+		const channel = this.channelManager.getChannel(channelId);
+		if (!channel) {
+			return { ok: false, error: `Channel not found: ${idHex}` };
+		}
+		const state = channel.getState();
+		const monitor = this.channelManager.getMonitor(channelId);
+		// A CONFIRMED close needs no rebroadcast: no-op success. The gate is
+		// isCommitmentConfirmed alone, deliberately not isFullyResolved: a
+		// cooperative close is marked fully resolved the moment it is
+		// classified, possibly from a mempool sighting (issue #338), and an
+		// unconfirmed mutual close is exactly what this route exists to
+		// re-send. A genuinely resolved force-close is always also confirmed.
+		const closeSettled =
+			monitor !== undefined && monitor.isCommitmentConfirmed();
+		if (
+			closeSettled &&
+			(state === ChannelState.FORCE_CLOSED || state === ChannelState.CLOSED)
+		) {
+			return {
+				ok: true,
+				txid: monitor!.getFullState().commitmentBroadcast?.txid,
+				broadcastOk: true
+			};
+		}
+
+		if (state === ChannelState.FORCE_CLOSED) {
+			const rebuilt = this.channelManager.rebuildForceCloseCommitment(
+				channelId,
+				this.resolveForceCloseFeeRatePerVbyte()
+			);
+			if (!rebuilt.ok || !rebuilt.tx) {
+				return { ok: false, error: rebuilt.error };
+			}
+			const txid = bitcoin.Transaction.fromBuffer(rebuilt.tx).getId();
+			const broadcastOk = await this._broadcastCloseTx(idHex, txid, rebuilt.tx);
+			return { ok: true, txid, broadcastOk };
+		}
+
+		if (state === ChannelState.CLOSED) {
+			const closeHex = channel.getFullState().lastCooperativeCloseTxHex;
+			if (!closeHex) {
+				return {
+					ok: false,
+					error: 'No close transaction recorded for this channel'
+				};
+			}
+			let closeTx: bitcoin.Transaction;
+			try {
+				closeTx = bitcoin.Transaction.fromHex(closeHex);
+			} catch {
+				return { ok: false, error: 'Recorded close transaction is invalid' };
+			}
+			const txid = closeTx.getId();
+			const broadcastOk = await this._broadcastCloseTx(
+				idHex,
+				txid,
+				closeTx.toBuffer()
+			);
+			return { ok: true, txid, broadcastOk };
+		}
+
+		return { ok: false, error: `Channel is not closed (state ${state})` };
+	}
+
+	/**
+	 * Broadcast a close tx exactly once through the watcher (or the raw
+	 * backend before the watcher exists) and record the outcome for
+	 * closeStatus. A duplicate rejection counts as success: that is the
+	 * network saying the tx is already known.
+	 */
+	private async _broadcastCloseTx(
+		idHex: string,
+		txid: string,
+		tx: Buffer
+	): Promise<boolean> {
+		this._pendingCloseTxids.set(txid, idHex);
+		let ok = false;
+		try {
+			if (this.chainWatcher) {
+				await this.chainWatcher.broadcastTransaction(tx);
+				ok = true;
+			} else if (this._chainBackend) {
+				await this._chainBackend.broadcastTransaction(tx.toString('hex'));
+				ok = true;
+			}
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			// Only the KNOWN duplicate-transaction rejections count as success
+			// (same allowlist as broadcastPendingFundingTx). A broad match is
+			// dangerous: "Input already spent by conflicting transaction" also
+			// says "already" but means this tx can never be in the network.
+			ok = /already in block ?chain|already known|txn-already/i.test(msg);
+		}
+		this._lastCloseBroadcast.set(idHex, { txid, ok });
+		return ok;
 	}
 
 	// ─────────────── Splicing ───────────────
@@ -9015,7 +9300,140 @@ export class LightningNode extends EventEmitter {
 			info.htlcMinimumMsat = policy.htlcMinimumMsat;
 			info.htlcMaximumMsat = policy.htlcMaximumMsat;
 		}
+		const closeStatus = this._buildCloseStatus(state, channelId);
+		if (closeStatus) info.closeStatus = closeStatus;
 		return info;
+	}
+
+	/**
+	 * Derive closeStatus for a closing/closed channel from persisted channel
+	 * state, the monitor's classified commitment spend, and the in-memory
+	 * close-broadcast bookkeeping. Returns undefined for channels that are
+	 * not closing.
+	 */
+	private _buildCloseStatus(
+		state: IChannelState,
+		channelId: Buffer
+	): ICloseStatus | undefined {
+		const s = state.state;
+		const closing =
+			s === ChannelState.SHUTTING_DOWN ||
+			s === ChannelState.NEGOTIATING_CLOSING ||
+			s === ChannelState.CLOSED ||
+			s === ChannelState.FORCE_CLOSED ||
+			// A pre-funding error has nothing on chain to report (the field is
+			// initialized to null, so a bare undefined check is not enough).
+			(s === ChannelState.ERRORED && state.fundingTxid != null);
+		if (!closing) return undefined;
+
+		const idHex = channelId.toString('hex');
+		const monitor = this.channelManager.getMonitor(channelId);
+		const cb = monitor?.getFullState().commitmentBroadcast ?? null;
+		const last = this._lastCloseBroadcast.get(idHex);
+
+		let closer: ICloseStatus['closer'];
+		if (cb) {
+			switch (cb.commitmentType) {
+				case CommitmentType.COOPERATIVE_CLOSE:
+					closer = 'cooperative';
+					break;
+				case CommitmentType.OUR_COMMITMENT:
+					closer = 'local';
+					break;
+				case CommitmentType.THEIR_CURRENT_COMMITMENT:
+				case CommitmentType.THEIR_REVOKED_COMMITMENT:
+				case CommitmentType.THEIR_FUTURE_COMMITMENT:
+					closer = 'remote';
+					break;
+				default:
+					closer = 'unknown';
+			}
+		} else if (s === ChannelState.FORCE_CLOSED) {
+			// Only our own force close reaches FORCE_CLOSED before a spend is
+			// observed; a remote close is classified at detection time.
+			closer = 'local';
+		} else if (
+			s === ChannelState.SHUTTING_DOWN ||
+			s === ChannelState.NEGOTIATING_CLOSING
+		) {
+			closer = 'cooperative';
+		} else if (s === ChannelState.CLOSED) {
+			closer = state.lastCooperativeCloseTxHex ? 'cooperative' : 'unknown';
+		} else {
+			closer = 'unknown';
+		}
+
+		const status: ICloseStatus = {
+			closer,
+			broadcast: cb !== null || last?.ok === true,
+			// The monitor's classified spend height, NOT a tracked output's
+			// confirmationHeight (handleOutputSpent overwrites that with the
+			// sweep's height). 0 covers both mempool-first sightings and a close
+			// that has not been seen at all.
+			confirmationHeight: cb ? cb.blockHeight : 0,
+			resolution:
+				monitor === undefined
+					? 'pending'
+					: monitor.getState() === MonitorState.FULLY_RESOLVED
+					? // A cooperative close is marked fully resolved at
+					  // classification, possibly from a mempool sighting (issue
+					  // #338). An unconfirmed close is never 'resolved'; report it
+					  // as still pending so consumers do not read a terminal
+					  // guarantee that a reorg can void.
+					  monitor.isCommitmentConfirmed()
+						? 'resolved'
+						: 'pending'
+					: monitor.getState() === MonitorState.RESOLVING
+					? 'sweeping'
+					: 'pending'
+		};
+		// Our stamped reason describes OUR close. When the spend that actually
+		// resolved the channel was the peer's (simultaneous-close race, or a
+		// remote close after our coop attempt), the reason no longer describes
+		// what happened: peer closes report no reason, per the contract.
+		if (state.closeReason && (closer === 'local' || closer === 'cooperative')) {
+			status.reason = state.closeReason;
+		}
+
+		if (cb?.txid) {
+			status.closingTxid = cb.txid;
+		} else if (state.lastCooperativeCloseTxHex) {
+			try {
+				status.closingTxid = bitcoin.Transaction.fromHex(
+					state.lastCooperativeCloseTxHex
+				).getId();
+			} catch {
+				// Unparseable stored hex: leave the txid unset.
+			}
+		} else if (last) {
+			status.closingTxid = last.txid;
+		}
+
+		// to_local CSV maturity: only meaningful for OUR confirmed commitment.
+		if (cb && cb.commitmentType === CommitmentType.OUR_COMMITMENT && monitor) {
+			const toLocal = monitor
+				.getTrackedOutputs()
+				.find(
+					(o) => o.outputType === OutputType.TO_LOCAL && !o.isSecondLevelHtlc
+				);
+			if (toLocal) {
+				if (
+					toLocal.maturityHeight !== undefined &&
+					toLocal.maturityHeight !== Number.MAX_SAFE_INTEGER
+				) {
+					// Authoritative: derived from the actual sweep tx.
+					status.fundsAvailableHeight = toLocal.maturityHeight;
+				} else if (cb.blockHeight > 0) {
+					const csv = toLocal.witnessScript
+						? csvFromToLocalScript(toLocal.witnessScript) ??
+						  state.localConfig.toSelfDelay
+						: state.localConfig.toSelfDelay;
+					status.fundsAvailableHeight = cb.blockHeight + csv;
+				}
+				// Unconfirmed commitment: no CSV base yet, leave unset.
+			}
+		}
+		return status;
 	}
 
 	// ─────────────── SCID Registration ───────────────
@@ -13936,6 +14354,7 @@ export class LightningNode extends EventEmitter {
 		// or a mempool eviction never orphans a signed funding.
 		this.retryPendingFundingBroadcasts();
 		this.retryPendingSpliceBroadcasts();
+		this.retryFailedTerminalPersists();
 		// Re-CPFP any stuck anchor force-close commitment at the current live feerate
 		// so a fee spike after the original broadcast cannot pin the package (M1).
 		this.channelManager.reCpfpStuckCommitments(
@@ -14073,10 +14492,11 @@ export class LightningNode extends EventEmitter {
 			});
 			return;
 		}
-		const result = this.channelManager.forceClose(
+		const result = this._forceCloseWithReason(
 			channelId,
 			this.getSweepDestinationScript(),
-			this.resolveForceCloseFeeRatePerVbyte()
+			this.resolveForceCloseFeeRatePerVbyte(),
+			'CHANNEL_FAILED_FORCE_CLOSED'
 		);
 		if (!result.ok) {
 			// Say what actually happened: the channel is still ERRORED and
@@ -14190,10 +14610,11 @@ export class LightningNode extends EventEmitter {
 						message: `inbound HTLC ${htlc.id} preimage held but unacked ${claimBuffer} blocks before expiry (${htlc.cltvExpiry}); force-closing to claim via HTLC-success`,
 						timestamp: Date.now()
 					} as ILightningError);
-					this.channelManager.forceClose(
+					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
-						this.resolveForceCloseFeeRatePerVbyte()
+						this.resolveForceCloseFeeRatePerVbyte(),
+						'HTLC_CLAIM_FORCE_CLOSE'
 					);
 					break; // channel is closing; stop scanning it
 				}
@@ -14332,10 +14753,11 @@ export class LightningNode extends EventEmitter {
 					message: `forwarded HTLC ${htlc.id} inbound expiry near (${htlc.cltvExpiry}) with outbound leg unresolved; force-closing inbound to resolve on-chain`,
 					timestamp: Date.now()
 				} as ILightningError);
-				this.channelManager.forceClose(
+				this._forceCloseWithReason(
 					channelId,
 					this.getSweepDestinationScript(),
-					this.resolveForceCloseFeeRatePerVbyte()
+					this.resolveForceCloseFeeRatePerVbyte(),
+					'FORWARD_TIMEOUT_FORCE_CLOSE'
 				);
 				break; // channel is closing; stop scanning it
 			}
@@ -15142,10 +15564,11 @@ export class LightningNode extends EventEmitter {
 						message: `offered HTLC ${htlc.id} still active ${graceBlocks} blocks past expiry (${htlc.cltvExpiry}); force-closing to claim via timeout path`,
 						timestamp: Date.now()
 					} as ILightningError);
-					this.channelManager.forceClose(
+					this._forceCloseWithReason(
 						channelId,
 						this.getSweepDestinationScript(),
-						this.resolveForceCloseFeeRatePerVbyte()
+						this.resolveForceCloseFeeRatePerVbyte(),
+						'HTLC_EXPIRY_FORCE_CLOSE'
 					);
 					break; // channel is closing; no further HTLC scanning on it
 				}
@@ -15650,10 +16073,11 @@ export class LightningNode extends EventEmitter {
 							const destScript = bitcoin.payments.p2wpkh({
 								pubkey: this.fundingPubkey
 							}).output!;
-							this.channelManager.forceClose(
+							this._forceCloseWithReason(
 								channelId,
 								destScript,
-								this.resolveForceCloseFeeRatePerVbyte()
+								this.resolveForceCloseFeeRatePerVbyte(),
+								'REESTABLISH_TIMEOUT_FORCE_CLOSED'
 							);
 							this._stuckChannelTracker.delete(reestablishKey);
 							this.emit('node:error', {
@@ -15692,10 +16116,11 @@ export class LightningNode extends EventEmitter {
 					const startHeight = this._stuckChannelTracker.get(erroredKey)!;
 					if (blockHeight - startHeight > this.reestablishTimeoutBlocks) {
 						try {
-							this.channelManager.forceClose(
+							this._forceCloseWithReason(
 								channelId,
 								this.getSweepDestinationScript(),
-								this.resolveForceCloseFeeRatePerVbyte()
+								this.resolveForceCloseFeeRatePerVbyte(),
+								'ERRORED_TIMEOUT_FORCE_CLOSED'
 							);
 							this._stuckChannelTracker.delete(erroredKey);
 							this.emit('node:error', {
@@ -15734,10 +16159,11 @@ export class LightningNode extends EventEmitter {
 							const destScript = bitcoin.payments.p2wpkh({
 								pubkey: this.fundingPubkey
 							}).output!;
-							this.channelManager.forceClose(
+							this._forceCloseWithReason(
 								channelId,
 								destScript,
-								this.resolveForceCloseFeeRatePerVbyte()
+								this.resolveForceCloseFeeRatePerVbyte(),
+								'STUCK_CHANNEL_FORCE_CLOSED'
 							);
 							this._stuckChannelTracker.delete(shutdownKey);
 							this.emit('node:error', {
