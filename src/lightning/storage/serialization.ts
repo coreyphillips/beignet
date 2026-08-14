@@ -441,6 +441,7 @@ export interface ISerializedSpliceInFlight {
 	ourSharedInputSig: string;
 	ourWalletWitnesses: string[][];
 	ourWalletInputIndices: number[];
+	inputPrevouts?: Array<{ script: string; valueSats: string }>;
 	remoteCommitmentSig: string | null;
 	remoteCommitmentSigFeeratePerKw?: number;
 	remoteCommitmentSigLeaseBlockheight?: number;
@@ -470,6 +471,10 @@ export function serializeSpliceInFlight(
 			w.map((b) => b.toString('hex'))
 		),
 		ourWalletInputIndices: [...f.ourWalletInputIndices],
+		inputPrevouts: f.inputPrevouts.map((p) => ({
+			script: p.script.toString('hex'),
+			valueSats: bigintToStr(p.valueSats)
+		})),
 		remoteCommitmentSig: bufToHex(f.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: f.remoteCommitmentSigFeeratePerKw,
 		remoteCommitmentSigLeaseBlockheight: f.remoteCommitmentSigLeaseBlockheight,
@@ -500,6 +505,10 @@ export function deserializeSpliceInFlight(
 			w.map((h) => Buffer.from(h, 'hex'))
 		),
 		ourWalletInputIndices: [...s.ourWalletInputIndices],
+		inputPrevouts: (s.inputPrevouts ?? []).map((p) => ({
+			script: Buffer.from(p.script, 'hex'),
+			valueSats: strToBigint(p.valueSats)
+		})),
 		remoteCommitmentSig: hexToBuf(s.remoteCommitmentSig),
 		remoteCommitmentSigFeeratePerKw: s.remoteCommitmentSigFeeratePerKw,
 		remoteCommitmentSigLeaseBlockheight: s.remoteCommitmentSigLeaseBlockheight,

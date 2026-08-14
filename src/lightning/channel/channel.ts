@@ -542,6 +542,16 @@ export class Channel {
 	 * Cleared on disconnect and when a fresh interactive negotiation starts.
 	 */
 	private _txAbortSent = false;
+	// We refused a COMPLETED splice negotiation with tx_abort. The peer sends
+	// its mid-splice commitment_signed right after its final tx_complete, so
+	// that message can already be in flight when our abort leaves; judged
+	// against the post-abort channel it would fail the channel on a signature
+	// that was never meant for it. While set, commitment_signed is ignored.
+	// Quiescence bars legitimate commitment traffic until the peer processes
+	// our abort, so nothing real is swallowed. Cleared when any tx_abort
+	// arrives (message ordering puts the peer's echo after the stray) and on
+	// disconnect.
+	private _spliceAbortIgnoreCommitment = false;
 	// One-shot: we answered a post-reestablish channel_reestablish (a peer whose
 	// channel process restarted on the same connection, e.g. CLN after a
 	// tx_abort) by retransmitting ours. Without the latch two nodes that both
@@ -3124,6 +3134,11 @@ export class Channel {
 	 * Returns revoke_and_ack.
 	 */
 	handleCommitmentSigned(msg: ICommitmentSignedMessage): ChannelAction[] {
+		// A mid-splice commitment_signed that raced our tx_abort belongs to
+		// the aborted splice: ignore it (see _spliceAbortIgnoreCommitment).
+		if (this._spliceAbortIgnoreCommitment) {
+			return [];
+		}
 		// Fresh signed traffic ends the reestablish exchange (status machine).
 		this._lastReestablishOutcome = null;
 		// start_batch collection: buffer the announced batch, then process all
@@ -5788,6 +5803,7 @@ export class Channel {
 		// to unwind).
 		this._spliceAbortPending = false;
 		this._txAbortSent = false;
+		this._spliceAbortIgnoreCommitment = false;
 		this._reestablishRetransmitted = false;
 		this._pendingRbfInit = null;
 		// An un-echoed abort of a recorded attempt dies with the connection
@@ -7902,19 +7918,19 @@ export class Channel {
 			oldWitnessScript
 		);
 
-		// Apply the peer's wallet-input witnesses to the non-shared inputs we did
-		// not sign ourselves (in ascending input order).
-		if (peerWalletWitnesses.length > 0) {
-			const ours = new Set(ourWalletInputIndices);
-			let w = 0;
-			for (
-				let i = 0;
-				i < tx.ins.length && w < peerWalletWitnesses.length;
-				i++
-			) {
-				if (i === sharedInputIndex || ours.has(i)) continue;
-				tx.setWitness(i, peerWalletWitnesses[w++]);
-			}
+		// Apply the peer's wallet-input witnesses to the non-shared inputs we
+		// did not sign ourselves (in ascending input order). Exactly one stack
+		// per peer input: surplus or shortfall means the message does not
+		// match the negotiated tx.
+		const ours = new Set(ourWalletInputIndices);
+		const peerIndices: number[] = [];
+		for (let i = 0; i < tx.ins.length; i++) {
+			if (i === sharedInputIndex || ours.has(i)) continue;
+			peerIndices.push(i);
+		}
+		if (peerWalletWitnesses.length !== peerIndices.length) return null;
+		for (let k = 0; k < peerIndices.length; k++) {
+			tx.setWitness(peerIndices[k], peerWalletWitnesses[k]);
 		}
 
 		const spliceTxid = Buffer.from(tx.getHash());
@@ -8203,6 +8219,10 @@ export class Channel {
 				session.getRemoteFundingPubkey() ||
 				this._state.remoteBasepoints?.fundingPubkey;
 			if (!remoteFundingPubkey || st.newFundingOutputIndex < 0) return;
+			// Captured while the builder's prev_txs are still in hand: witness
+			// validation after a restart has nothing else to bind and verify
+			// the peer's signatures against.
+			const prevouts = this._spliceInputPrevouts();
 			this._state.spliceInFlight = {
 				spliceTxid: Buffer.from(st.tx.getHash()),
 				newFundingOutputIndex: st.newFundingOutputIndex,
@@ -8218,6 +8238,12 @@ export class Channel {
 					w.map((b) => Buffer.from(b))
 				),
 				ourWalletInputIndices: [...st.ourWalletInputIndices],
+				inputPrevouts: prevouts
+					? prevouts.scripts.map((s, i) => ({
+							script: Buffer.from(s),
+							valueSats: prevouts.values[i]
+					  }))
+					: [],
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig
 					? Buffer.from(this._spliceRemoteCommitmentSig)
 					: null,
@@ -11044,10 +11070,23 @@ export class Channel {
 				this._spliceSession!.getState() === SpliceState.AWAITING_TX_SIGNATURES
 			) {
 				// Both sides complete: audit the negotiated tx before signing
-				// anything for it (S-2.M4).
+				// anything for it (S-2.M4). An unacceptable tx fails the
+				// NEGOTIATION, not the channel: tx_abort + unwind (nothing is
+				// signed yet), mirroring the tx_add_input refusal arm. A bare
+				// ERROR would leave both sides parked in a dead splice. The
+				// peer's mid-splice commitment_signed may already be in flight
+				// behind its tx_complete; the ignore window absorbs it.
 				const invalid = this._validateNegotiatedInteractiveTx('splice');
 				if (invalid) {
-					return [{ type: ChannelActionType.ERROR, message: invalid }];
+					this._spliceAbortIgnoreCommitment = true;
+					return [
+						this._txAbort(this._state.channelId!, invalid),
+						...this.abortSplice(invalid),
+						{
+							type: ChannelActionType.ERROR,
+							message: `splice aborted: ${invalid}`
+						}
+					];
 				}
 			}
 			return [...driveActions, ...this._maybeSendSpliceCommitment()];
@@ -11194,12 +11233,15 @@ export class Channel {
 			const remoteOwned = (input.serialId % 2n === 0n) !== weAreInitiator;
 			const isShared =
 				kind === 'splice' && (!input.prevTx || input.prevTx.length === 0);
-			if (kind === 'v2' && !isShared) {
+			if ((kind === 'v2' || (kind === 'splice' && remoteOwned)) && !isShared) {
 				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
 				// prevouts; every other type would have to be accepted on
 				// shape alone. Refuse the negotiation HERE, before the
 				// commitment round signs anything for this transaction, rather
 				// than at tx_signatures when signatures may already be out.
+				// Splice checks REMOTE inputs only: our own splice-in inputs
+				// are signed by the wallet's own closures (any script type)
+				// and never pass through our witness validator.
 				const unsupported = this._v2CheckInputSpendable(input);
 				if (unsupported) return unsupported;
 			}
@@ -11503,6 +11545,44 @@ export class Channel {
 		};
 	}
 
+	/**
+	 * The complete prevout set of the negotiated splice tx (script and value
+	 * per input, in tx-input order, the shared funding input included): from
+	 * the live builder's prev_txs while it exists, from the durable record
+	 * after a restart (captured at record creation, when the prev_txs were
+	 * last in hand). Null when neither source resolves; a record persisted
+	 * before prevouts were captured resolves nothing.
+	 */
+	private _spliceInputPrevouts(): {
+		scripts: Buffer[];
+		values: bigint[];
+	} | null {
+		const builder = this._spliceSession?.getTxBuilder();
+		const st = this._spliceTx;
+		if (builder && st) {
+			const sorted = [...builder.getInputs()].sort((a, b) =>
+				a.serialId < b.serialId ? -1 : 1
+			);
+			if (sorted.length !== st.tx.ins.length) return null;
+			const p2wshScript = bitcoin.payments.p2wsh({
+				redeem: { output: st.oldWitnessScript }
+			}).output as Buffer;
+			return this._collectPrevouts(st.tx, sorted, {
+				index: st.sharedInputIndex,
+				script: p2wshScript,
+				value: this._state.fundingSatoshis
+			});
+		}
+		const record = this._state.spliceInFlight;
+		if (!record?.inputPrevouts || record.inputPrevouts.length === 0) {
+			return null;
+		}
+		return {
+			scripts: record.inputPrevouts.map((p) => p.script),
+			values: record.inputPrevouts.map((p) => p.valueSats)
+		};
+	}
+
 	/** The tx-input indices of the PEER's funding inputs, ascending. */
 	private _v2PeerInputIndices(inputCount: number): number[] | null {
 		const session = this._state.dualFundingSession;
@@ -11580,29 +11660,75 @@ export class Channel {
 	}
 
 	/**
-	 * v2 funding inputs must pay P2WPKH or P2TR: those are the only prevout
-	 * types whose tx_signatures witnesses can be cryptographically verified,
-	 * and an unverifiable input must never make it into the negotiated tx.
+	 * Validate the peer's splice tx_signatures wallet witnesses BEFORE they
+	 * are applied and the splice tx broadcast: exactly one stack per peer
+	 * wallet input, each bound to its negotiated prevout and
+	 * cryptographically verified (the same rules as _validateV2PeerWitnesses).
+	 * The count check always runs; the per-witness cryptographic checks are
+	 * skipped only for a restored builder-less session whose record predates
+	 * prevout capture, where refusing would wedge a live channel's in-flight
+	 * splice (the shared-input 2-of-2 verification still gates the exchange).
+	 * Returns the problem, or null when acceptable.
+	 */
+	private _validateSplicePeerWitnesses(witnesses: Buffer[][]): string | null {
+		const st = this._spliceTx;
+		if (!st) return 'no negotiated splice transaction';
+		const ours = new Set(st.ourWalletInputIndices);
+		const peerIndices: number[] = [];
+		for (let i = 0; i < st.tx.ins.length; i++) {
+			if (i === st.sharedInputIndex || ours.has(i)) continue;
+			peerIndices.push(i);
+		}
+		if (witnesses.length !== peerIndices.length) {
+			return `expected ${peerIndices.length} witness stacks, got ${witnesses.length}`;
+		}
+		if (peerIndices.length === 0) return null;
+		const prevouts = this._spliceInputPrevouts();
+		if (!prevouts) {
+			if (!this._spliceSession?.getTxBuilder()) return null;
+			return 'splice funding prevouts cannot be resolved';
+		}
+		if (prevouts.scripts.length !== st.tx.ins.length) {
+			return 'splice prevouts do not cover the negotiated tx';
+		}
+		for (let k = 0; k < peerIndices.length; k++) {
+			const problem = this._validateWitnessForInput(
+				st.tx,
+				peerIndices[k],
+				witnesses[k],
+				prevouts
+			);
+			if (problem) return problem;
+		}
+		return null;
+	}
+
+	/**
+	 * Interactive-tx funding inputs we will have to judge witnesses for (v2
+	 * open inputs, splice remote inputs) must pay P2WPKH or P2TR: those are
+	 * the only prevout types whose tx_signatures witnesses can be
+	 * cryptographically verified, and an unverifiable input must never make
+	 * it into the negotiated tx.
 	 */
 	private _v2CheckInputSpendable(input: IInteractiveTxInput): string | null {
 		if (!input.prevTx || input.prevTx.length < 32) {
-			return 'v2 funding input carries no previous transaction';
+			return 'funding input carries no previous transaction';
 		}
 		let script: Buffer;
 		try {
 			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
 			const out = prev.outs[input.prevTxVout ?? input.prevOutputIndex];
-			if (!out) return 'v2 funding input names a missing prevout';
+			if (!out) return 'funding input names a missing prevout';
 			script = Buffer.from(out.script);
 		} catch {
-			return 'v2 funding input previous transaction is unreadable';
+			return 'funding input previous transaction is unreadable';
 		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
 		const isP2tr =
 			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
 		if (!isP2wpkh && !isP2tr) {
-			return 'v2 funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
+			return 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
 		}
 		return null;
 	}
@@ -12266,10 +12392,6 @@ export class Channel {
 				return [];
 			}
 
-			const actions: ChannelAction[] = [];
-			// We must have sent ours first (some peers send tx_signatures before us).
-			actions.push(...this._maybeSendSpliceTxSigs());
-
 			// The peer's 2-of-2 funding signature arrives in the
 			// shared_input_signature TLV (BOLT 2 splicing); its witnesses cover
 			// only its OWN wallet inputs. Legacy beignet (pre-TLV) sent the sig as
@@ -12293,6 +12415,49 @@ export class Channel {
 					}
 				];
 			}
+
+			// Validate the peer's wallet witnesses BEFORE they are applied and
+			// the batch below persists + broadcasts: one stack per peer input,
+			// every signature verified against its negotiated prevout (the same
+			// rules as the v2 open path). Refusing here fails the exchange with
+			// a named error instead of persisting a splice tx that can never
+			// confirm. Validation runs BEFORE _maybeSendSpliceTxSigs: that
+			// helper marks our signatures sent (memory and record) as a side
+			// effect, and a refusal here must not leave state claiming a send
+			// that never happened. The build alone has no such side effects.
+			if (!this._spliceTx) {
+				this.buildAndSignSpliceTx();
+			}
+			const witnessProblem =
+				this._validateSplicePeerWitnesses(peerWalletWitnesses);
+			if (witnessProblem) {
+				const refusal: ChannelAction[] = [];
+				// Refusing the message does not make the splice unconfirmable
+				// once OUR shared-input signature has left: witness data does
+				// not change the txid (BIP 141), so the peer can broadcast its
+				// locally valid copy of the same transaction. Keep watching the
+				// negotiated outpoint so a confirmation still locks the splice
+				// (the confirmed flag flushes splice_locked once valid
+				// signatures finally arrive, e.g. retransmitted on reconnect).
+				const record = this._state.spliceInFlight;
+				if (record && (this._spliceSentTxSigs || record.sentTxSignatures)) {
+					refusal.push({
+						type: ChannelActionType.WATCH_FUNDING,
+						fundingTxid: record.spliceTxid,
+						fundingOutputIndex: record.newFundingOutputIndex,
+						minimumDepth: this._state.minimumDepth
+					});
+				}
+				refusal.push({
+					type: ChannelActionType.ERROR,
+					message: `invalid splice tx_signatures: ${witnessProblem}`
+				});
+				return refusal;
+			}
+
+			const actions: ChannelAction[] = [];
+			// We must have sent ours first (some peers send tx_signatures before us).
+			actions.push(...this._maybeSendSpliceTxSigs());
 			const tx = this.applyPeerSpliceSignature(peerSig, peerWalletWitnesses);
 			if (!tx) {
 				return [
@@ -13258,6 +13423,10 @@ export class Channel {
 	 * Handle tx_abort from peer.
 	 */
 	handleTxAbort(): ChannelAction[] {
+		// Any tx_abort from the peer proves it has processed our abort (the
+		// echo travels behind whatever the peer sent before seeing ours), so
+		// the stray-commitment window of a refused splice negotiation is over.
+		this._spliceAbortIgnoreCommitment = false;
 		// The echo/ack of a tx_abort we sent (e.g. telling the peer to forget a
 		// splice we lost across a restart). Both sides have now forgotten it.
 		if (this._spliceAbortPending) {

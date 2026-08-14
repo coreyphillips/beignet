@@ -24,7 +24,10 @@ import {
 	estimateSpliceTxWeight,
 	spliceFeeSats
 } from '../../src/lightning/channel/splice-weight';
-import { Channel } from '../../src/lightning/channel/channel';
+import {
+	Channel,
+	ISpliceWalletInput
+} from '../../src/lightning/channel/channel';
 import {
 	ChannelManager,
 	IChannelManagerConfig
@@ -45,7 +48,8 @@ import {
 	decodeTxAddInputMessage,
 	decodeTxAddOutputMessage,
 	decodeTxSignaturesMessage,
-	encodeTxAddInputMessage
+	encodeTxAddInputMessage,
+	encodeTxSignaturesMessage
 } from '../../src/lightning/message/interactive-tx';
 import { decodeStfuMessage } from '../../src/lightning/message/stfu';
 import {
@@ -2135,8 +2139,18 @@ describe('Splice', function () {
 				crypto.randomBytes(20)
 			]);
 			const withdraw = 50_000n;
+			// Fold the on-chain fee into relative_satoshis exactly as
+			// node.spliceOut does (the tx_complete audit enforces the feerate,
+			// and an audit failure now aborts the splice).
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
 			opener.setSpliceOutDestination(destScript, withdraw);
-			opener.initiateSplice(-withdraw, 253);
+			opener.initiateSplice(-(withdraw + spliceOutFee), 253);
 
 			// splice_ack carries the FRESH funding pubkey (CLN behavior).
 			opener.handleSpliceAck({
@@ -2198,8 +2212,17 @@ describe('Splice', function () {
 				crypto.randomBytes(20)
 			]);
 			const withdraw = 50_000n;
+			// Fee folded into relative_satoshis: the tx_complete audit enforces
+			// the feerate, and an audit failure now aborts the splice.
+			const spliceOutFee = spliceFeeSats(
+				estimateSpliceTxWeight({
+					walletInputCount: 0,
+					destinationScriptLen: destScript.length
+				}),
+				253
+			);
 			opener.setSpliceOutDestination(destScript, withdraw);
-			opener.initiateSplice(-withdraw, 253);
+			opener.initiateSplice(-(withdraw + spliceOutFee), 253);
 			opener.handleSpliceAck({
 				channelId,
 				fundingPubkey: makeBasepoints(acceptorSeed).fundingPubkey,
@@ -3101,12 +3124,25 @@ describe('Splice', function () {
 				acceptor: Channel;
 				broadcasts: Buffer[];
 				errors: string[];
+				/** WATCH_FUNDING actions, tagged with the emitting channel. */
+				watches: Array<{
+					from: Channel;
+					txid: Buffer;
+					outputIndex: number;
+				}>;
 				enqueue: (to: Channel, from: Channel, actions: any[]) => void;
 				pump: () => void;
 				/** After skipping `skip` matches, drop the next `count` messages of this type. */
 				drop: (msgType: MessageType, count?: number, skip?: number) => void;
 				/** Clear all drop rules (a fresh connection delivers everything). */
 				clearDrops: () => void;
+				/** Transform every outbound payload of this type (adversarial peer). */
+				intercept: (
+					msgType: MessageType,
+					fn: (payload: Buffer) => Buffer
+				) => void;
+				/** Stop tampering (an honest retry follows). */
+				clearIntercepts: () => void;
 			}
 
 			function makeWirePair(pushMsat = 0n): IWirePair {
@@ -3173,12 +3209,23 @@ describe('Splice', function () {
 					MessageType,
 					{ skip: number; count: number }
 				>();
+				const interceptRules = new Map<
+					MessageType,
+					(payload: Buffer) => Buffer
+				>();
 
+				const watches: IWirePair['watches'] = [];
 				const enqueue = (to: Channel, from: Channel, actions: any[]): void => {
 					for (const a of actions) {
 						if (a.type === ChannelActionType.ERROR) errors.push(a.message);
 						if (a.type === ChannelActionType.BROADCAST_TX)
 							broadcasts.push(a.tx);
+						if (a.type === ChannelActionType.WATCH_FUNDING)
+							watches.push({
+								from,
+								txid: a.fundingTxid,
+								outputIndex: a.fundingOutputIndex
+							});
 						if (a.type === ChannelActionType.SEND_MESSAGE) {
 							const rule = dropRules.get(a.messageType);
 							if (rule) {
@@ -3189,11 +3236,12 @@ describe('Splice', function () {
 									continue; // dropped on the wire
 								}
 							}
+							const transform = interceptRules.get(a.messageType);
 							queue.push({
 								to,
 								from,
 								msgType: a.messageType,
-								payload: a.payload
+								payload: transform ? transform(a.payload) : a.payload
 							});
 						}
 					}
@@ -3214,16 +3262,28 @@ describe('Splice', function () {
 				const clearDrops = (): void => {
 					dropRules.clear();
 				};
+				const intercept = (
+					msgType: MessageType,
+					fn: (payload: Buffer) => Buffer
+				): void => {
+					interceptRules.set(msgType, fn);
+				};
+				const clearIntercepts = (): void => {
+					interceptRules.clear();
+				};
 
 				return {
 					opener,
 					acceptor,
 					broadcasts,
 					errors,
+					watches,
 					enqueue,
 					pump,
 					drop,
-					clearDrops
+					clearDrops,
+					intercept,
+					clearIntercepts
 				};
 			}
 
@@ -3295,6 +3355,509 @@ describe('Splice', function () {
 				pair.pump();
 				return destScript;
 			}
+
+			/** Opener splices IN, funded by the given wallet UTXO (or a fresh
+			 *  P2WPKH one from makeSpliceInWallet). */
+			function startSpliceIn(
+				pair: IWirePair,
+				amount = 300_000n,
+				wallet?: { walletInput: ISpliceWalletInput; changeScript: Buffer }
+			): void {
+				const w = wallet ?? makeSpliceInWallet(amount);
+				pair.opener.setSpliceInInputs([w.walletInput], w.changeScript);
+				pair.enqueue(
+					pair.acceptor,
+					pair.opener,
+					pair.opener.initiateSplice(amount, 253)
+				);
+				pair.pump();
+			}
+
+			/** A P2TR wallet UTXO funding a splice-in: key-spend signWitness over
+			 *  the BIP 341 all-prevouts sighash (explicit SIGHASH_ALL form). */
+			function makeP2trSpliceInWallet(amountSats: bigint): {
+				walletInput: ISpliceWalletInput;
+				changeScript: Buffer;
+			} {
+				bitcoin.initEccLib(ecc);
+				const priv = crypto.randomBytes(32);
+				const xonly = Buffer.from(getPublicKey(priv).subarray(1));
+				const script = Buffer.concat([Buffer.from([0x51, 0x20]), xonly]);
+				const value = amountSats + 100_000n;
+				const prevTx = new bitcoin.Transaction();
+				prevTx.version = 2;
+				prevTx.addInput(crypto.randomBytes(32), 0);
+				prevTx.addOutput(script, Number(value));
+				return {
+					walletInput: {
+						prevTx: prevTx.toBuffer(),
+						prevOutputIndex: 0,
+						value,
+						sequence: 0xfffffffd,
+						signWitness: (
+							tx: bitcoin.Transaction,
+							inputIndex: number,
+							_value: bigint,
+							prevouts?: { scripts: Buffer[]; values: bigint[] }
+						): Buffer[] => {
+							const msg = tx.hashForWitnessV1(
+								inputIndex,
+								prevouts!.scripts,
+								prevouts!.values.map((v) => Number(v)),
+								bitcoin.Transaction.SIGHASH_ALL
+							);
+							const rawSig = Buffer.from(ecc.signSchnorr(msg, priv));
+							return [
+								Buffer.concat([
+									rawSig,
+									Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
+								])
+							];
+						}
+					},
+					changeScript: Buffer.concat([
+						Buffer.from([0x00, 0x14]),
+						crypto.randomBytes(20)
+					])
+				};
+			}
+
+			/** Tamper every tx_signatures that carries wallet witnesses. */
+			function tamperTxSigs(
+				pair: IWirePair,
+				fn: (witnesses: Buffer[][]) => Buffer[][]
+			): void {
+				pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+					const msg = decodeTxSignaturesMessage(payload);
+					if (msg.witnesses.length === 0) return payload;
+					msg.witnesses = fn(msg.witnesses);
+					return encodeTxSignaturesMessage(msg);
+				});
+			}
+
+			describe('peer wallet witness validation (issue #345)', function () {
+				it('refuses a wallet witness whose signature does not verify', function () {
+					const pair = makeWirePair();
+					// Well-formed P2WPKH stack, correct pubkey, signature by another
+					// key: only a real BIP 143 verify can catch it.
+					tamperTxSigs(pair, (witnesses) => {
+						const junkPriv = crypto
+							.createHash('sha256')
+							.update('not-the-wallet-key')
+							.digest();
+						const sig64 = Buffer.from(
+							ecc.sign(crypto.randomBytes(32), junkPriv)
+						);
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [[der, witnesses[0][1]]];
+					});
+					startSpliceIn(pair);
+
+					expect(
+						pair.errors.some((e) => e.includes('invalid splice tx_signatures')),
+						'named refusal surfaced'
+					).to.be.true;
+					expect(pair.errors.some((e) => e.includes('does not verify'))).to.be
+						.true;
+					const record = pair.acceptor.getFullState().spliceInFlight!;
+					expect(record.receivedTxSignatures, 'nothing recorded').to.be.false;
+					expect(record.fullySigned).to.be.false;
+					// Only the opener (which received valid signatures) broadcast.
+					expect(pair.broadcasts.length).to.equal(1);
+				});
+
+				it('refuses a wallet witness naming the wrong pubkey', function () {
+					const pair = makeWirePair();
+					tamperTxSigs(pair, (witnesses) => {
+						const otherPub = Buffer.from(
+							getPublicKey(
+								crypto.createHash('sha256').update('other-key').digest()
+							)
+						);
+						return [[witnesses[0][0], otherPub]];
+					});
+					startSpliceIn(pair);
+					expect(
+						pair.errors.some(
+							(e) =>
+								e.includes('invalid splice tx_signatures') &&
+								e.includes('does not match the prevout program')
+						)
+					).to.be.true;
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.false;
+				});
+
+				it('refuses surplus witness stacks', function () {
+					const pair = makeWirePair();
+					tamperTxSigs(pair, (witnesses) => [
+						...witnesses,
+						[Buffer.alloc(71, 1), Buffer.alloc(33, 2)]
+					]);
+					startSpliceIn(pair);
+					expect(
+						pair.errors.some(
+							(e) =>
+								e.includes('invalid splice tx_signatures') &&
+								e.includes('expected 1 witness stacks, got 2')
+						)
+					).to.be.true;
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.false;
+				});
+
+				it('refuses missing witness stacks', function () {
+					const pair = makeWirePair();
+					tamperTxSigs(pair, () => []);
+					startSpliceIn(pair);
+					expect(
+						pair.errors.some(
+							(e) =>
+								e.includes('invalid splice tx_signatures') &&
+								e.includes('expected 1 witness stacks, got 0')
+						)
+					).to.be.true;
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.false;
+				});
+
+				it('accepts a valid P2TR wallet input (BIP 341 sighash covers the shared prevout)', function () {
+					const pair = makeWirePair();
+					startSpliceIn(pair, 300_000n, makeP2trSpliceInWallet(300_000n));
+
+					expect(pair.errors).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(2);
+					expect(pair.broadcasts[0].equals(pair.broadcasts[1])).to.be.true;
+					const finalTx = bitcoin.Transaction.fromBuffer(pair.broadcasts[0]);
+					const witnessSizes = finalTx.ins.map((i) => i.witness.length).sort();
+					// 1-element P2TR key-spend + 4-element 2-of-2 shared witness.
+					expect(witnessSizes).to.deep.equal([1, 4]);
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+				});
+
+				it('refuses a splice-in from an unverifiable prevout type at negotiation time', function () {
+					const pair = makeWirePair();
+					const p2wshScript = Buffer.concat([
+						Buffer.from([0x00, 0x20]),
+						crypto.randomBytes(32)
+					]);
+					const value = 400_000n;
+					const prevTx = new bitcoin.Transaction();
+					prevTx.version = 2;
+					prevTx.addInput(crypto.randomBytes(32), 0);
+					prevTx.addOutput(p2wshScript, Number(value));
+					startSpliceIn(pair, 300_000n, {
+						walletInput: {
+							prevTx: prevTx.toBuffer(),
+							prevOutputIndex: 0,
+							value,
+							sequence: 0xfffffffd,
+							// The OPENER may sign its own input (local inputs are not
+							// gated); only the acceptor's judgment is under test.
+							signWitness: (): Buffer[] => [Buffer.alloc(0)]
+						},
+						changeScript: Buffer.concat([
+							Buffer.from([0x00, 0x14]),
+							crypto.randomBytes(20)
+						])
+					});
+
+					// The ACCEPTOR refuses the opener's P2WSH input at its
+					// negotiated-tx audit, before its commitment signs anything,
+					// and fails the NEGOTIATION with tx_abort: both sides unwind
+					// to NORMAL and the channel keeps operating.
+					expect(pair.errors.some((e) => e.includes('unsupported output type')))
+						.to.be.true;
+					// The opener's mid-splice commitment_signed was already in
+					// flight when the abort left; the ignore window absorbs it
+					// instead of failing the channel on it.
+					expect(
+						pair.errors.filter((e) => e.includes('commitment'))
+					).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(0);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFullState().spliceInFlight).to.be.null;
+					expect(pair.acceptor.getFullState().spliceInFlight).to.be.null;
+
+					// The channel is still usable: a fresh valid splice completes.
+					const preCapacity = pair.opener.getFundingSatoshis();
+					startSpliceOut(pair, 25_000n);
+					completeSpliceLocked(pair);
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.opener.getFundingSatoshis() < preCapacity).to.be.true;
+				});
+
+				it('persists the splice prevout set and tolerates a legacy record without it', function () {
+					const pair = makeWirePair();
+					startSpliceOut(pair);
+
+					const serialized = JSON.parse(
+						JSON.stringify(serializeChannelState(pair.opener.getFullState()))
+					);
+					const restoredState = deserializeChannelState(serialized);
+					const prevouts = restoredState.spliceInFlight!.inputPrevouts;
+					// Splice-out: the only input is the shared funding input, whose
+					// prevout is the old 2-of-2 P2WSH at the pre-splice capacity.
+					expect(prevouts.length).to.equal(1);
+					expect(prevouts[0].script.length).to.equal(34);
+					expect(prevouts[0].script[0]).to.equal(0x00);
+					expect(prevouts[0].script[1]).to.equal(0x20);
+					expect(Number(prevouts[0].valueSats)).to.equal(
+						Number(FUNDING_SATOSHIS)
+					);
+
+					// A record persisted before the field existed deserializes to [].
+					delete serialized.spliceInFlight.inputPrevouts;
+					const legacy = deserializeChannelState(serialized);
+					expect(legacy.spliceInFlight!.inputPrevouts).to.deep.equal([]);
+				});
+
+				/** Drive a splice-in to the point where both sides signed but no
+				 *  tx_signatures crossed, then crash-restore the ACCEPTOR from its
+				 *  serialized state (optionally mutating the serialized record).
+				 *  Returns the restored acceptor, reestablish-connected to the
+				 *  still-live opener but with the fallout NOT yet pumped. */
+				function restartAcceptorBeforeTxSigs(
+					pair: IWirePair,
+					mutate?: (serialized: any) => void
+				): Channel {
+					pair.drop(MessageType.TX_SIGNATURES);
+					startSpliceIn(pair);
+					expect(pair.errors).to.deep.equal([]);
+
+					const serialized = JSON.parse(
+						JSON.stringify(serializeChannelState(pair.acceptor.getFullState()))
+					);
+					if (mutate) mutate(serialized);
+					const restoredState = deserializeChannelState(serialized);
+					const restored = new Channel(restoredState);
+					const acceptorFundingPriv = crypto
+						.createHash('sha256')
+						.update(acceptorSeed)
+						.update(Buffer.from([0]))
+						.digest();
+					restored.setSigner(new ChannelSigner(acceptorFundingPriv));
+					restored.restoreSpliceInFlight();
+					restored.markForReestablish();
+					pair.opener.markForReestablish();
+					pair.clearDrops();
+
+					const rRe = findSendAction(
+						restored.createReestablish(),
+						MessageType.CHANNEL_REESTABLISH
+					);
+					const oRe = findSendAction(
+						pair.opener.createReestablish(),
+						MessageType.CHANNEL_REESTABLISH
+					);
+					pair.enqueue(
+						pair.opener,
+						restored,
+						restored.handleReestablish(
+							decodeChannelReestablishMessage(oRe.payload)
+						)
+					);
+					pair.enqueue(
+						restored,
+						pair.opener,
+						pair.opener.handleReestablish(
+							decodeChannelReestablishMessage(rRe.payload)
+						)
+					);
+					return restored;
+				}
+
+				it('post-restart: retransmitted witnesses verify against the persisted prevout set', function () {
+					const pair = makeWirePair();
+					const restored = restartAcceptorBeforeTxSigs(pair);
+					expect(
+						restored.getFullState().spliceInFlight!.inputPrevouts.length,
+						'prevout set survived the restart'
+					).to.equal(2);
+					pair.pump();
+
+					expect(pair.errors).to.deep.equal([]);
+					expect(restored.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+					expect(restored.getSpliceSession()!.getState()).to.equal(
+						SpliceState.AWAITING_SPLICE_LOCKED
+					);
+				});
+
+				it('post-restart: tampered witnesses are refused with no live builder', function () {
+					const pair = makeWirePair();
+					const restored = restartAcceptorBeforeTxSigs(pair);
+					tamperTxSigs(pair, (witnesses) => {
+						const junkPriv = crypto
+							.createHash('sha256')
+							.update('not-the-wallet-key')
+							.digest();
+						const sig64 = Buffer.from(
+							ecc.sign(crypto.randomBytes(32), junkPriv)
+						);
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [[der, witnesses[0][1]]];
+					});
+					pair.pump();
+
+					expect(
+						pair.errors.some(
+							(e) =>
+								e.includes('invalid splice tx_signatures') &&
+								e.includes('does not verify')
+						)
+					).to.be.true;
+					expect(restored.getFullState().spliceInFlight!.receivedTxSignatures)
+						.to.be.false;
+				});
+
+				it('legacy record without prevouts: crypto checks skipped, count check still applies', function () {
+					// Tampered witnesses pass a legacy restore (nothing to verify
+					// against; documented fail-open for pre-upgrade records).
+					const pairA = makeWirePair();
+					const restoredA = restartAcceptorBeforeTxSigs(pairA, (s) => {
+						delete s.spliceInFlight.inputPrevouts;
+					});
+					expect(
+						restoredA.getFullState().spliceInFlight!.inputPrevouts
+					).to.deep.equal([]);
+					tamperTxSigs(pairA, (witnesses) => {
+						const junkPriv = crypto
+							.createHash('sha256')
+							.update('not-the-wallet-key')
+							.digest();
+						const sig64 = Buffer.from(
+							ecc.sign(crypto.randomBytes(32), junkPriv)
+						);
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [[der, witnesses[0][1]]];
+					});
+					pairA.pump();
+					expect(pairA.errors).to.deep.equal([]);
+					expect(restoredA.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+
+					// The count check needs no prevouts and still refuses.
+					const pairB = makeWirePair();
+					const restoredB = restartAcceptorBeforeTxSigs(pairB, (s) => {
+						delete s.spliceInFlight.inputPrevouts;
+					});
+					tamperTxSigs(pairB, () => []);
+					pairB.pump();
+					expect(
+						pairB.errors.some((e) =>
+							e.includes('expected 1 witness stacks, got 0')
+						)
+					).to.be.true;
+					expect(restoredB.getFullState().spliceInFlight!.receivedTxSignatures)
+						.to.be.false;
+				});
+
+				it('keeps watching the splice outpoint on refusal and locks when it confirms', function () {
+					const pair = makeWirePair();
+					tamperTxSigs(pair, (witnesses) => {
+						const junkPriv = crypto
+							.createHash('sha256')
+							.update('not-the-wallet-key')
+							.digest();
+						const sig64 = Buffer.from(
+							ecc.sign(crypto.randomBytes(32), junkPriv)
+						);
+						const der = bitcoin.script.signature.encode(
+							sig64,
+							bitcoin.Transaction.SIGHASH_ALL
+						);
+						return [[der, witnesses[0][1]]];
+					});
+					startSpliceIn(pair);
+
+					// Refused, but the acceptor's shared-input signature had already
+					// left (it signs first), and witness data does not change the
+					// txid (BIP 141): the opener's locally valid broadcast can
+					// confirm. The refusal must keep the outpoint watched.
+					expect(
+						pair.errors.some((e) => e.includes('invalid splice tx_signatures'))
+					).to.be.true;
+					const record = pair.acceptor.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures).to.be.true;
+					expect(record.receivedTxSignatures).to.be.false;
+					expect(
+						pair.watches.some(
+							(w) =>
+								w.from === pair.acceptor && w.txid.equals(record.spliceTxid)
+						),
+						'acceptor still watches the negotiated splice outpoint'
+					).to.be.true;
+
+					// The watch pays off: the tx confirms; the peer retransmits its
+					// (honest) tx_signatures on reconnect and the splice locks.
+					pair.acceptor.markSpliceConfirmed();
+					pair.opener.markSpliceConfirmed();
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+
+					expect(pair.opener.getState()).to.equal(ChannelState.NORMAL);
+					expect(pair.acceptor.getState()).to.equal(ChannelState.NORMAL);
+					expect(
+						pair.acceptor.getFullState().fundingTxid!.equals(record.spliceTxid)
+					).to.be.true;
+				});
+
+				it('refusal before our signatures leave does not mark them sent', function () {
+					const pair = makeWirePair();
+					// Tamper the ACCEPTOR's (witness-free) tx_signatures by adding a
+					// surplus stack: the OPENER refuses BEFORE its signatures leave.
+					pair.intercept(MessageType.TX_SIGNATURES, (payload) => {
+						const msg = decodeTxSignaturesMessage(payload);
+						if (msg.witnesses.length > 0) return payload;
+						msg.witnesses = [[Buffer.alloc(71, 1), Buffer.alloc(33, 2)]];
+						return encodeTxSignaturesMessage(msg);
+					});
+					startSpliceIn(pair);
+
+					expect(
+						pair.errors.some((e) =>
+							e.includes('expected 0 witness stacks, got 1')
+						)
+					).to.be.true;
+					// The refusal ran before the send helper: state must not claim
+					// our signatures left when they did not.
+					const record = pair.opener.getFullState().spliceInFlight!;
+					expect(record.sentTxSignatures, 'opener signatures not marked sent')
+						.to.be.false;
+					expect(record.receivedTxSignatures).to.be.false;
+					// Our shared-input signature never left, so the splice cannot
+					// confirm: no watch, no broadcast.
+					expect(
+						pair.watches.filter((w) => w.from === pair.opener)
+					).to.deep.equal([]);
+					expect(pair.broadcasts.length).to.equal(0);
+
+					// An honest retransmission completes the splice with the flags
+					// telling the truth end to end.
+					pair.clearIntercepts();
+					disconnect(pair);
+					reconnect(pair);
+					expect(pair.broadcasts.length).to.equal(2);
+					expect(pair.opener.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+					expect(pair.acceptor.getFullState().spliceInFlight!.fullySigned).to.be
+						.true;
+				});
+			});
 
 			it('carries the shared-input signature in the tx_signatures TLV, not the witnesses (CLN interop)', function () {
 				const pair = makeWirePair();
@@ -3967,7 +4530,13 @@ describe('Splice', function () {
 			expect(openerChannel.isQuiescent()).to.be.true;
 			expect(acceptorChannel.isQuiescent()).to.be.true;
 
-			// Initiate splice on opener
+			// Initiate a splice-in on the opener, backed by a real wallet input
+			// (the tx_complete audit aborts an unbacked contribution).
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			const result = openerManager.initiateSplice(channelId, 100_000n, 253);
 			expect(result.ok).to.be.true;
 
@@ -3980,26 +4549,18 @@ describe('Splice', function () {
 			const { openerManager, channelId, openerChannel } =
 				createNormalChannelPair();
 
-			// Setup quiescence and splice
+			// Setup quiescence and a backed splice-in; the auto-routing runs the
+			// negotiation and signature exchange to AWAITING_SPLICE_LOCKED.
 			openerManager.initiateQuiescence(channelId);
+			const wallet = makeSpliceInWallet(100_000n);
+			openerChannel.setSpliceInInputs(
+				[wallet.walletInput],
+				wallet.changeScript
+			);
 			openerManager.initiateSplice(channelId, 100_000n, 253);
-
-			// Get session and progress through interactive TX
-			const session = openerChannel.getSpliceSession()!;
-			session.addInput({
-				serialId: 0n,
-				prevTxid: crypto.randomBytes(32),
-				prevOutputIndex: 0,
-				sequence: 0xfffffffd
-			});
-			session.addOutput({
-				serialId: 2n,
-				amountSats: 100_000n,
-				scriptPubkey: Buffer.alloc(22, 0x01)
-			});
-			session.markTxComplete();
-			session.handlePeerTxComplete();
-			session.handleTxSignatures(crypto.randomBytes(32), 0);
+			expect(openerChannel.getSpliceSession()!.getState()).to.equal(
+				SpliceState.AWAITING_SPLICE_LOCKED
+			);
 
 			const result = openerManager.sendSpliceLocked(channelId);
 			expect(result.ok).to.be.true;

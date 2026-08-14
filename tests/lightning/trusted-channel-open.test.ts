@@ -663,7 +663,13 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	function stubSplice(ch: any, overrides: Record<string, unknown> = {}): void {
 		ch._state.state = ChannelState.SPLICING;
-		ch._spliceTx = { newFundingOutputIndex: 0, ourWalletWitnesses: [] };
+		ch._spliceTx = {
+			tx: { ins: [] },
+			sharedInputIndex: 0,
+			newFundingOutputIndex: 0,
+			ourWalletWitnesses: [],
+			ourWalletInputIndices: []
+		};
 		ch._state.spliceInFlight = {
 			spliceTxid: crypto.randomBytes(32),
 			newFundingOutputIndex: 0,
@@ -688,6 +694,7 @@ describe('Zero-conf splice semantics (BOLT 2)', function () {
 		ch._spliceSession = {
 			getState: () => SpliceState.AWAITING_TX_SIGNATURES,
 			isComplete: () => false,
+			getTxBuilder: () => null,
 			hasSentSpliceLocked: () => false,
 			sendSpliceLocked: () => ({
 				ok: true,
