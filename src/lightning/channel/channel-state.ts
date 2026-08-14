@@ -42,6 +42,16 @@ export interface ISpliceInFlight {
 	/** Splice-in wallet witnesses, in tx-input order (parallel to ourWalletInputIndices). */
 	ourWalletWitnesses: Buffer[][];
 	ourWalletInputIndices: number[];
+	/**
+	 * The complete prevout set of the negotiated splice tx (scriptPubkey and
+	 * value per input, in tx-input order, the shared funding input included).
+	 * The interactive-tx prev_txs die with the process, and peer witness
+	 * validation needs the set after a restart: BIP 143 sighashes commit to
+	 * the spent input's value, BIP 341 sighashes to every input's script and
+	 * value. Empty on records persisted before this field existed, in which
+	 * case the cryptographic witness checks are skipped after a restart.
+	 */
+	inputPrevouts: Array<{ script: Buffer; valueSats: bigint }>;
 	/** Peer's signature on OUR spliced commitment (adopted at completeSplice). */
 	remoteCommitmentSig: Buffer | null;
 	/**

@@ -7902,19 +7902,19 @@ export class Channel {
 			oldWitnessScript
 		);
 
-		// Apply the peer's wallet-input witnesses to the non-shared inputs we did
-		// not sign ourselves (in ascending input order).
-		if (peerWalletWitnesses.length > 0) {
-			const ours = new Set(ourWalletInputIndices);
-			let w = 0;
-			for (
-				let i = 0;
-				i < tx.ins.length && w < peerWalletWitnesses.length;
-				i++
-			) {
-				if (i === sharedInputIndex || ours.has(i)) continue;
-				tx.setWitness(i, peerWalletWitnesses[w++]);
-			}
+		// Apply the peer's wallet-input witnesses to the non-shared inputs we
+		// did not sign ourselves (in ascending input order). Exactly one stack
+		// per peer input: surplus or shortfall means the message does not
+		// match the negotiated tx.
+		const ours = new Set(ourWalletInputIndices);
+		const peerIndices: number[] = [];
+		for (let i = 0; i < tx.ins.length; i++) {
+			if (i === sharedInputIndex || ours.has(i)) continue;
+			peerIndices.push(i);
+		}
+		if (peerWalletWitnesses.length !== peerIndices.length) return null;
+		for (let k = 0; k < peerIndices.length; k++) {
+			tx.setWitness(peerIndices[k], peerWalletWitnesses[k]);
 		}
 
 		const spliceTxid = Buffer.from(tx.getHash());
@@ -8203,6 +8203,10 @@ export class Channel {
 				session.getRemoteFundingPubkey() ||
 				this._state.remoteBasepoints?.fundingPubkey;
 			if (!remoteFundingPubkey || st.newFundingOutputIndex < 0) return;
+			// Captured while the builder's prev_txs are still in hand: witness
+			// validation after a restart has nothing else to bind and verify
+			// the peer's signatures against.
+			const prevouts = this._spliceInputPrevouts();
 			this._state.spliceInFlight = {
 				spliceTxid: Buffer.from(st.tx.getHash()),
 				newFundingOutputIndex: st.newFundingOutputIndex,
@@ -8218,6 +8222,12 @@ export class Channel {
 					w.map((b) => Buffer.from(b))
 				),
 				ourWalletInputIndices: [...st.ourWalletInputIndices],
+				inputPrevouts: prevouts
+					? prevouts.scripts.map((s, i) => ({
+							script: Buffer.from(s),
+							valueSats: prevouts.values[i]
+					  }))
+					: [],
 				remoteCommitmentSig: this._spliceRemoteCommitmentSig
 					? Buffer.from(this._spliceRemoteCommitmentSig)
 					: null,
@@ -11194,12 +11204,15 @@ export class Channel {
 			const remoteOwned = (input.serialId % 2n === 0n) !== weAreInitiator;
 			const isShared =
 				kind === 'splice' && (!input.prevTx || input.prevTx.length === 0);
-			if (kind === 'v2' && !isShared) {
+			if ((kind === 'v2' || (kind === 'splice' && remoteOwned)) && !isShared) {
 				// Witnesses can only be VERIFIED for P2WPKH and P2TR key-spend
 				// prevouts; every other type would have to be accepted on
 				// shape alone. Refuse the negotiation HERE, before the
 				// commitment round signs anything for this transaction, rather
 				// than at tx_signatures when signatures may already be out.
+				// Splice checks REMOTE inputs only: our own splice-in inputs
+				// are signed by the wallet's own closures (any script type)
+				// and never pass through our witness validator.
 				const unsupported = this._v2CheckInputSpendable(input);
 				if (unsupported) return unsupported;
 			}
@@ -11503,6 +11516,44 @@ export class Channel {
 		};
 	}
 
+	/**
+	 * The complete prevout set of the negotiated splice tx (script and value
+	 * per input, in tx-input order, the shared funding input included): from
+	 * the live builder's prev_txs while it exists, from the durable record
+	 * after a restart (captured at record creation, when the prev_txs were
+	 * last in hand). Null when neither source resolves; a record persisted
+	 * before prevouts were captured resolves nothing.
+	 */
+	private _spliceInputPrevouts(): {
+		scripts: Buffer[];
+		values: bigint[];
+	} | null {
+		const builder = this._spliceSession?.getTxBuilder();
+		const st = this._spliceTx;
+		if (builder && st) {
+			const sorted = [...builder.getInputs()].sort((a, b) =>
+				a.serialId < b.serialId ? -1 : 1
+			);
+			if (sorted.length !== st.tx.ins.length) return null;
+			const p2wshScript = bitcoin.payments.p2wsh({
+				redeem: { output: st.oldWitnessScript }
+			}).output as Buffer;
+			return this._collectPrevouts(st.tx, sorted, {
+				index: st.sharedInputIndex,
+				script: p2wshScript,
+				value: this._state.fundingSatoshis
+			});
+		}
+		const record = this._state.spliceInFlight;
+		if (!record?.inputPrevouts || record.inputPrevouts.length === 0) {
+			return null;
+		}
+		return {
+			scripts: record.inputPrevouts.map((p) => p.script),
+			values: record.inputPrevouts.map((p) => p.valueSats)
+		};
+	}
+
 	/** The tx-input indices of the PEER's funding inputs, ascending. */
 	private _v2PeerInputIndices(inputCount: number): number[] | null {
 		const session = this._state.dualFundingSession;
@@ -11580,29 +11631,75 @@ export class Channel {
 	}
 
 	/**
-	 * v2 funding inputs must pay P2WPKH or P2TR: those are the only prevout
-	 * types whose tx_signatures witnesses can be cryptographically verified,
-	 * and an unverifiable input must never make it into the negotiated tx.
+	 * Validate the peer's splice tx_signatures wallet witnesses BEFORE they
+	 * are applied and the splice tx broadcast: exactly one stack per peer
+	 * wallet input, each bound to its negotiated prevout and
+	 * cryptographically verified (the same rules as _validateV2PeerWitnesses).
+	 * The count check always runs; the per-witness cryptographic checks are
+	 * skipped only for a restored builder-less session whose record predates
+	 * prevout capture, where refusing would wedge a live channel's in-flight
+	 * splice (the shared-input 2-of-2 verification still gates the exchange).
+	 * Returns the problem, or null when acceptable.
+	 */
+	private _validateSplicePeerWitnesses(witnesses: Buffer[][]): string | null {
+		const st = this._spliceTx;
+		if (!st) return 'no negotiated splice transaction';
+		const ours = new Set(st.ourWalletInputIndices);
+		const peerIndices: number[] = [];
+		for (let i = 0; i < st.tx.ins.length; i++) {
+			if (i === st.sharedInputIndex || ours.has(i)) continue;
+			peerIndices.push(i);
+		}
+		if (witnesses.length !== peerIndices.length) {
+			return `expected ${peerIndices.length} witness stacks, got ${witnesses.length}`;
+		}
+		if (peerIndices.length === 0) return null;
+		const prevouts = this._spliceInputPrevouts();
+		if (!prevouts) {
+			if (!this._spliceSession?.getTxBuilder()) return null;
+			return 'splice funding prevouts cannot be resolved';
+		}
+		if (prevouts.scripts.length !== st.tx.ins.length) {
+			return 'splice prevouts do not cover the negotiated tx';
+		}
+		for (let k = 0; k < peerIndices.length; k++) {
+			const problem = this._validateWitnessForInput(
+				st.tx,
+				peerIndices[k],
+				witnesses[k],
+				prevouts
+			);
+			if (problem) return problem;
+		}
+		return null;
+	}
+
+	/**
+	 * Interactive-tx funding inputs we will have to judge witnesses for (v2
+	 * open inputs, splice remote inputs) must pay P2WPKH or P2TR: those are
+	 * the only prevout types whose tx_signatures witnesses can be
+	 * cryptographically verified, and an unverifiable input must never make
+	 * it into the negotiated tx.
 	 */
 	private _v2CheckInputSpendable(input: IInteractiveTxInput): string | null {
 		if (!input.prevTx || input.prevTx.length < 32) {
-			return 'v2 funding input carries no previous transaction';
+			return 'funding input carries no previous transaction';
 		}
 		let script: Buffer;
 		try {
 			const prev = bitcoin.Transaction.fromBuffer(input.prevTx);
 			const out = prev.outs[input.prevTxVout ?? input.prevOutputIndex];
-			if (!out) return 'v2 funding input names a missing prevout';
+			if (!out) return 'funding input names a missing prevout';
 			script = Buffer.from(out.script);
 		} catch {
-			return 'v2 funding input previous transaction is unreadable';
+			return 'funding input previous transaction is unreadable';
 		}
 		const isP2wpkh =
 			script.length === 22 && script[0] === 0x00 && script[1] === 0x14;
 		const isP2tr =
 			script.length === 34 && script[0] === 0x51 && script[1] === 0x20;
 		if (!isP2wpkh && !isP2tr) {
-			return 'v2 funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
+			return 'funding input pays an unsupported output type (only P2WPKH and P2TR witnesses can be verified)';
 		}
 		return null;
 	}
@@ -12290,6 +12387,23 @@ export class Channel {
 					{
 						type: ChannelActionType.ERROR,
 						message: 'splice tx_signatures missing shared-input signature'
+					}
+				];
+			}
+
+			// Validate the peer's wallet witnesses BEFORE they are applied and
+			// the batch below persists + broadcasts: one stack per peer input,
+			// every signature verified against its negotiated prevout (the same
+			// rules as the v2 open path). Refusing here fails the exchange with
+			// a named error instead of persisting a splice tx that can never
+			// confirm.
+			const witnessProblem =
+				this._validateSplicePeerWitnesses(peerWalletWitnesses);
+			if (witnessProblem) {
+				return [
+					{
+						type: ChannelActionType.ERROR,
+						message: `invalid splice tx_signatures: ${witnessProblem}`
 					}
 				];
 			}
