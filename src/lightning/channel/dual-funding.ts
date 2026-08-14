@@ -16,9 +16,13 @@
  * pledged inputs stay reserved. Two mitigations, both best effort:
  *   - When the node has a chain backend, peer prevouts are verified against
  *     the chain as tx_add_input arrives (ChannelManager.verifyPeerFundingInput)
- *     and a conclusive spent-or-missing answer aborts the negotiation.
- *     'unknown' proceeds (fail open), and a fast negotiation can outrun the
- *     verdict. Splice inputs are not covered.
+ *     and POSITIVE evidence of a spend (the prevout's tx confirmed on its
+ *     script with the output no longer unspent) aborts the negotiation.
+ *     Absence from the server's view is NOT conclusive (BOLT 2 permits
+ *     unconfirmed inputs and an honest parent may not be indexed yet), so a
+ *     fully fabricated prevout classifies 'unknown' and proceeds; the pledge
+ *     release below is the mitigation for that case. A fast negotiation can
+ *     outrun the verdict. Splice inputs are not covered.
  *   - When a v2 open dies terminally before our tx_signatures were released,
  *     its funding pledges release at once (releaseInputPledges) instead of
  *     waiting out the pledge TTL. Post-signature deaths keep the TTL as the

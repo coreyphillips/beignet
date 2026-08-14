@@ -249,15 +249,16 @@ async function settle(pred: () => boolean, ms = 5000): Promise<void> {
 describe('Issue #311: v2 open pledge release and chain verification (node level)', function () {
 	this.timeout(20_000);
 
-	it('an acceptor with a chain backend aborts a fabricated prevout and the opener frees its pledge', async function () {
+	it('an acceptor with a chain backend aborts a spent prevout and the opener frees its pledge', async function () {
 		const input = makeWalletInput(200_000);
 		const { provider, released } = fundingProviderWith(input);
 		const opener = new LightningNode(
 			makeNodeConfig(1, { fundingProvider: provider })
 		);
-		// The acceptor's chain view has never seen the opener's input: empty
-		// history is the fabricated-prevTx signature.
+		// Positive evidence of a spend: the input's tx is confirmed on its
+		// script but the outpoint is no longer in the unspent set.
 		const backend = new StubBackend();
+		backend.history = [{ txid: outpointOf(input).txid, height: 100 }];
 		const acceptor = new LightningNode(
 			makeNodeConfig(2, { chainBackend: backend })
 		);
@@ -302,6 +303,44 @@ describe('Issue #311: v2 open pledge release and chain verification (node level)
 		backend.history = [{ txid: op.txid, height: 100 }];
 		const acceptor = new LightningNode(
 			makeNodeConfig(4, { chainBackend: backend })
+		);
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		connectNodes(opener, acceptor);
+
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(
+			() => channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(
+			backend.queries,
+			'the acceptor consulted its chain'
+		).to.be.greaterThan(0);
+		expect(released, 'nothing was released').to.have.length(0);
+
+		opener.destroy();
+		acceptor.destroy();
+	});
+
+	it('a prevout this server has not indexed is never refuted (fail open)', async function () {
+		// BOLT 2 permits unconfirmed inputs, and a valid unconfirmed parent
+		// may simply not have reached the acceptor's server yet: absence
+		// alone must not abort an honest open.
+		const input = makeWalletInput(200_000);
+		const { provider, released } = fundingProviderWith(input);
+		const opener = new LightningNode(
+			makeNodeConfig(9, { fundingProvider: provider })
+		);
+		const backend = new StubBackend();
+		const acceptor = new LightningNode(
+			makeNodeConfig(10, { chainBackend: backend })
 		);
 		opener.on('node:error', () => {});
 		acceptor.on('node:error', () => {});
@@ -431,5 +470,148 @@ describe('Issue #311: v2 open pledge release and chain verification (node level)
 
 		opener.destroy();
 		acceptor.destroy();
+	});
+
+	/** A completed open white-boxed into the diverged-RBF terminal shape. */
+	async function divergedOpen(seed: number): Promise<{
+		opener: LightningNode;
+		acceptor: LightningNode;
+		channelId: Buffer;
+		input: ISpliceWalletInput;
+		released: Array<Array<{ txid: string; vout: number }>>;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		channel: any;
+	}> {
+		const input = makeWalletInput(200_000);
+		const { provider, released } = fundingProviderWith(input);
+		const opener = new LightningNode(
+			makeNodeConfig(seed, { fundingProvider: provider })
+		);
+		const acceptor = new LightningNode(makeNodeConfig(seed + 1));
+		opener.on('node:error', () => {});
+		acceptor.on('node:error', () => {});
+		connectNodes(opener, acceptor);
+		const channel = opener.openChannelV2(acceptor.getNodeId(), {
+			fundingSatoshis: 150_000n,
+			fundingFeeratePerkw: 1000
+		});
+		await settle(
+			() => channel.getState() === ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		expect(channel.getState()).to.equal(
+			ChannelState.AWAITING_FUNDING_CONFIRMED
+		);
+		// The peer answered reestablish with unknown-channel after dropping
+		// its side: errored, with nothing anyone could broadcast.
+		const st = channel.getFullState() as unknown as {
+			state: ChannelState;
+			pendingFundingTxHex: string | null;
+			v2InFlight: unknown;
+		};
+		st.state = ChannelState.ERRORED;
+		st.pendingFundingTxHex = null;
+		st.v2InFlight = {
+			sentTxSignatures: false,
+			fullySigned: false,
+			ourWalletInputIndices: [0],
+			ourWitnesses: []
+		};
+		return {
+			opener,
+			acceptor,
+			channelId: channel.getChannelId()!,
+			input,
+			released,
+			channel
+		};
+	}
+
+	it('the diverged-RBF void releases the pledges once the terminal decision lands', async function () {
+		const h = await divergedOpen(11);
+		(
+			h.opener as unknown as {
+				handleChannelErrored(id: Buffer, reason: string): void;
+			}
+		).handleChannelErrored(h.channelId, 'diverged RBF');
+		await settle(() => h.released.length > 0);
+
+		expect(h.released).to.deep.equal([[outpointOf(h.input)]]);
+		expect(
+			h.opener.getChannelManager().getChannel(h.channelId),
+			'the channel was voided'
+		).to.equal(undefined);
+
+		h.opener.destroy();
+		h.acceptor.destroy();
+	});
+
+	it('a void that can neither delete nor condemn the row keeps the pledges', async function () {
+		const h = await divergedOpen(13);
+		// A store that refuses everything: the terminal decision cannot land
+		// durably, a restart would restore the open, and its inputs must
+		// stay reserved.
+		(h.opener as unknown as { storage: unknown }).storage = {
+			loadChannel: (): never => {
+				throw new Error('io failure');
+			},
+			deleteChannel: (): never => {
+				throw new Error('io failure');
+			}
+		};
+		(
+			h.opener as unknown as {
+				handleChannelErrored(id: Buffer, reason: string): void;
+			}
+		).handleChannelErrored(h.channelId, 'diverged RBF');
+		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setImmediate(resolve));
+
+		expect(h.released, 'no release without a durable decision').to.have.length(
+			0
+		);
+		expect(
+			h.opener.getChannelManager().getChannel(h.channelId),
+			'the channel stays tracked for a retry'
+		).to.equal(h.channel);
+
+		h.opener.destroy();
+		h.acceptor.destroy();
+	});
+
+	it('the node answers the durable-row probe from storage, failing toward keeping pledges', function () {
+		const node = new LightningNode(makeNodeConfig(15));
+		const probe = (
+			node.getChannelManager() as unknown as {
+				config: { hasResumableChannelRow?: (id: Buffer) => boolean };
+			}
+		).config.hasResumableChannelRow!;
+		const id = crypto.randomBytes(32);
+		const nodeStorage = node as unknown as { storage: unknown };
+
+		expect(probe(id), 'no storage: nothing durable exists').to.equal(false);
+		nodeStorage.storage = { loadChannel: (): null => null };
+		expect(probe(id), 'no row: nothing to resume').to.equal(false);
+		nodeStorage.storage = {
+			loadChannel: (): object => ({
+				state: { condemned: false },
+				peerPubkey: 'aa'
+			})
+		};
+		expect(probe(id), 'a live row survives a restart').to.equal(true);
+		nodeStorage.storage = {
+			loadChannel: (): object => ({
+				state: { condemned: true },
+				peerPubkey: 'aa'
+			})
+		};
+		expect(probe(id), 'a condemned row is deletion-owed').to.equal(false);
+		nodeStorage.storage = {
+			loadChannel: (): never => {
+				throw new Error('io failure');
+			}
+		};
+		expect(probe(id), 'unreadable: assume it survives').to.equal(true);
+
+		node.destroy();
 	});
 });

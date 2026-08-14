@@ -194,7 +194,10 @@ describe('S-2.H3: interactive-tx tx_add_input receive-side validation', function
 			}
 		});
 
-		it('reports spent-or-missing when the txid never appears in the script history', async function () {
+		it('fails open (unknown) when the txid is absent from the script history', async function () {
+			// Absence is NOT conclusive: a valid unconfirmed parent may simply
+			// not be indexed by this server yet, and BOLT 2 permits unconfirmed
+			// inputs, so an unindexed tx must never be refuted.
 			const backend = makeBackend({
 				listUnspent: async () => [],
 				getScriptHashHistory: async () => [
@@ -202,7 +205,7 @@ describe('S-2.H3: interactive-tx tx_add_input receive-side validation', function
 				]
 			});
 			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
-				'spent-or-missing'
+				'unknown'
 			);
 		});
 
@@ -246,19 +249,20 @@ describe('S-2.H3: interactive-tx tx_add_input receive-side validation', function
 			);
 		});
 
-		it('still refutes a fabricated tx on a backend without listUnspent, and fails open on a history hit', async function () {
-			const absent = makeBackend({
-				getScriptHashHistory: async () => []
+		it('answers unknown without querying on a backend that lacks listUnspent', async function () {
+			// Without the unspent set there is no positive-evidence path, so
+			// the classifier does not spend a round trip on history alone.
+			let historyCalls = 0;
+			const backend = makeBackend({
+				getScriptHashHistory: async () => {
+					historyCalls++;
+					return [];
+				}
 			});
-			expect(await classifyRemoteFundingInput(absent, outpoint)).to.equal(
-				'spent-or-missing'
-			);
-			const present = makeBackend({
-				getScriptHashHistory: async () => [{ txid, height: 120 }]
-			});
-			expect(await classifyRemoteFundingInput(present, outpoint)).to.equal(
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
 				'unknown'
 			);
+			expect(historyCalls).to.equal(0);
 		});
 	});
 });

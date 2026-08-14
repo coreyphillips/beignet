@@ -133,31 +133,32 @@ export function computeScriptHash(scriptPubkey: Buffer): string {
 
 /**
  * Chain verdict on a dual-funding peer's claimed prevout (issue #311).
- * 'unspent' = the outpoint exists unspent; 'spent-or-missing' = the chain
- * conclusively refutes the claim (the tx is absent from the script's history,
- * mempool included, or its confirmed output is no longer unspent);
- * 'unknown' = the backend could not answer conclusively (disconnected,
- * timeout, unconfirmed parent not indexed) and callers must fail open.
+ * 'unspent' = the outpoint exists unspent; 'spent-or-missing' = POSITIVE
+ * evidence refutes the claim (the tx is confirmed on this script and its
+ * output is no longer in the unspent set); 'unknown' = no conclusive answer
+ * (disconnected, timeout, tx not indexed by this server) and callers must
+ * fail open. Absence alone is NEVER conclusive: BOLT 2 permits unconfirmed
+ * inputs, and a valid unconfirmed parent may simply not have reached this
+ * server yet.
  */
 export type RemoteInputVerdict = 'unspent' | 'spent-or-missing' | 'unknown';
 
 /**
  * Best-effort chain verification that a peer-claimed prevout exists unspent
  * (issue #311). Interactive-tx validation is otherwise pure self-consistency
- * over bytes the peer chose, so a fabricated prev_tx yields a funding tx
- * that can never confirm. Queries the prevout script's unspent set and
- * history in parallel; only a conclusive negative reports 'spent-or-missing'.
- * Never throws.
+ * over bytes the peer chose. Queries the prevout script's unspent set and
+ * history in parallel; only positive evidence of a spend reports
+ * 'spent-or-missing'. Never throws.
  */
 export async function classifyRemoteFundingInput(
 	backend: IChainBackend,
 	outpoint: { txidDisplayHex: string; vout: number; scriptPubKey: Buffer }
 ): Promise<RemoteInputVerdict> {
+	// Without the unspent set there is no positive evidence path at all.
+	if (!backend.listUnspent) return 'unknown';
 	const scriptHash = computeScriptHash(outpoint.scriptPubKey);
 	const [unspent, history] = await Promise.all([
-		backend.listUnspent
-			? backend.listUnspent(scriptHash).catch(() => null)
-			: Promise.resolve(null),
+		backend.listUnspent(scriptHash).catch(() => null),
 		backend.getScriptHashHistory(scriptHash).catch(() => null)
 	]);
 	if (
@@ -168,15 +169,17 @@ export async function classifyRemoteFundingInput(
 	) {
 		return 'unspent';
 	}
-	if (!history) return 'unknown';
+	if (!unspent || !history) return 'unknown';
 	const entry = history.find((h) => h.txid === outpoint.txidDisplayHex);
-	// Electrum script history includes mempool entries (height <= 0), so a
-	// transaction the network has never seen cannot appear here.
-	if (!entry) return 'spent-or-missing';
-	if (!unspent) return 'unknown';
-	// Confirmed on chain but not in the unspent set: the output existed and
-	// has been spent. Unconfirmed (height <= 0): servers index mempool utxos
-	// inconsistently, so absence from listunspent proves nothing; fail open.
+	// Absent from the history: NOT conclusive. This server may simply not
+	// have indexed a valid unconfirmed parent yet, and BOLT 2 permits
+	// unconfirmed inputs, so treating absence as refutation would falsely
+	// abort honest opens. Fail open.
+	if (!entry) return 'unknown';
+	// Confirmed on chain but not in the unspent set: the output provably
+	// existed and has been spent. Unconfirmed (height <= 0): servers index
+	// mempool utxos inconsistently, so absence from listunspent proves
+	// nothing; fail open.
 	return entry.height > 0 ? 'spent-or-missing' : 'unknown';
 }
 

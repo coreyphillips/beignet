@@ -4566,6 +4566,7 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 	function setupNegotiation(opts?: {
 		verify?: VerifyFn;
 		provider?: IFundingProvider;
+		hasResumableChannelRow?: (channelId: Buffer) => boolean;
 	}): {
 		mgr: ChannelManager;
 		channel: Channel;
@@ -4577,7 +4578,10 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 		const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
 		const mgr = new ChannelManager({
 			...makeChannelManagerConfig(),
-			...(opts?.verify ? { verifyRemoteFundingInput: opts.verify } : {})
+			...(opts?.verify ? { verifyRemoteFundingInput: opts.verify } : {}),
+			...(opts?.hasResumableChannelRow
+				? { hasResumableChannelRow: opts.hasResumableChannelRow }
+				: {})
 		});
 		if (opts?.provider) mgr.setFundingProvider(opts.provider);
 		const sent: number[] = [];
@@ -4834,6 +4838,62 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 			);
 			expect(h.errors.join(' ')).to.contain('after signature release');
 		});
+
+		it('a verdict landing after a disconnect never re-arms the abort latch', async () => {
+			let resolveVerdict!: (verdict: Verdict) => void;
+			const h = setupNegotiation({
+				verify: () =>
+					new Promise<Verdict>((resolve) => {
+						resolveVerdict = resolve;
+					})
+			});
+			// A recorded open: the disconnect keeps the session and the record
+			// so reestablish can resume the signature exchange. The derived id
+			// must be in place before the peer input so the late verdict still
+			// resolves this channel after its promotion.
+			const derivedId = crypto.randomBytes(32);
+			const st = h.channel.getFullState() as unknown as {
+				channelId: Buffer;
+				state: ChannelState;
+				v2InFlight: unknown;
+			};
+			st.channelId = derivedId;
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ADD_INPUT,
+				encodeTxAddInputMessage({
+					channelId: derivedId,
+					serialId: 1n,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			);
+			st.state = ChannelState.AWAITING_TX_SIGNATURES;
+			st.v2InFlight = {
+				sentTxSignatures: false,
+				fullySigned: false,
+				ourWalletInputIndices: [0],
+				ourWitnesses: []
+			};
+
+			h.mgr.handlePeerDisconnected(h.owner);
+			expect(h.channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+			h.sent.length = 0;
+
+			resolveVerdict('spent-or-missing');
+			await settle();
+
+			expect(
+				h.sent.filter((type) => type === MessageType.TX_ABORT),
+				'no abort into a dead connection'
+			).to.have.length(0);
+			expect(
+				(h.channel as unknown as { _v2AbortPending: boolean })._v2AbortPending,
+				'the latch the disconnect cleared stays cleared'
+			).to.equal(false);
+			expect(h.channel.getState()).to.equal(ChannelState.AWAITING_REESTABLISH);
+		});
 	});
 
 	describe('pledge release on terminal death (ChannelManager)', () => {
@@ -5056,6 +5116,103 @@ describe('Issue #311: fabricated prevTx defenses', () => {
 			resolveSelection({ inputs: [input], changeScript: Buffer.alloc(0) });
 			await settle();
 
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('keeps the pledges when a durable row a restart could restore survives', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const probed: string[] = [];
+			const h = setupNegotiation({
+				provider,
+				// The node's abandoned listener could not adjudicate the row
+				// (unreadable store): the manager must not release inputs an
+				// open resumed after a restart would still spend.
+				hasResumableChannelRow: (channelId) => {
+					probed.push(channelId.toString('hex'));
+					return true;
+				}
+			});
+			h.channel.setDualFundingContribution(
+				[makeContributionInput(100_000)],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: h.tempId,
+					data: Buffer.from('cancel', 'ascii')
+				})
+			);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
+			expect(probed, 'the durable row was consulted').to.not.have.length(0);
+			expect(
+				released,
+				'nothing released while the row survives'
+			).to.have.length(0);
+		});
+
+		it('releases when the durable probe reports the row gone', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const input = makeContributionInput(100_000);
+			const h = setupNegotiation({
+				provider,
+				hasResumableChannelRow: () => false
+			});
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: h.tempId,
+					data: Buffer.from('cancel', 'ascii')
+				})
+			);
+			await settle();
+
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases the contribution when an invalid peer input errors the open', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			// Serial id parity violation (we are the initiator, the peer must
+			// use odd ids): the builder refuses, the batch carries a bare
+			// local ERROR with no state transition, and the manager removes
+			// the open. Its pledges must not be left to the TTL.
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ADD_INPUT,
+				encodeTxAddInputMessage({
+					channelId: h.tempId,
+					serialId: 2n,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
 			expect(released).to.deep.equal([[outpointOf(input)]]);
 		});
 	});

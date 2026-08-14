@@ -297,18 +297,29 @@ export interface IChannelManagerConfig {
 	/**
 	 * Optional chain-backed, best-effort verification of a v2 peer's
 	 * tx_add_input prevout (issue #311). Every local prev_tx check is
-	 * self-consistency over bytes the peer chose, so a fabricated prevout
-	 * yields a funding tx that can never confirm while our pledged inputs
-	 * stay frozen. Called fire-and-forget as peer inputs arrive; a
-	 * 'spent-or-missing' verdict aborts the negotiation, anything else
-	 * proceeds (fail open). `txid` is internal byte order. Absent means no
-	 * verification.
+	 * self-consistency over bytes the peer chose. Called fire-and-forget as
+	 * peer inputs arrive; only 'spent-or-missing' (positive evidence the
+	 * prevout was spent) aborts the negotiation, anything else proceeds
+	 * (fail open; absence from a server's view is never conclusive, since
+	 * BOLT 2 permits unconfirmed inputs). `txid` is internal byte order.
+	 * Absent means no verification.
 	 */
 	verifyRemoteFundingInput?: (input: {
 		txid: Buffer;
 		vout: number;
 		scriptPubKey: Buffer;
 	}) => Promise<'unspent' | 'spent-or-missing' | 'unknown'>;
+	/**
+	 * Whether a durable channel row a restart could restore survives for
+	 * this id (issue #311). Consulted before releasing the funding pledges
+	 * of an abandoned v2 open: the node's channel:abandoned listener can
+	 * leave a row untouched when the store cannot answer, and a restart
+	 * would then resume an open whose inputs are no longer reserved.
+	 * Implementations must answer true when unsure (a read failure keeps
+	 * the pledge; the TTL is the backstop). Absent means no durable rows
+	 * exist (no storage).
+	 */
+	hasResumableChannelRow?: (channelId: Buffer) => boolean;
 }
 
 /**
@@ -391,6 +402,14 @@ export class ChannelManager extends EventEmitter {
 	 * interactive-tx input and message caps.
 	 */
 	private _verifiedPeerInputs = new WeakMap<Channel, Set<string>>();
+	/**
+	 * Channels whose v2 funding pledges were already released (issue #311).
+	 * Several terminal sites can fire for one death (an ERROR action in the
+	 * teardown batch plus the tx_abort finally, an error sweep plus a later
+	 * disconnect); the provider release is idempotent, but releasing once
+	 * keeps the call sites honest and observable.
+	 */
+	private _v2PledgesReleased = new WeakSet<Channel>();
 	/** Cached local node id (pubkey) for the tx_signatures ordering tie-break. */
 	private localNodeIdCache: Buffer | null = null;
 	/**
@@ -5013,6 +5032,12 @@ export class ChannelManager extends EventEmitter {
 		const idHex = channelId.toString('hex');
 		const registeredPeer = this.channelPeers.get(idHex);
 		if (registeredPeer !== undefined && registeredPeer !== peerPubkey) return;
+		// A verdict landing after a disconnect must not act: markForReestablish
+		// keeps the session of a recorded open (it resumes over reestablish),
+		// so the guards below would pass, and the abort would re-arm the
+		// _v2AbortPending latch the disconnect just cleared while its tx_abort
+		// is lost with the connection, wedging the resumed exchange.
+		if (channel.getState() === ChannelState.AWAITING_REESTABLISH) return;
 		// Session identity: a peer abort or completed open nulls or replaces
 		// the session.
 		if (channel.getDualFundingSession() !== session) return;
@@ -5599,14 +5624,19 @@ export class ChannelManager extends EventEmitter {
 	 */
 	private releaseAbandonedV2Pledges(channel: Channel): void {
 		if (!this.fundingProvider?.releaseInputPledges) return;
+		if (this._v2PledgesReleased.has(channel)) return;
 		const outpoints = channel.getReleasableV2PledgeOutpoints();
 		if (outpoints.length === 0) return;
-		const idHex = (
-			channel.getChannelId() ?? channel.getTemporaryChannelId()
-		)?.toString('hex');
+		const id = channel.getChannelId() ?? channel.getTemporaryChannelId();
+		const idHex = id?.toString('hex');
 		if (idHex && (this.channels.has(idHex) || this.tempChannels.has(idHex))) {
 			return;
 		}
+		// A durable row a restart could restore keeps its pledges: releasing
+		// here would let the wallet double-spend the input of an open that
+		// resumes after a restart. The TTL remains the backstop.
+		if (id && this.config.hasResumableChannelRow?.(id) === true) return;
+		this._v2PledgesReleased.add(channel);
 		void this.fundingProvider
 			.releaseInputPledges(outpoints)
 			.catch(() => undefined);
@@ -5946,7 +5976,12 @@ export class ChannelManager extends EventEmitter {
 					// A channel that failed before funding has no permanent id yet, so
 					// fall back to the temporary one: without it the error carries a
 					// null channelId and cannot be tied back to the open it belongs to.
-					this.removeCurrentTempChannel(peerPubkey, channel);
+					if (this.removeCurrentTempChannel(peerPubkey, channel)) {
+						// A validation error just ended a tracked v2 open (an
+						// invalid peer contribution, a failed audit): its
+						// funding pledges release with it (issue #311).
+						this.releaseErroredTempV2Pledges(channel);
+					}
 					this.emit(
 						'error',
 						channel.getChannelId() ?? channel.getTemporaryChannelId(),
