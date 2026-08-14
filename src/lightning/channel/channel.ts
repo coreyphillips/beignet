@@ -11645,17 +11645,26 @@ export class Channel {
 		if (isP2tr) {
 			if (stack.length === 1) {
 				const sig = stack[0];
-				// BOLT 2 requires SIGHASH_ALL on every tx_signatures
-				// signature: only the explicit 65-byte form qualifies (the
-				// 64-byte shorthand is SIGHASH_DEFAULT).
-				if (sig.length !== 65 || sig[64] !== 0x01) {
-					return 'P2TR key-spend signature must carry an explicit SIGHASH_ALL byte';
+				// BOLT 2 names SIGHASH_ALL for tx_signatures, but BIP 341's
+				// 64-byte SIGHASH_DEFAULT shorthand commits to exactly the
+				// same transaction data, and common signers (Bitcoin Core,
+				// libwally, and so eclair and CLN) emit it for taproot
+				// inputs: both forms are accepted. A 65-byte signature with
+				// any other trailing byte stays refused, including 0x00,
+				// which BIP 341 forbids in the explicit form.
+				const isDefaultForm = sig.length === 64;
+				if (!isDefaultForm && (sig.length !== 65 || sig[64] !== 0x01)) {
+					return 'P2TR key-spend signature must be the 64-byte SIGHASH_DEFAULT form or carry an explicit SIGHASH_ALL byte';
 				}
+				// The hash type byte is part of the BIP 341 message, so the
+				// sighash must be computed for the form the witness carries.
 				const sighash = tx.hashForWitnessV1(
 					index,
 					prevouts.scripts,
 					prevouts.values.map((v) => Number(v)),
-					bitcoin.Transaction.SIGHASH_ALL
+					isDefaultForm
+						? bitcoin.Transaction.SIGHASH_DEFAULT
+						: bitcoin.Transaction.SIGHASH_ALL
 				);
 				let valid = false;
 				try {

@@ -200,8 +200,16 @@ function makeRealPrevOut(valueSats: number): IRealPrevOut {
 	};
 }
 
-/** A real P2TR key-path prevout (raw x-only key program, BIP 341 spend). */
-function makeRealP2trPrevOut(valueSats: number): IRealPrevOut {
+/**
+ * A real P2TR key-path prevout (raw x-only key program, BIP 341 spend).
+ * 'all' signs the explicit 65-byte SIGHASH_ALL form; 'default' signs the
+ * 64-byte SIGHASH_DEFAULT shorthand (a different BIP 341 message: the hash
+ * type byte is part of the preimage).
+ */
+function makeRealP2trPrevOut(
+	valueSats: number,
+	sighash: 'all' | 'default' = 'all'
+): IRealPrevOut {
 	const priv = crypto.randomBytes(32);
 	const xonly = Buffer.from(getPublicKey(priv).subarray(1));
 	const script = Buffer.concat([Buffer.from([0x51, 0x20]), xonly]);
@@ -214,17 +222,21 @@ function makeRealP2trPrevOut(valueSats: number): IRealPrevOut {
 		script,
 		pub: xonly,
 		sign: (tx, index, prevouts) => {
-			const sighash = tx.hashForWitnessV1(
+			const hashType =
+				sighash === 'default'
+					? bitcoin.Transaction.SIGHASH_DEFAULT
+					: bitcoin.Transaction.SIGHASH_ALL;
+			const msg = tx.hashForWitnessV1(
 				index,
 				prevouts.scripts,
 				prevouts.values.map((v) => Number(v)),
-				bitcoin.Transaction.SIGHASH_ALL
+				hashType
 			);
+			const rawSig = Buffer.from(ecc.signSchnorr(msg, priv));
 			return [
-				Buffer.concat([
-					Buffer.from(ecc.signSchnorr(sighash, priv)),
-					Buffer.from([bitcoin.Transaction.SIGHASH_ALL])
-				])
+				sighash === 'default'
+					? rawSig
+					: Buffer.concat([rawSig, Buffer.from([hashType])])
 			];
 		}
 	};
@@ -3075,7 +3087,7 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		).to.not.equal(null);
 	});
 
-	it('verifies P2TR peer inputs: explicit SIGHASH_ALL key-spend only', () => {
+	it('verifies P2TR peer inputs: key-spend with SIGHASH_DEFAULT or explicit SIGHASH_ALL', () => {
 		const h = driveToCommitmentExchange({
 			acceptorPrev: makeRealP2trPrevOut(60_000)
 		});
@@ -3084,14 +3096,16 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
 		const genuine = h.acceptorWitness();
 
-		// The 64-byte SIGHASH_DEFAULT shorthand is refused: BOLT 2 names
-		// SIGHASH_ALL, which only the explicit 65-byte form carries.
+		// A 64-byte witness is judged against the SIGHASH_DEFAULT message,
+		// not waved through: this signature was made over the SIGHASH_ALL
+		// message, so presented in the shorthand form it must fail the
+		// schnorr verify (the hash type byte is part of the preimage).
 		let actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
 			witnesses: [[genuine[0][0].subarray(0, 64)]]
 		});
-		expect(findError(actions)).to.contain('explicit SIGHASH_ALL');
+		expect(findError(actions)).to.contain('does not verify');
 
 		// A 65-byte signature with a non-ALL type byte is refused.
 		const wrongType = Buffer.from(genuine[0][0]);
@@ -3100,6 +3114,17 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 			channelId: cid,
 			txid,
 			witnesses: [[wrongType]]
+		});
+		expect(findError(actions)).to.contain('explicit SIGHASH_ALL');
+
+		// A 65-byte signature with a trailing 0x00 is refused: BIP 341
+		// forbids the explicit form for SIGHASH_DEFAULT.
+		const explicitDefault = Buffer.from(genuine[0][0]);
+		explicitDefault[64] = 0x00;
+		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: [[explicitDefault]]
 		});
 		expect(findError(actions)).to.contain('explicit SIGHASH_ALL');
 
@@ -3126,6 +3151,26 @@ describe('Dual funding v2 reestablish (issues 288/289)', () => {
 
 		// The genuine explicit-ALL key-spend verifies and is accepted.
 		actions = h.opener.handleTxSignatures({
+			channelId: cid,
+			txid,
+			witnesses: genuine
+		});
+		expect(findError(actions)).to.equal(null);
+	});
+
+	it('accepts a genuine 64-byte SIGHASH_DEFAULT P2TR key-spend witness', () => {
+		// Bitcoin Core and libwally sign taproot inputs with SIGHASH_DEFAULT
+		// by default, so eclair and CLN peers emit the 64-byte shorthand.
+		const h = driveToCommitmentExchange({
+			acceptorPrev: makeRealP2trPrevOut(60_000, 'default')
+		});
+		deliverCommitments(h);
+		const cid = h.opener.getChannelId()!;
+		const txid = Buffer.from(h.opener.getFullState().v2InFlight!.fundingTxid);
+		const genuine = h.acceptorWitness();
+		expect(genuine[0][0].length).to.equal(64);
+
+		const actions = h.opener.handleTxSignatures({
 			channelId: cid,
 			txid,
 			witnesses: genuine
