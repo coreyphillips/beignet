@@ -126,24 +126,20 @@ export async function createEclairClient(): Promise<EclairRestClient | null> {
 /**
  * Restart Eclair and wait for it to sync to bitcoind's chain tip.
  *
- * Eclair's ZMQ block notifications do not work reliably under Docker
- * on ARM Macs. Restarting forces Eclair to sync via RPC at startup.
+ * Eclair's ZMQ block notifications do not work reliably under Docker on ARM
+ * Macs; restarting forces Eclair to sync via RPC at startup. This helper
+ * ALWAYS restarts, even when Eclair already reports the tip: callers use it
+ * as a forced transport reset that re-runs Eclair's funding-confirmation
+ * checks. Those checks only run when Eclair PROCESSES a block, so one
+ * trigger block is mined while Eclair is stopped: the startup catch-up then
+ * always has at least one unseen block to process, without depending on the
+ * (unreliable) live ZMQ feed. The helper resolves only once Eclair reports
+ * the post-trigger height, proving the catch-up ran.
  */
 export async function restartEclairAndSync(
 	client: EclairRestClient,
 	timeoutMs = 120_000
 ): Promise<void> {
-	const btcInfo = (await bitcoinRpc('getblockchaininfo')) as { blocks: number };
-	const targetHeight = btcInfo.blocks;
-
-	// Check if already synced (avoid unnecessary restart)
-	try {
-		const info = await client.getInfo();
-		if (info.blockHeight >= targetHeight) return;
-	} catch {
-		/* not reachable, restart anyway */
-	}
-
 	// Eclair v0.14 refuses to start if it detects locked UTXOs.
 	// Must stop Eclair first, then unlock, then start — otherwise Eclair
 	// re-locks UTXOs between our unlock and its shutdown.
@@ -157,13 +153,18 @@ export async function restartEclairAndSync(
 	} catch {
 		/* ignore */
 	}
+	// Mined while Eclair is down so it CANNOT arrive over live ZMQ: the
+	// startup catch-up must process it, re-checking every armed watch.
+	await mineBlocks(1);
+	const btcInfo = (await bitcoinRpc('getblockchaininfo')) as { blocks: number };
+	const goal = btcInfo.blocks;
 	try {
 		execSync('docker start eclair', { timeout: 30_000 });
 	} catch {
 		/* ignore */
 	}
 
-	// Wait for Eclair to come back up and sync
+	// Wait for Eclair to come back up and report the post-trigger tip.
 	const start = Date.now();
 	let lastLog = 0;
 	while (Date.now() - start < timeoutMs) {
@@ -173,12 +174,12 @@ export async function restartEclairAndSync(
 
 			if (elapsed - lastLog >= 15) {
 				console.log(
-					`    Eclair restart sync: ${info.blockHeight}/${targetHeight} (${elapsed}s elapsed)`
+					`    Eclair restart sync: ${info.blockHeight}/${goal} (${elapsed}s elapsed)`
 				);
 				lastLog = elapsed;
 			}
 
-			if (info.blockHeight >= targetHeight) return;
+			if (info.blockHeight >= goal) return;
 		} catch {
 			// Eclair still starting up
 		}

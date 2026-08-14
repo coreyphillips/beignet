@@ -57,14 +57,6 @@ import { SqliteStorage } from '../../../src/lightning/storage/sqlite-storage';
 import { Network } from '../../../src/lightning/invoice/types';
 import { LnCoinType } from '../../../src/lightning/keys/wallet-keys';
 
-// Eclair's amd64 Docker image crashes with SIGSEGV in libsecp256k1-jni.so when
-// running under QEMU/Rosetta on ARM Macs. Channel operations (which involve
-// secp256k1 DER parsing) trigger the crash; TCP and init work fine. Running an
-// arm64-NATIVE Eclair image (e.g. polarlightning/eclair) avoids the crash — set
-// ECLAIR_ARM64_NATIVE=1 to run the channel tiers in that case.
-const isArmMac = os.platform() === 'darwin' && os.arch() === 'arm64';
-const skipChannelTests = isArmMac && process.env.ECLAIR_ARM64_NATIVE !== '1';
-
 // Beignet-funded opens to Eclair (Tier 13) require Eclair to DISCOVER a funding
 // transaction that its PEER published. Eclair sits in WAIT_FOR_FUNDING_CONFIRMED
 // ("waiting for them to publish the funding tx") until it sees that tx via a live
@@ -77,8 +69,7 @@ const skipChannelTests = isArmMac && process.env.ECLAIR_ARM64_NATIVE !== '1';
 // confirmed P2WSH 2-of-2 and Eclair-funded channels (every other tier) work.
 // Set ECLAIR_ZMQ_LIVE=1 to force-run these when running against an Eclair whose
 // ZMQ feed actually delivers (e.g. a rebuilt container or Linux host).
-const skipBeignetFundedEclair =
-	skipChannelTests || process.env.ECLAIR_ZMQ_LIVE !== '1';
+const skipBeignetFundedEclair = process.env.ECLAIR_ZMQ_LIVE !== '1';
 
 describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 	this.timeout(120_000);
@@ -256,7 +247,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 2: Channel Open', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should open channel from Eclair to beignet', async function () {
@@ -384,7 +375,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 3: Eclair pays beignet', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should receive payment from Eclair', async function () {
@@ -577,7 +568,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 4: Beignet pays Eclair', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should pay Eclair invoice', async function () {
@@ -606,9 +597,6 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 				const channelId = channels[0].getChannelId();
 				if (channelId) {
 					node.handleFundingConfirmed(channelId);
-
-					// Setup routing for beignet → Eclair
-					setupRoutingForChannel(node, eclairPubkey);
 				}
 			}
 			await sleep(1000);
@@ -618,6 +606,13 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 			await sleep(3000);
 
 			await waitForEclairChannels(eclair, 1, 30_000);
+
+			// Setup routing for beignet -> Eclair AFTER the final reconnect:
+			// the synthetic graph entry has zeroed signatures, and if it exists
+			// when Eclair runs its on-connect gossip sync, beignet serves it in
+			// reply to query_short_channel_ids and Eclair 0.14+ closes the
+			// connection on the malformed announcement (0.13.x only warned).
+			setupRoutingForChannel(node, eclairPubkey);
 
 			// Create Eclair invoice
 			const eclairInvoice = await eclair.createInvoice(
@@ -716,7 +711,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 5: Beignet opens channel to Eclair', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should open channel from beignet to Eclair', async function () {
@@ -797,7 +792,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 6: Cooperative Close', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should cooperatively close channel initiated by Eclair', async function () {
@@ -979,7 +974,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 7: Force Close', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should force close channel from beignet side', async function () {
@@ -1120,7 +1115,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 8: Bidirectional Payments', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should handle bidirectional payments in same channel', async function () {
@@ -1304,7 +1299,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 9: Channel Reestablishment', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should reestablish channel after beignet disconnect/reconnect', async function () {
@@ -1475,7 +1470,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 
 	describe('Tier 12: Anchor Channels', function () {
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		it('should open an anchor channel from Eclair to beignet', async function () {
@@ -1723,7 +1718,7 @@ describe('Interop: Beignet ↔ Eclair (regtest)', function () {
 		let storage: SqliteStorage | null = null;
 
 		beforeEach(function () {
-			if (skipAll || skipChannelTests) this.skip();
+			if (skipAll) this.skip();
 		});
 
 		afterEach(async () => {
