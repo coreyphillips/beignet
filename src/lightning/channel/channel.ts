@@ -11508,16 +11508,14 @@ export class Channel {
 	/**
 	 * Validate the peer's tx_signatures witnesses BEFORE they enter the
 	 * session: exactly one stack per peer input, each bound to its negotiated
-	 * prevout and cryptographically verified where the output type allows.
-	 * P2WPKH: [DER SIGHASH_ALL signature, pubkey], the pubkey must hash to
-	 * the program and the signature must verify over the BIP 143 sighash.
-	 * P2TR key-spend: a 65-byte schnorr signature with an explicit ALL byte
-	 * (BOLT 2 requires SIGHASH_ALL on tx_signatures signatures), verified
-	 * over the BIP 341 sighash against the output key. P2WSH: the witness
-	 * script must hash to the program, items under standardness bounds, and
-	 * DER-shaped items must carry ALL (the script itself cannot be executed
-	 * generically); taproot script-path likewise is judged structurally.
-	 * Returns the problem, or null when acceptable.
+	 * prevout and cryptographically verified. P2WPKH: [DER SIGHASH_ALL
+	 * signature, pubkey], the pubkey must hash to the program and the
+	 * signature must verify over the BIP 143 sighash. P2TR key-spend: a
+	 * 64-byte (SIGHASH_DEFAULT) or 65-byte explicit-ALL schnorr signature,
+	 * verified over the matching BIP 341 sighash against the output key.
+	 * P2WSH and taproot script-path witnesses cannot be judged generically
+	 * (the script's semantics are its own) and fail closed. Returns the
+	 * problem, or null when acceptable.
 	 */
 	private _validateV2PeerWitnesses(witnesses: Buffer[][]): string | null {
 		const prevouts = this._v2InputPrevouts();
@@ -11645,17 +11643,26 @@ export class Channel {
 		if (isP2tr) {
 			if (stack.length === 1) {
 				const sig = stack[0];
-				// BOLT 2 requires SIGHASH_ALL on every tx_signatures
-				// signature: only the explicit 65-byte form qualifies (the
-				// 64-byte shorthand is SIGHASH_DEFAULT).
-				if (sig.length !== 65 || sig[64] !== 0x01) {
-					return 'P2TR key-spend signature must carry an explicit SIGHASH_ALL byte';
+				// BOLT 2 names SIGHASH_ALL for tx_signatures, but BIP 341's
+				// 64-byte SIGHASH_DEFAULT shorthand commits to exactly the
+				// same transaction data, and common signers (Bitcoin Core,
+				// libwally, and so eclair and CLN) emit it for taproot
+				// inputs: both forms are accepted. A 65-byte signature with
+				// any other trailing byte stays refused, including 0x00,
+				// which BIP 341 forbids in the explicit form.
+				const isDefaultForm = sig.length === 64;
+				if (!isDefaultForm && (sig.length !== 65 || sig[64] !== 0x01)) {
+					return 'P2TR key-spend signature must be the 64-byte SIGHASH_DEFAULT form or carry an explicit SIGHASH_ALL byte';
 				}
+				// The hash type byte is part of the BIP 341 message, so the
+				// sighash must be computed for the form the witness carries.
 				const sighash = tx.hashForWitnessV1(
 					index,
 					prevouts.scripts,
 					prevouts.values.map((v) => Number(v)),
-					bitcoin.Transaction.SIGHASH_ALL
+					isDefaultForm
+						? bitcoin.Transaction.SIGHASH_DEFAULT
+						: bitcoin.Transaction.SIGHASH_ALL
 				);
 				let valid = false;
 				try {
@@ -12353,9 +12360,10 @@ export class Channel {
 
 		// Validate the peer's witnesses BEFORE they enter the session: the
 		// count must match its inputs exactly, every stack must be able to
-		// spend a segwit input, and signature-shaped elements must commit with
-		// SIGHASH_ALL. Refusing here fails the negotiation cleanly instead of
-		// advancing into a funding tx that can never be broadcast.
+		// spend a segwit input, and signatures must commit to the whole
+		// transaction (SIGHASH_ALL, or its taproot SIGHASH_DEFAULT
+		// equivalent). Refusing here fails the negotiation cleanly instead
+		// of advancing into a funding tx that can never be broadcast.
 		const witnessProblem = this._validateV2PeerWitnesses(msg.witnesses || []);
 		if (witnessProblem) {
 			return [
