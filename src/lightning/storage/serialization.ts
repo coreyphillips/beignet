@@ -1100,15 +1100,12 @@ export function serializeGraphChannel(ch: IGraphChannel): string {
 }
 
 export function deserializeGraphChannel(json: string): IGraphChannel {
-	const ch = JSON.parse(json, genericReviver) as IGraphChannel;
-	// Rows persisted before provenance tracking (#340) could only come from
-	// the signature-verified receive path, so an absent flag means verified.
-	// Explicit false (e.g. a verified update on an RGS-primed channel)
-	// round-trips untouched.
-	ch.announcementVerified ??= true;
-	if (ch.update1) ch.update1Verified ??= true;
-	if (ch.update2) ch.update2Verified ??= true;
-	return ch;
+	// Provenance flags round-trip as-is; rows that predate them come back with
+	// the flags absent and are resolved by signature verification at the
+	// common restore boundary (NetworkGraph.restoreChannel). Absence must NOT
+	// be trusted here: pre-#340 rows could hold zero-signature RGS messages
+	// persisted alongside a verified update.
+	return JSON.parse(json, genericReviver) as IGraphChannel;
 }
 
 export function serializeGraphNode(node: IGraphNode): string {
@@ -1129,11 +1126,9 @@ export function serializeGraphNode(node: IGraphNode): string {
 
 export function deserializeGraphNode(json: string): IGraphNode {
 	const parsed = JSON.parse(json, genericReviver);
-	const node = {
+	// Provenance resolution for legacy rows happens in NetworkGraph.restoreNode.
+	return {
 		...parsed,
 		channels: new Set(parsed.channels as string[])
 	} as IGraphNode;
-	// Legacy rows (pre-#340) only ever held verified announcements.
-	if (node.announcement) node.announcementVerified ??= true;
-	return node;
 }

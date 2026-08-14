@@ -576,9 +576,12 @@ Entries inserted directly through `graph.addChannelAnnouncement` /
 work for local routing but are never served in `reply_channel_range` or
 `query_short_channel_ids` responses (BOLT 7 forbids relaying unvalidated
 announcements; strict peers such as eclair 0.14+ disconnect on invalid gossip
-signatures). Pass `{ verified: true }` only for signature-checked messages; the
-`handlePeerMessage` gossip handlers do this automatically after verification.
-Rapid Gossip Sync entries are always unverified because RGS strips signatures.
+signatures). Pass `{ verified: true }` only for signature-checked messages that
+re-encode byte-identically to the signed wire payload; the `handlePeerMessage`
+gossip handlers do this automatically. Rapid Gossip Sync entries are always
+unverified because RGS strips signatures. Stored rows that predate these flags
+are resolved at restore by verifying the canonical re-encoding, failing safe to
+unverified.
 
 ### HTLC Forwarding
 

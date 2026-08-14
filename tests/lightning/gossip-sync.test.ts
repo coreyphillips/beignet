@@ -27,8 +27,16 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage
 } from '../../src/lightning/gossip/types';
-import { decodeChannelAnnouncementMessage } from '../../src/lightning/gossip/messages';
+import {
+	decodeChannelAnnouncementMessage,
+	encodeChannelAnnouncementMessage
+} from '../../src/lightning/gossip/messages';
 import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
+import {
+	makeSignedChannelKeys,
+	makeSignedChannelAnnouncement,
+	makeSignedChannelUpdate
+} from './helpers/signed-gossip';
 import {
 	GossipSyncManager,
 	GossipSyncState
@@ -888,6 +896,66 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(result.nodeAnnouncements.length).to.equal(0);
 		});
 
+		it('lets a verified update take over an unverified slot despite an older timestamp', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(100, 1, 0);
+			const [n1, n2] = makeNodePair(1);
+			graph.addChannelAnnouncement(makeChannelAnnouncement(scid, n1, n2), {
+				verified: true
+			});
+			// RGS-style: synthetic update stamped with the snapshot's global
+			// latest-seen timestamp.
+			graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 2000));
+			// The real signed update carries its true, older timestamp and must
+			// still win the slot.
+			expect(
+				graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 1500), {
+					verified: true
+				})
+			).to.be.true;
+			const result = graph.getGossipMessagesForChannels([scid]);
+			expect(result.updates.length).to.equal(1);
+			expect(result.updates[0].timestamp).to.equal(1500);
+		});
+
+		it('keeps rejecting stale updates between slots of equal provenance', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(100, 1, 0);
+			const [n1, n2] = makeNodePair(1);
+			graph.addChannelAnnouncement(makeChannelAnnouncement(scid, n1, n2), {
+				verified: true
+			});
+			graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 1500), {
+				verified: true
+			});
+			expect(
+				graph.applyChannelUpdate(makeChannelUpdate(scid, 0, 1400), {
+					verified: true
+				})
+			).to.be.false;
+			graph.applyChannelUpdate(makeChannelUpdate(scid, 1, 2000));
+			expect(graph.applyChannelUpdate(makeChannelUpdate(scid, 1, 1900))).to.be
+				.false;
+		});
+
+		it('lets a verified node announcement take over an unverified one despite an older timestamp', function () {
+			const graph = new NetworkGraph();
+			const scid = makeScid(100, 1, 0);
+			const [n1, n2] = makeNodePair(1);
+			graph.addChannelAnnouncement(makeChannelAnnouncement(scid, n1, n2), {
+				verified: true
+			});
+			graph.applyNodeAnnouncement(makeNodeAnnouncement(n1, 2000));
+			expect(
+				graph.applyNodeAnnouncement(makeNodeAnnouncement(n1, 1500), {
+					verified: true
+				})
+			).to.be.true;
+			const result = graph.getGossipMessagesForChannels([scid]);
+			expect(result.nodeAnnouncements.length).to.equal(1);
+			expect(result.nodeAnnouncements[0].timestamp).to.equal(1500);
+		});
+
 		it('upgrades an unverified channel when a verified announcement for the same SCID arrives', function () {
 			const graph = new NetworkGraph();
 			const scid = makeScid(100, 1, 0);
@@ -1219,6 +1287,192 @@ describe('Gossip Sync (Phase 5)', function () {
 			expect(scids.length).to.equal(1);
 			expect(scids[0].equals(verifiedScid)).to.be.true;
 			node.destroy();
+		});
+
+		it('serves received announcements byte-identically and withholds ones with unreproducible signed bytes (issue #340)', function () {
+			const node = makeNode();
+			const peer = 'aa'.repeat(33);
+			const cleanScid = makeScid(150, 1, 0);
+			const extraScid = makeScid(150, 2, 0);
+			const clean = makeSignedChannelAnnouncement(
+				cleanScid,
+				makeSignedChannelKeys(),
+				REGTEST_CHAIN_HASH
+			);
+			// Signed future fields the codec cannot round-trip: re-encoding
+			// would drop them and break the signatures.
+			const extra = makeSignedChannelAnnouncement(
+				extraScid,
+				makeSignedChannelKeys(),
+				REGTEST_CHAIN_HASH,
+				Buffer.from([1, 2, 3])
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				clean.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				extra.payload
+			);
+
+			const graph = node.getGraph();
+			// Both entries are routable...
+			expect(graph.getChannel(cleanScid)!.announcementVerified).to.be.true;
+			expect(graph.getChannel(extraScid)!.announcementVerified).to.be.false;
+
+			// ...but only the clean one is served, byte-identical to the wire
+			// payload whose signatures were verified.
+			const outbound: Array<{ type: number; payload: Buffer }> = [];
+			node.on(
+				'message:outbound',
+				(_pubkey: string, type: number, payload: Buffer) => {
+					outbound.push({ type, payload });
+				}
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.QUERY_SHORT_CHANNEL_IDS,
+				encodeQueryShortChannelIdsMessage({
+					chainHash: REGTEST_CHAIN_HASH,
+					encodedShortIds: encodeShortChannelIds([cleanScid, extraScid])
+				})
+			);
+			const served = outbound.filter(
+				(m) => m.type === MessageType.CHANNEL_ANNOUNCEMENT
+			);
+			expect(served.length).to.equal(1);
+			expect(served[0].payload.equals(clean.payload)).to.be.true;
+			node.destroy();
+		});
+
+		it('withholds a signed channel_update whose extra signed bytes cannot be reproduced (issue #340)', function () {
+			const node = makeNode();
+			const peer = 'aa'.repeat(33);
+			const scid = makeScid(151, 1, 0);
+			const keys = makeSignedChannelKeys();
+			const ann = makeSignedChannelAnnouncement(scid, keys, REGTEST_CHAIN_HASH);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_ANNOUNCEMENT,
+				ann.payload
+			);
+			const cleanUpd = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			);
+			const extraUpd = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey2,
+				1,
+				1000,
+				REGTEST_CHAIN_HASH,
+				Buffer.from([9, 9])
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_UPDATE,
+				cleanUpd.payload
+			);
+			node.handlePeerMessage(
+				peer,
+				MessageType.CHANNEL_UPDATE,
+				extraUpd.payload
+			);
+
+			const ch = node.getGraph().getChannel(scid)!;
+			expect(ch.update1Verified).to.be.true;
+			// The lossy update stays routable but unservable.
+			expect(ch.update2).to.exist;
+			expect(ch.update2Verified).to.be.false;
+			const served = node.getGraph().getGossipMessagesForChannels([scid]);
+			expect(served.updates.length).to.equal(1);
+			expect(served.updates[0].channelFlags & 0x01).to.equal(0);
+			node.destroy();
+		});
+
+		it('refuses to cache or serve an assembled announcement with invalid counterparty signatures (issue #340)', function (done) {
+			const node = makeNode();
+			const scid = makeScid(160, 1, 0);
+			const keys = makeSignedChannelKeys();
+			// Structurally valid announcement whose signatures were never
+			// validated: the counterparty sent zeros via announcement_signatures.
+			const zeroSigAnn = encodeChannelAnnouncementMessage({
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				chainHash: REGTEST_CHAIN_HASH,
+				shortChannelId: scid,
+				nodeId1: getPublicKey(keys.nodeKey1),
+				nodeId2: getPublicKey(keys.nodeKey2),
+				bitcoinKey1: Buffer.alloc(33),
+				bitcoinKey2: Buffer.alloc(33)
+			});
+			const upd = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			).payload;
+			node.on('announcement:ready', () => {
+				const gossipCache = (
+					node as unknown as { _ownChannelGossip: Map<string, unknown> }
+				)._ownChannelGossip;
+				expect(gossipCache.size).to.equal(0);
+				const ch = node.getGraph().getChannel(scid);
+				// Routable locally, never advertised.
+				expect(ch).to.exist;
+				expect(ch!.announcementVerified).to.be.false;
+				expect(node.getGraph().getChannelsByBlockRange(160, 1)).to.have.length(
+					0
+				);
+				node.destroy();
+				done();
+			});
+			node
+				.getChannelManager()
+				.emit('announcement:ready', crypto.randomBytes(32), zeroSigAnn, upd);
+		});
+
+		it('caches and serves a fully signed assembled announcement', function (done) {
+			const node = makeNode();
+			const scid = makeScid(161, 1, 0);
+			const ann = makeSignedChannelAnnouncement(
+				scid,
+				makeSignedChannelKeys(),
+				REGTEST_CHAIN_HASH
+			);
+			const upd = makeSignedChannelUpdate(
+				scid,
+				makeSignedChannelKeys().nodeKey1,
+				0,
+				1000,
+				REGTEST_CHAIN_HASH
+			).payload;
+			node.on('announcement:ready', () => {
+				const gossipCache = (
+					node as unknown as { _ownChannelGossip: Map<string, unknown> }
+				)._ownChannelGossip;
+				expect(gossipCache.size).to.equal(1);
+				expect(node.getGraph().getChannel(scid)!.announcementVerified).to.be
+					.true;
+				expect(node.getGraph().getChannelsByBlockRange(161, 1)).to.have.length(
+					1
+				);
+				node.destroy();
+				done();
+			});
+			node
+				.getChannelManager()
+				.emit('announcement:ready', crypto.randomBytes(32), ann.payload, upd);
 		});
 
 		it('should handle inbound query_short_channel_ids via handlePeerMessage', function () {

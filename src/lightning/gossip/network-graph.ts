@@ -13,6 +13,11 @@ import {
 	DEFAULT_PRUNE_MAX_AGE,
 	decodeShortChannelId
 } from './types';
+import {
+	verifyChannelAnnouncementMessage,
+	verifyChannelUpdateMessage,
+	verifyNodeAnnouncementMessage
+} from './validation';
 
 export class NetworkGraph {
 	private _channels: Map<string, IGraphChannel> = new Map();
@@ -131,10 +136,17 @@ export class NetworkGraph {
 
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 		const existing = direction === 0 ? channel.update1 : channel.update2;
+		const existingVerified =
+			direction === 0 ? channel.update1Verified : channel.update2Verified;
 
-		// Reject if not strictly newer
+		// Reject if not strictly newer, unless a verified update is taking over
+		// an unverified slot: RGS stamps synthetic updates with the snapshot's
+		// global latest-seen timestamp, which would otherwise block the real
+		// signed update forever.
 		if (existing && msg.timestamp <= existing.timestamp) {
-			return false;
+			if (!(opts.verified === true && existingVerified !== true)) {
+				return false;
+			}
 		}
 
 		if (direction === 0) {
@@ -166,9 +178,12 @@ export class NetworkGraph {
 			return false;
 		}
 
-		// Reject if not strictly newer
+		// Reject if not strictly newer, unless a verified announcement is taking
+		// over an unverified slot (see applyChannelUpdate).
 		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
-			return false;
+			if (!(opts.verified === true && node.announcementVerified !== true)) {
+				return false;
+			}
 		}
 
 		node.announcement = msg;
@@ -276,9 +291,35 @@ export class NetworkGraph {
 	}
 
 	/**
-	 * Restore a channel directly into the graph (bypasses validation).
+	 * Restore a channel directly into the graph (bypasses graph validation).
+	 * Rows persisted before provenance tracking carry no verified flags;
+	 * they are resolved here by verifying the canonical re-encoding, since
+	 * absence cannot be trusted (pre-#340 rows could hold zero-signature RGS
+	 * messages persisted alongside a verified update). Fails safe to
+	 * unverified; rows with explicit flags skip the signature checks. This is
+	 * the common boundary for every storage backend, custom ones included.
 	 */
 	restoreChannel(channel: IGraphChannel): void {
+		if (channel.announcementVerified === undefined) {
+			channel.announcementVerified = verifyChannelAnnouncementMessage(
+				channel.announcement
+			);
+		}
+		if (channel.update1 && channel.update1Verified === undefined) {
+			channel.update1Verified = verifyChannelUpdateMessage(
+				channel.update1,
+				channel.nodeId1,
+				channel.nodeId2
+			);
+		}
+		if (channel.update2 && channel.update2Verified === undefined) {
+			channel.update2Verified = verifyChannelUpdateMessage(
+				channel.update2,
+				channel.nodeId1,
+				channel.nodeId2
+			);
+		}
+
 		const scidHex = channel.shortChannelId.toString('hex');
 		this._channels.set(scidHex, channel);
 
@@ -304,9 +345,16 @@ export class NetworkGraph {
 	}
 
 	/**
-	 * Restore a node directly into the graph (bypasses validation).
+	 * Restore a node directly into the graph (bypasses graph validation).
+	 * Legacy rows without a provenance flag are resolved by verifying the
+	 * canonical re-encoding (see restoreChannel).
 	 */
 	restoreNode(node: IGraphNode): void {
+		if (node.announcement && node.announcementVerified === undefined) {
+			node.announcementVerified = verifyNodeAnnouncementMessage(
+				node.announcement
+			);
+		}
 		const nodeHex = node.nodeId.toString('hex');
 		const existing = this._nodes.get(nodeHex);
 		if (existing) {

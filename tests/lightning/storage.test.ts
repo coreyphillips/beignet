@@ -32,6 +32,13 @@ import {
 	perCommitmentPointFromSecret
 } from '../../src/lightning/keys/derivation';
 import { getPublicKey } from '../../src/lightning/crypto/ecdh';
+import {
+	makeSignedChannelKeys,
+	makeSignedChannelAnnouncement,
+	makeSignedChannelUpdate,
+	makeSignedNodeAnnouncement
+} from './helpers/signed-gossip';
+import { NetworkGraph } from '../../src/lightning/gossip/network-graph';
 import { buildLocalCommitment } from '../../src/lightning/channel/commitment-builder';
 import {
 	PaymentStatus,
@@ -325,17 +332,71 @@ describe('Storage Layer', function () {
 			};
 		}
 
-		it('treats legacy persisted graph rows without provenance flags as verified', function () {
-			// Rows written before #340 could only come from the
-			// signature-verified receive path.
-			const channel = makeGraphChannelFixture();
-			const restored = deserializeGraphChannel(serializeGraphChannel(channel));
-			expect(restored.announcementVerified).to.be.true;
-			expect(restored.update1Verified).to.be.true;
-			// No update2 in the row: no flag is invented for it.
-			expect(restored.update2Verified).to.be.undefined;
+		it('resolves legacy rows without provenance flags by signature verification at restore', function () {
+			// Pre-#340 rows carry no flags and may hold zero-signature RGS
+			// messages (a verified update persisted the whole channel), so
+			// absence is resolved by verifying the canonical re-encoding at the
+			// restore boundary, never trusted.
+			const invalid = makeGraphChannelFixture();
+			const restoredInvalid = deserializeGraphChannel(
+				serializeGraphChannel(invalid)
+			);
+			// Deserialize invents nothing.
+			expect(restoredInvalid.announcementVerified).to.be.undefined;
+			expect(restoredInvalid.update1Verified).to.be.undefined;
+			const graphInvalid = new NetworkGraph();
+			graphInvalid.restoreChannel(restoredInvalid);
+			const chInvalid = graphInvalid.getChannel(
+				restoredInvalid.shortChannelId
+			)!;
+			expect(chInvalid.announcementVerified).to.be.false;
+			expect(chInvalid.update1Verified).to.be.false;
 
-			const nodeAnn: INodeAnnouncementMessage = {
+			// A genuinely signed legacy row resolves verified.
+			const scid = Buffer.from('0000010000020003', 'hex');
+			const keys = makeSignedChannelKeys();
+			const { msg: annMsg } = makeSignedChannelAnnouncement(scid, keys);
+			const { msg: updMsg } = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000
+			);
+			const legacy: IGraphChannel = {
+				shortChannelId: scid,
+				nodeId1: annMsg.nodeId1,
+				nodeId2: annMsg.nodeId2,
+				features: Buffer.alloc(0),
+				announcement: annMsg,
+				update1: updMsg
+			};
+			const restoredValid = deserializeGraphChannel(
+				serializeGraphChannel(legacy)
+			);
+			const graphValid = new NetworkGraph();
+			graphValid.restoreChannel(restoredValid);
+			const chValid = graphValid.getChannel(scid)!;
+			expect(chValid.announcementVerified).to.be.true;
+			expect(chValid.update1Verified).to.be.true;
+			// No update2 in the row: no flag is invented for it.
+			expect(chValid.update2Verified).to.be.undefined;
+
+			// Node announcements resolve the same way.
+			const signedNode = makeSignedNodeAnnouncement(keys.nodeKey1, 1000);
+			const goodNode: IGraphNode = {
+				nodeId: signedNode.msg.nodeId,
+				announcement: signedNode.msg,
+				channels: new Set(['abc123'])
+			};
+			const restoredGoodNode = deserializeGraphNode(
+				serializeGraphNode(goodNode)
+			);
+			expect(restoredGoodNode.announcementVerified).to.be.undefined;
+			graphValid.restoreNode(restoredGoodNode);
+			expect(graphValid.getNode(signedNode.msg.nodeId)!.announcementVerified).to
+				.be.true;
+
+			const badAnn: INodeAnnouncementMessage = {
 				signature: crypto.randomBytes(64),
 				features: Buffer.alloc(0),
 				timestamp: 1000,
@@ -344,21 +405,14 @@ describe('Storage Layer', function () {
 				alias: Buffer.alloc(32),
 				addresses: []
 			};
-			const node: IGraphNode = {
-				nodeId: nodeAnn.nodeId,
-				announcement: nodeAnn,
-				channels: new Set(['abc123'])
-			};
-			const restoredNode = deserializeGraphNode(serializeGraphNode(node));
-			expect(restoredNode.announcementVerified).to.be.true;
-
-			// A node row without an announcement gets no flag either.
-			const bare: IGraphNode = {
-				nodeId: getPublicKey(makeSeed(2)),
+			const badNode: IGraphNode = {
+				nodeId: badAnn.nodeId,
+				announcement: badAnn,
 				channels: new Set()
 			};
-			const restoredBare = deserializeGraphNode(serializeGraphNode(bare));
-			expect(restoredBare.announcementVerified).to.be.undefined;
+			graphValid.restoreNode(badNode);
+			expect(graphValid.getNode(badAnn.nodeId)!.announcementVerified).to.be
+				.false;
 		});
 
 		it('round-trips explicit provenance flags', function () {
@@ -547,6 +601,59 @@ describe('Storage Layer', function () {
 			expect(all[0].shortChannelId.equals(channel.shortChannelId)).to.be.true;
 		});
 
+		it('does not resurrect legacy zero-signature RGS rows as servable after restart', function () {
+			// Pre-#340 sequence: RGS primed the channel (zero-sig announcement),
+			// a later signature-verified update persisted the WHOLE row without
+			// provenance flags. After restart the announcement must stay
+			// unservable while the genuinely signed update resolves verified.
+			const scid = Buffer.from('0000640000010000', 'hex'); // block 100
+			const keys = makeSignedChannelKeys();
+			const nodeId1 = getPublicKey(keys.nodeKey1);
+			const nodeId2 = getPublicKey(keys.nodeKey2);
+			const zeroSigAnn: IChannelAnnouncementMessage = {
+				nodeSignature1: Buffer.alloc(64),
+				nodeSignature2: Buffer.alloc(64),
+				bitcoinSignature1: Buffer.alloc(64),
+				bitcoinSignature2: Buffer.alloc(64),
+				features: Buffer.alloc(0),
+				chainHash: BITCOIN_CHAIN_HASH,
+				shortChannelId: scid,
+				nodeId1,
+				nodeId2,
+				bitcoinKey1: Buffer.alloc(33),
+				bitcoinKey2: Buffer.alloc(33)
+			};
+			const { msg: signedUpd } = makeSignedChannelUpdate(
+				scid,
+				keys.nodeKey1,
+				0,
+				1000
+			);
+			const legacyRow: IGraphChannel = {
+				shortChannelId: scid,
+				nodeId1,
+				nodeId2,
+				features: Buffer.alloc(0),
+				announcement: zeroSigAnn,
+				update1: signedUpd
+			};
+
+			storage.saveGossipChannel(scid.toString('hex'), legacyRow);
+			const loaded = storage.loadAllGossipChannels();
+			expect(loaded).to.have.length(1);
+
+			const graph = new NetworkGraph();
+			graph.restoreChannel(loaded[0]);
+			const ch = graph.getChannel(scid)!;
+			expect(ch.announcementVerified).to.be.false;
+			expect(ch.update1Verified).to.be.true;
+			// Never advertised, never served.
+			expect(graph.getChannelsByBlockRange(100, 5)).to.have.length(0);
+			const served = graph.getGossipMessagesForChannels([scid]);
+			expect(served.announcements).to.have.length(0);
+			expect(served.updates).to.have.length(0);
+		});
+
 		it('should save and load gossip nodes', function () {
 			const nodeId = getPublicKey(makeSeed(1));
 			const node: IGraphNode = {
@@ -619,9 +726,6 @@ describe('Storage Layer', function () {
 
 	describe('NetworkGraph restore', function () {
 		it('should restore channels via restoreChannel', function () {
-			const {
-				NetworkGraph
-			} = require('../../src/lightning/gossip/network-graph');
 			const graph = new NetworkGraph();
 
 			const nodeId1 = getPublicKey(makeSeed(1));
@@ -657,7 +761,7 @@ describe('Storage Layer', function () {
 
 			const loaded = graph.getChannel(channel.shortChannelId);
 			expect(loaded).to.not.be.undefined;
-			expect(loaded.shortChannelId.equals(channel.shortChannelId)).to.be.true;
+			expect(loaded!.shortChannelId.equals(channel.shortChannelId)).to.be.true;
 		});
 	});
 });
