@@ -3,6 +3,8 @@ name: type-check
 on:
   workflow_dispatch:
   pull_request:
+  push:
+    branches: [master]
 
 jobs:
   typescript:
@@ -22,7 +24,7 @@ jobs:
           cache: 'npm'
 
       - name: Install Node.js dependencies
-        run: npm install || npm install
+        run: npm ci
 
       - name: Type check
         run: npm run tsc:check
