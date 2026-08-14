@@ -143,6 +143,8 @@ export function applyRapidGossipSnapshot(
 			bitcoinKey1: EMPTY_KEY,
 			bitcoinKey2: EMPTY_KEY
 		};
+		// RGS strips signatures by design, so the entry stays unverified and is
+		// never relayed to gossip queries (BOLT 7, #340).
 		if (graph.addChannelAnnouncement(msg)) channelsAdded++;
 	}
 
@@ -233,6 +235,7 @@ export function applyRapidGossipSnapshot(
 			feeProportionalMillionths: feeProp,
 			htlcMaximumMsat: htlcMax
 		};
+		// Unverified (RGS strips signatures): applied for routing, never relayed.
 		if (graph.applyChannelUpdate(msg)) updatesApplied++;
 	}
 

@@ -13,6 +13,11 @@ import {
 	DEFAULT_PRUNE_MAX_AGE,
 	decodeShortChannelId
 } from './types';
+import {
+	verifyChannelAnnouncementMessage,
+	verifyChannelUpdateMessage,
+	verifyNodeAnnouncementMessage
+} from './validation';
 
 export class NetworkGraph {
 	private _channels: Map<string, IGraphChannel> = new Map();
@@ -37,8 +42,14 @@ export class NetworkGraph {
 	/**
 	 * Add a channel to the graph from a channel_announcement.
 	 * Validates that nodeId1 < nodeId2 lexicographically and chain_hash matches.
+	 * Pass { verified: true } only for signature-verified (or self-signed)
+	 * announcements; unverified entries are excluded from gossip query
+	 * responses (BOLT 7: MUST NOT relay unvalidated announcements, #340).
 	 */
-	addChannelAnnouncement(msg: IChannelAnnouncementMessage): boolean {
+	addChannelAnnouncement(
+		msg: IChannelAnnouncementMessage,
+		opts: { verified?: boolean } = {}
+	): boolean {
 		// Validate chain hash against OUR chain (not hardcoded mainnet).
 		if (!msg.chainHash.equals(this._chainHash)) {
 			return false;
@@ -51,8 +62,24 @@ export class NetworkGraph {
 
 		const scidHex = msg.shortChannelId.toString('hex');
 
-		// Reject duplicate
-		if (this._channels.has(scidHex)) {
+		const existing = this._channels.get(scidHex);
+		if (existing) {
+			// Upgrade path: a signed announcement for an SCID we only hold
+			// unverified (e.g. Rapid Gossip Sync primed it) replaces the entry
+			// in place, so the channel becomes servable. Endpoints must match;
+			// existing updates and their provenance flags are preserved.
+			if (
+				opts.verified === true &&
+				existing.announcementVerified !== true &&
+				existing.nodeId1.equals(msg.nodeId1) &&
+				existing.nodeId2.equals(msg.nodeId2)
+			) {
+				existing.announcement = msg;
+				existing.features = Buffer.from(msg.features);
+				existing.announcementVerified = true;
+				return true;
+			}
+			// Reject duplicate
 			return false;
 		}
 
@@ -62,7 +89,8 @@ export class NetworkGraph {
 			nodeId1: Buffer.from(msg.nodeId1),
 			nodeId2: Buffer.from(msg.nodeId2),
 			features: Buffer.from(msg.features),
-			announcement: msg
+			announcement: msg,
+			announcementVerified: opts.verified === true
 		};
 		this._channels.set(scidHex, channel);
 
@@ -93,8 +121,13 @@ export class NetworkGraph {
 	 * Apply a channel_update to an existing channel.
 	 * Direction bit determines whether to set update1 (dir=0) or update2 (dir=1).
 	 * Rejects if channel unknown or timestamp is not strictly newer.
+	 * Pass { verified: true } only for signature-verified (or self-signed)
+	 * updates; unverified updates are excluded from gossip query responses.
 	 */
-	applyChannelUpdate(msg: IChannelUpdateMessage): boolean {
+	applyChannelUpdate(
+		msg: IChannelUpdateMessage,
+		opts: { verified?: boolean } = {}
+	): boolean {
 		const scidHex = msg.shortChannelId.toString('hex');
 		const channel = this._channels.get(scidHex);
 		if (!channel) {
@@ -103,16 +136,25 @@ export class NetworkGraph {
 
 		const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 		const existing = direction === 0 ? channel.update1 : channel.update2;
+		const existingVerified =
+			direction === 0 ? channel.update1Verified : channel.update2Verified;
 
-		// Reject if not strictly newer
+		// Reject if not strictly newer, unless a verified update is taking over
+		// an unverified slot: RGS stamps synthetic updates with the snapshot's
+		// global latest-seen timestamp, which would otherwise block the real
+		// signed update forever.
 		if (existing && msg.timestamp <= existing.timestamp) {
-			return false;
+			if (!(opts.verified === true && existingVerified !== true)) {
+				return false;
+			}
 		}
 
 		if (direction === 0) {
 			channel.update1 = msg;
+			channel.update1Verified = opts.verified === true;
 		} else {
 			channel.update2 = msg;
+			channel.update2Verified = opts.verified === true;
 		}
 
 		return true;
@@ -121,8 +163,13 @@ export class NetworkGraph {
 	/**
 	 * Apply a node_announcement to an existing node.
 	 * Rejects if node has no channels or timestamp is not strictly newer.
+	 * Pass { verified: true } only for signature-verified (or self-signed)
+	 * announcements; unverified ones are excluded from gossip query responses.
 	 */
-	applyNodeAnnouncement(msg: INodeAnnouncementMessage): boolean {
+	applyNodeAnnouncement(
+		msg: INodeAnnouncementMessage,
+		opts: { verified?: boolean } = {}
+	): boolean {
 		const nodeHex = msg.nodeId.toString('hex');
 		const node = this._nodes.get(nodeHex);
 
@@ -131,12 +178,16 @@ export class NetworkGraph {
 			return false;
 		}
 
-		// Reject if not strictly newer
+		// Reject if not strictly newer, unless a verified announcement is taking
+		// over an unverified slot (see applyChannelUpdate).
 		if (node.announcement && msg.timestamp <= node.announcement.timestamp) {
-			return false;
+			if (!(opts.verified === true && node.announcementVerified !== true)) {
+				return false;
+			}
 		}
 
 		node.announcement = msg;
+		node.announcementVerified = opts.verified === true;
 		return true;
 	}
 
@@ -240,9 +291,35 @@ export class NetworkGraph {
 	}
 
 	/**
-	 * Restore a channel directly into the graph (bypasses validation).
+	 * Restore a channel directly into the graph (bypasses graph validation).
+	 * Rows persisted before provenance tracking carry no verified flags;
+	 * they are resolved here by verifying the canonical re-encoding, since
+	 * absence cannot be trusted (pre-#340 rows could hold zero-signature RGS
+	 * messages persisted alongside a verified update). Fails safe to
+	 * unverified; rows with explicit flags skip the signature checks. This is
+	 * the common boundary for every storage backend, custom ones included.
 	 */
 	restoreChannel(channel: IGraphChannel): void {
+		if (channel.announcementVerified === undefined) {
+			channel.announcementVerified = verifyChannelAnnouncementMessage(
+				channel.announcement
+			);
+		}
+		if (channel.update1 && channel.update1Verified === undefined) {
+			channel.update1Verified = verifyChannelUpdateMessage(
+				channel.update1,
+				channel.nodeId1,
+				channel.nodeId2
+			);
+		}
+		if (channel.update2 && channel.update2Verified === undefined) {
+			channel.update2Verified = verifyChannelUpdateMessage(
+				channel.update2,
+				channel.nodeId1,
+				channel.nodeId2
+			);
+		}
+
 		const scidHex = channel.shortChannelId.toString('hex');
 		this._channels.set(scidHex, channel);
 
@@ -268,13 +345,21 @@ export class NetworkGraph {
 	}
 
 	/**
-	 * Restore a node directly into the graph (bypasses validation).
+	 * Restore a node directly into the graph (bypasses graph validation).
+	 * Legacy rows without a provenance flag are resolved by verifying the
+	 * canonical re-encoding (see restoreChannel).
 	 */
 	restoreNode(node: IGraphNode): void {
+		if (node.announcement && node.announcementVerified === undefined) {
+			node.announcementVerified = verifyNodeAnnouncementMessage(
+				node.announcement
+			);
+		}
 		const nodeHex = node.nodeId.toString('hex');
 		const existing = this._nodes.get(nodeHex);
 		if (existing) {
 			existing.announcement = node.announcement;
+			existing.announcementVerified = node.announcementVerified;
 		} else {
 			this._nodes.set(nodeHex, node);
 		}
@@ -307,6 +392,9 @@ export class NetworkGraph {
 		const endBlock = firstBlock + numberOfBlocks;
 		const result: Buffer[] = [];
 		for (const channel of this._channels.values()) {
+			// BOLT 7: never advertise announcements we have not validated (#340).
+			// Strict peers (eclair 0.14+) disconnect on invalid gossip signatures.
+			if (channel.announcementVerified !== true) continue;
 			const scid = decodeShortChannelId(channel.shortChannelId);
 			if (scid.block >= firstBlock && scid.block < endBlock) {
 				result.push(Buffer.from(channel.shortChannelId));
@@ -343,10 +431,19 @@ export class NetworkGraph {
 		for (const scid of scids) {
 			const channel = this._channels.get(scid.toString('hex'));
 			if (!channel) continue;
+			// BOLT 7: never relay announcements we have not validated (#340).
+			// Skipping the whole channel also covers a verified update sitting
+			// on an unverified announcement: an update MUST NOT be sent without
+			// a servable channel_announcement.
+			if (channel.announcementVerified !== true) continue;
 
 			announcements.push(channel.announcement);
-			if (channel.update1) updates.push(channel.update1);
-			if (channel.update2) updates.push(channel.update2);
+			if (channel.update1 && channel.update1Verified === true) {
+				updates.push(channel.update1);
+			}
+			if (channel.update2 && channel.update2Verified === true) {
+				updates.push(channel.update2);
+			}
 
 			// Collect node announcements for endpoint nodes (deduplicated)
 			for (const nodeId of [channel.nodeId1, channel.nodeId2]) {
@@ -354,7 +451,7 @@ export class NetworkGraph {
 				if (seenNodes.has(nodeHex)) continue;
 				seenNodes.add(nodeHex);
 				const node = this._nodes.get(nodeHex);
-				if (node?.announcement) {
+				if (node?.announcement && node.announcementVerified === true) {
 					nodeAnnouncements.push(node.announcement);
 				}
 			}

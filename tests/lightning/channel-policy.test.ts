@@ -30,6 +30,10 @@ import {
 	decodeChannelUpdateMessage
 } from '../../src/lightning/gossip/messages';
 import { decode as decodeInvoice } from '../../src/lightning/invoice/decode';
+import {
+	makeSignedChannelKeys,
+	makeSignedChannelAnnouncement
+} from './helpers/signed-gossip';
 import { SqliteStorage } from '../../src/lightning/storage/sqlite-storage';
 import { BeignetNode } from '../../src/cli/beignet-node';
 
@@ -616,14 +620,15 @@ describe('Channel Routing Policy (M3)', function () {
 					feeProportionalMillionths: 0,
 					htlcMaximumMsat: 123n
 				});
+				// The handler now refuses to cache an announcement whose signatures
+				// do not validate (#340), so use a genuinely signed one.
+				const signedAnn = makeSignedChannelAnnouncement(
+					scid,
+					makeSignedChannelKeys()
+				).payload;
 				alice
 					.getChannelManager()
-					.emit(
-						'announcement:ready',
-						channelId,
-						Buffer.alloc(430),
-						placeholderUpdate
-					);
+					.emit('announcement:ready', channelId, signedAnn, placeholderUpdate);
 
 				const gossip = (
 					alice as unknown as {

@@ -185,12 +185,23 @@ export interface IGraphChannel {
 	announcement: IChannelAnnouncementMessage;
 	update1?: IChannelUpdateMessage;
 	update2?: IChannelUpdateMessage;
+	// BOLT 7: a node MUST NOT relay announcements it has not validated. These
+	// flags record signature-verified (or self-signed) provenance per stored
+	// message; unverified entries (Rapid Gossip Sync strips signatures, direct
+	// API injection carries none) stay routable locally but are excluded from
+	// reply_channel_range / query_short_channel_ids responses.
+	announcementVerified?: boolean;
+	update1Verified?: boolean;
+	update2Verified?: boolean;
 }
 
 export interface IGraphNode {
 	nodeId: Buffer;
 	announcement?: INodeAnnouncementMessage;
 	channels: Set<string>;
+	// Same provenance rule as IGraphChannel: unverified node_announcements are
+	// never served to gossip queries.
+	announcementVerified?: boolean;
 }
 
 export interface IRouteHop {

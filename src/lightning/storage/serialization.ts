@@ -1100,6 +1100,11 @@ export function serializeGraphChannel(ch: IGraphChannel): string {
 }
 
 export function deserializeGraphChannel(json: string): IGraphChannel {
+	// Provenance flags round-trip as-is; rows that predate them come back with
+	// the flags absent and are resolved by signature verification at the
+	// common restore boundary (NetworkGraph.restoreChannel). Absence must NOT
+	// be trusted here: pre-#340 rows could hold zero-signature RGS messages
+	// persisted alongside a verified update.
 	return JSON.parse(json, genericReviver) as IGraphChannel;
 }
 
@@ -1113,11 +1118,15 @@ export function serializeGraphNode(node: IGraphNode): string {
 			node.announcement as unknown as Record<string, unknown>
 		);
 	}
+	if (node.announcementVerified !== undefined) {
+		obj.announcementVerified = node.announcementVerified;
+	}
 	return JSON.stringify(obj);
 }
 
 export function deserializeGraphNode(json: string): IGraphNode {
 	const parsed = JSON.parse(json, genericReviver);
+	// Provenance resolution for legacy rows happens in NetworkGraph.restoreNode.
 	return {
 		...parsed,
 		channels: new Set(parsed.channels as string[])

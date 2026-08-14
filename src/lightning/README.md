@@ -571,6 +571,18 @@ const hinted = gsp.findRoute(graph, source, destination, amountMsat, finalCltv,
 // Routing hints inject synthetic edges for private channels not in the gossip graph
 ```
 
+Entries inserted directly through `graph.addChannelAnnouncement` /
+`applyChannelUpdate` / `applyNodeAnnouncement` are unverified by default: they
+work for local routing but are never served in `reply_channel_range` or
+`query_short_channel_ids` responses (BOLT 7 forbids relaying unvalidated
+announcements; strict peers such as eclair 0.14+ disconnect on invalid gossip
+signatures). Pass `{ verified: true }` only for signature-checked messages that
+re-encode byte-identically to the signed wire payload; the `handlePeerMessage`
+gossip handlers do this automatically. Rapid Gossip Sync entries are always
+unverified because RGS strips signatures. Stored rows that predate these flags
+are resolved at restore by verifying the canonical re-encoding, failing safe to
+unverified.
+
 ### HTLC Forwarding
 
 Multi-hop payments are forwarded automatically. Register SCIDs to enable forwarding:
@@ -780,7 +792,7 @@ Interop tests are excluded from `npm run test:lightning`. Use `npm run test:inte
 
 - **Two-party simulation**: nodes are wired via `message:outbound` event loopback, no TCP required
 - **Synchronous loopback**: the entire HTLC fulfill chain completes synchronously during `addHtlc()`, so store state BEFORE calling it
-- **Graph population**: tests inject gossip data directly into `NetworkGraph` rather than using signed messages
+- **Graph population**: tests inject gossip data directly into `NetworkGraph` rather than using signed messages; such entries are unverified and never served to gossip queries, so responder-side tests pass `{ verified: true }`
 - **Crypto verification**: signed gossip messages use real cryptographic signatures for validation tests
 - **Conformance vectors**: `tests/lightning/conformance/vectors` holds the official BOLT vectors, expanded into cases at runtime
 - **Docker interop**: LND, CLN and Eclair interop tests auto-skip when the containers are unavailable

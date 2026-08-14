@@ -12,6 +12,11 @@ import {
 	IChannelUpdateMessage,
 	INodeAnnouncementMessage
 } from './types';
+import {
+	encodeChannelAnnouncementMessage,
+	encodeChannelUpdateMessage,
+	encodeNodeAnnouncementMessage
+} from './messages';
 
 /**
  * Compute the double-SHA256 hash used for gossip signatures.
@@ -90,6 +95,61 @@ export function verifyChannelUpdate(
 	const direction = msg.channelFlags & CHANNEL_FLAG_DIRECTION;
 	const signerKey = direction === 0 ? nodeId1 : nodeId2;
 	return verify(hash, signerKey, msg.signature);
+}
+
+/**
+ * Verify a decoded channel_announcement against its canonical re-encoding.
+ * True only when the signatures validate over bytes we can reproduce, so a
+ * passing message can be relayed faithfully. Signed future fields the codec
+ * cannot round-trip make this false. Used to resolve provenance for stored
+ * rows that predate verification flags (#340).
+ */
+export function verifyChannelAnnouncementMessage(
+	msg: IChannelAnnouncementMessage
+): boolean {
+	try {
+		return verifyChannelAnnouncement(
+			msg,
+			encodeChannelAnnouncementMessage(msg)
+		);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Verify a decoded node_announcement against its canonical re-encoding.
+ * See verifyChannelAnnouncementMessage.
+ */
+export function verifyNodeAnnouncementMessage(
+	msg: INodeAnnouncementMessage
+): boolean {
+	try {
+		return verifyNodeAnnouncement(msg, encodeNodeAnnouncementMessage(msg));
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Verify a decoded channel_update against its canonical re-encoding.
+ * See verifyChannelAnnouncementMessage.
+ */
+export function verifyChannelUpdateMessage(
+	msg: IChannelUpdateMessage,
+	nodeId1: Buffer,
+	nodeId2: Buffer
+): boolean {
+	try {
+		return verifyChannelUpdate(
+			msg,
+			encodeChannelUpdateMessage(msg),
+			nodeId1,
+			nodeId2
+		);
+	} catch {
+		return false;
+	}
 }
 
 /**

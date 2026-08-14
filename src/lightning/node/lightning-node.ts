@@ -73,6 +73,9 @@ import {
 	decodeChannelAnnouncementMessage,
 	decodeNodeAnnouncementMessage,
 	decodeChannelUpdateMessage,
+	encodeChannelAnnouncementMessage,
+	encodeNodeAnnouncementMessage,
+	encodeChannelUpdateMessage,
 	nodeAddressToHostPort,
 	announcedDialableAddresses
 } from '../gossip/messages';
@@ -3294,38 +3297,73 @@ export class LightningNode extends EventEmitter {
 					}
 				}
 
-				// Add to our own network graph
+				// Verify the assembled announcement before it can be advertised: the
+				// counterparty's announcement_signatures are never validated on
+				// receipt, so zero or garbage signatures would otherwise be cached,
+				// broadcast and served as gossip (#340). Byte-identical re-encoding
+				// is required so relayed copies keep valid signatures.
+				let announcementValid = false;
 				try {
 					const annMsg = decodeChannelAnnouncementMessage(channelAnnouncement);
-					this.graph.addChannelAnnouncement(annMsg);
+					try {
+						announcementValid =
+							verifyChannelAnnouncement(annMsg, channelAnnouncement) &&
+							encodeChannelAnnouncementMessage(annMsg).equals(
+								channelAnnouncement
+							);
+					} catch {
+						announcementValid = false;
+					}
+					// Add to our own network graph. With invalid counterparty
+					// signatures the entry stays local-only: routable, never served.
+					this.graph.addChannelAnnouncement(annMsg, {
+						verified: announcementValid
+					});
 					const updateMsg = decodeChannelUpdateMessage(signedChannelUpdate);
-					this.graph.applyChannelUpdate(updateMsg);
+					let updateValid = false;
+					try {
+						updateValid =
+							verifyChannelUpdate(
+								updateMsg,
+								signedChannelUpdate,
+								annMsg.nodeId1,
+								annMsg.nodeId2
+							) &&
+							encodeChannelUpdateMessage(updateMsg).equals(signedChannelUpdate);
+					} catch {
+						updateValid = false;
+					}
+					this.graph.applyChannelUpdate(updateMsg, { verified: updateValid });
 				} catch {
 					// Ignore decode errors for self-generated announcements
 				}
 
-				// Build + cache our node_announcement (BOLT 7: required after a channel is
-				// announced). Caching lets us re-broadcast it — a one-shot send rarely
-				// reaches the whole network, so the node never shows up on explorers.
-				const nodeAnnouncementPayload = this.buildNodeAnnouncement(
-					Math.floor(Date.now() / 1000)
-				);
-				if (nodeAnnouncementPayload) {
-					this._ownNodeAnnouncement = nodeAnnouncementPayload;
+				if (announcementValid) {
+					// Build + cache our node_announcement (BOLT 7: required after a
+					// channel is announced). Caching lets us re-broadcast it — a
+					// one-shot send rarely reaches the whole network, so the node
+					// never shows up on explorers.
+					const nodeAnnouncementPayload = this.buildNodeAnnouncement(
+						Math.floor(Date.now() / 1000)
+					);
+					if (nodeAnnouncementPayload) {
+						this._ownNodeAnnouncement = nodeAnnouncementPayload;
+					}
+
+					// Cache this channel's gossip so we can re-broadcast it to new
+					// peers and when serving gossip_timestamp_filter requests.
+					this._ownChannelGossip.set(channelId.toString('hex'), {
+						announcement: channelAnnouncement,
+						update: signedChannelUpdate
+					});
+
+					// Broadcast to all currently-connected peers now…
+					this.broadcastOwnGossip();
+					// …and keep it propagating: re-broadcast (with a refreshed
+					// node_announcement timestamp) periodically. Idempotent — starts
+					// once.
+					this.startGossipRefresh();
 				}
-
-				// Cache this channel's gossip so we can re-broadcast it to new peers and
-				// when serving gossip_timestamp_filter requests.
-				this._ownChannelGossip.set(channelId.toString('hex'), {
-					announcement: channelAnnouncement,
-					update: signedChannelUpdate
-				});
-
-				// Broadcast to all currently-connected peers now…
-				this.broadcastOwnGossip();
-				// …and keep it propagating: re-broadcast (with a refreshed
-				// node_announcement timestamp) periodically. Idempotent — starts once.
-				this.startGossipRefresh();
 
 				this.emit('announcement:ready', channelId);
 			}
@@ -7824,7 +7862,9 @@ export class LightningNode extends EventEmitter {
 				update: refreshed
 			});
 			try {
-				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed));
+				this.graph.applyChannelUpdate(decodeChannelUpdateMessage(refreshed), {
+					verified: true
+				});
 			} catch {
 				// Own-update decode failure only affects our local graph view.
 			}
@@ -7876,7 +7916,6 @@ export class LightningNode extends EventEmitter {
 		const policy = this.getChannelPolicy(channelId);
 		if (!policy) return null;
 		try {
-			const { encodeChannelUpdateMessage } = require('../gossip/messages');
 			const ourNodeId = getPublicKey(this.nodePrivkey);
 			const peerNodeId = Buffer.from(peerHex, 'hex');
 			// BOLT 7: htlc_maximum_msat MUST NOT exceed the channel capacity.
@@ -9026,7 +9065,6 @@ export class LightningNode extends EventEmitter {
 	 */
 	private buildNodeAnnouncement(timestamp: number): Buffer | null {
 		try {
-			const { encodeNodeAnnouncementMessage } = require('../gossip/messages');
 			const nodeId = getPublicKey(this.nodePrivkey);
 			const aliasBuffer = Buffer.alloc(32);
 			if (this.alias) {
@@ -9075,7 +9113,6 @@ export class LightningNode extends EventEmitter {
 		channelId?: Buffer
 	): Buffer | null {
 		try {
-			const { encodeChannelUpdateMessage } = require('../gossip/messages');
 			const msg = decodeChannelUpdateMessage(cachedUpdate);
 			msg.timestamp = timestamp;
 			// Reflect the current forwarding policy in the BOLT 7 disable bit
@@ -9604,7 +9641,12 @@ export class LightningNode extends EventEmitter {
 		if (!verifyChannelAnnouncement(msg, payload)) {
 			return;
 		}
-		if (this.graph.addChannelAnnouncement(msg)) {
+		// The signature covers the full payload, signed future fields included.
+		// If the codec cannot reproduce it byte for byte, a served re-encoding
+		// would carry invalid signatures, so keep the entry routable but never
+		// serve it (#340).
+		const servable = encodeChannelAnnouncementMessage(msg).equals(payload);
+		if (this.graph.addChannelAnnouncement(msg, { verified: servable })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(
@@ -9635,7 +9677,9 @@ export class LightningNode extends EventEmitter {
 		// private channels never enters the graph, yet its channels still need
 		// a reconnect path or they sit in AWAITING_REESTABLISH forever.
 		this.captureChannelPeerAddresses(msg);
-		if (this.graph.applyNodeAnnouncement(msg)) {
+		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+		const servable = encodeNodeAnnouncementMessage(msg).equals(payload);
+		if (this.graph.applyNodeAnnouncement(msg, { verified: servable })) {
 			const node = this.graph.getNode(msg.nodeId);
 			if (node)
 				this.safeStorage(
@@ -9715,7 +9759,9 @@ export class LightningNode extends EventEmitter {
 		if (!verifyChannelUpdate(msg, payload, channel.nodeId1, channel.nodeId2)) {
 			return;
 		}
-		if (this.graph.applyChannelUpdate(msg)) {
+		// Serve only what re-encodes byte-identically (see handleChannelAnnouncement).
+		const servable = encodeChannelUpdateMessage(msg).equals(payload);
+		if (this.graph.applyChannelUpdate(msg, { verified: servable })) {
 			const ch = this.graph.getChannel(msg.shortChannelId);
 			if (ch)
 				this.safeStorage(

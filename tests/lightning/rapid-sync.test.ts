@@ -167,6 +167,55 @@ describe('Rapid Gossip Sync (v1 snapshot parsing)', () => {
 		expect(graph.getChannelCount()).to.equal(1);
 	});
 
+	it('keeps snapshot entries unverified so gossip queries never serve them (issue #340)', () => {
+		// RGS strips signatures, so serving these would get us disconnected by
+		// strict peers (BOLT 7: MUST NOT relay unvalidated announcements).
+		const graph = new NetworkGraph();
+		applyRapidGossipSnapshot(
+			graph,
+			baseSnapshot([
+				{ scid, flags: 0x00 },
+				{ scid, flags: 0x01 }
+			])
+		);
+		const scidBuf = encodeShortChannelId(
+			decodeShortChannelId(Buffer.from(u64(scid)))
+		);
+		expect(graph.getChannel(scidBuf)!.announcementVerified).to.not.be.true;
+		expect(graph.getChannelsByBlockRange(800000, 1).length).to.equal(0);
+		const served = graph.getGossipMessagesForChannels([scidBuf]);
+		expect(served.announcements.length).to.equal(0);
+		expect(served.updates.length).to.equal(0);
+	});
+
+	it('lets a real verified update replace an RGS slot despite the snapshot timestamp (issue #340)', () => {
+		// RGS stamps every synthetic update with the snapshot's global
+		// latest-seen timestamp; the live signed update carries its true,
+		// older timestamp and must still take the slot.
+		const graph = new NetworkGraph();
+		applyRapidGossipSnapshot(graph, baseSnapshot([{ scid, flags: 0x00 }]));
+		const scidBuf = encodeShortChannelId(
+			decodeShortChannelId(Buffer.from(u64(scid)))
+		);
+		const realUpdate = {
+			signature: Buffer.alloc(64, 1),
+			chainHash: BITCOIN_CHAIN_HASH,
+			shortChannelId: scidBuf,
+			timestamp: 1_700_000_000 - 3600,
+			messageFlags: 0x01,
+			channelFlags: 0,
+			cltvExpiryDelta: 144,
+			htlcMinimumMsat: 1n,
+			feeBaseMsat: 0,
+			feeProportionalMillionths: 0,
+			htlcMaximumMsat: 1_000n
+		};
+		expect(graph.applyChannelUpdate(realUpdate, { verified: true })).to.be.true;
+		const ch = graph.getChannel(scidBuf)!;
+		expect(ch.update1Verified).to.be.true;
+		expect(ch.update1!.timestamp).to.equal(1_700_000_000 - 3600);
+	});
+
 	it('applies all explicitly-present update fields', () => {
 		const graph = new NetworkGraph();
 		// flags: dir0 + all five field bits (0x40|0x20|0x10|0x08|0x04) = 0x7C
