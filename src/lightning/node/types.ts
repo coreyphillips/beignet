@@ -693,6 +693,43 @@ export interface IChannelInfo {
 	cltvExpiryDelta?: number;
 	htlcMinimumMsat?: bigint;
 	htlcMaximumMsat?: bigint;
+	/**
+	 * Close progress, present for channels that are closing or closed
+	 * (SHUTTING_DOWN, NEGOTIATING_CLOSING, CLOSED, FORCE_CLOSED, and ERRORED
+	 * with an on-chain funding output).
+	 */
+	closeStatus?: ICloseStatus;
+}
+
+/**
+ * How a channel's close is progressing, derived from persisted channel state
+ * and the chain monitor's classified commitment spend.
+ */
+export interface ICloseStatus {
+	/** Who published (or is negotiating) the close. */
+	closer: 'local' | 'remote' | 'cooperative' | 'unknown';
+	/**
+	 * Why WE closed: 'user' for an API-initiated close, otherwise the
+	 * automatic close code (e.g. REESTABLISH_TIMEOUT_FORCE_CLOSED). Absent
+	 * for a close the peer initiated.
+	 */
+	reason?: string;
+	/** Txid (display byte order) of the commitment or mutual close, when known. */
+	closingTxid?: string;
+	/**
+	 * Whether the daemon believes the close tx reached the network: the last
+	 * broadcast attempt succeeded or the spend was observed on chain.
+	 */
+	broadcast: boolean;
+	/** Block height the close confirmed at; 0 while unconfirmed. */
+	confirmationHeight: number;
+	/** Sweep progress across the close's tracked outputs. */
+	resolution: 'pending' | 'sweeping' | 'resolved';
+	/**
+	 * Height at which the to_local CSV matures and our main balance becomes
+	 * spendable. Only present for our own force close once computable.
+	 */
+	fundsAvailableHeight?: number;
 }
 
 // ─── Channel Routing Policy ───
@@ -725,7 +762,13 @@ export interface IChannelPolicy {
 export interface INodeInfo {
 	nodeId: string;
 	network: Network;
+	/**
+	 * Every known channel row, including CLOSED/FORCE_CLOSED ones (kept for
+	 * history). Use openChannelCount for the number of operating channels.
+	 */
 	channelCount: number;
+	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
+	openChannelCount: number;
 	peerCount: number;
 	networkingEnabled: boolean;
 	alias?: string;

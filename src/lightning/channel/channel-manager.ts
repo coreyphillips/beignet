@@ -51,8 +51,10 @@ import {
 import {
 	ChannelAction,
 	ChannelActionType,
+	IBroadcastTxAction,
 	IChannelPersistEvent,
 	IChannelPersistRequest,
+	IErrorAction,
 	ISendMessageAction,
 	IWireDurabilityBarrier,
 	QUORUM_BARRIER_MESSAGE_TYPES,
@@ -7146,6 +7148,68 @@ export class ChannelManager extends EventEmitter {
 			actions,
 			feeRatePerVbyte
 		);
+	}
+
+	/**
+	 * Rebuild the latest commitment of a FORCE_CLOSED channel for a manual
+	 * rebroadcast (the on-demand counterpart of rearmCommitmentCpfp, same
+	 * guards). The rebuild is byte-identical (deterministic signatures) and
+	 * derives only from current persisted state, so no older/revoked
+	 * commitment can ever be produced. Deliberately does NOT touch
+	 * this.monitors (forceClose() would replace the live monitor and discard
+	 * its tracked outputs) and does NOT emit broadcast:tx: the caller
+	 * broadcasts exactly once, awaitably, so a duplicate does not land in the
+	 * watcher's failed-broadcast retry queue as a false BROADCAST_FAILED.
+	 */
+	rebuildForceCloseCommitment(
+		channelId: Buffer,
+		feeRatePerVbyte: number
+	): { ok: boolean; tx?: Buffer; error?: string } {
+		const idHex = channelId.toString('hex');
+		const channel = this.channels.get(idHex);
+		const monitor = this.monitors.get(idHex);
+		if (!channel || !monitor) {
+			return { ok: false, error: `Channel not found: ${idHex}` };
+		}
+		if (channel.getState() !== ChannelState.FORCE_CLOSED) {
+			return { ok: false, error: 'Channel is not force-closed' };
+		}
+		// Same reasoning as rearmCommitmentCpfp: once the monitor classified a
+		// spend that is NOT our commitment (the peer's close, possibly a
+		// revoked breach), rebroadcasting ours would compete with it.
+		const broadcast = monitor.getFullState().commitmentBroadcast;
+		if (
+			broadcast &&
+			broadcast.commitmentType !== CommitmentType.OUR_COMMITMENT
+		) {
+			return { ok: false, error: 'Close was not our commitment' };
+		}
+		if (monitor.isFullyResolved() || monitor.isCommitmentConfirmed()) {
+			return { ok: false, error: 'Close already confirmed' };
+		}
+		const signer = this.signerFor(channel, true);
+		const actions = channel.forceClose(signer);
+		const errAction = actions.find(
+			(a): a is IErrorAction => a.type === ChannelActionType.ERROR
+		);
+		if (errAction) {
+			return { ok: false, error: errAction.message };
+		}
+		const txAction = actions.find(
+			(a): a is IBroadcastTxAction => a.type === ChannelActionType.BROADCAST_TX
+		);
+		if (!txAction) {
+			return { ok: false, error: 'Force close rebuilt no transaction' };
+		}
+		if (!this._pendingCommitmentCpfp.has(idHex)) {
+			this._maybeCpfpAnchorCommitment(
+				channelId,
+				channel.getFullState(),
+				actions,
+				feeRatePerVbyte
+			);
+		}
+		return { ok: true, tx: txAction.tx };
 	}
 
 	/** Resolve the funding private key for a channel (per-channel keys or node key). */

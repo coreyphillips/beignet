@@ -35,7 +35,13 @@ export interface NodeInfo {
 	 * lightningBalanceSats at splice_locked.
 	 */
 	splicingBalanceSats: number;
+	/**
+	 * Every known channel row, including CLOSED/FORCE_CLOSED ones (kept for
+	 * history). Use openChannelCount for the number of operating channels.
+	 */
 	channelCount: number;
+	/** Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED). */
+	openChannelCount: number;
 	peerCount: number;
 	listening: boolean;
 	/** WebSocket listener port when accepting inbound WS peers (opt-in). */
@@ -61,7 +67,40 @@ export type ChannelStateString =
 	| 'FORCE_CLOSED'
 	| 'AWAITING_REESTABLISH'
 	| 'CLOSED'
+	| 'ERRORED'
 	| 'ANNOUNCEMENT_READY';
+
+/**
+ * How a channel's close is progressing. Present on closing/closed channels
+ * (SHUTTING_DOWN, NEGOTIATING_CLOSING, CLOSED, FORCE_CLOSED, and ERRORED
+ * with an on-chain funding output).
+ */
+export interface CloseStatus {
+	/** Who published (or is negotiating) the close. */
+	closer: 'local' | 'remote' | 'cooperative' | 'unknown';
+	/**
+	 * Why WE closed: 'user' for an API-initiated close, otherwise the
+	 * automatic close code (e.g. REESTABLISH_TIMEOUT_FORCE_CLOSED). Absent
+	 * for a close the peer initiated.
+	 */
+	reason?: string;
+	/** Txid of the commitment or mutual close transaction, when known. */
+	closingTxid?: string;
+	/**
+	 * Whether the daemon believes the close tx reached the network: the last
+	 * broadcast attempt succeeded or the spend was observed on chain.
+	 */
+	broadcast: boolean;
+	/** Block height the close confirmed at; 0 while unconfirmed. */
+	confirmationHeight: number;
+	/** Sweep progress across the close's tracked outputs. */
+	resolution: 'pending' | 'sweeping' | 'resolved';
+	/**
+	 * Height at which the to_local CSV matures and our main balance becomes
+	 * spendable. Only present for our own force close once computable.
+	 */
+	fundsAvailableHeight?: number;
+}
 
 export interface ChannelInfo {
 	channelId: string;
@@ -102,6 +141,8 @@ export interface ChannelInfo {
 	/** Msat values as decimal strings (bigint in the library) */
 	htlcMinimumMsat?: string;
 	htlcMaximumMsat?: string;
+	/** Close progress; present for closing/closed channels. */
+	closeStatus?: CloseStatus;
 }
 
 export interface ChannelPolicyInfo {
@@ -851,6 +892,8 @@ export interface BeignetNodeEvents {
 		initiator: 'local' | 'remote';
 	}) => void;
 	'channel:closed': (data: { channelId: string }) => void;
+	/** The true terminal event of a close: every on-chain output of the channel is irrevocably swept or claimed and the channel state becomes CLOSED. */
+	'channel:resolved': (data: { channelId: string }) => void;
 	/** The channel was removed with nothing to close on chain, and its persisted state was durably deleted: its unconfirmed funding tx vanished from mempool and chain, or the open was aborted or abandoned before any funding existed. */
 	'channel:voided': (data: { channelId: string }) => void;
 	'htlc:forwarded': (data: {

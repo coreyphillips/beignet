@@ -355,7 +355,7 @@ node.listInvoices();
 await node.destroy();
 ```
 
-Events: `node:ready`, `channel:ready`, `channel:closed`, `peer:connect`, `peer:disconnect`, `peer:error`, `payment:sent`, `payment:received`, `node:error`, `log`.
+Events: `node:ready`, `channel:ready`, `channel:closed`, `channel:resolved`, `peer:connect`, `peer:disconnect`, `peer:error`, `payment:sent`, `payment:received`, `node:error`, `log`.
 
 Useful variants: `payInvoiceSafe` (never throws), `payInvoiceWithRetry({ maxRetries, backoffMs, maxFeeSats })`, `sendPaymentAsync` (returns the hash immediately), `connectAndOpenChannel`, `openChannelAndWait`, `sendKeysend`, `createOffer`/`payOffer`, `spliceIn`/`spliceOut`, `backup`, `gracefulShutdown`.
 

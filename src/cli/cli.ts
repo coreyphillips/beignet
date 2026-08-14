@@ -732,6 +732,12 @@ async function handleChannel(): Promise<void> {
 					channelId: filteredArgs[2]
 				})
 			);
+		case 'rebroadcast-close':
+			return outputResult(
+				await httpRequest('POST', '/channel/rebroadcast-close', {
+					channelId: filteredArgs[2]
+				})
+			);
 		case 'list':
 			return outputResult(await httpRequest('GET', '/channels'));
 		case 'get':
@@ -928,7 +934,7 @@ async function handleChannel(): Promise<void> {
 				error: {
 					code: 'UNKNOWN_COMMAND',
 					message:
-						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
+						'Usage: beignet channel [open|open-zeroconf|open-v2|open-and-wait|connect-and-open|close|forceclose|rebroadcast-close|funding-quote|splice-quote|splice-in|splice-out|ensure-minimum|update-policy|update-commitment-feerate|policy|diagnostics|health|suggestions|wait-ready|ready|list|get]'
 				}
 			});
 			process.exitCode = 1;
@@ -2302,6 +2308,7 @@ Channels:
                                          confirmation (trusted peers only)
   channel close <id>                     Cooperative close
   channel forceclose <id>                Force close
+  channel rebroadcast-close <id>         Rebroadcast recorded close tx
   channel funding-quote <pubkey> [satsPerVbyte]
                                          Peer-aware max open preview: v1 or
                                          v2 decided like openChannel would

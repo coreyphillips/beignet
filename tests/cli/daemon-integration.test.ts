@@ -252,6 +252,68 @@ describe('HTTP Route Fixes', () => {
 		}
 	}).timeout(30000);
 
+	it('POST /channel/rebroadcast-close validates its channelId', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const missing = await httpPost(
+				addr.port,
+				'/channel/rebroadcast-close',
+				{}
+			);
+			expect(missing.body.ok).to.be.false;
+			expect((missing.body.error as { code: string }).code).to.equal(
+				'INVALID_PARAMS'
+			);
+
+			const unknown = await httpPost(addr.port, '/channel/rebroadcast-close', {
+				channelId: 'aa'.repeat(32)
+			});
+			expect(unknown.body.ok).to.be.false;
+			expect((unknown.body.error as { code: string }).code).to.equal(
+				'REBROADCAST_FAILED'
+			);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
+	it('GET /info reports openChannelCount alongside channelCount', async () => {
+		const { server, node } = await startDaemon({
+			mnemonic: testMnemonic,
+			network: 'regtest',
+			dataDir: tmpDir,
+			daemonPort: 0,
+			electrumHost: '127.0.0.1',
+			electrumPort: 60001,
+			electrumTls: false
+		});
+		const addr = server.address() as { port: number };
+		try {
+			const resp = await httpGet(addr.port, '/info');
+			expect(resp.body.ok).to.be.true;
+			const info = resp.body.result as {
+				channelCount: number;
+				openChannelCount: number;
+			};
+			expect(info.channelCount).to.be.a('number');
+			expect(info.openChannelCount).to.be.a('number');
+			expect(info.openChannelCount).to.equal(0);
+		} finally {
+			await node.destroy();
+			server.close();
+		}
+	}).timeout(30000);
+
 	it('GET /payment without paymentHash returns INVALID_PARAMS', async () => {
 		const { server, node } = await startDaemon({
 			mnemonic: testMnemonic,

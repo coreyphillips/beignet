@@ -552,6 +552,33 @@ export function getOpenApiSpec(): Record<string, unknown> {
 					}
 				}
 			},
+			'/channel/rebroadcast-close': {
+				post: {
+					summary:
+						'Rebroadcast the recorded close transaction of a force-closed channel (or an unconfirmed mutual close). Idempotent; always rebuilds from the latest state, so no older commitment can be selected.',
+					tags: ['Channels'],
+					requestBody: bodyContent({ channelId: 'string' }),
+					responses: {
+						'200': {
+							description: 'Rebroadcast result',
+							content: jsonContent({
+								type: 'object',
+								properties: {
+									txid: {
+										type: 'string',
+										description: 'Txid of the rebroadcast close transaction'
+									},
+									broadcastOk: {
+										type: 'boolean',
+										description:
+											'Whether the broadcast reached the network (a duplicate rejection counts as success)'
+									}
+								}
+							})
+						}
+					}
+				}
+			},
 			'/channel/update-commitment-feerate': {
 				post: {
 					summary:
@@ -1889,7 +1916,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 			'/events': {
 				get: {
 					summary:
-						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
+						'Server-Sent Events stream (payment:received, payment:sent, payment:failed, invoice:settled, transaction:received, transaction:sent, transaction:confirmed, channel:opening, channel:ready, channel:pending-close, channel:force-closing, channel:closed, channel:resolved, peer:connect, peer:disconnect, node:ready; plus htlc:forwarded, htlc:fulfilled, htlc:failed when the daemon is started with htlcEvents)',
 					tags: ['Node'],
 					responses: {
 						'200': {
@@ -2652,7 +2679,16 @@ export function getOpenApiSpec(): Record<string, unknown> {
 							description:
 								'Splice-in-transit funds: for channels paying through their splice, only what is still arriving; for parked mid-splice channels, the whole settle-to balance. Rejoins lightningBalanceSats at splice_locked'
 						},
-						channelCount: { type: 'integer' },
+						channelCount: {
+							type: 'integer',
+							description:
+								'Every known channel row, including CLOSED/FORCE_CLOSED ones kept for history. Use openChannelCount for operating channels'
+						},
+						openChannelCount: {
+							type: 'integer',
+							description:
+								'Channels not in a terminal state (CLOSED, FORCE_CLOSED, ERRORED)'
+						},
 						peerCount: { type: 'integer' },
 						listening: { type: 'boolean' }
 					}
@@ -2814,6 +2850,7 @@ export function getOpenApiSpec(): Record<string, unknown> {
 								'FORCE_CLOSED',
 								'AWAITING_REESTABLISH',
 								'CLOSED',
+								'ERRORED',
 								'ANNOUNCEMENT_READY'
 							]
 						},
@@ -2856,6 +2893,49 @@ export function getOpenApiSpec(): Record<string, unknown> {
 						htlcMaximumMsat: {
 							type: 'string',
 							description: 'Msat as decimal string'
+						},
+						closeStatus: { $ref: '#/components/schemas/CloseStatus' }
+					}
+				},
+				CloseStatus: {
+					type: 'object',
+					description:
+						'Close progress; present for closing/closed channels (SHUTTING_DOWN, NEGOTIATING_CLOSING, CLOSED, FORCE_CLOSED, and ERRORED with an on-chain funding output)',
+					properties: {
+						closer: {
+							type: 'string',
+							enum: ['local', 'remote', 'cooperative', 'unknown'],
+							description: 'Who published (or is negotiating) the close'
+						},
+						reason: {
+							type: 'string',
+							description:
+								'Why we closed: user for an API-initiated close, otherwise the automatic close code (e.g. REESTABLISH_TIMEOUT_FORCE_CLOSED). Absent for a close the peer initiated'
+						},
+						closingTxid: {
+							type: 'string',
+							description:
+								'Txid of the commitment or mutual close transaction, when known'
+						},
+						broadcast: {
+							type: 'boolean',
+							description:
+								'Whether the daemon believes the close tx reached the network: the last broadcast attempt succeeded or the spend was observed on chain'
+						},
+						confirmationHeight: {
+							type: 'integer',
+							description:
+								'Block height the close confirmed at; 0 while unconfirmed'
+						},
+						resolution: {
+							type: 'string',
+							enum: ['pending', 'sweeping', 'resolved'],
+							description: "Sweep progress across the close's tracked outputs"
+						},
+						fundsAvailableHeight: {
+							type: 'integer',
+							description:
+								'Height at which the to_local CSV matures and our main balance becomes spendable; only present for our own force close once computable'
 						}
 					}
 				},

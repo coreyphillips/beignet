@@ -17,7 +17,8 @@ const NEW_EVENTS = [
 	'invoice:settled',
 	'channel:opening',
 	'channel:pending-close',
-	'channel:force-closing'
+	'channel:force-closing',
+	'channel:resolved'
 ];
 const HTLC_EVENTS = ['htlc:forwarded', 'htlc:fulfilled', 'htlc:failed'];
 const BASE_EVENTS = [
