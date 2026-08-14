@@ -73,7 +73,9 @@ import {
 } from '../../src/lightning/message/error';
 import {
 	encodeTxAbortMessage,
-	encodeTxAddOutputMessage
+	encodeTxAddInputMessage,
+	encodeTxAddOutputMessage,
+	encodeTxRemoveInputMessage
 } from '../../src/lightning/message/interactive-tx';
 import { IChannelBasepoints } from '../../src/lightning/keys/derivation';
 import { LightningNode } from '../../src/lightning/node/lightning-node';
@@ -4497,6 +4499,564 @@ describe('Round 17: v2 channel_type admission', () => {
 			);
 			expect(result.ok).to.equal(false);
 			expect(result.error).to.match(/did not propose/);
+		});
+	});
+});
+
+describe('Issue #311: fabricated prevTx defenses', () => {
+	type Verdict = 'unspent' | 'spent-or-missing' | 'unknown';
+	type VerifyFn = (input: {
+		txid: Buffer;
+		vout: number;
+		scriptPubKey: Buffer;
+	}) => Promise<Verdict>;
+
+	const settle = async (): Promise<void> => {
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		await new Promise<void>((resolve) => setImmediate(resolve));
+	};
+
+	/** A wallet input whose witness closure is never exercised here. */
+	function makeContributionInput(valueSats: number): ISpliceWalletInput {
+		const prevTx = new bitcoin.Transaction();
+		prevTx.version = 2;
+		prevTx.addInput(crypto.randomBytes(32), 0);
+		prevTx.addOutput(
+			bitcoin.payments.p2wpkh({ hash: crypto.randomBytes(20) }).output!,
+			valueSats
+		);
+		return {
+			prevTx: prevTx.toBuffer(),
+			prevOutputIndex: 0,
+			value: BigInt(valueSats),
+			sequence: 0xfffffffd,
+			signWitness: (): Buffer[] => []
+		};
+	}
+
+	const outpointOf = (
+		input: ISpliceWalletInput
+	): { txid: string; vout: number } => ({
+		txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+		vout: input.prevOutputIndex
+	});
+
+	/** Minimal provider carrying only the release spy (no auto-funding). */
+	function providerWithReleaseSpy(): {
+		provider: IFundingProvider;
+		released: Array<Array<{ txid: string; vout: number }>>;
+	} {
+		const released: Array<Array<{ txid: string; vout: number }>> = [];
+		const provider: IFundingProvider = {
+			buildFundingTransaction: () => Promise.reject(new Error('not needed')),
+			broadcastTransaction: () => Promise.reject(new Error('not needed')),
+			releaseInputPledges: async (outpoints) => {
+				released.push(outpoints);
+			}
+		};
+		return { provider, released };
+	}
+
+	/**
+	 * An opener whose accept_channel2 arrived: the session sits in
+	 * TX_NEGOTIATION awaiting interactive-tx messages. No funding provider
+	 * method is offered for selection, so the embedder-driven legacy path
+	 * keeps the negotiation idle until the test feeds messages.
+	 */
+	function setupNegotiation(opts?: {
+		verify?: VerifyFn;
+		provider?: IFundingProvider;
+	}): {
+		mgr: ChannelManager;
+		channel: Channel;
+		tempId: Buffer;
+		owner: string;
+		sent: number[];
+		errors: string[];
+	} {
+		const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+		const mgr = new ChannelManager({
+			...makeChannelManagerConfig(),
+			...(opts?.verify ? { verifyRemoteFundingInput: opts.verify } : {})
+		});
+		if (opts?.provider) mgr.setFundingProvider(opts.provider);
+		const sent: number[] = [];
+		const errors: string[] = [];
+		mgr.on('error', (_id: Buffer | null, message: string) => {
+			errors.push(message);
+		});
+		mgr.on('message:outbound', (_peer: string, type: number) => {
+			sent.push(type);
+		});
+		const channel = mgr.createDualFundedChannel(owner, makeDualFundingParams());
+		const tempId = channel.getTemporaryChannelId();
+		mgr.handleMessage(
+			owner,
+			MessageType.ACCEPT_CHANNEL2,
+			encodeAcceptChannel2Message(makeAcceptChannel2Msg({ channelId: tempId }))
+		);
+		expect(channel.getDualFundingSession()?.getState()).to.equal(
+			DualFundingState.TX_NEGOTIATION
+		);
+		sent.length = 0;
+		return { mgr, channel, tempId, owner, sent, errors };
+	}
+
+	function peerAddInput(
+		h: { mgr: ChannelManager; tempId: Buffer; owner: string },
+		prevTx: Buffer,
+		serialId = 1n
+	): void {
+		h.mgr.handleMessage(
+			h.owner,
+			MessageType.TX_ADD_INPUT,
+			encodeTxAddInputMessage({
+				channelId: h.tempId,
+				serialId,
+				prevTx,
+				prevTxVout: 0,
+				sequence: 0xfffffffd
+			})
+		);
+	}
+
+	describe('chain verification of peer inputs (ChannelManager)', () => {
+		it('aborts the negotiation when the chain refutes a peer prevout', async () => {
+			const h = setupNegotiation({
+				verify: async () => 'spent-or-missing'
+			});
+			peerAddInput(h, makePeerPrevTx());
+			await settle();
+
+			expect(
+				h.sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(1);
+			expect(h.channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(h.channel.getDualFundingSession()?.getState()).to.equal(
+				DualFundingState.ABORTED
+			);
+			expect(h.errors.join(' ')).to.contain('issue #311');
+		});
+
+		it('hands the callback the prevout the peer claimed', async () => {
+			const seen: Array<{ txid: Buffer; vout: number; scriptPubKey: Buffer }> =
+				[];
+			const h = setupNegotiation({
+				verify: async (input) => {
+					seen.push(input);
+					return 'unspent';
+				}
+			});
+			const prevTx = makePeerPrevTx();
+			peerAddInput(h, prevTx);
+			await settle();
+
+			expect(seen).to.have.length(1);
+			const parsed = bitcoin.Transaction.fromBuffer(prevTx);
+			expect(seen[0].txid.equals(parsed.getHash())).to.equal(true);
+			expect(seen[0].vout).to.equal(0);
+			expect(seen[0].scriptPubKey.equals(parsed.outs[0].script)).to.equal(true);
+		});
+
+		it('proceeds on unspent, unknown and a rejecting callback', async () => {
+			const verdicts: Array<Verdict | Error> = [
+				'unspent',
+				'unknown',
+				new Error('backend exploded')
+			];
+			for (const verdict of verdicts) {
+				const h = setupNegotiation({
+					verify: () =>
+						verdict instanceof Error
+							? Promise.reject(verdict)
+							: Promise.resolve(verdict)
+				});
+				peerAddInput(h, makePeerPrevTx());
+				await settle();
+
+				expect(
+					h.sent.filter((type) => type === MessageType.TX_ABORT),
+					`no abort for ${String(verdict)}`
+				).to.have.length(0);
+				expect(h.channel.getDualFundingSession()?.getState()).to.equal(
+					DualFundingState.TX_NEGOTIATION
+				);
+			}
+		});
+
+		it('never fires without a callback or outside TX_NEGOTIATION, and skips the splice shared input', async () => {
+			let calls = 0;
+			const counting: VerifyFn = async () => {
+				calls++;
+				return 'unspent';
+			};
+
+			// Outside TX_NEGOTIATION: the open still awaits accept_channel2.
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const mgr = new ChannelManager({
+				...makeChannelManagerConfig(),
+				verifyRemoteFundingInput: counting
+			});
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			mgr.handleMessage(
+				owner,
+				MessageType.TX_ADD_INPUT,
+				encodeTxAddInputMessage({
+					channelId: channel.getTemporaryChannelId(),
+					serialId: 1n,
+					prevTx: makePeerPrevTx(),
+					prevTxVout: 0,
+					sequence: 0xfffffffd
+				})
+			);
+			await settle();
+			expect(calls, 'no verification before the negotiation').to.equal(0);
+
+			// A shared-input tx_add_input (splice TLV) is exempt.
+			const h = setupNegotiation({ verify: counting });
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ADD_INPUT,
+				encodeTxAddInputMessage({
+					channelId: h.tempId,
+					serialId: 1n,
+					prevTx: Buffer.alloc(0),
+					prevTxVout: 0,
+					sequence: 0xfffffffd,
+					sharedInputTxid: crypto.randomBytes(32)
+				})
+			);
+			await settle();
+			expect(calls, 'shared input skipped').to.equal(0);
+		});
+
+		it('queries a repeated outpoint once', async () => {
+			let calls = 0;
+			const h = setupNegotiation({
+				verify: async () => {
+					calls++;
+					return 'unspent';
+				}
+			});
+			const prevTx = makePeerPrevTx();
+			peerAddInput(h, prevTx, 1n);
+			peerAddInput(h, prevTx, 3n);
+			await settle();
+
+			expect(calls).to.equal(1);
+		});
+
+		it('a verdict landing after the peer aborted touches nothing', async () => {
+			let resolveVerdict!: (verdict: Verdict) => void;
+			const h = setupNegotiation({
+				verify: () =>
+					new Promise<Verdict>((resolve) => {
+						resolveVerdict = resolve;
+					})
+			});
+			peerAddInput(h, makePeerPrevTx());
+
+			// The peer aborts while the chain query is in flight.
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: h.tempId,
+					data: Buffer.from('changed my mind', 'ascii')
+				})
+			);
+			const sentBefore = [...h.sent];
+
+			resolveVerdict('spent-or-missing');
+			await settle();
+
+			expect(h.sent, 'late verdict sent nothing').to.deep.equal(sentBefore);
+		});
+
+		it('a verdict landing after tx_remove_input does not abort', async () => {
+			let resolveVerdict!: (verdict: Verdict) => void;
+			const h = setupNegotiation({
+				verify: () =>
+					new Promise<Verdict>((resolve) => {
+						resolveVerdict = resolve;
+					})
+			});
+			peerAddInput(h, makePeerPrevTx());
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_REMOVE_INPUT,
+				encodeTxRemoveInputMessage({ channelId: h.tempId, serialId: 1n })
+			);
+
+			resolveVerdict('spent-or-missing');
+			await settle();
+
+			expect(
+				h.sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(0);
+			expect(h.channel.getDualFundingSession()?.getState()).to.equal(
+				DualFundingState.TX_NEGOTIATION
+			);
+		});
+
+		it('a verdict landing after signature release reports but never aborts', async () => {
+			let resolveVerdict!: (verdict: Verdict) => void;
+			const h = setupNegotiation({
+				verify: () =>
+					new Promise<Verdict>((resolve) => {
+						resolveVerdict = resolve;
+					})
+			});
+			peerAddInput(h, makePeerPrevTx());
+
+			// White-box: the negotiation raced ahead and our witnesses left.
+			(
+				h.channel.getFullState() as unknown as { v2InFlight: unknown }
+			).v2InFlight = {
+				sentTxSignatures: true,
+				ourWalletInputIndices: [0],
+				ourWitnesses: []
+			};
+
+			resolveVerdict('spent-or-missing');
+			await settle();
+
+			expect(
+				h.sent.filter((type) => type === MessageType.TX_ABORT)
+			).to.have.length(0);
+			expect(h.mgr.getTempChannel(h.tempId), 'channel retained').to.equal(
+				h.channel
+			);
+			expect(h.errors.join(' ')).to.contain('after signature release');
+		});
+	});
+
+	describe('pledge release on terminal death (ChannelManager)', () => {
+		it('reports no releasable outpoints for a live negotiation', () => {
+			const { provider } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			h.channel.setDualFundingContribution(
+				[makeContributionInput(100_000)],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+			expect(h.channel.getReleasableV2PledgeOutpoints()).to.deep.equal([]);
+		});
+
+		it('never reports outpoints once the attempt is broadcastable', () => {
+			const { provider } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			h.channel.setDualFundingContribution(
+				[makeContributionInput(100_000)],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+			const st = h.channel.getFullState() as unknown as {
+				state: ChannelState;
+				v2InFlight: unknown;
+				pendingFundingTxHex?: string;
+			};
+			st.state = ChannelState.ERRORED;
+
+			// Our witnesses left.
+			st.v2InFlight = {
+				sentTxSignatures: true,
+				ourWalletInputIndices: [0],
+				ourWitnesses: []
+			};
+			expect(h.channel.getReleasableV2PledgeOutpoints()).to.deep.equal([]);
+
+			// Zero-local-input acceptor: the peer can complete the tx alone.
+			st.v2InFlight = {
+				sentTxSignatures: false,
+				fullySigned: false,
+				ourWalletInputIndices: [],
+				ourWitnesses: []
+			};
+			expect(h.channel.getReleasableV2PledgeOutpoints()).to.deep.equal([]);
+
+			// A fully signed tx staged for (re)broadcast.
+			st.v2InFlight = null as unknown as object;
+			st.pendingFundingTxHex = '02000000';
+			expect(h.channel.getReleasableV2PledgeOutpoints()).to.deep.equal([]);
+		});
+
+		it('releases the contribution when the peer aborts the open', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.TX_ABORT,
+				encodeTxAbortMessage({
+					channelId: h.tempId,
+					data: Buffer.from('cancel', 'ascii')
+				})
+			);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases the contribution when the peer disconnects mid-negotiation', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handlePeerDisconnected(h.owner);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases an already-errored open when its peer disconnects', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+			// A local abort whose echo never arrives: ERRORED, still tracked.
+			h.channel.abortDualFunding('operator cancelled');
+			expect(h.channel.getState()).to.equal(ChannelState.ERRORED);
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(h.channel);
+			expect(
+				released,
+				'no release while the abort awaits its echo'
+			).to.have.length(0);
+
+			h.mgr.handlePeerDisconnected(h.owner);
+			await settle();
+
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases the contribution when a BOLT 1 error kills the open', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: h.tempId,
+					data: Buffer.from('go away', 'ascii')
+				})
+			);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases the contribution on a connection-wide BOLT 1 error', async () => {
+			const { provider, released } = providerWithReleaseSpy();
+			const h = setupNegotiation({ provider });
+			const input = makeContributionInput(100_000);
+			h.channel.setDualFundingContribution(
+				[input],
+				Buffer.alloc(0),
+				100_000n,
+				1000
+			);
+
+			h.mgr.handleMessage(
+				h.owner,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: Buffer.alloc(32),
+					data: Buffer.from('all channels', 'ascii')
+				})
+			);
+			await settle();
+
+			expect(h.mgr.getTempChannel(h.tempId)).to.equal(undefined);
+			expect(released).to.deep.equal([[outpointOf(input)]]);
+		});
+
+		it('releases a wallet selection that resolved after its open died', async () => {
+			const released: Array<Array<{ txid: string; vout: number }>> = [];
+			const input = makeContributionInput(200_000);
+			let resolveSelection!: (value: {
+				inputs: ISpliceWalletInput[];
+				changeScript: Buffer;
+			}) => void;
+			const provider: IFundingProvider = {
+				buildFundingTransaction: () => Promise.reject(new Error('not needed')),
+				broadcastTransaction: () => Promise.reject(new Error('not needed')),
+				selectSpliceInputs: () =>
+					new Promise((resolve) => {
+						resolveSelection = resolve;
+					}),
+				releaseInputPledges: async (outpoints) => {
+					released.push(outpoints);
+				}
+			};
+			const owner = getPublicKey(crypto.randomBytes(32)).toString('hex');
+			const mgr = new ChannelManager(makeChannelManagerConfig());
+			mgr.setFundingProvider(provider);
+			mgr.on('error', () => {});
+			mgr.on('message:outbound', () => {});
+			const channel = mgr.createDualFundedChannel(
+				owner,
+				makeDualFundingParams()
+			);
+			const tempId = channel.getTemporaryChannelId();
+			mgr.handleMessage(
+				owner,
+				MessageType.ACCEPT_CHANNEL2,
+				encodeAcceptChannel2Message(
+					makeAcceptChannel2Msg({ channelId: tempId })
+				)
+			);
+
+			// The open dies while the wallet selection is still in flight.
+			mgr.handleMessage(
+				owner,
+				MessageType.ERROR,
+				encodeErrorMessage({
+					channelId: tempId,
+					data: Buffer.from('gone', 'ascii')
+				})
+			);
+			expect(mgr.getTempChannel(tempId)).to.equal(undefined);
+
+			resolveSelection({ inputs: [input], changeScript: Buffer.alloc(0) });
+			await settle();
+
+			expect(released).to.deep.equal([[outpointOf(input)]]);
 		});
 	});
 });

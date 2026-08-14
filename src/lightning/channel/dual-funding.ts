@@ -7,6 +7,23 @@
  *
  * Manages state transitions and uses InteractiveTxBuilder for
  * collaborative transaction construction.
+ *
+ * Trust model for peer inputs (issue #311): interactive-tx is a BOLT 2
+ * property, so every receive-side check of a peer's tx_add_input prev_tx
+ * (parse, vout range, segwit-only, the tx_complete solvency audit, witness
+ * verification) is self-consistency over bytes the peer chose. A fabricated
+ * prevout yields a negotiated funding tx that can never confirm, while our
+ * pledged inputs stay reserved. Two mitigations, both best effort:
+ *   - When the node has a chain backend, peer prevouts are verified against
+ *     the chain as tx_add_input arrives (ChannelManager.verifyPeerFundingInput)
+ *     and a conclusive spent-or-missing answer aborts the negotiation.
+ *     'unknown' proceeds (fail open), and a fast negotiation can outrun the
+ *     verdict. Splice inputs are not covered.
+ *   - When a v2 open dies terminally before our tx_signatures were released,
+ *     its funding pledges release at once (releaseInputPledges) instead of
+ *     waiting out the pledge TTL. Post-signature deaths keep the TTL as the
+ *     backstop: the peer may broadcast, so an early release could double
+ *     spend a funding tx that still confirms.
  */
 
 import { InteractiveTxBuilder } from '../interactive-tx/builder';

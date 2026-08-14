@@ -97,7 +97,7 @@ import {
 } from '../script/funding-taproot';
 import { buildTaprootAnchorOutput } from '../script/commitment-taproot';
 import * as ecc from '@bitcoinerlab/secp256k1';
-import { Channel, ITaprootClosingCache } from './channel';
+import { Channel, ISpliceWalletInput, ITaprootClosingCache } from './channel';
 import {
 	createOpenerState,
 	createAcceptorState,
@@ -147,9 +147,14 @@ import {
 	decodeTxInitRbfMessage,
 	decodeTxAckRbfMessage,
 	decodeTxAbortMessage,
-	encodeTxAbortMessage
+	encodeTxAbortMessage,
+	ITxAddInputMessage
 } from '../message/interactive-tx';
-import { IDualFundingParams } from './dual-funding';
+import {
+	DualFundingSession,
+	DualFundingState,
+	IDualFundingParams
+} from './dual-funding';
 import { ILeaseRates } from '../gossip/types';
 import { signWillFund, verifyWillFund } from './liquidity-ads';
 import { decodeAnnouncementSignaturesMessage } from '../gossip/messages';
@@ -289,6 +294,21 @@ export interface IChannelManagerConfig {
 	 * channel falls back to its commitment feerate.
 	 */
 	getClosingFeeratePerKw?: () => number | undefined;
+	/**
+	 * Optional chain-backed, best-effort verification of a v2 peer's
+	 * tx_add_input prevout (issue #311). Every local prev_tx check is
+	 * self-consistency over bytes the peer chose, so a fabricated prevout
+	 * yields a funding tx that can never confirm while our pledged inputs
+	 * stay frozen. Called fire-and-forget as peer inputs arrive; a
+	 * 'spent-or-missing' verdict aborts the negotiation, anything else
+	 * proceeds (fail open). `txid` is internal byte order. Absent means no
+	 * verification.
+	 */
+	verifyRemoteFundingInput?: (input: {
+		txid: Buffer;
+		vout: number;
+		scriptPubKey: Buffer;
+	}) => Promise<'unspent' | 'spent-or-missing' | 'unknown'>;
 }
 
 /**
@@ -364,6 +384,13 @@ export class ChannelManager extends EventEmitter {
 	private _walletDestinationScript: Buffer | null = null;
 	/** Funding provider used to attach wallet inputs for anchor fee bumps. */
 	private fundingProvider: IFundingProvider | null = null;
+	/**
+	 * Peer funding outpoints already submitted to verifyRemoteFundingInput,
+	 * keyed per channel instance as `txidHex:vout` (issue #311). Dedups the
+	 * chain queries an RBF's re-added inputs would repeat; bounded by the
+	 * interactive-tx input and message caps.
+	 */
+	private _verifiedPeerInputs = new WeakMap<Channel, Set<string>>();
 	/** Cached local node id (pubkey) for the tx_signatures ordering tie-break. */
 	private localNodeIdCache: Buffer | null = null;
 	/**
@@ -1430,6 +1457,7 @@ export class ChannelManager extends EventEmitter {
 					channel.getChannelId(),
 					'dead unfunded v2 open removed on disconnect'
 				);
+				this.releaseAbandonedV2Pledges(channel);
 			}
 		}
 
@@ -1460,6 +1488,7 @@ export class ChannelManager extends EventEmitter {
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
 					'dead unfunded v2 open removed on disconnect'
 				);
+				this.releaseAbandonedV2Pledges(channel);
 				continue;
 			}
 			if (!earlyStates.has(state)) continue;
@@ -1487,6 +1516,11 @@ export class ChannelManager extends EventEmitter {
 				channel.getTemporaryChannelId(),
 				`Peer disconnected during channel open (state: ${state})`
 			);
+			// A live record-less v2 negotiation died with its peer: nothing
+			// was ever signed, so its funding pledges release at once
+			// (issue #311). The getter answers empty for the v1 states in
+			// this sweep.
+			this.releaseAbandonedV2Pledges(channel);
 		}
 	}
 
@@ -4622,8 +4656,13 @@ export class ChannelManager extends EventEmitter {
 					.then(
 						({ inputs, changeScript }) => {
 							// Wallet selection can outlive a disconnect and same-id retry.
-							// A stale completion must not mutate or dispatch for its old channel.
-							if (!isCurrentOpen()) return;
+							// A stale completion must not mutate or dispatch for its old
+							// channel; its just-pledged inputs were never registered
+							// anywhere, so their pledges release at once (issue #311).
+							if (!isCurrentOpen()) {
+								this.releaseStaleSelectionPledges(inputs);
+								return;
+							}
 							channel.setDualFundingContribution(
 								inputs,
 								changeScript,
@@ -4827,7 +4866,12 @@ export class ChannelManager extends EventEmitter {
 		void selection
 			.then(
 				({ inputs, changeScript }) => {
-					if (!isCurrentOpen()) return;
+					// A stale completion's just-pledged inputs were never registered
+					// anywhere, so their pledges release at once (issue #311).
+					if (!isCurrentOpen()) {
+						this.releaseStaleSelectionPledges(inputs);
+						return;
+					}
 					channel.setDualFundingContribution(
 						inputs,
 						changeScript,
@@ -4876,6 +4920,141 @@ export class ChannelManager extends EventEmitter {
 		if (!channel) return;
 
 		const actions = channel.handleTxAddInput(msg);
+		// Kick off the chain check before dispatching replies: a synchronous
+		// transport can drive the whole negotiation inside processActions, and
+		// the session gate below must see the state right after the add.
+		this.verifyPeerFundingInput(peerPubkey, channel, msg);
+		this.processActions(peerPubkey, channel, actions);
+	}
+
+	/**
+	 * Kick off the optional chain verification of a v2 peer's tx_add_input
+	 * prevout (issue #311). Fire and forget: the negotiation proceeds while
+	 * the backend answers, and only a conclusive 'spent-or-missing' verdict
+	 * acts (applyPeerInputVerdict). Scoped to v2 open negotiations; splice
+	 * inputs (shared or wallet) never satisfy the session gate.
+	 */
+	private verifyPeerFundingInput(
+		peerPubkey: string,
+		channel: Channel,
+		msg: ITxAddInputMessage
+	): void {
+		const verify = this.config.verifyRemoteFundingInput;
+		if (!verify) return;
+		// Splice shared input: its outpoint is the channel's own funding
+		// output, validated against the channel state instead of the chain.
+		if (msg.sharedInputTxid) return;
+		const session = channel.getDualFundingSession();
+		if (!session || session.getState() !== DualFundingState.TX_NEGOTIATION) {
+			return;
+		}
+		// A prev_tx the channel already rejected (unparseable, vout out of
+		// range) never reaches the builder; nothing to verify.
+		let prevTx: bitcoin.Transaction;
+		try {
+			prevTx = bitcoin.Transaction.fromBuffer(msg.prevTx);
+		} catch {
+			return;
+		}
+		const vout = msg.prevTxVout;
+		if (!prevTx.outs[vout]) return;
+		const txid = Buffer.from(prevTx.getHash());
+		const key = `${txid.toString('hex')}:${vout}`;
+		let seen = this._verifiedPeerInputs.get(channel);
+		if (!seen) {
+			seen = new Set();
+			this._verifiedPeerInputs.set(channel, seen);
+		}
+		if (seen.has(key)) return;
+		seen.add(key);
+		void verify({ txid, vout, scriptPubKey: prevTx.outs[vout].script })
+			.then((verdict) =>
+				this.applyPeerInputVerdict(
+					verdict,
+					peerPubkey,
+					channel,
+					session,
+					msg.channelId,
+					txid,
+					vout
+				)
+			)
+			.catch(() => {
+				// Verification failure is 'unknown': fail open.
+			});
+	}
+
+	/**
+	 * Act on a chain verdict for a peer funding input (issue #311). Only a
+	 * conclusive 'spent-or-missing' aborts, and only when the channel, the
+	 * session and the contributed outpoint all still stand exactly as they
+	 * did when the query left. Anything already past the point where an
+	 * abort is allowed (tx_signatures released, funding tx staged) is left
+	 * to the funding-missing watchdog and the pledge TTL.
+	 */
+	private applyPeerInputVerdict(
+		verdict: 'unspent' | 'spent-or-missing' | 'unknown',
+		peerPubkey: string,
+		channel: Channel,
+		session: DualFundingSession,
+		channelId: Buffer,
+		txid: Buffer,
+		vout: number
+	): void {
+		if (verdict !== 'spent-or-missing') return;
+		// Instance identity: the id must still resolve to this very object,
+		// registered to this very peer. A disconnect plus a same-id retry
+		// replaces the instance; a late verdict must not touch its successor.
+		const found =
+			this.findChannelByChannelId(channelId) ||
+			this.findChannelByChannelIdInTemp(channelId) ||
+			this.findTempChannel(channelId);
+		if (found !== channel) return;
+		const idHex = channelId.toString('hex');
+		const registeredPeer = this.channelPeers.get(idHex);
+		if (registeredPeer !== undefined && registeredPeer !== peerPubkey) return;
+		// Session identity: a peer abort or completed open nulls or replaces
+		// the session.
+		if (channel.getDualFundingSession() !== session) return;
+		// The outpoint must still be contributed. RBF resets the builder
+		// inside the SAME session object, so builder membership, not session
+		// identity, is the staleness guard for a renegotiated attempt.
+		const stillContributed = session
+			.getTxBuilder()
+			?.getInputs()
+			.some(
+				(i) =>
+					!i.isShared && i.prevTxid.equals(txid) && i.prevOutputIndex === vout
+			);
+		if (!stillContributed) return;
+		const displayOutpoint = `${Buffer.from(txid)
+			.reverse()
+			.toString('hex')}:${vout}`;
+		const reason = `peer tx_add_input ${displayOutpoint} not found unspent on chain (issue #311)`;
+		// Too late to abort (BOLT 2: no tx_abort after tx_signatures; a staged
+		// fully signed tx owes the network a broadcast). Report and leave the
+		// outcome to the watchdog; dispatching the refusal ERROR instead would
+		// wrongly tear down the temp channel.
+		const st = channel.getFullState();
+		if (st.v2InFlight?.sentTxSignatures || st.pendingFundingTxHex) {
+			this.emitContained(
+				'error',
+				channel.getChannelId() ?? channel.getTemporaryChannelId(),
+				`${reason}, detected after signature release`
+			);
+			return;
+		}
+		const actions = channel.abortDualFunding(reason);
+		// A refusal (e.g. an RBF request awaiting its answer) comes back as a
+		// bare local ERROR with no wire message: swallow it, fail open.
+		if (!actions.some((a) => a.type === ChannelActionType.SEND_MESSAGE)) {
+			return;
+		}
+		this.emitContained(
+			'error',
+			channel.getChannelId() ?? channel.getTemporaryChannelId(),
+			reason
+		);
 		this.processActions(peerPubkey, channel, actions);
 	}
 
@@ -5042,6 +5221,7 @@ export class ChannelManager extends EventEmitter {
 					channel.getChannelId() ?? channel.getTemporaryChannelId(),
 					'v2 open aborted'
 				);
+				this.releaseAbandonedV2Pledges(channel);
 			}
 		}
 	}
@@ -5171,11 +5351,14 @@ export class ChannelManager extends EventEmitter {
 				this.failChannelByError(channel, `Remote error: ${errorText}`);
 			}
 			// Unfunded negotiations with this peer die too; nothing is on chain,
-			// so they are simply forgotten.
+			// so they are simply forgotten. A dead v2 open's funding pledges
+			// release with it (issue #311, releaseErroredTempV2Pledges).
 			for (const tempId of [...this.tempChannels.keys()]) {
 				if (this.channelPeers.get(tempId) !== peerPubkey) continue;
+				const tempChannel = this.tempChannels.get(tempId);
 				this.tempChannels.delete(tempId);
 				this.channelPeers.delete(tempId);
+				if (tempChannel) this.releaseErroredTempV2Pledges(tempChannel);
 			}
 			this.emit('error', msg.channelId, `Remote error: ${errorText}`);
 			return;
@@ -5186,11 +5369,15 @@ export class ChannelManager extends EventEmitter {
 		// peer's cancellation, but only the owning peer may remove the lifecycle.
 		const exactTemp = this.tempChannels.get(channelIdHex);
 		if (exactTemp) {
-			this.removeCurrentTempChannel(peerPubkey, exactTemp);
+			if (this.removeCurrentTempChannel(peerPubkey, exactTemp)) {
+				this.releaseErroredTempV2Pledges(exactTemp);
+			}
 		} else {
 			const derivedTemp = this.findChannelByChannelIdInTemp(msg.channelId);
 			if (derivedTemp) {
-				this.removeCurrentTempChannel(peerPubkey, derivedTemp);
+				if (this.removeCurrentTempChannel(peerPubkey, derivedTemp)) {
+					this.releaseErroredTempV2Pledges(derivedTemp);
+				}
 			}
 		}
 
@@ -5400,6 +5587,69 @@ export class ChannelManager extends EventEmitter {
 			this.channelPeers.delete(tempId);
 		}
 		return removed;
+	}
+
+	/**
+	 * Release the wallet pledges of a conclusively dead v2 open (issue #311).
+	 * The channel getter reports outpoints only for an abandoned open with
+	 * nothing anyone could broadcast (getReleasableV2PledgeOutpoints), so
+	 * every call site fails safe; a channel the node's channel:abandoned
+	 * listener re-restored (resumable RBF row) is skipped. Best effort by
+	 * design: the pledge TTL remains the backstop.
+	 */
+	private releaseAbandonedV2Pledges(channel: Channel): void {
+		if (!this.fundingProvider?.releaseInputPledges) return;
+		const outpoints = channel.getReleasableV2PledgeOutpoints();
+		if (outpoints.length === 0) return;
+		const idHex = (
+			channel.getChannelId() ?? channel.getTemporaryChannelId()
+		)?.toString('hex');
+		if (idHex && (this.channels.has(idHex) || this.tempChannels.has(idHex))) {
+			return;
+		}
+		void this.fundingProvider
+			.releaseInputPledges(outpoints)
+			.catch(() => undefined);
+	}
+
+	/**
+	 * A v2 temp open just deleted because of a fatal BOLT 1 error: mark it
+	 * ERRORED (consistent with failChannelByError; also what lets the
+	 * abandoned-v2 getter answer) and release its funding pledges
+	 * (issue #311). v1 opens are left untouched: they have no v2 pledges,
+	 * and their removed channel objects keep their historical state.
+	 */
+	private releaseErroredTempV2Pledges(channel: Channel): void {
+		if (channel.getFullState().fundingVersion !== 2) return;
+		channel.markErrored();
+		this.releaseAbandonedV2Pledges(channel);
+	}
+
+	/**
+	 * Release the pledges of a wallet selection that resolved after its open
+	 * died (issue #311). The inputs were selected and frozen but never
+	 * registered on any channel, never contributed and never signed, so the
+	 * release is unconditionally safe.
+	 */
+	private releaseStaleSelectionPledges(inputs: ISpliceWalletInput[]): void {
+		if (!this.fundingProvider?.releaseInputPledges || inputs.length === 0) {
+			return;
+		}
+		const outpoints: Array<{ txid: string; vout: number }> = [];
+		for (const input of inputs) {
+			try {
+				outpoints.push({
+					txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+					vout: input.prevOutputIndex
+				});
+			} catch {
+				// Unreadable prevTx cannot name a pledge; the TTL covers it.
+			}
+		}
+		if (outpoints.length === 0) return;
+		void this.fundingProvider
+			.releaseInputPledges(outpoints)
+			.catch(() => undefined);
 	}
 
 	private processActions(

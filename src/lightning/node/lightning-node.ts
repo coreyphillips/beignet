@@ -221,7 +221,11 @@ import {
 	IChannelPersistRequest
 } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
-import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
+import {
+	ChainWatcher,
+	classifyRemoteFundingInput,
+	computeScriptHash
+} from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
@@ -981,7 +985,35 @@ export class LightningNode extends EventEmitter {
 				return satPerVbyte > 0
 					? Math.ceil(this.clampEstimatedFeeRate(satPerVbyte) * 250)
 					: undefined;
-			}
+			},
+			// Chain-backed check that a v2 peer's tx_add_input prevout exists
+			// unspent (issue #311); only offered when a chain backend was
+			// configured, and read lazily because _chainBackend is assigned
+			// after this construction. Never throws: any failure is 'unknown'
+			// and the manager fails open.
+			...(config.chainBackend
+				? {
+						verifyRemoteFundingInput: async (input: {
+							txid: Buffer;
+							vout: number;
+							scriptPubKey: Buffer;
+						}): Promise<'unspent' | 'spent-or-missing' | 'unknown'> => {
+							const backend = this._chainBackend;
+							if (!backend) return 'unknown';
+							try {
+								return await classifyRemoteFundingInput(backend, {
+									txidDisplayHex: Buffer.from(input.txid)
+										.reverse()
+										.toString('hex'),
+									vout: input.vout,
+									scriptPubKey: input.scriptPubKey
+								});
+							} catch {
+								return 'unknown';
+							}
+						}
+				  }
+				: {})
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
 		// (zero-fee second-level HTLC txs and commitment CPFP).
@@ -13994,6 +14026,15 @@ export class LightningNode extends EventEmitter {
 				channelId: channelId.toString('hex'),
 				reason
 			});
+			// Nothing anyone can broadcast: the pledges reserving our inputs
+			// protect a transaction that will never exist, so they release
+			// now instead of waiting out the TTL (issue #311).
+			const pledges = channel.getReleasableV2PledgeOutpoints();
+			if (pledges.length > 0) {
+				void this.fundingProvider
+					?.releaseInputPledges?.(pledges)
+					.catch(() => undefined);
+			}
 			this.voidMissingFundingChannel(
 				channelId,
 				state.fundingTxid.toString('hex')

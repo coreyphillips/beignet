@@ -41,6 +41,20 @@ export interface IChainBackend {
 		txid: string,
 		height: number
 	): Promise<{ blockHeight: number; txIndex: number }>;
+	/**
+	 * List unspent outputs for a script hash (Electrum
+	 * blockchain.scripthash.listunspent). Optional; used to verify that a
+	 * dual-funding peer's claimed prevout actually exists unspent on chain
+	 * (issue #311). height 0 means unconfirmed.
+	 */
+	listUnspent?(scriptHash: string): Promise<
+		Array<{
+			txid: string;
+			outputIndex: number;
+			valueSat: number;
+			height: number;
+		}>
+	>;
 }
 
 /** A funding output being watched for confirmation */
@@ -115,6 +129,55 @@ export interface IChainWatcherConfig {
 export function computeScriptHash(scriptPubkey: Buffer): string {
 	const hash = crypto.createHash('sha256').update(scriptPubkey).digest();
 	return Buffer.from(hash).reverse().toString('hex');
+}
+
+/**
+ * Chain verdict on a dual-funding peer's claimed prevout (issue #311).
+ * 'unspent' = the outpoint exists unspent; 'spent-or-missing' = the chain
+ * conclusively refutes the claim (the tx is absent from the script's history,
+ * mempool included, or its confirmed output is no longer unspent);
+ * 'unknown' = the backend could not answer conclusively (disconnected,
+ * timeout, unconfirmed parent not indexed) and callers must fail open.
+ */
+export type RemoteInputVerdict = 'unspent' | 'spent-or-missing' | 'unknown';
+
+/**
+ * Best-effort chain verification that a peer-claimed prevout exists unspent
+ * (issue #311). Interactive-tx validation is otherwise pure self-consistency
+ * over bytes the peer chose, so a fabricated prev_tx yields a funding tx
+ * that can never confirm. Queries the prevout script's unspent set and
+ * history in parallel; only a conclusive negative reports 'spent-or-missing'.
+ * Never throws.
+ */
+export async function classifyRemoteFundingInput(
+	backend: IChainBackend,
+	outpoint: { txidDisplayHex: string; vout: number; scriptPubKey: Buffer }
+): Promise<RemoteInputVerdict> {
+	const scriptHash = computeScriptHash(outpoint.scriptPubKey);
+	const [unspent, history] = await Promise.all([
+		backend.listUnspent
+			? backend.listUnspent(scriptHash).catch(() => null)
+			: Promise.resolve(null),
+		backend.getScriptHashHistory(scriptHash).catch(() => null)
+	]);
+	if (
+		unspent?.some(
+			(u) =>
+				u.txid === outpoint.txidDisplayHex && u.outputIndex === outpoint.vout
+		)
+	) {
+		return 'unspent';
+	}
+	if (!history) return 'unknown';
+	const entry = history.find((h) => h.txid === outpoint.txidDisplayHex);
+	// Electrum script history includes mempool entries (height <= 0), so a
+	// transaction the network has never seen cannot appear here.
+	if (!entry) return 'spent-or-missing';
+	if (!unspent) return 'unknown';
+	// Confirmed on chain but not in the unspent set: the output existed and
+	// has been spent. Unconfirmed (height <= 0): servers index mempool utxos
+	// inconsistently, so absence from listunspent proves nothing; fail open.
+	return entry.height > 0 ? 'spent-or-missing' : 'unknown';
 }
 
 /**

@@ -358,4 +358,123 @@ describe('Funding input pledges', function () {
 		expect(unfrozenLog).to.deep.equal([]);
 		expect(outpoints(inputs)).to.not.include(`${utxos[0].tx_hash}:0`);
 	});
+
+	describe('releaseInputPledges (issue #311)', function () {
+		const asOutpoint = (op: string): { txid: string; vout: number } => {
+			const sep = op.lastIndexOf(':');
+			return { txid: op.slice(0, sep), vout: Number(op.slice(sep + 1)) };
+		};
+
+		it('releases a selection pledge so the coin is selectable at once', async function () {
+			const { wallet, unfrozenLog } = makeWallet([100_000, 100_000]);
+			const provider = new WalletFundingProvider(wallet as never);
+
+			const { inputs } = await provider.selectSpliceInputs!(150_000n, 1000);
+			const pledgedOps = outpoints(inputs);
+			expect(pledgedOps.length).to.equal(2);
+			// The wallet is exhausted while the pledges stand.
+			let error = '';
+			try {
+				await provider.selectSpliceInputs!(80_000n, 1000);
+			} catch (e) {
+				error = (e as Error).message;
+			}
+			expect(error).to.contain('insufficient wallet funds');
+
+			// The open died before anything was signed: release returns the
+			// coins to the pool immediately, no TTL wait.
+			await provider.releaseInputPledges(pledgedOps.map(asOutpoint));
+			expect(unfrozenLog.sort()).to.deep.equal([...pledgedOps].sort());
+			const next = await provider.selectSpliceInputs!(80_000n, 1000);
+			expect(next.inputs.length).to.be.greaterThan(0);
+		});
+
+		it('releasing one open leaves a concurrent open pledged', async function () {
+			const { wallet } = makeWallet([100_000, 100_000, 100_000, 100_000]);
+			const provider = new WalletFundingProvider(wallet as never);
+
+			const first = await provider.selectSpliceInputs!(80_000n, 1000);
+			const second = await provider.selectSpliceInputs!(80_000n, 1000);
+			const firstOps = outpoints(first.inputs);
+			const secondOps = outpoints(second.inputs);
+
+			await provider.releaseInputPledges(firstOps.map(asOutpoint));
+
+			// A follow-up selection may reuse the released coins but never the
+			// still-pledged ones.
+			const next = await provider.selectSpliceInputs!(80_000n, 1000);
+			for (const op of outpoints(next.inputs)) {
+				expect(secondOps, 'concurrent pledge survived').to.not.include(op);
+			}
+		});
+
+		it('ignores unknown outpoints, tolerates a double release, never touches user freezes', async function () {
+			const { wallet, utxos, frozen, unfrozenLog } = makeWallet([
+				100_000, 100_000
+			]);
+			// User froze coin 1 with no tag.
+			await wallet.freezeUtxo({ txid: utxos[1].tx_hash, index: 0 });
+
+			const provider = new WalletFundingProvider(wallet as never);
+			const { inputs } = await provider.selectSpliceInputs!(80_000n, 1000);
+			const pledgedOps = outpoints(inputs).map(asOutpoint);
+
+			const releaseAll = [
+				...pledgedOps,
+				{ txid: utxos[1].tx_hash, vout: 0 },
+				{ txid: crypto.randomBytes(32).toString('hex'), vout: 7 }
+			];
+			await provider.releaseInputPledges(releaseAll);
+			await provider.releaseInputPledges(releaseAll);
+
+			expect(unfrozenLog).to.deep.equal(
+				pledgedOps.map((o) => `${o.txid}:${o.vout}`)
+			);
+			expect(
+				frozen.has(`${utxos[1].tx_hash}:0`),
+				'user freeze untouched'
+			).to.equal(true);
+		});
+
+		it('a renewal after a racing release re-freezes the coin', async function () {
+			const { wallet, utxos, frozen, payment } = makeWallet([100_000, 100_000]);
+			const key = `${utxos[0].tx_hash}:0`;
+			const spend = new bitcoin.Transaction();
+			spend.version = 2;
+			spend.addInput(
+				Buffer.from(utxos[0].tx_hash, 'hex').reverse(),
+				utxos[0].tx_pos
+			);
+			spend.addOutput(payment.output!, 90_000);
+			wallet.send = async () => ok(spend.toHex());
+
+			const provider = new WalletFundingProvider(wallet as never);
+			await provider.buildFundingTransaction(payment.address!, 90_000n);
+			await provider.releaseInputPledges([asOutpoint(key)]);
+			expect(frozen.has(key)).to.equal(false);
+
+			// The broadcast obligation still stands: the per-block renewal wins.
+			await provider.pledgeTransactionInputs(spend.toHex());
+			expect(frozen.has(key)).to.equal(true);
+		});
+
+		it('releases a stale tagged pledge persisted by a previous run', async function () {
+			const { wallet, utxos, frozen, unfrozenLog } = makeWallet([
+				100_000, 100_000
+			]);
+			const key = `${utxos[0].tx_hash}:0`;
+			// A pledge freeze from a crashed run, still fresh (2 minutes old).
+			frozen.set(key, {
+				tx_hash: utxos[0].tx_hash,
+				tx_pos: 0,
+				freezeTag: 'funding-pledge',
+				frozenAt: Date.now() - 2 * 60_000
+			});
+
+			const provider = new WalletFundingProvider(wallet as never);
+			await provider.releaseInputPledges([asOutpoint(key)]);
+			expect(unfrozenLog).to.deep.equal([key]);
+			expect(frozen.has(key)).to.equal(false);
+		});
+	});
 });

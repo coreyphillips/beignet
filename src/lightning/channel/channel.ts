@@ -13173,6 +13173,31 @@ export class Channel {
 	}
 
 	/**
+	 * The wallet outpoints this side contributed to the v2 open, reported only
+	 * when the open is conclusively dead with nothing anyone could broadcast
+	 * (isAbandonedV2Open), so callers can release their funding pledges at
+	 * once instead of waiting out the pledge TTL (issue #311). RBF
+	 * renegotiations reuse the same contribution inputs, so this set covers
+	 * every attempt. Empty for a zero-contribution accept and for channels
+	 * restored after a restart (the contribution is process-local; the
+	 * provider TTL covers those). txid is display-order hex, matching the
+	 * provider's pledge keys.
+	 */
+	getReleasableV2PledgeOutpoints(): Array<{ txid: string; vout: number }> {
+		if (!this.isAbandonedV2Open()) return [];
+		const contribution = this._dualFundingContribution;
+		if (!contribution) return [];
+		try {
+			return contribution.inputs.map((input) => ({
+				txid: bitcoin.Transaction.fromBuffer(input.prevTx).getId(),
+				vout: input.prevOutputIndex
+			}));
+		} catch {
+			return [];
+		}
+	}
+
+	/**
 	 * Whether the PEER may be able to broadcast the recorded funding tx
 	 * without any further message from us. True once our witnesses left
 	 * (sentTxSignatures) or the fully signed tx exists (fullySigned, or
