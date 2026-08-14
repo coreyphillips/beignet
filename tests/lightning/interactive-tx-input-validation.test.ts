@@ -21,6 +21,11 @@ import {
 	validatePeerInputPrevTx
 } from '../../src/lightning/interactive-tx/validation';
 import { IInteractiveTxInput } from '../../src/lightning/interactive-tx/types';
+import {
+	classifyRemoteFundingInput,
+	computeScriptHash,
+	IChainBackend
+} from '../../src/lightning/chain/chain-watcher';
 
 bitcoin.initEccLib(ecc);
 
@@ -141,6 +146,123 @@ describe('S-2.H3: interactive-tx tx_add_input receive-side validation', function
 			}
 			err = builder.addPeerInput(peerInput({ prevTx }));
 			expect(err).to.match(/4096/);
+		});
+	});
+
+	describe('classifyRemoteFundingInput (issue #311)', function () {
+		const script = p2wpkhScript();
+		const txid = crypto.randomBytes(32).toString('hex');
+		const outpoint = { txidDisplayHex: txid, vout: 1, scriptPubKey: script };
+
+		/** Minimal IChainBackend stub; unimplemented calls reject. */
+		function makeBackend(overrides: Partial<IChainBackend>): IChainBackend {
+			return {
+				subscribeToHeaders: (): Promise<void> =>
+					Promise.reject(new Error('not needed')),
+				subscribeToScriptHash: (): Promise<void> =>
+					Promise.reject(new Error('not needed')),
+				getScriptHashHistory: (): Promise<
+					Array<{ txid: string; height: number }>
+				> => Promise.reject(new Error('not needed')),
+				getTransaction: (): Promise<Buffer> =>
+					Promise.reject(new Error('not needed')),
+				broadcastTransaction: (): Promise<string> =>
+					Promise.reject(new Error('not needed')),
+				...overrides
+			};
+		}
+
+		it('reports unspent when the outpoint is in the unspent set, querying the prevout script hash', async function () {
+			const seenHashes: string[] = [];
+			const backend = makeBackend({
+				listUnspent: async (sh) => {
+					seenHashes.push(sh);
+					return [{ txid, outputIndex: 1, valueSat: 5000, height: 100 }];
+				},
+				getScriptHashHistory: async (sh) => {
+					seenHashes.push(sh);
+					return [{ txid, height: 100 }];
+				}
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unspent'
+			);
+			for (const sh of seenHashes) {
+				expect(sh, 'queries use the prevout script hash').to.equal(
+					computeScriptHash(script)
+				);
+			}
+		});
+
+		it('fails open (unknown) when the txid is absent from the script history', async function () {
+			// Absence is NOT conclusive: a valid unconfirmed parent may simply
+			// not be indexed by this server yet, and BOLT 2 permits unconfirmed
+			// inputs, so an unindexed tx must never be refuted.
+			const backend = makeBackend({
+				listUnspent: async () => [],
+				getScriptHashHistory: async () => [
+					{ txid: crypto.randomBytes(32).toString('hex'), height: 50 }
+				]
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unknown'
+			);
+		});
+
+		it('reports spent-or-missing for a confirmed tx whose output left the unspent set', async function () {
+			const backend = makeBackend({
+				listUnspent: async () => [],
+				getScriptHashHistory: async () => [{ txid, height: 120 }]
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'spent-or-missing'
+			);
+		});
+
+		it('fails open (unknown) for an unconfirmed tx absent from the unspent set', async function () {
+			const backend = makeBackend({
+				listUnspent: async () => [],
+				getScriptHashHistory: async () => [{ txid, height: 0 }]
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unknown'
+			);
+		});
+
+		it('fails open (unknown) when the backend cannot answer', async function () {
+			const backend = makeBackend({
+				listUnspent: () => Promise.reject(new Error('disconnected')),
+				getScriptHashHistory: () => Promise.reject(new Error('disconnected'))
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unknown'
+			);
+		});
+
+		it('fails open (unknown) for a confirmed history hit when only listUnspent failed', async function () {
+			const backend = makeBackend({
+				listUnspent: () => Promise.reject(new Error('disconnected')),
+				getScriptHashHistory: async () => [{ txid, height: 120 }]
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unknown'
+			);
+		});
+
+		it('answers unknown without querying on a backend that lacks listUnspent', async function () {
+			// Without the unspent set there is no positive-evidence path, so
+			// the classifier does not spend a round trip on history alone.
+			let historyCalls = 0;
+			const backend = makeBackend({
+				getScriptHashHistory: async () => {
+					historyCalls++;
+					return [];
+				}
+			});
+			expect(await classifyRemoteFundingInput(backend, outpoint)).to.equal(
+				'unknown'
+			);
+			expect(historyCalls).to.equal(0);
 		});
 	});
 });

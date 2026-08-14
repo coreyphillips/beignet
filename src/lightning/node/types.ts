@@ -106,6 +106,19 @@ export interface IFundingProvider {
 	pledgeTransactionInputs?(txHex: string): Promise<void>;
 
 	/**
+	 * Release the pledges holding these exact outpoints (optional). Called when
+	 * a v2 open is conclusively dead before any tx_signatures were released, so
+	 * its reserved coins return to the spendable pool at once instead of
+	 * waiting out the pledge TTL (issue #311). `txid` is display-order hex.
+	 *
+	 * Implementations must only unfreeze coins they themselves pledged (never
+	 * user freezes), must ignore unknown outpoints, and must be idempotent.
+	 */
+	releaseInputPledges?(
+		outpoints: Array<{ txid: string; vout: number }>
+	): Promise<void>;
+
+	/**
 	 * Splice-in only (optional): select wallet UTXOs covering `amountSats` plus
 	 * fees and return them as splice inputs (each with its prevTx, value and a
 	 * witness-signing closure) along with a change script. Required for

@@ -221,7 +221,11 @@ import {
 	IChannelPersistRequest
 } from '../channel/channel-actions';
 import { FeatureFlags, Feature } from '../features/flags';
-import { ChainWatcher, computeScriptHash } from '../chain/chain-watcher';
+import {
+	ChainWatcher,
+	classifyRemoteFundingInput,
+	computeScriptHash
+} from '../chain/chain-watcher';
 import { signP2wpkhInput } from '../chain/sweep';
 import {
 	satPerVbyteToSatPerKw,
@@ -981,6 +985,50 @@ export class LightningNode extends EventEmitter {
 				return satPerVbyte > 0
 					? Math.ceil(this.clampEstimatedFeeRate(satPerVbyte) * 250)
 					: undefined;
+			},
+			// Chain-backed check that a v2 peer's tx_add_input prevout exists
+			// unspent (issue #311); only offered when a chain backend was
+			// configured, and read lazily because _chainBackend is assigned
+			// after this construction. Never throws: any failure is 'unknown'
+			// and the manager fails open.
+			...(config.chainBackend
+				? {
+						verifyRemoteFundingInput: async (input: {
+							txid: Buffer;
+							vout: number;
+							scriptPubKey: Buffer;
+						}): Promise<'unspent' | 'spent-or-missing' | 'unknown'> => {
+							const backend = this._chainBackend;
+							if (!backend) return 'unknown';
+							try {
+								return await classifyRemoteFundingInput(backend, {
+									txidDisplayHex: Buffer.from(input.txid)
+										.reverse()
+										.toString('hex'),
+									vout: input.vout,
+									scriptPubKey: input.scriptPubKey
+								});
+							} catch {
+								return 'unknown';
+							}
+						}
+				  }
+				: {}),
+			// Whether a durable row a restart could restore survives for this
+			// channel (issue #311): consulted before the manager releases an
+			// abandoned v2 open's funding pledges, because the abandoned
+			// listener leaves the row untouched when the store cannot answer.
+			// Unreadable = assume it survives (keep the pledge); a condemned
+			// row is deletion-owed and can never resume.
+			hasResumableChannelRow: (channelId: Buffer): boolean => {
+				if (!this.storage?.loadChannel) return false;
+				try {
+					const row = this.storage.loadChannel(channelId.toString('hex'));
+					if (!row) return false;
+					return row.state.condemned !== true;
+				} catch {
+					return true;
+				}
 			}
 		});
 		// Let the channel manager attach wallet inputs for anchor fee bumps
@@ -4591,23 +4639,26 @@ export class LightningNode extends EventEmitter {
 	 * watch, its persisted state and any retained funding tx, and tell the
 	 * embedder via channel:voided.
 	 */
-	private voidMissingFundingChannel(channelId: Buffer, txid: string): void {
+	private voidMissingFundingChannel(channelId: Buffer, txid: string): boolean {
 		const idHex = channelId.toString('hex');
 		// Durable FIRST: the live channel and its funding watch are only
 		// removed once the deletion, or at least the durable intent to
 		// delete, exists on disk. Removing them first and failing both
 		// writes would leave a storage-wide outage with neither a tracked
 		// channel nor a watch while the row silently restores at the next
-		// start.
+		// start. Returns whether the terminal decision landed durably
+		// (deleted, or condemned so a restart deletes instead of restoring);
+		// callers releasing resources tied to the channel (issue #311
+		// funding pledges) must act only on true.
 		const deleted = this.deleteChannelDurably(idHex);
 		if (!deleted && !this.condemnChannelRow(idHex)) {
 			this.emitStructuredLog('channel', 'channel_void_unresolved', {
 				channelId: idHex,
 				txid
 			});
-			return;
+			return false;
 		}
-		if (!this.channelManager.voidChannel(channelId)) return;
+		if (!this.channelManager.voidChannel(channelId)) return true;
 		this.chainWatcher?.removeWatchedFunding(channelId);
 		this.deletePendingFundingTx(
 			Buffer.from(txid, 'hex').reverse().toString('hex')
@@ -4621,13 +4672,14 @@ export class LightningNode extends EventEmitter {
 				channelId: idHex,
 				txid
 			});
-			return;
+			return true;
 		}
 		this.emitStructuredLog('channel', 'channel_voided', {
 			channelId: idHex,
 			txid
 		});
 		this.emit('channel:voided', { channelId });
+		return true;
 	}
 
 	// ─────────────── Pending funding broadcasts ───────────────
@@ -13994,10 +14046,22 @@ export class LightningNode extends EventEmitter {
 				channelId: channelId.toString('hex'),
 				reason
 			});
-			this.voidMissingFundingChannel(
+			// Nothing anyone can broadcast: the pledges reserving our inputs
+			// protect a transaction that will never exist, so they release
+			// as soon as the void's durable terminal decision lands
+			// (issue #311). A void that could not delete or condemn the row
+			// keeps the pledges: a restart would restore the open and its
+			// inputs must still be reserved.
+			const pledges = channel.getReleasableV2PledgeOutpoints();
+			const voided = this.voidMissingFundingChannel(
 				channelId,
 				state.fundingTxid.toString('hex')
 			);
+			if (voided && pledges.length > 0) {
+				void this.fundingProvider
+					?.releaseInputPledges?.(pledges)
+					.catch(() => undefined);
+			}
 			return;
 		}
 		if (mustNotBroadcastCommitment(state)) {

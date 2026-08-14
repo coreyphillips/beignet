@@ -41,6 +41,20 @@ export interface IChainBackend {
 		txid: string,
 		height: number
 	): Promise<{ blockHeight: number; txIndex: number }>;
+	/**
+	 * List unspent outputs for a script hash (Electrum
+	 * blockchain.scripthash.listunspent). Optional; used to verify that a
+	 * dual-funding peer's claimed prevout actually exists unspent on chain
+	 * (issue #311). height 0 means unconfirmed.
+	 */
+	listUnspent?(scriptHash: string): Promise<
+		Array<{
+			txid: string;
+			outputIndex: number;
+			valueSat: number;
+			height: number;
+		}>
+	>;
 }
 
 /** A funding output being watched for confirmation */
@@ -115,6 +129,58 @@ export interface IChainWatcherConfig {
 export function computeScriptHash(scriptPubkey: Buffer): string {
 	const hash = crypto.createHash('sha256').update(scriptPubkey).digest();
 	return Buffer.from(hash).reverse().toString('hex');
+}
+
+/**
+ * Chain verdict on a dual-funding peer's claimed prevout (issue #311).
+ * 'unspent' = the outpoint exists unspent; 'spent-or-missing' = POSITIVE
+ * evidence refutes the claim (the tx is confirmed on this script and its
+ * output is no longer in the unspent set); 'unknown' = no conclusive answer
+ * (disconnected, timeout, tx not indexed by this server) and callers must
+ * fail open. Absence alone is NEVER conclusive: BOLT 2 permits unconfirmed
+ * inputs, and a valid unconfirmed parent may simply not have reached this
+ * server yet.
+ */
+export type RemoteInputVerdict = 'unspent' | 'spent-or-missing' | 'unknown';
+
+/**
+ * Best-effort chain verification that a peer-claimed prevout exists unspent
+ * (issue #311). Interactive-tx validation is otherwise pure self-consistency
+ * over bytes the peer chose. Queries the prevout script's unspent set and
+ * history in parallel; only positive evidence of a spend reports
+ * 'spent-or-missing'. Never throws.
+ */
+export async function classifyRemoteFundingInput(
+	backend: IChainBackend,
+	outpoint: { txidDisplayHex: string; vout: number; scriptPubKey: Buffer }
+): Promise<RemoteInputVerdict> {
+	// Without the unspent set there is no positive evidence path at all.
+	if (!backend.listUnspent) return 'unknown';
+	const scriptHash = computeScriptHash(outpoint.scriptPubKey);
+	const [unspent, history] = await Promise.all([
+		backend.listUnspent(scriptHash).catch(() => null),
+		backend.getScriptHashHistory(scriptHash).catch(() => null)
+	]);
+	if (
+		unspent?.some(
+			(u) =>
+				u.txid === outpoint.txidDisplayHex && u.outputIndex === outpoint.vout
+		)
+	) {
+		return 'unspent';
+	}
+	if (!unspent || !history) return 'unknown';
+	const entry = history.find((h) => h.txid === outpoint.txidDisplayHex);
+	// Absent from the history: NOT conclusive. This server may simply not
+	// have indexed a valid unconfirmed parent yet, and BOLT 2 permits
+	// unconfirmed inputs, so treating absence as refutation would falsely
+	// abort honest opens. Fail open.
+	if (!entry) return 'unknown';
+	// Confirmed on chain but not in the unspent set: the output provably
+	// existed and has been spent. Unconfirmed (height <= 0): servers index
+	// mempool utxos inconsistently, so absence from listunspent proves
+	// nothing; fail open.
+	return entry.height > 0 ? 'spent-or-missing' : 'unknown';
 }
 
 /**

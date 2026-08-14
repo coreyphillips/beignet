@@ -315,6 +315,34 @@ export class WalletFundingProvider implements IFundingProvider {
 		}
 	}
 
+	/**
+	 * Release the pledges holding these exact outpoints
+	 * (IFundingProvider.releaseInputPledges, issue #311).
+	 *
+	 * Runs under the selection lock so it never interleaves with a
+	 * select-and-pledge or a renewal; a release racing a per-block renewal is
+	 * self-healing anyway (the next pledgeTransactionInputs re-freezes).
+	 * Adopting stale pledges first makes a pledge persisted by a previous run
+	 * releasable too. Only outpoints in the pledged map are touched: the map
+	 * only ever holds PLEDGE_TAG freezes, so user freezes are safe, and
+	 * unknown outpoints (including a double release) are no-ops.
+	 */
+	async releaseInputPledges(
+		outpoints: Array<{ txid: string; vout: number }>
+	): Promise<void> {
+		if (outpoints.length === 0) return;
+		return this.runSelection(async () => {
+			this.adoptStalePledges();
+			for (const { txid, vout } of outpoints) {
+				const key = `${txid}:${vout}`;
+				if (!this.pledged.has(key)) continue;
+				this.pledged.delete(key);
+				this.renewedPledges.delete(key);
+				await this.wallet.unfreezeUtxo?.({ txid, index: vout });
+			}
+		});
+	}
+
 	async buildFundingTransaction(
 		address: string,
 		amountSats: bigint,
