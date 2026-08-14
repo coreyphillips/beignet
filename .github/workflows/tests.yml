@@ -62,13 +62,15 @@ jobs:
       - name: Run network-switch test (isolated process)
         run: npx mocha --exit -r ts-node/register tests/electrum-switch-network.test.ts
 
-      - name: Run lightning unit tests
-        run: npm run test:lightning
-
-      # Also covered by the test:lightning glob above; a named step makes the
-      # conformance gate visible in CI output instead of incidental.
+      # Also covered by the test:lightning glob below; a named step makes the
+      # conformance gate visible in CI output instead of incidental. It must
+      # run BEFORE test:lightning: a conformance failure inside that broader
+      # step would fail there first and skip a later named step.
       - name: Run BOLT conformance vectors
         run: npm run test:conformance
+
+      - name: Run lightning unit tests
+        run: npm run test:lightning
 
       # The process-level chaos matrix SIGKILLs a real LightningNode child
       # (built against dist) at every recorded boundary; its cost and any

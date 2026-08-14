@@ -604,8 +604,7 @@ Counts are floors, not snapshots. Run the suites for exact numbers.
 
 The on-chain wallet suites live in `tests/*.test.ts` and connect to **live public
 Electrum servers**, so they need network access and can fail on a server outage
-rather than on your change. Each script runs `yarn build` first, so yarn has to be
-installed:
+rather than on your change. Each script runs `npm run build` first:
 
 ```bash
 npm run test:wallet        # also test:transaction, test:electrum, test:storage,
